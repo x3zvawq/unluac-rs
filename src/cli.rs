@@ -16,7 +16,7 @@ use unluac::decompile::{
 };
 use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
-const DEFAULT_SOURCE: &str = "tests/cases/common/control_flow/07_branch_state_carry.lua";
+const DEFAULT_SOURCE: &str = "tests/lua_cases/common/control_flow/07_branch_state_carry.lua";
 
 #[derive(Debug)]
 struct CliOptions {
@@ -392,7 +392,7 @@ fn parse_usize(value: impl AsRef<str>, flag: &str) -> Result<usize, CliError> {
 fn print_help() {
     println!("usage:");
     println!("  cargo run -- --dialect=lua5.1");
-    println!("  cargo run -- --dialect=lua5.1 --source tests/cases/lua5.1/01_setfenv.lua");
+    println!("  cargo run -- --dialect=lua5.1 --source tests/lua_cases/lua5.1/01_setfenv.lua");
     println!("  cargo run -- --dialect=lua5.1 --input /path/to/chunk.out --detail=verbose");
     println!();
     println!("options:");

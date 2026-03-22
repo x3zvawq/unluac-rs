@@ -20,7 +20,7 @@
 ```bash
 cargo run -- --dialect=lua5.1
 cargo run -- --dialect=lua5.1 --detail=verbose
-cargo run -- --dialect=lua5.1 --source tests/cases/lua5.1/01_setfenv.lua
+cargo run -- --dialect=lua5.1 --source tests/lua_cases/lua5.1/01_setfenv.lua
 cargo run -- --dialect=lua5.1 --input /absolute/path/to/chunk.out
 ```
 
@@ -92,10 +92,15 @@ lua/build/lua5.1/luac
 
 这是回归测试入口，不是开发期实时查看 dump 的入口。
 
-像 [tests/decompile_pipeline.rs](/Users/x3zvawq/workspace/unluac-rs/tests/decompile_pipeline.rs) 这样的测试，职责是锁定：
+当前测试目录约定：
+
+- unit 测试放在 [tests/unit/lua51/parser.rs](/Users/x3zvawq/workspace/unluac-rs/tests/unit/lua51/parser.rs) 和 [tests/unit/lua51/transformer.rs](/Users/x3zvawq/workspace/unluac-rs/tests/unit/lua51/transformer.rs) 这类路径下
+- regression 测试放在 [tests/regression/lua51/pipeline.rs](/Users/x3zvawq/workspace/unluac-rs/tests/regression/lua51/pipeline.rs) 这类路径下
+
+像 [tests/regression/lua51/pipeline.rs](/Users/x3zvawq/workspace/unluac-rs/tests/regression/lua51/pipeline.rs) 这样的测试，职责是锁定：
 
 - 主 pipeline 的最小契约
-- 当前 parser dump 的基本形状
+- 当前 parser / transformer dump 的基本形状
 - 未实现阶段是否明确报错
 
 这里故意保留固定 chunk fixture，而不是动态调用 `luac`，原因是：
