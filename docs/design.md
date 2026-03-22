@@ -12,5 +12,6 @@
 - [7.readability.md](./design/7.readability.md)
 - [8.naming.md](./design/8.naming.md)
 - [9.generate.md](./design/9.generate.md)
+- [10.debugging.md](./design/10.debugging.md)
 
 后续新增层次时，继续按 `{index}.{layer}.md` 拆分，避免回到单文件堆叠。
