@@ -1,1 +1,4 @@
 /target
+/lua/.tmp
+/lua/build
+/lua/sources

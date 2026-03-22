@@ -1,0 +1,2 @@
+[alias]
+lua = "run -p xtask --"
