@@ -4,8 +4,7 @@
 //! 都需要先锁定，避免后续接更多层时把当前调试工作流回归掉。
 
 use unluac::decompile::{
-    DebugDetail, DebugFormat, DebugOptions, DecompileError, DecompileOptions, DecompileStage,
-    decompile,
+    DebugDetail, DebugOptions, DecompileError, DecompileOptions, DecompileStage, decompile,
 };
 
 // 这里继续保留固定 chunk fixture，而不是动态调用 luac，
@@ -36,8 +35,7 @@ mod decompile_pipeline {
             DecompileOptions {
                 debug: DebugOptions {
                     enable: true,
-                    output_stage: Some(DecompileStage::Parse),
-                    format: DebugFormat::Human,
+                    output_stages: vec![DecompileStage::Parse],
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -66,8 +64,7 @@ mod decompile_pipeline {
             DecompileOptions {
                 debug: DebugOptions {
                     enable: true,
-                    output_stage: Some(DecompileStage::Parse),
-                    format: DebugFormat::Human,
+                    output_stages: vec![DecompileStage::Parse],
                     detail: DebugDetail::Summary,
                     filters: Default::default(),
                 },
@@ -81,6 +78,28 @@ mod decompile_pipeline {
         assert!(dump.contains("proto tree"));
         assert!(!dump.contains("\nconstants\n"));
         assert!(!dump.contains("\nraw instructions\n"));
+    }
+
+    #[test]
+    fn ignores_unreached_dump_stage_when_target_stage_stops_earlier() {
+        let result = decompile(
+            &decode_hex(SETFENV_CHUNK_HEX),
+            DecompileOptions {
+                target_stage: DecompileStage::Parse,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Parse, DecompileStage::Transform],
+                    detail: DebugDetail::Normal,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("unreached dump stage should not force pipeline to continue");
+
+        assert_eq!(result.state.completed_stage, Some(DecompileStage::Parse));
+        assert_eq!(result.debug_output.len(), 1);
+        assert_eq!(result.debug_output[0].stage, DecompileStage::Parse);
     }
 
     #[test]

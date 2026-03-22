@@ -3,6 +3,7 @@
         "https://raw.githubusercontent.com/DavidAnson/markdownlint/": true
     },
     "cSpell.words": [
+        "luac",
         "unluac"
     ],
 }

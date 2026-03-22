@@ -34,12 +34,6 @@ impl DecompilerPipeline {
         options: DecompileOptions,
     ) -> Result<DecompileResult, DecompileError> {
         let options = options.normalized();
-        let required_stage = options
-            .debug
-            .output_stage
-            .map_or(options.target_stage, |stage| {
-                stage.max(options.target_stage)
-            });
 
         let mut state = DecompileState::new(options.dialect, options.target_stage);
         let mut debug_output = Vec::new();
@@ -49,11 +43,11 @@ impl DecompilerPipeline {
         });
         state.mark_completed(DecompileStage::Parse);
 
-        if let Some(output) = collect_stage_dump(&state, &options.debug)? {
+        if let Some(output) = collect_stage_dump(&state, DecompileStage::Parse, &options.debug)? {
             debug_output.push(output);
         }
 
-        if required_stage == DecompileStage::Parse {
+        if options.target_stage == DecompileStage::Parse {
             return Ok(DecompileResult {
                 state,
                 debug_output,

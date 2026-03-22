@@ -5,10 +5,8 @@
 
 use thiserror::Error;
 
-use crate::parser::ParseError;
-
-use super::debug::DebugFormat;
 use super::state::DecompileStage;
+use crate::parser::ParseError;
 
 /// 主反编译 pipeline 可能返回的错误。
 #[derive(Debug, Error)]
@@ -24,9 +22,4 @@ pub enum DecompileError {
     },
     #[error("requested debug output for stage `{stage}`, but that stage has no artifact yet")]
     MissingStageOutput { stage: DecompileStage },
-    #[error("debug format `{format}` is not implemented for stage `{stage}`")]
-    UnsupportedDebugFormat {
-        stage: DecompileStage,
-        format: DebugFormat,
-    },
 }

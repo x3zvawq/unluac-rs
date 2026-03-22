@@ -4,12 +4,14 @@
 //! 具体某个 dialect 的 parser 本体与专属枚举都放到子目录里，避免公共层
 //! 被单个版本的细节持续污染。
 
+mod debug;
 mod dialect;
 mod error;
 mod options;
 mod raw;
 mod reader;
 
+pub use debug::dump_parser;
 pub use dialect::lua51::*;
 pub use error::ParseError;
 pub use options::{ParseMode, ParseOptions, StringDecodeMode, StringEncoding};

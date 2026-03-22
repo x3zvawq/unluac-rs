@@ -10,13 +10,12 @@ mod options;
 mod pipeline;
 mod state;
 
+pub use crate::debug::{DebugDetail, DebugFilters};
 pub use contracts::{
     AstChunk, CfgGraph, DataflowFacts, GeneratedChunk, GraphFacts, HirChunk, LoweredChunk,
     NamingResult, ReadabilityResult, StructureFacts,
 };
-pub use debug::{
-    DebugDetail, DebugFilters, DebugFormat, DebugOptions, StageDebugOutput, dump_parser,
-};
+pub use debug::{DebugOptions, StageDebugOutput, dump_parser};
 pub use error::DecompileError;
 pub use options::{DecompileDialect, DecompileOptions};
 pub use pipeline::{DecompileResult, decompile};

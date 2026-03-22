@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use unluac::decompile::{
-    DebugDetail, DebugFilters, DebugFormat, DebugOptions, DecompileDialect, DecompileOptions,
-    DecompileStage, decompile,
+    DebugDetail, DebugFilters, DebugOptions, DecompileDialect, DecompileOptions, DecompileStage,
+    decompile,
 };
 use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
@@ -44,8 +44,7 @@ impl Default for CliOptions {
             target_stage: DecompileStage::Parse,
             debug_options: DebugOptions {
                 enable: true,
-                output_stage: Some(DecompileStage::Parse),
-                format: DebugFormat::Human,
+                output_stages: vec![DecompileStage::Parse],
                 detail: DebugDetail::Normal,
                 filters: DebugFilters::default(),
             },
@@ -113,6 +112,7 @@ where
     I: IntoIterator<Item = OsString>,
 {
     let mut options = CliOptions::default();
+    let mut saw_explicit_dump = false;
     let mut args = args.into_iter();
     let _program = args.next();
 
@@ -186,13 +186,25 @@ where
             continue;
         }
         if let Some(flag) = value.strip_prefix("--dump=") {
-            options.debug_options.output_stage = Some(parse_stage(flag)?);
+            if !saw_explicit_dump {
+                // 默认值只是为了开箱即用；一旦用户显式指定，就以用户列表为准。
+                options.debug_options.output_stages.clear();
+                saw_explicit_dump = true;
+            }
+            options.debug_options.output_stages.push(parse_stage(flag)?);
             options.debug_options.enable = true;
             continue;
         }
         if value == "--dump" {
-            options.debug_options.output_stage =
-                Some(parse_stage(next_value(&mut args, "--dump")?)?);
+            if !saw_explicit_dump {
+                // 默认值只是为了开箱即用；一旦用户显式指定，就以用户列表为准。
+                options.debug_options.output_stages.clear();
+                saw_explicit_dump = true;
+            }
+            options
+                .debug_options
+                .output_stages
+                .push(parse_stage(next_value(&mut args, "--dump")?)?);
             options.debug_options.enable = true;
             continue;
         }
@@ -202,14 +214,6 @@ where
         }
         if value == "--stop-after" {
             options.target_stage = parse_stage(next_value(&mut args, "--stop-after")?)?;
-            continue;
-        }
-        if let Some(flag) = value.strip_prefix("--format=") {
-            options.debug_options.format = parse_debug_format(flag)?;
-            continue;
-        }
-        if value == "--format" {
-            options.debug_options.format = parse_debug_format(next_value(&mut args, "--format")?)?;
             continue;
         }
         if let Some(flag) = value.strip_prefix("--detail=") {
@@ -231,7 +235,7 @@ where
         }
         if value == "--no-debug" {
             options.debug_options.enable = false;
-            options.debug_options.output_stage = None;
+            options.debug_options.output_stages.clear();
             continue;
         }
 
@@ -343,12 +347,6 @@ fn parse_stage(value: impl AsRef<str>) -> Result<DecompileStage, CliError> {
         .ok_or_else(|| CliError::Usage(format!("unsupported stage: {value}")))
 }
 
-fn parse_debug_format(value: impl AsRef<str>) -> Result<DebugFormat, CliError> {
-    let value = value.as_ref();
-    DebugFormat::parse(value)
-        .ok_or_else(|| CliError::Usage(format!("unsupported debug format: {value}")))
-}
-
 fn parse_debug_detail(value: impl AsRef<str>) -> Result<DebugDetail, CliError> {
     let value = value.as_ref();
     DebugDetail::parse(value)
@@ -408,7 +406,6 @@ fn print_help() {
     println!("  --dump <stage>");
     println!("  --stop-after <stage>");
     println!("  --detail <summary|normal|verbose>");
-    println!("  --format <human|json>");
     println!("  --proto <id>");
     println!("  --no-debug");
 }

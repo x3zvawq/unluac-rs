@@ -62,8 +62,8 @@ impl Default for DecompileOptions {
 
 impl DecompileOptions {
     pub(crate) fn normalized(mut self) -> Self {
-        if self.debug.enable && self.debug.output_stage.is_none() {
-            self.debug.output_stage = Some(self.target_stage);
+        if self.debug.enable && self.debug.output_stages.is_empty() {
+            self.debug.output_stages.push(self.target_stage);
         }
         self
     }
