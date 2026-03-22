@@ -5,6 +5,7 @@
 
 use crate::debug::{DebugDetail, DebugFilters};
 use crate::parser;
+use crate::transformer;
 
 use super::error::DecompileError;
 use super::state::{DecompileStage, DecompileState};
@@ -38,6 +39,18 @@ pub fn dump_parser(
     })
 }
 
+/// 对外保留 transformer 阶段的统一包装，方便库层调用方继续从 decompile 命名空间访问。
+pub fn dump_lir(
+    chunk: &crate::transformer::LoweredChunk,
+    options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Ok(StageDebugOutput {
+        stage: DecompileStage::Transform,
+        detail: options.detail,
+        content: transformer::dump_lir(chunk, options.detail, &options.filters),
+    })
+}
+
 pub(crate) fn collect_stage_dump(
     state: &DecompileState,
     stage: DecompileStage,
@@ -53,6 +66,12 @@ pub(crate) fn collect_stage_dump(
                 return Err(DecompileError::MissingStageOutput { stage });
             };
             dump_parser(chunk, options).map(Some)
+        }
+        DecompileStage::Transform => {
+            let Some(chunk) = state.lowered.as_ref() else {
+                return Err(DecompileError::MissingStageOutput { stage });
+            };
+            dump_lir(chunk, options).map(Some)
         }
         _ => Err(DecompileError::MissingStageOutput { stage }),
     }

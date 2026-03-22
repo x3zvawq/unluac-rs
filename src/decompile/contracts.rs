@@ -3,9 +3,8 @@
 //! 当前只有 parser 真正实现完成，但现在就把后续层的输出位置先定出来，
 //! 可以避免后面补 transformer、cfg 时为了接线再次大幅改 state 结构。
 
-/// Transformer 层未来会产出的统一 low-IR 根对象。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LoweredChunk;
+/// Transformer 层产出的统一 low-IR 根对象。
+pub use crate::transformer::LoweredChunk;
 
 /// CFG 层未来会产出的控制流图根对象。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

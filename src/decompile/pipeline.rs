@@ -4,6 +4,7 @@
 //! 这样后续补层时只需要往这个骨架里填实现，不需要重写调用约定。
 
 use crate::parser::parse_lua51_chunk;
+use crate::transformer::lower_chunk;
 
 use super::debug::{StageDebugOutput, collect_stage_dump};
 use super::error::DecompileError;
@@ -54,9 +55,28 @@ impl DecompilerPipeline {
             });
         }
 
+        let raw_chunk = state
+            .raw_chunk
+            .as_ref()
+            .expect("parse stage completed must leave raw_chunk in state");
+        state.lowered = Some(lower_chunk(raw_chunk)?);
+        state.mark_completed(DecompileStage::Transform);
+
+        if let Some(output) = collect_stage_dump(&state, DecompileStage::Transform, &options.debug)?
+        {
+            debug_output.push(output);
+        }
+
+        if options.target_stage == DecompileStage::Transform {
+            return Ok(DecompileResult {
+                state,
+                debug_output,
+            });
+        }
+
         Err(DecompileError::StageNotImplemented {
-            stage: DecompileStage::Transform,
-            completed_stage: DecompileStage::Parse,
+            stage: DecompileStage::Cfg,
+            completed_stage: DecompileStage::Transform,
         })
     }
 }

@@ -53,7 +53,7 @@ impl Default for DecompileOptions {
         Self {
             dialect: DecompileDialect::Lua51,
             parse: ParseOptions::default(),
-            // 当前只有 parser 已经实现，默认停在 parse 可以让库和 CLI 都立即可用。
+            // 默认仍停在 parse，是为了保留当前最常用的 parser 调试工作流。
             target_stage: DecompileStage::Parse,
             debug: DebugOptions::default(),
         }

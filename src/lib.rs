@@ -8,3 +8,4 @@
 pub mod debug;
 pub mod decompile;
 pub mod parser;
+pub mod transformer;

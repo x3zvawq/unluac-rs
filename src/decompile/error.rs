@@ -7,12 +7,15 @@ use thiserror::Error;
 
 use super::state::DecompileStage;
 use crate::parser::ParseError;
+use crate::transformer::TransformError;
 
 /// 主反编译 pipeline 可能返回的错误。
 #[derive(Debug, Error)]
 pub enum DecompileError {
     #[error(transparent)]
     Parse(#[from] ParseError),
+    #[error(transparent)]
+    Transform(#[from] TransformError),
     #[error(
         "stage `{stage}` is not implemented yet; pipeline currently stops after `{completed_stage}`"
     )]

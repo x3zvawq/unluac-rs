@@ -1,0 +1,36 @@
+//! 这个模块承载 raw -> low-IR 的 transformer 层。
+//!
+//! 它位于 parser 和 CFG 之间，职责是把各个 dialect 的原始指令模式一次性
+//! lowering 成统一 low-IR，并顺手建立后续排错所需的 lowering 映射。
+
+mod common;
+mod debug;
+mod dialect;
+mod error;
+
+pub use common::{
+    AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchInstr, BranchOperands,
+    BranchPredicate, CallInstr, CallKind, Capture, CaptureSource, CloseInstr, ClosureInstr,
+    CondOperand, ConcatInstr, ConstRef, DialectCaptureExtra, GenericForCallInstr,
+    GenericForLoopInstr, GetTableInstr, GetUpvalueInstr, InstrRef, JumpInstr, LoadBoolInstr,
+    LoadConstInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr,
+    NewTableInstr, NumericForInitInstr, NumericForLoopInstr, ProtoRef, RawInstrRef, Reg,
+    RegRange, ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr,
+    TailCallInstr, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+};
+pub use debug::dump_lir;
+pub use error::TransformError;
+
+use crate::parser::{DialectVersion, RawChunk};
+
+/// 根据 chunk 的实际 dialect 自动选择 lowering 实现。
+pub fn lower_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
+    match chunk.header.version {
+        DialectVersion::Lua51 => dialect::lua51::lower_chunk(chunk),
+    }
+}
+
+/// 直接按 Lua 5.1 规则 lowering，不做方言自动探测。
+pub fn lower_lua51_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
+    dialect::lua51::lower_chunk(chunk)
+}

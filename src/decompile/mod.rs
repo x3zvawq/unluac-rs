@@ -15,7 +15,7 @@ pub use contracts::{
     AstChunk, CfgGraph, DataflowFacts, GeneratedChunk, GraphFacts, HirChunk, LoweredChunk,
     NamingResult, ReadabilityResult, StructureFacts,
 };
-pub use debug::{DebugOptions, StageDebugOutput, dump_parser};
+pub use debug::{DebugOptions, StageDebugOutput, dump_lir, dump_parser};
 pub use error::DecompileError;
 pub use options::{DecompileDialect, DecompileOptions};
 pub use pipeline::{DecompileResult, decompile};
