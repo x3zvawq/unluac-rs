@@ -1,0 +1,68 @@
+//! 这个文件实现主反编译 pipeline 的统一入口。
+//!
+//! 当前只真正接上 parser，但入口已经先按完整阶段序列搭好；
+//! 这样后续补层时只需要往这个骨架里填实现，不需要重写调用约定。
+
+use crate::parser::parse_lua51_chunk;
+
+use super::debug::{StageDebugOutput, collect_stage_dump};
+use super::error::DecompileError;
+use super::options::{DecompileDialect, DecompileOptions};
+use super::state::{DecompileStage, DecompileState};
+
+/// 一次主 pipeline 调用的返回值。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecompileResult {
+    pub state: DecompileState,
+    pub debug_output: Vec<StageDebugOutput>,
+}
+
+/// 对外暴露唯一的主入口，统一完成默认值补齐和阶段调度。
+pub fn decompile(
+    bytes: &[u8],
+    options: DecompileOptions,
+) -> Result<DecompileResult, DecompileError> {
+    DecompilerPipeline.run(bytes, options)
+}
+
+struct DecompilerPipeline;
+
+impl DecompilerPipeline {
+    fn run(
+        self,
+        bytes: &[u8],
+        options: DecompileOptions,
+    ) -> Result<DecompileResult, DecompileError> {
+        let options = options.normalized();
+        let required_stage = options
+            .debug
+            .output_stage
+            .map_or(options.target_stage, |stage| {
+                stage.max(options.target_stage)
+            });
+
+        let mut state = DecompileState::new(options.dialect, options.target_stage);
+        let mut debug_output = Vec::new();
+
+        state.raw_chunk = Some(match options.dialect {
+            DecompileDialect::Lua51 => parse_lua51_chunk(bytes, options.parse)?,
+        });
+        state.mark_completed(DecompileStage::Parse);
+
+        if let Some(output) = collect_stage_dump(&state, &options.debug)? {
+            debug_output.push(output);
+        }
+
+        if required_stage == DecompileStage::Parse {
+            return Ok(DecompileResult {
+                state,
+                debug_output,
+            });
+        }
+
+        Err(DecompileError::StageNotImplemented {
+            stage: DecompileStage::Transform,
+            completed_stage: DecompileStage::Parse,
+        })
+    }
+}
