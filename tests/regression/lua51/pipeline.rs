@@ -117,7 +117,10 @@ mod decompile_pipeline {
         )
         .expect("transform stage should succeed");
 
-        assert_eq!(result.state.completed_stage, Some(DecompileStage::Transform));
+        assert_eq!(
+            result.state.completed_stage,
+            Some(DecompileStage::Transform)
+        );
         assert!(result.state.raw_chunk.is_some());
         assert!(result.state.lowered.is_some());
         assert_eq!(result.debug_output.len(), 1);
@@ -130,21 +133,107 @@ mod decompile_pipeline {
     }
 
     #[test]
-    fn reports_cfg_stage_as_not_implemented_after_transform() {
-        let error = decompile(
+    fn returns_cfg_state_and_cfg_dump() {
+        let result = decompile(
             &crate::support::decode_hex(SETFENV_CHUNK_HEX),
             DecompileOptions {
                 target_stage: DecompileStage::Cfg,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Cfg],
+                    detail: DebugDetail::Normal,
+                    filters: Default::default(),
+                },
                 ..DecompileOptions::default()
             },
         )
-        .expect_err("cfg stage should not be implemented yet");
+        .expect("cfg stage should succeed");
+
+        assert_eq!(result.state.completed_stage, Some(DecompileStage::Cfg));
+        assert!(result.state.cfg.is_some());
+        assert_eq!(result.debug_output.len(), 1);
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("===== Dump CFG ====="));
+        assert!(dump.contains("block listing"));
+        assert!(dump.contains("edge listing"));
+    }
+
+    #[test]
+    fn returns_graph_facts_state_and_dump() {
+        let result = decompile(
+            &crate::support::decode_hex(SETFENV_CHUNK_HEX),
+            DecompileOptions {
+                target_stage: DecompileStage::GraphFacts,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::GraphFacts],
+                    detail: DebugDetail::Normal,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("graph facts stage should succeed");
+
+        assert_eq!(
+            result.state.completed_stage,
+            Some(DecompileStage::GraphFacts)
+        );
+        assert!(result.state.graph_facts.is_some());
+        assert_eq!(result.debug_output.len(), 1);
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("===== Dump GraphFacts ====="));
+        assert!(dump.contains("dominator tree"));
+        assert!(dump.contains("post-dominator tree"));
+        assert!(dump.contains("natural loops"));
+    }
+
+    #[test]
+    fn returns_dataflow_state_and_dump() {
+        let result = decompile(
+            &crate::support::decode_hex(SETFENV_CHUNK_HEX),
+            DecompileOptions {
+                target_stage: DecompileStage::Dataflow,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Dataflow],
+                    detail: DebugDetail::Normal,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("dataflow stage should succeed");
+
+        assert_eq!(result.state.completed_stage, Some(DecompileStage::Dataflow));
+        assert!(result.state.dataflow.is_some());
+        assert_eq!(result.debug_output.len(), 1);
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("===== Dump Dataflow ====="));
+        assert!(dump.contains("instr effects"));
+        assert!(dump.contains("liveness"));
+        assert!(dump.contains("phi candidates"));
+    }
+
+    #[test]
+    fn reports_structure_facts_stage_as_not_implemented_after_dataflow() {
+        let error = decompile(
+            &crate::support::decode_hex(SETFENV_CHUNK_HEX),
+            DecompileOptions {
+                target_stage: DecompileStage::StructureFacts,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect_err("structure facts stage should not be implemented yet");
 
         assert!(matches!(
             error,
             DecompileError::StageNotImplemented {
-                stage: DecompileStage::Cfg,
-                completed_stage: DecompileStage::Transform,
+                stage: DecompileStage::StructureFacts,
+                completed_stage: DecompileStage::Dataflow,
             }
         ));
     }

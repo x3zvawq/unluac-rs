@@ -6,5 +6,8 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "unit/common/mod.rs"]
+mod common;
+
 #[path = "unit/lua51/mod.rs"]
 mod lua51;

@@ -11,13 +11,12 @@ use crate::parser::{
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchInstr, BranchOperands,
     BranchPredicate, CallInstr, CallKind, Capture, CaptureSource, CloseInstr, ClosureInstr,
-    CondOperand, ConcatInstr, ConstRef, DialectCaptureExtra, GenericForCallInstr,
+    ConcatInstr, CondOperand, ConstRef, DialectCaptureExtra, GenericForCallInstr,
     GenericForLoopInstr, GetTableInstr, GetUpvalueInstr, InstrRef, JumpInstr, LoadBoolInstr,
     LoadConstInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr,
-    NewTableInstr, NumericForInitInstr, NumericForLoopInstr, ProtoRef, RawInstrRef, Reg,
-    RegRange, ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr,
-    TailCallInstr, TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand,
-    ValuePack, VarArgInstr,
+    NewTableInstr, NumericForInitInstr, NumericForLoopInstr, ProtoRef, RawInstrRef, Reg, RegRange,
+    ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr,
+    TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
 const BITRK: u16 = 1 << 8;
@@ -612,10 +611,7 @@ impl<'a> ProtoLowerer<'a> {
                     let values = if b == 0 {
                         ValuePack::Open(Reg(usize::from(a) + 1))
                     } else {
-                        ValuePack::Fixed(RegRange::new(
-                            Reg(usize::from(a) + 1),
-                            usize::from(b),
-                        ))
+                        ValuePack::Fixed(RegRange::new(Reg(usize::from(a) + 1), usize::from(b)))
                     };
                     self.emit(
                         Some(raw_index),
@@ -742,7 +738,14 @@ impl<'a> ProtoLowerer<'a> {
         let low_to_raw = self
             .emitted
             .iter()
-            .map(|emitted| emitted.raw_indices.iter().copied().map(RawInstrRef).collect())
+            .map(|emitted| {
+                emitted
+                    .raw_indices
+                    .iter()
+                    .copied()
+                    .map(RawInstrRef)
+                    .collect()
+            })
             .collect::<Vec<Vec<RawInstrRef>>>();
         let pc_map = self
             .emitted
@@ -1016,7 +1019,11 @@ impl<'a> ProtoLowerer<'a> {
             return CallKind::Normal;
         }
 
-        match self.pending_methods.get(callee.index()).and_then(|value| *value) {
+        match self
+            .pending_methods
+            .get(callee.index())
+            .and_then(|value| *value)
+        {
             Some(self_arg) if self_arg == Reg(callee.index() + 1) => CallKind::Method,
             _ => CallKind::Normal,
         }

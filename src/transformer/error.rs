@@ -20,39 +20,53 @@ pub enum TransformError {
     },
     #[error("opcode `{opcode}` at raw pc {raw_pc} must be followed by a helper JMP")]
     MissingHelperJump { raw_pc: u32, opcode: &'static str },
-    #[error("helper instruction after raw pc {raw_pc} must be JMP, found `{found}` at raw pc {helper_pc}")]
+    #[error(
+        "helper instruction after raw pc {raw_pc} must be JMP, found `{found}` at raw pc {helper_pc}"
+    )]
     InvalidHelperJump {
         raw_pc: u32,
         helper_pc: u32,
         found: &'static str,
     },
-    #[error("raw pc {raw_pc} references constant k{const_index}, but only {const_count} constants exist")]
+    #[error(
+        "raw pc {raw_pc} references constant k{const_index}, but only {const_count} constants exist"
+    )]
     InvalidConstRef {
         raw_pc: u32,
         const_index: usize,
         const_count: usize,
     },
-    #[error("raw pc {raw_pc} references upvalue u{upvalue_index}, but only {upvalue_count} upvalues exist")]
+    #[error(
+        "raw pc {raw_pc} references upvalue u{upvalue_index}, but only {upvalue_count} upvalues exist"
+    )]
     InvalidUpvalueRef {
         raw_pc: u32,
         upvalue_index: usize,
         upvalue_count: usize,
     },
-    #[error("raw pc {raw_pc} references child proto p{proto_index}, but only {child_count} children exist")]
+    #[error(
+        "raw pc {raw_pc} references child proto p{proto_index}, but only {child_count} children exist"
+    )]
     InvalidProtoRef {
         raw_pc: u32,
         proto_index: usize,
         child_count: usize,
     },
-    #[error("raw pc {raw_pc} jumps to raw pc {target_raw}, but current proto only has {instr_count} raw instructions")]
+    #[error(
+        "raw pc {raw_pc} jumps to raw pc {target_raw}, but current proto only has {instr_count} raw instructions"
+    )]
     InvalidJumpTarget {
         raw_pc: u32,
         target_raw: usize,
         instr_count: usize,
     },
-    #[error("raw pc {raw_pc} targets raw pc {target_raw}, but that raw instruction does not start a low-IR instruction")]
+    #[error(
+        "raw pc {raw_pc} targets raw pc {target_raw}, but that raw instruction does not start a low-IR instruction"
+    )]
     UntargetableRawInstruction { raw_pc: u32, target_raw: usize },
-    #[error("numeric for at raw pc {raw_pc} must target a matching FORLOOP, but raw pc {target_raw} is `{found}`")]
+    #[error(
+        "numeric for at raw pc {raw_pc} must target a matching FORLOOP, but raw pc {target_raw} is `{found}`"
+    )]
     InvalidNumericForPair {
         raw_pc: u32,
         target_raw: usize,
@@ -60,7 +74,9 @@ pub enum TransformError {
     },
     #[error("closure at raw pc {raw_pc} is missing capture helper #{capture_index}")]
     MissingClosureCapture { raw_pc: u32, capture_index: usize },
-    #[error("closure at raw pc {raw_pc} expects MOVE/GETUPVAL capture helper, found `{found}` at raw pc {capture_pc}")]
+    #[error(
+        "closure at raw pc {raw_pc} expects MOVE/GETUPVAL capture helper, found `{found}` at raw pc {capture_pc}"
+    )]
     InvalidClosureCapture {
         raw_pc: u32,
         capture_pc: u32,

@@ -3,6 +3,7 @@
 //! 当前只真正接上 parser，但入口已经先按完整阶段序列搭好；
 //! 这样后续补层时只需要往这个骨架里填实现，不需要重写调用约定。
 
+use crate::cfg::{analyze_dataflow, analyze_graph_facts, build_cfg_graph};
 use crate::parser::parse_lua51_chunk;
 use crate::transformer::lower_chunk;
 
@@ -74,9 +75,80 @@ impl DecompilerPipeline {
             });
         }
 
+        state.cfg = Some({
+            let lowered = state
+                .lowered
+                .as_ref()
+                .expect("transform stage completed must leave lowered in state");
+            build_cfg_graph(lowered)
+        });
+        state.mark_completed(DecompileStage::Cfg);
+
+        if let Some(output) = collect_stage_dump(&state, DecompileStage::Cfg, &options.debug)? {
+            debug_output.push(output);
+        }
+
+        if options.target_stage == DecompileStage::Cfg {
+            return Ok(DecompileResult {
+                state,
+                debug_output,
+            });
+        }
+
+        state.graph_facts = Some({
+            let cfg_graph = state
+                .cfg
+                .as_ref()
+                .expect("cfg stage completed must leave cfg graph in state");
+            analyze_graph_facts(cfg_graph)
+        });
+        state.mark_completed(DecompileStage::GraphFacts);
+
+        if let Some(output) =
+            collect_stage_dump(&state, DecompileStage::GraphFacts, &options.debug)?
+        {
+            debug_output.push(output);
+        }
+
+        if options.target_stage == DecompileStage::GraphFacts {
+            return Ok(DecompileResult {
+                state,
+                debug_output,
+            });
+        }
+
+        state.dataflow = Some({
+            let lowered = state
+                .lowered
+                .as_ref()
+                .expect("transform stage completed must leave lowered in state");
+            let cfg_graph = state
+                .cfg
+                .as_ref()
+                .expect("cfg stage completed must leave cfg graph in state");
+            let graph_facts = state
+                .graph_facts
+                .as_ref()
+                .expect("graph facts stage completed must leave graph facts in state");
+            analyze_dataflow(lowered, cfg_graph, graph_facts)
+        });
+        state.mark_completed(DecompileStage::Dataflow);
+
+        if let Some(output) = collect_stage_dump(&state, DecompileStage::Dataflow, &options.debug)?
+        {
+            debug_output.push(output);
+        }
+
+        if options.target_stage == DecompileStage::Dataflow {
+            return Ok(DecompileResult {
+                state,
+                debug_output,
+            });
+        }
+
         Err(DecompileError::StageNotImplemented {
-            stage: DecompileStage::Cfg,
-            completed_stage: DecompileStage::Transform,
+            stage: DecompileStage::StructureFacts,
+            completed_stage: DecompileStage::Dataflow,
         })
     }
 }

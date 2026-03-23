@@ -181,14 +181,22 @@ fn dialect_label(version: DialectVersion) -> &'static str {
 fn format_low_instr(instr: &LowInstr) -> String {
     match instr {
         LowInstr::Move(instr) => {
-            format!("move {} <- {}", format_reg(instr.dst), format_reg(instr.src))
+            format!(
+                "move {} <- {}",
+                format_reg(instr.dst),
+                format_reg(instr.src)
+            )
         }
         LowInstr::LoadNil(instr) => format!("load-nil {}", format_reg_range(instr.dst)),
         LowInstr::LoadBool(instr) => {
             format!("load-bool {} <- {}", format_reg(instr.dst), instr.value)
         }
         LowInstr::LoadConst(instr) => {
-            format!("load-const {} <- {}", format_reg(instr.dst), format_const(instr.value))
+            format!(
+                "load-const {} <- {}",
+                format_reg(instr.dst),
+                format_const(instr.value)
+            )
         }
         LowInstr::UnaryOp(instr) => format!(
             "{} {} <- {}",
@@ -408,7 +416,11 @@ fn format_binary_op(op: BinaryOpKind) -> &'static str {
 fn format_branch_cond(cond: BranchCond) -> String {
     let base = match cond.operands {
         BranchOperands::Unary(operand) => {
-            format!("{} {}", format_branch_predicate(cond.predicate), format_cond_operand(operand))
+            format!(
+                "{} {}",
+                format_branch_predicate(cond.predicate),
+                format_cond_operand(operand)
+            )
         }
         BranchOperands::Binary(lhs, rhs) => format!(
             "{} {}, {}",
@@ -460,7 +472,11 @@ fn format_pc_list(pcs: &[u32]) -> String {
     if pcs.is_empty() {
         "-".to_owned()
     } else {
-        let joined = pcs.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+        let joined = pcs
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
         format!("[{joined}]")
     }
 }

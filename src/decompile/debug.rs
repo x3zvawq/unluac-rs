@@ -3,6 +3,7 @@
 //! 各层具体如何渲染自己的 dump，应该尽量贴着实现放置；这里仅保留跨层共用的
 //! 选项、阶段包装和主 pipeline 的分派逻辑，避免再次长成一个巨型总控文件。
 
+use crate::cfg;
 use crate::debug::{DebugDetail, DebugFilters};
 use crate::parser;
 use crate::transformer;
@@ -51,6 +52,50 @@ pub fn dump_lir(
     })
 }
 
+/// 对外保留 CFG 阶段的统一包装，方便库层调用方继续从 decompile 命名空间访问。
+pub fn dump_cfg(
+    graph: &crate::cfg::CfgGraph,
+    options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Ok(StageDebugOutput {
+        stage: DecompileStage::Cfg,
+        detail: options.detail,
+        content: cfg::dump_cfg(graph, options.detail, &options.filters),
+    })
+}
+
+/// 对外保留 GraphFacts 阶段的统一包装。
+pub fn dump_graph_facts(
+    graph_facts: &crate::cfg::GraphFacts,
+    options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Ok(StageDebugOutput {
+        stage: DecompileStage::GraphFacts,
+        detail: options.detail,
+        content: cfg::dump_graph_facts(graph_facts, options.detail, &options.filters),
+    })
+}
+
+/// 对外保留 Dataflow 阶段的统一包装。
+pub fn dump_dataflow(
+    lowered: &crate::transformer::LoweredChunk,
+    cfg_graph: &crate::cfg::CfgGraph,
+    dataflow: &crate::cfg::DataflowFacts,
+    options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Ok(StageDebugOutput {
+        stage: DecompileStage::Dataflow,
+        detail: options.detail,
+        content: cfg::dump_dataflow(
+            lowered,
+            cfg_graph,
+            dataflow,
+            options.detail,
+            &options.filters,
+        ),
+    })
+}
+
 pub(crate) fn collect_stage_dump(
     state: &DecompileState,
     stage: DecompileStage,
@@ -72,6 +117,30 @@ pub(crate) fn collect_stage_dump(
                 return Err(DecompileError::MissingStageOutput { stage });
             };
             dump_lir(chunk, options).map(Some)
+        }
+        DecompileStage::Cfg => {
+            let Some(graph) = state.cfg.as_ref() else {
+                return Err(DecompileError::MissingStageOutput { stage });
+            };
+            dump_cfg(graph, options).map(Some)
+        }
+        DecompileStage::GraphFacts => {
+            let Some(graph_facts) = state.graph_facts.as_ref() else {
+                return Err(DecompileError::MissingStageOutput { stage });
+            };
+            dump_graph_facts(graph_facts, options).map(Some)
+        }
+        DecompileStage::Dataflow => {
+            let Some(lowered) = state.lowered.as_ref() else {
+                return Err(DecompileError::MissingStageOutput { stage });
+            };
+            let Some(cfg_graph) = state.cfg.as_ref() else {
+                return Err(DecompileError::MissingStageOutput { stage });
+            };
+            let Some(dataflow) = state.dataflow.as_ref() else {
+                return Err(DecompileError::MissingStageOutput { stage });
+            };
+            dump_dataflow(lowered, cfg_graph, dataflow, options).map(Some)
         }
         _ => Err(DecompileError::MissingStageOutput { stage }),
     }

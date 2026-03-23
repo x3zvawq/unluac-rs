@@ -3,7 +3,17 @@
         "https://raw.githubusercontent.com/DavidAnson/markdownlint/": true
     },
     "cSpell.words": [
+        "BITRK",
+        "CDPATH",
+        "instrs",
+        "LFIELDS",
         "luac",
-        "unluac"
+        "LUAJIT",
+        "preds",
+        "succs",
+        "unluac",
+        "Upvalue",
+        "upvalues",
+        "vararg"
     ],
 }

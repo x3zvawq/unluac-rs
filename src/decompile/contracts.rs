@@ -1,22 +1,19 @@
-//! 这个文件定义主 pipeline 各层之间的契约占位类型。
+//! 这个文件重导出主 pipeline 各层之间的稳定契约类型。
 //!
-//! 当前只有 parser 真正实现完成，但现在就把后续层的输出位置先定出来，
-//! 可以避免后面补 transformer、cfg 时为了接线再次大幅改 state 结构。
+//! `decompile` 是对外总入口，但真实实现已经分散到 parser、transformer、
+//! cfg 等模块里；这里统一转发，可以让调用方只从一处拿到完整阶段类型。
 
 /// Transformer 层产出的统一 low-IR 根对象。
 pub use crate::transformer::LoweredChunk;
 
-/// CFG 层未来会产出的控制流图根对象。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CfgGraph;
+/// CFG 层产出的控制流图。
+pub use crate::cfg::CfgGraph;
 
-/// 图分析层未来会产出的支配、回边和循环等事实集合。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct GraphFacts;
+/// 图分析层产出的支配、回边和循环等事实集合。
+pub use crate::cfg::GraphFacts;
 
-/// 数据流层未来会产出的 def-use、活跃性和副作用摘要。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DataflowFacts;
+/// 数据流层产出的 def-use、活跃性和副作用摘要。
+pub use crate::cfg::DataflowFacts;
 
 /// 结构恢复前置层未来会产出的结构候选与保留约束。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
