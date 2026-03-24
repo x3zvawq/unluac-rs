@@ -152,9 +152,18 @@ mod analyze_dataflow_shared {
         assert_eq!(
             phi.incoming
                 .iter()
-                .map(|incoming| (incoming.pred.index(), incoming.def.index()))
+                .map(|incoming| {
+                    (
+                        incoming.pred.index(),
+                        incoming
+                            .defs
+                            .iter()
+                            .map(|def| def.index())
+                            .collect::<Vec<_>>(),
+                    )
+                })
                 .collect::<Vec<_>>(),
-            vec![(1, 1), (2, 2)]
+            vec![(1, vec![1]), (2, vec![2])]
         );
 
         let reaching = &dataflow.reaching_defs[5].fixed[&Reg(1)];
@@ -208,6 +217,99 @@ mod analyze_dataflow_shared {
         );
         assert_eq!(dataflow.open_def_uses[0].len(), 1);
         assert_eq!(dataflow.open_def_uses[0][0].instr.index(), 1);
+    }
+
+    #[test]
+    fn keeps_multiple_reaching_defs_per_phi_incoming_edge() {
+        let chunk = chunk_with_instrs(vec![
+            LowInstr::LoadBool(LoadBoolInstr {
+                dst: Reg(0),
+                value: true,
+            }),
+            LowInstr::Branch(BranchInstr {
+                cond: BranchCond {
+                    predicate: BranchPredicate::Truthy,
+                    operands: BranchOperands::Unary(unluac::transformer::CondOperand::Reg(Reg(0))),
+                    negated: false,
+                },
+                then_target: InstrRef(2),
+                else_target: InstrRef(4),
+            }),
+            LowInstr::LoadConst(LoadConstInstr {
+                dst: Reg(1),
+                value: unluac::transformer::ConstRef(0),
+            }),
+            LowInstr::Jump(unluac::transformer::JumpInstr {
+                target: InstrRef(6),
+            }),
+            LowInstr::LoadConst(LoadConstInstr {
+                dst: Reg(1),
+                value: unluac::transformer::ConstRef(1),
+            }),
+            LowInstr::Jump(unluac::transformer::JumpInstr {
+                target: InstrRef(6),
+            }),
+            LowInstr::Branch(BranchInstr {
+                cond: BranchCond {
+                    predicate: BranchPredicate::Truthy,
+                    operands: BranchOperands::Unary(unluac::transformer::CondOperand::Reg(Reg(0))),
+                    negated: false,
+                },
+                then_target: InstrRef(8),
+                else_target: InstrRef(10),
+            }),
+            LowInstr::LoadBool(LoadBoolInstr {
+                dst: Reg(3),
+                value: false,
+            }),
+            LowInstr::LoadConst(LoadConstInstr {
+                dst: Reg(1),
+                value: unluac::transformer::ConstRef(2),
+            }),
+            LowInstr::Jump(unluac::transformer::JumpInstr {
+                target: InstrRef(10),
+            }),
+            LowInstr::Move(MoveInstr {
+                dst: Reg(4),
+                src: Reg(1),
+            }),
+            LowInstr::Return(ReturnInstr {
+                values: ValuePack::Fixed(RegRange::new(Reg(4), 1)),
+            }),
+        ]);
+
+        let cfg = build_cfg_graph(&chunk);
+        let graph_facts = analyze_graph_facts(&cfg);
+        let dataflow = analyze_dataflow(&chunk, &cfg, &graph_facts);
+
+        let phi = dataflow
+            .phi_candidates
+            .iter()
+            .find(|candidate| {
+                candidate.reg == Reg(1)
+                    && candidate
+                        .incoming
+                        .iter()
+                        .any(|incoming| incoming.defs.len() > 1)
+            })
+            .expect("outer merge should produce a phi candidate for r1");
+
+        assert_eq!(
+            phi.incoming
+                .iter()
+                .map(|incoming| {
+                    (
+                        incoming.pred.index(),
+                        incoming
+                            .defs
+                            .iter()
+                            .map(|def| def.index())
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![(3, vec![1, 2]), (5, vec![4])]
+        );
     }
 }
 

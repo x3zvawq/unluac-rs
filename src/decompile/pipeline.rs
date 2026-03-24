@@ -5,6 +5,7 @@
 
 use crate::cfg::{analyze_dataflow, analyze_graph_facts, build_cfg_graph};
 use crate::parser::parse_lua51_chunk;
+use crate::structure::analyze_structure;
 use crate::transformer::lower_chunk;
 
 use super::debug::{StageDebugOutput, collect_stage_dump};
@@ -146,9 +147,43 @@ impl DecompilerPipeline {
             });
         }
 
+        state.structure_facts = Some({
+            let lowered = state
+                .lowered
+                .as_ref()
+                .expect("transform stage completed must leave lowered in state");
+            let cfg_graph = state
+                .cfg
+                .as_ref()
+                .expect("cfg stage completed must leave cfg graph in state");
+            let graph_facts = state
+                .graph_facts
+                .as_ref()
+                .expect("graph facts stage completed must leave graph facts in state");
+            let dataflow = state
+                .dataflow
+                .as_ref()
+                .expect("dataflow stage completed must leave dataflow in state");
+            analyze_structure(lowered, cfg_graph, graph_facts, dataflow)
+        });
+        state.mark_completed(DecompileStage::StructureFacts);
+
+        if let Some(output) =
+            collect_stage_dump(&state, DecompileStage::StructureFacts, &options.debug)?
+        {
+            debug_output.push(output);
+        }
+
+        if options.target_stage == DecompileStage::StructureFacts {
+            return Ok(DecompileResult {
+                state,
+                debug_output,
+            });
+        }
+
         Err(DecompileError::StageNotImplemented {
-            stage: DecompileStage::StructureFacts,
-            completed_stage: DecompileStage::Dataflow,
+            stage: DecompileStage::Hir,
+            completed_stage: DecompileStage::StructureFacts,
         })
     }
 }

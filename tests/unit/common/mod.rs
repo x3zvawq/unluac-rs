@@ -4,3 +4,4 @@
 //! Dataflow 的共享语义，而不是把断言间接绑死到某个 dialect 的 parser 上。
 
 mod cfg_dataflow;
+mod structure;

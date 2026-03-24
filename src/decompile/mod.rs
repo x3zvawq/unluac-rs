@@ -17,7 +17,7 @@ pub use contracts::{
 };
 pub use debug::{
     DebugOptions, StageDebugOutput, dump_cfg, dump_dataflow, dump_graph_facts, dump_lir,
-    dump_parser,
+    dump_parser, dump_structure,
 };
 pub use error::DecompileError;
 pub use options::{DecompileDialect, DecompileOptions};

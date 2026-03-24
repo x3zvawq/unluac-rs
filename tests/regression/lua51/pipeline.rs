@@ -219,21 +219,54 @@ mod decompile_pipeline {
     }
 
     #[test]
-    fn reports_structure_facts_stage_as_not_implemented_after_dataflow() {
-        let error = decompile(
+    fn returns_structure_state_and_dump() {
+        let result = decompile(
             &crate::support::decode_hex(SETFENV_CHUNK_HEX),
             DecompileOptions {
                 target_stage: DecompileStage::StructureFacts,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::StructureFacts],
+                    detail: DebugDetail::Normal,
+                    filters: Default::default(),
+                },
                 ..DecompileOptions::default()
             },
         )
-        .expect_err("structure facts stage should not be implemented yet");
+        .expect("structure stage should succeed");
+
+        assert_eq!(
+            result.state.completed_stage,
+            Some(DecompileStage::StructureFacts)
+        );
+        assert!(result.state.structure_facts.is_some());
+        assert_eq!(result.debug_output.len(), 1);
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("===== Dump Structure ====="));
+        assert!(dump.contains("branch candidates"));
+        assert!(dump.contains("loop candidates"));
+        assert!(dump.contains("short-circuit candidates"));
+        assert!(dump.contains("region facts"));
+        assert!(dump.contains("scope candidates"));
+    }
+
+    #[test]
+    fn reports_hir_stage_as_not_implemented_after_structure() {
+        let error = decompile(
+            &crate::support::decode_hex(SETFENV_CHUNK_HEX),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect_err("hir stage should not be implemented yet");
 
         assert!(matches!(
             error,
             DecompileError::StageNotImplemented {
-                stage: DecompileStage::StructureFacts,
-                completed_stage: DecompileStage::Dataflow,
+                stage: DecompileStage::Hir,
+                completed_stage: DecompileStage::StructureFacts,
             }
         ));
     }

@@ -490,14 +490,14 @@ fn build_phi_candidate(
 
         let defs = block_out
             .get(pred.index())
-            .and_then(|defs_by_reg| defs_by_reg.get(reg.index()))?;
-        if defs.len() != 1 {
+            .and_then(|defs_by_reg| defs_by_reg.get(reg.index()))?
+            .clone();
+        if defs.is_empty() {
             return None;
         }
 
-        let def = *defs.iter().next()?;
-        distinct_defs.insert(def);
-        incoming.push(PhiIncoming { pred, def });
+        distinct_defs.extend(defs.iter().copied());
+        incoming.push(PhiIncoming { pred, defs });
     }
 
     if incoming.len() < 2 || distinct_defs.len() < 2 {

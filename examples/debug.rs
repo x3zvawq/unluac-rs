@@ -20,7 +20,7 @@ const SOURCE: &str = "tests/lua_cases/common/control_flow/07_branch_state_carry.
 const STRING_ENCODING: StringEncoding = StringEncoding::Utf8;
 const STRING_DECODE_MODE: StringDecodeMode = StringDecodeMode::Strict;
 const PARSE_MODE: ParseMode = ParseMode::Strict;
-const TARGET_STAGE: DecompileStage = DecompileStage::Dataflow;
+const TARGET_STAGE: DecompileStage = DecompileStage::Cfg;
 const DEBUG_DETAIL: DebugDetail = DebugDetail::Normal;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

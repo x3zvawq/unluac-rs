@@ -15,9 +15,8 @@ pub use crate::cfg::GraphFacts;
 /// 数据流层产出的 def-use、活跃性和副作用摘要。
 pub use crate::cfg::DataflowFacts;
 
-/// 结构恢复前置层未来会产出的结构候选与保留约束。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct StructureFacts;
+/// 结构恢复前置层产出的结构候选与保留约束。
+pub use crate::structure::StructureFacts;
 
 /// HIR 层未来会产出的结构化语义树。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

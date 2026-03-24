@@ -6,6 +6,7 @@
 use crate::cfg;
 use crate::debug::{DebugDetail, DebugFilters};
 use crate::parser;
+use crate::structure;
 use crate::transformer;
 
 use super::error::DecompileError;
@@ -96,6 +97,18 @@ pub fn dump_dataflow(
     })
 }
 
+/// 对外保留 StructureFacts 阶段的统一包装。
+pub fn dump_structure(
+    structure_facts: &crate::structure::StructureFacts,
+    options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Ok(StageDebugOutput {
+        stage: DecompileStage::StructureFacts,
+        detail: options.detail,
+        content: structure::dump_structure(structure_facts, options.detail, &options.filters),
+    })
+}
+
 pub(crate) fn collect_stage_dump(
     state: &DecompileState,
     stage: DecompileStage,
@@ -141,6 +154,12 @@ pub(crate) fn collect_stage_dump(
                 return Err(DecompileError::MissingStageOutput { stage });
             };
             dump_dataflow(lowered, cfg_graph, dataflow, options).map(Some)
+        }
+        DecompileStage::StructureFacts => {
+            let Some(structure_facts) = state.structure_facts.as_ref() else {
+                return Err(DecompileError::MissingStageOutput { stage });
+            };
+            dump_structure(structure_facts, options).map(Some)
         }
         _ => Err(DecompileError::MissingStageOutput { stage }),
     }

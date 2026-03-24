@@ -284,10 +284,10 @@ pub struct PhiCandidate {
 }
 
 /// 一个 predecessor 边给 phi 提供的候选版本。
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct PhiIncoming {
     pub pred: BlockRef,
-    pub def: DefId,
+    pub defs: BTreeSet<DefId>,
 }
 
 impl Cfg {
