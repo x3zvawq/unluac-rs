@@ -5,6 +5,7 @@
 
 use crate::cfg;
 use crate::debug::{DebugDetail, DebugFilters};
+use crate::hir;
 use crate::parser;
 use crate::structure;
 use crate::transformer;
@@ -109,6 +110,18 @@ pub fn dump_structure(
     })
 }
 
+/// 对外保留 HIR 阶段的统一包装。
+pub fn dump_hir(
+    hir_module: &crate::hir::HirModule,
+    options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Ok(StageDebugOutput {
+        stage: DecompileStage::Hir,
+        detail: options.detail,
+        content: hir::dump_hir(hir_module, options.detail, &options.filters),
+    })
+}
+
 pub(crate) fn collect_stage_dump(
     state: &DecompileState,
     stage: DecompileStage,
@@ -160,6 +173,12 @@ pub(crate) fn collect_stage_dump(
                 return Err(DecompileError::MissingStageOutput { stage });
             };
             dump_structure(structure_facts, options).map(Some)
+        }
+        DecompileStage::Hir => {
+            let Some(hir_module) = state.hir.as_ref() else {
+                return Err(DecompileError::MissingStageOutput { stage });
+            };
+            dump_hir(hir_module, options).map(Some)
         }
         _ => Err(DecompileError::MissingStageOutput { stage }),
     }

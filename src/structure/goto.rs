@@ -4,7 +4,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::cfg::Cfg;
+use crate::cfg::{Cfg, EdgeKind};
 
 use super::branches::collect_branch_region_blocks;
 use super::common::{BranchCandidate, GotoReason, GotoRequirement, LoopCandidate};
@@ -39,8 +39,13 @@ pub(super) fn analyze_goto_requirements(
             for block in &loop_candidate.blocks {
                 for edge_ref in &cfg.succs[block.index()] {
                     let edge = cfg.edges[edge_ref.index()];
+                    // 顺着线性 body tail 自然落到 continue target 的边，本质上还是
+                    // 当前循环的正常执行路径，不应该被提前标成 continue-like requirement。
+                    // 这里保留的只应该是“主动提前跳到 continue target”的控制边，
+                    // 这样 HIR 才能区分自然 fallthrough 和真正的 continue 语义。
                     if edge.to == continue_target
                         && !loop_candidate.backedges.contains(edge_ref)
+                        && edge.kind != EdgeKind::Fallthrough
                         && cfg.reachable_blocks.contains(&edge.from)
                     {
                         requirements.insert(GotoRequirement {

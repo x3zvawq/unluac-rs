@@ -7,7 +7,7 @@ use crate::cfg::{Cfg, CfgGraph, DataflowFacts, GraphFacts};
 use crate::transformer::{LoweredChunk, LoweredProto};
 
 use super::common::StructureFacts;
-use super::{branches, goto, helpers, loops, regions, scope, short_circuit};
+use super::{branch_values, branches, goto, helpers, loops, regions, scope, short_circuit};
 
 /// 对整个 lowered chunk 递归提取结构候选。
 pub fn analyze_structure(
@@ -55,6 +55,13 @@ fn analyze_proto_structure(
         dataflow,
         &branch_candidates,
     );
+    let branch_value_merge_candidates = branch_values::analyze_branch_value_merges(
+        cfg,
+        graph_facts,
+        dataflow,
+        &branch_candidates,
+        &short_circuit_candidates,
+    );
     let scope_candidates = scope::analyze_scopes(
         proto,
         cfg,
@@ -84,6 +91,7 @@ fn analyze_proto_structure(
 
     StructureFacts {
         branch_candidates,
+        branch_value_merge_candidates,
         loop_candidates,
         short_circuit_candidates,
         goto_requirements,

@@ -9,8 +9,9 @@ use std::fmt::Write as _;
 use crate::debug::{DebugDetail, DebugFilters};
 
 use super::common::{
-    BranchCandidate, GotoRequirement, LoopCandidate, RegionFact, ScopeCandidate,
-    ShortCircuitCandidate, StructureFacts,
+    BranchCandidate, BranchValueMergeCandidate, GotoRequirement, LoopCandidate, RegionFact,
+    ScopeCandidate, ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNode, ShortCircuitTarget,
+    StructureFacts,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -50,9 +51,10 @@ pub fn dump_structure(
         let indent = "  ".repeat(entry.depth);
         let _ = writeln!(
             output,
-            "{indent}proto#{} branches={} loops={} short-circuits={} gotos={} regions={} scopes={}",
+            "{indent}proto#{} branches={} branch-values={} loops={} short-circuits={} gotos={} regions={} scopes={}",
             entry.id,
             entry.facts.branch_candidates.len(),
+            entry.facts.branch_value_merge_candidates.len(),
             entry.facts.loop_candidates.len(),
             entry.facts.short_circuit_candidates.len(),
             entry.facts.goto_requirements.len(),
@@ -66,6 +68,13 @@ pub fn dump_structure(
 
         let _ = writeln!(output, "{indent}  branch candidates");
         write_branches(&mut output, &indent, &entry.facts.branch_candidates);
+
+        let _ = writeln!(output, "{indent}  branch value merges");
+        write_branch_value_merges(
+            &mut output,
+            &indent,
+            &entry.facts.branch_value_merge_candidates,
+        );
 
         let _ = writeln!(output, "{indent}  loop candidates");
         write_loops(&mut output, &indent, &entry.facts.loop_candidates);
@@ -153,6 +162,37 @@ fn write_loops(output: &mut String, indent: &str, candidates: &[LoopCandidate]) 
     }
 }
 
+fn write_branch_value_merges(
+    output: &mut String,
+    indent: &str,
+    candidates: &[BranchValueMergeCandidate],
+) {
+    if candidates.is_empty() {
+        let _ = writeln!(output, "{indent}    <none>");
+        return;
+    }
+
+    for candidate in candidates {
+        let _ = writeln!(
+            output,
+            "{indent}    header=#{} merge=#{} values={}",
+            candidate.header.index(),
+            candidate.merge.index(),
+            candidate.values.len(),
+        );
+        for value in &candidate.values {
+            let _ = writeln!(
+                output,
+                "{indent}      phi=p{} reg={} then-preds={} else-preds={}",
+                value.phi_id.index(),
+                format_reg(value.reg),
+                format_block_set(&value.then_preds),
+                format_block_set(&value.else_preds),
+            );
+        }
+    }
+}
+
 fn write_short_circuits(output: &mut String, indent: &str, candidates: &[ShortCircuitCandidate]) {
     if candidates.is_empty() {
         let _ = writeln!(output, "{indent}    <none>");
@@ -162,10 +202,11 @@ fn write_short_circuits(output: &mut String, indent: &str, candidates: &[ShortCi
     for candidate in candidates {
         let _ = writeln!(
             output,
-            "{indent}    header=#{} kind={} merge=#{} result={} reducible={} blocks={}",
+            "{indent}    header=#{} entry=n{} nodes={} exit={} result={} reducible={} blocks={}",
             candidate.header.index(),
-            format_short_circuit_kind(candidate.kind_hint),
-            candidate.merge.index(),
+            candidate.entry.index(),
+            candidate.nodes.len(),
+            format_short_circuit_exit(&candidate.exit),
             candidate
                 .result_reg
                 .map(format_reg)
@@ -173,6 +214,46 @@ fn write_short_circuits(output: &mut String, indent: &str, candidates: &[ShortCi
             candidate.reducible,
             format_block_set(&candidate.blocks),
         );
+        write_short_circuit_nodes(output, indent, &candidate.nodes);
+    }
+}
+
+fn write_short_circuit_nodes(output: &mut String, indent: &str, nodes: &[ShortCircuitNode]) {
+    if nodes.is_empty() {
+        return;
+    }
+
+    for node in nodes {
+        let _ = writeln!(
+            output,
+            "{indent}      node n{} header=#{} truthy={} falsy={}",
+            node.id.index(),
+            node.header.index(),
+            format_short_circuit_target(&node.truthy),
+            format_short_circuit_target(&node.falsy),
+        );
+    }
+}
+
+fn format_short_circuit_exit(exit: &ShortCircuitExit) -> String {
+    match exit {
+        ShortCircuitExit::ValueMerge(block) => format!("value-merge=#{}", block.index()),
+        ShortCircuitExit::BranchExit { truthy, falsy } => {
+            format!(
+                "branch(truthy=#{} falsy=#{})",
+                truthy.index(),
+                falsy.index()
+            )
+        }
+    }
+}
+
+fn format_short_circuit_target(target: &ShortCircuitTarget) -> String {
+    match target {
+        ShortCircuitTarget::Node(node_ref) => format!("n{}", node_ref.index()),
+        ShortCircuitTarget::Value(block) => format!("value=#{}", block.index()),
+        ShortCircuitTarget::TruthyExit => "truthy-exit".to_owned(),
+        ShortCircuitTarget::FalsyExit => "falsy-exit".to_owned(),
     }
 }
 
@@ -301,14 +382,6 @@ fn format_loop_kind(kind: super::common::LoopKindHint) -> &'static str {
         super::common::LoopKindHint::NumericForLike => "numeric-for-like",
         super::common::LoopKindHint::GenericForLike => "generic-for-like",
         super::common::LoopKindHint::Unknown => "unknown",
-    }
-}
-
-fn format_short_circuit_kind(kind: super::common::ShortCircuitKindHint) -> &'static str {
-    match kind {
-        super::common::ShortCircuitKindHint::AndLike => "and-like",
-        super::common::ShortCircuitKindHint::OrLike => "or-like",
-        super::common::ShortCircuitKindHint::Unknown => "unknown",
     }
 }
 

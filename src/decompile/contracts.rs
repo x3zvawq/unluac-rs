@@ -18,9 +18,8 @@ pub use crate::cfg::DataflowFacts;
 /// 结构恢复前置层产出的结构候选与保留约束。
 pub use crate::structure::StructureFacts;
 
-/// HIR 层未来会产出的结构化语义树。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct HirChunk;
+/// HIR 层产出的结构化语义树。
+pub use crate::hir::HirModule as HirChunk;
 
 /// AST 层未来会产出的语法树。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

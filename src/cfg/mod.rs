@@ -13,8 +13,9 @@ pub use build::build_cfg_graph;
 pub use common::{
     BasicBlock, BlockKind, BlockRef, Cfg, CfgEdge, CfgGraph, DataflowFacts, Def, DefId,
     DominatorTree, EdgeKind, EdgeRef, EffectTag, GraphFacts, InstrEffect, InstrRange,
-    InstrReachingDefs, InstrUseDefs, NaturalLoop, OpenDef, OpenDefId, OpenUseSite, PhiCandidate,
-    PhiIncoming, PostDominatorTree, SideEffectSummary, UseSite,
+    InstrReachingDefs, InstrReachingValues, InstrUseDefs, InstrUseValues, NaturalLoop, OpenDef,
+    OpenDefId, OpenUseSite, PhiCandidate, PhiId, PhiIncoming, PostDominatorTree, SideEffectSummary,
+    SsaValue, UseSite,
 };
 pub use dataflow::analyze_dataflow;
 pub use debug::{dump_cfg, dump_dataflow, dump_graph_facts};

@@ -16,7 +16,7 @@ pub use contracts::{
     NamingResult, ReadabilityResult, StructureFacts,
 };
 pub use debug::{
-    DebugOptions, StageDebugOutput, dump_cfg, dump_dataflow, dump_graph_facts, dump_lir,
+    DebugOptions, StageDebugOutput, dump_cfg, dump_dataflow, dump_graph_facts, dump_hir, dump_lir,
     dump_parser, dump_structure,
 };
 pub use error::DecompileError;

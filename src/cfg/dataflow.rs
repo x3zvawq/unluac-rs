@@ -12,11 +12,12 @@ use crate::transformer::{
 
 use super::common::{
     BlockRef, Cfg, CfgGraph, DataflowFacts, Def, DefId, EffectTag, GraphFacts, InstrEffect,
-    InstrReachingDefs, InstrUseDefs, OpenDef, OpenDefId, OpenUseSite, PhiCandidate, PhiIncoming,
-    SideEffectSummary, UseSite,
+    InstrReachingDefs, InstrReachingValues, InstrUseDefs, InstrUseValues, OpenDef, OpenDefId,
+    OpenUseSite, PhiCandidate, PhiId, PhiIncoming, SideEffectSummary, SsaValue, UseSite,
 };
 
 type FixedState = Vec<BTreeSet<DefId>>;
+type ValueState = Vec<BTreeSet<SsaValue>>;
 
 struct DefLookupTables {
     fixed: Vec<BTreeMap<Reg, DefId>>,
@@ -33,11 +34,23 @@ struct BlockReachingState {
 
 struct InstructionFacts {
     reaching_defs: Vec<InstrReachingDefs>,
+    reaching_values: Vec<InstrReachingValues>,
     use_defs: Vec<InstrUseDefs>,
+    use_values: Vec<InstrUseValues>,
     def_uses: Vec<Vec<UseSite>>,
     open_reaching_defs: Vec<BTreeSet<OpenDefId>>,
     open_use_defs: Vec<BTreeSet<OpenDefId>>,
     open_def_uses: Vec<Vec<OpenUseSite>>,
+}
+
+struct BlockValueState {
+    fixed_in: Vec<ValueState>,
+    fixed_out: Vec<ValueState>,
+}
+
+struct ValueMaterializeCtx<'a> {
+    lookups: &'a DefLookupTables,
+    open_defs: &'a [OpenDef],
 }
 
 struct BlockLiveness {
@@ -146,7 +159,9 @@ fn analyze_proto_dataflow(
 
     let mut instruction_facts = InstructionFacts {
         reaching_defs: vec![InstrReachingDefs::default(); proto.instrs.len()],
+        reaching_values: vec![InstrReachingValues::default(); proto.instrs.len()],
         use_defs: vec![InstrUseDefs::default(); proto.instrs.len()],
+        use_values: vec![InstrUseValues::default(); proto.instrs.len()],
         def_uses: vec![Vec::new(); defs.len()],
         open_reaching_defs: vec![BTreeSet::new(); proto.instrs.len()],
         open_use_defs: vec![BTreeSet::new(); proto.instrs.len()],
@@ -157,11 +172,12 @@ fn analyze_proto_dataflow(
         cfg,
         &instr_effects,
         &lookups,
+        &open_defs,
         &block_state,
         &mut instruction_facts,
     );
 
-    let liveness = solve_liveness(cfg, graph_facts, &instr_effects);
+    let liveness = solve_liveness(cfg, graph_facts, &instr_effects, &instruction_facts);
 
     let phi_candidates = compute_phi_candidates(
         cfg,
@@ -170,6 +186,19 @@ fn analyze_proto_dataflow(
         &liveness.live_in,
         &block_state.fixed_out,
         &lookups.fixed,
+    );
+
+    materialize_value_facts(
+        cfg,
+        graph_facts,
+        &instr_effects,
+        ValueMaterializeCtx {
+            lookups: &lookups,
+            open_defs: &open_defs,
+        },
+        reg_count,
+        &phi_candidates,
+        &mut instruction_facts,
     );
 
     let children = proto
@@ -195,7 +224,9 @@ fn analyze_proto_dataflow(
         reg_versions,
         instr_defs,
         reaching_defs: instruction_facts.reaching_defs,
+        reaching_values: instruction_facts.reaching_values,
         use_defs: instruction_facts.use_defs,
+        use_values: instruction_facts.use_values,
         def_uses: instruction_facts.def_uses,
         open_reaching_defs: instruction_facts.open_reaching_defs,
         open_use_defs: instruction_facts.open_use_defs,
@@ -266,6 +297,7 @@ fn materialize_instruction_facts(
     cfg: &Cfg,
     instr_effects: &[InstrEffect],
     lookups: &DefLookupTables,
+    open_defs: &[OpenDef],
     block_state: &BlockReachingState,
     instruction_facts: &mut InstructionFacts,
 ) {
@@ -282,8 +314,9 @@ fn materialize_instruction_facts(
             instruction_facts.reaching_defs[instr_index] = snapshot_fixed_state(&current_fixed);
             instruction_facts.open_reaching_defs[instr_index] = current_open.clone();
 
+            let fixed_use_regs = resolved_fixed_use_regs(effect, &current_open, open_defs);
             let mut fixed_use_defs = BTreeMap::new();
-            for reg in &effect.fixed_uses {
+            for reg in &fixed_use_regs {
                 let defs = current_fixed.get(reg.index()).cloned().unwrap_or_default();
                 for def in &defs {
                     instruction_facts.def_uses[def.index()].push(UseSite {
@@ -325,6 +358,7 @@ fn solve_liveness(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     instr_effects: &[InstrEffect],
+    instruction_facts: &InstructionFacts,
 ) -> BlockLiveness {
     let mut block_uses = vec![BTreeSet::new(); cfg.blocks.len()];
     let mut block_defs = vec![BTreeSet::new(); cfg.blocks.len()];
@@ -342,7 +376,7 @@ fn solve_liveness(
         for instr_index in instr_indices {
             let effect = &instr_effects[instr_index];
 
-            for reg in &effect.fixed_uses {
+            for reg in instruction_facts.use_defs[instr_index].fixed.keys() {
                 if !seen_defs.contains(reg) {
                     block_uses[block.index()].insert(*reg);
                 }
@@ -470,6 +504,9 @@ fn compute_phi_candidates(
     }
 
     phi_candidates.sort_by_key(|candidate| (candidate.block, candidate.reg));
+    for (index, candidate) in phi_candidates.iter_mut().enumerate() {
+        candidate.id = PhiId(index);
+    }
     phi_candidates
 }
 
@@ -506,10 +543,228 @@ fn build_phi_candidate(
 
     incoming.sort_by_key(|incoming| incoming.pred);
     Some(PhiCandidate {
+        id: PhiId(0),
         block,
         reg,
         incoming,
     })
+}
+
+fn materialize_value_facts(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    instr_effects: &[InstrEffect],
+    ctx: ValueMaterializeCtx<'_>,
+    reg_count: usize,
+    phi_candidates: &[PhiCandidate],
+    instruction_facts: &mut InstructionFacts,
+) {
+    let phi_by_block = index_phi_candidates_by_block(cfg, phi_candidates);
+    let mut block_state = BlockValueState {
+        fixed_in: vec![vec![BTreeSet::new(); reg_count]; cfg.blocks.len()],
+        fixed_out: vec![vec![BTreeSet::new(); reg_count]; cfg.blocks.len()],
+    };
+
+    solve_reaching_values(
+        cfg,
+        graph_facts,
+        instr_effects,
+        ctx.lookups,
+        phi_candidates,
+        &phi_by_block,
+        &mut block_state,
+    );
+
+    for block in cfg.block_order.iter().copied() {
+        let Some(instr_indices) = instr_indices(cfg, block) else {
+            continue;
+        };
+
+        let mut current_fixed = block_state.fixed_in[block.index()].clone();
+
+        for instr_index in instr_indices {
+            let effect = &instr_effects[instr_index];
+            instruction_facts.reaching_values[instr_index] = snapshot_value_state(&current_fixed);
+
+            let fixed_use_regs = resolved_fixed_use_regs(
+                effect,
+                &instruction_facts.open_reaching_defs[instr_index],
+                ctx.open_defs,
+            );
+            let mut fixed_use_values = BTreeMap::new();
+            for reg in &fixed_use_regs {
+                fixed_use_values.insert(
+                    *reg,
+                    current_fixed.get(reg.index()).cloned().unwrap_or_default(),
+                );
+            }
+            instruction_facts.use_values[instr_index] = InstrUseValues {
+                fixed: fixed_use_values,
+            };
+
+            apply_value_transfer(effect, &ctx.lookups.fixed[instr_index], &mut current_fixed);
+        }
+    }
+}
+
+/// `Open(start)` 表示“从 start 到当前 top 的连续值包”，而不是单个开放尾值。
+///
+/// 因此如果当前 reaching 的 open def 实际从更晚寄存器开始，那么 `start..tail_start-1`
+/// 这一段仍然是被这条指令真实读取的固定寄存器前缀，必须进入 use/liveness。
+fn resolved_fixed_use_regs(
+    effect: &InstrEffect,
+    current_open: &BTreeSet<OpenDefId>,
+    open_defs: &[OpenDef],
+) -> BTreeSet<Reg> {
+    let mut regs = effect.fixed_uses.clone();
+
+    let Some(start_reg) = effect.open_use else {
+        return regs;
+    };
+
+    if current_open.len() != 1 {
+        return regs;
+    }
+
+    let open_def_id = current_open
+        .iter()
+        .next()
+        .expect("len checked above, exactly one reaching open def exists");
+    let Some(open_def) = open_defs.get(open_def_id.index()) else {
+        return regs;
+    };
+    if open_def.start_reg.index() <= start_reg.index() {
+        return regs;
+    }
+
+    for index in start_reg.index()..open_def.start_reg.index() {
+        regs.insert(Reg(index));
+    }
+
+    regs
+}
+
+fn solve_reaching_values(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    instr_effects: &[InstrEffect],
+    lookups: &DefLookupTables,
+    phi_candidates: &[PhiCandidate],
+    phi_by_block: &[Vec<PhiId>],
+    block_state: &mut BlockValueState,
+) {
+    let mut changed = true;
+    while changed {
+        changed = false;
+
+        for block in &graph_facts.rpo {
+            let block = *block;
+            let mut new_in = merge_predecessor_value_state(cfg, block, &block_state.fixed_out);
+            // phi 代表“进入这个 block 之后立刻可见的合流值”，因此它必须覆盖掉
+            // predecessor 合并出来的底层 def 集，否则后续 use 仍然会看到多定义。
+            apply_block_phi_values(&mut new_in, phi_candidates, &phi_by_block[block.index()]);
+
+            if block_state.fixed_in[block.index()] != new_in {
+                block_state.fixed_in[block.index()] = new_in.clone();
+                changed = true;
+            }
+
+            let mut current_fixed = new_in;
+            if let Some(instr_indices) = instr_indices(cfg, block) {
+                for instr_index in instr_indices {
+                    apply_value_transfer(
+                        &instr_effects[instr_index],
+                        &lookups.fixed[instr_index],
+                        &mut current_fixed,
+                    );
+                }
+            }
+
+            if block_state.fixed_out[block.index()] != current_fixed {
+                block_state.fixed_out[block.index()] = current_fixed;
+                changed = true;
+            }
+        }
+    }
+}
+
+fn index_phi_candidates_by_block(cfg: &Cfg, phi_candidates: &[PhiCandidate]) -> Vec<Vec<PhiId>> {
+    let mut phi_by_block = vec![Vec::new(); cfg.blocks.len()];
+    for phi in phi_candidates {
+        phi_by_block[phi.block.index()].push(phi.id);
+    }
+    phi_by_block
+}
+
+fn merge_predecessor_value_state(
+    cfg: &Cfg,
+    block: BlockRef,
+    block_out: &[ValueState],
+) -> ValueState {
+    let reg_count = block_out.first().map_or(0, Vec::len);
+    let mut merged_fixed = vec![BTreeSet::new(); reg_count];
+
+    for edge_ref in &cfg.preds[block.index()] {
+        let pred = cfg.edges[edge_ref.index()].from;
+        if !cfg.reachable_blocks.contains(&pred) {
+            continue;
+        }
+
+        for (reg_values, pred_values) in merged_fixed.iter_mut().zip(&block_out[pred.index()]) {
+            reg_values.extend(pred_values.iter().copied());
+        }
+    }
+
+    merged_fixed
+}
+
+fn apply_block_phi_values(
+    state: &mut [BTreeSet<SsaValue>],
+    phi_candidates: &[PhiCandidate],
+    phi_ids: &[PhiId],
+) {
+    for phi_id in phi_ids {
+        let phi = &phi_candidates[phi_id.index()];
+        state[phi.reg.index()] = BTreeSet::from([SsaValue::Phi(*phi_id)]);
+    }
+}
+
+fn apply_value_transfer(
+    effect: &InstrEffect,
+    fixed_def_lookup: &BTreeMap<Reg, DefId>,
+    fixed_state: &mut [BTreeSet<SsaValue>],
+) {
+    for reg in &effect.fixed_must_defs {
+        let def = fixed_def_lookup
+            .get(reg)
+            .copied()
+            .expect("must-def register should already have a concrete DefId");
+        fixed_state[reg.index()] = BTreeSet::from([SsaValue::Def(def)]);
+    }
+
+    for reg in &effect.fixed_may_defs {
+        let def = fixed_def_lookup
+            .get(reg)
+            .copied()
+            .expect("may-def register should already have a concrete DefId");
+        fixed_state[reg.index()].insert(SsaValue::Def(def));
+    }
+}
+
+fn snapshot_value_state(state: &[BTreeSet<SsaValue>]) -> InstrReachingValues {
+    let fixed = state
+        .iter()
+        .enumerate()
+        .filter_map(|(index, values)| {
+            if values.is_empty() {
+                None
+            } else {
+                Some((Reg(index), values.clone()))
+            }
+        })
+        .collect();
+
+    InstrReachingValues { fixed }
 }
 
 fn block_defines_reg(
@@ -729,7 +984,10 @@ fn compute_instr_effect(instr: &LowInstr) -> InstrEffect {
             );
         }
         LowInstr::GenericForLoop(instr) => {
-            insert_reg_range_uses(&mut effect.fixed_uses, instr.control);
+            effect.fixed_uses.insert(instr.control);
+            if instr.bindings.len != 0 {
+                effect.fixed_uses.insert(instr.bindings.start);
+            }
         }
         LowInstr::Jump(_instr) => {}
         LowInstr::Branch(instr) => match instr.cond.operands {

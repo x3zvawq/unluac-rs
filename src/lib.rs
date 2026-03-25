@@ -8,6 +8,7 @@
 pub mod cfg;
 pub mod debug;
 pub mod decompile;
+pub mod hir;
 pub mod parser;
 pub mod structure;
 pub mod transformer;

@@ -390,6 +390,7 @@ pub struct NumericForInitInstr {
     pub index: Reg,
     pub limit: Reg,
     pub step: Reg,
+    pub binding: Reg,
     pub body_target: InstrRef,
     pub exit_target: InstrRef,
 }
@@ -399,6 +400,7 @@ pub struct NumericForLoopInstr {
     pub index: Reg,
     pub limit: Reg,
     pub step: Reg,
+    pub binding: Reg,
     pub body_target: InstrRef,
     pub exit_target: InstrRef,
 }
@@ -411,7 +413,8 @@ pub struct GenericForCallInstr {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct GenericForLoopInstr {
-    pub control: RegRange,
+    pub control: Reg,
+    pub bindings: RegRange,
     pub body_target: InstrRef,
     pub exit_target: InstrRef,
 }

@@ -117,7 +117,14 @@ fn classify_if_else_branch(
         else_entry,
     )?;
     if merge == cfg.exit_block {
-        return None;
+        return Some(BranchCandidate {
+            header,
+            then_entry,
+            else_entry: Some(else_entry),
+            merge: None,
+            kind: BranchKind::IfElse,
+            invert_hint: false,
+        });
     }
 
     if merge == then_entry {

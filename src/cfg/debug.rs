@@ -9,7 +9,9 @@ use std::fmt::Write as _;
 use crate::debug::{DebugDetail, DebugFilters};
 use crate::transformer::{LowInstr, LoweredChunk, LoweredProto, Reg};
 
-use super::common::{BlockRef, CfgGraph, DataflowFacts, DefId, EffectTag, GraphFacts, OpenDefId};
+use super::common::{
+    BlockRef, CfgGraph, DataflowFacts, DefId, EffectTag, GraphFacts, OpenDefId, SsaValue,
+};
 
 #[derive(Debug, Clone, Copy)]
 struct ProtoEntry<'a, T> {
@@ -302,6 +304,15 @@ pub fn dump_dataflow(
                     format_open_def_set(&entry.facts.open_reaching_defs[instr_index]),
                 );
             }
+
+            let _ = writeln!(output, "{indent}  reaching values");
+            for (instr_index, values) in entry.facts.reaching_values.iter().enumerate() {
+                let _ = writeln!(
+                    output,
+                    "{indent}    @{instr_index:03} fixed={}",
+                    format_reaching_values(&values.fixed),
+                );
+            }
         }
     }
 
@@ -479,6 +490,36 @@ fn format_def_set(defs: &BTreeSet<DefId>) -> String {
             "[{}]",
             defs.iter()
                 .map(|def| format!("def{}", def.index()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+fn format_reaching_values(values: &BTreeMap<Reg, BTreeSet<SsaValue>>) -> String {
+    if values.is_empty() {
+        "[-]".to_owned()
+    } else {
+        values
+            .iter()
+            .map(|(reg, values)| format!("{}<-{}", format_reg(*reg), format_value_set(values)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+fn format_value_set(values: &BTreeSet<SsaValue>) -> String {
+    if values.is_empty() {
+        "[-]".to_owned()
+    } else {
+        format!(
+            "[{}]",
+            values
+                .iter()
+                .map(|value| match value {
+                    SsaValue::Def(def) => format!("def{}", def.index()),
+                    SsaValue::Phi(phi) => format!("phi{}", phi.index()),
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         )

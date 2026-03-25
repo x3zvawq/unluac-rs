@@ -4,6 +4,7 @@
 //! 但仍然刻意停在“候选/约束”层，不替 HIR 过早做最终语法决定。
 
 mod analyze;
+mod branch_values;
 mod branches;
 mod common;
 mod debug;
@@ -16,8 +17,9 @@ mod short_circuit;
 
 pub use analyze::analyze_structure;
 pub use common::{
-    BranchCandidate, BranchKind, GotoReason, GotoRequirement, LoopCandidate, LoopKindHint,
-    RegionFact, RegionKind, ScopeCandidate, ScopeKind, ShortCircuitCandidate, ShortCircuitKindHint,
-    StructureFacts,
+    BranchCandidate, BranchKind, BranchValueMergeCandidate, BranchValueMergeValue, GotoReason,
+    GotoRequirement, LoopCandidate, LoopKindHint, RegionFact, RegionKind, ScopeCandidate,
+    ScopeKind, ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNode, ShortCircuitNodeRef,
+    ShortCircuitTarget, StructureFacts,
 };
 pub use debug::dump_structure;

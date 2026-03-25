@@ -67,29 +67,56 @@ fn infer_loop_shape(
             .iter()
             .next()
             .expect("set length already checked");
-        if let Some(terminator) = cfg.terminator(&proto.instrs, source) {
-            match terminator {
-                LowInstr::NumericForLoop(_instr) => {
-                    return (LoopKindHint::NumericForLike, Some(source));
-                }
-                LowInstr::GenericForLoop(_instr) => {
-                    return (LoopKindHint::GenericForLike, Some(source));
-                }
-                LowInstr::Branch(_instr)
-                    if branch_has_header_and_exit(cfg, source, header, blocks) =>
-                {
-                    return (LoopKindHint::RepeatLike, Some(source));
-                }
-                _ => {}
-            }
+        if let Some(terminator) = cfg.terminator(&proto.instrs, source)
+            && matches!(terminator, LowInstr::NumericForLoop(_instr))
+        {
+            return (LoopKindHint::NumericForLike, Some(source));
         }
     }
 
+    // generic-for 的 header 本身就携带了比普通回边更强的形状证据。
+    // 如果这里先按“回边源是 branch”去判断，很容易把正常的 generic-for
+    // 误认成 repeat-like，后面 HIR 就只能回到 unresolved 的 VM 级控制块。
     if matches!(
         cfg.terminator(&proto.instrs, header),
-        Some(LowInstr::Branch(_instr)) if branch_has_loop_body_and_exit(cfg, header, blocks)
+        Some(LowInstr::GenericForLoop(instr))
+            if generic_for_has_loop_body_and_exit(proto, cfg, header, instr, blocks)
     ) {
+        return (LoopKindHint::GenericForLike, Some(header));
+    }
+
+    // `while` 的 header 本质上是“纯条件入口”。如果 header 自己已经带了主体语句，
+    // 这时更像 `repeat`/混合 loop，不应该在 facts 层过早绑定成 while，否则 HIR
+    // 会把 header 前缀静悄悄丢掉。
+    if block_is_pure_branch(proto, cfg, header)
+        && branch_has_loop_body_and_exit(cfg, header, blocks)
+    {
         return (LoopKindHint::WhileLike, Some(header));
+    }
+
+    if backedge_sources.len() == 1 {
+        let source = *backedge_sources
+            .iter()
+            .next()
+            .expect("set length already checked");
+        if matches!(
+            cfg.terminator(&proto.instrs, source),
+            Some(LowInstr::Branch(_instr)) if branch_has_header_and_exit(cfg, source, header, blocks)
+        ) {
+            return (LoopKindHint::RepeatLike, Some(source));
+        }
+
+        if matches!(
+            cfg.terminator(&proto.instrs, source),
+            Some(LowInstr::Jump(jump))
+                if cfg.instr_to_block[jump.target.index()] == header
+                    && repeat_continue_target_via_backedge_pad(proto, cfg, source, blocks).is_some()
+        ) {
+            return (
+                LoopKindHint::RepeatLike,
+                repeat_continue_target_via_backedge_pad(proto, cfg, source, blocks),
+            );
+        }
     }
 
     let continue_target = if backedge_sources.len() == 1 {
@@ -126,6 +153,78 @@ fn branch_has_header_and_exit(
 
     (then_block == header && !blocks.contains(&else_block))
         || (else_block == header && !blocks.contains(&then_block))
+}
+
+fn block_is_pure_branch(proto: &LoweredProto, cfg: &Cfg, block: BlockRef) -> bool {
+    let range = cfg.blocks[block.index()].instrs;
+    range.len == 1
+        && matches!(
+            cfg.terminator(&proto.instrs, block),
+            Some(LowInstr::Branch(_))
+        )
+}
+
+fn repeat_continue_target_via_backedge_pad(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    backedge_source: BlockRef,
+    blocks: &BTreeSet<BlockRef>,
+) -> Option<BlockRef> {
+    let mut preds = cfg.preds[backedge_source.index()]
+        .iter()
+        .map(|edge_ref| cfg.edges[edge_ref.index()].from)
+        .filter(|pred| cfg.reachable_blocks.contains(pred))
+        .filter(|pred| blocks.contains(pred))
+        .collect::<Vec<_>>();
+    preds.sort();
+    preds.dedup();
+    let [continue_target] = preds.as_slice() else {
+        return None;
+    };
+
+    if !matches!(
+        cfg.terminator(&proto.instrs, *continue_target),
+        Some(LowInstr::Branch(_))
+    ) {
+        return None;
+    }
+
+    let (then_edge_ref, else_edge_ref) = branch_edges(cfg, *continue_target)?;
+    let then_block = cfg.edges[then_edge_ref.index()].to;
+    let else_block = cfg.edges[else_edge_ref.index()].to;
+
+    if (then_block == backedge_source && !blocks.contains(&else_block))
+        || (else_block == backedge_source && !blocks.contains(&then_block))
+    {
+        Some(*continue_target)
+    } else {
+        None
+    }
+}
+
+fn generic_for_has_loop_body_and_exit(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    header: BlockRef,
+    instr: &crate::transformer::GenericForLoopInstr,
+    blocks: &BTreeSet<BlockRef>,
+) -> bool {
+    let range = cfg.blocks[header.index()].instrs;
+    if range.len < 2 {
+        return false;
+    }
+    let Some(call_instr_index) = range.end().checked_sub(2) else {
+        return false;
+    };
+    let Some(LowInstr::GenericForCall(call)) = proto.instrs.get(call_instr_index) else {
+        return false;
+    };
+    let body_block = cfg.instr_to_block[instr.body_target.index()];
+    let exit_block = cfg.instr_to_block[instr.exit_target.index()];
+
+    matches!(call.results, crate::transformer::ResultPack::Fixed(range) if range == instr.bindings)
+        && blocks.contains(&body_block)
+        && !blocks.contains(&exit_block)
 }
 
 fn is_reducible_loop(cfg: &Cfg, header: BlockRef, blocks: &BTreeSet<BlockRef>) -> bool {

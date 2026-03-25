@@ -4,6 +4,7 @@
 //! 这样后续补层时只需要往这个骨架里填实现，不需要重写调用约定。
 
 use crate::cfg::{analyze_dataflow, analyze_graph_facts, build_cfg_graph};
+use crate::hir::analyze_hir;
 use crate::parser::parse_lua51_chunk;
 use crate::structure::analyze_structure;
 use crate::transformer::lower_chunk;
@@ -181,9 +182,45 @@ impl DecompilerPipeline {
             });
         }
 
+        state.hir = Some({
+            let lowered = state
+                .lowered
+                .as_ref()
+                .expect("transform stage completed must leave lowered in state");
+            let cfg_graph = state
+                .cfg
+                .as_ref()
+                .expect("cfg stage completed must leave cfg graph in state");
+            let graph_facts = state
+                .graph_facts
+                .as_ref()
+                .expect("graph facts stage completed must leave graph facts in state");
+            let dataflow = state
+                .dataflow
+                .as_ref()
+                .expect("dataflow stage completed must leave dataflow in state");
+            let structure_facts = state
+                .structure_facts
+                .as_ref()
+                .expect("structure stage completed must leave structure facts in state");
+            analyze_hir(lowered, cfg_graph, graph_facts, dataflow, structure_facts)
+        });
+        state.mark_completed(DecompileStage::Hir);
+
+        if let Some(output) = collect_stage_dump(&state, DecompileStage::Hir, &options.debug)? {
+            debug_output.push(output);
+        }
+
+        if options.target_stage == DecompileStage::Hir {
+            return Ok(DecompileResult {
+                state,
+                debug_output,
+            });
+        }
+
         Err(DecompileError::StageNotImplemented {
-            stage: DecompileStage::Hir,
-            completed_stage: DecompileStage::StructureFacts,
+            stage: DecompileStage::Ast,
+            completed_stage: DecompileStage::Hir,
         })
     }
 }

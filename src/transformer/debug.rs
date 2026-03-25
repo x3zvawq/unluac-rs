@@ -273,18 +273,20 @@ fn format_low_instr(instr: &LowInstr) -> String {
         ),
         LowInstr::Close(instr) => format!("close from {}", format_reg(instr.from)),
         LowInstr::NumericForInit(instr) => format!(
-            "numeric-for-init index={} limit={} step={} body={} exit={}",
+            "numeric-for-init index={} limit={} step={} binding={} body={} exit={}",
             format_reg(instr.index),
             format_reg(instr.limit),
             format_reg(instr.step),
+            format_reg(instr.binding),
             format_instr_ref(instr.body_target),
             format_instr_ref(instr.exit_target)
         ),
         LowInstr::NumericForLoop(instr) => format!(
-            "numeric-for-loop index={} limit={} step={} body={} exit={}",
+            "numeric-for-loop index={} limit={} step={} binding={} body={} exit={}",
             format_reg(instr.index),
             format_reg(instr.limit),
             format_reg(instr.step),
+            format_reg(instr.binding),
             format_instr_ref(instr.body_target),
             format_instr_ref(instr.exit_target)
         ),
@@ -294,8 +296,9 @@ fn format_low_instr(instr: &LowInstr) -> String {
             format_result_pack(instr.results)
         ),
         LowInstr::GenericForLoop(instr) => format!(
-            "generic-for-loop control={} body={} exit={}",
-            format_reg_range(instr.control),
+            "generic-for-loop control={} bindings={} body={} exit={}",
+            format_reg(instr.control),
+            format_reg_range(instr.bindings),
             format_instr_ref(instr.body_target),
             format_instr_ref(instr.exit_target)
         ),

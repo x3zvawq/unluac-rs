@@ -1,0 +1,43 @@
+//! 这个文件是 HIR 结构恢复的 facade。
+//!
+//! 它只负责声明 `structure/` 子模块、拼装共享上下文，并暴露结构化 lowering 的入口。
+//! 真正的业务逻辑都放在目录里，避免入口文件再次膨胀成难维护的巨型实现。
+
+mod body;
+mod branch_values;
+mod loops;
+mod rewrites;
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use crate::cfg::{BlockRef, PhiCandidate, PhiId};
+use crate::hir::common::{
+    HirBlock, HirExpr, HirGenericFor, HirLValue, HirNumericFor, HirRepeat, HirStmt, HirUnaryExpr,
+    HirUnaryOpKind, HirWhile, TempId,
+};
+use crate::structure::{
+    BranchCandidate, BranchKind, BranchValueMergeCandidate, BranchValueMergeValue, GotoReason,
+    LoopCandidate, LoopKindHint, RegionKind, ShortCircuitCandidate, ShortCircuitExit,
+    ShortCircuitNodeRef, ShortCircuitTarget,
+};
+use crate::transformer::{InstrRef, LowInstr, Reg};
+
+use super::exprs::{expr_for_dup_safe_fixed_def, expr_for_reg_use};
+use super::short_circuit::{
+    BranchShortCircuitPlan, build_branch_short_circuit_plan, build_conditional_reassign_plan,
+    lower_materialized_value_leaf_expr, lower_short_circuit_subject,
+    recover_value_phi_expr_with_allowed_blocks, value_merge_candidate_by_header,
+    value_merge_skipped_blocks,
+};
+use super::{ProtoLowering, assign_stmt, branch_stmt, lower_branch_cond};
+use super::{
+    is_control_terminator, lower_control_instr,
+    lower_phi_materialization_with_allowed_blocks_except, lower_regular_instr,
+};
+use body::*;
+use rewrites::{apply_loop_rewrites, rewrite_expr_temps, rewrite_stmt_exprs, temp_expr_overrides};
+
+/// 尝试基于现有结构候选恢复一个更接近源码的 HIR block。
+pub(super) fn try_build_structured_body(lowering: &ProtoLowering<'_>) -> Option<HirBlock> {
+    body::build_structured_body(lowering)
+}

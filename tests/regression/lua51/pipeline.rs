@@ -3,6 +3,10 @@
 //! 它们不关心某一层内部怎么实现，而是验证主入口停阶段、dump 输出和错误语义
 //! 是否稳定，因此归类为 regression。
 
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
 use unluac::decompile::{
     DebugDetail, DebugOptions, DecompileError, DecompileOptions, DecompileStage, decompile,
 };
@@ -245,6 +249,7 @@ mod decompile_pipeline {
         let dump = &result.debug_output[0].content;
         assert!(dump.contains("===== Dump Structure ====="));
         assert!(dump.contains("branch candidates"));
+        assert!(dump.contains("branch value merges"));
         assert!(dump.contains("loop candidates"));
         assert!(dump.contains("short-circuit candidates"));
         assert!(dump.contains("region facts"));
@@ -252,22 +257,202 @@ mod decompile_pipeline {
     }
 
     #[test]
-    fn reports_hir_stage_as_not_implemented_after_structure() {
-        let error = decompile(
+    fn returns_hir_state_and_dump() {
+        let result = decompile(
             &crate::support::decode_hex(SETFENV_CHUNK_HEX),
             DecompileOptions {
                 target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    detail: DebugDetail::Normal,
+                    filters: Default::default(),
+                },
                 ..DecompileOptions::default()
             },
         )
-        .expect_err("hir stage should not be implemented yet");
+        .expect("hir stage should succeed");
+
+        assert_eq!(result.state.completed_stage, Some(DecompileStage::Hir));
+        assert!(result.state.hir.is_some());
+        assert_eq!(result.debug_output.len(), 1);
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("===== Dump HIR ====="));
+        assert!(dump.contains("proto#0"));
+        assert!(dump.contains("temp"));
+    }
+
+    #[test]
+    fn boolean_hell_hir_prefers_guarded_or_shape_for_initial_short_circuit_value() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/01_boolean_hell.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    detail: DebugDetail::Normal,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("boolean_hell hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(!dump.contains("decision("), "{dump}");
+        assert!(
+            !dump.contains("local [\"l0\"] = ((p0 or (p3 and (p1 and p2))) and"),
+            "{dump}"
+        );
+        assert!(
+            dump.contains("local [\"l0\"] = ((p0 and")
+                || dump.contains("local [\"l0\"] = (((p0 and"),
+            "{dump}"
+        );
+    }
+
+    #[test]
+    fn all_supported_lua_cases_reach_clean_hir_exit() {
+        let mut failures = Vec::new();
+
+        for case in crate::support::case_manifest::hir_exit_regression_cases() {
+            let Some(dialect) = case.dialect.decompile_dialect() else {
+                failures.push(format!(
+                    "{} is marked for HIR exit regression but has no supported decompile dialect",
+                    case.path
+                ));
+                continue;
+            };
+
+            let chunk = compile_lua_case(case.dialect.luac_label(), case.path);
+            let result = decompile(
+                &chunk,
+                DecompileOptions {
+                    dialect,
+                    target_stage: DecompileStage::Hir,
+                    debug: DebugOptions {
+                        enable: true,
+                        output_stages: vec![DecompileStage::Hir],
+                        detail: DebugDetail::Normal,
+                        filters: Default::default(),
+                    },
+                    ..DecompileOptions::default()
+                },
+            );
+
+            match result {
+                Ok(result) => {
+                    let dump = &result.debug_output[0].content;
+                    let mut residuals = Vec::new();
+                    if dump.contains("decision(") {
+                        residuals.push("decision");
+                    }
+                    if dump.contains("unresolved(") {
+                        residuals.push("unresolved");
+                    }
+                    if dump.contains("unstructured summary=fallback") {
+                        residuals.push("fallback");
+                    }
+
+                    if !residuals.is_empty() {
+                        failures.push(format!(
+                            "{} leaked HIR residuals [{}]\n{}",
+                            case.path,
+                            residuals.join(", "),
+                            dump
+                        ));
+                    }
+                }
+                Err(error) => {
+                    failures.push(format!("{} failed to reach HIR: {error}", case.path));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "supported HIR cases should exit cleanly:\n\n{}",
+            failures.join("\n\n")
+        );
+    }
+
+    #[test]
+    fn reports_ast_stage_as_not_implemented_after_hir() {
+        let error = decompile(
+            &crate::support::decode_hex(SETFENV_CHUNK_HEX),
+            DecompileOptions {
+                target_stage: DecompileStage::Ast,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect_err("ast stage should not be implemented yet");
 
         assert!(matches!(
             error,
             DecompileError::StageNotImplemented {
-                stage: DecompileStage::Hir,
-                completed_stage: DecompileStage::StructureFacts,
+                stage: DecompileStage::Ast,
+                completed_stage: DecompileStage::Hir,
             }
         ));
     }
+}
+
+fn compile_lua_case(dialect_label: &str, source_relative: &str) -> Vec<u8> {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let source = repo_root.join(source_relative);
+    let luac = repo_root
+        .join("lua")
+        .join("build")
+        .join(dialect_label)
+        .join("luac");
+    assert!(
+        luac.exists(),
+        "missing bundled luac for {dialect_label}: {}",
+        luac.display()
+    );
+
+    let output = test_chunk_output_path(&repo_root, dialect_label, &source);
+    fs::create_dir_all(
+        output
+            .parent()
+            .expect("regression chunk path should always have a parent"),
+    )
+    .expect("should create regression chunk output directory");
+
+    let status = Command::new(&luac)
+        .arg("-s")
+        .arg("-o")
+        .arg(&output)
+        .arg(&source)
+        .status()
+        .expect("should spawn bundled luac for regression case");
+    assert!(
+        status.success(),
+        "bundled luac failed for {} with status {status}",
+        source.display()
+    );
+
+    fs::read(&output).unwrap_or_else(|error| {
+        panic!(
+            "should read compiled regression chunk {}: {error}",
+            output.display()
+        )
+    })
+}
+
+fn test_chunk_output_path(repo_root: &Path, dialect_label: &str, source: &Path) -> PathBuf {
+    let relative = source
+        .strip_prefix(repo_root)
+        .expect("regression source should stay inside the repo root");
+    repo_root
+        .join("target")
+        .join("unluac-tests")
+        .join(dialect_label)
+        .join(relative)
+        .with_extension("out")
 }

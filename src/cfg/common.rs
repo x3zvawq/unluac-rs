@@ -166,7 +166,9 @@ pub struct DataflowFacts {
     pub reg_versions: BTreeMap<Reg, Vec<DefId>>,
     pub instr_defs: Vec<Vec<DefId>>,
     pub reaching_defs: Vec<InstrReachingDefs>,
+    pub reaching_values: Vec<InstrReachingValues>,
     pub use_defs: Vec<InstrUseDefs>,
+    pub use_values: Vec<InstrUseValues>,
     pub def_uses: Vec<Vec<UseSite>>,
     pub open_reaching_defs: Vec<BTreeSet<OpenDefId>>,
     pub open_use_defs: Vec<BTreeSet<OpenDefId>>,
@@ -261,6 +263,21 @@ pub struct InstrUseDefs {
     pub open: BTreeSet<OpenDefId>,
 }
 
+/// 一条指令在执行前可见的 SSA-like 值身份。
+///
+/// `reaching_defs` 保留底层真实 `DefId` 证据，这里则负责把 block 入口已经确认的
+/// phi 合流替换成稳定的 `SsaValue::Phi`，供 HIR 之类的后续层直接消费。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InstrReachingValues {
+    pub fixed: BTreeMap<Reg, BTreeSet<SsaValue>>,
+}
+
+/// 一条指令真实 use 对应到哪些 SSA-like 值身份。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InstrUseValues {
+    pub fixed: BTreeMap<Reg, BTreeSet<SsaValue>>,
+}
+
 /// 一个固定定义被使用的位置。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct UseSite {
@@ -278,9 +295,20 @@ pub struct OpenUseSite {
 /// 一个 SSA-like phi 候选。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhiCandidate {
+    pub id: PhiId,
     pub block: BlockRef,
     pub reg: Reg,
     pub incoming: Vec<PhiIncoming>,
+}
+
+/// 一个 phi 候选的稳定身份。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct PhiId(pub usize);
+
+impl PhiId {
+    pub const fn index(self) -> usize {
+        self.0
+    }
 }
 
 /// 一个 predecessor 边给 phi 提供的候选版本。
@@ -288,6 +316,16 @@ pub struct PhiCandidate {
 pub struct PhiIncoming {
     pub pred: BlockRef,
     pub defs: BTreeSet<DefId>,
+}
+
+/// 一个寄存器值在 SSA-like 视图里的稳定身份。
+///
+/// 这里区分“真实 low-IR 定义”和“block 入口合流出的 phi 值”，是为了让后续层
+/// 不用重复从 `use_defs = {def_a, def_b}` 里反推“其实这是同一个 merge 后的值”。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum SsaValue {
+    Def(DefId),
+    Phi(PhiId),
 }
 
 impl Cfg {
