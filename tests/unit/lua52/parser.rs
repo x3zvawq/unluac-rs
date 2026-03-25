@@ -139,7 +139,8 @@ mod parse_lua52_chunk {
 
     #[test]
     fn decodes_nested_env_shadowing_and_closure_capture_for_env_shadow_fixture() {
-        let chunk = parse_fixture_with_debug("tests/lua_cases/lua5.2/07_env_shadow_and_closure.lua");
+        let chunk =
+            parse_fixture_with_debug("tests/lua_cases/lua5.2/07_env_shadow_and_closure.lua");
         let main = &chunk.main.common;
         let make_reader = &main.children[0].common;
         let reader = &make_reader.children[0].common;
@@ -149,7 +150,8 @@ mod parse_lua52_chunk {
         assert_eq!(reader.upvalues.common.count, 2);
 
         let upvalue_names = reader
-            .debug_info.common
+            .debug_info
+            .common
             .upvalue_names
             .iter()
             .filter_map(|name| name.text.as_ref().map(|text| text.value.as_str()))

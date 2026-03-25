@@ -389,6 +389,7 @@ fn chunk_with_instrs(instrs: Vec<LowInstr>) -> LoweredChunk {
             format: 0,
             endianness: Endianness::Little,
             integer_size: 4,
+            lua_integer_size: None,
             size_t_size: 8,
             instruction_size: 4,
             number_size: 8,

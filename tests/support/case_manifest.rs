@@ -29,7 +29,8 @@ impl LuaCaseDialect {
         match self {
             Self::Lua51 => Some(DecompileDialect::Lua51),
             Self::Lua52 => Some(DecompileDialect::Lua52),
-            Self::Lua53 | Self::Lua54 => None,
+            Self::Lua53 => Some(DecompileDialect::Lua53),
+            Self::Lua54 => None,
         }
     }
 
@@ -336,6 +337,30 @@ pub(crate) const ALL_CASES: &[LuaCaseManifestEntry] = &[
     ),
     LuaCaseManifestEntry::new(
         "tests/lua_cases/lua5.3/01_bitwise_and_idiv.lua",
+        LuaCaseDialect::Lua53,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.3/02_bitwise_closure_mesh.lua",
+        LuaCaseDialect::Lua53,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.3/03_idiv_float_branching.lua",
+        LuaCaseDialect::Lua53,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.3/04_method_table_bitwise.lua",
+        LuaCaseDialect::Lua53,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.3/05_integer_float_capture.lua",
+        LuaCaseDialect::Lua53,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.3/06_loop_bitwise_dispatch.lua",
+        LuaCaseDialect::Lua53,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.3/07_bnot_mask_pipeline.lua",
         LuaCaseDialect::Lua53,
     ),
     LuaCaseManifestEntry::new(
