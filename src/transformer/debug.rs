@@ -175,6 +175,7 @@ fn format_optional_source(proto: &LoweredProto) -> String {
 fn dialect_label(version: DialectVersion) -> &'static str {
     match version {
         DialectVersion::Lua51 => "lua5.1",
+        DialectVersion::Lua52 => "lua5.2",
     }
 }
 
@@ -351,6 +352,7 @@ fn format_access_base(base: AccessBase) -> String {
     match base {
         AccessBase::Reg(reg) => format_reg(reg),
         AccessBase::Env => "env".to_owned(),
+        AccessBase::Upvalue(upvalue) => format_upvalue(upvalue),
     }
 }
 

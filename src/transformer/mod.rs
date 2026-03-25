@@ -27,10 +27,16 @@ use crate::parser::{DialectVersion, RawChunk};
 pub fn lower_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
     match chunk.header.version {
         DialectVersion::Lua51 => dialect::lua51::lower_chunk(chunk),
+        DialectVersion::Lua52 => dialect::lua52::lower_chunk(chunk),
     }
 }
 
 /// 直接按 Lua 5.1 规则 lowering，不做方言自动探测。
 pub fn lower_lua51_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
     dialect::lua51::lower_chunk(chunk)
+}
+
+/// 直接按 Lua 5.2 规则 lowering，不做方言自动探测。
+pub fn lower_lua52_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
+    dialect::lua52::lower_chunk(chunk)
 }

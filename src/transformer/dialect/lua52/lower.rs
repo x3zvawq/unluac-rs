@@ -1,12 +1,22 @@
-//! 这个文件实现 Lua 5.1 到统一 low-IR 的 lowering。
+//! 这个文件实现 Lua 5.2 到统一 low-IR 的 lowering。
 //!
-//! Lua 5.1 里最麻烦的地方不是普通一对一转译，而是 `TEST/TESTSET` 配合 helper
-//! `JMP`、`CLOSURE` 后置 capture、`FORPREP/FORLOOP` 和 `TFORLOOP` 这类模式型
-//! 指令。这里一次性把这些模式吃干净，避免后续 CFG 再去理解方言细节。
+//! 这里最需要显式处理的 5.2 差异有三类：
+//! 1. raw pc 仍然按“字”计数，但 parser 会把 `LOADKX/EXTRAARG`、`SETLIST/EXTRAARG`
+//!    折成一个逻辑指令，所以跳转解析不能再偷用 logical index。
+//! 2. `GETTABUP/SETTABUP` 的 base 是 upvalue table，本层要直接落成
+//!    `AccessBase::Upvalue`，不能伪造中间寄存器。
+//! 3. `JMP(A)` 和 test helper `JMP` 可能自带 close 语义，本层必须把它显式拆成
+//!    `Close + Jump`，后续 CFG/SSA 才能看见真实副作用。
+
+use std::collections::BTreeMap;
 
 use crate::parser::{
-    DialectInstrExtra, Lua51InstrExtra, Lua51Opcode, Lua51Operands, RawChunk, RawInstr,
+    DialectInstrExtra, Lua52InstrExtra, Lua52Opcode, Lua52Operands, RawChunk, RawInstr,
     RawInstrOpcode, RawInstrOperands, RawProto,
+};
+use crate::transformer::dialect::puc_lua::{
+    LFIELDS_PER_FLUSH, call_args_pack, call_result_pack, index_k, is_k, range_len_inclusive,
+    reg_from_u8, reg_from_u16, return_pack,
 };
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchInstr, BranchOperands,
@@ -18,9 +28,6 @@ use crate::transformer::{
     ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr,
     TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
-
-const BITRK: u16 = 1 << 8;
-const LFIELDS_PER_FLUSH: u32 = 50;
 
 pub(crate) fn lower_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
     Ok(LoweredChunk {
@@ -61,6 +68,8 @@ struct ProtoLowerer<'a> {
     raw_target_low: Vec<Option<usize>>,
     raw_to_low: Vec<Vec<InstrRef>>,
     pending_methods: Vec<Option<Reg>>,
+    raw_pc_to_index: BTreeMap<u32, usize>,
+    raw_word_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +123,14 @@ impl<'a> ProtoLowerer<'a> {
     fn new(raw: &'a RawProto) -> Self {
         let raw_instr_count = raw.common.instructions.len();
         let method_slots = usize::from(raw.common.frame.max_stack_size).saturating_add(2);
+        let mut raw_pc_to_index = BTreeMap::new();
+        let mut raw_word_count = 0_usize;
+
+        for (index, instr) in raw.common.instructions.iter().enumerate() {
+            let pc = raw_pc(instr);
+            raw_pc_to_index.insert(pc, index);
+            raw_word_count = raw_word_count.max((pc + u32::from(word_len(instr))) as usize);
+        }
 
         Self {
             raw,
@@ -121,6 +138,8 @@ impl<'a> ProtoLowerer<'a> {
             raw_target_low: vec![None; raw_instr_count],
             raw_to_low: vec![Vec::new(); raw_instr_count],
             pending_methods: vec![None; method_slots],
+            raw_pc_to_index,
+            raw_word_count,
         }
     }
 
@@ -129,11 +148,11 @@ impl<'a> ProtoLowerer<'a> {
 
         while raw_index < self.raw.common.instructions.len() {
             let raw_instr = &self.raw.common.instructions[raw_index];
-            let (opcode, operands, extra) = decode_lua51(raw_instr);
+            let (opcode, operands, extra) = decode_lua52(raw_instr);
             let raw_pc = extra.pc;
 
             match opcode {
-                Lua51Opcode::Move => {
+                Lua52Opcode::Move => {
                     let (a, b) = expect_ab(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.invalidate_written_reg(dst);
@@ -147,7 +166,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua51Opcode::LoadK => {
+                Lua52Opcode::LoadK => {
                     let (a, bx) = expect_abx(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.invalidate_written_reg(dst);
@@ -161,7 +180,24 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua51Opcode::LoadBool => {
+                Lua52Opcode::LoadKx => {
+                    let a = expect_a(raw_pc, opcode, operands)?;
+                    let dst = reg_from_u8(a);
+                    self.invalidate_written_reg(dst);
+                    self.emit(
+                        Some(raw_index),
+                        vec![raw_index],
+                        PendingLowInstr::Ready(LowInstr::LoadConst(LoadConstInstr {
+                            dst,
+                            value: self.const_ref(
+                                raw_pc,
+                                self.extra_arg(raw_pc, opcode, extra.extra_arg)? as usize,
+                            )?,
+                        })),
+                    );
+                    raw_index += 1;
+                }
+                Lua52Opcode::LoadBool => {
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.invalidate_written_reg(dst);
@@ -176,19 +212,20 @@ impl<'a> ProtoLowerer<'a> {
 
                     if c != 0 {
                         self.clear_all_method_hints();
-                        let target_raw = self.ensure_targetable_raw(raw_pc, raw_index + 2)?;
                         self.emit(
                             None,
                             vec![raw_index],
                             PendingLowInstr::Jump {
-                                target: TargetPlaceholder::Raw(target_raw),
+                                target: TargetPlaceholder::Raw(
+                                    self.ensure_targetable_pc(raw_pc, raw_pc + 2)?,
+                                ),
                             },
                         );
                     }
 
                     raw_index += 1;
                 }
-                Lua51Opcode::LoadNil => {
+                Lua52Opcode::LoadNil => {
                     let (a, b) = expect_ab(raw_pc, opcode, operands)?;
                     let len = range_len_inclusive(usize::from(a), usize::from(b));
                     let dst = RegRange::new(reg_from_u8(a), len);
@@ -200,7 +237,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua51Opcode::GetUpVal => {
+                Lua52Opcode::GetUpVal => {
                     let (a, b) = expect_ab(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.invalidate_written_reg(dst);
@@ -214,8 +251,8 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua51Opcode::GetGlobal => {
-                    let (a, bx) = expect_abx(raw_pc, opcode, operands)?;
+                Lua52Opcode::GetTabUp => {
+                    let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.invalidate_written_reg(dst);
                     self.emit(
@@ -223,13 +260,13 @@ impl<'a> ProtoLowerer<'a> {
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::GetTable(GetTableInstr {
                             dst,
-                            base: AccessBase::Env,
-                            key: AccessKey::Const(self.const_ref(raw_pc, bx as usize)?),
+                            base: AccessBase::Upvalue(self.upvalue_ref(raw_pc, b as usize)?),
+                            key: self.access_key(raw_pc, c)?,
                         })),
                     );
                     raw_index += 1;
                 }
-                Lua51Opcode::GetTable => {
+                Lua52Opcode::GetTable => {
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.invalidate_written_reg(dst);
@@ -244,20 +281,20 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua51Opcode::SetGlobal => {
-                    let (a, bx) = expect_abx(raw_pc, opcode, operands)?;
+                Lua52Opcode::SetTabUp => {
+                    let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::SetTable(SetTableInstr {
-                            base: AccessBase::Env,
-                            key: AccessKey::Const(self.const_ref(raw_pc, bx as usize)?),
-                            value: ValueOperand::Reg(reg_from_u8(a)),
+                            base: AccessBase::Upvalue(self.upvalue_ref(raw_pc, a as usize)?),
+                            key: self.access_key(raw_pc, b)?,
+                            value: self.value_operand(raw_pc, c)?,
                         })),
                     );
                     raw_index += 1;
                 }
-                Lua51Opcode::SetUpVal => {
+                Lua52Opcode::SetUpVal => {
                     let (a, b) = expect_ab(raw_pc, opcode, operands)?;
                     self.emit(
                         Some(raw_index),
@@ -269,7 +306,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua51Opcode::SetTable => {
+                Lua52Opcode::SetTable => {
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     self.emit(
                         Some(raw_index),
@@ -282,7 +319,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua51Opcode::NewTable => {
+                Lua52Opcode::NewTable => {
                     let (a, _, _) = expect_abc(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.invalidate_written_reg(dst);
@@ -293,7 +330,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua51Opcode::Self_ => {
+                Lua52Opcode::Self_ => {
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let callee = reg_from_u8(a);
                     let self_arg = Reg(callee.index() + 1);
@@ -319,12 +356,12 @@ impl<'a> ProtoLowerer<'a> {
                     self.set_pending_method(callee, self_arg);
                     raw_index += 1;
                 }
-                Lua51Opcode::Add
-                | Lua51Opcode::Sub
-                | Lua51Opcode::Mul
-                | Lua51Opcode::Div
-                | Lua51Opcode::Mod
-                | Lua51Opcode::Pow => {
+                Lua52Opcode::Add
+                | Lua52Opcode::Sub
+                | Lua52Opcode::Mul
+                | Lua52Opcode::Div
+                | Lua52Opcode::Mod
+                | Lua52Opcode::Pow => {
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.invalidate_written_reg(dst);
@@ -340,7 +377,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua51Opcode::Unm | Lua51Opcode::Not | Lua51Opcode::Len => {
+                Lua52Opcode::Unm | Lua52Opcode::Not | Lua52Opcode::Len => {
                     let (a, b) = expect_ab(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.invalidate_written_reg(dst);
@@ -355,7 +392,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua51Opcode::Concat => {
+                Lua52Opcode::Concat => {
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.invalidate_written_reg(dst);
@@ -372,21 +409,30 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua51Opcode::Jmp => {
+                Lua52Opcode::Jmp => {
                     self.clear_all_method_hints();
-                    let (_, sbx) = expect_asbx(raw_pc, opcode, operands)?;
-                    self.emit(
-                        Some(raw_index),
-                        vec![raw_index],
-                        PendingLowInstr::Jump {
-                            target: TargetPlaceholder::Raw(
-                                self.jump_target(raw_pc, raw_index, sbx)?,
-                            ),
-                        },
-                    );
+                    let (a, sbx) = expect_asbx(raw_pc, opcode, operands)?;
+                    let target = TargetPlaceholder::Raw(self.jump_target(raw_pc, extra.pc, sbx)?);
+
+                    if let Some(close_from) = close_from_raw_a(a) {
+                        self.emit(
+                            Some(raw_index),
+                            vec![raw_index],
+                            PendingLowInstr::Ready(LowInstr::Close(CloseInstr {
+                                from: close_from,
+                            })),
+                        );
+                        self.emit(None, vec![raw_index], PendingLowInstr::Jump { target });
+                    } else {
+                        self.emit(
+                            Some(raw_index),
+                            vec![raw_index],
+                            PendingLowInstr::Jump { target },
+                        );
+                    }
                     raw_index += 1;
                 }
-                Lua51Opcode::Eq | Lua51Opcode::Lt | Lua51Opcode::Le => {
+                Lua52Opcode::Eq | Lua52Opcode::Lt | Lua52Opcode::Le => {
                     self.clear_all_method_hints();
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
@@ -398,18 +444,40 @@ impl<'a> ProtoLowerer<'a> {
                         ),
                         negated: a == 0,
                     };
+
+                    let then_target = if helper.close_from.is_some() {
+                        TargetPlaceholder::Low(self.emitted.len() + 1)
+                    } else {
+                        TargetPlaceholder::Raw(helper.jump_target)
+                    };
                     self.emit(
                         Some(raw_index),
                         vec![raw_index, helper.helper_index],
                         PendingLowInstr::Branch {
                             cond,
-                            then_target: TargetPlaceholder::Raw(helper.jump_target),
+                            then_target,
                             else_target: TargetPlaceholder::Raw(helper.fallthrough_target),
                         },
                     );
-                    raw_index += 2;
+                    if let Some(close_from) = helper.close_from {
+                        self.emit(
+                            None,
+                            vec![raw_index, helper.helper_index],
+                            PendingLowInstr::Ready(LowInstr::Close(CloseInstr {
+                                from: close_from,
+                            })),
+                        );
+                        self.emit(
+                            None,
+                            vec![raw_index, helper.helper_index],
+                            PendingLowInstr::Jump {
+                                target: TargetPlaceholder::Raw(helper.jump_target),
+                            },
+                        );
+                    }
+                    raw_index = helper.next_index;
                 }
-                Lua51Opcode::Test => {
+                Lua52Opcode::Test => {
                     self.clear_all_method_hints();
                     let (a, c) = expect_ac(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
@@ -418,18 +486,40 @@ impl<'a> ProtoLowerer<'a> {
                         operands: BranchOperands::Unary(CondOperand::Reg(reg_from_u8(a))),
                         negated: c == 0,
                     };
+
+                    let then_target = if helper.close_from.is_some() {
+                        TargetPlaceholder::Low(self.emitted.len() + 1)
+                    } else {
+                        TargetPlaceholder::Raw(helper.jump_target)
+                    };
                     self.emit(
                         Some(raw_index),
                         vec![raw_index, helper.helper_index],
                         PendingLowInstr::Branch {
                             cond,
-                            then_target: TargetPlaceholder::Raw(helper.jump_target),
+                            then_target,
                             else_target: TargetPlaceholder::Raw(helper.fallthrough_target),
                         },
                     );
-                    raw_index += 2;
+                    if let Some(close_from) = helper.close_from {
+                        self.emit(
+                            None,
+                            vec![raw_index, helper.helper_index],
+                            PendingLowInstr::Ready(LowInstr::Close(CloseInstr {
+                                from: close_from,
+                            })),
+                        );
+                        self.emit(
+                            None,
+                            vec![raw_index, helper.helper_index],
+                            PendingLowInstr::Jump {
+                                target: TargetPlaceholder::Raw(helper.jump_target),
+                            },
+                        );
+                    }
+                    raw_index = helper.next_index;
                 }
-                Lua51Opcode::TestSet => {
+                Lua52Opcode::TestSet => {
                     self.clear_all_method_hints();
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
@@ -440,15 +530,36 @@ impl<'a> ProtoLowerer<'a> {
                     };
 
                     if usize::from(a) == usize::from(b) {
+                        let then_target = if helper.close_from.is_some() {
+                            TargetPlaceholder::Low(self.emitted.len() + 1)
+                        } else {
+                            TargetPlaceholder::Raw(helper.jump_target)
+                        };
                         self.emit(
                             Some(raw_index),
                             vec![raw_index, helper.helper_index],
                             PendingLowInstr::Branch {
                                 cond,
-                                then_target: TargetPlaceholder::Raw(helper.jump_target),
+                                then_target,
                                 else_target: TargetPlaceholder::Raw(helper.fallthrough_target),
                             },
                         );
+                        if let Some(close_from) = helper.close_from {
+                            self.emit(
+                                None,
+                                vec![raw_index, helper.helper_index],
+                                PendingLowInstr::Ready(LowInstr::Close(CloseInstr {
+                                    from: close_from,
+                                })),
+                            );
+                            self.emit(
+                                None,
+                                vec![raw_index, helper.helper_index],
+                                PendingLowInstr::Jump {
+                                    target: TargetPlaceholder::Raw(helper.jump_target),
+                                },
+                            );
+                        }
                     } else {
                         let move_low = self.emitted.len() + 1;
                         self.emit(
@@ -468,6 +579,15 @@ impl<'a> ProtoLowerer<'a> {
                                 src: reg_from_u16(b),
                             })),
                         );
+                        if let Some(close_from) = helper.close_from {
+                            self.emit(
+                                None,
+                                vec![raw_index, helper.helper_index],
+                                PendingLowInstr::Ready(LowInstr::Close(CloseInstr {
+                                    from: close_from,
+                                })),
+                            );
+                        }
                         self.emit(
                             None,
                             vec![raw_index, helper.helper_index],
@@ -477,9 +597,9 @@ impl<'a> ProtoLowerer<'a> {
                         );
                     }
 
-                    raw_index += 2;
+                    raw_index = helper.next_index;
                 }
-                Lua51Opcode::Call => {
+                Lua52Opcode::Call => {
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let kind = self.take_call_kind(reg_from_u8(a), b);
                     self.clear_all_method_hints();
@@ -495,7 +615,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua51Opcode::TailCall => {
+                Lua52Opcode::TailCall => {
                     let (a, b, _) = expect_abc(raw_pc, opcode, operands)?;
                     let kind = self.take_call_kind(reg_from_u8(a), b);
                     self.clear_all_method_hints();
@@ -510,7 +630,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua51Opcode::Return => {
+                Lua52Opcode::Return => {
                     let (a, b) = expect_ab(raw_pc, opcode, operands)?;
                     self.clear_all_method_hints();
                     self.emit(
@@ -522,7 +642,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua51Opcode::ForLoop => {
+                Lua52Opcode::ForLoop => {
                     self.clear_all_method_hints();
                     let (a, sbx) = expect_asbx(raw_pc, opcode, operands)?;
                     let index = reg_from_u8(a);
@@ -535,24 +655,24 @@ impl<'a> ProtoLowerer<'a> {
                             step: Reg(index.index() + 2),
                             binding: Reg(index.index() + 3),
                             body_target: TargetPlaceholder::Raw(
-                                self.jump_target(raw_pc, raw_index, sbx)?,
+                                self.jump_target(raw_pc, extra.pc, sbx)?,
                             ),
                             exit_target: TargetPlaceholder::Raw(
-                                self.ensure_targetable_raw(raw_pc, raw_index + 1)?,
+                                self.ensure_targetable_pc(raw_pc, self.next_raw_pc(raw_index))?,
                             ),
                         },
                     );
                     raw_index += 1;
                 }
-                Lua51Opcode::ForPrep => {
+                Lua52Opcode::ForPrep => {
                     self.clear_all_method_hints();
                     let (a, sbx) = expect_asbx(raw_pc, opcode, operands)?;
-                    let target_raw = self.jump_target(raw_pc, raw_index, sbx)?;
+                    let target_raw = self.jump_target(raw_pc, extra.pc, sbx)?;
                     let target_opcode = opcode_at(self.raw, target_raw);
-                    if target_opcode != Lua51Opcode::ForLoop {
+                    if target_opcode != Lua52Opcode::ForLoop {
                         return Err(TransformError::InvalidNumericForPair {
                             raw_pc,
-                            target_raw,
+                            target_raw: raw_pc_at(self.raw, target_raw) as usize,
                             found: opcode_label(target_opcode),
                         });
                     }
@@ -567,19 +687,19 @@ impl<'a> ProtoLowerer<'a> {
                             step: Reg(index.index() + 2),
                             binding: Reg(index.index() + 3),
                             body_target: TargetPlaceholder::Raw(
-                                self.ensure_targetable_raw(raw_pc, raw_index + 1)?,
+                                self.ensure_targetable_pc(raw_pc, self.next_raw_pc(raw_index))?,
                             ),
                             exit_target: TargetPlaceholder::Raw(
-                                self.ensure_targetable_raw(raw_pc, target_raw + 1)?,
+                                self.ensure_targetable_pc(raw_pc, self.next_raw_pc(target_raw))?,
                             ),
                         },
                     );
                     raw_index += 1;
                 }
-                Lua51Opcode::TForLoop => {
+                Lua52Opcode::TForCall => {
                     self.clear_all_method_hints();
-                    let (a, c) = expect_ac(raw_pc, opcode, operands)?;
-                    let helper = self.helper_jump(raw_index, opcode)?;
+                    let (a, _, c) = expect_abc(raw_pc, opcode, operands)?;
+                    let pair = self.generic_for_pair(raw_index, a, c)?;
                     let state_start = reg_from_u8(a);
                     self.emit(
                         Some(raw_index),
@@ -593,21 +713,28 @@ impl<'a> ProtoLowerer<'a> {
                         })),
                     );
                     self.emit(
-                        None,
-                        vec![raw_index, helper.helper_index],
+                        Some(pair.loop_index),
+                        vec![pair.loop_index],
                         PendingLowInstr::GenericForLoop {
-                            control: Reg(state_start.index() + 2),
-                            bindings: RegRange::new(Reg(state_start.index() + 3), usize::from(c)),
-                            body_target: TargetPlaceholder::Raw(helper.jump_target),
-                            exit_target: TargetPlaceholder::Raw(helper.fallthrough_target),
+                            control: pair.control,
+                            bindings: pair.bindings,
+                            body_target: TargetPlaceholder::Raw(pair.body_target),
+                            exit_target: TargetPlaceholder::Raw(pair.exit_target),
                         },
                     );
-                    raw_index += 2;
+                    raw_index = pair.next_index;
                 }
-                Lua51Opcode::SetList => {
+                Lua52Opcode::TForLoop => {
+                    return Err(TransformError::InvalidGenericForLoop {
+                        raw_pc,
+                        helper_pc: raw_pc,
+                        found: opcode_label(opcode),
+                    });
+                }
+                Lua52Opcode::SetList => {
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let list_chunk = if c == 0 {
-                        extra.setlist_extra_arg.unwrap_or(0)
+                        self.extra_arg(raw_pc, opcode, extra.extra_arg)?
                     } else {
                         u32::from(c)
                     };
@@ -627,86 +754,45 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua51Opcode::Close => {
-                    self.clear_all_method_hints();
-                    let a = expect_a(raw_pc, opcode, operands)?;
-                    self.emit(
-                        Some(raw_index),
-                        vec![raw_index],
-                        PendingLowInstr::Ready(LowInstr::Close(CloseInstr {
-                            from: reg_from_u8(a),
-                        })),
-                    );
-                    raw_index += 1;
-                }
-                Lua51Opcode::Closure => {
+                Lua52Opcode::Closure => {
                     let (a, bx) = expect_abx(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.invalidate_written_reg(dst);
                     let proto = self.proto_ref(raw_pc, bx as usize)?;
-                    let capture_count = usize::from(
-                        self.raw.common.children[proto.index()]
-                            .common
-                            .upvalues
-                            .common
-                            .count,
-                    );
-                    let mut captures = Vec::with_capacity(capture_count);
-                    let mut raw_indices = vec![raw_index];
-
-                    for capture_index in 0..capture_count {
-                        let capture_raw = raw_index + 1 + capture_index;
-                        let Some(raw_capture_instr) = self.raw.common.instructions.get(capture_raw)
-                        else {
-                            return Err(TransformError::MissingClosureCapture {
-                                raw_pc,
-                                capture_index,
-                            });
-                        };
-                        let (capture_opcode, capture_operands, capture_extra) =
-                            decode_lua51(raw_capture_instr);
-                        raw_indices.push(capture_raw);
-
-                        let source = match capture_opcode {
-                            Lua51Opcode::Move => {
-                                let (_, b) =
-                                    expect_ab(capture_extra.pc, capture_opcode, capture_operands)?;
-                                CaptureSource::Reg(reg_from_u16(b))
-                            }
-                            Lua51Opcode::GetUpVal => {
-                                let (_, b) =
-                                    expect_ab(capture_extra.pc, capture_opcode, capture_operands)?;
+                    let child = &self.raw.common.children[proto.index()];
+                    let captures = child
+                        .common
+                        .upvalues
+                        .common
+                        .descriptors
+                        .iter()
+                        .map(|descriptor| {
+                            let source = if descriptor.in_stack {
+                                CaptureSource::Reg(Reg(descriptor.index as usize))
+                            } else {
                                 CaptureSource::Upvalue(
-                                    self.upvalue_ref(capture_extra.pc, b as usize)?,
+                                    self.upvalue_ref(raw_pc, descriptor.index as usize)?,
                                 )
-                            }
-                            _ => {
-                                return Err(TransformError::InvalidClosureCapture {
-                                    raw_pc,
-                                    capture_pc: capture_extra.pc,
-                                    found: opcode_label(capture_opcode),
-                                });
-                            }
-                        };
-
-                        captures.push(Capture {
-                            source,
-                            extra: DialectCaptureExtra::None,
-                        });
-                    }
+                            };
+                            Ok(Capture {
+                                source,
+                                extra: DialectCaptureExtra::None,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, TransformError>>()?;
 
                     self.emit(
                         Some(raw_index),
-                        raw_indices,
+                        vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::Closure(ClosureInstr {
                             dst,
                             proto,
                             captures,
                         })),
                     );
-                    raw_index += 1 + capture_count;
+                    raw_index += 1;
                 }
-                Lua51Opcode::VarArg => {
+                Lua52Opcode::VarArg => {
                     let (a, b) = expect_ab(raw_pc, opcode, operands)?;
                     self.clear_all_method_hints();
                     self.emit(
@@ -716,11 +802,14 @@ impl<'a> ProtoLowerer<'a> {
                             results: if b == 0 {
                                 ResultPack::Open(reg_from_u8(a))
                             } else {
-                                ResultPack::Fixed(RegRange::new(reg_from_u8(a), usize::from(b)))
+                                ResultPack::Fixed(RegRange::new(reg_from_u8(a), usize::from(b - 1)))
                             },
                         })),
                     );
                     raw_index += 1;
+                }
+                Lua52Opcode::ExtraArg => {
+                    return Err(TransformError::UnexpectedStandaloneExtraArg { raw_pc });
                 }
             }
         }
@@ -758,7 +847,7 @@ impl<'a> ProtoLowerer<'a> {
                     .raw_indices
                     .iter()
                     .copied()
-                    .map(|raw_index| raw_pc(&self.raw.common.instructions[raw_index]))
+                    .map(|index| raw_pc_at(self.raw, index))
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -794,7 +883,7 @@ impl<'a> ProtoLowerer<'a> {
         owner_raw: usize,
         pending: &PendingLowInstr,
     ) -> Result<LowInstr, TransformError> {
-        let owner_pc = raw_pc(&self.raw.common.instructions[owner_raw]);
+        let owner_pc = raw_pc_at(self.raw, owner_raw);
 
         match pending {
             PendingLowInstr::Ready(instr) => Ok(instr.clone()),
@@ -865,7 +954,7 @@ impl<'a> ProtoLowerer<'a> {
                 let Some(low_index) = self.raw_target_low[raw_index] else {
                     return Err(TransformError::UntargetableRawInstruction {
                         raw_pc: owner_pc,
-                        target_raw: raw_index,
+                        target_raw: raw_pc_at(self.raw, raw_index) as usize,
                     });
                 };
                 Ok(InstrRef(low_index))
@@ -931,6 +1020,18 @@ impl<'a> ProtoLowerer<'a> {
         Ok(ProtoRef(index))
     }
 
+    fn extra_arg(
+        &self,
+        raw_pc: u32,
+        opcode: Lua52Opcode,
+        extra_arg: Option<u32>,
+    ) -> Result<u32, TransformError> {
+        extra_arg.ok_or(TransformError::MissingExtraArg {
+            raw_pc,
+            opcode: opcode_label(opcode),
+        })
+    }
+
     fn value_operand(&self, raw_pc: u32, rk: u16) -> Result<ValueOperand, TransformError> {
         if is_k(rk) {
             Ok(ValueOperand::Const(self.const_ref(raw_pc, index_k(rk))?))
@@ -955,66 +1056,112 @@ impl<'a> ProtoLowerer<'a> {
         }
     }
 
-    fn jump_target(
-        &self,
-        raw_pc: u32,
-        raw_index: usize,
-        sbx: i32,
-    ) -> Result<usize, TransformError> {
-        let target = raw_index as i64 + 1 + i64::from(sbx);
-        if target < 0 || target >= self.raw.common.instructions.len() as i64 {
+    fn jump_target(&self, raw_pc: u32, base_pc: u32, sbx: i32) -> Result<usize, TransformError> {
+        let target_pc = i64::from(base_pc) + 1 + i64::from(sbx);
+        if target_pc < 0 || target_pc >= self.raw_word_count as i64 {
             return Err(TransformError::InvalidJumpTarget {
                 raw_pc,
-                target_raw: target.max(0) as usize,
-                instr_count: self.raw.common.instructions.len(),
+                target_raw: target_pc.max(0) as usize,
+                instr_count: self.raw_word_count,
             });
         }
-        Ok(target as usize)
+        self.ensure_targetable_pc(raw_pc, target_pc as u32)
     }
 
-    fn ensure_targetable_raw(
-        &self,
-        raw_pc: u32,
-        target_raw: usize,
-    ) -> Result<usize, TransformError> {
-        if target_raw >= self.raw.common.instructions.len() {
+    fn ensure_targetable_pc(&self, raw_pc: u32, target_pc: u32) -> Result<usize, TransformError> {
+        if target_pc as usize >= self.raw_word_count {
             return Err(TransformError::InvalidJumpTarget {
                 raw_pc,
-                target_raw,
-                instr_count: self.raw.common.instructions.len(),
+                target_raw: target_pc as usize,
+                instr_count: self.raw_word_count,
             });
         }
-        Ok(target_raw)
+
+        self.raw_pc_to_index.get(&target_pc).copied().ok_or(
+            TransformError::UntargetableRawInstruction {
+                raw_pc,
+                target_raw: target_pc as usize,
+            },
+        )
     }
 
     fn helper_jump(
         &self,
         raw_index: usize,
-        opcode: Lua51Opcode,
+        opcode: Lua52Opcode,
     ) -> Result<HelperJump, TransformError> {
-        let raw_pc = raw_pc(&self.raw.common.instructions[raw_index]);
-        let helper_index = raw_index + 1;
-        let Some(helper_instr) = self.raw.common.instructions.get(helper_index) else {
+        let raw_pc = raw_pc_at(self.raw, raw_index);
+        let helper_pc = raw_pc + 1;
+        let Some(helper_index) = self.raw_pc_to_index.get(&helper_pc).copied() else {
             return Err(TransformError::MissingHelperJump {
                 raw_pc,
                 opcode: opcode_label(opcode),
             });
         };
-        let (helper_opcode, helper_operands, helper_extra) = decode_lua51(helper_instr);
-        if helper_opcode != Lua51Opcode::Jmp {
+        let helper_instr = &self.raw.common.instructions[helper_index];
+        let (helper_opcode, helper_operands, helper_extra) = decode_lua52(helper_instr);
+        if helper_opcode != Lua52Opcode::Jmp {
             return Err(TransformError::InvalidHelperJump {
                 raw_pc,
                 helper_pc: helper_extra.pc,
                 found: opcode_label(helper_opcode),
             });
         }
-        let (_, helper_sbx) = expect_asbx(helper_extra.pc, helper_opcode, helper_operands)?;
+        let (a, helper_sbx) = expect_asbx(helper_extra.pc, helper_opcode, helper_operands)?;
 
         Ok(HelperJump {
             helper_index,
-            jump_target: self.jump_target(helper_extra.pc, helper_index, helper_sbx)?,
-            fallthrough_target: self.ensure_targetable_raw(raw_pc, raw_index + 2)?,
+            jump_target: self.jump_target(helper_extra.pc, helper_extra.pc, helper_sbx)?,
+            fallthrough_target: self
+                .ensure_targetable_pc(raw_pc, self.next_raw_pc(helper_index))?,
+            close_from: close_from_raw_a(a),
+            next_index: helper_index + 1,
         })
+    }
+
+    fn generic_for_pair(
+        &self,
+        raw_index: usize,
+        call_a: u8,
+        result_count: u16,
+    ) -> Result<GenericForPair, TransformError> {
+        let raw_pc = raw_pc_at(self.raw, raw_index);
+        let helper_pc = raw_pc + 1;
+        let Some(loop_index) = self.raw_pc_to_index.get(&helper_pc).copied() else {
+            return Err(TransformError::MissingGenericForLoop { raw_pc });
+        };
+        let helper_instr = &self.raw.common.instructions[loop_index];
+        let (helper_opcode, helper_operands, helper_extra) = decode_lua52(helper_instr);
+        if helper_opcode != Lua52Opcode::TForLoop {
+            return Err(TransformError::InvalidGenericForLoop {
+                raw_pc,
+                helper_pc: helper_extra.pc,
+                found: opcode_label(helper_opcode),
+            });
+        }
+        let (loop_a, helper_sbx) = expect_asbx(helper_extra.pc, helper_opcode, helper_operands)?;
+        if usize::from(loop_a) != usize::from(call_a) + 2 {
+            return Err(TransformError::InvalidGenericForPair {
+                raw_pc,
+                call_base: usize::from(call_a),
+                loop_control: usize::from(loop_a),
+            });
+        }
+
+        let control = reg_from_u8(loop_a);
+        Ok(GenericForPair {
+            loop_index,
+            control,
+            bindings: RegRange::new(Reg(control.index() + 1), usize::from(result_count)),
+            body_target: self.jump_target(helper_extra.pc, helper_extra.pc, helper_sbx)?,
+            exit_target: self.ensure_targetable_pc(raw_pc, self.next_raw_pc(loop_index))?,
+            next_index: loop_index + 1,
+        })
+    }
+
+    fn next_raw_pc(&self, raw_index: usize) -> u32 {
+        let instr = &self.raw.common.instructions[raw_index];
+        raw_pc(instr) + u32::from(word_len(instr))
     }
 
     fn set_pending_method(&mut self, callee: Reg, self_arg: Reg) {
@@ -1065,114 +1212,146 @@ struct HelperJump {
     helper_index: usize,
     jump_target: usize,
     fallthrough_target: usize,
+    close_from: Option<Reg>,
+    next_index: usize,
 }
 
-fn decode_lua51(raw: &RawInstr) -> (Lua51Opcode, &Lua51Operands, Lua51InstrExtra) {
-    let RawInstrOpcode::Lua51(opcode) = raw.opcode else {
-        unreachable!("lua51 lowerer should only decode lua51 opcodes");
+#[derive(Debug, Clone, Copy)]
+struct GenericForPair {
+    loop_index: usize,
+    control: Reg,
+    bindings: RegRange,
+    body_target: usize,
+    exit_target: usize,
+    next_index: usize,
+}
+
+fn decode_lua52(raw: &RawInstr) -> (Lua52Opcode, &Lua52Operands, Lua52InstrExtra) {
+    let RawInstrOpcode::Lua52(opcode) = raw.opcode else {
+        unreachable!("lua52 lowerer should only decode lua52 opcodes");
     };
-    let RawInstrOperands::Lua51(ref operands) = raw.operands else {
-        unreachable!("lua51 lowerer should only decode lua51 operands");
+    let RawInstrOperands::Lua52(ref operands) = raw.operands else {
+        unreachable!("lua52 lowerer should only decode lua52 operands");
     };
-    let DialectInstrExtra::Lua51(extra) = raw.extra else {
-        unreachable!("lua51 lowerer should only decode lua51 instruction extras");
+    let DialectInstrExtra::Lua52(extra) = raw.extra else {
+        unreachable!("lua52 lowerer should only decode lua52 instruction extras");
     };
     (opcode, operands, extra)
 }
 
 fn raw_pc(raw: &RawInstr) -> u32 {
-    let DialectInstrExtra::Lua51(extra) = raw.extra else {
-        unreachable!("lua51 lowerer should only decode lua51 instruction extras");
+    let DialectInstrExtra::Lua52(extra) = raw.extra else {
+        unreachable!("lua52 lowerer should only decode lua52 instruction extras");
     };
     extra.pc
 }
 
-fn opcode_at(raw: &RawProto, index: usize) -> Lua51Opcode {
-    let (opcode, _, _) = decode_lua51(&raw.common.instructions[index]);
+fn word_len(raw: &RawInstr) -> u8 {
+    let DialectInstrExtra::Lua52(extra) = raw.extra else {
+        unreachable!("lua52 lowerer should only decode lua52 instruction extras");
+    };
+    extra.word_len
+}
+
+fn raw_pc_at(raw: &RawProto, index: usize) -> u32 {
+    raw_pc(&raw.common.instructions[index])
+}
+
+fn opcode_at(raw: &RawProto, index: usize) -> Lua52Opcode {
+    let (opcode, _, _) = decode_lua52(&raw.common.instructions[index]);
     opcode
 }
 
-fn reg_from_u8(index: u8) -> Reg {
-    Reg(index as usize)
-}
-
-fn reg_from_u16(index: u16) -> Reg {
-    Reg(index as usize)
-}
-
-fn is_k(value: u16) -> bool {
-    value & BITRK != 0
-}
-
-fn index_k(value: u16) -> usize {
-    usize::from(value & !BITRK)
-}
-
-fn range_len_inclusive(start: usize, end: usize) -> usize {
-    end.saturating_sub(start) + 1
-}
-
-fn call_args_pack(a: u8, b: u16) -> ValuePack {
-    if b == 0 {
-        ValuePack::Open(Reg(usize::from(a) + 1))
+fn close_from_raw_a(a: u8) -> Option<Reg> {
+    if a == 0 {
+        None
     } else {
-        ValuePack::Fixed(RegRange::new(Reg(usize::from(a) + 1), usize::from(b - 1)))
+        Some(Reg(usize::from(a - 1)))
     }
 }
 
-fn call_result_pack(a: u8, c: u16) -> ResultPack {
-    match c {
-        0 => ResultPack::Open(reg_from_u8(a)),
-        1 => ResultPack::Ignore,
-        _ => ResultPack::Fixed(RegRange::new(reg_from_u8(a), usize::from(c - 1))),
-    }
-}
-
-fn return_pack(a: u8, b: u16) -> ValuePack {
-    if b == 0 {
-        ValuePack::Open(reg_from_u8(a))
-    } else {
-        ValuePack::Fixed(RegRange::new(reg_from_u8(a), usize::from(b - 1)))
-    }
-}
-
-fn unary_op_kind(opcode: Lua51Opcode) -> UnaryOpKind {
+fn unary_op_kind(opcode: Lua52Opcode) -> UnaryOpKind {
     match opcode {
-        Lua51Opcode::Unm => UnaryOpKind::Neg,
-        Lua51Opcode::Not => UnaryOpKind::Not,
-        Lua51Opcode::Len => UnaryOpKind::Length,
+        Lua52Opcode::Unm => UnaryOpKind::Neg,
+        Lua52Opcode::Not => UnaryOpKind::Not,
+        Lua52Opcode::Len => UnaryOpKind::Length,
         _ => unreachable!("only unary opcodes should reach unary_op_kind"),
     }
 }
 
-fn binary_op_kind(opcode: Lua51Opcode) -> BinaryOpKind {
+fn binary_op_kind(opcode: Lua52Opcode) -> BinaryOpKind {
     match opcode {
-        Lua51Opcode::Add => BinaryOpKind::Add,
-        Lua51Opcode::Sub => BinaryOpKind::Sub,
-        Lua51Opcode::Mul => BinaryOpKind::Mul,
-        Lua51Opcode::Div => BinaryOpKind::Div,
-        Lua51Opcode::Mod => BinaryOpKind::Mod,
-        Lua51Opcode::Pow => BinaryOpKind::Pow,
+        Lua52Opcode::Add => BinaryOpKind::Add,
+        Lua52Opcode::Sub => BinaryOpKind::Sub,
+        Lua52Opcode::Mul => BinaryOpKind::Mul,
+        Lua52Opcode::Div => BinaryOpKind::Div,
+        Lua52Opcode::Mod => BinaryOpKind::Mod,
+        Lua52Opcode::Pow => BinaryOpKind::Pow,
         _ => unreachable!("only arithmetic opcodes should reach binary_op_kind"),
     }
 }
 
-fn branch_predicate(opcode: Lua51Opcode) -> BranchPredicate {
+fn branch_predicate(opcode: Lua52Opcode) -> BranchPredicate {
     match opcode {
-        Lua51Opcode::Eq => BranchPredicate::Eq,
-        Lua51Opcode::Lt => BranchPredicate::Lt,
-        Lua51Opcode::Le => BranchPredicate::Le,
+        Lua52Opcode::Eq => BranchPredicate::Eq,
+        Lua52Opcode::Lt => BranchPredicate::Lt,
+        Lua52Opcode::Le => BranchPredicate::Le,
         _ => unreachable!("only compare opcodes should reach branch_predicate"),
+    }
+}
+
+fn opcode_label(opcode: Lua52Opcode) -> &'static str {
+    match opcode {
+        Lua52Opcode::Move => "MOVE",
+        Lua52Opcode::LoadK => "LOADK",
+        Lua52Opcode::LoadKx => "LOADKX",
+        Lua52Opcode::LoadBool => "LOADBOOL",
+        Lua52Opcode::LoadNil => "LOADNIL",
+        Lua52Opcode::GetUpVal => "GETUPVAL",
+        Lua52Opcode::GetTabUp => "GETTABUP",
+        Lua52Opcode::GetTable => "GETTABLE",
+        Lua52Opcode::SetTabUp => "SETTABUP",
+        Lua52Opcode::SetUpVal => "SETUPVAL",
+        Lua52Opcode::SetTable => "SETTABLE",
+        Lua52Opcode::NewTable => "NEWTABLE",
+        Lua52Opcode::Self_ => "SELF",
+        Lua52Opcode::Add => "ADD",
+        Lua52Opcode::Sub => "SUB",
+        Lua52Opcode::Mul => "MUL",
+        Lua52Opcode::Div => "DIV",
+        Lua52Opcode::Mod => "MOD",
+        Lua52Opcode::Pow => "POW",
+        Lua52Opcode::Unm => "UNM",
+        Lua52Opcode::Not => "NOT",
+        Lua52Opcode::Len => "LEN",
+        Lua52Opcode::Concat => "CONCAT",
+        Lua52Opcode::Jmp => "JMP",
+        Lua52Opcode::Eq => "EQ",
+        Lua52Opcode::Lt => "LT",
+        Lua52Opcode::Le => "LE",
+        Lua52Opcode::Test => "TEST",
+        Lua52Opcode::TestSet => "TESTSET",
+        Lua52Opcode::Call => "CALL",
+        Lua52Opcode::TailCall => "TAILCALL",
+        Lua52Opcode::Return => "RETURN",
+        Lua52Opcode::ForLoop => "FORLOOP",
+        Lua52Opcode::ForPrep => "FORPREP",
+        Lua52Opcode::TForCall => "TFORCALL",
+        Lua52Opcode::TForLoop => "TFORLOOP",
+        Lua52Opcode::SetList => "SETLIST",
+        Lua52Opcode::Closure => "CLOSURE",
+        Lua52Opcode::VarArg => "VARARG",
+        Lua52Opcode::ExtraArg => "EXTRAARG",
     }
 }
 
 fn expect_a(
     raw_pc: u32,
-    opcode: Lua51Opcode,
-    operands: &Lua51Operands,
+    opcode: Lua52Opcode,
+    operands: &Lua52Operands,
 ) -> Result<u8, TransformError> {
     match operands {
-        Lua51Operands::A { a } => Ok(*a),
+        Lua52Operands::A { a } => Ok(*a),
         _ => Err(TransformError::UnexpectedOperands {
             raw_pc,
             opcode: opcode_label(opcode),
@@ -1183,11 +1362,11 @@ fn expect_a(
 
 fn expect_ab(
     raw_pc: u32,
-    opcode: Lua51Opcode,
-    operands: &Lua51Operands,
+    opcode: Lua52Opcode,
+    operands: &Lua52Operands,
 ) -> Result<(u8, u16), TransformError> {
     match operands {
-        Lua51Operands::AB { a, b } => Ok((*a, *b)),
+        Lua52Operands::AB { a, b } => Ok((*a, *b)),
         _ => Err(TransformError::UnexpectedOperands {
             raw_pc,
             opcode: opcode_label(opcode),
@@ -1198,11 +1377,11 @@ fn expect_ab(
 
 fn expect_ac(
     raw_pc: u32,
-    opcode: Lua51Opcode,
-    operands: &Lua51Operands,
+    opcode: Lua52Opcode,
+    operands: &Lua52Operands,
 ) -> Result<(u8, u16), TransformError> {
     match operands {
-        Lua51Operands::AC { a, c } => Ok((*a, *c)),
+        Lua52Operands::AC { a, c } => Ok((*a, *c)),
         _ => Err(TransformError::UnexpectedOperands {
             raw_pc,
             opcode: opcode_label(opcode),
@@ -1213,11 +1392,11 @@ fn expect_ac(
 
 fn expect_abc(
     raw_pc: u32,
-    opcode: Lua51Opcode,
-    operands: &Lua51Operands,
+    opcode: Lua52Opcode,
+    operands: &Lua52Operands,
 ) -> Result<(u8, u16, u16), TransformError> {
     match operands {
-        Lua51Operands::ABC { a, b, c } => Ok((*a, *b, *c)),
+        Lua52Operands::ABC { a, b, c } => Ok((*a, *b, *c)),
         _ => Err(TransformError::UnexpectedOperands {
             raw_pc,
             opcode: opcode_label(opcode),
@@ -1228,11 +1407,11 @@ fn expect_abc(
 
 fn expect_abx(
     raw_pc: u32,
-    opcode: Lua51Opcode,
-    operands: &Lua51Operands,
+    opcode: Lua52Opcode,
+    operands: &Lua52Operands,
 ) -> Result<(u8, u32), TransformError> {
     match operands {
-        Lua51Operands::ABx { a, bx } => Ok((*a, *bx)),
+        Lua52Operands::ABx { a, bx } => Ok((*a, *bx)),
         _ => Err(TransformError::UnexpectedOperands {
             raw_pc,
             opcode: opcode_label(opcode),
@@ -1243,58 +1422,15 @@ fn expect_abx(
 
 fn expect_asbx(
     raw_pc: u32,
-    opcode: Lua51Opcode,
-    operands: &Lua51Operands,
+    opcode: Lua52Opcode,
+    operands: &Lua52Operands,
 ) -> Result<(u8, i32), TransformError> {
     match operands {
-        Lua51Operands::AsBx { a, sbx } => Ok((*a, *sbx)),
+        Lua52Operands::AsBx { a, sbx } => Ok((*a, *sbx)),
         _ => Err(TransformError::UnexpectedOperands {
             raw_pc,
             opcode: opcode_label(opcode),
             expected: "AsBx",
         }),
-    }
-}
-
-fn opcode_label(opcode: Lua51Opcode) -> &'static str {
-    match opcode {
-        Lua51Opcode::Move => "MOVE",
-        Lua51Opcode::LoadK => "LOADK",
-        Lua51Opcode::LoadBool => "LOADBOOL",
-        Lua51Opcode::LoadNil => "LOADNIL",
-        Lua51Opcode::GetUpVal => "GETUPVAL",
-        Lua51Opcode::GetGlobal => "GETGLOBAL",
-        Lua51Opcode::GetTable => "GETTABLE",
-        Lua51Opcode::SetGlobal => "SETGLOBAL",
-        Lua51Opcode::SetUpVal => "SETUPVAL",
-        Lua51Opcode::SetTable => "SETTABLE",
-        Lua51Opcode::NewTable => "NEWTABLE",
-        Lua51Opcode::Self_ => "SELF",
-        Lua51Opcode::Add => "ADD",
-        Lua51Opcode::Sub => "SUB",
-        Lua51Opcode::Mul => "MUL",
-        Lua51Opcode::Div => "DIV",
-        Lua51Opcode::Mod => "MOD",
-        Lua51Opcode::Pow => "POW",
-        Lua51Opcode::Unm => "UNM",
-        Lua51Opcode::Not => "NOT",
-        Lua51Opcode::Len => "LEN",
-        Lua51Opcode::Concat => "CONCAT",
-        Lua51Opcode::Jmp => "JMP",
-        Lua51Opcode::Eq => "EQ",
-        Lua51Opcode::Lt => "LT",
-        Lua51Opcode::Le => "LE",
-        Lua51Opcode::Test => "TEST",
-        Lua51Opcode::TestSet => "TESTSET",
-        Lua51Opcode::Call => "CALL",
-        Lua51Opcode::TailCall => "TAILCALL",
-        Lua51Opcode::Return => "RETURN",
-        Lua51Opcode::ForLoop => "FORLOOP",
-        Lua51Opcode::ForPrep => "FORPREP",
-        Lua51Opcode::TForLoop => "TFORLOOP",
-        Lua51Opcode::SetList => "SETLIST",
-        Lua51Opcode::Close => "CLOSE",
-        Lua51Opcode::Closure => "CLOSURE",
-        Lua51Opcode::VarArg => "VARARG",
     }
 }

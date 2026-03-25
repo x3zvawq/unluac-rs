@@ -131,8 +131,12 @@ mod parse_lua51_chunk {
             RawInstrOperands::Lua51(Lua51Operands::AB { a: 1, b: 0 })
         ));
 
-        let DialectInstrExtra::Lua51(first_extra) = instructions[0].extra;
-        let DialectInstrExtra::Lua51(last_extra) = instructions[14].extra;
+        let DialectInstrExtra::Lua51(first_extra) = instructions[0].extra else {
+            panic!("lua51 fixture should preserve lua51 instruction extras");
+        };
+        let DialectInstrExtra::Lua51(last_extra) = instructions[14].extra else {
+            panic!("lua51 fixture should preserve lua51 instruction extras");
+        };
 
         assert_eq!(
             first_extra,

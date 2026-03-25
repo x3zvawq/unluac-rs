@@ -5,3 +5,5 @@
 //! 过早统一。
 
 pub mod lua51;
+pub mod lua52;
+pub mod puc_lua;

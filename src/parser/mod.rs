@@ -13,14 +13,17 @@ mod reader;
 
 pub use debug::dump_parser;
 pub use dialect::lua51::*;
+pub use dialect::lua52::*;
 pub use error::ParseError;
 pub use options::{ParseMode, ParseOptions, StringDecodeMode, StringEncoding};
 pub use raw::*;
 
 use dialect::lua51::Lua51Parser;
+use dialect::lua52::Lua52Parser;
 
 const LUA_SIGNATURE: &[u8; 4] = b"\x1bLua";
 const LUA51_VERSION: u8 = 0x51;
+const LUA52_VERSION: u8 = 0x52;
 
 /// 根据 chunk header 自动选择对应 dialect parser。
 pub fn parse_chunk(bytes: &[u8], options: ParseOptions) -> Result<RawChunk, ParseError> {
@@ -38,6 +41,7 @@ pub fn parse_chunk(bytes: &[u8], options: ParseOptions) -> Result<RawChunk, Pars
 
     match bytes[4] {
         LUA51_VERSION => Lua51Parser::new(options).parse(bytes),
+        LUA52_VERSION => Lua52Parser::new(options).parse(bytes),
         found => Err(ParseError::UnsupportedVersion { found }),
     }
 }
@@ -45,4 +49,9 @@ pub fn parse_chunk(bytes: &[u8], options: ParseOptions) -> Result<RawChunk, Pars
 /// 直接按 Lua 5.1 规则解析 chunk，不做版本自动探测。
 pub fn parse_lua51_chunk(bytes: &[u8], options: ParseOptions) -> Result<RawChunk, ParseError> {
     Lua51Parser::new(options).parse(bytes)
+}
+
+/// 直接按 Lua 5.2 规则解析 chunk，不做版本自动探测。
+pub fn parse_lua52_chunk(bytes: &[u8], options: ParseOptions) -> Result<RawChunk, ParseError> {
+    Lua52Parser::new(options).parse(bytes)
 }

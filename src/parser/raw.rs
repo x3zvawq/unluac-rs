@@ -9,6 +9,10 @@ use super::dialect::lua51::{
     Lua51ConstPoolExtra, Lua51DebugExtra, Lua51HeaderExtra, Lua51InstrExtra, Lua51Opcode,
     Lua51Operands, Lua51ProtoExtra, Lua51UpvalueExtra,
 };
+use super::dialect::lua52::{
+    Lua52ConstPoolExtra, Lua52DebugExtra, Lua52HeaderExtra, Lua52InstrExtra, Lua52Opcode,
+    Lua52Operands, Lua52ProtoExtra, Lua52UpvalueExtra,
+};
 
 /// 一个完整解析后的 chunk。
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +48,7 @@ pub enum Dialect {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum DialectVersion {
     Lua51,
+    Lua52,
 }
 
 /// header 声明的字节序。
@@ -175,12 +180,14 @@ pub struct RawInstr {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum RawInstrOpcode {
     Lua51(Lua51Opcode),
+    Lua52(Lua52Opcode),
 }
 
 /// 各 dialect 自己的 operand 形态。
 #[derive(Debug, Clone, PartialEq)]
 pub enum RawInstrOperands {
     Lua51(Lua51Operands),
+    Lua52(Lua52Operands),
 }
 
 /// parser 产物关联到原始字节流的位置。
@@ -216,34 +223,40 @@ pub struct DecodedText {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DialectHeaderExtra {
     Lua51(Lua51HeaderExtra),
+    Lua52(Lua52HeaderExtra),
 }
 
 /// 各 dialect 在 proto 上附加的专属信息。
 #[derive(Debug, Clone, PartialEq)]
 pub enum DialectProtoExtra {
     Lua51(Lua51ProtoExtra),
+    Lua52(Lua52ProtoExtra),
 }
 
 /// 各 dialect 在常量池上附加的专属信息。
 #[derive(Debug, Clone, PartialEq)]
 pub enum DialectConstPoolExtra {
     Lua51(Lua51ConstPoolExtra),
+    Lua52(Lua52ConstPoolExtra),
 }
 
 /// 各 dialect 在 upvalue 信息上附加的专属内容。
 #[derive(Debug, Clone, PartialEq)]
 pub enum DialectUpvalueExtra {
     Lua51(Lua51UpvalueExtra),
+    Lua52(Lua52UpvalueExtra),
 }
 
 /// 各 dialect 在调试信息上附加的专属内容。
 #[derive(Debug, Clone, PartialEq)]
 pub enum DialectDebugExtra {
     Lua51(Lua51DebugExtra),
+    Lua52(Lua52DebugExtra),
 }
 
 /// 各 dialect 在指令上附加的专属内容。
 #[derive(Debug, Clone, PartialEq)]
 pub enum DialectInstrExtra {
     Lua51(Lua51InstrExtra),
+    Lua52(Lua52InstrExtra),
 }

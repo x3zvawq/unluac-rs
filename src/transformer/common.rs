@@ -205,6 +205,7 @@ pub enum ResultPack {
 pub enum AccessBase {
     Reg(Reg),
     Env,
+    Upvalue(UpvalueRef),
 }
 
 /// 表访问的 key。

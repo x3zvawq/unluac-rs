@@ -28,6 +28,18 @@ pub enum TransformError {
         helper_pc: u32,
         found: &'static str,
     },
+    #[error("opcode `{opcode}` at raw pc {raw_pc} must be followed by EXTRAARG")]
+    MissingExtraArg { raw_pc: u32, opcode: &'static str },
+    #[error(
+        "helper instruction after raw pc {raw_pc} must be EXTRAARG, found `{found}` at raw pc {helper_pc}"
+    )]
+    InvalidExtraArg {
+        raw_pc: u32,
+        helper_pc: u32,
+        found: &'static str,
+    },
+    #[error("unexpected standalone EXTRAARG at raw pc {raw_pc}")]
+    UnexpectedStandaloneExtraArg { raw_pc: u32 },
     #[error(
         "raw pc {raw_pc} references constant k{const_index}, but only {const_count} constants exist"
     )]
@@ -71,6 +83,24 @@ pub enum TransformError {
         raw_pc: u32,
         target_raw: usize,
         found: &'static str,
+    },
+    #[error("generic for call at raw pc {raw_pc} must be followed by TFORLOOP")]
+    MissingGenericForLoop { raw_pc: u32 },
+    #[error(
+        "generic for helper after raw pc {raw_pc} must be TFORLOOP, found `{found}` at raw pc {helper_pc}"
+    )]
+    InvalidGenericForLoop {
+        raw_pc: u32,
+        helper_pc: u32,
+        found: &'static str,
+    },
+    #[error(
+        "generic for pair at raw pc {raw_pc} is inconsistent: TFORCALL base r{call_base}, TFORLOOP control r{loop_control}"
+    )]
+    InvalidGenericForPair {
+        raw_pc: u32,
+        call_base: usize,
+        loop_control: usize,
     },
     #[error("closure at raw pc {raw_pc} is missing capture helper #{capture_index}")]
     MissingClosureCapture { raw_pc: u32, capture_index: usize },

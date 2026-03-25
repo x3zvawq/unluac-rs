@@ -332,6 +332,7 @@ fn resolve_luac(options: &CliOptions) -> Result<PathBuf, CliError> {
 
     Ok(match options.dialect {
         DecompileDialect::Lua51 => PathBuf::from("luac"),
+        DecompileDialect::Lua52 => PathBuf::from("lua5.2"),
     })
 }
 
@@ -393,10 +394,11 @@ fn print_help() {
     println!("usage:");
     println!("  cargo run -- --dialect=lua5.1");
     println!("  cargo run -- --dialect=lua5.1 --source tests/lua_cases/lua5.1/01_setfenv.lua");
+    println!("  cargo run -- --dialect=lua5.2 --source tests/lua_cases/lua5.2/02_env_redirect.lua");
     println!("  cargo run -- --dialect=lua5.1 --input /path/to/chunk.out --detail=verbose");
     println!();
     println!("options:");
-    println!("  --dialect <lua5.1>");
+    println!("  --dialect <lua5.1|lua5.2>");
     println!("  --input <chunk-path>");
     println!("  --source <lua-source-path>");
     println!("  --luac <luac-path>");
