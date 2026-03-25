@@ -3,7 +3,9 @@
 //! 它们直接手工构造 low-IR，而不是经过 parser/transformer，是为了让失败点
 //! 只指向 CFG / GraphFacts / Dataflow 自己的规则实现。
 
-use unluac::cfg::{EdgeKind, analyze_dataflow, analyze_graph_facts, build_cfg_graph};
+use unluac::cfg::{
+    EdgeKind, PhiId, SsaValue, analyze_dataflow, analyze_graph_facts, build_cfg_graph,
+};
 use unluac::parser::{
     ChunkHeader, Dialect, DialectConstPoolExtra, DialectDebugExtra, DialectHeaderExtra,
     DialectUpvalueExtra, DialectVersion, Endianness, Lua51ConstPoolExtra, Lua51DebugExtra,
@@ -176,6 +178,16 @@ mod analyze_dataflow_shared {
             use_defs.iter().map(|def| def.index()).collect::<Vec<_>>(),
             vec![1, 2]
         );
+        let reaching_values = &dataflow.reaching_values[5].fixed[&Reg(1)];
+        assert_eq!(
+            reaching_values.iter().copied().collect::<Vec<_>>(),
+            vec![SsaValue::Phi(PhiId(0))]
+        );
+        let use_values = &dataflow.use_values[5].fixed[&Reg(1)];
+        assert_eq!(
+            use_values.iter().copied().collect::<Vec<_>>(),
+            vec![SsaValue::Phi(PhiId(0))]
+        );
         assert_eq!(
             dataflow.live_in[3]
                 .iter()
@@ -217,6 +229,62 @@ mod analyze_dataflow_shared {
         );
         assert_eq!(dataflow.open_def_uses[0].len(), 1);
         assert_eq!(dataflow.open_def_uses[0][0].instr.index(), 1);
+    }
+
+    #[test]
+    fn treats_open_pack_fixed_prefix_as_real_fixed_uses() {
+        let chunk = chunk_with_instrs(vec![
+            LowInstr::LoadConst(LoadConstInstr {
+                dst: Reg(0),
+                value: unluac::transformer::ConstRef(0),
+            }),
+            LowInstr::GetTable(unluac::transformer::GetTableInstr {
+                dst: Reg(1),
+                base: unluac::transformer::AccessBase::Env,
+                key: unluac::transformer::AccessKey::Const(unluac::transformer::ConstRef(1)),
+            }),
+            LowInstr::Call(unluac::transformer::CallInstr {
+                callee: Reg(1),
+                args: ValuePack::Fixed(RegRange::new(Reg(2), 0)),
+                results: ResultPack::Open(Reg(1)),
+                kind: unluac::transformer::CallKind::Normal,
+            }),
+            LowInstr::Return(ReturnInstr {
+                values: ValuePack::Open(Reg(0)),
+            }),
+        ]);
+
+        let cfg = build_cfg_graph(&chunk);
+        let graph_facts = analyze_graph_facts(&cfg);
+        let dataflow = analyze_dataflow(&chunk, &cfg, &graph_facts);
+
+        assert_eq!(
+            dataflow.use_defs[3]
+                .fixed
+                .get(&Reg(0))
+                .expect("open pack prefix should count as fixed use")
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![dataflow.instr_defs[0][0]]
+        );
+        assert_eq!(
+            dataflow.use_values[3]
+                .fixed
+                .get(&Reg(0))
+                .expect("open pack prefix should count as fixed value use")
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![SsaValue::Def(dataflow.instr_defs[0][0])]
+        );
+        assert_eq!(
+            dataflow.open_use_defs[3]
+                .iter()
+                .map(|open_def| open_def.index())
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
     }
 
     #[test]

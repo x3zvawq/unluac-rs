@@ -212,7 +212,8 @@ mod lower_lua51_chunk {
         assert!(matches!(
             &instrs[18],
             LowInstr::GenericForLoop(instr)
-                if instr.control == RegRange::new(Reg(4), 3)
+                if instr.control == Reg(4)
+                    && instr.bindings == RegRange::new(Reg(5), 2)
                     && instr.body_target == InstrRef(10)
                     && instr.exit_target == InstrRef(19)
         ));
