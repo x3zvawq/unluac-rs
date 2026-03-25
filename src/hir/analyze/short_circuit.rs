@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::cfg::{BlockRef, DefId, PhiCandidate, PhiId, SsaValue};
+use crate::cfg::{BlockRef, CompactSet, DefId, PhiCandidate, PhiId, SsaValue};
 use crate::hir::common::{
     HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr, TempId,
 };
@@ -183,14 +183,14 @@ enum ChangedRegionEntry {
 
 fn classify_value_leaves(
     phi: &PhiCandidate,
-    entry_defs: &BTreeSet<DefId>,
+    entry_defs: &CompactSet<DefId>,
 ) -> Option<BTreeMap<BlockRef, ValueLeafKind>> {
     let mut leaf_kinds = BTreeMap::new();
     let mut has_preserved = false;
     let mut has_changed = false;
 
     for incoming in &phi.incoming {
-        let kind = if &incoming.defs == entry_defs {
+        let kind = if incoming.defs.iter().eq(entry_defs.iter()) {
             has_preserved = true;
             ValueLeafKind::Preserved
         } else {

@@ -571,6 +571,9 @@ fn lower_access_base_expr(
         AccessBase::Env => HirExpr::GlobalRef(HirGlobalRef {
             name: "_ENV".to_owned(),
         }),
+        AccessBase::Upvalue(upvalue) => {
+            HirExpr::UpvalueRef(lowering.bindings.upvalues[upvalue.index()])
+        }
     }
 }
 
@@ -585,6 +588,9 @@ fn lower_access_base_expr_inline(
         AccessBase::Env => HirExpr::GlobalRef(HirGlobalRef {
             name: "_ENV".to_owned(),
         }),
+        AccessBase::Upvalue(upvalue) => {
+            HirExpr::UpvalueRef(lowering.bindings.upvalues[upvalue.index()])
+        }
     }
 }
 
@@ -619,7 +625,7 @@ fn lower_table_access_expr_inline(
     base: AccessBase,
     key: AccessKey,
 ) -> HirExpr {
-    if matches!(base, AccessBase::Env)
+    if access_base_is_named_env(lowering.proto, base)
         && let Some(name) = global_name_from_key(lowering.proto, key)
     {
         return HirExpr::GlobalRef(HirGlobalRef { name });
@@ -629,6 +635,19 @@ fn lower_table_access_expr_inline(
         base: lower_access_base_expr_inline(lowering, block, instr_ref, base),
         key: lower_access_key_expr_inline(lowering, block, instr_ref, key),
     }))
+}
+
+fn access_base_is_named_env(proto: &LoweredProto, base: AccessBase) -> bool {
+    match base {
+        AccessBase::Env => true,
+        AccessBase::Upvalue(upvalue) => proto
+            .debug_info
+            .common
+            .upvalue_names
+            .get(upvalue.index())
+            .is_some_and(|name| decode_raw_string(name) == "_ENV"),
+        AccessBase::Reg(_) => false,
+    }
 }
 
 fn global_name_from_key(proto: &LoweredProto, key: AccessKey) -> Option<String> {

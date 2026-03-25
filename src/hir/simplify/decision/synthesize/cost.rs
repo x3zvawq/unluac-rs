@@ -4,8 +4,6 @@
 //! 回答一个更工程化的问题：当几种候选都等价时，哪一种更接近源码短路直觉、也更不容易
 //! 把共享子图机械展开成难读的乘积式。
 
-use std::collections::BTreeMap;
-
 use super::*;
 
 const AND_WITH_OR_CHILD_PENALTY: usize = 8;
@@ -50,12 +48,25 @@ fn structural_expr_cost(expr: &HirExpr) -> usize {
 }
 
 fn duplicate_atom_penalty(expr: &HirExpr) -> usize {
-    let mut counts = BTreeMap::new();
-    collect_atomic_occurrences(expr, &mut counts);
-    counts
-        .into_values()
-        .map(|count| count.saturating_sub(1))
-        .sum::<usize>()
+    let mut atoms = Vec::new();
+    collect_atomic_occurrences(expr, &mut atoms);
+    if atoms.len() < 2 {
+        return 0;
+    }
+
+    atoms.sort_unstable();
+
+    let mut duplicates = 0;
+    let mut run_len = 1usize;
+    for window in atoms.windows(2) {
+        if window[0] == window[1] {
+            run_len += 1;
+        } else {
+            duplicates += run_len.saturating_sub(1);
+            run_len = 1;
+        }
+    }
+    duplicates + run_len.saturating_sub(1)
 }
 
 fn logical_shape_penalty(expr: &HirExpr) -> usize {
@@ -172,28 +183,56 @@ fn expr_is_compact_logical_branch(expr: &HirExpr) -> bool {
     ) || matches!(expr, HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Eq)
 }
 
-fn collect_atomic_occurrences(expr: &HirExpr, counts: &mut BTreeMap<String, usize>) {
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+enum AtomicValueKey<'a> {
+    Nil,
+    Boolean(bool),
+    Integer(i64),
+    Number(u64),
+    String(&'a str),
+    Param(usize),
+    Local(usize),
+    Upvalue(usize),
+    Temp(usize),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+enum AtomicOccurrenceKey<'a> {
+    Value(AtomicValueKey<'a>),
+    Not(AtomicValueKey<'a>),
+}
+
+fn collect_atomic_occurrences<'a>(expr: &'a HirExpr, atoms: &mut Vec<AtomicOccurrenceKey<'a>>) {
+    if let Some(key) = atomic_value_key(expr) {
+        atoms.push(AtomicOccurrenceKey::Value(key));
+        return;
+    }
+
     match expr {
-        HirExpr::Nil => bump_atom("nil".to_owned(), counts),
-        HirExpr::Boolean(value) => bump_atom(format!("bool:{value}"), counts),
-        HirExpr::Integer(value) => bump_atom(format!("int:{value}"), counts),
-        HirExpr::Number(value) => bump_atom(format!("num:{:?}", value.to_bits()), counts),
-        HirExpr::String(value) => bump_atom(format!("str:{value}"), counts),
-        HirExpr::ParamRef(param) => bump_atom(format!("p{}", param.index()), counts),
-        HirExpr::LocalRef(local) => bump_atom(format!("l{}", local.index()), counts),
-        HirExpr::UpvalueRef(upvalue) => bump_atom(format!("u{}", upvalue.index()), counts),
-        HirExpr::TempRef(temp) => bump_atom(format!("t{}", temp.index()), counts),
-        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not && is_atomic_expr(&unary.expr) => {
-            bump_atom(format!("not({})", atomic_expr_key(&unary.expr)), counts);
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::TempRef(_) => {
+            unreachable!("atomic exprs should have been handled before recursing")
         }
-        HirExpr::Unary(unary) => collect_atomic_occurrences(&unary.expr, counts),
+        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not && is_atomic_expr(&unary.expr) => {
+            atoms.push(AtomicOccurrenceKey::Not(
+                atomic_value_key(&unary.expr).expect("atomic expr must map to an atomic key"),
+            ));
+        }
+        HirExpr::Unary(unary) => collect_atomic_occurrences(&unary.expr, atoms),
         HirExpr::Binary(binary) => {
-            collect_atomic_occurrences(&binary.lhs, counts);
-            collect_atomic_occurrences(&binary.rhs, counts);
+            collect_atomic_occurrences(&binary.lhs, atoms);
+            collect_atomic_occurrences(&binary.rhs, atoms);
         }
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            collect_atomic_occurrences(&logical.lhs, counts);
-            collect_atomic_occurrences(&logical.rhs, counts);
+            collect_atomic_occurrences(&logical.lhs, atoms);
+            collect_atomic_occurrences(&logical.rhs, atoms);
         }
         HirExpr::Decision(_)
         | HirExpr::GlobalRef(_)
@@ -204,10 +243,6 @@ fn collect_atomic_occurrences(expr: &HirExpr, counts: &mut BTreeMap<String, usiz
         | HirExpr::Closure(_)
         | HirExpr::Unresolved(_) => {}
     }
-}
-
-fn bump_atom(key: String, counts: &mut BTreeMap<String, usize>) {
-    *counts.entry(key).or_default() += 1;
 }
 
 fn is_atomic_expr(expr: &HirExpr) -> bool {
@@ -225,17 +260,17 @@ fn is_atomic_expr(expr: &HirExpr) -> bool {
     )
 }
 
-fn atomic_expr_key(expr: &HirExpr) -> String {
+fn atomic_value_key(expr: &HirExpr) -> Option<AtomicValueKey<'_>> {
     match expr {
-        HirExpr::Nil => "nil".to_owned(),
-        HirExpr::Boolean(value) => format!("bool:{value}"),
-        HirExpr::Integer(value) => format!("int:{value}"),
-        HirExpr::Number(value) => format!("num:{:?}", value.to_bits()),
-        HirExpr::String(value) => format!("str:{value}"),
-        HirExpr::ParamRef(param) => format!("p{}", param.index()),
-        HirExpr::LocalRef(local) => format!("l{}", local.index()),
-        HirExpr::UpvalueRef(upvalue) => format!("u{}", upvalue.index()),
-        HirExpr::TempRef(temp) => format!("t{}", temp.index()),
-        _ => "complex".to_owned(),
+        HirExpr::Nil => Some(AtomicValueKey::Nil),
+        HirExpr::Boolean(value) => Some(AtomicValueKey::Boolean(*value)),
+        HirExpr::Integer(value) => Some(AtomicValueKey::Integer(*value)),
+        HirExpr::Number(value) => Some(AtomicValueKey::Number(value.to_bits())),
+        HirExpr::String(value) => Some(AtomicValueKey::String(value.as_str())),
+        HirExpr::ParamRef(param) => Some(AtomicValueKey::Param(param.index())),
+        HirExpr::LocalRef(local) => Some(AtomicValueKey::Local(local.index())),
+        HirExpr::UpvalueRef(upvalue) => Some(AtomicValueKey::Upvalue(upvalue.index())),
+        HirExpr::TempRef(temp) => Some(AtomicValueKey::Temp(temp.index())),
+        _ => None,
     }
 }

@@ -11,3 +11,6 @@ mod common;
 
 #[path = "unit/lua51/mod.rs"]
 mod lua51;
+
+#[path = "unit/lua52/mod.rs"]
+mod lua52;

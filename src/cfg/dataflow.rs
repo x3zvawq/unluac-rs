@@ -11,13 +11,14 @@ use crate::transformer::{
 };
 
 use super::common::{
-    BlockRef, Cfg, CfgGraph, DataflowFacts, Def, DefId, EffectTag, GraphFacts, InstrEffect,
-    InstrReachingDefs, InstrReachingValues, InstrUseDefs, InstrUseValues, OpenDef, OpenDefId,
-    OpenUseSite, PhiCandidate, PhiId, PhiIncoming, SideEffectSummary, SsaValue, UseSite,
+    BlockRef, Cfg, CfgGraph, CompactSet, DataflowFacts, Def, DefId, EffectTag, GraphFacts,
+    InstrEffect, InstrReachingDefs, InstrReachingValues, InstrUseDefs, InstrUseValues, OpenDef,
+    OpenDefId, OpenUseSite, PhiCandidate, PhiId, PhiIncoming, RegValueMap, SideEffectSummary,
+    SsaValue, UseSite,
 };
 
-type FixedState = Vec<BTreeSet<DefId>>;
-type ValueState = Vec<BTreeSet<SsaValue>>;
+type FixedState = Vec<CompactSet<DefId>>;
+type ValueState = Vec<CompactSet<SsaValue>>;
 
 struct DefLookupTables {
     fixed: Vec<BTreeMap<Reg, DefId>>,
@@ -149,8 +150,8 @@ fn analyze_proto_dataflow(
     }
 
     let mut block_state = BlockReachingState {
-        fixed_in: vec![vec![BTreeSet::new(); reg_count]; cfg.blocks.len()],
-        fixed_out: vec![vec![BTreeSet::new(); reg_count]; cfg.blocks.len()],
+        fixed_in: vec![vec![CompactSet::Empty; reg_count]; cfg.blocks.len()],
+        fixed_out: vec![vec![CompactSet::Empty; reg_count]; cfg.blocks.len()],
         open_in: vec![BTreeSet::new(); cfg.blocks.len()],
         open_out: vec![BTreeSet::new(); cfg.blocks.len()],
     };
@@ -315,7 +316,7 @@ fn materialize_instruction_facts(
             instruction_facts.open_reaching_defs[instr_index] = current_open.clone();
 
             let fixed_use_regs = resolved_fixed_use_regs(effect, &current_open, open_defs);
-            let mut fixed_use_defs = BTreeMap::new();
+            let mut fixed_use_defs = RegValueMap::with_reg_count(current_fixed.len());
             for reg in &fixed_use_regs {
                 let defs = current_fixed.get(reg.index()).cloned().unwrap_or_default();
                 for def in &defs {
@@ -377,8 +378,8 @@ fn solve_liveness(
             let effect = &instr_effects[instr_index];
 
             for reg in instruction_facts.use_defs[instr_index].fixed.keys() {
-                if !seen_defs.contains(reg) {
-                    block_uses[block.index()].insert(*reg);
+                if !seen_defs.contains(&reg) {
+                    block_uses[block.index()].insert(reg);
                 }
             }
 
@@ -468,7 +469,7 @@ fn compute_phi_candidates(
     graph_facts: &GraphFacts,
     defs: &[Def],
     live_in: &[BTreeSet<Reg>],
-    block_out: &[Vec<BTreeSet<DefId>>],
+    block_out: &[Vec<CompactSet<DefId>>],
     fixed_def_lookup: &[BTreeMap<Reg, DefId>],
 ) -> Vec<PhiCandidate> {
     let mut def_blocks = BTreeMap::<Reg, BTreeSet<BlockRef>>::new();
@@ -514,7 +515,7 @@ fn build_phi_candidate(
     cfg: &Cfg,
     block: BlockRef,
     reg: Reg,
-    block_out: &[Vec<BTreeSet<DefId>>],
+    block_out: &[Vec<CompactSet<DefId>>],
 ) -> Option<PhiCandidate> {
     let mut incoming = Vec::new();
     let mut distinct_defs = BTreeSet::new();
@@ -534,7 +535,10 @@ fn build_phi_candidate(
         }
 
         distinct_defs.extend(defs.iter().copied());
-        incoming.push(PhiIncoming { pred, defs });
+        incoming.push(PhiIncoming {
+            pred,
+            defs: defs.iter().copied().collect(),
+        });
     }
 
     if incoming.len() < 2 || distinct_defs.len() < 2 {
@@ -561,8 +565,8 @@ fn materialize_value_facts(
 ) {
     let phi_by_block = index_phi_candidates_by_block(cfg, phi_candidates);
     let mut block_state = BlockValueState {
-        fixed_in: vec![vec![BTreeSet::new(); reg_count]; cfg.blocks.len()],
-        fixed_out: vec![vec![BTreeSet::new(); reg_count]; cfg.blocks.len()],
+        fixed_in: vec![vec![CompactSet::Empty; reg_count]; cfg.blocks.len()],
+        fixed_out: vec![vec![CompactSet::Empty; reg_count]; cfg.blocks.len()],
     };
 
     solve_reaching_values(
@@ -591,7 +595,7 @@ fn materialize_value_facts(
                 &instruction_facts.open_reaching_defs[instr_index],
                 ctx.open_defs,
             );
-            let mut fixed_use_values = BTreeMap::new();
+            let mut fixed_use_values = RegValueMap::with_reg_count(current_fixed.len());
             for reg in &fixed_use_regs {
                 fixed_use_values.insert(
                     *reg,
@@ -702,7 +706,7 @@ fn merge_predecessor_value_state(
     block_out: &[ValueState],
 ) -> ValueState {
     let reg_count = block_out.first().map_or(0, Vec::len);
-    let mut merged_fixed = vec![BTreeSet::new(); reg_count];
+    let mut merged_fixed = vec![CompactSet::Empty; reg_count];
 
     for edge_ref in &cfg.preds[block.index()] {
         let pred = cfg.edges[edge_ref.index()].from;
@@ -719,27 +723,27 @@ fn merge_predecessor_value_state(
 }
 
 fn apply_block_phi_values(
-    state: &mut [BTreeSet<SsaValue>],
+    state: &mut [CompactSet<SsaValue>],
     phi_candidates: &[PhiCandidate],
     phi_ids: &[PhiId],
 ) {
     for phi_id in phi_ids {
         let phi = &phi_candidates[phi_id.index()];
-        state[phi.reg.index()] = BTreeSet::from([SsaValue::Phi(*phi_id)]);
+        state[phi.reg.index()] = CompactSet::singleton(SsaValue::Phi(*phi_id));
     }
 }
 
 fn apply_value_transfer(
     effect: &InstrEffect,
     fixed_def_lookup: &BTreeMap<Reg, DefId>,
-    fixed_state: &mut [BTreeSet<SsaValue>],
+    fixed_state: &mut [CompactSet<SsaValue>],
 ) {
     for reg in &effect.fixed_must_defs {
         let def = fixed_def_lookup
             .get(reg)
             .copied()
             .expect("must-def register should already have a concrete DefId");
-        fixed_state[reg.index()] = BTreeSet::from([SsaValue::Def(def)]);
+        fixed_state[reg.index()] = CompactSet::singleton(SsaValue::Def(def));
     }
 
     for reg in &effect.fixed_may_defs {
@@ -751,20 +755,10 @@ fn apply_value_transfer(
     }
 }
 
-fn snapshot_value_state(state: &[BTreeSet<SsaValue>]) -> InstrReachingValues {
-    let fixed = state
-        .iter()
-        .enumerate()
-        .filter_map(|(index, values)| {
-            if values.is_empty() {
-                None
-            } else {
-                Some((Reg(index), values.clone()))
-            }
-        })
-        .collect();
-
-    InstrReachingValues { fixed }
+fn snapshot_value_state(state: &[CompactSet<SsaValue>]) -> InstrReachingValues {
+    InstrReachingValues {
+        fixed: RegValueMap::from_state(state),
+    }
 }
 
 fn block_defines_reg(
@@ -783,11 +777,11 @@ fn block_defines_reg(
 fn merge_predecessor_state(
     cfg: &Cfg,
     block: BlockRef,
-    block_out: &[Vec<BTreeSet<DefId>>],
+    block_out: &[Vec<CompactSet<DefId>>],
     open_block_out: &[BTreeSet<OpenDefId>],
-) -> (Vec<BTreeSet<DefId>>, BTreeSet<OpenDefId>) {
+) -> (Vec<CompactSet<DefId>>, BTreeSet<OpenDefId>) {
     let reg_count = block_out.first().map_or(0, Vec::len);
-    let mut merged_fixed = vec![BTreeSet::new(); reg_count];
+    let mut merged_fixed = vec![CompactSet::Empty; reg_count];
     let mut merged_open = BTreeSet::new();
 
     for edge_ref in &cfg.preds[block.index()] {
@@ -810,7 +804,7 @@ fn apply_transfer(
     fixed_def_lookup: &BTreeMap<Reg, DefId>,
     open_must_def_lookup: Option<OpenDefId>,
     open_may_def_lookup: Option<OpenDefId>,
-    fixed_state: &mut [BTreeSet<DefId>],
+    fixed_state: &mut [CompactSet<DefId>],
     open_state: &mut BTreeSet<OpenDefId>,
 ) {
     for reg in &effect.fixed_must_defs {
@@ -818,7 +812,7 @@ fn apply_transfer(
             .get(reg)
             .copied()
             .expect("must-def register should already have a concrete DefId");
-        fixed_state[reg.index()] = BTreeSet::from([def]);
+        fixed_state[reg.index()] = CompactSet::singleton(def);
     }
 
     for reg in &effect.fixed_may_defs {
@@ -839,20 +833,10 @@ fn apply_transfer(
     }
 }
 
-fn snapshot_fixed_state(state: &[BTreeSet<DefId>]) -> InstrReachingDefs {
-    let fixed = state
-        .iter()
-        .enumerate()
-        .filter_map(|(index, defs)| {
-            if defs.is_empty() {
-                None
-            } else {
-                Some((Reg(index), defs.clone()))
-            }
-        })
-        .collect();
-
-    InstrReachingDefs { fixed }
+fn snapshot_fixed_state(state: &[CompactSet<DefId>]) -> InstrReachingDefs {
+    InstrReachingDefs {
+        fixed: RegValueMap::from_state(state),
+    }
 }
 
 fn compute_reg_count(proto: &LoweredProto, instr_effects: &[InstrEffect]) -> usize {
@@ -1016,14 +1000,26 @@ fn compute_side_effect_summary(instr: &LowInstr) -> SideEffectSummary {
         }
         LowInstr::GetTable(instr) => {
             tags.insert(EffectTag::ReadTable);
-            if matches!(instr.base, AccessBase::Env) {
-                tags.insert(EffectTag::ReadEnv);
+            match instr.base {
+                AccessBase::Env => {
+                    tags.insert(EffectTag::ReadEnv);
+                }
+                AccessBase::Upvalue(_) => {
+                    tags.insert(EffectTag::ReadUpvalue);
+                }
+                AccessBase::Reg(_) => {}
             }
         }
         LowInstr::SetTable(instr) => {
             tags.insert(EffectTag::WriteTable);
-            if matches!(instr.base, AccessBase::Env) {
-                tags.insert(EffectTag::WriteEnv);
+            match instr.base {
+                AccessBase::Env => {
+                    tags.insert(EffectTag::WriteEnv);
+                }
+                AccessBase::Upvalue(_) => {
+                    tags.insert(EffectTag::ReadUpvalue);
+                }
+                AccessBase::Reg(_) => {}
             }
         }
         LowInstr::NewTable(_instr) => {

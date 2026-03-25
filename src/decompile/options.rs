@@ -15,12 +15,14 @@ use super::state::DecompileStage;
 pub enum DecompileDialect {
     #[default]
     Lua51,
+    Lua52,
 }
 
 impl DecompileDialect {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Lua51 => "lua5.1",
+            Self::Lua52 => "lua5.2",
         }
     }
 
@@ -28,6 +30,7 @@ impl DecompileDialect {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "lua5.1" | "lua51" => Some(Self::Lua51),
+            "lua5.2" | "lua52" => Some(Self::Lua52),
             _ => None,
         }
     }

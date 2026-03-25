@@ -3,14 +3,15 @@
 //! CFG/GraphFacts/Dataflow 都是跨 dialect 共享的，所以观察视图也放在这一层，
 //! 让 CLI、主 pipeline 和单测都复用同一套稳定文本格式。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use crate::debug::{DebugDetail, DebugFilters};
 use crate::transformer::{LowInstr, LoweredChunk, LoweredProto, Reg};
 
 use super::common::{
-    BlockRef, CfgGraph, DataflowFacts, DefId, EffectTag, GraphFacts, OpenDefId, SsaValue,
+    BlockRef, CfgGraph, CompactSet, DataflowFacts, DefId, EffectTag, GraphFacts, OpenDefId,
+    RegValueMap, SsaValue,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -471,24 +472,33 @@ fn format_reg_set(regs: &BTreeSet<Reg>) -> String {
     }
 }
 
-fn format_reaching_defs(defs: &BTreeMap<Reg, BTreeSet<DefId>>) -> String {
-    if defs.is_empty() {
+fn format_reaching_defs(defs: &RegValueMap<DefId>) -> String {
+    if defs.iter().next().is_none() {
         "[-]".to_owned()
     } else {
         defs.iter()
-            .map(|(reg, defs)| format!("{}<-{}", format_reg(*reg), format_def_set(defs)))
+            .map(|(reg, defs)| format!("{}<-{}", format_reg(reg), format_def_set(defs)))
             .collect::<Vec<_>>()
             .join(" ")
     }
 }
 
-fn format_def_set(defs: &BTreeSet<DefId>) -> String {
+fn format_def_set(defs: &CompactSet<DefId>) -> String {
+    format_def_iter(defs.iter())
+}
+
+fn format_btree_def_set(defs: &BTreeSet<DefId>) -> String {
+    format_def_iter(defs.iter())
+}
+
+fn format_def_iter<'a>(defs: impl Iterator<Item = &'a DefId>) -> String {
+    let defs = defs.collect::<Vec<_>>();
     if defs.is_empty() {
         "[-]".to_owned()
     } else {
         format!(
             "[{}]",
-            defs.iter()
+            defs.into_iter()
                 .map(|def| format!("def{}", def.index()))
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -496,19 +506,19 @@ fn format_def_set(defs: &BTreeSet<DefId>) -> String {
     }
 }
 
-fn format_reaching_values(values: &BTreeMap<Reg, BTreeSet<SsaValue>>) -> String {
-    if values.is_empty() {
+fn format_reaching_values(values: &RegValueMap<SsaValue>) -> String {
+    if values.iter().next().is_none() {
         "[-]".to_owned()
     } else {
         values
             .iter()
-            .map(|(reg, values)| format!("{}<-{}", format_reg(*reg), format_value_set(values)))
+            .map(|(reg, values)| format!("{}<-{}", format_reg(reg), format_value_set(values)))
             .collect::<Vec<_>>()
             .join(" ")
     }
 }
 
-fn format_value_set(values: &BTreeSet<SsaValue>) -> String {
+fn format_value_set(values: &CompactSet<SsaValue>) -> String {
     if values.is_empty() {
         "[-]".to_owned()
     } else {
@@ -561,7 +571,7 @@ fn format_phi_incoming(incoming: &[super::common::PhiIncoming]) -> String {
             format!(
                 "#{}:{}",
                 incoming.pred.index(),
-                format_def_set(&incoming.defs)
+                format_btree_def_set(&incoming.defs)
             )
         })
         .collect::<Vec<_>>()

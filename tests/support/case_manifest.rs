@@ -28,7 +28,8 @@ impl LuaCaseDialect {
     pub(crate) const fn decompile_dialect(self) -> Option<DecompileDialect> {
         match self {
             Self::Lua51 => Some(DecompileDialect::Lua51),
-            Self::Lua52 | Self::Lua53 | Self::Lua54 => None,
+            Self::Lua52 => Some(DecompileDialect::Lua52),
+            Self::Lua53 | Self::Lua54 => None,
         }
     }
 
@@ -293,6 +294,10 @@ pub(crate) const ALL_CASES: &[LuaCaseManifestEntry] = &[
     ),
     LuaCaseManifestEntry::new(
         "tests/lua_cases/lua5.2/02_env_redirect.lua",
+        LuaCaseDialect::Lua52,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.2/03_extraarg_boundary.lua",
         LuaCaseDialect::Lua52,
     ),
     LuaCaseManifestEntry::new(

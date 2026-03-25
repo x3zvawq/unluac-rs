@@ -54,6 +54,7 @@ fn stabilize_block(block: &mut HirBlock) -> bool {
         };
 
         install_constructor_seed(&mut block.stmts[index], rebuilt_ctor);
+        debug_assert!(end_index > index, "constructor rewrite must consume at least one trailing stmt");
         block.stmts.drain(index + 1..=end_index);
         changed = true;
         index += 1;
@@ -148,18 +149,18 @@ fn try_rebuild_constructor_region(
         }
         if let Some(set_list) = table_set_list_step(stmt, binding) {
             steps.push(RegionStep::SetList(set_list));
-            return rebuild_constructor_from_steps(constructor, &steps, &block.stmts[index + 1..])
-                .map(|constructor| (constructor, index));
+            index += 1;
+            continue;
         }
         break;
     }
 
     if steps.is_empty() {
-        None
-    } else {
-        rebuild_record_only_constructor(constructor, &steps, &block.stmts[index..])
-            .map(|constructor| (constructor, index.saturating_sub(1)))
+        return None;
     }
+
+    rebuild_constructor_from_steps(constructor, &steps, &block.stmts[index..])
+        .map(|constructor| (constructor, index.saturating_sub(1)))
 }
 
 fn keyed_write_step(
@@ -250,15 +251,7 @@ fn rebuild_constructor_from_steps(
     steps: &[RegionStep],
     remaining_stmts: &[HirStmt],
 ) -> Option<HirTableConstructor> {
-    let terminal = match steps.last() {
-        Some(RegionStep::SetList(set_list)) => set_list,
-        _ => return None,
-    };
-    if terminal.start_index != next_array_index(&constructor) {
-        return None;
-    }
-
-    let mut pending_fixed = terminal.values.clone();
+    let remaining_uses = collect_stmt_slice_bindings(remaining_stmts);
     let mut pending_producers = Vec::<(TableBinding, HirExpr)>::new();
     let mut consumed = std::collections::BTreeSet::new();
 
@@ -266,24 +259,13 @@ fn rebuild_constructor_from_steps(
         match step {
             RegionStep::Producer(binding, value) => {
                 pending_producers.push((*binding, value.clone()));
-                if pending_fixed
-                    .first()
-                    .is_some_and(|first| matches_binding_ref(first, *binding))
-                {
-                    if stmt_slice_uses_binding(remaining_stmts, *binding) {
-                        return None;
-                    }
-                    constructor.fields.push(HirTableField::Array(value.clone()));
-                    pending_fixed.remove(0);
-                    consumed.insert(*binding);
-                }
             }
             RegionStep::Record(field) => {
-                let value = inline_record_value(
+                let value = inline_constructor_value(
                     &field.value,
                     &pending_producers,
                     &mut consumed,
-                    remaining_stmts,
+                    &remaining_uses,
                 )?;
                 constructor.fields.push(HirTableField::Record(
                     crate::hir::common::HirRecordField {
@@ -293,18 +275,18 @@ fn rebuild_constructor_from_steps(
                 ));
             }
             RegionStep::SetList(set_list) => {
-                for value in &pending_fixed {
-                    if expr_depends_on_any_binding(
+                if set_list.start_index != next_array_index(&constructor) {
+                    return None;
+                }
+
+                for value in &set_list.values {
+                    let value = inline_constructor_value(
                         value,
-                        &pending_producers
-                            .iter()
-                            .filter(|(binding, _)| !consumed.contains(binding))
-                            .map(|(binding, _)| *binding)
-                            .collect::<Vec<_>>(),
-                    ) {
-                        return None;
-                    }
-                    constructor.fields.push(HirTableField::Array(value.clone()));
+                        &pending_producers,
+                        &mut consumed,
+                        &remaining_uses,
+                    )?;
+                    constructor.fields.push(HirTableField::Array(value));
                 }
                 if let Some(trailing) = &set_list.trailing_multivalue {
                     if expr_depends_on_any_binding(
@@ -319,48 +301,16 @@ fn rebuild_constructor_from_steps(
                     }
                     constructor.trailing_multivalue = Some(trailing.clone());
                 }
+
+                if pending_producers
+                    .iter()
+                    .any(|(binding, _)| !consumed.contains(binding))
+                {
+                    return None;
+                }
+                pending_producers.clear();
+                consumed.clear();
             }
-        }
-    }
-
-    if pending_producers
-        .iter()
-        .any(|(binding, _)| !consumed.contains(binding))
-    {
-        return None;
-    }
-
-    Some(constructor)
-}
-
-fn rebuild_record_only_constructor(
-    mut constructor: HirTableConstructor,
-    steps: &[RegionStep],
-    remaining_stmts: &[HirStmt],
-) -> Option<HirTableConstructor> {
-    let mut pending_producers = Vec::<(TableBinding, HirExpr)>::new();
-    let mut consumed = std::collections::BTreeSet::new();
-
-    for step in steps {
-        match step {
-            RegionStep::Producer(binding, value) => {
-                pending_producers.push((*binding, value.clone()));
-            }
-            RegionStep::Record(field) => {
-                let value = inline_record_value(
-                    &field.value,
-                    &pending_producers,
-                    &mut consumed,
-                    remaining_stmts,
-                )?;
-                constructor.fields.push(HirTableField::Record(
-                    crate::hir::common::HirRecordField {
-                        key: field.key.clone(),
-                        value,
-                    },
-                ));
-            }
-            RegionStep::SetList(_) => return None,
         }
     }
 
@@ -421,19 +371,207 @@ fn is_identifier_name(name: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-fn stmt_slice_uses_binding(stmts: &[HirStmt], binding: TableBinding) -> bool {
-    stmts.iter().any(|stmt| stmt_uses_binding(stmt, binding))
+fn collect_stmt_slice_bindings(stmts: &[HirStmt]) -> std::collections::BTreeSet<TableBinding> {
+    let mut bindings = std::collections::BTreeSet::new();
+    for stmt in stmts {
+        collect_stmt_bindings(stmt, &mut bindings);
+    }
+    bindings
 }
 
-fn inline_record_value(
+fn collect_stmt_bindings(stmt: &HirStmt, bindings: &mut std::collections::BTreeSet<TableBinding>) {
+    match stmt {
+        HirStmt::LocalDecl(local_decl) => {
+            for value in &local_decl.values {
+                collect_expr_bindings(value, bindings);
+            }
+        }
+        HirStmt::Assign(assign) => {
+            for target in &assign.targets {
+                collect_lvalue_bindings(target, bindings);
+            }
+            for value in &assign.values {
+                collect_expr_bindings(value, bindings);
+            }
+        }
+        HirStmt::TableSetList(set_list) => {
+            collect_expr_bindings(&set_list.base, bindings);
+            for value in &set_list.values {
+                collect_expr_bindings(value, bindings);
+            }
+            if let Some(trailing) = &set_list.trailing_multivalue {
+                collect_expr_bindings(trailing, bindings);
+            }
+        }
+        HirStmt::CallStmt(call_stmt) => collect_call_bindings(&call_stmt.call, bindings),
+        HirStmt::Return(ret) => {
+            for value in &ret.values {
+                collect_expr_bindings(value, bindings);
+            }
+        }
+        HirStmt::If(if_stmt) => {
+            collect_expr_bindings(&if_stmt.cond, bindings);
+            collect_stmt_slice_bindings_into(&if_stmt.then_block.stmts, bindings);
+            if let Some(else_block) = &if_stmt.else_block {
+                collect_stmt_slice_bindings_into(&else_block.stmts, bindings);
+            }
+        }
+        HirStmt::While(while_stmt) => {
+            collect_expr_bindings(&while_stmt.cond, bindings);
+            collect_stmt_slice_bindings_into(&while_stmt.body.stmts, bindings);
+        }
+        HirStmt::Repeat(repeat_stmt) => {
+            collect_stmt_slice_bindings_into(&repeat_stmt.body.stmts, bindings);
+            collect_expr_bindings(&repeat_stmt.cond, bindings);
+        }
+        HirStmt::NumericFor(numeric_for) => {
+            collect_expr_bindings(&numeric_for.start, bindings);
+            collect_expr_bindings(&numeric_for.limit, bindings);
+            collect_expr_bindings(&numeric_for.step, bindings);
+            collect_stmt_slice_bindings_into(&numeric_for.body.stmts, bindings);
+        }
+        HirStmt::GenericFor(generic_for) => {
+            for value in &generic_for.iterator {
+                collect_expr_bindings(value, bindings);
+            }
+            collect_stmt_slice_bindings_into(&generic_for.body.stmts, bindings);
+        }
+        HirStmt::Block(block) => collect_stmt_slice_bindings_into(&block.stmts, bindings),
+        HirStmt::Unstructured(unstructured) => {
+            collect_stmt_slice_bindings_into(&unstructured.body.stmts, bindings);
+        }
+        HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => {}
+    }
+}
+
+fn collect_stmt_slice_bindings_into(
+    stmts: &[HirStmt],
+    bindings: &mut std::collections::BTreeSet<TableBinding>,
+) {
+    for stmt in stmts {
+        collect_stmt_bindings(stmt, bindings);
+    }
+}
+
+fn collect_lvalue_bindings(
+    lvalue: &HirLValue,
+    bindings: &mut std::collections::BTreeSet<TableBinding>,
+) {
+    match lvalue {
+        HirLValue::Temp(temp) => {
+            bindings.insert(TableBinding::Temp(*temp));
+        }
+        HirLValue::Local(local) => {
+            bindings.insert(TableBinding::Local(*local));
+        }
+        HirLValue::TableAccess(access) => {
+            collect_expr_bindings(&access.base, bindings);
+            collect_expr_bindings(&access.key, bindings);
+        }
+        HirLValue::Upvalue(_) | HirLValue::Global(_) => {}
+    }
+}
+
+fn collect_call_bindings(
+    call: &crate::hir::common::HirCallExpr,
+    bindings: &mut std::collections::BTreeSet<TableBinding>,
+) {
+    collect_expr_bindings(&call.callee, bindings);
+    for arg in &call.args {
+        collect_expr_bindings(arg, bindings);
+    }
+}
+
+fn collect_expr_bindings(expr: &HirExpr, bindings: &mut std::collections::BTreeSet<TableBinding>) {
+    if let Some(binding) = binding_from_expr(expr) {
+        bindings.insert(binding);
+        return;
+    }
+
+    match expr {
+        HirExpr::TableAccess(access) => {
+            collect_expr_bindings(&access.base, bindings);
+            collect_expr_bindings(&access.key, bindings);
+        }
+        HirExpr::Unary(unary) => collect_expr_bindings(&unary.expr, bindings),
+        HirExpr::Binary(binary) => {
+            collect_expr_bindings(&binary.lhs, bindings);
+            collect_expr_bindings(&binary.rhs, bindings);
+        }
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            collect_expr_bindings(&logical.lhs, bindings);
+            collect_expr_bindings(&logical.rhs, bindings);
+        }
+        HirExpr::Decision(decision) => {
+            for node in &decision.nodes {
+                collect_expr_bindings(&node.test, bindings);
+                collect_decision_target_bindings(&node.truthy, bindings);
+                collect_decision_target_bindings(&node.falsy, bindings);
+            }
+        }
+        HirExpr::Call(call) => collect_call_bindings(call, bindings),
+        HirExpr::TableConstructor(table) => {
+            for field in &table.fields {
+                match field {
+                    HirTableField::Array(expr) => collect_expr_bindings(expr, bindings),
+                    HirTableField::Record(field) => {
+                        collect_table_key_bindings(&field.key, bindings);
+                        collect_expr_bindings(&field.value, bindings);
+                    }
+                }
+            }
+            if let Some(trailing) = &table.trailing_multivalue {
+                collect_expr_bindings(trailing, bindings);
+            }
+        }
+        HirExpr::Closure(closure) => {
+            for capture in &closure.captures {
+                collect_expr_bindings(&capture.value, bindings);
+            }
+        }
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::ParamRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::VarArg
+        | HirExpr::Unresolved(_) => {}
+        HirExpr::LocalRef(_) | HirExpr::TempRef(_) => {}
+    }
+}
+
+fn collect_decision_target_bindings(
+    target: &crate::hir::common::HirDecisionTarget,
+    bindings: &mut std::collections::BTreeSet<TableBinding>,
+) {
+    match target {
+        crate::hir::common::HirDecisionTarget::Expr(expr) => collect_expr_bindings(expr, bindings),
+        crate::hir::common::HirDecisionTarget::Node(_)
+        | crate::hir::common::HirDecisionTarget::CurrentValue => {}
+    }
+}
+
+fn collect_table_key_bindings(
+    key: &HirTableKey,
+    bindings: &mut std::collections::BTreeSet<TableBinding>,
+) {
+    if let HirTableKey::Expr(expr) = key {
+        collect_expr_bindings(expr, bindings);
+    }
+}
+
+fn inline_constructor_value(
     value: &HirExpr,
     pending_producers: &[(TableBinding, HirExpr)],
     consumed: &mut std::collections::BTreeSet<TableBinding>,
-    remaining_stmts: &[HirStmt],
+    remaining_uses: &std::collections::BTreeSet<TableBinding>,
 ) -> Option<HirExpr> {
     for (binding, producer_value) in pending_producers {
         if matches_binding_ref(value, *binding) {
-            if stmt_slice_uses_binding(remaining_stmts, *binding) {
+            if remaining_uses.contains(binding) {
                 return None;
             }
             consumed.insert(*binding);
@@ -455,89 +593,9 @@ fn inline_record_value(
     }
 }
 
-fn stmt_uses_binding(stmt: &HirStmt, binding: TableBinding) -> bool {
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => local_decl
-            .values
-            .iter()
-            .any(|expr| expr_uses_binding(expr, binding)),
-        HirStmt::Assign(assign) => {
-            assign
-                .targets
-                .iter()
-                .any(|target| lvalue_uses_binding(target, binding))
-                || assign
-                    .values
-                    .iter()
-                    .any(|expr| expr_uses_binding(expr, binding))
-        }
-        HirStmt::TableSetList(set_list) => {
-            expr_uses_binding(&set_list.base, binding)
-                || set_list
-                    .values
-                    .iter()
-                    .any(|expr| expr_uses_binding(expr, binding))
-                || set_list
-                    .trailing_multivalue
-                    .as_ref()
-                    .is_some_and(|expr| expr_uses_binding(expr, binding))
-        }
-        HirStmt::CallStmt(call_stmt) => call_expr_uses_binding(&call_stmt.call, binding),
-        HirStmt::Return(ret) => ret
-            .values
-            .iter()
-            .any(|expr| expr_uses_binding(expr, binding)),
-        HirStmt::If(if_stmt) => {
-            expr_uses_binding(&if_stmt.cond, binding)
-                || stmt_slice_uses_binding(&if_stmt.then_block.stmts, binding)
-                || if_stmt
-                    .else_block
-                    .as_ref()
-                    .is_some_and(|block| stmt_slice_uses_binding(&block.stmts, binding))
-        }
-        HirStmt::While(while_stmt) => {
-            expr_uses_binding(&while_stmt.cond, binding)
-                || stmt_slice_uses_binding(&while_stmt.body.stmts, binding)
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            stmt_slice_uses_binding(&repeat_stmt.body.stmts, binding)
-                || expr_uses_binding(&repeat_stmt.cond, binding)
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            expr_uses_binding(&numeric_for.start, binding)
-                || expr_uses_binding(&numeric_for.limit, binding)
-                || expr_uses_binding(&numeric_for.step, binding)
-                || stmt_slice_uses_binding(&numeric_for.body.stmts, binding)
-        }
-        HirStmt::GenericFor(generic_for) => {
-            generic_for
-                .iterator
-                .iter()
-                .any(|expr| expr_uses_binding(expr, binding))
-                || stmt_slice_uses_binding(&generic_for.body.stmts, binding)
-        }
-        HirStmt::Block(block) => stmt_slice_uses_binding(&block.stmts, binding),
-        HirStmt::Unstructured(unstructured) => {
-            stmt_slice_uses_binding(&unstructured.body.stmts, binding)
-        }
-        HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => false,
-    }
-}
-
 fn call_expr_uses_binding(call: &crate::hir::common::HirCallExpr, binding: TableBinding) -> bool {
     expr_uses_binding(&call.callee, binding)
         || call.args.iter().any(|arg| expr_uses_binding(arg, binding))
-}
-
-fn lvalue_uses_binding(lvalue: &HirLValue, binding: TableBinding) -> bool {
-    match lvalue {
-        HirLValue::Temp(temp) => binding == TableBinding::Temp(*temp),
-        HirLValue::Local(local) => binding == TableBinding::Local(*local),
-        HirLValue::TableAccess(access) => {
-            expr_uses_binding(&access.base, binding) || expr_uses_binding(&access.key, binding)
-        }
-        HirLValue::Upvalue(_) | HirLValue::Global(_) => false,
-    }
 }
 
 fn expr_depends_on_any_binding(expr: &HirExpr, bindings: &[TableBinding]) -> bool {
@@ -613,5 +671,88 @@ fn table_key_uses_binding(key: &HirTableKey, binding: TableBinding) -> bool {
     match key {
         HirTableKey::Name(_) => false,
         HirTableKey::Expr(expr) => expr_uses_binding(expr, binding),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::hir::common::{
+        HirAssign, HirExpr, HirLValue, HirReturn, HirTableField, HirTableSetList,
+    };
+    use crate::parser::{ProtoLineRange, ProtoSignature};
+
+    #[test]
+    fn greedily_consumes_adjacent_set_list_chunks_in_single_pass() {
+        let table = TempId(0);
+        let value_a = TempId(1);
+        let value_b = TempId(2);
+
+        let mut proto = HirProto {
+            id: crate::hir::common::HirProtoRef(0),
+            source: None,
+            line_range: ProtoLineRange {
+                defined_start: 0,
+                defined_end: 0,
+            },
+            signature: ProtoSignature {
+                num_params: 0,
+                is_vararg: false,
+            },
+            params: Vec::new(),
+            locals: Vec::new(),
+            upvalues: Vec::new(),
+            temps: vec![table, value_a, value_b],
+            body: HirBlock {
+                stmts: vec![
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(table)],
+                        values: vec![HirExpr::TableConstructor(Box::default())],
+                    })),
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(value_a)],
+                        values: vec![HirExpr::Integer(1)],
+                    })),
+                    HirStmt::TableSetList(Box::new(HirTableSetList {
+                        base: HirExpr::TempRef(table),
+                        values: vec![HirExpr::TempRef(value_a)],
+                        trailing_multivalue: None,
+                        start_index: 1,
+                    })),
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(value_b)],
+                        values: vec![HirExpr::Integer(2)],
+                    })),
+                    HirStmt::TableSetList(Box::new(HirTableSetList {
+                        base: HirExpr::TempRef(table),
+                        values: vec![HirExpr::TempRef(value_b)],
+                        trailing_multivalue: None,
+                        start_index: 2,
+                    })),
+                    HirStmt::Return(Box::new(HirReturn {
+                        values: vec![HirExpr::TempRef(table)],
+                    })),
+                ],
+            },
+            children: Vec::new(),
+        };
+
+        let changed = stabilize_table_constructors_in_proto(&mut proto);
+        assert!(changed);
+
+        let body = &proto.body;
+        assert_eq!(body.stmts.len(), 2);
+        let HirStmt::Assign(assign) = &body.stmts[0] else {
+            panic!("expected constructor seed assignment to remain");
+        };
+        let [HirExpr::TableConstructor(table)] = assign.values.as_slice() else {
+            panic!("expected constructor seed to be rewritten into a table constructor");
+        };
+        assert_eq!(
+            table.fields,
+            vec![HirTableField::Array(HirExpr::Integer(1)), HirTableField::Array(HirExpr::Integer(2))]
+        );
+        assert!(table.trailing_multivalue.is_none());
     }
 }

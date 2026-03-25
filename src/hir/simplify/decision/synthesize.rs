@@ -186,12 +186,21 @@ fn eval_pure_expr(
 }
 
 pub(super) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
+    if !matches!(expr, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_)) {
+        return None;
+    }
     if !expr_is_synth_safe(expr) {
         return None;
     }
 
+    let current = normalize_candidate_expr(expr.clone());
+    let candidates = direct_pure_logical_rewrite_candidates(&current);
+    if candidates.is_empty() {
+        return None;
+    }
+
     let mut refs = BTreeSet::new();
-    collect_refs_from_expr(expr, &mut refs);
+    collect_refs_from_expr(&current, &mut refs);
     let refs = refs.into_iter().collect::<Vec<_>>();
     if refs.len() > MAX_SYNTH_REFS {
         return None;
@@ -203,7 +212,7 @@ pub(super) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
         .map(|(index, key)| (*key, index))
         .collect::<BTreeMap<_, _>>();
     let mut literals = BTreeSet::new();
-    collect_literals_from_expr(expr, &mut literals);
+    collect_literals_from_expr(&current, &mut literals);
     let mut domain = vec![
         AbstractValue::Nil,
         AbstractValue::False,
@@ -212,10 +221,9 @@ pub(super) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
     domain.extend(literals);
     domain.extend((0..EXTRA_TRUTHY_SYMBOLS).map(|index| AbstractValue::TruthySymbol(index as u8)));
     let environments = enumerate_environments(refs.len(), &domain)?;
-    let current = normalize_candidate_expr(expr.clone());
     let current_cost = expr_cost(&current);
 
-    direct_pure_logical_rewrite_candidates(&current)
+    candidates
         .into_iter()
         .map(normalize_candidate_expr)
         .filter(|candidate| {

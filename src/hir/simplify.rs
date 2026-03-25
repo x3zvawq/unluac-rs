@@ -23,13 +23,21 @@ pub(super) fn simplify_hir(module: &mut HirModule) {
     for _ in 0..MAX_SIMPLIFY_ITERATIONS {
         let mut changed = false;
         for proto in &mut module.protos {
-            changed |= decision::simplify_decision_exprs_in_proto(proto);
-            changed |= boolean_shells::remove_boolean_materialization_shells_in_proto(proto);
-            changed |= logical_simplify::simplify_logical_exprs_in_proto(proto);
-            changed |= table_constructors::stabilize_table_constructors_in_proto(proto);
-            changed |= temp_inline::inline_temps_in_proto(proto);
-            changed |= locals::promote_temps_to_locals_in_proto(proto);
-            changed |= decision::eliminate_remaining_decisions_in_proto(proto);
+            let decision_changed = decision::simplify_decision_exprs_in_proto(proto);
+            let boolean_shells_changed =
+                boolean_shells::remove_boolean_materialization_shells_in_proto(proto);
+            let logical_changed = logical_simplify::simplify_logical_exprs_in_proto(proto);
+            let table_changed = table_constructors::stabilize_table_constructors_in_proto(proto);
+            let temp_inline_changed = temp_inline::inline_temps_in_proto(proto);
+            let locals_changed = locals::promote_temps_to_locals_in_proto(proto);
+            let eliminate_changed = decision::eliminate_remaining_decisions_in_proto(proto);
+            changed |= decision_changed
+                || boolean_shells_changed
+                || logical_changed
+                || table_changed
+                || temp_inline_changed
+                || locals_changed
+                || eliminate_changed;
         }
 
         if !changed {
