@@ -220,6 +220,8 @@ impl Lua53Parser {
                 signature: ProtoSignature {
                     num_params,
                     is_vararg: raw_is_vararg != 0,
+                    has_vararg_param_reg: false,
+                    named_vararg_table: false,
                 },
                 frame: ProtoFrameInfo { max_stack_size },
                 instructions,

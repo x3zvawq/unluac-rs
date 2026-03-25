@@ -178,6 +178,7 @@ fn dialect_label(version: DialectVersion) -> &'static str {
         DialectVersion::Lua52 => "lua5.2",
         DialectVersion::Lua53 => "lua5.3",
         DialectVersion::Lua54 => "lua5.4",
+        DialectVersion::Lua55 => "lua5.5",
     }
 }
 
@@ -246,6 +247,11 @@ fn format_low_instr(instr: &LowInstr) -> String {
             format_access_base(instr.base),
             format_access_key(instr.key),
             format_value_operand(instr.value)
+        ),
+        LowInstr::ErrNil(instr) => format!(
+            "err-nnil {} name={}",
+            format_reg(instr.subject),
+            instr.name.map_or_else(|| "?".to_owned(), format_const)
         ),
         LowInstr::NewTable(instr) => format!("new-table {}", format_reg(instr.dst)),
         LowInstr::SetList(instr) => format!(

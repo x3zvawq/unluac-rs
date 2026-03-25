@@ -8,4 +8,5 @@ pub mod lua51;
 pub mod lua52;
 pub mod lua53;
 pub mod lua54;
+pub mod lua55;
 pub mod puc_lua;

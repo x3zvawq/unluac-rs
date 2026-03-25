@@ -11,7 +11,7 @@ mod error;
 pub use common::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchInstr, BranchOperands,
     BranchPredicate, CallInstr, CallKind, Capture, CaptureSource, CloseInstr, ClosureInstr,
-    ConcatInstr, CondOperand, ConstRef, DialectCaptureExtra, GenericForCallInstr,
+    ConcatInstr, CondOperand, ConstRef, DialectCaptureExtra, ErrNilInstr, GenericForCallInstr,
     GenericForLoopInstr, GetTableInstr, GetUpvalueInstr, InstrRef, JumpInstr, LoadBoolInstr,
     LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr, LoweredChunk,
     LoweredProto, LoweringMap, MoveInstr, NewTableInstr, NumberLiteral, NumericForInitInstr,
@@ -31,6 +31,7 @@ pub fn lower_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
         DialectVersion::Lua52 => dialect::lua52::lower_chunk(chunk),
         DialectVersion::Lua53 => dialect::lua53::lower_chunk(chunk),
         DialectVersion::Lua54 => dialect::lua54::lower_chunk(chunk),
+        DialectVersion::Lua55 => dialect::lua55::lower_chunk(chunk),
     }
 }
 
@@ -52,4 +53,9 @@ pub fn lower_lua53_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformErro
 /// 直接按 Lua 5.4 规则 lowering，不做方言自动探测。
 pub fn lower_lua54_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
     dialect::lua54::lower_chunk(chunk)
+}
+
+/// 直接按 Lua 5.5 规则 lowering，不做方言自动探测。
+pub fn lower_lua55_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
+    dialect::lua55::lower_chunk(chunk)
 }

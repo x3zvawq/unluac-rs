@@ -328,6 +328,7 @@ fn summarize_block_fallthrough_assignments(block: &HirBlock) -> Option<Fallthrou
 fn summarize_stmt_fallthrough_assignments(stmt: &HirStmt) -> Option<FallthroughSummary> {
     match stmt {
         HirStmt::LocalDecl(_)
+        | HirStmt::ErrNil(_)
         | HirStmt::ToBeClosed(_)
         | HirStmt::Close(_)
         | HirStmt::CallStmt(_)
@@ -464,6 +465,7 @@ fn rewrite_stmt(
                 .is_some_and(|expr| rewrite_expr(expr, mapping));
             base_changed || values_changed || trailing_changed
         }
+        HirStmt::ErrNil(err_nil) => rewrite_expr(&mut err_nil.value, mapping),
         HirStmt::ToBeClosed(to_be_closed) => rewrite_expr(&mut to_be_closed.value, mapping),
         HirStmt::CallStmt(call_stmt) => rewrite_call_expr(&mut call_stmt.call, mapping),
         HirStmt::Return(ret) => ret.values.iter_mut().fold(false, |changed, expr| {
@@ -688,6 +690,7 @@ fn stmt_touches_temp(stmt: &HirStmt, temp: TempId) -> bool {
                     .as_ref()
                     .is_some_and(|expr| expr_touches_temp(expr, temp))
         }
+        HirStmt::ErrNil(err_nil) => expr_touches_temp(&err_nil.value, temp),
         HirStmt::ToBeClosed(to_be_closed) => expr_touches_temp(&to_be_closed.value, temp),
         HirStmt::CallStmt(call_stmt) => call_expr_touches_temp(&call_stmt.call, temp),
         HirStmt::Return(ret) => ret.values.iter().any(|expr| expr_touches_temp(expr, temp)),
@@ -919,6 +922,8 @@ mod tests {
             signature: crate::parser::ProtoSignature {
                 num_params: 0,
                 is_vararg: false,
+                has_vararg_param_reg: false,
+                named_vararg_table: false,
             },
             params: Vec::new(),
             locals: Vec::new(),

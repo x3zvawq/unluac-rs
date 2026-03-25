@@ -88,6 +88,7 @@ fn inline_temps_in_nested_blocks(stmt: &mut HirStmt, scratch: &mut TempUseScratc
         HirStmt::LocalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
         | HirStmt::ToBeClosed(_)
         | HirStmt::Close(_)
         | HirStmt::CallStmt(_)
@@ -125,6 +126,7 @@ fn is_simple_stmt(stmt: &HirStmt) -> bool {
         | HirStmt::Repeat(_)
         | HirStmt::NumericFor(_)
         | HirStmt::GenericFor(_)
+        | HirStmt::ErrNil(_)
         | HirStmt::ToBeClosed(_)
         | HirStmt::Close(_)
         | HirStmt::Break
@@ -260,6 +262,9 @@ fn collect_stmt_temp_uses_into(stmt: &HirStmt, scratch: &mut TempUseScratch) {
                 collect_expr_temp_uses(expr, scratch);
             }
         }
+        HirStmt::ErrNil(err_nil) => {
+            collect_expr_temp_uses(&err_nil.value, scratch);
+        }
         HirStmt::ToBeClosed(to_be_closed) => {
             collect_expr_temp_uses(&to_be_closed.value, scratch);
         }
@@ -339,6 +344,7 @@ fn max_temp_index_in_stmt(stmt: &HirStmt) -> Option<usize> {
             )
             .flatten()
             .max(),
+        HirStmt::ErrNil(err_nil) => max_temp_index_in_expr(&err_nil.value),
         HirStmt::ToBeClosed(to_be_closed) => max_temp_index_in_expr(&to_be_closed.value),
         HirStmt::CallStmt(call_stmt) => max_temp_index_in_call(&call_stmt.call),
         HirStmt::Return(ret) => ret.values.iter().filter_map(max_temp_index_in_expr).max(),
@@ -502,6 +508,9 @@ fn replace_temp_in_simple_stmt(stmt: &mut HirStmt, temp: TempId, replacement: &H
             if let Some(expr) = &mut set_list.trailing_multivalue {
                 replace_temp_in_expr(expr, temp, replacement);
             }
+        }
+        HirStmt::ErrNil(err_nil) => {
+            replace_temp_in_expr(&mut err_nil.value, temp, replacement);
         }
         HirStmt::CallStmt(call_stmt) => {
             replace_temp_in_call_expr(&mut call_stmt.call, temp, replacement)
@@ -818,6 +827,8 @@ mod tests {
             signature: crate::parser::ProtoSignature {
                 num_params: 0,
                 is_vararg: false,
+                has_vararg_param_reg: false,
+                named_vararg_table: false,
             },
             params: Vec::new(),
             locals: Vec::new(),

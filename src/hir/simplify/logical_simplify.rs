@@ -50,6 +50,7 @@ fn simplify_stmt(stmt: &mut HirStmt) -> bool {
                 .is_some_and(simplify_expr);
             base_changed || values_changed || trailing_changed
         }
+        HirStmt::ErrNil(err_nil) => simplify_expr(&mut err_nil.value),
         HirStmt::ToBeClosed(to_be_closed) => simplify_expr(&mut to_be_closed.value),
         HirStmt::CallStmt(call_stmt) => simplify_call_expr(&mut call_stmt.call),
         HirStmt::Return(ret) => ret
@@ -713,6 +714,8 @@ mod tests {
             signature: crate::parser::ProtoSignature {
                 num_params: 0,
                 is_vararg: false,
+                has_vararg_param_reg: false,
+                named_vararg_table: false,
             },
             params: Vec::new(),
             locals: Vec::new(),

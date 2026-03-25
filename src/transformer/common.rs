@@ -153,6 +153,7 @@ pub enum LowInstr {
     SetUpvalue(SetUpvalueInstr),
     GetTable(GetTableInstr),
     SetTable(SetTableInstr),
+    ErrNil(ErrNilInstr),
     NewTable(NewTableInstr),
     SetList(SetListInstr),
     Call(CallInstr),
@@ -368,6 +369,12 @@ pub struct SetTableInstr {
     pub base: AccessBase,
     pub key: AccessKey,
     pub value: ValueOperand,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct ErrNilInstr {
+    pub subject: Reg,
+    pub name: Option<ConstRef>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]

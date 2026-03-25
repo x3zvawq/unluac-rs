@@ -125,7 +125,7 @@ impl<'a> BinaryReader<'a> {
         }
     }
 
-    pub(crate) fn read_varint_u64(
+    pub(crate) fn read_varint_u64_lua54(
         &mut self,
         limit: u64,
         field: &'static str,
@@ -136,10 +136,30 @@ impl<'a> BinaryReader<'a> {
         loop {
             let byte = self.read_u8()?;
             if value >= shifted_limit {
-                return Err(ParseError::IntegerOverflow { field, value: limit });
+                return Err(ParseError::IntegerOverflow { field, value });
             }
             value = (value << 7) | u64::from(byte & 0x7f);
             if (byte & 0x80) != 0 {
+                return Ok(value);
+            }
+        }
+    }
+
+    pub(crate) fn read_varint_u64_lua55(
+        &mut self,
+        limit: u64,
+        field: &'static str,
+    ) -> Result<u64, ParseError> {
+        let mut value = 0_u64;
+        let shifted_limit = limit >> 7;
+
+        loop {
+            let byte = self.read_u8()?;
+            if value > shifted_limit {
+                return Err(ParseError::IntegerOverflow { field, value });
+            }
+            value = (value << 7) | u64::from(byte & 0x7f);
+            if (byte & 0x80) == 0 {
                 return Ok(value);
             }
         }

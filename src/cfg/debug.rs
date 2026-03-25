@@ -597,6 +597,7 @@ fn format_low_instr_head(instr: &LowInstr) -> &'static str {
         LowInstr::SetUpvalue(_instr) => "set-upvalue",
         LowInstr::GetTable(_instr) => "get-table",
         LowInstr::SetTable(_instr) => "set-table",
+        LowInstr::ErrNil(_instr) => "err-nnil",
         LowInstr::NewTable(_instr) => "new-table",
         LowInstr::SetList(_instr) => "set-list",
         LowInstr::Call(_instr) => "call",

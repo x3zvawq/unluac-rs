@@ -619,6 +619,8 @@ where
 fn entry_reg_expr(lowering: &ProtoLowering<'_>, reg: Reg) -> HirExpr {
     if reg.index() < lowering.bindings.params.len() {
         HirExpr::ParamRef(lowering.bindings.params[reg.index()])
+    } else if let Some(local) = lowering.bindings.entry_local_regs.get(&reg) {
+        HirExpr::LocalRef(*local)
     } else {
         unresolved_expr(format!("entry-reg r{}", reg.index()))
     }

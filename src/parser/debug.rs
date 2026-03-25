@@ -9,6 +9,7 @@ use super::dialect::lua51;
 use super::dialect::lua52;
 use super::dialect::lua53;
 use super::dialect::lua54;
+use super::dialect::lua55;
 use super::{DialectVersion, RawChunk};
 
 /// 根据 chunk 的实际 dialect 分派到对应的 parser dump 实现。
@@ -18,5 +19,6 @@ pub fn dump_parser(chunk: &RawChunk, detail: DebugDetail, filters: &DebugFilters
         DialectVersion::Lua52 => lua52::dump_chunk(chunk, detail, filters),
         DialectVersion::Lua53 => lua53::dump_chunk(chunk, detail, filters),
         DialectVersion::Lua54 => lua54::dump_chunk(chunk, detail, filters),
+        DialectVersion::Lua55 => lua55::dump_chunk(chunk, detail, filters),
     }
 }

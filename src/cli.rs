@@ -331,10 +331,11 @@ fn resolve_luac(options: &CliOptions) -> Result<PathBuf, CliError> {
     }
 
     Ok(match options.dialect {
-        DecompileDialect::Lua51 => PathBuf::from("luac"),
+        DecompileDialect::Lua51 => PathBuf::from("lua5.1"),
         DecompileDialect::Lua52 => PathBuf::from("lua5.2"),
         DecompileDialect::Lua53 => PathBuf::from("lua5.3"),
         DecompileDialect::Lua54 => PathBuf::from("lua5.4"),
+        DecompileDialect::Lua55 => PathBuf::from("lua5.5"),
     })
 }
 
@@ -403,10 +404,13 @@ fn print_help() {
     println!(
         "  cargo run -- --dialect=lua5.4 --source tests/lua_cases/lua5.4/01_tbc_close.lua --stop-after=transform --dump=transform"
     );
+    println!(
+        "  cargo run -- --dialect=lua5.5 --source tests/lua_cases/lua5.5/03_named_vararg_basic.lua --stop-after=hir --dump=hir"
+    );
     println!("  cargo run -- --dialect=lua5.1 --input /path/to/chunk.out --detail=verbose");
     println!();
     println!("options:");
-    println!("  --dialect <lua5.1|lua5.2|lua5.3|lua5.4>");
+    println!("  --dialect <lua5.1|lua5.2|lua5.3|lua5.4|lua5.5>");
     println!("  --input <chunk-path>");
     println!("  --source <lua-source-path>");
     println!("  --luac <luac-path>");

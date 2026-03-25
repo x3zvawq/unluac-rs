@@ -92,6 +92,8 @@ pub(super) fn empty_proto(id: HirProtoRef) -> HirProto {
         signature: crate::parser::ProtoSignature {
             num_params: 0,
             is_vararg: false,
+            has_vararg_param_reg: false,
+            named_vararg_table: false,
         },
         params: Vec::new(),
         locals: Vec::new(),

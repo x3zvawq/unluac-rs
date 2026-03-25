@@ -282,6 +282,8 @@ fn dummy_proto(body: HirBlock) -> HirProto {
         signature: crate::parser::ProtoSignature {
             num_params: 0,
             is_vararg: false,
+            has_vararg_param_reg: false,
+            named_vararg_table: false,
         },
         params: Vec::new(),
         locals: Vec::new(),
@@ -379,6 +381,7 @@ fn stmt_contains_if(stmt: &HirStmt) -> bool {
         HirStmt::LocalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
         | HirStmt::ToBeClosed(_)
         | HirStmt::CallStmt(_)
         | HirStmt::Return(_)

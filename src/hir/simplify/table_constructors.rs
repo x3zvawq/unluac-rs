@@ -84,6 +84,7 @@ fn stabilize_nested(stmt: &mut HirStmt) -> bool {
         HirStmt::LocalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
         | HirStmt::ToBeClosed(_)
         | HirStmt::Close(_)
         | HirStmt::CallStmt(_)
@@ -408,6 +409,9 @@ fn collect_stmt_bindings(stmt: &HirStmt, bindings: &mut std::collections::BTreeS
                 collect_expr_bindings(trailing, bindings);
             }
         }
+        HirStmt::ErrNil(err_nil) => {
+            collect_expr_bindings(&err_nil.value, bindings);
+        }
         HirStmt::ToBeClosed(to_be_closed) => {
             collect_expr_bindings(&to_be_closed.value, bindings);
         }
@@ -711,6 +715,8 @@ mod tests {
             signature: ProtoSignature {
                 num_params: 0,
                 is_vararg: false,
+                has_vararg_param_reg: false,
+                named_vararg_table: false,
             },
             params: Vec::new(),
             locals: Vec::new(),

@@ -27,9 +27,16 @@ pub(super) fn build_bindings(
         .map(UpvalueId)
         .collect::<Vec<_>>();
     let mut locals = Vec::new();
+    let mut entry_local_regs = BTreeMap::new();
     let mut numeric_for_locals = BTreeMap::new();
     let mut generic_for_locals = BTreeMap::new();
     let mut block_local_regs = BTreeMap::new();
+
+    if proto.signature.has_vararg_param_reg {
+        let local = LocalId(locals.len());
+        locals.push(local);
+        entry_local_regs.insert(crate::transformer::Reg(usize::from(proto.signature.num_params)), local);
+    }
 
     for candidate in structure
         .loop_candidates
@@ -120,6 +127,7 @@ pub(super) fn build_bindings(
         phi_temps,
         instr_fixed_defs,
         instr_open_defs,
+        entry_local_regs,
         numeric_for_locals,
         generic_for_locals,
         block_local_regs,

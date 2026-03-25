@@ -115,6 +115,14 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
                         .unwrap_or_else(|| "-".to_owned()),
                 );
             }
+            HirStmt::ErrNil(err_nnil) => {
+                let _ = writeln!(
+                    output,
+                    "{indent}err-nnil {} name={}",
+                    format_expr(&err_nnil.value),
+                    err_nnil.name.as_deref().unwrap_or("?"),
+                );
+            }
             HirStmt::ToBeClosed(to_be_closed) => {
                 let _ = writeln!(
                     output,

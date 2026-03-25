@@ -70,6 +70,7 @@ fn remove_boolean_materialization_shells_in_nested(
         HirStmt::LocalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
         | HirStmt::ToBeClosed(_)
         | HirStmt::Close(_)
         | HirStmt::CallStmt(_)
@@ -154,6 +155,9 @@ fn collect_stmt_temp_uses(stmt: &HirStmt, use_counts: &mut BTreeMap<TempId, usiz
             if let Some(trailing) = &set_list.trailing_multivalue {
                 collect_expr_temp_uses(trailing, use_counts);
             }
+        }
+        HirStmt::ErrNil(err_nil) => {
+            collect_expr_temp_uses(&err_nil.value, use_counts);
         }
         HirStmt::ToBeClosed(to_be_closed) => {
             collect_expr_temp_uses(&to_be_closed.value, use_counts);
@@ -397,6 +401,8 @@ mod tests {
             signature: crate::parser::ProtoSignature {
                 num_params: 0,
                 is_vararg: false,
+                has_vararg_param_reg: false,
+                named_vararg_table: false,
             },
             params: Vec::new(),
             locals: vec![crate::hir::common::LocalId(0)],

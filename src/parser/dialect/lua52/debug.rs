@@ -122,6 +122,7 @@ fn write_header_view(output: &mut String, header: &ChunkHeader) {
         DialectHeaderExtra::Lua54(_) => {
             unreachable!("lua52 debug should not receive lua54 header extras")
         }
+        _ => unreachable!("lua52 debug should not receive non-lua52 header extras"),
     }
 }
 
@@ -208,10 +209,11 @@ fn write_constants_view(output: &mut String, protos: &[ProtoEntry<'_>], visible_
             DialectConstPoolExtra::Lua53(_) => {
                 unreachable!("lua52 debug should not receive lua53 const-pool extras")
             }
-            DialectConstPoolExtra::Lua54(_) => {
-                unreachable!("lua52 debug should not receive lua54 const-pool extras")
-            }
+        DialectConstPoolExtra::Lua54(_) => {
+            unreachable!("lua52 debug should not receive lua54 const-pool extras")
         }
+        _ => unreachable!("lua52 debug should not receive non-lua52 const-pool extras"),
+    }
     }
 }
 
@@ -288,6 +290,7 @@ fn write_verbose_debug_info(output: &mut String, proto: &RawProto) {
         DialectDebugExtra::Lua54(_) => {
             unreachable!("lua52 debug should not receive lua54 debug extras")
         }
+        _ => unreachable!("lua52 debug should not receive non-lua52 debug extras"),
     }
     match &proto.common.upvalues.extra {
         DialectUpvalueExtra::Lua52(extra) => {
@@ -300,6 +303,7 @@ fn write_verbose_debug_info(output: &mut String, proto: &RawProto) {
         DialectUpvalueExtra::Lua54(_) => {
             unreachable!("lua52 debug should not receive lua54 upvalue extras")
         }
+        _ => unreachable!("lua52 debug should not receive non-lua52 upvalue extras"),
     }
 
     let descriptors = &proto.common.upvalues.common.descriptors;
@@ -401,6 +405,7 @@ impl HeaderDebugExt for ChunkHeader {
             DialectVersion::Lua52 => "lua5.2",
             DialectVersion::Lua53 => "lua5.3",
             DialectVersion::Lua54 => "lua5.4",
+            DialectVersion::Lua55 => "lua5.5",
         }
     }
 
@@ -423,6 +428,7 @@ impl RawProtoDebugExt for RawProto {
             DialectProtoExtra::Lua51(_) => 0,
             DialectProtoExtra::Lua53(_) => 0,
             DialectProtoExtra::Lua54(_) => 0,
+            _ => 0,
         }
     }
 }
@@ -442,6 +448,7 @@ impl RawInstrDebugExt for RawInstr {
             DialectInstrExtra::Lua51(_) => 0,
             DialectInstrExtra::Lua53(_) => 0,
             DialectInstrExtra::Lua54(_) => 0,
+            _ => 0,
         }
     }
 
@@ -451,6 +458,7 @@ impl RawInstrDebugExt for RawInstr {
             DialectInstrExtra::Lua51(_) => 1,
             DialectInstrExtra::Lua53(_) => 1,
             DialectInstrExtra::Lua54(_) => 1,
+            _ => 1,
         }
     }
 
@@ -460,6 +468,7 @@ impl RawInstrDebugExt for RawInstr {
             DialectInstrExtra::Lua51(_) => None,
             DialectInstrExtra::Lua53(_) => None,
             DialectInstrExtra::Lua54(_) => None,
+            _ => None,
         }
     }
 
@@ -469,6 +478,7 @@ impl RawInstrDebugExt for RawInstr {
             RawInstrOpcode::Lua51(_) => "-",
             RawInstrOpcode::Lua53(_) => "-",
             RawInstrOpcode::Lua54(_) => "-",
+            _ => "-",
         }
     }
 
@@ -478,6 +488,7 @@ impl RawInstrDebugExt for RawInstr {
             RawInstrOperands::Lua51(_) => "-".to_owned(),
             RawInstrOperands::Lua53(_) => "-".to_owned(),
             RawInstrOperands::Lua54(_) => "-".to_owned(),
+            _ => "-".to_owned(),
         }
     }
 }

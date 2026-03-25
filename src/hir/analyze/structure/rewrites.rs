@@ -86,6 +86,9 @@ pub(super) fn rewrite_stmt_exprs(stmt: &mut HirStmt, expr_overrides: &BTreeMap<T
                 rewrite_expr_temps(trailing, expr_overrides);
             }
         }
+        HirStmt::ErrNil(err_nil) => {
+            rewrite_expr_temps(&mut err_nil.value, expr_overrides);
+        }
         HirStmt::ToBeClosed(to_be_closed) => {
             rewrite_expr_temps(&mut to_be_closed.value, expr_overrides);
         }

@@ -114,6 +114,7 @@ fn write_header_view(output: &mut String, header: &ChunkHeader) {
         DialectHeaderExtra::Lua51(_) | DialectHeaderExtra::Lua52(_) | DialectHeaderExtra::Lua53(_) => {
             unreachable!("lua54 debug should not receive non-lua54 header extras")
         }
+        _ => unreachable!("lua54 debug should not receive non-lua54 header extras"),
     }
 }
 
@@ -206,6 +207,7 @@ fn write_constants_view(output: &mut String, protos: &[ProtoEntry<'_>], visible_
             | DialectConstPoolExtra::Lua53(_) => {
                 unreachable!("lua54 debug should not receive non-lua54 const-pool extras")
             }
+            _ => unreachable!("lua54 debug should not receive non-lua54 const-pool extras"),
         }
     }
 }
@@ -384,6 +386,7 @@ impl HeaderDebugExt for ChunkHeader {
             DialectVersion::Lua52 => "lua5.2",
             DialectVersion::Lua53 => "lua5.3",
             DialectVersion::Lua54 => "lua5.4",
+            DialectVersion::Lua55 => "lua5.5",
         }
     }
 
@@ -408,6 +411,7 @@ impl RawProtoDebugExt for RawProto {
             | DialectProtoExtra::Lua53(_) => {
                 unreachable!("lua54 debug should not receive non-lua54 proto extras")
             }
+            _ => unreachable!("lua54 debug should not receive non-lua54 proto extras"),
         }
     }
 }
@@ -429,6 +433,7 @@ impl RawInstrDebugExt for RawInstr {
             | DialectInstrExtra::Lua53(_) => {
                 unreachable!("lua54 debug should not receive non-lua54 instruction extras")
             }
+            _ => unreachable!("lua54 debug should not receive non-lua54 instruction extras"),
         }
     }
 
@@ -440,6 +445,7 @@ impl RawInstrDebugExt for RawInstr {
             | DialectInstrExtra::Lua53(_) => {
                 unreachable!("lua54 debug should not receive non-lua54 instruction extras")
             }
+            _ => unreachable!("lua54 debug should not receive non-lua54 instruction extras"),
         }
     }
 
@@ -451,6 +457,7 @@ impl RawInstrDebugExt for RawInstr {
             | DialectInstrExtra::Lua53(_) => {
                 unreachable!("lua54 debug should not receive non-lua54 instruction extras")
             }
+            _ => unreachable!("lua54 debug should not receive non-lua54 instruction extras"),
         }
     }
 
@@ -460,6 +467,7 @@ impl RawInstrDebugExt for RawInstr {
             RawInstrOpcode::Lua51(_) | RawInstrOpcode::Lua52(_) | RawInstrOpcode::Lua53(_) => {
                 unreachable!("lua54 debug should not receive non-lua54 opcodes")
             }
+            _ => unreachable!("lua54 debug should not receive non-lua54 opcodes"),
         }
     }
 
@@ -471,6 +479,7 @@ impl RawInstrDebugExt for RawInstr {
             | RawInstrOperands::Lua53(_) => {
                 unreachable!("lua54 debug should not receive non-lua54 operands")
             }
+            _ => unreachable!("lua54 debug should not receive non-lua54 operands"),
         }
     }
 }

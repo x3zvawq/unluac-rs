@@ -39,6 +39,7 @@ pub(super) struct ProtoBindings {
     pub(super) phi_temps: Vec<TempId>,
     pub(super) instr_fixed_defs: Vec<Vec<TempId>>,
     pub(super) instr_open_defs: Vec<Option<TempId>>,
+    pub(super) entry_local_regs: BTreeMap<Reg, LocalId>,
     pub(super) numeric_for_locals: BTreeMap<BlockRef, LocalId>,
     pub(super) generic_for_locals: BTreeMap<BlockRef, Vec<LocalId>>,
     pub(super) block_local_regs: BTreeMap<BlockRef, BTreeMap<Reg, LocalId>>,
@@ -450,6 +451,13 @@ pub(super) fn lower_regular_instr(
                 set_table.value,
             )],
         )],
+        LowInstr::ErrNil(err_nnil) => vec![HirStmt::ErrNil(Box::new(crate::hir::common::HirErrNil {
+            value: expr_for_reg_use(lowering, block, instr_ref, err_nnil.subject),
+            name: err_nnil.name.and_then(|const_ref| match lowering.proto.constants.common.literals.get(const_ref.index()) {
+                Some(crate::parser::RawLiteralConst::String(value)) => Some(decode_raw_string(value)),
+                _ => None,
+            }),
+        }))],
         LowInstr::NewTable(_new_table) => fixed_assign(
             lowering,
             instr_ref,

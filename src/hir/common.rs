@@ -99,6 +99,7 @@ pub enum HirStmt {
     LocalDecl(Box<HirLocalDecl>),
     Assign(Box<HirAssign>),
     TableSetList(Box<HirTableSetList>),
+    ErrNil(Box<HirErrNil>),
     ToBeClosed(Box<HirToBeClosed>),
     Close(Box<HirClose>),
     CallStmt(Box<HirCallStmt>),
@@ -299,6 +300,12 @@ pub struct HirTableSetList {
     pub start_index: u32,
     pub values: Vec<HirExpr>,
     pub trailing_multivalue: Option<HirExpr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HirErrNil {
+    pub value: HirExpr,
+    pub name: Option<String>,
 }
 
 /// 标记某个绑定在当前词法作用域结束时需要执行 Lua 5.4 的 to-be-closed 语义。

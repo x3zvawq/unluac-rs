@@ -916,6 +916,9 @@ fn compute_instr_effect(instr: &LowInstr) -> InstrEffect {
             insert_access_key_use(&mut effect.fixed_uses, instr.key);
             insert_value_operand_use(&mut effect.fixed_uses, instr.value);
         }
+        LowInstr::ErrNil(instr) => {
+            effect.fixed_uses.insert(instr.subject);
+        }
         LowInstr::NewTable(instr) => {
             effect.fixed_must_defs.insert(instr.dst);
         }
@@ -1031,6 +1034,7 @@ fn compute_side_effect_summary(instr: &LowInstr) -> SideEffectSummary {
                 AccessBase::Reg(_) => {}
             }
         }
+        LowInstr::ErrNil(_instr) => {}
         LowInstr::NewTable(_instr) => {
             tags.insert(EffectTag::Alloc);
         }
