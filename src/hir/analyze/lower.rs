@@ -168,10 +168,7 @@ fn lower_label_goto_body(lowering: &ProtoLowering<'_>) -> HirBlock {
 
         let next_block = reachable_blocks.get(index + 1).copied();
         stmts.extend(lower_block_with_edge_copies(
-            lowering,
-            block,
-            next_block,
-            &label_map,
+            lowering, block, next_block, &label_map,
         ));
     }
 
@@ -237,14 +234,16 @@ fn lower_control_instr_with_edge_copies(
     label_map: &BTreeMap<BlockRef, HirLabelId>,
 ) -> Vec<HirStmt> {
     match instr {
-        LowInstr::Jump(jump) => lower_edge_block(
-            lowering,
-            block,
-            lowering.cfg.instr_to_block[jump.target.index()],
-            next_block,
-            label_map,
-        )
-        .stmts,
+        LowInstr::Jump(jump) => {
+            lower_edge_block(
+                lowering,
+                block,
+                lowering.cfg.instr_to_block[jump.target.index()],
+                next_block,
+                label_map,
+            )
+            .stmts
+        }
         LowInstr::Branch(branch) => {
             let then_target = lowering.cfg.instr_to_block[branch.then_target.index()];
             let else_target = lowering.cfg.instr_to_block[branch.else_target.index()];
@@ -252,7 +251,11 @@ fn lower_control_instr_with_edge_copies(
                 lower_branch_cond(lowering, block, instr_ref, branch.cond),
                 lower_edge_block(lowering, block, then_target, next_block, label_map),
                 Some(lower_edge_block(
-                    lowering, block, else_target, next_block, label_map,
+                    lowering,
+                    block,
+                    else_target,
+                    next_block,
+                    label_map,
                 )),
             )]
         }

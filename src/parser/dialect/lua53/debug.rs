@@ -1,7 +1,8 @@
-//! 这个文件实现 Lua 5.2 parser 的专用调试视图。
+//! 这个文件实现 Lua 5.3 parser 的专用调试视图。
 //!
-//! 它和 Lua 5.1 的 dump 形状保持一致，这样不同版本的 parser 输出可以横向对比；
-//! 同时把 5.2 的 upvalue 描述符、`LOADKX/SETLIST` 绑定的 `EXTRAARG` 等事实显式打出来。
+//! 它和 5.2 的 dump 形状尽量保持一致，方便横向对比；同时把 5.3 新增的
+//! `lua_Integer` header 信息、分离的整数/浮点常量、`LOADKX/SETLIST` 绑定的
+//! `EXTRAARG` 等事实显式打出来。
 
 use std::fmt::Write as _;
 
@@ -14,8 +15,8 @@ use crate::parser::{
 };
 
 use super::raw::{
-    Lua52ConstPoolExtra, Lua52DebugExtra, Lua52HeaderExtra, Lua52InstrExtra, Lua52Opcode,
-    Lua52Operands, Lua52ProtoExtra, Lua52UpvalueExtra,
+    Lua53ConstPoolExtra, Lua53DebugExtra, Lua53HeaderExtra, Lua53InstrExtra, Lua53Opcode,
+    Lua53Operands, Lua53ProtoExtra, Lua53UpvalueExtra,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -112,12 +113,11 @@ fn write_header_view(output: &mut String, header: &ChunkHeader) {
     let _ = writeln!(output, "  origin: {}", format_origin(header.origin));
 
     match &header.extra {
-        DialectHeaderExtra::Lua52(extra) => {
-            let Lua52HeaderExtra = extra;
+        DialectHeaderExtra::Lua53(extra) => {
+            let Lua53HeaderExtra = extra;
         }
-        DialectHeaderExtra::Lua51(_) => {}
-        DialectHeaderExtra::Lua53(_) => {
-            unreachable!("lua52 debug should not receive lua53 header extras")
+        DialectHeaderExtra::Lua51(_) | DialectHeaderExtra::Lua52(_) => {
+            unreachable!("lua53 debug should not receive non-lua53 header extras")
         }
     }
 }
@@ -198,12 +198,11 @@ fn write_constants_view(output: &mut String, protos: &[ProtoEntry<'_>], visible_
         }
 
         match &entry.proto.common.constants.extra {
-            DialectConstPoolExtra::Lua52(extra) => {
-                let Lua52ConstPoolExtra = extra;
+            DialectConstPoolExtra::Lua53(extra) => {
+                let Lua53ConstPoolExtra = extra;
             }
-            DialectConstPoolExtra::Lua51(_) => {}
-            DialectConstPoolExtra::Lua53(_) => {
-                unreachable!("lua52 debug should not receive lua53 const-pool extras")
+            DialectConstPoolExtra::Lua51(_) | DialectConstPoolExtra::Lua52(_) => {
+                unreachable!("lua53 debug should not receive non-lua53 const-pool extras")
             }
         }
     }
@@ -270,49 +269,32 @@ fn write_raw_instructions_view(
 
 fn write_verbose_debug_info(output: &mut String, proto: &RawProto) {
     let debug_info = &proto.common.debug_info;
-
     match &debug_info.extra {
-        DialectDebugExtra::Lua52(extra) => {
-            let Lua52DebugExtra = extra;
+        DialectDebugExtra::Lua53(extra) => {
+            let Lua53DebugExtra = extra;
         }
-        DialectDebugExtra::Lua51(_) => {}
-        DialectDebugExtra::Lua53(_) => {
-            unreachable!("lua52 debug should not receive lua53 debug extras")
+        DialectDebugExtra::Lua51(_) | DialectDebugExtra::Lua52(_) => {
+            unreachable!("lua53 debug should not receive non-lua53 debug extras")
         }
     }
+
     match &proto.common.upvalues.extra {
-        DialectUpvalueExtra::Lua52(extra) => {
-            let Lua52UpvalueExtra = extra;
+        DialectUpvalueExtra::Lua53(extra) => {
+            let Lua53UpvalueExtra = extra;
         }
-        DialectUpvalueExtra::Lua51(_) => {}
-        DialectUpvalueExtra::Lua53(_) => {
-            unreachable!("lua52 debug should not receive lua53 upvalue extras")
-        }
-    }
-
-    let descriptors = &proto.common.upvalues.common.descriptors;
-    if descriptors.is_empty() {
-        let _ = writeln!(output, "      upvalue_descs=<empty>");
-    } else {
-        let _ = writeln!(output, "      upvalue_descs");
-        for (index, descriptor) in descriptors.iter().enumerate() {
-            let _ = writeln!(
-                output,
-                "        u{index}: instack={} idx={}",
-                descriptor.in_stack, descriptor.index,
-            );
+        DialectUpvalueExtra::Lua51(_) | DialectUpvalueExtra::Lua52(_) => {
+            unreachable!("lua53 debug should not receive non-lua53 upvalue extras")
         }
     }
 
-    let locals = &debug_info.common.local_vars;
-    if locals.is_empty() {
-        let _ = writeln!(output, "      locals=<empty>");
+    let _ = writeln!(output, "    debug locals");
+    if debug_info.common.local_vars.is_empty() {
+        let _ = writeln!(output, "      <empty>");
     } else {
-        let _ = writeln!(output, "      locals");
-        for local in locals {
+        for local in &debug_info.common.local_vars {
             let _ = writeln!(
                 output,
-                "        {} [{}..{}]",
+                "      {} [{}..{}]",
                 format_raw_string(&local.name),
                 local.start_pc,
                 local.end_pc,
@@ -320,13 +302,12 @@ fn write_verbose_debug_info(output: &mut String, proto: &RawProto) {
         }
     }
 
-    let upvalue_names = &debug_info.common.upvalue_names;
-    if upvalue_names.is_empty() {
-        let _ = writeln!(output, "      upvalue_names=<empty>");
+    let _ = writeln!(output, "    debug upvalue names");
+    if debug_info.common.upvalue_names.is_empty() {
+        let _ = writeln!(output, "      <empty>");
     } else {
-        let _ = writeln!(output, "      upvalue_names");
-        for (index, name) in upvalue_names.iter().enumerate() {
-            let _ = writeln!(output, "        u{index}: {}", format_raw_string(name));
+        for (index, name) in debug_info.common.upvalue_names.iter().enumerate() {
+            let _ = writeln!(output, "      u{index:<3} {}", format_raw_string(name));
         }
     }
 }
@@ -406,9 +387,10 @@ trait RawProtoDebugExt {
 impl RawProtoDebugExt for RawProto {
     fn raw_vararg_bits(&self) -> u8 {
         match &self.extra {
-            DialectProtoExtra::Lua52(Lua52ProtoExtra { raw_is_vararg }) => *raw_is_vararg,
-            DialectProtoExtra::Lua51(_) => 0,
-            DialectProtoExtra::Lua53(_) => 0,
+            DialectProtoExtra::Lua53(Lua53ProtoExtra { raw_is_vararg }) => *raw_is_vararg,
+            DialectProtoExtra::Lua51(_) | DialectProtoExtra::Lua52(_) => {
+                unreachable!("lua53 debug should not receive non-lua53 proto extras")
+            }
         }
     }
 }
@@ -424,50 +406,55 @@ trait RawInstrDebugExt {
 impl RawInstrDebugExt for RawInstr {
     fn pc(&self) -> usize {
         match &self.extra {
-            DialectInstrExtra::Lua52(Lua52InstrExtra { pc, .. }) => *pc as usize,
-            DialectInstrExtra::Lua51(_) => 0,
-            DialectInstrExtra::Lua53(_) => 0,
+            DialectInstrExtra::Lua53(Lua53InstrExtra { pc, .. }) => *pc as usize,
+            DialectInstrExtra::Lua51(_) | DialectInstrExtra::Lua52(_) => {
+                unreachable!("lua53 debug should not receive non-lua53 instruction extras")
+            }
         }
     }
 
     fn word_len(&self) -> u8 {
         match &self.extra {
-            DialectInstrExtra::Lua52(Lua52InstrExtra { word_len, .. }) => *word_len,
-            DialectInstrExtra::Lua51(_) => 1,
-            DialectInstrExtra::Lua53(_) => 1,
+            DialectInstrExtra::Lua53(Lua53InstrExtra { word_len, .. }) => *word_len,
+            DialectInstrExtra::Lua51(_) | DialectInstrExtra::Lua52(_) => {
+                unreachable!("lua53 debug should not receive non-lua53 instruction extras")
+            }
         }
     }
 
     fn extra_arg(&self) -> Option<u32> {
         match &self.extra {
-            DialectInstrExtra::Lua52(Lua52InstrExtra { extra_arg, .. }) => *extra_arg,
-            DialectInstrExtra::Lua51(_) => None,
-            DialectInstrExtra::Lua53(_) => None,
+            DialectInstrExtra::Lua53(Lua53InstrExtra { extra_arg, .. }) => *extra_arg,
+            DialectInstrExtra::Lua51(_) | DialectInstrExtra::Lua52(_) => {
+                unreachable!("lua53 debug should not receive non-lua53 instruction extras")
+            }
         }
     }
 
     fn opcode_label(&self) -> &'static str {
         match self.opcode {
-            RawInstrOpcode::Lua52(opcode) => opcode.label(),
-            RawInstrOpcode::Lua51(_) => "-",
-            RawInstrOpcode::Lua53(_) => "-",
+            RawInstrOpcode::Lua53(opcode) => opcode.label(),
+            RawInstrOpcode::Lua51(_) | RawInstrOpcode::Lua52(_) => {
+                unreachable!("lua53 debug should not receive non-lua53 opcodes")
+            }
         }
     }
 
     fn operands_label(&self) -> String {
         match &self.operands {
-            RawInstrOperands::Lua52(operands) => operands.label(),
-            RawInstrOperands::Lua51(_) => "-".to_owned(),
-            RawInstrOperands::Lua53(_) => "-".to_owned(),
+            RawInstrOperands::Lua53(operands) => operands.label(),
+            RawInstrOperands::Lua51(_) | RawInstrOperands::Lua52(_) => {
+                unreachable!("lua53 debug should not receive non-lua53 operands")
+            }
         }
     }
 }
 
-trait Lua52OpcodeDebugExt {
+trait Lua53OpcodeDebugExt {
     fn label(self) -> &'static str;
 }
 
-impl Lua52OpcodeDebugExt for Lua52Opcode {
+impl Lua53OpcodeDebugExt for Lua53Opcode {
     fn label(self) -> &'static str {
         match self {
             Self::Move => "MOVE",
@@ -486,10 +473,17 @@ impl Lua52OpcodeDebugExt for Lua52Opcode {
             Self::Add => "ADD",
             Self::Sub => "SUB",
             Self::Mul => "MUL",
-            Self::Div => "DIV",
             Self::Mod => "MOD",
             Self::Pow => "POW",
+            Self::Div => "DIV",
+            Self::Idiv => "IDIV",
+            Self::Band => "BAND",
+            Self::Bor => "BOR",
+            Self::Bxor => "BXOR",
+            Self::Shl => "SHL",
+            Self::Shr => "SHR",
             Self::Unm => "UNM",
+            Self::BNot => "BNOT",
             Self::Not => "NOT",
             Self::Len => "LEN",
             Self::Concat => "CONCAT",
@@ -514,11 +508,11 @@ impl Lua52OpcodeDebugExt for Lua52Opcode {
     }
 }
 
-trait Lua52OperandsDebugExt {
+trait Lua53OperandsDebugExt {
     fn label(&self) -> String;
 }
 
-impl Lua52OperandsDebugExt for Lua52Operands {
+impl Lua53OperandsDebugExt for Lua53Operands {
     fn label(&self) -> String {
         match self {
             Self::A { a } => format!("A(a={a})"),

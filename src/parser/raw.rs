@@ -13,6 +13,10 @@ use super::dialect::lua52::{
     Lua52ConstPoolExtra, Lua52DebugExtra, Lua52HeaderExtra, Lua52InstrExtra, Lua52Opcode,
     Lua52Operands, Lua52ProtoExtra, Lua52UpvalueExtra,
 };
+use super::dialect::lua53::{
+    Lua53ConstPoolExtra, Lua53DebugExtra, Lua53HeaderExtra, Lua53InstrExtra, Lua53Opcode,
+    Lua53Operands, Lua53ProtoExtra, Lua53UpvalueExtra,
+};
 
 /// 一个完整解析后的 chunk。
 #[derive(Debug, Clone, PartialEq)]
@@ -30,6 +34,7 @@ pub struct ChunkHeader {
     pub format: u8,
     pub endianness: Endianness,
     pub integer_size: u8,
+    pub lua_integer_size: Option<u8>,
     pub size_t_size: u8,
     pub instruction_size: u8,
     pub number_size: u8,
@@ -49,6 +54,7 @@ pub enum Dialect {
 pub enum DialectVersion {
     Lua51,
     Lua52,
+    Lua53,
 }
 
 /// header 声明的字节序。
@@ -181,6 +187,7 @@ pub struct RawInstr {
 pub enum RawInstrOpcode {
     Lua51(Lua51Opcode),
     Lua52(Lua52Opcode),
+    Lua53(Lua53Opcode),
 }
 
 /// 各 dialect 自己的 operand 形态。
@@ -188,6 +195,7 @@ pub enum RawInstrOpcode {
 pub enum RawInstrOperands {
     Lua51(Lua51Operands),
     Lua52(Lua52Operands),
+    Lua53(Lua53Operands),
 }
 
 /// parser 产物关联到原始字节流的位置。
@@ -224,6 +232,7 @@ pub struct DecodedText {
 pub enum DialectHeaderExtra {
     Lua51(Lua51HeaderExtra),
     Lua52(Lua52HeaderExtra),
+    Lua53(Lua53HeaderExtra),
 }
 
 /// 各 dialect 在 proto 上附加的专属信息。
@@ -231,6 +240,7 @@ pub enum DialectHeaderExtra {
 pub enum DialectProtoExtra {
     Lua51(Lua51ProtoExtra),
     Lua52(Lua52ProtoExtra),
+    Lua53(Lua53ProtoExtra),
 }
 
 /// 各 dialect 在常量池上附加的专属信息。
@@ -238,6 +248,7 @@ pub enum DialectProtoExtra {
 pub enum DialectConstPoolExtra {
     Lua51(Lua51ConstPoolExtra),
     Lua52(Lua52ConstPoolExtra),
+    Lua53(Lua53ConstPoolExtra),
 }
 
 /// 各 dialect 在 upvalue 信息上附加的专属内容。
@@ -245,6 +256,7 @@ pub enum DialectConstPoolExtra {
 pub enum DialectUpvalueExtra {
     Lua51(Lua51UpvalueExtra),
     Lua52(Lua52UpvalueExtra),
+    Lua53(Lua53UpvalueExtra),
 }
 
 /// 各 dialect 在调试信息上附加的专属内容。
@@ -252,6 +264,7 @@ pub enum DialectUpvalueExtra {
 pub enum DialectDebugExtra {
     Lua51(Lua51DebugExtra),
     Lua52(Lua52DebugExtra),
+    Lua53(Lua53DebugExtra),
 }
 
 /// 各 dialect 在指令上附加的专属内容。
@@ -259,4 +272,5 @@ pub enum DialectDebugExtra {
 pub enum DialectInstrExtra {
     Lua51(Lua51InstrExtra),
     Lua52(Lua52InstrExtra),
+    Lua53(Lua53InstrExtra),
 }

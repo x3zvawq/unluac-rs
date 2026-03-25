@@ -62,7 +62,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         };
         stmts.push(branch_stmt(plan.cond, then_block, else_block));
         self.install_stop_boundary_value_merge_override(block, branch_stop, target_overrides);
-        self.install_branch_value_merge_overrides(block, target_overrides);
+        for header in &plan.consumed_headers {
+            self.install_branch_value_merge_overrides(*header, target_overrides);
+        }
 
         match branch_stop {
             Some(next) if next == self.lowering.cfg.exit_block => Some(None),

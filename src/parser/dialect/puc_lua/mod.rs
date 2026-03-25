@@ -8,6 +8,9 @@ use crate::parser::Endianness;
 
 pub(crate) const LUA_SIGNATURE: &[u8; 4] = b"\x1bLua";
 pub(crate) const LUA52_LUAC_TAIL: &[u8; 6] = b"\x19\x93\r\n\x1a\n";
+pub(crate) const LUA53_LUAC_DATA: &[u8; 6] = b"\x19\x93\r\n\x1a\n";
+pub(crate) const LUA53_LUAC_INT: i64 = 0x5678;
+pub(crate) const LUA53_LUAC_NUM: f64 = 370.5;
 pub(crate) const MAXARG_SBX_18: i32 = ((1 << 18) - 1) >> 1;
 
 /// PUC-Lua chunk header 里显式声明的基础布局。
@@ -15,6 +18,7 @@ pub(crate) const MAXARG_SBX_18: i32 = ((1 << 18) - 1) >> 1;
 pub(crate) struct PucLuaLayout {
     pub(crate) endianness: Endianness,
     pub(crate) integer_size: u8,
+    pub(crate) lua_integer_size: Option<u8>,
     pub(crate) size_t_size: u8,
     pub(crate) instruction_size: u8,
     pub(crate) number_size: u8,

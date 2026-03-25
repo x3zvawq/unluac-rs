@@ -54,7 +54,10 @@ fn stabilize_block(block: &mut HirBlock) -> bool {
         };
 
         install_constructor_seed(&mut block.stmts[index], rebuilt_ctor);
-        debug_assert!(end_index > index, "constructor rewrite must consume at least one trailing stmt");
+        debug_assert!(
+            end_index > index,
+            "constructor rewrite must consume at least one trailing stmt"
+        );
         block.stmts.drain(index + 1..=end_index);
         changed = true;
         index += 1;
@@ -751,7 +754,10 @@ mod tests {
         };
         assert_eq!(
             table.fields,
-            vec![HirTableField::Array(HirExpr::Integer(1)), HirTableField::Array(HirExpr::Integer(2))]
+            vec![
+                HirTableField::Array(HirExpr::Integer(1)),
+                HirTableField::Array(HirExpr::Integer(2))
+            ]
         );
         assert!(table.trailing_multivalue.is_none());
     }

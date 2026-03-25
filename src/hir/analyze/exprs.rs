@@ -629,11 +629,7 @@ fn loop_local_for_reg(
         .copied()
 }
 
-fn fixed_def_for_reg(
-    lowering: &ProtoLowering<'_>,
-    instr_ref: InstrRef,
-    reg: Reg,
-) -> Option<DefId> {
+fn fixed_def_for_reg(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, reg: Reg) -> Option<DefId> {
     lowering.dataflow.instr_defs[instr_ref.index()]
         .iter()
         .copied()

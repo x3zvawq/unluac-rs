@@ -1,11 +1,12 @@
-//! 这个文件实现 Lua 5.2 chunk 的实际解析逻辑。
+//! 这个文件实现 Lua 5.3 chunk 的实际解析逻辑。
 //!
-//! 它一方面复用 PUC-Lua 家族共享的位域拆解 helper，另一方面明确保留 5.2 自己的
-//! header tail、upvalue 描述符、`LOADKX/EXTRAARG` 等布局差异，避免把版本细节
-//! 模糊成“差不多一样”的弱抽象。
+//! 它复用 PUC-Lua 家族共享的位域拆解 helper，同时显式保留 5.3 自己的
+//! header 校验、字符串长度编码、整数/浮点常量标签，以及新增位运算 opcode 的
+//! 解析规则，避免把版本差异揉成一个“差不多能用”的弱抽象。
 
 use crate::parser::dialect::puc_lua::{
-    LUA_SIGNATURE, LUA52_LUAC_TAIL, PucLuaLayout, RawInstructionWord, decode_instruction_word,
+    LUA_SIGNATURE, LUA53_LUAC_DATA, LUA53_LUAC_INT, LUA53_LUAC_NUM, PucLuaLayout,
+    RawInstructionWord, decode_instruction_word,
 };
 use crate::parser::error::ParseError;
 use crate::parser::options::ParseOptions;
@@ -20,23 +21,26 @@ use crate::parser::raw::{
 use crate::parser::reader::BinaryReader;
 
 use super::raw::{
-    Lua52ConstPoolExtra, Lua52DebugExtra, Lua52HeaderExtra, Lua52InstrExtra, Lua52Opcode,
-    Lua52Operands, Lua52ProtoExtra, Lua52UpvalueExtra,
+    Lua53ConstPoolExtra, Lua53DebugExtra, Lua53HeaderExtra, Lua53InstrExtra, Lua53Opcode,
+    Lua53Operands, Lua53ProtoExtra, Lua53UpvalueExtra,
 };
 
-const LUA52_VERSION: u8 = 0x52;
-const LUA52_FORMAT: u8 = 0;
-const LUA52_HEADER_SIZE: usize = 18;
+const LUA53_VERSION: u8 = 0x53;
+const LUA53_FORMAT: u8 = 0;
 const LUA_TNIL: u8 = 0;
 const LUA_TBOOLEAN: u8 = 1;
 const LUA_TNUMBER: u8 = 3;
-const LUA_TSTRING: u8 = 4;
+const LUA_TSHRSTR: u8 = 4;
+const LUA_TNUMFLT: u8 = LUA_TNUMBER;
+const LUA_TLNGSTR: u8 = LUA_TSHRSTR | (1 << 4);
+const LUA_TNUMINT: u8 = LUA_TNUMBER | (1 << 4);
+const LUA53_LONG_STRING_MARKER: u8 = 0xff;
 
-pub(crate) struct Lua52Parser {
+pub(crate) struct Lua53Parser {
     options: ParseOptions,
 }
 
-impl Lua52Parser {
+impl Lua53Parser {
     pub(crate) const fn new(options: ParseOptions) -> Self {
         Self { options }
     }
@@ -47,13 +51,23 @@ impl Lua52Parser {
         let layout = PucLuaLayout {
             endianness: header.endianness,
             integer_size: header.integer_size,
-            lua_integer_size: None,
+            lua_integer_size: header.lua_integer_size,
             size_t_size: header.size_t_size,
             instruction_size: header.instruction_size,
             number_size: header.number_size,
-            integral_number: header.integral_number,
+            integral_number: false,
         };
-        let main = self.parse_proto(&mut reader, &layout)?;
+        let main_upvalue_count = reader.read_u8()?;
+        let main = self.parse_proto(&mut reader, &layout, None)?;
+
+        if !self.options.mode.is_permissive()
+            && main.common.upvalues.common.count != main_upvalue_count
+        {
+            return Err(ParseError::UnsupportedValue {
+                field: "main proto upvalue count",
+                value: u64::from(main_upvalue_count),
+            });
+        }
 
         Ok(RawChunk {
             header,
@@ -76,34 +90,33 @@ impl Lua52Parser {
         }
 
         let version = reader.read_u8()?;
-        if version != LUA52_VERSION {
+        if version != LUA53_VERSION {
             return Err(ParseError::UnsupportedVersion { found: version });
         }
 
         let format = reader.read_u8()?;
-        if format != LUA52_FORMAT && !self.options.mode.is_permissive() {
+        if format != LUA53_FORMAT && !self.options.mode.is_permissive() {
             return Err(ParseError::UnsupportedHeaderFormat { found: format });
         }
 
-        let endianness = match reader.read_u8()? {
-            0 => Endianness::Big,
-            1 => Endianness::Little,
-            value => {
-                if !self.options.mode.is_permissive() {
-                    return Err(ParseError::UnsupportedValue {
-                        field: "endianness",
-                        value: u64::from(value),
-                    });
-                }
-                Endianness::Little
-            }
-        };
+        let luac_data = reader.read_array::<6>()?;
+        if luac_data != *LUA53_LUAC_DATA && !self.options.mode.is_permissive() {
+            return Err(ParseError::UnsupportedValue {
+                field: "luac_data",
+                value: u64::from(u32::from_le_bytes([
+                    luac_data[0],
+                    luac_data[1],
+                    luac_data[2],
+                    luac_data[3],
+                ])),
+            });
+        }
+
         let integer_size = reader.read_u8()?;
         let size_t_size = reader.read_u8()?;
         let instruction_size = reader.read_u8()?;
+        let lua_integer_size = reader.read_u8()?;
         let number_size = reader.read_u8()?;
-        let integral_number = reader.read_u8()? != 0;
-        let tail = reader.read_array::<6>()?;
 
         if instruction_size != 4 {
             return Err(ParseError::UnsupportedSize {
@@ -111,41 +124,79 @@ impl Lua52Parser {
                 value: instruction_size,
             });
         }
-        if tail != *LUA52_LUAC_TAIL && !self.options.mode.is_permissive() {
+
+        let luac_int_bytes = reader.read_exact(usize::from(lua_integer_size))?;
+        let endianness = self.detect_endianness(luac_int_bytes)?;
+        let luac_int = decode_i64_bytes(luac_int_bytes, endianness, "lua_Integer")?;
+        if luac_int != LUA53_LUAC_INT && !self.options.mode.is_permissive() {
             return Err(ParseError::UnsupportedValue {
-                field: "luac_tail",
-                value: u64::from(u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]])),
+                field: "luac_int",
+                value: luac_int as u64,
+            });
+        }
+
+        let luac_num_bytes = reader.read_exact(usize::from(number_size))?;
+        let luac_num = decode_f64_bytes(luac_num_bytes, endianness)?;
+        if luac_num != LUA53_LUAC_NUM && !self.options.mode.is_permissive() {
+            return Err(ParseError::UnsupportedValue {
+                field: "luac_num",
+                value: luac_num.to_bits(),
             });
         }
 
         Ok(ChunkHeader {
             dialect: Dialect::PucLua,
-            version: DialectVersion::Lua52,
+            version: DialectVersion::Lua53,
             format,
             endianness,
             integer_size,
-            lua_integer_size: None,
+            lua_integer_size: Some(lua_integer_size),
             size_t_size,
             instruction_size,
             number_size,
-            integral_number,
-            extra: DialectHeaderExtra::Lua52(Lua52HeaderExtra),
+            integral_number: false,
+            extra: DialectHeaderExtra::Lua53(Lua53HeaderExtra),
             origin: Origin {
                 span: Span {
                     offset: start,
-                    size: LUA52_HEADER_SIZE,
+                    size: reader.offset() - start,
                 },
                 raw_word: None,
             },
         })
     }
 
+    fn detect_endianness(&self, bytes: &[u8]) -> Result<Endianness, ParseError> {
+        let little = decode_i64_bytes(bytes, Endianness::Little, "lua_Integer")?;
+        if little == LUA53_LUAC_INT {
+            return Ok(Endianness::Little);
+        }
+
+        let big = decode_i64_bytes(bytes, Endianness::Big, "lua_Integer")?;
+        if big == LUA53_LUAC_INT {
+            return Ok(Endianness::Big);
+        }
+
+        if self.options.mode.is_permissive() {
+            Ok(Endianness::Little)
+        } else {
+            Err(ParseError::UnsupportedValue {
+                field: "luac_int",
+                value: little as u64,
+            })
+        }
+    }
+
     fn parse_proto(
         &self,
         reader: &mut BinaryReader<'_>,
         layout: &PucLuaLayout,
+        parent_source: Option<&RawString>,
     ) -> Result<RawProto, ParseError> {
         let start = reader.offset();
+        let source = self
+            .parse_optional_string(reader, layout)?
+            .or_else(|| parent_source.cloned());
         let defined_start = self.read_u32(reader, layout, "linedefined")?;
         let defined_end = self.read_u32(reader, layout, "lastlinedefined")?;
         let num_params = reader.read_u8()?;
@@ -154,10 +205,10 @@ impl Lua52Parser {
 
         let instruction_words = self.parse_instruction_words(reader, layout)?;
         let instructions = self.decode_instructions(&instruction_words)?;
-        let (constants, children) = self.parse_constants(reader, layout)?;
+        let constants = self.parse_constants(reader, layout)?;
         let upvalues = self.parse_upvalues(reader, layout)?;
-        let (source, debug_info) =
-            self.parse_debug_info(reader, layout, instruction_words.len())?;
+        let children = self.parse_children(reader, layout, source.as_ref())?;
+        let debug_info = self.parse_debug_info(reader, layout, instruction_words.len())?;
 
         Ok(RawProto {
             common: RawProtoCommon {
@@ -177,7 +228,7 @@ impl Lua52Parser {
                 debug_info,
                 children,
             },
-            extra: DialectProtoExtra::Lua52(Lua52ProtoExtra { raw_is_vararg }),
+            extra: DialectProtoExtra::Lua53(Lua53ProtoExtra { raw_is_vararg }),
             origin: Origin {
                 span: Span {
                     offset: start,
@@ -223,89 +274,96 @@ impl Lua52Parser {
         while pc < words.len() {
             let entry = words[pc];
             let fields = decode_instruction_word(entry.word);
-            let opcode = Lua52Opcode::try_from(fields.opcode)
+            let opcode = Lua53Opcode::try_from(fields.opcode)
                 .map_err(|opcode| ParseError::InvalidOpcode { pc, opcode })?;
 
             let mut word_len = 1_u8;
             let mut extra_arg = None;
 
             let operands = match opcode {
-                Lua52Opcode::Move
-                | Lua52Opcode::LoadNil
-                | Lua52Opcode::GetUpVal
-                | Lua52Opcode::SetUpVal
-                | Lua52Opcode::Unm
-                | Lua52Opcode::Not
-                | Lua52Opcode::Len
-                | Lua52Opcode::Return
-                | Lua52Opcode::VarArg => Lua52Operands::AB {
+                Lua53Opcode::Move
+                | Lua53Opcode::LoadNil
+                | Lua53Opcode::GetUpVal
+                | Lua53Opcode::SetUpVal
+                | Lua53Opcode::Unm
+                | Lua53Opcode::BNot
+                | Lua53Opcode::Not
+                | Lua53Opcode::Len
+                | Lua53Opcode::Return
+                | Lua53Opcode::VarArg => Lua53Operands::AB {
                     a: fields.a,
                     b: fields.b,
                 },
-                Lua52Opcode::LoadK | Lua52Opcode::Closure => Lua52Operands::ABx {
+                Lua53Opcode::LoadK | Lua53Opcode::Closure => Lua53Operands::ABx {
                     a: fields.a,
                     bx: fields.bx,
                 },
-                Lua52Opcode::LoadKx => {
+                Lua53Opcode::LoadKx => {
                     let helper = self.extra_arg_word(words, pc, opcode)?;
                     extra_arg = Some(helper);
                     word_len = 2;
-                    Lua52Operands::A { a: fields.a }
+                    Lua53Operands::A { a: fields.a }
                 }
-                Lua52Opcode::LoadBool
-                | Lua52Opcode::GetTabUp
-                | Lua52Opcode::GetTable
-                | Lua52Opcode::SetTabUp
-                | Lua52Opcode::SetTable
-                | Lua52Opcode::NewTable
-                | Lua52Opcode::Self_
-                | Lua52Opcode::Add
-                | Lua52Opcode::Sub
-                | Lua52Opcode::Mul
-                | Lua52Opcode::Div
-                | Lua52Opcode::Mod
-                | Lua52Opcode::Pow
-                | Lua52Opcode::Concat
-                | Lua52Opcode::Eq
-                | Lua52Opcode::Lt
-                | Lua52Opcode::Le
-                | Lua52Opcode::TestSet
-                | Lua52Opcode::Call
-                | Lua52Opcode::TailCall
-                | Lua52Opcode::TForCall => Lua52Operands::ABC {
+                Lua53Opcode::LoadBool
+                | Lua53Opcode::GetTabUp
+                | Lua53Opcode::GetTable
+                | Lua53Opcode::SetTabUp
+                | Lua53Opcode::SetTable
+                | Lua53Opcode::NewTable
+                | Lua53Opcode::Self_
+                | Lua53Opcode::Add
+                | Lua53Opcode::Sub
+                | Lua53Opcode::Mul
+                | Lua53Opcode::Mod
+                | Lua53Opcode::Pow
+                | Lua53Opcode::Div
+                | Lua53Opcode::Idiv
+                | Lua53Opcode::Band
+                | Lua53Opcode::Bor
+                | Lua53Opcode::Bxor
+                | Lua53Opcode::Shl
+                | Lua53Opcode::Shr
+                | Lua53Opcode::Concat
+                | Lua53Opcode::Eq
+                | Lua53Opcode::Lt
+                | Lua53Opcode::Le
+                | Lua53Opcode::TestSet
+                | Lua53Opcode::Call
+                | Lua53Opcode::TailCall
+                | Lua53Opcode::TForCall => Lua53Operands::ABC {
                     a: fields.a,
                     b: fields.b,
                     c: fields.c,
                 },
-                Lua52Opcode::Jmp
-                | Lua52Opcode::ForLoop
-                | Lua52Opcode::ForPrep
-                | Lua52Opcode::TForLoop => Lua52Operands::AsBx {
+                Lua53Opcode::Jmp
+                | Lua53Opcode::ForLoop
+                | Lua53Opcode::ForPrep
+                | Lua53Opcode::TForLoop => Lua53Operands::AsBx {
                     a: fields.a,
                     sbx: fields.sbx,
                 },
-                Lua52Opcode::Test => Lua52Operands::AC {
+                Lua53Opcode::Test => Lua53Operands::AC {
                     a: fields.a,
                     c: fields.c,
                 },
-                Lua52Opcode::SetList => {
+                Lua53Opcode::SetList => {
                     if fields.c == 0 {
                         extra_arg = Some(self.extra_arg_word(words, pc, opcode)?);
                         word_len = 2;
                     }
-                    Lua52Operands::ABC {
+                    Lua53Operands::ABC {
                         a: fields.a,
                         b: fields.b,
                         c: fields.c,
                     }
                 }
-                Lua52Opcode::ExtraArg => Lua52Operands::Ax { ax: fields.ax },
+                Lua53Opcode::ExtraArg => Lua53Operands::Ax { ax: fields.ax },
             };
 
             instructions.push(RawInstr {
-                opcode: RawInstrOpcode::Lua52(opcode),
-                operands: RawInstrOperands::Lua52(operands),
-                extra: DialectInstrExtra::Lua52(Lua52InstrExtra {
+                opcode: RawInstrOpcode::Lua53(opcode),
+                operands: RawInstrOperands::Lua53(operands),
+                extra: DialectInstrExtra::Lua53(Lua53InstrExtra {
                     pc: pc as u32,
                     word_len,
                     extra_arg,
@@ -329,7 +387,7 @@ impl Lua52Parser {
         &self,
         words: &[RawInstructionWord],
         pc: usize,
-        opcode: Lua52Opcode,
+        opcode: Lua53Opcode,
     ) -> Result<u32, ParseError> {
         let Some(helper) = words.get(pc + 1).copied() else {
             return Err(ParseError::MissingExtraArgWord {
@@ -338,14 +396,14 @@ impl Lua52Parser {
             });
         };
         let helper_fields = decode_instruction_word(helper.word);
-        let helper_opcode = Lua52Opcode::try_from(helper_fields.opcode).map_err(|found| {
+        let helper_opcode = Lua53Opcode::try_from(helper_fields.opcode).map_err(|found| {
             ParseError::InvalidExtraArgWord {
                 pc,
                 opcode: opcode_label(opcode),
                 found,
             }
         })?;
-        if helper_opcode != Lua52Opcode::ExtraArg {
+        if helper_opcode != Lua53Opcode::ExtraArg {
             return Err(ParseError::InvalidExtraArgWord {
                 pc,
                 opcode: opcode_label(opcode),
@@ -359,7 +417,7 @@ impl Lua52Parser {
         &self,
         reader: &mut BinaryReader<'_>,
         layout: &PucLuaLayout,
-    ) -> Result<(RawConstPool, Vec<RawProto>), ParseError> {
+    ) -> Result<RawConstPool, ParseError> {
         let constant_count = self.read_count(reader, layout, "constant count")?;
         let mut literals = Vec::with_capacity(constant_count as usize);
 
@@ -369,16 +427,15 @@ impl Lua52Parser {
             let literal = match tag {
                 LUA_TNIL => RawLiteralConst::Nil,
                 LUA_TBOOLEAN => RawLiteralConst::Boolean(reader.read_u8()? != 0),
-                LUA_TNUMBER => {
-                    if layout.integral_number {
-                        RawLiteralConst::Integer(self.read_i64(reader, layout, "lua_Number")?)
-                    } else {
-                        RawLiteralConst::Number(
-                            reader.read_f64_sized(layout.number_size, layout.endianness)?,
-                        )
-                    }
-                }
-                LUA_TSTRING => {
+                LUA_TNUMFLT => RawLiteralConst::Number(
+                    reader.read_f64_sized(layout.number_size, layout.endianness)?,
+                ),
+                LUA_TNUMINT => RawLiteralConst::Integer(self.read_lua_integer(
+                    reader,
+                    layout,
+                    "lua_Integer",
+                )?),
+                LUA_TSHRSTR | LUA_TLNGSTR => {
                     let value =
                         self.parse_string(reader, layout)?
                             .ok_or(ParseError::UnsupportedValue {
@@ -392,19 +449,10 @@ impl Lua52Parser {
             literals.push(literal);
         }
 
-        let child_count = self.read_count(reader, layout, "child proto count")?;
-        let mut children = Vec::with_capacity(child_count as usize);
-        for _ in 0..child_count {
-            children.push(self.parse_proto(reader, layout)?);
-        }
-
-        Ok((
-            RawConstPool {
-                common: RawConstPoolCommon { literals },
-                extra: DialectConstPoolExtra::Lua52(Lua52ConstPoolExtra),
-            },
-            children,
-        ))
+        Ok(RawConstPool {
+            common: RawConstPoolCommon { literals },
+            extra: DialectConstPoolExtra::Lua53(Lua53ConstPoolExtra),
+        })
     }
 
     fn parse_upvalues(
@@ -431,8 +479,22 @@ impl Lua52Parser {
                 count: count_u8,
                 descriptors,
             },
-            extra: DialectUpvalueExtra::Lua52(Lua52UpvalueExtra),
+            extra: DialectUpvalueExtra::Lua53(Lua53UpvalueExtra),
         })
+    }
+
+    fn parse_children(
+        &self,
+        reader: &mut BinaryReader<'_>,
+        layout: &PucLuaLayout,
+        parent_source: Option<&RawString>,
+    ) -> Result<Vec<RawProto>, ParseError> {
+        let child_count = self.read_count(reader, layout, "child proto count")?;
+        let mut children = Vec::with_capacity(child_count as usize);
+        for _ in 0..child_count {
+            children.push(self.parse_proto(reader, layout, parent_source)?);
+        }
+        Ok(children)
     }
 
     fn parse_debug_info(
@@ -440,9 +502,7 @@ impl Lua52Parser {
         reader: &mut BinaryReader<'_>,
         layout: &PucLuaLayout,
         raw_instruction_words: usize,
-    ) -> Result<(Option<RawString>, RawDebugInfo), ParseError> {
-        let source = self.parse_optional_string(reader, layout)?;
-
+    ) -> Result<RawDebugInfo, ParseError> {
         let line_count = self.read_count(reader, layout, "line info count")?;
         let mut line_info = Vec::with_capacity(line_count as usize);
         for _ in 0..line_count {
@@ -485,17 +545,14 @@ impl Lua52Parser {
             });
         }
 
-        Ok((
-            source,
-            RawDebugInfo {
-                common: RawDebugInfoCommon {
-                    line_info,
-                    local_vars,
-                    upvalue_names,
-                },
-                extra: DialectDebugExtra::Lua52(Lua52DebugExtra),
+        Ok(RawDebugInfo {
+            common: RawDebugInfoCommon {
+                line_info,
+                local_vars,
+                upvalue_names,
             },
-        ))
+            extra: DialectDebugExtra::Lua53(Lua53DebugExtra),
+        })
     }
 
     fn parse_optional_string(
@@ -511,22 +568,24 @@ impl Lua52Parser {
         reader: &mut BinaryReader<'_>,
         layout: &PucLuaLayout,
     ) -> Result<Option<RawString>, ParseError> {
-        let size = reader.read_u64_sized(layout.size_t_size, layout.endianness, "size_t")?;
-        if size == 0 {
-            return Ok(None);
-        }
-
-        let byte_count = usize::try_from(size).map_err(|_| ParseError::IntegerOverflow {
+        let size = match reader.read_u8()? {
+            0 => return Ok(None),
+            LUA53_LONG_STRING_MARKER => {
+                reader.read_u64_sized(layout.size_t_size, layout.endianness, "size_t")?
+            }
+            size => u64::from(size),
+        };
+        let payload_size = size.checked_sub(1).ok_or(ParseError::UnsupportedValue {
             field: "string size",
             value: size,
         })?;
+        let byte_count =
+            usize::try_from(payload_size).map_err(|_| ParseError::IntegerOverflow {
+                field: "string size",
+                value: payload_size,
+            })?;
         let offset = reader.offset();
-        let payload = reader.read_exact(byte_count)?.to_vec();
-        let bytes = match payload.split_last() {
-            Some((&0, bytes_without_nul)) => bytes_without_nul.to_vec(),
-            _ if self.options.mode.is_permissive() => payload,
-            _ => return Err(ParseError::UnterminatedString { offset }),
-        };
+        let bytes = reader.read_exact(byte_count)?.to_vec();
         let text = self.decode_string_text(offset, &bytes)?;
 
         Ok(Some(RawString {
@@ -587,49 +646,127 @@ impl Lua52Parser {
     ) -> Result<i64, ParseError> {
         reader.read_i64_sized(layout.integer_size, layout.endianness, field)
     }
+
+    fn read_lua_integer(
+        &self,
+        reader: &mut BinaryReader<'_>,
+        layout: &PucLuaLayout,
+        field: &'static str,
+    ) -> Result<i64, ParseError> {
+        let Some(size) = layout.lua_integer_size else {
+            unreachable!("lua53 parser should always carry lua_integer_size in layout");
+        };
+        reader.read_i64_sized(size, layout.endianness, field)
+    }
 }
 
-fn opcode_label(opcode: Lua52Opcode) -> &'static str {
+fn decode_i64_bytes(
+    bytes: &[u8],
+    endianness: Endianness,
+    field: &'static str,
+) -> Result<i64, ParseError> {
+    if !(1..=8).contains(&bytes.len()) {
+        return Err(ParseError::UnsupportedSize {
+            field,
+            value: bytes.len() as u8,
+        });
+    }
+
+    let mut buffer = [0_u8; 8];
+    match endianness {
+        Endianness::Little => buffer[..bytes.len()].copy_from_slice(bytes),
+        Endianness::Big => buffer[8 - bytes.len()..].copy_from_slice(bytes),
+    }
+
+    if bytes.len() == 8 {
+        return Ok(match endianness {
+            Endianness::Little => i64::from_le_bytes(buffer),
+            Endianness::Big => i64::from_be_bytes(buffer),
+        });
+    }
+
+    let unsigned = match endianness {
+        Endianness::Little => u64::from_le_bytes(buffer),
+        Endianness::Big => u64::from_be_bytes(buffer),
+    };
+    let bits = (bytes.len() as u32) * 8;
+    let shift = 64 - bits;
+    Ok(((unsigned << shift) as i64) >> shift)
+}
+
+fn decode_f64_bytes(bytes: &[u8], endianness: Endianness) -> Result<f64, ParseError> {
+    match bytes.len() {
+        4 => {
+            let mut buffer = [0_u8; 4];
+            buffer.copy_from_slice(bytes);
+            Ok(match endianness {
+                Endianness::Little => f32::from_le_bytes(buffer),
+                Endianness::Big => f32::from_be_bytes(buffer),
+            } as f64)
+        }
+        8 => {
+            let mut buffer = [0_u8; 8];
+            buffer.copy_from_slice(bytes);
+            Ok(match endianness {
+                Endianness::Little => f64::from_le_bytes(buffer),
+                Endianness::Big => f64::from_be_bytes(buffer),
+            })
+        }
+        value => Err(ParseError::UnsupportedSize {
+            field: "number_size",
+            value: value as u8,
+        }),
+    }
+}
+
+fn opcode_label(opcode: Lua53Opcode) -> &'static str {
     match opcode {
-        Lua52Opcode::Move => "MOVE",
-        Lua52Opcode::LoadK => "LOADK",
-        Lua52Opcode::LoadKx => "LOADKX",
-        Lua52Opcode::LoadBool => "LOADBOOL",
-        Lua52Opcode::LoadNil => "LOADNIL",
-        Lua52Opcode::GetUpVal => "GETUPVAL",
-        Lua52Opcode::GetTabUp => "GETTABUP",
-        Lua52Opcode::GetTable => "GETTABLE",
-        Lua52Opcode::SetTabUp => "SETTABUP",
-        Lua52Opcode::SetUpVal => "SETUPVAL",
-        Lua52Opcode::SetTable => "SETTABLE",
-        Lua52Opcode::NewTable => "NEWTABLE",
-        Lua52Opcode::Self_ => "SELF",
-        Lua52Opcode::Add => "ADD",
-        Lua52Opcode::Sub => "SUB",
-        Lua52Opcode::Mul => "MUL",
-        Lua52Opcode::Div => "DIV",
-        Lua52Opcode::Mod => "MOD",
-        Lua52Opcode::Pow => "POW",
-        Lua52Opcode::Unm => "UNM",
-        Lua52Opcode::Not => "NOT",
-        Lua52Opcode::Len => "LEN",
-        Lua52Opcode::Concat => "CONCAT",
-        Lua52Opcode::Jmp => "JMP",
-        Lua52Opcode::Eq => "EQ",
-        Lua52Opcode::Lt => "LT",
-        Lua52Opcode::Le => "LE",
-        Lua52Opcode::Test => "TEST",
-        Lua52Opcode::TestSet => "TESTSET",
-        Lua52Opcode::Call => "CALL",
-        Lua52Opcode::TailCall => "TAILCALL",
-        Lua52Opcode::Return => "RETURN",
-        Lua52Opcode::ForLoop => "FORLOOP",
-        Lua52Opcode::ForPrep => "FORPREP",
-        Lua52Opcode::TForCall => "TFORCALL",
-        Lua52Opcode::TForLoop => "TFORLOOP",
-        Lua52Opcode::SetList => "SETLIST",
-        Lua52Opcode::Closure => "CLOSURE",
-        Lua52Opcode::VarArg => "VARARG",
-        Lua52Opcode::ExtraArg => "EXTRAARG",
+        Lua53Opcode::Move => "MOVE",
+        Lua53Opcode::LoadK => "LOADK",
+        Lua53Opcode::LoadKx => "LOADKX",
+        Lua53Opcode::LoadBool => "LOADBOOL",
+        Lua53Opcode::LoadNil => "LOADNIL",
+        Lua53Opcode::GetUpVal => "GETUPVAL",
+        Lua53Opcode::GetTabUp => "GETTABUP",
+        Lua53Opcode::GetTable => "GETTABLE",
+        Lua53Opcode::SetTabUp => "SETTABUP",
+        Lua53Opcode::SetUpVal => "SETUPVAL",
+        Lua53Opcode::SetTable => "SETTABLE",
+        Lua53Opcode::NewTable => "NEWTABLE",
+        Lua53Opcode::Self_ => "SELF",
+        Lua53Opcode::Add => "ADD",
+        Lua53Opcode::Sub => "SUB",
+        Lua53Opcode::Mul => "MUL",
+        Lua53Opcode::Mod => "MOD",
+        Lua53Opcode::Pow => "POW",
+        Lua53Opcode::Div => "DIV",
+        Lua53Opcode::Idiv => "IDIV",
+        Lua53Opcode::Band => "BAND",
+        Lua53Opcode::Bor => "BOR",
+        Lua53Opcode::Bxor => "BXOR",
+        Lua53Opcode::Shl => "SHL",
+        Lua53Opcode::Shr => "SHR",
+        Lua53Opcode::Unm => "UNM",
+        Lua53Opcode::BNot => "BNOT",
+        Lua53Opcode::Not => "NOT",
+        Lua53Opcode::Len => "LEN",
+        Lua53Opcode::Concat => "CONCAT",
+        Lua53Opcode::Jmp => "JMP",
+        Lua53Opcode::Eq => "EQ",
+        Lua53Opcode::Lt => "LT",
+        Lua53Opcode::Le => "LE",
+        Lua53Opcode::Test => "TEST",
+        Lua53Opcode::TestSet => "TESTSET",
+        Lua53Opcode::Call => "CALL",
+        Lua53Opcode::TailCall => "TAILCALL",
+        Lua53Opcode::Return => "RETURN",
+        Lua53Opcode::ForLoop => "FORLOOP",
+        Lua53Opcode::ForPrep => "FORPREP",
+        Lua53Opcode::TForCall => "TFORCALL",
+        Lua53Opcode::TForLoop => "TFORLOOP",
+        Lua53Opcode::SetList => "SETLIST",
+        Lua53Opcode::Closure => "CLOSURE",
+        Lua53Opcode::VarArg => "VARARG",
+        Lua53Opcode::ExtraArg => "EXTRAARG",
     }
 }

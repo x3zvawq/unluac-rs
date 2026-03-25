@@ -102,6 +102,9 @@ fn write_header_view(output: &mut String, header: &ChunkHeader) {
     let _ = writeln!(output, "  format: {}", header.format);
     let _ = writeln!(output, "  endianness: {}", header.endianness_label());
     let _ = writeln!(output, "  integer_size: {}", header.integer_size);
+    if let Some(lua_integer_size) = header.lua_integer_size {
+        let _ = writeln!(output, "  lua_integer_size: {lua_integer_size}");
+    }
     let _ = writeln!(output, "  size_t_size: {}", header.size_t_size);
     let _ = writeln!(output, "  instruction_size: {}", header.instruction_size);
     let _ = writeln!(output, "  number_size: {}", header.number_size);
@@ -114,6 +117,9 @@ fn write_header_view(output: &mut String, header: &ChunkHeader) {
         }
         DialectHeaderExtra::Lua52(_) => {
             unreachable!("lua51 debug should not receive lua52 header extras")
+        }
+        DialectHeaderExtra::Lua53(_) => {
+            unreachable!("lua51 debug should not receive lua53 header extras")
         }
     }
 }
@@ -200,6 +206,9 @@ fn write_constants_view(output: &mut String, protos: &[ProtoEntry<'_>], visible_
             DialectConstPoolExtra::Lua52(_) => {
                 unreachable!("lua51 debug should not receive lua52 const-pool extras")
             }
+            DialectConstPoolExtra::Lua53(_) => {
+                unreachable!("lua51 debug should not receive lua53 const-pool extras")
+            }
         }
     }
 }
@@ -273,6 +282,9 @@ fn write_verbose_debug_info(output: &mut String, proto: &RawProto) {
         DialectDebugExtra::Lua52(_) => {
             unreachable!("lua51 debug should not receive lua52 debug extras")
         }
+        DialectDebugExtra::Lua53(_) => {
+            unreachable!("lua51 debug should not receive lua53 debug extras")
+        }
     }
     match &proto.common.upvalues.extra {
         DialectUpvalueExtra::Lua51(extra) => {
@@ -280,6 +292,9 @@ fn write_verbose_debug_info(output: &mut String, proto: &RawProto) {
         }
         DialectUpvalueExtra::Lua52(_) => {
             unreachable!("lua51 debug should not receive lua52 upvalue extras")
+        }
+        DialectUpvalueExtra::Lua53(_) => {
+            unreachable!("lua51 debug should not receive lua53 upvalue extras")
         }
     }
 
@@ -366,6 +381,7 @@ impl HeaderDebugExt for ChunkHeader {
         match self.version {
             DialectVersion::Lua51 => "lua5.1",
             DialectVersion::Lua52 => "lua5.2",
+            DialectVersion::Lua53 => "lua5.3",
         }
     }
 
@@ -388,6 +404,9 @@ impl RawProtoDebugExt for RawProto {
             DialectProtoExtra::Lua52(_) => {
                 unreachable!("lua51 debug should not receive lua52 proto extras")
             }
+            DialectProtoExtra::Lua53(_) => {
+                unreachable!("lua51 debug should not receive lua53 proto extras")
+            }
         }
     }
 }
@@ -407,6 +426,9 @@ impl RawInstrDebugExt for RawInstr {
             DialectInstrExtra::Lua52(_) => {
                 unreachable!("lua51 debug should not receive lua52 instruction extras")
             }
+            DialectInstrExtra::Lua53(_) => {
+                unreachable!("lua51 debug should not receive lua53 instruction extras")
+            }
         }
     }
 
@@ -415,6 +437,9 @@ impl RawInstrDebugExt for RawInstr {
             DialectInstrExtra::Lua51(Lua51InstrExtra { word_len, .. }) => *word_len,
             DialectInstrExtra::Lua52(_) => {
                 unreachable!("lua51 debug should not receive lua52 instruction extras")
+            }
+            DialectInstrExtra::Lua53(_) => {
+                unreachable!("lua51 debug should not receive lua53 instruction extras")
             }
         }
     }
@@ -427,6 +452,9 @@ impl RawInstrDebugExt for RawInstr {
             DialectInstrExtra::Lua52(_) => {
                 unreachable!("lua51 debug should not receive lua52 instruction extras")
             }
+            DialectInstrExtra::Lua53(_) => {
+                unreachable!("lua51 debug should not receive lua53 instruction extras")
+            }
         }
     }
 
@@ -436,6 +464,9 @@ impl RawInstrDebugExt for RawInstr {
             RawInstrOpcode::Lua52(_) => {
                 unreachable!("lua51 debug should not receive lua52 opcodes")
             }
+            RawInstrOpcode::Lua53(_) => {
+                unreachable!("lua51 debug should not receive lua53 opcodes")
+            }
         }
     }
 
@@ -444,6 +475,9 @@ impl RawInstrDebugExt for RawInstr {
             RawInstrOperands::Lua51(operands) => operands.label(),
             RawInstrOperands::Lua52(_) => {
                 unreachable!("lua51 debug should not receive lua52 operands")
+            }
+            RawInstrOperands::Lua53(_) => {
+                unreachable!("lua51 debug should not receive lua53 operands")
             }
         }
     }

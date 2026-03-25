@@ -79,19 +79,43 @@ pub(super) fn build_branch_short_circuit_plan(
         .find(|candidate| {
             candidate.header == header
                 && candidate.reducible
-                && matches!(candidate.exit, ShortCircuitExit::BranchExit { .. })
+                && matches!(
+                    candidate.exit,
+                    ShortCircuitExit::BranchExit { .. } | ShortCircuitExit::ValueMerge(_)
+                )
         })?;
-    let ShortCircuitExit::BranchExit { truthy, falsy } = short.exit else {
-        return None;
+    let (truthy, falsy, decision) = match short.exit {
+        ShortCircuitExit::BranchExit { truthy, falsy } => (
+            truthy,
+            falsy,
+            build_branch_decision_expr(lowering, short, short.entry)?,
+        ),
+        ShortCircuitExit::ValueMerge(_) => {
+            let (truthy, falsy, truthy_leaves, falsy_leaves) =
+                branch_exit_blocks_from_value_merge_candidate(short)?;
+            (
+                truthy,
+                falsy,
+                build_branch_decision_expr_for_value_merge_candidate(
+                    lowering,
+                    short,
+                    &truthy_leaves,
+                    &falsy_leaves,
+                )?,
+            )
+        }
     };
 
-    let decision = build_branch_decision_expr(lowering, short, short.entry)?;
-    let allowed_blocks = BTreeSet::from([header]);
+    let consumed_headers = short
+        .nodes
+        .iter()
+        .map(|node| node.header)
+        .collect::<Vec<_>>();
+    let allowed_blocks = consumed_headers.iter().copied().collect::<BTreeSet<_>>();
     if decision_references_forbidden_candidate_temps(lowering, short, &decision, &allowed_blocks) {
         return None;
     }
     let cond = finalize_condition_decision_expr(decision);
-    let consumed_headers = short.nodes.iter().map(|node| node.header).collect();
 
     Some(BranchShortCircuitPlan {
         cond,
@@ -99,6 +123,126 @@ pub(super) fn build_branch_short_circuit_plan(
         falsy,
         consumed_headers,
     })
+}
+
+fn branch_exit_blocks_from_value_merge_candidate(
+    short: &ShortCircuitCandidate,
+) -> Option<(BlockRef, BlockRef, BTreeSet<BlockRef>, BTreeSet<BlockRef>)> {
+    let ShortCircuitExit::ValueMerge(_) = short.exit else {
+        return None;
+    };
+
+    let (truthy_leaves, falsy_leaves) = short_circuit_value_truthiness_leaves(short)?;
+
+    if truthy_leaves.len() != 1 || falsy_leaves.len() != 1 {
+        return None;
+    }
+
+    let truthy_leaves = collect_short_circuit_truthy_value_leaves(
+        short,
+        short.entry,
+        &mut BTreeMap::new(),
+        &mut BTreeMap::new(),
+    )?;
+    let falsy_leaves = collect_short_circuit_falsy_value_leaves(
+        short,
+        short.entry,
+        &mut BTreeMap::new(),
+        &mut BTreeMap::new(),
+    )?;
+    let truthy = *truthy_leaves
+        .iter()
+        .next()
+        .expect("len checked above, exactly one truthy leaf exists");
+    let falsy = *falsy_leaves
+        .iter()
+        .next()
+        .expect("len checked above, exactly one falsy leaf exists");
+    (truthy != falsy).then_some((truthy, falsy, truthy_leaves, falsy_leaves))
+}
+
+fn short_circuit_value_truthiness_leaves(
+    short: &ShortCircuitCandidate,
+) -> Option<(BTreeSet<BlockRef>, BTreeSet<BlockRef>)> {
+    let mut truthy_memo = BTreeMap::new();
+    let mut falsy_memo = BTreeMap::new();
+    let truthy_leaves = collect_short_circuit_truthy_value_leaves(
+        short,
+        short.entry,
+        &mut truthy_memo,
+        &mut falsy_memo,
+    )?;
+    let falsy_leaves = collect_short_circuit_falsy_value_leaves(
+        short,
+        short.entry,
+        &mut truthy_memo,
+        &mut falsy_memo,
+    )?;
+    Some((truthy_leaves, falsy_leaves))
+}
+
+fn collect_short_circuit_truthy_value_leaves(
+    short: &ShortCircuitCandidate,
+    node_ref: ShortCircuitNodeRef,
+    truthy_memo: &mut BTreeMap<ShortCircuitNodeRef, BTreeSet<BlockRef>>,
+    falsy_memo: &mut BTreeMap<ShortCircuitNodeRef, BTreeSet<BlockRef>>,
+) -> Option<BTreeSet<BlockRef>> {
+    if let Some(leaves) = truthy_memo.get(&node_ref) {
+        return Some(leaves.clone());
+    }
+
+    let node = short.nodes.get(node_ref.index())?;
+    let leaves = collect_short_circuit_target_value_leaves(
+        short,
+        &node.truthy,
+        true,
+        truthy_memo,
+        falsy_memo,
+    )?;
+    truthy_memo.insert(node_ref, leaves.clone());
+    Some(leaves)
+}
+
+fn collect_short_circuit_falsy_value_leaves(
+    short: &ShortCircuitCandidate,
+    node_ref: ShortCircuitNodeRef,
+    truthy_memo: &mut BTreeMap<ShortCircuitNodeRef, BTreeSet<BlockRef>>,
+    falsy_memo: &mut BTreeMap<ShortCircuitNodeRef, BTreeSet<BlockRef>>,
+) -> Option<BTreeSet<BlockRef>> {
+    if let Some(leaves) = falsy_memo.get(&node_ref) {
+        return Some(leaves.clone());
+    }
+
+    let node = short.nodes.get(node_ref.index())?;
+    let leaves = collect_short_circuit_target_value_leaves(
+        short,
+        &node.falsy,
+        false,
+        truthy_memo,
+        falsy_memo,
+    )?;
+    falsy_memo.insert(node_ref, leaves.clone());
+    Some(leaves)
+}
+
+fn collect_short_circuit_target_value_leaves(
+    short: &ShortCircuitCandidate,
+    target: &ShortCircuitTarget,
+    want_truthy: bool,
+    truthy_memo: &mut BTreeMap<ShortCircuitNodeRef, BTreeSet<BlockRef>>,
+    falsy_memo: &mut BTreeMap<ShortCircuitNodeRef, BTreeSet<BlockRef>>,
+) -> Option<BTreeSet<BlockRef>> {
+    match target {
+        ShortCircuitTarget::Node(next_ref) => {
+            if want_truthy {
+                collect_short_circuit_truthy_value_leaves(short, *next_ref, truthy_memo, falsy_memo)
+            } else {
+                collect_short_circuit_falsy_value_leaves(short, *next_ref, truthy_memo, falsy_memo)
+            }
+        }
+        ShortCircuitTarget::Value(block) => Some(BTreeSet::from([*block])),
+        ShortCircuitTarget::TruthyExit | ShortCircuitTarget::FalsyExit => None,
+    }
 }
 
 /// 如果一个 value merge 的一部分叶子只是“把 merge 前的旧值原样带过去”，
@@ -478,6 +622,32 @@ fn build_branch_decision_expr(
                 HirDecisionTarget::Expr(HirExpr::Boolean(true)),
             )),
             ShortCircuitTarget::Value(_) => None,
+        },
+    )
+}
+
+fn build_branch_decision_expr_for_value_merge_candidate(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+    truthy_leaves: &BTreeSet<BlockRef>,
+    falsy_leaves: &BTreeSet<BlockRef>,
+) -> Option<HirDecisionExpr> {
+    build_decision_expr(
+        lowering,
+        short,
+        short.entry,
+        lower_short_circuit_subject_inline,
+        |_, target| match target {
+            ShortCircuitTarget::Node(next_ref) => Some(DecisionEdge::Node(*next_ref)),
+            ShortCircuitTarget::Value(block) if truthy_leaves.contains(block) => Some(
+                DecisionEdge::Leaf(HirDecisionTarget::Expr(HirExpr::Boolean(true))),
+            ),
+            ShortCircuitTarget::Value(block) if falsy_leaves.contains(block) => Some(
+                DecisionEdge::Leaf(HirDecisionTarget::Expr(HirExpr::Boolean(false))),
+            ),
+            ShortCircuitTarget::Value(_)
+            | ShortCircuitTarget::TruthyExit
+            | ShortCircuitTarget::FalsyExit => None,
         },
     )
 }

@@ -130,6 +130,7 @@ impl Lua51Parser {
             format,
             endianness,
             integer_size,
+            lua_integer_size: None,
             size_t_size,
             instruction_size,
             number_size,
