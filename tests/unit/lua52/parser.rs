@@ -136,6 +136,27 @@ mod parse_lua52_chunk {
             "fixture should contain a SETLIST collapsed with EXTRAARG beyond the normal C range"
         );
     }
+
+    #[test]
+    fn decodes_nested_env_shadowing_and_closure_capture_for_env_shadow_fixture() {
+        let chunk = parse_fixture_with_debug("tests/lua_cases/lua5.2/07_env_shadow_and_closure.lua");
+        let main = &chunk.main.common;
+        let make_reader = &main.children[0].common;
+        let reader = &make_reader.children[0].common;
+
+        assert_eq!(main.upvalues.common.count, 1);
+        assert_eq!(make_reader.upvalues.common.count, 1);
+        assert_eq!(reader.upvalues.common.count, 2);
+
+        let upvalue_names = reader
+            .debug_info.common
+            .upvalue_names
+            .iter()
+            .filter_map(|name| name.text.as_ref().map(|text| text.value.as_str()))
+            .collect::<Vec<_>>();
+        assert!(upvalue_names.contains(&"_ENV"));
+        assert!(upvalue_names.contains(&"prefix"));
+    }
 }
 
 fn parse_fixture(source_relative: &str) -> unluac::parser::RawChunk {

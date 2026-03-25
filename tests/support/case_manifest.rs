@@ -47,10 +47,18 @@ pub(crate) struct LuaCaseManifestEntry {
 
 impl LuaCaseManifestEntry {
     const fn new(path: &'static str, dialect: LuaCaseDialect) -> Self {
+        Self::new_with_hir_exit(path, dialect, dialect.supports_hir_regression())
+    }
+
+    const fn new_with_hir_exit(
+        path: &'static str,
+        dialect: LuaCaseDialect,
+        expect_clean_hir_exit: bool,
+    ) -> Self {
         Self {
             path,
             dialect,
-            expect_clean_hir_exit: dialect.supports_hir_regression(),
+            expect_clean_hir_exit,
         }
     }
 }
@@ -289,16 +297,42 @@ pub(crate) const ALL_CASES: &[LuaCaseManifestEntry] = &[
         LuaCaseDialect::Lua51,
     ),
     LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.1/03_setfenv_nested_closure.lua",
+        LuaCaseDialect::Lua51,
+    ),
+    LuaCaseManifestEntry::new_with_hir_exit(
         "tests/lua_cases/lua5.2/01_goto_and_label.lua",
         LuaCaseDialect::Lua52,
+        true,
     ),
-    LuaCaseManifestEntry::new(
+    LuaCaseManifestEntry::new_with_hir_exit(
         "tests/lua_cases/lua5.2/02_env_redirect.lua",
         LuaCaseDialect::Lua52,
+        true,
     ),
     LuaCaseManifestEntry::new(
         "tests/lua_cases/lua5.2/03_extraarg_boundary.lua",
         LuaCaseDialect::Lua52,
+    ),
+    LuaCaseManifestEntry::new_with_hir_exit(
+        "tests/lua_cases/lua5.2/04_goto_break_like.lua",
+        LuaCaseDialect::Lua52,
+        true,
+    ),
+    LuaCaseManifestEntry::new_with_hir_exit(
+        "tests/lua_cases/lua5.2/05_goto_continue_like.lua",
+        LuaCaseDialect::Lua52,
+        true,
+    ),
+    LuaCaseManifestEntry::new_with_hir_exit(
+        "tests/lua_cases/lua5.2/06_goto_irreducible_mesh.lua",
+        LuaCaseDialect::Lua52,
+        true,
+    ),
+    LuaCaseManifestEntry::new_with_hir_exit(
+        "tests/lua_cases/lua5.2/07_env_shadow_and_closure.lua",
+        LuaCaseDialect::Lua52,
+        true,
     ),
     LuaCaseManifestEntry::new(
         "tests/lua_cases/lua5.3/01_bitwise_and_idiv.lua",

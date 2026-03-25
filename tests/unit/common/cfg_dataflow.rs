@@ -261,7 +261,7 @@ mod analyze_dataflow_shared {
         assert_eq!(
             dataflow.use_defs[3]
                 .fixed
-                .get(&Reg(0))
+                .get(Reg(0))
                 .expect("open pack prefix should count as fixed use")
                 .iter()
                 .copied()
@@ -271,7 +271,7 @@ mod analyze_dataflow_shared {
         assert_eq!(
             dataflow.use_values[3]
                 .fixed
-                .get(&Reg(0))
+                .get(Reg(0))
                 .expect("open pack prefix should count as fixed value use")
                 .iter()
                 .copied()

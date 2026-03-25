@@ -8,3 +8,6 @@ mod support;
 
 #[path = "regression/lua51/mod.rs"]
 mod lua51;
+
+#[path = "regression/lua52/mod.rs"]
+mod lua52;
