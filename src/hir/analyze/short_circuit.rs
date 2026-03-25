@@ -123,7 +123,7 @@ pub(super) fn build_conditional_reassign_plan(
     let instr_ref = lowering.cfg.blocks[header.index()].instrs.last()?;
     let entry_defs = lowering.dataflow.reaching_defs[instr_ref.index()]
         .fixed
-        .get(&reg)?
+        .get(reg)?
         .clone();
     if entry_defs.is_empty() {
         return None;

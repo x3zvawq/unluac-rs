@@ -31,7 +31,7 @@ pub(super) fn expr_for_reg_use(
     }
     let Some(values) = lowering.dataflow.use_values[instr_ref.index()]
         .fixed
-        .get(&reg)
+        .get(reg)
     else {
         return entry_reg_expr(lowering, reg);
     };
@@ -101,7 +101,7 @@ pub(super) fn expr_for_reg_at_block_entry(
 
     let Some(values) = lowering.dataflow.reaching_values[range.start.index()]
         .fixed
-        .get(&reg)
+        .get(reg)
     else {
         return entry_reg_expr(lowering, reg);
     };
@@ -128,6 +128,75 @@ pub(super) fn expr_for_reg_at_block_entry(
     ))
 }
 
+/// 某些 `goto + label` 形状需要读取“离开 block 时这个寄存器的稳定值”。
+///
+/// 这和普通 `expr_for_reg_use` 不同：phi edge copy 不一定对应某条真实 use，
+/// 也不能只看 `incoming.defs`，否则像“从 inner loop header 直接跳回 outer header”
+/// 这种边会把 block 入口 phi 的稳定值丢掉。
+pub(super) fn expr_for_reg_at_block_exit(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    reg: Reg,
+) -> HirExpr {
+    if let Some(local) = loop_local_for_reg(lowering, block, reg) {
+        return HirExpr::LocalRef(local);
+    }
+
+    let range = lowering.cfg.blocks[block.index()].instrs;
+    let Some(last_instr_ref) = range.last() else {
+        return entry_reg_expr(lowering, reg);
+    };
+
+    let effect = &lowering.dataflow.instr_effects[last_instr_ref.index()];
+    if effect.fixed_must_defs.contains(&reg) {
+        let Some(def) = fixed_def_for_reg(lowering, last_instr_ref, reg) else {
+            return unresolved_expr(format!(
+                "missing block-exit def r{} block#{}",
+                reg.index(),
+                block.index()
+            ));
+        };
+        return HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()]);
+    }
+
+    let mut values = lowering.dataflow.reaching_values[last_instr_ref.index()]
+        .fixed
+        .get(reg)
+        .cloned()
+        .unwrap_or_default();
+    if effect.fixed_may_defs.contains(&reg) {
+        let Some(def) = fixed_def_for_reg(lowering, last_instr_ref, reg) else {
+            return unresolved_expr(format!(
+                "missing block-exit may-def r{} block#{}",
+                reg.index(),
+                block.index()
+            ));
+        };
+        values.insert(SsaValue::Def(def));
+    }
+
+    if values.is_empty() {
+        return entry_reg_expr(lowering, reg);
+    }
+
+    if values.len() == 1 {
+        let value = values
+            .iter()
+            .next()
+            .expect("len checked above, exactly one SSA-like value exists");
+        return match value {
+            SsaValue::Def(def) => HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()]),
+            SsaValue::Phi(phi) => HirExpr::TempRef(lowering.bindings.phi_temps[phi.index()]),
+        };
+    }
+
+    unresolved_expr(format!(
+        "multi-value exit r{} block#{}",
+        reg.index(),
+        block.index()
+    ))
+}
+
 /// 当值恢复跨过被整体吸收的 branch 区域时，内部 leaf/node block 可能不会单独物化。
 ///
 /// 这里允许沿着单一 `DefId` 继续下钻，但只展开“可以安全重复求值”的定义。
@@ -144,7 +213,7 @@ fn expr_for_reg_use_inline(
     }
     let Some(values) = lowering.dataflow.use_values[instr_ref.index()]
         .fixed
-        .get(&reg)
+        .get(reg)
     else {
         return entry_reg_expr(lowering, reg);
     };
@@ -558,6 +627,17 @@ fn loop_local_for_reg(
         .get(&block)
         .and_then(|locals| locals.get(&reg))
         .copied()
+}
+
+fn fixed_def_for_reg(
+    lowering: &ProtoLowering<'_>,
+    instr_ref: InstrRef,
+    reg: Reg,
+) -> Option<DefId> {
+    lowering.dataflow.instr_defs[instr_ref.index()]
+        .iter()
+        .copied()
+        .find(|def_id| lowering.dataflow.defs[def_id.index()].reg == reg)
 }
 
 fn lower_access_base_expr(

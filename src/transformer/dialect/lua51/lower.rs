@@ -881,10 +881,10 @@ impl<'a> ProtoLowerer<'a> {
     ) -> usize {
         let low_index = self.emitted.len();
 
-        if let Some(owner_raw) = owner_raw {
-            if self.raw_target_low[owner_raw].is_none() {
-                self.raw_target_low[owner_raw] = Some(low_index);
-            }
+        if let Some(owner_raw) = owner_raw
+            && self.raw_target_low[owner_raw].is_none()
+        {
+            self.raw_target_low[owner_raw] = Some(low_index);
         }
 
         for raw_index in &raw_indices {

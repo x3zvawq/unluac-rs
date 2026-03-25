@@ -36,22 +36,21 @@ fn inline_temps_in_block(block: &mut HirBlock, scratch: &mut TempUseScratch) -> 
     let mut next_stmt_state: Option<NextStmtState> = None;
 
     for stmt in std::mem::take(&mut block.stmts).into_iter().rev() {
-        if let Some((temp, value)) = inline_candidate(&stmt) {
-            if suffix_use_totals.get(temp.index()).copied().unwrap_or(0) == 1 {
-                if let Some(state) = &mut next_stmt_state {
-                    if state.is_simple && state.temp_uses.count(temp) == 1 {
-                        state.temp_uses.remove_from_totals(&mut suffix_use_totals);
-                        let next_stmt = kept_rev
-                            .last_mut()
-                            .expect("next stmt metadata must track the last kept stmt");
-                        replace_temp_in_simple_stmt(next_stmt, temp, value);
-                        state.temp_uses = collect_stmt_temp_uses(next_stmt, scratch);
-                        state.temp_uses.add_to_totals(&mut suffix_use_totals);
-                        changed = true;
-                        continue;
-                    }
-                }
-            }
+        if let Some((temp, value)) = inline_candidate(&stmt)
+            && suffix_use_totals.get(temp.index()).copied().unwrap_or(0) == 1
+            && let Some(state) = &mut next_stmt_state
+            && state.is_simple
+            && state.temp_uses.count(temp) == 1
+        {
+            state.temp_uses.remove_from_totals(&mut suffix_use_totals);
+            let next_stmt = kept_rev
+                .last_mut()
+                .expect("next stmt metadata must track the last kept stmt");
+            replace_temp_in_simple_stmt(next_stmt, temp, value);
+            state.temp_uses = collect_stmt_temp_uses(next_stmt, scratch);
+            state.temp_uses.add_to_totals(&mut suffix_use_totals);
+            changed = true;
+            continue;
         }
 
         let stmt_uses = collect_stmt_temp_uses(&stmt, scratch);

@@ -9,9 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::bindings::build_bindings;
 use super::exprs::{
-    expr_for_closure_capture, expr_for_const, expr_for_reg_use, expr_for_value_operand,
-    is_multiret_results, lower_binary_op, lower_branch_cond, lower_table_access_expr,
-    lower_table_access_target, lower_unary_op, lower_value_pack, lower_value_pack_components,
+    expr_for_closure_capture, expr_for_const, expr_for_reg_at_block_exit, expr_for_reg_use,
+    expr_for_value_operand, is_multiret_results, lower_binary_op, lower_branch_cond,
+    lower_table_access_expr, lower_table_access_target, lower_unary_op, lower_value_pack,
+    lower_value_pack_components,
 };
 use super::helpers::{
     assign_stmt, branch_stmt, build_label_map_for_summary, decode_raw_string, empty_proto,
@@ -23,7 +24,7 @@ use crate::cfg::{BlockRef, Cfg, CfgGraph, DataflowFacts, GraphFacts, PhiId};
 use crate::hir::common::{
     HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirCallStmt, HirCapture, HirClosureExpr,
     HirExpr, HirLValue, HirLabel, HirLabelId, HirProto, HirProtoRef, HirStmt, HirTableSetList,
-    HirUnaryExpr, HirUnstructured, LocalId, ParamId, TempId, UpvalueId,
+    HirUnaryExpr, LocalId, ParamId, TempId, UpvalueId,
 };
 use crate::structure::StructureFacts;
 use crate::transformer::{CallKind, InstrRef, LowInstr, LoweredProto, Reg, ResultPack, ValuePack};
@@ -130,100 +131,175 @@ pub(super) fn lower_proto(
 fn build_proto_body(lowering: &ProtoLowering<'_>) -> HirBlock {
     if let Some(body) = try_build_structured_body(lowering) {
         body
-    } else if is_linear_proto(lowering.cfg, lowering.structure) {
-        lower_block_sequence(lowering, false)
     } else {
-        build_fallback_body(lowering)
+        lower_label_goto_body(lowering)
     }
 }
 
-fn build_fallback_body(lowering: &ProtoLowering<'_>) -> HirBlock {
-    HirBlock {
-        stmts: vec![HirStmt::Unstructured(Box::new(HirUnstructured {
-            body: lower_block_sequence(lowering, true),
-            summary: Some(format!(
-                "fallback blocks={} branches={} loops={} gotos={}",
-                reachable_block_count(lowering.cfg),
-                lowering.structure.branch_candidates.len(),
-                lowering.structure.loop_candidates.len(),
-                lowering.structure.goto_requirements.len(),
-            )),
-        }))],
-    }
-}
-
-fn is_linear_proto(cfg: &Cfg, structure: &StructureFacts) -> bool {
-    reachable_block_count(cfg) <= 1
-        && structure.branch_candidates.is_empty()
-        && structure.loop_candidates.is_empty()
-        && structure.goto_requirements.is_empty()
-}
-
-fn reachable_block_count(cfg: &Cfg) -> usize {
-    cfg.block_order
+fn unique_reachable_successor(cfg: &Cfg, block: BlockRef) -> Option<BlockRef> {
+    let mut successors = cfg.succs[block.index()]
         .iter()
-        .filter(|block| cfg.reachable_blocks.contains(block))
-        .count()
+        .map(|edge_ref| cfg.edges[edge_ref.index()].to)
+        .filter(|succ| cfg.reachable_blocks.contains(succ));
+    let succ = successors.next()?;
+    if successors.next().is_none() {
+        Some(succ)
+    } else {
+        None
+    }
 }
 
-fn lower_block_sequence(lowering: &ProtoLowering<'_>, emit_labels: bool) -> HirBlock {
-    let label_map = if emit_labels {
-        lowering
-            .cfg
-            .block_order
-            .iter()
-            .filter(|block| lowering.cfg.reachable_blocks.contains(block))
-            .enumerate()
-            .map(|(index, block)| (*block, HirLabelId(index)))
-            .collect::<BTreeMap<_, _>>()
-    } else {
-        BTreeMap::new()
-    };
+fn lower_label_goto_body(lowering: &ProtoLowering<'_>) -> HirBlock {
+    let label_map = build_label_map_for_summary(lowering.cfg);
+    let reachable_blocks = lowering
+        .cfg
+        .block_order
+        .iter()
+        .copied()
+        .filter(|block| lowering.cfg.reachable_blocks.contains(block))
+        .filter(|block| *block != lowering.cfg.exit_block)
+        .collect::<Vec<_>>();
 
     let mut stmts = Vec::new();
-    for block in &lowering.cfg.block_order {
-        let block = *block;
-        if !lowering.cfg.reachable_blocks.contains(&block) {
-            continue;
-        }
-
+    for (index, block) in reachable_blocks.iter().copied().enumerate() {
         if let Some(label_id) = label_map.get(&block) {
             stmts.push(HirStmt::Label(Box::new(HirLabel { id: *label_id })));
         }
 
-        stmts.extend(lower_phi_materialization(lowering, block));
-
-        let range = lowering.cfg.blocks[block.index()].instrs;
-        if range.is_empty() {
-            continue;
-        }
-
-        let last_instr = range
-            .last()
-            .expect("non-empty block should have a last instruction");
-        for instr_index in range.start.index()..range.end() {
-            let instr_ref = InstrRef(instr_index);
-            let instr = &lowering.proto.instrs[instr_index];
-            if instr_ref == last_instr && is_control_terminator(instr) {
-                stmts.extend(lower_control_instr(
-                    lowering, block, instr_ref, instr, &label_map,
-                ));
-            } else {
-                stmts.extend(lower_regular_instr(lowering, block, instr_ref, instr));
-            }
-        }
+        let next_block = reachable_blocks.get(index + 1).copied();
+        stmts.extend(lower_block_with_edge_copies(
+            lowering,
+            block,
+            next_block,
+            &label_map,
+        ));
     }
 
     HirBlock { stmts }
 }
 
-fn lower_phi_materialization(lowering: &ProtoLowering<'_>, block: BlockRef) -> Vec<HirStmt> {
-    lower_phi_materialization_with_allowed_blocks_except(
-        lowering,
-        block,
-        &BTreeSet::new(),
-        &BTreeSet::new(),
-    )
+fn lower_block_with_edge_copies(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    next_block: Option<BlockRef>,
+    label_map: &BTreeMap<BlockRef, HirLabelId>,
+) -> Vec<HirStmt> {
+    let range = lowering.cfg.blocks[block.index()].instrs;
+    if range.is_empty() {
+        return lower_linear_edge(lowering, block, next_block, label_map);
+    }
+
+    let last_instr = range
+        .last()
+        .expect("non-empty block should have a last instruction");
+    let mut stmts = Vec::new();
+    for instr_index in range.start.index()..range.end() {
+        let instr_ref = InstrRef(instr_index);
+        let instr = &lowering.proto.instrs[instr_index];
+        if instr_ref == last_instr && is_control_terminator(instr) {
+            stmts.extend(lower_control_instr_with_edge_copies(
+                lowering, block, instr_ref, instr, next_block, label_map,
+            ));
+        } else {
+            stmts.extend(lower_regular_instr(lowering, block, instr_ref, instr));
+        }
+    }
+
+    if !is_control_terminator(&lowering.proto.instrs[last_instr.index()]) {
+        stmts.extend(lower_linear_edge(lowering, block, next_block, label_map));
+    }
+
+    stmts
+}
+
+fn lower_linear_edge(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    next_block: Option<BlockRef>,
+    label_map: &BTreeMap<BlockRef, HirLabelId>,
+) -> Vec<HirStmt> {
+    let Some(target) = unique_reachable_successor(lowering.cfg, block) else {
+        return Vec::new();
+    };
+    if target == lowering.cfg.exit_block {
+        return Vec::new();
+    }
+
+    lower_edge_block(lowering, block, target, next_block, label_map).stmts
+}
+
+fn lower_control_instr_with_edge_copies(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    instr: &LowInstr,
+    next_block: Option<BlockRef>,
+    label_map: &BTreeMap<BlockRef, HirLabelId>,
+) -> Vec<HirStmt> {
+    match instr {
+        LowInstr::Jump(jump) => lower_edge_block(
+            lowering,
+            block,
+            lowering.cfg.instr_to_block[jump.target.index()],
+            next_block,
+            label_map,
+        )
+        .stmts,
+        LowInstr::Branch(branch) => {
+            let then_target = lowering.cfg.instr_to_block[branch.then_target.index()];
+            let else_target = lowering.cfg.instr_to_block[branch.else_target.index()];
+            vec![branch_stmt(
+                lower_branch_cond(lowering, block, instr_ref, branch.cond),
+                lower_edge_block(lowering, block, then_target, next_block, label_map),
+                Some(lower_edge_block(
+                    lowering, block, else_target, next_block, label_map,
+                )),
+            )]
+        }
+        _ => lower_control_instr(lowering, block, instr_ref, instr, label_map),
+    }
+}
+
+fn lower_edge_block(
+    lowering: &ProtoLowering<'_>,
+    from: BlockRef,
+    to: BlockRef,
+    next_block: Option<BlockRef>,
+    label_map: &BTreeMap<BlockRef, HirLabelId>,
+) -> HirBlock {
+    let mut stmts = lower_edge_phi_copies(lowering, from, to);
+    if to != lowering.cfg.exit_block && Some(to) != next_block {
+        stmts.push(goto_stmt(label_map[&to]));
+    }
+    HirBlock { stmts }
+}
+
+fn lower_edge_phi_copies(
+    lowering: &ProtoLowering<'_>,
+    from: BlockRef,
+    to: BlockRef,
+) -> Vec<HirStmt> {
+    if to == lowering.cfg.exit_block {
+        return Vec::new();
+    }
+
+    let mut targets = Vec::new();
+    let mut values = Vec::new();
+    for phi in lowering
+        .dataflow
+        .phi_candidates
+        .iter()
+        .filter(|phi| phi.block == to)
+    {
+        targets.push(HirLValue::Temp(lowering.bindings.phi_temps[phi.id.index()]));
+        values.push(expr_for_reg_at_block_exit(lowering, from, phi.reg));
+    }
+
+    if targets.is_empty() {
+        Vec::new()
+    } else {
+        vec![assign_stmt(targets, values)]
+    }
 }
 
 /// 某些结构化路径会先把短路 header 的前缀语句物化出来，再跳到 merge block。
