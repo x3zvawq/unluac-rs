@@ -3,6 +3,7 @@
 //! 当前只真正接上 parser，但入口已经先按完整阶段序列搭好；
 //! 这样后续补层时只需要往这个骨架里填实现，不需要重写调用约定。
 
+use crate::ast::{AstDialectVersion, AstTargetDialect, lower_ast, make_readable};
 use crate::cfg::{analyze_dataflow, analyze_graph_facts, build_cfg_graph};
 use crate::hir::analyze_hir;
 use crate::parser::{
@@ -224,9 +225,62 @@ impl DecompilerPipeline {
             });
         }
 
+        state.ast = Some({
+            let hir = state
+                .hir
+                .as_ref()
+                .expect("hir stage completed must leave hir module in state");
+            lower_ast(hir, target_ast_dialect(options.dialect))?
+        });
+        state.mark_completed(DecompileStage::Ast);
+
+        if let Some(output) = collect_stage_dump(&state, DecompileStage::Ast, &options.debug)? {
+            debug_output.push(output);
+        }
+
+        if options.target_stage == DecompileStage::Ast {
+            return Ok(DecompileResult {
+                state,
+                debug_output,
+            });
+        }
+
+        state.readability = Some({
+            let ast = state
+                .ast
+                .as_ref()
+                .expect("ast stage completed must leave ast module in state");
+            make_readable(ast, target_ast_dialect(options.dialect))
+        });
+        state.mark_completed(DecompileStage::Readability);
+
+        if let Some(output) =
+            collect_stage_dump(&state, DecompileStage::Readability, &options.debug)?
+        {
+            debug_output.push(output);
+        }
+
+        if options.target_stage == DecompileStage::Readability {
+            return Ok(DecompileResult {
+                state,
+                debug_output,
+            });
+        }
+
         Err(DecompileError::StageNotImplemented {
-            stage: DecompileStage::Ast,
-            completed_stage: DecompileStage::Hir,
+            stage: DecompileStage::Naming,
+            completed_stage: DecompileStage::Readability,
         })
     }
+}
+
+fn target_ast_dialect(dialect: DecompileDialect) -> AstTargetDialect {
+    let version = match dialect {
+        DecompileDialect::Lua51 => AstDialectVersion::Lua51,
+        DecompileDialect::Lua52 => AstDialectVersion::Lua52,
+        DecompileDialect::Lua53 => AstDialectVersion::Lua53,
+        DecompileDialect::Lua54 => AstDialectVersion::Lua54,
+        DecompileDialect::Lua55 => AstDialectVersion::Lua55,
+    };
+    AstTargetDialect::new(version)
 }

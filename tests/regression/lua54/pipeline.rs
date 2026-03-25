@@ -125,4 +125,53 @@ mod decompile_pipeline {
         assert!(dump.contains("goto L1"), "{dump}");
         assert!(!dump.contains("unstructured summary=close"), "{dump}");
     }
+
+    #[test]
+    fn lua54_ast_stage_absorbs_simple_tbc_into_local_close_decl() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.4",
+            "tests/lua_cases/lua5.4/01_tbc_close.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua54,
+                target_stage: DecompileStage::Ast,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Ast],
+                    detail: DebugDetail::Normal,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.4 ast stage should succeed for simple tbc fixture");
+
+        assert_eq!(result.state.completed_stage, Some(DecompileStage::Ast));
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("local l1<close> ="), "{dump}");
+        assert!(!dump.contains("to-be-closed"), "{dump}");
+        assert!(!dump.contains("close from"), "{dump}");
+    }
+
+    #[test]
+    fn lua54_ast_stage_rejects_goto_close_fixture_until_close_scopes_are_recovered() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.4",
+            "tests/lua_cases/lua5.4/05_tbc_goto_reenter.lua",
+        );
+        let error = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua54,
+                target_stage: DecompileStage::Ast,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect_err("lua5.4 ast stage should currently reject residual close fixture");
+
+        let message = error.to_string();
+        assert!(message.contains("explicit close semantics"), "{message}");
+    }
 }

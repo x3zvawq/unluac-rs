@@ -15,13 +15,13 @@ use unluac::decompile::{
 use unluac::parser::{ParseMode, ParseOptions, StringDecodeMode, StringEncoding};
 
 /// 开发时最常改的是这几个常量，直接编辑代码通常比来回敲命令更顺手。
-const DIALECT: DecompileDialect = DecompileDialect::Lua54;
-const SOURCE: &str = "tests/lua_cases/lua5.4/01_tbc_close.lua";
+const DIALECT: DecompileDialect = DecompileDialect::Lua51;
+const SOURCE: &str = "tests/lua_cases/common/tricky/01_boolean_hell.lua";
 const STRING_ENCODING: StringEncoding = StringEncoding::Utf8;
 const STRING_DECODE_MODE: StringDecodeMode = StringDecodeMode::Strict;
 const PARSE_MODE: ParseMode = ParseMode::Strict;
-const TARGET_STAGE: DecompileStage = DecompileStage::Hir;
-const DEBUG_DETAIL: DebugDetail = DebugDetail::Normal;
+const TARGET_STAGE: DecompileStage = DecompileStage::Ast;
+const DEBUG_DETAIL: DebugDetail = DebugDetail::Verbose;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

@@ -6,6 +6,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[allow(dead_code)]
 pub(crate) mod case_manifest;
@@ -38,6 +39,8 @@ pub(crate) fn compile_lua_case(dialect_label: &str, source_relative: &str) -> Ve
 pub(crate) fn compile_lua_case_with_debug(dialect_label: &str, source_relative: &str) -> Vec<u8> {
     compile_lua_case_inner(dialect_label, source_relative, false)
 }
+
+static TEST_CHUNK_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn compile_lua_case_inner(
     dialect_label: &str,
@@ -93,6 +96,7 @@ fn test_chunk_output_path(
     source: &Path,
     strip_debug: bool,
 ) -> PathBuf {
+    let unique = TEST_CHUNK_COUNTER.fetch_add(1, Ordering::Relaxed);
     let relative = source
         .strip_prefix(repo_root)
         .expect("test source should stay inside repo root");
@@ -102,5 +106,5 @@ fn test_chunk_output_path(
         .join(dialect_label)
         .join(if strip_debug { "stripped" } else { "debug" })
         .join(relative)
-        .with_extension("out")
+        .with_extension(format!("{}.out", unique))
 }

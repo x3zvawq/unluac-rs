@@ -4,3 +4,4 @@
 //! 写 AST 时，底层又悄悄退回 fallback 或把 `goto` 误折成别的结构。
 
 mod goto_shapes;
+mod pipeline;

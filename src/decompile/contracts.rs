@@ -21,13 +21,11 @@ pub use crate::structure::StructureFacts;
 /// HIR 层产出的结构化语义树。
 pub use crate::hir::HirModule as HirChunk;
 
-/// AST 层未来会产出的语法树。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AstChunk;
+/// AST 层产出的 target-dialect-aware 语法树。
+pub use crate::ast::AstModule as AstChunk;
 
 /// 可读性层未来会产出的稳定 AST 调整结果。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ReadabilityResult;
+pub use crate::ast::AstModule as ReadabilityResult;
 
 /// 命名层未来会产出的绑定名决策结果。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

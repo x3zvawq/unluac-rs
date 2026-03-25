@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use unluac::decompile::{
-    DebugDetail, DebugOptions, DecompileError, DecompileOptions, DecompileStage, decompile,
+    DebugDetail, DebugOptions, DecompileOptions, DecompileStage, decompile,
 };
 
 const SETFENV_CHUNK_HEX: &str = "
@@ -382,23 +382,17 @@ mod decompile_pipeline {
     }
 
     #[test]
-    fn reports_ast_stage_as_not_implemented_after_hir() {
-        let error = decompile(
+    fn reaches_ast_stage_for_basic_lua51_fixture() {
+        let result = decompile(
             &crate::support::decode_hex(SETFENV_CHUNK_HEX),
             DecompileOptions {
                 target_stage: DecompileStage::Ast,
                 ..DecompileOptions::default()
             },
         )
-        .expect_err("ast stage should not be implemented yet");
+        .expect("ast stage should now succeed");
 
-        assert!(matches!(
-            error,
-            DecompileError::StageNotImplemented {
-                stage: DecompileStage::Ast,
-                completed_stage: DecompileStage::Hir,
-            }
-        ));
+        assert_eq!(result.state.completed_stage, Some(DecompileStage::Ast));
     }
 }
 

@@ -3,6 +3,7 @@
 //! 各层具体如何渲染自己的 dump，应该尽量贴着实现放置；这里仅保留跨层共用的
 //! 选项、阶段包装和主 pipeline 的分派逻辑，避免再次长成一个巨型总控文件。
 
+use crate::ast;
 use crate::cfg;
 use crate::debug::{DebugDetail, DebugFilters};
 use crate::hir;
@@ -122,6 +123,30 @@ pub fn dump_hir(
     })
 }
 
+/// 对外保留 AST 阶段的统一包装。
+pub fn dump_ast(
+    ast_module: &crate::ast::AstModule,
+    options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Ok(StageDebugOutput {
+        stage: DecompileStage::Ast,
+        detail: options.detail,
+        content: ast::dump_ast(ast_module, options.detail, &options.filters),
+    })
+}
+
+/// 对外保留 Readability 阶段的统一包装。
+pub fn dump_readability(
+    ast_module: &crate::ast::AstModule,
+    options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Ok(StageDebugOutput {
+        stage: DecompileStage::Readability,
+        detail: options.detail,
+        content: ast::dump_ast(ast_module, options.detail, &options.filters),
+    })
+}
+
 pub(crate) fn collect_stage_dump(
     state: &DecompileState,
     stage: DecompileStage,
@@ -179,6 +204,18 @@ pub(crate) fn collect_stage_dump(
                 return Err(DecompileError::MissingStageOutput { stage });
             };
             dump_hir(hir_module, options).map(Some)
+        }
+        DecompileStage::Ast => {
+            let Some(ast_module) = state.ast.as_ref() else {
+                return Err(DecompileError::MissingStageOutput { stage });
+            };
+            dump_ast(ast_module, options).map(Some)
+        }
+        DecompileStage::Readability => {
+            let Some(ast_module) = state.readability.as_ref() else {
+                return Err(DecompileError::MissingStageOutput { stage });
+            };
+            dump_readability(ast_module, options).map(Some)
         }
         _ => Err(DecompileError::MissingStageOutput { stage }),
     }
