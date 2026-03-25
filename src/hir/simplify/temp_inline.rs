@@ -88,6 +88,8 @@ fn inline_temps_in_nested_blocks(stmt: &mut HirStmt, scratch: &mut TempUseScratc
         HirStmt::LocalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
         | HirStmt::CallStmt(_)
         | HirStmt::Return(_)
         | HirStmt::Break
@@ -123,6 +125,8 @@ fn is_simple_stmt(stmt: &HirStmt) -> bool {
         | HirStmt::Repeat(_)
         | HirStmt::NumericFor(_)
         | HirStmt::GenericFor(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
         | HirStmt::Break
         | HirStmt::Continue
         | HirStmt::Goto(_)
@@ -256,6 +260,9 @@ fn collect_stmt_temp_uses_into(stmt: &HirStmt, scratch: &mut TempUseScratch) {
                 collect_expr_temp_uses(expr, scratch);
             }
         }
+        HirStmt::ToBeClosed(to_be_closed) => {
+            collect_expr_temp_uses(&to_be_closed.value, scratch);
+        }
         HirStmt::CallStmt(call_stmt) => collect_call_temp_uses(&call_stmt.call, scratch),
         HirStmt::Return(ret) => {
             for value in &ret.values {
@@ -289,7 +296,11 @@ fn collect_stmt_temp_uses_into(stmt: &HirStmt, scratch: &mut TempUseScratch) {
             }
             collect_block_temp_uses(&generic_for.body, scratch);
         }
-        HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => {}
+        HirStmt::Break
+        | HirStmt::Close(_)
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => {}
         HirStmt::Block(block) => collect_block_temp_uses(block, scratch),
         HirStmt::Unstructured(unstructured) => collect_block_temp_uses(&unstructured.body, scratch),
     }
@@ -328,6 +339,7 @@ fn max_temp_index_in_stmt(stmt: &HirStmt) -> Option<usize> {
             )
             .flatten()
             .max(),
+        HirStmt::ToBeClosed(to_be_closed) => max_temp_index_in_expr(&to_be_closed.value),
         HirStmt::CallStmt(call_stmt) => max_temp_index_in_call(&call_stmt.call),
         HirStmt::Return(ret) => ret.values.iter().filter_map(max_temp_index_in_expr).max(),
         HirStmt::If(if_stmt) => std::iter::once(max_temp_index_in_expr(&if_stmt.cond))
@@ -359,7 +371,11 @@ fn max_temp_index_in_stmt(stmt: &HirStmt) -> Option<usize> {
             .filter_map(max_temp_index_in_expr)
             .chain(std::iter::once(max_temp_index_in_block(&generic_for.body)).flatten())
             .max(),
-        HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => None,
+        HirStmt::Break
+        | HirStmt::Close(_)
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => None,
         HirStmt::Block(block) => max_temp_index_in_block(block),
         HirStmt::Unstructured(unstructured) => max_temp_index_in_block(&unstructured.body),
     }
@@ -500,6 +516,8 @@ fn replace_temp_in_simple_stmt(stmt: &mut HirStmt, temp: TempId, replacement: &H
         | HirStmt::Repeat(_)
         | HirStmt::NumericFor(_)
         | HirStmt::GenericFor(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
         | HirStmt::Break
         | HirStmt::Continue
         | HirStmt::Goto(_)

@@ -99,6 +99,8 @@ pub enum HirStmt {
     LocalDecl(Box<HirLocalDecl>),
     Assign(Box<HirAssign>),
     TableSetList(Box<HirTableSetList>),
+    ToBeClosed(Box<HirToBeClosed>),
+    Close(Box<HirClose>),
     CallStmt(Box<HirCallStmt>),
     Return(Box<HirReturn>),
     If(Box<HirIf>),
@@ -297,6 +299,26 @@ pub struct HirTableSetList {
     pub start_index: u32,
     pub values: Vec<HirExpr>,
     pub trailing_multivalue: Option<HirExpr>,
+}
+
+/// 标记某个绑定在当前词法作用域结束时需要执行 Lua 5.4 的 to-be-closed 语义。
+///
+/// 这一层先显式保留 “哪个绑定被标记为 `<close>`” 这个语义事实，而不是继续退回
+/// `unstructured "tbc rX"`。后续 AST 可以再根据 target dialect 把它收成真正的
+/// `<close>` 局部声明形式。
+#[derive(Debug, Clone, PartialEq)]
+pub struct HirToBeClosed {
+    pub value: HirExpr,
+}
+
+/// 显式表示一次 Lua VM `Close` cleanup 边界。
+///
+/// 这里先保留“从哪个寄存器槽位开始关闭”活动值这个语义事实，避免在 HIR 里继续退回
+/// `unstructured "close from rX"`。后续 AST 可以基于它和 `ToBeClosed` 的组合，
+/// 再决定是否能恢复成 `<close>` 变量的词法块边界。
+#[derive(Debug, Clone, PartialEq)]
+pub struct HirClose {
+    pub from_reg: usize,
 }
 
 /// 返回语句。

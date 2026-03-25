@@ -79,6 +79,7 @@ fn simplify_stmt(stmt: &mut HirStmt) -> bool {
                 .is_some_and(simplify_expr);
             base_changed || values_changed || trailing_changed
         }
+        HirStmt::ToBeClosed(to_be_closed) => simplify_expr(&mut to_be_closed.value),
         HirStmt::CallStmt(call_stmt) => simplify_call_expr(&mut call_stmt.call),
         HirStmt::Return(ret) => ret
             .values
@@ -110,7 +111,11 @@ fn simplify_stmt(stmt: &mut HirStmt) -> bool {
         }
         HirStmt::Block(block) => simplify_block(block),
         HirStmt::Unstructured(unstructured) => simplify_block(&mut unstructured.body),
-        HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => false,
+        HirStmt::Break
+        | HirStmt::Close(_)
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => false,
     }
 }
 

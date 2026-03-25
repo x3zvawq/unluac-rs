@@ -379,9 +379,11 @@ fn stmt_contains_if(stmt: &HirStmt) -> bool {
         HirStmt::LocalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
+        | HirStmt::ToBeClosed(_)
         | HirStmt::CallStmt(_)
         | HirStmt::Return(_)
         | HirStmt::Break
+        | HirStmt::Close(_)
         | HirStmt::Continue
         | HirStmt::Goto(_)
         | HirStmt::Label(_) => false,

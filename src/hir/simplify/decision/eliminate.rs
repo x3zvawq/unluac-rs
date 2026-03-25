@@ -13,7 +13,8 @@ use crate::hir::common::{
     HirAssign, HirBinaryExpr, HirBlock, HirCallExpr, HirCallStmt, HirClosureExpr, HirDecisionExpr,
     HirDecisionNode, HirDecisionTarget, HirExpr, HirGenericFor, HirIf, HirLValue, HirLocalDecl,
     HirLogicalExpr, HirNumericFor, HirProto, HirRecordField, HirReturn, HirStmt, HirTableAccess,
-    HirTableConstructor, HirTableField, HirTableKey, HirTableSetList, HirUnaryExpr, LocalId,
+    HirTableConstructor, HirTableField, HirTableKey, HirTableSetList, HirToBeClosed,
+    HirUnaryExpr, LocalId,
 };
 
 pub(super) fn eliminate_remaining_decisions_in_proto(proto: &mut HirProto) -> bool {
@@ -136,6 +137,11 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
             })));
             (prefix, base_changed || values_changed || trailing_changed)
         }
+        HirStmt::ToBeClosed(to_be_closed) => {
+            let (mut prefix, value, changed) = extract_value_expr(to_be_closed.value, state);
+            prefix.push(HirStmt::ToBeClosed(Box::new(HirToBeClosed { value })));
+            (prefix, changed)
+        }
         HirStmt::CallStmt(call_stmt) => {
             let (mut prefix, call, changed) = extract_call_expr(call_stmt.call, state);
             prefix.push(HirStmt::CallStmt(Box::new(HirCallStmt { call })));
@@ -207,7 +213,11 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
             );
             (vec![HirStmt::Unstructured(unstructured)], changed)
         }
-        HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => {
+        HirStmt::Break
+        | HirStmt::Close(_)
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => {
             (vec![stmt], false)
         }
     }

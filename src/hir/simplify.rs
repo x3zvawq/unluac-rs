@@ -123,6 +123,10 @@ fn collect_stmt_residuals(stmt: &crate::hir::common::HirStmt, residuals: &mut Hi
                 collect_expr_residuals(trailing, residuals);
             }
         }
+        crate::hir::common::HirStmt::ToBeClosed(to_be_closed) => {
+            collect_expr_residuals(&to_be_closed.value, residuals);
+        }
+        crate::hir::common::HirStmt::Close(_) => {}
         crate::hir::common::HirStmt::CallStmt(call_stmt) => {
             collect_call_residuals(&call_stmt.call, residuals);
         }

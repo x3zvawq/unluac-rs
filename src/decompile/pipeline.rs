@@ -5,7 +5,7 @@
 
 use crate::cfg::{analyze_dataflow, analyze_graph_facts, build_cfg_graph};
 use crate::hir::analyze_hir;
-use crate::parser::{parse_lua51_chunk, parse_lua52_chunk, parse_lua53_chunk};
+use crate::parser::{parse_lua51_chunk, parse_lua52_chunk, parse_lua53_chunk, parse_lua54_chunk};
 use crate::structure::analyze_structure;
 use crate::transformer::lower_chunk;
 
@@ -46,6 +46,7 @@ impl DecompilerPipeline {
             DecompileDialect::Lua51 => parse_lua51_chunk(bytes, options.parse)?,
             DecompileDialect::Lua52 => parse_lua52_chunk(bytes, options.parse)?,
             DecompileDialect::Lua53 => parse_lua53_chunk(bytes, options.parse)?,
+            DecompileDialect::Lua54 => parse_lua54_chunk(bytes, options.parse)?,
         });
         state.mark_completed(DecompileStage::Parse);
 

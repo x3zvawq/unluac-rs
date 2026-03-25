@@ -115,6 +115,16 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
                         .unwrap_or_else(|| "-".to_owned()),
                 );
             }
+            HirStmt::ToBeClosed(to_be_closed) => {
+                let _ = writeln!(
+                    output,
+                    "{indent}to-be-closed {}",
+                    format_expr(&to_be_closed.value)
+                );
+            }
+            HirStmt::Close(close) => {
+                let _ = writeln!(output, "{indent}close from r{}", close.from_reg);
+            }
             HirStmt::CallStmt(call_stmt) => {
                 let _ = writeln!(output, "{indent}call {}", format_call_expr(&call_stmt.call));
             }

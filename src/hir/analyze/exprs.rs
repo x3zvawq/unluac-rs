@@ -250,6 +250,7 @@ pub(super) fn expr_for_value_operand(
     match operand {
         ValueOperand::Reg(reg) => expr_for_reg_use(lowering, block, instr_ref, reg),
         ValueOperand::Const(const_ref) => expr_for_const(lowering.proto, const_ref),
+        ValueOperand::Integer(value) => HirExpr::Integer(value),
     }
 }
 
@@ -262,6 +263,7 @@ fn expr_for_value_operand_inline(
     match operand {
         ValueOperand::Reg(reg) => expr_for_reg_use_inline(lowering, block, instr_ref, reg),
         ValueOperand::Const(const_ref) => expr_for_const(lowering.proto, const_ref),
+        ValueOperand::Integer(value) => HirExpr::Integer(value),
     }
 }
 
@@ -508,6 +510,12 @@ pub(super) fn expr_for_dup_safe_fixed_def(
         LowInstr::LoadConst(load_const) if load_const.dst == def.reg => {
             Some(expr_for_const(lowering.proto, load_const.value))
         }
+        LowInstr::LoadInteger(load_integer) if load_integer.dst == def.reg => {
+            Some(HirExpr::Integer(load_integer.value))
+        }
+        LowInstr::LoadNumber(load_number) if load_number.dst == def.reg => {
+            Some(HirExpr::Number(load_number.value))
+        }
         LowInstr::UnaryOp(unary) if unary.dst == def.reg => {
             Some(HirExpr::Unary(Box::new(HirUnaryExpr {
                 op: lower_unary_op(unary.op),
@@ -679,6 +687,7 @@ fn lower_access_key_expr(
     match key {
         AccessKey::Reg(reg) => expr_for_reg_use(lowering, block, instr_ref, reg),
         AccessKey::Const(const_ref) => expr_for_const(lowering.proto, const_ref),
+        AccessKey::Integer(value) => HirExpr::Integer(value),
     }
 }
 
@@ -691,6 +700,7 @@ fn lower_access_key_expr_inline(
     match key {
         AccessKey::Reg(reg) => expr_for_reg_use_inline(lowering, block, instr_ref, reg),
         AccessKey::Const(const_ref) => expr_for_const(lowering.proto, const_ref),
+        AccessKey::Integer(value) => HirExpr::Integer(value),
     }
 }
 
@@ -745,6 +755,8 @@ fn lower_cond_operand(
     match operand {
         CondOperand::Reg(reg) => expr_for_reg_use(lowering, block, instr_ref, reg),
         CondOperand::Const(const_ref) => expr_for_const(lowering.proto, const_ref),
+        CondOperand::Integer(value) => HirExpr::Integer(value),
+        CondOperand::Number(value) => HirExpr::Number(value.to_f64()),
     }
 }
 
@@ -757,6 +769,8 @@ fn lower_cond_operand_inline(
     match operand {
         CondOperand::Reg(reg) => expr_for_reg_use_inline(lowering, block, instr_ref, reg),
         CondOperand::Const(const_ref) => expr_for_const(lowering.proto, const_ref),
+        CondOperand::Integer(value) => HirExpr::Integer(value),
+        CondOperand::Number(value) => HirExpr::Number(value.to_f64()),
     }
 }
 

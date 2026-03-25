@@ -327,7 +327,11 @@ fn summarize_block_fallthrough_assignments(block: &HirBlock) -> Option<Fallthrou
 
 fn summarize_stmt_fallthrough_assignments(stmt: &HirStmt) -> Option<FallthroughSummary> {
     match stmt {
-        HirStmt::LocalDecl(_) | HirStmt::CallStmt(_) | HirStmt::Label(_) => {
+        HirStmt::LocalDecl(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::Label(_) => {
             Some(FallthroughSummary {
                 falls_through: true,
                 assigned_temps: BTreeSet::new(),
@@ -460,6 +464,7 @@ fn rewrite_stmt(
                 .is_some_and(|expr| rewrite_expr(expr, mapping));
             base_changed || values_changed || trailing_changed
         }
+        HirStmt::ToBeClosed(to_be_closed) => rewrite_expr(&mut to_be_closed.value, mapping),
         HirStmt::CallStmt(call_stmt) => rewrite_call_expr(&mut call_stmt.call, mapping),
         HirStmt::Return(ret) => ret.values.iter_mut().fold(false, |changed, expr| {
             rewrite_expr(expr, mapping) || changed
@@ -524,7 +529,11 @@ fn rewrite_stmt(
             )
             .changed
         }
-        HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => false,
+        HirStmt::Break
+        | HirStmt::Close(_)
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => false,
     }
 }
 
@@ -679,6 +688,7 @@ fn stmt_touches_temp(stmt: &HirStmt, temp: TempId) -> bool {
                     .as_ref()
                     .is_some_and(|expr| expr_touches_temp(expr, temp))
         }
+        HirStmt::ToBeClosed(to_be_closed) => expr_touches_temp(&to_be_closed.value, temp),
         HirStmt::CallStmt(call_stmt) => call_expr_touches_temp(&call_stmt.call, temp),
         HirStmt::Return(ret) => ret.values.iter().any(|expr| expr_touches_temp(expr, temp)),
         HirStmt::If(if_stmt) => {
@@ -712,7 +722,11 @@ fn stmt_touches_temp(stmt: &HirStmt, temp: TempId) -> bool {
         }
         HirStmt::Block(block) => stmts_touch_temp(&block.stmts, temp),
         HirStmt::Unstructured(unstructured) => stmts_touch_temp(&unstructured.body.stmts, temp),
-        HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => false,
+        HirStmt::Break
+        | HirStmt::Close(_)
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => false,
     }
 }
 

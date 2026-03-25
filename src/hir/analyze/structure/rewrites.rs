@@ -86,6 +86,9 @@ pub(super) fn rewrite_stmt_exprs(stmt: &mut HirStmt, expr_overrides: &BTreeMap<T
                 rewrite_expr_temps(trailing, expr_overrides);
             }
         }
+        HirStmt::ToBeClosed(to_be_closed) => {
+            rewrite_expr_temps(&mut to_be_closed.value, expr_overrides);
+        }
         HirStmt::CallStmt(call_stmt) => {
             rewrite_call_expr_temps(&mut call_stmt.call, expr_overrides)
         }
@@ -114,6 +117,7 @@ pub(super) fn rewrite_stmt_exprs(stmt: &mut HirStmt, expr_overrides: &BTreeMap<T
             }
         }
         HirStmt::Break
+        | HirStmt::Close(_)
         | HirStmt::Continue
         | HirStmt::Goto(_)
         | HirStmt::Label(_)

@@ -17,6 +17,7 @@ pub enum DecompileDialect {
     Lua51,
     Lua52,
     Lua53,
+    Lua54,
 }
 
 impl DecompileDialect {
@@ -25,6 +26,7 @@ impl DecompileDialect {
             Self::Lua51 => "lua5.1",
             Self::Lua52 => "lua5.2",
             Self::Lua53 => "lua5.3",
+            Self::Lua54 => "lua5.4",
         }
     }
 
@@ -34,6 +36,7 @@ impl DecompileDialect {
             "lua5.1" | "lua51" => Some(Self::Lua51),
             "lua5.2" | "lua52" => Some(Self::Lua52),
             "lua5.3" | "lua53" => Some(Self::Lua53),
+            "lua5.4" | "lua54" => Some(Self::Lua54),
             _ => None,
         }
     }

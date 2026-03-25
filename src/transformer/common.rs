@@ -95,6 +95,20 @@ impl ConstRef {
     }
 }
 
+/// 以 bit-pattern 保留的数值字面量。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct NumberLiteral(pub u64);
+
+impl NumberLiteral {
+    pub fn from_f64(value: f64) -> Self {
+        Self(value.to_bits())
+    }
+
+    pub fn to_f64(self) -> f64 {
+        f64::from_bits(self.0)
+    }
+}
+
 /// 当前 proto upvalue 表里的引用。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct UpvalueRef(pub usize);
@@ -120,6 +134,7 @@ impl ProtoRef {
 pub enum ValueOperand {
     Reg(Reg),
     Const(ConstRef),
+    Integer(i64),
 }
 
 /// 统一 low-IR 指令枚举。
@@ -129,6 +144,8 @@ pub enum LowInstr {
     LoadNil(LoadNilInstr),
     LoadBool(LoadBoolInstr),
     LoadConst(LoadConstInstr),
+    LoadInteger(LoadIntegerInstr),
+    LoadNumber(LoadNumberInstr),
     UnaryOp(UnaryOpInstr),
     BinaryOp(BinaryOpInstr),
     Concat(ConcatInstr),
@@ -144,6 +161,7 @@ pub enum LowInstr {
     Return(ReturnInstr),
     Closure(ClosureInstr),
     Close(CloseInstr),
+    Tbc(TbcInstr),
     NumericForInit(NumericForInitInstr),
     NumericForLoop(NumericForLoopInstr),
     GenericForCall(GenericForCallInstr),
@@ -213,6 +231,7 @@ pub enum AccessBase {
 pub enum AccessKey {
     Reg(Reg),
     Const(ConstRef),
+    Integer(i64),
 }
 
 /// 闭包 capture 来源。
@@ -250,6 +269,8 @@ pub enum BranchPredicate {
 pub enum CondOperand {
     Reg(Reg),
     Const(ConstRef),
+    Integer(i64),
+    Number(NumberLiteral),
 }
 
 /// 条件的操作数形态。
@@ -288,6 +309,18 @@ pub struct LoadBoolInstr {
 pub struct LoadConstInstr {
     pub dst: Reg,
     pub value: ConstRef,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LoadIntegerInstr {
+    pub dst: Reg,
+    pub value: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LoadNumberInstr {
+    pub dst: Reg,
+    pub value: f64,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -384,6 +417,11 @@ pub struct ClosureInstr {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct CloseInstr {
     pub from: Reg,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct TbcInstr {
+    pub reg: Reg,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]

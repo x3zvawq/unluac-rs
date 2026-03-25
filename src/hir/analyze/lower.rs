@@ -22,9 +22,9 @@ use super::short_circuit::{recover_value_phi_expr, recover_value_phi_expr_with_a
 use super::structure::try_build_structured_body;
 use crate::cfg::{BlockRef, Cfg, CfgGraph, DataflowFacts, GraphFacts, PhiId};
 use crate::hir::common::{
-    HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirCallStmt, HirCapture, HirClosureExpr,
-    HirExpr, HirLValue, HirLabel, HirLabelId, HirProto, HirProtoRef, HirStmt, HirTableSetList,
-    HirUnaryExpr, LocalId, ParamId, TempId, UpvalueId,
+    HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirCallStmt, HirCapture, HirClose,
+    HirClosureExpr, HirExpr, HirLValue, HirLabel, HirLabelId, HirProto, HirProtoRef, HirStmt,
+    HirTableSetList, HirToBeClosed, HirUnaryExpr, LocalId, ParamId, TempId, UpvalueId,
 };
 use crate::structure::StructureFacts;
 use crate::transformer::{CallKind, InstrRef, LowInstr, LoweredProto, Reg, ResultPack, ValuePack};
@@ -367,6 +367,12 @@ pub(super) fn lower_regular_instr(
             instr_ref,
             vec![expr_for_const(lowering.proto, load_const.value)],
         ),
+        LowInstr::LoadInteger(load_integer) => {
+            fixed_assign(lowering, instr_ref, vec![HirExpr::Integer(load_integer.value)])
+        }
+        LowInstr::LoadNumber(load_number) => {
+            fixed_assign(lowering, instr_ref, vec![HirExpr::Number(load_number.value)])
+        }
         LowInstr::UnaryOp(unary) => fixed_assign(
             lowering,
             instr_ref,
@@ -491,10 +497,12 @@ pub(super) fn lower_regular_instr(
                     .collect(),
             }))],
         ),
-        LowInstr::Close(close) => vec![unstructured_stmt(format!(
-            "close from r{}",
-            close.from.index()
-        ))],
+        LowInstr::Close(close) => vec![HirStmt::Close(Box::new(HirClose {
+            from_reg: close.from.index(),
+        }))],
+        LowInstr::Tbc(tbc) => vec![HirStmt::ToBeClosed(Box::new(HirToBeClosed {
+            value: expr_for_reg_use(lowering, block, instr_ref, tbc.reg),
+        }))],
         LowInstr::NumericForInit(instr) => vec![
             assign_stmt(
                 lower_fixed_targets(lowering, instr_ref),

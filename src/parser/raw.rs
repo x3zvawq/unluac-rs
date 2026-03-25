@@ -17,6 +17,10 @@ use super::dialect::lua53::{
     Lua53ConstPoolExtra, Lua53DebugExtra, Lua53HeaderExtra, Lua53InstrExtra, Lua53Opcode,
     Lua53Operands, Lua53ProtoExtra, Lua53UpvalueExtra,
 };
+use super::dialect::lua54::{
+    Lua54ConstPoolExtra, Lua54DebugExtra, Lua54HeaderExtra, Lua54InstrExtra, Lua54Opcode,
+    Lua54Operands, Lua54ProtoExtra, Lua54UpvalueExtra,
+};
 
 /// 一个完整解析后的 chunk。
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +59,7 @@ pub enum DialectVersion {
     Lua51,
     Lua52,
     Lua53,
+    Lua54,
 }
 
 /// header 声明的字节序。
@@ -188,6 +193,7 @@ pub enum RawInstrOpcode {
     Lua51(Lua51Opcode),
     Lua52(Lua52Opcode),
     Lua53(Lua53Opcode),
+    Lua54(Lua54Opcode),
 }
 
 /// 各 dialect 自己的 operand 形态。
@@ -196,6 +202,7 @@ pub enum RawInstrOperands {
     Lua51(Lua51Operands),
     Lua52(Lua52Operands),
     Lua53(Lua53Operands),
+    Lua54(Lua54Operands),
 }
 
 /// parser 产物关联到原始字节流的位置。
@@ -233,6 +240,7 @@ pub enum DialectHeaderExtra {
     Lua51(Lua51HeaderExtra),
     Lua52(Lua52HeaderExtra),
     Lua53(Lua53HeaderExtra),
+    Lua54(Lua54HeaderExtra),
 }
 
 /// 各 dialect 在 proto 上附加的专属信息。
@@ -241,6 +249,7 @@ pub enum DialectProtoExtra {
     Lua51(Lua51ProtoExtra),
     Lua52(Lua52ProtoExtra),
     Lua53(Lua53ProtoExtra),
+    Lua54(Lua54ProtoExtra),
 }
 
 /// 各 dialect 在常量池上附加的专属信息。
@@ -249,6 +258,7 @@ pub enum DialectConstPoolExtra {
     Lua51(Lua51ConstPoolExtra),
     Lua52(Lua52ConstPoolExtra),
     Lua53(Lua53ConstPoolExtra),
+    Lua54(Lua54ConstPoolExtra),
 }
 
 /// 各 dialect 在 upvalue 信息上附加的专属内容。
@@ -257,6 +267,7 @@ pub enum DialectUpvalueExtra {
     Lua51(Lua51UpvalueExtra),
     Lua52(Lua52UpvalueExtra),
     Lua53(Lua53UpvalueExtra),
+    Lua54(Lua54UpvalueExtra),
 }
 
 /// 各 dialect 在调试信息上附加的专属内容。
@@ -265,6 +276,7 @@ pub enum DialectDebugExtra {
     Lua51(Lua51DebugExtra),
     Lua52(Lua52DebugExtra),
     Lua53(Lua53DebugExtra),
+    Lua54(Lua54DebugExtra),
 }
 
 /// 各 dialect 在指令上附加的专属内容。
@@ -273,4 +285,5 @@ pub enum DialectInstrExtra {
     Lua51(Lua51InstrExtra),
     Lua52(Lua52InstrExtra),
     Lua53(Lua53InstrExtra),
+    Lua54(Lua54InstrExtra),
 }

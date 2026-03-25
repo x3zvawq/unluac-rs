@@ -881,6 +881,12 @@ fn compute_instr_effect(instr: &LowInstr) -> InstrEffect {
         LowInstr::LoadConst(instr) => {
             effect.fixed_must_defs.insert(instr.dst);
         }
+        LowInstr::LoadInteger(instr) => {
+            effect.fixed_must_defs.insert(instr.dst);
+        }
+        LowInstr::LoadNumber(instr) => {
+            effect.fixed_must_defs.insert(instr.dst);
+        }
         LowInstr::UnaryOp(instr) => {
             effect.fixed_uses.insert(instr.src);
             effect.fixed_must_defs.insert(instr.dst);
@@ -947,6 +953,9 @@ fn compute_instr_effect(instr: &LowInstr) -> InstrEffect {
             }
         }
         LowInstr::Close(_instr) => {}
+        LowInstr::Tbc(instr) => {
+            effect.fixed_uses.insert(instr.reg);
+        }
         LowInstr::NumericForInit(instr) => {
             effect.fixed_uses.insert(instr.index);
             effect.fixed_uses.insert(instr.limit);
@@ -1056,8 +1065,11 @@ fn insert_reg_range_defs(target: &mut BTreeSet<Reg>, range: RegRange) {
 }
 
 fn insert_value_operand_use(target: &mut BTreeSet<Reg>, operand: ValueOperand) {
-    if let ValueOperand::Reg(reg) = operand {
-        target.insert(reg);
+    match operand {
+        ValueOperand::Reg(reg) => {
+            target.insert(reg);
+        }
+        ValueOperand::Const(_) | ValueOperand::Integer(_) => {}
     }
 }
 
@@ -1068,8 +1080,11 @@ fn insert_access_base_use(target: &mut BTreeSet<Reg>, base: AccessBase) {
 }
 
 fn insert_access_key_use(target: &mut BTreeSet<Reg>, key: AccessKey) {
-    if let AccessKey::Reg(reg) = key {
-        target.insert(reg);
+    match key {
+        AccessKey::Reg(reg) => {
+            target.insert(reg);
+        }
+        AccessKey::Const(_) | AccessKey::Integer(_) => {}
     }
 }
 
@@ -1097,8 +1112,11 @@ fn insert_result_pack_def(
 }
 
 fn insert_cond_operand_use(target: &mut BTreeSet<Reg>, operand: CondOperand) {
-    if let CondOperand::Reg(reg) = operand {
-        target.insert(reg);
+    match operand {
+        CondOperand::Reg(reg) => {
+            target.insert(reg);
+        }
+        CondOperand::Const(_) | CondOperand::Integer(_) | CondOperand::Number(_) => {}
     }
 }
 

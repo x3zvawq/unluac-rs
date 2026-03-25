@@ -177,6 +177,7 @@ fn dialect_label(version: DialectVersion) -> &'static str {
         DialectVersion::Lua51 => "lua5.1",
         DialectVersion::Lua52 => "lua5.2",
         DialectVersion::Lua53 => "lua5.3",
+        DialectVersion::Lua54 => "lua5.4",
     }
 }
 
@@ -199,6 +200,12 @@ fn format_low_instr(instr: &LowInstr) -> String {
                 format_reg(instr.dst),
                 format_const(instr.value)
             )
+        }
+        LowInstr::LoadInteger(instr) => {
+            format!("load-int {} <- {}", format_reg(instr.dst), instr.value)
+        }
+        LowInstr::LoadNumber(instr) => {
+            format!("load-num {} <- {}", format_reg(instr.dst), instr.value)
         }
         LowInstr::UnaryOp(instr) => format!(
             "{} {} <- {}",
@@ -274,6 +281,7 @@ fn format_low_instr(instr: &LowInstr) -> String {
                 .join(", ")
         ),
         LowInstr::Close(instr) => format!("close from {}", format_reg(instr.from)),
+        LowInstr::Tbc(instr) => format!("tbc {}", format_reg(instr.reg)),
         LowInstr::NumericForInit(instr) => format!(
             "numeric-for-init index={} limit={} step={} binding={} body={} exit={}",
             format_reg(instr.index),
@@ -346,6 +354,7 @@ fn format_value_operand(operand: ValueOperand) -> String {
     match operand {
         ValueOperand::Reg(reg) => format_reg(reg),
         ValueOperand::Const(const_ref) => format_const(const_ref),
+        ValueOperand::Integer(value) => value.to_string(),
     }
 }
 
@@ -361,6 +370,7 @@ fn format_access_key(key: AccessKey) -> String {
     match key {
         AccessKey::Reg(reg) => format_reg(reg),
         AccessKey::Const(const_ref) => format_const(const_ref),
+        AccessKey::Integer(value) => value.to_string(),
     }
 }
 
@@ -456,6 +466,8 @@ fn format_cond_operand(operand: CondOperand) -> String {
     match operand {
         CondOperand::Reg(reg) => format_reg(reg),
         CondOperand::Const(const_ref) => format_const(const_ref),
+        CondOperand::Integer(value) => value.to_string(),
+        CondOperand::Number(value) => value.to_f64().to_string(),
     }
 }
 

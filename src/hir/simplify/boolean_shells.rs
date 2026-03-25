@@ -70,6 +70,8 @@ fn remove_boolean_materialization_shells_in_nested(
         HirStmt::LocalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
         | HirStmt::CallStmt(_)
         | HirStmt::Return(_)
         | HirStmt::Break
@@ -153,6 +155,9 @@ fn collect_stmt_temp_uses(stmt: &HirStmt, use_counts: &mut BTreeMap<TempId, usiz
                 collect_expr_temp_uses(trailing, use_counts);
             }
         }
+        HirStmt::ToBeClosed(to_be_closed) => {
+            collect_expr_temp_uses(&to_be_closed.value, use_counts);
+        }
         HirStmt::CallStmt(call_stmt) => {
             collect_expr_temp_uses(&call_stmt.call.callee, use_counts);
             for arg in &call_stmt.call.args {
@@ -195,7 +200,11 @@ fn collect_stmt_temp_uses(stmt: &HirStmt, use_counts: &mut BTreeMap<TempId, usiz
         HirStmt::Unstructured(unstructured) => {
             collect_block_temp_uses(&unstructured.body, use_counts)
         }
-        HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => {}
+        HirStmt::Break
+        | HirStmt::Close(_)
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => {}
     }
 }
 

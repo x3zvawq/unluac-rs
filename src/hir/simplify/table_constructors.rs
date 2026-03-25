@@ -84,6 +84,8 @@ fn stabilize_nested(stmt: &mut HirStmt) -> bool {
         HirStmt::LocalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
         | HirStmt::CallStmt(_)
         | HirStmt::Return(_)
         | HirStmt::Break
@@ -406,6 +408,9 @@ fn collect_stmt_bindings(stmt: &HirStmt, bindings: &mut std::collections::BTreeS
                 collect_expr_bindings(trailing, bindings);
             }
         }
+        HirStmt::ToBeClosed(to_be_closed) => {
+            collect_expr_bindings(&to_be_closed.value, bindings);
+        }
         HirStmt::CallStmt(call_stmt) => collect_call_bindings(&call_stmt.call, bindings),
         HirStmt::Return(ret) => {
             for value in &ret.values {
@@ -443,7 +448,11 @@ fn collect_stmt_bindings(stmt: &HirStmt, bindings: &mut std::collections::BTreeS
         HirStmt::Unstructured(unstructured) => {
             collect_stmt_slice_bindings_into(&unstructured.body.stmts, bindings);
         }
-        HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => {}
+        HirStmt::Break
+        | HirStmt::Close(_)
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => {}
     }
 }
 

@@ -17,3 +17,6 @@ mod lua52;
 
 #[path = "unit/lua53/mod.rs"]
 mod lua53;
+
+#[path = "unit/lua54/mod.rs"]
+mod lua54;

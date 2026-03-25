@@ -12,11 +12,12 @@ mod simplify;
 pub use analyze::analyze_hir;
 pub use common::{
     HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirCallStmt, HirCapture,
+    HirClose,
     HirClosureExpr, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget,
     HirExpr, HirGenericFor, HirGlobalRef, HirGoto, HirIf, HirLValue, HirLabel, HirLabelId,
     HirLocalDecl, HirModule, HirNumericFor, HirProto, HirProtoRef, HirRecordField, HirRepeat,
     HirReturn, HirStmt, HirTableAccess, HirTableConstructor, HirTableField, HirTableKey,
-    HirTableSetList, HirUnaryExpr, HirUnaryOpKind, HirUnresolvedExpr, HirUnstructured, HirWhile,
-    LocalId, ParamId, TempId, UpvalueId,
+    HirTableSetList, HirToBeClosed, HirUnaryExpr, HirUnaryOpKind, HirUnresolvedExpr,
+    HirUnstructured, HirWhile, LocalId, ParamId, TempId, UpvalueId,
 };
 pub use debug::dump_hir;
