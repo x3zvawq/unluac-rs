@@ -30,7 +30,7 @@ impl LuaCaseDialect {
             Self::Lua51 => Some(DecompileDialect::Lua51),
             Self::Lua52 => Some(DecompileDialect::Lua52),
             Self::Lua53 => Some(DecompileDialect::Lua53),
-            Self::Lua54 => None,
+            Self::Lua54 => Some(DecompileDialect::Lua54),
         }
     }
 
@@ -369,6 +369,30 @@ pub(crate) const ALL_CASES: &[LuaCaseManifestEntry] = &[
     ),
     LuaCaseManifestEntry::new(
         "tests/lua_cases/lua5.4/02_const_local.lua",
+        LuaCaseDialect::Lua54,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.4/03_const_closure_mesh.lua",
+        LuaCaseDialect::Lua54,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.4/04_tbc_multi_exit.lua",
+        LuaCaseDialect::Lua54,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.4/05_tbc_goto_reenter.lua",
+        LuaCaseDialect::Lua54,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.4/06_close_tailcall_barrier.lua",
+        LuaCaseDialect::Lua54,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.4/07_generic_for_const_close.lua",
+        LuaCaseDialect::Lua54,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.4/08_vararg_const_pipeline.lua",
         LuaCaseDialect::Lua54,
     ),
 ];
