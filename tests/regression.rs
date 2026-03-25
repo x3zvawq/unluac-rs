@@ -17,3 +17,6 @@ mod lua53;
 
 #[path = "regression/lua54/mod.rs"]
 mod lua54;
+
+#[path = "regression/lua55/mod.rs"]
+mod lua55;

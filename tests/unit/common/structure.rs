@@ -843,6 +843,8 @@ fn proto_with_instrs(instrs: Vec<LowInstr>) -> LoweredProto {
         signature: ProtoSignature {
             num_params: 0,
             is_vararg: false,
+            has_vararg_param_reg: false,
+            named_vararg_table: false,
         },
         frame: ProtoFrameInfo { max_stack_size: 8 },
         constants: RawConstPool {

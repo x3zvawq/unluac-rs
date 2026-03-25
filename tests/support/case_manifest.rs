@@ -13,6 +13,7 @@ pub(crate) enum LuaCaseDialect {
     Lua52,
     Lua53,
     Lua54,
+    Lua55,
 }
 
 impl LuaCaseDialect {
@@ -22,6 +23,7 @@ impl LuaCaseDialect {
             Self::Lua52 => "lua5.2",
             Self::Lua53 => "lua5.3",
             Self::Lua54 => "lua5.4",
+            Self::Lua55 => "lua5.5",
         }
     }
 
@@ -31,6 +33,7 @@ impl LuaCaseDialect {
             Self::Lua52 => Some(DecompileDialect::Lua52),
             Self::Lua53 => Some(DecompileDialect::Lua53),
             Self::Lua54 => Some(DecompileDialect::Lua54),
+            Self::Lua55 => Some(DecompileDialect::Lua55),
         }
     }
 
@@ -394,6 +397,38 @@ pub(crate) const ALL_CASES: &[LuaCaseManifestEntry] = &[
     LuaCaseManifestEntry::new(
         "tests/lua_cases/lua5.4/08_vararg_const_pipeline.lua",
         LuaCaseDialect::Lua54,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.5/01_global_basic.lua",
+        LuaCaseDialect::Lua55,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.5/02_global_function_capture.lua",
+        LuaCaseDialect::Lua55,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.5/03_named_vararg_basic.lua",
+        LuaCaseDialect::Lua55,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.5/04_named_vararg_closure_mesh.lua",
+        LuaCaseDialect::Lua55,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.5/05_global_const_gate.lua",
+        LuaCaseDialect::Lua55,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.5/06_global_named_vararg_pipeline.lua",
+        LuaCaseDialect::Lua55,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.5/07_named_vararg_return.lua",
+        LuaCaseDialect::Lua55,
+    ),
+    LuaCaseManifestEntry::new(
+        "tests/lua_cases/lua5.5/08_named_vararg_index_only.lua",
+        LuaCaseDialect::Lua55,
     ),
 ];
 
