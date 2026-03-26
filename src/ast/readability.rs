@@ -4,6 +4,7 @@ mod branch_pretty;
 mod cleanup;
 mod function_sugar;
 mod inline_exprs;
+mod materialize_temps;
 mod short_circuit_pretty;
 mod statement_merge;
 
@@ -95,12 +96,21 @@ const FUNCTION_SUGAR_STAGE: ReadabilityStage = ReadabilityStage {
     ],
 };
 
+const TEMP_MATERIALIZE_STAGE: ReadabilityStage = ReadabilityStage {
+    name: "temp-materialize",
+    passes: &[ReadabilityPass {
+        name: "materialize-temps",
+        apply: materialize_temps::apply,
+    }],
+};
+
 const READABILITY_STAGES: &[ReadabilityStage] = &[
     STRUCTURAL_CLEANUP_STAGE,
     STATEMENT_MERGE_STAGE,
     CONTROL_FLOW_PRETTY_STAGE,
     EXPR_INLINE_STAGE,
     SHORT_CIRCUIT_PRETTY_STAGE,
+    TEMP_MATERIALIZE_STAGE,
     FUNCTION_SUGAR_STAGE,
 ];
 

@@ -27,6 +27,7 @@ impl<'a> AstLowerer<'a> {
         )?;
         let body = self.lower_proto_body(closure.proto.index())?;
         Ok(AstFunctionExpr {
+            function: closure.proto,
             params: child.params.clone(),
             is_vararg: child.signature.is_vararg,
             body,

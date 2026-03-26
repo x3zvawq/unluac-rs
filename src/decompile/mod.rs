@@ -11,6 +11,9 @@ mod pipeline;
 mod state;
 
 pub use crate::debug::{DebugColorMode, DebugDetail, DebugFilters};
+pub use crate::naming::{
+    FunctionNameMap, NameInfo, NameMap, NameSource, NamingMode, NamingOptions,
+};
 pub use crate::readability::ReadabilityOptions;
 pub use crate::timing::{TimingNode, TimingReport, render_timing_report};
 pub use contracts::{
@@ -19,7 +22,7 @@ pub use contracts::{
 };
 pub use debug::{
     DebugOptions, StageDebugOutput, dump_ast, dump_cfg, dump_dataflow, dump_graph_facts, dump_hir,
-    dump_lir, dump_parser, dump_readability, dump_structure,
+    dump_lir, dump_naming, dump_parser, dump_readability, dump_structure,
 };
 pub use error::DecompileError;
 pub use options::{DecompileDialect, DecompileOptions};

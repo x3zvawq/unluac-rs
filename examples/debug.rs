@@ -12,16 +12,17 @@ use unluac::decompile::{
     DebugColorMode, DebugDetail, DebugFilters, DebugOptions, DecompileDialect, DecompileOptions,
     DecompileStage, ReadabilityOptions, decompile, render_timing_report,
 };
+use unluac::naming::{NamingMode, NamingOptions};
 use unluac::parser::{ParseMode, ParseOptions, StringDecodeMode, StringEncoding};
 
 /// 开发时最常改的是这几个常量，直接编辑代码通常比来回敲命令更顺手。
 const DIALECT: DecompileDialect = DecompileDialect::Lua51;
-const SOURCE: &str = "tests/lua_cases/common/tricky/01_boolean_hell.lua";
+const SOURCE: &str = "tests/lua_cases/common/tricky/15_short_circuit_side_effects.lua";
 const STRING_ENCODING: StringEncoding = StringEncoding::Utf8;
 const STRING_DECODE_MODE: StringDecodeMode = StringDecodeMode::Strict;
 const PARSE_MODE: ParseMode = ParseMode::Strict;
 // 这个入口更常用来直接看“最终会长成什么源码形状”，所以默认停在 Readability。
-const TARGET_STAGE: DecompileStage = DecompileStage::Readability;
+const TARGET_STAGE: DecompileStage = DecompileStage::Naming;
 const DEBUG_DETAIL: DebugDetail = DebugDetail::Verbose;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -47,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             target_stage: TARGET_STAGE,
             debug: DebugOptions {
                 enable: true,
-                output_stages: vec![TARGET_STAGE],
+                output_stages: vec![DecompileStage::Readability, TARGET_STAGE],
                 timing: true,
                 color: DebugColorMode::Always,
                 detail: DEBUG_DETAIL,
@@ -58,6 +59,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 index_inline_max_complexity: 10,
                 args_inline_max_complexity: 6,
                 access_base_inline_max_complexity: 5,
+            },
+            naming: NamingOptions {
+                mode: NamingMode::DebugLike,
+                debug_like_include_function: true,
             },
         },
     )?;

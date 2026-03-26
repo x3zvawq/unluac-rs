@@ -204,6 +204,7 @@ fn hir_from_ast_expr(expr: &AstExpr) -> Option<HirExpr> {
             super::super::common::AstNameRef::Param(param) => Some(HirExpr::ParamRef(*param)),
             super::super::common::AstNameRef::Local(local) => Some(HirExpr::LocalRef(*local)),
             super::super::common::AstNameRef::Temp(temp) => Some(HirExpr::TempRef(*temp)),
+            super::super::common::AstNameRef::SyntheticLocal(_) => None,
             super::super::common::AstNameRef::Upvalue(upvalue) => {
                 Some(HirExpr::UpvalueRef(*upvalue))
             }
@@ -326,6 +327,7 @@ mod tests {
         let c = AstExpr::Var(AstNameRef::Param(ParamId(3)));
         let fallback = and(not(a.clone()), not(b.clone()));
         let mut module = AstModule {
+            entry_function: Default::default(),
             body: AstBlock {
                 stmts: vec![AstStmt::Return(Box::new(crate::ast::AstReturn {
                     values: vec![or(

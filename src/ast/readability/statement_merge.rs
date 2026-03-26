@@ -116,6 +116,10 @@ fn local_binding_matches_target(binding: AstBindingRef, target: &AstLValue) -> b
         (AstBindingRef::Local(local), AstLValue::Name(AstNameRef::Local(target_local))) => {
             local == *target_local
         }
+        (
+            AstBindingRef::SyntheticLocal(local),
+            AstLValue::Name(AstNameRef::SyntheticLocal(target_local)),
+        ) => local == *target_local,
         (AstBindingRef::Temp(temp), AstLValue::Name(AstNameRef::Temp(target_temp))) => {
             temp == *target_temp
         }
@@ -136,6 +140,7 @@ mod tests {
     fn merges_empty_local_decl_followed_by_matching_assign() {
         let temp = TempId(0);
         let module = AstModule {
+            entry_function: Default::default(),
             body: crate::ast::AstBlock {
                 stmts: vec![
                     AstStmt::LocalDecl(Box::new(AstLocalDecl {
@@ -165,7 +170,9 @@ mod tests {
             module.body.stmts,
             vec![AstStmt::LocalDecl(Box::new(AstLocalDecl {
                 bindings: vec![AstLocalBinding {
-                    id: crate::ast::AstBindingRef::Temp(temp),
+                    id: crate::ast::AstBindingRef::SyntheticLocal(crate::ast::AstSyntheticLocalId(
+                        temp,
+                    )),
                     attr: AstLocalAttr::None,
                 }],
                 values: vec![AstExpr::Call(Box::new(AstCallExpr {
@@ -179,6 +186,7 @@ mod tests {
     #[test]
     fn does_not_merge_when_assign_targets_do_not_match_decl_bindings() {
         let module = AstModule {
+            entry_function: Default::default(),
             body: crate::ast::AstBlock {
                 stmts: vec![
                     AstStmt::LocalDecl(Box::new(AstLocalDecl {

@@ -8,6 +8,7 @@ use crate::ast::{
 };
 use crate::cfg::{analyze_dataflow, analyze_graph_facts, build_cfg_graph};
 use crate::hir::analyze_hir_with_timing;
+use crate::naming::assign_names;
 use crate::parser::{
     parse_lua51_chunk, parse_lua52_chunk, parse_lua53_chunk, parse_lua54_chunk, parse_lua55_chunk,
 };
@@ -263,9 +264,34 @@ impl DecompilerPipeline {
             return Ok(finish_result(state, debug_output, &timings));
         }
 
+        state.naming = Some(timings.record(DecompileStage::Naming.label(), || {
+            let ast = state
+                .readability
+                .as_ref()
+                .expect("readability stage completed must leave readability result in state");
+            let hir = state
+                .hir
+                .as_ref()
+                .expect("hir stage completed must leave hir module in state");
+            let raw_chunk = state
+                .raw_chunk
+                .as_ref()
+                .expect("parse stage completed must leave raw chunk in state");
+            assign_names(ast, hir, raw_chunk, options.naming)
+        })?);
+        state.mark_completed(DecompileStage::Naming);
+
+        if let Some(output) = collect_stage_dump(&state, DecompileStage::Naming, &options.debug)? {
+            debug_output.push(output);
+        }
+
+        if options.target_stage == DecompileStage::Naming {
+            return Ok(finish_result(state, debug_output, &timings));
+        }
+
         Err(DecompileError::StageNotImplemented {
-            stage: DecompileStage::Naming,
-            completed_stage: DecompileStage::Readability,
+            stage: DecompileStage::Generate,
+            completed_stage: DecompileStage::Naming,
         })
     }
 }

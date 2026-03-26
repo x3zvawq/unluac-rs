@@ -89,6 +89,7 @@ where
             target_stage,
             debug: debug_options,
             readability: Default::default(),
+            naming: Default::default(),
         },
     )?;
 

@@ -5,11 +5,22 @@
 
 use std::fmt;
 
-use crate::hir::{HirLabelId, LocalId, ParamId, TempId, UpvalueId};
+use crate::hir::{HirLabelId, HirProtoRef, LocalId, ParamId, TempId, UpvalueId};
+
+/// AST 内部物化出来的保守局部绑定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash)]
+pub struct AstSyntheticLocalId(pub TempId);
+
+impl AstSyntheticLocalId {
+    pub const fn index(self) -> usize {
+        self.0.index()
+    }
+}
 
 /// AST 根对象。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct AstModule {
+    pub entry_function: HirProtoRef,
     pub body: AstBlock,
 }
 
@@ -84,6 +95,7 @@ pub enum AstNameRef {
     Param(ParamId),
     Local(LocalId),
     Temp(TempId),
+    SyntheticLocal(AstSyntheticLocalId),
     Upvalue(UpvalueId),
     Global(AstGlobalName),
 }
@@ -93,6 +105,7 @@ pub enum AstNameRef {
 pub enum AstBindingRef {
     Local(LocalId),
     Temp(TempId),
+    SyntheticLocal(AstSyntheticLocalId),
 }
 
 /// 全局名。
@@ -110,6 +123,7 @@ pub struct AstReturn {
 /// 函数表达式。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AstFunctionExpr {
+    pub function: HirProtoRef,
     pub params: Vec<ParamId>,
     pub is_vararg: bool,
     pub body: AstBlock,

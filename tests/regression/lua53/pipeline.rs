@@ -135,10 +135,10 @@ mod decompile_pipeline {
             Some(DecompileStage::Readability)
         );
         let dump = &result.debug_output[0].content;
-        assert!(dump.contains("local t8, t9, t10, t11"), "{dump}");
+        assert!(dump.contains("local l1, l2, l3, l4"), "{dump}");
         assert!(dump.contains("local function l0(p0)"), "{dump}");
         assert!(
-            dump.contains("t8, t9, t10, t11 = l0({5, 8, 13, 21, 34})"),
+            dump.contains("l1, l2, l3, l4 = l0({5, 8, 13, 21, 34})"),
             "{dump}"
         );
         assert!(dump.contains("for l0 = l3, l4, l5 do"), "{dump}");

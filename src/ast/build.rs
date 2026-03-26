@@ -41,7 +41,10 @@ impl<'a> AstLowerer<'a> {
 
     fn lower_module(&mut self) -> Result<AstModule, AstLowerError> {
         let body = self.lower_proto_body(self.module.entry.index())?;
-        Ok(AstModule { body })
+        Ok(AstModule {
+            entry_function: self.module.entry,
+            body,
+        })
     }
 
     fn lower_proto_body(&mut self, proto_index: usize) -> Result<AstBlock, AstLowerError> {

@@ -322,6 +322,36 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn reaches_naming_stage_and_reports_binding_name_sources() {
+        let result = decompile(
+            &crate::support::decode_hex(SETFENV_CHUNK_HEX),
+            DecompileOptions {
+                target_stage: DecompileStage::Naming,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Naming],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Normal,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("naming stage should succeed");
+
+        assert_eq!(result.state.completed_stage, Some(DecompileStage::Naming));
+        assert!(result.state.naming.is_some());
+        assert_eq!(result.debug_output.len(), 1);
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("===== Dump Naming ====="), "{dump}");
+        assert!(dump.contains("proto#0"), "{dump}");
+        assert!(dump.contains("params"), "{dump}");
+        assert!(dump.contains("source="), "{dump}");
+    }
+
+    #[test]
     fn boolean_hell_hir_prefers_guarded_or_shape_for_initial_short_circuit_value() {
         let result = decompile(
             &compile_lua_case(

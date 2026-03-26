@@ -1,13 +1,21 @@
 //! AST 层的人类可读 dump。
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
+use crate::hir::LocalId;
 
 use super::common::{
-    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionName, AstLValue, AstModule,
-    AstNamePath, AstNameRef, AstStmt, AstTableField,
+    AstBindingRef, AstBlock, AstCallExpr, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName,
+    AstLValue, AstMethodCallExpr, AstModule, AstNamePath, AstNameRef, AstStmt,
+    AstSyntheticLocalId, AstTableField,
 };
+
+#[derive(Debug, Default)]
+struct FunctionRenderNames {
+    synthetic_locals: BTreeMap<AstSyntheticLocalId, usize>,
+}
 
 /// 输出 AST 的调试文本。
 pub fn dump_ast(
@@ -40,11 +48,17 @@ fn dump_module(
     let _ = writeln!(output, "===== Dump {stage_title} =====");
     let _ = writeln!(output, "{stage_label} detail={detail}");
     let _ = writeln!(output);
-    write_block(&mut output, "", &module.body);
+    let names = collect_function_render_names(&module.body);
+    write_block(&mut output, "", &module.body, &names);
     colorize_debug_text(&output, color)
 }
 
-fn write_block(output: &mut String, indent: &str, block: &AstBlock) {
+fn write_block(
+    output: &mut String,
+    indent: &str,
+    block: &AstBlock,
+    names: &FunctionRenderNames,
+) {
     if block.stmts.is_empty() {
         let _ = writeln!(output, "{indent}<empty>");
         return;
@@ -56,7 +70,7 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock) {
                 let bindings = local_decl
                     .bindings
                     .iter()
-                    .map(format_local_binding)
+                    .map(|binding| format_local_binding(binding, names))
                     .collect::<Vec<_>>()
                     .join(", ");
                 if local_decl.values.is_empty() {
@@ -65,7 +79,7 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock) {
                     let _ = writeln!(
                         output,
                         "{indent}local {bindings} = {}",
-                        format_value_list(&local_decl.values, indent),
+                        format_value_list(&local_decl.values, indent, names),
                     );
                 }
             }
@@ -87,7 +101,7 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock) {
                     let _ = writeln!(
                         output,
                         "{indent}global {bindings} = {}",
-                        format_value_list(&global_decl.values, indent),
+                        format_value_list(&global_decl.values, indent, names),
                     );
                 }
             }
@@ -98,14 +112,14 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock) {
                     assign
                         .targets
                         .iter()
-                        .map(|target| format_lvalue(target, indent))
+                        .map(|target| format_lvalue(target, indent, names))
                         .collect::<Vec<_>>()
                         .join(", "),
-                    format_value_list(&assign.values, indent),
+                    format_value_list(&assign.values, indent, names),
                 );
             }
             AstStmt::CallStmt(call_stmt) => {
-                let _ = writeln!(output, "{indent}{}", format_call(&call_stmt.call, indent));
+                let _ = writeln!(output, "{indent}{}", format_call(&call_stmt.call, indent, names));
             }
             AstStmt::Return(ret) => {
                 if ret.values.is_empty() {
@@ -114,7 +128,7 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock) {
                     let _ = writeln!(
                         output,
                         "{indent}return {}",
-                        format_value_list(&ret.values, indent),
+                        format_value_list(&ret.values, indent, names),
                     );
                 }
             }
@@ -122,12 +136,12 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock) {
                 let _ = writeln!(
                     output,
                     "{indent}if {} then",
-                    format_head_expr(&if_stmt.cond, indent),
+                    format_head_expr(&if_stmt.cond, indent, names),
                 );
-                write_block(output, &format!("{indent}  "), &if_stmt.then_block);
+                write_block(output, &format!("{indent}  "), &if_stmt.then_block, names);
                 if let Some(else_block) = &if_stmt.else_block {
                     let _ = writeln!(output, "{indent}else");
-                    write_block(output, &format!("{indent}  "), else_block);
+                    write_block(output, &format!("{indent}  "), else_block, names);
                 }
                 let _ = writeln!(output, "{indent}end");
             }
@@ -135,30 +149,30 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock) {
                 let _ = writeln!(
                     output,
                     "{indent}while {} do",
-                    format_head_expr(&while_stmt.cond, indent),
+                    format_head_expr(&while_stmt.cond, indent, names),
                 );
-                write_block(output, &format!("{indent}  "), &while_stmt.body);
+                write_block(output, &format!("{indent}  "), &while_stmt.body, names);
                 let _ = writeln!(output, "{indent}end");
             }
             AstStmt::Repeat(repeat_stmt) => {
                 let _ = writeln!(output, "{indent}repeat");
-                write_block(output, &format!("{indent}  "), &repeat_stmt.body);
+                write_block(output, &format!("{indent}  "), &repeat_stmt.body, names);
                 let _ = writeln!(
                     output,
                     "{indent}until {}",
-                    format_head_expr(&repeat_stmt.cond, indent),
+                    format_head_expr(&repeat_stmt.cond, indent, names),
                 );
             }
             AstStmt::NumericFor(numeric_for) => {
                 let _ = writeln!(
                     output,
                     "{indent}for {} = {}, {}, {} do",
-                    format_binding_ref(numeric_for.binding),
-                    format_expr(&numeric_for.start, indent),
-                    format_expr(&numeric_for.limit, indent),
-                    format_expr(&numeric_for.step, indent),
+                    format_binding_ref(numeric_for.binding, names),
+                    format_expr(&numeric_for.start, indent, names),
+                    format_expr(&numeric_for.limit, indent, names),
+                    format_expr(&numeric_for.step, indent, names),
                 );
-                write_block(output, &format!("{indent}  "), &numeric_for.body);
+                write_block(output, &format!("{indent}  "), &numeric_for.body, names);
                 let _ = writeln!(output, "{indent}end");
             }
             AstStmt::GenericFor(generic_for) => {
@@ -169,12 +183,12 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock) {
                         .bindings
                         .iter()
                         .copied()
-                        .map(format_binding_ref)
+                        .map(|binding| format_binding_ref(binding, names))
                         .collect::<Vec<_>>()
                         .join(", "),
-                    format_value_list(&generic_for.iterator, indent),
+                    format_value_list(&generic_for.iterator, indent, names),
                 );
-                write_block(output, &format!("{indent}  "), &generic_for.body);
+                write_block(output, &format!("{indent}  "), &generic_for.body, names);
                 let _ = writeln!(output, "{indent}end");
             }
             AstStmt::Break => {
@@ -191,14 +205,15 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock) {
             }
             AstStmt::DoBlock(block) => {
                 let _ = writeln!(output, "{indent}do");
-                write_block(output, &format!("{indent}  "), block);
+                write_block(output, &format!("{indent}  "), block, names);
                 let _ = writeln!(output, "{indent}end");
             }
             AstStmt::FunctionDecl(function_decl) => {
+                let function_names = collect_function_render_names(&function_decl.func.body);
                 let _ = writeln!(
                     output,
                     "{indent}{}({})",
-                    format_function_name(&function_decl.target),
+                    format_function_name(&function_decl.target, names),
                     function_decl
                         .func
                         .params
@@ -207,14 +222,20 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock) {
                         .collect::<Vec<_>>()
                         .join(", "),
                 );
-                write_block(output, &format!("{indent}  "), &function_decl.func.body);
+                write_block(
+                    output,
+                    &format!("{indent}  "),
+                    &function_decl.func.body,
+                    &function_names,
+                );
                 let _ = writeln!(output, "{indent}end");
             }
             AstStmt::LocalFunctionDecl(local_function_decl) => {
+                let function_names = collect_function_render_names(&local_function_decl.func.body);
                 let _ = writeln!(
                     output,
                     "{indent}local function {}({})",
-                    format_binding_ref(local_function_decl.name),
+                    format_binding_ref(local_function_decl.name, names),
                     local_function_decl
                         .func
                         .params
@@ -227,6 +248,7 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock) {
                     output,
                     &format!("{indent}  "),
                     &local_function_decl.func.body,
+                    &function_names,
                 );
                 let _ = writeln!(output, "{indent}end");
             }
@@ -234,79 +256,79 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock) {
     }
 }
 
-fn format_value_list(values: &[AstExpr], indent: &str) -> String {
+fn format_value_list(values: &[AstExpr], indent: &str, names: &FunctionRenderNames) -> String {
     if values.is_empty() {
         "-".to_owned()
     } else {
         values
             .iter()
-            .map(|expr| format_expr(expr, indent))
+            .map(|expr| format_expr(expr, indent, names))
             .collect::<Vec<_>>()
             .join(", ")
     }
 }
 
-fn format_expr(expr: &AstExpr, indent: &str) -> String {
+fn format_expr(expr: &AstExpr, indent: &str, names: &FunctionRenderNames) -> String {
     match expr {
         AstExpr::Nil => "nil".to_owned(),
         AstExpr::Boolean(value) => value.to_string(),
         AstExpr::Integer(value) => value.to_string(),
         AstExpr::Number(value) => value.to_string(),
         AstExpr::String(value) => format!("{value:?}"),
-        AstExpr::Var(name) => format_name_ref(name),
+        AstExpr::Var(name) => format_name_ref(name, names),
         AstExpr::FieldAccess(access) => {
-            format!("{}.{}", format_expr(&access.base, indent), access.field)
+            format!("{}.{}", format_expr(&access.base, indent, names), access.field)
         }
         AstExpr::IndexAccess(access) => {
             format!(
                 "{}[{}]",
-                format_expr(&access.base, indent),
-                format_expr(&access.index, indent)
+                format_expr(&access.base, indent, names),
+                format_expr(&access.index, indent, names)
             )
         }
         AstExpr::Unary(unary) => format!(
             "({} {})",
             format_unary_op(unary.op),
-            format_expr(&unary.expr, indent)
+            format_expr(&unary.expr, indent, names)
         ),
         AstExpr::Binary(binary) => format!(
             "({} {} {})",
-            format_expr(&binary.lhs, indent),
+            format_expr(&binary.lhs, indent, names),
             format_binary_op(binary.op),
-            format_expr(&binary.rhs, indent)
+            format_expr(&binary.rhs, indent, names)
         ),
         AstExpr::LogicalAnd(logical) => {
             format!(
                 "({} and {})",
-                format_expr(&logical.lhs, indent),
-                format_expr(&logical.rhs, indent)
+                format_expr(&logical.lhs, indent, names),
+                format_expr(&logical.rhs, indent, names)
             )
         }
         AstExpr::LogicalOr(logical) => {
             format!(
                 "({} or {})",
-                format_expr(&logical.lhs, indent),
-                format_expr(&logical.rhs, indent)
+                format_expr(&logical.lhs, indent, names),
+                format_expr(&logical.rhs, indent, names)
             )
         }
-        AstExpr::Call(call) => format_call(&AstCallKind::Call(call.clone()), indent),
-        AstExpr::MethodCall(call) => format_call(&AstCallKind::MethodCall(call.clone()), indent),
+        AstExpr::Call(call) => format_call_expr(call, indent, names),
+        AstExpr::MethodCall(call) => format_method_call_expr(call, indent, names),
         AstExpr::VarArg => "...".to_owned(),
         AstExpr::TableConstructor(table) => {
             let fields = table
                 .fields
                 .iter()
                 .map(|field| match field {
-                    AstTableField::Array(expr) => format_expr(expr, indent),
+                    AstTableField::Array(expr) => format_expr(expr, indent, names),
                     AstTableField::Record(record) => match &record.key {
                         super::common::AstTableKey::Name(name) => {
-                            format!("{name} = {}", format_expr(&record.value, indent))
+                            format!("{name} = {}", format_expr(&record.value, indent, names))
                         }
                         super::common::AstTableKey::Expr(expr) => {
                             format!(
                                 "[{}] = {}",
-                                format_expr(expr, indent),
-                                format_expr(&record.value, indent)
+                                format_expr(expr, indent, names),
+                                format_expr(&record.value, indent, names)
                             )
                         }
                     },
@@ -319,22 +341,23 @@ fn format_expr(expr: &AstExpr, indent: &str) -> String {
     }
 }
 
-fn format_head_expr(expr: &AstExpr, indent: &str) -> String {
-    strip_outer_parens(format_expr(expr, indent))
+fn format_head_expr(expr: &AstExpr, indent: &str, names: &FunctionRenderNames) -> String {
+    strip_outer_parens(format_expr(expr, indent, names))
 }
 
-fn format_name_ref(name: &super::common::AstNameRef) -> String {
+fn format_name_ref(name: &AstNameRef, names: &FunctionRenderNames) -> String {
     match name {
-        super::common::AstNameRef::Param(param) => format!("p{}", param.index()),
-        super::common::AstNameRef::Local(local) => format!("l{}", local.index()),
-        super::common::AstNameRef::Temp(temp) => format!("t{}", temp.index()),
-        super::common::AstNameRef::Upvalue(upvalue) => format!("u{}", upvalue.index()),
-        super::common::AstNameRef::Global(global) => global.text.clone(),
+        AstNameRef::Param(param) => format!("p{}", param.index()),
+        AstNameRef::Local(local) => format!("l{}", local.index()),
+        AstNameRef::Temp(temp) => format!("t{}", temp.index()),
+        AstNameRef::SyntheticLocal(local) => format!("l{}", display_synthetic_local(*local, names)),
+        AstNameRef::Upvalue(upvalue) => format!("u{}", upvalue.index()),
+        AstNameRef::Global(global) => global.text.clone(),
     }
 }
 
-fn format_name_path(path: &AstNamePath) -> String {
-    let mut rendered = format_name_ref(&path.root);
+fn format_name_path(path: &AstNamePath, names: &FunctionRenderNames) -> String {
+    let mut rendered = format_name_ref(&path.root, names);
     for field in &path.fields {
         rendered.push('.');
         rendered.push_str(field);
@@ -342,10 +365,10 @@ fn format_name_path(path: &AstNamePath) -> String {
     rendered
 }
 
-fn format_function_name(target: &AstFunctionName) -> String {
+fn format_function_name(target: &AstFunctionName, names: &FunctionRenderNames) -> String {
     match target {
         AstFunctionName::Plain(path) => {
-            let rendered = format_name_path(path);
+            let rendered = format_name_path(path, names);
             if matches!(path.root, AstNameRef::Global(_)) {
                 format!("global function {rendered}")
             } else {
@@ -353,7 +376,7 @@ fn format_function_name(target: &AstFunctionName) -> String {
             }
         }
         AstFunctionName::Method(path, method) => {
-            let rendered = format!("{}:{method}", format_name_path(path));
+            let rendered = format!("{}:{method}", format_name_path(path, names));
             if matches!(path.root, AstNameRef::Global(_)) {
                 format!("global function {rendered}")
             } else {
@@ -363,15 +386,19 @@ fn format_function_name(target: &AstFunctionName) -> String {
     }
 }
 
-fn format_binding_ref(binding: AstBindingRef) -> String {
+fn format_binding_ref(binding: AstBindingRef, names: &FunctionRenderNames) -> String {
     match binding {
         AstBindingRef::Local(local) => format!("l{}", local.index()),
         AstBindingRef::Temp(temp) => format!("t{}", temp.index()),
+        AstBindingRef::SyntheticLocal(local) => format!("l{}", display_synthetic_local(local, names)),
     }
 }
 
-fn format_local_binding(binding: &super::common::AstLocalBinding) -> String {
-    let name = format_binding_ref(binding.id);
+fn format_local_binding(
+    binding: &super::common::AstLocalBinding,
+    names: &FunctionRenderNames,
+) -> String {
+    let name = format_binding_ref(binding.id, names);
     match binding.attr {
         super::common::AstLocalAttr::None => name,
         super::common::AstLocalAttr::Const => format!("{name}<const>"),
@@ -379,55 +406,67 @@ fn format_local_binding(binding: &super::common::AstLocalBinding) -> String {
     }
 }
 
-fn format_lvalue(target: &AstLValue, indent: &str) -> String {
+fn format_lvalue(target: &AstLValue, indent: &str, names: &FunctionRenderNames) -> String {
     match target {
-        AstLValue::Name(name) => format_name_ref(name),
+        AstLValue::Name(name) => format_name_ref(name, names),
         AstLValue::FieldAccess(access) => {
-            format!("{}.{}", format_expr(&access.base, indent), access.field)
+            format!("{}.{}", format_expr(&access.base, indent, names), access.field)
         }
         AstLValue::IndexAccess(access) => {
             format!(
                 "{}[{}]",
-                format_expr(&access.base, indent),
-                format_expr(&access.index, indent)
+                format_expr(&access.base, indent, names),
+                format_expr(&access.index, indent, names)
             )
         }
     }
 }
 
-fn format_call(call: &AstCallKind, indent: &str) -> String {
+fn format_call(call: &AstCallKind, indent: &str, names: &FunctionRenderNames) -> String {
     match call {
-        AstCallKind::Call(call) => format!(
-            "{}({})",
-            format_call_target(&call.callee, indent),
-            format_arg_list(&call.args, indent)
-        ),
-        AstCallKind::MethodCall(call) => format!(
-            "{}:{}({})",
-            format_expr(&call.receiver, indent),
-            call.method,
-            format_arg_list(&call.args, indent)
-        ),
+        AstCallKind::Call(call) => format_call_expr(call, indent, names),
+        AstCallKind::MethodCall(call) => format_method_call_expr(call, indent, names),
     }
 }
 
-fn format_call_target(expr: &AstExpr, indent: &str) -> String {
-    let rendered = format_expr(expr, indent);
+fn format_call_expr(call: &AstCallExpr, indent: &str, names: &FunctionRenderNames) -> String {
+    format!(
+        "{}({})",
+        format_call_target(&call.callee, indent, names),
+        format_arg_list(&call.args, indent, names)
+    )
+}
+
+fn format_method_call_expr(
+    call: &AstMethodCallExpr,
+    indent: &str,
+    names: &FunctionRenderNames,
+) -> String {
+    format!(
+        "{}:{}({})",
+        format_expr(&call.receiver, indent, names),
+        call.method,
+        format_arg_list(&call.args, indent, names)
+    )
+}
+
+fn format_call_target(expr: &AstExpr, indent: &str, names: &FunctionRenderNames) -> String {
+    let rendered = format_expr(expr, indent, names);
     match expr {
         AstExpr::FunctionExpr(_) => format!("({rendered})"),
         _ => rendered,
     }
 }
 
-fn format_arg_list(values: &[AstExpr], indent: &str) -> String {
+fn format_arg_list(values: &[AstExpr], indent: &str, names: &FunctionRenderNames) -> String {
     values
         .iter()
-        .map(|expr| format_expr(expr, indent))
+        .map(|expr| format_expr(expr, indent, names))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-fn format_function_expr(function: &super::common::AstFunctionExpr, indent: &str) -> String {
+fn format_function_expr(function: &AstFunctionExpr, indent: &str) -> String {
     let params = function
         .params
         .iter()
@@ -435,9 +474,271 @@ fn format_function_expr(function: &super::common::AstFunctionExpr, indent: &str)
         .collect::<Vec<_>>()
         .join(", ");
     let child_indent = format!("{indent}  ");
+    let child_names = collect_function_render_names(&function.body);
     let mut body = String::new();
-    write_block(&mut body, &child_indent, &function.body);
+    write_block(&mut body, &child_indent, &function.body, &child_names);
     format!("function({params})\n{body}{indent}end")
+}
+
+fn display_synthetic_local(local: AstSyntheticLocalId, names: &FunctionRenderNames) -> usize {
+    names
+        .synthetic_locals
+        .get(&local)
+        .copied()
+        .unwrap_or_else(|| local.index())
+}
+
+fn collect_function_render_names(block: &AstBlock) -> FunctionRenderNames {
+    let mut max_local = None::<usize>;
+    let mut synthetic_locals = BTreeSet::new();
+    collect_function_render_names_in_block(block, &mut max_local, &mut synthetic_locals);
+    let start_index = max_local.map_or(0, |index| index + 1);
+    let synthetic_locals = synthetic_locals
+        .into_iter()
+        .enumerate()
+        .map(|(offset, local)| (local, start_index + offset))
+        .collect();
+    FunctionRenderNames { synthetic_locals }
+}
+
+fn collect_function_render_names_in_block(
+    block: &AstBlock,
+    max_local: &mut Option<usize>,
+    synthetic_locals: &mut BTreeSet<AstSyntheticLocalId>,
+) {
+    for stmt in &block.stmts {
+        collect_function_render_names_in_stmt(stmt, max_local, synthetic_locals);
+    }
+}
+
+fn collect_function_render_names_in_stmt(
+    stmt: &AstStmt,
+    max_local: &mut Option<usize>,
+    synthetic_locals: &mut BTreeSet<AstSyntheticLocalId>,
+) {
+    match stmt {
+        AstStmt::LocalDecl(local_decl) => {
+            for binding in &local_decl.bindings {
+                collect_binding_ref(binding.id, max_local, synthetic_locals);
+            }
+            for value in &local_decl.values {
+                collect_function_render_names_in_expr(value, max_local, synthetic_locals);
+            }
+        }
+        AstStmt::GlobalDecl(global_decl) => {
+            for value in &global_decl.values {
+                collect_function_render_names_in_expr(value, max_local, synthetic_locals);
+            }
+        }
+        AstStmt::Assign(assign) => {
+            for target in &assign.targets {
+                collect_function_render_names_in_lvalue(target, max_local, synthetic_locals);
+            }
+            for value in &assign.values {
+                collect_function_render_names_in_expr(value, max_local, synthetic_locals);
+            }
+        }
+        AstStmt::CallStmt(call_stmt) => {
+            collect_function_render_names_in_call(&call_stmt.call, max_local, synthetic_locals);
+        }
+        AstStmt::Return(ret) => {
+            for value in &ret.values {
+                collect_function_render_names_in_expr(value, max_local, synthetic_locals);
+            }
+        }
+        AstStmt::If(if_stmt) => {
+            collect_function_render_names_in_expr(&if_stmt.cond, max_local, synthetic_locals);
+            collect_function_render_names_in_block(&if_stmt.then_block, max_local, synthetic_locals);
+            if let Some(else_block) = &if_stmt.else_block {
+                collect_function_render_names_in_block(else_block, max_local, synthetic_locals);
+            }
+        }
+        AstStmt::While(while_stmt) => {
+            collect_function_render_names_in_expr(&while_stmt.cond, max_local, synthetic_locals);
+            collect_function_render_names_in_block(&while_stmt.body, max_local, synthetic_locals);
+        }
+        AstStmt::Repeat(repeat_stmt) => {
+            collect_function_render_names_in_block(&repeat_stmt.body, max_local, synthetic_locals);
+            collect_function_render_names_in_expr(&repeat_stmt.cond, max_local, synthetic_locals);
+        }
+        AstStmt::NumericFor(numeric_for) => {
+            collect_binding_ref(numeric_for.binding, max_local, synthetic_locals);
+            collect_function_render_names_in_expr(&numeric_for.start, max_local, synthetic_locals);
+            collect_function_render_names_in_expr(&numeric_for.limit, max_local, synthetic_locals);
+            collect_function_render_names_in_expr(&numeric_for.step, max_local, synthetic_locals);
+            collect_function_render_names_in_block(&numeric_for.body, max_local, synthetic_locals);
+        }
+        AstStmt::GenericFor(generic_for) => {
+            for binding in &generic_for.bindings {
+                collect_binding_ref(*binding, max_local, synthetic_locals);
+            }
+            for iterator in &generic_for.iterator {
+                collect_function_render_names_in_expr(iterator, max_local, synthetic_locals);
+            }
+            collect_function_render_names_in_block(&generic_for.body, max_local, synthetic_locals);
+        }
+        AstStmt::DoBlock(block) => {
+            collect_function_render_names_in_block(block, max_local, synthetic_locals);
+        }
+        AstStmt::FunctionDecl(function_decl) => {
+            collect_function_render_names_in_function_name(
+                &function_decl.target,
+                max_local,
+                synthetic_locals,
+            );
+        }
+        AstStmt::LocalFunctionDecl(local_function_decl) => {
+            collect_binding_ref(local_function_decl.name, max_local, synthetic_locals);
+        }
+        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => {}
+    }
+}
+
+fn collect_function_render_names_in_function_name(
+    target: &AstFunctionName,
+    max_local: &mut Option<usize>,
+    synthetic_locals: &mut BTreeSet<AstSyntheticLocalId>,
+) {
+    let path = match target {
+        AstFunctionName::Plain(path) => path,
+        AstFunctionName::Method(path, _) => path,
+    };
+    collect_name_ref(&path.root, max_local, synthetic_locals);
+}
+
+fn collect_function_render_names_in_call(
+    call: &AstCallKind,
+    max_local: &mut Option<usize>,
+    synthetic_locals: &mut BTreeSet<AstSyntheticLocalId>,
+) {
+    match call {
+        AstCallKind::Call(call) => {
+            collect_function_render_names_in_expr(&call.callee, max_local, synthetic_locals);
+            for arg in &call.args {
+                collect_function_render_names_in_expr(arg, max_local, synthetic_locals);
+            }
+        }
+        AstCallKind::MethodCall(call) => {
+            collect_function_render_names_in_expr(&call.receiver, max_local, synthetic_locals);
+            for arg in &call.args {
+                collect_function_render_names_in_expr(arg, max_local, synthetic_locals);
+            }
+        }
+    }
+}
+
+fn collect_function_render_names_in_lvalue(
+    target: &AstLValue,
+    max_local: &mut Option<usize>,
+    synthetic_locals: &mut BTreeSet<AstSyntheticLocalId>,
+) {
+    match target {
+        AstLValue::Name(name) => collect_name_ref(name, max_local, synthetic_locals),
+        AstLValue::FieldAccess(access) => {
+            collect_function_render_names_in_expr(&access.base, max_local, synthetic_locals);
+        }
+        AstLValue::IndexAccess(access) => {
+            collect_function_render_names_in_expr(&access.base, max_local, synthetic_locals);
+            collect_function_render_names_in_expr(&access.index, max_local, synthetic_locals);
+        }
+    }
+}
+
+fn collect_function_render_names_in_expr(
+    expr: &AstExpr,
+    max_local: &mut Option<usize>,
+    synthetic_locals: &mut BTreeSet<AstSyntheticLocalId>,
+) {
+    match expr {
+        AstExpr::Var(name) => collect_name_ref(name, max_local, synthetic_locals),
+        AstExpr::FieldAccess(access) => {
+            collect_function_render_names_in_expr(&access.base, max_local, synthetic_locals);
+        }
+        AstExpr::IndexAccess(access) => {
+            collect_function_render_names_in_expr(&access.base, max_local, synthetic_locals);
+            collect_function_render_names_in_expr(&access.index, max_local, synthetic_locals);
+        }
+        AstExpr::Unary(unary) => {
+            collect_function_render_names_in_expr(&unary.expr, max_local, synthetic_locals);
+        }
+        AstExpr::Binary(binary) => {
+            collect_function_render_names_in_expr(&binary.lhs, max_local, synthetic_locals);
+            collect_function_render_names_in_expr(&binary.rhs, max_local, synthetic_locals);
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            collect_function_render_names_in_expr(&logical.lhs, max_local, synthetic_locals);
+            collect_function_render_names_in_expr(&logical.rhs, max_local, synthetic_locals);
+        }
+        AstExpr::Call(call) => {
+            collect_function_render_names_in_expr(&call.callee, max_local, synthetic_locals);
+            for arg in &call.args {
+                collect_function_render_names_in_expr(arg, max_local, synthetic_locals);
+            }
+        }
+        AstExpr::MethodCall(call) => {
+            collect_function_render_names_in_expr(&call.receiver, max_local, synthetic_locals);
+            for arg in &call.args {
+                collect_function_render_names_in_expr(arg, max_local, synthetic_locals);
+            }
+        }
+        AstExpr::TableConstructor(table) => {
+            for field in &table.fields {
+                match field {
+                    AstTableField::Array(value) => {
+                        collect_function_render_names_in_expr(value, max_local, synthetic_locals);
+                    }
+                    AstTableField::Record(record) => {
+                        if let super::common::AstTableKey::Expr(key) = &record.key {
+                            collect_function_render_names_in_expr(key, max_local, synthetic_locals);
+                        }
+                        collect_function_render_names_in_expr(
+                            &record.value,
+                            max_local,
+                            synthetic_locals,
+                        );
+                    }
+                }
+            }
+        }
+        AstExpr::FunctionExpr(_) | AstExpr::Nil | AstExpr::Boolean(_) | AstExpr::Integer(_)
+        | AstExpr::Number(_) | AstExpr::String(_) | AstExpr::VarArg => {}
+    }
+}
+
+fn collect_name_ref(
+    name: &AstNameRef,
+    max_local: &mut Option<usize>,
+    synthetic_locals: &mut BTreeSet<AstSyntheticLocalId>,
+) {
+    match name {
+        AstNameRef::Local(local) => update_max_local(max_local, *local),
+        AstNameRef::SyntheticLocal(local) => {
+            synthetic_locals.insert(*local);
+        }
+        AstNameRef::Param(_)
+        | AstNameRef::Temp(_)
+        | AstNameRef::Upvalue(_)
+        | AstNameRef::Global(_) => {}
+    }
+}
+
+fn collect_binding_ref(
+    binding: AstBindingRef,
+    max_local: &mut Option<usize>,
+    synthetic_locals: &mut BTreeSet<AstSyntheticLocalId>,
+) {
+    match binding {
+        AstBindingRef::Local(local) => update_max_local(max_local, local),
+        AstBindingRef::SyntheticLocal(local) => {
+            synthetic_locals.insert(local);
+        }
+        AstBindingRef::Temp(_) => {}
+    }
+}
+
+fn update_max_local(max_local: &mut Option<usize>, local: LocalId) {
+    let index = local.index();
+    *max_local = Some(max_local.map_or(index, |current| current.max(index)));
 }
 
 fn format_unary_op(op: super::common::AstUnaryOpKind) -> &'static str {

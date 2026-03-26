@@ -5,6 +5,7 @@
 
 use std::fmt;
 
+use crate::naming::NamingOptions;
 use crate::parser::ParseOptions;
 use crate::readability::ReadabilityOptions;
 
@@ -60,6 +61,7 @@ pub struct DecompileOptions {
     pub target_stage: DecompileStage,
     pub debug: DebugOptions,
     pub readability: ReadabilityOptions,
+    pub naming: NamingOptions,
 }
 
 impl Default for DecompileOptions {
@@ -71,6 +73,7 @@ impl Default for DecompileOptions {
             target_stage: DecompileStage::Parse,
             debug: DebugOptions::default(),
             readability: ReadabilityOptions::default(),
+            naming: NamingOptions::default(),
         }
     }
 }

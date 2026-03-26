@@ -30,7 +30,7 @@ fn cleanup_block(block: &mut AstBlock) -> bool {
         let original_len = local_decl.bindings.len();
         local_decl.bindings.retain(|binding| match binding.id {
             AstBindingRef::Temp(temp) => temp_uses.get(&temp).copied().unwrap_or(0) > 0,
-            AstBindingRef::Local(_) => true,
+            AstBindingRef::Local(_) | AstBindingRef::SyntheticLocal(_) => true,
         });
         changed |= local_decl.bindings.len() != original_len;
     }

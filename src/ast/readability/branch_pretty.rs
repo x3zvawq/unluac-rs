@@ -255,6 +255,7 @@ mod tests {
     fn flips_negative_truthy_ternary_to_positive_polarity() {
         let param = ParamId(0);
         let mut module = AstModule {
+            entry_function: Default::default(),
             body: crate::ast::AstBlock {
                 stmts: vec![AstStmt::Return(Box::new(crate::ast::AstReturn {
                     values: vec![AstExpr::LogicalOr(Box::new(AstLogicalExpr {

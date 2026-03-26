@@ -7,6 +7,7 @@ use crate::ast;
 use crate::cfg;
 use crate::debug::{DebugDetail, DebugFilters};
 use crate::hir;
+use crate::naming;
 use crate::parser;
 use crate::structure;
 use crate::transformer;
@@ -160,6 +161,18 @@ pub fn dump_readability(
     })
 }
 
+/// 对外保留 Naming 阶段的统一包装。
+pub fn dump_naming(
+    names: &crate::naming::NameMap,
+    options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Ok(StageDebugOutput {
+        stage: DecompileStage::Naming,
+        detail: options.detail,
+        content: naming::dump_naming(names, options.detail, &options.filters, options.color),
+    })
+}
+
 pub(crate) fn collect_stage_dump(
     state: &DecompileState,
     stage: DecompileStage,
@@ -229,6 +242,12 @@ pub(crate) fn collect_stage_dump(
                 return Err(DecompileError::MissingStageOutput { stage });
             };
             dump_readability(ast_module, options).map(Some)
+        }
+        DecompileStage::Naming => {
+            let Some(names) = state.naming.as_ref() else {
+                return Err(DecompileError::MissingStageOutput { stage });
+            };
+            dump_naming(names, options).map(Some)
         }
         _ => Err(DecompileError::MissingStageOutput { stage }),
     }

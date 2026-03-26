@@ -254,14 +254,16 @@ fn try_lower_local_function_decl(local_decl: AstLocalDecl) -> AstStmt {
     if binding.attr != AstLocalAttr::None {
         return AstStmt::LocalDecl(Box::new(local_decl));
     }
-    let AstBindingRef::Local(name) = binding.id else {
-        return AstStmt::LocalDecl(Box::new(local_decl));
+    let name = match binding.id {
+        AstBindingRef::Local(name) => AstBindingRef::Local(name),
+        AstBindingRef::SyntheticLocal(name) => AstBindingRef::SyntheticLocal(name),
+        AstBindingRef::Temp(_) => return AstStmt::LocalDecl(Box::new(local_decl)),
     };
     let AstExpr::FunctionExpr(func) = &local_decl.values[0] else {
         return AstStmt::LocalDecl(Box::new(local_decl));
     };
     AstStmt::LocalFunctionDecl(Box::new(AstLocalFunctionDecl {
-        name: AstBindingRef::Local(name),
+        name,
         func: func.as_ref().clone(),
     }))
 }
@@ -378,6 +380,7 @@ fn name_path_from_expr(expr: &AstExpr) -> Option<(AstNameRef, Vec<String>)> {
         AstExpr::Var(
             name @ (AstNameRef::Param(_)
             | AstNameRef::Local(_)
+            | AstNameRef::SyntheticLocal(_)
             | AstNameRef::Upvalue(_)
             | AstNameRef::Global(_)),
         ) => Some((name.clone(), Vec::new())),
@@ -566,6 +569,9 @@ fn count_binding_value_uses_in_expr(expr: &AstExpr, binding: AstBindingRef) -> u
 fn name_matches_binding(name: &AstNameRef, binding: AstBindingRef) -> bool {
     match (name, binding) {
         (AstNameRef::Local(local), AstBindingRef::Local(binding_local)) => *local == binding_local,
+        (AstNameRef::SyntheticLocal(local), AstBindingRef::SyntheticLocal(binding_local)) => {
+            *local == binding_local
+        }
         (AstNameRef::Temp(temp), AstBindingRef::Temp(binding_temp)) => *temp == binding_temp,
         _ => false,
     }

@@ -15,8 +15,8 @@ pub use common::{
     AstGlobalDecl, AstGlobalName, AstGoto, AstIf, AstIndexAccess, AstLValue, AstLabel, AstLabelId,
     AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalFunctionDecl, AstLogicalExpr,
     AstMethodCallExpr, AstModule, AstNamePath, AstNameRef, AstNumericFor, AstRecordField,
-    AstRepeat, AstReturn, AstStmt, AstTableConstructor, AstTableField, AstTableKey,
-    AstTargetDialect, AstUnaryExpr, AstUnaryOpKind, AstWhile,
+    AstRepeat, AstReturn, AstStmt, AstSyntheticLocalId, AstTableConstructor, AstTableField,
+    AstTableKey, AstTargetDialect, AstUnaryExpr, AstUnaryOpKind, AstWhile,
 };
 pub use debug::{dump_ast, dump_readability};
 pub use error::AstLowerError;

@@ -685,6 +685,7 @@ fn is_context_safe_expr(expr: &AstExpr) -> bool {
         AstExpr::Var(
             AstNameRef::Param(_)
             | AstNameRef::Local(_)
+            | AstNameRef::SyntheticLocal(_)
             | AstNameRef::Temp(_)
             | AstNameRef::Upvalue(_),
         ) => true,
@@ -837,6 +838,7 @@ mod tests {
         let temp = TempId(0);
         let local = LocalId(0);
         let module = AstModule {
+            entry_function: Default::default(),
             body: crate::ast::AstBlock {
                 stmts: vec![
                     AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
@@ -882,6 +884,7 @@ mod tests {
         let lhs = LocalId(0);
         let rhs = LocalId(1);
         let mut module = AstModule {
+            entry_function: Default::default(),
             body: crate::ast::AstBlock {
                 stmts: vec![
                     AstStmt::Assign(Box::new(crate::ast::AstAssign {
@@ -926,6 +929,7 @@ mod tests {
         let lhs = LocalId(1);
         let rhs = LocalId(2);
         let mut module = AstModule {
+            entry_function: Default::default(),
             body: crate::ast::AstBlock {
                 stmts: vec![
                     AstStmt::Assign(Box::new(crate::ast::AstAssign {
@@ -979,6 +983,7 @@ mod tests {
     fn does_not_inline_expr_with_potential_runtime_behavior_changes() {
         let temp = TempId(0);
         let mut module = AstModule {
+            entry_function: Default::default(),
             body: crate::ast::AstBlock {
                 stmts: vec![
                     AstStmt::Assign(Box::new(crate::ast::AstAssign {
@@ -1018,6 +1023,7 @@ mod tests {
         let first = TempId(0);
         let second = TempId(1);
         let mut module = AstModule {
+            entry_function: Default::default(),
             body: crate::ast::AstBlock {
                 stmts: vec![
                     AstStmt::Assign(Box::new(crate::ast::AstAssign {
