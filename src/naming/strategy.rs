@@ -9,6 +9,7 @@ use crate::ast::AstSyntheticLocalId;
 use crate::hir::{HirProto, HirProtoRef, LocalId, ParamId, UpvalueId};
 
 use super::NamingError;
+use super::ast_facts::FunctionAstNamingFacts;
 use super::common::{
     CandidateHint, CapturedBinding, FunctionHints, FunctionNameMap, FunctionNamingEvidence,
     NameSource, NamingMode, NamingOptions,
@@ -80,10 +81,19 @@ pub(super) fn choose_local_candidate(
     index: usize,
     evidence: &FunctionNamingEvidence,
     hints: &FunctionHints,
+    ast_facts: &FunctionAstNamingFacts,
     options: NamingOptions,
 ) -> CandidateHint {
     if options.mode == NamingMode::DebugLike {
-        return mode_fallback_candidate(options, proto.id, "r", index, "value".to_owned());
+        let visible_count = ast_facts.debug_like_binding_order.len();
+        return mode_fallback_candidate(
+            options,
+            proto.id,
+            "r",
+            debug_like_binding_index(ast_facts, crate::ast::AstBindingRef::Local(local))
+                .unwrap_or(visible_count + index),
+            "value".to_owned(),
+        );
     }
     if let Some(name) = evidence
         .local_debug_names
@@ -153,16 +163,17 @@ pub(super) fn choose_synthetic_local_candidate(
     synthetic_order: usize,
     evidence: &FunctionNamingEvidence,
     hints: &FunctionHints,
+    ast_facts: &FunctionAstNamingFacts,
     options: NamingOptions,
 ) -> CandidateHint {
     if options.mode == NamingMode::DebugLike {
-        // synthetic local 在调试视角里本质上也是“当前函数里的额外局部槽位”，
-        // 因此这里让它们和普通 local 共享 `r` 前缀，并排在显式 local 之后连续编号。
+        let visible_count = ast_facts.debug_like_binding_order.len();
         return mode_fallback_candidate(
             options,
             proto.id,
             "r",
-            proto.locals.len() + synthetic_order,
+            debug_like_binding_index(ast_facts, crate::ast::AstBindingRef::SyntheticLocal(local))
+                .unwrap_or(visible_count + proto.locals.len() + synthetic_order),
             "value".to_owned(),
         );
     }
@@ -173,10 +184,23 @@ pub(super) fn choose_synthetic_local_candidate(
             source: NameSource::Debug,
         };
     }
+    if ast_facts.unused_synthetic_locals.contains(&local) {
+        return CandidateHint {
+            text: "_".to_owned(),
+            source: NameSource::Discard,
+        };
+    }
     if let Some(hint) = hints.synthetic_local_hints.get(&local) {
         return hint.clone();
     }
     mode_fallback_candidate(options, proto.id, "sl", index, "value".to_owned())
+}
+
+fn debug_like_binding_index(
+    ast_facts: &FunctionAstNamingFacts,
+    binding: crate::ast::AstBindingRef,
+) -> Option<usize> {
+    ast_facts.debug_like_binding_order.get(&binding).copied()
 }
 
 fn resolve_visible_binding_name(

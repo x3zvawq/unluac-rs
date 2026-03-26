@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use crate::hir::HirProto;
 
 use super::NamingError;
+use super::ast_facts::FunctionAstNamingFacts;
 use super::common::{
     CandidateHint, FunctionHints, FunctionNameMap, FunctionNamingEvidence, ModuleNameAllocator,
     NameInfo, NameSource, NamingMode, NamingOptions,
@@ -69,6 +70,7 @@ pub(super) fn assign_names_for_function(
     proto: &HirProto,
     evidence: &FunctionNamingEvidence,
     hints: &FunctionHints,
+    ast_facts: &FunctionAstNamingFacts,
     options: NamingOptions,
     lexical: &FunctionLexicalContext,
     assigned_functions: &[FunctionNameMap],
@@ -121,7 +123,9 @@ pub(super) fn assign_names_for_function(
         .map(|(index, local)| {
             allocate_name(
                 module_names.reserve_function_shape_name(
-                    choose_local_candidate(proto, *local, index, evidence, hints, options),
+                    choose_local_candidate(
+                        proto, *local, index, evidence, hints, ast_facts, options,
+                    ),
                     &used,
                     options.mode,
                 ),
@@ -159,6 +163,7 @@ pub(super) fn assign_names_for_function(
                         synthetic_order,
                         evidence,
                         hints,
+                        ast_facts,
                         options,
                     ),
                     &used,
@@ -220,6 +225,14 @@ fn next_available_simple_param_name(
 }
 
 fn allocate_name(candidate: CandidateHint, used: &mut BTreeSet<String>) -> NameInfo {
+    if candidate.source == NameSource::Discard {
+        return NameInfo {
+            text: candidate.text,
+            source: candidate.source,
+            renamed: false,
+        };
+    }
+
     let base = candidate.text;
     if !used.contains(&base) && !is_lua_keyword(&base) {
         used.insert(base.clone());

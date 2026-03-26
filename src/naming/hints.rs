@@ -443,6 +443,7 @@ fn hint_priority(source: NameSource) -> usize {
         NameSource::FieldName => 70,
         NameSource::TableShape | NameSource::BoolShape | NameSource::FunctionShape => 60,
         NameSource::ResultShape => 50,
+        NameSource::Discard => 20,
         NameSource::DebugLike | NameSource::Simple | NameSource::ConflictFallback => 10,
     }
 }

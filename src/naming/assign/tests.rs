@@ -185,7 +185,7 @@ fn debug_like_mode_uses_function_qualified_binding_ids() {
             named_vararg_table: false,
         },
         params: vec![ParamId(0), ParamId(1)],
-        locals: vec![LocalId(0)],
+        locals: vec![LocalId(0), LocalId(1), LocalId(2)],
         upvalues: Vec::new(),
         temps: vec![TempId(0)],
         temp_debug_locals: vec![None],
@@ -202,10 +202,17 @@ fn debug_like_mode_uses_function_qualified_binding_ids() {
             stmts: vec![
                 AstStmt::LocalDecl(Box::new(AstLocalDecl {
                     bindings: vec![AstLocalBinding {
-                        id: AstBindingRef::SyntheticLocal(AstSyntheticLocalId(TempId(0))),
+                        id: AstBindingRef::Local(LocalId(2)),
                         attr: AstLocalAttr::None,
                     }],
                     values: vec![AstExpr::Nil],
+                })),
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::SyntheticLocal(AstSyntheticLocalId(TempId(0))),
+                        attr: AstLocalAttr::None,
+                    }],
+                    values: vec![AstExpr::Var(crate::ast::AstNameRef::Local(LocalId(2)))],
                 })),
                 AstStmt::Return(Box::new(AstReturn {
                     values: vec![AstExpr::Var(crate::ast::AstNameRef::SyntheticLocal(
@@ -229,7 +236,9 @@ fn debug_like_mode_uses_function_qualified_binding_ids() {
 
     let function = names.function(HirProtoRef(0)).expect("function names");
     assert_eq!(function.params[0].text, "p0_0");
-    assert_eq!(function.locals[0].text, "r0_0");
+    assert_eq!(function.locals[0].text, "r0_2");
+    assert_eq!(function.locals[1].text, "r0_3");
+    assert_eq!(function.locals[2].text, "r0_0");
     assert_eq!(
         function
             .synthetic_locals
@@ -237,6 +246,81 @@ fn debug_like_mode_uses_function_qualified_binding_ids() {
             .expect("synthetic local names")
             .text,
         "r0_1"
+    );
+}
+
+#[test]
+fn simple_mode_uses_underscore_for_unused_synthetic_local() {
+    let proto = HirProto {
+        id: HirProtoRef(0),
+        source: None,
+        line_range: ProtoLineRange {
+            defined_start: 0,
+            defined_end: 0,
+        },
+        signature: ProtoSignature {
+            num_params: 0,
+            is_vararg: false,
+            has_vararg_param_reg: false,
+            named_vararg_table: false,
+        },
+        params: Vec::new(),
+        locals: Vec::new(),
+        upvalues: Vec::new(),
+        temps: vec![TempId(0), TempId(1)],
+        temp_debug_locals: vec![None, None],
+        body: HirBlock::default(),
+        children: Vec::new(),
+    };
+    let hir = HirModule {
+        entry: HirProtoRef(0),
+        protos: vec![proto],
+    };
+    let ast = AstModule {
+        entry_function: HirProtoRef(0),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![
+                        AstLocalBinding {
+                            id: AstBindingRef::SyntheticLocal(AstSyntheticLocalId(TempId(0))),
+                            attr: AstLocalAttr::None,
+                        },
+                        AstLocalBinding {
+                            id: AstBindingRef::SyntheticLocal(AstSyntheticLocalId(TempId(1))),
+                            attr: AstLocalAttr::None,
+                        },
+                    ],
+                    values: vec![AstExpr::Nil, AstExpr::Integer(1)],
+                })),
+                AstStmt::Return(Box::new(AstReturn {
+                    values: vec![AstExpr::Var(crate::ast::AstNameRef::SyntheticLocal(
+                        AstSyntheticLocalId(TempId(1)),
+                    ))],
+                })),
+            ],
+        },
+    };
+
+    let names = assign_names(&ast, &hir, &empty_raw_chunk(), NamingOptions::default())
+        .expect("naming should succeed");
+
+    let function = names.function(HirProtoRef(0)).expect("function names");
+    assert_eq!(
+        function
+            .synthetic_locals
+            .get(&AstSyntheticLocalId(TempId(0)))
+            .expect("unused synthetic local")
+            .text,
+        "_"
+    );
+    assert_eq!(
+        function
+            .synthetic_locals
+            .get(&AstSyntheticLocalId(TempId(1)))
+            .expect("used synthetic local")
+            .text,
+        "value"
     );
 }
 

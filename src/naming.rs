@@ -2,6 +2,7 @@
 
 mod allocate;
 mod assign;
+mod ast_facts;
 mod common;
 mod debug;
 mod error;

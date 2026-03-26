@@ -1075,17 +1075,17 @@ mod decompile_pipeline {
         assert!(
             generated
                 .source
-                .contains("local r0_1 = table.unpack or unpack"),
+                .contains("local r0_0 = table.unpack or unpack"),
             "{}",
             generated.source
         );
         assert!(
-            !generated.source.contains("local r0_0 = table.unpack"),
+            !generated.source.contains("local r0_1 = table.unpack"),
             "{}",
             generated.source
         );
         assert!(
-            generated.source.contains("return r1_1(r0_1(r1_0))"),
+            generated.source.contains("return r1_1(r0_0(r1_0))"),
             "{}",
             generated.source
         );
@@ -1176,6 +1176,60 @@ mod decompile_pipeline {
             "{}",
             generated.source
         );
+        assert!(
+            generated.source.contains("local _, "),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
+    fn coroutine_generate_debug_like_compacts_visible_binding_indices_without_gaps() {
+        let result = decompile(
+            &compile_lua_case("lua5.1", "tests/lua_cases/common/runtime/02_coroutine.lua"),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                naming: NamingOptions {
+                    mode: NamingMode::DebugLike,
+                    debug_like_include_function: true,
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("coroutine debug-like generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated.source.contains("local r0_0 = coroutine.create("),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("local r0_1, r0_2 = coroutine.resume(r0_0, 10)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("local r0_3, r0_4 = coroutine.resume(r0_0)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("local r0_5, r0_6 = coroutine.resume(r0_0)"),
+            "{}",
+            generated.source
+        );
+        assert!(!generated.source.contains("r0_11"), "{}", generated.source);
     }
 }
 

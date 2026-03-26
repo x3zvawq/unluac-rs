@@ -16,6 +16,7 @@ use crate::parser::RawChunk;
 
 use super::NamingError;
 use super::allocate::assign_names_for_function;
+use super::ast_facts::collect_ast_naming_facts;
 use super::common::{FunctionHints, ModuleNameAllocator, NameMap, NamingOptions};
 use super::evidence::build_naming_evidence;
 use super::hints::collect_function_hints;
@@ -30,6 +31,7 @@ pub fn assign_names(
     options: NamingOptions,
 ) -> Result<NameMap, NamingError> {
     let evidence = build_naming_evidence(raw, hir)?;
+    let ast_facts = collect_ast_naming_facts(module, hir);
     let lexical_contexts = collect_lexical_contexts(module, hir)?;
     validate_readability_ast(module, module.entry_function, hir)?;
 
@@ -43,6 +45,7 @@ pub fn assign_names(
             proto,
             &evidence.functions[proto.id.index()],
             &hints[proto.id.index()],
+            &ast_facts.functions[proto.id.index()],
             options,
             lexical_contexts
                 .function(proto.id)
