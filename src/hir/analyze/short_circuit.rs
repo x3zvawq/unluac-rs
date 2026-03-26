@@ -15,11 +15,11 @@ use crate::structure::{
     ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNode, ShortCircuitNodeRef,
     ShortCircuitTarget,
 };
-use crate::transformer::LowInstr;
+use crate::transformer::{BranchOperands, CondOperand, InstrRef, LowInstr, Reg};
 
 use super::exprs::{
-    expr_for_fixed_def, expr_for_reg_at_block_entry, expr_for_reg_use, lower_branch_subject,
-    lower_branch_subject_inline,
+    expr_for_dup_safe_fixed_def, expr_for_fixed_def, expr_for_reg_at_block_entry, expr_for_reg_use,
+    lower_branch_subject, lower_branch_subject_inline, lower_branch_subject_single_eval,
 };
 use super::{ProtoLowering, is_control_terminator};
 
@@ -50,21 +50,57 @@ pub(super) fn recover_value_phi_expr(
     recover_value_phi_expr_with_allowed_blocks(lowering, phi, &BTreeSet::new())
 }
 
+#[derive(Debug, Clone)]
+pub(super) enum ValueMergeExprRecovery {
+    Pure(HirExpr),
+    Impure(HirExpr),
+}
+
+impl ValueMergeExprRecovery {
+    fn into_expr(self) -> HirExpr {
+        match self {
+            Self::Pure(expr) | Self::Impure(expr) => expr,
+        }
+    }
+}
+
 pub(super) fn recover_value_phi_expr_with_allowed_blocks(
     lowering: &ProtoLowering<'_>,
     phi: &PhiCandidate,
     allowed_blocks: &BTreeSet<BlockRef>,
 ) -> Option<HirExpr> {
+    recover_value_phi_expr_recovery_with_allowed_blocks(lowering, phi, allowed_blocks)
+        .map(ValueMergeExprRecovery::into_expr)
+}
+
+pub(super) fn recover_value_phi_expr_recovery_with_allowed_blocks(
+    lowering: &ProtoLowering<'_>,
+    phi: &PhiCandidate,
+    allowed_blocks: &BTreeSet<BlockRef>,
+) -> Option<ValueMergeExprRecovery> {
     let short = lowering.structure.short_circuit_candidates.iter().find(|candidate| {
         candidate.reducible
             && candidate.result_reg == Some(phi.reg)
             && matches!(candidate.exit, ShortCircuitExit::ValueMerge(merge) if merge == phi.block)
     })?;
-    let decision = build_value_decision_expr(lowering, short, short.entry)?;
-    if decision_references_forbidden_candidate_temps(lowering, short, &decision, allowed_blocks) {
+    if let Some(decision) = build_value_decision_expr(lowering, short, short.entry)
+        && !decision_references_forbidden_candidate_temps(
+            lowering,
+            short,
+            &decision,
+            allowed_blocks,
+        )
+    {
+        return Some(ValueMergeExprRecovery::Pure(finalize_value_decision_expr(
+            decision,
+        )));
+    }
+
+    let expr = build_impure_value_merge_expr(lowering, short, short.entry)?;
+    if expr_references_forbidden_candidate_temps(lowering, short, &expr, allowed_blocks) {
         return None;
     }
-    Some(finalize_value_decision_expr(decision))
+    Some(ValueMergeExprRecovery::Impure(expr))
 }
 
 /// 条件型短路恢复入口。
@@ -600,6 +636,124 @@ pub(super) fn value_merge_skipped_blocks(short: &ShortCircuitCandidate) -> BTree
         .collect()
 }
 
+/// 当值短路已经把某个 branch header 的 subject 直接吸收到表达式里时，紧邻 branch 的
+/// subject-producing def 不应该再作为 prefix 语句单独物化，否则就会出现“先求值一次，
+/// 表达式里又再求值一次”的重复。
+///
+/// 这里刻意只吃当前 header 内、且没有被后续 prefix 指令再次读取的那批 def，避免把
+/// 还服务于其它前缀语句的中间值一起抹掉。
+pub(super) fn consumed_value_merge_subject_instrs(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+) -> BTreeSet<InstrRef> {
+    let range = lowering.cfg.blocks[block.index()].instrs;
+    let Some(branch_instr_ref) = range.last() else {
+        return BTreeSet::new();
+    };
+    let LowInstr::Branch(branch) = &lowering.proto.instrs[branch_instr_ref.index()] else {
+        return BTreeSet::new();
+    };
+
+    let mut candidate_defs = BTreeSet::new();
+    for reg in branch_cond_regs(branch.cond) {
+        collect_consumed_single_eval_defs(
+            lowering,
+            block,
+            branch_instr_ref,
+            reg,
+            &mut candidate_defs,
+        );
+    }
+
+    let candidate_instrs = candidate_defs
+        .iter()
+        .filter_map(|def_id| {
+            lowering
+                .dataflow
+                .defs
+                .get(def_id.index())
+                .map(|def| def.instr)
+        })
+        .collect::<BTreeSet<_>>();
+
+    candidate_defs
+        .into_iter()
+        .filter_map(|def_id| {
+            let def = lowering.dataflow.defs.get(def_id.index())?;
+            let effect = &lowering.dataflow.instr_effects[def.instr.index()];
+            let used_elsewhere = effect.fixed_must_defs.iter().any(|reg| {
+                ((def.instr.index() + 1)..branch_instr_ref.index()).any(|instr_index| {
+                    lowering.dataflow.instr_effects[instr_index]
+                        .fixed_uses
+                        .contains(reg)
+                        && !candidate_instrs.contains(&InstrRef(instr_index))
+                })
+            });
+            (!used_elsewhere).then_some(def.instr)
+        })
+        .collect()
+}
+
+fn collect_consumed_single_eval_defs(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    consumer_instr: InstrRef,
+    reg: Reg,
+    out: &mut BTreeSet<crate::cfg::DefId>,
+) {
+    let Some(values) = lowering.dataflow.use_values[consumer_instr.index()]
+        .fixed
+        .get(reg)
+    else {
+        return;
+    };
+    if values.len() != 1 {
+        return;
+    }
+    let Some(crate::cfg::SsaValue::Def(def_id)) = values.iter().next().copied() else {
+        return;
+    };
+    let Some(def) = lowering.dataflow.defs.get(def_id.index()) else {
+        return;
+    };
+    if def.block != block || !out.insert(def_id) {
+        return;
+    }
+
+    let recoverable = if consumer_instr == lowering.cfg.blocks[block.index()].instrs.last().unwrap()
+    {
+        expr_for_fixed_def(lowering, def_id).is_some()
+    } else {
+        expr_for_dup_safe_fixed_def(lowering, def_id).is_some()
+    };
+    if !recoverable {
+        out.remove(&def_id);
+        return;
+    }
+
+    let effect = &lowering.dataflow.instr_effects[def.instr.index()];
+    for used_reg in &effect.fixed_uses {
+        collect_consumed_single_eval_defs(lowering, block, def.instr, *used_reg, out);
+    }
+}
+
+fn branch_cond_regs(cond: crate::transformer::BranchCond) -> Vec<Reg> {
+    match cond.operands {
+        BranchOperands::Unary(operand) => cond_operand_reg(operand).into_iter().collect(),
+        BranchOperands::Binary(lhs, rhs) => cond_operand_reg(lhs)
+            .into_iter()
+            .chain(cond_operand_reg(rhs))
+            .collect(),
+    }
+}
+
+fn cond_operand_reg(operand: CondOperand) -> Option<Reg> {
+    match operand {
+        CondOperand::Reg(reg) => Some(reg),
+        CondOperand::Const(_) | CondOperand::Integer(_) | CondOperand::Number(_) => None,
+    }
+}
+
 fn build_branch_decision_expr(
     lowering: &ProtoLowering<'_>,
     short: &ShortCircuitCandidate,
@@ -673,6 +827,120 @@ fn build_value_decision_expr(
             ShortCircuitTarget::TruthyExit | ShortCircuitTarget::FalsyExit => None,
         },
     )
+}
+
+/// 纯 `Decision` 综合器会拒绝带副作用的 subject，但值短路里的 `call(...) and ...`
+/// 在 Lua 里本来就是合法且单次求值的。
+///
+/// 这里补的是一条更早层的、结构受限的恢复路径：只吃“共享 fallback 的 guarded
+/// disjunction”这一类值短路 DAG。它不会尝试做表达式空间搜索，也不会放宽成
+/// 可重复求值的 inline；目标只是把最常见的带副作用短路值恢复成源码级 `and/or`
+/// 形状，而不是让它们先掉成 `if` 壳。
+fn build_impure_value_merge_expr(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+    entry: ShortCircuitNodeRef,
+) -> Option<HirExpr> {
+    Some(build_impure_value_merge_plan(lowering, short, entry)?.into_expr())
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ImpureValueMergePlan {
+    Expr(HirExpr),
+    OrFallback { head: HirExpr, fallback: HirExpr },
+}
+
+impl ImpureValueMergePlan {
+    fn into_expr(self) -> HirExpr {
+        match self {
+            Self::Expr(expr) => expr,
+            Self::OrFallback { head, fallback } => {
+                HirExpr::LogicalOr(Box::new(crate::hir::common::HirLogicalExpr {
+                    lhs: head,
+                    rhs: fallback,
+                }))
+            }
+        }
+    }
+
+    fn as_expr(&self) -> HirExpr {
+        self.clone().into_expr()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ImpureValueMergeTarget {
+    Current,
+    Plan(ImpureValueMergePlan),
+}
+
+fn build_impure_value_merge_plan(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+    node_ref: ShortCircuitNodeRef,
+) -> Option<ImpureValueMergePlan> {
+    let node = short.nodes.get(node_ref.index())?;
+    let subject = lower_short_circuit_subject_single_eval(lowering, node.header)?;
+    let truthy = build_impure_value_merge_target(lowering, short, node.header, &node.truthy)?;
+    let falsy = build_impure_value_merge_target(lowering, short, node.header, &node.falsy)?;
+    combine_impure_value_merge_targets(subject, truthy, falsy)
+}
+
+fn build_impure_value_merge_target(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+    current_header: BlockRef,
+    target: &ShortCircuitTarget,
+) -> Option<ImpureValueMergeTarget> {
+    match target {
+        ShortCircuitTarget::Node(next_ref) => Some(ImpureValueMergeTarget::Plan(
+            build_impure_value_merge_plan(lowering, short, *next_ref)?,
+        )),
+        ShortCircuitTarget::Value(block) if *block == current_header => {
+            Some(ImpureValueMergeTarget::Current)
+        }
+        ShortCircuitTarget::Value(block) => Some(ImpureValueMergeTarget::Plan(
+            ImpureValueMergePlan::Expr(lower_value_leaf_expr(lowering, short, *block)?),
+        )),
+        ShortCircuitTarget::TruthyExit | ShortCircuitTarget::FalsyExit => None,
+    }
+}
+
+fn combine_impure_value_merge_targets(
+    subject: HirExpr,
+    truthy: ImpureValueMergeTarget,
+    falsy: ImpureValueMergeTarget,
+) -> Option<ImpureValueMergePlan> {
+    match (truthy, falsy) {
+        (ImpureValueMergeTarget::Current, ImpureValueMergeTarget::Current) => {
+            Some(ImpureValueMergePlan::Expr(subject))
+        }
+        (ImpureValueMergeTarget::Current, ImpureValueMergeTarget::Plan(fallback)) => {
+            Some(ImpureValueMergePlan::OrFallback {
+                head: subject,
+                fallback: fallback.into_expr(),
+            })
+        }
+        (ImpureValueMergeTarget::Plan(truthy), ImpureValueMergeTarget::Current) => {
+            Some(ImpureValueMergePlan::Expr(HirExpr::LogicalAnd(Box::new(
+                crate::hir::common::HirLogicalExpr {
+                    lhs: subject,
+                    rhs: truthy.into_expr(),
+                },
+            ))))
+        }
+        (
+            ImpureValueMergeTarget::Plan(ImpureValueMergePlan::OrFallback { head, fallback }),
+            ImpureValueMergeTarget::Plan(falsy),
+        ) if falsy.as_expr() == fallback => Some(ImpureValueMergePlan::OrFallback {
+            head: HirExpr::LogicalAnd(Box::new(crate::hir::common::HirLogicalExpr {
+                lhs: subject,
+                rhs: head,
+            })),
+            fallback,
+        }),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -832,6 +1100,23 @@ fn lower_short_circuit_subject_inline(
     ))
 }
 
+fn lower_short_circuit_subject_single_eval(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+) -> Option<HirExpr> {
+    let instr_ref = lowering.cfg.blocks[block.index()].instrs.last()?;
+    let LowInstr::Branch(branch) = &lowering.proto.instrs[instr_ref.index()] else {
+        return None;
+    };
+
+    Some(lower_branch_subject_single_eval(
+        lowering,
+        block,
+        instr_ref,
+        branch.cond,
+    ))
+}
+
 fn lower_value_leaf_expr(
     lowering: &ProtoLowering<'_>,
     short: &ShortCircuitCandidate,
@@ -894,7 +1179,31 @@ fn decision_references_forbidden_candidate_temps(
     decision: &HirDecisionExpr,
     allowed_blocks: &BTreeSet<BlockRef>,
 ) -> bool {
-    let forbidden = short
+    let forbidden = forbidden_candidate_temps(lowering, short, allowed_blocks);
+
+    decision.nodes.iter().any(|node| {
+        expr_references_any_temp(&node.test, &forbidden)
+            || decision_target_references_any_temp(&node.truthy, &forbidden)
+            || decision_target_references_any_temp(&node.falsy, &forbidden)
+    })
+}
+
+fn expr_references_forbidden_candidate_temps(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+    expr: &HirExpr,
+    allowed_blocks: &BTreeSet<BlockRef>,
+) -> bool {
+    let forbidden = forbidden_candidate_temps(lowering, short, allowed_blocks);
+    expr_references_any_temp(expr, &forbidden)
+}
+
+fn forbidden_candidate_temps(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+    allowed_blocks: &BTreeSet<BlockRef>,
+) -> BTreeSet<TempId> {
+    short
         .blocks
         .iter()
         .copied()
@@ -906,13 +1215,7 @@ fn decision_references_forbidden_candidate_temps(
                 .map(|def_id| lowering.bindings.fixed_temps[def_id.index()])
                 .collect::<Vec<_>>()
         })
-        .collect::<BTreeSet<_>>();
-
-    decision.nodes.iter().any(|node| {
-        expr_references_any_temp(&node.test, &forbidden)
-            || decision_target_references_any_temp(&node.truthy, &forbidden)
-            || decision_target_references_any_temp(&node.falsy, &forbidden)
-    })
+        .collect::<BTreeSet<_>>()
 }
 
 fn decision_target_references_any_temp(

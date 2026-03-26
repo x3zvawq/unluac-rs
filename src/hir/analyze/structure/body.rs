@@ -39,6 +39,7 @@ pub(super) struct StructuredBodyLowerer<'a, 'b> {
     pub(super) entry_overrides: BTreeMap<BlockRef, BTreeMap<Reg, HirExpr>>,
     pub(super) phi_overrides: BTreeMap<BlockRef, BTreeMap<PhiId, HirExpr>>,
     pub(super) suppressed_phis: BTreeSet<PhiId>,
+    pub(super) suppressed_instrs: BTreeSet<InstrRef>,
     pub(super) structured_close_points: BTreeSet<InstrRef>,
     pub(super) visited: BTreeSet<BlockRef>,
     pub(super) active_loops: Vec<ActiveLoopContext>,
@@ -119,6 +120,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             entry_overrides: BTreeMap::new(),
             phi_overrides: BTreeMap::new(),
             suppressed_phis: BTreeSet::new(),
+            suppressed_instrs: BTreeSet::new(),
             structured_close_points,
             visited: BTreeSet::new(),
             active_loops: Vec::new(),
@@ -302,6 +304,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         for instr_index in range.start.index()..end {
             let instr_ref = InstrRef(instr_index);
             let instr = &self.lowering.proto.instrs[instr_index];
+            if self.suppressed_instrs.contains(&instr_ref) {
+                continue;
+            }
             // `Close` 只在 low-IR 里显式出现；一旦结构层已经用 `scope_candidates` 证明
             // 这些 cleanup 点属于某个词法边界，HIR 就不该继续把它们暴露成伪语句。
             // 否则 while/repeat/if 已经结构化了，dump 里仍会残留“close from rX”的噪音，

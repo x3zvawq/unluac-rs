@@ -652,6 +652,39 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn short_circuit_side_effects_hir_restores_impure_value_short_circuit() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/15_short_circuit_side_effects.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("short_circuit_side_effects hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(
+            dump.contains(
+                "local [\"l2\"] = ((call(normal) l1(\"a\", p0) multiret=false and call(normal) l1(\"b\", p1) multiret=false) or (call(normal) l1(\"c\", true) multiret=false and call(normal) l1(\"d\", \"done\") multiret=false))"
+            ),
+            "{dump}"
+        );
+        assert!(!dump.contains("if l2"), "{dump}");
+        assert!(!dump.contains("local [\"l5\"] = -"), "{dump}");
+    }
+
+    #[test]
     fn short_circuit_side_effects_generate_inherits_parent_local_name_for_closure_upvalue() {
         let result = decompile(
             &compile_lua_case(
@@ -677,6 +710,39 @@ mod decompile_pipeline {
         );
         assert!(
             !generated.source.contains("up[#up + 1] = c"),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
+    fn short_circuit_side_effects_generate_restores_impure_short_circuit_expression() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/15_short_circuit_side_effects.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("short_circuit_side_effects generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated.source.contains(
+                "local ok = fn2(\"a\", a) and fn2(\"b\", b) or fn2(\"c\", true) and fn2(\"d\", \"done\")"
+            ),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("if result"),
             "{}",
             generated.source
         );

@@ -392,6 +392,39 @@ pub(super) fn lower_branch_subject_inline(
     }
 }
 
+/// 值型短路恢复需要的是“当前这一跳可以直接表达”的 subject，而不是“可任意复制”的值。
+///
+/// 例如 `mark("a", x)` 这种调用不能走 dup-safe inline，因为复制它会改变求值次数；
+/// 但当它正好就是当前短路节点那一次 truthiness test 时，仍然应该把它恢复成源码里的
+/// 操作数表达式，而不是先退回 temp，再被结构层保守地降成 `if` 壳。
+pub(super) fn lower_branch_subject_single_eval(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    cond: BranchCond,
+) -> HirExpr {
+    match cond.operands {
+        BranchOperands::Unary(operand) => match cond.predicate {
+            BranchPredicate::Truthy => {
+                lower_cond_operand_single_eval(lowering, block, instr_ref, operand)
+            }
+            _ => unresolved_expr("unsupported unary branch predicate"),
+        },
+        BranchOperands::Binary(lhs, rhs) => HirExpr::Binary(Box::new(HirBinaryExpr {
+            op: match cond.predicate {
+                BranchPredicate::Eq => HirBinaryOpKind::Eq,
+                BranchPredicate::Lt => HirBinaryOpKind::Lt,
+                BranchPredicate::Le => HirBinaryOpKind::Le,
+                BranchPredicate::Truthy => {
+                    return unresolved_expr("unsupported truthy binary branch");
+                }
+            },
+            lhs: lower_cond_operand_single_eval(lowering, block, instr_ref, lhs),
+            rhs: lower_cond_operand_single_eval(lowering, block, instr_ref, rhs),
+        })),
+    }
+}
+
 pub(super) fn lower_unary_op(op: UnaryOpKind) -> HirUnaryOpKind {
     match op {
         UnaryOpKind::Not => HirUnaryOpKind::Not,
@@ -485,6 +518,49 @@ pub(super) fn expr_for_fixed_def(lowering: &ProtoLowering<'_>, def_id: DefId) ->
         | LowInstr::Branch(_) => None,
         _ => None,
     }
+}
+
+/// `single-eval` 只承诺“这次求值可以直接表达出来”，并不承诺“可以重复复制很多次”。
+///
+/// 这条语义专门服务短路节点的单次 test：像 `call(...)` 这种不可复制但可单次出现的值，
+/// 在这里应该优先恢复成本体表达式，而不是先掉回 temp。
+fn expr_for_reg_use_single_eval(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    reg: Reg,
+) -> HirExpr {
+    if let Some(local) = loop_local_for_reg(lowering, block, reg) {
+        return HirExpr::LocalRef(local);
+    }
+    let Some(values) = lowering.dataflow.use_values[instr_ref.index()]
+        .fixed
+        .get(reg)
+    else {
+        return entry_reg_expr(lowering, reg);
+    };
+
+    if values.is_empty() {
+        return entry_reg_expr(lowering, reg);
+    }
+
+    if values.len() == 1 {
+        let value = values
+            .iter()
+            .next()
+            .expect("len checked above, exactly one SSA-like value exists");
+        return match value {
+            SsaValue::Def(def) => expr_for_fixed_def(lowering, *def)
+                .unwrap_or_else(|| HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()])),
+            SsaValue::Phi(phi) => HirExpr::TempRef(lowering.bindings.phi_temps[phi.index()]),
+        };
+    }
+
+    unresolved_expr(format!(
+        "multi-value use r{} @{}",
+        reg.index(),
+        instr_ref.index()
+    ))
 }
 
 /// 这类定义可以安全地在表达式里重复展开，不会额外增加副作用，也不会改变
@@ -770,6 +846,20 @@ fn lower_cond_operand_inline(
 ) -> HirExpr {
     match operand {
         CondOperand::Reg(reg) => expr_for_reg_use_inline(lowering, block, instr_ref, reg),
+        CondOperand::Const(const_ref) => expr_for_const(lowering.proto, const_ref),
+        CondOperand::Integer(value) => HirExpr::Integer(value),
+        CondOperand::Number(value) => HirExpr::Number(value.to_f64()),
+    }
+}
+
+fn lower_cond_operand_single_eval(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    operand: CondOperand,
+) -> HirExpr {
+    match operand {
+        CondOperand::Reg(reg) => expr_for_reg_use_single_eval(lowering, block, instr_ref, reg),
         CondOperand::Const(const_ref) => expr_for_const(lowering.proto, const_ref),
         CondOperand::Integer(value) => HirExpr::Integer(value),
         CondOperand::Number(value) => HirExpr::Number(value.to_f64()),

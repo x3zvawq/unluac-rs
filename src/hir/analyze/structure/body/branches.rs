@@ -194,7 +194,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .iter()
             .find(|phi| phi.block == merge && phi.reg == reg)?;
         let allowed_blocks = BTreeSet::from([block]);
-        let _ = recover_value_phi_expr_with_allowed_blocks(self.lowering, phi, &allowed_blocks)?;
+        let recovery = recover_value_phi_expr_recovery_with_allowed_blocks(
+            self.lowering,
+            phi,
+            &allowed_blocks,
+        )?;
 
         if let Some(stop) = stop
             && stop != merge
@@ -203,6 +207,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         }
 
+        if matches!(recovery, ValueMergeExprRecovery::Impure(_)) {
+            self.suppressed_instrs
+                .extend(consumed_value_merge_subject_instrs(self.lowering, block));
+        }
         stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
         self.visited.insert(block);
         self.visited.extend(value_merge_skipped_blocks(short));
