@@ -15,4 +15,33 @@ pub enum NamingError {
         "naming requires readability output without raw temp bindings, but proto#{function} still contains temp t{temp}"
     )]
     UnexpectedTemp { function: usize, temp: usize },
+    #[error(
+        "closure capture evidence mismatch: parent proto#{parent} captures {captures} values for child proto#{child}, but child declares {upvalues} upvalues"
+    )]
+    CaptureEvidenceMismatch {
+        parent: usize,
+        child: usize,
+        captures: usize,
+        upvalues: usize,
+    },
+    #[error(
+        "closure capture evidence is ambiguous: child proto#{child} was observed with incompatible capture sources"
+    )]
+    ConflictingCaptureEvidence { child: usize },
+    #[error(
+        "upvalue naming for proto#{function} needs parent proto#{parent}, but that function has not been assigned yet"
+    )]
+    MissingCaptureParent {
+        function: usize,
+        parent: usize,
+    },
+    #[error(
+        "upvalue naming for proto#{function} references missing {kind} {index} from parent proto#{parent}"
+    )]
+    MissingCapturedBinding {
+        function: usize,
+        parent: usize,
+        kind: &'static str,
+        index: usize,
+    },
 }

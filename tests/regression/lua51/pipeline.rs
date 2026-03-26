@@ -620,6 +620,29 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn short_circuit_side_effects_generate_inherits_parent_local_name_for_closure_upvalue() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/15_short_circuit_side_effects.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("short_circuit_side_effects generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(generated.source.contains("tbl[#tbl + 1] = a"), "{}", generated.source);
+        assert!(!generated.source.contains("up[#up + 1] = a"), "{}", generated.source);
+    }
+
+    #[test]
     fn all_supported_lua_cases_reach_clean_hir_exit() {
         let mut failures = Vec::new();
 
