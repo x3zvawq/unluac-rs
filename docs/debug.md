@@ -2,7 +2,7 @@
 
 这份文档说明当前仓库里几种调试入口分别做什么，以及遇到问题时该怎么用它们定位。
 
-## 三种入口
+## 四种入口
 
 ### 1. `cargo run`
 
@@ -88,28 +88,99 @@ lua/build/lua5.1/luac
 - 持续观察 parser dump 形状
 - 后续扩到 transformer/cfg 后持续看某一层输出
 
-## 3. `cargo test`
+## 3. `cargo unit-test`
 
-这是回归测试入口，不是开发期实时查看 dump 的入口。
+这是当前单元测试入口。
 
-当前测试目录约定：
+运行方式：
 
-- unit 测试放在 [tests/unit/lua51/parser.rs](/Users/x3zvawq/workspace/unluac-rs/tests/unit/lua51/parser.rs) 和 [tests/unit/lua51/transformer.rs](/Users/x3zvawq/workspace/unluac-rs/tests/unit/lua51/transformer.rs) 这类路径下
-- regression 测试放在 [tests/regression/lua51/pipeline.rs](/Users/x3zvawq/workspace/unluac-rs/tests/regression/lua51/pipeline.rs) 这类路径下
+```bash
+cargo unit-test
+```
 
-像 [tests/regression/lua51/pipeline.rs](/Users/x3zvawq/workspace/unluac-rs/tests/regression/lua51/pipeline.rs) 这样的测试，职责是锁定：
+等价入口：
 
-- 主 pipeline 的最小契约
-- 当前 parser / transformer dump 的基本形状
-- 未实现阶段是否明确报错
+```bash
+cargo lua test-unit
+```
 
-这里故意保留固定 chunk fixture，而不是动态调用 `luac`，原因是：
+最常用的命令：
 
-- 测试应该尽量稳定、自包含
-- 不希望因为外部工具链、二进制缺失或本地构建状态导致测试漂移
-- 开发期动态调试已经由 `examples/debug.rs` 负责
+```bash
+cargo unit-test --suite case-health
+cargo unit-test --suite decompile-pipeline-health
+cargo unit-test --dialect lua5.4
+cargo unit-test --case-filter generic_for
+cargo unit-test --case-filter control_flow --case-filter generic_for
+cargo unit-test --jobs 4
+UNLUAC_TEST_OUTPUT=verbose cargo unit-test
+```
+
+它的职责是对每一个被纳入支持范围的 `(case, dialect)` 做健康检查，重点确认：
+
+- 原始源码在对应 dialect 下可解释、可编译、可执行
+- 编译后的 chunk 可以成功反编译到最终源码
+- 反编译结果可以重新编译并执行
+- 反编译结果的 `(exit status, stdout, stderr)` 与原始源码一致
+
+当前支持的参数：
+
+- `--suite <all|case-health|decompile-pipeline-health>`
+- `--dialect <all|lua5.1|lua5.2|lua5.3|lua5.4|lua5.5>`
+- `--case-filter <substring>`，可重复传入，多次传入时按“任一匹配”处理
+- `--output <simple|verbose>`
+- `--timeout-seconds <n>`
+- `--progress <auto|on|off>`
+- `--color <auto|always|never>`
+- `--jobs <n>`
+
+当前支持的环境变量：
+
+- `UNLUAC_TEST_OUTPUT=simple|verbose`
+- `UNLUAC_TEST_PROGRESS=auto|on|off`
+- `UNLUAC_TEST_COLOR=auto|always|never`
+
+当前默认值：
+
+- `suite=all`
+- `dialect=all`
+- `output=simple`
+- `timeout-seconds=10`
+- `progress=auto`
+- `color=auto`
+- `jobs=1`
+
+当前实现里，单元测试内部有两个 suite：
+
+- `case-health`
+  只检查原始 case 在对应 dialect 下是否可解释、可编译、可执行，且源码直跑与编译后执行结果一致
+- `decompile-pipeline-health`
+  在 `case-health` 基线上继续检查反编译主流程能否生成可重新编译、可重新执行且语义等价的源码
+
+这个入口适合的场景：
+
+- 看当前支持范围内哪些 case 真正跑通了
+- 只跑某一个健康检查 suite
+- 用 `--case-filter` 聚焦某一组 case
+- 用 `--jobs` 并行跑大量 case
+- 用 `UNLUAC_TEST_OUTPUT=verbose` 查看失败细节
+
+## 4. `cargo test --test regression`
+
+这是当前回归测试入口。
+
+运行方式：
+
+```bash
+cargo test --test regression
+```
+
+回归测试主要放在 [tests/regression](/Users/x3zvawq/workspace/unluac-rs/tests/regression) 下，例如 [tests/regression/lua51/pipeline.rs](/Users/x3zvawq/workspace/unluac-rs/tests/regression/lua51/pipeline.rs)。
+
+它的职责是锁定已经修好的 bug、优化结果或语义决策，防止后续修改回退。这里允许断言中间层形状、特定 case 的结构恢复结果或某个明确错误语义。
 
 所以：
 
-- `cargo test` 负责“防回归”
+- `cargo unit-test` 负责“全量健康检查”
+- `cargo test --test regression` 负责“防回归”
 - `cargo run --example debug` 负责“高频排错”

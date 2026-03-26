@@ -12,8 +12,11 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+use unluac::decompile::{DecompileOptions, DecompileStage, decompile};
+
 #[allow(dead_code)]
 pub(crate) mod case_manifest;
+use case_manifest::{LuaCaseManifestEntry, case_health_cases, decompile_pipeline_health_cases};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct LuaCommandOutput {
@@ -35,6 +38,12 @@ impl LuaCommandOutput {
             render_bytes(&self.stderr)
         )
     }
+}
+
+pub(crate) fn repo_relative_display(path: &Path) -> String {
+    path.strip_prefix(repo_root())
+        .map(|relative| relative.display().to_string())
+        .unwrap_or_else(|_| sanitize_repo_paths(&path.display().to_string()))
 }
 
 const TEST_OUTPUT_ENV: &str = "UNLUAC_TEST_OUTPUT";
@@ -67,18 +76,73 @@ pub(crate) fn test_output_mode() -> TestOutputMode {
     })
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub(crate) enum FailureKind {
+    RunSourceFailed,
+    SourceExecutionFailed,
+    CompileSourceFailed,
+    SourceCompilationFailed,
+    RunCompiledChunkFailed,
+    CompiledChunkExecutionFailed,
+    SourceChunkOutputMismatch,
+    CaseHealthBaselineFailed,
+    UnsupportedDecompileDialect,
+    DecompileFailed,
+    GenerateWithoutSource,
+    WriteGeneratedSourceFailed,
+    CompileGeneratedSourceFailed,
+    GeneratedSourceCompilationFailed,
+    RunGeneratedChunkFailed,
+    GeneratedChunkExecutionFailed,
+    GeneratedOutputMismatch,
+}
+
+impl FailureKind {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::RunSourceFailed => "run-source-failed",
+            Self::SourceExecutionFailed => "source-execution-failed",
+            Self::CompileSourceFailed => "compile-source-failed",
+            Self::SourceCompilationFailed => "source-compilation-failed",
+            Self::RunCompiledChunkFailed => "run-compiled-chunk-failed",
+            Self::CompiledChunkExecutionFailed => "compiled-chunk-execution-failed",
+            Self::SourceChunkOutputMismatch => "source-chunk-output-mismatch",
+            Self::CaseHealthBaselineFailed => "case-health-baseline-failed",
+            Self::UnsupportedDecompileDialect => "unsupported-decompile-dialect",
+            Self::DecompileFailed => "decompile-failed",
+            Self::GenerateWithoutSource => "generate-without-source",
+            Self::WriteGeneratedSourceFailed => "write-generated-source-failed",
+            Self::CompileGeneratedSourceFailed => "compile-generated-source-failed",
+            Self::GeneratedSourceCompilationFailed => "generated-source-compilation-failed",
+            Self::RunGeneratedChunkFailed => "run-generated-chunk-failed",
+            Self::GeneratedChunkExecutionFailed => "generated-chunk-execution-failed",
+            Self::GeneratedOutputMismatch => "generated-output-mismatch",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct TestFailure {
+    kind: FailureKind,
     summary: String,
     detail: String,
 }
 
 impl TestFailure {
-    pub(crate) fn new(summary: impl Into<String>, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        kind: FailureKind,
+        summary: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
         Self {
+            kind,
             summary: summary.into(),
             detail: detail.into(),
         }
+    }
+
+    pub(crate) fn kind(&self) -> FailureKind {
+        self.kind
     }
 
     pub(crate) fn summary(&self) -> &str {
@@ -101,6 +165,69 @@ pub(crate) fn failure_separator() -> &'static str {
     match test_output_mode() {
         TestOutputMode::Simple => "\n",
         TestOutputMode::Verbose => "\n\n",
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum UnitSuite {
+    CaseHealth,
+    DecompilePipelineHealth,
+}
+
+impl UnitSuite {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::CaseHealth => "case-health",
+            Self::DecompilePipelineHealth => "decompile-pipeline-health",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "case-health" => Ok(Self::CaseHealth),
+            "decompile-pipeline-health" => Ok(Self::DecompilePipelineHealth),
+            _ => Err(format!(
+                "unknown unit suite: {value} (expected `case-health` or `decompile-pipeline-health`)"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct UnitCaseSpec {
+    pub(crate) suite: UnitSuite,
+    pub(crate) entry: LuaCaseManifestEntry,
+}
+
+pub(crate) fn unit_case_specs() -> Vec<UnitCaseSpec> {
+    case_health_cases()
+        .map(|entry| UnitCaseSpec {
+            suite: UnitSuite::CaseHealth,
+            entry,
+        })
+        .chain(decompile_pipeline_health_cases().map(|entry| UnitCaseSpec {
+            suite: UnitSuite::DecompilePipelineHealth,
+            entry,
+        }))
+        .collect()
+}
+
+pub(crate) fn find_unit_case_spec(
+    suite: UnitSuite,
+    dialect_label: &str,
+    path: &str,
+) -> Option<UnitCaseSpec> {
+    unit_case_specs().into_iter().find(|spec| {
+        spec.suite == suite
+            && spec.entry.dialect.luac_label() == dialect_label
+            && spec.entry.path == path
+    })
+}
+
+pub(crate) fn run_unit_case(spec: UnitCaseSpec) -> Result<(), TestFailure> {
+    match spec.suite {
+        UnitSuite::CaseHealth => run_case_health(&spec.entry),
+        UnitSuite::DecompilePipelineHealth => run_decompile_pipeline_health(&spec.entry),
     }
 }
 
@@ -172,14 +299,22 @@ pub(crate) fn build_case_health_baseline(
 ) -> Result<CaseHealthBaseline, TestFailure> {
     let dialect_label = entry.dialect.luac_label();
     let source_output = run_lua_case(dialect_label, entry.path).map_err(|error| {
-        TestFailure::new("run source failed", format!("run source failed: {error}"))
+        TestFailure::new(
+            FailureKind::RunSourceFailed,
+            "run source failed",
+            format!("run source failed: {error}"),
+        )
     })?;
     if !source_output.success() {
+        let reason = primary_command_reason(&source_output)
+            .map(|reason| format!(": {reason}"))
+            .unwrap_or_default();
         let summary = format!(
-            "source execution failed (status: {})",
+            "source execution failed{reason} (status: {})",
             render_status_code(source_output.status_code)
         );
         return Err(TestFailure::new(
+            FailureKind::SourceExecutionFailed,
             summary.clone(),
             format!("{summary}\n{}", source_output.render()),
         ));
@@ -194,17 +329,22 @@ pub(crate) fn build_case_health_baseline(
     )
     .map_err(|error| {
         TestFailure::new(
+            FailureKind::CompileSourceFailed,
             "compile source failed",
             format!("compile source failed: {error}"),
         )
     })?;
     if !compile_output.success() {
+        let reason = primary_command_reason(&compile_output)
+            .map(|reason| format!(": {reason}"))
+            .unwrap_or_default();
         let summary = format!(
-            "source compilation failed (artifact: {}, status: {})",
-            compiled_path.display(),
+            "source compilation failed{reason} (artifact: {}, status: {})",
+            repo_relative_display(&compiled_path),
             render_status_code(compile_output.status_code)
         );
         return Err(TestFailure::new(
+            FailureKind::SourceCompilationFailed,
             summary.clone(),
             format!("{summary}\n{}", compile_output.render()),
         ));
@@ -212,17 +352,22 @@ pub(crate) fn build_case_health_baseline(
 
     let chunk_output = run_lua_file(dialect_label, &compiled_path).map_err(|error| {
         TestFailure::new(
+            FailureKind::RunCompiledChunkFailed,
             "run compiled chunk failed",
             format!("run compiled chunk failed: {error}"),
         )
     })?;
     if !chunk_output.success() {
+        let reason = primary_command_reason(&chunk_output)
+            .map(|reason| format!(": {reason}"))
+            .unwrap_or_default();
         let summary = format!(
-            "compiled chunk execution failed (artifact: {}, status: {})",
-            compiled_path.display(),
+            "compiled chunk execution failed{reason} (artifact: {}, status: {})",
+            repo_relative_display(&compiled_path),
             render_status_code(chunk_output.status_code)
         );
         return Err(TestFailure::new(
+            FailureKind::CompiledChunkExecutionFailed,
             summary.clone(),
             format!("{summary}\n{}", chunk_output.render()),
         ));
@@ -233,15 +378,168 @@ pub(crate) fn build_case_health_baseline(
     {
         let summary = format!(
             "source/chunk output mismatch (artifact: {})",
-            compiled_path.display(),
+            repo_relative_display(&compiled_path),
         );
         return Err(TestFailure::new(
+            FailureKind::SourceChunkOutputMismatch,
             summary.clone(),
             format!("{summary}\n{diff}"),
         ));
     }
 
     Ok(CaseHealthBaseline { source_output })
+}
+
+pub(crate) fn run_case_health(entry: &LuaCaseManifestEntry) -> Result<(), TestFailure> {
+    build_case_health_baseline(entry, UnitSuite::CaseHealth.label()).map(|_| ())
+}
+
+pub(crate) fn run_decompile_pipeline_health(
+    entry: &LuaCaseManifestEntry,
+) -> Result<(), TestFailure> {
+    let dialect_label = entry.dialect.luac_label();
+    let baseline = build_case_health_baseline(entry, UnitSuite::DecompilePipelineHealth.label())
+        .map_err(|failure| {
+            TestFailure::new(
+                FailureKind::CaseHealthBaselineFailed,
+                format!("case-health baseline failed first: {}", failure.summary()),
+                format!("case-health baseline failed first\n{}", failure.detail()),
+            )
+        })?;
+    let dialect = entry.dialect.decompile_dialect().ok_or_else(|| {
+        TestFailure::new(
+            FailureKind::UnsupportedDecompileDialect,
+            "unsupported decompile dialect",
+            format!("unsupported decompile dialect for {}", entry.path),
+        )
+    })?;
+
+    let chunk = compile_lua_case(dialect_label, entry.path);
+    let result = decompile(
+        &chunk,
+        DecompileOptions {
+            dialect,
+            target_stage: DecompileStage::Generate,
+            debug: Default::default(),
+            ..DecompileOptions::default()
+        },
+    )
+    .map_err(|error| {
+        TestFailure::new(
+            FailureKind::DecompileFailed,
+            format!("decompile failed: {error}"),
+            format!("decompile failed: {error}"),
+        )
+    })?;
+
+    let generated = result.state.generated.as_ref().ok_or_else(|| {
+        TestFailure::new(
+            FailureKind::GenerateWithoutSource,
+            "generate stage finished without source",
+            format!("generate stage finished without source for {}", entry.path),
+        )
+    })?;
+    let generated_source_path = write_generated_case_source(
+        dialect_label,
+        UnitSuite::DecompilePipelineHealth.label(),
+        entry.path,
+        &generated.source,
+    )
+    .map_err(|error| {
+        TestFailure::new(
+            FailureKind::WriteGeneratedSourceFailed,
+            "write generated source failed",
+            format!("write generated source failed: {error}"),
+        )
+    })?;
+
+    let (generated_chunk_path, compile_output) = compile_generated_source_to_suite_artifact(
+        dialect_label,
+        entry.path,
+        UnitSuite::DecompilePipelineHealth.label(),
+        &generated_source_path,
+        true,
+    )
+    .map_err(|error| {
+        TestFailure::new(
+            FailureKind::CompileGeneratedSourceFailed,
+            "compile generated source failed",
+            format!("compile generated source failed: {error}"),
+        )
+    })?;
+    if !compile_output.success() {
+        let reason = primary_command_reason(&compile_output)
+            .map(|reason| format!(": {reason}"))
+            .unwrap_or_default();
+        let summary = format!(
+            "generated source compilation failed{reason} (status: {})",
+            compile_output.status_code.unwrap_or_default(),
+        );
+        return Err(TestFailure::new(
+            FailureKind::GeneratedSourceCompilationFailed,
+            summary.clone(),
+            format!(
+                "{summary}\nsource artifact: {}\nchunk artifact: {}\n{}\ngenerated source:\n{}",
+                repo_relative_display(&generated_source_path),
+                repo_relative_display(&generated_chunk_path),
+                compile_output.render(),
+                generated.source
+            ),
+        ));
+    }
+
+    let generated_output = run_lua_file(dialect_label, &generated_chunk_path).map_err(|error| {
+        TestFailure::new(
+            FailureKind::RunGeneratedChunkFailed,
+            "run generated chunk failed",
+            format!("run generated chunk failed: {error}"),
+        )
+    })?;
+    if !generated_output.success() {
+        let reason = primary_command_reason(&generated_output)
+            .map(|reason| format!(": {reason}"))
+            .unwrap_or_default();
+        let summary = format!(
+            "generated chunk execution failed{reason} (chunk artifact: {}, status: {})",
+            repo_relative_display(&generated_chunk_path),
+            generated_output.status_code.unwrap_or_default(),
+        );
+        return Err(TestFailure::new(
+            FailureKind::GeneratedChunkExecutionFailed,
+            summary.clone(),
+            format!(
+                "{summary}\nsource artifact: {}\nchunk artifact: {}\n{}\ngenerated source:\n{}",
+                repo_relative_display(&generated_source_path),
+                repo_relative_display(&generated_chunk_path),
+                generated_output.render(),
+                generated.source
+            ),
+        ));
+    }
+
+    if let Some(diff) = diff_command_outputs(
+        "expected-source",
+        &baseline.source_output,
+        "generated-chunk",
+        &generated_output,
+    ) {
+        let summary = format!(
+            "generated output mismatch (chunk artifact: {})",
+            repo_relative_display(&generated_chunk_path),
+        );
+        return Err(TestFailure::new(
+            FailureKind::GeneratedOutputMismatch,
+            summary.clone(),
+            format!(
+                "{summary}\nsource artifact: {}\nchunk artifact: {}\n{diff}\ngenerated source:\n{}",
+                repo_relative_display(&generated_source_path),
+                repo_relative_display(&generated_chunk_path),
+                generated.source
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 /// 使用 vendored 的 `luac` 把某个仓库内 Lua case 编译成测试 chunk。
@@ -394,6 +692,33 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+fn sanitize_repo_paths(text: &str) -> String {
+    let root = repo_root();
+    let root = root.to_string_lossy();
+    let root_with_separator = format!("{root}/");
+    text.replace(&root_with_separator, "")
+}
+
+fn primary_command_reason(output: &LuaCommandOutput) -> Option<String> {
+    [&output.stderr, &output.stdout]
+        .into_iter()
+        .find_map(|bytes| {
+            String::from_utf8_lossy(bytes)
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(sanitize_repo_paths)
+        })
+        .map(|line| {
+            line.rsplit(": ")
+                .next()
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+                .unwrap_or(line.as_str())
+                .to_owned()
+        })
+}
+
 fn lua_tool_path(dialect_label: &str, tool_name: &str) -> Result<PathBuf, String> {
     let tool = repo_root()
         .join("lua")
@@ -500,6 +825,6 @@ fn render_bytes(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         "<empty>".to_owned()
     } else {
-        String::from_utf8_lossy(bytes).into_owned()
+        sanitize_repo_paths(&String::from_utf8_lossy(bytes))
     }
 }

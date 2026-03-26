@@ -3,6 +3,10 @@ name = "unluac"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "unit_case_runner"
+path = "tests/support/unit_case_runner.rs"
+
 [lints]
 workspace = true
 
