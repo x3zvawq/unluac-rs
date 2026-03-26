@@ -2,6 +2,7 @@
 
 mod branch_pretty;
 mod cleanup;
+mod field_access_sugar;
 mod function_sugar;
 mod inline_exprs;
 mod materialize_temps;
@@ -50,6 +51,14 @@ const EXPR_INLINE_STAGE: ReadabilityStage = ReadabilityStage {
             apply: cleanup::apply,
         },
     ],
+};
+
+const ACCESS_SUGAR_STAGE: ReadabilityStage = ReadabilityStage {
+    name: "access-sugar",
+    passes: &[ReadabilityPass {
+        name: "field-access-sugar",
+        apply: field_access_sugar::apply,
+    }],
 };
 
 const STATEMENT_MERGE_STAGE: ReadabilityStage = ReadabilityStage {
@@ -107,6 +116,7 @@ const TEMP_MATERIALIZE_STAGE: ReadabilityStage = ReadabilityStage {
 const READABILITY_STAGES: &[ReadabilityStage] = &[
     STRUCTURAL_CLEANUP_STAGE,
     STATEMENT_MERGE_STAGE,
+    ACCESS_SUGAR_STAGE,
     CONTROL_FLOW_PRETTY_STAGE,
     EXPR_INLINE_STAGE,
     SHORT_CIRCUIT_PRETTY_STAGE,

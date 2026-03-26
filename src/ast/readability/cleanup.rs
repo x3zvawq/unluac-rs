@@ -10,10 +10,10 @@ use super::super::common::{
 use super::ReadabilityContext;
 
 pub(super) fn apply(module: &mut AstModule, _context: ReadabilityContext) -> bool {
-    cleanup_block(&mut module.body)
+    cleanup_block(&mut module.body, true)
 }
 
-fn cleanup_block(block: &mut AstBlock) -> bool {
+fn cleanup_block(block: &mut AstBlock, allow_trailing_empty_return_elision: bool) -> bool {
     let mut changed = false;
     for stmt in &mut block.stmts {
         changed |= cleanup_stmt(stmt);
@@ -42,40 +42,53 @@ fn cleanup_block(block: &mut AstBlock) -> bool {
         }
         _ => true,
     });
-    changed || block.stmts.len() != original_len
+    changed |= block.stmts.len() != original_len;
+
+    if allow_trailing_empty_return_elision
+        && matches!(
+            block.stmts.last(),
+            Some(AstStmt::Return(ret)) if ret.values.is_empty()
+        )
+    {
+        // 尾部无值 return 只是 VM 的函数/chunk 结束痕迹，不是值得保留到源码层的语句。
+        block.stmts.pop();
+        changed = true;
+    }
+
+    changed
 }
 
 fn cleanup_stmt(stmt: &mut AstStmt) -> bool {
     match stmt {
         AstStmt::If(if_stmt) => {
-            let mut changed = cleanup_block(&mut if_stmt.then_block);
+            let mut changed = cleanup_block(&mut if_stmt.then_block, false);
             if let Some(else_block) = &mut if_stmt.else_block {
-                changed |= cleanup_block(else_block);
+                changed |= cleanup_block(else_block, false);
             }
             cleanup_function_exprs_in_expr(&mut if_stmt.cond) || changed
         }
         AstStmt::While(while_stmt) => {
             cleanup_function_exprs_in_expr(&mut while_stmt.cond)
-                | cleanup_block(&mut while_stmt.body)
+                | cleanup_block(&mut while_stmt.body, false)
         }
         AstStmt::Repeat(repeat_stmt) => {
-            cleanup_block(&mut repeat_stmt.body)
+            cleanup_block(&mut repeat_stmt.body, false)
                 | cleanup_function_exprs_in_expr(&mut repeat_stmt.cond)
         }
         AstStmt::NumericFor(numeric_for) => {
             let mut changed = cleanup_function_exprs_in_expr(&mut numeric_for.start);
             changed |= cleanup_function_exprs_in_expr(&mut numeric_for.limit);
             changed |= cleanup_function_exprs_in_expr(&mut numeric_for.step);
-            changed | cleanup_block(&mut numeric_for.body)
+            changed | cleanup_block(&mut numeric_for.body, false)
         }
         AstStmt::GenericFor(generic_for) => {
             let mut changed = false;
             for expr in &mut generic_for.iterator {
                 changed |= cleanup_function_exprs_in_expr(expr);
             }
-            changed | cleanup_block(&mut generic_for.body)
+            changed | cleanup_block(&mut generic_for.body, false)
         }
-        AstStmt::DoBlock(block) => cleanup_block(block),
+        AstStmt::DoBlock(block) => cleanup_block(block, false),
         AstStmt::FunctionDecl(function_decl) => cleanup_function_expr(&mut function_decl.func),
         AstStmt::LocalFunctionDecl(local_function_decl) => {
             cleanup_function_expr(&mut local_function_decl.func)
@@ -117,7 +130,7 @@ fn cleanup_stmt(stmt: &mut AstStmt) -> bool {
 }
 
 fn cleanup_function_expr(function: &mut AstFunctionExpr) -> bool {
-    cleanup_block(&mut function.body)
+    cleanup_block(&mut function.body, true)
 }
 
 fn cleanup_function_exprs_in_call(call: &mut AstCallKind) -> bool {
@@ -381,5 +394,88 @@ fn collect_temp_uses_in_expr(expr: &AstExpr, uses: &mut BTreeMap<TempId, usize>)
         | AstExpr::String(_)
         | AstExpr::Var(_)
         | AstExpr::VarArg => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ast::{
+        AstBlock, AstExpr, AstFunctionExpr, AstIf, AstLocalFunctionDecl, AstModule, AstReturn,
+        AstStmt, AstTargetDialect,
+    };
+    use crate::hir::{LocalId, ParamId};
+
+    use super::{ReadabilityContext, apply};
+
+    #[test]
+    fn removes_trailing_empty_return_from_module_and_function_bodies() {
+        let local = LocalId(0);
+        let mut module = AstModule {
+            entry_function: Default::default(),
+            body: AstBlock {
+                stmts: vec![
+                    AstStmt::LocalFunctionDecl(Box::new(AstLocalFunctionDecl {
+                        name: crate::ast::AstBindingRef::Local(local),
+                        func: AstFunctionExpr {
+                            function: Default::default(),
+                            params: vec![ParamId(0)],
+                            is_vararg: false,
+                            body: AstBlock {
+                                stmts: vec![AstStmt::Return(Box::new(AstReturn {
+                                    values: vec![],
+                                }))],
+                            },
+                        },
+                    })),
+                    AstStmt::Return(Box::new(AstReturn { values: vec![] })),
+                ],
+            },
+        };
+
+        assert!(apply(
+            &mut module,
+            ReadabilityContext {
+                target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+                options: Default::default(),
+            }
+        ));
+
+        let AstStmt::LocalFunctionDecl(local_fn) = &module.body.stmts[0] else {
+            panic!("expected local function decl");
+        };
+        assert!(local_fn.func.body.stmts.is_empty(), "{module:#?}");
+        assert_eq!(module.body.stmts.len(), 1, "{module:#?}");
+    }
+
+    #[test]
+    fn keeps_empty_return_inside_nested_control_flow_blocks() {
+        let mut module = AstModule {
+            entry_function: Default::default(),
+            body: AstBlock {
+                stmts: vec![AstStmt::If(Box::new(AstIf {
+                    cond: AstExpr::Boolean(true),
+                    then_block: AstBlock {
+                        stmts: vec![AstStmt::Return(Box::new(AstReturn { values: vec![] }))],
+                    },
+                    else_block: None,
+                }))],
+            },
+        };
+
+        assert!(!apply(
+            &mut module,
+            ReadabilityContext {
+                target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+                options: Default::default(),
+            }
+        ));
+
+        let AstStmt::If(ast_if) = &module.body.stmts[0] else {
+            panic!("expected if statement");
+        };
+        assert!(matches!(
+            ast_if.then_block.stmts.as_slice(),
+            [AstStmt::Return(ret)] if ret.values.is_empty()
+        ));
     }
 }

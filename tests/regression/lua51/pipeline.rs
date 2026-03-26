@@ -749,6 +749,73 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn short_circuit_side_effects_generate_inlines_single_use_concat_alias() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/15_short_circuit_side_effects.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("short_circuit_side_effects generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated
+                .source
+                .contains("return ok, table.concat(tbl, \",\")"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local concat = table.concat"),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
+    fn short_circuit_side_effects_generate_omits_terminal_empty_chunk_return() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/15_short_circuit_side_effects.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("short_circuit_side_effects generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            !generated.source.trim_end().ends_with("return"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .trim_end()
+                .ends_with("print(\"short\", result2, value2)"),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
     fn all_supported_lua_cases_reach_clean_hir_exit() {
         let mut failures = Vec::new();
 

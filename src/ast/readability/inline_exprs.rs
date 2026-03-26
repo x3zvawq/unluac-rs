@@ -1,12 +1,11 @@
 //! 受阈值约束的保守表达式内联。
 //!
 //! 这里只处理非常窄的一类模式：
-//! - 单值 temp 赋值
+//! - 单值 temp / local 别名
 //! - 后续只使用一次
-//! - 使用点出现在 return / 调用参数 / 索引位
+//! - 使用点出现在 return / 调用参数 / 索引位 / 调用目标
 //! - 被内联表达式必须是我们能证明“纯且无元方法副作用”的安全子集
 
-use crate::hir::TempId;
 use crate::readability::ReadabilityOptions;
 
 use super::super::common::{
@@ -37,24 +36,24 @@ fn rewrite_block(block: &mut AstBlock, options: ReadabilityOptions) -> bool {
             continue;
         };
 
-        let Some((binding, value)) = inline_candidate(&old_stmts[index]) else {
+        let Some((candidate, value)) = inline_candidate(&old_stmts[index]) else {
             new_stmts.push(old_stmts[index].clone());
             index += 1;
             continue;
         };
-        if !is_inline_candidate_expr(value) {
+        if !candidate.allows_expr(value) {
             new_stmts.push(old_stmts[index].clone());
             index += 1;
             continue;
         }
-        if count_temp_uses_in_stmts(&old_stmts[(index + 1)..], binding) != 1 {
+        if count_binding_uses_in_stmts(&old_stmts[(index + 1)..], candidate.binding()) != 1 {
             new_stmts.push(old_stmts[index].clone());
             index += 1;
             continue;
         }
 
         let mut rewritten_next = next_stmt.clone();
-        if !rewrite_stmt_use_sites(&mut rewritten_next, binding, value, options) {
+        if !rewrite_stmt_use_sites(&mut rewritten_next, candidate, value, options) {
             new_stmts.push(old_stmts[index].clone());
             index += 1;
             continue;
@@ -72,30 +71,68 @@ fn rewrite_block(block: &mut AstBlock, options: ReadabilityOptions) -> bool {
 fn rewrite_nested(stmt: &mut AstStmt, options: ReadabilityOptions) -> bool {
     match stmt {
         AstStmt::If(if_stmt) => {
-            let mut changed = rewrite_block(&mut if_stmt.then_block, options);
+            let mut changed = rewrite_nested_functions_in_expr(&mut if_stmt.cond, options);
+            changed |= rewrite_block(&mut if_stmt.then_block, options);
             if let Some(else_block) = &mut if_stmt.else_block {
                 changed |= rewrite_block(else_block, options);
             }
             changed
         }
-        AstStmt::While(while_stmt) => rewrite_block(&mut while_stmt.body, options),
-        AstStmt::Repeat(repeat_stmt) => rewrite_block(&mut repeat_stmt.body, options),
-        AstStmt::NumericFor(numeric_for) => rewrite_block(&mut numeric_for.body, options),
-        AstStmt::GenericFor(generic_for) => rewrite_block(&mut generic_for.body, options),
+        AstStmt::While(while_stmt) => {
+            rewrite_nested_functions_in_expr(&mut while_stmt.cond, options)
+                | rewrite_block(&mut while_stmt.body, options)
+        }
+        AstStmt::Repeat(repeat_stmt) => {
+            rewrite_block(&mut repeat_stmt.body, options)
+                | rewrite_nested_functions_in_expr(&mut repeat_stmt.cond, options)
+        }
+        AstStmt::NumericFor(numeric_for) => {
+            let mut changed = rewrite_nested_functions_in_expr(&mut numeric_for.start, options);
+            changed |= rewrite_nested_functions_in_expr(&mut numeric_for.limit, options);
+            changed |= rewrite_nested_functions_in_expr(&mut numeric_for.step, options);
+            changed |= rewrite_block(&mut numeric_for.body, options);
+            changed
+        }
+        AstStmt::GenericFor(generic_for) => {
+            let mut changed = false;
+            for expr in &mut generic_for.iterator {
+                changed |= rewrite_nested_functions_in_expr(expr, options);
+            }
+            changed |= rewrite_block(&mut generic_for.body, options);
+            changed
+        }
         AstStmt::DoBlock(block) => rewrite_block(block, options),
         AstStmt::FunctionDecl(function_decl) => rewrite_function(&mut function_decl.func, options),
         AstStmt::LocalFunctionDecl(local_function_decl) => {
             rewrite_function(&mut local_function_decl.func, options)
         }
-        AstStmt::LocalDecl(_)
-        | AstStmt::GlobalDecl(_)
-        | AstStmt::Assign(_)
-        | AstStmt::CallStmt(_)
-        | AstStmt::Return(_)
-        | AstStmt::Break
-        | AstStmt::Continue
-        | AstStmt::Goto(_)
-        | AstStmt::Label(_) => false,
+        AstStmt::LocalDecl(local_decl) => {
+            local_decl.values.iter_mut().fold(false, |changed, expr| {
+                rewrite_nested_functions_in_expr(expr, options) | changed
+            })
+        }
+        AstStmt::GlobalDecl(global_decl) => {
+            global_decl.values.iter_mut().fold(false, |changed, expr| {
+                rewrite_nested_functions_in_expr(expr, options) | changed
+            })
+        }
+        AstStmt::Assign(assign) => {
+            let mut changed = false;
+            for target in &mut assign.targets {
+                changed |= rewrite_nested_functions_in_lvalue(target, options);
+            }
+            for value in &mut assign.values {
+                changed |= rewrite_nested_functions_in_expr(value, options);
+            }
+            changed
+        }
+        AstStmt::CallStmt(call_stmt) => {
+            rewrite_nested_functions_in_call(&mut call_stmt.call, options)
+        }
+        AstStmt::Return(ret) => ret.values.iter_mut().fold(false, |changed, expr| {
+            rewrite_nested_functions_in_expr(expr, options) | changed
+        }),
+        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => false,
     }
 }
 
@@ -103,7 +140,100 @@ fn rewrite_function(function: &mut AstFunctionExpr, options: ReadabilityOptions)
     rewrite_block(&mut function.body, options)
 }
 
-fn inline_candidate(stmt: &AstStmt) -> Option<(TempId, &AstExpr)> {
+fn rewrite_nested_functions_in_call(call: &mut AstCallKind, options: ReadabilityOptions) -> bool {
+    match call {
+        AstCallKind::Call(call) => {
+            let mut changed = rewrite_nested_functions_in_expr(&mut call.callee, options);
+            for arg in &mut call.args {
+                changed |= rewrite_nested_functions_in_expr(arg, options);
+            }
+            changed
+        }
+        AstCallKind::MethodCall(call) => {
+            let mut changed = rewrite_nested_functions_in_expr(&mut call.receiver, options);
+            for arg in &mut call.args {
+                changed |= rewrite_nested_functions_in_expr(arg, options);
+            }
+            changed
+        }
+    }
+}
+
+fn rewrite_nested_functions_in_lvalue(lvalue: &mut AstLValue, options: ReadabilityOptions) -> bool {
+    match lvalue {
+        AstLValue::Name(_) => false,
+        AstLValue::FieldAccess(access) => {
+            rewrite_nested_functions_in_expr(&mut access.base, options)
+        }
+        AstLValue::IndexAccess(access) => {
+            rewrite_nested_functions_in_expr(&mut access.base, options)
+                | rewrite_nested_functions_in_expr(&mut access.index, options)
+        }
+    }
+}
+
+fn rewrite_nested_functions_in_expr(expr: &mut AstExpr, options: ReadabilityOptions) -> bool {
+    match expr {
+        AstExpr::FieldAccess(access) => rewrite_nested_functions_in_expr(&mut access.base, options),
+        AstExpr::IndexAccess(access) => {
+            rewrite_nested_functions_in_expr(&mut access.base, options)
+                | rewrite_nested_functions_in_expr(&mut access.index, options)
+        }
+        AstExpr::Unary(unary) => rewrite_nested_functions_in_expr(&mut unary.expr, options),
+        AstExpr::Binary(binary) => {
+            rewrite_nested_functions_in_expr(&mut binary.lhs, options)
+                | rewrite_nested_functions_in_expr(&mut binary.rhs, options)
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            rewrite_nested_functions_in_expr(&mut logical.lhs, options)
+                | rewrite_nested_functions_in_expr(&mut logical.rhs, options)
+        }
+        AstExpr::Call(call) => {
+            let mut changed = rewrite_nested_functions_in_expr(&mut call.callee, options);
+            for arg in &mut call.args {
+                changed |= rewrite_nested_functions_in_expr(arg, options);
+            }
+            changed
+        }
+        AstExpr::MethodCall(call) => {
+            let mut changed = rewrite_nested_functions_in_expr(&mut call.receiver, options);
+            for arg in &mut call.args {
+                changed |= rewrite_nested_functions_in_expr(arg, options);
+            }
+            changed
+        }
+        AstExpr::TableConstructor(table) => {
+            let mut changed = false;
+            for field in &mut table.fields {
+                match field {
+                    AstTableField::Array(value) => {
+                        changed |= rewrite_nested_functions_in_expr(value, options);
+                    }
+                    AstTableField::Record(record) => {
+                        if let AstTableKey::Expr(key) = &mut record.key {
+                            changed |= rewrite_nested_functions_in_expr(key, options);
+                        }
+                        changed |= rewrite_nested_functions_in_expr(&mut record.value, options);
+                    }
+                }
+            }
+            changed
+        }
+        // 这里必须显式钻进函数表达式体：
+        // expr-inline 阶段早于 function-sugar，很多源码里的 `local function`
+        // 这时仍是 `local x = function() ... end`，如果不进这里，整个函数体都会错过内联。
+        AstExpr::FunctionExpr(function) => rewrite_function(function, options),
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Var(_)
+        | AstExpr::VarArg => false,
+    }
+}
+
+fn inline_candidate(stmt: &AstStmt) -> Option<(InlineCandidate, &AstExpr)> {
     match stmt {
         AstStmt::Assign(assign) => inline_candidate_from_assign(assign),
         AstStmt::LocalDecl(local_decl) => inline_candidate_from_local_decl(local_decl),
@@ -111,17 +241,19 @@ fn inline_candidate(stmt: &AstStmt) -> Option<(TempId, &AstExpr)> {
     }
 }
 
-fn inline_candidate_from_assign(assign: &AstAssign) -> Option<(TempId, &AstExpr)> {
+fn inline_candidate_from_assign(assign: &AstAssign) -> Option<(InlineCandidate, &AstExpr)> {
     let [AstLValue::Name(AstNameRef::Temp(temp))] = assign.targets.as_slice() else {
         return None;
     };
     let [value] = assign.values.as_slice() else {
         return None;
     };
-    Some((*temp, value))
+    Some((InlineCandidate::TempLike(AstBindingRef::Temp(*temp)), value))
 }
 
-fn inline_candidate_from_local_decl(local_decl: &AstLocalDecl) -> Option<(TempId, &AstExpr)> {
+fn inline_candidate_from_local_decl(
+    local_decl: &AstLocalDecl,
+) -> Option<(InlineCandidate, &AstExpr)> {
     let [binding] = local_decl.bindings.as_slice() else {
         return None;
     };
@@ -131,37 +263,40 @@ fn inline_candidate_from_local_decl(local_decl: &AstLocalDecl) -> Option<(TempId
     if binding.attr != AstLocalAttr::None {
         return None;
     }
-    let AstBindingRef::Temp(temp) = binding.id else {
-        return None;
+    let candidate = match binding.id {
+        AstBindingRef::Temp(_) => InlineCandidate::TempLike(binding.id),
+        AstBindingRef::Local(_) | AstBindingRef::SyntheticLocal(_) => {
+            InlineCandidate::LocalAlias(binding.id)
+        }
     };
-    Some((temp, value))
+    Some((candidate, value))
 }
 
 fn rewrite_stmt_use_sites(
     stmt: &mut AstStmt,
-    binding: TempId,
+    candidate: InlineCandidate,
     replacement: &AstExpr,
     options: ReadabilityOptions,
 ) -> bool {
     match stmt {
         AstStmt::LocalDecl(local_decl) => rewrite_expr_list_context(
             &mut local_decl.values,
-            binding,
+            candidate,
             replacement,
             InlineSite::Neutral,
             options,
         ),
         AstStmt::GlobalDecl(global_decl) => {
-            rewrite_global_decl_use_sites(global_decl, binding, replacement, options)
+            rewrite_global_decl_use_sites(global_decl, candidate, replacement, options)
         }
         AstStmt::Assign(assign) => {
             let mut changed = false;
             for target in &mut assign.targets {
-                changed |= rewrite_lvalue_use_sites(target, binding, replacement, options);
+                changed |= rewrite_lvalue_use_sites(target, candidate, replacement, options);
             }
             changed |= rewrite_expr_list_context(
                 &mut assign.values,
-                binding,
+                candidate,
                 replacement,
                 InlineSite::Neutral,
                 options,
@@ -169,32 +304,32 @@ fn rewrite_stmt_use_sites(
             changed
         }
         AstStmt::CallStmt(call_stmt) => {
-            rewrite_call_use_sites(&mut call_stmt.call, binding, replacement, options)
+            rewrite_call_use_sites(&mut call_stmt.call, candidate, replacement, options)
         }
         AstStmt::Return(ret) => rewrite_expr_list_context(
             &mut ret.values,
-            binding,
+            candidate,
             replacement,
             InlineSite::ReturnValue,
             options,
         ),
         AstStmt::If(if_stmt) => rewrite_expr_use_sites(
             &mut if_stmt.cond,
-            binding,
+            candidate,
             replacement,
             InlineSite::Neutral,
             options,
         ),
         AstStmt::While(while_stmt) => rewrite_expr_use_sites(
             &mut while_stmt.cond,
-            binding,
+            candidate,
             replacement,
             InlineSite::Neutral,
             options,
         ),
         AstStmt::Repeat(repeat_stmt) => rewrite_expr_use_sites(
             &mut repeat_stmt.cond,
-            binding,
+            candidate,
             replacement,
             InlineSite::Neutral,
             options,
@@ -202,21 +337,21 @@ fn rewrite_stmt_use_sites(
         AstStmt::NumericFor(numeric_for) => {
             let mut changed = rewrite_expr_use_sites(
                 &mut numeric_for.start,
-                binding,
+                candidate,
                 replacement,
                 InlineSite::Neutral,
                 options,
             );
             changed |= rewrite_expr_use_sites(
                 &mut numeric_for.limit,
-                binding,
+                candidate,
                 replacement,
                 InlineSite::Neutral,
                 options,
             );
             changed |= rewrite_expr_use_sites(
                 &mut numeric_for.step,
-                binding,
+                candidate,
                 replacement,
                 InlineSite::Neutral,
                 options,
@@ -225,7 +360,7 @@ fn rewrite_stmt_use_sites(
         }
         AstStmt::GenericFor(generic_for) => rewrite_expr_list_context(
             &mut generic_for.iterator,
-            binding,
+            candidate,
             replacement,
             InlineSite::Neutral,
             options,
@@ -242,13 +377,13 @@ fn rewrite_stmt_use_sites(
 
 fn rewrite_global_decl_use_sites(
     global_decl: &mut AstGlobalDecl,
-    binding: TempId,
+    candidate: InlineCandidate,
     replacement: &AstExpr,
     options: ReadabilityOptions,
 ) -> bool {
     rewrite_expr_list_context(
         &mut global_decl.values,
-        binding,
+        candidate,
         replacement,
         InlineSite::Neutral,
         options,
@@ -257,21 +392,21 @@ fn rewrite_global_decl_use_sites(
 
 fn rewrite_expr_list_context(
     exprs: &mut [AstExpr],
-    binding: TempId,
+    candidate: InlineCandidate,
     replacement: &AstExpr,
     site: InlineSite,
     options: ReadabilityOptions,
 ) -> bool {
     let mut changed = false;
     for expr in exprs {
-        changed |= rewrite_expr_use_sites(expr, binding, replacement, site, options);
+        changed |= rewrite_expr_use_sites(expr, candidate, replacement, site, options);
     }
     changed
 }
 
 fn rewrite_lvalue_use_sites(
     lvalue: &mut AstLValue,
-    binding: TempId,
+    candidate: InlineCandidate,
     replacement: &AstExpr,
     options: ReadabilityOptions,
 ) -> bool {
@@ -279,7 +414,7 @@ fn rewrite_lvalue_use_sites(
         AstLValue::Name(_) => false,
         AstLValue::FieldAccess(access) => rewrite_expr_use_sites(
             &mut access.base,
-            binding,
+            candidate,
             replacement,
             InlineSite::Neutral.descend_access_base(),
             options,
@@ -287,14 +422,14 @@ fn rewrite_lvalue_use_sites(
         AstLValue::IndexAccess(access) => {
             let mut changed = rewrite_expr_use_sites(
                 &mut access.base,
-                binding,
+                candidate,
                 replacement,
                 InlineSite::Neutral.descend_access_base(),
                 options,
             );
             changed |= rewrite_expr_use_sites(
                 &mut access.index,
-                binding,
+                candidate,
                 replacement,
                 InlineSite::Index,
                 options,
@@ -306,7 +441,7 @@ fn rewrite_lvalue_use_sites(
 
 fn rewrite_call_use_sites(
     call: &mut AstCallKind,
-    binding: TempId,
+    candidate: InlineCandidate,
     replacement: &AstExpr,
     options: ReadabilityOptions,
 ) -> bool {
@@ -314,14 +449,14 @@ fn rewrite_call_use_sites(
         AstCallKind::Call(call) => {
             let mut changed = rewrite_expr_use_sites(
                 &mut call.callee,
-                binding,
+                candidate,
                 replacement,
-                InlineSite::Neutral,
+                InlineSite::CallCallee,
                 options,
             );
             changed |= rewrite_expr_list_context(
                 &mut call.args,
-                binding,
+                candidate,
                 replacement,
                 InlineSite::CallArg,
                 options,
@@ -331,14 +466,14 @@ fn rewrite_call_use_sites(
         AstCallKind::MethodCall(call) => {
             let mut changed = rewrite_expr_use_sites(
                 &mut call.receiver,
-                binding,
+                candidate,
                 replacement,
                 InlineSite::Neutral,
                 options,
             );
             changed |= rewrite_expr_list_context(
                 &mut call.args,
-                binding,
+                candidate,
                 replacement,
                 InlineSite::CallArg,
                 options,
@@ -350,12 +485,12 @@ fn rewrite_call_use_sites(
 
 fn rewrite_expr_use_sites(
     expr: &mut AstExpr,
-    binding: TempId,
+    candidate: InlineCandidate,
     replacement: &AstExpr,
     site: InlineSite,
     options: ReadabilityOptions,
 ) -> bool {
-    if site.allows(binding, expr, replacement, options) {
+    if site.allows(candidate, expr, replacement, options) {
         *expr = replacement.clone();
         return true;
     }
@@ -363,7 +498,7 @@ fn rewrite_expr_use_sites(
     match expr {
         AstExpr::FieldAccess(access) => rewrite_expr_use_sites(
             &mut access.base,
-            binding,
+            candidate,
             replacement,
             site.descend_access_base(),
             options,
@@ -371,14 +506,14 @@ fn rewrite_expr_use_sites(
         AstExpr::IndexAccess(access) => {
             let mut changed = rewrite_expr_use_sites(
                 &mut access.base,
-                binding,
+                candidate,
                 replacement,
                 site.descend_access_base(),
                 options,
             );
             changed |= rewrite_expr_use_sites(
                 &mut access.index,
-                binding,
+                candidate,
                 replacement,
                 InlineSite::Index,
                 options,
@@ -387,7 +522,7 @@ fn rewrite_expr_use_sites(
         }
         AstExpr::Unary(unary) => rewrite_expr_use_sites(
             &mut unary.expr,
-            binding,
+            candidate,
             replacement,
             InlineSite::Neutral,
             options,
@@ -395,14 +530,14 @@ fn rewrite_expr_use_sites(
         AstExpr::Binary(binary) => {
             let mut changed = rewrite_expr_use_sites(
                 &mut binary.lhs,
-                binding,
+                candidate,
                 replacement,
                 InlineSite::Neutral,
                 options,
             );
             changed |= rewrite_expr_use_sites(
                 &mut binary.rhs,
-                binding,
+                candidate,
                 replacement,
                 InlineSite::Neutral,
                 options,
@@ -412,14 +547,14 @@ fn rewrite_expr_use_sites(
         AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
             let mut changed = rewrite_expr_use_sites(
                 &mut logical.lhs,
-                binding,
+                candidate,
                 replacement,
                 InlineSite::Neutral,
                 options,
             );
             changed |= rewrite_expr_use_sites(
                 &mut logical.rhs,
-                binding,
+                candidate,
                 replacement,
                 InlineSite::Neutral,
                 options,
@@ -429,14 +564,14 @@ fn rewrite_expr_use_sites(
         AstExpr::Call(call) => {
             let mut changed = rewrite_expr_use_sites(
                 &mut call.callee,
-                binding,
+                candidate,
                 replacement,
-                InlineSite::Neutral,
+                InlineSite::CallCallee,
                 options,
             );
             changed |= rewrite_expr_list_context(
                 &mut call.args,
-                binding,
+                candidate,
                 replacement,
                 InlineSite::CallArg,
                 options,
@@ -446,14 +581,14 @@ fn rewrite_expr_use_sites(
         AstExpr::MethodCall(call) => {
             let mut changed = rewrite_expr_use_sites(
                 &mut call.receiver,
-                binding,
+                candidate,
                 replacement,
                 InlineSite::Neutral,
                 options,
             );
             changed |= rewrite_expr_list_context(
                 &mut call.args,
-                binding,
+                candidate,
                 replacement,
                 InlineSite::CallArg,
                 options,
@@ -467,7 +602,7 @@ fn rewrite_expr_use_sites(
                     AstTableField::Array(value) => {
                         changed |= rewrite_expr_use_sites(
                             value,
-                            binding,
+                            candidate,
                             replacement,
                             InlineSite::Neutral,
                             options,
@@ -477,7 +612,7 @@ fn rewrite_expr_use_sites(
                         if let AstTableKey::Expr(key) = &mut record.key {
                             changed |= rewrite_expr_use_sites(
                                 key,
-                                binding,
+                                candidate,
                                 replacement,
                                 InlineSite::Index,
                                 options,
@@ -485,7 +620,7 @@ fn rewrite_expr_use_sites(
                         }
                         changed |= rewrite_expr_use_sites(
                             &mut record.value,
-                            binding,
+                            candidate,
                             replacement,
                             InlineSite::Neutral,
                             options,
@@ -506,161 +641,163 @@ fn rewrite_expr_use_sites(
     }
 }
 
-fn count_temp_uses_in_stmts(stmts: &[AstStmt], binding: TempId) -> usize {
+fn count_binding_uses_in_stmts(stmts: &[AstStmt], binding: AstBindingRef) -> usize {
     stmts
         .iter()
-        .map(|stmt| count_temp_uses_in_stmt(stmt, binding))
+        .map(|stmt| count_binding_uses_in_stmt(stmt, binding))
         .sum()
 }
 
-fn count_temp_uses_in_stmt(stmt: &AstStmt, binding: TempId) -> usize {
+fn count_binding_uses_in_stmt(stmt: &AstStmt, binding: AstBindingRef) -> usize {
     match stmt {
         AstStmt::LocalDecl(local_decl) => local_decl
             .values
             .iter()
-            .map(|value| count_temp_uses_in_expr(value, binding))
+            .map(|value| count_binding_uses_in_expr(value, binding))
             .sum(),
         AstStmt::GlobalDecl(global_decl) => global_decl
             .values
             .iter()
-            .map(|value| count_temp_uses_in_expr(value, binding))
+            .map(|value| count_binding_uses_in_expr(value, binding))
             .sum(),
         AstStmt::Assign(assign) => {
             assign
                 .targets
                 .iter()
-                .map(|target| count_temp_uses_in_lvalue(target, binding))
+                .map(|target| count_binding_uses_in_lvalue(target, binding))
                 .sum::<usize>()
                 + assign
                     .values
                     .iter()
-                    .map(|value| count_temp_uses_in_expr(value, binding))
+                    .map(|value| count_binding_uses_in_expr(value, binding))
                     .sum::<usize>()
         }
-        AstStmt::CallStmt(call_stmt) => count_temp_uses_in_call(&call_stmt.call, binding),
+        AstStmt::CallStmt(call_stmt) => count_binding_uses_in_call(&call_stmt.call, binding),
         AstStmt::Return(ret) => ret
             .values
             .iter()
-            .map(|value| count_temp_uses_in_expr(value, binding))
+            .map(|value| count_binding_uses_in_expr(value, binding))
             .sum(),
         AstStmt::If(if_stmt) => {
-            count_temp_uses_in_expr(&if_stmt.cond, binding)
-                + count_temp_uses_in_block(&if_stmt.then_block, binding)
+            count_binding_uses_in_expr(&if_stmt.cond, binding)
+                + count_binding_uses_in_block(&if_stmt.then_block, binding)
                 + if_stmt
                     .else_block
                     .as_ref()
-                    .map(|else_block| count_temp_uses_in_block(else_block, binding))
+                    .map(|else_block| count_binding_uses_in_block(else_block, binding))
                     .unwrap_or(0)
         }
         AstStmt::While(while_stmt) => {
-            count_temp_uses_in_expr(&while_stmt.cond, binding)
-                + count_temp_uses_in_block(&while_stmt.body, binding)
+            count_binding_uses_in_expr(&while_stmt.cond, binding)
+                + count_binding_uses_in_block(&while_stmt.body, binding)
         }
         AstStmt::Repeat(repeat_stmt) => {
-            count_temp_uses_in_block(&repeat_stmt.body, binding)
-                + count_temp_uses_in_expr(&repeat_stmt.cond, binding)
+            count_binding_uses_in_block(&repeat_stmt.body, binding)
+                + count_binding_uses_in_expr(&repeat_stmt.cond, binding)
         }
         AstStmt::NumericFor(numeric_for) => {
-            count_temp_uses_in_expr(&numeric_for.start, binding)
-                + count_temp_uses_in_expr(&numeric_for.limit, binding)
-                + count_temp_uses_in_expr(&numeric_for.step, binding)
-                + count_temp_uses_in_block(&numeric_for.body, binding)
+            count_binding_uses_in_expr(&numeric_for.start, binding)
+                + count_binding_uses_in_expr(&numeric_for.limit, binding)
+                + count_binding_uses_in_expr(&numeric_for.step, binding)
+                + count_binding_uses_in_block(&numeric_for.body, binding)
         }
         AstStmt::GenericFor(generic_for) => {
             generic_for
                 .iterator
                 .iter()
-                .map(|expr| count_temp_uses_in_expr(expr, binding))
+                .map(|expr| count_binding_uses_in_expr(expr, binding))
                 .sum::<usize>()
-                + count_temp_uses_in_block(&generic_for.body, binding)
+                + count_binding_uses_in_block(&generic_for.body, binding)
         }
-        AstStmt::DoBlock(block) => count_temp_uses_in_block(block, binding),
+        AstStmt::DoBlock(block) => count_binding_uses_in_block(block, binding),
         AstStmt::FunctionDecl(function_decl) => {
-            count_temp_uses_in_block(&function_decl.func.body, binding)
+            count_binding_uses_in_block(&function_decl.func.body, binding)
         }
         AstStmt::LocalFunctionDecl(local_function_decl) => {
-            count_temp_uses_in_block(&local_function_decl.func.body, binding)
+            count_binding_uses_in_block(&local_function_decl.func.body, binding)
         }
         AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => 0,
     }
 }
 
-fn count_temp_uses_in_block(block: &AstBlock, binding: TempId) -> usize {
+fn count_binding_uses_in_block(block: &AstBlock, binding: AstBindingRef) -> usize {
     block
         .stmts
         .iter()
-        .map(|stmt| count_temp_uses_in_stmt(stmt, binding))
+        .map(|stmt| count_binding_uses_in_stmt(stmt, binding))
         .sum()
 }
 
-fn count_temp_uses_in_call(call: &AstCallKind, binding: TempId) -> usize {
+fn count_binding_uses_in_call(call: &AstCallKind, binding: AstBindingRef) -> usize {
     match call {
         AstCallKind::Call(call) => {
-            count_temp_uses_in_expr(&call.callee, binding)
+            count_binding_uses_in_expr(&call.callee, binding)
                 + call
                     .args
                     .iter()
-                    .map(|arg| count_temp_uses_in_expr(arg, binding))
+                    .map(|arg| count_binding_uses_in_expr(arg, binding))
                     .sum::<usize>()
         }
         AstCallKind::MethodCall(call) => {
-            count_temp_uses_in_expr(&call.receiver, binding)
+            count_binding_uses_in_expr(&call.receiver, binding)
                 + call
                     .args
                     .iter()
-                    .map(|arg| count_temp_uses_in_expr(arg, binding))
+                    .map(|arg| count_binding_uses_in_expr(arg, binding))
                     .sum::<usize>()
         }
     }
 }
 
-fn count_temp_uses_in_lvalue(target: &AstLValue, binding: TempId) -> usize {
+fn count_binding_uses_in_lvalue(target: &AstLValue, binding: AstBindingRef) -> usize {
     match target {
         AstLValue::Name(_) => 0,
-        AstLValue::FieldAccess(access) => count_temp_uses_in_expr(&access.base, binding),
+        AstLValue::FieldAccess(access) => count_binding_uses_in_expr(&access.base, binding),
         AstLValue::IndexAccess(access) => {
-            count_temp_uses_in_expr(&access.base, binding)
-                + count_temp_uses_in_expr(&access.index, binding)
+            count_binding_uses_in_expr(&access.base, binding)
+                + count_binding_uses_in_expr(&access.index, binding)
         }
     }
 }
 
-fn count_temp_uses_in_expr(expr: &AstExpr, binding: TempId) -> usize {
+fn count_binding_uses_in_expr(expr: &AstExpr, binding: AstBindingRef) -> usize {
     match expr {
-        AstExpr::Var(AstNameRef::Temp(temp)) if *temp == binding => 1,
-        AstExpr::FieldAccess(access) => count_temp_uses_in_expr(&access.base, binding),
+        AstExpr::Var(name) if name_matches_binding(name, binding) => 1,
+        AstExpr::FieldAccess(access) => count_binding_uses_in_expr(&access.base, binding),
         AstExpr::IndexAccess(access) => {
-            count_temp_uses_in_expr(&access.base, binding)
-                + count_temp_uses_in_expr(&access.index, binding)
+            count_binding_uses_in_expr(&access.base, binding)
+                + count_binding_uses_in_expr(&access.index, binding)
         }
-        AstExpr::Unary(unary) => count_temp_uses_in_expr(&unary.expr, binding),
+        AstExpr::Unary(unary) => count_binding_uses_in_expr(&unary.expr, binding),
         AstExpr::Binary(binary) => {
-            count_temp_uses_in_expr(&binary.lhs, binding)
-                + count_temp_uses_in_expr(&binary.rhs, binding)
+            count_binding_uses_in_expr(&binary.lhs, binding)
+                + count_binding_uses_in_expr(&binary.rhs, binding)
         }
         AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            count_temp_uses_in_expr(&logical.lhs, binding)
-                + count_temp_uses_in_expr(&logical.rhs, binding)
+            count_binding_uses_in_expr(&logical.lhs, binding)
+                + count_binding_uses_in_expr(&logical.rhs, binding)
         }
-        AstExpr::Call(call) => count_temp_uses_in_call(&AstCallKind::Call(call.clone()), binding),
+        AstExpr::Call(call) => {
+            count_binding_uses_in_call(&AstCallKind::Call(call.clone()), binding)
+        }
         AstExpr::MethodCall(call) => {
-            count_temp_uses_in_call(&AstCallKind::MethodCall(call.clone()), binding)
+            count_binding_uses_in_call(&AstCallKind::MethodCall(call.clone()), binding)
         }
         AstExpr::TableConstructor(table) => table
             .fields
             .iter()
             .map(|field| match field {
-                AstTableField::Array(value) => count_temp_uses_in_expr(value, binding),
+                AstTableField::Array(value) => count_binding_uses_in_expr(value, binding),
                 AstTableField::Record(record) => {
                     let key_count = match &record.key {
                         AstTableKey::Name(_) => 0,
-                        AstTableKey::Expr(key) => count_temp_uses_in_expr(key, binding),
+                        AstTableKey::Expr(key) => count_binding_uses_in_expr(key, binding),
                     };
-                    key_count + count_temp_uses_in_expr(&record.value, binding)
+                    key_count + count_binding_uses_in_expr(&record.value, binding)
                 }
             })
             .sum(),
-        AstExpr::FunctionExpr(function) => count_temp_uses_in_block(&function.body, binding),
+        AstExpr::FunctionExpr(function) => count_binding_uses_in_block(&function.body, binding),
         AstExpr::Nil
         | AstExpr::Boolean(_)
         | AstExpr::Integer(_)
@@ -777,27 +914,58 @@ fn expr_complexity(expr: &AstExpr) -> usize {
 }
 
 #[derive(Clone, Copy)]
+enum InlineCandidate {
+    TempLike(AstBindingRef),
+    LocalAlias(AstBindingRef),
+}
+
+impl InlineCandidate {
+    fn binding(self) -> AstBindingRef {
+        match self {
+            Self::TempLike(binding) | Self::LocalAlias(binding) => binding,
+        }
+    }
+
+    fn allows_expr(self, expr: &AstExpr) -> bool {
+        match self {
+            Self::TempLike(_) => is_inline_candidate_expr(expr),
+            // 这里故意不把普通 local 别名放宽到所有上下文：
+            // 没有 debug 证据时，我们不能把用户可能主动写出来的局部语义名随手吞掉。
+            // 目前只允许它们作为“前缀表达式别名”收回去，例如 `local concat = table.concat`。
+            Self::LocalAlias(_) => is_access_base_inline_expr(expr),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 enum InlineSite {
     Neutral,
     ReturnValue,
     Index,
     CallArg,
+    CallCallee,
     AccessBase,
 }
 
 impl InlineSite {
     fn allows(
         self,
-        binding: TempId,
+        candidate: InlineCandidate,
         use_expr: &AstExpr,
         replacement: &AstExpr,
         options: ReadabilityOptions,
     ) -> bool {
-        matches!(use_expr, AstExpr::Var(AstNameRef::Temp(temp)) if *temp == binding)
+        if matches!(candidate, InlineCandidate::LocalAlias(_))
+            && !matches!(self, Self::CallCallee | Self::AccessBase)
+        {
+            return false;
+        }
+        matches!(use_expr, AstExpr::Var(name) if name_matches_binding(name, candidate.binding()))
             && self
                 .complexity_limit(options)
                 .is_some_and(|limit| expr_complexity(replacement) <= limit)
-            && (!matches!(self, Self::AccessBase) || is_access_base_inline_expr(replacement))
+            && (!matches!(self, Self::AccessBase | Self::CallCallee)
+                || is_access_base_inline_expr(replacement))
     }
 
     fn complexity_limit(self, options: ReadabilityOptions) -> Option<usize> {
@@ -806,6 +974,10 @@ impl InlineSite {
             Self::ReturnValue => Some(options.return_inline_max_complexity),
             Self::Index => Some(options.index_inline_max_complexity),
             Self::CallArg => Some(options.args_inline_max_complexity),
+            // 这里刻意复用 access-base 的阈值：
+            // `table.concat(tbl)` 这类“把别名还原回前缀表达式”的可读性取舍，
+            // 本质上和 `obj[key]` 里的 base 折叠是同一种源码形状决策。
+            Self::CallCallee => Some(options.access_base_inline_max_complexity),
             Self::AccessBase => Some(options.access_base_inline_max_complexity),
         }
     }
@@ -813,15 +985,31 @@ impl InlineSite {
     fn descend_access_base(self) -> Self {
         match self {
             Self::Neutral => Self::AccessBase,
-            Self::ReturnValue | Self::Index | Self::CallArg | Self::AccessBase => Self::Neutral,
+            Self::ReturnValue
+            | Self::Index
+            | Self::CallArg
+            | Self::CallCallee
+            | Self::AccessBase => Self::Neutral,
         }
+    }
+}
+
+fn name_matches_binding(name: &AstNameRef, binding: AstBindingRef) -> bool {
+    match (binding, name) {
+        (AstBindingRef::Local(local), AstNameRef::Local(name_local)) => local == *name_local,
+        (AstBindingRef::Temp(temp), AstNameRef::Temp(name_temp)) => temp == *name_temp,
+        (AstBindingRef::SyntheticLocal(local), AstNameRef::SyntheticLocal(name_local)) => {
+            local == *name_local
+        }
+        _ => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::ast::common::{
-        AstCallExpr, AstFieldAccess, AstIndexAccess, AstLocalBinding, AstMethodCallExpr, AstReturn,
+        AstCallExpr, AstFieldAccess, AstGlobalName, AstIndexAccess, AstLocalBinding,
+        AstMethodCallExpr, AstReturn,
     };
     use crate::ast::{
         AstBinaryExpr, AstBinaryOpKind, AstCallKind, AstExpr, AstLValue, AstLocalAttr, AstModule,
@@ -1081,5 +1269,235 @@ mod tests {
                 })),
             ]
         );
+    }
+
+    #[test]
+    fn inlines_single_use_local_alias_into_call_callee_with_access_base_threshold() {
+        let alias = LocalId(0);
+        let table_arg = LocalId(1);
+        let mut module = AstModule {
+            entry_function: Default::default(),
+            body: crate::ast::AstBlock {
+                stmts: vec![
+                    AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                        bindings: vec![AstLocalBinding {
+                            id: crate::ast::AstBindingRef::Local(alias),
+                            attr: AstLocalAttr::None,
+                        }],
+                        values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                            base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                                text: "table".to_owned(),
+                            })),
+                            field: "concat".to_owned(),
+                        }))],
+                    })),
+                    AstStmt::Return(Box::new(AstReturn {
+                        values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                            callee: AstExpr::Var(AstNameRef::Local(alias)),
+                            args: vec![
+                                AstExpr::Var(AstNameRef::Local(table_arg)),
+                                AstExpr::String(",".to_owned()),
+                            ],
+                        }))],
+                    })),
+                ],
+            },
+        };
+
+        assert!(apply(
+            &mut module,
+            ReadabilityContext {
+                target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+                options: ReadabilityOptions {
+                    access_base_inline_max_complexity: 5,
+                    ..ReadabilityOptions::default()
+                },
+            }
+        ));
+        assert_eq!(
+            module.body.stmts,
+            vec![AstStmt::Return(Box::new(AstReturn {
+                values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                    callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "table".to_owned(),
+                        })),
+                        field: "concat".to_owned(),
+                    })),
+                    args: vec![
+                        AstExpr::Var(AstNameRef::Local(table_arg)),
+                        AstExpr::String(",".to_owned()),
+                    ],
+                }))],
+            }))]
+        );
+    }
+
+    #[test]
+    fn does_not_inline_local_alias_into_plain_return_value() {
+        let alias = LocalId(0);
+        let mut module = AstModule {
+            entry_function: Default::default(),
+            body: crate::ast::AstBlock {
+                stmts: vec![
+                    AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                        bindings: vec![AstLocalBinding {
+                            id: crate::ast::AstBindingRef::Local(alias),
+                            attr: AstLocalAttr::None,
+                        }],
+                        values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                            base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                                text: "table".to_owned(),
+                            })),
+                            field: "concat".to_owned(),
+                        }))],
+                    })),
+                    AstStmt::Return(Box::new(AstReturn {
+                        values: vec![AstExpr::Var(AstNameRef::Local(alias))],
+                    })),
+                ],
+            },
+        };
+
+        assert!(!apply(
+            &mut module,
+            ReadabilityContext {
+                target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+                options: ReadabilityOptions {
+                    access_base_inline_max_complexity: 5,
+                    return_inline_max_complexity: usize::MAX,
+                    ..ReadabilityOptions::default()
+                },
+            }
+        ));
+    }
+
+    #[test]
+    fn inlines_local_alias_inside_function_body_after_other_locals() {
+        let func = crate::hir::HirProtoRef(1);
+        let table_local = LocalId(0);
+        let helper = LocalId(1);
+        let ok = LocalId(2);
+        let concat = LocalId(3);
+        let mut module = AstModule {
+            entry_function: Default::default(),
+            body: crate::ast::AstBlock {
+                stmts: vec![AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(LocalId(10)),
+                        attr: AstLocalAttr::None,
+                    }],
+                    values: vec![AstExpr::FunctionExpr(Box::new(
+                        crate::ast::AstFunctionExpr {
+                            function: func,
+                            params: vec![crate::hir::ParamId(0), crate::hir::ParamId(1)],
+                            is_vararg: false,
+                            body: crate::ast::AstBlock {
+                                stmts: vec![
+                                    AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                                        bindings: vec![AstLocalBinding {
+                                            id: crate::ast::AstBindingRef::Local(table_local),
+                                            attr: AstLocalAttr::None,
+                                        }],
+                                        values: vec![AstExpr::TableConstructor(Box::new(
+                                            crate::ast::AstTableConstructor { fields: vec![] },
+                                        ))],
+                                    })),
+                                    AstStmt::LocalFunctionDecl(Box::new(
+                                        crate::ast::AstLocalFunctionDecl {
+                                            name: crate::ast::AstBindingRef::Local(helper),
+                                            func: crate::ast::AstFunctionExpr {
+                                                function: crate::hir::HirProtoRef(2),
+                                                params: vec![
+                                                    crate::hir::ParamId(0),
+                                                    crate::hir::ParamId(1),
+                                                ],
+                                                is_vararg: false,
+                                                body: crate::ast::AstBlock {
+                                                    stmts: vec![AstStmt::Return(Box::new(
+                                                        AstReturn {
+                                                            values: vec![AstExpr::Var(
+                                                                AstNameRef::Param(
+                                                                    crate::hir::ParamId(1),
+                                                                ),
+                                                            )],
+                                                        },
+                                                    ))],
+                                                },
+                                            },
+                                        },
+                                    )),
+                                    AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                                        bindings: vec![AstLocalBinding {
+                                            id: crate::ast::AstBindingRef::Local(ok),
+                                            attr: AstLocalAttr::None,
+                                        }],
+                                        values: vec![AstExpr::Boolean(true)],
+                                    })),
+                                    AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                                        bindings: vec![AstLocalBinding {
+                                            id: crate::ast::AstBindingRef::Local(concat),
+                                            attr: AstLocalAttr::None,
+                                        }],
+                                        values: vec![AstExpr::FieldAccess(Box::new(
+                                            AstFieldAccess {
+                                                base: AstExpr::Var(AstNameRef::Global(
+                                                    AstGlobalName {
+                                                        text: "table".to_owned(),
+                                                    },
+                                                )),
+                                                field: "concat".to_owned(),
+                                            },
+                                        ))],
+                                    })),
+                                    AstStmt::Return(Box::new(AstReturn {
+                                        values: vec![
+                                            AstExpr::Var(AstNameRef::Local(ok)),
+                                            AstExpr::Call(Box::new(AstCallExpr {
+                                                callee: AstExpr::Var(AstNameRef::Local(concat)),
+                                                args: vec![
+                                                    AstExpr::Var(AstNameRef::Local(table_local)),
+                                                    AstExpr::String(",".to_owned()),
+                                                ],
+                                            })),
+                                        ],
+                                    })),
+                                ],
+                            },
+                        },
+                    ))],
+                }))],
+            },
+        };
+
+        assert!(apply(
+            &mut module,
+            ReadabilityContext {
+                target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+                options: ReadabilityOptions::default(),
+            }
+        ));
+
+        let AstStmt::LocalDecl(local_decl) = &module.body.stmts[0] else {
+            panic!("expected function wrapper local");
+        };
+        let AstExpr::FunctionExpr(function) = &local_decl.values[0] else {
+            panic!("expected function expr");
+        };
+        assert!(matches!(
+            function.body.stmts.as_slice(),
+            [
+                _,
+                _,
+                _,
+                AstStmt::Return(ret)
+            ] if matches!(
+                ret.values.as_slice(),
+                [
+                    AstExpr::Var(AstNameRef::Local(ok_name)),
+                    AstExpr::Call(call)
+                ] if *ok_name == ok && matches!(&call.callee, AstExpr::FieldAccess(_))
+            )
+        ));
     }
 }
