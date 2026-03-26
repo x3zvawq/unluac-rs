@@ -1033,7 +1033,15 @@ mod decompile_pipeline {
             "{}",
             generated.source
         );
+        assert!(
+            generated
+                .source
+                .contains("if p2_0 == 0 then\n            return p2_1\n        end"),
+            "{}",
+            generated.source
+        );
         assert!(!generated.source.contains("u2_0("), "{}", generated.source);
+        assert!(!generated.source.contains("else"), "{}", generated.source);
         assert!(
             !generated.source.contains("local r1_0"),
             "{}",

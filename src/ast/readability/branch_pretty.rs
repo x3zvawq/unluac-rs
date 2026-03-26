@@ -1,8 +1,8 @@
 //! 让结构等价的条件语句更接近源码。
 
 use super::super::common::{
-    AstBlock, AstExpr, AstFunctionExpr, AstLValue, AstLogicalExpr, AstModule, AstStmt,
-    AstUnaryOpKind,
+    AstBinaryExpr, AstBinaryOpKind, AstBlock, AstExpr, AstFunctionExpr, AstLValue, AstLogicalExpr,
+    AstModule, AstStmt, AstUnaryExpr, AstUnaryOpKind,
 };
 use super::ReadabilityContext;
 
@@ -12,10 +12,22 @@ pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool
 }
 
 fn rewrite_block(block: &mut AstBlock) -> bool {
+    let old_stmts = std::mem::take(&mut block.stmts);
+    let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
-    for stmt in &mut block.stmts {
-        changed |= rewrite_stmt(stmt);
+    for mut stmt in old_stmts {
+        changed |= rewrite_stmt(&mut stmt);
+        match flatten_terminating_if(stmt) {
+            Ok(flattened) => {
+                new_stmts.extend(flattened);
+                changed = true;
+            }
+            Err(stmt) => {
+                new_stmts.push(stmt);
+            }
+        }
     }
+    block.stmts = new_stmts;
     changed
 }
 
@@ -216,6 +228,118 @@ fn prettify_truthy_ternary(expr: &AstExpr) -> Option<AstExpr> {
         })),
         rhs: and_expr.rhs.clone(),
     })))
+}
+
+fn flatten_terminating_if(stmt: AstStmt) -> Result<Vec<AstStmt>, AstStmt> {
+    let AstStmt::If(mut if_stmt) = stmt else {
+        return Err(stmt);
+    };
+    let Some(else_block) = if_stmt.else_block.take() else {
+        return Err(AstStmt::If(if_stmt));
+    };
+    let then_terminates = block_always_terminates(&if_stmt.then_block);
+    let else_terminates = block_always_terminates(&else_block);
+
+    if then_terminates {
+        let mut stmts = vec![AstStmt::If(if_stmt)];
+        stmts.extend(lifted_tail_stmts(else_block));
+        return Ok(stmts);
+    }
+
+    if else_terminates {
+        if_stmt.cond = negate_guard_condition(if_stmt.cond);
+        let then_block = std::mem::replace(&mut if_stmt.then_block, else_block);
+        if_stmt.else_block = None;
+
+        let mut stmts = vec![AstStmt::If(if_stmt)];
+        stmts.extend(lifted_tail_stmts(then_block));
+        return Ok(stmts);
+    }
+
+    if_stmt.else_block = Some(else_block);
+    Err(AstStmt::If(if_stmt))
+}
+
+fn block_always_terminates(block: &AstBlock) -> bool {
+    let Some(last_stmt) = block.stmts.last() else {
+        return false;
+    };
+    stmt_always_terminates(last_stmt)
+}
+
+fn stmt_always_terminates(stmt: &AstStmt) -> bool {
+    match stmt {
+        AstStmt::Return(_) | AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) => true,
+        AstStmt::If(if_stmt) => if_stmt.else_block.as_ref().is_some_and(|else_block| {
+            block_always_terminates(&if_stmt.then_block) && block_always_terminates(else_block)
+        }),
+        AstStmt::DoBlock(block) => block_always_terminates(block),
+        AstStmt::LocalDecl(_)
+        | AstStmt::GlobalDecl(_)
+        | AstStmt::Assign(_)
+        | AstStmt::CallStmt(_)
+        | AstStmt::While(_)
+        | AstStmt::Repeat(_)
+        | AstStmt::NumericFor(_)
+        | AstStmt::GenericFor(_)
+        | AstStmt::Label(_)
+        | AstStmt::FunctionDecl(_)
+        | AstStmt::LocalFunctionDecl(_) => false,
+    }
+}
+
+fn lifted_tail_stmts(block: AstBlock) -> Vec<AstStmt> {
+    if block_requires_scope_barrier(&block) {
+        vec![AstStmt::DoBlock(Box::new(block))]
+    } else {
+        block.stmts
+    }
+}
+
+fn block_requires_scope_barrier(block: &AstBlock) -> bool {
+    block.stmts.iter().any(stmt_requires_scope_barrier)
+}
+
+fn stmt_requires_scope_barrier(stmt: &AstStmt) -> bool {
+    matches!(
+        stmt,
+        AstStmt::LocalDecl(_)
+            | AstStmt::LocalFunctionDecl(_)
+            | AstStmt::Label(_)
+            | AstStmt::Goto(_)
+    )
+}
+
+fn negate_guard_condition(expr: AstExpr) -> AstExpr {
+    match expr {
+        AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not => unary.expr,
+        AstExpr::Binary(binary) => negate_relational_expr(*binary),
+        other => AstExpr::Unary(Box::new(AstUnaryExpr {
+            op: AstUnaryOpKind::Not,
+            expr: other,
+        })),
+    }
+}
+
+fn negate_relational_expr(binary: AstBinaryExpr) -> AstExpr {
+    match binary.op {
+        // Lua AST 目前没有 `>` / `>=` / `~=` 节点，所以这里通过交换 operands
+        // 只消掉那些可以无损改写成现有关系运算的情况；剩下的再回退成 `not (...)`。
+        AstBinaryOpKind::Lt => AstExpr::Binary(Box::new(AstBinaryExpr {
+            op: AstBinaryOpKind::Le,
+            lhs: binary.rhs,
+            rhs: binary.lhs,
+        })),
+        AstBinaryOpKind::Le => AstExpr::Binary(Box::new(AstBinaryExpr {
+            op: AstBinaryOpKind::Lt,
+            lhs: binary.rhs,
+            rhs: binary.lhs,
+        })),
+        _ => AstExpr::Unary(Box::new(AstUnaryExpr {
+            op: AstUnaryOpKind::Not,
+            expr: AstExpr::Binary(Box::new(binary)),
+        })),
+    }
 }
 
 fn expr_is_always_truthy(expr: &AstExpr) -> bool {
