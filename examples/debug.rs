@@ -16,7 +16,7 @@ use unluac::parser::{ParseMode, ParseOptions, StringDecodeMode, StringEncoding};
 
 /// 开发时最常改的是这几个常量，直接编辑代码通常比来回敲命令更顺手。
 const DIALECT: DecompileDialect = DecompileDialect::Lua55;
-const SOURCE: &str = "tests/lua_cases/common/tricky/02_ultimate_mess.lua";
+const SOURCE: &str = "tests/lua_cases/common/tricky/01_boolean_hell.lua";
 const STRING_ENCODING: StringEncoding = StringEncoding::Utf8;
 const STRING_DECODE_MODE: StringDecodeMode = StringDecodeMode::Strict;
 const PARSE_MODE: ParseMode = ParseMode::Strict;

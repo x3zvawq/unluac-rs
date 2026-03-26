@@ -267,18 +267,25 @@ pub(super) fn synthesize_readable_pure_logical_expr(expr: &HirExpr) -> Option<Hi
     let mut best = current.clone();
     let mut visited = vec![current.clone()];
     let mut queue = vec![current.clone()];
+    if let Some(structured) = readable_structured_candidate(&current, &environments, &ref_positions) {
+        let structured = normalize_candidate_expr(structured);
+        if validate_pure_expr_equivalence(expr, &structured, &environments, &ref_positions) {
+            if cost::readable_expr_cost(&structured) < cost::readable_expr_cost(&best) {
+                best = structured.clone();
+            }
+            if !visited.iter().any(|seen| seen == &structured) {
+                visited.push(structured.clone());
+                queue.push(structured);
+            }
+        }
+    }
     let mut cursor = 0usize;
 
     while cursor < queue.len() && visited.len() < 64 {
         let candidate = queue[cursor].clone();
         cursor += 1;
 
-        let mut next_candidates = readable_local_rewrite_candidates(&candidate);
-        if let Some(structured) =
-            readable_structured_candidate(&candidate, &environments, &ref_positions)
-        {
-            next_candidates.push(structured);
-        }
+        let next_candidates = readable_local_rewrite_candidates(&candidate);
 
         for next in next_candidates.into_iter().map(normalize_candidate_expr) {
             if visited.iter().any(|seen| seen == &next) {

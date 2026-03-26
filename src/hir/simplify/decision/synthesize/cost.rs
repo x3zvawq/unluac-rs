@@ -89,21 +89,23 @@ fn duplicate_atom_penalty(expr: &HirExpr) -> usize {
 fn duplicate_branch_penalty(expr: &HirExpr) -> usize {
     let mut branches = Vec::new();
     collect_branch_subexprs(expr, &mut branches);
-    let mut penalty = 0usize;
-    for left in 0..branches.len() {
-        for right in (left + 1)..branches.len() {
-            if branches[left] == branches[right] {
-                penalty += structural_expr_cost(&branches[left]);
-            }
-        }
+    let mut counts = std::collections::BTreeMap::<ExprShapeKey<'_>, (usize, usize)>::new();
+    for branch in branches {
+        let key = expr_shape_key(branch);
+        let cost = structural_expr_cost(branch);
+        let entry = counts.entry(key).or_insert((0, cost));
+        entry.0 += 1;
     }
-    penalty
+    counts
+        .into_values()
+        .map(|(count, cost)| count.saturating_sub(1) * count / 2 * cost)
+        .sum()
 }
 
-fn collect_branch_subexprs(expr: &HirExpr, out: &mut Vec<HirExpr>) {
+fn collect_branch_subexprs<'a>(expr: &'a HirExpr, out: &mut Vec<&'a HirExpr>) {
     match expr {
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            out.push(expr.clone());
+            out.push(expr);
             collect_branch_subexprs(&logical.lhs, out);
             collect_branch_subexprs(&logical.rhs, out);
         }
@@ -129,6 +131,73 @@ fn collect_branch_subexprs(expr: &HirExpr, out: &mut Vec<HirExpr>) {
         | HirExpr::TableConstructor(_)
         | HirExpr::Closure(_)
         | HirExpr::Unresolved(_) => {}
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
+enum ExprShapeKey<'a> {
+    Nil,
+    Boolean(bool),
+    Integer(i64),
+    Number(u64),
+    String(&'a str),
+    Param(usize),
+    Local(usize),
+    Upvalue(usize),
+    Temp(usize),
+    Not(Box<ExprShapeKey<'a>>),
+    Eq(Box<ExprShapeKey<'a>>, Box<ExprShapeKey<'a>>),
+    LogicalAnd(Box<ExprShapeKey<'a>>, Box<ExprShapeKey<'a>>),
+    LogicalOr(Box<ExprShapeKey<'a>>, Box<ExprShapeKey<'a>>),
+    Global(&'a str),
+    TableAccess(Box<ExprShapeKey<'a>>, Box<ExprShapeKey<'a>>),
+    Call,
+    VarArg,
+    TableConstructor,
+    Closure,
+    Decision,
+    Unresolved,
+}
+
+fn expr_shape_key<'a>(expr: &'a HirExpr) -> ExprShapeKey<'a> {
+    match expr {
+        HirExpr::Nil => ExprShapeKey::Nil,
+        HirExpr::Boolean(value) => ExprShapeKey::Boolean(*value),
+        HirExpr::Integer(value) => ExprShapeKey::Integer(*value),
+        HirExpr::Number(value) => ExprShapeKey::Number(value.to_bits()),
+        HirExpr::String(value) => ExprShapeKey::String(value.as_str()),
+        HirExpr::ParamRef(param) => ExprShapeKey::Param(param.index()),
+        HirExpr::LocalRef(local) => ExprShapeKey::Local(local.index()),
+        HirExpr::UpvalueRef(upvalue) => ExprShapeKey::Upvalue(upvalue.index()),
+        HirExpr::TempRef(temp) => ExprShapeKey::Temp(temp.index()),
+        HirExpr::GlobalRef(global) => ExprShapeKey::Global(global.name.as_str()),
+        HirExpr::TableAccess(access) => ExprShapeKey::TableAccess(
+            Box::new(expr_shape_key(&access.base)),
+            Box::new(expr_shape_key(&access.key)),
+        ),
+        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
+            ExprShapeKey::Not(Box::new(expr_shape_key(&unary.expr)))
+        }
+        HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Eq => ExprShapeKey::Eq(
+            Box::new(expr_shape_key(&binary.lhs)),
+            Box::new(expr_shape_key(&binary.rhs)),
+        ),
+        HirExpr::LogicalAnd(logical) => ExprShapeKey::LogicalAnd(
+            Box::new(expr_shape_key(&logical.lhs)),
+            Box::new(expr_shape_key(&logical.rhs)),
+        ),
+        HirExpr::LogicalOr(logical) => ExprShapeKey::LogicalOr(
+            Box::new(expr_shape_key(&logical.lhs)),
+            Box::new(expr_shape_key(&logical.rhs)),
+        ),
+        HirExpr::Unary(_other) => ExprShapeKey::Unresolved,
+        HirExpr::Binary(_other) => ExprShapeKey::Unresolved,
+        HirExpr::Decision(_) => ExprShapeKey::Decision,
+        HirExpr::Call(_) => ExprShapeKey::Call,
+        HirExpr::VarArg => ExprShapeKey::VarArg,
+        HirExpr::TableConstructor(_) => ExprShapeKey::TableConstructor,
+        HirExpr::Closure(_) => ExprShapeKey::Closure,
+        HirExpr::Unresolved(_) => ExprShapeKey::Unresolved,
     }
 }
 
