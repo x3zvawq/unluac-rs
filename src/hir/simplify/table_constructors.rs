@@ -141,10 +141,18 @@ fn try_rebuild_constructor_region(
 ) -> Option<(HirTableConstructor, usize)> {
     let mut steps = Vec::new();
     let mut index = seed_index + 1;
+    let mut best = None;
 
     while let Some(stmt) = block.stmts.get(index) {
         if let Some(record) = keyed_write_step(stmt, binding) {
             steps.push(RegionStep::Record(record));
+            if let Some(rebuilt) = rebuild_constructor_from_steps(
+                constructor.clone(),
+                &steps,
+                &block.stmts[index + 1..],
+            ) {
+                best = Some((rebuilt, index));
+            }
             index += 1;
             continue;
         }
@@ -155,18 +163,25 @@ fn try_rebuild_constructor_region(
         }
         if let Some(set_list) = table_set_list_step(stmt, binding) {
             steps.push(RegionStep::SetList(set_list));
+            if let Some(rebuilt) = rebuild_constructor_from_steps(
+                constructor.clone(),
+                &steps,
+                &block.stmts[index + 1..],
+            ) {
+                best = Some((rebuilt, index));
+            }
             index += 1;
             continue;
         }
         break;
     }
 
-    if steps.is_empty() {
-        return None;
-    }
-
-    rebuild_constructor_from_steps(constructor, &steps, &block.stmts[index..])
-        .map(|constructor| (constructor, index.saturating_sub(1)))
+    // 不要求“扫描到的最长前缀”整体可折叠。
+    // 某些稳定构造区域后面会紧跟无关的 local producer；如果继续把它们吞进候选区，
+    // 末尾那批未消费 producer 会让整段 region 失败，反而错过前面已经足够安全的
+    // `{ ... }` 前缀。因此这里持续记住“最后一个成功前缀”，在真正遇到无关语句时
+    // 回退到最近一次可证明安全的构造器边界。
+    best
 }
 
 fn keyed_write_step(

@@ -153,28 +153,35 @@ impl<'a> AstLowerer<'a> {
             },
             HirExpr::VarArg => AstExpr::VarArg,
             HirExpr::TableConstructor(table) => {
-                AstExpr::TableConstructor(Box::new(AstTableConstructor {
-                    fields: table
-                        .fields
-                        .iter()
-                        .map(|field| match field {
-                            HirTableField::Array(value) => {
-                                Ok(AstTableField::Array(self.lower_expr(proto_index, value)?))
-                            }
-                            HirTableField::Record(record) => {
-                                Ok(AstTableField::Record(crate::ast::common::AstRecordField {
-                                    key: match &record.key {
-                                        HirTableKey::Name(name) => AstTableKey::Name(name.clone()),
-                                        HirTableKey::Expr(expr) => {
-                                            AstTableKey::Expr(self.lower_expr(proto_index, expr)?)
-                                        }
-                                    },
-                                    value: self.lower_expr(proto_index, &record.value)?,
-                                }))
-                            }
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                }))
+                let mut fields = table
+                    .fields
+                    .iter()
+                    .map(|field| match field {
+                        HirTableField::Array(value) => {
+                            Ok(AstTableField::Array(self.lower_expr(proto_index, value)?))
+                        }
+                        HirTableField::Record(record) => {
+                            Ok(AstTableField::Record(crate::ast::common::AstRecordField {
+                                key: match &record.key {
+                                    HirTableKey::Name(name) => AstTableKey::Name(name.clone()),
+                                    HirTableKey::Expr(expr) => {
+                                        AstTableKey::Expr(self.lower_expr(proto_index, expr)?)
+                                    }
+                                },
+                                value: self.lower_expr(proto_index, &record.value)?,
+                            }))
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if let Some(trailing) = &table.trailing_multivalue {
+                    // AST 不需要再区分“尾部多返回”这个语义槽位；
+                    // 只要把它保留成最后一个数组字段，Lua 语法自身就会在运行时
+                    // 按表构造器上下文处理多返回展开。
+                    fields.push(AstTableField::Array(
+                        self.lower_expr(proto_index, trailing)?,
+                    ));
+                }
+                AstExpr::TableConstructor(Box::new(AstTableConstructor { fields }))
             }
             HirExpr::Closure(closure) => {
                 AstExpr::FunctionExpr(Box::new(self.lower_function_expr(proto_index, closure)?))

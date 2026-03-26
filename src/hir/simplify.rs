@@ -61,6 +61,16 @@ pub(super) fn simplify_hir_with_timing(
             changed |= timings.record("locals", || {
                 apply_proto_pass(module, locals::promote_temps_to_locals_in_proto)
             });
+            changed |= timings.record("table-constructors-post-locals", || {
+                // 一部分建表片段只有在 temp-inline / locals 把机械绑定收平之后才会显形，
+                // 例如 `local values = {}; values[1] = ...` 这类来源于寄存器搬运的形状。
+                // 这里再跑一轮相同的结构化规则，把这些“晚显形”的稳定片段也收回构造器，
+                // 避免把 `table-set-list` 残留继续推给 AST。
+                apply_proto_pass(
+                    module,
+                    table_constructors::stabilize_table_constructors_in_proto,
+                )
+            });
             changed |= timings.record("eliminate-decisions", || {
                 apply_proto_pass(module, decision::eliminate_remaining_decisions_in_proto)
             });

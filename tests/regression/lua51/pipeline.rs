@@ -735,6 +735,80 @@ mod decompile_pipeline {
             generated.source
         );
     }
+
+    #[test]
+    fn return_truncation_hir_folds_set_list_tail_into_table_constructor() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/edge_cases/01_return_truncation.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("return_truncation hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(
+            dump.contains("table(array=2, record=0, trailing=call(normal) l0() multiret=true)"),
+            "{dump}"
+        );
+        assert!(!dump.contains("table-set-list"), "{dump}");
+    }
+
+    #[test]
+    fn return_truncation_generate_stage_keeps_tail_multiret_constructor_shape() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/edge_cases/01_return_truncation.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                naming: NamingOptions {
+                    mode: NamingMode::DebugLike,
+                    debug_like_include_function: true,
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("return_truncation generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated
+                .source
+                .contains("local r0_1 = { r0_0(), \"tail\", r0_0() }"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("print(\"ret\", table.concat(r0_1, \",\"))"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("table-set-list"),
+            "{}",
+            generated.source
+        );
+    }
 }
 
 fn compile_lua_case(dialect_label: &str, source_relative: &str) -> Vec<u8> {
