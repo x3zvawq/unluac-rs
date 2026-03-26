@@ -19,6 +19,7 @@ use super::state::{DecompileStage, DecompileState};
 pub struct DebugOptions {
     pub enable: bool,
     pub output_stages: Vec<DecompileStage>,
+    pub timing: bool,
     pub detail: DebugDetail,
     pub filters: DebugFilters,
 }

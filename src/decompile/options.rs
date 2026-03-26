@@ -77,7 +77,7 @@ impl Default for DecompileOptions {
 
 impl DecompileOptions {
     pub(crate) fn normalized(mut self) -> Self {
-        if self.debug.enable && self.debug.output_stages.is_empty() {
+        if self.debug.enable && self.debug.output_stages.is_empty() && !self.debug.timing {
             self.debug.output_stages.push(self.target_stage);
         }
         self

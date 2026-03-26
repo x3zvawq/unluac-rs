@@ -14,8 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 mod cost;
 
 use crate::hir::common::{
-    HirBinaryOpKind, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr,
-    HirLogicalExpr, HirUnaryExpr, HirUnaryOpKind, LocalId, ParamId, TempId, UpvalueId,
+    HirBinaryOpKind, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget,
+    HirExpr, HirLogicalExpr, HirUnaryExpr, HirUnaryOpKind, LocalId, ParamId, TempId, UpvalueId,
 };
 
 use super::{logical_and, logical_or};
@@ -267,7 +267,8 @@ pub(super) fn synthesize_readable_pure_logical_expr(expr: &HirExpr) -> Option<Hi
     let mut best = current.clone();
     let mut visited = vec![current.clone()];
     let mut queue = vec![current.clone()];
-    if let Some(structured) = readable_structured_candidate(&current, &environments, &ref_positions) {
+    if let Some(structured) = readable_structured_candidate(&current, &environments, &ref_positions)
+    {
         let structured = normalize_candidate_expr(structured);
         if validate_pure_expr_equivalence(expr, &structured, &environments, &ref_positions) {
             if cost::readable_expr_cost(&structured) < cost::readable_expr_cost(&best) {
@@ -511,9 +512,10 @@ fn lower_pure_expr_to_target(
             lower_pure_expr_to_target(&logical.lhs, truthy, rhs, nodes)
         }
         _ if expr_is_synth_safe(expr) => {
-            if let Some(existing) = nodes.iter().find(|node| {
-                node.test == *expr && node.truthy == truthy && node.falsy == falsy
-            }) {
+            if let Some(existing) = nodes
+                .iter()
+                .find(|node| node.test == *expr && node.truthy == truthy && node.falsy == falsy)
+            {
                 return Some(HirDecisionTarget::Node(existing.id));
             }
             let id = HirDecisionNodeRef(nodes.len());

@@ -208,11 +208,11 @@ fn write_constants_view(output: &mut String, protos: &[ProtoEntry<'_>], visible_
             DialectConstPoolExtra::Lua51(_) | DialectConstPoolExtra::Lua52(_) => {
                 unreachable!("lua53 debug should not receive non-lua53 const-pool extras")
             }
-        DialectConstPoolExtra::Lua54(_) => {
-            unreachable!("lua53 debug should not receive non-lua53 const-pool extras")
+            DialectConstPoolExtra::Lua54(_) => {
+                unreachable!("lua53 debug should not receive non-lua53 const-pool extras")
+            }
+            _ => unreachable!("lua53 debug should not receive non-lua53 const-pool extras"),
         }
-        _ => unreachable!("lua53 debug should not receive non-lua53 const-pool extras"),
-    }
     }
 }
 

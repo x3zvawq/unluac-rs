@@ -235,10 +235,16 @@ fn collect_close_temps_in_block(block: &HirBlock, temps: &mut BTreeSet<TempId>) 
             }
             HirStmt::While(while_stmt) => collect_close_temps_in_block(&while_stmt.body, temps),
             HirStmt::Repeat(repeat_stmt) => collect_close_temps_in_block(&repeat_stmt.body, temps),
-            HirStmt::NumericFor(numeric_for) => collect_close_temps_in_block(&numeric_for.body, temps),
-            HirStmt::GenericFor(generic_for) => collect_close_temps_in_block(&generic_for.body, temps),
+            HirStmt::NumericFor(numeric_for) => {
+                collect_close_temps_in_block(&numeric_for.body, temps)
+            }
+            HirStmt::GenericFor(generic_for) => {
+                collect_close_temps_in_block(&generic_for.body, temps)
+            }
             HirStmt::Block(block) => collect_close_temps_in_block(block, temps),
-            HirStmt::Unstructured(unstructured) => collect_close_temps_in_block(&unstructured.body, temps),
+            HirStmt::Unstructured(unstructured) => {
+                collect_close_temps_in_block(&unstructured.body, temps)
+            }
             _ => {}
         }
     }
@@ -253,10 +259,7 @@ fn stmt_has_continue(stmt: &HirStmt) -> bool {
         HirStmt::Continue => true,
         HirStmt::If(if_stmt) => {
             block_has_continue(&if_stmt.then_block)
-                || if_stmt
-                    .else_block
-                    .as_ref()
-                    .is_some_and(block_has_continue)
+                || if_stmt.else_block.as_ref().is_some_and(block_has_continue)
         }
         HirStmt::While(while_stmt) => block_has_continue(&while_stmt.body),
         HirStmt::Repeat(repeat_stmt) => block_has_continue(&repeat_stmt.body),
@@ -269,7 +272,10 @@ fn stmt_has_continue(stmt: &HirStmt) -> bool {
 }
 
 pub(super) fn count_local_uses_in_stmts(stmts: &[HirStmt], local: LocalId) -> usize {
-    stmts.iter().map(|stmt| count_local_uses_in_stmt(stmt, local)).sum()
+    stmts
+        .iter()
+        .map(|stmt| count_local_uses_in_stmt(stmt, local))
+        .sum()
 }
 
 fn count_local_uses_in_stmt(stmt: &HirStmt, local: LocalId) -> usize {
@@ -361,7 +367,8 @@ fn count_local_uses_in_block(block: &HirBlock, local: LocalId) -> usize {
 fn count_local_uses_in_lvalue(target: &HirLValue, local: LocalId) -> usize {
     match target {
         HirLValue::TableAccess(access) => {
-            count_local_uses_in_expr(&access.base, local) + count_local_uses_in_expr(&access.key, local)
+            count_local_uses_in_expr(&access.base, local)
+                + count_local_uses_in_expr(&access.key, local)
         }
         HirLValue::Local(target_local) if *target_local == local => 1,
         _ => 0,
@@ -381,14 +388,17 @@ fn count_local_uses_in_expr(expr: &HirExpr, local: LocalId) -> usize {
     match expr {
         HirExpr::LocalRef(expr_local) if *expr_local == local => 1,
         HirExpr::TableAccess(access) => {
-            count_local_uses_in_expr(&access.base, local) + count_local_uses_in_expr(&access.key, local)
+            count_local_uses_in_expr(&access.base, local)
+                + count_local_uses_in_expr(&access.key, local)
         }
         HirExpr::Unary(unary) => count_local_uses_in_expr(&unary.expr, local),
         HirExpr::Binary(binary) => {
-            count_local_uses_in_expr(&binary.lhs, local) + count_local_uses_in_expr(&binary.rhs, local)
+            count_local_uses_in_expr(&binary.lhs, local)
+                + count_local_uses_in_expr(&binary.rhs, local)
         }
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            count_local_uses_in_expr(&logical.lhs, local) + count_local_uses_in_expr(&logical.rhs, local)
+            count_local_uses_in_expr(&logical.lhs, local)
+                + count_local_uses_in_expr(&logical.rhs, local)
         }
         HirExpr::Decision(decision) => decision
             .nodes

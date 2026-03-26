@@ -13,16 +13,13 @@ use self::analysis::{
 };
 use super::common::{
     AstAssign, AstBindingRef, AstBlock, AstCallStmt, AstExpr, AstGenericFor, AstGoto, AstIf,
-    AstIndexAccess, AstLabel, AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl,
-    AstModule, AstNumericFor, AstRepeat, AstReturn, AstStmt, AstTargetDialect, AstWhile,
+    AstIndexAccess, AstLabel, AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl, AstModule,
+    AstNumericFor, AstRepeat, AstReturn, AstStmt, AstTargetDialect, AstWhile,
 };
 use super::error::AstLowerError;
 
 /// 对外的 AST lowering 入口。
-pub fn lower_ast(
-    module: &HirModule,
-    target: AstTargetDialect,
-) -> Result<AstModule, AstLowerError> {
+pub fn lower_ast(module: &HirModule, target: AstTargetDialect) -> Result<AstModule, AstLowerError> {
     let mut lowerer = AstLowerer::new(module, target);
     lowerer.lower_module()
 }
@@ -48,14 +45,14 @@ impl<'a> AstLowerer<'a> {
     }
 
     fn lower_proto_body(&mut self, proto_index: usize) -> Result<AstBlock, AstLowerError> {
-        let proto = self
-            .module
-            .protos
-            .get(proto_index)
-            .ok_or(AstLowerError::MissingChildProto {
-                proto: self.module.entry.index(),
-                child: proto_index,
-            })?;
+        let proto =
+            self.module
+                .protos
+                .get(proto_index)
+                .ok_or(AstLowerError::MissingChildProto {
+                    proto: self.module.entry.index(),
+                    child: proto_index,
+                })?;
         let close_temps = collect_close_temps(&proto.body);
         self.lower_block(proto_index, &proto.body, Some(&close_temps), None)
     }
@@ -140,10 +137,11 @@ impl<'a> AstLowerer<'a> {
                     for (offset, value) in set_list.values.iter().enumerate() {
                         let index_value =
                             AstExpr::Integer(i64::from(set_list.start_index) + offset as i64);
-                        let target = super::common::AstLValue::IndexAccess(Box::new(AstIndexAccess {
-                            base: base.clone(),
-                            index: index_value,
-                        }));
+                        let target =
+                            super::common::AstLValue::IndexAccess(Box::new(AstIndexAccess {
+                                base: base.clone(),
+                                index: index_value,
+                            }));
                         stmts.push(AstStmt::Assign(Box::new(AstAssign {
                             targets: vec![target],
                             values: vec![self.lower_expr(proto_index, value)?],
@@ -199,7 +197,8 @@ impl<'a> AstLowerer<'a> {
                         loop_continue.or(continue_target),
                     )?;
                     if let Some(label) = loop_continue {
-                        body.stmts.push(AstStmt::Label(Box::new(AstLabel { id: label })));
+                        body.stmts
+                            .push(AstStmt::Label(Box::new(AstLabel { id: label })));
                     }
                     AstStmt::While(Box::new(AstWhile {
                         cond: self.lower_expr(proto_index, &while_stmt.cond)?,
@@ -215,7 +214,8 @@ impl<'a> AstLowerer<'a> {
                         loop_continue.or(continue_target),
                     )?;
                     if let Some(label) = loop_continue {
-                        body.stmts.push(AstStmt::Label(Box::new(AstLabel { id: label })));
+                        body.stmts
+                            .push(AstStmt::Label(Box::new(AstLabel { id: label })));
                     }
                     AstStmt::Repeat(Box::new(AstRepeat {
                         body,
@@ -231,7 +231,8 @@ impl<'a> AstLowerer<'a> {
                         loop_continue.or(continue_target),
                     )?;
                     if let Some(label) = loop_continue {
-                        body.stmts.push(AstStmt::Label(Box::new(AstLabel { id: label })));
+                        body.stmts
+                            .push(AstStmt::Label(Box::new(AstLabel { id: label })));
                     }
                     AstStmt::NumericFor(Box::new(AstNumericFor {
                         binding: AstBindingRef::Local(numeric_for.binding),
@@ -242,12 +243,7 @@ impl<'a> AstLowerer<'a> {
                     }))
                 }
                 HirStmt::GenericFor(generic_for) => {
-                    self.lower_generic_for_stmt(
-                        proto_index,
-                        generic_for,
-                        None,
-                        continue_target,
-                    )?
+                    self.lower_generic_for_stmt(proto_index, generic_for, None, continue_target)?
                 }
                 HirStmt::Break => AstStmt::Break,
                 HirStmt::Continue => {
@@ -329,7 +325,8 @@ impl<'a> AstLowerer<'a> {
             loop_continue.or(continue_target),
         )?;
         if let Some(label) = loop_continue {
-            body.stmts.push(AstStmt::Label(Box::new(AstLabel { id: label })));
+            body.stmts
+                .push(AstStmt::Label(Box::new(AstLabel { id: label })));
         }
         let iterator = iterator_override.unwrap_or(&generic_for.iterator);
         Ok(AstStmt::GenericFor(Box::new(AstGenericFor {

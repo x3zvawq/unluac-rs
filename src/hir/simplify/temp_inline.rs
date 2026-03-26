@@ -232,7 +232,10 @@ impl TempUseScratch {
     }
 
     fn has_debug_local_hint(&self, temp: TempId) -> bool {
-        self.temp_debug_hints.get(temp.index()).copied().unwrap_or(false)
+        self.temp_debug_hints
+            .get(temp.index())
+            .copied()
+            .unwrap_or(false)
     }
 
     fn note_temp(&mut self, temp: TempId) {
@@ -281,15 +284,19 @@ fn inline_site_in_simple_stmt(stmt: &HirStmt, temp: TempId) -> Option<InlineSite
             .iter()
             .find_map(|target| find_site_in_lvalue(target, temp, InlineSite::Direct))
             .or_else(|| find_site_in_exprs(&assign.values, temp, InlineSite::Direct)),
-        HirStmt::TableSetList(set_list) => find_site_in_expr(&set_list.base, temp, InlineSite::Direct)
-            .or_else(|| find_site_in_exprs(&set_list.values, temp, InlineSite::Direct))
-            .or_else(|| {
-                set_list
-                    .trailing_multivalue
-                    .as_ref()
-                    .and_then(|expr| find_site_in_expr(expr, temp, InlineSite::Direct))
-            }),
-        HirStmt::CallStmt(call_stmt) => find_site_in_call(&call_stmt.call, temp, InlineSite::Direct),
+        HirStmt::TableSetList(set_list) => {
+            find_site_in_expr(&set_list.base, temp, InlineSite::Direct)
+                .or_else(|| find_site_in_exprs(&set_list.values, temp, InlineSite::Direct))
+                .or_else(|| {
+                    set_list
+                        .trailing_multivalue
+                        .as_ref()
+                        .and_then(|expr| find_site_in_expr(expr, temp, InlineSite::Direct))
+                })
+        }
+        HirStmt::CallStmt(call_stmt) => {
+            find_site_in_call(&call_stmt.call, temp, InlineSite::Direct)
+        }
         HirStmt::Return(ret) => find_site_in_exprs(&ret.values, temp, InlineSite::ReturnValue),
         HirStmt::If(_)
         | HirStmt::While(_)
@@ -309,7 +316,8 @@ fn inline_site_in_simple_stmt(stmt: &HirStmt, temp: TempId) -> Option<InlineSite
 }
 
 fn find_site_in_exprs(exprs: &[HirExpr], temp: TempId, site: InlineSite) -> Option<InlineSite> {
-    exprs.iter()
+    exprs
+        .iter()
         .find_map(|expr| find_site_in_expr(expr, temp, site))
 }
 
@@ -326,8 +334,10 @@ fn find_site_in_call(call: &HirCallExpr, temp: TempId, site: InlineSite) -> Opti
 fn find_site_in_lvalue(lvalue: &HirLValue, temp: TempId, site: InlineSite) -> Option<InlineSite> {
     match lvalue {
         HirLValue::Temp(target) if *target == temp => Some(site),
-        HirLValue::TableAccess(access) => find_site_in_expr(&access.base, temp, site.descend_access_base())
-            .or_else(|| find_site_in_expr(&access.key, temp, InlineSite::Index)),
+        HirLValue::TableAccess(access) => {
+            find_site_in_expr(&access.base, temp, site.descend_access_base())
+                .or_else(|| find_site_in_expr(&access.key, temp, InlineSite::Index))
+        }
         HirLValue::Temp(_) | HirLValue::Local(_) | HirLValue::Upvalue(_) | HirLValue::Global(_) => {
             None
         }
@@ -338,8 +348,10 @@ fn find_site_in_expr(expr: &HirExpr, temp: TempId, site: InlineSite) -> Option<I
     match expr {
         HirExpr::TempRef(other) if *other == temp => Some(site),
         HirExpr::TempRef(_) => None,
-        HirExpr::TableAccess(access) => find_site_in_expr(&access.base, temp, site.descend_access_base())
-            .or_else(|| find_site_in_expr(&access.key, temp, InlineSite::Index)),
+        HirExpr::TableAccess(access) => {
+            find_site_in_expr(&access.base, temp, site.descend_access_base())
+                .or_else(|| find_site_in_expr(&access.key, temp, InlineSite::Index))
+        }
         HirExpr::Unary(unary) => find_site_in_expr(&unary.expr, temp, InlineSite::Nested),
         HirExpr::Binary(binary) => find_site_in_expr(&binary.lhs, temp, InlineSite::Nested)
             .or_else(|| find_site_in_expr(&binary.rhs, temp, InlineSite::Nested)),
@@ -353,17 +365,20 @@ fn find_site_in_expr(expr: &HirExpr, temp: TempId, site: InlineSite) -> Option<I
                 .or_else(|| find_site_in_decision_target(&node.falsy, temp, InlineSite::Nested))
         }),
         HirExpr::Call(call) => find_site_in_call(call, temp, InlineSite::Nested),
-        HirExpr::TableConstructor(table) => table.fields.iter().find_map(|field| match field {
-            HirTableField::Array(value) => find_site_in_expr(value, temp, InlineSite::Nested),
-            HirTableField::Record(field) => find_site_in_table_key(&field.key, temp)
-                .or_else(|| find_site_in_expr(&field.value, temp, InlineSite::Nested)),
-        })
-        .or_else(|| {
-            table
-                .trailing_multivalue
-                .as_ref()
-                .and_then(|expr| find_site_in_expr(expr, temp, InlineSite::Nested))
-        }),
+        HirExpr::TableConstructor(table) => table
+            .fields
+            .iter()
+            .find_map(|field| match field {
+                HirTableField::Array(value) => find_site_in_expr(value, temp, InlineSite::Nested),
+                HirTableField::Record(field) => find_site_in_table_key(&field.key, temp)
+                    .or_else(|| find_site_in_expr(&field.value, temp, InlineSite::Nested)),
+            })
+            .or_else(|| {
+                table
+                    .trailing_multivalue
+                    .as_ref()
+                    .and_then(|expr| find_site_in_expr(expr, temp, InlineSite::Nested))
+            }),
         HirExpr::Closure(closure) => closure
             .captures
             .iter()
@@ -420,8 +435,16 @@ fn expr_complexity(expr: &HirExpr) -> usize {
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
             1 + expr_complexity(&logical.lhs) + expr_complexity(&logical.rhs)
         }
-        HirExpr::TableAccess(access) => 1 + expr_complexity(&access.base) + expr_complexity(&access.key),
-        HirExpr::Decision(decision) => 1 + decision.nodes.iter().map(decision_node_complexity).sum::<usize>(),
+        HirExpr::TableAccess(access) => {
+            1 + expr_complexity(&access.base) + expr_complexity(&access.key)
+        }
+        HirExpr::Decision(decision) => {
+            1 + decision
+                .nodes
+                .iter()
+                .map(decision_node_complexity)
+                .sum::<usize>()
+        }
         HirExpr::Call(call) => {
             1 + expr_complexity(&call.callee) + call.args.iter().map(expr_complexity).sum::<usize>()
         }
@@ -441,7 +464,13 @@ fn expr_complexity(expr: &HirExpr) -> usize {
                     .as_ref()
                     .map_or(0, expr_complexity)
         }
-        HirExpr::Closure(closure) => 1 + closure.captures.iter().map(|capture| expr_complexity(&capture.value)).sum::<usize>(),
+        HirExpr::Closure(closure) => {
+            1 + closure
+                .captures
+                .iter()
+                .map(|capture| expr_complexity(&capture.value))
+                .sum::<usize>()
+        }
     }
 }
 
@@ -481,10 +510,11 @@ impl InlineSite {
         match self {
             Self::Direct => true,
             Self::Nested => is_atomic_nested_inline_expr(replacement),
-            Self::AccessBase => self
-                .complexity_limit(options)
-                .is_some_and(|limit| expr_complexity(replacement) <= limit)
-                && is_access_base_inline_expr(replacement),
+            Self::AccessBase => {
+                self.complexity_limit(options)
+                    .is_some_and(|limit| expr_complexity(replacement) <= limit)
+                    && is_access_base_inline_expr(replacement)
+            }
             Self::ReturnValue | Self::Index | Self::CallArg => self
                 .complexity_limit(options)
                 .is_some_and(|limit| expr_complexity(replacement) <= limit),
@@ -504,11 +534,9 @@ impl InlineSite {
     fn descend_access_base(self) -> Self {
         match self {
             Self::Direct => Self::AccessBase,
-            Self::Nested
-            | Self::ReturnValue
-            | Self::Index
-            | Self::CallArg
-            | Self::AccessBase => Self::Nested,
+            Self::Nested | Self::ReturnValue | Self::Index | Self::CallArg | Self::AccessBase => {
+                Self::Nested
+            }
         }
     }
 }
@@ -1135,18 +1163,22 @@ mod tests {
             stmts: vec![
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::Temp(TempId(0))],
-                    values: vec![HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
-                        base: HirExpr::GlobalRef(HirGlobalRef {
-                            name: "root".to_owned(),
-                        }),
-                        key: HirExpr::String("items".to_owned()),
-                    }))],
+                    values: vec![HirExpr::TableAccess(Box::new(
+                        crate::hir::common::HirTableAccess {
+                            base: HirExpr::GlobalRef(HirGlobalRef {
+                                name: "root".to_owned(),
+                            }),
+                            key: HirExpr::String("items".to_owned()),
+                        },
+                    ))],
                 })),
                 HirStmt::Return(Box::new(HirReturn {
-                    values: vec![HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
-                        base: HirExpr::TempRef(TempId(0)),
-                        key: HirExpr::String("value".to_owned()),
-                    }))],
+                    values: vec![HirExpr::TableAccess(Box::new(
+                        crate::hir::common::HirTableAccess {
+                            base: HirExpr::TempRef(TempId(0)),
+                            key: HirExpr::String("value".to_owned()),
+                        },
+                    ))],
                 })),
             ],
         });
@@ -1174,23 +1206,29 @@ mod tests {
                 stmts: vec![
                     HirStmt::Assign(Box::new(HirAssign {
                         targets: vec![HirLValue::Temp(TempId(0))],
-                        values: vec![HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
-                            base: HirExpr::ParamRef(crate::hir::common::ParamId(0)),
-                            key: HirExpr::String("branches".to_owned()),
-                        }))],
+                        values: vec![HirExpr::TableAccess(Box::new(
+                            crate::hir::common::HirTableAccess {
+                                base: HirExpr::ParamRef(crate::hir::common::ParamId(0)),
+                                key: HirExpr::String("branches".to_owned()),
+                            },
+                        ))],
                     })),
                     HirStmt::Assign(Box::new(HirAssign {
                         targets: vec![HirLValue::Temp(TempId(1))],
-                        values: vec![HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
-                            base: HirExpr::TempRef(TempId(0)),
-                            key: HirExpr::String("picked".to_owned()),
-                        }))],
+                        values: vec![HirExpr::TableAccess(Box::new(
+                            crate::hir::common::HirTableAccess {
+                                base: HirExpr::TempRef(TempId(0)),
+                                key: HirExpr::String("picked".to_owned()),
+                            },
+                        ))],
                     })),
                     HirStmt::Return(Box::new(HirReturn {
-                        values: vec![HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
-                            base: HirExpr::TempRef(TempId(1)),
-                            key: HirExpr::String("value".to_owned()),
-                        }))],
+                        values: vec![HirExpr::TableAccess(Box::new(
+                            crate::hir::common::HirTableAccess {
+                                base: HirExpr::TempRef(TempId(1)),
+                                key: HirExpr::String("value".to_owned()),
+                            },
+                        ))],
                     })),
                 ],
             })
@@ -1231,24 +1269,30 @@ mod tests {
                 stmts: vec![
                     HirStmt::Assign(Box::new(HirAssign {
                         targets: vec![HirLValue::Temp(TempId(0))],
-                        values: vec![HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
-                            base: HirExpr::ParamRef(crate::hir::common::ParamId(0)),
-                            key: HirExpr::String("branches".to_owned()),
-                        }))],
+                        values: vec![HirExpr::TableAccess(Box::new(
+                            crate::hir::common::HirTableAccess {
+                                base: HirExpr::ParamRef(crate::hir::common::ParamId(0)),
+                                key: HirExpr::String("branches".to_owned()),
+                            },
+                        ))],
                     })),
                     HirStmt::Assign(Box::new(HirAssign {
                         targets: vec![HirLValue::Temp(TempId(1))],
-                        values: vec![HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
-                            base: HirExpr::TempRef(TempId(0)),
-                            key: HirExpr::String("picked".to_owned()),
-                        }))],
+                        values: vec![HirExpr::TableAccess(Box::new(
+                            crate::hir::common::HirTableAccess {
+                                base: HirExpr::TempRef(TempId(0)),
+                                key: HirExpr::String("picked".to_owned()),
+                            },
+                        ))],
                     })),
                     HirStmt::Assign(Box::new(HirAssign {
                         targets: vec![HirLValue::Temp(TempId(2))],
-                        values: vec![HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
-                            base: HirExpr::TempRef(TempId(1)),
-                            key: HirExpr::String("value".to_owned()),
-                        }))],
+                        values: vec![HirExpr::TableAccess(Box::new(
+                            crate::hir::common::HirTableAccess {
+                                base: HirExpr::TempRef(TempId(1)),
+                                key: HirExpr::String("value".to_owned()),
+                            },
+                        ))],
                     })),
                     HirStmt::Return(Box::new(HirReturn {
                         values: vec![HirExpr::TempRef(TempId(2))],
@@ -1296,12 +1340,14 @@ mod tests {
                     })),
                     HirStmt::Assign(Box::new(HirAssign {
                         targets: vec![HirLValue::Temp(TempId(1))],
-                        values: vec![HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
-                            base: HirExpr::GlobalRef(HirGlobalRef {
-                                name: "root".to_owned(),
-                            }),
-                            key: HirExpr::TempRef(TempId(0)),
-                        }))],
+                        values: vec![HirExpr::TableAccess(Box::new(
+                            crate::hir::common::HirTableAccess {
+                                base: HirExpr::GlobalRef(HirGlobalRef {
+                                    name: "root".to_owned(),
+                                }),
+                                key: HirExpr::TempRef(TempId(0)),
+                            },
+                        ))],
                     })),
                     HirStmt::Return(Box::new(HirReturn {
                         values: vec![HirExpr::TempRef(TempId(1))],
@@ -1405,7 +1451,10 @@ mod tests {
             })],
         };
 
-        super::super::simplify_hir(&mut module, crate::readability::ReadabilityOptions::default());
+        super::super::simplify_hir(
+            &mut module,
+            crate::readability::ReadabilityOptions::default(),
+        );
 
         assert!(matches!(
             &module.protos[0].body.stmts.as_slice(),

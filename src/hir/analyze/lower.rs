@@ -370,12 +370,16 @@ pub(super) fn lower_regular_instr(
             instr_ref,
             vec![expr_for_const(lowering.proto, load_const.value)],
         ),
-        LowInstr::LoadInteger(load_integer) => {
-            fixed_assign(lowering, instr_ref, vec![HirExpr::Integer(load_integer.value)])
-        }
-        LowInstr::LoadNumber(load_number) => {
-            fixed_assign(lowering, instr_ref, vec![HirExpr::Number(load_number.value)])
-        }
+        LowInstr::LoadInteger(load_integer) => fixed_assign(
+            lowering,
+            instr_ref,
+            vec![HirExpr::Integer(load_integer.value)],
+        ),
+        LowInstr::LoadNumber(load_number) => fixed_assign(
+            lowering,
+            instr_ref,
+            vec![HirExpr::Number(load_number.value)],
+        ),
         LowInstr::UnaryOp(unary) => fixed_assign(
             lowering,
             instr_ref,
@@ -453,13 +457,25 @@ pub(super) fn lower_regular_instr(
                 set_table.value,
             )],
         )],
-        LowInstr::ErrNil(err_nnil) => vec![HirStmt::ErrNil(Box::new(crate::hir::common::HirErrNil {
-            value: expr_for_reg_use(lowering, block, instr_ref, err_nnil.subject),
-            name: err_nnil.name.and_then(|const_ref| match lowering.proto.constants.common.literals.get(const_ref.index()) {
-                Some(crate::parser::RawLiteralConst::String(value)) => Some(decode_raw_string(value)),
-                _ => None,
-            }),
-        }))],
+        LowInstr::ErrNil(err_nnil) => {
+            vec![HirStmt::ErrNil(Box::new(crate::hir::common::HirErrNil {
+                value: expr_for_reg_use(lowering, block, instr_ref, err_nnil.subject),
+                name: err_nnil.name.and_then(|const_ref| {
+                    match lowering
+                        .proto
+                        .constants
+                        .common
+                        .literals
+                        .get(const_ref.index())
+                    {
+                        Some(crate::parser::RawLiteralConst::String(value)) => {
+                            Some(decode_raw_string(value))
+                        }
+                        _ => None,
+                    }
+                }),
+            }))]
+        }
         LowInstr::NewTable(_new_table) => fixed_assign(
             lowering,
             instr_ref,

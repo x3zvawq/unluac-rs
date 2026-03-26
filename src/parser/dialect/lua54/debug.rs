@@ -111,7 +111,9 @@ fn write_header_view(output: &mut String, header: &ChunkHeader) {
         DialectHeaderExtra::Lua54(extra) => {
             let Lua54HeaderExtra = extra;
         }
-        DialectHeaderExtra::Lua51(_) | DialectHeaderExtra::Lua52(_) | DialectHeaderExtra::Lua53(_) => {
+        DialectHeaderExtra::Lua51(_)
+        | DialectHeaderExtra::Lua52(_)
+        | DialectHeaderExtra::Lua53(_) => {
             unreachable!("lua54 debug should not receive non-lua54 header extras")
         }
         _ => unreachable!("lua54 debug should not receive non-lua54 header extras"),

@@ -211,9 +211,7 @@ fn or_chain_penalty(expr: &HirExpr) -> usize {
             or_chain_penalty(&logical.lhs) + or_chain_penalty(&logical.rhs)
         }
         HirExpr::Unary(unary) => or_chain_penalty(&unary.expr),
-        HirExpr::Binary(binary) => {
-            or_chain_penalty(&binary.lhs) + or_chain_penalty(&binary.rhs)
-        }
+        HirExpr::Binary(binary) => or_chain_penalty(&binary.lhs) + or_chain_penalty(&binary.rhs),
         HirExpr::Nil
         | HirExpr::Boolean(_)
         | HirExpr::Integer(_)

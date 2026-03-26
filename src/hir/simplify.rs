@@ -14,32 +14,58 @@ mod temp_inline;
 
 use crate::hir::common::HirModule;
 use crate::readability::ReadabilityOptions;
+use crate::timing::TimingCollector;
 
 const MAX_SIMPLIFY_ITERATIONS: usize = 128;
 
 /// 对已经构造完成的 HIR 做 fixed-point 收敛。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn simplify_hir(module: &mut HirModule, readability: ReadabilityOptions) {
+    let timings = TimingCollector::disabled();
+    simplify_hir_with_timing(module, readability, &timings);
+}
+
+pub(super) fn simplify_hir_with_timing(
+    module: &mut HirModule,
+    readability: ReadabilityOptions,
+    timings: &TimingCollector,
+) {
     let mut converged = false;
 
     for _ in 0..MAX_SIMPLIFY_ITERATIONS {
-        let mut changed = false;
-        for proto in &mut module.protos {
-            let decision_changed = decision::simplify_decision_exprs_in_proto(proto);
-            let boolean_shells_changed =
-                boolean_shells::remove_boolean_materialization_shells_in_proto(proto);
-            let logical_changed = logical_simplify::simplify_logical_exprs_in_proto(proto);
-            let table_changed = table_constructors::stabilize_table_constructors_in_proto(proto);
-            let temp_inline_changed = temp_inline::inline_temps_in_proto(proto, readability);
-            let locals_changed = locals::promote_temps_to_locals_in_proto(proto);
-            let eliminate_changed = decision::eliminate_remaining_decisions_in_proto(proto);
-            changed |= decision_changed
-                || boolean_shells_changed
-                || logical_changed
-                || table_changed
-                || temp_inline_changed
-                || locals_changed
-                || eliminate_changed;
-        }
+        let changed = timings.record("fixed-point-round", || {
+            let mut changed = false;
+            changed |= timings.record("decision", || {
+                apply_proto_pass(module, decision::simplify_decision_exprs_in_proto)
+            });
+            changed |= timings.record("boolean-shells", || {
+                apply_proto_pass(
+                    module,
+                    boolean_shells::remove_boolean_materialization_shells_in_proto,
+                )
+            });
+            changed |= timings.record("logical-simplify", || {
+                apply_proto_pass(module, logical_simplify::simplify_logical_exprs_in_proto)
+            });
+            changed |= timings.record("table-constructors", || {
+                apply_proto_pass(
+                    module,
+                    table_constructors::stabilize_table_constructors_in_proto,
+                )
+            });
+            changed |= timings.record("temp-inline", || {
+                apply_proto_pass(module, |proto| {
+                    temp_inline::inline_temps_in_proto(proto, readability)
+                })
+            });
+            changed |= timings.record("locals", || {
+                apply_proto_pass(module, locals::promote_temps_to_locals_in_proto)
+            });
+            changed |= timings.record("eliminate-decisions", || {
+                apply_proto_pass(module, decision::eliminate_remaining_decisions_in_proto)
+            });
+            changed
+        });
 
         if !changed {
             converged = true;
@@ -67,6 +93,17 @@ pub(super) fn simplify_hir(module: &mut HirModule, readability: ReadabilityOptio
             residuals.other_unstructured
         ));
     }
+}
+
+fn apply_proto_pass(
+    module: &mut HirModule,
+    mut pass: impl FnMut(&mut crate::hir::common::HirProto) -> bool,
+) -> bool {
+    let mut changed = false;
+    for proto in &mut module.protos {
+        changed |= pass(proto);
+    }
+    changed
 }
 
 pub(crate) fn synthesize_readable_pure_logical_expr(

@@ -577,7 +577,10 @@ mod tests {
             })],
         };
 
-        super::super::simplify_hir(&mut module, crate::readability::ReadabilityOptions::default());
+        super::super::simplify_hir(
+            &mut module,
+            crate::readability::ReadabilityOptions::default(),
+        );
 
         assert!(matches!(
             &module.protos[0].body.stmts.as_slice(),

@@ -225,9 +225,7 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
         | HirStmt::Close(_)
         | HirStmt::Continue
         | HirStmt::Goto(_)
-        | HirStmt::Label(_) => {
-            (vec![stmt], false)
-        }
+        | HirStmt::Label(_) => (vec![stmt], false),
     }
 }
 

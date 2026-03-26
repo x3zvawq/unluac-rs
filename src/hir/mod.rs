@@ -10,16 +10,15 @@ mod decision;
 mod simplify;
 
 pub use analyze::analyze_hir;
-pub(crate) use simplify::synthesize_readable_pure_logical_expr;
+pub(crate) use analyze::analyze_hir_with_timing;
 pub use common::{
     HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirCallStmt, HirCapture,
-    HirClose,
-    HirClosureExpr, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget,
-    HirExpr, HirGenericFor, HirGlobalRef, HirGoto, HirIf, HirLValue, HirLabel, HirLabelId,
-    HirLogicalExpr,
-    HirLocalDecl, HirModule, HirNumericFor, HirProto, HirProtoRef, HirRecordField, HirRepeat,
-    HirReturn, HirStmt, HirTableAccess, HirTableConstructor, HirTableField, HirTableKey,
-    HirTableSetList, HirToBeClosed, HirUnaryExpr, HirUnaryOpKind, HirUnresolvedExpr,
-    HirUnstructured, HirWhile, LocalId, ParamId, TempId, UpvalueId,
+    HirClose, HirClosureExpr, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef,
+    HirDecisionTarget, HirExpr, HirGenericFor, HirGlobalRef, HirGoto, HirIf, HirLValue, HirLabel,
+    HirLabelId, HirLocalDecl, HirLogicalExpr, HirModule, HirNumericFor, HirProto, HirProtoRef,
+    HirRecordField, HirRepeat, HirReturn, HirStmt, HirTableAccess, HirTableConstructor,
+    HirTableField, HirTableKey, HirTableSetList, HirToBeClosed, HirUnaryExpr, HirUnaryOpKind,
+    HirUnresolvedExpr, HirUnstructured, HirWhile, LocalId, ParamId, TempId, UpvalueId,
 };
 pub use debug::dump_hir;
+pub(crate) use simplify::synthesize_readable_pure_logical_expr;

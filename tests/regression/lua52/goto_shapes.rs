@@ -49,6 +49,7 @@ fn hir_dump_for(source_relative: &str) -> String {
             debug: DebugOptions {
                 enable: true,
                 output_stages: vec![DecompileStage::Hir],
+                timing: false,
                 detail: DebugDetail::Normal,
                 filters: Default::default(),
             },

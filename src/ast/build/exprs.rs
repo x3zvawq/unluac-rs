@@ -5,7 +5,7 @@ use crate::hir::{
     HirTableAccess, HirTableField, HirTableKey, HirUnaryOpKind,
 };
 
-use super::{AstLowerer, AstLowerError};
+use super::{AstLowerError, AstLowerer};
 use crate::ast::common::{
     AstAssign, AstBinaryExpr, AstBinaryOpKind, AstCallExpr, AstCallKind, AstExpr, AstFieldAccess,
     AstFunctionExpr, AstGlobalName, AstIndexAccess, AstLValue, AstLocalAttr, AstLocalBinding,
@@ -19,14 +19,12 @@ impl<'a> AstLowerer<'a> {
         owner_proto: usize,
         closure: &HirClosureExpr,
     ) -> Result<AstFunctionExpr, AstLowerError> {
-        let child = self
-            .module
-            .protos
-            .get(closure.proto.index())
-            .ok_or(AstLowerError::MissingChildProto {
+        let child = self.module.protos.get(closure.proto.index()).ok_or(
+            AstLowerError::MissingChildProto {
                 proto: owner_proto,
                 child: closure.proto.index(),
-            })?;
+            },
+        )?;
         let body = self.lower_proto_body(closure.proto.index())?;
         Ok(AstFunctionExpr {
             params: child.params.clone(),
@@ -153,8 +151,8 @@ impl<'a> AstLowerer<'a> {
                 AstCallKind::MethodCall(call) => AstExpr::MethodCall(call),
             },
             HirExpr::VarArg => AstExpr::VarArg,
-            HirExpr::TableConstructor(table) => AstExpr::TableConstructor(Box::new(
-                AstTableConstructor {
+            HirExpr::TableConstructor(table) => {
+                AstExpr::TableConstructor(Box::new(AstTableConstructor {
                     fields: table
                         .fields
                         .iter()
@@ -162,8 +160,8 @@ impl<'a> AstLowerer<'a> {
                             HirTableField::Array(value) => {
                                 Ok(AstTableField::Array(self.lower_expr(proto_index, value)?))
                             }
-                            HirTableField::Record(record) => Ok(AstTableField::Record(
-                                crate::ast::common::AstRecordField {
+                            HirTableField::Record(record) => {
+                                Ok(AstTableField::Record(crate::ast::common::AstRecordField {
                                     key: match &record.key {
                                         HirTableKey::Name(name) => AstTableKey::Name(name.clone()),
                                         HirTableKey::Expr(expr) => {
@@ -171,12 +169,12 @@ impl<'a> AstLowerer<'a> {
                                         }
                                     },
                                     value: self.lower_expr(proto_index, &record.value)?,
-                                },
-                            )),
+                                }))
+                            }
                         })
                         .collect::<Result<Vec<_>, _>>()?,
-                },
-            )),
+                }))
+            }
             HirExpr::Closure(closure) => {
                 AstExpr::FunctionExpr(Box::new(self.lower_function_expr(proto_index, closure)?))
             }
@@ -201,7 +199,9 @@ impl<'a> AstLowerer<'a> {
             .map(|arg| self.lower_expr(proto_index, arg))
             .collect::<Result<Vec<_>, _>>()?;
 
-        if call.method && let AstExpr::FieldAccess(access) = callee {
+        if call.method
+            && let AstExpr::FieldAccess(access) = callee
+        {
             return Ok(AstCallKind::MethodCall(Box::new(AstMethodCallExpr {
                 receiver: access.base,
                 method: access.field,

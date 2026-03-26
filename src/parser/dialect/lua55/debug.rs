@@ -16,7 +16,12 @@ pub(crate) fn dump_chunk(chunk: &RawChunk, detail: DebugDetail, filters: &DebugF
     collect_protos(&chunk.main, 0, &mut protos);
 
     let _ = writeln!(output, "===== Dump Parser =====");
-    let _ = writeln!(output, "parser dialect=lua5.5 detail={} protos={}", detail, protos.len());
+    let _ = writeln!(
+        output,
+        "parser dialect=lua5.5 detail={} protos={}",
+        detail,
+        protos.len()
+    );
     if let Some(proto_id) = filters.proto {
         let _ = writeln!(output, "filters proto=proto#{proto_id}");
     }
@@ -92,7 +97,11 @@ pub(crate) fn dump_chunk(chunk: &RawChunk, detail: DebugDetail, filters: &DebugF
     output
 }
 
-fn collect_protos<'a>(proto: &'a RawProto, depth: usize, out: &mut Vec<(usize, usize, &'a RawProto)>) {
+fn collect_protos<'a>(
+    proto: &'a RawProto,
+    depth: usize,
+    out: &mut Vec<(usize, usize, &'a RawProto)>,
+) {
     let id = out.len();
     out.push((id, depth, proto));
     for child in &proto.common.children {

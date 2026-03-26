@@ -332,12 +332,10 @@ fn summarize_stmt_fallthrough_assignments(stmt: &HirStmt) -> Option<FallthroughS
         | HirStmt::ToBeClosed(_)
         | HirStmt::Close(_)
         | HirStmt::CallStmt(_)
-        | HirStmt::Label(_) => {
-            Some(FallthroughSummary {
-                falls_through: true,
-                assigned_temps: BTreeSet::new(),
-            })
-        }
+        | HirStmt::Label(_) => Some(FallthroughSummary {
+            falls_through: true,
+            assigned_temps: BTreeSet::new(),
+        }),
         HirStmt::Assign(assign) => Some(FallthroughSummary {
             falls_through: true,
             assigned_temps: assign
@@ -844,7 +842,10 @@ mod tests {
             })],
         };
 
-        super::super::simplify_hir(&mut module, crate::readability::ReadabilityOptions::default());
+        super::super::simplify_hir(
+            &mut module,
+            crate::readability::ReadabilityOptions::default(),
+        );
 
         assert_eq!(module.protos[0].locals.len(), 1);
         assert!(matches!(
@@ -891,7 +892,10 @@ mod tests {
             })],
         };
 
-        super::super::simplify_hir(&mut module, crate::readability::ReadabilityOptions::default());
+        super::super::simplify_hir(
+            &mut module,
+            crate::readability::ReadabilityOptions::default(),
+        );
 
         assert_eq!(module.protos[0].locals.len(), 1);
         assert!(matches!(

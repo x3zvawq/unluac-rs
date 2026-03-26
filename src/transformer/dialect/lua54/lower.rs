@@ -19,10 +19,10 @@ use crate::transformer::{
     ConcatInstr, CondOperand, ConstRef, DialectCaptureExtra, GenericForCallInstr,
     GenericForLoopInstr, GetTableInstr, GetUpvalueInstr, InstrRef, JumpInstr, LoadBoolInstr,
     LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr, LoweredChunk,
-    LoweredProto, LoweringMap, MoveInstr, NewTableInstr, NumericForInitInstr,
+    LoweredProto, LoweringMap, MoveInstr, NewTableInstr, NumberLiteral, NumericForInitInstr,
     NumericForLoopInstr, ProtoRef, RawInstrRef, Reg, RegRange, ResultPack, ReturnInstr,
     SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr, TbcInstr, TransformError,
-    UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr, NumberLiteral,
+    UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
 const EXTRAARG_SCALE_8: u32 = 1_u32 << 8;
@@ -508,12 +508,14 @@ impl<'a> ProtoLowerer<'a> {
                     let dst = reg_from_u8(a);
                     self.invalidate_written_reg(dst);
                     let (lhs, rhs) = match opcode {
-                        Lua54Opcode::ShrI => {
-                            (ValueOperand::Reg(reg_from_u8(b)), ValueOperand::Integer(i64::from(sc)))
-                        }
-                        Lua54Opcode::ShlI => {
-                            (ValueOperand::Integer(i64::from(sc)), ValueOperand::Reg(reg_from_u8(b)))
-                        }
+                        Lua54Opcode::ShrI => (
+                            ValueOperand::Reg(reg_from_u8(b)),
+                            ValueOperand::Integer(i64::from(sc)),
+                        ),
+                        Lua54Opcode::ShlI => (
+                            ValueOperand::Integer(i64::from(sc)),
+                            ValueOperand::Reg(reg_from_u8(b)),
+                        ),
                         _ => unreachable!("only shift-immediate opcodes should reach this branch"),
                     };
                     self.emit(
@@ -617,7 +619,9 @@ impl<'a> ProtoLowerer<'a> {
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Jump {
-                            target: TargetPlaceholder::Raw(self.jump_target_sj(raw_pc, extra.pc, sj)?),
+                            target: TargetPlaceholder::Raw(
+                                self.jump_target_sj(raw_pc, extra.pc, sj)?,
+                            ),
                         },
                     );
                     raw_index += 1;
@@ -679,7 +683,8 @@ impl<'a> ProtoLowerer<'a> {
                     let (a, sb, c, k) = expect_asbck(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let rhs = self.compare_immediate(sb, c != 0);
-                    let (predicate, lhs, rhs) = compare_immediate_shape(opcode, reg_from_u8(a), rhs);
+                    let (predicate, lhs, rhs) =
+                        compare_immediate_shape(opcode, reg_from_u8(a), rhs);
                     let cond = BranchCond {
                         predicate,
                         operands: BranchOperands::Binary(lhs, rhs),
@@ -1077,7 +1082,14 @@ impl<'a> ProtoLowerer<'a> {
         let low_to_raw = self
             .emitted
             .iter()
-            .map(|emitted| emitted.raw_indices.iter().copied().map(RawInstrRef).collect())
+            .map(|emitted| {
+                emitted
+                    .raw_indices
+                    .iter()
+                    .copied()
+                    .map(RawInstrRef)
+                    .collect()
+            })
             .collect::<Vec<Vec<RawInstrRef>>>();
         let pc_map = self
             .emitted
@@ -1267,9 +1279,16 @@ impl<'a> ProtoLowerer<'a> {
         })
     }
 
-    fn value_operand(&self, raw_pc: u32, operand: u8, k: bool) -> Result<ValueOperand, TransformError> {
+    fn value_operand(
+        &self,
+        raw_pc: u32,
+        operand: u8,
+        k: bool,
+    ) -> Result<ValueOperand, TransformError> {
         if k {
-            Ok(ValueOperand::Const(self.const_ref(raw_pc, operand as usize)?))
+            Ok(ValueOperand::Const(
+                self.const_ref(raw_pc, operand as usize)?,
+            ))
         } else {
             Ok(ValueOperand::Reg(reg_from_u8(operand)))
         }

@@ -27,7 +27,12 @@ mod lower_lua55_chunk {
                     if matches!(get_table.base, AccessBase::Reg(reg) if reg == Reg(1))
             )
         }));
-        assert!(probe.instrs.iter().any(|instr| matches!(instr, LowInstr::VarArg(_))));
+        assert!(
+            probe
+                .instrs
+                .iter()
+                .any(|instr| matches!(instr, LowInstr::VarArg(_)))
+        );
     }
 
     #[test]

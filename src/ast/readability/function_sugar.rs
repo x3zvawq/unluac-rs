@@ -73,7 +73,9 @@ fn rewrite_nested(stmt: &mut AstStmt, target: AstTargetDialect) -> bool {
             changed
         }
         AstStmt::DoBlock(block) => rewrite_block(block, target),
-        AstStmt::FunctionDecl(function_decl) => rewrite_function_expr(&mut function_decl.func, target),
+        AstStmt::FunctionDecl(function_decl) => {
+            rewrite_function_expr(&mut function_decl.func, target)
+        }
         AstStmt::LocalFunctionDecl(local_function_decl) => {
             rewrite_function_expr(&mut local_function_decl.func, target)
         }
@@ -136,7 +138,10 @@ fn rewrite_function_exprs_in_call(call: &mut AstCallKind, target: AstTargetDiale
     }
 }
 
-fn rewrite_function_exprs_in_lvalue(target_lvalue: &mut AstLValue, target: AstTargetDialect) -> bool {
+fn rewrite_function_exprs_in_lvalue(
+    target_lvalue: &mut AstLValue,
+    target: AstTargetDialect,
+) -> bool {
     match target_lvalue {
         AstLValue::Name(_) => false,
         AstLValue::FieldAccess(access) => rewrite_function_exprs_in_expr(&mut access.base, target),
@@ -211,9 +216,7 @@ fn lower_direct_function_stmt(stmt: AstStmt, target: AstTargetDialect) -> AstStm
         AstStmt::GlobalDecl(global_decl) => {
             try_lower_global_function_decl((**global_decl).clone(), target).unwrap_or(stmt)
         }
-        AstStmt::Assign(assign) => {
-            try_lower_function_assign((**assign).clone()).unwrap_or(stmt)
-        }
+        AstStmt::Assign(assign) => try_lower_function_assign((**assign).clone()).unwrap_or(stmt),
         _ => stmt,
     }
 }
@@ -267,7 +270,8 @@ fn try_lower_global_function_decl(
     global_decl: AstGlobalDecl,
     target: AstTargetDialect,
 ) -> Option<AstStmt> {
-    if !target.caps.global_decl || global_decl.bindings.len() != 1 || global_decl.values.len() != 1 {
+    if !target.caps.global_decl || global_decl.bindings.len() != 1 || global_decl.values.len() != 1
+    {
         return None;
     }
     if global_decl.bindings[0].attr != super::super::common::AstGlobalAttr::None {
@@ -371,10 +375,12 @@ fn function_name_from_lvalue(target: &AstLValue) -> Option<AstFunctionName> {
 
 fn name_path_from_expr(expr: &AstExpr) -> Option<(AstNameRef, Vec<String>)> {
     match expr {
-        AstExpr::Var(name @ (AstNameRef::Param(_)
-        | AstNameRef::Local(_)
-        | AstNameRef::Upvalue(_)
-        | AstNameRef::Global(_))) => Some((name.clone(), Vec::new())),
+        AstExpr::Var(
+            name @ (AstNameRef::Param(_)
+            | AstNameRef::Local(_)
+            | AstNameRef::Upvalue(_)
+            | AstNameRef::Global(_)),
+        ) => Some((name.clone(), Vec::new())),
         AstExpr::FieldAccess(access) => {
             let (root, mut fields) = name_path_from_expr(&access.base)?;
             fields.push(access.field.clone());
@@ -385,7 +391,10 @@ fn name_path_from_expr(expr: &AstExpr) -> Option<(AstNameRef, Vec<String>)> {
 }
 
 fn count_binding_value_uses_in_stmts(stmts: &[AstStmt], binding: AstBindingRef) -> usize {
-    stmts.iter().map(|stmt| count_binding_value_uses_in_stmt(stmt, binding)).sum()
+    stmts
+        .iter()
+        .map(|stmt| count_binding_value_uses_in_stmt(stmt, binding))
+        .sum()
 }
 
 fn count_binding_value_uses_in_stmt(stmt: &AstStmt, binding: AstBindingRef) -> usize {
@@ -450,7 +459,9 @@ fn count_binding_value_uses_in_stmt(stmt: &AstStmt, binding: AstBindingRef) -> u
                 + count_binding_value_uses_in_block(&generic_for.body, binding)
         }
         AstStmt::DoBlock(block) => count_binding_value_uses_in_block(block, binding),
-        AstStmt::FunctionDecl(function_decl) => count_binding_value_uses_in_block(&function_decl.func.body, binding),
+        AstStmt::FunctionDecl(function_decl) => {
+            count_binding_value_uses_in_block(&function_decl.func.body, binding)
+        }
         AstStmt::LocalFunctionDecl(local_function_decl) => {
             count_binding_value_uses_in_block(&local_function_decl.func.body, binding)
         }
@@ -515,7 +526,9 @@ fn count_binding_value_uses_in_expr(expr: &AstExpr, binding: AstBindingRef) -> u
             count_binding_value_uses_in_expr(&logical.lhs, binding)
                 + count_binding_value_uses_in_expr(&logical.rhs, binding)
         }
-        AstExpr::Call(call) => count_binding_value_uses_in_call(&AstCallKind::Call(call.clone()), binding),
+        AstExpr::Call(call) => {
+            count_binding_value_uses_in_call(&AstCallKind::Call(call.clone()), binding)
+        }
         AstExpr::MethodCall(call) => {
             count_binding_value_uses_in_call(&AstCallKind::MethodCall(call.clone()), binding)
         }
@@ -527,16 +540,19 @@ fn count_binding_value_uses_in_expr(expr: &AstExpr, binding: AstBindingRef) -> u
                     count_binding_value_uses_in_expr(value, binding)
                 }
                 super::super::common::AstTableField::Record(record) => {
-                    let key_count = if let super::super::common::AstTableKey::Expr(key) = &record.key {
-                        count_binding_value_uses_in_expr(key, binding)
-                    } else {
-                        0
-                    };
+                    let key_count =
+                        if let super::super::common::AstTableKey::Expr(key) = &record.key {
+                            count_binding_value_uses_in_expr(key, binding)
+                        } else {
+                            0
+                        };
                     key_count + count_binding_value_uses_in_expr(&record.value, binding)
                 }
             })
             .sum(),
-        AstExpr::FunctionExpr(function) => count_binding_value_uses_in_block(&function.body, binding),
+        AstExpr::FunctionExpr(function) => {
+            count_binding_value_uses_in_block(&function.body, binding)
+        }
         AstExpr::Nil
         | AstExpr::Boolean(_)
         | AstExpr::Integer(_)

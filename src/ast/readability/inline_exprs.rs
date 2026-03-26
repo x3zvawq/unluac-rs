@@ -144,16 +144,16 @@ fn rewrite_stmt_use_sites(
     options: ReadabilityOptions,
 ) -> bool {
     match stmt {
-        AstStmt::LocalDecl(local_decl) => {
-            rewrite_expr_list_context(
-                &mut local_decl.values,
-                binding,
-                replacement,
-                InlineSite::Neutral,
-                options,
-            )
+        AstStmt::LocalDecl(local_decl) => rewrite_expr_list_context(
+            &mut local_decl.values,
+            binding,
+            replacement,
+            InlineSite::Neutral,
+            options,
+        ),
+        AstStmt::GlobalDecl(global_decl) => {
+            rewrite_global_decl_use_sites(global_decl, binding, replacement, options)
         }
-        AstStmt::GlobalDecl(global_decl) => rewrite_global_decl_use_sites(global_decl, binding, replacement, options),
         AstStmt::Assign(assign) => {
             let mut changed = false;
             for target in &mut assign.targets {
@@ -507,7 +507,10 @@ fn rewrite_expr_use_sites(
 }
 
 fn count_temp_uses_in_stmts(stmts: &[AstStmt], binding: TempId) -> usize {
-    stmts.iter().map(|stmt| count_temp_uses_in_stmt(stmt, binding)).sum()
+    stmts
+        .iter()
+        .map(|stmt| count_temp_uses_in_stmt(stmt, binding))
+        .sum()
 }
 
 fn count_temp_uses_in_stmt(stmt: &AstStmt, binding: TempId) -> usize {
@@ -572,7 +575,9 @@ fn count_temp_uses_in_stmt(stmt: &AstStmt, binding: TempId) -> usize {
                 + count_temp_uses_in_block(&generic_for.body, binding)
         }
         AstStmt::DoBlock(block) => count_temp_uses_in_block(block, binding),
-        AstStmt::FunctionDecl(function_decl) => count_temp_uses_in_block(&function_decl.func.body, binding),
+        AstStmt::FunctionDecl(function_decl) => {
+            count_temp_uses_in_block(&function_decl.func.body, binding)
+        }
         AstStmt::LocalFunctionDecl(local_function_decl) => {
             count_temp_uses_in_block(&local_function_decl.func.body, binding)
         }
@@ -677,10 +682,12 @@ fn is_context_safe_expr(expr: &AstExpr) -> bool {
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_) => true,
-        AstExpr::Var(AstNameRef::Param(_)
-        | AstNameRef::Local(_)
-        | AstNameRef::Temp(_)
-        | AstNameRef::Upvalue(_)) => true,
+        AstExpr::Var(
+            AstNameRef::Param(_)
+            | AstNameRef::Local(_)
+            | AstNameRef::Temp(_)
+            | AstNameRef::Upvalue(_),
+        ) => true,
         AstExpr::Unary(unary) => {
             matches!(unary.op, super::super::common::AstUnaryOpKind::Not)
                 && is_context_safe_expr(&unary.expr)
@@ -738,12 +745,15 @@ fn expr_complexity(expr: &AstExpr) -> usize {
             1 + expr_complexity(&logical.lhs) + expr_complexity(&logical.rhs)
         }
         AstExpr::FieldAccess(access) => 1 + expr_complexity(&access.base),
-        AstExpr::IndexAccess(access) => 1 + expr_complexity(&access.base) + expr_complexity(&access.index),
+        AstExpr::IndexAccess(access) => {
+            1 + expr_complexity(&access.base) + expr_complexity(&access.index)
+        }
         AstExpr::Call(call) => {
             1 + expr_complexity(&call.callee) + call.args.iter().map(expr_complexity).sum::<usize>()
         }
         AstExpr::MethodCall(call) => {
-            1 + expr_complexity(&call.receiver) + call.args.iter().map(expr_complexity).sum::<usize>()
+            1 + expr_complexity(&call.receiver)
+                + call.args.iter().map(expr_complexity).sum::<usize>()
         }
         AstExpr::TableConstructor(table) => {
             1 + table
@@ -783,7 +793,9 @@ impl InlineSite {
         options: ReadabilityOptions,
     ) -> bool {
         matches!(use_expr, AstExpr::Var(AstNameRef::Temp(temp)) if *temp == binding)
-            && self.complexity_limit(options).is_some_and(|limit| expr_complexity(replacement) <= limit)
+            && self
+                .complexity_limit(options)
+                .is_some_and(|limit| expr_complexity(replacement) <= limit)
             && (!matches!(self, Self::AccessBase) || is_access_base_inline_expr(replacement))
     }
 
@@ -811,8 +823,8 @@ mod tests {
         AstCallExpr, AstFieldAccess, AstIndexAccess, AstLocalBinding, AstMethodCallExpr, AstReturn,
     };
     use crate::ast::{
-        AstBinaryExpr, AstBinaryOpKind, AstCallKind, AstExpr, AstLValue, AstLocalAttr,
-        AstModule, AstNameRef, AstStmt, AstTargetDialect, AstUnaryExpr, AstUnaryOpKind,
+        AstBinaryExpr, AstBinaryOpKind, AstCallKind, AstExpr, AstLValue, AstLocalAttr, AstModule,
+        AstNameRef, AstStmt, AstTargetDialect, AstUnaryExpr, AstUnaryOpKind,
     };
     use crate::hir::{LocalId, TempId};
 

@@ -249,7 +249,7 @@ mod tests {
     };
     use crate::hir::ParamId;
 
-    use super::{apply, super::ReadabilityContext};
+    use super::{super::ReadabilityContext, apply};
 
     #[test]
     fn flips_negative_truthy_ternary_to_positive_polarity() {

@@ -13,8 +13,8 @@ use crate::parser::RawLocalVar;
 use crate::structure::{LoopKindHint, StructureFacts};
 use crate::transformer::{InstrRef, LoweredProto, Reg};
 
-use super::helpers::decode_raw_string;
 use super::ProtoBindings;
+use super::helpers::decode_raw_string;
 
 pub(super) fn build_bindings(
     proto: &LoweredProto,
@@ -37,7 +37,10 @@ pub(super) fn build_bindings(
     if proto.signature.has_vararg_param_reg {
         let local = LocalId(locals.len());
         locals.push(local);
-        entry_local_regs.insert(crate::transformer::Reg(usize::from(proto.signature.num_params)), local);
+        entry_local_regs.insert(
+            crate::transformer::Reg(usize::from(proto.signature.num_params)),
+            local,
+        );
     }
 
     for candidate in structure
@@ -104,7 +107,8 @@ pub(super) fn build_bindings(
 
     for def in &dataflow.defs {
         let temp = fixed_temps[def.id.index()];
-        temp_debug_locals[temp.index()] = debug_local_name_for_reg_at_instr(proto, def.reg, def.instr);
+        temp_debug_locals[temp.index()] =
+            debug_local_name_for_reg_at_instr(proto, def.reg, def.instr);
     }
 
     for open_def in &dataflow.open_defs {
@@ -157,7 +161,12 @@ fn debug_local_name_for_reg_at_instr(
     reg: Reg,
     instr: InstrRef,
 ) -> Option<String> {
-    let pc = proto.lowering_map.pc_map.get(instr.index())?.first().copied()?;
+    let pc = proto
+        .lowering_map
+        .pc_map
+        .get(instr.index())?
+        .first()
+        .copied()?;
     debug_local_name_for_reg_at_pc(proto, reg, pc)
 }
 

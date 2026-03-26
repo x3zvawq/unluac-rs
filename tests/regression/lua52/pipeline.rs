@@ -21,6 +21,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Ast],
+                    timing: false,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },

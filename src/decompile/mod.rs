@@ -10,15 +10,16 @@ mod options;
 mod pipeline;
 mod state;
 
-pub use crate::readability::ReadabilityOptions;
 pub use crate::debug::{DebugDetail, DebugFilters};
+pub use crate::readability::ReadabilityOptions;
+pub use crate::timing::{TimingNode, TimingReport, render_timing_report};
 pub use contracts::{
     AstChunk, CfgGraph, DataflowFacts, GeneratedChunk, GraphFacts, HirChunk, LoweredChunk,
     NamingResult, ReadabilityResult, StructureFacts,
 };
 pub use debug::{
-    DebugOptions, StageDebugOutput, dump_ast, dump_cfg, dump_dataflow, dump_graph_facts,
-    dump_hir, dump_lir, dump_parser, dump_readability, dump_structure,
+    DebugOptions, StageDebugOutput, dump_ast, dump_cfg, dump_dataflow, dump_graph_facts, dump_hir,
+    dump_lir, dump_parser, dump_readability, dump_structure,
 };
 pub use error::DecompileError;
 pub use options::{DecompileDialect, DecompileOptions};

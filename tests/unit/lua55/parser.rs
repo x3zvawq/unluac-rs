@@ -47,9 +47,11 @@ mod parse_lua55_chunk {
         assert!(expose.signature.is_vararg);
         assert!(expose.signature.has_vararg_param_reg);
         assert!(expose.signature.named_vararg_table);
-        assert!(expose.instructions.iter().any(|instr| {
-            matches!(instr.opcode, RawInstrOpcode::Lua55(Lua55Opcode::Return1))
-        }));
+        assert!(
+            expose.instructions.iter().any(|instr| {
+                matches!(instr.opcode, RawInstrOpcode::Lua55(Lua55Opcode::Return1))
+            })
+        );
 
         let DialectDebugExtra::Lua55(debug_extra) = &expose.debug_info.extra else {
             panic!("lua55 fixture should carry lua55 debug extras");

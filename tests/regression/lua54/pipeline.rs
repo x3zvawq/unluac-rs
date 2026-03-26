@@ -9,10 +9,8 @@ mod decompile_pipeline {
 
     #[test]
     fn lua54_transform_stage_reports_tbc_close_and_loadi() {
-        let chunk = crate::support::compile_lua_case(
-            "lua5.4",
-            "tests/lua_cases/lua5.4/01_tbc_close.lua",
-        );
+        let chunk =
+            crate::support::compile_lua_case("lua5.4", "tests/lua_cases/lua5.4/01_tbc_close.lua");
         let result = decompile(
             &chunk,
             DecompileOptions {
@@ -21,6 +19,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Transform],
+                    timing: false,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -42,10 +41,8 @@ mod decompile_pipeline {
 
     #[test]
     fn lua54_hir_stage_runs_for_const_local_fixture() {
-        let chunk = crate::support::compile_lua_case(
-            "lua5.4",
-            "tests/lua_cases/lua5.4/02_const_local.lua",
-        );
+        let chunk =
+            crate::support::compile_lua_case("lua5.4", "tests/lua_cases/lua5.4/02_const_local.lua");
         let result = decompile(
             &chunk,
             DecompileOptions {
@@ -54,6 +51,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
+                    timing: false,
                     detail: DebugDetail::Summary,
                     filters: Default::default(),
                 },
@@ -70,10 +68,8 @@ mod decompile_pipeline {
 
     #[test]
     fn lua54_hir_stage_models_tbc_as_structured_stmt() {
-        let chunk = crate::support::compile_lua_case(
-            "lua5.4",
-            "tests/lua_cases/lua5.4/01_tbc_close.lua",
-        );
+        let chunk =
+            crate::support::compile_lua_case("lua5.4", "tests/lua_cases/lua5.4/01_tbc_close.lua");
         let result = decompile(
             &chunk,
             DecompileOptions {
@@ -82,6 +78,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
+                    timing: false,
                     detail: DebugDetail::Verbose,
                     filters: Default::default(),
                 },
@@ -110,6 +107,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
+                    timing: false,
                     detail: DebugDetail::Verbose,
                     filters: Default::default(),
                 },
@@ -128,10 +126,8 @@ mod decompile_pipeline {
 
     #[test]
     fn lua54_ast_stage_absorbs_simple_tbc_into_local_close_decl() {
-        let chunk = crate::support::compile_lua_case(
-            "lua5.4",
-            "tests/lua_cases/lua5.4/01_tbc_close.lua",
-        );
+        let chunk =
+            crate::support::compile_lua_case("lua5.4", "tests/lua_cases/lua5.4/01_tbc_close.lua");
         let result = decompile(
             &chunk,
             DecompileOptions {
@@ -140,6 +136,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Ast],
+                    timing: false,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -189,6 +186,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Readability],
+                    timing: false,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -197,9 +195,15 @@ mod decompile_pipeline {
         )
         .expect("lua5.4 readability stage should succeed for generic-for close fixture");
 
-        assert_eq!(result.state.completed_stage, Some(DecompileStage::Readability));
+        assert_eq!(
+            result.state.completed_stage,
+            Some(DecompileStage::Readability)
+        );
         let dump = &result.debug_output[0].content;
-        assert!(dump.contains("for l0, l1, l2 in l5({\"aa\", \"bbb\", \"c\"}) do"), "{dump}");
+        assert!(
+            dump.contains("for l0, l1, l2 in l5({\"aa\", \"bbb\", \"c\"}) do"),
+            "{dump}"
+        );
         assert!(dump.contains("<close> = l4("), "{dump}");
         assert!(!dump.contains("to-be-closed"), "{dump}");
         assert!(!dump.contains("local t9"), "{dump}");

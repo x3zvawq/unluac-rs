@@ -3,12 +3,9 @@
 //! 它们不关心某一层内部怎么实现，而是验证主入口停阶段、dump 输出和错误语义
 //! 是否稳定，因此归类为 regression。
 
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use unluac::decompile::{
-    DebugDetail, DebugOptions, DecompileOptions, DecompileStage, ReadabilityOptions, decompile,
+    DebugDetail, DebugOptions, DecompileOptions, DecompileStage, ReadabilityOptions, TimingNode,
+    TimingReport, decompile,
 };
 
 const SETFENV_CHUNK_HEX: &str = "
@@ -38,6 +35,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Parse],
+                    timing: false,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -67,6 +65,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Parse],
+                    timing: false,
                     detail: DebugDetail::Summary,
                     filters: Default::default(),
                 },
@@ -91,6 +90,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Parse, DecompileStage::Transform],
+                    timing: false,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -113,6 +113,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Transform],
+                    timing: false,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -145,6 +146,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Cfg],
+                    timing: false,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -172,6 +174,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::GraphFacts],
+                    timing: false,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -203,6 +206,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Dataflow],
+                    timing: false,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -231,6 +235,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::StructureFacts],
+                    timing: false,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -265,6 +270,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
+                    timing: false,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -295,6 +301,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
+                    timing: false,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -334,6 +341,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
+                    timing: false,
                     detail: DebugDetail::Verbose,
                     filters: Default::default(),
                 },
@@ -343,7 +351,10 @@ mod decompile_pipeline {
         .expect("ultimate_mess hir stage should succeed");
 
         let dump = &result.debug_output[0].content;
-        assert!(dump.contains("local [\"l1\"] = p0[\"branches\"]["), "{dump}");
+        assert!(
+            dump.contains("local [\"l1\"] = p0[\"branches\"]["),
+            "{dump}"
+        );
         assert!(dump.contains("local [\"l2\"] = l1[\"items\"]["), "{dump}");
         assert!(dump.contains("return "), "{dump}");
         assert!(dump.contains("l2[\"value\"]"), "{dump}");
@@ -367,6 +378,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
+                    timing: false,
                     detail: DebugDetail::Verbose,
                     filters: Default::default(),
                 },
@@ -376,7 +388,10 @@ mod decompile_pipeline {
         .expect("ultimate_mess hir stage with debug chunk should succeed");
 
         let dump = &result.debug_output[0].content;
-        assert!(dump.contains("local [\"l1\"] = p0[\"branches\"]["), "{dump}");
+        assert!(
+            dump.contains("local [\"l1\"] = p0[\"branches\"]["),
+            "{dump}"
+        );
         assert!(dump.contains("local [\"l2\"] = l1[\"items\"]["), "{dump}");
         assert!(dump.contains("return "), "{dump}");
         assert!(dump.contains("l2[\"value\"]"), "{dump}");
@@ -394,6 +409,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Readability],
+                    timing: false,
                     detail: DebugDetail::Verbose,
                     filters: Default::default(),
                 },
@@ -409,9 +425,18 @@ mod decompile_pipeline {
             ),
             "{dump}"
         );
-        assert!(dump.contains("local l1 = p0.branches[((p1 and \"t\") or \"f\")]"), "{dump}");
-        assert!(dump.contains("local l2 = l1.items[((p2 and 1) or 2)]"), "{dump}");
-        assert!(dump.contains("return ((l0 and \"T\") or \"F\"), l2.value"), "{dump}");
+        assert!(
+            dump.contains("local l1 = p0.branches[((p1 and \"t\") or \"f\")]"),
+            "{dump}"
+        );
+        assert!(
+            dump.contains("local l2 = l1.items[((p2 and 1) or 2)]"),
+            "{dump}"
+        );
+        assert!(
+            dump.contains("return ((l0 and \"T\") or \"F\"), l2.value"),
+            "{dump}"
+        );
     }
 
     #[test]
@@ -436,6 +461,7 @@ mod decompile_pipeline {
                     debug: DebugOptions {
                         enable: true,
                         output_stages: vec![DecompileStage::Hir],
+                        timing: false,
                         detail: DebugDetail::Normal,
                         filters: Default::default(),
                     },
@@ -492,59 +518,103 @@ mod decompile_pipeline {
 
         assert_eq!(result.state.completed_stage, Some(DecompileStage::Ast));
     }
+
+    #[test]
+    fn leaves_timing_disabled_by_default() {
+        let result = decompile(
+            &crate::support::decode_hex(SETFENV_CHUNK_HEX),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: Vec::new(),
+                    timing: false,
+                    detail: DebugDetail::Summary,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("hir stage should succeed without timing");
+
+        assert!(result.timing_report.is_none());
+    }
+
+    #[test]
+    fn collects_pipeline_and_pass_timings_when_enabled() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.1",
+            "tests/lua_cases/common/tricky/02_ultimate_mess.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: unluac::decompile::DecompileDialect::Lua51,
+                target_stage: DecompileStage::Readability,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: Vec::new(),
+                    timing: true,
+                    detail: DebugDetail::Normal,
+                    filters: Default::default(),
+                },
+                readability: ReadabilityOptions {
+                    return_inline_max_complexity: 999,
+                    index_inline_max_complexity: 999,
+                    args_inline_max_complexity: 6,
+                    access_base_inline_max_complexity: 999,
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("readability stage should succeed with timing enabled");
+
+        let report = result
+            .timing_report
+            .as_ref()
+            .expect("timing should be collected when explicitly enabled");
+        assert!(find_timing_node(report, &["parse"]).is_some());
+        assert!(find_timing_node(report, &["hir", "lower"]).is_some());
+        assert!(
+            find_timing_node(
+                report,
+                &["hir", "simplify", "fixed-point-round", "temp-inline"]
+            )
+            .is_some()
+        );
+        assert!(find_timing_node(report, &["readability", "statement-merge"]).is_some());
+        assert!(
+            find_timing_node(
+                report,
+                &[
+                    "readability",
+                    "short-circuit-pretty",
+                    "fixed-point-round",
+                    "short-circuit-pretty"
+                ],
+            )
+            .is_some()
+        );
+    }
+
+    fn find_timing_node<'a>(report: &'a TimingReport, path: &[&str]) -> Option<&'a TimingNode> {
+        find_timing_node_in_children(&report.nodes, path)
+    }
+
+    fn find_timing_node_in_children<'a>(
+        nodes: &'a [TimingNode],
+        path: &[&str],
+    ) -> Option<&'a TimingNode> {
+        let (head, tail) = path.split_first()?;
+        let node = nodes.iter().find(|node| node.label == *head)?;
+        if tail.is_empty() {
+            Some(node)
+        } else {
+            find_timing_node_in_children(&node.children, tail)
+        }
+    }
 }
 
 fn compile_lua_case(dialect_label: &str, source_relative: &str) -> Vec<u8> {
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let source = repo_root.join(source_relative);
-    let luac = repo_root
-        .join("lua")
-        .join("build")
-        .join(dialect_label)
-        .join("luac");
-    assert!(
-        luac.exists(),
-        "missing bundled luac for {dialect_label}: {}",
-        luac.display()
-    );
-
-    let output = test_chunk_output_path(&repo_root, dialect_label, &source);
-    fs::create_dir_all(
-        output
-            .parent()
-            .expect("regression chunk path should always have a parent"),
-    )
-    .expect("should create regression chunk output directory");
-
-    let status = Command::new(&luac)
-        .arg("-s")
-        .arg("-o")
-        .arg(&output)
-        .arg(&source)
-        .status()
-        .expect("should spawn bundled luac for regression case");
-    assert!(
-        status.success(),
-        "bundled luac failed for {} with status {status}",
-        source.display()
-    );
-
-    fs::read(&output).unwrap_or_else(|error| {
-        panic!(
-            "should read compiled regression chunk {}: {error}",
-            output.display()
-        )
-    })
-}
-
-fn test_chunk_output_path(repo_root: &Path, dialect_label: &str, source: &Path) -> PathBuf {
-    let relative = source
-        .strip_prefix(repo_root)
-        .expect("regression source should stay inside the repo root");
-    repo_root
-        .join("target")
-        .join("unluac-tests")
-        .join(dialect_label)
-        .join(relative)
-        .with_extension("out")
+    crate::support::compile_lua_case(dialect_label, source_relative)
 }

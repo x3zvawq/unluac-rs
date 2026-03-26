@@ -6,8 +6,8 @@
 //! 显式实现，避免把这些变化继续塞回 5.4 的读取假设里。
 
 use crate::parser::dialect::puc_lua::{
-    LUA_SIGNATURE, LUA55_LUAC_DATA, LUA55_LUAC_INST, LUA55_LUAC_INT, LUA55_LUAC_NUM,
-    PucLuaLayout, RawInstructionWord, decode_instruction_word_55,
+    LUA_SIGNATURE, LUA55_LUAC_DATA, LUA55_LUAC_INST, LUA55_LUAC_INT, LUA55_LUAC_NUM, PucLuaLayout,
+    RawInstructionWord, decode_instruction_word_55,
 };
 use crate::parser::error::ParseError;
 use crate::parser::options::ParseOptions;
@@ -149,11 +149,8 @@ impl Lua55ParserState {
                 value: instruction_size,
             });
         }
-        let instruction_sentinel = reader.read_u64_sized(
-            instruction_size,
-            endianness,
-            "instruction",
-        )?;
+        let instruction_sentinel =
+            reader.read_u64_sized(instruction_size, endianness, "instruction")?;
         if instruction_sentinel != u64::from(LUA55_LUAC_INST) && !self.options.mode.is_permissive()
         {
             return Err(ParseError::UnsupportedValue {
@@ -543,12 +540,16 @@ impl Lua55ParserState {
                 LUA_VNUMFLT => RawLiteralConst::Number(
                     reader.read_f64_sized(layout.number_size, layout.endianness)?,
                 ),
-                LUA_VNUMINT => RawLiteralConst::Integer(self.read_lua_integer(reader, "lua_Integer")?),
+                LUA_VNUMINT => {
+                    RawLiteralConst::Integer(self.read_lua_integer(reader, "lua_Integer")?)
+                }
                 LUA_VSHRSTR | LUA_VLNGSTR => {
-                    let value = self.parse_string(reader)?.ok_or(ParseError::UnsupportedValue {
-                        field: "string constant length",
-                        value: 0,
-                    })?;
+                    let value = self
+                        .parse_string(reader)?
+                        .ok_or(ParseError::UnsupportedValue {
+                            field: "string constant length",
+                            value: 0,
+                        })?;
                     RawLiteralConst::String(value)
                 }
                 _ => return Err(ParseError::InvalidConstantTag { offset, tag }),
@@ -562,7 +563,10 @@ impl Lua55ParserState {
         })
     }
 
-    fn parse_upvalues(&mut self, reader: &mut BinaryReader<'_>) -> Result<RawUpvalueInfo, ParseError> {
+    fn parse_upvalues(
+        &mut self,
+        reader: &mut BinaryReader<'_>,
+    ) -> Result<RawUpvalueInfo, ParseError> {
         let count = self.read_count(reader, "upvalue count")?;
         let count_u8 = u8::try_from(count).map_err(|_| ParseError::IntegerOverflow {
             field: "upvalue count",
@@ -631,10 +635,12 @@ impl Lua55ParserState {
         let local_count = self.read_count(reader, "local var count")?;
         let mut local_vars = Vec::with_capacity(local_count as usize);
         for _ in 0..local_count {
-            let name = self.parse_optional_string(reader)?.ok_or(ParseError::UnsupportedValue {
-                field: "local var name length",
-                value: 0,
-            })?;
+            let name = self
+                .parse_optional_string(reader)?
+                .ok_or(ParseError::UnsupportedValue {
+                    field: "local var name length",
+                    value: 0,
+                })?;
             let start_pc = self.read_count(reader, "local var startpc")?;
             let end_pc = self.read_count(reader, "local var endpc")?;
             local_vars.push(RawLocalVar {
@@ -729,10 +735,12 @@ impl Lua55ParserState {
                     value: current,
                 });
             }
-            lines.push(u32::try_from(current).map_err(|_| ParseError::IntegerOverflow {
-                field: "line info",
-                value: current as u64,
-            })?);
+            lines.push(
+                u32::try_from(current).map_err(|_| ParseError::IntegerOverflow {
+                    field: "line info",
+                    value: current as u64,
+                })?,
+            );
         }
 
         Ok(lines)
@@ -756,10 +764,11 @@ impl Lua55ParserState {
                 return Ok(None);
             }
 
-            let saved_index = usize::try_from(index - 1).map_err(|_| ParseError::IntegerOverflow {
-                field: "string reuse index",
-                value: index,
-            })?;
+            let saved_index =
+                usize::try_from(index - 1).map_err(|_| ParseError::IntegerOverflow {
+                    field: "string reuse index",
+                    value: index,
+                })?;
             let saved = self.saved_strings.get(saved_index).cloned().ok_or(
                 ParseError::UnsupportedValue {
                     field: "string reuse index",
@@ -777,10 +786,11 @@ impl Lua55ParserState {
             field: "string size",
             value: size,
         })?;
-        let payload_len = usize::try_from(payload_size).map_err(|_| ParseError::IntegerOverflow {
-            field: "string size",
-            value: payload_size,
-        })?;
+        let payload_len =
+            usize::try_from(payload_size).map_err(|_| ParseError::IntegerOverflow {
+                field: "string size",
+                value: payload_size,
+            })?;
         let offset = reader.offset();
         let bytes = reader.read_exact(byte_count)?;
         if bytes[payload_len] != 0 {
@@ -851,11 +861,7 @@ impl Lua55ParserState {
         }
     }
 
-    fn skip_align(
-        &self,
-        reader: &mut BinaryReader<'_>,
-        align: usize,
-    ) -> Result<(), ParseError> {
+    fn skip_align(&self, reader: &mut BinaryReader<'_>, align: usize) -> Result<(), ParseError> {
         if align <= 1 {
             return Ok(());
         }

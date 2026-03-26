@@ -21,6 +21,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Transform],
+                    timing: false,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -52,6 +53,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
+                    timing: false,
                     detail: DebugDetail::Verbose,
                     filters: Default::default(),
                 },
@@ -84,6 +86,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
+                    timing: false,
                     detail: DebugDetail::Verbose,
                     filters: Default::default(),
                 },
@@ -113,6 +116,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
+                    timing: false,
                     detail: DebugDetail::Verbose,
                     filters: Default::default(),
                 },
@@ -123,8 +127,14 @@ mod decompile_pipeline {
 
         assert_eq!(result.state.completed_stage, Some(DecompileStage::Hir));
         let dump = &result.debug_output[0].content;
-        assert!(dump.contains("err-nnil") && dump.contains("name=registry"), "{dump}");
-        assert!(dump.contains("err-nnil") && dump.contains("name=install"), "{dump}");
+        assert!(
+            dump.contains("err-nnil") && dump.contains("name=registry"),
+            "{dump}"
+        );
+        assert!(
+            dump.contains("err-nnil") && dump.contains("name=install"),
+            "{dump}"
+        );
         assert!(!dump.contains("entry-reg"), "{dump}");
     }
 
@@ -142,6 +152,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
+                    timing: false,
                     detail: DebugDetail::Verbose,
                     filters: Default::default(),
                 },
@@ -152,7 +163,10 @@ mod decompile_pipeline {
 
         assert_eq!(result.state.completed_stage, Some(DecompileStage::Hir));
         let dump = &result.debug_output[0].content;
-        assert!(dump.contains("return l0[p0], l0[(p0 + -1)], l0[\"n\"], ..."), "{dump}");
+        assert!(
+            dump.contains("return l0[p0], l0[(p0 + -1)], l0[\"n\"], ..."),
+            "{dump}"
+        );
         assert!(!dump.contains("entry-reg"), "{dump}");
         assert!(!dump.contains("unresolved("), "{dump}");
     }
@@ -171,6 +185,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Ast],
+                    timing: false,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -204,6 +219,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Readability],
+                    timing: false,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -212,7 +228,10 @@ mod decompile_pipeline {
         )
         .expect("lua5.5 readability stage should succeed for global fixture");
 
-        assert_eq!(result.state.completed_stage, Some(DecompileStage::Readability));
+        assert_eq!(
+            result.state.completed_stage,
+            Some(DecompileStage::Readability)
+        );
         let dump = &result.debug_output[0].content;
         assert!(dump.contains("===== Dump Readability ====="), "{dump}");
         assert!(dump.contains("global function step(p0)"), "{dump}");
@@ -234,6 +253,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Readability],
+                    timing: false,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -242,7 +262,10 @@ mod decompile_pipeline {
         )
         .expect("lua5.5 readability stage should succeed for local function fixture");
 
-        assert_eq!(result.state.completed_stage, Some(DecompileStage::Readability));
+        assert_eq!(
+            result.state.completed_stage,
+            Some(DecompileStage::Readability)
+        );
         let dump = &result.debug_output[0].content;
         assert!(dump.contains("local function l1(p0)"), "{dump}");
         assert!(dump.contains("if p0"), "{dump}");
@@ -264,6 +287,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Ast],
+                    timing: false,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -293,6 +317,7 @@ mod decompile_pipeline {
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Readability],
+                    timing: false,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -301,13 +326,19 @@ mod decompile_pipeline {
         )
         .expect("lua5.5 readability stage should dump inline function body");
 
-        assert_eq!(result.state.completed_stage, Some(DecompileStage::Readability));
+        assert_eq!(
+            result.state.completed_stage,
+            Some(DecompileStage::Readability)
+        );
         let dump = &result.debug_output[0].content;
         assert!(dump.contains("local function l1(p0)"), "{dump}");
         assert!(dump.contains("local function l1(p0, p1)"), "{dump}");
         assert!(dump.contains("local function l6()"), "{dump}");
         assert!(dump.contains("local l7 = l6()"), "{dump}");
-        assert!(dump.contains("u0.print(\"var55-closure\", l1(2, 4, 7, 5))"), "{dump}");
+        assert!(
+            dump.contains("u0.print(\"var55-closure\", l1(2, 4, 7, 5))"),
+            "{dump}"
+        );
         assert!(!dump.contains("function(p0) ... end"), "{dump}");
         assert!(!dump.contains("end(-)"), "{dump}");
     }

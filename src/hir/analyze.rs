@@ -12,11 +12,12 @@ mod short_circuit;
 mod structure;
 
 use self::lower::{ChildAnalyses, lower_proto};
-use super::simplify::simplify_hir;
+use super::simplify::simplify_hir_with_timing;
 use crate::cfg::{CfgGraph, DataflowFacts, GraphFacts};
 use crate::hir::common::HirModule;
 use crate::readability::ReadabilityOptions;
 use crate::structure::StructureFacts;
+use crate::timing::TimingCollector;
 use crate::transformer::LoweredChunk;
 
 use self::exprs::lower_branch_cond;
@@ -35,6 +36,27 @@ pub fn analyze_hir(
     structure: &StructureFacts,
     readability: ReadabilityOptions,
 ) -> HirModule {
+    let timings = TimingCollector::disabled();
+    analyze_hir_with_timing(
+        chunk,
+        cfg_graph,
+        graph_facts,
+        dataflow,
+        structure,
+        &timings,
+        readability,
+    )
+}
+
+pub(crate) fn analyze_hir_with_timing(
+    chunk: &LoweredChunk,
+    cfg_graph: &CfgGraph,
+    graph_facts: &GraphFacts,
+    dataflow: &DataflowFacts,
+    structure: &StructureFacts,
+    timings: &TimingCollector,
+    readability: ReadabilityOptions,
+) -> HirModule {
     let mut protos = Vec::new();
     let child_analyses = ChildAnalyses {
         cfg_graphs: &cfg_graph.children,
@@ -42,17 +64,21 @@ pub fn analyze_hir(
         dataflow: &dataflow.children,
         structure: &structure.children,
     };
-    let entry = lower_proto(
-        &chunk.main,
-        &cfg_graph.cfg,
-        graph_facts,
-        dataflow,
-        structure,
-        child_analyses,
-        &mut protos,
-    );
+    let entry = timings.record("lower", || {
+        lower_proto(
+            &chunk.main,
+            &cfg_graph.cfg,
+            graph_facts,
+            dataflow,
+            structure,
+            child_analyses,
+            &mut protos,
+        )
+    });
 
     let mut module = HirModule { entry, protos };
-    simplify_hir(&mut module, readability);
+    timings.record("simplify", || {
+        simplify_hir_with_timing(&mut module, readability, timings);
+    });
     module
 }

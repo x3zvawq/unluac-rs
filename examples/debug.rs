@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use unluac::decompile::{
-    DebugDetail, DebugFilters, DebugOptions, DecompileDialect, DecompileOptions,
-    DecompileStage, ReadabilityOptions, decompile,
+    DebugDetail, DebugFilters, DebugOptions, DecompileDialect, DecompileOptions, DecompileStage,
+    ReadabilityOptions, decompile, render_timing_report,
 };
 use unluac::parser::{ParseMode, ParseOptions, StringDecodeMode, StringEncoding};
 
@@ -48,6 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             debug: DebugOptions {
                 enable: true,
                 output_stages: vec![TARGET_STAGE],
+                timing: true,
                 detail: DEBUG_DETAIL,
                 filters: DebugFilters::default(),
             },
@@ -67,7 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("chunk:  {}", chunk.display());
     println!();
 
-    if result.debug_output.is_empty() {
+    if result.debug_output.is_empty() && result.timing_report.is_none() {
         println!(
             "pipeline stopped after {}",
             result
@@ -81,6 +82,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!();
             }
             print!("{}", output.content);
+        }
+        if let Some(report) = result.timing_report.as_ref() {
+            if !result.debug_output.is_empty() {
+                println!();
+            }
+            print!("{}", render_timing_report(report, DEBUG_DETAIL));
         }
     }
 

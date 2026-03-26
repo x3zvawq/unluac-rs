@@ -501,10 +501,12 @@ impl Lua54Parser {
                     "lua_Integer",
                 )?),
                 LUA_VSHRSTR | LUA_VLNGSTR => {
-                    let value = self.parse_string(reader)?.ok_or(ParseError::UnsupportedValue {
-                        field: "string constant length",
-                        value: 0,
-                    })?;
+                    let value = self
+                        .parse_string(reader)?
+                        .ok_or(ParseError::UnsupportedValue {
+                            field: "string constant length",
+                            value: 0,
+                        })?;
                     RawLiteralConst::String(value)
                 }
                 _ => return Err(ParseError::InvalidConstantTag { offset, tag }),
@@ -584,10 +586,12 @@ impl Lua54Parser {
         let local_count = self.read_count(reader, "local var count")?;
         let mut local_vars = Vec::with_capacity(local_count as usize);
         for _ in 0..local_count {
-            let name = self.parse_optional_string(reader)?.ok_or(ParseError::UnsupportedValue {
-                field: "local var name length",
-                value: 0,
-            })?;
+            let name = self
+                .parse_optional_string(reader)?
+                .ok_or(ParseError::UnsupportedValue {
+                    field: "local var name length",
+                    value: 0,
+                })?;
             let start_pc = self.read_count(reader, "local var startpc")?;
             let end_pc = self.read_count(reader, "local var endpc")?;
             local_vars.push(RawLocalVar {
@@ -683,10 +687,12 @@ impl Lua54Parser {
                     value: current,
                 });
             }
-            lines.push(u32::try_from(current).map_err(|_| ParseError::IntegerOverflow {
-                field: "line info",
-                value: current as u64,
-            })?);
+            lines.push(
+                u32::try_from(current).map_err(|_| ParseError::IntegerOverflow {
+                    field: "line info",
+                    value: current as u64,
+                })?,
+            );
         }
 
         Ok(lines)

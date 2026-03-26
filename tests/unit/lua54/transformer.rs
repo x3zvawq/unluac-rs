@@ -1,9 +1,7 @@
 //! 这些测试固定 Lua 5.4 transformer 的层内契约。
 
 use unluac::parser::{ParseOptions, parse_lua54_chunk};
-use unluac::transformer::{
-    AccessBase, AccessKey, LowInstr, Reg, ValuePack, lower_lua54_chunk,
-};
+use unluac::transformer::{AccessBase, AccessKey, LowInstr, Reg, ValuePack, lower_lua54_chunk};
 
 mod lower_lua54_chunk {
     use super::*;
@@ -29,8 +27,14 @@ mod lower_lua54_chunk {
     fn lowers_tbc_close_and_field_access_for_tbc_close_fixture() {
         let lowered = lower_fixture("tests/lua_cases/lua5.4/01_tbc_close.lua");
 
-        assert!(proto_has_instr(&lowered.main, &|instr| matches!(instr, LowInstr::Tbc(_))));
-        assert!(proto_has_instr(&lowered.main, &|instr| matches!(instr, LowInstr::Close(_))));
+        assert!(proto_has_instr(&lowered.main, &|instr| matches!(
+            instr,
+            LowInstr::Tbc(_)
+        )));
+        assert!(proto_has_instr(&lowered.main, &|instr| matches!(
+            instr,
+            LowInstr::Close(_)
+        )));
         assert!(proto_has_instr(&lowered.main, &|instr| {
             matches!(
                 instr,
@@ -46,18 +50,16 @@ mod lower_lua54_chunk {
         let lowered = lower_fixture("tests/lua_cases/lua5.4/01_tbc_close.lua");
         let close_metamethod = &lowered.main.children[0].children[0];
 
+        assert!(close_metamethod.instrs.windows(2).any(|window| matches!(
+            window,
+            [LowInstr::LoadBool(load_bool), LowInstr::Jump(_)] if !load_bool.value
+        )));
         assert!(
             close_metamethod
                 .instrs
-                .windows(2)
-                .any(|window| matches!(
-                    window,
-                    [LowInstr::LoadBool(load_bool), LowInstr::Jump(_)] if !load_bool.value
-                ))
+                .iter()
+                .any(|instr| { matches!(instr, LowInstr::LoadBool(load_bool) if load_bool.value) })
         );
-        assert!(close_metamethod.instrs.iter().any(|instr| {
-            matches!(instr, LowInstr::LoadBool(load_bool) if load_bool.value)
-        }));
     }
 }
 

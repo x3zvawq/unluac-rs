@@ -216,7 +216,11 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock) {
                         .collect::<Vec<_>>()
                         .join(", "),
                 );
-                write_block(output, &format!("{indent}  "), &local_function_decl.func.body);
+                write_block(
+                    output,
+                    &format!("{indent}  "),
+                    &local_function_decl.func.body,
+                );
                 let _ = writeln!(output, "{indent}end");
             }
         }

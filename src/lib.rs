@@ -13,4 +13,5 @@ pub mod hir;
 pub mod parser;
 pub mod readability;
 pub mod structure;
+mod timing;
 pub mod transformer;

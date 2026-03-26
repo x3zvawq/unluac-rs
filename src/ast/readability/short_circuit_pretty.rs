@@ -249,10 +249,16 @@ fn ast_from_hir_expr(expr: &HirExpr) -> Option<AstExpr> {
         HirExpr::Integer(value) => Some(AstExpr::Integer(*value)),
         HirExpr::Number(value) => Some(AstExpr::Number(*value)),
         HirExpr::String(value) => Some(AstExpr::String(value.clone())),
-        HirExpr::ParamRef(param) => Some(AstExpr::Var(super::super::common::AstNameRef::Param(*param))),
-        HirExpr::LocalRef(local) => Some(AstExpr::Var(super::super::common::AstNameRef::Local(*local))),
+        HirExpr::ParamRef(param) => Some(AstExpr::Var(super::super::common::AstNameRef::Param(
+            *param,
+        ))),
+        HirExpr::LocalRef(local) => Some(AstExpr::Var(super::super::common::AstNameRef::Local(
+            *local,
+        ))),
         HirExpr::TempRef(temp) => Some(AstExpr::Var(super::super::common::AstNameRef::Temp(*temp))),
-        HirExpr::UpvalueRef(upvalue) => Some(AstExpr::Var(super::super::common::AstNameRef::Upvalue(*upvalue))),
+        HirExpr::UpvalueRef(upvalue) => Some(AstExpr::Var(
+            super::super::common::AstNameRef::Upvalue(*upvalue),
+        )),
         HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
             Some(AstExpr::Unary(Box::new(AstUnaryExpr {
                 op: AstUnaryOpKind::Not,
@@ -327,10 +333,7 @@ mod tests {
                             and(a.clone(), b.clone()),
                             and(
                                 c.clone(),
-                                or(
-                                    b.clone(),
-                                    or(and(c.clone(), a.clone()), fallback.clone()),
-                                ),
+                                or(b.clone(), or(and(c.clone(), a.clone()), fallback.clone())),
                             ),
                         ),
                         fallback.clone(),
@@ -351,10 +354,7 @@ mod tests {
             panic!("expected return");
         };
         let expected = or(
-            and(
-                or(and(a.clone(), b.clone()), c.clone()),
-                or(b, and(c, a)),
-            ),
+            and(or(and(a.clone(), b.clone()), c.clone()), or(b, and(c, a))),
             fallback,
         );
         assert_eq!(ret.values, vec![expected]);

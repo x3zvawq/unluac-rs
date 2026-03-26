@@ -12,7 +12,7 @@ use std::process::Command;
 
 use unluac::decompile::{
     DebugDetail, DebugFilters, DebugOptions, DecompileDialect, DecompileOptions, DecompileStage,
-    decompile,
+    decompile, render_timing_report,
 };
 use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
@@ -45,6 +45,7 @@ impl Default for CliOptions {
             debug_options: DebugOptions {
                 enable: true,
                 output_stages: vec![DecompileStage::Parse],
+                timing: false,
                 detail: DebugDetail::Normal,
                 filters: DebugFilters::default(),
             },
@@ -72,6 +73,7 @@ where
         debug_options,
         ..
     } = options;
+    let debug_detail = debug_options.detail;
 
     let result = decompile(
         &bytes,
@@ -88,7 +90,7 @@ where
         },
     )?;
 
-    if result.debug_output.is_empty() {
+    if result.debug_output.is_empty() && result.timing_report.is_none() {
         println!(
             "pipeline stopped after {}",
             result
@@ -102,6 +104,12 @@ where
                 println!();
             }
             print!("{}", output.content);
+        }
+        if let Some(report) = result.timing_report.as_ref() {
+            if !result.debug_output.is_empty() {
+                println!();
+            }
+            print!("{}", render_timing_report(report, debug_detail));
         }
     }
 
@@ -234,9 +242,18 @@ where
                 Some(parse_usize(next_value(&mut args, "--proto")?, "--proto")?);
             continue;
         }
+        if value == "--timing" {
+            if !saw_explicit_dump {
+                options.debug_options.output_stages.clear();
+            }
+            options.debug_options.enable = true;
+            options.debug_options.timing = true;
+            continue;
+        }
         if value == "--no-debug" {
             options.debug_options.enable = false;
             options.debug_options.output_stages.clear();
+            options.debug_options.timing = false;
             continue;
         }
 
@@ -422,6 +439,7 @@ fn print_help() {
     println!("  --stop-after <stage>");
     println!("  --detail <summary|normal|verbose>");
     println!("  --proto <id>");
+    println!("  --timing");
     println!("  --no-debug");
 }
 

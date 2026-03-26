@@ -5,8 +5,7 @@ use std::collections::BTreeMap;
 use crate::hir::TempId;
 
 use super::super::common::{
-    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstModule,
-    AstStmt,
+    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstModule, AstStmt,
 };
 use super::ReadabilityContext;
 
@@ -38,7 +37,9 @@ fn cleanup_block(block: &mut AstBlock) -> bool {
 
     let original_len = block.stmts.len();
     block.stmts.retain(|stmt| match stmt {
-        AstStmt::LocalDecl(local_decl) => !(local_decl.bindings.is_empty() && local_decl.values.is_empty()),
+        AstStmt::LocalDecl(local_decl) => {
+            !(local_decl.bindings.is_empty() && local_decl.values.is_empty())
+        }
         _ => true,
     });
     changed || block.stmts.len() != original_len
@@ -54,10 +55,12 @@ fn cleanup_stmt(stmt: &mut AstStmt) -> bool {
             cleanup_function_exprs_in_expr(&mut if_stmt.cond) || changed
         }
         AstStmt::While(while_stmt) => {
-            cleanup_function_exprs_in_expr(&mut while_stmt.cond) | cleanup_block(&mut while_stmt.body)
+            cleanup_function_exprs_in_expr(&mut while_stmt.cond)
+                | cleanup_block(&mut while_stmt.body)
         }
         AstStmt::Repeat(repeat_stmt) => {
-            cleanup_block(&mut repeat_stmt.body) | cleanup_function_exprs_in_expr(&mut repeat_stmt.cond)
+            cleanup_block(&mut repeat_stmt.body)
+                | cleanup_function_exprs_in_expr(&mut repeat_stmt.cond)
         }
         AstStmt::NumericFor(numeric_for) => {
             let mut changed = cleanup_function_exprs_in_expr(&mut numeric_for.start);

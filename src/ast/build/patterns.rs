@@ -167,7 +167,8 @@ impl<'a> AstLowerer<'a> {
             return Ok(None);
         };
 
-        let (generic_for, consumed, close_temp) = match (stmts.get(index + 1), stmts.get(index + 2)) {
+        let (generic_for, consumed, close_temp) = match (stmts.get(index + 1), stmts.get(index + 2))
+        {
             (Some(HirStmt::ToBeClosed(to_be_closed)), Some(HirStmt::GenericFor(generic_for))) => {
                 let HirExpr::TempRef(close_temp) = &to_be_closed.value else {
                     return Ok(None);
@@ -178,7 +179,11 @@ impl<'a> AstLowerer<'a> {
             _ => return Ok(None),
         };
 
-        if !assign_targets_match_generic_for_init(assign.targets.as_slice(), generic_for, close_temp) {
+        if !assign_targets_match_generic_for_init(
+            assign.targets.as_slice(),
+            generic_for,
+            close_temp,
+        ) {
             return Ok(None);
         }
 
@@ -197,7 +202,9 @@ impl<'a> AstLowerer<'a> {
 fn lvalue_matches_global_name(target: &HirLValue, name: &str) -> bool {
     match target {
         HirLValue::Global(global) => global.name == name,
-        HirLValue::TableAccess(access) => matches!(&access.key, HirExpr::String(key) if key == name),
+        HirLValue::TableAccess(access) => {
+            matches!(&access.key, HirExpr::String(key) if key == name)
+        }
         _ => false,
     }
 }
@@ -212,15 +219,16 @@ fn assign_targets_match_generic_for_init(
         return false;
     }
 
-    let iter_targets_match = targets
-        .iter()
-        .zip(generic_for.iterator.iter())
-        .all(|(target, iterator)| match (target, iterator) {
-            (HirLValue::Temp(target_temp), HirExpr::TempRef(iterator_temp)) => {
-                target_temp == iterator_temp
-            }
-            _ => false,
-        });
+    let iter_targets_match =
+        targets
+            .iter()
+            .zip(generic_for.iterator.iter())
+            .all(|(target, iterator)| match (target, iterator) {
+                (HirLValue::Temp(target_temp), HirExpr::TempRef(iterator_temp)) => {
+                    target_temp == iterator_temp
+                }
+                _ => false,
+            });
     if !iter_targets_match {
         return false;
     }
