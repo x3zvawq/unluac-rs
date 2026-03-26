@@ -90,10 +90,15 @@ where
             debug: debug_options,
             readability: Default::default(),
             naming: Default::default(),
+            generate: Default::default(),
         },
     )?;
 
     if result.debug_output.is_empty() && result.timing_report.is_none() {
+        if let Some(generated) = result.state.generated.as_ref() {
+            print!("{}", generated.source);
+            return Ok(());
+        }
         println!(
             "pipeline stopped after {}",
             result

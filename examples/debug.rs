@@ -22,7 +22,7 @@ const STRING_ENCODING: StringEncoding = StringEncoding::Utf8;
 const STRING_DECODE_MODE: StringDecodeMode = StringDecodeMode::Strict;
 const PARSE_MODE: ParseMode = ParseMode::Strict;
 // 这个入口更常用来直接看“最终会长成什么源码形状”，所以默认停在 Readability。
-const TARGET_STAGE: DecompileStage = DecompileStage::Naming;
+const TARGET_STAGE: DecompileStage = DecompileStage::Generate;
 const DEBUG_DETAIL: DebugDetail = DebugDetail::Verbose;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -48,8 +48,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             target_stage: TARGET_STAGE,
             debug: DebugOptions {
                 enable: true,
-                output_stages: vec![DecompileStage::Readability, TARGET_STAGE],
-                timing: true,
+                output_stages: vec![ TARGET_STAGE],
+                timing: false,
                 color: DebugColorMode::Always,
                 detail: DEBUG_DETAIL,
                 filters: DebugFilters::default(),
@@ -64,6 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mode: NamingMode::DebugLike,
                 debug_like_include_function: true,
             },
+            generate: Default::default(),
         },
     )?;
 
@@ -75,6 +76,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     if result.debug_output.is_empty() && result.timing_report.is_none() {
+        if let Some(generated) = result.state.generated.as_ref() {
+            print!("{}", generated.source);
+            return Ok(());
+        }
         println!(
             "pipeline stopped after {}",
             result

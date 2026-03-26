@@ -2,8 +2,9 @@
 
 use super::super::common::{
     AstAssign, AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionDecl, AstFunctionExpr,
-    AstFunctionName, AstGlobalDecl, AstLValue, AstLocalAttr, AstLocalDecl, AstLocalFunctionDecl,
-    AstModule, AstNamePath, AstNameRef, AstStmt, AstTargetDialect,
+    AstFunctionName, AstGlobalBindingTarget, AstGlobalDecl, AstLValue, AstLocalAttr,
+    AstLocalDecl, AstLocalFunctionDecl, AstModule, AstNamePath, AstNameRef, AstStmt,
+    AstTargetDialect,
 };
 use super::ReadabilityContext;
 
@@ -279,12 +280,15 @@ fn try_lower_global_function_decl(
     if global_decl.bindings[0].attr != super::super::common::AstGlobalAttr::None {
         return None;
     }
+    let AstGlobalBindingTarget::Name(name) = &global_decl.bindings[0].target else {
+        return None;
+    };
     let AstExpr::FunctionExpr(func) = &global_decl.values[0] else {
         return None;
     };
     Some(AstStmt::FunctionDecl(Box::new(AstFunctionDecl {
         target: AstFunctionName::Plain(AstNamePath {
-            root: AstNameRef::Global(global_decl.bindings[0].name.clone()),
+            root: AstNameRef::Global(name.clone()),
             fields: Vec::new(),
         }),
         func: func.as_ref().clone(),
@@ -324,9 +328,12 @@ fn inline_function_into_stmt(
             if global_decl.bindings[0].attr == super::super::common::AstGlobalAttr::None
                 && target.caps.global_decl
             {
+                let AstGlobalBindingTarget::Name(name) = &global_decl.bindings[0].target else {
+                    return None;
+                };
                 return Some(AstStmt::FunctionDecl(Box::new(AstFunctionDecl {
                     target: AstFunctionName::Plain(AstNamePath {
-                        root: AstNameRef::Global(global_decl.bindings[0].name.clone()),
+                        root: AstNameRef::Global(name.clone()),
                         fields: Vec::new(),
                     }),
                     func: function,

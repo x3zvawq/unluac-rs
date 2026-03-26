@@ -353,4 +353,51 @@ mod decompile_pipeline {
         assert!(!dump.contains("function(p0) ... end"), "{dump}");
         assert!(!dump.contains("end(-)"), "{dump}");
     }
+
+    #[test]
+    fn lua55_generate_stage_emits_final_source_for_global_fixture() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.5",
+            "tests/lua_cases/lua5.5/01_global_basic.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua55,
+                target_stage: DecompileStage::Generate,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Generate],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Normal,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.5 generate stage should succeed for global fixture");
+
+        assert_eq!(result.state.completed_stage, Some(DecompileStage::Generate));
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should leave generated source in state");
+        assert!(
+            generated.source.contains("global label = value3"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("function step(a)"),
+            "{}",
+            generated.source
+        );
+        assert!(generated.source.contains("up.print("), "{}", generated.source);
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("===== Dump Generate ====="), "{dump}");
+        assert!(dump.contains("function step(a)"), "{dump}");
+    }
 }

@@ -12,11 +12,12 @@ pub use common::{
     AstAssign, AstBinaryExpr, AstBinaryOpKind, AstBindingRef, AstBlock, AstCallExpr, AstCallKind,
     AstCallStmt, AstDialectCaps, AstDialectVersion, AstExpr, AstFieldAccess, AstFunctionDecl,
     AstFunctionExpr, AstFunctionName, AstGenericFor, AstGlobalAttr, AstGlobalBinding,
-    AstGlobalDecl, AstGlobalName, AstGoto, AstIf, AstIndexAccess, AstLValue, AstLabel, AstLabelId,
-    AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalFunctionDecl, AstLogicalExpr,
-    AstMethodCallExpr, AstModule, AstNamePath, AstNameRef, AstNumericFor, AstRecordField,
-    AstRepeat, AstReturn, AstStmt, AstSyntheticLocalId, AstTableConstructor, AstTableField,
-    AstTableKey, AstTargetDialect, AstUnaryExpr, AstUnaryOpKind, AstWhile,
+    AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstGoto, AstIf, AstIndexAccess,
+    AstLValue, AstLabel, AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl,
+    AstLocalFunctionDecl, AstLogicalExpr, AstMethodCallExpr, AstModule, AstNamePath, AstNameRef,
+    AstNumericFor, AstRecordField, AstRepeat, AstReturn, AstStmt, AstSyntheticLocalId,
+    AstTableConstructor, AstTableField, AstTableKey, AstTargetDialect, AstUnaryExpr,
+    AstUnaryOpKind, AstWhile,
 };
 pub use debug::{dump_ast, dump_readability};
 pub use error::AstLowerError;

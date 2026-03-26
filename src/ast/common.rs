@@ -267,8 +267,18 @@ pub struct AstLocalBinding {
 /// `global` binding。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AstGlobalBinding {
-    pub name: AstGlobalName,
+    pub target: AstGlobalBindingTarget,
     pub attr: AstGlobalAttr,
+}
+
+/// `global` 声明的绑定目标。
+///
+/// 这里显式区分普通全局名和 `global *` wildcard，是为了避免把 `*` 塞成一个伪名字。
+/// 后续 Generate 只需要按这个稳定结构输出，不需要再猜测当前 binding 到底是不是 wildcard。
+#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash)]
+pub enum AstGlobalBindingTarget {
+    Name(AstGlobalName),
+    Wildcard,
 }
 
 /// 局部声明属性。

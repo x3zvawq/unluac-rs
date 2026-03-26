@@ -4,8 +4,8 @@ use crate::hir::{HirExpr, HirLValue, HirStmt};
 
 use super::{AstLowerError, AstLowerer};
 use crate::ast::common::{
-    AstBindingRef, AstGlobalAttr, AstGlobalBinding, AstGlobalDecl, AstGlobalName, AstLocalAttr,
-    AstLocalBinding, AstLocalDecl, AstStmt,
+    AstBindingRef, AstGlobalAttr, AstGlobalBinding, AstGlobalBindingTarget, AstGlobalDecl,
+    AstGlobalName, AstLocalAttr, AstLocalBinding, AstLocalDecl, AstStmt,
 };
 
 impl<'a> AstLowerer<'a> {
@@ -60,7 +60,7 @@ impl<'a> AstLowerer<'a> {
         Ok(Some((
             AstStmt::GlobalDecl(Box::new(AstGlobalDecl {
                 bindings: vec![AstGlobalBinding {
-                    name: AstGlobalName { text: name.clone() },
+                    target: AstGlobalBindingTarget::Name(AstGlobalName { text: name.clone() }),
                     attr: AstGlobalAttr::None,
                 }],
                 values,

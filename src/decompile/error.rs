@@ -7,6 +7,7 @@ use thiserror::Error;
 
 use super::state::DecompileStage;
 use crate::ast::AstLowerError;
+use crate::generate::GenerateError;
 use crate::naming::NamingError;
 use crate::parser::ParseError;
 use crate::transformer::TransformError;
@@ -22,6 +23,8 @@ pub enum DecompileError {
     Ast(#[from] AstLowerError),
     #[error(transparent)]
     Naming(#[from] NamingError),
+    #[error(transparent)]
+    Generate(#[from] GenerateError),
     #[error(
         "stage `{stage}` is not implemented yet; pipeline currently stops after `{completed_stage}`"
     )]

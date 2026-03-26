@@ -9,6 +9,7 @@ pub mod ast;
 pub mod cfg;
 pub mod debug;
 pub mod decompile;
+pub mod generate;
 pub mod hir;
 pub mod naming;
 pub mod parser;

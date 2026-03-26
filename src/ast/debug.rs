@@ -84,23 +84,30 @@ fn write_block(
                 }
             }
             AstStmt::GlobalDecl(global_decl) => {
+                let attr = global_decl
+                    .bindings
+                    .first()
+                    .map(|binding| binding.attr)
+                    .unwrap_or(super::common::AstGlobalAttr::None);
+                let keyword = match attr {
+                    super::common::AstGlobalAttr::None => "global",
+                    super::common::AstGlobalAttr::Const => "global<const>",
+                };
                 let bindings = global_decl
                     .bindings
                     .iter()
-                    .map(|binding| match binding.attr {
-                        super::common::AstGlobalAttr::None => binding.name.text.clone(),
-                        super::common::AstGlobalAttr::Const => {
-                            format!("{}<const>", binding.name.text)
-                        }
+                    .map(|binding| match &binding.target {
+                        super::common::AstGlobalBindingTarget::Name(name) => name.text.clone(),
+                        super::common::AstGlobalBindingTarget::Wildcard => "*".to_owned(),
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
                 if global_decl.values.is_empty() {
-                    let _ = writeln!(output, "{indent}global {bindings}");
+                    let _ = writeln!(output, "{indent}{keyword} {bindings}");
                 } else {
                     let _ = writeln!(
                         output,
-                        "{indent}global {bindings} = {}",
+                        "{indent}{keyword} {bindings} = {}",
                         format_value_list(&global_decl.values, indent, names),
                     );
                 }

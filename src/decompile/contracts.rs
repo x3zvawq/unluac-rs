@@ -30,6 +30,5 @@ pub use crate::ast::AstModule as ReadabilityResult;
 /// 命名层未来会产出的绑定名决策结果。
 pub use crate::naming::NameMap as NamingResult;
 
-/// 生成层未来会产出的最终源码对象。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct GeneratedChunk;
+/// 生成层产出的最终源码对象。
+pub use crate::generate::GeneratedChunk;

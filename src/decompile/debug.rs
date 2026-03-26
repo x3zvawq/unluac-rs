@@ -6,6 +6,7 @@
 use crate::ast;
 use crate::cfg;
 use crate::debug::{DebugDetail, DebugFilters};
+use crate::generate;
 use crate::hir;
 use crate::naming;
 use crate::parser;
@@ -173,6 +174,18 @@ pub fn dump_naming(
     })
 }
 
+/// 对外保留 Generate 阶段的统一包装。
+pub fn dump_generate(
+    chunk: &crate::generate::GeneratedChunk,
+    options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Ok(StageDebugOutput {
+        stage: DecompileStage::Generate,
+        detail: options.detail,
+        content: generate::dump_generate(chunk, options.detail, &options.filters, options.color),
+    })
+}
+
 pub(crate) fn collect_stage_dump(
     state: &DecompileState,
     stage: DecompileStage,
@@ -249,6 +262,11 @@ pub(crate) fn collect_stage_dump(
             };
             dump_naming(names, options).map(Some)
         }
-        _ => Err(DecompileError::MissingStageOutput { stage }),
+        DecompileStage::Generate => {
+            let Some(chunk) = state.generated.as_ref() else {
+                return Err(DecompileError::MissingStageOutput { stage });
+            };
+            dump_generate(chunk, options).map(Some)
+        }
     }
 }
