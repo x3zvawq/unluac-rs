@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use unluac::decompile::{
-    DebugDetail, DebugFilters, DebugOptions, DecompileDialect, DecompileOptions, DecompileStage,
-    decompile, render_timing_report,
+    DebugColorMode, DebugDetail, DebugFilters, DebugOptions, DecompileDialect, DecompileOptions,
+    DecompileStage, decompile, render_timing_report,
 };
 use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
@@ -46,6 +46,7 @@ impl Default for CliOptions {
                 enable: true,
                 output_stages: vec![DecompileStage::Parse],
                 timing: false,
+                color: DebugColorMode::Auto,
                 detail: DebugDetail::Normal,
                 filters: DebugFilters::default(),
             },
@@ -74,6 +75,7 @@ where
         ..
     } = options;
     let debug_detail = debug_options.detail;
+    let debug_color = debug_options.color;
 
     let result = decompile(
         &bytes,
@@ -109,7 +111,10 @@ where
             if !result.debug_output.is_empty() {
                 println!();
             }
-            print!("{}", render_timing_report(report, debug_detail));
+            print!(
+                "{}",
+                render_timing_report(report, debug_detail, debug_color)
+            );
         }
     }
 
@@ -231,6 +236,14 @@ where
         }
         if value == "--detail" {
             options.debug_options.detail = parse_debug_detail(next_value(&mut args, "--detail")?)?;
+            continue;
+        }
+        if let Some(flag) = value.strip_prefix("--color=") {
+            options.debug_options.color = parse_debug_color(flag)?;
+            continue;
+        }
+        if value == "--color" {
+            options.debug_options.color = parse_debug_color(next_value(&mut args, "--color")?)?;
             continue;
         }
         if let Some(flag) = value.strip_prefix("--proto=") {
@@ -375,6 +388,12 @@ fn parse_debug_detail(value: impl AsRef<str>) -> Result<DebugDetail, CliError> {
         .ok_or_else(|| CliError::Usage(format!("unsupported debug detail: {value}")))
 }
 
+fn parse_debug_color(value: impl AsRef<str>) -> Result<DebugColorMode, CliError> {
+    let value = value.as_ref();
+    DebugColorMode::parse(value)
+        .ok_or_else(|| CliError::Usage(format!("unsupported debug color mode: {value}")))
+}
+
 fn parse_string_encoding(value: impl AsRef<str>) -> Result<StringEncoding, CliError> {
     let value = value.as_ref();
     match value {
@@ -438,6 +457,7 @@ fn print_help() {
     println!("  --dump <stage>");
     println!("  --stop-after <stage>");
     println!("  --detail <summary|normal|verbose>");
+    println!("  --color <auto|always|never>");
     println!("  --proto <id>");
     println!("  --timing");
     println!("  --no-debug");

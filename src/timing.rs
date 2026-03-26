@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::time::{Duration, Instant};
 
-use crate::debug::DebugDetail;
+use crate::debug::{DebugColorMode, DebugDetail, colorize_debug_text};
 
 /// 一次 pipeline 运行产出的 timing 树。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -28,14 +28,18 @@ pub struct TimingNode {
 }
 
 /// 把层级 timing 渲染成终端友好的稳定文本。
-pub fn render_timing_report(report: &TimingReport, detail: DebugDetail) -> String {
+pub fn render_timing_report(
+    report: &TimingReport,
+    detail: DebugDetail,
+    color: DebugColorMode,
+) -> String {
     let mut output = String::new();
     let _ = writeln!(output, "===== Timing =====");
     let _ = writeln!(output, "pipeline total={}", format_duration(report.total));
 
     if report.nodes.is_empty() {
         let _ = writeln!(output, "no timing spans recorded");
-        return output;
+        return colorize_debug_text(&output, color);
     }
 
     let max_depth = match detail {
@@ -47,7 +51,7 @@ pub fn render_timing_report(report: &TimingReport, detail: DebugDetail) -> Strin
         render_node(&mut output, node, 0, max_depth, detail);
     }
 
-    output
+    colorize_debug_text(&output, color)
 }
 
 #[derive(Debug)]

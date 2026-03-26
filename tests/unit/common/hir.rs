@@ -9,7 +9,7 @@
 //! 6. loop-local 的 continue-like requirement 是否能稳定恢复成 `Continue` 或更自然的 loop 控制。
 
 use unluac::cfg::{analyze_dataflow, analyze_graph_facts, build_cfg_graph};
-use unluac::decompile::DebugDetail;
+use unluac::decompile::{DebugColorMode, DebugDetail};
 use unluac::hir::{
     HirExpr, HirLValue, HirStmt, HirTableField, HirTableKey, LocalId, analyze_hir, dump_hir,
 };
@@ -139,7 +139,12 @@ mod analyze_hir_shared {
 
         let hir = analyze_fixture(&chunk);
         let proto = &hir.protos[0];
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
 
         assert!(
             matches!(
@@ -192,7 +197,12 @@ mod analyze_hir_shared {
 
         let hir = analyze_fixture(&chunk);
         let proto = &hir.protos[0];
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
 
         assert!(
             proto.body.stmts.iter().any(|stmt| {
@@ -248,7 +258,12 @@ mod analyze_hir_shared {
 
         let hir = analyze_fixture(&chunk);
         let proto = &hir.protos[0];
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
 
         let table = proto
             .body
@@ -302,7 +317,12 @@ mod analyze_hir_shared {
 
         let hir = analyze_fixture(&chunk);
         let proto = &hir.protos[0];
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
 
         let table = proto
             .body
@@ -361,7 +381,12 @@ mod analyze_hir_shared {
 
         let hir = analyze_fixture(&chunk);
         let proto = &hir.protos[0];
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
         println!("{dump}");
 
         assert!(matches!(
@@ -418,7 +443,12 @@ mod analyze_hir_shared {
 
         let hir = analyze_fixture(&chunk);
         let proto = &hir.protos[0];
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
 
         assert!(
             matches!(
@@ -471,7 +501,12 @@ mod analyze_hir_shared {
 
         let hir = analyze_fixture(&chunk);
         let proto = &hir.protos[0];
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
 
         assert!(
             matches!(
@@ -525,7 +560,12 @@ mod analyze_hir_shared {
 
         let hir = analyze_fixture(&chunk);
         let proto = &hir.protos[0];
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
 
         assert!(
             matches!(
@@ -607,7 +647,12 @@ mod analyze_hir_shared {
 
         let hir = analyze_fixture(&chunk);
         let proto = &hir.protos[0];
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
 
         assert!(
             !proto
@@ -693,7 +738,12 @@ mod analyze_hir_shared {
 
         let hir = analyze_fixture(&chunk);
         let proto = &hir.protos[0];
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
 
         assert!(
             !proto
@@ -764,7 +814,12 @@ mod analyze_hir_shared {
 
         let hir = analyze_fixture(&chunk);
         let proto = &hir.protos[0];
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
 
         assert!(!dump.contains("unstructured summary=fallback"), "{dump}");
         assert!(!dump.contains("unresolved(phi"), "{dump}");
@@ -820,7 +875,12 @@ mod analyze_hir_shared {
 
         let hir = analyze_fixture(&chunk);
         let proto = &hir.protos[0];
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
 
         assert!(
             matches!(
@@ -887,7 +947,12 @@ mod analyze_hir_shared {
         ]);
 
         let hir = analyze_fixture(&chunk);
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
 
         assert!(!dump.contains("unresolved(phi"), "{dump}");
         assert!(!dump.contains("decision("), "{dump}");
@@ -937,7 +1002,12 @@ mod analyze_hir_shared {
         ]);
 
         let hir = analyze_fixture(&chunk);
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
         let proto = &hir.protos[0];
 
         assert!(
@@ -990,7 +1060,12 @@ mod analyze_hir_shared {
         ]);
 
         let hir = analyze_fixture(&chunk);
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
         let proto = &hir.protos[0];
 
         assert!(
@@ -1046,7 +1121,12 @@ mod analyze_hir_shared {
         ]);
 
         let hir = analyze_fixture(&chunk);
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
 
         assert!(dump.contains("\n    repeat\n"), "{dump}");
         assert!(!dump.contains("unstructured summary=fallback"), "{dump}");
@@ -1109,7 +1189,12 @@ mod analyze_hir_shared {
         ]);
 
         let hir = analyze_fixture(&chunk);
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
         let proto = &hir.protos[0];
 
         assert!(
@@ -1182,7 +1267,12 @@ mod analyze_hir_shared {
         ]);
 
         let hir = analyze_fixture(&chunk);
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
 
         assert!(dump.contains("\n    repeat\n"), "{dump}");
         assert!(dump.contains("\n        then\n          break\n"), "{dump}");
@@ -1263,7 +1353,12 @@ mod analyze_hir_shared {
         ]);
 
         let hir = analyze_fixture(&chunk);
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
 
         assert!(dump.contains("\n    repeat\n"), "{dump}");
         assert!(!dump.contains("until (6 < t"), "{dump}");
@@ -1317,7 +1412,12 @@ mod analyze_hir_shared {
         ]);
 
         let hir = analyze_fixture(&chunk);
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
         let proto = &hir.protos[0];
 
         assert!(
@@ -1402,7 +1502,12 @@ mod analyze_hir_shared {
         ]);
 
         let hir = analyze_fixture(&chunk);
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
 
         assert!(dump.contains("numeric-for l0 ="), "{dump}");
         assert!(dump.contains("\n      if "), "{dump}");
@@ -1469,7 +1574,12 @@ mod analyze_hir_shared {
         ]);
 
         let hir = analyze_fixture(&chunk);
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
         let proto = &hir.protos[0];
 
         assert!(
@@ -1542,7 +1652,12 @@ mod analyze_hir_shared {
         ]);
 
         let hir = analyze_fixture(&chunk);
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
         let proto = &hir.protos[0];
 
         assert!(
@@ -1603,7 +1718,12 @@ mod analyze_hir_shared {
         ]);
 
         let hir = analyze_fixture(&chunk);
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
         let proto = &hir.protos[0];
 
         assert!(
@@ -1691,7 +1811,12 @@ mod analyze_hir_shared {
         ]);
 
         let hir = analyze_fixture(&chunk);
-        let dump = dump_hir(&hir, DebugDetail::Normal, &Default::default());
+        let dump = dump_hir(
+            &hir,
+            DebugDetail::Normal,
+            &Default::default(),
+            DebugColorMode::Never,
+        );
         let proto = &hir.protos[0];
 
         assert!(

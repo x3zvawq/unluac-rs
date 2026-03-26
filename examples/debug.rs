@@ -9,13 +9,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use unluac::decompile::{
-    DebugDetail, DebugFilters, DebugOptions, DecompileDialect, DecompileOptions, DecompileStage,
-    ReadabilityOptions, decompile, render_timing_report,
+    DebugColorMode, DebugDetail, DebugFilters, DebugOptions, DecompileDialect, DecompileOptions,
+    DecompileStage, ReadabilityOptions, decompile, render_timing_report,
 };
 use unluac::parser::{ParseMode, ParseOptions, StringDecodeMode, StringEncoding};
 
 /// 开发时最常改的是这几个常量，直接编辑代码通常比来回敲命令更顺手。
-const DIALECT: DecompileDialect = DecompileDialect::Lua55;
+const DIALECT: DecompileDialect = DecompileDialect::Lua51;
 const SOURCE: &str = "tests/lua_cases/common/tricky/01_boolean_hell.lua";
 const STRING_ENCODING: StringEncoding = StringEncoding::Utf8;
 const STRING_DECODE_MODE: StringDecodeMode = StringDecodeMode::Strict;
@@ -49,6 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 enable: true,
                 output_stages: vec![TARGET_STAGE],
                 timing: true,
+                color: DebugColorMode::Always,
                 detail: DEBUG_DETAIL,
                 filters: DebugFilters::default(),
             },
@@ -87,7 +88,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !result.debug_output.is_empty() {
                 println!();
             }
-            print!("{}", render_timing_report(report, DEBUG_DETAIL));
+            print!(
+                "{}",
+                render_timing_report(report, DEBUG_DETAIL, DebugColorMode::Auto)
+            );
         }
     }
 

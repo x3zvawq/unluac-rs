@@ -4,7 +4,8 @@
 //! 选择，并且能稳定跑到 transform 和 HIR。
 
 use unluac::decompile::{
-    DebugDetail, DebugOptions, DecompileDialect, DecompileOptions, DecompileStage, decompile,
+    DebugColorMode, DebugDetail, DebugOptions, DecompileDialect, DecompileOptions, DecompileStage,
+    decompile,
 };
 
 mod decompile_pipeline {
@@ -25,6 +26,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Transform],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -58,6 +60,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Summary,
                     filters: Default::default(),
                 },
@@ -87,6 +90,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -117,6 +121,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Readability],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },

@@ -5,7 +5,7 @@
 
 use std::fmt::Write as _;
 
-use crate::debug::{DebugDetail, DebugFilters};
+use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
 use crate::parser::{
     ChunkHeader, DecodedText, Dialect, DialectConstPoolExtra, DialectDebugExtra,
     DialectHeaderExtra, DialectInstrExtra, DialectProtoExtra, DialectUpvalueExtra, DialectVersion,
@@ -26,7 +26,12 @@ struct ProtoEntry<'a> {
     proto: &'a RawProto,
 }
 
-pub(crate) fn dump_chunk(chunk: &RawChunk, detail: DebugDetail, filters: &DebugFilters) -> String {
+pub(crate) fn dump_chunk(
+    chunk: &RawChunk,
+    detail: DebugDetail,
+    filters: &DebugFilters,
+    color: DebugColorMode,
+) -> String {
     let mut output = String::new();
     let protos = collect_proto_entries(&chunk.main);
     let visible_protos = visible_proto_ids(&protos, filters);
@@ -55,7 +60,7 @@ pub(crate) fn dump_chunk(chunk: &RawChunk, detail: DebugDetail, filters: &DebugF
         write_raw_instructions_view(&mut output, &protos, &visible_protos, detail);
     }
 
-    output
+    colorize_debug_text(&output, color)
 }
 
 fn collect_proto_entries(root: &RawProto) -> Vec<ProtoEntry<'_>> {

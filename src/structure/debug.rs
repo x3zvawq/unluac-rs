@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use crate::debug::{DebugDetail, DebugFilters};
+use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
 
 use super::common::{
     BranchCandidate, BranchValueMergeCandidate, GotoRequirement, LoopCandidate, RegionFact,
@@ -26,6 +26,7 @@ pub fn dump_structure(
     structure: &StructureFacts,
     detail: DebugDetail,
     filters: &DebugFilters,
+    color: DebugColorMode,
 ) -> String {
     let mut output = String::new();
     let entries = collect_proto_entries(structure);
@@ -92,7 +93,7 @@ pub fn dump_structure(
         write_scopes(&mut output, &indent, &entry.facts.scope_candidates);
     }
 
-    output
+    colorize_debug_text(&output, color)
 }
 
 fn collect_proto_entries(root: &StructureFacts) -> Vec<ProtoEntry<'_>> {

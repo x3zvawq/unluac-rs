@@ -5,7 +5,9 @@
 //! 2. `continue-like` case 仍然能恢复成语义级 `continue`
 //! 3. 必须保留 `goto` 的 case 真的在 HIR 里可见
 
-use unluac::decompile::{DebugDetail, DebugOptions, DecompileOptions, DecompileStage, decompile};
+use unluac::decompile::{
+    DebugColorMode, DebugDetail, DebugOptions, DecompileOptions, DecompileStage, decompile,
+};
 
 mod decompile_pipeline {
     use super::*;
@@ -50,6 +52,7 @@ fn hir_dump_for(source_relative: &str) -> String {
                 enable: true,
                 output_stages: vec![DecompileStage::Hir],
                 timing: false,
+                color: DebugColorMode::Never,
                 detail: DebugDetail::Normal,
                 filters: Default::default(),
             },

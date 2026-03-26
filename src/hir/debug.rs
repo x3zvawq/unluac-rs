@@ -6,7 +6,7 @@
 
 use std::fmt::Write as _;
 
-use crate::debug::{DebugDetail, DebugFilters};
+use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
 
 use super::common::{
     HirBlock, HirDecisionExpr, HirDecisionTarget, HirExpr, HirLValue, HirModule, HirStmt,
@@ -14,7 +14,12 @@ use super::common::{
 };
 
 /// 输出 HIR 的人类可读摘要。
-pub fn dump_hir(module: &HirModule, detail: DebugDetail, filters: &DebugFilters) -> String {
+pub fn dump_hir(
+    module: &HirModule,
+    detail: DebugDetail,
+    filters: &DebugFilters,
+    color: DebugColorMode,
+) -> String {
     let mut output = String::new();
 
     let _ = writeln!(output, "===== Dump HIR =====");
@@ -65,7 +70,7 @@ pub fn dump_hir(module: &HirModule, detail: DebugDetail, filters: &DebugFilters)
         write_block(&mut output, "    ", &proto.body);
     }
 
-    output
+    colorize_debug_text(&output, color)
 }
 
 fn write_block(output: &mut String, indent: &str, block: &HirBlock) {

@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use crate::debug::{DebugDetail, DebugFilters};
+use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
 
 use super::common::{
     AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionName, AstLValue, AstModule,
@@ -10,8 +10,13 @@ use super::common::{
 };
 
 /// 输出 AST 的调试文本。
-pub fn dump_ast(module: &AstModule, detail: DebugDetail, _filters: &DebugFilters) -> String {
-    dump_module(module, detail, "AST", "ast")
+pub fn dump_ast(
+    module: &AstModule,
+    detail: DebugDetail,
+    _filters: &DebugFilters,
+    color: DebugColorMode,
+) -> String {
+    dump_module(module, detail, "AST", "ast", color)
 }
 
 /// 输出 Readability 阶段的调试文本。
@@ -19,8 +24,9 @@ pub fn dump_readability(
     module: &AstModule,
     detail: DebugDetail,
     _filters: &DebugFilters,
+    color: DebugColorMode,
 ) -> String {
-    dump_module(module, detail, "Readability", "readability")
+    dump_module(module, detail, "Readability", "readability", color)
 }
 
 fn dump_module(
@@ -28,13 +34,14 @@ fn dump_module(
     detail: DebugDetail,
     stage_title: &str,
     stage_label: &str,
+    color: DebugColorMode,
 ) -> String {
     let mut output = String::new();
     let _ = writeln!(output, "===== Dump {stage_title} =====");
     let _ = writeln!(output, "{stage_label} detail={detail}");
     let _ = writeln!(output);
     write_block(&mut output, "", &module.body);
-    output
+    colorize_debug_text(&output, color)
 }
 
 fn write_block(output: &mut String, indent: &str, block: &AstBlock) {

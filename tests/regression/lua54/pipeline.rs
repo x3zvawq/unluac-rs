@@ -1,7 +1,8 @@
 //! 这些测试固定 Lua 5.4 主 pipeline 的 smoke 契约。
 
 use unluac::decompile::{
-    DebugDetail, DebugOptions, DecompileDialect, DecompileOptions, DecompileStage, decompile,
+    DebugColorMode, DebugDetail, DebugOptions, DecompileDialect, DecompileOptions, DecompileStage,
+    decompile,
 };
 
 mod decompile_pipeline {
@@ -20,6 +21,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Transform],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -52,6 +54,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Summary,
                     filters: Default::default(),
                 },
@@ -79,6 +82,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Verbose,
                     filters: Default::default(),
                 },
@@ -108,6 +112,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Verbose,
                     filters: Default::default(),
                 },
@@ -137,6 +142,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Ast],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -187,6 +193,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Readability],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },

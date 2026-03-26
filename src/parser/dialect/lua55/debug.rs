@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use crate::debug::{DebugDetail, DebugFilters};
+use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
 use crate::parser::raw::{
     DecodedText, DialectDebugExtra, DialectInstrExtra, DialectProtoExtra, RawChunk, RawInstr,
     RawInstrOpcode, RawInstrOperands, RawProto, RawString,
@@ -10,7 +10,12 @@ use crate::parser::raw::{
 
 use super::raw::{Lua55DebugExtra, Lua55InstrExtra, Lua55Opcode, Lua55Operands, Lua55ProtoExtra};
 
-pub(crate) fn dump_chunk(chunk: &RawChunk, detail: DebugDetail, filters: &DebugFilters) -> String {
+pub(crate) fn dump_chunk(
+    chunk: &RawChunk,
+    detail: DebugDetail,
+    filters: &DebugFilters,
+    color: DebugColorMode,
+) -> String {
     let mut output = String::new();
     let mut protos = Vec::new();
     collect_protos(&chunk.main, 0, &mut protos);
@@ -94,7 +99,7 @@ pub(crate) fn dump_chunk(chunk: &RawChunk, detail: DebugDetail, filters: &DebugF
         }
     }
 
-    output
+    colorize_debug_text(&output, color)
 }
 
 fn collect_protos<'a>(

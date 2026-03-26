@@ -10,7 +10,7 @@ mod options;
 mod pipeline;
 mod state;
 
-pub use crate::debug::{DebugDetail, DebugFilters};
+pub use crate::debug::{DebugColorMode, DebugDetail, DebugFilters};
 pub use crate::readability::ReadabilityOptions;
 pub use crate::timing::{TimingNode, TimingReport, render_timing_report};
 pub use contracts::{

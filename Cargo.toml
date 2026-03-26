@@ -21,4 +21,5 @@ redundant_clone = "deny"
 
 [dependencies]
 encoding_rs = "0.8.35"
+owo-colors = "4.2.2"
 thiserror = "2.0.12"

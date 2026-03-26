@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use crate::debug::{DebugDetail, DebugFilters};
+use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
 use crate::transformer::{LowInstr, LoweredChunk, LoweredProto, Reg};
 
 use super::common::{
@@ -31,7 +31,12 @@ struct DataflowProtoEntry<'a> {
 }
 
 /// 输出 CFG 的人类可读摘要。
-pub fn dump_cfg(graph: &CfgGraph, detail: DebugDetail, filters: &DebugFilters) -> String {
+pub fn dump_cfg(
+    graph: &CfgGraph,
+    detail: DebugDetail,
+    filters: &DebugFilters,
+    color: DebugColorMode,
+) -> String {
     let mut output = String::new();
     let entries = collect_proto_entries(graph);
     let visible = visible_proto_ids(&entries, filters);
@@ -99,7 +104,7 @@ pub fn dump_cfg(graph: &CfgGraph, detail: DebugDetail, filters: &DebugFilters) -
         }
     }
 
-    output
+    colorize_debug_text(&output, color)
 }
 
 /// 输出 GraphFacts 的人类可读摘要。
@@ -107,6 +112,7 @@ pub fn dump_graph_facts(
     graph_facts: &GraphFacts,
     detail: DebugDetail,
     filters: &DebugFilters,
+    color: DebugColorMode,
 ) -> String {
     let mut output = String::new();
     let entries = collect_proto_entries(graph_facts);
@@ -197,7 +203,7 @@ pub fn dump_graph_facts(
         }
     }
 
-    output
+    colorize_debug_text(&output, color)
 }
 
 /// 输出数据流层的人类可读摘要。
@@ -207,6 +213,7 @@ pub fn dump_dataflow(
     dataflow: &DataflowFacts,
     detail: DebugDetail,
     filters: &DebugFilters,
+    color: DebugColorMode,
 ) -> String {
     let mut output = String::new();
     let entries = collect_dataflow_entries(&chunk.main, cfg, dataflow);
@@ -317,7 +324,7 @@ pub fn dump_dataflow(
         }
     }
 
-    output
+    colorize_debug_text(&output, color)
 }
 
 fn collect_proto_entries<'a, T>(root: &'a T) -> Vec<ProtoEntry<'a, T>>

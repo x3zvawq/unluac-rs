@@ -20,6 +20,7 @@ pub struct DebugOptions {
     pub enable: bool,
     pub output_stages: Vec<DecompileStage>,
     pub timing: bool,
+    pub color: crate::debug::DebugColorMode,
     pub detail: DebugDetail,
     pub filters: DebugFilters,
 }
@@ -40,7 +41,7 @@ pub fn dump_parser(
     Ok(StageDebugOutput {
         stage: DecompileStage::Parse,
         detail: options.detail,
-        content: parser::dump_parser(chunk, options.detail, &options.filters),
+        content: parser::dump_parser(chunk, options.detail, &options.filters, options.color),
     })
 }
 
@@ -52,7 +53,7 @@ pub fn dump_lir(
     Ok(StageDebugOutput {
         stage: DecompileStage::Transform,
         detail: options.detail,
-        content: transformer::dump_lir(chunk, options.detail, &options.filters),
+        content: transformer::dump_lir(chunk, options.detail, &options.filters, options.color),
     })
 }
 
@@ -64,7 +65,7 @@ pub fn dump_cfg(
     Ok(StageDebugOutput {
         stage: DecompileStage::Cfg,
         detail: options.detail,
-        content: cfg::dump_cfg(graph, options.detail, &options.filters),
+        content: cfg::dump_cfg(graph, options.detail, &options.filters, options.color),
     })
 }
 
@@ -76,7 +77,12 @@ pub fn dump_graph_facts(
     Ok(StageDebugOutput {
         stage: DecompileStage::GraphFacts,
         detail: options.detail,
-        content: cfg::dump_graph_facts(graph_facts, options.detail, &options.filters),
+        content: cfg::dump_graph_facts(
+            graph_facts,
+            options.detail,
+            &options.filters,
+            options.color,
+        ),
     })
 }
 
@@ -96,6 +102,7 @@ pub fn dump_dataflow(
             dataflow,
             options.detail,
             &options.filters,
+            options.color,
         ),
     })
 }
@@ -108,7 +115,12 @@ pub fn dump_structure(
     Ok(StageDebugOutput {
         stage: DecompileStage::StructureFacts,
         detail: options.detail,
-        content: structure::dump_structure(structure_facts, options.detail, &options.filters),
+        content: structure::dump_structure(
+            structure_facts,
+            options.detail,
+            &options.filters,
+            options.color,
+        ),
     })
 }
 
@@ -120,7 +132,7 @@ pub fn dump_hir(
     Ok(StageDebugOutput {
         stage: DecompileStage::Hir,
         detail: options.detail,
-        content: hir::dump_hir(hir_module, options.detail, &options.filters),
+        content: hir::dump_hir(hir_module, options.detail, &options.filters, options.color),
     })
 }
 
@@ -132,7 +144,7 @@ pub fn dump_ast(
     Ok(StageDebugOutput {
         stage: DecompileStage::Ast,
         detail: options.detail,
-        content: ast::dump_ast(ast_module, options.detail, &options.filters),
+        content: ast::dump_ast(ast_module, options.detail, &options.filters, options.color),
     })
 }
 
@@ -144,7 +156,7 @@ pub fn dump_readability(
     Ok(StageDebugOutput {
         stage: DecompileStage::Readability,
         detail: options.detail,
-        content: ast::dump_readability(ast_module, options.detail, &options.filters),
+        content: ast::dump_readability(ast_module, options.detail, &options.filters, options.color),
     })
 }
 

@@ -4,8 +4,8 @@
 //! 是否稳定，因此归类为 regression。
 
 use unluac::decompile::{
-    DebugDetail, DebugOptions, DecompileOptions, DecompileStage, ReadabilityOptions, TimingNode,
-    TimingReport, decompile,
+    DebugColorMode, DebugDetail, DebugOptions, DecompileOptions, DecompileStage,
+    ReadabilityOptions, TimingNode, TimingReport, decompile,
 };
 
 const SETFENV_CHUNK_HEX: &str = "
@@ -36,6 +36,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Parse],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -66,6 +67,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Parse],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Summary,
                     filters: Default::default(),
                 },
@@ -82,6 +84,29 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn always_color_mode_emits_ansi_sequences_in_dump_output() {
+        let result = decompile(
+            &crate::support::decode_hex(SETFENV_CHUNK_HEX),
+            DecompileOptions {
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Parse],
+                    timing: false,
+                    color: DebugColorMode::Always,
+                    detail: DebugDetail::Summary,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("colored parse dump should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("\u{1b}["), "dump should include ANSI escapes");
+        assert!(dump.contains("===== Dump Parser ====="));
+    }
+
+    #[test]
     fn ignores_unreached_dump_stage_when_target_stage_stops_earlier() {
         let result = decompile(
             &crate::support::decode_hex(SETFENV_CHUNK_HEX),
@@ -91,6 +116,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Parse, DecompileStage::Transform],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -114,6 +140,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Transform],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -147,6 +174,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Cfg],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -175,6 +203,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::GraphFacts],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -207,6 +236,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Dataflow],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -236,6 +266,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::StructureFacts],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -271,6 +302,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -302,6 +334,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
@@ -342,6 +375,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Verbose,
                     filters: Default::default(),
                 },
@@ -379,6 +413,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Verbose,
                     filters: Default::default(),
                 },
@@ -410,6 +445,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: vec![DecompileStage::Readability],
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Verbose,
                     filters: Default::default(),
                 },
@@ -462,6 +498,7 @@ mod decompile_pipeline {
                         enable: true,
                         output_stages: vec![DecompileStage::Hir],
                         timing: false,
+                        color: DebugColorMode::Never,
                         detail: DebugDetail::Normal,
                         filters: Default::default(),
                     },
@@ -529,6 +566,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: Vec::new(),
                     timing: false,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Summary,
                     filters: Default::default(),
                 },
@@ -555,6 +593,7 @@ mod decompile_pipeline {
                     enable: true,
                     output_stages: Vec::new(),
                     timing: true,
+                    color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },

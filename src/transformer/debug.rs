@@ -5,7 +5,7 @@
 
 use std::fmt::Write as _;
 
-use crate::debug::{DebugDetail, DebugFilters};
+use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
 use crate::parser::DialectVersion;
 
 use super::{
@@ -23,7 +23,12 @@ struct ProtoEntry<'a> {
 }
 
 /// 输出统一 low-IR 的人类可读调试视图。
-pub fn dump_lir(chunk: &LoweredChunk, detail: DebugDetail, filters: &DebugFilters) -> String {
+pub fn dump_lir(
+    chunk: &LoweredChunk,
+    detail: DebugDetail,
+    filters: &DebugFilters,
+    color: DebugColorMode,
+) -> String {
     let mut output = String::new();
     let protos = collect_proto_entries(&chunk.main);
     let visible_protos = visible_proto_ids(&protos, filters);
@@ -45,7 +50,7 @@ pub fn dump_lir(chunk: &LoweredChunk, detail: DebugDetail, filters: &DebugFilter
     let _ = writeln!(output);
     write_lir_listing(&mut output, &protos, &visible_protos);
 
-    output
+    colorize_debug_text(&output, color)
 }
 
 fn collect_proto_entries(root: &LoweredProto) -> Vec<ProtoEntry<'_>> {

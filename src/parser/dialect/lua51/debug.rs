@@ -5,7 +5,7 @@
 
 use std::fmt::Write as _;
 
-use crate::debug::{DebugDetail, DebugFilters};
+use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
 use crate::parser::{
     ChunkHeader, DecodedText, Dialect, DialectConstPoolExtra, DialectDebugExtra,
     DialectHeaderExtra, DialectInstrExtra, DialectProtoExtra, DialectUpvalueExtra, DialectVersion,
@@ -26,8 +26,13 @@ struct ProtoEntry<'a> {
     proto: &'a RawProto,
 }
 
-pub(crate) fn dump_chunk(chunk: &RawChunk, detail: DebugDetail, filters: &DebugFilters) -> String {
-    render_human(chunk, detail, filters)
+pub(crate) fn dump_chunk(
+    chunk: &RawChunk,
+    detail: DebugDetail,
+    filters: &DebugFilters,
+    color: DebugColorMode,
+) -> String {
+    colorize_debug_text(&render_human(chunk, detail, filters), color)
 }
 
 fn render_human(chunk: &RawChunk, detail: DebugDetail, filters: &DebugFilters) -> String {
