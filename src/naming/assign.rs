@@ -930,9 +930,17 @@ fn assign_names_for_function(
         .synthetic_locals
         .iter()
         .copied()
-        .map(|local| {
+        .enumerate()
+        .map(|(synthetic_order, local)| {
             let info = allocate_name(
-                choose_synthetic_local_candidate(proto, local, evidence, hints, options),
+                choose_synthetic_local_candidate(
+                    proto,
+                    local,
+                    synthetic_order,
+                    evidence,
+                    hints,
+                    options,
+                ),
                 &mut used,
             );
             (local, info)
@@ -955,6 +963,15 @@ fn choose_param_candidate(
     hints: &FunctionHints,
     options: NamingOptions,
 ) -> CandidateHint {
+    if options.mode == NamingMode::DebugLike {
+        return mode_fallback_candidate(
+            options,
+            proto.id,
+            "p",
+            index,
+            alphabetical_name(index).unwrap_or_else(|| format!("arg{}", index + 1)),
+        );
+    }
     if let Some(name) = evidence
         .param_debug_names
         .get(index)
@@ -985,6 +1002,9 @@ fn choose_local_candidate(
     hints: &FunctionHints,
     options: NamingOptions,
 ) -> CandidateHint {
+    if options.mode == NamingMode::DebugLike {
+        return mode_fallback_candidate(options, proto.id, "r", index, "value".to_owned());
+    }
     if let Some(name) = evidence
         .local_debug_names
         .get(index)
@@ -1008,6 +1028,9 @@ fn choose_upvalue_candidate(
     evidence: &FunctionNamingEvidence,
     options: NamingOptions,
 ) -> CandidateHint {
+    if options.mode == NamingMode::DebugLike {
+        return mode_fallback_candidate(options, proto.id, "u", index, "up".to_owned());
+    }
     if let Some(name) = evidence
         .upvalue_debug_names
         .get(index)
@@ -1024,10 +1047,22 @@ fn choose_upvalue_candidate(
 fn choose_synthetic_local_candidate(
     proto: &HirProto,
     local: AstSyntheticLocalId,
+    synthetic_order: usize,
     evidence: &FunctionNamingEvidence,
     hints: &FunctionHints,
     options: NamingOptions,
 ) -> CandidateHint {
+    if options.mode == NamingMode::DebugLike {
+        // synthetic local 在调试视角里本质上也是“当前函数里的额外局部槽位”，
+        // 因此这里让它们和普通 local 共享 `r` 前缀，并排在显式 local 之后连续编号。
+        return mode_fallback_candidate(
+            options,
+            proto.id,
+            "r",
+            proto.locals.len() + synthetic_order,
+            "value".to_owned(),
+        );
+    }
     let index = local.index();
     if let Some(name) = evidence.temp_debug_names.get(index).and_then(as_valid_name) {
         return CandidateHint {
@@ -1529,14 +1564,14 @@ mod tests {
 
         let function = names.function(HirProtoRef(0)).expect("function names");
         assert_eq!(function.params[0].text, "p0_0");
-        assert_eq!(function.locals[0].text, "l0_0");
+        assert_eq!(function.locals[0].text, "r0_0");
         assert_eq!(
             function
                 .synthetic_locals
                 .get(&AstSyntheticLocalId(TempId(0)))
                 .expect("synthetic local names")
                 .text,
-            "sl0_0"
+            "r0_1"
         );
     }
 }

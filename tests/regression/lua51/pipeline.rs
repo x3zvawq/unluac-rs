@@ -7,6 +7,7 @@ use unluac::decompile::{
     DebugColorMode, DebugDetail, DebugOptions, DecompileOptions, DecompileStage,
     ReadabilityOptions, TimingNode, TimingReport, decompile,
 };
+use unluac::naming::{NamingMode, NamingOptions};
 
 const SETFENV_CHUNK_HEX: &str = "
 1b4c7561510001040804080023000000000000004074657374732f6361736573
@@ -531,6 +532,35 @@ mod decompile_pipeline {
         assert!(!dump.contains("local l1, l2, l3, l4"), "{dump}");
         assert!(dump.contains("local l1, l2 = l0(false, true)"), "{dump}");
         assert!(dump.contains("local l3, l4 = l0(true, 0)"), "{dump}");
+    }
+
+    #[test]
+    fn short_circuit_side_effects_generate_uses_register_like_names_in_debug_like_mode() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/15_short_circuit_side_effects.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                naming: NamingOptions {
+                    mode: NamingMode::DebugLike,
+                    debug_like_include_function: true,
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("short_circuit_side_effects generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(generated.source.contains("local function r0_0("), "{}", generated.source);
+        assert!(generated.source.contains("local function r1_1("), "{}", generated.source);
+        assert!(generated.source.contains("local r0_1, r0_2 = r0_0(false, true)"), "{}", generated.source);
+        assert!(!generated.source.contains("local function fn("), "{}", generated.source);
     }
 
     #[test]

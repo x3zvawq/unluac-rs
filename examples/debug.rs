@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 access_base_inline_max_complexity: 5,
             },
             naming: NamingOptions {
-                mode: NamingMode::DebugLike,
+                mode: NamingMode::Simple,
                 debug_like_include_function: true,
             },
             generate: Default::default(),
