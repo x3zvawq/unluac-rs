@@ -76,8 +76,7 @@ pub(super) fn simplify_hir_with_timing(
     if !converged {
         emit_hir_warning(format!(
             "HIR simplify exceeded {MAX_SIMPLIFY_ITERATIONS} fixed-point rounds; \
-             output may still contain unstable intermediate shapes. 如果你遇到这条警告，\
-             请把对应 case 反馈给维护者。"
+             output may still contain unstable intermediate shapes."
         ));
     }
 
@@ -85,8 +84,7 @@ pub(super) fn simplify_hir_with_timing(
     if residuals.has_soft_residuals() {
         emit_hir_warning(format!(
             "HIR exit still contains residual nodes: decision={}, unresolved={}, \
-             fallback_unstructured={}, other_unstructured={}. 如果你遇到这条警告，请把对应 \
-             case 反馈给维护者。",
+             fallback_unstructured={}, other_unstructured={}.",
             residuals.decisions,
             residuals.unresolved,
             residuals.fallback_unstructured,

@@ -7,7 +7,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicUsize, Ordering},
+};
 
 #[allow(dead_code)]
 pub(crate) mod case_manifest;
@@ -31,6 +34,73 @@ impl LuaCommandOutput {
             render_bytes(&self.stdout),
             render_bytes(&self.stderr)
         )
+    }
+}
+
+const TEST_OUTPUT_ENV: &str = "UNLUAC_TEST_OUTPUT";
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum TestOutputMode {
+    Simple,
+    Verbose,
+}
+
+impl TestOutputMode {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "simple" => Ok(Self::Simple),
+            "verbose" => Ok(Self::Verbose),
+            _ => Err(format!(
+                "invalid {TEST_OUTPUT_ENV}={raw:?}, expected one of: simple, verbose"
+            )),
+        }
+    }
+}
+
+static TEST_OUTPUT_MODE: OnceLock<TestOutputMode> = OnceLock::new();
+
+pub(crate) fn test_output_mode() -> TestOutputMode {
+    *TEST_OUTPUT_MODE.get_or_init(|| match std::env::var(TEST_OUTPUT_ENV) {
+        Ok(raw) => TestOutputMode::parse(raw.trim()).unwrap_or_else(|error| panic!("{error}")),
+        Err(std::env::VarError::NotPresent) => TestOutputMode::Simple,
+        Err(error) => panic!("failed to read {TEST_OUTPUT_ENV}: {error}"),
+    })
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct TestFailure {
+    summary: String,
+    detail: String,
+}
+
+impl TestFailure {
+    pub(crate) fn new(summary: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            summary: summary.into(),
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    pub(crate) fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+pub(crate) fn format_case_failure(path: &str, failure: &TestFailure) -> String {
+    match test_output_mode() {
+        TestOutputMode::Simple => format!("{path} :: {}", failure.summary()),
+        TestOutputMode::Verbose => format!("case: {path}\n{}", failure.detail()),
+    }
+}
+
+pub(crate) fn failure_separator() -> &'static str {
+    match test_output_mode() {
+        TestOutputMode::Simple => "\n",
+        TestOutputMode::Verbose => "\n\n",
     }
 }
 
@@ -99,15 +169,19 @@ pub(crate) fn write_generated_case_source(
 pub(crate) fn build_case_health_baseline(
     entry: &case_manifest::LuaCaseManifestEntry,
     suite_label: &str,
-) -> Result<CaseHealthBaseline, String> {
+) -> Result<CaseHealthBaseline, TestFailure> {
     let dialect_label = entry.dialect.luac_label();
-    let source_output = run_lua_case(dialect_label, entry.path)
-        .map_err(|error| format!("run source failed: {error}"))?;
+    let source_output = run_lua_case(dialect_label, entry.path).map_err(|error| {
+        TestFailure::new("run source failed", format!("run source failed: {error}"))
+    })?;
     if !source_output.success() {
-        return Err(format!(
-            "source execution failed for {}\n{}",
-            entry.path,
-            source_output.render()
+        let summary = format!(
+            "source execution failed (status: {})",
+            render_status_code(source_output.status_code)
+        );
+        return Err(TestFailure::new(
+            summary.clone(),
+            format!("{summary}\n{}", source_output.render()),
         ));
     }
 
@@ -118,35 +192,52 @@ pub(crate) fn build_case_health_baseline(
         "compiled-source",
         true,
     )
-    .map_err(|error| format!("compile source failed: {error}"))?;
+    .map_err(|error| {
+        TestFailure::new(
+            "compile source failed",
+            format!("compile source failed: {error}"),
+        )
+    })?;
     if !compile_output.success() {
-        return Err(format!(
-            "source compilation failed for {}\nartifact: {}\n{}",
-            entry.path,
+        let summary = format!(
+            "source compilation failed (artifact: {}, status: {})",
             compiled_path.display(),
-            compile_output.render()
+            render_status_code(compile_output.status_code)
+        );
+        return Err(TestFailure::new(
+            summary.clone(),
+            format!("{summary}\n{}", compile_output.render()),
         ));
     }
 
-    let chunk_output = run_lua_file(dialect_label, &compiled_path)
-        .map_err(|error| format!("run compiled chunk failed: {error}"))?;
+    let chunk_output = run_lua_file(dialect_label, &compiled_path).map_err(|error| {
+        TestFailure::new(
+            "run compiled chunk failed",
+            format!("run compiled chunk failed: {error}"),
+        )
+    })?;
     if !chunk_output.success() {
-        return Err(format!(
-            "compiled chunk execution failed for {}\nartifact: {}\n{}",
-            entry.path,
+        let summary = format!(
+            "compiled chunk execution failed (artifact: {}, status: {})",
             compiled_path.display(),
-            chunk_output.render()
+            render_status_code(chunk_output.status_code)
+        );
+        return Err(TestFailure::new(
+            summary.clone(),
+            format!("{summary}\n{}", chunk_output.render()),
         ));
     }
 
     if let Some(diff) =
         diff_command_outputs("source", &source_output, "compiled-chunk", &chunk_output)
     {
-        return Err(format!(
-            "source/chunk output mismatch for {}\nartifact: {}\n{}",
-            entry.path,
+        let summary = format!(
+            "source/chunk output mismatch (artifact: {})",
             compiled_path.display(),
-            diff
+        );
+        return Err(TestFailure::new(
+            summary.clone(),
+            format!("{summary}\n{diff}"),
         ));
     }
 

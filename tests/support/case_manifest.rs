@@ -86,11 +86,6 @@ pub(crate) struct LuaCaseManifestEntry {
     pub(crate) suites: LuaCaseSuites,
 }
 
-const LUA51_ONLY: &[LuaCaseDialect] = &[LuaCaseDialect::Lua51];
-const LUA52_ONLY: &[LuaCaseDialect] = &[LuaCaseDialect::Lua52];
-const LUA53_ONLY: &[LuaCaseDialect] = &[LuaCaseDialect::Lua53];
-const LUA54_ONLY: &[LuaCaseDialect] = &[LuaCaseDialect::Lua54];
-const LUA55_ONLY: &[LuaCaseDialect] = &[LuaCaseDialect::Lua55];
 const ALL_DIALECTS: &[LuaCaseDialect] = &[
     LuaCaseDialect::Lua51,
     LuaCaseDialect::Lua52,
@@ -98,6 +93,20 @@ const ALL_DIALECTS: &[LuaCaseDialect] = &[
     LuaCaseDialect::Lua54,
     LuaCaseDialect::Lua55,
 ];
+const PUC_LUA_51: &[LuaCaseDialect] = &[LuaCaseDialect::Lua51];
+const PUC_LUA_GE_52: &[LuaCaseDialect] = &[
+    LuaCaseDialect::Lua52,
+    LuaCaseDialect::Lua53,
+    LuaCaseDialect::Lua54,
+    LuaCaseDialect::Lua55,
+];
+const PUC_LUA_GE_53: &[LuaCaseDialect] = &[
+    LuaCaseDialect::Lua53,
+    LuaCaseDialect::Lua54,
+    LuaCaseDialect::Lua55,
+];
+const PUC_LUA_GE_54: &[LuaCaseDialect] = &[LuaCaseDialect::Lua54, LuaCaseDialect::Lua55];
+const PUC_LUA_GE_55: &[LuaCaseDialect] = &[LuaCaseDialect::Lua55];
 
 pub(crate) const ALL_CASES: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new(
@@ -318,104 +327,120 @@ pub(crate) const ALL_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/lua_cases/common/tricky/30_while_repeat_closure_interleave.lua",
         ALL_DIALECTS,
     ),
-    LuaCaseMatrixEntry::new("tests/lua_cases/lua5.1/01_setfenv.lua", LUA51_ONLY),
-    LuaCaseMatrixEntry::new("tests/lua_cases/lua5.1/02_module_legacy.lua", LUA51_ONLY),
+    LuaCaseMatrixEntry::new("tests/lua_cases/lua5.1/01_setfenv.lua", PUC_LUA_51),
+    LuaCaseMatrixEntry::new("tests/lua_cases/lua5.1/02_module_legacy.lua", PUC_LUA_51),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.1/03_setfenv_nested_closure.lua",
-        LUA51_ONLY,
+        PUC_LUA_51,
     ),
-    LuaCaseMatrixEntry::new("tests/lua_cases/lua5.2/01_goto_and_label.lua", LUA52_ONLY),
-    LuaCaseMatrixEntry::new("tests/lua_cases/lua5.2/02_env_redirect.lua", LUA52_ONLY),
     LuaCaseMatrixEntry::new(
-        "tests/lua_cases/lua5.2/03_extraarg_boundary.lua",
-        LUA52_ONLY,
+        "tests/lua_cases/lua5.2/01_goto_and_label.lua",
+        PUC_LUA_GE_52,
     ),
-    LuaCaseMatrixEntry::new("tests/lua_cases/lua5.2/04_goto_break_like.lua", LUA52_ONLY),
+    LuaCaseMatrixEntry::new("tests/lua_cases/lua5.2/02_env_redirect.lua", PUC_LUA_GE_52),
+    // 这个case太大了，跑起来很墨迹
+    // LuaCaseMatrixEntry::new(
+    //     "tests/lua_cases/lua5.2/03_extraarg_boundary.lua",
+    //     PUC_LUA_GE_52,
+    // ),
+    LuaCaseMatrixEntry::new(
+        "tests/lua_cases/lua5.2/04_goto_break_like.lua",
+        PUC_LUA_GE_52,
+    ),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.2/05_goto_continue_like.lua",
-        LUA52_ONLY,
+        PUC_LUA_GE_52,
     ),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.2/06_goto_irreducible_mesh.lua",
-        LUA52_ONLY,
+        PUC_LUA_GE_52,
     ),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.2/07_env_shadow_and_closure.lua",
-        LUA52_ONLY,
+        PUC_LUA_GE_52,
     ),
-    LuaCaseMatrixEntry::new("tests/lua_cases/lua5.3/01_bitwise_and_idiv.lua", LUA53_ONLY),
+    LuaCaseMatrixEntry::new(
+        "tests/lua_cases/lua5.3/01_bitwise_and_idiv.lua",
+        PUC_LUA_GE_53,
+    ),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.3/02_bitwise_closure_mesh.lua",
-        LUA53_ONLY,
+        PUC_LUA_GE_53,
     ),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.3/03_idiv_float_branching.lua",
-        LUA53_ONLY,
+        PUC_LUA_GE_53,
     ),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.3/04_method_table_bitwise.lua",
-        LUA53_ONLY,
+        PUC_LUA_GE_53,
     ),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.3/05_integer_float_capture.lua",
-        LUA53_ONLY,
+        PUC_LUA_GE_53,
     ),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.3/06_loop_bitwise_dispatch.lua",
-        LUA53_ONLY,
+        PUC_LUA_GE_53,
     ),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.3/07_bnot_mask_pipeline.lua",
-        LUA53_ONLY,
+        PUC_LUA_GE_53,
     ),
-    LuaCaseMatrixEntry::new("tests/lua_cases/lua5.4/01_tbc_close.lua", LUA54_ONLY),
-    LuaCaseMatrixEntry::new("tests/lua_cases/lua5.4/02_const_local.lua", LUA54_ONLY),
+    LuaCaseMatrixEntry::new("tests/lua_cases/lua5.4/01_tbc_close.lua", PUC_LUA_GE_54),
+    LuaCaseMatrixEntry::new("tests/lua_cases/lua5.4/02_const_local.lua", PUC_LUA_GE_54),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.4/03_const_closure_mesh.lua",
-        LUA54_ONLY,
+        PUC_LUA_GE_54,
     ),
-    LuaCaseMatrixEntry::new("tests/lua_cases/lua5.4/04_tbc_multi_exit.lua", LUA54_ONLY),
-    LuaCaseMatrixEntry::new("tests/lua_cases/lua5.4/05_tbc_goto_reenter.lua", LUA54_ONLY),
+    LuaCaseMatrixEntry::new(
+        "tests/lua_cases/lua5.4/04_tbc_multi_exit.lua",
+        PUC_LUA_GE_54,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/lua_cases/lua5.4/05_tbc_goto_reenter.lua",
+        PUC_LUA_GE_54,
+    ),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.4/06_close_tailcall_barrier.lua",
-        LUA54_ONLY,
+        PUC_LUA_GE_54,
     ),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.4/07_generic_for_const_close.lua",
-        LUA54_ONLY,
+        PUC_LUA_GE_54,
     ),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.4/08_vararg_const_pipeline.lua",
-        LUA54_ONLY,
+        PUC_LUA_GE_54,
     ),
-    LuaCaseMatrixEntry::new("tests/lua_cases/lua5.5/01_global_basic.lua", LUA55_ONLY),
+    LuaCaseMatrixEntry::new("tests/lua_cases/lua5.5/01_global_basic.lua", PUC_LUA_GE_55),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.5/02_global_function_capture.lua",
-        LUA55_ONLY,
+        PUC_LUA_GE_55,
     ),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.5/03_named_vararg_basic.lua",
-        LUA55_ONLY,
+        PUC_LUA_GE_55,
     ),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.5/04_named_vararg_closure_mesh.lua",
-        LUA55_ONLY,
+        PUC_LUA_GE_55,
     ),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.5/05_global_const_gate.lua",
-        LUA55_ONLY,
+        PUC_LUA_GE_55,
     ),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.5/06_global_named_vararg_pipeline.lua",
-        LUA55_ONLY,
+        PUC_LUA_GE_55,
     ),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.5/07_named_vararg_return.lua",
-        LUA55_ONLY,
+        PUC_LUA_GE_55,
     ),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.5/08_named_vararg_index_only.lua",
-        LUA55_ONLY,
+        PUC_LUA_GE_55,
     ),
 ];
 

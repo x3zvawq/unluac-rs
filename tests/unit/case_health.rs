@@ -3,8 +3,10 @@
 //! `case-health` 只回答一个问题：case 自己在对应 dialect 下是不是健康的。
 //! 它要求源码直跑、源码编译后再跑的退出码和输出完全一致。
 
-use crate::support::build_case_health_baseline;
 use crate::support::case_manifest::{LuaCaseDialect, case_health_cases};
+use crate::support::{build_case_health_baseline, failure_separator, format_case_failure};
+
+const MAX_REPORTED_FAILURES_PER_DIALECT: usize = 5;
 
 #[test]
 fn lua51_cases_are_healthy() {
@@ -32,18 +34,24 @@ fn lua55_cases_are_healthy() {
 }
 
 fn assert_case_health_for_dialect(dialect: LuaCaseDialect) {
+    let mut failure_count = 0;
     let mut failures = Vec::new();
 
     for entry in case_health_cases().filter(|entry| entry.dialect == dialect) {
         if let Err(error) = build_case_health_baseline(&entry, "case-health") {
-            failures.push(format!("case: {}\n{}", entry.path, error));
+            failure_count += 1;
+            if failures.len() < MAX_REPORTED_FAILURES_PER_DIALECT {
+                failures.push(format_case_failure(entry.path, &error));
+            }
         }
     }
 
     assert!(
-        failures.is_empty(),
-        "case-health failed for {}:\n\n{}",
+        failure_count == 0,
+        "case-health failed for {}: {} case(s) failed, showing first {}\n{}",
         dialect.luac_label(),
-        failures.join("\n\n")
+        failure_count,
+        MAX_REPORTED_FAILURES_PER_DIALECT,
+        failures.join(failure_separator())
     );
 }
