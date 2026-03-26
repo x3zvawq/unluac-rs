@@ -352,12 +352,18 @@ fn find_site_in_expr(expr: &HirExpr, temp: TempId, site: InlineSite) -> Option<I
             find_site_in_expr(&access.base, temp, site.descend_access_base())
                 .or_else(|| find_site_in_expr(&access.key, temp, InlineSite::Index))
         }
-        HirExpr::Unary(unary) => find_site_in_expr(&unary.expr, temp, InlineSite::Nested),
-        HirExpr::Binary(binary) => find_site_in_expr(&binary.lhs, temp, InlineSite::Nested)
-            .or_else(|| find_site_in_expr(&binary.rhs, temp, InlineSite::Nested)),
+        HirExpr::Unary(unary) => {
+            find_site_in_expr(&unary.expr, temp, site.descend_pure_wrapper())
+        }
+        HirExpr::Binary(binary) => {
+            let child_site = site.descend_pure_wrapper();
+            find_site_in_expr(&binary.lhs, temp, child_site)
+                .or_else(|| find_site_in_expr(&binary.rhs, temp, child_site))
+        }
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            find_site_in_expr(&logical.lhs, temp, InlineSite::Nested)
-                .or_else(|| find_site_in_expr(&logical.rhs, temp, InlineSite::Nested))
+            let child_site = site.descend_pure_wrapper();
+            find_site_in_expr(&logical.lhs, temp, child_site)
+                .or_else(|| find_site_in_expr(&logical.rhs, temp, child_site))
         }
         HirExpr::Decision(decision) => decision.nodes.iter().find_map(|node| {
             find_site_in_expr(&node.test, temp, InlineSite::Nested)
@@ -535,6 +541,18 @@ impl InlineSite {
         match self {
             Self::Direct => Self::AccessBase,
             Self::Nested | Self::ReturnValue | Self::Index | Self::CallArg | Self::AccessBase => {
+                Self::Nested
+            }
+        }
+    }
+
+    fn descend_pure_wrapper(self) -> Self {
+        match self {
+            // 这里只保留 index 语境向下穿透纯壳层，避免像 `t[(x + 1)]` 这种机械中间 temp
+            // 在进入 locals 阶段前就失去折叠机会；而 return/call 等站位仍维持保守边界，
+            // 防止上下文再次泄漏成“整坨表达式”。
+            Self::Index => Self::Index,
+            Self::Direct | Self::Nested | Self::ReturnValue | Self::CallArg | Self::AccessBase => {
                 Self::Nested
             }
         }
@@ -1372,6 +1390,106 @@ mod tests {
                         if matches!(access.base, HirExpr::GlobalRef(_))
                             && matches!(access.key, HirExpr::String(ref value) if value == "picked")
                 )
+        ));
+    }
+
+    #[test]
+    fn preserves_index_context_through_pure_wrapper_layers() {
+        let mut proto = HirProto {
+            upvalues: vec![crate::hir::common::UpvalueId(0)],
+            temps: vec![TempId(0), TempId(1)],
+            temp_debug_locals: vec![None, None],
+            ..dummy_proto(HirBlock {
+                stmts: vec![
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(TempId(0))],
+                        values: vec![HirExpr::UpvalueRef(crate::hir::common::UpvalueId(0))],
+                    })),
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(TempId(1))],
+                        values: vec![HirExpr::Unary(Box::new(
+                            crate::hir::common::HirUnaryExpr {
+                                op: crate::hir::common::HirUnaryOpKind::Length,
+                                expr: HirExpr::TempRef(TempId(0)),
+                            },
+                        ))],
+                    })),
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::TableAccess(Box::new(
+                            crate::hir::common::HirTableAccess {
+                                base: HirExpr::TempRef(TempId(0)),
+                                key: HirExpr::Binary(Box::new(
+                                    crate::hir::common::HirBinaryExpr {
+                                        op: crate::hir::common::HirBinaryOpKind::Add,
+                                        lhs: HirExpr::TempRef(TempId(1)),
+                                        rhs: HirExpr::Integer(1),
+                                    },
+                                )),
+                            },
+                        ))],
+                        values: vec![HirExpr::ParamRef(crate::hir::common::ParamId(0))],
+                    })),
+                    HirStmt::Return(Box::new(HirReturn {
+                        values: vec![HirExpr::ParamRef(crate::hir::common::ParamId(1))],
+                    })),
+                ],
+            })
+        };
+
+        assert!(inline_temps_in_proto(
+            &mut proto,
+            crate::readability::ReadabilityOptions::default()
+        ));
+        let [upvalue_assign, assign_stmt, return_stmt] = proto.body.stmts.as_slice() else {
+            panic!(
+                "expected temp forward + assign + return after inline: {:?}",
+                proto.body.stmts
+            );
+        };
+        let HirStmt::Assign(upvalue_assign) = upvalue_assign else {
+            panic!("expected first stmt to remain temp forward: {upvalue_assign:?}");
+        };
+        assert!(matches!(
+            upvalue_assign.targets.as_slice(),
+            [HirLValue::Temp(TempId(0))]
+        ));
+        assert!(matches!(
+            upvalue_assign.values.as_slice(),
+            [HirExpr::UpvalueRef(crate::hir::common::UpvalueId(0))]
+        ));
+        let HirStmt::Assign(assign) = assign_stmt else {
+            panic!("expected first stmt to be assign: {assign_stmt:?}");
+        };
+        let HirStmt::Return(ret) = return_stmt else {
+            panic!("expected second stmt to be return: {return_stmt:?}");
+        };
+        let [HirLValue::TableAccess(access)] = assign.targets.as_slice() else {
+            panic!("expected single table access target: {:?}", assign.targets);
+        };
+        assert!(matches!(
+            access.base,
+            HirExpr::TempRef(TempId(0))
+        ));
+        let HirExpr::Binary(binary) = &access.key else {
+            panic!("expected binary key after inline: {:?}", access.key);
+        };
+        assert_eq!(binary.op, crate::hir::common::HirBinaryOpKind::Add);
+        let HirExpr::Unary(unary) = &binary.lhs else {
+            panic!("expected unary lhs after inline: {:?}", binary.lhs);
+        };
+        assert_eq!(unary.op, crate::hir::common::HirUnaryOpKind::Length);
+        assert!(matches!(
+            &unary.expr,
+            HirExpr::TempRef(TempId(0))
+        ));
+        assert!(matches!(&binary.rhs, HirExpr::Integer(1)));
+        assert!(matches!(
+            assign.values.as_slice(),
+            [HirExpr::ParamRef(crate::hir::common::ParamId(0))]
+        ));
+        assert!(matches!(
+            ret.values.as_slice(),
+            [HirExpr::ParamRef(crate::hir::common::ParamId(1))]
         ));
     }
 

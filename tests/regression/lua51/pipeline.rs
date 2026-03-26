@@ -592,6 +592,34 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn short_circuit_side_effects_hir_collapses_index_temps_before_locals() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/15_short_circuit_side_effects.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("short_circuit_side_effects hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("assign u0[((# u0) + 1)] = p0"), "{dump}");
+        assert!(!dump.contains("local [\"l0\"] = u0"), "{dump}");
+        assert!(!dump.contains("local [\"l1\"] = (# u0)"), "{dump}");
+    }
+
+    #[test]
     fn all_supported_lua_cases_reach_clean_hir_exit() {
         let mut failures = Vec::new();
 
