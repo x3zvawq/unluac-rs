@@ -47,6 +47,12 @@ fn inline_temps_in_block(
     for stmt in std::mem::take(&mut block.stmts).into_iter().rev() {
         if let Some((temp, value)) = inline_candidate(&stmt)
             && !scratch.has_debug_local_hint(temp)
+            // `t = t + step` 这类自更新赋值表面上只在后缀里被用了一次，
+            // 但它本质上承载的是跨语句/跨迭代的状态推进。
+            // 一旦把它内联进下一条 `yield/return/call`，当前赋值本身就会消失，
+            // 后续再也没有地方记录“状态已经更新过”。
+            // 因此这里只允许折叠真正的 forwarding temp，不折叠自引用状态槽位。
+            && !expr_touches_temp(value, temp)
             && suffix_use_totals.get(temp.index()).copied().unwrap_or(0) == 1
             && let Some(state) = &mut next_stmt_state
             && state.temp_uses.count(temp) == 1
@@ -625,6 +631,76 @@ fn is_named_field_chain_expr(expr: &HirExpr) -> bool {
     };
     matches!(&access.key, HirExpr::String(_))
         && (is_atomic_nested_inline_expr(&access.base) || is_named_field_chain_expr(&access.base))
+}
+
+fn expr_touches_temp(expr: &HirExpr, temp: TempId) -> bool {
+    match expr {
+        HirExpr::TempRef(other) => *other == temp,
+        HirExpr::TableAccess(access) => {
+            expr_touches_temp(&access.base, temp) || expr_touches_temp(&access.key, temp)
+        }
+        HirExpr::Unary(unary) => expr_touches_temp(&unary.expr, temp),
+        HirExpr::Binary(binary) => {
+            expr_touches_temp(&binary.lhs, temp) || expr_touches_temp(&binary.rhs, temp)
+        }
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            expr_touches_temp(&logical.lhs, temp) || expr_touches_temp(&logical.rhs, temp)
+        }
+        HirExpr::Decision(decision) => decision.nodes.iter().any(|node| {
+            expr_touches_temp(&node.test, temp)
+                || decision_target_touches_temp(&node.truthy, temp)
+                || decision_target_touches_temp(&node.falsy, temp)
+        }),
+        HirExpr::Call(call) => {
+            expr_touches_temp(&call.callee, temp)
+                || call.args.iter().any(|arg| expr_touches_temp(arg, temp))
+        }
+        HirExpr::TableConstructor(table) => {
+            table.fields.iter().any(|field| match field {
+                HirTableField::Array(expr) => expr_touches_temp(expr, temp),
+                HirTableField::Record(field) => {
+                    table_key_touches_temp(&field.key, temp)
+                        || expr_touches_temp(&field.value, temp)
+                }
+            }) || table
+                .trailing_multivalue
+                .as_ref()
+                .is_some_and(|expr| expr_touches_temp(expr, temp))
+        }
+        HirExpr::Closure(closure) => closure
+            .captures
+            .iter()
+            .any(|capture| expr_touches_temp(&capture.value, temp)),
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::VarArg
+        | HirExpr::Unresolved(_) => false,
+    }
+}
+
+fn decision_target_touches_temp(
+    target: &crate::hir::common::HirDecisionTarget,
+    temp: TempId,
+) -> bool {
+    match target {
+        crate::hir::common::HirDecisionTarget::Expr(expr) => expr_touches_temp(expr, temp),
+        crate::hir::common::HirDecisionTarget::Node(_)
+        | crate::hir::common::HirDecisionTarget::CurrentValue => false,
+    }
+}
+
+fn table_key_touches_temp(key: &HirTableKey, temp: TempId) -> bool {
+    match key {
+        HirTableKey::Name(_) => false,
+        HirTableKey::Expr(expr) => expr_touches_temp(expr, temp),
+    }
 }
 
 fn collect_stmt_temp_uses_into(stmt: &HirStmt, scratch: &mut TempUseScratch) {

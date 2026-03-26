@@ -143,6 +143,71 @@ fn does_not_inline_temp_into_nested_return_base_access() {
 }
 
 #[test]
+fn does_not_inline_self_referential_loop_state_update_into_following_call() {
+    let mut proto = HirProto {
+        locals: vec![LocalId(0)],
+        ..dummy_proto(HirBlock {
+            stmts: vec![HirStmt::NumericFor(Box::new(HirNumericFor {
+                binding: LocalId(0),
+                start: HirExpr::Integer(1),
+                limit: HirExpr::Integer(2),
+                step: HirExpr::Integer(1),
+                body: HirBlock {
+                    stmts: vec![
+                        HirStmt::Assign(Box::new(HirAssign {
+                            targets: vec![HirLValue::Temp(TempId(0))],
+                            values: vec![HirExpr::Binary(Box::new(HirBinaryExpr {
+                                op: HirBinaryOpKind::Add,
+                                lhs: HirExpr::TempRef(TempId(0)),
+                                rhs: HirExpr::Integer(1),
+                            }))],
+                        })),
+                        HirStmt::CallStmt(Box::new(HirCallStmt {
+                            call: HirCallExpr {
+                                callee: HirExpr::GlobalRef(HirGlobalRef {
+                                    name: "yield".to_owned(),
+                                }),
+                                args: vec![HirExpr::TempRef(TempId(0))],
+                                multiret: false,
+                                method: false,
+                            },
+                        })),
+                    ],
+                },
+            }))],
+        })
+    };
+
+    assert!(!inline_temps_in_proto(
+        &mut proto,
+        crate::readability::ReadabilityOptions::default()
+    ));
+    assert!(matches!(
+        proto.body.stmts.as_slice(),
+        [HirStmt::NumericFor(numeric_for)]
+            if matches!(
+                numeric_for.body.stmts.as_slice(),
+                [HirStmt::Assign(assign), HirStmt::CallStmt(call_stmt)]
+                    if matches!(
+                        assign.targets.as_slice(),
+                        [HirLValue::Temp(TempId(0))]
+                    )
+                        && matches!(
+                            assign.values.as_slice(),
+                            [HirExpr::Binary(binary)]
+                                if binary.op == HirBinaryOpKind::Add
+                                    && matches!(binary.lhs, HirExpr::TempRef(TempId(0)))
+                                    && matches!(binary.rhs, HirExpr::Integer(1))
+                        )
+                        && matches!(
+                            call_stmt.call.args.as_slice(),
+                            [HirExpr::TempRef(TempId(0))]
+                        )
+            )
+    ));
+}
+
+#[test]
 fn inlines_named_field_access_base_into_immediate_assign_when_threshold_allows() {
     let mut proto = HirProto {
         temps: vec![TempId(0), TempId(1), TempId(2), TempId(3)],

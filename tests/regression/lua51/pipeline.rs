@@ -1090,6 +1090,93 @@ mod decompile_pipeline {
             generated.source
         );
     }
+
+    #[test]
+    fn coroutine_hir_keeps_loop_state_update_as_assignment_before_yield() {
+        let result = decompile(
+            &compile_lua_case("lua5.1", "tests/lua_cases/common/runtime/02_coroutine.lua"),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("coroutine hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("l1 = (l1 + l0)"), "{dump}");
+        assert!(
+            dump.contains("call(normal) global(coroutine)[\"yield\"](l1)"),
+            "{dump}"
+        );
+        assert!(
+            !dump.contains("global(coroutine)[\"yield\"]((l1 + l0))"),
+            "{dump}"
+        );
+    }
+
+    #[test]
+    fn coroutine_generate_keeps_state_update_before_yield() {
+        let result = decompile(
+            &compile_lua_case("lua5.1", "tests/lua_cases/common/runtime/02_coroutine.lua"),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("coroutine generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated.source.contains("for i = 1, 2, 1 do"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .lines()
+                .any(|line| line.contains("coroutine.yield(") && !line.contains("+ i)")),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .lines()
+                .any(|line| line.contains(" = ") && line.contains("+ i")),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .lines()
+                .filter(|line| line.contains("coroutine.yield("))
+                .all(|line| !line.contains("+ i)")),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .lines()
+                .any(|line| line.trim_start().starts_with("return ") && line.contains("* 2")),
+            "{}",
+            generated.source
+        );
+    }
 }
 
 fn compile_lua_case(dialect_label: &str, source_relative: &str) -> Vec<u8> {
