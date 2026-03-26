@@ -14,8 +14,25 @@ pub(super) fn expr_cost(expr: &HirExpr) -> usize {
     structural_expr_cost(expr) + duplicate_atom_penalty(expr) + logical_shape_penalty(expr)
 }
 
+pub(super) fn readable_expr_cost(expr: &HirExpr) -> ReadableExprCost {
+    ReadableExprCost {
+        duplicate_branch_penalty: duplicate_branch_penalty(expr),
+        duplicate_atom_penalty: duplicate_atom_penalty(expr),
+        or_chain_penalty: or_chain_penalty(expr),
+        structural_cost: structural_expr_cost(expr),
+    }
+}
+
 pub(super) fn is_truthy(value: &AbstractValue) -> bool {
     !matches!(value, AbstractValue::Nil | AbstractValue::False)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub(super) struct ReadableExprCost {
+    duplicate_branch_penalty: usize,
+    duplicate_atom_penalty: usize,
+    or_chain_penalty: usize,
+    structural_cost: usize,
 }
 
 fn structural_expr_cost(expr: &HirExpr) -> usize {
@@ -67,6 +84,85 @@ fn duplicate_atom_penalty(expr: &HirExpr) -> usize {
         }
     }
     duplicates + run_len.saturating_sub(1)
+}
+
+fn duplicate_branch_penalty(expr: &HirExpr) -> usize {
+    let mut branches = Vec::new();
+    collect_branch_subexprs(expr, &mut branches);
+    let mut penalty = 0usize;
+    for left in 0..branches.len() {
+        for right in (left + 1)..branches.len() {
+            if branches[left] == branches[right] {
+                penalty += structural_expr_cost(&branches[left]);
+            }
+        }
+    }
+    penalty
+}
+
+fn collect_branch_subexprs(expr: &HirExpr, out: &mut Vec<HirExpr>) {
+    match expr {
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            out.push(expr.clone());
+            collect_branch_subexprs(&logical.lhs, out);
+            collect_branch_subexprs(&logical.rhs, out);
+        }
+        HirExpr::Unary(unary) => collect_branch_subexprs(&unary.expr, out),
+        HirExpr::Binary(binary) => {
+            collect_branch_subexprs(&binary.lhs, out);
+            collect_branch_subexprs(&binary.rhs, out);
+        }
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::TempRef(_)
+        | HirExpr::Decision(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::TableAccess(_)
+        | HirExpr::Call(_)
+        | HirExpr::VarArg
+        | HirExpr::TableConstructor(_)
+        | HirExpr::Closure(_)
+        | HirExpr::Unresolved(_) => {}
+    }
+}
+
+fn or_chain_penalty(expr: &HirExpr) -> usize {
+    match expr {
+        HirExpr::LogicalOr(logical) => {
+            let chain_penalty = flatten_or_chain(expr).len().saturating_sub(2) * 4;
+            chain_penalty + or_chain_penalty(&logical.lhs) + or_chain_penalty(&logical.rhs)
+        }
+        HirExpr::LogicalAnd(logical) => {
+            or_chain_penalty(&logical.lhs) + or_chain_penalty(&logical.rhs)
+        }
+        HirExpr::Unary(unary) => or_chain_penalty(&unary.expr),
+        HirExpr::Binary(binary) => {
+            or_chain_penalty(&binary.lhs) + or_chain_penalty(&binary.rhs)
+        }
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::TempRef(_)
+        | HirExpr::Decision(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::TableAccess(_)
+        | HirExpr::Call(_)
+        | HirExpr::VarArg
+        | HirExpr::TableConstructor(_)
+        | HirExpr::Closure(_)
+        | HirExpr::Unresolved(_) => 0,
+    }
 }
 
 fn logical_shape_penalty(expr: &HirExpr) -> usize {

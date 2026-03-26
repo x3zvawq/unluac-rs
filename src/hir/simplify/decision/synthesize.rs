@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod cost;
 
 use crate::hir::common::{
-    HirBinaryOpKind, HirDecisionExpr, HirDecisionNodeRef, HirDecisionTarget, HirExpr,
+    HirBinaryOpKind, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr,
     HirLogicalExpr, HirUnaryExpr, HirUnaryOpKind, LocalId, ParamId, TempId, UpvalueId,
 };
 
@@ -231,6 +231,333 @@ pub(super) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
         })
         .filter(|candidate| expr_cost(candidate) < current_cost)
         .min_by_key(expr_cost)
+}
+
+pub(super) fn synthesize_readable_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
+    if !matches!(expr, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_)) {
+        return None;
+    }
+    if !expr_is_synth_safe(expr) {
+        return None;
+    }
+
+    let current = normalize_candidate_expr(expr.clone());
+    let mut refs = BTreeSet::new();
+    collect_refs_from_expr(&current, &mut refs);
+    let refs = refs.into_iter().collect::<Vec<_>>();
+    if refs.len() > MAX_SYNTH_REFS {
+        return None;
+    }
+
+    let ref_positions = refs
+        .iter()
+        .enumerate()
+        .map(|(index, key)| (*key, index))
+        .collect::<BTreeMap<_, _>>();
+    let mut literals = BTreeSet::new();
+    collect_literals_from_expr(&current, &mut literals);
+    let mut domain = vec![
+        AbstractValue::Nil,
+        AbstractValue::False,
+        AbstractValue::True,
+    ];
+    domain.extend(literals);
+    domain.extend((0..EXTRA_TRUTHY_SYMBOLS).map(|index| AbstractValue::TruthySymbol(index as u8)));
+    let environments = enumerate_environments(refs.len(), &domain)?;
+    let mut best = current.clone();
+    let mut visited = vec![current.clone()];
+    let mut queue = vec![current.clone()];
+    let mut cursor = 0usize;
+
+    while cursor < queue.len() && visited.len() < 64 {
+        let candidate = queue[cursor].clone();
+        cursor += 1;
+
+        let mut next_candidates = readable_local_rewrite_candidates(&candidate);
+        if let Some(structured) =
+            readable_structured_candidate(&candidate, &environments, &ref_positions)
+        {
+            next_candidates.push(structured);
+        }
+
+        for next in next_candidates.into_iter().map(normalize_candidate_expr) {
+            if visited.iter().any(|seen| seen == &next) {
+                continue;
+            }
+            if !validate_pure_expr_equivalence(expr, &next, &environments, &ref_positions) {
+                continue;
+            }
+            if cost::readable_expr_cost(&next) < cost::readable_expr_cost(&best) {
+                best = next.clone();
+            }
+            visited.push(next.clone());
+            queue.push(next);
+            if visited.len() >= 64 {
+                break;
+            }
+        }
+    }
+
+    (cost::readable_expr_cost(&best) < cost::readable_expr_cost(&current)).then_some(best)
+}
+
+fn build_readable_decision(expr: &HirExpr) -> Option<HirDecisionExpr> {
+    let mut nodes = Vec::new();
+    let entry = lower_pure_expr_to_target(
+        expr,
+        HirDecisionTarget::CurrentValue,
+        HirDecisionTarget::CurrentValue,
+        &mut nodes,
+    )?;
+    let HirDecisionTarget::Node(entry) = entry else {
+        return None;
+    };
+    Some(HirDecisionExpr { entry, nodes })
+}
+
+fn readable_structured_candidate(
+    expr: &HirExpr,
+    environments: &[Vec<AbstractValue>],
+    ref_positions: &BTreeMap<RefKey, usize>,
+) -> Option<HirExpr> {
+    let decision = build_readable_decision(expr)?;
+    let context = SynthesisContext {
+        decision: &decision,
+        ref_positions: ref_positions.clone(),
+        environments: environments.to_vec(),
+    };
+    let mut memo = BTreeMap::new();
+    synthesize_readable_value_node_expr(&context, decision.entry, &mut memo)
+}
+
+fn readable_local_rewrite_candidates(expr: &HirExpr) -> Vec<HirExpr> {
+    let mut candidates = Vec::new();
+    candidates.extend(fold_or_guard_with_shared_fallback(expr));
+    candidates.extend(factor_falsy_fallback_guard(expr));
+    candidates.extend(strip_falsy_fallback_inside_guard(expr));
+    candidates
+}
+
+fn fold_or_guard_with_shared_fallback(expr: &HirExpr) -> Vec<HirExpr> {
+    let outer_terms = flatten_or_chain(expr);
+    if outer_terms.len() < 3 {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    for (fallback_index, fallback) in outer_terms.iter().enumerate() {
+        for (guard_index, guard_term) in outer_terms.iter().enumerate() {
+            if guard_index == fallback_index {
+                continue;
+            }
+            let HirExpr::LogicalAnd(guard) = guard_term else {
+                continue;
+            };
+            let inner_terms = flatten_or_chain(&guard.rhs);
+            if !inner_terms.contains(fallback) {
+                continue;
+            }
+
+            let x_terms = outer_terms
+                .iter()
+                .enumerate()
+                .filter_map(|(index, term)| {
+                    (index != fallback_index && index != guard_index).then_some((*term).clone())
+                })
+                .collect::<Vec<_>>();
+            if x_terms.is_empty() {
+                continue;
+            }
+
+            let guarded = logical_and(
+                logical_or(rebuild_or_chain(x_terms), guard.lhs.clone()),
+                rebuild_or_chain(inner_terms.into_iter().cloned().collect()),
+            );
+            candidates.push(logical_or(guarded, (*fallback).clone()));
+        }
+    }
+    candidates
+}
+
+fn factor_falsy_fallback_guard(expr: &HirExpr) -> Vec<HirExpr> {
+    let outer_terms = flatten_or_chain(expr);
+    if outer_terms.len() < 3 {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    for (fallback_index, fallback) in outer_terms.iter().enumerate() {
+        if super::expr_truthiness(fallback) != Some(false) {
+            continue;
+        }
+
+        for (guard_index, guard_term) in outer_terms.iter().enumerate() {
+            if guard_index == fallback_index {
+                continue;
+            }
+            let HirExpr::LogicalAnd(guard) = guard_term else {
+                continue;
+            };
+            let inner_terms = flatten_or_chain(&guard.rhs);
+            let Some(inner_fallback_index) = inner_terms.iter().position(|term| *term == *fallback)
+            else {
+                continue;
+            };
+            if inner_terms.len() < 2 {
+                continue;
+            }
+
+            let z_terms = inner_terms
+                .iter()
+                .enumerate()
+                .filter_map(|(index, term)| (index != inner_fallback_index).then_some(*term))
+                .collect::<Vec<_>>();
+            if z_terms.is_empty() {
+                continue;
+            }
+            let x_terms = outer_terms
+                .iter()
+                .enumerate()
+                .filter_map(|(index, term)| {
+                    (index != fallback_index && index != guard_index).then_some((*term).clone())
+                })
+                .collect::<Vec<_>>();
+
+            let z = rebuild_or_chain(z_terms.into_iter().cloned().collect());
+            let guarded = if x_terms.is_empty() {
+                logical_and(guard.lhs.clone(), z)
+            } else {
+                logical_and(logical_or(rebuild_or_chain(x_terms), guard.lhs.clone()), z)
+            };
+            candidates.push(logical_or(guarded, (*fallback).clone()));
+        }
+    }
+    candidates
+}
+
+fn strip_falsy_fallback_inside_guard(expr: &HirExpr) -> Vec<HirExpr> {
+    let outer_terms = flatten_or_chain(expr);
+    if outer_terms.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    for (fallback_index, fallback) in outer_terms.iter().enumerate() {
+        if super::expr_truthiness(fallback) != Some(false) {
+            continue;
+        }
+
+        for (guard_index, guard_term) in outer_terms.iter().enumerate() {
+            if guard_index == fallback_index {
+                continue;
+            }
+            let HirExpr::LogicalAnd(guard) = guard_term else {
+                continue;
+            };
+            let inner_terms = flatten_or_chain(&guard.rhs);
+            let Some(inner_fallback_index) = inner_terms.iter().position(|term| *term == *fallback)
+            else {
+                continue;
+            };
+            let z_terms = inner_terms
+                .iter()
+                .enumerate()
+                .filter_map(|(index, term)| (index != inner_fallback_index).then_some(*term))
+                .collect::<Vec<_>>();
+            if z_terms.is_empty() {
+                continue;
+            }
+            let replacement = logical_and(
+                guard.lhs.clone(),
+                rebuild_or_chain(z_terms.into_iter().cloned().collect()),
+            );
+            let rebuilt = outer_terms
+                .iter()
+                .enumerate()
+                .map(|(index, term)| {
+                    if index == guard_index {
+                        replacement.clone()
+                    } else {
+                        (*term).clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            candidates.push(rebuild_or_chain(rebuilt));
+        }
+    }
+    candidates
+}
+
+fn lower_pure_expr_to_target(
+    expr: &HirExpr,
+    truthy: HirDecisionTarget,
+    falsy: HirDecisionTarget,
+    nodes: &mut Vec<HirDecisionNode>,
+) -> Option<HirDecisionTarget> {
+    match expr {
+        HirExpr::LogicalAnd(logical) => {
+            let rhs = lower_pure_expr_to_target(&logical.rhs, truthy, falsy.clone(), nodes)?;
+            lower_pure_expr_to_target(&logical.lhs, rhs, falsy, nodes)
+        }
+        HirExpr::LogicalOr(logical) => {
+            let rhs = lower_pure_expr_to_target(&logical.rhs, truthy.clone(), falsy, nodes)?;
+            lower_pure_expr_to_target(&logical.lhs, truthy, rhs, nodes)
+        }
+        _ if expr_is_synth_safe(expr) => {
+            if let Some(existing) = nodes.iter().find(|node| {
+                node.test == *expr && node.truthy == truthy && node.falsy == falsy
+            }) {
+                return Some(HirDecisionTarget::Node(existing.id));
+            }
+            let id = HirDecisionNodeRef(nodes.len());
+            nodes.push(HirDecisionNode {
+                id,
+                test: expr.clone(),
+                truthy,
+                falsy,
+            });
+            Some(HirDecisionTarget::Node(id))
+        }
+        _ => None,
+    }
+}
+
+fn synthesize_readable_value_node_expr(
+    context: &SynthesisContext<'_>,
+    node_ref: HirDecisionNodeRef,
+    memo: &mut BTreeMap<HirDecisionNodeRef, HirExpr>,
+) -> Option<HirExpr> {
+    if let Some(cached) = memo.get(&node_ref) {
+        return Some(cached.clone());
+    }
+
+    let node = &context.decision.nodes[node_ref.index()];
+    let truthy = synthesize_readable_value_target(context, &node.truthy, memo)?;
+    let falsy = synthesize_readable_value_target(context, &node.falsy, memo)?;
+    let expr = structured_candidates(&node.test, &truthy, &falsy)
+        .into_iter()
+        .map(normalize_candidate_expr)
+        .filter(|candidate| validate_candidate_for_node(context, node_ref, candidate))
+        .min_by_key(cost::readable_expr_cost)?;
+    memo.insert(node_ref, expr.clone());
+    Some(expr)
+}
+
+fn synthesize_readable_value_target(
+    context: &SynthesisContext<'_>,
+    target: &HirDecisionTarget,
+    memo: &mut BTreeMap<HirDecisionNodeRef, HirExpr>,
+) -> Option<SynthTarget> {
+    match target {
+        HirDecisionTarget::Node(next_ref) => Some(SynthTarget::Expr(
+            synthesize_readable_value_node_expr(context, *next_ref, memo)?,
+        )),
+        HirDecisionTarget::CurrentValue => Some(SynthTarget::CurrentValue),
+        HirDecisionTarget::Expr(expr) if expr_is_synth_safe(expr) => {
+            Some(SynthTarget::Expr(expr.clone()))
+        }
+        HirDecisionTarget::Expr(_) => None,
+    }
 }
 
 fn validate_pure_expr_equivalence(

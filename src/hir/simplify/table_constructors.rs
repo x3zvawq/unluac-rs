@@ -722,6 +722,7 @@ mod tests {
             locals: Vec::new(),
             upvalues: Vec::new(),
             temps: vec![table, value_a, value_b],
+            temp_debug_locals: vec![None, None, None],
             body: HirBlock {
                 stmts: vec![
                     HirStmt::Assign(Box::new(HirAssign {

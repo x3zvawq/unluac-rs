@@ -143,7 +143,7 @@ pub fn dump_readability(
     Ok(StageDebugOutput {
         stage: DecompileStage::Readability,
         detail: options.detail,
-        content: ast::dump_ast(ast_module, options.detail, &options.filters),
+        content: ast::dump_readability(ast_module, options.detail, &options.filters),
     })
 }
 

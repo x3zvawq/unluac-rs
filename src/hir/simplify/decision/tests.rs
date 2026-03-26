@@ -31,7 +31,7 @@ fn collapses_repeated_same_test_in_decision_chain() {
         })],
     };
 
-    super::super::simplify_hir(&mut module);
+    super::super::simplify_hir(&mut module, crate::readability::ReadabilityOptions::default());
 
     assert!(matches!(
         &module.protos[0].body.stmts.as_slice(),
@@ -64,7 +64,7 @@ fn folds_constant_truthy_decision_to_leaf_expr() {
         })],
     };
 
-    super::super::simplify_hir(&mut module);
+    super::super::simplify_hir(&mut module, crate::readability::ReadabilityOptions::default());
 
     assert!(matches!(
         &module.protos[0].body.stmts.as_slice(),
@@ -106,7 +106,7 @@ fn specializes_descendant_when_stable_test_truthiness_is_already_known() {
         })],
     };
 
-    super::super::simplify_hir(&mut module);
+    super::super::simplify_hir(&mut module, crate::readability::ReadabilityOptions::default());
 
     assert!(matches!(
         &module.protos[0].body.stmts.as_slice(),
@@ -143,7 +143,7 @@ fn collapses_value_decision_when_then_branch_is_definitely_truthy() {
         })],
     };
 
-    super::super::simplify_hir(&mut module);
+    super::super::simplify_hir(&mut module, crate::readability::ReadabilityOptions::default());
 
     assert!(matches!(
         &module.protos[0].body.stmts.as_slice(),
@@ -174,7 +174,7 @@ fn keeps_collapsible_decision_inside_short_circuit_expr_as_value_expr() {
         })],
     };
 
-    super::super::simplify_hir(&mut module);
+    super::super::simplify_hir(&mut module, crate::readability::ReadabilityOptions::default());
 
     assert!(matches!(
         module.protos[0].body.stmts.as_slice(),
@@ -203,7 +203,7 @@ fn removes_boolean_shells_in_condition_context() {
         })],
     };
 
-    super::super::simplify_hir(&mut module);
+    super::super::simplify_hir(&mut module, crate::readability::ReadabilityOptions::default());
 
     assert!(matches!(
         module.protos[0].body.stmts.as_slice(),
@@ -289,6 +289,7 @@ fn dummy_proto(body: HirBlock) -> HirProto {
         locals: Vec::new(),
         upvalues: Vec::new(),
         temps: vec![TempId(0)],
+        temp_debug_locals: vec![None],
         body,
         children: Vec::new(),
     }

@@ -10,6 +10,7 @@ mod options;
 mod pipeline;
 mod state;
 
+pub use crate::readability::ReadabilityOptions;
 pub use crate::debug::{DebugDetail, DebugFilters};
 pub use contracts::{
     AstChunk, CfgGraph, DataflowFacts, GeneratedChunk, GraphFacts, HirChunk, LoweredChunk,

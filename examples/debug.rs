@@ -9,18 +9,19 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use unluac::decompile::{
-    DebugDetail, DebugFilters, DebugOptions, DecompileDialect, DecompileOptions, DecompileStage,
-    decompile,
+    DebugDetail, DebugFilters, DebugOptions, DecompileDialect, DecompileOptions,
+    DecompileStage, ReadabilityOptions, decompile,
 };
 use unluac::parser::{ParseMode, ParseOptions, StringDecodeMode, StringEncoding};
 
 /// 开发时最常改的是这几个常量，直接编辑代码通常比来回敲命令更顺手。
-const DIALECT: DecompileDialect = DecompileDialect::Lua51;
-const SOURCE: &str = "tests/lua_cases/common/tricky/01_boolean_hell.lua";
+const DIALECT: DecompileDialect = DecompileDialect::Lua55;
+const SOURCE: &str = "tests/lua_cases/common/tricky/02_ultimate_mess.lua";
 const STRING_ENCODING: StringEncoding = StringEncoding::Utf8;
 const STRING_DECODE_MODE: StringDecodeMode = StringDecodeMode::Strict;
 const PARSE_MODE: ParseMode = ParseMode::Strict;
-const TARGET_STAGE: DecompileStage = DecompileStage::Ast;
+// 这个入口更常用来直接看“最终会长成什么源码形状”，所以默认停在 Readability。
+const TARGET_STAGE: DecompileStage = DecompileStage::Readability;
 const DEBUG_DETAIL: DebugDetail = DebugDetail::Verbose;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,6 +50,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 output_stages: vec![TARGET_STAGE],
                 detail: DEBUG_DETAIL,
                 filters: DebugFilters::default(),
+            },
+            readability: ReadabilityOptions {
+                return_inline_max_complexity: 10,
+                index_inline_max_complexity: 10,
+                args_inline_max_complexity: 6,
             },
         },
     )?;

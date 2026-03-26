@@ -43,6 +43,10 @@ pub(super) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
     synthesize::naturalize_pure_logical_expr(expr)
 }
 
+pub(crate) fn synthesize_readable_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
+    synthesize::synthesize_readable_pure_logical_expr(expr)
+}
+
 fn simplify_block(block: &mut HirBlock) -> bool {
     block
         .stmts

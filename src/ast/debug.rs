@@ -11,9 +11,27 @@ use super::common::{
 
 /// 输出 AST 的调试文本。
 pub fn dump_ast(module: &AstModule, detail: DebugDetail, _filters: &DebugFilters) -> String {
+    dump_module(module, detail, "AST", "ast")
+}
+
+/// 输出 Readability 阶段的调试文本。
+pub fn dump_readability(
+    module: &AstModule,
+    detail: DebugDetail,
+    _filters: &DebugFilters,
+) -> String {
+    dump_module(module, detail, "Readability", "readability")
+}
+
+fn dump_module(
+    module: &AstModule,
+    detail: DebugDetail,
+    stage_title: &str,
+    stage_label: &str,
+) -> String {
     let mut output = String::new();
-    let _ = writeln!(output, "===== Dump AST =====");
-    let _ = writeln!(output, "ast detail={detail}");
+    let _ = writeln!(output, "===== Dump {stage_title} =====");
+    let _ = writeln!(output, "{stage_label} detail={detail}");
     let _ = writeln!(output);
     write_block(&mut output, "", &module.body);
     output
@@ -28,79 +46,106 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock) {
     for stmt in &block.stmts {
         match stmt {
             AstStmt::LocalDecl(local_decl) => {
-                let _ = writeln!(
-                    output,
-                    "{indent}local {} = {}",
-                    local_decl
-                        .bindings
-                        .iter()
-                        .map(format_local_binding)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    format_expr_list(&local_decl.values, indent),
-                );
+                let bindings = local_decl
+                    .bindings
+                    .iter()
+                    .map(format_local_binding)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if local_decl.values.is_empty() {
+                    let _ = writeln!(output, "{indent}local {bindings}");
+                } else {
+                    let _ = writeln!(
+                        output,
+                        "{indent}local {bindings} = {}",
+                        format_value_list(&local_decl.values, indent),
+                    );
+                }
             }
             AstStmt::GlobalDecl(global_decl) => {
-                let _ = writeln!(
-                    output,
-                    "{indent}global {} = {}",
-                    global_decl
-                        .bindings
-                        .iter()
-                        .map(|binding| match binding.attr {
-                            super::common::AstGlobalAttr::None => binding.name.text.clone(),
-                            super::common::AstGlobalAttr::Const => {
-                                format!("{}<const>", binding.name.text)
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    format_expr_list(&global_decl.values, indent),
-                );
+                let bindings = global_decl
+                    .bindings
+                    .iter()
+                    .map(|binding| match binding.attr {
+                        super::common::AstGlobalAttr::None => binding.name.text.clone(),
+                        super::common::AstGlobalAttr::Const => {
+                            format!("{}<const>", binding.name.text)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if global_decl.values.is_empty() {
+                    let _ = writeln!(output, "{indent}global {bindings}");
+                } else {
+                    let _ = writeln!(
+                        output,
+                        "{indent}global {bindings} = {}",
+                        format_value_list(&global_decl.values, indent),
+                    );
+                }
             }
             AstStmt::Assign(assign) => {
                 let _ = writeln!(
                     output,
-                    "{indent}assign {} = {}",
+                    "{indent}{} = {}",
                     assign
                         .targets
                         .iter()
                         .map(|target| format_lvalue(target, indent))
                         .collect::<Vec<_>>()
                         .join(", "),
-                    format_expr_list(&assign.values, indent),
+                    format_value_list(&assign.values, indent),
                 );
             }
             AstStmt::CallStmt(call_stmt) => {
-                let _ = writeln!(output, "{indent}call {}", format_call(&call_stmt.call, indent));
+                let _ = writeln!(output, "{indent}{}", format_call(&call_stmt.call, indent));
             }
             AstStmt::Return(ret) => {
-                let _ = writeln!(output, "{indent}return {}", format_expr_list(&ret.values, indent));
+                if ret.values.is_empty() {
+                    let _ = writeln!(output, "{indent}return");
+                } else {
+                    let _ = writeln!(
+                        output,
+                        "{indent}return {}",
+                        format_value_list(&ret.values, indent),
+                    );
+                }
             }
             AstStmt::If(if_stmt) => {
-                let _ = writeln!(output, "{indent}if {}", format_expr(&if_stmt.cond, indent));
-                let _ = writeln!(output, "{indent}  then");
-                write_block(output, &format!("{indent}    "), &if_stmt.then_block);
+                let _ = writeln!(
+                    output,
+                    "{indent}if {} then",
+                    format_head_expr(&if_stmt.cond, indent),
+                );
+                write_block(output, &format!("{indent}  "), &if_stmt.then_block);
                 if let Some(else_block) = &if_stmt.else_block {
-                    let _ = writeln!(output, "{indent}  else");
-                    write_block(output, &format!("{indent}    "), else_block);
+                    let _ = writeln!(output, "{indent}else");
+                    write_block(output, &format!("{indent}  "), else_block);
                 }
                 let _ = writeln!(output, "{indent}end");
             }
             AstStmt::While(while_stmt) => {
-                let _ = writeln!(output, "{indent}while {}", format_expr(&while_stmt.cond, indent));
+                let _ = writeln!(
+                    output,
+                    "{indent}while {} do",
+                    format_head_expr(&while_stmt.cond, indent),
+                );
                 write_block(output, &format!("{indent}  "), &while_stmt.body);
                 let _ = writeln!(output, "{indent}end");
             }
             AstStmt::Repeat(repeat_stmt) => {
                 let _ = writeln!(output, "{indent}repeat");
                 write_block(output, &format!("{indent}  "), &repeat_stmt.body);
-                let _ = writeln!(output, "{indent}until {}", format_expr(&repeat_stmt.cond, indent));
+                let _ = writeln!(
+                    output,
+                    "{indent}until {}",
+                    format_head_expr(&repeat_stmt.cond, indent),
+                );
             }
             AstStmt::NumericFor(numeric_for) => {
                 let _ = writeln!(
                     output,
-                    "{indent}numeric-for {} = {}, {}, {}",
+                    "{indent}for {} = {}, {}, {} do",
                     format_binding_ref(numeric_for.binding),
                     format_expr(&numeric_for.start, indent),
                     format_expr(&numeric_for.limit, indent),
@@ -112,7 +157,7 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock) {
             AstStmt::GenericFor(generic_for) => {
                 let _ = writeln!(
                     output,
-                    "{indent}generic-for {} in {}",
+                    "{indent}for {} in {} do",
                     generic_for
                         .bindings
                         .iter()
@@ -120,7 +165,7 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock) {
                         .map(format_binding_ref)
                         .collect::<Vec<_>>()
                         .join(", "),
-                    format_expr_list(&generic_for.iterator, indent),
+                    format_value_list(&generic_for.iterator, indent),
                 );
                 write_block(output, &format!("{indent}  "), &generic_for.body);
                 let _ = writeln!(output, "{indent}end");
@@ -135,7 +180,7 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock) {
                 let _ = writeln!(output, "{indent}goto L{}", goto_stmt.target.index());
             }
             AstStmt::Label(label) => {
-                let _ = writeln!(output, "{indent}label L{}", label.id.index());
+                let _ = writeln!(output, "{indent}::L{}::", label.id.index());
             }
             AstStmt::DoBlock(block) => {
                 let _ = writeln!(output, "{indent}do");
@@ -178,7 +223,7 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock) {
     }
 }
 
-fn format_expr_list(values: &[AstExpr], indent: &str) -> String {
+fn format_value_list(values: &[AstExpr], indent: &str) -> String {
     if values.is_empty() {
         "-".to_owned()
     } else {
@@ -208,11 +253,15 @@ fn format_expr(expr: &AstExpr, indent: &str) -> String {
                 format_expr(&access.index, indent)
             )
         }
-        AstExpr::Unary(unary) => format!("({:?} {})", unary.op, format_expr(&unary.expr, indent)),
+        AstExpr::Unary(unary) => format!(
+            "({} {})",
+            format_unary_op(unary.op),
+            format_expr(&unary.expr, indent)
+        ),
         AstExpr::Binary(binary) => format!(
-            "({} {:?} {})",
+            "({} {} {})",
             format_expr(&binary.lhs, indent),
-            binary.op,
+            format_binary_op(binary.op),
             format_expr(&binary.rhs, indent)
         ),
         AstExpr::LogicalAnd(logical) => {
@@ -253,10 +302,14 @@ fn format_expr(expr: &AstExpr, indent: &str) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("table{{{fields}}}")
+            format!("{{{fields}}}")
         }
         AstExpr::FunctionExpr(function) => format_function_expr(function, indent),
     }
+}
+
+fn format_head_expr(expr: &AstExpr, indent: &str) -> String {
+    strip_outer_parens(format_expr(expr, indent))
 }
 
 fn format_name_ref(name: &super::common::AstNameRef) -> String {
@@ -335,16 +388,32 @@ fn format_call(call: &AstCallKind, indent: &str) -> String {
     match call {
         AstCallKind::Call(call) => format!(
             "{}({})",
-            format_expr(&call.callee, indent),
-            format_expr_list(&call.args, indent)
+            format_call_target(&call.callee, indent),
+            format_arg_list(&call.args, indent)
         ),
         AstCallKind::MethodCall(call) => format!(
             "{}:{}({})",
             format_expr(&call.receiver, indent),
             call.method,
-            format_expr_list(&call.args, indent)
+            format_arg_list(&call.args, indent)
         ),
     }
+}
+
+fn format_call_target(expr: &AstExpr, indent: &str) -> String {
+    let rendered = format_expr(expr, indent);
+    match expr {
+        AstExpr::FunctionExpr(_) => format!("({rendered})"),
+        _ => rendered,
+    }
+}
+
+fn format_arg_list(values: &[AstExpr], indent: &str) -> String {
+    values
+        .iter()
+        .map(|expr| format_expr(expr, indent))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn format_function_expr(function: &super::common::AstFunctionExpr, indent: &str) -> String {
@@ -358,4 +427,56 @@ fn format_function_expr(function: &super::common::AstFunctionExpr, indent: &str)
     let mut body = String::new();
     write_block(&mut body, &child_indent, &function.body);
     format!("function({params})\n{body}{indent}end")
+}
+
+fn format_unary_op(op: super::common::AstUnaryOpKind) -> &'static str {
+    match op {
+        super::common::AstUnaryOpKind::Not => "not",
+        super::common::AstUnaryOpKind::Neg => "-",
+        super::common::AstUnaryOpKind::BitNot => "~",
+        super::common::AstUnaryOpKind::Length => "#",
+    }
+}
+
+fn format_binary_op(op: super::common::AstBinaryOpKind) -> &'static str {
+    match op {
+        super::common::AstBinaryOpKind::Add => "+",
+        super::common::AstBinaryOpKind::Sub => "-",
+        super::common::AstBinaryOpKind::Mul => "*",
+        super::common::AstBinaryOpKind::Div => "/",
+        super::common::AstBinaryOpKind::FloorDiv => "//",
+        super::common::AstBinaryOpKind::Mod => "%",
+        super::common::AstBinaryOpKind::Pow => "^",
+        super::common::AstBinaryOpKind::BitAnd => "&",
+        super::common::AstBinaryOpKind::BitOr => "|",
+        super::common::AstBinaryOpKind::BitXor => "~",
+        super::common::AstBinaryOpKind::Shl => "<<",
+        super::common::AstBinaryOpKind::Shr => ">>",
+        super::common::AstBinaryOpKind::Concat => "..",
+        super::common::AstBinaryOpKind::Eq => "==",
+        super::common::AstBinaryOpKind::Lt => "<",
+        super::common::AstBinaryOpKind::Le => "<=",
+    }
+}
+
+fn strip_outer_parens(rendered: String) -> String {
+    if !rendered.starts_with('(') || !rendered.ends_with(')') {
+        return rendered;
+    }
+
+    let mut depth = 0usize;
+    for (index, ch) in rendered.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && index + ch.len_utf8() != rendered.len() {
+                    return rendered;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    rendered[1..(rendered.len() - 1)].to_owned()
 }

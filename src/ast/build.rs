@@ -6,7 +6,7 @@ mod patterns;
 
 use std::collections::BTreeSet;
 
-use crate::hir::{HirBlock, HirModule, HirStmt, TempId};
+use crate::hir::{HirBlock, HirGenericFor, HirModule, HirStmt, TempId};
 
 use self::analysis::{
     block_has_continue, collect_close_temps, collect_referenced_temps, max_hir_label_id,
@@ -101,6 +101,14 @@ impl<'a> AstLowerer<'a> {
 
             if let Some((stmt, consumed)) =
                 self.try_lower_local_close_decl(proto_index, &block.stmts, index)?
+            {
+                stmts.push(stmt);
+                index += consumed;
+                continue;
+            }
+
+            if let Some((stmt, consumed)) =
+                self.try_lower_generic_for_init(proto_index, &block.stmts, index, continue_target)?
             {
                 stmts.push(stmt);
                 index += consumed;
@@ -234,30 +242,12 @@ impl<'a> AstLowerer<'a> {
                     }))
                 }
                 HirStmt::GenericFor(generic_for) => {
-                    let loop_continue = self.loop_continue_label_if_needed(&generic_for.body);
-                    let mut body = self.lower_block(
+                    self.lower_generic_for_stmt(
                         proto_index,
-                        &generic_for.body,
+                        generic_for,
                         None,
-                        loop_continue.or(continue_target),
-                    )?;
-                    if let Some(label) = loop_continue {
-                        body.stmts.push(AstStmt::Label(Box::new(AstLabel { id: label })));
-                    }
-                    AstStmt::GenericFor(Box::new(AstGenericFor {
-                        bindings: generic_for
-                            .bindings
-                            .iter()
-                            .copied()
-                            .map(AstBindingRef::Local)
-                            .collect(),
-                        iterator: generic_for
-                            .iterator
-                            .iter()
-                            .map(|expr| self.lower_expr(proto_index, expr))
-                            .collect::<Result<Vec<_>, _>>()?,
-                        body,
-                    }))
+                        continue_target,
+                    )?
                 }
                 HirStmt::Break => AstStmt::Break,
                 HirStmt::Continue => {
@@ -322,6 +312,39 @@ impl<'a> AstLowerer<'a> {
         }
 
         Ok(AstBlock { stmts })
+    }
+
+    fn lower_generic_for_stmt(
+        &mut self,
+        proto_index: usize,
+        generic_for: &HirGenericFor,
+        iterator_override: Option<&[crate::hir::HirExpr]>,
+        continue_target: Option<AstLabelId>,
+    ) -> Result<AstStmt, AstLowerError> {
+        let loop_continue = self.loop_continue_label_if_needed(&generic_for.body);
+        let mut body = self.lower_block(
+            proto_index,
+            &generic_for.body,
+            None,
+            loop_continue.or(continue_target),
+        )?;
+        if let Some(label) = loop_continue {
+            body.stmts.push(AstStmt::Label(Box::new(AstLabel { id: label })));
+        }
+        let iterator = iterator_override.unwrap_or(&generic_for.iterator);
+        Ok(AstStmt::GenericFor(Box::new(AstGenericFor {
+            bindings: generic_for
+                .bindings
+                .iter()
+                .copied()
+                .map(AstBindingRef::Local)
+                .collect(),
+            iterator: iterator
+                .iter()
+                .map(|expr| self.lower_expr(proto_index, expr))
+                .collect::<Result<Vec<_>, _>>()?,
+            body,
+        })))
     }
 
     fn loop_continue_label_if_needed(&mut self, body: &HirBlock) -> Option<AstLabelId> {

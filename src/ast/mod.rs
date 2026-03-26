@@ -16,7 +16,8 @@ pub use common::{
     AstRepeat, AstReturn, AstStmt, AstTableConstructor, AstTableField, AstTableKey,
     AstTargetDialect, AstUnaryExpr, AstUnaryOpKind, AstWhile,
 };
-pub use debug::dump_ast;
+pub use debug::{dump_ast, dump_readability};
 pub use error::AstLowerError;
 pub use build::lower_ast;
-pub use readability::make_readable;
+pub use readability::{make_readable, make_readable_with_options};
+pub use crate::readability::ReadabilityOptions;

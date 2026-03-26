@@ -99,6 +99,7 @@ pub(super) fn empty_proto(id: HirProtoRef) -> HirProto {
         locals: Vec::new(),
         upvalues: Vec::new(),
         temps: Vec::new(),
+        temp_debug_locals: Vec::new(),
         body: HirBlock::default(),
         children: Vec::new(),
     }

@@ -98,4 +98,37 @@ mod decompile_pipeline {
         assert!(!dump.contains("unresolved("), "{dump}");
         assert!(!dump.contains("unstructured summary=fallback"), "{dump}");
     }
+
+    #[test]
+    fn lua53_readability_stage_merges_adjacent_local_decl_and_uses_lua_like_dump_syntax() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.3",
+            "tests/lua_cases/lua5.3/03_idiv_float_branching.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua53,
+                target_stage: DecompileStage::Readability,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Readability],
+                    detail: DebugDetail::Normal,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.3 readability stage should succeed");
+
+        assert_eq!(result.state.completed_stage, Some(DecompileStage::Readability));
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("local t8, t9, t10, t11"), "{dump}");
+        assert!(dump.contains("local function l0(p0)"), "{dump}");
+        assert!(dump.contains("t8, t9, t10, t11 = l0({5, 8, 13, 21, 34})"), "{dump}");
+        assert!(dump.contains("for l0 = l3, l4, l5 do"), "{dump}");
+        assert!(dump.contains("::L1::"), "{dump}");
+        assert!(!dump.contains("assign "), "{dump}");
+        assert!(!dump.contains("numeric-for "), "{dump}");
+    }
 }

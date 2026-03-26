@@ -5,11 +5,13 @@
 //! 控制流边界或 debug 语义悄悄改坏。
 
 use crate::hir::common::{
-    HirBlock, HirCallExpr, HirExpr, HirLValue, HirProto, HirStmt, HirTableField, TempId,
+    HirBlock, HirCallExpr, HirExpr, HirLValue, HirProto, HirStmt, HirTableField, HirTableKey,
+    TempId,
 };
+use crate::readability::ReadabilityOptions;
 
 /// 对单个 proto 递归执行局部 temp 折叠。
-pub(super) fn inline_temps_in_proto(proto: &mut HirProto) -> bool {
+pub(super) fn inline_temps_in_proto(proto: &mut HirProto, readability: ReadabilityOptions) -> bool {
     let proto_temp_count = proto
         .temps
         .iter()
@@ -18,15 +20,19 @@ pub(super) fn inline_temps_in_proto(proto: &mut HirProto) -> bool {
         .map_or(0, |max_index| max_index + 1);
     let body_temp_count = max_temp_index_in_block(&proto.body).map_or(0, |max_index| max_index + 1);
     let temp_count = proto_temp_count.max(body_temp_count);
-    let mut scratch = TempUseScratch::new(temp_count);
-    inline_temps_in_block(&mut proto.body, &mut scratch)
+    let mut scratch = TempUseScratch::new(proto, temp_count);
+    inline_temps_in_block(&mut proto.body, &mut scratch, readability)
 }
 
-fn inline_temps_in_block(block: &mut HirBlock, scratch: &mut TempUseScratch) -> bool {
+fn inline_temps_in_block(
+    block: &mut HirBlock,
+    scratch: &mut TempUseScratch,
+    readability: ReadabilityOptions,
+) -> bool {
     let mut changed = false;
 
     for stmt in &mut block.stmts {
-        changed |= inline_temps_in_nested_blocks(stmt, scratch);
+        changed |= inline_temps_in_nested_blocks(stmt, scratch, readability);
     }
 
     // 逆向扫描只需要维护“后缀里每个 temp 当前被用了多少次”以及最近一个保留下来的
@@ -37,10 +43,15 @@ fn inline_temps_in_block(block: &mut HirBlock, scratch: &mut TempUseScratch) -> 
 
     for stmt in std::mem::take(&mut block.stmts).into_iter().rev() {
         if let Some((temp, value)) = inline_candidate(&stmt)
+            && !scratch.has_debug_local_hint(temp)
             && suffix_use_totals.get(temp.index()).copied().unwrap_or(0) == 1
             && let Some(state) = &mut next_stmt_state
             && state.is_simple
             && state.temp_uses.count(temp) == 1
+            && kept_rev
+                .last()
+                .and_then(|next_stmt| inline_site_in_simple_stmt(next_stmt, temp))
+                .is_some_and(|site| site.allows(value, readability))
         {
             state.temp_uses.remove_from_totals(&mut suffix_use_totals);
             let next_stmt = kept_rev
@@ -68,22 +79,34 @@ fn inline_temps_in_block(block: &mut HirBlock, scratch: &mut TempUseScratch) -> 
     changed
 }
 
-fn inline_temps_in_nested_blocks(stmt: &mut HirStmt, scratch: &mut TempUseScratch) -> bool {
+fn inline_temps_in_nested_blocks(
+    stmt: &mut HirStmt,
+    scratch: &mut TempUseScratch,
+    readability: ReadabilityOptions,
+) -> bool {
     match stmt {
         HirStmt::If(if_stmt) => {
-            let mut changed = inline_temps_in_block(&mut if_stmt.then_block, scratch);
+            let mut changed = inline_temps_in_block(&mut if_stmt.then_block, scratch, readability);
             if let Some(else_block) = &mut if_stmt.else_block {
-                changed |= inline_temps_in_block(else_block, scratch);
+                changed |= inline_temps_in_block(else_block, scratch, readability);
             }
             changed
         }
-        HirStmt::While(while_stmt) => inline_temps_in_block(&mut while_stmt.body, scratch),
-        HirStmt::Repeat(repeat_stmt) => inline_temps_in_block(&mut repeat_stmt.body, scratch),
-        HirStmt::NumericFor(numeric_for) => inline_temps_in_block(&mut numeric_for.body, scratch),
-        HirStmt::GenericFor(generic_for) => inline_temps_in_block(&mut generic_for.body, scratch),
-        HirStmt::Block(block) => inline_temps_in_block(block, scratch),
+        HirStmt::While(while_stmt) => {
+            inline_temps_in_block(&mut while_stmt.body, scratch, readability)
+        }
+        HirStmt::Repeat(repeat_stmt) => {
+            inline_temps_in_block(&mut repeat_stmt.body, scratch, readability)
+        }
+        HirStmt::NumericFor(numeric_for) => {
+            inline_temps_in_block(&mut numeric_for.body, scratch, readability)
+        }
+        HirStmt::GenericFor(generic_for) => {
+            inline_temps_in_block(&mut generic_for.body, scratch, readability)
+        }
+        HirStmt::Block(block) => inline_temps_in_block(block, scratch, readability),
         HirStmt::Unstructured(unstructured) => {
-            inline_temps_in_block(&mut unstructured.body, scratch)
+            inline_temps_in_block(&mut unstructured.body, scratch, readability)
         }
         HirStmt::LocalDecl(_)
         | HirStmt::Assign(_)
@@ -186,13 +209,19 @@ impl TempUseSummary {
 }
 
 struct TempUseScratch {
+    temp_debug_hints: Vec<bool>,
     counts: Vec<usize>,
     touched: Vec<TempId>,
 }
 
 impl TempUseScratch {
-    fn new(temp_count: usize) -> Self {
+    fn new(proto: &HirProto, temp_count: usize) -> Self {
+        let mut temp_debug_hints = vec![false; temp_count];
+        for (index, hint) in proto.temp_debug_locals.iter().enumerate().take(temp_count) {
+            temp_debug_hints[index] = hint.is_some();
+        }
         Self {
+            temp_debug_hints,
             counts: vec![0; temp_count],
             touched: Vec::new(),
         }
@@ -200,6 +229,10 @@ impl TempUseScratch {
 
     fn temp_count(&self) -> usize {
         self.counts.len()
+    }
+
+    fn has_debug_local_hint(&self, temp: TempId) -> bool {
+        self.temp_debug_hints.get(temp.index()).copied().unwrap_or(false)
     }
 
     fn note_temp(&mut self, temp: TempId) {
@@ -236,6 +269,248 @@ impl TempUseScratch {
 fn collect_stmt_temp_uses(stmt: &HirStmt, scratch: &mut TempUseScratch) -> TempUseSummary {
     collect_stmt_temp_uses_into(stmt, scratch);
     scratch.finish_summary()
+}
+
+fn inline_site_in_simple_stmt(stmt: &HirStmt, temp: TempId) -> Option<InlineSite> {
+    match stmt {
+        HirStmt::LocalDecl(local_decl) => {
+            find_site_in_exprs(&local_decl.values, temp, InlineSite::Direct)
+        }
+        HirStmt::Assign(assign) => assign
+            .targets
+            .iter()
+            .find_map(|target| find_site_in_lvalue(target, temp, InlineSite::Direct))
+            .or_else(|| find_site_in_exprs(&assign.values, temp, InlineSite::Direct)),
+        HirStmt::TableSetList(set_list) => find_site_in_expr(&set_list.base, temp, InlineSite::Direct)
+            .or_else(|| find_site_in_exprs(&set_list.values, temp, InlineSite::Direct))
+            .or_else(|| {
+                set_list
+                    .trailing_multivalue
+                    .as_ref()
+                    .and_then(|expr| find_site_in_expr(expr, temp, InlineSite::Direct))
+            }),
+        HirStmt::CallStmt(call_stmt) => find_site_in_call(&call_stmt.call, temp, InlineSite::Direct),
+        HirStmt::Return(ret) => find_site_in_exprs(&ret.values, temp, InlineSite::ReturnValue),
+        HirStmt::If(_)
+        | HirStmt::While(_)
+        | HirStmt::Repeat(_)
+        | HirStmt::NumericFor(_)
+        | HirStmt::GenericFor(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_)
+        | HirStmt::Block(_)
+        | HirStmt::Unstructured(_) => None,
+    }
+}
+
+fn find_site_in_exprs(exprs: &[HirExpr], temp: TempId, site: InlineSite) -> Option<InlineSite> {
+    exprs.iter()
+        .find_map(|expr| find_site_in_expr(expr, temp, site))
+}
+
+fn find_site_in_call(call: &HirCallExpr, temp: TempId, site: InlineSite) -> Option<InlineSite> {
+    let callee_site = if matches!(site, InlineSite::Direct) {
+        InlineSite::Direct
+    } else {
+        InlineSite::Nested
+    };
+    find_site_in_expr(&call.callee, temp, callee_site)
+        .or_else(|| find_site_in_exprs(&call.args, temp, InlineSite::CallArg))
+}
+
+fn find_site_in_lvalue(lvalue: &HirLValue, temp: TempId, site: InlineSite) -> Option<InlineSite> {
+    match lvalue {
+        HirLValue::Temp(target) if *target == temp => Some(site),
+        HirLValue::TableAccess(access) => find_site_in_expr(&access.base, temp, InlineSite::Nested)
+            .or_else(|| find_site_in_expr(&access.key, temp, InlineSite::Index)),
+        HirLValue::Temp(_) | HirLValue::Local(_) | HirLValue::Upvalue(_) | HirLValue::Global(_) => {
+            None
+        }
+    }
+}
+
+fn find_site_in_expr(expr: &HirExpr, temp: TempId, site: InlineSite) -> Option<InlineSite> {
+    match expr {
+        HirExpr::TempRef(other) if *other == temp => Some(site),
+        HirExpr::TempRef(_) => None,
+        HirExpr::TableAccess(access) => find_site_in_expr(&access.base, temp, InlineSite::Nested)
+            .or_else(|| find_site_in_expr(&access.key, temp, InlineSite::Index)),
+        HirExpr::Unary(unary) => find_site_in_expr(&unary.expr, temp, InlineSite::Nested),
+        HirExpr::Binary(binary) => find_site_in_expr(&binary.lhs, temp, InlineSite::Nested)
+            .or_else(|| find_site_in_expr(&binary.rhs, temp, InlineSite::Nested)),
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            find_site_in_expr(&logical.lhs, temp, InlineSite::Nested)
+                .or_else(|| find_site_in_expr(&logical.rhs, temp, InlineSite::Nested))
+        }
+        HirExpr::Decision(decision) => decision.nodes.iter().find_map(|node| {
+            find_site_in_expr(&node.test, temp, InlineSite::Nested)
+                .or_else(|| find_site_in_decision_target(&node.truthy, temp, InlineSite::Nested))
+                .or_else(|| find_site_in_decision_target(&node.falsy, temp, InlineSite::Nested))
+        }),
+        HirExpr::Call(call) => find_site_in_call(call, temp, InlineSite::Nested),
+        HirExpr::TableConstructor(table) => table.fields.iter().find_map(|field| match field {
+            HirTableField::Array(value) => find_site_in_expr(value, temp, InlineSite::Nested),
+            HirTableField::Record(field) => find_site_in_table_key(&field.key, temp)
+                .or_else(|| find_site_in_expr(&field.value, temp, InlineSite::Nested)),
+        })
+        .or_else(|| {
+            table
+                .trailing_multivalue
+                .as_ref()
+                .and_then(|expr| find_site_in_expr(expr, temp, InlineSite::Nested))
+        }),
+        HirExpr::Closure(closure) => closure
+            .captures
+            .iter()
+            .find_map(|capture| find_site_in_expr(&capture.value, temp, InlineSite::Nested)),
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::VarArg
+        | HirExpr::Unresolved(_) => None,
+    }
+}
+
+fn find_site_in_decision_target(
+    target: &crate::hir::common::HirDecisionTarget,
+    temp: TempId,
+    site: InlineSite,
+) -> Option<InlineSite> {
+    match target {
+        crate::hir::common::HirDecisionTarget::Expr(expr) => find_site_in_expr(expr, temp, site),
+        crate::hir::common::HirDecisionTarget::Node(_)
+        | crate::hir::common::HirDecisionTarget::CurrentValue => None,
+    }
+}
+
+fn find_site_in_table_key(key: &HirTableKey, temp: TempId) -> Option<InlineSite> {
+    match key {
+        HirTableKey::Name(_) => None,
+        HirTableKey::Expr(expr) => find_site_in_expr(expr, temp, InlineSite::Index),
+    }
+}
+
+fn expr_complexity(expr: &HirExpr) -> usize {
+    match expr {
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::TempRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::VarArg
+        | HirExpr::Unresolved(_) => 1,
+        HirExpr::Unary(unary) => 1 + expr_complexity(&unary.expr),
+        HirExpr::Binary(binary) => 1 + expr_complexity(&binary.lhs) + expr_complexity(&binary.rhs),
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            1 + expr_complexity(&logical.lhs) + expr_complexity(&logical.rhs)
+        }
+        HirExpr::TableAccess(access) => 1 + expr_complexity(&access.base) + expr_complexity(&access.key),
+        HirExpr::Decision(decision) => 1 + decision.nodes.iter().map(decision_node_complexity).sum::<usize>(),
+        HirExpr::Call(call) => {
+            1 + expr_complexity(&call.callee) + call.args.iter().map(expr_complexity).sum::<usize>()
+        }
+        HirExpr::TableConstructor(table) => {
+            1 + table
+                .fields
+                .iter()
+                .map(|field| match field {
+                    HirTableField::Array(value) => expr_complexity(value),
+                    HirTableField::Record(field) => {
+                        table_key_complexity(&field.key) + expr_complexity(&field.value)
+                    }
+                })
+                .sum::<usize>()
+                + table
+                    .trailing_multivalue
+                    .as_ref()
+                    .map_or(0, expr_complexity)
+        }
+        HirExpr::Closure(closure) => 1 + closure.captures.iter().map(|capture| expr_complexity(&capture.value)).sum::<usize>(),
+    }
+}
+
+fn decision_node_complexity(node: &crate::hir::common::HirDecisionNode) -> usize {
+    1 + expr_complexity(&node.test)
+        + decision_target_complexity(&node.truthy)
+        + decision_target_complexity(&node.falsy)
+}
+
+fn decision_target_complexity(target: &crate::hir::common::HirDecisionTarget) -> usize {
+    match target {
+        crate::hir::common::HirDecisionTarget::Expr(expr) => expr_complexity(expr),
+        crate::hir::common::HirDecisionTarget::Node(_)
+        | crate::hir::common::HirDecisionTarget::CurrentValue => 1,
+    }
+}
+
+fn table_key_complexity(key: &HirTableKey) -> usize {
+    match key {
+        HirTableKey::Name(_) => 1,
+        HirTableKey::Expr(expr) => expr_complexity(expr),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InlineSite {
+    Direct,
+    Nested,
+    ReturnValue,
+    Index,
+    CallArg,
+}
+
+impl InlineSite {
+    fn allows(self, replacement: &HirExpr, options: ReadabilityOptions) -> bool {
+        match self {
+            Self::Direct => true,
+            Self::Nested => is_atomic_nested_inline_expr(replacement),
+            Self::ReturnValue | Self::Index | Self::CallArg => self
+                .complexity_limit(options)
+                .is_some_and(|limit| expr_complexity(replacement) <= limit),
+        }
+    }
+
+    fn complexity_limit(self, options: ReadabilityOptions) -> Option<usize> {
+        match self {
+            Self::Direct | Self::Nested => None,
+            Self::ReturnValue => Some(options.return_inline_max_complexity),
+            Self::Index => Some(options.index_inline_max_complexity),
+            Self::CallArg => Some(options.args_inline_max_complexity),
+        }
+    }
+}
+
+fn is_atomic_nested_inline_expr(expr: &HirExpr) -> bool {
+    matches!(
+        expr,
+        HirExpr::Nil
+            | HirExpr::Boolean(_)
+            | HirExpr::Integer(_)
+            | HirExpr::Number(_)
+            | HirExpr::String(_)
+            | HirExpr::ParamRef(_)
+            | HirExpr::LocalRef(_)
+            | HirExpr::UpvalueRef(_)
+            | HirExpr::TempRef(_)
+            | HirExpr::GlobalRef(_)
+            | HirExpr::VarArg
+    )
 }
 
 fn collect_stmt_temp_uses_into(stmt: &HirStmt, scratch: &mut TempUseScratch) {
@@ -761,7 +1036,10 @@ mod tests {
             ],
         });
 
-        assert!(inline_temps_in_proto(&mut proto));
+        assert!(inline_temps_in_proto(
+            &mut proto,
+            crate::readability::ReadabilityOptions::default()
+        ));
         assert_eq!(proto.body.stmts.len(), 3);
         assert!(matches!(
             &proto.body.stmts[1],
@@ -787,7 +1065,10 @@ mod tests {
             ],
         });
 
-        assert!(!inline_temps_in_proto(&mut proto));
+        assert!(!inline_temps_in_proto(
+            &mut proto,
+            crate::readability::ReadabilityOptions::default()
+        ));
         assert_eq!(proto.body.stmts.len(), 3);
     }
 
@@ -809,10 +1090,125 @@ mod tests {
             ],
         });
 
-        assert!(inline_temps_in_proto(&mut proto));
+        assert!(inline_temps_in_proto(
+            &mut proto,
+            crate::readability::ReadabilityOptions::default()
+        ));
         assert!(matches!(
             proto.body.stmts.as_slice(),
             [HirStmt::Return(ret)] if matches!(ret.values.as_slice(), [HirExpr::Integer(7)])
+        ));
+    }
+
+    #[test]
+    fn does_not_inline_temp_into_nested_return_base_access() {
+        let mut proto = dummy_proto(HirBlock {
+            stmts: vec![
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Temp(TempId(0))],
+                    values: vec![HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
+                        base: HirExpr::GlobalRef(HirGlobalRef {
+                            name: "root".to_owned(),
+                        }),
+                        key: HirExpr::String("items".to_owned()),
+                    }))],
+                })),
+                HirStmt::Return(Box::new(HirReturn {
+                    values: vec![HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
+                        base: HirExpr::TempRef(TempId(0)),
+                        key: HirExpr::String("value".to_owned()),
+                    }))],
+                })),
+            ],
+        });
+
+        assert!(!inline_temps_in_proto(
+            &mut proto,
+            crate::readability::ReadabilityOptions::default()
+        ));
+        assert!(matches!(
+            proto.body.stmts.as_slice(),
+            [HirStmt::Assign(_), HirStmt::Return(ret)]
+                if matches!(
+                    ret.values.as_slice(),
+                    [HirExpr::TableAccess(access)]
+                        if matches!(access.base, HirExpr::TempRef(TempId(0)))
+                )
+        ));
+    }
+
+    #[test]
+    fn still_inlines_temp_directly_in_index_context() {
+        let mut proto = HirProto {
+            temps: vec![TempId(0), TempId(1), TempId(2)],
+            ..dummy_proto(HirBlock {
+                stmts: vec![
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(TempId(0))],
+                        values: vec![HirExpr::String("picked".to_owned())],
+                    })),
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(TempId(1))],
+                        values: vec![HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
+                            base: HirExpr::GlobalRef(HirGlobalRef {
+                                name: "root".to_owned(),
+                            }),
+                            key: HirExpr::TempRef(TempId(0)),
+                        }))],
+                    })),
+                    HirStmt::Return(Box::new(HirReturn {
+                        values: vec![HirExpr::TempRef(TempId(1))],
+                    })),
+                ],
+            })
+        };
+
+        assert!(inline_temps_in_proto(
+            &mut proto,
+            crate::readability::ReadabilityOptions {
+                index_inline_max_complexity: 5,
+                ..crate::readability::ReadabilityOptions::default()
+            }
+        ));
+        assert!(matches!(
+            proto.body.stmts.as_slice(),
+            [HirStmt::Return(ret)]
+                if matches!(
+                    ret.values.as_slice(),
+                    [HirExpr::TableAccess(access)]
+                        if matches!(access.base, HirExpr::GlobalRef(_))
+                            && matches!(access.key, HirExpr::String(ref value) if value == "picked")
+                )
+        ));
+    }
+
+    #[test]
+    fn does_not_inline_direct_return_when_temp_has_debug_local_hint() {
+        let mut proto = dummy_proto(HirBlock {
+            stmts: vec![
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Temp(TempId(0))],
+                    values: vec![HirExpr::Integer(41)],
+                })),
+                HirStmt::Return(Box::new(HirReturn {
+                    values: vec![HirExpr::TempRef(TempId(0))],
+                })),
+            ],
+        });
+        proto.temp_debug_locals[0] = Some("x".to_owned());
+
+        assert!(!inline_temps_in_proto(
+            &mut proto,
+            crate::readability::ReadabilityOptions {
+                return_inline_max_complexity: usize::MAX,
+                index_inline_max_complexity: usize::MAX,
+                args_inline_max_complexity: usize::MAX,
+            }
+        ));
+        assert!(matches!(
+            proto.body.stmts.as_slice(),
+            [HirStmt::Assign(_), HirStmt::Return(ret)]
+                if matches!(ret.values.as_slice(), [HirExpr::TempRef(TempId(0))])
         ));
     }
 
@@ -834,6 +1230,7 @@ mod tests {
             locals: Vec::new(),
             upvalues: Vec::new(),
             temps: vec![TempId(0), TempId(1)],
+            temp_debug_locals: vec![None, None],
             body,
             children: Vec::new(),
         }
@@ -860,7 +1257,7 @@ mod tests {
             })],
         };
 
-        super::super::simplify_hir(&mut module);
+        super::super::simplify_hir(&mut module, crate::readability::ReadabilityOptions::default());
 
         assert!(matches!(
             &module.protos[0].body.stmts.as_slice(),

@@ -6,6 +6,7 @@
 use std::fmt;
 
 use crate::parser::ParseOptions;
+use crate::readability::ReadabilityOptions;
 
 use super::debug::DebugOptions;
 use super::state::DecompileStage;
@@ -58,6 +59,7 @@ pub struct DecompileOptions {
     pub parse: ParseOptions,
     pub target_stage: DecompileStage,
     pub debug: DebugOptions,
+    pub readability: ReadabilityOptions,
 }
 
 impl Default for DecompileOptions {
@@ -68,6 +70,7 @@ impl Default for DecompileOptions {
             // 默认仍停在 parse，是为了保留当前最常用的 parser 调试工作流。
             target_stage: DecompileStage::Parse,
             debug: DebugOptions::default(),
+            readability: ReadabilityOptions::default(),
         }
     }
 }

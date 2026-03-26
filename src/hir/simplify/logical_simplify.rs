@@ -577,7 +577,7 @@ mod tests {
             })],
         };
 
-        super::super::simplify_hir(&mut module);
+        super::super::simplify_hir(&mut module, crate::readability::ReadabilityOptions::default());
 
         assert!(matches!(
             &module.protos[0].body.stmts.as_slice(),
@@ -721,6 +721,7 @@ mod tests {
             locals: Vec::new(),
             upvalues: Vec::new(),
             temps: vec![TempId(0), TempId(1), TempId(2), TempId(3)],
+            temp_debug_locals: vec![None, None, None, None],
             body,
             children: Vec::new(),
         }

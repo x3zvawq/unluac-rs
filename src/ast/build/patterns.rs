@@ -155,12 +155,79 @@ impl<'a> AstLowerer<'a> {
             2,
         )))
     }
+
+    pub(super) fn try_lower_generic_for_init(
+        &mut self,
+        proto_index: usize,
+        stmts: &[HirStmt],
+        index: usize,
+        continue_target: Option<crate::ast::AstLabelId>,
+    ) -> Result<Option<(AstStmt, usize)>, AstLowerError> {
+        let Some(HirStmt::Assign(assign)) = stmts.get(index) else {
+            return Ok(None);
+        };
+
+        let (generic_for, consumed, close_temp) = match (stmts.get(index + 1), stmts.get(index + 2)) {
+            (Some(HirStmt::ToBeClosed(to_be_closed)), Some(HirStmt::GenericFor(generic_for))) => {
+                let HirExpr::TempRef(close_temp) = &to_be_closed.value else {
+                    return Ok(None);
+                };
+                (generic_for, 3, Some(*close_temp))
+            }
+            (Some(HirStmt::GenericFor(generic_for)), _) => (generic_for, 2, None),
+            _ => return Ok(None),
+        };
+
+        if !assign_targets_match_generic_for_init(assign.targets.as_slice(), generic_for, close_temp) {
+            return Ok(None);
+        }
+
+        Ok(Some((
+            self.lower_generic_for_stmt(
+                proto_index,
+                generic_for,
+                Some(assign.values.as_slice()),
+                continue_target,
+            )?,
+            consumed,
+        )))
+    }
 }
 
 fn lvalue_matches_global_name(target: &HirLValue, name: &str) -> bool {
     match target {
         HirLValue::Global(global) => global.name == name,
         HirLValue::TableAccess(access) => matches!(&access.key, HirExpr::String(key) if key == name),
+        _ => false,
+    }
+}
+
+fn assign_targets_match_generic_for_init(
+    targets: &[HirLValue],
+    generic_for: &crate::hir::HirGenericFor,
+    close_temp: Option<crate::hir::TempId>,
+) -> bool {
+    let expected_targets = generic_for.iterator.len() + usize::from(close_temp.is_some());
+    if targets.len() != expected_targets {
+        return false;
+    }
+
+    let iter_targets_match = targets
+        .iter()
+        .zip(generic_for.iterator.iter())
+        .all(|(target, iterator)| match (target, iterator) {
+            (HirLValue::Temp(target_temp), HirExpr::TempRef(iterator_temp)) => {
+                target_temp == iterator_temp
+            }
+            _ => false,
+        });
+    if !iter_targets_match {
+        return false;
+    }
+
+    match (close_temp, targets.last()) {
+        (Some(close_temp), Some(HirLValue::Temp(target_temp))) => *target_temp == close_temp,
+        (None, _) => true,
         _ => false,
     }
 }

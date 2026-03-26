@@ -7,11 +7,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::cfg::{Cfg, DataflowFacts};
+use crate::cfg::{Cfg, DataflowFacts, OpenDef};
 use crate::hir::common::{LocalId, ParamId, TempId, UpvalueId};
+use crate::parser::RawLocalVar;
 use crate::structure::{LoopKindHint, StructureFacts};
-use crate::transformer::LoweredProto;
+use crate::transformer::{InstrRef, LoweredProto, Reg};
 
+use super::helpers::decode_raw_string;
 use super::ProtoBindings;
 
 pub(super) fn build_bindings(
@@ -98,6 +100,17 @@ pub(super) fn build_bindings(
     }
 
     let temps = (0..next_temp_index).map(TempId).collect::<Vec<_>>();
+    let mut temp_debug_locals = vec![None; next_temp_index];
+
+    for def in &dataflow.defs {
+        let temp = fixed_temps[def.id.index()];
+        temp_debug_locals[temp.index()] = debug_local_name_for_reg_at_instr(proto, def.reg, def.instr);
+    }
+
+    for open_def in &dataflow.open_defs {
+        let temp = open_temps[open_def.id.index()];
+        temp_debug_locals[temp.index()] = debug_local_name_for_open_def_start(proto, open_def);
+    }
 
     let instr_fixed_defs = dataflow
         .instr_defs
@@ -122,6 +135,7 @@ pub(super) fn build_bindings(
         locals,
         upvalues,
         temps,
+        temp_debug_locals,
         fixed_temps,
         open_temps,
         phi_temps,
@@ -132,6 +146,34 @@ pub(super) fn build_bindings(
         generic_for_locals,
         block_local_regs,
     }
+}
+
+fn debug_local_name_for_open_def_start(proto: &LoweredProto, open_def: &OpenDef) -> Option<String> {
+    debug_local_name_for_reg_at_instr(proto, open_def.start_reg, open_def.instr)
+}
+
+fn debug_local_name_for_reg_at_instr(
+    proto: &LoweredProto,
+    reg: Reg,
+    instr: InstrRef,
+) -> Option<String> {
+    let pc = proto.lowering_map.pc_map.get(instr.index())?.first().copied()?;
+    debug_local_name_for_reg_at_pc(proto, reg, pc)
+}
+
+fn debug_local_name_for_reg_at_pc(proto: &LoweredProto, reg: Reg, pc: u32) -> Option<String> {
+    proto
+        .debug_info
+        .common
+        .local_vars
+        .iter()
+        .filter(|local| debug_local_is_active_at_pc(local, pc))
+        .nth(reg.index())
+        .map(|local| decode_raw_string(&local.name))
+}
+
+fn debug_local_is_active_at_pc(local: &RawLocalVar, pc: u32) -> bool {
+    local.start_pc <= pc && pc < local.end_pc
 }
 
 fn numeric_for_binding_reg(

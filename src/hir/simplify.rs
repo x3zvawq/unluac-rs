@@ -13,11 +13,12 @@ mod table_constructors;
 mod temp_inline;
 
 use crate::hir::common::HirModule;
+use crate::readability::ReadabilityOptions;
 
 const MAX_SIMPLIFY_ITERATIONS: usize = 128;
 
 /// 对已经构造完成的 HIR 做 fixed-point 收敛。
-pub(super) fn simplify_hir(module: &mut HirModule) {
+pub(super) fn simplify_hir(module: &mut HirModule, readability: ReadabilityOptions) {
     let mut converged = false;
 
     for _ in 0..MAX_SIMPLIFY_ITERATIONS {
@@ -28,7 +29,7 @@ pub(super) fn simplify_hir(module: &mut HirModule) {
                 boolean_shells::remove_boolean_materialization_shells_in_proto(proto);
             let logical_changed = logical_simplify::simplify_logical_exprs_in_proto(proto);
             let table_changed = table_constructors::stabilize_table_constructors_in_proto(proto);
-            let temp_inline_changed = temp_inline::inline_temps_in_proto(proto);
+            let temp_inline_changed = temp_inline::inline_temps_in_proto(proto, readability);
             let locals_changed = locals::promote_temps_to_locals_in_proto(proto);
             let eliminate_changed = decision::eliminate_remaining_decisions_in_proto(proto);
             changed |= decision_changed
@@ -66,6 +67,12 @@ pub(super) fn simplify_hir(module: &mut HirModule) {
             residuals.other_unstructured
         ));
     }
+}
+
+pub(crate) fn synthesize_readable_pure_logical_expr(
+    expr: &crate::hir::common::HirExpr,
+) -> Option<crate::hir::common::HirExpr> {
+    decision::synthesize_readable_pure_logical_expr(expr)
 }
 
 #[derive(Default)]

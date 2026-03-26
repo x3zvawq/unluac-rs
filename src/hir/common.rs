@@ -23,6 +23,7 @@ pub struct HirProto {
     pub locals: Vec<LocalId>,
     pub upvalues: Vec<UpvalueId>,
     pub temps: Vec<TempId>,
+    pub temp_debug_locals: Vec<Option<String>>,
     pub body: HirBlock,
     pub children: Vec<HirProtoRef>,
 }

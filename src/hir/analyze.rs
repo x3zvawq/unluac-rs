@@ -15,6 +15,7 @@ use self::lower::{ChildAnalyses, lower_proto};
 use super::simplify::simplify_hir;
 use crate::cfg::{CfgGraph, DataflowFacts, GraphFacts};
 use crate::hir::common::HirModule;
+use crate::readability::ReadabilityOptions;
 use crate::structure::StructureFacts;
 use crate::transformer::LoweredChunk;
 
@@ -32,6 +33,7 @@ pub fn analyze_hir(
     graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
     structure: &StructureFacts,
+    readability: ReadabilityOptions,
 ) -> HirModule {
     let mut protos = Vec::new();
     let child_analyses = ChildAnalyses {
@@ -51,6 +53,6 @@ pub fn analyze_hir(
     );
 
     let mut module = HirModule { entry, protos };
-    simplify_hir(&mut module);
+    simplify_hir(&mut module, readability);
     module
 }

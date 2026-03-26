@@ -844,7 +844,7 @@ mod tests {
             })],
         };
 
-        super::super::simplify_hir(&mut module);
+        super::super::simplify_hir(&mut module, crate::readability::ReadabilityOptions::default());
 
         assert_eq!(module.protos[0].locals.len(), 1);
         assert!(matches!(
@@ -891,7 +891,7 @@ mod tests {
             })],
         };
 
-        super::super::simplify_hir(&mut module);
+        super::super::simplify_hir(&mut module, crate::readability::ReadabilityOptions::default());
 
         assert_eq!(module.protos[0].locals.len(), 1);
         assert!(matches!(
@@ -929,6 +929,7 @@ mod tests {
             locals: Vec::new(),
             upvalues: Vec::new(),
             temps: vec![TempId(0), TempId(1)],
+            temp_debug_locals: vec![None, None],
             body,
             children: Vec::new(),
         }

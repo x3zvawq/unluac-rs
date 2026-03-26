@@ -3,7 +3,7 @@
 //! 当前只真正接上 parser，但入口已经先按完整阶段序列搭好；
 //! 这样后续补层时只需要往这个骨架里填实现，不需要重写调用约定。
 
-use crate::ast::{AstDialectVersion, AstTargetDialect, lower_ast, make_readable};
+use crate::ast::{AstDialectVersion, AstTargetDialect, lower_ast, make_readable_with_options};
 use crate::cfg::{analyze_dataflow, analyze_graph_facts, build_cfg_graph};
 use crate::hir::analyze_hir;
 use crate::parser::{
@@ -210,7 +210,14 @@ impl DecompilerPipeline {
                 .structure_facts
                 .as_ref()
                 .expect("structure stage completed must leave structure facts in state");
-            analyze_hir(lowered, cfg_graph, graph_facts, dataflow, structure_facts)
+            analyze_hir(
+                lowered,
+                cfg_graph,
+                graph_facts,
+                dataflow,
+                structure_facts,
+                options.readability,
+            )
         });
         state.mark_completed(DecompileStage::Hir);
 
@@ -250,7 +257,11 @@ impl DecompilerPipeline {
                 .ast
                 .as_ref()
                 .expect("ast stage completed must leave ast module in state");
-            make_readable(ast, target_ast_dialect(options.dialect))
+            make_readable_with_options(
+                ast,
+                target_ast_dialect(options.dialect),
+                options.readability,
+            )
         });
         state.mark_completed(DecompileStage::Readability);
 

@@ -8,8 +8,9 @@ use super::super::common::{
     AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstModule,
     AstStmt,
 };
+use super::ReadabilityContext;
 
-pub(super) fn apply(module: &mut AstModule) -> bool {
+pub(super) fn apply(module: &mut AstModule, _context: ReadabilityContext) -> bool {
     cleanup_block(&mut module.body)
 }
 

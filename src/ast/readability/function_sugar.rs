@@ -5,9 +5,10 @@ use super::super::common::{
     AstFunctionName, AstGlobalDecl, AstLValue, AstLocalAttr, AstLocalDecl, AstLocalFunctionDecl,
     AstModule, AstNamePath, AstNameRef, AstStmt, AstTargetDialect,
 };
+use super::ReadabilityContext;
 
-pub(super) fn apply(module: &mut AstModule, target: AstTargetDialect) -> bool {
-    rewrite_block(&mut module.body, target)
+pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
+    rewrite_block(&mut module.body, context.target)
 }
 
 fn rewrite_block(block: &mut AstBlock, target: AstTargetDialect) -> bool {

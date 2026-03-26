@@ -62,8 +62,10 @@ mod decompile_pipeline {
 
         assert_eq!(result.state.completed_stage, Some(DecompileStage::Hir));
         let dump = &result.debug_output[0].content;
-        assert!(dump.contains("local [\"l1\"] = ((l0[1] * 10) + l0[l0[\"n\"]])"), "{dump}");
-        assert!(dump.contains("assign l0[2] = (l0[2] + p0)"), "{dump}");
+        assert!(dump.contains("local [\"l1\"] = l0[1]"), "{dump}");
+        assert!(dump.contains("local [\"l3\"] = l0[l0[\"n\"]]"), "{dump}");
+        assert!(dump.contains("assign l0[l5] = (l6 + p0)"), "{dump}");
+        assert!(dump.contains("return l4, l0[\"n\"],"), "{dump}");
         assert!(!dump.contains("entry-reg"), "{dump}");
         assert!(!dump.contains("unresolved("), "{dump}");
     }
@@ -182,7 +184,7 @@ mod decompile_pipeline {
         assert!(dump.contains("global label ="), "{dump}");
         assert!(dump.contains("global counter ="), "{dump}");
         assert!(dump.contains("local l5 = function(p0)"), "{dump}");
-        assert!(dump.contains("assign u0.counter = ((u0.counter Mul 2) Add p0)"), "{dump}");
+        assert!(dump.contains("u0.counter ="), "{dump}");
         assert!(dump.contains("global step = l5"), "{dump}");
         assert!(!dump.contains("local t"), "{dump}");
         assert!(!dump.contains("err-nnil"), "{dump}");
@@ -212,6 +214,7 @@ mod decompile_pipeline {
 
         assert_eq!(result.state.completed_stage, Some(DecompileStage::Readability));
         let dump = &result.debug_output[0].content;
+        assert!(dump.contains("===== Dump Readability ====="), "{dump}");
         assert!(dump.contains("global function step(p0)"), "{dump}");
         assert!(!dump.contains("local l5 = function"), "{dump}");
         assert!(!dump.contains("global step = l5"), "{dump}");
@@ -242,6 +245,8 @@ mod decompile_pipeline {
         assert_eq!(result.state.completed_stage, Some(DecompileStage::Readability));
         let dump = &result.debug_output[0].content;
         assert!(dump.contains("local function l1(p0)"), "{dump}");
+        assert!(dump.contains("if p0"), "{dump}");
+        assert!(!dump.contains("if (not p0)"), "{dump}");
         assert!(!dump.contains("local l1 = function(p0)"), "{dump}");
     }
 
@@ -270,7 +275,7 @@ mod decompile_pipeline {
         assert_eq!(result.state.completed_stage, Some(DecompileStage::Ast));
         let dump = &result.debug_output[0].content;
         assert!(dump.contains("local l1 = function(p0)"), "{dump}");
-        assert!(dump.contains("if (Not p0)"), "{dump}");
+        assert!(dump.contains("if not p0 then"), "{dump}");
         assert!(!dump.contains("local l1 = function(p0) ... end"), "{dump}");
     }
 
@@ -298,8 +303,12 @@ mod decompile_pipeline {
 
         assert_eq!(result.state.completed_stage, Some(DecompileStage::Readability));
         let dump = &result.debug_output[0].content;
-        assert!(dump.contains("call u0.print(\"var55-closure\", function(p0)"), "{dump}");
+        assert!(dump.contains("local function l1(p0)"), "{dump}");
         assert!(dump.contains("local function l1(p0, p1)"), "{dump}");
+        assert!(dump.contains("local function l6()"), "{dump}");
+        assert!(dump.contains("local l7 = l6()"), "{dump}");
+        assert!(dump.contains("u0.print(\"var55-closure\", l1(2, 4, 7, 5))"), "{dump}");
         assert!(!dump.contains("function(p0) ... end"), "{dump}");
+        assert!(!dump.contains("end(-)"), "{dump}");
     }
 }

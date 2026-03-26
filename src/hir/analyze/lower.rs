@@ -34,6 +34,7 @@ pub(super) struct ProtoBindings {
     pub(super) locals: Vec<LocalId>,
     pub(super) upvalues: Vec<UpvalueId>,
     pub(super) temps: Vec<TempId>,
+    pub(super) temp_debug_locals: Vec<Option<String>>,
     pub(super) fixed_temps: Vec<TempId>,
     pub(super) open_temps: Vec<TempId>,
     pub(super) phi_temps: Vec<TempId>,
@@ -122,6 +123,7 @@ pub(super) fn lower_proto(
         locals: lowering.bindings.locals.clone(),
         upvalues: lowering.bindings.upvalues.clone(),
         temps: lowering.bindings.temps.clone(),
+        temp_debug_locals: lowering.bindings.temp_debug_locals.clone(),
         body: build_proto_body(&lowering),
         children: child_refs,
     };

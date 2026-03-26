@@ -408,6 +408,7 @@ mod tests {
             locals: vec![crate::hir::common::LocalId(0)],
             upvalues: Vec::new(),
             temps: vec![TempId(0), TempId(1)],
+            temp_debug_locals: vec![None, None],
             body,
             children: Vec::new(),
         }

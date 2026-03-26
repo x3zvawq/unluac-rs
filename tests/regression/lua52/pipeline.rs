@@ -33,7 +33,7 @@ mod decompile_pipeline {
         let dump = &result.debug_output[0].content;
         assert!(dump.contains("===== Dump AST ====="), "{dump}");
         assert!(dump.contains("goto L"), "{dump}");
-        assert!(dump.contains("label L"), "{dump}");
+        assert!(dump.contains("::L"), "{dump}");
         assert!(!dump.contains("\ncontinue\n"), "{dump}");
     }
 }

@@ -1746,7 +1746,14 @@ fn analyze_fixture(chunk: &LoweredChunk) -> unluac::hir::HirModule {
     let graph_facts = analyze_graph_facts(&cfg);
     let dataflow = analyze_dataflow(chunk, &cfg, &graph_facts);
     let structure = analyze_structure(chunk, &cfg, &graph_facts, &dataflow);
-    analyze_hir(chunk, &cfg, &graph_facts, &dataflow, &structure)
+    analyze_hir(
+        chunk,
+        &cfg,
+        &graph_facts,
+        &dataflow,
+        &structure,
+        unluac::readability::ReadabilityOptions::default(),
+    )
 }
 
 fn chunk_with_instrs(instrs: Vec<LowInstr>) -> LoweredChunk {
