@@ -352,9 +352,7 @@ fn find_site_in_expr(expr: &HirExpr, temp: TempId, site: InlineSite) -> Option<I
             find_site_in_expr(&access.base, temp, site.descend_access_base())
                 .or_else(|| find_site_in_expr(&access.key, temp, InlineSite::Index))
         }
-        HirExpr::Unary(unary) => {
-            find_site_in_expr(&unary.expr, temp, site.descend_pure_wrapper())
-        }
+        HirExpr::Unary(unary) => find_site_in_expr(&unary.expr, temp, site.descend_pure_wrapper()),
         HirExpr::Binary(binary) => {
             let child_site = site.descend_pure_wrapper();
             find_site_in_expr(&binary.lhs, temp, child_site)
@@ -1407,24 +1405,20 @@ mod tests {
                     })),
                     HirStmt::Assign(Box::new(HirAssign {
                         targets: vec![HirLValue::Temp(TempId(1))],
-                        values: vec![HirExpr::Unary(Box::new(
-                            crate::hir::common::HirUnaryExpr {
-                                op: crate::hir::common::HirUnaryOpKind::Length,
-                                expr: HirExpr::TempRef(TempId(0)),
-                            },
-                        ))],
+                        values: vec![HirExpr::Unary(Box::new(crate::hir::common::HirUnaryExpr {
+                            op: crate::hir::common::HirUnaryOpKind::Length,
+                            expr: HirExpr::TempRef(TempId(0)),
+                        }))],
                     })),
                     HirStmt::Assign(Box::new(HirAssign {
                         targets: vec![HirLValue::TableAccess(Box::new(
                             crate::hir::common::HirTableAccess {
                                 base: HirExpr::TempRef(TempId(0)),
-                                key: HirExpr::Binary(Box::new(
-                                    crate::hir::common::HirBinaryExpr {
-                                        op: crate::hir::common::HirBinaryOpKind::Add,
-                                        lhs: HirExpr::TempRef(TempId(1)),
-                                        rhs: HirExpr::Integer(1),
-                                    },
-                                )),
+                                key: HirExpr::Binary(Box::new(crate::hir::common::HirBinaryExpr {
+                                    op: crate::hir::common::HirBinaryOpKind::Add,
+                                    lhs: HirExpr::TempRef(TempId(1)),
+                                    rhs: HirExpr::Integer(1),
+                                })),
                             },
                         ))],
                         values: vec![HirExpr::ParamRef(crate::hir::common::ParamId(0))],
@@ -1466,10 +1460,7 @@ mod tests {
         let [HirLValue::TableAccess(access)] = assign.targets.as_slice() else {
             panic!("expected single table access target: {:?}", assign.targets);
         };
-        assert!(matches!(
-            access.base,
-            HirExpr::TempRef(TempId(0))
-        ));
+        assert!(matches!(access.base, HirExpr::TempRef(TempId(0))));
         let HirExpr::Binary(binary) = &access.key else {
             panic!("expected binary key after inline: {:?}", access.key);
         };
@@ -1478,10 +1469,7 @@ mod tests {
             panic!("expected unary lhs after inline: {:?}", binary.lhs);
         };
         assert_eq!(unary.op, crate::hir::common::HirUnaryOpKind::Length);
-        assert!(matches!(
-            &unary.expr,
-            HirExpr::TempRef(TempId(0))
-        ));
+        assert!(matches!(&unary.expr, HirExpr::TempRef(TempId(0))));
         assert!(matches!(&binary.rhs, HirExpr::Integer(1)));
         assert!(matches!(
             assign.values.as_slice(),

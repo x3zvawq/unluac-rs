@@ -3,6 +3,7 @@
 mod assign;
 mod debug;
 mod error;
+mod lexical;
 
 pub use assign::{
     FunctionNameMap, NameInfo, NameMap, NameSource, NamingMode, NamingOptions, assign_names,

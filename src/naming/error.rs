@@ -31,10 +31,7 @@ pub enum NamingError {
     #[error(
         "upvalue naming for proto#{function} needs parent proto#{parent}, but that function has not been assigned yet"
     )]
-    MissingCaptureParent {
-        function: usize,
-        parent: usize,
-    },
+    MissingCaptureParent { function: usize, parent: usize },
     #[error(
         "upvalue naming for proto#{function} references missing {kind} {index} from parent proto#{parent}"
     )]

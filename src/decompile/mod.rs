@@ -22,8 +22,9 @@ pub use contracts::{
     NamingResult, ReadabilityResult, StructureFacts,
 };
 pub use debug::{
-    DebugOptions, StageDebugOutput, dump_ast, dump_cfg, dump_dataflow, dump_graph_facts, dump_hir,
-    dump_generate, dump_lir, dump_naming, dump_parser, dump_readability, dump_structure,
+    DebugOptions, StageDebugOutput, dump_ast, dump_cfg, dump_dataflow, dump_generate,
+    dump_graph_facts, dump_hir, dump_lir, dump_naming, dump_parser, dump_readability,
+    dump_structure,
 };
 pub use error::DecompileError;
 pub use options::{DecompileDialect, DecompileOptions};

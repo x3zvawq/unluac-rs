@@ -2,9 +2,8 @@
 
 use super::super::common::{
     AstAssign, AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionDecl, AstFunctionExpr,
-    AstFunctionName, AstGlobalBindingTarget, AstGlobalDecl, AstLValue, AstLocalAttr,
-    AstLocalDecl, AstLocalFunctionDecl, AstModule, AstNamePath, AstNameRef, AstStmt,
-    AstTargetDialect,
+    AstFunctionName, AstGlobalBindingTarget, AstGlobalDecl, AstLValue, AstLocalAttr, AstLocalDecl,
+    AstLocalFunctionDecl, AstModule, AstNamePath, AstNameRef, AstStmt, AstTargetDialect,
 };
 use super::ReadabilityContext;
 

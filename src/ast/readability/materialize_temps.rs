@@ -115,12 +115,18 @@ fn materialize_nested_functions_in_call(call: &mut AstCallKind) -> bool {
     match call {
         AstCallKind::Call(call) => {
             let callee_changed = materialize_nested_functions_in_expr(&mut call.callee);
-            let arg_changed = call.args.iter_mut().any(materialize_nested_functions_in_expr);
+            let arg_changed = call
+                .args
+                .iter_mut()
+                .any(materialize_nested_functions_in_expr);
             callee_changed || arg_changed
         }
         AstCallKind::MethodCall(call) => {
             let receiver_changed = materialize_nested_functions_in_expr(&mut call.receiver);
-            let arg_changed = call.args.iter_mut().any(materialize_nested_functions_in_expr);
+            let arg_changed = call
+                .args
+                .iter_mut()
+                .any(materialize_nested_functions_in_expr);
             receiver_changed || arg_changed
         }
     }
@@ -295,10 +301,9 @@ fn collect_function_temps_in_stmt(stmt: &AstStmt, temps: &mut BTreeSet<TempId>) 
                     temps.insert(temp);
                 });
         }
-        AstStmt::FunctionDecl(function_decl) => collect_function_temps_in_function_name(
-            &function_decl.target,
-            temps,
-        ),
+        AstStmt::FunctionDecl(function_decl) => {
+            collect_function_temps_in_function_name(&function_decl.target, temps)
+        }
         AstStmt::LocalFunctionDecl(local_function_decl) => {
             if let AstBindingRef::Temp(temp) = local_function_decl.name {
                 temps.insert(temp);
@@ -474,7 +479,9 @@ fn rewrite_function_stmt(stmt: &mut AstStmt, mapping: &BTreeMap<TempId, AstSynth
             rewrite_function_block(&mut generic_for.body, mapping);
         }
         AstStmt::DoBlock(block) => rewrite_function_block(block, mapping),
-        AstStmt::FunctionDecl(function_decl) => rewrite_function_name(&mut function_decl.target, mapping),
+        AstStmt::FunctionDecl(function_decl) => {
+            rewrite_function_name(&mut function_decl.target, mapping)
+        }
         AstStmt::LocalFunctionDecl(local_function_decl) => {
             if let AstBindingRef::Temp(temp) = local_function_decl.name
                 && let Some(&synthetic) = mapping.get(&temp)
@@ -617,10 +624,13 @@ mod tests {
             },
         };
 
-        let changed = super::apply(&mut module, super::ReadabilityContext {
-            target: crate::ast::AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
-            options: crate::readability::ReadabilityOptions::default(),
-        });
+        let changed = super::apply(
+            &mut module,
+            super::ReadabilityContext {
+                target: crate::ast::AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+                options: crate::readability::ReadabilityOptions::default(),
+            },
+        );
 
         assert!(changed);
         let AstStmt::LocalDecl(local_decl) = &module.body.stmts[0] else {

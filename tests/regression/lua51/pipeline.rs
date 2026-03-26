@@ -557,10 +557,28 @@ mod decompile_pipeline {
             .generated
             .as_ref()
             .expect("generate stage should provide source");
-        assert!(generated.source.contains("local function r0_0("), "{}", generated.source);
-        assert!(generated.source.contains("local function r1_1("), "{}", generated.source);
-        assert!(generated.source.contains("local r0_1, r0_2 = r0_0(false, true)"), "{}", generated.source);
-        assert!(!generated.source.contains("local function fn("), "{}", generated.source);
+        assert!(
+            generated.source.contains("local function r0_0("),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("local function r1_1("),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("local r0_1, r0_2 = r0_0(false, true)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local function fn("),
+            "{}",
+            generated.source
+        );
     }
 
     #[test]
@@ -588,7 +606,21 @@ mod decompile_pipeline {
             "{}",
             generated.source
         );
-        assert!(generated.source.contains("local function fn2("), "{}", generated.source);
+        assert!(
+            generated.source.contains("local function fn2("),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("local function fn2(c, d)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local function fn2(a, b)"),
+            "{}",
+            generated.source
+        );
     }
 
     #[test]
@@ -638,8 +670,16 @@ mod decompile_pipeline {
             .generated
             .as_ref()
             .expect("generate stage should provide source");
-        assert!(generated.source.contains("tbl[#tbl + 1] = a"), "{}", generated.source);
-        assert!(!generated.source.contains("up[#up + 1] = a"), "{}", generated.source);
+        assert!(
+            generated.source.contains("tbl[#tbl + 1] = c"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("up[#up + 1] = c"),
+            "{}",
+            generated.source
+        );
     }
 
     #[test]

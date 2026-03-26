@@ -48,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             target_stage: TARGET_STAGE,
             debug: DebugOptions {
                 enable: true,
-                output_stages: vec![ TARGET_STAGE],
+                output_stages: vec![TARGET_STAGE],
                 timing: false,
                 color: DebugColorMode::Always,
                 detail: DEBUG_DETAIL,

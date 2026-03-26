@@ -291,18 +291,25 @@ impl DecompilerPipeline {
         }
 
         state.generated = Some(timings.record(DecompileStage::Generate.label(), || {
-            let ast = state.readability.as_ref().expect(
-                "readability stage completed must leave readability result in state",
-            );
+            let ast = state
+                .readability
+                .as_ref()
+                .expect("readability stage completed must leave readability result in state");
             let names = state
                 .naming
                 .as_ref()
                 .expect("naming stage completed must leave name map in state");
-            generate_chunk(ast, names, target_ast_dialect(options.dialect), options.generate)
+            generate_chunk(
+                ast,
+                names,
+                target_ast_dialect(options.dialect),
+                options.generate,
+            )
         })?);
         state.mark_completed(DecompileStage::Generate);
 
-        if let Some(output) = collect_stage_dump(&state, DecompileStage::Generate, &options.debug)? {
+        if let Some(output) = collect_stage_dump(&state, DecompileStage::Generate, &options.debug)?
+        {
             debug_output.push(output);
         }
 

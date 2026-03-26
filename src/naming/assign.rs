@@ -14,6 +14,7 @@ use crate::hir::{
 use crate::parser::{RawChunk, RawLocalVar, RawProto, RawString};
 
 use super::NamingError;
+use super::lexical::{FunctionLexicalContext, VisibleBinding, collect_lexical_contexts};
 
 /// Naming 模式。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -229,6 +230,7 @@ pub fn assign_names(
     options: NamingOptions,
 ) -> Result<NameMap, NamingError> {
     let evidence = build_naming_evidence(raw, hir)?;
+    let lexical_contexts = collect_lexical_contexts(module, hir)?;
     validate_readability_ast(module, module.entry_function, hir)?;
     let mut hints = vec![FunctionHints::default(); hir.protos.len()];
     collect_function_hints(module, hir, &mut hints)?;
@@ -241,6 +243,9 @@ pub fn assign_names(
             &evidence.functions[proto.id.index()],
             &hints[proto.id.index()],
             options,
+            lexical_contexts
+                .function(proto.id)
+                .expect("lexical contexts should cover every HIR proto"),
             &functions,
             &mut module_names,
         )?);
@@ -807,8 +812,13 @@ fn validate_expr_has_no_temps(
             function: function.index(),
             temp: temp.index(),
         }),
-        AstExpr::Var(_) | AstExpr::Nil | AstExpr::Boolean(_) | AstExpr::Integer(_)
-        | AstExpr::Number(_) | AstExpr::String(_) | AstExpr::VarArg => Ok(()),
+        AstExpr::Var(_)
+        | AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::VarArg => Ok(()),
         AstExpr::FieldAccess(access) => validate_expr_has_no_temps(&access.base, function, hir),
         AstExpr::IndexAccess(access) => {
             validate_expr_has_no_temps(&access.base, function, hir)?;
@@ -840,7 +850,9 @@ fn validate_expr_has_no_temps(
         AstExpr::TableConstructor(table) => {
             for field in &table.fields {
                 match field {
-                    AstTableField::Array(value) => validate_expr_has_no_temps(value, function, hir)?,
+                    AstTableField::Array(value) => {
+                        validate_expr_has_no_temps(value, function, hir)?
+                    }
                     AstTableField::Record(record) => {
                         if let AstTableKey::Expr(key) = &record.key {
                             validate_expr_has_no_temps(key, function, hir)?;
@@ -851,7 +863,9 @@ fn validate_expr_has_no_temps(
             }
             Ok(())
         }
-        AstExpr::FunctionExpr(function_expr) => validate_function_expr_has_no_temps(function_expr, hir),
+        AstExpr::FunctionExpr(function_expr) => {
+            validate_function_expr_has_no_temps(function_expr, hir)
+        }
     }
 }
 
@@ -917,7 +931,13 @@ fn collect_stmt_hints(
         }
         AstStmt::NumericFor(numeric_for) => {
             let candidate = numeric_loop_name(loop_ctx.numeric_depth);
-            register_binding_hint(function, numeric_for.binding, candidate, NameSource::LoopRole, hints);
+            register_binding_hint(
+                function,
+                numeric_for.binding,
+                candidate,
+                NameSource::LoopRole,
+                hints,
+            );
             collect_expr_hints(function, &numeric_for.start, hints, hir)?;
             collect_expr_hints(function, &numeric_for.limit, hints, hir)?;
             collect_expr_hints(function, &numeric_for.step, hints, hir)?;
@@ -1138,7 +1158,11 @@ fn register_binding_expr_hint(
     register_binding_hint(function, binding, &candidate, source, hints);
 }
 
-fn record_binding_presence(function: HirProtoRef, binding: AstBindingRef, hints: &mut [FunctionHints]) {
+fn record_binding_presence(
+    function: HirProtoRef,
+    binding: AstBindingRef,
+    hints: &mut [FunctionHints],
+) {
     if let AstBindingRef::SyntheticLocal(local) = binding {
         record_synthetic_local(function, local, hints);
     }
@@ -1158,9 +1182,9 @@ fn register_binding_hint(
         AstBindingRef::SyntheticLocal(local) => {
             register_synthetic_local_hint(function, local, candidate, source, hints)
         }
-        AstBindingRef::Temp(_) => unreachable!(
-            "readability output must not leak raw temp bindings into naming"
-        ),
+        AstBindingRef::Temp(_) => {
+            unreachable!("readability output must not leak raw temp bindings into naming")
+        }
     }
 }
 
@@ -1212,7 +1236,11 @@ fn register_synthetic_local_hint(
     );
 }
 
-fn record_synthetic_local(function: HirProtoRef, local: AstSyntheticLocalId, hints: &mut [FunctionHints]) {
+fn record_synthetic_local(
+    function: HirProtoRef,
+    local: AstSyntheticLocalId,
+    hints: &mut [FunctionHints],
+) {
     hints[function.index()].synthetic_locals.insert(local);
 }
 
@@ -1257,22 +1285,27 @@ fn assign_names_for_function(
     evidence: &FunctionNamingEvidence,
     hints: &FunctionHints,
     options: NamingOptions,
+    lexical: &FunctionLexicalContext,
     assigned_functions: &[FunctionNameMap],
     module_names: &mut ModuleNameAllocator,
 ) -> Result<FunctionNameMap, NamingError> {
     let mut used = lua_keywords();
+    let outer_visible_names = resolve_outer_visible_names(proto.id, lexical, assigned_functions)?;
     let params = proto
         .params
         .iter()
         .enumerate()
         .map(|(index, param)| {
-            allocate_name(
+            allocate_param_name(
                 module_names.reserve_function_shape_name(
                     choose_param_candidate(proto, *param, index, evidence, hints, options),
                     &used,
                     options.mode,
                 ),
+                index,
+                options,
                 &mut used,
+                &outer_visible_names,
             )
         })
         .collect::<Vec<_>>();
@@ -1337,6 +1370,64 @@ fn assign_names_for_function(
         synthetic_locals,
         upvalues,
     })
+}
+
+fn resolve_outer_visible_names(
+    function: HirProtoRef,
+    lexical: &FunctionLexicalContext,
+    assigned_functions: &[FunctionNameMap],
+) -> Result<BTreeSet<String>, NamingError> {
+    let mut names = BTreeSet::new();
+    for &binding in &lexical.outer_visible_bindings {
+        names.insert(resolve_visible_binding_name(
+            function,
+            binding,
+            assigned_functions,
+        )?);
+    }
+    Ok(names)
+}
+
+fn resolve_visible_binding_name(
+    function: HirProtoRef,
+    binding: VisibleBinding,
+    assigned_functions: &[FunctionNameMap],
+) -> Result<String, NamingError> {
+    match binding {
+        VisibleBinding::Param {
+            function: parent,
+            param,
+        } => resolve_captured_param_name(function, parent, param, assigned_functions),
+        VisibleBinding::Local {
+            function: parent,
+            local,
+        } => resolve_captured_local_name(function, parent, local, assigned_functions),
+        VisibleBinding::SyntheticLocal {
+            function: parent,
+            local,
+        } => {
+            let parent_names = assigned_functions.get(parent.index()).ok_or(
+                NamingError::MissingCaptureParent {
+                    function: function.index(),
+                    parent: parent.index(),
+                },
+            )?;
+            parent_names
+                .synthetic_locals
+                .get(&local)
+                .map(|name| name.text.clone())
+                .ok_or(NamingError::MissingCapturedBinding {
+                    function: function.index(),
+                    parent: parent.index(),
+                    kind: "synthetic-local",
+                    index: local.index(),
+                })
+        }
+        VisibleBinding::Upvalue {
+            function: parent,
+            upvalue,
+        } => resolve_captured_upvalue_name(function, parent, upvalue, assigned_functions),
+    }
 }
 
 fn choose_param_candidate(
@@ -1476,12 +1567,13 @@ fn resolve_captured_param_name(
     param: ParamId,
     assigned_functions: &[FunctionNameMap],
 ) -> Result<String, NamingError> {
-    let parent_names = assigned_functions
-        .get(parent.index())
-        .ok_or(NamingError::MissingCaptureParent {
-            function: function.index(),
-            parent: parent.index(),
-        })?;
+    let parent_names =
+        assigned_functions
+            .get(parent.index())
+            .ok_or(NamingError::MissingCaptureParent {
+                function: function.index(),
+                parent: parent.index(),
+            })?;
     parent_names
         .params
         .get(param.index())
@@ -1500,12 +1592,13 @@ fn resolve_captured_local_name(
     local: LocalId,
     assigned_functions: &[FunctionNameMap],
 ) -> Result<String, NamingError> {
-    let parent_names = assigned_functions
-        .get(parent.index())
-        .ok_or(NamingError::MissingCaptureParent {
-            function: function.index(),
-            parent: parent.index(),
-        })?;
+    let parent_names =
+        assigned_functions
+            .get(parent.index())
+            .ok_or(NamingError::MissingCaptureParent {
+                function: function.index(),
+                parent: parent.index(),
+            })?;
     parent_names
         .locals
         .get(local.index())
@@ -1524,12 +1617,13 @@ fn resolve_captured_upvalue_name(
     upvalue: UpvalueId,
     assigned_functions: &[FunctionNameMap],
 ) -> Result<String, NamingError> {
-    let parent_names = assigned_functions
-        .get(parent.index())
-        .ok_or(NamingError::MissingCaptureParent {
-            function: function.index(),
-            parent: parent.index(),
-        })?;
+    let parent_names =
+        assigned_functions
+            .get(parent.index())
+            .ok_or(NamingError::MissingCaptureParent {
+                function: function.index(),
+                parent: parent.index(),
+            })?;
     parent_names
         .upvalues
         .get(upvalue.index())
@@ -1540,6 +1634,47 @@ fn resolve_captured_upvalue_name(
             kind: "upvalue",
             index: upvalue.index(),
         })
+}
+
+fn allocate_param_name(
+    candidate: CandidateHint,
+    index: usize,
+    options: NamingOptions,
+    used: &mut BTreeSet<String>,
+    outer_visible_names: &BTreeSet<String>,
+) -> NameInfo {
+    if options.mode == NamingMode::DebugLike || candidate.source != NameSource::Simple {
+        return allocate_name(candidate, used);
+    }
+    if !outer_visible_names.contains(&candidate.text) {
+        return allocate_name(candidate, used);
+    }
+
+    let replacement = next_available_simple_param_name(index, used, outer_visible_names);
+    allocate_name(
+        CandidateHint {
+            text: replacement,
+            source: candidate.source,
+        },
+        used,
+    )
+}
+
+fn next_available_simple_param_name(
+    mut index: usize,
+    used: &BTreeSet<String>,
+    outer_visible_names: &BTreeSet<String>,
+) -> String {
+    loop {
+        let candidate = alphabetical_name(index).unwrap_or_else(|| format!("arg{}", index + 1));
+        if !used.contains(&candidate)
+            && !outer_visible_names.contains(&candidate)
+            && !is_lua_keyword(&candidate)
+        {
+            return candidate;
+        }
+        index = index.saturating_add(1);
+    }
 }
 
 fn choose_synthetic_local_candidate(
@@ -1696,9 +1831,9 @@ fn binding_from_name_ref(name: &AstNameRef) -> Option<AstBindingRef> {
     match name {
         AstNameRef::Local(local) => Some(AstBindingRef::Local(*local)),
         AstNameRef::SyntheticLocal(local) => Some(AstBindingRef::SyntheticLocal(*local)),
-        AstNameRef::Temp(_) => unreachable!(
-            "readability output must not leak raw temp refs into naming"
-        ),
+        AstNameRef::Temp(_) => {
+            unreachable!("readability output must not leak raw temp refs into naming")
+        }
         AstNameRef::Param(_) | AstNameRef::Upvalue(_) | AstNameRef::Global(_) => None,
     }
 }

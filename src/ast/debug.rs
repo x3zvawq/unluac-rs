@@ -8,8 +8,8 @@ use crate::hir::LocalId;
 
 use super::common::{
     AstBindingRef, AstBlock, AstCallExpr, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName,
-    AstLValue, AstMethodCallExpr, AstModule, AstNamePath, AstNameRef, AstStmt,
-    AstSyntheticLocalId, AstTableField,
+    AstLValue, AstMethodCallExpr, AstModule, AstNamePath, AstNameRef, AstStmt, AstSyntheticLocalId,
+    AstTableField,
 };
 
 #[derive(Debug, Default)]
@@ -53,12 +53,7 @@ fn dump_module(
     colorize_debug_text(&output, color)
 }
 
-fn write_block(
-    output: &mut String,
-    indent: &str,
-    block: &AstBlock,
-    names: &FunctionRenderNames,
-) {
+fn write_block(output: &mut String, indent: &str, block: &AstBlock, names: &FunctionRenderNames) {
     if block.stmts.is_empty() {
         let _ = writeln!(output, "{indent}<empty>");
         return;
@@ -126,7 +121,11 @@ fn write_block(
                 );
             }
             AstStmt::CallStmt(call_stmt) => {
-                let _ = writeln!(output, "{indent}{}", format_call(&call_stmt.call, indent, names));
+                let _ = writeln!(
+                    output,
+                    "{indent}{}",
+                    format_call(&call_stmt.call, indent, names)
+                );
             }
             AstStmt::Return(ret) => {
                 if ret.values.is_empty() {
@@ -284,7 +283,11 @@ fn format_expr(expr: &AstExpr, indent: &str, names: &FunctionRenderNames) -> Str
         AstExpr::String(value) => format!("{value:?}"),
         AstExpr::Var(name) => format_name_ref(name, names),
         AstExpr::FieldAccess(access) => {
-            format!("{}.{}", format_expr(&access.base, indent, names), access.field)
+            format!(
+                "{}.{}",
+                format_expr(&access.base, indent, names),
+                access.field
+            )
         }
         AstExpr::IndexAccess(access) => {
             format!(
@@ -397,7 +400,9 @@ fn format_binding_ref(binding: AstBindingRef, names: &FunctionRenderNames) -> St
     match binding {
         AstBindingRef::Local(local) => format!("l{}", local.index()),
         AstBindingRef::Temp(temp) => format!("t{}", temp.index()),
-        AstBindingRef::SyntheticLocal(local) => format!("l{}", display_synthetic_local(local, names)),
+        AstBindingRef::SyntheticLocal(local) => {
+            format!("l{}", display_synthetic_local(local, names))
+        }
     }
 }
 
@@ -417,7 +422,11 @@ fn format_lvalue(target: &AstLValue, indent: &str, names: &FunctionRenderNames) 
     match target {
         AstLValue::Name(name) => format_name_ref(name, names),
         AstLValue::FieldAccess(access) => {
-            format!("{}.{}", format_expr(&access.base, indent, names), access.field)
+            format!(
+                "{}.{}",
+                format_expr(&access.base, indent, names),
+                access.field
+            )
         }
         AstLValue::IndexAccess(access) => {
             format!(
@@ -555,7 +564,11 @@ fn collect_function_render_names_in_stmt(
         }
         AstStmt::If(if_stmt) => {
             collect_function_render_names_in_expr(&if_stmt.cond, max_local, synthetic_locals);
-            collect_function_render_names_in_block(&if_stmt.then_block, max_local, synthetic_locals);
+            collect_function_render_names_in_block(
+                &if_stmt.then_block,
+                max_local,
+                synthetic_locals,
+            );
             if let Some(else_block) = &if_stmt.else_block {
                 collect_function_render_names_in_block(else_block, max_local, synthetic_locals);
             }
@@ -707,8 +720,13 @@ fn collect_function_render_names_in_expr(
                 }
             }
         }
-        AstExpr::FunctionExpr(_) | AstExpr::Nil | AstExpr::Boolean(_) | AstExpr::Integer(_)
-        | AstExpr::Number(_) | AstExpr::String(_) | AstExpr::VarArg => {}
+        AstExpr::FunctionExpr(_)
+        | AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::VarArg => {}
     }
 }
 

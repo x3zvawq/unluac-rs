@@ -116,11 +116,16 @@ impl<'a> Emitter<'a> {
                         feature: "goto",
                     });
                 }
-                Ok(Doc::text(format!("goto {}", format_label_name(ast_goto.target))))
+                Ok(Doc::text(format!(
+                    "goto {}",
+                    format_label_name(ast_goto.target)
+                )))
             }
             AstStmt::Label(label) => self.emit_label(label),
             AstStmt::DoBlock(block) => self.emit_do_block(block, function),
-            AstStmt::FunctionDecl(function_decl) => self.emit_function_decl(function_decl, function),
+            AstStmt::FunctionDecl(function_decl) => {
+                self.emit_function_decl(function_decl, function)
+            }
             AstStmt::LocalFunctionDecl(local_function_decl) => {
                 self.emit_local_function_decl(local_function_decl, function)
             }
@@ -192,7 +197,11 @@ impl<'a> Emitter<'a> {
             .iter()
             .map(Self::emit_global_binding_target)
             .collect::<Vec<_>>();
-        let mut parts = vec![Doc::text(keyword), Doc::text(" "), Doc::join(bindings, Doc::text(", "))];
+        let mut parts = vec![
+            Doc::text(keyword),
+            Doc::text(" "),
+            Doc::join(bindings, Doc::text(", ")),
+        ];
         if !global_decl.values.is_empty() {
             parts.push(Doc::text(" = "));
             parts.push(self.emit_value_list(&global_decl.values, function)?);
@@ -207,11 +216,7 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn emit_assign(
-        &self,
-        assign: &AstAssign,
-        function: HirProtoRef,
-    ) -> Result<Doc, GenerateError> {
+    fn emit_assign(&self, assign: &AstAssign, function: HirProtoRef) -> Result<Doc, GenerateError> {
         let targets = assign
             .targets
             .iter()
@@ -233,11 +238,7 @@ impl<'a> Emitter<'a> {
         self.emit_call_kind(&call_stmt.call, function)
     }
 
-    fn emit_return(
-        &self,
-        ret: &AstReturn,
-        function: HirProtoRef,
-    ) -> Result<Doc, GenerateError> {
+    fn emit_return(&self, ret: &AstReturn, function: HirProtoRef) -> Result<Doc, GenerateError> {
         if ret.values.is_empty() {
             return Ok(Doc::text("return"));
         }
@@ -259,10 +260,7 @@ impl<'a> Emitter<'a> {
         if let Some(else_block) = &ast_if.else_block {
             parts.push(Doc::line());
             parts.push(Doc::text("else"));
-            parts.push(self.emit_indented_body(
-                else_block,
-                self.emit_block(else_block, function)?,
-            ));
+            parts.push(self.emit_indented_body(else_block, self.emit_block(else_block, function)?));
         }
         parts.push(Doc::line());
         parts.push(Doc::text("end"));
@@ -290,7 +288,10 @@ impl<'a> Emitter<'a> {
     ) -> Result<Doc, GenerateError> {
         let body = self.emit_block(&ast_repeat.body, function)?;
         let cond = self.emit_expr(&ast_repeat.cond, function, 0, ExprSide::Standalone)?;
-        let mut parts = vec![Doc::text("repeat"), self.emit_indented_body(&ast_repeat.body, body)];
+        let mut parts = vec![
+            Doc::text("repeat"),
+            self.emit_indented_body(&ast_repeat.body, body),
+        ];
         parts.push(Doc::line());
         parts.push(Doc::text("until "));
         parts.push(cond);
@@ -352,11 +353,7 @@ impl<'a> Emitter<'a> {
         Ok(Doc::text(format!("::{}::", format_label_name(label.id))))
     }
 
-    fn emit_do_block(
-        &self,
-        block: &AstBlock,
-        function: HirProtoRef,
-    ) -> Result<Doc, GenerateError> {
+    fn emit_do_block(&self, block: &AstBlock, function: HirProtoRef) -> Result<Doc, GenerateError> {
         let body = self.emit_block(block, function)?;
         Ok(self.emit_block_stmt(Doc::text("do"), block, body))
     }
@@ -398,7 +395,10 @@ impl<'a> Emitter<'a> {
         let mut params = func
             .params
             .iter()
-            .map(|param| self.resolve_name_ref(func.function, &AstNameRef::Param(*param)).map(Doc::text))
+            .map(|param| {
+                self.resolve_name_ref(func.function, &AstNameRef::Param(*param))
+                    .map(Doc::text)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         if func.is_vararg {
             params.push(Doc::text("..."));
@@ -419,7 +419,11 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_parenthesized_list(&self, items: Vec<Doc>) -> Doc {
-        Doc::concat([Doc::text("("), Doc::join(items, Doc::text(", ")), Doc::text(")")])
+        Doc::concat([
+            Doc::text("("),
+            Doc::join(items, Doc::text(", ")),
+            Doc::text(")"),
+        ])
     }
 
     fn emit_block_stmt(&self, header: Doc, block: &AstBlock, body: Doc) -> Doc {
@@ -486,11 +490,7 @@ impl<'a> Emitter<'a> {
         ]))
     }
 
-    fn emit_lvalue(
-        &self,
-        lvalue: &AstLValue,
-        function: HirProtoRef,
-    ) -> Result<Doc, GenerateError> {
+    fn emit_lvalue(&self, lvalue: &AstLValue, function: HirProtoRef) -> Result<Doc, GenerateError> {
         match lvalue {
             AstLValue::Name(name) => self.emit_name_ref(name, function),
             AstLValue::FieldAccess(access) => self.emit_field_access(access, function),
@@ -507,7 +507,11 @@ impl<'a> Emitter<'a> {
     ) -> Result<Doc, GenerateError> {
         let (doc, prec, assoc) = match expr {
             AstExpr::Nil => (Doc::text("nil"), PREC_LITERAL, Assoc::Non),
-            AstExpr::Boolean(value) => (Doc::text(if *value { "true" } else { "false" }), PREC_LITERAL, Assoc::Non),
+            AstExpr::Boolean(value) => (
+                Doc::text(if *value { "true" } else { "false" }),
+                PREC_LITERAL,
+                Assoc::Non,
+            ),
             AstExpr::Integer(value) => (Doc::text(value.to_string()), PREC_LITERAL, Assoc::Non),
             AstExpr::Number(value) => (Doc::text(format_number(*value)), PREC_LITERAL, Assoc::Non),
             AstExpr::String(value) => (
@@ -515,7 +519,11 @@ impl<'a> Emitter<'a> {
                 PREC_LITERAL,
                 Assoc::Non,
             ),
-            AstExpr::Var(name) => (self.emit_name_ref(name, function)?, PREC_PREFIX, Assoc::Left),
+            AstExpr::Var(name) => (
+                self.emit_name_ref(name, function)?,
+                PREC_PREFIX,
+                Assoc::Left,
+            ),
             AstExpr::FieldAccess(access) => (
                 self.emit_field_access(access, function)?,
                 PREC_PREFIX,
@@ -581,11 +589,9 @@ impl<'a> Emitter<'a> {
                 PREC_LITERAL,
                 Assoc::Non,
             ),
-            AstExpr::FunctionExpr(func) => (
-                self.emit_function_expr(func)?,
-                PREC_LITERAL,
-                Assoc::Non,
-            ),
+            AstExpr::FunctionExpr(func) => {
+                (self.emit_function_expr(func)?, PREC_LITERAL, Assoc::Non)
+            }
         };
         Ok(maybe_parenthesize(doc, prec, parent_prec, side, assoc))
     }
@@ -731,10 +737,22 @@ impl<'a> Emitter<'a> {
                     .function(function)
                     .ok_or_else(|| GenerateError::missing_function_names(function))?;
                 let text = match name {
-                    AstNameRef::Param(id) => function_names.params.get(id.index()).map(|info| info.text.clone()),
-                    AstNameRef::Local(id) => function_names.locals.get(id.index()).map(|info| info.text.clone()),
-                    AstNameRef::SyntheticLocal(id) => function_names.synthetic_locals.get(id).map(|info| info.text.clone()),
-                    AstNameRef::Upvalue(id) => function_names.upvalues.get(id.index()).map(|info| info.text.clone()),
+                    AstNameRef::Param(id) => function_names
+                        .params
+                        .get(id.index())
+                        .map(|info| info.text.clone()),
+                    AstNameRef::Local(id) => function_names
+                        .locals
+                        .get(id.index())
+                        .map(|info| info.text.clone()),
+                    AstNameRef::SyntheticLocal(id) => function_names
+                        .synthetic_locals
+                        .get(id)
+                        .map(|info| info.text.clone()),
+                    AstNameRef::Upvalue(id) => function_names
+                        .upvalues
+                        .get(id.index())
+                        .map(|info| info.text.clone()),
                     AstNameRef::Global(_) | AstNameRef::Temp(_) => unreachable!(),
                 };
                 text.ok_or_else(|| GenerateError::MissingName {
@@ -761,8 +779,14 @@ impl<'a> Emitter<'a> {
                     .function(function)
                     .ok_or_else(|| GenerateError::missing_function_names(function))?;
                 let text = match binding {
-                    AstBindingRef::Local(id) => function_names.locals.get(id.index()).map(|info| info.text.clone()),
-                    AstBindingRef::SyntheticLocal(id) => function_names.synthetic_locals.get(id).map(|info| info.text.clone()),
+                    AstBindingRef::Local(id) => function_names
+                        .locals
+                        .get(id.index())
+                        .map(|info| info.text.clone()),
+                    AstBindingRef::SyntheticLocal(id) => function_names
+                        .synthetic_locals
+                        .get(id)
+                        .map(|info| info.text.clone()),
                     AstBindingRef::Temp(_) => unreachable!(),
                 };
                 text.ok_or_else(|| GenerateError::MissingBindingName {
@@ -774,7 +798,13 @@ impl<'a> Emitter<'a> {
     }
 }
 
-fn maybe_parenthesize(doc: Doc, expr_prec: u8, parent_prec: u8, side: ExprSide, assoc: Assoc) -> Doc {
+fn maybe_parenthesize(
+    doc: Doc,
+    expr_prec: u8,
+    parent_prec: u8,
+    side: ExprSide,
+    assoc: Assoc,
+) -> Doc {
     let needs_parens = if expr_prec < parent_prec {
         true
     } else if expr_prec > parent_prec {
@@ -817,8 +847,14 @@ fn binary_meta(op: crate::ast::AstBinaryOpKind) -> (u8, Assoc, &'static str) {
 }
 
 fn common_global_attr(bindings: &[AstGlobalBinding]) -> Option<AstGlobalAttr> {
-    let first = bindings.first().map(|binding| binding.attr).unwrap_or(AstGlobalAttr::None);
-    bindings.iter().all(|binding| binding.attr == first).then_some(first)
+    let first = bindings
+        .first()
+        .map(|binding| binding.attr)
+        .unwrap_or(AstGlobalAttr::None);
+    bindings
+        .iter()
+        .all(|binding| binding.attr == first)
+        .then_some(first)
 }
 
 fn format_label_name(label: crate::ast::AstLabelId) -> String {

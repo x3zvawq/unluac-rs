@@ -16,12 +16,20 @@ pub enum GenerateError {
     #[error("generate cannot resolve name {name:?} in proto#{function}")]
     MissingName { function: usize, name: AstNameRef },
     #[error("generate cannot resolve binding {binding:?} in proto#{function}")]
-    MissingBindingName { function: usize, binding: AstBindingRef },
+    MissingBindingName {
+        function: usize,
+        binding: AstBindingRef,
+    },
     #[error("generate encountered residual temp name {name:?} in proto#{function}")]
     ResidualTempName { function: usize, name: AstNameRef },
     #[error("generate encountered residual temp binding {binding:?} in proto#{function}")]
-    ResidualTempBinding { function: usize, binding: AstBindingRef },
-    #[error("generate encountered mixed global attributes in a single declaration in proto#{function}")]
+    ResidualTempBinding {
+        function: usize,
+        binding: AstBindingRef,
+    },
+    #[error(
+        "generate encountered mixed global attributes in a single declaration in proto#{function}"
+    )]
     MixedGlobalAttrs { function: usize },
     #[error(
         "target dialect `{dialect}` does not support feature `{feature}` required during generate"

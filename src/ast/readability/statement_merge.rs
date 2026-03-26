@@ -57,7 +57,8 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock) -> bool {
         let mut sink_changed = false;
         let mut lookahead = index + 1;
         while lookahead < block.stmts.len() && !remaining.is_empty() {
-            if let Some(merged) = try_sink_hoisted_decl_into_stmt(&remaining, &block.stmts[lookahead])
+            if let Some(merged) =
+                try_sink_hoisted_decl_into_stmt(&remaining, &block.stmts[lookahead])
             {
                 let consumed = merged.bindings.len();
                 block.stmts[lookahead] = AstStmt::LocalDecl(Box::new(merged));
@@ -185,7 +186,8 @@ fn try_sink_hoisted_decl_into_stmt(
     let AstStmt::Assign(assign) = stmt else {
         return None;
     };
-    if assign.values.is_empty() || assign.targets.is_empty() || assign.targets.len() > pending.len() {
+    if assign.values.is_empty() || assign.targets.is_empty() || assign.targets.len() > pending.len()
+    {
         return None;
     }
     let candidate = &pending[..assign.targets.len()];
@@ -212,7 +214,10 @@ fn is_temp_like_binding(binding: AstBindingRef) -> bool {
     )
 }
 
-fn stmt_references_any_binding(stmt: &AstStmt, bindings: &[super::super::common::AstLocalBinding]) -> bool {
+fn stmt_references_any_binding(
+    stmt: &AstStmt,
+    bindings: &[super::super::common::AstLocalBinding],
+) -> bool {
     match stmt {
         AstStmt::LocalDecl(local_decl) => {
             local_decl
@@ -285,7 +290,9 @@ fn stmt_references_any_binding(stmt: &AstStmt, bindings: &[super::super::common:
                 || block_references_any_binding(&function_decl.func.body, bindings)
         }
         AstStmt::LocalFunctionDecl(function_decl) => {
-            bindings.iter().any(|binding| binding.id == function_decl.name)
+            bindings
+                .iter()
+                .any(|binding| binding.id == function_decl.name)
                 || block_references_any_binding(&function_decl.func.body, bindings)
         }
         AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => false,
@@ -306,7 +313,8 @@ fn block_references_any_binding(
     block: &AstBlock,
     bindings: &[super::super::common::AstLocalBinding],
 ) -> bool {
-    block.stmts
+    block
+        .stmts
         .iter()
         .any(|stmt| stmt_references_any_binding(stmt, bindings))
 }
@@ -397,20 +405,22 @@ fn expr_references_any_binding(
                     .iter()
                     .any(|arg| expr_references_any_binding(arg, bindings))
         }
-        super::super::common::AstExpr::TableConstructor(table) => table.fields.iter().any(|field| match field {
-            super::super::common::AstTableField::Array(value) => {
-                expr_references_any_binding(value, bindings)
-            }
-            super::super::common::AstTableField::Record(record) => {
-                let key_references_binding = match &record.key {
-                    super::super::common::AstTableKey::Name(_) => false,
-                    super::super::common::AstTableKey::Expr(expr) => {
-                        expr_references_any_binding(expr, bindings)
-                    }
-                };
-                key_references_binding || expr_references_any_binding(&record.value, bindings)
-            }
-        }),
+        super::super::common::AstExpr::TableConstructor(table) => {
+            table.fields.iter().any(|field| match field {
+                super::super::common::AstTableField::Array(value) => {
+                    expr_references_any_binding(value, bindings)
+                }
+                super::super::common::AstTableField::Record(record) => {
+                    let key_references_binding = match &record.key {
+                        super::super::common::AstTableKey::Name(_) => false,
+                        super::super::common::AstTableKey::Expr(expr) => {
+                            expr_references_any_binding(expr, bindings)
+                        }
+                    };
+                    key_references_binding || expr_references_any_binding(&record.value, bindings)
+                }
+            })
+        }
         super::super::common::AstExpr::FunctionExpr(function) => {
             block_references_any_binding(&function.body, bindings)
         }

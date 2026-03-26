@@ -394,7 +394,11 @@ mod decompile_pipeline {
             "{}",
             generated.source
         );
-        assert!(generated.source.contains("up.print("), "{}", generated.source);
+        assert!(
+            generated.source.contains("up.print("),
+            "{}",
+            generated.source
+        );
 
         let dump = &result.debug_output[0].content;
         assert!(dump.contains("===== Dump Generate ====="), "{dump}");
