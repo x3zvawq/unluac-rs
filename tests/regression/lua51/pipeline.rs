@@ -1048,6 +1048,48 @@ mod decompile_pipeline {
             generated.source
         );
     }
+
+    #[test]
+    fn vararg_and_tailcall_generate_inlines_unpack_alias_chain_initializer() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/functions/03_vararg_and_tailcall.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                naming: NamingOptions {
+                    mode: NamingMode::DebugLike,
+                    debug_like_include_function: true,
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("vararg_and_tailcall generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated
+                .source
+                .contains("local r0_1 = table.unpack or unpack"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local r0_0 = table.unpack"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("return r1_1(r0_1(r1_0))"),
+            "{}",
+            generated.source
+        );
+    }
 }
 
 fn compile_lua_case(dialect_label: &str, source_relative: &str) -> Vec<u8> {

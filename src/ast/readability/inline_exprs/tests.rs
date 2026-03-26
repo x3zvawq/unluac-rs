@@ -624,3 +624,154 @@ fn inlines_local_alias_inside_function_body_after_other_locals() {
         )
     ));
 }
+
+#[test]
+fn folds_access_base_alias_into_adjacent_local_alias_initializer_chain() {
+    let unpack_alias = LocalId(0);
+    let fn_alias = LocalId(1);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(unpack_alias),
+                        attr: AstLocalAttr::None,
+                    }],
+                    values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "table".to_owned(),
+                        })),
+                        field: "unpack".to_owned(),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(fn_alias),
+                        attr: AstLocalAttr::None,
+                    }],
+                    values: vec![AstExpr::LogicalOr(Box::new(crate::ast::AstLogicalExpr {
+                        lhs: AstExpr::Var(AstNameRef::Local(unpack_alias)),
+                        rhs: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "unpack".to_owned(),
+                        })),
+                    }))],
+                })),
+                AstStmt::Return(Box::new(AstReturn {
+                    values: vec![AstExpr::Var(AstNameRef::Local(fn_alias))],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+
+    assert_eq!(
+        module.body.stmts,
+        vec![
+            AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                bindings: vec![AstLocalBinding {
+                    id: crate::ast::AstBindingRef::Local(fn_alias),
+                    attr: AstLocalAttr::None,
+                }],
+                values: vec![AstExpr::LogicalOr(Box::new(crate::ast::AstLogicalExpr {
+                    lhs: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "table".to_owned(),
+                        })),
+                        field: "unpack".to_owned(),
+                    })),
+                    rhs: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                        text: "unpack".to_owned(),
+                    })),
+                }))],
+            })),
+            AstStmt::Return(Box::new(AstReturn {
+                values: vec![AstExpr::Var(AstNameRef::Local(fn_alias))],
+            })),
+        ]
+    );
+}
+
+#[test]
+fn does_not_count_shadowed_nested_function_locals_as_outer_alias_uses() {
+    let outer_alias = LocalId(0);
+    let func = crate::hir::HirProtoRef(1);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(outer_alias),
+                        attr: AstLocalAttr::None,
+                    }],
+                    values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "table".to_owned(),
+                        })),
+                        field: "unpack".to_owned(),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(LocalId(1)),
+                        attr: AstLocalAttr::None,
+                    }],
+                    values: vec![AstExpr::LogicalOr(Box::new(crate::ast::AstLogicalExpr {
+                        lhs: AstExpr::Var(AstNameRef::Local(outer_alias)),
+                        rhs: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "unpack".to_owned(),
+                        })),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(LocalId(2)),
+                        attr: AstLocalAttr::None,
+                    }],
+                    values: vec![AstExpr::FunctionExpr(Box::new(
+                        crate::ast::AstFunctionExpr {
+                            function: func,
+                            params: Vec::new(),
+                            is_vararg: false,
+                            body: crate::ast::AstBlock {
+                                stmts: vec![AstStmt::LocalDecl(Box::new(
+                                    crate::ast::AstLocalDecl {
+                                        bindings: vec![AstLocalBinding {
+                                            id: crate::ast::AstBindingRef::Local(LocalId(0)),
+                                            attr: AstLocalAttr::None,
+                                        }],
+                                        values: vec![AstExpr::Integer(1)],
+                                    },
+                                ))],
+                            },
+                        },
+                    ))],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+
+    let AstStmt::LocalDecl(local_decl) = &module.body.stmts[0] else {
+        panic!("expected alias initializer to fold into second local");
+    };
+    assert_eq!(
+        local_decl.bindings[0].id,
+        crate::ast::AstBindingRef::Local(LocalId(1))
+    );
+}

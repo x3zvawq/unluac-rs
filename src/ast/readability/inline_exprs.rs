@@ -53,7 +53,20 @@ fn rewrite_block(block: &mut AstBlock, options: ReadabilityOptions) -> bool {
         }
 
         let mut rewritten_next = next_stmt.clone();
-        if !rewrite_stmt_use_sites(&mut rewritten_next, candidate, value, options) {
+        let policy = if matches!(candidate, InlineCandidate::LocalAlias(_))
+            && stmt_is_alias_initializer_sink(next_stmt)
+        {
+            InlinePolicy::AliasInitializerChain
+        } else {
+            InlinePolicy::Conservative
+        };
+        if !rewrite_stmt_use_sites_with_policy(
+            &mut rewritten_next,
+            candidate,
+            value,
+            options,
+            policy,
+        ) {
             new_stmts.push(old_stmts[index].clone());
             index += 1;
             continue;
@@ -357,18 +370,10 @@ fn inline_candidate_from_local_decl(
     Some((candidate, value))
 }
 
-fn rewrite_stmt_use_sites(
-    stmt: &mut AstStmt,
-    candidate: InlineCandidate,
-    replacement: &AstExpr,
-    options: ReadabilityOptions,
-) -> bool {
-    rewrite_stmt_use_sites_with_policy(
-        stmt,
-        candidate,
-        replacement,
-        options,
-        InlinePolicy::Conservative,
+fn stmt_is_alias_initializer_sink(stmt: &AstStmt) -> bool {
+    matches!(
+        inline_candidate(stmt),
+        Some((InlineCandidate::LocalAlias(_), _))
     )
 }
 
@@ -850,12 +855,7 @@ fn count_binding_uses_in_stmt(stmt: &AstStmt, binding: AstBindingRef) -> usize {
                 + count_binding_uses_in_block(&generic_for.body, binding)
         }
         AstStmt::DoBlock(block) => count_binding_uses_in_block(block, binding),
-        AstStmt::FunctionDecl(function_decl) => {
-            count_binding_uses_in_block(&function_decl.func.body, binding)
-        }
-        AstStmt::LocalFunctionDecl(local_function_decl) => {
-            count_binding_uses_in_block(&local_function_decl.func.body, binding)
-        }
+        AstStmt::FunctionDecl(_) | AstStmt::LocalFunctionDecl(_) => 0,
         AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => 0,
     }
 }
@@ -937,7 +937,7 @@ fn count_binding_uses_in_expr(expr: &AstExpr, binding: AstBindingRef) -> usize {
                 }
             })
             .sum(),
-        AstExpr::FunctionExpr(function) => count_binding_uses_in_block(&function.body, binding),
+        AstExpr::FunctionExpr(_) => 0,
         AstExpr::Nil
         | AstExpr::Boolean(_)
         | AstExpr::Integer(_)
@@ -1091,6 +1091,7 @@ enum InlineSite {
 enum InlinePolicy {
     Conservative,
     ExtendedCallChain,
+    AliasInitializerChain,
 }
 
 impl InlineSite {
@@ -1107,7 +1108,7 @@ impl InlineSite {
             return false;
         }
 
-        let Some(limit) = self.complexity_limit(options) else {
+        let Some(limit) = self.complexity_limit(options, policy) else {
             return false;
         };
         if expr_complexity(replacement) > limit {
@@ -1125,13 +1126,21 @@ impl InlineSite {
                         && is_access_base_inline_expr(replacement)
                 }
                 InlinePolicy::ExtendedCallChain => self.allows_extended_local_alias(replacement),
+                InlinePolicy::AliasInitializerChain => {
+                    self.allows_alias_initializer_local_alias(replacement)
+                }
             },
         }
     }
 
-    fn complexity_limit(self, options: ReadabilityOptions) -> Option<usize> {
+    fn complexity_limit(self, options: ReadabilityOptions, policy: InlinePolicy) -> Option<usize> {
         match self {
-            Self::Neutral => None,
+            Self::Neutral => match policy {
+                InlinePolicy::AliasInitializerChain => {
+                    Some(options.access_base_inline_max_complexity)
+                }
+                InlinePolicy::Conservative | InlinePolicy::ExtendedCallChain => None,
+            },
             Self::ReturnValue => Some(options.return_inline_max_complexity),
             Self::Index => Some(options.index_inline_max_complexity),
             Self::CallArg => Some(options.args_inline_max_complexity),
@@ -1162,6 +1171,20 @@ impl InlineSite {
             Self::CallArg => is_context_safe_expr(replacement),
             Self::AccessBase => is_access_base_inline_expr(replacement),
             Self::Neutral | Self::ReturnValue | Self::Index => false,
+        }
+    }
+
+    fn allows_alias_initializer_local_alias(self, replacement: &AstExpr) -> bool {
+        match self {
+            // 这里专门服务“局部别名链初始化”：
+            // `local unpack = table.unpack; local fn = unpack or _G.unpack`
+            // 这种形状本质上还是在组装一个后续调用会消费的前缀表达式别名。
+            // 允许它在紧邻的下一条 local alias 初始化式里收回，能把机械拆分重新压回
+            // 更接近源码的单条声明，而不会放宽到普通 return/if/赋值上下文。
+            Self::Neutral | Self::AccessBase | Self::CallCallee => {
+                is_access_base_inline_expr(replacement)
+            }
+            Self::ReturnValue | Self::Index | Self::CallArg => false,
         }
     }
 }
