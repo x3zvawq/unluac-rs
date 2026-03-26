@@ -484,6 +484,61 @@ mod decompile_pipeline {
             generated.source
         );
     }
+
+    #[test]
+    fn nested_loop_mesh_hir_keeps_inner_loop_tail_as_break_without_synthetic_continue() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/control_flow/06_nested_loop_mesh.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("nested_loop_mesh hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("break"), "{dump}");
+        assert!(!dump.contains("continue"), "{dump}");
+    }
+
+    #[test]
+    fn nested_loop_mesh_generate_stage_succeeds_without_continue_or_goto() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/control_flow/06_nested_loop_mesh.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("nested_loop_mesh generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(generated.source.contains("break"), "{}", generated.source);
+        assert!(
+            !generated.source.contains("continue"),
+            "{}",
+            generated.source
+        );
+        assert!(!generated.source.contains("goto"), "{}", generated.source);
+    }
 }
 
 fn compile_lua_case(dialect_label: &str, source_relative: &str) -> Vec<u8> {

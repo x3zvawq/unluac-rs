@@ -344,6 +344,18 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             };
             if let Some(break_block) = loop_context.break_exits.get(&non_continue_entry) {
                 self.visited.insert(non_continue_entry);
+                // 当前 branch 本身如果没有“主动提前跳到 continue target”的证据，
+                // 那它更像 loop tail 上的“否则 break”判定：继续这一臂只是自然回到
+                // 下一轮，不应该硬提升成显式 `continue`。否则像 Lua 5.1 这种没有
+                // `continue` / `goto` 的 target dialect 会被我们平白制造出无法落地的语义。
+                if !loop_context.continue_sources.contains(&block) {
+                    stmts.push(branch_stmt(
+                        negate_expr(continue_cond),
+                        break_block.clone(),
+                        None,
+                    ));
+                    return Some(None);
+                }
                 let stmt = if candidate.then_entry == continue_target {
                     branch_stmt(continue_cond, continue_block, Some(break_block.clone()))
                 } else {
