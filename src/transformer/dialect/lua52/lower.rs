@@ -3,8 +3,8 @@
 //! 这里最需要显式处理的 5.2 差异有三类：
 //! 1. raw pc 仍然按“字”计数，但 parser 会把 `LOADKX/EXTRAARG`、`SETLIST/EXTRAARG`
 //!    折成一个逻辑指令，所以跳转解析不能再偷用 logical index。
-//! 2. `GETTABUP/SETTABUP` 的 base 是 upvalue table，本层要直接落成
-//!    `AccessBase::Upvalue`，不能伪造中间寄存器。
+//! 2. `GETTABUP/SETTABUP` 的 base 可能是普通 upvalue table，也可能是词法 `_ENV`；
+//!    本层要把后者直接恢复成 `AccessBase::Env`，不能把这层语义继续拖给 HIR 猜。
 //! 3. `JMP(A)` 和 test helper `JMP` 可能自带 close 语义，本层必须把它显式拆成
 //!    `Close + Jump`，后续 CFG/SSA 才能看见真实副作用。
 
@@ -14,6 +14,7 @@ use crate::parser::{
     DialectInstrExtra, Lua52InstrExtra, Lua52Opcode, Lua52Operands, RawChunk, RawInstr,
     RawInstrOpcode, RawInstrOperands, RawProto,
 };
+use crate::transformer::common::resolve_env_upvalues;
 use crate::transformer::dialect::puc_lua::{
     LFIELDS_PER_FLUSH, call_args_pack, call_result_pack, index_k, is_k, range_len_inclusive,
     reg_from_u8, reg_from_u16, return_pack,
@@ -32,19 +33,23 @@ use crate::transformer::{
 pub(crate) fn lower_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
     Ok(LoweredChunk {
         header: chunk.header.clone(),
-        main: lower_proto(&chunk.main)?,
+        main: lower_proto(&chunk.main, None)?,
         origin: chunk.origin,
     })
 }
 
-fn lower_proto(raw: &RawProto) -> Result<LoweredProto, TransformError> {
+fn lower_proto(
+    raw: &RawProto,
+    parent_env_upvalues: Option<&[bool]>,
+) -> Result<LoweredProto, TransformError> {
+    let env_upvalues = resolve_env_upvalues(raw, parent_env_upvalues);
     let children = raw
         .common
         .children
         .iter()
-        .map(lower_proto)
+        .map(|child| lower_proto(child, Some(&env_upvalues)))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut lowerer = ProtoLowerer::new(raw);
+    let mut lowerer = ProtoLowerer::new(raw, env_upvalues);
     let (instrs, lowering_map) = lowerer.lower()?;
 
     Ok(LoweredProto {
@@ -64,6 +69,7 @@ fn lower_proto(raw: &RawProto) -> Result<LoweredProto, TransformError> {
 
 struct ProtoLowerer<'a> {
     raw: &'a RawProto,
+    env_upvalues: Vec<bool>,
     emitted: Vec<EmittedInstr>,
     raw_target_low: Vec<Option<usize>>,
     raw_to_low: Vec<Vec<InstrRef>>,
@@ -120,7 +126,7 @@ enum TargetPlaceholder {
 }
 
 impl<'a> ProtoLowerer<'a> {
-    fn new(raw: &'a RawProto) -> Self {
+    fn new(raw: &'a RawProto, env_upvalues: Vec<bool>) -> Self {
         let raw_instr_count = raw.common.instructions.len();
         let method_slots = usize::from(raw.common.frame.max_stack_size).saturating_add(2);
         let mut raw_pc_to_index = BTreeMap::new();
@@ -134,6 +140,7 @@ impl<'a> ProtoLowerer<'a> {
 
         Self {
             raw,
+            env_upvalues,
             emitted: Vec::new(),
             raw_target_low: vec![None; raw_instr_count],
             raw_to_low: vec![Vec::new(); raw_instr_count],
@@ -260,7 +267,7 @@ impl<'a> ProtoLowerer<'a> {
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::GetTable(GetTableInstr {
                             dst,
-                            base: AccessBase::Upvalue(self.upvalue_ref(raw_pc, b as usize)?),
+                            base: self.access_base_for_upvalue(raw_pc, b as usize)?,
                             key: self.access_key(raw_pc, c)?,
                         })),
                     );
@@ -287,7 +294,7 @@ impl<'a> ProtoLowerer<'a> {
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::SetTable(SetTableInstr {
-                            base: AccessBase::Upvalue(self.upvalue_ref(raw_pc, a as usize)?),
+                            base: self.access_base_for_upvalue(raw_pc, a as usize)?,
                             key: self.access_key(raw_pc, b)?,
                             value: self.value_operand(raw_pc, c)?,
                         })),
@@ -1006,6 +1013,19 @@ impl<'a> ProtoLowerer<'a> {
             });
         }
         Ok(UpvalueRef(index))
+    }
+
+    fn access_base_for_upvalue(
+        &self,
+        raw_pc: u32,
+        index: usize,
+    ) -> Result<AccessBase, TransformError> {
+        let upvalue = self.upvalue_ref(raw_pc, index)?;
+        Ok(if self.env_upvalues.get(index).copied().unwrap_or(false) {
+            AccessBase::Env
+        } else {
+            AccessBase::Upvalue(upvalue)
+        })
     }
 
     fn proto_ref(&self, raw_pc: u32, index: usize) -> Result<ProtoRef, TransformError> {

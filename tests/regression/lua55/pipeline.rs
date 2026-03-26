@@ -206,7 +206,7 @@ mod decompile_pipeline {
         assert!(dump.contains("global label ="), "{dump}");
         assert!(dump.contains("global counter ="), "{dump}");
         assert!(dump.contains("local l5 = function(p0)"), "{dump}");
-        assert!(dump.contains("u0.counter ="), "{dump}");
+        assert!(dump.contains("counter = ((counter * 2) + p0)"), "{dump}");
         assert!(dump.contains("global step = l5"), "{dump}");
         assert!(!dump.contains("local t"), "{dump}");
         assert!(!dump.contains("err-nnil"), "{dump}");
@@ -347,7 +347,7 @@ mod decompile_pipeline {
         assert!(dump.contains("local function l6()"), "{dump}");
         assert!(dump.contains("local l7 = l6()"), "{dump}");
         assert!(
-            dump.contains("u0.print(\"var55-closure\", l1(2, 4, 7, 5))"),
+            dump.contains("print(\"var55-closure\", l1(2, 4, 7, 5))"),
             "{dump}"
         );
         assert!(!dump.contains("function(p0) ... end"), "{dump}");
@@ -395,10 +395,11 @@ mod decompile_pipeline {
             generated.source
         );
         assert!(
-            generated.source.contains("up.print("),
+            generated.source.contains("print(\"g55-basic\""),
             "{}",
             generated.source
         );
+        assert!(!generated.source.contains("up."), "{}", generated.source);
 
         let dump = &result.debug_output[0].content;
         assert!(dump.contains("===== Dump Generate ====="), "{dump}");
