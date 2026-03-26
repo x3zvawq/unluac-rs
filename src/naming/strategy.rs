@@ -109,6 +109,15 @@ pub(super) fn choose_upvalue_candidate(
     options: NamingOptions,
     assigned_functions: &[FunctionNameMap],
 ) -> Result<CandidateHint, NamingError> {
+    if let Some(capture) = evidence
+        .upvalue_capture_sources
+        .get(index)
+        .and_then(|capture| *capture)
+    {
+        // upvalue 不是一个“重新发明名字”的槽位：只要我们知道它捕获自哪个父绑定，
+        // 就应该沿用那个绑定在父作用域里已经稳定下来的名字。
+        return resolve_captured_name(proto.id, capture, assigned_functions);
+    }
     if options.mode == NamingMode::DebugLike {
         return Ok(mode_fallback_candidate(
             options,
@@ -127,13 +136,6 @@ pub(super) fn choose_upvalue_candidate(
             text: name,
             source: NameSource::Debug,
         });
-    }
-    if let Some(capture) = evidence
-        .upvalue_capture_sources
-        .get(index)
-        .and_then(|capture| *capture)
-    {
-        return resolve_captured_name(proto.id, capture, assigned_functions);
     }
     Ok(mode_fallback_candidate(
         options,

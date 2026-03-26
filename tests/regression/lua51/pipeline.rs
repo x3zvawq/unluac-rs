@@ -575,6 +575,16 @@ mod decompile_pipeline {
             generated.source
         );
         assert!(
+            generated.source.contains("r1_0[#r1_0 + 1] = p2_0"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("u2_0[#u2_0 + 1] = p2_0"),
+            "{}",
+            generated.source
+        );
+        assert!(
             !generated.source.contains("local function fn("),
             "{}",
             generated.source
