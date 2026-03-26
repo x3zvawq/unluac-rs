@@ -316,6 +316,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
         let mut continue_cond = self.lower_branch_cond_for_target(block, continue_target)?;
         rewrite_expr_temps(&mut continue_cond, &temp_expr_overrides(target_overrides));
+        let prefer_natural_fallthrough = self.prefer_natural_fallthrough_over_continue(
+            candidate,
+            continue_target,
+            &loop_context,
+        );
 
         stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
         self.visited.insert(block);
@@ -348,7 +353,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 // 那它更像 loop tail 上的“否则 break”判定：继续这一臂只是自然回到
                 // 下一轮，不应该硬提升成显式 `continue`。否则像 Lua 5.1 这种没有
                 // `continue` / `goto` 的 target dialect 会被我们平白制造出无法落地的语义。
-                if !loop_context.continue_sources.contains(&block) {
+                if prefer_natural_fallthrough {
                     stmts.push(branch_stmt(
                         negate_expr(continue_cond),
                         break_block.clone(),
@@ -367,6 +372,17 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 };
                 stmts.push(stmt);
                 return Some(None);
+            }
+
+            if prefer_natural_fallthrough {
+                let non_continue_block =
+                    self.lower_region(non_continue_entry, Some(continue_target), target_overrides)?;
+                stmts.push(branch_stmt(
+                    negate_expr(continue_cond),
+                    non_continue_block,
+                    None,
+                ));
+                return Some(Some(continue_target));
             }
 
             let branch_stop = self.branch_stop_for_region(
@@ -434,6 +450,74 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         } else {
             Some(Some(merge))
         }
+    }
+
+    fn prefer_natural_fallthrough_over_continue(
+        &self,
+        candidate: &BranchCandidate,
+        continue_target: BlockRef,
+        loop_context: &ActiveLoopContext,
+    ) -> bool {
+        if candidate.merge == Some(continue_target) {
+            return false;
+        }
+        let Some(non_continue_entry) =
+            self.non_continue_entry_for_continue_candidate(candidate, continue_target)
+        else {
+            return false;
+        };
+
+        self.entry_is_break_funnel_to_continue(
+            non_continue_entry,
+            continue_target,
+            loop_context,
+            &mut BTreeSet::new(),
+        )
+    }
+
+    fn non_continue_entry_for_continue_candidate(
+        &self,
+        candidate: &BranchCandidate,
+        continue_target: BlockRef,
+    ) -> Option<BlockRef> {
+        if candidate.then_entry == continue_target {
+            candidate.else_entry.or(candidate.merge)
+        } else if candidate.else_entry == Some(continue_target) {
+            Some(candidate.then_entry)
+        } else {
+            None
+        }
+    }
+
+    fn entry_is_break_funnel_to_continue(
+        &self,
+        entry: BlockRef,
+        continue_target: BlockRef,
+        loop_context: &ActiveLoopContext,
+        visited: &mut BTreeSet<BlockRef>,
+    ) -> bool {
+        if !visited.insert(entry) {
+            return false;
+        }
+        if loop_context.break_exits.contains_key(&entry) {
+            return true;
+        }
+
+        let Some(candidate) = self.branch_by_header.get(&entry).copied() else {
+            return false;
+        };
+        let Some(non_continue_entry) =
+            self.non_continue_entry_for_continue_candidate(candidate, continue_target)
+        else {
+            return false;
+        };
+
+        self.entry_is_break_funnel_to_continue(
+            non_continue_entry,
+            continue_target,
+            loop_context,
+            visited,
+        )
     }
 
     fn lower_value_merge_node(

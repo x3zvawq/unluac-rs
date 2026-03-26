@@ -737,6 +737,69 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn repeat_until_closure_runtime_hir_keeps_break_funnel_without_synthetic_continue() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/03_repeat_until_closure_runtime.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("repeat_until_closure_runtime hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("repeat"), "{dump}");
+        assert!(dump.contains("break"), "{dump}");
+        assert!(!dump.contains("continue"), "{dump}");
+    }
+
+    #[test]
+    fn repeat_until_closure_runtime_generate_stage_succeeds_without_continue() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/03_repeat_until_closure_runtime.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("repeat_until_closure_runtime generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(generated.source.contains("repeat"), "{}", generated.source);
+        assert!(generated.source.contains("until"), "{}", generated.source);
+        assert!(generated.source.contains("break"), "{}", generated.source);
+        assert!(
+            !generated.source.contains("continue"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("print(\"repeat-closure\""),
+            "{}",
+            generated.source
+        );
+        assert!(generated.source.contains("== nil"), "{}", generated.source);
+    }
+
+    #[test]
     fn return_truncation_hir_folds_set_list_tail_into_table_constructor() {
         let result = decompile(
             &compile_lua_case(
