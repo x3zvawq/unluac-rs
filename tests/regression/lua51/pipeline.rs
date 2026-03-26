@@ -513,6 +513,41 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn nested_loop_mesh_readability_inlines_loop_header_and_branch_exprs() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/control_flow/06_nested_loop_mesh.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Readability,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Readability],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("nested_loop_mesh readability stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("for l0 = 1, p0, 1 do"), "{dump}");
+        assert!(dump.contains("if ((l0 + l3) % 2) == 0 then"), "{dump}");
+        assert!(
+            dump.contains("l1[((# l1) + 1)] = ((l0 * 10) + l3)"),
+            "{dump}"
+        );
+        assert!(!dump.contains("local l2 = 1"), "{dump}");
+        assert!(!dump.contains("local l4 = 1"), "{dump}");
+        assert!(!dump.contains("local l7 = (l0 + l3)"), "{dump}");
+        assert!(!dump.contains("local l8 = (l7 % 2)"), "{dump}");
+    }
+
+    #[test]
     fn nested_loop_mesh_generate_stage_succeeds_without_continue_or_goto() {
         let result = decompile(
             &compile_lua_case(
@@ -531,6 +566,11 @@ mod decompile_pipeline {
             .generated
             .as_ref()
             .expect("generate stage should provide source");
+        assert!(
+            generated.source.contains("for i = 1, a, 1 do"),
+            "{}",
+            generated.source
+        );
         assert!(generated.source.contains("break"), "{}", generated.source);
         assert!(
             !generated.source.contains("continue"),
@@ -538,6 +578,31 @@ mod decompile_pipeline {
             generated.source
         );
         assert!(!generated.source.contains("goto"), "{}", generated.source);
+        assert!(
+            !generated.source.contains("local value = 1"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local value2 = a"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local value3 = 1"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local ok2"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local ok3"),
+            "{}",
+            generated.source
+        );
     }
 }
 

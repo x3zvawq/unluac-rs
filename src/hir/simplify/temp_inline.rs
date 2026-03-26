@@ -10,6 +10,9 @@ use crate::hir::common::{
 };
 use crate::readability::ReadabilityOptions;
 
+const NESTED_INLINE_MAX_COMPLEXITY: usize = 5;
+const CONTROL_HEAD_INLINE_MAX_COMPLEXITY: usize = 5;
+
 /// 对单个 proto 递归执行局部 temp 折叠。
 pub(super) fn inline_temps_in_proto(proto: &mut HirProto, readability: ReadabilityOptions) -> bool {
     let proto_temp_count = proto
@@ -46,18 +49,17 @@ fn inline_temps_in_block(
             && !scratch.has_debug_local_hint(temp)
             && suffix_use_totals.get(temp.index()).copied().unwrap_or(0) == 1
             && let Some(state) = &mut next_stmt_state
-            && state.is_simple
             && state.temp_uses.count(temp) == 1
             && kept_rev
                 .last()
-                .and_then(|next_stmt| inline_site_in_simple_stmt(next_stmt, temp))
+                .and_then(|next_stmt| inline_site_in_stmt(next_stmt, temp))
                 .is_some_and(|site| site.allows(value, readability))
         {
             state.temp_uses.remove_from_totals(&mut suffix_use_totals);
             let next_stmt = kept_rev
                 .last_mut()
                 .expect("next stmt metadata must track the last kept stmt");
-            replace_temp_in_simple_stmt(next_stmt, temp, value);
+            replace_temp_in_stmt(next_stmt, temp, value);
             state.temp_uses = collect_stmt_temp_uses(next_stmt, scratch);
             state.temp_uses.add_to_totals(&mut suffix_use_totals);
             changed = true;
@@ -67,7 +69,6 @@ fn inline_temps_in_block(
         let stmt_uses = collect_stmt_temp_uses(&stmt, scratch);
         stmt_uses.add_to_totals(&mut suffix_use_totals);
         next_stmt_state = Some(NextStmtState {
-            is_simple: is_simple_stmt(&stmt),
             temp_uses: stmt_uses,
         });
         kept_rev.push(stmt);
@@ -137,32 +138,7 @@ fn inline_candidate(stmt: &HirStmt) -> Option<(TempId, &HirExpr)> {
     Some((*temp, value))
 }
 
-fn is_simple_stmt(stmt: &HirStmt) -> bool {
-    match stmt {
-        HirStmt::LocalDecl(_)
-        | HirStmt::Assign(_)
-        | HirStmt::TableSetList(_)
-        | HirStmt::CallStmt(_)
-        | HirStmt::Return(_) => true,
-        HirStmt::If(_)
-        | HirStmt::While(_)
-        | HirStmt::Repeat(_)
-        | HirStmt::NumericFor(_)
-        | HirStmt::GenericFor(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
-        | HirStmt::Break
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_)
-        | HirStmt::Block(_)
-        | HirStmt::Unstructured(_) => false,
-    }
-}
-
 struct NextStmtState {
-    is_simple: bool,
     temp_uses: TempUseSummary,
 }
 
@@ -274,7 +250,7 @@ fn collect_stmt_temp_uses(stmt: &HirStmt, scratch: &mut TempUseScratch) -> TempU
     scratch.finish_summary()
 }
 
-fn inline_site_in_simple_stmt(stmt: &HirStmt, temp: TempId) -> Option<InlineSite> {
+fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<InlineSite> {
     match stmt {
         HirStmt::LocalDecl(local_decl) => {
             find_site_in_exprs(&local_decl.values, temp, InlineSite::Direct)
@@ -298,12 +274,22 @@ fn inline_site_in_simple_stmt(stmt: &HirStmt, temp: TempId) -> Option<InlineSite
             find_site_in_call(&call_stmt.call, temp, InlineSite::Direct)
         }
         HirStmt::Return(ret) => find_site_in_exprs(&ret.values, temp, InlineSite::ReturnValue),
-        HirStmt::If(_)
-        | HirStmt::While(_)
-        | HirStmt::Repeat(_)
-        | HirStmt::NumericFor(_)
-        | HirStmt::GenericFor(_)
-        | HirStmt::ErrNil(_)
+        HirStmt::If(if_stmt) => find_site_in_expr(&if_stmt.cond, temp, InlineSite::Condition),
+        HirStmt::While(while_stmt) => {
+            find_site_in_expr(&while_stmt.cond, temp, InlineSite::Condition)
+        }
+        HirStmt::Repeat(repeat_stmt) => {
+            find_site_in_expr(&repeat_stmt.cond, temp, InlineSite::Condition)
+        }
+        HirStmt::NumericFor(numeric_for) => {
+            find_site_in_expr(&numeric_for.start, temp, InlineSite::LoopHead)
+                .or_else(|| find_site_in_expr(&numeric_for.limit, temp, InlineSite::LoopHead))
+                .or_else(|| find_site_in_expr(&numeric_for.step, temp, InlineSite::LoopHead))
+        }
+        HirStmt::GenericFor(generic_for) => {
+            find_site_in_exprs(&generic_for.iterator, temp, InlineSite::LoopHead)
+        }
+        HirStmt::ErrNil(_)
         | HirStmt::ToBeClosed(_)
         | HirStmt::Close(_)
         | HirStmt::Break
@@ -507,17 +493,27 @@ enum InlineSite {
     Index,
     CallArg,
     AccessBase,
+    Condition,
+    LoopHead,
 }
 
 impl InlineSite {
     fn allows(self, replacement: &HirExpr, options: ReadabilityOptions) -> bool {
         match self {
             Self::Direct => true,
-            Self::Nested => is_atomic_nested_inline_expr(replacement),
+            Self::Nested => {
+                expr_complexity(replacement) <= NESTED_INLINE_MAX_COMPLEXITY
+                    && is_small_pure_nested_inline_expr(replacement)
+            }
             Self::AccessBase => {
                 self.complexity_limit(options)
                     .is_some_and(|limit| expr_complexity(replacement) <= limit)
                     && is_access_base_inline_expr(replacement)
+            }
+            // 条件头 / for 头属于源码结构骨架，保留少量低复杂度表达式能明显减少
+            // 机械 temp 噪音；但这里仍然用固定的小阈值，避免把整坨复杂逻辑塞回控制头。
+            Self::Condition | Self::LoopHead => {
+                expr_complexity(replacement) <= CONTROL_HEAD_INLINE_MAX_COMPLEXITY
             }
             Self::ReturnValue | Self::Index | Self::CallArg => self
                 .complexity_limit(options)
@@ -527,7 +523,7 @@ impl InlineSite {
 
     fn complexity_limit(self, options: ReadabilityOptions) -> Option<usize> {
         match self {
-            Self::Direct | Self::Nested => None,
+            Self::Direct | Self::Nested | Self::Condition | Self::LoopHead => None,
             Self::ReturnValue => Some(options.return_inline_max_complexity),
             Self::Index => Some(options.index_inline_max_complexity),
             Self::CallArg => Some(options.args_inline_max_complexity),
@@ -538,9 +534,13 @@ impl InlineSite {
     fn descend_access_base(self) -> Self {
         match self {
             Self::Direct => Self::AccessBase,
-            Self::Nested | Self::ReturnValue | Self::Index | Self::CallArg | Self::AccessBase => {
-                Self::Nested
-            }
+            Self::Nested
+            | Self::ReturnValue
+            | Self::Index
+            | Self::CallArg
+            | Self::AccessBase
+            | Self::Condition
+            | Self::LoopHead => Self::Nested,
         }
     }
 
@@ -550,6 +550,11 @@ impl InlineSite {
             // 在进入 locals 阶段前就失去折叠机会；而 return/call 等站位仍维持保守边界，
             // 防止上下文再次泄漏成“整坨表达式”。
             Self::Index => Self::Index,
+            // 条件头 / loop 头本身就是高价值结构位置，允许低复杂度表达式继续穿过
+            // 纯 wrapper，能把 `if ((a + b) % 2 == 0)`、`for i = 1, n, 1` 这类源码形状
+            // 从机械 temp 链里收回来。
+            Self::Condition => Self::Condition,
+            Self::LoopHead => Self::LoopHead,
             Self::Direct | Self::Nested | Self::ReturnValue | Self::CallArg | Self::AccessBase => {
                 Self::Nested
             }
@@ -572,6 +577,37 @@ fn is_atomic_nested_inline_expr(expr: &HirExpr) -> bool {
             | HirExpr::GlobalRef(_)
             | HirExpr::VarArg
     )
+}
+
+fn is_small_pure_nested_inline_expr(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::TempRef(_)
+        | HirExpr::GlobalRef(_) => true,
+        HirExpr::Unary(unary) => is_small_pure_nested_inline_expr(&unary.expr),
+        HirExpr::Binary(binary) => {
+            is_small_pure_nested_inline_expr(&binary.lhs)
+                && is_small_pure_nested_inline_expr(&binary.rhs)
+        }
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            is_small_pure_nested_inline_expr(&logical.lhs)
+                && is_small_pure_nested_inline_expr(&logical.rhs)
+        }
+        HirExpr::VarArg
+        | HirExpr::TableAccess(_)
+        | HirExpr::Decision(_)
+        | HirExpr::Call(_)
+        | HirExpr::TableConstructor(_)
+        | HirExpr::Closure(_)
+        | HirExpr::Unresolved(_) => false,
+    }
 }
 
 fn is_access_base_inline_expr(expr: &HirExpr) -> bool {
@@ -833,7 +869,7 @@ fn max_temp_index_in_table_key(key: &crate::hir::common::HirTableKey) -> Option<
     }
 }
 
-fn replace_temp_in_simple_stmt(stmt: &mut HirStmt, temp: TempId, replacement: &HirExpr) {
+fn replace_temp_in_stmt(stmt: &mut HirStmt, temp: TempId, replacement: &HirExpr) {
     match stmt {
         HirStmt::LocalDecl(local_decl) => {
             for value in &mut local_decl.values {
@@ -860,6 +896,9 @@ fn replace_temp_in_simple_stmt(stmt: &mut HirStmt, temp: TempId, replacement: &H
         HirStmt::ErrNil(err_nil) => {
             replace_temp_in_expr(&mut err_nil.value, temp, replacement);
         }
+        HirStmt::ToBeClosed(to_be_closed) => {
+            replace_temp_in_expr(&mut to_be_closed.value, temp, replacement);
+        }
         HirStmt::CallStmt(call_stmt) => {
             replace_temp_in_call_expr(&mut call_stmt.call, temp, replacement)
         }
@@ -868,19 +907,48 @@ fn replace_temp_in_simple_stmt(stmt: &mut HirStmt, temp: TempId, replacement: &H
                 replace_temp_in_expr(value, temp, replacement);
             }
         }
-        HirStmt::If(_)
-        | HirStmt::While(_)
-        | HirStmt::Repeat(_)
-        | HirStmt::NumericFor(_)
-        | HirStmt::GenericFor(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
+        HirStmt::If(if_stmt) => {
+            replace_temp_in_expr(&mut if_stmt.cond, temp, replacement);
+            replace_temp_in_block(&mut if_stmt.then_block, temp, replacement);
+            if let Some(else_block) = &mut if_stmt.else_block {
+                replace_temp_in_block(else_block, temp, replacement);
+            }
+        }
+        HirStmt::While(while_stmt) => {
+            replace_temp_in_expr(&mut while_stmt.cond, temp, replacement);
+            replace_temp_in_block(&mut while_stmt.body, temp, replacement);
+        }
+        HirStmt::Repeat(repeat_stmt) => {
+            replace_temp_in_block(&mut repeat_stmt.body, temp, replacement);
+            replace_temp_in_expr(&mut repeat_stmt.cond, temp, replacement);
+        }
+        HirStmt::NumericFor(numeric_for) => {
+            replace_temp_in_expr(&mut numeric_for.start, temp, replacement);
+            replace_temp_in_expr(&mut numeric_for.limit, temp, replacement);
+            replace_temp_in_expr(&mut numeric_for.step, temp, replacement);
+            replace_temp_in_block(&mut numeric_for.body, temp, replacement);
+        }
+        HirStmt::GenericFor(generic_for) => {
+            for expr in &mut generic_for.iterator {
+                replace_temp_in_expr(expr, temp, replacement);
+            }
+            replace_temp_in_block(&mut generic_for.body, temp, replacement);
+        }
+        HirStmt::Close(_)
         | HirStmt::Break
         | HirStmt::Continue
         | HirStmt::Goto(_)
-        | HirStmt::Label(_)
-        | HirStmt::Block(_)
-        | HirStmt::Unstructured(_) => {}
+        | HirStmt::Label(_) => {}
+        HirStmt::Block(block) => replace_temp_in_block(block, temp, replacement),
+        HirStmt::Unstructured(unstructured) => {
+            replace_temp_in_block(&mut unstructured.body, temp, replacement);
+        }
+    }
+}
+
+fn replace_temp_in_block(block: &mut HirBlock, temp: TempId, replacement: &HirExpr) {
+    for stmt in &mut block.stmts {
+        replace_temp_in_stmt(stmt, temp, replacement);
     }
 }
 
@@ -1078,7 +1146,8 @@ fn replace_temp_in_table_key(
 mod tests {
     use super::*;
     use crate::hir::common::{
-        HirAssign, HirCallStmt, HirGlobalRef, HirModule, HirProtoRef, HirReturn,
+        HirAssign, HirBinaryExpr, HirBinaryOpKind, HirCallStmt, HirGlobalRef, HirIf, HirModule,
+        HirNumericFor, HirProtoRef, HirReturn, HirUnaryExpr, HirUnaryOpKind, LocalId, ParamId,
     };
 
     #[test]
@@ -1565,6 +1634,154 @@ mod tests {
         assert!(matches!(
             &module.protos[0].body.stmts.as_slice(),
             [HirStmt::Return(ret)] if matches!(ret.values.as_slice(), [HirExpr::Integer(7)])
+        ));
+    }
+
+    #[test]
+    fn inlines_single_use_temps_into_numeric_for_header() {
+        let mut proto = HirProto {
+            temps: vec![TempId(0), TempId(1), TempId(2)],
+            locals: vec![LocalId(0)],
+            temp_debug_locals: vec![None, None, None],
+            ..dummy_proto(HirBlock {
+                stmts: vec![
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(TempId(0))],
+                        values: vec![HirExpr::Integer(1)],
+                    })),
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(TempId(1))],
+                        values: vec![HirExpr::ParamRef(ParamId(0))],
+                    })),
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(TempId(2))],
+                        values: vec![HirExpr::Integer(1)],
+                    })),
+                    HirStmt::NumericFor(Box::new(HirNumericFor {
+                        binding: LocalId(0),
+                        start: HirExpr::TempRef(TempId(0)),
+                        limit: HirExpr::TempRef(TempId(1)),
+                        step: HirExpr::TempRef(TempId(2)),
+                        body: HirBlock::default(),
+                    })),
+                ],
+            })
+        };
+
+        assert!(inline_temps_in_proto(
+            &mut proto,
+            crate::readability::ReadabilityOptions::default()
+        ));
+        assert!(matches!(
+            proto.body.stmts.as_slice(),
+            [HirStmt::NumericFor(numeric_for)]
+                if matches!(numeric_for.start, HirExpr::Integer(1))
+                    && matches!(numeric_for.limit, HirExpr::ParamRef(ParamId(0)))
+                    && matches!(numeric_for.step, HirExpr::Integer(1))
+        ));
+    }
+
+    #[test]
+    fn inlines_small_nested_exprs_into_condition_and_assign_value() {
+        let mut proto = HirProto {
+            temps: vec![TempId(0), TempId(1), TempId(2)],
+            temp_debug_locals: vec![None, None, None],
+            ..dummy_proto(HirBlock {
+                stmts: vec![
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(TempId(0))],
+                        values: vec![HirExpr::Binary(Box::new(HirBinaryExpr {
+                            op: HirBinaryOpKind::Add,
+                            lhs: HirExpr::ParamRef(ParamId(0)),
+                            rhs: HirExpr::ParamRef(ParamId(1)),
+                        }))],
+                    })),
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(TempId(1))],
+                        values: vec![HirExpr::Binary(Box::new(HirBinaryExpr {
+                            op: HirBinaryOpKind::Mod,
+                            lhs: HirExpr::TempRef(TempId(0)),
+                            rhs: HirExpr::Integer(2),
+                        }))],
+                    })),
+                    HirStmt::If(Box::new(HirIf {
+                        cond: HirExpr::Unary(Box::new(HirUnaryExpr {
+                            op: HirUnaryOpKind::Not,
+                            expr: HirExpr::Binary(Box::new(HirBinaryExpr {
+                                op: HirBinaryOpKind::Eq,
+                                lhs: HirExpr::TempRef(TempId(1)),
+                                rhs: HirExpr::Integer(0),
+                            })),
+                        })),
+                        then_block: HirBlock::default(),
+                        else_block: None,
+                    })),
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(TempId(2))],
+                        values: vec![HirExpr::Binary(Box::new(HirBinaryExpr {
+                            op: HirBinaryOpKind::Mul,
+                            lhs: HirExpr::ParamRef(ParamId(0)),
+                            rhs: HirExpr::Integer(10),
+                        }))],
+                    })),
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Global(HirGlobalRef {
+                            name: "value".to_owned(),
+                        })],
+                        values: vec![HirExpr::Binary(Box::new(HirBinaryExpr {
+                            op: HirBinaryOpKind::Add,
+                            lhs: HirExpr::TempRef(TempId(2)),
+                            rhs: HirExpr::ParamRef(ParamId(1)),
+                        }))],
+                    })),
+                ],
+            })
+        };
+
+        assert!(inline_temps_in_proto(
+            &mut proto,
+            crate::readability::ReadabilityOptions::default()
+        ));
+        assert!(matches!(
+            proto.body.stmts.as_slice(),
+            [HirStmt::If(if_stmt), HirStmt::Assign(assign)]
+                if matches!(
+                    &if_stmt.cond,
+                    HirExpr::Unary(unary)
+                        if unary.op == HirUnaryOpKind::Not
+                            && matches!(
+                                &unary.expr,
+                                HirExpr::Binary(eq)
+                                    if eq.op == HirBinaryOpKind::Eq
+                                        && matches!(
+                                            &eq.lhs,
+                                            HirExpr::Binary(mod_expr)
+                                                if mod_expr.op == HirBinaryOpKind::Mod
+                                                    && matches!(
+                                                        &mod_expr.lhs,
+                                                        HirExpr::Binary(add_expr)
+                                                            if add_expr.op == HirBinaryOpKind::Add
+                                                                && matches!(add_expr.lhs, HirExpr::ParamRef(ParamId(0)))
+                                                                && matches!(add_expr.rhs, HirExpr::ParamRef(ParamId(1)))
+                                                    )
+                                                    && matches!(mod_expr.rhs, HirExpr::Integer(2))
+                                        )
+                                        && matches!(eq.rhs, HirExpr::Integer(0))
+                            )
+                )
+                    && matches!(
+                        assign.values.as_slice(),
+                        [HirExpr::Binary(add_expr)]
+                            if add_expr.op == HirBinaryOpKind::Add
+                                && matches!(
+                                    &add_expr.lhs,
+                                    HirExpr::Binary(mul_expr)
+                                        if mul_expr.op == HirBinaryOpKind::Mul
+                                            && matches!(mul_expr.lhs, HirExpr::ParamRef(ParamId(0)))
+                                            && matches!(mul_expr.rhs, HirExpr::Integer(10))
+                                )
+                                && matches!(add_expr.rhs, HirExpr::ParamRef(ParamId(1)))
+                    )
         ));
     }
 }
