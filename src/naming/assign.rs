@@ -144,6 +144,55 @@ struct LoopContext {
     numeric_depth: usize,
 }
 
+#[derive(Debug, Default)]
+struct ModuleNameAllocator {
+    function_shape_names: BTreeSet<String>,
+    next_function_shape_suffix: BTreeMap<String, usize>,
+}
+
+impl ModuleNameAllocator {
+    fn reserve_function_shape_name(
+        &mut self,
+        candidate: CandidateHint,
+        used_in_function: &BTreeSet<String>,
+        mode: NamingMode,
+    ) -> CandidateHint {
+        if mode == NamingMode::DebugLike || candidate.source != NameSource::FunctionShape {
+            return candidate;
+        }
+
+        // `fn` 这类函数形状名如果每个函数都从头开始，会在阅读时迅速失去区分度。
+        // 这里单独做模块级递增，只影响函数形状名，不去污染其它局部命名规则。
+        let base = candidate.text;
+        let mut next_suffix = self
+            .next_function_shape_suffix
+            .get(&base)
+            .copied()
+            .unwrap_or(1);
+
+        loop {
+            let text = if next_suffix == 1 {
+                base.clone()
+            } else {
+                format!("{base}{next_suffix}")
+            };
+            if !self.function_shape_names.contains(&text)
+                && !used_in_function.contains(&text)
+                && !is_lua_keyword(&text)
+            {
+                self.function_shape_names.insert(text.clone());
+                self.next_function_shape_suffix
+                    .insert(base, next_suffix.saturating_add(1));
+                return CandidateHint {
+                    text,
+                    source: candidate.source,
+                };
+            }
+            next_suffix = next_suffix.saturating_add(1);
+        }
+    }
+}
+
 /// 对外的 Naming 入口。
 pub fn assign_names(
     module: &AstModule,
@@ -155,6 +204,7 @@ pub fn assign_names(
     validate_readability_ast(module, module.entry_function, hir)?;
     let mut hints = vec![FunctionHints::default(); hir.protos.len()];
     collect_function_hints(module, hir, &mut hints)?;
+    let mut module_names = ModuleNameAllocator::default();
 
     let functions = hir
         .protos
@@ -165,6 +215,7 @@ pub fn assign_names(
                 &evidence.functions[proto.id.index()],
                 &hints[proto.id.index()],
                 options,
+                &mut module_names,
             )
         })
         .collect::<Vec<_>>();
@@ -891,6 +942,7 @@ fn assign_names_for_function(
     evidence: &FunctionNamingEvidence,
     hints: &FunctionHints,
     options: NamingOptions,
+    module_names: &mut ModuleNameAllocator,
 ) -> FunctionNameMap {
     let mut used = lua_keywords();
     let params = proto
@@ -899,7 +951,11 @@ fn assign_names_for_function(
         .enumerate()
         .map(|(index, param)| {
             allocate_name(
-                choose_param_candidate(proto, *param, index, evidence, hints, options),
+                module_names.reserve_function_shape_name(
+                    choose_param_candidate(proto, *param, index, evidence, hints, options),
+                    &used,
+                    options.mode,
+                ),
                 &mut used,
             )
         })
@@ -910,7 +966,11 @@ fn assign_names_for_function(
         .enumerate()
         .map(|(index, local)| {
             allocate_name(
-                choose_local_candidate(proto, *local, index, evidence, hints, options),
+                module_names.reserve_function_shape_name(
+                    choose_local_candidate(proto, *local, index, evidence, hints, options),
+                    &used,
+                    options.mode,
+                ),
                 &mut used,
             )
         })
@@ -921,7 +981,11 @@ fn assign_names_for_function(
         .enumerate()
         .map(|(index, upvalue)| {
             allocate_name(
-                choose_upvalue_candidate(proto, *upvalue, index, evidence, options),
+                module_names.reserve_function_shape_name(
+                    choose_upvalue_candidate(proto, *upvalue, index, evidence, options),
+                    &used,
+                    options.mode,
+                ),
                 &mut used,
             )
         })
@@ -933,13 +997,17 @@ fn assign_names_for_function(
         .enumerate()
         .map(|(synthetic_order, local)| {
             let info = allocate_name(
-                choose_synthetic_local_candidate(
-                    proto,
-                    local,
-                    synthetic_order,
-                    evidence,
-                    hints,
-                    options,
+                module_names.reserve_function_shape_name(
+                    choose_synthetic_local_candidate(
+                        proto,
+                        local,
+                        synthetic_order,
+                        evidence,
+                        hints,
+                        options,
+                    ),
+                    &used,
+                    options.mode,
                 ),
                 &mut used,
             );
