@@ -1,4 +1,4 @@
-//! 这些测试固定 Lua 5.5 主 pipeline 的 smoke 契约。
+//! 这些测试固定 Lua 5.5 已经修好的回归点。
 
 use unluac::decompile::{
     DebugColorMode, DebugDetail, DebugOptions, DecompileDialect, DecompileOptions, DecompileStage,

@@ -1,7 +1,4 @@
-//! 这些测试固定 Lua 5.3 主 pipeline 的 smoke 契约。
-//!
-//! 这里不尝试锁 HIR 的最终形状，只先确认：`lua5.3` 已经接进 decompile/CLI dialect
-//! 选择，并且能稳定跑到 transform 和 HIR。
+//! 这些测试固定 Lua 5.3 已经修好的回归点。
 
 use unluac::decompile::{
     DebugColorMode, DebugDetail, DebugOptions, DecompileDialect, DecompileOptions, DecompileStage,

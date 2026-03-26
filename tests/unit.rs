@@ -1,25 +1,13 @@
-//! 这个 integration test 入口聚合所有 unit 风格测试。
+//! 这个 integration test 入口聚合所有 unit 测试。
 //!
-//! 这里按 `tests/unit/<dialect>/...` 组织，是为了让“层内契约测试”和
-//! “主流程回归测试”分开演进，同时继续兼容 Cargo 对 tests 根目录的发现规则。
+//! unit 只负责 case-health 和 decompile-pipeline-health 两类健康检查，
+//! 它们都是围绕 `(case, dialect)` 这个最小支持单元展开的。
 
 #[path = "support/mod.rs"]
 mod support;
 
-#[path = "unit/common/mod.rs"]
-mod common;
+#[path = "unit/case_health.rs"]
+mod case_health;
 
-#[path = "unit/lua51/mod.rs"]
-mod lua51;
-
-#[path = "unit/lua52/mod.rs"]
-mod lua52;
-
-#[path = "unit/lua53/mod.rs"]
-mod lua53;
-
-#[path = "unit/lua54/mod.rs"]
-mod lua54;
-
-#[path = "unit/lua55/mod.rs"]
-mod lua55;
+#[path = "unit/decompile_pipeline_health.rs"]
+mod decompile_pipeline_health;

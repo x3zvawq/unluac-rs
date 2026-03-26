@@ -1,4 +1,4 @@
-//! 这些测试固定 Lua 5.2 主 pipeline 的 AST smoke 契约。
+//! 这些测试固定 Lua 5.2 已经修好的 AST 回归点。
 
 use unluac::decompile::{
     DebugColorMode, DebugDetail, DebugOptions, DecompileDialect, DecompileOptions, DecompileStage,

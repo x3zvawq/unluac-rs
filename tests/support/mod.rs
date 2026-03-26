@@ -2,6 +2,7 @@
 //!
 //! 这些 helper 只负责测试夹具解码这类稳定、无业务语义的重复逻辑，避免 unit
 //! 和 regression 两套入口各自复制同一份样板代码。
+#![allow(dead_code)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,22 +12,145 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[allow(dead_code)]
 pub(crate) mod case_manifest;
 
-/// 把嵌入测试文件里的十六进制 fixture 解码成原始字节。
-pub(crate) fn decode_hex(hex: &str) -> Vec<u8> {
-    let compact = hex
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect::<String>();
-    assert_eq!(compact.len() % 2, 0, "fixture hex should have even length");
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct LuaCommandOutput {
+    pub(crate) status_code: Option<i32>,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+}
 
-    compact
-        .as_bytes()
-        .chunks(2)
-        .map(|pair| {
-            let digits = std::str::from_utf8(pair).expect("fixture hex should stay ascii");
-            u8::from_str_radix(digits, 16).expect("fixture hex should decode")
-        })
-        .collect()
+impl LuaCommandOutput {
+    pub(crate) fn success(&self) -> bool {
+        self.status_code == Some(0)
+    }
+
+    pub(crate) fn render(&self) -> String {
+        format!(
+            "status: {}\nstdout:\n{}\nstderr:\n{}",
+            render_status_code(self.status_code),
+            render_bytes(&self.stdout),
+            render_bytes(&self.stderr)
+        )
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct CaseHealthBaseline {
+    pub(crate) source_output: LuaCommandOutput,
+}
+
+/// 使用 vendored 的 `lua` 直接执行某个仓库内 Lua case。
+pub(crate) fn run_lua_case(
+    dialect_label: &str,
+    source_relative: &str,
+) -> Result<LuaCommandOutput, String> {
+    let source = repo_root().join(source_relative);
+    run_lua_file(dialect_label, &source)
+}
+
+/// 使用 vendored 的 `lua` 执行一个已经落盘的 Lua 源码或 chunk 文件。
+pub(crate) fn run_lua_file(
+    dialect_label: &str,
+    input_path: &Path,
+) -> Result<LuaCommandOutput, String> {
+    let lua = lua_tool_path(dialect_label, "lua")?;
+    run_command(&lua, &[input_path.as_os_str()], "lua")
+}
+
+/// 使用 vendored 的 `luac` 把一个仓库内 case 编译到 health suite 的稳定产物路径。
+pub(crate) fn compile_lua_case_to_suite_artifact(
+    dialect_label: &str,
+    source_relative: &str,
+    suite_label: &str,
+    artifact_label: &str,
+    strip_debug: bool,
+) -> Result<(PathBuf, LuaCommandOutput), String> {
+    let source = repo_root().join(source_relative);
+    let output = suite_artifact_path(
+        suite_label,
+        dialect_label,
+        artifact_label,
+        source_relative,
+        "luac",
+    );
+    let command_output = compile_lua_file_to_path(dialect_label, &source, &output, strip_debug)?;
+    Ok((output, command_output))
+}
+
+/// 把反编译得到的源码落到稳定产物路径，便于后续编译、执行和排错。
+pub(crate) fn write_generated_case_source(
+    dialect_label: &str,
+    suite_label: &str,
+    source_relative: &str,
+    generated_source: &str,
+) -> Result<PathBuf, String> {
+    let output = suite_artifact_path(
+        suite_label,
+        dialect_label,
+        "generated-source",
+        source_relative,
+        "lua",
+    );
+    write_output_file(&output, generated_source.as_bytes())?;
+    Ok(output)
+}
+
+/// 执行 case-health，并返回后续 pipeline health 可以直接复用的基线输出。
+pub(crate) fn build_case_health_baseline(
+    entry: &case_manifest::LuaCaseManifestEntry,
+    suite_label: &str,
+) -> Result<CaseHealthBaseline, String> {
+    let dialect_label = entry.dialect.luac_label();
+    let source_output = run_lua_case(dialect_label, entry.path)
+        .map_err(|error| format!("run source failed: {error}"))?;
+    if !source_output.success() {
+        return Err(format!(
+            "source execution failed for {}\n{}",
+            entry.path,
+            source_output.render()
+        ));
+    }
+
+    let (compiled_path, compile_output) = compile_lua_case_to_suite_artifact(
+        dialect_label,
+        entry.path,
+        suite_label,
+        "compiled-source",
+        true,
+    )
+    .map_err(|error| format!("compile source failed: {error}"))?;
+    if !compile_output.success() {
+        return Err(format!(
+            "source compilation failed for {}\nartifact: {}\n{}",
+            entry.path,
+            compiled_path.display(),
+            compile_output.render()
+        ));
+    }
+
+    let chunk_output = run_lua_file(dialect_label, &compiled_path)
+        .map_err(|error| format!("run compiled chunk failed: {error}"))?;
+    if !chunk_output.success() {
+        return Err(format!(
+            "compiled chunk execution failed for {}\nartifact: {}\n{}",
+            entry.path,
+            compiled_path.display(),
+            chunk_output.render()
+        ));
+    }
+
+    if let Some(diff) =
+        diff_command_outputs("source", &source_output, "compiled-chunk", &chunk_output)
+    {
+        return Err(format!(
+            "source/chunk output mismatch for {}\nartifact: {}\n{}",
+            entry.path,
+            compiled_path.display(),
+            diff
+        ));
+    }
+
+    Ok(CaseHealthBaseline { source_output })
 }
 
 /// 使用 vendored 的 `luac` 把某个仓库内 Lua case 编译成测试 chunk。
@@ -89,6 +213,37 @@ fn compile_lua_case_inner(
     })
 }
 
+/// 使用 vendored 的 `luac` 把已经生成好的源码落成稳定的 health chunk 产物。
+pub(crate) fn compile_generated_source_to_suite_artifact(
+    dialect_label: &str,
+    source_relative: &str,
+    suite_label: &str,
+    generated_source_path: &Path,
+    strip_debug: bool,
+) -> Result<(PathBuf, LuaCommandOutput), String> {
+    let output = suite_artifact_path(
+        suite_label,
+        dialect_label,
+        "generated-chunk",
+        source_relative,
+        "luac",
+    );
+    let command_output =
+        compile_lua_file_to_path(dialect_label, generated_source_path, &output, strip_debug)?;
+    Ok((output, command_output))
+}
+
+fn compile_lua_file_to_path(
+    dialect_label: &str,
+    source: &Path,
+    output: &Path,
+    strip_debug: bool,
+) -> Result<LuaCommandOutput, String> {
+    let luac = lua_tool_path(dialect_label, "luac")?;
+    ensure_parent_dir(output)?;
+    run_command_with_optional_strip(&luac, source, output, strip_debug)
+}
+
 #[allow(dead_code)]
 fn test_chunk_output_path(
     repo_root: &Path,
@@ -107,4 +262,153 @@ fn test_chunk_output_path(
         .join(if strip_debug { "stripped" } else { "debug" })
         .join(relative)
         .with_extension(format!("{}.out", unique))
+}
+
+pub(crate) fn diff_command_outputs(
+    expected_label: &str,
+    expected: &LuaCommandOutput,
+    actual_label: &str,
+    actual: &LuaCommandOutput,
+) -> Option<String> {
+    let mut diffs = Vec::new();
+
+    if expected.status_code != actual.status_code {
+        diffs.push(format!(
+            "status mismatch:\n  {expected_label}: {}\n  {actual_label}: {}",
+            render_status_code(expected.status_code),
+            render_status_code(actual.status_code)
+        ));
+    }
+
+    if expected.stdout != actual.stdout {
+        diffs.push(format!(
+            "stdout mismatch:\n  {expected_label}:\n{}\n  {actual_label}:\n{}",
+            render_bytes(&expected.stdout),
+            render_bytes(&actual.stdout)
+        ));
+    }
+
+    if expected.stderr != actual.stderr {
+        diffs.push(format!(
+            "stderr mismatch:\n  {expected_label}:\n{}\n  {actual_label}:\n{}",
+            render_bytes(&expected.stderr),
+            render_bytes(&actual.stderr)
+        ));
+    }
+
+    (!diffs.is_empty()).then(|| diffs.join("\n"))
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn lua_tool_path(dialect_label: &str, tool_name: &str) -> Result<PathBuf, String> {
+    let tool = repo_root()
+        .join("lua")
+        .join("build")
+        .join(dialect_label)
+        .join(tool_name);
+    if !tool.exists() {
+        return Err(format!(
+            "missing bundled {tool_name} for {dialect_label}: {}",
+            tool.display()
+        ));
+    }
+    Ok(tool)
+}
+
+fn suite_artifact_path(
+    suite_label: &str,
+    dialect_label: &str,
+    artifact_label: &str,
+    source_relative: &str,
+    extension: &str,
+) -> PathBuf {
+    repo_root()
+        .join("target")
+        .join("unluac-tests")
+        .join(suite_label)
+        .join(dialect_label)
+        .join(artifact_label)
+        .join(source_relative)
+        .with_extension(extension)
+}
+
+fn write_output_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    ensure_parent_dir(path)?;
+    fs::write(path, bytes)
+        .map_err(|error| format!("should write output file {}: {error}", path.display()))
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Err(format!(
+            "path {} should always have a parent",
+            path.display()
+        ));
+    };
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("should create directory {}: {error}", parent.display()))
+}
+
+fn run_command_with_optional_strip(
+    luac: &Path,
+    source: &Path,
+    output: &Path,
+    strip_debug: bool,
+) -> Result<LuaCommandOutput, String> {
+    let mut command = Command::new(luac);
+    if strip_debug {
+        command.arg("-s");
+    }
+    command.arg("-o").arg(output).arg(source);
+    let output = command.output().map_err(|error| {
+        format!(
+            "should spawn luac {} for {}: {error}",
+            luac.display(),
+            source.display()
+        )
+    })?;
+    Ok(LuaCommandOutput {
+        status_code: output.status.code(),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
+fn run_command(
+    command_path: &Path,
+    args: &[&std::ffi::OsStr],
+    tool_name: &str,
+) -> Result<LuaCommandOutput, String> {
+    let output = Command::new(command_path)
+        .args(args)
+        .output()
+        .map_err(|error| {
+            format!(
+                "should spawn {tool_name} {}: {error}",
+                command_path.display()
+            )
+        })?;
+    Ok(LuaCommandOutput {
+        status_code: output.status.code(),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
+fn render_status_code(status_code: Option<i32>) -> String {
+    match status_code {
+        Some(code) => code.to_string(),
+        None => "terminated-by-signal".to_owned(),
+    }
+}
+
+fn render_bytes(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        "<empty>".to_owned()
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
 }
