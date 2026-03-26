@@ -506,6 +506,34 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn short_circuit_side_effects_readability_sinks_hoisted_multi_return_locals() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/15_short_circuit_side_effects.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Readability,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Readability],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("short_circuit_side_effects readability stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(!dump.contains("local l1, l2, l3, l4"), "{dump}");
+        assert!(dump.contains("local l1, l2 = l0(false, true)"), "{dump}");
+        assert!(dump.contains("local l3, l4 = l0(true, 0)"), "{dump}");
+    }
+
+    #[test]
     fn all_supported_lua_cases_reach_clean_hir_exit() {
         let mut failures = Vec::new();
 

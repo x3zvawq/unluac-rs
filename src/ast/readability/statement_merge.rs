@@ -17,6 +17,8 @@ fn rewrite_block(block: &mut AstBlock) -> bool {
         changed |= rewrite_nested(stmt);
     }
 
+    changed |= sink_hoisted_temp_decls(block);
+
     let old_stmts = std::mem::take(&mut block.stmts);
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut index = 0;
@@ -39,6 +41,54 @@ fn rewrite_block(block: &mut AstBlock) -> bool {
     }
 
     block.stmts = new_stmts;
+    changed
+}
+
+fn sink_hoisted_temp_decls(block: &mut AstBlock) -> bool {
+    let mut changed = false;
+    let mut index = 0;
+    while index < block.stmts.len() {
+        let Some(pending_bindings) = hoisted_temp_bindings(&block.stmts[index]) else {
+            index += 1;
+            continue;
+        };
+
+        let mut remaining = pending_bindings;
+        let mut sink_changed = false;
+        let mut lookahead = index + 1;
+        while lookahead < block.stmts.len() && !remaining.is_empty() {
+            if let Some(merged) = try_sink_hoisted_decl_into_stmt(&remaining, &block.stmts[lookahead])
+            {
+                let consumed = merged.bindings.len();
+                block.stmts[lookahead] = AstStmt::LocalDecl(Box::new(merged));
+                remaining.drain(..consumed);
+                sink_changed = true;
+                lookahead += 1;
+                continue;
+            }
+            if stmt_references_any_binding(&block.stmts[lookahead], &remaining) {
+                break;
+            }
+            lookahead += 1;
+        }
+
+        if !sink_changed {
+            index += 1;
+            continue;
+        }
+
+        changed = true;
+        if remaining.is_empty() {
+            block.stmts.remove(index);
+            continue;
+        }
+
+        let AstStmt::LocalDecl(local_decl) = &mut block.stmts[index] else {
+            unreachable!("hoisted temp decl scan must point at local decl");
+        };
+        local_decl.bindings = remaining;
+        index += 1;
+    }
     changed
 }
 
@@ -108,6 +158,282 @@ fn try_merge_local_decl_with_assign(current: &AstStmt, next: &AstStmt) -> Option
     Some(AstLocalDecl {
         bindings: local_decl.bindings.clone(),
         values: assign.values.clone(),
+    })
+}
+
+fn hoisted_temp_bindings(stmt: &AstStmt) -> Option<Vec<super::super::common::AstLocalBinding>> {
+    let AstStmt::LocalDecl(local_decl) = stmt else {
+        return None;
+    };
+    if !local_decl.values.is_empty() || local_decl.bindings.is_empty() {
+        return None;
+    }
+    if local_decl
+        .bindings
+        .iter()
+        .any(|binding| binding.attr != AstLocalAttr::None || !is_temp_like_binding(binding.id))
+    {
+        return None;
+    }
+    Some(local_decl.bindings.clone())
+}
+
+fn try_sink_hoisted_decl_into_stmt(
+    pending: &[super::super::common::AstLocalBinding],
+    stmt: &AstStmt,
+) -> Option<AstLocalDecl> {
+    let AstStmt::Assign(assign) = stmt else {
+        return None;
+    };
+    if assign.values.is_empty() || assign.targets.is_empty() || assign.targets.len() > pending.len() {
+        return None;
+    }
+    let candidate = &pending[..assign.targets.len()];
+    if !candidate
+        .iter()
+        .zip(assign.targets.iter())
+        .all(|(binding, target)| local_binding_matches_target(binding.id, target))
+    {
+        return None;
+    }
+    if stmt_references_any_binding_in_assign(assign, &pending[assign.targets.len()..]) {
+        return None;
+    }
+    Some(AstLocalDecl {
+        bindings: candidate.to_vec(),
+        values: assign.values.clone(),
+    })
+}
+
+fn is_temp_like_binding(binding: AstBindingRef) -> bool {
+    matches!(
+        binding,
+        AstBindingRef::Temp(_) | AstBindingRef::SyntheticLocal(_)
+    )
+}
+
+fn stmt_references_any_binding(stmt: &AstStmt, bindings: &[super::super::common::AstLocalBinding]) -> bool {
+    match stmt {
+        AstStmt::LocalDecl(local_decl) => {
+            local_decl
+                .bindings
+                .iter()
+                .any(|binding| bindings.iter().any(|pending| pending.id == binding.id))
+                || local_decl
+                    .values
+                    .iter()
+                    .any(|value| expr_references_any_binding(value, bindings))
+        }
+        AstStmt::GlobalDecl(global_decl) => global_decl
+            .values
+            .iter()
+            .any(|value| expr_references_any_binding(value, bindings)),
+        AstStmt::Assign(assign) => {
+            assign
+                .targets
+                .iter()
+                .any(|target| lvalue_references_any_binding(target, bindings))
+                || assign
+                    .values
+                    .iter()
+                    .any(|value| expr_references_any_binding(value, bindings))
+        }
+        AstStmt::CallStmt(call_stmt) => call_references_any_binding(&call_stmt.call, bindings),
+        AstStmt::Return(ret) => ret
+            .values
+            .iter()
+            .any(|value| expr_references_any_binding(value, bindings)),
+        AstStmt::If(if_stmt) => {
+            expr_references_any_binding(&if_stmt.cond, bindings)
+                || block_references_any_binding(&if_stmt.then_block, bindings)
+                || if_stmt
+                    .else_block
+                    .as_ref()
+                    .is_some_and(|block| block_references_any_binding(block, bindings))
+        }
+        AstStmt::While(while_stmt) => {
+            expr_references_any_binding(&while_stmt.cond, bindings)
+                || block_references_any_binding(&while_stmt.body, bindings)
+        }
+        AstStmt::Repeat(repeat_stmt) => {
+            block_references_any_binding(&repeat_stmt.body, bindings)
+                || expr_references_any_binding(&repeat_stmt.cond, bindings)
+        }
+        AstStmt::NumericFor(numeric_for) => {
+            bindings
+                .iter()
+                .any(|binding| binding.id == numeric_for.binding)
+                || expr_references_any_binding(&numeric_for.start, bindings)
+                || expr_references_any_binding(&numeric_for.limit, bindings)
+                || expr_references_any_binding(&numeric_for.step, bindings)
+                || block_references_any_binding(&numeric_for.body, bindings)
+        }
+        AstStmt::GenericFor(generic_for) => {
+            generic_for
+                .bindings
+                .iter()
+                .any(|binding| bindings.iter().any(|pending| pending.id == *binding))
+                || generic_for
+                    .iterator
+                    .iter()
+                    .any(|expr| expr_references_any_binding(expr, bindings))
+                || block_references_any_binding(&generic_for.body, bindings)
+        }
+        AstStmt::DoBlock(block) => block_references_any_binding(block, bindings),
+        AstStmt::FunctionDecl(function_decl) => {
+            function_name_references_any_binding(&function_decl.target, bindings)
+                || block_references_any_binding(&function_decl.func.body, bindings)
+        }
+        AstStmt::LocalFunctionDecl(function_decl) => {
+            bindings.iter().any(|binding| binding.id == function_decl.name)
+                || block_references_any_binding(&function_decl.func.body, bindings)
+        }
+        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => false,
+    }
+}
+
+fn stmt_references_any_binding_in_assign(
+    assign: &super::super::common::AstAssign,
+    bindings: &[super::super::common::AstLocalBinding],
+) -> bool {
+    assign
+        .values
+        .iter()
+        .any(|value| expr_references_any_binding(value, bindings))
+}
+
+fn block_references_any_binding(
+    block: &AstBlock,
+    bindings: &[super::super::common::AstLocalBinding],
+) -> bool {
+    block.stmts
+        .iter()
+        .any(|stmt| stmt_references_any_binding(stmt, bindings))
+}
+
+fn call_references_any_binding(
+    call: &super::super::common::AstCallKind,
+    bindings: &[super::super::common::AstLocalBinding],
+) -> bool {
+    match call {
+        super::super::common::AstCallKind::Call(call) => {
+            expr_references_any_binding(&call.callee, bindings)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_references_any_binding(arg, bindings))
+        }
+        super::super::common::AstCallKind::MethodCall(call) => {
+            expr_references_any_binding(&call.receiver, bindings)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_references_any_binding(arg, bindings))
+        }
+    }
+}
+
+fn function_name_references_any_binding(
+    target: &super::super::common::AstFunctionName,
+    bindings: &[super::super::common::AstLocalBinding],
+) -> bool {
+    let path = match target {
+        super::super::common::AstFunctionName::Plain(path) => path,
+        super::super::common::AstFunctionName::Method(path, _) => path,
+    };
+    name_ref_matches_any_binding(&path.root, bindings)
+}
+
+fn lvalue_references_any_binding(
+    target: &AstLValue,
+    bindings: &[super::super::common::AstLocalBinding],
+) -> bool {
+    match target {
+        AstLValue::Name(name) => name_ref_matches_any_binding(name, bindings),
+        AstLValue::FieldAccess(access) => expr_references_any_binding(&access.base, bindings),
+        AstLValue::IndexAccess(access) => {
+            expr_references_any_binding(&access.base, bindings)
+                || expr_references_any_binding(&access.index, bindings)
+        }
+    }
+}
+
+fn expr_references_any_binding(
+    expr: &super::super::common::AstExpr,
+    bindings: &[super::super::common::AstLocalBinding],
+) -> bool {
+    match expr {
+        super::super::common::AstExpr::Var(name) => name_ref_matches_any_binding(name, bindings),
+        super::super::common::AstExpr::FieldAccess(access) => {
+            expr_references_any_binding(&access.base, bindings)
+        }
+        super::super::common::AstExpr::IndexAccess(access) => {
+            expr_references_any_binding(&access.base, bindings)
+                || expr_references_any_binding(&access.index, bindings)
+        }
+        super::super::common::AstExpr::Unary(unary) => {
+            expr_references_any_binding(&unary.expr, bindings)
+        }
+        super::super::common::AstExpr::Binary(binary) => {
+            expr_references_any_binding(&binary.lhs, bindings)
+                || expr_references_any_binding(&binary.rhs, bindings)
+        }
+        super::super::common::AstExpr::LogicalAnd(logical)
+        | super::super::common::AstExpr::LogicalOr(logical) => {
+            expr_references_any_binding(&logical.lhs, bindings)
+                || expr_references_any_binding(&logical.rhs, bindings)
+        }
+        super::super::common::AstExpr::Call(call) => {
+            expr_references_any_binding(&call.callee, bindings)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_references_any_binding(arg, bindings))
+        }
+        super::super::common::AstExpr::MethodCall(call) => {
+            expr_references_any_binding(&call.receiver, bindings)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_references_any_binding(arg, bindings))
+        }
+        super::super::common::AstExpr::TableConstructor(table) => table.fields.iter().any(|field| match field {
+            super::super::common::AstTableField::Array(value) => {
+                expr_references_any_binding(value, bindings)
+            }
+            super::super::common::AstTableField::Record(record) => {
+                let key_references_binding = match &record.key {
+                    super::super::common::AstTableKey::Name(_) => false,
+                    super::super::common::AstTableKey::Expr(expr) => {
+                        expr_references_any_binding(expr, bindings)
+                    }
+                };
+                key_references_binding || expr_references_any_binding(&record.value, bindings)
+            }
+        }),
+        super::super::common::AstExpr::FunctionExpr(function) => {
+            block_references_any_binding(&function.body, bindings)
+        }
+        super::super::common::AstExpr::Nil
+        | super::super::common::AstExpr::Boolean(_)
+        | super::super::common::AstExpr::Integer(_)
+        | super::super::common::AstExpr::Number(_)
+        | super::super::common::AstExpr::String(_)
+        | super::super::common::AstExpr::VarArg => false,
+    }
+}
+
+fn name_ref_matches_any_binding(
+    name: &AstNameRef,
+    bindings: &[super::super::common::AstLocalBinding],
+) -> bool {
+    bindings.iter().any(|binding| match (binding.id, name) {
+        (AstBindingRef::Local(local), AstNameRef::Local(target)) => local == *target,
+        (AstBindingRef::SyntheticLocal(local), AstNameRef::SyntheticLocal(target)) => {
+            local == *target
+        }
+        (AstBindingRef::Temp(temp), AstNameRef::Temp(target)) => temp == *target,
+        _ => false,
     })
 }
 
