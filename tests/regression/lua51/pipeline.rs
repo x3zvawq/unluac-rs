@@ -809,6 +809,160 @@ mod decompile_pipeline {
             generated.source
         );
     }
+
+    #[test]
+    fn closure_counter_hir_recovers_short_circuit_update_without_dead_materialization_shell() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/functions/02_closure_counter.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("closure_counter hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("assign u0 = (u0 + (p0 or 1))"), "{dump}");
+        assert!(!dump.contains("if p0"), "{dump}");
+        assert!(!dump.contains("assign t1 = p0"), "{dump}");
+        assert!(!dump.contains("assign t2 = 1"), "{dump}");
+        assert!(!dump.contains("local [\"l0\"] = u0"), "{dump}");
+    }
+
+    #[test]
+    fn closure_counter_generate_restores_compact_closure_counter_shape() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/functions/02_closure_counter.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("closure_counter generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated.source.contains("value = value + (b or 1)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("print(\"closure\", result(), result(2), result())"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("if b then"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local value3, value4"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local value = value2"),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
+    fn closure_counter_impure_step_hir_keeps_impure_short_circuit_expr_without_if_fallback() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/functions/07_closure_counter_impure_step.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("closure_counter_impure_step hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("assign u0 = (l0 + (l3 or 1))"), "{dump}");
+        assert!(
+            dump.contains("call(method) l2(l1) multiret=false"),
+            "{dump}"
+        );
+        assert!(!dump.contains("if l3"), "{dump}");
+        assert!(!dump.contains("if p0"), "{dump}");
+    }
+
+    #[test]
+    fn closure_counter_impure_step_generate_keeps_impure_or_shape_without_if_fallback() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/functions/07_closure_counter_impure_step.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("closure_counter_impure_step generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated.source.contains("value = value2 + (result or 1)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("print(\"closure-impure\", result(), result(), result(), result())"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("if result then"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("if value3.next"),
+            "{}",
+            generated.source
+        );
+        assert!(!generated.source.contains("value4"), "{}", generated.source);
+    }
 }
 
 fn compile_lua_case(dialect_label: &str, source_relative: &str) -> Vec<u8> {

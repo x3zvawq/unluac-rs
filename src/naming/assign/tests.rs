@@ -3,10 +3,14 @@
 //! 我们把测试和实现分开存放，避免主实现文件被大段 `#[cfg(test)]` 代码淹没。
 
 use crate::ast::{
-    AstBindingRef, AstBlock, AstExpr, AstFieldAccess, AstIndexAccess, AstLocalAttr,
-    AstLocalBinding, AstLocalDecl, AstModule, AstReturn, AstStmt, AstSyntheticLocalId,
+    AstBindingRef, AstBlock, AstExpr, AstFieldAccess, AstFunctionExpr, AstIndexAccess,
+    AstLocalAttr, AstLocalBinding, AstLocalDecl, AstModule, AstReturn, AstStmt,
+    AstSyntheticLocalId,
 };
-use crate::hir::{HirBlock, HirModule, HirProto, HirProtoRef, LocalId, ParamId, TempId};
+use crate::hir::{
+    HirBlock, HirCapture, HirClosureExpr, HirExpr, HirLocalDecl, HirModule, HirProto, HirProtoRef,
+    HirReturn, HirStmt, LocalId, ParamId, TempId, UpvalueId,
+};
 use crate::naming::{NameSource, NamingMode, NamingOptions, assign_names};
 use crate::parser::{
     ChunkHeader, Dialect, DialectConstPoolExtra, DialectDebugExtra, DialectHeaderExtra,
@@ -234,4 +238,130 @@ fn debug_like_mode_uses_function_qualified_binding_ids() {
             .text,
         "r0_1"
     );
+}
+
+#[test]
+fn capture_provenance_upvalue_keeps_parent_name_when_child_local_conflicts() {
+    let mut raw = empty_raw_chunk();
+    raw.main.common.children.push(raw.main.clone());
+
+    let parent = HirProto {
+        id: HirProtoRef(0),
+        source: None,
+        line_range: ProtoLineRange {
+            defined_start: 0,
+            defined_end: 0,
+        },
+        signature: ProtoSignature {
+            num_params: 0,
+            is_vararg: false,
+            has_vararg_param_reg: false,
+            named_vararg_table: false,
+        },
+        params: Vec::new(),
+        locals: vec![LocalId(0)],
+        upvalues: Vec::new(),
+        temps: Vec::new(),
+        temp_debug_locals: Vec::new(),
+        body: HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![LocalId(0)],
+                    values: vec![HirExpr::Nil],
+                })),
+                HirStmt::Return(Box::new(HirReturn {
+                    values: vec![HirExpr::Closure(Box::new(HirClosureExpr {
+                        proto: HirProtoRef(1),
+                        captures: vec![HirCapture {
+                            value: HirExpr::LocalRef(LocalId(0)),
+                        }],
+                    }))],
+                })),
+            ],
+        },
+        children: vec![HirProtoRef(1)],
+    };
+    let child = HirProto {
+        id: HirProtoRef(1),
+        source: None,
+        line_range: ProtoLineRange {
+            defined_start: 0,
+            defined_end: 0,
+        },
+        signature: ProtoSignature {
+            num_params: 0,
+            is_vararg: false,
+            has_vararg_param_reg: false,
+            named_vararg_table: false,
+        },
+        params: Vec::new(),
+        locals: vec![LocalId(0)],
+        upvalues: vec![UpvalueId(0)],
+        temps: Vec::new(),
+        temp_debug_locals: Vec::new(),
+        body: HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![LocalId(0)],
+                    values: vec![HirExpr::UpvalueRef(UpvalueId(0))],
+                })),
+                HirStmt::Return(Box::new(HirReturn {
+                    values: vec![HirExpr::LocalRef(LocalId(0))],
+                })),
+            ],
+        },
+        children: Vec::new(),
+    };
+    let hir = HirModule {
+        entry: HirProtoRef(0),
+        protos: vec![parent, child],
+    };
+    let ast = AstModule {
+        entry_function: HirProtoRef(0),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Local(LocalId(0)),
+                        attr: AstLocalAttr::None,
+                    }],
+                    values: vec![AstExpr::Nil],
+                })),
+                AstStmt::Return(Box::new(AstReturn {
+                    values: vec![AstExpr::FunctionExpr(Box::new(AstFunctionExpr {
+                        function: HirProtoRef(1),
+                        params: Vec::new(),
+                        is_vararg: false,
+                        body: AstBlock {
+                            stmts: vec![
+                                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                                    bindings: vec![AstLocalBinding {
+                                        id: AstBindingRef::Local(LocalId(0)),
+                                        attr: AstLocalAttr::None,
+                                    }],
+                                    values: vec![AstExpr::Var(crate::ast::AstNameRef::Upvalue(
+                                        UpvalueId(0),
+                                    ))],
+                                })),
+                                AstStmt::Return(Box::new(AstReturn {
+                                    values: vec![AstExpr::Var(crate::ast::AstNameRef::Local(
+                                        LocalId(0),
+                                    ))],
+                                })),
+                            ],
+                        },
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    let names =
+        assign_names(&ast, &hir, &raw, NamingOptions::default()).expect("naming should succeed");
+
+    let parent_names = names.function(HirProtoRef(0)).expect("parent names");
+    let child_names = names.function(HirProtoRef(1)).expect("child names");
+    assert_eq!(parent_names.locals[0].text, "value");
+    assert_eq!(child_names.upvalues[0].text, "value");
+    assert_ne!(child_names.locals[0].text, "value");
 }

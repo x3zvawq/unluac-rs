@@ -1,9 +1,9 @@
-//! 这个文件负责清理已经失去职责的布尔物化分支壳。
+//! 这个文件负责清理已经失去职责的值物化分支壳。
 //!
-//! 当 HIR 前面已经把 merge 值恢复成直接的布尔表达式时，原先那种
-//! `if cond then t=true else f=false end` 的结构壳就只剩下机械噪音了。
-//! 这里专门删除这一类“纯布尔物化、无副作用、目标 temp 已经没人再读”的壳，
-//! 避免把普通 if/else 结构误删掉。
+//! 当 HIR 前面已经把 merge 值恢复成直接的值表达式时，原先那种
+//! `if cond then t=value else f=fallback end` 的结构壳就只剩下机械噪音了。
+//! 这里专门删除这一类“纯值物化、无副作用、目标 temp 已经没人再读”的壳，
+//! 避免把真正承担控制语义的 `if/else` 结构误删掉。
 
 use std::collections::BTreeMap;
 
@@ -12,22 +12,22 @@ use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirProto, HirStmt, HirTab
 pub(super) fn remove_boolean_materialization_shells_in_proto(proto: &mut HirProto) -> bool {
     let mut use_counts = BTreeMap::new();
     collect_block_temp_uses(&proto.body, &mut use_counts);
-    remove_boolean_materialization_shells_in_block(&mut proto.body, &use_counts)
+    remove_dead_materialization_shells_in_block(&mut proto.body, &use_counts)
 }
 
-fn remove_boolean_materialization_shells_in_block(
+fn remove_dead_materialization_shells_in_block(
     block: &mut HirBlock,
     use_counts: &BTreeMap<TempId, usize>,
 ) -> bool {
     let mut changed = false;
 
     for stmt in &mut block.stmts {
-        changed |= remove_boolean_materialization_shells_in_nested(stmt, use_counts);
+        changed |= remove_dead_materialization_shells_in_nested(stmt, use_counts);
     }
 
     let mut index = 0;
     while index < block.stmts.len() {
-        if removable_boolean_materialization_shell(&block.stmts[index], use_counts) {
+        if removable_dead_materialization_shell(&block.stmts[index], use_counts) {
             block.stmts.remove(index);
             changed = true;
             continue;
@@ -38,34 +38,34 @@ fn remove_boolean_materialization_shells_in_block(
     changed
 }
 
-fn remove_boolean_materialization_shells_in_nested(
+fn remove_dead_materialization_shells_in_nested(
     stmt: &mut HirStmt,
     use_counts: &BTreeMap<TempId, usize>,
 ) -> bool {
     match stmt {
         HirStmt::If(if_stmt) => {
             let mut changed =
-                remove_boolean_materialization_shells_in_block(&mut if_stmt.then_block, use_counts);
+                remove_dead_materialization_shells_in_block(&mut if_stmt.then_block, use_counts);
             if let Some(else_block) = &mut if_stmt.else_block {
-                changed |= remove_boolean_materialization_shells_in_block(else_block, use_counts);
+                changed |= remove_dead_materialization_shells_in_block(else_block, use_counts);
             }
             changed
         }
         HirStmt::While(while_stmt) => {
-            remove_boolean_materialization_shells_in_block(&mut while_stmt.body, use_counts)
+            remove_dead_materialization_shells_in_block(&mut while_stmt.body, use_counts)
         }
         HirStmt::Repeat(repeat_stmt) => {
-            remove_boolean_materialization_shells_in_block(&mut repeat_stmt.body, use_counts)
+            remove_dead_materialization_shells_in_block(&mut repeat_stmt.body, use_counts)
         }
         HirStmt::NumericFor(numeric_for) => {
-            remove_boolean_materialization_shells_in_block(&mut numeric_for.body, use_counts)
+            remove_dead_materialization_shells_in_block(&mut numeric_for.body, use_counts)
         }
         HirStmt::GenericFor(generic_for) => {
-            remove_boolean_materialization_shells_in_block(&mut generic_for.body, use_counts)
+            remove_dead_materialization_shells_in_block(&mut generic_for.body, use_counts)
         }
-        HirStmt::Block(block) => remove_boolean_materialization_shells_in_block(block, use_counts),
+        HirStmt::Block(block) => remove_dead_materialization_shells_in_block(block, use_counts),
         HirStmt::Unstructured(unstructured) => {
-            remove_boolean_materialization_shells_in_block(&mut unstructured.body, use_counts)
+            remove_dead_materialization_shells_in_block(&mut unstructured.body, use_counts)
         }
         HirStmt::LocalDecl(_)
         | HirStmt::Assign(_)
@@ -82,7 +82,7 @@ fn remove_boolean_materialization_shells_in_nested(
     }
 }
 
-fn removable_boolean_materialization_shell(
+fn removable_dead_materialization_shell(
     stmt: &HirStmt,
     use_counts: &BTreeMap<TempId, usize>,
 ) -> bool {
@@ -96,10 +96,10 @@ fn removable_boolean_materialization_shell(
         return false;
     }
 
-    let Some((then_temp, then_value)) = bool_assign_pattern(&if_stmt.then_block) else {
+    let Some((then_temp, then_value)) = pure_assign_pattern(&if_stmt.then_block) else {
         return false;
     };
-    let Some((else_temp, else_value)) = bool_assign_pattern(else_block) else {
+    let Some((else_temp, else_value)) = pure_assign_pattern(else_block) else {
         return false;
     };
 
@@ -109,21 +109,21 @@ fn removable_boolean_materialization_shell(
         return false;
     }
 
-    matches!((then_value, else_value), (true, false) | (false, true))
+    expr_is_side_effect_free(then_value) && expr_is_side_effect_free(else_value)
 }
 
-fn bool_assign_pattern(block: &HirBlock) -> Option<(TempId, bool)> {
+fn pure_assign_pattern(block: &HirBlock) -> Option<(TempId, &HirExpr)> {
     let [HirStmt::Assign(assign)] = block.stmts.as_slice() else {
         return None;
     };
     let [HirLValue::Temp(temp)] = assign.targets.as_slice() else {
         return None;
     };
-    let [HirExpr::Boolean(value)] = assign.values.as_slice() else {
+    let [value] = assign.values.as_slice() else {
         return None;
     };
 
-    Some((*temp, *value))
+    Some((*temp, value))
 }
 
 fn collect_block_temp_uses(block: &HirBlock, use_counts: &mut BTreeMap<TempId, usize>) {

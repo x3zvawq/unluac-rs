@@ -181,6 +181,10 @@ pub(crate) const ALL_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/lua_cases/common/functions/06_closure_pipeline.lua",
         ALL_DIALECTS,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/lua_cases/common/functions/07_closure_counter_impure_step.lua",
+        ALL_DIALECTS,
+    ),
     LuaCaseMatrixEntry::new("tests/lua_cases/common/runtime/01_pcall.lua", ALL_DIALECTS),
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/common/runtime/02_coroutine.lua",

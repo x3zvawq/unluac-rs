@@ -55,6 +55,33 @@ fn removes_dead_boolean_materialization_shell() {
     ));
 }
 
+#[test]
+fn removes_dead_pure_value_materialization_shell() {
+    let mut proto = dummy_proto(HirBlock {
+        stmts: vec![
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::ParamRef(crate::hir::common::ParamId(0)),
+                then_block: HirBlock {
+                    stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(TempId(0))],
+                        values: vec![HirExpr::ParamRef(crate::hir::common::ParamId(0))],
+                    }))],
+                },
+                else_block: Some(HirBlock {
+                    stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(TempId(1))],
+                        values: vec![HirExpr::Integer(1)],
+                    }))],
+                }),
+            })),
+            HirStmt::Return(Box::new(crate::hir::common::HirReturn { values: vec![] })),
+        ],
+    });
+
+    assert!(remove_boolean_materialization_shells_in_proto(&mut proto));
+    assert!(matches!(proto.body.stmts.as_slice(), [HirStmt::Return(_)]));
+}
+
 fn dummy_proto(body: HirBlock) -> crate::hir::common::HirProto {
     crate::hir::common::HirProto {
         id: HirProtoRef(0),

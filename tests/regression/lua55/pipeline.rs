@@ -405,4 +405,44 @@ mod decompile_pipeline {
         assert!(dump.contains("===== Dump Generate ====="), "{dump}");
         assert!(dump.contains("function step(a)"), "{dump}");
     }
+
+    #[test]
+    fn lua55_generate_stage_keeps_self_field_for_impure_closure_counter() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.5",
+            "tests/lua_cases/common/functions/07_closure_counter_impure_step.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua55,
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.5 generate stage should succeed for impure closure counter fixture");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should leave generated source in state");
+        assert!(
+            generated
+                .source
+                .contains("local result = value3.next(value3)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local item = value3[value2]"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("value = value2 + (result or 1)"),
+            "{}",
+            generated.source
+        );
+    }
 }

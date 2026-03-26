@@ -76,6 +76,24 @@ pub(super) fn assign_names_for_function(
 ) -> Result<FunctionNameMap, NamingError> {
     let mut used = lua_keywords();
     let outer_visible_names = resolve_outer_visible_names(proto.id, lexical, assigned_functions)?;
+    let upvalue_candidates = proto
+        .upvalues
+        .iter()
+        .enumerate()
+        .map(|(index, _upvalue)| {
+            choose_upvalue_candidate(proto, index, evidence, options, assigned_functions)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // capture provenance 给出的 upvalue 名字，本质上就是父词法作用域里已经稳定存在的
+    // 同一个绑定名。这里必须优先保留它们，再让当前函数里的 params/locals 绕开；
+    // 如果反过来先给 locals 分配，再把 upvalue 重命名成 `value4` 之类，生成源码会把
+    // 自由变量改成一个父作用域里根本不存在的名字，直接破坏运行语义。
+    for candidate in &upvalue_candidates {
+        if candidate.source == NameSource::CaptureProvenance {
+            used.insert(candidate.text.clone());
+        }
+    }
 
     let params = proto
         .params
@@ -113,13 +131,18 @@ pub(super) fn assign_names_for_function(
         .collect::<Vec<_>>();
 
     let mut upvalues = Vec::with_capacity(proto.upvalues.len());
-    for (index, _upvalue) in proto.upvalues.iter().enumerate() {
-        let candidate =
-            choose_upvalue_candidate(proto, index, evidence, options, assigned_functions)?;
-        upvalues.push(allocate_name(
-            module_names.reserve_function_shape_name(candidate, &used, options.mode),
-            &mut used,
-        ));
+    for candidate in upvalue_candidates {
+        let candidate = module_names.reserve_function_shape_name(candidate, &used, options.mode);
+        if candidate.source == NameSource::CaptureProvenance {
+            upvalues.push(NameInfo {
+                text: candidate.text,
+                source: candidate.source,
+                renamed: false,
+            });
+            continue;
+        }
+
+        upvalues.push(allocate_name(candidate, &mut used));
     }
 
     let synthetic_locals = hints

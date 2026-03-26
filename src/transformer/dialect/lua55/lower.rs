@@ -475,7 +475,7 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 1;
                 }
                 Lua55Opcode::Self_ => {
-                    let (a, b, c, k) = expect_abck(raw_pc, opcode, operands)?;
+                    let (a, b, c, _k) = expect_abck(raw_pc, opcode, operands)?;
                     let callee = reg_from_u8(a);
                     let self_arg = Reg(callee.index() + 1);
                     self.invalidate_written_reg(callee);
@@ -494,7 +494,13 @@ impl<'a> ProtoLowerer<'a> {
                         PendingLowInstr::Ready(LowInstr::GetTable(GetTableInstr {
                             dst: callee,
                             base: AccessBase::Reg(reg_from_u8(b)),
-                            key: self.access_key(raw_pc, c, k)?,
+                            // Lua 5.5 的 `SELF` 沿用了 ABCk 外壳，但字段名仍然总是来自
+                            // 常量表；`luac -l` 也会直接把第三操作数解读成常量索引，
+                            // 不再像 5.4 那样依赖显式 `k` 标记。
+                            // 这里如果继续复用通用 `access_key(c, k)`，像 `obj:next()`
+                            // 这样的调用就会被误降成 `obj[rX]()`，后面整个 method/
+                            // field 恢复都会跑偏。
+                            key: AccessKey::Const(self.const_ref(raw_pc, c as usize)?),
                         })),
                     );
                     self.set_pending_method(callee, self_arg);
@@ -1342,14 +1348,6 @@ impl<'a> ProtoLowerer<'a> {
             ))
         } else {
             Ok(ValueOperand::Reg(reg_from_u8(operand)))
-        }
-    }
-
-    fn access_key(&self, raw_pc: u32, operand: u8, k: bool) -> Result<AccessKey, TransformError> {
-        if k {
-            Ok(AccessKey::Const(self.const_ref(raw_pc, operand as usize)?))
-        } else {
-            Ok(AccessKey::Reg(reg_from_u8(operand)))
         }
     }
 
