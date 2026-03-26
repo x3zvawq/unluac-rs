@@ -963,6 +963,83 @@ mod decompile_pipeline {
         );
         assert!(!generated.source.contains("value4"), "{}", generated.source);
     }
+
+    #[test]
+    fn recursive_local_function_hir_recovers_self_capture_as_local_binding() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/functions/05_recursive_local_function.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("recursive_local_function hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(
+            dump.contains("local [\"l0\"] = closure(proto#2 captures=l0)"),
+            "{dump}"
+        );
+        assert!(!dump.contains("captures=t0"), "{dump}");
+        assert!(
+            dump.contains("return call(normal) l0(p0, 1) multiret=true"),
+            "{dump}"
+        );
+    }
+
+    #[test]
+    fn recursive_local_function_generate_keeps_recursive_call_on_local_name() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/functions/05_recursive_local_function.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                naming: NamingOptions {
+                    mode: NamingMode::DebugLike,
+                    debug_like_include_function: true,
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("recursive_local_function generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated.source.contains("local function r1_0("),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("return r1_0(p2_0 - 1, p2_1 * p2_0)"),
+            "{}",
+            generated.source
+        );
+        assert!(!generated.source.contains("u2_0("), "{}", generated.source);
+        assert!(
+            !generated.source.contains("local r1_0"),
+            "{}",
+            generated.source
+        );
+    }
 }
 
 fn compile_lua_case(dialect_label: &str, source_relative: &str) -> Vec<u8> {

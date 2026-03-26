@@ -6,6 +6,7 @@
 //! 是细节实现”的混淆。
 
 mod boolean_shells;
+mod closure_self_capture;
 pub(super) mod decision;
 mod locals;
 mod logical_simplify;
@@ -51,6 +52,12 @@ pub(super) fn simplify_hir_with_timing(
                 apply_proto_pass(
                     module,
                     table_constructors::stabilize_table_constructors_in_proto,
+                )
+            });
+            changed |= timings.record("closure-self-capture", || {
+                apply_proto_pass(
+                    module,
+                    closure_self_capture::resolve_recursive_closure_self_captures_in_proto,
                 )
             });
             changed |= timings.record("temp-inline", || {
