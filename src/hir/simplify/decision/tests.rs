@@ -1,3 +1,7 @@
+//! 这个文件承载 `decision` 模块的局部不变量测试。
+//!
+//! 我们把测试和实现分开存放，避免主实现文件被大段 `#[cfg(test)]` 代码淹没。
+
 use super::*;
 use crate::hir::common::{
     HirIf, HirLogicalExpr, HirModule, HirProto, HirProtoRef, HirReturn, HirUnaryExpr,

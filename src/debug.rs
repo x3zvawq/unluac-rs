@@ -792,3 +792,6 @@ fn is_opcode_token(token: &str) -> bool {
                 | "getvarg"
         )
 }
+
+#[cfg(test)]
+mod tests;
