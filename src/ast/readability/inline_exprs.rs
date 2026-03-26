@@ -121,11 +121,19 @@ fn collapse_adjacent_call_alias_runs(block: &mut AstBlock, options: ReadabilityO
             {
                 continue;
             }
-            if count_binding_uses_in_stmts(
-                &old_stmts[(candidate_index + 1)..run_end],
-                candidate.binding(),
-            ) != 0
-            {
+            let intermediate_uses = if is_lookup_inline_expr(value) {
+                count_binding_uses_in_remaining_run(
+                    &old_stmts[(candidate_index + 1)..run_end],
+                    &removed[(candidate_index + 1 - index)..],
+                    candidate.binding(),
+                )
+            } else {
+                count_binding_uses_in_stmts(
+                    &old_stmts[(candidate_index + 1)..run_end],
+                    candidate.binding(),
+                )
+            };
+            if intermediate_uses != 0 {
                 continue;
             }
 
@@ -580,14 +588,17 @@ fn rewrite_call_use_sites(
                 options,
                 policy,
             );
-            changed |= rewrite_expr_list_context(
-                &mut call.args,
-                candidate,
-                replacement,
-                InlineSite::CallArg,
-                options,
-                policy,
-            );
+            let args_len = call.args.len();
+            for (index, arg) in call.args.iter_mut().enumerate() {
+                changed |= rewrite_expr_use_sites(
+                    arg,
+                    candidate,
+                    replacement,
+                    call_arg_site(index, args_len),
+                    options,
+                    policy,
+                );
+            }
             changed
         }
         AstCallKind::MethodCall(call) => {
@@ -599,14 +610,17 @@ fn rewrite_call_use_sites(
                 options,
                 policy,
             );
-            changed |= rewrite_expr_list_context(
-                &mut call.args,
-                candidate,
-                replacement,
-                InlineSite::CallArg,
-                options,
-                policy,
-            );
+            let args_len = call.args.len();
+            for (index, arg) in call.args.iter_mut().enumerate() {
+                changed |= rewrite_expr_use_sites(
+                    arg,
+                    candidate,
+                    replacement,
+                    call_arg_site(index, args_len),
+                    options,
+                    policy,
+                );
+            }
             changed
         }
     }
@@ -708,14 +722,17 @@ fn rewrite_expr_use_sites(
                 options,
                 policy,
             );
-            changed |= rewrite_expr_list_context(
-                &mut call.args,
-                candidate,
-                replacement,
-                InlineSite::CallArg,
-                options,
-                policy,
-            );
+            let args_len = call.args.len();
+            for (index, arg) in call.args.iter_mut().enumerate() {
+                changed |= rewrite_expr_use_sites(
+                    arg,
+                    candidate,
+                    replacement,
+                    call_arg_site(index, args_len),
+                    options,
+                    policy,
+                );
+            }
             changed
         }
         AstExpr::MethodCall(call) => {
@@ -727,14 +744,17 @@ fn rewrite_expr_use_sites(
                 options,
                 policy,
             );
-            changed |= rewrite_expr_list_context(
-                &mut call.args,
-                candidate,
-                replacement,
-                InlineSite::CallArg,
-                options,
-                policy,
-            );
+            let args_len = call.args.len();
+            for (index, arg) in call.args.iter_mut().enumerate() {
+                changed |= rewrite_expr_use_sites(
+                    arg,
+                    candidate,
+                    replacement,
+                    call_arg_site(index, args_len),
+                    options,
+                    policy,
+                );
+            }
             changed
         }
         AstExpr::TableConstructor(table) => {
@@ -790,6 +810,19 @@ fn count_binding_uses_in_stmts(stmts: &[AstStmt], binding: AstBindingRef) -> usi
     stmts
         .iter()
         .map(|stmt| count_binding_uses_in_stmt(stmt, binding))
+        .sum()
+}
+
+fn count_binding_uses_in_remaining_run(
+    stmts: &[AstStmt],
+    removed: &[bool],
+    binding: AstBindingRef,
+) -> usize {
+    stmts
+        .iter()
+        .zip(removed.iter())
+        .filter(|(_, removed)| !**removed)
+        .map(|(stmt, _)| count_binding_uses_in_stmt(stmt, binding))
         .sum()
 }
 
@@ -989,6 +1022,29 @@ fn is_access_base_inline_expr(expr: &AstExpr) -> bool {
     is_atomic_access_base_expr(expr) || is_named_field_chain_expr(expr)
 }
 
+fn is_lookup_inline_expr(expr: &AstExpr) -> bool {
+    match expr {
+        AstExpr::FieldAccess(access) => {
+            is_atomic_access_base_expr(&access.base) || is_lookup_inline_expr(&access.base)
+        }
+        AstExpr::IndexAccess(access) => {
+            (is_atomic_access_base_expr(&access.base) || is_lookup_inline_expr(&access.base))
+                && is_context_safe_expr(&access.index)
+        }
+        _ => false,
+    }
+}
+
+fn is_call_callee_inline_expr(expr: &AstExpr) -> bool {
+    is_access_base_inline_expr(expr)
+        || is_lookup_inline_expr(expr)
+        || is_recallable_inline_expr(expr)
+}
+
+fn is_extended_neutral_local_alias_expr(expr: &AstExpr) -> bool {
+    is_context_safe_expr(expr) || is_lookup_inline_expr(expr)
+}
+
 fn is_named_field_chain_expr(expr: &AstExpr) -> bool {
     let AstExpr::FieldAccess(access) = expr else {
         return false;
@@ -1082,7 +1138,8 @@ enum InlineSite {
     Neutral,
     ReturnValue,
     Index,
-    CallArg,
+    CallArgNonFinal,
+    CallArgFinal,
     CallCallee,
     AccessBase,
 }
@@ -1139,11 +1196,12 @@ impl InlineSite {
                 InlinePolicy::AliasInitializerChain => {
                     Some(options.access_base_inline_max_complexity)
                 }
-                InlinePolicy::Conservative | InlinePolicy::ExtendedCallChain => None,
+                InlinePolicy::Conservative => None,
+                InlinePolicy::ExtendedCallChain => Some(options.access_base_inline_max_complexity),
             },
             Self::ReturnValue => Some(options.return_inline_max_complexity),
             Self::Index => Some(options.index_inline_max_complexity),
-            Self::CallArg => Some(options.args_inline_max_complexity),
+            Self::CallArgNonFinal | Self::CallArgFinal => Some(options.args_inline_max_complexity),
             // 这里刻意复用 access-base 的阈值：
             // `table.concat(tbl)` 这类“把别名还原回前缀表达式”的可读性取舍，
             // 本质上和 `obj[key]` 里的 base 折叠是同一种源码形状决策。
@@ -1157,7 +1215,8 @@ impl InlineSite {
             Self::Neutral => Self::AccessBase,
             Self::ReturnValue
             | Self::Index
-            | Self::CallArg
+            | Self::CallArgNonFinal
+            | Self::CallArgFinal
             | Self::CallCallee
             | Self::AccessBase => Self::Neutral,
         }
@@ -1165,12 +1224,14 @@ impl InlineSite {
 
     fn allows_extended_local_alias(self, replacement: &AstExpr) -> bool {
         match self {
-            Self::CallCallee => {
-                is_access_base_inline_expr(replacement) || is_recallable_inline_expr(replacement)
+            Self::Neutral => is_extended_neutral_local_alias_expr(replacement),
+            Self::CallCallee => is_call_callee_inline_expr(replacement),
+            Self::CallArgNonFinal => {
+                is_context_safe_expr(replacement) || is_recallable_inline_expr(replacement)
             }
-            Self::CallArg => is_context_safe_expr(replacement),
+            Self::CallArgFinal => is_context_safe_expr(replacement),
             Self::AccessBase => is_access_base_inline_expr(replacement),
-            Self::Neutral | Self::ReturnValue | Self::Index => false,
+            Self::ReturnValue | Self::Index => false,
         }
     }
 
@@ -1184,13 +1245,21 @@ impl InlineSite {
             Self::Neutral | Self::AccessBase | Self::CallCallee => {
                 is_access_base_inline_expr(replacement)
             }
-            Self::ReturnValue | Self::Index | Self::CallArg => false,
+            Self::ReturnValue | Self::Index | Self::CallArgNonFinal | Self::CallArgFinal => false,
         }
     }
 }
 
 fn is_recallable_inline_expr(expr: &AstExpr) -> bool {
     matches!(expr, AstExpr::Call(_) | AstExpr::MethodCall(_))
+}
+
+fn call_arg_site(index: usize, len: usize) -> InlineSite {
+    if index + 1 == len {
+        InlineSite::CallArgFinal
+    } else {
+        InlineSite::CallArgNonFinal
+    }
 }
 
 fn name_matches_binding(name: &AstNameRef, binding: AstBindingRef) -> bool {

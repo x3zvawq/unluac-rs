@@ -787,16 +787,29 @@ mod decompile_pipeline {
         assert!(generated.source.contains("until"), "{}", generated.source);
         assert!(generated.source.contains("break"), "{}", generated.source);
         assert!(
+            generated
+                .source
+                .contains("if ok2 > 10 and ok % 2 == 0 then"),
+            "{}",
+            generated.source
+        );
+        assert!(
             !generated.source.contains("continue"),
             "{}",
             generated.source
         );
         assert!(
-            generated.source.contains("print(\"repeat-closure\""),
+            generated.source.contains(
+                "print(\"repeat-closure\", result[1](), result[3](), result[6](), result[7] == nil)"
+            ),
             "{}",
             generated.source
         );
-        assert!(generated.source.contains("== nil"), "{}", generated.source);
+        assert!(
+            !generated.source.contains("local item = result[1]"),
+            "{}",
+            generated.source
+        );
     }
 
     #[test]

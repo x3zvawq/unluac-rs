@@ -201,3 +201,65 @@ fn wraps_lifted_tail_with_do_block_when_branch_declares_local() {
     assert_eq!(module.body.stmts.len(), 2);
     assert!(matches!(module.body.stmts[1], AstStmt::DoBlock(_)));
 }
+
+#[test]
+fn collapses_nested_guard_if_chain_into_single_short_circuit_condition() {
+    let lhs = ParamId(0);
+    let rhs = ParamId(1);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: AstBlock {
+            stmts: vec![AstStmt::If(Box::new(AstIf {
+                cond: AstExpr::Binary(Box::new(AstBinaryExpr {
+                    op: AstBinaryOpKind::Lt,
+                    lhs: AstExpr::Integer(10),
+                    rhs: AstExpr::Var(AstNameRef::Param(lhs)),
+                })),
+                then_block: AstBlock {
+                    stmts: vec![AstStmt::If(Box::new(AstIf {
+                        cond: AstExpr::Binary(Box::new(AstBinaryExpr {
+                            op: AstBinaryOpKind::Eq,
+                            lhs: AstExpr::Var(AstNameRef::Param(rhs)),
+                            rhs: AstExpr::Integer(0),
+                        })),
+                        then_block: AstBlock {
+                            stmts: vec![AstStmt::Break],
+                        },
+                        else_block: None,
+                    }))],
+                },
+                else_block: None,
+            }))],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(AstDialectVersion::Lua55),
+            options: Default::default(),
+        }
+    ));
+
+    assert_eq!(
+        module.body.stmts,
+        vec![AstStmt::If(Box::new(AstIf {
+            cond: AstExpr::LogicalAnd(Box::new(AstLogicalExpr {
+                lhs: AstExpr::Binary(Box::new(AstBinaryExpr {
+                    op: AstBinaryOpKind::Lt,
+                    lhs: AstExpr::Integer(10),
+                    rhs: AstExpr::Var(AstNameRef::Param(lhs)),
+                })),
+                rhs: AstExpr::Binary(Box::new(AstBinaryExpr {
+                    op: AstBinaryOpKind::Eq,
+                    lhs: AstExpr::Var(AstNameRef::Param(rhs)),
+                    rhs: AstExpr::Integer(0),
+                })),
+            })),
+            then_block: AstBlock {
+                stmts: vec![AstStmt::Break],
+            },
+            else_block: None,
+        }))]
+    );
+}
