@@ -55,6 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return_inline_max_complexity: 10,
                 index_inline_max_complexity: 10,
                 args_inline_max_complexity: 6,
+                access_base_inline_max_complexity: 5,
             },
         },
     )?;

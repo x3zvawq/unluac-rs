@@ -9,6 +9,7 @@ pub struct ReadabilityOptions {
     pub return_inline_max_complexity: usize,
     pub index_inline_max_complexity: usize,
     pub args_inline_max_complexity: usize,
+    pub access_base_inline_max_complexity: usize,
 }
 
 impl Default for ReadabilityOptions {
@@ -17,6 +18,7 @@ impl Default for ReadabilityOptions {
             return_inline_max_complexity: 10,
             index_inline_max_complexity: 10,
             args_inline_max_complexity: 6,
+            access_base_inline_max_complexity: 5,
         }
     }
 }

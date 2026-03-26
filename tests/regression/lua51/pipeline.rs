@@ -317,7 +317,7 @@ mod decompile_pipeline {
     }
 
     #[test]
-    fn ultimate_mess_hir_keeps_branch_and_item_accesses_as_intermediate_locals() {
+    fn ultimate_mess_hir_folds_single_access_segments_without_collapsing_the_whole_chain() {
         let result = decompile(
             &compile_lua_case(
                 "lua5.1",
@@ -325,6 +325,12 @@ mod decompile_pipeline {
             ),
             DecompileOptions {
                 target_stage: DecompileStage::Hir,
+                readability: ReadabilityOptions {
+                    return_inline_max_complexity: usize::MAX,
+                    index_inline_max_complexity: usize::MAX,
+                    args_inline_max_complexity: usize::MAX,
+                    access_base_inline_max_complexity: usize::MAX,
+                },
                 debug: DebugOptions {
                     enable: true,
                     output_stages: vec![DecompileStage::Hir],
@@ -337,20 +343,14 @@ mod decompile_pipeline {
         .expect("ultimate_mess hir stage should succeed");
 
         let dump = &result.debug_output[0].content;
-        assert!(
-            dump.contains("local [\"l1\"] = p0[\"branches\"]"),
-            "{dump}"
-        );
-        assert!(dump.contains("local [\"l2\"] = "), "{dump}");
-        assert!(dump.contains("local [\"l2\"] = l1["), "{dump}");
-        assert!(dump.contains("local [\"l3\"] = l2[\"items\"]"), "{dump}");
-        assert!(dump.contains("local [\"l4\"] = l3["), "{dump}");
+        assert!(dump.contains("local [\"l1\"] = p0[\"branches\"]["), "{dump}");
+        assert!(dump.contains("local [\"l2\"] = l1[\"items\"]["), "{dump}");
         assert!(dump.contains("return "), "{dump}");
-        assert!(dump.contains("l4[\"value\"]"), "{dump}");
+        assert!(dump.contains("l2[\"value\"]"), "{dump}");
     }
 
     #[test]
-    fn ultimate_mess_debug_locals_veto_overeager_inline_even_with_max_thresholds() {
+    fn ultimate_mess_debug_chunk_still_keeps_two_access_chain_locals() {
         let result = decompile(
             &crate::support::compile_lua_case_with_debug(
                 "lua5.1",
@@ -362,6 +362,7 @@ mod decompile_pipeline {
                     return_inline_max_complexity: usize::MAX,
                     index_inline_max_complexity: usize::MAX,
                     args_inline_max_complexity: usize::MAX,
+                    access_base_inline_max_complexity: usize::MAX,
                 },
                 debug: DebugOptions {
                     enable: true,
@@ -372,15 +373,13 @@ mod decompile_pipeline {
                 ..DecompileOptions::default()
             },
         )
-        .expect("ultimate_mess hir stage with debug locals should succeed");
+        .expect("ultimate_mess hir stage with debug chunk should succeed");
 
         let dump = &result.debug_output[0].content;
-        assert!(dump.contains("local [\"l1\"] = p0[\"branches\"]"), "{dump}");
-        assert!(dump.contains("local [\"l2\"] = l1["), "{dump}");
-        assert!(dump.contains("local [\"l3\"] = l2[\"items\"]"), "{dump}");
-        assert!(dump.contains("local [\"l4\"] = l3["), "{dump}");
+        assert!(dump.contains("local [\"l1\"] = p0[\"branches\"]["), "{dump}");
+        assert!(dump.contains("local [\"l2\"] = l1[\"items\"]["), "{dump}");
         assert!(dump.contains("return "), "{dump}");
-        assert!(dump.contains("l4[\"value\"]"), "{dump}");
+        assert!(dump.contains("l2[\"value\"]"), "{dump}");
     }
 
     #[test]
@@ -410,11 +409,9 @@ mod decompile_pipeline {
             ),
             "{dump}"
         );
-        assert!(dump.contains("local l1 = p0.branches"), "{dump}");
-        assert!(dump.contains("local l2 = l1[((p1 and \"t\") or \"f\")]"), "{dump}");
-        assert!(dump.contains("local l3 = l2.items"), "{dump}");
-        assert!(dump.contains("local l4 = l3[((p2 and 1) or 2)]"), "{dump}");
-        assert!(dump.contains("return ((l0 and \"T\") or \"F\"), l4.value"), "{dump}");
+        assert!(dump.contains("local l1 = p0.branches[((p1 and \"t\") or \"f\")]"), "{dump}");
+        assert!(dump.contains("local l2 = l1.items[((p2 and 1) or 2)]"), "{dump}");
+        assert!(dump.contains("return ((l0 and \"T\") or \"F\"), l2.value"), "{dump}");
     }
 
     #[test]

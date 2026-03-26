@@ -326,7 +326,7 @@ fn find_site_in_call(call: &HirCallExpr, temp: TempId, site: InlineSite) -> Opti
 fn find_site_in_lvalue(lvalue: &HirLValue, temp: TempId, site: InlineSite) -> Option<InlineSite> {
     match lvalue {
         HirLValue::Temp(target) if *target == temp => Some(site),
-        HirLValue::TableAccess(access) => find_site_in_expr(&access.base, temp, InlineSite::Nested)
+        HirLValue::TableAccess(access) => find_site_in_expr(&access.base, temp, site.descend_access_base())
             .or_else(|| find_site_in_expr(&access.key, temp, InlineSite::Index)),
         HirLValue::Temp(_) | HirLValue::Local(_) | HirLValue::Upvalue(_) | HirLValue::Global(_) => {
             None
@@ -338,7 +338,7 @@ fn find_site_in_expr(expr: &HirExpr, temp: TempId, site: InlineSite) -> Option<I
     match expr {
         HirExpr::TempRef(other) if *other == temp => Some(site),
         HirExpr::TempRef(_) => None,
-        HirExpr::TableAccess(access) => find_site_in_expr(&access.base, temp, InlineSite::Nested)
+        HirExpr::TableAccess(access) => find_site_in_expr(&access.base, temp, site.descend_access_base())
             .or_else(|| find_site_in_expr(&access.key, temp, InlineSite::Index)),
         HirExpr::Unary(unary) => find_site_in_expr(&unary.expr, temp, InlineSite::Nested),
         HirExpr::Binary(binary) => find_site_in_expr(&binary.lhs, temp, InlineSite::Nested)
@@ -473,6 +473,7 @@ enum InlineSite {
     ReturnValue,
     Index,
     CallArg,
+    AccessBase,
 }
 
 impl InlineSite {
@@ -480,6 +481,10 @@ impl InlineSite {
         match self {
             Self::Direct => true,
             Self::Nested => is_atomic_nested_inline_expr(replacement),
+            Self::AccessBase => self
+                .complexity_limit(options)
+                .is_some_and(|limit| expr_complexity(replacement) <= limit)
+                && is_access_base_inline_expr(replacement),
             Self::ReturnValue | Self::Index | Self::CallArg => self
                 .complexity_limit(options)
                 .is_some_and(|limit| expr_complexity(replacement) <= limit),
@@ -492,6 +497,18 @@ impl InlineSite {
             Self::ReturnValue => Some(options.return_inline_max_complexity),
             Self::Index => Some(options.index_inline_max_complexity),
             Self::CallArg => Some(options.args_inline_max_complexity),
+            Self::AccessBase => Some(options.access_base_inline_max_complexity),
+        }
+    }
+
+    fn descend_access_base(self) -> Self {
+        match self {
+            Self::Direct => Self::AccessBase,
+            Self::Nested
+            | Self::ReturnValue
+            | Self::Index
+            | Self::CallArg
+            | Self::AccessBase => Self::Nested,
         }
     }
 }
@@ -511,6 +528,18 @@ fn is_atomic_nested_inline_expr(expr: &HirExpr) -> bool {
             | HirExpr::GlobalRef(_)
             | HirExpr::VarArg
     )
+}
+
+fn is_access_base_inline_expr(expr: &HirExpr) -> bool {
+    is_atomic_nested_inline_expr(expr) || is_named_field_chain_expr(expr)
+}
+
+fn is_named_field_chain_expr(expr: &HirExpr) -> bool {
+    let HirExpr::TableAccess(access) = expr else {
+        return false;
+    };
+    matches!(&access.key, HirExpr::String(_))
+        && (is_atomic_nested_inline_expr(&access.base) || is_named_field_chain_expr(&access.base))
 }
 
 fn collect_stmt_temp_uses_into(stmt: &HirStmt, scratch: &mut TempUseScratch) {
@@ -1138,6 +1167,124 @@ mod tests {
     }
 
     #[test]
+    fn inlines_named_field_access_base_into_immediate_assign_when_threshold_allows() {
+        let mut proto = HirProto {
+            temps: vec![TempId(0), TempId(1), TempId(2), TempId(3)],
+            ..dummy_proto(HirBlock {
+                stmts: vec![
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(TempId(0))],
+                        values: vec![HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
+                            base: HirExpr::ParamRef(crate::hir::common::ParamId(0)),
+                            key: HirExpr::String("branches".to_owned()),
+                        }))],
+                    })),
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(TempId(1))],
+                        values: vec![HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
+                            base: HirExpr::TempRef(TempId(0)),
+                            key: HirExpr::String("picked".to_owned()),
+                        }))],
+                    })),
+                    HirStmt::Return(Box::new(HirReturn {
+                        values: vec![HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
+                            base: HirExpr::TempRef(TempId(1)),
+                            key: HirExpr::String("value".to_owned()),
+                        }))],
+                    })),
+                ],
+            })
+        };
+
+        assert!(inline_temps_in_proto(
+            &mut proto,
+            crate::readability::ReadabilityOptions {
+                access_base_inline_max_complexity: 5,
+                ..crate::readability::ReadabilityOptions::default()
+            }
+        ));
+        assert!(matches!(
+            proto.body.stmts.as_slice(),
+            [HirStmt::Assign(assign), HirStmt::Return(ret)]
+                if matches!(
+                    assign.values.as_slice(),
+                    [HirExpr::TableAccess(access)]
+                        if matches!(&access.base, HirExpr::TableAccess(inner)
+                            if matches!(inner.base, HirExpr::ParamRef(_))
+                                && matches!(inner.key, HirExpr::String(ref value) if value == "branches"))
+                            && matches!(access.key, HirExpr::String(ref value) if value == "picked")
+                )
+                    && matches!(
+                        ret.values.as_slice(),
+                        [HirExpr::TableAccess(access)]
+                            if matches!(access.base, HirExpr::TempRef(TempId(1)))
+                                && matches!(access.key, HirExpr::String(ref value) if value == "value")
+                    )
+        ));
+    }
+
+    #[test]
+    fn does_not_chain_access_base_inline_past_single_segment() {
+        let mut proto = HirProto {
+            temps: vec![TempId(0), TempId(1), TempId(2)],
+            ..dummy_proto(HirBlock {
+                stmts: vec![
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(TempId(0))],
+                        values: vec![HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
+                            base: HirExpr::ParamRef(crate::hir::common::ParamId(0)),
+                            key: HirExpr::String("branches".to_owned()),
+                        }))],
+                    })),
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(TempId(1))],
+                        values: vec![HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
+                            base: HirExpr::TempRef(TempId(0)),
+                            key: HirExpr::String("picked".to_owned()),
+                        }))],
+                    })),
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(TempId(2))],
+                        values: vec![HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
+                            base: HirExpr::TempRef(TempId(1)),
+                            key: HirExpr::String("value".to_owned()),
+                        }))],
+                    })),
+                    HirStmt::Return(Box::new(HirReturn {
+                        values: vec![HirExpr::TempRef(TempId(2))],
+                    })),
+                ],
+            })
+        };
+
+        assert!(inline_temps_in_proto(
+            &mut proto,
+            crate::readability::ReadabilityOptions {
+                access_base_inline_max_complexity: usize::MAX,
+                ..crate::readability::ReadabilityOptions::default()
+            }
+        ));
+        assert!(matches!(
+            proto.body.stmts.as_slice(),
+            [HirStmt::Assign(assign), HirStmt::Return(ret)]
+                if matches!(
+                    assign.values.as_slice(),
+                    [HirExpr::TableAccess(access)]
+                        if matches!(&access.base, HirExpr::TableAccess(inner)
+                            if matches!(inner.base, HirExpr::ParamRef(_))
+                                && matches!(inner.key, HirExpr::String(ref value) if value == "branches"))
+                            && matches!(access.key, HirExpr::String(ref value) if value == "picked")
+                )
+                    && matches!(
+                        ret.values.as_slice(),
+                        [HirExpr::TableAccess(access)]
+                            if matches!(access.base, HirExpr::TempRef(TempId(1)))
+                                && matches!(access.key, HirExpr::String(ref value) if value == "value")
+                    )
+        ));
+    }
+
+    #[test]
     fn still_inlines_temp_directly_in_index_context() {
         let mut proto = HirProto {
             temps: vec![TempId(0), TempId(1), TempId(2)],
@@ -1203,6 +1350,7 @@ mod tests {
                 return_inline_max_complexity: usize::MAX,
                 index_inline_max_complexity: usize::MAX,
                 args_inline_max_complexity: usize::MAX,
+                access_base_inline_max_complexity: usize::MAX,
             }
         ));
         assert!(matches!(

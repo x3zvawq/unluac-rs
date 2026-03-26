@@ -200,7 +200,7 @@ mod decompile_pipeline {
         assert_eq!(result.state.completed_stage, Some(DecompileStage::Readability));
         let dump = &result.debug_output[0].content;
         assert!(dump.contains("for l0, l1, l2 in l5({\"aa\", \"bbb\", \"c\"}) do"), "{dump}");
-        assert!(dump.contains("local l13<close> ="), "{dump}");
+        assert!(dump.contains("<close> = l4("), "{dump}");
         assert!(!dump.contains("to-be-closed"), "{dump}");
         assert!(!dump.contains("local t9"), "{dump}");
     }

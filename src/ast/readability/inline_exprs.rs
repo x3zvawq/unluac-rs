@@ -42,7 +42,7 @@ fn rewrite_block(block: &mut AstBlock, options: ReadabilityOptions) -> bool {
             index += 1;
             continue;
         };
-        if !is_context_safe_expr(value) {
+        if !is_inline_candidate_expr(value) {
             new_stmts.push(old_stmts[index].clone());
             index += 1;
             continue;
@@ -281,7 +281,7 @@ fn rewrite_lvalue_use_sites(
             &mut access.base,
             binding,
             replacement,
-            InlineSite::Neutral,
+            InlineSite::Neutral.descend_access_base(),
             options,
         ),
         AstLValue::IndexAccess(access) => {
@@ -289,7 +289,7 @@ fn rewrite_lvalue_use_sites(
                 &mut access.base,
                 binding,
                 replacement,
-                InlineSite::Neutral,
+                InlineSite::Neutral.descend_access_base(),
                 options,
             );
             changed |= rewrite_expr_use_sites(
@@ -365,7 +365,7 @@ fn rewrite_expr_use_sites(
             &mut access.base,
             binding,
             replacement,
-            InlineSite::Neutral,
+            site.descend_access_base(),
             options,
         ),
         AstExpr::IndexAccess(access) => {
@@ -373,7 +373,7 @@ fn rewrite_expr_use_sites(
                 &mut access.base,
                 binding,
                 replacement,
-                InlineSite::Neutral,
+                site.descend_access_base(),
                 options,
             );
             changed |= rewrite_expr_use_sites(
@@ -666,6 +666,10 @@ fn count_temp_uses_in_expr(expr: &AstExpr, binding: TempId) -> usize {
     }
 }
 
+fn is_inline_candidate_expr(expr: &AstExpr) -> bool {
+    is_context_safe_expr(expr) || is_access_base_inline_expr(expr)
+}
+
 fn is_context_safe_expr(expr: &AstExpr) -> bool {
     match expr {
         AstExpr::Nil
@@ -694,6 +698,29 @@ fn is_context_safe_expr(expr: &AstExpr) -> bool {
         | AstExpr::TableConstructor(_)
         | AstExpr::FunctionExpr(_) => false,
     }
+}
+
+fn is_access_base_inline_expr(expr: &AstExpr) -> bool {
+    is_atomic_access_base_expr(expr) || is_named_field_chain_expr(expr)
+}
+
+fn is_named_field_chain_expr(expr: &AstExpr) -> bool {
+    let AstExpr::FieldAccess(access) = expr else {
+        return false;
+    };
+    is_atomic_access_base_expr(&access.base) || is_named_field_chain_expr(&access.base)
+}
+
+fn is_atomic_access_base_expr(expr: &AstExpr) -> bool {
+    matches!(
+        expr,
+        AstExpr::Nil
+            | AstExpr::Boolean(_)
+            | AstExpr::Integer(_)
+            | AstExpr::Number(_)
+            | AstExpr::String(_)
+            | AstExpr::Var(_)
+    )
 }
 
 fn expr_complexity(expr: &AstExpr) -> usize {
@@ -744,6 +771,7 @@ enum InlineSite {
     ReturnValue,
     Index,
     CallArg,
+    AccessBase,
 }
 
 impl InlineSite {
@@ -756,6 +784,7 @@ impl InlineSite {
     ) -> bool {
         matches!(use_expr, AstExpr::Var(AstNameRef::Temp(temp)) if *temp == binding)
             && self.complexity_limit(options).is_some_and(|limit| expr_complexity(replacement) <= limit)
+            && (!matches!(self, Self::AccessBase) || is_access_base_inline_expr(replacement))
     }
 
     fn complexity_limit(self, options: ReadabilityOptions) -> Option<usize> {
@@ -764,6 +793,14 @@ impl InlineSite {
             Self::ReturnValue => Some(options.return_inline_max_complexity),
             Self::Index => Some(options.index_inline_max_complexity),
             Self::CallArg => Some(options.args_inline_max_complexity),
+            Self::AccessBase => Some(options.access_base_inline_max_complexity),
+        }
+    }
+
+    fn descend_access_base(self) -> Self {
+        match self {
+            Self::Neutral => Self::AccessBase,
+            Self::ReturnValue | Self::Index | Self::CallArg | Self::AccessBase => Self::Neutral,
         }
     }
 }
@@ -771,7 +808,7 @@ impl InlineSite {
 #[cfg(test)]
 mod tests {
     use crate::ast::common::{
-        AstCallExpr, AstIndexAccess, AstLocalBinding, AstMethodCallExpr, AstReturn,
+        AstCallExpr, AstFieldAccess, AstIndexAccess, AstLocalBinding, AstMethodCallExpr, AstReturn,
     };
     use crate::ast::{
         AstBinaryExpr, AstBinaryOpKind, AstCallKind, AstExpr, AstLValue, AstLocalAttr,
@@ -961,5 +998,70 @@ mod tests {
                 },
             }
         ));
+    }
+
+    #[test]
+    fn inlines_named_field_access_base_into_adjacent_index_assign() {
+        let root = LocalId(0);
+        let first = TempId(0);
+        let second = TempId(1);
+        let mut module = AstModule {
+            body: crate::ast::AstBlock {
+                stmts: vec![
+                    AstStmt::Assign(Box::new(crate::ast::AstAssign {
+                        targets: vec![AstLValue::Name(AstNameRef::Temp(first))],
+                        values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                            base: AstExpr::Var(AstNameRef::Local(root)),
+                            field: "branches".to_owned(),
+                        }))],
+                    })),
+                    AstStmt::Assign(Box::new(crate::ast::AstAssign {
+                        targets: vec![AstLValue::Name(AstNameRef::Temp(second))],
+                        values: vec![AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                            base: AstExpr::Var(AstNameRef::Temp(first)),
+                            index: AstExpr::String("picked".to_owned()),
+                        }))],
+                    })),
+                    AstStmt::Return(Box::new(AstReturn {
+                        values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                            base: AstExpr::Var(AstNameRef::Temp(second)),
+                            field: "value".to_owned(),
+                        }))],
+                    })),
+                ],
+            },
+        };
+
+        assert!(apply(
+            &mut module,
+            ReadabilityContext {
+                target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+                options: ReadabilityOptions {
+                    access_base_inline_max_complexity: 5,
+                    ..ReadabilityOptions::default()
+                },
+            }
+        ));
+        assert_eq!(
+            module.body.stmts,
+            vec![
+                AstStmt::Assign(Box::new(crate::ast::AstAssign {
+                    targets: vec![AstLValue::Name(AstNameRef::Temp(second))],
+                    values: vec![AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                        base: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                            base: AstExpr::Var(AstNameRef::Local(root)),
+                            field: "branches".to_owned(),
+                        })),
+                        index: AstExpr::String("picked".to_owned()),
+                    }))],
+                })),
+                AstStmt::Return(Box::new(AstReturn {
+                    values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Temp(second)),
+                        field: "value".to_owned(),
+                    }))],
+                })),
+            ]
+        );
     }
 }
