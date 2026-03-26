@@ -36,6 +36,7 @@ fn analyze_proto_structure(
     let branch_candidates = branches::analyze_branches(cfg, graph_facts);
     let irreducible_regions = helpers::compute_irreducible_regions(cfg);
     let goto_requirements = goto::analyze_goto_requirements(
+        proto,
         cfg,
         &loop_candidates,
         &branch_candidates,

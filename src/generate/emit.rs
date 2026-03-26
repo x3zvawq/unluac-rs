@@ -3,6 +3,7 @@
 //! 这里采用外部 emitter，而不是把“生成字符串”的方法塞回 AST 节点本身。
 //! 这样 AST 仍保持纯语法数据，Generate 只在这一层处理名字解析、括号优先级和布局意图。
 
+use crate::ast::pretty::preferred_relational_render;
 use crate::ast::{
     AstAssign, AstBindingRef, AstBlock, AstCallExpr, AstCallKind, AstCallStmt, AstExpr,
     AstFieldAccess, AstFunctionDecl, AstFunctionExpr, AstFunctionName, AstGenericFor,
@@ -257,14 +258,37 @@ impl<'a> Emitter<'a> {
             Doc::text(" then"),
             self.emit_indented_body(&ast_if.then_block, then_body),
         ];
-        if let Some(else_block) = &ast_if.else_block {
-            parts.push(Doc::line());
-            parts.push(Doc::text("else"));
-            parts.push(self.emit_indented_body(else_block, self.emit_block(else_block, function)?));
-        }
+        self.emit_if_else_chain(ast_if.else_block.as_ref(), function, &mut parts)?;
         parts.push(Doc::line());
         parts.push(Doc::text("end"));
         Ok(Doc::concat(parts))
+    }
+
+    fn emit_if_else_chain(
+        &self,
+        else_block: Option<&AstBlock>,
+        function: HirProtoRef,
+        parts: &mut Vec<Doc>,
+    ) -> Result<(), GenerateError> {
+        let Some(else_block) = else_block else {
+            return Ok(());
+        };
+
+        if let [AstStmt::If(else_if)] = else_block.stmts.as_slice() {
+            let cond = self.emit_expr(&else_if.cond, function, 0, ExprSide::Standalone)?;
+            let then_body = self.emit_block(&else_if.then_block, function)?;
+            parts.push(Doc::line());
+            parts.push(Doc::text("elseif "));
+            parts.push(cond);
+            parts.push(Doc::text(" then"));
+            parts.push(self.emit_indented_body(&else_if.then_block, then_body));
+            return self.emit_if_else_chain(else_if.else_block.as_ref(), function, parts);
+        }
+
+        parts.push(Doc::line());
+        parts.push(Doc::text("else"));
+        parts.push(self.emit_indented_body(else_block, self.emit_block(else_block, function)?));
+        Ok(())
     }
 
     fn emit_while(
@@ -547,10 +571,16 @@ impl<'a> Emitter<'a> {
             }
             AstExpr::Binary(binary) => {
                 let (prec, assoc, op) = binary_meta(binary.op);
-                let lhs = self.emit_expr(&binary.lhs, function, prec, ExprSide::Left)?;
-                let rhs = self.emit_expr(&binary.rhs, function, prec, ExprSide::Right)?;
+                let (lhs_expr, op_text, rhs_expr) =
+                    if let Some(preferred) = preferred_relational_render(binary) {
+                        (preferred.lhs, preferred.op_text, preferred.rhs)
+                    } else {
+                        (&binary.lhs, op, &binary.rhs)
+                    };
+                let lhs = self.emit_expr(lhs_expr, function, prec, ExprSide::Left)?;
+                let rhs = self.emit_expr(rhs_expr, function, prec, ExprSide::Right)?;
                 (
-                    Doc::concat([lhs, Doc::text(" "), Doc::text(op), Doc::text(" "), rhs]),
+                    Doc::concat([lhs, Doc::text(" "), Doc::text(op_text), Doc::text(" "), rhs]),
                     prec,
                     assoc,
                 )

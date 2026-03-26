@@ -604,6 +604,137 @@ mod decompile_pipeline {
             generated.source
         );
     }
+
+    #[test]
+    fn branch_state_carry_hir_keeps_numeric_for_branch_merge_without_synthetic_continue() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/control_flow/07_branch_state_carry.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("branch_state_carry hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("assign l2[((# l2) + 1)] = l1"), "{dump}");
+        assert!(!dump.contains("continue"), "{dump}");
+    }
+
+    #[test]
+    fn branch_state_carry_readability_recovers_for_header_and_elseif_shape() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/control_flow/07_branch_state_carry.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Readability,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Readability],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("branch_state_carry readability stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("for l0 = 1, (# p0), 1 do"), "{dump}");
+        assert!(dump.contains("if l4 > 0 then"), "{dump}");
+        assert!(dump.contains("elseif l4 == 0 then"), "{dump}");
+        assert!(!dump.contains("local l3 = 1"), "{dump}");
+        assert!(!dump.contains("else\n      if"), "{dump}");
+        assert!(!dump.contains("if 0 < l4 then"), "{dump}");
+    }
+
+    #[test]
+    fn branch_state_carry_generate_stage_succeeds_without_continue() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/control_flow/07_branch_state_carry.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("branch_state_carry generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated.source.contains("tbl[#tbl + 1] = ok"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("for i = 1, #a, 1 do"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("if item > 0 then"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("elseif item == 0 then"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("print(\"branch-state\", fn({ 2, 0, -3, 1, -1 }))"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("continue"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local value = 1"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local ok2 = #a"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("else\n        if"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("if 0 < item then"),
+            "{}",
+            generated.source
+        );
+    }
 }
 
 fn compile_lua_case(dialect_label: &str, source_relative: &str) -> Vec<u8> {

@@ -5,12 +5,14 @@
 use std::collections::BTreeSet;
 
 use crate::cfg::{Cfg, EdgeKind};
+use crate::transformer::{LowInstr, LoweredProto};
 
 use super::branches::collect_branch_region_blocks;
-use super::common::{BranchCandidate, GotoReason, GotoRequirement, LoopCandidate};
+use super::common::{BranchCandidate, GotoReason, GotoRequirement, LoopCandidate, LoopKindHint};
 use super::helpers::IrreducibleRegion;
 
 pub(super) fn analyze_goto_requirements(
+    proto: &LoweredProto,
     cfg: &Cfg,
     loop_candidates: &[LoopCandidate],
     branch_candidates: &[BranchCandidate],
@@ -36,6 +38,9 @@ pub(super) fn analyze_goto_requirements(
         }
 
         if let Some(continue_target) = loop_candidate.continue_target {
+            let numeric_for_tail_carries_body = loop_candidate.kind_hint
+                == LoopKindHint::NumericForLike
+                && block_has_non_control_prefix(proto, cfg, continue_target);
             for block in &loop_candidate.blocks {
                 for edge_ref in &cfg.succs[block.index()] {
                     let edge = cfg.edges[edge_ref.index()];
@@ -43,7 +48,14 @@ pub(super) fn analyze_goto_requirements(
                     // 当前循环的正常执行路径，不应该被提前标成 continue-like requirement。
                     // 这里保留的只应该是“主动提前跳到 continue target”的控制边，
                     // 这样 HIR 才能区分自然 fallthrough 和真正的 continue 语义。
+                    //
+                    // numeric-for 的 continue target 是 `FORLOOP` 所在 block。本来如果这个
+                    // block 前面还挂着普通 low-IR 指令，那它就已经是 loop tail 的一部分：
+                    // 提前跳到 block 开头仍会执行这些语句，语义上不是 `continue`，只是
+                    // branch 正常 merge 回 tail。像 `branch_state_carry` 这类 case 必须在
+                    // facts 层把它排除掉，不能等 HIR 再兜底。
                     if edge.to == continue_target
+                        && !numeric_for_tail_carries_body
                         && !loop_candidate.backedges.contains(edge_ref)
                         && edge.kind != EdgeKind::Fallthrough
                         && cfg.reachable_blocks.contains(&edge.from)
@@ -93,4 +105,38 @@ pub(super) fn analyze_goto_requirements(
     }
 
     requirements.into_iter().collect()
+}
+
+fn block_has_non_control_prefix(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    block: crate::cfg::BlockRef,
+) -> bool {
+    let range = cfg.blocks[block.index()].instrs;
+    let Some(last_instr_ref) = range.last() else {
+        return false;
+    };
+    let Some(last_instr) = proto.instrs.get(last_instr_ref.index()) else {
+        return false;
+    };
+
+    let body_end = if is_control_terminator(last_instr) {
+        range.end().saturating_sub(1)
+    } else {
+        range.end()
+    };
+    range.start.index() < body_end
+}
+
+fn is_control_terminator(instr: &LowInstr) -> bool {
+    matches!(
+        instr,
+        LowInstr::Jump(_)
+            | LowInstr::Branch(_)
+            | LowInstr::Return(_)
+            | LowInstr::TailCall(_)
+            | LowInstr::NumericForInit(_)
+            | LowInstr::NumericForLoop(_)
+            | LowInstr::GenericForLoop(_)
+    )
 }

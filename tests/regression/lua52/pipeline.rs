@@ -67,8 +67,20 @@ mod decompile_pipeline {
         assert_eq!(result.state.completed_stage, Some(DecompileStage::Hir));
         let dump = &result.debug_output[0].content;
         assert!(dump.contains("global(print)"), "{dump}");
+        assert!(dump.contains("local [\"l0\"] = p0"), "{dump}");
+        assert!(dump.contains("local [\"l0\"] = (u0 + p0)"), "{dump}");
+        assert!(
+            dump.contains("return closure(proto#2 captures=l0)"),
+            "{dump}"
+        );
+        assert!(
+            dump.contains("return closure(proto#3 captures=u0, l0)"),
+            "{dump}"
+        );
         assert!(!dump.contains("u0[\"print\"]"), "{dump}");
         assert!(!dump.contains("u0.print"), "{dump}");
+        assert!(!dump.contains("captures=p0"), "{dump}");
+        assert!(!dump.contains("captures=u0, (u0 + p0)"), "{dump}");
     }
 
     #[test]
@@ -102,6 +114,16 @@ mod decompile_pipeline {
             .as_ref()
             .expect("generate stage should leave generated source in state");
         assert!(
+            generated.source.contains("local result = fn(2)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("local result2 = result(3)"),
+            "{}",
+            generated.source
+        );
+        assert!(
             generated
                 .source
                 .contains("print(\"nested-closure\", result2(4))"),
@@ -109,7 +131,19 @@ mod decompile_pipeline {
             generated.source
         );
         assert!(
-            generated.source.contains("local print = print"),
+            generated
+                .source
+                .contains("print(\"nested-closure\", result(1)(2))"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("local value = a"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("local ok = value + b"),
             "{}",
             generated.source
         );
@@ -120,6 +154,32 @@ mod decompile_pipeline {
         );
         assert!(
             !generated.source.contains("u0.print("),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local print = print"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated
+                .source
+                .contains("print(\"nested-closure\", fn(2)(3)(4))"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated
+                .source
+                .contains("print(\"nested-closure\", value(1)(2))"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated
+                .source
+                .contains("return function(b)\n        return function(c)"),
             "{}",
             generated.source
         );

@@ -4,6 +4,7 @@ mod build;
 mod common;
 mod debug;
 mod error;
+pub(crate) mod pretty;
 mod readability;
 
 pub use crate::readability::ReadabilityOptions;

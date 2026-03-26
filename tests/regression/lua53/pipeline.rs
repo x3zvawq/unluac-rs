@@ -138,9 +138,12 @@ mod decompile_pipeline {
             dump.contains("l1, l2, l3, l4 = l0({5, 8, 13, 21, 34})"),
             "{dump}"
         );
-        assert!(dump.contains("for l0 = l3, l4, l5 do"), "{dump}");
+        assert!(dump.contains("for l0 = 1, (# p0), 1 do"), "{dump}");
+        assert!(dump.contains("> 0.4"), "{dump}");
         assert!(dump.contains("::L1::"), "{dump}");
         assert!(!dump.contains("assign "), "{dump}");
         assert!(!dump.contains("numeric-for "), "{dump}");
+        assert!(!dump.contains("for l0 = l3, l4, l5 do"), "{dump}");
+        assert!(!dump.contains("0.4 <"), "{dump}");
     }
 }

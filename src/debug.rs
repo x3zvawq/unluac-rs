@@ -676,6 +676,7 @@ fn is_keyword_token(token: &str) -> bool {
             | "if"
             | "then"
             | "else"
+            | "elseif"
             | "end"
             | "while"
             | "repeat"

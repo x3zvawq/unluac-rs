@@ -203,6 +203,23 @@ fn collect_plans(
         if !has_future_touch {
             continue;
         }
+        // 只在控制头里单次消费的 temp，更像机械性的结构参数而不是源码级 local。
+        // 如果这里先把它们提升成 local，后面的 temp-inline 就再也无法把
+        // `for i = 1, #values, 1 do`、`if value > 0 then` 这类头部形状收回来。
+        // 因此只要它们的唯一未来使用点仍局限在单条控制语句的头部，就把机会留给
+        // temp-inline，而不是在 locals pass 里过早物化成新 local。
+        let touching_stmt_indices = (decl_index + 1..block.stmts.len())
+            .filter(|future_index| !removable_aliases.contains(future_index))
+            .filter(|future_index| stmt_touches_any_temp(&block.stmts[*future_index], &group))
+            .collect::<Vec<_>>();
+        if touching_stmt_indices.len() == 1
+            && stmt_consumes_temps_only_in_control_head(
+                &block.stmts[touching_stmt_indices[0]],
+                &group,
+            )
+        {
+            continue;
+        }
 
         PlanAllocator {
             plans: &mut plans,
@@ -657,8 +674,60 @@ fn stmts_touch_temp(stmts: &[HirStmt], temp: TempId) -> bool {
     stmts.iter().any(|stmt| stmt_touches_temp(stmt, temp))
 }
 
+fn stmts_touch_any_temp(stmts: &[HirStmt], temps: &BTreeSet<TempId>) -> bool {
+    stmts.iter().any(|stmt| stmt_touches_any_temp(stmt, temps))
+}
+
 fn stmt_touches_any_temp(stmt: &HirStmt, temps: &BTreeSet<TempId>) -> bool {
     temps.iter().any(|temp| stmt_touches_temp(stmt, *temp))
+}
+
+fn stmt_consumes_temps_only_in_control_head(stmt: &HirStmt, temps: &BTreeSet<TempId>) -> bool {
+    match stmt {
+        HirStmt::If(if_stmt) => {
+            expr_touches_any_temp(&if_stmt.cond, temps)
+                && !stmts_touch_any_temp(&if_stmt.then_block.stmts, temps)
+                && if_stmt
+                    .else_block
+                    .as_ref()
+                    .is_none_or(|else_block| !stmts_touch_any_temp(&else_block.stmts, temps))
+        }
+        HirStmt::While(while_stmt) => {
+            expr_touches_any_temp(&while_stmt.cond, temps)
+                && !stmts_touch_any_temp(&while_stmt.body.stmts, temps)
+        }
+        HirStmt::Repeat(repeat_stmt) => {
+            expr_touches_any_temp(&repeat_stmt.cond, temps)
+                && !stmts_touch_any_temp(&repeat_stmt.body.stmts, temps)
+        }
+        HirStmt::NumericFor(numeric_for) => {
+            (expr_touches_any_temp(&numeric_for.start, temps)
+                || expr_touches_any_temp(&numeric_for.limit, temps)
+                || expr_touches_any_temp(&numeric_for.step, temps))
+                && !stmts_touch_any_temp(&numeric_for.body.stmts, temps)
+        }
+        HirStmt::GenericFor(generic_for) => {
+            generic_for
+                .iterator
+                .iter()
+                .any(|expr| expr_touches_any_temp(expr, temps))
+                && !stmts_touch_any_temp(&generic_for.body.stmts, temps)
+        }
+        HirStmt::LocalDecl(_)
+        | HirStmt::Assign(_)
+        | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::Return(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_)
+        | HirStmt::Block(_)
+        | HirStmt::Unstructured(_) => false,
+    }
 }
 
 fn stmt_touches_temp(stmt: &HirStmt, temp: TempId) -> bool {
@@ -734,6 +803,10 @@ fn stmt_touches_temp(stmt: &HirStmt, temp: TempId) -> bool {
 fn call_expr_touches_temp(call: &HirCallExpr, temp: TempId) -> bool {
     expr_touches_temp(&call.callee, temp)
         || call.args.iter().any(|arg| expr_touches_temp(arg, temp))
+}
+
+fn expr_touches_any_temp(expr: &HirExpr, temps: &BTreeSet<TempId>) -> bool {
+    temps.iter().any(|temp| expr_touches_temp(expr, *temp))
 }
 
 fn expr_touches_temp(expr: &HirExpr, temp: TempId) -> bool {
@@ -912,6 +985,80 @@ mod tests {
                     && matches!(if_stmt.else_block.as_ref().map(|block| block.stmts.as_slice()), Some([HirStmt::Assign(assign)])
                         if matches!(assign.targets.as_slice(), [HirLValue::Local(LocalId(0))]))
                     && matches!(ret.values.as_slice(), [HirExpr::LocalRef(LocalId(0))])
+        ));
+    }
+
+    #[test]
+    fn does_not_promote_single_use_numeric_for_header_temps_into_locals() {
+        let mut module = HirModule {
+            entry: HirProtoRef(0),
+            protos: vec![HirProto {
+                id: HirProtoRef(0),
+                source: None,
+                line_range: crate::parser::ProtoLineRange {
+                    defined_start: 0,
+                    defined_end: 0,
+                },
+                signature: crate::parser::ProtoSignature {
+                    num_params: 1,
+                    is_vararg: false,
+                    has_vararg_param_reg: false,
+                    named_vararg_table: false,
+                },
+                params: vec![crate::hir::common::ParamId(0)],
+                locals: vec![LocalId(0)],
+                upvalues: Vec::new(),
+                temps: vec![TempId(0), TempId(1), TempId(2)],
+                temp_debug_locals: vec![None, None, None],
+                body: HirBlock {
+                    stmts: vec![
+                        HirStmt::Assign(Box::new(HirAssign {
+                            targets: vec![HirLValue::Temp(TempId(0))],
+                            values: vec![HirExpr::Integer(1)],
+                        })),
+                        HirStmt::Assign(Box::new(HirAssign {
+                            targets: vec![HirLValue::Temp(TempId(1))],
+                            values: vec![HirExpr::Unary(Box::new(
+                                crate::hir::common::HirUnaryExpr {
+                                    op: crate::hir::common::HirUnaryOpKind::Length,
+                                    expr: HirExpr::ParamRef(crate::hir::common::ParamId(0)),
+                                },
+                            ))],
+                        })),
+                        HirStmt::Assign(Box::new(HirAssign {
+                            targets: vec![HirLValue::Temp(TempId(2))],
+                            values: vec![HirExpr::Integer(1)],
+                        })),
+                        HirStmt::NumericFor(Box::new(crate::hir::common::HirNumericFor {
+                            binding: LocalId(0),
+                            start: HirExpr::TempRef(TempId(0)),
+                            limit: HirExpr::TempRef(TempId(1)),
+                            step: HirExpr::TempRef(TempId(2)),
+                            body: HirBlock::default(),
+                        })),
+                    ],
+                },
+                children: Vec::new(),
+            }],
+        };
+
+        super::super::simplify_hir(
+            &mut module,
+            crate::readability::ReadabilityOptions::default(),
+        );
+
+        assert_eq!(module.protos[0].locals.len(), 1);
+        assert!(matches!(
+            module.protos[0].body.stmts.as_slice(),
+            [HirStmt::NumericFor(numeric_for)]
+                if matches!(numeric_for.start, HirExpr::Integer(1))
+                    && matches!(
+                        &numeric_for.limit,
+                        HirExpr::Unary(unary)
+                            if unary.op == crate::hir::common::HirUnaryOpKind::Length
+                                && matches!(unary.expr, HirExpr::ParamRef(crate::hir::common::ParamId(0)))
+                    )
+                    && matches!(numeric_for.step, HirExpr::Integer(1))
         ));
     }
 

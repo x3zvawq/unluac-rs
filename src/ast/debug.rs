@@ -11,6 +11,7 @@ use super::common::{
     AstLValue, AstMethodCallExpr, AstModule, AstNamePath, AstNameRef, AstStmt, AstSyntheticLocalId,
     AstTableField,
 };
+use super::pretty::preferred_relational_render;
 
 #[derive(Debug, Default)]
 struct FunctionRenderNames {
@@ -139,17 +140,7 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock, names: &Func
                 }
             }
             AstStmt::If(if_stmt) => {
-                let _ = writeln!(
-                    output,
-                    "{indent}if {} then",
-                    format_head_expr(&if_stmt.cond, indent, names),
-                );
-                write_block(output, &format!("{indent}  "), &if_stmt.then_block, names);
-                if let Some(else_block) = &if_stmt.else_block {
-                    let _ = writeln!(output, "{indent}else");
-                    write_block(output, &format!("{indent}  "), else_block, names);
-                }
-                let _ = writeln!(output, "{indent}end");
+                write_if_stmt(output, indent, if_stmt, names);
             }
             AstStmt::While(while_stmt) => {
                 let _ = writeln!(
@@ -301,12 +292,23 @@ fn format_expr(expr: &AstExpr, indent: &str, names: &FunctionRenderNames) -> Str
             format_unary_op(unary.op),
             format_expr(&unary.expr, indent, names)
         ),
-        AstExpr::Binary(binary) => format!(
-            "({} {} {})",
-            format_expr(&binary.lhs, indent, names),
-            format_binary_op(binary.op),
-            format_expr(&binary.rhs, indent, names)
-        ),
+        AstExpr::Binary(binary) => {
+            if let Some(preferred) = preferred_relational_render(binary) {
+                format!(
+                    "({} {} {})",
+                    format_expr(preferred.lhs, indent, names),
+                    preferred.op_text,
+                    format_expr(preferred.rhs, indent, names)
+                )
+            } else {
+                format!(
+                    "({} {} {})",
+                    format_expr(&binary.lhs, indent, names),
+                    format_binary_op(binary.op),
+                    format_expr(&binary.rhs, indent, names)
+                )
+            }
+        }
         AstExpr::LogicalAnd(logical) => {
             format!(
                 "({} and {})",
@@ -353,6 +355,47 @@ fn format_expr(expr: &AstExpr, indent: &str, names: &FunctionRenderNames) -> Str
 
 fn format_head_expr(expr: &AstExpr, indent: &str, names: &FunctionRenderNames) -> String {
     strip_outer_parens(format_expr(expr, indent, names))
+}
+
+fn write_if_stmt(
+    output: &mut String,
+    indent: &str,
+    if_stmt: &super::common::AstIf,
+    names: &FunctionRenderNames,
+) {
+    let _ = writeln!(
+        output,
+        "{indent}if {} then",
+        format_head_expr(&if_stmt.cond, indent, names),
+    );
+    write_block(output, &format!("{indent}  "), &if_stmt.then_block, names);
+    write_else_chain(output, indent, if_stmt.else_block.as_ref(), names);
+    let _ = writeln!(output, "{indent}end");
+}
+
+fn write_else_chain(
+    output: &mut String,
+    indent: &str,
+    else_block: Option<&AstBlock>,
+    names: &FunctionRenderNames,
+) {
+    let Some(else_block) = else_block else {
+        return;
+    };
+
+    if let [AstStmt::If(else_if)] = else_block.stmts.as_slice() {
+        let _ = writeln!(
+            output,
+            "{indent}elseif {} then",
+            format_head_expr(&else_if.cond, indent, names),
+        );
+        write_block(output, &format!("{indent}  "), &else_if.then_block, names);
+        write_else_chain(output, indent, else_if.else_block.as_ref(), names);
+        return;
+    }
+
+    let _ = writeln!(output, "{indent}else");
+    write_block(output, &format!("{indent}  "), else_block, names);
 }
 
 fn format_name_ref(name: &AstNameRef, names: &FunctionRenderNames) -> String {

@@ -369,10 +369,15 @@ fn find_site_in_expr(expr: &HirExpr, temp: TempId, site: InlineSite) -> Option<I
                     .as_ref()
                     .and_then(|expr| find_site_in_expr(expr, temp, InlineSite::Nested))
             }),
-        HirExpr::Closure(closure) => closure
-            .captures
-            .iter()
-            .find_map(|capture| find_site_in_expr(&capture.value, temp, InlineSite::Nested)),
+        HirExpr::Closure(_) => {
+            // capture 一旦跨过函数边界，就会直接决定子 proto 的 upvalue provenance。
+            // 如果这里把 temp 内联进 capture，后面的 locals / naming 就再也看不到
+            // “这是一个单独的局部变量被捕获”这层结构事实了，像
+            // `local offset = seed`、`local base = offset + step` 这类源码骨架
+            // 会被压扁成参数或裸表达式。这里宁可保留 temp，让后续 locals pass
+            // 把它稳定提升成真正的 local。
+            None
+        }
         HirExpr::Nil
         | HirExpr::Boolean(_)
         | HirExpr::Integer(_)
@@ -1146,8 +1151,9 @@ fn replace_temp_in_table_key(
 mod tests {
     use super::*;
     use crate::hir::common::{
-        HirAssign, HirBinaryExpr, HirBinaryOpKind, HirCallStmt, HirGlobalRef, HirIf, HirModule,
-        HirNumericFor, HirProtoRef, HirReturn, HirUnaryExpr, HirUnaryOpKind, LocalId, ParamId,
+        HirAssign, HirBinaryExpr, HirBinaryOpKind, HirCallStmt, HirCapture, HirClosureExpr,
+        HirGlobalRef, HirIf, HirModule, HirNumericFor, HirProtoRef, HirReturn, HirUnaryExpr,
+        HirUnaryOpKind, LocalId, ParamId,
     };
 
     #[test]
@@ -1578,6 +1584,50 @@ mod tests {
             proto.body.stmts.as_slice(),
             [HirStmt::Assign(_), HirStmt::Return(ret)]
                 if matches!(ret.values.as_slice(), [HirExpr::TempRef(TempId(0))])
+        ));
+    }
+
+    #[test]
+    fn does_not_inline_temp_into_closure_capture() {
+        let mut proto = HirProto {
+            temps: vec![TempId(0)],
+            temp_debug_locals: vec![None],
+            ..dummy_proto(HirBlock {
+                stmts: vec![
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(TempId(0))],
+                        values: vec![HirExpr::ParamRef(ParamId(0))],
+                    })),
+                    HirStmt::Return(Box::new(HirReturn {
+                        values: vec![HirExpr::Closure(Box::new(HirClosureExpr {
+                            proto: HirProtoRef(1),
+                            captures: vec![HirCapture {
+                                value: HirExpr::TempRef(TempId(0)),
+                            }],
+                        }))],
+                    })),
+                ],
+            })
+        };
+        proto.signature.num_params = 1;
+        proto.params = vec![ParamId(0)];
+
+        assert!(!inline_temps_in_proto(
+            &mut proto,
+            crate::readability::ReadabilityOptions::default()
+        ));
+        assert!(matches!(
+            proto.body.stmts.as_slice(),
+            [HirStmt::Assign(assign), HirStmt::Return(ret)]
+                if matches!(
+                    assign.values.as_slice(),
+                    [HirExpr::ParamRef(ParamId(0))]
+                )
+                    && matches!(
+                        ret.values.as_slice(),
+                        [HirExpr::Closure(closure)]
+                            if matches!(closure.captures.as_slice(), [HirCapture { value: HirExpr::TempRef(TempId(0)) }])
+                    )
         ));
     }
 

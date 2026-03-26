@@ -65,6 +65,91 @@ fn rewrite_block(block: &mut AstBlock, options: ReadabilityOptions) -> bool {
     }
 
     block.stmts = new_stmts;
+    changed |= collapse_adjacent_call_alias_runs(block, options);
+    changed
+}
+
+fn collapse_adjacent_call_alias_runs(block: &mut AstBlock, options: ReadabilityOptions) -> bool {
+    let old_stmts = std::mem::take(&mut block.stmts);
+    let mut new_stmts = Vec::with_capacity(old_stmts.len());
+    let mut changed = false;
+    let mut index = 0;
+
+    while index < old_stmts.len() {
+        let mut run_end = index;
+        while run_end < old_stmts.len() && inline_candidate(&old_stmts[run_end]).is_some() {
+            run_end += 1;
+        }
+
+        if run_end == index
+            || run_end >= old_stmts.len()
+            || !matches!(old_stmts[run_end], AstStmt::CallStmt(_))
+        {
+            new_stmts.push(old_stmts[index].clone());
+            index += 1;
+            continue;
+        }
+
+        let mut rewritten_sink = old_stmts[run_end].clone();
+        let mut removed = vec![false; run_end - index];
+        let mut collapsed_count = 0usize;
+
+        for candidate_index in (index..run_end).rev() {
+            let Some((candidate, value)) = inline_candidate(&old_stmts[candidate_index]) else {
+                continue;
+            };
+            if !matches!(candidate, InlineCandidate::LocalAlias(_)) {
+                continue;
+            }
+            if count_binding_uses_in_stmts(
+                &old_stmts[(candidate_index + 1)..(run_end + 1)],
+                candidate.binding(),
+            ) != 1
+            {
+                continue;
+            }
+            if count_binding_uses_in_stmts(
+                &old_stmts[(candidate_index + 1)..run_end],
+                candidate.binding(),
+            ) != 0
+            {
+                continue;
+            }
+
+            let mut trial_sink = rewritten_sink.clone();
+            if rewrite_stmt_use_sites_with_policy(
+                &mut trial_sink,
+                candidate,
+                value,
+                options,
+                InlinePolicy::ExtendedCallChain,
+            ) {
+                rewritten_sink = trial_sink;
+                removed[candidate_index - index] = true;
+                collapsed_count += 1;
+            }
+        }
+
+        // 这里只折叠真正的“局部别名包”：
+        // 至少一次收回两层相邻别名，才能证明我们是在还原机械展开的调用准备序列，
+        // 而不是把源码里本来就有阶段语义的 local（例如 stage1 / stage2）继续吞掉。
+        if collapsed_count >= 2 {
+            changed = true;
+            for (offset, stmt) in old_stmts[index..run_end].iter().enumerate() {
+                if !removed[offset] {
+                    new_stmts.push(stmt.clone());
+                }
+            }
+            new_stmts.push(rewritten_sink);
+            index = run_end + 1;
+            continue;
+        }
+
+        new_stmts.push(old_stmts[index].clone());
+        index += 1;
+    }
+
+    block.stmts = new_stmts;
     changed
 }
 
@@ -278,6 +363,22 @@ fn rewrite_stmt_use_sites(
     replacement: &AstExpr,
     options: ReadabilityOptions,
 ) -> bool {
+    rewrite_stmt_use_sites_with_policy(
+        stmt,
+        candidate,
+        replacement,
+        options,
+        InlinePolicy::Conservative,
+    )
+}
+
+fn rewrite_stmt_use_sites_with_policy(
+    stmt: &mut AstStmt,
+    candidate: InlineCandidate,
+    replacement: &AstExpr,
+    options: ReadabilityOptions,
+    policy: InlinePolicy,
+) -> bool {
     match stmt {
         AstStmt::LocalDecl(local_decl) => rewrite_expr_list_context(
             &mut local_decl.values,
@@ -285,14 +386,16 @@ fn rewrite_stmt_use_sites(
             replacement,
             InlineSite::Neutral,
             options,
+            policy,
         ),
         AstStmt::GlobalDecl(global_decl) => {
-            rewrite_global_decl_use_sites(global_decl, candidate, replacement, options)
+            rewrite_global_decl_use_sites(global_decl, candidate, replacement, options, policy)
         }
         AstStmt::Assign(assign) => {
             let mut changed = false;
             for target in &mut assign.targets {
-                changed |= rewrite_lvalue_use_sites(target, candidate, replacement, options);
+                changed |=
+                    rewrite_lvalue_use_sites(target, candidate, replacement, options, policy);
             }
             changed |= rewrite_expr_list_context(
                 &mut assign.values,
@@ -300,11 +403,12 @@ fn rewrite_stmt_use_sites(
                 replacement,
                 InlineSite::Neutral,
                 options,
+                policy,
             );
             changed
         }
         AstStmt::CallStmt(call_stmt) => {
-            rewrite_call_use_sites(&mut call_stmt.call, candidate, replacement, options)
+            rewrite_call_use_sites(&mut call_stmt.call, candidate, replacement, options, policy)
         }
         AstStmt::Return(ret) => rewrite_expr_list_context(
             &mut ret.values,
@@ -312,6 +416,7 @@ fn rewrite_stmt_use_sites(
             replacement,
             InlineSite::ReturnValue,
             options,
+            policy,
         ),
         AstStmt::If(if_stmt) => rewrite_expr_use_sites(
             &mut if_stmt.cond,
@@ -319,6 +424,7 @@ fn rewrite_stmt_use_sites(
             replacement,
             InlineSite::Neutral,
             options,
+            policy,
         ),
         AstStmt::While(while_stmt) => rewrite_expr_use_sites(
             &mut while_stmt.cond,
@@ -326,6 +432,7 @@ fn rewrite_stmt_use_sites(
             replacement,
             InlineSite::Neutral,
             options,
+            policy,
         ),
         AstStmt::Repeat(repeat_stmt) => rewrite_expr_use_sites(
             &mut repeat_stmt.cond,
@@ -333,6 +440,7 @@ fn rewrite_stmt_use_sites(
             replacement,
             InlineSite::Neutral,
             options,
+            policy,
         ),
         AstStmt::NumericFor(numeric_for) => {
             let mut changed = rewrite_expr_use_sites(
@@ -341,6 +449,7 @@ fn rewrite_stmt_use_sites(
                 replacement,
                 InlineSite::Neutral,
                 options,
+                policy,
             );
             changed |= rewrite_expr_use_sites(
                 &mut numeric_for.limit,
@@ -348,6 +457,7 @@ fn rewrite_stmt_use_sites(
                 replacement,
                 InlineSite::Neutral,
                 options,
+                policy,
             );
             changed |= rewrite_expr_use_sites(
                 &mut numeric_for.step,
@@ -355,6 +465,7 @@ fn rewrite_stmt_use_sites(
                 replacement,
                 InlineSite::Neutral,
                 options,
+                policy,
             );
             changed
         }
@@ -364,6 +475,7 @@ fn rewrite_stmt_use_sites(
             replacement,
             InlineSite::Neutral,
             options,
+            policy,
         ),
         AstStmt::DoBlock(_)
         | AstStmt::FunctionDecl(_)
@@ -380,6 +492,7 @@ fn rewrite_global_decl_use_sites(
     candidate: InlineCandidate,
     replacement: &AstExpr,
     options: ReadabilityOptions,
+    policy: InlinePolicy,
 ) -> bool {
     rewrite_expr_list_context(
         &mut global_decl.values,
@@ -387,6 +500,7 @@ fn rewrite_global_decl_use_sites(
         replacement,
         InlineSite::Neutral,
         options,
+        policy,
     )
 }
 
@@ -396,10 +510,11 @@ fn rewrite_expr_list_context(
     replacement: &AstExpr,
     site: InlineSite,
     options: ReadabilityOptions,
+    policy: InlinePolicy,
 ) -> bool {
     let mut changed = false;
     for expr in exprs {
-        changed |= rewrite_expr_use_sites(expr, candidate, replacement, site, options);
+        changed |= rewrite_expr_use_sites(expr, candidate, replacement, site, options, policy);
     }
     changed
 }
@@ -409,6 +524,7 @@ fn rewrite_lvalue_use_sites(
     candidate: InlineCandidate,
     replacement: &AstExpr,
     options: ReadabilityOptions,
+    policy: InlinePolicy,
 ) -> bool {
     match lvalue {
         AstLValue::Name(_) => false,
@@ -418,6 +534,7 @@ fn rewrite_lvalue_use_sites(
             replacement,
             InlineSite::Neutral.descend_access_base(),
             options,
+            policy,
         ),
         AstLValue::IndexAccess(access) => {
             let mut changed = rewrite_expr_use_sites(
@@ -426,6 +543,7 @@ fn rewrite_lvalue_use_sites(
                 replacement,
                 InlineSite::Neutral.descend_access_base(),
                 options,
+                policy,
             );
             changed |= rewrite_expr_use_sites(
                 &mut access.index,
@@ -433,6 +551,7 @@ fn rewrite_lvalue_use_sites(
                 replacement,
                 InlineSite::Index,
                 options,
+                policy,
             );
             changed
         }
@@ -444,6 +563,7 @@ fn rewrite_call_use_sites(
     candidate: InlineCandidate,
     replacement: &AstExpr,
     options: ReadabilityOptions,
+    policy: InlinePolicy,
 ) -> bool {
     match call {
         AstCallKind::Call(call) => {
@@ -453,6 +573,7 @@ fn rewrite_call_use_sites(
                 replacement,
                 InlineSite::CallCallee,
                 options,
+                policy,
             );
             changed |= rewrite_expr_list_context(
                 &mut call.args,
@@ -460,6 +581,7 @@ fn rewrite_call_use_sites(
                 replacement,
                 InlineSite::CallArg,
                 options,
+                policy,
             );
             changed
         }
@@ -470,6 +592,7 @@ fn rewrite_call_use_sites(
                 replacement,
                 InlineSite::Neutral,
                 options,
+                policy,
             );
             changed |= rewrite_expr_list_context(
                 &mut call.args,
@@ -477,6 +600,7 @@ fn rewrite_call_use_sites(
                 replacement,
                 InlineSite::CallArg,
                 options,
+                policy,
             );
             changed
         }
@@ -489,8 +613,9 @@ fn rewrite_expr_use_sites(
     replacement: &AstExpr,
     site: InlineSite,
     options: ReadabilityOptions,
+    policy: InlinePolicy,
 ) -> bool {
-    if site.allows(candidate, expr, replacement, options) {
+    if site.allows(candidate, expr, replacement, options, policy) {
         *expr = replacement.clone();
         return true;
     }
@@ -502,6 +627,7 @@ fn rewrite_expr_use_sites(
             replacement,
             site.descend_access_base(),
             options,
+            policy,
         ),
         AstExpr::IndexAccess(access) => {
             let mut changed = rewrite_expr_use_sites(
@@ -510,6 +636,7 @@ fn rewrite_expr_use_sites(
                 replacement,
                 site.descend_access_base(),
                 options,
+                policy,
             );
             changed |= rewrite_expr_use_sites(
                 &mut access.index,
@@ -517,6 +644,7 @@ fn rewrite_expr_use_sites(
                 replacement,
                 InlineSite::Index,
                 options,
+                policy,
             );
             changed
         }
@@ -526,6 +654,7 @@ fn rewrite_expr_use_sites(
             replacement,
             InlineSite::Neutral,
             options,
+            policy,
         ),
         AstExpr::Binary(binary) => {
             let mut changed = rewrite_expr_use_sites(
@@ -534,6 +663,7 @@ fn rewrite_expr_use_sites(
                 replacement,
                 InlineSite::Neutral,
                 options,
+                policy,
             );
             changed |= rewrite_expr_use_sites(
                 &mut binary.rhs,
@@ -541,6 +671,7 @@ fn rewrite_expr_use_sites(
                 replacement,
                 InlineSite::Neutral,
                 options,
+                policy,
             );
             changed
         }
@@ -551,6 +682,7 @@ fn rewrite_expr_use_sites(
                 replacement,
                 InlineSite::Neutral,
                 options,
+                policy,
             );
             changed |= rewrite_expr_use_sites(
                 &mut logical.rhs,
@@ -558,6 +690,7 @@ fn rewrite_expr_use_sites(
                 replacement,
                 InlineSite::Neutral,
                 options,
+                policy,
             );
             changed
         }
@@ -568,6 +701,7 @@ fn rewrite_expr_use_sites(
                 replacement,
                 InlineSite::CallCallee,
                 options,
+                policy,
             );
             changed |= rewrite_expr_list_context(
                 &mut call.args,
@@ -575,6 +709,7 @@ fn rewrite_expr_use_sites(
                 replacement,
                 InlineSite::CallArg,
                 options,
+                policy,
             );
             changed
         }
@@ -585,6 +720,7 @@ fn rewrite_expr_use_sites(
                 replacement,
                 InlineSite::Neutral,
                 options,
+                policy,
             );
             changed |= rewrite_expr_list_context(
                 &mut call.args,
@@ -592,6 +728,7 @@ fn rewrite_expr_use_sites(
                 replacement,
                 InlineSite::CallArg,
                 options,
+                policy,
             );
             changed
         }
@@ -606,6 +743,7 @@ fn rewrite_expr_use_sites(
                             replacement,
                             InlineSite::Neutral,
                             options,
+                            policy,
                         );
                     }
                     AstTableField::Record(record) => {
@@ -616,6 +754,7 @@ fn rewrite_expr_use_sites(
                                 replacement,
                                 InlineSite::Index,
                                 options,
+                                policy,
                             );
                         }
                         changed |= rewrite_expr_use_sites(
@@ -624,6 +763,7 @@ fn rewrite_expr_use_sites(
                             replacement,
                             InlineSite::Neutral,
                             options,
+                            policy,
                         );
                     }
                 }
@@ -947,6 +1087,12 @@ enum InlineSite {
     AccessBase,
 }
 
+#[derive(Clone, Copy)]
+enum InlinePolicy {
+    Conservative,
+    ExtendedCallChain,
+}
+
 impl InlineSite {
     fn allows(
         self,
@@ -954,18 +1100,33 @@ impl InlineSite {
         use_expr: &AstExpr,
         replacement: &AstExpr,
         options: ReadabilityOptions,
+        policy: InlinePolicy,
     ) -> bool {
-        if matches!(candidate, InlineCandidate::LocalAlias(_))
-            && !matches!(self, Self::CallCallee | Self::AccessBase)
+        if !matches!(use_expr, AstExpr::Var(name) if name_matches_binding(name, candidate.binding()))
         {
             return false;
         }
-        matches!(use_expr, AstExpr::Var(name) if name_matches_binding(name, candidate.binding()))
-            && self
-                .complexity_limit(options)
-                .is_some_and(|limit| expr_complexity(replacement) <= limit)
-            && (!matches!(self, Self::AccessBase | Self::CallCallee)
-                || is_access_base_inline_expr(replacement))
+
+        let Some(limit) = self.complexity_limit(options) else {
+            return false;
+        };
+        if expr_complexity(replacement) > limit {
+            return false;
+        }
+
+        match candidate {
+            InlineCandidate::TempLike(_) => {
+                !matches!(self, Self::AccessBase | Self::CallCallee)
+                    || is_access_base_inline_expr(replacement)
+            }
+            InlineCandidate::LocalAlias(_) => match policy {
+                InlinePolicy::Conservative => {
+                    matches!(self, Self::CallCallee | Self::AccessBase)
+                        && is_access_base_inline_expr(replacement)
+                }
+                InlinePolicy::ExtendedCallChain => self.allows_extended_local_alias(replacement),
+            },
+        }
     }
 
     fn complexity_limit(self, options: ReadabilityOptions) -> Option<usize> {
@@ -992,6 +1153,21 @@ impl InlineSite {
             | Self::AccessBase => Self::Neutral,
         }
     }
+
+    fn allows_extended_local_alias(self, replacement: &AstExpr) -> bool {
+        match self {
+            Self::CallCallee => {
+                is_access_base_inline_expr(replacement) || is_recallable_inline_expr(replacement)
+            }
+            Self::CallArg => is_context_safe_expr(replacement),
+            Self::AccessBase => is_access_base_inline_expr(replacement),
+            Self::Neutral | Self::ReturnValue | Self::Index => false,
+        }
+    }
+}
+
+fn is_recallable_inline_expr(expr: &AstExpr) -> bool {
+    matches!(expr, AstExpr::Call(_) | AstExpr::MethodCall(_))
 }
 
 fn name_matches_binding(name: &AstNameRef, binding: AstBindingRef) -> bool {
@@ -1370,6 +1546,143 @@ mod tests {
                 },
             }
         ));
+    }
+
+    #[test]
+    fn collapses_adjacent_local_alias_run_into_final_call_stmt() {
+        let print_alias = LocalId(0);
+        let label_alias = LocalId(1);
+        let stage_alias = LocalId(2);
+        let mut module = AstModule {
+            entry_function: Default::default(),
+            body: crate::ast::AstBlock {
+                stmts: vec![
+                    AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                        bindings: vec![AstLocalBinding {
+                            id: crate::ast::AstBindingRef::Local(print_alias),
+                            attr: AstLocalAttr::None,
+                        }],
+                        values: vec![AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "print".to_owned(),
+                        }))],
+                    })),
+                    AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                        bindings: vec![AstLocalBinding {
+                            id: crate::ast::AstBindingRef::Local(label_alias),
+                            attr: AstLocalAttr::None,
+                        }],
+                        values: vec![AstExpr::String("nested-closure".to_owned())],
+                    })),
+                    AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                        bindings: vec![AstLocalBinding {
+                            id: crate::ast::AstBindingRef::Local(stage_alias),
+                            attr: AstLocalAttr::None,
+                        }],
+                        values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                            callee: AstExpr::Var(AstNameRef::Local(LocalId(3))),
+                            args: vec![AstExpr::Integer(1)],
+                        }))],
+                    })),
+                    AstStmt::CallStmt(Box::new(crate::ast::AstCallStmt {
+                        call: AstCallKind::Call(Box::new(AstCallExpr {
+                            callee: AstExpr::Var(AstNameRef::Local(print_alias)),
+                            args: vec![
+                                AstExpr::Var(AstNameRef::Local(label_alias)),
+                                AstExpr::Call(Box::new(AstCallExpr {
+                                    callee: AstExpr::Var(AstNameRef::Local(stage_alias)),
+                                    args: vec![AstExpr::Integer(2)],
+                                })),
+                            ],
+                        })),
+                    })),
+                ],
+            },
+        };
+
+        assert!(apply(
+            &mut module,
+            ReadabilityContext {
+                target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+                options: ReadabilityOptions::default(),
+            }
+        ));
+        assert_eq!(
+            module.body.stmts,
+            vec![AstStmt::CallStmt(Box::new(crate::ast::AstCallStmt {
+                call: AstCallKind::Call(Box::new(AstCallExpr {
+                    callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                        text: "print".to_owned(),
+                    })),
+                    args: vec![
+                        AstExpr::String("nested-closure".to_owned()),
+                        AstExpr::Call(Box::new(AstCallExpr {
+                            callee: AstExpr::Call(Box::new(AstCallExpr {
+                                callee: AstExpr::Var(AstNameRef::Local(LocalId(3))),
+                                args: vec![AstExpr::Integer(1)],
+                            })),
+                            args: vec![AstExpr::Integer(2)],
+                        })),
+                    ],
+                })),
+            }))]
+        );
+    }
+
+    #[test]
+    fn does_not_collapse_single_call_chain_alias_before_final_call_stmt() {
+        let stage1 = LocalId(0);
+        let stage2 = LocalId(1);
+        let mut module = AstModule {
+            entry_function: Default::default(),
+            body: crate::ast::AstBlock {
+                stmts: vec![
+                    AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                        bindings: vec![AstLocalBinding {
+                            id: crate::ast::AstBindingRef::Local(stage1),
+                            attr: AstLocalAttr::None,
+                        }],
+                        values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                            callee: AstExpr::Var(AstNameRef::Local(LocalId(2))),
+                            args: vec![AstExpr::Integer(2)],
+                        }))],
+                    })),
+                    AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                        bindings: vec![AstLocalBinding {
+                            id: crate::ast::AstBindingRef::Local(stage2),
+                            attr: AstLocalAttr::None,
+                        }],
+                        values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                            callee: AstExpr::Var(AstNameRef::Local(stage1)),
+                            args: vec![AstExpr::Integer(3)],
+                        }))],
+                    })),
+                    AstStmt::CallStmt(Box::new(crate::ast::AstCallStmt {
+                        call: AstCallKind::Call(Box::new(AstCallExpr {
+                            callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                                text: "print".to_owned(),
+                            })),
+                            args: vec![
+                                AstExpr::String("nested-closure".to_owned()),
+                                AstExpr::Call(Box::new(AstCallExpr {
+                                    callee: AstExpr::Var(AstNameRef::Local(stage2)),
+                                    args: vec![AstExpr::Integer(4)],
+                                })),
+                            ],
+                        })),
+                    })),
+                ],
+            },
+        };
+
+        let before = module.clone();
+        assert!(!apply(
+            &mut module,
+            ReadabilityContext {
+                target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+                options: ReadabilityOptions::default(),
+            }
+        ));
+        assert_eq!(module.body.stmts, before.body.stmts);
     }
 
     #[test]
