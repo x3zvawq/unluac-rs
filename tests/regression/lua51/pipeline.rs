@@ -813,6 +813,78 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn generic_for_mutator_hir_keeps_guard_return_without_synthetic_continue() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/11_generic_for_mutator.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("generic_for_mutator hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("generic-for l0, l1 in"), "{dump}");
+        assert!(
+            dump.contains("assign l2 = (((l2 + l3) + l4) + l5)"),
+            "{dump}"
+        );
+        assert!(dump.contains("if (20 < l2)"), "{dump}");
+        assert!(dump.contains("return l3, l4, l5, l2"), "{dump}");
+        assert!(!dump.contains("continue"), "{dump}");
+    }
+
+    #[test]
+    fn generic_for_mutator_generate_restores_guard_return_shape_without_continue() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/11_generic_for_mutator.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("generic_for_mutator generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(generated.source.contains("for "), "{}", generated.source);
+        assert!(
+            generated.source.contains("in ipairs("),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("> 20 then"),
+            "{}",
+            generated.source
+        );
+        assert!(generated.source.contains("return "), "{}", generated.source);
+        assert!(!generated.source.contains("else"), "{}", generated.source);
+        assert!(
+            !generated.source.contains("continue"),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
     fn return_truncation_hir_folds_set_list_tail_into_table_constructor() {
         let result = decompile(
             &compile_lua_case(
@@ -876,6 +948,112 @@ mod decompile_pipeline {
             generated
                 .source
                 .contains("print(\"ret\", table.concat(r0_1, \",\"))"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("table-set-list"),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
+    fn crazy_table_init_hir_folds_mixed_constructor_without_residual_set_list() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/12_crazy_table_init.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("crazy_table_init hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("table(array=5, record=3"), "{dump}");
+        assert!(
+            dump.contains("trailing=call(normal) global(string)[\"byte\"](\"A\") multiret=true"),
+            "{dump}"
+        );
+        assert!(!dump.contains("table-set-list"), "{dump}");
+    }
+
+    #[test]
+    fn crazy_table_init_generate_restores_mixed_table_literal_shape() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/12_crazy_table_init.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("crazy_table_init generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated.source.contains("local function"),
+            "{}",
+            generated.source
+        );
+        assert!(generated.source.contains("a = 4"), "{}", generated.source);
+        assert!(generated.source.contains("[5] = 6"), "{}", generated.source);
+        assert!(
+            generated.source.contains("f = function()"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("string.byte(\"A\")"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("print(\"crazy-table\""),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains(
+                "print(\"crazy-table\", result[1], result[2], result[3], result[4], result[5], result[6], result.a, result.f())"
+            ),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local item = result[1]"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local item2 = result[2]"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local a = result.a"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("result.f()"),
             "{}",
             generated.source
         );

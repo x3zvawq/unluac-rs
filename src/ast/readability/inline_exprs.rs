@@ -1052,6 +1052,10 @@ fn is_extended_neutral_local_alias_expr(expr: &AstExpr) -> bool {
     is_context_safe_expr(expr) || is_lookup_inline_expr(expr)
 }
 
+fn is_extended_call_arg_local_alias_expr(expr: &AstExpr) -> bool {
+    is_context_safe_expr(expr) || is_lookup_inline_expr(expr)
+}
+
 fn is_named_field_chain_expr(expr: &AstExpr) -> bool {
     let AstExpr::FieldAccess(access) = expr else {
         return false;
@@ -1264,9 +1268,13 @@ impl InlineSite {
             }
             Self::CallCallee => is_call_callee_inline_expr(replacement),
             Self::CallArgNonFinal => {
-                is_context_safe_expr(replacement) || is_recallable_inline_expr(replacement)
+                is_extended_call_arg_local_alias_expr(replacement)
+                    || is_recallable_inline_expr(replacement)
             }
-            Self::CallArgFinal => is_context_safe_expr(replacement),
+            // 这里只有在“局部别名包折回最终调用”时，才允许把纯 lookup 收回参数位。
+            // 这能把 `local x = t[1]; local y = t.a; print(x, y)` 这类机械展开收回去，
+            // 同时仍然不放宽到任意调用结果，避免把阶段 local 继续吞掉。
+            Self::CallArgFinal => is_extended_call_arg_local_alias_expr(replacement),
             Self::AccessBase => is_access_base_inline_expr(replacement),
             Self::ReturnValue | Self::Index => false,
         }

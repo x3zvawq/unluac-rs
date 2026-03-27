@@ -28,6 +28,12 @@ enum RegionStep {
     SetList(HirTableSetList),
 }
 
+#[derive(Debug, Clone)]
+enum SegmentToken {
+    Producer(TableBinding),
+    Record(crate::hir::common::HirRecordField),
+}
+
 pub(super) fn stabilize_table_constructors_in_proto(proto: &mut HirProto) -> bool {
     stabilize_block(&mut proto.body)
 }
@@ -200,13 +206,6 @@ fn keyed_write_step(
     if binding_from_expr(&access.base) != Some(binding) {
         return None;
     }
-    // 后续 `obj.method = function(...) ... end` 这类赋值，源码层通常更像独立的方法声明，
-    // 而不是字面量里本来就写着的函数字段。这里如果把 closure 继续吞进构造器，
-    // 后面的 AST/readability 就失去了恢复 `function obj:method()` / `function obj.method()`
-    // 的结构信息，所以直接把 region 边界停在这里。
-    if matches!(value, HirExpr::Closure(_)) {
-        return None;
-    }
     if expr_uses_binding(&access.key, binding) || expr_uses_binding(value, binding) {
         return None;
     }
@@ -280,79 +279,176 @@ fn rebuild_constructor_from_steps(
     remaining_stmts: &[HirStmt],
 ) -> Option<HirTableConstructor> {
     let remaining_uses = collect_stmt_slice_bindings(remaining_stmts);
-    let mut pending_producers = Vec::<(TableBinding, HirExpr)>::new();
-    let mut consumed = std::collections::BTreeSet::new();
+    let region_contains_set_list = steps
+        .iter()
+        .any(|step| matches!(step, RegionStep::SetList(_)));
+    let mut pending_segment = Vec::new();
 
     for step in steps {
         match step {
-            RegionStep::Producer(binding, value) => {
-                pending_producers.push((*binding, value.clone()));
-            }
-            RegionStep::Record(field) => {
-                let value = inline_constructor_value(
-                    &field.value,
-                    &pending_producers,
-                    &mut consumed,
-                    &remaining_uses,
-                )?;
-                if matches!(value, HirExpr::Closure(_)) {
-                    return None;
-                }
-                constructor.fields.push(HirTableField::Record(
-                    crate::hir::common::HirRecordField {
-                        key: field.key.clone(),
-                        value,
-                    },
-                ));
+            RegionStep::Producer(_, _) | RegionStep::Record(_) => {
+                pending_segment.push(step.clone())
             }
             RegionStep::SetList(set_list) => {
-                if set_list.start_index != next_array_index(&constructor) {
-                    return None;
-                }
-
-                for value in &set_list.values {
-                    let value = inline_constructor_value(
-                        value,
-                        &pending_producers,
-                        &mut consumed,
-                        &remaining_uses,
-                    )?;
-                    constructor.fields.push(HirTableField::Array(value));
-                }
-                if let Some(trailing) = &set_list.trailing_multivalue {
-                    if expr_depends_on_any_binding(
-                        trailing,
-                        &pending_producers
-                            .iter()
-                            .filter(|(binding, _)| !consumed.contains(binding))
-                            .map(|(binding, _)| *binding)
-                            .collect::<Vec<_>>(),
-                    ) {
-                        return None;
-                    }
-                    constructor.trailing_multivalue = Some(trailing.clone());
-                }
-
-                if pending_producers
-                    .iter()
-                    .any(|(binding, _)| !consumed.contains(binding))
-                {
-                    return None;
-                }
-                pending_producers.clear();
-                consumed.clear();
+                flush_constructor_segment(
+                    &mut constructor,
+                    &pending_segment,
+                    Some(set_list),
+                    &remaining_uses,
+                    region_contains_set_list,
+                )?;
+                pending_segment.clear();
             }
         }
     }
 
-    if pending_producers
+    flush_constructor_segment(
+        &mut constructor,
+        &pending_segment,
+        None,
+        &remaining_uses,
+        region_contains_set_list,
+    )?;
+
+    Some(constructor)
+}
+
+fn flush_constructor_segment(
+    constructor: &mut HirTableConstructor,
+    segment: &[RegionStep],
+    set_list: Option<&HirTableSetList>,
+    remaining_uses: &std::collections::BTreeSet<TableBinding>,
+    allow_closure_records: bool,
+) -> Option<()> {
+    if segment.is_empty() {
+        if let Some(set_list) = set_list {
+            if set_list.start_index != next_array_index(constructor) {
+                return None;
+            }
+            for value in &set_list.values {
+                constructor.fields.push(HirTableField::Array(value.clone()));
+            }
+            if let Some(trailing) = &set_list.trailing_multivalue {
+                constructor.trailing_multivalue = Some(trailing.clone());
+            }
+        }
+        return Some(());
+    }
+
+    let mut producer_values = Vec::<(TableBinding, HirExpr)>::new();
+    let mut tokens = Vec::<SegmentToken>::new();
+    let mut consumed = std::collections::BTreeSet::new();
+
+    for step in segment {
+        match step {
+            RegionStep::Producer(binding, value) => {
+                producer_values.push((*binding, value.clone()));
+                tokens.push(SegmentToken::Producer(*binding));
+            }
+            RegionStep::Record(field) => {
+                let value = inline_constructor_value(
+                    &field.value,
+                    &producer_values,
+                    &mut consumed,
+                    remaining_uses,
+                )?;
+                // 只有能证明这段 region 还处在字面量初始化 flush 里时，才允许继续吸收
+                // `field = function() ... end`。如果整段根本没有 `SETLIST`，这类 closure
+                // 赋值更像“先建表、再挂方法”，需要把结构机会留给后续 method sugar。
+                if matches!(value, HirExpr::Closure(_)) && !allow_closure_records {
+                    return None;
+                }
+                tokens.push(SegmentToken::Record(crate::hir::common::HirRecordField {
+                    key: field.key.clone(),
+                    value,
+                }));
+            }
+            RegionStep::SetList(_) => unreachable!("set-list should terminate constructor segment"),
+        }
+    }
+
+    if let Some(set_list) = set_list {
+        if set_list.start_index != next_array_index(constructor) {
+            return None;
+        }
+
+        let mut queued_values = std::collections::VecDeque::from(set_list.values.clone());
+        for token in tokens {
+            match token {
+                SegmentToken::Producer(binding) => {
+                    if consumed.contains(&binding) {
+                        continue;
+                    }
+                    let Some(producer_value) =
+                        producer_value_for_binding(&producer_values, binding)
+                    else {
+                        return None;
+                    };
+                    match queued_values.front() {
+                        Some(front) if matches_binding_ref(front, binding) => {
+                            if remaining_uses.contains(&binding) {
+                                return None;
+                            }
+                            consumed.insert(binding);
+                            queued_values.pop_front();
+                            constructor
+                                .fields
+                                .push(HirTableField::Array(producer_value.clone()));
+                        }
+                        Some(_)
+                            if queued_values
+                                .iter()
+                                .any(|value| matches_binding_ref(value, binding)) =>
+                        {
+                            // Lua 编译器为构造器批量刷出的 `SETLIST` 顺序和源码数组项顺序一致。
+                            // 如果 producer 在 token 序里出现得更早，却在 set-list 队列里更晚，
+                            // 说明这段 region 已经不是我们能稳定证明的字面量顺序。
+                            return None;
+                        }
+                        _ => {}
+                    }
+                }
+                SegmentToken::Record(field) => {
+                    constructor.fields.push(HirTableField::Record(field))
+                }
+            }
+        }
+
+        for value in queued_values {
+            let value =
+                inline_constructor_value(&value, &producer_values, &mut consumed, remaining_uses)?;
+            constructor.fields.push(HirTableField::Array(value));
+        }
+
+        if let Some(trailing) = &set_list.trailing_multivalue {
+            let trailing = inline_constructor_value(
+                trailing,
+                &producer_values,
+                &mut consumed,
+                remaining_uses,
+            )?;
+            constructor.trailing_multivalue = Some(trailing);
+        }
+    } else {
+        for token in tokens {
+            match token {
+                SegmentToken::Producer(binding) if !consumed.contains(&binding) => return None,
+                SegmentToken::Producer(_) => {}
+                SegmentToken::Record(field) => {
+                    constructor.fields.push(HirTableField::Record(field))
+                }
+            }
+        }
+    }
+
+    if producer_values
         .iter()
         .any(|(binding, _)| !consumed.contains(binding))
     {
         return None;
     }
 
-    Some(constructor)
+    Some(())
 }
 
 fn next_array_index(constructor: &HirTableConstructor) -> u32 {
@@ -610,14 +706,92 @@ fn inline_constructor_value(
     consumed: &mut std::collections::BTreeSet<TableBinding>,
     remaining_uses: &std::collections::BTreeSet<TableBinding>,
 ) -> Option<HirExpr> {
+    inline_constructor_value_at_site(
+        value,
+        pending_producers,
+        consumed,
+        remaining_uses,
+        ConstructorInlineSite::Neutral,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ConstructorInlineSite {
+    Neutral,
+    CallCallee,
+    AccessBase,
+}
+
+fn inline_constructor_value_at_site(
+    value: &HirExpr,
+    pending_producers: &[(TableBinding, HirExpr)],
+    consumed: &mut std::collections::BTreeSet<TableBinding>,
+    remaining_uses: &std::collections::BTreeSet<TableBinding>,
+    site: ConstructorInlineSite,
+) -> Option<HirExpr> {
     for (binding, producer_value) in pending_producers {
         if matches_binding_ref(value, *binding) {
             if remaining_uses.contains(binding) {
                 return None;
             }
+            if !matches!(site, ConstructorInlineSite::Neutral)
+                && !is_constructor_access_base_inline_expr(producer_value)
+            {
+                return None;
+            }
             consumed.insert(*binding);
             return Some(producer_value.clone());
         }
+    }
+
+    match value {
+        HirExpr::TableAccess(access) => {
+            return Some(HirExpr::TableAccess(Box::new(
+                crate::hir::common::HirTableAccess {
+                    base: inline_constructor_value_at_site(
+                        &access.base,
+                        pending_producers,
+                        consumed,
+                        remaining_uses,
+                        ConstructorInlineSite::AccessBase,
+                    )?,
+                    key: inline_constructor_value_at_site(
+                        &access.key,
+                        pending_producers,
+                        consumed,
+                        remaining_uses,
+                        ConstructorInlineSite::Neutral,
+                    )?,
+                },
+            )));
+        }
+        HirExpr::Call(call) => {
+            return Some(HirExpr::Call(Box::new(crate::hir::common::HirCallExpr {
+                callee: inline_constructor_value_at_site(
+                    &call.callee,
+                    pending_producers,
+                    consumed,
+                    remaining_uses,
+                    ConstructorInlineSite::CallCallee,
+                )?,
+                args: call
+                    .args
+                    .iter()
+                    .map(|arg| {
+                        inline_constructor_value_at_site(
+                            arg,
+                            pending_producers,
+                            consumed,
+                            remaining_uses,
+                            ConstructorInlineSite::Neutral,
+                        )
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+                multiret: call.multiret,
+                method: call.method,
+            })));
+        }
+        _ => {}
     }
 
     if expr_depends_on_any_binding(
@@ -628,10 +802,35 @@ fn inline_constructor_value(
             .map(|(binding, _)| *binding)
             .collect::<Vec<_>>(),
     ) {
-        None
+        return None;
     } else {
         Some(value.clone())
     }
+}
+
+fn is_constructor_access_base_inline_expr(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::GlobalRef(_) => true,
+        HirExpr::TableAccess(access) => is_constructor_access_base_inline_expr(&access.base),
+        _ => false,
+    }
+}
+
+fn producer_value_for_binding(
+    producers: &[(TableBinding, HirExpr)],
+    binding: TableBinding,
+) -> Option<&HirExpr> {
+    producers
+        .iter()
+        .find_map(|(candidate, value)| (*candidate == binding).then_some(value))
 }
 
 fn call_expr_uses_binding(call: &crate::hir::common::HirCallExpr, binding: TableBinding) -> bool {

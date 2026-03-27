@@ -950,6 +950,142 @@ fn inlines_local_alias_inside_function_body_after_other_locals() {
 }
 
 #[test]
+fn collapses_lookup_alias_run_back_into_final_print_args() {
+    let table_local = LocalId(0);
+    let item1 = LocalId(1);
+    let item2 = LocalId(2);
+    let item3 = LocalId(3);
+    let field_a = LocalId(4);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(table_local),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Local(LocalId(20))),
+                        args: Vec::new(),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(item1),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                        base: AstExpr::Var(AstNameRef::Local(table_local)),
+                        index: AstExpr::Integer(1),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(item2),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                        base: AstExpr::Var(AstNameRef::Local(table_local)),
+                        index: AstExpr::Integer(2),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(item3),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                        base: AstExpr::Var(AstNameRef::Local(table_local)),
+                        index: AstExpr::Integer(3),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(field_a),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Local(table_local)),
+                        field: "a".to_owned(),
+                    }))],
+                })),
+                AstStmt::CallStmt(Box::new(crate::ast::AstCallStmt {
+                    call: AstCallKind::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "print".to_owned(),
+                        })),
+                        args: vec![
+                            AstExpr::String("crazy-table".to_owned()),
+                            AstExpr::Var(AstNameRef::Local(item1)),
+                            AstExpr::Var(AstNameRef::Local(item2)),
+                            AstExpr::Var(AstNameRef::Local(item3)),
+                            AstExpr::Var(AstNameRef::Local(field_a)),
+                        ],
+                    })),
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+
+    assert_eq!(
+        module.body.stmts,
+        vec![
+            AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                bindings: vec![AstLocalBinding {
+                    id: crate::ast::AstBindingRef::Local(table_local),
+                    attr: AstLocalAttr::None,
+                    origin: crate::ast::AstLocalOrigin::Recovered,
+                }],
+                values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                    callee: AstExpr::Var(AstNameRef::Local(LocalId(20))),
+                    args: Vec::new(),
+                }))],
+            })),
+            AstStmt::CallStmt(Box::new(crate::ast::AstCallStmt {
+                call: AstCallKind::Call(Box::new(AstCallExpr {
+                    callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                        text: "print".to_owned(),
+                    })),
+                    args: vec![
+                        AstExpr::String("crazy-table".to_owned()),
+                        AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                            base: AstExpr::Var(AstNameRef::Local(table_local)),
+                            index: AstExpr::Integer(1),
+                        })),
+                        AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                            base: AstExpr::Var(AstNameRef::Local(table_local)),
+                            index: AstExpr::Integer(2),
+                        })),
+                        AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                            base: AstExpr::Var(AstNameRef::Local(table_local)),
+                            index: AstExpr::Integer(3),
+                        })),
+                        AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                            base: AstExpr::Var(AstNameRef::Local(table_local)),
+                            field: "a".to_owned(),
+                        })),
+                    ],
+                })),
+            })),
+        ]
+    );
+}
+
+#[test]
 fn folds_access_base_alias_into_adjacent_local_alias_initializer_chain() {
     let unpack_alias = LocalId(0);
     let fn_alias = LocalId(1);

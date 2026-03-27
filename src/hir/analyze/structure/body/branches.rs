@@ -317,6 +317,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let mut continue_cond = self.lower_branch_cond_for_target(block, continue_target)?;
         rewrite_expr_temps(&mut continue_cond, &temp_expr_overrides(target_overrides));
         let prefer_natural_fallthrough = self.prefer_natural_fallthrough_over_continue(
+            block,
             candidate,
             continue_target,
             &loop_context,
@@ -416,6 +417,21 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             // 隐式 merge 臂”。这里把 merge 臂显式降成 else block，避免 loop body 因为
             // “只有 then、没有 else” 被迫整片 fallback。
             let non_continue_entry = candidate.merge?;
+            if self.prefer_natural_fallthrough_over_continue(
+                block,
+                candidate,
+                continue_target,
+                &loop_context,
+            ) {
+                let non_continue_block =
+                    self.lower_region(non_continue_entry, stop, target_overrides)?;
+                stmts.push(branch_stmt(
+                    negate_expr(continue_cond),
+                    non_continue_block,
+                    None,
+                ));
+                return Some(None);
+            }
             let non_continue_block =
                 self.lower_region(non_continue_entry, stop, target_overrides)?;
             stmts.push(branch_stmt(
@@ -454,6 +470,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
     fn prefer_natural_fallthrough_over_continue(
         &self,
+        block: BlockRef,
         candidate: &BranchCandidate,
         continue_target: BlockRef,
         loop_context: &ActiveLoopContext,
@@ -466,6 +483,19 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         else {
             return false;
         };
+        // 只有当非 continue 臂本身就是 terminal exit，且从 CFG 上根本到不了当前
+        // continue target 时，才能确定它是“提前结束本轮/本函数”的 guard 分支。
+        // 像 repeat 里的 break funnel 虽然最终也可能不回到 continue target，但它本身
+        // 仍然是一个需要继续展开的控制块，不能在这里过早压平成 guard-return。
+        if !loop_context.continue_sources.contains(&block)
+            && matches!(
+                self.block_terminator(non_continue_entry),
+                Some((_instr_ref, LowInstr::Return(_) | LowInstr::TailCall(_)))
+            )
+            && !can_reach(self.lowering.cfg, non_continue_entry, continue_target)
+        {
+            return true;
+        }
 
         self.entry_is_break_funnel_to_continue(
             non_continue_entry,
