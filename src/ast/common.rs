@@ -7,8 +7,8 @@
 //! 的 provenance。这样后续 pass 在做 sugar 时可以依赖前层已经确认过的结构事实，
 //! 而不是回头重新猜测。
 
-use std::fmt;
 use std::collections::BTreeSet;
+use std::fmt;
 
 use crate::hir::{HirLabelId, HirProtoRef, LocalId, ParamId, TempId, UpvalueId};
 

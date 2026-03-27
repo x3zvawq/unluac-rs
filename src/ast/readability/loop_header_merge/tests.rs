@@ -1,12 +1,15 @@
 //! 这个文件承载 `loop_header_merge` 模块的局部不变量测试。
 
 use super::ReadabilityContext;
-use crate::ast::common::{AstBindingRef, AstLocalBinding, AstLocalOrigin, AstNameRef};
+use crate::ast::common::{
+    AstAssign, AstBinaryExpr, AstBinaryOpKind, AstBindingRef, AstLValue, AstLocalBinding,
+    AstLocalOrigin, AstNameRef, AstRepeat,
+};
 use crate::ast::{
     AstBlock, AstExpr, AstLocalAttr, AstLocalDecl, AstModule, AstNumericFor, AstStmt,
     AstTargetDialect,
 };
-use crate::hir::LocalId;
+use crate::hir::{LocalId, TempId};
 
 fn apply_loop_header_merge(module: &AstModule) -> AstModule {
     let mut module = module.clone();
@@ -89,6 +92,63 @@ fn does_not_collapse_when_header_alias_is_used_after_loop() {
         panic!("expected trailing return");
     };
     assert_eq!(ret.values, vec![AstExpr::Var(AstNameRef::Local(limit))]);
+}
+
+#[test]
+fn collapses_repeat_tail_temp_into_until_condition() {
+    let temp = TempId(0);
+    let carried = LocalId(0);
+    let limit = LocalId(1);
+    let module = AstModule {
+        entry_function: Default::default(),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Temp(temp),
+                        attr: AstLocalAttr::None,
+                        origin: AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![],
+                })),
+                AstStmt::Repeat(Box::new(AstRepeat {
+                    body: AstBlock {
+                        stmts: vec![AstStmt::Assign(Box::new(AstAssign {
+                            targets: vec![AstLValue::Name(AstNameRef::Temp(temp))],
+                            values: vec![AstExpr::Binary(Box::new(AstBinaryExpr {
+                                op: AstBinaryOpKind::Add,
+                                lhs: AstExpr::Var(AstNameRef::Local(limit)),
+                                rhs: AstExpr::Integer(10),
+                            }))],
+                        }))],
+                    },
+                    cond: AstExpr::Binary(Box::new(AstBinaryExpr {
+                        op: AstBinaryOpKind::Lt,
+                        lhs: AstExpr::Var(AstNameRef::Temp(temp)),
+                        rhs: AstExpr::Var(AstNameRef::Local(carried)),
+                    })),
+                })),
+            ],
+        },
+    };
+
+    let module = apply_loop_header_merge(&module);
+    let AstStmt::Repeat(repeat_stmt) = &module.body.stmts[1] else {
+        panic!("expected repeat statement to remain");
+    };
+    assert!(repeat_stmt.body.stmts.is_empty());
+    assert_eq!(
+        repeat_stmt.cond,
+        AstExpr::Binary(Box::new(AstBinaryExpr {
+            op: AstBinaryOpKind::Lt,
+            lhs: AstExpr::Binary(Box::new(AstBinaryExpr {
+                op: AstBinaryOpKind::Add,
+                lhs: AstExpr::Var(AstNameRef::Local(limit)),
+                rhs: AstExpr::Integer(10),
+            })),
+            rhs: AstExpr::Var(AstNameRef::Local(carried)),
+        }))
+    );
 }
 
 fn local_decl(binding: LocalId, value: AstExpr) -> AstStmt {

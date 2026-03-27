@@ -1980,8 +1980,62 @@ mod decompile_pipeline {
             "{}",
             generated.source
         );
-        assert!(!generated.source.contains("local r0_3 = r0_1[1]"), "{}", generated.source);
-        assert!(!generated.source.contains("local r0_5 = r0_1[3]"), "{}", generated.source);
+        assert!(
+            !generated.source.contains("local r0_3 = r0_1[1]"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local r0_5 = r0_1[3]"),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
+    fn while_repeat_closure_interleave_generate_keeps_outer_loop_binding_visible_in_until() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/30_while_repeat_closure_interleave.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                naming: NamingOptions {
+                    mode: NamingMode::DebugLike,
+                    debug_like_include_function: true,
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("while_repeat_closure_interleave generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated.source.contains("return r1_2 + p2_0, r1_0")
+                || generated.source.contains("return r1_3 + p2_0, r1_1"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("until r1_3 > r1_1 + 10")
+                || generated.source.contains("until r1_3 > (r1_1 + 10)")
+                || generated.source.contains("until r1_1 + 10 < r1_3")
+                || generated.source.contains("until r1_2 > r1_0 + 10")
+                || generated.source.contains("until r1_2 > (r1_0 + 10)")
+                || generated.source.contains("until r1_0 + 10 < r1_2"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local r1_0\n"),
+            "{}",
+            generated.source
+        );
     }
 }
 

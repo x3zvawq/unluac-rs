@@ -23,6 +23,14 @@ fn rewrite_block(block: &mut AstBlock, options: ReadabilityOptions) -> bool {
         changed |= rewrite_nested(stmt, options);
     }
 
+    for index in 0..block.stmts.len() {
+        let (head, tail) = block.stmts.split_at_mut(index + 1);
+        let Some(AstStmt::Repeat(repeat_stmt)) = head.last_mut() else {
+            continue;
+        };
+        changed |= collapse_repeat_tail_binding(repeat_stmt, tail, options);
+    }
+
     let old_stmts = std::mem::take(&mut block.stmts);
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut index = 0;
@@ -280,6 +288,72 @@ fn loop_header_candidate(
     Some((binding, value))
 }
 
+fn collapse_repeat_tail_binding(
+    repeat_stmt: &mut super::super::common::AstRepeat,
+    tail_stmts: &[AstStmt],
+    options: ReadabilityOptions,
+) -> bool {
+    let Some((binding, replacement)) = repeat_tail_candidate(repeat_stmt, options) else {
+        return false;
+    };
+    if count_binding_uses_in_stmts(tail_stmts, binding) != 0 {
+        return false;
+    }
+    if !replace_binding_use_in_expr(&mut repeat_stmt.cond, binding, &replacement) {
+        return false;
+    }
+    repeat_stmt.body.stmts.pop();
+    true
+}
+
+fn repeat_tail_candidate(
+    repeat_stmt: &super::super::common::AstRepeat,
+    options: ReadabilityOptions,
+) -> Option<(super::super::common::AstBindingRef, AstExpr)> {
+    let tail_index = repeat_stmt.body.stmts.len().checked_sub(1)?;
+    let tail_stmt = repeat_stmt.body.stmts.get(tail_index)?;
+    let (binding, value) = repeat_tail_assignment(tail_stmt)?;
+    if !matches!(
+        binding,
+        super::super::common::AstBindingRef::Temp(_)
+            | super::super::common::AstBindingRef::SyntheticLocal(_)
+    ) {
+        return None;
+    }
+    if !is_loop_header_inline_expr(value, options) {
+        return None;
+    }
+    if count_binding_uses_in_stmts(&repeat_stmt.body.stmts[..tail_index], binding) != 0 {
+        return None;
+    }
+    if repeat_stmt.body.stmts[..tail_index]
+        .iter()
+        .any(|stmt| stmt_mentions_binding_target(stmt, binding))
+    {
+        return None;
+    }
+    if count_name_expr_uses(&repeat_stmt.cond, binding) != 1 {
+        return None;
+    }
+    Some((binding, value.clone()))
+}
+
+fn repeat_tail_assignment(
+    stmt: &AstStmt,
+) -> Option<(super::super::common::AstBindingRef, &AstExpr)> {
+    let AstStmt::Assign(assign) = stmt else {
+        return None;
+    };
+    let [super::super::common::AstLValue::Name(name)] = assign.targets.as_slice() else {
+        return None;
+    };
+    let [value] = assign.values.as_slice() else {
+        return None;
+    };
+    let binding = binding_from_name_ref(name)?;
+    Some((binding, value))
+}
+
 fn is_loop_header_inline_expr(expr: &AstExpr, options: ReadabilityOptions) -> bool {
     expr_complexity(expr) <= options.return_inline_max_complexity
         && !matches!(
@@ -350,10 +424,212 @@ fn replace_exact_name_expr(
     }
 }
 
+fn replace_binding_use_in_expr(
+    expr: &mut AstExpr,
+    binding: super::super::common::AstBindingRef,
+    replacement: &AstExpr,
+) -> bool {
+    if matches!(expr, AstExpr::Var(name) if name_matches_binding(name, binding)) {
+        *expr = replacement.clone();
+        return true;
+    }
+
+    match expr {
+        AstExpr::FieldAccess(access) => {
+            replace_binding_use_in_expr(&mut access.base, binding, replacement)
+        }
+        AstExpr::IndexAccess(access) => {
+            replace_binding_use_in_expr(&mut access.base, binding, replacement)
+                | replace_binding_use_in_expr(&mut access.index, binding, replacement)
+        }
+        AstExpr::Unary(unary) => replace_binding_use_in_expr(&mut unary.expr, binding, replacement),
+        AstExpr::Binary(binary) => {
+            replace_binding_use_in_expr(&mut binary.lhs, binding, replacement)
+                | replace_binding_use_in_expr(&mut binary.rhs, binding, replacement)
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            replace_binding_use_in_expr(&mut logical.lhs, binding, replacement)
+                | replace_binding_use_in_expr(&mut logical.rhs, binding, replacement)
+        }
+        AstExpr::Call(call) => {
+            let mut changed = replace_binding_use_in_expr(&mut call.callee, binding, replacement);
+            for arg in &mut call.args {
+                changed |= replace_binding_use_in_expr(arg, binding, replacement);
+            }
+            changed
+        }
+        AstExpr::MethodCall(call) => {
+            let mut changed = replace_binding_use_in_expr(&mut call.receiver, binding, replacement);
+            for arg in &mut call.args {
+                changed |= replace_binding_use_in_expr(arg, binding, replacement);
+            }
+            changed
+        }
+        AstExpr::TableConstructor(table) => {
+            let mut changed = false;
+            for field in &mut table.fields {
+                changed |= match field {
+                    super::super::common::AstTableField::Array(value) => {
+                        replace_binding_use_in_expr(value, binding, replacement)
+                    }
+                    super::super::common::AstTableField::Record(record) => {
+                        let key_changed = match &mut record.key {
+                            super::super::common::AstTableKey::Name(_) => false,
+                            super::super::common::AstTableKey::Expr(key) => {
+                                replace_binding_use_in_expr(key, binding, replacement)
+                            }
+                        };
+                        key_changed
+                            | replace_binding_use_in_expr(&mut record.value, binding, replacement)
+                    }
+                };
+            }
+            changed
+        }
+        AstExpr::FunctionExpr(_) => false,
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Var(_)
+        | AstExpr::VarArg => false,
+    }
+}
+
 fn count_name_expr_uses(expr: &AstExpr, binding: super::super::common::AstBindingRef) -> usize {
     match expr {
         AstExpr::Var(name) if name_matches_binding(name, binding) => 1,
-        _ => 0,
+        AstExpr::FieldAccess(access) => count_name_expr_uses(&access.base, binding),
+        AstExpr::IndexAccess(access) => {
+            count_name_expr_uses(&access.base, binding)
+                + count_name_expr_uses(&access.index, binding)
+        }
+        AstExpr::Unary(unary) => count_name_expr_uses(&unary.expr, binding),
+        AstExpr::Binary(binary) => {
+            count_name_expr_uses(&binary.lhs, binding) + count_name_expr_uses(&binary.rhs, binding)
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            count_name_expr_uses(&logical.lhs, binding)
+                + count_name_expr_uses(&logical.rhs, binding)
+        }
+        AstExpr::Call(call) => {
+            count_name_expr_uses(&call.callee, binding)
+                + call
+                    .args
+                    .iter()
+                    .map(|arg| count_name_expr_uses(arg, binding))
+                    .sum::<usize>()
+        }
+        AstExpr::MethodCall(call) => {
+            count_name_expr_uses(&call.receiver, binding)
+                + call
+                    .args
+                    .iter()
+                    .map(|arg| count_name_expr_uses(arg, binding))
+                    .sum::<usize>()
+        }
+        AstExpr::TableConstructor(table) => table
+            .fields
+            .iter()
+            .map(|field| match field {
+                super::super::common::AstTableField::Array(value) => {
+                    count_name_expr_uses(value, binding)
+                }
+                super::super::common::AstTableField::Record(record) => {
+                    let key_uses = match &record.key {
+                        super::super::common::AstTableKey::Name(_) => 0,
+                        super::super::common::AstTableKey::Expr(key) => {
+                            count_name_expr_uses(key, binding)
+                        }
+                    };
+                    key_uses + count_name_expr_uses(&record.value, binding)
+                }
+            })
+            .sum(),
+        AstExpr::FunctionExpr(_)
+        | AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Var(_)
+        | AstExpr::VarArg => 0,
+    }
+}
+
+fn stmt_mentions_binding_target(
+    stmt: &AstStmt,
+    binding: super::super::common::AstBindingRef,
+) -> bool {
+    match stmt {
+        AstStmt::LocalDecl(local_decl) => local_decl
+            .bindings
+            .iter()
+            .any(|local_binding| local_binding.id == binding),
+        AstStmt::Assign(assign) => assign
+            .targets
+            .iter()
+            .any(|target| lvalue_mentions_binding_target(target, binding)),
+        AstStmt::If(if_stmt) => {
+            block_mentions_binding_target(&if_stmt.then_block, binding)
+                || if_stmt
+                    .else_block
+                    .as_ref()
+                    .is_some_and(|else_block| block_mentions_binding_target(else_block, binding))
+        }
+        AstStmt::While(while_stmt) => block_mentions_binding_target(&while_stmt.body, binding),
+        AstStmt::Repeat(repeat_stmt) => block_mentions_binding_target(&repeat_stmt.body, binding),
+        AstStmt::NumericFor(numeric_for) => {
+            numeric_for.binding == binding
+                || block_mentions_binding_target(&numeric_for.body, binding)
+        }
+        AstStmt::GenericFor(generic_for) => {
+            generic_for.bindings.contains(&binding)
+                || block_mentions_binding_target(&generic_for.body, binding)
+        }
+        AstStmt::DoBlock(block) => block_mentions_binding_target(block, binding),
+        AstStmt::LocalFunctionDecl(function_decl) => function_decl.name == binding,
+        AstStmt::GlobalDecl(_)
+        | AstStmt::CallStmt(_)
+        | AstStmt::Return(_)
+        | AstStmt::FunctionDecl(_)
+        | AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_) => false,
+    }
+}
+
+fn block_mentions_binding_target(
+    block: &AstBlock,
+    binding: super::super::common::AstBindingRef,
+) -> bool {
+    block
+        .stmts
+        .iter()
+        .any(|stmt| stmt_mentions_binding_target(stmt, binding))
+}
+
+fn lvalue_mentions_binding_target(
+    lvalue: &super::super::common::AstLValue,
+    binding: super::super::common::AstBindingRef,
+) -> bool {
+    match lvalue {
+        super::super::common::AstLValue::Name(name) => binding_from_name_ref(name) == Some(binding),
+        super::super::common::AstLValue::FieldAccess(_)
+        | super::super::common::AstLValue::IndexAccess(_) => false,
+    }
+}
+
+fn binding_from_name_ref(name: &AstNameRef) -> Option<super::super::common::AstBindingRef> {
+    match name {
+        AstNameRef::Local(local) => Some(super::super::common::AstBindingRef::Local(*local)),
+        AstNameRef::Temp(temp) => Some(super::super::common::AstBindingRef::Temp(*temp)),
+        AstNameRef::SyntheticLocal(local) => {
+            Some(super::super::common::AstBindingRef::SyntheticLocal(*local))
+        }
+        AstNameRef::Param(_) | AstNameRef::Upvalue(_) | AstNameRef::Global(_) => None,
     }
 }
 

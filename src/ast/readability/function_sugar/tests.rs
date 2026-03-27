@@ -146,9 +146,7 @@ fn keeps_recursive_local_function_binding_before_table_slot_forwarding() {
                                 }))],
                             }))],
                         },
-                        captured_bindings: [AstBindingRef::Local(LocalId(2))]
-                            .into_iter()
-                            .collect(),
+                        captured_bindings: [AstBindingRef::Local(LocalId(2))].into_iter().collect(),
                     }))],
                 })),
                 AstStmt::Assign(Box::new(AstAssign {

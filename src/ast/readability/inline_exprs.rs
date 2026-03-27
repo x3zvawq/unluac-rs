@@ -396,7 +396,10 @@ fn stmt_is_adjacent_call_result_sink(stmt: &AstStmt) -> bool {
             .values
             .iter()
             .any(expr_contains_direct_call_callee_var),
-        AstStmt::Assign(assign) => assign.values.iter().any(expr_contains_direct_call_callee_var),
+        AstStmt::Assign(assign) => assign
+            .values
+            .iter()
+            .any(expr_contains_direct_call_callee_var),
         AstStmt::Return(ret) => ret.values.iter().any(expr_contains_direct_call_callee_var),
         AstStmt::GlobalDecl(_)
         | AstStmt::CallStmt(_)
