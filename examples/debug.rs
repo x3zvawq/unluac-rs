@@ -16,24 +16,26 @@ use unluac::naming::{NamingMode, NamingOptions};
 use unluac::parser::{ParseMode, ParseOptions, StringDecodeMode, StringEncoding};
 
 /// 开发时最常改的是这几个常量，直接编辑代码通常比来回敲命令更顺手。
-const DIALECT: DecompileDialect = DecompileDialect::Lua55;
-const SOURCE: &str = "tests/lua_cases/lua5.5/02_global_function_capture.lua";
+const DIALECT: DecompileDialect = DecompileDialect::Luau;
+const SOURCE: &str = "tests/lua_cases/luau/01_continue_compound_pipeline.lua";
 const STRING_ENCODING: StringEncoding = StringEncoding::Utf8;
 const STRING_DECODE_MODE: StringDecodeMode = StringDecodeMode::Strict;
 const PARSE_MODE: ParseMode = ParseMode::Strict;
-// 这个入口更常用来直接看“最终会长成什么源码形状”，所以默认停在 Readability。
+// 这个入口更常用来直接看“最终会长成什么源码形状”，所以默认停在 Generate。
 const TARGET_STAGE: DecompileStage = DecompileStage::Generate;
 const DEBUG_DETAIL: DebugDetail = DebugDetail::Verbose;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompilerProtocol {
+    LuacStyle,
+    LuauBinaryStdout,
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source = repo_root.join(SOURCE);
-    let luac = repo_root
-        .join("lua")
-        .join("build")
-        .join(DIALECT.label())
-        .join("luac");
-    let chunk = compile_source(&luac, &source, DIALECT)?;
+    let compiler = bundled_compiler_path(&repo_root, DIALECT);
+    let chunk = compile_source(&compiler, &source, DIALECT)?;
     let bytes = fs::read(&chunk)?;
 
     let result = decompile(
@@ -71,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("== Debug Input ==");
     println!("dialect: {}", DIALECT.label());
     println!("source: {}", source.display());
-    println!("luac:   {}", luac.display());
+    println!("compiler: {}", compiler.display());
     println!("chunk:  {}", chunk.display());
     println!();
 
@@ -109,15 +111,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn compile_source(
-    luac: &Path,
+    compiler: &Path,
     source: &Path,
     dialect: DecompileDialect,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    if !luac.exists() {
+    if !compiler.exists() {
         return Err(format!(
-            "missing bundled luac for {}: {}",
+            "missing bundled compiler for {}: {}",
             dialect.label(),
-            luac.display()
+            compiler.display()
         )
         .into());
     }
@@ -133,17 +135,76 @@ fn compile_source(
         .file_stem()
         .and_then(OsStr::to_str)
         .unwrap_or("debug");
-    let output = output_dir.join(format!("{file_stem}.out"));
+    let output = output_dir.join(format!("{file_stem}.{}", compiled_chunk_extension(dialect)));
 
-    let status = Command::new(luac)
-        .arg("-s")
-        .arg("-o")
-        .arg(&output)
-        .arg(source)
-        .status()?;
-    if !status.success() {
-        return Err(format!("luac exited with status {status}").into());
+    match compiler_protocol(dialect) {
+        CompilerProtocol::LuacStyle => {
+            let status = Command::new(compiler)
+                .arg("-s")
+                .arg("-o")
+                .arg(&output)
+                .arg(source)
+                .status()?;
+            if !status.success() {
+                return Err(format!("compiler exited with status {status}").into());
+            }
+        }
+        CompilerProtocol::LuauBinaryStdout => {
+            // Luau 的编译器不会原地写输出文件，必须显式接住 stdout 再落盘。
+            let command_output = Command::new(compiler)
+                .arg("--binary")
+                .arg("-g0")
+                .arg(source)
+                .output()?;
+            if !command_output.status.success() {
+                return Err(
+                    format!("compiler exited with status {}", command_output.status).into(),
+                );
+            }
+            fs::write(&output, &command_output.stdout)?;
+        }
     }
 
     Ok(output)
+}
+
+fn bundled_compiler_path(repo_root: &Path, dialect: DecompileDialect) -> PathBuf {
+    repo_root
+        .join("lua")
+        .join("build")
+        .join(dialect.label())
+        .join(bundled_compiler_name(dialect))
+}
+
+fn bundled_compiler_name(dialect: DecompileDialect) -> &'static str {
+    match dialect {
+        DecompileDialect::Lua51
+        | DecompileDialect::Lua52
+        | DecompileDialect::Lua53
+        | DecompileDialect::Lua54
+        | DecompileDialect::Lua55 => "luac",
+        DecompileDialect::Luau => "luau-compile",
+    }
+}
+
+fn compiler_protocol(dialect: DecompileDialect) -> CompilerProtocol {
+    match dialect {
+        DecompileDialect::Lua51
+        | DecompileDialect::Lua52
+        | DecompileDialect::Lua53
+        | DecompileDialect::Lua54
+        | DecompileDialect::Lua55 => CompilerProtocol::LuacStyle,
+        DecompileDialect::Luau => CompilerProtocol::LuauBinaryStdout,
+    }
+}
+
+fn compiled_chunk_extension(dialect: DecompileDialect) -> &'static str {
+    match dialect {
+        DecompileDialect::Lua51
+        | DecompileDialect::Lua52
+        | DecompileDialect::Lua53
+        | DecompileDialect::Lua54
+        | DecompileDialect::Lua55 => "out",
+        DecompileDialect::Luau => "luau",
+    }
 }
