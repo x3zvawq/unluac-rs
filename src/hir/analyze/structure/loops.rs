@@ -784,11 +784,20 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // 但最终必须无条件跳到循环之后的统一 continuation。更复杂的 exit 形状留给后续轮次，
         // 避免这一步又退化成拼命堆 break 特判。
         let mut stmts = self.lower_block_prefix(block, false, &BTreeMap::new())?;
-        let (_instr_ref, instr) = self.block_terminator(block)?;
-        let LowInstr::Jump(jump) = instr else {
-            return None;
+        let target = match self.block_terminator(block) {
+            Some((_instr_ref, LowInstr::Jump(jump))) => {
+                self.lowering.cfg.instr_to_block[jump.target.index()]
+            }
+            // Lua 5.4 的 close/capture cleanup pad 很常见的一种形状是“只有 cleanup，
+            // 然后直接 fallthrough 到 post-loop continuation”。如果这里仍然硬要求
+            // 显式 jump，像 `while ... if ... break end` 这种明明已经结构化的 loop
+            // 也会整片回退成 label/goto。
+            Some((_instr_ref, instr)) if !is_control_terminator(instr) => {
+                unique_reachable_successor(self.lowering.cfg, block)?
+            }
+            None => unique_reachable_successor(self.lowering.cfg, block)?,
+            Some(_) => return None,
         };
-        let target = self.lowering.cfg.instr_to_block[jump.target.index()];
         if target != post_loop && Some(target) != downstream_post_loop {
             return None;
         }

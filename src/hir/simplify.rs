@@ -6,7 +6,9 @@
 //! 是细节实现”的混淆。
 
 mod boolean_shells;
+mod close_scopes;
 mod closure_self_capture;
+mod dead_labels;
 pub(super) mod decision;
 mod locals;
 mod logical_simplify;
@@ -80,6 +82,15 @@ pub(super) fn simplify_hir_with_timing(
             });
             changed |= timings.record("eliminate-decisions", || {
                 apply_proto_pass(module, decision::eliminate_remaining_decisions_in_proto)
+            });
+            changed |= timings.record("close-scopes", || {
+                apply_proto_pass(module, close_scopes::materialize_tbc_close_scopes_in_proto)
+            });
+            changed |= timings.record("dead-labels", || {
+                apply_proto_pass(module, dead_labels::remove_unused_labels_in_proto)
+            });
+            changed |= timings.record("locals-post-close-scopes", || {
+                apply_proto_pass(module, locals::promote_temps_to_locals_in_proto)
             });
             changed
         });

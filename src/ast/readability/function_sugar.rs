@@ -5,7 +5,8 @@ use std::collections::BTreeSet;
 use super::super::common::{
     AstAssign, AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionDecl, AstFunctionExpr,
     AstFunctionName, AstGlobalBindingTarget, AstGlobalDecl, AstLValue, AstLocalAttr, AstLocalDecl,
-    AstLocalFunctionDecl, AstModule, AstNamePath, AstNameRef, AstStmt, AstTargetDialect,
+    AstLocalFunctionDecl, AstModule, AstNamePath, AstNameRef, AstStmt, AstTableField, AstTableKey,
+    AstTargetDialect,
 };
 use super::ReadabilityContext;
 
@@ -28,6 +29,15 @@ fn rewrite_block(
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut index = 0;
     while index < old_stmts.len() {
+        if let Some((stmt, consumed)) =
+            try_inline_terminal_constructor_call(&old_stmts[index..], method_fields)
+        {
+            new_stmts.push(stmt);
+            changed = true;
+            index += consumed;
+            continue;
+        }
+
         if let Some((stmt, consumed)) = try_chain_local_method_call_stmt(&old_stmts[index..]) {
             new_stmts.push(stmt);
             changed = true;
@@ -280,6 +290,112 @@ fn try_lower_forwarded_function_stmt(
     let function = function.as_ref().clone();
     let stmt = inline_function_into_stmt(next, binding, function, target, method_fields)?;
     Some((stmt, 2))
+}
+
+fn try_inline_terminal_constructor_call(
+    stmts: &[AstStmt],
+    method_fields: &BTreeSet<String>,
+) -> Option<(AstStmt, usize)> {
+    let (callee_binding, callee_expr) = single_local_alias_decl(stmts.first()?)?;
+    let mut consumed = 1usize;
+    let mut arg_locals = Vec::<(AstBindingRef, AstExpr)>::new();
+
+    while let Some(stmt) = stmts.get(consumed) {
+        let Some((binding, value)) = single_local_alias_decl(stmt) else {
+            break;
+        };
+        arg_locals.push((binding, value.clone()));
+        consumed += 1;
+    }
+    if arg_locals.is_empty() {
+        return None;
+    }
+
+    while let Some(stmt) = stmts.get(consumed) {
+        let AstStmt::FunctionDecl(function_decl) = stmt else {
+            break;
+        };
+        let Some((binding, field, func)) =
+            inlineable_table_function_field(function_decl, method_fields)
+        else {
+            break;
+        };
+        let (_, table_expr) = arg_locals.iter_mut().find(|(id, _)| *id == binding)?;
+        let AstExpr::TableConstructor(table) = table_expr else {
+            return None;
+        };
+        table.fields.push(AstTableField::Record(
+            super::super::common::AstRecordField {
+                key: AstTableKey::Name(field),
+                value: AstExpr::FunctionExpr(Box::new(func)),
+            },
+        ));
+        consumed += 1;
+    }
+
+    let AstStmt::Return(ret) = stmts.get(consumed)? else {
+        return None;
+    };
+    let [AstExpr::Call(call)] = ret.values.as_slice() else {
+        return None;
+    };
+    let AstExpr::Var(name) = &call.callee else {
+        return None;
+    };
+    if !name_matches_binding(name, callee_binding) || call.args.len() != arg_locals.len() {
+        return None;
+    }
+    for (arg, (binding, _)) in call.args.iter().zip(arg_locals.iter()) {
+        let AstExpr::Var(name) = arg else {
+            return None;
+        };
+        if !name_matches_binding(name, *binding) {
+            return None;
+        }
+    }
+
+    let mut lowered_return = ret.as_ref().clone();
+    let AstExpr::Call(lowered_call) = &mut lowered_return.values[0] else {
+        unreachable!("matched above")
+    };
+    lowered_call.callee = callee_expr.clone();
+    lowered_call.args = arg_locals
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect::<Vec<_>>();
+    Some((AstStmt::Return(Box::new(lowered_return)), consumed + 1))
+}
+
+fn single_local_alias_decl(stmt: &AstStmt) -> Option<(AstBindingRef, &AstExpr)> {
+    let AstStmt::LocalDecl(local_decl) = stmt else {
+        return None;
+    };
+    if local_decl.bindings.len() != 1 || local_decl.values.len() != 1 {
+        return None;
+    }
+    if local_decl.bindings[0].attr != AstLocalAttr::None {
+        return None;
+    }
+    Some((local_decl.bindings[0].id, &local_decl.values[0]))
+}
+
+fn inlineable_table_function_field(
+    function_decl: &AstFunctionDecl,
+    method_fields: &BTreeSet<String>,
+) -> Option<(AstBindingRef, String, AstFunctionExpr)> {
+    let AstFunctionName::Plain(path) = &function_decl.target else {
+        return None;
+    };
+    if path.fields.len() != 1 || method_fields.contains(&path.fields[0]) {
+        return None;
+    }
+    let binding = match &path.root {
+        AstNameRef::Local(local) => AstBindingRef::Local(*local),
+        AstNameRef::SyntheticLocal(local) => AstBindingRef::SyntheticLocal(*local),
+        AstNameRef::Temp(temp) => AstBindingRef::Temp(*temp),
+        AstNameRef::Param(_) | AstNameRef::Upvalue(_) | AstNameRef::Global(_) => return None,
+    };
+    Some((binding, path.fields[0].clone(), function_decl.func.clone()))
 }
 
 fn try_lower_local_function_decl(local_decl: AstLocalDecl) -> AstStmt {

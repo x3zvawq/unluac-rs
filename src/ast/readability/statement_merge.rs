@@ -9,6 +9,7 @@ use super::binding_flow::{
     block_references_any_binding, count_binding_uses_in_stmts, expr_references_any_binding,
     stmt_references_any_binding,
 };
+use super::expr_analysis::{expr_complexity, is_copy_like_expr};
 
 const ADJACENT_LOCAL_VALUE_COMPLEXITY_LIMIT: usize = 4;
 
@@ -600,103 +601,7 @@ fn stmt_references_any_binding_in_assign(
 }
 
 fn is_mergeable_adjacent_local_value(expr: &super::super::common::AstExpr) -> bool {
-    adjacent_local_value_complexity(expr) <= ADJACENT_LOCAL_VALUE_COMPLEXITY_LIMIT
-        && is_copy_like_adjacent_local_value(expr)
-}
-
-fn is_copy_like_adjacent_local_value(expr: &super::super::common::AstExpr) -> bool {
-    match expr {
-        super::super::common::AstExpr::Nil
-        | super::super::common::AstExpr::Boolean(_)
-        | super::super::common::AstExpr::Integer(_)
-        | super::super::common::AstExpr::Number(_)
-        | super::super::common::AstExpr::String(_)
-        | super::super::common::AstExpr::Var(_) => true,
-        super::super::common::AstExpr::FieldAccess(access) => {
-            is_copy_like_adjacent_local_value(&access.base)
-        }
-        super::super::common::AstExpr::IndexAccess(access) => {
-            is_copy_like_adjacent_local_value(&access.base)
-                && is_copy_like_adjacent_local_value(&access.index)
-        }
-        super::super::common::AstExpr::Unary(_)
-        | super::super::common::AstExpr::Binary(_)
-        | super::super::common::AstExpr::LogicalAnd(_)
-        | super::super::common::AstExpr::LogicalOr(_)
-        | super::super::common::AstExpr::Call(_)
-        | super::super::common::AstExpr::MethodCall(_)
-        | super::super::common::AstExpr::VarArg
-        | super::super::common::AstExpr::TableConstructor(_)
-        | super::super::common::AstExpr::FunctionExpr(_) => false,
-    }
-}
-
-fn adjacent_local_value_complexity(expr: &super::super::common::AstExpr) -> usize {
-    match expr {
-        super::super::common::AstExpr::Nil
-        | super::super::common::AstExpr::Boolean(_)
-        | super::super::common::AstExpr::Integer(_)
-        | super::super::common::AstExpr::Number(_)
-        | super::super::common::AstExpr::String(_)
-        | super::super::common::AstExpr::Var(_)
-        | super::super::common::AstExpr::VarArg => 1,
-        super::super::common::AstExpr::FieldAccess(access) => {
-            1 + adjacent_local_value_complexity(&access.base)
-        }
-        super::super::common::AstExpr::IndexAccess(access) => {
-            1 + adjacent_local_value_complexity(&access.base)
-                + adjacent_local_value_complexity(&access.index)
-        }
-        super::super::common::AstExpr::Unary(unary) => {
-            1 + adjacent_local_value_complexity(&unary.expr)
-        }
-        super::super::common::AstExpr::Binary(binary) => {
-            1 + adjacent_local_value_complexity(&binary.lhs)
-                + adjacent_local_value_complexity(&binary.rhs)
-        }
-        super::super::common::AstExpr::LogicalAnd(logical)
-        | super::super::common::AstExpr::LogicalOr(logical) => {
-            1 + adjacent_local_value_complexity(&logical.lhs)
-                + adjacent_local_value_complexity(&logical.rhs)
-        }
-        super::super::common::AstExpr::Call(call) => {
-            1 + adjacent_local_value_complexity(&call.callee)
-                + call
-                    .args
-                    .iter()
-                    .map(adjacent_local_value_complexity)
-                    .sum::<usize>()
-        }
-        super::super::common::AstExpr::MethodCall(call) => {
-            1 + adjacent_local_value_complexity(&call.receiver)
-                + call
-                    .args
-                    .iter()
-                    .map(adjacent_local_value_complexity)
-                    .sum::<usize>()
-        }
-        super::super::common::AstExpr::TableConstructor(table) => {
-            1 + table
-                .fields
-                .iter()
-                .map(|field| match field {
-                    super::super::common::AstTableField::Array(value) => {
-                        adjacent_local_value_complexity(value)
-                    }
-                    super::super::common::AstTableField::Record(record) => {
-                        let key_cost = match &record.key {
-                            super::super::common::AstTableKey::Name(_) => 1,
-                            super::super::common::AstTableKey::Expr(key) => {
-                                adjacent_local_value_complexity(key)
-                            }
-                        };
-                        key_cost + adjacent_local_value_complexity(&record.value)
-                    }
-                })
-                .sum::<usize>()
-        }
-        super::super::common::AstExpr::FunctionExpr(function) => 1 + function.body.stmts.len(),
-    }
+    expr_complexity(expr) <= ADJACENT_LOCAL_VALUE_COMPLEXITY_LIMIT && is_copy_like_expr(expr)
 }
 
 fn local_binding_matches_target(binding: AstBindingRef, target: &AstLValue) -> bool {

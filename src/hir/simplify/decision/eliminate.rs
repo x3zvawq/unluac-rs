@@ -158,7 +158,10 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
         }
         HirStmt::ToBeClosed(to_be_closed) => {
             let (mut prefix, value, changed) = extract_value_expr(to_be_closed.value, state);
-            prefix.push(HirStmt::ToBeClosed(Box::new(HirToBeClosed { value })));
+            prefix.push(HirStmt::ToBeClosed(Box::new(HirToBeClosed {
+                reg_index: to_be_closed.reg_index,
+                value,
+            })));
             (prefix, changed)
         }
         HirStmt::CallStmt(call_stmt) => {

@@ -14,6 +14,11 @@ use super::super::common::{
     AstTableField, AstTableKey,
 };
 use super::ReadabilityContext;
+use super::binding_flow::{count_binding_uses_in_stmt, count_binding_uses_in_stmts};
+use super::expr_analysis::{
+    expr_complexity, is_access_base_inline_expr, is_context_safe_expr, is_lookup_inline_expr,
+    is_mechanical_run_inline_expr,
+};
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
     let _ = context.target;
@@ -83,6 +88,7 @@ fn rewrite_block(block: &mut AstBlock, options: ReadabilityOptions) -> bool {
 
     block.stmts = new_stmts;
     changed |= collapse_adjacent_call_alias_runs(block, options);
+    changed |= collapse_adjacent_mechanical_alias_runs(block, options);
     changed
 }
 
@@ -159,6 +165,99 @@ fn collapse_adjacent_call_alias_runs(block: &mut AstBlock, options: ReadabilityO
         // 至少一次收回两层相邻别名，才能证明我们是在还原机械展开的调用准备序列，
         // 而不是把源码里本来就有阶段语义的 local（例如 stage1 / stage2）继续吞掉。
         if collapsed_count >= 2 {
+            changed = true;
+            for (offset, stmt) in old_stmts[index..run_end].iter().enumerate() {
+                if !removed[offset] {
+                    new_stmts.push(stmt.clone());
+                }
+            }
+            new_stmts.push(rewritten_sink);
+            index = run_end + 1;
+            continue;
+        }
+
+        new_stmts.push(old_stmts[index].clone());
+        index += 1;
+    }
+
+    block.stmts = new_stmts;
+    changed
+}
+
+fn collapse_adjacent_mechanical_alias_runs(
+    block: &mut AstBlock,
+    options: ReadabilityOptions,
+) -> bool {
+    let old_stmts = std::mem::take(&mut block.stmts);
+    let mut new_stmts = Vec::with_capacity(old_stmts.len());
+    let mut changed = false;
+    let mut index = 0;
+
+    while index < old_stmts.len() {
+        let mut run_end = index;
+        while run_end < old_stmts.len() && inline_candidate(&old_stmts[run_end]).is_some() {
+            run_end += 1;
+        }
+
+        if run_end == index
+            || run_end >= old_stmts.len()
+            || !stmt_can_absorb_mechanical_run(&old_stmts[run_end])
+        {
+            new_stmts.push(old_stmts[index].clone());
+            index += 1;
+            continue;
+        }
+
+        let mut rewritten_sink = old_stmts[run_end].clone();
+        let mut removed = vec![false; run_end - index];
+        let mut collapsed_count = 0usize;
+        let mut has_non_lookup_piece = false;
+
+        for candidate_index in (index..run_end).rev() {
+            let Some((candidate, value)) = inline_candidate(&old_stmts[candidate_index]) else {
+                continue;
+            };
+            if !candidate.allows_expr_with_policy(value, InlinePolicy::MechanicalRun) {
+                continue;
+            }
+            if count_binding_uses_in_stmts(
+                &old_stmts[(candidate_index + 1)..(run_end + 1)],
+                candidate.binding(),
+            ) != 1
+            {
+                continue;
+            }
+            if count_binding_uses_in_stmts(&old_stmts[(run_end + 1)..], candidate.binding()) != 0 {
+                continue;
+            }
+            if count_binding_uses_in_remaining_run(
+                &old_stmts[(candidate_index + 1)..run_end],
+                &removed[(candidate_index + 1 - index)..],
+                candidate.binding(),
+            ) != 0
+            {
+                continue;
+            }
+            if !stmt_has_nested_binding_use(&rewritten_sink, candidate.binding()) {
+                continue;
+            }
+
+            let mut trial_sink = rewritten_sink.clone();
+            if rewrite_stmt_use_sites_with_policy(
+                &mut trial_sink,
+                candidate,
+                value,
+                options,
+                InlinePolicy::MechanicalRun,
+            ) {
+                rewritten_sink = trial_sink;
+                removed[candidate_index - index] = true;
+                collapsed_count += 1;
+                has_non_lookup_piece |= !is_lookup_inline_expr(value);
+            }
+        }
+
+        if collapsed_count >= 2 && has_non_lookup_piece {
             changed = true;
             for (offset, stmt) in old_stmts[index..run_end].iter().enumerate() {
                 if !removed[offset] {
@@ -884,11 +983,149 @@ fn rewrite_expr_use_sites(
     }
 }
 
-fn count_binding_uses_in_stmts(stmts: &[AstStmt], binding: AstBindingRef) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| count_binding_uses_in_stmt(stmt, binding))
-        .sum()
+fn stmt_can_absorb_mechanical_run(stmt: &AstStmt) -> bool {
+    matches!(
+        stmt,
+        AstStmt::Assign(_)
+            | AstStmt::CallStmt(_)
+            | AstStmt::Return(_)
+            | AstStmt::If(_)
+            | AstStmt::While(_)
+            | AstStmt::Repeat(_)
+            | AstStmt::NumericFor(_)
+            | AstStmt::GenericFor(_)
+    )
+}
+
+fn stmt_has_nested_binding_use(stmt: &AstStmt, binding: AstBindingRef) -> bool {
+    match stmt {
+        AstStmt::LocalDecl(local_decl) => local_decl
+            .values
+            .iter()
+            .any(|value| expr_has_nested_binding_use(value, binding, false)),
+        AstStmt::GlobalDecl(global_decl) => global_decl
+            .values
+            .iter()
+            .any(|value| expr_has_nested_binding_use(value, binding, false)),
+        AstStmt::Assign(assign) => {
+            assign
+                .targets
+                .iter()
+                .any(|target| lvalue_has_nested_binding_use(target, binding))
+                || assign
+                    .values
+                    .iter()
+                    .any(|value| expr_has_nested_binding_use(value, binding, false))
+        }
+        AstStmt::CallStmt(call_stmt) => call_has_nested_binding_use(&call_stmt.call, binding),
+        AstStmt::Return(ret) => ret
+            .values
+            .iter()
+            .any(|value| expr_has_nested_binding_use(value, binding, false)),
+        AstStmt::If(if_stmt) => expr_has_nested_binding_use(&if_stmt.cond, binding, false),
+        AstStmt::While(while_stmt) => expr_has_nested_binding_use(&while_stmt.cond, binding, false),
+        AstStmt::Repeat(repeat_stmt) => {
+            expr_has_nested_binding_use(&repeat_stmt.cond, binding, false)
+        }
+        AstStmt::NumericFor(numeric_for) => {
+            expr_has_nested_binding_use(&numeric_for.start, binding, false)
+                || expr_has_nested_binding_use(&numeric_for.limit, binding, false)
+                || expr_has_nested_binding_use(&numeric_for.step, binding, false)
+        }
+        AstStmt::GenericFor(generic_for) => generic_for
+            .iterator
+            .iter()
+            .any(|expr| expr_has_nested_binding_use(expr, binding, false)),
+        AstStmt::DoBlock(_)
+        | AstStmt::FunctionDecl(_)
+        | AstStmt::LocalFunctionDecl(_)
+        | AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_) => false,
+    }
+}
+
+fn call_has_nested_binding_use(call: &AstCallKind, binding: AstBindingRef) -> bool {
+    match call {
+        AstCallKind::Call(call) => {
+            expr_has_nested_binding_use(&call.callee, binding, false)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_has_nested_binding_use(arg, binding, false))
+        }
+        AstCallKind::MethodCall(call) => {
+            expr_has_nested_binding_use(&call.receiver, binding, false)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_has_nested_binding_use(arg, binding, false))
+        }
+    }
+}
+
+fn lvalue_has_nested_binding_use(target: &AstLValue, binding: AstBindingRef) -> bool {
+    match target {
+        AstLValue::Name(_) => false,
+        AstLValue::FieldAccess(access) => expr_has_nested_binding_use(&access.base, binding, true),
+        AstLValue::IndexAccess(access) => {
+            expr_has_nested_binding_use(&access.base, binding, true)
+                || expr_has_nested_binding_use(&access.index, binding, true)
+        }
+    }
+}
+
+fn expr_has_nested_binding_use(expr: &AstExpr, binding: AstBindingRef, nested: bool) -> bool {
+    match expr {
+        AstExpr::Var(name) if name_matches_binding(name, binding) => nested,
+        AstExpr::FieldAccess(access) => expr_has_nested_binding_use(&access.base, binding, true),
+        AstExpr::IndexAccess(access) => {
+            expr_has_nested_binding_use(&access.base, binding, true)
+                || expr_has_nested_binding_use(&access.index, binding, true)
+        }
+        AstExpr::Unary(unary) => expr_has_nested_binding_use(&unary.expr, binding, true),
+        AstExpr::Binary(binary) => {
+            expr_has_nested_binding_use(&binary.lhs, binding, true)
+                || expr_has_nested_binding_use(&binary.rhs, binding, true)
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            expr_has_nested_binding_use(&logical.lhs, binding, true)
+                || expr_has_nested_binding_use(&logical.rhs, binding, true)
+        }
+        AstExpr::Call(call) => {
+            expr_has_nested_binding_use(&call.callee, binding, true)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_has_nested_binding_use(arg, binding, true))
+        }
+        AstExpr::MethodCall(call) => {
+            expr_has_nested_binding_use(&call.receiver, binding, true)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_has_nested_binding_use(arg, binding, true))
+        }
+        AstExpr::TableConstructor(table) => table.fields.iter().any(|field| match field {
+            AstTableField::Array(value) => expr_has_nested_binding_use(value, binding, true),
+            AstTableField::Record(record) => {
+                let key_matches = match &record.key {
+                    AstTableKey::Name(_) => false,
+                    AstTableKey::Expr(key) => expr_has_nested_binding_use(key, binding, true),
+                };
+                key_matches || expr_has_nested_binding_use(&record.value, binding, true)
+            }
+        }),
+        AstExpr::FunctionExpr(_)
+        | AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Var(_)
+        | AstExpr::VarArg => false,
+    }
 }
 
 fn count_binding_uses_in_remaining_run(
@@ -904,213 +1141,8 @@ fn count_binding_uses_in_remaining_run(
         .sum()
 }
 
-fn count_binding_uses_in_stmt(stmt: &AstStmt, binding: AstBindingRef) -> usize {
-    match stmt {
-        AstStmt::LocalDecl(local_decl) => local_decl
-            .values
-            .iter()
-            .map(|value| count_binding_uses_in_expr(value, binding))
-            .sum(),
-        AstStmt::GlobalDecl(global_decl) => global_decl
-            .values
-            .iter()
-            .map(|value| count_binding_uses_in_expr(value, binding))
-            .sum(),
-        AstStmt::Assign(assign) => {
-            assign
-                .targets
-                .iter()
-                .map(|target| count_binding_uses_in_lvalue(target, binding))
-                .sum::<usize>()
-                + assign
-                    .values
-                    .iter()
-                    .map(|value| count_binding_uses_in_expr(value, binding))
-                    .sum::<usize>()
-        }
-        AstStmt::CallStmt(call_stmt) => count_binding_uses_in_call(&call_stmt.call, binding),
-        AstStmt::Return(ret) => ret
-            .values
-            .iter()
-            .map(|value| count_binding_uses_in_expr(value, binding))
-            .sum(),
-        AstStmt::If(if_stmt) => {
-            count_binding_uses_in_expr(&if_stmt.cond, binding)
-                + count_binding_uses_in_block(&if_stmt.then_block, binding)
-                + if_stmt
-                    .else_block
-                    .as_ref()
-                    .map(|else_block| count_binding_uses_in_block(else_block, binding))
-                    .unwrap_or(0)
-        }
-        AstStmt::While(while_stmt) => {
-            count_binding_uses_in_expr(&while_stmt.cond, binding)
-                + count_binding_uses_in_block(&while_stmt.body, binding)
-        }
-        AstStmt::Repeat(repeat_stmt) => {
-            count_binding_uses_in_block(&repeat_stmt.body, binding)
-                + count_binding_uses_in_expr(&repeat_stmt.cond, binding)
-        }
-        AstStmt::NumericFor(numeric_for) => {
-            count_binding_uses_in_expr(&numeric_for.start, binding)
-                + count_binding_uses_in_expr(&numeric_for.limit, binding)
-                + count_binding_uses_in_expr(&numeric_for.step, binding)
-                + count_binding_uses_in_block(&numeric_for.body, binding)
-        }
-        AstStmt::GenericFor(generic_for) => {
-            generic_for
-                .iterator
-                .iter()
-                .map(|expr| count_binding_uses_in_expr(expr, binding))
-                .sum::<usize>()
-                + count_binding_uses_in_block(&generic_for.body, binding)
-        }
-        AstStmt::DoBlock(block) => count_binding_uses_in_block(block, binding),
-        AstStmt::FunctionDecl(_) | AstStmt::LocalFunctionDecl(_) => 0,
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => 0,
-    }
-}
-
-fn count_binding_uses_in_block(block: &AstBlock, binding: AstBindingRef) -> usize {
-    block
-        .stmts
-        .iter()
-        .map(|stmt| count_binding_uses_in_stmt(stmt, binding))
-        .sum()
-}
-
-fn count_binding_uses_in_call(call: &AstCallKind, binding: AstBindingRef) -> usize {
-    match call {
-        AstCallKind::Call(call) => {
-            count_binding_uses_in_expr(&call.callee, binding)
-                + call
-                    .args
-                    .iter()
-                    .map(|arg| count_binding_uses_in_expr(arg, binding))
-                    .sum::<usize>()
-        }
-        AstCallKind::MethodCall(call) => {
-            count_binding_uses_in_expr(&call.receiver, binding)
-                + call
-                    .args
-                    .iter()
-                    .map(|arg| count_binding_uses_in_expr(arg, binding))
-                    .sum::<usize>()
-        }
-    }
-}
-
-fn count_binding_uses_in_lvalue(target: &AstLValue, binding: AstBindingRef) -> usize {
-    match target {
-        AstLValue::Name(_) => 0,
-        AstLValue::FieldAccess(access) => count_binding_uses_in_expr(&access.base, binding),
-        AstLValue::IndexAccess(access) => {
-            count_binding_uses_in_expr(&access.base, binding)
-                + count_binding_uses_in_expr(&access.index, binding)
-        }
-    }
-}
-
-fn count_binding_uses_in_expr(expr: &AstExpr, binding: AstBindingRef) -> usize {
-    match expr {
-        AstExpr::Var(name) if name_matches_binding(name, binding) => 1,
-        AstExpr::FieldAccess(access) => count_binding_uses_in_expr(&access.base, binding),
-        AstExpr::IndexAccess(access) => {
-            count_binding_uses_in_expr(&access.base, binding)
-                + count_binding_uses_in_expr(&access.index, binding)
-        }
-        AstExpr::Unary(unary) => count_binding_uses_in_expr(&unary.expr, binding),
-        AstExpr::Binary(binary) => {
-            count_binding_uses_in_expr(&binary.lhs, binding)
-                + count_binding_uses_in_expr(&binary.rhs, binding)
-        }
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            count_binding_uses_in_expr(&logical.lhs, binding)
-                + count_binding_uses_in_expr(&logical.rhs, binding)
-        }
-        AstExpr::Call(call) => {
-            count_binding_uses_in_call(&AstCallKind::Call(call.clone()), binding)
-        }
-        AstExpr::MethodCall(call) => {
-            count_binding_uses_in_call(&AstCallKind::MethodCall(call.clone()), binding)
-        }
-        AstExpr::TableConstructor(table) => table
-            .fields
-            .iter()
-            .map(|field| match field {
-                AstTableField::Array(value) => count_binding_uses_in_expr(value, binding),
-                AstTableField::Record(record) => {
-                    let key_count = match &record.key {
-                        AstTableKey::Name(_) => 0,
-                        AstTableKey::Expr(key) => count_binding_uses_in_expr(key, binding),
-                    };
-                    key_count + count_binding_uses_in_expr(&record.value, binding)
-                }
-            })
-            .sum(),
-        AstExpr::FunctionExpr(_) => 0,
-        AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Var(_)
-        | AstExpr::VarArg => 0,
-    }
-}
-
 fn is_inline_candidate_expr(expr: &AstExpr) -> bool {
     is_context_safe_expr(expr) || is_access_base_inline_expr(expr)
-}
-
-fn is_context_safe_expr(expr: &AstExpr) -> bool {
-    match expr {
-        AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_) => true,
-        AstExpr::Var(
-            AstNameRef::Param(_)
-            | AstNameRef::Local(_)
-            | AstNameRef::SyntheticLocal(_)
-            | AstNameRef::Temp(_)
-            | AstNameRef::Upvalue(_),
-        ) => true,
-        AstExpr::Unary(unary) => {
-            matches!(unary.op, super::super::common::AstUnaryOpKind::Not)
-                && is_context_safe_expr(&unary.expr)
-        }
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            is_context_safe_expr(&logical.lhs) && is_context_safe_expr(&logical.rhs)
-        }
-        AstExpr::Var(AstNameRef::Global(_))
-        | AstExpr::FieldAccess(_)
-        | AstExpr::IndexAccess(_)
-        | AstExpr::Binary(_)
-        | AstExpr::Call(_)
-        | AstExpr::MethodCall(_)
-        | AstExpr::VarArg
-        | AstExpr::TableConstructor(_)
-        | AstExpr::FunctionExpr(_) => false,
-    }
-}
-
-fn is_access_base_inline_expr(expr: &AstExpr) -> bool {
-    is_atomic_access_base_expr(expr) || is_named_field_chain_expr(expr)
-}
-
-fn is_lookup_inline_expr(expr: &AstExpr) -> bool {
-    match expr {
-        AstExpr::FieldAccess(access) => {
-            is_atomic_access_base_expr(&access.base) || is_lookup_inline_expr(&access.base)
-        }
-        AstExpr::IndexAccess(access) => {
-            (is_atomic_access_base_expr(&access.base) || is_lookup_inline_expr(&access.base))
-                && is_context_safe_expr(&access.index)
-        }
-        _ => false,
-    }
 }
 
 fn is_call_callee_inline_expr(expr: &AstExpr) -> bool {
@@ -1125,70 +1157,6 @@ fn is_extended_neutral_local_alias_expr(expr: &AstExpr) -> bool {
 
 fn is_extended_call_arg_local_alias_expr(expr: &AstExpr) -> bool {
     is_context_safe_expr(expr) || is_lookup_inline_expr(expr)
-}
-
-fn is_named_field_chain_expr(expr: &AstExpr) -> bool {
-    let AstExpr::FieldAccess(access) = expr else {
-        return false;
-    };
-    is_atomic_access_base_expr(&access.base) || is_named_field_chain_expr(&access.base)
-}
-
-fn is_atomic_access_base_expr(expr: &AstExpr) -> bool {
-    matches!(
-        expr,
-        AstExpr::Nil
-            | AstExpr::Boolean(_)
-            | AstExpr::Integer(_)
-            | AstExpr::Number(_)
-            | AstExpr::String(_)
-            | AstExpr::Var(_)
-    )
-}
-
-fn expr_complexity(expr: &AstExpr) -> usize {
-    match expr {
-        AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Var(_)
-        | AstExpr::VarArg => 1,
-        AstExpr::Unary(unary) => 1 + expr_complexity(&unary.expr),
-        AstExpr::Binary(binary) => 1 + expr_complexity(&binary.lhs) + expr_complexity(&binary.rhs),
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            1 + expr_complexity(&logical.lhs) + expr_complexity(&logical.rhs)
-        }
-        AstExpr::FieldAccess(access) => 1 + expr_complexity(&access.base),
-        AstExpr::IndexAccess(access) => {
-            1 + expr_complexity(&access.base) + expr_complexity(&access.index)
-        }
-        AstExpr::Call(call) => {
-            1 + expr_complexity(&call.callee) + call.args.iter().map(expr_complexity).sum::<usize>()
-        }
-        AstExpr::MethodCall(call) => {
-            1 + expr_complexity(&call.receiver)
-                + call.args.iter().map(expr_complexity).sum::<usize>()
-        }
-        AstExpr::TableConstructor(table) => {
-            1 + table
-                .fields
-                .iter()
-                .map(|field| match field {
-                    AstTableField::Array(value) => expr_complexity(value),
-                    AstTableField::Record(record) => {
-                        let key_cost = match &record.key {
-                            AstTableKey::Name(_) => 1,
-                            AstTableKey::Expr(key) => expr_complexity(key),
-                        };
-                        key_cost + expr_complexity(&record.value)
-                    }
-                })
-                .sum::<usize>()
-        }
-        AstExpr::FunctionExpr(function) => 1 + function.body.stmts.len(),
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -1210,7 +1178,10 @@ impl InlineCandidate {
 
     fn allows_expr_with_policy(self, expr: &AstExpr, policy: InlinePolicy) -> bool {
         match self {
-            Self::TempLike(_) => is_inline_candidate_expr(expr),
+            Self::TempLike(_) => match policy {
+                InlinePolicy::MechanicalRun => is_mechanical_run_inline_expr(expr),
+                _ => is_inline_candidate_expr(expr),
+            },
             // 这里故意不把普通 local 别名放宽到所有上下文：
             // 没有 debug 证据时，我们不能把用户可能主动写出来的局部语义名随手吞掉。
             // 目前只允许它们作为“前缀表达式别名”收回去，例如 `local concat = table.concat`。
@@ -1222,6 +1193,7 @@ impl InlineCandidate {
                 origin: AstLocalOrigin::Recovered,
                 ..
             } => match policy {
+                InlinePolicy::MechanicalRun => is_mechanical_run_inline_expr(expr),
                 InlinePolicy::AdjacentCallResultCallee => is_lookup_inline_expr(expr),
                 _ => is_access_base_inline_expr(expr) || is_recallable_inline_expr(expr),
             },
@@ -1248,6 +1220,7 @@ enum InlinePolicy {
     ExtendedCallChain,
     AliasInitializerChain,
     AdjacentCallResultCallee,
+    MechanicalRun,
 }
 
 impl InlineSite {
@@ -1272,10 +1245,13 @@ impl InlineSite {
         }
 
         match candidate {
-            InlineCandidate::TempLike(_) => {
-                !matches!(self, Self::AccessBase | Self::CallCallee)
-                    || is_access_base_inline_expr(replacement)
-            }
+            InlineCandidate::TempLike(_) => match policy {
+                InlinePolicy::MechanicalRun => self.allows_mechanical_run_expr(replacement),
+                _ => {
+                    !matches!(self, Self::AccessBase | Self::CallCallee)
+                        || is_access_base_inline_expr(replacement)
+                }
+            },
             InlineCandidate::LocalAlias { origin, .. } => match policy {
                 InlinePolicy::Conservative => match origin {
                     AstLocalOrigin::DebugHinted => {
@@ -1301,6 +1277,10 @@ impl InlineSite {
                 InlinePolicy::AdjacentCallResultCallee => {
                     self.allows_adjacent_call_result_local_alias(replacement)
                 }
+                InlinePolicy::MechanicalRun => match origin {
+                    AstLocalOrigin::DebugHinted => false,
+                    AstLocalOrigin::Recovered => self.allows_mechanical_run_expr(replacement),
+                },
             },
         }
     }
@@ -1314,6 +1294,7 @@ impl InlineSite {
                 InlinePolicy::AdjacentCallResultCallee => None,
                 InlinePolicy::Conservative => None,
                 InlinePolicy::ExtendedCallChain => Some(options.access_base_inline_max_complexity),
+                InlinePolicy::MechanicalRun => Some(options.return_inline_max_complexity),
             },
             Self::ComparisonOperand => Some(options.args_inline_max_complexity),
             Self::ReturnValue => Some(options.return_inline_max_complexity),
@@ -1397,6 +1378,19 @@ impl InlineSite {
 
     fn allows_adjacent_call_result_local_alias(self, replacement: &AstExpr) -> bool {
         matches!(self, Self::CallCallee) && is_lookup_inline_expr(replacement)
+    }
+
+    fn allows_mechanical_run_expr(self, replacement: &AstExpr) -> bool {
+        match self {
+            Self::Neutral | Self::ComparisonOperand | Self::ReturnNestedValue | Self::Index => {
+                is_mechanical_run_inline_expr(replacement)
+            }
+            Self::CallCallee => is_call_callee_inline_expr(replacement),
+            Self::AccessBase => {
+                is_access_base_inline_expr(replacement) || is_lookup_inline_expr(replacement)
+            }
+            Self::ReturnValue | Self::CallArgNonFinal | Self::CallArgFinal => false,
+        }
     }
 }
 

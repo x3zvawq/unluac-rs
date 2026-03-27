@@ -529,6 +529,7 @@ pub(super) fn lower_regular_instr(
             from_reg: close.from.index(),
         }))],
         LowInstr::Tbc(tbc) => vec![HirStmt::ToBeClosed(Box::new(HirToBeClosed {
+            reg_index: tbc.reg.index(),
             value: expr_for_reg_use(lowering, block, instr_ref, tbc.reg),
         }))],
         LowInstr::NumericForInit(instr) => vec![

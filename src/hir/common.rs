@@ -317,6 +317,13 @@ pub struct HirErrNil {
 /// `<close>` 局部声明形式。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirToBeClosed {
+    /// 对应 Lua VM 里的寄存器槽位。
+    ///
+    /// 这里额外保留 `tbc rX` 的原始槽位，不是为了把后面的 AST 再次绑定回寄存器，
+    /// 而是为了让 HIR 还能在结构层之后重建“这条 `<close>` 词法块究竟在什么位置结束”。
+    /// 对于像 Lua 5.4 `goto` 反复进入同一块、以及多条退出路径都触发 cleanup 的 case，
+    /// 单靠 `value: HirExpr` 已经不足以把多个 `close from rX` 重新配对回同一条声明。
+    pub reg_index: usize,
     pub value: HirExpr,
 }
 

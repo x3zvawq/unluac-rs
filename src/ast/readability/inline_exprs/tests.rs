@@ -268,6 +268,234 @@ fn inlines_named_field_access_base_into_adjacent_index_assign() {
 }
 
 #[test]
+fn collapses_mechanical_alias_run_into_nested_assignment_expr() {
+    let table = LocalId(0);
+    let first = LocalId(1);
+    let second = LocalId(2);
+    let index = LocalId(3);
+    let left = LocalId(4);
+    let middle = LocalId(5);
+    let right = LocalId(6);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(index),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Binary(Box::new(AstBinaryExpr {
+                        op: AstBinaryOpKind::Add,
+                        lhs: AstExpr::Unary(Box::new(AstUnaryExpr {
+                            op: AstUnaryOpKind::Length,
+                            expr: AstExpr::Var(AstNameRef::Local(table)),
+                        })),
+                        rhs: AstExpr::Integer(1),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(left),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Local(first)),
+                        field: "name".to_owned(),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(middle),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::String("+".to_owned())],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(right),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Local(second)),
+                        field: "name".to_owned(),
+                    }))],
+                })),
+                AstStmt::Assign(Box::new(crate::ast::AstAssign {
+                    targets: vec![AstLValue::IndexAccess(Box::new(AstIndexAccess {
+                        base: AstExpr::Var(AstNameRef::Local(table)),
+                        index: AstExpr::Var(AstNameRef::Local(index)),
+                    }))],
+                    values: vec![AstExpr::Binary(Box::new(AstBinaryExpr {
+                        op: AstBinaryOpKind::Concat,
+                        lhs: AstExpr::Binary(Box::new(AstBinaryExpr {
+                            op: AstBinaryOpKind::Concat,
+                            lhs: AstExpr::Var(AstNameRef::Local(left)),
+                            rhs: AstExpr::Var(AstNameRef::Local(middle)),
+                        })),
+                        rhs: AstExpr::Var(AstNameRef::Local(right)),
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua54),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+    assert_eq!(
+        module.body.stmts,
+        vec![AstStmt::Assign(Box::new(crate::ast::AstAssign {
+            targets: vec![AstLValue::IndexAccess(Box::new(AstIndexAccess {
+                base: AstExpr::Var(AstNameRef::Local(table)),
+                index: AstExpr::Binary(Box::new(AstBinaryExpr {
+                    op: AstBinaryOpKind::Add,
+                    lhs: AstExpr::Unary(Box::new(AstUnaryExpr {
+                        op: AstUnaryOpKind::Length,
+                        expr: AstExpr::Var(AstNameRef::Local(table)),
+                    })),
+                    rhs: AstExpr::Integer(1),
+                })),
+            }))],
+            values: vec![AstExpr::Binary(Box::new(AstBinaryExpr {
+                op: AstBinaryOpKind::Concat,
+                lhs: AstExpr::Binary(Box::new(AstBinaryExpr {
+                    op: AstBinaryOpKind::Concat,
+                    lhs: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Local(first)),
+                        field: "name".to_owned(),
+                    })),
+                    rhs: AstExpr::String("+".to_owned()),
+                })),
+                rhs: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                    base: AstExpr::Var(AstNameRef::Local(second)),
+                    field: "name".to_owned(),
+                })),
+            }))],
+        }))]
+    );
+}
+
+#[test]
+fn does_not_collapse_stage_locals_into_flat_return_values() {
+    let first = LocalId(0);
+    let second = LocalId(1);
+    let lhs = LocalId(2);
+    let rhs = LocalId(3);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(first),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Binary(Box::new(AstBinaryExpr {
+                        op: AstBinaryOpKind::Add,
+                        lhs: AstExpr::Var(AstNameRef::Local(lhs)),
+                        rhs: AstExpr::Integer(1),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(second),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Binary(Box::new(AstBinaryExpr {
+                        op: AstBinaryOpKind::Add,
+                        lhs: AstExpr::Var(AstNameRef::Local(rhs)),
+                        rhs: AstExpr::Integer(2),
+                    }))],
+                })),
+                AstStmt::Return(Box::new(AstReturn {
+                    values: vec![
+                        AstExpr::Var(AstNameRef::Local(first)),
+                        AstExpr::Var(AstNameRef::Local(second)),
+                    ],
+                })),
+            ],
+        },
+    };
+
+    assert!(!apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua54),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+}
+
+#[test]
+fn does_not_collapse_lookup_stage_chain_into_nested_return_access() {
+    let root = LocalId(0);
+    let branch = LocalId(1);
+    let item = LocalId(2);
+    let selector = LocalId(3);
+    let index = LocalId(4);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(branch),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                        base: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                            base: AstExpr::Var(AstNameRef::Local(root)),
+                            field: "branches".to_owned(),
+                        })),
+                        index: AstExpr::Var(AstNameRef::Local(selector)),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(item),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                        base: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                            base: AstExpr::Var(AstNameRef::Local(branch)),
+                            field: "items".to_owned(),
+                        })),
+                        index: AstExpr::Var(AstNameRef::Local(index)),
+                    }))],
+                })),
+                AstStmt::Return(Box::new(AstReturn {
+                    values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Local(item)),
+                        field: "value".to_owned(),
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(!apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua54),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+}
+
+#[test]
 fn inlines_single_use_local_alias_into_call_callee_with_access_base_threshold() {
     let alias = LocalId(0);
     let table_arg = LocalId(1);

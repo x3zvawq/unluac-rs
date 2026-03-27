@@ -12,6 +12,7 @@ use super::super::common::{
 };
 use super::ReadabilityContext;
 use super::binding_flow::{count_binding_uses_in_stmt, count_binding_uses_in_stmts};
+use super::expr_analysis::expr_complexity;
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
     rewrite_block(&mut module.body, context.options)
@@ -630,51 +631,6 @@ fn binding_from_name_ref(name: &AstNameRef) -> Option<super::super::common::AstB
             Some(super::super::common::AstBindingRef::SyntheticLocal(*local))
         }
         AstNameRef::Param(_) | AstNameRef::Upvalue(_) | AstNameRef::Global(_) => None,
-    }
-}
-
-fn expr_complexity(expr: &AstExpr) -> usize {
-    match expr {
-        AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Var(_)
-        | AstExpr::VarArg => 1,
-        AstExpr::Unary(unary) => 1 + expr_complexity(&unary.expr),
-        AstExpr::Binary(binary) => 1 + expr_complexity(&binary.lhs) + expr_complexity(&binary.rhs),
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            1 + expr_complexity(&logical.lhs) + expr_complexity(&logical.rhs)
-        }
-        AstExpr::FieldAccess(access) => 1 + expr_complexity(&access.base),
-        AstExpr::IndexAccess(access) => {
-            1 + expr_complexity(&access.base) + expr_complexity(&access.index)
-        }
-        AstExpr::Call(call) => {
-            1 + expr_complexity(&call.callee) + call.args.iter().map(expr_complexity).sum::<usize>()
-        }
-        AstExpr::MethodCall(call) => {
-            1 + expr_complexity(&call.receiver)
-                + call.args.iter().map(expr_complexity).sum::<usize>()
-        }
-        AstExpr::TableConstructor(table) => {
-            1 + table
-                .fields
-                .iter()
-                .map(|field| match field {
-                    super::super::common::AstTableField::Array(value) => expr_complexity(value),
-                    super::super::common::AstTableField::Record(record) => {
-                        let key_cost = match &record.key {
-                            super::super::common::AstTableKey::Name(_) => 1,
-                            super::super::common::AstTableKey::Expr(key) => expr_complexity(key),
-                        };
-                        key_cost + expr_complexity(&record.value)
-                    }
-                })
-                .sum::<usize>()
-        }
-        AstExpr::FunctionExpr(function) => 1 + function.body.stmts.len(),
     }
 }
 

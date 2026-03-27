@@ -41,6 +41,7 @@ pub(super) struct StructuredBodyLowerer<'a, 'b> {
     pub(super) suppressed_phis: BTreeSet<PhiId>,
     pub(super) suppressed_instrs: BTreeSet<InstrRef>,
     pub(super) structured_close_points: BTreeSet<InstrRef>,
+    pub(super) tbc_scope_regs: BTreeSet<usize>,
     pub(super) visited: BTreeSet<BlockRef>,
     pub(super) active_loops: Vec<ActiveLoopContext>,
 }
@@ -112,6 +113,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .iter()
             .flat_map(|scope| scope.close_points.iter().copied())
             .collect();
+        let tbc_scope_regs = lowering
+            .proto
+            .instrs
+            .iter()
+            .filter_map(|instr| match instr {
+                LowInstr::Tbc(tbc) => Some(tbc.reg.index()),
+                _ => None,
+            })
+            .collect();
 
         Self {
             lowering,
@@ -125,6 +135,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             suppressed_phis: BTreeSet::new(),
             suppressed_instrs: BTreeSet::new(),
             structured_close_points,
+            tbc_scope_regs,
             visited: BTreeSet::new(),
             active_loops: Vec::new(),
         }
@@ -329,7 +340,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             // 否则 while/repeat/if 已经结构化了，dump 里仍会残留“close from rX”的噪音，
             // 迫使后面的 AST/readability 再去反推这其实只是作用域结束。
             if self.structured_close_points.contains(&instr_ref)
-                && matches!(instr, LowInstr::Close(_))
+                && matches!(instr, LowInstr::Close(close) if !self.tbc_scope_regs.contains(&close.from.index()))
             {
                 continue;
             }

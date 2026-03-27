@@ -3,6 +3,7 @@
 mod binding_flow;
 mod branch_pretty;
 mod cleanup;
+mod expr_analysis;
 mod field_access_sugar;
 mod function_sugar;
 mod inline_exprs;
