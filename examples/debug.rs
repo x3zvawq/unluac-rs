@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             debug: DebugOptions {
                 enable: true,
                 output_stages: vec![TARGET_STAGE],
-                timing: false,
+                timing: true,
                 color: DebugColorMode::Always,
                 detail: DEBUG_DETAIL,
                 filters: DebugFilters::default(),

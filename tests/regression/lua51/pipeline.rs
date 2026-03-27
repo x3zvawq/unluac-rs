@@ -871,6 +871,13 @@ mod decompile_pipeline {
             generated.source
         );
         assert!(
+            generated
+                .source
+                .contains("local value, value2, item = k, v, a[k]"),
+            "{}",
+            generated.source
+        );
+        assert!(
             generated.source.contains("> 20 then"),
             "{}",
             generated.source
