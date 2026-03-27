@@ -72,6 +72,8 @@ pub(super) struct LoopStatePlan {
 #[derive(Debug, Clone)]
 pub(super) struct ActiveLoopContext {
     pub(super) header: BlockRef,
+    pub(super) post_loop: BlockRef,
+    pub(super) downstream_post_loop: Option<BlockRef>,
     pub(super) continue_target: Option<BlockRef>,
     pub(super) continue_sources: BTreeSet<BlockRef>,
     pub(super) break_exits: BTreeMap<BlockRef, HirBlock>,
@@ -217,6 +219,18 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                         return Some(None);
                     }
                     if target == loop_context.header {
+                        return Some(None);
+                    }
+                    // Lua 5.2+ 的 loop break 常常直接跳到 post-loop continuation，
+                    // 而不会先经过额外的 break pad。这里如果继续把它当普通线性 successor，
+                    // body lowering 就会错误地走出当前 loop，最终把 numeric-for/while
+                    // 整体打回 unresolved。对当前活跃 loop 来说，这条边的语义就是 break。
+                    if target == loop_context.post_loop {
+                        stmts.push(HirStmt::Break);
+                        return Some(None);
+                    }
+                    if Some(target) == loop_context.downstream_post_loop {
+                        stmts.push(HirStmt::Break);
                         return Some(None);
                     }
                     if let Some(break_block) = loop_context.break_exits.get(&target) {
@@ -409,6 +423,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         else {
             return Some(None);
         };
+
+        // 单节点 short-circuit 和普通 branch 在结构信息上是重叠的。
+        // 这里如果已经有 plain branch candidate，就优先走普通 branch 恢复：
+        // short-circuit 那条 `can_reach(truthy, falsy)` 启发式在 loop 图里会把
+        // “经过回边才重新绕到另一臂”的路径也算进去，进而把简单的
+        // `if cond then break end` / `if cond then ... end` 误折成错误的 then/merge。
+        // 多节点 short-circuit 仍然保留，因为那类结构 plain branch 本来就表达不全。
+        if consumed_headers.len() == 1 && self.branch_by_header.contains_key(&header) {
+            return Some(None);
+        }
 
         if stop == Some(falsy) || can_reach(self.lowering.cfg, truthy, falsy) {
             return Some(Some(StructuredBranchPlan {

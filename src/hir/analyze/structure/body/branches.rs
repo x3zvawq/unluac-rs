@@ -68,10 +68,17 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 self.branch_value_else_target_overrides(block, branch_target_overrides)
             })
             .unwrap_or_else(|| target_overrides.clone());
-        let then_block = self.lower_region(plan.then_entry, branch_stop, &then_target_overrides)?;
+        let then_block =
+            match self.lower_region(plan.then_entry, branch_stop, &then_target_overrides) {
+                Some(block) => block,
+                None => return None,
+            };
         let else_block = match plan.else_entry {
             Some(else_entry) => {
-                Some(self.lower_region(else_entry, branch_stop, &else_target_overrides)?)
+                match self.lower_region(else_entry, branch_stop, &else_target_overrides) {
+                    Some(block) => Some(block),
+                    None => return None,
+                }
             }
             None => None,
         };
@@ -255,9 +262,20 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // 这样后面的 AST/readability 就不用再对着 `close + jump` 反推源码意图。
         let loop_context = self.active_loops.last()?.clone();
         let candidate = *self.branch_by_header.get(&block)?;
-        let break_exit = candidate
-            .merge
-            .filter(|merge| loop_context.break_exits.contains_key(merge))?;
+        let break_exit = candidate.merge.filter(|merge| {
+            loop_context.break_exits.contains_key(merge)
+                || *merge == loop_context.post_loop
+                || Some(*merge) == loop_context.downstream_post_loop
+        })?;
+        let break_block = if break_exit == loop_context.post_loop
+            || Some(break_exit) == loop_context.downstream_post_loop
+        {
+            HirBlock {
+                stmts: vec![HirStmt::Break],
+            }
+        } else {
+            loop_context.break_exits[&break_exit].clone()
+        };
         // break 臂之外的那一臂，很多时候只是继续执行当前 loop body，最后再回到
         // continue target。如果这里一口气把它降到 break pad 的出口，repeat/for 的
         // loop tail 就会被一起吞进去，随后整片 region 只能 fallback。这里优先把
@@ -270,13 +288,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             })
             .or(Some(break_exit));
         let then_block = self.lower_region(candidate.then_entry, body_stop, target_overrides)?;
-        let break_block = loop_context.break_exits[&break_exit].clone();
         let mut cond = self.lower_candidate_cond(block, candidate)?;
         rewrite_expr_temps(&mut cond, &temp_expr_overrides(target_overrides));
 
         stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
         self.visited.insert(block);
-        self.visited.insert(break_exit);
+        if break_exit != loop_context.post_loop
+            && Some(break_exit) != loop_context.downstream_post_loop
+        {
+            self.visited.insert(break_exit);
+        }
 
         if body_stop == Some(break_exit)
             && break_block.stmts.last() == Some(&HirStmt::Break)
@@ -333,6 +354,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if candidate.then_entry != continue_target
             && candidate.else_entry != Some(continue_target)
             && candidate.merge != Some(continue_target)
+        {
+            return None;
+        }
+        if self
+            .non_continue_entry_for_continue_candidate(candidate, continue_target)
+            .is_some_and(|entry| self.entry_is_direct_loop_break(entry, &loop_context))
         {
             return None;
         }
@@ -551,7 +578,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if !visited.insert(entry) {
             return false;
         }
-        if loop_context.break_exits.contains_key(&entry) {
+        if self.entry_is_direct_loop_break(entry, loop_context) {
             return true;
         }
 
@@ -570,6 +597,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             loop_context,
             visited,
         )
+    }
+
+    fn entry_is_direct_loop_break(
+        &self,
+        entry: BlockRef,
+        loop_context: &ActiveLoopContext,
+    ) -> bool {
+        loop_context.break_exits.contains_key(&entry)
+            || entry == loop_context.post_loop
+            || Some(entry) == loop_context.downstream_post_loop
     }
 
     fn lower_value_merge_node(
