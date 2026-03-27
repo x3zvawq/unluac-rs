@@ -457,55 +457,36 @@ pub(crate) const ALL_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/lua_cases/lua5.5/08_named_vararg_index_only.lua",
         PUC_LUA_GE_55,
     ),
-    LuaCaseMatrixEntry::new_with_suites(
+    LuaCaseMatrixEntry::new(
         "tests/lua_cases/luau/01_continue_compound_pipeline.lua",
         LUAU_ONLY,
-        LuaCaseSuites::case_health_only(),
     ),
-    LuaCaseMatrixEntry::new_with_suites(
+    LuaCaseMatrixEntry::new(
         "tests/lua_cases/luau/02_if_expression_router.lua",
         LUAU_ONLY,
-        LuaCaseSuites::case_health_only(),
     ),
-    LuaCaseMatrixEntry::new_with_suites(
+    LuaCaseMatrixEntry::new(
         "tests/lua_cases/luau/03_interp_escape_nested.lua",
         LUAU_ONLY,
-        LuaCaseSuites::case_health_only(),
     ),
-    LuaCaseMatrixEntry::new_with_suites(
-        "tests/lua_cases/luau/04_typed_callback_mesh.lua",
-        LUAU_ONLY,
-        LuaCaseSuites::case_health_only(),
-    ),
-    LuaCaseMatrixEntry::new_with_suites(
+    LuaCaseMatrixEntry::new("tests/lua_cases/luau/04_typed_callback_mesh.lua", LUAU_ONLY),
+    LuaCaseMatrixEntry::new(
         "tests/lua_cases/luau/05_repeat_continue_funnel.lua",
         LUAU_ONLY,
-        LuaCaseSuites::case_health_only(),
     ),
-    LuaCaseMatrixEntry::new_with_suites(
+    LuaCaseMatrixEntry::new(
         "tests/lua_cases/luau/06_compound_index_side_effects.lua",
         LUAU_ONLY,
-        LuaCaseSuites::case_health_only(),
     ),
-    LuaCaseMatrixEntry::new_with_suites(
-        "tests/lua_cases/luau/07_generic_fold_branch.lua",
-        LUAU_ONLY,
-        LuaCaseSuites::case_health_only(),
-    ),
-    LuaCaseMatrixEntry::new_with_suites(
+    LuaCaseMatrixEntry::new("tests/lua_cases/luau/07_generic_fold_branch.lua", LUAU_ONLY),
+    LuaCaseMatrixEntry::new(
         "tests/lua_cases/luau/08_optional_closure_dispatch.lua",
         LUAU_ONLY,
-        LuaCaseSuites::case_health_only(),
     ),
-    LuaCaseMatrixEntry::new_with_suites(
-        "tests/lua_cases/luau/09_recursive_if_interp.lua",
-        LUAU_ONLY,
-        LuaCaseSuites::case_health_only(),
-    ),
-    LuaCaseMatrixEntry::new_with_suites(
+    LuaCaseMatrixEntry::new("tests/lua_cases/luau/09_recursive_if_interp.lua", LUAU_ONLY),
+    LuaCaseMatrixEntry::new(
         "tests/lua_cases/luau/10_nested_continue_closure_mesh.lua",
         LUAU_ONLY,
-        LuaCaseSuites::case_health_only(),
     ),
 ];
 

@@ -17,6 +17,7 @@ pub use dialect::lua52::*;
 pub use dialect::lua53::*;
 pub use dialect::lua54::*;
 pub use dialect::lua55::*;
+pub use dialect::luau::*;
 pub use error::ParseError;
 pub use options::{ParseMode, ParseOptions, StringDecodeMode, StringEncoding};
 pub use raw::*;

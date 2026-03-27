@@ -124,6 +124,12 @@ pub(super) fn build_bindings(
         temp_debug_locals[temp.index()] = debug_local_name_for_open_def_start(proto, open_def);
     }
 
+    for phi in &dataflow.phi_candidates {
+        let temp = phi_temps[phi.id.index()];
+        temp_debug_locals[temp.index()] =
+            debug_local_name_for_reg_at_block_entry(proto, cfg, phi.block, phi.reg);
+    }
+
     let instr_fixed_defs = dataflow
         .instr_defs
         .iter()
@@ -177,6 +183,20 @@ fn debug_local_name_for_reg_at_instr(
         .first()
         .copied()?;
     debug_local_name_for_reg_at_pc(proto, reg, pc)
+}
+
+fn debug_local_name_for_reg_at_block_entry(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    block: crate::cfg::BlockRef,
+    reg: Reg,
+) -> Option<String> {
+    let instrs = cfg.blocks[block.index()].instrs;
+    if instrs.is_empty() {
+        return None;
+    }
+    let instr = instrs.start;
+    debug_local_name_for_reg_at_instr(proto, reg, instr)
 }
 
 fn debug_local_name_for_reg_at_pc(proto: &LoweredProto, reg: Reg, pc: u32) -> Option<String> {

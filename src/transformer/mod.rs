@@ -32,6 +32,7 @@ pub fn lower_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
         DialectVersion::Lua53 => dialect::lua53::lower_chunk(chunk),
         DialectVersion::Lua54 => dialect::lua54::lower_chunk(chunk),
         DialectVersion::Lua55 => dialect::lua55::lower_chunk(chunk),
+        DialectVersion::Luau => dialect::luau::lower_chunk(chunk),
     }
 }
 

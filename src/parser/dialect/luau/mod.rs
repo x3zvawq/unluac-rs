@@ -3,6 +3,10 @@
 //! Luau 的 chunk 协议与 PUC-Lua 头、常量池和 opcode 空间都不兼容，
 //! 因此这里会独立演进，不复用 `puc_lua` 的解析协议。
 
+mod debug;
 mod parser;
+mod raw;
 
-pub use parser::LuauParser;
+pub(crate) use debug::dump_chunk;
+pub(crate) use parser::LuauParser;
+pub use raw::*;

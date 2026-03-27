@@ -6,12 +6,12 @@
 use crate::parser::error::ParseError;
 use crate::parser::options::ParseOptions;
 use crate::parser::raw::{
-    ChunkHeader, DecodedText, Dialect, DialectConstPoolExtra, DialectDebugExtra,
+    ChunkHeader, ChunkLayout, DecodedText, Dialect, DialectConstPoolExtra, DialectDebugExtra,
     DialectHeaderExtra, DialectInstrExtra, DialectProtoExtra, DialectUpvalueExtra, DialectVersion,
-    Endianness, Origin, ProtoFrameInfo, ProtoLineRange, ProtoSignature, RawChunk, RawConstPool,
-    RawConstPoolCommon, RawDebugInfo, RawDebugInfoCommon, RawInstr, RawInstrOpcode,
-    RawInstrOperands, RawLiteralConst, RawLocalVar, RawProto, RawProtoCommon, RawString,
-    RawUpvalueInfo, RawUpvalueInfoCommon, Span,
+    Endianness, Origin, ProtoFrameInfo, ProtoLineRange, ProtoSignature, PucLuaChunkLayout,
+    RawChunk, RawConstPool, RawConstPoolCommon, RawDebugInfo, RawDebugInfoCommon, RawInstr,
+    RawInstrOpcode, RawInstrOperands, RawLiteralConst, RawLocalVar, RawProto, RawProtoCommon,
+    RawString, RawUpvalueInfo, RawUpvalueInfoCommon, Span,
 };
 use crate::parser::reader::BinaryReader;
 
@@ -58,13 +58,16 @@ impl Lua51Parser {
     pub(crate) fn parse(&self, bytes: &[u8]) -> Result<RawChunk, ParseError> {
         let mut reader = BinaryReader::new(bytes);
         let header = self.parse_header(&mut reader)?;
+        let layout = header
+            .puc_lua_layout()
+            .expect("lua51 parser must produce a PUC-Lua header layout");
         let layout = Lua51Layout {
-            endianness: header.endianness,
-            integer_size: header.integer_size,
-            size_t_size: header.size_t_size,
-            instruction_size: header.instruction_size,
-            number_size: header.number_size,
-            integral_number: header.integral_number,
+            endianness: layout.endianness,
+            integer_size: layout.integer_size,
+            size_t_size: layout.size_t_size,
+            instruction_size: layout.instruction_size,
+            number_size: layout.number_size,
+            integral_number: layout.integral_number,
         };
         let main = self.parse_proto(&mut reader, &layout, None)?;
 
@@ -127,14 +130,16 @@ impl Lua51Parser {
         Ok(ChunkHeader {
             dialect: Dialect::PucLua,
             version: DialectVersion::Lua51,
-            format,
-            endianness,
-            integer_size,
-            lua_integer_size: None,
-            size_t_size,
-            instruction_size,
-            number_size,
-            integral_number,
+            layout: ChunkLayout::PucLua(PucLuaChunkLayout {
+                format,
+                endianness,
+                integer_size,
+                lua_integer_size: None,
+                size_t_size,
+                instruction_size,
+                number_size,
+                integral_number,
+            }),
             extra: DialectHeaderExtra::Lua51(Lua51HeaderExtra),
             origin: Origin {
                 span: Span {

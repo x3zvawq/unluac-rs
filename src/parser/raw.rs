@@ -25,6 +25,10 @@ use super::dialect::lua55::{
     Lua55ConstPoolExtra, Lua55DebugExtra, Lua55HeaderExtra, Lua55InstrExtra, Lua55Opcode,
     Lua55Operands, Lua55ProtoExtra, Lua55UpvalueExtra,
 };
+use super::dialect::luau::{
+    LuauConstPoolExtra, LuauDebugExtra, LuauHeaderExtra, LuauInstrExtra, LuauOpcode, LuauOperands,
+    LuauProtoExtra, LuauUpvalueExtra,
+};
 
 /// 一个完整解析后的 chunk。
 #[derive(Debug, Clone, PartialEq)]
@@ -39,6 +43,21 @@ pub struct RawChunk {
 pub struct ChunkHeader {
     pub dialect: Dialect,
     pub version: DialectVersion,
+    pub layout: ChunkLayout,
+    pub extra: DialectHeaderExtra,
+    pub origin: Origin,
+}
+
+/// chunk 级机器布局在不同 dialect family 之间并不相同。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChunkLayout {
+    PucLua(PucLuaChunkLayout),
+    Luau(LuauChunkLayout),
+}
+
+/// PUC-Lua chunk header 暴露给 parser 的布局事实。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct PucLuaChunkLayout {
     pub format: u8,
     pub endianness: Endianness,
     pub integer_size: u8,
@@ -47,14 +66,36 @@ pub struct ChunkHeader {
     pub instruction_size: u8,
     pub number_size: u8,
     pub integral_number: bool,
-    pub extra: DialectHeaderExtra,
-    pub origin: Origin,
+}
+
+/// Luau serialized bytecode 的头信息。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct LuauChunkLayout {
+    pub bytecode_version: u8,
+    pub type_version: Option<u8>,
+}
+
+impl ChunkHeader {
+    pub fn puc_lua_layout(&self) -> Option<&PucLuaChunkLayout> {
+        match &self.layout {
+            ChunkLayout::PucLua(layout) => Some(layout),
+            ChunkLayout::Luau(_) => None,
+        }
+    }
+
+    pub fn luau_layout(&self) -> Option<&LuauChunkLayout> {
+        match &self.layout {
+            ChunkLayout::PucLua(_) => None,
+            ChunkLayout::Luau(layout) => Some(layout),
+        }
+    }
 }
 
 /// 当前支持的 Lua dialect family。
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Dialect {
     PucLua,
+    Luau,
 }
 
 /// dialect family 里的具体字节码版本。
@@ -65,6 +106,7 @@ pub enum DialectVersion {
     Lua53,
     Lua54,
     Lua55,
+    Luau,
 }
 
 /// header 声明的字节序。
@@ -128,6 +170,10 @@ pub struct RawConstPool {
 /// 多个 dialect 之间都共享的常量类别。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawConstPoolCommon {
+    /// 这里存放所有 dialect 都能直接复用的“字面量子集”。
+    ///
+    /// 像 Luau 这种拥有 import/table/closure/vector 常量的 dialect，会把完整常量表
+    /// 放进 `extra`，而公共层只保留后续 HIR/AST 能直接消费的字面量引用。
     pub literals: Vec<RawLiteralConst>,
 }
 
@@ -202,6 +248,7 @@ pub enum RawInstrOpcode {
     Lua53(Lua53Opcode),
     Lua54(Lua54Opcode),
     Lua55(Lua55Opcode),
+    Luau(LuauOpcode),
 }
 
 /// 各 dialect 自己的 operand 形态。
@@ -212,6 +259,7 @@ pub enum RawInstrOperands {
     Lua53(Lua53Operands),
     Lua54(Lua54Operands),
     Lua55(Lua55Operands),
+    Luau(LuauOperands),
 }
 
 /// parser 产物关联到原始字节流的位置。
@@ -251,6 +299,7 @@ pub enum DialectHeaderExtra {
     Lua53(Lua53HeaderExtra),
     Lua54(Lua54HeaderExtra),
     Lua55(Lua55HeaderExtra),
+    Luau(LuauHeaderExtra),
 }
 
 /// 各 dialect 在 proto 上附加的专属信息。
@@ -261,6 +310,7 @@ pub enum DialectProtoExtra {
     Lua53(Lua53ProtoExtra),
     Lua54(Lua54ProtoExtra),
     Lua55(Lua55ProtoExtra),
+    Luau(LuauProtoExtra),
 }
 
 /// 各 dialect 在常量池上附加的专属信息。
@@ -271,6 +321,7 @@ pub enum DialectConstPoolExtra {
     Lua53(Lua53ConstPoolExtra),
     Lua54(Lua54ConstPoolExtra),
     Lua55(Lua55ConstPoolExtra),
+    Luau(LuauConstPoolExtra),
 }
 
 /// 各 dialect 在 upvalue 信息上附加的专属内容。
@@ -281,6 +332,7 @@ pub enum DialectUpvalueExtra {
     Lua53(Lua53UpvalueExtra),
     Lua54(Lua54UpvalueExtra),
     Lua55(Lua55UpvalueExtra),
+    Luau(LuauUpvalueExtra),
 }
 
 /// 各 dialect 在调试信息上附加的专属内容。
@@ -291,6 +343,7 @@ pub enum DialectDebugExtra {
     Lua53(Lua53DebugExtra),
     Lua54(Lua54DebugExtra),
     Lua55(Lua55DebugExtra),
+    Luau(LuauDebugExtra),
 }
 
 /// 各 dialect 在指令上附加的专属内容。
@@ -301,4 +354,5 @@ pub enum DialectInstrExtra {
     Lua53(Lua53InstrExtra),
     Lua54(Lua54InstrExtra),
     Lua55(Lua55InstrExtra),
+    Luau(LuauInstrExtra),
 }

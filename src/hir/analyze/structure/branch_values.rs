@@ -16,25 +16,6 @@ use super::rewrites::lvalue_as_expr;
 use super::*;
 
 impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
-    pub(super) fn branch_value_needs_arm_target_overrides(&self, header: BlockRef) -> bool {
-        let Some(candidate) = self.branch_value_merges_by_header.get(&header).copied() else {
-            return false;
-        };
-        let Some(branch) = self.branch_by_header.get(&header).copied() else {
-            return false;
-        };
-        let Some(else_entry) = branch.else_entry else {
-            return false;
-        };
-
-        candidate.values.iter().any(|value| {
-            value.then_preds.len() != 1
-                || value.else_preds.len() != 1
-                || !value.then_preds.contains(&branch.then_entry)
-                || !value.else_preds.contains(&else_entry)
-        })
-    }
-
     fn branch_value_target_overrides_for_preds(
         &self,
         header: BlockRef,

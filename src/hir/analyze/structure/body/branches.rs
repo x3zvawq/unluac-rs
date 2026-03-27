@@ -53,9 +53,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         let branch_stop =
             self.branch_stop_for_region(block, plan.then_entry, plan.else_entry, plan.merge, stop);
-        let use_branch_value_arm_overrides = self.branch_value_needs_arm_target_overrides(block);
-        let branch_target_overrides = use_branch_value_arm_overrides
-            .then(|| self.branch_value_target_overrides(block, target_overrides));
+        let branch_target_overrides = self
+            .branch_value_merges_by_header
+            .contains_key(&block)
+            .then(|| {
+                // branch value merge 一旦存在，先把两臂里对应的 def 统一接到 merge target 身份。
+                // 这样即便 merge 值来源是 impure call / method call，后面没法折回 decision expr，
+                // HIR 也仍然能保住“分支里显式写值，merge 后继续读同一状态槽位”的结构。
+                self.branch_value_target_overrides(block, target_overrides)
+            });
         let then_target_overrides = branch_target_overrides
             .as_ref()
             .map(|branch_target_overrides| {

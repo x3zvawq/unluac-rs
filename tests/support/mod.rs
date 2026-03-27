@@ -456,6 +456,13 @@ pub(crate) fn run_decompile_pipeline_health(
     entry: &LuaCaseManifestEntry,
 ) -> Result<(), TestFailure> {
     let dialect_label = entry.dialect.label();
+    let toolchain = lua_toolchain(dialect_label).map_err(|error| {
+        TestFailure::new(
+            FailureKind::RunGeneratedChunkFailed,
+            "unknown test dialect",
+            format!("unknown test dialect {dialect_label}: {error}"),
+        )
+    })?;
     let baseline = build_case_health_baseline(entry, UnitSuite::DecompilePipelineHealth.label())
         .map_err(|failure| {
             TestFailure::new(
@@ -546,29 +553,36 @@ pub(crate) fn run_decompile_pipeline_health(
         ));
     }
 
-    let generated_output = run_lua_file(dialect_label, &generated_chunk_path).map_err(|error| {
-        TestFailure::new(
-            FailureKind::RunGeneratedChunkFailed,
-            "run generated chunk failed",
-            format!("run generated chunk failed: {error}"),
-        )
-    })?;
+    let generated_runtime_path = if toolchain.can_run_compiled_chunks {
+        &generated_chunk_path
+    } else {
+        &generated_source_path
+    };
+    let generated_output =
+        run_lua_file(dialect_label, generated_runtime_path).map_err(|error| {
+            TestFailure::new(
+                FailureKind::RunGeneratedChunkFailed,
+                "run generated artifact failed",
+                format!("run generated artifact failed: {error}"),
+            )
+        })?;
     if !generated_output.success() {
         let reason = primary_command_reason(&generated_output)
             .map(|reason| format!(": {reason}"))
             .unwrap_or_default();
         let summary = format!(
-            "generated chunk execution failed{reason} (chunk artifact: {}, status: {})",
-            repo_relative_display(&generated_chunk_path),
+            "generated artifact execution failed{reason} (runtime artifact: {}, status: {})",
+            repo_relative_display(generated_runtime_path),
             generated_output.status_code.unwrap_or_default(),
         );
         return Err(TestFailure::new(
             FailureKind::GeneratedChunkExecutionFailed,
             summary.clone(),
             format!(
-                "{summary}\nsource artifact: {}\nchunk artifact: {}\n{}\ngenerated source:\n{}",
+                "{summary}\nsource artifact: {}\nchunk artifact: {}\nruntime artifact: {}\n{}\ngenerated source:\n{}",
                 repo_relative_display(&generated_source_path),
                 repo_relative_display(&generated_chunk_path),
+                repo_relative_display(generated_runtime_path),
                 generated_output.render(),
                 generated.source
             ),
@@ -578,20 +592,21 @@ pub(crate) fn run_decompile_pipeline_health(
     if let Some(diff) = diff_command_outputs(
         "expected-source",
         &baseline.source_output,
-        "generated-chunk",
+        "generated-artifact",
         &generated_output,
     ) {
         let summary = format!(
-            "generated output mismatch (chunk artifact: {})",
-            repo_relative_display(&generated_chunk_path),
+            "generated output mismatch (runtime artifact: {})",
+            repo_relative_display(generated_runtime_path),
         );
         return Err(TestFailure::new(
             FailureKind::GeneratedOutputMismatch,
             summary.clone(),
             format!(
-                "{summary}\nsource artifact: {}\nchunk artifact: {}\n{diff}\ngenerated source:\n{}",
+                "{summary}\nsource artifact: {}\nchunk artifact: {}\nruntime artifact: {}\n{diff}\ngenerated source:\n{}",
                 repo_relative_display(&generated_source_path),
                 repo_relative_display(&generated_chunk_path),
+                repo_relative_display(generated_runtime_path),
                 generated.source
             ),
         ));

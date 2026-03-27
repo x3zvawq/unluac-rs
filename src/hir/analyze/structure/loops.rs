@@ -62,7 +62,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
         stmts.extend(loop_state_init_stmts(&plan));
         self.visited.insert(candidate.header);
-        self.install_loop_exit_bindings(candidate, exit, &plan);
+        self.install_loop_exit_bindings(candidate, exit, &plan, target_overrides);
 
         self.active_loops.push(loop_context.clone());
         let body = match self.lower_region(
@@ -144,7 +144,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
         self.visited
             .extend(loop_context.break_exits.keys().copied());
-        self.install_loop_exit_bindings(candidate, exit, &plan);
+        self.install_loop_exit_bindings(candidate, exit, &plan, target_overrides);
         stmts.push(HirStmt::Repeat(Box::new(HirRepeat {
             body: HirBlock { stmts: body },
             cond: {
@@ -257,7 +257,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.visited.insert(continue_block);
         self.visited
             .extend(loop_context.break_exits.keys().copied());
-        self.install_loop_exit_bindings(candidate, exit, &plan);
+        self.install_loop_exit_bindings(candidate, exit, &plan, target_overrides);
         stmts.push(HirStmt::NumericFor(Box::new(HirNumericFor {
             binding,
             start: expr_for_reg_use(self.lowering, block, instr_ref, init.index),
@@ -334,7 +334,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.visited.insert(header);
         self.visited
             .extend(loop_context.break_exits.keys().copied());
-        self.install_loop_exit_bindings(candidate, exit, &plan);
+        self.install_loop_exit_bindings(candidate, exit, &plan, target_overrides);
         stmts.push(HirStmt::GenericFor(Box::new(HirGenericFor {
             bindings,
             iterator: self.lower_generic_for_iterator(header, call_instr_ref, call),
@@ -363,7 +363,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 continue;
             }
 
-            let init = self.loop_entry_expr(preheader, phi)?;
+            let init = self.loop_entry_expr(preheader, phi, target_overrides)?;
             let temp = *self.lowering.bindings.phi_temps.get(phi.id.index())?;
             let target = self.loop_state_target(candidate, exit, phi.reg, temp, target_overrides);
             plan.backedge_target_overrides.insert(temp, target.clone());
@@ -402,7 +402,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 continue;
             }
 
-            let init = self.loop_exit_entry_expr(phi, &candidate.blocks)?;
+            let init = self.loop_exit_entry_expr(phi, &candidate.blocks, target_overrides)?;
             let temp = *self.lowering.bindings.phi_temps.get(phi.id.index())?;
             let target = self.loop_state_target(candidate, exit, phi.reg, temp, target_overrides);
             plan.backedge_target_overrides.insert(temp, target.clone());
@@ -430,18 +430,24 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         Some(plan)
     }
 
-    fn loop_entry_expr(&self, preheader: BlockRef, phi: &PhiCandidate) -> Option<HirExpr> {
+    fn loop_entry_expr(
+        &self,
+        preheader: BlockRef,
+        phi: &PhiCandidate,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<HirExpr> {
         let incoming = phi
             .incoming
             .iter()
             .find(|incoming| incoming.pred == preheader)?;
-        self.loop_incoming_expr(preheader, phi.reg, incoming)
+        self.loop_incoming_expr(preheader, phi.reg, incoming, target_overrides)
     }
 
     fn loop_exit_entry_expr(
         &self,
         phi: &PhiCandidate,
         loop_blocks: &BTreeSet<BlockRef>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirExpr> {
         let mut init_expr = None;
 
@@ -450,7 +456,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .iter()
             .filter(|incoming| !loop_blocks.contains(&incoming.pred))
         {
-            let expr = self.loop_incoming_expr(incoming.pred, phi.reg, incoming)?;
+            let expr =
+                self.loop_incoming_expr(incoming.pred, phi.reg, incoming, target_overrides)?;
             if init_expr
                 .as_ref()
                 .is_some_and(|known_expr: &HirExpr| *known_expr != expr)
@@ -468,6 +475,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         pred: BlockRef,
         reg: Reg,
         incoming: &crate::cfg::PhiIncoming,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirExpr> {
         // 某些 loop 会直接跟在另一个已经结构化的 region 后面。此时 CFG/Dataflow 视角里，
         // predecessor 边上同一寄存器可能仍然带着“多个原始 def 合流”的痕迹；但对 HIR 来说，
@@ -482,6 +490,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return Some(expr.clone());
         }
 
+        if let Some(expr) = self.shared_incoming_override_expr(incoming, target_overrides) {
+            return Some(expr);
+        }
+
         single_fixed_incoming_expr(self.lowering, incoming)
     }
 
@@ -490,6 +502,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         candidate: &LoopCandidate,
         exit: BlockRef,
         plan: &LoopStatePlan,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
     ) {
         if plan.states.is_empty() {
             return;
@@ -536,7 +549,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             if !phi_has_inside_and_outside_incoming(phi, &inside_exit_blocks) {
                 continue;
             }
-            let Some(exit_init) = self.loop_exit_entry_expr(phi, &inside_exit_blocks) else {
+            let Some(exit_init) =
+                self.loop_exit_entry_expr(phi, &inside_exit_blocks, target_overrides)
+            else {
                 continue;
             };
             // 只有当 exit phi 的“循环外初值”与当前 loop state 的初值确实是同一个语义槽位时，
@@ -969,4 +984,29 @@ fn single_fixed_incoming_expr(
         .next()
         .expect("len checked above, exactly one def exists");
     Some(HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()]))
+}
+
+impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
+    fn shared_incoming_override_expr(
+        &self,
+        incoming: &crate::cfg::PhiIncoming,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<HirExpr> {
+        let mut shared_expr = None;
+
+        for def in &incoming.defs {
+            let temp = *self.lowering.bindings.fixed_temps.get(def.index())?;
+            let lvalue = target_overrides.get(&temp)?;
+            let expr = lvalue_as_expr(lvalue)?;
+            if shared_expr
+                .as_ref()
+                .is_some_and(|known_expr: &HirExpr| *known_expr != expr)
+            {
+                return None;
+            }
+            shared_expr = Some(expr);
+        }
+
+        shared_expr
+    }
 }

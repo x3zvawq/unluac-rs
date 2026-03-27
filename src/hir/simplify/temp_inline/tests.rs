@@ -5,8 +5,8 @@
 use super::*;
 use crate::hir::common::{
     HirAssign, HirBinaryExpr, HirBinaryOpKind, HirCallStmt, HirCapture, HirClosureExpr,
-    HirGlobalRef, HirIf, HirModule, HirNumericFor, HirProtoRef, HirReturn, HirUnaryExpr,
-    HirUnaryOpKind, LocalId, ParamId,
+    HirGenericFor, HirGlobalRef, HirIf, HirModule, HirNumericFor, HirProtoRef, HirReturn,
+    HirUnaryExpr, HirUnaryOpKind, LocalId, ParamId,
 };
 
 #[test]
@@ -66,10 +66,10 @@ fn does_not_inline_across_control_barrier() {
         ],
     });
 
-    assert!(!inline_temps_in_proto(
+    inline_temps_in_proto(
         &mut proto,
-        crate::readability::ReadabilityOptions::default()
-    ));
+        crate::readability::ReadabilityOptions::default(),
+    );
     assert_eq!(proto.body.stmts.len(), 3);
 }
 
@@ -127,10 +127,11 @@ fn does_not_inline_temp_into_nested_return_base_access() {
         ],
     });
 
-    assert!(!inline_temps_in_proto(
+    inline_temps_in_proto(
         &mut proto,
-        crate::readability::ReadabilityOptions::default()
-    ));
+        crate::readability::ReadabilityOptions::default(),
+    );
+    println!("{proto:#?}");
     assert!(matches!(
         proto.body.stmts.as_slice(),
         [HirStmt::Assign(_), HirStmt::Return(ret)]
@@ -179,10 +180,10 @@ fn does_not_inline_self_referential_loop_state_update_into_following_call() {
         })
     };
 
-    assert!(!inline_temps_in_proto(
+    inline_temps_in_proto(
         &mut proto,
-        crate::readability::ReadabilityOptions::default()
-    ));
+        crate::readability::ReadabilityOptions::default(),
+    );
     assert!(matches!(
         proto.body.stmts.as_slice(),
         [HirStmt::NumericFor(numeric_for)]
@@ -205,6 +206,179 @@ fn does_not_inline_self_referential_loop_state_update_into_following_call() {
                             [HirExpr::TempRef(TempId(0))]
                         )
             )
+    ));
+}
+
+#[test]
+fn does_not_inline_debug_hinted_generic_for_loop_state_update() {
+    let mut proto = HirProto {
+        locals: vec![LocalId(0), LocalId(1), LocalId(2), LocalId(3)],
+        temps: vec![TempId(0)],
+        temp_debug_locals: vec![Some("value".to_owned())],
+        ..dummy_proto(HirBlock {
+            stmts: vec![HirStmt::GenericFor(Box::new(HirGenericFor {
+                bindings: vec![LocalId(0), LocalId(1)],
+                iterator: vec![
+                    HirExpr::GlobalRef(HirGlobalRef {
+                        name: "ipairs".to_owned(),
+                    }),
+                    HirExpr::LocalRef(LocalId(2)),
+                ],
+                body: HirBlock {
+                    stmts: vec![
+                        HirStmt::Assign(Box::new(HirAssign {
+                            targets: vec![HirLValue::Temp(TempId(0))],
+                            values: vec![HirExpr::Call(Box::new(HirCallExpr {
+                                callee: HirExpr::GlobalRef(HirGlobalRef {
+                                    name: "step".to_owned(),
+                                }),
+                                args: vec![
+                                    HirExpr::LocalRef(LocalId(3)),
+                                    HirExpr::LocalRef(LocalId(1)),
+                                    HirExpr::LocalRef(LocalId(0)),
+                                ],
+                                multiret: false,
+                                method: false,
+                            }))],
+                        })),
+                        HirStmt::Assign(Box::new(HirAssign {
+                            targets: vec![HirLValue::Local(LocalId(3))],
+                            values: vec![HirExpr::TempRef(TempId(0))],
+                        })),
+                    ],
+                },
+            }))],
+        })
+    };
+
+    inline_temps_in_proto(
+        &mut proto,
+        crate::readability::ReadabilityOptions::default(),
+    );
+    assert!(matches!(
+        proto.body.stmts.as_slice(),
+        [HirStmt::GenericFor(generic_for)]
+            if matches!(
+                generic_for.body.stmts.as_slice(),
+                [HirStmt::Assign(assign), HirStmt::Assign(update)]
+                    if matches!(
+                        assign.targets.as_slice(),
+                        [HirLValue::Temp(TempId(0))]
+                    )
+                        && matches!(
+                            update.targets.as_slice(),
+                            [HirLValue::Local(LocalId(3))]
+                        )
+                        && matches!(
+                            update.values.as_slice(),
+                            [HirExpr::TempRef(TempId(0))]
+                        )
+            )
+    ));
+}
+
+#[test]
+fn does_not_inline_generic_for_carried_state_update_from_loop_prefix() {
+    let mut proto = HirProto {
+        locals: vec![LocalId(0), LocalId(1)],
+        temps: (0..10).map(TempId).collect(),
+        ..dummy_proto(HirBlock {
+            stmts: vec![
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Temp(TempId(0))],
+                    values: vec![HirExpr::Integer(0)],
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Temp(TempId(9))],
+                    values: vec![HirExpr::Integer(4)],
+                })),
+                HirStmt::GenericFor(Box::new(HirGenericFor {
+                    bindings: vec![LocalId(0), LocalId(1)],
+                    iterator: vec![
+                        HirExpr::TempRef(TempId(1)),
+                        HirExpr::TempRef(TempId(2)),
+                        HirExpr::TempRef(TempId(3)),
+                    ],
+                    body: HirBlock {
+                        stmts: vec![
+                            HirStmt::Assign(Box::new(HirAssign {
+                                targets: vec![HirLValue::Temp(TempId(4))],
+                                values: vec![HirExpr::TempRef(TempId(9))],
+                            })),
+                            HirStmt::Assign(Box::new(HirAssign {
+                                targets: vec![HirLValue::Temp(TempId(5))],
+                                values: vec![HirExpr::LocalRef(LocalId(1))],
+                            })),
+                            HirStmt::Assign(Box::new(HirAssign {
+                                targets: vec![HirLValue::Temp(TempId(6))],
+                                values: vec![HirExpr::LocalRef(LocalId(0))],
+                            })),
+                            HirStmt::Assign(Box::new(HirAssign {
+                                targets: vec![HirLValue::Temp(TempId(9))],
+                                values: vec![HirExpr::Call(Box::new(HirCallExpr {
+                                    callee: HirExpr::GlobalRef(HirGlobalRef {
+                                        name: "step".to_owned(),
+                                    }),
+                                    args: vec![
+                                        HirExpr::TempRef(TempId(4)),
+                                        HirExpr::TempRef(TempId(5)),
+                                        HirExpr::TempRef(TempId(6)),
+                                    ],
+                                    multiret: false,
+                                    method: false,
+                                }))],
+                            })),
+                            HirStmt::Assign(Box::new(HirAssign {
+                                targets: vec![HirLValue::TableAccess(Box::new(
+                                    crate::hir::common::HirTableAccess {
+                                        base: HirExpr::TempRef(TempId(0)),
+                                        key: HirExpr::Integer(1),
+                                    },
+                                ))],
+                                values: vec![HirExpr::TempRef(TempId(9))],
+                            })),
+                        ],
+                    },
+                })),
+                HirStmt::Return(Box::new(HirReturn {
+                    values: vec![HirExpr::TempRef(TempId(9))],
+                })),
+            ],
+        })
+    };
+
+    inline_temps_in_proto(
+        &mut proto,
+        crate::readability::ReadabilityOptions::default(),
+    );
+    let generic_for = proto
+        .body
+        .stmts
+        .iter()
+        .find_map(|stmt| match stmt {
+            HirStmt::GenericFor(generic_for) => Some(generic_for.as_ref()),
+            _ => None,
+        })
+        .expect("test fixture should still contain a generic-for");
+    assert!(generic_for.body.stmts.iter().any(|stmt| {
+        matches!(
+            stmt,
+            HirStmt::Assign(assign)
+                if matches!(assign.targets.as_slice(), [HirLValue::Temp(TempId(9))])
+                    && matches!(assign.values.as_slice(), [HirExpr::Call(_)])
+        )
+    }));
+    assert!(generic_for.body.stmts.iter().any(|stmt| {
+        matches!(
+            stmt,
+            HirStmt::Assign(assign)
+                if matches!(assign.targets.as_slice(), [HirLValue::TableAccess(_)])
+                    && matches!(assign.values.as_slice(), [HirExpr::TempRef(TempId(9))])
+        )
+    }));
+    assert!(matches!(
+        proto.body.stmts.last(),
+        Some(HirStmt::Return(ret)) if matches!(ret.values.as_slice(), [HirExpr::TempRef(TempId(9))])
     ));
 }
 

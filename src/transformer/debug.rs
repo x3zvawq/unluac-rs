@@ -184,6 +184,7 @@ fn dialect_label(version: DialectVersion) -> &'static str {
         DialectVersion::Lua53 => "lua5.3",
         DialectVersion::Lua54 => "lua5.4",
         DialectVersion::Lua55 => "lua5.5",
+        DialectVersion::Luau => "luau",
     }
 }
 

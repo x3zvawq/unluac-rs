@@ -13,10 +13,11 @@ use crate::hir::{
 };
 use crate::naming::{NameSource, NamingMode, NamingOptions, assign_names};
 use crate::parser::{
-    ChunkHeader, Dialect, DialectConstPoolExtra, DialectDebugExtra, DialectHeaderExtra,
-    DialectProtoExtra, DialectUpvalueExtra, DialectVersion, Endianness, Origin, ProtoFrameInfo,
-    ProtoLineRange, ProtoSignature, RawChunk, RawConstPool, RawConstPoolCommon, RawDebugInfo,
-    RawDebugInfoCommon, RawProto, RawProtoCommon, RawUpvalueInfo, RawUpvalueInfoCommon, Span,
+    ChunkHeader, ChunkLayout, Dialect, DialectConstPoolExtra, DialectDebugExtra,
+    DialectHeaderExtra, DialectProtoExtra, DialectUpvalueExtra, DialectVersion, Endianness, Origin,
+    ProtoFrameInfo, ProtoLineRange, ProtoSignature, PucLuaChunkLayout, RawChunk, RawConstPool,
+    RawConstPoolCommon, RawDebugInfo, RawDebugInfoCommon, RawProto, RawProtoCommon, RawUpvalueInfo,
+    RawUpvalueInfoCommon, Span,
 };
 use crate::parser::{
     Lua51ConstPoolExtra, Lua51DebugExtra, Lua51HeaderExtra, Lua51ProtoExtra, Lua51UpvalueExtra,
@@ -31,14 +32,16 @@ fn empty_raw_chunk() -> RawChunk {
         header: ChunkHeader {
             dialect: Dialect::PucLua,
             version: DialectVersion::Lua51,
-            format: 0,
-            endianness: Endianness::Little,
-            integer_size: 4,
-            lua_integer_size: None,
-            size_t_size: 4,
-            instruction_size: 4,
-            number_size: 8,
-            integral_number: false,
+            layout: ChunkLayout::PucLua(PucLuaChunkLayout {
+                format: 0,
+                endianness: Endianness::Little,
+                integer_size: 4,
+                lua_integer_size: None,
+                size_t_size: 4,
+                instruction_size: 4,
+                number_size: 8,
+                integral_number: false,
+            }),
             extra: DialectHeaderExtra::Lua51(Lua51HeaderExtra),
             origin,
         },

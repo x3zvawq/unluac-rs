@@ -10,6 +10,8 @@ mod helpers;
 mod lower;
 mod short_circuit;
 mod structure;
+#[cfg(test)]
+mod tests;
 
 use self::lower::{ChildAnalyses, lower_proto};
 use super::simplify::simplify_hir_with_timing;

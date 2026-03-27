@@ -101,19 +101,22 @@ fn visible_proto_ids(protos: &[ProtoEntry<'_>], filters: &DebugFilters) -> Vec<u
 }
 
 fn write_header_view(output: &mut String, header: &ChunkHeader) {
+    let layout = header
+        .puc_lua_layout()
+        .expect("lua52 debug should only receive puc-lua chunk layouts");
     let _ = writeln!(output, "header");
     let _ = writeln!(output, "  dialect: {}", header.dialect_label());
     let _ = writeln!(output, "  version: {}", header.version_label());
-    let _ = writeln!(output, "  format: {}", header.format);
+    let _ = writeln!(output, "  format: {}", layout.format);
     let _ = writeln!(output, "  endianness: {}", header.endianness_label());
-    let _ = writeln!(output, "  integer_size: {}", header.integer_size);
-    if let Some(lua_integer_size) = header.lua_integer_size {
+    let _ = writeln!(output, "  integer_size: {}", layout.integer_size);
+    if let Some(lua_integer_size) = layout.lua_integer_size {
         let _ = writeln!(output, "  lua_integer_size: {lua_integer_size}");
     }
-    let _ = writeln!(output, "  size_t_size: {}", header.size_t_size);
-    let _ = writeln!(output, "  instruction_size: {}", header.instruction_size);
-    let _ = writeln!(output, "  number_size: {}", header.number_size);
-    let _ = writeln!(output, "  integral_number: {}", header.integral_number);
+    let _ = writeln!(output, "  size_t_size: {}", layout.size_t_size);
+    let _ = writeln!(output, "  instruction_size: {}", layout.instruction_size);
+    let _ = writeln!(output, "  number_size: {}", layout.number_size);
+    let _ = writeln!(output, "  integral_number: {}", layout.integral_number);
     let _ = writeln!(output, "  origin: {}", format_origin(header.origin));
 
     match &header.extra {
@@ -401,6 +404,7 @@ impl HeaderDebugExt for ChunkHeader {
     fn dialect_label(&self) -> &'static str {
         match self.dialect {
             Dialect::PucLua => "puc-lua",
+            Dialect::Luau => "luau",
         }
     }
 
@@ -411,11 +415,16 @@ impl HeaderDebugExt for ChunkHeader {
             DialectVersion::Lua53 => "lua5.3",
             DialectVersion::Lua54 => "lua5.4",
             DialectVersion::Lua55 => "lua5.5",
+            DialectVersion::Luau => "luau",
         }
     }
 
     fn endianness_label(&self) -> &'static str {
-        match self.endianness {
+        match self
+            .puc_lua_layout()
+            .expect("lua52 debug should only receive puc-lua chunk layouts")
+            .endianness
+        {
             Endianness::Little => "little",
             Endianness::Big => "big",
         }
