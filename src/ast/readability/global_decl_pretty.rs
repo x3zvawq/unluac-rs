@@ -1174,9 +1174,9 @@ fn collect_missing_globals_in_expr(
 }
 
 fn insert_missing_global_decls(block: &mut AstBlock, missing: &MissingGlobals) {
-    let mut prefix = Vec::new();
+    let mut inserted = Vec::new();
     if !missing.none.is_empty() {
-        prefix.push(AstStmt::GlobalDecl(Box::new(AstGlobalDecl {
+        inserted.push(AstStmt::GlobalDecl(Box::new(AstGlobalDecl {
             bindings: missing
                 .none
                 .iter()
@@ -1192,7 +1192,7 @@ fn insert_missing_global_decls(block: &mut AstBlock, missing: &MissingGlobals) {
         })));
     }
     if !missing.const_.is_empty() {
-        prefix.push(AstStmt::GlobalDecl(Box::new(AstGlobalDecl {
+        inserted.push(AstStmt::GlobalDecl(Box::new(AstGlobalDecl {
             bindings: missing
                 .const_
                 .iter()
@@ -1207,8 +1207,20 @@ fn insert_missing_global_decls(block: &mut AstBlock, missing: &MissingGlobals) {
             values: Vec::new(),
         })));
     }
-    prefix.append(&mut block.stmts);
-    block.stmts = prefix;
+    if inserted.is_empty() {
+        return;
+    }
+
+    let old_stmts = std::mem::take(&mut block.stmts);
+    let insert_at = old_stmts
+        .iter()
+        .take_while(|stmt| matches!(stmt, AstStmt::GlobalDecl(_)))
+        .count();
+    let mut new_stmts = Vec::with_capacity(old_stmts.len() + inserted.len());
+    new_stmts.extend(old_stmts.iter().take(insert_at).cloned());
+    new_stmts.extend(inserted);
+    new_stmts.extend(old_stmts.into_iter().skip(insert_at));
+    block.stmts = new_stmts;
 }
 
 #[cfg(test)]

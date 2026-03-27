@@ -29,6 +29,7 @@ struct AstLowerer<'a> {
     module: &'a HirModule,
     target: AstTargetDialect,
     next_synthetic_label: usize,
+    next_fresh_temp: Vec<usize>,
 }
 
 impl<'a> AstLowerer<'a> {
@@ -37,6 +38,18 @@ impl<'a> AstLowerer<'a> {
             module,
             target,
             next_synthetic_label: max_hir_label_id(module) + 1,
+            next_fresh_temp: module
+                .protos
+                .iter()
+                .map(|proto| {
+                    proto
+                        .temps
+                        .iter()
+                        .map(|temp| temp.index())
+                        .max()
+                        .map_or(0, |max| max + 1)
+                })
+                .collect(),
         }
     }
 
@@ -127,6 +140,14 @@ impl<'a> AstLowerer<'a> {
                 self.try_lower_method_call_alias(proto_index, &block.stmts, index)?
             {
                 stmts.push(stmt);
+                index += consumed;
+                continue;
+            }
+
+            if let Some((group, consumed)) =
+                self.try_lower_installer_iife_call_stmt(proto_index, &block.stmts, index)?
+            {
+                stmts.extend(group);
                 index += consumed;
                 continue;
             }
@@ -382,6 +403,16 @@ impl<'a> AstLowerer<'a> {
             self.next_synthetic_label += 1;
             Some(label)
         }
+    }
+
+    fn fresh_temp(&mut self, proto_index: usize) -> TempId {
+        let next = self
+            .next_fresh_temp
+            .get_mut(proto_index)
+            .expect("proto temp seed must exist");
+        let temp = TempId(*next);
+        *next += 1;
+        temp
     }
 
     fn lower_local_binding(

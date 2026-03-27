@@ -564,6 +564,13 @@ mod decompile_pipeline {
             "{}",
             generated.source
         );
+        assert!(
+            generated.source.contains("local function ")
+                && generated.source.contains("(\"ax\")")
+                && !generated.source.contains("(function("),
+            "{}",
+            generated.source
+        );
     }
 
     #[test]

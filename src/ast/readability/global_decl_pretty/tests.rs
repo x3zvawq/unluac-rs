@@ -220,3 +220,57 @@ fn inserts_mutable_global_prelude_when_outer_block_reads_name_written_in_nested_
     assert_eq!(global_decl.bindings[0].attr, AstGlobalAttr::None);
     assert!(global_decl.values.is_empty());
 }
+
+#[test]
+fn inserts_missing_globals_after_existing_leading_global_decl_run() {
+    let mut module = AstModule {
+        entry_function: HirProtoRef(0),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::GlobalDecl(Box::new(AstGlobalDecl {
+                    bindings: vec![crate::ast::AstGlobalBinding {
+                        target: AstGlobalBindingTarget::Name(crate::ast::AstGlobalName {
+                            text: "outer_prefix".to_owned(),
+                        }),
+                        attr: AstGlobalAttr::None,
+                    }],
+                    values: vec![AstExpr::String("G".to_owned())],
+                })),
+                AstStmt::CallStmt(Box::new(crate::ast::AstCallStmt {
+                    call: crate::ast::common::AstCallKind::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Global(crate::ast::AstGlobalName {
+                            text: "print".to_owned(),
+                        })),
+                        args: vec![AstExpr::String("tag".to_owned())],
+                    })),
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+            options: Default::default(),
+        }
+    ));
+
+    let [
+        AstStmt::GlobalDecl(explicit),
+        AstStmt::GlobalDecl(inferred),
+        ..,
+    ] = module.body.stmts.as_slice()
+    else {
+        panic!("expected explicit global decl followed by inferred prelude");
+    };
+    assert!(matches!(
+        &explicit.bindings[0].target,
+        AstGlobalBindingTarget::Name(name) if name.text == "outer_prefix"
+    ));
+    assert!(matches!(
+        &inferred.bindings[0].target,
+        AstGlobalBindingTarget::Name(name) if name.text == "print"
+    ));
+    assert_eq!(inferred.bindings[0].attr, AstGlobalAttr::Const);
+}

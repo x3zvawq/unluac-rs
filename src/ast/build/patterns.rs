@@ -4,9 +4,9 @@ use crate::hir::{HirCallExpr, HirExpr, HirLValue, HirStmt, LocalId};
 
 use super::{AstLowerError, AstLowerer};
 use crate::ast::common::{
-    AstAssign, AstBindingRef, AstCallKind, AstCallStmt, AstExpr, AstGlobalAttr, AstGlobalBinding,
-    AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstLocalAttr, AstLocalDecl,
-    AstMethodCallExpr, AstStmt,
+    AstAssign, AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstExpr, AstGlobalAttr,
+    AstGlobalBinding, AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstLocalAttr,
+    AstLocalDecl, AstMethodCallExpr, AstStmt,
 };
 
 impl<'a> AstLowerer<'a> {
@@ -275,6 +275,56 @@ impl<'a> AstLowerer<'a> {
                 call: self.lower_call(proto_index, &forwarded_call)?,
             })),
             2,
+        )))
+    }
+
+    pub(super) fn try_lower_installer_iife_call_stmt(
+        &mut self,
+        proto_index: usize,
+        stmts: &[HirStmt],
+        index: usize,
+    ) -> Result<Option<(Vec<AstStmt>, usize)>, AstLowerError> {
+        let Some(HirStmt::CallStmt(call_stmt)) = stmts.get(index) else {
+            return Ok(None);
+        };
+        if call_stmt.call.method {
+            return Ok(None);
+        }
+        let HirExpr::Closure(_) = &call_stmt.call.callee else {
+            return Ok(None);
+        };
+
+        let AstExpr::FunctionExpr(function) =
+            self.lower_expr(proto_index, &call_stmt.call.callee)?
+        else {
+            return Ok(None);
+        };
+        if !function_expr_looks_like_named_installer(&function) {
+            return Ok(None);
+        }
+
+        let temp = self.fresh_temp(proto_index);
+        let binding = AstBindingRef::Temp(temp);
+        let args = call_stmt
+            .call
+            .args
+            .iter()
+            .map(|arg| self.lower_expr(proto_index, arg))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some((
+            vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![self.recovered_local_binding(binding, AstLocalAttr::None)],
+                    values: vec![AstExpr::FunctionExpr(function)],
+                })),
+                AstStmt::CallStmt(Box::new(AstCallStmt {
+                    call: AstCallKind::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(crate::ast::common::AstNameRef::Temp(temp)),
+                        args,
+                    })),
+                })),
+            ],
+            1,
         )))
     }
 
@@ -563,6 +613,76 @@ fn lvalue_matches_global_name(target: &HirLValue, name: &str) -> bool {
             matches!(&access.key, HirExpr::String(key) if key == name)
         }
         _ => false,
+    }
+}
+
+fn function_expr_looks_like_named_installer(function: &crate::ast::AstFunctionExpr) -> bool {
+    function
+        .body
+        .stmts
+        .iter()
+        .any(stmt_looks_like_named_installer_step)
+}
+
+fn stmt_looks_like_named_installer_step(stmt: &AstStmt) -> bool {
+    match stmt {
+        AstStmt::GlobalDecl(_) | AstStmt::FunctionDecl(_) | AstStmt::LocalFunctionDecl(_) => true,
+        AstStmt::If(if_stmt) => {
+            if_stmt
+                .then_block
+                .stmts
+                .iter()
+                .any(stmt_looks_like_named_installer_step)
+                || if_stmt.else_block.as_ref().is_some_and(|else_block| {
+                    else_block
+                        .stmts
+                        .iter()
+                        .any(stmt_looks_like_named_installer_step)
+                })
+        }
+        AstStmt::While(while_stmt) => while_stmt
+            .body
+            .stmts
+            .iter()
+            .any(stmt_looks_like_named_installer_step),
+        AstStmt::Repeat(repeat_stmt) => repeat_stmt
+            .body
+            .stmts
+            .iter()
+            .any(stmt_looks_like_named_installer_step),
+        AstStmt::NumericFor(numeric_for) => numeric_for
+            .body
+            .stmts
+            .iter()
+            .any(stmt_looks_like_named_installer_step),
+        AstStmt::GenericFor(generic_for) => generic_for
+            .body
+            .stmts
+            .iter()
+            .any(stmt_looks_like_named_installer_step),
+        AstStmt::DoBlock(block) => block.stmts.iter().any(stmt_looks_like_named_installer_step),
+        AstStmt::Assign(assign) => assign.targets.iter().any(lvalue_looks_like_global_write),
+        AstStmt::LocalDecl(_)
+        | AstStmt::CallStmt(_)
+        | AstStmt::Return(_)
+        | AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_) => false,
+    }
+}
+
+fn lvalue_looks_like_global_write(target: &crate::ast::AstLValue) -> bool {
+    match target {
+        crate::ast::AstLValue::Name(crate::ast::AstNameRef::Global(_)) => true,
+        crate::ast::AstLValue::Name(_) => false,
+        crate::ast::AstLValue::FieldAccess(_) => false,
+        crate::ast::AstLValue::IndexAccess(access) => {
+            matches!(
+                &access.base,
+                AstExpr::Var(crate::ast::AstNameRef::Global(_))
+            )
+        }
     }
 }
 
