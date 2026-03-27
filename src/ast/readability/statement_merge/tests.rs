@@ -256,6 +256,7 @@ fn merges_adjacent_single_value_local_decls_inside_nested_function_expr_bodies()
                         function: Default::default(),
                         params: Vec::new(),
                         is_vararg: false,
+                        named_vararg: None,
                         body: crate::ast::AstBlock {
                             stmts: vec![
                                 AstStmt::LocalDecl(Box::new(AstLocalDecl {

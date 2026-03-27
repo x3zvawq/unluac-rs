@@ -5,8 +5,8 @@
 
 use crate::ast::{AstCallKind, AstExpr, AstStmt, AstTargetDialect, lower_ast};
 use crate::hir::{
-    HirBlock, HirCallExpr, HirCallStmt, HirExpr, HirLocalDecl, HirModule, HirProto, HirProtoRef,
-    HirReturn, HirStmt, HirTableAccess, LocalId, ParamId,
+    HirBlock, HirCallExpr, HirCallStmt, HirExpr, HirGlobalRef, HirLocalDecl, HirModule, HirProto,
+    HirProtoRef, HirReturn, HirStmt, HirTableAccess, LocalId, ParamId,
 };
 use crate::parser::{ProtoLineRange, ProtoSignature};
 
@@ -108,5 +108,85 @@ fn lower_ast_recovers_method_call_from_field_alias_before_call() {
             if matches!(call.receiver, AstExpr::Var(crate::ast::AstNameRef::Local(LocalId(2))))
                 && call.method == "method2"
                 && matches!(call.args.as_slice(), [AstExpr::Integer(7)])
+    ));
+}
+
+#[test]
+fn lower_ast_forwards_multiret_call_carrier_into_final_call_arg() {
+    let module = HirModule {
+        entry: HirProtoRef(0),
+        protos: vec![HirProto {
+            id: HirProtoRef(0),
+            source: None,
+            line_range: ProtoLineRange {
+                defined_start: 0,
+                defined_end: 0,
+            },
+            signature: ProtoSignature {
+                num_params: 0,
+                is_vararg: false,
+                has_vararg_param_reg: false,
+                named_vararg_table: false,
+            },
+            params: vec![],
+            locals: vec![LocalId(0)],
+            upvalues: Vec::new(),
+            temps: Vec::new(),
+            temp_debug_locals: Vec::new(),
+            local_debug_hints: Vec::new(),
+            body: HirBlock {
+                stmts: vec![
+                    HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                        bindings: vec![LocalId(0)],
+                        values: vec![HirExpr::Call(Box::new(HirCallExpr {
+                            callee: HirExpr::GlobalRef(HirGlobalRef {
+                                name: "probe".to_owned(),
+                            }),
+                            args: vec![HirExpr::Integer(2), HirExpr::Integer(4)],
+                            multiret: true,
+                            method: false,
+                        }))],
+                    })),
+                    HirStmt::CallStmt(Box::new(HirCallStmt {
+                        call: HirCallExpr {
+                            callee: HirExpr::GlobalRef(HirGlobalRef {
+                                name: "print".to_owned(),
+                            }),
+                            args: vec![
+                                HirExpr::String("var55-getvarg".to_owned()),
+                                HirExpr::LocalRef(LocalId(0)),
+                            ],
+                            multiret: false,
+                            method: false,
+                        },
+                    })),
+                ],
+            },
+            children: Vec::new(),
+        }],
+    };
+
+    let ast = lower_ast(
+        &module,
+        AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+    )
+    .expect("ast lowering should forward multiret call carrier");
+
+    let [AstStmt::CallStmt(call_stmt)] = ast.body.stmts.as_slice() else {
+        panic!("expected direct call statement without forwarding local");
+    };
+
+    assert!(matches!(
+        &call_stmt.call,
+        AstCallKind::Call(call)
+            if matches!(&call.callee, AstExpr::Var(crate::ast::AstNameRef::Global(global)) if global.text == "print")
+                && matches!(call.args.as_slice(),
+                    [
+                        AstExpr::String(tag),
+                        AstExpr::Call(inner_call)
+                    ] if tag == "var55-getvarg"
+                        && matches!(&inner_call.callee, AstExpr::Var(crate::ast::AstNameRef::Global(global)) if global.text == "probe")
+                        && matches!(inner_call.args.as_slice(), [AstExpr::Integer(2), AstExpr::Integer(4)])
+                )
     ));
 }

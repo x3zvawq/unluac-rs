@@ -6,6 +6,7 @@ mod cleanup;
 mod expr_analysis;
 mod field_access_sugar;
 mod function_sugar;
+mod global_decl_pretty;
 mod inline_exprs;
 mod local_coalesce;
 mod loop_header_merge;
@@ -137,6 +138,20 @@ const FUNCTION_SUGAR_STAGE: ReadabilityStage = ReadabilityStage {
     ],
 };
 
+const GLOBAL_DECL_PRETTY_STAGE: ReadabilityStage = ReadabilityStage {
+    name: "global-decl-pretty",
+    passes: &[
+        ReadabilityPass {
+            name: "global-decl-pretty",
+            apply: global_decl_pretty::apply,
+        },
+        ReadabilityPass {
+            name: "cleanup",
+            apply: cleanup::apply,
+        },
+    ],
+};
+
 const TEMP_MATERIALIZE_STAGE: ReadabilityStage = ReadabilityStage {
     name: "temp-materialize",
     passes: &[ReadabilityPass {
@@ -156,6 +171,7 @@ const READABILITY_STAGES: &[ReadabilityStage] = &[
     SHORT_CIRCUIT_PRETTY_STAGE,
     TEMP_MATERIALIZE_STAGE,
     FUNCTION_SUGAR_STAGE,
+    GLOBAL_DECL_PRETTY_STAGE,
 ];
 
 const MAX_STAGE_ROUNDS: usize = 64;

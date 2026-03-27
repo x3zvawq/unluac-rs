@@ -375,7 +375,7 @@ fn count_local_uses_in_lvalue(target: &HirLValue, local: LocalId) -> usize {
     }
 }
 
-fn count_local_uses_in_call(call: &HirCallExpr, local: LocalId) -> usize {
+pub(super) fn count_local_uses_in_call(call: &HirCallExpr, local: LocalId) -> usize {
     count_local_uses_in_expr(&call.callee, local)
         + call
             .args

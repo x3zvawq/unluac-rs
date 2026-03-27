@@ -236,6 +236,48 @@ impl<'a> AstLowerer<'a> {
         Ok(Some((lowered, 2)))
     }
 
+    pub(super) fn try_lower_forwarded_multiret_call_stmt(
+        &mut self,
+        proto_index: usize,
+        stmts: &[HirStmt],
+        index: usize,
+    ) -> Result<Option<(AstStmt, usize)>, AstLowerError> {
+        let Some(HirStmt::LocalDecl(local_decl)) = stmts.get(index) else {
+            return Ok(None);
+        };
+        let [binding] = local_decl.bindings.as_slice() else {
+            return Ok(None);
+        };
+        let [HirExpr::Call(source_call)] = local_decl.values.as_slice() else {
+            return Ok(None);
+        };
+        if !source_call.multiret {
+            return Ok(None);
+        }
+
+        let Some(HirStmt::CallStmt(call_stmt)) = stmts.get(index + 1) else {
+            return Ok(None);
+        };
+        if super::analysis::count_local_uses_in_stmts(&stmts[(index + 1)..], *binding) != 1
+            || !call_stmt_uses_local_as_final_arg_only(&call_stmt.call, *binding)
+        {
+            return Ok(None);
+        }
+
+        let mut forwarded_call = call_stmt.call.clone();
+        let Some(last_arg) = forwarded_call.args.last_mut() else {
+            return Ok(None);
+        };
+        *last_arg = HirExpr::Call(Box::new((**source_call).clone()));
+
+        Ok(Some((
+            AstStmt::CallStmt(Box::new(AstCallStmt {
+                call: self.lower_call(proto_index, &forwarded_call)?,
+            })),
+            2,
+        )))
+    }
+
     pub(super) fn try_lower_generic_for_init(
         &mut self,
         proto_index: usize,
@@ -501,6 +543,13 @@ fn callee_local_ref(expr: &HirExpr) -> Option<LocalId> {
         return None;
     };
     Some(*local)
+}
+
+fn call_stmt_uses_local_as_final_arg_only(call: &HirCallExpr, local: LocalId) -> bool {
+    matches!(
+        call.args.last(),
+        Some(HirExpr::LocalRef(last_local)) if *last_local == local
+    ) && super::analysis::count_local_uses_in_call(call, local) == 1
 }
 
 fn hir_exprs_equal(lhs: &HirExpr, rhs: &HirExpr) -> bool {

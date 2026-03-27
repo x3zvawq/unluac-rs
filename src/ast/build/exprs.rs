@@ -28,10 +28,25 @@ impl<'a> AstLowerer<'a> {
             },
         )?;
         let body = self.lower_proto_body(closure.proto.index())?;
+        let named_vararg = if child.signature.has_vararg_param_reg {
+            Some(
+                child
+                    .locals
+                    .first()
+                    .copied()
+                    .map(crate::ast::common::AstBindingRef::Local)
+                    .ok_or(AstLowerError::MissingNamedVarargBinding {
+                        proto: closure.proto.index(),
+                    })?,
+            )
+        } else {
+            None
+        };
         Ok(AstFunctionExpr {
             function: closure.proto,
             params: child.params.clone(),
             is_vararg: child.signature.is_vararg,
+            named_vararg,
             body,
             captured_bindings: closure
                 .captures

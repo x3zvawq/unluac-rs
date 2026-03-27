@@ -131,6 +131,7 @@ pub struct AstFunctionExpr {
     pub function: HirProtoRef,
     pub params: Vec<ParamId>,
     pub is_vararg: bool,
+    pub named_vararg: Option<AstBindingRef>,
     pub body: AstBlock,
     /// 这份集合只记录“闭包初始化时显式 capture 了哪些当前词法绑定”。
     ///

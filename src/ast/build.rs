@@ -132,6 +132,14 @@ impl<'a> AstLowerer<'a> {
             }
 
             if let Some((stmt, consumed)) =
+                self.try_lower_forwarded_multiret_call_stmt(proto_index, &block.stmts, index)?
+            {
+                stmts.push(stmt);
+                index += consumed;
+                continue;
+            }
+
+            if let Some((stmt, consumed)) =
                 self.try_lower_temp_close_decl(proto_index, &block.stmts, index)?
             {
                 stmts.push(stmt);

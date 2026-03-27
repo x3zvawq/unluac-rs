@@ -19,6 +19,8 @@ pub enum AstLowerError {
     ResidualHir { proto: usize, kind: &'static str },
     #[error("HIR proto#{proto} references missing child proto#{child}")]
     MissingChildProto { proto: usize, child: usize },
+    #[error("HIR proto#{proto} marks a named vararg table but has no recoverable entry binding")]
+    MissingNamedVarargBinding { proto: usize },
     #[error("HIR proto#{proto} has unsupported to-be-closed shape: {reason}")]
     InvalidToBeClosed { proto: usize, reason: &'static str },
     #[error(

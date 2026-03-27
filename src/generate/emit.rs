@@ -388,7 +388,14 @@ impl<'a> Emitter<'a> {
         function: HirProtoRef,
     ) -> Result<Doc, GenerateError> {
         let target = self.emit_function_name(&function_decl.target, function)?;
-        let header = Doc::concat([Doc::text("function "), target]);
+        let header = Doc::concat([
+            Doc::text(if self.function_decl_is_global(function_decl) {
+                "global function "
+            } else {
+                "function "
+            }),
+            target,
+        ]);
         let params = self.emit_decl_param_list(
             &function_decl.func,
             matches!(function_decl.target, AstFunctionName::Method(_, _)),
@@ -443,7 +450,15 @@ impl<'a> Emitter<'a> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         if func.is_vararg {
-            params.push(Doc::text("..."));
+            let vararg = if let Some(binding) = func.named_vararg {
+                Doc::text(format!(
+                    "...{}",
+                    self.resolve_binding_ref(func.function, &binding)?
+                ))
+            } else {
+                Doc::text("...")
+            };
+            params.push(vararg);
         }
         Ok(self.emit_parenthesized_list(params))
     }
@@ -766,6 +781,15 @@ impl<'a> Emitter<'a> {
             parts.push(Doc::text(format!(".{field}")));
         }
         Ok(Doc::concat(parts))
+    }
+
+    fn function_decl_is_global(&self, function_decl: &AstFunctionDecl) -> bool {
+        self.target.caps.global_decl
+            && matches!(
+                &function_decl.target,
+                AstFunctionName::Plain(path) | AstFunctionName::Method(path, _)
+                    if matches!(path.root, AstNameRef::Global(_))
+            )
     }
 
     fn resolve_name_ref(

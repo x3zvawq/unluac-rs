@@ -19,6 +19,7 @@ fn method_function(params: &[ParamId]) -> AstExpr {
         function: HirProtoRef(1),
         params: params.to_vec(),
         is_vararg: false,
+        named_vararg: None,
         body: AstBlock {
             stmts: vec![AstStmt::Return(Box::new(crate::ast::AstReturn {
                 values: vec![AstExpr::Var(AstNameRef::Param(params[0]))],
@@ -139,6 +140,7 @@ fn keeps_recursive_local_function_binding_before_table_slot_forwarding() {
                         function: HirProtoRef(1),
                         params: vec![ParamId(0)],
                         is_vararg: false,
+                        named_vararg: None,
                         body: AstBlock {
                             stmts: vec![AstStmt::Return(Box::new(crate::ast::AstReturn {
                                 values: vec![AstExpr::Call(Box::new(crate::ast::AstCallExpr {
@@ -239,6 +241,7 @@ fn inlines_constructor_locals_and_function_field_into_terminal_return_call() {
                         function: HirProtoRef(2),
                         params: vec![ParamId(0), ParamId(1)],
                         is_vararg: false,
+                        named_vararg: None,
                         body: AstBlock { stmts: Vec::new() },
                         captured_bindings: Default::default(),
                     },

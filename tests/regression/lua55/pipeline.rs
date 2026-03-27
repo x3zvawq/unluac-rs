@@ -276,7 +276,8 @@ mod decompile_pipeline {
             Some(DecompileStage::Readability)
         );
         let dump = &result.debug_output[0].content;
-        assert!(dump.contains("local function l1(p0)"), "{dump}");
+        assert!(dump.contains("global<const> print"), "{dump}");
+        assert!(dump.contains("local function l1(p0, ...l0)"), "{dump}");
         assert!(dump.contains("if p0"), "{dump}");
         assert!(!dump.contains("if (not p0)"), "{dump}");
         assert!(!dump.contains("local l1 = function(p0)"), "{dump}");
@@ -308,7 +309,7 @@ mod decompile_pipeline {
 
         assert_eq!(result.state.completed_stage, Some(DecompileStage::Ast));
         let dump = &result.debug_output[0].content;
-        assert!(dump.contains("local l1 = function(p0)"), "{dump}");
+        assert!(dump.contains("local l1 = function(p0, ...l0)"), "{dump}");
         assert!(dump.contains("if not p0 then"), "{dump}");
         assert!(!dump.contains("local l1 = function(p0) ... end"), "{dump}");
     }
@@ -342,7 +343,8 @@ mod decompile_pipeline {
             Some(DecompileStage::Readability)
         );
         let dump = &result.debug_output[0].content;
-        assert!(dump.contains("local function l1(p0)"), "{dump}");
+        assert!(dump.contains("global<const> print"), "{dump}");
+        assert!(dump.contains("local function l1(p0, ...l0)"), "{dump}");
         assert!(dump.contains("local function l1(p0, p1)"), "{dump}");
         assert!(dump.contains("local function l6()"), "{dump}");
         assert!(dump.contains("local l7 = l6()"), "{dump}");
@@ -385,12 +387,14 @@ mod decompile_pipeline {
             .as_ref()
             .expect("generate stage should leave generated source in state");
         assert!(
-            generated.source.contains("global label = value3"),
+            generated
+                .source
+                .contains("global counter, label = 9, \"seed\""),
             "{}",
             generated.source
         );
         assert!(
-            generated.source.contains("function step(a)"),
+            generated.source.contains("global function step(a)"),
             "{}",
             generated.source
         );
@@ -399,11 +403,167 @@ mod decompile_pipeline {
             "{}",
             generated.source
         );
+        assert!(
+            !generated.source.contains("local value"),
+            "{}",
+            generated.source
+        );
         assert!(!generated.source.contains("up."), "{}", generated.source);
 
         let dump = &result.debug_output[0].content;
         assert!(dump.contains("===== Dump Generate ====="), "{dump}");
-        assert!(dump.contains("function step(a)"), "{dump}");
+        assert!(dump.contains("global function step(a)"), "{dump}");
+    }
+
+    #[test]
+    fn lua55_generate_stage_emits_named_vararg_parameter_for_basic_fixture() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.5",
+            "tests/lua_cases/lua5.5/03_named_vararg_basic.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua55,
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.5 generate stage should succeed for named vararg fixture");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should leave generated source in state");
+        assert!(
+            generated.source.contains("local function fn(a, ...value)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("return ok2, value.n"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local function fn(a, ...)"),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
+    fn lua55_generate_stage_infers_const_global_prelude_for_const_gate_fixture() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.5",
+            "tests/lua_cases/lua5.5/05_global_const_gate.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua55,
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.5 generate stage should succeed for global const fixture");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should leave generated source in state");
+        assert!(
+            generated.source.contains("global<const> math, tostring"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("local function fn(a)"),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
+    fn lua55_generate_stage_keeps_named_vararg_parameter_for_getvarg_fixture() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.5",
+            "tests/lua_cases/lua5.5/08_named_vararg_index_only.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua55,
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.5 generate stage should succeed for getvarg fixture");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should leave generated source in state");
+        assert!(
+            generated.source.contains("local function fn(a, ...value)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("return value[a], value[a + -1], value.n, ..."),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("print(\"var55-getvarg\", fn(2, 4, 7, 5, 9))"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local result ="),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
+    fn lua55_generate_stage_predeclares_outer_global_for_nested_global_function_capture() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.5",
+            "tests/lua_cases/lua5.5/02_global_function_capture.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua55,
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.5 generate stage should succeed for nested global function capture");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should leave generated source in state");
+        assert!(
+            generated.source.contains("global emit"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("global function emit(b)"),
+            "{}",
+            generated.source
+        );
     }
 
     #[test]

@@ -82,6 +82,11 @@ fn collect_function_context(
     for &param in &proto.params {
         declare_binding(&mut scopes, VisibleBinding::Param { function, param });
     }
+    if proto.signature.has_vararg_param_reg
+        && let Some(&local) = proto.locals.first()
+    {
+        declare_binding(&mut scopes, VisibleBinding::Local { function, local });
+    }
     for &upvalue in &proto.upvalues {
         declare_binding(&mut scopes, VisibleBinding::Upvalue { function, upvalue });
     }

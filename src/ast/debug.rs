@@ -214,6 +214,7 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock, names: &Func
                     format_decl_params(
                         &function_decl.func,
                         matches!(function_decl.target, AstFunctionName::Method(_, _)),
+                        names,
                     ),
                 );
                 write_block(
@@ -230,13 +231,7 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock, names: &Func
                     output,
                     "{indent}local function {}({})",
                     format_binding_ref(local_function_decl.name, names),
-                    local_function_decl
-                        .func
-                        .params
-                        .iter()
-                        .map(|param| format!("p{}", param.index()))
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    format_decl_params(&local_function_decl.func, false, names),
                 );
                 write_block(
                     output,
@@ -523,7 +518,11 @@ fn format_arg_list(values: &[AstExpr], indent: &str, names: &FunctionRenderNames
 }
 
 fn format_function_expr(function: &AstFunctionExpr, indent: &str) -> String {
-    let params = format_decl_params(function, false);
+    let params = format_decl_params(
+        function,
+        false,
+        &collect_function_render_names(&function.body),
+    );
     let child_indent = format!("{indent}  ");
     let child_names = collect_function_render_names(&function.body);
     let mut body = String::new();
@@ -531,14 +530,25 @@ fn format_function_expr(function: &AstFunctionExpr, indent: &str) -> String {
     format!("function({params})\n{body}{indent}end")
 }
 
-fn format_decl_params(function: &AstFunctionExpr, implicit_self: bool) -> String {
-    function
+fn format_decl_params(
+    function: &AstFunctionExpr,
+    implicit_self: bool,
+    names: &FunctionRenderNames,
+) -> String {
+    let mut params = function
         .params
         .iter()
         .skip(usize::from(implicit_self))
         .map(|param| format!("p{}", param.index()))
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect::<Vec<_>>();
+    if function.is_vararg {
+        params.push(if let Some(binding) = function.named_vararg {
+            format!("...{}", format_binding_ref(binding, names))
+        } else {
+            "...".to_owned()
+        });
+    }
+    params.join(", ")
 }
 
 fn display_synthetic_local(local: AstSyntheticLocalId, names: &FunctionRenderNames) -> usize {

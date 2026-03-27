@@ -479,6 +479,7 @@ fn capture_provenance_upvalue_keeps_parent_name_when_child_local_conflicts() {
                         function: HirProtoRef(1),
                         params: Vec::new(),
                         is_vararg: false,
+                        named_vararg: None,
                         body: AstBlock {
                             stmts: vec![
                                 AstStmt::LocalDecl(Box::new(AstLocalDecl {

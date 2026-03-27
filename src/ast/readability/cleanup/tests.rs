@@ -23,6 +23,7 @@ fn removes_trailing_empty_return_from_module_and_function_bodies() {
                         function: Default::default(),
                         params: vec![ParamId(0)],
                         is_vararg: false,
+                        named_vararg: None,
                         body: AstBlock {
                             stmts: vec![AstStmt::Return(Box::new(AstReturn { values: vec![] }))],
                         },

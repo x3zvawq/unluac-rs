@@ -1129,6 +1129,7 @@ fn inlines_local_alias_inside_function_body_after_other_locals() {
                         function: func,
                         params: vec![crate::hir::ParamId(0), crate::hir::ParamId(1)],
                         is_vararg: false,
+                        named_vararg: None,
                         body: crate::ast::AstBlock {
                             stmts: vec![
                                 AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
@@ -1151,6 +1152,7 @@ fn inlines_local_alias_inside_function_body_after_other_locals() {
                                                 crate::hir::ParamId(1),
                                             ],
                                             is_vararg: false,
+                                            named_vararg: None,
                                             body: crate::ast::AstBlock {
                                                 stmts: vec![AstStmt::Return(Box::new(AstReturn {
                                                     values: vec![AstExpr::Var(AstNameRef::Param(
@@ -1493,6 +1495,7 @@ fn does_not_count_shadowed_nested_function_locals_as_outer_alias_uses() {
                             function: func,
                             params: Vec::new(),
                             is_vararg: false,
+                            named_vararg: None,
                             body: crate::ast::AstBlock {
                                 stmts: vec![AstStmt::LocalDecl(Box::new(
                                     crate::ast::AstLocalDecl {
