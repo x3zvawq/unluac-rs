@@ -414,26 +414,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     }
 
     fn loop_entry_expr(&self, preheader: BlockRef, phi: &PhiCandidate) -> Option<HirExpr> {
-        if let Some(expr) = self
-            .entry_overrides
-            .get(&preheader)
-            .and_then(|overrides| overrides.get(&phi.reg))
-        {
-            return Some(expr.clone());
-        }
-
         let incoming = phi
             .incoming
             .iter()
             .find(|incoming| incoming.pred == preheader)?;
-        let def = *incoming.defs.iter().next()?;
-        if incoming.defs.len() == 1 {
-            Some(HirExpr::TempRef(
-                self.lowering.bindings.fixed_temps[def.index()],
-            ))
-        } else {
-            None
-        }
+        self.loop_incoming_expr(preheader, phi.reg, incoming)
     }
 
     fn loop_exit_entry_expr(
@@ -448,7 +433,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .iter()
             .filter(|incoming| !loop_blocks.contains(&incoming.pred))
         {
-            let expr = single_fixed_incoming_expr(self.lowering, incoming)?;
+            let expr = self.loop_incoming_expr(incoming.pred, phi.reg, incoming)?;
             if init_expr
                 .as_ref()
                 .is_some_and(|known_expr: &HirExpr| *known_expr != expr)
@@ -459,6 +444,28 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         init_expr
+    }
+
+    fn loop_incoming_expr(
+        &self,
+        pred: BlockRef,
+        reg: Reg,
+        incoming: &crate::cfg::PhiIncoming,
+    ) -> Option<HirExpr> {
+        // 某些 loop 会直接跟在另一个已经结构化的 region 后面。此时 CFG/Dataflow 视角里，
+        // predecessor 边上同一寄存器可能仍然带着“多个原始 def 合流”的痕迹；但对 HIR 来说，
+        // 前一个结构已经把它稳定成了 entry override。这里只在 predecessor 本身没有再次改写
+        // 该寄存器时，沿用这份 override，避免把同一个语义槽位重新打回 unresolved phi。
+        if !self.block_redefines_reg(pred, reg)
+            && let Some(expr) = self
+                .entry_overrides
+                .get(&pred)
+                .and_then(|overrides| overrides.get(&reg))
+        {
+            return Some(expr.clone());
+        }
+
+        single_fixed_incoming_expr(self.lowering, incoming)
     }
 
     fn install_loop_exit_bindings(

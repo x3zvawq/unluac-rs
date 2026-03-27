@@ -366,7 +366,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .collect()
     }
 
-    fn block_redefines_reg(&self, block: BlockRef, reg: Reg) -> bool {
+    pub(super) fn block_redefines_reg(&self, block: BlockRef, reg: Reg) -> bool {
         let range = self.lowering.cfg.blocks[block.index()].instrs;
         (range.start.index()..range.end()).any(|instr_index| {
             let effect = &self.lowering.dataflow.instr_effects[instr_index];

@@ -966,6 +966,81 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn return_truncation_barriers_hir_folds_open_pack_barrier_into_constructor() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/08_return_truncation_barriers.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("return_truncation_barriers hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(
+            dump.contains("table(array=2, record=0, trailing=...)"),
+            "{dump}"
+        );
+        assert!(!dump.contains("table-set-list"), "{dump}");
+        assert!(!dump.contains("assign t1, t2 = ..."), "{dump}");
+    }
+
+    #[test]
+    fn return_truncation_barriers_generate_keeps_vararg_barrier_constructor_shape() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/08_return_truncation_barriers.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                naming: NamingOptions {
+                    mode: NamingMode::DebugLike,
+                    debug_like_include_function: true,
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("return_truncation_barriers generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated
+                .source
+                .contains("local r1_0 = { ..., \"barrier\", ... }"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("print(\"retbarrier\", table.concat(r0_1, \",\"), r0_2, r0_3, r0_4)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("table-set-list"),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
     fn crazy_table_init_hir_folds_mixed_constructor_without_residual_set_list() {
         let result = decompile(
             &compile_lua_case(
@@ -1697,6 +1772,65 @@ mod decompile_pipeline {
             generated.source
         );
         assert!(!generated.source.contains("r0_11"), "{}", generated.source);
+    }
+
+    #[test]
+    fn loops_hir_removes_exit_phi_after_while_to_numeric_for_chain() {
+        let result = decompile(
+            &compile_lua_case("lua5.1", "tests/lua_cases/common/control_flow/02_loops.lua"),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("loops hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("while (l2 <= 3)"), "{dump}");
+        assert!(dump.contains("numeric-for l0 = 4, 6, 1"), "{dump}");
+        assert!(!dump.contains("unresolved("), "{dump}");
+    }
+
+    #[test]
+    fn loops_generate_recovers_while_then_numeric_for_shape() {
+        let result = decompile(
+            &compile_lua_case("lua5.1", "tests/lua_cases/common/control_flow/02_loops.lua"),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("loops generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(generated.source.contains("while "), "{}", generated.source);
+        assert!(
+            generated.source.contains(" <= 3 do"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("for i = 4, 6, 1 do"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("print(\"loop\", "),
+            "{}",
+            generated.source
+        );
     }
 }
 

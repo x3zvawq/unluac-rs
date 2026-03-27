@@ -238,6 +238,85 @@ fn folds_set_list_with_trailing_multivalue_into_constructor_tail() {
 }
 
 #[test]
+fn folds_set_list_with_open_pack_barrier_into_constructor_tail() {
+    let table_local = LocalId(0);
+    let first_value = TempId(0);
+    let second_value = TempId(1);
+
+    let mut proto = HirProto {
+        id: crate::hir::common::HirProtoRef(0),
+        source: None,
+        line_range: ProtoLineRange {
+            defined_start: 0,
+            defined_end: 0,
+        },
+        signature: ProtoSignature {
+            num_params: 0,
+            is_vararg: true,
+            has_vararg_param_reg: false,
+            named_vararg_table: false,
+        },
+        params: Vec::new(),
+        locals: vec![table_local],
+        upvalues: Vec::new(),
+        temps: vec![first_value, second_value],
+        temp_debug_locals: vec![None, None],
+        local_debug_hints: vec![None],
+        body: HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![table_local],
+                    values: vec![HirExpr::TableConstructor(Box::default())],
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Temp(first_value), HirLValue::Temp(second_value)],
+                    values: vec![HirExpr::VarArg],
+                })),
+                HirStmt::TableSetList(Box::new(HirTableSetList {
+                    base: HirExpr::LocalRef(table_local),
+                    values: vec![
+                        HirExpr::TempRef(first_value),
+                        HirExpr::String("barrier".to_owned()),
+                    ],
+                    trailing_multivalue: Some(HirExpr::VarArg),
+                    start_index: 1,
+                })),
+                HirStmt::Return(Box::new(HirReturn {
+                    values: vec![HirExpr::LocalRef(table_local)],
+                })),
+            ],
+        },
+        children: Vec::new(),
+    };
+
+    let changed = stabilize_table_constructors_in_proto(&mut proto);
+    assert!(changed);
+    assert_eq!(proto.body.stmts.len(), 2);
+    assert!(
+        proto
+            .body
+            .stmts
+            .iter()
+            .all(|stmt| !matches!(stmt, HirStmt::TableSetList(_) | HirStmt::Assign(_)))
+    );
+
+    let HirStmt::LocalDecl(seed) = &proto.body.stmts[0] else {
+        panic!("expected constructor seed to stay a local decl");
+    };
+    let [HirExpr::TableConstructor(table_ctor)] = seed.values.as_slice() else {
+        panic!("expected constructor seed to be rewritten into a table constructor");
+    };
+    assert_eq!(
+        table_ctor.fields,
+        vec![
+            HirTableField::Array(HirExpr::VarArg),
+            HirTableField::Array(HirExpr::String("barrier".to_owned())),
+        ]
+    );
+    assert_eq!(table_ctor.trailing_multivalue, Some(HirExpr::VarArg));
+}
+
+#[test]
 fn folds_mixed_record_and_array_constructor_with_closure_field_and_trailing_multivalue() {
     let table_local = LocalId(0);
     let v1 = LocalId(1);

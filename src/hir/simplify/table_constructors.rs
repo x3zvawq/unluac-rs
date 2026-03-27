@@ -24,8 +24,33 @@ enum TableBinding {
 #[derive(Debug, Clone)]
 enum RegionStep {
     Producer(TableBinding, HirExpr),
+    ProducerGroup(ProducerGroup),
     Record(crate::hir::common::HirRecordField),
     SetList(HirTableSetList),
+}
+
+#[derive(Debug, Clone)]
+struct ProducerGroup {
+    slots: Vec<ProducerGroupSlot>,
+    drop_without_consumption_is_safe: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ProducerGroupSlot {
+    binding: TableBinding,
+    value: Option<HirExpr>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingProducer {
+    binding: TableBinding,
+    value: Option<HirExpr>,
+    group: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProducerGroupMeta {
+    drop_without_consumption_is_safe: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -162,8 +187,8 @@ fn try_rebuild_constructor_region(
             index += 1;
             continue;
         }
-        if let Some(producer) = simple_value_producer_step(stmt, binding) {
-            steps.push(producer);
+        if let Some(mut producers) = producer_steps(stmt, binding) {
+            steps.append(&mut producers);
             index += 1;
             continue;
         }
@@ -215,41 +240,80 @@ fn keyed_write_step(
     })
 }
 
-fn simple_value_producer_step(
-    stmt: &HirStmt,
-    constructor_binding: TableBinding,
-) -> Option<RegionStep> {
+fn producer_steps(stmt: &HirStmt, constructor_binding: TableBinding) -> Option<Vec<RegionStep>> {
     match stmt {
-        HirStmt::LocalDecl(local_decl) => {
-            let [binding] = local_decl.bindings.as_slice() else {
-                return None;
-            };
-            let [value] = local_decl.values.as_slice() else {
-                return None;
-            };
-            if expr_uses_binding(value, constructor_binding) {
-                return None;
-            }
-            Some(RegionStep::Producer(
-                TableBinding::Local(*binding),
-                value.clone(),
-            ))
-        }
+        HirStmt::LocalDecl(local_decl) => producer_steps_from_bindings(
+            local_decl
+                .bindings
+                .iter()
+                .copied()
+                .map(TableBinding::Local)
+                .collect(),
+            &local_decl.values,
+            constructor_binding,
+        ),
         HirStmt::Assign(assign) => {
-            let [target] = assign.targets.as_slice() else {
-                return None;
-            };
-            let binding = binding_from_lvalue(target)?;
-            let [value] = assign.values.as_slice() else {
-                return None;
-            };
-            if expr_uses_binding(value, constructor_binding) {
-                return None;
-            }
-            Some(RegionStep::Producer(binding, value.clone()))
+            let bindings = assign
+                .targets
+                .iter()
+                .map(binding_from_lvalue)
+                .collect::<Option<Vec<_>>>()?;
+            producer_steps_from_bindings(bindings, &assign.values, constructor_binding)
         }
         _ => None,
     }
+}
+
+fn producer_steps_from_bindings(
+    bindings: Vec<TableBinding>,
+    values: &[HirExpr],
+    constructor_binding: TableBinding,
+) -> Option<Vec<RegionStep>> {
+    if bindings.is_empty()
+        || values.is_empty()
+        || values
+            .iter()
+            .any(|value| expr_uses_binding(value, constructor_binding))
+    {
+        return None;
+    }
+
+    if bindings.len() == values.len() {
+        return Some(
+            bindings
+                .into_iter()
+                .zip(values.iter().cloned())
+                .map(|(binding, value)| RegionStep::Producer(binding, value))
+                .collect(),
+        );
+    }
+
+    let [source] = values else {
+        return None;
+    };
+    if bindings.len() > 1 && is_open_pack_source(source) {
+        return Some(vec![RegionStep::ProducerGroup(ProducerGroup {
+            slots: bindings
+                .into_iter()
+                .enumerate()
+                .map(|(index, binding)| ProducerGroupSlot {
+                    binding,
+                    value: (index == 0).then_some(source.clone()),
+                })
+                .collect(),
+            drop_without_consumption_is_safe: can_drop_open_pack_source_if_unused(source),
+        })]);
+    }
+
+    None
+}
+
+fn is_open_pack_source(expr: &HirExpr) -> bool {
+    matches!(expr, HirExpr::VarArg) || matches!(expr, HirExpr::Call(call) if call.multiret)
+}
+
+fn can_drop_open_pack_source_if_unused(expr: &HirExpr) -> bool {
+    matches!(expr, HirExpr::VarArg)
 }
 
 fn table_set_list_step(stmt: &HirStmt, binding: TableBinding) -> Option<HirTableSetList> {
@@ -286,7 +350,7 @@ fn rebuild_constructor_from_steps(
 
     for step in steps {
         match step {
-            RegionStep::Producer(_, _) | RegionStep::Record(_) => {
+            RegionStep::Producer(_, _) | RegionStep::ProducerGroup(_) | RegionStep::Record(_) => {
                 pending_segment.push(step.clone())
             }
             RegionStep::SetList(set_list) => {
@@ -335,21 +399,42 @@ fn flush_constructor_segment(
         return Some(());
     }
 
-    let mut producer_values = Vec::<(TableBinding, HirExpr)>::new();
+    let mut producer_values = Vec::<PendingProducer>::new();
+    let mut producer_groups = Vec::<ProducerGroupMeta>::new();
     let mut tokens = Vec::<SegmentToken>::new();
     let mut consumed = std::collections::BTreeSet::new();
+    let mut consumed_groups = std::collections::BTreeSet::new();
 
     for step in segment {
         match step {
             RegionStep::Producer(binding, value) => {
-                producer_values.push((*binding, value.clone()));
+                producer_values.push(PendingProducer {
+                    binding: *binding,
+                    value: Some(value.clone()),
+                    group: None,
+                });
                 tokens.push(SegmentToken::Producer(*binding));
+            }
+            RegionStep::ProducerGroup(group) => {
+                let group_id = producer_groups.len();
+                producer_groups.push(ProducerGroupMeta {
+                    drop_without_consumption_is_safe: group.drop_without_consumption_is_safe,
+                });
+                for slot in &group.slots {
+                    producer_values.push(PendingProducer {
+                        binding: slot.binding,
+                        value: slot.value.clone(),
+                        group: Some(group_id),
+                    });
+                    tokens.push(SegmentToken::Producer(slot.binding));
+                }
             }
             RegionStep::Record(field) => {
                 let value = inline_constructor_value(
                     &field.value,
                     &producer_values,
                     &mut consumed,
+                    &mut consumed_groups,
                     remaining_uses,
                 )?;
                 // 只有能证明这段 region 还处在字面量初始化 flush 里时，才允许继续吸收
@@ -379,13 +464,13 @@ fn flush_constructor_segment(
                     if consumed.contains(&binding) {
                         continue;
                     }
-                    let Some(producer_value) =
-                        producer_value_for_binding(&producer_values, binding)
-                    else {
-                        return None;
-                    };
                     match queued_values.front() {
                         Some(front) if matches_binding_ref(front, binding) => {
+                            let Some(producer_value) =
+                                producer_value_for_binding(&producer_values, binding)
+                            else {
+                                return None;
+                            };
                             if remaining_uses.contains(&binding) {
                                 return None;
                             }
@@ -415,8 +500,13 @@ fn flush_constructor_segment(
         }
 
         for value in queued_values {
-            let value =
-                inline_constructor_value(&value, &producer_values, &mut consumed, remaining_uses)?;
+            let value = inline_constructor_value(
+                &value,
+                &producer_values,
+                &mut consumed,
+                &mut consumed_groups,
+                remaining_uses,
+            )?;
             constructor.fields.push(HirTableField::Array(value));
         }
 
@@ -425,6 +515,7 @@ fn flush_constructor_segment(
                 trailing,
                 &producer_values,
                 &mut consumed,
+                &mut consumed_groups,
                 remaining_uses,
             )?;
             constructor.trailing_multivalue = Some(trailing);
@@ -441,10 +532,19 @@ fn flush_constructor_segment(
         }
     }
 
-    if producer_values
-        .iter()
-        .any(|(binding, _)| !consumed.contains(binding))
-    {
+    if producer_values.iter().any(|producer| {
+        if consumed.contains(&producer.binding) {
+            return false;
+        }
+        if remaining_uses.contains(&producer.binding) {
+            return true;
+        }
+        match producer.group {
+            Some(group) if consumed_groups.contains(&group) => false,
+            Some(group) => !producer_groups[group].drop_without_consumption_is_safe,
+            None => true,
+        }
+    }) {
         return None;
     }
 
@@ -702,14 +802,16 @@ fn collect_table_key_bindings(
 
 fn inline_constructor_value(
     value: &HirExpr,
-    pending_producers: &[(TableBinding, HirExpr)],
+    pending_producers: &[PendingProducer],
     consumed: &mut std::collections::BTreeSet<TableBinding>,
+    consumed_groups: &mut std::collections::BTreeSet<usize>,
     remaining_uses: &std::collections::BTreeSet<TableBinding>,
 ) -> Option<HirExpr> {
     inline_constructor_value_at_site(
         value,
         pending_producers,
         consumed,
+        consumed_groups,
         remaining_uses,
         ConstructorInlineSite::Neutral,
     )
@@ -724,22 +826,27 @@ enum ConstructorInlineSite {
 
 fn inline_constructor_value_at_site(
     value: &HirExpr,
-    pending_producers: &[(TableBinding, HirExpr)],
+    pending_producers: &[PendingProducer],
     consumed: &mut std::collections::BTreeSet<TableBinding>,
+    consumed_groups: &mut std::collections::BTreeSet<usize>,
     remaining_uses: &std::collections::BTreeSet<TableBinding>,
     site: ConstructorInlineSite,
 ) -> Option<HirExpr> {
-    for (binding, producer_value) in pending_producers {
-        if matches_binding_ref(value, *binding) {
-            if remaining_uses.contains(binding) {
+    for producer in pending_producers {
+        if matches_binding_ref(value, producer.binding) {
+            if remaining_uses.contains(&producer.binding) {
                 return None;
             }
+            let producer_value = producer.value.as_ref()?;
             if !matches!(site, ConstructorInlineSite::Neutral)
                 && !is_constructor_access_base_inline_expr(producer_value)
             {
                 return None;
             }
-            consumed.insert(*binding);
+            consumed.insert(producer.binding);
+            if let Some(group) = producer.group {
+                consumed_groups.insert(group);
+            }
             return Some(producer_value.clone());
         }
     }
@@ -752,6 +859,7 @@ fn inline_constructor_value_at_site(
                         &access.base,
                         pending_producers,
                         consumed,
+                        consumed_groups,
                         remaining_uses,
                         ConstructorInlineSite::AccessBase,
                     )?,
@@ -759,6 +867,7 @@ fn inline_constructor_value_at_site(
                         &access.key,
                         pending_producers,
                         consumed,
+                        consumed_groups,
                         remaining_uses,
                         ConstructorInlineSite::Neutral,
                     )?,
@@ -771,6 +880,7 @@ fn inline_constructor_value_at_site(
                     &call.callee,
                     pending_producers,
                     consumed,
+                    consumed_groups,
                     remaining_uses,
                     ConstructorInlineSite::CallCallee,
                 )?,
@@ -782,6 +892,7 @@ fn inline_constructor_value_at_site(
                             arg,
                             pending_producers,
                             consumed,
+                            consumed_groups,
                             remaining_uses,
                             ConstructorInlineSite::Neutral,
                         )
@@ -798,8 +909,8 @@ fn inline_constructor_value_at_site(
         value,
         &pending_producers
             .iter()
-            .filter(|(binding, _)| !consumed.contains(binding))
-            .map(|(binding, _)| *binding)
+            .filter(|producer| !consumed.contains(&producer.binding))
+            .map(|producer| producer.binding)
             .collect::<Vec<_>>(),
     ) {
         return None;
@@ -825,12 +936,14 @@ fn is_constructor_access_base_inline_expr(expr: &HirExpr) -> bool {
 }
 
 fn producer_value_for_binding(
-    producers: &[(TableBinding, HirExpr)],
+    producers: &[PendingProducer],
     binding: TableBinding,
 ) -> Option<&HirExpr> {
-    producers
-        .iter()
-        .find_map(|(candidate, value)| (*candidate == binding).then_some(value))
+    producers.iter().find_map(|producer| {
+        (producer.binding == binding)
+            .then_some(producer.value.as_ref())
+            .flatten()
+    })
 }
 
 fn call_expr_uses_binding(call: &crate::hir::common::HirCallExpr, binding: TableBinding) -> bool {
