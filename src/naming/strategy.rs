@@ -43,6 +43,11 @@ pub(super) fn choose_param_candidate(
     hints: &FunctionHints,
     options: NamingOptions,
 ) -> CandidateHint {
+    if let Some(hint) = hints.param_hints.get(&param)
+        && hint.source == NameSource::SelfParam
+    {
+        return hint.clone();
+    }
     if options.mode == NamingMode::DebugLike {
         return mode_fallback_candidate(
             options,

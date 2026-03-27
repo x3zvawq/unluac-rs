@@ -21,6 +21,7 @@ pub struct HirProto {
     pub signature: ProtoSignature,
     pub params: Vec<ParamId>,
     pub locals: Vec<LocalId>,
+    pub local_debug_hints: Vec<Option<String>>,
     pub upvalues: Vec<UpvalueId>,
     pub temps: Vec<TempId>,
     pub temp_debug_locals: Vec<Option<String>>,

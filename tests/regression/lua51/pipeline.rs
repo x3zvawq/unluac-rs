@@ -1168,6 +1168,103 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn self_sugar_trap_generate_recovers_method_chain_and_method_decls() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/06_self_sugar_trap.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("self_sugar_trap generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated.source.contains("a:method1():method2(a.prop)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("function tbl:method1()"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("function tbl:method2(b)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("function tbl.method3(a)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("a.method3(a)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains(":method3("),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
+    fn method_sugar_generate_recovers_method_decl_without_rewriting_explicit_dot_call() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/functions/04_method_sugar.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("method_sugar generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated.source.contains("function tbl:add(b)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("function tbl:read()"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("tbl:add(3)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("result2:read()"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("tbl.read(tbl)"),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
     fn coroutine_hir_keeps_loop_state_update_as_assignment_before_yield() {
         let result = decompile(
             &compile_lua_case("lua5.1", "tests/lua_cases/common/runtime/02_coroutine.lua"),

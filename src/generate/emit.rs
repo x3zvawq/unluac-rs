@@ -389,7 +389,11 @@ impl<'a> Emitter<'a> {
     ) -> Result<Doc, GenerateError> {
         let target = self.emit_function_name(&function_decl.target, function)?;
         let header = Doc::concat([Doc::text("function "), target]);
-        self.emit_function_with_header(&function_decl.func, header)
+        let params = self.emit_decl_param_list(
+            &function_decl.func,
+            matches!(function_decl.target, AstFunctionName::Method(_, _)),
+        )?;
+        self.emit_function_with_header_and_params(&function_decl.func, header, params)
     }
 
     fn emit_local_function_decl(
@@ -407,7 +411,16 @@ impl<'a> Emitter<'a> {
         func: &AstFunctionExpr,
         header: Doc,
     ) -> Result<Doc, GenerateError> {
-        let params = self.emit_param_list(func)?;
+        let params = self.emit_decl_param_list(func, false)?;
+        self.emit_function_with_header_and_params(func, header, params)
+    }
+
+    fn emit_function_with_header_and_params(
+        &self,
+        func: &AstFunctionExpr,
+        header: Doc,
+        params: Doc,
+    ) -> Result<Doc, GenerateError> {
         let body = self.emit_block(&func.body, func.function)?;
         let mut parts = vec![header, params, self.emit_indented_body(&func.body, body)];
         parts.push(Doc::line());
@@ -415,10 +428,15 @@ impl<'a> Emitter<'a> {
         Ok(Doc::concat(parts))
     }
 
-    fn emit_param_list(&self, func: &AstFunctionExpr) -> Result<Doc, GenerateError> {
+    fn emit_decl_param_list(
+        &self,
+        func: &AstFunctionExpr,
+        implicit_self: bool,
+    ) -> Result<Doc, GenerateError> {
         let mut params = func
             .params
             .iter()
+            .skip(usize::from(implicit_self))
             .map(|param| {
                 self.resolve_name_ref(func.function, &AstNameRef::Param(*param))
                     .map(Doc::text)

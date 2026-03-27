@@ -428,14 +428,17 @@ mod decompile_pipeline {
             .as_ref()
             .expect("generate stage should leave generated source in state");
         assert!(
-            generated
-                .source
-                .contains("local result = value3.next(value3)"),
+            generated.source.contains("function tbl:next()"),
             "{}",
             generated.source
         );
         assert!(
-            !generated.source.contains("local item = value3[value2]"),
+            generated.source.contains("local result = tbl:next()"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains(".next("),
             "{}",
             generated.source
         );

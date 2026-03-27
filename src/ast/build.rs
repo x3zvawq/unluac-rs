@@ -13,8 +13,9 @@ use self::analysis::{
 };
 use super::common::{
     AstAssign, AstBindingRef, AstBlock, AstCallStmt, AstExpr, AstGenericFor, AstGoto, AstIf,
-    AstIndexAccess, AstLabel, AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl, AstModule,
-    AstNumericFor, AstRepeat, AstReturn, AstStmt, AstTargetDialect, AstWhile,
+    AstIndexAccess, AstLabel, AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl,
+    AstLocalOrigin, AstModule, AstNumericFor, AstRepeat, AstReturn, AstStmt, AstTargetDialect,
+    AstWhile,
 };
 use super::error::AstLowerError;
 
@@ -76,9 +77,8 @@ impl<'a> AstLowerer<'a> {
                 .iter()
                 .copied()
                 .filter(|temp| referenced_temps.contains(temp) && !close_temps.contains(temp))
-                .map(|temp| AstLocalBinding {
-                    id: AstBindingRef::Temp(temp),
-                    attr: AstLocalAttr::None,
+                .map(|temp| {
+                    self.recovered_local_binding(AstBindingRef::Temp(temp), AstLocalAttr::None)
                 })
                 .collect::<Vec<_>>();
             if !temp_bindings.is_empty() {
@@ -109,6 +109,22 @@ impl<'a> AstLowerer<'a> {
 
             if let Some((stmt, consumed)) =
                 self.try_lower_generic_for_init(proto_index, &block.stmts, index, continue_target)?
+            {
+                stmts.push(stmt);
+                index += consumed;
+                continue;
+            }
+
+            if let Some((stmt, consumed)) =
+                self.try_lower_method_call_chain(proto_index, &block.stmts, index)?
+            {
+                stmts.push(stmt);
+                index += consumed;
+                continue;
+            }
+
+            if let Some((stmt, consumed)) =
+                self.try_lower_method_call_alias(proto_index, &block.stmts, index)?
             {
                 stmts.push(stmt);
                 index += consumed;
@@ -357,6 +373,37 @@ impl<'a> AstLowerer<'a> {
             let label = AstLabelId(self.next_synthetic_label);
             self.next_synthetic_label += 1;
             Some(label)
+        }
+    }
+
+    fn lower_local_binding(
+        &self,
+        proto_index: usize,
+        binding: crate::hir::LocalId,
+        attr: AstLocalAttr,
+    ) -> AstLocalBinding {
+        let proto = &self.module.protos[proto_index];
+        let origin = if proto
+            .local_debug_hints
+            .get(binding.index())
+            .is_some_and(|hint| hint.is_some())
+        {
+            AstLocalOrigin::DebugHinted
+        } else {
+            AstLocalOrigin::Recovered
+        };
+        AstLocalBinding {
+            id: AstBindingRef::Local(binding),
+            attr,
+            origin,
+        }
+    }
+
+    fn recovered_local_binding(&self, binding: AstBindingRef, attr: AstLocalAttr) -> AstLocalBinding {
+        AstLocalBinding {
+            id: binding,
+            attr,
+            origin: AstLocalOrigin::Recovered,
         }
     }
 }

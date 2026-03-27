@@ -55,9 +55,10 @@ fn build_function_evidence(
         .map(|reg| debug_local_name_for_reg_at_pc(raw, reg, 0))
         .collect::<Vec<_>>();
 
-    let mut local_debug_names = vec![None; hir.locals.len()];
+    let mut local_debug_names = hir.local_debug_hints.clone();
     if raw.common.signature.has_vararg_param_reg
         && let Some(slot) = local_debug_names.first_mut()
+        && slot.is_none()
     {
         *slot = debug_local_name_for_reg_at_pc(raw, hir.params.len(), 0);
     }

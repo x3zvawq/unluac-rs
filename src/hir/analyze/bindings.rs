@@ -29,6 +29,7 @@ pub(super) fn build_bindings(
         .map(UpvalueId)
         .collect::<Vec<_>>();
     let mut locals = Vec::new();
+    let mut local_debug_hints = Vec::new();
     let mut entry_local_regs = BTreeMap::new();
     let mut numeric_for_locals = BTreeMap::new();
     let mut generic_for_locals = BTreeMap::new();
@@ -37,6 +38,11 @@ pub(super) fn build_bindings(
     if proto.signature.has_vararg_param_reg {
         let local = LocalId(locals.len());
         locals.push(local);
+        local_debug_hints.push(debug_local_name_for_reg_at_pc(
+            proto,
+            crate::transformer::Reg(usize::from(proto.signature.num_params)),
+            0,
+        ));
         entry_local_regs.insert(
             crate::transformer::Reg(usize::from(proto.signature.num_params)),
             local,
@@ -54,6 +60,7 @@ pub(super) fn build_bindings(
         };
         let local = LocalId(locals.len());
         locals.push(local);
+        local_debug_hints.push(None);
         numeric_for_locals.insert(candidate.header, local);
 
         for block in &candidate.blocks {
@@ -76,6 +83,7 @@ pub(super) fn build_bindings(
         for offset in 0..bindings.len {
             let local = LocalId(locals.len());
             locals.push(local);
+            local_debug_hints.push(None);
             let reg = crate::transformer::Reg(bindings.start.index() + offset);
             locals_for_loop.push(local);
 
@@ -137,6 +145,7 @@ pub(super) fn build_bindings(
     ProtoBindings {
         params,
         locals,
+        local_debug_hints,
         upvalues,
         temps,
         temp_debug_locals,

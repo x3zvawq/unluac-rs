@@ -10,8 +10,8 @@ use crate::readability::ReadabilityOptions;
 
 use super::super::common::{
     AstAssign, AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstGlobalDecl,
-    AstLValue, AstLocalAttr, AstLocalDecl, AstModule, AstNameRef, AstStmt, AstTableField,
-    AstTableKey,
+    AstLValue, AstLocalAttr, AstLocalDecl, AstLocalOrigin, AstModule, AstNameRef, AstStmt,
+    AstTableField, AstTableKey,
 };
 use super::ReadabilityContext;
 
@@ -53,7 +53,7 @@ fn rewrite_block(block: &mut AstBlock, options: ReadabilityOptions) -> bool {
         }
 
         let mut rewritten_next = next_stmt.clone();
-        let policy = if matches!(candidate, InlineCandidate::LocalAlias(_))
+        let policy = if matches!(candidate, InlineCandidate::LocalAlias { .. })
             && stmt_is_alias_initializer_sink(next_stmt)
         {
             InlinePolicy::AliasInitializerChain
@@ -111,7 +111,7 @@ fn collapse_adjacent_call_alias_runs(block: &mut AstBlock, options: ReadabilityO
             let Some((candidate, value)) = inline_candidate(&old_stmts[candidate_index]) else {
                 continue;
             };
-            if !matches!(candidate, InlineCandidate::LocalAlias(_)) {
+            if !matches!(candidate, InlineCandidate::LocalAlias { .. }) {
                 continue;
             }
             if count_binding_uses_in_stmts(
@@ -372,7 +372,10 @@ fn inline_candidate_from_local_decl(
     let candidate = match binding.id {
         AstBindingRef::Temp(_) => InlineCandidate::TempLike(binding.id),
         AstBindingRef::Local(_) | AstBindingRef::SyntheticLocal(_) => {
-            InlineCandidate::LocalAlias(binding.id)
+            InlineCandidate::LocalAlias {
+                binding: binding.id,
+                origin: binding.origin,
+            }
         }
     };
     Some((candidate, value))
@@ -381,7 +384,7 @@ fn inline_candidate_from_local_decl(
 fn stmt_is_alias_initializer_sink(stmt: &AstStmt) -> bool {
     matches!(
         inline_candidate(stmt),
-        Some((InlineCandidate::LocalAlias(_), _))
+        Some((InlineCandidate::LocalAlias { .. }, _))
     )
 }
 
@@ -676,11 +679,17 @@ fn rewrite_expr_use_sites(
             policy,
         ),
         AstExpr::Binary(binary) => {
+            let operand_site = match binary.op {
+                super::super::common::AstBinaryOpKind::Eq
+                | super::super::common::AstBinaryOpKind::Lt
+                | super::super::common::AstBinaryOpKind::Le => InlineSite::ComparisonOperand,
+                _ => InlineSite::Neutral,
+            };
             let mut changed = rewrite_expr_use_sites(
                 &mut binary.lhs,
                 candidate,
                 replacement,
-                InlineSite::Neutral,
+                operand_site,
                 options,
                 policy,
             );
@@ -688,7 +697,7 @@ fn rewrite_expr_use_sites(
                 &mut binary.rhs,
                 candidate,
                 replacement,
-                InlineSite::Neutral,
+                operand_site,
                 options,
                 policy,
             );
@@ -1112,13 +1121,17 @@ fn expr_complexity(expr: &AstExpr) -> usize {
 #[derive(Clone, Copy)]
 enum InlineCandidate {
     TempLike(AstBindingRef),
-    LocalAlias(AstBindingRef),
+    LocalAlias {
+        binding: AstBindingRef,
+        origin: AstLocalOrigin,
+    },
 }
 
 impl InlineCandidate {
     fn binding(self) -> AstBindingRef {
         match self {
-            Self::TempLike(binding) | Self::LocalAlias(binding) => binding,
+            Self::TempLike(binding) => binding,
+            Self::LocalAlias { binding, .. } => binding,
         }
     }
 
@@ -1128,7 +1141,14 @@ impl InlineCandidate {
             // 这里故意不把普通 local 别名放宽到所有上下文：
             // 没有 debug 证据时，我们不能把用户可能主动写出来的局部语义名随手吞掉。
             // 目前只允许它们作为“前缀表达式别名”收回去，例如 `local concat = table.concat`。
-            Self::LocalAlias(_) => is_access_base_inline_expr(expr),
+            Self::LocalAlias {
+                origin: AstLocalOrigin::DebugHinted,
+                ..
+            } => is_access_base_inline_expr(expr),
+            Self::LocalAlias {
+                origin: AstLocalOrigin::Recovered,
+                ..
+            } => is_access_base_inline_expr(expr) || is_recallable_inline_expr(expr),
         }
     }
 }
@@ -1136,6 +1156,7 @@ impl InlineCandidate {
 #[derive(Clone, Copy)]
 enum InlineSite {
     Neutral,
+    ComparisonOperand,
     ReturnValue,
     Index,
     CallArgNonFinal,
@@ -1177,10 +1198,24 @@ impl InlineSite {
                 !matches!(self, Self::AccessBase | Self::CallCallee)
                     || is_access_base_inline_expr(replacement)
             }
-            InlineCandidate::LocalAlias(_) => match policy {
+            InlineCandidate::LocalAlias { origin, .. } => match policy {
                 InlinePolicy::Conservative => {
-                    matches!(self, Self::CallCallee | Self::AccessBase)
-                        && is_access_base_inline_expr(replacement)
+                    match origin {
+                        AstLocalOrigin::DebugHinted => {
+                            matches!(self, Self::CallCallee | Self::AccessBase)
+                                && is_access_base_inline_expr(replacement)
+                        }
+                        AstLocalOrigin::Recovered => match self {
+                            Self::CallCallee | Self::AccessBase => {
+                                is_access_base_inline_expr(replacement)
+                            }
+                            Self::ComparisonOperand => {
+                                is_access_base_inline_expr(replacement)
+                                    || is_recallable_inline_expr(replacement)
+                            }
+                            _ => false,
+                        },
+                    }
                 }
                 InlinePolicy::ExtendedCallChain => self.allows_extended_local_alias(replacement),
                 InlinePolicy::AliasInitializerChain => {
@@ -1199,6 +1234,7 @@ impl InlineSite {
                 InlinePolicy::Conservative => None,
                 InlinePolicy::ExtendedCallChain => Some(options.access_base_inline_max_complexity),
             },
+            Self::ComparisonOperand => Some(options.args_inline_max_complexity),
             Self::ReturnValue => Some(options.return_inline_max_complexity),
             Self::Index => Some(options.index_inline_max_complexity),
             Self::CallArgNonFinal | Self::CallArgFinal => Some(options.args_inline_max_complexity),
@@ -1213,6 +1249,7 @@ impl InlineSite {
     fn descend_access_base(self) -> Self {
         match self {
             Self::Neutral => Self::AccessBase,
+            Self::ComparisonOperand => Self::ComparisonOperand,
             Self::ReturnValue
             | Self::Index
             | Self::CallArgNonFinal
@@ -1225,6 +1262,9 @@ impl InlineSite {
     fn allows_extended_local_alias(self, replacement: &AstExpr) -> bool {
         match self {
             Self::Neutral => is_extended_neutral_local_alias_expr(replacement),
+            Self::ComparisonOperand => {
+                is_extended_neutral_local_alias_expr(replacement) || is_recallable_inline_expr(replacement)
+            }
             Self::CallCallee => is_call_callee_inline_expr(replacement),
             Self::CallArgNonFinal => {
                 is_context_safe_expr(replacement) || is_recallable_inline_expr(replacement)
@@ -1242,7 +1282,7 @@ impl InlineSite {
             // 这种形状本质上还是在组装一个后续调用会消费的前缀表达式别名。
             // 允许它在紧邻的下一条 local alias 初始化式里收回，能把机械拆分重新压回
             // 更接近源码的单条声明，而不会放宽到普通 return/if/赋值上下文。
-            Self::Neutral | Self::AccessBase | Self::CallCallee => {
+            Self::Neutral | Self::ComparisonOperand | Self::AccessBase | Self::CallCallee => {
                 is_access_base_inline_expr(replacement)
             }
             Self::ReturnValue | Self::Index | Self::CallArgNonFinal | Self::CallArgFinal => false,

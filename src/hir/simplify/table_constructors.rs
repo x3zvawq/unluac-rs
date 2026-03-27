@@ -200,6 +200,13 @@ fn keyed_write_step(
     if binding_from_expr(&access.base) != Some(binding) {
         return None;
     }
+    // 后续 `obj.method = function(...) ... end` 这类赋值，源码层通常更像独立的方法声明，
+    // 而不是字面量里本来就写着的函数字段。这里如果把 closure 继续吞进构造器，
+    // 后面的 AST/readability 就失去了恢复 `function obj:method()` / `function obj.method()`
+    // 的结构信息，所以直接把 region 边界停在这里。
+    if matches!(value, HirExpr::Closure(_)) {
+        return None;
+    }
     if expr_uses_binding(&access.key, binding) || expr_uses_binding(value, binding) {
         return None;
     }
@@ -288,6 +295,9 @@ fn rebuild_constructor_from_steps(
                     &mut consumed,
                     &remaining_uses,
                 )?;
+                if matches!(value, HirExpr::Closure(_)) {
+                    return None;
+                }
                 constructor.fields.push(HirTableField::Record(
                     crate::hir::common::HirRecordField {
                         key: field.key.clone(),

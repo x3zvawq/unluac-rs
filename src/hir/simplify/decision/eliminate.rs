@@ -20,8 +20,15 @@ use crate::hir::common::{
 pub(super) fn eliminate_remaining_decisions_in_proto(proto: &mut HirProto) -> bool {
     let mut next_local_index = proto.locals.len();
     let mut new_locals = Vec::new();
-    let changed = eliminate_block(&mut proto.body, &mut next_local_index, &mut new_locals);
+    let mut new_local_debug_hints = Vec::new();
+    let changed = eliminate_block(
+        &mut proto.body,
+        &mut next_local_index,
+        &mut new_locals,
+        &mut new_local_debug_hints,
+    );
     proto.locals.extend(new_locals);
+    proto.local_debug_hints.extend(new_local_debug_hints);
     changed
 }
 
@@ -29,6 +36,7 @@ fn eliminate_block(
     block: &mut HirBlock,
     next_local_index: &mut usize,
     new_locals: &mut Vec<LocalId>,
+    new_local_debug_hints: &mut Vec<Option<String>>,
 ) -> bool {
     let mut changed = false;
     let mut rewritten = Vec::with_capacity(block.stmts.len());
@@ -36,6 +44,7 @@ fn eliminate_block(
     let mut state = EliminationState {
         next_local_index,
         new_locals,
+        new_local_debug_hints,
     };
 
     for stmt in original {
@@ -51,6 +60,7 @@ fn eliminate_block(
 struct EliminationState<'a> {
     next_local_index: &'a mut usize,
     new_locals: &'a mut Vec<LocalId>,
+    new_local_debug_hints: &'a mut Vec<Option<String>>,
 }
 
 impl EliminationState<'_> {
@@ -58,6 +68,7 @@ impl EliminationState<'_> {
         let local = LocalId(*self.next_local_index);
         *self.next_local_index += 1;
         self.new_locals.push(local);
+        self.new_local_debug_hints.push(None);
         local
     }
 }
@@ -166,9 +177,15 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
                 &mut if_stmt.then_block,
                 state.next_local_index,
                 state.new_locals,
+                state.new_local_debug_hints,
             );
             let else_changed = if_stmt.else_block.as_mut().is_some_and(|else_block| {
-                eliminate_block(else_block, state.next_local_index, state.new_locals)
+                eliminate_block(
+                    else_block,
+                    state.next_local_index,
+                    state.new_locals,
+                    state.new_local_debug_hints,
+                )
             });
             (
                 vec![HirStmt::If(if_stmt)],
@@ -181,6 +198,7 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
                 &mut while_stmt.body,
                 state.next_local_index,
                 state.new_locals,
+                state.new_local_debug_hints,
             );
             (
                 vec![HirStmt::While(while_stmt)],
@@ -192,6 +210,7 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
                 &mut repeat_stmt.body,
                 state.next_local_index,
                 state.new_locals,
+                state.new_local_debug_hints,
             );
             let cond_changed = eliminate_condition_expr(&mut repeat_stmt.cond);
             (
@@ -210,7 +229,12 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
             (prefix, changed)
         }
         HirStmt::Block(mut block) => {
-            let changed = eliminate_block(&mut block, state.next_local_index, state.new_locals);
+            let changed = eliminate_block(
+                &mut block,
+                state.next_local_index,
+                state.new_locals,
+                state.new_local_debug_hints,
+            );
             (vec![HirStmt::Block(block)], changed)
         }
         HirStmt::Unstructured(mut unstructured) => {
@@ -218,6 +242,7 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
                 &mut unstructured.body,
                 state.next_local_index,
                 state.new_locals,
+                state.new_local_debug_hints,
             );
             (vec![HirStmt::Unstructured(unstructured)], changed)
         }
@@ -251,6 +276,7 @@ fn extract_numeric_for(
         &mut numeric_for.body,
         state.next_local_index,
         state.new_locals,
+        state.new_local_debug_hints,
     );
     (prefix, numeric_for, exprs_changed || body_changed)
 }
@@ -265,6 +291,7 @@ fn extract_generic_for(
         &mut generic_for.body,
         state.next_local_index,
         state.new_locals,
+        state.new_local_debug_hints,
     );
     (prefix, generic_for, iterator_changed || body_changed)
 }

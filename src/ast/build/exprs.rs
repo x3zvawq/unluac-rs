@@ -8,9 +8,9 @@ use crate::hir::{
 use super::{AstLowerError, AstLowerer};
 use crate::ast::common::{
     AstAssign, AstBinaryExpr, AstBinaryOpKind, AstCallExpr, AstCallKind, AstExpr, AstFieldAccess,
-    AstFunctionExpr, AstGlobalName, AstIndexAccess, AstLValue, AstLocalAttr, AstLocalBinding,
-    AstLocalDecl, AstLogicalExpr, AstMethodCallExpr, AstNameRef, AstTableConstructor,
-    AstTableField, AstTableKey, AstUnaryExpr, AstUnaryOpKind,
+    AstFunctionExpr, AstGlobalName, AstIndexAccess, AstLValue, AstLocalDecl, AstLogicalExpr,
+    AstMethodCallExpr, AstNameRef, AstTableConstructor, AstTableField, AstTableKey, AstUnaryExpr,
+    AstUnaryOpKind,
 };
 
 impl<'a> AstLowerer<'a> {
@@ -45,10 +45,7 @@ impl<'a> AstLowerer<'a> {
                 .bindings
                 .iter()
                 .copied()
-                .map(|binding| AstLocalBinding {
-                    id: crate::ast::common::AstBindingRef::Local(binding),
-                    attr: AstLocalAttr::None,
-                })
+                .map(|binding| self.lower_local_binding(proto_index, binding, crate::ast::AstLocalAttr::None))
                 .collect(),
             values: local_decl
                 .values
@@ -201,7 +198,7 @@ impl<'a> AstLowerer<'a> {
         call: &HirCallExpr,
     ) -> Result<AstCallKind, AstLowerError> {
         let callee = self.lower_expr(proto_index, &call.callee)?;
-        let args = call
+        let mut args = call
             .args
             .iter()
             .map(|arg| self.lower_expr(proto_index, arg))
@@ -210,6 +207,16 @@ impl<'a> AstLowerer<'a> {
         if call.method
             && let AstExpr::FieldAccess(access) = callee
         {
+            if args.is_empty() {
+                return Err(AstLowerError::InvalidMethodCallPattern {
+                    proto: proto_index,
+                    reason: "method call must keep the implicit receiver as its first argument",
+                });
+            }
+            // HIR `call(method)` 仍然沿用 low-IR 的显式 receiver 形状；
+            // 真正落到 AST 时，要把这个首参收回 `receiver:method(args...)`，
+            // 否则后面生成源码会把 `self` 又打印一遍。
+            args.remove(0);
             return Ok(AstCallKind::MethodCall(Box::new(AstMethodCallExpr {
                 receiver: access.base,
                 method: access.field,

@@ -211,13 +211,10 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock, names: &Func
                     output,
                     "{indent}{}({})",
                     format_function_name(&function_decl.target, names),
-                    function_decl
-                        .func
-                        .params
-                        .iter()
-                        .map(|param| format!("p{}", param.index()))
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    format_decl_params(
+                        &function_decl.func,
+                        matches!(function_decl.target, AstFunctionName::Method(_, _)),
+                    ),
                 );
                 write_block(
                     output,
@@ -526,17 +523,22 @@ fn format_arg_list(values: &[AstExpr], indent: &str, names: &FunctionRenderNames
 }
 
 fn format_function_expr(function: &AstFunctionExpr, indent: &str) -> String {
-    let params = function
-        .params
-        .iter()
-        .map(|param| format!("p{}", param.index()))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let params = format_decl_params(function, false);
     let child_indent = format!("{indent}  ");
     let child_names = collect_function_render_names(&function.body);
     let mut body = String::new();
     write_block(&mut body, &child_indent, &function.body, &child_names);
     format!("function({params})\n{body}{indent}end")
+}
+
+fn format_decl_params(function: &AstFunctionExpr, implicit_self: bool) -> String {
+    function
+        .params
+        .iter()
+        .skip(usize::from(implicit_self))
+        .map(|param| format!("p{}", param.index()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn display_synthetic_local(local: AstSyntheticLocalId, names: &FunctionRenderNames) -> usize {

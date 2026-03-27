@@ -262,6 +262,7 @@ pub struct AstGlobalDecl {
 pub struct AstLocalBinding {
     pub id: AstBindingRef,
     pub attr: AstLocalAttr,
+    pub origin: AstLocalOrigin,
 }
 
 /// `global` binding。
@@ -287,6 +288,17 @@ pub enum AstLocalAttr {
     None,
     Const,
     Close,
+}
+
+/// 局部绑定在进入 AST 时的来源。
+///
+/// 这里不是为了精确复刻 parser 的原始局部声明，而是给 readability 一个稳定边界：
+/// 带 parser debug 影子的 local 更接近源码语义名，机械恢复出来的 local 则可以更积极
+/// 地继续收回表达式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstLocalOrigin {
+    Recovered,
+    DebugHinted,
 }
 
 /// 全局声明属性。

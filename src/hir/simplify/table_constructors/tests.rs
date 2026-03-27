@@ -5,8 +5,8 @@
 use super::*;
 
 use crate::hir::common::{
-    HirAssign, HirCallExpr, HirExpr, HirGlobalRef, HirLValue, HirLocalDecl, HirReturn,
-    HirTableField, HirTableSetList,
+    HirAssign, HirCallExpr, HirClosureExpr, HirExpr, HirGlobalRef, HirLValue, HirLocalDecl,
+    HirReturn, HirTableField, HirTableSetList,
 };
 use crate::parser::{ProtoLineRange, ProtoSignature};
 
@@ -233,4 +233,66 @@ fn folds_set_list_with_trailing_multivalue_into_constructor_tail() {
         ret,
         HirStmt::Return(ret) if matches!(ret.values.as_slice(), [HirExpr::LocalRef(local)] if *local == table_local)
     ));
+}
+
+#[test]
+fn does_not_fold_closure_backed_record_writes_into_constructor() {
+    let table_local = LocalId(0);
+    let closure_local = LocalId(1);
+
+    let mut proto = HirProto {
+        id: crate::hir::common::HirProtoRef(0),
+        source: None,
+        line_range: ProtoLineRange {
+            defined_start: 0,
+            defined_end: 0,
+        },
+        signature: ProtoSignature {
+            num_params: 0,
+            is_vararg: false,
+            has_vararg_param_reg: false,
+            named_vararg_table: false,
+        },
+        params: Vec::new(),
+        locals: vec![table_local, closure_local],
+        upvalues: Vec::new(),
+        temps: Vec::new(),
+        temp_debug_locals: Vec::new(),
+        body: HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![table_local],
+                    values: vec![HirExpr::TableConstructor(Box::default())],
+                })),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![closure_local],
+                    values: vec![HirExpr::Closure(Box::new(HirClosureExpr {
+                        proto: crate::hir::common::HirProtoRef(1),
+                        captures: Vec::new(),
+                    }))],
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::TableAccess(Box::new(
+                        crate::hir::common::HirTableAccess {
+                            base: HirExpr::LocalRef(table_local),
+                            key: HirExpr::String("method".to_owned()),
+                        },
+                    ))],
+                    values: vec![HirExpr::LocalRef(closure_local)],
+                })),
+            ],
+        },
+        children: Vec::new(),
+    };
+
+    let changed = stabilize_table_constructors_in_proto(&mut proto);
+    assert!(!changed);
+    assert_eq!(proto.body.stmts.len(), 3);
+    let HirStmt::LocalDecl(seed) = &proto.body.stmts[0] else {
+        panic!("table seed should stay a local decl");
+    };
+    let [HirExpr::TableConstructor(table_ctor)] = seed.values.as_slice() else {
+        panic!("expected original table constructor seed");
+    };
+    assert!(table_ctor.fields.is_empty());
 }

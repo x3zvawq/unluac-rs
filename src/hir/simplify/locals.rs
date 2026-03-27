@@ -16,13 +16,17 @@ use crate::hir::common::{
 pub(super) fn promote_temps_to_locals_in_proto(proto: &mut HirProto) -> bool {
     let mut next_local_index = proto.locals.len();
     let mut new_locals = Vec::new();
+    let mut new_local_debug_hints = Vec::new();
     let result = promote_block(
+        &proto.temp_debug_locals,
         &mut proto.body,
         &BTreeMap::new(),
         &mut next_local_index,
         &mut new_locals,
+        &mut new_local_debug_hints,
     );
     proto.locals.extend(new_locals);
+    proto.local_debug_hints.extend(new_local_debug_hints);
     result.changed
 }
 
@@ -53,11 +57,13 @@ struct PromotionResult {
 }
 
 struct PlanAllocator<'a> {
+    temp_debug_locals: &'a [Option<String>],
     plans: &'a mut Vec<PromotionPlan>,
     reserved_temps: &'a mut BTreeSet<TempId>,
     reserved_alias_indices: &'a mut BTreeSet<usize>,
     next_local_index: &'a mut usize,
     new_locals: &'a mut Vec<LocalId>,
+    new_local_debug_hints: &'a mut Vec<Option<String>>,
 }
 
 impl PlanAllocator<'_> {
@@ -71,6 +77,8 @@ impl PlanAllocator<'_> {
         let local = LocalId(*self.next_local_index);
         *self.next_local_index += 1;
         self.new_locals.push(local);
+        self.new_local_debug_hints
+            .push(debug_hint_for_temp_group(self.temp_debug_locals, &temps));
         self.reserved_temps.extend(temps.iter().copied());
         self.reserved_alias_indices
             .extend(removable_aliases.iter().copied());
@@ -85,12 +93,21 @@ impl PlanAllocator<'_> {
 }
 
 fn promote_block(
+    temp_debug_locals: &[Option<String>],
     block: &mut HirBlock,
     inherited: &BTreeMap<TempId, LocalId>,
     next_local_index: &mut usize,
     new_locals: &mut Vec<LocalId>,
+    new_local_debug_hints: &mut Vec<Option<String>>,
 ) -> PromotionResult {
-    let plans = collect_plans(block, inherited, next_local_index, new_locals);
+    let plans = collect_plans(
+        temp_debug_locals,
+        block,
+        inherited,
+        next_local_index,
+        new_locals,
+        new_local_debug_hints,
+    );
     let plan_by_decl = plans.iter().fold(
         BTreeMap::<usize, Vec<&PromotionPlan>>::new(),
         |mut grouped, plan| {
@@ -132,7 +149,14 @@ fn promote_block(
             continue;
         }
 
-        let stmt_changed = rewrite_stmt(&mut stmt, &mapping, next_local_index, new_locals);
+        let stmt_changed = rewrite_stmt(
+            temp_debug_locals,
+            &mut stmt,
+            &mapping,
+            next_local_index,
+            new_locals,
+            new_local_debug_hints,
+        );
         changed |= stmt_changed;
         rewritten.push(stmt);
     }
@@ -145,10 +169,12 @@ fn promote_block(
 }
 
 fn collect_plans(
+    temp_debug_locals: &[Option<String>],
     block: &HirBlock,
     inherited: &BTreeMap<TempId, LocalId>,
     next_local_index: &mut usize,
     new_locals: &mut Vec<LocalId>,
+    new_local_debug_hints: &mut Vec<Option<String>>,
 ) -> Vec<PromotionPlan> {
     if block.stmts.iter().any(|stmt| {
         matches!(
@@ -222,11 +248,13 @@ fn collect_plans(
         }
 
         PlanAllocator {
+            temp_debug_locals,
             plans: &mut plans,
             reserved_temps: &mut reserved_temps,
             reserved_alias_indices: &mut reserved_alias_indices,
             next_local_index,
             new_locals,
+            new_local_debug_hints,
         }
         .allocate(
             decl_index,
@@ -246,11 +274,13 @@ fn collect_plans(
 
         for temp in merge_temps {
             PlanAllocator {
+                temp_debug_locals,
                 plans: &mut plans,
                 reserved_temps: &mut reserved_temps,
                 reserved_alias_indices: &mut reserved_alias_indices,
                 next_local_index,
                 new_locals,
+                new_local_debug_hints,
             }
             .allocate(
                 decl_index,
@@ -449,10 +479,12 @@ fn rewrite_decl_stmt(
 }
 
 fn rewrite_stmt(
+    temp_debug_locals: &[Option<String>],
     stmt: &mut HirStmt,
     mapping: &BTreeMap<TempId, LocalId>,
     next_local_index: &mut usize,
     new_locals: &mut Vec<LocalId>,
+    new_local_debug_hints: &mut Vec<Option<String>>,
 ) -> bool {
     match stmt {
         HirStmt::LocalDecl(local_decl) => {
@@ -489,29 +521,52 @@ fn rewrite_stmt(
         HirStmt::If(if_stmt) => {
             let cond_changed = rewrite_expr(&mut if_stmt.cond, mapping);
             let then_changed = promote_block(
+                temp_debug_locals,
                 &mut if_stmt.then_block,
                 mapping,
                 next_local_index,
                 new_locals,
+                new_local_debug_hints,
             )
             .changed;
             let else_changed = if_stmt.else_block.as_mut().is_some_and(|else_block| {
-                promote_block(else_block, mapping, next_local_index, new_locals).changed
+                promote_block(
+                    temp_debug_locals,
+                    else_block,
+                    mapping,
+                    next_local_index,
+                    new_locals,
+                    new_local_debug_hints,
+                )
+                .changed
             });
             cond_changed || then_changed || else_changed
         }
         HirStmt::While(while_stmt) => {
             let cond_changed = rewrite_expr(&mut while_stmt.cond, mapping);
-            let body_changed =
-                promote_block(&mut while_stmt.body, mapping, next_local_index, new_locals).changed;
+            let body_changed = promote_block(
+                temp_debug_locals,
+                &mut while_stmt.body,
+                mapping,
+                next_local_index,
+                new_locals,
+                new_local_debug_hints,
+            )
+            .changed;
             cond_changed || body_changed
         }
         HirStmt::Repeat(repeat_stmt) => {
             // `repeat ... until` 的条件和 loop body 共享同一个词法作用域。
             // body 里刚刚提升出来的 local 如果不继续带到条件里，条件就会继续挂着旧 temp，
             // 最后得到“body 已经是 l2，until 里还是 t3”这种半截 HIR。
-            let body_result =
-                promote_block(&mut repeat_stmt.body, mapping, next_local_index, new_locals);
+            let body_result = promote_block(
+                temp_debug_locals,
+                &mut repeat_stmt.body,
+                mapping,
+                next_local_index,
+                new_locals,
+                new_local_debug_hints,
+            );
             let cond_changed = rewrite_expr(&mut repeat_stmt.cond, &body_result.trailing_mapping);
             body_result.changed || cond_changed
         }
@@ -519,8 +574,15 @@ fn rewrite_stmt(
             let start_changed = rewrite_expr(&mut numeric_for.start, mapping);
             let limit_changed = rewrite_expr(&mut numeric_for.limit, mapping);
             let step_changed = rewrite_expr(&mut numeric_for.step, mapping);
-            let body_changed =
-                promote_block(&mut numeric_for.body, mapping, next_local_index, new_locals).changed;
+            let body_changed = promote_block(
+                temp_debug_locals,
+                &mut numeric_for.body,
+                mapping,
+                next_local_index,
+                new_locals,
+                new_local_debug_hints,
+            )
+            .changed;
             start_changed || limit_changed || step_changed || body_changed
         }
         HirStmt::GenericFor(generic_for) => {
@@ -530,19 +592,36 @@ fn rewrite_stmt(
                 .fold(false, |changed, expr| {
                     rewrite_expr(expr, mapping) || changed
                 });
-            let body_changed =
-                promote_block(&mut generic_for.body, mapping, next_local_index, new_locals).changed;
+            let body_changed = promote_block(
+                temp_debug_locals,
+                &mut generic_for.body,
+                mapping,
+                next_local_index,
+                new_locals,
+                new_local_debug_hints,
+            )
+            .changed;
             iterator_changed || body_changed
         }
         HirStmt::Block(block) => {
-            promote_block(block, mapping, next_local_index, new_locals).changed
+            promote_block(
+                temp_debug_locals,
+                block,
+                mapping,
+                next_local_index,
+                new_locals,
+                new_local_debug_hints,
+            )
+            .changed
         }
         HirStmt::Unstructured(unstructured) => {
             promote_block(
+                temp_debug_locals,
                 &mut unstructured.body,
                 mapping,
                 next_local_index,
                 new_locals,
+                new_local_debug_hints,
             )
             .changed
         }
@@ -552,6 +631,15 @@ fn rewrite_stmt(
         | HirStmt::Goto(_)
         | HirStmt::Label(_) => false,
     }
+}
+
+fn debug_hint_for_temp_group(
+    temp_debug_locals: &[Option<String>],
+    temps: &BTreeSet<TempId>,
+) -> Option<String> {
+    temps
+        .iter()
+        .find_map(|temp| temp_debug_locals.get(temp.index()).cloned().flatten())
 }
 
 fn rewrite_call_expr(call: &mut HirCallExpr, mapping: &BTreeMap<TempId, LocalId>) -> bool {

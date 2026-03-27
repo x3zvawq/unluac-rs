@@ -31,4 +31,6 @@ pub enum AstLowerError {
     UnsupportedSetListTrailingMultivalue { proto: usize },
     #[error("HIR proto#{proto} contains err-nnil that cannot be matched to a global declaration")]
     InvalidGlobalDeclPattern { proto: usize },
+    #[error("HIR proto#{proto} has invalid method call lowering shape: {reason}")]
+    InvalidMethodCallPattern { proto: usize, reason: &'static str },
 }

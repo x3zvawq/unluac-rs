@@ -325,6 +325,56 @@ fn simple_mode_uses_underscore_for_unused_synthetic_local() {
 }
 
 #[test]
+fn debug_like_mode_still_uses_self_for_method_receiver_param() {
+    let proto = HirProto {
+        id: HirProtoRef(0),
+        source: None,
+        line_range: ProtoLineRange {
+            defined_start: 0,
+            defined_end: 0,
+        },
+        signature: ProtoSignature {
+            num_params: 2,
+            is_vararg: false,
+            has_vararg_param_reg: false,
+            named_vararg_table: false,
+        },
+        params: vec![ParamId(0), ParamId(1)],
+        locals: Vec::new(),
+        upvalues: Vec::new(),
+        temps: Vec::new(),
+        temp_debug_locals: Vec::new(),
+        body: HirBlock::default(),
+        children: Vec::new(),
+    };
+
+    let candidate = super::super::strategy::choose_param_candidate(
+        &proto,
+        ParamId(0),
+        0,
+        &super::super::common::FunctionNamingEvidence::default(),
+        &super::super::common::FunctionHints {
+            param_hints: std::iter::once((
+                ParamId(0),
+                super::super::common::CandidateHint {
+                    text: "self".to_owned(),
+                    source: NameSource::SelfParam,
+                },
+            ))
+            .collect(),
+            ..Default::default()
+        },
+        NamingOptions {
+            mode: NamingMode::DebugLike,
+            debug_like_include_function: true,
+        },
+    );
+
+    assert_eq!(candidate.text, "self");
+    assert_eq!(candidate.source, NameSource::SelfParam);
+}
+
+#[test]
 fn capture_provenance_upvalue_keeps_parent_name_when_child_local_conflicts() {
     let mut raw = empty_raw_chunk();
     raw.main.common.children.push(raw.main.clone());
