@@ -1386,6 +1386,51 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn recursive_local_function_slot_generate_keeps_recursive_local_before_slot_assign() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/27_recursive_local_function_slot.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                naming: NamingOptions {
+                    mode: NamingMode::DebugLike,
+                    debug_like_include_function: true,
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("recursive_local_function_slot generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated.source.contains("local function r1_2("),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("return r1_2(p2_0 - 1) + 1"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("r1_0[r1_1] = r1_2"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("= function("),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
     fn vararg_and_tailcall_generate_inlines_unpack_alias_chain_initializer() {
         let result = decompile(
             &compile_lua_case(

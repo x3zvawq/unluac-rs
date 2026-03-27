@@ -1,5 +1,7 @@
 //! AST build：表达式和常规语句 lowering。
 
+use std::collections::BTreeSet;
+
 use crate::hir::{
     HirAssign, HirBinaryOpKind, HirCallExpr, HirClosureExpr, HirExpr, HirLValue, HirLocalDecl,
     HirTableAccess, HirTableField, HirTableKey, HirUnaryOpKind,
@@ -31,6 +33,11 @@ impl<'a> AstLowerer<'a> {
             params: child.params.clone(),
             is_vararg: child.signature.is_vararg,
             body,
+            captured_bindings: closure
+                .captures
+                .iter()
+                .filter_map(|capture| capture_binding_from_hir_expr(&capture.value))
+                .collect::<BTreeSet<_>>(),
         })
     }
 
@@ -227,6 +234,14 @@ impl<'a> AstLowerer<'a> {
         }
 
         Ok(AstCallKind::Call(Box::new(AstCallExpr { callee, args })))
+    }
+}
+
+fn capture_binding_from_hir_expr(expr: &HirExpr) -> Option<crate::ast::common::AstBindingRef> {
+    match expr {
+        HirExpr::LocalRef(local) => Some(crate::ast::common::AstBindingRef::Local(*local)),
+        HirExpr::TempRef(temp) => Some(crate::ast::common::AstBindingRef::Temp(*temp)),
+        _ => None,
     }
 }
 

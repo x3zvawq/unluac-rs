@@ -23,6 +23,7 @@ fn method_function(params: &[ParamId]) -> AstExpr {
                 values: vec![AstExpr::Var(AstNameRef::Param(params[0]))],
             }))],
         },
+        captured_bindings: Default::default(),
     }))
 }
 
@@ -99,6 +100,90 @@ fn lowers_field_function_assignment_into_method_decl_when_method_call_evidence_e
                     root: AstNameRef::Local(LocalId(0)),
                     fields,
                 }) if fields == &vec!["method3".to_owned()]
+            )
+    ));
+}
+
+#[test]
+fn keeps_recursive_local_function_binding_before_table_slot_forwarding() {
+    let mut module = AstModule {
+        entry_function: HirProtoRef(0),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Local(LocalId(0)),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::TableConstructor(Box::new(AstTableConstructor {
+                        fields: Vec::new(),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Local(LocalId(1)),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Integer(1)],
+                })),
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Local(LocalId(2)),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::FunctionExpr(Box::new(AstFunctionExpr {
+                        function: HirProtoRef(1),
+                        params: vec![ParamId(0)],
+                        is_vararg: false,
+                        body: AstBlock {
+                            stmts: vec![AstStmt::Return(Box::new(crate::ast::AstReturn {
+                                values: vec![AstExpr::Call(Box::new(crate::ast::AstCallExpr {
+                                    callee: AstExpr::Var(AstNameRef::Local(LocalId(2))),
+                                    args: vec![AstExpr::Var(AstNameRef::Param(ParamId(0)))],
+                                }))],
+                            }))],
+                        },
+                        captured_bindings: [AstBindingRef::Local(LocalId(2))]
+                            .into_iter()
+                            .collect(),
+                    }))],
+                })),
+                AstStmt::Assign(Box::new(AstAssign {
+                    targets: vec![AstLValue::IndexAccess(Box::new(
+                        crate::ast::AstIndexAccess {
+                            base: AstExpr::Var(AstNameRef::Local(LocalId(0))),
+                            index: AstExpr::Var(AstNameRef::Local(LocalId(1))),
+                        },
+                    ))],
+                    values: vec![AstExpr::Var(AstNameRef::Local(LocalId(2)))],
+                })),
+            ],
+        },
+    };
+
+    let changed = apply(
+        &mut module,
+        super::ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+            options: ReadabilityOptions::default(),
+        },
+    );
+    assert!(changed);
+
+    assert!(matches!(
+        &module.body.stmts[2],
+        AstStmt::LocalFunctionDecl(local_function_decl)
+            if local_function_decl.name == AstBindingRef::Local(LocalId(2))
+    ));
+    assert!(matches!(
+        &module.body.stmts[3],
+        AstStmt::Assign(assign)
+            if matches!(
+                assign.values.as_slice(),
+                [AstExpr::Var(AstNameRef::Local(LocalId(2)))]
             )
     ));
 }

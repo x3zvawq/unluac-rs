@@ -577,7 +577,9 @@ fn rewrite_function_expr(expr: &mut AstExpr, mapping: &BTreeMap<TempId, AstSynth
                 }
             }
         }
-        AstExpr::FunctionExpr(_) => {}
+        AstExpr::FunctionExpr(function) => {
+            rewrite_function_capture_bindings(function, mapping);
+        }
         AstExpr::Nil
         | AstExpr::Boolean(_)
         | AstExpr::Integer(_)
@@ -593,6 +595,27 @@ fn rewrite_name_ref(name: &mut AstNameRef, mapping: &BTreeMap<TempId, AstSynthet
     {
         *name = AstNameRef::SyntheticLocal(synthetic);
     }
+}
+
+fn rewrite_function_capture_bindings(
+    function: &mut AstFunctionExpr,
+    mapping: &BTreeMap<TempId, AstSyntheticLocalId>,
+) {
+    if function.captured_bindings.is_empty() {
+        return;
+    }
+    function.captured_bindings = function
+        .captured_bindings
+        .iter()
+        .map(|binding| match binding {
+            AstBindingRef::Temp(temp) => mapping
+                .get(temp)
+                .copied()
+                .map(AstBindingRef::SyntheticLocal)
+                .unwrap_or(AstBindingRef::Temp(*temp)),
+            _ => *binding,
+        })
+        .collect();
 }
 
 #[cfg(test)]

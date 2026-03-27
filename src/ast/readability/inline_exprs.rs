@@ -672,7 +672,7 @@ fn rewrite_expr_use_sites(
             &mut unary.expr,
             candidate,
             replacement,
-            InlineSite::Neutral,
+            site.descend_value_expr(),
             options,
             policy,
         ),
@@ -681,7 +681,7 @@ fn rewrite_expr_use_sites(
                 super::super::common::AstBinaryOpKind::Eq
                 | super::super::common::AstBinaryOpKind::Lt
                 | super::super::common::AstBinaryOpKind::Le => InlineSite::ComparisonOperand,
-                _ => InlineSite::Neutral,
+                _ => site.descend_value_expr(),
             };
             let mut changed = rewrite_expr_use_sites(
                 &mut binary.lhs,
@@ -706,7 +706,7 @@ fn rewrite_expr_use_sites(
                 &mut logical.lhs,
                 candidate,
                 replacement,
-                InlineSite::Neutral,
+                site.descend_value_expr(),
                 options,
                 policy,
             );
@@ -714,7 +714,7 @@ fn rewrite_expr_use_sites(
                 &mut logical.rhs,
                 candidate,
                 replacement,
-                InlineSite::Neutral,
+                site.descend_value_expr(),
                 options,
                 policy,
             );
@@ -1160,6 +1160,7 @@ enum InlineSite {
     Neutral,
     ComparisonOperand,
     ReturnValue,
+    ReturnNestedValue,
     Index,
     CallArgNonFinal,
     CallArgFinal,
@@ -1214,6 +1215,7 @@ impl InlineSite {
                             is_access_base_inline_expr(replacement)
                                 || is_recallable_inline_expr(replacement)
                         }
+                        Self::ReturnNestedValue => is_recallable_inline_expr(replacement),
                         _ => false,
                     },
                 },
@@ -1236,6 +1238,7 @@ impl InlineSite {
             },
             Self::ComparisonOperand => Some(options.args_inline_max_complexity),
             Self::ReturnValue => Some(options.return_inline_max_complexity),
+            Self::ReturnNestedValue => Some(options.return_inline_max_complexity),
             Self::Index => Some(options.index_inline_max_complexity),
             Self::CallArgNonFinal | Self::CallArgFinal => Some(options.args_inline_max_complexity),
             // 这里刻意复用 access-base 的阈值：
@@ -1250,7 +1253,21 @@ impl InlineSite {
         match self {
             Self::Neutral => Self::AccessBase,
             Self::ComparisonOperand => Self::ComparisonOperand,
-            Self::ReturnValue
+            Self::ReturnValue => Self::ReturnNestedValue,
+            Self::ReturnNestedValue => Self::ReturnNestedValue,
+            Self::Index
+            | Self::CallArgNonFinal
+            | Self::CallArgFinal
+            | Self::CallCallee
+            | Self::AccessBase => Self::Neutral,
+        }
+    }
+
+    fn descend_value_expr(self) -> Self {
+        match self {
+            Self::ReturnValue | Self::ReturnNestedValue => Self::ReturnNestedValue,
+            Self::ComparisonOperand => Self::ComparisonOperand,
+            Self::Neutral
             | Self::Index
             | Self::CallArgNonFinal
             | Self::CallArgFinal
@@ -1266,6 +1283,7 @@ impl InlineSite {
                 is_extended_neutral_local_alias_expr(replacement)
                     || is_recallable_inline_expr(replacement)
             }
+            Self::ReturnNestedValue => is_recallable_inline_expr(replacement),
             Self::CallCallee => is_call_callee_inline_expr(replacement),
             Self::CallArgNonFinal => {
                 is_extended_call_arg_local_alias_expr(replacement)
@@ -1290,7 +1308,11 @@ impl InlineSite {
             Self::Neutral | Self::ComparisonOperand | Self::AccessBase | Self::CallCallee => {
                 is_access_base_inline_expr(replacement)
             }
-            Self::ReturnValue | Self::Index | Self::CallArgNonFinal | Self::CallArgFinal => false,
+            Self::ReturnValue
+            | Self::ReturnNestedValue
+            | Self::Index
+            | Self::CallArgNonFinal
+            | Self::CallArgFinal => false,
         }
     }
 }

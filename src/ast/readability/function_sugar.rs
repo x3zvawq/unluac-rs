@@ -265,6 +265,15 @@ fn try_lower_forwarded_function_stmt(
     let AstExpr::FunctionExpr(function) = &local_decl.values[0] else {
         return None;
     };
+    // 只有“纯转发”的函数壳才适合被下一条语句吸收。
+    // 递归 local function 这类 case 在 AST 函数体里往往已经只剩 `u0` 之类的 upvalue 引用，
+    // 直接扫 body 看不到它对当前 binding 槽位的依赖；所以这里优先使用 AST build
+    // 带下来的 capture provenance，确认这个局部槽位是不是闭包初始化的一部分。
+    if function.captured_bindings.contains(&binding)
+        || count_binding_value_uses_in_block(&function.body, binding) != 0
+    {
+        return None;
+    }
     if count_binding_value_uses_in_stmts(&stmts[1..], binding) != 1 {
         return None;
     }

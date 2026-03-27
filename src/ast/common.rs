@@ -2,8 +2,13 @@
 //!
 //! AST 是 target-dialect-aware 的语法树：它不再做控制流恢复，但要把 HIR 已经确定
 //! 的结构落成“某个目标 Lua 方言真正允许出现”的语法节点。
+//!
+//! 除了语法节点本身，这一层也会保留少量“readability 必须知道、但源码语法里看不见”
+//! 的 provenance。这样后续 pass 在做 sugar 时可以依赖前层已经确认过的结构事实，
+//! 而不是回头重新猜测。
 
 use std::fmt;
+use std::collections::BTreeSet;
 
 use crate::hir::{HirLabelId, HirProtoRef, LocalId, ParamId, TempId, UpvalueId};
 
@@ -127,6 +132,12 @@ pub struct AstFunctionExpr {
     pub params: Vec<ParamId>,
     pub is_vararg: bool,
     pub body: AstBlock,
+    /// 这份集合只记录“闭包初始化时显式 capture 了哪些当前词法绑定”。
+    ///
+    /// 它不是源码语法的一部分，而是给 readability 提供结构事实：
+    /// 如果一个函数值仍然依赖某个局部槽位，就不能把那个槽位前推消掉，
+    /// 否则像递归 local function 这种形状会失去可见声明。
+    pub captured_bindings: BTreeSet<AstBindingRef>,
 }
 
 /// 顶层/表字段函数声明。

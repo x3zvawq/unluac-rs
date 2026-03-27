@@ -26,6 +26,7 @@ fn removes_trailing_empty_return_from_module_and_function_bodies() {
                         body: AstBlock {
                             stmts: vec![AstStmt::Return(Box::new(AstReturn { values: vec![] }))],
                         },
+                        captured_bindings: Default::default(),
                     },
                 })),
                 AstStmt::Return(Box::new(AstReturn { values: vec![] })),
@@ -129,4 +130,31 @@ fn drops_unused_synthetic_locals_but_keeps_bindings_assigned_later() {
         local_decl.bindings[0].id,
         crate::ast::AstBindingRef::SyntheticLocal(assigned)
     );
+}
+
+#[test]
+fn flattens_single_return_do_block_after_inner_locals_disappear() {
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: AstBlock {
+            stmts: vec![AstStmt::DoBlock(Box::new(AstBlock {
+                stmts: vec![AstStmt::Return(Box::new(AstReturn {
+                    values: vec![AstExpr::Integer(1)],
+                }))],
+            }))],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+            options: Default::default(),
+        }
+    ));
+
+    assert!(matches!(
+        module.body.stmts.as_slice(),
+        [AstStmt::Return(ret)] if ret.values == vec![AstExpr::Integer(1)]
+    ));
 }

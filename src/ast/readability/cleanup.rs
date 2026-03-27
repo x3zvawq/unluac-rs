@@ -18,6 +18,24 @@ fn cleanup_block(block: &mut AstBlock, allow_trailing_empty_return_elision: bool
         changed |= cleanup_stmt(stmt);
     }
 
+    let old_stmts = std::mem::take(&mut block.stmts);
+    let mut flattened_stmts = Vec::with_capacity(old_stmts.len());
+    for stmt in old_stmts {
+        match stmt {
+            AstStmt::DoBlock(nested)
+                if nested.stmts.len() == 1 && can_elide_single_stmt_do_block(&nested.stmts[0]) =>
+            {
+                // 这里专门清理“只剩一条非局部作用域语句”的机械 do-end。
+                // 它通常是前层为了暂存中间 local 范围而留下来的壳；一旦内部局部已经被
+                // 其他 pass 收回，这层壳继续保留只会让源码多出无意义缩进。
+                flattened_stmts.push(nested.stmts[0].clone());
+                changed = true;
+            }
+            other => flattened_stmts.push(other),
+        }
+    }
+    block.stmts = flattened_stmts;
+
     let mechanical_binding_uses = collect_mechanical_binding_uses(block);
     for stmt in &mut block.stmts {
         let AstStmt::LocalDecl(local_decl) = stmt else {
@@ -61,6 +79,24 @@ fn cleanup_block(block: &mut AstBlock, allow_trailing_empty_return_elision: bool
     }
 
     changed
+}
+
+fn can_elide_single_stmt_do_block(stmt: &AstStmt) -> bool {
+    matches!(
+        stmt,
+        AstStmt::Assign(_)
+            | AstStmt::CallStmt(_)
+            | AstStmt::Return(_)
+            | AstStmt::If(_)
+            | AstStmt::While(_)
+            | AstStmt::Repeat(_)
+            | AstStmt::NumericFor(_)
+            | AstStmt::GenericFor(_)
+            | AstStmt::Break
+            | AstStmt::Continue
+            | AstStmt::Goto(_)
+            | AstStmt::FunctionDecl(_)
+    )
 }
 
 fn collect_mechanical_binding_uses(block: &AstBlock) -> BTreeMap<AstBindingRef, usize> {

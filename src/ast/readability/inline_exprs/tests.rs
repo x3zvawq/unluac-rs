@@ -371,6 +371,62 @@ fn does_not_inline_local_alias_into_plain_return_value() {
 }
 
 #[test]
+fn inlines_recovered_call_alias_inside_nested_return_value_expr() {
+    let alias = LocalId(0);
+    let arg = LocalId(1);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(alias),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "step".to_owned(),
+                        })),
+                        args: vec![AstExpr::Var(AstNameRef::Local(arg))],
+                    }))],
+                })),
+                AstStmt::Return(Box::new(AstReturn {
+                    values: vec![AstExpr::Binary(Box::new(AstBinaryExpr {
+                        op: AstBinaryOpKind::Add,
+                        lhs: AstExpr::Var(AstNameRef::Local(alias)),
+                        rhs: AstExpr::Integer(1),
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+    assert_eq!(
+        module.body.stmts,
+        vec![AstStmt::Return(Box::new(AstReturn {
+            values: vec![AstExpr::Binary(Box::new(AstBinaryExpr {
+                op: AstBinaryOpKind::Add,
+                lhs: AstExpr::Call(Box::new(AstCallExpr {
+                    callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                        text: "step".to_owned(),
+                    })),
+                    args: vec![AstExpr::Var(AstNameRef::Local(arg))],
+                })),
+                rhs: AstExpr::Integer(1),
+            }))],
+        }))]
+    );
+}
+
+#[test]
 fn inlines_recovered_call_alias_inside_comparison_operand() {
     let alias = LocalId(0);
     let arg = LocalId(1);
@@ -874,6 +930,7 @@ fn inlines_local_alias_inside_function_body_after_other_locals() {
                                                     ))],
                                                 }))],
                                             },
+                                            captured_bindings: Default::default(),
                                         },
                                     },
                                 )),
@@ -912,6 +969,7 @@ fn inlines_local_alias_inside_function_body_after_other_locals() {
                                 })),
                             ],
                         },
+                        captured_bindings: Default::default(),
                     },
                 ))],
             }))],
@@ -1219,6 +1277,7 @@ fn does_not_count_shadowed_nested_function_locals_as_outer_alias_uses() {
                                     },
                                 ))],
                             },
+                            captured_bindings: Default::default(),
                         },
                     ))],
                 })),

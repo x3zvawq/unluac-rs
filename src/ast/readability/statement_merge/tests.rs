@@ -304,6 +304,7 @@ fn merges_adjacent_single_value_local_decls_inside_nested_function_expr_bodies()
                                 })),
                             ],
                         },
+                        captured_bindings: Default::default(),
                     },
                 ))],
             }))],

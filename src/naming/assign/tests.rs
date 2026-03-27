@@ -498,6 +498,7 @@ fn capture_provenance_upvalue_keeps_parent_name_when_child_local_conflicts() {
                                 })),
                             ],
                         },
+                        captured_bindings: Default::default(),
                     }))],
                 })),
             ],
