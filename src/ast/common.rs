@@ -195,6 +195,7 @@ pub enum AstDialectVersion {
     Lua53,
     Lua54,
     Lua55,
+    Luau,
 }
 
 impl AstDialectVersion {
@@ -205,6 +206,7 @@ impl AstDialectVersion {
             Self::Lua53 => "lua5.3",
             Self::Lua54 => "lua5.4",
             Self::Lua55 => "lua5.5",
+            Self::Luau => "luau",
         }
     }
 }
@@ -249,6 +251,14 @@ impl AstTargetDialect {
                 local_close: true,
                 global_decl: true,
                 global_const: true,
+            },
+            AstDialectVersion::Luau => AstDialectCaps {
+                goto_label: false,
+                continue_stmt: true,
+                local_const: false,
+                local_close: false,
+                global_decl: false,
+                global_const: false,
             },
         };
         Self { version, caps }

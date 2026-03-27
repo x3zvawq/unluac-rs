@@ -18,6 +18,12 @@ use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
 const DEFAULT_SOURCE: &str = "tests/lua_cases/common/control_flow/07_branch_state_carry.lua";
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CompilerProtocol {
+    LuacStyle,
+    LuauBinaryStdout,
+}
+
 #[derive(Debug)]
 struct CliOptions {
     dialect: DecompileDialect,
@@ -313,7 +319,8 @@ fn resolve_input_path(options: &CliOptions) -> Result<PathBuf, CliError> {
 }
 
 fn compile_source(options: &CliOptions, source: &Path) -> Result<PathBuf, CliError> {
-    let luac = resolve_luac(options)?;
+    let compiler = resolve_compiler(options)?;
+    let protocol = compiler_protocol(options.dialect);
     let output_dir = repo_root()
         .join("target")
         .join("unluac-debug")
@@ -329,31 +336,62 @@ fn compile_source(options: &CliOptions, source: &Path) -> Result<PathBuf, CliErr
         .and_then(OsStr::to_str)
         .unwrap_or("index")
         .to_owned();
-    let output = output_dir.join(format!("{file_stem}.out"));
+    let output = output_dir.join(format!(
+        "{file_stem}.{}",
+        compiled_chunk_extension(options.dialect)
+    ));
 
-    let status = Command::new(&luac)
-        .arg("-s")
-        .arg("-o")
-        .arg(&output)
-        .arg(source)
-        .status()
-        .map_err(|source_error| CliError::Io {
-            action: "spawn luac",
-            path: luac.clone(),
-            source: source_error,
-        })?;
+    match protocol {
+        CompilerProtocol::LuacStyle => {
+            let status = Command::new(&compiler)
+                .arg("-s")
+                .arg("-o")
+                .arg(&output)
+                .arg(source)
+                .status()
+                .map_err(|source_error| CliError::Io {
+                    action: "spawn compiler",
+                    path: compiler.clone(),
+                    source: source_error,
+                })?;
 
-    if !status.success() {
-        return Err(CliError::Process(format!(
-            "luac exited with status {status} while compiling {}",
-            source.display()
-        )));
+            if !status.success() {
+                return Err(CliError::Process(format!(
+                    "compiler exited with status {status} while compiling {}",
+                    source.display()
+                )));
+            }
+        }
+        CompilerProtocol::LuauBinaryStdout => {
+            let command_output = Command::new(&compiler)
+                .arg("--binary")
+                .arg("-g0")
+                .arg(source)
+                .output()
+                .map_err(|source_error| CliError::Io {
+                    action: "spawn compiler",
+                    path: compiler.clone(),
+                    source: source_error,
+                })?;
+            if !command_output.status.success() {
+                return Err(CliError::Process(format!(
+                    "compiler exited with status {} while compiling {}",
+                    command_output.status,
+                    source.display()
+                )));
+            }
+            fs::write(&output, &command_output.stdout).map_err(|source_error| CliError::Io {
+                action: "write compiled chunk",
+                path: output.clone(),
+                source: source_error,
+            })?;
+        }
     }
 
     Ok(output)
 }
 
-fn resolve_luac(options: &CliOptions) -> Result<PathBuf, CliError> {
+fn resolve_compiler(options: &CliOptions) -> Result<PathBuf, CliError> {
     if let Some(path) = options.luac.as_ref() {
         return Ok(path.clone());
     }
@@ -362,7 +400,7 @@ fn resolve_luac(options: &CliOptions) -> Result<PathBuf, CliError> {
         .join("lua")
         .join("build")
         .join(options.dialect.label())
-        .join("luac");
+        .join(bundled_compiler_name(options.dialect));
     if bundled.exists() {
         return Ok(bundled);
     }
@@ -373,7 +411,41 @@ fn resolve_luac(options: &CliOptions) -> Result<PathBuf, CliError> {
         DecompileDialect::Lua53 => PathBuf::from("lua5.3"),
         DecompileDialect::Lua54 => PathBuf::from("lua5.4"),
         DecompileDialect::Lua55 => PathBuf::from("lua5.5"),
+        DecompileDialect::Luau => PathBuf::from("luau-compile"),
     })
+}
+
+fn compiler_protocol(dialect: DecompileDialect) -> CompilerProtocol {
+    match dialect {
+        DecompileDialect::Lua51
+        | DecompileDialect::Lua52
+        | DecompileDialect::Lua53
+        | DecompileDialect::Lua54
+        | DecompileDialect::Lua55 => CompilerProtocol::LuacStyle,
+        DecompileDialect::Luau => CompilerProtocol::LuauBinaryStdout,
+    }
+}
+
+fn bundled_compiler_name(dialect: DecompileDialect) -> &'static str {
+    match dialect {
+        DecompileDialect::Lua51
+        | DecompileDialect::Lua52
+        | DecompileDialect::Lua53
+        | DecompileDialect::Lua54
+        | DecompileDialect::Lua55 => "luac",
+        DecompileDialect::Luau => "luau-compile",
+    }
+}
+
+fn compiled_chunk_extension(dialect: DecompileDialect) -> &'static str {
+    match dialect {
+        DecompileDialect::Lua51
+        | DecompileDialect::Lua52
+        | DecompileDialect::Lua53
+        | DecompileDialect::Lua54
+        | DecompileDialect::Lua55 => "out",
+        DecompileDialect::Luau => "luau",
+    }
 }
 
 fn parse_dialect(value: impl AsRef<str>) -> Result<DecompileDialect, CliError> {
@@ -450,13 +522,16 @@ fn print_help() {
     println!(
         "  cargo run -- --dialect=lua5.5 --source tests/lua_cases/lua5.5/03_named_vararg_basic.lua --stop-after=hir --dump=hir"
     );
+    println!(
+        "  cargo run -- --dialect=luau --source tests/lua_cases/luau/01_continue_compound_pipeline.lua"
+    );
     println!("  cargo run -- --dialect=lua5.1 --input /path/to/chunk.out --detail=verbose");
     println!();
     println!("options:");
-    println!("  --dialect <lua5.1|lua5.2|lua5.3|lua5.4|lua5.5>");
+    println!("  --dialect <lua5.1|lua5.2|lua5.3|lua5.4|lua5.5|luau>");
     println!("  --input <chunk-path>");
     println!("  --source <lua-source-path>");
-    println!("  --luac <luac-path>");
+    println!("  --luac <compiler-path>");
     println!("  --encoding <utf8|gbk>");
     println!("  --decode-mode <strict|lossy>");
     println!("  --parse-mode <strict|permissive>");

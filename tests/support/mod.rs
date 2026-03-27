@@ -40,6 +40,51 @@ impl LuaCommandOutput {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum LuaCompilerProtocol {
+    LuacStyle,
+    LuauBinaryStdout,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct LuaToolchain {
+    runtime_name: &'static str,
+    compiler_name: &'static str,
+    compiler_protocol: LuaCompilerProtocol,
+    chunk_extension: &'static str,
+    can_run_compiled_chunks: bool,
+}
+
+impl LuaToolchain {
+    const fn stock_puc_lua() -> Self {
+        Self {
+            runtime_name: "lua",
+            compiler_name: "luac",
+            compiler_protocol: LuaCompilerProtocol::LuacStyle,
+            chunk_extension: "luac",
+            can_run_compiled_chunks: true,
+        }
+    }
+
+    const fn luau() -> Self {
+        Self {
+            runtime_name: "luau",
+            compiler_name: "luau-compile",
+            compiler_protocol: LuaCompilerProtocol::LuauBinaryStdout,
+            chunk_extension: "luau",
+            can_run_compiled_chunks: false,
+        }
+    }
+}
+
+fn lua_toolchain(dialect_label: &str) -> Result<LuaToolchain, String> {
+    match dialect_label {
+        "lua5.1" | "lua5.2" | "lua5.3" | "lua5.4" | "lua5.5" => Ok(LuaToolchain::stock_puc_lua()),
+        "luau" => Ok(LuaToolchain::luau()),
+        _ => Err(format!("unknown Lua dialect label: {dialect_label}")),
+    }
+}
+
 pub(crate) fn repo_relative_display(path: &Path) -> String {
     path.strip_prefix(repo_root())
         .map(|relative| relative.display().to_string())
@@ -219,7 +264,7 @@ pub(crate) fn find_unit_case_spec(
 ) -> Option<UnitCaseSpec> {
     unit_case_specs().into_iter().find(|spec| {
         spec.suite == suite
-            && spec.entry.dialect.luac_label() == dialect_label
+            && spec.entry.dialect.label() == dialect_label
             && spec.entry.path == path
     })
 }
@@ -250,8 +295,9 @@ pub(crate) fn run_lua_file(
     dialect_label: &str,
     input_path: &Path,
 ) -> Result<LuaCommandOutput, String> {
-    let lua = lua_tool_path(dialect_label, "lua")?;
-    run_command(&lua, &[input_path.as_os_str()], "lua")
+    let toolchain = lua_toolchain(dialect_label)?;
+    let runtime = lua_tool_path(dialect_label, toolchain.runtime_name)?;
+    run_command(&runtime, &[input_path.as_os_str()], toolchain.runtime_name)
 }
 
 /// 使用 vendored 的 `luac` 把一个仓库内 case 编译到 health suite 的稳定产物路径。
@@ -262,13 +308,14 @@ pub(crate) fn compile_lua_case_to_suite_artifact(
     artifact_label: &str,
     strip_debug: bool,
 ) -> Result<(PathBuf, LuaCommandOutput), String> {
+    let toolchain = lua_toolchain(dialect_label)?;
     let source = repo_root().join(source_relative);
     let output = suite_artifact_path(
         suite_label,
         dialect_label,
         artifact_label,
         source_relative,
-        "luac",
+        toolchain.chunk_extension,
     );
     let command_output = compile_lua_file_to_path(dialect_label, &source, &output, strip_debug)?;
     Ok((output, command_output))
@@ -297,7 +344,14 @@ pub(crate) fn build_case_health_baseline(
     entry: &case_manifest::LuaCaseManifestEntry,
     suite_label: &str,
 ) -> Result<CaseHealthBaseline, TestFailure> {
-    let dialect_label = entry.dialect.luac_label();
+    let dialect_label = entry.dialect.label();
+    let toolchain = lua_toolchain(dialect_label).map_err(|error| {
+        TestFailure::new(
+            FailureKind::RunSourceFailed,
+            "unknown test dialect",
+            format!("unknown test dialect {dialect_label}: {error}"),
+        )
+    })?;
     let source_output = run_lua_case(dialect_label, entry.path).map_err(|error| {
         TestFailure::new(
             FailureKind::RunSourceFailed,
@@ -350,6 +404,10 @@ pub(crate) fn build_case_health_baseline(
         ));
     }
 
+    if !toolchain.can_run_compiled_chunks {
+        return Ok(CaseHealthBaseline { source_output });
+    }
+
     let chunk_output = run_lua_file(dialect_label, &compiled_path).map_err(|error| {
         TestFailure::new(
             FailureKind::RunCompiledChunkFailed,
@@ -397,7 +455,7 @@ pub(crate) fn run_case_health(entry: &LuaCaseManifestEntry) -> Result<(), TestFa
 pub(crate) fn run_decompile_pipeline_health(
     entry: &LuaCaseManifestEntry,
 ) -> Result<(), TestFailure> {
-    let dialect_label = entry.dialect.luac_label();
+    let dialect_label = entry.dialect.label();
     let baseline = build_case_health_baseline(entry, UnitSuite::DecompilePipelineHealth.label())
         .map_err(|failure| {
             TestFailure::new(
@@ -562,36 +620,22 @@ fn compile_lua_case_inner(
 ) -> Vec<u8> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source = repo_root.join(source_relative);
-    let luac = repo_root
-        .join("lua")
-        .join("build")
-        .join(dialect_label)
-        .join("luac");
-    assert!(
-        luac.exists(),
-        "missing bundled luac for {dialect_label}: {}",
-        luac.display()
+    let toolchain = lua_toolchain(dialect_label)
+        .unwrap_or_else(|error| panic!("invalid test dialect {dialect_label}: {error}"));
+    let output = test_chunk_output_path(
+        &repo_root,
+        dialect_label,
+        &source,
+        strip_debug,
+        toolchain.chunk_extension,
     );
-
-    let output = test_chunk_output_path(&repo_root, dialect_label, &source, strip_debug);
-    fs::create_dir_all(
-        output
-            .parent()
-            .expect("test chunk output path should always have a parent"),
-    )
-    .expect("should create test chunk output directory");
-
-    let status = Command::new(&luac)
-        .args(strip_debug.then_some("-s"))
-        .arg("-o")
-        .arg(&output)
-        .arg(&source)
-        .status()
-        .expect("should spawn bundled luac for test case");
+    let command_output = compile_lua_file_to_path(dialect_label, &source, &output, strip_debug)
+        .unwrap_or_else(|error| panic!("should compile test chunk {}: {error}", source.display()));
     assert!(
-        status.success(),
-        "bundled luac failed for {} with status {status}",
-        source.display()
+        command_output.success(),
+        "bundled compiler failed for {}:\n{}",
+        source.display(),
+        command_output.render()
     );
 
     fs::read(&output).unwrap_or_else(|error| {
@@ -610,12 +654,13 @@ pub(crate) fn compile_generated_source_to_suite_artifact(
     generated_source_path: &Path,
     strip_debug: bool,
 ) -> Result<(PathBuf, LuaCommandOutput), String> {
+    let toolchain = lua_toolchain(dialect_label)?;
     let output = suite_artifact_path(
         suite_label,
         dialect_label,
         "generated-chunk",
         source_relative,
-        "luac",
+        toolchain.chunk_extension,
     );
     let command_output =
         compile_lua_file_to_path(dialect_label, generated_source_path, &output, strip_debug)?;
@@ -628,9 +673,10 @@ fn compile_lua_file_to_path(
     output: &Path,
     strip_debug: bool,
 ) -> Result<LuaCommandOutput, String> {
-    let luac = lua_tool_path(dialect_label, "luac")?;
+    let toolchain = lua_toolchain(dialect_label)?;
+    let compiler = lua_tool_path(dialect_label, toolchain.compiler_name)?;
     ensure_parent_dir(output)?;
-    run_command_with_optional_strip(&luac, source, output, strip_debug)
+    run_compiler_to_output_path(toolchain, &compiler, source, output, strip_debug)
 }
 
 #[allow(dead_code)]
@@ -639,6 +685,7 @@ fn test_chunk_output_path(
     dialect_label: &str,
     source: &Path,
     strip_debug: bool,
+    chunk_extension: &str,
 ) -> PathBuf {
     let unique = TEST_CHUNK_COUNTER.fetch_add(1, Ordering::Relaxed);
     let relative = source
@@ -650,7 +697,7 @@ fn test_chunk_output_path(
         .join(dialect_label)
         .join(if strip_debug { "stripped" } else { "debug" })
         .join(relative)
-        .with_extension(format!("{}.out", unique))
+        .with_extension(format!("{chunk_extension}.{unique}"))
 }
 
 pub(crate) fn diff_command_outputs(
@@ -768,29 +815,57 @@ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("should create directory {}: {error}", parent.display()))
 }
 
-fn run_command_with_optional_strip(
-    luac: &Path,
+fn run_compiler_to_output_path(
+    toolchain: LuaToolchain,
+    compiler: &Path,
     source: &Path,
     output: &Path,
     strip_debug: bool,
 ) -> Result<LuaCommandOutput, String> {
-    let mut command = Command::new(luac);
-    if strip_debug {
-        command.arg("-s");
+    match toolchain.compiler_protocol {
+        LuaCompilerProtocol::LuacStyle => {
+            let mut command = Command::new(compiler);
+            if strip_debug {
+                command.arg("-s");
+            }
+            command.arg("-o").arg(output).arg(source);
+            let output = command.output().map_err(|error| {
+                format!(
+                    "should spawn compiler {} for {}: {error}",
+                    compiler.display(),
+                    source.display()
+                )
+            })?;
+            Ok(LuaCommandOutput {
+                status_code: output.status.code(),
+                stdout: output.stdout,
+                stderr: output.stderr,
+            })
+        }
+        LuaCompilerProtocol::LuauBinaryStdout => {
+            let debug_level = if strip_debug { "-g0" } else { "-g2" };
+            let output_bytes = Command::new(compiler)
+                .arg("--binary")
+                .arg(debug_level)
+                .arg(source)
+                .output()
+                .map_err(|error| {
+                    format!(
+                        "should spawn compiler {} for {}: {error}",
+                        compiler.display(),
+                        source.display()
+                    )
+                })?;
+            if output_bytes.status.success() {
+                write_output_file(output, &output_bytes.stdout)?;
+            }
+            Ok(LuaCommandOutput {
+                status_code: output_bytes.status.code(),
+                stdout: output_bytes.stdout,
+                stderr: output_bytes.stderr,
+            })
+        }
     }
-    command.arg("-o").arg(output).arg(source);
-    let output = command.output().map_err(|error| {
-        format!(
-            "should spawn luac {} for {}: {error}",
-            luac.display(),
-            source.display()
-        )
-    })?;
-    Ok(LuaCommandOutput {
-        status_code: output.status.code(),
-        stdout: output.stdout,
-        stderr: output.stderr,
-    })
 }
 
 fn run_command(

@@ -61,7 +61,7 @@ fn run() -> Result<ExitKind, String> {
                 println!(
                     "{}\t{}\t{}",
                     spec.suite.label(),
-                    spec.entry.dialect.luac_label(),
+                    spec.entry.dialect.label(),
                     spec.entry.path
                 );
             }

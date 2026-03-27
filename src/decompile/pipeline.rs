@@ -12,6 +12,7 @@ use crate::hir::analyze_hir_with_timing;
 use crate::naming::assign_names;
 use crate::parser::{
     parse_lua51_chunk, parse_lua52_chunk, parse_lua53_chunk, parse_lua54_chunk, parse_lua55_chunk,
+    parse_luau_chunk,
 };
 use crate::structure::analyze_structure;
 use crate::timing::{TimingCollector, TimingReport};
@@ -60,6 +61,7 @@ impl DecompilerPipeline {
                     DecompileDialect::Lua53 => parse_lua53_chunk(bytes, options.parse),
                     DecompileDialect::Lua54 => parse_lua54_chunk(bytes, options.parse),
                     DecompileDialect::Lua55 => parse_lua55_chunk(bytes, options.parse),
+                    DecompileDialect::Luau => parse_luau_chunk(bytes, options.parse),
                 })?,
             );
         state.mark_completed(DecompileStage::Parse);
@@ -336,6 +338,7 @@ fn target_ast_dialect(dialect: DecompileDialect) -> AstTargetDialect {
         DecompileDialect::Lua53 => AstDialectVersion::Lua53,
         DecompileDialect::Lua54 => AstDialectVersion::Lua54,
         DecompileDialect::Lua55 => AstDialectVersion::Lua55,
+        DecompileDialect::Luau => AstDialectVersion::Luau,
     };
     AstTargetDialect::new(version)
 }

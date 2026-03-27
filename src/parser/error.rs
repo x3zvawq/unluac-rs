@@ -8,6 +8,8 @@ use thiserror::Error;
 /// 将 Lua 字节码解析成 raw 结构时可能产生的错误。
 #[derive(Debug, Error)]
 pub enum ParseError {
+    #[error("parser for dialect `{dialect}` is not implemented yet")]
+    UnsupportedDialect { dialect: &'static str },
     #[error(
         "unexpected end of input at offset {offset}: need {requested} bytes but only {remaining} remain"
     )]

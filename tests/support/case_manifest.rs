@@ -13,16 +13,18 @@ pub(crate) enum LuaCaseDialect {
     Lua53,
     Lua54,
     Lua55,
+    Luau,
 }
 
 impl LuaCaseDialect {
-    pub(crate) const fn luac_label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Lua51 => "lua5.1",
             Self::Lua52 => "lua5.2",
             Self::Lua53 => "lua5.3",
             Self::Lua54 => "lua5.4",
             Self::Lua55 => "lua5.5",
+            Self::Luau => "luau",
         }
     }
 
@@ -33,6 +35,7 @@ impl LuaCaseDialect {
             Self::Lua53 => Some(DecompileDialect::Lua53),
             Self::Lua54 => Some(DecompileDialect::Lua54),
             Self::Lua55 => Some(DecompileDialect::Lua55),
+            Self::Luau => Some(DecompileDialect::Luau),
         }
     }
 }
@@ -48,6 +51,13 @@ impl LuaCaseSuites {
         Self {
             case_health: true,
             decompile_pipeline_health: true,
+        }
+    }
+
+    pub(crate) const fn case_health_only() -> Self {
+        Self {
+            case_health: true,
+            decompile_pipeline_health: false,
         }
     }
 }
@@ -107,6 +117,7 @@ const PUC_LUA_GE_53: &[LuaCaseDialect] = &[
 ];
 const PUC_LUA_GE_54: &[LuaCaseDialect] = &[LuaCaseDialect::Lua54, LuaCaseDialect::Lua55];
 const PUC_LUA_GE_55: &[LuaCaseDialect] = &[LuaCaseDialect::Lua55];
+const LUAU_ONLY: &[LuaCaseDialect] = &[LuaCaseDialect::Luau];
 
 pub(crate) const ALL_CASES: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new(
@@ -445,6 +456,56 @@ pub(crate) const ALL_CASES: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/lua5.5/08_named_vararg_index_only.lua",
         PUC_LUA_GE_55,
+    ),
+    LuaCaseMatrixEntry::new_with_suites(
+        "tests/lua_cases/luau/01_continue_compound_pipeline.lua",
+        LUAU_ONLY,
+        LuaCaseSuites::case_health_only(),
+    ),
+    LuaCaseMatrixEntry::new_with_suites(
+        "tests/lua_cases/luau/02_if_expression_router.lua",
+        LUAU_ONLY,
+        LuaCaseSuites::case_health_only(),
+    ),
+    LuaCaseMatrixEntry::new_with_suites(
+        "tests/lua_cases/luau/03_interp_escape_nested.lua",
+        LUAU_ONLY,
+        LuaCaseSuites::case_health_only(),
+    ),
+    LuaCaseMatrixEntry::new_with_suites(
+        "tests/lua_cases/luau/04_typed_callback_mesh.lua",
+        LUAU_ONLY,
+        LuaCaseSuites::case_health_only(),
+    ),
+    LuaCaseMatrixEntry::new_with_suites(
+        "tests/lua_cases/luau/05_repeat_continue_funnel.lua",
+        LUAU_ONLY,
+        LuaCaseSuites::case_health_only(),
+    ),
+    LuaCaseMatrixEntry::new_with_suites(
+        "tests/lua_cases/luau/06_compound_index_side_effects.lua",
+        LUAU_ONLY,
+        LuaCaseSuites::case_health_only(),
+    ),
+    LuaCaseMatrixEntry::new_with_suites(
+        "tests/lua_cases/luau/07_generic_fold_branch.lua",
+        LUAU_ONLY,
+        LuaCaseSuites::case_health_only(),
+    ),
+    LuaCaseMatrixEntry::new_with_suites(
+        "tests/lua_cases/luau/08_optional_closure_dispatch.lua",
+        LUAU_ONLY,
+        LuaCaseSuites::case_health_only(),
+    ),
+    LuaCaseMatrixEntry::new_with_suites(
+        "tests/lua_cases/luau/09_recursive_if_interp.lua",
+        LUAU_ONLY,
+        LuaCaseSuites::case_health_only(),
+    ),
+    LuaCaseMatrixEntry::new_with_suites(
+        "tests/lua_cases/luau/10_nested_continue_closure_mesh.lua",
+        LUAU_ONLY,
+        LuaCaseSuites::case_health_only(),
     ),
 ];
 
