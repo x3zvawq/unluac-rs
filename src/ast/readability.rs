@@ -1,10 +1,13 @@
 //! AST readability：把合法 AST 收敛成更接近源码的稳定形状。
 
+mod binding_flow;
 mod branch_pretty;
 mod cleanup;
 mod field_access_sugar;
 mod function_sugar;
 mod inline_exprs;
+mod local_coalesce;
+mod loop_header_merge;
 mod materialize_temps;
 mod short_circuit_pretty;
 mod statement_merge;
@@ -75,6 +78,34 @@ const STATEMENT_MERGE_STAGE: ReadabilityStage = ReadabilityStage {
     ],
 };
 
+const LOCAL_COALESCE_STAGE: ReadabilityStage = ReadabilityStage {
+    name: "local-coalesce",
+    passes: &[
+        ReadabilityPass {
+            name: "local-coalesce",
+            apply: local_coalesce::apply,
+        },
+        ReadabilityPass {
+            name: "cleanup",
+            apply: cleanup::apply,
+        },
+    ],
+};
+
+const LOOP_HEADER_MERGE_STAGE: ReadabilityStage = ReadabilityStage {
+    name: "loop-header-merge",
+    passes: &[
+        ReadabilityPass {
+            name: "loop-header-merge",
+            apply: loop_header_merge::apply,
+        },
+        ReadabilityPass {
+            name: "cleanup",
+            apply: cleanup::apply,
+        },
+    ],
+};
+
 const CONTROL_FLOW_PRETTY_STAGE: ReadabilityStage = ReadabilityStage {
     name: "control-flow-pretty",
     passes: &[ReadabilityPass {
@@ -115,7 +146,9 @@ const TEMP_MATERIALIZE_STAGE: ReadabilityStage = ReadabilityStage {
 
 const READABILITY_STAGES: &[ReadabilityStage] = &[
     STRUCTURAL_CLEANUP_STAGE,
+    LOCAL_COALESCE_STAGE,
     STATEMENT_MERGE_STAGE,
+    LOOP_HEADER_MERGE_STAGE,
     ACCESS_SUGAR_STAGE,
     CONTROL_FLOW_PRETTY_STAGE,
     EXPR_INLINE_STAGE,

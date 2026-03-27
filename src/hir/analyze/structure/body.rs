@@ -59,6 +59,7 @@ pub(super) struct LoopStateSlot {
     pub(super) phi_id: PhiId,
     pub(super) reg: Reg,
     pub(super) temp: TempId,
+    pub(super) target: HirLValue,
     pub(super) init: HirExpr,
 }
 
@@ -166,7 +167,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             }
 
             if self.loop_by_header.contains_key(&block) && Some(block) != suppressed_loop_header {
-                current = self.lower_loop(block, stop, &mut stmts)?;
+                current = self.lower_loop(block, stop, &mut stmts, target_overrides)?;
             } else if self.branch_by_header.contains_key(&block) {
                 current = self.lower_branch(block, stop, &mut stmts, target_overrides)?;
             } else {
@@ -184,11 +185,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stmts: &mut Vec<HirStmt>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Option<BlockRef>> {
-        if let Some(next) = self.try_lower_numeric_for_init(block, stop, stmts) {
+        if let Some(next) = self.try_lower_numeric_for_init(block, stop, stmts, target_overrides) {
             return Some(next);
         }
 
-        if let Some(next) = self.try_lower_generic_for_preheader(block, stop, stmts) {
+        if let Some(next) =
+            self.try_lower_generic_for_preheader(block, stop, stmts, target_overrides)
+        {
             return Some(next);
         }
 

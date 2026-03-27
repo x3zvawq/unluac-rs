@@ -382,3 +382,70 @@ fn does_not_merge_one_shot_call_prep_alias_run() {
     let module = apply_statement_merge(&module);
     assert_eq!(module.body.stmts.len(), 4);
 }
+
+#[test]
+fn sinks_hoisted_temp_decl_into_generic_for_body_assignment() {
+    let iter_fn = LocalId(0);
+    let temp_a = TempId(0);
+    let temp_b = TempId(1);
+    let module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![
+                        AstLocalBinding {
+                            id: crate::ast::AstBindingRef::Temp(temp_a),
+                            attr: AstLocalAttr::None,
+                            origin: crate::ast::AstLocalOrigin::Recovered,
+                        },
+                        AstLocalBinding {
+                            id: crate::ast::AstBindingRef::Temp(temp_b),
+                            attr: AstLocalAttr::None,
+                            origin: crate::ast::AstLocalOrigin::Recovered,
+                        },
+                    ],
+                    values: Vec::new(),
+                })),
+                AstStmt::GenericFor(Box::new(crate::ast::AstGenericFor {
+                    bindings: vec![crate::ast::AstBindingRef::Local(LocalId(10))],
+                    iterator: vec![AstExpr::Var(AstNameRef::Local(iter_fn))],
+                    body: crate::ast::AstBlock {
+                        stmts: vec![
+                            AstStmt::Assign(Box::new(crate::ast::AstAssign {
+                                targets: vec![
+                                    AstLValue::Name(AstNameRef::Temp(temp_a)),
+                                    AstLValue::Name(AstNameRef::Temp(temp_b)),
+                                ],
+                                values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                                    callee: AstExpr::Var(AstNameRef::Local(LocalId(11))),
+                                    args: vec![AstExpr::Var(AstNameRef::Local(LocalId(10)))],
+                                }))],
+                            })),
+                            AstStmt::CallStmt(Box::new(crate::ast::AstCallStmt {
+                                call: AstCallKind::Call(Box::new(AstCallExpr {
+                                    callee: AstExpr::Var(AstNameRef::Local(LocalId(12))),
+                                    args: vec![
+                                        AstExpr::Var(AstNameRef::Temp(temp_a)),
+                                        AstExpr::Var(AstNameRef::Temp(temp_b)),
+                                    ],
+                                })),
+                            })),
+                        ],
+                    },
+                })),
+            ],
+        },
+    };
+
+    let module = apply_statement_merge(&module);
+    assert_eq!(module.body.stmts.len(), 1);
+    let AstStmt::GenericFor(generic_for) = &module.body.stmts[0] else {
+        panic!("expected generic-for after sinking hoisted temps");
+    };
+    let AstStmt::LocalDecl(local_decl) = &generic_for.body.stmts[0] else {
+        panic!("expected first loop stmt to become local decl");
+    };
+    assert_eq!(local_decl.bindings.len(), 2);
+    assert_eq!(local_decl.values.len(), 1);
+}

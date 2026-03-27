@@ -1409,6 +1409,110 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn nested_control_flow_hir_keeps_branch_carried_loop_state_without_unresolved_phi() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/04_nested_control_flow.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("nested_control_flow hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(
+            dump.contains("repeat\n              assign l2 = (l2 + 1)"),
+            "{dump}"
+        );
+        assert!(
+            dump.contains("numeric-for l0 = t6, t7, t8\n              assign l2 = (l2 + l0)"),
+            "{dump}"
+        );
+        assert!(!dump.contains("unresolved("), "{dump}");
+        assert!(!dump.contains("continue"), "{dump}");
+    }
+
+    #[test]
+    fn nested_control_flow_generate_restores_repeat_and_numeric_for_shape() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/04_nested_control_flow.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("nested_control_flow generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated.source.contains("elseif a > 5 then"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("local ok = 0"),
+            "{}",
+            generated.source
+        );
+        assert!(generated.source.contains("repeat"), "{}", generated.source);
+        assert!(
+            generated.source.contains("for i = 1, 5, 1 do"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("local result, value = fn(v)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("return ok, a > 0 and \"positive\" or \"negative\""),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local _, _,"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local value2 = 1"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("ok = value"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("continue"),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
     fn method_sugar_generate_recovers_method_decl_without_rewriting_explicit_dot_call() {
         let result = decompile(
             &compile_lua_case(

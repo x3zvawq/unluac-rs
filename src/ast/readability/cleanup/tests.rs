@@ -6,7 +6,7 @@ use crate::ast::{
     AstBlock, AstExpr, AstFunctionExpr, AstIf, AstLocalFunctionDecl, AstModule, AstReturn, AstStmt,
     AstTargetDialect,
 };
-use crate::hir::{LocalId, ParamId};
+use crate::hir::{LocalId, ParamId, TempId};
 
 use super::{ReadabilityContext, apply};
 
@@ -78,4 +78,55 @@ fn keeps_empty_return_inside_nested_control_flow_blocks() {
         ast_if.then_block.stmts.as_slice(),
         [AstStmt::Return(ret)] if ret.values.is_empty()
     ));
+}
+
+#[test]
+fn drops_unused_synthetic_locals_but_keeps_bindings_assigned_later() {
+    let unused = crate::ast::AstSyntheticLocalId(TempId(0));
+    let assigned = crate::ast::AstSyntheticLocalId(TempId(1));
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![
+                        crate::ast::AstLocalBinding {
+                            id: crate::ast::AstBindingRef::SyntheticLocal(unused),
+                            attr: crate::ast::AstLocalAttr::None,
+                            origin: crate::ast::AstLocalOrigin::Recovered,
+                        },
+                        crate::ast::AstLocalBinding {
+                            id: crate::ast::AstBindingRef::SyntheticLocal(assigned),
+                            attr: crate::ast::AstLocalAttr::None,
+                            origin: crate::ast::AstLocalOrigin::Recovered,
+                        },
+                    ],
+                    values: Vec::new(),
+                })),
+                AstStmt::Assign(Box::new(crate::ast::AstAssign {
+                    targets: vec![crate::ast::AstLValue::Name(
+                        crate::ast::AstNameRef::SyntheticLocal(assigned),
+                    )],
+                    values: vec![AstExpr::Integer(1)],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+            options: Default::default(),
+        }
+    ));
+
+    let AstStmt::LocalDecl(local_decl) = &module.body.stmts[0] else {
+        panic!("expected trimmed local decl");
+    };
+    assert_eq!(local_decl.bindings.len(), 1);
+    assert_eq!(
+        local_decl.bindings[0].id,
+        crate::ast::AstBindingRef::SyntheticLocal(assigned)
+    );
 }

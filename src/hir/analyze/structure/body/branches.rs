@@ -53,17 +53,39 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         let branch_stop =
             self.branch_stop_for_region(block, plan.then_entry, plan.else_entry, plan.merge, stop);
-        let then_block = self.lower_region(plan.then_entry, branch_stop, target_overrides)?;
+        let use_branch_value_arm_overrides = self.branch_value_needs_arm_target_overrides(block);
+        let branch_target_overrides = use_branch_value_arm_overrides
+            .then(|| self.branch_value_target_overrides(block, target_overrides));
+        let then_target_overrides = branch_target_overrides
+            .as_ref()
+            .map(|branch_target_overrides| {
+                self.branch_value_then_target_overrides(block, branch_target_overrides)
+            })
+            .unwrap_or_else(|| target_overrides.clone());
+        let else_target_overrides = branch_target_overrides
+            .as_ref()
+            .map(|branch_target_overrides| {
+                self.branch_value_else_target_overrides(block, branch_target_overrides)
+            })
+            .unwrap_or_else(|| target_overrides.clone());
+        let then_block = self.lower_region(plan.then_entry, branch_stop, &then_target_overrides)?;
         let else_block = match plan.else_entry {
             Some(else_entry) => {
-                Some(self.lower_region(else_entry, branch_stop, target_overrides)?)
+                Some(self.lower_region(else_entry, branch_stop, &else_target_overrides)?)
             }
             None => None,
         };
         stmts.push(branch_stmt(plan.cond, then_block, else_block));
         self.install_stop_boundary_value_merge_override(block, branch_stop, target_overrides);
         for header in &plan.consumed_headers {
-            self.install_branch_value_merge_overrides(*header, target_overrides);
+            let branch_value_overrides = if *header == block {
+                branch_target_overrides
+                    .clone()
+                    .unwrap_or_else(|| target_overrides.clone())
+            } else {
+                self.branch_value_target_overrides(*header, target_overrides)
+            };
+            self.install_branch_value_merge_overrides(*header, &branch_value_overrides);
         }
 
         match branch_stop {
