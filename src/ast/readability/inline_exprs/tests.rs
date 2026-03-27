@@ -1301,3 +1301,80 @@ fn does_not_count_shadowed_nested_function_locals_as_outer_alias_uses() {
         crate::ast::AstBindingRef::Local(LocalId(1))
     );
 }
+
+#[test]
+fn inlines_lookup_alias_into_adjacent_multi_return_call_callee() {
+    let funcs = LocalId(0);
+    let callee = LocalId(1);
+    let first = LocalId(2);
+    let second = LocalId(3);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(callee),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                        base: AstExpr::Var(AstNameRef::Local(funcs)),
+                        index: AstExpr::Integer(1),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![
+                        AstLocalBinding {
+                            id: crate::ast::AstBindingRef::Local(first),
+                            attr: AstLocalAttr::None,
+                            origin: crate::ast::AstLocalOrigin::Recovered,
+                        },
+                        AstLocalBinding {
+                            id: crate::ast::AstBindingRef::Local(second),
+                            attr: AstLocalAttr::None,
+                            origin: crate::ast::AstLocalOrigin::Recovered,
+                        },
+                    ],
+                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Local(callee)),
+                        args: vec![AstExpr::Integer(2)],
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+
+    assert_eq!(
+        module.body.stmts,
+        vec![AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+            bindings: vec![
+                AstLocalBinding {
+                    id: crate::ast::AstBindingRef::Local(first),
+                    attr: AstLocalAttr::None,
+                    origin: crate::ast::AstLocalOrigin::Recovered,
+                },
+                AstLocalBinding {
+                    id: crate::ast::AstBindingRef::Local(second),
+                    attr: AstLocalAttr::None,
+                    origin: crate::ast::AstLocalOrigin::Recovered,
+                },
+            ],
+            values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                callee: AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                    base: AstExpr::Var(AstNameRef::Local(funcs)),
+                    index: AstExpr::Integer(1),
+                })),
+                args: vec![AstExpr::Integer(2)],
+            }))],
+        }))]
+    );
+}

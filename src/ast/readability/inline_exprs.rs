@@ -41,7 +41,18 @@ fn rewrite_block(block: &mut AstBlock, options: ReadabilityOptions) -> bool {
             index += 1;
             continue;
         };
-        if !candidate.allows_expr(value) {
+        let policy = if matches!(candidate, InlineCandidate::LocalAlias { .. })
+            && stmt_is_alias_initializer_sink(next_stmt)
+        {
+            InlinePolicy::AliasInitializerChain
+        } else if matches!(candidate, InlineCandidate::LocalAlias { .. })
+            && stmt_is_adjacent_call_result_sink(next_stmt)
+        {
+            InlinePolicy::AdjacentCallResultCallee
+        } else {
+            InlinePolicy::Conservative
+        };
+        if !candidate.allows_expr_with_policy(value, policy) {
             new_stmts.push(old_stmts[index].clone());
             index += 1;
             continue;
@@ -53,13 +64,6 @@ fn rewrite_block(block: &mut AstBlock, options: ReadabilityOptions) -> bool {
         }
 
         let mut rewritten_next = next_stmt.clone();
-        let policy = if matches!(candidate, InlineCandidate::LocalAlias { .. })
-            && stmt_is_alias_initializer_sink(next_stmt)
-        {
-            InlinePolicy::AliasInitializerChain
-        } else {
-            InlinePolicy::Conservative
-        };
         if !rewrite_stmt_use_sites_with_policy(
             &mut rewritten_next,
             candidate,
@@ -384,6 +388,70 @@ fn stmt_is_alias_initializer_sink(stmt: &AstStmt) -> bool {
         inline_candidate(stmt),
         Some((InlineCandidate::LocalAlias { .. }, _))
     )
+}
+
+fn stmt_is_adjacent_call_result_sink(stmt: &AstStmt) -> bool {
+    match stmt {
+        AstStmt::LocalDecl(local_decl) => local_decl
+            .values
+            .iter()
+            .any(expr_contains_direct_call_callee_var),
+        AstStmt::Assign(assign) => assign.values.iter().any(expr_contains_direct_call_callee_var),
+        AstStmt::Return(ret) => ret.values.iter().any(expr_contains_direct_call_callee_var),
+        AstStmt::GlobalDecl(_)
+        | AstStmt::CallStmt(_)
+        | AstStmt::If(_)
+        | AstStmt::While(_)
+        | AstStmt::Repeat(_)
+        | AstStmt::NumericFor(_)
+        | AstStmt::GenericFor(_)
+        | AstStmt::DoBlock(_)
+        | AstStmt::FunctionDecl(_)
+        | AstStmt::LocalFunctionDecl(_)
+        | AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_) => false,
+    }
+}
+
+fn expr_contains_direct_call_callee_var(expr: &AstExpr) -> bool {
+    match expr {
+        AstExpr::Call(call) => matches!(call.callee, AstExpr::Var(_)),
+        AstExpr::MethodCall(_) => false,
+        AstExpr::FieldAccess(access) => expr_contains_direct_call_callee_var(&access.base),
+        AstExpr::IndexAccess(access) => {
+            expr_contains_direct_call_callee_var(&access.base)
+                || expr_contains_direct_call_callee_var(&access.index)
+        }
+        AstExpr::Unary(unary) => expr_contains_direct_call_callee_var(&unary.expr),
+        AstExpr::Binary(binary) => {
+            expr_contains_direct_call_callee_var(&binary.lhs)
+                || expr_contains_direct_call_callee_var(&binary.rhs)
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            expr_contains_direct_call_callee_var(&logical.lhs)
+                || expr_contains_direct_call_callee_var(&logical.rhs)
+        }
+        AstExpr::TableConstructor(table) => table.fields.iter().any(|field| match field {
+            AstTableField::Array(value) => expr_contains_direct_call_callee_var(value),
+            AstTableField::Record(record) => {
+                let key_has_call = match &record.key {
+                    AstTableKey::Name(_) => false,
+                    AstTableKey::Expr(key) => expr_contains_direct_call_callee_var(key),
+                };
+                key_has_call || expr_contains_direct_call_callee_var(&record.value)
+            }
+        }),
+        AstExpr::FunctionExpr(_)
+        | AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Var(_)
+        | AstExpr::VarArg => false,
+    }
 }
 
 fn rewrite_stmt_use_sites_with_policy(
@@ -1137,7 +1205,7 @@ impl InlineCandidate {
         }
     }
 
-    fn allows_expr(self, expr: &AstExpr) -> bool {
+    fn allows_expr_with_policy(self, expr: &AstExpr, policy: InlinePolicy) -> bool {
         match self {
             Self::TempLike(_) => is_inline_candidate_expr(expr),
             // 这里故意不把普通 local 别名放宽到所有上下文：
@@ -1150,7 +1218,10 @@ impl InlineCandidate {
             Self::LocalAlias {
                 origin: AstLocalOrigin::Recovered,
                 ..
-            } => is_access_base_inline_expr(expr) || is_recallable_inline_expr(expr),
+            } => match policy {
+                InlinePolicy::AdjacentCallResultCallee => is_lookup_inline_expr(expr),
+                _ => is_access_base_inline_expr(expr) || is_recallable_inline_expr(expr),
+            },
         }
     }
 }
@@ -1173,6 +1244,7 @@ enum InlinePolicy {
     Conservative,
     ExtendedCallChain,
     AliasInitializerChain,
+    AdjacentCallResultCallee,
 }
 
 impl InlineSite {
@@ -1223,6 +1295,9 @@ impl InlineSite {
                 InlinePolicy::AliasInitializerChain => {
                     self.allows_alias_initializer_local_alias(replacement)
                 }
+                InlinePolicy::AdjacentCallResultCallee => {
+                    self.allows_adjacent_call_result_local_alias(replacement)
+                }
             },
         }
     }
@@ -1233,6 +1308,7 @@ impl InlineSite {
                 InlinePolicy::AliasInitializerChain => {
                     Some(options.access_base_inline_max_complexity)
                 }
+                InlinePolicy::AdjacentCallResultCallee => None,
                 InlinePolicy::Conservative => None,
                 InlinePolicy::ExtendedCallChain => Some(options.access_base_inline_max_complexity),
             },
@@ -1314,6 +1390,10 @@ impl InlineSite {
             | Self::CallArgNonFinal
             | Self::CallArgFinal => false,
         }
+    }
+
+    fn allows_adjacent_call_result_local_alias(self, replacement: &AstExpr) -> bool {
+        matches!(self, Self::CallCallee) && is_lookup_inline_expr(replacement)
     }
 }
 

@@ -1877,6 +1877,112 @@ mod decompile_pipeline {
             generated.source
         );
     }
+
+    #[test]
+    fn loop_closure_break_return_hir_suppresses_exit_phi_from_break_funnel() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/29_loop_closure_break_return.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("loop_closure_break_return hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("while (l1 < p0)"), "{dump}");
+        assert!(dump.contains("if (l1 == 3)"), "{dump}");
+        assert!(!dump.contains("unresolved("), "{dump}");
+    }
+
+    #[test]
+    fn loop_closure_break_return_generate_recovers_loop_and_closure_shape() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/29_loop_closure_break_return.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("loop_closure_break_return generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated.source.contains("while ")
+                && generated.source.contains(" do")
+                && generated.source.contains("break"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("return captured + extra, i")
+                || generated.source.contains("return ok2 + b, ok")
+                || generated.source.contains("return r1_2 + p2_0, r1_1"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("[#tbl + 1] = function(")
+                || generated.source.contains("[#r1_0 + 1] = function("),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
+    fn loop_closure_break_return_debug_like_inlines_lookup_callees_into_multi_return_locals() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/29_loop_closure_break_return.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                naming: NamingOptions {
+                    mode: NamingMode::DebugLike,
+                    debug_like_include_function: true,
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("loop_closure_break_return debug-like generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated.source.contains("local r0_3, r0_4 = r0_1[1](2)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("local r0_5, r0_6 = r0_1[3](4)"),
+            "{}",
+            generated.source
+        );
+        assert!(!generated.source.contains("local r0_3 = r0_1[1]"), "{}", generated.source);
+        assert!(!generated.source.contains("local r0_5 = r0_1[3]"), "{}", generated.source);
+    }
 }
 
 fn compile_lua_case(dialect_label: &str, source_relative: &str) -> Vec<u8> {

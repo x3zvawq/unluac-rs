@@ -485,6 +485,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             };
             entry_overrides.insert(state.reg, state_expr);
         }
+        let inside_exit_blocks = self
+            .loop_state_inside_exit_blocks(candidate, exit)
+            .unwrap_or_else(|| candidate.blocks.clone());
 
         for phi in self
             .lowering
@@ -493,13 +496,30 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .iter()
             .filter(|phi| phi.block == exit)
         {
-            if !phi_has_inside_and_outside_incoming(phi, &candidate.blocks) {
-                continue;
-            }
             let Some(state) = plan.states.iter().find(|state| state.reg == phi.reg) else {
                 continue;
             };
-            let Some(exit_init) = self.loop_exit_entry_expr(phi, &candidate.blocks) else {
+            let Some(state_expr) = lvalue_as_expr(&state.target) else {
+                continue;
+            };
+            // break 先落在线性 cleanup pad、再跳到 post-loop continuation 时，
+            // exit phi 的 incoming 里会混进这些 pad block。它们虽然 CFG 上已不在
+            // `candidate.blocks` 内，但语义上仍然是 loop state 的内部出口。
+            if phi_incoming_all_within_blocks(phi, &inside_exit_blocks) {
+                if state.temp == self.lowering.bindings.phi_temps[phi.id.index()] {
+                    self.suppressed_phis.insert(phi.id);
+                } else {
+                    self.phi_overrides
+                        .entry(exit)
+                        .or_default()
+                        .insert(phi.id, state_expr);
+                }
+                continue;
+            }
+            if !phi_has_inside_and_outside_incoming(phi, &inside_exit_blocks) {
+                continue;
+            }
+            let Some(exit_init) = self.loop_exit_entry_expr(phi, &inside_exit_blocks) else {
                 continue;
             };
             // 只有当 exit phi 的“循环外初值”与当前 loop state 的初值确实是同一个语义槽位时，
@@ -513,9 +533,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 self.suppressed_phis.insert(phi.id);
                 continue;
             }
-            let Some(state_expr) = lvalue_as_expr(&state.target) else {
-                continue;
-            };
             self.phi_overrides
                 .entry(exit)
                 .or_default()
@@ -686,6 +703,31 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let target = self.lowering.cfg.instr_to_block[jump.target.index()];
         self.lower_block_prefix(post_loop, false, &BTreeMap::new())?;
         Some(target)
+    }
+
+    fn loop_state_inside_exit_blocks(
+        &self,
+        candidate: &LoopCandidate,
+        post_loop: BlockRef,
+    ) -> Option<BTreeSet<BlockRef>> {
+        let downstream_post_loop = self.normalized_post_loop_successor(post_loop);
+        let mut inside_blocks = candidate.blocks.clone();
+        for exit in candidate
+            .exits
+            .iter()
+            .copied()
+            .filter(|exit| *exit != post_loop)
+        {
+            if block_is_terminal_exit(self.lowering, exit) {
+                continue;
+            }
+            if downstream_post_loop == Some(exit) {
+                continue;
+            }
+            self.lower_break_exit_pad(exit, post_loop, downstream_post_loop)?;
+            inside_blocks.insert(exit);
+        }
+        Some(inside_blocks)
     }
 
     fn repeat_backedge_pad(
@@ -865,6 +907,12 @@ fn phi_has_inside_and_outside_incoming(
     }
 
     saw_inside && saw_outside
+}
+
+fn phi_incoming_all_within_blocks(phi: &PhiCandidate, allowed_blocks: &BTreeSet<BlockRef>) -> bool {
+    phi.incoming
+        .iter()
+        .all(|incoming| allowed_blocks.contains(&incoming.pred))
 }
 
 fn single_fixed_incoming_expr(
