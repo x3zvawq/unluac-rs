@@ -98,6 +98,7 @@ fn dummy_proto(body: HirBlock) -> crate::hir::common::HirProto {
         },
         params: Vec::new(),
         locals: vec![crate::hir::common::LocalId(0)],
+        local_debug_hints: Vec::new(),
         upvalues: Vec::new(),
         temps: vec![TempId(0), TempId(1)],
         temp_debug_locals: vec![None, None],

@@ -31,6 +31,7 @@ fn greedily_consumes_adjacent_set_list_chunks_in_single_pass() {
         },
         params: Vec::new(),
         locals: Vec::new(),
+        local_debug_hints: Vec::new(),
         upvalues: Vec::new(),
         temps: vec![table, value_a, value_b],
         temp_debug_locals: vec![None, None, None],
@@ -115,6 +116,7 @@ fn folds_set_list_with_trailing_multivalue_into_constructor_tail() {
         upvalues: Vec::new(),
         temps: Vec::new(),
         temp_debug_locals: Vec::new(),
+        local_debug_hints: Vec::new(),
         body: HirBlock {
             stmts: vec![
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
@@ -258,6 +260,7 @@ fn does_not_fold_closure_backed_record_writes_into_constructor() {
         upvalues: Vec::new(),
         temps: Vec::new(),
         temp_debug_locals: Vec::new(),
+        local_debug_hints: Vec::new(),
         body: HirBlock {
             stmts: vec![
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {

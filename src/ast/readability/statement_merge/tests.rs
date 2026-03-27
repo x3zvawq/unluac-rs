@@ -20,6 +20,7 @@ fn merges_empty_local_decl_followed_by_matching_assign() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Temp(temp),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: Vec::new(),
                 })),
@@ -47,6 +48,7 @@ fn merges_empty_local_decl_followed_by_matching_assign() {
                     temp,
                 )),
                 attr: AstLocalAttr::None,
+                origin: crate::ast::AstLocalOrigin::Recovered,
             }],
             values: vec![AstExpr::Call(Box::new(AstCallExpr {
                 callee: AstExpr::Var(AstNameRef::Local(LocalId(0))),
@@ -66,6 +68,7 @@ fn does_not_merge_when_assign_targets_do_not_match_decl_bindings() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(LocalId(0)),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: Vec::new(),
                 })),

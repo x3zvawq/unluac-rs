@@ -178,6 +178,7 @@ fn wraps_lifted_tail_with_do_block_when_branch_declares_local() {
                             bindings: vec![AstLocalBinding {
                                 id: crate::ast::AstBindingRef::Local(local),
                                 attr: crate::ast::AstLocalAttr::None,
+                                origin: crate::ast::AstLocalOrigin::Recovered,
                             }],
                             values: vec![AstExpr::Integer(1)],
                         })),

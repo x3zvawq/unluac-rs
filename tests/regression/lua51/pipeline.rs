@@ -1216,6 +1216,11 @@ mod decompile_pipeline {
             "{}",
             generated.source
         );
+        assert!(
+            generated.source.contains("print(\"self\", fn(tbl) == tbl)"),
+            "{}",
+            generated.source
+        );
     }
 
     #[test]

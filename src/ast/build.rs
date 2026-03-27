@@ -399,7 +399,11 @@ impl<'a> AstLowerer<'a> {
         }
     }
 
-    fn recovered_local_binding(&self, binding: AstBindingRef, attr: AstLocalAttr) -> AstLocalBinding {
+    fn recovered_local_binding(
+        &self,
+        binding: AstBindingRef,
+        attr: AstLocalAttr,
+    ) -> AstLocalBinding {
         AstLocalBinding {
             id: binding,
             attr,

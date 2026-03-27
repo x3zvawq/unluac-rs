@@ -36,6 +36,7 @@ fn lowers_field_function_assignment_into_method_decl_when_method_call_evidence_e
                     bindings: vec![AstLocalBinding {
                         id: AstBindingRef::Local(LocalId(0)),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::TableConstructor(Box::new(AstTableConstructor {
                         fields: Vec::new(),

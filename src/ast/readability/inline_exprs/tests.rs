@@ -28,6 +28,7 @@ fn inlines_safe_expr_into_single_return_within_threshold() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Temp(temp),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: Vec::new(),
                 })),
@@ -278,6 +279,7 @@ fn inlines_single_use_local_alias_into_call_callee_with_access_base_threshold() 
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(alias),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
                         base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
@@ -339,6 +341,7 @@ fn does_not_inline_local_alias_into_plain_return_value() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(alias),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
                         base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
@@ -368,6 +371,129 @@ fn does_not_inline_local_alias_into_plain_return_value() {
 }
 
 #[test]
+fn inlines_recovered_call_alias_inside_comparison_operand() {
+    let alias = LocalId(0);
+    let arg = LocalId(1);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(alias),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "fn".to_owned(),
+                        })),
+                        args: vec![AstExpr::Var(AstNameRef::Local(arg))],
+                    }))],
+                })),
+                AstStmt::CallStmt(Box::new(crate::ast::AstCallStmt {
+                    call: AstCallKind::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "print".to_owned(),
+                        })),
+                        args: vec![
+                            AstExpr::String("self".to_owned()),
+                            AstExpr::Binary(Box::new(AstBinaryExpr {
+                                op: AstBinaryOpKind::Eq,
+                                lhs: AstExpr::Var(AstNameRef::Local(alias)),
+                                rhs: AstExpr::Var(AstNameRef::Local(arg)),
+                            })),
+                        ],
+                    })),
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+    assert_eq!(
+        module.body.stmts,
+        vec![AstStmt::CallStmt(Box::new(crate::ast::AstCallStmt {
+            call: AstCallKind::Call(Box::new(AstCallExpr {
+                callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                    text: "print".to_owned(),
+                })),
+                args: vec![
+                    AstExpr::String("self".to_owned()),
+                    AstExpr::Binary(Box::new(AstBinaryExpr {
+                        op: AstBinaryOpKind::Eq,
+                        lhs: AstExpr::Call(Box::new(AstCallExpr {
+                            callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                                text: "fn".to_owned(),
+                            })),
+                            args: vec![AstExpr::Var(AstNameRef::Local(arg))],
+                        })),
+                        rhs: AstExpr::Var(AstNameRef::Local(arg)),
+                    })),
+                ],
+            })),
+        }))]
+    );
+}
+
+#[test]
+fn does_not_inline_debug_hinted_call_alias_inside_comparison_operand() {
+    let alias = LocalId(0);
+    let arg = LocalId(1);
+    let original = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(alias),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::DebugHinted,
+                    }],
+                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "fn".to_owned(),
+                        })),
+                        args: vec![AstExpr::Var(AstNameRef::Local(arg))],
+                    }))],
+                })),
+                AstStmt::CallStmt(Box::new(crate::ast::AstCallStmt {
+                    call: AstCallKind::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "print".to_owned(),
+                        })),
+                        args: vec![
+                            AstExpr::String("self".to_owned()),
+                            AstExpr::Binary(Box::new(AstBinaryExpr {
+                                op: AstBinaryOpKind::Eq,
+                                lhs: AstExpr::Var(AstNameRef::Local(alias)),
+                                rhs: AstExpr::Var(AstNameRef::Local(arg)),
+                            })),
+                        ],
+                    })),
+                })),
+            ],
+        },
+    };
+    let mut module = original.clone();
+
+    assert!(!apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+    assert_eq!(module, original);
+}
+
+#[test]
 fn collapses_adjacent_local_alias_run_into_final_call_stmt() {
     let print_alias = LocalId(0);
     let label_alias = LocalId(1);
@@ -380,6 +506,7 @@ fn collapses_adjacent_local_alias_run_into_final_call_stmt() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(print_alias),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::Var(AstNameRef::Global(AstGlobalName {
                         text: "print".to_owned(),
@@ -389,6 +516,7 @@ fn collapses_adjacent_local_alias_run_into_final_call_stmt() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(label_alias),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::String("nested-closure".to_owned())],
                 })),
@@ -396,6 +524,7 @@ fn collapses_adjacent_local_alias_run_into_final_call_stmt() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(stage_alias),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::Call(Box::new(AstCallExpr {
                         callee: AstExpr::Var(AstNameRef::Local(LocalId(3))),
@@ -459,6 +588,7 @@ fn does_not_collapse_single_call_chain_alias_before_final_call_stmt() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(stage1),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::Call(Box::new(AstCallExpr {
                         callee: AstExpr::Var(AstNameRef::Local(LocalId(2))),
@@ -469,6 +599,7 @@ fn does_not_collapse_single_call_chain_alias_before_final_call_stmt() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(stage2),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::Call(Box::new(AstCallExpr {
                         callee: AstExpr::Var(AstNameRef::Local(stage1)),
@@ -522,6 +653,7 @@ fn collapses_indexed_call_alias_run_back_into_final_print_args() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(table_local),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::Call(Box::new(AstCallExpr {
                         callee: AstExpr::Var(AstNameRef::Local(LocalId(20))),
@@ -532,6 +664,7 @@ fn collapses_indexed_call_alias_run_back_into_final_print_args() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(item1),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::IndexAccess(Box::new(AstIndexAccess {
                         base: AstExpr::Var(AstNameRef::Local(table_local)),
@@ -542,6 +675,7 @@ fn collapses_indexed_call_alias_run_back_into_final_print_args() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(value1),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::Call(Box::new(AstCallExpr {
                         callee: AstExpr::Var(AstNameRef::Local(item1)),
@@ -552,6 +686,7 @@ fn collapses_indexed_call_alias_run_back_into_final_print_args() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(item2),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::IndexAccess(Box::new(AstIndexAccess {
                         base: AstExpr::Var(AstNameRef::Local(table_local)),
@@ -562,6 +697,7 @@ fn collapses_indexed_call_alias_run_back_into_final_print_args() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(value2),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::Call(Box::new(AstCallExpr {
                         callee: AstExpr::Var(AstNameRef::Local(item2)),
@@ -572,6 +708,7 @@ fn collapses_indexed_call_alias_run_back_into_final_print_args() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(item3),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::IndexAccess(Box::new(AstIndexAccess {
                         base: AstExpr::Var(AstNameRef::Local(table_local)),
@@ -582,6 +719,7 @@ fn collapses_indexed_call_alias_run_back_into_final_print_args() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(value3),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::Call(Box::new(AstCallExpr {
                         callee: AstExpr::Var(AstNameRef::Local(item3)),
@@ -592,6 +730,7 @@ fn collapses_indexed_call_alias_run_back_into_final_print_args() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(item4),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::IndexAccess(Box::new(AstIndexAccess {
                         base: AstExpr::Var(AstNameRef::Local(table_local)),
@@ -635,6 +774,7 @@ fn collapses_indexed_call_alias_run_back_into_final_print_args() {
                 bindings: vec![AstLocalBinding {
                     id: crate::ast::AstBindingRef::Local(table_local),
                     attr: AstLocalAttr::None,
+                    origin: crate::ast::AstLocalOrigin::Recovered,
                 }],
                 values: vec![AstExpr::Call(Box::new(AstCallExpr {
                     callee: AstExpr::Var(AstNameRef::Local(LocalId(20))),
@@ -698,6 +838,7 @@ fn inlines_local_alias_inside_function_body_after_other_locals() {
                 bindings: vec![AstLocalBinding {
                     id: crate::ast::AstBindingRef::Local(LocalId(10)),
                     attr: AstLocalAttr::None,
+                    origin: crate::ast::AstLocalOrigin::Recovered,
                 }],
                 values: vec![AstExpr::FunctionExpr(Box::new(
                     crate::ast::AstFunctionExpr {
@@ -710,6 +851,7 @@ fn inlines_local_alias_inside_function_body_after_other_locals() {
                                     bindings: vec![AstLocalBinding {
                                         id: crate::ast::AstBindingRef::Local(table_local),
                                         attr: AstLocalAttr::None,
+                                        origin: crate::ast::AstLocalOrigin::Recovered,
                                     }],
                                     values: vec![AstExpr::TableConstructor(Box::new(
                                         crate::ast::AstTableConstructor { fields: vec![] },
@@ -739,6 +881,7 @@ fn inlines_local_alias_inside_function_body_after_other_locals() {
                                     bindings: vec![AstLocalBinding {
                                         id: crate::ast::AstBindingRef::Local(ok),
                                         attr: AstLocalAttr::None,
+                                        origin: crate::ast::AstLocalOrigin::Recovered,
                                     }],
                                     values: vec![AstExpr::Boolean(true)],
                                 })),
@@ -746,6 +889,7 @@ fn inlines_local_alias_inside_function_body_after_other_locals() {
                                     bindings: vec![AstLocalBinding {
                                         id: crate::ast::AstBindingRef::Local(concat),
                                         attr: AstLocalAttr::None,
+                                        origin: crate::ast::AstLocalOrigin::Recovered,
                                     }],
                                     values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
                                         base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
@@ -817,6 +961,7 @@ fn folds_access_base_alias_into_adjacent_local_alias_initializer_chain() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(unpack_alias),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
                         base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
@@ -829,6 +974,7 @@ fn folds_access_base_alias_into_adjacent_local_alias_initializer_chain() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(fn_alias),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::LogicalOr(Box::new(crate::ast::AstLogicalExpr {
                         lhs: AstExpr::Var(AstNameRef::Local(unpack_alias)),
@@ -859,6 +1005,7 @@ fn folds_access_base_alias_into_adjacent_local_alias_initializer_chain() {
                 bindings: vec![AstLocalBinding {
                     id: crate::ast::AstBindingRef::Local(fn_alias),
                     attr: AstLocalAttr::None,
+                    origin: crate::ast::AstLocalOrigin::Recovered,
                 }],
                 values: vec![AstExpr::LogicalOr(Box::new(crate::ast::AstLogicalExpr {
                     lhs: AstExpr::FieldAccess(Box::new(AstFieldAccess {
@@ -891,6 +1038,7 @@ fn does_not_count_shadowed_nested_function_locals_as_outer_alias_uses() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(outer_alias),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
                         base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
@@ -903,6 +1051,7 @@ fn does_not_count_shadowed_nested_function_locals_as_outer_alias_uses() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(LocalId(1)),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::LogicalOr(Box::new(crate::ast::AstLogicalExpr {
                         lhs: AstExpr::Var(AstNameRef::Local(outer_alias)),
@@ -915,6 +1064,7 @@ fn does_not_count_shadowed_nested_function_locals_as_outer_alias_uses() {
                     bindings: vec![AstLocalBinding {
                         id: crate::ast::AstBindingRef::Local(LocalId(2)),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::FunctionExpr(Box::new(
                         crate::ast::AstFunctionExpr {
@@ -927,6 +1077,7 @@ fn does_not_count_shadowed_nested_function_locals_as_outer_alias_uses() {
                                         bindings: vec![AstLocalBinding {
                                             id: crate::ast::AstBindingRef::Local(LocalId(0)),
                                             attr: AstLocalAttr::None,
+                                            origin: crate::ast::AstLocalOrigin::Recovered,
                                         }],
                                         values: vec![AstExpr::Integer(1)],
                                     },

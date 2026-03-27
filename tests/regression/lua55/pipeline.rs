@@ -437,11 +437,7 @@ mod decompile_pipeline {
             "{}",
             generated.source
         );
-        assert!(
-            !generated.source.contains(".next("),
-            "{}",
-            generated.source
-        );
+        assert!(!generated.source.contains(".next("), "{}", generated.source);
         assert!(
             generated.source.contains("value = value2 + (result or 1)"),
             "{}",

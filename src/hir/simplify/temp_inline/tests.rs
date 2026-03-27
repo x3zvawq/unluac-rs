@@ -146,6 +146,7 @@ fn does_not_inline_temp_into_nested_return_base_access() {
 fn does_not_inline_self_referential_loop_state_update_into_following_call() {
     let mut proto = HirProto {
         locals: vec![LocalId(0)],
+        local_debug_hints: Vec::new(),
         ..dummy_proto(HirBlock {
             stmts: vec![HirStmt::NumericFor(Box::new(HirNumericFor {
                 binding: LocalId(0),
@@ -510,6 +511,7 @@ fn does_not_inline_temp_into_closure_capture() {
     let mut proto = HirProto {
         temps: vec![TempId(0)],
         temp_debug_locals: vec![None],
+        local_debug_hints: Vec::new(),
         ..dummy_proto(HirBlock {
             stmts: vec![
                 HirStmt::Assign(Box::new(HirAssign {
@@ -565,6 +567,7 @@ fn dummy_proto(body: HirBlock) -> HirProto {
         },
         params: Vec::new(),
         locals: Vec::new(),
+        local_debug_hints: Vec::new(),
         upvalues: Vec::new(),
         temps: vec![TempId(0), TempId(1)],
         temp_debug_locals: vec![None, None],
@@ -610,6 +613,7 @@ fn inlines_single_use_temps_into_numeric_for_header() {
     let mut proto = HirProto {
         temps: vec![TempId(0), TempId(1), TempId(2)],
         locals: vec![LocalId(0)],
+        local_debug_hints: Vec::new(),
         temp_debug_locals: vec![None, None, None],
         ..dummy_proto(HirBlock {
             stmts: vec![

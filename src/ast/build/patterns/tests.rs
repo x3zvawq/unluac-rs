@@ -32,6 +32,7 @@ fn lower_ast_recovers_method_call_from_field_alias_before_call() {
             upvalues: Vec::new(),
             temps: Vec::new(),
             temp_debug_locals: Vec::new(),
+            local_debug_hints: Vec::new(),
             body: HirBlock {
                 stmts: vec![
                     HirStmt::LocalDecl(Box::new(HirLocalDecl {

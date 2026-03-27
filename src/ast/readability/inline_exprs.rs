@@ -371,12 +371,10 @@ fn inline_candidate_from_local_decl(
     }
     let candidate = match binding.id {
         AstBindingRef::Temp(_) => InlineCandidate::TempLike(binding.id),
-        AstBindingRef::Local(_) | AstBindingRef::SyntheticLocal(_) => {
-            InlineCandidate::LocalAlias {
-                binding: binding.id,
-                origin: binding.origin,
-            }
-        }
+        AstBindingRef::Local(_) | AstBindingRef::SyntheticLocal(_) => InlineCandidate::LocalAlias {
+            binding: binding.id,
+            origin: binding.origin,
+        },
     };
     Some((candidate, value))
 }
@@ -1199,24 +1197,22 @@ impl InlineSite {
                     || is_access_base_inline_expr(replacement)
             }
             InlineCandidate::LocalAlias { origin, .. } => match policy {
-                InlinePolicy::Conservative => {
-                    match origin {
-                        AstLocalOrigin::DebugHinted => {
-                            matches!(self, Self::CallCallee | Self::AccessBase)
-                                && is_access_base_inline_expr(replacement)
-                        }
-                        AstLocalOrigin::Recovered => match self {
-                            Self::CallCallee | Self::AccessBase => {
-                                is_access_base_inline_expr(replacement)
-                            }
-                            Self::ComparisonOperand => {
-                                is_access_base_inline_expr(replacement)
-                                    || is_recallable_inline_expr(replacement)
-                            }
-                            _ => false,
-                        },
+                InlinePolicy::Conservative => match origin {
+                    AstLocalOrigin::DebugHinted => {
+                        matches!(self, Self::CallCallee | Self::AccessBase)
+                            && is_access_base_inline_expr(replacement)
                     }
-                }
+                    AstLocalOrigin::Recovered => match self {
+                        Self::CallCallee | Self::AccessBase => {
+                            is_access_base_inline_expr(replacement)
+                        }
+                        Self::ComparisonOperand => {
+                            is_access_base_inline_expr(replacement)
+                                || is_recallable_inline_expr(replacement)
+                        }
+                        _ => false,
+                    },
+                },
                 InlinePolicy::ExtendedCallChain => self.allows_extended_local_alias(replacement),
                 InlinePolicy::AliasInitializerChain => {
                     self.allows_alias_initializer_local_alias(replacement)
@@ -1263,7 +1259,8 @@ impl InlineSite {
         match self {
             Self::Neutral => is_extended_neutral_local_alias_expr(replacement),
             Self::ComparisonOperand => {
-                is_extended_neutral_local_alias_expr(replacement) || is_recallable_inline_expr(replacement)
+                is_extended_neutral_local_alias_expr(replacement)
+                    || is_recallable_inline_expr(replacement)
             }
             Self::CallCallee => is_call_callee_inline_expr(replacement),
             Self::CallArgNonFinal => {

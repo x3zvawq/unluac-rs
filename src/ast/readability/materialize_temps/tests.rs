@@ -19,6 +19,7 @@ fn materializes_remaining_temps_into_synthetic_locals() {
                     bindings: vec![AstLocalBinding {
                         id: AstBindingRef::Temp(temp),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::Boolean(true)],
                 })),

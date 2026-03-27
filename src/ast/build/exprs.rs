@@ -45,7 +45,9 @@ impl<'a> AstLowerer<'a> {
                 .bindings
                 .iter()
                 .copied()
-                .map(|binding| self.lower_local_binding(proto_index, binding, crate::ast::AstLocalAttr::None))
+                .map(|binding| {
+                    self.lower_local_binding(proto_index, binding, crate::ast::AstLocalAttr::None)
+                })
                 .collect(),
             values: local_decl
                 .values

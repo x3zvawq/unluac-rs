@@ -144,10 +144,9 @@ impl<'a> AstLowerer<'a> {
         }
         Ok(Some((
             AstStmt::LocalDecl(Box::new(AstLocalDecl {
-                bindings: vec![self.recovered_local_binding(
-                    AstBindingRef::Temp(*temp),
-                    AstLocalAttr::Close,
-                )],
+                bindings: vec![
+                    self.recovered_local_binding(AstBindingRef::Temp(*temp), AstLocalAttr::Close),
+                ],
                 values: vec![self.lower_expr(proto_index, &assign.values[0])?],
             })),
             2,

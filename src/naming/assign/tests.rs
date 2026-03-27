@@ -104,6 +104,7 @@ fn heuristic_mode_prefers_field_shape_for_local_chain() {
         },
         params: vec![ParamId(0), ParamId(1), ParamId(2), ParamId(3)],
         locals: vec![LocalId(0), LocalId(1)],
+        local_debug_hints: Vec::new(),
         upvalues: Vec::new(),
         temps: Vec::new(),
         temp_debug_locals: Vec::new(),
@@ -122,6 +123,7 @@ fn heuristic_mode_prefers_field_shape_for_local_chain() {
                     bindings: vec![AstLocalBinding {
                         id: AstBindingRef::Local(LocalId(0)),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::IndexAccess(Box::new(AstIndexAccess {
                         base: AstExpr::FieldAccess(Box::new(AstFieldAccess {
@@ -135,6 +137,7 @@ fn heuristic_mode_prefers_field_shape_for_local_chain() {
                     bindings: vec![AstLocalBinding {
                         id: AstBindingRef::Local(LocalId(1)),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::IndexAccess(Box::new(AstIndexAccess {
                         base: AstExpr::FieldAccess(Box::new(AstFieldAccess {
@@ -189,6 +192,7 @@ fn debug_like_mode_uses_function_qualified_binding_ids() {
         upvalues: Vec::new(),
         temps: vec![TempId(0)],
         temp_debug_locals: vec![None],
+        local_debug_hints: Vec::new(),
         body: HirBlock::default(),
         children: Vec::new(),
     };
@@ -204,6 +208,7 @@ fn debug_like_mode_uses_function_qualified_binding_ids() {
                     bindings: vec![AstLocalBinding {
                         id: AstBindingRef::Local(LocalId(2)),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::Nil],
                 })),
@@ -211,6 +216,7 @@ fn debug_like_mode_uses_function_qualified_binding_ids() {
                     bindings: vec![AstLocalBinding {
                         id: AstBindingRef::SyntheticLocal(AstSyntheticLocalId(TempId(0))),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::Var(crate::ast::AstNameRef::Local(LocalId(2)))],
                 })),
@@ -266,6 +272,7 @@ fn simple_mode_uses_underscore_for_unused_synthetic_local() {
         },
         params: Vec::new(),
         locals: Vec::new(),
+        local_debug_hints: Vec::new(),
         upvalues: Vec::new(),
         temps: vec![TempId(0), TempId(1)],
         temp_debug_locals: vec![None, None],
@@ -285,10 +292,12 @@ fn simple_mode_uses_underscore_for_unused_synthetic_local() {
                         AstLocalBinding {
                             id: AstBindingRef::SyntheticLocal(AstSyntheticLocalId(TempId(0))),
                             attr: AstLocalAttr::None,
+                            origin: crate::ast::AstLocalOrigin::Recovered,
                         },
                         AstLocalBinding {
                             id: AstBindingRef::SyntheticLocal(AstSyntheticLocalId(TempId(1))),
                             attr: AstLocalAttr::None,
+                            origin: crate::ast::AstLocalOrigin::Recovered,
                         },
                     ],
                     values: vec![AstExpr::Nil, AstExpr::Integer(1)],
@@ -341,6 +350,7 @@ fn debug_like_mode_still_uses_self_for_method_receiver_param() {
         },
         params: vec![ParamId(0), ParamId(1)],
         locals: Vec::new(),
+        local_debug_hints: Vec::new(),
         upvalues: Vec::new(),
         temps: Vec::new(),
         temp_debug_locals: Vec::new(),
@@ -394,6 +404,7 @@ fn capture_provenance_upvalue_keeps_parent_name_when_child_local_conflicts() {
         },
         params: Vec::new(),
         locals: vec![LocalId(0)],
+        local_debug_hints: Vec::new(),
         upvalues: Vec::new(),
         temps: Vec::new(),
         temp_debug_locals: Vec::new(),
@@ -430,6 +441,7 @@ fn capture_provenance_upvalue_keeps_parent_name_when_child_local_conflicts() {
         },
         params: Vec::new(),
         locals: vec![LocalId(0)],
+        local_debug_hints: Vec::new(),
         upvalues: vec![UpvalueId(0)],
         temps: Vec::new(),
         temp_debug_locals: Vec::new(),
@@ -458,6 +470,7 @@ fn capture_provenance_upvalue_keeps_parent_name_when_child_local_conflicts() {
                     bindings: vec![AstLocalBinding {
                         id: AstBindingRef::Local(LocalId(0)),
                         attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
                     }],
                     values: vec![AstExpr::Nil],
                 })),
@@ -472,6 +485,7 @@ fn capture_provenance_upvalue_keeps_parent_name_when_child_local_conflicts() {
                                     bindings: vec![AstLocalBinding {
                                         id: AstBindingRef::Local(LocalId(0)),
                                         attr: AstLocalAttr::None,
+                                        origin: crate::ast::AstLocalOrigin::Recovered,
                                     }],
                                     values: vec![AstExpr::Var(crate::ast::AstNameRef::Upvalue(
                                         UpvalueId(0),

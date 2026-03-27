@@ -169,6 +169,7 @@ fn dummy_proto(body: HirBlock) -> HirProto {
         },
         params: Vec::new(),
         locals: Vec::new(),
+        local_debug_hints: Vec::new(),
         upvalues: Vec::new(),
         temps: vec![TempId(0), TempId(1), TempId(2), TempId(3)],
         temp_debug_locals: vec![None, None, None, None],
