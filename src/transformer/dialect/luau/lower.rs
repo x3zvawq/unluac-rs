@@ -4,7 +4,7 @@
 //! 折进 raw 层了；这里专注做语义恢复，把它翻成项目里既有的 CFG/HIR/AST 管线能理解
 //! 的稳定 low-IR 契约。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::parser::{
     DialectConstPoolExtra, DialectInstrExtra, DialectProtoExtra, LuauCaptureKind, LuauConstEntry,
@@ -66,7 +66,6 @@ struct ProtoLowerer<'a> {
     raw_to_low: Vec<Vec<InstrRef>>,
     pending_methods: Vec<Option<Reg>>,
     raw_pc_to_index: BTreeMap<u32, usize>,
-    targeted_raw_indices: BTreeSet<usize>,
     raw_word_count: usize,
 }
 
@@ -136,49 +135,6 @@ impl<'a> ProtoLowerer<'a> {
             raw_word_count = raw_word_count.max((pc + u32::from(word_len(instr))) as usize);
         }
 
-        let mut targeted_raw_indices = BTreeSet::new();
-        for instr in &raw.common.instructions {
-            let (opcode, operands, extra) = decode_luau(instr);
-            let raw_pc = extra.pc;
-            let target_pc = match opcode {
-                LuauOpcode::Jump
-                | LuauOpcode::JumpBack
-                | LuauOpcode::JumpIf
-                | LuauOpcode::JumpIfNot
-                | LuauOpcode::JumpIfEq
-                | LuauOpcode::JumpIfLe
-                | LuauOpcode::JumpIfLt
-                | LuauOpcode::JumpIfNotEq
-                | LuauOpcode::JumpIfNotLe
-                | LuauOpcode::JumpIfNotLt
-                | LuauOpcode::JumpXEqKNil
-                | LuauOpcode::JumpXEqKB
-                | LuauOpcode::JumpXEqKN
-                | LuauOpcode::JumpXEqKS
-                | LuauOpcode::ForNPrep
-                | LuauOpcode::ForNLoop
-                | LuauOpcode::ForGLoop
-                | LuauOpcode::ForGPrep
-                | LuauOpcode::ForGPrepInext
-                | LuauOpcode::ForGPrepNext => {
-                    let Ok((_, d)) = expect_ad(raw_pc, opcode, operands) else {
-                        unreachable!("jump-like luau opcode should always decode as AD");
-                    };
-                    Some(i64::from(raw_pc) + 1 + i64::from(d))
-                }
-                _ => None,
-            };
-            let Some(target_pc) = target_pc else {
-                continue;
-            };
-            if target_pc < 0 {
-                continue;
-            }
-            if let Some(raw_index) = raw_pc_to_index.get(&(target_pc as u32)) {
-                targeted_raw_indices.insert(*raw_index);
-            }
-        }
-
         Self {
             raw,
             emitted: Vec::new(),
@@ -186,7 +142,6 @@ impl<'a> ProtoLowerer<'a> {
             raw_to_low: vec![Vec::new(); raw_instr_count],
             pending_methods: vec![None; method_slots],
             raw_pc_to_index,
-            targeted_raw_indices,
             raw_word_count,
         }
     }
@@ -1461,41 +1416,19 @@ impl<'a> ProtoLowerer<'a> {
 
     fn fold_single_result_call_move(
         &self,
-        raw_index: usize,
+        _raw_index: usize,
         call_a: u8,
         call_c: u8,
     ) -> Result<(ResultPack, Option<usize>), TransformError> {
-        if call_c != 2 {
-            return Ok((call_result_pack(call_a, u16::from(call_c)), None));
-        }
-
-        let Some(next_raw) = self.raw.common.instructions.get(raw_index + 1) else {
-            return Ok((call_result_pack(call_a, u16::from(call_c)), None));
-        };
-        if self.targeted_raw_indices.contains(&(raw_index + 1)) {
-            return Ok((call_result_pack(call_a, u16::from(call_c)), None));
-        }
-        let (next_opcode, next_operands, _) = decode_luau(next_raw);
-        if next_opcode != LuauOpcode::Move {
-            return Ok((call_result_pack(call_a, u16::from(call_c)), None));
-        }
-        let (_, move_src) = expect_ab(
-            raw_pc_at(self.raw, raw_index + 1),
-            next_opcode,
-            next_operands,
-        )?;
-        if move_src != call_a {
-            return Ok((call_result_pack(call_a, u16::from(call_c)), None));
-        }
-        let (move_dst, _) = expect_ab(
-            raw_pc_at(self.raw, raw_index + 1),
-            next_opcode,
-            next_operands,
-        )?;
-        Ok((
-            ResultPack::Fixed(RegRange::new(reg_from_u8(move_dst), 1)),
-            Some(raw_index + 1),
-        ))
+        // Luau 的单结果调用常见形状是 `CALL A ...; MOVE dst, A`。
+        //
+        // 这里如果把后面的 MOVE 折进 CALL，low-IR 就会错误地宣称“结果只定义在 dst”，
+        // 但 VM 语义上结果其实仍然留在寄存器 A 里，后续代码完全可能继续读取 A。
+        // `nested_closure_factory` / `multi_assign_rotation` 这类 common case 正是因此把
+        // “刚产生的闭包/旋转值”读回成旧值。相比之下，保留真实的 CALL + MOVE 形状虽然
+        // 机械一点，但能让 dataflow/SSA 忠实看到两个寄存器身份，后面的 simplify 再去
+        // 按需收敛就安全得多。
+        Ok((call_result_pack(call_a, u16::from(call_c)), None))
     }
 
     fn jump_target(&self, raw_pc: u32, offset: i32) -> Result<usize, TransformError> {

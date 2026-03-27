@@ -160,6 +160,14 @@ impl<'a> AstLowerer<'a> {
                 continue;
             }
 
+            if let Some((group, consumed)) =
+                self.try_lower_single_value_final_call_arg_stmt(proto_index, &block.stmts, index)?
+            {
+                stmts.extend(group);
+                index += consumed;
+                continue;
+            }
+
             if let Some((stmt, consumed)) =
                 self.try_lower_temp_close_decl(proto_index, &block.stmts, index)?
             {

@@ -80,7 +80,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             self.visited.insert(continue_target);
         }
         let mut cond = self.lower_branch_cond_for_target(candidate.header, body_entry)?;
-        rewrite_expr_temps(&mut cond, &temp_expr_overrides(&combined_target_overrides));
+        let mut cond_expr_overrides = self.block_prefix_temp_expr_overrides(candidate.header);
+        cond_expr_overrides.extend(temp_expr_overrides(&combined_target_overrides));
+        rewrite_expr_temps(&mut cond, &cond_expr_overrides);
         stmts.push(HirStmt::While(Box::new(HirWhile { cond, body })));
 
         Some(Some(exit))
@@ -593,8 +595,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return target;
         }
 
-        self.uniform_loop_exit_target_override(candidate, exit, reg, target_overrides)
-            .unwrap_or(HirLValue::Temp(temp))
+        if let Some(target) =
+            self.uniform_loop_exit_target_override(candidate, exit, reg, target_overrides)
+        {
+            return target;
+        }
+
+        HirLValue::Temp(temp)
     }
 
     fn uniform_loop_header_target_override(
@@ -866,6 +873,40 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 )
             })
             .collect()
+    }
+
+    fn block_prefix_temp_expr_overrides(&self, block: BlockRef) -> BTreeMap<TempId, HirExpr> {
+        let range = self.lowering.cfg.blocks[block.index()].instrs;
+        if range.is_empty() {
+            return BTreeMap::new();
+        }
+
+        let end = if let Some((_instr_ref, instr)) = self.block_terminator(block) {
+            if is_control_terminator(instr) {
+                range.end() - 1
+            } else {
+                range.end()
+            }
+        } else {
+            range.end()
+        };
+
+        let mut expr_overrides = BTreeMap::new();
+        for instr_index in range.start.index()..end {
+            let instr_ref = InstrRef(instr_index);
+            if self.suppressed_instrs.contains(&instr_ref) {
+                continue;
+            }
+            for def in &self.lowering.dataflow.instr_defs[instr_index] {
+                let Some(mut expr) = expr_for_dup_safe_fixed_def(self.lowering, *def) else {
+                    continue;
+                };
+                rewrite_expr_temps(&mut expr, &expr_overrides);
+                expr_overrides.insert(self.lowering.bindings.fixed_temps[def.index()], expr);
+            }
+        }
+
+        expr_overrides
     }
 }
 

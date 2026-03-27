@@ -47,6 +47,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .filter(|incoming| preds.contains(&incoming.pred))
             {
                 for def in &incoming.defs {
+                    // branch arm 的 target override 只该接管“arm 内真正写出来的值”。
+                    // 如果把 header 公共前缀里的初始 def 也提前改绑到 shared target，
+                    // 嵌套 loop/branch 读取 carried-in 初值时就会先碰到一个还没赋值的
+                    // branch merge 槽位，像 `nested_control_flow` 里的 `out = 0`
+                    // 会被错误改写成未初始化的 `out`。
+                    if self.lowering.dataflow.defs[def.index()].block == header {
+                        continue;
+                    }
                     let Some(def_temp) = self.lowering.bindings.fixed_temps.get(def.index()) else {
                         continue;
                     };
@@ -104,7 +112,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         };
 
         for value in &candidate.values {
-            let Some(shared_target) = self.shared_branch_target_lvalue(value, target_overrides)
+            let Some(shared_target) =
+                self.shared_branch_target_lvalue(header, value, target_overrides)
             else {
                 continue;
             };
@@ -189,7 +198,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .phi_candidates
             .get(value.phi_id.index())?;
 
-        self.shared_branch_target_expr(phi, target_overrides)
+        self.shared_branch_target_expr(header, phi, target_overrides)
             .map(BranchValueOverride::Alias)
             .or_else(|| {
                 self.branch_value_decision_expr(header, value, target_overrides)
@@ -199,6 +208,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
     fn shared_branch_target_lvalue(
         &self,
+        header: BlockRef,
         value: &BranchValueMergeValue,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirLValue> {
@@ -211,6 +221,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         for incoming in &phi.incoming {
             for def in &incoming.defs {
+                if self.lowering.dataflow.defs[def.index()].block == header {
+                    continue;
+                }
                 let temp = *self.lowering.bindings.fixed_temps.get(def.index())?;
                 let target = target_overrides.get(&temp)?;
                 let _ = lvalue_as_expr(target)?;
@@ -229,6 +242,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
     fn shared_branch_target_expr(
         &self,
+        header: BlockRef,
         phi: &PhiCandidate,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirExpr> {
@@ -236,6 +250,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         for incoming in &phi.incoming {
             for def in &incoming.defs {
+                if self.lowering.dataflow.defs[def.index()].block == header {
+                    continue;
+                }
                 let temp = *self.lowering.bindings.fixed_temps.get(def.index())?;
                 let lvalue = target_overrides.get(&temp)?;
                 let expr = lvalue_as_expr(lvalue)?;

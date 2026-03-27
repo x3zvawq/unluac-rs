@@ -85,10 +85,11 @@ fn infer_loop_shape(
         return (LoopKindHint::GenericForLike, Some(header));
     }
 
-    // `while` 的 header 本质上是“纯条件入口”。如果 header 自己已经带了主体语句，
-    // 这时更像 `repeat`/混合 loop，不应该在 facts 层过早绑定成 while，否则 HIR
-    // 会把 header 前缀静悄悄丢掉。
-    if block_is_pure_branch(proto, cfg, header)
+    // Luau 会把一部分 loop-invariant 的常量准备直接塞进 header block，再接 branch。
+    // 这种前缀并不属于源码里的 loop body；如果这里还坚持“header 只能有一条 branch”，
+    // 很多最普通的 `while i < 3 do ... end` 都会被误打成 repeat/unknown，后面整片
+    // 结构恢复就只能回退成 label/goto。
+    if block_is_while_header_like(proto, cfg, header)
         && branch_has_loop_body_and_exit(cfg, header, blocks)
     {
         return (LoopKindHint::WhileLike, Some(header));
@@ -155,13 +156,28 @@ fn branch_has_header_and_exit(
         || (else_block == header && !blocks.contains(&then_block))
 }
 
-fn block_is_pure_branch(proto: &LoweredProto, cfg: &Cfg, block: BlockRef) -> bool {
+fn block_is_while_header_like(proto: &LoweredProto, cfg: &Cfg, block: BlockRef) -> bool {
     let range = cfg.blocks[block.index()].instrs;
-    range.len == 1
-        && matches!(
-            cfg.terminator(&proto.instrs, block),
-            Some(LowInstr::Branch(_))
+    if !matches!(
+        cfg.terminator(&proto.instrs, block),
+        Some(LowInstr::Branch(_))
+    ) {
+        return false;
+    }
+    if range.len == 1 {
+        return true;
+    }
+
+    (range.start.index()..range.end() - 1).all(|instr_index| {
+        matches!(
+            proto.instrs[instr_index],
+            LowInstr::LoadNil(_)
+                | LowInstr::LoadBool(_)
+                | LowInstr::LoadConst(_)
+                | LowInstr::LoadInteger(_)
+                | LowInstr::LoadNumber(_)
         )
+    })
 }
 
 fn repeat_continue_target_via_backedge_pad(

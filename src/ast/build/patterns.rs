@@ -278,6 +278,52 @@ impl<'a> AstLowerer<'a> {
         )))
     }
 
+    pub(super) fn try_lower_single_value_final_call_arg_stmt(
+        &mut self,
+        proto_index: usize,
+        stmts: &[HirStmt],
+        index: usize,
+    ) -> Result<Option<(Vec<AstStmt>, usize)>, AstLowerError> {
+        let Some(HirStmt::CallStmt(call_stmt)) = stmts.get(index) else {
+            return Ok(None);
+        };
+        let Some(HirExpr::Call(arg_call)) = call_stmt.call.args.last() else {
+            return Ok(None);
+        };
+        if arg_call.multiret {
+            return Ok(None);
+        }
+
+        // Lua/Luau 只有“语法上的最后一个调用参数”会展开多返回。
+        // HIR 里这里已经明确是单值调用；与其把这个约束丢给 emitter 再猜，
+        // 不如在 AST build 里直接物化成一个局部槽位，后续 readability 也不会
+        // 把它错误吞回 final arg。
+        let temp = self.fresh_temp(proto_index);
+        let binding = AstBindingRef::Temp(temp);
+        let mut lowered_call = call_stmt.call.clone();
+        let last_arg = lowered_call
+            .args
+            .last_mut()
+            .expect("checked above, final arg must exist");
+        *last_arg = HirExpr::TempRef(temp);
+
+        Ok(Some((
+            vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![self.recovered_local_binding(binding, AstLocalAttr::None)],
+                    values: vec![self.lower_expr(
+                        proto_index,
+                        &call_stmt.call.args[call_stmt.call.args.len() - 1],
+                    )?],
+                })),
+                AstStmt::CallStmt(Box::new(AstCallStmt {
+                    call: self.lower_call(proto_index, &lowered_call)?,
+                })),
+            ],
+            1,
+        )))
+    }
+
     pub(super) fn try_lower_installer_iife_call_stmt(
         &mut self,
         proto_index: usize,

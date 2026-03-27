@@ -324,3 +324,84 @@ fn lower_ast_names_installer_iife_before_calling_it() {
             }) && matches!(call.args.as_slice(), [AstExpr::String(tag)] if tag == "ax")
     ));
 }
+
+#[test]
+fn lower_ast_materializes_single_value_final_call_arg_into_local() {
+    let module = HirModule {
+        entry: HirProtoRef(0),
+        protos: vec![HirProto {
+            id: HirProtoRef(0),
+            source: None,
+            line_range: ProtoLineRange {
+                defined_start: 0,
+                defined_end: 0,
+            },
+            signature: ProtoSignature {
+                num_params: 0,
+                is_vararg: false,
+                has_vararg_param_reg: false,
+                named_vararg_table: false,
+            },
+            params: vec![],
+            locals: vec![],
+            upvalues: Vec::new(),
+            temps: vec![],
+            temp_debug_locals: Vec::new(),
+            local_debug_hints: Vec::new(),
+            body: HirBlock {
+                stmts: vec![HirStmt::CallStmt(Box::new(HirCallStmt {
+                    call: HirCallExpr {
+                        callee: HirExpr::GlobalRef(HirGlobalRef {
+                            name: "print".to_owned(),
+                        }),
+                        args: vec![
+                            HirExpr::String("assign-rot".to_owned()),
+                            HirExpr::Call(Box::new(HirCallExpr {
+                                callee: HirExpr::GlobalRef(HirGlobalRef {
+                                    name: "values".to_owned(),
+                                }),
+                                args: vec![],
+                                multiret: false,
+                                method: false,
+                            })),
+                        ],
+                        multiret: false,
+                        method: false,
+                    },
+                }))],
+            },
+            children: Vec::new(),
+        }],
+    };
+
+    let ast = lower_ast(
+        &module,
+        AstTargetDialect::new(crate::ast::AstDialectVersion::Luau),
+    )
+    .expect("ast lowering should materialize final single-value call args");
+
+    let [AstStmt::LocalDecl(local_decl), AstStmt::CallStmt(call_stmt)] = ast.body.stmts.as_slice()
+    else {
+        panic!("expected barrier local decl before call stmt");
+    };
+    let binding = local_decl.bindings[0].id;
+    assert!(matches!(
+        local_decl.values.as_slice(),
+        [AstExpr::Call(inner_call)]
+            if matches!(&inner_call.callee, AstExpr::Var(crate::ast::AstNameRef::Global(global)) if global.text == "values")
+                && inner_call.args.is_empty()
+    ));
+    assert!(matches!(
+        &call_stmt.call,
+        AstCallKind::Call(call)
+            if matches!(&call.callee, AstExpr::Var(crate::ast::AstNameRef::Global(global)) if global.text == "print")
+                && matches!(call.args.as_slice(),
+                    [
+                        AstExpr::String(tag),
+                        AstExpr::Var(name)
+                    ] if tag == "assign-rot" && match (name, binding) {
+                        (crate::ast::AstNameRef::Temp(temp), crate::ast::AstBindingRef::Temp(binding_temp)) => *temp == binding_temp,
+                        _ => false,
+                    })
+    ));
+}
