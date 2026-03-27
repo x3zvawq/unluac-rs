@@ -926,7 +926,9 @@ impl<'a> ProtoLowerer<'a> {
                             index,
                             limit: Reg(index.index() + 1),
                             step: Reg(index.index() + 2),
-                            binding: Reg(index.index() + 3),
+                            // Lua 5.5 的 numeric-for 体里会直接复用 A+2 这格作为当前 binding；
+                            // 如果继续沿用 5.4 的 A+3，循环体里读到的就会是旧 step 槽位。
+                            binding: Reg(index.index() + 2),
                             body_target: TargetPlaceholder::Raw(
                                 self.jump_target_back_bx(raw_pc, extra.pc, bx)?,
                             ),
@@ -958,7 +960,7 @@ impl<'a> ProtoLowerer<'a> {
                             index,
                             limit: Reg(index.index() + 1),
                             step: Reg(index.index() + 2),
-                            binding: Reg(index.index() + 3),
+                            binding: Reg(index.index() + 2),
                             body_target: TargetPlaceholder::Raw(
                                 self.ensure_targetable_pc(raw_pc, self.next_raw_pc(raw_index))?,
                             ),
@@ -999,7 +1001,11 @@ impl<'a> ProtoLowerer<'a> {
                         PendingLowInstr::Ready(LowInstr::GenericForCall(GenericForCallInstr {
                             state: RegRange::new(state_start, 3),
                             results: ResultPack::Fixed(RegRange::new(
-                                Reg(state_start.index() + 4),
+                                // Lua 5.5 的 generic-for 结果区间会直接落在 A+3 开始，
+                                // 也就是与 5.4 不同，不再额外空出一格给循环体里的绑定。
+                                // 如果继续沿用 5.4 的 A+4，后面的 HIR 会把隐藏 close 槽位
+                                // 错当成源码里的第一个迭代变量。
+                                Reg(state_start.index() + 3),
                                 usize::from(c),
                             )),
                         })),
@@ -1491,7 +1497,7 @@ impl<'a> ProtoLowerer<'a> {
         Ok(GenericForPair {
             loop_index,
             control: Reg(usize::from(loop_a) + 2),
-            bindings: RegRange::new(Reg(usize::from(loop_a) + 4), usize::from(result_count)),
+            bindings: RegRange::new(Reg(usize::from(loop_a) + 3), usize::from(result_count)),
             body_target: self.jump_target_back_bx(helper_extra.pc, helper_extra.pc, bx)?,
             exit_target: self.ensure_targetable_pc(raw_pc, self.next_raw_pc(loop_index))?,
             next_index: loop_index + 1,

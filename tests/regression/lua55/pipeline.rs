@@ -567,6 +567,66 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn lua55_generate_stage_recovers_generic_for_bindings_without_tbc_slot_shift() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.5",
+            "tests/lua_cases/common/control_flow/04_generic_for.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua55,
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.5 generate stage should recover generic-for bindings");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should leave generated source in state");
+        assert!(
+            generated.source.contains("[#") && generated.source.contains(" .. \":\") .. "),
+            "{}",
+            generated.source
+        );
+        assert!(!generated.source.contains("value5"), "{}", generated.source);
+    }
+
+    #[test]
+    fn lua55_generate_stage_recovers_generic_for_mutator_locals() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.5",
+            "tests/lua_cases/common/tricky/11_generic_for_mutator.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua55,
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.5 generate stage should recover generic-for mutator locals");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should leave generated source in state");
+        assert!(
+            generated
+                .source
+                .contains("local value, value2, item = k, v, a[k]"),
+            "{}",
+            generated.source
+        );
+        assert!(!generated.source.contains("value3"), "{}", generated.source);
+    }
+
+    #[test]
     fn lua55_generate_stage_keeps_self_field_for_impure_closure_counter() {
         let chunk = crate::support::compile_lua_case(
             "lua5.5",
