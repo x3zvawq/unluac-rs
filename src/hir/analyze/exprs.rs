@@ -833,6 +833,8 @@ fn lower_cond_operand(
     match operand {
         CondOperand::Reg(reg) => expr_for_reg_use(lowering, block, instr_ref, reg),
         CondOperand::Const(const_ref) => expr_for_const(lowering.proto, const_ref),
+        CondOperand::Nil => HirExpr::Nil,
+        CondOperand::Boolean(value) => HirExpr::Boolean(value),
         CondOperand::Integer(value) => HirExpr::Integer(value),
         CondOperand::Number(value) => HirExpr::Number(value.to_f64()),
     }
@@ -847,6 +849,8 @@ fn lower_cond_operand_inline(
     match operand {
         CondOperand::Reg(reg) => expr_for_reg_use_inline(lowering, block, instr_ref, reg),
         CondOperand::Const(const_ref) => expr_for_const(lowering.proto, const_ref),
+        CondOperand::Nil => HirExpr::Nil,
+        CondOperand::Boolean(value) => HirExpr::Boolean(value),
         CondOperand::Integer(value) => HirExpr::Integer(value),
         CondOperand::Number(value) => HirExpr::Number(value.to_f64()),
     }
@@ -861,6 +865,8 @@ fn lower_cond_operand_single_eval(
     match operand {
         CondOperand::Reg(reg) => expr_for_reg_use_single_eval(lowering, block, instr_ref, reg),
         CondOperand::Const(const_ref) => expr_for_const(lowering.proto, const_ref),
+        CondOperand::Nil => HirExpr::Nil,
+        CondOperand::Boolean(value) => HirExpr::Boolean(value),
         CondOperand::Integer(value) => HirExpr::Integer(value),
         CondOperand::Number(value) => HirExpr::Number(value.to_f64()),
     }

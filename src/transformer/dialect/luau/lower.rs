@@ -4,7 +4,7 @@
 //! 折进 raw 层了；这里专注做语义恢复，把它翻成项目里既有的 CFG/HIR/AST 管线能理解
 //! 的稳定 low-IR 契约。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::parser::{
     DialectConstPoolExtra, DialectInstrExtra, DialectProtoExtra, LuauCaptureKind, LuauConstEntry,
@@ -17,12 +17,13 @@ use crate::transformer::dialect::puc_lua::{
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchInstr, BranchOperands,
     BranchPredicate, CallInstr, CallKind, Capture, CaptureSource, CloseInstr, ClosureInstr,
-    CondOperand, ConstRef, DialectCaptureExtra, GenericForCallInstr, GenericForLoopInstr,
-    GetTableInstr, GetUpvalueInstr, InstrRef, JumpInstr, LoadBoolInstr, LoadConstInstr,
-    LoadIntegerInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr,
-    NewTableInstr, NumericForInitInstr, NumericForLoopInstr, ProtoRef, RawInstrRef, Reg, RegRange,
-    ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TransformError,
-    UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    ConcatInstr, CondOperand, ConstRef, DialectCaptureExtra, GenericForCallInstr,
+    GenericForLoopInstr, GetTableInstr, GetUpvalueInstr, InstrRef, JumpInstr, LoadBoolInstr,
+    LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto,
+    LoweringMap, MoveInstr, NewTableInstr, NumericForInitInstr, NumericForLoopInstr, ProtoRef,
+    RawInstrRef, Reg, RegRange, ResultPack, ReturnInstr, SetListInstr, SetTableInstr,
+    SetUpvalueInstr, TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand,
+    ValuePack, VarArgInstr,
 };
 
 pub(crate) fn lower_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
@@ -65,6 +66,7 @@ struct ProtoLowerer<'a> {
     raw_to_low: Vec<Vec<InstrRef>>,
     pending_methods: Vec<Option<Reg>>,
     raw_pc_to_index: BTreeMap<u32, usize>,
+    targeted_raw_indices: BTreeSet<usize>,
     raw_word_count: usize,
 }
 
@@ -115,6 +117,12 @@ enum TargetPlaceholder {
     Low(usize),
 }
 
+#[derive(Debug, Clone, Copy)]
+enum LogicalSelectValue {
+    Reg(Reg),
+    Const(ConstRef),
+}
+
 impl<'a> ProtoLowerer<'a> {
     fn new(raw: &'a RawProto) -> Self {
         let raw_instr_count = raw.common.instructions.len();
@@ -128,6 +136,49 @@ impl<'a> ProtoLowerer<'a> {
             raw_word_count = raw_word_count.max((pc + u32::from(word_len(instr))) as usize);
         }
 
+        let mut targeted_raw_indices = BTreeSet::new();
+        for instr in &raw.common.instructions {
+            let (opcode, operands, extra) = decode_luau(instr);
+            let raw_pc = extra.pc;
+            let target_pc = match opcode {
+                LuauOpcode::Jump
+                | LuauOpcode::JumpBack
+                | LuauOpcode::JumpIf
+                | LuauOpcode::JumpIfNot
+                | LuauOpcode::JumpIfEq
+                | LuauOpcode::JumpIfLe
+                | LuauOpcode::JumpIfLt
+                | LuauOpcode::JumpIfNotEq
+                | LuauOpcode::JumpIfNotLe
+                | LuauOpcode::JumpIfNotLt
+                | LuauOpcode::JumpXEqKNil
+                | LuauOpcode::JumpXEqKB
+                | LuauOpcode::JumpXEqKN
+                | LuauOpcode::JumpXEqKS
+                | LuauOpcode::ForNPrep
+                | LuauOpcode::ForNLoop
+                | LuauOpcode::ForGLoop
+                | LuauOpcode::ForGPrep
+                | LuauOpcode::ForGPrepInext
+                | LuauOpcode::ForGPrepNext => {
+                    let Ok((_, d)) = expect_ad(raw_pc, opcode, operands) else {
+                        unreachable!("jump-like luau opcode should always decode as AD");
+                    };
+                    Some(i64::from(raw_pc) + 1 + i64::from(d))
+                }
+                _ => None,
+            };
+            let Some(target_pc) = target_pc else {
+                continue;
+            };
+            if target_pc < 0 {
+                continue;
+            }
+            if let Some(raw_index) = raw_pc_to_index.get(&(target_pc as u32)) {
+                targeted_raw_indices.insert(*raw_index);
+            }
+        }
+
         Self {
             raw,
             emitted: Vec::new(),
@@ -135,6 +186,7 @@ impl<'a> ProtoLowerer<'a> {
             raw_to_low: vec![Vec::new(); raw_instr_count],
             pending_methods: vec![None; method_slots],
             raw_pc_to_index,
+            targeted_raw_indices,
             raw_word_count,
         }
     }
@@ -435,6 +487,18 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
+                LuauOpcode::DupTable => {
+                    let (a, d) = expect_ad(raw_pc, opcode, operands)?;
+                    let dst = reg_from_u8(a);
+                    self.invalidate_written_reg(dst);
+                    self.emit(
+                        Some(raw_index),
+                        vec![raw_index],
+                        PendingLowInstr::Ready(LowInstr::NewTable(NewTableInstr { dst })),
+                    );
+                    self.emit_dup_table_template(raw_pc, raw_index, dst, d as usize)?;
+                    raw_index += 1;
+                }
                 LuauOpcode::NameCall => {
                     let (a, b, _) = expect_abc(raw_pc, opcode, operands)?;
                     let callee = reg_from_u8(a);
@@ -619,6 +683,89 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
+                LuauOpcode::JumpXEqKS => {
+                    let (a, d) = expect_ad(raw_pc, opcode, operands)?;
+                    let aux = required_aux(raw_pc, opcode, extra)?;
+                    self.clear_all_method_hints();
+                    self.emit(
+                        Some(raw_index),
+                        vec![raw_index],
+                        PendingLowInstr::Branch {
+                            cond: BranchCond {
+                                predicate: BranchPredicate::Eq,
+                                operands: BranchOperands::Binary(
+                                    CondOperand::Reg(reg_from_u8(a)),
+                                    CondOperand::Const(
+                                        self.string_const_ref(
+                                            raw_pc,
+                                            (aux & 0x00ff_ffff) as usize,
+                                        )?,
+                                    ),
+                                ),
+                                negated: aux_not(aux),
+                            },
+                            then_target: TargetPlaceholder::Raw(
+                                self.jump_target(raw_pc, i32::from(d))?,
+                            ),
+                            else_target: TargetPlaceholder::Raw(
+                                self.ensure_targetable_pc(raw_pc, self.next_raw_pc(raw_index))?,
+                            ),
+                        },
+                    );
+                    raw_index += 1;
+                }
+                LuauOpcode::JumpXEqKB => {
+                    let (a, d) = expect_ad(raw_pc, opcode, operands)?;
+                    let aux = required_aux(raw_pc, opcode, extra)?;
+                    self.clear_all_method_hints();
+                    self.emit(
+                        Some(raw_index),
+                        vec![raw_index],
+                        PendingLowInstr::Branch {
+                            cond: BranchCond {
+                                predicate: BranchPredicate::Eq,
+                                operands: BranchOperands::Binary(
+                                    CondOperand::Reg(reg_from_u8(a)),
+                                    CondOperand::Boolean((aux & 1) != 0),
+                                ),
+                                negated: aux_not(aux),
+                            },
+                            then_target: TargetPlaceholder::Raw(
+                                self.jump_target(raw_pc, i32::from(d))?,
+                            ),
+                            else_target: TargetPlaceholder::Raw(
+                                self.ensure_targetable_pc(raw_pc, self.next_raw_pc(raw_index))?,
+                            ),
+                        },
+                    );
+                    raw_index += 1;
+                }
+                LuauOpcode::JumpXEqKNil => {
+                    let (a, d) = expect_ad(raw_pc, opcode, operands)?;
+                    let aux = required_aux(raw_pc, opcode, extra)?;
+                    self.clear_all_method_hints();
+                    self.emit(
+                        Some(raw_index),
+                        vec![raw_index],
+                        PendingLowInstr::Branch {
+                            cond: BranchCond {
+                                predicate: BranchPredicate::Eq,
+                                operands: BranchOperands::Binary(
+                                    CondOperand::Reg(reg_from_u8(a)),
+                                    CondOperand::Nil,
+                                ),
+                                negated: aux_not(aux),
+                            },
+                            then_target: TargetPlaceholder::Raw(
+                                self.jump_target(raw_pc, i32::from(d))?,
+                            ),
+                            else_target: TargetPlaceholder::Raw(
+                                self.ensure_targetable_pc(raw_pc, self.next_raw_pc(raw_index))?,
+                            ),
+                        },
+                    );
+                    raw_index += 1;
+                }
                 LuauOpcode::Add
                 | LuauOpcode::Sub
                 | LuauOpcode::Mul
@@ -679,53 +826,77 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
+                LuauOpcode::Concat => {
+                    let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
+                    let dst = reg_from_u8(a);
+                    self.invalidate_written_reg(dst);
+                    self.emit(
+                        Some(raw_index),
+                        vec![raw_index],
+                        PendingLowInstr::Ready(LowInstr::Concat(ConcatInstr {
+                            dst,
+                            src: RegRange::new(
+                                reg_from_u8(b),
+                                range_len_inclusive(usize::from(b), usize::from(c)),
+                            ),
+                        })),
+                    );
+                    raw_index += 1;
+                }
+                LuauOpcode::Or => {
+                    let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
+                    let dst = reg_from_u8(a);
+                    let lhs = reg_from_u8(b);
+                    self.invalidate_written_reg(dst);
+                    self.emit_logical_select(
+                        raw_index,
+                        lhs,
+                        dst,
+                        LogicalSelectValue::Reg(lhs),
+                        LogicalSelectValue::Reg(reg_from_u8(c)),
+                    );
+                    raw_index += 1;
+                }
+                LuauOpcode::And => {
+                    let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
+                    let dst = reg_from_u8(a);
+                    let lhs = reg_from_u8(b);
+                    self.invalidate_written_reg(dst);
+                    self.emit_logical_select(
+                        raw_index,
+                        lhs,
+                        dst,
+                        LogicalSelectValue::Reg(reg_from_u8(c)),
+                        LogicalSelectValue::Reg(lhs),
+                    );
+                    raw_index += 1;
+                }
+                LuauOpcode::AndK => {
+                    let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
+                    let dst = reg_from_u8(a);
+                    let lhs = reg_from_u8(b);
+                    self.invalidate_written_reg(dst);
+                    self.emit_logical_select(
+                        raw_index,
+                        lhs,
+                        dst,
+                        LogicalSelectValue::Const(self.literal_const_ref(raw_pc, c as usize)?),
+                        LogicalSelectValue::Reg(lhs),
+                    );
+                    raw_index += 1;
+                }
                 LuauOpcode::OrK => {
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     let src = reg_from_u8(b);
-                    let const_value = self.literal_const_ref(raw_pc, c as usize)?;
                     self.invalidate_written_reg(dst);
-
-                    let branch_low = self.emitted.len();
-                    let truthy_low = branch_low + 1;
-                    let jump_low = branch_low + 2;
-                    let falsy_low = branch_low + 3;
-                    let after_low = branch_low + 4;
-
-                    self.emit(
-                        Some(raw_index),
-                        vec![raw_index],
-                        PendingLowInstr::Branch {
-                            cond: BranchCond {
-                                predicate: BranchPredicate::Truthy,
-                                operands: BranchOperands::Unary(CondOperand::Reg(src)),
-                                negated: false,
-                            },
-                            then_target: TargetPlaceholder::Low(truthy_low),
-                            else_target: TargetPlaceholder::Low(falsy_low),
-                        },
+                    self.emit_logical_select(
+                        raw_index,
+                        src,
+                        dst,
+                        LogicalSelectValue::Reg(src),
+                        LogicalSelectValue::Const(self.literal_const_ref(raw_pc, c as usize)?),
                     );
-                    self.emit(
-                        None,
-                        vec![raw_index],
-                        PendingLowInstr::Ready(LowInstr::Move(MoveInstr { dst, src })),
-                    );
-                    self.emit(
-                        None,
-                        vec![raw_index],
-                        PendingLowInstr::Jump {
-                            target: TargetPlaceholder::Low(after_low),
-                        },
-                    );
-                    self.emit(
-                        None,
-                        vec![raw_index],
-                        PendingLowInstr::Ready(LowInstr::LoadConst(LoadConstInstr {
-                            dst,
-                            value: const_value,
-                        })),
-                    );
-                    debug_assert_eq!(jump_low + 1, falsy_low);
                     raw_index += 1;
                 }
                 LuauOpcode::Not | LuauOpcode::Minus | LuauOpcode::Length => {
@@ -1301,6 +1472,9 @@ impl<'a> ProtoLowerer<'a> {
         let Some(next_raw) = self.raw.common.instructions.get(raw_index + 1) else {
             return Ok((call_result_pack(call_a, u16::from(call_c)), None));
         };
+        if self.targeted_raw_indices.contains(&(raw_index + 1)) {
+            return Ok((call_result_pack(call_a, u16::from(call_c)), None));
+        }
         let (next_opcode, next_operands, _) = decode_luau(next_raw);
         if next_opcode != LuauOpcode::Move {
             return Ok((call_result_pack(call_a, u16::from(call_c)), None));
@@ -1406,6 +1580,91 @@ impl<'a> ProtoLowerer<'a> {
 
     fn clear_all_method_hints(&mut self) {
         self.pending_methods.fill(None);
+    }
+
+    fn emit_logical_select(
+        &mut self,
+        raw_index: usize,
+        condition: Reg,
+        dst: Reg,
+        truthy_value: LogicalSelectValue,
+        falsy_value: LogicalSelectValue,
+    ) {
+        let branch_low = self.emitted.len();
+        let truthy_low = branch_low + 1;
+        let jump_low = branch_low + 2;
+        let falsy_low = branch_low + 3;
+        let after_low = branch_low + 4;
+
+        self.emit(
+            Some(raw_index),
+            vec![raw_index],
+            PendingLowInstr::Branch {
+                cond: BranchCond {
+                    predicate: BranchPredicate::Truthy,
+                    operands: BranchOperands::Unary(CondOperand::Reg(condition)),
+                    negated: false,
+                },
+                then_target: TargetPlaceholder::Low(truthy_low),
+                else_target: TargetPlaceholder::Low(falsy_low),
+            },
+        );
+        self.emit_logical_select_value(raw_index, dst, truthy_value);
+        self.emit(
+            None,
+            vec![raw_index],
+            PendingLowInstr::Jump {
+                target: TargetPlaceholder::Low(after_low),
+            },
+        );
+        self.emit_logical_select_value(raw_index, dst, falsy_value);
+        debug_assert_eq!(jump_low + 1, falsy_low);
+    }
+
+    fn emit_logical_select_value(&mut self, raw_index: usize, dst: Reg, value: LogicalSelectValue) {
+        let instr = match value {
+            LogicalSelectValue::Reg(src) => LowInstr::Move(MoveInstr { dst, src }),
+            LogicalSelectValue::Const(value) => LowInstr::LoadConst(LoadConstInstr { dst, value }),
+        };
+        self.emit(None, vec![raw_index], PendingLowInstr::Ready(instr));
+    }
+
+    fn emit_dup_table_template(
+        &mut self,
+        raw_pc: u32,
+        raw_index: usize,
+        dst: Reg,
+        const_index: usize,
+    ) -> Result<(), TransformError> {
+        match self.const_entry(raw_pc, const_index)?.clone() {
+            LuauConstEntry::Table { .. } => Ok(()),
+            LuauConstEntry::TableWithConstants { entries } => {
+                for entry in entries {
+                    let Some(value_const) = entry.value_const else {
+                        continue;
+                    };
+                    self.emit(
+                        None,
+                        vec![raw_index],
+                        PendingLowInstr::Ready(LowInstr::SetTable(SetTableInstr {
+                            base: AccessBase::Reg(dst),
+                            key: AccessKey::Const(
+                                self.literal_const_ref(raw_pc, entry.key_const as usize)?,
+                            ),
+                            value: ValueOperand::Const(
+                                self.literal_const_ref(raw_pc, value_const as usize)?,
+                            ),
+                        })),
+                    );
+                }
+                Ok(())
+            }
+            _ => Err(TransformError::InvalidConstRef {
+                raw_pc,
+                const_index,
+                const_count: self.const_entries().len(),
+            }),
+        }
     }
 }
 

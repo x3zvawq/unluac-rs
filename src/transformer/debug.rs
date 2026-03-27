@@ -478,6 +478,8 @@ fn format_cond_operand(operand: CondOperand) -> String {
     match operand {
         CondOperand::Reg(reg) => format_reg(reg),
         CondOperand::Const(const_ref) => format_const(const_ref),
+        CondOperand::Nil => "nil".to_owned(),
+        CondOperand::Boolean(value) => value.to_string(),
         CondOperand::Integer(value) => value.to_string(),
         CondOperand::Number(value) => value.to_f64().to_string(),
     }

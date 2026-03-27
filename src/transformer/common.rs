@@ -325,6 +325,8 @@ pub enum BranchPredicate {
 pub enum CondOperand {
     Reg(Reg),
     Const(ConstRef),
+    Nil,
+    Boolean(bool),
     Integer(i64),
     Number(NumberLiteral),
 }

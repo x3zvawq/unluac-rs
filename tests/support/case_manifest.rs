@@ -102,6 +102,7 @@ const ALL_DIALECTS: &[LuaCaseDialect] = &[
     LuaCaseDialect::Lua53,
     LuaCaseDialect::Lua54,
     LuaCaseDialect::Lua55,
+    LuaCaseDialect::Luau,
 ];
 const PUC_LUA_51: &[LuaCaseDialect] = &[LuaCaseDialect::Lua51];
 const PUC_LUA_GE_52: &[LuaCaseDialect] = &[

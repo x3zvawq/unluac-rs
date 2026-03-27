@@ -750,7 +750,11 @@ fn branch_cond_regs(cond: crate::transformer::BranchCond) -> Vec<Reg> {
 fn cond_operand_reg(operand: CondOperand) -> Option<Reg> {
     match operand {
         CondOperand::Reg(reg) => Some(reg),
-        CondOperand::Const(_) | CondOperand::Integer(_) | CondOperand::Number(_) => None,
+        CondOperand::Const(_)
+        | CondOperand::Nil
+        | CondOperand::Boolean(_)
+        | CondOperand::Integer(_)
+        | CondOperand::Number(_) => None,
     }
 }
 

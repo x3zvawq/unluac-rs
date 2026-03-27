@@ -1120,7 +1120,11 @@ fn insert_cond_operand_use(target: &mut BTreeSet<Reg>, operand: CondOperand) {
         CondOperand::Reg(reg) => {
             target.insert(reg);
         }
-        CondOperand::Const(_) | CondOperand::Integer(_) | CondOperand::Number(_) => {}
+        CondOperand::Const(_)
+        | CondOperand::Nil
+        | CondOperand::Boolean(_)
+        | CondOperand::Integer(_)
+        | CondOperand::Number(_) => {}
     }
 }
 
