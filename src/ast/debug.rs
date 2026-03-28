@@ -11,7 +11,7 @@ use super::common::{
     AstLValue, AstMethodCallExpr, AstModule, AstNamePath, AstNameRef, AstStmt, AstSyntheticLocalId,
     AstTableField,
 };
-use super::pretty::preferred_relational_render;
+use super::pretty::{preferred_negated_relational_render, preferred_relational_render};
 
 #[derive(Debug, Default)]
 struct FunctionRenderNames {
@@ -282,11 +282,22 @@ fn format_expr(expr: &AstExpr, indent: &str, names: &FunctionRenderNames) -> Str
                 format_expr(&access.index, indent, names)
             )
         }
-        AstExpr::Unary(unary) => format!(
-            "({} {})",
-            format_unary_op(unary.op),
-            format_expr(&unary.expr, indent, names)
-        ),
+        AstExpr::Unary(unary) => {
+            if let Some(preferred) = preferred_negated_relational_render(unary) {
+                format!(
+                    "({} {} {})",
+                    format_expr(preferred.lhs, indent, names),
+                    preferred.op_text,
+                    format_expr(preferred.rhs, indent, names)
+                )
+            } else {
+                format!(
+                    "({} {})",
+                    format_unary_op(unary.op),
+                    format_expr(&unary.expr, indent, names)
+                )
+            }
+        }
         AstExpr::Binary(binary) => {
             if let Some(preferred) = preferred_relational_render(binary) {
                 format!(

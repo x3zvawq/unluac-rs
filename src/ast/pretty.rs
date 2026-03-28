@@ -4,7 +4,10 @@
 //! 语法节点。这里提供跨 debug / generate 共享的轻量规则，让不同输出入口在不改变
 //! AST 语义的前提下，尽量收敛到更接近源码的文本形状。
 
-use super::common::{AstBinaryExpr, AstBinaryOpKind, AstExpr, AstTableField, AstTableKey};
+use super::common::{
+    AstBinaryExpr, AstBinaryOpKind, AstExpr, AstTableField, AstTableKey, AstUnaryExpr,
+    AstUnaryOpKind,
+};
 
 pub(crate) struct PreferredRelationalRender<'a> {
     pub(crate) lhs: &'a AstExpr,
@@ -39,6 +42,26 @@ pub(crate) fn preferred_relational_render(
         }),
         _ => None,
     }
+}
+
+pub(crate) fn preferred_negated_relational_render(
+    unary: &AstUnaryExpr,
+) -> Option<PreferredRelationalRender<'_>> {
+    if unary.op != AstUnaryOpKind::Not {
+        return None;
+    }
+    let AstExpr::Binary(binary) = &unary.expr else {
+        return None;
+    };
+    if binary.op != AstBinaryOpKind::Eq {
+        return None;
+    }
+
+    Some(PreferredRelationalRender {
+        lhs: &binary.lhs,
+        op_text: "~=",
+        rhs: &binary.rhs,
+    })
 }
 
 fn should_flip_relational_operands(lhs: &AstExpr, rhs: &AstExpr) -> bool {
@@ -95,3 +118,6 @@ fn expr_display_complexity(expr: &AstExpr) -> usize {
         AstExpr::FunctionExpr(function) => 2 + function.body.stmts.len(),
     }
 }
+
+#[cfg(test)]
+mod tests;

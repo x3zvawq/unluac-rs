@@ -7,12 +7,16 @@
 
 use std::collections::BTreeMap;
 
-use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirProto, HirStmt, HirTableField, TempId};
+use crate::hir::common::{
+    HirAssign, HirBlock, HirExpr, HirLValue, HirLocalDecl, HirLogicalExpr, HirProto, HirStmt,
+    HirTableField, HirUnaryExpr, HirUnaryOpKind, LocalId, TempId,
+};
 
 pub(super) fn remove_boolean_materialization_shells_in_proto(proto: &mut HirProto) -> bool {
     let mut use_counts = BTreeMap::new();
     collect_block_temp_uses(&proto.body, &mut use_counts);
     remove_dead_materialization_shells_in_block(&mut proto.body, &use_counts)
+        | collapse_live_boolean_materialization_shells_in_block(&mut proto.body)
 }
 
 fn remove_dead_materialization_shells_in_block(
@@ -36,6 +40,118 @@ fn remove_dead_materialization_shells_in_block(
     }
 
     changed
+}
+
+fn collapse_live_boolean_materialization_shells_in_block(block: &mut HirBlock) -> bool {
+    let mut changed = false;
+
+    for stmt in &mut block.stmts {
+        changed |= collapse_live_boolean_materialization_shells_in_nested(stmt);
+    }
+
+    let mut index = 0;
+    while index < block.stmts.len() {
+        let Some((target, value)) =
+            collapsible_live_boolean_materialization_shell(&block.stmts[index])
+        else {
+            index += 1;
+            continue;
+        };
+
+        if index > 0
+            && let HirLValue::Local(local) = &target
+            && empty_single_local_decl_binding(&block.stmts[index - 1]) == Some(*local)
+        {
+            block.stmts[index - 1] = HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                bindings: vec![*local],
+                values: vec![value],
+            }));
+            block.stmts.remove(index);
+            changed = true;
+            index = index.saturating_sub(1);
+            continue;
+        }
+
+        block.stmts[index] = HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![target],
+            values: vec![value],
+        }));
+        changed = true;
+        index += 1;
+    }
+
+    changed
+}
+
+fn collapse_live_boolean_materialization_shells_in_nested(stmt: &mut HirStmt) -> bool {
+    match stmt {
+        HirStmt::If(if_stmt) => {
+            let mut changed =
+                collapse_live_boolean_materialization_shells_in_block(&mut if_stmt.then_block);
+            if let Some(else_block) = &mut if_stmt.else_block {
+                changed |= collapse_live_boolean_materialization_shells_in_block(else_block);
+            }
+            changed
+        }
+        HirStmt::While(while_stmt) => {
+            collapse_live_boolean_materialization_shells_in_block(&mut while_stmt.body)
+        }
+        HirStmt::Repeat(repeat_stmt) => {
+            collapse_live_boolean_materialization_shells_in_block(&mut repeat_stmt.body)
+        }
+        HirStmt::NumericFor(numeric_for) => {
+            collapse_live_boolean_materialization_shells_in_block(&mut numeric_for.body)
+        }
+        HirStmt::GenericFor(generic_for) => {
+            collapse_live_boolean_materialization_shells_in_block(&mut generic_for.body)
+        }
+        HirStmt::Block(block) => collapse_live_boolean_materialization_shells_in_block(block),
+        HirStmt::Unstructured(unstructured) => {
+            collapse_live_boolean_materialization_shells_in_block(&mut unstructured.body)
+        }
+        HirStmt::LocalDecl(_)
+        | HirStmt::Assign(_)
+        | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::Return(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => false,
+    }
+}
+
+fn collapsible_live_boolean_materialization_shell(stmt: &HirStmt) -> Option<(HirLValue, HirExpr)> {
+    let HirStmt::If(if_stmt) = stmt else {
+        return None;
+    };
+    let Some(else_block) = &if_stmt.else_block else {
+        return None;
+    };
+
+    let (then_target, then_value) = pure_assign_pattern(&if_stmt.then_block)?;
+    let (else_target, else_value) = pure_assign_pattern(else_block)?;
+    if then_target != else_target {
+        return None;
+    }
+
+    match (then_value, else_value) {
+        (HirExpr::Boolean(true), HirExpr::Boolean(false)) => Some((
+            then_target.clone(),
+            booleanized_truthiness_expr(if_stmt.cond.clone()),
+        )),
+        (HirExpr::Boolean(false), HirExpr::Boolean(true)) => Some((
+            then_target.clone(),
+            HirExpr::Unary(Box::new(HirUnaryExpr {
+                op: HirUnaryOpKind::Not,
+                expr: if_stmt.cond.clone(),
+            })),
+        )),
+        _ => None,
+    }
 }
 
 fn remove_dead_materialization_shells_in_nested(
@@ -96,15 +212,19 @@ fn removable_dead_materialization_shell(
         return false;
     }
 
-    let Some((then_temp, then_value)) = pure_assign_pattern(&if_stmt.then_block) else {
+    let Some((then_target, then_value)) = pure_assign_pattern(&if_stmt.then_block) else {
         return false;
     };
-    let Some((else_temp, else_value)) = pure_assign_pattern(else_block) else {
+    let Some((else_target, else_value)) = pure_assign_pattern(else_block) else {
+        return false;
+    };
+    let (HirLValue::Temp(then_temp), HirLValue::Temp(else_temp)) = (then_target, else_target)
+    else {
         return false;
     };
 
-    if use_counts.get(&then_temp).copied().unwrap_or(0) != 0
-        || use_counts.get(&else_temp).copied().unwrap_or(0) != 0
+    if use_counts.get(then_temp).copied().unwrap_or(0) != 0
+        || use_counts.get(else_temp).copied().unwrap_or(0) != 0
     {
         return false;
     }
@@ -112,18 +232,59 @@ fn removable_dead_materialization_shell(
     expr_is_side_effect_free(then_value) && expr_is_side_effect_free(else_value)
 }
 
-fn pure_assign_pattern(block: &HirBlock) -> Option<(TempId, &HirExpr)> {
+fn pure_assign_pattern(block: &HirBlock) -> Option<(&HirLValue, &HirExpr)> {
     let [HirStmt::Assign(assign)] = block.stmts.as_slice() else {
         return None;
     };
-    let [HirLValue::Temp(temp)] = assign.targets.as_slice() else {
+    let [target] = assign.targets.as_slice() else {
         return None;
     };
     let [value] = assign.values.as_slice() else {
         return None;
     };
 
-    Some((*temp, value))
+    Some((target, value))
+}
+
+fn empty_single_local_decl_binding(stmt: &HirStmt) -> Option<LocalId> {
+    let HirStmt::LocalDecl(local_decl) = stmt else {
+        return None;
+    };
+    let [binding] = local_decl.bindings.as_slice() else {
+        return None;
+    };
+    if !local_decl.values.is_empty() {
+        return None;
+    }
+    Some(*binding)
+}
+
+fn booleanized_truthiness_expr(cond: HirExpr) -> HirExpr {
+    if expr_is_boolean_valued(&cond) {
+        cond
+    } else {
+        HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+            lhs: HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+                lhs: cond,
+                rhs: HirExpr::Boolean(true),
+            })),
+            rhs: HirExpr::Boolean(false),
+        }))
+    }
+}
+
+fn expr_is_boolean_valued(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::Boolean(_) => true,
+        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => true,
+        HirExpr::Binary(binary) => matches!(
+            binary.op,
+            crate::hir::common::HirBinaryOpKind::Eq
+                | crate::hir::common::HirBinaryOpKind::Lt
+                | crate::hir::common::HirBinaryOpKind::Le
+        ),
+        _ => false,
+    }
 }
 
 fn collect_block_temp_uses(block: &HirBlock, use_counts: &mut BTreeMap<TempId, usize>) {

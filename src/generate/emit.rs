@@ -3,7 +3,7 @@
 //! 这里采用外部 emitter，而不是把“生成字符串”的方法塞回 AST 节点本身。
 //! 这样 AST 仍保持纯语法数据，Generate 只在这一层处理名字解析、括号优先级和布局意图。
 
-use crate::ast::pretty::preferred_relational_render;
+use crate::ast::pretty::{preferred_negated_relational_render, preferred_relational_render};
 use crate::ast::{
     AstAssign, AstBindingRef, AstBlock, AstCallExpr, AstCallKind, AstCallStmt, AstExpr,
     AstFieldAccess, AstFunctionDecl, AstFunctionExpr, AstFunctionName, AstGenericFor,
@@ -599,15 +599,32 @@ impl<'a> Emitter<'a> {
                 Assoc::Left,
             ),
             AstExpr::Unary(unary) => {
-                let prec = PREC_UNARY;
-                let inner = self.emit_expr(&unary.expr, function, prec, ExprSide::Right)?;
-                let op = match unary.op {
-                    AstUnaryOpKind::Not => "not ",
-                    AstUnaryOpKind::Neg => "-",
-                    AstUnaryOpKind::BitNot => "~",
-                    AstUnaryOpKind::Length => "#",
-                };
-                (Doc::concat([Doc::text(op), inner]), prec, Assoc::Right)
+                if let Some(preferred) = preferred_negated_relational_render(unary) {
+                    let prec = PREC_COMPARE;
+                    let lhs = self.emit_expr(preferred.lhs, function, prec, ExprSide::Left)?;
+                    let rhs = self.emit_expr(preferred.rhs, function, prec, ExprSide::Right)?;
+                    (
+                        Doc::concat([
+                            lhs,
+                            Doc::text(" "),
+                            Doc::text(preferred.op_text),
+                            Doc::text(" "),
+                            rhs,
+                        ]),
+                        prec,
+                        Assoc::Non,
+                    )
+                } else {
+                    let prec = PREC_UNARY;
+                    let inner = self.emit_expr(&unary.expr, function, prec, ExprSide::Right)?;
+                    let op = match unary.op {
+                        AstUnaryOpKind::Not => "not ",
+                        AstUnaryOpKind::Neg => "-",
+                        AstUnaryOpKind::BitNot => "~",
+                        AstUnaryOpKind::Length => "#",
+                    };
+                    (Doc::concat([Doc::text(op), inner]), prec, Assoc::Right)
+                }
             }
             AstExpr::Binary(binary) => {
                 let (prec, assoc, op) = binary_meta(binary.op);
