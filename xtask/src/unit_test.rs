@@ -74,6 +74,12 @@ impl ColorMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PlainProgressDetail {
+    Sparse,
+    Verbose,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Options {
     suite: String,
@@ -83,6 +89,7 @@ pub(crate) struct Options {
     timeout_seconds: u64,
     progress: ProgressMode,
     color: ColorMode,
+    plain_progress_detail: PlainProgressDetail,
     jobs: usize,
 }
 
@@ -193,6 +200,7 @@ enum ReporterMode {
 struct Reporter {
     mode: ReporterMode,
     palette: Palette,
+    plain_progress_detail: PlainProgressDetail,
 }
 
 impl Reporter {
@@ -211,7 +219,11 @@ impl Reporter {
         } else {
             ReporterMode::Plain
         };
-        Ok(Self { mode, palette })
+        Ok(Self {
+            mode,
+            palette,
+            plain_progress_detail: options.plain_progress_detail,
+        })
     }
 
     fn announce_start(&self, total: usize, options: &Options, jobs: usize) {
@@ -245,14 +257,28 @@ impl Reporter {
         total: usize,
         active: usize,
         case: &UnitCaseDescriptor,
+        event: ProgressEventKind,
     ) {
-        let message = progress_message(self.palette, completed, total, active, case);
         match &self.mode {
             ReporterMode::Interactive(progress) => {
+                let message = progress_message(self.palette, completed, total, active, case);
                 progress.set_position(completed as u64);
                 progress.set_message(message);
             }
-            ReporterMode::Plain => eprintln!("{message}"),
+            ReporterMode::Plain => match self.plain_progress_detail {
+                PlainProgressDetail::Verbose => {
+                    let message = progress_message(self.palette, completed, total, active, case);
+                    eprintln!("{message}");
+                }
+                PlainProgressDetail::Sparse => {
+                    if should_emit_sparse_plain_progress(event, completed, total) {
+                        eprintln!(
+                            "{}",
+                            sparse_progress_message(self.palette, completed, total, active)
+                        );
+                    }
+                }
+            },
         }
     }
 
@@ -469,12 +495,24 @@ where
         match event_rx.recv() {
             Ok(WorkerEvent::Started { case }) => {
                 active += 1;
-                reporter.update_progress(completed, total, active, &case);
+                reporter.update_progress(
+                    completed,
+                    total,
+                    active,
+                    &case,
+                    ProgressEventKind::Started,
+                );
             }
             Ok(WorkerEvent::Finished { case, execution }) => {
                 active = active.saturating_sub(1);
                 completed += 1;
-                reporter.update_progress(completed, total, active, &case);
+                reporter.update_progress(
+                    completed,
+                    total,
+                    active,
+                    &case,
+                    ProgressEventKind::Finished,
+                );
 
                 match execution.outcome {
                     UnitCaseOutcome::Passed => {}
@@ -558,6 +596,7 @@ pub(crate) fn print_help() {
     println!("                      [--case-filter <substring>]...");
     println!("                      [--output <simple|verbose>] [--timeout-seconds <n>]");
     println!("                      [--progress <auto|on|off>] [--color <auto|always|never>]");
+    println!("                      [--verbose]");
     println!("                      [--jobs <n>]");
 }
 
@@ -575,6 +614,7 @@ where
         timeout_seconds: 10,
         progress: parse_env_or_default(PROGRESS_ENV, "auto", ProgressMode::parse)?,
         color: parse_env_or_default(COLOR_ENV, "auto", ColorMode::parse)?,
+        plain_progress_detail: PlainProgressDetail::Sparse,
         jobs: 1,
     };
 
@@ -639,6 +679,9 @@ where
                 if options.jobs == 0 {
                     bail!("jobs must be greater than zero");
                 }
+            }
+            "--verbose" => {
+                options.plain_progress_detail = PlainProgressDetail::Verbose;
             }
             other => bail!("unsupported `test-unit` option: {other}"),
         }
@@ -953,6 +996,34 @@ fn progress_message(
     )
 }
 
+fn sparse_progress_message(
+    palette: Palette,
+    completed: usize,
+    total: usize,
+    active: usize,
+) -> String {
+    format!(
+        "[{completed}/{total}]\tactive: {active}\t{}",
+        palette.cyan("progress")
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProgressEventKind {
+    Started,
+    Finished,
+}
+
+fn should_emit_sparse_plain_progress(
+    event: ProgressEventKind,
+    completed: usize,
+    total: usize,
+) -> bool {
+    matches!(event, ProgressEventKind::Finished)
+        && completed > 0
+        && (completed == total || completed % 100 == 0)
+}
+
 fn normalize_runner_failure(
     raw: &str,
     case: &UnitCaseDescriptor,
@@ -996,8 +1067,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ColorMode, FailureOutputMode, MachineFailure, Options, ProgressMode, matches_case_filters,
-        normalize_runner_failure, parse_args, parse_machine_failure, sorted_failure_counts,
+        ColorMode, FailureOutputMode, MachineFailure, Options, PlainProgressDetail, ProgressMode,
+        matches_case_filters, normalize_runner_failure, parse_args, parse_machine_failure,
+        sorted_failure_counts,
     };
     use std::os::unix::process::ExitStatusExt;
 
@@ -1020,6 +1092,7 @@ mod tests {
             "off",
             "--color",
             "always",
+            "--verbose",
             "--jobs",
             "4",
         ])
@@ -1035,6 +1108,7 @@ mod tests {
                 timeout_seconds: 12,
                 progress: ProgressMode::Off,
                 color: ColorMode::Always,
+                plain_progress_detail: PlainProgressDetail::Verbose,
                 jobs: 4,
             }
         );
@@ -1056,6 +1130,30 @@ mod tests {
         let error = parse_args(["--jobs", "0"]).expect_err("zero jobs should be rejected");
 
         assert_eq!(error.to_string(), "jobs must be greater than zero");
+    }
+
+    #[test]
+    fn sparse_plain_progress_should_only_emit_on_milestones() {
+        assert!(!super::should_emit_sparse_plain_progress(
+            super::ProgressEventKind::Started,
+            100,
+            500,
+        ));
+        assert!(!super::should_emit_sparse_plain_progress(
+            super::ProgressEventKind::Finished,
+            99,
+            500,
+        ));
+        assert!(super::should_emit_sparse_plain_progress(
+            super::ProgressEventKind::Finished,
+            100,
+            500,
+        ));
+        assert!(super::should_emit_sparse_plain_progress(
+            super::ProgressEventKind::Finished,
+            500,
+            500,
+        ));
     }
 
     #[test]
