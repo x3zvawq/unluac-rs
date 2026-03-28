@@ -48,6 +48,34 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn repeat_break_value_flow_hir_keeps_break_guard_on_current_loop_state() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/22_repeat_break_value_flow.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Normal,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("repeat_break_value_flow hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("if (10 < l1)"), "{dump}");
+        assert!(!dump.contains("local [\"l3\"] = -"), "{dump}");
+        assert!(!dump.contains("assign l3 ="), "{dump}");
+    }
+
+    #[test]
     fn ultimate_mess_hir_folds_single_access_segments_without_collapsing_the_whole_chain() {
         let result = decompile(
             &compile_lua_case(

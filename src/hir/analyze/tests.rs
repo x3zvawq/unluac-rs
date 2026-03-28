@@ -87,7 +87,8 @@ fn luau_while_header_consts_stay_in_condition_expr() {
 
 #[test]
 fn luau_branch_carried_state_stays_resolved_across_nested_loops() {
-    let module = lower_luau_fixture_to_hir("tests/lua_cases/common/tricky/04_nested_control_flow.lua");
+    let module =
+        lower_luau_fixture_to_hir("tests/lua_cases/common/tricky/04_nested_control_flow.lua");
     let proto = &module.protos[1];
     let hir_dump = dump_hir(
         &module,
@@ -177,7 +178,11 @@ fn stmt_contains_unresolved_expr(stmt: &HirStmt) -> bool {
         HirStmt::Return(ret) => ret.values.iter().any(expr_contains_unresolved),
         HirStmt::If(if_stmt) => {
             expr_contains_unresolved(&if_stmt.cond)
-                || if_stmt.then_block.stmts.iter().any(stmt_contains_unresolved_expr)
+                || if_stmt
+                    .then_block
+                    .stmts
+                    .iter()
+                    .any(stmt_contains_unresolved_expr)
                 || if_stmt
                     .else_block
                     .as_ref()
@@ -185,26 +190,44 @@ fn stmt_contains_unresolved_expr(stmt: &HirStmt) -> bool {
         }
         HirStmt::While(while_stmt) => {
             expr_contains_unresolved(&while_stmt.cond)
-                || while_stmt.body.stmts.iter().any(stmt_contains_unresolved_expr)
+                || while_stmt
+                    .body
+                    .stmts
+                    .iter()
+                    .any(stmt_contains_unresolved_expr)
         }
         HirStmt::Repeat(repeat_stmt) => {
-            repeat_stmt.body.stmts.iter().any(stmt_contains_unresolved_expr)
+            repeat_stmt
+                .body
+                .stmts
+                .iter()
+                .any(stmt_contains_unresolved_expr)
                 || expr_contains_unresolved(&repeat_stmt.cond)
         }
         HirStmt::NumericFor(numeric_for) => {
             expr_contains_unresolved(&numeric_for.start)
                 || expr_contains_unresolved(&numeric_for.limit)
                 || expr_contains_unresolved(&numeric_for.step)
-                || numeric_for.body.stmts.iter().any(stmt_contains_unresolved_expr)
+                || numeric_for
+                    .body
+                    .stmts
+                    .iter()
+                    .any(stmt_contains_unresolved_expr)
         }
         HirStmt::GenericFor(generic_for) => {
             generic_for.iterator.iter().any(expr_contains_unresolved)
-                || generic_for.body.stmts.iter().any(stmt_contains_unresolved_expr)
+                || generic_for
+                    .body
+                    .stmts
+                    .iter()
+                    .any(stmt_contains_unresolved_expr)
         }
         HirStmt::Block(block) => block.stmts.iter().any(stmt_contains_unresolved_expr),
-        HirStmt::Unstructured(unstructured) => {
-            unstructured.body.stmts.iter().any(stmt_contains_unresolved_expr)
-        }
+        HirStmt::Unstructured(unstructured) => unstructured
+            .body
+            .stmts
+            .iter()
+            .any(stmt_contains_unresolved_expr),
         HirStmt::Break
         | HirStmt::Close(_)
         | HirStmt::Continue
@@ -234,20 +257,18 @@ fn expr_contains_unresolved(expr: &HirExpr) -> bool {
         HirExpr::Call(call) => {
             expr_contains_unresolved(&call.callee) || call.args.iter().any(expr_contains_unresolved)
         }
-        HirExpr::TableConstructor(table) => {
-            table.fields.iter().any(|field| match field {
-                crate::hir::common::HirTableField::Array(value) => expr_contains_unresolved(value),
-                crate::hir::common::HirTableField::Record(field) => {
-                    matches!(
-                        &field.key,
-                        crate::hir::common::HirTableKey::Expr(expr) if expr_contains_unresolved(expr)
-                    ) || expr_contains_unresolved(&field.value)
-                }
-            }) || table
-                .trailing_multivalue
-                .as_ref()
-                .is_some_and(expr_contains_unresolved)
-        }
+        HirExpr::TableConstructor(table) => table.fields.iter().any(|field| match field {
+            crate::hir::common::HirTableField::Array(value) => expr_contains_unresolved(value),
+            crate::hir::common::HirTableField::Record(field) => {
+                matches!(
+                    &field.key,
+                    crate::hir::common::HirTableKey::Expr(expr) if expr_contains_unresolved(expr)
+                ) || expr_contains_unresolved(&field.value)
+            }
+        }) || table
+            .trailing_multivalue
+            .as_ref()
+            .is_some_and(expr_contains_unresolved),
         HirExpr::Closure(closure) => closure
             .captures
             .iter()

@@ -16,6 +16,23 @@ use super::rewrites::lvalue_as_expr;
 use super::*;
 
 impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
+    fn branch_value_arm_target(
+        &self,
+        header: BlockRef,
+        value: &BranchValueMergeValue,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> HirLValue {
+        let phi_temp = self.lowering.bindings.phi_temps[value.phi_id.index()];
+        if let Some(target) = target_overrides.get(&phi_temp) {
+            return target.clone();
+        }
+        if let Some(target) = self.shared_branch_target_lvalue(header, value, target_overrides) {
+            return target;
+        }
+
+        HirLValue::Temp(phi_temp)
+    }
+
     fn branch_value_target_overrides_for_preds(
         &self,
         header: BlockRef,
@@ -36,11 +53,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             else {
                 continue;
             };
-            let phi_temp = self.lowering.bindings.phi_temps[value.phi_id.index()];
-            let target = target_overrides
-                .get(&phi_temp)
-                .cloned()
-                .unwrap_or(HirLValue::Temp(phi_temp));
+            let target = self.branch_value_arm_target(header, value, target_overrides);
             for incoming in phi
                 .incoming
                 .iter()

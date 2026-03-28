@@ -104,6 +104,39 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn lua53_hir_stage_keeps_branch_merge_inside_numeric_for_on_loop_state() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.3",
+            "tests/lua_cases/lua5.3/02_bitwise_closure_mesh.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua53,
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Normal,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.3 bitwise_closure_mesh hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(
+            dump.contains("assign u3[((# u3) + 1)] = (l1 ~ l0)"),
+            "{dump}"
+        );
+        assert!(!dump.contains("local [\"l5\"] = -"), "{dump}");
+        assert!(!dump.contains("local [\"l6\"] = -"), "{dump}");
+    }
+
+    #[test]
     fn lua53_readability_stage_merges_adjacent_local_decl_and_uses_lua_like_dump_syntax() {
         let chunk = crate::support::compile_lua_case(
             "lua5.3",
