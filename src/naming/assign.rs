@@ -15,7 +15,7 @@ use crate::hir::HirModule;
 use crate::parser::RawChunk;
 
 use super::NamingError;
-use super::allocate::assign_names_for_function;
+use super::allocate::{FunctionAssignContext, assign_names_for_function};
 use super::ast_facts::collect_ast_naming_facts;
 use super::common::{FunctionHints, ModuleNameAllocator, NameMap, NamingOptions};
 use super::evidence::build_naming_evidence;
@@ -41,18 +41,18 @@ pub fn assign_names(
     let mut module_names = ModuleNameAllocator::default();
     let mut functions = Vec::with_capacity(hir.protos.len());
     for proto in &hir.protos {
-        functions.push(assign_names_for_function(
+        functions.push(assign_names_for_function(FunctionAssignContext {
             proto,
-            &evidence.functions[proto.id.index()],
-            &hints[proto.id.index()],
-            &ast_facts.functions[proto.id.index()],
+            evidence: &evidence.functions[proto.id.index()],
+            hints: &hints[proto.id.index()],
+            ast_facts: &ast_facts.functions[proto.id.index()],
             options,
-            lexical_contexts
+            lexical: lexical_contexts
                 .function(proto.id)
                 .expect("lexical contexts should cover every HIR proto"),
-            &functions,
-            &mut module_names,
-        )?);
+            assigned_functions: &functions,
+            module_names: &mut module_names,
+        })?);
     }
 
     Ok(NameMap {

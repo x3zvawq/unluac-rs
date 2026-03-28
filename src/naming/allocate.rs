@@ -65,17 +65,31 @@ impl ModuleNameAllocator {
     }
 }
 
+pub(super) struct FunctionAssignContext<'a> {
+    pub proto: &'a HirProto,
+    pub evidence: &'a FunctionNamingEvidence,
+    pub hints: &'a FunctionHints,
+    pub ast_facts: &'a FunctionAstNamingFacts,
+    pub options: NamingOptions,
+    pub lexical: &'a FunctionLexicalContext,
+    pub assigned_functions: &'a [FunctionNameMap],
+    pub module_names: &'a mut ModuleNameAllocator,
+}
+
 /// 为单个函数分配最终名字。
 pub(super) fn assign_names_for_function(
-    proto: &HirProto,
-    evidence: &FunctionNamingEvidence,
-    hints: &FunctionHints,
-    ast_facts: &FunctionAstNamingFacts,
-    options: NamingOptions,
-    lexical: &FunctionLexicalContext,
-    assigned_functions: &[FunctionNameMap],
-    module_names: &mut ModuleNameAllocator,
+    context: FunctionAssignContext<'_>,
 ) -> Result<FunctionNameMap, NamingError> {
+    let FunctionAssignContext {
+        proto,
+        evidence,
+        hints,
+        ast_facts,
+        options,
+        lexical,
+        assigned_functions,
+        module_names,
+    } = context;
     let mut used = lua_keywords();
     let outer_visible_names = resolve_outer_visible_names(proto.id, lexical, assigned_functions)?;
     let upvalue_candidates = proto

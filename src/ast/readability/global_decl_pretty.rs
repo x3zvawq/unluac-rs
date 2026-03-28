@@ -405,6 +405,7 @@ fn collect_explicit_globals_in_lvalue(target: &AstLValue, names: &mut BTreeSet<S
 }
 
 fn collect_explicit_globals_in_expr(expr: &AstExpr, names: &mut BTreeSet<String>) {
+    let _ = names;
     match expr {
         AstExpr::FieldAccess(access) => collect_explicit_globals_in_expr(&access.base, names),
         AstExpr::IndexAccess(access) => {
@@ -981,9 +982,7 @@ fn collect_missing_globals_in_lvalue(
     match lvalue {
         AstLValue::Name(AstNameRef::Global(global)) => {
             if !outer_declared.contains(&global.text) && !explicit_here.contains(&global.text) {
-                if is_write {
-                    missing.note_none(&global.text);
-                } else if nested_written_here.contains(&global.text) {
+                if is_write || nested_written_here.contains(&global.text) {
                     missing.note_none(&global.text);
                 } else {
                     missing.note_const(&global.text);

@@ -38,6 +38,12 @@ struct FlatProto {
     child_indices: Vec<usize>,
 }
 
+struct LuauSymbolDebugInfo {
+    local_vars: Vec<RawLocalVar>,
+    local_regs: Vec<u8>,
+    upvalue_names: Vec<RawString>,
+}
+
 struct DecodedInstrs {
     instrs: Vec<RawInstr>,
     word_pc_by_raw: Vec<u32>,
@@ -531,7 +537,12 @@ impl LuauParserState {
 
         let debug_info_enabled = reader.read_u8()? != 0;
         let (local_vars, local_regs, upvalue_names) = if debug_info_enabled {
-            self.parse_symbol_debug_info(reader, raw_by_word_pc, upvalue_count)?
+            let symbols = self.parse_symbol_debug_info(reader, raw_by_word_pc, upvalue_count)?;
+            (
+                symbols.local_vars,
+                symbols.local_regs,
+                symbols.upvalue_names,
+            )
         } else {
             (Vec::new(), Vec::new(), Vec::new())
         };
@@ -592,7 +603,7 @@ impl LuauParserState {
         reader: &mut BinaryReader<'_>,
         raw_by_word_pc: &[Option<u32>],
         upvalue_count: u8,
-    ) -> Result<(Vec<RawLocalVar>, Vec<u8>, Vec<RawString>), ParseError> {
+    ) -> Result<LuauSymbolDebugInfo, ParseError> {
         let local_count = usize::try_from(self.read_varint_u32(reader, "luau local debug count")?)
             .map_err(|_| ParseError::IntegerOverflow {
                 field: "luau local debug count",
@@ -640,7 +651,11 @@ impl LuauParserState {
             }
         }
 
-        Ok((locals, regs, upvalue_names))
+        Ok(LuauSymbolDebugInfo {
+            local_vars: locals,
+            local_regs: regs,
+            upvalue_names,
+        })
     }
 
     fn read_string_ref(

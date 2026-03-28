@@ -467,11 +467,8 @@ fn flush_constructor_segment(
                     }
                     match queued_values.front() {
                         Some(front) if matches_binding_ref(front, binding) => {
-                            let Some(producer_value) =
-                                producer_value_for_binding(&producer_values, binding)
-                            else {
-                                return None;
-                            };
+                            let producer_value =
+                                producer_value_for_binding(&producer_values, binding)?;
                             if remaining_uses.contains(&binding) {
                                 return None;
                             }
@@ -975,7 +972,7 @@ fn inline_constructor_value_at_site(
             .map(|producer| producer.binding)
             .collect::<Vec<_>>(),
     ) {
-        return None;
+        None
     } else {
         Some(value.clone())
     }

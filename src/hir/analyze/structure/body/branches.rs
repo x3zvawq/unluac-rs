@@ -74,17 +74,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 self.branch_value_else_target_overrides(block, branch_target_overrides)
             })
             .unwrap_or_else(|| target_overrides.clone());
-        let then_block =
-            match self.lower_region(plan.then_entry, branch_stop, &then_target_overrides) {
-                Some(block) => block,
-                None => return None,
-            };
+        let then_block = self.lower_region(plan.then_entry, branch_stop, &then_target_overrides)?;
         let else_block = match plan.else_entry {
             Some(else_entry) => {
-                match self.lower_region(else_entry, branch_stop, &else_target_overrides) {
-                    Some(block) => Some(block),
-                    None => return None,
-                }
+                Some(self.lower_region(else_entry, branch_stop, &else_target_overrides)?)
             }
             None => None,
         };

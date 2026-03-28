@@ -138,9 +138,11 @@ fn collect_scope_intervals(stmts: &[HirStmt]) -> Vec<ScopeInterval> {
 
     intervals.sort_by_key(|interval| (interval.start, interval.end));
 
-    well_nested_scope_intervals(&intervals)
-        .then_some(intervals)
-        .unwrap_or_default()
+    if well_nested_scope_intervals(&intervals) {
+        intervals
+    } else {
+        Vec::new()
+    }
 }
 
 fn scope_start(stmts: &[HirStmt], index: usize) -> Option<ScopeStart> {

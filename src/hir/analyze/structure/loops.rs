@@ -65,14 +65,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.install_loop_exit_bindings(candidate, exit, &plan, target_overrides);
 
         self.active_loops.push(loop_context.clone());
-        let body = match self.lower_region(
+        let body = self.lower_region(
             body_entry,
             Some(candidate.header),
             &combined_target_overrides,
-        ) {
-            Some(body) => body,
-            None => return None,
-        };
+        )?;
         self.active_loops.pop();
         self.visited
             .extend(loop_context.break_exits.keys().copied());
@@ -189,20 +186,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         }
 
-        let Some(binding) = self
+        let binding = self
             .lowering
             .bindings
             .numeric_for_locals
             .get(&header)
-            .copied()
-        else {
-            return None;
-        };
-        let Some(plan) =
-            self.build_loop_state_plan(candidate, block, exit, &[init.index], target_overrides)
-        else {
-            return None;
-        };
+            .copied()?;
+        let plan =
+            self.build_loop_state_plan(candidate, block, exit, &[init.index], target_overrides)?;
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
         let mut suppressed = plan
@@ -227,27 +218,19 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let loop_context = self.build_active_loop_context(candidate, exit)?;
         self.active_loops.push(loop_context.clone());
         let body = if continue_block == header {
-            HirBlock {
-                stmts: match self.lower_block_prefix(header, false, &combined_target_overrides) {
-                    Some(stmts) => stmts,
-                    None => return None,
-                },
-            }
+            let stmts = self.lower_block_prefix(header, false, &combined_target_overrides)?;
+            HirBlock { stmts }
         } else {
-            let mut stmts = match self.lower_region_with_suppressed_loop(
-                header,
-                Some(continue_block),
-                &combined_target_overrides,
-                Some(header),
-            ) {
-                Some(block) => block.stmts,
-                None => return None,
-            };
-            let Some(prefix) =
-                self.lower_block_prefix(continue_block, false, &combined_target_overrides)
-            else {
-                return None;
-            };
+            let mut stmts = self
+                .lower_region_with_suppressed_loop(
+                    header,
+                    Some(continue_block),
+                    &combined_target_overrides,
+                    Some(header),
+                )?
+                .stmts;
+            let prefix =
+                self.lower_block_prefix(continue_block, false, &combined_target_overrides)?;
             stmts.extend(prefix);
             HirBlock { stmts }
         };

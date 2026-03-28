@@ -57,6 +57,17 @@ pub(crate) struct LuaJitParser {
     options: ParseOptions,
 }
 
+struct LuaJitDebugInfoInput<'a> {
+    bytes: &'a [u8],
+    base_offset: usize,
+    instruction_count: usize,
+    upvalue_count: u8,
+    first_line: u32,
+    line_count: u32,
+    debug_size: u32,
+    stripped: bool,
+}
+
 impl LuaJitParser {
     pub(crate) const fn new(options: ParseOptions) -> Self {
         Self { options }
@@ -248,16 +259,16 @@ impl LuaJitParser {
         } else {
             let debug_offset = reader.offset();
             let debug_bytes = reader.read_exact(debug_size as usize)?;
-            self.parse_debug_info(
-                debug_bytes,
-                base_offset + debug_offset,
+            self.parse_debug_info(LuaJitDebugInfoInput {
+                bytes: debug_bytes,
+                base_offset: base_offset + debug_offset,
                 instruction_count,
                 upvalue_count,
-                first_line.unwrap_or_default(),
-                line_count.unwrap_or_default(),
+                first_line: first_line.unwrap_or_default(),
+                line_count: line_count.unwrap_or_default(),
                 debug_size,
                 stripped,
-            )?
+            })?
         };
 
         if reader.remaining() != 0 {
@@ -591,15 +602,19 @@ impl LuaJitParser {
 
     fn parse_debug_info(
         &self,
-        bytes: &[u8],
-        base_offset: usize,
-        instruction_count: usize,
-        upvalue_count: u8,
-        first_line: u32,
-        line_count: u32,
-        debug_size: u32,
-        stripped: bool,
+        input: LuaJitDebugInfoInput<'_>,
     ) -> Result<RawDebugInfo, ParseError> {
+        let LuaJitDebugInfoInput {
+            bytes,
+            base_offset,
+            instruction_count,
+            upvalue_count,
+            first_line,
+            line_count,
+            debug_size,
+            stripped,
+        } = input;
+
         let mut reader = BinaryReader::new(bytes);
         let line_width = if line_count < 256 {
             1
