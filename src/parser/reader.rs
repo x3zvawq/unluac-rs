@@ -164,4 +164,68 @@ impl<'a> BinaryReader<'a> {
             }
         }
     }
+
+    pub(crate) fn read_uleb128_u32(&mut self, field: &'static str) -> Result<u32, ParseError> {
+        let mut value = 0_u32;
+        let mut shift = 0_u32;
+
+        loop {
+            let byte = self.read_u8()?;
+            let payload = u32::from(byte & 0x7f);
+            if shift >= 32 || (payload << shift) >> shift != payload {
+                return Err(ParseError::IntegerOverflow {
+                    field,
+                    value: u64::from(value),
+                });
+            }
+            value |= payload << shift;
+            if (byte & 0x80) == 0 {
+                return Ok(value);
+            }
+            shift += 7;
+            if shift >= 32 {
+                return Err(ParseError::IntegerOverflow {
+                    field,
+                    value: u64::from(value),
+                });
+            }
+        }
+    }
+
+    pub(crate) fn read_uleb128_33(
+        &mut self,
+        field: &'static str,
+    ) -> Result<(u32, bool), ParseError> {
+        let first = self.read_u8()?;
+        let is_wide = (first & 1) != 0;
+        let mut value = u32::from(first >> 1);
+
+        if value < 0x40 {
+            return Ok((value, is_wide));
+        }
+
+        value &= 0x3f;
+        let mut shift = 6_u32;
+        loop {
+            let byte = self.read_u8()?;
+            let payload = u32::from(byte & 0x7f);
+            if shift >= 32 || (payload << shift) >> shift != payload {
+                return Err(ParseError::IntegerOverflow {
+                    field,
+                    value: u64::from(value),
+                });
+            }
+            value |= payload << shift;
+            if (byte & 0x80) == 0 {
+                return Ok((value, is_wide));
+            }
+            shift += 7;
+            if shift >= 32 {
+                return Err(ParseError::IntegerOverflow {
+                    field,
+                    value: u64::from(value),
+                });
+            }
+        }
+    }
 }

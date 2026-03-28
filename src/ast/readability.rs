@@ -10,6 +10,7 @@ mod global_decl_pretty;
 mod inline_exprs;
 mod local_coalesce;
 mod loop_header_merge;
+mod luajit_goto_safety;
 mod materialize_temps;
 mod short_circuit_pretty;
 mod statement_merge;
@@ -152,6 +153,14 @@ const GLOBAL_DECL_PRETTY_STAGE: ReadabilityStage = ReadabilityStage {
     ],
 };
 
+const LUAJIT_GOTO_SAFETY_STAGE: ReadabilityStage = ReadabilityStage {
+    name: "luajit-goto-safety",
+    passes: &[ReadabilityPass {
+        name: "luajit-goto-safety",
+        apply: luajit_goto_safety::apply,
+    }],
+};
+
 const TEMP_MATERIALIZE_STAGE: ReadabilityStage = ReadabilityStage {
     name: "temp-materialize",
     passes: &[ReadabilityPass {
@@ -172,6 +181,7 @@ const READABILITY_STAGES: &[ReadabilityStage] = &[
     TEMP_MATERIALIZE_STAGE,
     FUNCTION_SUGAR_STAGE,
     GLOBAL_DECL_PRETTY_STAGE,
+    LUAJIT_GOTO_SAFETY_STAGE,
 ];
 
 const MAX_STAGE_ROUNDS: usize = 64;

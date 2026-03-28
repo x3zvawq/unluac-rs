@@ -12,6 +12,8 @@ use crate::parser::DialectVersion;
 pub enum TransformError {
     #[error("unsupported transform dialect `{version:?}`")]
     UnsupportedDialect { version: DialectVersion },
+    #[error("unsupported opcode `{opcode}` at raw pc {raw_pc}")]
+    UnsupportedOpcode { raw_pc: u32, opcode: &'static str },
     #[error("unexpected operands for opcode `{opcode}` at raw pc {raw_pc}: expected {expected}")]
     UnexpectedOperands {
         raw_pc: u32,

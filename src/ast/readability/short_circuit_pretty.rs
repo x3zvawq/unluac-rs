@@ -177,6 +177,9 @@ fn rewrite_expr(expr: &mut AstExpr) -> bool {
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg => false,
     };
@@ -200,6 +203,12 @@ fn hir_from_ast_expr(expr: &AstExpr) -> Option<HirExpr> {
         AstExpr::Integer(value) => Some(HirExpr::Integer(*value)),
         AstExpr::Number(value) => Some(HirExpr::Number(*value)),
         AstExpr::String(value) => Some(HirExpr::String(value.clone())),
+        AstExpr::Int64(value) => Some(HirExpr::Int64(*value)),
+        AstExpr::UInt64(value) => Some(HirExpr::UInt64(*value)),
+        AstExpr::Complex { real, imag } => Some(HirExpr::Complex {
+            real: *real,
+            imag: *imag,
+        }),
         AstExpr::Var(name) => match name {
             super::super::common::AstNameRef::Param(param) => Some(HirExpr::ParamRef(*param)),
             super::super::common::AstNameRef::Local(local) => Some(HirExpr::LocalRef(*local)),
@@ -250,6 +259,12 @@ fn ast_from_hir_expr(expr: &HirExpr) -> Option<AstExpr> {
         HirExpr::Integer(value) => Some(AstExpr::Integer(*value)),
         HirExpr::Number(value) => Some(AstExpr::Number(*value)),
         HirExpr::String(value) => Some(AstExpr::String(value.clone())),
+        HirExpr::Int64(value) => Some(AstExpr::Int64(*value)),
+        HirExpr::UInt64(value) => Some(AstExpr::UInt64(*value)),
+        HirExpr::Complex { real, imag } => Some(AstExpr::Complex {
+            real: *real,
+            imag: *imag,
+        }),
         HirExpr::ParamRef(param) => Some(AstExpr::Var(super::super::common::AstNameRef::Param(
             *param,
         ))),

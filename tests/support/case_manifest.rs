@@ -13,6 +13,7 @@ pub(crate) enum LuaCaseDialect {
     Lua53,
     Lua54,
     Lua55,
+    Luajit,
     Luau,
 }
 
@@ -24,6 +25,7 @@ impl LuaCaseDialect {
             Self::Lua53 => "lua5.3",
             Self::Lua54 => "lua5.4",
             Self::Lua55 => "lua5.5",
+            Self::Luajit => "luajit",
             Self::Luau => "luau",
         }
     }
@@ -35,6 +37,7 @@ impl LuaCaseDialect {
             Self::Lua53 => Some(DecompileDialect::Lua53),
             Self::Lua54 => Some(DecompileDialect::Lua54),
             Self::Lua55 => Some(DecompileDialect::Lua55),
+            Self::Luajit => Some(DecompileDialect::Luajit),
             Self::Luau => Some(DecompileDialect::Luau),
         }
     }
@@ -102,6 +105,7 @@ const ALL_DIALECTS: &[LuaCaseDialect] = &[
     LuaCaseDialect::Lua53,
     LuaCaseDialect::Lua54,
     LuaCaseDialect::Lua55,
+    LuaCaseDialect::Luajit,
     LuaCaseDialect::Luau,
 ];
 const PUC_LUA_51: &[LuaCaseDialect] = &[LuaCaseDialect::Lua51];
@@ -119,6 +123,7 @@ const PUC_LUA_GE_53: &[LuaCaseDialect] = &[
 const PUC_LUA_GE_54: &[LuaCaseDialect] = &[LuaCaseDialect::Lua54, LuaCaseDialect::Lua55];
 const PUC_LUA_GE_55: &[LuaCaseDialect] = &[LuaCaseDialect::Lua55];
 const LUAU_ONLY: &[LuaCaseDialect] = &[LuaCaseDialect::Luau];
+const LUAJIT_ONLY: &[LuaCaseDialect] = &[LuaCaseDialect::Luajit];
 
 pub(crate) const ALL_CASES: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new(
@@ -488,6 +493,46 @@ pub(crate) const ALL_CASES: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/luau/10_nested_continue_closure_mesh.lua",
         LUAU_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/lua_cases/luajit/01_goto_cdata_accumulator.lua",
+        LUAJIT_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/lua_cases/luajit/02_imaginary_wave_fold.lua",
+        LUAJIT_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/lua_cases/luajit/03_ffi_struct_goto_mesh.lua",
+        LUAJIT_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/lua_cases/luajit/04_bit_cdata_pipeline.lua",
+        LUAJIT_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/lua_cases/luajit/05_hexfloat_dispatch.lua",
+        LUAJIT_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/lua_cases/luajit/06_label_closure_reentry.lua",
+        LUAJIT_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/lua_cases/luajit/07_ffi_metatype_counter.lua",
+        LUAJIT_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/lua_cases/luajit/08_imaginary_branch_mesh.lua",
+        LUAJIT_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/lua_cases/luajit/09_ull_table_rotation.lua",
+        LUAJIT_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/lua_cases/luajit/10_jit_status_hexfloat.lua",
+        LUAJIT_ONLY,
     ),
 ];
 

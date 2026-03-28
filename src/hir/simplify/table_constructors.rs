@@ -385,6 +385,7 @@ fn flush_constructor_segment(
     allow_closure_records: bool,
 ) -> Option<()> {
     if segment.is_empty() {
+        normalize_sequential_integer_record_fields(constructor);
         if let Some(set_list) = set_list {
             if set_list.start_index != next_array_index(constructor) {
                 return None;
@@ -494,7 +495,7 @@ fn flush_constructor_segment(
                     }
                 }
                 SegmentToken::Record(field) => {
-                    constructor.fields.push(HirTableField::Record(field))
+                    push_constructor_field(constructor, field);
                 }
             }
         }
@@ -526,10 +527,11 @@ fn flush_constructor_segment(
                 SegmentToken::Producer(binding) if !consumed.contains(&binding) => return None,
                 SegmentToken::Producer(_) => {}
                 SegmentToken::Record(field) => {
-                    constructor.fields.push(HirTableField::Record(field))
+                    push_constructor_field(constructor, field);
                 }
             }
         }
+        normalize_sequential_integer_record_fields(constructor);
     }
 
     if producer_values.iter().any(|producer| {
@@ -558,6 +560,63 @@ fn next_array_index(constructor: &HirTableConstructor) -> u32 {
         .filter(|field| matches!(field, HirTableField::Array(_)))
         .count() as u32
         + 1
+}
+
+fn push_constructor_field(
+    constructor: &mut HirTableConstructor,
+    field: crate::hir::common::HirRecordField,
+) {
+    let next_index = i64::from(next_array_index(constructor));
+    match &field.key {
+        HirTableKey::Expr(HirExpr::Integer(value)) if *value == next_index => {
+            constructor.fields.push(HirTableField::Array(field.value));
+        }
+        _ => constructor.fields.push(HirTableField::Record(field)),
+    }
+}
+
+fn normalize_sequential_integer_record_fields(constructor: &mut HirTableConstructor) {
+    loop {
+        let next_index = i64::from(next_array_index(constructor));
+        let Some(record_index) = constructor.fields.iter().position(|field| {
+            let HirTableField::Record(field) = field else {
+                return false;
+            };
+            matches!(&field.key, HirTableKey::Expr(HirExpr::Integer(value)) if *value == next_index)
+                && can_reorder_integer_record_value(&field.value)
+        }) else {
+            break;
+        };
+        let HirTableField::Record(field) = constructor.fields.remove(record_index) else {
+            unreachable!("record field position was validated above");
+        };
+        constructor.fields.push(HirTableField::Array(field.value));
+    }
+}
+
+fn can_reorder_integer_record_value(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
+        | HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::TempRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::Closure(_) => true,
+        HirExpr::Unary(unary) => can_reorder_integer_record_value(&unary.expr),
+        HirExpr::Binary(binary) => {
+            can_reorder_integer_record_value(&binary.lhs)
+                && can_reorder_integer_record_value(&binary.rhs)
+        }
+        _ => false,
+    }
 }
 
 fn binding_from_lvalue(lvalue: &HirLValue) -> Option<TableBinding> {
@@ -771,6 +830,9 @@ fn collect_expr_bindings(expr: &HirExpr, bindings: &mut std::collections::BTreeS
         | HirExpr::Integer(_)
         | HirExpr::Number(_)
         | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::UpvalueRef(_)
         | HirExpr::GlobalRef(_)
@@ -926,6 +988,9 @@ fn is_constructor_access_base_inline_expr(expr: &HirExpr) -> bool {
         | HirExpr::Integer(_)
         | HirExpr::Number(_)
         | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)
         | HirExpr::UpvalueRef(_)
@@ -1000,6 +1065,9 @@ fn expr_uses_binding(expr: &HirExpr, binding: TableBinding) -> bool {
         | HirExpr::Integer(_)
         | HirExpr::Number(_)
         | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::UpvalueRef(_)
         | HirExpr::GlobalRef(_)

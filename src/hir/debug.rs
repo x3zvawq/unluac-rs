@@ -231,6 +231,9 @@ fn format_expr(expr: &HirExpr) -> String {
         HirExpr::Integer(value) => value.to_string(),
         HirExpr::Number(value) => value.to_string(),
         HirExpr::String(value) => format!("{value:?}"),
+        HirExpr::Int64(value) => format!("{value}LL"),
+        HirExpr::UInt64(value) => format!("{value}ULL"),
+        HirExpr::Complex { real, imag } => format_complex_literal(*real, *imag),
         HirExpr::ParamRef(param) => format!("p{}", param.index()),
         HirExpr::LocalRef(local) => format!("l{}", local.index()),
         HirExpr::UpvalueRef(upvalue) => format!("u{}", upvalue.index()),
@@ -301,6 +304,14 @@ fn format_expr(expr: &HirExpr) -> String {
         ),
         HirExpr::Unresolved(unresolved) => format!("unresolved({})", unresolved.summary),
     }
+}
+
+fn format_complex_literal(real: f64, imag: f64) -> String {
+    if real == 0.0 {
+        return format!("{imag}i");
+    }
+    let sign = if imag.is_sign_negative() { "-" } else { "+" };
+    format!("({real} {sign} {}i)", imag.abs())
 }
 
 fn format_decision_expr(decision: &HirDecisionExpr) -> String {

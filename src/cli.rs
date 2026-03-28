@@ -21,6 +21,7 @@ const DEFAULT_SOURCE: &str = "tests/lua_cases/common/control_flow/07_branch_stat
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum CompilerProtocol {
     LuacStyle,
+    LuaJitBytecodeTool,
     LuauBinaryStdout,
 }
 
@@ -362,6 +363,24 @@ fn compile_source(options: &CliOptions, source: &Path) -> Result<PathBuf, CliErr
                 )));
             }
         }
+        CompilerProtocol::LuaJitBytecodeTool => {
+            let status = Command::new(&compiler)
+                .arg(source)
+                .arg(&output)
+                .status()
+                .map_err(|source_error| CliError::Io {
+                    action: "spawn compiler",
+                    path: compiler.clone(),
+                    source: source_error,
+                })?;
+
+            if !status.success() {
+                return Err(CliError::Process(format!(
+                    "compiler exited with status {status} while compiling {}",
+                    source.display()
+                )));
+            }
+        }
         CompilerProtocol::LuauBinaryStdout => {
             let command_output = Command::new(&compiler)
                 .arg("--binary")
@@ -411,6 +430,7 @@ fn resolve_compiler(options: &CliOptions) -> Result<PathBuf, CliError> {
         DecompileDialect::Lua53 => PathBuf::from("lua5.3"),
         DecompileDialect::Lua54 => PathBuf::from("lua5.4"),
         DecompileDialect::Lua55 => PathBuf::from("lua5.5"),
+        DecompileDialect::Luajit => PathBuf::from("luajit"),
         DecompileDialect::Luau => PathBuf::from("luau-compile"),
     })
 }
@@ -422,6 +442,7 @@ fn compiler_protocol(dialect: DecompileDialect) -> CompilerProtocol {
         | DecompileDialect::Lua53
         | DecompileDialect::Lua54
         | DecompileDialect::Lua55 => CompilerProtocol::LuacStyle,
+        DecompileDialect::Luajit => CompilerProtocol::LuaJitBytecodeTool,
         DecompileDialect::Luau => CompilerProtocol::LuauBinaryStdout,
     }
 }
@@ -433,6 +454,7 @@ fn bundled_compiler_name(dialect: DecompileDialect) -> &'static str {
         | DecompileDialect::Lua53
         | DecompileDialect::Lua54
         | DecompileDialect::Lua55 => "luac",
+        DecompileDialect::Luajit => "luac",
         DecompileDialect::Luau => "luau-compile",
     }
 }
@@ -444,6 +466,7 @@ fn compiled_chunk_extension(dialect: DecompileDialect) -> &'static str {
         | DecompileDialect::Lua53
         | DecompileDialect::Lua54
         | DecompileDialect::Lua55 => "out",
+        DecompileDialect::Luajit => "luajit",
         DecompileDialect::Luau => "luau",
     }
 }
@@ -518,6 +541,9 @@ fn print_help() {
     );
     println!(
         "  cargo run -- --dialect=lua5.4 --source tests/lua_cases/lua5.4/01_tbc_close.lua --stop-after=transform --dump=transform"
+    );
+    println!(
+        "  cargo run -- --dialect=luajit --source tests/lua_cases/luajit/01_goto_cdata_accumulator.lua --stop-after=parse --dump=parse"
     );
     println!(
         "  cargo run -- --dialect=lua5.5 --source tests/lua_cases/lua5.5/03_named_vararg_basic.lua --stop-after=hir --dump=hir"

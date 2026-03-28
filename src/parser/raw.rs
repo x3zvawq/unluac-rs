@@ -25,6 +25,10 @@ use super::dialect::lua55::{
     Lua55ConstPoolExtra, Lua55DebugExtra, Lua55HeaderExtra, Lua55InstrExtra, Lua55Opcode,
     Lua55Operands, Lua55ProtoExtra, Lua55UpvalueExtra,
 };
+use super::dialect::luajit::{
+    LuaJitConstPoolExtra, LuaJitDebugExtra, LuaJitHeaderExtra, LuaJitInstrExtra, LuaJitOpcode,
+    LuaJitOperands, LuaJitProtoExtra, LuaJitUpvalueExtra,
+};
 use super::dialect::luau::{
     LuauConstPoolExtra, LuauDebugExtra, LuauHeaderExtra, LuauInstrExtra, LuauOpcode, LuauOperands,
     LuauProtoExtra, LuauUpvalueExtra,
@@ -52,6 +56,7 @@ pub struct ChunkHeader {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChunkLayout {
     PucLua(PucLuaChunkLayout),
+    LuaJit(LuaJitChunkLayout),
     Luau(LuauChunkLayout),
 }
 
@@ -75,17 +80,32 @@ pub struct LuauChunkLayout {
     pub type_version: Option<u8>,
 }
 
+/// LuaJIT dump chunk 的头信息。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct LuaJitChunkLayout {
+    pub dump_version: u8,
+    pub flags: u32,
+}
+
 impl ChunkHeader {
     pub fn puc_lua_layout(&self) -> Option<&PucLuaChunkLayout> {
         match &self.layout {
             ChunkLayout::PucLua(layout) => Some(layout),
+            ChunkLayout::LuaJit(_) | ChunkLayout::Luau(_) => None,
+        }
+    }
+
+    pub fn luajit_layout(&self) -> Option<&LuaJitChunkLayout> {
+        match &self.layout {
+            ChunkLayout::LuaJit(layout) => Some(layout),
             ChunkLayout::Luau(_) => None,
+            ChunkLayout::PucLua(_) => None,
         }
     }
 
     pub fn luau_layout(&self) -> Option<&LuauChunkLayout> {
         match &self.layout {
-            ChunkLayout::PucLua(_) => None,
+            ChunkLayout::PucLua(_) | ChunkLayout::LuaJit(_) => None,
             ChunkLayout::Luau(layout) => Some(layout),
         }
     }
@@ -95,6 +115,7 @@ impl ChunkHeader {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Dialect {
     PucLua,
+    LuaJit,
     Luau,
 }
 
@@ -106,6 +127,7 @@ pub enum DialectVersion {
     Lua53,
     Lua54,
     Lua55,
+    LuaJit,
     Luau,
 }
 
@@ -185,6 +207,9 @@ pub enum RawLiteralConst {
     Integer(i64),
     Number(f64),
     String(RawString),
+    Int64(i64),
+    UInt64(u64),
+    Complex { real: f64, imag: f64 },
 }
 
 /// parser 暴露给后续层的 upvalue 信息。
@@ -248,6 +273,7 @@ pub enum RawInstrOpcode {
     Lua53(Lua53Opcode),
     Lua54(Lua54Opcode),
     Lua55(Lua55Opcode),
+    LuaJit(LuaJitOpcode),
     Luau(LuauOpcode),
 }
 
@@ -259,6 +285,7 @@ pub enum RawInstrOperands {
     Lua53(Lua53Operands),
     Lua54(Lua54Operands),
     Lua55(Lua55Operands),
+    LuaJit(LuaJitOperands),
     Luau(LuauOperands),
 }
 
@@ -299,6 +326,7 @@ pub enum DialectHeaderExtra {
     Lua53(Lua53HeaderExtra),
     Lua54(Lua54HeaderExtra),
     Lua55(Lua55HeaderExtra),
+    LuaJit(LuaJitHeaderExtra),
     Luau(LuauHeaderExtra),
 }
 
@@ -310,6 +338,7 @@ pub enum DialectProtoExtra {
     Lua53(Lua53ProtoExtra),
     Lua54(Lua54ProtoExtra),
     Lua55(Lua55ProtoExtra),
+    LuaJit(LuaJitProtoExtra),
     Luau(LuauProtoExtra),
 }
 
@@ -321,6 +350,7 @@ pub enum DialectConstPoolExtra {
     Lua53(Lua53ConstPoolExtra),
     Lua54(Lua54ConstPoolExtra),
     Lua55(Lua55ConstPoolExtra),
+    LuaJit(LuaJitConstPoolExtra),
     Luau(LuauConstPoolExtra),
 }
 
@@ -332,6 +362,7 @@ pub enum DialectUpvalueExtra {
     Lua53(Lua53UpvalueExtra),
     Lua54(Lua54UpvalueExtra),
     Lua55(Lua55UpvalueExtra),
+    LuaJit(LuaJitUpvalueExtra),
     Luau(LuauUpvalueExtra),
 }
 
@@ -343,6 +374,7 @@ pub enum DialectDebugExtra {
     Lua53(Lua53DebugExtra),
     Lua54(Lua54DebugExtra),
     Lua55(Lua55DebugExtra),
+    LuaJit(LuaJitDebugExtra),
     Luau(LuauDebugExtra),
 }
 
@@ -354,5 +386,6 @@ pub enum DialectInstrExtra {
     Lua53(Lua53InstrExtra),
     Lua54(Lua54InstrExtra),
     Lua55(Lua55InstrExtra),
+    LuaJit(LuaJitInstrExtra),
     Luau(LuauInstrExtra),
 }

@@ -131,6 +131,12 @@ impl<'a> AstLowerer<'a> {
             HirExpr::Integer(value) => AstExpr::Integer(*value),
             HirExpr::Number(value) => AstExpr::Number(*value),
             HirExpr::String(value) => AstExpr::String(value.clone()),
+            HirExpr::Int64(value) => AstExpr::Int64(*value),
+            HirExpr::UInt64(value) => AstExpr::UInt64(*value),
+            HirExpr::Complex { real, imag } => AstExpr::Complex {
+                real: *real,
+                imag: *imag,
+            },
             HirExpr::ParamRef(param) => AstExpr::Var(AstNameRef::Param(*param)),
             HirExpr::LocalRef(local) => AstExpr::Var(AstNameRef::Local(*local)),
             HirExpr::UpvalueRef(upvalue) => AstExpr::Var(AstNameRef::Upvalue(*upvalue)),

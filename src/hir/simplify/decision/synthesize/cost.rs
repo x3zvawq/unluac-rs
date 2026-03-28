@@ -49,6 +49,9 @@ fn structural_expr_cost(expr: &HirExpr) -> usize {
         | HirExpr::Integer(_)
         | HirExpr::Number(_)
         | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)
         | HirExpr::UpvalueRef(_)
@@ -119,6 +122,9 @@ fn collect_branch_subexprs<'a>(expr: &'a HirExpr, out: &mut Vec<&'a HirExpr>) {
         | HirExpr::Integer(_)
         | HirExpr::Number(_)
         | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)
         | HirExpr::UpvalueRef(_)
@@ -141,6 +147,9 @@ enum ExprShapeKey<'a> {
     Integer(i64),
     Number(u64),
     String(&'a str),
+    Int64(i64),
+    UInt64(u64),
+    Complex { real_bits: u64, imag_bits: u64 },
     Param(usize),
     Local(usize),
     Upvalue(usize),
@@ -166,6 +175,12 @@ fn expr_shape_key<'a>(expr: &'a HirExpr) -> ExprShapeKey<'a> {
         HirExpr::Integer(value) => ExprShapeKey::Integer(*value),
         HirExpr::Number(value) => ExprShapeKey::Number(value.to_bits()),
         HirExpr::String(value) => ExprShapeKey::String(value.as_str()),
+        HirExpr::Int64(value) => ExprShapeKey::Int64(*value),
+        HirExpr::UInt64(value) => ExprShapeKey::UInt64(*value),
+        HirExpr::Complex { real, imag } => ExprShapeKey::Complex {
+            real_bits: real.to_bits(),
+            imag_bits: imag.to_bits(),
+        },
         HirExpr::ParamRef(param) => ExprShapeKey::Param(param.index()),
         HirExpr::LocalRef(local) => ExprShapeKey::Local(local.index()),
         HirExpr::UpvalueRef(upvalue) => ExprShapeKey::Upvalue(upvalue.index()),
@@ -217,6 +232,9 @@ fn or_chain_penalty(expr: &HirExpr) -> usize {
         | HirExpr::Integer(_)
         | HirExpr::Number(_)
         | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)
         | HirExpr::UpvalueRef(_)
@@ -257,6 +275,9 @@ fn logical_shape_penalty(expr: &HirExpr) -> usize {
         | HirExpr::Integer(_)
         | HirExpr::Number(_)
         | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)
         | HirExpr::UpvalueRef(_)
@@ -329,6 +350,9 @@ fn expr_is_compact_logical_branch(expr: &HirExpr) -> bool {
             | HirExpr::Integer(_)
             | HirExpr::Number(_)
             | HirExpr::String(_)
+            | HirExpr::Int64(_)
+            | HirExpr::UInt64(_)
+            | HirExpr::Complex { .. }
             | HirExpr::ParamRef(_)
             | HirExpr::LocalRef(_)
             | HirExpr::UpvalueRef(_)
@@ -377,6 +401,9 @@ fn collect_atomic_occurrences<'a>(expr: &'a HirExpr, atoms: &mut Vec<AtomicOccur
         | HirExpr::Integer(_)
         | HirExpr::Number(_)
         | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)
         | HirExpr::UpvalueRef(_)
@@ -416,6 +443,9 @@ fn is_atomic_expr(expr: &HirExpr) -> bool {
             | HirExpr::Integer(_)
             | HirExpr::Number(_)
             | HirExpr::String(_)
+            | HirExpr::Int64(_)
+            | HirExpr::UInt64(_)
+            | HirExpr::Complex { .. }
             | HirExpr::ParamRef(_)
             | HirExpr::LocalRef(_)
             | HirExpr::UpvalueRef(_)

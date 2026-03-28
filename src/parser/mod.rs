@@ -17,6 +17,7 @@ pub use dialect::lua52::*;
 pub use dialect::lua53::*;
 pub use dialect::lua54::*;
 pub use dialect::lua55::*;
+pub use dialect::luajit::*;
 pub use dialect::luau::*;
 pub use error::ParseError;
 pub use options::{ParseMode, ParseOptions, StringDecodeMode, StringEncoding};
@@ -27,6 +28,7 @@ use dialect::lua52::Lua52Parser;
 use dialect::lua53::Lua53Parser;
 use dialect::lua54::Lua54Parser;
 use dialect::lua55::Lua55Parser;
+use dialect::luajit::LuaJitParser;
 use dialect::luau::LuauParser;
 
 const LUA_SIGNATURE: &[u8; 4] = b"\x1bLua";
@@ -83,6 +85,11 @@ pub fn parse_lua54_chunk(bytes: &[u8], options: ParseOptions) -> Result<RawChunk
 /// 直接按 Lua 5.5 规则解析 chunk，不做版本自动探测。
 pub fn parse_lua55_chunk(bytes: &[u8], options: ParseOptions) -> Result<RawChunk, ParseError> {
     Lua55Parser::new(options).parse(bytes)
+}
+
+/// LuaJIT 入口保留显式 dialect 分派，不走 PUC-Lua 自动探测。
+pub fn parse_luajit_chunk(bytes: &[u8], options: ParseOptions) -> Result<RawChunk, ParseError> {
+    LuaJitParser::new(options).parse(bytes)
 }
 
 /// Luau 入口先只保留显式 dialect 分派位，避免调用方继续误走 PUC-Lua 自动探测。

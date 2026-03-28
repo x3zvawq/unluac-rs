@@ -294,6 +294,9 @@ fn collect_expr_hints(
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg => Ok(()),
     }
@@ -474,6 +477,9 @@ fn candidate_from_expr(expr: &AstExpr) -> Option<(String, NameSource)> {
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg => None,
     }

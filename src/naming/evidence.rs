@@ -270,6 +270,9 @@ fn collect_capture_evidence_in_expr(
         | HirExpr::Integer(_)
         | HirExpr::Number(_)
         | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)
         | HirExpr::UpvalueRef(_)
@@ -354,6 +357,9 @@ fn captured_binding_from_expr(parent: HirProtoRef, expr: &HirExpr) -> Option<Cap
         | HirExpr::Integer(_)
         | HirExpr::Number(_)
         | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
         | HirExpr::TempRef(_)
         | HirExpr::GlobalRef(_)
         | HirExpr::VarArg

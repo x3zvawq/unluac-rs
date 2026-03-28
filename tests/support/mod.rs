@@ -43,6 +43,7 @@ impl LuaCommandOutput {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum LuaCompilerProtocol {
     LuacStyle,
+    LuaJitBytecodeTool,
     LuauBinaryStdout,
 }
 
@@ -75,11 +76,22 @@ impl LuaToolchain {
             can_run_compiled_chunks: false,
         }
     }
+
+    const fn luajit() -> Self {
+        Self {
+            runtime_name: "luajit",
+            compiler_name: "luac",
+            compiler_protocol: LuaCompilerProtocol::LuaJitBytecodeTool,
+            chunk_extension: "luajit",
+            can_run_compiled_chunks: true,
+        }
+    }
 }
 
 fn lua_toolchain(dialect_label: &str) -> Result<LuaToolchain, String> {
     match dialect_label {
         "lua5.1" | "lua5.2" | "lua5.3" | "lua5.4" | "lua5.5" => Ok(LuaToolchain::stock_puc_lua()),
+        "luajit" => Ok(LuaToolchain::luajit()),
         "luau" => Ok(LuaToolchain::luau()),
         _ => Err(format!("unknown Lua dialect label: {dialect_label}")),
     }
@@ -845,6 +857,24 @@ fn run_compiler_to_output_path(
             }
             command.arg("-o").arg(output).arg(source);
             let output = command.output().map_err(|error| {
+                format!(
+                    "should spawn compiler {} for {}: {error}",
+                    compiler.display(),
+                    source.display()
+                )
+            })?;
+            Ok(LuaCommandOutput {
+                status_code: output.status.code(),
+                stdout: output.stdout,
+                stderr: output.stderr,
+            })
+        }
+        LuaCompilerProtocol::LuaJitBytecodeTool => {
+            let mut command = Command::new(compiler);
+            if strip_debug {
+                command.arg("-s");
+            }
+            let output = command.arg(source).arg(output).output().map_err(|error| {
                 format!(
                     "should spawn compiler {} for {}: {error}",
                     compiler.display(),

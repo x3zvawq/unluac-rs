@@ -194,6 +194,9 @@ fn rewrite_nested_functions_in_expr(expr: &mut AstExpr) -> bool {
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg => false,
     }
@@ -471,6 +474,9 @@ fn rewrite_binding_in_expr(expr: &mut AstExpr, carried: AstBindingRef, seed: Ast
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::VarArg => {}
     }
 }
@@ -614,6 +620,9 @@ fn expr_references_binding(expr: &AstExpr, binding: AstBindingRef) -> bool {
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::VarArg => false,
     }
 }

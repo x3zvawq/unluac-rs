@@ -24,13 +24,13 @@ pub enum ParseError {
     UnsupportedVersion { found: u8 },
     #[error("unsupported PUC-Lua header format {found}")]
     UnsupportedHeaderFormat { found: u8 },
-    #[error("unsupported {field} size {value} in PUC-Lua chunk")]
+    #[error("unsupported {field} size {value} in bytecode chunk")]
     UnsupportedSize { field: &'static str, value: u8 },
-    #[error("unsupported {field} value {value} in PUC-Lua chunk")]
+    #[error("unsupported {field} value {value} in bytecode chunk")]
     UnsupportedValue { field: &'static str, value: u64 },
     #[error("integer overflow while decoding {field}: {value}")]
     IntegerOverflow { field: &'static str, value: u64 },
-    #[error("negative {field} value {value} is not valid in PUC-Lua chunks")]
+    #[error("negative {field} value {value} is not valid in this bytecode chunk")]
     NegativeValue { field: &'static str, value: i64 },
     #[error("invalid constant tag {tag} at offset {offset}")]
     InvalidConstantTag { offset: usize, tag: u8 },

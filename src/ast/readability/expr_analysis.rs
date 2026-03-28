@@ -17,6 +17,9 @@ pub(super) fn expr_complexity(expr: &AstExpr) -> usize {
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg => 1,
         AstExpr::Unary(unary) => 1 + expr_complexity(&unary.expr),
@@ -61,7 +64,10 @@ pub(super) fn is_context_safe_expr(expr: &AstExpr) -> bool {
         | AstExpr::Boolean(_)
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
-        | AstExpr::String(_) => true,
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. } => true,
         AstExpr::Var(
             AstNameRef::Param(_)
             | AstNameRef::Local(_)
@@ -112,6 +118,9 @@ pub(super) fn is_copy_like_expr(expr: &AstExpr) -> bool {
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::Var(_) => true,
         AstExpr::FieldAccess(access) => is_copy_like_expr(&access.base),
         AstExpr::IndexAccess(access) => {
@@ -136,6 +145,9 @@ pub(super) fn is_mechanical_run_inline_expr(expr: &AstExpr) -> bool {
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::Var(_) => true,
         AstExpr::FieldAccess(access) => is_mechanical_run_inline_expr(&access.base),
         AstExpr::IndexAccess(access) => {
@@ -173,6 +185,9 @@ fn is_atomic_access_base_expr(expr: &AstExpr) -> bool {
             | AstExpr::Integer(_)
             | AstExpr::Number(_)
             | AstExpr::String(_)
+            | AstExpr::Int64(_)
+            | AstExpr::UInt64(_)
+            | AstExpr::Complex { .. }
             | AstExpr::Var(_)
     )
 }

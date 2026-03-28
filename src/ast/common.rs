@@ -65,6 +65,9 @@ pub enum AstExpr {
     Integer(i64),
     Number(f64),
     String(String),
+    Int64(i64),
+    UInt64(u64),
+    Complex { real: f64, imag: f64 },
     Var(AstNameRef),
     FieldAccess(Box<AstFieldAccess>),
     IndexAccess(Box<AstIndexAccess>),
@@ -195,6 +198,7 @@ pub enum AstDialectVersion {
     Lua53,
     Lua54,
     Lua55,
+    LuaJit,
     Luau,
 }
 
@@ -206,6 +210,7 @@ impl AstDialectVersion {
             Self::Lua53 => "lua5.3",
             Self::Lua54 => "lua5.4",
             Self::Lua55 => "lua5.5",
+            Self::LuaJit => "luajit",
             Self::Luau => "luau",
         }
     }
@@ -251,6 +256,14 @@ impl AstTargetDialect {
                 local_close: true,
                 global_decl: true,
                 global_const: true,
+            },
+            AstDialectVersion::LuaJit => AstDialectCaps {
+                goto_label: true,
+                continue_stmt: false,
+                local_const: false,
+                local_close: false,
+                global_decl: false,
+                global_const: false,
             },
             AstDialectVersion::Luau => AstDialectCaps {
                 goto_label: false,

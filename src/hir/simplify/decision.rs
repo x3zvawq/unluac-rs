@@ -171,6 +171,9 @@ fn simplify_expr(expr: &mut HirExpr) -> bool {
         | HirExpr::Integer(_)
         | HirExpr::Number(_)
         | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)
         | HirExpr::UpvalueRef(_)
@@ -591,6 +594,9 @@ fn expr_supports_truth_fact(expr: &HirExpr) -> bool {
         | HirExpr::Integer(_)
         | HirExpr::Number(_)
         | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)
         | HirExpr::UpvalueRef(_)

@@ -364,7 +364,10 @@ fn expr_contains_string(expr: &HirExpr, needle: &str) -> bool {
         HirExpr::Nil
         | HirExpr::Boolean(_)
         | HirExpr::Integer(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
         | HirExpr::Number(_)
+        | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)
         | HirExpr::UpvalueRef(_)

@@ -480,6 +480,9 @@ fn rewrite_nested_functions_in_expr(expr: &mut super::super::common::AstExpr) ->
         | super::super::common::AstExpr::Integer(_)
         | super::super::common::AstExpr::Number(_)
         | super::super::common::AstExpr::String(_)
+        | super::super::common::AstExpr::Int64(_)
+        | super::super::common::AstExpr::UInt64(_)
+        | super::super::common::AstExpr::Complex { .. }
         | super::super::common::AstExpr::Var(_)
         | super::super::common::AstExpr::VarArg => false,
     }

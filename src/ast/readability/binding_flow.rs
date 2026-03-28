@@ -299,6 +299,9 @@ pub(super) fn expr_references_any_binding(expr: &AstExpr, bindings: &[AstLocalBi
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::VarArg => false,
     }
 }
@@ -390,6 +393,9 @@ fn count_binding_uses_in_expr(expr: &AstExpr, binding: AstBindingRef) -> usize {
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg => 0,
     }

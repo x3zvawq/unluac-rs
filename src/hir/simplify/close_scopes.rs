@@ -529,6 +529,9 @@ fn expr_mentions_binding(expr: &HirExpr, binding: ScopeBinding) -> bool {
         | HirExpr::Integer(_)
         | HirExpr::Number(_)
         | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::UpvalueRef(_)
         | HirExpr::GlobalRef(_)

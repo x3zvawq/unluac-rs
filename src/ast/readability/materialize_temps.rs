@@ -199,6 +199,9 @@ fn materialize_nested_functions_in_expr(expr: &mut AstExpr) -> bool {
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg => false,
     }
@@ -407,6 +410,9 @@ fn collect_function_temps_in_expr(expr: &AstExpr, temps: &mut BTreeSet<TempId>) 
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg => {}
     }
@@ -585,6 +591,9 @@ fn rewrite_function_expr(expr: &mut AstExpr, mapping: &BTreeMap<TempId, AstSynth
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::VarArg => {}
     }
 }

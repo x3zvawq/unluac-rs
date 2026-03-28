@@ -51,7 +51,10 @@ fn expr_display_complexity(expr: &AstExpr) -> usize {
         | AstExpr::Boolean(_)
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
-        | AstExpr::String(_) => 1,
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. } => 1,
         // 把变量刻意排在常量之上，这样 `0 < value` 会更倾向翻成 `value > 0`。
         AstExpr::Var(_) | AstExpr::VarArg => 2,
         AstExpr::Unary(unary) => 1 + expr_display_complexity(&unary.expr),

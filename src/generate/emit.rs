@@ -576,6 +576,13 @@ impl<'a> Emitter<'a> {
                 PREC_LITERAL,
                 Assoc::Non,
             ),
+            AstExpr::Int64(value) => (Doc::text(format!("{value}LL")), PREC_LITERAL, Assoc::Non),
+            AstExpr::UInt64(value) => (Doc::text(format!("{value}ULL")), PREC_LITERAL, Assoc::Non),
+            AstExpr::Complex { real, imag } => (
+                Doc::text(format_complex_literal(*real, *imag)),
+                PREC_LITERAL,
+                Assoc::Non,
+            ),
             AstExpr::Var(name) => (
                 self.emit_name_ref(name, function)?,
                 PREC_PREFIX,
@@ -945,6 +952,15 @@ fn format_number(value: f64) -> String {
         };
     }
     value.to_string()
+}
+
+fn format_complex_literal(real: f64, imag: f64) -> String {
+    if real == 0.0 {
+        return format!("{}i", format_number(imag));
+    }
+    let imag_abs = format_number(imag.abs());
+    let imag_sign = if imag.is_sign_negative() { "-" } else { "+" };
+    format!("({} {} {}i)", format_number(real), imag_sign, imag_abs)
 }
 
 fn format_string_literal(value: &str, quote_style: QuoteStyle) -> String {

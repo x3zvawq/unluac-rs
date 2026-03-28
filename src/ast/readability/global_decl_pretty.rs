@@ -190,6 +190,9 @@ fn rewrite_nested_expr(expr: &mut AstExpr, visible_globals: &BTreeSet<String>) -
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg => false,
     }
@@ -450,6 +453,9 @@ fn collect_explicit_globals_in_expr(expr: &AstExpr, names: &mut BTreeSet<String>
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg => {}
     }
@@ -616,6 +622,9 @@ fn collect_nested_written_globals_in_expr(expr: &AstExpr, names: &mut BTreeSet<S
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg => {}
     }
@@ -1033,6 +1042,9 @@ fn collect_missing_globals_in_expr(
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::VarArg
         | AstExpr::FunctionExpr(_) => {}
         AstExpr::FieldAccess(access) => {

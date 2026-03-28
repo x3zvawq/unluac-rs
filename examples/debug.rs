@@ -16,11 +16,11 @@ use unluac::naming::{NamingMode, NamingOptions};
 use unluac::parser::{ParseMode, ParseOptions, StringDecodeMode, StringEncoding};
 
 /// 开发时最常改的是这几个常量，直接编辑代码通常比来回敲命令更顺手。
-const DIALECT: DecompileDialect = DecompileDialect::Lua51;
-const SOURCE: &str = "tests/lua_cases/common/tricky/22_repeat_break_value_flow.lua";
+const DIALECT: DecompileDialect = DecompileDialect::Luajit;
+const SOURCE: &str = "tests/lua_cases/common/tricky/26_pcall_multi_return_reuse.lua";
 const STRING_ENCODING: StringEncoding = StringEncoding::Utf8;
 const STRING_DECODE_MODE: StringDecodeMode = StringDecodeMode::Strict;
-const PARSE_MODE: ParseMode = ParseMode::Strict;
+const PARSE_MODE: ParseMode = ParseMode::Permissive;
 // 这个入口更常用来直接看“最终会长成什么源码形状”，所以默认停在 Generate。
 const TARGET_STAGE: DecompileStage = DecompileStage::Generate;
 const DEBUG_DETAIL: DebugDetail = DebugDetail::Verbose;
@@ -28,6 +28,7 @@ const DEBUG_DETAIL: DebugDetail = DebugDetail::Verbose;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompilerProtocol {
     LuacStyle,
+    LuaJitBytecodeTool,
     LuauBinaryStdout,
 }
 
@@ -149,6 +150,16 @@ fn compile_source(
                 return Err(format!("compiler exited with status {status}").into());
             }
         }
+        CompilerProtocol::LuaJitBytecodeTool => {
+            let status = Command::new(compiler)
+                .arg("-s")
+                .arg(source)
+                .arg(&output)
+                .status()?;
+            if !status.success() {
+                return Err(format!("compiler exited with status {status}").into());
+            }
+        }
         CompilerProtocol::LuauBinaryStdout => {
             // Luau 的编译器不会原地写输出文件，必须显式接住 stdout 再落盘。
             let command_output = Command::new(compiler)
@@ -183,6 +194,7 @@ fn bundled_compiler_name(dialect: DecompileDialect) -> &'static str {
         | DecompileDialect::Lua53
         | DecompileDialect::Lua54
         | DecompileDialect::Lua55 => "luac",
+        DecompileDialect::Luajit => "luac",
         DecompileDialect::Luau => "luau-compile",
     }
 }
@@ -194,6 +206,7 @@ fn compiler_protocol(dialect: DecompileDialect) -> CompilerProtocol {
         | DecompileDialect::Lua53
         | DecompileDialect::Lua54
         | DecompileDialect::Lua55 => CompilerProtocol::LuacStyle,
+        DecompileDialect::Luajit => CompilerProtocol::LuaJitBytecodeTool,
         DecompileDialect::Luau => CompilerProtocol::LuauBinaryStdout,
     }
 }
@@ -205,6 +218,7 @@ fn compiled_chunk_extension(dialect: DecompileDialect) -> &'static str {
         | DecompileDialect::Lua53
         | DecompileDialect::Lua54
         | DecompileDialect::Lua55 => "out",
+        DecompileDialect::Luajit => "luajit",
         DecompileDialect::Luau => "luau",
     }
 }

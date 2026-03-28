@@ -266,6 +266,9 @@ fn rewrite_nested_functions_in_expr(expr: &mut AstExpr, options: ReadabilityOpti
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg => false,
     }
@@ -493,6 +496,9 @@ fn replace_binding_use_in_expr(
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg => false,
     }
@@ -554,6 +560,9 @@ fn count_name_expr_uses(expr: &AstExpr, binding: super::super::common::AstBindin
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg => 0,
     }

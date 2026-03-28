@@ -212,6 +212,9 @@ fn validate_expr_has_no_temps(
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::VarArg => Ok(()),
         AstExpr::FieldAccess(access) => validate_expr_has_no_temps(&access.base, function, hir),
         AstExpr::IndexAccess(access) => {

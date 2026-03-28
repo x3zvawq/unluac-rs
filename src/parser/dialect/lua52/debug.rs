@@ -373,6 +373,9 @@ fn format_literal(literal: &RawLiteralConst) -> String {
         RawLiteralConst::Integer(value) => format!("int({value})"),
         RawLiteralConst::Number(value) => format!("num({value})"),
         RawLiteralConst::String(value) => format!("str({})", format_raw_string(value)),
+        RawLiteralConst::Int64(value) => format!("i64({value})"),
+        RawLiteralConst::UInt64(value) => format!("u64({value})"),
+        RawLiteralConst::Complex { real, imag } => format!("complex({real},{imag})"),
     }
 }
 
@@ -404,6 +407,7 @@ impl HeaderDebugExt for ChunkHeader {
     fn dialect_label(&self) -> &'static str {
         match self.dialect {
             Dialect::PucLua => "puc-lua",
+            Dialect::LuaJit => "luajit",
             Dialect::Luau => "luau",
         }
     }
@@ -415,6 +419,7 @@ impl HeaderDebugExt for ChunkHeader {
             DialectVersion::Lua53 => "lua5.3",
             DialectVersion::Lua54 => "lua5.4",
             DialectVersion::Lua55 => "lua5.5",
+            DialectVersion::LuaJit => "luajit",
             DialectVersion::Luau => "luau",
         }
     }

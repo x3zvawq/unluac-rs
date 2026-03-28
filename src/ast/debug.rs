@@ -264,6 +264,9 @@ fn format_expr(expr: &AstExpr, indent: &str, names: &FunctionRenderNames) -> Str
         AstExpr::Integer(value) => value.to_string(),
         AstExpr::Number(value) => value.to_string(),
         AstExpr::String(value) => format!("{value:?}"),
+        AstExpr::Int64(value) => format!("{value}LL"),
+        AstExpr::UInt64(value) => format!("{value}ULL"),
+        AstExpr::Complex { real, imag } => format_complex_literal(*real, *imag),
         AstExpr::Var(name) => format_name_ref(name, names),
         AstExpr::FieldAccess(access) => {
             format!(
@@ -343,6 +346,14 @@ fn format_expr(expr: &AstExpr, indent: &str, names: &FunctionRenderNames) -> Str
         }
         AstExpr::FunctionExpr(function) => format_function_expr(function, indent),
     }
+}
+
+fn format_complex_literal(real: f64, imag: f64) -> String {
+    if real == 0.0 {
+        return format!("{imag}i");
+    }
+    let sign = if imag.is_sign_negative() { "-" } else { "+" };
+    format!("({real} {sign} {}i)", imag.abs())
 }
 
 fn format_head_expr(expr: &AstExpr, indent: &str, names: &FunctionRenderNames) -> String {
@@ -781,6 +792,9 @@ fn collect_function_render_names_in_expr(
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::VarArg => {}
     }
 }

@@ -58,6 +58,9 @@ enum AbstractValue {
     Integer(i64),
     Number(u64),
     String(String),
+    Int64(i64),
+    UInt64(u64),
+    Complex { real_bits: u64, imag_bits: u64 },
     TruthySymbol(u8),
 }
 
@@ -129,6 +132,12 @@ fn eval_pure_expr(
         HirExpr::Integer(value) => Some(AbstractValue::Integer(*value)),
         HirExpr::Number(value) => Some(AbstractValue::Number(value.to_bits())),
         HirExpr::String(value) => Some(AbstractValue::String(value.clone())),
+        HirExpr::Int64(value) => Some(AbstractValue::Int64(*value)),
+        HirExpr::UInt64(value) => Some(AbstractValue::UInt64(*value)),
+        HirExpr::Complex { real, imag } => Some(AbstractValue::Complex {
+            real_bits: real.to_bits(),
+            imag_bits: imag.to_bits(),
+        }),
         HirExpr::ParamRef(param) => env
             .get(*ref_positions.get(&RefKey::Param(*param))?)
             .cloned(),
@@ -924,6 +933,9 @@ fn expr_is_synth_safe(expr: &HirExpr) -> bool {
         | HirExpr::Integer(_)
         | HirExpr::Number(_)
         | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)
         | HirExpr::UpvalueRef(_)
@@ -992,6 +1004,9 @@ fn collect_refs_from_expr(expr: &HirExpr, refs: &mut BTreeSet<RefKey>) {
         | HirExpr::Integer(_)
         | HirExpr::Number(_)
         | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
         | HirExpr::Decision(_)
         | HirExpr::GlobalRef(_)
         | HirExpr::TableAccess(_)
@@ -1039,6 +1054,18 @@ fn collect_literals_from_expr(expr: &HirExpr, literals: &mut BTreeSet<AbstractVa
         }
         HirExpr::String(value) => {
             literals.insert(AbstractValue::String(value.clone()));
+        }
+        HirExpr::Int64(value) => {
+            literals.insert(AbstractValue::Int64(*value));
+        }
+        HirExpr::UInt64(value) => {
+            literals.insert(AbstractValue::UInt64(*value));
+        }
+        HirExpr::Complex { real, imag } => {
+            literals.insert(AbstractValue::Complex {
+                real_bits: real.to_bits(),
+                imag_bits: imag.to_bits(),
+            });
         }
         HirExpr::Unary(unary) => collect_literals_from_expr(&unary.expr, literals),
         HirExpr::Binary(binary) => {

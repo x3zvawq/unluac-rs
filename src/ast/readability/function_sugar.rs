@@ -235,6 +235,9 @@ fn rewrite_function_exprs_in_expr(expr: &mut AstExpr, target: AstTargetDialect) 
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg => false,
     }
@@ -818,6 +821,9 @@ fn count_binding_value_uses_in_expr(expr: &AstExpr, binding: AstBindingRef) -> u
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg => 0,
     }
@@ -994,6 +1000,9 @@ fn collect_method_field_names_in_expr(expr: &AstExpr, fields: &mut BTreeSet<Stri
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
         | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg => {}
     }

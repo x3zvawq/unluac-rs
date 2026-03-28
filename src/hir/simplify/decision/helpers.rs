@@ -42,6 +42,9 @@ pub(super) fn expr_truthiness(expr: &HirExpr) -> Option<bool> {
         HirExpr::Integer(_)
         | HirExpr::Number(_)
         | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
         | HirExpr::Closure(_)
         | HirExpr::TableConstructor(_) => Some(true),
         HirExpr::ParamRef(_)

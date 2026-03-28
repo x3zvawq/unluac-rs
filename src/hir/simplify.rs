@@ -335,6 +335,9 @@ fn collect_expr_residuals(expr: &crate::hir::common::HirExpr, residuals: &mut Hi
         | crate::hir::common::HirExpr::Integer(_)
         | crate::hir::common::HirExpr::Number(_)
         | crate::hir::common::HirExpr::String(_)
+        | crate::hir::common::HirExpr::Int64(_)
+        | crate::hir::common::HirExpr::UInt64(_)
+        | crate::hir::common::HirExpr::Complex { .. }
         | crate::hir::common::HirExpr::ParamRef(_)
         | crate::hir::common::HirExpr::LocalRef(_)
         | crate::hir::common::HirExpr::UpvalueRef(_)
