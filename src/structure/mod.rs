@@ -11,15 +11,18 @@ mod debug;
 mod goto;
 mod helpers;
 mod loops;
+mod phi_facts;
 mod regions;
 mod scope;
 mod short_circuit;
 
 pub use analyze::analyze_structure;
 pub use common::{
-    BranchCandidate, BranchKind, BranchValueMergeCandidate, BranchValueMergeValue, GotoReason,
-    GotoRequirement, LoopCandidate, LoopKindHint, RegionFact, RegionKind, ScopeCandidate,
-    ScopeKind, ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNode, ShortCircuitNodeRef,
-    ShortCircuitTarget, StructureFacts,
+    BranchCandidate, BranchKind, BranchRegionFact, BranchValueMergeArm, BranchValueMergeCandidate,
+    BranchValueMergeValue, GenericPhiMaterialization, GotoReason, GotoRequirement, LoopCandidate,
+    LoopExitValueMergeCandidate, LoopKindHint, LoopSourceBindings, LoopValueArm, LoopValueIncoming,
+    LoopValueMerge, RegionFact, RegionKind, ScopeCandidate, ScopeKind, ShortCircuitCandidate,
+    ShortCircuitExit, ShortCircuitNode, ShortCircuitNodeRef, ShortCircuitTarget,
+    ShortCircuitValueIncoming, StructureFacts,
 };
 pub use debug::dump_structure;

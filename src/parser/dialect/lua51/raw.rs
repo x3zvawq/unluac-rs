@@ -3,107 +3,80 @@
 //! 它们不放进 parser 公共层，是因为这些结构天然和 Lua 5.1 VM 指令集
 //! 绑定，后续支持 Lua 5.2、LuaJIT、Luau 时不会共享这套定义。
 
-/// Lua 5.1 的 opcode 命名空间，保持与虚拟机原始指令集一致。
+use crate::parser::dialect::puc_lua::{DecodedInstructionFields, define_puc_lua_opcodes};
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-#[repr(u8)]
-pub enum Lua51Opcode {
-    Move = 0,
-    LoadK = 1,
-    LoadBool = 2,
-    LoadNil = 3,
-    GetUpVal = 4,
-    GetGlobal = 5,
-    GetTable = 6,
-    SetGlobal = 7,
-    SetUpVal = 8,
-    SetTable = 9,
-    NewTable = 10,
-    Self_ = 11,
-    Add = 12,
-    Sub = 13,
-    Mul = 14,
-    Div = 15,
-    Mod = 16,
-    Pow = 17,
-    Unm = 18,
-    Not = 19,
-    Len = 20,
-    Concat = 21,
-    Jmp = 22,
-    Eq = 23,
-    Lt = 24,
-    Le = 25,
-    Test = 26,
-    TestSet = 27,
-    Call = 28,
-    TailCall = 29,
-    Return = 30,
-    ForLoop = 31,
-    ForPrep = 32,
-    TForLoop = 33,
-    SetList = 34,
-    Close = 35,
-    Closure = 36,
-    VarArg = 37,
+pub enum Lua51OperandKind {
+    A,
+    AB,
+    AC,
+    ABC,
+    ABx,
+    AsBx,
 }
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Lua51ExtraWordPolicy {
+    None,
+    SetListWordIfCZero,
+}
+
+define_puc_lua_opcodes!(
+    opcode: Lua51Opcode,
+    operand_kind: Lua51OperandKind,
+    extra_word_policy: Lua51ExtraWordPolicy,
+    [
+        (Move, "MOVE", AB),
+        (LoadK, "LOADK", ABx),
+        (LoadBool, "LOADBOOL", ABC),
+        (LoadNil, "LOADNIL", AB),
+        (GetUpVal, "GETUPVAL", AB),
+        (GetGlobal, "GETGLOBAL", ABx),
+        (GetTable, "GETTABLE", ABC),
+        (SetGlobal, "SETGLOBAL", ABx),
+        (SetUpVal, "SETUPVAL", AB),
+        (SetTable, "SETTABLE", ABC),
+        (NewTable, "NEWTABLE", ABC),
+        (Self_, "SELF", ABC),
+        (Add, "ADD", ABC),
+        (Sub, "SUB", ABC),
+        (Mul, "MUL", ABC),
+        (Div, "DIV", ABC),
+        (Mod, "MOD", ABC),
+        (Pow, "POW", ABC),
+        (Unm, "UNM", AB),
+        (Not, "NOT", AB),
+        (Len, "LEN", AB),
+        (Concat, "CONCAT", ABC),
+        (Jmp, "JMP", AsBx),
+        (Eq, "EQ", ABC),
+        (Lt, "LT", ABC),
+        (Le, "LE", ABC),
+        (Test, "TEST", AC),
+        (TestSet, "TESTSET", ABC),
+        (Call, "CALL", ABC),
+        (TailCall, "TAILCALL", ABC),
+        (Return, "RETURN", AB),
+        (ForLoop, "FORLOOP", AsBx),
+        (ForPrep, "FORPREP", AsBx),
+        (TForLoop, "TFORLOOP", AC),
+        (SetList, "SETLIST", ABC, SetListWordIfCZero),
+        (Close, "CLOSE", A),
+        (Closure, "CLOSURE", ABx),
+        (VarArg, "VARARG", AB),
+    ]
+);
 
 impl Lua51Opcode {
     /// 暴露指令模式，是为了让调试视图和后续 lowering 能共享同一份编码事实。
     pub const fn mode(self) -> Lua51InstructionMode {
-        match self {
-            Self::LoadK | Self::GetGlobal | Self::SetGlobal | Self::Closure => {
-                Lua51InstructionMode::ABx
-            }
-            Self::Jmp | Self::ForLoop | Self::ForPrep => Lua51InstructionMode::AsBx,
-            _ => Lua51InstructionMode::ABC,
-        }
-    }
-}
-
-impl TryFrom<u8> for Lua51Opcode {
-    type Error = u8;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Move),
-            1 => Ok(Self::LoadK),
-            2 => Ok(Self::LoadBool),
-            3 => Ok(Self::LoadNil),
-            4 => Ok(Self::GetUpVal),
-            5 => Ok(Self::GetGlobal),
-            6 => Ok(Self::GetTable),
-            7 => Ok(Self::SetGlobal),
-            8 => Ok(Self::SetUpVal),
-            9 => Ok(Self::SetTable),
-            10 => Ok(Self::NewTable),
-            11 => Ok(Self::Self_),
-            12 => Ok(Self::Add),
-            13 => Ok(Self::Sub),
-            14 => Ok(Self::Mul),
-            15 => Ok(Self::Div),
-            16 => Ok(Self::Mod),
-            17 => Ok(Self::Pow),
-            18 => Ok(Self::Unm),
-            19 => Ok(Self::Not),
-            20 => Ok(Self::Len),
-            21 => Ok(Self::Concat),
-            22 => Ok(Self::Jmp),
-            23 => Ok(Self::Eq),
-            24 => Ok(Self::Lt),
-            25 => Ok(Self::Le),
-            26 => Ok(Self::Test),
-            27 => Ok(Self::TestSet),
-            28 => Ok(Self::Call),
-            29 => Ok(Self::TailCall),
-            30 => Ok(Self::Return),
-            31 => Ok(Self::ForLoop),
-            32 => Ok(Self::ForPrep),
-            33 => Ok(Self::TForLoop),
-            34 => Ok(Self::SetList),
-            35 => Ok(Self::Close),
-            36 => Ok(Self::Closure),
-            37 => Ok(Self::VarArg),
-            _ => Err(value),
+        match self.operand_kind() {
+            Lua51OperandKind::ABx => Lua51InstructionMode::ABx,
+            Lua51OperandKind::AsBx => Lua51InstructionMode::AsBx,
+            Lua51OperandKind::A
+            | Lua51OperandKind::AB
+            | Lua51OperandKind::AC
+            | Lua51OperandKind::ABC => Lua51InstructionMode::ABC,
         }
     }
 }
@@ -117,6 +90,35 @@ pub enum Lua51Operands {
     ABC { a: u8, b: u16, c: u16 },
     ABx { a: u8, bx: u32 },
     AsBx { a: u8, sbx: i32 },
+}
+
+impl Lua51Opcode {
+    pub(crate) fn decode_operands(self, fields: DecodedInstructionFields) -> Lua51Operands {
+        match self.operand_kind() {
+            Lua51OperandKind::A => Lua51Operands::A { a: fields.a },
+            Lua51OperandKind::AB => Lua51Operands::AB {
+                a: fields.a,
+                b: fields.b,
+            },
+            Lua51OperandKind::AC => Lua51Operands::AC {
+                a: fields.a,
+                c: fields.c,
+            },
+            Lua51OperandKind::ABC => Lua51Operands::ABC {
+                a: fields.a,
+                b: fields.b,
+                c: fields.c,
+            },
+            Lua51OperandKind::ABx => Lua51Operands::ABx {
+                a: fields.a,
+                bx: fields.bx,
+            },
+            Lua51OperandKind::AsBx => Lua51Operands::AsBx {
+                a: fields.a,
+                sbx: fields.sbx,
+            },
+        }
+    }
 }
 
 /// Lua 5.1 指令编码使用的三种模式。

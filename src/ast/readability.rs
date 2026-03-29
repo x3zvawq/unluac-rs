@@ -1,6 +1,12 @@
-//! AST readability：把合法 AST 收敛成更接近源码的稳定形状。
+//! AST readability：把前层已经合法的 AST 收敛成更接近源码的稳定形状。
+//!
+//! 这里不是给前层“补事实”或“兜底修结构”的阶段：
+//! - 不负责替 AST build / HIR / Structure 补缺失语义
+//! - 不负责把前层过度内联、过度结构化的问题继续静默修掉
+//! - 只在前层事实已经足够稳定时，做源码可读性层面的保守整形
 
 mod binding_flow;
+mod binding_tree;
 mod branch_pretty;
 mod cleanup;
 mod expr_analysis;
@@ -8,12 +14,16 @@ mod field_access_sugar;
 mod function_sugar;
 mod global_decl_pretty;
 mod inline_exprs;
+mod installer_iife;
 mod local_coalesce;
 mod loop_header_merge;
 mod luajit_goto_safety;
 mod materialize_temps;
 mod short_circuit_pretty;
 mod statement_merge;
+mod traverse;
+mod visit;
+mod walk;
 
 use super::common::{AstModule, AstTargetDialect};
 use crate::readability::ReadabilityOptions;
@@ -35,140 +45,136 @@ struct ReadabilityPass {
 struct ReadabilityStage {
     name: &'static str,
     passes: &'static [ReadabilityPass],
+    cleanup_after_passes: bool,
 }
 
-const STRUCTURAL_CLEANUP_STAGE: ReadabilityStage = ReadabilityStage {
-    name: "structural-cleanup",
-    passes: &[ReadabilityPass {
-        name: "cleanup",
-        apply: cleanup::apply,
+const CLEANUP_PASS: ReadabilityPass = ReadabilityPass {
+    name: "cleanup",
+    apply: cleanup::apply,
+};
+
+const fn stage(name: &'static str, passes: &'static [ReadabilityPass]) -> ReadabilityStage {
+    ReadabilityStage {
+        name,
+        passes,
+        cleanup_after_passes: false,
+    }
+}
+
+const fn stage_with_cleanup(
+    name: &'static str,
+    passes: &'static [ReadabilityPass],
+) -> ReadabilityStage {
+    ReadabilityStage {
+        name,
+        passes,
+        cleanup_after_passes: true,
+    }
+}
+
+const STRUCTURAL_CLEANUP_STAGE: ReadabilityStage = stage("structural-cleanup", &[CLEANUP_PASS]);
+
+const EXPR_INLINE_STAGE: ReadabilityStage = stage_with_cleanup(
+    "expr-inline",
+    &[ReadabilityPass {
+        name: "inline-exprs",
+        apply: inline_exprs::apply,
     }],
-};
+);
 
-const EXPR_INLINE_STAGE: ReadabilityStage = ReadabilityStage {
-    name: "expr-inline",
-    passes: &[
-        ReadabilityPass {
-            name: "inline-exprs",
-            apply: inline_exprs::apply,
-        },
-        ReadabilityPass {
-            name: "cleanup",
-            apply: cleanup::apply,
-        },
-    ],
-};
-
-const ACCESS_SUGAR_STAGE: ReadabilityStage = ReadabilityStage {
-    name: "access-sugar",
-    passes: &[ReadabilityPass {
+const ACCESS_SUGAR_STAGE: ReadabilityStage = stage(
+    "access-sugar",
+    &[ReadabilityPass {
         name: "field-access-sugar",
         apply: field_access_sugar::apply,
     }],
-};
+);
 
-const STATEMENT_MERGE_STAGE: ReadabilityStage = ReadabilityStage {
-    name: "statement-merge",
-    passes: &[
-        ReadabilityPass {
-            name: "statement-merge",
-            apply: statement_merge::apply,
-        },
-        ReadabilityPass {
-            name: "cleanup",
-            apply: cleanup::apply,
-        },
-    ],
-};
+const STATEMENT_MERGE_STAGE: ReadabilityStage = stage_with_cleanup(
+    "statement-merge",
+    &[ReadabilityPass {
+        name: "statement-merge",
+        apply: statement_merge::apply,
+    }],
+);
 
-const LOCAL_COALESCE_STAGE: ReadabilityStage = ReadabilityStage {
-    name: "local-coalesce",
-    passes: &[
-        ReadabilityPass {
-            name: "local-coalesce",
-            apply: local_coalesce::apply,
-        },
-        ReadabilityPass {
-            name: "cleanup",
-            apply: cleanup::apply,
-        },
-    ],
-};
+const LOCAL_COALESCE_STAGE: ReadabilityStage = stage_with_cleanup(
+    "local-coalesce",
+    &[ReadabilityPass {
+        name: "local-coalesce",
+        apply: local_coalesce::apply,
+    }],
+);
 
-const LOOP_HEADER_MERGE_STAGE: ReadabilityStage = ReadabilityStage {
-    name: "loop-header-merge",
-    passes: &[
-        ReadabilityPass {
-            name: "loop-header-merge",
-            apply: loop_header_merge::apply,
-        },
-        ReadabilityPass {
-            name: "cleanup",
-            apply: cleanup::apply,
-        },
-    ],
-};
+const LOOP_HEADER_MERGE_STAGE: ReadabilityStage = stage_with_cleanup(
+    "loop-header-merge",
+    &[ReadabilityPass {
+        name: "loop-header-merge",
+        apply: loop_header_merge::apply,
+    }],
+);
 
-const CONTROL_FLOW_PRETTY_STAGE: ReadabilityStage = ReadabilityStage {
-    name: "control-flow-pretty",
-    passes: &[ReadabilityPass {
+const CONTROL_FLOW_PRETTY_STAGE: ReadabilityStage = stage(
+    "control-flow-pretty",
+    &[ReadabilityPass {
         name: "branch-pretty",
         apply: branch_pretty::apply,
     }],
-};
+);
 
-const SHORT_CIRCUIT_PRETTY_STAGE: ReadabilityStage = ReadabilityStage {
-    name: "short-circuit-pretty",
-    passes: &[ReadabilityPass {
+const SHORT_CIRCUIT_PRETTY_STAGE: ReadabilityStage = stage(
+    "short-circuit-pretty",
+    &[ReadabilityPass {
         name: "short-circuit-pretty",
         apply: short_circuit_pretty::apply,
     }],
-};
+);
 
-const FUNCTION_SUGAR_STAGE: ReadabilityStage = ReadabilityStage {
-    name: "function-sugar",
-    passes: &[
+const FUNCTION_SUGAR_STAGE: ReadabilityStage = stage_with_cleanup(
+    "function-sugar",
+    &[
+        ReadabilityPass {
+            name: "installer-iife",
+            apply: installer_iife::apply,
+        },
         ReadabilityPass {
             name: "function-sugar",
             apply: function_sugar::apply,
         },
-        ReadabilityPass {
-            name: "cleanup",
-            apply: cleanup::apply,
-        },
     ],
-};
+);
 
-const GLOBAL_DECL_PRETTY_STAGE: ReadabilityStage = ReadabilityStage {
-    name: "global-decl-pretty",
-    passes: &[
-        ReadabilityPass {
-            name: "global-decl-pretty",
-            apply: global_decl_pretty::apply,
-        },
-        ReadabilityPass {
-            name: "cleanup",
-            apply: cleanup::apply,
-        },
-    ],
-};
+const GLOBAL_DECL_PRETTY_STAGE: ReadabilityStage = stage_with_cleanup(
+    "global-decl-pretty",
+    &[ReadabilityPass {
+        name: "global-decl-pretty",
+        apply: global_decl_pretty::apply,
+    }],
+);
 
-const LUAJIT_GOTO_SAFETY_STAGE: ReadabilityStage = ReadabilityStage {
-    name: "luajit-goto-safety",
-    passes: &[ReadabilityPass {
+const LUAJIT_GOTO_SAFETY_STAGE: ReadabilityStage = stage(
+    "luajit-goto-safety",
+    &[ReadabilityPass {
         name: "luajit-goto-safety",
         apply: luajit_goto_safety::apply,
     }],
-};
+);
 
-const TEMP_MATERIALIZE_STAGE: ReadabilityStage = ReadabilityStage {
-    name: "temp-materialize",
-    passes: &[ReadabilityPass {
+const TEMP_MATERIALIZE_STAGE: ReadabilityStage = stage(
+    "temp-materialize",
+    &[ReadabilityPass {
         name: "materialize-temps",
         apply: materialize_temps::apply,
     }],
-};
+);
 
+// Stage 顺序本身就是 readability 契约的一部分：
+// 1. 先把最机械的 local/stmt 壳压平，避免后续 sugar 看见被过度拆开的 AST。
+// 2. 再做 access / control-flow / expr sugar，让表达式和结构更接近源码。
+// 3. `materialize-temps` 必须先于 `installer-iife/function-sugar`，否则后者会把仍处在
+//    临时槽位里的机械节点误当成稳定源码 binding，也没法给新引入的局部名分配 AST 自己的
+//    synthetic local。
+// 4. `global-decl-pretty` 和 `luajit-goto-safety` 放在后面，只消费前面已经稳定下来的 AST。
 const READABILITY_STAGES: &[ReadabilityStage] = &[
     STRUCTURAL_CLEANUP_STAGE,
     LOCAL_COALESCE_STAGE,
@@ -217,6 +223,11 @@ pub(crate) fn make_readable_with_options_and_timing(
                     let mut changed = false;
                     for pass in stage.passes {
                         changed |= timings.record(pass.name, || (pass.apply)(&mut module, context));
+                    }
+                    if stage.cleanup_after_passes {
+                        changed |= timings.record(CLEANUP_PASS.name, || {
+                            (CLEANUP_PASS.apply)(&mut module, context)
+                        });
                     }
                     changed
                 });

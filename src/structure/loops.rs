@@ -1,19 +1,34 @@
 //! 这个文件实现共享循环候选提取。
 //!
-//! 循环形态只产出 hint，不在这里过早绑定成最终 `while/repeat/for` 语法。
+//! 这个 pass 只消费 CFG / GraphFacts / Dataflow / low-IR terminator，产出“循环形态 hint +
+//! 可直接复用的源码绑定证据 + loop merge incoming 事实”，不会越权决定最终
+//! `while/repeat/for` 语法。
+//!
+//! 例子：
+//! - `NumericForInit/Loop` 会产出 `LoopKindHint::NumericForLike`，并把源码绑定寄存器
+//!   记录成 `LoopSourceBindings::Numeric`
+//! - `GenericForCall/Loop` 会产出 `LoopKindHint::GenericForLike`，并把源码绑定区间
+//!   记录成 `LoopSourceBindings::Generic`
+//! - `while ... do ... end` 的 header/exit phi 会被整理成 `inside/outside` 两臂的
+//!   incoming facts，后续 HIR 直接消费这些结构事实，不再自己回头拆 `phi.incoming`
+//! - 普通 `while/repeat` 只保留形态 hint，不会伪造额外 binding 证据
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::cfg::{BlockRef, Cfg, EdgeRef, GraphFacts};
+use crate::cfg::{BlockRef, Cfg, DataflowFacts, EdgeRef, GraphFacts};
 use crate::transformer::{LowInstr, LoweredProto};
 
-use super::common::{LoopCandidate, LoopKindHint};
-use super::helpers::{branch_edges, collect_region_exits};
+use super::common::{
+    LoopCandidate, LoopExitValueMergeCandidate, LoopKindHint, LoopSourceBindings, LoopValueMerge,
+};
+use super::helpers::{collect_region_exits, is_reducible_region};
+use super::phi_facts::loop_value_merges_in_block;
 
 pub(super) fn analyze_loops(
     proto: &LoweredProto,
     cfg: &Cfg,
     graph_facts: &GraphFacts,
+    dataflow: &DataflowFacts,
 ) -> Vec<LoopCandidate> {
     let mut grouped_loops = BTreeMap::<BlockRef, (BTreeSet<BlockRef>, Vec<EdgeRef>)>::new();
     for natural_loop in &graph_facts.natural_loops {
@@ -29,18 +44,25 @@ pub(super) fn analyze_loops(
         .map(|(header, (blocks, mut backedges))| {
             backedges.sort();
             backedges.dedup();
+            let preheader = unique_loop_preheader(cfg, header, &blocks);
             let exits = collect_region_exits(cfg, &blocks);
-            let reducible = is_reducible_loop(cfg, header, &blocks);
-            let (kind_hint, continue_target) =
-                infer_loop_shape(proto, cfg, header, &blocks, &backedges);
+            let reducible = is_reducible_region(cfg, header, &blocks);
+            let (kind_hint, continue_target, source_bindings) =
+                infer_loop_shape(proto, cfg, header, &blocks, &backedges, preheader);
+            let header_value_merges = analyze_loop_header_value_merges(dataflow, header, &blocks);
+            let exit_value_merges = analyze_loop_exit_value_merges(dataflow, &exits, &blocks);
 
             LoopCandidate {
                 header,
+                preheader,
                 blocks,
                 backedges,
                 exits,
                 continue_target,
                 kind_hint,
+                source_bindings,
+                header_value_merges,
+                exit_value_merges,
                 reducible,
             }
         })
@@ -56,7 +78,8 @@ fn infer_loop_shape(
     header: BlockRef,
     blocks: &BTreeSet<BlockRef>,
     backedges: &[EdgeRef],
-) -> (LoopKindHint, Option<BlockRef>) {
+    preheader: Option<BlockRef>,
+) -> (LoopKindHint, Option<BlockRef>, Option<LoopSourceBindings>) {
     let backedge_sources = backedges
         .iter()
         .map(|edge_ref| cfg.edges[edge_ref.index()].from)
@@ -70,7 +93,11 @@ fn infer_loop_shape(
         if let Some(terminator) = cfg.terminator(&proto.instrs, source)
             && matches!(terminator, LowInstr::NumericForLoop(_instr))
         {
-            return (LoopKindHint::NumericForLike, Some(source));
+            return (
+                LoopKindHint::NumericForLike,
+                Some(source),
+                numeric_for_source_bindings(proto, cfg, preheader),
+            );
         }
     }
 
@@ -82,7 +109,11 @@ fn infer_loop_shape(
         Some(LowInstr::GenericForLoop(instr))
             if generic_for_has_loop_body_and_exit(proto, cfg, header, instr, blocks)
     ) {
-        return (LoopKindHint::GenericForLike, Some(header));
+        return (
+            LoopKindHint::GenericForLike,
+            Some(header),
+            generic_for_source_bindings(proto, cfg, header),
+        );
     }
 
     // Luau 会把一部分 loop-invariant 的常量准备直接塞进 header block，再接 branch。
@@ -92,7 +123,7 @@ fn infer_loop_shape(
     if block_is_while_header_like(proto, cfg, header)
         && branch_has_loop_body_and_exit(cfg, header, blocks)
     {
-        return (LoopKindHint::WhileLike, Some(header));
+        return (LoopKindHint::WhileLike, Some(header), None);
     }
 
     if backedge_sources.len() == 1 {
@@ -104,7 +135,7 @@ fn infer_loop_shape(
             cfg.terminator(&proto.instrs, source),
             Some(LowInstr::Branch(_instr)) if branch_has_header_and_exit(cfg, source, header, blocks)
         ) {
-            return (LoopKindHint::RepeatLike, Some(source));
+            return (LoopKindHint::RepeatLike, Some(source), None);
         }
 
         if matches!(
@@ -116,6 +147,7 @@ fn infer_loop_shape(
             return (
                 LoopKindHint::RepeatLike,
                 repeat_continue_target_via_backedge_pad(proto, cfg, source, blocks),
+                None,
             );
         }
     }
@@ -126,11 +158,87 @@ fn infer_loop_shape(
         None
     };
 
-    (LoopKindHint::Unknown, continue_target)
+    (LoopKindHint::Unknown, continue_target, None)
+}
+
+fn numeric_for_source_bindings(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    preheader: Option<BlockRef>,
+) -> Option<LoopSourceBindings> {
+    let preheader = preheader?;
+    let instr_ref = cfg.blocks[preheader.index()].instrs.last()?;
+
+    match proto.instrs.get(instr_ref.index())? {
+        LowInstr::NumericForInit(instr) => Some(LoopSourceBindings::Numeric(instr.binding)),
+        _ => None,
+    }
+}
+
+fn generic_for_source_bindings(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    header: BlockRef,
+) -> Option<LoopSourceBindings> {
+    let instr_ref = cfg.blocks[header.index()].instrs.last()?;
+
+    match proto.instrs.get(instr_ref.index())? {
+        LowInstr::GenericForLoop(instr) => Some(LoopSourceBindings::Generic(instr.bindings)),
+        _ => None,
+    }
+}
+
+fn analyze_loop_header_value_merges(
+    dataflow: &DataflowFacts,
+    header: BlockRef,
+    loop_blocks: &BTreeSet<BlockRef>,
+) -> Vec<LoopValueMerge> {
+    loop_value_merges_in_block(dataflow, header, loop_blocks)
+        .into_iter()
+        .filter(loop_value_has_inside_and_outside_incoming)
+        .collect()
+}
+
+fn analyze_loop_exit_value_merges(
+    dataflow: &DataflowFacts,
+    exits: &BTreeSet<BlockRef>,
+    loop_blocks: &BTreeSet<BlockRef>,
+) -> Vec<LoopExitValueMergeCandidate> {
+    exits
+        .iter()
+        .copied()
+        .filter_map(|exit| {
+            let values = loop_value_merges_in_block(dataflow, exit, loop_blocks)
+                .into_iter()
+                .filter(|value| !value.inside_arm.is_empty())
+                .collect::<Vec<_>>();
+            (!values.is_empty()).then_some(LoopExitValueMergeCandidate { exit, values })
+        })
+        .collect()
+}
+
+fn loop_value_has_inside_and_outside_incoming(value: &LoopValueMerge) -> bool {
+    !value.inside_arm.is_empty() && !value.outside_arm.is_empty()
+}
+
+fn unique_loop_preheader(
+    cfg: &Cfg,
+    header: BlockRef,
+    loop_blocks: &BTreeSet<BlockRef>,
+) -> Option<BlockRef> {
+    let preds = cfg
+        .reachable_predecessors(header)
+        .into_iter()
+        .filter(|pred| !loop_blocks.contains(pred))
+        .collect::<Vec<_>>();
+    let [preheader] = preds.as_slice() else {
+        return None;
+    };
+    Some(*preheader)
 }
 
 fn branch_has_loop_body_and_exit(cfg: &Cfg, header: BlockRef, blocks: &BTreeSet<BlockRef>) -> bool {
-    let Some((then_edge_ref, else_edge_ref)) = branch_edges(cfg, header) else {
+    let Some((then_edge_ref, else_edge_ref)) = cfg.branch_edges(header) else {
         return false;
     };
     let then_block = cfg.edges[then_edge_ref.index()].to;
@@ -146,7 +254,7 @@ fn branch_has_header_and_exit(
     header: BlockRef,
     blocks: &BTreeSet<BlockRef>,
 ) -> bool {
-    let Some((then_edge_ref, else_edge_ref)) = branch_edges(cfg, block) else {
+    let Some((then_edge_ref, else_edge_ref)) = cfg.branch_edges(block) else {
         return false;
     };
     let then_block = cfg.edges[then_edge_ref.index()].to;
@@ -186,14 +294,11 @@ fn repeat_continue_target_via_backedge_pad(
     backedge_source: BlockRef,
     blocks: &BTreeSet<BlockRef>,
 ) -> Option<BlockRef> {
-    let mut preds = cfg.preds[backedge_source.index()]
-        .iter()
-        .map(|edge_ref| cfg.edges[edge_ref.index()].from)
-        .filter(|pred| cfg.reachable_blocks.contains(pred))
+    let preds = cfg
+        .reachable_predecessors(backedge_source)
+        .into_iter()
         .filter(|pred| blocks.contains(pred))
         .collect::<Vec<_>>();
-    preds.sort();
-    preds.dedup();
     let [continue_target] = preds.as_slice() else {
         return None;
     };
@@ -205,7 +310,7 @@ fn repeat_continue_target_via_backedge_pad(
         return None;
     }
 
-    let (then_edge_ref, else_edge_ref) = branch_edges(cfg, *continue_target)?;
+    let (then_edge_ref, else_edge_ref) = cfg.branch_edges(*continue_target)?;
     let then_block = cfg.edges[then_edge_ref.index()].to;
     let else_block = cfg.edges[else_edge_ref.index()].to;
 
@@ -241,17 +346,4 @@ fn generic_for_has_loop_body_and_exit(
     matches!(call.results, crate::transformer::ResultPack::Fixed(range) if range == instr.bindings)
         && blocks.contains(&body_block)
         && !blocks.contains(&exit_block)
-}
-
-fn is_reducible_loop(cfg: &Cfg, header: BlockRef, blocks: &BTreeSet<BlockRef>) -> bool {
-    blocks.iter().all(|block| {
-        if *block == header {
-            true
-        } else {
-            cfg.preds[block.index()].iter().all(|edge_ref| {
-                let pred = cfg.edges[edge_ref.index()].from;
-                !cfg.reachable_blocks.contains(&pred) || blocks.contains(&pred)
-            })
-        }
-    })
 }

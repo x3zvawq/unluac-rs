@@ -4,26 +4,26 @@
 //! 折进 raw 层了；这里专注做语义恢复，把它翻成项目里既有的 CFG/HIR/AST 管线能理解
 //! 的稳定 low-IR 契约。
 
-use std::collections::BTreeMap;
-
 use crate::parser::{
-    DialectConstPoolExtra, DialectInstrExtra, DialectProtoExtra, LuauCaptureKind, LuauConstEntry,
-    LuauInstrExtra, LuauOpcode, LuauOperands, LuauProtoExtra, RawChunk, RawInstr, RawInstrOpcode,
-    RawInstrOperands, RawLiteralConst, RawProto,
+    LuauCaptureKind, LuauConstEntry, LuauInstrExtra, LuauOpcode, LuauOperands, RawChunk,
+    RawLiteralConst, RawProto,
+};
+use crate::transformer::dialect::lowering::{
+    PendingLowInstr, PendingLoweringState, PendingMethodHints, TargetPlaceholder, WordCodeIndex,
+    instr_pc, instr_word_len, resolve_pending_instr_with,
 };
 use crate::transformer::dialect::puc_lua::{
     call_args_pack, call_result_pack, range_len_inclusive, reg_from_u8, return_pack,
 };
+use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
-    AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchInstr, BranchOperands,
+    AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchOperands,
     BranchPredicate, CallInstr, CallKind, Capture, CaptureSource, CloseInstr, ClosureInstr,
-    ConcatInstr, CondOperand, ConstRef, DialectCaptureExtra, GenericForCallInstr,
-    GenericForLoopInstr, GetTableInstr, GetUpvalueInstr, InstrRef, JumpInstr, LoadBoolInstr,
-    LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto,
-    LoweringMap, MoveInstr, NewTableInstr, NumericForInitInstr, NumericForLoopInstr, ProtoRef,
-    RawInstrRef, Reg, RegRange, ResultPack, ReturnInstr, SetListInstr, SetTableInstr,
-    SetUpvalueInstr, TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand,
-    ValuePack, VarArgInstr,
+    ConcatInstr, CondOperand, ConstRef, DialectCaptureExtra, GenericForCallInstr, GetTableInstr,
+    GetUpvalueInstr, InstrRef, LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr,
+    LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg,
+    RegRange, ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr,
+    TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
 pub(crate) fn lower_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
@@ -61,59 +61,9 @@ fn lower_proto(raw: &RawProto) -> Result<LoweredProto, TransformError> {
 
 struct ProtoLowerer<'a> {
     raw: &'a RawProto,
-    emitted: Vec<EmittedInstr>,
-    raw_target_low: Vec<Option<usize>>,
-    raw_to_low: Vec<Vec<InstrRef>>,
-    pending_methods: Vec<Option<Reg>>,
-    raw_pc_to_index: BTreeMap<u32, usize>,
-    raw_word_count: usize,
-}
-
-#[derive(Debug, Clone)]
-struct EmittedInstr {
-    raw_indices: Vec<usize>,
-    instr: PendingLowInstr,
-}
-
-#[derive(Debug, Clone)]
-enum PendingLowInstr {
-    Ready(LowInstr),
-    Jump {
-        target: TargetPlaceholder,
-    },
-    Branch {
-        cond: BranchCond,
-        then_target: TargetPlaceholder,
-        else_target: TargetPlaceholder,
-    },
-    NumericForInit {
-        index: Reg,
-        limit: Reg,
-        step: Reg,
-        binding: Reg,
-        body_target: TargetPlaceholder,
-        exit_target: TargetPlaceholder,
-    },
-    NumericForLoop {
-        index: Reg,
-        limit: Reg,
-        step: Reg,
-        binding: Reg,
-        body_target: TargetPlaceholder,
-        exit_target: TargetPlaceholder,
-    },
-    GenericForLoop {
-        control: Reg,
-        bindings: RegRange,
-        body_target: TargetPlaceholder,
-        exit_target: TargetPlaceholder,
-    },
-}
-
-#[derive(Debug, Clone, Copy)]
-enum TargetPlaceholder {
-    Raw(usize),
-    Low(usize),
+    lowering: PendingLoweringState,
+    pending_methods: PendingMethodHints,
+    word_code_index: WordCodeIndex,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -126,23 +76,12 @@ impl<'a> ProtoLowerer<'a> {
     fn new(raw: &'a RawProto) -> Self {
         let raw_instr_count = raw.common.instructions.len();
         let method_slots = usize::from(raw.common.frame.max_stack_size).saturating_add(2);
-        let mut raw_pc_to_index = BTreeMap::new();
-        let mut raw_word_count = 0_usize;
-
-        for (index, instr) in raw.common.instructions.iter().enumerate() {
-            let pc = raw_pc(instr);
-            raw_pc_to_index.insert(pc, index);
-            raw_word_count = raw_word_count.max((pc + u32::from(word_len(instr))) as usize);
-        }
 
         Self {
             raw,
-            emitted: Vec::new(),
-            raw_target_low: vec![None; raw_instr_count],
-            raw_to_low: vec![Vec::new(); raw_instr_count],
-            pending_methods: vec![None; method_slots],
-            raw_pc_to_index,
-            raw_word_count,
+            lowering: PendingLoweringState::new(raw_instr_count),
+            pending_methods: PendingMethodHints::new(method_slots),
+            word_code_index: WordCodeIndex::from_raw(raw, instr_pc, instr_word_len),
         }
     }
 
@@ -151,7 +90,9 @@ impl<'a> ProtoLowerer<'a> {
 
         while raw_index < self.raw.common.instructions.len() {
             let raw_instr = &self.raw.common.instructions[raw_index];
-            let (opcode, operands, extra) = decode_luau(raw_instr);
+            let (opcode, operands, extra) = raw_instr
+                .luau()
+                .expect("luau lowerer should only decode luau instructions");
             let raw_pc = extra.pc;
 
             match opcode {
@@ -971,7 +912,7 @@ impl<'a> ProtoLowerer<'a> {
                     return Err(TransformError::InvalidClosureCapture {
                         raw_pc,
                         capture_pc: raw_pc,
-                        found: opcode_label(opcode),
+                        found: opcode.label(),
                     });
                 }
                 LuauOpcode::ForNPrep => {
@@ -1077,64 +1018,20 @@ impl<'a> ProtoLowerer<'a> {
     }
 
     fn finish(&self) -> Result<(Vec<LowInstr>, LoweringMap), TransformError> {
-        let instrs = self
-            .emitted
-            .iter()
-            .map(|emitted| {
-                let owner_raw = emitted.raw_indices.first().copied().unwrap_or(0);
-                self.resolve_pending_instr(owner_raw, &emitted.instr)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let low_to_raw = self
-            .emitted
-            .iter()
-            .map(|emitted| {
-                emitted
-                    .raw_indices
-                    .iter()
+        self.lowering.finish(
+            self.raw,
+            |owner_raw, pending| self.resolve_pending_instr(owner_raw, pending),
+            instr_pc,
+            |raw_index| {
+                self.raw
+                    .common
+                    .debug_info
+                    .common
+                    .line_info
+                    .get(raw_index)
                     .copied()
-                    .map(RawInstrRef)
-                    .collect()
-            })
-            .collect::<Vec<Vec<RawInstrRef>>>();
-        let pc_map = self
-            .emitted
-            .iter()
-            .map(|emitted| {
-                emitted
-                    .raw_indices
-                    .iter()
-                    .copied()
-                    .map(|index| raw_pc_at(self.raw, index))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let line_hints = self
-            .emitted
-            .iter()
-            .map(|emitted| {
-                emitted.raw_indices.iter().find_map(|raw_index| {
-                    self.raw
-                        .common
-                        .debug_info
-                        .common
-                        .line_info
-                        .get(*raw_index)
-                        .copied()
-                })
-            })
-            .collect::<Vec<_>>();
-
-        Ok((
-            instrs,
-            LoweringMap {
-                low_to_raw,
-                raw_to_low: self.raw_to_low.clone(),
-                pc_map,
-                line_hints,
             },
-        ))
+        )
     }
 
     fn resolve_pending_instr(
@@ -1143,63 +1040,7 @@ impl<'a> ProtoLowerer<'a> {
         pending: &PendingLowInstr,
     ) -> Result<LowInstr, TransformError> {
         let owner_pc = raw_pc_at(self.raw, owner_raw);
-
-        match pending {
-            PendingLowInstr::Ready(instr) => Ok(instr.clone()),
-            PendingLowInstr::Jump { target } => Ok(LowInstr::Jump(JumpInstr {
-                target: self.resolve_target(owner_pc, *target)?,
-            })),
-            PendingLowInstr::Branch {
-                cond,
-                then_target,
-                else_target,
-            } => Ok(LowInstr::Branch(BranchInstr {
-                cond: *cond,
-                then_target: self.resolve_target(owner_pc, *then_target)?,
-                else_target: self.resolve_target(owner_pc, *else_target)?,
-            })),
-            PendingLowInstr::NumericForInit {
-                index,
-                limit,
-                step,
-                binding,
-                body_target,
-                exit_target,
-            } => Ok(LowInstr::NumericForInit(NumericForInitInstr {
-                index: *index,
-                limit: *limit,
-                step: *step,
-                binding: *binding,
-                body_target: self.resolve_target(owner_pc, *body_target)?,
-                exit_target: self.resolve_target(owner_pc, *exit_target)?,
-            })),
-            PendingLowInstr::NumericForLoop {
-                index,
-                limit,
-                step,
-                binding,
-                body_target,
-                exit_target,
-            } => Ok(LowInstr::NumericForLoop(NumericForLoopInstr {
-                index: *index,
-                limit: *limit,
-                step: *step,
-                binding: *binding,
-                body_target: self.resolve_target(owner_pc, *body_target)?,
-                exit_target: self.resolve_target(owner_pc, *exit_target)?,
-            })),
-            PendingLowInstr::GenericForLoop {
-                control,
-                bindings,
-                body_target,
-                exit_target,
-            } => Ok(LowInstr::GenericForLoop(GenericForLoopInstr {
-                control: *control,
-                bindings: *bindings,
-                body_target: self.resolve_target(owner_pc, *body_target)?,
-                exit_target: self.resolve_target(owner_pc, *exit_target)?,
-            })),
-        }
+        resolve_pending_instr_with(pending, |target| self.resolve_target(owner_pc, target))
     }
 
     fn resolve_target(
@@ -1207,18 +1048,9 @@ impl<'a> ProtoLowerer<'a> {
         owner_pc: u32,
         target: TargetPlaceholder,
     ) -> Result<InstrRef, TransformError> {
-        match target {
-            TargetPlaceholder::Low(index) => Ok(InstrRef(index)),
-            TargetPlaceholder::Raw(raw_index) => {
-                let Some(low_index) = self.raw_target_low[raw_index] else {
-                    return Err(TransformError::UntargetableRawInstruction {
-                        raw_pc: owner_pc,
-                        target_raw: raw_pc_at(self.raw, raw_index) as usize,
-                    });
-                };
-                Ok(InstrRef(low_index))
-            }
-        }
+        self.lowering.resolve_target(owner_pc, target, |raw_index| {
+            raw_pc_at(self.raw, raw_index) as usize
+        })
     }
 
     fn emit(
@@ -1227,20 +1059,7 @@ impl<'a> ProtoLowerer<'a> {
         raw_indices: Vec<usize>,
         instr: PendingLowInstr,
     ) -> usize {
-        let low_index = self.emitted.len();
-
-        if let Some(owner_raw) = owner_raw
-            && self.raw_target_low[owner_raw].is_none()
-        {
-            self.raw_target_low[owner_raw] = Some(low_index);
-        }
-
-        for raw_index in &raw_indices {
-            self.raw_to_low[*raw_index].push(InstrRef(low_index));
-        }
-
-        self.emitted.push(EmittedInstr { raw_indices, instr });
-        low_index
+        self.lowering.emit(owner_raw, raw_indices, instr)
     }
 
     fn literal_const_ref(&self, raw_pc: u32, index: usize) -> Result<ConstRef, TransformError> {
@@ -1274,10 +1093,11 @@ impl<'a> ProtoLowerer<'a> {
     }
 
     fn const_entries(&self) -> &[LuauConstEntry] {
-        match &self.raw.common.constants.extra {
-            DialectConstPoolExtra::Luau(extra) => &extra.entries,
-            _ => unreachable!("luau lowerer should only receive luau constant pools"),
-        }
+        self.raw
+            .common
+            .constants
+            .luau_entries()
+            .expect("luau lowerer should only receive luau constant pools")
     }
 
     fn const_entry(&self, raw_pc: u32, index: usize) -> Result<&LuauConstEntry, TransformError> {
@@ -1319,30 +1139,17 @@ impl<'a> ProtoLowerer<'a> {
         raw_pc: u32,
         const_index: usize,
     ) -> Result<ProtoRef, TransformError> {
-        let LuauConstEntry::Closure { proto_index } = self.const_entry(raw_pc, const_index)? else {
+        let LuauConstEntry::Closure {
+            child_proto_index, ..
+        } = self.const_entry(raw_pc, const_index)?
+        else {
             return Err(TransformError::InvalidConstRef {
                 raw_pc,
                 const_index,
                 const_count: self.const_entries().len(),
             });
         };
-        let child_ids = match &self.raw.extra {
-            DialectProtoExtra::Luau(LuauProtoExtra {
-                child_proto_ids, ..
-            }) => child_proto_ids,
-            _ => unreachable!("luau lowerer should only receive luau proto extras"),
-        };
-        let Some(child_index) = child_ids
-            .iter()
-            .position(|child_id| child_id == proto_index)
-        else {
-            return Err(TransformError::InvalidProtoRef {
-                raw_pc,
-                proto_index: *proto_index as usize,
-                child_count: child_ids.len(),
-            });
-        };
-        Ok(ProtoRef(child_index))
+        self.proto_ref(raw_pc, *child_proto_index)
     }
 
     fn import_path(
@@ -1379,13 +1186,15 @@ impl<'a> ProtoLowerer<'a> {
                     capture_index,
                 });
             };
-            let (capture_opcode, capture_operands, capture_extra) = decode_luau(raw_capture_instr);
+            let (capture_opcode, capture_operands, capture_extra) = raw_capture_instr
+                .luau()
+                .expect("luau lowerer should only decode luau instructions");
             raw_indices.push(capture_raw);
             if capture_opcode != LuauOpcode::Capture {
                 return Err(TransformError::InvalidClosureCapture {
                     raw_pc,
                     capture_pc: capture_extra.pc,
-                    found: opcode_label(capture_opcode),
+                    found: capture_opcode.label(),
                 });
             }
 
@@ -1394,7 +1203,7 @@ impl<'a> ProtoLowerer<'a> {
                 TransformError::InvalidClosureCapture {
                     raw_pc,
                     capture_pc: capture_extra.pc,
-                    found: opcode_label(capture_opcode),
+                    found: capture_opcode.label(),
                 }
             })?;
             let source = match kind {
@@ -1433,74 +1242,32 @@ impl<'a> ProtoLowerer<'a> {
 
     fn jump_target(&self, raw_pc: u32, offset: i32) -> Result<usize, TransformError> {
         let target_pc = i64::from(raw_pc) + 1 + i64::from(offset);
-        if target_pc < 0 || target_pc >= self.raw_word_count as i64 {
-            return Err(TransformError::InvalidJumpTarget {
-                raw_pc,
-                target_raw: target_pc.max(0) as usize,
-                instr_count: self.raw_word_count,
-            });
-        }
-        self.ensure_targetable_pc(raw_pc, target_pc as u32)
+        self.word_code_index.ensure_valid_jump_pc(raw_pc, target_pc)
     }
 
     fn ensure_targetable_pc(&self, raw_pc: u32, target_pc: u32) -> Result<usize, TransformError> {
-        if target_pc as usize >= self.raw_word_count {
-            return Err(TransformError::InvalidJumpTarget {
-                raw_pc,
-                target_raw: target_pc as usize,
-                instr_count: self.raw_word_count,
-            });
-        }
-
-        self.raw_pc_to_index.get(&target_pc).copied().ok_or(
-            TransformError::UntargetableRawInstruction {
-                raw_pc,
-                target_raw: target_pc as usize,
-            },
-        )
+        self.word_code_index.ensure_targetable_pc(raw_pc, target_pc)
     }
 
     fn next_raw_pc(&self, raw_index: usize) -> u32 {
         let instr = &self.raw.common.instructions[raw_index];
-        raw_pc(instr) + u32::from(word_len(instr))
+        instr.pc() + u32::from(instr_word_len(instr))
     }
 
     fn set_pending_method(&mut self, callee: Reg, self_arg: Reg) {
-        if callee.index() < self.pending_methods.len() {
-            self.pending_methods[callee.index()] = Some(self_arg);
-        }
+        self.pending_methods.set(callee, self_arg);
     }
 
     fn take_call_kind(&mut self, callee: Reg, raw_b: u16) -> CallKind {
-        if raw_b <= 1 {
-            return CallKind::Normal;
-        }
-
-        match self
-            .pending_methods
-            .get(callee.index())
-            .and_then(|value| *value)
-        {
-            Some(self_arg) if self_arg == Reg(callee.index() + 1) => CallKind::Method,
-            _ => CallKind::Normal,
-        }
+        self.pending_methods.call_kind_if(callee, raw_b > 1)
     }
 
     fn invalidate_written_reg(&mut self, reg: Reg) {
-        for (callee, pending) in self.pending_methods.iter_mut().enumerate() {
-            let Some(self_arg) = *pending else {
-                continue;
-            };
-            if callee == reg.index() || self_arg.index() == reg.index() {
-                *pending = None;
-            }
-        }
+        self.pending_methods.invalidate_reg(reg);
     }
 
     fn invalidate_written_range(&mut self, range: RegRange) {
-        for offset in 0..range.len {
-            self.invalidate_written_reg(Reg(range.start.index() + offset));
-        }
+        self.pending_methods.invalidate_range(range);
     }
 
     fn invalidate_vararg_results(&mut self, a: u8, b: u8) {
@@ -1512,7 +1279,7 @@ impl<'a> ProtoLowerer<'a> {
     }
 
     fn clear_all_method_hints(&mut self) {
-        self.pending_methods.fill(None);
+        self.pending_methods.clear();
     }
 
     fn emit_logical_select(
@@ -1523,7 +1290,7 @@ impl<'a> ProtoLowerer<'a> {
         truthy_value: LogicalSelectValue,
         falsy_value: LogicalSelectValue,
     ) {
-        let branch_low = self.emitted.len();
+        let branch_low = self.lowering.next_low_index() - 1;
         let truthy_low = branch_low + 1;
         let jump_low = branch_low + 2;
         let falsy_low = branch_low + 3;
@@ -1601,35 +1368,8 @@ impl<'a> ProtoLowerer<'a> {
     }
 }
 
-fn decode_luau(raw: &RawInstr) -> (LuauOpcode, &LuauOperands, LuauInstrExtra) {
-    let RawInstrOpcode::Luau(opcode) = raw.opcode else {
-        unreachable!("luau lowerer should only decode luau opcodes");
-    };
-    let RawInstrOperands::Luau(ref operands) = raw.operands else {
-        unreachable!("luau lowerer should only decode luau operands");
-    };
-    let DialectInstrExtra::Luau(extra) = raw.extra else {
-        unreachable!("luau lowerer should only decode luau extras");
-    };
-    (opcode, operands, extra)
-}
-
-fn raw_pc(raw: &RawInstr) -> u32 {
-    let DialectInstrExtra::Luau(extra) = raw.extra else {
-        unreachable!("luau lowerer should only decode luau extras");
-    };
-    extra.pc
-}
-
-fn word_len(raw: &RawInstr) -> u8 {
-    let DialectInstrExtra::Luau(extra) = raw.extra else {
-        unreachable!("luau lowerer should only decode luau extras");
-    };
-    extra.word_len
-}
-
 fn raw_pc_at(raw: &RawProto, index: usize) -> u32 {
-    raw_pc(&raw.common.instructions[index])
+    raw.common.instructions[index].pc()
 }
 
 fn required_aux(
@@ -1639,7 +1379,7 @@ fn required_aux(
 ) -> Result<u32, TransformError> {
     extra.aux.ok_or(TransformError::MissingExtraArg {
         raw_pc,
-        opcode: opcode_label(opcode),
+        opcode: opcode.label(),
     })
 }
 
@@ -1655,7 +1395,7 @@ fn aux_reg(raw_pc: u32, opcode: LuauOpcode, extra: LuauInstrExtra) -> Result<u8,
     let aux = required_aux(raw_pc, opcode, extra)?;
     u8::try_from(aux & 0xff).map_err(|_| TransformError::MissingExtraArg {
         raw_pc,
-        opcode: opcode_label(opcode),
+        opcode: opcode.label(),
     })
 }
 
@@ -1701,166 +1441,24 @@ fn compare_negated(opcode: LuauOpcode) -> bool {
     )
 }
 
-fn opcode_label(opcode: LuauOpcode) -> &'static str {
-    match opcode {
-        LuauOpcode::Nop => "NOP",
-        LuauOpcode::Break => "BREAK",
-        LuauOpcode::LoadNil => "LOADNIL",
-        LuauOpcode::LoadB => "LOADB",
-        LuauOpcode::LoadN => "LOADN",
-        LuauOpcode::LoadK => "LOADK",
-        LuauOpcode::Move => "MOVE",
-        LuauOpcode::GetGlobal => "GETGLOBAL",
-        LuauOpcode::SetGlobal => "SETGLOBAL",
-        LuauOpcode::GetUpVal => "GETUPVAL",
-        LuauOpcode::SetUpVal => "SETUPVAL",
-        LuauOpcode::CloseUpVals => "CLOSEUPVALS",
-        LuauOpcode::GetImport => "GETIMPORT",
-        LuauOpcode::GetTable => "GETTABLE",
-        LuauOpcode::SetTable => "SETTABLE",
-        LuauOpcode::GetTableKs => "GETTABLEKS",
-        LuauOpcode::SetTableKs => "SETTABLEKS",
-        LuauOpcode::GetTableN => "GETTABLEN",
-        LuauOpcode::SetTableN => "SETTABLEN",
-        LuauOpcode::NewClosure => "NEWCLOSURE",
-        LuauOpcode::NameCall => "NAMECALL",
-        LuauOpcode::Call => "CALL",
-        LuauOpcode::Return => "RETURN",
-        LuauOpcode::Jump => "JUMP",
-        LuauOpcode::JumpBack => "JUMPBACK",
-        LuauOpcode::JumpIf => "JUMPIF",
-        LuauOpcode::JumpIfNot => "JUMPIFNOT",
-        LuauOpcode::JumpIfEq => "JUMPIFEQ",
-        LuauOpcode::JumpIfLe => "JUMPIFLE",
-        LuauOpcode::JumpIfLt => "JUMPIFLT",
-        LuauOpcode::JumpIfNotEq => "JUMPIFNOTEQ",
-        LuauOpcode::JumpIfNotLe => "JUMPIFNOTLE",
-        LuauOpcode::JumpIfNotLt => "JUMPIFNOTLT",
-        LuauOpcode::Add => "ADD",
-        LuauOpcode::Sub => "SUB",
-        LuauOpcode::Mul => "MUL",
-        LuauOpcode::Div => "DIV",
-        LuauOpcode::Mod => "MOD",
-        LuauOpcode::Pow => "POW",
-        LuauOpcode::AddK => "ADDK",
-        LuauOpcode::SubK => "SUBK",
-        LuauOpcode::MulK => "MULK",
-        LuauOpcode::DivK => "DIVK",
-        LuauOpcode::ModK => "MODK",
-        LuauOpcode::PowK => "POWK",
-        LuauOpcode::And => "AND",
-        LuauOpcode::Or => "OR",
-        LuauOpcode::AndK => "ANDK",
-        LuauOpcode::OrK => "ORK",
-        LuauOpcode::Concat => "CONCAT",
-        LuauOpcode::Not => "NOT",
-        LuauOpcode::Minus => "MINUS",
-        LuauOpcode::Length => "LENGTH",
-        LuauOpcode::NewTable => "NEWTABLE",
-        LuauOpcode::DupTable => "DUPTABLE",
-        LuauOpcode::SetList => "SETLIST",
-        LuauOpcode::ForNPrep => "FORNPREP",
-        LuauOpcode::ForNLoop => "FORNLOOP",
-        LuauOpcode::ForGLoop => "FORGLOOP",
-        LuauOpcode::ForGPrepInext => "FORGPREP_INEXT",
-        LuauOpcode::FastCall3 => "FASTCALL3",
-        LuauOpcode::ForGPrepNext => "FORGPREP_NEXT",
-        LuauOpcode::NativeCall => "NATIVECALL",
-        LuauOpcode::GetVarArgs => "GETVARARGS",
-        LuauOpcode::DupClosure => "DUPCLOSURE",
-        LuauOpcode::PrepVarArgs => "PREPVARARGS",
-        LuauOpcode::LoadKx => "LOADKX",
-        LuauOpcode::JumpX => "JUMPX",
-        LuauOpcode::FastCall => "FASTCALL",
-        LuauOpcode::Coverage => "COVERAGE",
-        LuauOpcode::Capture => "CAPTURE",
-        LuauOpcode::SubRK => "SUBRK",
-        LuauOpcode::DivRK => "DIVRK",
-        LuauOpcode::FastCall1 => "FASTCALL1",
-        LuauOpcode::FastCall2 => "FASTCALL2",
-        LuauOpcode::FastCall2K => "FASTCALL2K",
-        LuauOpcode::ForGPrep => "FORGPREP",
-        LuauOpcode::JumpXEqKNil => "JUMPXEQKNIL",
-        LuauOpcode::JumpXEqKB => "JUMPXEQKB",
-        LuauOpcode::JumpXEqKN => "JUMPXEQKN",
-        LuauOpcode::JumpXEqKS => "JUMPXEQKS",
-        LuauOpcode::IDiv => "IDIV",
-        LuauOpcode::IDivK => "IDIVK",
+define_operand_expecters! {
+    opcode = LuauOpcode,
+    operands = LuauOperands,
+    label = LuauOpcode::label,
+    fn expect_a("A") -> u8 {
+        LuauOperands::A { a } => *a
     }
-}
-
-fn expect_a(
-    raw_pc: u32,
-    opcode: LuauOpcode,
-    operands: &LuauOperands,
-) -> Result<u8, TransformError> {
-    match operands {
-        LuauOperands::A { a } => Ok(*a),
-        _ => Err(TransformError::UnexpectedOperands {
-            raw_pc,
-            opcode: opcode_label(opcode),
-            expected: "A",
-        }),
+    fn expect_ab("AB") -> (u8, u8) {
+        LuauOperands::AB { a, b } => (*a, *b)
     }
-}
-
-fn expect_ab(
-    raw_pc: u32,
-    opcode: LuauOpcode,
-    operands: &LuauOperands,
-) -> Result<(u8, u8), TransformError> {
-    match operands {
-        LuauOperands::AB { a, b } => Ok((*a, *b)),
-        _ => Err(TransformError::UnexpectedOperands {
-            raw_pc,
-            opcode: opcode_label(opcode),
-            expected: "AB",
-        }),
+    fn expect_abc("ABC") -> (u8, u8, u8) {
+        LuauOperands::ABC { a, b, c } => (*a, *b, *c)
     }
-}
-
-fn expect_abc(
-    raw_pc: u32,
-    opcode: LuauOpcode,
-    operands: &LuauOperands,
-) -> Result<(u8, u8, u8), TransformError> {
-    match operands {
-        LuauOperands::ABC { a, b, c } => Ok((*a, *b, *c)),
-        _ => Err(TransformError::UnexpectedOperands {
-            raw_pc,
-            opcode: opcode_label(opcode),
-            expected: "ABC",
-        }),
+    fn expect_ac("AC") -> (u8, u8) {
+        LuauOperands::AC { a, c } => (*a, *c)
     }
-}
-
-fn expect_ac(
-    raw_pc: u32,
-    opcode: LuauOpcode,
-    operands: &LuauOperands,
-) -> Result<(u8, u8), TransformError> {
-    match operands {
-        LuauOperands::AC { a, c } => Ok((*a, *c)),
-        _ => Err(TransformError::UnexpectedOperands {
-            raw_pc,
-            opcode: opcode_label(opcode),
-            expected: "AC",
-        }),
-    }
-}
-
-fn expect_ad(
-    raw_pc: u32,
-    opcode: LuauOpcode,
-    operands: &LuauOperands,
-) -> Result<(u8, i16), TransformError> {
-    match operands {
-        LuauOperands::AD { a, d } => Ok((*a, *d)),
-        _ => Err(TransformError::UnexpectedOperands {
-            raw_pc,
-            opcode: opcode_label(opcode),
-            expected: "AD",
-        }),
+    fn expect_ad("AD") -> (u8, i16) {
+        LuauOperands::AD { a, d } => (*a, *d)
     }
 }
 

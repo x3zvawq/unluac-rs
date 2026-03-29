@@ -20,8 +20,8 @@ use crate::parser::reader::BinaryReader;
 
 use super::raw::{
     LuaJitConstPoolExtra, LuaJitDebugExtra, LuaJitHeaderExtra, LuaJitInstrExtra, LuaJitKgcEntry,
-    LuaJitNumberConstEntry, LuaJitOpcode, LuaJitOperands, LuaJitProtoExtra, LuaJitTableConst,
-    LuaJitTableLiteral, LuaJitTableRecord, LuaJitUpvalueExtra,
+    LuaJitNumberConstEntry, LuaJitOpcode, LuaJitProtoExtra, LuaJitTableConst, LuaJitTableLiteral,
+    LuaJitTableRecord, LuaJitUpvalueExtra,
 };
 
 const LUAJIT_HEAD1: u8 = 0x1b;
@@ -346,15 +346,7 @@ impl LuaJitParser {
             let opcode_byte = (word & 0xff) as u8;
             let opcode = LuaJitOpcode::try_from(opcode_byte)
                 .map_err(|opcode| ParseError::InvalidOpcode { pc, opcode })?;
-            let a = ((word >> 8) & 0xff) as u8;
-            let d = ((word >> 16) & 0xffff) as u16;
-            let c = ((word >> 16) & 0xff) as u8;
-            let b = ((word >> 24) & 0xff) as u8;
-            let operands = match opcode.operand_kind() {
-                super::raw::LuaJitOperandKind::A => LuaJitOperands::A { a },
-                super::raw::LuaJitOperandKind::AD => LuaJitOperands::AD { a, d },
-                super::raw::LuaJitOperandKind::ABC => LuaJitOperands::ABC { a, b, c },
-            };
+            let operands = opcode.decode_operands(word);
             instructions.push(RawInstr {
                 opcode: RawInstrOpcode::LuaJit(opcode),
                 operands: RawInstrOperands::LuaJit(operands),

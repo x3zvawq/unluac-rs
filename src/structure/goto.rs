@@ -1,39 +1,43 @@
 //! 这个文件实现必须保留跳转的结构约束。
 //!
-//! 目标不是做最终 `goto/label` 决策，而是把当前结构候选无法吞掉的边先明确标记。
+//! 它依赖 loop/branch/irreducible region 已经给出的结构候选，负责把这些候选明确
+//! 吞不掉的边提前标成 `GotoRequirement`，避免 HIR/AST 再去临时猜“这里是不是还要
+//! 保留 label/goto”。
+//! 它不会越权决定最终 `goto/label` 语法，只表达“哪些跳转现在还不能被结构化吸收”。
+//!
+//! 例子：
+//! - `break` 或 `continue` 形状如果提前跳出了当前 loop body，会被记成
+//!   `UnstructuredBreakLike / UnstructuredContinueLike`
+//! - branch region 内部如果有一条边直接跳到 merge 之外，会被记成
+//!   `CrossStructureJump`
 
 use std::collections::BTreeSet;
 
 use crate::cfg::{Cfg, EdgeKind};
 use crate::transformer::{LowInstr, LoweredProto};
 
-use super::branches::collect_branch_region_blocks;
-use super::common::{BranchCandidate, GotoReason, GotoRequirement, LoopCandidate, LoopKindHint};
-use super::helpers::IrreducibleRegion;
+use super::common::IrreducibleRegion;
+use super::common::{BranchRegionFact, GotoReason, GotoRequirement, LoopCandidate, LoopKindHint};
+use super::helpers::{collect_region_entry_edges, collect_region_exit_edges};
 
 pub(super) fn analyze_goto_requirements(
     proto: &LoweredProto,
     cfg: &Cfg,
     loop_candidates: &[LoopCandidate],
-    branch_candidates: &[BranchCandidate],
+    branch_regions: &[BranchRegionFact],
     irreducible_regions: &[IrreducibleRegion],
 ) -> Vec<GotoRequirement> {
     let mut requirements = BTreeSet::new();
 
     for loop_candidate in loop_candidates {
-        for block in &loop_candidate.blocks {
-            for edge_ref in &cfg.preds[block.index()] {
-                let edge = cfg.edges[edge_ref.index()];
-                if cfg.reachable_blocks.contains(&edge.from)
-                    && !loop_candidate.blocks.contains(&edge.from)
-                    && *block != loop_candidate.header
-                {
-                    requirements.insert(GotoRequirement {
-                        from: edge.from,
-                        to: *block,
-                        reason: GotoReason::MultiEntryRegion,
-                    });
-                }
+        for edge_ref in collect_region_entry_edges(cfg, &loop_candidate.blocks) {
+            let edge = cfg.edges[edge_ref.index()];
+            if edge.to != loop_candidate.header {
+                requirements.insert(GotoRequirement {
+                    from: edge.from,
+                    to: edge.to,
+                    reason: GotoReason::MultiEntryRegion,
+                });
             }
         }
 
@@ -82,24 +86,15 @@ pub(super) fn analyze_goto_requirements(
         }
     }
 
-    for branch_candidate in branch_candidates {
-        let Some(merge) = branch_candidate.merge else {
-            continue;
-        };
-        let region_blocks = collect_branch_region_blocks(cfg, branch_candidate, merge, None);
-        for block in &region_blocks {
-            for edge_ref in &cfg.succs[block.index()] {
-                let edge = cfg.edges[edge_ref.index()];
-                if cfg.reachable_blocks.contains(&edge.to)
-                    && !region_blocks.contains(&edge.to)
-                    && edge.to != merge
-                {
-                    requirements.insert(GotoRequirement {
-                        from: edge.from,
-                        to: edge.to,
-                        reason: GotoReason::CrossStructureJump,
-                    });
-                }
+    for branch_region in branch_regions {
+        for edge_ref in collect_region_exit_edges(cfg, &branch_region.flow_blocks) {
+            let edge = cfg.edges[edge_ref.index()];
+            if edge.to != branch_region.merge {
+                requirements.insert(GotoRequirement {
+                    from: edge.from,
+                    to: edge.to,
+                    reason: GotoReason::CrossStructureJump,
+                });
             }
         }
     }

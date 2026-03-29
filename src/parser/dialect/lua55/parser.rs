@@ -6,24 +6,29 @@
 //! 显式实现，避免把这些变化继续塞回 5.4 的读取假设里。
 
 use crate::parser::dialect::puc_lua::{
-    LUA_SIGNATURE, LUA55_LUAC_DATA, LUA55_LUAC_INST, LUA55_LUAC_INT, LUA55_LUAC_NUM, PucLuaLayout,
-    RawInstructionWord, decode_instruction_word_55,
+    AbsDebugDriver, AbsLineInfoConfig, LUA55_LUAC_DATA, LUA55_LUAC_INST, LUA55_LUAC_INT,
+    LUA55_LUAC_NUM, PucLuaLayout, PucLuaProtoSections, build_raw_string, count_u8,
+    decode_instruction_word_55, define_puc_lua_instruction_codec, finish_puc_lua_proto,
+    inherit_source, parse_abs_debug_sections, parse_child_protos, parse_luac_data_header_prelude,
+    parse_puc_lua_instruction_section, parse_tagged_literal_pool, parse_upvalues_with_kinds,
+    read_f64_sentinel, read_i64_sentinel, read_i64_sentinel_endianness, read_proto_prelude,
+    require_present, validate_instruction_word_size, validate_main_proto_upvalue_count,
+    validate_optional_count_match,
 };
 use crate::parser::error::ParseError;
 use crate::parser::options::ParseOptions;
 use crate::parser::raw::{
-    ChunkHeader, ChunkLayout, DecodedText, Dialect, DialectConstPoolExtra, DialectDebugExtra,
+    ChunkHeader, ChunkLayout, Dialect, DialectConstPoolExtra, DialectDebugExtra,
     DialectHeaderExtra, DialectInstrExtra, DialectProtoExtra, DialectUpvalueExtra, DialectVersion,
-    Endianness, Origin, ProtoFrameInfo, ProtoLineRange, ProtoSignature, PucLuaChunkLayout,
-    RawChunk, RawConstPool, RawConstPoolCommon, RawDebugInfo, RawDebugInfoCommon, RawInstr,
-    RawInstrOpcode, RawInstrOperands, RawLiteralConst, RawLocalVar, RawProto, RawProtoCommon,
-    RawString, RawUpvalueDescriptor, RawUpvalueInfo, RawUpvalueInfoCommon, Span,
+    Origin, ProtoSignature, PucLuaChunkLayout, RawChunk, RawConstPool, RawConstPoolCommon,
+    RawDebugInfo, RawInstrOpcode, RawInstrOperands, RawLiteralConst, RawLocalVar, RawProto,
+    RawString, RawUpvalueInfo, RawUpvalueInfoCommon, Span,
 };
 use crate::parser::reader::BinaryReader;
 
 use super::raw::{
-    Lua55AbsLineInfo, Lua55ConstPoolExtra, Lua55DebugExtra, Lua55HeaderExtra, Lua55InstrExtra,
-    Lua55Opcode, Lua55Operands, Lua55ProtoExtra, Lua55UpvalueExtra,
+    Lua55AbsLineInfo, Lua55ConstPoolExtra, Lua55DebugExtra, Lua55ExtraWordPolicy, Lua55HeaderExtra,
+    Lua55InstrExtra, Lua55Opcode, Lua55ProtoExtra, Lua55UpvalueExtra,
 };
 
 const LUA55_VERSION: u8 = 0x55;
@@ -47,6 +52,79 @@ pub(crate) struct Lua55Parser {
 struct Lua55ParserState {
     options: ParseOptions,
     saved_strings: Vec<RawString>,
+}
+
+struct Lua55AbsDebugDriver<'a> {
+    parser: &'a mut Lua55ParserState,
+    layout: &'a PucLuaLayout,
+    permissive: bool,
+    upvalue_count: u8,
+}
+
+impl<'a, 'bytes> AbsDebugDriver<'bytes> for Lua55AbsDebugDriver<'a> {
+    fn read_count(
+        &mut self,
+        reader: &mut BinaryReader<'bytes>,
+        field: &'static str,
+    ) -> Result<u32, ParseError> {
+        reader.read_varint_u32_lua55(field)
+    }
+
+    fn read_line_delta(&mut self, reader: &mut BinaryReader<'bytes>) -> Result<i8, ParseError> {
+        Ok(reader.read_u8()? as i8)
+    }
+
+    fn prepare_abs_line_info(
+        &mut self,
+        reader: &mut BinaryReader<'bytes>,
+        abs_line_count: u32,
+    ) -> Result<(), ParseError> {
+        if abs_line_count != 0 {
+            self.parser
+                .skip_align(reader, usize::from(self.layout.integer_size))?;
+        }
+        Ok(())
+    }
+
+    fn read_abs_line_pair(
+        &mut self,
+        reader: &mut BinaryReader<'bytes>,
+    ) -> Result<(u32, u32), ParseError> {
+        Ok((
+            reader.read_varint_u32_lua55("abs line info pc")?,
+            reader.read_varint_u32_lua55("abs line info line")?,
+        ))
+    }
+
+    fn parse_local_var(
+        &mut self,
+        reader: &mut BinaryReader<'bytes>,
+    ) -> Result<RawLocalVar, ParseError> {
+        Ok(RawLocalVar {
+            name: require_present(
+                self.parser.parse_optional_string(reader)?,
+                "local var name length",
+            )?,
+            start_pc: reader.read_varint_u32_lua55("local var startpc")?,
+            end_pc: reader.read_varint_u32_lua55("local var endpc")?,
+        })
+    }
+
+    fn validate_upvalue_count(&mut self, count: u32) -> Result<(), ParseError> {
+        validate_optional_count_match(
+            self.permissive,
+            "upvalue name count",
+            count,
+            self.upvalue_count,
+        )
+    }
+
+    fn parse_upvalue_name(
+        &mut self,
+        reader: &mut BinaryReader<'bytes>,
+    ) -> Result<Option<RawString>, ParseError> {
+        self.parser.parse_optional_string(reader)
+    }
 }
 
 impl Lua55Parser {
@@ -82,14 +160,11 @@ impl Lua55ParserState {
         let main_upvalue_count = reader.read_u8()?;
         let main = self.parse_proto(&mut reader, &layout, None)?;
 
-        if !self.options.mode.is_permissive()
-            && main.common.upvalues.common.count != main_upvalue_count
-        {
-            return Err(ParseError::UnsupportedValue {
-                field: "main proto upvalue count",
-                value: u64::from(main_upvalue_count),
-            });
-        }
+        validate_main_proto_upvalue_count(
+            self.options.mode.is_permissive(),
+            main_upvalue_count,
+            main.common.upvalues.common.count,
+        )?;
 
         Ok(RawChunk {
             header,
@@ -105,53 +180,26 @@ impl Lua55ParserState {
     }
 
     fn parse_header(&self, reader: &mut BinaryReader<'_>) -> Result<ChunkHeader, ParseError> {
-        let start = reader.offset();
-        let signature = reader.read_array::<4>()?;
-        if signature != *LUA_SIGNATURE {
-            return Err(ParseError::InvalidSignature { offset: start });
-        }
-
-        let version = reader.read_u8()?;
-        if version != LUA55_VERSION {
-            return Err(ParseError::UnsupportedVersion { found: version });
-        }
-
-        let format = reader.read_u8()?;
-        if format != LUA55_FORMAT && !self.options.mode.is_permissive() {
-            return Err(ParseError::UnsupportedHeaderFormat { found: format });
-        }
-
-        let luac_data = reader.read_array::<6>()?;
-        if luac_data != *LUA55_LUAC_DATA && !self.options.mode.is_permissive() {
-            return Err(ParseError::UnsupportedValue {
-                field: "luac_data",
-                value: u64::from(u32::from_le_bytes([
-                    luac_data[0],
-                    luac_data[1],
-                    luac_data[2],
-                    luac_data[3],
-                ])),
-            });
-        }
+        let start = parse_luac_data_header_prelude(
+            reader,
+            LUA55_VERSION,
+            LUA55_FORMAT,
+            LUA55_LUAC_DATA,
+            self.options.mode.is_permissive(),
+        )?;
 
         let integer_size = reader.read_u8()?;
-        let int_sentinel_bytes = reader.read_exact(usize::from(integer_size))?;
-        let endianness = self.detect_endianness(int_sentinel_bytes)?;
-        let int_sentinel = decode_i64_bytes(int_sentinel_bytes, endianness, "int")?;
-        if int_sentinel != LUA55_LUAC_INT && !self.options.mode.is_permissive() {
-            return Err(ParseError::UnsupportedValue {
-                field: "luac_int",
-                value: int_sentinel as u64,
-            });
-        }
+        let endianness = read_i64_sentinel_endianness(
+            reader,
+            integer_size,
+            LUA55_LUAC_INT,
+            "int",
+            "luac_int",
+            self.options.mode.is_permissive(),
+        )?;
 
         let instruction_size = reader.read_u8()?;
-        if instruction_size != 4 {
-            return Err(ParseError::UnsupportedSize {
-                field: "instruction_size",
-                value: instruction_size,
-            });
-        }
+        validate_instruction_word_size(instruction_size)?;
         let instruction_sentinel =
             reader.read_u64_sized(instruction_size, endianness, "instruction")?;
         if instruction_sentinel != u64::from(LUA55_LUAC_INST) && !self.options.mode.is_permissive()
@@ -163,30 +211,32 @@ impl Lua55ParserState {
         }
 
         let lua_integer_size = reader.read_u8()?;
-        let luac_lua_int_bytes = reader.read_exact(usize::from(lua_integer_size))?;
-        let luac_lua_int = decode_i64_bytes(luac_lua_int_bytes, endianness, "lua_Integer")?;
-        if luac_lua_int != LUA55_LUAC_INT && !self.options.mode.is_permissive() {
-            return Err(ParseError::UnsupportedValue {
-                field: "luac_lua_integer",
-                value: luac_lua_int as u64,
-            });
-        }
+        read_i64_sentinel(
+            reader,
+            lua_integer_size,
+            endianness,
+            LUA55_LUAC_INT,
+            "lua_Integer",
+            "luac_lua_integer",
+            self.options.mode.is_permissive(),
+        )?;
 
         let number_size = reader.read_u8()?;
-        let luac_num_bytes = reader.read_exact(usize::from(number_size))?;
-        let luac_num = decode_f64_bytes(luac_num_bytes, endianness)?;
-        if luac_num != LUA55_LUAC_NUM && !self.options.mode.is_permissive() {
-            return Err(ParseError::UnsupportedValue {
-                field: "luac_num",
-                value: luac_num.to_bits(),
-            });
-        }
+        read_f64_sentinel(
+            reader,
+            number_size,
+            endianness,
+            LUA55_LUAC_NUM,
+            "number_size",
+            "luac_num",
+            self.options.mode.is_permissive(),
+        )?;
 
         Ok(ChunkHeader {
             dialect: Dialect::PucLua,
             version: DialectVersion::Lua55,
             layout: ChunkLayout::PucLua(PucLuaChunkLayout {
-                format,
+                format: LUA55_FORMAT,
                 endianness,
                 integer_size,
                 lua_integer_size: Some(lua_integer_size),
@@ -206,325 +256,65 @@ impl Lua55ParserState {
         })
     }
 
-    fn detect_endianness(&self, bytes: &[u8]) -> Result<Endianness, ParseError> {
-        let little = decode_i64_bytes(bytes, Endianness::Little, "int")?;
-        if little == LUA55_LUAC_INT {
-            return Ok(Endianness::Little);
-        }
-
-        let big = decode_i64_bytes(bytes, Endianness::Big, "int")?;
-        if big == LUA55_LUAC_INT {
-            return Ok(Endianness::Big);
-        }
-
-        if self.options.mode.is_permissive() {
-            Ok(Endianness::Little)
-        } else {
-            Err(ParseError::UnsupportedValue {
-                field: "luac_int",
-                value: little as u64,
-            })
-        }
-    }
-
     fn parse_proto(
         &mut self,
         reader: &mut BinaryReader<'_>,
         layout: &PucLuaLayout,
         parent_source: Option<&RawString>,
     ) -> Result<RawProto, ParseError> {
-        let start = reader.offset();
-        let defined_start = self.read_count(reader, "linedefined")?;
-        let defined_end = self.read_count(reader, "lastlinedefined")?;
-        let num_params = reader.read_u8()?;
-        let raw_flag = reader.read_u8()?;
+        let (prelude, header_source) = read_proto_prelude(
+            reader,
+            |_| Ok(None),
+            |reader, field| reader.read_varint_u32_lua55(field),
+        )?;
+        let raw_flag = prelude.raw_flag;
         let semantic_flag = raw_flag & !PF_FIXED;
-        let max_stack_size = reader.read_u8()?;
 
-        let instruction_words = self.parse_instruction_words(reader, layout)?;
-        let instructions = self.decode_instructions(&instruction_words)?;
+        let (raw_instruction_words, instructions) =
+            parse_puc_lua_instruction_section::<Lua55InstructionCodec, _, _>(
+                reader,
+                layout,
+                |reader, field| reader.read_varint_u32_lua55(field),
+                |reader, layout| self.skip_align(reader, usize::from(layout.instruction_size)),
+                "instruction",
+            )?;
         let constants = self.parse_constants(reader, layout)?;
         let upvalues = self.parse_upvalues(reader)?;
-        let children = self.parse_children(reader, layout, parent_source)?;
-        let source = self
-            .parse_optional_string(reader)?
-            .or_else(|| parent_source.cloned());
+        let child_count = reader.read_varint_u32_lua55("child proto count")?;
+        let children = parse_child_protos(child_count, || {
+            self.parse_proto(reader, layout, parent_source)
+        })?;
+        let source = inherit_source(
+            self.parse_optional_string(reader)?.or(header_source),
+            parent_source,
+        );
         let debug_info = self.parse_debug_info(
             reader,
             layout,
-            instruction_words.len(),
-            defined_start,
+            raw_instruction_words,
+            prelude.line_range.defined_start,
             upvalues.common.count,
         )?;
 
-        Ok(RawProto {
-            common: RawProtoCommon {
-                source,
-                line_range: ProtoLineRange {
-                    defined_start,
-                    defined_end,
-                },
-                signature: ProtoSignature {
-                    num_params,
-                    is_vararg: semantic_flag & (PF_VAHID | PF_VATAB) != 0,
-                    has_vararg_param_reg: semantic_flag & (PF_VAHID | PF_VATAB) != 0,
-                    named_vararg_table: semantic_flag & PF_VATAB != 0,
-                },
-                frame: ProtoFrameInfo { max_stack_size },
+        Ok(finish_puc_lua_proto(
+            prelude,
+            source,
+            ProtoSignature {
+                num_params: prelude.num_params,
+                is_vararg: semantic_flag & (PF_VAHID | PF_VATAB) != 0,
+                has_vararg_param_reg: semantic_flag & (PF_VAHID | PF_VATAB) != 0,
+                named_vararg_table: semantic_flag & PF_VATAB != 0,
+            },
+            PucLuaProtoSections {
                 instructions,
                 constants,
                 upvalues,
                 debug_info,
                 children,
             },
-            extra: DialectProtoExtra::Lua55(Lua55ProtoExtra { raw_flag }),
-            origin: Origin {
-                span: Span {
-                    offset: start,
-                    size: reader.offset() - start,
-                },
-                raw_word: None,
-            },
-        })
-    }
-
-    fn parse_instruction_words(
-        &self,
-        reader: &mut BinaryReader<'_>,
-        layout: &PucLuaLayout,
-    ) -> Result<Vec<RawInstructionWord>, ParseError> {
-        let count = self.read_count(reader, "instruction count")?;
-        self.skip_align(reader, usize::from(layout.instruction_size))?;
-        let mut words = Vec::with_capacity(count as usize);
-
-        for _ in 0..count {
-            let offset = reader.offset();
-            let word =
-                reader.read_u64_sized(layout.instruction_size, layout.endianness, "instruction")?;
-            let word = u32::try_from(word).map_err(|_| ParseError::UnsupportedValue {
-                field: "instruction word",
-                value: word,
-            })?;
-            words.push(RawInstructionWord { offset, word });
-        }
-
-        Ok(words)
-    }
-
-    fn decode_instructions(
-        &self,
-        words: &[RawInstructionWord],
-    ) -> Result<Vec<RawInstr>, ParseError> {
-        let mut instructions = Vec::with_capacity(words.len());
-        let mut pc = 0_usize;
-
-        while pc < words.len() {
-            let entry = words[pc];
-            let fields = decode_instruction_word_55(entry.word);
-            let opcode = Lua55Opcode::try_from(fields.opcode)
-                .map_err(|opcode| ParseError::InvalidOpcode { pc, opcode })?;
-
-            let mut word_len = 1_u8;
-            let mut extra_arg = None;
-
-            let operands = match opcode {
-                Lua55Opcode::Return0 => Lua55Operands::None,
-                Lua55Opcode::LoadKx => {
-                    extra_arg = Some(self.extra_arg_word(words, pc, opcode)?);
-                    word_len = 2;
-                    Lua55Operands::A { a: fields.a }
-                }
-                Lua55Opcode::LoadFalse
-                | Lua55Opcode::LFalseSkip
-                | Lua55Opcode::LoadTrue
-                | Lua55Opcode::Return1
-                | Lua55Opcode::Tbc
-                | Lua55Opcode::VarArgPrep
-                | Lua55Opcode::Close => Lua55Operands::A { a: fields.a },
-                Lua55Opcode::Test => Lua55Operands::Ak {
-                    a: fields.a,
-                    k: fields.k,
-                },
-                Lua55Opcode::Move
-                | Lua55Opcode::LoadNil
-                | Lua55Opcode::GetUpVal
-                | Lua55Opcode::SetUpVal
-                | Lua55Opcode::Unm
-                | Lua55Opcode::BNot
-                | Lua55Opcode::Not
-                | Lua55Opcode::Len
-                | Lua55Opcode::Concat => Lua55Operands::AB {
-                    a: fields.a,
-                    b: fields.b,
-                },
-                Lua55Opcode::TForCall => Lua55Operands::AC {
-                    a: fields.a,
-                    c: fields.c,
-                },
-                Lua55Opcode::GetVarg => Lua55Operands::ABC {
-                    a: fields.a,
-                    b: fields.b,
-                    c: fields.c,
-                },
-                Lua55Opcode::Eq
-                | Lua55Opcode::Lt
-                | Lua55Opcode::Le
-                | Lua55Opcode::EqK
-                | Lua55Opcode::TestSet => Lua55Operands::ABk {
-                    a: fields.a,
-                    b: fields.b,
-                    k: fields.k,
-                },
-                Lua55Opcode::AddI | Lua55Opcode::ShlI | Lua55Opcode::ShrI => Lua55Operands::ABsCk {
-                    a: fields.a,
-                    b: fields.b,
-                    sc: fields.sc,
-                    k: fields.k,
-                },
-                Lua55Opcode::EqI
-                | Lua55Opcode::LtI
-                | Lua55Opcode::LeI
-                | Lua55Opcode::GtI
-                | Lua55Opcode::GeI
-                | Lua55Opcode::MMBinI => Lua55Operands::AsBCk {
-                    a: fields.a,
-                    sb: fields.sb,
-                    c: fields.c,
-                    k: fields.k,
-                },
-                Lua55Opcode::LoadI | Lua55Opcode::LoadF => Lua55Operands::AsBx {
-                    a: fields.a,
-                    sbx: fields.sbx,
-                },
-                Lua55Opcode::LoadK
-                | Lua55Opcode::Closure
-                | Lua55Opcode::ForLoop
-                | Lua55Opcode::ForPrep
-                | Lua55Opcode::TForPrep
-                | Lua55Opcode::TForLoop
-                | Lua55Opcode::ErrNNil => Lua55Operands::ABx {
-                    a: fields.a,
-                    bx: fields.bx,
-                },
-                Lua55Opcode::Jmp => Lua55Operands::AsJ { sj: fields.sj },
-                Lua55Opcode::GetTabUp
-                | Lua55Opcode::GetTable
-                | Lua55Opcode::GetI
-                | Lua55Opcode::GetField
-                | Lua55Opcode::SetTabUp
-                | Lua55Opcode::SetTable
-                | Lua55Opcode::SetI
-                | Lua55Opcode::SetField
-                | Lua55Opcode::Self_
-                | Lua55Opcode::AddK
-                | Lua55Opcode::SubK
-                | Lua55Opcode::MulK
-                | Lua55Opcode::ModK
-                | Lua55Opcode::PowK
-                | Lua55Opcode::DivK
-                | Lua55Opcode::IdivK
-                | Lua55Opcode::BandK
-                | Lua55Opcode::BorK
-                | Lua55Opcode::BxorK
-                | Lua55Opcode::Add
-                | Lua55Opcode::Sub
-                | Lua55Opcode::Mul
-                | Lua55Opcode::Mod
-                | Lua55Opcode::Pow
-                | Lua55Opcode::Div
-                | Lua55Opcode::Idiv
-                | Lua55Opcode::Band
-                | Lua55Opcode::Bor
-                | Lua55Opcode::Bxor
-                | Lua55Opcode::Shl
-                | Lua55Opcode::Shr
-                | Lua55Opcode::MMBin
-                | Lua55Opcode::MMBinK
-                | Lua55Opcode::Call
-                | Lua55Opcode::TailCall
-                | Lua55Opcode::Return
-                | Lua55Opcode::VarArg => Lua55Operands::ABCk {
-                    a: fields.a,
-                    b: fields.b,
-                    c: fields.c,
-                    k: fields.k,
-                },
-                Lua55Opcode::NewTable => {
-                    extra_arg = Some(self.extra_arg_word(words, pc, opcode)?);
-                    word_len = 2;
-                    Lua55Operands::AvBCk {
-                        a: fields.a,
-                        vb: fields.vb,
-                        vc: fields.vc,
-                        k: fields.k,
-                    }
-                }
-                Lua55Opcode::SetList => {
-                    if fields.k {
-                        extra_arg = Some(self.extra_arg_word(words, pc, opcode)?);
-                        word_len = 2;
-                    }
-                    Lua55Operands::AvBCk {
-                        a: fields.a,
-                        vb: fields.vb,
-                        vc: fields.vc,
-                        k: fields.k,
-                    }
-                }
-                Lua55Opcode::ExtraArg => Lua55Operands::Ax { ax: fields.ax },
-            };
-
-            instructions.push(RawInstr {
-                opcode: RawInstrOpcode::Lua55(opcode),
-                operands: RawInstrOperands::Lua55(operands),
-                extra: DialectInstrExtra::Lua55(Lua55InstrExtra {
-                    pc: pc as u32,
-                    word_len,
-                    extra_arg,
-                }),
-                origin: Origin {
-                    span: Span {
-                        offset: entry.offset,
-                        size: usize::from(word_len) * 4,
-                    },
-                    raw_word: Some(u64::from(entry.word)),
-                },
-            });
-
-            pc += usize::from(word_len);
-        }
-
-        Ok(instructions)
-    }
-
-    fn extra_arg_word(
-        &self,
-        words: &[RawInstructionWord],
-        pc: usize,
-        opcode: Lua55Opcode,
-    ) -> Result<u32, ParseError> {
-        let Some(helper) = words.get(pc + 1).copied() else {
-            return Err(ParseError::MissingExtraArgWord {
-                pc,
-                opcode: opcode_label(opcode),
-            });
-        };
-        let helper_fields = decode_instruction_word_55(helper.word);
-        let helper_opcode = Lua55Opcode::try_from(helper_fields.opcode).map_err(|found| {
-            ParseError::InvalidExtraArgWord {
-                pc,
-                opcode: opcode_label(opcode),
-                found,
-            }
-        })?;
-        if helper_opcode != Lua55Opcode::ExtraArg {
-            return Err(ParseError::InvalidExtraArgWord {
-                pc,
-                opcode: opcode_label(opcode),
-                found: helper_fields.opcode,
-            });
-        }
-        Ok(helper_fields.ax)
+            DialectProtoExtra::Lua55(Lua55ProtoExtra { raw_flag }),
+            reader.offset(),
+        ))
     }
 
     fn parse_constants(
@@ -532,35 +322,29 @@ impl Lua55ParserState {
         reader: &mut BinaryReader<'_>,
         layout: &PucLuaLayout,
     ) -> Result<RawConstPool, ParseError> {
-        let count = self.read_count(reader, "constant count")?;
-        let mut literals = Vec::with_capacity(count as usize);
-
-        for _ in 0..count {
-            let offset = reader.offset();
-            let tag = reader.read_u8()?;
-            let literal = match tag {
-                LUA_VNIL => RawLiteralConst::Nil,
-                LUA_VFALSE => RawLiteralConst::Boolean(false),
-                LUA_VTRUE => RawLiteralConst::Boolean(true),
-                LUA_VNUMFLT => RawLiteralConst::Number(
-                    reader.read_f64_sized(layout.number_size, layout.endianness)?,
-                ),
-                LUA_VNUMINT => {
-                    RawLiteralConst::Integer(self.read_lua_integer(reader, "lua_Integer")?)
-                }
-                LUA_VSHRSTR | LUA_VLNGSTR => {
-                    let value = self
-                        .parse_string(reader)?
-                        .ok_or(ParseError::UnsupportedValue {
-                            field: "string constant length",
-                            value: 0,
-                        })?;
-                    RawLiteralConst::String(value)
-                }
-                _ => return Err(ParseError::InvalidConstantTag { offset, tag }),
-            };
-            literals.push(literal);
-        }
+        let literals = parse_tagged_literal_pool(
+            reader,
+            |reader, field| reader.read_varint_u32_lua55(field),
+            |tag, offset, reader| {
+                Ok(match tag {
+                    LUA_VNIL => RawLiteralConst::Nil,
+                    LUA_VFALSE => RawLiteralConst::Boolean(false),
+                    LUA_VTRUE => RawLiteralConst::Boolean(true),
+                    LUA_VNUMFLT => RawLiteralConst::Number(
+                        reader.read_f64_sized(layout.number_size, layout.endianness)?,
+                    ),
+                    LUA_VNUMINT => {
+                        RawLiteralConst::Integer(self.read_lua_integer(reader, "lua_Integer")?)
+                    }
+                    LUA_VSHRSTR | LUA_VLNGSTR => {
+                        let value =
+                            require_present(self.parse_string(reader)?, "string constant length")?;
+                        RawLiteralConst::String(value)
+                    }
+                    _ => return Err(ParseError::InvalidConstantTag { offset, tag }),
+                })
+            },
+        )?;
 
         Ok(RawConstPool {
             common: RawConstPoolCommon { literals },
@@ -572,21 +356,9 @@ impl Lua55ParserState {
         &mut self,
         reader: &mut BinaryReader<'_>,
     ) -> Result<RawUpvalueInfo, ParseError> {
-        let count = self.read_count(reader, "upvalue count")?;
-        let count_u8 = u8::try_from(count).map_err(|_| ParseError::IntegerOverflow {
-            field: "upvalue count",
-            value: u64::from(count),
-        })?;
-        let mut descriptors = Vec::with_capacity(count as usize);
-        let mut kinds = Vec::with_capacity(count as usize);
-
-        for _ in 0..count {
-            descriptors.push(RawUpvalueDescriptor {
-                in_stack: reader.read_u8()? != 0,
-                index: reader.read_u8()?,
-            });
-            kinds.push(reader.read_u8()?);
-        }
+        let count = reader.read_varint_u32_lua55("upvalue count")?;
+        let count_u8 = count_u8(count, "upvalue count")?;
+        let (descriptors, kinds) = parse_upvalues_with_kinds(reader, count)?;
 
         Ok(RawUpvalueInfo {
             common: RawUpvalueInfoCommon {
@@ -597,20 +369,6 @@ impl Lua55ParserState {
         })
     }
 
-    fn parse_children(
-        &mut self,
-        reader: &mut BinaryReader<'_>,
-        layout: &PucLuaLayout,
-        parent_source: Option<&RawString>,
-    ) -> Result<Vec<RawProto>, ParseError> {
-        let count = self.read_count(reader, "child proto count")?;
-        let mut children = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            children.push(self.parse_proto(reader, layout, parent_source)?);
-        }
-        Ok(children)
-    }
-
     fn parse_debug_info(
         &mut self,
         reader: &mut BinaryReader<'_>,
@@ -619,136 +377,36 @@ impl Lua55ParserState {
         defined_start: u32,
         upvalue_count: u8,
     ) -> Result<RawDebugInfo, ParseError> {
-        let line_count = self.read_count(reader, "line info count")?;
-        let mut line_deltas = Vec::with_capacity(line_count as usize);
-        for _ in 0..line_count {
-            line_deltas.push(reader.read_u8()? as i8);
-        }
-
-        let abs_line_count = self.read_count(reader, "abs line info count")?;
-        let mut abs_line_info = Vec::with_capacity(abs_line_count as usize);
-        if abs_line_count != 0 {
-            self.skip_align(reader, usize::from(layout.integer_size))?;
-        }
-        for _ in 0..abs_line_count {
-            abs_line_info.push(Lua55AbsLineInfo {
-                pc: self.read_count(reader, "abs line info pc")?,
-                line: self.read_count(reader, "abs line info line")?,
-            });
-        }
-
-        let local_count = self.read_count(reader, "local var count")?;
-        let mut local_vars = Vec::with_capacity(local_count as usize);
-        for _ in 0..local_count {
-            let name = self
-                .parse_optional_string(reader)?
-                .ok_or(ParseError::UnsupportedValue {
-                    field: "local var name length",
-                    value: 0,
-                })?;
-            let start_pc = self.read_count(reader, "local var startpc")?;
-            let end_pc = self.read_count(reader, "local var endpc")?;
-            local_vars.push(RawLocalVar {
-                name,
-                start_pc,
-                end_pc,
-            });
-        }
-
-        let upvalue_name_count = self.read_count(reader, "upvalue name count")?;
-        if !self.options.mode.is_permissive()
-            && upvalue_name_count != 0
-            && upvalue_name_count != u32::from(upvalue_count)
-        {
-            return Err(ParseError::UnsupportedValue {
-                field: "upvalue name count",
-                value: u64::from(upvalue_name_count),
-            });
-        }
-
-        let mut upvalue_names = Vec::with_capacity(upvalue_name_count as usize);
-        for _ in 0..upvalue_name_count {
-            if let Some(name) = self.parse_optional_string(reader)? {
-                upvalue_names.push(name);
-            }
-        }
-
-        if !self.options.mode.is_permissive()
-            && !line_deltas.is_empty()
-            && line_deltas.len() != raw_instruction_words
-        {
-            return Err(ParseError::UnsupportedValue {
-                field: "line info length",
-                value: line_deltas.len() as u64,
-            });
-        }
-
-        let line_info = self.reconstruct_line_info(defined_start, &line_deltas, &abs_line_info)?;
+        let permissive = self.options.mode.is_permissive();
+        let mut driver = Lua55AbsDebugDriver {
+            parser: self,
+            layout,
+            permissive,
+            upvalue_count,
+        };
+        let sections = parse_abs_debug_sections(
+            reader,
+            AbsLineInfoConfig {
+                raw_instruction_words,
+                defined_start,
+                abslineinfo_marker: ABSLINEINFO,
+                permissive,
+            },
+            &mut driver,
+        )?;
+        let abs_line_info = sections
+            .abs_line_pairs
+            .into_iter()
+            .map(|(pc, line)| Lua55AbsLineInfo { pc, line })
+            .collect();
 
         Ok(RawDebugInfo {
-            common: RawDebugInfoCommon {
-                line_info,
-                local_vars,
-                upvalue_names,
-            },
+            common: sections.common,
             extra: DialectDebugExtra::Lua55(Lua55DebugExtra {
-                line_deltas,
+                line_deltas: sections.line_deltas,
                 abs_line_info,
             }),
         })
-    }
-
-    fn reconstruct_line_info(
-        &self,
-        defined_start: u32,
-        line_deltas: &[i8],
-        abs_line_info: &[Lua55AbsLineInfo],
-    ) -> Result<Vec<u32>, ParseError> {
-        if line_deltas.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut lines = Vec::with_capacity(line_deltas.len());
-        let mut current = i64::from(defined_start);
-        let mut abs_index = 0_usize;
-
-        for (pc, delta) in line_deltas.iter().copied().enumerate() {
-            if let Some(abs) = abs_line_info.get(abs_index)
-                && abs.pc as usize == pc
-            {
-                current = i64::from(abs.line);
-                lines.push(abs.line);
-                abs_index += 1;
-                continue;
-            }
-
-            if delta == ABSLINEINFO {
-                if self.options.mode.is_permissive() {
-                    lines.push(current.max(0) as u32);
-                    continue;
-                }
-                return Err(ParseError::UnsupportedValue {
-                    field: "abs line info marker",
-                    value: pc as u64,
-                });
-            }
-
-            current += i64::from(delta);
-            if current < 0 {
-                return Err(ParseError::NegativeValue {
-                    field: "line info",
-                    value: current,
-                });
-            }
-            lines.push(
-                u32::try_from(current).map_err(|_| ParseError::IntegerOverflow {
-                    field: "line info",
-                    value: current as u64,
-                })?,
-            );
-        }
-
-        Ok(lines)
     }
 
     fn parse_optional_string(
@@ -762,9 +420,9 @@ impl Lua55ParserState {
         &mut self,
         reader: &mut BinaryReader<'_>,
     ) -> Result<Option<RawString>, ParseError> {
-        let size = self.read_size(reader, "string size")?;
+        let size = reader.read_varint_u64_lua55(u64::MAX, "string size")?;
         if size == 0 {
-            let index = self.read_size(reader, "string reuse index")?;
+            let index = reader.read_varint_u64_lua55(u64::MAX, "string reuse index")?;
             if index == 0 {
                 return Ok(None);
             }
@@ -804,48 +462,9 @@ impl Lua55ParserState {
             });
         }
         let payload = &bytes[..payload_len];
-        let text = self.decode_string_text(offset, payload)?;
-        let raw = RawString {
-            bytes: payload.to_vec(),
-            text,
-            origin: Origin {
-                span: Span {
-                    offset,
-                    size: byte_count,
-                },
-                raw_word: None,
-            },
-        };
+        let raw = build_raw_string(self.options, offset, payload.to_vec(), byte_count)?;
         self.saved_strings.push(raw.clone());
         Ok(Some(raw))
-    }
-
-    fn decode_string_text(
-        &self,
-        offset: usize,
-        bytes: &[u8],
-    ) -> Result<Option<DecodedText>, ParseError> {
-        let encoding = self.options.string_encoding;
-        let value = encoding.decode(offset, bytes, self.options.string_decode_mode)?;
-
-        Ok(Some(DecodedText { encoding, value }))
-    }
-
-    fn read_count(
-        &self,
-        reader: &mut BinaryReader<'_>,
-        field: &'static str,
-    ) -> Result<u32, ParseError> {
-        let value = reader.read_varint_u64_lua55(i32::MAX as u64, field)?;
-        u32::try_from(value).map_err(|_| ParseError::IntegerOverflow { field, value })
-    }
-
-    fn read_size(
-        &self,
-        reader: &mut BinaryReader<'_>,
-        field: &'static str,
-    ) -> Result<u64, ParseError> {
-        reader.read_varint_u64_lua55(u64::MAX, field)
     }
 
     fn read_lua_integer(
@@ -853,7 +472,7 @@ impl Lua55ParserState {
         reader: &mut BinaryReader<'_>,
         field: &'static str,
     ) -> Result<i64, ParseError> {
-        let encoded = self.read_size(reader, field)?;
+        let encoded = reader.read_varint_u64_lua55(u64::MAX, field)?;
         let magnitude = encoded >> 1;
         let magnitude_i64 = i64::try_from(magnitude).map_err(|_| ParseError::IntegerOverflow {
             field,
@@ -880,151 +499,24 @@ impl Lua55ParserState {
     }
 }
 
-fn decode_i64_bytes(
-    bytes: &[u8],
-    endianness: Endianness,
-    field: &'static str,
-) -> Result<i64, ParseError> {
-    if !(1..=8).contains(&bytes.len()) {
-        return Err(ParseError::UnsupportedSize {
-            field,
-            value: bytes.len() as u8,
-        });
-    }
-
-    let mut buffer = [0_u8; 8];
-    match endianness {
-        Endianness::Little => buffer[..bytes.len()].copy_from_slice(bytes),
-        Endianness::Big => buffer[8 - bytes.len()..].copy_from_slice(bytes),
-    }
-
-    if bytes.len() == 8 {
-        return Ok(match endianness {
-            Endianness::Little => i64::from_le_bytes(buffer),
-            Endianness::Big => i64::from_be_bytes(buffer),
-        });
-    }
-
-    let unsigned = match endianness {
-        Endianness::Little => u64::from_le_bytes(buffer),
-        Endianness::Big => u64::from_be_bytes(buffer),
-    };
-    let bits = (bytes.len() as u32) * 8;
-    let shift = 64 - bits;
-    Ok(((unsigned << shift) as i64) >> shift)
-}
-
-fn decode_f64_bytes(bytes: &[u8], endianness: Endianness) -> Result<f64, ParseError> {
-    match bytes.len() {
-        4 => {
-            let mut buffer = [0_u8; 4];
-            buffer.copy_from_slice(bytes);
-            Ok(match endianness {
-                Endianness::Little => f32::from_le_bytes(buffer),
-                Endianness::Big => f32::from_be_bytes(buffer),
-            } as f64)
-        }
-        8 => {
-            let mut buffer = [0_u8; 8];
-            buffer.copy_from_slice(bytes);
-            Ok(match endianness {
-                Endianness::Little => f64::from_le_bytes(buffer),
-                Endianness::Big => f64::from_be_bytes(buffer),
-            })
-        }
-        value => Err(ParseError::UnsupportedSize {
-            field: "number_size",
-            value: value as u8,
-        }),
-    }
-}
-
-fn opcode_label(opcode: Lua55Opcode) -> &'static str {
-    match opcode {
-        Lua55Opcode::Move => "MOVE",
-        Lua55Opcode::LoadI => "LOADI",
-        Lua55Opcode::LoadF => "LOADF",
-        Lua55Opcode::LoadK => "LOADK",
-        Lua55Opcode::LoadKx => "LOADKX",
-        Lua55Opcode::LoadFalse => "LOADFALSE",
-        Lua55Opcode::LFalseSkip => "LFALSESKIP",
-        Lua55Opcode::LoadTrue => "LOADTRUE",
-        Lua55Opcode::LoadNil => "LOADNIL",
-        Lua55Opcode::GetUpVal => "GETUPVAL",
-        Lua55Opcode::SetUpVal => "SETUPVAL",
-        Lua55Opcode::GetTabUp => "GETTABUP",
-        Lua55Opcode::GetTable => "GETTABLE",
-        Lua55Opcode::GetI => "GETI",
-        Lua55Opcode::GetField => "GETFIELD",
-        Lua55Opcode::SetTabUp => "SETTABUP",
-        Lua55Opcode::SetTable => "SETTABLE",
-        Lua55Opcode::SetI => "SETI",
-        Lua55Opcode::SetField => "SETFIELD",
-        Lua55Opcode::NewTable => "NEWTABLE",
-        Lua55Opcode::Self_ => "SELF",
-        Lua55Opcode::AddI => "ADDI",
-        Lua55Opcode::AddK => "ADDK",
-        Lua55Opcode::SubK => "SUBK",
-        Lua55Opcode::MulK => "MULK",
-        Lua55Opcode::ModK => "MODK",
-        Lua55Opcode::PowK => "POWK",
-        Lua55Opcode::DivK => "DIVK",
-        Lua55Opcode::IdivK => "IDIVK",
-        Lua55Opcode::BandK => "BANDK",
-        Lua55Opcode::BorK => "BORK",
-        Lua55Opcode::BxorK => "BXORK",
-        Lua55Opcode::ShlI => "SHLI",
-        Lua55Opcode::ShrI => "SHRI",
-        Lua55Opcode::Add => "ADD",
-        Lua55Opcode::Sub => "SUB",
-        Lua55Opcode::Mul => "MUL",
-        Lua55Opcode::Mod => "MOD",
-        Lua55Opcode::Pow => "POW",
-        Lua55Opcode::Div => "DIV",
-        Lua55Opcode::Idiv => "IDIV",
-        Lua55Opcode::Band => "BAND",
-        Lua55Opcode::Bor => "BOR",
-        Lua55Opcode::Bxor => "BXOR",
-        Lua55Opcode::Shl => "SHL",
-        Lua55Opcode::Shr => "SHR",
-        Lua55Opcode::MMBin => "MMBIN",
-        Lua55Opcode::MMBinI => "MMBINI",
-        Lua55Opcode::MMBinK => "MMBINK",
-        Lua55Opcode::Unm => "UNM",
-        Lua55Opcode::BNot => "BNOT",
-        Lua55Opcode::Not => "NOT",
-        Lua55Opcode::Len => "LEN",
-        Lua55Opcode::Concat => "CONCAT",
-        Lua55Opcode::Close => "CLOSE",
-        Lua55Opcode::Tbc => "TBC",
-        Lua55Opcode::Jmp => "JMP",
-        Lua55Opcode::Eq => "EQ",
-        Lua55Opcode::Lt => "LT",
-        Lua55Opcode::Le => "LE",
-        Lua55Opcode::EqK => "EQK",
-        Lua55Opcode::EqI => "EQI",
-        Lua55Opcode::LtI => "LTI",
-        Lua55Opcode::LeI => "LEI",
-        Lua55Opcode::GtI => "GTI",
-        Lua55Opcode::GeI => "GEI",
-        Lua55Opcode::Test => "TEST",
-        Lua55Opcode::TestSet => "TESTSET",
-        Lua55Opcode::Call => "CALL",
-        Lua55Opcode::TailCall => "TAILCALL",
-        Lua55Opcode::Return => "RETURN",
-        Lua55Opcode::Return0 => "RETURN0",
-        Lua55Opcode::Return1 => "RETURN1",
-        Lua55Opcode::ForLoop => "FORLOOP",
-        Lua55Opcode::ForPrep => "FORPREP",
-        Lua55Opcode::TForPrep => "TFORPREP",
-        Lua55Opcode::TForCall => "TFORCALL",
-        Lua55Opcode::TForLoop => "TFORLOOP",
-        Lua55Opcode::SetList => "SETLIST",
-        Lua55Opcode::Closure => "CLOSURE",
-        Lua55Opcode::VarArg => "VARARG",
-        Lua55Opcode::GetVarg => "GETVARG",
-        Lua55Opcode::ErrNNil => "ERRNNIL",
-        Lua55Opcode::VarArgPrep => "VARARGPREP",
-        Lua55Opcode::ExtraArg => "EXTRAARG",
-    }
-}
+define_puc_lua_instruction_codec!(
+    codec: Lua55InstructionCodec,
+    opcode: Lua55Opcode,
+    fields: crate::parser::dialect::puc_lua::DecodedInstructionFields55,
+    extra_word_policy: Lua55ExtraWordPolicy,
+    operands: super::raw::Lua55Operands,
+    decode_fields: decode_instruction_word_55,
+    extra_arg_opcode: Lua55Opcode::ExtraArg,
+    should_read_extra_word: |policy, fields| match policy {
+        Lua55ExtraWordPolicy::None => false,
+        Lua55ExtraWordPolicy::ExtraArg => true,
+        Lua55ExtraWordPolicy::ExtraArgIfK => fields.k,
+    },
+    wrap_opcode: RawInstrOpcode::Lua55,
+    wrap_operands: RawInstrOperands::Lua55,
+    wrap_extra: |pc, word_len, extra_arg| DialectInstrExtra::Lua55(Lua55InstrExtra {
+        pc,
+        word_len,
+        extra_arg,
+    }),
+);

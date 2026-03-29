@@ -38,6 +38,7 @@ pub(super) fn expr_complexity(expr: &AstExpr) -> usize {
             1 + expr_complexity(&call.receiver)
                 + call.args.iter().map(expr_complexity).sum::<usize>()
         }
+        AstExpr::SingleValue(expr) => 1 + expr_complexity(expr),
         AstExpr::TableConstructor(table) => {
             1 + table
                 .fields
@@ -79,6 +80,7 @@ pub(super) fn is_context_safe_expr(expr: &AstExpr) -> bool {
             matches!(unary.op, super::super::common::AstUnaryOpKind::Not)
                 && is_context_safe_expr(&unary.expr)
         }
+        AstExpr::SingleValue(expr) => is_context_safe_expr(expr),
         AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
             is_context_safe_expr(&logical.lhs) && is_context_safe_expr(&logical.rhs)
         }
@@ -122,6 +124,7 @@ pub(super) fn is_copy_like_expr(expr: &AstExpr) -> bool {
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_) => true,
+        AstExpr::SingleValue(expr) => is_copy_like_expr(expr),
         AstExpr::FieldAccess(access) => is_copy_like_expr(&access.base),
         AstExpr::IndexAccess(access) => {
             is_copy_like_expr(&access.base) && is_copy_like_expr(&access.index)
@@ -149,6 +152,7 @@ pub(super) fn is_mechanical_run_inline_expr(expr: &AstExpr) -> bool {
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_) => true,
+        AstExpr::SingleValue(expr) => is_mechanical_run_inline_expr(expr),
         AstExpr::FieldAccess(access) => is_mechanical_run_inline_expr(&access.base),
         AstExpr::IndexAccess(access) => {
             is_mechanical_run_inline_expr(&access.base)

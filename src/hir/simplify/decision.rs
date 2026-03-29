@@ -14,20 +14,23 @@ mod eliminate;
 mod helpers;
 mod synthesize;
 
+use super::walk::{ExprRewritePass, rewrite_proto_exprs};
 use helpers::{
     expr_is_boolean_valued, expr_truthiness, logical_and, logical_or, negate_expr,
     simplify_condition_truthiness_shape, simplify_lua_logical_shape,
 };
 
 use crate::hir::common::{
-    HirBinaryOpKind, HirBlock, HirCallExpr, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef,
-    HirDecisionTarget, HirExpr, HirProto, HirStmt, HirTableConstructor, HirTableField, HirTableKey,
-    HirUnaryOpKind,
+    HirBinaryOpKind, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget,
+    HirExpr, HirProto, HirUnaryOpKind,
 };
+
+#[cfg(test)]
+use crate::hir::common::{HirBlock, HirStmt, HirTableField, HirTableKey};
 
 /// 对单个 proto 递归执行 decision DAG 归一化。
 pub(super) fn simplify_decision_exprs_in_proto(proto: &mut HirProto) -> bool {
-    simplify_block(&mut proto.body)
+    rewrite_proto_exprs(proto, &mut DecisionExprPass)
 }
 
 /// 把前面保留在 HIR 内部的 `Decision` 彻底消掉。
@@ -47,220 +50,60 @@ pub(crate) fn synthesize_readable_pure_logical_expr(expr: &HirExpr) -> Option<Hi
     synthesize::synthesize_readable_pure_logical_expr(expr)
 }
 
-fn simplify_block(block: &mut HirBlock) -> bool {
-    block
-        .stmts
-        .iter_mut()
-        .fold(false, |changed, stmt| simplify_stmt(stmt) || changed)
-}
+struct DecisionExprPass;
 
-fn simplify_stmt(stmt: &mut HirStmt) -> bool {
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => local_decl
-            .values
-            .iter_mut()
-            .fold(false, |changed, expr| simplify_expr(expr) || changed),
-        HirStmt::Assign(assign) => {
-            let targets_changed = assign
-                .targets
-                .iter_mut()
-                .fold(false, |changed, target| simplify_lvalue(target) || changed);
-            let values_changed = assign
-                .values
-                .iter_mut()
-                .fold(false, |changed, expr| simplify_expr(expr) || changed);
-            targets_changed || values_changed
-        }
-        HirStmt::TableSetList(set_list) => {
-            let base_changed = simplify_expr(&mut set_list.base);
-            let values_changed = set_list
-                .values
-                .iter_mut()
-                .fold(false, |changed, expr| simplify_expr(expr) || changed);
-            let trailing_changed = set_list
-                .trailing_multivalue
-                .as_mut()
-                .is_some_and(simplify_expr);
-            base_changed || values_changed || trailing_changed
-        }
-        HirStmt::ErrNil(err_nil) => simplify_expr(&mut err_nil.value),
-        HirStmt::ToBeClosed(to_be_closed) => simplify_expr(&mut to_be_closed.value),
-        HirStmt::CallStmt(call_stmt) => simplify_call_expr(&mut call_stmt.call),
-        HirStmt::Return(ret) => ret
-            .values
-            .iter_mut()
-            .fold(false, |changed, expr| simplify_expr(expr) || changed),
-        HirStmt::If(if_stmt) => {
-            simplify_condition_expr(&mut if_stmt.cond)
-                || simplify_block(&mut if_stmt.then_block)
-                || if_stmt.else_block.as_mut().is_some_and(simplify_block)
-        }
-        HirStmt::While(while_stmt) => {
-            simplify_condition_expr(&mut while_stmt.cond) || simplify_block(&mut while_stmt.body)
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            simplify_block(&mut repeat_stmt.body) || simplify_condition_expr(&mut repeat_stmt.cond)
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            simplify_expr(&mut numeric_for.start)
-                || simplify_expr(&mut numeric_for.limit)
-                || simplify_expr(&mut numeric_for.step)
-                || simplify_block(&mut numeric_for.body)
-        }
-        HirStmt::GenericFor(generic_for) => {
-            let iterator_changed = generic_for
-                .iterator
-                .iter_mut()
-                .fold(false, |changed, expr| simplify_expr(expr) || changed);
-            iterator_changed || simplify_block(&mut generic_for.body)
-        }
-        HirStmt::Block(block) => simplify_block(block),
-        HirStmt::Unstructured(unstructured) => simplify_block(&mut unstructured.body),
-        HirStmt::Break
-        | HirStmt::Close(_)
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => false,
-    }
-}
-
-fn simplify_lvalue(lvalue: &mut crate::hir::common::HirLValue) -> bool {
-    match lvalue {
-        crate::hir::common::HirLValue::TableAccess(access) => {
-            simplify_expr(&mut access.base) || simplify_expr(&mut access.key)
-        }
-        crate::hir::common::HirLValue::Temp(_)
-        | crate::hir::common::HirLValue::Local(_)
-        | crate::hir::common::HirLValue::Upvalue(_)
-        | crate::hir::common::HirLValue::Global(_) => false,
-    }
-}
-
-fn simplify_call_expr(call: &mut HirCallExpr) -> bool {
-    let callee_changed = simplify_expr(&mut call.callee);
-    let args_changed = call
-        .args
-        .iter_mut()
-        .fold(false, |changed, arg| simplify_expr(arg) || changed);
-    callee_changed || args_changed
-}
-
-fn simplify_expr(expr: &mut HirExpr) -> bool {
-    let mut decision_replacement = None;
-    let mut changed = match expr {
-        HirExpr::TableAccess(access) => {
-            simplify_expr(&mut access.base) || simplify_expr(&mut access.key)
-        }
-        HirExpr::Unary(unary) => simplify_expr(&mut unary.expr),
-        HirExpr::Binary(binary) => simplify_expr(&mut binary.lhs) || simplify_expr(&mut binary.rhs),
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            simplify_expr(&mut logical.lhs) || simplify_expr(&mut logical.rhs)
-        }
-        HirExpr::Decision(decision) => {
+impl ExprRewritePass for DecisionExprPass {
+    fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
+        let mut decision_replacement = None;
+        let mut changed = false;
+        if let HirExpr::Decision(decision) = expr {
             let (decision_changed, replacement) = simplify_decision_expr(decision);
             decision_replacement = replacement;
-            decision_changed
+            changed |= decision_changed;
         }
-        HirExpr::Call(call) => simplify_call_expr(call),
-        HirExpr::TableConstructor(table) => simplify_table_constructor(table),
-        HirExpr::Closure(closure) => closure.captures.iter_mut().fold(false, |acc, capture| {
-            simplify_expr(&mut capture.value) || acc
-        }),
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => false,
-    };
 
-    if let Some(replacement) = decision_replacement {
-        *expr = replacement;
-        changed = true;
+        if let Some(replacement) = decision_replacement {
+            *expr = replacement;
+            changed = true;
+        }
+
+        if let Some(replacement) = simplify_lua_logical_shape(expr) {
+            *expr = replacement;
+            changed = true;
+        }
+        if let Some(replacement) = simplify_condition_truthiness_shape(expr) {
+            *expr = replacement;
+            changed = true;
+        }
+
+        changed
     }
 
-    if let Some(replacement) = simplify_lua_logical_shape(expr) {
-        *expr = replacement;
-        changed = true;
+    fn rewrite_condition_expr(&mut self, expr: &mut HirExpr) -> bool {
+        if let HirExpr::Decision(decision) = expr
+            && !decision_has_shared_nodes(decision)
+            && !decision_has_cycles(decision)
+            && let Some(replacement) = collapse_condition_decision_expr(decision)
+        {
+            *expr = replacement;
+            return true;
+        }
+        false
     }
-    if let Some(replacement) = simplify_condition_truthiness_shape(expr) {
-        *expr = replacement;
-        changed = true;
-    }
-
-    changed
-}
-
-fn simplify_condition_expr(expr: &mut HirExpr) -> bool {
-    let mut changed = simplify_expr(expr);
-    if let HirExpr::Decision(decision) = expr
-        && !decision_has_shared_nodes(decision)
-        && let Some(replacement) = collapse_condition_decision_expr(decision)
-    {
-        *expr = replacement;
-        changed = true;
-    }
-    changed
-}
-
-fn simplify_table_constructor(table: &mut HirTableConstructor) -> bool {
-    let fields_changed = table.fields.iter_mut().fold(false, |changed, field| {
-        let field_changed = match field {
-            HirTableField::Array(expr) => simplify_expr(expr),
-            HirTableField::Record(field) => {
-                let key_changed = match &mut field.key {
-                    HirTableKey::Name(_) => false,
-                    HirTableKey::Expr(expr) => simplify_expr(expr),
-                };
-                let value_changed = simplify_expr(&mut field.value);
-                key_changed || value_changed
-            }
-        };
-        changed || field_changed
-    });
-    let trailing_changed = table
-        .trailing_multivalue
-        .as_mut()
-        .is_some_and(simplify_expr);
-
-    fields_changed || trailing_changed
 }
 
 fn simplify_decision_expr(decision: &mut HirDecisionExpr) -> (bool, Option<HirExpr>) {
-    let nested_changed = decision.nodes.iter_mut().fold(false, |changed, node| {
-        let test_changed = simplify_condition_expr(&mut node.test);
-        let truthy_changed = simplify_decision_target(&mut node.truthy);
-        let falsy_changed = simplify_decision_target(&mut node.falsy);
-        changed || test_changed || truthy_changed || falsy_changed
-    });
-
     let Some(reduced) = reduce_decision_expr(decision) else {
-        return (nested_changed, None);
+        return (false, None);
     };
 
     match reduced {
         ReducedDecision::Expr(expr) => (true, Some(expr)),
         ReducedDecision::Decision(reduced_decision) => {
-            let changed = nested_changed || reduced_decision != *decision;
+            let changed = reduced_decision != *decision;
             *decision = reduced_decision;
             (changed, None)
         }
-    }
-}
-
-fn simplify_decision_target(target: &mut HirDecisionTarget) -> bool {
-    match target {
-        HirDecisionTarget::Expr(expr) => simplify_expr(expr),
-        HirDecisionTarget::Node(_) | HirDecisionTarget::CurrentValue => false,
     }
 }
 
@@ -339,7 +182,11 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
         ResolvedDecisionTarget::Expr(expr) => Some(ReducedDecision::Expr(expr)),
         ResolvedDecisionTarget::Node(entry) => {
             let rebuilt = rebuild_decision(entry, &nodes);
-            let rebuilt = specialize_decision_by_known_tests(&rebuilt).unwrap_or(rebuilt);
+            let rebuilt = if decision_has_cycles(&rebuilt) {
+                rebuilt
+            } else {
+                specialize_decision_by_known_tests(&rebuilt).unwrap_or(rebuilt)
+            };
             if let Some(expr) = collapse_value_decision_expr(&rebuilt) {
                 return Some(ReducedDecision::Expr(expr));
             }
@@ -724,6 +571,10 @@ fn remap_target(
 }
 
 pub(in crate::hir) fn collapse_value_decision_expr(decision: &HirDecisionExpr) -> Option<HirExpr> {
+    if decision_has_cycles(decision) {
+        return None;
+    }
+
     if decision_has_shared_nodes(decision) {
         synthesize::synthesize_value_decision_expr(decision).or_else(|| {
             let mut memo = BTreeMap::new();
@@ -840,6 +691,10 @@ fn normalize_collapsed_target(
 pub(in crate::hir) fn collapse_condition_decision_expr(
     decision: &HirDecisionExpr,
 ) -> Option<HirExpr> {
+    if decision_has_cycles(decision) {
+        return None;
+    }
+
     let mut memo = BTreeMap::new();
     collapse_condition_node(decision, decision.entry, &mut memo)
 }
@@ -921,6 +776,56 @@ pub(in crate::hir) fn decision_has_shared_nodes(decision: &HirDecisionExpr) -> b
     }
 
     incoming.into_iter().any(|count| count > 1)
+}
+
+pub(in crate::hir) fn decision_has_cycles(decision: &HirDecisionExpr) -> bool {
+    if decision.nodes.is_empty() || decision.entry.index() >= decision.nodes.len() {
+        return false;
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum VisitState {
+        Unvisited,
+        Visiting,
+        Done,
+    }
+
+    let mut states = vec![VisitState::Unvisited; decision.nodes.len()];
+    let mut stack = vec![(decision.entry, false)];
+
+    while let Some((node_ref, expanded)) = stack.pop() {
+        let node_index = node_ref.index();
+        let Some(node) = decision.nodes.get(node_index) else {
+            continue;
+        };
+
+        if expanded {
+            states[node_index] = VisitState::Done;
+            continue;
+        }
+
+        match states[node_index] {
+            VisitState::Done => continue,
+            VisitState::Visiting => return true,
+            VisitState::Unvisited => {
+                states[node_index] = VisitState::Visiting;
+                stack.push((node_ref, true));
+            }
+        }
+
+        for target in [&node.truthy, &node.falsy] {
+            let HirDecisionTarget::Node(next_ref) = target else {
+                continue;
+            };
+            match states[next_ref.index()] {
+                VisitState::Done => {}
+                VisitState::Visiting => return true,
+                VisitState::Unvisited => stack.push((*next_ref, false)),
+            }
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]

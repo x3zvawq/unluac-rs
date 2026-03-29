@@ -115,7 +115,7 @@ impl NameMap {
 
 /// 所有函数的辅助证据。
 #[derive(Debug, Clone, Default)]
-pub(super) struct NamingEvidence {
+pub struct NamingEvidence {
     pub(super) functions: Vec<FunctionNamingEvidence>,
 }
 

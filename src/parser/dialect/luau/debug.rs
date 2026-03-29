@@ -6,10 +6,7 @@
 use std::fmt::Write as _;
 
 use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
-use crate::parser::raw::{
-    DecodedText, DialectConstPoolExtra, DialectDebugExtra, DialectInstrExtra, DialectProtoExtra,
-    RawChunk, RawInstr, RawInstrOpcode, RawInstrOperands, RawProto, RawString,
-};
+use crate::parser::raw::{DecodedText, RawChunk, RawInstr, RawProto, RawString};
 
 use super::raw::{
     LuauConstEntry, LuauDebugExtra, LuauInstrExtra, LuauOpcode, LuauOperands, LuauProtoExtra,
@@ -56,18 +53,21 @@ pub(crate) fn dump_chunk(
         }
 
         let indent = "  ".repeat(depth);
-        let DialectProtoExtra::Luau(LuauProtoExtra {
+        let LuauProtoExtra {
             flags,
             type_info,
             debug_name,
             ..
-        }) = &proto.extra
-        else {
-            unreachable!("luau debug should only receive luau protos");
-        };
-        let DialectConstPoolExtra::Luau(const_pool_extra) = &proto.common.constants.extra else {
-            unreachable!("luau debug should only receive luau constants");
-        };
+        } = proto
+            .extra
+            .luau()
+            .expect("luau debug should only receive luau protos");
+        let const_pool_extra = proto
+            .common
+            .constants
+            .extra
+            .luau()
+            .expect("luau debug should only receive luau constants");
 
         let _ = writeln!(
             output,
@@ -89,10 +89,10 @@ pub(crate) fn dump_chunk(
             continue;
         }
 
-        if let DialectDebugExtra::Luau(LuauDebugExtra {
+        if let Some(LuauDebugExtra {
             line_gap_log2,
             local_regs,
-        }) = &proto.common.debug_info.extra
+        }) = proto.common.debug_info.extra.luau()
         {
             let _ = writeln!(
                 output,
@@ -177,22 +177,28 @@ fn format_const_entry(entry: &LuauConstEntry) -> String {
         LuauConstEntry::TableWithConstants { entries } => {
             format!("table+consts entries={entries:?}")
         }
-        LuauConstEntry::Closure { proto_index } => format!("closure proto={proto_index}"),
+        LuauConstEntry::Closure {
+            proto_index,
+            child_proto_index,
+        } => format!("closure proto={proto_index} child={child_proto_index}"),
         LuauConstEntry::Vector { x, y, z, w } => format!("vector ({x}, {y}, {z}, {w})"),
     }
 }
 
 fn decode_luau(raw: &RawInstr) -> (LuauOpcode, &LuauOperands, LuauInstrExtra) {
-    let RawInstrOpcode::Luau(opcode) = raw.opcode else {
-        unreachable!("luau debug should only receive luau opcodes");
-    };
-    let RawInstrOperands::Luau(ref operands) = raw.operands else {
-        unreachable!("luau debug should only receive luau operands");
-    };
-    let DialectInstrExtra::Luau(extra) = raw.extra else {
-        unreachable!("luau debug should only receive luau extras");
-    };
-    (opcode, operands, extra)
+    let opcode = raw
+        .opcode
+        .luau()
+        .expect("luau debug should only receive luau opcodes");
+    let operands = raw
+        .operands
+        .luau()
+        .expect("luau debug should only receive luau operands");
+    let extra = raw
+        .extra
+        .luau()
+        .expect("luau debug should only receive luau extras");
+    (*opcode, operands, *extra)
 }
 
 fn format_operands(operands: &LuauOperands) -> String {

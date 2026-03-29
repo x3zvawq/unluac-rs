@@ -287,6 +287,7 @@ fn collect_expr_facts(
                 collect_expr_facts(arg, collector, hir, facts);
             }
         }
+        AstExpr::SingleValue(expr) => collect_expr_facts(expr, collector, hir, facts),
         AstExpr::TableConstructor(table) => {
             for field in &table.fields {
                 match field {

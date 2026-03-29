@@ -77,6 +77,9 @@ fn conditional_reassign_picks_shallowest_changed_only_region() {
         ],
         exit: ShortCircuitExit::ValueMerge(BlockRef(23)),
         result_reg: None,
+        result_phi_id: None,
+        entry_defs: BTreeSet::new(),
+        value_incomings: Vec::new(),
         reducible: true,
     };
     let leaf_kinds = BTreeMap::from([

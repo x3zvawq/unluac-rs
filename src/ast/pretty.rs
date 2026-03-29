@@ -95,6 +95,7 @@ fn expr_display_complexity(expr: &AstExpr) -> usize {
             3 + expr_display_complexity(&call.callee)
                 + call.args.iter().map(expr_display_complexity).sum::<usize>()
         }
+        AstExpr::SingleValue(expr) => 1 + expr_display_complexity(expr),
         AstExpr::MethodCall(call) => {
             3 + expr_display_complexity(&call.receiver)
                 + call.args.iter().map(expr_display_complexity).sum::<usize>()

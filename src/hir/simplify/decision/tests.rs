@@ -204,6 +204,70 @@ fn keeps_collapsible_decision_inside_short_circuit_expr_as_value_expr() {
 }
 
 #[test]
+fn refuses_to_collapse_cyclic_value_decision_expr() {
+    let decision = HirDecisionExpr {
+        entry: HirDecisionNodeRef(0),
+        nodes: vec![
+            HirDecisionNode {
+                id: HirDecisionNodeRef(0),
+                test: HirExpr::TempRef(TempId(0)),
+                truthy: HirDecisionTarget::Node(HirDecisionNodeRef(1)),
+                falsy: HirDecisionTarget::Expr(HirExpr::String("stop".into())),
+            },
+            HirDecisionNode {
+                id: HirDecisionNodeRef(1),
+                test: HirExpr::TempRef(TempId(1)),
+                truthy: HirDecisionTarget::Expr(HirExpr::String("done".into())),
+                falsy: HirDecisionTarget::Node(HirDecisionNodeRef(0)),
+            },
+        ],
+    };
+
+    assert!(super::decision_has_cycles(&decision));
+    assert!(super::collapse_value_decision_expr(&decision).is_none());
+    assert!(super::collapse_condition_decision_expr(&decision).is_none());
+}
+
+#[test]
+fn keeps_cyclic_value_decision_stable_during_simplify() {
+    let mut module = HirModule {
+        entry: HirProtoRef(0),
+        protos: vec![dummy_proto(HirBlock {
+            stmts: vec![HirStmt::Return(Box::new(HirReturn {
+                values: vec![HirExpr::Decision(Box::new(HirDecisionExpr {
+                    entry: HirDecisionNodeRef(0),
+                    nodes: vec![
+                        HirDecisionNode {
+                            id: HirDecisionNodeRef(0),
+                            test: HirExpr::TempRef(TempId(0)),
+                            truthy: HirDecisionTarget::Node(HirDecisionNodeRef(1)),
+                            falsy: HirDecisionTarget::Expr(HirExpr::String("stop".into())),
+                        },
+                        HirDecisionNode {
+                            id: HirDecisionNodeRef(1),
+                            test: HirExpr::TempRef(TempId(1)),
+                            truthy: HirDecisionTarget::Expr(HirExpr::String("done".into())),
+                            falsy: HirDecisionTarget::Node(HirDecisionNodeRef(0)),
+                        },
+                    ],
+                }))],
+            }))],
+        })],
+    };
+
+    super::super::simplify_hir(
+        &mut module,
+        crate::readability::ReadabilityOptions::default(),
+    );
+
+    assert!(matches!(
+        &module.protos[0].body.stmts.as_slice(),
+        [HirStmt::Return(ret)]
+            if matches!(ret.values.as_slice(), [HirExpr::Decision(_)])
+    ));
+}
+
+#[test]
 fn removes_boolean_shells_in_condition_context() {
     let mut module = HirModule {
         entry: HirProtoRef(0),

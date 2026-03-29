@@ -244,6 +244,7 @@ fn validate_expr_has_no_temps(
             }
             Ok(())
         }
+        AstExpr::SingleValue(expr) => validate_expr_has_no_temps(expr, function, hir),
         AstExpr::TableConstructor(table) => {
             for field in &table.fields {
                 match field {

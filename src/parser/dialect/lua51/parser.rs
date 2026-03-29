@@ -3,6 +3,7 @@
 //! 实现直接对照官方 `lundump.c` 的布局规则，目的是让 parser 在源头上
 //! 保真，而不是在更后面的层次再去猜原始结构。
 
+use crate::parser::dialect::puc_lua::{LUA_SIGNATURE, decode_instruction_word};
 use crate::parser::error::ParseError;
 use crate::parser::options::ParseOptions;
 use crate::parser::raw::{
@@ -16,11 +17,10 @@ use crate::parser::raw::{
 use crate::parser::reader::BinaryReader;
 
 use super::raw::{
-    Lua51ConstPoolExtra, Lua51DebugExtra, Lua51HeaderExtra, Lua51InstrExtra, Lua51Opcode,
-    Lua51Operands, Lua51ProtoExtra, Lua51UpvalueExtra,
+    Lua51ConstPoolExtra, Lua51DebugExtra, Lua51ExtraWordPolicy, Lua51HeaderExtra, Lua51InstrExtra,
+    Lua51Opcode, Lua51ProtoExtra, Lua51UpvalueExtra,
 };
 
-const LUA_SIGNATURE: &[u8; 4] = b"\x1bLua";
 const LUA51_VERSION: u8 = 0x51;
 const LUA51_FORMAT: u8 = 0;
 const LUA51_HEADER_SIZE: usize = 12;
@@ -28,7 +28,6 @@ const LUA_TNIL: u8 = 0;
 const LUA_TBOOLEAN: u8 = 1;
 const LUA_TNUMBER: u8 = 3;
 const LUA_TSTRING: u8 = 4;
-const MAXARG_SBX: i32 = ((1 << 18) - 1) >> 1;
 
 pub(crate) struct Lua51Parser {
     options: ParseOptions,
@@ -245,66 +244,23 @@ impl Lua51Parser {
 
         while pc < words.len() {
             let entry = words[pc];
-            let opcode_byte = (entry.word & 0x3f) as u8;
-            let opcode = Lua51Opcode::try_from(opcode_byte)
+            let fields = decode_instruction_word(entry.word);
+            let opcode = Lua51Opcode::try_from(fields.opcode)
                 .map_err(|opcode| ParseError::InvalidOpcode { pc, opcode })?;
-            let a = ((entry.word >> 6) & 0xff) as u8;
-            let c = ((entry.word >> 14) & 0x1ff) as u16;
-            let b = ((entry.word >> 23) & 0x1ff) as u16;
-            let bx = (entry.word >> 14) & 0x3ffff;
-            let sbx = bx as i32 - MAXARG_SBX;
 
             let mut word_len = 1_u8;
-            let mut setlist_extra_arg = None;
-
-            let operands = match opcode {
-                Lua51Opcode::Move
-                | Lua51Opcode::LoadNil
-                | Lua51Opcode::GetUpVal
-                | Lua51Opcode::SetUpVal
-                | Lua51Opcode::Unm
-                | Lua51Opcode::Not
-                | Lua51Opcode::Len
-                | Lua51Opcode::Return
-                | Lua51Opcode::VarArg => Lua51Operands::AB { a, b },
-                Lua51Opcode::LoadK
-                | Lua51Opcode::GetGlobal
-                | Lua51Opcode::SetGlobal
-                | Lua51Opcode::Closure => Lua51Operands::ABx { a, bx },
-                Lua51Opcode::LoadBool
-                | Lua51Opcode::GetTable
-                | Lua51Opcode::SetTable
-                | Lua51Opcode::NewTable
-                | Lua51Opcode::Self_
-                | Lua51Opcode::Add
-                | Lua51Opcode::Sub
-                | Lua51Opcode::Mul
-                | Lua51Opcode::Div
-                | Lua51Opcode::Mod
-                | Lua51Opcode::Pow
-                | Lua51Opcode::Concat
-                | Lua51Opcode::Eq
-                | Lua51Opcode::Lt
-                | Lua51Opcode::Le
-                | Lua51Opcode::TestSet
-                | Lua51Opcode::Call
-                | Lua51Opcode::TailCall => Lua51Operands::ABC { a, b, c },
-                Lua51Opcode::Jmp | Lua51Opcode::ForLoop | Lua51Opcode::ForPrep => {
-                    Lua51Operands::AsBx { a, sbx }
+            let setlist_extra_arg = match opcode.extra_word_policy() {
+                Lua51ExtraWordPolicy::None => None,
+                Lua51ExtraWordPolicy::SetListWordIfCZero if fields.c == 0 => {
+                    let Some(extra_word) = words.get(pc + 1).copied() else {
+                        return Err(ParseError::MissingSetListWord { pc });
+                    };
+                    word_len = 2;
+                    Some(extra_word.word)
                 }
-                Lua51Opcode::Test | Lua51Opcode::TForLoop => Lua51Operands::AC { a, c },
-                Lua51Opcode::SetList => {
-                    if c == 0 {
-                        let Some(extra_word) = words.get(pc + 1).copied() else {
-                            return Err(ParseError::MissingSetListWord { pc });
-                        };
-                        setlist_extra_arg = Some(extra_word.word);
-                        word_len = 2;
-                    }
-                    Lua51Operands::ABC { a, b, c }
-                }
-                Lua51Opcode::Close => Lua51Operands::A { a },
+                Lua51ExtraWordPolicy::SetListWordIfCZero => None,
             };
+            let operands = opcode.decode_operands(fields);
 
             let span_size = usize::from(word_len) * 4;
             instructions.push(RawInstr {

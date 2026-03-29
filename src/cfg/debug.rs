@@ -175,15 +175,16 @@ pub fn dump_graph_facts(
         }
 
         let _ = writeln!(output, "{indent}  dominance frontier");
-        for (block_index, frontier) in facts.dominance_frontier.iter().enumerate() {
-            if frontier.is_empty() && matches!(detail, DebugDetail::Normal) {
+        for block_index in 0..facts.dominance_frontier.len() {
+            let block = BlockRef(block_index);
+            if facts.dominance_frontier_is_empty(block) && matches!(detail, DebugDetail::Normal) {
                 continue;
             }
             let _ = writeln!(
                 output,
                 "{indent}    block #{} frontier={}",
                 block_index,
-                format_block_set(frontier),
+                format_block_list(&facts.dominance_frontier_blocks(block).collect::<Vec<_>>()),
             );
         }
 
@@ -280,10 +281,10 @@ pub fn dump_dataflow(
                 output,
                 "{indent}    block #{} live_in={} live_out={} open_in={} open_out={}",
                 block.index(),
-                format_reg_set(&entry.facts.live_in[block.index()]),
-                format_reg_set(&entry.facts.live_out[block.index()]),
-                entry.facts.open_live_in[block.index()],
-                entry.facts.open_live_out[block.index()],
+                format_reg_set(entry.facts.live_in_regs(*block)),
+                format_reg_set(entry.facts.live_out_regs(*block)),
+                entry.facts.block_open_live_in(*block),
+                entry.facts.block_open_live_out(*block),
             );
         }
 
@@ -309,7 +310,11 @@ pub fn dump_dataflow(
                     output,
                     "{indent}    @{instr_index:03} fixed={} open={}",
                     format_reaching_defs(&defs.fixed),
-                    format_open_def_set(&entry.facts.open_reaching_defs[instr_index]),
+                    format_open_def_set(
+                        entry
+                            .facts
+                            .open_reaching_defs_at(crate::transformer::InstrRef(instr_index)),
+                    ),
                 );
             }
 

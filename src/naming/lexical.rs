@@ -506,6 +506,9 @@ fn collect_expr_context(
             }
             Ok(())
         }
+        AstExpr::SingleValue(expr) => {
+            collect_expr_context(expr, hir, contexts, outer_visible_bindings, scopes)
+        }
         AstExpr::TableConstructor(table) => {
             for field in &table.fields {
                 match field {

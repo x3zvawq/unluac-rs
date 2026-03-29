@@ -3,14 +3,10 @@
 use std::fmt::Write as _;
 
 use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
-use crate::parser::raw::{
-    DecodedText, DialectConstPoolExtra, DialectDebugExtra, DialectHeaderExtra, DialectInstrExtra,
-    DialectProtoExtra, RawChunk, RawInstr, RawInstrOpcode, RawInstrOperands, RawLiteralConst,
-    RawProto, RawString,
-};
+use crate::parser::raw::{DecodedText, RawChunk, RawInstr, RawLiteralConst, RawProto, RawString};
 
 use super::raw::{
-    LuaJitConstPoolExtra, LuaJitDebugExtra, LuaJitHeaderExtra, LuaJitInstrExtra, LuaJitKgcEntry,
+    LuaJitConstPoolExtra, LuaJitDebugExtra, LuaJitHeaderExtra, LuaJitKgcEntry,
     LuaJitNumberConstEntry, LuaJitOperands, LuaJitProtoExtra, LuaJitTableConst, LuaJitTableLiteral,
     LuaJitTableRecord,
 };
@@ -29,16 +25,17 @@ pub(crate) fn dump_chunk(
         .header
         .luajit_layout()
         .expect("luajit debug should only receive luajit layouts");
-    let DialectHeaderExtra::LuaJit(LuaJitHeaderExtra {
+    let LuaJitHeaderExtra {
         chunk_name,
         stripped,
         uses_ffi,
         fr2,
         big_endian,
-    }) = &chunk.header.extra
-    else {
-        unreachable!("luajit debug should only receive luajit header extras");
-    };
+    } = chunk
+        .header
+        .extra
+        .luajit()
+        .expect("luajit debug should only receive luajit header extras");
 
     let _ = writeln!(output, "===== Dump Parser =====");
     let _ = writeln!(
@@ -69,22 +66,24 @@ pub(crate) fn dump_chunk(
         }
 
         let indent = "  ".repeat(depth);
-        let DialectProtoExtra::LuaJit(LuaJitProtoExtra {
+        let LuaJitProtoExtra {
             flags,
             first_line,
             line_count,
             debug_size,
-        }) = &proto.extra
-        else {
-            unreachable!("luajit debug should only receive luajit protos");
-        };
-        let DialectConstPoolExtra::LuaJit(LuaJitConstPoolExtra {
+        } = proto
+            .extra
+            .luajit()
+            .expect("luajit debug should only receive luajit protos");
+        let LuaJitConstPoolExtra {
             kgc_entries,
             knum_entries,
-        }) = &proto.common.constants.extra
-        else {
-            unreachable!("luajit debug should only receive luajit constants");
-        };
+        } = proto
+            .common
+            .constants
+            .extra
+            .luajit()
+            .expect("luajit debug should only receive luajit constants");
 
         let _ = writeln!(
             output,
@@ -110,10 +109,10 @@ pub(crate) fn dump_chunk(
             continue;
         }
 
-        if let DialectDebugExtra::LuaJit(LuaJitDebugExtra {
+        if let Some(LuaJitDebugExtra {
             stripped,
             debug_size,
-        }) = &proto.common.debug_info.extra
+        }) = proto.common.debug_info.extra.luajit()
         {
             let _ = writeln!(
                 output,
@@ -177,19 +176,23 @@ fn collect_protos<'a>(
 }
 
 fn format_instr(raw: &RawInstr) -> String {
-    let RawInstrOpcode::LuaJit(opcode) = raw.opcode else {
-        unreachable!("luajit debug should only receive luajit opcodes");
-    };
-    let RawInstrOperands::LuaJit(ref operands) = raw.operands else {
-        unreachable!("luajit debug should only receive luajit operands");
-    };
-    let DialectInstrExtra::LuaJit(LuaJitInstrExtra { pc, raw_word }) = raw.extra else {
-        unreachable!("luajit debug should only receive luajit extras");
-    };
+    let opcode = raw
+        .opcode
+        .luajit()
+        .expect("luajit debug should only receive luajit opcodes");
+    let operands = raw
+        .operands
+        .luajit()
+        .expect("luajit debug should only receive luajit operands");
+    let extra = raw
+        .extra
+        .luajit()
+        .expect("luajit debug should only receive luajit extras");
     format!(
         "pc={} opcode={opcode:?} operands={} raw=0x{raw_word:08x}",
-        pc,
+        extra.pc,
         format_operands(operands),
+        raw_word = extra.raw_word,
     )
 }
 

@@ -3,12 +3,9 @@
 use std::fmt::Write as _;
 
 use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
-use crate::parser::raw::{
-    DecodedText, DialectDebugExtra, DialectInstrExtra, DialectProtoExtra, RawChunk, RawInstr,
-    RawInstrOpcode, RawInstrOperands, RawProto, RawString,
-};
+use crate::parser::raw::{DecodedText, RawChunk, RawInstr, RawProto, RawString};
 
-use super::raw::{Lua55DebugExtra, Lua55InstrExtra, Lua55Opcode, Lua55Operands, Lua55ProtoExtra};
+use super::raw::{Lua55DebugExtra, Lua55InstrExtra, Lua55Opcode, Lua55Operands};
 
 pub(crate) fn dump_chunk(
     chunk: &RawChunk,
@@ -38,10 +35,11 @@ pub(crate) fn dump_chunk(
         }
 
         let indent = "  ".repeat(depth);
-        let raw_flag = match proto.extra {
-            DialectProtoExtra::Lua55(Lua55ProtoExtra { raw_flag }) => raw_flag,
-            _ => unreachable!("lua55 debug should only receive lua55 protos"),
-        };
+        let raw_flag = proto
+            .extra
+            .lua55()
+            .expect("lua55 debug should only receive lua55 protos")
+            .raw_flag;
         let _ = writeln!(
             output,
             "{indent}proto#{id} source={} lines={}..{} params={} vararg={} raw_flag=0x{raw_flag:02x} stack={} instrs={} consts={} upvalues={} children={}",
@@ -61,10 +59,10 @@ pub(crate) fn dump_chunk(
             continue;
         }
 
-        if let DialectDebugExtra::Lua55(Lua55DebugExtra {
+        if let Some(Lua55DebugExtra {
             line_deltas,
             abs_line_info,
-        }) = &proto.common.debug_info.extra
+        }) = proto.common.debug_info.extra.lua55()
             && matches!(detail, DebugDetail::Verbose)
         {
             let _ = writeln!(
@@ -127,112 +125,19 @@ fn format_raw_string(source: &RawString) -> String {
 }
 
 fn decode_lua55(raw: &RawInstr) -> (Lua55Opcode, &Lua55Operands, Lua55InstrExtra) {
-    let RawInstrOpcode::Lua55(opcode) = raw.opcode else {
-        unreachable!("lua55 debug should only receive lua55 opcodes");
-    };
-    let RawInstrOperands::Lua55(ref operands) = raw.operands else {
-        unreachable!("lua55 debug should only receive lua55 operands");
-    };
-    let DialectInstrExtra::Lua55(extra) = raw.extra else {
-        unreachable!("lua55 debug should only receive lua55 extras");
-    };
-    (opcode, operands, extra)
-}
-
-trait Lua55OpcodeDebugExt {
-    fn label(self) -> &'static str;
-}
-
-impl Lua55OpcodeDebugExt for Lua55Opcode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Move => "MOVE",
-            Self::LoadI => "LOADI",
-            Self::LoadF => "LOADF",
-            Self::LoadK => "LOADK",
-            Self::LoadKx => "LOADKX",
-            Self::LoadFalse => "LOADFALSE",
-            Self::LFalseSkip => "LFALSESKIP",
-            Self::LoadTrue => "LOADTRUE",
-            Self::LoadNil => "LOADNIL",
-            Self::GetUpVal => "GETUPVAL",
-            Self::SetUpVal => "SETUPVAL",
-            Self::GetTabUp => "GETTABUP",
-            Self::GetTable => "GETTABLE",
-            Self::GetI => "GETI",
-            Self::GetField => "GETFIELD",
-            Self::SetTabUp => "SETTABUP",
-            Self::SetTable => "SETTABLE",
-            Self::SetI => "SETI",
-            Self::SetField => "SETFIELD",
-            Self::NewTable => "NEWTABLE",
-            Self::Self_ => "SELF",
-            Self::AddI => "ADDI",
-            Self::AddK => "ADDK",
-            Self::SubK => "SUBK",
-            Self::MulK => "MULK",
-            Self::ModK => "MODK",
-            Self::PowK => "POWK",
-            Self::DivK => "DIVK",
-            Self::IdivK => "IDIVK",
-            Self::BandK => "BANDK",
-            Self::BorK => "BORK",
-            Self::BxorK => "BXORK",
-            Self::ShlI => "SHLI",
-            Self::ShrI => "SHRI",
-            Self::Add => "ADD",
-            Self::Sub => "SUB",
-            Self::Mul => "MUL",
-            Self::Mod => "MOD",
-            Self::Pow => "POW",
-            Self::Div => "DIV",
-            Self::Idiv => "IDIV",
-            Self::Band => "BAND",
-            Self::Bor => "BOR",
-            Self::Bxor => "BXOR",
-            Self::Shl => "SHL",
-            Self::Shr => "SHR",
-            Self::MMBin => "MMBIN",
-            Self::MMBinI => "MMBINI",
-            Self::MMBinK => "MMBINK",
-            Self::Unm => "UNM",
-            Self::BNot => "BNOT",
-            Self::Not => "NOT",
-            Self::Len => "LEN",
-            Self::Concat => "CONCAT",
-            Self::Close => "CLOSE",
-            Self::Tbc => "TBC",
-            Self::Jmp => "JMP",
-            Self::Eq => "EQ",
-            Self::Lt => "LT",
-            Self::Le => "LE",
-            Self::EqK => "EQK",
-            Self::EqI => "EQI",
-            Self::LtI => "LTI",
-            Self::LeI => "LEI",
-            Self::GtI => "GTI",
-            Self::GeI => "GEI",
-            Self::Test => "TEST",
-            Self::TestSet => "TESTSET",
-            Self::Call => "CALL",
-            Self::TailCall => "TAILCALL",
-            Self::Return => "RETURN",
-            Self::Return0 => "RETURN0",
-            Self::Return1 => "RETURN1",
-            Self::ForLoop => "FORLOOP",
-            Self::ForPrep => "FORPREP",
-            Self::TForPrep => "TFORPREP",
-            Self::TForCall => "TFORCALL",
-            Self::TForLoop => "TFORLOOP",
-            Self::SetList => "SETLIST",
-            Self::Closure => "CLOSURE",
-            Self::VarArg => "VARARG",
-            Self::GetVarg => "GETVARG",
-            Self::ErrNNil => "ERRNNIL",
-            Self::VarArgPrep => "VARARGPREP",
-            Self::ExtraArg => "EXTRAARG",
-        }
-    }
+    let opcode = raw
+        .opcode
+        .lua55()
+        .expect("lua55 debug should only receive lua55 opcodes");
+    let operands = raw
+        .operands
+        .lua55()
+        .expect("lua55 debug should only receive lua55 operands");
+    let extra = raw
+        .extra
+        .lua55()
+        .expect("lua55 debug should only receive lua55 extras");
+    (*opcode, operands, *extra)
 }
 
 trait Lua55OperandsDebugExt {

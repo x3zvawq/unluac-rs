@@ -4,101 +4,73 @@
 //! `GETTABUP` / `SETTABUP`、`TFORCALL` / `TFORLOOP` 的编码形状，都不应该污染
 //! parser 公共层。
 
-/// Lua 5.2 的 opcode 命名空间，保持与虚拟机原始指令集一致。
+use crate::parser::dialect::puc_lua::{DecodedInstructionFields, define_puc_lua_opcodes};
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-#[repr(u8)]
-pub enum Lua52Opcode {
-    Move = 0,
-    LoadK = 1,
-    LoadKx = 2,
-    LoadBool = 3,
-    LoadNil = 4,
-    GetUpVal = 5,
-    GetTabUp = 6,
-    GetTable = 7,
-    SetTabUp = 8,
-    SetUpVal = 9,
-    SetTable = 10,
-    NewTable = 11,
-    Self_ = 12,
-    Add = 13,
-    Sub = 14,
-    Mul = 15,
-    Div = 16,
-    Mod = 17,
-    Pow = 18,
-    Unm = 19,
-    Not = 20,
-    Len = 21,
-    Concat = 22,
-    Jmp = 23,
-    Eq = 24,
-    Lt = 25,
-    Le = 26,
-    Test = 27,
-    TestSet = 28,
-    Call = 29,
-    TailCall = 30,
-    Return = 31,
-    ForLoop = 32,
-    ForPrep = 33,
-    TForCall = 34,
-    TForLoop = 35,
-    SetList = 36,
-    Closure = 37,
-    VarArg = 38,
-    ExtraArg = 39,
+pub enum Lua52OperandKind {
+    A,
+    AB,
+    AC,
+    ABC,
+    ABx,
+    AsBx,
+    Ax,
 }
 
-impl TryFrom<u8> for Lua52Opcode {
-    type Error = u8;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Move),
-            1 => Ok(Self::LoadK),
-            2 => Ok(Self::LoadKx),
-            3 => Ok(Self::LoadBool),
-            4 => Ok(Self::LoadNil),
-            5 => Ok(Self::GetUpVal),
-            6 => Ok(Self::GetTabUp),
-            7 => Ok(Self::GetTable),
-            8 => Ok(Self::SetTabUp),
-            9 => Ok(Self::SetUpVal),
-            10 => Ok(Self::SetTable),
-            11 => Ok(Self::NewTable),
-            12 => Ok(Self::Self_),
-            13 => Ok(Self::Add),
-            14 => Ok(Self::Sub),
-            15 => Ok(Self::Mul),
-            16 => Ok(Self::Div),
-            17 => Ok(Self::Mod),
-            18 => Ok(Self::Pow),
-            19 => Ok(Self::Unm),
-            20 => Ok(Self::Not),
-            21 => Ok(Self::Len),
-            22 => Ok(Self::Concat),
-            23 => Ok(Self::Jmp),
-            24 => Ok(Self::Eq),
-            25 => Ok(Self::Lt),
-            26 => Ok(Self::Le),
-            27 => Ok(Self::Test),
-            28 => Ok(Self::TestSet),
-            29 => Ok(Self::Call),
-            30 => Ok(Self::TailCall),
-            31 => Ok(Self::Return),
-            32 => Ok(Self::ForLoop),
-            33 => Ok(Self::ForPrep),
-            34 => Ok(Self::TForCall),
-            35 => Ok(Self::TForLoop),
-            36 => Ok(Self::SetList),
-            37 => Ok(Self::Closure),
-            38 => Ok(Self::VarArg),
-            39 => Ok(Self::ExtraArg),
-            _ => Err(value),
-        }
-    }
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Lua52ExtraWordPolicy {
+    None,
+    ExtraArg,
+    ExtraArgIfCZero,
 }
+
+define_puc_lua_opcodes!(
+    opcode: Lua52Opcode,
+    operand_kind: Lua52OperandKind,
+    extra_word_policy: Lua52ExtraWordPolicy,
+    [
+        (Move, "MOVE", AB),
+        (LoadK, "LOADK", ABx),
+        (LoadKx, "LOADKX", A, ExtraArg),
+        (LoadBool, "LOADBOOL", ABC),
+        (LoadNil, "LOADNIL", AB),
+        (GetUpVal, "GETUPVAL", AB),
+        (GetTabUp, "GETTABUP", ABC),
+        (GetTable, "GETTABLE", ABC),
+        (SetTabUp, "SETTABUP", ABC),
+        (SetUpVal, "SETUPVAL", AB),
+        (SetTable, "SETTABLE", ABC),
+        (NewTable, "NEWTABLE", ABC),
+        (Self_, "SELF", ABC),
+        (Add, "ADD", ABC),
+        (Sub, "SUB", ABC),
+        (Mul, "MUL", ABC),
+        (Div, "DIV", ABC),
+        (Mod, "MOD", ABC),
+        (Pow, "POW", ABC),
+        (Unm, "UNM", AB),
+        (Not, "NOT", AB),
+        (Len, "LEN", AB),
+        (Concat, "CONCAT", ABC),
+        (Jmp, "JMP", AsBx),
+        (Eq, "EQ", ABC),
+        (Lt, "LT", ABC),
+        (Le, "LE", ABC),
+        (Test, "TEST", AC),
+        (TestSet, "TESTSET", ABC),
+        (Call, "CALL", ABC),
+        (TailCall, "TAILCALL", ABC),
+        (Return, "RETURN", AB),
+        (ForLoop, "FORLOOP", AsBx),
+        (ForPrep, "FORPREP", AsBx),
+        (TForCall, "TFORCALL", ABC),
+        (TForLoop, "TFORLOOP", AsBx),
+        (SetList, "SETLIST", ABC, ExtraArgIfCZero),
+        (Closure, "CLOSURE", ABx),
+        (VarArg, "VARARG", AB),
+        (ExtraArg, "EXTRAARG", Ax),
+    ]
+);
 
 /// Lua 5.2 指令解码后的 operand 形态。
 #[derive(Debug, Clone, PartialEq)]
@@ -110,6 +82,36 @@ pub enum Lua52Operands {
     ABx { a: u8, bx: u32 },
     AsBx { a: u8, sbx: i32 },
     Ax { ax: u32 },
+}
+
+impl Lua52Opcode {
+    pub(crate) fn decode_operands(self, fields: DecodedInstructionFields) -> Lua52Operands {
+        match self.operand_kind() {
+            Lua52OperandKind::A => Lua52Operands::A { a: fields.a },
+            Lua52OperandKind::AB => Lua52Operands::AB {
+                a: fields.a,
+                b: fields.b,
+            },
+            Lua52OperandKind::AC => Lua52Operands::AC {
+                a: fields.a,
+                c: fields.c,
+            },
+            Lua52OperandKind::ABC => Lua52Operands::ABC {
+                a: fields.a,
+                b: fields.b,
+                c: fields.c,
+            },
+            Lua52OperandKind::ABx => Lua52Operands::ABx {
+                a: fields.a,
+                bx: fields.bx,
+            },
+            Lua52OperandKind::AsBx => Lua52Operands::AsBx {
+                a: fields.a,
+                sbx: fields.sbx,
+            },
+            Lua52OperandKind::Ax => Lua52Operands::Ax { ax: fields.ax },
+        }
+    }
 }
 
 /// Lua 5.2 header 额外规则目前只体现在 `LUAC_TAIL` 校验上，这里保留空结构以稳定接口。

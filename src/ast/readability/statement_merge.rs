@@ -1,8 +1,18 @@
-//! 把显然属于同一次源码声明的相邻语句重新合并。
+//! 这个文件负责把被前层机械拆开的相邻语句重新合并回更像源码的一次声明。
+//!
+//! 它依赖 binding/use 分析已经给出稳定引用关系，因此这里只合并“明显属于同一段
+//! 源码声明”的 local/assign/temp-hoist 形状，而不会越权跨阶段重排有副作用的语句。
+//! 这一步的目标是消掉 VM/结构恢复留下的机械拆分，不是随意把多条语句压成一行。
+//!
+//! 例子：
+//! - `local a; a = f()` 会合成 `local a = f()`
+//! - `local a = x; local b = y` 在两者确实属于同一组声明且后续使用形状允许时，
+//!   会合成 `local a, b = x, y`
+//! - 提前 hoist 出来的 `local t0; if cond then t0 = x end` 会尽量把 `t0` 下沉回
+//!   真正使用它的分支/循环体里
 
 use super::super::common::{
-    AstBindingRef, AstBlock, AstFunctionExpr, AstLValue, AstLocalAttr, AstLocalDecl, AstModule,
-    AstNameRef, AstStmt,
+    AstBindingRef, AstBlock, AstLValue, AstLocalAttr, AstLocalDecl, AstModule, AstNameRef, AstStmt,
 };
 use super::ReadabilityContext;
 use super::binding_flow::{
@@ -10,46 +20,46 @@ use super::binding_flow::{
     stmt_references_any_binding,
 };
 use super::expr_analysis::{expr_complexity, is_copy_like_expr};
+use super::walk::{self, AstRewritePass, BlockKind};
 
 const ADJACENT_LOCAL_VALUE_COMPLEXITY_LIMIT: usize = 4;
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
     let _ = context.target;
-    rewrite_block(&mut module.body)
+    walk::rewrite_module(module, &mut StatementMergePass)
 }
 
-fn rewrite_block(block: &mut AstBlock) -> bool {
-    let mut changed = false;
-    for stmt in &mut block.stmts {
-        changed |= rewrite_nested(stmt);
-    }
+struct StatementMergePass;
 
-    changed |= sink_hoisted_temp_decls(block);
+impl AstRewritePass for StatementMergePass {
+    fn rewrite_block(&mut self, block: &mut AstBlock, _kind: BlockKind) -> bool {
+        let mut changed = sink_hoisted_temp_decls(block);
 
-    let old_stmts = std::mem::take(&mut block.stmts);
-    let mut new_stmts = Vec::with_capacity(old_stmts.len());
-    let mut index = 0;
-    while index < old_stmts.len() {
-        let Some(next_stmt) = old_stmts.get(index + 1) else {
+        let old_stmts = std::mem::take(&mut block.stmts);
+        let mut new_stmts = Vec::with_capacity(old_stmts.len());
+        let mut index = 0;
+        while index < old_stmts.len() {
+            let Some(next_stmt) = old_stmts.get(index + 1) else {
+                new_stmts.push(old_stmts[index].clone());
+                index += 1;
+                continue;
+            };
+
+            if let Some(merged) = try_merge_local_decl_with_assign(&old_stmts[index], next_stmt) {
+                new_stmts.push(AstStmt::LocalDecl(Box::new(merged)));
+                changed = true;
+                index += 2;
+                continue;
+            }
+
             new_stmts.push(old_stmts[index].clone());
             index += 1;
-            continue;
-        };
-
-        if let Some(merged) = try_merge_local_decl_with_assign(&old_stmts[index], next_stmt) {
-            new_stmts.push(AstStmt::LocalDecl(Box::new(merged)));
-            changed = true;
-            index += 2;
-            continue;
         }
 
-        new_stmts.push(old_stmts[index].clone());
-        index += 1;
+        block.stmts = new_stmts;
+        changed |= merge_adjacent_single_value_local_decls(block);
+        changed
     }
-
-    block.stmts = new_stmts;
-    changed |= merge_adjacent_single_value_local_decls(block);
-    changed
 }
 
 fn merge_adjacent_single_value_local_decls(block: &mut AstBlock) -> bool {
@@ -317,175 +327,6 @@ fn sink_pending_bindings_into_block(
         index += 1;
     }
     consumed
-}
-
-fn rewrite_nested(stmt: &mut AstStmt) -> bool {
-    match stmt {
-        AstStmt::If(if_stmt) => {
-            let mut changed = rewrite_nested_functions_in_expr(&mut if_stmt.cond);
-            changed |= rewrite_block(&mut if_stmt.then_block);
-            if let Some(else_block) = &mut if_stmt.else_block {
-                changed |= rewrite_block(else_block);
-            }
-            changed
-        }
-        AstStmt::While(while_stmt) => {
-            rewrite_nested_functions_in_expr(&mut while_stmt.cond)
-                | rewrite_block(&mut while_stmt.body)
-        }
-        AstStmt::Repeat(repeat_stmt) => {
-            rewrite_block(&mut repeat_stmt.body)
-                | rewrite_nested_functions_in_expr(&mut repeat_stmt.cond)
-        }
-        AstStmt::NumericFor(numeric_for) => {
-            let mut changed = rewrite_nested_functions_in_expr(&mut numeric_for.start);
-            changed |= rewrite_nested_functions_in_expr(&mut numeric_for.limit);
-            changed |= rewrite_nested_functions_in_expr(&mut numeric_for.step);
-            changed |= rewrite_block(&mut numeric_for.body);
-            changed
-        }
-        AstStmt::GenericFor(generic_for) => {
-            let mut changed = false;
-            for expr in &mut generic_for.iterator {
-                changed |= rewrite_nested_functions_in_expr(expr);
-            }
-            changed |= rewrite_block(&mut generic_for.body);
-            changed
-        }
-        AstStmt::DoBlock(block) => rewrite_block(block),
-        AstStmt::FunctionDecl(function_decl) => rewrite_function(&mut function_decl.func),
-        AstStmt::LocalFunctionDecl(local_function_decl) => {
-            rewrite_function(&mut local_function_decl.func)
-        }
-        AstStmt::LocalDecl(local_decl) => {
-            local_decl.values.iter_mut().fold(false, |changed, expr| {
-                rewrite_nested_functions_in_expr(expr) | changed
-            })
-        }
-        AstStmt::GlobalDecl(global_decl) => {
-            global_decl.values.iter_mut().fold(false, |changed, expr| {
-                rewrite_nested_functions_in_expr(expr) | changed
-            })
-        }
-        AstStmt::Assign(assign) => {
-            let mut changed = false;
-            for target in &mut assign.targets {
-                changed |= rewrite_nested_functions_in_lvalue(target);
-            }
-            for value in &mut assign.values {
-                changed |= rewrite_nested_functions_in_expr(value);
-            }
-            changed
-        }
-        AstStmt::CallStmt(call_stmt) => rewrite_nested_functions_in_call(&mut call_stmt.call),
-        AstStmt::Return(ret) => ret.values.iter_mut().fold(false, |changed, expr| {
-            rewrite_nested_functions_in_expr(expr) | changed
-        }),
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => false,
-    }
-}
-
-fn rewrite_function(function: &mut AstFunctionExpr) -> bool {
-    rewrite_block(&mut function.body)
-}
-
-fn rewrite_nested_functions_in_call(call: &mut super::super::common::AstCallKind) -> bool {
-    match call {
-        super::super::common::AstCallKind::Call(call) => {
-            let mut changed = rewrite_nested_functions_in_expr(&mut call.callee);
-            for arg in &mut call.args {
-                changed |= rewrite_nested_functions_in_expr(arg);
-            }
-            changed
-        }
-        super::super::common::AstCallKind::MethodCall(call) => {
-            let mut changed = rewrite_nested_functions_in_expr(&mut call.receiver);
-            for arg in &mut call.args {
-                changed |= rewrite_nested_functions_in_expr(arg);
-            }
-            changed
-        }
-    }
-}
-
-fn rewrite_nested_functions_in_lvalue(target: &mut AstLValue) -> bool {
-    match target {
-        AstLValue::Name(_) => false,
-        AstLValue::FieldAccess(access) => rewrite_nested_functions_in_expr(&mut access.base),
-        AstLValue::IndexAccess(access) => {
-            rewrite_nested_functions_in_expr(&mut access.base)
-                | rewrite_nested_functions_in_expr(&mut access.index)
-        }
-    }
-}
-
-fn rewrite_nested_functions_in_expr(expr: &mut super::super::common::AstExpr) -> bool {
-    match expr {
-        super::super::common::AstExpr::FieldAccess(access) => {
-            rewrite_nested_functions_in_expr(&mut access.base)
-        }
-        super::super::common::AstExpr::IndexAccess(access) => {
-            rewrite_nested_functions_in_expr(&mut access.base)
-                | rewrite_nested_functions_in_expr(&mut access.index)
-        }
-        super::super::common::AstExpr::Unary(unary) => {
-            rewrite_nested_functions_in_expr(&mut unary.expr)
-        }
-        super::super::common::AstExpr::Binary(binary) => {
-            rewrite_nested_functions_in_expr(&mut binary.lhs)
-                | rewrite_nested_functions_in_expr(&mut binary.rhs)
-        }
-        super::super::common::AstExpr::LogicalAnd(logical)
-        | super::super::common::AstExpr::LogicalOr(logical) => {
-            rewrite_nested_functions_in_expr(&mut logical.lhs)
-                | rewrite_nested_functions_in_expr(&mut logical.rhs)
-        }
-        super::super::common::AstExpr::Call(call) => {
-            let mut changed = rewrite_nested_functions_in_expr(&mut call.callee);
-            for arg in &mut call.args {
-                changed |= rewrite_nested_functions_in_expr(arg);
-            }
-            changed
-        }
-        super::super::common::AstExpr::MethodCall(call) => {
-            let mut changed = rewrite_nested_functions_in_expr(&mut call.receiver);
-            for arg in &mut call.args {
-                changed |= rewrite_nested_functions_in_expr(arg);
-            }
-            changed
-        }
-        super::super::common::AstExpr::TableConstructor(table) => {
-            let mut changed = false;
-            for field in &mut table.fields {
-                changed |= match field {
-                    super::super::common::AstTableField::Array(value) => {
-                        rewrite_nested_functions_in_expr(value)
-                    }
-                    super::super::common::AstTableField::Record(record) => {
-                        let key_changed = match &mut record.key {
-                            super::super::common::AstTableKey::Name(_) => false,
-                            super::super::common::AstTableKey::Expr(key) => {
-                                rewrite_nested_functions_in_expr(key)
-                            }
-                        };
-                        key_changed | rewrite_nested_functions_in_expr(&mut record.value)
-                    }
-                };
-            }
-            changed
-        }
-        super::super::common::AstExpr::FunctionExpr(function) => rewrite_function(function),
-        super::super::common::AstExpr::Nil
-        | super::super::common::AstExpr::Boolean(_)
-        | super::super::common::AstExpr::Integer(_)
-        | super::super::common::AstExpr::Number(_)
-        | super::super::common::AstExpr::String(_)
-        | super::super::common::AstExpr::Int64(_)
-        | super::super::common::AstExpr::UInt64(_)
-        | super::super::common::AstExpr::Complex { .. }
-        | super::super::common::AstExpr::Var(_)
-        | super::super::common::AstExpr::VarArg => false,
-    }
 }
 
 fn single_value_local_decl(

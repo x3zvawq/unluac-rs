@@ -1,16 +1,20 @@
 //! 这个文件专门负责把 Dataflow 的定义身份提升成 HIR 可直接消费的绑定表。
 //!
-//! HIR 第一版刻意不在主分析流程里散落 temp/phi/open-def 的编号规则，而是把这些
-//! “身份分配”集中在这里统一完成。这样做有两个目的：
-//! 1. 后续 `simplify` 若要把 `TempId` 提升成 `LocalId`，只需要围绕一处绑定入口演化；
-//! 2. 保证表达式恢复和控制流恢复只消费稳定身份，不重复推导 Dataflow 细节。
+//! 这个 pass 依赖前层已经给好的结构证据和数据流事实，不再回头重扫 CFG/low-IR 去猜
+//! loop binding 或 merge 形状；它只负责“分配稳定身份”。
+//!
+//! 例子：
+//! - `for i = 1, n do ... end` 对应的 `NumericForLike + LoopSourceBindings::Numeric(rX)`
+//!   会直接产出一个 `LocalId` 绑定到该 loop header
+//! - `for k, v in iter() do ... end` 对应的 `LoopSourceBindings::Generic(rA..)` 会直接产出
+//!   一组 header locals，而不是再从 `GenericForLoop` terminator 回扫一次
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::cfg::{Cfg, DataflowFacts, OpenDef};
 use crate::hir::common::{LocalId, ParamId, TempId, UpvalueId};
 use crate::parser::RawLocalVar;
-use crate::structure::{LoopKindHint, StructureFacts};
+use crate::structure::{LoopSourceBindings, StructureFacts};
 use crate::transformer::{InstrRef, LoweredProto, Reg};
 
 use super::ProtoBindings;
@@ -49,52 +53,41 @@ pub(super) fn build_bindings(
         );
     }
 
-    for candidate in structure
-        .loop_candidates
-        .iter()
-        .filter(|candidate| candidate.kind_hint == LoopKindHint::NumericForLike)
-    {
-        let Some(reg) = numeric_for_binding_reg(proto, cfg, candidate.header, &candidate.blocks)
-        else {
-            continue;
-        };
-        let local = LocalId(locals.len());
-        locals.push(local);
-        local_debug_hints.push(None);
-        numeric_for_locals.insert(candidate.header, local);
+    for candidate in &structure.loop_candidates {
+        match candidate.source_bindings {
+            Some(LoopSourceBindings::Numeric(reg)) => {
+                let local = LocalId(locals.len());
+                locals.push(local);
+                local_debug_hints.push(None);
+                numeric_for_locals.insert(candidate.header, local);
 
-        for block in &candidate.blocks {
-            block_local_regs
-                .entry(*block)
-                .or_insert_with(BTreeMap::new)
-                .insert(reg, local);
-        }
-    }
-
-    for candidate in structure
-        .loop_candidates
-        .iter()
-        .filter(|candidate| candidate.kind_hint == LoopKindHint::GenericForLike)
-    {
-        let Some(bindings) = generic_for_binding_regs(proto, cfg, candidate.header) else {
-            continue;
-        };
-        let mut locals_for_loop = Vec::with_capacity(bindings.len);
-        for offset in 0..bindings.len {
-            let local = LocalId(locals.len());
-            locals.push(local);
-            local_debug_hints.push(None);
-            let reg = crate::transformer::Reg(bindings.start.index() + offset);
-            locals_for_loop.push(local);
-
-            for block in &candidate.blocks {
-                block_local_regs
-                    .entry(*block)
-                    .or_insert_with(BTreeMap::new)
-                    .insert(reg, local);
+                for block in &candidate.blocks {
+                    block_local_regs
+                        .entry(*block)
+                        .or_insert_with(BTreeMap::new)
+                        .insert(reg, local);
+                }
             }
+            Some(LoopSourceBindings::Generic(bindings)) => {
+                let mut locals_for_loop = Vec::with_capacity(bindings.len);
+                for offset in 0..bindings.len {
+                    let local = LocalId(locals.len());
+                    locals.push(local);
+                    local_debug_hints.push(None);
+                    let reg = crate::transformer::Reg(bindings.start.index() + offset);
+                    locals_for_loop.push(local);
+
+                    for block in &candidate.blocks {
+                        block_local_regs
+                            .entry(*block)
+                            .or_insert_with(BTreeMap::new)
+                            .insert(reg, local);
+                    }
+                }
+                generic_for_locals.insert(candidate.header, locals_for_loop);
+            }
+            None => {}
         }
-        generic_for_locals.insert(candidate.header, locals_for_loop);
     }
 
     let fixed_temps = (0..dataflow.defs.len()).map(TempId).collect::<Vec<_>>();
@@ -212,35 +205,4 @@ fn debug_local_name_for_reg_at_pc(proto: &LoweredProto, reg: Reg, pc: u32) -> Op
 
 fn debug_local_is_active_at_pc(local: &RawLocalVar, pc: u32) -> bool {
     local.start_pc <= pc && pc < local.end_pc
-}
-
-fn numeric_for_binding_reg(
-    proto: &LoweredProto,
-    cfg: &Cfg,
-    loop_header: crate::cfg::BlockRef,
-    loop_blocks: &BTreeSet<crate::cfg::BlockRef>,
-) -> Option<crate::transformer::Reg> {
-    let preheader = cfg.preds[loop_header.index()]
-        .iter()
-        .map(|edge_ref| cfg.edges[edge_ref.index()].from)
-        .find(|pred| !loop_blocks.contains(pred))?;
-    let instr_ref = cfg.blocks[preheader.index()].instrs.last()?;
-
-    match proto.instrs.get(instr_ref.index())? {
-        crate::transformer::LowInstr::NumericForInit(instr) => Some(instr.binding),
-        _ => None,
-    }
-}
-
-fn generic_for_binding_regs(
-    proto: &LoweredProto,
-    cfg: &Cfg,
-    loop_header: crate::cfg::BlockRef,
-) -> Option<crate::transformer::RegRange> {
-    let instr_ref = cfg.blocks[loop_header.index()].instrs.last()?;
-
-    match proto.instrs.get(instr_ref.index())? {
-        crate::transformer::LowInstr::GenericForLoop(instr) => Some(instr.bindings),
-        _ => None,
-    }
 }

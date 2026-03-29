@@ -268,6 +268,7 @@ fn collect_expr_hints(
             Ok(())
         }
         AstExpr::MethodCall(call) => collect_method_call_hints(function, call, hints, hir),
+        AstExpr::SingleValue(expr) => collect_expr_hints(function, expr, hints, hir),
         AstExpr::TableConstructor(table) => {
             for field in &table.fields {
                 match field {
@@ -465,6 +466,7 @@ fn candidate_from_expr(expr: &AstExpr) -> Option<(String, NameSource)> {
         AstExpr::Call(_) | AstExpr::MethodCall(_) => {
             Some(("result".to_owned(), NameSource::ResultShape))
         }
+        AstExpr::SingleValue(expr) => candidate_from_expr(expr),
         AstExpr::Boolean(_)
         | AstExpr::LogicalAnd(_)
         | AstExpr::LogicalOr(_)

@@ -9,9 +9,10 @@ use std::fmt::Write as _;
 use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
 
 use super::common::{
-    BranchCandidate, BranchValueMergeCandidate, GotoRequirement, LoopCandidate, RegionFact,
-    ScopeCandidate, ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNode, ShortCircuitTarget,
-    StructureFacts,
+    BranchCandidate, BranchRegionFact, BranchValueMergeCandidate, GenericPhiMaterialization,
+    GotoRequirement, LoopCandidate, LoopExitValueMergeCandidate, LoopSourceBindings,
+    LoopValueMerge, RegionFact, ScopeCandidate, ShortCircuitCandidate, ShortCircuitExit,
+    ShortCircuitNode, ShortCircuitTarget, ShortCircuitValueIncoming, StructureFacts,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -52,9 +53,10 @@ pub fn dump_structure(
         let indent = "  ".repeat(entry.depth);
         let _ = writeln!(
             output,
-            "{indent}proto#{} branches={} branch-values={} loops={} short-circuits={} gotos={} regions={} scopes={}",
+            "{indent}proto#{} branches={} branch-regions={} branch-values={} loops={} short-circuits={} gotos={} regions={} scopes={}",
             entry.id,
             entry.facts.branch_candidates.len(),
+            entry.facts.branch_region_facts.len(),
             entry.facts.branch_value_merge_candidates.len(),
             entry.facts.loop_candidates.len(),
             entry.facts.short_circuit_candidates.len(),
@@ -70,11 +72,21 @@ pub fn dump_structure(
         let _ = writeln!(output, "{indent}  branch candidates");
         write_branches(&mut output, &indent, &entry.facts.branch_candidates);
 
+        let _ = writeln!(output, "{indent}  branch region facts");
+        write_branch_regions(&mut output, &indent, &entry.facts.branch_region_facts);
+
         let _ = writeln!(output, "{indent}  branch value merges");
         write_branch_value_merges(
             &mut output,
             &indent,
             &entry.facts.branch_value_merge_candidates,
+        );
+
+        let _ = writeln!(output, "{indent}  generic phi materializations");
+        write_generic_phi_materializations(
+            &mut output,
+            &indent,
+            &entry.facts.generic_phi_materializations,
         );
 
         let _ = writeln!(output, "{indent}  loop candidates");
@@ -151,14 +163,64 @@ fn write_loops(output: &mut String, indent: &str, candidates: &[LoopCandidate]) 
     for candidate in candidates {
         let _ = writeln!(
             output,
-            "{indent}    header=#{} kind={} continue={} exits={} reducible={} backedges={} blocks={}",
+            "{indent}    header=#{} preheader={} kind={} bindings={} continue={} exits={} reducible={} backedges={} blocks={}",
             candidate.header.index(),
+            format_optional_block(candidate.preheader),
             format_loop_kind(candidate.kind_hint),
+            format_loop_source_bindings(candidate.source_bindings),
             format_optional_block(candidate.continue_target),
             format_block_set(&candidate.exits),
             candidate.reducible,
             format_edge_refs(&candidate.backedges),
             format_block_set(&candidate.blocks),
+        );
+        for value in &candidate.header_value_merges {
+            write_loop_value_merge(output, indent, "header", value);
+        }
+        for exit in &candidate.exit_value_merges {
+            write_loop_exit_value_merge(output, indent, exit);
+        }
+    }
+}
+
+fn write_branch_regions(output: &mut String, indent: &str, facts: &[BranchRegionFact]) {
+    if facts.is_empty() {
+        let _ = writeln!(output, "{indent}    <none>");
+        return;
+    }
+
+    for fact in facts {
+        let _ = writeln!(
+            output,
+            "{indent}    header=#{} kind={} merge=#{} flow={} structured={} then-preds={} else-preds={}",
+            fact.header.index(),
+            format_branch_kind(fact.kind),
+            fact.merge.index(),
+            format_block_set(&fact.flow_blocks),
+            format_block_set(&fact.structured_blocks),
+            format_block_set(&fact.then_merge_preds),
+            format_block_set(&fact.else_merge_preds),
+        );
+    }
+}
+
+fn write_generic_phi_materializations(
+    output: &mut String,
+    indent: &str,
+    candidates: &[GenericPhiMaterialization],
+) {
+    if candidates.is_empty() {
+        let _ = writeln!(output, "{indent}    <none>");
+        return;
+    }
+
+    for candidate in candidates {
+        let _ = writeln!(
+            output,
+            "{indent}    block=#{} phi=p{} reg={}",
+            candidate.block.index(),
+            candidate.phi_id.index(),
+            format_reg(candidate.reg),
         );
     }
 }
@@ -184,11 +246,15 @@ fn write_branch_value_merges(
         for value in &candidate.values {
             let _ = writeln!(
                 output,
-                "{indent}      phi=p{} reg={} then-preds={} else-preds={}",
+                "{indent}      phi=p{} reg={} then-preds={} then-defs={} then-non-header-defs={} else-preds={} else-defs={} else-non-header-defs={}",
                 value.phi_id.index(),
                 format_reg(value.reg),
-                format_block_set(&value.then_preds),
-                format_block_set(&value.else_preds),
+                format_block_set(&value.then_arm.preds),
+                format_def_set(&value.then_arm.defs),
+                format_def_set(&value.then_arm.non_header_defs),
+                format_block_set(&value.else_arm.preds),
+                format_def_set(&value.else_arm.defs),
+                format_def_set(&value.else_arm.non_header_defs),
             );
         }
     }
@@ -203,7 +269,7 @@ fn write_short_circuits(output: &mut String, indent: &str, candidates: &[ShortCi
     for candidate in candidates {
         let _ = writeln!(
             output,
-            "{indent}    header=#{} entry=n{} nodes={} exit={} result={} reducible={} blocks={}",
+            "{indent}    header=#{} entry=n{} nodes={} exit={} result={} phi={} reducible={} blocks={} entry-defs={}",
             candidate.header.index(),
             candidate.entry.index(),
             candidate.nodes.len(),
@@ -212,9 +278,21 @@ fn write_short_circuits(output: &mut String, indent: &str, candidates: &[ShortCi
                 .result_reg
                 .map(format_reg)
                 .unwrap_or_else(|| "-".to_owned()),
+            candidate
+                .result_phi_id
+                .map(|phi_id| format!("p{}", phi_id.index()))
+                .unwrap_or_else(|| "-".to_owned()),
             candidate.reducible,
             format_block_set(&candidate.blocks),
+            format_def_set(&candidate.entry_defs),
         );
+        if !candidate.value_incomings.is_empty() {
+            let _ = writeln!(
+                output,
+                "{indent}      value-incomings={}",
+                format_short_circuit_value_incomings(&candidate.value_incomings),
+            );
+        }
         write_short_circuit_nodes(output, indent, &candidate.nodes);
     }
 }
@@ -247,6 +325,24 @@ fn format_short_circuit_exit(exit: &ShortCircuitExit) -> String {
             )
         }
     }
+}
+
+fn format_short_circuit_value_incomings(incomings: &[ShortCircuitValueIncoming]) -> String {
+    incomings
+        .iter()
+        .map(|incoming| {
+            format!(
+                "#{}=>{} local={}",
+                incoming.pred.index(),
+                format_def_set(&incoming.defs),
+                incoming
+                    .latest_local_def
+                    .map(|def| format!("d{}", def.index()))
+                    .unwrap_or_else(|| "-".to_owned())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn format_short_circuit_target(target: &ShortCircuitTarget) -> String {
@@ -364,6 +460,20 @@ fn format_instr_refs(instrs: &[crate::transformer::InstrRef]) -> String {
     }
 }
 
+fn format_def_set(defs: &BTreeSet<crate::cfg::DefId>) -> String {
+    if defs.is_empty() {
+        "[-]".to_owned()
+    } else {
+        format!(
+            "[{}]",
+            defs.iter()
+                .map(|def| format!("d{}", def.index()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
 fn format_reg(reg: crate::transformer::Reg) -> String {
     format!("r{}", reg.index())
 }
@@ -384,6 +494,55 @@ fn format_loop_kind(kind: super::common::LoopKindHint) -> &'static str {
         super::common::LoopKindHint::GenericForLike => "generic-for-like",
         super::common::LoopKindHint::Unknown => "unknown",
     }
+}
+
+fn format_loop_source_bindings(bindings: Option<LoopSourceBindings>) -> String {
+    match bindings {
+        Some(LoopSourceBindings::Numeric(reg)) => format!("numeric:{}", format_reg(reg)),
+        Some(LoopSourceBindings::Generic(range)) => format!(
+            "generic:{}..{}",
+            format_reg(range.start),
+            range.start.index() + range.len
+        ),
+        None => "-".to_owned(),
+    }
+}
+
+fn write_loop_exit_value_merge(
+    output: &mut String,
+    indent: &str,
+    candidate: &LoopExitValueMergeCandidate,
+) {
+    let _ = writeln!(
+        output,
+        "{indent}      exit=#{} values={}",
+        candidate.exit.index(),
+        candidate.values.len(),
+    );
+    for value in &candidate.values {
+        write_loop_value_merge(output, indent, "exit", value);
+    }
+}
+
+fn write_loop_value_merge(output: &mut String, indent: &str, label: &str, value: &LoopValueMerge) {
+    let _ = writeln!(
+        output,
+        "{indent}      {label} phi=p{} reg={} inside-preds={} inside-defs={} outside-preds={} outside-defs={}",
+        value.phi_id.index(),
+        format_reg(value.reg),
+        format_block_set_from_iter(value.inside_arm.preds()),
+        format_def_set_from_iter(value.inside_arm.defs()),
+        format_block_set_from_iter(value.outside_arm.preds()),
+        format_def_set_from_iter(value.outside_arm.defs()),
+    );
+}
+
+fn format_block_set_from_iter(blocks: impl Iterator<Item = crate::cfg::BlockRef>) -> String {
+    format_block_set(&blocks.collect())
+}
+
+fn format_def_set_from_iter(defs: impl Iterator<Item = crate::cfg::DefId>) -> String {
+    format_def_set(&defs.collect())
 }
 
 fn format_goto_reason(reason: super::common::GotoReason) -> &'static str {

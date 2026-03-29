@@ -4,7 +4,10 @@
 //! 回答一个更工程化的问题：当几种候选都等价时，哪一种更接近源码短路直觉、也更不容易
 //! 把共享子图机械展开成难读的乘积式。
 
-use super::*;
+use crate::hir::common::{HirBinaryOpKind, HirExpr, HirUnaryOpKind};
+
+use super::domain::AbstractValue;
+use super::readable::flatten_or_chain;
 
 const AND_WITH_OR_CHILD_PENALTY: usize = 8;
 const COMPLEX_AND_WITH_OR_EXTRA_PENALTY: usize = 4;

@@ -4,19 +4,23 @@
 //! `JMP`、`CLOSURE` 后置 capture、`FORPREP/FORLOOP` 和 `TFORLOOP` 这类模式型
 //! 指令。这里一次性把这些模式吃干净，避免后续 CFG 再去理解方言细节。
 
-use crate::parser::{
-    DialectInstrExtra, Lua51InstrExtra, Lua51Opcode, Lua51Operands, RawChunk, RawInstr,
-    RawInstrOpcode, RawInstrOperands, RawProto,
+use crate::parser::{Lua51Opcode, Lua51Operands, RawChunk, RawProto};
+use crate::transformer::dialect::lowering::{
+    PendingLowInstr, PendingLoweringState, PendingMethodHints, TargetPlaceholder, instr_pc,
+    resolve_pending_instr_with,
 };
+use crate::transformer::dialect::puc_lua::{
+    checked_const_ref, checked_proto_ref, checked_upvalue_ref,
+};
+use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
-    AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchInstr, BranchOperands,
+    AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchOperands,
     BranchPredicate, CallInstr, CallKind, Capture, CaptureSource, CloseInstr, ClosureInstr,
-    ConcatInstr, CondOperand, ConstRef, DialectCaptureExtra, GenericForCallInstr,
-    GenericForLoopInstr, GetTableInstr, GetUpvalueInstr, InstrRef, JumpInstr, LoadBoolInstr,
-    LoadConstInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr,
-    NewTableInstr, NumericForInitInstr, NumericForLoopInstr, ProtoRef, RawInstrRef, Reg, RegRange,
-    ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr,
-    TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    ConcatInstr, CondOperand, ConstRef, DialectCaptureExtra, GenericForCallInstr, GetTableInstr,
+    GetUpvalueInstr, InstrRef, LoadBoolInstr, LoadConstInstr, LoadNilInstr, LowInstr, LoweredChunk,
+    LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange, ResultPack,
+    ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr, TransformError,
+    UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
 const BITRK: u16 = 1 << 8;
@@ -57,57 +61,8 @@ fn lower_proto(raw: &RawProto) -> Result<LoweredProto, TransformError> {
 
 struct ProtoLowerer<'a> {
     raw: &'a RawProto,
-    emitted: Vec<EmittedInstr>,
-    raw_target_low: Vec<Option<usize>>,
-    raw_to_low: Vec<Vec<InstrRef>>,
-    pending_methods: Vec<Option<Reg>>,
-}
-
-#[derive(Debug, Clone)]
-struct EmittedInstr {
-    raw_indices: Vec<usize>,
-    instr: PendingLowInstr,
-}
-
-#[derive(Debug, Clone)]
-enum PendingLowInstr {
-    Ready(LowInstr),
-    Jump {
-        target: TargetPlaceholder,
-    },
-    Branch {
-        cond: BranchCond,
-        then_target: TargetPlaceholder,
-        else_target: TargetPlaceholder,
-    },
-    NumericForInit {
-        index: Reg,
-        limit: Reg,
-        step: Reg,
-        binding: Reg,
-        body_target: TargetPlaceholder,
-        exit_target: TargetPlaceholder,
-    },
-    NumericForLoop {
-        index: Reg,
-        limit: Reg,
-        step: Reg,
-        binding: Reg,
-        body_target: TargetPlaceholder,
-        exit_target: TargetPlaceholder,
-    },
-    GenericForLoop {
-        control: Reg,
-        bindings: RegRange,
-        body_target: TargetPlaceholder,
-        exit_target: TargetPlaceholder,
-    },
-}
-
-#[derive(Debug, Clone, Copy)]
-enum TargetPlaceholder {
-    Raw(usize),
-    Low(usize),
+    lowering: PendingLoweringState,
+    pending_methods: PendingMethodHints,
 }
 
 impl<'a> ProtoLowerer<'a> {
@@ -117,10 +72,8 @@ impl<'a> ProtoLowerer<'a> {
 
         Self {
             raw,
-            emitted: Vec::new(),
-            raw_target_low: vec![None; raw_instr_count],
-            raw_to_low: vec![Vec::new(); raw_instr_count],
-            pending_methods: vec![None; method_slots],
+            lowering: PendingLoweringState::new(raw_instr_count),
+            pending_methods: PendingMethodHints::new(method_slots),
         }
     }
 
@@ -129,7 +82,9 @@ impl<'a> ProtoLowerer<'a> {
 
         while raw_index < self.raw.common.instructions.len() {
             let raw_instr = &self.raw.common.instructions[raw_index];
-            let (opcode, operands, extra) = decode_lua51(raw_instr);
+            let (opcode, operands, extra) = raw_instr
+                .lua51()
+                .expect("lua51 lowerer should only decode lua51 instructions");
             let raw_pc = extra.pc;
 
             match opcode {
@@ -450,7 +405,7 @@ impl<'a> ProtoLowerer<'a> {
                             },
                         );
                     } else {
-                        let move_low = self.emitted.len() + 1;
+                        let move_low = self.lowering.next_low_index();
                         self.emit(
                             Some(raw_index),
                             vec![raw_index, helper.helper_index],
@@ -553,7 +508,7 @@ impl<'a> ProtoLowerer<'a> {
                         return Err(TransformError::InvalidNumericForPair {
                             raw_pc,
                             target_raw,
-                            found: opcode_label(target_opcode),
+                            found: target_opcode.label(),
                         });
                     }
 
@@ -663,8 +618,9 @@ impl<'a> ProtoLowerer<'a> {
                                 capture_index,
                             });
                         };
-                        let (capture_opcode, capture_operands, capture_extra) =
-                            decode_lua51(raw_capture_instr);
+                        let (capture_opcode, capture_operands, capture_extra) = raw_capture_instr
+                            .lua51()
+                            .expect("lua51 lowerer should only decode lua51 instructions");
                         raw_indices.push(capture_raw);
 
                         let source = match capture_opcode {
@@ -684,7 +640,7 @@ impl<'a> ProtoLowerer<'a> {
                                 return Err(TransformError::InvalidClosureCapture {
                                     raw_pc,
                                     capture_pc: capture_extra.pc,
-                                    found: opcode_label(capture_opcode),
+                                    found: capture_opcode.label(),
                                 });
                             }
                         };
@@ -729,64 +685,20 @@ impl<'a> ProtoLowerer<'a> {
     }
 
     fn finish(&self) -> Result<(Vec<LowInstr>, LoweringMap), TransformError> {
-        let instrs = self
-            .emitted
-            .iter()
-            .map(|emitted| {
-                let owner_raw = emitted.raw_indices.first().copied().unwrap_or(0);
-                self.resolve_pending_instr(owner_raw, &emitted.instr)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let low_to_raw = self
-            .emitted
-            .iter()
-            .map(|emitted| {
-                emitted
-                    .raw_indices
-                    .iter()
+        self.lowering.finish(
+            self.raw,
+            |owner_raw, pending| self.resolve_pending_instr(owner_raw, pending),
+            instr_pc,
+            |raw_index| {
+                self.raw
+                    .common
+                    .debug_info
+                    .common
+                    .line_info
+                    .get(raw_index)
                     .copied()
-                    .map(RawInstrRef)
-                    .collect()
-            })
-            .collect::<Vec<Vec<RawInstrRef>>>();
-        let pc_map = self
-            .emitted
-            .iter()
-            .map(|emitted| {
-                emitted
-                    .raw_indices
-                    .iter()
-                    .copied()
-                    .map(|raw_index| raw_pc(&self.raw.common.instructions[raw_index]))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let line_hints = self
-            .emitted
-            .iter()
-            .map(|emitted| {
-                emitted.raw_indices.iter().find_map(|raw_index| {
-                    self.raw
-                        .common
-                        .debug_info
-                        .common
-                        .line_info
-                        .get(*raw_index)
-                        .copied()
-                })
-            })
-            .collect::<Vec<_>>();
-
-        Ok((
-            instrs,
-            LoweringMap {
-                low_to_raw,
-                raw_to_low: self.raw_to_low.clone(),
-                pc_map,
-                line_hints,
             },
-        ))
+        )
     }
 
     fn resolve_pending_instr(
@@ -794,64 +706,8 @@ impl<'a> ProtoLowerer<'a> {
         owner_raw: usize,
         pending: &PendingLowInstr,
     ) -> Result<LowInstr, TransformError> {
-        let owner_pc = raw_pc(&self.raw.common.instructions[owner_raw]);
-
-        match pending {
-            PendingLowInstr::Ready(instr) => Ok(instr.clone()),
-            PendingLowInstr::Jump { target } => Ok(LowInstr::Jump(JumpInstr {
-                target: self.resolve_target(owner_pc, *target)?,
-            })),
-            PendingLowInstr::Branch {
-                cond,
-                then_target,
-                else_target,
-            } => Ok(LowInstr::Branch(BranchInstr {
-                cond: *cond,
-                then_target: self.resolve_target(owner_pc, *then_target)?,
-                else_target: self.resolve_target(owner_pc, *else_target)?,
-            })),
-            PendingLowInstr::NumericForInit {
-                index,
-                limit,
-                step,
-                binding,
-                body_target,
-                exit_target,
-            } => Ok(LowInstr::NumericForInit(NumericForInitInstr {
-                index: *index,
-                limit: *limit,
-                step: *step,
-                binding: *binding,
-                body_target: self.resolve_target(owner_pc, *body_target)?,
-                exit_target: self.resolve_target(owner_pc, *exit_target)?,
-            })),
-            PendingLowInstr::NumericForLoop {
-                index,
-                limit,
-                step,
-                binding,
-                body_target,
-                exit_target,
-            } => Ok(LowInstr::NumericForLoop(NumericForLoopInstr {
-                index: *index,
-                limit: *limit,
-                step: *step,
-                binding: *binding,
-                body_target: self.resolve_target(owner_pc, *body_target)?,
-                exit_target: self.resolve_target(owner_pc, *exit_target)?,
-            })),
-            PendingLowInstr::GenericForLoop {
-                control,
-                bindings,
-                body_target,
-                exit_target,
-            } => Ok(LowInstr::GenericForLoop(GenericForLoopInstr {
-                control: *control,
-                bindings: *bindings,
-                body_target: self.resolve_target(owner_pc, *body_target)?,
-                exit_target: self.resolve_target(owner_pc, *exit_target)?,
-            })),
-        }
+        let owner_pc = self.raw.common.instructions[owner_raw].pc();
+        resolve_pending_instr_with(pending, |target| self.resolve_target(owner_pc, target))
     }
 
     fn resolve_target(
@@ -859,18 +715,8 @@ impl<'a> ProtoLowerer<'a> {
         owner_pc: u32,
         target: TargetPlaceholder,
     ) -> Result<InstrRef, TransformError> {
-        match target {
-            TargetPlaceholder::Low(index) => Ok(InstrRef(index)),
-            TargetPlaceholder::Raw(raw_index) => {
-                let Some(low_index) = self.raw_target_low[raw_index] else {
-                    return Err(TransformError::UntargetableRawInstruction {
-                        raw_pc: owner_pc,
-                        target_raw: raw_index,
-                    });
-                };
-                Ok(InstrRef(low_index))
-            }
-        }
+        self.lowering
+            .resolve_target(owner_pc, target, std::convert::identity)
     }
 
     fn emit(
@@ -879,56 +725,19 @@ impl<'a> ProtoLowerer<'a> {
         raw_indices: Vec<usize>,
         instr: PendingLowInstr,
     ) -> usize {
-        let low_index = self.emitted.len();
-
-        if let Some(owner_raw) = owner_raw
-            && self.raw_target_low[owner_raw].is_none()
-        {
-            self.raw_target_low[owner_raw] = Some(low_index);
-        }
-
-        for raw_index in &raw_indices {
-            self.raw_to_low[*raw_index].push(InstrRef(low_index));
-        }
-
-        self.emitted.push(EmittedInstr { raw_indices, instr });
-        low_index
+        self.lowering.emit(owner_raw, raw_indices, instr)
     }
 
     fn const_ref(&self, raw_pc: u32, index: usize) -> Result<ConstRef, TransformError> {
-        let const_count = self.raw.common.constants.common.literals.len();
-        if index >= const_count {
-            return Err(TransformError::InvalidConstRef {
-                raw_pc,
-                const_index: index,
-                const_count,
-            });
-        }
-        Ok(ConstRef(index))
+        checked_const_ref(self.raw, raw_pc, index)
     }
 
     fn upvalue_ref(&self, raw_pc: u32, index: usize) -> Result<UpvalueRef, TransformError> {
-        let upvalue_count = self.raw.common.upvalues.common.count as usize;
-        if index >= upvalue_count {
-            return Err(TransformError::InvalidUpvalueRef {
-                raw_pc,
-                upvalue_index: index,
-                upvalue_count,
-            });
-        }
-        Ok(UpvalueRef(index))
+        checked_upvalue_ref(self.raw, raw_pc, index)
     }
 
     fn proto_ref(&self, raw_pc: u32, index: usize) -> Result<ProtoRef, TransformError> {
-        let child_count = self.raw.common.children.len();
-        if index >= child_count {
-            return Err(TransformError::InvalidProtoRef {
-                raw_pc,
-                proto_index: index,
-                child_count,
-            });
-        }
-        Ok(ProtoRef(index))
+        checked_proto_ref(self.raw, raw_pc, index)
     }
 
     fn value_operand(&self, raw_pc: u32, rk: u16) -> Result<ValueOperand, TransformError> {
@@ -992,20 +801,22 @@ impl<'a> ProtoLowerer<'a> {
         raw_index: usize,
         opcode: Lua51Opcode,
     ) -> Result<HelperJump, TransformError> {
-        let raw_pc = raw_pc(&self.raw.common.instructions[raw_index]);
+        let raw_pc = self.raw.common.instructions[raw_index].pc();
         let helper_index = raw_index + 1;
         let Some(helper_instr) = self.raw.common.instructions.get(helper_index) else {
             return Err(TransformError::MissingHelperJump {
                 raw_pc,
-                opcode: opcode_label(opcode),
+                opcode: opcode.label(),
             });
         };
-        let (helper_opcode, helper_operands, helper_extra) = decode_lua51(helper_instr);
+        let (helper_opcode, helper_operands, helper_extra) = helper_instr
+            .lua51()
+            .expect("lua51 lowerer should only decode lua51 instructions");
         if helper_opcode != Lua51Opcode::Jmp {
             return Err(TransformError::InvalidHelperJump {
                 raw_pc,
                 helper_pc: helper_extra.pc,
-                found: opcode_label(helper_opcode),
+                found: helper_opcode.label(),
             });
         }
         let (_, helper_sbx) = expect_asbx(helper_extra.pc, helper_opcode, helper_operands)?;
@@ -1018,45 +829,23 @@ impl<'a> ProtoLowerer<'a> {
     }
 
     fn set_pending_method(&mut self, callee: Reg, self_arg: Reg) {
-        if callee.index() < self.pending_methods.len() {
-            self.pending_methods[callee.index()] = Some(self_arg);
-        }
+        self.pending_methods.set(callee, self_arg);
     }
 
     fn take_call_kind(&mut self, callee: Reg, raw_b: u16) -> CallKind {
-        if raw_b == 1 {
-            return CallKind::Normal;
-        }
-
-        match self
-            .pending_methods
-            .get(callee.index())
-            .and_then(|value| *value)
-        {
-            Some(self_arg) if self_arg == Reg(callee.index() + 1) => CallKind::Method,
-            _ => CallKind::Normal,
-        }
+        self.pending_methods.call_kind(callee, raw_b)
     }
 
     fn invalidate_written_reg(&mut self, reg: Reg) {
-        for (callee, pending) in self.pending_methods.iter_mut().enumerate() {
-            let Some(self_arg) = *pending else {
-                continue;
-            };
-            if callee == reg.index() || self_arg.index() == reg.index() {
-                *pending = None;
-            }
-        }
+        self.pending_methods.invalidate_reg(reg);
     }
 
     fn invalidate_written_range(&mut self, range: RegRange) {
-        for offset in 0..range.len {
-            self.invalidate_written_reg(Reg(range.start.index() + offset));
-        }
+        self.pending_methods.invalidate_range(range);
     }
 
     fn clear_all_method_hints(&mut self) {
-        self.pending_methods.fill(None);
+        self.pending_methods.clear();
     }
 }
 
@@ -1067,29 +856,11 @@ struct HelperJump {
     fallthrough_target: usize,
 }
 
-fn decode_lua51(raw: &RawInstr) -> (Lua51Opcode, &Lua51Operands, Lua51InstrExtra) {
-    let RawInstrOpcode::Lua51(opcode) = raw.opcode else {
-        unreachable!("lua51 lowerer should only decode lua51 opcodes");
-    };
-    let RawInstrOperands::Lua51(ref operands) = raw.operands else {
-        unreachable!("lua51 lowerer should only decode lua51 operands");
-    };
-    let DialectInstrExtra::Lua51(extra) = raw.extra else {
-        unreachable!("lua51 lowerer should only decode lua51 instruction extras");
-    };
-    (opcode, operands, extra)
-}
-
-fn raw_pc(raw: &RawInstr) -> u32 {
-    let DialectInstrExtra::Lua51(extra) = raw.extra else {
-        unreachable!("lua51 lowerer should only decode lua51 instruction extras");
-    };
-    extra.pc
-}
-
 fn opcode_at(raw: &RawProto, index: usize) -> Lua51Opcode {
-    let (opcode, _, _) = decode_lua51(&raw.common.instructions[index]);
-    opcode
+    raw.common.instructions[index]
+        .lua51()
+        .expect("lua51 lowerer should only decode lua51 instructions")
+        .0
 }
 
 fn reg_from_u8(index: u8) -> Reg {
@@ -1166,135 +937,26 @@ fn branch_predicate(opcode: Lua51Opcode) -> BranchPredicate {
     }
 }
 
-fn expect_a(
-    raw_pc: u32,
-    opcode: Lua51Opcode,
-    operands: &Lua51Operands,
-) -> Result<u8, TransformError> {
-    match operands {
-        Lua51Operands::A { a } => Ok(*a),
-        _ => Err(TransformError::UnexpectedOperands {
-            raw_pc,
-            opcode: opcode_label(opcode),
-            expected: "A",
-        }),
+define_operand_expecters! {
+    opcode = Lua51Opcode,
+    operands = Lua51Operands,
+    label = Lua51Opcode::label,
+    fn expect_a("A") -> u8 {
+        Lua51Operands::A { a } => *a
     }
-}
-
-fn expect_ab(
-    raw_pc: u32,
-    opcode: Lua51Opcode,
-    operands: &Lua51Operands,
-) -> Result<(u8, u16), TransformError> {
-    match operands {
-        Lua51Operands::AB { a, b } => Ok((*a, *b)),
-        _ => Err(TransformError::UnexpectedOperands {
-            raw_pc,
-            opcode: opcode_label(opcode),
-            expected: "AB",
-        }),
+    fn expect_ab("AB") -> (u8, u16) {
+        Lua51Operands::AB { a, b } => (*a, *b)
     }
-}
-
-fn expect_ac(
-    raw_pc: u32,
-    opcode: Lua51Opcode,
-    operands: &Lua51Operands,
-) -> Result<(u8, u16), TransformError> {
-    match operands {
-        Lua51Operands::AC { a, c } => Ok((*a, *c)),
-        _ => Err(TransformError::UnexpectedOperands {
-            raw_pc,
-            opcode: opcode_label(opcode),
-            expected: "AC",
-        }),
+    fn expect_ac("AC") -> (u8, u16) {
+        Lua51Operands::AC { a, c } => (*a, *c)
     }
-}
-
-fn expect_abc(
-    raw_pc: u32,
-    opcode: Lua51Opcode,
-    operands: &Lua51Operands,
-) -> Result<(u8, u16, u16), TransformError> {
-    match operands {
-        Lua51Operands::ABC { a, b, c } => Ok((*a, *b, *c)),
-        _ => Err(TransformError::UnexpectedOperands {
-            raw_pc,
-            opcode: opcode_label(opcode),
-            expected: "ABC",
-        }),
+    fn expect_abc("ABC") -> (u8, u16, u16) {
+        Lua51Operands::ABC { a, b, c } => (*a, *b, *c)
     }
-}
-
-fn expect_abx(
-    raw_pc: u32,
-    opcode: Lua51Opcode,
-    operands: &Lua51Operands,
-) -> Result<(u8, u32), TransformError> {
-    match operands {
-        Lua51Operands::ABx { a, bx } => Ok((*a, *bx)),
-        _ => Err(TransformError::UnexpectedOperands {
-            raw_pc,
-            opcode: opcode_label(opcode),
-            expected: "ABx",
-        }),
+    fn expect_abx("ABx") -> (u8, u32) {
+        Lua51Operands::ABx { a, bx } => (*a, *bx)
     }
-}
-
-fn expect_asbx(
-    raw_pc: u32,
-    opcode: Lua51Opcode,
-    operands: &Lua51Operands,
-) -> Result<(u8, i32), TransformError> {
-    match operands {
-        Lua51Operands::AsBx { a, sbx } => Ok((*a, *sbx)),
-        _ => Err(TransformError::UnexpectedOperands {
-            raw_pc,
-            opcode: opcode_label(opcode),
-            expected: "AsBx",
-        }),
-    }
-}
-
-fn opcode_label(opcode: Lua51Opcode) -> &'static str {
-    match opcode {
-        Lua51Opcode::Move => "MOVE",
-        Lua51Opcode::LoadK => "LOADK",
-        Lua51Opcode::LoadBool => "LOADBOOL",
-        Lua51Opcode::LoadNil => "LOADNIL",
-        Lua51Opcode::GetUpVal => "GETUPVAL",
-        Lua51Opcode::GetGlobal => "GETGLOBAL",
-        Lua51Opcode::GetTable => "GETTABLE",
-        Lua51Opcode::SetGlobal => "SETGLOBAL",
-        Lua51Opcode::SetUpVal => "SETUPVAL",
-        Lua51Opcode::SetTable => "SETTABLE",
-        Lua51Opcode::NewTable => "NEWTABLE",
-        Lua51Opcode::Self_ => "SELF",
-        Lua51Opcode::Add => "ADD",
-        Lua51Opcode::Sub => "SUB",
-        Lua51Opcode::Mul => "MUL",
-        Lua51Opcode::Div => "DIV",
-        Lua51Opcode::Mod => "MOD",
-        Lua51Opcode::Pow => "POW",
-        Lua51Opcode::Unm => "UNM",
-        Lua51Opcode::Not => "NOT",
-        Lua51Opcode::Len => "LEN",
-        Lua51Opcode::Concat => "CONCAT",
-        Lua51Opcode::Jmp => "JMP",
-        Lua51Opcode::Eq => "EQ",
-        Lua51Opcode::Lt => "LT",
-        Lua51Opcode::Le => "LE",
-        Lua51Opcode::Test => "TEST",
-        Lua51Opcode::TestSet => "TESTSET",
-        Lua51Opcode::Call => "CALL",
-        Lua51Opcode::TailCall => "TAILCALL",
-        Lua51Opcode::Return => "RETURN",
-        Lua51Opcode::ForLoop => "FORLOOP",
-        Lua51Opcode::ForPrep => "FORPREP",
-        Lua51Opcode::TForLoop => "TFORLOOP",
-        Lua51Opcode::SetList => "SETLIST",
-        Lua51Opcode::Close => "CLOSE",
-        Lua51Opcode::Closure => "CLOSURE",
-        Lua51Opcode::VarArg => "VARARG",
+    fn expect_asbx("AsBx") -> (u8, i32) {
+        Lua51Operands::AsBx { a, sbx } => (*a, *sbx)
     }
 }

@@ -11,4 +11,5 @@ pub mod lua54;
 pub mod lua55;
 pub mod luajit;
 pub mod luau;
+pub(crate) mod opcodes;
 pub mod puc_lua;

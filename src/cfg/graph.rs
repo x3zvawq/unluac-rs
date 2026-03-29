@@ -9,31 +9,107 @@ use super::common::{
     BlockRef, Cfg, CfgGraph, DominatorTree, EdgeRef, GraphFacts, NaturalLoop, PostDominatorTree,
 };
 
-/// 对整个 CFG 树递归计算图事实。
-pub fn analyze_graph_facts(cfg: &CfgGraph) -> GraphFacts {
-    GraphFacts {
-        rpo: compute_rpo(&cfg.cfg),
-        dominator_tree: compute_dominator_tree(&cfg.cfg),
-        post_dominator_tree: compute_post_dominator_tree(&cfg.cfg),
-        dominance_frontier: compute_dominance_frontier(&cfg.cfg),
-        backedges: compute_backedges(&cfg.cfg),
-        loop_headers: compute_loop_headers(&cfg.cfg),
-        natural_loops: compute_natural_loops(&cfg.cfg),
-        children: cfg.children.iter().map(analyze_graph_facts).collect(),
+struct DenseBlockSet {
+    present: Vec<bool>,
+}
+
+impl DenseBlockSet {
+    fn new(block_count: usize) -> Self {
+        Self {
+            present: vec![false; block_count],
+        }
+    }
+
+    fn from_blocks<I>(block_count: usize, blocks: I) -> Self
+    where
+        I: IntoIterator<Item = BlockRef>,
+    {
+        let mut set = Self::new(block_count);
+        for block in blocks {
+            set.present[block.index()] = true;
+        }
+        set
+    }
+
+    fn contains(&self, block: BlockRef) -> bool {
+        self.present[block.index()]
+    }
+
+    fn insert(&mut self, block: BlockRef) -> bool {
+        let slot = &mut self.present[block.index()];
+        let inserted = !*slot;
+        *slot = true;
+        inserted
     }
 }
 
-fn compute_rpo(cfg: &Cfg) -> Vec<BlockRef> {
-    if !cfg.reachable_blocks.contains(&cfg.entry_block) {
+struct GraphAnalysis {
+    rpo: Vec<BlockRef>,
+    dominator_tree: DominatorTree,
+    post_dominator_tree: PostDominatorTree,
+    dominance_frontier: Vec<BTreeSet<BlockRef>>,
+    backedges: Vec<EdgeRef>,
+    loop_headers: BTreeSet<BlockRef>,
+    natural_loops: Vec<NaturalLoop>,
+}
+
+impl GraphAnalysis {
+    fn analyze(cfg: &Cfg) -> Self {
+        let reachable =
+            DenseBlockSet::from_blocks(cfg.blocks.len(), cfg.reachable_blocks.iter().copied());
+        let rpo = compute_rpo(cfg, &reachable);
+        let dominator_tree = compute_dominator_tree(cfg, &rpo);
+        let reverse_reachable = compute_reverse_reachable(cfg, &reachable);
+        let reverse_rpo = compute_reverse_rpo(cfg, &reverse_reachable);
+        let post_dominator_tree = compute_post_dominator_tree(cfg, &reverse_rpo);
+        let dominance_frontier = compute_dominance_frontier(cfg, &dominator_tree, &reachable);
+        let backedges = compute_backedges(cfg, &dominator_tree, &reachable);
+        let loop_headers = compute_loop_headers(cfg, &backedges);
+        let natural_loops = compute_natural_loops(cfg, &backedges, &reachable);
+
+        Self {
+            rpo,
+            dominator_tree,
+            post_dominator_tree,
+            dominance_frontier,
+            backedges,
+            loop_headers,
+            natural_loops,
+        }
+    }
+
+    fn into_graph_facts(self, children: Vec<GraphFacts>) -> GraphFacts {
+        GraphFacts {
+            rpo: self.rpo,
+            dominator_tree: self.dominator_tree,
+            post_dominator_tree: self.post_dominator_tree,
+            dominance_frontier: self.dominance_frontier,
+            backedges: self.backedges,
+            loop_headers: self.loop_headers,
+            natural_loops: self.natural_loops,
+            children,
+        }
+    }
+}
+
+/// 对整个 CFG 树递归计算图事实。
+pub fn analyze_graph_facts(cfg: &CfgGraph) -> GraphFacts {
+    let analysis = GraphAnalysis::analyze(&cfg.cfg);
+    let children = cfg.children.iter().map(analyze_graph_facts).collect();
+    analysis.into_graph_facts(children)
+}
+
+fn compute_rpo(cfg: &Cfg, reachable: &DenseBlockSet) -> Vec<BlockRef> {
+    if !reachable.contains(cfg.entry_block) {
         return Vec::new();
     }
 
-    let mut visited = BTreeSet::new();
+    let mut visited = DenseBlockSet::new(cfg.blocks.len());
     let mut postorder = Vec::new();
     dfs_postorder(
         cfg,
         cfg.entry_block,
-        &cfg.reachable_blocks,
+        reachable,
         &mut visited,
         &mut postorder,
     );
@@ -41,15 +117,12 @@ fn compute_rpo(cfg: &Cfg) -> Vec<BlockRef> {
     postorder
 }
 
-fn compute_dominator_tree(cfg: &Cfg) -> DominatorTree {
-    let rpo = compute_rpo(cfg);
-    compute_tree(cfg, &rpo, cfg.entry_block, false)
+fn compute_dominator_tree(cfg: &Cfg, rpo: &[BlockRef]) -> DominatorTree {
+    compute_tree(cfg, rpo, cfg.entry_block, false)
 }
 
-fn compute_post_dominator_tree(cfg: &Cfg) -> PostDominatorTree {
-    let reverse_reachable = compute_reverse_reachable(cfg);
-    let rpo = compute_reverse_rpo(cfg, &reverse_reachable);
-    let tree = compute_tree(cfg, &rpo, cfg.exit_block, true);
+fn compute_post_dominator_tree(cfg: &Cfg, reverse_rpo: &[BlockRef]) -> PostDominatorTree {
+    let tree = compute_tree(cfg, reverse_rpo, cfg.exit_block, true);
 
     PostDominatorTree {
         parent: tree.parent,
@@ -58,15 +131,16 @@ fn compute_post_dominator_tree(cfg: &Cfg) -> PostDominatorTree {
     }
 }
 
-fn compute_dominance_frontier(cfg: &Cfg) -> Vec<BTreeSet<BlockRef>> {
-    let dom_tree = compute_dominator_tree(cfg);
+fn compute_dominance_frontier(
+    cfg: &Cfg,
+    dom_tree: &DominatorTree,
+    reachable: &DenseBlockSet,
+) -> Vec<BTreeSet<BlockRef>> {
     let mut frontier = vec![BTreeSet::new(); cfg.blocks.len()];
 
-    for block in cfg
-        .reachable_blocks
-        .iter()
-        .copied()
-        .filter(|block| cfg.preds[block.index()].len() >= 2)
+    for block in (0..cfg.blocks.len())
+        .map(BlockRef)
+        .filter(|block| reachable.contains(*block) && cfg.preds[block.index()].len() >= 2)
     {
         let Some(block_parent) = dom_tree.parent[block.index()] else {
             continue;
@@ -88,17 +162,19 @@ fn compute_dominance_frontier(cfg: &Cfg) -> Vec<BTreeSet<BlockRef>> {
     frontier
 }
 
-fn compute_backedges(cfg: &Cfg) -> Vec<EdgeRef> {
-    let dom_tree = compute_dominator_tree(cfg);
-
+fn compute_backedges(
+    cfg: &Cfg,
+    dom_tree: &DominatorTree,
+    reachable: &DenseBlockSet,
+) -> Vec<EdgeRef> {
     cfg.edges
         .iter()
         .enumerate()
         .filter_map(|(index, edge)| {
             let edge_ref = EdgeRef(index);
-            if cfg.reachable_blocks.contains(&edge.from)
-                && cfg.reachable_blocks.contains(&edge.to)
-                && dominates(&dom_tree.parent, edge.to, edge.from)
+            if reachable.contains(edge.from)
+                && reachable.contains(edge.to)
+                && dom_tree.dominates(edge.to, edge.from)
             {
                 Some(edge_ref)
             } else {
@@ -108,18 +184,22 @@ fn compute_backedges(cfg: &Cfg) -> Vec<EdgeRef> {
         .collect()
 }
 
-fn compute_loop_headers(cfg: &Cfg) -> BTreeSet<BlockRef> {
-    compute_backedges(cfg)
-        .into_iter()
+fn compute_loop_headers(cfg: &Cfg, backedges: &[EdgeRef]) -> BTreeSet<BlockRef> {
+    backedges
+        .iter()
+        .copied()
         .map(|edge_ref| cfg.edges[edge_ref.index()].to)
         .collect()
 }
 
-fn compute_natural_loops(cfg: &Cfg) -> Vec<NaturalLoop> {
-    let backedges = compute_backedges(cfg);
-
+fn compute_natural_loops(
+    cfg: &Cfg,
+    backedges: &[EdgeRef],
+    reachable: &DenseBlockSet,
+) -> Vec<NaturalLoop> {
     backedges
-        .into_iter()
+        .iter()
+        .copied()
         .map(|backedge| {
             let edge = cfg.edges[backedge.index()];
             let mut blocks = BTreeSet::from([edge.to]);
@@ -133,7 +213,7 @@ fn compute_natural_loops(cfg: &Cfg) -> Vec<NaturalLoop> {
             while let Some(block) = worklist.pop_front() {
                 for pred_edge in &cfg.preds[block.index()] {
                     let pred = cfg.edges[pred_edge.index()].from;
-                    if cfg.reachable_blocks.contains(&pred) && blocks.insert(pred) {
+                    if reachable.contains(pred) && blocks.insert(pred) {
                         worklist.push_back(pred);
                     }
                 }
@@ -148,8 +228,8 @@ fn compute_natural_loops(cfg: &Cfg) -> Vec<NaturalLoop> {
         .collect()
 }
 
-fn compute_reverse_reachable(cfg: &Cfg) -> BTreeSet<BlockRef> {
-    let mut reverse_reachable = BTreeSet::new();
+fn compute_reverse_reachable(cfg: &Cfg, reachable: &DenseBlockSet) -> DenseBlockSet {
+    let mut reverse_reachable = DenseBlockSet::new(cfg.blocks.len());
     let mut worklist = VecDeque::from([cfg.exit_block]);
 
     while let Some(block) = worklist.pop_front() {
@@ -159,7 +239,7 @@ fn compute_reverse_reachable(cfg: &Cfg) -> BTreeSet<BlockRef> {
 
         for edge_ref in &cfg.preds[block.index()] {
             let pred = cfg.edges[edge_ref.index()].from;
-            if cfg.reachable_blocks.contains(&pred) && !reverse_reachable.contains(&pred) {
+            if reachable.contains(pred) && !reverse_reachable.contains(pred) {
                 worklist.push_back(pred);
             }
         }
@@ -168,12 +248,12 @@ fn compute_reverse_reachable(cfg: &Cfg) -> BTreeSet<BlockRef> {
     reverse_reachable
 }
 
-fn compute_reverse_rpo(cfg: &Cfg, reverse_reachable: &BTreeSet<BlockRef>) -> Vec<BlockRef> {
-    if !reverse_reachable.contains(&cfg.exit_block) {
+fn compute_reverse_rpo(cfg: &Cfg, reverse_reachable: &DenseBlockSet) -> Vec<BlockRef> {
+    if !reverse_reachable.contains(cfg.exit_block) {
         return Vec::new();
     }
 
-    let mut visited = BTreeSet::new();
+    let mut visited = DenseBlockSet::new(cfg.blocks.len());
     let mut postorder = Vec::new();
     dfs_reverse_postorder(
         cfg,
@@ -294,29 +374,14 @@ fn collect_tree_order(block: BlockRef, children: &[Vec<BlockRef>], order: &mut V
     }
 }
 
-fn dominates(parent: &[Option<BlockRef>], dom: BlockRef, mut block: BlockRef) -> bool {
-    if dom == block {
-        return true;
-    }
-
-    while let Some(next) = parent[block.index()] {
-        if next == dom {
-            return true;
-        }
-        block = next;
-    }
-
-    false
-}
-
 fn dfs_postorder(
     cfg: &Cfg,
     block: BlockRef,
-    visible: &BTreeSet<BlockRef>,
-    visited: &mut BTreeSet<BlockRef>,
+    visible: &DenseBlockSet,
+    visited: &mut DenseBlockSet,
     postorder: &mut Vec<BlockRef>,
 ) {
-    if !visible.contains(&block) || !visited.insert(block) {
+    if !visible.contains(block) || !visited.insert(block) {
         return;
     }
 
@@ -331,11 +396,11 @@ fn dfs_postorder(
 fn dfs_reverse_postorder(
     cfg: &Cfg,
     block: BlockRef,
-    visible: &BTreeSet<BlockRef>,
-    visited: &mut BTreeSet<BlockRef>,
+    visible: &DenseBlockSet,
+    visited: &mut DenseBlockSet,
     postorder: &mut Vec<BlockRef>,
 ) {
-    if !visible.contains(&block) || !visited.insert(block) {
+    if !visible.contains(block) || !visited.insert(block) {
         return;
     }
 

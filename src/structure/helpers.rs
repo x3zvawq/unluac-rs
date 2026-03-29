@@ -2,111 +2,134 @@
 //!
 //! 它们都只读 CFG / graph facts，不掺杂具体候选语义，目的是让 branch/loop/
 //! short-circuit/scope 等模块共享一套稳定的小工具。
+//!
+//! 它依赖 CFG / GraphFacts 已经提供好的 block、edge、支配关系和可达性，只表达
+//! “共享图查询”本身，不越权决定某个候选最终是不是 `if/while/and-or`。
+//!
+//! 例子：
+//! - `collect_region_entry_edges` 会把“区域外进入区域内”的所有边统一收出来，供
+//!   goto/irreducible 共用
+//! - `collect_region_exit_edges` 会把“区域内流向区域外”的边统一收出来，供
+//!   goto/region exit 共用
+//! - `is_reducible_region` 会回答“除 header 外，区域内 block 是否只被区域内前驱进入”
 
 use std::collections::{BTreeSet, VecDeque};
 
-use crate::cfg::{BlockRef, Cfg, EdgeKind, EdgeRef};
+use crate::cfg::{BlockRef, Cfg, DominatorTree, EdgeRef};
 
-/// 不可规约区域的共享描述。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct IrreducibleRegion {
-    pub entry: BlockRef,
-    pub blocks: BTreeSet<BlockRef>,
-    pub entry_edges: Vec<EdgeRef>,
-}
+use super::common::IrreducibleRegion;
 
 pub(super) fn collect_region_exits(cfg: &Cfg, blocks: &BTreeSet<BlockRef>) -> BTreeSet<BlockRef> {
-    let mut exits = BTreeSet::new();
+    collect_region_exit_edges(cfg, blocks)
+        .into_iter()
+        .map(|edge_ref| cfg.edges[edge_ref.index()].to)
+        .collect()
+}
+
+pub(super) fn collect_region_entry_edges(cfg: &Cfg, blocks: &BTreeSet<BlockRef>) -> Vec<EdgeRef> {
+    let mut entry_edges = Vec::new();
+
+    for block in blocks {
+        for edge_ref in &cfg.preds[block.index()] {
+            let edge = cfg.edges[edge_ref.index()];
+            if cfg.reachable_blocks.contains(&edge.from) && !blocks.contains(&edge.from) {
+                entry_edges.push(*edge_ref);
+            }
+        }
+    }
+
+    entry_edges.sort();
+    entry_edges.dedup();
+    entry_edges
+}
+
+pub(super) fn collect_region_exit_edges(cfg: &Cfg, blocks: &BTreeSet<BlockRef>) -> Vec<EdgeRef> {
+    let mut exit_edges = Vec::new();
 
     for block in blocks {
         for edge_ref in &cfg.succs[block.index()] {
             let edge = cfg.edges[edge_ref.index()];
             if cfg.reachable_blocks.contains(&edge.to) && !blocks.contains(&edge.to) {
-                exits.insert(edge.to);
+                exit_edges.push(*edge_ref);
             }
         }
     }
 
-    exits
+    exit_edges.sort();
+    exit_edges.dedup();
+    exit_edges
 }
 
-pub(super) fn branch_edges(cfg: &Cfg, block: BlockRef) -> Option<(&EdgeRef, &EdgeRef)> {
-    let succs = &cfg.succs[block.index()];
-    if succs.len() != 2 {
-        return None;
-    }
-
-    let then_edge = succs
-        .iter()
-        .find(|edge_ref| matches!(cfg.edges[edge_ref.index()].kind, EdgeKind::BranchTrue))?;
-    let else_edge = succs
-        .iter()
-        .find(|edge_ref| matches!(cfg.edges[edge_ref.index()].kind, EdgeKind::BranchFalse))?;
-
-    Some((then_edge, else_edge))
-}
-
-pub(super) fn nearest_common_postdom(
-    parent: &[Option<BlockRef>],
-    left: BlockRef,
-    right: BlockRef,
-) -> Option<BlockRef> {
-    let mut ancestors = BTreeSet::new();
-    let mut cursor = Some(left);
-    while let Some(block) = cursor {
-        ancestors.insert(block);
-        cursor = parent[block.index()];
-    }
-
-    let mut cursor = Some(right);
-    while let Some(block) = cursor {
-        if ancestors.contains(&block) {
-            return Some(block);
-        }
-        cursor = parent[block.index()];
-    }
-
-    None
-}
-
-pub(super) fn dominates(parent: &[Option<BlockRef>], dom: BlockRef, mut block: BlockRef) -> bool {
-    if dom == block {
-        return true;
-    }
-
-    while let Some(next) = parent[block.index()] {
-        if next == dom {
-            return true;
-        }
-        block = next;
-    }
-
-    false
-}
-
-pub(super) fn can_reach(cfg: &Cfg, from: BlockRef, to: BlockRef) -> bool {
-    if from == to {
-        return true;
-    }
-
-    let mut visited = BTreeSet::new();
-    let mut worklist = VecDeque::from([from]);
+pub(super) fn collect_forward_region_blocks(
+    cfg: &Cfg,
+    entries: impl IntoIterator<Item = BlockRef>,
+    stop: Option<BlockRef>,
+    dom_limit: Option<(BlockRef, &DominatorTree)>,
+) -> BTreeSet<BlockRef> {
+    let mut blocks = BTreeSet::new();
+    let mut worklist = VecDeque::from_iter(entries);
 
     while let Some(block) = worklist.pop_front() {
-        if !cfg.reachable_blocks.contains(&block) || !visited.insert(block) {
+        if Some(block) == stop
+            || !cfg.reachable_blocks.contains(&block)
+            || !blocks.insert(block)
+            || dom_limit.is_some_and(|(root, tree)| !tree.dominates(root, block))
+        {
             continue;
         }
 
         for edge_ref in &cfg.succs[block.index()] {
             let succ = cfg.edges[edge_ref.index()].to;
-            if succ == to {
-                return true;
+            if Some(succ) != stop {
+                worklist.push_back(succ);
             }
-            worklist.push_back(succ);
         }
     }
 
-    false
+    blocks
+}
+
+pub(super) fn collect_region_predecessors_to_target(
+    cfg: &Cfg,
+    blocks: &BTreeSet<BlockRef>,
+    target: BlockRef,
+) -> BTreeSet<BlockRef> {
+    blocks
+        .iter()
+        .copied()
+        .filter(|block| {
+            cfg.succs[block.index()]
+                .iter()
+                .any(|edge_ref| cfg.edges[edge_ref.index()].to == target)
+        })
+        .collect()
+}
+
+pub(super) fn collect_merge_arm_preds(
+    cfg: &Cfg,
+    dom_tree: &DominatorTree,
+    entry: BlockRef,
+    merge: BlockRef,
+) -> BTreeSet<BlockRef> {
+    let blocks = collect_forward_region_blocks(cfg, [entry], Some(merge), Some((entry, dom_tree)));
+    collect_region_predecessors_to_target(cfg, &blocks, merge)
+}
+
+pub(super) fn is_reducible_region(
+    cfg: &Cfg,
+    header: BlockRef,
+    blocks: &BTreeSet<BlockRef>,
+) -> bool {
+    blocks.iter().all(|block| {
+        if *block == header {
+            true
+        } else {
+            cfg.preds[block.index()].iter().all(|edge_ref| {
+                let pred = cfg.edges[edge_ref.index()].from;
+                !cfg.reachable_blocks.contains(&pred) || blocks.contains(&pred)
+            })
+        }
+    })
 }
 
 pub(super) fn compute_irreducible_regions(cfg: &Cfg) -> Vec<IrreducibleRegion> {
@@ -134,9 +157,8 @@ pub(super) fn compute_irreducible_regions(cfg: &Cfg) -> Vec<IrreducibleRegion> {
             }
             component.insert(cursor);
 
-            for edge_ref in &cfg.preds[cursor.index()] {
-                let pred = cfg.edges[edge_ref.index()].from;
-                if cfg.reachable_blocks.contains(&pred) && pred != cfg.exit_block {
+            for pred in cfg.reachable_predecessors(cursor) {
+                if pred != cfg.exit_block {
                     worklist.push_back(pred);
                 }
             }
@@ -153,7 +175,7 @@ pub(super) fn compute_irreducible_regions(cfg: &Cfg) -> Vec<IrreducibleRegion> {
             continue;
         }
 
-        let entry_edges = component_entry_edges(cfg, &component);
+        let entry_edges = collect_region_entry_edges(cfg, &component);
         if entry_edges.len() <= 1 {
             continue;
         }
@@ -203,23 +225,6 @@ fn dfs_postorder(
     }
 
     order.push(block);
-}
-
-fn component_entry_edges(cfg: &Cfg, blocks: &BTreeSet<BlockRef>) -> Vec<EdgeRef> {
-    let mut entry_edges = Vec::new();
-
-    for block in blocks {
-        for edge_ref in &cfg.preds[block.index()] {
-            let edge = cfg.edges[edge_ref.index()];
-            if cfg.reachable_blocks.contains(&edge.from) && !blocks.contains(&edge.from) {
-                entry_edges.push(*edge_ref);
-            }
-        }
-    }
-
-    entry_edges.sort();
-    entry_edges.dedup();
-    entry_edges
 }
 
 fn has_self_loop(cfg: &Cfg, block: BlockRef) -> bool {

@@ -9,7 +9,7 @@ use crate::ast::{
 use crate::cfg::{analyze_dataflow, analyze_graph_facts, build_cfg_graph};
 use crate::generate::generate_chunk;
 use crate::hir::analyze_hir_with_timing;
-use crate::naming::assign_names;
+use crate::naming::{assign_names_with_evidence, collect_naming_evidence};
 use crate::parser::{
     parse_lua51_chunk, parse_lua52_chunk, parse_lua53_chunk, parse_lua54_chunk, parse_lua55_chunk,
     parse_luajit_chunk, parse_luau_chunk,
@@ -281,7 +281,10 @@ impl DecompilerPipeline {
                 .raw_chunk
                 .as_ref()
                 .expect("parse stage completed must leave raw chunk in state");
-            assign_names(ast, hir, raw_chunk, options.naming)
+            let evidence = timings.record("collect-evidence", || {
+                collect_naming_evidence(raw_chunk, hir)
+            })?;
+            assign_names_with_evidence(ast, hir, &evidence, options.naming)
         })?);
         state.mark_completed(DecompileStage::Naming);
 

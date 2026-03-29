@@ -18,8 +18,7 @@ use crate::parser::reader::BinaryReader;
 
 use super::raw::{
     LuauConstEntry, LuauConstPoolExtra, LuauDebugExtra, LuauHeaderExtra, LuauInstrExtra,
-    LuauOpcode, LuauOperandKind, LuauOperands, LuauProtoExtra, LuauTableConstEntry,
-    LuauUpvalueExtra,
+    LuauOpcode, LuauProtoExtra, LuauTableConstEntry, LuauUpvalueExtra,
 };
 
 const LUAU_ERROR_BLOB_VERSION: u8 = 0;
@@ -36,6 +35,12 @@ struct LuauParserState {
 struct FlatProto {
     proto: RawProto,
     child_indices: Vec<usize>,
+}
+
+enum FlatProtoSlot {
+    Pending(Box<FlatProto>),
+    Building,
+    Consumed,
 }
 
 struct LuauSymbolDebugInfo {
@@ -84,8 +89,12 @@ impl LuauParserState {
         let layout = *header
             .luau_layout()
             .expect("luau parser must produce a luau chunk layout");
-        let flat_protos = self.parse_proto_table(&mut reader, layout)?;
-        let main_index = usize::try_from(self.read_varint_u32(&mut reader, "luau main proto id")?)
+        let mut flat_protos = self
+            .parse_proto_table(&mut reader, layout)?
+            .into_iter()
+            .map(|proto| FlatProtoSlot::Pending(Box::new(proto)))
+            .collect::<Vec<_>>();
+        let main_index = usize::try_from(reader.read_varint_u32_luau("luau main proto id")?)
             .map_err(|_| ParseError::IntegerOverflow {
                 field: "luau main proto id",
                 value: u64::MAX,
@@ -97,8 +106,7 @@ impl LuauParserState {
             });
         }
 
-        let mut cache = vec![None; flat_protos.len()];
-        let main = build_proto_tree(main_index, &flat_protos, &mut cache)?;
+        let main = build_proto_tree(main_index, &mut flat_protos)?;
 
         Ok(RawChunk {
             header,
@@ -151,7 +159,7 @@ impl LuauParserState {
         &self,
         reader: &mut BinaryReader<'_>,
     ) -> Result<Vec<RawString>, ParseError> {
-        let string_count = usize::try_from(self.read_varint_u32(reader, "luau string count")?)
+        let string_count = usize::try_from(reader.read_varint_u32_luau("luau string count")?)
             .map_err(|_| ParseError::IntegerOverflow {
                 field: "luau string count",
                 value: u64::MAX,
@@ -160,7 +168,7 @@ impl LuauParserState {
 
         for _ in 0..string_count {
             let offset = reader.offset();
-            let length = usize::try_from(self.read_varint_u32(reader, "luau string length")?)
+            let length = usize::try_from(reader.read_varint_u32_luau("luau string length")?)
                 .map_err(|_| ParseError::IntegerOverflow {
                     field: "luau string length",
                     value: u64::MAX,
@@ -218,7 +226,7 @@ impl LuauParserState {
         reader: &mut BinaryReader<'_>,
         layout: LuauChunkLayout,
     ) -> Result<Vec<FlatProto>, ParseError> {
-        let proto_count = usize::try_from(self.read_varint_u32(reader, "luau proto count")?)
+        let proto_count = usize::try_from(reader.read_varint_u32_luau("luau proto count")?)
             .map_err(|_| ParseError::IntegerOverflow {
                 field: "luau proto count",
                 value: u64::MAX,
@@ -249,11 +257,11 @@ impl LuauParserState {
             0
         };
         let type_info = if layout.bytecode_version >= 4 {
-            let size = usize::try_from(self.read_varint_u32(reader, "luau proto type info size")?)
+            let size = usize::try_from(reader.read_varint_u32_luau("luau proto type info size")?)
                 .map_err(|_| ParseError::IntegerOverflow {
-                    field: "luau proto type info size",
-                    value: u64::MAX,
-                })?;
+                field: "luau proto type info size",
+                value: u64::MAX,
+            })?;
             reader.read_exact(size)?.to_vec()
         } else {
             Vec::new()
@@ -262,7 +270,8 @@ impl LuauParserState {
         let decoded = self.parse_instructions(reader)?;
         let constants = self.parse_constants(reader)?;
         let child_indices = self.parse_child_proto_indices(reader)?;
-        let defined_start = self.read_varint_u32(reader, "luau linedefined")?;
+        let constants = self.normalize_constants(constants, child_indices.as_slice())?;
+        let defined_start = reader.read_varint_u32_luau("luau linedefined")?;
         let debug_name = self.read_string_ref(reader)?;
         let debug_info = self.parse_debug_info(
             reader,
@@ -302,7 +311,6 @@ impl LuauParserState {
                     flags,
                     type_info,
                     debug_name,
-                    child_proto_ids: child_indices.iter().map(|index| *index as u32).collect(),
                 }),
                 origin: Origin {
                     span: Span {
@@ -320,7 +328,7 @@ impl LuauParserState {
         &self,
         reader: &mut BinaryReader<'_>,
     ) -> Result<DecodedInstrs, ParseError> {
-        let word_count = usize::try_from(self.read_varint_u32(reader, "luau code word count")?)
+        let word_count = usize::try_from(reader.read_varint_u32_luau("luau code word count")?)
             .map_err(|_| ParseError::IntegerOverflow {
                 field: "luau code word count",
                 value: u64::MAX,
@@ -328,8 +336,7 @@ impl LuauParserState {
         let code_offset = reader.offset();
         let mut words = Vec::with_capacity(word_count);
         for _ in 0..word_count {
-            let bytes = reader.read_array::<4>()?;
-            words.push(u32::from_le_bytes(bytes));
+            words.push(reader.read_u32_le()?);
         }
 
         let mut instrs = Vec::new();
@@ -358,7 +365,7 @@ impl LuauParserState {
                         })
                 })
                 .transpose()?;
-            let operands = decode_operands(opcode, word);
+            let operands = opcode.decode_operands(word);
             let raw_index = instrs.len() as u32;
             raw_by_word_pc[word_pc] = Some(raw_index);
             word_pc_by_raw.push(word_pc as u32);
@@ -394,7 +401,7 @@ impl LuauParserState {
         &mut self,
         reader: &mut BinaryReader<'_>,
     ) -> Result<RawConstPool, ParseError> {
-        let const_count = usize::try_from(self.read_varint_u32(reader, "luau const count")?)
+        let const_count = usize::try_from(reader.read_varint_u32_luau("luau const count")?)
             .map_err(|_| ParseError::IntegerOverflow {
                 field: "luau const count",
                 value: u64::MAX,
@@ -417,7 +424,7 @@ impl LuauParserState {
                 }
                 2 => {
                     let literal_index = literals.len();
-                    literals.push(RawLiteralConst::Number(self.read_f64_le(reader)?));
+                    literals.push(RawLiteralConst::Number(reader.read_f64_le()?));
                     LuauConstEntry::Literal { literal_index }
                 }
                 3 => {
@@ -432,33 +439,34 @@ impl LuauParserState {
                     LuauConstEntry::Literal { literal_index }
                 }
                 4 => LuauConstEntry::Import {
-                    import_id: self.read_u32_le(reader)?,
+                    import_id: reader.read_u32_le()?,
                 },
                 5 => {
                     let key_count =
-                        usize::try_from(self.read_varint_u32(reader, "luau table key count")?)
+                        usize::try_from(reader.read_varint_u32_luau("luau table key count")?)
                             .map_err(|_| ParseError::IntegerOverflow {
                                 field: "luau table key count",
                                 value: u64::MAX,
                             })?;
                     let mut key_consts = Vec::with_capacity(key_count);
                     for _ in 0..key_count {
-                        key_consts.push(self.read_varint_u32(reader, "luau table key const")?);
+                        key_consts.push(reader.read_varint_u32_luau("luau table key const")?);
                     }
                     LuauConstEntry::Table { key_consts }
                 }
                 6 => LuauConstEntry::Closure {
-                    proto_index: self.read_varint_u32(reader, "luau closure const proto")?,
+                    proto_index: reader.read_varint_u32_luau("luau closure const proto")?,
+                    child_proto_index: 0,
                 },
                 7 => LuauConstEntry::Vector {
-                    x: self.read_f32_le(reader)?,
-                    y: self.read_f32_le(reader)?,
-                    z: self.read_f32_le(reader)?,
-                    w: self.read_f32_le(reader)?,
+                    x: reader.read_f32_le()?,
+                    y: reader.read_f32_le()?,
+                    z: reader.read_f32_le()?,
+                    w: reader.read_f32_le()?,
                 },
                 8 => {
                     let key_count = usize::try_from(
-                        self.read_varint_u32(reader, "luau table-with-constants key count")?,
+                        reader.read_varint_u32_luau("luau table-with-constants key count")?,
                     )
                     .map_err(|_| ParseError::IntegerOverflow {
                         field: "luau table-with-constants key count",
@@ -467,8 +475,8 @@ impl LuauParserState {
                     let mut table_entries = Vec::with_capacity(key_count);
                     for _ in 0..key_count {
                         let key_const =
-                            self.read_varint_u32(reader, "luau table-with-constants key")?;
-                        let value_const = self.read_i32_le(reader)?;
+                            reader.read_varint_u32_luau("luau table-with-constants key")?;
+                        let value_const = reader.read_i32_le()?;
                         table_entries.push(LuauTableConstEntry {
                             key_const,
                             value_const: (value_const >= 0).then_some(value_const as u32),
@@ -494,19 +502,47 @@ impl LuauParserState {
         })
     }
 
+    fn normalize_constants(
+        &self,
+        mut constants: RawConstPool,
+        child_indices: &[usize],
+    ) -> Result<RawConstPool, ParseError> {
+        let DialectConstPoolExtra::Luau(extra) = &mut constants.extra else {
+            unreachable!("luau parser should only normalize luau constant pools");
+        };
+        for (const_index, entry) in extra.entries.iter_mut().enumerate() {
+            let LuauConstEntry::Closure {
+                proto_index,
+                child_proto_index,
+            } = entry
+            else {
+                continue;
+            };
+            *child_proto_index = child_indices
+                .iter()
+                .position(|candidate| *candidate == *proto_index as usize)
+                .ok_or(ParseError::InvalidLuauClosureProto {
+                    const_index,
+                    proto_index: *proto_index,
+                    child_count: child_indices.len(),
+                })?;
+        }
+        Ok(constants)
+    }
+
     fn parse_child_proto_indices(
         &self,
         reader: &mut BinaryReader<'_>,
     ) -> Result<Vec<usize>, ParseError> {
-        let child_count = usize::try_from(self.read_varint_u32(reader, "luau child proto count")?)
+        let child_count = usize::try_from(reader.read_varint_u32_luau("luau child proto count")?)
             .map_err(|_| ParseError::IntegerOverflow {
-                field: "luau child proto count",
-                value: u64::MAX,
-            })?;
+            field: "luau child proto count",
+            value: u64::MAX,
+        })?;
         let mut children = Vec::with_capacity(child_count);
         for _ in 0..child_count {
             children.push(
-                usize::try_from(self.read_varint_u32(reader, "luau child proto index")?).map_err(
+                usize::try_from(reader.read_varint_u32_luau("luau child proto index")?).map_err(
                     |_| ParseError::IntegerOverflow {
                         field: "luau child proto index",
                         value: u64::MAX,
@@ -582,7 +618,7 @@ impl LuauParserState {
         let mut absolute_lines = vec![0i32; intervals];
         let mut last_line = 0i32;
         for item in &mut absolute_lines {
-            last_line += self.read_i32_le(reader)?;
+            last_line += reader.read_i32_le()?;
             *item = last_line;
         }
 
@@ -604,11 +640,11 @@ impl LuauParserState {
         raw_by_word_pc: &[Option<u32>],
         upvalue_count: u8,
     ) -> Result<LuauSymbolDebugInfo, ParseError> {
-        let local_count = usize::try_from(self.read_varint_u32(reader, "luau local debug count")?)
+        let local_count = usize::try_from(reader.read_varint_u32_luau("luau local debug count")?)
             .map_err(|_| ParseError::IntegerOverflow {
-                field: "luau local debug count",
-                value: u64::MAX,
-            })?;
+            field: "luau local debug count",
+            value: u64::MAX,
+        })?;
         let mut locals = Vec::with_capacity(local_count);
         let mut regs = Vec::with_capacity(local_count);
 
@@ -619,8 +655,8 @@ impl LuauParserState {
                     field: "luau local debug name",
                     value: 0,
                 })?;
-            let start_word = self.read_varint_u32(reader, "luau local startpc")?;
-            let end_word = self.read_varint_u32(reader, "luau local endpc")?;
+            let start_word = reader.read_varint_u32_luau("luau local startpc")?;
+            let end_word = reader.read_varint_u32_luau("luau local endpc")?;
             let reg = reader.read_u8()?;
             locals.push(RawLocalVar {
                 name,
@@ -631,7 +667,7 @@ impl LuauParserState {
         }
 
         let encoded_upvalue_names =
-            usize::try_from(self.read_varint_u32(reader, "luau upvalue debug name count")?)
+            usize::try_from(reader.read_varint_u32_luau("luau upvalue debug name count")?)
                 .map_err(|_| ParseError::IntegerOverflow {
                     field: "luau upvalue debug name count",
                     value: u64::MAX,
@@ -662,7 +698,7 @@ impl LuauParserState {
         &self,
         reader: &mut BinaryReader<'_>,
     ) -> Result<Option<RawString>, ParseError> {
-        let id = self.read_varint_u32(reader, "luau string id")?;
+        let id = reader.read_varint_u32_luau("luau string id")?;
         if id == 0 {
             return Ok(None);
         }
@@ -690,72 +726,41 @@ impl LuauParserState {
         let value = encoding.decode(offset, bytes, self.options.string_decode_mode)?;
         Ok(Some(DecodedText { encoding, value }))
     }
-
-    fn read_varint_u32(
-        &self,
-        reader: &mut BinaryReader<'_>,
-        field: &'static str,
-    ) -> Result<u32, ParseError> {
-        let mut value = 0u64;
-        let mut shift = 0u32;
-
-        loop {
-            let byte = reader.read_u8()?;
-            value |= u64::from(byte & 0x7f) << shift;
-            if value > u64::from(u32::MAX) {
-                return Err(ParseError::IntegerOverflow { field, value });
-            }
-            if (byte & 0x80) == 0 {
-                return u32::try_from(value)
-                    .map_err(|_| ParseError::IntegerOverflow { field, value });
-            }
-            shift += 7;
-            if shift >= 32 {
-                return Err(ParseError::IntegerOverflow { field, value });
-            }
-        }
-    }
-
-    fn read_u32_le(&self, reader: &mut BinaryReader<'_>) -> Result<u32, ParseError> {
-        Ok(u32::from_le_bytes(reader.read_array::<4>()?))
-    }
-
-    fn read_i32_le(&self, reader: &mut BinaryReader<'_>) -> Result<i32, ParseError> {
-        Ok(i32::from_le_bytes(reader.read_array::<4>()?))
-    }
-
-    fn read_f32_le(&self, reader: &mut BinaryReader<'_>) -> Result<f32, ParseError> {
-        Ok(f32::from_le_bytes(reader.read_array::<4>()?))
-    }
-
-    fn read_f64_le(&self, reader: &mut BinaryReader<'_>) -> Result<f64, ParseError> {
-        Ok(f64::from_le_bytes(reader.read_array::<8>()?))
-    }
 }
 
 fn build_proto_tree(
     proto_index: usize,
-    flat_protos: &[FlatProto],
-    cache: &mut [Option<RawProto>],
+    flat_protos: &mut [FlatProtoSlot],
 ) -> Result<RawProto, ParseError> {
-    if let Some(proto) = &cache[proto_index] {
-        return Ok(proto.clone());
-    }
-
-    let flat = flat_protos
-        .get(proto_index)
+    let slot = flat_protos
+        .get_mut(proto_index)
         .ok_or(ParseError::UnsupportedValue {
             field: "luau proto index",
             value: proto_index as u64,
         })?;
-    let mut proto = flat.proto.clone();
+    let flat = match std::mem::replace(slot, FlatProtoSlot::Building) {
+        FlatProtoSlot::Pending(flat) => *flat,
+        FlatProtoSlot::Building => {
+            return Err(ParseError::UnsupportedValue {
+                field: "luau proto cycle",
+                value: proto_index as u64,
+            });
+        }
+        FlatProtoSlot::Consumed => {
+            return Err(ParseError::UnsupportedValue {
+                field: "luau proto index reuse",
+                value: proto_index as u64,
+            });
+        }
+    };
+    let mut proto = flat.proto;
     proto.common.children = flat
         .child_indices
         .iter()
         .copied()
-        .map(|index| build_proto_tree(index, flat_protos, cache))
+        .map(|index| build_proto_tree(index, flat_protos))
         .collect::<Result<Vec<_>, _>>()?;
-    cache[proto_index] = Some(proto.clone());
+    flat_protos[proto_index] = FlatProtoSlot::Consumed;
     Ok(proto)
 }
 
@@ -767,24 +772,4 @@ fn raw_pc_from_word_pc(word_pc: u32, raw_by_word: &[Option<u32>]) -> Result<u32,
             field: "luau debug pc",
             value: u64::from(word_pc),
         })
-}
-
-fn decode_operands(opcode: LuauOpcode, word: u32) -> LuauOperands {
-    let a = ((word >> 8) & 0xff) as u8;
-    let b = ((word >> 16) & 0xff) as u8;
-    let c = ((word >> 24) & 0xff) as u8;
-    match opcode.operand_kind() {
-        LuauOperandKind::None => LuauOperands::None,
-        LuauOperandKind::A => LuauOperands::A { a },
-        LuauOperandKind::AB => LuauOperands::AB { a, b },
-        LuauOperandKind::AC => LuauOperands::AC { a, c },
-        LuauOperandKind::ABC => LuauOperands::ABC { a, b, c },
-        LuauOperandKind::AD => LuauOperands::AD {
-            a,
-            d: (word as i32 >> 16) as i16,
-        },
-        LuauOperandKind::E => LuauOperands::E {
-            e: (word as i32) >> 8,
-        },
-    }
 }

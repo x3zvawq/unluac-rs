@@ -331,6 +331,7 @@ fn format_expr(expr: &AstExpr, indent: &str, names: &FunctionRenderNames) -> Str
         }
         AstExpr::Call(call) => format_call_expr(call, indent, names),
         AstExpr::MethodCall(call) => format_method_call_expr(call, indent, names),
+        AstExpr::SingleValue(expr) => format!("({})", format_expr(expr, indent, names)),
         AstExpr::VarArg => "...".to_owned(),
         AstExpr::TableConstructor(table) => {
             let fields = table
@@ -777,6 +778,9 @@ fn collect_function_render_names_in_expr(
             for arg in &call.args {
                 collect_function_render_names_in_expr(arg, max_local, synthetic_locals);
             }
+        }
+        AstExpr::SingleValue(expr) => {
+            collect_function_render_names_in_expr(expr, max_local, synthetic_locals);
         }
         AstExpr::TableConstructor(table) => {
             for field in &table.fields {

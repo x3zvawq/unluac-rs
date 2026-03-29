@@ -34,6 +34,14 @@ pub enum ParseError {
     NegativeValue { field: &'static str, value: i64 },
     #[error("invalid constant tag {tag} at offset {offset}")]
     InvalidConstantTag { offset: usize, tag: u8 },
+    #[error(
+        "luau closure const #{const_index} refers to proto {proto_index}, but current proto only exposes {child_count} child slots"
+    )]
+    InvalidLuauClosureProto {
+        const_index: usize,
+        proto_index: u32,
+        child_count: usize,
+    },
     #[error("invalid opcode {opcode} at raw pc {pc}")]
     InvalidOpcode { pc: usize, opcode: u8 },
     #[error("missing SETLIST extra argument after raw pc {pc}")]

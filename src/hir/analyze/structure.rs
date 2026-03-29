@@ -6,19 +6,20 @@
 mod body;
 mod branch_values;
 mod loops;
+mod overrides;
 mod rewrites;
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::cfg::{BlockRef, PhiCandidate, PhiId};
+use crate::cfg::{BlockRef, PhiId};
 use crate::hir::common::{
     HirBlock, HirExpr, HirGenericFor, HirLValue, HirNumericFor, HirRepeat, HirStmt, HirUnaryExpr,
     HirUnaryOpKind, HirWhile, TempId,
 };
 use crate::structure::{
-    BranchCandidate, BranchKind, BranchValueMergeCandidate, BranchValueMergeValue, GotoReason,
-    LoopCandidate, LoopKindHint, RegionKind, ShortCircuitCandidate, ShortCircuitExit,
-    ShortCircuitNodeRef, ShortCircuitTarget,
+    BranchCandidate, BranchKind, BranchRegionFact, BranchValueMergeArm, BranchValueMergeCandidate,
+    BranchValueMergeValue, GotoReason, LoopCandidate, LoopKindHint, LoopValueArm, LoopValueMerge,
+    ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNodeRef, ShortCircuitTarget,
 };
 use crate::transformer::{InstrRef, LowInstr, Reg};
 
@@ -27,8 +28,8 @@ use super::short_circuit::{
     BranchShortCircuitPlan, ValueMergeExprRecovery, build_branch_short_circuit_plan,
     build_conditional_reassign_plan, consumed_value_merge_subject_instrs,
     lower_materialized_value_leaf_expr, lower_short_circuit_subject,
-    recover_value_phi_expr_recovery_with_allowed_blocks,
-    recover_value_phi_expr_with_allowed_blocks, value_merge_candidate_by_header,
+    recover_short_value_merge_expr_recovery_with_allowed_blocks,
+    recover_short_value_merge_expr_with_allowed_blocks, value_merge_candidate_by_header,
     value_merge_skipped_blocks,
 };
 use super::{ProtoLowering, assign_stmt, branch_stmt, lower_branch_cond};
@@ -37,7 +38,11 @@ use super::{
     lower_phi_materialization_with_allowed_blocks_except, lower_regular_instr,
 };
 use body::*;
-use rewrites::{apply_loop_rewrites, rewrite_expr_temps, rewrite_stmt_exprs, temp_expr_overrides};
+use overrides::StructureOverrideState;
+use rewrites::{
+    apply_loop_rewrites, rewrite_expr_temps, rewrite_stmt_exprs, shared_expr_for_defs,
+    temp_expr_overrides,
+};
 
 /// 尝试基于现有结构候选恢复一个更接近源码的 HIR block。
 pub(super) fn try_build_structured_body(lowering: &ProtoLowering<'_>) -> Option<HirBlock> {

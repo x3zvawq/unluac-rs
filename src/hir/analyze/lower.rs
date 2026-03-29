@@ -18,7 +18,9 @@ use super::helpers::{
     assign_stmt, branch_stmt, build_label_map_for_summary, decode_raw_string, empty_proto,
     goto_block, goto_stmt, label_for_block, return_stmt, unresolved_expr, unstructured_stmt,
 };
-use super::short_circuit::{recover_value_phi_expr, recover_value_phi_expr_with_allowed_blocks};
+use super::short_circuit::{
+    recover_short_value_merge_expr_with_allowed_blocks, value_merge_candidates_in_block,
+};
 use super::structure::try_build_structured_body;
 use crate::cfg::{BlockRef, Cfg, CfgGraph, DataflowFacts, GraphFacts, PhiId};
 use crate::hir::common::{
@@ -26,7 +28,7 @@ use crate::hir::common::{
     HirClosureExpr, HirExpr, HirLValue, HirLabel, HirLabelId, HirProto, HirProtoRef, HirStmt,
     HirTableSetList, HirToBeClosed, HirUnaryExpr, LocalId, ParamId, TempId, UpvalueId,
 };
-use crate::structure::StructureFacts;
+use crate::structure::{ShortCircuitExit, StructureFacts};
 use crate::transformer::{CallKind, InstrRef, LowInstr, LoweredProto, Reg, ResultPack, ValuePack};
 
 pub(super) struct ProtoBindings {
@@ -141,19 +143,6 @@ fn build_proto_body(lowering: &ProtoLowering<'_>) -> HirBlock {
     }
 }
 
-fn unique_reachable_successor(cfg: &Cfg, block: BlockRef) -> Option<BlockRef> {
-    let mut successors = cfg.succs[block.index()]
-        .iter()
-        .map(|edge_ref| cfg.edges[edge_ref.index()].to)
-        .filter(|succ| cfg.reachable_blocks.contains(succ));
-    let succ = successors.next()?;
-    if successors.next().is_none() {
-        Some(succ)
-    } else {
-        None
-    }
-}
-
 fn lower_label_goto_body(lowering: &ProtoLowering<'_>) -> HirBlock {
     let label_map = build_label_map_for_summary(lowering.cfg);
     let reachable_blocks = lowering
@@ -220,7 +209,7 @@ fn lower_linear_edge(
     next_block: Option<BlockRef>,
     label_map: &BTreeMap<BlockRef, HirLabelId>,
 ) -> Vec<HirStmt> {
-    let Some(target) = unique_reachable_successor(lowering.cfg, block) else {
+    let Some(target) = lowering.cfg.unique_reachable_successor(block) else {
         return Vec::new();
     };
     if target == lowering.cfg.exit_block {
@@ -293,12 +282,7 @@ fn lower_edge_phi_copies(
 
     let mut targets = Vec::new();
     let mut values = Vec::new();
-    for phi in lowering
-        .dataflow
-        .phi_candidates
-        .iter()
-        .filter(|phi| phi.block == to)
-    {
+    for phi in lowering.dataflow.phi_candidates_in_block(to) {
         targets.push(HirLValue::Temp(lowering.bindings.phi_temps[phi.id.index()]));
         values.push(expr_for_reg_at_block_exit(lowering, from, phi.reg));
     }
@@ -308,6 +292,18 @@ fn lower_edge_phi_copies(
     } else {
         vec![assign_stmt(targets, values)]
     }
+}
+
+fn generic_phi_materializations_in_block<'a>(
+    lowering: &'a ProtoLowering<'a>,
+    block: BlockRef,
+) -> impl Iterator<Item = crate::structure::GenericPhiMaterialization> + 'a {
+    lowering
+        .structure
+        .generic_phi_materializations
+        .iter()
+        .copied()
+        .filter(move |phi| phi.block == block)
 }
 
 /// 某些结构化路径会先把短路 header 的前缀语句物化出来，再跳到 merge block。
@@ -322,26 +318,61 @@ pub(super) fn lower_phi_materialization_with_allowed_blocks_except(
     suppressed: &BTreeSet<PhiId>,
     allowed_blocks: &BTreeSet<BlockRef>,
 ) -> Vec<HirStmt> {
-    lowering
-        .dataflow
-        .phi_candidates
-        .iter()
-        .filter(|phi| phi.block == block)
-        .filter(|phi| !suppressed.contains(&phi.id))
-        .filter_map(|phi| {
-            let temp = lowering.bindings.phi_temps.get(phi.id.index()).copied()?;
-            let value = recover_value_phi_expr_with_allowed_blocks(lowering, phi, allowed_blocks)
-                .or_else(|| recover_value_phi_expr(lowering, phi))
+    let mut stmts = Vec::new();
+    let mut covered_phi_ids = BTreeSet::new();
+    let mut short_value_merges =
+        value_merge_candidates_in_block(lowering, block).collect::<Vec<_>>();
+    short_value_merges.sort_by_key(|candidate| match candidate.result_phi_id {
+        Some(phi_id) => phi_id,
+        None => unreachable!("value-merge short-circuit should carry a phi id"),
+    });
+
+    for short in short_value_merges {
+        let Some(phi_id) = short.result_phi_id else {
+            unreachable!("value-merge short-circuit should carry a phi id");
+        };
+        if suppressed.contains(&phi_id) {
+            continue;
+        }
+
+        let ShortCircuitExit::ValueMerge(merge) = short.exit else {
+            unreachable!("value merge candidate iterator should only yield value merges");
+        };
+        let Some(reg) = short.result_reg else {
+            unreachable!("value merge short-circuit should carry a result reg");
+        };
+        let Some(temp) = lowering.bindings.phi_temps.get(phi_id.index()).copied() else {
+            unreachable!("every phi id should have a temp binding");
+        };
+        covered_phi_ids.insert(phi_id);
+        let value =
+            recover_short_value_merge_expr_with_allowed_blocks(lowering, short, allowed_blocks)
                 .unwrap_or_else(|| {
-                    unresolved_expr(format!(
-                        "phi block=#{} reg=r{}",
-                        phi.block.index(),
-                        phi.reg.index()
-                    ))
+                    unresolved_expr(format!("phi block=#{} reg=r{}", merge.index(), reg.index()))
                 });
-            Some(assign_stmt(vec![HirLValue::Temp(temp)], vec![value]))
-        })
-        .collect()
+        stmts.push(assign_stmt(vec![HirLValue::Temp(temp)], vec![value]));
+    }
+
+    stmts.extend(
+        generic_phi_materializations_in_block(lowering, block)
+            .filter(|phi| !suppressed.contains(&phi.phi_id))
+            .filter(|phi| !covered_phi_ids.contains(&phi.phi_id))
+            .filter_map(|phi| {
+                let temp = lowering
+                    .bindings
+                    .phi_temps
+                    .get(phi.phi_id.index())
+                    .copied()?;
+                let value = unresolved_expr(format!(
+                    "phi block=#{} reg=r{}",
+                    phi.block.index(),
+                    phi.reg.index()
+                ));
+                Some(assign_stmt(vec![HirLValue::Temp(temp)], vec![value]))
+            }),
+    );
+
+    stmts
 }
 
 pub(super) fn lower_regular_instr(

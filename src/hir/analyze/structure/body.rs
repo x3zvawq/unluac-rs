@@ -6,7 +6,6 @@
 
 mod branches;
 
-use super::rewrites::lvalue_as_expr;
 use super::*;
 
 /// 尝试基于现有结构候选恢复一个更接近源码的 HIR block。
@@ -32,14 +31,11 @@ pub(super) fn build_structured_body(lowering: &ProtoLowering<'_>) -> Option<HirB
 pub(super) struct StructuredBodyLowerer<'a, 'b> {
     pub(super) lowering: &'b ProtoLowering<'a>,
     pub(super) branch_by_header: BTreeMap<BlockRef, &'b BranchCandidate>,
-    pub(super) branch_region_blocks: BTreeMap<BlockRef, BTreeSet<BlockRef>>,
+    pub(super) branch_regions_by_header: BTreeMap<BlockRef, &'b BranchRegionFact>,
     pub(super) branch_value_merges_by_header: BTreeMap<BlockRef, &'b BranchValueMergeCandidate>,
     pub(super) loop_by_header: BTreeMap<BlockRef, &'b LoopCandidate>,
     pub(super) merge_allowed_blocks: BTreeMap<BlockRef, BTreeSet<BlockRef>>,
-    pub(super) entry_overrides: BTreeMap<BlockRef, BTreeMap<Reg, HirExpr>>,
-    pub(super) phi_overrides: BTreeMap<BlockRef, BTreeMap<PhiId, HirExpr>>,
-    pub(super) suppressed_phis: BTreeSet<PhiId>,
-    pub(super) suppressed_instrs: BTreeSet<InstrRef>,
+    pub(super) overrides: StructureOverrideState,
     pub(super) structured_close_points: BTreeSet<InstrRef>,
     pub(super) tbc_scope_regs: BTreeSet<usize>,
     pub(super) visited: BTreeSet<BlockRef>,
@@ -94,12 +90,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .iter()
             .map(|candidate| (candidate.header, candidate))
             .collect();
-        let branch_region_blocks = lowering
+        let branch_regions_by_header = lowering
             .structure
-            .region_facts
+            .branch_region_facts
             .iter()
-            .filter(|fact| fact.kind == RegionKind::BranchRegion)
-            .map(|fact| (fact.entry, fact.blocks.clone()))
+            .map(|fact| (fact.header, fact))
             .collect();
         let loop_by_header = lowering
             .structure
@@ -126,14 +121,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         Self {
             lowering,
             branch_by_header,
-            branch_region_blocks,
+            branch_regions_by_header,
             branch_value_merges_by_header,
             loop_by_header,
             merge_allowed_blocks: BTreeMap::new(),
-            entry_overrides: BTreeMap::new(),
-            phi_overrides: BTreeMap::new(),
-            suppressed_phis: BTreeSet::new(),
-            suppressed_instrs: BTreeSet::new(),
+            overrides: StructureOverrideState::default(),
             structured_close_points,
             tbc_scope_regs,
             visited: BTreeSet::new(),
@@ -294,9 +286,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .get(&block)
             .cloned()
             .unwrap_or_default();
-        let overridden_phis = self.phi_overrides.get(&block).cloned().unwrap_or_default();
-        let mut suppressed = self.suppressed_phis.clone();
-        suppressed.extend(overridden_phis.keys().copied());
+        let overridden_phis = self
+            .overrides
+            .block_phi_exprs(block)
+            .cloned()
+            .unwrap_or_default();
+        let suppressed = self.overrides.suppressed_phis_for_block(block);
         let mut stmts = overridden_phis
             .iter()
             .map(|(phi_id, value)| {
@@ -332,7 +327,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         for instr_index in range.start.index()..end {
             let instr_ref = InstrRef(instr_index);
             let instr = &self.lowering.proto.instrs[instr_index];
-            if self.suppressed_instrs.contains(&instr_ref) {
+            if self.overrides.instr_is_suppressed(instr_ref) {
                 continue;
             }
             // `Close` 只在 low-IR 里显式出现；一旦结构层已经用 `scope_candidates` 证明
@@ -359,36 +354,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     }
 
     fn block_entry_expr_overrides(&self, block: BlockRef) -> BTreeMap<TempId, HirExpr> {
-        let Some(reg_overrides) = self.entry_overrides.get(&block) else {
-            return BTreeMap::new();
-        };
-        let range = self.lowering.cfg.blocks[block.index()].instrs;
-        if range.is_empty() {
-            return BTreeMap::new();
-        }
-
-        let reaching = &self.lowering.dataflow.reaching_values[range.start.index()].fixed;
-        reg_overrides
-            .iter()
-            .filter(|(reg, _)| !self.block_redefines_reg(block, **reg))
-            .filter_map(|(reg, expr)| {
-                let values = reaching.get(reg)?;
-                if values.len() != 1 {
-                    return None;
-                }
-                let source_temp = match values
-                    .iter()
-                    .next()
-                    .expect("len checked above, exactly one reaching value exists")
-                {
-                    crate::cfg::SsaValue::Def(def) => {
-                        self.lowering.bindings.fixed_temps[def.index()]
-                    }
-                    crate::cfg::SsaValue::Phi(phi) => self.lowering.bindings.phi_temps[phi.index()],
-                };
-                Some((source_temp, expr.clone()))
-            })
-            .collect()
+        self.overrides
+            .block_entry_temp_exprs(block)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub(super) fn block_redefines_reg(&self, block: BlockRef, reg: Reg) -> bool {
@@ -397,6 +366,84 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             let effect = &self.lowering.dataflow.instr_effects[instr_index];
             effect.fixed_must_defs.contains(&reg) || effect.fixed_may_defs.contains(&reg)
         })
+    }
+
+    pub(super) fn install_entry_override(&mut self, block: BlockRef, reg: Reg, expr: HirExpr) {
+        let source_temp = self.block_entry_source_temp(block, reg);
+        let carries_through_block = !self.block_redefines_reg(block, reg);
+        self.overrides
+            .insert_entry_expr(block, reg, expr, source_temp, carries_through_block);
+    }
+
+    pub(super) fn replace_phi_with_entry_expr(
+        &mut self,
+        block: BlockRef,
+        phi_id: PhiId,
+        reg: Reg,
+        expr: HirExpr,
+    ) {
+        self.overrides.suppress_phi(phi_id);
+        self.install_entry_override(block, reg, expr);
+    }
+
+    pub(super) fn replace_phi_with_entry_expr_if_local_use(
+        &mut self,
+        block: BlockRef,
+        phi_id: PhiId,
+        reg: Reg,
+        expr: HirExpr,
+    ) {
+        if self
+            .lowering
+            .dataflow
+            .phi_used_only_in_block(self.lowering.cfg, phi_id, block)
+        {
+            self.replace_phi_with_entry_expr(block, phi_id, reg, expr);
+        } else {
+            self.overrides.insert_phi_expr(block, phi_id, expr);
+        }
+    }
+
+    pub(super) fn replace_phi_with_target_expr(
+        &mut self,
+        block: BlockRef,
+        phi_id: PhiId,
+        target_temp: TempId,
+        expr: HirExpr,
+    ) {
+        if target_temp == self.lowering.bindings.phi_temps[phi_id.index()] {
+            self.overrides.suppress_phi(phi_id);
+        } else {
+            self.overrides.insert_phi_expr(block, phi_id, expr);
+        }
+    }
+
+    fn block_entry_source_temp(&self, block: BlockRef, reg: Reg) -> Option<TempId> {
+        let range = self.lowering.cfg.blocks[block.index()].instrs;
+        if range.is_empty() || self.block_redefines_reg(block, reg) {
+            return None;
+        }
+
+        let values = self
+            .lowering
+            .dataflow
+            .reaching_values_at(range.start)
+            .fixed
+            .get(reg)?;
+        if values.len() != 1 {
+            return None;
+        }
+
+        Some(
+            match values
+                .iter()
+                .next()
+                .expect("len checked above, exactly one reaching value exists")
+            {
+                crate::cfg::SsaValue::Def(def) => self.lowering.bindings.fixed_temps[def.index()],
+                crate::cfg::SsaValue::Phi(phi) => self.lowering.bindings.phi_temps[phi.index()],
+            },
+        )
     }
 
     fn build_plain_branch_plan(&self, block: BlockRef) -> Option<StructuredBranchPlan> {
@@ -445,7 +492,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return Some(None);
         }
 
-        if stop == Some(falsy) || can_reach(self.lowering.cfg, truthy, falsy) {
+        if stop == Some(falsy) || self.lowering.cfg.can_reach(truthy, falsy) {
             return Some(Some(StructuredBranchPlan {
                 cond,
                 then_entry: truthy,
@@ -455,11 +502,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             }));
         }
 
-        let merge = nearest_common_postdom(
-            &self.lowering.graph_facts.post_dominator_tree.parent,
-            truthy,
-            falsy,
-        )?;
+        let merge = self
+            .lowering
+            .graph_facts
+            .nearest_common_postdom(truthy, falsy)?;
 
         Some(Some(StructuredBranchPlan {
             cond,
@@ -572,18 +618,21 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         else_entry: Option<BlockRef>,
         stop: BlockRef,
     ) -> bool {
-        let Some(region_blocks) = self.branch_region_blocks.get(&block) else {
+        let Some(region) = self.branch_regions_by_header.get(&block).copied() else {
             return false;
         };
-        if !region_blocks.contains(&stop) {
+        if !region.structured_blocks.contains(&stop) {
             return false;
         }
 
-        let mut allowed_blocks = region_blocks.clone();
+        let mut allowed_blocks = region.structured_blocks.clone();
         allowed_blocks.insert(stop);
         let arm_reaches_stop = |entry| {
             entry == stop
-                || can_reach_within_blocks(self.lowering.cfg, entry, stop, &allowed_blocks)
+                || self
+                    .lowering
+                    .cfg
+                    .can_reach_within(entry, stop, &allowed_blocks)
         };
 
         arm_reaches_stop(then_entry) && else_entry.is_some_and(arm_reaches_stop)
@@ -596,27 +645,17 @@ fn supports_structured_goto_requirement(reason: GotoReason) -> bool {
 
 fn shared_target_expr_from_overrides(
     lowering: &ProtoLowering<'_>,
-    phi: &PhiCandidate,
+    short: &ShortCircuitCandidate,
     target_overrides: &BTreeMap<TempId, HirLValue>,
 ) -> Option<HirExpr> {
-    let mut shared_expr = None;
-
-    for incoming in &phi.incoming {
-        for def in &incoming.defs {
-            let temp = *lowering.bindings.fixed_temps.get(def.index())?;
-            let lvalue = target_overrides.get(&temp)?;
-            let expr = lvalue_as_expr(lvalue)?;
-            if shared_expr
-                .as_ref()
-                .is_some_and(|known_expr: &HirExpr| *known_expr != expr)
-            {
-                return None;
-            }
-            shared_expr = Some(expr);
-        }
-    }
-
-    shared_expr
+    shared_expr_for_defs(
+        &lowering.bindings.fixed_temps,
+        short
+            .value_incomings
+            .iter()
+            .flat_map(|incoming| incoming.defs.iter().copied()),
+        target_overrides,
+    )
 }
 
 fn negate_expr(expr: HirExpr) -> HirExpr {
@@ -627,87 +666,4 @@ fn negate_expr(expr: HirExpr) -> HirExpr {
             expr,
         })),
     }
-}
-
-fn can_reach(cfg: &crate::cfg::Cfg, from: BlockRef, to: BlockRef) -> bool {
-    if from == to {
-        return true;
-    }
-
-    let mut visited = BTreeSet::new();
-    let mut worklist = VecDeque::from([from]);
-
-    while let Some(block) = worklist.pop_front() {
-        if !cfg.reachable_blocks.contains(&block) || !visited.insert(block) {
-            continue;
-        }
-
-        for edge_ref in &cfg.succs[block.index()] {
-            let succ = cfg.edges[edge_ref.index()].to;
-            if succ == to {
-                return true;
-            }
-            worklist.push_back(succ);
-        }
-    }
-
-    false
-}
-
-fn can_reach_within_blocks(
-    cfg: &crate::cfg::Cfg,
-    from: BlockRef,
-    to: BlockRef,
-    allowed_blocks: &BTreeSet<BlockRef>,
-) -> bool {
-    if from == to {
-        return true;
-    }
-
-    let mut visited = BTreeSet::new();
-    let mut worklist = VecDeque::from([from]);
-
-    while let Some(block) = worklist.pop_front() {
-        if !cfg.reachable_blocks.contains(&block)
-            || !allowed_blocks.contains(&block)
-            || !visited.insert(block)
-        {
-            continue;
-        }
-
-        for edge_ref in &cfg.succs[block.index()] {
-            let succ = cfg.edges[edge_ref.index()].to;
-            if succ == to {
-                return true;
-            }
-            if allowed_blocks.contains(&succ) {
-                worklist.push_back(succ);
-            }
-        }
-    }
-
-    false
-}
-
-fn nearest_common_postdom(
-    parent: &[Option<BlockRef>],
-    left: BlockRef,
-    right: BlockRef,
-) -> Option<BlockRef> {
-    let mut ancestors = BTreeSet::new();
-    let mut cursor = Some(left);
-    while let Some(block) = cursor {
-        ancestors.insert(block);
-        cursor = parent[block.index()];
-    }
-
-    let mut cursor = Some(right);
-    while let Some(block) = cursor {
-        if ancestors.contains(&block) {
-            return Some(block);
-        }
-        cursor = parent[block.index()];
-    }
-
-    None
 }

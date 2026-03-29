@@ -1,4 +1,15 @@
-//! 把最终仍残留在 AST 里的 temp 物化成 AST 自己的保守局部绑定。
+//! 这个文件负责把最终仍然泄漏到 AST 层的 temp 身份物化成保守 synthetic local。
+//!
+//! 理想情况下，前层应该尽量在 HIR/AST build 阶段就把源码绑定恢复干净；但如果某些
+//! temp 直到 Readability 结束前仍然存在，这里会把它们显式落成 AST 自己的
+//! synthetic local，避免 Generate 再去猜。它不会把 temp 强行美化成本地源码变量，
+//! 只负责把“无法继续隐藏的 temp”稳定表达出来。
+//!
+//! 例子：
+//! - `t0 = f(); return t0` 会物化成一个 synthetic local，再由后续 pass/Generate
+//!   稳定输出，而不是把裸 `t0` 留到最终代码
+//! - 命名 vararg、capture binding、函数名路径里残留的 temp 也会一起收成
+//!   synthetic local 身份
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -9,310 +20,109 @@ use super::super::common::{
     AstNameRef, AstStmt, AstSyntheticLocalId, AstTableField, AstTableKey,
 };
 use super::ReadabilityContext;
+use super::visit::{self, AstVisitor};
+use super::walk::{self, AstRewritePass, BlockKind};
 
 pub(super) fn apply(module: &mut AstModule, _context: ReadabilityContext) -> bool {
-    materialize_function_block(&mut module.body)
+    walk::rewrite_module(module, &mut MaterializeTempsPass)
 }
 
-fn materialize_function_block(block: &mut AstBlock) -> bool {
-    let mut changed = false;
-    for stmt in &mut block.stmts {
-        changed |= materialize_nested_functions_in_stmt(stmt);
-    }
+struct MaterializeTempsPass;
 
-    let temps = collect_function_temps_in_block(block);
-    if temps.is_empty() {
-        return changed;
-    }
+impl AstRewritePass for MaterializeTempsPass {
+    fn rewrite_block(&mut self, block: &mut AstBlock, _kind: BlockKind) -> bool {
+        let temps = collect_function_temps_in_block(block);
+        if temps.is_empty() {
+            return false;
+        }
 
-    let mapping = temps
-        .into_iter()
-        .map(|temp| (temp, AstSyntheticLocalId(temp)))
-        .collect::<BTreeMap<_, _>>();
-    rewrite_function_block(block, &mapping);
-    true
-}
-
-fn materialize_nested_functions_in_stmt(stmt: &mut AstStmt) -> bool {
-    match stmt {
-        AstStmt::LocalDecl(local_decl) => {
-            let mut changed = false;
-            for value in &mut local_decl.values {
-                changed |= materialize_nested_functions_in_expr(value);
-            }
-            changed
-        }
-        AstStmt::GlobalDecl(global_decl) => {
-            let mut changed = false;
-            for value in &mut global_decl.values {
-                changed |= materialize_nested_functions_in_expr(value);
-            }
-            changed
-        }
-        AstStmt::Assign(assign) => {
-            let mut changed = false;
-            for target in &mut assign.targets {
-                changed |= materialize_nested_functions_in_lvalue(target);
-            }
-            for value in &mut assign.values {
-                changed |= materialize_nested_functions_in_expr(value);
-            }
-            changed
-        }
-        AstStmt::CallStmt(call_stmt) => materialize_nested_functions_in_call(&mut call_stmt.call),
-        AstStmt::Return(ret) => {
-            let mut changed = false;
-            for value in &mut ret.values {
-                changed |= materialize_nested_functions_in_expr(value);
-            }
-            changed
-        }
-        AstStmt::If(if_stmt) => {
-            let cond_changed = materialize_nested_functions_in_expr(&mut if_stmt.cond);
-            let then_changed = materialize_function_block(&mut if_stmt.then_block);
-            let else_changed = if_stmt
-                .else_block
-                .as_mut()
-                .is_some_and(materialize_function_block);
-            cond_changed || then_changed || else_changed
-        }
-        AstStmt::While(while_stmt) => {
-            materialize_nested_functions_in_expr(&mut while_stmt.cond)
-                || materialize_function_block(&mut while_stmt.body)
-        }
-        AstStmt::Repeat(repeat_stmt) => {
-            materialize_function_block(&mut repeat_stmt.body)
-                || materialize_nested_functions_in_expr(&mut repeat_stmt.cond)
-        }
-        AstStmt::NumericFor(numeric_for) => {
-            let start_changed = materialize_nested_functions_in_expr(&mut numeric_for.start);
-            let limit_changed = materialize_nested_functions_in_expr(&mut numeric_for.limit);
-            let step_changed = materialize_nested_functions_in_expr(&mut numeric_for.step);
-            let body_changed = materialize_function_block(&mut numeric_for.body);
-            start_changed || limit_changed || step_changed || body_changed
-        }
-        AstStmt::GenericFor(generic_for) => {
-            let mut changed = false;
-            for expr in &mut generic_for.iterator {
-                changed |= materialize_nested_functions_in_expr(expr);
-            }
-            changed || materialize_function_block(&mut generic_for.body)
-        }
-        AstStmt::DoBlock(block) => materialize_function_block(block),
-        AstStmt::FunctionDecl(function_decl) => materialize_function_expr(&mut function_decl.func),
-        AstStmt::LocalFunctionDecl(local_function_decl) => {
-            materialize_function_expr(&mut local_function_decl.func)
-        }
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => false,
-    }
-}
-
-fn materialize_function_expr(function: &mut AstFunctionExpr) -> bool {
-    materialize_function_block(&mut function.body)
-}
-
-fn materialize_nested_functions_in_call(call: &mut AstCallKind) -> bool {
-    match call {
-        AstCallKind::Call(call) => {
-            let callee_changed = materialize_nested_functions_in_expr(&mut call.callee);
-            let arg_changed = call
-                .args
-                .iter_mut()
-                .any(materialize_nested_functions_in_expr);
-            callee_changed || arg_changed
-        }
-        AstCallKind::MethodCall(call) => {
-            let receiver_changed = materialize_nested_functions_in_expr(&mut call.receiver);
-            let arg_changed = call
-                .args
-                .iter_mut()
-                .any(materialize_nested_functions_in_expr);
-            receiver_changed || arg_changed
-        }
-    }
-}
-
-fn materialize_nested_functions_in_lvalue(target: &mut AstLValue) -> bool {
-    match target {
-        AstLValue::Name(_) => false,
-        AstLValue::FieldAccess(access) => materialize_nested_functions_in_expr(&mut access.base),
-        AstLValue::IndexAccess(access) => {
-            let base_changed = materialize_nested_functions_in_expr(&mut access.base);
-            let index_changed = materialize_nested_functions_in_expr(&mut access.index);
-            base_changed || index_changed
-        }
-    }
-}
-
-fn materialize_nested_functions_in_expr(expr: &mut AstExpr) -> bool {
-    match expr {
-        AstExpr::FieldAccess(access) => materialize_nested_functions_in_expr(&mut access.base),
-        AstExpr::IndexAccess(access) => {
-            let base_changed = materialize_nested_functions_in_expr(&mut access.base);
-            let index_changed = materialize_nested_functions_in_expr(&mut access.index);
-            base_changed || index_changed
-        }
-        AstExpr::Unary(unary) => materialize_nested_functions_in_expr(&mut unary.expr),
-        AstExpr::Binary(binary) => {
-            let lhs_changed = materialize_nested_functions_in_expr(&mut binary.lhs);
-            let rhs_changed = materialize_nested_functions_in_expr(&mut binary.rhs);
-            lhs_changed || rhs_changed
-        }
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            let lhs_changed = materialize_nested_functions_in_expr(&mut logical.lhs);
-            let rhs_changed = materialize_nested_functions_in_expr(&mut logical.rhs);
-            lhs_changed || rhs_changed
-        }
-        AstExpr::Call(call) => {
-            let mut changed = materialize_nested_functions_in_expr(&mut call.callee);
-            for arg in &mut call.args {
-                changed |= materialize_nested_functions_in_expr(arg);
-            }
-            changed
-        }
-        AstExpr::MethodCall(call) => {
-            let mut changed = materialize_nested_functions_in_expr(&mut call.receiver);
-            for arg in &mut call.args {
-                changed |= materialize_nested_functions_in_expr(arg);
-            }
-            changed
-        }
-        AstExpr::TableConstructor(table) => {
-            let mut changed = false;
-            for field in &mut table.fields {
-                changed |= match field {
-                    AstTableField::Array(value) => materialize_nested_functions_in_expr(value),
-                    AstTableField::Record(record) => {
-                        let key_changed = match &mut record.key {
-                            AstTableKey::Name(_) => false,
-                            AstTableKey::Expr(expr) => materialize_nested_functions_in_expr(expr),
-                        };
-                        key_changed || materialize_nested_functions_in_expr(&mut record.value)
-                    }
-                };
-            }
-            changed
-        }
-        AstExpr::FunctionExpr(function) => materialize_function_expr(function),
-        AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::Var(_)
-        | AstExpr::VarArg => false,
+        let mapping = temps
+            .into_iter()
+            .map(|temp| (temp, AstSyntheticLocalId(temp)))
+            .collect::<BTreeMap<_, _>>();
+        rewrite_function_block(block, &mapping);
+        true
     }
 }
 
 fn collect_function_temps_in_block(block: &AstBlock) -> BTreeSet<TempId> {
-    let mut temps = BTreeSet::new();
-    for stmt in &block.stmts {
-        collect_function_temps_in_stmt(stmt, &mut temps);
-    }
-    temps
+    let mut collector = FunctionTempCollector::default();
+    visit::visit_block(block, &mut collector);
+    collector.temps
 }
 
-fn collect_function_temps_in_stmt(stmt: &AstStmt, temps: &mut BTreeSet<TempId>) {
-    match stmt {
-        AstStmt::LocalDecl(local_decl) => {
-            for binding in &local_decl.bindings {
-                if let AstBindingRef::Temp(temp) = binding.id {
-                    temps.insert(temp);
+#[derive(Default)]
+struct FunctionTempCollector {
+    temps: BTreeSet<TempId>,
+}
+
+impl AstVisitor for FunctionTempCollector {
+    fn visit_stmt(&mut self, stmt: &AstStmt) {
+        match stmt {
+            AstStmt::LocalDecl(local_decl) => {
+                for binding in &local_decl.bindings {
+                    if let AstBindingRef::Temp(temp) = binding.id {
+                        self.temps.insert(temp);
+                    }
                 }
             }
-            for value in &local_decl.values {
-                collect_function_temps_in_expr(value, temps);
+            AstStmt::FunctionDecl(function_decl) => {
+                collect_function_temps_in_function_name(&function_decl.target, &mut self.temps);
+            }
+            AstStmt::LocalFunctionDecl(local_function_decl) => {
+                if let AstBindingRef::Temp(temp) = local_function_decl.name {
+                    self.temps.insert(temp);
+                }
+            }
+            AstStmt::NumericFor(numeric_for) => {
+                if let AstBindingRef::Temp(temp) = numeric_for.binding {
+                    self.temps.insert(temp);
+                }
+            }
+            AstStmt::GenericFor(generic_for) => {
+                for binding in &generic_for.bindings {
+                    if let AstBindingRef::Temp(temp) = binding {
+                        self.temps.insert(*temp);
+                    }
+                }
+            }
+            AstStmt::GlobalDecl(_)
+            | AstStmt::Assign(_)
+            | AstStmt::CallStmt(_)
+            | AstStmt::Return(_)
+            | AstStmt::If(_)
+            | AstStmt::While(_)
+            | AstStmt::Repeat(_)
+            | AstStmt::DoBlock(_)
+            | AstStmt::Break
+            | AstStmt::Continue
+            | AstStmt::Goto(_)
+            | AstStmt::Label(_) => {}
+        }
+    }
+
+    fn visit_lvalue(&mut self, target: &AstLValue) {
+        if let AstLValue::Name(AstNameRef::Temp(temp)) = target {
+            self.temps.insert(*temp);
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &AstExpr) {
+        if let AstExpr::Var(AstNameRef::Temp(temp)) = expr {
+            self.temps.insert(*temp);
+        }
+    }
+
+    fn visit_function_expr(&mut self, function: &AstFunctionExpr) -> bool {
+        if let Some(AstBindingRef::Temp(temp)) = function.named_vararg {
+            self.temps.insert(temp);
+        }
+        for binding in &function.captured_bindings {
+            if let AstBindingRef::Temp(temp) = binding {
+                self.temps.insert(*temp);
             }
         }
-        AstStmt::GlobalDecl(global_decl) => {
-            for value in &global_decl.values {
-                collect_function_temps_in_expr(value, temps);
-            }
-        }
-        AstStmt::Assign(assign) => {
-            for target in &assign.targets {
-                collect_function_temps_in_lvalue(target, temps);
-            }
-            for value in &assign.values {
-                collect_function_temps_in_expr(value, temps);
-            }
-        }
-        AstStmt::CallStmt(call_stmt) => collect_function_temps_in_call(&call_stmt.call, temps),
-        AstStmt::Return(ret) => {
-            for value in &ret.values {
-                collect_function_temps_in_expr(value, temps);
-            }
-        }
-        AstStmt::If(if_stmt) => {
-            collect_function_temps_in_expr(&if_stmt.cond, temps);
-            collect_function_temps_in_block(&if_stmt.then_block)
-                .into_iter()
-                .for_each(|temp| {
-                    temps.insert(temp);
-                });
-            if let Some(else_block) = &if_stmt.else_block {
-                collect_function_temps_in_block(else_block)
-                    .into_iter()
-                    .for_each(|temp| {
-                        temps.insert(temp);
-                    });
-            }
-        }
-        AstStmt::While(while_stmt) => {
-            collect_function_temps_in_expr(&while_stmt.cond, temps);
-            collect_function_temps_in_block(&while_stmt.body)
-                .into_iter()
-                .for_each(|temp| {
-                    temps.insert(temp);
-                });
-        }
-        AstStmt::Repeat(repeat_stmt) => {
-            collect_function_temps_in_block(&repeat_stmt.body)
-                .into_iter()
-                .for_each(|temp| {
-                    temps.insert(temp);
-                });
-            collect_function_temps_in_expr(&repeat_stmt.cond, temps);
-        }
-        AstStmt::NumericFor(numeric_for) => {
-            collect_function_temps_in_expr(&numeric_for.start, temps);
-            collect_function_temps_in_expr(&numeric_for.limit, temps);
-            collect_function_temps_in_expr(&numeric_for.step, temps);
-            collect_function_temps_in_block(&numeric_for.body)
-                .into_iter()
-                .for_each(|temp| {
-                    temps.insert(temp);
-                });
-        }
-        AstStmt::GenericFor(generic_for) => {
-            for expr in &generic_for.iterator {
-                collect_function_temps_in_expr(expr, temps);
-            }
-            collect_function_temps_in_block(&generic_for.body)
-                .into_iter()
-                .for_each(|temp| {
-                    temps.insert(temp);
-                });
-        }
-        AstStmt::DoBlock(block) => {
-            collect_function_temps_in_block(block)
-                .into_iter()
-                .for_each(|temp| {
-                    temps.insert(temp);
-                });
-        }
-        AstStmt::FunctionDecl(function_decl) => {
-            collect_function_temps_in_function_name(&function_decl.target, temps)
-        }
-        AstStmt::LocalFunctionDecl(local_function_decl) => {
-            if let AstBindingRef::Temp(temp) = local_function_decl.name {
-                temps.insert(temp);
-            }
-        }
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => {}
+        false
     }
 }
 
@@ -326,95 +136,6 @@ fn collect_function_temps_in_function_name(
     };
     if let AstNameRef::Temp(temp) = path.root {
         temps.insert(temp);
-    }
-}
-
-fn collect_function_temps_in_call(call: &AstCallKind, temps: &mut BTreeSet<TempId>) {
-    match call {
-        AstCallKind::Call(call) => {
-            collect_function_temps_in_expr(&call.callee, temps);
-            for arg in &call.args {
-                collect_function_temps_in_expr(arg, temps);
-            }
-        }
-        AstCallKind::MethodCall(call) => {
-            collect_function_temps_in_expr(&call.receiver, temps);
-            for arg in &call.args {
-                collect_function_temps_in_expr(arg, temps);
-            }
-        }
-    }
-}
-
-fn collect_function_temps_in_lvalue(target: &AstLValue, temps: &mut BTreeSet<TempId>) {
-    match target {
-        AstLValue::Name(AstNameRef::Temp(temp)) => {
-            temps.insert(*temp);
-        }
-        AstLValue::Name(_) => {}
-        AstLValue::FieldAccess(access) => collect_function_temps_in_expr(&access.base, temps),
-        AstLValue::IndexAccess(access) => {
-            collect_function_temps_in_expr(&access.base, temps);
-            collect_function_temps_in_expr(&access.index, temps);
-        }
-    }
-}
-
-fn collect_function_temps_in_expr(expr: &AstExpr, temps: &mut BTreeSet<TempId>) {
-    match expr {
-        AstExpr::Var(AstNameRef::Temp(temp)) => {
-            temps.insert(*temp);
-        }
-        AstExpr::FieldAccess(access) => collect_function_temps_in_expr(&access.base, temps),
-        AstExpr::IndexAccess(access) => {
-            collect_function_temps_in_expr(&access.base, temps);
-            collect_function_temps_in_expr(&access.index, temps);
-        }
-        AstExpr::Unary(unary) => collect_function_temps_in_expr(&unary.expr, temps),
-        AstExpr::Binary(binary) => {
-            collect_function_temps_in_expr(&binary.lhs, temps);
-            collect_function_temps_in_expr(&binary.rhs, temps);
-        }
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            collect_function_temps_in_expr(&logical.lhs, temps);
-            collect_function_temps_in_expr(&logical.rhs, temps);
-        }
-        AstExpr::Call(call) => {
-            collect_function_temps_in_expr(&call.callee, temps);
-            for arg in &call.args {
-                collect_function_temps_in_expr(arg, temps);
-            }
-        }
-        AstExpr::MethodCall(call) => {
-            collect_function_temps_in_expr(&call.receiver, temps);
-            for arg in &call.args {
-                collect_function_temps_in_expr(arg, temps);
-            }
-        }
-        AstExpr::TableConstructor(table) => {
-            for field in &table.fields {
-                match field {
-                    AstTableField::Array(value) => collect_function_temps_in_expr(value, temps),
-                    AstTableField::Record(record) => {
-                        if let AstTableKey::Expr(key) = &record.key {
-                            collect_function_temps_in_expr(key, temps);
-                        }
-                        collect_function_temps_in_expr(&record.value, temps);
-                    }
-                }
-            }
-        }
-        AstExpr::FunctionExpr(_) => {}
-        AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::Var(_)
-        | AstExpr::VarArg => {}
     }
 }
 
@@ -570,6 +291,7 @@ fn rewrite_function_expr(expr: &mut AstExpr, mapping: &BTreeMap<TempId, AstSynth
                 rewrite_function_expr(arg, mapping);
             }
         }
+        AstExpr::SingleValue(expr) => rewrite_function_expr(expr, mapping),
         AstExpr::TableConstructor(table) => {
             for field in &mut table.fields {
                 match field {

@@ -4,6 +4,16 @@
 //! 但经过 close-scope 物化、branch/loop 恢复之后，入口块和大量中间 pad 的 label 往往
 //! 已经不再被任何 `goto` 命中。它们继续留在 HIR 里不仅会让源码多出 `::L0::` 这类
 //! 噪音，还会挡住后续 locals pass 对顶层 temp 的提升。
+//!
+//! 它依赖更前面的 HIR 结构恢复和 scope/loop pass 已经稳定了真正需要保留的 goto，
+//! 这里只做“没有任何引用”的 label 清扫，不重新判断控制流是否可结构化，也不会替
+//! 前层兜底重写 jump 目标。
+//!
+//! 例子：
+//! - `::L1::` 如果已经没有任何 `goto L1`，这里会把它删掉
+//! - fallback body 里为了每个 block 都预发的 label，经过 branch/loop 吸收后只要
+//!   失去引用，就会在这里统一清理
+//! - 它不会删除仍被 `goto` 命中的 label，也不会主动合并 block 或改写 goto 结构
 
 use std::collections::BTreeSet;
 

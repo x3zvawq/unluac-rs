@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::cfg::DefId;
 use crate::hir::common::{HirExpr, HirLValue, HirStmt, TempId};
 
 pub(super) fn apply_loop_rewrites(
@@ -43,6 +44,32 @@ pub(super) fn lvalue_as_expr(lvalue: &HirLValue) -> Option<HirExpr> {
         HirLValue::Global(global) => Some(HirExpr::GlobalRef(global.clone())),
         HirLValue::TableAccess(_) => None,
     }
+}
+
+pub(super) fn shared_expr_for_defs<I>(
+    fixed_temps: &[TempId],
+    defs: I,
+    target_overrides: &BTreeMap<TempId, HirLValue>,
+) -> Option<HirExpr>
+where
+    I: IntoIterator<Item = DefId>,
+{
+    let mut shared_expr = None;
+
+    for def in defs {
+        let temp = *fixed_temps.get(def.index())?;
+        let lvalue = target_overrides.get(&temp)?;
+        let expr = lvalue_as_expr(lvalue)?;
+        if shared_expr
+            .as_ref()
+            .is_some_and(|known_expr: &HirExpr| *known_expr != expr)
+        {
+            return None;
+        }
+        shared_expr = Some(expr);
+    }
+
+    shared_expr
 }
 
 pub(super) fn rewrite_stmt_targets(

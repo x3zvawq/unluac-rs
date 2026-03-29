@@ -1,22 +1,39 @@
-//! 结构安全的 AST cleanup。
+//! 这个文件负责清理已经没有源码意义的机械 AST 壳。
+//!
+//! 它依赖前面的结构恢复和 readability pass 已经把真正需要保留的局部作用域、
+//! 控制流和显式 return 暴露出来；这里专门删除“只剩形式意义”的 do-end、空 local、
+//! 以及 chunk/function 结尾的无值 return。它不会越权合并业务语句，也不会把仍有
+//! 词法意义的块错误拍平。
+//!
+//! 例子：
+//! - `do print(x) end` 会在内部没有局部作用域意义时折成 `print(x)`
+//! - `local t0` 这种只剩机械 temp 壳、且没有值也没有使用的声明会被删除
+//! - 函数尾部的 `return` 会在没有返回值时被去掉
 
 use std::collections::BTreeMap;
 
-use super::super::common::{
-    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstModule, AstStmt,
-};
+use super::super::common::{AstBindingRef, AstBlock, AstModule, AstStmt};
 use super::ReadabilityContext;
 use super::binding_flow::count_binding_mentions_in_block;
+use super::walk::{self, AstRewritePass, BlockKind};
 
 pub(super) fn apply(module: &mut AstModule, _context: ReadabilityContext) -> bool {
-    cleanup_block(&mut module.body, true)
+    walk::rewrite_module(module, &mut CleanupPass)
+}
+
+struct CleanupPass;
+
+impl AstRewritePass for CleanupPass {
+    fn rewrite_block(&mut self, block: &mut AstBlock, kind: BlockKind) -> bool {
+        cleanup_block(
+            block,
+            matches!(kind, BlockKind::ModuleBody | BlockKind::FunctionBody),
+        )
+    }
 }
 
 fn cleanup_block(block: &mut AstBlock, allow_trailing_empty_return_elision: bool) -> bool {
     let mut changed = false;
-    for stmt in &mut block.stmts {
-        changed |= cleanup_stmt(stmt);
-    }
 
     let old_stmts = std::mem::take(&mut block.stmts);
     let mut flattened_stmts = Vec::with_capacity(old_stmts.len());
@@ -116,172 +133,6 @@ fn collect_mechanical_binding_uses(block: &AstBlock) -> BTreeMap<AstBindingRef, 
         }
     }
     uses
-}
-
-fn cleanup_stmt(stmt: &mut AstStmt) -> bool {
-    match stmt {
-        AstStmt::If(if_stmt) => {
-            let mut changed = cleanup_block(&mut if_stmt.then_block, false);
-            if let Some(else_block) = &mut if_stmt.else_block {
-                changed |= cleanup_block(else_block, false);
-            }
-            cleanup_function_exprs_in_expr(&mut if_stmt.cond) || changed
-        }
-        AstStmt::While(while_stmt) => {
-            cleanup_function_exprs_in_expr(&mut while_stmt.cond)
-                | cleanup_block(&mut while_stmt.body, false)
-        }
-        AstStmt::Repeat(repeat_stmt) => {
-            cleanup_block(&mut repeat_stmt.body, false)
-                | cleanup_function_exprs_in_expr(&mut repeat_stmt.cond)
-        }
-        AstStmt::NumericFor(numeric_for) => {
-            let mut changed = cleanup_function_exprs_in_expr(&mut numeric_for.start);
-            changed |= cleanup_function_exprs_in_expr(&mut numeric_for.limit);
-            changed |= cleanup_function_exprs_in_expr(&mut numeric_for.step);
-            changed | cleanup_block(&mut numeric_for.body, false)
-        }
-        AstStmt::GenericFor(generic_for) => {
-            let mut changed = false;
-            for expr in &mut generic_for.iterator {
-                changed |= cleanup_function_exprs_in_expr(expr);
-            }
-            changed | cleanup_block(&mut generic_for.body, false)
-        }
-        AstStmt::DoBlock(block) => cleanup_block(block, false),
-        AstStmt::FunctionDecl(function_decl) => cleanup_function_expr(&mut function_decl.func),
-        AstStmt::LocalFunctionDecl(local_function_decl) => {
-            cleanup_function_expr(&mut local_function_decl.func)
-        }
-        AstStmt::LocalDecl(local_decl) => {
-            let mut changed = false;
-            for value in &mut local_decl.values {
-                changed |= cleanup_function_exprs_in_expr(value);
-            }
-            changed
-        }
-        AstStmt::GlobalDecl(global_decl) => {
-            let mut changed = false;
-            for value in &mut global_decl.values {
-                changed |= cleanup_function_exprs_in_expr(value);
-            }
-            changed
-        }
-        AstStmt::Assign(assign) => {
-            let mut changed = false;
-            for target in &mut assign.targets {
-                changed |= cleanup_function_exprs_in_lvalue(target);
-            }
-            for value in &mut assign.values {
-                changed |= cleanup_function_exprs_in_expr(value);
-            }
-            changed
-        }
-        AstStmt::CallStmt(call_stmt) => cleanup_function_exprs_in_call(&mut call_stmt.call),
-        AstStmt::Return(ret) => {
-            let mut changed = false;
-            for value in &mut ret.values {
-                changed |= cleanup_function_exprs_in_expr(value);
-            }
-            changed
-        }
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => false,
-    }
-}
-
-fn cleanup_function_expr(function: &mut AstFunctionExpr) -> bool {
-    cleanup_block(&mut function.body, true)
-}
-
-fn cleanup_function_exprs_in_call(call: &mut AstCallKind) -> bool {
-    match call {
-        AstCallKind::Call(call) => {
-            let mut changed = cleanup_function_exprs_in_expr(&mut call.callee);
-            for arg in &mut call.args {
-                changed |= cleanup_function_exprs_in_expr(arg);
-            }
-            changed
-        }
-        AstCallKind::MethodCall(call) => {
-            let mut changed = cleanup_function_exprs_in_expr(&mut call.receiver);
-            for arg in &mut call.args {
-                changed |= cleanup_function_exprs_in_expr(arg);
-            }
-            changed
-        }
-    }
-}
-
-fn cleanup_function_exprs_in_lvalue(target: &mut AstLValue) -> bool {
-    match target {
-        AstLValue::Name(_) => false,
-        AstLValue::FieldAccess(access) => cleanup_function_exprs_in_expr(&mut access.base),
-        AstLValue::IndexAccess(access) => {
-            cleanup_function_exprs_in_expr(&mut access.base)
-                | cleanup_function_exprs_in_expr(&mut access.index)
-        }
-    }
-}
-
-fn cleanup_function_exprs_in_expr(expr: &mut AstExpr) -> bool {
-    match expr {
-        AstExpr::FieldAccess(access) => cleanup_function_exprs_in_expr(&mut access.base),
-        AstExpr::IndexAccess(access) => {
-            cleanup_function_exprs_in_expr(&mut access.base)
-                | cleanup_function_exprs_in_expr(&mut access.index)
-        }
-        AstExpr::Unary(unary) => cleanup_function_exprs_in_expr(&mut unary.expr),
-        AstExpr::Binary(binary) => {
-            cleanup_function_exprs_in_expr(&mut binary.lhs)
-                | cleanup_function_exprs_in_expr(&mut binary.rhs)
-        }
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            cleanup_function_exprs_in_expr(&mut logical.lhs)
-                | cleanup_function_exprs_in_expr(&mut logical.rhs)
-        }
-        AstExpr::Call(call) => {
-            let mut changed = cleanup_function_exprs_in_expr(&mut call.callee);
-            for arg in &mut call.args {
-                changed |= cleanup_function_exprs_in_expr(arg);
-            }
-            changed
-        }
-        AstExpr::MethodCall(call) => {
-            let mut changed = cleanup_function_exprs_in_expr(&mut call.receiver);
-            for arg in &mut call.args {
-                changed |= cleanup_function_exprs_in_expr(arg);
-            }
-            changed
-        }
-        AstExpr::TableConstructor(table) => {
-            let mut changed = false;
-            for field in &mut table.fields {
-                match field {
-                    super::super::common::AstTableField::Array(value) => {
-                        changed |= cleanup_function_exprs_in_expr(value);
-                    }
-                    super::super::common::AstTableField::Record(record) => {
-                        if let super::super::common::AstTableKey::Expr(key) = &mut record.key {
-                            changed |= cleanup_function_exprs_in_expr(key);
-                        }
-                        changed |= cleanup_function_exprs_in_expr(&mut record.value);
-                    }
-                }
-            }
-            changed
-        }
-        AstExpr::FunctionExpr(function) => cleanup_function_expr(function),
-        AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::Var(_)
-        | AstExpr::VarArg => false,
-    }
 }
 
 #[cfg(test)]

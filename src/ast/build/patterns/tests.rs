@@ -1,7 +1,7 @@
 //! 这个文件承载 `ast::build::patterns` 模块的局部不变量测试。
 //!
-//! 我们在这里直接构造 HIR 片段，验证 AST build 是否把 method-call 相关的机械别名
-//! 收回成更接近源码的 AST 形状。
+//! 我们在这里直接构造 HIR 片段，验证 AST build 只负责“合法 AST 化”，
+//! 不再提前替 Readability 收回 method-call / installer-iife 这类源码 sugar。
 
 use crate::ast::{AstCallKind, AstExpr, AstStmt, AstTargetDialect, lower_ast};
 use crate::hir::{
@@ -11,7 +11,7 @@ use crate::hir::{
 use crate::parser::{ProtoLineRange, ProtoSignature};
 
 #[test]
-fn lower_ast_recovers_method_call_from_field_alias_before_call() {
+fn lower_ast_preserves_method_call_alias_scaffolding_for_readability() {
     let module = HirModule {
         entry: HirProtoRef(0),
         protos: vec![HirProto {
@@ -82,25 +82,36 @@ fn lower_ast_recovers_method_call_from_field_alias_before_call() {
     .expect("ast lowering should succeed");
 
     let [
-        AstStmt::LocalDecl(alias),
+        AstStmt::LocalDecl(receiver_alias),
+        AstStmt::LocalDecl(field_alias),
         AstStmt::LocalDecl(method_result),
         AstStmt::CallStmt(call_stmt),
         AstStmt::Return(_),
     ] = ast.body.stmts.as_slice()
     else {
-        panic!("expected alias + method-result + method-call + return layout");
+        panic!(
+            "expected receiver alias + field alias + call carrier + method-call + return layout"
+        );
     };
 
     assert!(matches!(
-        alias.values.as_slice(),
+        receiver_alias.values.as_slice(),
         [AstExpr::Var(crate::ast::AstNameRef::Param(ParamId(0)))]
     ));
     assert!(matches!(
+        field_alias.values.as_slice(),
+        [AstExpr::FieldAccess(access)]
+            if matches!(access.base, AstExpr::Var(crate::ast::AstNameRef::Param(ParamId(0))))
+                && access.field == "method1"
+    ));
+    assert!(matches!(
         method_result.values.as_slice(),
-        [AstExpr::MethodCall(call)]
-            if matches!(call.receiver, AstExpr::Var(crate::ast::AstNameRef::Param(ParamId(0))))
-                && call.method == "method1"
-                && call.args.is_empty()
+        [AstExpr::Call(call)]
+            if matches!(&call.callee, AstExpr::Var(crate::ast::AstNameRef::Local(LocalId(1))))
+                && matches!(
+                    call.args.as_slice(),
+                    [AstExpr::Var(crate::ast::AstNameRef::Local(LocalId(0)))]
+                )
     ));
     assert!(matches!(
         &call_stmt.call,
@@ -192,7 +203,7 @@ fn lower_ast_forwards_multiret_call_carrier_into_final_call_arg() {
 }
 
 #[test]
-fn lower_ast_names_installer_iife_before_calling_it() {
+fn lower_ast_preserves_installer_iife_scaffolding_for_readability() {
     let module = HirModule {
         entry: HirProtoRef(0),
         protos: vec![
@@ -302,31 +313,21 @@ fn lower_ast_names_installer_iife_before_calling_it() {
         &module,
         AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
     )
-    .expect("ast lowering should name installer iife");
+    .expect("ast lowering should preserve installer iife for readability");
 
-    let [AstStmt::LocalDecl(local_decl), AstStmt::CallStmt(call_stmt)] = ast.body.stmts.as_slice()
-    else {
-        panic!("expected local installer decl followed by direct call");
+    let [AstStmt::CallStmt(call_stmt)] = ast.body.stmts.as_slice() else {
+        panic!("expected direct iife call to stay in ast build output");
     };
-    assert_eq!(local_decl.bindings.len(), 1);
-    assert!(matches!(
-        local_decl.values.as_slice(),
-        [AstExpr::FunctionExpr(_)]
-    ));
-    let binding = local_decl.bindings[0].id;
-    assert!(matches!(binding, crate::ast::AstBindingRef::Temp(_)));
     assert!(matches!(
         &call_stmt.call,
         AstCallKind::Call(call)
-            if matches!(&call.callee, AstExpr::Var(name) if match (name, binding) {
-                (crate::ast::AstNameRef::Temp(temp), crate::ast::AstBindingRef::Temp(binding_temp)) => *temp == binding_temp,
-                _ => false,
-            }) && matches!(call.args.as_slice(), [AstExpr::String(tag)] if tag == "ax")
+            if matches!(&call.callee, AstExpr::FunctionExpr(_))
+                && matches!(call.args.as_slice(), [AstExpr::String(tag)] if tag == "ax")
     ));
 }
 
 #[test]
-fn lower_ast_materializes_single_value_final_call_arg_into_local() {
+fn lower_ast_marks_single_value_final_call_arg_explicitly() {
     let module = HirModule {
         entry: HirProtoRef(0),
         protos: vec![HirProto {
@@ -378,19 +379,11 @@ fn lower_ast_materializes_single_value_final_call_arg_into_local() {
         &module,
         AstTargetDialect::new(crate::ast::AstDialectVersion::Luau),
     )
-    .expect("ast lowering should materialize final single-value call args");
+    .expect("ast lowering should preserve final single-value call args");
 
-    let [AstStmt::LocalDecl(local_decl), AstStmt::CallStmt(call_stmt)] = ast.body.stmts.as_slice()
-    else {
-        panic!("expected barrier local decl before call stmt");
+    let [AstStmt::CallStmt(call_stmt)] = ast.body.stmts.as_slice() else {
+        panic!("expected direct call statement with explicit single-value final arg");
     };
-    let binding = local_decl.bindings[0].id;
-    assert!(matches!(
-        local_decl.values.as_slice(),
-        [AstExpr::Call(inner_call)]
-            if matches!(&inner_call.callee, AstExpr::Var(crate::ast::AstNameRef::Global(global)) if global.text == "values")
-                && inner_call.args.is_empty()
-    ));
     assert!(matches!(
         &call_stmt.call,
         AstCallKind::Call(call)
@@ -398,10 +391,13 @@ fn lower_ast_materializes_single_value_final_call_arg_into_local() {
                 && matches!(call.args.as_slice(),
                     [
                         AstExpr::String(tag),
-                        AstExpr::Var(name)
-                    ] if tag == "assign-rot" && match (name, binding) {
-                        (crate::ast::AstNameRef::Temp(temp), crate::ast::AstBindingRef::Temp(binding_temp)) => *temp == binding_temp,
-                        _ => false,
-                    })
+                        AstExpr::SingleValue(inner)
+                    ] if tag == "assign-rot"
+                        && matches!(
+                            inner.as_ref(),
+                            AstExpr::Call(inner_call)
+                                if matches!(&inner_call.callee, AstExpr::Var(crate::ast::AstNameRef::Global(global)) if global.text == "values")
+                                    && inner_call.args.is_empty()
+                        ))
     ));
 }

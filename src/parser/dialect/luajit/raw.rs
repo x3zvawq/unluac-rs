@@ -1,35 +1,7 @@
 //! 这个文件定义 LuaJIT 专属的 raw 类型。
 
+use crate::parser::dialect::opcodes::define_opcode_kind_table;
 use crate::parser::{RawLiteralConst, RawString};
-
-macro_rules! define_luajit_opcodes {
-    ($(($name:ident, $kind:ident)),+ $(,)?) => {
-        #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-        #[repr(u8)]
-        pub enum LuaJitOpcode {
-            $( $name, )+
-        }
-
-        impl LuaJitOpcode {
-            pub const fn operand_kind(self) -> LuaJitOperandKind {
-                match self {
-                    $( Self::$name => LuaJitOperandKind::$kind, )+
-                }
-            }
-        }
-
-        impl TryFrom<u8> for LuaJitOpcode {
-            type Error = u8;
-
-            fn try_from(value: u8) -> Result<Self, Self::Error> {
-                match value {
-                    $( x if x == LuaJitOpcode::$name as u8 => Ok(LuaJitOpcode::$name), )+
-                    _ => Err(value),
-                }
-            }
-        }
-    };
-}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum LuaJitOperandKind {
@@ -38,105 +10,123 @@ pub enum LuaJitOperandKind {
     ABC,
 }
 
-define_luajit_opcodes!(
-    (IsLt, ABC),
-    (IsGe, ABC),
-    (IsLe, ABC),
-    (IsGt, ABC),
-    (IsEqV, ABC),
-    (IsNeV, ABC),
-    (IsEqS, ABC),
-    (IsNeS, ABC),
-    (IsEqN, ABC),
-    (IsNeN, ABC),
-    (IsEqP, ABC),
-    (IsNeP, ABC),
-    (IsTC, AD),
-    (IsFC, AD),
-    (IsT, AD),
-    (IsF, AD),
-    (IsType, AD),
-    (IsNum, AD),
-    (Mov, AD),
-    (Not, AD),
-    (Unm, AD),
-    (Len, AD),
-    (AddVN, ABC),
-    (SubVN, ABC),
-    (MulVN, ABC),
-    (DivVN, ABC),
-    (ModVN, ABC),
-    (AddNV, ABC),
-    (SubNV, ABC),
-    (MulNV, ABC),
-    (DivNV, ABC),
-    (ModNV, ABC),
-    (AddVV, ABC),
-    (SubVV, ABC),
-    (MulVV, ABC),
-    (DivVV, ABC),
-    (ModVV, ABC),
-    (Pow, ABC),
-    (Cat, ABC),
-    (KStr, AD),
-    (KCData, AD),
-    (KShort, AD),
-    (KNum, AD),
-    (KPri, AD),
-    (KNil, AD),
-    (UGet, AD),
-    (USetV, AD),
-    (USetS, AD),
-    (USetN, AD),
-    (USetP, AD),
-    (UClose, AD),
-    (FNew, AD),
-    (TNew, AD),
-    (TDup, AD),
-    (GGet, AD),
-    (GSet, AD),
-    (TGetV, ABC),
-    (TGetS, ABC),
-    (TGetB, ABC),
-    (TGetR, ABC),
-    (TSetV, ABC),
-    (TSetS, ABC),
-    (TSetB, ABC),
-    (TSetM, AD),
-    (TSetR, ABC),
-    (CallM, ABC),
-    (Call, ABC),
-    (CallMT, AD),
-    (CallT, AD),
-    (IterC, ABC),
-    (IterN, ABC),
-    (VArg, ABC),
-    (IsNext, AD),
-    (RetM, AD),
-    (Ret, AD),
-    (Ret0, AD),
-    (Ret1, AD),
-    (ForI, AD),
-    (JForI, AD),
-    (ForL, AD),
-    (IForL, AD),
-    (JForL, AD),
-    (IterL, AD),
-    (IIterL, AD),
-    (JIterL, AD),
-    (Loop, AD),
-    (ILoop, AD),
-    (JLoop, AD),
-    (Jmp, AD),
-    (FuncF, A),
-    (IFuncF, A),
-    (JFuncF, AD),
-    (FuncV, A),
-    (IFuncV, A),
-    (JFuncV, AD),
-    (FuncC, A),
-    (FuncCW, A),
+define_opcode_kind_table!(
+    opcode: LuaJitOpcode,
+    operand_kind: LuaJitOperandKind,
+    [
+        (IsLt, "ISLT", ABC),
+        (IsGe, "ISGE", ABC),
+        (IsLe, "ISLE", ABC),
+        (IsGt, "ISGT", ABC),
+        (IsEqV, "ISEQV", ABC),
+        (IsNeV, "ISNEV", ABC),
+        (IsEqS, "ISEQS", ABC),
+        (IsNeS, "ISNES", ABC),
+        (IsEqN, "ISEQN", ABC),
+        (IsNeN, "ISNEN", ABC),
+        (IsEqP, "ISEQP", ABC),
+        (IsNeP, "ISNEP", ABC),
+        (IsTC, "ISTC", AD),
+        (IsFC, "ISFC", AD),
+        (IsT, "IST", AD),
+        (IsF, "ISF", AD),
+        (IsType, "ISTYPE", AD),
+        (IsNum, "ISNUM", AD),
+        (Mov, "MOV", AD),
+        (Not, "NOT", AD),
+        (Unm, "UNM", AD),
+        (Len, "LEN", AD),
+        (AddVN, "ADDVN", ABC),
+        (SubVN, "SUBVN", ABC),
+        (MulVN, "MULVN", ABC),
+        (DivVN, "DIVVN", ABC),
+        (ModVN, "MODVN", ABC),
+        (AddNV, "ADDNV", ABC),
+        (SubNV, "SUBNV", ABC),
+        (MulNV, "MULNV", ABC),
+        (DivNV, "DIVNV", ABC),
+        (ModNV, "MODNV", ABC),
+        (AddVV, "ADDVV", ABC),
+        (SubVV, "SUBVV", ABC),
+        (MulVV, "MULVV", ABC),
+        (DivVV, "DIVVV", ABC),
+        (ModVV, "MODVV", ABC),
+        (Pow, "POW", ABC),
+        (Cat, "CAT", ABC),
+        (KStr, "KSTR", AD),
+        (KCData, "KCDATA", AD),
+        (KShort, "KSHORT", AD),
+        (KNum, "KNUM", AD),
+        (KPri, "KPRI", AD),
+        (KNil, "KNIL", AD),
+        (UGet, "UGET", AD),
+        (USetV, "USETV", AD),
+        (USetS, "USETS", AD),
+        (USetN, "USETN", AD),
+        (USetP, "USETP", AD),
+        (UClose, "UCLO", AD),
+        (FNew, "FNEW", AD),
+        (TNew, "TNEW", AD),
+        (TDup, "TDUP", AD),
+        (GGet, "GGET", AD),
+        (GSet, "GSET", AD),
+        (TGetV, "TGETV", ABC),
+        (TGetS, "TGETS", ABC),
+        (TGetB, "TGETB", ABC),
+        (TGetR, "TGETR", ABC),
+        (TSetV, "TSETV", ABC),
+        (TSetS, "TSETS", ABC),
+        (TSetB, "TSETB", ABC),
+        (TSetM, "TSETM", AD),
+        (TSetR, "TSETR", ABC),
+        (CallM, "CALLM", ABC),
+        (Call, "CALL", ABC),
+        (CallMT, "CALLMT", AD),
+        (CallT, "CALLT", AD),
+        (IterC, "ITERC", ABC),
+        (IterN, "ITERN", ABC),
+        (VArg, "VARG", ABC),
+        (IsNext, "ISNEXT", AD),
+        (RetM, "RETM", AD),
+        (Ret, "RET", AD),
+        (Ret0, "RET0", AD),
+        (Ret1, "RET1", AD),
+        (ForI, "FORI", AD),
+        (JForI, "JFORI", AD),
+        (ForL, "FORL", AD),
+        (IForL, "IFORL", AD),
+        (JForL, "JFORL", AD),
+        (IterL, "ITERL", AD),
+        (IIterL, "IITERL", AD),
+        (JIterL, "JITERL", AD),
+        (Loop, "LOOP", AD),
+        (ILoop, "ILOOP", AD),
+        (JLoop, "JLOOP", AD),
+        (Jmp, "JMP", AD),
+        (FuncF, "FUNCF", A),
+        (IFuncF, "IFUNCF", A),
+        (JFuncF, "JFUNCF", AD),
+        (FuncV, "FUNCV", A),
+        (IFuncV, "IFUNCV", A),
+        (JFuncV, "JFUNCV", AD),
+        (FuncC, "FUNCC", A),
+        (FuncCW, "FUNCCW", A),
+    ]
 );
+
+impl LuaJitOpcode {
+    pub(crate) fn decode_operands(self, word: u32) -> LuaJitOperands {
+        let a = ((word >> 8) & 0xff) as u8;
+        let d = ((word >> 16) & 0xffff) as u16;
+        let c = ((word >> 16) & 0xff) as u8;
+        let b = ((word >> 24) & 0xff) as u8;
+        match self.operand_kind() {
+            LuaJitOperandKind::A => LuaJitOperands::A { a },
+            LuaJitOperandKind::AD => LuaJitOperands::AD { a, d },
+            LuaJitOperandKind::ABC => LuaJitOperands::ABC { a, b, c },
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LuaJitOperands {

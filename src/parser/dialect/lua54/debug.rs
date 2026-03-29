@@ -7,16 +7,11 @@ use std::fmt::Write as _;
 
 use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
 use crate::parser::{
-    ChunkHeader, DecodedText, Dialect, DialectConstPoolExtra, DialectDebugExtra,
-    DialectHeaderExtra, DialectInstrExtra, DialectProtoExtra, DialectUpvalueExtra, DialectVersion,
-    Endianness, Origin, RawChunk, RawInstr, RawInstrOpcode, RawInstrOperands, RawLiteralConst,
-    RawProto, RawString,
+    ChunkHeader, DecodedText, Endianness, Origin, RawChunk, RawInstr, RawLiteralConst, RawProto,
+    RawString,
 };
 
-use super::raw::{
-    Lua54ConstPoolExtra, Lua54HeaderExtra, Lua54InstrExtra, Lua54Opcode, Lua54Operands,
-    Lua54ProtoExtra,
-};
+use super::raw::{Lua54DebugExtra, Lua54InstrExtra, Lua54Opcode, Lua54Operands, Lua54UpvalueExtra};
 
 #[derive(Debug, Clone, Copy)]
 struct ProtoEntry<'a> {
@@ -39,8 +34,7 @@ pub(crate) fn dump_chunk(
     let _ = writeln!(output, "===== Dump Parser =====");
     let _ = writeln!(
         output,
-        "parser dialect={} detail={} protos={}",
-        chunk.header.version_label(),
+        "parser dialect=lua5.4 detail={} protos={}",
         detail,
         protos.len()
     );
@@ -101,10 +95,14 @@ fn write_header_view(output: &mut String, header: &ChunkHeader) {
         .puc_lua_layout()
         .expect("lua54 debug should only receive puc-lua chunk layouts");
     let _ = writeln!(output, "header");
-    let _ = writeln!(output, "  dialect: {}", header.dialect_label());
-    let _ = writeln!(output, "  version: {}", header.version_label());
+    let _ = writeln!(output, "  dialect: puc-lua");
+    let _ = writeln!(output, "  version: lua5.4");
     let _ = writeln!(output, "  format: {}", layout.format);
-    let _ = writeln!(output, "  endianness: {}", header.endianness_label());
+    let _ = writeln!(
+        output,
+        "  endianness: {}",
+        format_endianness(layout.endianness)
+    );
     let _ = writeln!(output, "  integer_size: {}", layout.integer_size);
     if let Some(lua_integer_size) = layout.lua_integer_size {
         let _ = writeln!(output, "  lua_integer_size: {lua_integer_size}");
@@ -114,18 +112,6 @@ fn write_header_view(output: &mut String, header: &ChunkHeader) {
     let _ = writeln!(output, "  number_size: {}", layout.number_size);
     let _ = writeln!(output, "  integral_number: {}", layout.integral_number);
     let _ = writeln!(output, "  origin: {}", format_origin(header.origin));
-
-    match &header.extra {
-        DialectHeaderExtra::Lua54(extra) => {
-            let Lua54HeaderExtra = extra;
-        }
-        DialectHeaderExtra::Lua51(_)
-        | DialectHeaderExtra::Lua52(_)
-        | DialectHeaderExtra::Lua53(_) => {
-            unreachable!("lua54 debug should not receive non-lua54 header extras")
-        }
-        _ => unreachable!("lua54 debug should not receive non-lua54 header extras"),
-    }
 }
 
 fn write_proto_tree_view(
@@ -166,15 +152,13 @@ fn write_proto_tree_view(
         );
 
         if matches!(detail, DebugDetail::Verbose) {
-            let DialectDebugExtra::Lua54(debug_extra) = &common.debug_info.extra else {
-                unreachable!("lua54 debug should not receive non-lua54 debug extras");
-            };
+            let debug_extra = lua54_debug_extra(entry.proto);
             let _ = writeln!(
                 output,
                 "{indent}  origin={} vararg={} raw_vararg={} debug_lines={} line_deltas={} abs_lines={} locals={} upvalue_names={} upvalue_descs={}",
                 format_origin(entry.proto.origin),
                 common.signature.is_vararg,
-                entry.proto.raw_vararg_bits(),
+                raw_vararg_bits(entry.proto),
                 common.debug_info.common.line_info.len(),
                 debug_extra.line_deltas.len(),
                 debug_extra.abs_line_info.len(),
@@ -207,18 +191,6 @@ fn write_constants_view(output: &mut String, protos: &[ProtoEntry<'_>], visible_
                 let _ = writeln!(output, "    k{index:<3} {}", format_literal(literal));
             }
         }
-
-        match &entry.proto.common.constants.extra {
-            DialectConstPoolExtra::Lua54(extra) => {
-                let Lua54ConstPoolExtra = extra;
-            }
-            DialectConstPoolExtra::Lua51(_)
-            | DialectConstPoolExtra::Lua52(_)
-            | DialectConstPoolExtra::Lua53(_) => {
-                unreachable!("lua54 debug should not receive non-lua54 const-pool extras")
-            }
-            _ => unreachable!("lua54 debug should not receive non-lua54 const-pool extras"),
-        }
     }
 }
 
@@ -245,12 +217,13 @@ fn write_raw_instructions_view(
             let _ = writeln!(output, "    <empty>");
         } else {
             for instruction in instructions {
+                let (opcode, operands, extra) = decode_lua54(instruction);
                 let _ = writeln!(
                     output,
                     "    pc={:03} opcode={:<10} operands={} origin={}",
-                    instruction.pc(),
-                    instruction.opcode_label(),
-                    instruction.operands_label(),
+                    extra.pc,
+                    opcode.label(),
+                    operands.label(),
                     format_origin(instruction.origin),
                 );
 
@@ -259,8 +232,8 @@ fn write_raw_instructions_view(
                         output,
                         "      raw_word={} word_len={} extra_arg={} line={}",
                         format_optional_raw_word(instruction.origin.raw_word),
-                        instruction.word_len(),
-                        format_optional_u32(instruction.extra_arg()),
+                        extra.word_len,
+                        format_optional_u32(extra.extra_arg),
                         format_optional_line(
                             entry
                                 .proto
@@ -268,7 +241,7 @@ fn write_raw_instructions_view(
                                 .debug_info
                                 .common
                                 .line_info
-                                .get(instruction.pc())
+                                .get(extra.pc as usize,)
                         ),
                     );
                 }
@@ -283,12 +256,8 @@ fn write_raw_instructions_view(
 
 fn write_verbose_debug_info(output: &mut String, proto: &RawProto) {
     let debug_info = &proto.common.debug_info;
-    let DialectDebugExtra::Lua54(debug_extra) = &debug_info.extra else {
-        unreachable!("lua54 debug should not receive non-lua54 debug extras");
-    };
-    let DialectUpvalueExtra::Lua54(upvalue_extra) = &proto.common.upvalues.extra else {
-        unreachable!("lua54 debug should not receive non-lua54 upvalue extras");
-    };
+    let debug_extra = lua54_debug_extra(proto);
+    let upvalue_extra = lua54_upvalue_extra(proto);
 
     let _ = writeln!(output, "    upvalue_descs");
     if proto.common.upvalues.common.descriptors.is_empty() {
@@ -380,223 +349,53 @@ fn format_optional_line(line: Option<&u32>) -> String {
     line.map_or_else(|| "-".to_owned(), |line| line.to_string())
 }
 
-trait HeaderDebugExt {
-    fn dialect_label(&self) -> &'static str;
-    fn version_label(&self) -> &'static str;
-    fn endianness_label(&self) -> &'static str;
-}
-
-impl HeaderDebugExt for ChunkHeader {
-    fn dialect_label(&self) -> &'static str {
-        match self.dialect {
-            Dialect::PucLua => "puc-lua",
-            Dialect::LuaJit => "luajit",
-            Dialect::Luau => "luau",
-        }
-    }
-
-    fn version_label(&self) -> &'static str {
-        match self.version {
-            DialectVersion::Lua51 => "lua5.1",
-            DialectVersion::Lua52 => "lua5.2",
-            DialectVersion::Lua53 => "lua5.3",
-            DialectVersion::Lua54 => "lua5.4",
-            DialectVersion::Lua55 => "lua5.5",
-            DialectVersion::LuaJit => "luajit",
-            DialectVersion::Luau => "luau",
-        }
-    }
-
-    fn endianness_label(&self) -> &'static str {
-        match self
-            .puc_lua_layout()
-            .expect("lua54 debug should only receive puc-lua chunk layouts")
-            .endianness
-        {
-            Endianness::Little => "little",
-            Endianness::Big => "big",
-        }
+fn format_endianness(endianness: Endianness) -> &'static str {
+    match endianness {
+        Endianness::Little => "little",
+        Endianness::Big => "big",
     }
 }
 
-trait RawProtoDebugExt {
-    fn raw_vararg_bits(&self) -> u8;
+fn raw_vararg_bits(proto: &RawProto) -> u8 {
+    proto
+        .extra
+        .lua54()
+        .expect("lua54 debug should only receive lua54 proto extras")
+        .raw_is_vararg
 }
 
-impl RawProtoDebugExt for RawProto {
-    fn raw_vararg_bits(&self) -> u8 {
-        match &self.extra {
-            DialectProtoExtra::Lua54(Lua54ProtoExtra { raw_is_vararg }) => *raw_is_vararg,
-            DialectProtoExtra::Lua51(_)
-            | DialectProtoExtra::Lua52(_)
-            | DialectProtoExtra::Lua53(_) => {
-                unreachable!("lua54 debug should not receive non-lua54 proto extras")
-            }
-            _ => unreachable!("lua54 debug should not receive non-lua54 proto extras"),
-        }
-    }
+fn lua54_debug_extra(proto: &RawProto) -> &Lua54DebugExtra {
+    proto
+        .common
+        .debug_info
+        .extra
+        .lua54()
+        .expect("lua54 debug should only receive lua54 debug extras")
 }
 
-trait RawInstrDebugExt {
-    fn pc(&self) -> usize;
-    fn word_len(&self) -> u8;
-    fn extra_arg(&self) -> Option<u32>;
-    fn opcode_label(&self) -> &'static str;
-    fn operands_label(&self) -> String;
+fn lua54_upvalue_extra(proto: &RawProto) -> &Lua54UpvalueExtra {
+    proto
+        .common
+        .upvalues
+        .extra
+        .lua54()
+        .expect("lua54 debug should only receive lua54 upvalue extras")
 }
 
-impl RawInstrDebugExt for RawInstr {
-    fn pc(&self) -> usize {
-        match &self.extra {
-            DialectInstrExtra::Lua54(Lua54InstrExtra { pc, .. }) => *pc as usize,
-            DialectInstrExtra::Lua51(_)
-            | DialectInstrExtra::Lua52(_)
-            | DialectInstrExtra::Lua53(_) => {
-                unreachable!("lua54 debug should not receive non-lua54 instruction extras")
-            }
-            _ => unreachable!("lua54 debug should not receive non-lua54 instruction extras"),
-        }
-    }
-
-    fn word_len(&self) -> u8 {
-        match &self.extra {
-            DialectInstrExtra::Lua54(Lua54InstrExtra { word_len, .. }) => *word_len,
-            DialectInstrExtra::Lua51(_)
-            | DialectInstrExtra::Lua52(_)
-            | DialectInstrExtra::Lua53(_) => {
-                unreachable!("lua54 debug should not receive non-lua54 instruction extras")
-            }
-            _ => unreachable!("lua54 debug should not receive non-lua54 instruction extras"),
-        }
-    }
-
-    fn extra_arg(&self) -> Option<u32> {
-        match &self.extra {
-            DialectInstrExtra::Lua54(Lua54InstrExtra { extra_arg, .. }) => *extra_arg,
-            DialectInstrExtra::Lua51(_)
-            | DialectInstrExtra::Lua52(_)
-            | DialectInstrExtra::Lua53(_) => {
-                unreachable!("lua54 debug should not receive non-lua54 instruction extras")
-            }
-            _ => unreachable!("lua54 debug should not receive non-lua54 instruction extras"),
-        }
-    }
-
-    fn opcode_label(&self) -> &'static str {
-        match self.opcode {
-            RawInstrOpcode::Lua54(opcode) => opcode.label(),
-            RawInstrOpcode::Lua51(_) | RawInstrOpcode::Lua52(_) | RawInstrOpcode::Lua53(_) => {
-                unreachable!("lua54 debug should not receive non-lua54 opcodes")
-            }
-            _ => unreachable!("lua54 debug should not receive non-lua54 opcodes"),
-        }
-    }
-
-    fn operands_label(&self) -> String {
-        match &self.operands {
-            RawInstrOperands::Lua54(operands) => operands.label(),
-            RawInstrOperands::Lua51(_)
-            | RawInstrOperands::Lua52(_)
-            | RawInstrOperands::Lua53(_) => {
-                unreachable!("lua54 debug should not receive non-lua54 operands")
-            }
-            _ => unreachable!("lua54 debug should not receive non-lua54 operands"),
-        }
-    }
-}
-
-trait Lua54OpcodeDebugExt {
-    fn label(self) -> &'static str;
-}
-
-impl Lua54OpcodeDebugExt for Lua54Opcode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Move => "MOVE",
-            Self::LoadI => "LOADI",
-            Self::LoadF => "LOADF",
-            Self::LoadK => "LOADK",
-            Self::LoadKx => "LOADKX",
-            Self::LoadFalse => "LOADFALSE",
-            Self::LFalseSkip => "LFALSESKIP",
-            Self::LoadTrue => "LOADTRUE",
-            Self::LoadNil => "LOADNIL",
-            Self::GetUpVal => "GETUPVAL",
-            Self::SetUpVal => "SETUPVAL",
-            Self::GetTabUp => "GETTABUP",
-            Self::GetTable => "GETTABLE",
-            Self::GetI => "GETI",
-            Self::GetField => "GETFIELD",
-            Self::SetTabUp => "SETTABUP",
-            Self::SetTable => "SETTABLE",
-            Self::SetI => "SETI",
-            Self::SetField => "SETFIELD",
-            Self::NewTable => "NEWTABLE",
-            Self::Self_ => "SELF",
-            Self::AddI => "ADDI",
-            Self::AddK => "ADDK",
-            Self::SubK => "SUBK",
-            Self::MulK => "MULK",
-            Self::ModK => "MODK",
-            Self::PowK => "POWK",
-            Self::DivK => "DIVK",
-            Self::IdivK => "IDIVK",
-            Self::BandK => "BANDK",
-            Self::BorK => "BORK",
-            Self::BxorK => "BXORK",
-            Self::ShrI => "SHRI",
-            Self::ShlI => "SHLI",
-            Self::Add => "ADD",
-            Self::Sub => "SUB",
-            Self::Mul => "MUL",
-            Self::Mod => "MOD",
-            Self::Pow => "POW",
-            Self::Div => "DIV",
-            Self::Idiv => "IDIV",
-            Self::Band => "BAND",
-            Self::Bor => "BOR",
-            Self::Bxor => "BXOR",
-            Self::Shl => "SHL",
-            Self::Shr => "SHR",
-            Self::MMBin => "MMBIN",
-            Self::MMBinI => "MMBINI",
-            Self::MMBinK => "MMBINK",
-            Self::Unm => "UNM",
-            Self::BNot => "BNOT",
-            Self::Not => "NOT",
-            Self::Len => "LEN",
-            Self::Concat => "CONCAT",
-            Self::Close => "CLOSE",
-            Self::Tbc => "TBC",
-            Self::Jmp => "JMP",
-            Self::Eq => "EQ",
-            Self::Lt => "LT",
-            Self::Le => "LE",
-            Self::EqK => "EQK",
-            Self::EqI => "EQI",
-            Self::LtI => "LTI",
-            Self::LeI => "LEI",
-            Self::GtI => "GTI",
-            Self::GeI => "GEI",
-            Self::Test => "TEST",
-            Self::TestSet => "TESTSET",
-            Self::Call => "CALL",
-            Self::TailCall => "TAILCALL",
-            Self::Return => "RETURN",
-            Self::Return0 => "RETURN0",
-            Self::Return1 => "RETURN1",
-            Self::ForLoop => "FORLOOP",
-            Self::ForPrep => "FORPREP",
-            Self::TForPrep => "TFORPREP",
-            Self::TForCall => "TFORCALL",
-            Self::TForLoop => "TFORLOOP",
-            Self::SetList => "SETLIST",
-            Self::Closure => "CLOSURE",
-            Self::VarArg => "VARARG",
-            Self::VarArgPrep => "VARARGPREP",
-            Self::ExtraArg => "EXTRAARG",
-        }
-    }
+fn decode_lua54(raw: &RawInstr) -> (Lua54Opcode, &Lua54Operands, Lua54InstrExtra) {
+    let opcode = raw
+        .opcode
+        .lua54()
+        .expect("lua54 debug should only receive lua54 opcodes");
+    let operands = raw
+        .operands
+        .lua54()
+        .expect("lua54 debug should only receive lua54 operands");
+    let extra = raw
+        .extra
+        .lua54()
+        .expect("lua54 debug should only receive lua54 instruction extras");
+    (*opcode, operands, *extra)
 }
 
 trait Lua54OperandsDebugExt {

@@ -131,7 +131,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
         self.visited.insert(block);
         self.visited.extend(value_merge_skipped_blocks(short));
-        self.suppressed_phis.insert(plan.phi_id);
+        self.overrides.suppress_phi(plan.phi_id);
 
         stmts.push(assign_stmt(
             vec![HirLValue::Temp(plan.target_temp)],
@@ -165,15 +165,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if Some(merge) == stop {
             return None;
         }
-        let reg = short.result_reg?;
-        let phi = self
-            .lowering
-            .dataflow
-            .phi_candidates
-            .iter()
-            .find(|phi| phi.block == merge && phi.reg == reg)?;
         let allowed_blocks = BTreeSet::from([block]);
-        if recover_value_phi_expr_with_allowed_blocks(self.lowering, phi, &allowed_blocks).is_some()
+        if recover_short_value_merge_expr_with_allowed_blocks(self.lowering, short, &allowed_blocks)
+            .is_some()
         {
             return None;
         }
@@ -185,7 +179,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         }
 
-        let target_temp = *self.lowering.bindings.phi_temps.get(phi.id.index())?;
+        let target_temp = *self
+            .lowering
+            .bindings
+            .phi_temps
+            .get(short.result_phi_id?.index())?;
         let mut short_stmts = self.lower_block_prefix(block, true, target_overrides)?;
         short_stmts.extend(
             self.lower_value_merge_node(short, short.entry, target_temp, true)?
@@ -194,7 +192,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         self.visited.insert(block);
         self.visited.extend(value_merge_skipped_blocks(short));
-        self.suppressed_phis.insert(phi.id);
+        self.overrides.suppress_phi(short.result_phi_id?);
         stmts.extend(short_stmts);
 
         Some(Some(merge))
@@ -214,17 +212,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if Some(merge) == stop {
             return None;
         }
-        let reg = short.result_reg?;
-        let phi = self
-            .lowering
-            .dataflow
-            .phi_candidates
-            .iter()
-            .find(|phi| phi.block == merge && phi.reg == reg)?;
         let allowed_blocks = BTreeSet::from([block]);
-        let recovery = recover_value_phi_expr_recovery_with_allowed_blocks(
+        let recovery = recover_short_value_merge_expr_recovery_with_allowed_blocks(
             self.lowering,
-            phi,
+            short,
             &allowed_blocks,
         )?;
 
@@ -236,8 +227,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         if matches!(recovery, ValueMergeExprRecovery::Impure(_)) {
-            self.suppressed_instrs
-                .extend(consumed_value_merge_subject_instrs(self.lowering, block));
+            self.overrides
+                .suppress_instrs(consumed_value_merge_subject_instrs(self.lowering, block));
         }
         stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
         self.visited.insert(block);
@@ -283,7 +274,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let body_stop = loop_context
             .continue_target
             .filter(|target| {
-                *target != break_exit && can_reach(self.lowering.cfg, candidate.then_entry, *target)
+                *target != break_exit && self.lowering.cfg.can_reach(candidate.then_entry, *target)
             })
             .or(Some(break_exit));
         let then_block = self.lower_region(candidate.then_entry, body_stop, target_overrides)?;
@@ -540,7 +531,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 self.block_terminator(non_continue_entry),
                 Some((_instr_ref, LowInstr::Return(_) | LowInstr::TailCall(_)))
             )
-            && !can_reach(self.lowering.cfg, non_continue_entry, continue_target)
+            && !self
+                .lowering
+                .cfg
+                .can_reach(non_continue_entry, continue_target)
         {
             return true;
         }
@@ -690,27 +684,17 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return;
         }
 
+        let Some(phi_id) = short.result_phi_id else {
+            return;
+        };
         let Some(reg) = short.result_reg else {
             return;
         };
-        let Some(phi) = self
-            .lowering
-            .dataflow
-            .phi_candidates
-            .iter()
-            .find(|phi| phi.block == merge && phi.reg == reg)
-        else {
-            return;
-        };
-        let Some(expr) = shared_target_expr_from_overrides(self.lowering, phi, target_overrides)
+        let Some(expr) = shared_target_expr_from_overrides(self.lowering, short, target_overrides)
         else {
             return;
         };
 
-        self.suppressed_phis.insert(phi.id);
-        self.entry_overrides
-            .entry(merge)
-            .or_default()
-            .insert(reg, expr);
+        self.replace_phi_with_entry_expr(merge, phi_id, reg, expr);
     }
 }

@@ -7,6 +7,7 @@ mod common;
 mod debug;
 mod dialect;
 mod error;
+mod operands;
 
 pub use common::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchInstr, BranchOperands,

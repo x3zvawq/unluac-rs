@@ -77,6 +77,7 @@ pub enum AstExpr {
     LogicalOr(Box<AstLogicalExpr>),
     Call(Box<AstCallExpr>),
     MethodCall(Box<AstMethodCallExpr>),
+    SingleValue(Box<AstExpr>),
     VarArg,
     TableConstructor(Box<AstTableConstructor>),
     FunctionExpr(Box<AstFunctionExpr>),

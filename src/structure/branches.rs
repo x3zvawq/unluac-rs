@@ -1,14 +1,20 @@
 //! 这个文件实现共享分支候选提取。
 //!
-//! 它只回答“这个 block 更像哪种 branch 形态”，不提前做短路、scope 或最终
-//! HIR 结构决策。
+//! 它依赖 CFG/GraphFacts 已经提供好的 branch 边和后支配信息，负责回答
+//! “这个 block 更像哪种 branch 形态”，以及后续多个 pass 共用的 branch-region 事实。
+//! 它不会越权做短路、scope 或最终 HIR 结构决策。
+//!
+//! 例子：
+//! - `if cond then ... end` 会产出 `BranchKind::IfThen`
+//! - `if cond then ... else ... end` 会产出 `BranchKind::IfElse`
+//! - `if not cond then return end; ...` 这种守卫形状会被标成 `BranchKind::Guard`
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 
-use crate::cfg::{BlockRef, Cfg, GraphFacts};
+use crate::cfg::{BlockRef, Cfg, DominatorTree, GraphFacts};
 
-use super::common::{BranchCandidate, BranchKind};
-use super::helpers::{branch_edges, can_reach, dominates, nearest_common_postdom};
+use super::common::{BranchCandidate, BranchKind, BranchRegionFact};
+use super::helpers::{collect_forward_region_blocks, collect_merge_arm_preds};
 
 pub(super) fn analyze_branches(cfg: &Cfg, graph_facts: &GraphFacts) -> Vec<BranchCandidate> {
     let mut branch_candidates = Vec::new();
@@ -19,7 +25,7 @@ pub(super) fn analyze_branches(cfg: &Cfg, graph_facts: &GraphFacts) -> Vec<Branc
             continue;
         }
 
-        let Some((&then_edge_ref, &else_edge_ref)) = branch_edges(cfg, header) else {
+        let Some((then_edge_ref, else_edge_ref)) = cfg.branch_edges(header) else {
             continue;
         };
         let then_entry = cfg.edges[then_edge_ref.index()].to;
@@ -41,35 +47,61 @@ pub(super) fn analyze_branches(cfg: &Cfg, graph_facts: &GraphFacts) -> Vec<Branc
     branch_candidates
 }
 
-pub(super) fn collect_branch_region_blocks(
+pub(super) fn analyze_branch_regions(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    branch_candidates: &[BranchCandidate],
+) -> Vec<BranchRegionFact> {
+    let mut branch_regions = Vec::new();
+
+    for candidate in branch_candidates {
+        let Some(merge) = candidate.merge else {
+            continue;
+        };
+
+        branch_regions.push(BranchRegionFact {
+            header: candidate.header,
+            merge,
+            kind: candidate.kind,
+            flow_blocks: collect_branch_region_blocks(cfg, candidate, merge, None),
+            structured_blocks: collect_branch_region_blocks(
+                cfg,
+                candidate,
+                merge,
+                Some(&graph_facts.dominator_tree),
+            ),
+            then_merge_preds: collect_merge_arm_preds(
+                cfg,
+                &graph_facts.dominator_tree,
+                candidate.then_entry,
+                merge,
+            ),
+            else_merge_preds: candidate
+                .else_entry
+                .map(|else_entry| {
+                    collect_merge_arm_preds(cfg, &graph_facts.dominator_tree, else_entry, merge)
+                })
+                .unwrap_or_default(),
+        });
+    }
+
+    branch_regions.sort_by_key(|fact| (fact.header, fact.merge));
+    branch_regions
+}
+
+fn collect_branch_region_blocks(
     cfg: &Cfg,
     candidate: &BranchCandidate,
     merge: BlockRef,
-    dom_parent: Option<&[Option<BlockRef>]>,
+    dom_tree: Option<&DominatorTree>,
 ) -> BTreeSet<BlockRef> {
     let mut blocks = BTreeSet::from([candidate.header]);
-    let mut worklist = VecDeque::new();
-    worklist.push_back(candidate.then_entry);
-    if let Some(else_entry) = candidate.else_entry {
-        worklist.push_back(else_entry);
-    }
-
-    while let Some(block) = worklist.pop_front() {
-        if block == merge
-            || !cfg.reachable_blocks.contains(&block)
-            || !blocks.insert(block)
-            || dom_parent.is_some_and(|parent| !dominates(parent, candidate.header, block))
-        {
-            continue;
-        }
-
-        for edge_ref in &cfg.succs[block.index()] {
-            let succ = cfg.edges[edge_ref.index()].to;
-            if succ != merge {
-                worklist.push_back(succ);
-            }
-        }
-    }
+    blocks.extend(collect_forward_region_blocks(
+        cfg,
+        std::iter::once(candidate.then_entry).chain(candidate.else_entry),
+        Some(merge),
+        dom_tree.map(|tree| (candidate.header, tree)),
+    ));
 
     blocks
 }
@@ -80,8 +112,8 @@ fn classify_one_arm_branch(
     then_entry: BlockRef,
     else_entry: BlockRef,
 ) -> Option<BranchCandidate> {
-    let then_reaches_else = can_reach(cfg, then_entry, else_entry);
-    let else_reaches_then = can_reach(cfg, else_entry, then_entry);
+    let then_reaches_else = cfg.can_reach(then_entry, else_entry);
+    let else_reaches_then = cfg.can_reach(else_entry, then_entry);
 
     match (then_reaches_else, else_reaches_then) {
         (true, false) => Some(BranchCandidate {
@@ -111,11 +143,7 @@ fn classify_if_else_branch(
     then_entry: BlockRef,
     else_entry: BlockRef,
 ) -> Option<BranchCandidate> {
-    let merge = nearest_common_postdom(
-        &graph_facts.post_dominator_tree.parent,
-        then_entry,
-        else_entry,
-    )?;
+    let merge = graph_facts.nearest_common_postdom(then_entry, else_entry)?;
     if merge == cfg.exit_block {
         return Some(BranchCandidate {
             header,
@@ -165,7 +193,7 @@ fn classify_guard_branch(
     then_entry: BlockRef,
     else_entry: BlockRef,
 ) -> Option<BranchCandidate> {
-    if can_reach(cfg, then_entry, else_entry) || can_reach(cfg, else_entry, then_entry) {
+    if cfg.can_reach(then_entry, else_entry) || cfg.can_reach(else_entry, then_entry) {
         return None;
     }
 

@@ -1,24 +1,30 @@
 //! 这个文件提取普通 branch 的值合流候选。
 //!
-//! `BranchCandidate` 只回答控制骨架，而 merge 点上的 phi 只回答“这里发生了值合流”。
-//! 真正让 HIR 少走弯路的关键信息，是“这批 phi 到底是不是某个结构化 if/else 的两臂
-//! 产物”。这里就专门把这层关系显式化，避免 HIR 再从 branch + phi 里反推一次。
+//! 这个 pass 依赖 CFG / GraphFacts / Dataflow 已经给好的 branch 骨架和 phi 事实，
+//! 负责把“结构臂归属 + HIR 真正要用的 def 身份”一次性前移到 StructureFacts。
+//! 它不会越权做 decision/alias 最终选择，那一步仍留给 HIR。
+//!
+//! 例子：
+//! - `if cond then x = 1 else x = 2 end` 会把 merge phi 记录成
+//!   `then_arm = {preds, defs_of_1}`、`else_arm = {preds, defs_of_2}`
+//! - 这样 HIR 只消费 `then/else` 两臂已经分好的 defs，不再自己回头拆 `phi.incoming`
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 
 use crate::cfg::{BlockRef, Cfg, DataflowFacts, GraphFacts};
 
 use super::common::{
-    BranchCandidate, BranchKind, BranchValueMergeCandidate, BranchValueMergeValue,
-    ShortCircuitCandidate, ShortCircuitExit, ShortCircuitTarget,
+    BranchKind, BranchRegionFact, BranchValueMergeCandidate, ShortCircuitCandidate,
+    ShortCircuitExit,
 };
-use super::helpers::{can_reach, dominates};
+use super::helpers::collect_merge_arm_preds;
+use super::phi_facts::branch_value_merges_in_block;
 
 pub(super) fn analyze_branch_value_merges(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
-    branch_candidates: &[BranchCandidate],
+    branch_regions: &[BranchRegionFact],
     short_circuit_candidates: &[ShortCircuitCandidate],
 ) -> Vec<BranchValueMergeCandidate> {
     let short_circuit_merges = short_circuit_candidates
@@ -33,14 +39,10 @@ pub(super) fn analyze_branch_value_merges(
 
     let mut candidates = Vec::new();
 
-    for branch in branch_candidates {
-        let Some(candidate) = analyze_branch_value_merge_candidate(
-            cfg,
-            graph_facts,
-            dataflow,
-            branch,
-            &short_circuit_merges,
-        ) else {
+    for branch_region in branch_regions {
+        let Some(candidate) =
+            analyze_branch_value_merge_candidate(dataflow, branch_region, &short_circuit_merges)
+        else {
             continue;
         };
         candidates.push(candidate);
@@ -69,49 +71,18 @@ fn analyze_guard_short_circuit_branch_value_merges(
         let ShortCircuitExit::BranchExit { truthy, falsy } = short.exit else {
             continue;
         };
-        if !can_reach(cfg, truthy, falsy) || can_reach(cfg, falsy, truthy) {
+        if !cfg.can_reach(truthy, falsy) || cfg.can_reach(falsy, truthy) {
             continue;
         }
 
-        let then_preds =
-            collect_merge_arm_preds(cfg, &graph_facts.dominator_tree.parent, truthy, falsy);
-        let else_preds = collect_branch_exit_leaf_preds(short, false);
+        let then_preds = collect_merge_arm_preds(cfg, &graph_facts.dominator_tree, truthy, falsy);
+        let else_preds = short.branch_exit_leaf_preds(false);
         if then_preds.is_empty() || else_preds.is_empty() || !then_preds.is_disjoint(&else_preds) {
             continue;
         }
 
-        let mut values = Vec::new();
-        for phi in dataflow
-            .phi_candidates
-            .iter()
-            .filter(|phi| phi.block == falsy)
-        {
-            let mut phi_then_preds = BTreeSet::new();
-            let mut phi_else_preds = BTreeSet::new();
-            let mut valid = true;
-
-            for incoming in &phi.incoming {
-                if then_preds.contains(&incoming.pred) {
-                    phi_then_preds.insert(incoming.pred);
-                } else if else_preds.contains(&incoming.pred) {
-                    phi_else_preds.insert(incoming.pred);
-                } else {
-                    valid = false;
-                    break;
-                }
-            }
-
-            if !valid || phi_then_preds.is_empty() || phi_else_preds.is_empty() {
-                continue;
-            }
-
-            values.push(BranchValueMergeValue {
-                phi_id: phi.id,
-                reg: phi.reg,
-                then_preds: phi_then_preds,
-                else_preds: phi_else_preds,
-            });
-        }
+        let values =
+            branch_value_merges_in_block(short.header, dataflow, falsy, &then_preds, &else_preds);
 
         if !values.is_empty() {
             candidates.push(BranchValueMergeCandidate {
@@ -126,122 +97,35 @@ fn analyze_guard_short_circuit_branch_value_merges(
 }
 
 fn analyze_branch_value_merge_candidate(
-    cfg: &Cfg,
-    graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
-    branch: &BranchCandidate,
+    branch_region: &BranchRegionFact,
     short_circuit_merges: &BTreeSet<(BlockRef, BlockRef, Option<crate::transformer::Reg>)>,
 ) -> Option<BranchValueMergeCandidate> {
-    if branch.kind != BranchKind::IfElse {
+    if branch_region.kind != BranchKind::IfElse {
         return None;
     }
 
-    let merge = branch.merge?;
-    let else_entry = branch.else_entry?;
-    let then_preds = collect_merge_arm_preds(
-        cfg,
-        &graph_facts.dominator_tree.parent,
-        branch.then_entry,
+    let merge = branch_region.merge;
+    let then_preds = &branch_region.then_merge_preds;
+    let else_preds = &branch_region.else_merge_preds;
+    if then_preds.is_empty() || else_preds.is_empty() || !then_preds.is_disjoint(else_preds) {
+        return None;
+    }
+
+    let values = branch_value_merges_in_block(
+        branch_region.header,
+        dataflow,
         merge,
-    );
-    let else_preds =
-        collect_merge_arm_preds(cfg, &graph_facts.dominator_tree.parent, else_entry, merge);
-    if then_preds.is_empty() || else_preds.is_empty() || !then_preds.is_disjoint(&else_preds) {
-        return None;
-    }
-
-    let mut values = Vec::new();
-    for phi in dataflow
-        .phi_candidates
-        .iter()
-        .filter(|phi| phi.block == merge)
-    {
-        if short_circuit_merges.contains(&(branch.header, merge, Some(phi.reg))) {
-            continue;
-        }
-
-        let mut phi_then_preds = BTreeSet::new();
-        let mut phi_else_preds = BTreeSet::new();
-        let mut valid = true;
-
-        for incoming in &phi.incoming {
-            if then_preds.contains(&incoming.pred) {
-                phi_then_preds.insert(incoming.pred);
-            } else if else_preds.contains(&incoming.pred) {
-                phi_else_preds.insert(incoming.pred);
-            } else {
-                valid = false;
-                break;
-            }
-        }
-
-        if !valid || phi_then_preds.is_empty() || phi_else_preds.is_empty() {
-            continue;
-        }
-
-        values.push(BranchValueMergeValue {
-            phi_id: phi.id,
-            reg: phi.reg,
-            then_preds: phi_then_preds,
-            else_preds: phi_else_preds,
-        });
-    }
+        then_preds,
+        else_preds,
+    )
+    .into_iter()
+    .filter(|value| !short_circuit_merges.contains(&(branch_region.header, merge, Some(value.reg))))
+    .collect::<Vec<_>>();
 
     (!values.is_empty()).then_some(BranchValueMergeCandidate {
-        header: branch.header,
+        header: branch_region.header,
         merge,
         values,
     })
-}
-
-fn collect_merge_arm_preds(
-    cfg: &Cfg,
-    dom_parent: &[Option<BlockRef>],
-    entry: BlockRef,
-    merge: BlockRef,
-) -> BTreeSet<BlockRef> {
-    let mut visited = BTreeSet::new();
-    let mut merge_preds = BTreeSet::new();
-    let mut worklist = VecDeque::from([entry]);
-
-    while let Some(block) = worklist.pop_front() {
-        if !cfg.reachable_blocks.contains(&block)
-            || block == merge
-            || !visited.insert(block)
-            || !dominates(dom_parent, entry, block)
-        {
-            continue;
-        }
-
-        for edge_ref in &cfg.succs[block.index()] {
-            let succ = cfg.edges[edge_ref.index()].to;
-            if succ == merge {
-                merge_preds.insert(block);
-            } else {
-                worklist.push_back(succ);
-            }
-        }
-    }
-
-    merge_preds
-}
-
-fn collect_branch_exit_leaf_preds(
-    short: &ShortCircuitCandidate,
-    want_truthy: bool,
-) -> BTreeSet<BlockRef> {
-    short
-        .nodes
-        .iter()
-        .filter_map(|node| {
-            let matches_exit = if want_truthy {
-                matches!(&node.truthy, ShortCircuitTarget::TruthyExit)
-                    || matches!(&node.falsy, ShortCircuitTarget::TruthyExit)
-            } else {
-                matches!(&node.truthy, ShortCircuitTarget::FalsyExit)
-                    || matches!(&node.falsy, ShortCircuitTarget::FalsyExit)
-            };
-            matches_exit.then_some(node.header)
-        })
-        .collect()
 }

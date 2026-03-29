@@ -42,6 +42,22 @@ impl<'a> BinaryReader<'a> {
         Ok(self.read_exact(1)?[0])
     }
 
+    pub(crate) fn read_u32_le(&mut self) -> Result<u32, ParseError> {
+        Ok(u32::from_le_bytes(self.read_array::<4>()?))
+    }
+
+    pub(crate) fn read_i32_le(&mut self) -> Result<i32, ParseError> {
+        Ok(i32::from_le_bytes(self.read_array::<4>()?))
+    }
+
+    pub(crate) fn read_f32_le(&mut self) -> Result<f32, ParseError> {
+        Ok(f32::from_le_bytes(self.read_array::<4>()?))
+    }
+
+    pub(crate) fn read_f64_le(&mut self) -> Result<f64, ParseError> {
+        Ok(f64::from_le_bytes(self.read_array::<8>()?))
+    }
+
     pub(crate) fn read_array<const N: usize>(&mut self) -> Result<[u8; N], ParseError> {
         let bytes = self.read_exact(N)?;
         let mut array = [0_u8; N];
@@ -145,6 +161,11 @@ impl<'a> BinaryReader<'a> {
         }
     }
 
+    pub(crate) fn read_varint_u32_lua54(&mut self, field: &'static str) -> Result<u32, ParseError> {
+        let value = self.read_varint_u64_lua54(i32::MAX as u64, field)?;
+        u32::try_from(value).map_err(|_| ParseError::IntegerOverflow { field, value })
+    }
+
     pub(crate) fn read_varint_u64_lua55(
         &mut self,
         limit: u64,
@@ -163,6 +184,11 @@ impl<'a> BinaryReader<'a> {
                 return Ok(value);
             }
         }
+    }
+
+    pub(crate) fn read_varint_u32_lua55(&mut self, field: &'static str) -> Result<u32, ParseError> {
+        let value = self.read_varint_u64_lua55(i32::MAX as u64, field)?;
+        u32::try_from(value).map_err(|_| ParseError::IntegerOverflow { field, value })
     }
 
     pub(crate) fn read_uleb128_u32(&mut self, field: &'static str) -> Result<u32, ParseError> {
@@ -225,6 +251,28 @@ impl<'a> BinaryReader<'a> {
                     field,
                     value: u64::from(value),
                 });
+            }
+        }
+    }
+
+    pub(crate) fn read_varint_u32_luau(&mut self, field: &'static str) -> Result<u32, ParseError> {
+        let mut value = 0u64;
+        let mut shift = 0u32;
+
+        loop {
+            let byte = self.read_u8()?;
+            value |= u64::from(byte & 0x7f) << shift;
+            if value > u64::from(u32::MAX) {
+                return Err(ParseError::IntegerOverflow { field, value });
+            }
+            if (byte & 0x80) == 0 {
+                return u32::try_from(value)
+                    .map_err(|_| ParseError::IntegerOverflow { field, value });
+            }
+
+            shift += 7;
+            if shift >= 32 {
+                return Err(ParseError::IntegerOverflow { field, value });
             }
         }
     }

@@ -14,6 +14,7 @@ mod locals;
 mod logical_simplify;
 mod table_constructors;
 mod temp_inline;
+mod walk;
 
 use crate::hir::common::HirModule;
 use crate::readability::ReadabilityOptions;
@@ -37,62 +38,7 @@ pub(super) fn simplify_hir_with_timing(
 
     for _ in 0..MAX_SIMPLIFY_ITERATIONS {
         let changed = timings.record("fixed-point-round", || {
-            let mut changed = false;
-            changed |= timings.record("decision", || {
-                apply_proto_pass(module, decision::simplify_decision_exprs_in_proto)
-            });
-            changed |= timings.record("boolean-shells", || {
-                apply_proto_pass(
-                    module,
-                    boolean_shells::remove_boolean_materialization_shells_in_proto,
-                )
-            });
-            changed |= timings.record("logical-simplify", || {
-                apply_proto_pass(module, logical_simplify::simplify_logical_exprs_in_proto)
-            });
-            changed |= timings.record("table-constructors", || {
-                apply_proto_pass(
-                    module,
-                    table_constructors::stabilize_table_constructors_in_proto,
-                )
-            });
-            changed |= timings.record("closure-self-capture", || {
-                apply_proto_pass(
-                    module,
-                    closure_self_capture::resolve_recursive_closure_self_captures_in_proto,
-                )
-            });
-            changed |= timings.record("temp-inline", || {
-                apply_proto_pass(module, |proto| {
-                    temp_inline::inline_temps_in_proto(proto, readability)
-                })
-            });
-            changed |= timings.record("locals", || {
-                apply_proto_pass(module, locals::promote_temps_to_locals_in_proto)
-            });
-            changed |= timings.record("table-constructors-post-locals", || {
-                // 一部分建表片段只有在 temp-inline / locals 把机械绑定收平之后才会显形，
-                // 例如 `local values = {}; values[1] = ...` 这类来源于寄存器搬运的形状。
-                // 这里再跑一轮相同的结构化规则，把这些“晚显形”的稳定片段也收回构造器，
-                // 避免把 `table-set-list` 残留继续推给 AST。
-                apply_proto_pass(
-                    module,
-                    table_constructors::stabilize_table_constructors_in_proto,
-                )
-            });
-            changed |= timings.record("eliminate-decisions", || {
-                apply_proto_pass(module, decision::eliminate_remaining_decisions_in_proto)
-            });
-            changed |= timings.record("close-scopes", || {
-                apply_proto_pass(module, close_scopes::materialize_tbc_close_scopes_in_proto)
-            });
-            changed |= timings.record("dead-labels", || {
-                apply_proto_pass(module, dead_labels::remove_unused_labels_in_proto)
-            });
-            changed |= timings.record("locals-post-close-scopes", || {
-                apply_proto_pass(module, locals::promote_temps_to_locals_in_proto)
-            });
-            changed
+            run_fixed_point_round(module, readability, timings)
         });
 
         if !changed {
@@ -119,6 +65,121 @@ pub(super) fn simplify_hir_with_timing(
             residuals.other_unstructured
         ));
     }
+}
+
+fn run_fixed_point_round(
+    module: &mut HirModule,
+    readability: ReadabilityOptions,
+    timings: &TimingCollector,
+) -> bool {
+    let mut changed = false;
+    changed |= run_core_round(module, readability, timings);
+    changed |= run_exposure_round(module, timings);
+    changed |= run_cleanup_round(module, timings);
+    changed
+}
+
+fn run_core_round(
+    module: &mut HirModule,
+    readability: ReadabilityOptions,
+    timings: &TimingCollector,
+) -> bool {
+    let mut changed = false;
+    changed |= apply_timed_proto_pass(
+        module,
+        timings,
+        "decision",
+        decision::simplify_decision_exprs_in_proto,
+    );
+    changed |= apply_timed_proto_pass(
+        module,
+        timings,
+        "boolean-shells",
+        boolean_shells::remove_boolean_materialization_shells_in_proto,
+    );
+    changed |= apply_timed_proto_pass(
+        module,
+        timings,
+        "logical-simplify",
+        logical_simplify::simplify_logical_exprs_in_proto,
+    );
+    changed |= apply_timed_proto_pass(
+        module,
+        timings,
+        "table-constructors",
+        table_constructors::stabilize_table_constructors_in_proto,
+    );
+    changed |= apply_timed_proto_pass(
+        module,
+        timings,
+        "closure-self-capture",
+        closure_self_capture::resolve_recursive_closure_self_captures_in_proto,
+    );
+    changed |= apply_timed_proto_pass(module, timings, "temp-inline", |proto| {
+        temp_inline::inline_temps_in_proto(proto, readability)
+    });
+    changed |= apply_timed_proto_pass(
+        module,
+        timings,
+        "locals",
+        locals::promote_temps_to_locals_in_proto,
+    );
+    changed
+}
+
+fn run_exposure_round(module: &mut HirModule, timings: &TimingCollector) -> bool {
+    // 这一阶段只放“前一阶段会显露出新形状”的 pass。
+    //
+    // 例如 `temp-inline / locals` 之后，机械寄存器搬运可能会暴露出
+    // `local values = {}; values[1] = ...` 这类更像源码的建表片段。
+    // 这里显式保留第二轮 table constructor，而不是把它伪装成普通 fixed-point 噪音。
+    apply_timed_proto_pass(
+        module,
+        timings,
+        "table-constructors-post-locals",
+        table_constructors::stabilize_table_constructors_in_proto,
+    )
+}
+
+fn run_cleanup_round(module: &mut HirModule, timings: &TimingCollector) -> bool {
+    let mut changed = false;
+    changed |= apply_timed_proto_pass(
+        module,
+        timings,
+        "eliminate-decisions",
+        decision::eliminate_remaining_decisions_in_proto,
+    );
+    changed |= apply_timed_proto_pass(
+        module,
+        timings,
+        "close-scopes",
+        close_scopes::materialize_tbc_close_scopes_in_proto,
+    );
+    changed |= apply_timed_proto_pass(
+        module,
+        timings,
+        "dead-labels",
+        dead_labels::remove_unused_labels_in_proto,
+    );
+    changed |= apply_timed_proto_pass(
+        module,
+        timings,
+        "locals-post-close-scopes",
+        // `close-scopes` 会把 `<close>` cleanup 重新收成词法块，期间可能重新露出
+        // 可直接命名的 temp/local 边界。这里显式把第二轮 locals 放在 cleanup 阶段，
+        // 而不是继续当成“某个神秘的多跑一遍”。
+        locals::promote_temps_to_locals_in_proto,
+    );
+    changed
+}
+
+fn apply_timed_proto_pass(
+    module: &mut HirModule,
+    timings: &TimingCollector,
+    name: &'static str,
+    mut pass: impl FnMut(&mut crate::hir::common::HirProto) -> bool,
+) -> bool {
+    timings.record(name, || apply_proto_pass(module, &mut pass))
 }
 
 fn apply_proto_pass(

@@ -3,197 +3,48 @@
 //! Lua 的 `and/or` 返回的是原始操作数，不是布尔值，所以很多看似显然的布尔代数
 //! 恒等式其实并不安全。这里故意只实现一小撮在 Lua 值语义下也严格成立的规则，
 //! 用来压掉短路 DAG 恢复后最机械的重复，而不越权重写控制流结构。
+//!
+//! 它依赖前面的 short-circuit / decision 恢复已经把候选逻辑表达式保守落成 HIR，
+//! 这里仅做“值语义严格不变”的局部整理，不重新分析 CFG，也不替前层兜底修坏掉的
+//! 短路结构。
+//!
+//! 例子：
+//! - `x and x` 会折成 `x`
+//! - `(a and b) or (a and c)` 会整理成 `a and (b or c)`，但前提是共享 guard `a`
+//!   没有副作用
+//! - `x or x` 会折成 `x`
+//! - 它不会把一般 `if/branch` 结构强行改写成逻辑表达式，那仍然属于更前面的结构恢复职责
 
-use crate::hir::common::{
-    HirBlock, HirCallExpr, HirExpr, HirLogicalExpr, HirProto, HirStmt, HirTableConstructor,
-    HirTableField, HirTableKey,
-};
+use super::walk::{ExprRewritePass, rewrite_proto_exprs};
+use crate::hir::common::{HirExpr, HirLogicalExpr, HirProto};
+
+#[cfg(test)]
+use crate::hir::common::HirBlock;
+
+#[cfg(test)]
+use crate::hir::common::HirStmt;
 
 /// 对单个 proto 递归执行安全的逻辑表达式整理。
 pub(super) fn simplify_logical_exprs_in_proto(proto: &mut HirProto) -> bool {
-    simplify_block(&mut proto.body)
+    rewrite_proto_exprs(proto, &mut LogicalExprPass)
 }
 
-fn simplify_block(block: &mut HirBlock) -> bool {
-    block
-        .stmts
-        .iter_mut()
-        .fold(false, |changed, stmt| simplify_stmt(stmt) || changed)
-}
+struct LogicalExprPass;
 
-fn simplify_stmt(stmt: &mut HirStmt) -> bool {
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => local_decl
-            .values
-            .iter_mut()
-            .fold(false, |changed, expr| simplify_expr(expr) || changed),
-        HirStmt::Assign(assign) => {
-            let targets_changed = assign
-                .targets
-                .iter_mut()
-                .fold(false, |changed, target| simplify_lvalue(target) || changed);
-            let values_changed = assign
-                .values
-                .iter_mut()
-                .fold(false, |changed, expr| simplify_expr(expr) || changed);
-            targets_changed || values_changed
-        }
-        HirStmt::TableSetList(set_list) => {
-            let base_changed = simplify_expr(&mut set_list.base);
-            let values_changed = set_list
-                .values
-                .iter_mut()
-                .fold(false, |changed, expr| simplify_expr(expr) || changed);
-            let trailing_changed = set_list
-                .trailing_multivalue
-                .as_mut()
-                .is_some_and(simplify_expr);
-            base_changed || values_changed || trailing_changed
-        }
-        HirStmt::ErrNil(err_nil) => simplify_expr(&mut err_nil.value),
-        HirStmt::ToBeClosed(to_be_closed) => simplify_expr(&mut to_be_closed.value),
-        HirStmt::CallStmt(call_stmt) => simplify_call_expr(&mut call_stmt.call),
-        HirStmt::Return(ret) => ret
-            .values
-            .iter_mut()
-            .fold(false, |changed, expr| simplify_expr(expr) || changed),
-        HirStmt::If(if_stmt) => {
-            simplify_expr(&mut if_stmt.cond)
-                || simplify_block(&mut if_stmt.then_block)
-                || if_stmt.else_block.as_mut().is_some_and(simplify_block)
-        }
-        HirStmt::While(while_stmt) => {
-            simplify_expr(&mut while_stmt.cond) || simplify_block(&mut while_stmt.body)
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            simplify_block(&mut repeat_stmt.body) || simplify_expr(&mut repeat_stmt.cond)
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            simplify_expr(&mut numeric_for.start)
-                || simplify_expr(&mut numeric_for.limit)
-                || simplify_expr(&mut numeric_for.step)
-                || simplify_block(&mut numeric_for.body)
-        }
-        HirStmt::GenericFor(generic_for) => {
-            let iterator_changed = generic_for
-                .iterator
-                .iter_mut()
-                .fold(false, |changed, expr| simplify_expr(expr) || changed);
-            iterator_changed || simplify_block(&mut generic_for.body)
-        }
-        HirStmt::Block(block) => simplify_block(block),
-        HirStmt::Unstructured(unstructured) => simplify_block(&mut unstructured.body),
-        HirStmt::Break
-        | HirStmt::Close(_)
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => false,
-    }
-}
+impl ExprRewritePass for LogicalExprPass {
+    fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
+        let mut changed = false;
 
-fn simplify_lvalue(lvalue: &mut crate::hir::common::HirLValue) -> bool {
-    match lvalue {
-        crate::hir::common::HirLValue::TableAccess(access) => {
-            simplify_expr(&mut access.base) || simplify_expr(&mut access.key)
+        if let Some(replacement) = simplify_logical_shape(expr) {
+            *expr = replacement;
+            changed = true;
         }
-        crate::hir::common::HirLValue::Temp(_)
-        | crate::hir::common::HirLValue::Local(_)
-        | crate::hir::common::HirLValue::Upvalue(_)
-        | crate::hir::common::HirLValue::Global(_) => false,
-    }
-}
-
-fn simplify_call_expr(call: &mut HirCallExpr) -> bool {
-    let callee_changed = simplify_expr(&mut call.callee);
-    let args_changed = call
-        .args
-        .iter_mut()
-        .fold(false, |changed, arg| simplify_expr(arg) || changed);
-    callee_changed || args_changed
-}
-
-fn simplify_expr(expr: &mut HirExpr) -> bool {
-    let mut changed = match expr {
-        HirExpr::TableAccess(access) => {
-            simplify_expr(&mut access.base) || simplify_expr(&mut access.key)
+        if let Some(replacement) = super::decision::naturalize_pure_logical_expr(expr) {
+            *expr = replacement;
+            changed = true;
         }
-        HirExpr::Unary(unary) => simplify_expr(&mut unary.expr),
-        HirExpr::Binary(binary) => simplify_expr(&mut binary.lhs) || simplify_expr(&mut binary.rhs),
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            simplify_expr(&mut logical.lhs) || simplify_expr(&mut logical.rhs)
-        }
-        HirExpr::Decision(decision) => simplify_decision_expr(decision),
-        HirExpr::Call(call) => simplify_call_expr(call),
-        HirExpr::TableConstructor(table) => simplify_table_constructor(table),
-        HirExpr::Closure(closure) => closure.captures.iter_mut().fold(false, |acc, capture| {
-            simplify_expr(&mut capture.value) || acc
-        }),
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => false,
-    };
 
-    if let Some(replacement) = simplify_logical_shape(expr) {
-        *expr = replacement;
-        changed = true;
-    }
-    if let Some(replacement) = super::decision::naturalize_pure_logical_expr(expr) {
-        *expr = replacement;
-        changed = true;
-    }
-
-    changed
-}
-
-fn simplify_table_constructor(table: &mut HirTableConstructor) -> bool {
-    let fields_changed = table.fields.iter_mut().fold(false, |changed, field| {
-        let field_changed = match field {
-            HirTableField::Array(expr) => simplify_expr(expr),
-            HirTableField::Record(field) => {
-                let key_changed = match &mut field.key {
-                    HirTableKey::Name(_) => false,
-                    HirTableKey::Expr(expr) => simplify_expr(expr),
-                };
-                let value_changed = simplify_expr(&mut field.value);
-                key_changed || value_changed
-            }
-        };
-        changed || field_changed
-    });
-    let trailing_changed = table
-        .trailing_multivalue
-        .as_mut()
-        .is_some_and(simplify_expr);
-
-    fields_changed || trailing_changed
-}
-
-fn simplify_decision_expr(decision: &mut crate::hir::common::HirDecisionExpr) -> bool {
-    decision.nodes.iter_mut().fold(false, |changed, node| {
-        let test_changed = simplify_expr(&mut node.test);
-        let truthy_changed = simplify_decision_target(&mut node.truthy);
-        let falsy_changed = simplify_decision_target(&mut node.falsy);
-        changed || test_changed || truthy_changed || falsy_changed
-    })
-}
-
-fn simplify_decision_target(target: &mut crate::hir::common::HirDecisionTarget) -> bool {
-    match target {
-        crate::hir::common::HirDecisionTarget::Expr(expr) => simplify_expr(expr),
-        crate::hir::common::HirDecisionTarget::Node(_)
-        | crate::hir::common::HirDecisionTarget::CurrentValue => false,
+        changed
     }
 }
 

@@ -7,21 +7,21 @@
 //! - TDUP 在这里展开成 `NewTable + SetTable*`，不把模板表细节泄漏到后层。
 
 use crate::parser::{
-    DialectConstPoolExtra, DialectInstrExtra, LuaJitConstPoolExtra, LuaJitHeaderExtra,
-    LuaJitInstrExtra, LuaJitKgcEntry, LuaJitNumberConstEntry, LuaJitOpcode, LuaJitOperands,
-    LuaJitTableConst, LuaJitTableLiteral, RawChunk, RawInstr, RawInstrOpcode, RawInstrOperands,
-    RawLiteralConst, RawProto,
+    LuaJitKgcEntry, LuaJitNumberConstEntry, LuaJitOpcode, LuaJitOperands, LuaJitTableConst,
+    LuaJitTableLiteral, RawChunk, RawLiteralConst, RawProto,
 };
+use crate::transformer::dialect::lowering::{
+    PendingLowInstr, PendingLoweringState, TargetPlaceholder, instr_pc, resolve_pending_instr_with,
+};
+use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
-    AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchInstr, BranchOperands,
+    AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchOperands,
     BranchPredicate, CallInstr, CallKind, Capture, CaptureSource, CloseInstr, ClosureInstr,
-    ConcatInstr, CondOperand, ConstRef, DialectCaptureExtra, GenericForCallInstr,
-    GenericForLoopInstr, GetTableInstr, GetUpvalueInstr, InstrRef, JumpInstr, LoadBoolInstr,
-    LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto,
-    LoweringMap, MoveInstr, NewTableInstr, NumericForInitInstr, NumericForLoopInstr, ProtoRef,
-    RawInstrRef, Reg, RegRange, ResultPack, ReturnInstr, SetListInstr, SetTableInstr,
-    SetUpvalueInstr, TailCallInstr, TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef,
-    ValueOperand, ValuePack, VarArgInstr,
+    ConcatInstr, CondOperand, ConstRef, DialectCaptureExtra, GenericForCallInstr, GetTableInstr,
+    GetUpvalueInstr, InstrRef, LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr,
+    LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg,
+    RegRange, ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr,
+    TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
 const NO_REG: u8 = 0xff;
@@ -32,10 +32,10 @@ const BCDUMP_KPRI_TRUE: u16 = 2;
 const TWO_POW_52: f64 = 4_503_599_627_370_496.0;
 
 pub(crate) fn lower_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
-    let fr2 = match &chunk.header.extra {
-        crate::parser::DialectHeaderExtra::LuaJit(LuaJitHeaderExtra { fr2, .. }) => *fr2,
-        _ => unreachable!("luajit lowerer should only receive luajit headers"),
-    };
+    let fr2 = chunk
+        .header
+        .luajit_fr2()
+        .expect("luajit lowerer should only receive luajit headers");
 
     Ok(LoweredChunk {
         header: chunk.header.clone(),
@@ -71,57 +71,8 @@ fn lower_proto(raw: &RawProto, fr2: bool) -> Result<LoweredProto, TransformError
 
 struct ProtoLowerer<'a> {
     raw: &'a RawProto,
-    emitted: Vec<EmittedInstr>,
-    raw_target_low: Vec<Option<usize>>,
-    raw_to_low: Vec<Vec<InstrRef>>,
+    lowering: PendingLoweringState,
     fr2: usize,
-}
-
-#[derive(Debug, Clone)]
-struct EmittedInstr {
-    raw_indices: Vec<usize>,
-    instr: PendingLowInstr,
-}
-
-#[derive(Debug, Clone)]
-enum PendingLowInstr {
-    Ready(LowInstr),
-    Jump {
-        target: TargetPlaceholder,
-    },
-    Branch {
-        cond: BranchCond,
-        then_target: TargetPlaceholder,
-        else_target: TargetPlaceholder,
-    },
-    NumericForInit {
-        index: Reg,
-        limit: Reg,
-        step: Reg,
-        binding: Reg,
-        body_target: TargetPlaceholder,
-        exit_target: TargetPlaceholder,
-    },
-    NumericForLoop {
-        index: Reg,
-        limit: Reg,
-        step: Reg,
-        binding: Reg,
-        body_target: TargetPlaceholder,
-        exit_target: TargetPlaceholder,
-    },
-    GenericForLoop {
-        control: Reg,
-        bindings: RegRange,
-        body_target: TargetPlaceholder,
-        exit_target: TargetPlaceholder,
-    },
-}
-
-#[derive(Debug, Clone, Copy)]
-enum TargetPlaceholder {
-    Raw(usize),
-    Low(usize),
 }
 
 impl<'a> ProtoLowerer<'a> {
@@ -129,9 +80,7 @@ impl<'a> ProtoLowerer<'a> {
         let raw_instr_count = raw.common.instructions.len();
         Self {
             raw,
-            emitted: Vec::new(),
-            raw_target_low: vec![None; raw_instr_count],
-            raw_to_low: vec![Vec::new(); raw_instr_count],
+            lowering: PendingLoweringState::new(raw_instr_count),
             fr2: usize::from(fr2),
         }
     }
@@ -141,7 +90,9 @@ impl<'a> ProtoLowerer<'a> {
 
         while raw_index < self.raw.common.instructions.len() {
             let raw_instr = &self.raw.common.instructions[raw_index];
-            let (opcode, operands, extra) = decode_luajit(raw_instr);
+            let (opcode, operands, extra) = raw_instr
+                .luajit()
+                .expect("luajit lowerer should only decode luajit instructions");
             let raw_pc = extra.pc;
 
             match opcode {
@@ -311,7 +262,7 @@ impl<'a> ProtoLowerer<'a> {
                         _ => {
                             return Err(TransformError::UnsupportedOpcode {
                                 raw_pc,
-                                opcode: opcode_label(opcode),
+                                opcode: opcode.label(),
                             });
                         }
                     }
@@ -692,7 +643,7 @@ impl<'a> ProtoLowerer<'a> {
                         return Err(TransformError::InvalidNumericForPair {
                             raw_pc,
                             target_raw: loop_raw,
-                            found: opcode_label(loop_opcode),
+                            found: loop_opcode.label(),
                         });
                     }
                     let index = reg_from_u8(a);
@@ -857,7 +808,7 @@ impl<'a> ProtoLowerer<'a> {
                             },
                         );
                     } else {
-                        let move_low = self.emitted.len() + 1;
+                        let move_low = self.lowering.next_low_index();
                         self.emit(
                             Some(raw_index),
                             vec![raw_index, helper.helper_index],
@@ -898,7 +849,7 @@ impl<'a> ProtoLowerer<'a> {
                 _ => {
                     return Err(TransformError::UnsupportedOpcode {
                         raw_pc,
-                        opcode: opcode_label(opcode),
+                        opcode: opcode.label(),
                     });
                 }
             }
@@ -908,64 +859,20 @@ impl<'a> ProtoLowerer<'a> {
     }
 
     fn finish(&self) -> Result<(Vec<LowInstr>, LoweringMap), TransformError> {
-        let instrs = self
-            .emitted
-            .iter()
-            .map(|emitted| {
-                let owner_raw = emitted.raw_indices.first().copied().unwrap_or(0);
-                self.resolve_pending_instr(owner_raw, &emitted.instr)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let low_to_raw = self
-            .emitted
-            .iter()
-            .map(|emitted| {
-                emitted
-                    .raw_indices
-                    .iter()
+        self.lowering.finish(
+            self.raw,
+            |owner_raw, pending| self.resolve_pending_instr(owner_raw, pending),
+            instr_pc,
+            |raw_index| {
+                self.raw
+                    .common
+                    .debug_info
+                    .common
+                    .line_info
+                    .get(raw_index)
                     .copied()
-                    .map(RawInstrRef)
-                    .collect()
-            })
-            .collect::<Vec<Vec<RawInstrRef>>>();
-        let pc_map = self
-            .emitted
-            .iter()
-            .map(|emitted| {
-                emitted
-                    .raw_indices
-                    .iter()
-                    .copied()
-                    .map(|raw_index| raw_pc_at(self.raw, raw_index))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let line_hints = self
-            .emitted
-            .iter()
-            .map(|emitted| {
-                emitted.raw_indices.iter().find_map(|raw_index| {
-                    self.raw
-                        .common
-                        .debug_info
-                        .common
-                        .line_info
-                        .get(*raw_index)
-                        .copied()
-                })
-            })
-            .collect::<Vec<_>>();
-
-        Ok((
-            instrs,
-            LoweringMap {
-                low_to_raw,
-                raw_to_low: self.raw_to_low.clone(),
-                pc_map,
-                line_hints,
             },
-        ))
+        )
     }
 
     fn resolve_pending_instr(
@@ -974,62 +881,7 @@ impl<'a> ProtoLowerer<'a> {
         pending: &PendingLowInstr,
     ) -> Result<LowInstr, TransformError> {
         let owner_pc = raw_pc_at(self.raw, owner_raw);
-        match pending {
-            PendingLowInstr::Ready(instr) => Ok(instr.clone()),
-            PendingLowInstr::Jump { target } => Ok(LowInstr::Jump(JumpInstr {
-                target: self.resolve_target(owner_pc, *target)?,
-            })),
-            PendingLowInstr::Branch {
-                cond,
-                then_target,
-                else_target,
-            } => Ok(LowInstr::Branch(BranchInstr {
-                cond: *cond,
-                then_target: self.resolve_target(owner_pc, *then_target)?,
-                else_target: self.resolve_target(owner_pc, *else_target)?,
-            })),
-            PendingLowInstr::NumericForInit {
-                index,
-                limit,
-                step,
-                binding,
-                body_target,
-                exit_target,
-            } => Ok(LowInstr::NumericForInit(NumericForInitInstr {
-                index: *index,
-                limit: *limit,
-                step: *step,
-                binding: *binding,
-                body_target: self.resolve_target(owner_pc, *body_target)?,
-                exit_target: self.resolve_target(owner_pc, *exit_target)?,
-            })),
-            PendingLowInstr::NumericForLoop {
-                index,
-                limit,
-                step,
-                binding,
-                body_target,
-                exit_target,
-            } => Ok(LowInstr::NumericForLoop(NumericForLoopInstr {
-                index: *index,
-                limit: *limit,
-                step: *step,
-                binding: *binding,
-                body_target: self.resolve_target(owner_pc, *body_target)?,
-                exit_target: self.resolve_target(owner_pc, *exit_target)?,
-            })),
-            PendingLowInstr::GenericForLoop {
-                control,
-                bindings,
-                body_target,
-                exit_target,
-            } => Ok(LowInstr::GenericForLoop(GenericForLoopInstr {
-                control: *control,
-                bindings: *bindings,
-                body_target: self.resolve_target(owner_pc, *body_target)?,
-                exit_target: self.resolve_target(owner_pc, *exit_target)?,
-            })),
-        }
+        resolve_pending_instr_with(pending, |target| self.resolve_target(owner_pc, target))
     }
 
     fn resolve_target(
@@ -1037,18 +889,8 @@ impl<'a> ProtoLowerer<'a> {
         owner_pc: u32,
         target: TargetPlaceholder,
     ) -> Result<InstrRef, TransformError> {
-        match target {
-            TargetPlaceholder::Low(index) => Ok(InstrRef(index)),
-            TargetPlaceholder::Raw(raw_index) => {
-                let Some(low_index) = self.raw_target_low[raw_index] else {
-                    return Err(TransformError::UntargetableRawInstruction {
-                        raw_pc: owner_pc,
-                        target_raw: raw_index,
-                    });
-                };
-                Ok(InstrRef(low_index))
-            }
-        }
+        self.lowering
+            .resolve_target(owner_pc, target, |raw_index| raw_index)
     }
 
     fn emit(
@@ -1057,26 +899,11 @@ impl<'a> ProtoLowerer<'a> {
         raw_indices: Vec<usize>,
         instr: PendingLowInstr,
     ) -> usize {
-        let low_index = self.emitted.len();
-
-        if let Some(owner_raw) = owner_raw
-            && self.raw_target_low[owner_raw].is_none()
-        {
-            self.raw_target_low[owner_raw] = Some(low_index);
-        }
-
-        for raw_index in &raw_indices {
-            self.raw_to_low[*raw_index].push(InstrRef(low_index));
-        }
-
-        self.emitted.push(EmittedInstr { raw_indices, instr });
-        low_index
+        self.lowering.emit(owner_raw, raw_indices, instr)
     }
 
     fn mark_raw_target(&mut self, raw_index: usize) {
-        if self.raw_target_low[raw_index].is_none() {
-            self.raw_target_low[raw_index] = Some(self.emitted.len());
-        }
+        self.lowering.mark_raw_target(raw_index);
     }
 
     fn const_ref(&self, raw_pc: u32, index: usize) -> Result<ConstRef, TransformError> {
@@ -1092,19 +919,19 @@ impl<'a> ProtoLowerer<'a> {
     }
 
     fn kgc_entries(&self) -> &[LuaJitKgcEntry] {
-        match &self.raw.common.constants.extra {
-            DialectConstPoolExtra::LuaJit(LuaJitConstPoolExtra { kgc_entries, .. }) => kgc_entries,
-            _ => unreachable!("luajit lowerer should only receive luajit constant pools"),
-        }
+        self.raw
+            .common
+            .constants
+            .luajit_kgc_entries()
+            .expect("luajit lowerer should only receive luajit constant pools")
     }
 
     fn knum_entries(&self) -> &[LuaJitNumberConstEntry] {
-        match &self.raw.common.constants.extra {
-            DialectConstPoolExtra::LuaJit(LuaJitConstPoolExtra { knum_entries, .. }) => {
-                knum_entries
-            }
-            _ => unreachable!("luajit lowerer should only receive luajit constant pools"),
-        }
+        self.raw
+            .common
+            .constants
+            .luajit_knum_entries()
+            .expect("luajit lowerer should only receive luajit constant pools")
     }
 
     fn kgc_entry(&self, raw_pc: u32, index: usize) -> Result<&LuaJitKgcEntry, TransformError> {
@@ -1340,15 +1167,17 @@ impl<'a> ProtoLowerer<'a> {
         let Some(helper_instr) = self.raw.common.instructions.get(helper_index) else {
             return Err(TransformError::MissingHelperJump {
                 raw_pc,
-                opcode: opcode_label(opcode),
+                opcode: opcode.label(),
             });
         };
-        let (helper_opcode, helper_operands, helper_extra) = decode_luajit(helper_instr);
+        let (helper_opcode, helper_operands, helper_extra) = helper_instr
+            .luajit()
+            .expect("luajit lowerer should only decode luajit instructions");
         if helper_opcode != LuaJitOpcode::Jmp {
             return Err(TransformError::InvalidHelperJump {
                 raw_pc,
                 helper_pc: helper_extra.pc,
-                found: opcode_label(helper_opcode),
+                found: helper_opcode.label(),
             });
         }
         let (_, d) = expect_ad(helper_extra.pc, helper_opcode, helper_operands)?;
@@ -1369,7 +1198,9 @@ impl<'a> ProtoLowerer<'a> {
         let Some(helper_instr) = self.raw.common.instructions.get(helper_index) else {
             return Err(TransformError::MissingGenericForLoop { raw_pc });
         };
-        let (helper_opcode, helper_operands, helper_extra) = decode_luajit(helper_instr);
+        let (helper_opcode, helper_operands, helper_extra) = helper_instr
+            .luajit()
+            .expect("luajit lowerer should only decode luajit instructions");
         if !matches!(
             helper_opcode,
             LuaJitOpcode::IterL | LuaJitOpcode::IIterL | LuaJitOpcode::JIterL
@@ -1377,7 +1208,7 @@ impl<'a> ProtoLowerer<'a> {
             return Err(TransformError::InvalidGenericForLoop {
                 raw_pc,
                 helper_pc: helper_extra.pc,
-                found: opcode_label(helper_opcode),
+                found: helper_opcode.label(),
             });
         }
         let (_a, d) = expect_ad(helper_extra.pc, helper_opcode, helper_operands)?;
@@ -1458,29 +1289,15 @@ struct IterLoopHelper {
     exit_target: usize,
 }
 
-fn decode_luajit(raw: &RawInstr) -> (LuaJitOpcode, &LuaJitOperands, LuaJitInstrExtra) {
-    let RawInstrOpcode::LuaJit(opcode) = raw.opcode else {
-        unreachable!("luajit lowerer should only decode luajit opcodes");
-    };
-    let RawInstrOperands::LuaJit(ref operands) = raw.operands else {
-        unreachable!("luajit lowerer should only decode luajit operands");
-    };
-    let DialectInstrExtra::LuaJit(extra) = raw.extra else {
-        unreachable!("luajit lowerer should only decode luajit extras");
-    };
-    (opcode, operands, extra)
-}
-
 fn raw_pc_at(raw: &RawProto, index: usize) -> u32 {
-    let DialectInstrExtra::LuaJit(extra) = raw.common.instructions[index].extra else {
-        unreachable!("luajit lowerer should only decode luajit extras");
-    };
-    extra.pc
+    raw.common.instructions[index].pc()
 }
 
 fn opcode_at(raw: &RawProto, index: usize) -> LuaJitOpcode {
-    let (opcode, _, _) = decode_luajit(&raw.common.instructions[index]);
-    opcode
+    raw.common.instructions[index]
+        .luajit()
+        .expect("luajit lowerer should only decode luajit instructions")
+        .0
 }
 
 fn reg_from_u8(index: u8) -> Reg {
@@ -1547,134 +1364,14 @@ fn binary_op_kind(opcode: LuaJitOpcode) -> BinaryOpKind {
     }
 }
 
-fn opcode_label(opcode: LuaJitOpcode) -> &'static str {
-    match opcode {
-        LuaJitOpcode::IsLt => "ISLT",
-        LuaJitOpcode::IsGe => "ISGE",
-        LuaJitOpcode::IsLe => "ISLE",
-        LuaJitOpcode::IsGt => "ISGT",
-        LuaJitOpcode::IsEqV => "ISEQV",
-        LuaJitOpcode::IsNeV => "ISNEV",
-        LuaJitOpcode::IsEqS => "ISEQS",
-        LuaJitOpcode::IsNeS => "ISNES",
-        LuaJitOpcode::IsEqN => "ISEQN",
-        LuaJitOpcode::IsNeN => "ISNEN",
-        LuaJitOpcode::IsEqP => "ISEQP",
-        LuaJitOpcode::IsNeP => "ISNEP",
-        LuaJitOpcode::IsTC => "ISTC",
-        LuaJitOpcode::IsFC => "ISFC",
-        LuaJitOpcode::IsT => "IST",
-        LuaJitOpcode::IsF => "ISF",
-        LuaJitOpcode::IsType => "ISTYPE",
-        LuaJitOpcode::IsNum => "ISNUM",
-        LuaJitOpcode::Mov => "MOV",
-        LuaJitOpcode::Not => "NOT",
-        LuaJitOpcode::Unm => "UNM",
-        LuaJitOpcode::Len => "LEN",
-        LuaJitOpcode::AddVN => "ADDVN",
-        LuaJitOpcode::SubVN => "SUBVN",
-        LuaJitOpcode::MulVN => "MULVN",
-        LuaJitOpcode::DivVN => "DIVVN",
-        LuaJitOpcode::ModVN => "MODVN",
-        LuaJitOpcode::AddNV => "ADDNV",
-        LuaJitOpcode::SubNV => "SUBNV",
-        LuaJitOpcode::MulNV => "MULNV",
-        LuaJitOpcode::DivNV => "DIVNV",
-        LuaJitOpcode::ModNV => "MODNV",
-        LuaJitOpcode::AddVV => "ADDVV",
-        LuaJitOpcode::SubVV => "SUBVV",
-        LuaJitOpcode::MulVV => "MULVV",
-        LuaJitOpcode::DivVV => "DIVVV",
-        LuaJitOpcode::ModVV => "MODVV",
-        LuaJitOpcode::Pow => "POW",
-        LuaJitOpcode::Cat => "CAT",
-        LuaJitOpcode::KStr => "KSTR",
-        LuaJitOpcode::KCData => "KCDATA",
-        LuaJitOpcode::KShort => "KSHORT",
-        LuaJitOpcode::KNum => "KNUM",
-        LuaJitOpcode::KPri => "KPRI",
-        LuaJitOpcode::KNil => "KNIL",
-        LuaJitOpcode::UGet => "UGET",
-        LuaJitOpcode::USetV => "USETV",
-        LuaJitOpcode::USetS => "USETS",
-        LuaJitOpcode::USetN => "USETN",
-        LuaJitOpcode::USetP => "USETP",
-        LuaJitOpcode::UClose => "UCLO",
-        LuaJitOpcode::FNew => "FNEW",
-        LuaJitOpcode::TNew => "TNEW",
-        LuaJitOpcode::TDup => "TDUP",
-        LuaJitOpcode::GGet => "GGET",
-        LuaJitOpcode::GSet => "GSET",
-        LuaJitOpcode::TGetV => "TGETV",
-        LuaJitOpcode::TGetS => "TGETS",
-        LuaJitOpcode::TGetB => "TGETB",
-        LuaJitOpcode::TGetR => "TGETR",
-        LuaJitOpcode::TSetV => "TSETV",
-        LuaJitOpcode::TSetS => "TSETS",
-        LuaJitOpcode::TSetB => "TSETB",
-        LuaJitOpcode::TSetM => "TSETM",
-        LuaJitOpcode::TSetR => "TSETR",
-        LuaJitOpcode::CallM => "CALLM",
-        LuaJitOpcode::Call => "CALL",
-        LuaJitOpcode::CallMT => "CALLMT",
-        LuaJitOpcode::CallT => "CALLT",
-        LuaJitOpcode::IterC => "ITERC",
-        LuaJitOpcode::IterN => "ITERN",
-        LuaJitOpcode::VArg => "VARG",
-        LuaJitOpcode::IsNext => "ISNEXT",
-        LuaJitOpcode::RetM => "RETM",
-        LuaJitOpcode::Ret => "RET",
-        LuaJitOpcode::Ret0 => "RET0",
-        LuaJitOpcode::Ret1 => "RET1",
-        LuaJitOpcode::ForI => "FORI",
-        LuaJitOpcode::JForI => "JFORI",
-        LuaJitOpcode::ForL => "FORL",
-        LuaJitOpcode::IForL => "IFORL",
-        LuaJitOpcode::JForL => "JFORL",
-        LuaJitOpcode::IterL => "ITERL",
-        LuaJitOpcode::IIterL => "IITERL",
-        LuaJitOpcode::JIterL => "JITERL",
-        LuaJitOpcode::Loop => "LOOP",
-        LuaJitOpcode::ILoop => "ILOOP",
-        LuaJitOpcode::JLoop => "JLOOP",
-        LuaJitOpcode::Jmp => "JMP",
-        LuaJitOpcode::FuncF => "FUNCF",
-        LuaJitOpcode::IFuncF => "IFUNCF",
-        LuaJitOpcode::JFuncF => "JFUNCF",
-        LuaJitOpcode::FuncV => "FUNCV",
-        LuaJitOpcode::IFuncV => "IFUNCV",
-        LuaJitOpcode::JFuncV => "JFUNCV",
-        LuaJitOpcode::FuncC => "FUNCC",
-        LuaJitOpcode::FuncCW => "FUNCCW",
+define_operand_expecters! {
+    opcode = LuaJitOpcode,
+    operands = LuaJitOperands,
+    label = LuaJitOpcode::label,
+    fn expect_ad("AD") -> (u8, u16) {
+        LuaJitOperands::AD { a, d } => (*a, *d)
     }
-}
-
-fn expect_ad(
-    raw_pc: u32,
-    opcode: LuaJitOpcode,
-    operands: &LuaJitOperands,
-) -> Result<(u8, u16), TransformError> {
-    match *operands {
-        LuaJitOperands::AD { a, d } => Ok((a, d)),
-        _ => Err(TransformError::UnexpectedOperands {
-            raw_pc,
-            opcode: opcode_label(opcode),
-            expected: "AD",
-        }),
-    }
-}
-
-fn expect_abc(
-    raw_pc: u32,
-    opcode: LuaJitOpcode,
-    operands: &LuaJitOperands,
-) -> Result<(u8, u8, u8), TransformError> {
-    match *operands {
-        LuaJitOperands::ABC { a, b, c } => Ok((a, b, c)),
-        _ => Err(TransformError::UnexpectedOperands {
-            raw_pc,
-            opcode: opcode_label(opcode),
-            expected: "ABC",
-        }),
+    fn expect_abc("ABC") -> (u8, u8, u8) {
+        LuaJitOperands::ABC { a, b, c } => (*a, *b, *c)
     }
 }

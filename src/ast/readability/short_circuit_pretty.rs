@@ -156,6 +156,7 @@ fn rewrite_expr(expr: &mut AstExpr) -> bool {
             }
             changed
         }
+        AstExpr::SingleValue(expr) => rewrite_expr(expr),
         AstExpr::TableConstructor(table) => {
             let mut changed = false;
             for field in &mut table.fields {
@@ -240,6 +241,7 @@ fn hir_from_ast_expr(expr: &AstExpr) -> Option<HirExpr> {
             lhs: hir_from_ast_expr(&logical.lhs)?,
             rhs: hir_from_ast_expr(&logical.rhs)?,
         }))),
+        AstExpr::SingleValue(expr) => hir_from_ast_expr(expr),
         AstExpr::FieldAccess(_)
         | AstExpr::IndexAccess(_)
         | AstExpr::Unary(_)

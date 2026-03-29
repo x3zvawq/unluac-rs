@@ -1,22 +1,28 @@
 //! 这个文件实现 scope 候选提取。
 //!
-//! 这里不试图直接恢复最终词法块，只把 loop/branch 的天然边界以及显式 `Close`
-//! 指令整理成后续 HIR 可消费的候选。
+//! 它依赖 loop/branch/graph facts 已经给好的结构边界和显式 `Close` 指令，负责把
+//! “哪些 block 天然形成一个词法收束点”整理成 `ScopeCandidate`。
+//! 它不会越权恢复最终词法块，只保留 HIR 需要的 entry/exit/close-point 事实。
+//!
+//! 例子：
+//! - `while ... do ... end` 会产出一条 `LoopScope`，entry 是 loop header，exit 是
+//!   结构层已经识别出的单出口
+//! - 含 `Close` 的普通 block 会额外产出 `BlockScope`，让后面的结构化阶段直接知道
+//!   这些 cleanup 点属于词法边界，而不是把 `Close` 当普通语句往后拖
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cfg::{BlockRef, Cfg, GraphFacts};
 use crate::transformer::{InstrRef, LowInstr, LoweredProto};
 
-use super::branches::collect_branch_region_blocks;
-use super::common::{BranchCandidate, LoopCandidate, ScopeCandidate, ScopeKind};
+use super::common::{BranchRegionFact, LoopCandidate, ScopeCandidate, ScopeKind};
 
 pub(super) fn analyze_scopes(
     proto: &LoweredProto,
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     loop_candidates: &[LoopCandidate],
-    branch_candidates: &[BranchCandidate],
+    branch_regions: &[BranchRegionFact],
 ) -> Vec<ScopeCandidate> {
     let close_points_by_block = collect_close_points_by_block(proto, cfg);
     let mut scopes = Vec::new();
@@ -30,20 +36,14 @@ pub(super) fn analyze_scopes(
         });
     }
 
-    for branch_candidate in branch_candidates {
-        let Some(merge) = branch_candidate.merge else {
-            continue;
-        };
-        let blocks = collect_branch_region_blocks(
-            cfg,
-            branch_candidate,
-            merge,
-            Some(&graph_facts.dominator_tree.parent),
-        );
+    for branch_region in branch_regions {
         scopes.push(ScopeCandidate {
-            entry: branch_candidate.header,
-            exit: Some(merge),
-            close_points: collect_close_points(&blocks, &close_points_by_block),
+            entry: branch_region.header,
+            exit: Some(branch_region.merge),
+            close_points: collect_close_points(
+                &branch_region.structured_blocks,
+                &close_points_by_block,
+            ),
             kind: ScopeKind::BranchScope,
         });
     }
