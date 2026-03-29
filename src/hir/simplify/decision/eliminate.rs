@@ -17,6 +17,9 @@ use crate::hir::common::{
     LocalId,
 };
 
+use super::super::visit::{HirVisitor, visit_expr};
+use super::super::walk::rewrite_nested_blocks_in_stmt;
+
 pub(super) fn eliminate_remaining_decisions_in_proto(proto: &mut HirProto) -> bool {
     let mut next_local_index = proto.locals.len();
     let mut new_locals = Vec::new();
@@ -176,78 +179,45 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
         }
         HirStmt::If(mut if_stmt) => {
             let cond_changed = eliminate_condition_expr(&mut if_stmt.cond);
-            let then_changed = eliminate_block(
-                &mut if_stmt.then_block,
-                state.next_local_index,
-                state.new_locals,
-                state.new_local_debug_hints,
-            );
-            let else_changed = if_stmt.else_block.as_mut().is_some_and(|else_block| {
-                eliminate_block(
-                    else_block,
-                    state.next_local_index,
-                    state.new_locals,
-                    state.new_local_debug_hints,
-                )
-            });
-            (
-                vec![HirStmt::If(if_stmt)],
-                cond_changed || then_changed || else_changed,
-            )
+            let mut stmt = HirStmt::If(if_stmt);
+            let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state);
+            (vec![stmt], cond_changed || nested_changed)
         }
         HirStmt::While(mut while_stmt) => {
             let cond_changed = eliminate_condition_expr(&mut while_stmt.cond);
-            let body_changed = eliminate_block(
-                &mut while_stmt.body,
-                state.next_local_index,
-                state.new_locals,
-                state.new_local_debug_hints,
-            );
-            (
-                vec![HirStmt::While(while_stmt)],
-                cond_changed || body_changed,
-            )
+            let mut stmt = HirStmt::While(while_stmt);
+            let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state);
+            (vec![stmt], cond_changed || nested_changed)
         }
         HirStmt::Repeat(mut repeat_stmt) => {
-            let body_changed = eliminate_block(
-                &mut repeat_stmt.body,
-                state.next_local_index,
-                state.new_locals,
-                state.new_local_debug_hints,
-            );
             let cond_changed = eliminate_condition_expr(&mut repeat_stmt.cond);
-            (
-                vec![HirStmt::Repeat(repeat_stmt)],
-                body_changed || cond_changed,
-            )
+            let mut stmt = HirStmt::Repeat(repeat_stmt);
+            let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state);
+            (vec![stmt], nested_changed || cond_changed)
         }
         HirStmt::NumericFor(numeric_for) => {
             let (mut prefix, numeric_for, changed) = extract_numeric_for(numeric_for, state);
-            prefix.push(HirStmt::NumericFor(numeric_for));
-            (prefix, changed)
+            let mut stmt = HirStmt::NumericFor(numeric_for);
+            let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state);
+            prefix.push(stmt);
+            (prefix, changed || nested_changed)
         }
         HirStmt::GenericFor(generic_for) => {
             let (mut prefix, generic_for, changed) = extract_generic_for(generic_for, state);
-            prefix.push(HirStmt::GenericFor(generic_for));
-            (prefix, changed)
+            let mut stmt = HirStmt::GenericFor(generic_for);
+            let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state);
+            prefix.push(stmt);
+            (prefix, changed || nested_changed)
         }
-        HirStmt::Block(mut block) => {
-            let changed = eliminate_block(
-                &mut block,
-                state.next_local_index,
-                state.new_locals,
-                state.new_local_debug_hints,
-            );
-            (vec![HirStmt::Block(block)], changed)
+        HirStmt::Block(block) => {
+            let mut stmt = HirStmt::Block(block);
+            let changed = eliminate_nested_blocks_in_stmt(&mut stmt, state);
+            (vec![stmt], changed)
         }
-        HirStmt::Unstructured(mut unstructured) => {
-            let changed = eliminate_block(
-                &mut unstructured.body,
-                state.next_local_index,
-                state.new_locals,
-                state.new_local_debug_hints,
-            );
-            (vec![HirStmt::Unstructured(unstructured)], changed)
+        HirStmt::Unstructured(unstructured) => {
+            let mut stmt = HirStmt::Unstructured(unstructured);
+            let changed = eliminate_nested_blocks_in_stmt(&mut stmt, state);
+            (vec![stmt], changed)
         }
         HirStmt::Break
         | HirStmt::Close(_)
@@ -255,6 +225,17 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
         | HirStmt::Goto(_)
         | HirStmt::Label(_) => (vec![stmt], false),
     }
+}
+
+fn eliminate_nested_blocks_in_stmt(stmt: &mut HirStmt, state: &mut EliminationState<'_>) -> bool {
+    rewrite_nested_blocks_in_stmt(stmt, &mut |block| {
+        eliminate_block(
+            block,
+            state.next_local_index,
+            state.new_locals,
+            state.new_local_debug_hints,
+        )
+    })
 }
 
 fn assign_target_supports_direct_materialization(target: &HirLValue) -> bool {
@@ -275,13 +256,7 @@ fn extract_numeric_for(
     numeric_for.start = exprs.remove(0);
     numeric_for.limit = exprs.remove(0);
     numeric_for.step = exprs.remove(0);
-    let body_changed = eliminate_block(
-        &mut numeric_for.body,
-        state.next_local_index,
-        state.new_locals,
-        state.new_local_debug_hints,
-    );
-    (prefix, numeric_for, exprs_changed || body_changed)
+    (prefix, numeric_for, exprs_changed)
 }
 
 fn extract_generic_for(
@@ -290,13 +265,7 @@ fn extract_generic_for(
 ) -> (Vec<HirStmt>, Box<HirGenericFor>, bool) {
     let (prefix, iterator, iterator_changed) = extract_value_exprs(generic_for.iterator, state);
     generic_for.iterator = iterator;
-    let body_changed = eliminate_block(
-        &mut generic_for.body,
-        state.next_local_index,
-        state.new_locals,
-        state.new_local_debug_hints,
-    );
-    (prefix, generic_for, iterator_changed || body_changed)
+    (prefix, generic_for, iterator_changed)
 }
 
 fn extract_call_expr(
@@ -835,52 +804,18 @@ fn eliminate_condition_expr(expr: &mut HirExpr) -> bool {
 }
 
 fn expr_contains_decision(expr: &HirExpr) -> bool {
-    match expr {
-        HirExpr::Decision(_) => true,
-        HirExpr::TableAccess(access) => {
-            expr_contains_decision(&access.base) || expr_contains_decision(&access.key)
-        }
-        HirExpr::Unary(unary) => expr_contains_decision(&unary.expr),
-        HirExpr::Binary(binary) => {
-            expr_contains_decision(&binary.lhs) || expr_contains_decision(&binary.rhs)
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            expr_contains_decision(&logical.lhs) || expr_contains_decision(&logical.rhs)
-        }
-        HirExpr::Call(call) => {
-            expr_contains_decision(&call.callee) || call.args.iter().any(expr_contains_decision)
-        }
-        HirExpr::TableConstructor(table) => {
-            table.fields.iter().any(|field| match field {
-                HirTableField::Array(expr) => expr_contains_decision(expr),
-                HirTableField::Record(field) => {
-                    matches!(&field.key, HirTableKey::Expr(expr) if expr_contains_decision(expr))
-                        || expr_contains_decision(&field.value)
-                }
-            }) || table
-                .trailing_multivalue
-                .as_ref()
-                .is_some_and(expr_contains_decision)
-        }
-        HirExpr::Closure(closure) => closure
-            .captures
-            .iter()
-            .any(|capture| expr_contains_decision(&capture.value)),
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => false,
+    let mut collector = DecisionPresenceCollector { found: false };
+    visit_expr(expr, &mut collector);
+    collector.found
+}
+
+struct DecisionPresenceCollector {
+    found: bool,
+}
+
+impl HirVisitor for DecisionPresenceCollector {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        self.found |= matches!(expr, HirExpr::Decision(_));
     }
 }
 

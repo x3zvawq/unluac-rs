@@ -14,6 +14,7 @@ mod locals;
 mod logical_simplify;
 mod table_constructors;
 mod temp_inline;
+mod visit;
 mod walk;
 
 use crate::hir::common::HirModule;

@@ -13,70 +13,47 @@
 
 use std::collections::BTreeSet;
 
-use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirProto, HirStmt, TempId};
+use crate::hir::common::{HirExpr, HirLValue, HirProto, HirStmt, TempId};
+
+use super::visit::{HirVisitor, visit_proto};
+use super::walk::{HirRewritePass, rewrite_proto};
 
 pub(super) fn resolve_recursive_closure_self_captures_in_proto(proto: &mut HirProto) -> bool {
-    let defined_temps = collect_defined_temps(&proto.body);
-    rewrite_block(&mut proto.body, &defined_temps)
+    let defined_temps = collect_defined_temps(proto);
+    let mut pass = RecursiveClosureSelfCapturePass {
+        defined_temps: &defined_temps,
+    };
+    rewrite_proto(proto, &mut pass)
 }
 
-fn rewrite_block(block: &mut HirBlock, defined_temps: &BTreeSet<TempId>) -> bool {
-    let mut changed = false;
-    for stmt in &mut block.stmts {
-        changed |= rewrite_nested(stmt, defined_temps);
-        changed |= rewrite_stmt_self_captures(stmt, defined_temps);
-    }
-    changed
+struct RecursiveClosureSelfCapturePass<'a> {
+    defined_temps: &'a BTreeSet<TempId>,
 }
 
-fn rewrite_nested(stmt: &mut HirStmt, defined_temps: &BTreeSet<TempId>) -> bool {
-    match stmt {
-        HirStmt::If(if_stmt) => {
-            let mut changed = rewrite_block(&mut if_stmt.then_block, defined_temps);
-            if let Some(else_block) = &mut if_stmt.else_block {
-                changed |= rewrite_block(else_block, defined_temps);
+impl HirRewritePass for RecursiveClosureSelfCapturePass<'_> {
+    fn rewrite_stmt(&mut self, stmt: &mut HirStmt) -> bool {
+        match stmt {
+            HirStmt::LocalDecl(local_decl)
+                if local_decl.bindings.len() == 1 && local_decl.values.len() == 1 =>
+            {
+                rewrite_closure_self_captures(
+                    &mut local_decl.values[0],
+                    HirExpr::LocalRef(local_decl.bindings[0]),
+                    self.defined_temps,
+                )
             }
-            changed
+            HirStmt::Assign(assign) if assign.targets.len() == 1 && assign.values.len() == 1 => {
+                let Some(binding_expr) = lvalue_as_expr(&assign.targets[0]) else {
+                    return false;
+                };
+                rewrite_closure_self_captures(
+                    &mut assign.values[0],
+                    binding_expr,
+                    self.defined_temps,
+                )
+            }
+            _ => false,
         }
-        HirStmt::While(while_stmt) => rewrite_block(&mut while_stmt.body, defined_temps),
-        HirStmt::Repeat(repeat_stmt) => rewrite_block(&mut repeat_stmt.body, defined_temps),
-        HirStmt::NumericFor(numeric_for) => rewrite_block(&mut numeric_for.body, defined_temps),
-        HirStmt::GenericFor(generic_for) => rewrite_block(&mut generic_for.body, defined_temps),
-        HirStmt::Block(block) => rewrite_block(block, defined_temps),
-        HirStmt::Unstructured(unstructured) => rewrite_block(&mut unstructured.body, defined_temps),
-        HirStmt::LocalDecl(_)
-        | HirStmt::Assign(_)
-        | HirStmt::TableSetList(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
-        | HirStmt::CallStmt(_)
-        | HirStmt::Return(_)
-        | HirStmt::Break
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => false,
-    }
-}
-
-fn rewrite_stmt_self_captures(stmt: &mut HirStmt, defined_temps: &BTreeSet<TempId>) -> bool {
-    match stmt {
-        HirStmt::LocalDecl(local_decl)
-            if local_decl.bindings.len() == 1 && local_decl.values.len() == 1 =>
-        {
-            rewrite_closure_self_captures(
-                &mut local_decl.values[0],
-                HirExpr::LocalRef(local_decl.bindings[0]),
-                defined_temps,
-            )
-        }
-        HirStmt::Assign(assign) if assign.targets.len() == 1 && assign.values.len() == 1 => {
-            let Some(binding_expr) = lvalue_as_expr(&assign.targets[0]) else {
-                return false;
-            };
-            rewrite_closure_self_captures(&mut assign.values[0], binding_expr, defined_temps)
-        }
-        _ => false,
     }
 }
 
@@ -113,56 +90,27 @@ fn lvalue_as_expr(target: &HirLValue) -> Option<HirExpr> {
     }
 }
 
-fn collect_defined_temps(block: &HirBlock) -> BTreeSet<TempId> {
-    let mut defined = BTreeSet::new();
-    collect_defined_temps_in_block(block, &mut defined);
-    defined
+fn collect_defined_temps(proto: &HirProto) -> BTreeSet<TempId> {
+    let mut collector = DefinedTempCollector::default();
+    visit_proto(proto, &mut collector);
+    collector.defined
 }
 
-fn collect_defined_temps_in_block(block: &HirBlock, defined: &mut BTreeSet<TempId>) {
-    for stmt in &block.stmts {
-        collect_defined_temps_in_stmt(stmt, defined);
-    }
+#[derive(Default)]
+struct DefinedTempCollector {
+    defined: BTreeSet<TempId>,
 }
 
-fn collect_defined_temps_in_stmt(stmt: &HirStmt, defined: &mut BTreeSet<TempId>) {
-    match stmt {
-        HirStmt::Assign(assign) => {
-            for target in &assign.targets {
-                if let HirLValue::Temp(temp) = target {
-                    defined.insert(*temp);
-                }
+impl HirVisitor for DefinedTempCollector {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        let HirStmt::Assign(assign) = stmt else {
+            return;
+        };
+        for target in &assign.targets {
+            if let HirLValue::Temp(temp) = target {
+                self.defined.insert(*temp);
             }
         }
-        HirStmt::If(if_stmt) => {
-            collect_defined_temps_in_block(&if_stmt.then_block, defined);
-            if let Some(else_block) = &if_stmt.else_block {
-                collect_defined_temps_in_block(else_block, defined);
-            }
-        }
-        HirStmt::While(while_stmt) => collect_defined_temps_in_block(&while_stmt.body, defined),
-        HirStmt::Repeat(repeat_stmt) => collect_defined_temps_in_block(&repeat_stmt.body, defined),
-        HirStmt::NumericFor(numeric_for) => {
-            collect_defined_temps_in_block(&numeric_for.body, defined);
-        }
-        HirStmt::GenericFor(generic_for) => {
-            collect_defined_temps_in_block(&generic_for.body, defined);
-        }
-        HirStmt::Block(block) => collect_defined_temps_in_block(block, defined),
-        HirStmt::Unstructured(unstructured) => {
-            collect_defined_temps_in_block(&unstructured.body, defined);
-        }
-        HirStmt::LocalDecl(_)
-        | HirStmt::TableSetList(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
-        | HirStmt::CallStmt(_)
-        | HirStmt::Return(_)
-        | HirStmt::Break
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => {}
     }
 }
 

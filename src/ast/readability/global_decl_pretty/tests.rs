@@ -234,7 +234,10 @@ fn lua55_does_not_add_global_decl_without_explicit_global_evidence() {
         }
     ));
 
-    assert!(matches!(module.body.stmts.as_slice(), [AstStmt::CallStmt(_)]));
+    assert!(matches!(
+        module.body.stmts.as_slice(),
+        [AstStmt::CallStmt(_)]
+    ));
 }
 
 #[test]

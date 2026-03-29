@@ -6,9 +6,10 @@
 //! 末端兜底，而是在 HIR 里基于 `<close>` 绑定和对应寄存器槽位，把它们重新收成
 //! `HirStmt::Block`，让后面的 AST lowering 自然落成 `do ... end`。
 
-use crate::hir::common::{
-    HirBlock, HirCallExpr, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId,
-};
+use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId};
+
+use super::visit::{HirVisitor, visit_stmts};
+use super::walk::{HirRewritePass, for_each_nested_block_mut, rewrite_proto};
 
 #[cfg(test)]
 mod tests;
@@ -43,60 +44,27 @@ impl ScopeActivity {
     fn any(self) -> bool {
         self.mentions_binding || self.closes_scope
     }
-
-    fn merge(&mut self, other: ScopeActivity) {
-        self.mentions_binding |= other.mentions_binding;
-        self.closes_scope |= other.closes_scope;
-    }
 }
 
 pub(super) fn materialize_tbc_close_scopes_in_proto(proto: &mut HirProto) -> bool {
-    materialize_block(&mut proto.body)
+    rewrite_proto(proto, &mut CloseScopePass)
+}
+
+struct CloseScopePass;
+
+impl HirRewritePass for CloseScopePass {
+    fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
+        materialize_block(block)
+    }
 }
 
 fn materialize_block(block: &mut HirBlock) -> bool {
-    let mut changed = false;
-    for stmt in &mut block.stmts {
-        changed |= materialize_stmt(stmt);
-    }
-
     let rewritten = rewrite_stmt_slice(&block.stmts);
     if rewritten != block.stmts {
         block.stmts = rewritten;
-        changed = true;
+        return true;
     }
-
-    changed
-}
-
-fn materialize_stmt(stmt: &mut HirStmt) -> bool {
-    match stmt {
-        HirStmt::If(if_stmt) => {
-            let mut changed = materialize_block(&mut if_stmt.then_block);
-            if let Some(else_block) = &mut if_stmt.else_block {
-                changed |= materialize_block(else_block);
-            }
-            changed
-        }
-        HirStmt::While(while_stmt) => materialize_block(&mut while_stmt.body),
-        HirStmt::Repeat(repeat_stmt) => materialize_block(&mut repeat_stmt.body),
-        HirStmt::NumericFor(numeric_for) => materialize_block(&mut numeric_for.body),
-        HirStmt::GenericFor(generic_for) => materialize_block(&mut generic_for.body),
-        HirStmt::Block(block) => materialize_block(block),
-        HirStmt::Unstructured(unstructured) => materialize_block(&mut unstructured.body),
-        HirStmt::LocalDecl(_)
-        | HirStmt::Assign(_)
-        | HirStmt::TableSetList(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
-        | HirStmt::CallStmt(_)
-        | HirStmt::Return(_)
-        | HirStmt::Break
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => false,
-    }
+    false
 }
 
 fn rewrite_stmt_slice(stmts: &[HirStmt]) -> Vec<HirStmt> {
@@ -258,51 +226,14 @@ fn rebuild_slice(
 }
 
 fn strip_matching_close_from_stmt(stmt: &mut HirStmt, active_scope_reg: Option<usize>) -> bool {
-    match stmt {
-        HirStmt::Close(close) => close.from_reg != 0 && active_scope_reg != Some(close.from_reg),
-        HirStmt::If(if_stmt) => {
-            strip_matching_close_from_block(&mut if_stmt.then_block, active_scope_reg);
-            if let Some(else_block) = &mut if_stmt.else_block {
-                strip_matching_close_from_block(else_block, active_scope_reg);
-            }
-            true
-        }
-        HirStmt::While(while_stmt) => {
-            strip_matching_close_from_block(&mut while_stmt.body, active_scope_reg);
-            true
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            strip_matching_close_from_block(&mut repeat_stmt.body, active_scope_reg);
-            true
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            strip_matching_close_from_block(&mut numeric_for.body, active_scope_reg);
-            true
-        }
-        HirStmt::GenericFor(generic_for) => {
-            strip_matching_close_from_block(&mut generic_for.body, active_scope_reg);
-            true
-        }
-        HirStmt::Block(block) => {
-            strip_matching_close_from_block(block, active_scope_reg);
-            true
-        }
-        HirStmt::Unstructured(unstructured) => {
-            strip_matching_close_from_block(&mut unstructured.body, active_scope_reg);
-            true
-        }
-        HirStmt::LocalDecl(_)
-        | HirStmt::Assign(_)
-        | HirStmt::TableSetList(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::CallStmt(_)
-        | HirStmt::Return(_)
-        | HirStmt::Break
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => true,
+    if let HirStmt::Close(close) = stmt {
+        return close.from_reg != 0 && active_scope_reg != Some(close.from_reg);
     }
+
+    for_each_nested_block_mut(stmt, &mut |block| {
+        strip_matching_close_from_block(block, active_scope_reg);
+    });
+    true
 }
 
 fn strip_matching_close_from_block(block: &mut HirBlock, active_scope_reg: Option<usize>) {
@@ -316,248 +247,114 @@ fn scope_activity_in_stmt(
     binding: ScopeBinding,
     reg_index: usize,
 ) -> ScopeActivity {
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => ScopeActivity {
-            mentions_binding: local_decl
-                .bindings
-                .iter()
-                .copied()
-                .any(|local| binding == ScopeBinding::Local(local))
-                || local_decl
-                    .values
-                    .iter()
-                    .any(|value| expr_mentions_binding(value, binding)),
-            closes_scope: false,
-        },
-        HirStmt::Assign(assign) => ScopeActivity {
-            mentions_binding: assign
-                .targets
-                .iter()
-                .any(|target| lvalue_mentions_binding(target, binding))
-                || assign
-                    .values
-                    .iter()
-                    .any(|value| expr_mentions_binding(value, binding)),
-            closes_scope: false,
-        },
-        HirStmt::TableSetList(set_list) => ScopeActivity {
-            mentions_binding: expr_mentions_binding(&set_list.base, binding)
-                || set_list
-                    .values
-                    .iter()
-                    .any(|value| expr_mentions_binding(value, binding))
-                || set_list
-                    .trailing_multivalue
-                    .as_ref()
-                    .is_some_and(|value| expr_mentions_binding(value, binding)),
-            closes_scope: false,
-        },
-        HirStmt::ErrNil(err_nil) => ScopeActivity {
-            mentions_binding: expr_mentions_binding(&err_nil.value, binding),
-            closes_scope: false,
-        },
-        HirStmt::ToBeClosed(to_be_closed) => ScopeActivity {
-            mentions_binding: expr_mentions_binding(&to_be_closed.value, binding),
-            closes_scope: false,
-        },
-        HirStmt::Close(close) => ScopeActivity {
-            mentions_binding: false,
-            closes_scope: close.from_reg == reg_index,
-        },
-        HirStmt::CallStmt(call_stmt) => scope_activity_in_call(&call_stmt.call, binding),
-        HirStmt::Return(ret) => ScopeActivity {
-            mentions_binding: ret
-                .values
-                .iter()
-                .any(|value| expr_mentions_binding(value, binding)),
-            closes_scope: false,
-        },
-        HirStmt::If(if_stmt) => {
-            let mut activity = ScopeActivity {
-                mentions_binding: expr_mentions_binding(&if_stmt.cond, binding),
-                closes_scope: false,
-            };
-            activity.merge(scope_activity_in_block(
-                &if_stmt.then_block,
-                binding,
-                reg_index,
-            ));
-            if let Some(else_block) = &if_stmt.else_block {
-                activity.merge(scope_activity_in_block(else_block, binding, reg_index));
-            }
-            activity
-        }
-        HirStmt::While(while_stmt) => {
-            let mut activity = ScopeActivity {
-                mentions_binding: expr_mentions_binding(&while_stmt.cond, binding),
-                closes_scope: false,
-            };
-            activity.merge(scope_activity_in_block(
-                &while_stmt.body,
-                binding,
-                reg_index,
-            ));
-            activity
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            let mut activity = scope_activity_in_block(&repeat_stmt.body, binding, reg_index);
-            activity.mentions_binding |= expr_mentions_binding(&repeat_stmt.cond, binding);
-            activity
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            let mut activity = ScopeActivity {
-                mentions_binding: binding == ScopeBinding::Local(numeric_for.binding)
-                    || expr_mentions_binding(&numeric_for.start, binding)
-                    || expr_mentions_binding(&numeric_for.limit, binding)
-                    || expr_mentions_binding(&numeric_for.step, binding),
-                closes_scope: false,
-            };
-            activity.merge(scope_activity_in_block(
-                &numeric_for.body,
-                binding,
-                reg_index,
-            ));
-            activity
-        }
-        HirStmt::GenericFor(generic_for) => {
-            let mut activity = ScopeActivity {
-                mentions_binding: generic_for
+    let mut collector = ScopeActivityCollector {
+        binding,
+        reg_index,
+        activity: ScopeActivity::default(),
+    };
+    visit_stmts(std::slice::from_ref(stmt), &mut collector);
+    collector.activity
+}
+
+struct ScopeActivityCollector {
+    binding: ScopeBinding,
+    reg_index: usize,
+    activity: ScopeActivity,
+}
+
+impl ScopeActivityCollector {
+    fn binding_matches_local(&self, local: LocalId) -> bool {
+        self.binding == ScopeBinding::Local(local)
+    }
+
+    fn binding_matches_temp(&self, temp: TempId) -> bool {
+        self.binding == ScopeBinding::Temp(temp)
+    }
+}
+
+impl HirVisitor for ScopeActivityCollector {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        match stmt {
+            HirStmt::LocalDecl(local_decl) => {
+                self.activity.mentions_binding |= local_decl
                     .bindings
                     .iter()
                     .copied()
-                    .any(|local| binding == ScopeBinding::Local(local))
-                    || generic_for
-                        .iterator
-                        .iter()
-                        .any(|expr| expr_mentions_binding(expr, binding)),
-                closes_scope: false,
-            };
-            activity.merge(scope_activity_in_block(
-                &generic_for.body,
-                binding,
-                reg_index,
-            ));
-            activity
-        }
-        HirStmt::Block(block) => scope_activity_in_block(block, binding, reg_index),
-        HirStmt::Unstructured(unstructured) => {
-            scope_activity_in_block(&unstructured.body, binding, reg_index)
-        }
-        HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => {
-            ScopeActivity::default()
-        }
-    }
-}
-
-fn scope_activity_in_block(
-    block: &HirBlock,
-    binding: ScopeBinding,
-    reg_index: usize,
-) -> ScopeActivity {
-    let mut activity = ScopeActivity::default();
-    for stmt in &block.stmts {
-        activity.merge(scope_activity_in_stmt(stmt, binding, reg_index));
-    }
-    activity
-}
-
-fn scope_activity_in_call(call: &HirCallExpr, binding: ScopeBinding) -> ScopeActivity {
-    ScopeActivity {
-        mentions_binding: expr_mentions_binding(&call.callee, binding)
-            || call
-                .args
-                .iter()
-                .any(|arg| expr_mentions_binding(arg, binding)),
-        closes_scope: false,
-    }
-}
-
-fn lvalue_mentions_binding(target: &HirLValue, binding: ScopeBinding) -> bool {
-    match target {
-        HirLValue::Temp(temp) => binding == ScopeBinding::Temp(*temp),
-        HirLValue::Local(local) => binding == ScopeBinding::Local(*local),
-        HirLValue::Upvalue(_) | HirLValue::Global(_) => false,
-        HirLValue::TableAccess(access) => {
-            expr_mentions_binding(&access.base, binding)
-                || expr_mentions_binding(&access.key, binding)
+                    .any(|local| self.binding_matches_local(local));
+            }
+            HirStmt::Close(close) => {
+                self.activity.closes_scope |= close.from_reg == self.reg_index;
+            }
+            HirStmt::NumericFor(numeric_for) => {
+                self.activity.mentions_binding |= self.binding_matches_local(numeric_for.binding);
+            }
+            HirStmt::GenericFor(generic_for) => {
+                self.activity.mentions_binding |= generic_for
+                    .bindings
+                    .iter()
+                    .copied()
+                    .any(|local| self.binding_matches_local(local));
+            }
+            HirStmt::Assign(_)
+            | HirStmt::TableSetList(_)
+            | HirStmt::ErrNil(_)
+            | HirStmt::ToBeClosed(_)
+            | HirStmt::CallStmt(_)
+            | HirStmt::Return(_)
+            | HirStmt::If(_)
+            | HirStmt::While(_)
+            | HirStmt::Repeat(_)
+            | HirStmt::Block(_)
+            | HirStmt::Unstructured(_)
+            | HirStmt::Break
+            | HirStmt::Continue
+            | HirStmt::Goto(_)
+            | HirStmt::Label(_) => {}
         }
     }
-}
 
-fn expr_mentions_binding(expr: &HirExpr, binding: ScopeBinding) -> bool {
-    match expr {
-        HirExpr::LocalRef(local) => binding == ScopeBinding::Local(*local),
-        HirExpr::TempRef(temp) => binding == ScopeBinding::Temp(*temp),
-        HirExpr::TableAccess(access) => {
-            expr_mentions_binding(&access.base, binding)
-                || expr_mentions_binding(&access.key, binding)
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        match expr {
+            HirExpr::LocalRef(local) => {
+                self.activity.mentions_binding |= self.binding_matches_local(*local);
+            }
+            HirExpr::TempRef(temp) => {
+                self.activity.mentions_binding |= self.binding_matches_temp(*temp);
+            }
+            HirExpr::Nil
+            | HirExpr::Boolean(_)
+            | HirExpr::Integer(_)
+            | HirExpr::Number(_)
+            | HirExpr::String(_)
+            | HirExpr::Int64(_)
+            | HirExpr::UInt64(_)
+            | HirExpr::Complex { .. }
+            | HirExpr::ParamRef(_)
+            | HirExpr::UpvalueRef(_)
+            | HirExpr::GlobalRef(_)
+            | HirExpr::VarArg
+            | HirExpr::Unresolved(_)
+            | HirExpr::TableAccess(_)
+            | HirExpr::Unary(_)
+            | HirExpr::Binary(_)
+            | HirExpr::LogicalAnd(_)
+            | HirExpr::LogicalOr(_)
+            | HirExpr::Decision(_)
+            | HirExpr::Call(_)
+            | HirExpr::TableConstructor(_)
+            | HirExpr::Closure(_) => {}
         }
-        HirExpr::Unary(unary) => expr_mentions_binding(&unary.expr, binding),
-        HirExpr::Binary(binary) => {
-            expr_mentions_binding(&binary.lhs, binding)
-                || expr_mentions_binding(&binary.rhs, binding)
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            expr_mentions_binding(&logical.lhs, binding)
-                || expr_mentions_binding(&logical.rhs, binding)
-        }
-        HirExpr::Decision(decision) => decision.nodes.iter().any(|node| {
-            expr_mentions_binding(&node.test, binding)
-                || decision_target_mentions_binding(&node.truthy, binding)
-                || decision_target_mentions_binding(&node.falsy, binding)
-        }),
-        HirExpr::Call(call) => scope_activity_in_call(call, binding).mentions_binding,
-        HirExpr::TableConstructor(table) => {
-            table.fields.iter().any(|field| match field {
-                crate::hir::common::HirTableField::Array(value) => {
-                    expr_mentions_binding(value, binding)
-                }
-                crate::hir::common::HirTableField::Record(record) => {
-                    record_key_mentions_binding(&record.key, binding)
-                        || expr_mentions_binding(&record.value, binding)
-                }
-            }) || table
-                .trailing_multivalue
-                .as_ref()
-                .is_some_and(|value| expr_mentions_binding(value, binding))
-        }
-        HirExpr::Closure(closure) => closure
-            .captures
-            .iter()
-            .any(|capture| expr_mentions_binding(&capture.value, binding)),
-        HirExpr::Unresolved(_)
-        | HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg => false,
     }
-}
 
-fn decision_target_mentions_binding(
-    target: &crate::hir::common::HirDecisionTarget,
-    binding: ScopeBinding,
-) -> bool {
-    match target {
-        crate::hir::common::HirDecisionTarget::Node(_) => false,
-        crate::hir::common::HirDecisionTarget::CurrentValue => false,
-        crate::hir::common::HirDecisionTarget::Expr(expr) => expr_mentions_binding(expr, binding),
-    }
-}
-
-fn record_key_mentions_binding(
-    key: &crate::hir::common::HirTableKey,
-    binding: ScopeBinding,
-) -> bool {
-    match key {
-        crate::hir::common::HirTableKey::Name(_) => false,
-        crate::hir::common::HirTableKey::Expr(expr) => expr_mentions_binding(expr, binding),
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        match lvalue {
+            HirLValue::Temp(temp) => {
+                self.activity.mentions_binding |= self.binding_matches_temp(*temp);
+            }
+            HirLValue::Local(local) => {
+                self.activity.mentions_binding |= self.binding_matches_local(*local);
+            }
+            HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => {}
+        }
     }
 }

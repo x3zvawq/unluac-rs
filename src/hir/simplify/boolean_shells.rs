@@ -1,35 +1,53 @@
 //! 这个文件负责清理已经失去职责的值物化分支壳。
 //!
-//! 当 HIR 前面已经把 merge 值恢复成直接的值表达式时，原先那种
-//! `if cond then t=value else f=fallback end` 的结构壳就只剩下机械噪音了。
-//! 这里专门删除这一类“纯值物化、无副作用、目标 temp 已经没人再读”的壳，
-//! 避免把真正承担控制语义的 `if/else` 结构误删掉。
+//! 它依赖更前面的 HIR 决策已经把“真正承载语义的 merge 值”恢复成直接表达式；
+//! 走到这里时，某些 `if cond then t=true else t=false end` 只剩下机械性的值物化。
+//! 这里专门删除这一类纯值壳，或者把它们折回单条赋值，避免把真正承担控制语义的
+//! `if/else` 结构误删掉。
+//!
+//! 它不会越权去重新判断 branch/loop 是否应该结构化，也不会替前层补决策。
+//! 这里唯一关心的是：当前 `if` 是否已经退化成“无副作用的布尔值搬运壳”。
+//!
+//! 例子：
+//! - 输入：`if cond then t = true else t = false end`
+//! - 输出：`t = cond or false`
+//! - 如果 `t` 后面已经没人再读，且 `cond/true/false` 都无副作用，则整段壳会被删除
 
 use std::collections::BTreeMap;
 
 use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirLValue, HirLocalDecl, HirLogicalExpr, HirProto, HirStmt,
-    HirTableField, HirUnaryExpr, HirUnaryOpKind, LocalId, TempId,
+    HirUnaryExpr, HirUnaryOpKind, LocalId, TempId,
 };
 
+use super::visit::{HirVisitor, visit_proto};
+use super::walk::{HirRewritePass, rewrite_proto};
+
 pub(super) fn remove_boolean_materialization_shells_in_proto(proto: &mut HirProto) -> bool {
-    let mut use_counts = BTreeMap::new();
-    collect_block_temp_uses(&proto.body, &mut use_counts);
-    remove_dead_materialization_shells_in_block(&mut proto.body, &use_counts)
-        | collapse_live_boolean_materialization_shells_in_block(&mut proto.body)
+    let use_counts = collect_temp_use_counts(proto);
+    let mut dead_shell_pass = DeadBooleanShellPass {
+        use_counts: &use_counts,
+    };
+    let mut collapse_shell_pass = CollapseBooleanShellPass;
+    rewrite_proto(proto, &mut dead_shell_pass) | rewrite_proto(proto, &mut collapse_shell_pass)
 }
 
-fn remove_dead_materialization_shells_in_block(
+struct DeadBooleanShellPass<'a> {
+    use_counts: &'a BTreeMap<TempId, usize>,
+}
+
+impl HirRewritePass for DeadBooleanShellPass<'_> {
+    fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
+        remove_dead_materialization_shells_from_block(block, self.use_counts)
+    }
+}
+
+fn remove_dead_materialization_shells_from_block(
     block: &mut HirBlock,
     use_counts: &BTreeMap<TempId, usize>,
 ) -> bool {
-    let mut changed = false;
-
-    for stmt in &mut block.stmts {
-        changed |= remove_dead_materialization_shells_in_nested(stmt, use_counts);
-    }
-
     let mut index = 0;
+    let mut changed = false;
     while index < block.stmts.len() {
         if removable_dead_materialization_shell(&block.stmts[index], use_counts) {
             block.stmts.remove(index);
@@ -42,14 +60,17 @@ fn remove_dead_materialization_shells_in_block(
     changed
 }
 
-fn collapse_live_boolean_materialization_shells_in_block(block: &mut HirBlock) -> bool {
-    let mut changed = false;
+struct CollapseBooleanShellPass;
 
-    for stmt in &mut block.stmts {
-        changed |= collapse_live_boolean_materialization_shells_in_nested(stmt);
+impl HirRewritePass for CollapseBooleanShellPass {
+    fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
+        collapse_live_boolean_materialization_shells_in_block(block)
     }
+}
 
+fn collapse_live_boolean_materialization_shells_in_block(block: &mut HirBlock) -> bool {
     let mut index = 0;
+    let mut changed = false;
     while index < block.stmts.len() {
         let Some((target, value)) =
             collapsible_live_boolean_materialization_shell(&block.stmts[index])
@@ -83,47 +104,6 @@ fn collapse_live_boolean_materialization_shells_in_block(block: &mut HirBlock) -
     changed
 }
 
-fn collapse_live_boolean_materialization_shells_in_nested(stmt: &mut HirStmt) -> bool {
-    match stmt {
-        HirStmt::If(if_stmt) => {
-            let mut changed =
-                collapse_live_boolean_materialization_shells_in_block(&mut if_stmt.then_block);
-            if let Some(else_block) = &mut if_stmt.else_block {
-                changed |= collapse_live_boolean_materialization_shells_in_block(else_block);
-            }
-            changed
-        }
-        HirStmt::While(while_stmt) => {
-            collapse_live_boolean_materialization_shells_in_block(&mut while_stmt.body)
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            collapse_live_boolean_materialization_shells_in_block(&mut repeat_stmt.body)
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            collapse_live_boolean_materialization_shells_in_block(&mut numeric_for.body)
-        }
-        HirStmt::GenericFor(generic_for) => {
-            collapse_live_boolean_materialization_shells_in_block(&mut generic_for.body)
-        }
-        HirStmt::Block(block) => collapse_live_boolean_materialization_shells_in_block(block),
-        HirStmt::Unstructured(unstructured) => {
-            collapse_live_boolean_materialization_shells_in_block(&mut unstructured.body)
-        }
-        HirStmt::LocalDecl(_)
-        | HirStmt::Assign(_)
-        | HirStmt::TableSetList(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
-        | HirStmt::CallStmt(_)
-        | HirStmt::Return(_)
-        | HirStmt::Break
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => false,
-    }
-}
-
 fn collapsible_live_boolean_materialization_shell(stmt: &HirStmt) -> Option<(HirLValue, HirExpr)> {
     let HirStmt::If(if_stmt) = stmt else {
         return None;
@@ -151,50 +131,6 @@ fn collapsible_live_boolean_materialization_shell(stmt: &HirStmt) -> Option<(Hir
             })),
         )),
         _ => None,
-    }
-}
-
-fn remove_dead_materialization_shells_in_nested(
-    stmt: &mut HirStmt,
-    use_counts: &BTreeMap<TempId, usize>,
-) -> bool {
-    match stmt {
-        HirStmt::If(if_stmt) => {
-            let mut changed =
-                remove_dead_materialization_shells_in_block(&mut if_stmt.then_block, use_counts);
-            if let Some(else_block) = &mut if_stmt.else_block {
-                changed |= remove_dead_materialization_shells_in_block(else_block, use_counts);
-            }
-            changed
-        }
-        HirStmt::While(while_stmt) => {
-            remove_dead_materialization_shells_in_block(&mut while_stmt.body, use_counts)
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            remove_dead_materialization_shells_in_block(&mut repeat_stmt.body, use_counts)
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            remove_dead_materialization_shells_in_block(&mut numeric_for.body, use_counts)
-        }
-        HirStmt::GenericFor(generic_for) => {
-            remove_dead_materialization_shells_in_block(&mut generic_for.body, use_counts)
-        }
-        HirStmt::Block(block) => remove_dead_materialization_shells_in_block(block, use_counts),
-        HirStmt::Unstructured(unstructured) => {
-            remove_dead_materialization_shells_in_block(&mut unstructured.body, use_counts)
-        }
-        HirStmt::LocalDecl(_)
-        | HirStmt::Assign(_)
-        | HirStmt::TableSetList(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
-        | HirStmt::CallStmt(_)
-        | HirStmt::Return(_)
-        | HirStmt::Break
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => false,
     }
 }
 
@@ -287,174 +223,22 @@ fn expr_is_boolean_valued(expr: &HirExpr) -> bool {
     }
 }
 
-fn collect_block_temp_uses(block: &HirBlock, use_counts: &mut BTreeMap<TempId, usize>) {
-    for stmt in &block.stmts {
-        collect_stmt_temp_uses(stmt, use_counts);
-    }
+fn collect_temp_use_counts(proto: &HirProto) -> BTreeMap<TempId, usize> {
+    let mut collector = TempUseCollector::default();
+    visit_proto(proto, &mut collector);
+    collector.use_counts
 }
 
-fn collect_stmt_temp_uses(stmt: &HirStmt, use_counts: &mut BTreeMap<TempId, usize>) {
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => {
-            for value in &local_decl.values {
-                collect_expr_temp_uses(value, use_counts);
-            }
-        }
-        HirStmt::Assign(assign) => {
-            for target in &assign.targets {
-                collect_lvalue_temp_uses(target, use_counts);
-            }
-            for value in &assign.values {
-                collect_expr_temp_uses(value, use_counts);
-            }
-        }
-        HirStmt::TableSetList(set_list) => {
-            collect_expr_temp_uses(&set_list.base, use_counts);
-            for value in &set_list.values {
-                collect_expr_temp_uses(value, use_counts);
-            }
-            if let Some(trailing) = &set_list.trailing_multivalue {
-                collect_expr_temp_uses(trailing, use_counts);
-            }
-        }
-        HirStmt::ErrNil(err_nil) => {
-            collect_expr_temp_uses(&err_nil.value, use_counts);
-        }
-        HirStmt::ToBeClosed(to_be_closed) => {
-            collect_expr_temp_uses(&to_be_closed.value, use_counts);
-        }
-        HirStmt::CallStmt(call_stmt) => {
-            collect_expr_temp_uses(&call_stmt.call.callee, use_counts);
-            for arg in &call_stmt.call.args {
-                collect_expr_temp_uses(arg, use_counts);
-            }
-        }
-        HirStmt::Return(ret) => {
-            for value in &ret.values {
-                collect_expr_temp_uses(value, use_counts);
-            }
-        }
-        HirStmt::If(if_stmt) => {
-            collect_expr_temp_uses(&if_stmt.cond, use_counts);
-            collect_block_temp_uses(&if_stmt.then_block, use_counts);
-            if let Some(else_block) = &if_stmt.else_block {
-                collect_block_temp_uses(else_block, use_counts);
-            }
-        }
-        HirStmt::While(while_stmt) => {
-            collect_expr_temp_uses(&while_stmt.cond, use_counts);
-            collect_block_temp_uses(&while_stmt.body, use_counts);
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            collect_block_temp_uses(&repeat_stmt.body, use_counts);
-            collect_expr_temp_uses(&repeat_stmt.cond, use_counts);
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            collect_expr_temp_uses(&numeric_for.start, use_counts);
-            collect_expr_temp_uses(&numeric_for.limit, use_counts);
-            collect_expr_temp_uses(&numeric_for.step, use_counts);
-            collect_block_temp_uses(&numeric_for.body, use_counts);
-        }
-        HirStmt::GenericFor(generic_for) => {
-            for value in &generic_for.iterator {
-                collect_expr_temp_uses(value, use_counts);
-            }
-            collect_block_temp_uses(&generic_for.body, use_counts);
-        }
-        HirStmt::Block(block) => collect_block_temp_uses(block, use_counts),
-        HirStmt::Unstructured(unstructured) => {
-            collect_block_temp_uses(&unstructured.body, use_counts)
-        }
-        HirStmt::Break
-        | HirStmt::Close(_)
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => {}
-    }
+#[derive(Default)]
+struct TempUseCollector {
+    use_counts: BTreeMap<TempId, usize>,
 }
 
-fn collect_lvalue_temp_uses(lvalue: &HirLValue, use_counts: &mut BTreeMap<TempId, usize>) {
-    if let HirLValue::TableAccess(access) = lvalue {
-        collect_expr_temp_uses(&access.base, use_counts);
-        collect_expr_temp_uses(&access.key, use_counts);
-    }
-}
-
-fn collect_expr_temp_uses(expr: &HirExpr, use_counts: &mut BTreeMap<TempId, usize>) {
-    match expr {
-        HirExpr::TempRef(temp) => {
-            *use_counts.entry(*temp).or_insert(0) += 1;
+impl HirVisitor for TempUseCollector {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        if let HirExpr::TempRef(temp) = expr {
+            *self.use_counts.entry(*temp).or_default() += 1;
         }
-        HirExpr::TableAccess(access) => {
-            collect_expr_temp_uses(&access.base, use_counts);
-            collect_expr_temp_uses(&access.key, use_counts);
-        }
-        HirExpr::Unary(unary) => collect_expr_temp_uses(&unary.expr, use_counts),
-        HirExpr::Binary(binary) => {
-            collect_expr_temp_uses(&binary.lhs, use_counts);
-            collect_expr_temp_uses(&binary.rhs, use_counts);
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            collect_expr_temp_uses(&logical.lhs, use_counts);
-            collect_expr_temp_uses(&logical.rhs, use_counts);
-        }
-        HirExpr::Decision(decision) => {
-            for node in &decision.nodes {
-                collect_expr_temp_uses(&node.test, use_counts);
-                collect_decision_target_temp_uses(&node.truthy, use_counts);
-                collect_decision_target_temp_uses(&node.falsy, use_counts);
-            }
-        }
-        HirExpr::Call(call) => {
-            collect_expr_temp_uses(&call.callee, use_counts);
-            for arg in &call.args {
-                collect_expr_temp_uses(arg, use_counts);
-            }
-        }
-        HirExpr::TableConstructor(table) => {
-            for field in &table.fields {
-                match field {
-                    HirTableField::Array(expr) => collect_expr_temp_uses(expr, use_counts),
-                    HirTableField::Record(field) => {
-                        if let crate::hir::common::HirTableKey::Expr(expr) = &field.key {
-                            collect_expr_temp_uses(expr, use_counts);
-                        }
-                        collect_expr_temp_uses(&field.value, use_counts);
-                    }
-                }
-            }
-            if let Some(expr) = &table.trailing_multivalue {
-                collect_expr_temp_uses(expr, use_counts);
-            }
-        }
-        HirExpr::Closure(closure) => {
-            for capture in &closure.captures {
-                collect_expr_temp_uses(&capture.value, use_counts);
-            }
-        }
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => {}
-    }
-}
-
-fn collect_decision_target_temp_uses(
-    target: &crate::hir::common::HirDecisionTarget,
-    use_counts: &mut BTreeMap<TempId, usize>,
-) {
-    if let crate::hir::common::HirDecisionTarget::Expr(expr) = target {
-        collect_expr_temp_uses(expr, use_counts);
     }
 }
 

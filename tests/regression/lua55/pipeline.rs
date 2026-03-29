@@ -1,8 +1,8 @@
 //! 这些测试固定 Lua 5.5 已经修好的回归点。
 
 use unluac::decompile::{
-    decompile, DebugColorMode, DebugDetail, DebugOptions, DecompileDialect, DecompileOptions,
-    DecompileStage,
+    DebugColorMode, DebugDetail, DebugOptions, DecompileDialect, DecompileOptions, DecompileStage,
+    decompile,
 };
 
 mod decompile_pipeline {

@@ -5,8 +5,8 @@
 use super::*;
 
 use crate::hir::common::{
-    HirAssign, HirCallExpr, HirClosureExpr, HirExpr, HirGlobalRef, HirLValue, HirLocalDecl,
-    HirReturn, HirTableField, HirTableKey, HirTableSetList,
+    HirAssign, HirBlock, HirCallExpr, HirClosureExpr, HirExpr, HirGlobalRef, HirLValue,
+    HirLocalDecl, HirReturn, HirStmt, HirTableField, HirTableKey, HirTableSetList,
 };
 use crate::parser::{ProtoLineRange, ProtoSignature};
 
@@ -237,7 +237,7 @@ fn folds_set_list_with_trailing_multivalue_into_constructor_tail() {
         .expect("rewritten constructor region should still end with return");
     assert!(matches!(
         ret,
-        HirStmt::Return(ret) if matches!(ret.values.as_slice(), [HirExpr::LocalRef(local)] if *local == table_local)
+        HirStmt::Return(ret) if matches!(ret.values.as_slice(), [HirExpr::LocalRef(local)] if local == &table_local)
     ));
 }
 

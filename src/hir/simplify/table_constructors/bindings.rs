@@ -11,6 +11,7 @@ use crate::hir::common::{
 };
 
 use super::TableBinding;
+use crate::hir::simplify::visit::{HirVisitor, visit_block, visit_stmts};
 
 pub(super) fn binding_from_lvalue(lvalue: &HirLValue) -> Option<TableBinding> {
     match lvalue {
@@ -42,19 +43,17 @@ pub(super) fn table_key_from_expr(expr: &HirExpr) -> HirTableKey {
 }
 
 pub(super) fn collect_stmt_slice_bindings(stmts: &[HirStmt]) -> BTreeSet<TableBinding> {
-    let mut bindings = BTreeSet::new();
-    for stmt in stmts {
-        collect_stmt_bindings(stmt, &mut bindings);
-    }
-    bindings
+    let mut collector = BindingUseCollector::default();
+    visit_stmts(stmts, &mut collector);
+    collector.bindings
 }
 
 pub(super) fn collect_materialized_binding_counts(
     block: &crate::hir::common::HirBlock,
 ) -> BTreeMap<TableBinding, usize> {
-    let mut counts = BTreeMap::new();
-    collect_block_materialized_bindings(block, &mut counts);
-    counts
+    let mut collector = MaterializedBindingCollector::default();
+    visit_block(block, &mut collector);
+    collector.counts
 }
 
 pub(super) fn expr_depends_on_any_binding(expr: &HirExpr, bindings: &[TableBinding]) -> bool {
@@ -127,246 +126,72 @@ fn is_identifier_name(name: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-fn collect_stmt_bindings(stmt: &HirStmt, bindings: &mut BTreeSet<TableBinding>) {
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => {
-            for value in &local_decl.values {
-                collect_expr_bindings(value, bindings);
-            }
+#[derive(Default)]
+struct BindingUseCollector {
+    bindings: BTreeSet<TableBinding>,
+}
+
+impl HirVisitor for BindingUseCollector {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        if let Some(binding) = binding_from_expr(expr) {
+            self.bindings.insert(binding);
         }
-        HirStmt::Assign(assign) => {
-            for target in &assign.targets {
-                collect_lvalue_bindings(target, bindings);
-            }
-            for value in &assign.values {
-                collect_expr_bindings(value, bindings);
-            }
-        }
-        HirStmt::TableSetList(set_list) => {
-            collect_expr_bindings(&set_list.base, bindings);
-            for value in &set_list.values {
-                collect_expr_bindings(value, bindings);
-            }
-            if let Some(trailing) = &set_list.trailing_multivalue {
-                collect_expr_bindings(trailing, bindings);
-            }
-        }
-        HirStmt::ErrNil(err_nil) => collect_expr_bindings(&err_nil.value, bindings),
-        HirStmt::ToBeClosed(to_be_closed) => collect_expr_bindings(&to_be_closed.value, bindings),
-        HirStmt::CallStmt(call_stmt) => collect_call_bindings(&call_stmt.call, bindings),
-        HirStmt::Return(ret) => {
-            for value in &ret.values {
-                collect_expr_bindings(value, bindings);
-            }
-        }
-        HirStmt::If(if_stmt) => {
-            collect_expr_bindings(&if_stmt.cond, bindings);
-            collect_stmt_slice_bindings_into(&if_stmt.then_block.stmts, bindings);
-            if let Some(else_block) = &if_stmt.else_block {
-                collect_stmt_slice_bindings_into(&else_block.stmts, bindings);
-            }
-        }
-        HirStmt::While(while_stmt) => {
-            collect_expr_bindings(&while_stmt.cond, bindings);
-            collect_stmt_slice_bindings_into(&while_stmt.body.stmts, bindings);
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            collect_stmt_slice_bindings_into(&repeat_stmt.body.stmts, bindings);
-            collect_expr_bindings(&repeat_stmt.cond, bindings);
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            collect_expr_bindings(&numeric_for.start, bindings);
-            collect_expr_bindings(&numeric_for.limit, bindings);
-            collect_expr_bindings(&numeric_for.step, bindings);
-            collect_stmt_slice_bindings_into(&numeric_for.body.stmts, bindings);
-        }
-        HirStmt::GenericFor(generic_for) => {
-            for value in &generic_for.iterator {
-                collect_expr_bindings(value, bindings);
-            }
-            collect_stmt_slice_bindings_into(&generic_for.body.stmts, bindings);
-        }
-        HirStmt::Block(block) => collect_stmt_slice_bindings_into(&block.stmts, bindings),
-        HirStmt::Unstructured(unstructured) => {
-            collect_stmt_slice_bindings_into(&unstructured.body.stmts, bindings);
-        }
-        HirStmt::Break
-        | HirStmt::Close(_)
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => {}
     }
 }
 
-fn collect_block_materialized_bindings(
-    block: &crate::hir::common::HirBlock,
-    counts: &mut BTreeMap<TableBinding, usize>,
-) {
-    for stmt in &block.stmts {
-        collect_stmt_materialized_bindings(stmt, counts);
-    }
+#[derive(Default)]
+struct MaterializedBindingCollector {
+    counts: BTreeMap<TableBinding, usize>,
 }
 
-fn collect_stmt_materialized_bindings(stmt: &HirStmt, counts: &mut BTreeMap<TableBinding, usize>) {
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => {
-            for binding in &local_decl.bindings {
-                *counts.entry(TableBinding::Local(*binding)).or_default() += 1;
-            }
-        }
-        HirStmt::Assign(assign) => {
-            for target in &assign.targets {
-                if let Some(binding) = binding_from_lvalue(target) {
-                    *counts.entry(binding).or_default() += 1;
+impl HirVisitor for MaterializedBindingCollector {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        match stmt {
+            HirStmt::LocalDecl(local_decl) => {
+                for binding in &local_decl.bindings {
+                    *self
+                        .counts
+                        .entry(TableBinding::Local(*binding))
+                        .or_default() += 1;
                 }
             }
-        }
-        HirStmt::If(if_stmt) => {
-            collect_block_materialized_bindings(&if_stmt.then_block, counts);
-            if let Some(else_block) = &if_stmt.else_block {
-                collect_block_materialized_bindings(else_block, counts);
-            }
-        }
-        HirStmt::While(while_stmt) => collect_block_materialized_bindings(&while_stmt.body, counts),
-        HirStmt::Repeat(repeat_stmt) => {
-            collect_block_materialized_bindings(&repeat_stmt.body, counts);
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            *counts
-                .entry(TableBinding::Local(numeric_for.binding))
-                .or_default() += 1;
-            collect_block_materialized_bindings(&numeric_for.body, counts);
-        }
-        HirStmt::GenericFor(generic_for) => {
-            for binding in &generic_for.bindings {
-                *counts.entry(TableBinding::Local(*binding)).or_default() += 1;
-            }
-            collect_block_materialized_bindings(&generic_for.body, counts);
-        }
-        HirStmt::Block(block) => collect_block_materialized_bindings(block, counts),
-        HirStmt::Unstructured(unstructured) => {
-            collect_block_materialized_bindings(&unstructured.body, counts);
-        }
-        HirStmt::TableSetList(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
-        | HirStmt::CallStmt(_)
-        | HirStmt::Return(_)
-        | HirStmt::Break
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => {}
-    }
-}
-
-fn collect_stmt_slice_bindings_into(stmts: &[HirStmt], bindings: &mut BTreeSet<TableBinding>) {
-    for stmt in stmts {
-        collect_stmt_bindings(stmt, bindings);
-    }
-}
-
-fn collect_lvalue_bindings(lvalue: &HirLValue, bindings: &mut BTreeSet<TableBinding>) {
-    match lvalue {
-        HirLValue::Temp(temp) => {
-            bindings.insert(TableBinding::Temp(*temp));
-        }
-        HirLValue::Local(local) => {
-            bindings.insert(TableBinding::Local(*local));
-        }
-        HirLValue::TableAccess(access) => {
-            collect_expr_bindings(&access.base, bindings);
-            collect_expr_bindings(&access.key, bindings);
-        }
-        HirLValue::Upvalue(_) | HirLValue::Global(_) => {}
-    }
-}
-
-fn collect_call_bindings(call: &HirCallExpr, bindings: &mut BTreeSet<TableBinding>) {
-    collect_expr_bindings(&call.callee, bindings);
-    for arg in &call.args {
-        collect_expr_bindings(arg, bindings);
-    }
-}
-
-fn collect_expr_bindings(expr: &HirExpr, bindings: &mut BTreeSet<TableBinding>) {
-    if let Some(binding) = binding_from_expr(expr) {
-        bindings.insert(binding);
-        return;
-    }
-
-    match expr {
-        HirExpr::TableAccess(access) => {
-            collect_expr_bindings(&access.base, bindings);
-            collect_expr_bindings(&access.key, bindings);
-        }
-        HirExpr::Unary(unary) => collect_expr_bindings(&unary.expr, bindings),
-        HirExpr::Binary(binary) => {
-            collect_expr_bindings(&binary.lhs, bindings);
-            collect_expr_bindings(&binary.rhs, bindings);
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            collect_expr_bindings(&logical.lhs, bindings);
-            collect_expr_bindings(&logical.rhs, bindings);
-        }
-        HirExpr::Decision(decision) => {
-            for node in &decision.nodes {
-                collect_expr_bindings(&node.test, bindings);
-                collect_decision_target_bindings(&node.truthy, bindings);
-                collect_decision_target_bindings(&node.falsy, bindings);
-            }
-        }
-        HirExpr::Call(call) => collect_call_bindings(call, bindings),
-        HirExpr::TableConstructor(table) => {
-            for field in &table.fields {
-                match field {
-                    HirTableField::Array(expr) => collect_expr_bindings(expr, bindings),
-                    HirTableField::Record(field) => {
-                        collect_table_key_bindings(&field.key, bindings);
-                        collect_expr_bindings(&field.value, bindings);
+            HirStmt::Assign(assign) => {
+                for target in &assign.targets {
+                    if let Some(binding) = binding_from_lvalue(target) {
+                        *self.counts.entry(binding).or_default() += 1;
                     }
                 }
             }
-            if let Some(trailing) = &table.trailing_multivalue {
-                collect_expr_bindings(trailing, bindings);
+            HirStmt::NumericFor(numeric_for) => {
+                *self
+                    .counts
+                    .entry(TableBinding::Local(numeric_for.binding))
+                    .or_default() += 1;
             }
-        }
-        HirExpr::Closure(closure) => {
-            for capture in &closure.captures {
-                collect_expr_bindings(&capture.value, bindings);
+            HirStmt::GenericFor(generic_for) => {
+                for binding in &generic_for.bindings {
+                    *self
+                        .counts
+                        .entry(TableBinding::Local(*binding))
+                        .or_default() += 1;
+                }
             }
+            HirStmt::TableSetList(_)
+            | HirStmt::ErrNil(_)
+            | HirStmt::ToBeClosed(_)
+            | HirStmt::Close(_)
+            | HirStmt::CallStmt(_)
+            | HirStmt::Return(_)
+            | HirStmt::If(_)
+            | HirStmt::While(_)
+            | HirStmt::Repeat(_)
+            | HirStmt::Block(_)
+            | HirStmt::Unstructured(_)
+            | HirStmt::Break
+            | HirStmt::Continue
+            | HirStmt::Goto(_)
+            | HirStmt::Label(_) => {}
         }
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::TempRef(_) => {}
-    }
-}
-
-fn collect_decision_target_bindings(
-    target: &HirDecisionTarget,
-    bindings: &mut BTreeSet<TableBinding>,
-) {
-    match target {
-        HirDecisionTarget::Expr(expr) => collect_expr_bindings(expr, bindings),
-        HirDecisionTarget::Node(_) | HirDecisionTarget::CurrentValue => {}
-    }
-}
-
-fn collect_table_key_bindings(key: &HirTableKey, bindings: &mut BTreeSet<TableBinding>) {
-    if let HirTableKey::Expr(expr) = key {
-        collect_expr_bindings(expr, bindings);
     }
 }
 

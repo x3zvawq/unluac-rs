@@ -35,12 +35,12 @@ pub(super) fn rebuild_constructor_from_steps(
             RegionStep::SetList(set_list) => {
                 flush_constructor_segment(
                     &mut constructor,
-                &pending_segment,
-                Some(set_list),
-                &remaining_uses,
-                region_contains_set_list,
-                materialized_bindings,
-            )?;
+                    &pending_segment,
+                    Some(set_list),
+                    &remaining_uses,
+                    region_contains_set_list,
+                    materialized_bindings,
+                )?;
                 pending_segment.clear();
             }
         }
@@ -407,11 +407,9 @@ fn expr_captures_orphaned_binding(
                 removed_materializations,
             )
         }),
-        HirExpr::Call(call) => call_captures_orphaned_binding(
-            call,
-            materialized_bindings,
-            removed_materializations,
-        ),
+        HirExpr::Call(call) => {
+            call_captures_orphaned_binding(call, materialized_bindings, removed_materializations)
+        }
         HirExpr::TableAccess(access) => {
             expr_captures_orphaned_binding(
                 &access.base,
@@ -450,11 +448,7 @@ fn expr_captures_orphaned_binding(
             })
         }
         HirExpr::Closure(closure) => closure.captures.iter().any(|capture| {
-            capture_is_orphaned(
-                capture,
-                materialized_bindings,
-                removed_materializations,
-            )
+            capture_is_orphaned(capture, materialized_bindings, removed_materializations)
         }),
         HirExpr::Nil
         | HirExpr::Boolean(_)
@@ -486,7 +480,12 @@ fn capture_is_orphaned(
         .get(&binding)
         .copied()
         .unwrap_or_default()
-        .saturating_sub(removed_materializations.get(&binding).copied().unwrap_or_default());
+        .saturating_sub(
+            removed_materializations
+                .get(&binding)
+                .copied()
+                .unwrap_or_default(),
+        );
     surviving == 0
 }
 
@@ -510,11 +509,9 @@ fn decision_target_captures_orphaned_binding(
     removed_materializations: &BTreeMap<TableBinding, usize>,
 ) -> bool {
     match target {
-        HirDecisionTarget::Expr(expr) => expr_captures_orphaned_binding(
-            expr,
-            materialized_bindings,
-            removed_materializations,
-        ),
+        HirDecisionTarget::Expr(expr) => {
+            expr_captures_orphaned_binding(expr, materialized_bindings, removed_materializations)
+        }
         HirDecisionTarget::Node(_) | HirDecisionTarget::CurrentValue => false,
     }
 }
@@ -526,10 +523,8 @@ fn table_key_captures_orphaned_binding(
 ) -> bool {
     match key {
         HirTableKey::Name(_) => false,
-        HirTableKey::Expr(expr) => expr_captures_orphaned_binding(
-            expr,
-            materialized_bindings,
-            removed_materializations,
-        ),
+        HirTableKey::Expr(expr) => {
+            expr_captures_orphaned_binding(expr, materialized_bindings, removed_materializations)
+        }
     }
 }

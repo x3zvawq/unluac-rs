@@ -15,10 +15,13 @@ mod inline_value;
 mod rebuild;
 mod scan;
 
-use crate::hir::common::{HirBlock, HirExpr, HirProto, HirStmt, HirTableSetList, LocalId, TempId};
+use std::collections::BTreeMap;
+
+use crate::hir::common::{HirExpr, HirProto, HirTableSetList, LocalId, TempId};
 
 use self::bindings::collect_materialized_binding_counts;
 use self::scan::{constructor_seed, install_constructor_seed, try_rebuild_constructor_region};
+use super::walk::{HirRewritePass, rewrite_proto};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 enum TableBinding {
@@ -66,84 +69,48 @@ enum SegmentToken {
 
 pub(super) fn stabilize_table_constructors_in_proto(proto: &mut HirProto) -> bool {
     let materialized_bindings = collect_materialized_binding_counts(&proto.body);
-    stabilize_block(&mut proto.body, &materialized_bindings)
+    let mut pass = TableConstructorPass {
+        materialized_bindings,
+    };
+    rewrite_proto(proto, &mut pass)
 }
 
-fn stabilize_block(
-    block: &mut HirBlock,
-    materialized_bindings: &std::collections::BTreeMap<TableBinding, usize>,
-) -> bool {
-    let mut changed = false;
-
-    for stmt in &mut block.stmts {
-        changed |= stabilize_nested(stmt, materialized_bindings);
-    }
-
-    let mut index = 0;
-    while index < block.stmts.len() {
-        let Some((binding, seed_ctor)) = constructor_seed(&block.stmts[index]) else {
-            index += 1;
-            continue;
-        };
-
-        let Some((rebuilt_ctor, end_index)) =
-            try_rebuild_constructor_region(block, index, binding, seed_ctor, materialized_bindings)
-        else {
-            index += 1;
-            continue;
-        };
-
-        install_constructor_seed(&mut block.stmts[index], rebuilt_ctor);
-        debug_assert!(
-            end_index > index,
-            "constructor rewrite must consume at least one trailing stmt"
-        );
-        block.stmts.drain(index + 1..=end_index);
-        changed = true;
-        index += 1;
-    }
-
-    changed
+struct TableConstructorPass {
+    materialized_bindings: BTreeMap<TableBinding, usize>,
 }
 
-fn stabilize_nested(
-    stmt: &mut HirStmt,
-    materialized_bindings: &std::collections::BTreeMap<TableBinding, usize>,
-) -> bool {
-    match stmt {
-        HirStmt::If(if_stmt) => {
-            let mut changed = stabilize_block(&mut if_stmt.then_block, materialized_bindings);
-            if let Some(else_block) = &mut if_stmt.else_block {
-                changed |= stabilize_block(else_block, materialized_bindings);
-            }
-            changed
+impl HirRewritePass for TableConstructorPass {
+    fn rewrite_block(&mut self, block: &mut crate::hir::common::HirBlock) -> bool {
+        let mut changed = false;
+        let mut index = 0;
+        while index < block.stmts.len() {
+            let Some((binding, seed_ctor)) = constructor_seed(&block.stmts[index]) else {
+                index += 1;
+                continue;
+            };
+
+            let Some((rebuilt_ctor, end_index)) = try_rebuild_constructor_region(
+                block,
+                index,
+                binding,
+                seed_ctor,
+                &self.materialized_bindings,
+            ) else {
+                index += 1;
+                continue;
+            };
+
+            install_constructor_seed(&mut block.stmts[index], rebuilt_ctor);
+            debug_assert!(
+                end_index > index,
+                "constructor rewrite must consume at least one trailing stmt"
+            );
+            block.stmts.drain(index + 1..=end_index);
+            changed = true;
+            index += 1;
         }
-        HirStmt::While(while_stmt) => stabilize_block(&mut while_stmt.body, materialized_bindings),
-        HirStmt::Repeat(repeat_stmt) => {
-            stabilize_block(&mut repeat_stmt.body, materialized_bindings)
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            stabilize_block(&mut numeric_for.body, materialized_bindings)
-        }
-        HirStmt::GenericFor(generic_for) => {
-            stabilize_block(&mut generic_for.body, materialized_bindings)
-        }
-        HirStmt::Block(block) => stabilize_block(block, materialized_bindings),
-        HirStmt::Unstructured(unstructured) => {
-            stabilize_block(&mut unstructured.body, materialized_bindings)
-        }
-        HirStmt::LocalDecl(_)
-        | HirStmt::Assign(_)
-        | HirStmt::TableSetList(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
-        | HirStmt::CallStmt(_)
-        | HirStmt::Return(_)
-        | HirStmt::Break
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => false,
+
+        changed
     }
 }
 

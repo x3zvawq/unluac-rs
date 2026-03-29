@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::visit::{HirVisitor, visit_expr, visit_stmts};
 use crate::hir::common::{
     HirBlock, HirCallExpr, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt,
     HirTableConstructor, HirTableField, HirTableKey, LocalId, TempId,
@@ -762,15 +763,15 @@ fn rewrite_lvalue(lvalue: &mut HirLValue, mapping: &BTreeMap<TempId, LocalId>) -
 }
 
 fn stmts_touch_temp(stmts: &[HirStmt], temp: TempId) -> bool {
-    stmts.iter().any(|stmt| stmt_touches_temp(stmt, temp))
+    TempTouchCollector::touches_in_stmts(stmts, TempTouchQuery::One(temp))
 }
 
 fn stmts_touch_any_temp(stmts: &[HirStmt], temps: &BTreeSet<TempId>) -> bool {
-    stmts.iter().any(|stmt| stmt_touches_any_temp(stmt, temps))
+    TempTouchCollector::touches_in_stmts(stmts, TempTouchQuery::Many(temps))
 }
 
 fn stmt_touches_any_temp(stmt: &HirStmt, temps: &BTreeSet<TempId>) -> bool {
-    temps.iter().any(|temp| stmt_touches_temp(stmt, *temp))
+    TempTouchCollector::touches_in_stmts(std::slice::from_ref(stmt), TempTouchQuery::Many(temps))
 }
 
 fn stmt_consumes_temps_only_in_control_head(stmt: &HirStmt, temps: &BTreeSet<TempId>) -> bool {
@@ -821,155 +822,61 @@ fn stmt_consumes_temps_only_in_control_head(stmt: &HirStmt, temps: &BTreeSet<Tem
     }
 }
 
-fn stmt_touches_temp(stmt: &HirStmt, temp: TempId) -> bool {
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => local_decl
-            .values
-            .iter()
-            .any(|expr| expr_touches_temp(expr, temp)),
-        HirStmt::Assign(assign) => {
-            assign
-                .targets
-                .iter()
-                .any(|target| lvalue_touches_temp(target, temp))
-                || assign
-                    .values
-                    .iter()
-                    .any(|expr| expr_touches_temp(expr, temp))
-        }
-        HirStmt::TableSetList(set_list) => {
-            expr_touches_temp(&set_list.base, temp)
-                || set_list
-                    .values
-                    .iter()
-                    .any(|expr| expr_touches_temp(expr, temp))
-                || set_list
-                    .trailing_multivalue
-                    .as_ref()
-                    .is_some_and(|expr| expr_touches_temp(expr, temp))
-        }
-        HirStmt::ErrNil(err_nil) => expr_touches_temp(&err_nil.value, temp),
-        HirStmt::ToBeClosed(to_be_closed) => expr_touches_temp(&to_be_closed.value, temp),
-        HirStmt::CallStmt(call_stmt) => call_expr_touches_temp(&call_stmt.call, temp),
-        HirStmt::Return(ret) => ret.values.iter().any(|expr| expr_touches_temp(expr, temp)),
-        HirStmt::If(if_stmt) => {
-            expr_touches_temp(&if_stmt.cond, temp)
-                || stmts_touch_temp(&if_stmt.then_block.stmts, temp)
-                || if_stmt
-                    .else_block
-                    .as_ref()
-                    .is_some_and(|else_block| stmts_touch_temp(&else_block.stmts, temp))
-        }
-        HirStmt::While(while_stmt) => {
-            expr_touches_temp(&while_stmt.cond, temp)
-                || stmts_touch_temp(&while_stmt.body.stmts, temp)
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            stmts_touch_temp(&repeat_stmt.body.stmts, temp)
-                || expr_touches_temp(&repeat_stmt.cond, temp)
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            expr_touches_temp(&numeric_for.start, temp)
-                || expr_touches_temp(&numeric_for.limit, temp)
-                || expr_touches_temp(&numeric_for.step, temp)
-                || stmts_touch_temp(&numeric_for.body.stmts, temp)
-        }
-        HirStmt::GenericFor(generic_for) => {
-            generic_for
-                .iterator
-                .iter()
-                .any(|expr| expr_touches_temp(expr, temp))
-                || stmts_touch_temp(&generic_for.body.stmts, temp)
-        }
-        HirStmt::Block(block) => stmts_touch_temp(&block.stmts, temp),
-        HirStmt::Unstructured(unstructured) => stmts_touch_temp(&unstructured.body.stmts, temp),
-        HirStmt::Break
-        | HirStmt::Close(_)
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => false,
-    }
-}
-
-fn call_expr_touches_temp(call: &HirCallExpr, temp: TempId) -> bool {
-    expr_touches_temp(&call.callee, temp)
-        || call.args.iter().any(|arg| expr_touches_temp(arg, temp))
-}
-
 fn expr_touches_any_temp(expr: &HirExpr, temps: &BTreeSet<TempId>) -> bool {
-    temps.iter().any(|temp| expr_touches_temp(expr, *temp))
+    TempTouchCollector::touches_in_expr(expr, TempTouchQuery::Many(temps))
 }
 
-fn expr_touches_temp(expr: &HirExpr, temp: TempId) -> bool {
-    match expr {
-        HirExpr::TempRef(other) => *other == temp,
-        HirExpr::TableAccess(access) => {
-            expr_touches_temp(&access.base, temp) || expr_touches_temp(&access.key, temp)
+#[derive(Clone, Copy)]
+enum TempTouchQuery<'a> {
+    One(TempId),
+    Many(&'a BTreeSet<TempId>),
+}
+
+impl TempTouchQuery<'_> {
+    fn matches(self, temp: TempId) -> bool {
+        match self {
+            Self::One(expected) => expected == temp,
+            Self::Many(temps) => temps.contains(&temp),
         }
-        HirExpr::Unary(unary) => expr_touches_temp(&unary.expr, temp),
-        HirExpr::Binary(binary) => {
-            expr_touches_temp(&binary.lhs, temp) || expr_touches_temp(&binary.rhs, temp)
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            expr_touches_temp(&logical.lhs, temp) || expr_touches_temp(&logical.rhs, temp)
-        }
-        HirExpr::Decision(decision) => decision.nodes.iter().any(|node| {
-            expr_touches_temp(&node.test, temp)
-                || decision_target_touches_temp(&node.truthy, temp)
-                || decision_target_touches_temp(&node.falsy, temp)
-        }),
-        HirExpr::Call(call) => call_expr_touches_temp(call, temp),
-        HirExpr::TableConstructor(table) => {
-            table.fields.iter().any(|field| match field {
-                HirTableField::Array(expr) => expr_touches_temp(expr, temp),
-                HirTableField::Record(field) => {
-                    matches!(&field.key, HirTableKey::Expr(expr) if expr_touches_temp(expr, temp))
-                        || expr_touches_temp(&field.value, temp)
-                }
-            }) || table
-                .trailing_multivalue
-                .as_ref()
-                .is_some_and(|expr| expr_touches_temp(expr, temp))
-        }
-        HirExpr::Closure(closure) => closure
-            .captures
-            .iter()
-            .any(|capture| expr_touches_temp(&capture.value, temp)),
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => false,
     }
 }
 
-fn decision_target_touches_temp(
-    target: &crate::hir::common::HirDecisionTarget,
-    temp: TempId,
-) -> bool {
-    match target {
-        crate::hir::common::HirDecisionTarget::Expr(expr) => expr_touches_temp(expr, temp),
-        crate::hir::common::HirDecisionTarget::Node(_)
-        | crate::hir::common::HirDecisionTarget::CurrentValue => false,
+struct TempTouchCollector<'a> {
+    query: TempTouchQuery<'a>,
+    touched: bool,
+}
+
+impl<'a> TempTouchCollector<'a> {
+    fn touches_in_stmts(stmts: &[HirStmt], query: TempTouchQuery<'a>) -> bool {
+        let mut collector = Self {
+            query,
+            touched: false,
+        };
+        visit_stmts(stmts, &mut collector);
+        collector.touched
+    }
+
+    fn touches_in_expr(expr: &HirExpr, query: TempTouchQuery<'a>) -> bool {
+        let mut collector = Self {
+            query,
+            touched: false,
+        };
+        visit_expr(expr, &mut collector);
+        collector.touched
     }
 }
 
-fn lvalue_touches_temp(lvalue: &HirLValue, temp: TempId) -> bool {
-    match lvalue {
-        HirLValue::Temp(other) => *other == temp,
-        HirLValue::TableAccess(access) => {
-            expr_touches_temp(&access.base, temp) || expr_touches_temp(&access.key, temp)
+impl HirVisitor for TempTouchCollector<'_> {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        if let HirExpr::TempRef(temp) = expr {
+            self.touched |= self.query.matches(*temp);
         }
-        HirLValue::Local(_) | HirLValue::Upvalue(_) | HirLValue::Global(_) => false,
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        if let HirLValue::Temp(temp) = lvalue {
+            self.touched |= self.query.matches(*temp);
+        }
     }
 }
 
