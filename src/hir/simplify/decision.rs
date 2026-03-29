@@ -119,6 +119,13 @@ enum ResolvedDecisionTarget {
 }
 
 fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
+    // 循环 DAG 目前只允许“原样保留为 Decision”，不能继续走 value-collapse /
+    // known-test specialize 这条树化路径。否则会把同一条环上的节点反复递归展开，
+    // 最后在 simplify 阶段自己把栈打穿。
+    if decision_has_cycles(decision) {
+        return None;
+    }
+
     let mut nodes = decision.nodes.clone();
     let mut replacements = vec![None; nodes.len()];
     let mut changed = false;

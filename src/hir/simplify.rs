@@ -6,6 +6,7 @@
 //! 是细节实现”的混淆。
 
 mod boolean_shells;
+mod carried_locals;
 mod close_scopes;
 mod closure_self_capture;
 mod dead_labels;
@@ -155,6 +156,12 @@ fn run_cleanup_round(module: &mut HirModule, timings: &TimingCollector) -> bool 
         timings,
         "close-scopes",
         close_scopes::materialize_tbc_close_scopes_in_proto,
+    );
+    changed |= apply_timed_proto_pass(
+        module,
+        timings,
+        "carried-locals",
+        carried_locals::collapse_carried_local_handoffs_in_proto,
     );
     changed |= apply_timed_proto_pass(
         module,

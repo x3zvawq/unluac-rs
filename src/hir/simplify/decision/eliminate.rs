@@ -81,7 +81,7 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
         HirStmt::LocalDecl(local_decl)
             if local_decl.bindings.len() == 1
                 && local_decl.values.len() == 1
-                && expr_contains_decision(&local_decl.values[0]) =>
+                && expr_contains_eliminable_decision(&local_decl.values[0]) =>
         {
             let binding = local_decl.bindings[0];
             let value = local_decl
@@ -101,7 +101,7 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
             if assign.targets.len() == 1
                 && assign.values.len() == 1
                 && assign_target_supports_direct_materialization(&assign.targets[0])
-                && expr_contains_decision(&assign.values[0]) =>
+                && expr_contains_eliminable_decision(&assign.values[0]) =>
         {
             let target = assign
                 .targets
@@ -310,7 +310,7 @@ fn extract_value_expr(
     expr: HirExpr,
     state: &mut EliminationState<'_>,
 ) -> (Vec<HirStmt>, HirExpr, bool) {
-    if !expr_contains_decision(&expr) {
+    if !expr_contains_eliminable_decision(&expr) {
         return (Vec::new(), expr, false);
     }
     if let Some(collapsed) = collapse_expr_to_pure(expr.clone()) {
@@ -504,7 +504,7 @@ fn materialize_decision_target(
 }
 
 fn prepare_pure_expr(expr: HirExpr, state: &mut EliminationState<'_>) -> (Vec<HirStmt>, HirExpr) {
-    if expr_contains_decision(&expr)
+    if expr_contains_eliminable_decision(&expr)
         && let Some(collapsed) = collapse_expr_to_pure(expr.clone())
     {
         return prepare_pure_expr(collapsed, state);
@@ -512,7 +512,7 @@ fn prepare_pure_expr(expr: HirExpr, state: &mut EliminationState<'_>) -> (Vec<Hi
 
     match expr {
         HirExpr::Decision(_) | HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_)
-            if expr_contains_decision(&expr) =>
+            if expr_contains_eliminable_decision(&expr) =>
         {
             let local = state.alloc_local();
             let mut prefix = vec![empty_local_decl(local)];
@@ -803,19 +803,20 @@ fn eliminate_condition_expr(expr: &mut HirExpr) -> bool {
     changed
 }
 
-fn expr_contains_decision(expr: &HirExpr) -> bool {
-    let mut collector = DecisionPresenceCollector { found: false };
+fn expr_contains_eliminable_decision(expr: &HirExpr) -> bool {
+    let mut collector = EliminableDecisionCollector { found: false };
     visit_expr(expr, &mut collector);
     collector.found
 }
 
-struct DecisionPresenceCollector {
+struct EliminableDecisionCollector {
     found: bool,
 }
 
-impl HirVisitor for DecisionPresenceCollector {
+impl HirVisitor for EliminableDecisionCollector {
     fn visit_expr(&mut self, expr: &HirExpr) {
-        self.found |= matches!(expr, HirExpr::Decision(_));
+        self.found |=
+            matches!(expr, HirExpr::Decision(decision) if !super::decision_has_cycles(decision));
     }
 }
 

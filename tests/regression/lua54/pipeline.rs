@@ -188,6 +188,8 @@ mod decompile_pipeline {
         assert!(dump.contains("do"), "{dump}");
         assert!(dump.contains("<close>"), "{dump}");
         assert!(dump.contains("goto"), "{dump}");
+        assert_eq!(dump.matches("goto L").count(), 1, "{dump}");
+        assert_eq!(dump.matches("::L").count(), 1, "{dump}");
         assert!(!dump.contains("close from"), "{dump}");
     }
 
@@ -313,6 +315,18 @@ mod decompile_pipeline {
         );
         assert!(
             generated.source.contains("#tbl + 1"),
+            "{}",
+            generated.source
+        );
+        assert_eq!(
+            generated.source.matches("goto L").count(),
+            1,
+            "{}",
+            generated.source
+        );
+        assert_eq!(
+            generated.source.matches("::L").count(),
+            1,
             "{}",
             generated.source
         );

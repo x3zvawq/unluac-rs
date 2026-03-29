@@ -3,9 +3,10 @@
 //! 我们把测试和实现分开存放，避免主实现文件被大段 `#[cfg(test)]` 代码淹没。
 
 use crate::ast::{
-    AstBinaryExpr, AstBinaryOpKind, AstBlock, AstCallExpr, AstCallKind, AstCallStmt,
-    AstDialectVersion, AstExpr, AstIf, AstLocalBinding, AstLocalDecl, AstLogicalExpr, AstModule,
-    AstNameRef, AstReturn, AstStmt, AstTargetDialect, AstUnaryExpr, AstUnaryOpKind,
+    AstAssign, AstBinaryExpr, AstBinaryOpKind, AstBlock, AstCallExpr, AstCallKind, AstCallStmt,
+    AstDialectVersion, AstExpr, AstGlobalName, AstGoto, AstIf, AstLValue, AstLabel, AstLabelId,
+    AstLocalBinding, AstLocalDecl, AstLogicalExpr, AstModule, AstNameRef, AstReturn, AstStmt,
+    AstTargetDialect, AstUnaryExpr, AstUnaryOpKind,
 };
 use crate::hir::{LocalId, ParamId};
 
@@ -263,4 +264,123 @@ fn collapses_nested_guard_if_chain_into_single_short_circuit_condition() {
             else_block: None,
         }))]
     );
+}
+
+#[test]
+fn folds_single_entry_guard_goto_label_run_into_plain_if_body() {
+    let turn = AstNameRef::Global(AstGlobalName {
+        text: "turn".to_owned(),
+    });
+    let outer = AstLabelId(1);
+    let exit = AstLabelId(3);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::If(Box::new(AstIf {
+                    cond: AstExpr::Binary(Box::new(AstBinaryExpr {
+                        op: AstBinaryOpKind::Le,
+                        lhs: AstExpr::Integer(3),
+                        rhs: AstExpr::Var(turn.clone()),
+                    })),
+                    then_block: AstBlock {
+                        stmts: vec![AstStmt::Goto(Box::new(AstGoto { target: exit }))],
+                    },
+                    else_block: None,
+                })),
+                AstStmt::Assign(Box::new(AstAssign {
+                    targets: vec![AstLValue::Name(turn.clone())],
+                    values: vec![AstExpr::Binary(Box::new(AstBinaryExpr {
+                        op: AstBinaryOpKind::Add,
+                        lhs: AstExpr::Var(turn.clone()),
+                        rhs: AstExpr::Integer(1),
+                    }))],
+                })),
+                AstStmt::Goto(Box::new(AstGoto { target: outer })),
+                AstStmt::Label(Box::new(AstLabel { id: exit })),
+                AstStmt::CallStmt(Box::new(AstCallStmt {
+                    call: AstCallKind::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "tail".to_owned(),
+                        })),
+                        args: Vec::new(),
+                    })),
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(AstDialectVersion::Lua54),
+            options: Default::default(),
+        }
+    ));
+
+    assert_eq!(module.body.stmts.len(), 2);
+    let AstStmt::If(if_stmt) = &module.body.stmts[0] else {
+        panic!("expected folded guard if");
+    };
+    assert!(if_stmt.else_block.is_none(), "{if_stmt:?}");
+    assert_eq!(
+        if_stmt.cond,
+        AstExpr::Binary(Box::new(AstBinaryExpr {
+            op: AstBinaryOpKind::Lt,
+            lhs: AstExpr::Var(turn),
+            rhs: AstExpr::Integer(3),
+        }))
+    );
+    assert!(matches!(
+        if_stmt.then_block.stmts.as_slice(),
+        [AstStmt::Assign(_), AstStmt::Goto(goto_stmt)] if goto_stmt.target == outer
+    ));
+    assert!(matches!(module.body.stmts[1], AstStmt::CallStmt(_)));
+}
+
+#[test]
+fn keeps_guard_label_when_exit_label_has_multiple_goto_sources() {
+    let exit = AstLabelId(3);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::If(Box::new(AstIf {
+                    cond: AstExpr::Boolean(true),
+                    then_block: AstBlock {
+                        stmts: vec![AstStmt::Goto(Box::new(AstGoto { target: exit }))],
+                    },
+                    else_block: None,
+                })),
+                AstStmt::CallStmt(Box::new(AstCallStmt {
+                    call: AstCallKind::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "step".to_owned(),
+                        })),
+                        args: Vec::new(),
+                    })),
+                })),
+                AstStmt::Label(Box::new(AstLabel { id: exit })),
+                AstStmt::Goto(Box::new(AstGoto { target: exit })),
+            ],
+        },
+    };
+
+    assert!(!apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(AstDialectVersion::Lua54),
+            options: Default::default(),
+        }
+    ));
+
+    assert!(matches!(
+        module.body.stmts.as_slice(),
+        [
+            AstStmt::If(_),
+            AstStmt::CallStmt(_),
+            AstStmt::Label(label),
+            AstStmt::Goto(goto_stmt),
+        ] if label.id == exit && goto_stmt.target == exit
+    ));
 }

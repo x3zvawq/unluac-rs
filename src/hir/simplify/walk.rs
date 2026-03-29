@@ -53,6 +53,12 @@ pub(super) fn rewrite_proto(proto: &mut HirProto, pass: &mut impl HirRewritePass
     rewrite_block(&mut proto.body, pass)
 }
 
+pub(super) fn rewrite_stmts(stmts: &mut [HirStmt], pass: &mut impl HirRewritePass) -> bool {
+    stmts.iter_mut().fold(false, |changed, stmt| {
+        rewrite_stmt_tree(stmt, pass) || changed
+    })
+}
+
 pub(super) trait ExprRewritePass {
     fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool;
 
@@ -106,6 +112,10 @@ pub(super) fn rewrite_nested_blocks_in_stmt(
     changed
 }
 
+pub(super) fn rewrite_stmt_tree(stmt: &mut HirStmt, pass: &mut impl HirRewritePass) -> bool {
+    rewrite_stmt(stmt, pass)
+}
+
 struct ExprRewritePassAdapter<'a, P> {
     pass: &'a mut P,
 }
@@ -125,7 +135,8 @@ fn rewrite_block(block: &mut HirBlock, pass: &mut impl HirRewritePass) -> bool {
         .stmts
         .iter_mut()
         .fold(false, |changed, stmt| rewrite_stmt(stmt, pass) || changed);
-    pass.rewrite_block(block) || nested_changed
+    let block_changed = pass.rewrite_block(block);
+    block_changed || nested_changed
 }
 
 fn rewrite_stmt(stmt: &mut HirStmt, pass: &mut impl HirRewritePass) -> bool {
@@ -164,33 +175,38 @@ fn rewrite_stmt(stmt: &mut HirStmt, pass: &mut impl HirRewritePass) -> bool {
             .iter_mut()
             .fold(false, |changed, expr| rewrite_expr(expr, pass) || changed),
         HirStmt::If(if_stmt) => {
-            rewrite_condition_expr(&mut if_stmt.cond, pass)
-                || rewrite_block(&mut if_stmt.then_block, pass)
-                || if_stmt
-                    .else_block
-                    .as_mut()
-                    .is_some_and(|else_block| rewrite_block(else_block, pass))
+            let cond_changed = rewrite_condition_expr(&mut if_stmt.cond, pass);
+            let then_changed = rewrite_block(&mut if_stmt.then_block, pass);
+            let else_changed = if_stmt
+                .else_block
+                .as_mut()
+                .is_some_and(|else_block| rewrite_block(else_block, pass));
+            cond_changed || then_changed || else_changed
         }
         HirStmt::While(while_stmt) => {
-            rewrite_condition_expr(&mut while_stmt.cond, pass)
-                || rewrite_block(&mut while_stmt.body, pass)
+            let cond_changed = rewrite_condition_expr(&mut while_stmt.cond, pass);
+            let body_changed = rewrite_block(&mut while_stmt.body, pass);
+            cond_changed || body_changed
         }
         HirStmt::Repeat(repeat_stmt) => {
-            rewrite_block(&mut repeat_stmt.body, pass)
-                || rewrite_condition_expr(&mut repeat_stmt.cond, pass)
+            let body_changed = rewrite_block(&mut repeat_stmt.body, pass);
+            let cond_changed = rewrite_condition_expr(&mut repeat_stmt.cond, pass);
+            body_changed || cond_changed
         }
         HirStmt::NumericFor(numeric_for) => {
-            rewrite_expr(&mut numeric_for.start, pass)
-                || rewrite_expr(&mut numeric_for.limit, pass)
-                || rewrite_expr(&mut numeric_for.step, pass)
-                || rewrite_block(&mut numeric_for.body, pass)
+            let start_changed = rewrite_expr(&mut numeric_for.start, pass);
+            let limit_changed = rewrite_expr(&mut numeric_for.limit, pass);
+            let step_changed = rewrite_expr(&mut numeric_for.step, pass);
+            let body_changed = rewrite_block(&mut numeric_for.body, pass);
+            start_changed || limit_changed || step_changed || body_changed
         }
         HirStmt::GenericFor(generic_for) => {
             let iterator_changed = generic_for
                 .iterator
                 .iter_mut()
                 .fold(false, |changed, expr| rewrite_expr(expr, pass) || changed);
-            iterator_changed || rewrite_block(&mut generic_for.body, pass)
+            let body_changed = rewrite_block(&mut generic_for.body, pass);
+            iterator_changed || body_changed
         }
         HirStmt::Block(block) => rewrite_block(block, pass),
         HirStmt::Unstructured(unstructured) => rewrite_block(&mut unstructured.body, pass),
@@ -201,20 +217,24 @@ fn rewrite_stmt(stmt: &mut HirStmt, pass: &mut impl HirRewritePass) -> bool {
         | HirStmt::Label(_) => false,
     };
 
-    pass.rewrite_stmt(stmt) || nested_changed
+    let stmt_changed = pass.rewrite_stmt(stmt);
+    stmt_changed || nested_changed
 }
 
 fn rewrite_lvalue(lvalue: &mut HirLValue, pass: &mut impl HirRewritePass) -> bool {
     let nested_changed = match lvalue {
         HirLValue::TableAccess(access) => {
-            rewrite_expr(&mut access.base, pass) || rewrite_expr(&mut access.key, pass)
+            let base_changed = rewrite_expr(&mut access.base, pass);
+            let key_changed = rewrite_expr(&mut access.key, pass);
+            base_changed || key_changed
         }
         HirLValue::Temp(_) | HirLValue::Local(_) | HirLValue::Upvalue(_) | HirLValue::Global(_) => {
             false
         }
     };
 
-    pass.rewrite_lvalue(lvalue) || nested_changed
+    let lvalue_changed = pass.rewrite_lvalue(lvalue);
+    lvalue_changed || nested_changed
 }
 
 fn rewrite_call_expr(call: &mut HirCallExpr, pass: &mut impl HirRewritePass) -> bool {
@@ -223,20 +243,27 @@ fn rewrite_call_expr(call: &mut HirCallExpr, pass: &mut impl HirRewritePass) -> 
         .args
         .iter_mut()
         .fold(false, |changed, arg| rewrite_expr(arg, pass) || changed);
-    pass.rewrite_call(call) || callee_changed || args_changed
+    let call_changed = pass.rewrite_call(call);
+    call_changed || callee_changed || args_changed
 }
 
 fn rewrite_expr(expr: &mut HirExpr, pass: &mut impl HirRewritePass) -> bool {
     let nested_changed = match expr {
         HirExpr::TableAccess(access) => {
-            rewrite_expr(&mut access.base, pass) || rewrite_expr(&mut access.key, pass)
+            let base_changed = rewrite_expr(&mut access.base, pass);
+            let key_changed = rewrite_expr(&mut access.key, pass);
+            base_changed || key_changed
         }
         HirExpr::Unary(unary) => rewrite_expr(&mut unary.expr, pass),
         HirExpr::Binary(binary) => {
-            rewrite_expr(&mut binary.lhs, pass) || rewrite_expr(&mut binary.rhs, pass)
+            let lhs_changed = rewrite_expr(&mut binary.lhs, pass);
+            let rhs_changed = rewrite_expr(&mut binary.rhs, pass);
+            lhs_changed || rhs_changed
         }
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            rewrite_expr(&mut logical.lhs, pass) || rewrite_expr(&mut logical.rhs, pass)
+            let lhs_changed = rewrite_expr(&mut logical.lhs, pass);
+            let rhs_changed = rewrite_expr(&mut logical.rhs, pass);
+            lhs_changed || rhs_changed
         }
         HirExpr::Decision(decision) => rewrite_decision_expr(decision, pass),
         HirExpr::Call(call) => rewrite_call_expr(call, pass),
@@ -261,7 +288,8 @@ fn rewrite_expr(expr: &mut HirExpr, pass: &mut impl HirRewritePass) -> bool {
         | HirExpr::Unresolved(_) => false,
     };
 
-    pass.rewrite_expr(expr) || nested_changed
+    let expr_changed = pass.rewrite_expr(expr);
+    expr_changed || nested_changed
 }
 
 fn rewrite_condition_expr(expr: &mut HirExpr, pass: &mut impl HirRewritePass) -> bool {

@@ -8,12 +8,14 @@
 //! - `if not cond then a() else b() end` 会整理成 `if cond then b() else a() end`
 //! - `if a then if b then return end end` 会折成 `if a and b then return end`
 //! - `if cond then return end else tail()` 会拉平成 `if cond then return end; tail()`
+//! - `if exit then goto L1 end; body; ::L1:: tail` 会收成 `if not exit then body end; tail`
 
 use super::super::common::{
-    AstBinaryExpr, AstBinaryOpKind, AstBlock, AstExpr, AstIf, AstLogicalExpr, AstModule, AstStmt,
-    AstUnaryExpr, AstUnaryOpKind,
+    AstBinaryExpr, AstBinaryOpKind, AstBlock, AstExpr, AstFunctionExpr, AstIf, AstLabelId,
+    AstLogicalExpr, AstModule, AstStmt, AstUnaryExpr, AstUnaryOpKind,
 };
 use super::ReadabilityContext;
+use super::visit::{self, AstVisitor};
 use super::walk::{self, AstRewritePass, BlockKind};
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
@@ -26,19 +28,19 @@ struct BranchPrettyPass;
 impl AstRewritePass for BranchPrettyPass {
     fn rewrite_block(&mut self, block: &mut AstBlock, _kind: BlockKind) -> bool {
         let old_stmts = std::mem::take(&mut block.stmts);
-        let mut new_stmts = Vec::with_capacity(old_stmts.len());
+        let mut flattened_stmts = Vec::with_capacity(old_stmts.len());
         let mut changed = false;
         for stmt in old_stmts {
             match flatten_terminating_if(stmt) {
                 Ok(flattened) => {
-                    new_stmts.extend(flattened);
+                    flattened_stmts.extend(flattened);
                     changed = true;
                 }
-                Err(stmt) => new_stmts.push(stmt),
+                Err(stmt) => flattened_stmts.push(stmt),
             }
         }
-        block.stmts = new_stmts;
-        changed
+        block.stmts = flattened_stmts;
+        changed || fold_guard_goto_labels(block)
     }
 
     fn rewrite_stmt(&mut self, stmt: &mut AstStmt) -> bool {
@@ -142,6 +144,134 @@ fn flatten_terminating_if(stmt: AstStmt) -> Result<Vec<AstStmt>, AstStmt> {
 
     if_stmt.else_block = Some(else_block);
     Err(AstStmt::If(if_stmt))
+}
+
+fn fold_guard_goto_labels(block: &mut AstBlock) -> bool {
+    let mut changed = false;
+
+    while let Some(fold) = find_guard_goto_label_fold(block) {
+        let old_stmts = std::mem::take(&mut block.stmts);
+        let mut rewritten =
+            Vec::with_capacity(old_stmts.len() - (fold.label_index - fold.if_index));
+        let mut guarded_if = None;
+        let mut guarded_body = Vec::new();
+
+        for (index, stmt) in old_stmts.into_iter().enumerate() {
+            if index < fold.if_index {
+                rewritten.push(stmt);
+                continue;
+            }
+            if index == fold.if_index {
+                let AstStmt::If(mut if_stmt) = stmt else {
+                    unreachable!("guard fold should only target if statements");
+                };
+                if_stmt.cond = negate_guard_condition(if_stmt.cond);
+                if_stmt.then_block = AstBlock { stmts: Vec::new() };
+                if_stmt.else_block = None;
+                guarded_if = Some(if_stmt);
+                continue;
+            }
+            if index < fold.label_index {
+                guarded_body.push(stmt);
+                continue;
+            }
+            if index == fold.label_index {
+                continue;
+            }
+            rewritten.push(stmt);
+        }
+
+        let mut guarded_if = guarded_if.expect("guard fold should capture the rewritten if");
+        guarded_if.then_block = AstBlock {
+            stmts: guarded_body,
+        };
+        rewritten.insert(fold.if_index, AstStmt::If(guarded_if));
+        block.stmts = rewritten;
+        changed = true;
+    }
+
+    changed
+}
+
+#[derive(Clone, Copy)]
+struct GuardGotoFold {
+    if_index: usize,
+    label_index: usize,
+}
+
+fn find_guard_goto_label_fold(block: &AstBlock) -> Option<GuardGotoFold> {
+    for if_index in 0..block.stmts.len() {
+        let Some(target) = guard_goto_target(&block.stmts[if_index]) else {
+            continue;
+        };
+        if count_goto_target_in_block(block, target) != 1 {
+            continue;
+        }
+        let Some(label_index) = block.stmts[if_index + 1..]
+            .iter()
+            .position(|stmt| matches!(stmt, AstStmt::Label(label) if label.id == target))
+            .map(|offset| if_index + 1 + offset)
+        else {
+            continue;
+        };
+
+        let guarded_body = &block.stmts[if_index + 1..label_index];
+        if !guarded_body.is_empty() && can_fold_guard_goto_body(guarded_body) {
+            return Some(GuardGotoFold {
+                if_index,
+                label_index,
+            });
+        }
+    }
+
+    None
+}
+
+fn guard_goto_target(stmt: &AstStmt) -> Option<AstLabelId> {
+    let AstStmt::If(if_stmt) = stmt else {
+        return None;
+    };
+    if if_stmt.else_block.is_some() {
+        return None;
+    }
+    let [AstStmt::Goto(goto_stmt)] = if_stmt.then_block.stmts.as_slice() else {
+        return None;
+    };
+    Some(goto_stmt.target)
+}
+
+fn can_fold_guard_goto_body(stmts: &[AstStmt]) -> bool {
+    stmts.iter().all(|stmt| {
+        !matches!(
+            stmt,
+            AstStmt::Label(_) | AstStmt::LocalDecl(_) | AstStmt::LocalFunctionDecl(_)
+        )
+    })
+}
+
+fn count_goto_target_in_block(block: &AstBlock, target: AstLabelId) -> usize {
+    let mut collector = GotoTargetCollector { target, count: 0 };
+    visit::visit_block(block, &mut collector);
+    collector.count
+}
+
+struct GotoTargetCollector {
+    target: AstLabelId,
+    count: usize,
+}
+
+impl AstVisitor for GotoTargetCollector {
+    fn visit_stmt(&mut self, stmt: &AstStmt) {
+        if let AstStmt::Goto(goto_stmt) = stmt
+            && goto_stmt.target == self.target
+        {
+            self.count += 1;
+        }
+    }
+
+    fn visit_function_expr(&mut self, _function: &AstFunctionExpr) -> bool {
+        false
+    }
 }
 
 fn block_always_terminates(block: &AstBlock) -> bool {

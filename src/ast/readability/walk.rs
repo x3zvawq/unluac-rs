@@ -84,7 +84,8 @@ fn rewrite_block_with_kind(
         .stmts
         .iter_mut()
         .fold(false, |changed, stmt| rewrite_stmt(stmt, pass) || changed);
-    pass.rewrite_block(block, kind) || nested_changed
+    let block_changed = pass.rewrite_block(block, kind);
+    block_changed || nested_changed
 }
 
 pub(super) fn rewrite_module_scoped<P: ScopedAstRewritePass>(
@@ -135,7 +136,8 @@ pub(super) fn rewrite_stmt(stmt: &mut AstStmt, pass: &mut impl AstRewritePass) -
         }
     );
 
-    pass.rewrite_stmt(stmt) || nested_changed
+    let stmt_changed = pass.rewrite_stmt(stmt);
+    stmt_changed || nested_changed
 }
 
 fn rewrite_stmt_scoped<P: ScopedAstRewritePass>(
@@ -169,7 +171,8 @@ fn rewrite_stmt_scoped<P: ScopedAstRewritePass>(
         }
     );
 
-    pass.rewrite_stmt(stmt, scope) || nested_changed
+    let stmt_changed = pass.rewrite_stmt(stmt, scope);
+    stmt_changed || nested_changed
 }
 
 pub(super) fn rewrite_expr(expr: &mut AstExpr, pass: &mut impl AstRewritePass) -> bool {
@@ -186,7 +189,8 @@ pub(super) fn rewrite_expr(expr: &mut AstExpr, pass: &mut impl AstRewritePass) -
         }
     );
 
-    pass.rewrite_expr(expr) || nested_changed
+    let expr_changed = pass.rewrite_expr(expr);
+    expr_changed || nested_changed
 }
 
 fn rewrite_expr_scoped<P: ScopedAstRewritePass>(
@@ -207,7 +211,8 @@ fn rewrite_expr_scoped<P: ScopedAstRewritePass>(
         }
     );
 
-    pass.rewrite_expr(expr, scope) || nested_changed
+    let expr_changed = pass.rewrite_expr(expr, scope);
+    expr_changed || nested_changed
 }
 
 pub(super) fn rewrite_lvalue(lvalue: &mut AstLValue, pass: &mut impl AstRewritePass) -> bool {
@@ -216,7 +221,8 @@ pub(super) fn rewrite_lvalue(lvalue: &mut AstLValue, pass: &mut impl AstRewriteP
         nested_changed |= rewrite_expr(expr, pass);
     });
 
-    pass.rewrite_lvalue(lvalue) || nested_changed
+    let lvalue_changed = pass.rewrite_lvalue(lvalue);
+    lvalue_changed || nested_changed
 }
 
 fn rewrite_lvalue_scoped<P: ScopedAstRewritePass>(
@@ -229,12 +235,14 @@ fn rewrite_lvalue_scoped<P: ScopedAstRewritePass>(
         nested_changed |= rewrite_expr_scoped(expr, scope, pass);
     });
 
-    pass.rewrite_lvalue(lvalue, scope) || nested_changed
+    let lvalue_changed = pass.rewrite_lvalue(lvalue, scope);
+    lvalue_changed || nested_changed
 }
 
 fn rewrite_condition_expr(expr: &mut AstExpr, pass: &mut impl AstRewritePass) -> bool {
     let nested_changed = rewrite_expr(expr, pass);
-    pass.rewrite_condition_expr(expr) || nested_changed
+    let expr_changed = pass.rewrite_condition_expr(expr);
+    expr_changed || nested_changed
 }
 
 fn rewrite_condition_expr_scoped<P: ScopedAstRewritePass>(
@@ -243,7 +251,8 @@ fn rewrite_condition_expr_scoped<P: ScopedAstRewritePass>(
     pass: &mut P,
 ) -> bool {
     let nested_changed = rewrite_expr_scoped(expr, scope, pass);
-    pass.rewrite_condition_expr(expr, scope) || nested_changed
+    let expr_changed = pass.rewrite_condition_expr(expr, scope);
+    expr_changed || nested_changed
 }
 
 fn rewrite_call(call: &mut AstCallKind, pass: &mut impl AstRewritePass) -> bool {

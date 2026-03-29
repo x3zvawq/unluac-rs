@@ -173,12 +173,35 @@ fn rewrite_carried_binding_in_stmts(
     carried: AstBindingRef,
     seed: AstBindingRef,
 ) {
+    let mut prune_pass = RedundantSeedCopyPrunePass { carried, seed };
     for stmt in stmts.iter_mut() {
         rewrite_binding_in_stmt(stmt, carried, seed);
+        walk::rewrite_stmt(stmt, &mut prune_pass);
     }
+    prune_redundant_seed_copy_stmts(stmts, carried, seed);
+}
+
+struct RedundantSeedCopyPrunePass {
+    carried: AstBindingRef,
+    seed: AstBindingRef,
+}
+
+impl AstRewritePass for RedundantSeedCopyPrunePass {
+    fn rewrite_block(&mut self, block: &mut AstBlock, _kind: BlockKind) -> bool {
+        prune_redundant_seed_copy_stmts(&mut block.stmts, self.carried, self.seed)
+    }
+}
+
+fn prune_redundant_seed_copy_stmts(
+    stmts: &mut Vec<AstStmt>,
+    carried: AstBindingRef,
+    seed: AstBindingRef,
+) -> bool {
+    let original_len = stmts.len();
     stmts.retain(|stmt| {
         !is_exact_copy_stmt(stmt, carried, seed) && !is_redundant_self_assign(stmt, seed)
     });
+    stmts.len() != original_len
 }
 
 fn is_exact_copy_stmt(stmt: &AstStmt, carried: AstBindingRef, seed: AstBindingRef) -> bool {
