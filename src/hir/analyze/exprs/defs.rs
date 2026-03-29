@@ -167,6 +167,7 @@ fn expr_for_fixed_call(
         args: lower_value_pack_inline(lowering, block, instr_ref, call.args),
         multiret: false,
         method: matches!(call.kind, CallKind::Method),
+        method_name: lower_method_name(lowering.proto, call.method_name),
     })))
 }
 

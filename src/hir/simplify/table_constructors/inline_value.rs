@@ -111,6 +111,7 @@ fn inline_constructor_value_at_site(
                     .collect::<Option<Vec<_>>>()?,
                 multiret: call.multiret,
                 method: call.method,
+                method_name: call.method_name.clone(),
             })));
         }
         _ => {}

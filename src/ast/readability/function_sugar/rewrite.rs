@@ -9,7 +9,9 @@ use std::collections::BTreeSet;
 use super::super::ReadabilityContext;
 use super::analysis::{collect_method_field_names, collect_method_field_names_in_block};
 use super::chain::try_chain_local_method_call_stmt;
-use super::constructor::try_inline_terminal_constructor_call;
+use super::constructor::{
+    try_inline_terminal_constructor_call, try_inline_terminal_constructor_fields,
+};
 use super::direct::lower_direct_function_stmt;
 use super::forwarded::try_lower_forwarded_function_stmt;
 use super::method_alias::try_recover_method_alias_stmt;
@@ -37,6 +39,14 @@ fn rewrite_block(
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut index = 0;
     while index < old_stmts.len() {
+        if let Some((stmt, consumed)) = try_inline_terminal_constructor_fields(&old_stmts[index..])
+        {
+            new_stmts.push(stmt);
+            changed = true;
+            index += consumed;
+            continue;
+        }
+
         if let Some((stmt, consumed)) =
             try_inline_terminal_constructor_call(&old_stmts[index..], method_fields)
         {

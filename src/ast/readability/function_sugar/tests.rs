@@ -299,6 +299,71 @@ fn inlines_constructor_locals_and_function_field_into_terminal_return_call() {
 }
 
 #[test]
+fn inlines_trailing_table_function_assignment_back_into_terminal_constructor_local() {
+    let mut module = AstModule {
+        entry_function: HirProtoRef(0),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Local(LocalId(0)),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::TableConstructor(Box::new(AstTableConstructor {
+                        fields: vec![crate::ast::AstTableField::Record(
+                            crate::ast::AstRecordField {
+                                key: crate::ast::AstTableKey::Name("branch".to_owned()),
+                                value: AstExpr::TableConstructor(Box::new(AstTableConstructor {
+                                    fields: Vec::new(),
+                                })),
+                            },
+                        )],
+                    }))],
+                })),
+                AstStmt::Assign(Box::new(AstAssign {
+                    targets: vec![AstLValue::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Local(LocalId(0))),
+                        field: "pick".to_owned(),
+                    }))],
+                    values: vec![AstExpr::FunctionExpr(Box::new(AstFunctionExpr {
+                        function: HirProtoRef(1),
+                        params: vec![ParamId(0), ParamId(1)],
+                        is_vararg: false,
+                        named_vararg: None,
+                        body: AstBlock { stmts: Vec::new() },
+                        captured_bindings: Default::default(),
+                    }))],
+                })),
+                AstStmt::Return(Box::new(AstReturn {
+                    values: vec![AstExpr::Var(AstNameRef::Local(LocalId(0)))],
+                })),
+            ],
+        },
+    };
+
+    let changed = run_function_sugar_to_fixed_point(
+        &mut module,
+        AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+    );
+    assert!(changed);
+
+    let [AstStmt::LocalDecl(local_decl), AstStmt::Return(_)] = module.body.stmts.as_slice() else {
+        panic!("expected constructor local and terminal return to remain");
+    };
+    let [AstExpr::TableConstructor(table)] = local_decl.values.as_slice() else {
+        panic!("expected constructor local to stay a table literal");
+    };
+    assert!(matches!(
+        table.fields.as_slice(),
+        [crate::ast::AstTableField::Record(branch), crate::ast::AstTableField::Record(pick)]
+            if matches!(&branch.key, crate::ast::AstTableKey::Name(name) if name == "branch")
+                && matches!(&pick.key, crate::ast::AstTableKey::Name(name) if name == "pick")
+                && matches!(pick.value, AstExpr::FunctionExpr(_))
+    ));
+}
+
+#[test]
 fn recovers_method_call_from_direct_field_alias_call_stmt() {
     let receiver = LocalId(0);
     let field_alias = LocalId(1);

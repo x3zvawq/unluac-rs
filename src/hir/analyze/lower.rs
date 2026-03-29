@@ -11,8 +11,8 @@ use super::bindings::build_bindings;
 use super::exprs::{
     expr_for_closure_capture, expr_for_const, expr_for_reg_at_block_exit, expr_for_reg_use,
     expr_for_value_operand, is_multiret_results, lower_binary_op, lower_branch_cond,
-    lower_table_access_expr, lower_table_access_target, lower_unary_op, lower_value_pack,
-    lower_value_pack_components,
+    lower_method_name, lower_table_access_expr, lower_table_access_target, lower_unary_op,
+    lower_value_pack, lower_value_pack_components,
 };
 use super::helpers::{
     assign_stmt, branch_stmt, build_label_map_for_summary, decode_raw_string, empty_proto,
@@ -29,7 +29,7 @@ use crate::hir::common::{
     HirTableSetList, HirToBeClosed, HirUnaryExpr, LocalId, ParamId, TempId, UpvalueId,
 };
 use crate::structure::{ShortCircuitExit, StructureFacts};
-use crate::transformer::{CallKind, InstrRef, LowInstr, LoweredProto, Reg, ResultPack, ValuePack};
+use crate::transformer::{CallKind, InstrRef, LowInstr, LoweredProto, Reg, ResultPack};
 
 pub(super) struct ProtoBindings {
     pub(super) params: Vec<ParamId>,
@@ -515,21 +515,14 @@ pub(super) fn lower_regular_instr(
             vec![HirExpr::TableConstructor(Box::default())],
         ),
         LowInstr::SetList(set_list) => lower_set_list(lowering, block, instr_ref, set_list),
-        LowInstr::Call(call) => lower_call(
-            lowering,
-            block,
-            instr_ref,
-            call.kind,
-            call.args,
-            call.results,
-            call.callee,
-        ),
+        LowInstr::Call(call) => lower_call(lowering, block, instr_ref, call),
         LowInstr::TailCall(tail_call) => {
             vec![return_stmt(vec![HirExpr::Call(Box::new(HirCallExpr {
                 callee: expr_for_reg_use(lowering, block, instr_ref, tail_call.callee),
                 args: lower_value_pack(lowering, block, instr_ref, tail_call.args),
                 multiret: true,
                 method: matches!(tail_call.kind, CallKind::Method),
+                method_name: lower_method_name(lowering.proto, tail_call.method_name),
             }))])]
         }
         LowInstr::VarArg(vararg) => lower_vararg(lowering, instr_ref, vararg.results),
@@ -652,6 +645,7 @@ pub(super) fn lower_control_instr(
                 args: lower_value_pack(lowering, block, instr_ref, tail_call.args),
                 multiret: true,
                 method: matches!(tail_call.kind, CallKind::Method),
+                method_name: lower_method_name(lowering.proto, tail_call.method_name),
             }))])]
         }
         LowInstr::NumericForInit(instr) => vec![
@@ -736,19 +730,17 @@ fn lower_call(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,
     instr_ref: InstrRef,
-    kind: CallKind,
-    args: ValuePack,
-    results: ResultPack,
-    callee: Reg,
+    call: &crate::transformer::CallInstr,
 ) -> Vec<HirStmt> {
     let expr = HirExpr::Call(Box::new(HirCallExpr {
-        callee: expr_for_reg_use(lowering, block, instr_ref, callee),
-        args: lower_value_pack(lowering, block, instr_ref, args),
-        multiret: is_multiret_results(results),
-        method: matches!(kind, CallKind::Method),
+        callee: expr_for_reg_use(lowering, block, instr_ref, call.callee),
+        args: lower_value_pack(lowering, block, instr_ref, call.args),
+        multiret: is_multiret_results(call.results),
+        method: matches!(call.kind, CallKind::Method),
+        method_name: lower_method_name(lowering.proto, call.method_name),
     }));
 
-    if matches!(results, ResultPack::Ignore) {
+    if matches!(call.results, ResultPack::Ignore) {
         vec![HirStmt::CallStmt(Box::new(HirCallStmt {
             call: match expr {
                 HirExpr::Call(call) => *call,

@@ -227,12 +227,33 @@ impl<'a> AstLowerer<'a> {
         proto_index: usize,
         call: &HirCallExpr,
     ) -> Result<AstCallKind, AstLowerError> {
-        let callee = self.lower_expr(proto_index, &call.callee)?;
         let mut args = call
             .args
             .iter()
             .map(|arg| self.lower_expr(proto_index, arg))
             .collect::<Result<Vec<_>, _>>()?;
+
+        if call.method
+            && let Some(method_name) = &call.method_name
+        {
+            if args.is_empty() {
+                return Err(AstLowerError::InvalidMethodCallPattern {
+                    proto: proto_index,
+                    reason: "method call must keep the implicit receiver as its first argument",
+                });
+            }
+            // 这里优先信任前层 `SELF/NAMECALL` 留下的结构事实，而不是再从 callee
+            // 形状反推 method sugar。这样即使中途出现 `local f = obj.pick; f(obj, 4)`
+            // 这样的 alias scaffolding，也能稳定回收到 `obj:pick(4)`。
+            let receiver = args.remove(0);
+            return Ok(AstCallKind::MethodCall(Box::new(AstMethodCallExpr {
+                receiver,
+                method: method_name.clone(),
+                args,
+            })));
+        }
+
+        let callee = self.lower_expr(proto_index, &call.callee)?;
 
         if call.method
             && let AstExpr::FieldAccess(access) = callee
@@ -243,9 +264,6 @@ impl<'a> AstLowerer<'a> {
                     reason: "method call must keep the implicit receiver as its first argument",
                 });
             }
-            // HIR `call(method)` 仍然沿用 low-IR 的显式 receiver 形状；
-            // 真正落到 AST 时，要把这个首参收回 `receiver:method(args...)`，
-            // 否则后面生成源码会把 `self` 又打印一遍。
             args.remove(0);
             return Ok(AstCallKind::MethodCall(Box::new(AstMethodCallExpr {
                 receiver: access.base,

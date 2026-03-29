@@ -50,6 +50,10 @@ impl BlockFacts {
         missing
     }
 
+    pub(super) fn has_explicit_globals(&self) -> bool {
+        !self.explicit_here.is_empty()
+    }
+
     pub(super) fn visible_globals(
         &self,
         outer_declared: &BTreeSet<String>,

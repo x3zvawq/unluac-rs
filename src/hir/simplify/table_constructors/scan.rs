@@ -4,6 +4,8 @@
 //! setlist、producer”，不会在这里直接改写语句。
 //! 例如：`local t = {}; t.x = 1; t.y = 2` 会在这里被扫描成一串 constructor steps。
 
+use std::collections::BTreeMap;
+
 use crate::hir::common::{HirExpr, HirLValue, HirStmt, HirTableConstructor, HirTableSetList};
 
 use super::bindings::{
@@ -54,6 +56,7 @@ pub(super) fn try_rebuild_constructor_region(
     seed_index: usize,
     binding: TableBinding,
     constructor: HirTableConstructor,
+    materialized_bindings: &BTreeMap<TableBinding, usize>,
 ) -> Option<(HirTableConstructor, usize)> {
     let mut steps = Vec::new();
     let mut index = seed_index + 1;
@@ -66,6 +69,7 @@ pub(super) fn try_rebuild_constructor_region(
                 constructor.clone(),
                 &steps,
                 &block.stmts[index + 1..],
+                materialized_bindings,
             ) {
                 best = Some((rebuilt, index));
             }
@@ -83,6 +87,7 @@ pub(super) fn try_rebuild_constructor_region(
                 constructor.clone(),
                 &steps,
                 &block.stmts[index + 1..],
+                materialized_bindings,
             ) {
                 best = Some((rebuilt, index));
             }

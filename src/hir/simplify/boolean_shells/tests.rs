@@ -43,6 +43,7 @@ fn removes_dead_boolean_materialization_shell() {
                     }))],
                     multiret: false,
                     method: false,
+                    method_name: None,
                 },
             })),
         ],

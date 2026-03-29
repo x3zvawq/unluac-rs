@@ -3,8 +3,8 @@
 //! 我们把测试和实现分开存放，避免主实现文件被大段 `#[cfg(test)]` 代码淹没。
 
 use crate::ast::{
-    AstBlock, AstExpr, AstFunctionExpr, AstIf, AstLocalFunctionDecl, AstModule, AstReturn, AstStmt,
-    AstTargetDialect,
+    AstBlock, AstExpr, AstFieldAccess, AstFunctionExpr, AstIf, AstLocalAttr, AstLocalBinding,
+    AstLocalFunctionDecl, AstModule, AstNameRef, AstReturn, AstStmt, AstTargetDialect,
 };
 use crate::hir::{LocalId, ParamId, TempId};
 
@@ -157,5 +157,150 @@ fn flattens_single_return_do_block_after_inner_locals_disappear() {
     assert!(matches!(
         module.body.stmts.as_slice(),
         [AstStmt::Return(ret)] if ret.values == vec![AstExpr::Integer(1)]
+    ));
+}
+
+#[test]
+fn removes_unused_recovered_lookup_local_with_initializer() {
+    let alias = LocalId(0);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(alias),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Global(crate::ast::AstGlobalName {
+                            text: "result".to_owned(),
+                        })),
+                        field: "pick".to_owned(),
+                    }))],
+                })),
+                AstStmt::Return(Box::new(AstReturn {
+                    values: vec![AstExpr::String("ok".to_owned())],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+            options: Default::default(),
+        }
+    ));
+
+    assert!(matches!(
+        module.body.stmts.as_slice(),
+        [AstStmt::Return(ret)] if ret.values == vec![AstExpr::String("ok".to_owned())]
+    ));
+}
+
+#[test]
+fn keeps_recovered_lookup_local_when_nested_function_captures_it() {
+    let alias = LocalId(0);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: AstBlock {
+            stmts: vec![AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                bindings: vec![AstLocalBinding {
+                    id: crate::ast::AstBindingRef::Local(alias),
+                    attr: AstLocalAttr::None,
+                    origin: crate::ast::AstLocalOrigin::Recovered,
+                }],
+                values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                    base: AstExpr::Var(AstNameRef::Global(crate::ast::AstGlobalName {
+                        text: "state".to_owned(),
+                    })),
+                    field: "value".to_owned(),
+                }))],
+            }))],
+        },
+    };
+
+    module.body.stmts.push(AstStmt::Return(Box::new(AstReturn {
+        values: vec![AstExpr::FunctionExpr(Box::new(AstFunctionExpr {
+            function: Default::default(),
+            params: vec![],
+            is_vararg: false,
+            named_vararg: None,
+            body: AstBlock {
+                stmts: vec![AstStmt::Return(Box::new(AstReturn {
+                    values: vec![AstExpr::Var(AstNameRef::Upvalue(crate::hir::UpvalueId(0)))],
+                }))],
+            },
+            captured_bindings: [crate::ast::AstBindingRef::Local(alias)]
+                .into_iter()
+                .collect(),
+        }))],
+    })));
+
+    assert!(!apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+            options: Default::default(),
+        }
+    ));
+
+    assert!(matches!(
+        module.body.stmts.as_slice(),
+        [AstStmt::LocalDecl(_), AstStmt::Return(_)]
+    ));
+}
+
+#[test]
+fn keeps_empty_synthetic_local_when_nested_function_captures_it() {
+    let alias = crate::ast::AstSyntheticLocalId(TempId(0));
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::SyntheticLocal(alias),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: Vec::new(),
+                })),
+                AstStmt::Return(Box::new(AstReturn {
+                    values: vec![AstExpr::FunctionExpr(Box::new(AstFunctionExpr {
+                        function: Default::default(),
+                        params: vec![],
+                        is_vararg: false,
+                        named_vararg: None,
+                        body: AstBlock {
+                            stmts: vec![AstStmt::Return(Box::new(AstReturn {
+                                values: vec![AstExpr::Var(AstNameRef::Upvalue(
+                                    crate::hir::UpvalueId(0),
+                                ))],
+                            }))],
+                        },
+                        captured_bindings: [crate::ast::AstBindingRef::SyntheticLocal(alias)]
+                            .into_iter()
+                            .collect(),
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(!apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+            options: Default::default(),
+        }
+    ));
+
+    assert!(matches!(
+        module.body.stmts.as_slice(),
+        [AstStmt::LocalDecl(_), AstStmt::Return(_)]
     ));
 }

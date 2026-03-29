@@ -1,8 +1,8 @@
 //! 这些测试固定 Lua 5.5 已经修好的回归点。
 
 use unluac::decompile::{
-    DebugColorMode, DebugDetail, DebugOptions, DecompileDialect, DecompileOptions, DecompileStage,
-    decompile,
+    decompile, DebugColorMode, DebugDetail, DebugOptions, DecompileDialect, DecompileOptions,
+    DecompileStage,
 };
 
 mod decompile_pipeline {
@@ -276,7 +276,7 @@ mod decompile_pipeline {
             Some(DecompileStage::Readability)
         );
         let dump = &result.debug_output[0].content;
-        assert!(dump.contains("global<const> print"), "{dump}");
+        assert!(!dump.contains("global<const> print"), "{dump}");
         assert!(dump.contains("local function l1(p0, ...l0)"), "{dump}");
         assert!(dump.contains("if p0"), "{dump}");
         assert!(!dump.contains("if (not p0)"), "{dump}");
@@ -343,7 +343,7 @@ mod decompile_pipeline {
             Some(DecompileStage::Readability)
         );
         let dump = &result.debug_output[0].content;
-        assert!(dump.contains("global<const> print"), "{dump}");
+        assert!(!dump.contains("global<const> print"), "{dump}");
         assert!(dump.contains("local function l1(p0, ...l0)"), "{dump}");
         assert!(dump.contains("local function l1(p0, p1)"), "{dump}");
         assert!(dump.contains("local function l6()"), "{dump}");
@@ -454,7 +454,7 @@ mod decompile_pipeline {
     }
 
     #[test]
-    fn lua55_generate_stage_infers_const_global_prelude_for_const_gate_fixture() {
+    fn lua55_generate_stage_does_not_infer_const_global_prelude_for_const_gate_fixture() {
         let chunk = crate::support::compile_lua_case(
             "lua5.5",
             "tests/lua_cases/lua5.5/05_global_const_gate.lua",
@@ -475,7 +475,7 @@ mod decompile_pipeline {
             .as_ref()
             .expect("generate stage should leave generated source in state");
         assert!(
-            generated.source.contains("global<const> math, tostring"),
+            !generated.source.contains("global<const> math, tostring"),
             "{}",
             generated.source
         );
@@ -667,6 +667,64 @@ mod decompile_pipeline {
         assert!(!generated.source.contains(".next("), "{}", generated.source);
         assert!(
             generated.source.contains("value = value2 + (result or 1)"),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
+    fn lua55_generate_stage_recovers_nested_table_method_index_case_without_spurious_globals() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.5",
+            "tests/lua_cases/common/tricky/23_nested_table_call_index.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua55,
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.5 generate stage should succeed for nested table call/index fixture");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should leave generated source in state");
+        assert!(
+            generated.source.contains("branch = {"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("pick = function("),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains(":pick(4)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("return b.branch[b2]"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local pick = result.pick"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local branch = b.branch"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("global<const>"),
             "{}",
             generated.source
         );

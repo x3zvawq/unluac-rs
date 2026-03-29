@@ -4,7 +4,7 @@
 //! 不会在这里扫描 region 或重建字段序列。
 //! 例如：`t.x = v` 会在这里把键翻成 `Name(\"x\")` 并识别 `t` 的绑定身份。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
     HirCallExpr, HirDecisionTarget, HirExpr, HirLValue, HirStmt, HirTableField, HirTableKey,
@@ -47,6 +47,14 @@ pub(super) fn collect_stmt_slice_bindings(stmts: &[HirStmt]) -> BTreeSet<TableBi
         collect_stmt_bindings(stmt, &mut bindings);
     }
     bindings
+}
+
+pub(super) fn collect_materialized_binding_counts(
+    block: &crate::hir::common::HirBlock,
+) -> BTreeMap<TableBinding, usize> {
+    let mut counts = BTreeMap::new();
+    collect_block_materialized_bindings(block, &mut counts);
+    counts
 }
 
 pub(super) fn expr_depends_on_any_binding(expr: &HirExpr, bindings: &[TableBinding]) -> bool {
@@ -184,6 +192,68 @@ fn collect_stmt_bindings(stmt: &HirStmt, bindings: &mut BTreeSet<TableBinding>) 
         }
         HirStmt::Break
         | HirStmt::Close(_)
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => {}
+    }
+}
+
+fn collect_block_materialized_bindings(
+    block: &crate::hir::common::HirBlock,
+    counts: &mut BTreeMap<TableBinding, usize>,
+) {
+    for stmt in &block.stmts {
+        collect_stmt_materialized_bindings(stmt, counts);
+    }
+}
+
+fn collect_stmt_materialized_bindings(stmt: &HirStmt, counts: &mut BTreeMap<TableBinding, usize>) {
+    match stmt {
+        HirStmt::LocalDecl(local_decl) => {
+            for binding in &local_decl.bindings {
+                *counts.entry(TableBinding::Local(*binding)).or_default() += 1;
+            }
+        }
+        HirStmt::Assign(assign) => {
+            for target in &assign.targets {
+                if let Some(binding) = binding_from_lvalue(target) {
+                    *counts.entry(binding).or_default() += 1;
+                }
+            }
+        }
+        HirStmt::If(if_stmt) => {
+            collect_block_materialized_bindings(&if_stmt.then_block, counts);
+            if let Some(else_block) = &if_stmt.else_block {
+                collect_block_materialized_bindings(else_block, counts);
+            }
+        }
+        HirStmt::While(while_stmt) => collect_block_materialized_bindings(&while_stmt.body, counts),
+        HirStmt::Repeat(repeat_stmt) => {
+            collect_block_materialized_bindings(&repeat_stmt.body, counts);
+        }
+        HirStmt::NumericFor(numeric_for) => {
+            *counts
+                .entry(TableBinding::Local(numeric_for.binding))
+                .or_default() += 1;
+            collect_block_materialized_bindings(&numeric_for.body, counts);
+        }
+        HirStmt::GenericFor(generic_for) => {
+            for binding in &generic_for.bindings {
+                *counts.entry(TableBinding::Local(*binding)).or_default() += 1;
+            }
+            collect_block_materialized_bindings(&generic_for.body, counts);
+        }
+        HirStmt::Block(block) => collect_block_materialized_bindings(block, counts),
+        HirStmt::Unstructured(unstructured) => {
+            collect_block_materialized_bindings(&unstructured.body, counts);
+        }
+        HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::Return(_)
+        | HirStmt::Break
         | HirStmt::Continue
         | HirStmt::Goto(_)
         | HirStmt::Label(_) => {}

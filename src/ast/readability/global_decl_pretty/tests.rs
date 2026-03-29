@@ -80,7 +80,7 @@ fn merges_seed_locals_into_single_multi_global_decl_in_seed_order() {
 }
 
 #[test]
-fn inserts_const_global_decl_for_missing_readonly_globals_inside_nested_functions() {
+fn lua55_does_not_infer_const_global_decl_for_missing_readonly_globals_inside_nested_functions() {
     let mut module = AstModule {
         entry_function: HirProtoRef(0),
         body: AstBlock {
@@ -121,7 +121,7 @@ fn inserts_const_global_decl_for_missing_readonly_globals_inside_nested_function
         },
     };
 
-    assert!(apply(
+    assert!(!apply(
         &mut module,
         ReadabilityContext {
             target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
@@ -135,20 +135,15 @@ fn inserts_const_global_decl_for_missing_readonly_globals_inside_nested_function
     let [AstExpr::FunctionExpr(function)] = local_decl.values.as_slice() else {
         panic!("expected nested function expression");
     };
-    let [AstStmt::GlobalDecl(global_decl), ..] = function.body.stmts.as_slice() else {
-        panic!("expected inferred const global declaration inside nested function");
-    };
-    assert_eq!(global_decl.bindings.len(), 1);
     assert!(matches!(
-        &global_decl.bindings[0].target,
-        AstGlobalBindingTarget::Name(name) if name.text == "math"
+        function.body.stmts.as_slice(),
+        [AstStmt::Return(_)]
     ));
-    assert_eq!(global_decl.bindings[0].attr, AstGlobalAttr::Const);
-    assert!(global_decl.values.is_empty());
 }
 
 #[test]
-fn inserts_mutable_global_prelude_when_outer_block_reads_name_written_in_nested_function() {
+fn lua55_does_not_infer_mutable_global_prelude_when_outer_block_reads_name_written_in_nested_function()
+ {
     let mut module = AstModule {
         entry_function: HirProtoRef(0),
         body: AstBlock {
@@ -201,7 +196,7 @@ fn inserts_mutable_global_prelude_when_outer_block_reads_name_written_in_nested_
         },
     };
 
-    assert!(apply(
+    assert!(!apply(
         &mut module,
         ReadabilityContext {
             target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
@@ -209,20 +204,41 @@ fn inserts_mutable_global_prelude_when_outer_block_reads_name_written_in_nested_
         }
     ));
 
-    let [AstStmt::GlobalDecl(global_decl), ..] = module.body.stmts.as_slice() else {
-        panic!("expected inferred outer global prelude");
-    };
-    assert_eq!(global_decl.bindings.len(), 1);
     assert!(matches!(
-        &global_decl.bindings[0].target,
-        AstGlobalBindingTarget::Name(name) if name.text == "emit"
+        module.body.stmts.as_slice(),
+        [AstStmt::LocalDecl(_), AstStmt::CallStmt(_)]
     ));
-    assert_eq!(global_decl.bindings[0].attr, AstGlobalAttr::None);
-    assert!(global_decl.values.is_empty());
 }
 
 #[test]
-fn inserts_missing_globals_after_existing_leading_global_decl_run() {
+fn lua55_does_not_add_global_decl_without_explicit_global_evidence() {
+    let mut module = AstModule {
+        entry_function: HirProtoRef(0),
+        body: AstBlock {
+            stmts: vec![AstStmt::CallStmt(Box::new(crate::ast::AstCallStmt {
+                call: crate::ast::common::AstCallKind::Call(Box::new(AstCallExpr {
+                    callee: AstExpr::Var(AstNameRef::Global(crate::ast::AstGlobalName {
+                        text: "print".to_owned(),
+                    })),
+                    args: vec![AstExpr::String("tag".to_owned())],
+                })),
+            }))],
+        },
+    };
+
+    assert!(!apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+            options: Default::default(),
+        }
+    ));
+
+    assert!(matches!(module.body.stmts.as_slice(), [AstStmt::CallStmt(_)]));
+}
+
+#[test]
+fn lua55_infers_missing_globals_after_existing_leading_global_decl_run() {
     let mut module = AstModule {
         entry_function: HirProtoRef(0),
         body: AstBlock {
@@ -259,7 +275,7 @@ fn inserts_missing_globals_after_existing_leading_global_decl_run() {
     let [
         AstStmt::GlobalDecl(explicit),
         AstStmt::GlobalDecl(inferred),
-        ..,
+        AstStmt::CallStmt(_),
     ] = module.body.stmts.as_slice()
     else {
         panic!("expected explicit global decl followed by inferred prelude");

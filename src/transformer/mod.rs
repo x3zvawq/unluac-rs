@@ -15,10 +15,10 @@ pub use common::{
     ConcatInstr, CondOperand, ConstRef, DialectCaptureExtra, ErrNilInstr, GenericForCallInstr,
     GenericForLoopInstr, GetTableInstr, GetUpvalueInstr, InstrRef, JumpInstr, LoadBoolInstr,
     LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr, LoweredChunk,
-    LoweredProto, LoweringMap, MoveInstr, NewTableInstr, NumberLiteral, NumericForInitInstr,
-    NumericForLoopInstr, ProtoRef, RawInstrRef, Reg, RegRange, ResultPack, ReturnInstr,
-    SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr, TbcInstr, UnaryOpInstr,
-    UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    LoweredProto, LoweringMap, MethodNameHint, MoveInstr, NewTableInstr, NumberLiteral,
+    NumericForInitInstr, NumericForLoopInstr, ProtoRef, RawInstrRef, Reg, RegRange, ResultPack,
+    ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr, TbcInstr,
+    UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 pub use debug::dump_lir;
 pub use error::TransformError;

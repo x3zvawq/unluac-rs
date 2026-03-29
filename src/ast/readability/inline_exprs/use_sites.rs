@@ -513,7 +513,10 @@ impl InlineSite {
                             is_access_base_inline_expr(replacement)
                                 || is_recallable_inline_expr(replacement)
                         }
-                        Self::ReturnNestedValue => is_recallable_inline_expr(replacement),
+                        Self::ReturnNestedValue => {
+                            is_recallable_inline_expr(replacement)
+                                || is_lookup_inline_expr(replacement)
+                        }
                         _ => false,
                     },
                 },
@@ -592,7 +595,9 @@ impl InlineSite {
                 is_extended_neutral_local_alias_expr(replacement)
                     || is_recallable_inline_expr(replacement)
             }
-            Self::ReturnNestedValue => is_recallable_inline_expr(replacement),
+            Self::ReturnNestedValue => {
+                is_recallable_inline_expr(replacement) || is_lookup_inline_expr(replacement)
+            }
             Self::CallCallee => is_call_callee_inline_expr(replacement),
             Self::CallArgNonFinal => {
                 is_extended_call_arg_local_alias_expr(replacement)

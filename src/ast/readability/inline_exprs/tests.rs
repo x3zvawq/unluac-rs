@@ -1374,6 +1374,60 @@ fn collapses_lookup_alias_run_back_into_final_print_args() {
 }
 
 #[test]
+fn inlines_lookup_alias_inside_nested_return_value() {
+    let branch = LocalId(0);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(branch),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "obj".to_owned(),
+                        })),
+                        field: "branch".to_owned(),
+                    }))],
+                })),
+                AstStmt::Return(Box::new(AstReturn {
+                    values: vec![AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                        base: AstExpr::Var(AstNameRef::Local(branch)),
+                        index: AstExpr::Integer(4),
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+
+    assert_eq!(
+        module.body.stmts,
+        vec![AstStmt::Return(Box::new(AstReturn {
+            values: vec![AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                base: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                    base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                        text: "obj".to_owned(),
+                    })),
+                    field: "branch".to_owned(),
+                })),
+                index: AstExpr::Integer(4),
+            }))],
+        }))]
+    );
+}
+
+#[test]
 fn folds_access_base_alias_into_adjacent_local_alias_initializer_chain() {
     let unpack_alias = LocalId(0);
     let fn_alias = LocalId(1);

@@ -10,8 +10,8 @@ use crate::transformer::dialect::lowering::{
 };
 use crate::transformer::{
     AccessBase, CallInstr, CallKind, CloseInstr, ConstRef, GenericForCallInstr, LowInstr,
-    LoweredChunk, LoweredProto, LoweringMap, ProtoRef, Reg, RegRange, ResultPack, ReturnInstr,
-    TailCallInstr, TbcInstr, TransformError, UpvalueRef, ValuePack,
+    LoweredChunk, LoweredProto, LoweringMap, MethodNameHint, ProtoRef, Reg, RegRange, ResultPack,
+    ReturnInstr, TailCallInstr, TbcInstr, TransformError, UpvalueRef, ValuePack,
 };
 
 pub(crate) const BITRK: u16 = 1 << 8;
@@ -443,6 +443,7 @@ pub(crate) fn emit_call(
     args: ValuePack,
     results: ResultPack,
     kind: CallKind,
+    method_name: Option<MethodNameHint>,
 ) {
     lowering.emit(
         Some(raw_index),
@@ -452,6 +453,7 @@ pub(crate) fn emit_call(
             args,
             results,
             kind,
+            method_name,
         })),
     );
 }
@@ -462,6 +464,7 @@ pub(crate) fn emit_tail_call(
     callee: Reg,
     args: ValuePack,
     kind: CallKind,
+    method_name: Option<MethodNameHint>,
     close_before: bool,
 ) {
     if close_before {
@@ -473,13 +476,23 @@ pub(crate) fn emit_tail_call(
         lowering.emit(
             None,
             vec![raw_index],
-            PendingLowInstr::Ready(LowInstr::TailCall(TailCallInstr { callee, args, kind })),
+            PendingLowInstr::Ready(LowInstr::TailCall(TailCallInstr {
+                callee,
+                args,
+                kind,
+                method_name,
+            })),
         );
     } else {
         lowering.emit(
             Some(raw_index),
             vec![raw_index],
-            PendingLowInstr::Ready(LowInstr::TailCall(TailCallInstr { callee, args, kind })),
+            PendingLowInstr::Ready(LowInstr::TailCall(TailCallInstr {
+                callee,
+                args,
+                kind,
+                method_name,
+            })),
         );
     }
 }

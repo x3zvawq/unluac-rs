@@ -313,6 +313,7 @@ fn extract_call_expr(
             args,
             multiret: call.multiret,
             method: call.method,
+            method_name: call.method_name,
         },
         callee_changed || args_changed,
     )
@@ -656,6 +657,7 @@ fn collapse_expr_to_pure(expr: HirExpr) -> Option<HirExpr> {
                 args,
                 multiret: call.multiret,
                 method: call.method,
+                method_name: call.method_name,
             })))
         }
         HirExpr::TableConstructor(table) => {

@@ -6,9 +6,9 @@
 
 use crate::parser::{RawInstr, RawProto};
 use crate::transformer::{
-    BranchCond, BranchInstr, CallKind, GenericForLoopInstr, InstrRef, JumpInstr, LowInstr,
-    LoweringMap, NumericForInitInstr, NumericForLoopInstr, RawInstrRef, Reg, RegRange,
-    TransformError,
+    BranchCond, BranchInstr, CallKind, ConstRef, GenericForLoopInstr, InstrRef, JumpInstr,
+    LowInstr, LoweringMap, MethodNameHint, NumericForInitInstr, NumericForLoopInstr, RawInstrRef,
+    Reg, RegRange, TransformError,
 };
 
 #[derive(Debug, Clone)]
@@ -196,7 +196,7 @@ impl PendingLoweringState {
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingMethodHints {
-    slots: Vec<Option<Reg>>,
+    slots: Vec<Option<PendingMethodHint>>,
 }
 
 impl PendingMethodHints {
@@ -206,16 +206,20 @@ impl PendingMethodHints {
         }
     }
 
-    pub(crate) fn set(&mut self, callee: Reg, self_arg: Reg) {
-        set_pending_method_hint(&mut self.slots, callee, self_arg);
+    pub(crate) fn set(&mut self, callee: Reg, self_arg: Reg, method_name: Option<ConstRef>) {
+        set_pending_method_hint(&mut self.slots, callee, self_arg, method_name);
     }
 
-    pub(crate) fn call_kind(&self, callee: Reg, raw_b: u16) -> CallKind {
-        self.call_kind_if(callee, raw_b != 1)
+    pub(crate) fn call_info(&self, callee: Reg, raw_b: u16) -> (CallKind, Option<MethodNameHint>) {
+        self.call_info_if(callee, raw_b != 1)
     }
 
-    pub(crate) fn call_kind_if(&self, callee: Reg, hint_allowed: bool) -> CallKind {
-        pending_call_kind(&self.slots, callee, hint_allowed)
+    pub(crate) fn call_info_if(
+        &self,
+        callee: Reg,
+        hint_allowed: bool,
+    ) -> (CallKind, Option<MethodNameHint>) {
+        pending_call_info(&self.slots, callee, hint_allowed)
     }
 
     pub(crate) fn invalidate_reg(&mut self, reg: Reg) {
@@ -229,6 +233,12 @@ impl PendingMethodHints {
     pub(crate) fn clear(&mut self) {
         clear_pending_method_hints(&mut self.slots);
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingMethodHint {
+    self_arg: Reg,
+    method_name: Option<ConstRef>,
 }
 
 #[derive(Debug, Clone)]
@@ -445,40 +455,59 @@ pub(crate) fn ensure_targetable_pc(
         })
 }
 
-fn set_pending_method_hint(pending_methods: &mut [Option<Reg>], callee: Reg, self_arg: Reg) {
+fn set_pending_method_hint(
+    pending_methods: &mut [Option<PendingMethodHint>],
+    callee: Reg,
+    self_arg: Reg,
+    method_name: Option<ConstRef>,
+) {
     if callee.index() < pending_methods.len() {
-        pending_methods[callee.index()] = Some(self_arg);
+        pending_methods[callee.index()] = Some(PendingMethodHint {
+            self_arg,
+            method_name,
+        });
     }
 }
 
-fn pending_call_kind(pending_methods: &[Option<Reg>], callee: Reg, hint_allowed: bool) -> CallKind {
+fn pending_call_info(
+    pending_methods: &[Option<PendingMethodHint>],
+    callee: Reg,
+    hint_allowed: bool,
+) -> (CallKind, Option<MethodNameHint>) {
     if !hint_allowed {
-        return CallKind::Normal;
+        return (CallKind::Normal, None);
     }
 
     match pending_methods.get(callee.index()).and_then(|value| *value) {
-        Some(self_arg) if self_arg == Reg(callee.index() + 1) => CallKind::Method,
-        _ => CallKind::Normal,
+        Some(hint) if hint.self_arg == Reg(callee.index() + 1) => (
+            CallKind::Method,
+            hint.method_name
+                .map(|const_ref| MethodNameHint { const_ref }),
+        ),
+        _ => (CallKind::Normal, None),
     }
 }
 
-fn invalidate_pending_method_reg(pending_methods: &mut [Option<Reg>], reg: Reg) {
+fn invalidate_pending_method_reg(pending_methods: &mut [Option<PendingMethodHint>], reg: Reg) {
     for (callee, pending) in pending_methods.iter_mut().enumerate() {
-        let Some(self_arg) = *pending else {
+        let Some(hint) = *pending else {
             continue;
         };
-        if callee == reg.index() || self_arg.index() == reg.index() {
+        if callee == reg.index() || hint.self_arg.index() == reg.index() {
             *pending = None;
         }
     }
 }
 
-fn invalidate_pending_method_range(pending_methods: &mut [Option<Reg>], range: RegRange) {
+fn invalidate_pending_method_range(
+    pending_methods: &mut [Option<PendingMethodHint>],
+    range: RegRange,
+) {
     for offset in 0..range.len {
         invalidate_pending_method_reg(pending_methods, Reg(range.start.index() + offset));
     }
 }
 
-fn clear_pending_method_hints(pending_methods: &mut [Option<Reg>]) {
+fn clear_pending_method_hints(pending_methods: &mut [Option<PendingMethodHint>]) {
     pending_methods.fill(None);
 }

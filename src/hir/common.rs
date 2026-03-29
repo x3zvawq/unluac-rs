@@ -271,6 +271,11 @@ pub struct HirCallExpr {
     pub args: Vec<HirExpr>,
     pub multiret: bool,
     pub method: bool,
+    /// 来自 `SELF` / `NAMECALL` 的 method 名事实。
+    ///
+    /// 这一层显式保留字段名，是为了避免后面的 AST build 再去猜
+    /// `obj.method(obj, ...)` 是否可以收回 `obj:method(...)`。
+    pub method_name: Option<String>,
 }
 
 /// 调用语句。

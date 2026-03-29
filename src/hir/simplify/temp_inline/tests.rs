@@ -29,6 +29,7 @@ fn removes_immediate_temp_forwarding_chain() {
                     args: vec![HirExpr::TempRef(TempId(1))],
                     multiret: false,
                     method: false,
+                    method_name: None,
                 },
             })),
             HirStmt::Return(Box::new(HirReturn {
@@ -172,6 +173,7 @@ fn does_not_inline_self_referential_loop_state_update_into_following_call() {
                                 args: vec![HirExpr::TempRef(TempId(0))],
                                 multiret: false,
                                 method: false,
+                                method_name: None,
                             },
                         })),
                     ],
@@ -239,6 +241,7 @@ fn does_not_inline_debug_hinted_generic_for_loop_state_update() {
                                 ],
                                 multiret: false,
                                 method: false,
+                                method_name: None,
                             }))],
                         })),
                         HirStmt::Assign(Box::new(HirAssign {
@@ -326,6 +329,7 @@ fn does_not_inline_generic_for_carried_state_update_from_loop_prefix() {
                                     ],
                                     multiret: false,
                                     method: false,
+                                    method_name: None,
                                 }))],
                             })),
                             HirStmt::Assign(Box::new(HirAssign {

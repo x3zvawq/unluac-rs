@@ -1,16 +1,73 @@
-//! 这个子模块负责把“构造器尾部立刻安装方法”的模式收成更自然的函数 sugar。
+//! 这个子模块负责把“构造器尾部立刻安装方法/字段函数”的模式收成更自然的函数 sugar。
 //!
-//! 它依赖 method field 收集和前缀 local alias 证据，只吸收终端构造器调用链，不会在这里
-//! 重写一般赋值语句。
-//! 例如：先建表再给字段塞函数、最后立刻调用的模式，会在这里折成更紧凑的写法。
+//! 它依赖 method field 收集和前缀 local alias 证据，只吸收终端构造器链上的局部模式，
+//! 不会在这里重写一般赋值语句。
+//! 例如：
+//! - `local t = {}; t.pick = function(...) end; return t`
+//!   -> `local t = { pick = function(...) end }; return t`
+//! - 先建表再给字段塞函数、最后立刻调用的模式，也会在这里折成更紧凑的写法。
 
 use std::collections::BTreeSet;
 
 use super::super::binding_flow::name_matches_binding;
 use crate::ast::common::{
-    AstBindingRef, AstExpr, AstFunctionDecl, AstFunctionExpr, AstFunctionName, AstLocalAttr,
-    AstStmt, AstTableField, AstTableKey,
+    AstAssign, AstBindingRef, AstExpr, AstFieldAccess, AstFunctionDecl, AstFunctionExpr,
+    AstFunctionName, AstLValue, AstLocalAttr, AstStmt, AstTableField, AstTableKey,
 };
+
+pub(super) fn try_inline_terminal_constructor_fields(
+    stmts: &[AstStmt],
+) -> Option<(AstStmt, usize)> {
+    let AstStmt::LocalDecl(local_decl) = stmts.first()? else {
+        return None;
+    };
+    if local_decl.bindings.len() != 1 || local_decl.values.len() != 1 {
+        return None;
+    }
+    if local_decl.bindings[0].attr != AstLocalAttr::None {
+        return None;
+    }
+    let binding = local_decl.bindings[0].id;
+    let AstExpr::TableConstructor(_) = &local_decl.values[0] else {
+        return None;
+    };
+
+    let mut rewritten = local_decl.as_ref().clone();
+    let AstExpr::TableConstructor(table) = &mut rewritten.values[0] else {
+        unreachable!("matched constructor value above")
+    };
+
+    let mut consumed = 1usize;
+    let mut inlined_any = false;
+    while let Some(stmt) = stmts.get(consumed) {
+        let Some((field, func)) = inlineable_local_table_function_stmt(stmt, binding) else {
+            break;
+        };
+        table
+            .fields
+            .push(AstTableField::Record(crate::ast::AstRecordField {
+                key: AstTableKey::Name(field),
+                value: AstExpr::FunctionExpr(Box::new(func)),
+            }));
+        consumed += 1;
+        inlined_any = true;
+    }
+    if !inlined_any {
+        return None;
+    }
+
+    let AstStmt::Return(ret) = stmts.get(consumed)? else {
+        return None;
+    };
+    let [AstExpr::Var(name)] = ret.values.as_slice() else {
+        return None;
+    };
+    if !name_matches_binding(name, binding) {
+        return None;
+    }
+
+    Some((AstStmt::LocalDecl(Box::new(rewritten)), consumed))
+}
 
 pub(super) fn try_inline_terminal_constructor_call(
     stmts: &[AstStmt],
@@ -120,4 +177,46 @@ fn inlineable_table_function_field(
         | crate::ast::common::AstNameRef::Global(_) => return None,
     };
     Some((binding, path.fields[0].clone(), function_decl.func.clone()))
+}
+
+fn inlineable_local_table_function_stmt(
+    stmt: &AstStmt,
+    binding: AstBindingRef,
+) -> Option<(String, AstFunctionExpr)> {
+    match stmt {
+        AstStmt::Assign(assign) => inlineable_local_table_function_assign(assign, binding),
+        AstStmt::FunctionDecl(function_decl) => {
+            let AstFunctionName::Plain(path) = &function_decl.target else {
+                return None;
+            };
+            if path.fields.len() != 1 || !name_matches_binding(&path.root, binding) {
+                return None;
+            }
+            Some((path.fields[0].clone(), function_decl.func.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn inlineable_local_table_function_assign(
+    assign: &AstAssign,
+    binding: AstBindingRef,
+) -> Option<(String, AstFunctionExpr)> {
+    if assign.targets.len() != 1 || assign.values.len() != 1 {
+        return None;
+    }
+    let AstLValue::FieldAccess(access) = &assign.targets[0] else {
+        return None;
+    };
+    let AstFieldAccess { base, field } = access.as_ref();
+    let AstExpr::Var(name) = base else {
+        return None;
+    };
+    if !name_matches_binding(name, binding) {
+        return None;
+    }
+    let AstExpr::FunctionExpr(function) = &assign.values[0] else {
+        return None;
+    };
+    Some((field.clone(), function.as_ref().clone()))
 }

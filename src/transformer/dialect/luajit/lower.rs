@@ -525,6 +525,7 @@ impl<'a> ProtoLowerer<'a> {
                             args: self.call_args_pack(a, c),
                             results: call_results_pack(a, b),
                             kind: CallKind::Normal,
+                            method_name: None,
                         })),
                     );
                     raw_index += 1;
@@ -539,6 +540,7 @@ impl<'a> ProtoLowerer<'a> {
                             args: ValuePack::Open(self.call_arg_start(a)),
                             results: call_results_pack(a, b),
                             kind: CallKind::Normal,
+                            method_name: None,
                         })),
                     );
                     raw_index += 1;
@@ -552,6 +554,7 @@ impl<'a> ProtoLowerer<'a> {
                             callee: reg_from_u8(a),
                             args: self.tail_call_args_pack(a, d),
                             kind: CallKind::Normal,
+                            method_name: None,
                         })),
                     );
                     raw_index += 1;
@@ -565,6 +568,7 @@ impl<'a> ProtoLowerer<'a> {
                             callee: reg_from_u8(a),
                             args: ValuePack::Open(self.call_arg_start(a)),
                             kind: CallKind::Normal,
+                            method_name: None,
                         })),
                     );
                     raw_index += 1;

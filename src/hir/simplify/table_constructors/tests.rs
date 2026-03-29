@@ -137,6 +137,7 @@ fn folds_set_list_with_trailing_multivalue_into_constructor_tail() {
                             args: Vec::new(),
                             multiret: false,
                             method: false,
+                            method_name: None,
                         })),
                         HirExpr::String("tail".to_owned()),
                     ],
@@ -145,6 +146,7 @@ fn folds_set_list_with_trailing_multivalue_into_constructor_tail() {
                         args: Vec::new(),
                         multiret: true,
                         method: false,
+                        method_name: None,
                     }))),
                     start_index: 1,
                 })),
@@ -182,10 +184,12 @@ fn folds_set_list_with_trailing_multivalue_into_constructor_tail() {
                                 ],
                                 multiret: true,
                                 method: false,
+                                method_name: None,
                             })),
                         ],
                         multiret: false,
                         method: false,
+                        method_name: None,
                     },
                 })),
                 HirStmt::Return(Box::new(HirReturn {
@@ -426,6 +430,7 @@ fn folds_mixed_record_and_array_constructor_with_closure_field_and_trailing_mult
                         args: vec![HirExpr::String("A".to_owned())],
                         multiret: true,
                         method: false,
+                        method_name: None,
                     }))),
                     start_index: 1,
                 })),
@@ -551,4 +556,184 @@ fn does_not_fold_closure_backed_record_writes_into_constructor() {
         panic!("expected original table constructor seed");
     };
     assert!(table_ctor.fields.is_empty());
+}
+
+#[test]
+fn folds_expr_keyed_closure_backed_record_writes_into_constructor() {
+    let table_local = LocalId(0);
+    let closure_local = LocalId(1);
+
+    let mut proto = HirProto {
+        id: crate::hir::common::HirProtoRef(0),
+        source: None,
+        line_range: ProtoLineRange {
+            defined_start: 0,
+            defined_end: 0,
+        },
+        signature: ProtoSignature {
+            num_params: 1,
+            is_vararg: false,
+            has_vararg_param_reg: false,
+            named_vararg_table: false,
+        },
+        params: vec![crate::hir::ParamId(0)],
+        locals: vec![table_local, closure_local],
+        upvalues: Vec::new(),
+        temps: Vec::new(),
+        temp_debug_locals: Vec::new(),
+        local_debug_hints: Vec::new(),
+        body: HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![table_local],
+                    values: vec![HirExpr::TableConstructor(Box::default())],
+                })),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![closure_local],
+                    values: vec![HirExpr::Closure(Box::new(HirClosureExpr {
+                        proto: crate::hir::common::HirProtoRef(1),
+                        captures: Vec::new(),
+                    }))],
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::TableAccess(Box::new(
+                        crate::hir::common::HirTableAccess {
+                            base: HirExpr::LocalRef(table_local),
+                            key: HirExpr::ParamRef(crate::hir::ParamId(0)),
+                        },
+                    ))],
+                    values: vec![HirExpr::LocalRef(closure_local)],
+                })),
+            ],
+        },
+        children: Vec::new(),
+    };
+
+    let changed = stabilize_table_constructors_in_proto(&mut proto);
+    assert!(changed);
+    assert_eq!(proto.body.stmts.len(), 1);
+    let HirStmt::LocalDecl(seed) = &proto.body.stmts[0] else {
+        panic!("table seed should stay a local decl");
+    };
+    let [HirExpr::TableConstructor(table_ctor)] = seed.values.as_slice() else {
+        panic!("expected constructor seed to absorb expr-keyed closure record");
+    };
+    assert!(matches!(
+        table_ctor.fields.as_slice(),
+        [HirTableField::Record(field)]
+            if matches!(&field.key, HirTableKey::Expr(HirExpr::ParamRef(crate::hir::ParamId(0))))
+                && matches!(field.value, HirExpr::Closure(_))
+    ));
+}
+
+#[test]
+fn does_not_fold_recursive_local_function_slot_into_expr_keyed_constructor_field() {
+    let table_local = LocalId(0);
+    let function_local = LocalId(1);
+
+    let mut proto = HirProto {
+        id: crate::hir::common::HirProtoRef(0),
+        source: None,
+        line_range: ProtoLineRange {
+            defined_start: 0,
+            defined_end: 0,
+        },
+        signature: ProtoSignature {
+            num_params: 1,
+            is_vararg: false,
+            has_vararg_param_reg: false,
+            named_vararg_table: false,
+        },
+        params: vec![crate::hir::ParamId(0)],
+        locals: vec![table_local, function_local],
+        upvalues: Vec::new(),
+        temps: Vec::new(),
+        temp_debug_locals: Vec::new(),
+        local_debug_hints: Vec::new(),
+        body: HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![table_local],
+                    values: vec![HirExpr::TableConstructor(Box::default())],
+                })),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![function_local],
+                    values: vec![HirExpr::Closure(Box::new(HirClosureExpr {
+                        proto: crate::hir::common::HirProtoRef(1),
+                        captures: vec![crate::hir::common::HirCapture {
+                            value: HirExpr::LocalRef(function_local),
+                        }],
+                    }))],
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::TableAccess(Box::new(
+                        crate::hir::common::HirTableAccess {
+                            base: HirExpr::LocalRef(table_local),
+                            key: HirExpr::ParamRef(crate::hir::ParamId(0)),
+                        },
+                    ))],
+                    values: vec![HirExpr::LocalRef(function_local)],
+                })),
+            ],
+        },
+        children: Vec::new(),
+    };
+
+    let changed = stabilize_table_constructors_in_proto(&mut proto);
+    assert!(!changed);
+    assert_eq!(proto.body.stmts.len(), 3);
+}
+
+#[test]
+fn does_not_fold_direct_recursive_closure_when_capture_slot_has_no_surviving_binding_site() {
+    let table_local = LocalId(0);
+    let recursive_slot = LocalId(1);
+
+    let mut proto = HirProto {
+        id: crate::hir::common::HirProtoRef(0),
+        source: None,
+        line_range: ProtoLineRange {
+            defined_start: 0,
+            defined_end: 0,
+        },
+        signature: ProtoSignature {
+            num_params: 1,
+            is_vararg: false,
+            has_vararg_param_reg: false,
+            named_vararg_table: false,
+        },
+        params: vec![crate::hir::ParamId(0)],
+        locals: vec![table_local, recursive_slot],
+        upvalues: Vec::new(),
+        temps: Vec::new(),
+        temp_debug_locals: Vec::new(),
+        local_debug_hints: Vec::new(),
+        body: HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![table_local],
+                    values: vec![HirExpr::TableConstructor(Box::default())],
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::TableAccess(Box::new(
+                        crate::hir::common::HirTableAccess {
+                            base: HirExpr::LocalRef(table_local),
+                            key: HirExpr::ParamRef(crate::hir::ParamId(0)),
+                        },
+                    ))],
+                    values: vec![HirExpr::Closure(Box::new(HirClosureExpr {
+                        proto: crate::hir::common::HirProtoRef(1),
+                        captures: vec![crate::hir::common::HirCapture {
+                            value: HirExpr::LocalRef(recursive_slot),
+                        }],
+                    }))],
+                })),
+            ],
+        },
+        children: Vec::new(),
+    };
+
+    let changed = stabilize_table_constructors_in_proto(&mut proto);
+    assert!(!changed);
+    assert_eq!(proto.body.stmts.len(), 2);
 }

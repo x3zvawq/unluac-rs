@@ -259,6 +259,15 @@ pub enum CallKind {
     Method,
 }
 
+/// `SELF` 在 low-IR 上携带的 method 名提示。
+///
+/// 这里只保留“常量池里的字段名索引”，避免在 transformer 层过早解码字符串；
+/// 到 HIR / AST 再按各层自己的字符串语义恢复。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct MethodNameHint {
+    pub const_ref: ConstRef,
+}
+
 /// 参数值包。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum ValuePack {
@@ -452,6 +461,7 @@ pub struct CallInstr {
     pub args: ValuePack,
     pub results: ResultPack,
     pub kind: CallKind,
+    pub method_name: Option<MethodNameHint>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -459,6 +469,7 @@ pub struct TailCallInstr {
     pub callee: Reg,
     pub args: ValuePack,
     pub kind: CallKind,
+    pub method_name: Option<MethodNameHint>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]

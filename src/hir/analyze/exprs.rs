@@ -19,8 +19,8 @@ use crate::hir::common::{
 use crate::parser::RawLiteralConst;
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpKind, BranchCond, BranchOperands, BranchPredicate, CallKind,
-    CondOperand, ConstRef, InstrRef, LowInstr, LoweredProto, Reg, ResultPack, UnaryOpKind,
-    ValueOperand,
+    CondOperand, ConstRef, InstrRef, LowInstr, LoweredProto, MethodNameHint, Reg, ResultPack,
+    UnaryOpKind, ValueOperand,
 };
 
 pub(super) use self::access::{
@@ -106,4 +106,15 @@ fn fixed_def_for_reg(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, reg: Reg
 
 fn reg_in_range(range: crate::transformer::RegRange, reg: Reg) -> bool {
     reg.index() >= range.start.index() && reg.index() < range.start.index() + range.len
+}
+
+pub(super) fn lower_method_name(
+    proto: &LoweredProto,
+    method_name: Option<MethodNameHint>,
+) -> Option<String> {
+    let const_ref = method_name?.const_ref;
+    match proto.constants.common.literals.get(const_ref.index()) {
+        Some(RawLiteralConst::String(value)) => Some(decode_raw_string(value)),
+        _ => None,
+    }
 }
