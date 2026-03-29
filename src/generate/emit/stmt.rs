@@ -4,6 +4,7 @@
 //! 不会在这里补猜缺失的 global/function sugar。
 //! 例如：`AstStmt::GlobalDecl` 只有 AST 上确实存在时才会在这里输出对应声明。
 
+use crate::ast::pretty::is_default_numeric_for_step;
 use crate::ast::{
     AstAssign, AstBlock, AstCallStmt, AstFunctionDecl, AstGenericFor, AstGlobalDecl, AstIf,
     AstLabel, AstLocalDecl, AstLocalFunctionDecl, AstNumericFor, AstRepeat, AstReturn, AstStmt,
@@ -245,18 +246,25 @@ impl<'a> Emitter<'a> {
             .resolve_binding_ref(function, &numeric_for.binding)?;
         let start = self.emit_expr(&numeric_for.start, function, 0, ExprSide::Standalone)?;
         let limit = self.emit_expr(&numeric_for.limit, function, 0, ExprSide::Standalone)?;
-        let step = self.emit_expr(&numeric_for.step, function, 0, ExprSide::Standalone)?;
-        let header = Doc::concat([
+        let mut header_parts = vec![
             Doc::text("for "),
             Doc::text(binding),
             Doc::text(" = "),
             start,
             Doc::text(", "),
             limit,
-            Doc::text(", "),
-            step,
-            Doc::text(" do"),
-        ]);
+        ];
+        if !is_default_numeric_for_step(&numeric_for.step) {
+            header_parts.push(Doc::text(", "));
+            header_parts.push(self.emit_expr(
+                &numeric_for.step,
+                function,
+                0,
+                ExprSide::Standalone,
+            )?);
+        }
+        header_parts.push(Doc::text(" do"));
+        let header = Doc::concat(header_parts);
         let body = self.emit_block(&numeric_for.body, function)?;
         Ok(self.emit_block_stmt(header, &numeric_for.body, body))
     }

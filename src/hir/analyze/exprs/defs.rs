@@ -122,23 +122,14 @@ pub(crate) fn expr_for_dup_safe_fixed_def(
             })))
         }
         LowInstr::Concat(concat) if concat.dst == def_reg => {
-            let value = (0..concat.src.len)
-                .map(|offset| {
-                    expr_for_reg_use_inline(
-                        lowering,
-                        def_block,
-                        def_instr,
-                        Reg(concat.src.start.index() + offset),
-                    )
-                })
-                .reduce(|lhs, rhs| {
-                    HirExpr::Binary(Box::new(HirBinaryExpr {
-                        op: HirBinaryOpKind::Concat,
-                        lhs,
-                        rhs,
-                    }))
-                })
-                .unwrap_or_else(|| unresolved_expr("concat empty source"));
+            let value = concat_expr((0..concat.src.len).map(|offset| {
+                expr_for_reg_use_inline(
+                    lowering,
+                    def_block,
+                    def_instr,
+                    Reg(concat.src.start.index() + offset),
+                )
+            }));
             Some(value)
         }
         LowInstr::GetUpvalue(get_upvalue) if get_upvalue.dst == def_reg => {

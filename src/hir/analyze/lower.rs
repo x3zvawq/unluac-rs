@@ -15,8 +15,9 @@ use super::exprs::{
     lower_value_pack, lower_value_pack_components,
 };
 use super::helpers::{
-    assign_stmt, branch_stmt, build_label_map_for_summary, decode_raw_string, empty_proto,
-    goto_block, goto_stmt, label_for_block, return_stmt, unresolved_expr, unstructured_stmt,
+    assign_stmt, branch_stmt, build_label_map_for_summary, concat_expr, decode_raw_string,
+    empty_proto, goto_block, goto_stmt, label_for_block, return_stmt, unresolved_expr,
+    unstructured_stmt,
 };
 use super::short_circuit::{
     recover_short_value_merge_expr_with_allowed_blocks, value_merge_candidates_in_block,
@@ -24,9 +25,9 @@ use super::short_circuit::{
 use super::structure::try_build_structured_body;
 use crate::cfg::{BlockRef, Cfg, CfgGraph, DataflowFacts, GraphFacts, PhiId};
 use crate::hir::common::{
-    HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirCallStmt, HirCapture, HirClose,
-    HirClosureExpr, HirExpr, HirLValue, HirLabel, HirLabelId, HirProto, HirProtoRef, HirStmt,
-    HirTableSetList, HirToBeClosed, HirUnaryExpr, LocalId, ParamId, TempId, UpvalueId,
+    HirBinaryExpr, HirBlock, HirCallExpr, HirCallStmt, HirCapture, HirClose, HirClosureExpr,
+    HirExpr, HirLValue, HirLabel, HirLabelId, HirProto, HirProtoRef, HirStmt, HirTableSetList,
+    HirToBeClosed, HirUnaryExpr, LocalId, ParamId, TempId, UpvalueId,
 };
 use crate::structure::{ShortCircuitExit, StructureFacts};
 use crate::transformer::{CallKind, InstrRef, LowInstr, LoweredProto, Reg, ResultPack};
@@ -431,23 +432,14 @@ pub(super) fn lower_regular_instr(
             }))],
         ),
         LowInstr::Concat(concat) => {
-            let value = (0..concat.src.len)
-                .map(|offset| {
-                    expr_for_reg_use(
-                        lowering,
-                        block,
-                        instr_ref,
-                        Reg(concat.src.start.index() + offset),
-                    )
-                })
-                .reduce(|lhs, rhs| {
-                    HirExpr::Binary(Box::new(HirBinaryExpr {
-                        op: HirBinaryOpKind::Concat,
-                        lhs,
-                        rhs,
-                    }))
-                })
-                .unwrap_or_else(|| unresolved_expr("concat empty source"));
+            let value = concat_expr((0..concat.src.len).map(|offset| {
+                expr_for_reg_use(
+                    lowering,
+                    block,
+                    instr_ref,
+                    Reg(concat.src.start.index() + offset),
+                )
+            }));
             fixed_assign(lowering, instr_ref, vec![value])
         }
         LowInstr::GetUpvalue(get_upvalue) => fixed_assign(

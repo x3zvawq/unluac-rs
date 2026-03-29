@@ -9,6 +9,7 @@
 //! - `if a then if b then return end end` 会折成 `if a and b then return end`
 //! - `if cond then return end else tail()` 会拉平成 `if cond then return end; tail()`
 //! - `if exit then goto L1 end; body; ::L1:: tail` 会收成 `if not exit then body end; tail`
+//! - `if cond then a(); goto L1 end; b(); ::L1::` 会收成 `if cond then a() else b() end`
 
 use super::super::common::{
     AstBinaryExpr, AstBinaryOpKind, AstBlock, AstExpr, AstFunctionExpr, AstIf, AstLabelId,
@@ -40,7 +41,9 @@ impl AstRewritePass for BranchPrettyPass {
             }
         }
         block.stmts = flattened_stmts;
-        changed || fold_guard_goto_labels(block)
+        let folded_else = fold_terminal_goto_else(block);
+        let folded_guard = fold_guard_goto_labels(block);
+        changed || folded_else || folded_guard
     }
 
     fn rewrite_stmt(&mut self, stmt: &mut AstStmt) -> bool {
@@ -146,6 +149,52 @@ fn flatten_terminating_if(stmt: AstStmt) -> Result<Vec<AstStmt>, AstStmt> {
     Err(AstStmt::If(if_stmt))
 }
 
+fn fold_terminal_goto_else(block: &mut AstBlock) -> bool {
+    let mut changed = false;
+
+    while let Some(fold) = find_terminal_goto_else_fold(block) {
+        let old_stmts = std::mem::take(&mut block.stmts);
+        let mut rewritten =
+            Vec::with_capacity(old_stmts.len() - (fold.label_index - fold.if_index));
+        let mut rewritten_if = None;
+        let mut else_body = Vec::new();
+
+        for (index, stmt) in old_stmts.into_iter().enumerate() {
+            if index < fold.if_index {
+                rewritten.push(stmt);
+                continue;
+            }
+            if index == fold.if_index {
+                let AstStmt::If(mut if_stmt) = stmt else {
+                    unreachable!("terminal-goto else fold should only target if statements");
+                };
+                let popped = if_stmt.then_block.stmts.pop();
+                debug_assert!(matches!(popped, Some(AstStmt::Goto(_))));
+                if_stmt.else_block = Some(AstBlock { stmts: Vec::new() });
+                rewritten_if = Some(if_stmt);
+                continue;
+            }
+            if index < fold.label_index {
+                else_body.push(stmt);
+                continue;
+            }
+            if index == fold.label_index {
+                continue;
+            }
+            rewritten.push(stmt);
+        }
+
+        let mut rewritten_if =
+            rewritten_if.expect("terminal-goto else fold should capture the rewritten if");
+        rewritten_if.else_block = Some(AstBlock { stmts: else_body });
+        rewritten.insert(fold.if_index, AstStmt::If(rewritten_if));
+        block.stmts = rewritten;
+        changed = true;
+    }
+
+    changed
+}
+
 fn fold_guard_goto_labels(block: &mut AstBlock) -> bool {
     let mut changed = false;
 
@@ -199,6 +248,36 @@ struct GuardGotoFold {
     label_index: usize,
 }
 
+fn find_terminal_goto_else_fold(block: &AstBlock) -> Option<GuardGotoFold> {
+    for if_index in 0..block.stmts.len() {
+        let Some(target) = terminal_goto_else_target(&block.stmts[if_index]) else {
+            continue;
+        };
+        if count_goto_target_in_block(block, target) != 1 {
+            continue;
+        }
+        let Some(label_index) = block.stmts[if_index + 1..]
+            .iter()
+            .position(|stmt| matches!(stmt, AstStmt::Label(label) if label.id == target))
+            .map(|offset| if_index + 1 + offset)
+        else {
+            continue;
+        };
+
+        let else_body = &block.stmts[if_index + 1..label_index];
+        // 这里会把线性尾部搬进 `else` block；如果尾部自己再声明 local/label，
+        // 就会引入新的词法边界变化。Readability 只在这类结构风险不存在时才收回源码 sugar。
+        if !else_body.is_empty() && can_fold_guard_goto_body(else_body) {
+            return Some(GuardGotoFold {
+                if_index,
+                label_index,
+            });
+        }
+    }
+
+    None
+}
+
 fn find_guard_goto_label_fold(block: &AstBlock) -> Option<GuardGotoFold> {
     for if_index in 0..block.stmts.len() {
         let Some(target) = guard_goto_target(&block.stmts[if_index]) else {
@@ -225,6 +304,22 @@ fn find_guard_goto_label_fold(block: &AstBlock) -> Option<GuardGotoFold> {
     }
 
     None
+}
+
+fn terminal_goto_else_target(stmt: &AstStmt) -> Option<AstLabelId> {
+    let AstStmt::If(if_stmt) = stmt else {
+        return None;
+    };
+    if if_stmt.else_block.is_some() {
+        return None;
+    }
+    if if_stmt.then_block.stmts.len() < 2 {
+        return None;
+    }
+    let AstStmt::Goto(goto_stmt) = if_stmt.then_block.stmts.last()? else {
+        return None;
+    };
+    Some(goto_stmt.target)
 }
 
 fn guard_goto_target(stmt: &AstStmt) -> Option<AstLabelId> {

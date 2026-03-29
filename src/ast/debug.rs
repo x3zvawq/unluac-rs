@@ -11,7 +11,9 @@ use super::common::{
     AstLValue, AstMethodCallExpr, AstModule, AstNamePath, AstNameRef, AstStmt, AstSyntheticLocalId,
     AstTableField,
 };
-use super::pretty::{preferred_negated_relational_render, preferred_relational_render};
+use super::pretty::{
+    is_default_numeric_for_step, preferred_negated_relational_render, preferred_relational_render,
+};
 
 #[derive(Debug, Default)]
 struct FunctionRenderNames {
@@ -161,13 +163,18 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock, names: &Func
                 );
             }
             AstStmt::NumericFor(numeric_for) => {
+                let step_suffix = if is_default_numeric_for_step(&numeric_for.step) {
+                    String::new()
+                } else {
+                    format!(", {}", format_expr(&numeric_for.step, indent, names))
+                };
                 let _ = writeln!(
                     output,
-                    "{indent}for {} = {}, {}, {} do",
+                    "{indent}for {} = {}, {}{} do",
                     format_binding_ref(numeric_for.binding, names),
                     format_expr(&numeric_for.start, indent, names),
                     format_expr(&numeric_for.limit, indent, names),
-                    format_expr(&numeric_for.step, indent, names),
+                    step_suffix,
                 );
                 write_block(output, &format!("{indent}  "), &numeric_for.body, names);
                 let _ = writeln!(output, "{indent}end");

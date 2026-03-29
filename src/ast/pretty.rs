@@ -3,6 +3,7 @@
 //! AST 本身只保存稳定语义，不会专门为 `elseif`、`>` / `>=` 之类的打印糖再扩一层
 //! 语法节点。这里提供跨 debug / generate 共享的轻量规则，让不同输出入口在不改变
 //! AST 语义的前提下，尽量收敛到更接近源码的文本形状。
+//! 例如：默认步长的 numeric-for 可以在输出层省略第三个参数。
 
 use super::common::{
     AstBinaryExpr, AstBinaryOpKind, AstExpr, AstTableField, AstTableKey, AstUnaryExpr,
@@ -62,6 +63,14 @@ pub(crate) fn preferred_negated_relational_render(
         op_text: "~=",
         rhs: &binary.rhs,
     })
+}
+
+pub(crate) fn is_default_numeric_for_step(step: &AstExpr) -> bool {
+    match step {
+        AstExpr::Integer(1) => true,
+        AstExpr::Number(value) => *value == 1.0,
+        _ => false,
+    }
 }
 
 fn should_flip_relational_operands(lhs: &AstExpr, rhs: &AstExpr) -> bool {

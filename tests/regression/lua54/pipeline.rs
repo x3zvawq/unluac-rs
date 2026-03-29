@@ -412,4 +412,49 @@ mod decompile_pipeline {
         assert!(!dump.contains("to-be-closed"), "{dump}");
         assert!(!dump.contains("local t9"), "{dump}");
     }
+
+    #[test]
+    fn lua54_generate_stage_recovers_vararg_const_pipeline_source_shape() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.4",
+            "tests/lua_cases/lua5.4/08_vararg_const_pipeline.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua54,
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.4 generate stage should succeed for vararg const pipeline fixture");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated.source.contains("for i = 1, #tbl do"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("if i % 2 == 0 then"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("\n        else\n"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains(".. \":\" .."),
+            "{}",
+            generated.source
+        );
+        assert!(!generated.source.contains("goto L"), "{}", generated.source);
+        assert!(!generated.source.contains(", 1 do"), "{}", generated.source);
+    }
 }

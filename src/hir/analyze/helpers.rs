@@ -56,6 +56,23 @@ pub(super) fn unresolved_expr(summary: impl Into<String>) -> HirExpr {
     }))
 }
 
+pub(super) fn concat_expr(parts: impl IntoIterator<Item = HirExpr>) -> HirExpr {
+    let mut parts = parts.into_iter().collect::<Vec<_>>();
+    let Some(last) = parts.pop() else {
+        return unresolved_expr("concat empty source");
+    };
+    // Lua 源码里的 `..` 默认是右结合；CONCAT 指令只告诉我们“这一串值需要拼接”，
+    // 不携带显式括号。这里统一用右折叠做 canonical shape，避免不同 lowering 路径
+    // 各自长出一份左折叠实现，最后再让后层被迫补括号。
+    parts.into_iter().rfold(last, |rhs, lhs| {
+        HirExpr::Binary(Box::new(crate::hir::common::HirBinaryExpr {
+            op: crate::hir::common::HirBinaryOpKind::Concat,
+            lhs,
+            rhs,
+        }))
+    })
+}
+
 pub(super) fn label_for_block(
     cfg: &Cfg,
     label_map: &BTreeMap<BlockRef, HirLabelId>,

@@ -267,6 +267,58 @@ fn collapses_nested_guard_if_chain_into_single_short_circuit_condition() {
 }
 
 #[test]
+fn folds_terminal_goto_shell_back_into_if_else() {
+    let cond = ParamId(0);
+    let local = LocalId(0);
+    let label = AstLabelId(1);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::If(Box::new(AstIf {
+                    cond: AstExpr::Var(AstNameRef::Param(cond)),
+                    then_block: AstBlock {
+                        stmts: vec![
+                            AstStmt::Assign(Box::new(AstAssign {
+                                targets: vec![AstLValue::Name(AstNameRef::Local(local))],
+                                values: vec![AstExpr::Integer(1)],
+                            })),
+                            AstStmt::Goto(Box::new(AstGoto { target: label })),
+                        ],
+                    },
+                    else_block: None,
+                })),
+                AstStmt::Assign(Box::new(AstAssign {
+                    targets: vec![AstLValue::Name(AstNameRef::Local(local))],
+                    values: vec![AstExpr::Integer(2)],
+                })),
+                AstStmt::Label(Box::new(AstLabel { id: label })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(AstDialectVersion::Lua54),
+            options: Default::default(),
+        }
+    ));
+
+    assert_eq!(module.body.stmts.len(), 1);
+    let AstStmt::If(if_stmt) = &module.body.stmts[0] else {
+        panic!("expected if-else after folding terminal goto shell");
+    };
+    assert_eq!(if_stmt.then_block.stmts.len(), 1, "{if_stmt:?}");
+    assert_eq!(
+        if_stmt.else_block.as_ref().map(|block| block.stmts.len()),
+        Some(1),
+        "{if_stmt:?}"
+    );
+    assert!(!matches!(if_stmt.then_block.stmts[0], AstStmt::Goto(_)));
+}
+
+#[test]
 fn folds_single_entry_guard_goto_label_run_into_plain_if_body() {
     let turn = AstNameRef::Global(AstGlobalName {
         text: "turn".to_owned(),

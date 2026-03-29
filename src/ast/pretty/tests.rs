@@ -1,6 +1,6 @@
 use crate::ast::{AstBinaryExpr, AstBinaryOpKind, AstExpr, AstUnaryExpr, AstUnaryOpKind};
 
-use super::preferred_negated_relational_render;
+use super::{is_default_numeric_for_step, preferred_negated_relational_render};
 
 #[test]
 fn prefers_not_equal_render_for_negated_equality() {
@@ -18,4 +18,11 @@ fn prefers_not_equal_render_for_negated_equality() {
     assert_eq!(preferred.op_text, "~=");
     assert_eq!(preferred.lhs, &AstExpr::String("lhs".to_owned()));
     assert_eq!(preferred.rhs, &AstExpr::Nil);
+}
+
+#[test]
+fn treats_literal_one_as_default_numeric_for_step() {
+    assert!(is_default_numeric_for_step(&AstExpr::Integer(1)));
+    assert!(is_default_numeric_for_step(&AstExpr::Number(1.0)));
+    assert!(!is_default_numeric_for_step(&AstExpr::Integer(2)));
 }
