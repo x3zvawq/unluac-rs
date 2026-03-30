@@ -364,6 +364,139 @@ fn inlines_trailing_table_function_assignment_back_into_terminal_constructor_loc
 }
 
 #[test]
+fn inlines_nested_constructor_locals_into_terminal_local_call_initializer() {
+    let result = LocalId(4);
+    let mut module = AstModule {
+        entry_function: HirProtoRef(0),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Local(LocalId(0)),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Global(crate::ast::AstGlobalName {
+                            text: "ffi".to_owned(),
+                        })),
+                        field: "metatype".to_owned(),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Local(LocalId(1)),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::String("counter_t".to_owned())],
+                })),
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Local(LocalId(2)),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::TableConstructor(Box::new(AstTableConstructor {
+                        fields: Vec::new(),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Local(LocalId(3)),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::TableConstructor(Box::new(AstTableConstructor {
+                        fields: Vec::new(),
+                    }))],
+                })),
+                AstStmt::FunctionDecl(Box::new(AstFunctionDecl {
+                    target: AstFunctionName::Plain(AstNamePath {
+                        root: AstNameRef::Local(LocalId(3)),
+                        fields: vec!["bump".to_owned()],
+                    }),
+                    func: AstFunctionExpr {
+                        function: HirProtoRef(1),
+                        params: vec![ParamId(0), ParamId(1)],
+                        is_vararg: false,
+                        named_vararg: None,
+                        body: AstBlock { stmts: Vec::new() },
+                        captured_bindings: Default::default(),
+                    },
+                })),
+                AstStmt::Assign(Box::new(AstAssign {
+                    targets: vec![AstLValue::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Local(LocalId(2))),
+                        field: "__index".to_owned(),
+                    }))],
+                    values: vec![AstExpr::Var(AstNameRef::Local(LocalId(3)))],
+                })),
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Local(result),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Local(LocalId(0))),
+                        args: vec![
+                            AstExpr::Var(AstNameRef::Local(LocalId(1))),
+                            AstExpr::Var(AstNameRef::Local(LocalId(2))),
+                        ],
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    let changed = run_function_sugar_to_fixed_point(
+        &mut module,
+        AstTargetDialect::new(crate::ast::AstDialectVersion::LuaJit),
+    );
+    assert!(changed);
+
+    let [AstStmt::LocalDecl(local_decl)] = module.body.stmts.as_slice() else {
+        panic!("expected terminal local call initializer to absorb constructor prep locals");
+    };
+    let [AstExpr::Call(call)] = local_decl.values.as_slice() else {
+        panic!("expected local initializer to remain a call expression");
+    };
+    assert!(matches!(
+        &call.callee,
+        AstExpr::FieldAccess(access)
+            if matches!(
+                &access.base,
+                AstExpr::Var(AstNameRef::Global(name)) if name.text == "ffi"
+            ) && access.field == "metatype"
+    ));
+    assert!(matches!(
+        call.args.as_slice(),
+        [AstExpr::String(name), AstExpr::TableConstructor(meta)]
+            if name == "counter_t"
+                && matches!(
+                    meta.fields.as_slice(),
+                    [crate::ast::AstTableField::Record(index_field)]
+                        if matches!(
+                            &index_field.key,
+                            crate::ast::AstTableKey::Name(field) if field == "__index"
+                        ) && matches!(
+                            &index_field.value,
+                            AstExpr::TableConstructor(methods)
+                                if matches!(
+                                    methods.fields.as_slice(),
+                                    [crate::ast::AstTableField::Record(method_field)]
+                                        if matches!(
+                                            &method_field.key,
+                                            crate::ast::AstTableKey::Name(field) if field == "bump"
+                                        ) && matches!(method_field.value, AstExpr::FunctionExpr(_))
+                                )
+                        )
+                )
+    ));
+}
+
+#[test]
 fn recovers_method_call_from_direct_field_alias_call_stmt() {
     let receiver = LocalId(0);
     let field_alias = LocalId(1);
@@ -734,6 +867,125 @@ fn recovers_method_alias_inside_nested_call_argument() {
                                     [AstExpr::String(pattern)] if pattern == "(%d+)i$"
                                 )
                     )
+            )
+    ));
+}
+
+#[test]
+fn recovers_direct_method_call_with_receiver_alias_local() {
+    let receiver = LocalId(0);
+    let receiver_alias = LocalId(1);
+    let result = LocalId(2);
+    let mut module = AstModule {
+        entry_function: HirProtoRef(0),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Local(receiver_alias),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Var(AstNameRef::Local(receiver))],
+                })),
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Local(result),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                            base: AstExpr::Var(AstNameRef::Local(receiver)),
+                            field: "bump".to_owned(),
+                        })),
+                        args: vec![
+                            AstExpr::Var(AstNameRef::Local(receiver_alias)),
+                            AstExpr::Integer(7),
+                        ],
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(run_function_sugar_to_fixed_point(
+        &mut module,
+        AstTargetDialect::new(crate::ast::AstDialectVersion::LuaJit),
+    ));
+
+    assert!(matches!(
+        module.body.stmts.as_slice(),
+        [AstStmt::LocalDecl(local_decl)]
+            if matches!(
+                local_decl.values.as_slice(),
+                [AstExpr::MethodCall(call)]
+                    if matches!(&call.receiver, AstExpr::Var(AstNameRef::Local(LocalId(0))))
+                        && call.method == "bump"
+                        && matches!(call.args.as_slice(), [AstExpr::Integer(7)])
+            )
+    ));
+}
+
+#[test]
+fn recovers_nested_direct_method_call_with_receiver_alias_local_in_assign_value() {
+    let receiver = LocalId(0);
+    let receiver_alias = LocalId(1);
+    let acc = LocalId(2);
+    let mut module = AstModule {
+        entry_function: HirProtoRef(0),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Local(receiver_alias),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Var(AstNameRef::Local(receiver))],
+                })),
+                AstStmt::Assign(Box::new(AstAssign {
+                    targets: vec![AstLValue::Name(AstNameRef::Local(acc))],
+                    values: vec![AstExpr::Binary(Box::new(crate::ast::AstBinaryExpr {
+                        op: crate::ast::AstBinaryOpKind::Add,
+                        lhs: AstExpr::Var(AstNameRef::Local(acc)),
+                        rhs: AstExpr::Call(Box::new(AstCallExpr {
+                            callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                                base: AstExpr::Var(AstNameRef::Local(receiver)),
+                                field: "bump".to_owned(),
+                            })),
+                            args: vec![
+                                AstExpr::Var(AstNameRef::Local(receiver_alias)),
+                                AstExpr::Integer(7),
+                            ],
+                        })),
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(run_function_sugar_to_fixed_point(
+        &mut module,
+        AstTargetDialect::new(crate::ast::AstDialectVersion::LuaJit),
+    ));
+
+    assert!(matches!(
+        module.body.stmts.as_slice(),
+        [AstStmt::Assign(assign)]
+            if matches!(
+                assign.values.as_slice(),
+                [AstExpr::Binary(binary)]
+                    if matches!(&binary.lhs, AstExpr::Var(AstNameRef::Local(LocalId(2))))
+                        && matches!(
+                            &binary.rhs,
+                            AstExpr::MethodCall(call)
+                                if matches!(
+                                    &call.receiver,
+                                    AstExpr::Var(AstNameRef::Local(LocalId(0)))
+                                ) && call.method == "bump"
+                                    && matches!(call.args.as_slice(), [AstExpr::Integer(7)])
+                        )
             )
     ));
 }

@@ -176,4 +176,51 @@ mod decompile_pipeline {
             generated.source
         );
     }
+
+    #[test]
+    fn ffi_metatype_counter_generate_stage_recovers_method_body_and_loop_call_shape() {
+        let chunk = crate::support::compile_lua_case(
+            "luajit",
+            "tests/lua_cases/luajit/07_ffi_metatype_counter.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Luajit,
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("luajit ffi metatype counter fixture should decompile successfully");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should leave generated source in state");
+
+        assert!(
+            generated
+                .source
+                .lines()
+                .any(|line| line.contains(".value =") && line.contains(".value +")),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("metatype(\"counter_t\", {\n    __index = {\n        bump = function"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .lines()
+                .any(|line| line.contains("= ") && line.contains(":bump(")),
+            "{}",
+            generated.source
+        );
+    }
 }

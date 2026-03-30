@@ -23,6 +23,7 @@ use super::binding_flow::{count_binding_uses_in_stmt, count_binding_uses_in_stmt
 use super::binding_tree::{
     expr_references_binding, stmt_has_access_base_binding_use,
     stmt_has_direct_call_arg_binding_use, stmt_has_index_binding_use, stmt_has_nested_binding_use,
+    stmt_has_nested_binding_value_use,
 };
 use super::walk::{self, AstRewritePass, BlockKind};
 
@@ -112,8 +113,23 @@ fn rewrite_current_block(block: &mut AstBlock, options: ReadabilityOptions) -> b
             && matches!(next_stmt, AstStmt::Assign(_))
             && super::expr_analysis::is_mechanical_run_inline_expr(value)
             && stmt_has_index_binding_use(next_stmt, candidate.binding());
+        let allows_special_adjacent_assign_value =
+            matches!(
+                candidate,
+                candidate::InlineCandidate::LocalAlias {
+                    origin: super::super::common::AstLocalOrigin::Recovered,
+                    ..
+                }
+            ) && matches!(policy, InlinePolicy::Conservative)
+                && matches!(next_stmt, AstStmt::Assign(_))
+                && stmt_has_nested_binding_value_use(next_stmt, candidate.binding())
+                && (candidate::is_recallable_inline_expr(value)
+                    || (candidate::is_lookup_inline_expr(value)
+                        && assign_targets_same_lookup_expr(next_stmt, value)));
         let effective_policy = if allows_special_index_sink {
             InlinePolicy::MechanicalRun
+        } else if allows_special_adjacent_assign_value {
+            InlinePolicy::AdjacentAssignValue
         } else {
             policy
         };
@@ -540,6 +556,33 @@ fn expr_references_any_run_binding(
             binding != except && expr_references_binding(expr, binding)
         })
     })
+}
+
+fn assign_targets_same_lookup_expr(stmt: &AstStmt, expr: &super::super::common::AstExpr) -> bool {
+    let AstStmt::Assign(assign) = stmt else {
+        return false;
+    };
+    assign
+        .targets
+        .iter()
+        .any(|target| lvalue_matches_lookup_expr(target, expr))
+}
+
+fn lvalue_matches_lookup_expr(
+    target: &super::super::common::AstLValue,
+    expr: &super::super::common::AstExpr,
+) -> bool {
+    match (target, expr) {
+        (
+            super::super::common::AstLValue::FieldAccess(lhs),
+            super::super::common::AstExpr::FieldAccess(rhs),
+        ) => lhs.field == rhs.field && lhs.base == rhs.base,
+        (
+            super::super::common::AstLValue::IndexAccess(lhs),
+            super::super::common::AstExpr::IndexAccess(rhs),
+        ) => lhs.base == rhs.base && lhs.index == rhs.index,
+        _ => false,
+    }
 }
 
 fn count_binding_uses_in_remaining_run(

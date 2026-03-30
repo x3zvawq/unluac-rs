@@ -78,6 +78,7 @@ pub(super) enum InlinePolicy {
     ExtendedCallChain,
     AliasInitializerChain,
     AdjacentCallResultCallee,
+    AdjacentAssignValue,
     DirectReturnConstructor,
     MechanicalRun,
 }
@@ -94,6 +95,7 @@ impl InlineCandidate {
         match self {
             Self::TempLike(_) => match policy {
                 InlinePolicy::MechanicalRun => is_mechanical_run_inline_expr(expr),
+                InlinePolicy::AdjacentAssignValue => false,
                 InlinePolicy::DirectReturnConstructor => false,
                 _ => is_inline_candidate_expr(expr),
             },
@@ -110,6 +112,9 @@ impl InlineCandidate {
             } => match policy {
                 InlinePolicy::MechanicalRun => is_mechanical_run_inline_expr(expr),
                 InlinePolicy::AdjacentCallResultCallee => is_lookup_inline_expr(expr),
+                InlinePolicy::AdjacentAssignValue => {
+                    is_extended_neutral_local_alias_expr(expr) || is_recallable_inline_expr(expr)
+                }
                 InlinePolicy::DirectReturnConstructor => {
                     is_direct_return_constructor_inline_expr(expr)
                 }

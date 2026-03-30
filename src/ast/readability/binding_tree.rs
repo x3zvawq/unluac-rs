@@ -547,6 +547,49 @@ pub(super) fn stmt_has_direct_call_arg_binding_use(stmt: &AstStmt, binding: AstB
     }
 }
 
+pub(super) fn stmt_has_nested_binding_value_use(stmt: &AstStmt, binding: AstBindingRef) -> bool {
+    match stmt {
+        AstStmt::LocalDecl(local_decl) => local_decl
+            .values
+            .iter()
+            .any(|value| expr_has_nested_binding_use(value, binding, false)),
+        AstStmt::GlobalDecl(global_decl) => global_decl
+            .values
+            .iter()
+            .any(|value| expr_has_nested_binding_use(value, binding, false)),
+        AstStmt::Assign(assign) => assign
+            .values
+            .iter()
+            .any(|value| expr_has_nested_binding_use(value, binding, false)),
+        AstStmt::CallStmt(call_stmt) => call_has_nested_binding_use(&call_stmt.call, binding),
+        AstStmt::Return(ret) => ret
+            .values
+            .iter()
+            .any(|value| expr_has_nested_binding_use(value, binding, false)),
+        AstStmt::If(if_stmt) => expr_has_nested_binding_use(&if_stmt.cond, binding, false),
+        AstStmt::While(while_stmt) => expr_has_nested_binding_use(&while_stmt.cond, binding, false),
+        AstStmt::Repeat(repeat_stmt) => {
+            expr_has_nested_binding_use(&repeat_stmt.cond, binding, false)
+        }
+        AstStmt::NumericFor(numeric_for) => {
+            expr_has_nested_binding_use(&numeric_for.start, binding, false)
+                || expr_has_nested_binding_use(&numeric_for.limit, binding, false)
+                || expr_has_nested_binding_use(&numeric_for.step, binding, false)
+        }
+        AstStmt::GenericFor(generic_for) => generic_for
+            .iterator
+            .iter()
+            .any(|expr| expr_has_nested_binding_use(expr, binding, false)),
+        AstStmt::DoBlock(_)
+        | AstStmt::FunctionDecl(_)
+        | AstStmt::LocalFunctionDecl(_)
+        | AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_) => false,
+    }
+}
+
 fn block_mentions_binding_target(
     block: &crate::ast::common::AstBlock,
     binding: AstBindingRef,

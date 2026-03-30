@@ -791,6 +791,100 @@ fn inlines_recovered_call_alias_into_adjacent_local_initializer_call_arg() {
 }
 
 #[test]
+fn inlines_recovered_lookup_alias_into_adjacent_assign_value_expr() {
+    let self_local = LocalId(0);
+    let old_value = LocalId(1);
+    let delta = LocalId(2);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(old_value),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Local(self_local)),
+                        field: "value".to_owned(),
+                    }))],
+                })),
+                AstStmt::Assign(Box::new(crate::ast::AstAssign {
+                    targets: vec![AstLValue::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Local(self_local)),
+                        field: "value".to_owned(),
+                    }))],
+                    values: vec![AstExpr::Binary(Box::new(AstBinaryExpr {
+                        op: AstBinaryOpKind::Add,
+                        lhs: AstExpr::Var(AstNameRef::Local(old_value)),
+                        rhs: AstExpr::Var(AstNameRef::Local(delta)),
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+    assert_eq!(module.body.stmts.len(), 1);
+}
+
+#[test]
+fn inlines_recovered_call_alias_into_adjacent_assign_value_expr() {
+    let state = LocalId(0);
+    let index = LocalId(1);
+    let acc = LocalId(2);
+    let mixed = LocalId(3);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(mixed),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                            base: AstExpr::Var(AstNameRef::Local(state)),
+                            field: "bump".to_owned(),
+                        })),
+                        args: vec![
+                            AstExpr::Var(AstNameRef::Local(state)),
+                            AstExpr::Var(AstNameRef::Local(index)),
+                        ],
+                    }))],
+                })),
+                AstStmt::Assign(Box::new(crate::ast::AstAssign {
+                    targets: vec![AstLValue::Name(AstNameRef::Local(acc))],
+                    values: vec![AstExpr::Binary(Box::new(AstBinaryExpr {
+                        op: AstBinaryOpKind::Add,
+                        lhs: AstExpr::Var(AstNameRef::Local(acc)),
+                        rhs: AstExpr::Var(AstNameRef::Local(mixed)),
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+    assert_eq!(module.body.stmts.len(), 1);
+}
+
+#[test]
 fn inlines_mechanical_local_alias_into_adjacent_assign_index() {
     let text = LocalId(0);
     let slot = LocalId(1);

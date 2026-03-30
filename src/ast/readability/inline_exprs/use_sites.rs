@@ -530,6 +530,12 @@ impl InlineSite {
                 InlinePolicy::AdjacentCallResultCallee => {
                     self.allows_adjacent_call_result_local_alias(replacement)
                 }
+                InlinePolicy::AdjacentAssignValue => match origin {
+                    super::super::super::common::AstLocalOrigin::DebugHinted => false,
+                    super::super::super::common::AstLocalOrigin::Recovered => {
+                        self.allows_adjacent_assign_value_local_alias(replacement)
+                    }
+                },
                 InlinePolicy::DirectReturnConstructor => match origin {
                     super::super::super::common::AstLocalOrigin::DebugHinted => false,
                     super::super::super::common::AstLocalOrigin::Recovered => {
@@ -553,6 +559,7 @@ impl InlineSite {
                     Some(options.access_base_inline_max_complexity)
                 }
                 InlinePolicy::AdjacentCallResultCallee => None,
+                InlinePolicy::AdjacentAssignValue => Some(options.return_inline_max_complexity),
                 InlinePolicy::Conservative => None,
                 InlinePolicy::DirectReturnConstructor => None,
                 InlinePolicy::ExtendedCallChain => Some(options.access_base_inline_max_complexity),
@@ -651,6 +658,27 @@ impl InlineSite {
 
     fn allows_adjacent_call_result_local_alias(self, replacement: &AstExpr) -> bool {
         matches!(self, Self::CallCallee) && is_lookup_inline_expr(replacement)
+    }
+
+    fn allows_adjacent_assign_value_local_alias(self, replacement: &AstExpr) -> bool {
+        match self {
+            Self::Neutral | Self::ComparisonOperand => {
+                is_extended_neutral_local_alias_expr(replacement)
+                    || is_recallable_inline_expr(replacement)
+            }
+            Self::CallArgNonFinal | Self::CallArgFinal => {
+                is_extended_call_arg_local_alias_expr(replacement)
+                    || is_recallable_inline_expr(replacement)
+            }
+            Self::ReturnNestedValue => {
+                is_recallable_inline_expr(replacement) || is_lookup_inline_expr(replacement)
+            }
+            Self::AccessBase => {
+                is_access_base_inline_expr(replacement) || is_lookup_inline_expr(replacement)
+            }
+            Self::CallCallee => is_call_callee_inline_expr(replacement),
+            Self::ReturnValue | Self::Index => false,
+        }
     }
 
     fn allows_direct_return_constructor_local_alias(self, replacement: &AstExpr) -> bool {

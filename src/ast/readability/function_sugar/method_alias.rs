@@ -17,6 +17,7 @@ use crate::ast::common::{
 
 pub(super) fn try_recover_method_alias_stmt(stmts: &[AstStmt]) -> Option<(AstStmt, usize)> {
     try_recover_with_receiver_alias(stmts)
+        .or_else(|| try_recover_receiver_alias_direct_method_call(stmts))
         .or_else(|| try_recover_direct_receiver(stmts))
         .or_else(|| try_recover_direct_method_call_stmt(stmts))
 }
@@ -71,6 +72,29 @@ fn try_recover_direct_receiver(stmts: &[AstStmt]) -> Option<(AstStmt, usize)> {
             field_access.base.clone(),
             |arg| matches!(arg, AstExpr::Var(name) if name == receiver_name),
         )?,
+        2,
+    ))
+}
+
+fn try_recover_receiver_alias_direct_method_call(stmts: &[AstStmt]) -> Option<(AstStmt, usize)> {
+    let [receiver_alias, sink, ..] = stmts else {
+        return None;
+    };
+    let (receiver_binding, receiver_expr) = single_local_alias_decl(receiver_alias)?;
+    if count_binding_uses_in_stmts_deep(&stmts[1..], receiver_binding) != 1 {
+        return None;
+    }
+
+    Some((
+        rewrite_single_value_sink_stmt(sink, |value| {
+            rewrite_method_call_expr_nested(value, |expr| {
+                recover_direct_method_call_with_receiver_alias_expr(
+                    expr,
+                    receiver_binding,
+                    receiver_expr,
+                )
+            })
+        })?,
         2,
     ))
 }
@@ -461,29 +485,186 @@ fn try_recover_direct_method_call_stmt(stmts: &[AstStmt]) -> Option<(AstStmt, us
     let [stmt, ..] = stmts else {
         return None;
     };
-    Some((rewrite_truthy_ternary_method_call_stmt(stmt)?, 1))
+    Some((rewrite_direct_method_call_stmt(stmt)?, 1))
 }
 
-fn rewrite_truthy_ternary_method_call_stmt(stmt: &AstStmt) -> Option<AstStmt> {
-    rewrite_single_value_sink_stmt(stmt, rewrite_truthy_ternary_method_call_expr)
+fn rewrite_direct_method_call_stmt(stmt: &AstStmt) -> Option<AstStmt> {
+    rewrite_single_value_sink_stmt(stmt, rewrite_direct_method_call_expr_nested)
 }
 
-fn rewrite_truthy_ternary_method_call_expr(expr: &AstExpr) -> Option<AstExpr> {
-    let AstExpr::LogicalOr(or_expr) = expr else {
-        return None;
-    };
-    let AstExpr::LogicalAnd(and_expr) = &or_expr.lhs else {
-        return None;
-    };
-    let cond = recover_direct_method_call_expr(&and_expr.lhs)?;
+fn rewrite_direct_method_call_expr_nested(expr: &AstExpr) -> Option<AstExpr> {
+    rewrite_method_call_expr_nested(expr, recover_direct_method_call_expr)
+}
 
-    Some(AstExpr::LogicalOr(Box::new(AstLogicalExpr {
-        lhs: AstExpr::LogicalAnd(Box::new(AstLogicalExpr {
-            lhs: cond,
-            rhs: and_expr.rhs.clone(),
-        })),
-        rhs: or_expr.rhs.clone(),
-    })))
+fn rewrite_method_call_expr_nested<F>(expr: &AstExpr, try_rewrite_here: F) -> Option<AstExpr>
+where
+    F: Fn(&AstExpr) -> Option<AstExpr> + Copy,
+{
+    if let Some(rewritten) = try_rewrite_here(expr) {
+        return Some(rewritten);
+    }
+
+    match expr {
+        AstExpr::Unary(unary) => Some(AstExpr::Unary(Box::new(AstUnaryExpr {
+            op: unary.op,
+            expr: rewrite_method_call_expr_nested(&unary.expr, try_rewrite_here)?,
+        }))),
+        AstExpr::Binary(binary) => {
+            let lhs =
+                rewrite_method_call_expr_nested(&binary.lhs, try_rewrite_here).unwrap_or(binary.lhs.clone());
+            let rhs =
+                rewrite_method_call_expr_nested(&binary.rhs, try_rewrite_here).unwrap_or(binary.rhs.clone());
+            if lhs == binary.lhs && rhs == binary.rhs {
+                None
+            } else {
+                Some(AstExpr::Binary(Box::new(
+                    crate::ast::common::AstBinaryExpr {
+                        op: binary.op,
+                        lhs,
+                        rhs,
+                    },
+                )))
+            }
+        }
+        AstExpr::LogicalAnd(logical) => {
+            let lhs = rewrite_method_call_expr_nested(&logical.lhs, try_rewrite_here)
+                .unwrap_or(logical.lhs.clone());
+            let rhs = rewrite_method_call_expr_nested(&logical.rhs, try_rewrite_here)
+                .unwrap_or(logical.rhs.clone());
+            if lhs == logical.lhs && rhs == logical.rhs {
+                None
+            } else {
+                Some(AstExpr::LogicalAnd(Box::new(AstLogicalExpr { lhs, rhs })))
+            }
+        }
+        AstExpr::LogicalOr(logical) => {
+            let lhs = rewrite_method_call_expr_nested(&logical.lhs, try_rewrite_here)
+                .unwrap_or(logical.lhs.clone());
+            let rhs = rewrite_method_call_expr_nested(&logical.rhs, try_rewrite_here)
+                .unwrap_or(logical.rhs.clone());
+            if lhs == logical.lhs && rhs == logical.rhs {
+                None
+            } else {
+                Some(AstExpr::LogicalOr(Box::new(AstLogicalExpr { lhs, rhs })))
+            }
+        }
+        AstExpr::Call(call) => {
+            if let Some(callee) = rewrite_method_call_expr_nested(&call.callee, try_rewrite_here) {
+                return Some(AstExpr::Call(Box::new(AstCallExpr {
+                    callee,
+                    args: call.args.clone(),
+                })));
+            }
+            for (index, arg) in call.args.iter().enumerate() {
+                let Some(rewritten_arg) = rewrite_method_call_expr_nested(arg, try_rewrite_here) else {
+                    continue;
+                };
+                let mut args = call.args.clone();
+                args[index] = rewritten_arg;
+                return Some(AstExpr::Call(Box::new(AstCallExpr {
+                    callee: call.callee.clone(),
+                    args,
+                })));
+            }
+            None
+        }
+        AstExpr::MethodCall(call) => {
+            if let Some(receiver) = rewrite_method_call_expr_nested(&call.receiver, try_rewrite_here)
+            {
+                return Some(AstExpr::MethodCall(Box::new(AstMethodCallExpr {
+                    receiver,
+                    method: call.method.clone(),
+                    args: call.args.clone(),
+                })));
+            }
+            for (index, arg) in call.args.iter().enumerate() {
+                let Some(rewritten_arg) = rewrite_method_call_expr_nested(arg, try_rewrite_here) else {
+                    continue;
+                };
+                let mut args = call.args.clone();
+                args[index] = rewritten_arg;
+                return Some(AstExpr::MethodCall(Box::new(AstMethodCallExpr {
+                    receiver: call.receiver.clone(),
+                    method: call.method.clone(),
+                    args,
+                })));
+            }
+            None
+        }
+        AstExpr::FieldAccess(access) => Some(AstExpr::FieldAccess(Box::new(AstFieldAccess {
+            base: rewrite_method_call_expr_nested(&access.base, try_rewrite_here)?,
+            field: access.field.clone(),
+        }))),
+        AstExpr::IndexAccess(access) => {
+            if let Some(base) = rewrite_method_call_expr_nested(&access.base, try_rewrite_here) {
+                return Some(AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                    base,
+                    index: access.index.clone(),
+                })));
+            }
+            Some(AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                base: access.base.clone(),
+                index: rewrite_method_call_expr_nested(&access.index, try_rewrite_here)?,
+            })))
+        }
+        AstExpr::SingleValue(inner) => Some(AstExpr::SingleValue(Box::new(
+            rewrite_method_call_expr_nested(inner, try_rewrite_here)?,
+        ))),
+        AstExpr::TableConstructor(table) => {
+            table
+                .fields
+                .iter()
+                .enumerate()
+                .find_map(|(index, field)| match field {
+                    AstTableField::Array(value) => rewrite_method_call_expr_nested(value, try_rewrite_here)
+                        .map(|rewritten_value| {
+                            rebuild_table_with_field(
+                                table,
+                                index,
+                                AstTableField::Array(rewritten_value),
+                            )
+                        }),
+                    AstTableField::Record(field) => {
+                        if let AstTableKey::Expr(key) = &field.key
+                            && let Some(rewritten_key) =
+                                rewrite_method_call_expr_nested(key, try_rewrite_here)
+                        {
+                            return Some(rebuild_table_with_field(
+                                table,
+                                index,
+                                AstTableField::Record(crate::ast::common::AstRecordField {
+                                    key: AstTableKey::Expr(rewritten_key),
+                                    value: field.value.clone(),
+                                }),
+                            ));
+                        }
+                        rewrite_method_call_expr_nested(&field.value, try_rewrite_here).map(
+                            |rewritten_value| {
+                                rebuild_table_with_field(
+                                    table,
+                                    index,
+                                    AstTableField::Record(crate::ast::common::AstRecordField {
+                                        key: field.key.clone(),
+                                        value: rewritten_value,
+                                    }),
+                                )
+                            },
+                        )
+                    }
+                })
+        }
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::Var(_)
+        | AstExpr::VarArg
+        | AstExpr::FunctionExpr(_) => None,
+    }
 }
 
 fn recover_direct_method_call_expr(expr: &AstExpr) -> Option<AstExpr> {
@@ -508,6 +689,37 @@ fn recover_direct_method_call_expr(expr: &AstExpr) -> Option<AstExpr> {
 
     Some(AstExpr::MethodCall(Box::new(AstMethodCallExpr {
         receiver: access.base.clone(),
+        method: access.field.clone(),
+        args: args.to_vec(),
+    })))
+}
+
+fn recover_direct_method_call_with_receiver_alias_expr(
+    expr: &AstExpr,
+    receiver_binding: AstBindingRef,
+    receiver_expr: &AstExpr,
+) -> Option<AstExpr> {
+    let AstExpr::Call(call) = expr else {
+        return None;
+    };
+    let AstExpr::FieldAccess(access) = &call.callee else {
+        return None;
+    };
+    if &access.base != receiver_expr {
+        return None;
+    }
+    let [receiver_arg, args @ ..] = call.args.as_slice() else {
+        return None;
+    };
+    let AstExpr::Var(receiver_arg_name) = receiver_arg else {
+        return None;
+    };
+    if !name_matches_binding(receiver_arg_name, receiver_binding) {
+        return None;
+    }
+
+    Some(AstExpr::MethodCall(Box::new(AstMethodCallExpr {
+        receiver: receiver_expr.clone(),
         method: access.field.clone(),
         args: args.to_vec(),
     })))
