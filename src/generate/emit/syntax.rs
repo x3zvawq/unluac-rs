@@ -98,6 +98,10 @@ pub(super) fn format_complex_literal(real: f64, imag: f64) -> String {
 }
 
 pub(super) fn format_string_literal(value: &str, quote_style: QuoteStyle) -> String {
+    if value.contains(['\n', '\r']) {
+        return format_long_bracket_string(value);
+    }
+
     let candidates = match quote_style {
         QuoteStyle::PreferDouble => ['"', '\''],
         QuoteStyle::PreferSingle => ['\'', '"'],
@@ -134,6 +138,23 @@ pub(super) fn format_string_literal(value: &str, quote_style: QuoteStyle) -> Str
     rendered
 }
 
+fn format_long_bracket_string(value: &str) -> String {
+    let eqs = long_bracket_eqs(value);
+    format!("[{eqs}[{value}]{eqs}]")
+}
+
+fn long_bracket_eqs(value: &str) -> String {
+    for count in 0.. {
+        let eqs = "=".repeat(count);
+        let closing = format!("]{eqs}]");
+        if !value.contains(&closing) {
+            return eqs;
+        }
+    }
+
+    unreachable!("unbounded search over bracket delimiters should always terminate")
+}
+
 fn escape_cost(value: &str, quote: char) -> usize {
     value
         .chars()
@@ -145,3 +166,6 @@ fn escape_cost(value: &str, quote: char) -> usize {
         })
         .sum()
 }
+
+#[cfg(test)]
+mod tests;

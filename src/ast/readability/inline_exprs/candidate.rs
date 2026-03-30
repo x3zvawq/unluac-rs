@@ -113,7 +113,14 @@ impl InlineCandidate {
                 InlinePolicy::DirectReturnConstructor => {
                     is_direct_return_constructor_inline_expr(expr)
                 }
-                _ => is_access_base_inline_expr(expr) || is_recallable_inline_expr(expr),
+                InlinePolicy::AliasInitializerChain => {
+                    is_access_base_inline_expr(expr)
+                        || is_lookup_inline_expr(expr)
+                        || is_recallable_inline_expr(expr)
+                }
+                InlinePolicy::Conservative | InlinePolicy::ExtendedCallChain => {
+                    is_access_base_inline_expr(expr) || is_recallable_inline_expr(expr)
+                }
             },
         }
     }

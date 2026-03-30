@@ -659,6 +659,191 @@ fn collapses_mechanical_alias_run_into_nested_assignment_expr() {
 }
 
 #[test]
+fn inlines_lookup_alias_into_adjacent_field_assign_target_base() {
+    let items = LocalId(0);
+    let index = LocalId(1);
+    let item = LocalId(2);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(item),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                        base: AstExpr::Var(AstNameRef::Local(items)),
+                        index: AstExpr::Var(AstNameRef::Local(index)),
+                    }))],
+                })),
+                AstStmt::Assign(Box::new(crate::ast::AstAssign {
+                    targets: vec![AstLValue::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Local(item)),
+                        field: "id".to_owned(),
+                    }))],
+                    values: vec![AstExpr::Binary(Box::new(AstBinaryExpr {
+                        op: AstBinaryOpKind::Add,
+                        lhs: AstExpr::Var(AstNameRef::Local(index)),
+                        rhs: AstExpr::Integer(1),
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+    assert_eq!(
+        module.body.stmts,
+        vec![AstStmt::Assign(Box::new(crate::ast::AstAssign {
+            targets: vec![AstLValue::FieldAccess(Box::new(AstFieldAccess {
+                base: AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                    base: AstExpr::Var(AstNameRef::Local(items)),
+                    index: AstExpr::Var(AstNameRef::Local(index)),
+                })),
+                field: "id".to_owned(),
+            }))],
+            values: vec![AstExpr::Binary(Box::new(AstBinaryExpr {
+                op: AstBinaryOpKind::Add,
+                lhs: AstExpr::Var(AstNameRef::Local(index)),
+                rhs: AstExpr::Integer(1),
+            }))],
+        }))]
+    );
+}
+
+#[test]
+fn collapses_dependent_lookup_chain_into_plain_accumulator_assign() {
+    let items = LocalId(0);
+    let index = LocalId(1);
+    let item = LocalId(2);
+    let weight = LocalId(3);
+    let total = LocalId(4);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(item),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                        base: AstExpr::Var(AstNameRef::Local(items)),
+                        index: AstExpr::Var(AstNameRef::Local(index)),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(weight),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Local(item)),
+                        field: "weight".to_owned(),
+                    }))],
+                })),
+                AstStmt::Assign(Box::new(crate::ast::AstAssign {
+                    targets: vec![AstLValue::Name(AstNameRef::Local(total))],
+                    values: vec![AstExpr::Binary(Box::new(AstBinaryExpr {
+                        op: AstBinaryOpKind::Add,
+                        lhs: AstExpr::Var(AstNameRef::Local(total)),
+                        rhs: AstExpr::Var(AstNameRef::Local(weight)),
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+    assert_eq!(
+        module.body.stmts,
+        vec![AstStmt::Assign(Box::new(crate::ast::AstAssign {
+            targets: vec![AstLValue::Name(AstNameRef::Local(total))],
+            values: vec![AstExpr::Binary(Box::new(AstBinaryExpr {
+                op: AstBinaryOpKind::Add,
+                lhs: AstExpr::Var(AstNameRef::Local(total)),
+                rhs: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                    base: AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                        base: AstExpr::Var(AstNameRef::Local(items)),
+                        index: AstExpr::Var(AstNameRef::Local(index)),
+                    })),
+                    field: "weight".to_owned(),
+                })),
+            }))],
+        }))]
+    );
+}
+
+#[test]
+fn does_not_collapse_parallel_lookup_locals_into_plain_assignment() {
+    let items = LocalId(0);
+    let first = LocalId(1);
+    let second = LocalId(2);
+    let total = LocalId(3);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(first),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                        base: AstExpr::Var(AstNameRef::Local(items)),
+                        index: AstExpr::Integer(1),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(second),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                        base: AstExpr::Var(AstNameRef::Local(items)),
+                        index: AstExpr::Integer(2),
+                    }))],
+                })),
+                AstStmt::Assign(Box::new(crate::ast::AstAssign {
+                    targets: vec![AstLValue::Name(AstNameRef::Local(total))],
+                    values: vec![AstExpr::Binary(Box::new(AstBinaryExpr {
+                        op: AstBinaryOpKind::Add,
+                        lhs: AstExpr::Var(AstNameRef::Local(first)),
+                        rhs: AstExpr::Var(AstNameRef::Local(second)),
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(!apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+}
+
+#[test]
 fn does_not_collapse_stage_locals_into_flat_return_values() {
     let first = LocalId(0);
     let second = LocalId(1);

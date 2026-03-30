@@ -106,13 +106,7 @@ fn recover_method_call_sink(
     receiver_matches: impl Fn(&AstExpr) -> bool,
 ) -> Option<AstStmt> {
     rewrite_single_value_sink_stmt(stmt, |value| {
-        recover_method_call_expr(
-            value,
-            callee_binding,
-            &method,
-            &receiver,
-            &receiver_matches,
-        )
+        recover_method_call_expr(value, callee_binding, &method, &receiver, &receiver_matches)
     })
     .or_else(|| match stmt {
         AstStmt::CallStmt(call_stmt) => {
@@ -388,25 +382,15 @@ fn rewrite_binary_like_expr(
     receiver_matches: &dyn Fn(&AstExpr) -> bool,
     make_expr: impl FnOnce(AstExpr, AstExpr) -> AstExpr,
 ) -> Option<AstExpr> {
-    if let Some(rewritten_lhs) = rewrite_single_method_alias_use(
-        lhs,
-        callee_binding,
-        method,
-        receiver,
-        receiver_matches,
-    ) {
+    if let Some(rewritten_lhs) =
+        rewrite_single_method_alias_use(lhs, callee_binding, method, receiver, receiver_matches)
+    {
         return Some(make_expr(rewritten_lhs, rhs.clone()));
     }
 
     Some(make_expr(
         lhs.clone(),
-        rewrite_single_method_alias_use(
-            rhs,
-            callee_binding,
-            method,
-            receiver,
-            receiver_matches,
-        )?,
+        rewrite_single_method_alias_use(rhs, callee_binding, method, receiver, receiver_matches)?,
     ))
 }
 

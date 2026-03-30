@@ -88,4 +88,53 @@ mod decompile_pipeline {
             generated.source
         );
     }
+
+    #[test]
+    fn ffi_struct_goto_mesh_generate_stage_recovers_multiline_cdef_and_loop_body() {
+        let chunk = crate::support::compile_lua_case(
+            "luajit",
+            "tests/lua_cases/luajit/03_ffi_struct_goto_mesh.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Luajit,
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("luajit ffi struct goto mesh fixture should decompile successfully");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should leave generated source in state");
+
+        assert!(generated.source.contains("cdef([["));
+        assert!(
+            generated
+                .source
+                .lines()
+                .any(|line| line.contains("[i].id = i + 1")),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .lines()
+                .any(|line| line.contains("[i].weight = (i + 1) * 1.25")),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .lines()
+                .any(|line| line.contains("= ok +") && line.contains("[i].weight")),
+            "{}",
+            generated.source
+        );
+    }
 }

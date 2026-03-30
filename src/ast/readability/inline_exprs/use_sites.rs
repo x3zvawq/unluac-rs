@@ -510,6 +510,7 @@ impl InlineSite {
                     super::super::super::common::AstLocalOrigin::Recovered => match self {
                         Self::CallCallee | Self::AccessBase => {
                             is_access_base_inline_expr(replacement)
+                                || is_lookup_inline_expr(replacement)
                         }
                         Self::ComparisonOperand => {
                             is_access_base_inline_expr(replacement)
@@ -631,8 +632,14 @@ impl InlineSite {
             // 这种形状本质上还是在组装一个后续调用会消费的前缀表达式别名。
             // 允许它在紧邻的下一条 local alias 初始化式里收回，能把机械拆分重新压回
             // 更接近源码的单条声明，而不会放宽到普通 return/if/赋值上下文。
-            Self::Neutral | Self::ComparisonOperand | Self::AccessBase | Self::CallCallee => {
+            Self::Neutral | Self::ComparisonOperand | Self::CallCallee => {
                 is_access_base_inline_expr(replacement)
+            }
+            // 这里额外允许 lookup 落到 access base：
+            // `local item = items[i]; local weight = item.weight`
+            // 仍然只是把“取前缀再取字段”的机械两段式收回同一条 local 初始化。
+            Self::AccessBase => {
+                is_access_base_inline_expr(replacement) || is_lookup_inline_expr(replacement)
             }
             Self::ReturnValue
             | Self::ReturnNestedValue

@@ -21,7 +21,7 @@
 
 use crate::hir::common::{
     HirBlock, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr,
-    HirIf, HirLocalDecl, HirLValue, HirProto, HirStmt, LocalId,
+    HirIf, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId,
 };
 
 use super::visit::{self, HirVisitor};
@@ -114,7 +114,8 @@ fn branch_assign_values(if_stmt: &HirIf, binding: LocalId) -> Option<(&HirExpr, 
     let [else_value] = else_assign.values.as_slice() else {
         return None;
     };
-    if !matches_local_binding(then_target, binding) || !matches_local_binding(else_target, binding) {
+    if !matches_local_binding(then_target, binding) || !matches_local_binding(else_target, binding)
+    {
         return None;
     }
     Some((then_value, else_value))

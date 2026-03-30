@@ -20,7 +20,9 @@ use self::use_sites::rewrite_stmt_use_sites_with_policy;
 use super::super::common::{AstBindingRef, AstBlock, AstModule, AstStmt};
 use super::ReadabilityContext;
 use super::binding_flow::{count_binding_uses_in_stmt, count_binding_uses_in_stmts};
-use super::binding_tree::stmt_has_nested_binding_use;
+use super::binding_tree::{
+    expr_references_binding, stmt_has_access_base_binding_use, stmt_has_nested_binding_use,
+};
 use super::walk::{self, AstRewritePass, BlockKind};
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
@@ -76,7 +78,30 @@ fn rewrite_current_block(block: &mut AstBlock, options: ReadabilityOptions) -> b
         } else {
             InlinePolicy::Conservative
         };
-        if !candidate.allows_expr_with_policy(value, policy) {
+        if matches!(policy, InlinePolicy::AliasInitializerChain)
+            && candidate::is_lookup_inline_expr(value)
+            && stmt_starts_lookup_mechanical_run(&old_stmts, index, candidate.binding())
+        {
+            // 这里故意不提前把 lookup 链压成“下一条 local 的初始化式”：
+            // `local item = items[i]; local weight = item.weight; sum = sum + weight`
+            // 如果太早收成 `local weight = items[i].weight`，后面的机械 run 就只剩一层，
+            // 无法再判断“整条链都只是脚手架”。让它留到 run-collapse 一次性处理，
+            // 才能既收回 for-loop 里的机械局部，又保住 return 场景下的阶段 local。
+            new_stmts.push(old_stmts[index].clone());
+            index += 1;
+            continue;
+        }
+        let allows_special_lookup_access_base = matches!(
+            candidate,
+            candidate::InlineCandidate::LocalAlias {
+                origin: super::super::common::AstLocalOrigin::Recovered,
+                ..
+            }
+        ) && matches!(policy, InlinePolicy::Conservative)
+            && matches!(next_stmt, AstStmt::Assign(_))
+            && candidate::is_lookup_inline_expr(value)
+            && stmt_has_access_base_binding_use(next_stmt, candidate.binding());
+        if !candidate.allows_expr_with_policy(value, policy) && !allows_special_lookup_access_base {
             new_stmts.push(old_stmts[index].clone());
             index += 1;
             continue;
@@ -232,6 +257,7 @@ fn collapse_adjacent_mechanical_alias_runs(
         let mut removed = vec![false; run_end - index];
         let mut collapsed_count = 0usize;
         let mut has_non_lookup_piece = false;
+        let mut has_dependent_lookup_piece = false;
 
         for candidate_index in (index..run_end).rev() {
             let Some((candidate, value)) = inline_candidate(&old_stmts[candidate_index]) else {
@@ -274,11 +300,20 @@ fn collapse_adjacent_mechanical_alias_runs(
                 removed[candidate_index - index] = true;
                 collapsed_count += 1;
                 has_non_lookup_piece |= !candidate::is_lookup_inline_expr(value);
+                has_dependent_lookup_piece |= candidate::is_lookup_inline_expr(value)
+                    && expr_references_any_run_binding(
+                        value,
+                        &old_stmts[index..run_end],
+                        candidate.binding(),
+                    );
             }
         }
 
         if collapsed_count >= 2
-            && (has_non_lookup_piece || stmt_prefers_pure_lookup_run_collapse(&rewritten_sink))
+            && (has_non_lookup_piece
+                || stmt_prefers_pure_lookup_run_collapse(&rewritten_sink)
+                || (has_dependent_lookup_piece
+                    && stmt_prefers_dependent_lookup_run_collapse(&rewritten_sink)))
         {
             changed = true;
             for (offset, stmt) in old_stmts[index..run_end].iter().enumerate() {
@@ -428,6 +463,45 @@ fn stmt_prefers_pure_lookup_run_collapse(stmt: &AstStmt) -> bool {
                 .iter()
                 .any(|target| !matches!(target, super::super::common::AstLValue::Name(_)))
     )
+}
+
+fn stmt_prefers_dependent_lookup_run_collapse(stmt: &AstStmt) -> bool {
+    matches!(stmt, AstStmt::Assign(_))
+}
+
+fn stmt_starts_lookup_mechanical_run(
+    stmts: &[AstStmt],
+    index: usize,
+    binding: AstBindingRef,
+) -> bool {
+    let mut run_end = index;
+    while run_end < stmts.len() && inline_candidate(&stmts[run_end]).is_some() {
+        run_end += 1;
+    }
+
+    run_end > index + 1
+        && run_end < stmts.len()
+        && stmt_can_absorb_mechanical_run(&stmts[run_end])
+        && stmts
+            .get(index + 1)
+            .and_then(inline_candidate)
+            .is_some_and(|(_, next_value)| {
+                candidate::is_lookup_inline_expr(next_value)
+                    && expr_references_binding(next_value, binding)
+            })
+}
+
+fn expr_references_any_run_binding(
+    expr: &super::super::common::AstExpr,
+    run: &[AstStmt],
+    except: AstBindingRef,
+) -> bool {
+    run.iter().any(|stmt| {
+        inline_candidate(stmt).is_some_and(|(candidate, _)| {
+            let binding = candidate.binding();
+            binding != except && expr_references_binding(expr, binding)
+        })
+    })
 }
 
 fn count_binding_uses_in_remaining_run(
