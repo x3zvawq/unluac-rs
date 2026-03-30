@@ -9,6 +9,8 @@
 //!
 //! 这样做的目的不是“尽可能多地猜源码”，而是把已经能够证明安全的构造片段收回更自然的
 //! HIR 形状，为后续 AST 降低继续减负。
+//! 另外，如果构造器 seed 在 block 尾声只剩一次“把整张表 handoff 给最终目标”的写入，
+//! 这里也会把 owner 直接认回最终目标，避免后层继续携带机械性的中转 local。
 
 mod bindings;
 mod inline_value;
@@ -17,10 +19,15 @@ mod scan;
 
 use std::collections::BTreeMap;
 
-use crate::hir::common::{HirExpr, HirProto, HirTableSetList, LocalId, TempId};
+use crate::hir::common::{
+    HirAssign, HirExpr, HirLValue, HirProto, HirStmt, HirTableSetList, LocalId, TempId,
+};
 
 use self::bindings::collect_materialized_binding_counts;
-use self::scan::{constructor_seed, install_constructor_seed, try_rebuild_constructor_region};
+use self::scan::{
+    constructor_seed, install_constructor_seed, trailing_constructor_handoff,
+    try_rebuild_constructor_region,
+};
 use super::walk::{HirRewritePass, rewrite_proto};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -89,29 +96,51 @@ impl HirRewritePass for TableConstructorPass {
                 continue;
             };
 
-            let Some((rebuilt_ctor, end_index)) = try_rebuild_constructor_region(
+            let (constructor, end_index, rebuilt_region) = match try_rebuild_constructor_region(
                 block,
                 index,
                 binding,
-                seed_ctor,
+                seed_ctor.clone(),
                 &self.materialized_bindings,
-            ) else {
-                index += 1;
-                continue;
+            ) {
+                Some((rebuilt_ctor, end_index)) => (rebuilt_ctor, end_index, true),
+                None => (seed_ctor, index, false),
             };
 
-            install_constructor_seed(&mut block.stmts[index], rebuilt_ctor);
-            debug_assert!(
-                end_index > index,
-                "constructor rewrite must consume at least one trailing stmt"
-            );
-            block.stmts.drain(index + 1..=end_index);
+            let handoff_target =
+                trailing_constructor_handoff(&block.stmts[(end_index + 1)..], binding);
+            if !rebuilt_region && handoff_target.is_none() {
+                index += 1;
+                continue;
+            }
+
+            let consumed_handoff = handoff_target.is_some();
+            install_constructor_owner(&mut block.stmts[index], handoff_target, constructor);
+            let drain_end = end_index + usize::from(consumed_handoff);
+            if drain_end > index {
+                block.stmts.drain(index + 1..=drain_end);
+            }
             changed = true;
             index += 1;
         }
 
         changed
     }
+}
+
+fn install_constructor_owner(
+    stmt: &mut HirStmt,
+    target: Option<HirLValue>,
+    constructor: crate::hir::common::HirTableConstructor,
+) {
+    if let Some(target) = target {
+        *stmt = HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![target],
+            values: vec![HirExpr::TableConstructor(Box::new(constructor))],
+        }));
+        return;
+    }
+    install_constructor_seed(stmt, constructor);
 }
 
 #[cfg(test)]

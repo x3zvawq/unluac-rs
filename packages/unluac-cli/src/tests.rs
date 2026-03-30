@@ -35,8 +35,8 @@ fn defaults_to_pure_source_output_when_only_source_is_given() {
 
 #[test]
 fn debug_flag_reenables_repo_debug_stage_dump() {
-    let options = parse_args(args(&["--source", "case.lua", "--debug"]))
-        .expect("debug flag should parse");
+    let options =
+        parse_args(args(&["--source", "case.lua", "--debug"])).expect("debug flag should parse");
     assert!(options.decompile.debug.enable);
     assert_eq!(
         options.decompile.debug.output_stages,
@@ -73,12 +73,7 @@ fn stop_after_with_debug_tracks_new_target_stage() {
 #[test]
 fn explicit_dump_replaces_repo_debug_dump_stage() {
     let options = parse_args(args(&[
-        "--source",
-        "case.lua",
-        "--dump",
-        "parse",
-        "--dump",
-        "hir",
+        "--source", "case.lua", "--dump", "parse", "--dump", "hir",
     ]))
     .expect("dump should parse");
     assert!(options.decompile.debug.enable);

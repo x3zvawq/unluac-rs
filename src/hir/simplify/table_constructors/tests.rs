@@ -91,6 +91,206 @@ fn greedily_consumes_adjacent_set_list_chunks_in_single_pass() {
 }
 
 #[test]
+fn absorbs_terminal_global_handoff_for_single_use_constructor_seed() {
+    let table_local = LocalId(0);
+
+    let mut proto = HirProto {
+        id: crate::hir::common::HirProtoRef(0),
+        source: None,
+        line_range: ProtoLineRange {
+            defined_start: 0,
+            defined_end: 0,
+        },
+        signature: ProtoSignature {
+            num_params: 0,
+            is_vararg: false,
+            has_vararg_param_reg: false,
+            named_vararg_table: false,
+        },
+        params: Vec::new(),
+        locals: vec![table_local],
+        local_debug_hints: Vec::new(),
+        upvalues: Vec::new(),
+        temps: Vec::new(),
+        temp_debug_locals: Vec::new(),
+        body: HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![table_local],
+                    values: vec![HirExpr::TableConstructor(Box::new(
+                        crate::hir::common::HirTableConstructor {
+                            fields: vec![
+                                HirTableField::Record(crate::hir::common::HirRecordField {
+                                    key: HirTableKey::Name("answer".to_owned()),
+                                    value: HirExpr::Integer(42),
+                                }),
+                                HirTableField::Array(HirExpr::String("tail".to_owned())),
+                            ],
+                            trailing_multivalue: None,
+                        },
+                    ))],
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Global(HirGlobalRef {
+                        name: "payload".to_owned(),
+                    })],
+                    values: vec![HirExpr::LocalRef(table_local)],
+                })),
+                HirStmt::Return(Box::new(HirReturn {
+                    values: vec![HirExpr::GlobalRef(HirGlobalRef {
+                        name: "payload".to_owned(),
+                    })],
+                })),
+            ],
+        },
+        children: Vec::new(),
+    };
+
+    assert!(stabilize_table_constructors_in_proto(&mut proto));
+    assert_eq!(proto.body.stmts.len(), 2);
+
+    let HirStmt::Assign(assign) = &proto.body.stmts[0] else {
+        panic!("constructor seed should retarget into final global assignment");
+    };
+    assert!(matches!(
+        assign.targets.as_slice(),
+        [HirLValue::Global(global)] if global.name == "payload"
+    ));
+    let [HirExpr::TableConstructor(constructor)] = assign.values.as_slice() else {
+        panic!("retargeted handoff should keep constructor literal");
+    };
+    assert!(matches!(
+        constructor.fields.as_slice(),
+        [
+            HirTableField::Record(field),
+            HirTableField::Array(HirExpr::String(tail)),
+        ] if matches!(field.key, HirTableKey::Name(ref name) if name == "answer")
+            && matches!(field.value, HirExpr::Integer(42))
+            && tail == "tail"
+    ));
+}
+
+#[test]
+fn absorbs_constructor_region_before_terminal_global_handoff() {
+    let table_local = LocalId(0);
+
+    let mut proto = HirProto {
+        id: crate::hir::common::HirProtoRef(0),
+        source: None,
+        line_range: ProtoLineRange {
+            defined_start: 0,
+            defined_end: 0,
+        },
+        signature: ProtoSignature {
+            num_params: 0,
+            is_vararg: false,
+            has_vararg_param_reg: false,
+            named_vararg_table: false,
+        },
+        params: Vec::new(),
+        locals: vec![table_local],
+        local_debug_hints: Vec::new(),
+        upvalues: Vec::new(),
+        temps: Vec::new(),
+        temp_debug_locals: Vec::new(),
+        body: HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![table_local],
+                    values: vec![HirExpr::TableConstructor(Box::default())],
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::TableAccess(Box::new(
+                        crate::hir::common::HirTableAccess {
+                            base: HirExpr::LocalRef(table_local),
+                            key: HirExpr::String("answer".to_owned()),
+                        },
+                    ))],
+                    values: vec![HirExpr::Integer(42)],
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Global(HirGlobalRef {
+                        name: "payload".to_owned(),
+                    })],
+                    values: vec![HirExpr::LocalRef(table_local)],
+                })),
+            ],
+        },
+        children: Vec::new(),
+    };
+
+    assert!(stabilize_table_constructors_in_proto(&mut proto));
+    assert_eq!(proto.body.stmts.len(), 1);
+
+    let HirStmt::Assign(assign) = &proto.body.stmts[0] else {
+        panic!("constructor region should collapse into final global assignment");
+    };
+    let [HirExpr::TableConstructor(constructor)] = assign.values.as_slice() else {
+        panic!("collapsed region should leave a constructor literal");
+    };
+    assert!(matches!(
+        constructor.fields.as_slice(),
+        [HirTableField::Record(field)]
+            if matches!(field.key, HirTableKey::Name(ref name) if name == "answer")
+                && matches!(field.value, HirExpr::Integer(42))
+    ));
+}
+
+#[test]
+fn keeps_constructor_seed_when_binding_is_used_after_handoff() {
+    let table_local = LocalId(0);
+
+    let mut proto = HirProto {
+        id: crate::hir::common::HirProtoRef(0),
+        source: None,
+        line_range: ProtoLineRange {
+            defined_start: 0,
+            defined_end: 0,
+        },
+        signature: ProtoSignature {
+            num_params: 0,
+            is_vararg: false,
+            has_vararg_param_reg: false,
+            named_vararg_table: false,
+        },
+        params: Vec::new(),
+        locals: vec![table_local],
+        local_debug_hints: Vec::new(),
+        upvalues: Vec::new(),
+        temps: Vec::new(),
+        temp_debug_locals: Vec::new(),
+        body: HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![table_local],
+                    values: vec![HirExpr::TableConstructor(Box::default())],
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Global(HirGlobalRef {
+                        name: "payload".to_owned(),
+                    })],
+                    values: vec![HirExpr::LocalRef(table_local)],
+                })),
+                HirStmt::Return(Box::new(HirReturn {
+                    values: vec![HirExpr::LocalRef(table_local)],
+                })),
+            ],
+        },
+        children: Vec::new(),
+    };
+
+    assert!(!stabilize_table_constructors_in_proto(&mut proto));
+    assert!(matches!(
+        proto.body.stmts.as_slice(),
+        [
+            HirStmt::LocalDecl(_),
+            HirStmt::Assign(_),
+            HirStmt::Return(_)
+        ]
+    ));
+}
+
+#[test]
 fn folds_set_list_with_trailing_multivalue_into_constructor_tail() {
     let closure = LocalId(0);
     let table_local = LocalId(1);

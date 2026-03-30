@@ -1,7 +1,7 @@
 //! 这个子模块负责从连续 stmt 区域里扫描表构造器候选步骤。
 //!
 //! 它依赖 HIR 已经稳定的赋值/构造器形状，只回答“哪些 stmt 可视为构造器 seed、record、
-//! setlist、producer”，不会在这里直接改写语句。
+//! setlist、producer 或 trailing handoff”，不会在这里直接改写语句。
 //! 例如：`local t = {}; t.x = 1; t.y = 2` 会在这里被扫描成一串 constructor steps。
 
 use std::collections::BTreeMap;
@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 use crate::hir::common::{HirExpr, HirLValue, HirStmt, HirTableConstructor, HirTableSetList};
 
 use super::bindings::{
-    binding_from_expr, binding_from_lvalue, expr_uses_binding, table_key_from_expr,
+    binding_from_expr, binding_from_lvalue, expr_uses_binding, lvalue_uses_binding,
+    stmt_slice_mentions_binding, table_key_from_expr,
 };
 use super::rebuild::rebuild_constructor_from_steps;
 use super::{ProducerGroup, ProducerGroupSlot, RegionStep, TableBinding};
@@ -103,6 +104,34 @@ pub(super) fn try_rebuild_constructor_region(
     // `{ ... }` 前缀。因此这里持续记住“最后一个成功前缀”，在真正遇到无关语句时
     // 回退到最近一次可证明安全的构造器边界。
     best
+}
+
+pub(super) fn trailing_constructor_handoff(
+    stmts: &[HirStmt],
+    binding: TableBinding,
+) -> Option<HirLValue> {
+    let HirStmt::Assign(assign) = stmts.first()? else {
+        return None;
+    };
+    let [target] = assign.targets.as_slice() else {
+        return None;
+    };
+    let [value] = assign.values.as_slice() else {
+        return None;
+    };
+    if binding_from_expr(value) != Some(binding) {
+        return None;
+    }
+    // 这里只认“构造器 seed 的唯一尾部 handoff”：
+    // - target 自己不能再回看 seed binding，否则不是所有权转移而是继续同表写入；
+    // - handoff 之后也不能再出现这个 binding，否则后层还需要它的稳定身份。
+    if binding_from_lvalue(target) == Some(binding)
+        || lvalue_uses_binding(target, binding)
+        || stmt_slice_mentions_binding(&stmts[1..], binding)
+    {
+        return None;
+    }
+    Some(target.clone())
 }
 
 fn keyed_write_step(

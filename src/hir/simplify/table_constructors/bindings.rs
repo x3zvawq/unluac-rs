@@ -117,6 +117,101 @@ pub(super) fn expr_uses_binding(expr: &HirExpr, binding: TableBinding) -> bool {
     }
 }
 
+pub(super) fn lvalue_uses_binding(lvalue: &HirLValue, binding: TableBinding) -> bool {
+    match lvalue {
+        HirLValue::Temp(temp) => TableBinding::Temp(*temp) == binding,
+        HirLValue::Local(local) => TableBinding::Local(*local) == binding,
+        HirLValue::Upvalue(_) => false,
+        HirLValue::Global(_) => false,
+        HirLValue::TableAccess(access) => {
+            expr_uses_binding(&access.base, binding) || expr_uses_binding(&access.key, binding)
+        }
+    }
+}
+
+pub(super) fn stmt_slice_mentions_binding(stmts: &[HirStmt], binding: TableBinding) -> bool {
+    stmts
+        .iter()
+        .any(|stmt| stmt_mentions_binding(stmt, binding))
+}
+
+fn stmt_mentions_binding(stmt: &HirStmt, binding: TableBinding) -> bool {
+    match stmt {
+        HirStmt::LocalDecl(local_decl) => local_decl
+            .values
+            .iter()
+            .any(|value| expr_uses_binding(value, binding)),
+        HirStmt::Assign(assign) => {
+            assign
+                .targets
+                .iter()
+                .any(|target| lvalue_uses_binding(target, binding))
+                || assign
+                    .values
+                    .iter()
+                    .any(|value| expr_uses_binding(value, binding))
+        }
+        HirStmt::TableSetList(set_list) => {
+            expr_uses_binding(&set_list.base, binding)
+                || set_list
+                    .values
+                    .iter()
+                    .any(|value| expr_uses_binding(value, binding))
+                || set_list
+                    .trailing_multivalue
+                    .as_ref()
+                    .is_some_and(|value| expr_uses_binding(value, binding))
+        }
+        HirStmt::ErrNil(err_nil) => expr_uses_binding(&err_nil.value, binding),
+        HirStmt::ToBeClosed(to_be_closed) => expr_uses_binding(&to_be_closed.value, binding),
+        HirStmt::Close(_) => false,
+        HirStmt::CallStmt(call_stmt) => call_expr_uses_binding(&call_stmt.call, binding),
+        HirStmt::Return(ret) => ret
+            .values
+            .iter()
+            .any(|value| expr_uses_binding(value, binding)),
+        HirStmt::If(if_stmt) => {
+            expr_uses_binding(&if_stmt.cond, binding)
+                || stmt_slice_mentions_binding(&if_stmt.then_block.stmts, binding)
+                || if_stmt
+                    .else_block
+                    .as_ref()
+                    .is_some_and(|block| stmt_slice_mentions_binding(&block.stmts, binding))
+        }
+        HirStmt::While(while_stmt) => {
+            expr_uses_binding(&while_stmt.cond, binding)
+                || stmt_slice_mentions_binding(&while_stmt.body.stmts, binding)
+        }
+        HirStmt::Repeat(repeat_stmt) => {
+            stmt_slice_mentions_binding(&repeat_stmt.body.stmts, binding)
+                || expr_uses_binding(&repeat_stmt.cond, binding)
+        }
+        HirStmt::NumericFor(numeric_for) => {
+            TableBinding::Local(numeric_for.binding) == binding
+                || expr_uses_binding(&numeric_for.start, binding)
+                || expr_uses_binding(&numeric_for.limit, binding)
+                || expr_uses_binding(&numeric_for.step, binding)
+                || stmt_slice_mentions_binding(&numeric_for.body.stmts, binding)
+        }
+        HirStmt::GenericFor(generic_for) => {
+            generic_for
+                .bindings
+                .iter()
+                .any(|local| TableBinding::Local(*local) == binding)
+                || generic_for
+                    .iterator
+                    .iter()
+                    .any(|expr| expr_uses_binding(expr, binding))
+                || stmt_slice_mentions_binding(&generic_for.body.stmts, binding)
+        }
+        HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => false,
+        HirStmt::Block(block) => stmt_slice_mentions_binding(&block.stmts, binding),
+        HirStmt::Unstructured(unstructured) => {
+            stmt_slice_mentions_binding(&unstructured.body.stmts, binding)
+        }
+    }
+}
+
 fn is_identifier_name(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {

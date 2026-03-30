@@ -186,8 +186,11 @@ where
 
     let mut decompile = repo_debug_decompile_options();
     let has_explicit_dump = !args.dump.is_empty();
-    let has_explicit_debug_output =
-        args.debug || has_explicit_dump || args.detail.is_some() || args.color.is_some() || args.proto.is_some();
+    let has_explicit_debug_output = args.debug
+        || has_explicit_dump
+        || args.detail.is_some()
+        || args.color.is_some()
+        || args.proto.is_some();
 
     // CLI 默认直接输出最终源码；只有显式请求时才启用 repo debug preset 的调试行为。
     decompile.debug.enable = false;
