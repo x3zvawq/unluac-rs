@@ -280,5 +280,13 @@ mod decompile_pipeline {
             "{}",
             generated.source
         );
+        assert!(
+            generated
+                .source
+                .lines()
+                .any(|line| line.contains("if ") && line.contains(":find(\"%-\") then")),
+            "{}",
+            generated.source
+        );
     }
 }

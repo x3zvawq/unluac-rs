@@ -11,8 +11,8 @@
 use super::super::binding_flow::{count_binding_uses_in_stmts_deep, name_matches_binding};
 use crate::ast::common::{
     AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstExpr, AstFieldAccess, AstGlobalDecl,
-    AstIndexAccess, AstLocalAttr, AstLogicalExpr, AstMethodCallExpr, AstReturn, AstStmt,
-    AstTableConstructor, AstTableField, AstTableKey, AstUnaryExpr,
+    AstIf, AstIndexAccess, AstLocalAttr, AstLogicalExpr, AstMethodCallExpr, AstRepeat, AstReturn,
+    AstStmt, AstTableConstructor, AstTableField, AstTableKey, AstUnaryExpr, AstWhile,
 };
 
 pub(super) fn try_recover_method_alias_stmt(stmts: &[AstStmt]) -> Option<(AstStmt, usize)> {
@@ -86,7 +86,7 @@ fn try_recover_receiver_alias_direct_method_call(stmts: &[AstStmt]) -> Option<(A
     }
 
     Some((
-        rewrite_single_value_sink_stmt(sink, |value| {
+        rewrite_single_expr_sink_stmt(sink, |value| {
             rewrite_method_call_expr_nested(value, |expr| {
                 recover_direct_method_call_with_receiver_alias_expr(
                     expr,
@@ -129,7 +129,7 @@ fn recover_method_call_sink(
     receiver: AstExpr,
     receiver_matches: impl Fn(&AstExpr) -> bool,
 ) -> Option<AstStmt> {
-    rewrite_single_value_sink_stmt(stmt, |value| {
+    rewrite_single_expr_sink_stmt(stmt, |value| {
         recover_method_call_expr(value, callee_binding, &method, &receiver, &receiver_matches)
     })
     .or_else(|| match stmt {
@@ -489,7 +489,7 @@ fn try_recover_direct_method_call_stmt(stmts: &[AstStmt]) -> Option<(AstStmt, us
 }
 
 fn rewrite_direct_method_call_stmt(stmt: &AstStmt) -> Option<AstStmt> {
-    rewrite_single_value_sink_stmt(stmt, rewrite_direct_method_call_expr_nested)
+    rewrite_single_expr_sink_stmt(stmt, rewrite_direct_method_call_expr_nested)
 }
 
 fn rewrite_direct_method_call_expr_nested(expr: &AstExpr) -> Option<AstExpr> {
@@ -725,7 +725,7 @@ fn recover_direct_method_call_with_receiver_alias_expr(
     })))
 }
 
-fn rewrite_single_value_sink_stmt(
+fn rewrite_single_expr_sink_stmt(
     stmt: &AstStmt,
     mut rewrite_expr: impl FnMut(&AstExpr) -> Option<AstExpr>,
 ) -> Option<AstStmt> {
@@ -762,10 +762,20 @@ fn rewrite_single_value_sink_stmt(
             rewritten.values[0] = rewrite_expr(value)?;
             Some(AstStmt::Return(Box::new(rewritten)))
         }
+        AstStmt::If(if_stmt) => Some(AstStmt::If(Box::new(AstIf {
+            cond: rewrite_expr(&if_stmt.cond)?,
+            then_block: if_stmt.then_block.clone(),
+            else_block: if_stmt.else_block.clone(),
+        }))),
+        AstStmt::While(while_stmt) => Some(AstStmt::While(Box::new(AstWhile {
+            cond: rewrite_expr(&while_stmt.cond)?,
+            body: while_stmt.body.clone(),
+        }))),
+        AstStmt::Repeat(repeat_stmt) => Some(AstStmt::Repeat(Box::new(AstRepeat {
+            body: repeat_stmt.body.clone(),
+            cond: rewrite_expr(&repeat_stmt.cond)?,
+        }))),
         AstStmt::CallStmt(_)
-        | AstStmt::If(_)
-        | AstStmt::While(_)
-        | AstStmt::Repeat(_)
         | AstStmt::NumericFor(_)
         | AstStmt::GenericFor(_)
         | AstStmt::DoBlock(_)

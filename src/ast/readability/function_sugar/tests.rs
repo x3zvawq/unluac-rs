@@ -6,7 +6,7 @@
 
 use super::apply;
 use crate::ast::{
-    AstAssign, AstBindingRef, AstBlock, AstCallExpr, AstCallKind, AstExpr, AstFieldAccess,
+    AstAssign, AstBindingRef, AstBlock, AstCallExpr, AstCallKind, AstExpr, AstFieldAccess, AstIf,
     AstFunctionDecl, AstFunctionExpr, AstFunctionName, AstLValue, AstLocalAttr, AstLocalBinding,
     AstLocalDecl, AstMethodCallExpr, AstModule, AstNamePath, AstNameRef, AstReturn, AstStmt,
     AstTableConstructor, AstTargetDialect,
@@ -746,6 +746,98 @@ fn recovers_direct_method_call_inside_truthy_ternary_local_initializer() {
                                         && matches!(call.args.as_slice(), [AstExpr::String(pattern)] if pattern == "%-")
                             ) && matches!(&and_expr.rhs, AstExpr::String(value) if value == "neg")
                     ) && matches!(&or_expr.rhs, AstExpr::String(value) if value == "pos")
+            )
+    ));
+}
+
+#[test]
+fn recovers_direct_method_call_in_if_condition() {
+    let mut module = AstModule {
+        entry_function: HirProtoRef(0),
+        body: AstBlock {
+            stmts: vec![AstStmt::If(Box::new(AstIf {
+                cond: AstExpr::Call(Box::new(AstCallExpr {
+                    callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Local(LocalId(0))),
+                        field: "find".to_owned(),
+                    })),
+                    args: vec![
+                        AstExpr::Var(AstNameRef::Local(LocalId(0))),
+                        AstExpr::String("%-".to_owned()),
+                    ],
+                })),
+                then_block: AstBlock { stmts: vec![] },
+                else_block: None,
+            }))],
+        },
+    };
+
+    assert!(run_function_sugar_to_fixed_point(
+        &mut module,
+        AstTargetDialect::new(crate::ast::AstDialectVersion::LuaJit),
+    ));
+
+    assert!(matches!(
+        module.body.stmts.as_slice(),
+        [AstStmt::If(if_stmt)]
+            if matches!(
+                &if_stmt.cond,
+                AstExpr::MethodCall(call)
+                    if matches!(call.receiver, AstExpr::Var(AstNameRef::Local(LocalId(0))))
+                        && call.method == "find"
+                        && matches!(call.args.as_slice(), [AstExpr::String(pattern)] if pattern == "%-")
+            )
+    ));
+}
+
+#[test]
+fn recovers_method_alias_in_if_condition() {
+    let receiver = LocalId(0);
+    let field_alias = LocalId(1);
+    let mut module = AstModule {
+        entry_function: HirProtoRef(0),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Local(field_alias),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Local(receiver)),
+                        field: "find".to_owned(),
+                    }))],
+                })),
+                AstStmt::If(Box::new(AstIf {
+                    cond: AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Local(field_alias)),
+                        args: vec![
+                            AstExpr::Var(AstNameRef::Local(receiver)),
+                            AstExpr::String("%-".to_owned()),
+                        ],
+                    })),
+                    then_block: AstBlock { stmts: vec![] },
+                    else_block: None,
+                })),
+            ],
+        },
+    };
+
+    assert!(run_function_sugar_to_fixed_point(
+        &mut module,
+        AstTargetDialect::new(crate::ast::AstDialectVersion::LuaJit),
+    ));
+
+    assert!(matches!(
+        module.body.stmts.as_slice(),
+        [AstStmt::If(if_stmt)]
+            if matches!(
+                &if_stmt.cond,
+                AstExpr::MethodCall(call)
+                    if matches!(call.receiver, AstExpr::Var(AstNameRef::Local(LocalId(0))))
+                        && call.method == "find"
+                        && matches!(call.args.as_slice(), [AstExpr::String(pattern)] if pattern == "%-")
             )
     ));
 }
