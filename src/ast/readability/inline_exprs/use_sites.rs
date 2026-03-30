@@ -11,7 +11,8 @@ use super::super::super::common::{
 };
 use super::super::binding_flow::name_matches_binding;
 use super::super::expr_analysis::{
-    expr_complexity, is_access_base_inline_expr, is_mechanical_run_inline_expr,
+    expr_complexity, is_access_base_inline_expr, is_direct_return_constructor_inline_expr,
+    is_mechanical_run_inline_expr,
 };
 use super::candidate::{
     InlineCandidate, InlinePolicy, is_call_callee_inline_expr,
@@ -494,6 +495,7 @@ impl InlineSite {
         match candidate {
             InlineCandidate::TempLike(_) => match policy {
                 InlinePolicy::MechanicalRun => self.allows_mechanical_run_expr(replacement),
+                InlinePolicy::DirectReturnConstructor => false,
                 _ => {
                     !matches!(self, Self::AccessBase | Self::CallCallee)
                         || is_access_base_inline_expr(replacement)
@@ -527,6 +529,12 @@ impl InlineSite {
                 InlinePolicy::AdjacentCallResultCallee => {
                     self.allows_adjacent_call_result_local_alias(replacement)
                 }
+                InlinePolicy::DirectReturnConstructor => match origin {
+                    super::super::super::common::AstLocalOrigin::DebugHinted => false,
+                    super::super::super::common::AstLocalOrigin::Recovered => {
+                        self.allows_direct_return_constructor_local_alias(replacement)
+                    }
+                },
                 InlinePolicy::MechanicalRun => match origin {
                     super::super::super::common::AstLocalOrigin::DebugHinted => false,
                     super::super::super::common::AstLocalOrigin::Recovered => {
@@ -545,11 +553,15 @@ impl InlineSite {
                 }
                 InlinePolicy::AdjacentCallResultCallee => None,
                 InlinePolicy::Conservative => None,
+                InlinePolicy::DirectReturnConstructor => None,
                 InlinePolicy::ExtendedCallChain => Some(options.access_base_inline_max_complexity),
                 InlinePolicy::MechanicalRun => Some(options.return_inline_max_complexity),
             },
             Self::ComparisonOperand => Some(options.args_inline_max_complexity),
-            Self::ReturnValue => Some(options.return_inline_max_complexity),
+            Self::ReturnValue => match policy {
+                InlinePolicy::DirectReturnConstructor => Some(usize::MAX),
+                _ => Some(options.return_inline_max_complexity),
+            },
             Self::ReturnNestedValue => Some(options.return_inline_max_complexity),
             Self::Index => Some(options.index_inline_max_complexity),
             Self::CallArgNonFinal | Self::CallArgFinal => Some(options.args_inline_max_complexity),
@@ -632,6 +644,10 @@ impl InlineSite {
 
     fn allows_adjacent_call_result_local_alias(self, replacement: &AstExpr) -> bool {
         matches!(self, Self::CallCallee) && is_lookup_inline_expr(replacement)
+    }
+
+    fn allows_direct_return_constructor_local_alias(self, replacement: &AstExpr) -> bool {
+        matches!(self, Self::ReturnValue) && is_direct_return_constructor_inline_expr(replacement)
     }
 
     fn allows_mechanical_run_expr(self, replacement: &AstExpr) -> bool {

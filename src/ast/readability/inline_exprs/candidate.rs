@@ -9,8 +9,8 @@ use super::super::super::common::{
     AstNameRef, AstStmt, AstTableField, AstTableKey,
 };
 use super::super::expr_analysis::{
-    is_access_base_inline_expr, is_context_safe_expr, is_lookup_inline_expr as is_lookup_expr,
-    is_mechanical_run_inline_expr,
+    is_access_base_inline_expr, is_context_safe_expr, is_direct_return_constructor_inline_expr,
+    is_lookup_inline_expr as is_lookup_expr, is_mechanical_run_inline_expr,
 };
 
 pub(super) fn inline_candidate(stmt: &AstStmt) -> Option<(InlineCandidate, &AstExpr)> {
@@ -56,6 +56,13 @@ pub(super) fn stmt_is_adjacent_call_result_sink(stmt: &AstStmt) -> bool {
     }
 }
 
+pub(super) fn stmt_is_direct_return_value_sink(stmt: &AstStmt) -> bool {
+    matches!(
+        stmt,
+        AstStmt::Return(ret) if matches!(ret.values.as_slice(), [AstExpr::Var(_)])
+    )
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum InlineCandidate {
     TempLike(AstBindingRef),
@@ -71,6 +78,7 @@ pub(super) enum InlinePolicy {
     ExtendedCallChain,
     AliasInitializerChain,
     AdjacentCallResultCallee,
+    DirectReturnConstructor,
     MechanicalRun,
 }
 
@@ -86,6 +94,7 @@ impl InlineCandidate {
         match self {
             Self::TempLike(_) => match policy {
                 InlinePolicy::MechanicalRun => is_mechanical_run_inline_expr(expr),
+                InlinePolicy::DirectReturnConstructor => false,
                 _ => is_inline_candidate_expr(expr),
             },
             // 这里故意不把普通 local 别名放宽到所有上下文：
@@ -101,6 +110,9 @@ impl InlineCandidate {
             } => match policy {
                 InlinePolicy::MechanicalRun => is_mechanical_run_inline_expr(expr),
                 InlinePolicy::AdjacentCallResultCallee => is_lookup_inline_expr(expr),
+                InlinePolicy::DirectReturnConstructor => {
+                    is_direct_return_constructor_inline_expr(expr)
+                }
                 _ => is_access_base_inline_expr(expr) || is_recallable_inline_expr(expr),
             },
         }

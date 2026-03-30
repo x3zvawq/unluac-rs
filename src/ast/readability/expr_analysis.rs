@@ -174,6 +174,10 @@ pub(super) fn is_mechanical_run_inline_expr(expr: &AstExpr) -> bool {
     }
 }
 
+pub(super) fn is_direct_return_constructor_inline_expr(expr: &AstExpr) -> bool {
+    matches!(expr, AstExpr::TableConstructor(_))
+}
+
 fn is_named_field_chain_expr(expr: &AstExpr) -> bool {
     let AstExpr::FieldAccess(access) = expr else {
         return false;

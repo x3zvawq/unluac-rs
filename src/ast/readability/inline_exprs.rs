@@ -14,7 +14,7 @@ use crate::readability::ReadabilityOptions;
 
 use self::candidate::{
     InlinePolicy, inline_candidate, stmt_is_adjacent_call_result_sink,
-    stmt_is_alias_initializer_sink,
+    stmt_is_alias_initializer_sink, stmt_is_direct_return_value_sink,
 };
 use self::use_sites::rewrite_stmt_use_sites_with_policy;
 use super::super::common::{AstBindingRef, AstBlock, AstModule, AstStmt};
@@ -69,6 +69,10 @@ fn rewrite_current_block(block: &mut AstBlock, options: ReadabilityOptions) -> b
             && stmt_is_adjacent_call_result_sink(next_stmt)
         {
             InlinePolicy::AdjacentCallResultCallee
+        } else if matches!(candidate, candidate::InlineCandidate::LocalAlias { .. })
+            && stmt_is_direct_return_value_sink(next_stmt)
+        {
+            InlinePolicy::DirectReturnConstructor
         } else {
             InlinePolicy::Conservative
         };

@@ -279,7 +279,16 @@ mod decompile_pipeline {
         assert!(!dump.contains("global<const> print"), "{dump}");
         assert!(dump.contains("local function l1(p0, ...l0)"), "{dump}");
         assert!(dump.contains("if p0"), "{dump}");
+        assert!(
+            dump.contains("return {first = l0[1], last = l0[l0.n], n = l0.n}"),
+            "{dump}"
+        );
         assert!(!dump.contains("if (not p0)"), "{dump}");
+        assert!(!dump.contains("do\n"), "{dump}");
+        assert!(
+            !dump.contains("local l1 = {first = l0[1], last = l0[l0.n], n = l0.n}"),
+            "{dump}"
+        );
         assert!(!dump.contains("local l1 = function(p0)"), "{dump}");
     }
 

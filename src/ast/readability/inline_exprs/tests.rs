@@ -4,7 +4,7 @@
 
 use crate::ast::common::{
     AstCallExpr, AstFieldAccess, AstGlobalName, AstIndexAccess, AstLocalBinding, AstMethodCallExpr,
-    AstReturn,
+    AstRecordField, AstReturn, AstTableConstructor, AstTableField, AstTableKey,
 };
 use crate::ast::{
     AstBinaryExpr, AstBinaryOpKind, AstCallKind, AstExpr, AstLValue, AstLocalAttr, AstModule,
@@ -870,6 +870,72 @@ fn does_not_inline_local_alias_into_plain_return_value() {
             },
         }
     ));
+}
+
+#[test]
+fn inlines_recovered_constructor_alias_into_direct_return_value() {
+    let alias = LocalId(0);
+    let values = LocalId(1);
+    let table_expr = AstExpr::TableConstructor(Box::new(AstTableConstructor {
+        fields: vec![
+            AstTableField::Record(AstRecordField {
+                key: AstTableKey::Name("first".to_owned()),
+                value: AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                    base: AstExpr::Var(AstNameRef::Local(values)),
+                    index: AstExpr::Integer(1),
+                })),
+            }),
+            AstTableField::Record(AstRecordField {
+                key: AstTableKey::Name("last".to_owned()),
+                value: AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                    base: AstExpr::Var(AstNameRef::Local(values)),
+                    index: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Local(values)),
+                        field: "n".to_owned(),
+                    })),
+                })),
+            }),
+            AstTableField::Record(AstRecordField {
+                key: AstTableKey::Name("n".to_owned()),
+                value: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                    base: AstExpr::Var(AstNameRef::Local(values)),
+                    field: "n".to_owned(),
+                })),
+            }),
+        ],
+    }));
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(alias),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![table_expr.clone()],
+                })),
+                AstStmt::Return(Box::new(AstReturn {
+                    values: vec![AstExpr::Var(AstNameRef::Local(alias))],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+    assert_eq!(
+        module.body.stmts,
+        vec![AstStmt::Return(Box::new(AstReturn {
+            values: vec![table_expr],
+        }))]
+    );
 }
 
 #[test]
