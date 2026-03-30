@@ -76,10 +76,16 @@ const STRUCTURAL_CLEANUP_STAGE: ReadabilityStage = stage("structural-cleanup", &
 
 const EXPR_INLINE_STAGE: ReadabilityStage = stage_with_cleanup(
     "expr-inline",
-    &[ReadabilityPass {
-        name: "inline-exprs",
-        apply: inline_exprs::apply,
-    }],
+    &[
+        ReadabilityPass {
+            name: "inline-exprs",
+            apply: inline_exprs::apply,
+        },
+        ReadabilityPass {
+            name: "field-access-sugar-post-inline",
+            apply: field_access_sugar::apply,
+        },
+    ],
 );
 
 const ACCESS_SUGAR_STAGE: ReadabilityStage = stage(
@@ -171,6 +177,8 @@ const TEMP_MATERIALIZE_STAGE: ReadabilityStage = stage(
 // Stage 顺序本身就是 readability 契约的一部分：
 // 1. 先把最机械的 local/stmt 壳压平，避免后续 sugar 看见被过度拆开的 AST。
 // 2. 再做 access / control-flow / expr sugar，让表达式和结构更接近源码。
+//    `inline-exprs` 可能会重新露出 `"name"` 这类字符串索引，所以 access sugar
+//    要在表达式内联之后再补一轮，避免新暴露的 key 停在 `["n"]` 这种半糖形态。
 // 3. `materialize-temps` 必须先于 `installer-iife/function-sugar`，否则后者会把仍处在
 //    临时槽位里的机械节点误当成稳定源码 binding，也没法给新引入的局部名分配 AST 自己的
 //    synthetic local。

@@ -5,6 +5,7 @@
 //! - 后续只使用一次
 //! - 使用点出现在 return / 调用参数 / 索引位 / 调用目标
 //! - 被内联表达式必须是我们能证明“纯且无元方法副作用”的安全子集
+//! - 相邻 recovered local run 里，只有末尾 local 仍会跨语句存活的机械链
 
 mod candidate;
 mod use_sites;
@@ -102,6 +103,7 @@ fn rewrite_current_block(block: &mut AstBlock, options: ReadabilityOptions) -> b
 
     block.stmts = new_stmts;
     changed |= collapse_adjacent_call_alias_runs(block, options);
+    changed |= collapse_terminal_local_mechanical_runs(block, options);
     changed |= collapse_adjacent_mechanical_alias_runs(block, options);
     changed
 }
@@ -271,7 +273,9 @@ fn collapse_adjacent_mechanical_alias_runs(
             }
         }
 
-        if collapsed_count >= 2 && has_non_lookup_piece {
+        if collapsed_count >= 2
+            && (has_non_lookup_piece || stmt_prefers_pure_lookup_run_collapse(&rewritten_sink))
+        {
             changed = true;
             for (offset, stmt) in old_stmts[index..run_end].iter().enumerate() {
                 if !removed[offset] {
@@ -280,6 +284,108 @@ fn collapse_adjacent_mechanical_alias_runs(
             }
             new_stmts.push(rewritten_sink);
             index = run_end + 1;
+            continue;
+        }
+
+        new_stmts.push(old_stmts[index].clone());
+        index += 1;
+    }
+
+    block.stmts = new_stmts;
+    changed
+}
+
+fn collapse_terminal_local_mechanical_runs(
+    block: &mut AstBlock,
+    options: ReadabilityOptions,
+) -> bool {
+    let old_stmts = std::mem::take(&mut block.stmts);
+    let mut new_stmts = Vec::with_capacity(old_stmts.len());
+    let mut changed = false;
+    let mut index = 0;
+
+    while index < old_stmts.len() {
+        let mut run_end = index;
+        while run_end < old_stmts.len() && inline_candidate(&old_stmts[run_end]).is_some() {
+            run_end += 1;
+        }
+
+        if run_end <= index + 1 || run_end >= old_stmts.len() {
+            new_stmts.push(old_stmts[index].clone());
+            index += 1;
+            continue;
+        }
+
+        let Some((sink_candidate, _)) = inline_candidate(&old_stmts[run_end - 1]) else {
+            new_stmts.push(old_stmts[index].clone());
+            index += 1;
+            continue;
+        };
+        // 这里只处理“run 末尾这个 local 自己还会跨语句活下去”的情况：
+        // 前面的 recovered local 只是为了把最终表达式拆成多个机械阶段，
+        // 但末尾这个 binding 仍然是后续语句要继续引用的源码锚点。
+        if !matches!(sink_candidate, candidate::InlineCandidate::LocalAlias { .. })
+            || count_binding_uses_in_stmts(&old_stmts[run_end..], sink_candidate.binding()) == 0
+        {
+            new_stmts.push(old_stmts[index].clone());
+            index += 1;
+            continue;
+        }
+
+        let mut rewritten_sink = old_stmts[run_end - 1].clone();
+        let mut removed = vec![false; run_end - index - 1];
+        let mut collapsed_count = 0usize;
+
+        for candidate_index in (index..(run_end - 1)).rev() {
+            let Some((candidate, value)) = inline_candidate(&old_stmts[candidate_index]) else {
+                continue;
+            };
+            if !candidate.allows_expr_with_policy(value, InlinePolicy::MechanicalRun) {
+                continue;
+            }
+            if count_binding_uses_in_stmts(&old_stmts[(candidate_index + 1)..], candidate.binding())
+                != 1
+            {
+                continue;
+            }
+            if count_binding_uses_in_stmts(&old_stmts[run_end..], candidate.binding()) != 0 {
+                continue;
+            }
+            if count_binding_uses_in_remaining_run(
+                &old_stmts[(candidate_index + 1)..(run_end - 1)],
+                &removed[(candidate_index + 1 - index)..],
+                candidate.binding(),
+            ) != 0
+            {
+                continue;
+            }
+            if !stmt_has_nested_binding_use(&rewritten_sink, candidate.binding()) {
+                continue;
+            }
+
+            let mut trial_sink = rewritten_sink.clone();
+            if rewrite_stmt_use_sites_with_policy(
+                &mut trial_sink,
+                candidate,
+                value,
+                options,
+                InlinePolicy::MechanicalRun,
+            ) {
+                rewritten_sink = trial_sink;
+                removed[candidate_index - index] = true;
+                collapsed_count += 1;
+            }
+        }
+
+        if collapsed_count >= 2 {
+            changed = true;
+            for (offset, stmt) in old_stmts[index..(run_end - 1)].iter().enumerate() {
+                if !removed[offset] {
+                    new_stmts.push(stmt.clone());
+                }
+            }
+            new_stmts.push(rewritten_sink);
+            index = run_end;
             continue;
         }
 
@@ -302,6 +408,19 @@ fn stmt_can_absorb_mechanical_run(stmt: &AstStmt) -> bool {
             | AstStmt::Repeat(_)
             | AstStmt::NumericFor(_)
             | AstStmt::GenericFor(_)
+    )
+}
+
+fn stmt_prefers_pure_lookup_run_collapse(stmt: &AstStmt) -> bool {
+    matches!(
+        stmt,
+        // 纯 lookup bag 如果只是为了拼一个复合左值（例如 `tbl[tbl.n] = ...`），
+        // 保留中间 local 只会把“地址计算”拆成多行机械脚手架；这里允许把它们收回赋值本身。
+        AstStmt::Assign(assign)
+            if assign
+                .targets
+                .iter()
+                .any(|target| !matches!(target, super::super::common::AstLValue::Name(_)))
     )
 }
 

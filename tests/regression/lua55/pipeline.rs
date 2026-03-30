@@ -442,7 +442,28 @@ mod decompile_pipeline {
             generated.source
         );
         assert!(
-            generated.source.contains("return ok2, value.n"),
+            generated.source.contains("return ")
+                && generated.source.contains(", value.n,")
+                && !generated.source.contains("return ok2, value.n"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("= value[1] * 10 + value[value.n]"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("value.n = value.n + 1"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("value[value.n] = value[1] + value[2] + a"),
             "{}",
             generated.source
         );
@@ -481,6 +502,54 @@ mod decompile_pipeline {
         );
         assert!(
             generated.source.contains("local function fn(a)"),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
+    fn lua55_generate_stage_recovers_installer_iife_as_local_function_plus_call() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.5",
+            "tests/lua_cases/lua5.5/02_global_function_capture.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua55,
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.5 generate stage should recover installer iife fixture");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should leave generated source in state");
+        assert!(
+            generated.source.contains("local function"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("global function emit"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("(\"ax\")"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("(function("),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("end)(\"ax\")"),
             "{}",
             generated.source
         );
