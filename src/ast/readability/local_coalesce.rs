@@ -464,15 +464,12 @@ fn stmt_mentions_binding(stmt: &AstStmt, binding: AstBindingRef) -> bool {
                     .stmts
                     .iter()
                     .any(|stmt| stmt_mentions_binding(stmt, binding))
-                || if_stmt
-                    .else_block
-                    .as_ref()
-                    .is_some_and(|block| {
-                        block
-                            .stmts
-                            .iter()
-                            .any(|stmt| stmt_mentions_binding(stmt, binding))
-                    })
+                || if_stmt.else_block.as_ref().is_some_and(|block| {
+                    block
+                        .stmts
+                        .iter()
+                        .any(|stmt| stmt_mentions_binding(stmt, binding))
+                })
         }
         AstStmt::While(while_stmt) => {
             expr_references_binding(&while_stmt.cond, binding)

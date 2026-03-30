@@ -2,16 +2,32 @@
 name = "unluac"
 version = "0.1.0"
 edition = "2024"
-
-[[bin]]
-name = "unit_case_runner"
-path = "tests/support/unit_case_runner.rs"
+description = "Multi-dialect Lua decompiler written in Rust."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/x3zvawq/unluac-rs"
+homepage = "https://github.com/x3zvawq/unluac-rs"
+documentation = "https://docs.rs/unluac"
+rust-version = "1.94"
+keywords = ["lua", "luajit", "luau", "decompiler", "bytecode"]
+exclude = [
+    ".vscode/**",
+    "lua/**",
+    "packages/**",
+    "tests/**",
+    "xtask/**"
+]
 
 [lints]
 workspace = true
 
 [workspace]
-members = ["xtask"]
+members = [
+    "xtask",
+    "packages/unluac-cli",
+    "packages/unluac-test-support",
+    "packages/unluac-wasm",
+]
 resolver = "3"
 
 [workspace.lints.rust]
@@ -27,3 +43,6 @@ redundant_clone = "deny"
 encoding_rs = "0.8.35"
 owo-colors = "4.2.2"
 thiserror = "2.0.12"
+
+[dev-dependencies]
+unluac-test-support = { path = "packages/unluac-test-support" }

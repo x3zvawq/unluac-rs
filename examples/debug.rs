@@ -9,21 +9,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use unluac::decompile::{
-    DebugColorMode, DebugDetail, DebugFilters, DebugOptions, DecompileDialect, DecompileOptions,
-    DecompileStage, ReadabilityOptions, decompile, render_timing_report,
+    DebugColorMode, DecompileDialect, DecompileStage, decompile, render_timing_report,
+    repo_debug_decompile_options,
 };
-use unluac::naming::{NamingMode, NamingOptions};
-use unluac::parser::{ParseMode, ParseOptions, StringDecodeMode, StringEncoding};
 
 /// 开发时最常改的是这几个常量，直接编辑代码通常比来回敲命令更顺手。
-const DIALECT: DecompileDialect = DecompileDialect::Luajit;
-const SOURCE: &str = "tests/lua_cases/luajit/08_imaginary_branch_mesh.lua";
-const STRING_ENCODING: StringEncoding = StringEncoding::Utf8;
-const STRING_DECODE_MODE: StringDecodeMode = StringDecodeMode::Strict;
-const PARSE_MODE: ParseMode = ParseMode::Permissive;
-// 这个入口更常用来直接看“最终会长成什么源码形状”，所以默认停在 Generate。
-const TARGET_STAGE: DecompileStage = DecompileStage::Generate;
-const DEBUG_DETAIL: DebugDetail = DebugDetail::Verbose;
+const SOURCE: &str = "tests/lua_cases/luajit/09_ull_table_rotation.lua";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompilerProtocol {
@@ -34,45 +25,18 @@ enum CompilerProtocol {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let options = repo_debug_decompile_options();
+    let dialect = options.dialect;
+    let debug_detail = options.debug.detail;
     let source = repo_root.join(SOURCE);
-    let compiler = bundled_compiler_path(&repo_root, DIALECT);
-    let chunk = compile_source(&compiler, &source, DIALECT)?;
+    let compiler = bundled_compiler_path(&repo_root, dialect);
+    let chunk = compile_source(&compiler, &source, dialect)?;
     let bytes = fs::read(&chunk)?;
 
-    let result = decompile(
-        &bytes,
-        DecompileOptions {
-            dialect: DIALECT,
-            parse: ParseOptions {
-                mode: PARSE_MODE,
-                string_encoding: STRING_ENCODING,
-                string_decode_mode: STRING_DECODE_MODE,
-            },
-            target_stage: TARGET_STAGE,
-            debug: DebugOptions {
-                enable: true,
-                output_stages: vec![TARGET_STAGE],
-                timing: false,
-                color: DebugColorMode::Always,
-                detail: DEBUG_DETAIL,
-                filters: DebugFilters::default(),
-            },
-            readability: ReadabilityOptions {
-                return_inline_max_complexity: 10,
-                index_inline_max_complexity: 10,
-                args_inline_max_complexity: 6,
-                access_base_inline_max_complexity: 5,
-            },
-            naming: NamingOptions {
-                mode: NamingMode::DebugLike,
-                debug_like_include_function: true,
-            },
-            generate: Default::default(),
-        },
-    )?;
+    let result = decompile(&bytes, options)?;
 
     println!("== Debug Input ==");
-    println!("dialect: {}", DIALECT.label());
+    println!("dialect: {}", dialect.label());
     println!("source: {}", source.display());
     println!("compiler: {}", compiler.display());
     println!("chunk:  {}", chunk.display());
@@ -103,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             print!(
                 "{}",
-                render_timing_report(report, DEBUG_DETAIL, DebugColorMode::Auto)
+                render_timing_report(report, debug_detail, DebugColorMode::Auto)
             );
         }
     }

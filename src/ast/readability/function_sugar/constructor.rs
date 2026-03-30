@@ -16,8 +16,8 @@ use std::collections::BTreeSet;
 
 use super::super::binding_flow::{count_binding_uses_in_stmts_deep, name_matches_binding};
 use crate::ast::common::{
-    AstAssign, AstBindingRef, AstExpr, AstFieldAccess, AstFunctionExpr, AstFunctionName,
-    AstLValue, AstLocalAttr, AstLocalDecl, AstReturn, AstStmt, AstTableField, AstTableKey,
+    AstAssign, AstBindingRef, AstExpr, AstFieldAccess, AstFunctionExpr, AstFunctionName, AstLValue,
+    AstLocalAttr, AstLocalDecl, AstReturn, AstStmt, AstTableField, AstTableKey,
 };
 
 pub(super) fn try_inline_terminal_constructor_fields(
@@ -210,10 +210,16 @@ fn inline_nested_arg_local_table(stmt: &AstStmt, arg_locals: &mut [ConstructorAr
     let Some((outer_binding, field, inner_binding)) = inlineable_nested_table_assign(stmt) else {
         return false;
     };
-    let Some(inner_index) = arg_locals.iter().position(|arg| arg.binding == inner_binding) else {
+    let Some(inner_index) = arg_locals
+        .iter()
+        .position(|arg| arg.binding == inner_binding)
+    else {
         return false;
     };
-    let Some(outer_index) = arg_locals.iter().position(|arg| arg.binding == outer_binding) else {
+    let Some(outer_index) = arg_locals
+        .iter()
+        .position(|arg| arg.binding == outer_binding)
+    else {
         return false;
     };
     if inner_index == outer_index || !arg_locals[inner_index].pass_to_sink {
@@ -241,7 +247,9 @@ fn inline_nested_arg_local_table(stmt: &AstStmt, arg_locals: &mut [ConstructorAr
     true
 }
 
-fn inlineable_nested_table_assign(stmt: &AstStmt) -> Option<(AstBindingRef, String, AstBindingRef)> {
+fn inlineable_nested_table_assign(
+    stmt: &AstStmt,
+) -> Option<(AstBindingRef, String, AstBindingRef)> {
     let AstStmt::Assign(assign) = stmt else {
         return None;
     };

@@ -5,8 +5,7 @@ use crate::ast::common::{
     AstBinaryExpr, AstBinaryOpKind, AstBindingRef, AstLocalBinding, AstLocalOrigin, AstNameRef,
 };
 use crate::ast::{
-    AstBlock, AstExpr, AstLValue, AstLocalAttr, AstLocalDecl, AstModule, AstStmt,
-    AstTargetDialect,
+    AstBlock, AstExpr, AstLValue, AstLocalAttr, AstLocalDecl, AstModule, AstStmt, AstTargetDialect,
 };
 use crate::hir::{LocalId, TempId};
 
@@ -233,21 +232,18 @@ fn coalesces_hoisted_carried_temp_into_later_seed_local_and_prunes_self_writebac
     };
     assert!(if_stmt.then_block.stmts.is_empty());
     assert!(
-        if_stmt
-            .else_block
-            .as_ref()
-            .is_some_and(|block| {
-                block.stmts.iter().any(|stmt| {
-                    matches!(
-                        stmt,
-                        AstStmt::Assign(assign)
-                            if matches!(
-                                assign.targets.as_slice(),
-                                [AstLValue::Name(name)] if name == &AstNameRef::Local(total)
-                            )
-                    )
-                })
-            }),
+        if_stmt.else_block.as_ref().is_some_and(|block| {
+            block.stmts.iter().any(|stmt| {
+                matches!(
+                    stmt,
+                    AstStmt::Assign(assign)
+                        if matches!(
+                            assign.targets.as_slice(),
+                            [AstLValue::Name(name)] if name == &AstNameRef::Local(total)
+                        )
+                )
+            })
+        }),
         "expected else branch to write back into the seed local"
     );
     assert!(matches!(

@@ -1,5 +1,5 @@
 [package]
-name = "xtask"
+name = "unluac-cli"
 version = "0.1.0"
 edition = "2024"
 publish = false
@@ -8,6 +8,5 @@ publish = false
 workspace = true
 
 [dependencies]
-anyhow = "1.0.98"
-indicatif = "0.17.11"
-owo-colors = "4.2.2"
+clap = { version = "4.6.0", features = ["derive"] }
+unluac = { path = "../.." }

@@ -1,4 +1,4 @@
-//! 这个模块承载 tests 目录下共享的轻量辅助函数。
+//! 这个 crate 承载仓库测试共享的轻量辅助函数。
 //!
 //! 这些 helper 只负责测试夹具解码这类稳定、无业务语义的重复逻辑，避免 unit
 //! 和 regression 两套入口各自复制同一份样板代码。
@@ -15,22 +15,23 @@ use std::sync::{
 use unluac::decompile::{DecompileOptions, DecompileStage, decompile};
 
 #[allow(dead_code)]
-pub(crate) mod case_manifest;
-use case_manifest::{LuaCaseManifestEntry, case_health_cases, decompile_pipeline_health_cases};
+mod case_manifest;
+pub use case_manifest::{LuaCaseDialect, LuaCaseManifestEntry};
+use case_manifest::{case_health_cases, decompile_pipeline_health_cases};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct LuaCommandOutput {
+struct LuaCommandOutput {
     pub(crate) status_code: Option<i32>,
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
 }
 
 impl LuaCommandOutput {
-    pub(crate) fn success(&self) -> bool {
+    fn success(&self) -> bool {
         self.status_code == Some(0)
     }
 
-    pub(crate) fn render(&self) -> String {
+    fn render(&self) -> String {
         format!(
             "status: {}\nstdout:\n{}\nstderr:\n{}",
             render_status_code(self.status_code),
@@ -97,7 +98,7 @@ fn lua_toolchain(dialect_label: &str) -> Result<LuaToolchain, String> {
     }
 }
 
-pub(crate) fn repo_relative_display(path: &Path) -> String {
+fn repo_relative_display(path: &Path) -> String {
     path.strip_prefix(repo_root())
         .map(|relative| relative.display().to_string())
         .unwrap_or_else(|_| sanitize_repo_paths(&path.display().to_string()))
@@ -106,7 +107,7 @@ pub(crate) fn repo_relative_display(path: &Path) -> String {
 const TEST_OUTPUT_ENV: &str = "UNLUAC_TEST_OUTPUT";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum TestOutputMode {
+enum TestOutputMode {
     Simple,
     Verbose,
 }
@@ -125,7 +126,7 @@ impl TestOutputMode {
 
 static TEST_OUTPUT_MODE: OnceLock<TestOutputMode> = OnceLock::new();
 
-pub(crate) fn test_output_mode() -> TestOutputMode {
+fn test_output_mode() -> TestOutputMode {
     *TEST_OUTPUT_MODE.get_or_init(|| match std::env::var(TEST_OUTPUT_ENV) {
         Ok(raw) => TestOutputMode::parse(raw.trim()).unwrap_or_else(|error| panic!("{error}")),
         Err(std::env::VarError::NotPresent) => TestOutputMode::Simple,
@@ -134,7 +135,7 @@ pub(crate) fn test_output_mode() -> TestOutputMode {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub(crate) enum FailureKind {
+pub enum FailureKind {
     RunSourceFailed,
     SourceExecutionFailed,
     CompileSourceFailed,
@@ -155,7 +156,7 @@ pub(crate) enum FailureKind {
 }
 
 impl FailureKind {
-    pub(crate) const fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::RunSourceFailed => "run-source-failed",
             Self::SourceExecutionFailed => "source-execution-failed",
@@ -179,18 +180,14 @@ impl FailureKind {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct TestFailure {
+pub struct TestFailure {
     kind: FailureKind,
     summary: String,
     detail: String,
 }
 
 impl TestFailure {
-    pub(crate) fn new(
-        kind: FailureKind,
-        summary: impl Into<String>,
-        detail: impl Into<String>,
-    ) -> Self {
+    fn new(kind: FailureKind, summary: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
             kind,
             summary: summary.into(),
@@ -198,27 +195,27 @@ impl TestFailure {
         }
     }
 
-    pub(crate) fn kind(&self) -> FailureKind {
+    pub fn kind(&self) -> FailureKind {
         self.kind
     }
 
-    pub(crate) fn summary(&self) -> &str {
+    pub fn summary(&self) -> &str {
         &self.summary
     }
 
-    pub(crate) fn detail(&self) -> &str {
+    pub fn detail(&self) -> &str {
         &self.detail
     }
 }
 
-pub(crate) fn format_case_failure(path: &str, failure: &TestFailure) -> String {
+pub fn format_case_failure(path: &str, failure: &TestFailure) -> String {
     match test_output_mode() {
         TestOutputMode::Simple => format!("{path} :: {}", failure.summary()),
         TestOutputMode::Verbose => format!("case: {path}\n{}", failure.detail()),
     }
 }
 
-pub(crate) fn failure_separator() -> &'static str {
+fn failure_separator() -> &'static str {
     match test_output_mode() {
         TestOutputMode::Simple => "\n",
         TestOutputMode::Verbose => "\n\n",
@@ -226,20 +223,20 @@ pub(crate) fn failure_separator() -> &'static str {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum UnitSuite {
+pub enum UnitSuite {
     CaseHealth,
     DecompilePipelineHealth,
 }
 
 impl UnitSuite {
-    pub(crate) fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::CaseHealth => "case-health",
             Self::DecompilePipelineHealth => "decompile-pipeline-health",
         }
     }
 
-    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+    pub fn parse(value: &str) -> Result<Self, String> {
         match value {
             "case-health" => Ok(Self::CaseHealth),
             "decompile-pipeline-health" => Ok(Self::DecompilePipelineHealth),
@@ -251,12 +248,12 @@ impl UnitSuite {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) struct UnitCaseSpec {
-    pub(crate) suite: UnitSuite,
-    pub(crate) entry: LuaCaseManifestEntry,
+pub struct UnitCaseSpec {
+    pub suite: UnitSuite,
+    pub entry: LuaCaseManifestEntry,
 }
 
-pub(crate) fn unit_case_specs() -> Vec<UnitCaseSpec> {
+pub fn unit_case_specs() -> Vec<UnitCaseSpec> {
     case_health_cases()
         .map(|entry| UnitCaseSpec {
             suite: UnitSuite::CaseHealth,
@@ -269,7 +266,7 @@ pub(crate) fn unit_case_specs() -> Vec<UnitCaseSpec> {
         .collect()
 }
 
-pub(crate) fn find_unit_case_spec(
+pub fn find_unit_case_spec(
     suite: UnitSuite,
     dialect_label: &str,
     path: &str,
@@ -281,7 +278,7 @@ pub(crate) fn find_unit_case_spec(
     })
 }
 
-pub(crate) fn run_unit_case(spec: UnitCaseSpec) -> Result<(), TestFailure> {
+pub fn run_unit_case(spec: UnitCaseSpec) -> Result<(), TestFailure> {
     match spec.suite {
         UnitSuite::CaseHealth => run_case_health(&spec.entry),
         UnitSuite::DecompilePipelineHealth => run_decompile_pipeline_health(&spec.entry),
@@ -629,12 +626,12 @@ pub(crate) fn run_decompile_pipeline_health(
 
 /// 使用 vendored 的 `luac` 把某个仓库内 Lua case 编译成测试 chunk。
 #[allow(dead_code)]
-pub(crate) fn compile_lua_case(dialect_label: &str, source_relative: &str) -> Vec<u8> {
+pub fn compile_lua_case(dialect_label: &str, source_relative: &str) -> Vec<u8> {
     compile_lua_case_inner(dialect_label, source_relative, true)
 }
 
 #[allow(dead_code)]
-pub(crate) fn compile_lua_case_with_debug(dialect_label: &str, source_relative: &str) -> Vec<u8> {
+pub fn compile_lua_case_with_debug(dialect_label: &str, source_relative: &str) -> Vec<u8> {
     compile_lua_case_inner(dialect_label, source_relative, false)
 }
 
@@ -645,12 +642,12 @@ fn compile_lua_case_inner(
     source_relative: &str,
     strip_debug: bool,
 ) -> Vec<u8> {
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = repo_root();
     let source = repo_root.join(source_relative);
     let toolchain = lua_toolchain(dialect_label)
         .unwrap_or_else(|error| panic!("invalid test dialect {dialect_label}: {error}"));
     let output = test_chunk_output_path(
-        &repo_root,
+        repo_root,
         dialect_label,
         &source,
         strip_debug,
@@ -762,8 +759,16 @@ pub(crate) fn diff_command_outputs(
     (!diffs.is_empty()).then(|| diffs.join("\n"))
 }
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+fn repo_root() -> &'static PathBuf {
+    static REPO_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+    REPO_ROOT.get_or_init(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .expect("test support crate should live under packages/")
+    })
 }
 
 fn sanitize_repo_paths(text: &str) -> String {

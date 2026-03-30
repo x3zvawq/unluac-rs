@@ -26,6 +26,15 @@ impl NamingMode {
             Self::Heuristic => "heuristic",
         }
     }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "debug-like" => Some(Self::DebugLike),
+            "simple" => Some(Self::Simple),
+            "heuristic" => Some(Self::Heuristic),
+            _ => None,
+        }
+    }
 }
 
 /// Naming 选项。

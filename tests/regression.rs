@@ -3,8 +3,7 @@
 //! 回归测试强调的是对外契约和跨层组合行为，因此按 `regression/<dialect>/...`
 //! 拆分后，新增 dialect 时不会把根目录继续堆成平铺文件列表。
 
-#[path = "support/mod.rs"]
-mod support;
+use unluac_test_support as support;
 
 #[path = "regression/lua51/mod.rs"]
 mod lua51;

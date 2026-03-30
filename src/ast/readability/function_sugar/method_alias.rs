@@ -510,10 +510,10 @@ where
             expr: rewrite_method_call_expr_nested(&unary.expr, try_rewrite_here)?,
         }))),
         AstExpr::Binary(binary) => {
-            let lhs =
-                rewrite_method_call_expr_nested(&binary.lhs, try_rewrite_here).unwrap_or(binary.lhs.clone());
-            let rhs =
-                rewrite_method_call_expr_nested(&binary.rhs, try_rewrite_here).unwrap_or(binary.rhs.clone());
+            let lhs = rewrite_method_call_expr_nested(&binary.lhs, try_rewrite_here)
+                .unwrap_or(binary.lhs.clone());
+            let rhs = rewrite_method_call_expr_nested(&binary.rhs, try_rewrite_here)
+                .unwrap_or(binary.rhs.clone());
             if lhs == binary.lhs && rhs == binary.rhs {
                 None
             } else {
@@ -556,7 +556,8 @@ where
                 })));
             }
             for (index, arg) in call.args.iter().enumerate() {
-                let Some(rewritten_arg) = rewrite_method_call_expr_nested(arg, try_rewrite_here) else {
+                let Some(rewritten_arg) = rewrite_method_call_expr_nested(arg, try_rewrite_here)
+                else {
                     continue;
                 };
                 let mut args = call.args.clone();
@@ -569,7 +570,8 @@ where
             None
         }
         AstExpr::MethodCall(call) => {
-            if let Some(receiver) = rewrite_method_call_expr_nested(&call.receiver, try_rewrite_here)
+            if let Some(receiver) =
+                rewrite_method_call_expr_nested(&call.receiver, try_rewrite_here)
             {
                 return Some(AstExpr::MethodCall(Box::new(AstMethodCallExpr {
                     receiver,
@@ -578,7 +580,8 @@ where
                 })));
             }
             for (index, arg) in call.args.iter().enumerate() {
-                let Some(rewritten_arg) = rewrite_method_call_expr_nested(arg, try_rewrite_here) else {
+                let Some(rewritten_arg) = rewrite_method_call_expr_nested(arg, try_rewrite_here)
+                else {
                     continue;
                 };
                 let mut args = call.args.clone();
@@ -616,14 +619,17 @@ where
                 .iter()
                 .enumerate()
                 .find_map(|(index, field)| match field {
-                    AstTableField::Array(value) => rewrite_method_call_expr_nested(value, try_rewrite_here)
-                        .map(|rewritten_value| {
-                            rebuild_table_with_field(
-                                table,
-                                index,
-                                AstTableField::Array(rewritten_value),
-                            )
-                        }),
+                    AstTableField::Array(value) => {
+                        rewrite_method_call_expr_nested(value, try_rewrite_here).map(
+                            |rewritten_value| {
+                                rebuild_table_with_field(
+                                    table,
+                                    index,
+                                    AstTableField::Array(rewritten_value),
+                                )
+                            },
+                        )
+                    }
                     AstTableField::Record(field) => {
                         if let AstTableKey::Expr(key) = &field.key
                             && let Some(rewritten_key) =

@@ -5,8 +5,8 @@
 use super::ReadabilityContext;
 use crate::ast::common::{AstCallExpr, AstCallKind, AstIndexAccess, AstLocalBinding};
 use crate::ast::{
-    AstBlock, AstExpr, AstGoto, AstIf, AstLabel, AstLabelId, AstLValue, AstLocalAttr,
-    AstLocalDecl, AstModule, AstNameRef, AstStmt, AstTargetDialect, make_readable_with_options,
+    AstBlock, AstExpr, AstGoto, AstIf, AstLValue, AstLabel, AstLabelId, AstLocalAttr, AstLocalDecl,
+    AstModule, AstNameRef, AstStmt, AstTargetDialect, make_readable_with_options,
 };
 use crate::hir::{LocalId, TempId};
 
@@ -545,7 +545,10 @@ fn sinks_tail_hoisted_temp_into_exclusive_else_branch_when_leading_binding_stays
         panic!("expected top-level local decl");
     };
     assert_eq!(top_local.bindings.len(), 1);
-    assert_eq!(top_local.bindings[0].id, crate::ast::AstBindingRef::Temp(carried));
+    assert_eq!(
+        top_local.bindings[0].id,
+        crate::ast::AstBindingRef::Temp(carried)
+    );
 
     let AstStmt::If(if_stmt) = &module.body.stmts[1] else {
         panic!("expected if stmt after top-level local decl");
@@ -558,6 +561,9 @@ fn sinks_tail_hoisted_temp_into_exclusive_else_branch_when_leading_binding_stays
         panic!("expected staged temp to sink into else branch");
     };
     assert_eq!(staged_local.bindings.len(), 1);
-    assert_eq!(staged_local.bindings[0].id, crate::ast::AstBindingRef::Temp(staged));
+    assert_eq!(
+        staged_local.bindings[0].id,
+        crate::ast::AstBindingRef::Temp(staged)
+    );
     assert_eq!(staged_local.values, vec![AstExpr::Integer(2)]);
 }

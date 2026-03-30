@@ -6,10 +6,10 @@
 
 use super::apply;
 use crate::ast::{
-    AstAssign, AstBindingRef, AstBlock, AstCallExpr, AstCallKind, AstExpr, AstFieldAccess, AstIf,
-    AstFunctionDecl, AstFunctionExpr, AstFunctionName, AstLValue, AstLocalAttr, AstLocalBinding,
-    AstLocalDecl, AstMethodCallExpr, AstModule, AstNamePath, AstNameRef, AstReturn, AstStmt,
-    AstTableConstructor, AstTargetDialect,
+    AstAssign, AstBindingRef, AstBlock, AstCallExpr, AstCallKind, AstExpr, AstFieldAccess,
+    AstFunctionDecl, AstFunctionExpr, AstFunctionName, AstIf, AstLValue, AstLocalAttr,
+    AstLocalBinding, AstLocalDecl, AstMethodCallExpr, AstModule, AstNamePath, AstNameRef,
+    AstReturn, AstStmt, AstTableConstructor, AstTargetDialect,
 };
 use crate::hir::{HirProtoRef, LocalId, ParamId};
 use crate::readability::ReadabilityOptions;

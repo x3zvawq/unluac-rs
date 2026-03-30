@@ -197,6 +197,12 @@ enum ReporterMode {
     Plain,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ProgressCounts {
+    completed: usize,
+    total: usize,
+}
+
 struct Reporter {
     mode: ReporterMode,
     palette: Palette,
@@ -284,8 +290,7 @@ impl Reporter {
 
     fn emit_failure(
         &self,
-        completed: usize,
-        total: usize,
+        counts: ProgressCounts,
         case: &UnitCaseDescriptor,
         outcome: UnitCaseOutcome,
         rendered_failure: Option<&str>,
@@ -293,12 +298,9 @@ impl Reporter {
         output_mode: FailureOutputMode,
     ) {
         let text = match outcome {
-            UnitCaseOutcome::TimedOut => {
-                self.render_timeout(completed, total, case, timeout_seconds)
-            }
+            UnitCaseOutcome::TimedOut => self.render_timeout(counts, case, timeout_seconds),
             UnitCaseOutcome::Failed => self.render_failure(
-                completed,
-                total,
+                counts,
                 case,
                 rendered_failure.unwrap_or("runner exited with failure but did not report details"),
                 output_mode,
@@ -363,16 +365,15 @@ impl Reporter {
 
     fn render_timeout(
         &self,
-        completed: usize,
-        total: usize,
+        counts: ProgressCounts,
         case: &UnitCaseDescriptor,
         timeout_seconds: u64,
     ) -> String {
         format!(
             "{} [{}/{}]\tdialect: {}\tcase: {}\t{}",
             self.palette.red("FAIL"),
-            completed,
-            total,
+            counts.completed,
+            counts.total,
             self.palette.cyan(&case.dialect),
             case.path,
             self.palette
@@ -382,8 +383,7 @@ impl Reporter {
 
     fn render_failure(
         &self,
-        completed: usize,
-        total: usize,
+        counts: ProgressCounts,
         case: &UnitCaseDescriptor,
         raw: &str,
         output_mode: FailureOutputMode,
@@ -393,8 +393,8 @@ impl Reporter {
             FailureOutputMode::Simple => format!(
                 "{} [{}/{}]\tdialect: {}\tcase: {}\t{}",
                 self.palette.red("FAIL"),
-                completed,
-                total,
+                counts.completed,
+                counts.total,
                 self.palette.cyan(&case.dialect),
                 case.path,
                 self.palette.red(normalized)
@@ -404,8 +404,8 @@ impl Reporter {
                 lines.push(format!(
                     "{} [{}/{}]\tdialect: {}\tcase: {}",
                     self.palette.red("FAIL"),
-                    completed,
-                    total,
+                    counts.completed,
+                    counts.total,
                     self.palette.cyan(&case.dialect),
                     case.path
                 ));
@@ -443,6 +443,12 @@ where
     I: IntoIterator,
     I::Item: Into<String>,
 {
+    let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    if is_help_request(&args) {
+        print_help();
+        return Ok(());
+    }
+
     let options = parse_args(args)?;
     let root = workspace_root()?;
 
@@ -476,8 +482,8 @@ where
     reporter.announce_start(total, &options, jobs);
 
     let (event_rx, handles) = spawn_workers(
-        root.clone(),
-        runner.clone(),
+        root,
+        runner,
         cases,
         options.output.label().to_owned(),
         timeout,
@@ -522,8 +528,7 @@ where
                             *failure_counts.entry(classification).or_insert(0) += 1;
                         }
                         reporter.emit_failure(
-                            completed,
-                            total,
+                            ProgressCounts { completed, total },
                             &case,
                             execution.outcome,
                             execution.rendered_failure.as_deref(),
@@ -536,8 +541,7 @@ where
                         timed_out += 1;
                         *failure_counts.entry("timed-out".to_owned()).or_insert(0) += 1;
                         reporter.emit_failure(
-                            completed,
-                            total,
+                            ProgressCounts { completed, total },
                             &case,
                             execution.outcome,
                             execution.rendered_failure.as_deref(),
@@ -590,14 +594,16 @@ where
 }
 
 pub(crate) fn print_help() {
+    println!("usage:");
     println!("  cargo unit-test");
-    println!("  cargo lua test-unit [--suite <all|case-health|decompile-pipeline-health>]");
-    println!("                      [--dialect <all|lua5.1|lua5.2|lua5.3|lua5.4|lua5.5>]");
-    println!("                      [--case-filter <substring>]...");
-    println!("                      [--output <simple|verbose>] [--timeout-seconds <n>]");
-    println!("                      [--progress <auto|on|off>] [--color <auto|always|never>]");
-    println!("                      [--verbose]");
-    println!("                      [--jobs <n>]");
+    println!("  cargo unit-test <help|--help|-h>");
+    println!("                  [--suite <all|case-health|decompile-pipeline-health>]");
+    println!("                  [--dialect <all|lua5.1|lua5.2|lua5.3|lua5.4|lua5.5>]");
+    println!("                  [--case-filter <substring>]...");
+    println!("                  [--output <simple|verbose>] [--timeout-seconds <n>]");
+    println!("                  [--progress <auto|on|off>] [--color <auto|always|never>]");
+    println!("                  [--verbose]");
+    println!("                  [--jobs <n>]");
 }
 
 fn parse_args<I>(args: I) -> Result<Options>
@@ -691,6 +697,10 @@ where
     Ok(options)
 }
 
+fn is_help_request(args: &[String]) -> bool {
+    matches!(args, [flag] if matches!(flag.as_str(), "help" | "--help" | "-h"))
+}
+
 fn parse_env_or_default<T>(
     key: &str,
     default: &str,
@@ -749,7 +759,14 @@ fn workspace_root() -> Result<PathBuf> {
 fn build_unit_case_runner(root: &Path) -> Result<()> {
     run_command(
         "cargo",
-        ["build", "--quiet", "--bin", "unit_case_runner"],
+        [
+            "build",
+            "--quiet",
+            "-p",
+            "unluac-test-support",
+            "--bin",
+            "unit_case_runner",
+        ],
         root,
     )
 }
@@ -798,6 +815,9 @@ fn list_unit_cases(root: &Path, runner: &Path) -> Result<Vec<UnitCaseDescriptor>
         .collect()
 }
 
+type WorkerHandles = Vec<thread::JoinHandle<Result<()>>>;
+type SpawnedWorkers = (mpsc::Receiver<WorkerEvent>, WorkerHandles);
+
 fn spawn_workers(
     root: PathBuf,
     runner: PathBuf,
@@ -805,10 +825,7 @@ fn spawn_workers(
     output_mode: String,
     timeout: Duration,
     jobs: usize,
-) -> Result<(
-    mpsc::Receiver<WorkerEvent>,
-    Vec<thread::JoinHandle<Result<()>>>,
-)> {
+) -> Result<SpawnedWorkers> {
     let (task_tx, task_rx) = mpsc::channel::<ScheduledCase>();
     let (event_tx, event_rx) = mpsc::channel::<WorkerEvent>();
     let task_rx = Arc::new(Mutex::new(task_rx));
@@ -1021,7 +1038,7 @@ fn should_emit_sparse_plain_progress(
 ) -> bool {
     matches!(event, ProgressEventKind::Finished)
         && completed > 0
-        && (completed == total || completed % 100 == 0)
+        && (completed == total || completed.is_multiple_of(100))
 }
 
 fn normalize_runner_failure(
@@ -1068,8 +1085,8 @@ where
 mod tests {
     use super::{
         ColorMode, FailureOutputMode, MachineFailure, Options, PlainProgressDetail, ProgressMode,
-        matches_case_filters, normalize_runner_failure, parse_args, parse_machine_failure,
-        sorted_failure_counts,
+        is_help_request, matches_case_filters, normalize_runner_failure, parse_args,
+        parse_machine_failure, sorted_failure_counts,
     };
     use std::os::unix::process::ExitStatusExt;
 
@@ -1130,6 +1147,15 @@ mod tests {
         let error = parse_args(["--jobs", "0"]).expect_err("zero jobs should be rejected");
 
         assert_eq!(error.to_string(), "jobs must be greater than zero");
+    }
+
+    #[test]
+    fn help_request_should_recognize_all_supported_spellings() {
+        assert!(is_help_request(&["help".to_owned()]));
+        assert!(is_help_request(&["--help".to_owned()]));
+        assert!(is_help_request(&["-h".to_owned()]));
+        assert!(!is_help_request(&[]));
+        assert!(!is_help_request(&["--suite".to_owned(), "all".to_owned()]));
     }
 
     #[test]

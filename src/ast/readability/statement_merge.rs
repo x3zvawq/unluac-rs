@@ -18,7 +18,7 @@
 use std::collections::BTreeSet;
 
 use super::super::common::{
-    AstBindingRef, AstBlock, AstLabelId, AstLValue, AstLocalAttr, AstLocalDecl, AstModule,
+    AstBindingRef, AstBlock, AstLValue, AstLabelId, AstLocalAttr, AstLocalDecl, AstModule,
     AstNameRef, AstStmt,
 };
 use super::ReadabilityContext;
@@ -222,11 +222,9 @@ fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
         // `local next, staged; if ... else staged = ...; next = staged end`
         // 这种形状会因为 `next` 还要在 if 之后继续用，把 `staged` 也一起卡在块顶。
         for slice_end in (start + 1..=end).rev() {
-            if let Some((rewritten, consumed)) = try_sink_hoisted_decl_into_nested_stmt(
-                &pending[start..slice_end],
-                stmt,
-                suffix,
-            ) {
+            if let Some((rewritten, consumed)) =
+                try_sink_hoisted_decl_into_nested_stmt(&pending[start..slice_end], stmt, suffix)
+            {
                 return Some(NestedSinkAttempt {
                     rewritten,
                     start,

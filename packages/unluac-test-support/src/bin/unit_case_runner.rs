@@ -3,10 +3,7 @@
 use std::env;
 use std::process;
 
-#[path = "mod.rs"]
-mod support;
-
-use support::{
+use unluac_test_support::{
     UnitSuite, find_unit_case_spec, format_case_failure, run_unit_case, unit_case_specs,
 };
 

@@ -4,24 +4,41 @@
 
 ## 四种入口
 
-### 1. `cargo run`
+### 1. `cargo unluac`
 
 这是当前的轻量 CLI 入口。
 
+它来自仓库根目录的 Cargo alias：
+
+```bash
+cargo unluac -- ...
+```
+
+等价于：
+
+```bash
+cargo run -p unluac-cli -- ...
+```
+
 默认行为：
 
-- 运行 [src/main.rs](/Users/x3zvawq/workspace/unluac-rs/src/main.rs)
-- 转到 [src/cli.rs](/Users/x3zvawq/workspace/unluac-rs/src/cli.rs)
-- 如果没有传 `--input`，会先把默认 Lua 源码编译成 chunk
-- 然后调用库层 `decompile()` 并打印对应阶段的 dump
+- 运行 [packages/unluac-cli/src/main.rs](/Users/x3zvawq/workspace/unluac-rs/packages/unluac-cli/src/main.rs)
+- 转到 [packages/unluac-cli/src/cli.rs](/Users/x3zvawq/workspace/unluac-rs/packages/unluac-cli/src/cli.rs)
+- 必须显式传入 `--input` 或 `--source`
+- 如果传的是 `--source`，会先调用对应 dialect 的编译器把 Lua 源码编译成 chunk
+- 默认直接输出最终源码，不打印 debug dump
+- 如果显式传入 `--debug` 或其他 debug 相关参数，才会打印对应阶段的 dump / timing
 
 最常用的命令：
 
 ```bash
-cargo run -- --dialect=lua5.1
-cargo run -- --dialect=lua5.1 --detail=verbose
-cargo run -- --dialect=lua5.1 --source tests/lua_cases/lua5.1/01_setfenv.lua
-cargo run -- --dialect=lua5.1 --input /absolute/path/to/chunk.out
+cargo unluac -- --input /absolute/path/to/chunk.out --dialect=lua5.1
+cargo unluac -- --source tests/lua_cases/luajit/09_ull_table_rotation.lua
+cargo unluac -- --source tests/lua_cases/lua5.1/01_setfenv.lua --dialect=lua5.1
+cargo unluac -- --source tests/lua_cases/lua5.1/01_setfenv.lua --debug
+cargo unluac -- --input /absolute/path/to/chunk.out --timing
+cargo unluac -- --input /absolute/path/to/chunk.out --stop-after=generate
+cargo run -p unluac-cli -- --input /absolute/path/to/chunk.out --dump=parse --detail=verbose
 ```
 
 当前支持的一些实用参数：
@@ -29,6 +46,7 @@ cargo run -- --dialect=lua5.1 --input /absolute/path/to/chunk.out
 - `--dialect=lua5.1`
 - `--source=<lua 源码路径>`
 - `--input=<已编译 chunk 路径>`
+- `--debug`
 - `--encoding=utf8|gbk`
 - `--decode-mode=strict|lossy`
 - `--parse-mode=strict|permissive`
@@ -36,14 +54,50 @@ cargo run -- --dialect=lua5.1 --input /absolute/path/to/chunk.out
 - 多次写 `--dump` 可以同时查看多个阶段
 - `--stop-after=parse`
 - `--detail=summary|normal|verbose`
+- `--color=auto|always|never`
+- `--timing`
 - `--proto=<id>`
+- `--return-inline-max-complexity=<n>`
+- `--index-inline-max-complexity=<n>`
+- `--args-inline-max-complexity=<n>`
+- `--access-base-inline-max-complexity=<n>`
+- `--naming-mode=debug-like|simple|heuristic`
+- `--debug-like-include-function=true|false`
+- `--indent-width=<n>`
+- `--max-line-length=<n>`
+- `--quote-style=prefer-double|prefer-single|min-escape`
+- `--table-style=compact|balanced|expanded`
+- `--conservative-output=true|false`
 
 这里有一个当前约定：
 
+- 默认不启用 debug，CLI 会直接输出纯源码
+- `--debug` 会按 repo debug preset 为当前 `target_stage` 打开一份默认 dump
 - `--stop-after` 决定 pipeline 实际跑到哪一层
 - `--dump` 只决定“已经跑到的层里哪些需要打印”
+- `--timing` 可以单独使用；如果没有同时请求 dump，它只会输出 timing report
 
 也就是说，如果你写了更后的 `--dump`，但 `--stop-after` 停得更早，那么未到达的层不会输出，也不会因此强行继续执行。
+
+如果你只是想在当前仓库里快速调试 CLI，本地最常用的是这两类：
+
+```bash
+# 已经有 chunk，直接反编译成纯源码
+cargo unluac -- --input /absolute/path/to/chunk.out --dialect=lua5.1
+
+# 只有 Lua 源码，先编译再反编译成纯源码
+cargo unluac -- --source tests/lua_cases/lua5.1/01_setfenv.lua --dialect=lua5.1
+```
+
+如果你要看 repo debug preset 风格的调试输出，最常用的是这两类：
+
+```bash
+# 直接看当前 target_stage 的默认 dump
+cargo unluac -- --source tests/lua_cases/luajit/09_ull_table_rotation.lua --debug
+
+# 只看 timing，不输出 dump
+cargo unluac -- --input /absolute/path/to/chunk.out --timing
+```
 
 ## 2. `cargo run --example debug`
 
@@ -53,13 +107,15 @@ cargo run -- --dialect=lua5.1 --input /absolute/path/to/chunk.out
 
 入口文件是 [examples/debug.rs](/Users/x3zvawq/workspace/unluac-rs/examples/debug.rs)。
 
-最常改的常量在文件顶部：
+这个 example 现在会共享库层的 repo 调试 preset：
 
-- `DIALECT`
-- `SOURCE`
-- `STRING_ENCODING`
-- `TARGET_STAGE`
-- `DEBUG_DETAIL`
+- 入口代码在 [examples/debug.rs](/Users/x3zvawq/workspace/unluac-rs/examples/debug.rs)
+- 默认反编译选项在 [src/decompile/repo_debug.rs](/Users/x3zvawq/workspace/unluac-rs/src/decompile/repo_debug.rs)
+
+最常改的点通常是：
+
+- `examples/debug.rs` 里的 `SOURCE`
+- `src/decompile/repo_debug.rs` 里的 dialect / parse / debug / naming / generate preset
 
 运行方式：
 

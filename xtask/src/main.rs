@@ -31,5 +31,4 @@ fn print_help() {
     println!("  cargo lua fetch <all|toolchain>");
     println!("  cargo lua build <all|toolchain>");
     println!("  cargo lua clean <all|toolchain>");
-    unit_test::print_help();
 }

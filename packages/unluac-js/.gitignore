@@ -1,0 +1,3 @@
+.wasm-build
+dist
+node_modules

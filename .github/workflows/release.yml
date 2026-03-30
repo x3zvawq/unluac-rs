@@ -1,0 +1,160 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Prepare Release Metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Verify tag version
+        id: version
+        shell: bash
+        run: |
+          VERSION="$(node .github/scripts/sync_versions.mjs --print-version)"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+
+          if [[ "$TAG_VERSION" != "$VERSION" ]]; then
+            echo "Release tag version ${TAG_VERSION} does not match workspace version ${VERSION}" >&2
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+  build-cli:
+    name: Build CLI (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            binary_path: target/release/unluac-cli
+            extension: ""
+          - os: windows-latest
+            platform: windows-x86_64
+            binary_path: target/release/unluac-cli.exe
+            extension: ".exe"
+          - os: macos-13
+            platform: macos-x86_64
+            binary_path: target/release/unluac-cli
+            extension: ""
+          - os: macos-14
+            platform: macos-aarch64
+            binary_path: target/release/unluac-cli
+            extension: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build -p unluac-cli --release --locked
+
+      - name: Rename release binary
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir -p release-assets
+          cp "${{ matrix.binary_path }}" "release-assets/unluac-${VERSION}-${{ matrix.platform }}${{ matrix.extension }}"
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.platform }}
+          path: release-assets/*
+
+  publish-and-release:
+    name: Publish crate, npm and Create Release
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - build-cli
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download CLI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cli-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: packages/unluac-js/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --version 0.14.0 --locked
+
+      - name: Install wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.115 --locked
+
+      - name: Check synced package versions
+        run: node .github/scripts/sync_versions.mjs --check
+
+      - name: Publish Rust crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p unluac --locked
+
+      - name: Install npm dependencies
+        working-directory: packages/unluac-js
+        run: npm ci
+
+      - name: Build and publish npm package
+        working-directory: packages/unluac-js
+        run: |
+          npm run build
+          npm publish ./dist --access public
+
+      - name: Add wasm release asset
+        shell: bash
+        run: |
+          cp packages/unluac-js/.wasm-build/unluac_wasm_bg.wasm release-assets/unluac_wasm_bg.wasm
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          fi
+
+          gh release upload "$TAG" release-assets/* --clobber

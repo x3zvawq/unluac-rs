@@ -7,7 +7,7 @@
 use unluac::decompile::DecompileDialect;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum LuaCaseDialect {
+pub enum LuaCaseDialect {
     Lua51,
     Lua52,
     Lua53,
@@ -18,7 +18,7 @@ pub(crate) enum LuaCaseDialect {
 }
 
 impl LuaCaseDialect {
-    pub(crate) const fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Lua51 => "lua5.1",
             Self::Lua52 => "lua5.2",
@@ -93,9 +93,9 @@ impl LuaCaseMatrixEntry {
 
 /// 展开后的 `(case, dialect)` 测试单元。
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) struct LuaCaseManifestEntry {
-    pub(crate) path: &'static str,
-    pub(crate) dialect: LuaCaseDialect,
+pub struct LuaCaseManifestEntry {
+    pub path: &'static str,
+    pub dialect: LuaCaseDialect,
     pub(crate) suites: LuaCaseSuites,
 }
 

@@ -16,6 +16,21 @@ pub enum ParseMode {
 }
 
 impl ParseMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Permissive => "permissive",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "strict" => Some(Self::Strict),
+            "permissive" => Some(Self::Permissive),
+            _ => None,
+        }
+    }
+
     pub(crate) const fn is_permissive(self) -> bool {
         matches!(self, Self::Permissive)
     }
@@ -30,10 +45,18 @@ pub enum StringEncoding {
 }
 
 impl StringEncoding {
-    pub(crate) const fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Utf8 => "utf-8",
             Self::Gbk => "gbk",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "utf8" | "utf-8" => Some(Self::Utf8),
+            "gbk" => Some(Self::Gbk),
+            _ => None,
         }
     }
 
@@ -75,6 +98,23 @@ pub enum StringDecodeMode {
     #[default]
     Strict,
     Lossy,
+}
+
+impl StringDecodeMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Lossy => "lossy",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "strict" => Some(Self::Strict),
+            "lossy" => Some(Self::Lossy),
+            _ => None,
+        }
+    }
 }
 
 /// 传给各 dialect parser 的共享选项。

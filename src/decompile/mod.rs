@@ -8,6 +8,7 @@ mod debug;
 mod error;
 mod options;
 mod pipeline;
+mod repo_debug;
 mod state;
 
 pub use crate::debug::{DebugColorMode, DebugDetail, DebugFilters};
@@ -29,4 +30,5 @@ pub use debug::{
 pub use error::DecompileError;
 pub use options::{DecompileDialect, DecompileOptions};
 pub use pipeline::{DecompileResult, decompile};
+pub use repo_debug::repo_debug_decompile_options;
 pub use state::{DecompileStage, DecompileState};

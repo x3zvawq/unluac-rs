@@ -22,5 +22,5 @@
 - 该库需要考虑到编译成wasm模块的方式分发，因此需要避免使用某些导致库无法编译为wasm模块的操作或者依赖。
 - 每一轮工作完成如果有发生代码库的变化的话，需要在总结的开头部分输出一条在代码块内的git提交记录，以说明当前轮次做了什么内容，并且应该按照`<type>(<scope>): <subject>`的规则，比如: `fix(ast): 修复短路表达式的性能黑洞`，不需要携带具体case的信息，只需要说明情况。
 - 每一轮工作完成如果修改了业务代码则需要通过一下两条命令进行验证。
-  - `cargo clippy --all-targets --all-features --locked -- -D warnings`
+  - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
   - `cargo unit-test --jobs 8`

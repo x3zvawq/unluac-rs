@@ -1,3 +1,4 @@
 [alias]
+unluac = "run -p unluac-cli --"
 lua = "run -p xtask --"
 unit-test = "run -p xtask -- test-unit"

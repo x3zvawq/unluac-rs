@@ -327,7 +327,10 @@ fn collapses_multi_target_pure_temp_handoff_back_into_original_bindings() {
                 values: vec![HirExpr::TempRef(seed_index), HirExpr::TempRef(seed_total)],
             })),
             HirStmt::Assign(Box::new(HirAssign {
-                targets: vec![HirLValue::Temp(carried_index), HirLValue::Temp(carried_total)],
+                targets: vec![
+                    HirLValue::Temp(carried_index),
+                    HirLValue::Temp(carried_total),
+                ],
                 values: vec![
                     HirExpr::Binary(Box::new(HirBinaryExpr {
                         op: HirBinaryOpKind::Add,

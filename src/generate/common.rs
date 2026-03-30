@@ -40,6 +40,25 @@ pub enum QuoteStyle {
     MinEscape,
 }
 
+impl QuoteStyle {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PreferDouble => "prefer-double",
+            Self::PreferSingle => "prefer-single",
+            Self::MinEscape => "min-escape",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "prefer-double" => Some(Self::PreferDouble),
+            "prefer-single" => Some(Self::PreferSingle),
+            "min-escape" => Some(Self::MinEscape),
+            _ => None,
+        }
+    }
+}
+
 /// 表构造器布局策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TableStyle {
@@ -47,4 +66,23 @@ pub enum TableStyle {
     #[default]
     Balanced,
     Expanded,
+}
+
+impl TableStyle {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Balanced => "balanced",
+            Self::Expanded => "expanded",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "compact" => Some(Self::Compact),
+            "balanced" => Some(Self::Balanced),
+            "expanded" => Some(Self::Expanded),
+            _ => None,
+        }
+    }
 }
