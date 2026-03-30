@@ -501,6 +501,11 @@ mod decompile_pipeline {
             generated.source
         );
         assert!(
+            generated.source.contains("do\n        global<const> *"),
+            "{}",
+            generated.source
+        );
+        assert!(
             generated.source.contains("local function fn(a)"),
             "{}",
             generated.source

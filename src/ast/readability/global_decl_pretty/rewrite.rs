@@ -6,11 +6,10 @@
 //! global 前导只会在“当前作用域已经有显式 global 证据”时才从观测推断，因为默认
 //! `global *` 与 stripped bytecode 下的纯声明形式并不总是可区分。
 
-use std::collections::BTreeSet;
-
 use super::super::ReadabilityContext;
 use super::super::walk::{BlockKind, ScopedAstRewritePass, rewrite_module_scoped};
-use super::facts::{BlockFacts, MissingGlobals};
+use super::collective::try_wrap_missing_collective_suffix;
+use super::facts::{BlockFacts, MissingGlobals, VisibleGlobals};
 use super::insert::insert_missing_global_decls;
 use super::merge::merge_seed_global_runs;
 use crate::ast::common::{AstBlock, AstDialectVersion, AstModule};
@@ -23,7 +22,7 @@ pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool
     let mut pass = GlobalDeclPrettyPass {
         infer_missing: context.target.version != AstDialectVersion::Lua55,
     };
-    rewrite_module_scoped(module, &BTreeSet::new(), &mut pass)
+    rewrite_module_scoped(module, &VisibleGlobals::default(), &mut pass)
 }
 
 struct GlobalDeclPrettyPass {
@@ -31,12 +30,12 @@ struct GlobalDeclPrettyPass {
 }
 
 impl ScopedAstRewritePass for GlobalDeclPrettyPass {
-    type Scope = BTreeSet<String>;
+    type Scope = VisibleGlobals;
 
     fn enter_block(
         &mut self,
         block: &mut AstBlock,
-        _kind: BlockKind,
+        kind: BlockKind,
         outer_declared: &Self::Scope,
     ) -> (bool, Self::Scope) {
         // AST build 只负责把字节码里显式存在的 `global ... = ...` 降回合法语法；
@@ -46,12 +45,22 @@ impl ScopedAstRewritePass for GlobalDeclPrettyPass {
         // 为同一作用域里剩余的 global 访问补齐声明，才能生成可重新编译的源码。
         let mut changed = merge_seed_global_runs(block);
         let facts = BlockFacts::collect(block);
-        let missing =
-            if self.infer_missing || facts.has_explicit_globals() || !outer_declared.is_empty() {
-                facts.infer_missing(outer_declared)
-            } else {
-                MissingGlobals::default()
-            };
+        let mut missing = if self.infer_missing
+            || facts.has_explicit_globals()
+            || outer_declared.has_explicit_gate()
+        {
+            facts.infer_missing(outer_declared)
+        } else {
+            MissingGlobals::default()
+        };
+        if !missing.is_empty()
+            && !self.infer_missing
+            && !facts.has_explicit_globals()
+            && try_wrap_missing_collective_suffix(block, kind, &missing)
+        {
+            missing = MissingGlobals::default();
+            changed = true;
+        }
         if !missing.is_empty() {
             insert_missing_global_decls(block, &missing);
             changed = true;

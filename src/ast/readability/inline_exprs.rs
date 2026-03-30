@@ -324,8 +324,10 @@ fn collapse_terminal_local_mechanical_runs(
         // 这里只处理“run 末尾这个 local 自己还会跨语句活下去”的情况：
         // 前面的 recovered local 只是为了把最终表达式拆成多个机械阶段，
         // 但末尾这个 binding 仍然是后续语句要继续引用的源码锚点。
-        if !matches!(sink_candidate, candidate::InlineCandidate::LocalAlias { .. })
-            || count_binding_uses_in_stmts(&old_stmts[run_end..], sink_candidate.binding()) == 0
+        if !matches!(
+            sink_candidate,
+            candidate::InlineCandidate::LocalAlias { .. }
+        ) || count_binding_uses_in_stmts(&old_stmts[run_end..], sink_candidate.binding()) == 0
         {
             new_stmts.push(old_stmts[index].clone());
             index += 1;

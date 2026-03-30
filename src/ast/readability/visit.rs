@@ -44,14 +44,18 @@ pub(super) fn visit_block(block: &AstBlock, visitor: &mut impl AstVisitor) {
     visit_block_with_kind(block, BlockKind::Regular, visitor);
 }
 
+pub(super) fn visit_stmt(stmt: &AstStmt, visitor: &mut impl AstVisitor) {
+    visit_stmt_impl(stmt, visitor);
+}
+
 fn visit_block_with_kind(block: &AstBlock, kind: BlockKind, visitor: &mut impl AstVisitor) {
     visitor.visit_block(block, kind);
     for stmt in &block.stmts {
-        visit_stmt(stmt, visitor);
+        visit_stmt_impl(stmt, visitor);
     }
 }
 
-fn visit_stmt(stmt: &AstStmt, visitor: &mut impl AstVisitor) {
+fn visit_stmt_impl(stmt: &AstStmt, visitor: &mut impl AstVisitor) {
     visitor.visit_stmt(stmt);
     traverse_stmt_children!(
         stmt,

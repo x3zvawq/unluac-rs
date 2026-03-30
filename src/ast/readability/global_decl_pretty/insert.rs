@@ -2,7 +2,8 @@
 //!
 //! 它依赖 `facts` 已经判定好的 missing globals，只负责插入 AST `GlobalDecl`，不会重新
 //! 计算哪些名字该声明成 const 或 none。
-//! 例如：块内首次写 `installer` 且未声明时，这里会补一条前置 `global installer`。
+//! 例如：块内首次写 `installer` 且未声明时，这里会补一条前置 `global installer`；
+//! 若上层已经决定要落成 collective gate，这里也只负责把 `global *` 这个 AST 节点造出来。
 
 use crate::ast::AstGlobalAttr;
 use crate::ast::common::{
@@ -33,6 +34,16 @@ pub(super) fn insert_missing_global_decls(block: &mut AstBlock, missing: &Missin
     new_stmts.extend(inserted);
     new_stmts.extend(old_stmts.into_iter().skip(insert_at));
     block.stmts = new_stmts;
+}
+
+pub(super) fn build_wildcard_global_decl(attr: AstGlobalAttr) -> AstStmt {
+    AstStmt::GlobalDecl(Box::new(AstGlobalDecl {
+        bindings: vec![AstGlobalBinding {
+            target: AstGlobalBindingTarget::Wildcard,
+            attr,
+        }],
+        values: Vec::new(),
+    }))
 }
 
 fn build_global_decl(names: &[String], attr: AstGlobalAttr) -> AstStmt {

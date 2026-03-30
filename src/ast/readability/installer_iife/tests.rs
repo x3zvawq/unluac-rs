@@ -127,8 +127,10 @@ fn make_lua55_readable(module: &AstModule) -> AstModule {
 }
 
 fn expect_installer_rewrite(module: &AstModule) -> (&AstLocalFunctionDecl, &AstCallStmt) {
-    let [AstStmt::LocalFunctionDecl(local_function), AstStmt::CallStmt(call_stmt)] =
-        module.body.stmts.as_slice()
+    let [
+        AstStmt::LocalFunctionDecl(local_function),
+        AstStmt::CallStmt(call_stmt),
+    ] = module.body.stmts.as_slice()
     else {
         panic!("expected installer iife to become local function decl plus call");
     };
@@ -359,7 +361,9 @@ fn names_installer_iife_when_export_uses_method_decl_on_receiver() {
         body: AstBlock {
             stmts: vec![AstStmt::CallStmt(Box::new(AstCallStmt {
                 call: AstCallKind::Call(Box::new(AstCallExpr {
-                    callee: AstExpr::FunctionExpr(Box::new(installer_function_with_method_export())),
+                    callee: AstExpr::FunctionExpr(
+                        Box::new(installer_function_with_method_export()),
+                    ),
                     args: vec![AstExpr::TableConstructor(Box::new(AstTableConstructor {
                         fields: Vec::new(),
                     }))],

@@ -293,3 +293,113 @@ fn lua55_infers_missing_globals_after_existing_leading_global_decl_run() {
     ));
     assert_eq!(inferred.bindings[0].attr, AstGlobalAttr::Const);
 }
+
+#[test]
+fn lua55_wraps_terminal_missing_const_globals_in_collective_do_block() {
+    let mut module = AstModule {
+        entry_function: HirProtoRef(0),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::GlobalDecl(Box::new(AstGlobalDecl {
+                    bindings: vec![crate::ast::AstGlobalBinding {
+                        target: AstGlobalBindingTarget::Name(crate::ast::AstGlobalName {
+                            text: "score".to_owned(),
+                        }),
+                        attr: AstGlobalAttr::None,
+                    }],
+                    values: vec![AstExpr::Integer(6)],
+                })),
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Local(LocalId(0)),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::FunctionExpr(Box::new(AstFunctionExpr {
+                        function: HirProtoRef(1),
+                        params: vec![ParamId(0)],
+                        is_vararg: false,
+                        named_vararg: None,
+                        body: AstBlock {
+                            stmts: vec![
+                                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                                    bindings: vec![AstLocalBinding {
+                                        id: AstBindingRef::Local(LocalId(1)),
+                                        attr: AstLocalAttr::None,
+                                        origin: crate::ast::AstLocalOrigin::Recovered,
+                                    }],
+                                    values: vec![AstExpr::Integer(1)],
+                                })),
+                                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                                    bindings: vec![AstLocalBinding {
+                                        id: AstBindingRef::Local(LocalId(2)),
+                                        attr: AstLocalAttr::None,
+                                        origin: crate::ast::AstLocalOrigin::Recovered,
+                                    }],
+                                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                                        callee: AstExpr::FieldAccess(Box::new(
+                                            crate::ast::AstFieldAccess {
+                                                base: AstExpr::Var(AstNameRef::Global(
+                                                    crate::ast::AstGlobalName {
+                                                        text: "math".to_owned(),
+                                                    },
+                                                )),
+                                                field: "max".to_owned(),
+                                            },
+                                        )),
+                                        args: vec![
+                                            AstExpr::Var(AstNameRef::Local(LocalId(1))),
+                                            AstExpr::Var(AstNameRef::Global(
+                                                crate::ast::AstGlobalName {
+                                                    text: "score".to_owned(),
+                                                },
+                                            )),
+                                        ],
+                                    }))],
+                                })),
+                                AstStmt::Return(Box::new(AstReturn {
+                                    values: vec![AstExpr::Var(AstNameRef::Local(LocalId(2)))],
+                                })),
+                            ],
+                        },
+                        captured_bindings: Default::default(),
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+            options: Default::default(),
+        }
+    ));
+
+    let [AstStmt::GlobalDecl(_), AstStmt::LocalDecl(local_decl)] = module.body.stmts.as_slice()
+    else {
+        panic!("expected explicit outer global and local function binding");
+    };
+    let [AstExpr::FunctionExpr(function)] = local_decl.values.as_slice() else {
+        panic!("expected function expression to remain in local decl");
+    };
+    let [AstStmt::LocalDecl(_), AstStmt::DoBlock(block)] = function.body.stmts.as_slice() else {
+        panic!("expected trailing collective do block");
+    };
+    let [
+        AstStmt::GlobalDecl(global_decl),
+        AstStmt::LocalDecl(_),
+        AstStmt::Return(_),
+    ] = block.stmts.as_slice()
+    else {
+        panic!("expected wildcard gate plus wrapped suffix");
+    };
+    assert!(matches!(
+        global_decl.bindings.as_slice(),
+        [crate::ast::AstGlobalBinding {
+            target: AstGlobalBindingTarget::Wildcard,
+            attr: AstGlobalAttr::Const,
+        }]
+    ));
+}

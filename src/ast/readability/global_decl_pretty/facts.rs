@@ -2,19 +2,41 @@
 //!
 //! 它依赖共享 visitor 在一次遍历里收集“显式 global、嵌套函数写入、读写观测”，不会在这里
 //! 直接插入或合并声明。
-//! 例如：块里读到 `print`、写到 `installer` 时，这里会分别记成常量/可写观测。
+//! 例如：块里读到 `print`、写到 `installer` 时，这里会分别记成常量/可写观测；
+//! 如果块里显式出现了 `global *`，这里也会把 collective gate 作为正式作用域事实留下来。
 
 use std::collections::BTreeSet;
 
 use crate::ast::common::{
-    AstBlock, AstExpr, AstFunctionDecl, AstFunctionExpr, AstFunctionName, AstGlobalBindingTarget,
-    AstLValue, AstNameRef, AstStmt,
+    AstBlock, AstExpr, AstFunctionDecl, AstFunctionExpr, AstFunctionName, AstGlobalAttr,
+    AstGlobalBindingTarget, AstLValue, AstNameRef, AstStmt,
 };
 
 use super::super::visit::{self, AstVisitor};
 
+#[derive(Clone, Default)]
+pub(super) struct VisibleGlobals {
+    names: BTreeSet<String>,
+    collective: Option<AstGlobalAttr>,
+}
+
+impl VisibleGlobals {
+    pub(super) fn has_explicit_gate(&self) -> bool {
+        self.collective.is_some() || !self.names.is_empty()
+    }
+
+    fn contains_name(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+
+    fn collective(&self) -> Option<AstGlobalAttr> {
+        self.collective
+    }
+}
+
 pub(super) struct BlockFacts {
     explicit_here: BTreeSet<String>,
+    explicit_collective_here: Option<AstGlobalAttr>,
     nested_written_here: BTreeSet<String>,
     observations: Vec<GlobalObservation>,
 }
@@ -26,18 +48,31 @@ impl BlockFacts {
 
         Self {
             explicit_here: collector.explicit_here,
+            explicit_collective_here: collector.explicit_collective_here,
             nested_written_here: collector.nested_written_here,
             observations: collector.observations,
         }
     }
 
-    pub(super) fn infer_missing(&self, outer_declared: &BTreeSet<String>) -> MissingGlobals {
+    pub(super) fn infer_missing(&self, outer_visible: &VisibleGlobals) -> MissingGlobals {
         let mut missing = MissingGlobals::default();
+        let visible_collective =
+            merge_collective_attr(outer_visible.collective(), self.explicit_collective_here);
         for observation in &self.observations {
-            if outer_declared.contains(&observation.name)
+            if outer_visible.contains_name(&observation.name)
                 || self.explicit_here.contains(&observation.name)
             {
                 continue;
+            }
+            match visible_collective {
+                Some(AstGlobalAttr::None) => continue,
+                Some(AstGlobalAttr::Const)
+                    if observation.kind == GlobalObservationKind::Read
+                        && !self.nested_written_here.contains(&observation.name) =>
+                {
+                    continue;
+                }
+                Some(AstGlobalAttr::Const) | None => {}
             }
             if observation.kind == GlobalObservationKind::Write
                 || self.nested_written_here.contains(&observation.name)
@@ -51,18 +86,20 @@ impl BlockFacts {
     }
 
     pub(super) fn has_explicit_globals(&self) -> bool {
-        !self.explicit_here.is_empty()
+        self.explicit_collective_here.is_some() || !self.explicit_here.is_empty()
     }
 
     pub(super) fn visible_globals(
         &self,
-        outer_declared: &BTreeSet<String>,
+        outer_visible: &VisibleGlobals,
         missing: &MissingGlobals,
-    ) -> BTreeSet<String> {
-        let mut visible = outer_declared.clone();
-        visible.extend(self.explicit_here.iter().cloned());
-        visible.extend(missing.none.iter().cloned());
-        visible.extend(missing.const_.iter().cloned());
+    ) -> VisibleGlobals {
+        let mut visible = outer_visible.clone();
+        visible.names.extend(self.explicit_here.iter().cloned());
+        visible.names.extend(missing.none.iter().cloned());
+        visible.names.extend(missing.const_.iter().cloned());
+        visible.collective =
+            merge_collective_attr(visible.collective, self.explicit_collective_here);
         visible
     }
 }
@@ -110,6 +147,7 @@ struct GlobalObservation {
 #[derive(Default)]
 struct GlobalFactsCollector {
     explicit_here: BTreeSet<String>,
+    explicit_collective_here: Option<AstGlobalAttr>,
     nested_written_here: BTreeSet<String>,
     observations: Vec<GlobalObservation>,
     function_depth: usize,
@@ -126,10 +164,16 @@ impl GlobalFactsCollector {
     fn note_global_decl_bindings(
         bindings: &[crate::ast::common::AstGlobalBinding],
         names: &mut BTreeSet<String>,
+        collective: &mut Option<AstGlobalAttr>,
     ) {
         for binding in bindings {
-            if let AstGlobalBindingTarget::Name(name) = &binding.target {
-                names.insert(name.text.clone());
+            match &binding.target {
+                AstGlobalBindingTarget::Name(name) => {
+                    names.insert(name.text.clone());
+                }
+                AstGlobalBindingTarget::Wildcard => {
+                    *collective = merge_collective_attr(*collective, Some(binding.attr));
+                }
             }
         }
     }
@@ -140,11 +184,17 @@ impl AstVisitor for GlobalFactsCollector {
         match stmt {
             AstStmt::GlobalDecl(global_decl) => {
                 if self.function_depth == 0 {
-                    Self::note_global_decl_bindings(&global_decl.bindings, &mut self.explicit_here);
+                    Self::note_global_decl_bindings(
+                        &global_decl.bindings,
+                        &mut self.explicit_here,
+                        &mut self.explicit_collective_here,
+                    );
                 } else {
+                    let mut nested_collective = None;
                     Self::note_global_decl_bindings(
                         &global_decl.bindings,
                         &mut self.nested_written_here,
+                        &mut nested_collective,
                     );
                 }
             }
@@ -213,5 +263,20 @@ fn global_declared_name(function_decl: &AstFunctionDecl) -> Option<String> {
     match &path.root {
         AstNameRef::Global(global) => Some(global.text.clone()),
         _ => None,
+    }
+}
+
+fn merge_collective_attr(
+    current: Option<AstGlobalAttr>,
+    next: Option<AstGlobalAttr>,
+) -> Option<AstGlobalAttr> {
+    match (current, next) {
+        (Some(AstGlobalAttr::None), _) | (_, Some(AstGlobalAttr::None)) => {
+            Some(AstGlobalAttr::None)
+        }
+        (Some(AstGlobalAttr::Const), _) | (_, Some(AstGlobalAttr::Const)) => {
+            Some(AstGlobalAttr::Const)
+        }
+        (None, None) => None,
     }
 }
