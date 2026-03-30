@@ -486,3 +486,254 @@ fn chains_method_calls_after_recovering_alias_scaffolding() {
             )
     ));
 }
+
+#[test]
+fn recovers_method_alias_inside_truthy_ternary_local_initializer() {
+    let receiver = LocalId(0);
+    let field_alias = LocalId(1);
+    let result = LocalId(2);
+    let mut module = AstModule {
+        entry_function: HirProtoRef(0),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Local(field_alias),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Local(receiver)),
+                        field: "find".to_owned(),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Local(result),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::LogicalOr(Box::new(crate::ast::AstLogicalExpr {
+                        lhs: AstExpr::LogicalAnd(Box::new(crate::ast::AstLogicalExpr {
+                            lhs: AstExpr::Call(Box::new(AstCallExpr {
+                                callee: AstExpr::Var(AstNameRef::Local(field_alias)),
+                                args: vec![
+                                    AstExpr::Var(AstNameRef::Local(receiver)),
+                                    AstExpr::String("%-".to_owned()),
+                                ],
+                            })),
+                            rhs: AstExpr::String("neg".to_owned()),
+                        })),
+                        rhs: AstExpr::String("pos".to_owned()),
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        super::ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+            options: ReadabilityOptions::default(),
+        },
+    ));
+
+    assert!(matches!(
+        module.body.stmts.as_slice(),
+        [AstStmt::LocalDecl(local_decl)]
+            if matches!(
+                local_decl.values.as_slice(),
+                [AstExpr::LogicalOr(or_expr)]
+                    if matches!(
+                        &or_expr.lhs,
+                        AstExpr::LogicalAnd(and_expr)
+                            if matches!(
+                                &and_expr.lhs,
+                                AstExpr::MethodCall(call)
+                                    if matches!(call.receiver, AstExpr::Var(AstNameRef::Local(LocalId(0))))
+                                        && call.method == "find"
+                                        && matches!(call.args.as_slice(), [AstExpr::String(pattern)] if pattern == "%-")
+                            ) && matches!(&and_expr.rhs, AstExpr::String(value) if value == "neg")
+                    ) && matches!(&or_expr.rhs, AstExpr::String(value) if value == "pos")
+            )
+    ));
+}
+
+#[test]
+fn recovers_direct_method_call_inside_truthy_ternary_local_initializer() {
+    let mut module = AstModule {
+        entry_function: HirProtoRef(0),
+        body: AstBlock {
+            stmts: vec![AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                bindings: vec![AstLocalBinding {
+                    id: AstBindingRef::Local(LocalId(0)),
+                    attr: AstLocalAttr::None,
+                    origin: crate::ast::AstLocalOrigin::Recovered,
+                }],
+                values: vec![AstExpr::LogicalOr(Box::new(crate::ast::AstLogicalExpr {
+                    lhs: AstExpr::LogicalAnd(Box::new(crate::ast::AstLogicalExpr {
+                        lhs: AstExpr::Call(Box::new(AstCallExpr {
+                            callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                                base: AstExpr::Var(AstNameRef::Local(LocalId(1))),
+                                field: "find".to_owned(),
+                            })),
+                            args: vec![
+                                AstExpr::Var(AstNameRef::Local(LocalId(1))),
+                                AstExpr::String("%-".to_owned()),
+                            ],
+                        })),
+                        rhs: AstExpr::String("neg".to_owned()),
+                    })),
+                    rhs: AstExpr::String("pos".to_owned()),
+                }))],
+            }))],
+        },
+    };
+
+    assert!(run_function_sugar_to_fixed_point(
+        &mut module,
+        AstTargetDialect::new(crate::ast::AstDialectVersion::LuaJit),
+    ));
+
+    assert!(matches!(
+        module.body.stmts.as_slice(),
+        [AstStmt::LocalDecl(local_decl)]
+            if matches!(
+                local_decl.values.as_slice(),
+                [AstExpr::LogicalOr(or_expr)]
+                    if matches!(
+                        &or_expr.lhs,
+                        AstExpr::LogicalAnd(and_expr)
+                            if matches!(
+                                &and_expr.lhs,
+                                AstExpr::MethodCall(call)
+                                    if matches!(call.receiver, AstExpr::Var(AstNameRef::Local(LocalId(1))))
+                                        && call.method == "find"
+                                        && matches!(call.args.as_slice(), [AstExpr::String(pattern)] if pattern == "%-")
+                            ) && matches!(&and_expr.rhs, AstExpr::String(value) if value == "neg")
+                    ) && matches!(&or_expr.rhs, AstExpr::String(value) if value == "pos")
+            )
+    ));
+}
+
+#[test]
+fn keeps_direct_call_in_truthy_ternary_when_receiver_is_not_a_simple_name() {
+    let mut module = AstModule {
+        entry_function: HirProtoRef(0),
+        body: AstBlock {
+            stmts: vec![AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                bindings: vec![AstLocalBinding {
+                    id: AstBindingRef::Local(LocalId(0)),
+                    attr: AstLocalAttr::None,
+                    origin: crate::ast::AstLocalOrigin::Recovered,
+                }],
+                values: vec![AstExpr::LogicalOr(Box::new(crate::ast::AstLogicalExpr {
+                    lhs: AstExpr::LogicalAnd(Box::new(crate::ast::AstLogicalExpr {
+                        lhs: AstExpr::Call(Box::new(AstCallExpr {
+                            callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                                base: AstExpr::Call(Box::new(AstCallExpr {
+                                    callee: AstExpr::Var(AstNameRef::Local(LocalId(1))),
+                                    args: vec![],
+                                })),
+                                field: "find".to_owned(),
+                            })),
+                            args: vec![
+                                AstExpr::Call(Box::new(AstCallExpr {
+                                    callee: AstExpr::Var(AstNameRef::Local(LocalId(1))),
+                                    args: vec![],
+                                })),
+                                AstExpr::String("%-".to_owned()),
+                            ],
+                        })),
+                        rhs: AstExpr::String("neg".to_owned()),
+                    })),
+                    rhs: AstExpr::String("pos".to_owned()),
+                }))],
+            }))],
+        },
+    };
+
+    assert!(!run_function_sugar_to_fixed_point(
+        &mut module,
+        AstTargetDialect::new(crate::ast::AstDialectVersion::LuaJit),
+    ));
+    assert!(matches!(
+        module.body.stmts.as_slice(),
+        [AstStmt::LocalDecl(local_decl)]
+            if matches!(local_decl.values.as_slice(), [AstExpr::LogicalOr(_)])
+    ));
+}
+
+#[test]
+fn recovers_method_alias_inside_nested_call_argument() {
+    let receiver = LocalId(0);
+    let field_alias = LocalId(1);
+    let result = LocalId(2);
+    let mut module = AstModule {
+        entry_function: HirProtoRef(0),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Local(field_alias),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Local(receiver)),
+                        field: "match".to_owned(),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: AstBindingRef::Local(result),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Global(crate::ast::AstGlobalName {
+                            text: "tonumber".to_owned(),
+                        })),
+                        args: vec![AstExpr::Call(Box::new(AstCallExpr {
+                            callee: AstExpr::Var(AstNameRef::Local(field_alias)),
+                            args: vec![
+                                AstExpr::Var(AstNameRef::Local(receiver)),
+                                AstExpr::String("(%d+)i$".to_owned()),
+                            ],
+                        }))],
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        super::ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+            options: ReadabilityOptions::default(),
+        },
+    ));
+
+    assert!(matches!(
+        module.body.stmts.as_slice(),
+        [AstStmt::LocalDecl(local_decl)]
+            if matches!(
+                local_decl.values.as_slice(),
+                [AstExpr::Call(call)]
+                    if matches!(
+                        call.args.as_slice(),
+                        [AstExpr::MethodCall(method_call)]
+                            if matches!(
+                                &method_call.receiver,
+                                AstExpr::Var(AstNameRef::Local(LocalId(0)))
+                            ) && method_call.method == "match"
+                                && matches!(
+                                    method_call.args.as_slice(),
+                                    [AstExpr::String(pattern)] if pattern == "(%d+)i$"
+                                )
+                    )
+            )
+    ));
+}

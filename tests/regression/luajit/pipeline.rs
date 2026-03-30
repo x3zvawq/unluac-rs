@@ -57,4 +57,35 @@ mod decompile_pipeline {
 
         assert!(generated.source.contains("goto L1"), "{}", generated.source);
     }
+
+    #[test]
+    fn imaginary_wave_fold_generate_stage_recovers_truthy_ternary_method_call() {
+        let chunk = crate::support::compile_lua_case(
+            "luajit",
+            "tests/lua_cases/luajit/02_imaginary_wave_fold.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Luajit,
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("luajit imaginary wave fold fixture should decompile successfully");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should leave generated source in state");
+
+        assert!(
+            generated
+                .source
+                .contains(":find(\"%-\") and \"neg\" or \"pos\""),
+            "{}",
+            generated.source
+        );
+    }
 }

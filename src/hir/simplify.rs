@@ -6,6 +6,7 @@
 //! 是细节实现”的混淆。
 
 mod boolean_shells;
+mod branch_value_exprs;
 mod carried_locals;
 mod close_scopes;
 mod closure_self_capture;
@@ -133,14 +134,23 @@ fn run_exposure_round(module: &mut HirModule, timings: &TimingCollector) -> bool
     // 这一阶段只放“前一阶段会显露出新形状”的 pass。
     //
     // 例如 `temp-inline / locals` 之后，机械寄存器搬运可能会暴露出
-    // `local values = {}; values[1] = ...` 这类更像源码的建表片段。
+    // `local sign; if cond then sign = ... else sign = ... end` 或
+    // `local values = {}; values[1] = ...` 这类更像源码的片段。
     // 这里显式保留第二轮 table constructor，而不是把它伪装成普通 fixed-point 噪音。
-    apply_timed_proto_pass(
+    let mut changed = false;
+    changed |= apply_timed_proto_pass(
+        module,
+        timings,
+        "branch-value-exprs",
+        branch_value_exprs::collapse_branch_value_locals_in_proto,
+    );
+    changed |= apply_timed_proto_pass(
         module,
         timings,
         "table-constructors-post-locals",
         table_constructors::stabilize_table_constructors_in_proto,
-    )
+    );
+    changed
 }
 
 fn run_cleanup_round(module: &mut HirModule, timings: &TimingCollector) -> bool {

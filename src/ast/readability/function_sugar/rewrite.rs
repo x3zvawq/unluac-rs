@@ -2,7 +2,9 @@
 //!
 //! 它依赖 `analysis/direct/forwarded/constructor/chain/method_alias` 已提供的局部规则，
 //! 只负责按固定顺序在 block 上收敛这些 sugar，不会回头改 AST build 语义。
-//! 例如：一段 `local f = function...; t.f = f` 会先在这里被路由到 forwarded 规则处理。
+//! 例如：一段 `local f = function...; t.f = f` 会先在这里被路由到 forwarded 规则处理；
+//! 而已经在 HIR 收成值表达式的 `obj.field(obj, ...) and ... or ...`，则会在这里继续交给
+//! `method_alias` 统一判断是否值得收回 `obj:field(...)`。
 
 use std::collections::BTreeSet;
 

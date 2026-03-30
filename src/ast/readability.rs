@@ -182,7 +182,10 @@ const TEMP_MATERIALIZE_STAGE: ReadabilityStage = stage(
 // 3. `materialize-temps` 必须先于 `installer-iife/function-sugar`，否则后者会把仍处在
 //    临时槽位里的机械节点误当成稳定源码 binding，也没法给新引入的局部名分配 AST 自己的
 //    synthetic local。
-// 4. `global-decl-pretty` 和 `luajit-goto-safety` 放在后面，只消费前面已经稳定下来的 AST。
+// 4. `function-sugar` 现在同时承接局部 alias 和已经物化出来的机械 direct call method sugar。
+//    branch-local 值壳已经前推到 HIR；到了 AST 这里只剩 `obj.field(obj, ...)` 这种保守
+//    调用形状，需要在同一个 owner 里统一决定能否收回 `obj:field(...)`。
+// 5. `global-decl-pretty` 和 `luajit-goto-safety` 放在后面，只消费前面已经稳定下来的 AST。
 const READABILITY_STAGES: &[ReadabilityStage] = &[
     STRUCTURAL_CLEANUP_STAGE,
     LOCAL_COALESCE_STAGE,

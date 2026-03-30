@@ -16,6 +16,7 @@ use super::super::common::{
     AstLogicalExpr, AstModule, AstStmt, AstUnaryExpr, AstUnaryOpKind,
 };
 use super::ReadabilityContext;
+use super::expr_analysis::is_always_truthy_expr;
 use super::visit::{self, AstVisitor};
 use super::walk::{self, AstRewritePass, BlockKind};
 
@@ -87,7 +88,7 @@ fn prettify_truthy_ternary(expr: &AstExpr) -> Option<AstExpr> {
     if unary.op != AstUnaryOpKind::Not {
         return None;
     }
-    if !expr_is_always_truthy(&and_expr.rhs) || !expr_is_always_truthy(&or_expr.rhs) {
+    if !is_always_truthy_expr(&and_expr.rhs) || !is_always_truthy_expr(&or_expr.rhs) {
         return None;
     }
 
@@ -448,33 +449,6 @@ fn negate_relational_expr(binary: AstBinaryExpr) -> AstExpr {
             op: AstUnaryOpKind::Not,
             expr: AstExpr::Binary(Box::new(binary)),
         })),
-    }
-}
-
-fn expr_is_always_truthy(expr: &AstExpr) -> bool {
-    match expr {
-        AstExpr::Boolean(true)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::TableConstructor(_)
-        | AstExpr::FunctionExpr(_) => true,
-        AstExpr::Nil
-        | AstExpr::Boolean(false)
-        | AstExpr::Var(_)
-        | AstExpr::FieldAccess(_)
-        | AstExpr::IndexAccess(_)
-        | AstExpr::Unary(_)
-        | AstExpr::Binary(_)
-        | AstExpr::LogicalAnd(_)
-        | AstExpr::LogicalOr(_)
-        | AstExpr::Call(_)
-        | AstExpr::MethodCall(_)
-        | AstExpr::SingleValue(_)
-        | AstExpr::VarArg => false,
     }
 }
 

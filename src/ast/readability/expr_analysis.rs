@@ -178,6 +178,33 @@ pub(super) fn is_direct_return_constructor_inline_expr(expr: &AstExpr) -> bool {
     matches!(expr, AstExpr::TableConstructor(_))
 }
 
+pub(super) fn is_always_truthy_expr(expr: &AstExpr) -> bool {
+    match expr {
+        AstExpr::Boolean(true)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::TableConstructor(_)
+        | AstExpr::FunctionExpr(_) => true,
+        AstExpr::Nil
+        | AstExpr::Boolean(false)
+        | AstExpr::Var(_)
+        | AstExpr::FieldAccess(_)
+        | AstExpr::IndexAccess(_)
+        | AstExpr::Unary(_)
+        | AstExpr::Binary(_)
+        | AstExpr::LogicalAnd(_)
+        | AstExpr::LogicalOr(_)
+        | AstExpr::Call(_)
+        | AstExpr::MethodCall(_)
+        | AstExpr::SingleValue(_)
+        | AstExpr::VarArg => false,
+    }
+}
+
 fn is_named_field_chain_expr(expr: &AstExpr) -> bool {
     let AstExpr::FieldAccess(access) = expr else {
         return false;
