@@ -9,13 +9,16 @@ use crate::transformer::dialect::lowering::{
     PendingLowInstr, PendingLoweringState, TargetPlaceholder, WordCodeIndex,
 };
 use crate::transformer::{
-    AccessBase, CallInstr, CallKind, CloseInstr, ConstRef, GenericForCallInstr, LowInstr,
-    LoweredChunk, LoweredProto, LoweringMap, MethodNameHint, ProtoRef, Reg, RegRange, ResultPack,
-    ReturnInstr, TailCallInstr, TbcInstr, TransformError, UpvalueRef, ValuePack,
+    AccessBase, BinaryOpKind, CallInstr, CallKind, CloseInstr, ConstRef, GenericForCallInstr,
+    LowInstr, LoweredChunk, LoweredProto, LoweringMap, MethodNameHint, ProtoRef, Reg, RegRange,
+    ResultPack, ReturnInstr, TailCallInstr, TbcInstr, TransformError, UpvalueRef, ValueOperand,
+    ValuePack,
 };
 
 pub(crate) const BITRK: u16 = 1 << 8;
 pub(crate) const LFIELDS_PER_FLUSH: u32 = 50;
+const TM_ADD_EVENT: u8 = 6;
+const TM_SUB_EVENT: u8 = 7;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HelperJumpInfo {
@@ -205,6 +208,55 @@ where
         close_from: (spec.close_from)(a),
         next_index: helper_index + 1,
     })
+}
+
+pub(crate) fn addi_binary_shape<Opcode, InspectHelper, RawPcAt>(
+    raw: &RawProto,
+    word_code_index: &WordCodeIndex,
+    raw_index: usize,
+    immediate: i16,
+    helper_opcode: Opcode,
+    inspect_helper: InspectHelper,
+    raw_pc_at: RawPcAt,
+) -> Result<(BinaryOpKind, ValueOperand), TransformError>
+where
+    Opcode: Copy + Eq,
+    InspectHelper: Fn(&RawInstr) -> Result<(Opcode, i16, u8), TransformError>,
+    RawPcAt: Fn(&RawInstr) -> u32 + Copy,
+{
+    let default_shape = (
+        BinaryOpKind::Add,
+        ValueOperand::Integer(i64::from(immediate)),
+    );
+    if immediate >= 0 {
+        return Ok(default_shape);
+    }
+
+    let raw_pc = raw_pc_at(&raw.common.instructions[raw_index]);
+    let Some(helper_index) = word_code_index.raw_index_at_pc(raw_pc + 1) else {
+        return Ok(default_shape);
+    };
+    let (found_opcode, helper_immediate, event) =
+        inspect_helper(&raw.common.instructions[helper_index])?;
+
+    // `ADDI -1` 本身无法区分源码是 `x - 1` 还是 `x + -1`。
+    // 真正的语义线索来自紧随其后的 `MMBINI`：只有 helper 明确标成 `__sub`
+    // 且立即数幅值吻合时，我们才把它规范成共享 low-IR 的减法形状。
+    if found_opcode == helper_opcode
+        && event == TM_SUB_EVENT
+        && i32::from(helper_immediate) == -i32::from(immediate)
+    {
+        return Ok((
+            BinaryOpKind::Sub,
+            ValueOperand::Integer(i64::from(-i32::from(immediate))),
+        ));
+    }
+
+    if found_opcode == helper_opcode && event == TM_ADD_EVENT {
+        return Ok(default_shape);
+    }
+
+    Ok(default_shape)
 }
 
 pub(crate) fn helper_jump_asj<

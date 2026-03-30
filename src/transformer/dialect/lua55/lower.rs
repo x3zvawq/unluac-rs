@@ -12,11 +12,12 @@ use crate::transformer::dialect::lowering::{
 use crate::transformer::dialect::puc_lua::{
     GenericForPairAbxSpec, GenericForPairInfo as GenericForPair, HelperJumpAsjSpec,
     HelperJumpInfo as HelperJump, access_base_for_upvalue as shared_access_base_for_upvalue,
-    call_args_pack, call_result_pack, checked_const_ref, checked_proto_ref, checked_upvalue_ref,
-    emit_call, emit_generic_for_call, emit_generic_for_loop, emit_numeric_for_init,
-    emit_numeric_for_loop, emit_return, emit_tail_call, emit_tforprep, finish_lowered_proto,
-    generic_for_pair_abx, helper_jump_asj, jump_target_forward_bx, lower_chunk_with_env,
-    numeric_for_regs, prepare_env_lowering, range_len_inclusive, reg_from_u8, return_pack,
+    addi_binary_shape, call_args_pack, call_result_pack, checked_const_ref, checked_proto_ref,
+    checked_upvalue_ref, emit_call, emit_generic_for_call, emit_generic_for_loop,
+    emit_numeric_for_init, emit_numeric_for_loop, emit_return, emit_tail_call, emit_tforprep,
+    finish_lowered_proto, generic_for_pair_abx, helper_jump_asj, jump_target_forward_bx,
+    lower_chunk_with_env, numeric_for_regs, prepare_env_lowering, range_len_inclusive, reg_from_u8,
+    return_pack,
 };
 use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
@@ -443,15 +444,24 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::AddI => {
                     let (a, b, sc, _) = expect_absck(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
+                    let (op, rhs) = addi_binary_shape(
+                        self.raw,
+                        &self.word_code_index,
+                        raw_index,
+                        sc,
+                        Lua55Opcode::MMBinI,
+                        inspect_lua55_asbck_helper,
+                        instr_pc,
+                    )?;
                     self.invalidate_written_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::BinaryOp(BinaryOpInstr {
                             dst,
-                            op: BinaryOpKind::Add,
+                            op,
                             lhs: ValueOperand::Reg(reg_from_u8(b)),
-                            rhs: ValueOperand::Integer(i64::from(sc)),
+                            rhs,
                         })),
                     );
                     raw_index += 1;
@@ -1198,6 +1208,14 @@ fn inspect_lua55_abx_helper(raw: &RawInstr) -> Result<(Lua55Opcode, u32, u8, u32
         .expect("lua55 lowerer should only decode lua55 instructions");
     let (a, bx) = expect_abx(extra.pc, opcode, operands)?;
     Ok((opcode, extra.pc, a, bx))
+}
+
+fn inspect_lua55_asbck_helper(raw: &RawInstr) -> Result<(Lua55Opcode, i16, u8), TransformError> {
+    let (opcode, operands, extra) = raw
+        .lua55()
+        .expect("lua55 lowerer should only decode lua55 instructions");
+    let (_a, sb, c, _k) = expect_asbck(extra.pc, opcode, operands)?;
+    Ok((opcode, sb, c))
 }
 
 fn raw_pc_at(raw: &RawProto, index: usize) -> u32 {

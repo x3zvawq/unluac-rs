@@ -170,6 +170,40 @@ mod decompile_pipeline {
         assert_eq!(result.state.completed_stage, Some(DecompileStage::Hir));
         let dump = &result.debug_output[0].content;
         assert!(
+            dump.contains("return l0[p0], l0[(p0 - 1)], l0[\"n\"], ..."),
+            "{dump}"
+        );
+        assert!(!dump.contains("entry-reg"), "{dump}");
+        assert!(!dump.contains("unresolved("), "{dump}");
+    }
+
+    #[test]
+    fn lua55_hir_stage_preserves_add_negative_named_vararg_index_shape() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.5",
+            "tests/lua_cases/lua5.5/09_named_vararg_index_addneg.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua55,
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.5 hir stage should keep add-negative fixture shape");
+
+        assert_eq!(result.state.completed_stage, Some(DecompileStage::Hir));
+        let dump = &result.debug_output[0].content;
+        assert!(
             dump.contains("return l0[p0], l0[(p0 + -1)], l0[\"n\"], ..."),
             "{dump}"
         );
@@ -598,7 +632,7 @@ mod decompile_pipeline {
         assert!(
             generated
                 .source
-                .contains("return value[a], value[a + -1], value.n, ..."),
+                .contains("return value[a], value[a - 1], value.n, ..."),
             "{}",
             generated.source
         );
@@ -606,6 +640,53 @@ mod decompile_pipeline {
             generated
                 .source
                 .contains("print(\"var55-getvarg\", fn(2, 4, 7, 5, 9))"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local result ="),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
+    fn lua55_generate_stage_preserves_add_negative_named_vararg_index_shape() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.5",
+            "tests/lua_cases/lua5.5/09_named_vararg_index_addneg.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua55,
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.5 generate stage should preserve add-negative fixture shape");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should leave generated source in state");
+        assert!(
+            generated.source.contains("local function fn(a, ...value)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("return value[a], value[a + -1], value.n, ..."),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("print(\"var55-getvarg-addneg\", fn(2, 4, 7, 5, 9))"),
             "{}",
             generated.source
         );
