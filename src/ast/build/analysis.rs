@@ -1,4 +1,13 @@
 //! AST build：局部分析和小型统计 helper。
+//!
+//! 这些 helper 只服务 HIR -> AST lowering 所需的合法语法化，不负责源码美化。
+//! 例如：
+//! - 统计 label 最大值，给 AST fallback 的 synthetic label 让位
+//! - 收集 block 里真正被引用到的 temp，供 AST build 决定哪些 temp 需要先 hoist 成保守 local
+//! - 在需要 hoist temp 时，按 block 里的首次出现顺序返回，避免后续 `statement_merge`
+//!   因为声明顺序和首次赋值顺序错位而下沉失败
+//!
+//! 它不会在这里猜源码级 sugar，也不会替 Readability 做后层整形。
 
 use std::collections::BTreeSet;
 
@@ -50,19 +59,33 @@ pub(super) fn collect_close_temps(block: &HirBlock) -> BTreeSet<TempId> {
     temps
 }
 
-pub(super) fn collect_referenced_temps(block: &HirBlock) -> BTreeSet<TempId> {
-    let mut temps = BTreeSet::new();
-    collect_referenced_temps_in_block(block, &mut temps);
-    temps
+pub(super) fn collect_referenced_temps_in_encounter_order(block: &HirBlock) -> Vec<TempId> {
+    let mut collector = ReferencedTempCollector::default();
+    collect_referenced_temps_in_block(block, &mut collector);
+    collector.ordered
 }
 
-fn collect_referenced_temps_in_block(block: &HirBlock, temps: &mut BTreeSet<TempId>) {
+#[derive(Default)]
+struct ReferencedTempCollector {
+    seen: BTreeSet<TempId>,
+    ordered: Vec<TempId>,
+}
+
+impl ReferencedTempCollector {
+    fn note_temp(&mut self, temp: TempId) {
+        if self.seen.insert(temp) {
+            self.ordered.push(temp);
+        }
+    }
+}
+
+fn collect_referenced_temps_in_block(block: &HirBlock, temps: &mut ReferencedTempCollector) {
     for stmt in &block.stmts {
         collect_referenced_temps_in_stmt(stmt, temps);
     }
 }
 
-fn collect_referenced_temps_in_stmt(stmt: &HirStmt, temps: &mut BTreeSet<TempId>) {
+fn collect_referenced_temps_in_stmt(stmt: &HirStmt, temps: &mut ReferencedTempCollector) {
     match stmt {
         HirStmt::LocalDecl(local_decl) => {
             for value in &local_decl.values {
@@ -132,10 +155,10 @@ fn collect_referenced_temps_in_stmt(stmt: &HirStmt, temps: &mut BTreeSet<TempId>
     }
 }
 
-fn collect_referenced_temps_in_lvalue(target: &HirLValue, temps: &mut BTreeSet<TempId>) {
+fn collect_referenced_temps_in_lvalue(target: &HirLValue, temps: &mut ReferencedTempCollector) {
     match target {
         HirLValue::Temp(temp) => {
-            temps.insert(*temp);
+            temps.note_temp(*temp);
         }
         HirLValue::TableAccess(access) => {
             collect_referenced_temps_in_expr(&access.base, temps);
@@ -145,17 +168,17 @@ fn collect_referenced_temps_in_lvalue(target: &HirLValue, temps: &mut BTreeSet<T
     }
 }
 
-fn collect_referenced_temps_in_call(call: &HirCallExpr, temps: &mut BTreeSet<TempId>) {
+fn collect_referenced_temps_in_call(call: &HirCallExpr, temps: &mut ReferencedTempCollector) {
     collect_referenced_temps_in_expr(&call.callee, temps);
     for arg in &call.args {
         collect_referenced_temps_in_expr(arg, temps);
     }
 }
 
-fn collect_referenced_temps_in_expr(expr: &HirExpr, temps: &mut BTreeSet<TempId>) {
+fn collect_referenced_temps_in_expr(expr: &HirExpr, temps: &mut ReferencedTempCollector) {
     match expr {
         HirExpr::TempRef(temp) => {
-            temps.insert(*temp);
+            temps.note_temp(*temp);
         }
         HirExpr::TableAccess(access) => {
             collect_referenced_temps_in_expr(&access.base, temps);
@@ -216,7 +239,10 @@ fn collect_referenced_temps_in_expr(expr: &HirExpr, temps: &mut BTreeSet<TempId>
     }
 }
 
-fn collect_referenced_temps_in_target(target: &HirDecisionTarget, temps: &mut BTreeSet<TempId>) {
+fn collect_referenced_temps_in_target(
+    target: &HirDecisionTarget,
+    temps: &mut ReferencedTempCollector,
+) {
     if let HirDecisionTarget::Expr(expr) = target {
         collect_referenced_temps_in_expr(expr, temps);
     }

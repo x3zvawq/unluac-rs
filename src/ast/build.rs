@@ -9,7 +9,8 @@ use std::collections::BTreeSet;
 use crate::hir::{HirBlock, HirGenericFor, HirModule, HirStmt, TempId};
 
 use self::analysis::{
-    block_has_continue, collect_close_temps, collect_referenced_temps, max_hir_label_id,
+    block_has_continue, collect_close_temps, collect_referenced_temps_in_encounter_order,
+    max_hir_label_id,
 };
 use super::common::{
     AstAssign, AstBindingRef, AstBlock, AstCallStmt, AstExpr, AstGenericFor, AstGoto, AstIf,
@@ -68,15 +69,11 @@ impl<'a> AstLowerer<'a> {
         root_close_temps: Option<&BTreeSet<TempId>>,
         continue_target: Option<AstLabelId>,
     ) -> Result<AstBlock, AstLowerError> {
-        let proto = &self.module.protos[proto_index];
         let mut stmts = Vec::new();
         if let Some(close_temps) = root_close_temps {
-            let referenced_temps = collect_referenced_temps(block);
-            let temp_bindings = proto
-                .temps
-                .iter()
-                .copied()
-                .filter(|temp| referenced_temps.contains(temp) && !close_temps.contains(temp))
+            let temp_bindings = collect_referenced_temps_in_encounter_order(block)
+                .into_iter()
+                .filter(|temp| !close_temps.contains(temp))
                 .map(|temp| {
                     self.recovered_local_binding(AstBindingRef::Temp(temp), AstLocalAttr::None)
                 })

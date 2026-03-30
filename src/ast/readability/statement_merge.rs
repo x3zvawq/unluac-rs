@@ -10,9 +10,16 @@
 //!   会合成 `local a, b = x, y`
 //! - 提前 hoist 出来的 `local t0; if cond then t0 = x end` 会尽量把 `t0` 下沉回
 //!   真正使用它的分支/循环体里
+//! - 如果同一条 hoisted 声明里前面的 carried binding 还要跨分支后缀继续活着，
+//!   后面的 `staged` 之类一次性临时 binding 仍应允许单独沉回某个分支
+//! - 但如果当前位置之前已经有会跳到更后面 label 的 forward goto，
+//!   这里会停止继续下沉，避免生成“goto 跳进 local 作用域”的非法 Lua
+
+use std::collections::BTreeSet;
 
 use super::super::common::{
-    AstBindingRef, AstBlock, AstLValue, AstLocalAttr, AstLocalDecl, AstModule, AstNameRef, AstStmt,
+    AstBindingRef, AstBlock, AstLabelId, AstLValue, AstLocalAttr, AstLocalDecl, AstModule,
+    AstNameRef, AstStmt,
 };
 use super::ReadabilityContext;
 use super::binding_flow::{
@@ -20,6 +27,7 @@ use super::binding_flow::{
     stmt_references_any_binding,
 };
 use super::expr_analysis::{expr_complexity, is_copy_like_expr};
+use super::visit::{self, AstVisitor};
 use super::walk::{self, AstRewritePass, BlockKind};
 
 const ADJACENT_LOCAL_VALUE_COMPLEXITY_LIMIT: usize = 4;
@@ -137,6 +145,10 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock) -> bool {
         let mut sink_changed = false;
         let mut lookahead = index + 1;
         while lookahead < block.stmts.len() && !remaining.is_empty() {
+            if block_has_forward_goto_past_index(&block.stmts, lookahead) {
+                lookahead += 1;
+                continue;
+            }
             if let Some(merged) =
                 try_sink_hoisted_decl_into_stmt(&remaining, &block.stmts[lookahead])
             {
@@ -147,13 +159,13 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock) -> bool {
                 lookahead += 1;
                 continue;
             }
-            if let Some((rewritten, consumed)) = try_sink_hoisted_decl_into_nested_stmt(
+            if let Some(attempt) = try_sink_hoisted_decl_into_nested_stmt_anywhere(
                 &remaining,
                 &block.stmts[lookahead],
                 &block.stmts[(lookahead + 1)..],
             ) {
-                block.stmts[lookahead] = rewritten;
-                remaining.drain(..consumed);
+                block.stmts[lookahead] = attempt.rewritten;
+                remaining.drain(attempt.start..(attempt.start + attempt.consumed));
                 sink_changed = true;
                 lookahead += 1;
                 continue;
@@ -182,6 +194,49 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock) -> bool {
         index += 1;
     }
     changed
+}
+
+struct NestedSinkAttempt {
+    rewritten: AstStmt,
+    start: usize,
+    consumed: usize,
+}
+
+fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
+    pending: &[super::super::common::AstLocalBinding],
+    stmt: &AstStmt,
+    suffix: &[AstStmt],
+) -> Option<NestedSinkAttempt> {
+    for start in 0..pending.len() {
+        if count_binding_uses_in_stmts(suffix, pending[start].id) != 0 {
+            continue;
+        }
+
+        let mut end = start;
+        while end < pending.len() && count_binding_uses_in_stmts(suffix, pending[end].id) == 0 {
+            end += 1;
+        }
+
+        // 这里允许跳过前面仍需跨后缀存活的 carried binding，只把后面“只在某个嵌套块里
+        // 用完”的 hoisted local 单独沉进去；否则像
+        // `local next, staged; if ... else staged = ...; next = staged end`
+        // 这种形状会因为 `next` 还要在 if 之后继续用，把 `staged` 也一起卡在块顶。
+        for slice_end in (start + 1..=end).rev() {
+            if let Some((rewritten, consumed)) = try_sink_hoisted_decl_into_nested_stmt(
+                &pending[start..slice_end],
+                stmt,
+                suffix,
+            ) {
+                return Some(NestedSinkAttempt {
+                    rewritten,
+                    start,
+                    consumed,
+                });
+            }
+        }
+    }
+
+    None
 }
 
 fn try_sink_hoisted_decl_into_nested_stmt(
@@ -304,6 +359,10 @@ fn sink_pending_bindings_into_block(
     let mut index = 0usize;
     while index < block.stmts.len() && consumed < pending.len() {
         let remaining = &pending[consumed..];
+        if block_has_forward_goto_past_index(&block.stmts, index) {
+            index += 1;
+            continue;
+        }
         if let Some(merged) = try_sink_hoisted_decl_into_stmt(remaining, &block.stmts[index]) {
             let merged_len = merged.bindings.len();
             block.stmts[index] = AstStmt::LocalDecl(Box::new(merged));
@@ -461,6 +520,50 @@ fn local_binding_matches_target(binding: AstBindingRef, target: &AstLValue) -> b
             temp == *target_temp
         }
         _ => false,
+    }
+}
+
+fn block_has_forward_goto_past_index(stmts: &[AstStmt], index: usize) -> bool {
+    let future_labels = stmts[(index + 1)..]
+        .iter()
+        .filter_map(|stmt| match stmt {
+            AstStmt::Label(label) => Some(label.id),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if future_labels.is_empty() {
+        return false;
+    }
+    stmts[..index]
+        .iter()
+        .any(|stmt| stmt_contains_goto_to_any(stmt, &future_labels))
+}
+
+fn stmt_contains_goto_to_any(stmt: &AstStmt, targets: &BTreeSet<AstLabelId>) -> bool {
+    let mut visitor = GotoTargetVisitor {
+        targets,
+        found: false,
+    };
+    visit::visit_stmt(stmt, &mut visitor);
+    visitor.found
+}
+
+struct GotoTargetVisitor<'a> {
+    targets: &'a BTreeSet<AstLabelId>,
+    found: bool,
+}
+
+impl AstVisitor for GotoTargetVisitor<'_> {
+    fn visit_stmt(&mut self, stmt: &AstStmt) {
+        if let AstStmt::Goto(goto_stmt) = stmt
+            && self.targets.contains(&goto_stmt.target)
+        {
+            self.found = true;
+        }
+    }
+
+    fn visit_function_expr(&mut self, _function: &super::super::common::AstFunctionExpr) -> bool {
+        false
     }
 }
 

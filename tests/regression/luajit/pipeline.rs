@@ -223,4 +223,62 @@ mod decompile_pipeline {
             generated.source
         );
     }
+
+    #[test]
+    fn imaginary_branch_mesh_generate_stage_avoids_hoisted_empty_locals() {
+        let chunk = crate::support::compile_lua_case(
+            "luajit",
+            "tests/lua_cases/luajit/08_imaginary_branch_mesh.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Luajit,
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("luajit imaginary branch mesh fixture should decompile successfully");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should leave generated source in state");
+
+        assert!(
+            generated
+                .source
+                .lines()
+                .all(|line| !line.trim_start().starts_with("local ") || line.contains(" = ")),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.lines().any(|line| {
+                let Some((lhs, _)) = line.split_once(" = ") else {
+                    return false;
+                };
+                !line.trim_start().starts_with("local ") && lhs.contains(',')
+            }),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .lines()
+                .any(|line| line.contains("local ") && line.contains("= tostring(")),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .lines()
+                .any(|line| line.contains("local ") && line.contains("= tonumber(")),
+            "{}",
+            generated.source
+        );
+    }
 }

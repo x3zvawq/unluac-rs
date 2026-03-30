@@ -5,8 +5,8 @@
 use super::ReadabilityContext;
 use crate::ast::common::{AstCallExpr, AstCallKind, AstIndexAccess, AstLocalBinding};
 use crate::ast::{
-    AstExpr, AstLValue, AstLocalAttr, AstLocalDecl, AstModule, AstNameRef, AstStmt,
-    AstTargetDialect, make_readable_with_options,
+    AstBlock, AstExpr, AstGoto, AstIf, AstLabel, AstLabelId, AstLValue, AstLocalAttr,
+    AstLocalDecl, AstModule, AstNameRef, AstStmt, AstTargetDialect, make_readable_with_options,
 };
 use crate::hir::{LocalId, TempId};
 
@@ -450,4 +450,114 @@ fn sinks_hoisted_temp_decl_into_generic_for_body_assignment() {
     };
     assert_eq!(local_decl.bindings.len(), 2);
     assert_eq!(local_decl.values.len(), 1);
+}
+
+#[test]
+fn does_not_sink_hoisted_temp_past_forward_goto_into_later_label() {
+    let temp = TempId(0);
+    let label = AstLabelId(1);
+    let module = AstModule {
+        entry_function: Default::default(),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Temp(temp),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: Vec::new(),
+                })),
+                AstStmt::If(Box::new(AstIf {
+                    cond: AstExpr::Boolean(true),
+                    then_block: AstBlock {
+                        stmts: vec![AstStmt::Goto(Box::new(AstGoto { target: label }))],
+                    },
+                    else_block: None,
+                })),
+                AstStmt::Assign(Box::new(crate::ast::AstAssign {
+                    targets: vec![AstLValue::Name(AstNameRef::Temp(temp))],
+                    values: vec![AstExpr::Integer(1)],
+                })),
+                AstStmt::Label(Box::new(AstLabel { id: label })),
+            ],
+        },
+    };
+
+    let module = apply_statement_merge(&module);
+    assert!(matches!(module.body.stmts[0], AstStmt::LocalDecl(_)));
+    assert!(matches!(module.body.stmts[2], AstStmt::Assign(_)));
+}
+
+#[test]
+fn sinks_tail_hoisted_temp_into_exclusive_else_branch_when_leading_binding_stays_carried() {
+    let carried = TempId(0);
+    let staged = TempId(1);
+    let module = AstModule {
+        entry_function: Default::default(),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![
+                        AstLocalBinding {
+                            id: crate::ast::AstBindingRef::Temp(carried),
+                            attr: AstLocalAttr::None,
+                            origin: crate::ast::AstLocalOrigin::Recovered,
+                        },
+                        AstLocalBinding {
+                            id: crate::ast::AstBindingRef::Temp(staged),
+                            attr: AstLocalAttr::None,
+                            origin: crate::ast::AstLocalOrigin::Recovered,
+                        },
+                    ],
+                    values: Vec::new(),
+                })),
+                AstStmt::If(Box::new(AstIf {
+                    cond: AstExpr::Boolean(true),
+                    then_block: AstBlock {
+                        stmts: vec![AstStmt::Assign(Box::new(crate::ast::AstAssign {
+                            targets: vec![AstLValue::Name(AstNameRef::Temp(carried))],
+                            values: vec![AstExpr::Integer(1)],
+                        }))],
+                    },
+                    else_block: Some(AstBlock {
+                        stmts: vec![
+                            AstStmt::Assign(Box::new(crate::ast::AstAssign {
+                                targets: vec![AstLValue::Name(AstNameRef::Temp(staged))],
+                                values: vec![AstExpr::Integer(2)],
+                            })),
+                            AstStmt::Assign(Box::new(crate::ast::AstAssign {
+                                targets: vec![AstLValue::Name(AstNameRef::Temp(carried))],
+                                values: vec![AstExpr::Var(AstNameRef::Temp(staged))],
+                            })),
+                        ],
+                    }),
+                })),
+                AstStmt::Return(Box::new(crate::ast::AstReturn {
+                    values: vec![AstExpr::Var(AstNameRef::Temp(carried))],
+                })),
+            ],
+        },
+    };
+
+    let module = apply_statement_merge(&module);
+    let AstStmt::LocalDecl(top_local) = &module.body.stmts[0] else {
+        panic!("expected top-level local decl");
+    };
+    assert_eq!(top_local.bindings.len(), 1);
+    assert_eq!(top_local.bindings[0].id, crate::ast::AstBindingRef::Temp(carried));
+
+    let AstStmt::If(if_stmt) = &module.body.stmts[1] else {
+        panic!("expected if stmt after top-level local decl");
+    };
+    let else_block = if_stmt
+        .else_block
+        .as_ref()
+        .expect("fixture should keep else block");
+    let AstStmt::LocalDecl(staged_local) = &else_block.stmts[0] else {
+        panic!("expected staged temp to sink into else branch");
+    };
+    assert_eq!(staged_local.bindings.len(), 1);
+    assert_eq!(staged_local.bindings[0].id, crate::ast::AstBindingRef::Temp(staged));
+    assert_eq!(staged_local.values, vec![AstExpr::Integer(2)]);
 }

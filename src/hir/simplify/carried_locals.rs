@@ -7,6 +7,7 @@
 //!
 //! 这个 pass 只吃两类很窄的 handoff：
 //! - 纯别名交棒：`assign tX = lY; ... tX ...`
+//! - 多目标纯别名交棒：`assign tA, tB = sA, sB; ... tA/tB ...`
 //! - 更新后交棒：`assign tX = (sY + 1); ... sY = tX`
 //!
 //! 满足这几个条件时，说明这个 block 已经把“后半段状态身份”完全交给了 temp；
@@ -18,6 +19,8 @@
 //! 例子：
 //! - 输入：`local l0 = 1; do t4 = l0; ::L1:: if t4 < 3 then t4 = t4 + 1; goto L1 end end`
 //! - 输出：`local l0 = 1; do ::L1:: if l0 < 3 then l0 = l0 + 1; goto L1 end end`
+//! - 输入：`assign t8, t9 = t1, t2; ... assign t8, t9 = step(t8), next`
+//! - 输出：`... assign t1, t2 = step(t1), next`
 //! - 输入：`assign t3 = (t24 + 1); if cond(t3) then assign t23, t24 = step(t3), t3 end`
 //! - 输出：`assign t24 = (t24 + 1); if cond(t24) then assign t23 = step(t24) end`
 
@@ -43,6 +46,10 @@ fn collapse_block_handoffs(block: &mut HirBlock) -> bool {
     let mut index = 0;
 
     while index < block.stmts.len() {
+        if try_collapse_pure_binding_handoffs(block, index) {
+            changed = true;
+            continue;
+        }
         if try_collapse_pure_local_handoff(block, index) {
             changed = true;
             continue;
@@ -57,6 +64,30 @@ fn collapse_block_handoffs(block: &mut HirBlock) -> bool {
     }
 
     changed
+}
+
+fn try_collapse_pure_binding_handoffs(block: &mut HirBlock, index: usize) -> bool {
+    let Some(rewrites) = pure_binding_handoff_seed(&block.stmts[index]) else {
+        return false;
+    };
+
+    let suffix = &block.stmts[index + 1..];
+    if suffix.is_empty()
+        || rewrites.iter().any(|rewrite| {
+            suffix_mentions_binding(suffix, rewrite.to)
+                || !suffix_mentions_temp(suffix, rewrite.from)
+        })
+    {
+        return false;
+    }
+
+    let mut pass = TempToBindingPass { rewrites };
+    if !rewrite_stmts(&mut block.stmts[index + 1..], &mut pass) {
+        return false;
+    }
+
+    block.stmts.remove(index);
+    true
 }
 
 fn try_collapse_pure_local_handoff(block: &mut HirBlock, index: usize) -> bool {
@@ -127,10 +158,47 @@ fn try_collapse_binding_update_handoff(block: &mut HirBlock, index: usize) -> bo
     true
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 enum CarryBinding {
     Local(LocalId),
     Temp(TempId),
+}
+
+#[derive(Clone, Copy)]
+struct TempBindingRewrite {
+    from: TempId,
+    to: CarryBinding,
+}
+
+fn pure_binding_handoff_seed(stmt: &HirStmt) -> Option<Vec<TempBindingRewrite>> {
+    let HirStmt::Assign(assign) = stmt else {
+        return None;
+    };
+    if assign.targets.len() < 2 || assign.targets.len() != assign.values.len() {
+        return None;
+    }
+
+    let mut seen_targets = std::collections::BTreeSet::new();
+    let mut seen_bindings = std::collections::BTreeSet::new();
+    let mut rewrites = Vec::with_capacity(assign.targets.len());
+    for (target, value) in assign.targets.iter().zip(&assign.values) {
+        let HirLValue::Temp(target_temp) = target else {
+            return None;
+        };
+        let binding = match value {
+            HirExpr::LocalRef(local) => CarryBinding::Local(*local),
+            HirExpr::TempRef(temp) => CarryBinding::Temp(*temp),
+            _ => return None,
+        };
+        if !seen_targets.insert(*target_temp) || !seen_bindings.insert(binding) {
+            return None;
+        }
+        rewrites.push(TempBindingRewrite {
+            from: *target_temp,
+            to: binding,
+        });
+    }
+    Some(rewrites)
 }
 
 fn update_handoff_seed(stmt: &HirStmt) -> Option<(TempId, CarryBinding)> {
@@ -345,6 +413,48 @@ impl HirRewritePass for TempToTempPass {
     }
 }
 
+struct TempToBindingPass {
+    rewrites: Vec<TempBindingRewrite>,
+}
+
+impl TempToBindingPass {
+    fn binding_for_temp(&self, temp: TempId) -> Option<CarryBinding> {
+        self.rewrites
+            .iter()
+            .find_map(|rewrite| (rewrite.from == temp).then_some(rewrite.to))
+    }
+}
+
+impl HirRewritePass for TempToBindingPass {
+    fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
+        let HirExpr::TempRef(temp) = expr else {
+            return false;
+        };
+        let Some(binding) = self.binding_for_temp(*temp) else {
+            return false;
+        };
+        *expr = match binding {
+            CarryBinding::Local(local) => HirExpr::LocalRef(local),
+            CarryBinding::Temp(temp) => HirExpr::TempRef(temp),
+        };
+        true
+    }
+
+    fn rewrite_lvalue(&mut self, lvalue: &mut HirLValue) -> bool {
+        let HirLValue::Temp(temp) = lvalue else {
+            return false;
+        };
+        let Some(binding) = self.binding_for_temp(*temp) else {
+            return false;
+        };
+        *lvalue = match binding {
+            CarryBinding::Local(local) => HirLValue::Local(local),
+            CarryBinding::Temp(temp) => HirLValue::Temp(temp),
+        };
+        true
+    }
+}
+
 fn local_handoff_seed(stmt: &HirStmt) -> Option<(TempId, LocalId)> {
     let HirStmt::Assign(assign) = stmt else {
         return None;
@@ -367,6 +477,15 @@ fn suffix_mentions_local(stmts: &[HirStmt], local: LocalId) -> bool {
     collector.mentioned
 }
 
+fn suffix_mentions_binding(stmts: &[HirStmt], binding: CarryBinding) -> bool {
+    let mut collector = BindingMentionCollector {
+        binding,
+        mentioned: false,
+    };
+    visit_stmts(stmts, &mut collector);
+    collector.mentioned
+}
+
 fn suffix_mentions_temp(stmts: &[HirStmt], temp: TempId) -> bool {
     let mut collector = TempMentionCollector {
         temp,
@@ -374,6 +493,29 @@ fn suffix_mentions_temp(stmts: &[HirStmt], temp: TempId) -> bool {
     };
     visit_stmts(stmts, &mut collector);
     collector.mentioned
+}
+
+struct BindingMentionCollector {
+    binding: CarryBinding,
+    mentioned: bool,
+}
+
+impl HirVisitor for BindingMentionCollector {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        self.mentioned |= match (self.binding, expr) {
+            (CarryBinding::Local(binding), HirExpr::LocalRef(local)) => binding == *local,
+            (CarryBinding::Temp(binding), HirExpr::TempRef(temp)) => binding == *temp,
+            _ => false,
+        };
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        self.mentioned |= match (self.binding, lvalue) {
+            (CarryBinding::Local(binding), HirLValue::Local(local)) => binding == *local,
+            (CarryBinding::Temp(binding), HirLValue::Temp(temp)) => binding == *temp,
+            _ => false,
+        };
+    }
 }
 
 struct TempToLocalPass {

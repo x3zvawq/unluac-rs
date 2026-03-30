@@ -128,6 +128,22 @@ const CONTROL_FLOW_PRETTY_STAGE: ReadabilityStage = stage(
     }],
 );
 
+const POST_CONTROL_FLOW_STATEMENT_MERGE_STAGE: ReadabilityStage = stage_with_cleanup(
+    "post-control-flow-statement-merge",
+    &[ReadabilityPass {
+        name: "statement-merge-post-control-flow",
+        apply: statement_merge::apply,
+    }],
+);
+
+const POST_CONTROL_FLOW_LOCAL_COALESCE_STAGE: ReadabilityStage = stage_with_cleanup(
+    "post-control-flow-local-coalesce",
+    &[ReadabilityPass {
+        name: "local-coalesce-post-control-flow",
+        apply: local_coalesce::apply,
+    }],
+);
+
 const SHORT_CIRCUIT_PRETTY_STAGE: ReadabilityStage = stage(
     "short-circuit-pretty",
     &[ReadabilityPass {
@@ -177,6 +193,11 @@ const TEMP_MATERIALIZE_STAGE: ReadabilityStage = stage(
 // Stage 顺序本身就是 readability 契约的一部分：
 // 1. 先把最机械的 local/stmt 壳压平，避免后续 sugar 看见被过度拆开的 AST。
 // 2. 再做 access / control-flow / expr sugar，让表达式和结构更接近源码。
+//    控制流整理之后，原先被 label/goto 壳挡住的 hoisted temp 往往会重新暴露成普通相邻
+//    assign 形状，所以这里会补一轮已有的 statement-merge，而不是平行新长一个 pass。
+//    同理，某些 carried local 直到 `branch_pretty` 把 goto 网收成普通 `if-else` 之后，
+//    才能稳定看出“这个 seed local 正在吸收前面 hoist 出来的 carried temp”；
+//    这里继续复用已有的 `local_coalesce`，而不是为 post-branch 形状再长一个新 pass。
 //    `inline-exprs` 可能会重新露出 `"name"` 这类字符串索引，所以 access sugar
 //    要在表达式内联之后再补一轮，避免新暴露的 key 停在 `["n"]` 这种半糖形态。
 // 3. `materialize-temps` 必须先于 `installer-iife/function-sugar`，否则后者会把仍处在
@@ -193,6 +214,8 @@ const READABILITY_STAGES: &[ReadabilityStage] = &[
     LOOP_HEADER_MERGE_STAGE,
     ACCESS_SUGAR_STAGE,
     CONTROL_FLOW_PRETTY_STAGE,
+    POST_CONTROL_FLOW_STATEMENT_MERGE_STAGE,
+    POST_CONTROL_FLOW_LOCAL_COALESCE_STAGE,
     EXPR_INLINE_STAGE,
     SHORT_CIRCUIT_PRETTY_STAGE,
     TEMP_MATERIALIZE_STAGE,

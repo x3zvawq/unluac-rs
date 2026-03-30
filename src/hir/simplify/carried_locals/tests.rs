@@ -305,6 +305,68 @@ fn keeps_updated_handoff_without_direct_writeback() {
     ));
 }
 
+#[test]
+fn collapses_multi_target_pure_temp_handoff_back_into_original_bindings() {
+    let seed_index = TempId(0);
+    let seed_total = TempId(1);
+    let carried_index = TempId(2);
+    let carried_total = TempId(3);
+    let mut proto = empty_proto(
+        Vec::new(),
+        vec![seed_index, seed_total, carried_index, carried_total],
+        vec![
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(seed_index), HirLValue::Temp(seed_total)],
+                values: vec![HirExpr::Int64(1), HirExpr::Int64(2)],
+            })),
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![
+                    HirLValue::Temp(carried_index),
+                    HirLValue::Temp(carried_total),
+                ],
+                values: vec![HirExpr::TempRef(seed_index), HirExpr::TempRef(seed_total)],
+            })),
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(carried_index), HirLValue::Temp(carried_total)],
+                values: vec![
+                    HirExpr::Binary(Box::new(HirBinaryExpr {
+                        op: HirBinaryOpKind::Add,
+                        lhs: HirExpr::TempRef(carried_index),
+                        rhs: HirExpr::Int64(1),
+                    })),
+                    HirExpr::TempRef(carried_total),
+                ],
+            })),
+            HirStmt::Return(Box::new(HirReturn {
+                values: vec![
+                    HirExpr::TempRef(carried_index),
+                    HirExpr::TempRef(carried_total),
+                ],
+            })),
+        ],
+    );
+
+    assert!(collapse_carried_local_handoffs_in_proto(&mut proto));
+    assert!(matches!(
+        proto.body.stmts.as_slice(),
+        [HirStmt::Assign(_), HirStmt::Assign(assign), HirStmt::Return(ret)]
+            if matches!(
+                assign.targets.as_slice(),
+                [HirLValue::Temp(first), HirLValue::Temp(second)]
+                    if *first == seed_index && *second == seed_total
+            ) && matches!(
+                assign.values.as_slice(),
+                [HirExpr::Binary(binary), HirExpr::TempRef(total)]
+                    if matches!(binary.lhs, HirExpr::TempRef(index) if index == seed_index)
+                        && *total == seed_total
+            ) && matches!(
+                ret.values.as_slice(),
+                [HirExpr::TempRef(first), HirExpr::TempRef(second)]
+                    if *first == seed_index && *second == seed_total
+            )
+    ));
+}
+
 fn empty_proto(locals: Vec<LocalId>, temps: Vec<TempId>, stmts: Vec<HirStmt>) -> HirProto {
     HirProto {
         id: HirProtoRef(0),
