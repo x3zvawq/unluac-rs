@@ -4,7 +4,7 @@
 
 use crate::hir::{
     HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirExpr, HirIf, HirLValue, HirLocalDecl,
-    HirProto, HirProtoRef, HirReturn, HirStmt, LocalId, TempId,
+    HirProto, HirProtoRef, HirReturn, HirStmt, HirUnaryExpr, HirUnaryOpKind, LocalId, TempId,
 };
 use crate::parser::{ProtoLineRange, ProtoSignature};
 
@@ -110,6 +110,198 @@ fn keeps_handoff_when_original_local_is_still_used_after_seed() {
             HirStmt::Return(ret),
         ] if matches!(seed.targets.as_slice(), [HirLValue::Temp(id)] if *id == temp)
             && matches!(ret.values.as_slice(), [HirExpr::TempRef(id)] if *id == temp)
+    ));
+}
+
+#[test]
+fn collapses_updated_temp_handoff_back_into_carried_temp() {
+    let total = TempId(0);
+    let carried = TempId(1);
+    let next = TempId(2);
+    let mut proto = empty_proto(
+        Vec::new(),
+        vec![total, carried, next],
+        vec![
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(total), HirLValue::Temp(carried)],
+                values: vec![HirExpr::Int64(0), HirExpr::Int64(0)],
+            })),
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(next)],
+                values: vec![HirExpr::Binary(Box::new(HirBinaryExpr {
+                    op: HirBinaryOpKind::Add,
+                    lhs: HirExpr::TempRef(carried),
+                    rhs: HirExpr::Int64(1),
+                }))],
+            })),
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::Binary(Box::new(HirBinaryExpr {
+                    op: HirBinaryOpKind::Le,
+                    lhs: HirExpr::TempRef(next),
+                    rhs: HirExpr::Int64(10),
+                })),
+                then_block: HirBlock {
+                    stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(total), HirLValue::Temp(carried)],
+                        values: vec![
+                            HirExpr::Binary(Box::new(HirBinaryExpr {
+                                op: HirBinaryOpKind::Add,
+                                lhs: HirExpr::TempRef(total),
+                                rhs: HirExpr::Binary(Box::new(HirBinaryExpr {
+                                    op: HirBinaryOpKind::Mul,
+                                    lhs: HirExpr::TempRef(next),
+                                    rhs: HirExpr::Int64(2),
+                                })),
+                            })),
+                            HirExpr::TempRef(next),
+                        ],
+                    }))],
+                },
+                else_block: Some(HirBlock {
+                    stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(total), HirLValue::Temp(carried)],
+                        values: vec![
+                            HirExpr::Binary(Box::new(HirBinaryExpr {
+                                op: HirBinaryOpKind::Add,
+                                lhs: HirExpr::Binary(Box::new(HirBinaryExpr {
+                                    op: HirBinaryOpKind::Add,
+                                    lhs: HirExpr::TempRef(total),
+                                    rhs: HirExpr::TempRef(next),
+                                })),
+                                rhs: HirExpr::Int64(5),
+                            })),
+                            HirExpr::TempRef(next),
+                        ],
+                    }))],
+                }),
+            })),
+        ],
+    );
+
+    assert!(collapse_carried_local_handoffs_in_proto(&mut proto));
+    assert!(matches!(
+        proto.body.stmts.as_slice(),
+        [
+            HirStmt::Assign(_),
+            HirStmt::Assign(seed),
+            HirStmt::If(if_stmt),
+        ] if matches!(seed.targets.as_slice(), [HirLValue::Temp(id)] if *id == carried)
+            && matches!(
+                seed.values.as_slice(),
+                [HirExpr::Binary(binary)]
+                    if matches!(binary.lhs, HirExpr::TempRef(id) if id == carried)
+            )
+            && matches!(
+                if_stmt.cond,
+                HirExpr::Binary(ref binary)
+                    if matches!(binary.lhs, HirExpr::TempRef(id) if id == carried)
+            )
+            && matches!(
+                if_stmt.then_block.stmts.as_slice(),
+                [HirStmt::Assign(assign)]
+                    if matches!(assign.targets.as_slice(), [HirLValue::Temp(id)] if *id == total)
+                        && matches!(
+                            assign.values.as_slice(),
+                            [HirExpr::Binary(binary)]
+                                if matches!(
+                                    binary.rhs,
+                                    HirExpr::Binary(ref rhs)
+                                        if matches!(rhs.lhs, HirExpr::TempRef(id) if id == carried)
+                                )
+                        )
+            ) && matches!(
+                if_stmt.else_block.as_ref().map(|block| block.stmts.as_slice()),
+                Some([HirStmt::Assign(assign)])
+                    if matches!(assign.targets.as_slice(), [HirLValue::Temp(id)] if *id == total)
+                        && matches!(
+                            assign.values.as_slice(),
+                            [HirExpr::Binary(binary)]
+                                if matches!(
+                                    binary.lhs,
+                                    HirExpr::Binary(ref lhs)
+                                        if matches!(lhs.rhs, HirExpr::TempRef(id) if id == carried)
+                                )
+                        )
+            )
+    ));
+}
+
+#[test]
+fn keeps_updated_handoff_when_old_carried_value_stays_observable() {
+    let carried = TempId(0);
+    let next = TempId(1);
+    let mut proto = empty_proto(
+        Vec::new(),
+        vec![carried, next],
+        vec![
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(carried)],
+                values: vec![HirExpr::Int64(0)],
+            })),
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(next)],
+                values: vec![HirExpr::Binary(Box::new(HirBinaryExpr {
+                    op: HirBinaryOpKind::Add,
+                    lhs: HirExpr::TempRef(carried),
+                    rhs: HirExpr::Int64(1),
+                }))],
+            })),
+            HirStmt::Return(Box::new(HirReturn {
+                values: vec![HirExpr::TempRef(next), HirExpr::TempRef(carried)],
+            })),
+        ],
+    );
+
+    assert!(!collapse_carried_local_handoffs_in_proto(&mut proto));
+    assert!(matches!(
+        proto.body.stmts.as_slice(),
+        [
+            HirStmt::Assign(_),
+            HirStmt::Assign(seed),
+            HirStmt::Return(ret),
+        ] if matches!(seed.targets.as_slice(), [HirLValue::Temp(id)] if *id == next)
+            && matches!(
+                ret.values.as_slice(),
+                [HirExpr::TempRef(first), HirExpr::TempRef(second)]
+                    if *first == next && *second == carried
+            )
+    ));
+}
+
+#[test]
+fn keeps_updated_handoff_without_direct_writeback() {
+    let carried = TempId(0);
+    let next = TempId(1);
+    let mut proto = empty_proto(
+        Vec::new(),
+        vec![carried, next],
+        vec![
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(carried)],
+                values: vec![HirExpr::Int64(7)],
+            })),
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(next)],
+                values: vec![HirExpr::Unary(Box::new(HirUnaryExpr {
+                    op: HirUnaryOpKind::Neg,
+                    expr: HirExpr::TempRef(carried),
+                }))],
+            })),
+            HirStmt::Return(Box::new(HirReturn {
+                values: vec![HirExpr::TempRef(next)],
+            })),
+        ],
+    );
+
+    assert!(!collapse_carried_local_handoffs_in_proto(&mut proto));
+    assert!(matches!(
+        proto.body.stmts.as_slice(),
+        [
+            HirStmt::Assign(_),
+            HirStmt::Assign(seed),
+            HirStmt::Return(ret),
+        ] if matches!(seed.targets.as_slice(), [HirLValue::Temp(id)] if *id == next)
+            && matches!(ret.values.as_slice(), [HirExpr::TempRef(id)] if *id == next)
     ));
 }
 
