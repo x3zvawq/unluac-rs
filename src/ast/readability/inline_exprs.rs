@@ -21,7 +21,8 @@ use super::super::common::{AstBindingRef, AstBlock, AstModule, AstStmt};
 use super::ReadabilityContext;
 use super::binding_flow::{count_binding_uses_in_stmt, count_binding_uses_in_stmts};
 use super::binding_tree::{
-    expr_references_binding, stmt_has_access_base_binding_use, stmt_has_nested_binding_use,
+    expr_references_binding, stmt_has_access_base_binding_use,
+    stmt_has_direct_call_arg_binding_use, stmt_has_index_binding_use, stmt_has_nested_binding_use,
 };
 use super::walk::{self, AstRewritePass, BlockKind};
 
@@ -101,7 +102,24 @@ fn rewrite_current_block(block: &mut AstBlock, options: ReadabilityOptions) -> b
             && matches!(next_stmt, AstStmt::Assign(_))
             && candidate::is_lookup_inline_expr(value)
             && stmt_has_access_base_binding_use(next_stmt, candidate.binding());
-        if !candidate.allows_expr_with_policy(value, policy) && !allows_special_lookup_access_base {
+        let allows_special_index_sink = matches!(
+            candidate,
+            candidate::InlineCandidate::LocalAlias {
+                origin: super::super::common::AstLocalOrigin::Recovered,
+                ..
+            }
+        ) && matches!(policy, InlinePolicy::Conservative)
+            && matches!(next_stmt, AstStmt::Assign(_))
+            && super::expr_analysis::is_mechanical_run_inline_expr(value)
+            && stmt_has_index_binding_use(next_stmt, candidate.binding());
+        let effective_policy = if allows_special_index_sink {
+            InlinePolicy::MechanicalRun
+        } else {
+            policy
+        };
+        if !candidate.allows_expr_with_policy(value, effective_policy)
+            && !allows_special_lookup_access_base
+        {
             new_stmts.push(old_stmts[index].clone());
             index += 1;
             continue;
@@ -113,16 +131,36 @@ fn rewrite_current_block(block: &mut AstBlock, options: ReadabilityOptions) -> b
         }
 
         let mut rewritten_next = next_stmt.clone();
+        let mut rewrite_policy = effective_policy;
         if !rewrite_stmt_use_sites_with_policy(
             &mut rewritten_next,
             candidate,
             value,
             options,
-            policy,
+            rewrite_policy,
         ) {
-            new_stmts.push(old_stmts[index].clone());
-            index += 1;
-            continue;
+            if matches!(policy, InlinePolicy::AliasInitializerChain)
+                && candidate::is_recallable_inline_expr(value)
+                && stmt_has_direct_call_arg_binding_use(next_stmt, candidate.binding())
+            {
+                rewritten_next = next_stmt.clone();
+                rewrite_policy = InlinePolicy::ExtendedCallChain;
+                if !rewrite_stmt_use_sites_with_policy(
+                    &mut rewritten_next,
+                    candidate,
+                    value,
+                    options,
+                    rewrite_policy,
+                ) {
+                    new_stmts.push(old_stmts[index].clone());
+                    index += 1;
+                    continue;
+                }
+            } else {
+                new_stmts.push(old_stmts[index].clone());
+                index += 1;
+                continue;
+            }
         }
 
         new_stmts.push(rewritten_next);

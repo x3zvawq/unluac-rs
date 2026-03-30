@@ -137,4 +137,43 @@ mod decompile_pipeline {
             generated.source
         );
     }
+
+    #[test]
+    fn bit_cdata_pipeline_generate_stage_recovers_loop_inline_shapes() {
+        let chunk = crate::support::compile_lua_case(
+            "luajit",
+            "tests/lua_cases/luajit/04_bit_cdata_pipeline.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Luajit,
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("luajit bit cdata pipeline fixture should decompile successfully");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should leave generated source in state");
+
+        assert!(
+            generated
+                .source
+                .lines()
+                .any(|line| line.contains("bxor(tonumber(") && line.contains("tonumber(")),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.lines().any(|line| line.contains("[#")
+                && line.contains("+ 1]")
+                && line.contains("string.format")),
+            "{}",
+            generated.source
+        );
+    }
 }

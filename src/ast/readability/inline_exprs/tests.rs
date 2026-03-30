@@ -720,6 +720,160 @@ fn inlines_lookup_alias_into_adjacent_field_assign_target_base() {
 }
 
 #[test]
+fn inlines_recovered_call_alias_into_adjacent_local_initializer_call_arg() {
+    let mixed = LocalId(0);
+    let acc = LocalId(1);
+    let stages = LocalId(2);
+    let index = LocalId(3);
+    let bxor = LocalId(4);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(mixed),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "tonumber".to_owned(),
+                        })),
+                        args: vec![AstExpr::Binary(Box::new(AstBinaryExpr {
+                            op: AstBinaryOpKind::Mod,
+                            lhs: AstExpr::Var(AstNameRef::Local(acc)),
+                            rhs: AstExpr::UInt64(255),
+                        }))],
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(LocalId(5)),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                            base: AstExpr::Var(AstNameRef::Local(bxor)),
+                            field: "bxor".to_owned(),
+                        })),
+                        args: vec![
+                            AstExpr::Var(AstNameRef::Local(mixed)),
+                            AstExpr::Call(Box::new(AstCallExpr {
+                                callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                                    text: "tonumber".to_owned(),
+                                })),
+                                args: vec![AstExpr::Binary(Box::new(AstBinaryExpr {
+                                    op: AstBinaryOpKind::Mod,
+                                    lhs: AstExpr::IndexAccess(Box::new(AstIndexAccess {
+                                        base: AstExpr::Var(AstNameRef::Local(stages)),
+                                        index: AstExpr::Var(AstNameRef::Local(index)),
+                                    })),
+                                    rhs: AstExpr::UInt64(255),
+                                }))],
+                            })),
+                        ],
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+    assert_eq!(module.body.stmts.len(), 1,);
+}
+
+#[test]
+fn inlines_mechanical_local_alias_into_adjacent_assign_index() {
+    let text = LocalId(0);
+    let slot = LocalId(1);
+    let mixed = LocalId(2);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(slot),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Binary(Box::new(AstBinaryExpr {
+                        op: AstBinaryOpKind::Add,
+                        lhs: AstExpr::Unary(Box::new(AstUnaryExpr {
+                            op: AstUnaryOpKind::Length,
+                            expr: AstExpr::Var(AstNameRef::Local(text)),
+                        })),
+                        rhs: AstExpr::Integer(1),
+                    }))],
+                })),
+                AstStmt::Assign(Box::new(crate::ast::AstAssign {
+                    targets: vec![AstLValue::IndexAccess(Box::new(AstIndexAccess {
+                        base: AstExpr::Var(AstNameRef::Local(text)),
+                        index: AstExpr::Var(AstNameRef::Local(slot)),
+                    }))],
+                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                            base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                                text: "string".to_owned(),
+                            })),
+                            field: "format".to_owned(),
+                        })),
+                        args: vec![
+                            AstExpr::String("%02x".to_owned()),
+                            AstExpr::Var(AstNameRef::Local(mixed)),
+                        ],
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+    assert_eq!(
+        module.body.stmts,
+        vec![AstStmt::Assign(Box::new(crate::ast::AstAssign {
+            targets: vec![AstLValue::IndexAccess(Box::new(AstIndexAccess {
+                base: AstExpr::Var(AstNameRef::Local(text)),
+                index: AstExpr::Binary(Box::new(AstBinaryExpr {
+                    op: AstBinaryOpKind::Add,
+                    lhs: AstExpr::Unary(Box::new(AstUnaryExpr {
+                        op: AstUnaryOpKind::Length,
+                        expr: AstExpr::Var(AstNameRef::Local(text)),
+                    })),
+                    rhs: AstExpr::Integer(1),
+                })),
+            }))],
+            values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                    base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                        text: "string".to_owned(),
+                    })),
+                    field: "format".to_owned(),
+                })),
+                args: vec![
+                    AstExpr::String("%02x".to_owned()),
+                    AstExpr::Var(AstNameRef::Local(mixed)),
+                ],
+            }))],
+        }))]
+    );
+}
+
+#[test]
 fn collapses_dependent_lookup_chain_into_plain_accumulator_assign() {
     let items = LocalId(0);
     let index = LocalId(1);

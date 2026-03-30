@@ -451,6 +451,102 @@ pub(super) fn stmt_has_access_base_binding_use(stmt: &AstStmt, binding: AstBindi
     }
 }
 
+pub(super) fn stmt_has_index_binding_use(stmt: &AstStmt, binding: AstBindingRef) -> bool {
+    match stmt {
+        AstStmt::LocalDecl(local_decl) => local_decl
+            .values
+            .iter()
+            .any(|value| expr_has_index_binding_use(value, binding, false)),
+        AstStmt::GlobalDecl(global_decl) => global_decl
+            .values
+            .iter()
+            .any(|value| expr_has_index_binding_use(value, binding, false)),
+        AstStmt::Assign(assign) => {
+            assign
+                .targets
+                .iter()
+                .any(|target| lvalue_has_index_binding_use(target, binding))
+                || assign
+                    .values
+                    .iter()
+                    .any(|value| expr_has_index_binding_use(value, binding, false))
+        }
+        AstStmt::CallStmt(call_stmt) => call_has_index_binding_use(&call_stmt.call, binding),
+        AstStmt::Return(ret) => ret
+            .values
+            .iter()
+            .any(|value| expr_has_index_binding_use(value, binding, false)),
+        AstStmt::If(if_stmt) => expr_has_index_binding_use(&if_stmt.cond, binding, false),
+        AstStmt::While(while_stmt) => expr_has_index_binding_use(&while_stmt.cond, binding, false),
+        AstStmt::Repeat(repeat_stmt) => {
+            expr_has_index_binding_use(&repeat_stmt.cond, binding, false)
+        }
+        AstStmt::NumericFor(numeric_for) => {
+            expr_has_index_binding_use(&numeric_for.start, binding, false)
+                || expr_has_index_binding_use(&numeric_for.limit, binding, false)
+                || expr_has_index_binding_use(&numeric_for.step, binding, false)
+        }
+        AstStmt::GenericFor(generic_for) => generic_for
+            .iterator
+            .iter()
+            .any(|expr| expr_has_index_binding_use(expr, binding, false)),
+        AstStmt::DoBlock(_)
+        | AstStmt::FunctionDecl(_)
+        | AstStmt::LocalFunctionDecl(_)
+        | AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_) => false,
+    }
+}
+
+pub(super) fn stmt_has_direct_call_arg_binding_use(stmt: &AstStmt, binding: AstBindingRef) -> bool {
+    match stmt {
+        AstStmt::LocalDecl(local_decl) => local_decl
+            .values
+            .iter()
+            .any(|value| expr_has_direct_call_arg_binding_use(value, binding)),
+        AstStmt::GlobalDecl(global_decl) => global_decl
+            .values
+            .iter()
+            .any(|value| expr_has_direct_call_arg_binding_use(value, binding)),
+        AstStmt::Assign(assign) => assign
+            .values
+            .iter()
+            .any(|value| expr_has_direct_call_arg_binding_use(value, binding)),
+        AstStmt::CallStmt(call_stmt) => {
+            call_has_direct_call_arg_binding_use(&call_stmt.call, binding)
+        }
+        AstStmt::Return(ret) => ret
+            .values
+            .iter()
+            .any(|value| expr_has_direct_call_arg_binding_use(value, binding)),
+        AstStmt::If(if_stmt) => expr_has_direct_call_arg_binding_use(&if_stmt.cond, binding),
+        AstStmt::While(while_stmt) => {
+            expr_has_direct_call_arg_binding_use(&while_stmt.cond, binding)
+        }
+        AstStmt::Repeat(repeat_stmt) => {
+            expr_has_direct_call_arg_binding_use(&repeat_stmt.cond, binding)
+        }
+        AstStmt::NumericFor(numeric_for) => {
+            expr_has_direct_call_arg_binding_use(&numeric_for.start, binding)
+                || expr_has_direct_call_arg_binding_use(&numeric_for.limit, binding)
+                || expr_has_direct_call_arg_binding_use(&numeric_for.step, binding)
+        }
+        AstStmt::GenericFor(generic_for) => generic_for
+            .iterator
+            .iter()
+            .any(|expr| expr_has_direct_call_arg_binding_use(expr, binding)),
+        AstStmt::DoBlock(_)
+        | AstStmt::FunctionDecl(_)
+        | AstStmt::LocalFunctionDecl(_)
+        | AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_) => false,
+    }
+}
+
 fn block_mentions_binding_target(
     block: &crate::ast::common::AstBlock,
     binding: AstBindingRef,
@@ -517,6 +613,38 @@ fn call_has_access_base_binding_use(call: &AstCallKind, binding: AstBindingRef) 
     }
 }
 
+fn call_has_index_binding_use(call: &AstCallKind, binding: AstBindingRef) -> bool {
+    match call {
+        AstCallKind::Call(call) => {
+            expr_has_index_binding_use(&call.callee, binding, false)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_has_index_binding_use(arg, binding, false))
+        }
+        AstCallKind::MethodCall(call) => {
+            expr_has_index_binding_use(&call.receiver, binding, false)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_has_index_binding_use(arg, binding, false))
+        }
+    }
+}
+
+fn call_has_direct_call_arg_binding_use(call: &AstCallKind, binding: AstBindingRef) -> bool {
+    match call {
+        AstCallKind::Call(call) => call
+            .args
+            .iter()
+            .any(|arg| matches!(arg, AstExpr::Var(name) if name_matches_binding(name, binding))),
+        AstCallKind::MethodCall(call) => call
+            .args
+            .iter()
+            .any(|arg| matches!(arg, AstExpr::Var(name) if name_matches_binding(name, binding))),
+    }
+}
+
 fn lvalue_has_access_base_binding_use(target: &AstLValue, binding: AstBindingRef) -> bool {
     match target {
         AstLValue::Name(_) => false,
@@ -526,6 +654,17 @@ fn lvalue_has_access_base_binding_use(target: &AstLValue, binding: AstBindingRef
         AstLValue::IndexAccess(access) => {
             expr_has_access_base_binding_use(&access.base, binding, true)
                 || expr_has_access_base_binding_use(&access.index, binding, false)
+        }
+    }
+}
+
+fn lvalue_has_index_binding_use(target: &AstLValue, binding: AstBindingRef) -> bool {
+    match target {
+        AstLValue::Name(_) => false,
+        AstLValue::FieldAccess(access) => expr_has_index_binding_use(&access.base, binding, false),
+        AstLValue::IndexAccess(access) => {
+            expr_has_index_binding_use(&access.base, binding, false)
+                || expr_has_index_binding_use(&access.index, binding, true)
         }
     }
 }
@@ -576,6 +715,109 @@ fn expr_has_access_base_binding_use(
                     AstTableKey::Expr(key) => expr_has_access_base_binding_use(key, binding, false),
                 };
                 key_matches || expr_has_access_base_binding_use(&record.value, binding, false)
+            }
+        }),
+        AstExpr::FunctionExpr(_)
+        | AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::Var(_)
+        | AstExpr::VarArg => false,
+    }
+}
+
+fn expr_has_index_binding_use(expr: &AstExpr, binding: AstBindingRef, index: bool) -> bool {
+    match expr {
+        AstExpr::Var(name) if name_matches_binding(name, binding) => index,
+        AstExpr::FieldAccess(access) => expr_has_index_binding_use(&access.base, binding, false),
+        AstExpr::IndexAccess(access) => {
+            expr_has_index_binding_use(&access.base, binding, false)
+                || expr_has_index_binding_use(&access.index, binding, true)
+        }
+        AstExpr::Unary(unary) => expr_has_index_binding_use(&unary.expr, binding, false),
+        AstExpr::Binary(binary) => {
+            expr_has_index_binding_use(&binary.lhs, binding, false)
+                || expr_has_index_binding_use(&binary.rhs, binding, false)
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            expr_has_index_binding_use(&logical.lhs, binding, false)
+                || expr_has_index_binding_use(&logical.rhs, binding, false)
+        }
+        AstExpr::Call(call) => {
+            expr_has_index_binding_use(&call.callee, binding, false)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_has_index_binding_use(arg, binding, false))
+        }
+        AstExpr::MethodCall(call) => {
+            expr_has_index_binding_use(&call.receiver, binding, false)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_has_index_binding_use(arg, binding, false))
+        }
+        AstExpr::SingleValue(expr) => expr_has_index_binding_use(expr, binding, false),
+        AstExpr::TableConstructor(table) => table.fields.iter().any(|field| match field {
+            AstTableField::Array(value) => expr_has_index_binding_use(value, binding, false),
+            AstTableField::Record(record) => {
+                let key_matches = match &record.key {
+                    AstTableKey::Name(_) => false,
+                    AstTableKey::Expr(key) => expr_has_index_binding_use(key, binding, false),
+                };
+                key_matches || expr_has_index_binding_use(&record.value, binding, false)
+            }
+        }),
+        AstExpr::FunctionExpr(_)
+        | AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::Var(_)
+        | AstExpr::VarArg => false,
+    }
+}
+
+fn expr_has_direct_call_arg_binding_use(expr: &AstExpr, binding: AstBindingRef) -> bool {
+    match expr {
+        AstExpr::Call(call) => {
+            call_has_direct_call_arg_binding_use(&AstCallKind::Call(call.clone()), binding)
+        }
+        AstExpr::MethodCall(call) => {
+            call_has_direct_call_arg_binding_use(&AstCallKind::MethodCall(call.clone()), binding)
+        }
+        AstExpr::FieldAccess(access) => expr_has_direct_call_arg_binding_use(&access.base, binding),
+        AstExpr::IndexAccess(access) => {
+            expr_has_direct_call_arg_binding_use(&access.base, binding)
+                || expr_has_direct_call_arg_binding_use(&access.index, binding)
+        }
+        AstExpr::Unary(unary) => expr_has_direct_call_arg_binding_use(&unary.expr, binding),
+        AstExpr::Binary(binary) => {
+            expr_has_direct_call_arg_binding_use(&binary.lhs, binding)
+                || expr_has_direct_call_arg_binding_use(&binary.rhs, binding)
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            expr_has_direct_call_arg_binding_use(&logical.lhs, binding)
+                || expr_has_direct_call_arg_binding_use(&logical.rhs, binding)
+        }
+        AstExpr::SingleValue(expr) => expr_has_direct_call_arg_binding_use(expr, binding),
+        AstExpr::TableConstructor(table) => table.fields.iter().any(|field| match field {
+            AstTableField::Array(value) => expr_has_direct_call_arg_binding_use(value, binding),
+            AstTableField::Record(record) => {
+                let key_matches = match &record.key {
+                    AstTableKey::Name(_) => false,
+                    AstTableKey::Expr(key) => expr_has_direct_call_arg_binding_use(key, binding),
+                };
+                key_matches || expr_has_direct_call_arg_binding_use(&record.value, binding)
             }
         }),
         AstExpr::FunctionExpr(_)
