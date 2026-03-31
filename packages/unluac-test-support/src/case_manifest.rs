@@ -108,6 +108,14 @@ const ALL_DIALECTS: &[LuaCaseDialect] = &[
     LuaCaseDialect::Luajit,
     LuaCaseDialect::Luau,
 ];
+const ALL_NON_LUAU_DIALECTS: &[LuaCaseDialect] = &[
+    LuaCaseDialect::Lua51,
+    LuaCaseDialect::Lua52,
+    LuaCaseDialect::Lua53,
+    LuaCaseDialect::Lua54,
+    LuaCaseDialect::Lua55,
+    LuaCaseDialect::Luajit,
+];
 const PUC_LUA_51: &[LuaCaseDialect] = &[LuaCaseDialect::Lua51];
 const PUC_LUA_GE_52: &[LuaCaseDialect] = &[
     LuaCaseDialect::Lua52,
@@ -347,6 +355,14 @@ pub(crate) const ALL_CASES: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new(
         "tests/lua_cases/common/tricky/30_while_repeat_closure_interleave.lua",
         ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/lua_cases/common/tricky/32_short_circuit_branch_shared_subjects.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/lua_cases/common/tricky/33_inline_adjacent_result_sinks.lua",
+        ALL_NON_LUAU_DIALECTS,
     ),
     LuaCaseMatrixEntry::new("tests/lua_cases/lua5.1/01_setfenv.lua", PUC_LUA_51),
     LuaCaseMatrixEntry::new("tests/lua_cases/lua5.1/02_module_legacy.lua", PUC_LUA_51),

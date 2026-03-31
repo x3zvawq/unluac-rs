@@ -542,6 +542,153 @@ fn collapses_lookup_only_run_into_index_assign() {
 }
 
 #[test]
+fn collapses_single_call_prep_alias_into_terminal_result_decl() {
+    let mgr = LocalId(0);
+    let land = LocalId(1);
+    let player = LocalId(2);
+    let module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(mgr),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "GetHomelandMgr".to_owned(),
+                        })),
+                        args: Vec::new(),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(land),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                            base: AstExpr::Var(AstNameRef::Local(mgr)),
+                            field: "IsCommunityMember".to_owned(),
+                        })),
+                        args: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                            base: AstExpr::Var(AstNameRef::Local(player)),
+                            field: "dwID".to_owned(),
+                        }))],
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    let module = crate::ast::make_readable_with_options(
+        &module,
+        AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+        ReadabilityOptions::default(),
+    );
+
+    assert_eq!(
+        module.body.stmts,
+        vec![AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+            bindings: vec![AstLocalBinding {
+                id: crate::ast::AstBindingRef::Local(land),
+                attr: AstLocalAttr::None,
+                origin: crate::ast::AstLocalOrigin::Recovered,
+            }],
+            values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                    base: AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "GetHomelandMgr".to_owned(),
+                        })),
+                        args: Vec::new(),
+                    })),
+                    field: "IsCommunityMember".to_owned(),
+                })),
+                args: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                    base: AstExpr::Var(AstNameRef::Local(player)),
+                    field: "dwID".to_owned(),
+                }))],
+            }))],
+        }))]
+    );
+}
+
+#[test]
+fn inlines_recovered_call_alias_into_adjacent_local_initializer_value_expr() {
+    let picked = LocalId(0);
+    let kind = LocalId(1);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(picked),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "IsActivityOn".to_owned(),
+                        })),
+                        args: vec![AstExpr::Integer(936)],
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(kind),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::LogicalOr(Box::new(crate::ast::AstLogicalExpr {
+                        lhs: AstExpr::LogicalAnd(Box::new(crate::ast::AstLogicalExpr {
+                            lhs: AstExpr::Var(AstNameRef::Local(picked)),
+                            rhs: AstExpr::Integer(1),
+                        })),
+                        rhs: AstExpr::Integer(0),
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+
+    assert_eq!(
+        module.body.stmts,
+        vec![AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+            bindings: vec![AstLocalBinding {
+                id: crate::ast::AstBindingRef::Local(kind),
+                attr: AstLocalAttr::None,
+                origin: crate::ast::AstLocalOrigin::Recovered,
+            }],
+            values: vec![AstExpr::LogicalOr(Box::new(crate::ast::AstLogicalExpr {
+                lhs: AstExpr::LogicalAnd(Box::new(crate::ast::AstLogicalExpr {
+                    lhs: AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "IsActivityOn".to_owned(),
+                        })),
+                        args: vec![AstExpr::Integer(936)],
+                    })),
+                    rhs: AstExpr::Integer(1),
+                })),
+                rhs: AstExpr::Integer(0),
+            }))],
+        }))]
+    );
+}
+
+#[test]
 fn collapses_mechanical_alias_run_into_nested_assignment_expr() {
     let table = LocalId(0);
     let first = LocalId(1);
@@ -1631,6 +1778,254 @@ fn collapses_adjacent_local_alias_run_into_final_call_stmt() {
             })),
         }))]
     );
+}
+
+#[test]
+fn inlines_raw_global_alias_into_adjacent_first_call_arg() {
+    let overview = LocalId(0);
+    let active = LocalId(1);
+    let player = LocalId(2);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(overview),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                        text: "REMOTE_HL_OVERVIEW".to_owned(),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(active),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                            base: AstExpr::Var(AstNameRef::Local(player)),
+                            field: "GetRemoteArrayUInt".to_owned(),
+                        })),
+                        args: vec![
+                            AstExpr::Var(AstNameRef::Local(overview)),
+                            AstExpr::Integer(1),
+                            AstExpr::Integer(2),
+                        ],
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+    assert_eq!(
+        module.body.stmts,
+        vec![AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+            bindings: vec![AstLocalBinding {
+                id: crate::ast::AstBindingRef::Local(active),
+                attr: AstLocalAttr::None,
+                origin: crate::ast::AstLocalOrigin::Recovered,
+            }],
+            values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                    base: AstExpr::Var(AstNameRef::Local(player)),
+                    field: "GetRemoteArrayUInt".to_owned(),
+                })),
+                args: vec![
+                    AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                        text: "REMOTE_HL_OVERVIEW".to_owned(),
+                    })),
+                    AstExpr::Integer(1),
+                    AstExpr::Integer(2),
+                ],
+            }))],
+        }))]
+    );
+}
+
+#[test]
+fn inlines_raw_global_alias_into_later_call_arg_when_prefix_is_barrier_free() {
+    let overview = LocalId(0);
+    let active = LocalId(1);
+    let player = LocalId(2);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(overview),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                        text: "REMOTE_HL_OVERVIEW".to_owned(),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(active),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                            base: AstExpr::Var(AstNameRef::Local(player)),
+                            field: "GetRemoteArrayUInt".to_owned(),
+                        })),
+                        args: vec![
+                            AstExpr::Integer(1),
+                            AstExpr::Var(AstNameRef::Local(overview)),
+                            AstExpr::Integer(2),
+                        ],
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+    assert_eq!(
+        module.body.stmts,
+        vec![AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+            bindings: vec![AstLocalBinding {
+                id: crate::ast::AstBindingRef::Local(active),
+                attr: AstLocalAttr::None,
+                origin: crate::ast::AstLocalOrigin::Recovered,
+            }],
+            values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                    base: AstExpr::Var(AstNameRef::Local(player)),
+                    field: "GetRemoteArrayUInt".to_owned(),
+                })),
+                args: vec![
+                    AstExpr::Integer(1),
+                    AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                        text: "REMOTE_HL_OVERVIEW".to_owned(),
+                    })),
+                    AstExpr::Integer(2),
+                ],
+            }))],
+        }))]
+    );
+}
+
+#[test]
+fn does_not_inline_raw_global_alias_across_effectful_call_callee() {
+    let overview = LocalId(0);
+    let active = LocalId(1);
+    let builder = LocalId(2);
+    let original = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(overview),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                        text: "REMOTE_HL_OVERVIEW".to_owned(),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(active),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Call(Box::new(AstCallExpr {
+                            callee: AstExpr::Var(AstNameRef::Local(builder)),
+                            args: Vec::new(),
+                        })),
+                        args: vec![AstExpr::Var(AstNameRef::Local(overview))],
+                    }))],
+                })),
+            ],
+        },
+    };
+    let mut module = original.clone();
+
+    assert!(!apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+    assert_eq!(module, original);
+}
+
+#[test]
+fn does_not_inline_raw_global_alias_past_effectful_earlier_call_arg() {
+    let overview = LocalId(0);
+    let active = LocalId(1);
+    let player = LocalId(2);
+    let original = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(overview),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                        text: "REMOTE_HL_OVERVIEW".to_owned(),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(active),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                            base: AstExpr::Var(AstNameRef::Local(player)),
+                            field: "GetRemoteArrayUInt".to_owned(),
+                        })),
+                        args: vec![
+                            AstExpr::Call(Box::new(AstCallExpr {
+                                callee: AstExpr::Var(AstNameRef::Local(LocalId(3))),
+                                args: Vec::new(),
+                            })),
+                            AstExpr::Var(AstNameRef::Local(overview)),
+                        ],
+                    }))],
+                })),
+            ],
+        },
+    };
+    let mut module = original.clone();
+
+    assert!(!apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+    assert_eq!(module, original);
 }
 
 #[test]

@@ -21,7 +21,7 @@ use super::super::common::{AstBindingRef, AstBlock, AstModule, AstStmt};
 use super::ReadabilityContext;
 use super::binding_flow::{count_binding_uses_in_stmt, count_binding_uses_in_stmts};
 use super::binding_tree::{
-    expr_references_binding, stmt_has_access_base_binding_use,
+    expr_references_binding, stmt_has_access_base_binding_use, stmt_has_call_callee_binding_use,
     stmt_has_direct_call_arg_binding_use, stmt_has_index_binding_use, stmt_has_nested_binding_use,
     stmt_has_nested_binding_value_use,
 };
@@ -113,23 +113,28 @@ fn rewrite_current_block(block: &mut AstBlock, options: ReadabilityOptions) -> b
             && matches!(next_stmt, AstStmt::Assign(_))
             && super::expr_analysis::is_mechanical_run_inline_expr(value)
             && stmt_has_index_binding_use(next_stmt, candidate.binding());
-        let allows_special_adjacent_assign_value =
+        let allows_special_adjacent_value_sink =
             matches!(
                 candidate,
                 candidate::InlineCandidate::LocalAlias {
                     origin: super::super::common::AstLocalOrigin::Recovered,
                     ..
                 }
-            ) && matches!(policy, InlinePolicy::Conservative)
-                && matches!(next_stmt, AstStmt::Assign(_))
-                && stmt_has_nested_binding_value_use(next_stmt, candidate.binding())
-                && (candidate::is_recallable_inline_expr(value)
-                    || (candidate::is_lookup_inline_expr(value)
-                        && assign_targets_same_lookup_expr(next_stmt, value)));
+            ) && matches!(
+                policy,
+                InlinePolicy::Conservative | InlinePolicy::AliasInitializerChain
+            ) && matches!(next_stmt, AstStmt::Assign(_) | AstStmt::LocalDecl(_))
+                && stmt_sink_binding_allows_adjacent_value_inline(&old_stmts, index + 1)
+                && ((candidate::is_raw_global_alias_expr(value)
+                    && stmt_has_direct_call_arg_binding_use(next_stmt, candidate.binding()))
+                    || (stmt_has_nested_binding_value_use(next_stmt, candidate.binding())
+                        && (candidate::is_recallable_inline_expr(value)
+                            || (candidate::is_lookup_inline_expr(value)
+                                && assign_targets_same_lookup_expr(next_stmt, value)))));
         let effective_policy = if allows_special_index_sink {
             InlinePolicy::MechanicalRun
-        } else if allows_special_adjacent_assign_value {
-            InlinePolicy::AdjacentAssignValue
+        } else if allows_special_adjacent_value_sink {
+            InlinePolicy::AdjacentValueSink
         } else {
             policy
         };
@@ -186,6 +191,7 @@ fn rewrite_current_block(block: &mut AstBlock, options: ReadabilityOptions) -> b
 
     block.stmts = new_stmts;
     changed |= collapse_adjacent_call_alias_runs(block, options);
+    changed |= collapse_terminal_call_result_alias_runs(block, options);
     changed |= collapse_terminal_local_mechanical_runs(block, options);
     changed |= collapse_adjacent_mechanical_alias_runs(block, options);
     changed
@@ -210,7 +216,7 @@ fn collapse_adjacent_call_alias_runs(block: &mut AstBlock, options: ReadabilityO
             new_stmts.push(old_stmts[index].clone());
             index += 1;
             continue;
-        }
+        };
 
         let mut rewritten_sink = old_stmts[run_end].clone();
         let mut removed = vec![false; run_end - index];
@@ -281,6 +287,122 @@ fn collapse_adjacent_call_alias_runs(block: &mut AstBlock, options: ReadabilityO
 
     block.stmts = new_stmts;
     changed
+}
+
+fn collapse_terminal_call_result_alias_runs(
+    block: &mut AstBlock,
+    options: ReadabilityOptions,
+) -> bool {
+    let old_stmts = std::mem::take(&mut block.stmts);
+    let mut new_stmts = Vec::with_capacity(old_stmts.len());
+    let mut changed = false;
+    let mut index = 0;
+
+    while index < old_stmts.len() {
+        let Some(sink_index) = find_terminal_call_result_sink(&old_stmts, index) else {
+            new_stmts.push(old_stmts[index].clone());
+            index += 1;
+            continue;
+        };
+
+        let mut rewritten_sink = old_stmts[sink_index].clone();
+        let mut removed = vec![false; sink_index - index];
+        let mut collapsed_count = 0usize;
+
+        for candidate_index in (index..sink_index).rev() {
+            let Some((candidate, value)) = inline_candidate(&old_stmts[candidate_index]) else {
+                continue;
+            };
+            if !matches!(candidate, candidate::InlineCandidate::LocalAlias { .. }) {
+                continue;
+            }
+            if count_binding_uses_in_stmts(&old_stmts[(candidate_index + 1)..], candidate.binding())
+                != 1
+            {
+                continue;
+            }
+            let intermediate_uses = if candidate::is_lookup_inline_expr(value) {
+                count_binding_uses_in_remaining_run(
+                    &old_stmts[(candidate_index + 1)..sink_index],
+                    &removed[(candidate_index + 1 - index)..],
+                    candidate.binding(),
+                )
+            } else {
+                count_binding_uses_in_stmts(
+                    &old_stmts[(candidate_index + 1)..sink_index],
+                    candidate.binding(),
+                )
+            };
+            if intermediate_uses != 0
+                || !stmt_has_nested_binding_use(&rewritten_sink, candidate.binding())
+            {
+                continue;
+            }
+
+            let mut trial_sink = rewritten_sink.clone();
+            if rewrite_stmt_use_sites_with_policy(
+                &mut trial_sink,
+                candidate,
+                value,
+                options,
+                InlinePolicy::ExtendedCallChain,
+            ) {
+                rewritten_sink = trial_sink;
+                removed[candidate_index - index] = true;
+                collapsed_count += 1;
+            }
+        }
+
+        // 这里专门处理“调用准备 run 的终点自己还是一个 local/assign”：
+        // `local f = obj.m; local x = f(arg)`、`local a = t[i]; local v = call(a, ...)`
+        // 这类形状和最终 `call_stmt(...)` 属于同一 owner，只是 sink 还保留在结果声明里。
+        if collapsed_count >= 2 {
+            changed = true;
+            for (offset, stmt) in old_stmts[index..sink_index].iter().enumerate() {
+                if !removed[offset] {
+                    new_stmts.push(stmt.clone());
+                }
+            }
+            new_stmts.push(rewritten_sink);
+            index = sink_index + 1;
+            continue;
+        }
+
+        new_stmts.push(old_stmts[index].clone());
+        index += 1;
+    }
+
+    block.stmts = new_stmts;
+    changed
+}
+
+fn find_terminal_call_result_sink(stmts: &[AstStmt], index: usize) -> Option<usize> {
+    inline_candidate(stmts.get(index)?)?;
+
+    let mut sink_index = index + 1;
+    while sink_index < stmts.len() && inline_candidate(&stmts[sink_index]).is_some() {
+        if stmt_is_adjacent_call_result_sink(&stmts[sink_index]) {
+            return Some(sink_index);
+        }
+        sink_index += 1;
+    }
+
+    None
+}
+
+fn stmt_sink_binding_allows_adjacent_value_inline(stmts: &[AstStmt], sink_index: usize) -> bool {
+    let Some(stmt) = stmts.get(sink_index) else {
+        return false;
+    };
+    if matches!(stmt, AstStmt::Assign(_)) {
+        return true;
+    }
+    let Some((sink_candidate, _)) = inline_candidate(stmt) else {
+        return false;
+    };
+    !stmts[(sink_index + 1)..]
+        .iter()
+        .any(|stmt| stmt_has_call_callee_binding_use(stmt, sink_candidate.binding()))
 }
 
 fn collapse_adjacent_mechanical_alias_runs(

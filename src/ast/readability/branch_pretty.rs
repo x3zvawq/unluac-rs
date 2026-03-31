@@ -13,7 +13,7 @@
 
 use super::super::common::{
     AstBinaryExpr, AstBinaryOpKind, AstBlock, AstExpr, AstFunctionExpr, AstIf, AstLabelId,
-    AstLogicalExpr, AstModule, AstStmt, AstUnaryExpr, AstUnaryOpKind,
+    AstLogicalExpr, AstModule, AstReturn, AstStmt, AstUnaryExpr, AstUnaryOpKind,
 };
 use super::ReadabilityContext;
 use super::expr_analysis::is_always_truthy_expr;
@@ -28,7 +28,7 @@ pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool
 struct BranchPrettyPass;
 
 impl AstRewritePass for BranchPrettyPass {
-    fn rewrite_block(&mut self, block: &mut AstBlock, _kind: BlockKind) -> bool {
+    fn rewrite_block(&mut self, block: &mut AstBlock, kind: BlockKind) -> bool {
         let old_stmts = std::mem::take(&mut block.stmts);
         let mut flattened_stmts = Vec::with_capacity(old_stmts.len());
         let mut changed = false;
@@ -44,7 +44,8 @@ impl AstRewritePass for BranchPrettyPass {
         block.stmts = flattened_stmts;
         let folded_else = fold_terminal_goto_else(block);
         let folded_guard = fold_guard_goto_labels(block);
-        changed || folded_else || folded_guard
+        let folded_terminal_guard = fold_terminal_guard_return(block, kind);
+        changed || folded_else || folded_guard || folded_terminal_guard
     }
 
     fn rewrite_stmt(&mut self, stmt: &mut AstStmt) -> bool {
@@ -243,6 +244,58 @@ fn fold_guard_goto_labels(block: &mut AstBlock) -> bool {
     changed
 }
 
+fn fold_terminal_guard_return(block: &mut AstBlock, kind: BlockKind) -> bool {
+    if !matches!(kind, BlockKind::ModuleBody | BlockKind::FunctionBody) {
+        return false;
+    }
+
+    let Some((if_index, remove_terminal_empty_return)) = terminal_guard_return_candidate(block)
+    else {
+        return false;
+    };
+    let removed_if = block.stmts.remove(if_index);
+    let AstStmt::If(mut if_stmt) = removed_if else {
+        unreachable!("checked above, terminal guard candidate must remain an if");
+    };
+    if remove_terminal_empty_return {
+        let popped = block.stmts.pop();
+        debug_assert!(matches!(popped, Some(stmt) if is_empty_return_stmt(&stmt)));
+    }
+
+    let lifted_body = std::mem::replace(
+        &mut if_stmt.then_block,
+        AstBlock {
+            stmts: vec![AstStmt::Return(Box::new(AstReturn { values: Vec::new() }))],
+        },
+    );
+    if_stmt.cond = negate_guard_condition(if_stmt.cond);
+    if_stmt.else_block = None;
+
+    block.stmts.push(AstStmt::If(if_stmt));
+    block.stmts.extend(lifted_body.stmts);
+    true
+}
+
+fn terminal_guard_return_candidate(block: &AstBlock) -> Option<(usize, bool)> {
+    let if_index = match block.stmts.as_slice() {
+        [.., AstStmt::If(_)] => block.stmts.len() - 1,
+        [.., AstStmt::If(_), tail] if is_empty_return_stmt(tail) => block.stmts.len() - 2,
+        _ => return None,
+    };
+    let AstStmt::If(if_stmt) = block.stmts.get(if_index)? else {
+        return None;
+    };
+    if if_stmt.else_block.is_some()
+        || !block_always_terminates(&if_stmt.then_block)
+        || !matches!(if_stmt.then_block.stmts.last(), Some(AstStmt::Return(_)))
+        || block_contains_label_or_goto(&if_stmt.then_block)
+    {
+        return None;
+    }
+
+    Some((if_index, if_index + 1 < block.stmts.len()))
+}
+
 #[derive(Clone, Copy)]
 struct GuardGotoFold {
     if_index: usize,
@@ -410,6 +463,14 @@ fn block_requires_scope_barrier(block: &AstBlock) -> bool {
     block.stmts.iter().any(stmt_requires_scope_barrier)
 }
 
+fn block_contains_label_or_goto(block: &AstBlock) -> bool {
+    block.stmts.iter().any(stmt_contains_label_or_goto)
+}
+
+fn is_empty_return_stmt(stmt: &AstStmt) -> bool {
+    matches!(stmt, AstStmt::Return(ret) if ret.values.is_empty())
+}
+
 fn stmt_requires_scope_barrier(stmt: &AstStmt) -> bool {
     matches!(
         stmt,
@@ -418,6 +479,33 @@ fn stmt_requires_scope_barrier(stmt: &AstStmt) -> bool {
             | AstStmt::Label(_)
             | AstStmt::Goto(_)
     )
+}
+
+fn stmt_contains_label_or_goto(stmt: &AstStmt) -> bool {
+    match stmt {
+        AstStmt::If(if_stmt) => {
+            block_contains_label_or_goto(&if_stmt.then_block)
+                || if_stmt
+                    .else_block
+                    .as_ref()
+                    .is_some_and(block_contains_label_or_goto)
+        }
+        AstStmt::While(while_stmt) => block_contains_label_or_goto(&while_stmt.body),
+        AstStmt::Repeat(repeat_stmt) => block_contains_label_or_goto(&repeat_stmt.body),
+        AstStmt::NumericFor(numeric_for) => block_contains_label_or_goto(&numeric_for.body),
+        AstStmt::GenericFor(generic_for) => block_contains_label_or_goto(&generic_for.body),
+        AstStmt::DoBlock(block) => block_contains_label_or_goto(block),
+        AstStmt::Label(_) | AstStmt::Goto(_) => true,
+        AstStmt::LocalDecl(_)
+        | AstStmt::GlobalDecl(_)
+        | AstStmt::Assign(_)
+        | AstStmt::CallStmt(_)
+        | AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::FunctionDecl(_)
+        | AstStmt::LocalFunctionDecl(_)
+        | AstStmt::Return(_) => false,
+    }
 }
 
 fn negate_guard_condition(expr: AstExpr) -> AstExpr {

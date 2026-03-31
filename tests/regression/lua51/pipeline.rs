@@ -383,6 +383,42 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn nested_short_circuit_calls_hir_restores_shared_fallback_impure_chain() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/17_nested_short_circuit_calls.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("nested_short_circuit_calls hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(
+            dump.contains(
+                "local [\"l2\"] = ((call(normal) l1(\"a\", p0) multiret=false and ((call(normal) l1(\"b\", false) multiret=false or call(normal) l1(\"c\", \"fallback\") multiret=false) and call(normal) l1(\"d\", 8) multiret=false)) or call(normal) l1(\"e\", 13) multiret=false)"
+            ),
+            "{dump}"
+        );
+        assert!(
+            !dump.contains("if call(normal) l1(\"a\", p0) multiret=false"),
+            "{dump}"
+        );
+        assert!(!dump.contains("local [\"l5\"] = -"), "{dump}");
+    }
+
+    #[test]
     fn short_circuit_side_effects_generate_inherits_parent_local_name_for_closure_upvalue() {
         let result = decompile(
             &compile_lua_case(
@@ -1237,6 +1273,152 @@ mod decompile_pipeline {
             generated
                 .source
                 .contains("return payload.answer, payload[1]"),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
+    fn short_circuit_branch_shared_subjects_hir_keeps_current_header_producers_materialized() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/32_short_circuit_branch_shared_subjects.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("short_circuit_branch_shared_subjects hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("local [\"l0\"] = 1"), "{dump}");
+        assert!(dump.contains("global(GetHomelandMgr)"), "{dump}");
+        assert!(dump.contains("\"IsCommunityMember\""), "{dump}");
+        assert!(dump.contains("call(normal) l2(p0[\"dwID\"])"), "{dump}");
+        assert!(
+            !dump.contains("if ((0 < t1) and (t6 and (0 < t6)))"),
+            "{dump}"
+        );
+        assert!(!dump.contains("local [\"l0\"], [\"l1\"] = -"), "{dump}");
+    }
+
+    #[test]
+    fn short_circuit_branch_shared_subjects_generate_keeps_nested_value_definitions() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/32_short_circuit_branch_shared_subjects.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                naming: NamingOptions {
+                    mode: NamingMode::DebugLike,
+                    debug_like_include_function: true,
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("short_circuit_branch_shared_subjects generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated.source.contains("local r1_0 = 1"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("local r1_1 = GetHomelandMgr().IsCommunityMember(p1_0.dwID)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local r1_1 = GetHomelandMgr()\n"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("p1_0.SetTimer(48, \"scripts/Include/repro.lua\", r1_1, r1_0)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local r1_0, r1_1"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated
+                .source
+                .contains("if r1_0 > 0 and (r1_1 and r1_1 > 0) then"),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
+    fn inline_adjacent_result_sinks_generate_recovers_terminal_value_consumers() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/33_inline_adjacent_result_sinks.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                naming: NamingOptions {
+                    mode: NamingMode::DebugLike,
+                    debug_like_include_function: true,
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("inline_adjacent_result_sinks generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated
+                .source
+                .contains("local r1_0 = IsActivityOn(936) and 1 or 0"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("local r1_1 = GetHomelandMgr().IsCommunityMember(p1_0.dwID)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated
+                .source
+                .contains("local r1_0 = IsActivityOn(936)\n"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local r1_1 = GetHomelandMgr()\n"),
             "{}",
             generated.source
         );

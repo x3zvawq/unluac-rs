@@ -7,7 +7,8 @@
 use crate::readability::ReadabilityOptions;
 
 use super::super::super::common::{
-    AstCallKind, AstExpr, AstGlobalDecl, AstLValue, AstStmt, AstTableField, AstTableKey,
+    AstCallExpr, AstCallKind, AstExpr, AstGlobalDecl, AstLValue, AstMethodCallExpr, AstStmt,
+    AstTableField, AstTableKey,
 };
 use super::super::binding_flow::name_matches_binding;
 use super::super::expr_analysis::{
@@ -17,7 +18,7 @@ use super::super::expr_analysis::{
 use super::candidate::{
     InlineCandidate, InlinePolicy, is_call_callee_inline_expr,
     is_extended_call_arg_local_alias_expr, is_extended_neutral_local_alias_expr,
-    is_lookup_inline_expr, is_recallable_inline_expr,
+    is_lookup_inline_expr, is_raw_global_alias_expr, is_recallable_inline_expr,
 };
 
 pub(super) fn rewrite_stmt_use_sites_with_policy(
@@ -162,7 +163,8 @@ fn rewrite_expr_list_context(
 ) -> bool {
     let mut changed = false;
     for expr in exprs {
-        changed |= rewrite_expr_use_sites(expr, candidate, replacement, site, options, policy);
+        changed |=
+            rewrite_top_level_expr_use_sites(expr, candidate, replacement, site, options, policy);
     }
     changed
 }
@@ -215,50 +217,148 @@ fn rewrite_call_use_sites(
 ) -> bool {
     match call {
         AstCallKind::Call(call) => {
-            let mut changed = rewrite_expr_use_sites(
-                &mut call.callee,
-                candidate,
-                replacement,
-                InlineSite::CallCallee,
-                options,
-                policy,
-            );
-            let args_len = call.args.len();
-            for (index, arg) in call.args.iter_mut().enumerate() {
-                changed |= rewrite_expr_use_sites(
-                    arg,
-                    candidate,
-                    replacement,
-                    call_arg_site(index, args_len),
-                    options,
-                    policy,
-                );
-            }
-            changed
+            rewrite_call_expr_use_sites(call, candidate, replacement, options, policy, true)
         }
         AstCallKind::MethodCall(call) => {
-            let mut changed = rewrite_expr_use_sites(
-                &mut call.receiver,
-                candidate,
-                replacement,
-                InlineSite::Neutral,
-                options,
-                policy,
-            );
-            let args_len = call.args.len();
-            for (index, arg) in call.args.iter_mut().enumerate() {
-                changed |= rewrite_expr_use_sites(
-                    arg,
-                    candidate,
-                    replacement,
-                    call_arg_site(index, args_len),
-                    options,
-                    policy,
-                );
-            }
-            changed
+            rewrite_method_call_expr_use_sites(call, candidate, replacement, options, policy, true)
         }
     }
+}
+
+fn rewrite_top_level_expr_use_sites(
+    expr: &mut AstExpr,
+    candidate: InlineCandidate,
+    replacement: &AstExpr,
+    site: InlineSite,
+    options: ReadabilityOptions,
+    policy: InlinePolicy,
+) -> bool {
+    match expr {
+        AstExpr::Call(call) => {
+            rewrite_call_expr_use_sites(call, candidate, replacement, options, policy, true)
+        }
+        AstExpr::MethodCall(call) => {
+            rewrite_method_call_expr_use_sites(call, candidate, replacement, options, policy, true)
+        }
+        _ => rewrite_expr_use_sites(expr, candidate, replacement, site, options, policy),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CallRewriteMode {
+    options: ReadabilityOptions,
+    policy: InlinePolicy,
+    allow_raw_global_adjacent_arg_inline: bool,
+}
+
+fn rewrite_call_expr_use_sites(
+    call: &mut AstCallExpr,
+    candidate: InlineCandidate,
+    replacement: &AstExpr,
+    options: ReadabilityOptions,
+    policy: InlinePolicy,
+    allow_raw_global_adjacent_arg_inline: bool,
+) -> bool {
+    rewrite_call_parts_use_sites(
+        &mut call.callee,
+        &mut call.args,
+        InlineSite::CallCallee,
+        candidate,
+        replacement,
+        CallRewriteMode {
+            options,
+            policy,
+            allow_raw_global_adjacent_arg_inline,
+        },
+    )
+}
+
+fn rewrite_method_call_expr_use_sites(
+    call: &mut AstMethodCallExpr,
+    candidate: InlineCandidate,
+    replacement: &AstExpr,
+    options: ReadabilityOptions,
+    policy: InlinePolicy,
+    allow_raw_global_adjacent_arg_inline: bool,
+) -> bool {
+    rewrite_call_parts_use_sites(
+        &mut call.receiver,
+        &mut call.args,
+        InlineSite::Neutral,
+        candidate,
+        replacement,
+        CallRewriteMode {
+            options,
+            policy,
+            allow_raw_global_adjacent_arg_inline,
+        },
+    )
+}
+
+fn rewrite_call_parts_use_sites(
+    prefix: &mut AstExpr,
+    args: &mut [AstExpr],
+    prefix_site: InlineSite,
+    candidate: InlineCandidate,
+    replacement: &AstExpr,
+    mode: CallRewriteMode,
+) -> bool {
+    let mut changed = rewrite_expr_use_sites(
+        prefix,
+        candidate,
+        replacement,
+        prefix_site,
+        mode.options,
+        mode.policy,
+    );
+    let mut prefix_safe = mode.allow_raw_global_adjacent_arg_inline
+        && call_prefix_base_allows_raw_global_arg_inline(mode.policy, replacement, prefix);
+    let args_len = args.len();
+    for (index, arg) in args.iter_mut().enumerate() {
+        if prefix_safe && try_rewrite_raw_global_call_arg(arg, candidate, replacement) {
+            changed = true;
+        } else {
+            changed |= rewrite_expr_use_sites(
+                arg,
+                candidate,
+                replacement,
+                call_arg_site(index, args_len),
+                mode.options,
+                mode.policy,
+            );
+        }
+        prefix_safe &= raw_global_call_prefix_expr_is_barrier_free(arg);
+    }
+    changed
+}
+
+fn call_prefix_base_allows_raw_global_arg_inline(
+    policy: InlinePolicy,
+    replacement: &AstExpr,
+    prefix: &AstExpr,
+) -> bool {
+    matches!(policy, InlinePolicy::AdjacentValueSink)
+        && is_raw_global_alias_expr(replacement)
+        && raw_global_call_prefix_expr_is_barrier_free(prefix)
+}
+
+fn raw_global_call_prefix_expr_is_barrier_free(expr: &AstExpr) -> bool {
+    is_access_base_inline_expr(expr) || is_extended_call_arg_local_alias_expr(expr)
+}
+
+fn try_rewrite_raw_global_call_arg(
+    arg: &mut AstExpr,
+    candidate: InlineCandidate,
+    replacement: &AstExpr,
+) -> bool {
+    let AstExpr::Var(name) = arg else {
+        return false;
+    };
+    if !name_matches_binding(name, candidate.binding()) {
+        return false;
+    }
+    *arg = replacement.clone();
+    true
 }
 
 fn rewrite_expr_use_sites(
@@ -355,48 +455,10 @@ fn rewrite_expr_use_sites(
             changed
         }
         AstExpr::Call(call) => {
-            let mut changed = rewrite_expr_use_sites(
-                &mut call.callee,
-                candidate,
-                replacement,
-                InlineSite::CallCallee,
-                options,
-                policy,
-            );
-            let args_len = call.args.len();
-            for (index, arg) in call.args.iter_mut().enumerate() {
-                changed |= rewrite_expr_use_sites(
-                    arg,
-                    candidate,
-                    replacement,
-                    call_arg_site(index, args_len),
-                    options,
-                    policy,
-                );
-            }
-            changed
+            rewrite_call_expr_use_sites(call, candidate, replacement, options, policy, false)
         }
         AstExpr::MethodCall(call) => {
-            let mut changed = rewrite_expr_use_sites(
-                &mut call.receiver,
-                candidate,
-                replacement,
-                InlineSite::Neutral,
-                options,
-                policy,
-            );
-            let args_len = call.args.len();
-            for (index, arg) in call.args.iter_mut().enumerate() {
-                changed |= rewrite_expr_use_sites(
-                    arg,
-                    candidate,
-                    replacement,
-                    call_arg_site(index, args_len),
-                    options,
-                    policy,
-                );
-            }
-            changed
+            rewrite_method_call_expr_use_sites(call, candidate, replacement, options, policy, false)
         }
         AstExpr::SingleValue(expr) => rewrite_expr_use_sites(
             expr,
@@ -530,10 +592,10 @@ impl InlineSite {
                 InlinePolicy::AdjacentCallResultCallee => {
                     self.allows_adjacent_call_result_local_alias(replacement)
                 }
-                InlinePolicy::AdjacentAssignValue => match origin {
+                InlinePolicy::AdjacentValueSink => match origin {
                     super::super::super::common::AstLocalOrigin::DebugHinted => false,
                     super::super::super::common::AstLocalOrigin::Recovered => {
-                        self.allows_adjacent_assign_value_local_alias(replacement)
+                        self.allows_adjacent_value_sink_local_alias(replacement)
                     }
                 },
                 InlinePolicy::DirectReturnConstructor => match origin {
@@ -559,7 +621,7 @@ impl InlineSite {
                     Some(options.access_base_inline_max_complexity)
                 }
                 InlinePolicy::AdjacentCallResultCallee => None,
-                InlinePolicy::AdjacentAssignValue => Some(options.return_inline_max_complexity),
+                InlinePolicy::AdjacentValueSink => Some(options.return_inline_max_complexity),
                 InlinePolicy::Conservative => None,
                 InlinePolicy::DirectReturnConstructor => None,
                 InlinePolicy::ExtendedCallChain => Some(options.access_base_inline_max_complexity),
@@ -587,11 +649,10 @@ impl InlineSite {
             Self::ComparisonOperand => Self::ComparisonOperand,
             Self::ReturnValue => Self::ReturnNestedValue,
             Self::ReturnNestedValue => Self::ReturnNestedValue,
-            Self::Index
-            | Self::CallArgNonFinal
-            | Self::CallArgFinal
-            | Self::CallCallee
-            | Self::AccessBase => Self::Neutral,
+            Self::Index | Self::CallArgNonFinal | Self::CallArgFinal | Self::AccessBase => {
+                Self::Neutral
+            }
+            Self::CallCallee => Self::CallCallee,
         }
     }
 
@@ -660,7 +721,7 @@ impl InlineSite {
         matches!(self, Self::CallCallee) && is_lookup_inline_expr(replacement)
     }
 
-    fn allows_adjacent_assign_value_local_alias(self, replacement: &AstExpr) -> bool {
+    fn allows_adjacent_value_sink_local_alias(self, replacement: &AstExpr) -> bool {
         match self {
             Self::Neutral | Self::ComparisonOperand => {
                 is_extended_neutral_local_alias_expr(replacement)

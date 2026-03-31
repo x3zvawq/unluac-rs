@@ -26,6 +26,10 @@ pub(super) fn synthesize_value_decision_expr(
     value::synthesize_value_decision_expr(decision)
 }
 
+pub(super) fn decision_is_synth_safe(decision: &crate::hir::common::HirDecisionExpr) -> bool {
+    safety::decision_is_synth_safe(decision)
+}
+
 pub(super) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
     readable::naturalize_pure_logical_expr(expr)
 }

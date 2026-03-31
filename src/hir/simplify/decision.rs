@@ -50,6 +50,10 @@ pub(crate) fn synthesize_readable_pure_logical_expr(expr: &HirExpr) -> Option<Hi
     synthesize::synthesize_readable_pure_logical_expr(expr)
 }
 
+pub(crate) fn decision_is_synth_safe(decision: &HirDecisionExpr) -> bool {
+    synthesize::decision_is_synth_safe(decision)
+}
+
 struct DecisionExprPass;
 
 impl ExprRewritePass for DecisionExprPass {

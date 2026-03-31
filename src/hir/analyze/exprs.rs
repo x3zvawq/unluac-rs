@@ -32,7 +32,7 @@ pub(super) use self::branch::{
     lower_branch_subject_single_eval, lower_unary_op,
 };
 pub(super) use self::defs::{expr_for_dup_safe_fixed_def, expr_for_fixed_def, is_multiret_results};
-use self::packs::lower_value_pack_inline;
+use self::packs::lower_value_pack_single_eval;
 pub(super) use self::packs::{lower_value_pack, lower_value_pack_components};
 pub(super) use self::regs::{
     expr_for_closure_capture, expr_for_reg_at_block_entry, expr_for_reg_at_block_exit,

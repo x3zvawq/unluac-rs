@@ -163,6 +163,64 @@ fn lifts_terminating_else_branch_by_negating_condition() {
 }
 
 #[test]
+fn flips_terminal_if_before_empty_return_into_guard_return() {
+    let ready = LocalId(0);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: AstBlock {
+            stmts: vec![
+                AstStmt::If(Box::new(AstIf {
+                    cond: AstExpr::Var(AstNameRef::Local(ready)),
+                    then_block: AstBlock {
+                        stmts: vec![
+                            AstStmt::CallStmt(Box::new(AstCallStmt {
+                                call: AstCallKind::Call(Box::new(AstCallExpr {
+                                    callee: AstExpr::Var(AstNameRef::Param(ParamId(0))),
+                                    args: Vec::new(),
+                                })),
+                            })),
+                            AstStmt::Return(Box::new(AstReturn { values: Vec::new() })),
+                        ],
+                    },
+                    else_block: None,
+                })),
+                AstStmt::Return(Box::new(AstReturn { values: Vec::new() })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(AstDialectVersion::Lua55),
+            options: Default::default(),
+        }
+    ));
+
+    assert_eq!(module.body.stmts.len(), 3);
+    let AstStmt::If(if_stmt) = &module.body.stmts[0] else {
+        panic!("expected guard if");
+    };
+    assert!(if_stmt.else_block.is_none(), "{if_stmt:?}");
+    assert_eq!(
+        if_stmt.cond,
+        AstExpr::Unary(Box::new(AstUnaryExpr {
+            op: AstUnaryOpKind::Not,
+            expr: AstExpr::Var(AstNameRef::Local(ready)),
+        }))
+    );
+    assert!(matches!(
+        if_stmt.then_block.stmts.as_slice(),
+        [AstStmt::Return(ret)] if ret.values.is_empty()
+    ));
+    assert!(matches!(module.body.stmts[1], AstStmt::CallStmt(_)));
+    assert!(matches!(
+        module.body.stmts[2],
+        AstStmt::Return(ref ret) if ret.values.is_empty()
+    ));
+}
+
+#[test]
 fn wraps_lifted_tail_with_do_block_when_branch_declares_local() {
     let local = LocalId(0);
     let mut module = AstModule {

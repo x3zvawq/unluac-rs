@@ -226,7 +226,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         }
 
-        if matches!(recovery, ValueMergeExprRecovery::Impure(_)) {
+        if recovery.consumes_header_subject() {
             self.overrides
                 .suppress_instrs(consumed_value_merge_subject_instrs(self.lowering, block));
         }

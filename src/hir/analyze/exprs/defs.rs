@@ -14,6 +14,10 @@ pub(crate) fn is_multiret_results(results: crate::transformer::ResultPack) -> bo
 ///
 /// 这主要服务 merge 点上的值恢复。我们只在“一个 def 能稳定对应一个值表达式”时
 /// 返回 `Some`，否则宁可交回上层继续保守退化，也不在这里伪造来源。
+///
+/// 这里一旦决定把某个 `call(...)` def 直接恢复成表达式，嵌套的 `callee/args` 也应继续按
+/// `single-eval` 语义下钻；否则像 `obj.method(...)` 这种“先读 field 再调用”的值会被
+/// 半截留成 temp，最终又把更高层的短路/value-merge 恢复逼回 `if` 壳。
 pub(crate) fn expr_for_fixed_def(lowering: &ProtoLowering<'_>, def_id: DefId) -> Option<HirExpr> {
     if let Some(expr) = expr_for_dup_safe_fixed_def(lowering, def_id) {
         return Some(expr);
@@ -154,8 +158,8 @@ fn expr_for_fixed_call(
     }
 
     Some(HirExpr::Call(Box::new(HirCallExpr {
-        callee: expr_for_reg_use_inline(lowering, block, instr_ref, call.callee),
-        args: lower_value_pack_inline(lowering, block, instr_ref, call.args),
+        callee: expr_for_reg_use_single_eval(lowering, block, instr_ref, call.callee),
+        args: lower_value_pack_single_eval(lowering, block, instr_ref, call.args),
         multiret: false,
         method: matches!(call.kind, CallKind::Method),
         method_name: lower_method_name(lowering.proto, call.method_name),

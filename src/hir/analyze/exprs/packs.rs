@@ -73,7 +73,7 @@ pub(crate) fn lower_value_pack_components(
     }
 }
 
-pub(crate) fn lower_value_pack_inline(
+pub(crate) fn lower_value_pack_single_eval(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,
     instr_ref: InstrRef,
@@ -82,7 +82,7 @@ pub(crate) fn lower_value_pack_inline(
     match pack {
         crate::transformer::ValuePack::Fixed(range) => (0..range.len)
             .map(|offset| {
-                expr_for_reg_use_inline(
+                expr_for_reg_use_single_eval(
                     lowering,
                     block,
                     instr_ref,
@@ -92,7 +92,7 @@ pub(crate) fn lower_value_pack_inline(
             .collect(),
         crate::transformer::ValuePack::Open(reg) => {
             lower_open_value_pack(lowering, reg, instr_ref, |reg| {
-                expr_for_reg_use_inline(lowering, block, instr_ref, reg)
+                expr_for_reg_use_single_eval(lowering, block, instr_ref, reg)
             })
         }
     }

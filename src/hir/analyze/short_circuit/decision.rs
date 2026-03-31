@@ -35,11 +35,33 @@ pub(crate) fn build_branch_decision_expr(
     short: &ShortCircuitCandidate,
     entry: ShortCircuitNodeRef,
 ) -> Option<HirDecisionExpr> {
+    build_branch_decision_expr_with_subject(lowering, short, entry, lower_short_circuit_subject)
+}
+
+pub(crate) fn build_branch_decision_expr_single_eval(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+    entry: ShortCircuitNodeRef,
+) -> Option<HirDecisionExpr> {
+    build_branch_decision_expr_with_subject(
+        lowering,
+        short,
+        entry,
+        lower_short_circuit_subject_single_eval,
+    )
+}
+
+fn build_branch_decision_expr_with_subject(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+    entry: ShortCircuitNodeRef,
+    subject_for_block: fn(&ProtoLowering<'_>, BlockRef) -> Option<HirExpr>,
+) -> Option<HirDecisionExpr> {
     build_decision_expr(
         lowering,
         short,
         entry,
-        lower_short_circuit_subject,
+        subject_for_block,
         |node, target| match target {
             ShortCircuitTarget::Node(next_ref) => Some(DecisionEdge::Node(*next_ref)),
             ShortCircuitTarget::TruthyExit => Some(DecisionEdge::Leaf(HirDecisionTarget::Expr(
@@ -62,12 +84,43 @@ pub(crate) fn build_branch_decision_expr_for_value_merge_candidate(
     truthy_leaves: &BTreeSet<BlockRef>,
     falsy_leaves: &BTreeSet<BlockRef>,
 ) -> Option<HirDecisionExpr> {
+    build_branch_decision_expr_for_value_merge_candidate_with_subject(
+        lowering,
+        short,
+        truthy_leaves,
+        falsy_leaves,
+        lower_short_circuit_subject_inline,
+    )
+}
+
+pub(crate) fn build_branch_decision_expr_for_value_merge_candidate_single_eval(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+    truthy_leaves: &BTreeSet<BlockRef>,
+    falsy_leaves: &BTreeSet<BlockRef>,
+) -> Option<HirDecisionExpr> {
+    build_branch_decision_expr_for_value_merge_candidate_with_subject(
+        lowering,
+        short,
+        truthy_leaves,
+        falsy_leaves,
+        lower_short_circuit_subject_single_eval,
+    )
+}
+
+fn build_branch_decision_expr_for_value_merge_candidate_with_subject(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+    truthy_leaves: &BTreeSet<BlockRef>,
+    falsy_leaves: &BTreeSet<BlockRef>,
+    subject_for_block: fn(&ProtoLowering<'_>, BlockRef) -> Option<HirExpr>,
+) -> Option<HirDecisionExpr> {
     let _ = branch_exit_blocks_from_value_merge_candidate(short)?;
     build_decision_expr(
         lowering,
         short,
         short.entry,
-        lower_short_circuit_subject_inline,
+        subject_for_block,
         |_, target| match target {
             ShortCircuitTarget::Node(next_ref) => Some(DecisionEdge::Node(*next_ref)),
             ShortCircuitTarget::Value(block) if truthy_leaves.contains(block) => Some(
@@ -88,11 +141,38 @@ pub(crate) fn build_value_decision_expr(
     short: &ShortCircuitCandidate,
     entry: ShortCircuitNodeRef,
 ) -> Option<HirDecisionExpr> {
-    build_decision_expr(
+    build_value_decision_expr_with_subject(
         lowering,
         short,
         entry,
         lower_short_circuit_subject_inline,
+    )
+}
+
+pub(crate) fn build_value_decision_expr_single_eval(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+    entry: ShortCircuitNodeRef,
+) -> Option<HirDecisionExpr> {
+    build_value_decision_expr_with_subject(
+        lowering,
+        short,
+        entry,
+        lower_short_circuit_subject_single_eval,
+    )
+}
+
+fn build_value_decision_expr_with_subject(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+    entry: ShortCircuitNodeRef,
+    subject_for_block: fn(&ProtoLowering<'_>, BlockRef) -> Option<HirExpr>,
+) -> Option<HirDecisionExpr> {
+    build_decision_expr(
+        lowering,
+        short,
+        entry,
+        subject_for_block,
         |node, target| match target {
             ShortCircuitTarget::Node(next_ref) => Some(DecisionEdge::Node(*next_ref)),
             ShortCircuitTarget::Value(block) if *block == node.header => {
@@ -216,6 +296,44 @@ fn combine_impure_value_merge_targets(
             })),
             fallback,
         }),
+        (
+            ImpureValueMergeTarget::Plan(ImpureValueMergePlan::OrFallback {
+                head: truthy_head,
+                fallback,
+            }),
+            ImpureValueMergeTarget::Plan(ImpureValueMergePlan::OrFallback {
+                head: falsy_head,
+                fallback: falsy_fallback,
+            }),
+        ) if fallback == falsy_fallback => {
+            combine_shared_fallback_impure_heads(subject, truthy_head, falsy_head, fallback)
+        }
+        _ => None,
+    }
+}
+
+fn combine_shared_fallback_impure_heads(
+    subject: HirExpr,
+    truthy_head: HirExpr,
+    falsy_head: HirExpr,
+    fallback: HirExpr,
+) -> Option<ImpureValueMergePlan> {
+    let falsy_guard = split_and_guard_with_shared_rhs(&falsy_head, &truthy_head)?;
+    Some(ImpureValueMergePlan::OrFallback {
+        head: HirExpr::LogicalAnd(Box::new(crate::hir::common::HirLogicalExpr {
+            lhs: HirExpr::LogicalOr(Box::new(crate::hir::common::HirLogicalExpr {
+                lhs: subject,
+                rhs: falsy_guard,
+            })),
+            rhs: truthy_head,
+        })),
+        fallback,
+    })
+}
+
+fn split_and_guard_with_shared_rhs(expr: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
+    match expr {
+        HirExpr::LogicalAnd(logical) if logical.rhs == *rhs => Some(logical.lhs.clone()),
         _ => None,
     }
 }

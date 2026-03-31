@@ -27,14 +27,27 @@ pub(crate) struct ConditionalReassignPlan {
 
 #[derive(Debug, Clone)]
 pub(crate) enum ValueMergeExprRecovery {
-    Pure(HirExpr),
+    Pure {
+        expr: HirExpr,
+        consumed_header_subject: bool,
+    },
     Impure(HirExpr),
 }
 
 impl ValueMergeExprRecovery {
     fn into_expr(self) -> HirExpr {
         match self {
-            Self::Pure(expr) | Self::Impure(expr) => expr,
+            Self::Pure { expr, .. } | Self::Impure(expr) => expr,
+        }
+    }
+
+    pub(crate) fn consumes_header_subject(&self) -> bool {
+        match self {
+            Self::Pure {
+                consumed_header_subject,
+                ..
+            } => *consumed_header_subject,
+            Self::Impure(_) => true,
         }
     }
 }
@@ -53,17 +66,18 @@ pub(crate) fn recover_short_value_merge_expr_recovery_with_allowed_blocks(
     short: &ShortCircuitCandidate,
     allowed_blocks: &BTreeSet<BlockRef>,
 ) -> Option<ValueMergeExprRecovery> {
-    if let Some(decision) = build_value_decision_expr(lowering, short, short.entry)
-        && !decision_references_forbidden_candidate_temps(
+    if let Some((expr, consumed_header_subject)) =
+        recover_pure_value_decision_expr_with_allowed_blocks(
             lowering,
             short,
-            &decision,
+            short.entry,
             allowed_blocks,
         )
     {
-        return Some(ValueMergeExprRecovery::Pure(finalize_value_decision_expr(
-            decision,
-        )));
+        return Some(ValueMergeExprRecovery::Pure {
+            expr,
+            consumed_header_subject,
+        });
     }
 
     let expr = build_impure_value_merge_expr(lowering, short, short.entry)?;
@@ -71,6 +85,30 @@ pub(crate) fn recover_short_value_merge_expr_recovery_with_allowed_blocks(
         return None;
     }
     Some(ValueMergeExprRecovery::Impure(expr))
+}
+
+fn recover_pure_value_decision_expr_with_allowed_blocks(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+    entry: ShortCircuitNodeRef,
+    allowed_blocks: &BTreeSet<BlockRef>,
+) -> Option<(HirExpr, bool)> {
+    let decision = build_value_decision_expr(lowering, short, entry)?;
+    let decision_needs_single_eval =
+        decision_references_forbidden_candidate_temps(lowering, short, &decision, allowed_blocks);
+    let decision = if decision_needs_single_eval {
+        build_value_decision_expr_single_eval(lowering, short, entry)?
+    } else {
+        decision
+    };
+    if decision_references_forbidden_candidate_temps(lowering, short, &decision, allowed_blocks) {
+        return None;
+    }
+    let expr = finalize_value_decision_expr(decision);
+    if matches!(&expr, HirExpr::Decision(decision) if !decision_is_synth_safe(decision)) {
+        return None;
+    }
+    Some((expr, decision_needs_single_eval))
 }
 
 pub(crate) fn value_merge_candidates_in_block<'a>(
@@ -131,7 +169,41 @@ pub(crate) fn build_branch_short_circuit_plan(
         .iter()
         .map(|node| node.header)
         .collect::<Vec<_>>();
-    let allowed_blocks = consumed_headers.iter().copied().collect::<BTreeSet<_>>();
+    // structured branch short-circuit 只会显式物化入口 header 的 block prefix；
+    // 其余 consumed headers 会直接被整段吃掉，不会再单独 lower。
+    //
+    // 因此这里不能把“后续 header 里定义出来的 temp”也算进允许范围，否则 cond
+    // 一旦还引用这些 temp，就会得到“定义语句被吞掉，但 temp 仍留在条件/then 里”
+    // 的悬空 HIR。多节点链条里只有入口 header 自己的 temp 能保证随后会被物化。
+    let allowed_blocks = BTreeSet::from([header]);
+    let decision = if decision_references_forbidden_candidate_temps(
+        lowering,
+        short,
+        &decision,
+        &allowed_blocks,
+    ) {
+        match short.exit {
+            // branch short-circuit 的最终条件只会在当前结构位点求值一次。
+            // 当后续 consumed header 的 subject 只是被保守地留成 temp ref 时，
+            // 这里允许沿既有 decision builder 退回到 single-eval lowering，
+            // 把那一跳恢复成源码级操作数本体，而不是直接整段退化成布尔壳。
+            ShortCircuitExit::BranchExit { .. } => {
+                build_branch_decision_expr_single_eval(lowering, short, short.entry)?
+            }
+            ShortCircuitExit::ValueMerge(_) => {
+                let (_, _, truthy_leaves, falsy_leaves) =
+                    branch_exit_blocks_from_value_merge_candidate(short)?;
+                build_branch_decision_expr_for_value_merge_candidate_single_eval(
+                    lowering,
+                    short,
+                    &truthy_leaves,
+                    &falsy_leaves,
+                )?
+            }
+        }
+    } else {
+        decision
+    };
     if decision_references_forbidden_candidate_temps(lowering, short, &decision, &allowed_blocks) {
         return None;
     }
@@ -319,18 +391,13 @@ fn build_changed_region_value_expr(
     region: ChangedRegionEntry,
 ) -> Option<HirExpr> {
     match region {
-        ChangedRegionEntry::Node(node_ref) => {
-            let decision = build_value_decision_expr(lowering, short, node_ref)?;
-            if decision_references_forbidden_candidate_temps(
-                lowering,
-                short,
-                &decision,
-                &BTreeSet::new(),
-            ) {
-                return None;
-            }
-            Some(finalize_value_decision_expr(decision))
-        }
+        ChangedRegionEntry::Node(node_ref) => recover_pure_value_decision_expr_with_allowed_blocks(
+            lowering,
+            short,
+            node_ref,
+            &BTreeSet::new(),
+        )
+        .map(|(expr, _)| expr),
         ChangedRegionEntry::Leaf(block) => lower_value_leaf_expr(lowering, short, block),
     }
 }

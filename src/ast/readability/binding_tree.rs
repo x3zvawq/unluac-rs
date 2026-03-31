@@ -547,6 +547,51 @@ pub(super) fn stmt_has_direct_call_arg_binding_use(stmt: &AstStmt, binding: AstB
     }
 }
 
+pub(super) fn stmt_has_call_callee_binding_use(stmt: &AstStmt, binding: AstBindingRef) -> bool {
+    match stmt {
+        AstStmt::LocalDecl(local_decl) => local_decl
+            .values
+            .iter()
+            .any(|value| expr_has_call_callee_binding_use(value, binding, false)),
+        AstStmt::GlobalDecl(global_decl) => global_decl
+            .values
+            .iter()
+            .any(|value| expr_has_call_callee_binding_use(value, binding, false)),
+        AstStmt::Assign(assign) => assign
+            .values
+            .iter()
+            .any(|value| expr_has_call_callee_binding_use(value, binding, false)),
+        AstStmt::CallStmt(call_stmt) => call_has_call_callee_binding_use(&call_stmt.call, binding),
+        AstStmt::Return(ret) => ret
+            .values
+            .iter()
+            .any(|value| expr_has_call_callee_binding_use(value, binding, false)),
+        AstStmt::If(if_stmt) => expr_has_call_callee_binding_use(&if_stmt.cond, binding, false),
+        AstStmt::While(while_stmt) => {
+            expr_has_call_callee_binding_use(&while_stmt.cond, binding, false)
+        }
+        AstStmt::Repeat(repeat_stmt) => {
+            expr_has_call_callee_binding_use(&repeat_stmt.cond, binding, false)
+        }
+        AstStmt::NumericFor(numeric_for) => {
+            expr_has_call_callee_binding_use(&numeric_for.start, binding, false)
+                || expr_has_call_callee_binding_use(&numeric_for.limit, binding, false)
+                || expr_has_call_callee_binding_use(&numeric_for.step, binding, false)
+        }
+        AstStmt::GenericFor(generic_for) => generic_for
+            .iterator
+            .iter()
+            .any(|expr| expr_has_call_callee_binding_use(expr, binding, false)),
+        AstStmt::DoBlock(_)
+        | AstStmt::FunctionDecl(_)
+        | AstStmt::LocalFunctionDecl(_)
+        | AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_) => false,
+    }
+}
+
 pub(super) fn stmt_has_nested_binding_value_use(stmt: &AstStmt, binding: AstBindingRef) -> bool {
     match stmt {
         AstStmt::LocalDecl(local_decl) => local_decl
@@ -685,6 +730,25 @@ fn call_has_direct_call_arg_binding_use(call: &AstCallKind, binding: AstBindingR
             .args
             .iter()
             .any(|arg| matches!(arg, AstExpr::Var(name) if name_matches_binding(name, binding))),
+    }
+}
+
+fn call_has_call_callee_binding_use(call: &AstCallKind, binding: AstBindingRef) -> bool {
+    match call {
+        AstCallKind::Call(call) => {
+            expr_has_call_callee_binding_use(&call.callee, binding, true)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_has_call_callee_binding_use(arg, binding, false))
+        }
+        AstCallKind::MethodCall(call) => {
+            expr_has_call_callee_binding_use(&call.receiver, binding, true)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_has_call_callee_binding_use(arg, binding, false))
+        }
     }
 }
 
@@ -873,6 +937,69 @@ fn expr_has_direct_call_arg_binding_use(expr: &AstExpr, binding: AstBindingRef) 
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
+        | AstExpr::VarArg => false,
+    }
+}
+
+fn expr_has_call_callee_binding_use(
+    expr: &AstExpr,
+    binding: AstBindingRef,
+    callee_position: bool,
+) -> bool {
+    match expr {
+        AstExpr::Var(name) => callee_position && name_matches_binding(name, binding),
+        AstExpr::FieldAccess(access) => {
+            expr_has_call_callee_binding_use(&access.base, binding, callee_position)
+        }
+        AstExpr::IndexAccess(access) => {
+            expr_has_call_callee_binding_use(&access.base, binding, callee_position)
+                || expr_has_call_callee_binding_use(&access.index, binding, false)
+        }
+        AstExpr::Unary(unary) => expr_has_call_callee_binding_use(&unary.expr, binding, false),
+        AstExpr::Binary(binary) => {
+            expr_has_call_callee_binding_use(&binary.lhs, binding, false)
+                || expr_has_call_callee_binding_use(&binary.rhs, binding, false)
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            expr_has_call_callee_binding_use(&logical.lhs, binding, false)
+                || expr_has_call_callee_binding_use(&logical.rhs, binding, false)
+        }
+        AstExpr::Call(call) => {
+            expr_has_call_callee_binding_use(&call.callee, binding, true)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_has_call_callee_binding_use(arg, binding, false))
+        }
+        AstExpr::MethodCall(call) => {
+            expr_has_call_callee_binding_use(&call.receiver, binding, true)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_has_call_callee_binding_use(arg, binding, false))
+        }
+        AstExpr::SingleValue(expr) => {
+            expr_has_call_callee_binding_use(expr, binding, callee_position)
+        }
+        AstExpr::TableConstructor(table) => table.fields.iter().any(|field| match field {
+            AstTableField::Array(value) => expr_has_call_callee_binding_use(value, binding, false),
+            AstTableField::Record(record) => {
+                let key_matches = match &record.key {
+                    AstTableKey::Name(_) => false,
+                    AstTableKey::Expr(key) => expr_has_call_callee_binding_use(key, binding, false),
+                };
+                key_matches || expr_has_call_callee_binding_use(&record.value, binding, false)
+            }
+        }),
+        AstExpr::FunctionExpr(_)
+        | AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
         | AstExpr::VarArg => false,
     }
 }

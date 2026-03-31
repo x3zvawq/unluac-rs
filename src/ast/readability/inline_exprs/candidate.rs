@@ -11,6 +11,7 @@ use super::super::super::common::{
 use super::super::expr_analysis::{
     is_access_base_inline_expr, is_context_safe_expr, is_direct_return_constructor_inline_expr,
     is_lookup_inline_expr as is_lookup_expr, is_mechanical_run_inline_expr,
+    is_raw_global_alias_expr as is_raw_global_expr,
 };
 
 pub(super) fn inline_candidate(stmt: &AstStmt) -> Option<(InlineCandidate, &AstExpr)> {
@@ -78,7 +79,7 @@ pub(super) enum InlinePolicy {
     ExtendedCallChain,
     AliasInitializerChain,
     AdjacentCallResultCallee,
-    AdjacentAssignValue,
+    AdjacentValueSink,
     DirectReturnConstructor,
     MechanicalRun,
 }
@@ -95,7 +96,7 @@ impl InlineCandidate {
         match self {
             Self::TempLike(_) => match policy {
                 InlinePolicy::MechanicalRun => is_mechanical_run_inline_expr(expr),
-                InlinePolicy::AdjacentAssignValue => false,
+                InlinePolicy::AdjacentValueSink => false,
                 InlinePolicy::DirectReturnConstructor => false,
                 _ => is_inline_candidate_expr(expr),
             },
@@ -112,8 +113,10 @@ impl InlineCandidate {
             } => match policy {
                 InlinePolicy::MechanicalRun => is_mechanical_run_inline_expr(expr),
                 InlinePolicy::AdjacentCallResultCallee => is_lookup_inline_expr(expr),
-                InlinePolicy::AdjacentAssignValue => {
-                    is_extended_neutral_local_alias_expr(expr) || is_recallable_inline_expr(expr)
+                InlinePolicy::AdjacentValueSink => {
+                    is_extended_neutral_local_alias_expr(expr)
+                        || is_recallable_inline_expr(expr)
+                        || is_raw_global_alias_expr(expr)
                 }
                 InlinePolicy::DirectReturnConstructor => {
                     is_direct_return_constructor_inline_expr(expr)
@@ -133,6 +136,10 @@ impl InlineCandidate {
 
 pub(super) fn is_lookup_inline_expr(expr: &AstExpr) -> bool {
     is_lookup_expr(expr)
+}
+
+pub(super) fn is_raw_global_alias_expr(expr: &AstExpr) -> bool {
+    is_raw_global_expr(expr)
 }
 
 pub(super) fn is_call_callee_inline_expr(expr: &AstExpr) -> bool {

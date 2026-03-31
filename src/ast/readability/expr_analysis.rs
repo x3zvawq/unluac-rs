@@ -100,6 +100,10 @@ pub(super) fn is_access_base_inline_expr(expr: &AstExpr) -> bool {
     is_atomic_access_base_expr(expr) || is_named_field_chain_expr(expr)
 }
 
+pub(super) fn is_raw_global_alias_expr(expr: &AstExpr) -> bool {
+    matches!(expr, AstExpr::Var(AstNameRef::Global(_)))
+}
+
 pub(super) fn is_lookup_inline_expr(expr: &AstExpr) -> bool {
     match expr {
         AstExpr::FieldAccess(access) => {
