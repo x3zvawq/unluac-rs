@@ -16,6 +16,13 @@ pub fn dump_generate(
     let mut output = String::new();
     let _ = writeln!(output, "===== Dump Generate =====");
     let _ = writeln!(output, "generate detail={}", detail.label());
+    let _ = writeln!(output, "target={}", chunk.dialect);
+    if !chunk.warnings.is_empty() {
+        let _ = writeln!(output, "warnings={}", chunk.warnings.len());
+        for warning in &chunk.warnings {
+            let _ = writeln!(output, "  - {warning}");
+        }
+    }
     let _ = writeln!(output);
     let _ = write!(output, "{}", chunk.source);
     colorize_debug_text(&output, color)

@@ -11,7 +11,7 @@ mod emit;
 mod error;
 mod render;
 
-pub use common::{GenerateOptions, GeneratedChunk, QuoteStyle, TableStyle};
+pub use common::{GenerateMode, GenerateOptions, GeneratedChunk, QuoteStyle, TableStyle};
 pub use debug::dump_generate;
 pub use emit::generate_chunk;
 pub use error::GenerateError;

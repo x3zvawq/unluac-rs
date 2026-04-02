@@ -14,7 +14,7 @@ use std::process::Command;
 use clap::{Parser, builder::BoolishValueParser};
 use unluac::decompile::{
     DebugColorMode, DebugDetail, DebugFilters, DecompileDialect, DecompileOptions, DecompileStage,
-    NamingMode, QuoteStyle, TableStyle, decompile, render_timing_report,
+    GenerateMode, NamingMode, QuoteStyle, TableStyle, decompile, render_timing_report,
     repo_debug_decompile_options,
 };
 use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
@@ -117,6 +117,9 @@ struct CliArgs {
     /// Whether to prefer conservative source generation.
     #[arg(long, value_name = "BOOL", value_parser = BoolishValueParser::new())]
     conservative_output: Option<bool>,
+    /// How to handle syntax not supported by the requested target dialect.
+    #[arg(long, value_parser = parse_generate_mode_arg)]
+    generate_mode: Option<GenerateMode>,
 }
 
 pub fn run<I>(args: I) -> Result<(), CliError>
@@ -134,6 +137,11 @@ where
     let debug_detail = options.decompile.debug.detail;
     let debug_color = options.decompile.debug.color;
     let result = decompile(&bytes, options.decompile)?;
+    if let Some(generated) = result.state.generated.as_ref() {
+        for warning in &generated.warnings {
+            eprintln!("[unluac][generate-warning] {warning}");
+        }
+    }
 
     if result.debug_output.is_empty() && result.timing_report.is_none() {
         if let Some(generated) = result.state.generated.as_ref() {
@@ -273,6 +281,9 @@ where
     }
     if let Some(value) = args.conservative_output {
         decompile.generate.conservative_output = value;
+    }
+    if let Some(mode) = args.generate_mode {
+        decompile.generate.mode = mode;
     }
 
     Ok(CliOptions {
@@ -494,6 +505,10 @@ fn parse_quote_style_arg(value: &str) -> Result<QuoteStyle, String> {
 
 fn parse_table_style_arg(value: &str) -> Result<TableStyle, String> {
     TableStyle::parse(value).ok_or_else(|| format!("unsupported table style: {value}"))
+}
+
+fn parse_generate_mode_arg(value: &str) -> Result<GenerateMode, String> {
+    GenerateMode::parse(value).ok_or_else(|| format!("unsupported generate mode: {value}"))
 }
 
 #[derive(Debug)]

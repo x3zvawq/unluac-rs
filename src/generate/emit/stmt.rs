@@ -6,9 +6,9 @@
 
 use crate::ast::pretty::is_default_numeric_for_step;
 use crate::ast::{
-    AstAssign, AstBlock, AstCallStmt, AstFunctionDecl, AstGenericFor, AstGlobalDecl, AstIf,
-    AstLabel, AstLocalDecl, AstLocalFunctionDecl, AstNumericFor, AstRepeat, AstReturn, AstStmt,
-    AstWhile,
+    AstAssign, AstBlock, AstCallStmt, AstFeature, AstFunctionDecl, AstGenericFor, AstGlobalDecl,
+    AstIf, AstLabel, AstLocalDecl, AstLocalFunctionDecl, AstNumericFor, AstRepeat, AstReturn,
+    AstStmt, AstWhile,
 };
 use crate::generate::doc::Doc;
 use crate::hir::HirProtoRef;
@@ -36,7 +36,7 @@ impl<'a> Emitter<'a> {
             AstStmt::GenericFor(generic_for) => self.emit_generic_for(generic_for, function),
             AstStmt::Break => Ok(Doc::text("break")),
             AstStmt::Continue => {
-                if !self.target.caps.continue_stmt {
+                if !self.allows_feature(AstFeature::ContinueStmt) {
                     return Err(GenerateError::UnsupportedFeature {
                         dialect: self.target.version,
                         feature: "continue",
@@ -45,7 +45,7 @@ impl<'a> Emitter<'a> {
                 Ok(Doc::text("continue"))
             }
             AstStmt::Goto(ast_goto) => {
-                if !self.target.caps.goto_label {
+                if !self.allows_feature(AstFeature::GotoLabel) {
                     return Err(GenerateError::UnsupportedFeature {
                         dialect: self.target.version,
                         feature: "goto",
@@ -91,7 +91,7 @@ impl<'a> Emitter<'a> {
         function: HirProtoRef,
     ) -> Result<Doc, GenerateError> {
         // Generate 只序列化 AST 上已经存在的 global decl，不替前层补猜缺失声明。
-        if !self.target.caps.global_decl {
+        if !self.allows_feature(AstFeature::GlobalDecl) {
             return Err(GenerateError::UnsupportedFeature {
                 dialect: self.target.version,
                 feature: "global",
@@ -103,7 +103,9 @@ impl<'a> Emitter<'a> {
                 function: function.index(),
             },
         )?;
-        if matches!(attr, crate::ast::AstGlobalAttr::Const) && !self.target.caps.global_const {
+        if matches!(attr, crate::ast::AstGlobalAttr::Const)
+            && !self.allows_feature(AstFeature::GlobalConst)
+        {
             return Err(GenerateError::UnsupportedFeature {
                 dialect: self.target.version,
                 feature: "global<const>",
@@ -295,7 +297,7 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_label(&self, label: &AstLabel) -> Result<Doc, GenerateError> {
-        if !self.target.caps.goto_label {
+        if !self.allows_feature(AstFeature::GotoLabel) {
             return Err(GenerateError::UnsupportedFeature {
                 dialect: self.target.version,
                 feature: "label",

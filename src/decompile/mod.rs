@@ -12,7 +12,7 @@ mod repo_debug;
 mod state;
 
 pub use crate::debug::{DebugColorMode, DebugDetail, DebugFilters};
-pub use crate::generate::{GenerateOptions, QuoteStyle, TableStyle};
+pub use crate::generate::{GenerateMode, GenerateOptions, QuoteStyle, TableStyle};
 pub use crate::naming::{
     FunctionNameMap, NameInfo, NameMap, NameSource, NamingMode, NamingOptions,
 };

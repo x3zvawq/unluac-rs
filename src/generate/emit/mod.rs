@@ -8,7 +8,8 @@ mod names;
 mod stmt;
 mod syntax;
 
-use crate::ast::{AstBlock, AstModule, AstTargetDialect};
+use crate::ast::{AstBlock, AstFeature, AstModule, AstTargetDialect};
+use crate::generate::GenerateMode;
 use crate::generate::doc::Doc;
 use crate::hir::HirProtoRef;
 use crate::naming::NameMap;
@@ -61,7 +62,9 @@ pub fn generate_chunk(
     };
     let doc = emitter.emit_module(module)?;
     Ok(GeneratedChunk {
+        dialect: target.version,
         source: render_doc(&doc, options),
+        warnings: Vec::new(),
     })
 }
 
@@ -72,6 +75,10 @@ struct Emitter<'a> {
 }
 
 impl<'a> Emitter<'a> {
+    fn allows_feature(&self, feature: AstFeature) -> bool {
+        self.target.supports_feature(feature) || self.options.mode != GenerateMode::Strict
+    }
+
     fn emit_module(&self, module: &AstModule) -> Result<Doc, GenerateError> {
         self.emit_block(&module.body, module.entry_function)
     }

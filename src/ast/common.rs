@@ -191,6 +191,30 @@ pub struct AstDialectCaps {
     pub global_const: bool,
 }
 
+/// AST/Generate 关心的可选语法特性。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash)]
+pub enum AstFeature {
+    GotoLabel,
+    ContinueStmt,
+    LocalConst,
+    LocalClose,
+    GlobalDecl,
+    GlobalConst,
+}
+
+impl AstFeature {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::GotoLabel => "goto",
+            Self::ContinueStmt => "continue",
+            Self::LocalConst => "local<const>",
+            Self::LocalClose => "local<close>",
+            Self::GlobalDecl => "global",
+            Self::GlobalConst => "global<const>",
+        }
+    }
+}
+
 /// 当前支持的目标方言版本。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AstDialectVersion {
@@ -276,6 +300,33 @@ impl AstTargetDialect {
             },
         };
         Self { version, caps }
+    }
+
+    pub const fn relaxed_for_lowering(version: AstDialectVersion) -> Self {
+        let mut caps = Self::new(version).caps;
+        caps.goto_label = true;
+        caps.local_const = true;
+        caps.local_close = true;
+        caps.global_decl = true;
+        caps.global_const = true;
+        Self { version, caps }
+    }
+
+    pub const fn supports_feature(self, feature: AstFeature) -> bool {
+        self.caps.supports(feature)
+    }
+}
+
+impl AstDialectCaps {
+    pub const fn supports(self, feature: AstFeature) -> bool {
+        match feature {
+            AstFeature::GotoLabel => self.goto_label,
+            AstFeature::ContinueStmt => self.continue_stmt,
+            AstFeature::LocalConst => self.local_const,
+            AstFeature::LocalClose => self.local_close,
+            AstFeature::GlobalDecl => self.global_decl,
+            AstFeature::GlobalConst => self.global_decl && self.global_const,
+        }
     }
 }
 

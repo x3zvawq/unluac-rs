@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use unluac::decompile::{DecompileStage, NamingMode};
+use unluac::decompile::{DecompileStage, GenerateMode, NamingMode};
 
 use super::parse_args;
 
@@ -25,7 +25,7 @@ fn requires_explicit_input_or_source() {
 fn defaults_to_pure_source_output_when_only_source_is_given() {
     let options = parse_args(args(&["--source", "case.lua"])).expect("source should parse");
     assert_eq!(options.source, Some(PathBuf::from("case.lua")));
-    assert_eq!(options.decompile.dialect.label(), "luajit");
+    assert_eq!(options.decompile.dialect.label(), "lua5.1");
     assert_eq!(options.decompile.target_stage, DecompileStage::Generate);
     assert_eq!(options.decompile.naming.mode, NamingMode::DebugLike);
     assert!(!options.decompile.debug.enable);
@@ -103,9 +103,12 @@ fn naming_mode_and_bool_options_override_defaults() {
         "false",
         "--conservative-output",
         "false",
+        "--generate-mode",
+        "best-effort",
     ]))
     .expect("boolish options should parse");
     assert_eq!(options.decompile.naming.mode, NamingMode::Simple);
     assert!(!options.decompile.naming.debug_like_include_function);
     assert!(!options.decompile.generate.conservative_output);
+    assert_eq!(options.decompile.generate.mode, GenerateMode::BestEffort);
 }

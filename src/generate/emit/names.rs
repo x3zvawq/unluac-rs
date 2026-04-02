@@ -4,8 +4,8 @@
 //! 例如：残留的 `TempRef` 若没被命名收掉，这里会直接报错而不是静默生成假名字。
 
 use crate::ast::{
-    AstBindingRef, AstFunctionDecl, AstFunctionName, AstGlobalBinding, AstGlobalBindingTarget,
-    AstLocalAttr, AstLocalBinding, AstNameRef,
+    AstBindingRef, AstFeature, AstFunctionDecl, AstFunctionName, AstGlobalBinding,
+    AstGlobalBindingTarget, AstLocalAttr, AstLocalBinding, AstNameRef,
 };
 use crate::generate::doc::Doc;
 use crate::hir::HirProtoRef;
@@ -107,6 +107,21 @@ impl<'a> Emitter<'a> {
         binding: &AstLocalBinding,
         function: HirProtoRef,
     ) -> Result<Doc, GenerateError> {
+        match binding.attr {
+            AstLocalAttr::Const if !self.allows_feature(AstFeature::LocalConst) => {
+                return Err(GenerateError::UnsupportedFeature {
+                    dialect: self.target.version,
+                    feature: "local<const>",
+                });
+            }
+            AstLocalAttr::Close if !self.allows_feature(AstFeature::LocalClose) => {
+                return Err(GenerateError::UnsupportedFeature {
+                    dialect: self.target.version,
+                    feature: "local<close>",
+                });
+            }
+            AstLocalAttr::None | AstLocalAttr::Const | AstLocalAttr::Close => {}
+        }
         let name = self.names.resolve_binding_ref(function, &binding.id)?;
         let text = match binding.attr {
             AstLocalAttr::None => name,

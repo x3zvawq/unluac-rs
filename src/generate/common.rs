@@ -3,15 +3,30 @@
 //! 这些类型需要同时被 decompile 入口、renderer 和调试输出复用，所以单独抽到这里，
 //! 避免把“生成选项”和“最终产物”散落在 emit/render 两边。
 
+use crate::ast::AstDialectVersion;
+
 /// 最终生成的源码结果。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedChunk {
+    pub dialect: AstDialectVersion,
     pub source: String,
+    pub warnings: Vec<String>,
+}
+
+impl Default for GeneratedChunk {
+    fn default() -> Self {
+        Self {
+            dialect: AstDialectVersion::Lua51,
+            source: String::new(),
+            warnings: Vec::new(),
+        }
+    }
 }
 
 /// 代码生成选项。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenerateOptions {
+    pub mode: GenerateMode,
     pub indent_width: usize,
     pub max_line_length: usize,
     pub quote_style: QuoteStyle,
@@ -22,11 +37,40 @@ pub struct GenerateOptions {
 impl Default for GenerateOptions {
     fn default() -> Self {
         Self {
+            mode: GenerateMode::Strict,
             indent_width: 4,
             max_line_length: 100,
             quote_style: QuoteStyle::MinEscape,
             table_style: TableStyle::Balanced,
             conservative_output: true,
+        }
+    }
+}
+
+/// 输出层在遇到目标方言不支持的语法时该如何处理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GenerateMode {
+    #[default]
+    Strict,
+    BestEffort,
+    Permissive,
+}
+
+impl GenerateMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::BestEffort => "best-effort",
+            Self::Permissive => "permissive",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "strict" => Some(Self::Strict),
+            "best-effort" | "best_effort" | "besteffort" => Some(Self::BestEffort),
+            "permissive" => Some(Self::Permissive),
+            _ => None,
         }
     }
 }

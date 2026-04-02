@@ -11,8 +11,8 @@ pub use crate::readability::ReadabilityOptions;
 pub use build::lower_ast;
 pub use common::{
     AstAssign, AstBinaryExpr, AstBinaryOpKind, AstBindingRef, AstBlock, AstCallExpr, AstCallKind,
-    AstCallStmt, AstDialectCaps, AstDialectVersion, AstExpr, AstFieldAccess, AstFunctionDecl,
-    AstFunctionExpr, AstFunctionName, AstGenericFor, AstGlobalAttr, AstGlobalBinding,
+    AstCallStmt, AstDialectCaps, AstDialectVersion, AstExpr, AstFeature, AstFieldAccess,
+    AstFunctionDecl, AstFunctionExpr, AstFunctionName, AstGenericFor, AstGlobalAttr, AstGlobalBinding,
     AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstGoto, AstIf, AstIndexAccess,
     AstLValue, AstLabel, AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl,
     AstLocalFunctionDecl, AstLocalOrigin, AstLogicalExpr, AstMethodCallExpr, AstModule,
