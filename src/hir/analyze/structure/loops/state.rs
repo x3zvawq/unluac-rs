@@ -58,11 +58,17 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 continue;
             }
 
-            let init = self.loop_exit_entry_expr_with_inside_blocks(
+            let Some(init) = self.loop_exit_entry_expr_with_inside_blocks(
                 value,
                 &candidate.blocks,
                 target_overrides,
-            )?;
+            ) else {
+                // exit-only merge 只是“循环结束后也许还能继续复用这条 state”的附加收益，
+                // 不是 numeric-for / generic-for 能否结构化的必要前提。
+                // 如果循环外 incoming 本身已经是多路语义合流，强行要求这里解出唯一初值，
+                // 只会把本来能安全恢复的 loop 整片打回 label/goto。
+                continue;
+            };
             let temp = *self.lowering.bindings.phi_temps.get(value.phi_id.index())?;
             let target = self.loop_state_target(candidate, exit, value.reg, temp, target_overrides);
             plan.backedge_target_overrides.insert(temp, target.clone());

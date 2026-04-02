@@ -228,11 +228,9 @@ pub(crate) fn build_conditional_reassign_plan(
         return None;
     };
     let phi_id = short.result_phi_id?;
-    let reg = short.result_reg?;
     if phi_use_count(lowering, phi_id) <= 1 {
         return None;
     }
-    let instr_ref = lowering.cfg.blocks[header.index()].instrs.last()?;
     let entry_defs = short.entry_defs.clone();
     if entry_defs.is_empty() {
         return None;
@@ -252,7 +250,7 @@ pub(crate) fn build_conditional_reassign_plan(
     }
     let cond = finalize_condition_decision_expr(cond_decision);
     let assigned_value = build_changed_region_value_expr(lowering, short, changed_region)?;
-    let init_value = expr_for_reg_use(lowering, header, instr_ref, reg);
+    let init_value = preserved_entry_value_expr(lowering, &entry_defs)?;
     let target_temp = *lowering.bindings.phi_temps.get(phi_id.index())?;
 
     Some(ConditionalReassignPlan {
@@ -270,6 +268,34 @@ pub(crate) fn build_conditional_reassign_plan(
 /// 被多次读取时，才把它恢复成“保留旧值 + 条件改写”的语句结构。
 fn phi_use_count(lowering: &ProtoLowering<'_>, phi_id: PhiId) -> usize {
     lowering.dataflow.phi_use_count(phi_id)
+}
+
+fn preserved_entry_value_expr(
+    lowering: &ProtoLowering<'_>,
+    entry_defs: &BTreeSet<DefId>,
+) -> Option<HirExpr> {
+    if entry_defs.len() == 1 {
+        let def = *entry_defs
+            .iter()
+            .next()
+            .expect("len checked above, exactly one reaching def exists");
+        let temp = *lowering.bindings.fixed_temps.get(def.index())?;
+        return Some(HirExpr::TempRef(temp));
+    }
+
+    let mut shared_expr = None;
+    for def in entry_defs {
+        let expr = expr_for_dup_safe_fixed_def(lowering, *def)?;
+        if shared_expr
+            .as_ref()
+            .is_some_and(|known_expr: &HirExpr| *known_expr != expr)
+        {
+            return None;
+        }
+        shared_expr = Some(expr);
+    }
+
+    shared_expr
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]

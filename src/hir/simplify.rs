@@ -11,6 +11,7 @@ mod carried_locals;
 mod close_scopes;
 mod closure_self_capture;
 mod dead_labels;
+mod dead_temps;
 pub(super) mod decision;
 mod locals;
 mod logical_simplify;
@@ -172,6 +173,12 @@ fn run_cleanup_round(module: &mut HirModule, timings: &TimingCollector) -> bool 
         timings,
         "carried-locals",
         carried_locals::collapse_carried_local_handoffs_in_proto,
+    );
+    changed |= apply_timed_proto_pass(
+        module,
+        timings,
+        "dead-unresolved-temps",
+        dead_temps::remove_dead_unresolved_temp_materializations_in_proto,
     );
     changed |= apply_timed_proto_pass(
         module,

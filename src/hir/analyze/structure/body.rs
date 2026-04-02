@@ -214,45 +214,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         match instr {
             LowInstr::Jump(jump) => {
                 let target = self.lowering.cfg.instr_to_block[jump.target.index()];
-                if let Some(loop_context) = self.active_loops.last() {
-                    if loop_context.continue_target == Some(target)
-                        && loop_context.continue_sources.contains(&block)
-                    {
-                        stmts.push(HirStmt::Continue);
-                        return Some(None);
-                    }
-                    if target == loop_context.header {
-                        return Some(None);
-                    }
-                    // Lua 5.2+ 的 loop break 常常直接跳到 post-loop continuation，
-                    // 而不会先经过额外的 break pad。这里如果继续把它当普通线性 successor，
-                    // body lowering 就会错误地走出当前 loop，最终把 numeric-for/while
-                    // 整体打回 unresolved。对当前活跃 loop 来说，这条边的语义就是 break。
-                    if target == loop_context.post_loop {
-                        stmts.push(HirStmt::Break);
-                        return Some(None);
-                    }
-                    if Some(target) == loop_context.downstream_post_loop {
-                        stmts.push(HirStmt::Break);
-                        return Some(None);
-                    }
-                    if let Some(break_block) = loop_context.break_exits.get(&target) {
-                        stmts.extend(break_block.stmts.clone());
-                        self.visited.insert(target);
-                        return Some(None);
-                    }
-                }
-                if Some(target) == stop || target == self.lowering.cfg.exit_block {
-                    Some(if target == self.lowering.cfg.exit_block {
-                        None
-                    } else {
-                        Some(target)
-                    })
-                } else if self.lowering.cfg.reachable_blocks.contains(&target) {
-                    Some(Some(target))
-                } else {
-                    None
-                }
+                self.follow_linear_target(block, target, stop, stmts)
+            }
+            LowInstr::Branch(branch)
+                if self.lowering.cfg.instr_to_block[branch.then_target.index()]
+                    == self.lowering.cfg.instr_to_block[branch.else_target.index()] =>
+            {
+                let target = self.lowering.cfg.instr_to_block[branch.then_target.index()];
+                self.follow_linear_target(block, target, stop, stmts)
             }
             LowInstr::Return(_) | LowInstr::TailCall(_) => {
                 let empty_labels = BTreeMap::new();
@@ -266,11 +235,58 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 stmts.extend(lowered);
                 Some(None)
             }
-            LowInstr::Branch(_)
-            | LowInstr::NumericForInit(_)
+            LowInstr::Branch(_) | LowInstr::NumericForInit(_)
             | LowInstr::NumericForLoop(_)
             | LowInstr::GenericForLoop(_) => None,
             _ => None,
+        }
+    }
+
+    fn follow_linear_target(
+        &mut self,
+        block: BlockRef,
+        target: BlockRef,
+        stop: Option<BlockRef>,
+        stmts: &mut Vec<HirStmt>,
+    ) -> Option<Option<BlockRef>> {
+        if let Some(loop_context) = self.active_loops.last() {
+            if loop_context.continue_target == Some(target)
+                && loop_context.continue_sources.contains(&block)
+            {
+                stmts.push(HirStmt::Continue);
+                return Some(None);
+            }
+            if target == loop_context.header {
+                return Some(None);
+            }
+            // Lua 5.2+ 的 loop break 常常直接跳到 post-loop continuation，
+            // 而不会先经过额外的 break pad。这里如果继续把它当普通线性 successor，
+            // body lowering 就会错误地走出当前 loop，最终把 numeric-for/while
+            // 整体打回 unresolved。对当前活跃 loop 来说，这条边的语义就是 break。
+            if target == loop_context.post_loop {
+                stmts.push(HirStmt::Break);
+                return Some(None);
+            }
+            if Some(target) == loop_context.downstream_post_loop {
+                stmts.push(HirStmt::Break);
+                return Some(None);
+            }
+            if let Some(break_block) = loop_context.break_exits.get(&target) {
+                stmts.extend(break_block.stmts.clone());
+                self.visited.insert(target);
+                return Some(None);
+            }
+        }
+        if Some(target) == stop || target == self.lowering.cfg.exit_block {
+            Some(if target == self.lowering.cfg.exit_block {
+                None
+            } else {
+                Some(target)
+            })
+        } else if self.lowering.cfg.reachable_blocks.contains(&target) {
+            Some(Some(target))
+        } else {
+            None
         }
     }
 
@@ -626,7 +642,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     .can_reach_within(entry, stop, &allowed_blocks)
         };
 
-        arm_reaches_stop(then_entry) && else_entry.is_some_and(arm_reaches_stop)
+        // `if-then` / guard 没有显式 else 臂时，缺席的那一臂本来就代表“当前 region 不再
+        // 产生额外语句，直接把控制权交回外层 stop”。这里如果仍然要求 else_entry 存在，
+        // 嵌套 guard 会被错误地强推到自己的 merge 上，跨出外层 region，最后在更深的
+        // merge block 上重入并把整片结构化打回失败。
+        arm_reaches_stop(then_entry) && else_entry.is_none_or(arm_reaches_stop)
     }
 }
 

@@ -2157,6 +2157,60 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn loop_tail_guard_hir_keeps_numeric_for_guard_without_continue() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/control_flow/08_loop_tail_guard.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Normal,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("loop_tail_guard hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("numeric-for "), "{dump}");
+        assert!(dump.contains("if "), "{dump}");
+        assert!(!dump.contains("continue"), "{dump}");
+        assert!(!dump.contains("unresolved("), "{dump}");
+    }
+
+    #[test]
+    fn loop_tail_guard_generate_recovers_plain_guard_shape_for_lua51() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/control_flow/08_loop_tail_guard.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("loop_tail_guard generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(generated.source.contains("for "), "{}", generated.source);
+        assert!(generated.source.contains("if "), "{}", generated.source);
+        assert!(!generated.source.contains("continue"), "{}", generated.source);
+        assert!(!generated.source.contains("goto"), "{}", generated.source);
+    }
+
+    #[test]
     fn loop_closure_break_return_hir_suppresses_exit_phi_from_break_funnel() {
         let result = decompile(
             &compile_lua_case(

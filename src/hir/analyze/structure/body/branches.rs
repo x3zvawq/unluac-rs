@@ -482,18 +482,21 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         if candidate.merge == Some(continue_target) {
-            // `if cond then body end` 这类源码在 CFG 里会表现成“显式一臂 + 隐式 merge”，
-            // 如果 merge 恰好就是当前 loop 的 continue target，这里应该继续保留源码级
-            // loop 控制语义，而不是因为缺少显式 else 边就整段 fallback。
+            // `if cond then body end` 这类 loop-tail guard 在 CFG 里会表现成
+            // “显式一臂 + 隐式 merge”，而 merge 正好就是当前 loop 的 continue target。
+            // 这种形状本质上是“条件满足时执行 body，否则自然落回 loop latch”，
+            // 并不需要显式 `continue`。如果这里仍然强行提升成 `if ... then continue else ... end`，
+            // Lua 5.1 这类没有 `continue` / `goto` 的 dialect 就会被我们凭空制造出
+            // 无法落地的语义。
             let non_continue_block = self.lower_region(
                 candidate.then_entry,
                 Some(continue_target),
                 target_overrides,
             )?;
             stmts.push(branch_stmt(
-                continue_cond,
-                continue_block,
-                Some(non_continue_block),
+                negate_expr(continue_cond),
+                non_continue_block,
+                None,
             ));
             return Some(Some(continue_target));
         }
