@@ -19,7 +19,7 @@ use self::candidate::{
 use self::use_sites::rewrite_stmt_use_sites_with_policy;
 use super::super::common::{AstBindingRef, AstBlock, AstModule, AstStmt};
 use super::ReadabilityContext;
-use super::binding_flow::{count_binding_uses_in_stmt, count_binding_uses_in_stmts};
+use super::binding_flow::BindingUseIndex;
 use super::binding_tree::{
     expr_references_binding, stmt_has_access_base_binding_use, stmt_has_call_callee_binding_use,
     stmt_has_direct_call_arg_binding_use, stmt_has_index_binding_use, stmt_has_nested_binding_use,
@@ -51,6 +51,7 @@ fn rewrite_current_block(block: &mut AstBlock, options: ReadabilityOptions) -> b
     let mut changed = false;
 
     let old_stmts = std::mem::take(&mut block.stmts);
+    let use_index = BindingUseIndex::for_stmts(&old_stmts);
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut index = 0;
     while index < old_stmts.len() {
@@ -145,7 +146,7 @@ fn rewrite_current_block(block: &mut AstBlock, options: ReadabilityOptions) -> b
             index += 1;
             continue;
         }
-        if count_binding_uses_in_stmts(&old_stmts[(index + 1)..], candidate.binding()) != 1 {
+        if use_index.count_uses_in_suffix(index + 1, candidate.binding()) != 1 {
             new_stmts.push(old_stmts[index].clone());
             index += 1;
             continue;
@@ -199,6 +200,7 @@ fn rewrite_current_block(block: &mut AstBlock, options: ReadabilityOptions) -> b
 
 fn collapse_adjacent_call_alias_runs(block: &mut AstBlock, options: ReadabilityOptions) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
+    let use_index = BindingUseIndex::for_stmts(&old_stmts);
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
     let mut index = 0;
@@ -229,24 +231,20 @@ fn collapse_adjacent_call_alias_runs(block: &mut AstBlock, options: ReadabilityO
             if !matches!(candidate, candidate::InlineCandidate::LocalAlias { .. }) {
                 continue;
             }
-            if count_binding_uses_in_stmts(
-                &old_stmts[(candidate_index + 1)..(run_end + 1)],
-                candidate.binding(),
-            ) != 1
+            if use_index.count_uses_in_range(candidate_index + 1, run_end + 1, candidate.binding())
+                != 1
             {
                 continue;
             }
             let intermediate_uses = if candidate::is_lookup_inline_expr(value) {
                 count_binding_uses_in_remaining_run(
-                    &old_stmts[(candidate_index + 1)..run_end],
+                    &use_index,
+                    candidate_index + 1,
                     &removed[(candidate_index + 1 - index)..],
                     candidate.binding(),
                 )
             } else {
-                count_binding_uses_in_stmts(
-                    &old_stmts[(candidate_index + 1)..run_end],
-                    candidate.binding(),
-                )
+                use_index.count_uses_in_range(candidate_index + 1, run_end, candidate.binding())
             };
             if intermediate_uses != 0 {
                 continue;
@@ -294,6 +292,7 @@ fn collapse_terminal_call_result_alias_runs(
     options: ReadabilityOptions,
 ) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
+    let use_index = BindingUseIndex::for_stmts(&old_stmts);
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
     let mut index = 0;
@@ -316,22 +315,18 @@ fn collapse_terminal_call_result_alias_runs(
             if !matches!(candidate, candidate::InlineCandidate::LocalAlias { .. }) {
                 continue;
             }
-            if count_binding_uses_in_stmts(&old_stmts[(candidate_index + 1)..], candidate.binding())
-                != 1
-            {
+            if use_index.count_uses_in_suffix(candidate_index + 1, candidate.binding()) != 1 {
                 continue;
             }
             let intermediate_uses = if candidate::is_lookup_inline_expr(value) {
                 count_binding_uses_in_remaining_run(
-                    &old_stmts[(candidate_index + 1)..sink_index],
+                    &use_index,
+                    candidate_index + 1,
                     &removed[(candidate_index + 1 - index)..],
                     candidate.binding(),
                 )
             } else {
-                count_binding_uses_in_stmts(
-                    &old_stmts[(candidate_index + 1)..sink_index],
-                    candidate.binding(),
-                )
+                use_index.count_uses_in_range(candidate_index + 1, sink_index, candidate.binding())
             };
             if intermediate_uses != 0
                 || !stmt_has_nested_binding_use(&rewritten_sink, candidate.binding())
@@ -410,6 +405,7 @@ fn collapse_adjacent_mechanical_alias_runs(
     options: ReadabilityOptions,
 ) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
+    let use_index = BindingUseIndex::for_stmts(&old_stmts);
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
     let mut index = 0;
@@ -442,18 +438,17 @@ fn collapse_adjacent_mechanical_alias_runs(
             if !candidate.allows_expr_with_policy(value, InlinePolicy::MechanicalRun) {
                 continue;
             }
-            if count_binding_uses_in_stmts(
-                &old_stmts[(candidate_index + 1)..(run_end + 1)],
-                candidate.binding(),
-            ) != 1
+            if use_index.count_uses_in_range(candidate_index + 1, run_end + 1, candidate.binding())
+                != 1
             {
                 continue;
             }
-            if count_binding_uses_in_stmts(&old_stmts[(run_end + 1)..], candidate.binding()) != 0 {
+            if use_index.count_uses_in_suffix(run_end + 1, candidate.binding()) != 0 {
                 continue;
             }
             if count_binding_uses_in_remaining_run(
-                &old_stmts[(candidate_index + 1)..run_end],
+                &use_index,
+                candidate_index + 1,
                 &removed[(candidate_index + 1 - index)..],
                 candidate.binding(),
             ) != 0
@@ -515,6 +510,7 @@ fn collapse_terminal_local_mechanical_runs(
     options: ReadabilityOptions,
 ) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
+    let use_index = BindingUseIndex::for_stmts(&old_stmts);
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
     let mut index = 0;
@@ -542,7 +538,7 @@ fn collapse_terminal_local_mechanical_runs(
         if !matches!(
             sink_candidate,
             candidate::InlineCandidate::LocalAlias { .. }
-        ) || count_binding_uses_in_stmts(&old_stmts[run_end..], sink_candidate.binding()) == 0
+        ) || use_index.count_uses_in_suffix(run_end, sink_candidate.binding()) == 0
         {
             new_stmts.push(old_stmts[index].clone());
             index += 1;
@@ -560,16 +556,15 @@ fn collapse_terminal_local_mechanical_runs(
             if !candidate.allows_expr_with_policy(value, InlinePolicy::MechanicalRun) {
                 continue;
             }
-            if count_binding_uses_in_stmts(&old_stmts[(candidate_index + 1)..], candidate.binding())
-                != 1
-            {
+            if use_index.count_uses_in_suffix(candidate_index + 1, candidate.binding()) != 1 {
                 continue;
             }
-            if count_binding_uses_in_stmts(&old_stmts[run_end..], candidate.binding()) != 0 {
+            if use_index.count_uses_in_suffix(run_end, candidate.binding()) != 0 {
                 continue;
             }
             if count_binding_uses_in_remaining_run(
-                &old_stmts[(candidate_index + 1)..(run_end - 1)],
+                &use_index,
+                candidate_index + 1,
                 &removed[(candidate_index + 1 - index)..],
                 candidate.binding(),
             ) != 0
@@ -708,15 +703,16 @@ fn lvalue_matches_lookup_expr(
 }
 
 fn count_binding_uses_in_remaining_run(
-    stmts: &[AstStmt],
+    use_index: &BindingUseIndex,
+    start_index: usize,
     removed: &[bool],
     binding: AstBindingRef,
 ) -> usize {
-    stmts
+    removed
         .iter()
-        .zip(removed.iter())
+        .enumerate()
         .filter(|(_, removed)| !**removed)
-        .map(|(stmt, _)| count_binding_uses_in_stmt(stmt, binding))
+        .map(|(offset, _)| use_index.count_uses_in_stmt_index(start_index + offset, binding))
         .sum()
 }
 

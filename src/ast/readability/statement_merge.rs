@@ -23,7 +23,7 @@ use super::super::common::{
 };
 use super::ReadabilityContext;
 use super::binding_flow::{
-    block_references_any_binding, count_binding_uses_in_stmts, expr_references_any_binding,
+    BindingUseIndex, block_references_any_binding, expr_references_any_binding,
     stmt_references_any_binding,
 };
 use super::expr_analysis::{expr_complexity, is_copy_like_expr};
@@ -72,6 +72,7 @@ impl AstRewritePass for StatementMergePass {
 
 fn merge_adjacent_single_value_local_decls(block: &mut AstBlock) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
+    let use_index = BindingUseIndex::for_stmts(&old_stmts);
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
     let mut index = 0;
@@ -109,7 +110,7 @@ fn merge_adjacent_single_value_local_decls(block: &mut AstBlock) -> bool {
 
         let has_multi_use_binding = bindings
             .iter()
-            .any(|binding| count_binding_uses_in_stmts(&old_stmts[lookahead..], binding.id) > 1);
+            .any(|binding| use_index.count_uses_in_suffix(lookahead, binding.id) > 1);
 
         // 这里只合并真正有“阶段 local”味道的连续声明：
         // 如果整组 binding 都只在后缀里被读一次，那往往只是调用前的机械 alias 准备序列，
@@ -140,6 +141,7 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock) -> bool {
             index += 1;
             continue;
         };
+        let use_index = BindingUseIndex::for_stmts(&block.stmts);
 
         let mut remaining = pending_bindings;
         let mut sink_changed = false;
@@ -162,7 +164,8 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock) -> bool {
             if let Some(attempt) = try_sink_hoisted_decl_into_nested_stmt_anywhere(
                 &remaining,
                 &block.stmts[lookahead],
-                &block.stmts[(lookahead + 1)..],
+                &use_index,
+                lookahead + 1,
             ) {
                 block.stmts[lookahead] = attempt.rewritten;
                 remaining.drain(attempt.start..(attempt.start + attempt.consumed));
@@ -205,15 +208,18 @@ struct NestedSinkAttempt {
 fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
     pending: &[super::super::common::AstLocalBinding],
     stmt: &AstStmt,
-    suffix: &[AstStmt],
+    use_index: &BindingUseIndex,
+    suffix_start: usize,
 ) -> Option<NestedSinkAttempt> {
     for start in 0..pending.len() {
-        if count_binding_uses_in_stmts(suffix, pending[start].id) != 0 {
+        if use_index.count_uses_in_suffix(suffix_start, pending[start].id) != 0 {
             continue;
         }
 
         let mut end = start;
-        while end < pending.len() && count_binding_uses_in_stmts(suffix, pending[end].id) == 0 {
+        while end < pending.len()
+            && use_index.count_uses_in_suffix(suffix_start, pending[end].id) == 0
+        {
             end += 1;
         }
 
@@ -223,7 +229,12 @@ fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
         // 这种形状会因为 `next` 还要在 if 之后继续用，把 `staged` 也一起卡在块顶。
         for slice_end in (start + 1..=end).rev() {
             if let Some((rewritten, consumed)) =
-                try_sink_hoisted_decl_into_nested_stmt(&pending[start..slice_end], stmt, suffix)
+                try_sink_hoisted_decl_into_nested_stmt(
+                    &pending[start..slice_end],
+                    stmt,
+                    use_index,
+                    suffix_start,
+                )
             {
                 return Some(NestedSinkAttempt {
                     rewritten,
@@ -240,11 +251,12 @@ fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
 fn try_sink_hoisted_decl_into_nested_stmt(
     pending: &[super::super::common::AstLocalBinding],
     stmt: &AstStmt,
-    suffix: &[AstStmt],
+    use_index: &BindingUseIndex,
+    suffix_start: usize,
 ) -> Option<(AstStmt, usize)> {
     let sinkable_len = pending
         .iter()
-        .take_while(|binding| count_binding_uses_in_stmts(suffix, binding.id) == 0)
+        .take_while(|binding| use_index.count_uses_in_suffix(suffix_start, binding.id) == 0)
         .count();
     if sinkable_len == 0 {
         return None;
@@ -353,6 +365,7 @@ fn sink_pending_bindings_into_block(
     block: &mut AstBlock,
     pending: &[super::super::common::AstLocalBinding],
 ) -> usize {
+    let use_index = BindingUseIndex::for_stmts(&block.stmts);
     let mut consumed = 0usize;
     let mut index = 0usize;
     while index < block.stmts.len() && consumed < pending.len() {
@@ -371,7 +384,8 @@ fn sink_pending_bindings_into_block(
         if let Some((rewritten, nested_consumed)) = try_sink_hoisted_decl_into_nested_stmt(
             remaining,
             &block.stmts[index],
-            &block.stmts[(index + 1)..],
+            &use_index,
+            index + 1,
         ) {
             block.stmts[index] = rewritten;
             consumed += nested_consumed;

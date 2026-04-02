@@ -14,7 +14,7 @@
 //!   压回线性链
 //! - 如果某个判断链里存在回边或 merge 不受 root 支配，这里会直接放弃候选
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::cfg::{BlockRef, Cfg, DataflowFacts, DominatorTree, GraphFacts, PhiCandidate};
 use crate::transformer::{LoweredProto, Reg};
@@ -38,21 +38,35 @@ pub(super) fn analyze_value_merge_candidates(
     branch_candidates: &[BranchCandidate],
 ) -> Vec<ShortCircuitCandidate> {
     let mut best_by_merge = BTreeMap::<(BlockRef, Reg), ShortCircuitCandidate>::new();
+    let dom_tree = &graph_facts.dominator_tree;
+    let build_ctx = ValueMergeBuildCtx {
+        proto,
+        cfg,
+        dataflow,
+        branch_by_header,
+        dom_tree,
+    };
 
     for phi in &dataflow.phi_candidates {
         if phi.incoming.len() < 2 {
             continue;
         }
 
+        let merge_reachability = MergeReachability::for_merge(cfg, phi.block);
+
         for root in branch_candidates {
+            if root.header == phi.block
+                || !dom_tree.dominates(root.header, phi.block)
+                || !merge_reachability.contains(root.header)
+            {
+                continue;
+            }
+
             let Some(candidate) = ValueMergeDagBuilder::new(
-                proto,
-                cfg,
-                graph_facts,
-                dataflow,
-                branch_by_header,
+                &build_ctx,
                 root.header,
                 phi,
+                &merge_reachability,
             )
             .build() else {
                 continue;
@@ -71,18 +85,53 @@ pub(super) fn analyze_value_merge_candidates(
     best_by_merge.into_values().collect()
 }
 
+struct MergeReachability {
+    reaches_merge: Vec<bool>,
+}
+
+struct ValueMergeBuildCtx<'a> {
+    proto: &'a LoweredProto,
+    cfg: &'a Cfg,
+    dataflow: &'a DataflowFacts,
+    branch_by_header: &'a BTreeMap<BlockRef, &'a BranchCandidate>,
+    dom_tree: &'a DominatorTree,
+}
+
+impl MergeReachability {
+    fn for_merge(cfg: &Cfg, merge: BlockRef) -> Self {
+        let mut reaches_merge = vec![false; cfg.blocks.len()];
+        let mut worklist = VecDeque::from([merge]);
+
+        while let Some(block) = worklist.pop_front() {
+            if !cfg.reachable_blocks.contains(&block) || std::mem::replace(&mut reaches_merge[block.index()], true) {
+                continue;
+            }
+
+            for edge_ref in &cfg.preds[block.index()] {
+                let pred = cfg.edges[edge_ref.index()].from;
+                if cfg.reachable_blocks.contains(&pred) && !reaches_merge[pred.index()] {
+                    worklist.push_back(pred);
+                }
+            }
+        }
+
+        Self { reaches_merge }
+    }
+
+    fn contains(&self, block: BlockRef) -> bool {
+        self.reaches_merge.get(block.index()).copied().unwrap_or(false)
+    }
+}
+
 struct ValueMergeDagBuilder<'a> {
     proto: &'a LoweredProto,
     cfg: &'a Cfg,
     dataflow: &'a DataflowFacts,
     branch_by_header: &'a BTreeMap<BlockRef, &'a BranchCandidate>,
     dom_tree: &'a DominatorTree,
+    merge_reachability: &'a MergeReachability,
     root: BlockRef,
-    merge: BlockRef,
-    reg: Reg,
-    phi_id: crate::cfg::PhiId,
-    entry_defs: BTreeSet<crate::cfg::DefId>,
-    value_incomings: Vec<super::super::common::ShortCircuitValueIncoming>,
+    phi: &'a PhiCandidate,
     nodes: Vec<ShortCircuitNode>,
     node_by_header: BTreeMap<BlockRef, ShortCircuitNodeRef>,
     visiting: BTreeSet<BlockRef>,
@@ -92,28 +141,20 @@ struct ValueMergeDagBuilder<'a> {
 
 impl<'a> ValueMergeDagBuilder<'a> {
     fn new(
-        proto: &'a LoweredProto,
-        cfg: &'a Cfg,
-        graph_facts: &'a GraphFacts,
-        dataflow: &'a DataflowFacts,
-        branch_by_header: &'a BTreeMap<BlockRef, &'a BranchCandidate>,
+        ctx: &'a ValueMergeBuildCtx<'a>,
         root: BlockRef,
         phi: &'a PhiCandidate,
+        merge_reachability: &'a MergeReachability,
     ) -> Self {
-        let phi_facts = short_circuit_phi_facts(cfg, dataflow, root, phi.reg, phi);
-
         Self {
-            proto,
-            cfg,
-            dataflow,
-            branch_by_header,
-            dom_tree: &graph_facts.dominator_tree,
+            proto: ctx.proto,
+            cfg: ctx.cfg,
+            dataflow: ctx.dataflow,
+            branch_by_header: ctx.branch_by_header,
+            dom_tree: ctx.dom_tree,
+            merge_reachability,
             root,
-            merge: phi.block,
-            reg: phi.reg,
-            phi_id: phi.id,
-            entry_defs: phi_facts.entry_defs,
-            value_incomings: phi_facts.value_incomings,
+            phi,
             nodes: Vec::new(),
             node_by_header: BTreeMap::new(),
             visiting: BTreeSet::new(),
@@ -124,8 +165,9 @@ impl<'a> ValueMergeDagBuilder<'a> {
 
     fn build(mut self) -> Option<ShortCircuitCandidate> {
         if !self.branch_by_header.contains_key(&self.root)
-            || self.merge == self.root
-            || !self.dom_tree.dominates(self.root, self.merge)
+            || self.phi.block == self.root
+            || !self.dom_tree.dominates(self.root, self.phi.block)
+            || !self.merge_reachability.contains(self.root)
         {
             return None;
         }
@@ -149,17 +191,19 @@ impl<'a> ValueMergeDagBuilder<'a> {
             return None;
         }
 
+        let phi_facts =
+            short_circuit_phi_facts(self.cfg, self.dataflow, self.root, self.phi.reg, self.phi);
         let reducible = is_reducible_candidate(self.cfg, self.root, &self.blocks);
         Some(ShortCircuitCandidate {
             header: self.root,
             blocks: self.blocks,
             entry,
             nodes: self.nodes,
-            exit: ShortCircuitExit::ValueMerge(self.merge),
-            result_reg: Some(self.reg),
-            result_phi_id: Some(self.phi_id),
-            entry_defs: self.entry_defs,
-            value_incomings: self.value_incomings,
+            exit: ShortCircuitExit::ValueMerge(self.phi.block),
+            result_reg: Some(self.phi.reg),
+            result_phi_id: Some(self.phi.id),
+            entry_defs: phi_facts.entry_defs,
+            value_incomings: phi_facts.value_incomings,
             reducible,
         })
     }
@@ -173,7 +217,9 @@ impl<'a> ValueMergeDagBuilder<'a> {
         }
 
         let _candidate = self.branch_by_header.get(&header)?;
-        if !self.dom_tree.dominates(self.root, header) || !self.cfg.can_reach(header, self.merge) {
+        if !self.dom_tree.dominates(self.root, header)
+            || !self.merge_reachability.contains(header)
+        {
             self.visiting.remove(&header);
             return None;
         }
@@ -207,7 +253,7 @@ impl<'a> ValueMergeDagBuilder<'a> {
         from_header: BlockRef,
         target: BlockRef,
     ) -> Option<ShortCircuitTarget> {
-        if target == self.merge {
+        if target == self.phi.block {
             self.value_leaves.insert(from_header);
             return Some(ShortCircuitTarget::Value(from_header));
         }
@@ -221,10 +267,10 @@ impl<'a> ValueMergeDagBuilder<'a> {
         })
         .follow(
             target,
-            |block| block != self.merge && self.cfg.can_reach(block, self.merge),
+            |block| block != self.phi.block && self.merge_reachability.contains(block),
             |block, succs| {
-                matches!(succs, [succ] if *succ == self.merge)
-                    && block_writes_reg(self.proto, self.dataflow, self.cfg, block, self.reg)
+                matches!(succs, [succ] if *succ == self.phi.block)
+                    && block_writes_reg(self.proto, self.dataflow, self.cfg, block, self.phi.reg)
             },
         )? {
             LinearFollowTarget::Header(header) => {
@@ -240,7 +286,8 @@ impl<'a> ValueMergeDagBuilder<'a> {
 
     fn value_leaves_feed_phi(&self) -> bool {
         let mut incoming_preds = self
-            .value_incomings
+            .phi
+            .incoming
             .iter()
             .map(|incoming| incoming.pred)
             .collect::<Vec<_>>();
