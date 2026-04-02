@@ -75,7 +75,7 @@ pub(super) fn materialize_instruction_facts(
             instruction_facts.open_reaching_defs[instr_index] = current_open.clone();
 
             let fixed_use_regs = super::resolved_fixed_use_regs(effect, &current_open, open_defs);
-            let mut fixed_use_defs = RegValueMap::with_reg_count(current_fixed.len());
+            let mut fixed_use_defs = RegValueMap::sparse();
             for reg in &fixed_use_regs {
                 let defs = current_fixed.get(reg.index()).cloned().unwrap_or_default();
                 for def in &defs {

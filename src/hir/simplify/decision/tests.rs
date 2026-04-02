@@ -130,6 +130,33 @@ fn specializes_descendant_when_stable_test_truthiness_is_already_known() {
 }
 
 #[test]
+fn canonicalizes_truth_fact_sets_independent_of_path_order() {
+    let a = HirExpr::TempRef(TempId(0));
+    let not_b = HirExpr::Unary(Box::new(HirUnaryExpr {
+        op: HirUnaryOpKind::Not,
+        expr: HirExpr::TempRef(TempId(1)),
+    }));
+
+    let left = super::extend_truth_facts(
+        &super::extend_truth_facts(&TruthFacts::default(), &a, true),
+        &not_b,
+        false,
+    );
+    let right = super::extend_truth_facts(
+        &super::extend_truth_facts(&TruthFacts::default(), &not_b, false),
+        &a,
+        true,
+    );
+
+    assert_eq!(left, right);
+    assert_eq!(super::known_truthiness_from_facts(&a, &left), Some(true));
+    assert_eq!(
+        super::known_truthiness_from_facts(&not_b, &left),
+        Some(false)
+    );
+}
+
+#[test]
 fn collapses_value_decision_when_then_branch_is_definitely_truthy() {
     let mut module = HirModule {
         entry: HirProtoRef(0),

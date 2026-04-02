@@ -4,13 +4,13 @@
 //! 不会在这里扫描 region 或重建字段序列。
 //! 例如：`t.x = v` 会在这里把键翻成 `Name(\"x\")` 并识别 `t` 的绑定身份。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::hir::common::{
     HirCallExpr, HirDecisionTarget, HirExpr, HirLValue, HirStmt, HirTableField, HirTableKey,
 };
 
-use super::TableBinding;
+use super::{BindingId, TableBinding};
 use crate::hir::simplify::visit::{HirVisitor, visit_block, visit_stmts};
 
 pub(super) fn binding_from_lvalue(lvalue: &HirLValue) -> Option<TableBinding> {
@@ -42,12 +42,6 @@ pub(super) fn table_key_from_expr(expr: &HirExpr) -> HirTableKey {
     HirTableKey::Expr(expr.clone())
 }
 
-pub(super) fn collect_stmt_slice_bindings(stmts: &[HirStmt]) -> BTreeSet<TableBinding> {
-    let mut collector = BindingUseCollector::default();
-    visit_stmts(stmts, &mut collector);
-    collector.bindings
-}
-
 pub(super) fn collect_materialized_binding_counts(
     block: &crate::hir::common::HirBlock,
 ) -> BTreeMap<TableBinding, usize> {
@@ -56,10 +50,142 @@ pub(super) fn collect_materialized_binding_counts(
     collector.counts
 }
 
-pub(super) fn expr_depends_on_any_binding(expr: &HirExpr, bindings: &[TableBinding]) -> bool {
-    bindings
-        .iter()
-        .any(|binding| expr_uses_binding(expr, *binding))
+#[derive(Debug, Clone, Default)]
+pub(super) struct BindingIndex {
+    ids: BTreeMap<TableBinding, BindingId>,
+    bindings: Vec<TableBinding>,
+}
+
+impl BindingIndex {
+    pub(super) fn intern(&mut self, binding: TableBinding) -> BindingId {
+        if let Some(id) = self.ids.get(&binding).copied() {
+            return id;
+        }
+        let id = self.bindings.len();
+        self.ids.insert(binding, id);
+        self.bindings.push(binding);
+        id
+    }
+
+    pub(super) fn id_of(&self, binding: TableBinding) -> Option<BindingId> {
+        self.ids.get(&binding).copied()
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.bindings.len()
+    }
+
+    pub(super) fn materialized_counts(
+        &self,
+        counts: &BTreeMap<TableBinding, usize>,
+    ) -> Vec<u32> {
+        self.bindings
+            .iter()
+            .map(|binding| counts.get(binding).copied().unwrap_or_default() as u32)
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct StmtBindingSummary {
+    ids: Vec<BindingId>,
+}
+
+impl StmtBindingSummary {
+    pub(super) fn iter(&self) -> impl Iterator<Item = BindingId> + '_ {
+        self.ids.iter().copied()
+    }
+}
+
+pub(super) fn collect_stmt_binding_summary(
+    stmt: &HirStmt,
+    binding_index: &mut BindingIndex,
+) -> StmtBindingSummary {
+    intern_stmt_bindings(stmt, binding_index);
+    collect_stmt_slice_binding_summary(std::slice::from_ref(stmt), binding_index)
+}
+
+pub(super) fn intern_stmt_bindings(stmt: &HirStmt, binding_index: &mut BindingIndex) {
+    match stmt {
+        HirStmt::LocalDecl(local_decl) => {
+            for binding in &local_decl.bindings {
+                binding_index.intern(TableBinding::Local(*binding));
+            }
+        }
+        HirStmt::Assign(assign) => {
+            for target in &assign.targets {
+                if let Some(binding) = binding_from_lvalue(target) {
+                    binding_index.intern(binding);
+                }
+            }
+        }
+        HirStmt::NumericFor(numeric_for) => {
+            binding_index.intern(TableBinding::Local(numeric_for.binding));
+        }
+        HirStmt::GenericFor(generic_for) => {
+            for binding in &generic_for.bindings {
+                binding_index.intern(TableBinding::Local(*binding));
+            }
+        }
+        HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::Return(_)
+        | HirStmt::If(_)
+        | HirStmt::While(_)
+        | HirStmt::Repeat(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_)
+        | HirStmt::Block(_)
+        | HirStmt::Unstructured(_) => {}
+    }
+}
+
+pub(super) fn collect_stmt_slice_binding_summary(
+    stmts: &[HirStmt],
+    binding_index: &mut BindingIndex,
+) -> StmtBindingSummary {
+    let mut collector = BindingUseCollector {
+        binding_index,
+        ids: Vec::new(),
+    };
+    visit_stmts(stmts, &mut collector);
+    collector.ids.sort_unstable();
+    collector.ids.dedup();
+    StmtBindingSummary { ids: collector.ids }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct BindingUseSummary {
+    counts: Vec<u32>,
+}
+
+impl BindingUseSummary {
+    pub(super) fn with_binding_count(binding_count: usize) -> Self {
+        Self {
+            counts: vec![0; binding_count],
+        }
+    }
+
+    pub(super) fn contains(&self, binding_id: BindingId) -> bool {
+        self.counts.get(binding_id).copied().unwrap_or_default() > 0
+    }
+
+    pub(super) fn add_stmt_bindings(&mut self, bindings: &StmtBindingSummary) {
+        for binding_id in bindings.iter() {
+            self.counts[binding_id] += 1;
+        }
+    }
+
+    pub(super) fn remove_stmt_bindings(&mut self, bindings: &StmtBindingSummary) {
+        for binding_id in bindings.iter() {
+            self.counts[binding_id] -= 1;
+        }
+    }
 }
 
 pub(super) fn expr_uses_binding(expr: &HirExpr, binding: TableBinding) -> bool {
@@ -221,15 +347,15 @@ fn is_identifier_name(name: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-#[derive(Default)]
-struct BindingUseCollector {
-    bindings: BTreeSet<TableBinding>,
+struct BindingUseCollector<'a> {
+    binding_index: &'a mut BindingIndex,
+    ids: Vec<BindingId>,
 }
 
-impl HirVisitor for BindingUseCollector {
+impl HirVisitor for BindingUseCollector<'_> {
     fn visit_expr(&mut self, expr: &HirExpr) {
         if let Some(binding) = binding_from_expr(expr) {
-            self.bindings.insert(binding);
+            self.ids.push(self.binding_index.intern(binding));
         }
     }
 }

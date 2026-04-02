@@ -39,7 +39,7 @@ pub(super) fn materialize_value_facts(
                 &instruction_facts.open_reaching_defs[instr_index],
                 ctx.open_defs,
             );
-            let mut fixed_use_values = RegValueMap::with_reg_count(current_fixed.len());
+            let mut fixed_use_values = RegValueMap::sparse();
             for reg in &fixed_use_regs {
                 fixed_use_values.insert(
                     *reg,

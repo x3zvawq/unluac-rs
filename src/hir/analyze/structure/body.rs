@@ -258,10 +258,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 let empty_labels = BTreeMap::new();
                 let mut lowered =
                     lower_control_instr(self.lowering, block, instr_ref, instr, &empty_labels);
-                let entry_expr_overrides = self.block_entry_expr_overrides(block);
-                if !entry_expr_overrides.is_empty() {
+                if let Some(entry_expr_overrides) = self.block_entry_expr_overrides(block) {
                     for stmt in &mut lowered {
-                        rewrite_stmt_exprs(stmt, &entry_expr_overrides);
+                        rewrite_stmt_exprs(stmt, entry_expr_overrides);
                     }
                 }
                 stmts.extend(lowered);
@@ -281,19 +280,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         expect_branch_terminator: bool,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Vec<HirStmt>> {
+        let empty_allowed_blocks = BTreeSet::new();
         let allowed_blocks = self
             .merge_allowed_blocks
             .get(&block)
-            .cloned()
-            .unwrap_or_default();
-        let overridden_phis = self
-            .overrides
-            .block_phi_exprs(block)
-            .cloned()
-            .unwrap_or_default();
-        let suppressed = self.overrides.suppressed_phis_for_block(block);
+            .unwrap_or(&empty_allowed_blocks);
+        let overridden_phis = self.overrides.block_phi_exprs(block);
         let mut stmts = overridden_phis
-            .iter()
+            .into_iter()
+            .flat_map(|phi_exprs| phi_exprs.iter())
             .map(|(phi_id, value)| {
                 let temp = self.lowering.bindings.phi_temps[phi_id.index()];
                 assign_stmt(vec![HirLValue::Temp(temp)], vec![value.clone()])
@@ -302,13 +297,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stmts.extend(lower_phi_materialization_with_allowed_blocks_except(
             self.lowering,
             block,
-            &suppressed,
-            &allowed_blocks,
+            |phi_id| self.overrides.phi_is_suppressed_for_block(block, phi_id),
+            allowed_blocks,
         ));
         let range = self.lowering.cfg.blocks[block.index()].instrs;
         if range.is_empty() {
             return Some(stmts);
         }
+
+        let entry_expr_overrides = self.block_entry_expr_overrides(block);
 
         let end = if let Some((_instr_ref, instr)) = self.block_terminator(block) {
             if expect_branch_terminator && !matches!(instr, LowInstr::Branch(_)) {
@@ -341,10 +338,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             }
             let mut lowered = lower_regular_instr(self.lowering, block, instr_ref, instr);
             apply_loop_rewrites(&mut lowered, target_overrides);
-            let entry_expr_overrides = self.block_entry_expr_overrides(block);
-            if !entry_expr_overrides.is_empty() {
+            if let Some(entry_expr_overrides) = entry_expr_overrides {
                 for stmt in &mut lowered {
-                    rewrite_stmt_exprs(stmt, &entry_expr_overrides);
+                    rewrite_stmt_exprs(stmt, entry_expr_overrides);
                 }
             }
             stmts.extend(lowered);
@@ -353,11 +349,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         Some(stmts)
     }
 
-    fn block_entry_expr_overrides(&self, block: BlockRef) -> BTreeMap<TempId, HirExpr> {
-        self.overrides
-            .block_entry_temp_exprs(block)
-            .cloned()
-            .unwrap_or_default()
+    fn block_entry_expr_overrides(&self, block: BlockRef) -> Option<&BTreeMap<TempId, HirExpr>> {
+        self.overrides.block_entry_temp_exprs(block)
     }
 
     pub(super) fn block_redefines_reg(&self, block: BlockRef, reg: Reg) -> bool {
@@ -544,9 +537,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         };
 
-        let entry_expr_overrides = self.block_entry_expr_overrides(block);
-        if !entry_expr_overrides.is_empty() {
-            rewrite_expr_temps(&mut cond, &entry_expr_overrides);
+        if let Some(entry_expr_overrides) = self.block_entry_expr_overrides(block) {
+            rewrite_expr_temps(&mut cond, entry_expr_overrides);
         }
 
         Some(cond)

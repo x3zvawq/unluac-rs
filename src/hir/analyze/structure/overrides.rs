@@ -87,11 +87,10 @@ impl StructureOverrideState {
         self.suppressed_instrs.contains(&instr_ref)
     }
 
-    pub(super) fn suppressed_phis_for_block(&self, block: BlockRef) -> BTreeSet<PhiId> {
-        let mut suppressed = self.suppressed_phis.clone();
-        if let Some(phi_exprs) = self.block_phi_exprs(block) {
-            suppressed.extend(phi_exprs.keys().copied());
-        }
-        suppressed
+    pub(super) fn phi_is_suppressed_for_block(&self, block: BlockRef, phi_id: PhiId) -> bool {
+        self.suppressed_phis.contains(&phi_id)
+            || self
+                .block_phi_exprs(block)
+                .is_some_and(|phi_exprs| phi_exprs.contains_key(&phi_id))
     }
 }

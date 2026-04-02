@@ -125,9 +125,15 @@ where
 ///
 /// 数据流求解内部本来就是按寄存器索引保存状态；这里继续沿用这个布局，
 /// 避免把每条指令的 snapshot 再重建成 `BTreeMap`。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct RegValueMap<T> {
-    regs: Vec<CompactSet<T>>,
+    repr: RegValueMapRepr<T>,
+}
+
+#[derive(Debug, Clone)]
+enum RegValueMapRepr<T> {
+    Dense(Vec<CompactSet<T>>),
+    Sparse(Vec<(Reg, CompactSet<T>)>),
 }
 
 impl<T> RegValueMap<T>
@@ -136,13 +142,19 @@ where
 {
     pub fn with_reg_count(reg_count: usize) -> Self {
         Self {
-            regs: vec![CompactSet::Empty; reg_count],
+            repr: RegValueMapRepr::Dense(vec![CompactSet::Empty; reg_count]),
         }
     }
 
     pub fn from_state(state: &[CompactSet<T>]) -> Self {
         Self {
-            regs: state.to_vec(),
+            repr: RegValueMapRepr::Dense(state.to_vec()),
+        }
+    }
+
+    pub fn sparse() -> Self {
+        Self {
+            repr: RegValueMapRepr::Sparse(Vec::new()),
         }
     }
 
@@ -150,20 +162,35 @@ where
     where
         Q: Borrow<Reg>,
     {
-        self.regs
-            .get(reg.borrow().index())
-            .filter(|values| !values.is_empty())
+        match &self.repr {
+            RegValueMapRepr::Dense(regs) => regs
+                .get(reg.borrow().index())
+                .filter(|values| !values.is_empty()),
+            RegValueMapRepr::Sparse(entries) => entries
+                .binary_search_by_key(&reg.borrow().index(), |(stored_reg, _)| stored_reg.index())
+                .ok()
+                .and_then(|index| entries.get(index).map(|(_, values)| values)),
+        }
     }
 
     pub fn insert(&mut self, reg: Reg, values: CompactSet<T>) {
         if values.is_empty() {
             return;
         }
-        let slot = self
-            .regs
-            .get_mut(reg.index())
-            .expect("reg map should already be sized for every reachable register");
-        *slot = values;
+        match &mut self.repr {
+            RegValueMapRepr::Dense(regs) => {
+                let slot = regs
+                    .get_mut(reg.index())
+                    .expect("reg map should already be sized for every reachable register");
+                *slot = values;
+            }
+            RegValueMapRepr::Sparse(entries) => match entries
+                .binary_search_by_key(&reg.index(), |(stored_reg, _)| stored_reg.index())
+            {
+                Ok(index) => entries[index] = (reg, values),
+                Err(index) => entries.insert(index, (reg, values)),
+            },
+        }
     }
 
     pub fn keys(&self) -> impl Iterator<Item = Reg> + '_ {
@@ -174,19 +201,32 @@ where
         self.iter().map(|(_, values)| values)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (Reg, &CompactSet<T>)> + '_ {
-        self.regs
-            .iter()
-            .enumerate()
-            .filter_map(|(index, values)| (!values.is_empty()).then_some((Reg(index), values)))
+    pub fn iter(&self) -> RegValueMapIter<'_, T> {
+        match &self.repr {
+            RegValueMapRepr::Dense(regs) => RegValueMapIter::Dense { index: 0, regs },
+            RegValueMapRepr::Sparse(entries) => RegValueMapIter::Sparse(entries.iter()),
+        }
     }
 }
 
 impl<T> Default for RegValueMap<T> {
     fn default() -> Self {
-        Self { regs: Vec::new() }
+        Self {
+            repr: RegValueMapRepr::Sparse(Vec::new()),
+        }
     }
 }
+
+impl<T> PartialEq for RegValueMap<T>
+where
+    T: Copy + Ord + PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl<T> Eq for RegValueMap<T> where T: Copy + Ord + Eq {}
 
 impl<T> Index<&Reg> for RegValueMap<T>
 where
@@ -197,5 +237,58 @@ where
     fn index(&self, index: &Reg) -> &Self::Output {
         self.get(*index)
             .expect("indexed register should exist and have a non-empty reaching set")
+    }
+}
+
+pub enum RegValueMapIter<'a, T> {
+    Dense {
+        index: usize,
+        regs: &'a [CompactSet<T>],
+    },
+    Sparse(std::slice::Iter<'a, (Reg, CompactSet<T>)>),
+}
+
+impl<'a, T> Iterator for RegValueMapIter<'a, T>
+where
+    T: Copy + Ord,
+{
+    type Item = (Reg, &'a CompactSet<T>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Dense { index, regs } => {
+                while *index < regs.len() {
+                    let current = *index;
+                    *index += 1;
+                    let values = &regs[current];
+                    if !values.is_empty() {
+                        return Some((Reg(current), values));
+                    }
+                }
+                None
+            }
+            Self::Sparse(iter) => iter.next().map(|(reg, values)| (*reg, values)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sparse_and_dense_reg_value_maps_compare_by_logical_contents() {
+        let reg = Reg(3);
+        let values = CompactSet::singleton(7_u32);
+
+        let mut sparse = RegValueMap::sparse();
+        sparse.insert(reg, values.clone());
+
+        let mut dense = RegValueMap::with_reg_count(8);
+        dense.insert(reg, values);
+
+        assert_eq!(sparse, dense);
+        assert_eq!(sparse.get(reg), dense.get(reg));
+        assert_eq!(sparse.keys().collect::<Vec<_>>(), vec![reg]);
     }
 }

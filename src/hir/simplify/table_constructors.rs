@@ -20,7 +20,7 @@ mod scan;
 use std::collections::BTreeMap;
 
 use crate::hir::common::{
-    HirAssign, HirExpr, HirLValue, HirProto, HirStmt, HirTableSetList, LocalId, TempId,
+    HirAssign, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId,
 };
 
 use self::bindings::collect_materialized_binding_counts;
@@ -36,31 +36,31 @@ enum TableBinding {
     Local(LocalId),
 }
 
-#[derive(Debug, Clone)]
+type BindingId = usize;
+
+#[derive(Debug, Clone, Copy)]
 enum RegionStep {
-    Producer(TableBinding, HirExpr),
-    ProducerGroup(ProducerGroup),
-    Record(crate::hir::common::HirRecordField),
-    SetList(HirTableSetList),
-}
-
-#[derive(Debug, Clone)]
-struct ProducerGroup {
-    slots: Vec<ProducerGroupSlot>,
-    drop_without_consumption_is_safe: bool,
-}
-
-#[derive(Debug, Clone)]
-struct ProducerGroupSlot {
-    binding: TableBinding,
-    value: Option<HirExpr>,
+    Producer { stmt_index: usize, slot_index: usize },
+    ProducerGroup { stmt_index: usize },
+    Record { stmt_index: usize },
+    SetList { stmt_index: usize },
 }
 
 #[derive(Debug, Clone)]
 struct PendingProducer {
     binding: TableBinding,
-    value: Option<HirExpr>,
+    binding_id: BindingId,
+    source: PendingProducerSource,
     group: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+enum PendingProducerSource {
+    Value {
+        stmt_index: usize,
+        value_index: usize,
+    },
+    Empty,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -68,10 +68,31 @@ struct ProducerGroupMeta {
     drop_without_consumption_is_safe: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum SegmentToken {
-    Producer(TableBinding),
-    Record(crate::hir::common::HirRecordField),
+    Producer { producer_index: usize },
+    Record { prepared_record_index: usize },
+}
+
+#[derive(Debug, Clone)]
+struct RestoredPendingIntegerField {
+    field_index: usize,
+    key: i64,
+    value: HirExpr,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RebuildScratch {
+    pending_producers: Vec<PendingProducer>,
+    producer_groups: Vec<ProducerGroupMeta>,
+    tokens: Vec<SegmentToken>,
+    prepared_records: Vec<crate::hir::common::HirRecordField>,
+    producer_index_by_binding: Vec<Option<usize>>,
+    consumed_bindings: Vec<bool>,
+    consumed_groups: Vec<bool>,
+    removed_materializations: Vec<u32>,
+    touched_binding_ids: Vec<BindingId>,
+    restored_pending_integer_fields: Vec<RestoredPendingIntegerField>,
 }
 
 pub(super) fn stabilize_table_constructors_in_proto(proto: &mut HirProto) -> bool {
@@ -89,6 +110,7 @@ struct TableConstructorPass {
 impl HirRewritePass for TableConstructorPass {
     fn rewrite_block(&mut self, block: &mut crate::hir::common::HirBlock) -> bool {
         let mut changed = false;
+        let mut scratch = RebuildScratch::default();
         let mut index = 0;
         while index < block.stmts.len() {
             let Some((binding, seed_ctor)) = constructor_seed(&block.stmts[index]) else {
@@ -102,6 +124,7 @@ impl HirRewritePass for TableConstructorPass {
                 binding,
                 seed_ctor.clone(),
                 &self.materialized_bindings,
+                &mut scratch,
             ) {
                 Some((rebuilt_ctor, end_index)) => (rebuilt_ctor, end_index, true),
                 None => (seed_ctor, index, false),

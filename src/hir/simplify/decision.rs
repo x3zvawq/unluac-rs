@@ -217,7 +217,8 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
 /// 这样既能减少重复片段，也不会把 case-specific 的结构判断重新塞回 simplify。
 fn specialize_decision_by_known_tests(decision: &HirDecisionExpr) -> Option<HirDecisionExpr> {
     let mut specializer = DecisionSpecializer::new(decision);
-    let root = specializer.specialize_node(decision.entry, &[]);
+    let facts = TruthFacts::default();
+    let root = specializer.specialize_node(decision.entry, &facts);
     match root {
         ResolvedDecisionTarget::Expr(_) => None,
         ResolvedDecisionTarget::Node(entry) => {
@@ -230,17 +231,74 @@ fn specialize_decision_by_known_tests(decision: &HirDecisionExpr) -> Option<HirD
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+enum TruthFactExprKey {
+    Nil,
+    Boolean(bool),
+    Integer(i64),
+    Number(u64),
+    String(String),
+    Int64(i64),
+    UInt64(u64),
+    Complex { real_bits: u64, imag_bits: u64 },
+    Param(usize),
+    Local(usize),
+    Upvalue(usize),
+    Temp(usize),
+    Not(Box<TruthFactExprKey>),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 struct TruthFact {
-    expr: HirExpr,
+    expr: TruthFactExprKey,
     truthy: bool,
 }
 
-#[derive(Clone, PartialEq)]
-struct SpecializationMemoEntry {
-    node_ref: HirDecisionNodeRef,
-    facts: Vec<TruthFact>,
-    result: ResolvedDecisionTarget,
+#[derive(Debug, Clone, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+struct TruthFacts(Vec<TruthFact>);
+
+impl TruthFacts {
+    fn extended_with(&self, expr: &HirExpr, truthy: bool) -> Self {
+        let mut extended = self.clone();
+        extended.insert_expr(expr, truthy);
+        if let HirExpr::Unary(unary) = expr
+            && unary.op == HirUnaryOpKind::Not
+        {
+            extended.insert_expr(&unary.expr, !truthy);
+        }
+        extended
+    }
+
+    fn known_truthiness(&self, expr: &HirExpr) -> Option<bool> {
+        let key = truth_fact_expr_key(expr)?;
+        self.truthiness_for_key(&key)
+    }
+
+    fn insert_expr(&mut self, expr: &HirExpr, truthy: bool) {
+        let Some(expr) = truth_fact_expr_key(expr) else {
+            return;
+        };
+        self.insert_key(expr, truthy);
+    }
+
+    fn insert_key(&mut self, expr: TruthFactExprKey, truthy: bool) {
+        match self.0.binary_search_by(|fact| fact.expr.cmp(&expr)) {
+            Ok(index) => {
+                debug_assert_eq!(
+                    self.0[index].truthy, truthy,
+                    "truth fact set should not record contradictory facts for the same expression",
+                );
+            }
+            Err(index) => self.0.insert(index, TruthFact { expr, truthy }),
+        }
+    }
+
+    fn truthiness_for_key(&self, expr: &TruthFactExprKey) -> Option<bool> {
+        self.0
+            .binary_search_by(|fact| fact.expr.cmp(expr))
+            .ok()
+            .map(|index| self.0[index].truthy)
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -253,7 +311,7 @@ struct InternedDecisionNode {
 
 struct DecisionSpecializer<'a> {
     decision: &'a HirDecisionExpr,
-    memo: Vec<SpecializationMemoEntry>,
+    memo: BTreeMap<HirDecisionNodeRef, BTreeMap<TruthFacts, ResolvedDecisionTarget>>,
     interner: Vec<InternedDecisionNode>,
     nodes: Vec<HirDecisionNode>,
 }
@@ -262,7 +320,7 @@ impl<'a> DecisionSpecializer<'a> {
     fn new(decision: &'a HirDecisionExpr) -> Self {
         Self {
             decision,
-            memo: Vec::new(),
+            memo: BTreeMap::new(),
             interner: Vec::new(),
             nodes: Vec::new(),
         }
@@ -271,33 +329,30 @@ impl<'a> DecisionSpecializer<'a> {
     fn specialize_node(
         &mut self,
         node_ref: HirDecisionNodeRef,
-        facts: &[TruthFact],
+        facts: &TruthFacts,
     ) -> ResolvedDecisionTarget {
-        let node = self.decision.nodes[node_ref.index()].clone();
+        if let Some(result) = self
+            .memo
+            .get(&node_ref)
+            .and_then(|results| results.get(facts))
+        {
+            return result.clone();
+        }
 
-        if let Some(known_truthy) = known_truthiness_from_facts(&node.test, facts) {
+        let node = &self.decision.nodes[node_ref.index()];
+        let result = if let Some(known_truthy) = known_truthiness_from_facts(&node.test, facts) {
             let chosen = if known_truthy {
                 &node.truthy
             } else {
                 &node.falsy
             };
-            return self.specialize_target(&node, chosen, facts);
-        }
+            self.specialize_target(node, chosen, facts)
+        } else {
+            let truthy_facts = extend_truth_facts(facts, &node.test, true);
+            let falsy_facts = extend_truth_facts(facts, &node.test, false);
+            let truthy = self.specialize_target(node, &node.truthy, &truthy_facts);
+            let falsy = self.specialize_target(node, &node.falsy, &falsy_facts);
 
-        if let Some(entry) = self
-            .memo
-            .iter()
-            .find(|entry| entry.node_ref == node_ref && entry.facts == facts)
-        {
-            return entry.result.clone();
-        }
-
-        let truthy_facts = extend_truth_facts(facts, &node.test, true);
-        let falsy_facts = extend_truth_facts(facts, &node.test, false);
-        let truthy = self.specialize_target(&node, &node.truthy, &truthy_facts);
-        let falsy = self.specialize_target(&node, &node.falsy, &falsy_facts);
-
-        let result =
             if truthy == falsy {
                 truthy
             } else if let Some(existing) = self.interner.iter().find(|entry| {
@@ -319,13 +374,13 @@ impl<'a> DecisionSpecializer<'a> {
                     node_ref: mapped,
                 });
                 ResolvedDecisionTarget::Node(mapped)
-            };
+            }
+        };
 
-        self.memo.push(SpecializationMemoEntry {
-            node_ref,
-            facts: facts.to_vec(),
-            result: result.clone(),
-        });
+        self.memo
+            .entry(node_ref)
+            .or_default()
+            .insert(facts.clone(), result.clone());
         result
     }
 
@@ -333,7 +388,7 @@ impl<'a> DecisionSpecializer<'a> {
         &mut self,
         node: &HirDecisionNode,
         target: &HirDecisionTarget,
-        facts: &[TruthFact],
+        facts: &TruthFacts,
     ) -> ResolvedDecisionTarget {
         match target {
             HirDecisionTarget::Node(next_ref) => self.specialize_node(*next_ref, facts),
@@ -343,41 +398,18 @@ impl<'a> DecisionSpecializer<'a> {
     }
 }
 
-fn extend_truth_facts(facts: &[TruthFact], expr: &HirExpr, truthy: bool) -> Vec<TruthFact> {
-    let mut extended = facts.to_vec();
-
-    if expr_supports_truth_fact(expr) && !extended.iter().any(|fact| fact.expr == *expr) {
-        extended.push(TruthFact {
-            expr: expr.clone(),
-            truthy,
-        });
-    }
-
-    if let HirExpr::Unary(unary) = expr
-        && unary.op == HirUnaryOpKind::Not
-        && expr_supports_truth_fact(&unary.expr)
-        && !extended.iter().any(|fact| fact.expr == unary.expr)
-    {
-        extended.push(TruthFact {
-            expr: unary.expr.clone(),
-            truthy: !truthy,
-        });
-    }
-
-    extended
+fn extend_truth_facts(facts: &TruthFacts, expr: &HirExpr, truthy: bool) -> TruthFacts {
+    facts.extended_with(expr, truthy)
 }
 
-fn known_truthiness_from_facts(expr: &HirExpr, facts: &[TruthFact]) -> Option<bool> {
+fn known_truthiness_from_facts(expr: &HirExpr, facts: &TruthFacts) -> Option<bool> {
     facts
-        .iter()
-        .rev()
-        .find(|fact| fact.expr == *expr)
-        .map(|fact| fact.truthy)
+        .known_truthiness(expr)
         .or_else(|| expr_truthiness(expr))
         .or_else(|| known_truthiness_from_shape(expr, facts))
 }
 
-fn known_truthiness_from_shape(expr: &HirExpr, facts: &[TruthFact]) -> Option<bool> {
+fn known_truthiness_from_shape(expr: &HirExpr, facts: &TruthFacts) -> Option<bool> {
     match expr {
         HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
             known_truthiness_from_facts(&unary.expr, facts).map(|truthy| !truthy)
@@ -402,7 +434,7 @@ fn known_truthiness_from_shape(expr: &HirExpr, facts: &[TruthFact]) -> Option<bo
 fn known_eq_truthiness_from_facts(
     lhs: &HirExpr,
     rhs: &HirExpr,
-    facts: &[TruthFact],
+    facts: &TruthFacts,
 ) -> Option<bool> {
     if lhs == rhs {
         return Some(true);
@@ -445,23 +477,26 @@ fn literal_eq_by_truthiness(literal: TruthSensitiveLiteral, truthy: bool) -> Opt
     }
 }
 
-fn expr_supports_truth_fact(expr: &HirExpr) -> bool {
+fn truth_fact_expr_key(expr: &HirExpr) -> Option<TruthFactExprKey> {
     match expr {
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_) => true,
-        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
-            expr_supports_truth_fact(&unary.expr)
-        }
+        HirExpr::Nil => Some(TruthFactExprKey::Nil),
+        HirExpr::Boolean(value) => Some(TruthFactExprKey::Boolean(*value)),
+        HirExpr::Integer(value) => Some(TruthFactExprKey::Integer(*value)),
+        HirExpr::Number(value) => Some(TruthFactExprKey::Number(value.to_bits())),
+        HirExpr::String(value) => Some(TruthFactExprKey::String(value.clone())),
+        HirExpr::Int64(value) => Some(TruthFactExprKey::Int64(*value)),
+        HirExpr::UInt64(value) => Some(TruthFactExprKey::UInt64(*value)),
+        HirExpr::Complex { real, imag } => Some(TruthFactExprKey::Complex {
+            real_bits: real.to_bits(),
+            imag_bits: imag.to_bits(),
+        }),
+        HirExpr::ParamRef(param) => Some(TruthFactExprKey::Param(param.index())),
+        HirExpr::LocalRef(local) => Some(TruthFactExprKey::Local(local.index())),
+        HirExpr::UpvalueRef(upvalue) => Some(TruthFactExprKey::Upvalue(upvalue.index())),
+        HirExpr::TempRef(temp) => Some(TruthFactExprKey::Temp(temp.index())),
+        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => Some(TruthFactExprKey::Not(
+            Box::new(truth_fact_expr_key(&unary.expr)?),
+        )),
         HirExpr::GlobalRef(_)
         | HirExpr::TableAccess(_)
         | HirExpr::Unary(_)
@@ -473,7 +508,7 @@ fn expr_supports_truth_fact(expr: &HirExpr) -> bool {
         | HirExpr::VarArg
         | HirExpr::TableConstructor(_)
         | HirExpr::Closure(_)
-        | HirExpr::Unresolved(_) => false,
+        | HirExpr::Unresolved(_) => None,
     }
 }
 

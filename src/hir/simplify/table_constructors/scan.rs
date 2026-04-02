@@ -6,14 +6,15 @@
 
 use std::collections::BTreeMap;
 
-use crate::hir::common::{HirExpr, HirLValue, HirStmt, HirTableConstructor, HirTableSetList};
+use crate::hir::common::{HirExpr, HirLValue, HirStmt, HirTableConstructor};
 
 use super::bindings::{
-    binding_from_expr, binding_from_lvalue, expr_uses_binding, lvalue_uses_binding,
-    stmt_slice_mentions_binding, table_key_from_expr,
+    BindingIndex, BindingUseSummary, binding_from_expr, binding_from_lvalue,
+    collect_stmt_binding_summary, expr_uses_binding, lvalue_uses_binding,
+    stmt_slice_mentions_binding,
 };
-use super::rebuild::rebuild_constructor_from_steps;
-use super::{ProducerGroup, ProducerGroupSlot, RegionStep, TableBinding};
+use super::rebuild::{ConstructorBuilder, RegionRebuildContext, try_extend_constructor_from_steps};
+use super::{RebuildScratch, RegionStep, TableBinding};
 
 pub(super) fn constructor_seed(stmt: &HirStmt) -> Option<(TableBinding, HirTableConstructor)> {
     match stmt {
@@ -58,41 +59,74 @@ pub(super) fn try_rebuild_constructor_region(
     binding: TableBinding,
     constructor: HirTableConstructor,
     materialized_bindings: &BTreeMap<TableBinding, usize>,
+    scratch: &mut RebuildScratch,
 ) -> Option<(HirTableConstructor, usize)> {
+    let mut binding_index = BindingIndex::default();
+    let stmt_bindings = block
+        .stmts
+        .iter()
+        .map(|stmt| collect_stmt_binding_summary(stmt, &mut binding_index))
+        .collect::<Vec<_>>();
+    let materialized_binding_counts = binding_index.materialized_counts(materialized_bindings);
     let mut steps = Vec::new();
-    let mut index = seed_index + 1;
-    let mut best = None;
-
-    while let Some(stmt) = block.stmts.get(index) {
-        if let Some(record) = keyed_write_step(stmt, binding) {
-            steps.push(RegionStep::Record(record));
-            if let Some(rebuilt) = rebuild_constructor_from_steps(
-                constructor.clone(),
+    let mut best_end = None;
+    let mut committed_builder = ConstructorBuilder::from_constructor(constructor);
+    let mut committed_contains_set_list = false;
+    let mut pending_contains_set_list = false;
+    let scan_stmts = &block.stmts[(seed_index + 1)..];
+    let mut remaining_uses = BindingUseSummary::with_binding_count(binding_index.len());
+    for bindings in &stmt_bindings[(seed_index + 1)..] {
+        remaining_uses.add_stmt_bindings(bindings);
+    }
+    for (offset, stmt) in scan_stmts.iter().enumerate() {
+        let index = seed_index + 1 + offset;
+        remaining_uses.remove_stmt_bindings(&stmt_bindings[index]);
+        if keyed_write_step(stmt, binding) {
+            steps.push(RegionStep::Record { stmt_index: index });
+            let mut rebuild_context = RegionRebuildContext::new(
+                block,
+                &binding_index,
+                &remaining_uses,
+                committed_contains_set_list,
+                &materialized_binding_counts,
+                scratch,
+            );
+            if try_extend_constructor_from_steps(
+                &mut committed_builder,
                 &steps,
-                &block.stmts[index + 1..],
-                materialized_bindings,
+                &mut rebuild_context,
             ) {
-                best = Some((rebuilt, index));
+                best_end = Some(index);
+                committed_contains_set_list |= pending_contains_set_list;
+                steps.clear();
+                pending_contains_set_list = false;
             }
-            index += 1;
             continue;
         }
-        if let Some(mut producers) = producer_steps(stmt, binding) {
-            steps.append(&mut producers);
-            index += 1;
+        if producer_steps(stmt, index, binding, &mut steps) {
             continue;
         }
-        if let Some(set_list) = table_set_list_step(stmt, binding) {
-            steps.push(RegionStep::SetList(set_list));
-            if let Some(rebuilt) = rebuild_constructor_from_steps(
-                constructor.clone(),
+        if table_set_list_step(stmt, binding) {
+            steps.push(RegionStep::SetList { stmt_index: index });
+            pending_contains_set_list = true;
+            let mut rebuild_context = RegionRebuildContext::new(
+                block,
+                &binding_index,
+                &remaining_uses,
+                committed_contains_set_list,
+                &materialized_binding_counts,
+                scratch,
+            );
+            if try_extend_constructor_from_steps(
+                &mut committed_builder,
                 &steps,
-                &block.stmts[index + 1..],
-                materialized_bindings,
+                &mut rebuild_context,
             ) {
-                best = Some((rebuilt, index));
+                best_end = Some(index);
+                committed_contains_set_list = true;
+                steps.clear();
+                pending_contains_set_list = false;
             }
-            index += 1;
             continue;
         }
         break;
@@ -103,7 +137,7 @@ pub(super) fn try_rebuild_constructor_region(
     // 末尾那批未消费 producer 会让整段 region 失败，反而错过前面已经足够安全的
     // `{ ... }` 前缀。因此这里持续记住“最后一个成功前缀”，在真正遇到无关语句时
     // 回退到最近一次可证明安全的构造器边界。
-    best
+    best_end.map(|end_index| (committed_builder.into_constructor(), end_index))
 }
 
 pub(super) fn trailing_constructor_handoff(
@@ -134,32 +168,31 @@ pub(super) fn trailing_constructor_handoff(
     Some(target.clone())
 }
 
-fn keyed_write_step(
-    stmt: &HirStmt,
-    binding: TableBinding,
-) -> Option<crate::hir::common::HirRecordField> {
+fn keyed_write_step(stmt: &HirStmt, binding: TableBinding) -> bool {
     let HirStmt::Assign(assign) = stmt else {
-        return None;
+        return false;
     };
     let [HirLValue::TableAccess(access)] = assign.targets.as_slice() else {
-        return None;
+        return false;
     };
     let [value] = assign.values.as_slice() else {
-        return None;
+        return false;
     };
     if binding_from_expr(&access.base) != Some(binding) {
-        return None;
+        return false;
     }
     if expr_uses_binding(&access.key, binding) || expr_uses_binding(value, binding) {
-        return None;
+        return false;
     }
-    Some(crate::hir::common::HirRecordField {
-        key: table_key_from_expr(&access.key),
-        value: value.clone(),
-    })
+    true
 }
 
-fn producer_steps(stmt: &HirStmt, constructor_binding: TableBinding) -> Option<Vec<RegionStep>> {
+fn producer_steps(
+    stmt: &HirStmt,
+    stmt_index: usize,
+    constructor_binding: TableBinding,
+    steps: &mut Vec<RegionStep>,
+) -> bool {
     match stmt {
         HirStmt::LocalDecl(local_decl) => producer_steps_from_bindings(
             local_decl
@@ -167,19 +200,30 @@ fn producer_steps(stmt: &HirStmt, constructor_binding: TableBinding) -> Option<V
                 .iter()
                 .copied()
                 .map(TableBinding::Local)
-                .collect(),
+                .collect::<Vec<_>>(),
             &local_decl.values,
             constructor_binding,
+            stmt_index,
+            steps,
         ),
         HirStmt::Assign(assign) => {
             let bindings = assign
                 .targets
                 .iter()
                 .map(binding_from_lvalue)
-                .collect::<Option<Vec<_>>>()?;
-            producer_steps_from_bindings(bindings, &assign.values, constructor_binding)
+                .collect::<Option<Vec<_>>>();
+            let Some(bindings) = bindings else {
+                return false;
+            };
+            producer_steps_from_bindings(
+                bindings,
+                &assign.values,
+                constructor_binding,
+                stmt_index,
+                steps,
+            )
         }
-        _ => None,
+        _ => false,
     }
 }
 
@@ -187,60 +231,47 @@ fn producer_steps_from_bindings(
     bindings: Vec<TableBinding>,
     values: &[HirExpr],
     constructor_binding: TableBinding,
-) -> Option<Vec<RegionStep>> {
+    stmt_index: usize,
+    steps: &mut Vec<RegionStep>,
+) -> bool {
     if bindings.is_empty()
         || values.is_empty()
         || values
             .iter()
             .any(|value| expr_uses_binding(value, constructor_binding))
     {
-        return None;
+        return false;
     }
 
     if bindings.len() == values.len() {
-        return Some(
-            bindings
-                .into_iter()
-                .zip(values.iter().cloned())
-                .map(|(binding, value)| RegionStep::Producer(binding, value))
-                .collect(),
-        );
+        steps.extend((0..bindings.len()).map(|slot_index| RegionStep::Producer {
+            stmt_index,
+            slot_index,
+        }));
+        return true;
     }
 
     let [source] = values else {
-        return None;
+        return false;
     };
     if bindings.len() > 1 && is_open_pack_source(source) {
-        return Some(vec![RegionStep::ProducerGroup(ProducerGroup {
-            slots: bindings
-                .into_iter()
-                .enumerate()
-                .map(|(index, binding)| ProducerGroupSlot {
-                    binding,
-                    value: (index == 0).then_some(source.clone()),
-                })
-                .collect(),
-            drop_without_consumption_is_safe: can_drop_open_pack_source_if_unused(source),
-        })]);
+        steps.push(RegionStep::ProducerGroup { stmt_index });
+        return true;
     }
 
-    None
+    false
 }
 
 fn is_open_pack_source(expr: &HirExpr) -> bool {
     matches!(expr, HirExpr::VarArg) || matches!(expr, HirExpr::Call(call) if call.multiret)
 }
 
-fn can_drop_open_pack_source_if_unused(expr: &HirExpr) -> bool {
-    matches!(expr, HirExpr::VarArg)
-}
-
-fn table_set_list_step(stmt: &HirStmt, binding: TableBinding) -> Option<HirTableSetList> {
+fn table_set_list_step(stmt: &HirStmt, binding: TableBinding) -> bool {
     let HirStmt::TableSetList(set_list) = stmt else {
-        return None;
+        return false;
     };
     if binding_from_expr(&set_list.base) != Some(binding) {
-        return None;
+        return false;
     }
     if set_list
         .values
@@ -251,7 +282,7 @@ fn table_set_list_step(stmt: &HirStmt, binding: TableBinding) -> Option<HirTable
             .as_ref()
             .is_some_and(|expr| expr_uses_binding(expr, binding))
     {
-        return None;
+        return false;
     }
-    Some((**set_list).clone())
+    true
 }

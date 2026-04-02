@@ -316,7 +316,7 @@ fn generic_phi_materializations_in_block<'a>(
 pub(super) fn lower_phi_materialization_with_allowed_blocks_except(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,
-    suppressed: &BTreeSet<PhiId>,
+    is_suppressed: impl Fn(PhiId) -> bool,
     allowed_blocks: &BTreeSet<BlockRef>,
 ) -> Vec<HirStmt> {
     let mut stmts = Vec::new();
@@ -332,7 +332,7 @@ pub(super) fn lower_phi_materialization_with_allowed_blocks_except(
         let Some(phi_id) = short.result_phi_id else {
             unreachable!("value-merge short-circuit should carry a phi id");
         };
-        if suppressed.contains(&phi_id) {
+        if is_suppressed(phi_id) {
             continue;
         }
 
@@ -356,7 +356,7 @@ pub(super) fn lower_phi_materialization_with_allowed_blocks_except(
 
     stmts.extend(
         generic_phi_materializations_in_block(lowering, block)
-            .filter(|phi| !suppressed.contains(&phi.phi_id))
+            .filter(|phi| !is_suppressed(phi.phi_id))
             .filter(|phi| !covered_phi_ids.contains(&phi.phi_id))
             .filter_map(|phi| {
                 let temp = lowering
