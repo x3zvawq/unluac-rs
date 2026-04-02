@@ -1,17 +1,25 @@
 use super::*;
 
+pub(super) struct MaterializedValueFacts {
+    pub reaching_values: Vec<InstrReachingValues>,
+    pub use_values: Vec<InstrUseValues>,
+}
+
 pub(super) fn materialize_value_facts(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     instr_effects: &[InstrEffect],
     ctx: ValueMaterializeCtx<'_>,
     reg_count: usize,
-    instruction_facts: &mut InstructionFacts,
-) {
+    scratch: &mut MaterializeScratch,
+    instruction_facts: &InstructionFacts,
+) -> MaterializedValueFacts {
     let mut block_state = BlockValueState {
-        fixed_in: vec![vec![CompactSet::Empty; reg_count]; cfg.blocks.len()],
-        fixed_out: vec![vec![CompactSet::Empty; reg_count]; cfg.blocks.len()],
+        fixed_in: vec![TrackedState::new(reg_count); cfg.blocks.len()],
+        fixed_out: vec![TrackedState::new(reg_count); cfg.blocks.len()],
     };
+    let mut reaching_values = vec![InstrReachingValues::default(); instruction_facts.reaching_defs.len()];
+    let mut use_values = vec![InstrUseValues::default(); instruction_facts.use_defs.len()];
 
     solve_reaching_values(
         cfg,
@@ -32,26 +40,32 @@ pub(super) fn materialize_value_facts(
 
         for instr_index in instr_indices {
             let effect = &instr_effects[instr_index];
-            instruction_facts.reaching_values[instr_index] = snapshot_value_state(&current_fixed);
+            reaching_values[instr_index] = snapshot_value_state(&mut current_fixed);
 
             let fixed_use_regs = super::resolved_fixed_use_regs(
+                scratch,
                 effect,
                 &instruction_facts.open_reaching_defs[instr_index],
                 ctx.open_defs,
             );
-            let mut fixed_use_values = RegValueMap::sparse();
-            for reg in &fixed_use_regs {
-                fixed_use_values.insert(
-                    *reg,
-                    current_fixed.get(reg.index()).cloned().unwrap_or_default(),
-                );
+            let mut fixed_use_entries = Vec::with_capacity(fixed_use_regs.len());
+            for &reg in fixed_use_regs {
+                let values = current_fixed.get(reg).clone();
+                if !values.is_empty() {
+                    fixed_use_entries.push((reg, values));
+                }
             }
-            instruction_facts.use_values[instr_index] = InstrUseValues {
-                fixed: fixed_use_values,
+            use_values[instr_index] = InstrUseValues {
+                fixed: RegValueMap::from_sparse_entries(fixed_use_entries),
             };
 
             apply_value_transfer(effect, &ctx.lookups.fixed[instr_index], &mut current_fixed);
         }
+    }
+
+    MaterializedValueFacts {
+        reaching_values,
+        use_values,
     }
 }
 
@@ -102,13 +116,9 @@ fn solve_reaching_values(
     }
 }
 
-fn merge_predecessor_value_state(
-    cfg: &Cfg,
-    block: BlockRef,
-    block_out: &[ValueState],
-) -> ValueState {
-    let reg_count = block_out.first().map_or(0, Vec::len);
-    let mut merged_fixed = vec![CompactSet::Empty; reg_count];
+fn merge_predecessor_value_state(cfg: &Cfg, block: BlockRef, block_out: &[ValueState]) -> ValueState {
+    let reg_count = block_out.first().map_or(0, |state| state.regs.len());
+    let mut merged_fixed = ValueState::new(reg_count);
 
     for edge_ref in &cfg.preds[block.index()] {
         let pred = cfg.edges[edge_ref.index()].from;
@@ -116,44 +126,37 @@ fn merge_predecessor_value_state(
             continue;
         }
 
-        for (reg_values, pred_values) in merged_fixed.iter_mut().zip(&block_out[pred.index()]) {
-            reg_values.extend(pred_values.iter().copied());
-        }
+        merged_fixed.extend_from(&block_out[pred.index()]);
     }
 
     merged_fixed
 }
 
-fn apply_block_phi_values(state: &mut [CompactSet<SsaValue>], phi_candidates: &[PhiCandidate]) {
+pub(super) fn apply_block_phi_values(state: &mut ValueState, phi_candidates: &[PhiCandidate]) {
     for phi in phi_candidates {
-        state[phi.reg.index()] = CompactSet::singleton(SsaValue::Phi(phi.id));
+        state.set_singleton(phi.reg, SsaValue::Phi(phi.id));
     }
 }
 
 fn apply_value_transfer(
     effect: &InstrEffect,
-    fixed_def_lookup: &BTreeMap<Reg, DefId>,
-    fixed_state: &mut [CompactSet<SsaValue>],
+    fixed_def_lookup: &FixedDefLookup,
+    fixed_state: &mut ValueState,
 ) {
-    for reg in &effect.fixed_must_defs {
-        let def = fixed_def_lookup
-            .get(reg)
-            .copied()
-            .expect("must-def register should already have a concrete DefId");
-        fixed_state[reg.index()] = CompactSet::singleton(SsaValue::Def(def));
+    debug_assert_eq!(effect.fixed_must_defs.len(), fixed_def_lookup.must.len());
+    debug_assert_eq!(effect.fixed_may_defs.len(), fixed_def_lookup.may.len());
+
+    for &(reg, def) in &fixed_def_lookup.must {
+        fixed_state.set_singleton(reg, SsaValue::Def(def));
     }
 
-    for reg in &effect.fixed_may_defs {
-        let def = fixed_def_lookup
-            .get(reg)
-            .copied()
-            .expect("may-def register should already have a concrete DefId");
-        fixed_state[reg.index()].insert(SsaValue::Def(def));
+    for &(reg, def) in &fixed_def_lookup.may {
+        fixed_state.insert(reg, SsaValue::Def(def));
     }
 }
 
-fn snapshot_value_state(state: &[CompactSet<SsaValue>]) -> InstrReachingValues {
+fn snapshot_value_state(state: &mut ValueState) -> InstrReachingValues {
     InstrReachingValues {
-        fixed: RegValueMap::from_state(state),
+        fixed: state.snapshot_map(),
     }
 }

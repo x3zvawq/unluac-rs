@@ -7,8 +7,8 @@ pub(super) fn compute_phi_candidates(
     graph_facts: &GraphFacts,
     defs: &[Def],
     live_in: &[BTreeSet<Reg>],
-    block_out: &[Vec<CompactSet<DefId>>],
-    fixed_def_lookup: &[BTreeMap<Reg, DefId>],
+    block_out: &[FixedState],
+    fixed_def_lookup: &[FixedDefLookup],
 ) -> Vec<PhiCandidate> {
     let mut def_blocks = BTreeMap::<Reg, BTreeSet<BlockRef>>::new();
     for def in defs {
@@ -52,7 +52,7 @@ fn build_phi_candidate(
     cfg: &Cfg,
     block: BlockRef,
     reg: Reg,
-    block_out: &[Vec<CompactSet<DefId>>],
+    block_out: &[FixedState],
 ) -> Option<PhiCandidate> {
     let mut incoming = Vec::new();
     let mut distinct_defs = BTreeSet::new();
@@ -65,7 +65,7 @@ fn build_phi_candidate(
 
         let defs = block_out
             .get(pred.index())
-            .and_then(|defs_by_reg| defs_by_reg.get(reg.index()))?
+            .map(|defs_by_reg| defs_by_reg.get(reg))?
             .clone();
         if defs.is_empty() {
             return None;
@@ -95,11 +95,11 @@ fn block_defines_reg(
     cfg: &Cfg,
     block: BlockRef,
     reg: Reg,
-    fixed_def_lookup: &[BTreeMap<Reg, DefId>],
+    fixed_def_lookup: &[FixedDefLookup],
 ) -> bool {
     let Some(mut instr_indices) = super::instr_indices(cfg, block) else {
         return false;
     };
 
-    instr_indices.any(|instr_index| fixed_def_lookup[instr_index].contains_key(&reg))
+    instr_indices.any(|instr_index| fixed_def_lookup[instr_index].defines(reg))
 }

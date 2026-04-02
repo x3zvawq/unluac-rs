@@ -421,7 +421,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .lowering
             .dataflow
             .reaching_values_at(range.start)
-            .fixed
             .get(reg)?;
         if values.len() != 1 {
             return None;

@@ -10,7 +10,16 @@ use std::ops::Range;
 use crate::transformer::{InstrRef, Reg};
 
 use super::cfg::{BlockRef, Cfg};
-use super::storage::RegValueMap;
+use super::storage::{CompactSet, CompactSetIter, RegValueMap, RegValueMapIter};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ValueFactsStorage {
+    Materialized {
+        reaching_values: Vec<InstrReachingValues>,
+        use_values: Vec<InstrUseValues>,
+    },
+    NoPhi,
+}
 
 /// 一个 proto 的数据流事实，以及它的子 proto 事实。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,9 +30,7 @@ pub struct DataflowFacts {
     pub open_defs: Vec<OpenDef>,
     pub instr_defs: Vec<Vec<DefId>>,
     pub reaching_defs: Vec<InstrReachingDefs>,
-    pub reaching_values: Vec<InstrReachingValues>,
     pub use_defs: Vec<InstrUseDefs>,
-    pub use_values: Vec<InstrUseValues>,
     pub def_uses: Vec<Vec<UseSite>>,
     pub open_reaching_defs: Vec<BTreeSet<OpenDefId>>,
     pub open_use_defs: Vec<BTreeSet<OpenDefId>>,
@@ -34,7 +41,128 @@ pub struct DataflowFacts {
     pub open_live_out: Vec<bool>,
     pub phi_candidates: Vec<PhiCandidate>,
     pub(crate) phi_block_ranges: Vec<Range<usize>>,
+    pub(crate) value_facts: ValueFactsStorage,
     pub children: Vec<DataflowFacts>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ValueMapRef<'a> {
+    Materialized(&'a RegValueMap<SsaValue>),
+    DefBacked(&'a RegValueMap<DefId>),
+}
+
+impl<'a> ValueMapRef<'a> {
+    pub fn get(self, reg: Reg) -> Option<ValueSetRef<'a>> {
+        match self {
+            Self::Materialized(map) => map.get(reg).map(ValueSetRef::Materialized),
+            Self::DefBacked(map) => map.get(reg).map(ValueSetRef::DefBacked),
+        }
+    }
+
+    pub fn iter(self) -> ValueMapIter<'a> {
+        match self {
+            Self::Materialized(map) => ValueMapIter::Materialized(map.iter()),
+            Self::DefBacked(map) => ValueMapIter::DefBacked(map.iter()),
+        }
+    }
+
+    pub fn values(self) -> ValueMapValuesIter<'a> {
+        ValueMapValuesIter { inner: self.iter() }
+    }
+}
+
+pub struct ValueMapValuesIter<'a> {
+    inner: ValueMapIter<'a>,
+}
+
+impl<'a> Iterator for ValueMapValuesIter<'a> {
+    type Item = ValueSetRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(_, values)| values)
+    }
+}
+
+pub enum ValueMapIter<'a> {
+    Materialized(RegValueMapIter<'a, SsaValue>),
+    DefBacked(RegValueMapIter<'a, DefId>),
+}
+
+impl<'a> Iterator for ValueMapIter<'a> {
+    type Item = (Reg, ValueSetRef<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Materialized(iter) => iter.next().map(|(reg, values)| (reg, ValueSetRef::Materialized(values))),
+            Self::DefBacked(iter) => iter.next().map(|(reg, values)| (reg, ValueSetRef::DefBacked(values))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ValueSetRef<'a> {
+    Materialized(&'a CompactSet<SsaValue>),
+    DefBacked(&'a CompactSet<DefId>),
+}
+
+impl<'a> ValueSetRef<'a> {
+    pub fn is_empty(self) -> bool {
+        match self {
+            Self::Materialized(values) => values.is_empty(),
+            Self::DefBacked(values) => values.is_empty(),
+        }
+    }
+
+    pub fn len(self) -> usize {
+        match self {
+            Self::Materialized(values) => values.len(),
+            Self::DefBacked(values) => values.len(),
+        }
+    }
+
+    pub fn contains(self, needle: &SsaValue) -> bool {
+        match (self, needle) {
+            (Self::Materialized(values), _) => values.contains(needle),
+            (Self::DefBacked(values), SsaValue::Def(def_id)) => values.contains(def_id),
+            (Self::DefBacked(_), SsaValue::Phi(_)) => false,
+        }
+    }
+
+    pub fn iter(self) -> ValueSetIter<'a> {
+        match self {
+            Self::Materialized(values) => ValueSetIter::Materialized(values.iter()),
+            Self::DefBacked(values) => ValueSetIter::DefBacked(values.iter()),
+        }
+    }
+
+    pub fn to_compact_set(self) -> CompactSet<SsaValue> {
+        match self {
+            Self::Materialized(values) => values.clone(),
+            Self::DefBacked(values) => match values {
+                CompactSet::Empty => CompactSet::Empty,
+                CompactSet::One(def_id) => CompactSet::singleton(SsaValue::Def(*def_id)),
+                CompactSet::Many(def_ids) => {
+                    CompactSet::Many(def_ids.iter().copied().map(SsaValue::Def).collect())
+                }
+            },
+        }
+    }
+}
+
+pub enum ValueSetIter<'a> {
+    Materialized(CompactSetIter<'a, SsaValue>),
+    DefBacked(CompactSetIter<'a, DefId>),
+}
+
+impl<'a> Iterator for ValueSetIter<'a> {
+    type Item = SsaValue;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Materialized(iter) => iter.next().copied(),
+            Self::DefBacked(iter) => iter.next().copied().map(SsaValue::Def),
+        }
+    }
 }
 
 impl DataflowFacts {
@@ -44,10 +172,22 @@ impl DataflowFacts {
             .expect("dataflow should have a reaching-def snapshot for every instruction")
     }
 
-    pub fn reaching_values_at(&self, instr: InstrRef) -> &InstrReachingValues {
-        self.reaching_values
-            .get(instr.index())
-            .expect("dataflow should have a reaching-value snapshot for every instruction")
+    pub fn reaching_values_at(&self, instr: InstrRef) -> ValueMapRef<'_> {
+        match &self.value_facts {
+            ValueFactsStorage::Materialized { reaching_values, .. } => {
+                let values = reaching_values
+                    .get(instr.index())
+                    .expect("dataflow should have a reaching-value snapshot for every instruction");
+                ValueMapRef::Materialized(&values.fixed)
+            }
+            ValueFactsStorage::NoPhi => {
+                let defs = self
+                    .reaching_defs
+                    .get(instr.index())
+                    .expect("dataflow should have a reaching-def snapshot for every instruction");
+                ValueMapRef::DefBacked(&defs.fixed)
+            }
+        }
     }
 
     pub fn use_defs_at(&self, instr: InstrRef) -> &InstrUseDefs {
@@ -56,10 +196,22 @@ impl DataflowFacts {
             .expect("dataflow should have a use-def summary for every instruction")
     }
 
-    pub fn use_values_at(&self, instr: InstrRef) -> &InstrUseValues {
-        self.use_values
-            .get(instr.index())
-            .expect("dataflow should have a use-value summary for every instruction")
+    pub fn use_values_at(&self, instr: InstrRef) -> ValueMapRef<'_> {
+        match &self.value_facts {
+            ValueFactsStorage::Materialized { use_values, .. } => {
+                let values = use_values
+                    .get(instr.index())
+                    .expect("dataflow should have a use-value summary for every instruction");
+                ValueMapRef::Materialized(&values.fixed)
+            }
+            ValueFactsStorage::NoPhi => {
+                let defs = self
+                    .use_defs
+                    .get(instr.index())
+                    .expect("dataflow should have a use-def summary for every instruction");
+                ValueMapRef::DefBacked(&defs.fixed)
+            }
+        }
     }
 
     pub fn open_reaching_defs_at(&self, instr: InstrRef) -> &BTreeSet<OpenDefId> {
@@ -119,9 +271,13 @@ impl DataflowFacts {
     }
 
     pub fn phi_use_count(&self, phi_id: PhiId) -> usize {
-        self.use_values
-            .iter()
-            .flat_map(|uses| uses.fixed.values())
+        if self.phi_candidates.is_empty() {
+            return 0;
+        }
+
+        (0..self.use_defs.len())
+            .map(|instr_index| self.use_values_at(InstrRef(instr_index)))
+            .flat_map(ValueMapRef::values)
             .filter(|values| values.contains(&SsaValue::Phi(phi_id)))
             .count()
     }
@@ -166,11 +322,15 @@ impl DataflowFacts {
     }
 
     pub fn phi_used_only_in_block(&self, cfg: &Cfg, phi_id: PhiId, block: BlockRef) -> bool {
+        if self.phi_candidates.is_empty() {
+            return false;
+        }
+
         let mut saw_use = false;
 
-        for (instr_index, use_values) in self.use_values.iter().enumerate() {
-            let used_here = use_values
-                .fixed
+        for instr_index in 0..self.use_defs.len() {
+            let used_here = self
+                .use_values_at(InstrRef(instr_index))
                 .values()
                 .any(|values| values.contains(&SsaValue::Phi(phi_id)));
             if !used_here {

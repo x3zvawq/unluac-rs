@@ -14,7 +14,8 @@ pub use cfg::{
 pub use dataflow::{
     DataflowFacts, Def, DefId, EffectTag, InstrEffect, InstrReachingDefs, InstrReachingValues,
     InstrUseDefs, InstrUseValues, OpenDef, OpenDefId, OpenUseSite, PhiCandidate, PhiId,
-    PhiIncoming, SideEffectSummary, SsaValue, UseSite,
+    PhiIncoming, SideEffectSummary, SsaValue, UseSite, ValueMapRef, ValueSetRef,
 };
+pub(crate) use dataflow::ValueFactsStorage;
 pub use graph::{DominatorTree, GraphFacts, NaturalLoop, PostDominatorTree};
 pub use storage::{CompactSet, RegValueMap};

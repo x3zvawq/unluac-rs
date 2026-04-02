@@ -15,7 +15,7 @@ pub(crate) fn expr_for_reg_use(
     if let Some(local) = loop_local_for_reg(lowering, block, reg) {
         return HirExpr::LocalRef(local);
     }
-    let Some(values) = lowering.dataflow.use_values_at(instr_ref).fixed.get(reg) else {
+    let Some(values) = lowering.dataflow.use_values_at(instr_ref).get(reg) else {
         return entry_reg_expr(lowering, reg);
     };
 
@@ -85,7 +85,6 @@ pub(crate) fn expr_for_reg_at_block_entry(
     let Some(values) = lowering
         .dataflow
         .reaching_values_at(range.start)
-        .fixed
         .get(reg)
     else {
         return entry_reg_expr(lowering, reg);
@@ -147,9 +146,8 @@ pub(crate) fn expr_for_reg_at_block_exit(
     let mut values = lowering
         .dataflow
         .reaching_values_at(last_instr_ref)
-        .fixed
         .get(reg)
-        .cloned()
+        .map(|values| values.to_compact_set())
         .unwrap_or_default();
     if effect.fixed_may_defs.contains(&reg) {
         let Some(def) = fixed_def_for_reg(lowering, last_instr_ref, reg) else {
@@ -198,7 +196,7 @@ pub(crate) fn expr_for_reg_use_inline(
     if let Some(local) = loop_local_for_reg(lowering, block, reg) {
         return HirExpr::LocalRef(local);
     }
-    let Some(values) = lowering.dataflow.use_values_at(instr_ref).fixed.get(reg) else {
+    let Some(values) = lowering.dataflow.use_values_at(instr_ref).get(reg) else {
         return entry_reg_expr(lowering, reg);
     };
 
@@ -212,7 +210,7 @@ pub(crate) fn expr_for_reg_use_inline(
             .next()
             .expect("len checked above, exactly one SSA-like value exists");
         return match value {
-            SsaValue::Def(def) => expr_for_dup_safe_fixed_def(lowering, *def)
+            SsaValue::Def(def) => expr_for_dup_safe_fixed_def(lowering, def)
                 .unwrap_or_else(|| HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()])),
             SsaValue::Phi(phi) => HirExpr::TempRef(lowering.bindings.phi_temps[phi.index()]),
         };
@@ -238,7 +236,7 @@ pub(crate) fn expr_for_reg_use_single_eval(
     if let Some(local) = loop_local_for_reg(lowering, block, reg) {
         return HirExpr::LocalRef(local);
     }
-    let Some(values) = lowering.dataflow.use_values_at(instr_ref).fixed.get(reg) else {
+    let Some(values) = lowering.dataflow.use_values_at(instr_ref).get(reg) else {
         return entry_reg_expr(lowering, reg);
     };
 
@@ -252,7 +250,7 @@ pub(crate) fn expr_for_reg_use_single_eval(
             .next()
             .expect("len checked above, exactly one SSA-like value exists");
         return match value {
-            SsaValue::Def(def) => expr_for_fixed_def(lowering, *def)
+            SsaValue::Def(def) => expr_for_fixed_def(lowering, def)
                 .unwrap_or_else(|| HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()])),
             SsaValue::Phi(phi) => HirExpr::TempRef(lowering.bindings.phi_temps[phi.index()]),
         };

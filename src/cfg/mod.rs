@@ -15,7 +15,7 @@ pub use common::{
     DominatorTree, EdgeKind, EdgeRef, EffectTag, GraphFacts, InstrEffect, InstrRange,
     InstrReachingDefs, InstrReachingValues, InstrUseDefs, InstrUseValues, NaturalLoop, OpenDef,
     OpenDefId, OpenUseSite, PhiCandidate, PhiId, PhiIncoming, PostDominatorTree, RegValueMap,
-    SideEffectSummary, SsaValue, UseSite,
+    SideEffectSummary, SsaValue, UseSite, ValueMapRef, ValueSetRef,
 };
 pub use dataflow::analyze_dataflow;
 pub use debug::{dump_cfg, dump_dataflow, dump_graph_facts};

@@ -152,6 +152,12 @@ where
         }
     }
 
+    pub fn from_sparse_entries(entries: Vec<(Reg, CompactSet<T>)>) -> Self {
+        Self {
+            repr: RegValueMapRepr::Sparse(entries),
+        }
+    }
+
     pub fn sparse() -> Self {
         Self {
             repr: RegValueMapRepr::Sparse(Vec::new()),

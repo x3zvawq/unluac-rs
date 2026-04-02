@@ -11,7 +11,7 @@ use crate::transformer::{LowInstr, LoweredChunk, LoweredProto, Reg};
 
 use super::common::{
     BlockRef, CfgGraph, CompactSet, DataflowFacts, DefId, EffectTag, GraphFacts, OpenDefId,
-    RegValueMap, SsaValue,
+    RegValueMap, SsaValue, ValueMapRef, ValueSetRef,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -319,11 +319,15 @@ pub fn dump_dataflow(
             }
 
             let _ = writeln!(output, "{indent}  reaching values");
-            for (instr_index, values) in entry.facts.reaching_values.iter().enumerate() {
+            for instr_index in 0..entry.proto.instrs.len() {
                 let _ = writeln!(
                     output,
                     "{indent}    @{instr_index:03} fixed={}",
-                    format_reaching_values(&values.fixed),
+                    format_reaching_values(
+                        entry
+                            .facts
+                            .reaching_values_at(crate::transformer::InstrRef(instr_index)),
+                    ),
                 );
             }
         }
@@ -518,7 +522,7 @@ fn format_def_iter<'a>(defs: impl Iterator<Item = &'a DefId>) -> String {
     }
 }
 
-fn format_reaching_values(values: &RegValueMap<SsaValue>) -> String {
+fn format_reaching_values(values: ValueMapRef<'_>) -> String {
     if values.iter().next().is_none() {
         "[-]".to_owned()
     } else {
@@ -530,7 +534,7 @@ fn format_reaching_values(values: &RegValueMap<SsaValue>) -> String {
     }
 }
 
-fn format_value_set(values: &CompactSet<SsaValue>) -> String {
+fn format_value_set(values: ValueSetRef<'_>) -> String {
     if values.is_empty() {
         "[-]".to_owned()
     } else {

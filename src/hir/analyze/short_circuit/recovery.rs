@@ -558,7 +558,6 @@ fn collect_consumed_single_eval_defs(
     let Some(values) = lowering
         .dataflow
         .use_values_at(consumer_instr)
-        .fixed
         .get(reg)
     else {
         return;
@@ -566,7 +565,7 @@ fn collect_consumed_single_eval_defs(
     if values.len() != 1 {
         return;
     }
-    let Some(SsaValue::Def(def_id)) = values.iter().next().copied() else {
+    let Some(SsaValue::Def(def_id)) = values.iter().next() else {
         return;
     };
     let def_block = lowering.dataflow.def_block(def_id);

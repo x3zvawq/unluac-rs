@@ -26,16 +26,31 @@ use super::common::{
     BlockRef, Cfg, CfgGraph, CompactSet, DataflowFacts, Def, DefId, EffectTag, GraphFacts,
     InstrEffect, InstrReachingDefs, InstrReachingValues, InstrUseDefs, InstrUseValues, OpenDef,
     OpenDefId, OpenUseSite, PhiCandidate, PhiId, PhiIncoming, RegValueMap, SideEffectSummary,
-    SsaValue, UseSite,
+    SsaValue, UseSite, ValueFactsStorage,
 };
 
-type FixedState = Vec<CompactSet<DefId>>;
-type ValueState = Vec<CompactSet<SsaValue>>;
+type FixedState = TrackedState<DefId>;
+type ValueState = TrackedState<SsaValue>;
 
 struct DefLookupTables {
-    fixed: Vec<BTreeMap<Reg, DefId>>,
+    fixed: Vec<FixedDefLookup>,
     open_must: Vec<Option<OpenDefId>>,
     open_may: Vec<Option<OpenDefId>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FixedDefLookup {
+    must: Vec<(Reg, DefId)>,
+    may: Vec<(Reg, DefId)>,
+}
+
+impl FixedDefLookup {
+    fn defines(&self, reg: Reg) -> bool {
+        self.must
+            .iter()
+            .chain(self.may.iter())
+            .any(|(candidate, _)| *candidate == reg)
+    }
 }
 
 struct BlockReachingState {
@@ -47,9 +62,7 @@ struct BlockReachingState {
 
 struct InstructionFacts {
     reaching_defs: Vec<InstrReachingDefs>,
-    reaching_values: Vec<InstrReachingValues>,
     use_defs: Vec<InstrUseDefs>,
-    use_values: Vec<InstrUseValues>,
     def_uses: Vec<Vec<UseSite>>,
     open_reaching_defs: Vec<CompactSet<OpenDefId>>,
     open_use_defs: Vec<CompactSet<OpenDefId>>,
@@ -59,6 +72,212 @@ struct InstructionFacts {
 struct BlockValueState {
     fixed_in: Vec<ValueState>,
     fixed_out: Vec<ValueState>,
+}
+
+#[derive(Debug, Clone)]
+struct TrackedState<T> {
+    regs: Vec<CompactSet<T>>,
+    active_regs: Vec<Reg>,
+    active_marks: Vec<bool>,
+    active_sorted: bool,
+}
+
+impl<T> TrackedState<T>
+where
+    T: Copy + Ord,
+{
+    fn new(reg_count: usize) -> Self {
+        Self {
+            regs: vec![CompactSet::Empty; reg_count],
+            active_regs: Vec::new(),
+            active_marks: vec![false; reg_count],
+            active_sorted: true,
+        }
+    }
+
+    fn get(&self, reg: Reg) -> &CompactSet<T> {
+        self.regs
+            .get(reg.index())
+            .expect("tracked state should have a slot for every reachable register")
+    }
+
+    fn set_singleton(&mut self, reg: Reg, value: T) -> bool {
+        self.set_compact(reg, CompactSet::singleton(value))
+    }
+
+    fn insert(&mut self, reg: Reg, value: T) -> bool {
+        let index = reg.index();
+        let changed = self.regs[index].insert(value);
+        if changed {
+            self.ensure_active(reg);
+        }
+        changed
+    }
+
+    fn extend_from(&mut self, other: &Self) -> bool {
+        let mut changed = false;
+
+        for reg in other.active_regs.iter().copied() {
+            match other.get(reg) {
+                CompactSet::Empty => {}
+                CompactSet::One(value) => {
+                    changed |= self.insert(reg, *value);
+                }
+                CompactSet::Many(values) => {
+                    for value in values {
+                        changed |= self.insert(reg, *value);
+                    }
+                }
+            }
+        }
+
+        changed
+    }
+
+    fn snapshot_map(&mut self) -> RegValueMap<T> {
+        if !self.active_sorted {
+            self.active_regs.sort_unstable_by_key(|reg| reg.index());
+            self.active_sorted = true;
+        }
+        let mut entries = Vec::with_capacity(self.active_regs.len());
+        for &reg in &self.active_regs {
+            let values = self
+                .regs
+                .get(reg.index())
+                .cloned()
+                .expect("tracked state should have a slot for every active register");
+            if !values.is_empty() {
+                entries.push((reg, values));
+            }
+        }
+        RegValueMap::from_sparse_entries(entries)
+    }
+
+    fn set_compact(&mut self, reg: Reg, values: CompactSet<T>) -> bool {
+        let index = reg.index();
+        if self.regs[index] == values {
+            return false;
+        }
+        self.regs[index] = values;
+        if !self.regs[index].is_empty() {
+            self.ensure_active(reg);
+        }
+        true
+    }
+
+    fn ensure_active(&mut self, reg: Reg) {
+        let index = reg.index();
+        if self.active_marks[index] {
+            return;
+        }
+
+        if let Some(last_reg) = self.active_regs.last().copied()
+            && last_reg.index() > index
+        {
+            self.active_sorted = false;
+        }
+        self.active_marks[index] = true;
+        self.active_regs.push(reg);
+    }
+}
+
+impl<T> PartialEq for TrackedState<T>
+where
+    T: Copy + Ord + PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.regs == other.regs
+    }
+}
+
+impl<T> Eq for TrackedState<T> where T: Copy + Ord + Eq {}
+
+struct FixedUseScratch {
+    regs: Vec<Reg>,
+    seen: Vec<bool>,
+}
+
+impl FixedUseScratch {
+    fn new(reg_count: usize) -> Self {
+        Self {
+            regs: Vec::new(),
+            seen: vec![false; reg_count],
+        }
+    }
+
+    fn resolve<'a>(
+        &'a mut self,
+        effect: &InstrEffect,
+        current_open: &CompactSet<OpenDefId>,
+        open_defs: &[OpenDef],
+    ) -> &'a [Reg] {
+        self.clear();
+
+        for reg in effect.fixed_uses.iter().copied() {
+            self.push(reg);
+        }
+
+        let Some(start_reg) = effect.open_use else {
+            self.sort();
+            return &self.regs;
+        };
+
+        if current_open.len() != 1 {
+            self.sort();
+            return &self.regs;
+        }
+
+        let open_def_id = current_open
+            .iter()
+            .next()
+            .expect("len checked above, exactly one reaching open def exists");
+        let Some(open_def) = open_defs.get(open_def_id.index()) else {
+            self.sort();
+            return &self.regs;
+        };
+        if open_def.start_reg.index() <= start_reg.index() {
+            self.sort();
+            return &self.regs;
+        }
+
+        for index in start_reg.index()..open_def.start_reg.index() {
+            self.push(Reg(index));
+        }
+        self.sort();
+        &self.regs
+    }
+
+    fn clear(&mut self) {
+        for reg in self.regs.iter().copied() {
+            self.seen[reg.index()] = false;
+        }
+        self.regs.clear();
+    }
+
+    fn push(&mut self, reg: Reg) {
+        if self.seen[reg.index()] {
+            return;
+        }
+
+        self.seen[reg.index()] = true;
+        self.regs.push(reg);
+    }
+
+    fn sort(&mut self) {
+        self.regs.sort_unstable_by_key(|reg| reg.index());
+    }
+}
+
+struct MaterializeScratch {
+    fixed_use_regs: FixedUseScratch,
+}
+
+impl MaterializeScratch {
+    fn new(reg_count: usize) -> Self {
+        Self {
+            fixed_use_regs: FixedUseScratch::new(reg_count),
+        }
+    }
 }
 
 struct ValueMaterializeCtx<'a> {
@@ -106,7 +325,7 @@ fn analyze_proto_dataflow(
     let mut open_defs = Vec::new();
     let mut instr_defs = vec![Vec::new(); proto.instrs.len()];
     let mut lookups = DefLookupTables {
-        fixed: vec![BTreeMap::<Reg, DefId>::new(); proto.instrs.len()],
+        fixed: vec![FixedDefLookup::default(); proto.instrs.len()],
         open_must: vec![None; proto.instrs.len()],
         open_may: vec![None; proto.instrs.len()],
     };
@@ -119,11 +338,7 @@ fn analyze_proto_dataflow(
         for instr_index in instr_indices {
             let effect = &instr_effects[instr_index];
 
-            for reg in effect
-                .fixed_must_defs
-                .iter()
-                .chain(effect.fixed_may_defs.iter())
-            {
+            for reg in &effect.fixed_must_defs {
                 let id = DefId(defs.len());
                 let reg = *reg;
                 let def = Def {
@@ -134,7 +349,21 @@ fn analyze_proto_dataflow(
                 };
                 defs.push(def);
                 instr_defs[instr_index].push(id);
-                lookups.fixed[instr_index].insert(reg, id);
+                lookups.fixed[instr_index].must.push((reg, id));
+            }
+
+            for reg in &effect.fixed_may_defs {
+                let id = DefId(defs.len());
+                let reg = *reg;
+                let def = Def {
+                    id,
+                    reg,
+                    instr: crate::transformer::InstrRef(instr_index),
+                    block,
+                };
+                defs.push(def);
+                instr_defs[instr_index].push(id);
+                lookups.fixed[instr_index].may.push((reg, id));
             }
 
             if let Some(start_reg) = effect.open_must_def {
@@ -162,8 +391,8 @@ fn analyze_proto_dataflow(
     }
 
     let mut block_state = BlockReachingState {
-        fixed_in: vec![vec![CompactSet::Empty; reg_count]; cfg.blocks.len()],
-        fixed_out: vec![vec![CompactSet::Empty; reg_count]; cfg.blocks.len()],
+        fixed_in: vec![TrackedState::new(reg_count); cfg.blocks.len()],
+        fixed_out: vec![TrackedState::new(reg_count); cfg.blocks.len()],
         open_in: vec![CompactSet::Empty; cfg.blocks.len()],
         open_out: vec![CompactSet::Empty; cfg.blocks.len()],
     };
@@ -172,14 +401,14 @@ fn analyze_proto_dataflow(
 
     let mut instruction_facts = InstructionFacts {
         reaching_defs: vec![InstrReachingDefs::default(); proto.instrs.len()],
-        reaching_values: vec![InstrReachingValues::default(); proto.instrs.len()],
         use_defs: vec![InstrUseDefs::default(); proto.instrs.len()],
-        use_values: vec![InstrUseValues::default(); proto.instrs.len()],
         def_uses: vec![Vec::new(); defs.len()],
         open_reaching_defs: vec![CompactSet::Empty; proto.instrs.len()],
         open_use_defs: vec![CompactSet::Empty; proto.instrs.len()],
         open_def_uses: vec![Vec::new(); open_defs.len()],
     };
+
+    let mut materialize_scratch = MaterializeScratch::new(reg_count);
 
     materialize_instruction_facts(
         cfg,
@@ -187,6 +416,7 @@ fn analyze_proto_dataflow(
         &lookups,
         &open_defs,
         &block_state,
+        &mut materialize_scratch,
         &mut instruction_facts,
     );
 
@@ -202,19 +432,28 @@ fn analyze_proto_dataflow(
     );
     let phi_block_ranges = index_phi_candidate_ranges(cfg, &phi_candidates);
 
-    materialize_value_facts(
-        cfg,
-        graph_facts,
-        &instr_effects,
-        ValueMaterializeCtx {
-            lookups: &lookups,
-            open_defs: &open_defs,
-            phi_candidates: &phi_candidates,
-            phi_block_ranges: &phi_block_ranges,
-        },
-        reg_count,
-        &mut instruction_facts,
-    );
+    let value_facts = if phi_candidates.is_empty() {
+        ValueFactsStorage::NoPhi
+    } else {
+        let materialized = materialize_value_facts(
+            cfg,
+            graph_facts,
+            &instr_effects,
+            ValueMaterializeCtx {
+                lookups: &lookups,
+                open_defs: &open_defs,
+                phi_candidates: &phi_candidates,
+                phi_block_ranges: &phi_block_ranges,
+            },
+            reg_count,
+            &mut materialize_scratch,
+            &instruction_facts,
+        );
+        ValueFactsStorage::Materialized {
+            reaching_values: materialized.reaching_values,
+            use_values: materialized.use_values,
+        }
+    };
 
     let children = proto
         .children
@@ -238,9 +477,7 @@ fn analyze_proto_dataflow(
         open_defs,
         instr_defs,
         reaching_defs: instruction_facts.reaching_defs,
-        reaching_values: instruction_facts.reaching_values,
         use_defs: instruction_facts.use_defs,
-        use_values: instruction_facts.use_values,
         def_uses: instruction_facts.def_uses,
         open_reaching_defs: collect_open_sets(&instruction_facts.open_reaching_defs),
         open_use_defs: collect_open_sets(&instruction_facts.open_use_defs),
@@ -251,6 +488,7 @@ fn analyze_proto_dataflow(
         open_live_out: liveness.open_live_out,
         phi_candidates,
         phi_block_ranges,
+        value_facts,
         children,
     }
 }
@@ -259,37 +497,13 @@ fn analyze_proto_dataflow(
 ///
 /// 因此如果当前 reaching 的 open def 实际从更晚寄存器开始，那么 `start..tail_start-1`
 /// 这一段仍然是被这条指令真实读取的固定寄存器前缀，必须进入 use/liveness。
-fn resolved_fixed_use_regs(
+fn resolved_fixed_use_regs<'a>(
+    scratch: &'a mut MaterializeScratch,
     effect: &InstrEffect,
     current_open: &CompactSet<OpenDefId>,
     open_defs: &[OpenDef],
-) -> BTreeSet<Reg> {
-    let mut regs = effect.fixed_uses.clone();
-
-    let Some(start_reg) = effect.open_use else {
-        return regs;
-    };
-
-    if current_open.len() != 1 {
-        return regs;
-    }
-
-    let open_def_id = current_open
-        .iter()
-        .next()
-        .expect("len checked above, exactly one reaching open def exists");
-    let Some(open_def) = open_defs.get(open_def_id.index()) else {
-        return regs;
-    };
-    if open_def.start_reg.index() <= start_reg.index() {
-        return regs;
-    }
-
-    for index in start_reg.index()..open_def.start_reg.index() {
-        regs.insert(Reg(index));
-    }
-
-    regs
+) -> &'a [Reg] {
+    scratch.fixed_use_regs.resolve(effect, current_open, open_defs)
 }
 
 fn instr_indices(cfg: &Cfg, block: BlockRef) -> Option<impl Iterator<Item = usize>> {
@@ -322,4 +536,133 @@ fn collect_open_sets(sets: &[CompactSet<OpenDefId>]) -> Vec<BTreeSet<OpenDefId>>
     sets.iter()
         .map(|set| set.iter().copied().collect())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tracked_state_snapshot_preserves_sparse_contents() {
+        let mut state = TrackedState::new(8);
+        state.set_singleton(Reg(4), DefId(11));
+        state.insert(Reg(4), DefId(12));
+        state.set_singleton(Reg(1), DefId(3));
+
+        let snapshot = state.snapshot_map();
+
+        assert_eq!(snapshot.keys().collect::<Vec<_>>(), vec![Reg(1), Reg(4)]);
+        assert_eq!(
+            snapshot.get(Reg(1)).cloned(),
+            Some(CompactSet::singleton(DefId(3)))
+        );
+        assert_eq!(
+            snapshot.get(Reg(4)).cloned(),
+            Some(CompactSet::Many(BTreeSet::from([DefId(11), DefId(12)])))
+        );
+        assert_eq!(snapshot.get(Reg(7)), None);
+    }
+
+    #[test]
+    fn resolved_fixed_use_regs_should_include_open_gap_prefix() {
+        let mut effect = InstrEffect::default();
+        effect.fixed_uses.extend([Reg(1), Reg(5)]);
+        effect.open_use = Some(Reg(2));
+
+        let open_defs = vec![OpenDef {
+            id: OpenDefId(0),
+            start_reg: Reg(4),
+            instr: crate::transformer::InstrRef(0),
+            block: BlockRef(0),
+        }];
+        let current_open = CompactSet::singleton(OpenDefId(0));
+        let mut scratch = MaterializeScratch::new(8);
+
+        let regs = resolved_fixed_use_regs(&mut scratch, &effect, &current_open, &open_defs);
+
+        assert_eq!(regs, &[Reg(1), Reg(2), Reg(3), Reg(5)]);
+    }
+
+    #[test]
+    fn block_phi_values_should_override_reaching_defs_in_snapshot() {
+        let mut state = ValueState::new(4);
+        state.set_singleton(Reg(1), SsaValue::Def(DefId(7)));
+
+        values::apply_block_phi_values(
+            &mut state,
+            &[PhiCandidate {
+                id: PhiId(2),
+                block: BlockRef(1),
+                reg: Reg(1),
+                incoming: Vec::new(),
+            }],
+        );
+
+        let snapshot = state.snapshot_map();
+
+        assert_eq!(
+            snapshot.get(Reg(1)).cloned(),
+            Some(CompactSet::singleton(SsaValue::Phi(PhiId(2))))
+        );
+    }
+
+    #[test]
+    fn no_phi_value_queries_should_wrap_defs_as_ssa_defs() {
+        let reaching_defs = InstrReachingDefs {
+            fixed: RegValueMap::from_sparse_entries(vec![
+                (Reg(0), CompactSet::singleton(DefId(1))),
+                (Reg(2), CompactSet::Many(BTreeSet::from([DefId(3), DefId(4)]))),
+            ]),
+        };
+        let use_defs = InstrUseDefs {
+            fixed: RegValueMap::from_sparse_entries(vec![(Reg(2), CompactSet::singleton(DefId(4)))]),
+            open: BTreeSet::new(),
+        };
+        let dataflow = DataflowFacts {
+            instr_effects: vec![InstrEffect::default()],
+            effect_summaries: vec![SideEffectSummary::default()],
+            defs: Vec::new(),
+            open_defs: Vec::new(),
+            instr_defs: vec![Vec::new()],
+            reaching_defs: vec![reaching_defs],
+            use_defs: vec![use_defs],
+            def_uses: Vec::new(),
+            open_reaching_defs: vec![BTreeSet::new()],
+            open_use_defs: vec![BTreeSet::new()],
+            open_def_uses: Vec::new(),
+            live_in: Vec::new(),
+            live_out: Vec::new(),
+            open_live_in: Vec::new(),
+            open_live_out: Vec::new(),
+            phi_candidates: Vec::new(),
+            phi_block_ranges: Vec::new(),
+            value_facts: ValueFactsStorage::NoPhi,
+            children: Vec::new(),
+        };
+
+        assert_eq!(
+            dataflow
+                .reaching_values_at(crate::transformer::InstrRef(0))
+                .get(Reg(0))
+                .map(|values| values.to_compact_set()),
+            Some(CompactSet::singleton(SsaValue::Def(DefId(1))))
+        );
+        assert_eq!(
+            dataflow
+                .reaching_values_at(crate::transformer::InstrRef(0))
+                .get(Reg(2))
+                .map(|values| values.to_compact_set()),
+            Some(CompactSet::Many(BTreeSet::from([
+                SsaValue::Def(DefId(3)),
+                SsaValue::Def(DefId(4)),
+            ])))
+        );
+        assert_eq!(
+            dataflow
+                .use_values_at(crate::transformer::InstrRef(0))
+                .get(Reg(2))
+                .map(|values| values.to_compact_set()),
+            Some(CompactSet::singleton(SsaValue::Def(DefId(4))))
+        );
+    }
 }
