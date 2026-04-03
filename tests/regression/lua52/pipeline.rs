@@ -86,6 +86,45 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn lua52_generate_stage_coalesces_irreducible_goto_mesh_back_into_single_state_local_decl() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.2",
+            "tests/lua_cases/lua5.2/06_goto_irreducible_mesh.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua52,
+                target_stage: DecompileStage::Generate,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Generate],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Normal,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.2 generate stage should succeed for irreducible goto mesh fixture");
+
+        assert_eq!(
+            result.state.completed_stage,
+            Some(DecompileStage::Generate)
+        );
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should leave generated source in state");
+        assert_eq!(generated.source.matches("local ").count(), 1, "{}", generated.source);
+        assert!(!generated.source.contains("local r0_0, r0_1,"), "{}", generated.source);
+        assert!(!generated.source.contains("\nlocal r0_"), "{}", generated.source);
+        assert!(!contains_plain_self_assign(&generated.source), "{}", generated.source);
+    }
+
+    #[test]
     fn lua52_goto_break_like_case_preserves_runtime_output() {
         let spec = crate::support::find_unit_case_spec(
             crate::support::UnitSuite::DecompilePipelineHealth,

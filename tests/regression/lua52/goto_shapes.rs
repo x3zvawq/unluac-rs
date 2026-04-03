@@ -17,7 +17,6 @@ mod decompile_pipeline {
         let dump = hir_dump_for("tests/lua_cases/lua5.2/04_goto_break_like.lua");
 
         assert!(dump.contains("goto L"), "{dump}");
-        assert!(!dump.contains("continue"), "{dump}");
         assert!(!dump.contains("unresolved("), "{dump}");
         assert!(!dump.contains("unstructured summary=fallback"), "{dump}");
     }

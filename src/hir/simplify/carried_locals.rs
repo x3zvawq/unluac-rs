@@ -10,6 +10,8 @@
 //! - 多目标纯别名交棒：`assign tA, tB = sA, sB; ... tA/tB ...`
 //! - 多目标混合交棒：`assign tA, tB, tC = sA, sB, 0; ... sA, sB = tA, tB`
 //! - 更新后交棒：`assign tX = (sY + 1); ... sY = tX`
+//! - 显式 `goto/label` mesh 里的边界别名：若多条边界快照把同一组状态 temp 串成一个
+//!   等价类，这里会在当前 fallback block 内把它们统一认回同一批 binding
 //!
 //! 满足这几个条件时，说明这个 block 已经把“后半段状态身份”完全交给了 temp；
 //! 这里把它认回原 local，删掉 handoff seed。它不会发明新 local，也不会在原 local
@@ -26,6 +28,10 @@
 //! - 输出：`assign t10 = 0; ...`
 //! - 输入：`assign t3 = (t24 + 1); if cond(t3) then assign t23, t24 = step(t3), t3 end`
 //! - 输出：`assign t24 = (t24 + 1); if cond(t24) then assign t23 = step(t24) end`
+//! - 输入：`if cond then assign t10, t11 = t0, t1; goto L2 end; ... ::L2:: assign t2 = t10 + 1`
+//! - 输出：`if cond then goto L2 end; ... ::L2:: assign t0 = t0 + 1`
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId};
 
@@ -45,7 +51,7 @@ impl HirRewritePass for CarriedLocalPass {
 }
 
 fn collapse_block_handoffs(block: &mut HirBlock) -> bool {
-    let mut changed = false;
+    let mut changed = collapse_boundary_alias_classes(block);
     let mut index = 0;
 
     while index < block.stmts.len() {
@@ -72,6 +78,167 @@ fn collapse_block_handoffs(block: &mut HirBlock) -> bool {
 
     changed |= prune_redundant_self_assigns_in_block(block);
     changed
+}
+
+fn collapse_boundary_alias_classes(block: &mut HirBlock) -> bool {
+    if !block
+        .stmts
+        .iter()
+        .any(|stmt| matches!(stmt, HirStmt::Goto(_) | HirStmt::Label(_)))
+    {
+        return false;
+    }
+
+    let boundary_pairs = collect_boundary_alias_pairs(block);
+    if boundary_pairs.len() < 2 {
+        return false;
+    }
+
+    let mut adjacency = BTreeMap::<CarryBinding, BTreeSet<CarryBinding>>::new();
+    for pairs in boundary_pairs {
+        for (target, source) in pairs {
+            adjacency.entry(target).or_default().insert(source);
+            adjacency.entry(source).or_default().insert(target);
+        }
+    }
+
+    let mut visited = BTreeSet::new();
+    let mut rewrites = BTreeMap::new();
+    for &binding in adjacency.keys() {
+        if !visited.insert(binding) {
+            continue;
+        }
+
+        let mut stack = vec![binding];
+        let mut component = BTreeSet::from([binding]);
+        while let Some(current) = stack.pop() {
+            let Some(neighbors) = adjacency.get(&current) else {
+                continue;
+            };
+            for &neighbor in neighbors {
+                if visited.insert(neighbor) {
+                    stack.push(neighbor);
+                }
+                component.insert(neighbor);
+            }
+        }
+
+        // 这里只吃“已经被多条边界快照串起来”的 mesh 状态类。
+        // 单条 `a = b` 本身既可能是 handoff，也可能只是暂时保留的并行值；
+        // 至少需要 3 个成员，才能证明这更像同一槽位在多个 label 入口之间来回交棒。
+        if component.len() < 3 {
+            continue;
+        }
+
+        let canonical = component
+            .iter()
+            .copied()
+            .min_by_key(|binding| binding_canonical_key(*binding))
+            .expect("component is non-empty");
+        for member in component {
+            if member != canonical {
+                rewrites.insert(member, canonical);
+            }
+        }
+    }
+
+    if rewrites.is_empty() {
+        return false;
+    }
+
+    let mut pass = BindingClassRewritePass { rewrites };
+    if !rewrite_stmts(&mut block.stmts, &mut pass) {
+        return false;
+    }
+
+    rewrite_stmts(&mut block.stmts, &mut RedundantSelfAssignPrunePass);
+    prune_empty_assign_stmts(block);
+    true
+}
+
+fn collect_boundary_alias_pairs(block: &HirBlock) -> Vec<Vec<(CarryBinding, CarryBinding)>> {
+    let mut pairs = Vec::new();
+
+    for (index, stmt) in block.stmts.iter().enumerate() {
+        if let HirStmt::Assign(assign) = stmt
+            && let Some(alias_pairs) = top_level_boundary_alias_pairs(
+                assign,
+                block.stmts.get(index + 1),
+            )
+        {
+            pairs.push(alias_pairs);
+        }
+
+        let HirStmt::If(if_stmt) = stmt else {
+            continue;
+        };
+        let falls_through_to_label =
+            matches!(block.stmts.get(index + 1), Some(HirStmt::Label(_)));
+
+        if let Some(then_pairs) =
+            edge_snapshot_alias_pairs(&if_stmt.then_block, falls_through_to_label)
+        {
+            pairs.push(then_pairs);
+        }
+        if let Some(else_block) = &if_stmt.else_block
+            && let Some(else_pairs) = edge_snapshot_alias_pairs(else_block, falls_through_to_label)
+        {
+            pairs.push(else_pairs);
+        }
+    }
+
+    pairs
+}
+
+fn top_level_boundary_alias_pairs(
+    assign: &crate::hir::common::HirAssign,
+    next_stmt: Option<&HirStmt>,
+) -> Option<Vec<(CarryBinding, CarryBinding)>> {
+    match next_stmt {
+        Some(HirStmt::Goto(_)) | Some(HirStmt::Label(_)) => pure_alias_pairs(assign),
+        _ => None,
+    }
+}
+
+fn edge_snapshot_alias_pairs(
+    block: &HirBlock,
+    allow_fallthrough_to_label: bool,
+) -> Option<Vec<(CarryBinding, CarryBinding)>> {
+    match block.stmts.as_slice() {
+        [HirStmt::Assign(assign), HirStmt::Goto(_)] => pure_alias_pairs(assign),
+        [HirStmt::Assign(assign)] if allow_fallthrough_to_label => pure_alias_pairs(assign),
+        _ => None,
+    }
+}
+
+fn pure_alias_pairs(
+    assign: &crate::hir::common::HirAssign,
+) -> Option<Vec<(CarryBinding, CarryBinding)>> {
+    if assign.targets.is_empty() || assign.targets.len() != assign.values.len() {
+        return None;
+    }
+
+    let mut seen_targets = BTreeSet::new();
+    let mut seen_sources = BTreeSet::new();
+    let mut pairs = Vec::with_capacity(assign.targets.len());
+
+    for (target, value) in assign.targets.iter().zip(&assign.values) {
+        let target = carry_binding_from_lvalue(target)?;
+        let source = carry_binding_from_expr(value)?;
+        if !seen_targets.insert(target) || !seen_sources.insert(source) {
+            return None;
+        }
+        pairs.push((target, source));
+    }
+
+    Some(pairs)
+}
+
+fn binding_canonical_key(binding: CarryBinding) -> (u8, usize) {
+    match binding {
+        CarryBinding::Local(local) => (0, local.index()),
+        CarryBinding::Temp(temp) => (1, temp.index()),
+    }
 }
 
 fn try_collapse_pure_binding_handoffs(block: &mut HirBlock, index: usize) -> bool {
@@ -211,10 +378,74 @@ enum CarryBinding {
     Temp(TempId),
 }
 
+fn carry_binding_from_expr(expr: &HirExpr) -> Option<CarryBinding> {
+    match expr {
+        HirExpr::LocalRef(local) => Some(CarryBinding::Local(*local)),
+        HirExpr::TempRef(temp) => Some(CarryBinding::Temp(*temp)),
+        _ => None,
+    }
+}
+
+fn carry_binding_from_lvalue(lvalue: &HirLValue) -> Option<CarryBinding> {
+    match lvalue {
+        HirLValue::Local(local) => Some(CarryBinding::Local(*local)),
+        HirLValue::Temp(temp) => Some(CarryBinding::Temp(*temp)),
+        HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => None,
+    }
+}
+
+fn carry_binding_expr(binding: CarryBinding) -> HirExpr {
+    match binding {
+        CarryBinding::Local(local) => HirExpr::LocalRef(local),
+        CarryBinding::Temp(temp) => HirExpr::TempRef(temp),
+    }
+}
+
+fn carry_binding_lvalue(binding: CarryBinding) -> HirLValue {
+    match binding {
+        CarryBinding::Local(local) => HirLValue::Local(local),
+        CarryBinding::Temp(temp) => HirLValue::Temp(temp),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct TempBindingRewrite {
     from: TempId,
     to: CarryBinding,
+}
+
+struct BindingClassRewritePass {
+    rewrites: BTreeMap<CarryBinding, CarryBinding>,
+}
+
+impl BindingClassRewritePass {
+    fn rewrite_binding(&self, binding: CarryBinding) -> Option<CarryBinding> {
+        self.rewrites.get(&binding).copied()
+    }
+}
+
+impl HirRewritePass for BindingClassRewritePass {
+    fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
+        let Some(binding) = carry_binding_from_expr(expr) else {
+            return false;
+        };
+        let Some(rewrite) = self.rewrite_binding(binding) else {
+            return false;
+        };
+        *expr = carry_binding_expr(rewrite);
+        true
+    }
+
+    fn rewrite_lvalue(&mut self, lvalue: &mut HirLValue) -> bool {
+        let Some(binding) = carry_binding_from_lvalue(lvalue) else {
+            return false;
+        };
+        let Some(rewrite) = self.rewrite_binding(binding) else {
+            return false;
+        };
+        *lvalue = carry_binding_lvalue(rewrite);
+        true
+    }
 }
 
 struct BindingHandoffSeed {

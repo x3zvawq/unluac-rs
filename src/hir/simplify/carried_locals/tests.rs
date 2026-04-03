@@ -3,8 +3,9 @@
 //! 我们把测试放到实现文件外，避免 pass 本体被构造 proto 的样板淹没。
 
 use crate::hir::{
-    HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirExpr, HirIf, HirLValue, HirLocalDecl,
-    HirProto, HirProtoRef, HirReturn, HirStmt, HirUnaryExpr, HirUnaryOpKind, LocalId, TempId,
+    HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirExpr, HirGoto, HirIf, HirLabel,
+    HirLabelId, HirLValue, HirLocalDecl, HirProto, HirProtoRef, HirReturn, HirStmt, HirUnaryExpr,
+    HirUnaryOpKind, LocalId, TempId,
 };
 use crate::parser::{ProtoLineRange, ProtoSignature};
 
@@ -636,6 +637,340 @@ fn prunes_redundant_self_assign_stmt_without_handoff_rewrite() {
         [HirStmt::Assign(_), HirStmt::Return(ret)]
             if matches!(ret.values.as_slice(), [HirExpr::TempRef(id)] if *id == temp)
     ));
+}
+
+#[test]
+fn collapses_goto_mesh_boundary_aliases_back_into_two_carried_slots() {
+    let carried_x = TempId(0);
+    let carried_y = TempId(1);
+    let left_x = TempId(2);
+    let left_y = TempId(3);
+    let right_x = TempId(4);
+    let right_y = TempId(5);
+    let mesh_x = TempId(10);
+    let mesh_y = TempId(11);
+    let l2 = HirLabelId(2);
+    let l4 = HirLabelId(4);
+    let l5 = HirLabelId(5);
+
+    let mut proto = empty_proto(
+        Vec::new(),
+        vec![
+            carried_x, carried_y, left_x, left_y, right_x, right_y, mesh_x, mesh_y,
+        ],
+        vec![
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(carried_x)],
+                values: vec![HirExpr::Integer(0)],
+            })),
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(carried_y)],
+                values: vec![HirExpr::Integer(0)],
+            })),
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::Binary(Box::new(HirBinaryExpr {
+                    op: HirBinaryOpKind::Eq,
+                    lhs: HirExpr::TempRef(carried_x),
+                    rhs: HirExpr::Integer(0),
+                })),
+                then_block: HirBlock {
+                    stmts: vec![
+                        HirStmt::Assign(Box::new(HirAssign {
+                            targets: vec![HirLValue::Temp(mesh_x), HirLValue::Temp(mesh_y)],
+                            values: vec![
+                                HirExpr::TempRef(carried_x),
+                                HirExpr::TempRef(carried_y),
+                            ],
+                        })),
+                        HirStmt::Goto(Box::new(HirGoto { target: l2 })),
+                    ],
+                },
+                else_block: None,
+            })),
+            HirStmt::Goto(Box::new(HirGoto { target: l4 })),
+            HirStmt::Label(Box::new(HirLabel { id: l2 })),
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(left_x)],
+                values: vec![HirExpr::Binary(Box::new(HirBinaryExpr {
+                    op: HirBinaryOpKind::Add,
+                    lhs: HirExpr::TempRef(mesh_x),
+                    rhs: HirExpr::Integer(1),
+                }))],
+            })),
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(left_y)],
+                values: vec![HirExpr::Binary(Box::new(HirBinaryExpr {
+                    op: HirBinaryOpKind::Add,
+                    lhs: HirExpr::TempRef(mesh_y),
+                    rhs: HirExpr::Integer(10),
+                }))],
+            })),
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::Binary(Box::new(HirBinaryExpr {
+                    op: HirBinaryOpKind::Lt,
+                    lhs: HirExpr::TempRef(left_x),
+                    rhs: HirExpr::Integer(3),
+                })),
+                then_block: HirBlock {
+                    stmts: vec![
+                        HirStmt::Assign(Box::new(HirAssign {
+                            targets: vec![HirLValue::Temp(carried_x), HirLValue::Temp(carried_y)],
+                            values: vec![HirExpr::TempRef(left_x), HirExpr::TempRef(left_y)],
+                        })),
+                        HirStmt::Goto(Box::new(HirGoto { target: l4 })),
+                    ],
+                },
+                else_block: None,
+            })),
+            HirStmt::Goto(Box::new(HirGoto { target: l5 })),
+            HirStmt::Label(Box::new(HirLabel { id: l4 })),
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(right_x)],
+                values: vec![HirExpr::Binary(Box::new(HirBinaryExpr {
+                    op: HirBinaryOpKind::Add,
+                    lhs: HirExpr::TempRef(carried_x),
+                    rhs: HirExpr::Integer(2),
+                }))],
+            })),
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(right_y)],
+                values: vec![HirExpr::Binary(Box::new(HirBinaryExpr {
+                    op: HirBinaryOpKind::Add,
+                    lhs: HirExpr::TempRef(carried_y),
+                    rhs: HirExpr::Integer(1),
+                }))],
+            })),
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::Binary(Box::new(HirBinaryExpr {
+                    op: HirBinaryOpKind::Lt,
+                    lhs: HirExpr::TempRef(right_y),
+                    rhs: HirExpr::Integer(13),
+                })),
+                then_block: HirBlock {
+                    stmts: vec![
+                        HirStmt::Assign(Box::new(HirAssign {
+                            targets: vec![HirLValue::Temp(mesh_x), HirLValue::Temp(mesh_y)],
+                            values: vec![HirExpr::TempRef(right_x), HirExpr::TempRef(right_y)],
+                        })),
+                        HirStmt::Goto(Box::new(HirGoto { target: l2 })),
+                    ],
+                },
+                else_block: Some(HirBlock {
+                    stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(left_x), HirLValue::Temp(left_y)],
+                        values: vec![HirExpr::TempRef(right_x), HirExpr::TempRef(right_y)],
+                    }))],
+                }),
+            })),
+            HirStmt::Label(Box::new(HirLabel { id: l5 })),
+            HirStmt::Return(Box::new(HirReturn {
+                values: vec![HirExpr::TempRef(left_x), HirExpr::TempRef(left_y)],
+            })),
+        ],
+    );
+
+    assert!(collapse_carried_local_handoffs_in_proto(&mut proto));
+    assert!(!proto_mentions_temp(&proto, mesh_x));
+    assert!(!proto_mentions_temp(&proto, mesh_y));
+    assert!(!proto_mentions_temp(&proto, left_x));
+    assert!(!proto_mentions_temp(&proto, left_y));
+    assert!(!proto_mentions_temp(&proto, right_x));
+    assert!(!proto_mentions_temp(&proto, right_y));
+    assert!(matches!(
+        proto.body.stmts.as_slice(),
+        [
+            HirStmt::Assign(_),
+            HirStmt::Assign(_),
+            HirStmt::If(first_if),
+            HirStmt::Goto(_),
+            HirStmt::Label(_),
+            HirStmt::Assign(first_update),
+            HirStmt::Assign(second_update),
+            HirStmt::If(second_if),
+            HirStmt::Goto(_),
+            HirStmt::Label(_),
+            HirStmt::Assign(third_update),
+            HirStmt::Assign(fourth_update),
+            HirStmt::If(third_if),
+            HirStmt::Label(_),
+            HirStmt::Return(ret),
+        ] if first_if.then_block.stmts.as_slice() == [HirStmt::Goto(Box::new(HirGoto { target: l2 }))]
+            && matches!(
+                first_update.values.as_slice(),
+                [HirExpr::Binary(binary)]
+                    if matches!(binary.lhs, HirExpr::TempRef(id) if id == carried_x)
+            ) && matches!(
+                second_update.values.as_slice(),
+                [HirExpr::Binary(binary)]
+                    if matches!(binary.lhs, HirExpr::TempRef(id) if id == carried_y)
+            ) && second_if.then_block.stmts.as_slice() == [HirStmt::Goto(Box::new(HirGoto { target: l4 }))]
+            && matches!(
+                third_update.values.as_slice(),
+                [HirExpr::Binary(binary)]
+                    if matches!(binary.lhs, HirExpr::TempRef(id) if id == carried_x)
+            ) && matches!(
+                fourth_update.values.as_slice(),
+                [HirExpr::Binary(binary)]
+                    if matches!(binary.lhs, HirExpr::TempRef(id) if id == carried_y)
+            ) && third_if.then_block.stmts.as_slice() == [HirStmt::Goto(Box::new(HirGoto { target: l2 }))]
+            && matches!(
+                ret.values.as_slice(),
+                [HirExpr::TempRef(first), HirExpr::TempRef(second)]
+                    if *first == carried_x && *second == carried_y
+            )
+    ));
+}
+
+fn proto_mentions_temp(proto: &HirProto, temp: TempId) -> bool {
+    block_mentions_temp(&proto.body, temp)
+}
+
+fn block_mentions_temp(block: &HirBlock, temp: TempId) -> bool {
+    block.stmts.iter().any(|stmt| stmt_mentions_temp(stmt, temp))
+}
+
+fn stmt_mentions_temp(stmt: &HirStmt, temp: TempId) -> bool {
+    match stmt {
+        HirStmt::LocalDecl(local_decl) => local_decl.values.iter().any(|expr| expr_mentions_temp(expr, temp)),
+        HirStmt::Assign(assign) => {
+            assign
+                .targets
+                .iter()
+                .any(|target| lvalue_mentions_temp(target, temp))
+                || assign
+                    .values
+                    .iter()
+                    .any(|expr| expr_mentions_temp(expr, temp))
+        }
+        HirStmt::TableSetList(set_list) => {
+            expr_mentions_temp(&set_list.base, temp)
+                || set_list.values.iter().any(|expr| expr_mentions_temp(expr, temp))
+                || set_list
+                    .trailing_multivalue
+                    .as_ref()
+                    .is_some_and(|expr| expr_mentions_temp(expr, temp))
+        }
+        HirStmt::ErrNil(err_nil) => expr_mentions_temp(&err_nil.value, temp),
+        HirStmt::ToBeClosed(to_be_closed) => expr_mentions_temp(&to_be_closed.value, temp),
+        HirStmt::Close(_) | HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => {
+            false
+        }
+        HirStmt::CallStmt(call_stmt) => {
+            expr_mentions_temp(&call_stmt.call.callee, temp)
+                || call_stmt
+                    .call
+                    .args
+                    .iter()
+                    .any(|expr| expr_mentions_temp(expr, temp))
+        }
+        HirStmt::Return(ret) => ret.values.iter().any(|expr| expr_mentions_temp(expr, temp)),
+        HirStmt::If(if_stmt) => {
+            expr_mentions_temp(&if_stmt.cond, temp)
+                || block_mentions_temp(&if_stmt.then_block, temp)
+                || if_stmt
+                    .else_block
+                    .as_ref()
+                    .is_some_and(|block| block_mentions_temp(block, temp))
+        }
+        HirStmt::While(while_stmt) => {
+            expr_mentions_temp(&while_stmt.cond, temp) || block_mentions_temp(&while_stmt.body, temp)
+        }
+        HirStmt::Repeat(repeat_stmt) => {
+            block_mentions_temp(&repeat_stmt.body, temp)
+                || expr_mentions_temp(&repeat_stmt.cond, temp)
+        }
+        HirStmt::NumericFor(numeric_for) => {
+            expr_mentions_temp(&numeric_for.start, temp)
+                || expr_mentions_temp(&numeric_for.limit, temp)
+                || expr_mentions_temp(&numeric_for.step, temp)
+                || block_mentions_temp(&numeric_for.body, temp)
+        }
+        HirStmt::GenericFor(generic_for) => {
+            generic_for
+                .iterator
+                .iter()
+                .any(|expr| expr_mentions_temp(expr, temp))
+                || block_mentions_temp(&generic_for.body, temp)
+        }
+        HirStmt::Block(block) => block_mentions_temp(block, temp),
+        HirStmt::Unstructured(unstructured) => block_mentions_temp(&unstructured.body, temp),
+    }
+}
+
+fn lvalue_mentions_temp(lvalue: &HirLValue, temp: TempId) -> bool {
+    match lvalue {
+        HirLValue::Temp(id) => *id == temp,
+        HirLValue::TableAccess(access) => {
+            expr_mentions_temp(&access.base, temp) || expr_mentions_temp(&access.key, temp)
+        }
+        HirLValue::Local(_) | HirLValue::Upvalue(_) | HirLValue::Global(_) => false,
+    }
+}
+
+fn expr_mentions_temp(expr: &HirExpr, temp: TempId) -> bool {
+    match expr {
+        HirExpr::TempRef(id) => *id == temp,
+        HirExpr::TableAccess(access) => {
+            expr_mentions_temp(&access.base, temp) || expr_mentions_temp(&access.key, temp)
+        }
+        HirExpr::Unary(unary) => expr_mentions_temp(&unary.expr, temp),
+        HirExpr::Binary(binary) => {
+            expr_mentions_temp(&binary.lhs, temp) || expr_mentions_temp(&binary.rhs, temp)
+        }
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            expr_mentions_temp(&logical.lhs, temp) || expr_mentions_temp(&logical.rhs, temp)
+        }
+        HirExpr::Decision(decision) => decision.nodes.iter().any(|node| {
+            expr_mentions_temp(&node.test, temp)
+                || matches!(
+                    &node.truthy,
+                    crate::hir::common::HirDecisionTarget::Expr(expr)
+                        if expr_mentions_temp(expr, temp)
+                )
+                || matches!(
+                    &node.falsy,
+                    crate::hir::common::HirDecisionTarget::Expr(expr)
+                        if expr_mentions_temp(expr, temp)
+                )
+        }),
+        HirExpr::Call(call) => {
+            expr_mentions_temp(&call.callee, temp)
+                || call.args.iter().any(|arg| expr_mentions_temp(arg, temp))
+        }
+        HirExpr::TableConstructor(table) => {
+            table.fields.iter().any(|field| match field {
+                crate::hir::common::HirTableField::Array(expr) => expr_mentions_temp(expr, temp),
+                crate::hir::common::HirTableField::Record(field) => {
+                    matches!(
+                        &field.key,
+                        crate::hir::common::HirTableKey::Expr(expr)
+                            if expr_mentions_temp(expr, temp)
+                    ) || expr_mentions_temp(&field.value, temp)
+                }
+            }) || table
+                .trailing_multivalue
+                .as_ref()
+                .is_some_and(|expr| expr_mentions_temp(expr, temp))
+        }
+        HirExpr::Closure(closure) => closure
+            .captures
+            .iter()
+            .any(|capture| expr_mentions_temp(&capture.value, temp)),
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
+        | HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::VarArg
+        | HirExpr::Unresolved(_) => false,
+    }
 }
 
 fn empty_proto(locals: Vec<LocalId>, temps: Vec<TempId>, stmts: Vec<HirStmt>) -> HirProto {
