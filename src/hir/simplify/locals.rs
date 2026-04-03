@@ -247,6 +247,13 @@ fn collect_plans(
         {
             continue;
         }
+        if touching_stmt_indices
+            .iter()
+            .copied()
+            .any(|stmt_index| stmt_contains_nested_nonlocal_control(&block.stmts[stmt_index]))
+        {
+            continue;
+        }
 
         PlanAllocator {
             temp_debug_locals,
@@ -820,6 +827,40 @@ fn stmt_consumes_temps_only_in_control_head(stmt: &HirStmt, temps: &BTreeSet<Tem
         | HirStmt::Block(_)
         | HirStmt::Unstructured(_) => false,
     }
+}
+
+fn stmt_contains_nested_nonlocal_control(stmt: &HirStmt) -> bool {
+    match stmt {
+        HirStmt::If(if_stmt) => {
+            block_contains_nonlocal_control(&if_stmt.then_block)
+                || if_stmt
+                    .else_block
+                    .as_ref()
+                    .is_some_and(block_contains_nonlocal_control)
+        }
+        HirStmt::While(while_stmt) => block_contains_nonlocal_control(&while_stmt.body),
+        HirStmt::Repeat(repeat_stmt) => block_contains_nonlocal_control(&repeat_stmt.body),
+        HirStmt::NumericFor(numeric_for) => block_contains_nonlocal_control(&numeric_for.body),
+        HirStmt::GenericFor(generic_for) => block_contains_nonlocal_control(&generic_for.body),
+        HirStmt::Block(block) => block_contains_nonlocal_control(block),
+        HirStmt::Unstructured(_) => true,
+        HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => true,
+        HirStmt::LocalDecl(_)
+        | HirStmt::Assign(_)
+        | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::Return(_)
+        | HirStmt::Break => false,
+    }
+}
+
+fn block_contains_nonlocal_control(block: &HirBlock) -> bool {
+    block.stmts
+        .iter()
+        .any(stmt_contains_nested_nonlocal_control)
 }
 
 fn expr_touches_any_temp(expr: &HirExpr, temps: &BTreeSet<TempId>) -> bool {

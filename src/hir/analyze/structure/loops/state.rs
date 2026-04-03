@@ -54,6 +54,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             if excluded.contains(&value.reg)
                 || plan.states.iter().any(|state| state.reg == value.reg)
                 || !loop_value_has_inside_and_outside_incoming(value)
+                || self.exit_value_is_owned_by_inherited_state(value, target_overrides)
             {
                 continue;
             }
@@ -247,6 +248,26 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         HirLValue::Temp(temp)
     }
 
+    fn exit_value_is_owned_by_inherited_state(
+        &self,
+        value: &LoopValueMerge,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> bool {
+        let phi_temp = self.lowering.bindings.phi_temps[value.phi_id.index()];
+        if target_overrides.contains_key(&phi_temp) {
+            return true;
+        }
+
+        for def in value.inside_arm.defs() {
+            let def_temp = self.lowering.bindings.fixed_temps[def.index()];
+            if target_overrides.contains_key(&def_temp) {
+                return true;
+            }
+        }
+
+        false
+    }
+
     fn uniform_loop_header_target_override(
         &self,
         candidate: &LoopCandidate,
@@ -381,11 +402,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         Some(ActiveLoopContext {
             header: candidate.header,
+            loop_blocks: BTreeSet::new(),
             post_loop,
             downstream_post_loop,
             continue_target,
             continue_sources,
             break_exits,
+            state_slots: Vec::new(),
         })
     }
 

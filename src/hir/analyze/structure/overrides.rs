@@ -26,6 +26,10 @@ pub(super) struct StructureOverrideState {
 }
 
 impl StructureOverrideState {
+    pub(super) fn block_entry_expr(&self, block: BlockRef, reg: Reg) -> Option<&HirExpr> {
+        self.by_block.get(&block)?.entry_exprs.get(&reg)
+    }
+
     pub(super) fn block_phi_exprs(&self, block: BlockRef) -> Option<&BTreeMap<PhiId, HirExpr>> {
         self.by_block
             .get(&block)

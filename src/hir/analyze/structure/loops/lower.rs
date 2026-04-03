@@ -55,7 +55,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         let plan = self.build_loop_state_plan(candidate, preheader, exit, &[], target_overrides)?;
-        let loop_context = self.build_active_loop_context(candidate, exit)?;
+        let mut loop_context = self.build_active_loop_context(candidate, exit)?;
+        loop_context.loop_blocks = candidate.blocks.clone();
+        loop_context.state_slots = plan.states.clone();
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
         stmts.extend(loop_state_init_stmts(&plan));
@@ -102,7 +104,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         let plan = self.build_loop_state_plan(candidate, preheader, exit, &[], target_overrides)?;
-        let loop_context = self.build_active_loop_context(candidate, exit)?;
+        let mut loop_context = self.build_active_loop_context(candidate, exit)?;
+        loop_context.loop_blocks = candidate.blocks.clone();
+        loop_context.state_slots = plan.states.clone();
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
         let backedge_pad = self.repeat_backedge_pad(
@@ -213,7 +217,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             self.overrides.suppress_phi(*phi_id);
         }
         let continue_block = candidate.continue_target.unwrap_or(header);
-        let loop_context = self.build_active_loop_context(candidate, exit)?;
+        let mut loop_context = self.build_active_loop_context(candidate, exit)?;
+        loop_context.loop_blocks = candidate.blocks.clone();
+        loop_context.state_slots = plan.states.clone();
         self.active_loops.push(loop_context.clone());
         let body = if continue_block == header {
             let stmts = self.lower_block_prefix(header, false, &combined_target_overrides)?;
@@ -310,7 +316,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stmts.extend(self.lower_block_prefix(block, false, target_overrides)?);
         stmts.extend(loop_state_init_stmts(&plan));
 
-        let loop_context = self.build_active_loop_context(candidate, exit)?;
+        let mut loop_context = self.build_active_loop_context(candidate, exit)?;
+        loop_context.loop_blocks = candidate.blocks.clone();
+        loop_context.state_slots = plan.states.clone();
         self.active_loops.push(loop_context.clone());
         let body = self.lower_region(body_entry, Some(header), &combined_target_overrides)?;
         self.active_loops.pop();

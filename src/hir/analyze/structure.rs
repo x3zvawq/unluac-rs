@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cfg::{BlockRef, PhiId};
 use crate::hir::common::{
-    HirBlock, HirExpr, HirGenericFor, HirLValue, HirNumericFor, HirRepeat, HirStmt, HirUnaryExpr,
-    HirUnaryOpKind, HirWhile, TempId,
+    HirBlock, HirExpr, HirGenericFor, HirLValue, HirLabel, HirLabelId, HirNumericFor, HirRepeat,
+    HirStmt, HirUnaryExpr, HirUnaryOpKind, HirWhile, TempId,
 };
 use crate::structure::{
     BranchCandidate, BranchKind, BranchRegionFact, BranchValueMergeArm, BranchValueMergeCandidate,
@@ -23,7 +23,7 @@ use crate::structure::{
 };
 use crate::transformer::{InstrRef, LowInstr, Reg};
 
-use super::exprs::{expr_for_dup_safe_fixed_def, expr_for_reg_use};
+use super::exprs::{expr_for_dup_safe_fixed_def, expr_for_reg_at_block_exit, expr_for_reg_use};
 use super::short_circuit::{
     BranchShortCircuitPlan, build_branch_short_circuit_plan, build_conditional_reassign_plan,
     consumed_value_merge_subject_instrs, lower_materialized_value_leaf_expr,
@@ -33,13 +33,13 @@ use super::short_circuit::{
 };
 use super::{ProtoLowering, assign_stmt, branch_stmt, lower_branch_cond};
 use super::{
-    is_control_terminator, lower_control_instr,
+    build_label_map_for_summary, goto_block, is_control_terminator, lower_control_instr,
     lower_phi_materialization_with_allowed_blocks_except, lower_regular_instr,
 };
 use body::*;
 use overrides::StructureOverrideState;
 use rewrites::{
-    apply_loop_rewrites, rewrite_expr_temps, rewrite_stmt_exprs, shared_expr_for_defs,
+    apply_loop_rewrites, expr_as_lvalue, lvalue_as_expr, rewrite_expr_temps, rewrite_stmt_exprs, shared_expr_for_defs,
     temp_expr_overrides,
 };
 

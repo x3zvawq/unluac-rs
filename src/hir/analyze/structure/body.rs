@@ -34,6 +34,8 @@ pub(super) struct StructuredBodyLowerer<'a, 'b> {
     pub(super) branch_regions_by_header: BTreeMap<BlockRef, &'b BranchRegionFact>,
     pub(super) branch_value_merges_by_header: BTreeMap<BlockRef, &'b BranchValueMergeCandidate>,
     pub(super) loop_by_header: BTreeMap<BlockRef, &'b LoopCandidate>,
+    pub(super) label_map: BTreeMap<BlockRef, HirLabelId>,
+    pub(super) required_labels: BTreeSet<BlockRef>,
     pub(super) merge_allowed_blocks: BTreeMap<BlockRef, BTreeSet<BlockRef>>,
     pub(super) overrides: StructureOverrideState,
     pub(super) structured_close_points: BTreeSet<InstrRef>,
@@ -69,11 +71,13 @@ pub(super) struct LoopStatePlan {
 #[derive(Debug, Clone)]
 pub(super) struct ActiveLoopContext {
     pub(super) header: BlockRef,
+    pub(super) loop_blocks: BTreeSet<BlockRef>,
     pub(super) post_loop: BlockRef,
     pub(super) downstream_post_loop: Option<BlockRef>,
     pub(super) continue_target: Option<BlockRef>,
     pub(super) continue_sources: BTreeSet<BlockRef>,
     pub(super) break_exits: BTreeMap<BlockRef, HirBlock>,
+    pub(super) state_slots: Vec<LoopStateSlot>,
 }
 
 impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
@@ -124,6 +128,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             branch_regions_by_header,
             branch_value_merges_by_header,
             loop_by_header,
+            label_map: build_label_map_for_summary(lowering.cfg),
+            required_labels: BTreeSet::new(),
             merge_allowed_blocks: BTreeMap::new(),
             overrides: StructureOverrideState::default(),
             structured_close_points,
@@ -171,6 +177,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 return None;
             }
 
+            self.emit_required_label(block, &mut stmts);
+
             if self.loop_by_header.contains_key(&block) && Some(block) != suppressed_loop_header {
                 current = self.lower_loop(block, stop, &mut stmts, target_overrides)?;
             } else if self.branch_by_header.contains_key(&block) {
@@ -181,6 +189,91 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         Some(HirBlock { stmts })
+    }
+
+    pub(super) fn lower_escape_edge(
+        &mut self,
+        from: BlockRef,
+        to: BlockRef,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<HirBlock> {
+        if to == self.lowering.cfg.exit_block || !self.lowering.cfg.reachable_blocks.contains(&to) {
+            return None;
+        }
+        self.required_labels.insert(to);
+        let mut stmts = self.escape_state_snapshot_stmts(from, to, target_overrides);
+        stmts.extend(goto_block(self.label_map[&to]).stmts);
+        Some(HirBlock { stmts })
+    }
+
+    fn emit_required_label(&self, block: BlockRef, stmts: &mut Vec<HirStmt>) {
+        if !self.required_labels.contains(&block) {
+            return;
+        }
+        stmts.push(HirStmt::Label(Box::new(HirLabel {
+            id: self.label_map[&block],
+        })));
+    }
+
+    fn escape_state_snapshot_stmts(
+        &self,
+        from: BlockRef,
+        to: BlockRef,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Vec<HirStmt> {
+        let live_in = self.lowering.dataflow.live_in_regs(to);
+        let expr_overrides = temp_expr_overrides(target_overrides);
+        let mut seen_regs = BTreeSet::new();
+        let mut targets = Vec::new();
+        let mut values = Vec::new();
+
+        for loop_context in &self.active_loops {
+            if loop_context.loop_blocks.contains(&to) {
+                continue;
+            }
+
+            for state in &loop_context.state_slots {
+                if !live_in.contains(&state.reg) || !seen_regs.insert(state.reg) {
+                    continue;
+                }
+                let Some(target) = self.escape_state_target(to, state.reg) else {
+                    continue;
+                };
+                let mut value = expr_for_reg_at_block_exit(self.lowering, from, state.reg);
+                rewrite_expr_temps(&mut value, &expr_overrides);
+                if lvalue_as_expr(&target)
+                    .as_ref()
+                    .is_some_and(|target_expr| *target_expr == value)
+                {
+                    continue;
+                }
+                targets.push(target);
+                values.push(value);
+            }
+        }
+
+        if targets.is_empty() {
+            Vec::new()
+        } else {
+            vec![assign_stmt(targets, values)]
+        }
+    }
+
+    fn escape_state_target(&self, to: BlockRef, reg: Reg) -> Option<HirLValue> {
+        if let Some(target) = self
+            .overrides
+            .block_entry_expr(to, reg)
+            .and_then(expr_as_lvalue)
+        {
+            return Some(target);
+        }
+
+        self.active_loops
+            .iter()
+            .filter(|loop_context| !loop_context.loop_blocks.contains(&to))
+            .flat_map(|loop_context| loop_context.state_slots.iter())
+            .find(|state| state.reg == reg)
+            .map(|state| state.target.clone())
     }
 
     fn lower_linear_block(

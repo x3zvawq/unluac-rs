@@ -42,6 +42,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return Some(next);
         }
 
+        if let Some(escape_target) = self.cross_structure_escape_target(block) {
+            return self.lower_cross_structure_escape_branch(
+                block,
+                escape_target,
+                stop,
+                stmts,
+                target_overrides,
+            );
+        }
+
         stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
 
         let short_plan = self.try_build_short_circuit_plan(block, stop)?;
@@ -316,6 +326,75 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             Some(next) => Some(Some(next)),
             None => Some(None),
         }
+    }
+
+    fn cross_structure_escape_target(&self, block: BlockRef) -> Option<BlockRef> {
+        let loop_context = self.active_loops.last()?;
+        let candidate = self.branch_by_header.get(&block).copied()?;
+        let merge = candidate.merge?;
+        let continue_target = loop_context.continue_target?;
+
+        // 这类形状常见于 `if cond then goto after_outer_loop end`：
+        // 分支的一臂仍然沿当前 loop 继续跑，另一臂却直接跳到当前 loop 之外更远的 merge。
+        // 如果这里继续把它硬恢复成普通 `if-then`，缺席的那一臂会被误当成
+        // “自然回到当前 region 的 stop”，最终把跨层 `goto` 偷偷降成错误的 loop fallthrough。
+        //
+        // 对这种跨层退出，当前 structured HIR 没有等价的 `break/continue` 语义可承载；
+        // 与其在局部生成半真半假的结构，不如让整片 proto 退回显式 label/goto 形态，
+        // 由更保守但语义直观的 fallback 接手。
+        if candidate.else_entry.is_some()
+            || merge == loop_context.post_loop
+            || Some(merge) == loop_context.downstream_post_loop
+            || loop_context.break_exits.contains_key(&merge)
+        {
+            return None;
+        }
+
+        let loop_candidate = self.loop_by_header.get(&loop_context.header).copied()?;
+        if loop_candidate.blocks.contains(&merge) {
+            return None;
+        }
+
+        (candidate.then_entry == continue_target
+            || self
+                .lowering
+                .cfg
+                .can_reach(candidate.then_entry, continue_target))
+        .then_some(merge)
+    }
+
+    fn lower_cross_structure_escape_branch(
+        &mut self,
+        block: BlockRef,
+        escape_target: BlockRef,
+        _stop: Option<BlockRef>,
+        stmts: &mut Vec<HirStmt>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<Option<BlockRef>> {
+        let loop_context = self.active_loops.last()?.clone();
+        let continue_target = loop_context.continue_target?;
+        let candidate = *self.branch_by_header.get(&block)?;
+
+        let mut keep_cond = self.lower_candidate_cond(block, candidate)?;
+        rewrite_expr_temps(&mut keep_cond, &temp_expr_overrides(target_overrides));
+
+        stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
+        self.visited.insert(block);
+
+        let escape_block = self.lower_escape_edge(block, escape_target, target_overrides)?;
+        let continue_block = if candidate.then_entry == continue_target {
+            HirBlock::default()
+        } else {
+            self.lower_region(candidate.then_entry, Some(continue_target), target_overrides)?
+        };
+        let continue_else = (!continue_block.stmts.is_empty()).then_some(continue_block);
+        stmts.push(branch_stmt(
+            negate_expr(keep_cond),
+            escape_block,
+            continue_else,
+        ));
+
+        Some(Some(continue_target))
     }
 
     fn try_lower_loop_continue_branch(

@@ -23,7 +23,7 @@ use crate::timing::TimingCollector;
 use crate::transformer::LoweredChunk;
 
 use self::exprs::lower_branch_cond;
-use self::helpers::{assign_stmt, branch_stmt};
+use self::helpers::{assign_stmt, branch_stmt, build_label_map_for_summary, goto_block};
 use self::lower::{
     ProtoBindings, ProtoLowering, is_control_terminator, lower_control_instr,
     lower_phi_materialization_with_allowed_blocks_except, lower_regular_instr,

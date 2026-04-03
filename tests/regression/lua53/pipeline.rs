@@ -43,6 +43,68 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn lua53_generate_stage_keeps_cross_loop_goto_break_like_case_structured_with_single_escape() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.3",
+            "tests/lua_cases/lua5.2/04_goto_break_like.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua53,
+                target_stage: DecompileStage::Generate,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Generate],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Normal,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.3 generate stage should succeed for goto-break-like fixture");
+
+        assert_eq!(
+            result.state.completed_stage,
+            Some(DecompileStage::Generate)
+        );
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should leave generated source in state");
+        assert_eq!(generated.source.matches("while ").count(), 2, "{}", generated.source);
+        assert_eq!(generated.source.matches("goto L").count(), 1, "{}", generated.source);
+        assert_eq!(generated.source.matches("::L").count(), 1, "{}", generated.source);
+        assert!(generated.source.contains("> 2"), "{}", generated.source);
+        assert!(!generated.source.contains("continue"), "{}", generated.source);
+        assert!(
+            !contains_plain_self_assign(&generated.source),
+            "{}",
+            generated.source
+        );
+    }
+
+    #[test]
+    fn lua53_goto_break_like_case_preserves_runtime_output() {
+        let spec = crate::support::find_unit_case_spec(
+            crate::support::UnitSuite::DecompilePipelineHealth,
+            "lua5.3",
+            "tests/lua_cases/lua5.2/04_goto_break_like.lua",
+        )
+        .expect("lua5.3 goto-break-like fixture should be in pipeline health suite");
+
+        if let Err(failure) = crate::support::run_unit_case(spec) {
+            panic!(
+                "{}",
+                crate::support::format_case_failure(spec.entry.path, &failure)
+            );
+        }
+    }
+
+    #[test]
     fn lua53_hir_stage_runs_for_loop_bitwise_dispatch_fixture() {
         let chunk = crate::support::compile_lua_case(
             "lua5.3",
@@ -179,4 +241,20 @@ mod decompile_pipeline {
         assert!(!dump.contains("for l0 = l3, l4, l5 do"), "{dump}");
         assert!(!dump.contains("0.4 <"), "{dump}");
     }
+}
+
+fn contains_plain_self_assign(source: &str) -> bool {
+    source.lines().any(|line| {
+        let line = line.trim();
+        let Some((lhs, rhs)) = line.split_once('=') else {
+            return false;
+        };
+        let lhs = lhs.trim();
+        let rhs = rhs.trim();
+        !lhs.is_empty()
+            && lhs == rhs
+            && lhs
+                .chars()
+                .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    })
 }

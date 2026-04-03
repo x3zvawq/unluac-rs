@@ -290,12 +290,15 @@ fn stmt_has_continue(stmt: &HirStmt) -> bool {
             block_has_continue(&if_stmt.then_block)
                 || if_stmt.else_block.as_ref().is_some_and(block_has_continue)
         }
-        HirStmt::While(while_stmt) => block_has_continue(&while_stmt.body),
-        HirStmt::Repeat(repeat_stmt) => block_has_continue(&repeat_stmt.body),
-        HirStmt::NumericFor(numeric_for) => block_has_continue(&numeric_for.body),
-        HirStmt::GenericFor(generic_for) => block_has_continue(&generic_for.body),
         HirStmt::Block(block) => block_has_continue(block),
         HirStmt::Unstructured(unstructured) => block_has_continue(&unstructured.body),
+        // 内层 loop 自己会在各自的 AST lowering 里决定是否需要 synthetic continue label。
+        // 这里如果继续递归进去，外层 loop 会错误地因为“子循环里出现 continue”
+        // 也挂上一层无意义的 `::Lx::` label。
+        HirStmt::While(_)
+        | HirStmt::Repeat(_)
+        | HirStmt::NumericFor(_)
+        | HirStmt::GenericFor(_) => false,
         _ => false,
     }
 }

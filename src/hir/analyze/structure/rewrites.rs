@@ -46,6 +46,16 @@ pub(super) fn lvalue_as_expr(lvalue: &HirLValue) -> Option<HirExpr> {
     }
 }
 
+pub(super) fn expr_as_lvalue(expr: &HirExpr) -> Option<HirLValue> {
+    match expr {
+        HirExpr::TempRef(temp) => Some(HirLValue::Temp(*temp)),
+        HirExpr::LocalRef(local) => Some(HirLValue::Local(*local)),
+        HirExpr::UpvalueRef(upvalue) => Some(HirLValue::Upvalue(*upvalue)),
+        HirExpr::GlobalRef(global) => Some(HirLValue::Global(global.clone())),
+        _ => None,
+    }
+}
+
 pub(super) fn shared_expr_for_defs<I>(
     fixed_temps: &[TempId],
     defs: I,
