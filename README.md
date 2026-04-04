@@ -53,6 +53,7 @@ cargo run -p unluac-cli -- --input /absolute/path/to/chunk.out --dialect=lua5.1
 - CLI 当前要求你显式传入 `--input` 或 `--source`
 - 如果传入 `--source`，CLI 会先调用 `lua/build/<dialect>/` 下的编译器生成 chunk，再执行反编译
 - CLI 默认直接输出纯源码，不打印 debug dump
+- `generate` 阶段默认会在输出源码中附带 chunk / proto 注释元信息；可通过 `--comment false` 关闭
 - CLI 的 dialect / parse / readability / naming / generate 默认值仍与 [examples/debug.rs](./examples/debug.rs) 共用同一份 repo 调试 preset
 - 如果你想看 repo debug preset 风格的调试输出，可以显式附加 `--debug`
 
@@ -70,6 +71,7 @@ cargo run -p unluac-cli -- --input /absolute/path/to/chunk.out --dialect=lua5.1
 | `--encoding` | 字符串解码编码 | `utf-8` |
 | `--decode-mode` | 字符串解码失败策略 | `strict` |
 | `--naming-mode` | 命名策略 | `debug-like` |
+| `--comment` | 是否输出 generate 注释元信息 | `true` |
 
 更多调试相关命令和参数可参考 [docs/debug.md](./docs/debug.md)。
 
@@ -153,10 +155,22 @@ const chunkBytes = await readFile("./sample.luac");
 const result = await decompile(chunkBytes, {
   dialect: "lua5.1",
   targetStage: "generate",
+  generate: {
+    comment: false,
+  },
 });
 
 console.log(result.generatedSource);
 ```
+
+常用的 `generate` 选项包括：
+
+- `indentWidth`: 缩进宽度
+- `maxLineLength`: 软换行参考宽度
+- `quoteStyle`: 字符串引号风格
+- `tableStyle`: 表构造器布局风格
+- `conservativeOutput`: 是否偏向保守输出
+- `comment`: 是否输出文件头 / proto 注释，默认 `true`
 
 浏览器与更完整的说明可参考 [packages/unluac-js/README.md](./packages/unluac-js/README.md)。
 

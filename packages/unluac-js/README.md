@@ -27,6 +27,9 @@ console.log(values.dialects);
 const result = await decompile(chunkBytes, {
   dialect: "lua5.1",
   targetStage: "generate",
+  generate: {
+    comment: false,
+  },
 });
 
 console.log(result.generatedSource);
@@ -71,3 +74,22 @@ const result = await decompile(chunkBytes, {
   dialect: "lua5.4",
 });
 ```
+
+## 参数说明
+
+`decompile(bytes, options?)` 的常用参数如下：
+
+- `dialect`: 目标字节码 dialect，如 `lua5.1`、`lua5.4`、`luajit`、`luau`
+- `targetStage`: 反编译 pipeline 截止阶段，默认 `generate`
+- `parse.stringEncoding`: 字符串解码编码，支持 `utf-8` 和 `gbk`
+- `parse.stringDecodeMode`: 字符串解码失败策略，支持 `strict` 和 `lossy`
+- `naming.mode`: 命名策略，支持 `debug-like`、`simple`、`heuristic`
+
+`generate` 子选项：
+
+- `indentWidth`: 缩进宽度
+- `maxLineLength`: 软换行参考宽度
+- `quoteStyle`: 字符串引号风格
+- `tableStyle`: 表构造器布局风格
+- `conservativeOutput`: 是否偏向保守输出
+- `comment`: 是否输出文件头 / proto 注释，默认 `true`

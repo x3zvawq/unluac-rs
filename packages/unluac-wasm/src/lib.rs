@@ -78,6 +78,7 @@ struct WasmGenerateOptions {
     quote_style: Option<String>,
     table_style: Option<String>,
     conservative_output: Option<bool>,
+    comment: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -286,6 +287,9 @@ impl WasmGenerateOptions {
         }
         if let Some(value) = self.conservative_output {
             options.generate.conservative_output = value;
+        }
+        if let Some(value) = self.comment {
+            options.generate.comment = value;
         }
         Ok(())
     }
@@ -521,6 +525,7 @@ mod tests {
                 quote_style: Some("prefer-single".to_owned()),
                 table_style: Some("expanded".to_owned()),
                 conservative_output: Some(false),
+                comment: Some(false),
             }),
         }
         .into_core_options()
@@ -553,6 +558,7 @@ mod tests {
         assert_eq!(options.generate.quote_style, QuoteStyle::PreferSingle);
         assert_eq!(options.generate.table_style, TableStyle::Expanded);
         assert!(!options.generate.conservative_output);
+        assert!(!options.generate.comment);
     }
 
     #[test]

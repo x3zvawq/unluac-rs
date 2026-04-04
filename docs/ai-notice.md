@@ -25,3 +25,9 @@
 - 每一轮工作完成如果修改了业务代码则需要通过一下两条命令进行验证。
   - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
   - `cargo unit-test --jobs 8`
+- 当更新了decompile参数输入的时候，需要同步更新以下项目：
+  - `README.md/README_en.md` 中的参数列表
+  - `packages/unluac-js/src/index.ts` js包装库中的类型声明
+  - `packages/unluac-cli/src/cli.rs` cli工具中的参数解析部分
+  - `packages/unluac-wasm/src/lib.rs` wasm库中的参数解析部分
+  

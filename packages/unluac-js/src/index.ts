@@ -62,6 +62,7 @@ export interface UnluacDecompileOptions {
     quoteStyle?: UnluacQuoteStyle;
     tableStyle?: UnluacTableStyle;
     conservativeOutput?: boolean;
+    comment?: boolean;
   };
 }
 
