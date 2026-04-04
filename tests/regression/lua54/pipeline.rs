@@ -457,4 +457,30 @@ mod decompile_pipeline {
         assert!(!generated.source.contains("goto L"), "{}", generated.source);
         assert!(!generated.source.contains(", 1 do"), "{}", generated.source);
     }
+
+    #[test]
+    fn lua54_generate_stage_canonicalizes_shift_immediates_in_loop_bitwise_dispatch_fixture() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.4",
+            "tests/lua_cases/lua5.3/06_loop_bitwise_dispatch.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua54,
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.4 generate stage should canonicalize loop_bitwise_dispatch shifts");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(!generated.source.contains(">> -"), "{}", generated.source);
+        assert!(!generated.source.contains("<< -"), "{}", generated.source);
+        assert!(generated.source.contains("while "), "{}", generated.source);
+    }
 }

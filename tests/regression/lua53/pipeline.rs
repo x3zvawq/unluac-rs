@@ -66,20 +66,36 @@ mod decompile_pipeline {
         )
         .expect("lua5.3 generate stage should succeed for goto-break-like fixture");
 
-        assert_eq!(
-            result.state.completed_stage,
-            Some(DecompileStage::Generate)
-        );
+        assert_eq!(result.state.completed_stage, Some(DecompileStage::Generate));
         let generated = result
             .state
             .generated
             .as_ref()
             .expect("generate stage should leave generated source in state");
-        assert_eq!(generated.source.matches("while ").count(), 2, "{}", generated.source);
-        assert_eq!(generated.source.matches("goto L").count(), 1, "{}", generated.source);
-        assert_eq!(generated.source.matches("::L").count(), 1, "{}", generated.source);
+        assert_eq!(
+            generated.source.matches("while ").count(),
+            2,
+            "{}",
+            generated.source
+        );
+        assert_eq!(
+            generated.source.matches("goto L").count(),
+            1,
+            "{}",
+            generated.source
+        );
+        assert_eq!(
+            generated.source.matches("::L").count(),
+            1,
+            "{}",
+            generated.source
+        );
         assert!(generated.source.contains("> 2"), "{}", generated.source);
-        assert!(!generated.source.contains("continue"), "{}", generated.source);
+        assert!(
+            !generated.source.contains("continue"),
+            "{}",
+            generated.source
+        );
         assert!(
             !contains_plain_self_assign(&generated.source),
             "{}",
@@ -240,6 +256,53 @@ mod decompile_pipeline {
         assert!(!dump.contains("numeric-for "), "{dump}");
         assert!(!dump.contains("for l0 = l3, l4, l5 do"), "{dump}");
         assert!(!dump.contains("0.4 <"), "{dump}");
+    }
+
+    #[test]
+    fn lua53_hir_stage_recovers_while_state_flow_for_loop_bitwise_dispatch_fixture() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.3",
+            "tests/lua_cases/lua5.3/06_loop_bitwise_dispatch.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua53,
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.3 loop_bitwise_dispatch hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("while (l4 <= (# l3))"), "{dump}");
+        assert!(dump.contains("assign l1 = l8"), "{dump}");
+        assert!(!dump.contains("goto L"), "{dump}");
+    }
+
+    #[test]
+    fn lua53_loop_bitwise_dispatch_fixture_preserves_runtime_output() {
+        let spec = crate::support::find_unit_case_spec(
+            crate::support::UnitSuite::DecompilePipelineHealth,
+            "lua5.3",
+            "tests/lua_cases/lua5.3/06_loop_bitwise_dispatch.lua",
+        )
+        .expect("lua5.3 loop_bitwise_dispatch fixture should be in pipeline health suite");
+
+        if let Err(failure) = crate::support::run_unit_case(spec) {
+            panic!(
+                "{}",
+                crate::support::format_case_failure(spec.entry.path, &failure)
+            );
+        }
     }
 }
 

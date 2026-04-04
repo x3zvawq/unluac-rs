@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cfg::{BlockRef, Cfg, DataflowFacts, EdgeRef, GraphFacts};
-use crate::transformer::{LowInstr, LoweredProto};
+use crate::transformer::{LowInstr, LoweredProto, Reg};
 
 use super::common::{
     LoopCandidate, LoopExitValueMergeCandidate, LoopKindHint, LoopSourceBindings, LoopValueMerge,
@@ -47,9 +47,16 @@ pub(super) fn analyze_loops(
             let preheader = unique_loop_preheader(cfg, header, &blocks);
             let exits = collect_region_exits(cfg, &blocks);
             let reducible = is_reducible_region(cfg, header, &blocks);
-            let (kind_hint, continue_target, source_bindings) =
-                infer_loop_shape(proto, cfg, header, &blocks, &backedges, preheader);
             let header_value_merges = analyze_loop_header_value_merges(dataflow, header, &blocks);
+            let (kind_hint, continue_target, source_bindings) = infer_loop_shape(
+                proto,
+                cfg,
+                header,
+                &blocks,
+                &backedges,
+                preheader,
+                &header_value_merges,
+            );
             let exit_value_merges = analyze_loop_exit_value_merges(dataflow, &exits, &blocks);
 
             LoopCandidate {
@@ -79,6 +86,7 @@ fn infer_loop_shape(
     blocks: &BTreeSet<BlockRef>,
     backedges: &[EdgeRef],
     preheader: Option<BlockRef>,
+    header_value_merges: &[LoopValueMerge],
 ) -> (LoopKindHint, Option<BlockRef>, Option<LoopSourceBindings>) {
     let backedge_sources = backedges
         .iter()
@@ -116,11 +124,11 @@ fn infer_loop_shape(
         );
     }
 
-    // Luau 会把一部分 loop-invariant 的常量准备直接塞进 header block，再接 branch。
-    // 这种前缀并不属于源码里的 loop body；如果这里还坚持“header 只能有一条 branch”，
-    // 很多最普通的 `while i < 3 do ... end` 都会被误打成 repeat/unknown，后面整片
-    // 结构恢复就只能回退成 label/goto。
-    if block_is_while_header_like(proto, cfg, header)
+    // dialect lowering 往往会把 while 条件需要的临时准备也塞进 header block，再接 branch。
+    // 这些前缀仍然属于“每轮先算条件、再决定进不进 body”的源码语义；如果这里只接受
+    // 纯常量加载，像 `while i <= #values do`、`while (x & mask) ~= 0 do` 这类最普通的
+    // 条件都会被误打成 repeat/unknown，后面整片 loop state 恢复就只能回退成 label/goto。
+    if block_is_while_header_like(proto, cfg, header, header_value_merges)
         && branch_has_loop_body_and_exit(cfg, header, blocks)
     {
         return (LoopKindHint::WhileLike, Some(header), None);
@@ -264,7 +272,12 @@ fn branch_has_header_and_exit(
         || (else_block == header && !blocks.contains(&then_block))
 }
 
-fn block_is_while_header_like(proto: &LoweredProto, cfg: &Cfg, block: BlockRef) -> bool {
+fn block_is_while_header_like(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    block: BlockRef,
+    header_value_merges: &[LoopValueMerge],
+) -> bool {
     let range = cfg.blocks[block.index()].instrs;
     if !matches!(
         cfg.terminator(&proto.instrs, block),
@@ -276,16 +289,67 @@ fn block_is_while_header_like(proto: &LoweredProto, cfg: &Cfg, block: BlockRef) 
         return true;
     }
 
+    let carried_regs = header_value_merges
+        .iter()
+        .map(|value| value.reg)
+        .collect::<BTreeSet<_>>();
     (range.start.index()..range.end() - 1).all(|instr_index| {
-        matches!(
-            proto.instrs[instr_index],
-            LowInstr::LoadNil(_)
-                | LowInstr::LoadBool(_)
-                | LowInstr::LoadConst(_)
-                | LowInstr::LoadInteger(_)
-                | LowInstr::LoadNumber(_)
-        )
+        let instr = &proto.instrs[instr_index];
+        instr_is_while_header_prefix(instr) && !instr_writes_any_reg(instr, &carried_regs)
     })
+}
+
+fn instr_is_while_header_prefix(instr: &LowInstr) -> bool {
+    matches!(
+        instr,
+        LowInstr::Move(_)
+            | LowInstr::LoadNil(_)
+            | LowInstr::LoadBool(_)
+            | LowInstr::LoadConst(_)
+            | LowInstr::LoadInteger(_)
+            | LowInstr::LoadNumber(_)
+            | LowInstr::UnaryOp(_)
+            | LowInstr::BinaryOp(_)
+            | LowInstr::Concat(_)
+            | LowInstr::GetUpvalue(_)
+            | LowInstr::GetTable(_)
+    )
+}
+
+fn instr_writes_any_reg(instr: &LowInstr, regs: &BTreeSet<Reg>) -> bool {
+    match instr {
+        LowInstr::Move(instr) => regs.contains(&instr.dst),
+        LowInstr::LoadNil(instr) => (0..instr.dst.len)
+            .map(|offset| Reg(instr.dst.start.index() + offset))
+            .any(|reg| regs.contains(&reg)),
+        LowInstr::LoadBool(instr) => regs.contains(&instr.dst),
+        LowInstr::LoadConst(instr) => regs.contains(&instr.dst),
+        LowInstr::LoadInteger(instr) => regs.contains(&instr.dst),
+        LowInstr::LoadNumber(instr) => regs.contains(&instr.dst),
+        LowInstr::UnaryOp(instr) => regs.contains(&instr.dst),
+        LowInstr::BinaryOp(instr) => regs.contains(&instr.dst),
+        LowInstr::Concat(instr) => regs.contains(&instr.dst),
+        LowInstr::GetUpvalue(instr) => regs.contains(&instr.dst),
+        LowInstr::GetTable(instr) => regs.contains(&instr.dst),
+        LowInstr::SetUpvalue(_)
+        | LowInstr::SetTable(_)
+        | LowInstr::ErrNil(_)
+        | LowInstr::NewTable(_)
+        | LowInstr::SetList(_)
+        | LowInstr::Call(_)
+        | LowInstr::TailCall(_)
+        | LowInstr::VarArg(_)
+        | LowInstr::Return(_)
+        | LowInstr::Closure(_)
+        | LowInstr::Close(_)
+        | LowInstr::Tbc(_)
+        | LowInstr::NumericForInit(_)
+        | LowInstr::NumericForLoop(_)
+        | LowInstr::GenericForCall(_)
+        | LowInstr::GenericForLoop(_)
+        | LowInstr::Jump(_)
+        | LowInstr::Branch(_) => false,
+    }
 }
 
 fn repeat_continue_target_via_backedge_pad(

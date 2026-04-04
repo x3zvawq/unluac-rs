@@ -201,6 +201,12 @@ fn collect_plans(
         if reserved_temps.contains(&root_temp) {
             continue;
         }
+        // 目标 temp 自己又出现在 RHS 里时，这条赋值表达的是“沿用同一状态槽位继续更新”，
+        // 不能在 locals pass 里把它误提升成新的 block-local。否则像 loop carried state
+        // 或分支内的状态写回，会被拆成 `local next = step(state)`，原状态槽位反而失去写回。
+        if stmt_self_updates_temp(stmt, root_temp) {
+            continue;
+        }
 
         let mut group = BTreeSet::from([root_temp]);
         let mut removable_aliases = BTreeSet::new();
@@ -326,6 +332,17 @@ fn alias_temp_for_group(stmt: &HirStmt, group: &BTreeSet<TempId>) -> Option<Temp
         return None;
     };
     group.contains(source).then_some(*alias)
+}
+
+fn stmt_self_updates_temp(stmt: &HirStmt, temp: TempId) -> bool {
+    let HirStmt::Assign(assign) = stmt else {
+        return false;
+    };
+    matches!(assign.targets.as_slice(), [HirLValue::Temp(id)] if *id == temp)
+        && assign
+            .values
+            .iter()
+            .any(|value| expr_touches_any_temp(value, &BTreeSet::from([temp])))
 }
 
 fn if_merge_candidate_temps(
@@ -858,7 +875,8 @@ fn stmt_contains_nested_nonlocal_control(stmt: &HirStmt) -> bool {
 }
 
 fn block_contains_nonlocal_control(block: &HirBlock) -> bool {
-    block.stmts
+    block
+        .stmts
         .iter()
         .any(stmt_contains_nested_nonlocal_control)
 }

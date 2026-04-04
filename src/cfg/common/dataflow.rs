@@ -93,8 +93,12 @@ impl<'a> Iterator for ValueMapIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            Self::Materialized(iter) => iter.next().map(|(reg, values)| (reg, ValueSetRef::Materialized(values))),
-            Self::DefBacked(iter) => iter.next().map(|(reg, values)| (reg, ValueSetRef::DefBacked(values))),
+            Self::Materialized(iter) => iter
+                .next()
+                .map(|(reg, values)| (reg, ValueSetRef::Materialized(values))),
+            Self::DefBacked(iter) => iter
+                .next()
+                .map(|(reg, values)| (reg, ValueSetRef::DefBacked(values))),
         }
     }
 }
@@ -174,7 +178,9 @@ impl DataflowFacts {
 
     pub fn reaching_values_at(&self, instr: InstrRef) -> ValueMapRef<'_> {
         match &self.value_facts {
-            ValueFactsStorage::Materialized { reaching_values, .. } => {
+            ValueFactsStorage::Materialized {
+                reaching_values, ..
+            } => {
                 let values = reaching_values
                     .get(instr.index())
                     .expect("dataflow should have a reaching-value snapshot for every instruction");

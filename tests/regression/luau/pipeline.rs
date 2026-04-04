@@ -96,4 +96,71 @@ mod decompile_pipeline {
         assert!(!dump.contains("local [\"l3\"] = -"), "{dump}");
         assert!(!dump.contains("assign l3 ="), "{dump}");
     }
+
+    #[test]
+    fn repeat_continue_funnel_hir_stage_keeps_branch_carried_state_writeback() {
+        let chunk = crate::support::compile_lua_case(
+            "luau",
+            "tests/lua_cases/luau/05_repeat_continue_funnel.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Luau,
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("luau repeat_continue_funnel hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("assign t1 = (t1 * t0)"), "{dump}");
+        assert!(!dump.contains("local [\"l5\"] = (t1 * t0)"), "{dump}");
+    }
+
+    #[test]
+    fn nested_continue_closure_mesh_generate_stage_reuses_captured_table_binding() {
+        let chunk = crate::support::compile_lua_case(
+            "luau",
+            "tests/lua_cases/luau/10_nested_continue_closure_mesh.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Luau,
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("luau nested_continue_closure_mesh generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated.source.contains("in ipairs(tbl) do"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("ipairs(up)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local up"),
+            "{}",
+            generated.source
+        );
+    }
 }

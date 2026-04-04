@@ -385,7 +385,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let continue_block = if candidate.then_entry == continue_target {
             HirBlock::default()
         } else {
-            self.lower_region(candidate.then_entry, Some(continue_target), target_overrides)?
+            self.lower_region(
+                candidate.then_entry,
+                Some(continue_target),
+                target_overrides,
+            )?
         };
         let continue_else = (!continue_block.stmts.is_empty()).then_some(continue_block);
         stmts.push(branch_stmt(
@@ -440,6 +444,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             continue_target,
             &loop_context,
         );
+        let then_target_overrides =
+            self.branch_entry_target_overrides(block, Some(candidate.then_entry), target_overrides);
 
         stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
         self.visited.insert(block);
@@ -494,8 +500,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             }
 
             if prefer_natural_fallthrough {
-                let non_continue_block =
-                    self.lower_region(non_continue_entry, Some(continue_target), target_overrides)?;
+                let non_continue_target_overrides = self.branch_entry_target_overrides(
+                    block,
+                    Some(non_continue_entry),
+                    target_overrides,
+                );
+                let non_continue_block = self.lower_region(
+                    non_continue_entry,
+                    Some(continue_target),
+                    &non_continue_target_overrides,
+                )?;
                 stmts.push(branch_stmt(
                     negate_expr(continue_cond),
                     non_continue_block,
@@ -511,8 +525,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 candidate.merge,
                 stop,
             );
-            let non_continue_block =
-                self.lower_region(non_continue_entry, branch_stop, target_overrides)?;
+            let non_continue_target_overrides = self.branch_entry_target_overrides(
+                block,
+                Some(non_continue_entry),
+                target_overrides,
+            );
+            let non_continue_block = self.lower_region(
+                non_continue_entry,
+                branch_stop,
+                &non_continue_target_overrides,
+            )?;
             let stmt = if candidate.then_entry == continue_target {
                 branch_stmt(continue_cond, continue_block, Some(non_continue_block))
             } else {
@@ -567,10 +589,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             // 并不需要显式 `continue`。如果这里仍然强行提升成 `if ... then continue else ... end`，
             // Lua 5.1 这类没有 `continue` / `goto` 的 dialect 就会被我们凭空制造出
             // 无法落地的语义。
+            // 这里虽然 merge 臂本身只是自然落回 continue target，但 header 上若已经有
+            // branch-value merge，就仍然需要把“执行 body 的那一臂”接回共享状态槽位。
+            // 否则 arm 内新算出来的 carried 值只会停留在 branch-local temp 上，等不到
+            // continue target 就已经丢掉了写回。
             let non_continue_block = self.lower_region(
                 candidate.then_entry,
                 Some(continue_target),
-                target_overrides,
+                &then_target_overrides,
             )?;
             stmts.push(branch_stmt(
                 negate_expr(continue_cond),
@@ -705,6 +731,29 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stmts.push(branch_stmt(cond, truthy, Some(falsy)));
 
         Some(HirBlock { stmts })
+    }
+
+    fn branch_entry_target_overrides(
+        &self,
+        header: BlockRef,
+        entry: Option<BlockRef>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> BTreeMap<TempId, HirLValue> {
+        let Some(entry) = entry else {
+            return target_overrides.clone();
+        };
+        let Some(candidate) = self.branch_by_header.get(&header).copied() else {
+            return target_overrides.clone();
+        };
+
+        if entry == candidate.then_entry {
+            return self.branch_value_then_target_overrides(header, target_overrides);
+        }
+        if Some(entry) == candidate.else_entry {
+            return self.branch_value_else_target_overrides(header, target_overrides);
+        }
+
+        target_overrides.clone()
     }
 
     fn lower_value_merge_target(

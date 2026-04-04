@@ -328,7 +328,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 stmts.extend(lowered);
                 Some(None)
             }
-            LowInstr::Branch(_) | LowInstr::NumericForInit(_)
+            LowInstr::Branch(_)
+            | LowInstr::NumericForInit(_)
             | LowInstr::NumericForLoop(_)
             | LowInstr::GenericForLoop(_) => None,
             _ => None,

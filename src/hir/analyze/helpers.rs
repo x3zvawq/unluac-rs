@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use crate::cfg::{BlockRef, Cfg};
 use crate::hir::common::{
-    HirAssign, HirBlock, HirExpr, HirGoto, HirIf, HirLValue, HirLabelId, HirProto, HirProtoRef,
-    HirReturn, HirStmt, HirUnresolvedExpr, HirUnstructured,
+    HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirExpr, HirGoto, HirIf, HirLValue,
+    HirLabelId, HirProto, HirProtoRef, HirReturn, HirStmt, HirUnresolvedExpr, HirUnstructured,
 };
 use crate::transformer::InstrRef;
 
@@ -71,6 +71,29 @@ pub(super) fn concat_expr(parts: impl IntoIterator<Item = HirExpr>) -> HirExpr {
             rhs,
         }))
     })
+}
+
+pub(super) fn binary_expr(op: HirBinaryOpKind, lhs: HirExpr, rhs: HirExpr) -> HirExpr {
+    // Lua 5.4/5.5 的 shift-immediate lowering 可能把“反向 shift + 负计数”编码成统一二元式。
+    // 在 HIR 入口就把它 canonical 回 `lhs << n` / `lhs >> n`，避免后面各层继续传播
+    // `>> -1` 这类语义正确但源码形状不稳定的表达式。
+    let (op, rhs) = match (op, rhs) {
+        (HirBinaryOpKind::Shl, HirExpr::Integer(value)) if value < 0 => {
+            (HirBinaryOpKind::Shr, HirExpr::Integer(-value))
+        }
+        (HirBinaryOpKind::Shr, HirExpr::Integer(value)) if value < 0 => {
+            (HirBinaryOpKind::Shl, HirExpr::Integer(-value))
+        }
+        (HirBinaryOpKind::Shl, HirExpr::Int64(value)) if value < 0 => {
+            (HirBinaryOpKind::Shr, HirExpr::Int64(-value))
+        }
+        (HirBinaryOpKind::Shr, HirExpr::Int64(value)) if value < 0 => {
+            (HirBinaryOpKind::Shl, HirExpr::Int64(-value))
+        }
+        (op, rhs) => (op, rhs),
+    };
+
+    HirExpr::Binary(Box::new(HirBinaryExpr { op, lhs, rhs }))
 }
 
 pub(super) fn label_for_block(

@@ -509,12 +509,85 @@ fn capture_provenance_upvalue_keeps_parent_name_when_child_local_conflicts() {
         },
     };
 
-    let names =
-        assign_names(&ast, &hir, &raw, NamingOptions::default()).expect("naming should succeed");
+    let names = assign_names(
+        &ast,
+        &hir,
+        &raw,
+        NamingOptions {
+            mode: NamingMode::DebugLike,
+            debug_like_include_function: true,
+        },
+    )
+    .expect("naming should succeed");
 
     let parent_names = names.function(HirProtoRef(0)).expect("parent names");
     let child_names = names.function(HirProtoRef(1)).expect("child names");
     assert_eq!(parent_names.locals[0].text, "value");
     assert_eq!(child_names.upvalues[0].text, "value");
     assert_ne!(child_names.locals[0].text, "value");
+}
+
+#[test]
+fn capture_provenance_temp_uses_parent_synthetic_local_name() {
+    let child = HirProto {
+        id: HirProtoRef(1),
+        source: None,
+        line_range: ProtoLineRange {
+            defined_start: 0,
+            defined_end: 0,
+        },
+        signature: ProtoSignature {
+            num_params: 0,
+            is_vararg: false,
+            has_vararg_param_reg: false,
+            named_vararg_table: false,
+        },
+        params: Vec::new(),
+        locals: Vec::new(),
+        local_debug_hints: Vec::new(),
+        upvalues: vec![UpvalueId(0)],
+        temps: Vec::new(),
+        temp_debug_locals: Vec::new(),
+        body: HirBlock {
+            stmts: vec![HirStmt::Return(Box::new(HirReturn {
+                values: vec![HirExpr::UpvalueRef(UpvalueId(0))],
+            }))],
+        },
+        children: Vec::new(),
+    };
+
+    let evidence = super::super::common::FunctionNamingEvidence {
+        upvalue_capture_sources: vec![Some(super::super::common::CapturedBinding::Temp {
+            parent: HirProtoRef(0),
+            temp: TempId(0),
+        })],
+        ..Default::default()
+    };
+    let assigned_functions = vec![
+        super::super::common::FunctionNameMap {
+            synthetic_locals: std::iter::once((
+                AstSyntheticLocalId(TempId(0)),
+                super::super::common::NameInfo {
+                    text: "outer_state".to_owned(),
+                    source: NameSource::DebugLike,
+                    renamed: false,
+                },
+            ))
+            .collect(),
+            ..Default::default()
+        },
+        super::super::common::FunctionNameMap::default(),
+    ];
+
+    let candidate = super::super::strategy::choose_upvalue_candidate(
+        &child,
+        0,
+        &evidence,
+        NamingOptions::default(),
+        &assigned_functions,
+    )
+    .expect("upvalue candidate should resolve synthetic-local provenance");
+
+    assert_eq!(candidate.text, "outer_state");
+    assert_eq!(candidate.source, NameSource::CaptureProvenance);
 }

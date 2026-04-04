@@ -161,10 +161,8 @@ fn collect_boundary_alias_pairs(block: &HirBlock) -> Vec<Vec<(CarryBinding, Carr
 
     for (index, stmt) in block.stmts.iter().enumerate() {
         if let HirStmt::Assign(assign) = stmt
-            && let Some(alias_pairs) = top_level_boundary_alias_pairs(
-                assign,
-                block.stmts.get(index + 1),
-            )
+            && let Some(alias_pairs) =
+                top_level_boundary_alias_pairs(assign, block.stmts.get(index + 1))
         {
             pairs.push(alias_pairs);
         }
@@ -172,8 +170,7 @@ fn collect_boundary_alias_pairs(block: &HirBlock) -> Vec<Vec<(CarryBinding, Carr
         let HirStmt::If(if_stmt) = stmt else {
             continue;
         };
-        let falls_through_to_label =
-            matches!(block.stmts.get(index + 1), Some(HirStmt::Label(_)));
+        let falls_through_to_label = matches!(block.stmts.get(index + 1), Some(HirStmt::Label(_)));
 
         if let Some(then_pairs) =
             edge_snapshot_alias_pairs(&if_stmt.then_block, falls_through_to_label)
@@ -250,7 +247,11 @@ fn try_collapse_pure_binding_handoffs(block: &mut HirBlock, index: usize) -> boo
     if suffix.is_empty()
         || seed.rewrites.iter().any(|rewrite| {
             suffix_reads_binding(suffix, rewrite.to)
-                || !suffix_writes_binding_only_via_direct_writeback(suffix, rewrite.to, rewrite.from)
+                || !suffix_writes_binding_only_via_direct_writeback(
+                    suffix,
+                    rewrite.to,
+                    rewrite.from,
+                )
                 || !suffix_mentions_temp(suffix, rewrite.from)
         })
     {
@@ -303,7 +304,9 @@ fn try_collapse_single_binding_handoff(block: &mut HirBlock, index: usize) -> bo
     };
 
     let suffix = &block.stmts[index + 1..];
-    if suffix.is_empty() || suffix_mentions_binding(suffix, binding) || !suffix_mentions_temp(suffix, temp)
+    if suffix.is_empty()
+        || suffix_mentions_binding(suffix, binding)
+        || !suffix_mentions_temp(suffix, temp)
     {
         return false;
     }
@@ -578,9 +581,9 @@ fn suffix_writes_binding_only_via_direct_writeback(
     binding: CarryBinding,
     target_temp: TempId,
 ) -> bool {
-    stmts.iter().all(|stmt| {
-        stmt_writes_binding_only_via_direct_writeback(stmt, binding, target_temp)
-    })
+    stmts
+        .iter()
+        .all(|stmt| stmt_writes_binding_only_via_direct_writeback(stmt, binding, target_temp))
 }
 
 fn stmt_writes_binding_only_via_direct_writeback(
@@ -589,32 +592,49 @@ fn stmt_writes_binding_only_via_direct_writeback(
     target_temp: TempId,
 ) -> bool {
     match stmt {
-        HirStmt::Assign(assign) => assign.targets.iter().zip(&assign.values).all(|(target, value)| {
-            !binding_matches_lvalue(target, binding)
-                || matches_direct_writeback_pair(target, value, binding, target_temp)
-        }),
-        HirStmt::If(if_stmt) => {
-            suffix_writes_binding_only_via_direct_writeback(&if_stmt.then_block.stmts, binding, target_temp)
-                && if_stmt.else_block.as_ref().is_none_or(|else_block| {
-                    suffix_writes_binding_only_via_direct_writeback(
-                        &else_block.stmts,
-                        binding,
-                        target_temp,
-                    )
+        HirStmt::Assign(assign) => {
+            assign
+                .targets
+                .iter()
+                .zip(&assign.values)
+                .all(|(target, value)| {
+                    !binding_matches_lvalue(target, binding)
+                        || matches_direct_writeback_pair(target, value, binding, target_temp)
                 })
         }
-        HirStmt::While(while_stmt) => {
-            suffix_writes_binding_only_via_direct_writeback(&while_stmt.body.stmts, binding, target_temp)
+        HirStmt::If(if_stmt) => {
+            suffix_writes_binding_only_via_direct_writeback(
+                &if_stmt.then_block.stmts,
+                binding,
+                target_temp,
+            ) && if_stmt.else_block.as_ref().is_none_or(|else_block| {
+                suffix_writes_binding_only_via_direct_writeback(
+                    &else_block.stmts,
+                    binding,
+                    target_temp,
+                )
+            })
         }
-        HirStmt::Repeat(repeat_stmt) => {
-            suffix_writes_binding_only_via_direct_writeback(&repeat_stmt.body.stmts, binding, target_temp)
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            suffix_writes_binding_only_via_direct_writeback(&numeric_for.body.stmts, binding, target_temp)
-        }
-        HirStmt::GenericFor(generic_for) => {
-            suffix_writes_binding_only_via_direct_writeback(&generic_for.body.stmts, binding, target_temp)
-        }
+        HirStmt::While(while_stmt) => suffix_writes_binding_only_via_direct_writeback(
+            &while_stmt.body.stmts,
+            binding,
+            target_temp,
+        ),
+        HirStmt::Repeat(repeat_stmt) => suffix_writes_binding_only_via_direct_writeback(
+            &repeat_stmt.body.stmts,
+            binding,
+            target_temp,
+        ),
+        HirStmt::NumericFor(numeric_for) => suffix_writes_binding_only_via_direct_writeback(
+            &numeric_for.body.stmts,
+            binding,
+            target_temp,
+        ),
+        HirStmt::GenericFor(generic_for) => suffix_writes_binding_only_via_direct_writeback(
+            &generic_for.body.stmts,
+            binding,
+            target_temp,
+        ),
         HirStmt::Block(block) => {
             suffix_writes_binding_only_via_direct_writeback(&block.stmts, binding, target_temp)
         }
@@ -700,6 +720,9 @@ fn prune_redundant_self_assign_components_in_stmt(stmt: &mut HirStmt) -> bool {
     let HirStmt::Assign(assign) = stmt else {
         return false;
     };
+    if assign.targets.len() != assign.values.len() {
+        return false;
+    }
 
     let mut rewritten = Vec::with_capacity(assign.targets.len());
     for (target, value) in assign

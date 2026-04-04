@@ -236,7 +236,10 @@ impl DecompilerPipeline {
                 .hir
                 .as_ref()
                 .expect("hir stage completed must leave hir module in state");
-            lower_ast(hir, ast_lowering_target(requested_target, options.generate.mode))
+            lower_ast(
+                hir,
+                ast_lowering_target(requested_target, options.generate.mode),
+            )
         })?);
         state.mark_completed(DecompileStage::Ast);
 
@@ -316,12 +319,7 @@ impl DecompilerPipeline {
                 .expect("naming stage completed must leave name map in state");
             let mut generate_options = options.generate;
             generate_options.mode = output_generate_mode;
-            let mut generated = generate_chunk(
-                ast,
-                names,
-                output_target,
-                generate_options,
-            )?;
+            let mut generated = generate_chunk(ast, names, output_target, generate_options)?;
             generated.warnings = output_warnings.clone();
             Ok::<_, crate::generate::GenerateError>(generated)
         })?);
@@ -588,10 +586,7 @@ fn collect_stmt_features(stmt: &AstStmt, features: &mut BTreeSet<AstFeature>) {
     }
 }
 
-fn collect_lvalue_features(
-    lvalue: &crate::ast::AstLValue,
-    features: &mut BTreeSet<AstFeature>,
-) {
+fn collect_lvalue_features(lvalue: &crate::ast::AstLValue, features: &mut BTreeSet<AstFeature>) {
     match lvalue {
         crate::ast::AstLValue::Name(_) => {}
         crate::ast::AstLValue::FieldAccess(access) => {
@@ -652,10 +647,7 @@ fn collect_expr_features(expr: &AstExpr, features: &mut BTreeSet<AstFeature>) {
     }
 }
 
-fn collect_call_kind_features(
-    call: &crate::ast::AstCallKind,
-    features: &mut BTreeSet<AstFeature>,
-) {
+fn collect_call_kind_features(call: &crate::ast::AstCallKind, features: &mut BTreeSet<AstFeature>) {
     match call {
         crate::ast::AstCallKind::Call(call) => collect_call_expr_features(call, features),
         crate::ast::AstCallKind::MethodCall(call) => {
@@ -664,10 +656,7 @@ fn collect_call_kind_features(
     }
 }
 
-fn collect_call_expr_features(
-    call: &crate::ast::AstCallExpr,
-    features: &mut BTreeSet<AstFeature>,
-) {
+fn collect_call_expr_features(call: &crate::ast::AstCallExpr, features: &mut BTreeSet<AstFeature>) {
     collect_expr_features(&call.callee, features);
     for arg in &call.args {
         collect_expr_features(arg, features);
@@ -684,10 +673,7 @@ fn collect_method_call_expr_features(
     }
 }
 
-fn unsupported_ast_features(
-    module: &AstModule,
-    target: AstTargetDialect,
-) -> BTreeSet<AstFeature> {
+fn unsupported_ast_features(module: &AstModule, target: AstTargetDialect) -> BTreeSet<AstFeature> {
     collect_ast_features(module)
         .into_iter()
         .filter(|feature| !target.supports_feature(*feature))
@@ -701,7 +687,11 @@ fn choose_best_effort_target(
     candidate_output_versions(requested)
         .into_iter()
         .map(AstTargetDialect::new)
-        .find(|target| features.iter().all(|feature| target.supports_feature(*feature)))
+        .find(|target| {
+            features
+                .iter()
+                .all(|feature| target.supports_feature(*feature))
+        })
 }
 
 fn candidate_output_versions(requested: AstDialectVersion) -> Vec<AstDialectVersion> {

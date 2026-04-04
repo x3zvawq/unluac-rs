@@ -2206,7 +2206,11 @@ mod decompile_pipeline {
             .expect("generate stage should provide source");
         assert!(generated.source.contains("for "), "{}", generated.source);
         assert!(generated.source.contains("if "), "{}", generated.source);
-        assert!(!generated.source.contains("continue"), "{}", generated.source);
+        assert!(
+            !generated.source.contains("continue"),
+            "{}",
+            generated.source
+        );
         assert!(!generated.source.contains("goto"), "{}", generated.source);
     }
 

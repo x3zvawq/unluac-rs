@@ -10,7 +10,7 @@ use super::lower::{ChildAnalyses, lower_proto};
 use crate::cfg::{analyze_dataflow, analyze_graph_facts, build_cfg_graph};
 use crate::hir::common::{HirBinaryOpKind, HirExpr, HirLValue, HirModule, HirStmt};
 use crate::hir::dump_hir;
-use crate::parser::{ParseOptions, parse_luau_chunk};
+use crate::parser::{ParseOptions, parse_lua55_chunk, parse_luau_chunk};
 use crate::structure::analyze_structure;
 use crate::transformer::lower_chunk;
 
@@ -100,6 +100,62 @@ fn luau_branch_carried_state_stays_resolved_across_nested_loops() {
     assert!(
         !proto.body.stmts.iter().any(stmt_contains_unresolved_expr),
         "nested branch-carried loop state should not fall back to unresolved phi:\n{hir_dump}",
+    );
+}
+
+#[test]
+fn lua55_fixed_multiresult_call_keeps_all_fixed_defs_before_simplify() {
+    let bytes = unluac_test_support::compile_lua_case(
+        "lua5.5",
+        "tests/lua_cases/lua5.5/05_global_const_gate.lua",
+    );
+    let raw = parse_lua55_chunk(&bytes, ParseOptions::default()).expect("fixture should parse");
+    let lowered = lower_chunk(&raw).expect("fixture should lower into LIR");
+    let cfg_graph = build_cfg_graph(&lowered);
+    let graph_facts = analyze_graph_facts(&cfg_graph);
+    let dataflow = analyze_dataflow(&lowered, &cfg_graph, &graph_facts);
+
+    assert_eq!(
+        dataflow.instr_defs[7].len(),
+        2,
+        "lua5.5 const gate call should define both fixed result registers",
+    );
+
+    let structure = analyze_structure(&lowered, &cfg_graph, &graph_facts, &dataflow);
+    let mut protos = Vec::new();
+    let entry = lower_proto(
+        &lowered.main,
+        &cfg_graph.cfg,
+        &graph_facts,
+        &dataflow,
+        &structure,
+        ChildAnalyses {
+            cfg_graphs: &cfg_graph.children,
+            graph_facts: &graph_facts.children,
+            dataflow: &dataflow.children,
+            structure: &structure.children,
+        },
+        &mut protos,
+    );
+    let module = HirModule { entry, protos };
+    let proto = &module.protos[module.entry.index()];
+
+    assert!(
+        proto.body.stmts.iter().any(|stmt| {
+            matches!(
+                stmt,
+                HirStmt::Assign(assign)
+                    if matches!(assign.targets.as_slice(), [HirLValue::Temp(_), HirLValue::Temp(_)])
+                        && matches!(assign.values.as_slice(), [HirExpr::Call(call)] if call.multiret)
+            )
+        }),
+        "fixed multiresult call should stay a two-target assign before simplify:\n{}",
+        dump_hir(
+            &module,
+            crate::debug::DebugDetail::Verbose,
+            &crate::debug::DebugFilters::default(),
+            crate::debug::DebugColorMode::Never,
+        ),
     );
 }
 

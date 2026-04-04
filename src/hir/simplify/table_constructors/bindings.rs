@@ -75,10 +75,7 @@ impl BindingIndex {
         self.bindings.len()
     }
 
-    pub(super) fn materialized_counts(
-        &self,
-        counts: &BTreeMap<TableBinding, usize>,
-    ) -> Vec<u32> {
+    pub(super) fn materialized_counts(&self, counts: &BTreeMap<TableBinding, usize>) -> Vec<u32> {
         self.bindings
             .iter()
             .map(|binding| counts.get(binding).copied().unwrap_or_default() as u32)

@@ -33,7 +33,9 @@ struct DeadUnresolvedTempPass<'a> {
 impl HirRewritePass for DeadUnresolvedTempPass<'_> {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
         let original_len = block.stmts.len();
-        block.stmts.retain(|stmt| !is_dead_unresolved_temp_materialization(stmt, self.live_reads));
+        block
+            .stmts
+            .retain(|stmt| !is_dead_unresolved_temp_materialization(stmt, self.live_reads));
         block.stmts.len() != original_len
     }
 }

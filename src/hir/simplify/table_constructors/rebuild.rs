@@ -169,7 +169,8 @@ impl ConstructorBuilder {
     }
 
     fn push_array_value(&mut self, value: HirExpr) {
-        self.fields.push(BuilderField::Final(HirTableField::Array(value)));
+        self.fields
+            .push(BuilderField::Final(HirTableField::Array(value)));
         self.next_array_index += 1;
     }
 
@@ -185,7 +186,8 @@ impl ConstructorBuilder {
         let current_next_index = i64::from(self.next_array_index);
         match field.key {
             HirTableKey::Expr(HirExpr::Integer(value))
-                if matches!(policy, RecordPromotionPolicy::Normal) && value == current_next_index =>
+                if matches!(policy, RecordPromotionPolicy::Normal)
+                    && value == current_next_index =>
             {
                 self.push_array_value(field.value);
             }
@@ -232,10 +234,8 @@ impl ConstructorBuilder {
             .pending_integer_fields
             .remove(&i64::from(self.next_array_index))
         {
-            let old_field = std::mem::replace(
-                &mut self.fields[field_index],
-                BuilderField::MovedPendingInt,
-            );
+            let old_field =
+                std::mem::replace(&mut self.fields[field_index], BuilderField::MovedPendingInt);
             let BuilderField::PendingInt { key, value } = old_field else {
                 unreachable!("pending integer field index should always point at a pending field");
             };
@@ -244,7 +244,8 @@ impl ConstructorBuilder {
                 key,
                 value: value.clone(),
             });
-            self.fields.push(BuilderField::Final(HirTableField::Array(value)));
+            self.fields
+                .push(BuilderField::Final(HirTableField::Array(value)));
             self.next_array_index += 1;
         }
     }
@@ -333,20 +334,18 @@ fn flush_constructor_segment(
                 *slot_index,
                 context.scratch,
             )?,
-            RegionStep::ProducerGroup { stmt_index } => {
-                register_producer_group(
-                    context.block,
-                    context.binding_index,
-                    *stmt_index,
-                    context.scratch,
-                )?
-            }
-            RegionStep::Record { stmt_index } => prepare_record_step(
+            RegionStep::ProducerGroup { stmt_index } => register_producer_group(
+                context.block,
+                context.binding_index,
                 *stmt_index,
-                allow_closure_records,
-                context,
+                context.scratch,
             )?,
-            RegionStep::SetList { .. } => unreachable!("set-list should terminate constructor segment"),
+            RegionStep::Record { stmt_index } => {
+                prepare_record_step(*stmt_index, allow_closure_records, context)?
+            }
+            RegionStep::SetList { .. } => {
+                unreachable!("set-list should terminate constructor segment")
+            }
         }
     }
 
@@ -460,8 +459,7 @@ fn flush_constructor_segment(
     }
 
     if set_list_stmt_index.is_none() {
-        builder
-            .drain_pending_integer_fields(&mut context.scratch.restored_pending_integer_fields);
+        builder.drain_pending_integer_fields(&mut context.scratch.restored_pending_integer_fields);
     }
 
     Some(())
@@ -487,7 +485,9 @@ fn reset_touched_bindings(scratch: &mut RebuildScratch) {
 
 fn ensure_binding_capacity(scratch: &mut RebuildScratch, binding_count: usize) {
     if scratch.producer_index_by_binding.len() < binding_count {
-        scratch.producer_index_by_binding.resize(binding_count, None);
+        scratch
+            .producer_index_by_binding
+            .resize(binding_count, None);
     }
     if scratch.consumed_bindings.len() < binding_count {
         scratch.consumed_bindings.resize(binding_count, false);
@@ -516,7 +516,9 @@ fn register_single_producer(
     scratch.producer_index_by_binding[producer.binding_id] = Some(producer_index);
     scratch.removed_materializations[producer.binding_id] += 1;
     scratch.pending_producers.push(producer);
-    scratch.tokens.push(SegmentToken::Producer { producer_index });
+    scratch
+        .tokens
+        .push(SegmentToken::Producer { producer_index });
     Some(())
 }
 
@@ -553,7 +555,9 @@ fn register_producer_group(
             source,
             group: Some(group_id),
         });
-        scratch.tokens.push(SegmentToken::Producer { producer_index });
+        scratch
+            .tokens
+            .push(SegmentToken::Producer { producer_index });
     }
 
     Some(())
@@ -604,10 +608,9 @@ fn prepare_record_step(
         .scratch
         .prepared_records
         .push(crate::hir::common::HirRecordField { key, value });
-    context
-        .scratch
-        .tokens
-        .push(SegmentToken::Record { prepared_record_index });
+    context.scratch.tokens.push(SegmentToken::Record {
+        prepared_record_index,
+    });
     Some(())
 }
 
@@ -667,7 +670,10 @@ fn single_producer(
     }
 }
 
-fn producer_group_stmt(block: &HirBlock, stmt_index: usize) -> Option<(Vec<TableBinding>, &HirExpr)> {
+fn producer_group_stmt(
+    block: &HirBlock,
+    stmt_index: usize,
+) -> Option<(Vec<TableBinding>, &HirExpr)> {
     let stmt = block.stmts.get(stmt_index)?;
     match stmt {
         HirStmt::LocalDecl(local_decl) => {
@@ -703,7 +709,10 @@ fn can_drop_open_pack_source_if_unused(expr: &HirExpr) -> bool {
     matches!(expr, HirExpr::VarArg)
 }
 
-fn pending_producer_value<'a>(block: &'a HirBlock, producer: &PendingProducer) -> Option<&'a HirExpr> {
+fn pending_producer_value<'a>(
+    block: &'a HirBlock,
+    producer: &PendingProducer,
+) -> Option<&'a HirExpr> {
     match producer.source {
         PendingProducerSource::Value {
             stmt_index,

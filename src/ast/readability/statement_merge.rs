@@ -228,14 +228,12 @@ fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
         // `local next, staged; if ... else staged = ...; next = staged end`
         // 这种形状会因为 `next` 还要在 if 之后继续用，把 `staged` 也一起卡在块顶。
         for slice_end in (start + 1..=end).rev() {
-            if let Some((rewritten, consumed)) =
-                try_sink_hoisted_decl_into_nested_stmt(
-                    &pending[start..slice_end],
-                    stmt,
-                    use_index,
-                    suffix_start,
-                )
-            {
+            if let Some((rewritten, consumed)) = try_sink_hoisted_decl_into_nested_stmt(
+                &pending[start..slice_end],
+                stmt,
+                use_index,
+                suffix_start,
+            ) {
                 return Some(NestedSinkAttempt {
                     rewritten,
                     start,

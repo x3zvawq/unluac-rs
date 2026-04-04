@@ -581,11 +581,7 @@ fn collect_consumed_single_eval_defs(
     reg: Reg,
     out: &mut BTreeSet<DefId>,
 ) {
-    let Some(values) = lowering
-        .dataflow
-        .use_values_at(consumer_instr)
-        .get(reg)
-    else {
+    let Some(values) = lowering.dataflow.use_values_at(consumer_instr).get(reg) else {
         return;
     };
     if values.len() != 1 {

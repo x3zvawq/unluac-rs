@@ -97,8 +97,14 @@ impl BindingUseIndex {
         let Some(counts) = self.suffix_counts.get(&binding) else {
             return 0;
         };
-        let first_suffix_stmt = counts.stmt_indices.partition_point(|stmt_index| *stmt_index < start);
-        counts.suffix_totals.get(first_suffix_stmt).copied().unwrap_or(0)
+        let first_suffix_stmt = counts
+            .stmt_indices
+            .partition_point(|stmt_index| *stmt_index < start);
+        counts
+            .suffix_totals
+            .get(first_suffix_stmt)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub(super) fn count_uses_in_range(

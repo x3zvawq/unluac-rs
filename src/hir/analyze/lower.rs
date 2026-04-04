@@ -15,9 +15,9 @@ use super::exprs::{
     lower_value_pack, lower_value_pack_components,
 };
 use super::helpers::{
-    assign_stmt, branch_stmt, build_label_map_for_summary, concat_expr, decode_raw_string,
-    empty_proto, goto_block, goto_stmt, label_for_block, return_stmt, unresolved_expr,
-    unstructured_stmt,
+    assign_stmt, binary_expr, branch_stmt, build_label_map_for_summary, concat_expr,
+    decode_raw_string, empty_proto, goto_block, goto_stmt, label_for_block, return_stmt,
+    unresolved_expr, unstructured_stmt,
 };
 use super::short_circuit::{
     recover_short_value_merge_expr_with_allowed_blocks, value_merge_candidates_in_block,
@@ -25,9 +25,9 @@ use super::short_circuit::{
 use super::structure::try_build_structured_body;
 use crate::cfg::{BlockRef, Cfg, CfgGraph, DataflowFacts, GraphFacts, PhiId};
 use crate::hir::common::{
-    HirBinaryExpr, HirBlock, HirCallExpr, HirCallStmt, HirCapture, HirClose, HirClosureExpr,
-    HirExpr, HirLValue, HirLabel, HirLabelId, HirProto, HirProtoRef, HirStmt, HirTableSetList,
-    HirToBeClosed, HirUnaryExpr, LocalId, ParamId, TempId, UpvalueId,
+    HirBlock, HirCallExpr, HirCallStmt, HirCapture, HirClose, HirClosureExpr, HirExpr, HirLValue,
+    HirLabel, HirLabelId, HirProto, HirProtoRef, HirStmt, HirTableSetList, HirToBeClosed,
+    HirUnaryExpr, LocalId, ParamId, TempId, UpvalueId,
 };
 use crate::structure::{ShortCircuitExit, StructureFacts};
 use crate::transformer::{CallKind, InstrRef, LowInstr, LoweredProto, Reg, ResultPack};
@@ -425,11 +425,11 @@ pub(super) fn lower_regular_instr(
         LowInstr::BinaryOp(binary) => fixed_assign(
             lowering,
             instr_ref,
-            vec![HirExpr::Binary(Box::new(HirBinaryExpr {
-                op: lower_binary_op(binary.op),
-                lhs: expr_for_value_operand(lowering, block, instr_ref, binary.lhs),
-                rhs: expr_for_value_operand(lowering, block, instr_ref, binary.rhs),
-            }))],
+            vec![binary_expr(
+                lower_binary_op(binary.op),
+                expr_for_value_operand(lowering, block, instr_ref, binary.lhs),
+                expr_for_value_operand(lowering, block, instr_ref, binary.rhs),
+            )],
         ),
         LowInstr::Concat(concat) => {
             let value = concat_expr((0..concat.src.len).map(|offset| {

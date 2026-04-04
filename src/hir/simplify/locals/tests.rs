@@ -182,6 +182,58 @@ fn does_not_promote_single_use_numeric_for_header_temps_into_locals() {
     ));
 }
 
+#[test]
+fn does_not_promote_self_referential_temp_update_inside_branch() {
+    let mut module = HirModule {
+        entry: HirProtoRef(0),
+        protos: vec![dummy_proto(HirBlock {
+            stmts: vec![
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Temp(TempId(0))],
+                    values: vec![HirExpr::Integer(1)],
+                })),
+                HirStmt::If(Box::new(HirIf {
+                    cond: HirExpr::Boolean(true),
+                    then_block: HirBlock {
+                        stmts: vec![
+                            HirStmt::Assign(Box::new(HirAssign {
+                                targets: vec![HirLValue::Temp(TempId(0))],
+                                values: vec![HirExpr::Binary(Box::new(
+                                    crate::hir::common::HirBinaryExpr {
+                                        op: crate::hir::common::HirBinaryOpKind::Add,
+                                        lhs: HirExpr::TempRef(TempId(0)),
+                                        rhs: HirExpr::Integer(1),
+                                    },
+                                ))],
+                            })),
+                            HirStmt::Return(Box::new(HirReturn {
+                                values: vec![HirExpr::TempRef(TempId(0))],
+                            })),
+                        ],
+                    },
+                    else_block: None,
+                })),
+            ],
+        })],
+    };
+
+    super::super::simplify_hir(
+        &mut module,
+        crate::readability::ReadabilityOptions::default(),
+    );
+
+    assert!(matches!(
+        module.protos[0].body.stmts.as_slice(),
+        [HirStmt::LocalDecl(local_decl), HirStmt::If(if_stmt)]
+            if matches!(local_decl.bindings.as_slice(), [LocalId(0)])
+                && matches!(if_stmt.then_block.stmts.as_slice(), [HirStmt::Assign(assign), HirStmt::Return(ret)]
+                    if matches!(assign.targets.as_slice(), [HirLValue::Local(LocalId(0))])
+                        && matches!(assign.values.as_slice(), [HirExpr::Binary(binary)]
+                            if matches!(binary.lhs, HirExpr::LocalRef(LocalId(0))))
+                        && matches!(ret.values.as_slice(), [HirExpr::LocalRef(LocalId(0))]))
+    ));
+}
+
 fn dummy_proto(body: HirBlock) -> HirProto {
     HirProto {
         id: HirProtoRef(0),

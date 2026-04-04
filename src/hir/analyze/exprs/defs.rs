@@ -7,7 +7,11 @@
 use super::*;
 
 pub(crate) fn is_multiret_results(results: crate::transformer::ResultPack) -> bool {
-    matches!(results, crate::transformer::ResultPack::Open(_))
+    match results {
+        crate::transformer::ResultPack::Open(_) => true,
+        crate::transformer::ResultPack::Fixed(range) => range.len > 1,
+        crate::transformer::ResultPack::Ignore => false,
+    }
 }
 
 /// 尝试把一个固定定义直接解释成 HIR 表达式。
@@ -119,11 +123,11 @@ pub(crate) fn expr_for_dup_safe_fixed_def(
             })))
         }
         LowInstr::BinaryOp(binary) if binary.dst == def_reg => {
-            Some(HirExpr::Binary(Box::new(HirBinaryExpr {
-                op: lower_binary_op(binary.op),
-                lhs: expr_for_value_operand_inline(lowering, def_block, def_instr, binary.lhs),
-                rhs: expr_for_value_operand_inline(lowering, def_block, def_instr, binary.rhs),
-            })))
+            Some(super::super::helpers::binary_expr(
+                lower_binary_op(binary.op),
+                expr_for_value_operand_inline(lowering, def_block, def_instr, binary.lhs),
+                expr_for_value_operand_inline(lowering, def_block, def_instr, binary.rhs),
+            ))
         }
         LowInstr::Concat(concat) if concat.dst == def_reg => {
             let value = concat_expr((0..concat.src.len).map(|offset| {

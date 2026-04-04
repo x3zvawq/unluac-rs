@@ -18,7 +18,8 @@ pub(super) fn materialize_value_facts(
         fixed_in: vec![TrackedState::new(reg_count); cfg.blocks.len()],
         fixed_out: vec![TrackedState::new(reg_count); cfg.blocks.len()],
     };
-    let mut reaching_values = vec![InstrReachingValues::default(); instruction_facts.reaching_defs.len()];
+    let mut reaching_values =
+        vec![InstrReachingValues::default(); instruction_facts.reaching_defs.len()];
     let mut use_values = vec![InstrUseValues::default(); instruction_facts.use_defs.len()];
 
     solve_reaching_values(
@@ -116,7 +117,11 @@ fn solve_reaching_values(
     }
 }
 
-fn merge_predecessor_value_state(cfg: &Cfg, block: BlockRef, block_out: &[ValueState]) -> ValueState {
+fn merge_predecessor_value_state(
+    cfg: &Cfg,
+    block: BlockRef,
+    block_out: &[ValueState],
+) -> ValueState {
     let reg_count = block_out.first().map_or(0, |state| state.regs.len());
     let mut merged_fixed = ValueState::new(reg_count);
 

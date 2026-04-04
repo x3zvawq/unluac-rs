@@ -212,6 +212,46 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn lua55_hir_stage_keeps_fixed_multiresult_call_as_multivalue_carrier() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.5",
+            "tests/lua_cases/lua5.5/05_global_const_gate.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua55,
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.5 hir stage should preserve fixed multiresult call carrier");
+
+        assert_eq!(result.state.completed_stage, Some(DecompileStage::Hir));
+        let dump = &result.debug_output[0].content;
+        assert!(
+            dump.contains("assign t5, t6 = call(normal) l3(\"abc\") multiret=true"),
+            "{dump}"
+        );
+        assert!(
+            !dump.contains("call(normal) l3(\"abc\") multiret=false"),
+            "{dump}"
+        );
+        assert!(
+            !dump.contains("local [\"l4\"] = call(normal) l3(\"abc\")"),
+            "{dump}"
+        );
+    }
+
+    #[test]
     fn lua55_ast_stage_recovers_global_decl_from_errnnil_pattern() {
         let chunk = crate::support::compile_lua_case(
             "lua5.5",
@@ -550,6 +590,18 @@ mod decompile_pipeline {
         );
         assert!(
             generated.source.contains("local function fn(a)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated
+                .source
+                .contains("local result, value4 = fn(\"abc\")"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("\nlocal value4\n"),
             "{}",
             generated.source
         );
@@ -892,5 +944,31 @@ mod decompile_pipeline {
             "{}",
             generated.source
         );
+    }
+
+    #[test]
+    fn lua55_generate_stage_canonicalizes_shift_immediates_in_loop_bitwise_dispatch_fixture() {
+        let chunk = crate::support::compile_lua_case(
+            "lua5.5",
+            "tests/lua_cases/lua5.3/06_loop_bitwise_dispatch.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                dialect: DecompileDialect::Lua55,
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("lua5.5 generate stage should canonicalize loop_bitwise_dispatch shifts");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(!generated.source.contains(">> -"), "{}", generated.source);
+        assert!(!generated.source.contains("<< -"), "{}", generated.source);
+        assert!(generated.source.contains("while "), "{}", generated.source);
     }
 }

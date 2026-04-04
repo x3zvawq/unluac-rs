@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 
 use crate::ast::AstSyntheticLocalId;
-use crate::hir::{HirProto, HirProtoRef, LocalId, ParamId, UpvalueId};
+use crate::hir::{HirProto, HirProtoRef, LocalId, ParamId, TempId, UpvalueId};
 
 use super::NamingError;
 use super::ast_facts::FunctionAstNamingFacts;
@@ -262,6 +262,9 @@ fn resolve_captured_name(
         CapturedBinding::Local { parent, local } => {
             resolve_captured_local_name(function, parent, local, assigned_functions)?
         }
+        CapturedBinding::Temp { parent, temp } => {
+            resolve_captured_temp_name(function, parent, temp, assigned_functions)?
+        }
         CapturedBinding::Upvalue { parent, upvalue } => {
             resolve_captured_upvalue_name(function, parent, upvalue, assigned_functions)?
         }
@@ -319,6 +322,31 @@ fn resolve_captured_local_name(
             parent: parent.index(),
             kind: "local",
             index: local.index(),
+        })
+}
+
+fn resolve_captured_temp_name(
+    function: HirProtoRef,
+    parent: HirProtoRef,
+    temp: TempId,
+    assigned_functions: &[FunctionNameMap],
+) -> Result<String, NamingError> {
+    let parent_names =
+        assigned_functions
+            .get(parent.index())
+            .ok_or(NamingError::MissingCaptureParent {
+                function: function.index(),
+                parent: parent.index(),
+            })?;
+    parent_names
+        .synthetic_locals
+        .get(&AstSyntheticLocalId(temp))
+        .map(|name| name.text.clone())
+        .ok_or(NamingError::MissingCapturedBinding {
+            function: function.index(),
+            parent: parent.index(),
+            kind: "synthetic-local",
+            index: temp.index(),
         })
 }
 

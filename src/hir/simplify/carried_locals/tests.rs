@@ -3,9 +3,9 @@
 //! 我们把测试放到实现文件外，避免 pass 本体被构造 proto 的样板淹没。
 
 use crate::hir::{
-    HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirExpr, HirGoto, HirIf, HirLabel,
-    HirLabelId, HirLValue, HirLocalDecl, HirProto, HirProtoRef, HirReturn, HirStmt, HirUnaryExpr,
-    HirUnaryOpKind, LocalId, TempId,
+    HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirExpr, HirGoto, HirIf,
+    HirLValue, HirLabel, HirLabelId, HirLocalDecl, HirProto, HirProtoRef, HirReturn, HirStmt,
+    HirUnaryExpr, HirUnaryOpKind, LocalId, TempId,
 };
 use crate::parser::{ProtoLineRange, ProtoSignature};
 
@@ -72,6 +72,57 @@ fn collapses_single_temp_handoff_back_into_original_local() {
                             if matches!(binary.lhs, HirExpr::LocalRef(id) if id == local)
                     )
         ) && matches!(ret.values.as_slice(), [HirExpr::LocalRef(id)] if *id == local)
+    ));
+}
+
+#[test]
+fn keeps_multivalue_call_assignments_intact_when_pruning_self_assigns() {
+    let call_result = TempId(0);
+    let carried = TempId(1);
+    let mut proto = empty_proto(
+        Vec::new(),
+        vec![call_result, carried],
+        vec![
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(call_result), HirLValue::Temp(carried)],
+                values: vec![HirExpr::Call(Box::new(HirCallExpr {
+                    callee: HirExpr::GlobalRef(crate::hir::common::HirGlobalRef {
+                        name: "probe".to_owned(),
+                    }),
+                    args: vec![HirExpr::String("abc".to_owned())],
+                    multiret: true,
+                    method: false,
+                    method_name: None,
+                }))],
+            })),
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(call_result)],
+                values: vec![HirExpr::TempRef(call_result)],
+            })),
+            HirStmt::Return(Box::new(HirReturn {
+                values: vec![HirExpr::TempRef(call_result), HirExpr::TempRef(carried)],
+            })),
+        ],
+    );
+
+    assert!(collapse_carried_local_handoffs_in_proto(&mut proto));
+    assert!(matches!(
+        proto.body.stmts.as_slice(),
+        [
+            HirStmt::Assign(assign),
+            HirStmt::Return(ret),
+        ] if matches!(
+            assign.targets.as_slice(),
+            [HirLValue::Temp(first), HirLValue::Temp(second)]
+                if *first == call_result && *second == carried
+        ) && matches!(
+            assign.values.as_slice(),
+            [HirExpr::Call(call)] if call.multiret
+        ) && matches!(
+            ret.values.as_slice(),
+            [HirExpr::TempRef(first), HirExpr::TempRef(second)]
+                if *first == call_result && *second == carried
+        )
     ));
 }
 
@@ -473,10 +524,19 @@ fn collapses_partial_multi_target_handoff_and_keeps_non_alias_seed_parts() {
     let loop_state = TempId(4);
     let mut proto = empty_proto(
         Vec::new(),
-        vec![carried_index, carried_total, next_index, next_total, loop_state],
+        vec![
+            carried_index,
+            carried_total,
+            next_index,
+            next_total,
+            loop_state,
+        ],
         vec![
             HirStmt::Assign(Box::new(HirAssign {
-                targets: vec![HirLValue::Temp(carried_index), HirLValue::Temp(carried_total)],
+                targets: vec![
+                    HirLValue::Temp(carried_index),
+                    HirLValue::Temp(carried_total),
+                ],
                 values: vec![HirExpr::Int64(1), HirExpr::Int64(2)],
             })),
             HirStmt::Assign(Box::new(HirAssign {
@@ -508,7 +568,10 @@ fn collapses_partial_multi_target_handoff_and_keeps_non_alias_seed_parts() {
                 }))],
             })),
             HirStmt::Assign(Box::new(HirAssign {
-                targets: vec![HirLValue::Temp(carried_index), HirLValue::Temp(carried_total)],
+                targets: vec![
+                    HirLValue::Temp(carried_index),
+                    HirLValue::Temp(carried_total),
+                ],
                 values: vec![HirExpr::TempRef(next_index), HirExpr::TempRef(next_total)],
             })),
             HirStmt::Return(Box::new(HirReturn {
@@ -677,10 +740,7 @@ fn collapses_goto_mesh_boundary_aliases_back_into_two_carried_slots() {
                     stmts: vec![
                         HirStmt::Assign(Box::new(HirAssign {
                             targets: vec![HirLValue::Temp(mesh_x), HirLValue::Temp(mesh_y)],
-                            values: vec![
-                                HirExpr::TempRef(carried_x),
-                                HirExpr::TempRef(carried_y),
-                            ],
+                            values: vec![HirExpr::TempRef(carried_x), HirExpr::TempRef(carried_y)],
                         })),
                         HirStmt::Goto(Box::new(HirGoto { target: l2 })),
                     ],
@@ -826,12 +886,18 @@ fn proto_mentions_temp(proto: &HirProto, temp: TempId) -> bool {
 }
 
 fn block_mentions_temp(block: &HirBlock, temp: TempId) -> bool {
-    block.stmts.iter().any(|stmt| stmt_mentions_temp(stmt, temp))
+    block
+        .stmts
+        .iter()
+        .any(|stmt| stmt_mentions_temp(stmt, temp))
 }
 
 fn stmt_mentions_temp(stmt: &HirStmt, temp: TempId) -> bool {
     match stmt {
-        HirStmt::LocalDecl(local_decl) => local_decl.values.iter().any(|expr| expr_mentions_temp(expr, temp)),
+        HirStmt::LocalDecl(local_decl) => local_decl
+            .values
+            .iter()
+            .any(|expr| expr_mentions_temp(expr, temp)),
         HirStmt::Assign(assign) => {
             assign
                 .targets
@@ -844,7 +910,10 @@ fn stmt_mentions_temp(stmt: &HirStmt, temp: TempId) -> bool {
         }
         HirStmt::TableSetList(set_list) => {
             expr_mentions_temp(&set_list.base, temp)
-                || set_list.values.iter().any(|expr| expr_mentions_temp(expr, temp))
+                || set_list
+                    .values
+                    .iter()
+                    .any(|expr| expr_mentions_temp(expr, temp))
                 || set_list
                     .trailing_multivalue
                     .as_ref()
@@ -852,9 +921,11 @@ fn stmt_mentions_temp(stmt: &HirStmt, temp: TempId) -> bool {
         }
         HirStmt::ErrNil(err_nil) => expr_mentions_temp(&err_nil.value, temp),
         HirStmt::ToBeClosed(to_be_closed) => expr_mentions_temp(&to_be_closed.value, temp),
-        HirStmt::Close(_) | HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => {
-            false
-        }
+        HirStmt::Close(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => false,
         HirStmt::CallStmt(call_stmt) => {
             expr_mentions_temp(&call_stmt.call.callee, temp)
                 || call_stmt
@@ -873,7 +944,8 @@ fn stmt_mentions_temp(stmt: &HirStmt, temp: TempId) -> bool {
                     .is_some_and(|block| block_mentions_temp(block, temp))
         }
         HirStmt::While(while_stmt) => {
-            expr_mentions_temp(&while_stmt.cond, temp) || block_mentions_temp(&while_stmt.body, temp)
+            expr_mentions_temp(&while_stmt.cond, temp)
+                || block_mentions_temp(&while_stmt.body, temp)
         }
         HirStmt::Repeat(repeat_stmt) => {
             block_mentions_temp(&repeat_stmt.body, temp)

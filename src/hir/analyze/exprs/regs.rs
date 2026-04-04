@@ -82,11 +82,7 @@ pub(crate) fn expr_for_reg_at_block_entry(
         return entry_reg_expr(lowering, reg);
     }
 
-    let Some(values) = lowering
-        .dataflow
-        .reaching_values_at(range.start)
-        .get(reg)
-    else {
+    let Some(values) = lowering.dataflow.reaching_values_at(range.start).get(reg) else {
         return entry_reg_expr(lowering, reg);
     };
 

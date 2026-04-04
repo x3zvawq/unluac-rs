@@ -265,6 +265,10 @@ fn captured_binding_from_expr(parent: HirProtoRef, expr: &HirExpr) -> Option<Cap
             parent,
             local: *local,
         }),
+        HirExpr::TempRef(temp) => Some(CapturedBinding::Temp {
+            parent,
+            temp: *temp,
+        }),
         HirExpr::UpvalueRef(upvalue) => Some(CapturedBinding::Upvalue {
             parent,
             upvalue: *upvalue,
@@ -277,7 +281,6 @@ fn captured_binding_from_expr(parent: HirProtoRef, expr: &HirExpr) -> Option<Cap
         | HirExpr::Int64(_)
         | HirExpr::UInt64(_)
         | HirExpr::Complex { .. }
-        | HirExpr::TempRef(_)
         | HirExpr::GlobalRef(_)
         | HirExpr::VarArg
         | HirExpr::TableAccess(_)

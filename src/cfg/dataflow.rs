@@ -503,7 +503,9 @@ fn resolved_fixed_use_regs<'a>(
     current_open: &CompactSet<OpenDefId>,
     open_defs: &[OpenDef],
 ) -> &'a [Reg] {
-    scratch.fixed_use_regs.resolve(effect, current_open, open_defs)
+    scratch
+        .fixed_use_regs
+        .resolve(effect, current_open, open_defs)
 }
 
 fn instr_indices(cfg: &Cfg, block: BlockRef) -> Option<impl Iterator<Item = usize>> {
@@ -611,11 +613,17 @@ mod tests {
         let reaching_defs = InstrReachingDefs {
             fixed: RegValueMap::from_sparse_entries(vec![
                 (Reg(0), CompactSet::singleton(DefId(1))),
-                (Reg(2), CompactSet::Many(BTreeSet::from([DefId(3), DefId(4)]))),
+                (
+                    Reg(2),
+                    CompactSet::Many(BTreeSet::from([DefId(3), DefId(4)])),
+                ),
             ]),
         };
         let use_defs = InstrUseDefs {
-            fixed: RegValueMap::from_sparse_entries(vec![(Reg(2), CompactSet::singleton(DefId(4)))]),
+            fixed: RegValueMap::from_sparse_entries(vec![(
+                Reg(2),
+                CompactSet::singleton(DefId(4)),
+            )]),
             open: BTreeSet::new(),
         };
         let dataflow = DataflowFacts {

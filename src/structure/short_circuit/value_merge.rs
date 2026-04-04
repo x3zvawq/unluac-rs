@@ -62,13 +62,10 @@ pub(super) fn analyze_value_merge_candidates(
                 continue;
             }
 
-            let Some(candidate) = ValueMergeDagBuilder::new(
-                &build_ctx,
-                root.header,
-                phi,
-                &merge_reachability,
-            )
-            .build() else {
+            let Some(candidate) =
+                ValueMergeDagBuilder::new(&build_ctx, root.header, phi, &merge_reachability)
+                    .build()
+            else {
                 continue;
             };
 
@@ -103,7 +100,9 @@ impl MergeReachability {
         let mut worklist = VecDeque::from([merge]);
 
         while let Some(block) = worklist.pop_front() {
-            if !cfg.reachable_blocks.contains(&block) || std::mem::replace(&mut reaches_merge[block.index()], true) {
+            if !cfg.reachable_blocks.contains(&block)
+                || std::mem::replace(&mut reaches_merge[block.index()], true)
+            {
                 continue;
             }
 
@@ -119,7 +118,10 @@ impl MergeReachability {
     }
 
     fn contains(&self, block: BlockRef) -> bool {
-        self.reaches_merge.get(block.index()).copied().unwrap_or(false)
+        self.reaches_merge
+            .get(block.index())
+            .copied()
+            .unwrap_or(false)
     }
 }
 
@@ -217,8 +219,7 @@ impl<'a> ValueMergeDagBuilder<'a> {
         }
 
         let _candidate = self.branch_by_header.get(&header)?;
-        if !self.dom_tree.dominates(self.root, header)
-            || !self.merge_reachability.contains(header)
+        if !self.dom_tree.dominates(self.root, header) || !self.merge_reachability.contains(header)
         {
             self.visiting.remove(&header);
             return None;

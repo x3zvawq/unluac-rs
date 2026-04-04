@@ -19,9 +19,7 @@ mod scan;
 
 use std::collections::BTreeMap;
 
-use crate::hir::common::{
-    HirAssign, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId,
-};
+use crate::hir::common::{HirAssign, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId};
 
 use self::bindings::collect_materialized_binding_counts;
 use self::scan::{
@@ -40,10 +38,19 @@ type BindingId = usize;
 
 #[derive(Debug, Clone, Copy)]
 enum RegionStep {
-    Producer { stmt_index: usize, slot_index: usize },
-    ProducerGroup { stmt_index: usize },
-    Record { stmt_index: usize },
-    SetList { stmt_index: usize },
+    Producer {
+        stmt_index: usize,
+        slot_index: usize,
+    },
+    ProducerGroup {
+        stmt_index: usize,
+    },
+    Record {
+        stmt_index: usize,
+    },
+    SetList {
+        stmt_index: usize,
+    },
 }
 
 #[derive(Debug, Clone)]

@@ -454,7 +454,10 @@ fn absorbs_long_set_list_constructor_region_before_terminal_global_handoff() {
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(table_local),
-                    values: vec![HirExpr::TempRef(first_value), HirExpr::TempRef(second_value)],
+                    values: vec![
+                        HirExpr::TempRef(first_value),
+                        HirExpr::TempRef(second_value),
+                    ],
                     trailing_multivalue: None,
                     start_index: 1,
                 })),

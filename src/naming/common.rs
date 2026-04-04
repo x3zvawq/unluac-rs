@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::AstSyntheticLocalId;
-use crate::hir::{HirProtoRef, LocalId, ParamId, UpvalueId};
+use crate::hir::{HirProtoRef, LocalId, ParamId, TempId, UpvalueId};
 
 /// Naming 模式。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -148,6 +148,10 @@ pub(super) enum CapturedBinding {
     Local {
         parent: HirProtoRef,
         local: LocalId,
+    },
+    Temp {
+        parent: HirProtoRef,
+        temp: TempId,
     },
     Upvalue {
         parent: HirProtoRef,

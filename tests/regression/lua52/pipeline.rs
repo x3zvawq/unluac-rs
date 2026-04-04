@@ -64,20 +64,36 @@ mod decompile_pipeline {
         )
         .expect("lua5.2 generate stage should succeed for goto-break-like fixture");
 
-        assert_eq!(
-            result.state.completed_stage,
-            Some(DecompileStage::Generate)
-        );
+        assert_eq!(result.state.completed_stage, Some(DecompileStage::Generate));
         let generated = result
             .state
             .generated
             .as_ref()
             .expect("generate stage should leave generated source in state");
-        assert_eq!(generated.source.matches("while ").count(), 2, "{}", generated.source);
-        assert_eq!(generated.source.matches("goto L").count(), 1, "{}", generated.source);
-        assert_eq!(generated.source.matches("::L").count(), 1, "{}", generated.source);
+        assert_eq!(
+            generated.source.matches("while ").count(),
+            2,
+            "{}",
+            generated.source
+        );
+        assert_eq!(
+            generated.source.matches("goto L").count(),
+            1,
+            "{}",
+            generated.source
+        );
+        assert_eq!(
+            generated.source.matches("::L").count(),
+            1,
+            "{}",
+            generated.source
+        );
         assert!(generated.source.contains("> 2"), "{}", generated.source);
-        assert!(!generated.source.contains("continue"), "{}", generated.source);
+        assert!(
+            !generated.source.contains("continue"),
+            "{}",
+            generated.source
+        );
         assert!(
             !contains_plain_self_assign(&generated.source),
             "{}",
@@ -109,19 +125,33 @@ mod decompile_pipeline {
         )
         .expect("lua5.2 generate stage should succeed for irreducible goto mesh fixture");
 
-        assert_eq!(
-            result.state.completed_stage,
-            Some(DecompileStage::Generate)
-        );
+        assert_eq!(result.state.completed_stage, Some(DecompileStage::Generate));
         let generated = result
             .state
             .generated
             .as_ref()
             .expect("generate stage should leave generated source in state");
-        assert_eq!(generated.source.matches("local ").count(), 1, "{}", generated.source);
-        assert!(!generated.source.contains("local r0_0, r0_1,"), "{}", generated.source);
-        assert!(!generated.source.contains("\nlocal r0_"), "{}", generated.source);
-        assert!(!contains_plain_self_assign(&generated.source), "{}", generated.source);
+        assert_eq!(
+            generated.source.matches("local ").count(),
+            1,
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("local r0_0, r0_1,"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !generated.source.contains("\nlocal r0_"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            !contains_plain_self_assign(&generated.source),
+            "{}",
+            generated.source
+        );
     }
 
     #[test]

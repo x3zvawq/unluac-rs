@@ -62,7 +62,8 @@ fn inline_constructor_value_at_site(
 ) -> Option<HirExpr> {
     if let Some(binding) = binding_from_expr(value)
         && let Some(binding_id) = context.binding_index.id_of(binding)
-        && let Some(producer_index) = context.producer_index_by_binding
+        && let Some(producer_index) = context
+            .producer_index_by_binding
             .get(binding_id)
             .and_then(|producer_index| *producer_index)
     {
@@ -111,7 +112,11 @@ fn inline_constructor_value_at_site(
                     .args
                     .iter()
                     .map(|arg| {
-                        inline_constructor_value_at_site(context, arg, ConstructorInlineSite::Neutral)
+                        inline_constructor_value_at_site(
+                            context,
+                            arg,
+                            ConstructorInlineSite::Neutral,
+                        )
                     })
                     .collect::<Option<Vec<_>>>()?,
                 multiret: call.multiret,
@@ -134,7 +139,10 @@ fn inline_constructor_value_at_site(
     }
 }
 
-fn pending_producer_value<'a>(block: &'a HirBlock, producer: &PendingProducer) -> Option<&'a HirExpr> {
+fn pending_producer_value<'a>(
+    block: &'a HirBlock,
+    producer: &PendingProducer,
+) -> Option<&'a HirExpr> {
     match producer.source {
         PendingProducerSource::Value {
             stmt_index,
@@ -144,7 +152,11 @@ fn pending_producer_value<'a>(block: &'a HirBlock, producer: &PendingProducer) -
     }
 }
 
-fn producer_source_value(block: &HirBlock, stmt_index: usize, value_index: usize) -> Option<&HirExpr> {
+fn producer_source_value(
+    block: &HirBlock,
+    stmt_index: usize,
+    value_index: usize,
+) -> Option<&HirExpr> {
     let stmt = block.stmts.get(stmt_index)?;
     match stmt {
         crate::hir::common::HirStmt::LocalDecl(local_decl) => local_decl.values.get(value_index),
@@ -232,12 +244,14 @@ fn expr_depends_on_any_pending_binding(
         }
         HirExpr::TableConstructor(table) => {
             table.fields.iter().any(|field| match field {
-                crate::hir::common::HirTableField::Array(value) => expr_depends_on_any_pending_binding(
-                    value,
-                    binding_index,
-                    pending_producers,
-                    consumed_bindings,
-                ),
+                crate::hir::common::HirTableField::Array(value) => {
+                    expr_depends_on_any_pending_binding(
+                        value,
+                        binding_index,
+                        pending_producers,
+                        consumed_bindings,
+                    )
+                }
                 crate::hir::common::HirTableField::Record(field) => {
                     expr_depends_on_any_pending_binding(
                         &field.value,
@@ -271,21 +285,25 @@ fn expr_depends_on_any_pending_binding(
                 pending_producers,
                 consumed_bindings,
             ) || match &node.truthy {
-                crate::hir::common::HirDecisionTarget::Expr(expr) => expr_depends_on_any_pending_binding(
-                    expr,
-                    binding_index,
-                    pending_producers,
-                    consumed_bindings,
-                ),
+                crate::hir::common::HirDecisionTarget::Expr(expr) => {
+                    expr_depends_on_any_pending_binding(
+                        expr,
+                        binding_index,
+                        pending_producers,
+                        consumed_bindings,
+                    )
+                }
                 crate::hir::common::HirDecisionTarget::Node(_)
                 | crate::hir::common::HirDecisionTarget::CurrentValue => false,
             } || match &node.falsy {
-                crate::hir::common::HirDecisionTarget::Expr(expr) => expr_depends_on_any_pending_binding(
-                    expr,
-                    binding_index,
-                    pending_producers,
-                    consumed_bindings,
-                ),
+                crate::hir::common::HirDecisionTarget::Expr(expr) => {
+                    expr_depends_on_any_pending_binding(
+                        expr,
+                        binding_index,
+                        pending_producers,
+                        consumed_bindings,
+                    )
+                }
                 crate::hir::common::HirDecisionTarget::Node(_)
                 | crate::hir::common::HirDecisionTarget::CurrentValue => false,
             }
