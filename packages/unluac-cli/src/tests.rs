@@ -31,6 +31,7 @@ fn defaults_to_pure_source_output_when_only_source_is_given() {
     assert!(!options.decompile.debug.enable);
     assert!(!options.decompile.debug.timing);
     assert!(options.decompile.debug.output_stages.is_empty());
+    assert!(options.decompile.generate.comment);
 }
 
 #[test]
@@ -103,6 +104,8 @@ fn naming_mode_and_bool_options_override_defaults() {
         "false",
         "--conservative-output",
         "false",
+        "--comment",
+        "false",
         "--generate-mode",
         "best-effort",
     ]))
@@ -110,5 +113,6 @@ fn naming_mode_and_bool_options_override_defaults() {
     assert_eq!(options.decompile.naming.mode, NamingMode::Simple);
     assert!(!options.decompile.naming.debug_like_include_function);
     assert!(!options.decompile.generate.conservative_output);
+    assert!(!options.decompile.generate.comment);
     assert_eq!(options.decompile.generate.mode, GenerateMode::BestEffort);
 }

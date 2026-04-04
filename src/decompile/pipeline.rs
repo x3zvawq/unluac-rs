@@ -10,12 +10,15 @@ use crate::ast::{
     AstTargetDialect, lower_ast, make_readable_with_options_and_timing,
 };
 use crate::cfg::{analyze_dataflow, analyze_graph_facts, build_cfg_graph};
-use crate::generate::{GenerateMode, generate_chunk};
+use crate::generate::{
+    GenerateChunkCommentMetadata, GenerateCommentMetadata, GenerateFunctionCommentMetadata,
+    GenerateMode, generate_chunk,
+};
 use crate::hir::analyze_hir_with_timing;
 use crate::naming::{assign_names_with_evidence, collect_naming_evidence};
 use crate::parser::{
-    parse_lua51_chunk, parse_lua52_chunk, parse_lua53_chunk, parse_lua54_chunk, parse_lua55_chunk,
-    parse_luajit_chunk, parse_luau_chunk,
+    RawChunk, RawString, StringEncoding, parse_lua51_chunk, parse_lua52_chunk, parse_lua53_chunk,
+    parse_lua54_chunk, parse_lua55_chunk, parse_luajit_chunk, parse_luau_chunk,
 };
 use crate::structure::analyze_structure;
 use crate::timing::{TimingCollector, TimingReport};
@@ -319,7 +322,30 @@ impl DecompilerPipeline {
                 .expect("naming stage completed must leave name map in state");
             let mut generate_options = options.generate;
             generate_options.mode = output_generate_mode;
-            let mut generated = generate_chunk(ast, names, output_target, generate_options)?;
+            let comment_metadata = if generate_options.comment {
+                let raw_chunk = state
+                    .raw_chunk
+                    .as_ref()
+                    .expect("parse stage completed must leave raw chunk in state");
+                let hir = state
+                    .hir
+                    .as_ref()
+                    .expect("hir stage completed must leave hir module in state");
+                Some(build_generate_comment_metadata(
+                    raw_chunk,
+                    hir,
+                    options.parse.string_encoding,
+                ))
+            } else {
+                None
+            };
+            let mut generated = generate_chunk(
+                ast,
+                names,
+                output_target,
+                comment_metadata.as_ref(),
+                generate_options,
+            )?;
             generated.warnings = output_warnings.clone();
             Ok::<_, crate::generate::GenerateError>(generated)
         })?);
@@ -344,6 +370,39 @@ fn finish_result(
         debug_output,
         timing_report: timings.finish(),
     }
+}
+
+fn build_generate_comment_metadata(
+    raw_chunk: &RawChunk,
+    hir: &crate::hir::HirModule,
+    encoding: StringEncoding,
+) -> GenerateCommentMetadata {
+    GenerateCommentMetadata {
+        chunk: GenerateChunkCommentMetadata {
+            file_name: raw_chunk.main.common.source.as_ref().map(render_raw_string),
+            encoding,
+        },
+        functions: hir
+            .protos
+            .iter()
+            .map(|proto| GenerateFunctionCommentMetadata {
+                function: proto.id,
+                source: proto.source.clone(),
+                line_range: proto.line_range,
+                signature: proto.signature,
+                local_count: proto.locals.len(),
+                upvalue_count: proto.upvalues.len(),
+            })
+            .collect(),
+    }
+}
+
+fn render_raw_string(value: &RawString) -> String {
+    value
+        .text
+        .as_ref()
+        .map(|text| text.value.clone())
+        .unwrap_or_else(|| format!("<{} bytes>", value.bytes.len()))
 }
 
 #[derive(Debug, Clone)]

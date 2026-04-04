@@ -117,6 +117,9 @@ struct CliArgs {
     /// Whether to prefer conservative source generation.
     #[arg(long, value_name = "BOOL", value_parser = BoolishValueParser::new())]
     conservative_output: Option<bool>,
+    /// Whether to emit generate-stage comments and metadata.
+    #[arg(long, value_name = "BOOL", value_parser = BoolishValueParser::new())]
+    comment: Option<bool>,
     /// How to handle syntax not supported by the requested target dialect.
     #[arg(long, value_parser = parse_generate_mode_arg)]
     generate_mode: Option<GenerateMode>,
@@ -281,6 +284,9 @@ where
     }
     if let Some(value) = args.conservative_output {
         decompile.generate.conservative_output = value;
+    }
+    if let Some(value) = args.comment {
+        decompile.generate.comment = value;
     }
     if let Some(mode) = args.generate_mode {
         decompile.generate.mode = mode;

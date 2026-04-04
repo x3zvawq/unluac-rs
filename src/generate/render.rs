@@ -72,6 +72,9 @@ impl Renderer {
     }
 
     fn push_line(&mut self, indent: usize) {
+        while self.output.ends_with(' ') {
+            self.output.pop();
+        }
         self.output.push('\n');
         for _ in 0..indent {
             self.output.push(' ');

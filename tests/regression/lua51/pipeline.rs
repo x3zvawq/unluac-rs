@@ -2373,6 +2373,78 @@ mod decompile_pipeline {
             generated.source
         );
     }
+
+    #[test]
+    fn generate_comments_emit_chunk_and_function_meta_with_stable_blank_lines() {
+        let chunk = crate::support::compile_lua_case_with_debug(
+            "lua5.1",
+            "tests/lua_cases/common/functions/05_recursive_local_function.lua",
+        );
+        let result = decompile(
+            &chunk,
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("generate stage with comments should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            generated.source.starts_with("-- file: ")
+                && generated.source.contains("05_recursive_local_function.lua"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("-- dialect: lua5.1")
+                && generated.source.contains("-- encoding: utf-8")
+                && generated
+                    .source
+                    .contains("-- decompiled by unluac-rs\n\n-- line 1-11"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("-- proto#1 params=1")
+                && generated.source.contains("    -- line 2-8")
+                && generated.source.contains("    -- proto#2 params=2"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("    end\n")
+                && generated.source.contains("    return fn2(n, 1)")
+                && !generated.source.contains("\n\n\n"),
+            "{}",
+            generated.source
+        );
+
+        let result_without_comments = decompile(&chunk, {
+            let mut options = DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            };
+            options.generate.comment = false;
+            options
+        })
+        .expect("generate stage without comments should succeed");
+        let generated_without_comments = result_without_comments
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        assert!(
+            !generated_without_comments.source.starts_with("-- file:")
+                && !generated_without_comments.source.contains("-- proto#"),
+            "{}",
+            generated_without_comments.source
+        );
+    }
 }
 
 fn compile_lua_case(dialect_label: &str, source_relative: &str) -> Vec<u8> {
