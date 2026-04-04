@@ -6,8 +6,8 @@
 use std::fmt;
 
 use crate::generate::GenerateOptions;
-use crate::naming::NamingOptions;
-use crate::parser::ParseOptions;
+use crate::naming::{NamingMode, NamingOptions};
+use crate::parser::{ParseMode, ParseOptions, StringDecodeMode, StringEncoding};
 use crate::readability::ReadabilityOptions;
 
 use super::debug::DebugOptions;
@@ -76,12 +76,24 @@ impl Default for DecompileOptions {
     fn default() -> Self {
         Self {
             dialect: DecompileDialect::Lua51,
-            parse: ParseOptions::default(),
-            // 默认仍停在 parse，是为了保留当前最常用的 parser 调试工作流。
-            target_stage: DecompileStage::Parse,
+            parse: ParseOptions {
+                mode: ParseMode::Permissive,
+                string_encoding: StringEncoding::Utf8,
+                string_decode_mode: StringDecodeMode::Strict,
+            },
+            // 默认更偏向直接拿到最终源码，仓库内 CLI / wasm / 集成调用方都共享这套预期。
+            target_stage: DecompileStage::Generate,
             debug: DebugOptions::default(),
-            readability: ReadabilityOptions::default(),
-            naming: NamingOptions::default(),
+            readability: ReadabilityOptions {
+                return_inline_max_complexity: 10,
+                index_inline_max_complexity: 10,
+                args_inline_max_complexity: 6,
+                access_base_inline_max_complexity: 5,
+            },
+            naming: NamingOptions {
+                mode: NamingMode::DebugLike,
+                debug_like_include_function: true,
+            },
             generate: GenerateOptions::default(),
         }
     }

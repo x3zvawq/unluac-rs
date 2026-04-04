@@ -32,6 +32,8 @@ pub enum DecompileError {
         stage: DecompileStage,
         completed_stage: DecompileStage,
     },
+    #[error("this build was compiled without debug dump support")]
+    DebugUnavailable,
     #[error("requested debug output for stage `{stage}`, but that stage has no artifact yet")]
     MissingStageOutput { stage: DecompileStage },
 }

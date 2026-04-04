@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use unluac::decompile::{
-    DebugColorMode, DecompileDialect, DecompileStage, decompile, render_timing_report,
-    repo_debug_decompile_options,
+    DebugColorMode, DecompileDialect, DecompileOptions, DecompileStage, decompile,
+    render_timing_report,
 };
 
 /// 开发时最常改的是这几个常量，直接编辑代码通常比来回敲命令更顺手。
@@ -25,7 +25,7 @@ enum CompilerProtocol {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let options = repo_debug_decompile_options();
+    let options = DecompileOptions::default();
     let dialect = options.dialect;
     let debug_detail = options.debug.detail;
     let source = repo_root.join(SOURCE);

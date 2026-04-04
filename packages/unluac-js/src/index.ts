@@ -7,45 +7,22 @@ export type UnluacDialect =
   | "luajit"
   | "luau";
 
-export type UnluacStage =
-  | "parse"
-  | "transform"
-  | "cfg"
-  | "graph-facts"
-  | "dataflow"
-  | "structure-facts"
-  | "hir"
-  | "ast"
-  | "readability"
-  | "naming"
-  | "generate";
-
 export type UnluacParseMode = "strict" | "permissive";
 export type UnluacStringEncoding = "utf-8" | "gbk";
 export type UnluacStringDecodeMode = "strict" | "lossy";
-export type UnluacDebugDetail = "summary" | "normal" | "verbose";
-export type UnluacDebugColorMode = "auto" | "always" | "never";
 export type UnluacNamingMode = "debug-like" | "simple" | "heuristic";
 export type UnluacQuoteStyle = "prefer-double" | "prefer-single" | "min-escape";
 export type UnluacTableStyle = "compact" | "balanced" | "expanded";
 
 export interface UnluacDecompileOptions {
   dialect?: UnluacDialect;
-  targetStage?: UnluacStage;
   parse?: {
     mode?: UnluacParseMode;
     stringEncoding?: UnluacStringEncoding;
     stringDecodeMode?: UnluacStringDecodeMode;
   };
-  debug?: {
-    outputStages?: UnluacStage[];
-    timing?: boolean;
-    color?: UnluacDebugColorMode;
-    detail?: UnluacDebugDetail;
-    filters?: {
-      proto?: number;
-    };
-  };
+  // The published npm package ships a slim wasm build and rejects debug/timing options.
+  debug?: never;
   readability?: {
     returnInlineMaxComplexity?: number;
     indexInlineMaxComplexity?: number;
@@ -66,29 +43,11 @@ export interface UnluacDecompileOptions {
   };
 }
 
-export interface UnluacDebugOutput {
-  stage: UnluacStage;
-  detail: UnluacDebugDetail;
-  content: string;
-}
-
-export interface UnluacDecompileResult {
-  dialect: UnluacDialect;
-  targetStage: UnluacStage;
-  completedStage: UnluacStage | null;
-  generatedSource: string | null;
-  debugOutput: UnluacDebugOutput[];
-  timingReport: string | null;
-}
-
 export interface UnluacSupportedOptionValues {
   dialects: UnluacDialect[];
-  stages: UnluacStage[];
   parseModes: UnluacParseMode[];
   stringEncodings: UnluacStringEncoding[];
   stringDecodeModes: UnluacStringDecodeMode[];
-  debugDetails: UnluacDebugDetail[];
-  debugColors: UnluacDebugColorMode[];
   namingModes: UnluacNamingMode[];
   quoteStyles: UnluacQuoteStyle[];
   tableStyles: UnluacTableStyle[];
@@ -103,7 +62,7 @@ type WasmInitArgument =
 
 interface WasmBindings {
   default(input?: WasmInitArgument): Promise<unknown>;
-  decompile(bytes: Uint8Array, options: UnluacDecompileOptions): UnluacDecompileResult;
+  decompile(bytes: Uint8Array, options: UnluacDecompileOptions): string;
   supportedOptionValues(): UnluacSupportedOptionValues;
 }
 
@@ -173,7 +132,7 @@ export async function init(input?: UnluacInitInput | Promise<UnluacInitInput>): 
 export async function decompile(
   bytes: UnluacBytes,
   options: UnluacDecompileOptions = {}
-): Promise<UnluacDecompileResult> {
+): Promise<string> {
   await init();
   const bindings = await loadBindings();
   return bindings.decompile(toUint8Array(bytes), options);

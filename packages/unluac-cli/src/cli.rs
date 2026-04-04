@@ -15,7 +15,6 @@ use clap::{Parser, builder::BoolishValueParser};
 use unluac::decompile::{
     DebugColorMode, DebugDetail, DebugFilters, DecompileDialect, DecompileOptions, DecompileStage,
     GenerateMode, NamingMode, QuoteStyle, TableStyle, decompile, render_timing_report,
-    repo_debug_decompile_options,
 };
 use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
@@ -38,7 +37,7 @@ struct CliOptions {
 #[command(
     name = "unluac",
     version,
-    about = "Decompile Lua, LuaJIT, and Luau bytecode or source inputs.",
+    about = "Decompile Lua, LuaJIT, and Luau bytecode inputs, or source inputs when an external compiler is available.",
     disable_help_subcommand = true
 )]
 struct CliArgs {
@@ -48,13 +47,14 @@ struct CliArgs {
     /// Existing compiled chunk path.
     #[arg(long, conflicts_with = "source", required_unless_present = "source")]
     input: Option<PathBuf>,
-    /// Lua source path to compile before decompilation.
+    /// Lua source path to compile before decompilation. Requires an external compiler via `--luac`,
+    /// a bundled compiler under `lua/build/<dialect>/`, or a compatible compiler on PATH.
     #[arg(long, conflicts_with = "input", required_unless_present = "input")]
     source: Option<PathBuf>,
-    /// Enable debug output using the repo debug preset.
+    /// Enable debug output using the default final-source preset.
     #[arg(long)]
     debug: bool,
-    /// Override bundled compiler path.
+    /// Override the external compiler path used by `--source`.
     #[arg(long)]
     luac: Option<PathBuf>,
     /// String decoding encoding.
@@ -195,7 +195,7 @@ where
         }
     };
 
-    let mut decompile = repo_debug_decompile_options();
+    let mut decompile = DecompileOptions::default();
     let has_explicit_dump = !args.dump.is_empty();
     let has_explicit_debug_output = args.debug
         || has_explicit_dump
@@ -236,7 +236,7 @@ where
         if has_explicit_dump {
             decompile.debug.output_stages = args.dump;
         } else {
-            // 只要显式请求了 debug 输出但没指定 dump，就沿用 repo preset
+            // 只要显式请求了 debug 输出但没指定 dump，就沿用默认 preset
             // 的“当前目标阶段”约定，而不是静默什么都不打印。
             decompile.debug.output_stages = vec![decompile.target_stage];
         }

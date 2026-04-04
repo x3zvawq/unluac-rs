@@ -60,7 +60,13 @@ async function buildWasmArtifacts(): Promise<void> {
       "unluac_wasm",
       "--release",
     ],
-    wasmCrateDir
+    wasmCrateDir,
+    {
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1",
+      CARGO_PROFILE_RELEASE_LTO: "fat",
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "z",
+      CARGO_PROFILE_RELEASE_PANIC: "abort",
+    }
   );
 }
 
@@ -73,6 +79,7 @@ async function buildPublishPackageJson() {
     name: sourcePackageJson.name,
     version: sourcePackageJson.version,
     description: sourcePackageJson.description,
+    keywords: sourcePackageJson.keywords,
     license: sourcePackageJson.license,
     repository: sourcePackageJson.repository,
     type: "module",
@@ -104,20 +111,47 @@ async function buildPublishPackageJson() {
   };
 }
 
-async function runCommand(command: string, args: string[], cwd: string): Promise<void> {
+async function runCommand(
+  command: string,
+  args: string[],
+  cwd: string,
+  extraEnv: Record<string, string> = {}
+): Promise<void> {
   await new Promise<void>((resolvePromise, rejectPromise) => {
     const child = spawn(command, args, {
       cwd,
+      env: {
+        ...process.env,
+        ...extraEnv,
+      },
       stdio: "inherit",
     });
 
-    child.on("exit", (code) => {
-      if (code === 0) {
-        resolvePromise();
-        return;
-      }
-      rejectPromise(new Error(`${command} exited with code ${code ?? "unknown"}`));
+    const formattedCommand = [command, ...args].join(" ");
+
+    child.on("error", (error) => {
+      rejectPromise(
+        new Error(
+          `failed to start ${formattedCommand} in ${cwd}: ${error.message}`
+        )
+      );
     });
-    child.on("error", rejectPromise);
+    child.on("close", (code, signal) => {
+      if (signal) {
+        rejectPromise(
+          new Error(
+            `${formattedCommand} was terminated by signal ${signal} (cwd: ${cwd})`
+          )
+        );
+      } else if (code !== 0) {
+        rejectPromise(
+          new Error(
+            `${formattedCommand} exited with code ${code ?? "unknown"} (cwd: ${cwd})`
+          )
+        );
+      } else {
+        resolvePromise();
+      }
+    });
   });
 }

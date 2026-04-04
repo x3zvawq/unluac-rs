@@ -2,3 +2,4 @@
 /lua/.tmp
 /lua/build
 /lua/sources
+.DS_Store

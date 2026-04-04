@@ -331,7 +331,7 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "unluac"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "encoding_rs",
  "owo-colors",
@@ -341,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "unluac-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "unluac",
@@ -349,14 +349,14 @@ dependencies = [
 
 [[package]]
 name = "unluac-test-support"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "unluac",
 ]
 
 [[package]]
 name = "unluac-wasm"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde-wasm-bindgen",
@@ -515,7 +515,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "indicatif",

@@ -2,6 +2,8 @@
 
 [简体中文](./README.md) | English
 
+> This repository is still in a testing phase, and its behavior, APIs, and output details may continue to evolve. Bug reports, problematic test cases, incompatibility findings, usage feedback, and release-related suggestions are all very welcome.
+
 ## Introduction
 
 A Lua decompiler written in Rust with support for multiple dialects. The repository currently supports the following Lua versions and dialects:
@@ -51,7 +53,8 @@ cargo run -p unluac-cli -- --input /absolute/path/to/chunk.out --dialect=lua5.1
 Notes:
 
 - The CLI currently requires you to pass either `--input` or `--source`
-- When `--source` is provided, the CLI first invokes the compiler under `lua/build/<dialect>/`, then decompiles the generated chunk
+- When `--source` is provided, the CLI first invokes an external compiler to produce a chunk, then decompiles that generated chunk
+- The standalone `unluac-cli` binaries published on GitHub Release do not bundle a Lua compiler; `--source` only works when you pass `--luac` explicitly, or when a compatible compiler is available under `lua/build/<dialect>/` or on PATH
 - The CLI prints plain generated source by default and does not emit debug dumps
 - The default dialect / parse / readability / naming / generate values still share the same repo debug preset used by [examples/debug.rs](./examples/debug.rs)
 - If you want repo-debug-style dump output, explicitly add `--debug`
@@ -59,7 +62,8 @@ Notes:
 | Argument | Description | Default |
 | - | - | - |
 | `--input` | Path to a compiled chunk | None |
-| `--source` | Path to Lua source; the CLI compiles it before decompiling | None |
+| `--source` | Path to Lua source; the CLI invokes an external compiler before decompiling | None |
+| `--luac` | Explicit compiler path used by `--source` | First tries `lua/build/<dialect>/`, otherwise falls back to a compatible compiler on PATH |
 | `--dialect` | Dialect used for compilation / decompilation | `lua5.1` |
 | `--stop-after` | Last pipeline stage to run | `generate` |
 | `--debug` | Enable debug dumps | `false` |
@@ -123,6 +127,9 @@ The npm wrapper lives at [packages/unluac-js](./packages/unluac-js).
 
 It is currently a thin TypeScript wrapper that consumes the wasm bindings produced by `packages/unluac-wasm` and narrows the publishable contents to `dist/`.
 
+The published npm wasm build trims out `debug` / `timing` support to keep the package smaller. The CLI and in-repo Rust APIs still keep the full debugging surface.
+The npm-facing `decompile()` API also returns the final source string directly instead of exposing intermediate pipeline metadata.
+
 Local build:
 
 ```bash
@@ -150,12 +157,11 @@ import { decompile } from "unluac-js";
 import { readFile } from "node:fs/promises";
 
 const chunkBytes = await readFile("./sample.luac");
-const result = await decompile(chunkBytes, {
+const source = await decompile(chunkBytes, {
   dialect: "lua5.1",
-  targetStage: "generate",
 });
 
-console.log(result.generatedSource);
+console.log(source);
 ```
 
 For browser usage and more complete examples, see [packages/unluac-js/README.md](./packages/unluac-js/README.md).

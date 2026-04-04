@@ -1,4 +1,5 @@
 import { readFile, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import process from "node:process";
@@ -6,6 +7,7 @@ import process from "node:process";
 const repoRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const checkOnly = process.argv.includes("--check");
 const printVersion = process.argv.includes("--print-version");
+let shouldRefreshNpmLockfile = false;
 
 const rootManifestPath = resolve(repoRoot, "Cargo.toml");
 const targetFiles = [
@@ -14,6 +16,7 @@ const targetFiles = [
   { kind: "cargo", path: "packages/unluac-test-support/Cargo.toml" },
   { kind: "cargo", path: "packages/unluac-wasm/Cargo.toml" },
   { kind: "json", path: "packages/unluac-js/package.json" },
+  { kind: "package-lock", path: "packages/unluac-js/package-lock.json" },
 ];
 
 const rootManifest = await readFile(rootManifestPath, "utf8");
@@ -43,10 +46,19 @@ for (const target of targetFiles) {
 
   const packageJsonRaw = await readFile(absolutePath, "utf8");
   const packageJson = JSON.parse(packageJsonRaw);
-  if (packageJson.version !== rootVersion) {
-    mismatches.push(`${target.path}: ${packageJson.version} -> ${rootVersion}`);
+  const currentVersion =
+    target.kind === "package-lock" ? extractPackageLockVersion(packageJson, target.path) : packageJson.version;
+  if (currentVersion !== rootVersion) {
+    mismatches.push(`${target.path}: ${currentVersion} -> ${rootVersion}`);
     if (!checkOnly) {
-      packageJson.version = rootVersion;
+      if (target.path === "packages/unluac-js/package.json") {
+        shouldRefreshNpmLockfile = true;
+      }
+      if (target.kind === "package-lock") {
+        setPackageLockVersion(packageJson, rootVersion);
+      } else {
+        packageJson.version = rootVersion;
+      }
       await writeFile(absolutePath, `${JSON.stringify(packageJson, null, 2)}\n`);
     }
   }
@@ -73,10 +85,15 @@ if (checkOnly) {
   process.exit(1);
 }
 
+if (shouldRefreshNpmLockfile) {
+  await runCommand("npm", ["install", "--package-lock-only"], resolve(repoRoot, "packages/unluac-js"));
+}
+
 process.stdout.write(
   [
     `synced package versions to ${rootVersion}:`,
     ...mismatches.map((entry) => `  - ${entry}`),
+    ...(shouldRefreshNpmLockfile ? ["  - refreshed packages/unluac-js/package-lock.json via npm"] : []),
     "",
   ].join("\n")
 );
@@ -106,4 +123,49 @@ function replaceCargoPackageVersion(content, nextVersion, label) {
   }
 
   return updated;
+}
+
+function extractPackageLockVersion(packageLock, label) {
+  const rootPackageVersion = packageLock?.packages?.[""]?.version;
+  if (typeof packageLock.version !== "string" || typeof rootPackageVersion !== "string") {
+    throw new Error(`failed to find package-lock version fields in ${label}`);
+  }
+  if (packageLock.version !== rootPackageVersion) {
+    throw new Error(
+      `package-lock top-level version ${packageLock.version} does not match root package version ${rootPackageVersion} in ${label}`
+    );
+  }
+  return packageLock.version;
+}
+
+function setPackageLockVersion(packageLock, nextVersion) {
+  packageLock.version = nextVersion;
+  if (packageLock.packages?.[""]) {
+    packageLock.packages[""].version = nextVersion;
+  }
+}
+
+async function runCommand(command, args, cwd) {
+  await new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(command, args, {
+      cwd,
+      stdio: "inherit",
+    });
+
+    child.on("error", (error) => {
+      rejectPromise(
+        new Error(`failed to start ${command} ${args.join(" ")} in ${cwd}: ${error.message}`)
+      );
+    });
+
+    child.on("close", (code, signal) => {
+      if (signal) {
+        rejectPromise(new Error(`${command} ${args.join(" ")} was terminated by signal ${signal}`));
+      } else if (code !== 0) {
+        rejectPromise(new Error(`${command} ${args.join(" ")} exited with code ${code ?? "unknown"}`));
+      } else {
+        resolvePromise();
+      }
+    });
+  });
 }

@@ -1,6 +1,6 @@
 [package]
 name = "unluac"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "Multi-dialect Lua decompiler written in Rust."
 license = "MIT"
@@ -17,6 +17,11 @@ exclude = [
     "tests/**",
     "xtask/**"
 ]
+
+[features]
+default = ["decompile-debug", "timing-report"]
+decompile-debug = []
+timing-report = []
 
 [lints]
 workspace = true

@@ -1,16 +1,25 @@
 //! 这个文件实现主 pipeline 共享的调试调度逻辑。
 //!
-//! 各层具体如何渲染自己的 dump，应该尽量贴着实现放置；这里仅保留跨层共用的
-//! 选项、阶段包装和主 pipeline 的分派逻辑，避免再次长成一个巨型总控文件。
+//! 默认构建会保留完整调试导出能力，方便 CLI 和仓库内调试工作流复用；
+//! 当关闭 `decompile-debug` feature 时，这里会退化成只保留公共类型与空实现，
+//! 让 wasm 发布产物不再把各阶段 dump 渲染逻辑一起打包进去。
 
+#[cfg(feature = "decompile-debug")]
 use crate::ast;
+#[cfg(feature = "decompile-debug")]
 use crate::cfg;
 use crate::debug::{DebugDetail, DebugFilters};
+#[cfg(feature = "decompile-debug")]
 use crate::generate;
+#[cfg(feature = "decompile-debug")]
 use crate::hir;
+#[cfg(feature = "decompile-debug")]
 use crate::naming;
+#[cfg(feature = "decompile-debug")]
 use crate::parser;
+#[cfg(feature = "decompile-debug")]
 use crate::structure;
+#[cfg(feature = "decompile-debug")]
 use crate::transformer;
 
 use super::error::DecompileError;
@@ -36,6 +45,7 @@ pub struct StageDebugOutput {
 }
 
 /// 对外保留 parser 阶段的统一包装，方便库层调用方继续从 decompile 命名空间访问。
+#[cfg(feature = "decompile-debug")]
 pub fn dump_parser(
     chunk: &crate::parser::RawChunk,
     options: &DebugOptions,
@@ -47,7 +57,17 @@ pub fn dump_parser(
     })
 }
 
+/// 对外保留 parser 阶段的统一包装，方便库层调用方继续从 decompile 命名空间访问。
+#[cfg(not(feature = "decompile-debug"))]
+pub fn dump_parser(
+    _chunk: &crate::parser::RawChunk,
+    _options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Err(DecompileError::DebugUnavailable)
+}
+
 /// 对外保留 transformer 阶段的统一包装，方便库层调用方继续从 decompile 命名空间访问。
+#[cfg(feature = "decompile-debug")]
 pub fn dump_lir(
     chunk: &crate::transformer::LoweredChunk,
     options: &DebugOptions,
@@ -59,7 +79,17 @@ pub fn dump_lir(
     })
 }
 
+/// 对外保留 transformer 阶段的统一包装，方便库层调用方继续从 decompile 命名空间访问。
+#[cfg(not(feature = "decompile-debug"))]
+pub fn dump_lir(
+    _chunk: &crate::transformer::LoweredChunk,
+    _options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Err(DecompileError::DebugUnavailable)
+}
+
 /// 对外保留 CFG 阶段的统一包装，方便库层调用方继续从 decompile 命名空间访问。
+#[cfg(feature = "decompile-debug")]
 pub fn dump_cfg(
     graph: &crate::cfg::CfgGraph,
     options: &DebugOptions,
@@ -71,7 +101,17 @@ pub fn dump_cfg(
     })
 }
 
+/// 对外保留 CFG 阶段的统一包装，方便库层调用方继续从 decompile 命名空间访问。
+#[cfg(not(feature = "decompile-debug"))]
+pub fn dump_cfg(
+    _graph: &crate::cfg::CfgGraph,
+    _options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Err(DecompileError::DebugUnavailable)
+}
+
 /// 对外保留 GraphFacts 阶段的统一包装。
+#[cfg(feature = "decompile-debug")]
 pub fn dump_graph_facts(
     graph_facts: &crate::cfg::GraphFacts,
     options: &DebugOptions,
@@ -88,7 +128,17 @@ pub fn dump_graph_facts(
     })
 }
 
+/// 对外保留 GraphFacts 阶段的统一包装。
+#[cfg(not(feature = "decompile-debug"))]
+pub fn dump_graph_facts(
+    _graph_facts: &crate::cfg::GraphFacts,
+    _options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Err(DecompileError::DebugUnavailable)
+}
+
 /// 对外保留 Dataflow 阶段的统一包装。
+#[cfg(feature = "decompile-debug")]
 pub fn dump_dataflow(
     lowered: &crate::transformer::LoweredChunk,
     cfg_graph: &crate::cfg::CfgGraph,
@@ -109,7 +159,19 @@ pub fn dump_dataflow(
     })
 }
 
+/// 对外保留 Dataflow 阶段的统一包装。
+#[cfg(not(feature = "decompile-debug"))]
+pub fn dump_dataflow(
+    _lowered: &crate::transformer::LoweredChunk,
+    _cfg_graph: &crate::cfg::CfgGraph,
+    _dataflow: &crate::cfg::DataflowFacts,
+    _options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Err(DecompileError::DebugUnavailable)
+}
+
 /// 对外保留 StructureFacts 阶段的统一包装。
+#[cfg(feature = "decompile-debug")]
 pub fn dump_structure(
     structure_facts: &crate::structure::StructureFacts,
     options: &DebugOptions,
@@ -126,7 +188,17 @@ pub fn dump_structure(
     })
 }
 
+/// 对外保留 StructureFacts 阶段的统一包装。
+#[cfg(not(feature = "decompile-debug"))]
+pub fn dump_structure(
+    _structure_facts: &crate::structure::StructureFacts,
+    _options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Err(DecompileError::DebugUnavailable)
+}
+
 /// 对外保留 HIR 阶段的统一包装。
+#[cfg(feature = "decompile-debug")]
 pub fn dump_hir(
     hir_module: &crate::hir::HirModule,
     options: &DebugOptions,
@@ -138,7 +210,17 @@ pub fn dump_hir(
     })
 }
 
+/// 对外保留 HIR 阶段的统一包装。
+#[cfg(not(feature = "decompile-debug"))]
+pub fn dump_hir(
+    _hir_module: &crate::hir::HirModule,
+    _options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Err(DecompileError::DebugUnavailable)
+}
+
 /// 对外保留 AST 阶段的统一包装。
+#[cfg(feature = "decompile-debug")]
 pub fn dump_ast(
     ast_module: &crate::ast::AstModule,
     options: &DebugOptions,
@@ -150,7 +232,17 @@ pub fn dump_ast(
     })
 }
 
+/// 对外保留 AST 阶段的统一包装。
+#[cfg(not(feature = "decompile-debug"))]
+pub fn dump_ast(
+    _ast_module: &crate::ast::AstModule,
+    _options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Err(DecompileError::DebugUnavailable)
+}
+
 /// 对外保留 Readability 阶段的统一包装。
+#[cfg(feature = "decompile-debug")]
 pub fn dump_readability(
     ast_module: &crate::ast::AstModule,
     options: &DebugOptions,
@@ -162,7 +254,17 @@ pub fn dump_readability(
     })
 }
 
+/// 对外保留 Readability 阶段的统一包装。
+#[cfg(not(feature = "decompile-debug"))]
+pub fn dump_readability(
+    _ast_module: &crate::ast::AstModule,
+    _options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Err(DecompileError::DebugUnavailable)
+}
+
 /// 对外保留 Naming 阶段的统一包装。
+#[cfg(feature = "decompile-debug")]
 pub fn dump_naming(
     names: &crate::naming::NameMap,
     options: &DebugOptions,
@@ -174,7 +276,17 @@ pub fn dump_naming(
     })
 }
 
+/// 对外保留 Naming 阶段的统一包装。
+#[cfg(not(feature = "decompile-debug"))]
+pub fn dump_naming(
+    _names: &crate::naming::NameMap,
+    _options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Err(DecompileError::DebugUnavailable)
+}
+
 /// 对外保留 Generate 阶段的统一包装。
+#[cfg(feature = "decompile-debug")]
 pub fn dump_generate(
     chunk: &crate::generate::GeneratedChunk,
     options: &DebugOptions,
@@ -186,6 +298,16 @@ pub fn dump_generate(
     })
 }
 
+/// 对外保留 Generate 阶段的统一包装。
+#[cfg(not(feature = "decompile-debug"))]
+pub fn dump_generate(
+    _chunk: &crate::generate::GeneratedChunk,
+    _options: &DebugOptions,
+) -> Result<StageDebugOutput, DecompileError> {
+    Err(DecompileError::DebugUnavailable)
+}
+
+#[cfg(feature = "decompile-debug")]
 pub(crate) fn collect_stage_dump(
     state: &DecompileState,
     stage: DecompileStage,
@@ -269,4 +391,13 @@ pub(crate) fn collect_stage_dump(
             dump_generate(chunk, options).map(Some)
         }
     }
+}
+
+#[cfg(not(feature = "decompile-debug"))]
+pub(crate) fn collect_stage_dump(
+    _state: &DecompileState,
+    _stage: DecompileStage,
+    _options: &DebugOptions,
+) -> Result<Option<StageDebugOutput>, DecompileError> {
+    Ok(None)
 }

@@ -1,12 +1,21 @@
 {
   "name": "unluac-js",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "description": "JavaScript wrapper package for the unluac WebAssembly build.",
+  "keywords": [
+    "lua",
+    "decompiler",
+    "luac",
+    "bytecode",
+    "wasm",
+    "luajit",
+    "luau"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/X3ZvaWQ/unluac-rs.git",
+    "url": "git+https://github.com/x3zvawq/unluac-rs.git",
     "directory": "packages/unluac-js"
   },
   "type": "module",

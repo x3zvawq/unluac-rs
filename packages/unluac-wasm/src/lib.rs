@@ -6,13 +6,13 @@
 //! 这样 CLI、wasm 和后续 `unluac-js` 都能共享同一套枚举协议，而不是各自依赖
 //! Rust enum 的内部表示。
 
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
 use unluac::decompile::{
-    DebugColorMode, DebugDetail, DebugFilters, DecompileDialect, DecompileOptions, DecompileResult,
-    DecompileStage, NamingMode, QuoteStyle, TableStyle, decompile as run_decompile,
-    render_timing_report,
+    DecompileDialect, DecompileOptions, NamingMode, QuoteStyle, TableStyle,
+    decompile as run_decompile,
 };
 use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
@@ -22,9 +22,8 @@ pub use unluac as core;
 #[serde(rename_all = "camelCase", default)]
 struct WasmDecompileOptions {
     dialect: Option<String>,
-    target_stage: Option<String>,
     parse: Option<WasmParseOptions>,
-    debug: Option<WasmDebugOptions>,
+    debug: Option<IgnoredAny>,
     readability: Option<WasmReadabilityOptions>,
     naming: Option<WasmNamingOptions>,
     generate: Option<WasmGenerateOptions>,
@@ -36,22 +35,6 @@ struct WasmParseOptions {
     mode: Option<String>,
     string_encoding: Option<String>,
     string_decode_mode: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-struct WasmDebugOptions {
-    output_stages: Vec<String>,
-    timing: bool,
-    color: Option<String>,
-    detail: Option<String>,
-    filters: Option<WasmDebugFilters>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-struct WasmDebugFilters {
-    proto: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -83,33 +66,11 @@ struct WasmGenerateOptions {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct WasmDecompileResultPayload {
-    dialect: String,
-    target_stage: String,
-    completed_stage: Option<String>,
-    generated_source: Option<String>,
-    debug_output: Vec<WasmStageDebugOutput>,
-    timing_report: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WasmStageDebugOutput {
-    stage: String,
-    detail: String,
-    content: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct WasmSupportedOptionValues {
     dialects: Vec<&'static str>,
-    stages: Vec<&'static str>,
     parse_modes: Vec<&'static str>,
     string_encodings: Vec<&'static str>,
     string_decode_modes: Vec<&'static str>,
-    debug_details: Vec<&'static str>,
-    debug_colors: Vec<&'static str>,
     naming_modes: Vec<&'static str>,
     quote_styles: Vec<&'static str>,
     table_styles: Vec<&'static str>,
@@ -128,25 +89,33 @@ type BridgeResult<T> = Result<T, WasmBridgeError>;
 #[wasm_bindgen(js_name = decompile)]
 pub fn decompile_wasm(bytes: &[u8], options: JsValue) -> Result<JsValue, JsValue> {
     let options = parse_wasm_options(options).map_err(WasmBridgeError::into_js_value)?;
-    let debug_detail = options.debug.detail;
-    let debug_color = options.debug.color;
     let result = run_decompile(bytes, options).map_err(|error| {
         WasmBridgeError::new("decompile-failed", error.to_string(), None).into_js_value()
     })?;
 
-    to_js_value(&project_result(result, debug_detail, debug_color))
+    let generated_source = result
+        .state
+        .generated
+        .map(|generated| generated.source)
+        .ok_or_else(|| {
+            WasmBridgeError::new(
+                "missing-generated-source",
+                "expected generate stage output, but no source was produced",
+                None,
+            )
+            .into_js_value()
+        })?;
+
+    to_js_value(&generated_source)
 }
 
 #[wasm_bindgen(js_name = supportedOptionValues)]
 pub fn supported_option_values() -> Result<JsValue, JsValue> {
     to_js_value(&WasmSupportedOptionValues {
         dialects: dialect_labels(),
-        stages: stage_labels(),
         parse_modes: parse_mode_labels(),
         string_encodings: string_encoding_labels(),
         string_decode_modes: string_decode_mode_labels(),
-        debug_details: debug_detail_labels(),
-        debug_colors: debug_color_labels(),
         naming_modes: naming_mode_labels(),
         quote_styles: quote_style_labels(),
         table_styles: table_style_labels(),
@@ -166,22 +135,20 @@ fn parse_wasm_options(value: JsValue) -> BridgeResult<DecompileOptions> {
 
 impl WasmDecompileOptions {
     fn into_core_options(self) -> BridgeResult<DecompileOptions> {
-        let mut options = DecompileOptions {
-            target_stage: DecompileStage::Generate,
-            ..DecompileOptions::default()
-        };
+        let mut options = default_wasm_decompile_options();
 
         if let Some(value) = self.dialect {
             options.dialect = parse_option("dialect", &value, DecompileDialect::parse)?;
         }
-        if let Some(value) = self.target_stage {
-            options.target_stage = parse_option("targetStage", &value, DecompileStage::parse)?;
-        }
         if let Some(parse) = self.parse {
             parse.apply(&mut options)?;
         }
-        if let Some(debug) = self.debug {
-            debug.apply(&mut options)?;
+        if self.debug.is_some() {
+            return Err(WasmBridgeError::new(
+                "unsupported-option",
+                "the published wasm build omits debug and timing support to keep the bundle small",
+                Some("debug"),
+            ));
         }
         if let Some(readability) = self.readability {
             readability.apply(&mut options);
@@ -210,32 +177,6 @@ impl WasmParseOptions {
             options.parse.string_decode_mode =
                 parse_option("parse.stringDecodeMode", &value, StringDecodeMode::parse)?;
         }
-        Ok(())
-    }
-}
-
-impl WasmDebugOptions {
-    fn apply(self, options: &mut DecompileOptions) -> BridgeResult<()> {
-        options.debug.enable = true;
-        options.debug.output_stages = self
-            .output_stages
-            .into_iter()
-            .map(|value| parse_option("debug.outputStages[]", &value, DecompileStage::parse))
-            .collect::<BridgeResult<Vec<_>>>()?;
-        options.debug.timing = self.timing;
-
-        if let Some(value) = self.color {
-            options.debug.color = parse_option("debug.color", &value, DebugColorMode::parse)?;
-        }
-        if let Some(value) = self.detail {
-            options.debug.detail = parse_option("debug.detail", &value, DebugDetail::parse)?;
-        }
-        if let Some(filters) = self.filters {
-            options.debug.filters = DebugFilters {
-                proto: filters.proto,
-            };
-        }
-
         Ok(())
     }
 }
@@ -309,33 +250,8 @@ fn parse_option<T>(
     })
 }
 
-fn project_result(
-    result: DecompileResult,
-    debug_detail: DebugDetail,
-    debug_color: DebugColorMode,
-) -> WasmDecompileResultPayload {
-    WasmDecompileResultPayload {
-        dialect: result.state.dialect.label().to_owned(),
-        target_stage: result.state.target_stage.label().to_owned(),
-        completed_stage: result
-            .state
-            .completed_stage
-            .map(|stage| stage.label().to_owned()),
-        generated_source: result.state.generated.map(|generated| generated.source),
-        debug_output: result
-            .debug_output
-            .into_iter()
-            .map(|output| WasmStageDebugOutput {
-                stage: output.stage.label().to_owned(),
-                detail: output.detail.label().to_owned(),
-                content: output.content,
-            })
-            .collect(),
-        timing_report: result
-            .timing_report
-            .as_ref()
-            .map(|report| render_timing_report(report, debug_detail, debug_color)),
-    }
+fn default_wasm_decompile_options() -> DecompileOptions {
+    DecompileOptions::default()
 }
 
 impl WasmBridgeError {
@@ -376,25 +292,6 @@ fn dialect_labels() -> Vec<&'static str> {
     .collect()
 }
 
-fn stage_labels() -> Vec<&'static str> {
-    [
-        DecompileStage::Parse,
-        DecompileStage::Transform,
-        DecompileStage::Cfg,
-        DecompileStage::GraphFacts,
-        DecompileStage::Dataflow,
-        DecompileStage::StructureFacts,
-        DecompileStage::Hir,
-        DecompileStage::Ast,
-        DecompileStage::Readability,
-        DecompileStage::Naming,
-        DecompileStage::Generate,
-    ]
-    .into_iter()
-    .map(DecompileStage::label)
-    .collect()
-}
-
 fn parse_mode_labels() -> Vec<&'static str> {
     [ParseMode::Strict, ParseMode::Permissive]
         .into_iter()
@@ -414,28 +311,6 @@ fn string_decode_mode_labels() -> Vec<&'static str> {
         .into_iter()
         .map(StringDecodeMode::label)
         .collect()
-}
-
-fn debug_detail_labels() -> Vec<&'static str> {
-    [
-        DebugDetail::Summary,
-        DebugDetail::Normal,
-        DebugDetail::Verbose,
-    ]
-    .into_iter()
-    .map(DebugDetail::label)
-    .collect()
-}
-
-fn debug_color_labels() -> Vec<&'static str> {
-    [
-        DebugColorMode::Auto,
-        DebugColorMode::Always,
-        DebugColorMode::Never,
-    ]
-    .into_iter()
-    .map(DebugColorMode::label)
-    .collect()
 }
 
 fn naming_mode_labels() -> Vec<&'static str> {
@@ -474,46 +349,35 @@ fn table_style_labels() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        WasmDebugOptions, WasmDecompileOptions, WasmGenerateOptions, WasmNamingOptions,
-        WasmParseOptions, parse_mode_labels, quote_style_labels, stage_labels,
+        WasmDecompileOptions, WasmGenerateOptions, WasmNamingOptions, WasmParseOptions,
+        default_wasm_decompile_options, parse_mode_labels, quote_style_labels,
     };
-    use unluac::decompile::{
-        DecompileDialect, DecompileOptions, DecompileStage, NamingMode, QuoteStyle, TableStyle,
-    };
+    use serde::de::IgnoredAny;
+    use unluac::decompile::{DecompileDialect, NamingMode, QuoteStyle, TableStyle};
     use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
     #[test]
-    fn wasm_options_default_to_generate_stage() {
+    fn wasm_options_default_to_repo_generate_preset() {
         let options = WasmDecompileOptions::default()
             .into_core_options()
             .expect("default wasm options should be valid");
 
-        assert_eq!(
-            options,
-            DecompileOptions {
-                target_stage: DecompileStage::Generate,
-                ..DecompileOptions::default()
-            }
-        );
+        assert_eq!(options, default_wasm_decompile_options());
+        assert_eq!(options.parse.mode, ParseMode::Permissive);
+        assert_eq!(options.naming.mode, NamingMode::DebugLike);
+        assert!(options.naming.debug_like_include_function);
     }
 
     #[test]
     fn wasm_options_map_nested_string_enums_into_core_options() {
         let options = WasmDecompileOptions {
             dialect: Some("luau".to_owned()),
-            target_stage: Some("naming".to_owned()),
             parse: Some(WasmParseOptions {
                 mode: Some("permissive".to_owned()),
                 string_encoding: Some("gbk".to_owned()),
                 string_decode_mode: Some("lossy".to_owned()),
             }),
-            debug: Some(WasmDebugOptions {
-                output_stages: vec!["hir".to_owned(), "generate".to_owned()],
-                timing: true,
-                color: Some("never".to_owned()),
-                detail: Some("verbose".to_owned()),
-                filters: Some(super::WasmDebugFilters { proto: Some(7) }),
-            }),
+            debug: None,
             readability: None,
             naming: Some(WasmNamingOptions {
                 mode: Some("heuristic".to_owned()),
@@ -532,25 +396,9 @@ mod tests {
         .expect("explicit wasm options should be valid");
 
         assert_eq!(options.dialect, DecompileDialect::Luau);
-        assert_eq!(options.target_stage, DecompileStage::Naming);
         assert_eq!(options.parse.mode, ParseMode::Permissive);
         assert_eq!(options.parse.string_encoding, StringEncoding::Gbk);
         assert_eq!(options.parse.string_decode_mode, StringDecodeMode::Lossy);
-        assert!(options.debug.enable);
-        assert_eq!(
-            options.debug.output_stages,
-            vec![DecompileStage::Hir, DecompileStage::Generate]
-        );
-        assert!(options.debug.timing);
-        assert_eq!(
-            options.debug.color,
-            unluac::decompile::DebugColorMode::Never
-        );
-        assert_eq!(
-            options.debug.detail,
-            unluac::decompile::DebugDetail::Verbose
-        );
-        assert_eq!(options.debug.filters.proto, Some(7));
         assert_eq!(options.naming.mode, NamingMode::Heuristic);
         assert!(!options.naming.debug_like_include_function);
         assert_eq!(options.generate.indent_width, 2);
@@ -575,8 +423,20 @@ mod tests {
     }
 
     #[test]
+    fn wasm_options_reject_debug_payloads() {
+        let error = WasmDecompileOptions {
+            debug: Some(IgnoredAny),
+            ..WasmDecompileOptions::default()
+        }
+        .into_core_options()
+        .expect_err("published wasm build should reject debug options");
+
+        assert_eq!(error.code, "unsupported-option");
+        assert_eq!(error.field, Some("debug"));
+    }
+
+    #[test]
     fn supported_value_lists_match_public_labels() {
-        assert_eq!(stage_labels().last().copied(), Some("generate"));
         assert_eq!(parse_mode_labels(), vec!["strict", "permissive"]);
         assert_eq!(
             quote_style_labels(),

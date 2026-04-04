@@ -2,6 +2,8 @@
 
 简体中文 | [English](./README_en.md)
 
+> 当前仓库仍处于测试阶段，行为、接口和输出细节后续都可能继续调整。非常欢迎提交反编译失败、输出不理想或存在兼容性问题的测试样例，也欢迎通过 issue / discussion 提出使用反馈、改进建议和发布体验上的意见。
+
 ## 简介
 
 一个基于 Rust 的、支持多种 dialect 的 Lua 反编译器，目前支持以下版本 / dialect：
@@ -51,7 +53,8 @@ cargo run -p unluac-cli -- --input /absolute/path/to/chunk.out --dialect=lua5.1
 说明：
 
 - CLI 当前要求你显式传入 `--input` 或 `--source`
-- 如果传入 `--source`，CLI 会先调用 `lua/build/<dialect>/` 下的编译器生成 chunk，再执行反编译
+- 如果传入 `--source`，CLI 会先调用外部编译器生成 chunk，再执行反编译
+- GitHub Release 提供的裸 `unluac-cli` 二进制不会自带 Lua 编译器；`--source` 只有在你显式传入 `--luac`，或运行环境中存在 `lua/build/<dialect>/` / PATH 上的兼容编译器时才可用
 - CLI 默认直接输出纯源码，不打印 debug dump
 - `generate` 阶段默认会在输出源码中附带 chunk / proto 注释元信息；可通过 `--comment false` 关闭
 - CLI 的 dialect / parse / readability / naming / generate 默认值仍与 [examples/debug.rs](./examples/debug.rs) 共用同一份 repo 调试 preset
@@ -60,7 +63,8 @@ cargo run -p unluac-cli -- --input /absolute/path/to/chunk.out --dialect=lua5.1
 | 参数 | 说明 | 默认值 |
 | - | - | - |
 | `--input` | 已编译 chunk 路径 | 无 |
-| `--source` | Lua 源码路径，CLI 会先编译再反编译 | 无 |
+| `--source` | Lua 源码路径，CLI 会先调用外部编译器，再执行反编译 | 无 |
+| `--luac` | 显式指定 `--source` 使用的外部编译器路径 | 先尝试仓库内 `lua/build/<dialect>/`，否则回退到 PATH 上的兼容编译器 |
 | `--dialect` | 反编译 / 编译时使用的 dialect | `lua5.1` |
 | `--stop-after` | 反编译 pipeline 截止阶段 | `generate` |
 | `--debug` | 启用 debug dump | `false` |
@@ -125,6 +129,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 它当前是一个很薄的 TypeScript 壳层，会调用 `packages/unluac-wasm` 产出的 wasm 绑定，并将最终发布内容收敛到 `dist/`。
 
+当前发布到 npm 的 wasm 构建会裁掉 `debug` / `timing` 相关能力，以控制包体积；CLI 与仓库内库接口仍保留完整调试能力。
+同时 npm 包的 `decompile()` 会直接返回最终源码字符串，不再暴露中间 pipeline 元信息。
+
 本地构建方式：
 
 ```bash
@@ -152,15 +159,14 @@ import { decompile } from "unluac-js";
 import { readFile } from "node:fs/promises";
 
 const chunkBytes = await readFile("./sample.luac");
-const result = await decompile(chunkBytes, {
+const source = await decompile(chunkBytes, {
   dialect: "lua5.1",
-  targetStage: "generate",
   generate: {
     comment: false,
   },
 });
 
-console.log(result.generatedSource);
+console.log(source);
 ```
 
 常用的 `generate` 选项包括：

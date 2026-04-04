@@ -24,15 +24,11 @@ const chunkBytes = await readFile("./sample.luac");
 const values = await supportedOptionValues();
 console.log(values.dialects);
 
-const result = await decompile(chunkBytes, {
-  dialect: "lua5.1",
-  targetStage: "generate",
-  generate: {
-    comment: false,
-  },
+const source = await decompile(chunkBytes, {
+  dialect: "lua5.1"
 });
 
-console.log(result.generatedSource);
+console.log(source);
 ```
 
 如果你想更早完成初始化，也可以手动先调用：
@@ -55,12 +51,11 @@ import { decompile, init } from "unluac-js";
 
 await init();
 
-const result = await decompile(chunkBytes, {
+const source = await decompile(chunkBytes, {
   dialect: "luau",
-  targetStage: "generate",
 });
 
-console.log(result.generatedSource);
+console.log(source);
 ```
 
 如果你需要显式指定 wasm 文件位置，也可以传入 URL：
@@ -70,9 +65,11 @@ import { init, decompile } from "unluac-js";
 
 await init(new URL("./unluac_wasm_bg.wasm", import.meta.url));
 
-const result = await decompile(chunkBytes, {
+const source = await decompile(chunkBytes, {
   dialect: "lua5.4",
 });
+
+console.log(source);
 ```
 
 ## 参数说明
@@ -80,10 +77,15 @@ const result = await decompile(chunkBytes, {
 `decompile(bytes, options?)` 的常用参数如下：
 
 - `dialect`: 目标字节码 dialect，如 `lua5.1`、`lua5.4`、`luajit`、`luau`
-- `targetStage`: 反编译 pipeline 截止阶段，默认 `generate`
 - `parse.stringEncoding`: 字符串解码编码，支持 `utf-8` 和 `gbk`
 - `parse.stringDecodeMode`: 字符串解码失败策略，支持 `strict` 和 `lossy`
 - `naming.mode`: 命名策略，支持 `debug-like`、`simple`、`heuristic`
+
+默认情况下，这个包会直接输出最终源码，并沿用仓库当前默认 preset：
+
+- `parse.mode = permissive`
+- `naming.mode = debug-like`
+- `naming.debugLikeIncludeFunction = true`
 
 `generate` 子选项：
 
