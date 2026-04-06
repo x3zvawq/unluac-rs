@@ -1,12 +1,12 @@
 # unluac-rs
 
-简体中文 | [English](./README_en.md)
+[简体中文](./README.md) | English
 
-> 当前仓库仍处于测试阶段，行为、接口和输出细节后续都可能继续调整。非常欢迎提交反编译失败、输出不理想或存在兼容性问题的测试样例，也欢迎通过 issue / discussion 提出使用反馈、改进建议和发布体验上的意见。
+> This repository is still in a testing phase, and its behavior, APIs, and output details may continue to evolve. Bug reports, problematic test cases, incompatibility findings, usage feedback, and release-related suggestions are all very welcome.
 
-## 简介
+## Introduction
 
-一个基于 Rust 的、支持多种 dialect 的 Lua 反编译器，目前支持以下版本 / dialect：
+A Lua decompiler written in Rust with support for multiple dialects. The repository currently supports the following Lua versions and dialects:
 
 - [Lua 5.1](https://www.lua.org/versions.html#5.1)
 - [Lua 5.2](https://www.lua.org/versions.html#5.2)
@@ -16,81 +16,79 @@
 - [LuaJIT 2.1](https://luajit.org/)
 - [Luau](https://luau.org/)
 
-基于控制流分析、支配树分析等手段，去除了大多数中间变量。对于当前仓库中的 case 来说，基本可以恢复源码形状。
+It uses techniques such as control-flow analysis and dominator-tree analysis to eliminate most intermediate variables. For the cases currently tracked in this repository, it can usually reconstruct source code with a close-to-original shape.
 
-当前仓库的代码组织大致如下：
+The repository is currently organized roughly like this:
 
-- 根包 `unluac`：核心反编译库
-- `packages/unluac-cli`：命令行入口
-- `packages/unluac-wasm`：wasm 绑定层
-- `packages/unluac-js`：npm 包装层
-- `xtask`：测试与 Lua 工具链编排
+- Root package `unluac`: core decompiler library
+- `packages/unluac-cli`: command-line entry point
+- `packages/unluac-wasm`: wasm bindings
+- `packages/unluac-js`: npm wrapper package
+- `xtask`: test orchestration and Lua toolchain helpers
 
-## 使用方式
+## Usage
 
-目前仓库已经围绕以下几种使用方式组织代码，分别面向不同的集成和分发场景：
+The repository is currently organized around these integration and distribution paths:
 
-1. **命令行工具**：当前仓库内可以直接通过 `cargo unluac` 调试使用，后续 GitHub Release 二进制也会从同一套 CLI 产出。
-2. **Rust库**：可以将核心库 `unluac` 集成到 Rust 项目中，直接调用反编译 pipeline。
-3. **npm包**：仓库内提供了 `packages/unluac-js` 作为 npm 包装层，面向 Node.js / 浏览器等 JavaScript 环境。
-4. **WebAssembly**：仓库内提供了 `packages/unluac-wasm` 作为 wasm 绑定层，可供其他语言或运行时继续封装。
+1. **CLI**: inside this repository, the fastest way to debug is `cargo unluac`; future GitHub Release binaries will be produced from the same CLI package.
+2. **Rust library**: integrate the core crate `unluac` into a Rust project and call the decompilation pipeline directly.
+3. **npm package**: the repository ships `packages/unluac-js` as the npm-facing wrapper for Node.js and browser-based JavaScript environments.
+4. **WebAssembly**: the repository ships `packages/unluac-wasm` as the wasm binding layer for additional language or runtime wrappers.
 
-### 命令行工具
+### CLI
 
-当前仓库里最直接的命令行入口是：
+The most direct CLI entry point inside this repository is:
 
 ```bash
 cargo unluac -- --input /absolute/path/to/chunk.out --dialect=lua5.1
 cargo unluac -- --source tests/lua_cases/lua5.1/01_setfenv.lua --dialect=lua5.1
 ```
 
-等价命令：
+Equivalent command:
 
 ```bash
 cargo run -p unluac-cli -- --input /absolute/path/to/chunk.out --dialect=lua5.1
 ```
 
-说明：
+Notes:
 
-- CLI 当前要求你显式传入 `--input` 或 `--source`
-- 如果传入 `--source`，CLI 会先调用外部编译器生成 chunk，再执行反编译
-- GitHub Release 提供的裸 `unluac-cli` 二进制不会自带 Lua 编译器；`--source` 只有在你显式传入 `--luac`，或运行环境中存在 `lua/build/<dialect>/` / PATH 上的兼容编译器时才可用
-- CLI 默认直接输出纯源码，不打印 debug dump
-- `generate` 阶段默认会在输出源码中附带 chunk / proto 注释元信息；可通过 `--comment false` 关闭
-- CLI 的 dialect / parse / readability / naming / generate 默认值仍与 [examples/debug.rs](./examples/debug.rs) 共用同一份 repo 调试 preset
-- 如果你想看 repo debug preset 风格的调试输出，可以显式附加 `--debug`
+- The CLI currently requires you to pass either `--input` or `--source`
+- When `--source` is provided, the CLI first invokes an external compiler to produce a chunk, then decompiles that generated chunk
+- The standalone `unluac-cli` binaries published on GitHub Release do not bundle a Lua compiler; `--source` only works when you pass `--luac` explicitly, or when a compatible compiler is available under `lua/build/<dialect>/` or on PATH
+- The CLI prints plain generated source by default and does not emit debug dumps
+- The default dialect / parse / readability / naming / generate values still share the same repo debug preset used by [examples/debug.rs](./examples/debug.rs)
+- If you want repo-debug-style dump output, explicitly add `--debug`
 
-| 参数 | 说明 | 默认值 |
+| Argument | Description | Default |
 | - | - | - |
-| `--input` | 已编译 chunk 路径 | 无 |
-| `--source` | Lua 源码路径，CLI 会先调用外部编译器，再执行反编译 | 无 |
-| `--luac` | 显式指定 `--source` 使用的外部编译器路径 | 先尝试仓库内 `lua/build/<dialect>/`，否则回退到 PATH 上的兼容编译器 |
-| `--dialect` | 反编译 / 编译时使用的 dialect | `lua5.1` |
-| `--stop-after` | 反编译 pipeline 截止阶段 | `generate` |
-| `--debug` | 启用 debug dump | `false` |
-| `--detail` | 调试输出粒度 | `verbose`（启用 debug 时） |
-| `--color` | 调试输出颜色模式 | `always`（启用 debug 时） |
-| `--timing` | 输出耗时报告 | `false` |
-| `--parse-mode` | parser 宽松 / 严格模式 | `permissive` |
-| `--encoding` | 字符串解码编码 | `utf-8` |
-| `--decode-mode` | 字符串解码失败策略 | `strict` |
-| `--naming-mode` | 命名策略 | `debug-like` |
-| `--comment` | 是否输出 generate 注释元信息 | `true` |
+| `--input` | Path to a compiled chunk | None |
+| `--source` | Path to Lua source; the CLI invokes an external compiler before decompiling | None |
+| `--luac` | Explicit compiler path used by `--source` | First tries `lua/build/<dialect>/`, otherwise falls back to a compatible compiler on PATH |
+| `--dialect` | Dialect used for compilation / decompilation | `lua5.1` |
+| `--stop-after` | Last pipeline stage to run | `generate` |
+| `--debug` | Enable debug dumps | `false` |
+| `--detail` | Debug output detail level | `verbose` when debug is enabled |
+| `--color` | Debug color mode | `always` when debug is enabled |
+| `--timing` | Print timing report | `false` |
+| `--parse-mode` | Strict vs permissive parser mode | `permissive` |
+| `--encoding` | String decoding encoding | `utf-8` |
+| `--decode-mode` | String decode failure strategy | `strict` |
+| `--naming-mode` | Naming strategy | `debug-like` |
 
-更多调试相关命令和参数可参考 [docs/debug.md](./docs/debug.md)。
+For more debugging examples and flags, see [docs/debug.md](./docs/debug.md).
 
-### Rust库
+### Rust Library
 
-当前核心库包名为 `unluac`。
+The current core crate name is `unluac`.
 
-如果你希望在本地仓库或其他 Rust 项目里直接集成，当前最稳妥的方式是使用 `path` 或 `git` 依赖：
+If you want to integrate it from a local checkout or another Rust project, the most reliable setup right now is a `path` or `git` dependency:
 
 ```toml
 [dependencies]
 unluac = { git = "https://github.com/X3ZvaWQ/unluac-rs" }
 ```
 
-最小调用示例：
+Minimal example:
 
 ```rust
 use std::fs;
@@ -117,22 +115,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-这里需要注意：
+A few things to keep in mind:
 
-- 库入口直接接受“已编译 chunk 的字节”，不会替你先编译 Lua 源码
-- 如果你手上只有 Lua 源码，当前更方便的方式通常是直接用 CLI
-- 主反编译入口在 [src/decompile/mod.rs](./src/decompile/mod.rs) 下统一导出
+- The library API accepts bytes of an already compiled chunk and does not compile Lua source for you
+- If all you have is Lua source, the CLI is usually the more convenient entry point right now
+- The main decompiler entry points are re-exported from [src/decompile/mod.rs](./src/decompile/mod.rs)
 
-### Npm包
+### npm Package
 
-仓库内的 npm 包装层位于 [packages/unluac-js](./packages/unluac-js)。
+The npm wrapper lives at [packages/unluac-js](./packages/unluac-js).
 
-它当前是一个很薄的 TypeScript 壳层，会调用 `packages/unluac-wasm` 产出的 wasm 绑定，并将最终发布内容收敛到 `dist/`。
+It is currently a thin TypeScript wrapper that consumes the wasm bindings produced by `packages/unluac-wasm` and narrows the publishable contents to `dist/`.
 
-当前发布到 npm 的 wasm 构建会裁掉 `debug` / `timing` 相关能力，以控制包体积；CLI 与仓库内库接口仍保留完整调试能力。
-同时 npm 包的 `decompile()` 会直接返回最终源码字符串，不再暴露中间 pipeline 元信息。
+The published npm wasm build trims out `debug` / `timing` support to keep the package smaller. The CLI and in-repo Rust APIs still keep the full debugging surface.
+The npm-facing `decompile()` API also returns the final source string directly instead of exposing intermediate pipeline metadata.
 
-本地构建方式：
+Local build:
 
 ```bash
 cd packages/unluac-js
@@ -140,19 +138,19 @@ npm install
 npm run build
 ```
 
-构建完成后，发布目录位于：
+After the build completes, the publish directory is:
 
 ```text
 packages/unluac-js/dist
 ```
 
-对外暴露的主要 API 是：
+The main public APIs are:
 
 - `init(input?)`
 - `decompile(bytes, options?)`
 - `supportedOptionValues()`
 
-Node.js 环境中的最小示例：
+Minimal Node.js example:
 
 ```js
 import { decompile } from "unluac-js";
@@ -161,49 +159,37 @@ import { readFile } from "node:fs/promises";
 const chunkBytes = await readFile("./sample.luac");
 const source = await decompile(chunkBytes, {
   dialect: "lua5.1",
-  generate: {
-    comment: false,
-  },
 });
 
 console.log(source);
 ```
 
-常用的 `generate` 选项包括：
-
-- `indentWidth`: 缩进宽度
-- `maxLineLength`: 软换行参考宽度
-- `quoteStyle`: 字符串引号风格
-- `tableStyle`: 表构造器布局风格
-- `conservativeOutput`: 是否偏向保守输出
-- `comment`: 是否输出文件头 / proto 注释，默认 `true`
-
-浏览器与更完整的说明可参考 [packages/unluac-js/README.md](./packages/unluac-js/README.md)。
+For browser usage and more complete examples, see [packages/unluac-js/README.md](./packages/unluac-js/README.md).
 
 ### WebAssembly
 
-wasm 绑定层位于 [packages/unluac-wasm](./packages/unluac-wasm)。
+The wasm binding layer lives at [packages/unluac-wasm](./packages/unluac-wasm).
 
-它当前使用 `wasm-bindgen` 和 `serde-wasm-bindgen` 暴露 JS 友好的对象协议，而不是直接把 Rust 内部类型布局暴露到边界外。
+It currently uses `wasm-bindgen` and `serde-wasm-bindgen` to expose a JS-friendly object protocol instead of leaking Rust internal layouts across the boundary.
 
-如果你只是想在 JavaScript / TypeScript 环境使用，优先建议直接使用上面的 npm 包装层。  
-如果你需要把 wasm 接到其他语言或运行时，也可以：
+If you only want to use this project from JavaScript or TypeScript, the npm wrapper above is the recommended entry point.  
+If you need to integrate the wasm layer into another language or runtime, you can:
 
-- 从 npm 包的发布目录中获取已经构建好的 `unluac_wasm.js` 与 `unluac_wasm_bg.wasm`
-- 或者直接基于本仓库的 `packages/unluac-wasm` 自行构建并准备对应语言的绑定
+- Take the built `unluac_wasm.js` and `unluac_wasm_bg.wasm` files from the published npm package
+- Or build `packages/unluac-wasm` directly in this repository and prepare language-specific bindings yourself
 
-如果你打算把 wasm 支持扩展到某个特定语言或运行时，欢迎提交 PR。
+If you plan to extend the wasm support to a specific language or runtime, PRs are welcome.
 
-## 贡献与反馈
+## Contributing and Feedback
 
-欢迎任何形式的贡献，无论是代码、文档、测试用例，还是其他方面的改进。
-如果你在使用过程中遇到任何问题，或者有任何建议和想法，欢迎随时提交 issue；如果项目在某些 case 上表现不佳，也可以将对应的二进制文件作为附件上传，方便定位问题。
+Contributions of all kinds are welcome, including code, documentation, test cases, and other improvements.
+If you run into issues while using the project, or have ideas and suggestions, feel free to open an issue. If the project performs poorly on a specific case, attaching the corresponding binary file is also very helpful for diagnosis.
 
-## License MIT 
+## License MIT
 
-本项目采用 MIT License 发布，具体内容见 [LICENSE.txt](./LICENSE.txt)。
+This project is released under the MIT License. See [LICENSE.txt](./LICENSE.txt) for details.
 
-## 鸣谢
+## Acknowledgements
 
-- [metaworms's lua decompiler](https://luadec.metaworm.site) - 该项目的设计与实现受到了这个项目的启发，也受到了作者教程的帮助。当前该网站已经无法访问。
-- Codex + GPT-5.4 - 该项目的大部分代码由 Codex 和 GPT-5.4 生成，感谢 OpenAI 提供的强大工具。
+- [metaworms's lua decompiler](https://luadec.metaworm.site) - This project's design and implementation were inspired by it, and the author's tutorial was also very helpful. The website is no longer accessible today.
+- Codex + GPT-5.4 - Most of this project's code was generated with Codex and GPT-5.4. Thanks to OpenAI for building such strong tools.
