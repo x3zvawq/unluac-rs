@@ -7,6 +7,7 @@ mod analyze;
 mod common;
 mod debug;
 mod decision;
+mod promotion;
 mod simplify;
 
 pub use analyze::analyze_hir;

@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::super::promotion::ProtoPromotionFacts;
 use super::bindings::build_bindings;
 use super::exprs::{
     expr_for_closure_capture, expr_for_const, expr_for_reg_at_block_exit, expr_for_reg_use,
@@ -68,6 +69,12 @@ pub(super) struct ChildAnalyses<'a> {
     pub(super) structure: &'a [StructureFacts],
 }
 
+#[derive(Default)]
+pub(super) struct LowerArtifacts {
+    pub(super) protos: Vec<HirProto>,
+    pub(super) promotion_facts: Vec<ProtoPromotionFacts>,
+}
+
 pub(super) fn lower_proto(
     proto: &LoweredProto,
     cfg: &Cfg,
@@ -75,10 +82,13 @@ pub(super) fn lower_proto(
     dataflow: &DataflowFacts,
     structure: &StructureFacts,
     child_analyses: ChildAnalyses<'_>,
-    protos: &mut Vec<HirProto>,
+    artifacts: &mut LowerArtifacts,
 ) -> HirProtoRef {
-    let id = HirProtoRef(protos.len());
-    protos.push(empty_proto(id));
+    let id = HirProtoRef(artifacts.protos.len());
+    artifacts.protos.push(empty_proto(id));
+    artifacts
+        .promotion_facts
+        .push(ProtoPromotionFacts::default());
 
     let child_refs = proto
         .children
@@ -101,7 +111,7 @@ pub(super) fn lower_proto(
                         dataflow: &child_dataflow.children,
                         structure: &child_structure.children,
                     },
-                    protos,
+                    artifacts,
                 )
             },
         )
@@ -118,7 +128,7 @@ pub(super) fn lower_proto(
         bindings,
     };
 
-    protos[id.index()] = HirProto {
+    artifacts.protos[id.index()] = HirProto {
         id,
         source: proto.source.as_ref().map(decode_raw_string),
         line_range: proto.line_range,
@@ -132,6 +142,7 @@ pub(super) fn lower_proto(
         body: build_proto_body(&lowering),
         children: child_refs,
     };
+    artifacts.promotion_facts[id.index()] = ProtoPromotionFacts::from_dataflow(dataflow);
 
     id
 }

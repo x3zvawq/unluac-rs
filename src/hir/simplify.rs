@@ -21,6 +21,7 @@ mod visit;
 mod walk;
 
 use crate::hir::common::HirModule;
+use crate::hir::promotion::ProtoPromotionFacts;
 use crate::readability::ReadabilityOptions;
 use crate::timing::TimingCollector;
 
@@ -30,19 +31,20 @@ const MAX_SIMPLIFY_ITERATIONS: usize = 128;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn simplify_hir(module: &mut HirModule, readability: ReadabilityOptions) {
     let timings = TimingCollector::disabled();
-    simplify_hir_with_timing(module, readability, &timings);
+    simplify_hir_with_timing(module, readability, &timings, &[]);
 }
 
 pub(super) fn simplify_hir_with_timing(
     module: &mut HirModule,
     readability: ReadabilityOptions,
     timings: &TimingCollector,
+    promotion_facts: &[ProtoPromotionFacts],
 ) {
     let mut converged = false;
 
     for _ in 0..MAX_SIMPLIFY_ITERATIONS {
         let changed = timings.record("fixed-point-round", || {
-            run_fixed_point_round(module, readability, timings)
+            run_fixed_point_round(module, readability, timings, promotion_facts)
         });
 
         if !changed {
@@ -75,11 +77,12 @@ fn run_fixed_point_round(
     module: &mut HirModule,
     readability: ReadabilityOptions,
     timings: &TimingCollector,
+    promotion_facts: &[ProtoPromotionFacts],
 ) -> bool {
     let mut changed = false;
-    changed |= run_core_round(module, readability, timings);
+    changed |= run_core_round(module, readability, timings, promotion_facts);
     changed |= run_exposure_round(module, timings);
-    changed |= run_cleanup_round(module, timings);
+    changed |= run_cleanup_round(module, timings, promotion_facts);
     changed
 }
 
@@ -87,6 +90,7 @@ fn run_core_round(
     module: &mut HirModule,
     readability: ReadabilityOptions,
     timings: &TimingCollector,
+    promotion_facts: &[ProtoPromotionFacts],
 ) -> bool {
     let mut changed = false;
     changed |= apply_timed_proto_pass(
@@ -119,15 +123,19 @@ fn run_core_round(
         "closure-self-capture",
         closure_self_capture::resolve_recursive_closure_self_captures_in_proto,
     );
+    let empty_facts = ProtoPromotionFacts::default();
     changed |= apply_timed_proto_pass(module, timings, "temp-inline", |proto| {
-        temp_inline::inline_temps_in_proto(proto, readability)
+        let facts = promotion_facts
+            .get(proto.id.index())
+            .unwrap_or(&empty_facts);
+        temp_inline::inline_temps_in_proto_with_facts(proto, readability, facts)
     });
-    changed |= apply_timed_proto_pass(
-        module,
-        timings,
-        "locals",
-        locals::promote_temps_to_locals_in_proto,
-    );
+    changed |= apply_timed_proto_pass(module, timings, "locals", |proto| {
+        let facts = promotion_facts
+            .get(proto.id.index())
+            .unwrap_or(&empty_facts);
+        locals::promote_temps_to_locals_in_proto_with_facts(proto, facts)
+    });
     changed
 }
 
@@ -154,7 +162,11 @@ fn run_exposure_round(module: &mut HirModule, timings: &TimingCollector) -> bool
     changed
 }
 
-fn run_cleanup_round(module: &mut HirModule, timings: &TimingCollector) -> bool {
+fn run_cleanup_round(
+    module: &mut HirModule,
+    timings: &TimingCollector,
+    promotion_facts: &[ProtoPromotionFacts],
+) -> bool {
     let mut changed = false;
     changed |= apply_timed_proto_pass(
         module,
@@ -186,6 +198,7 @@ fn run_cleanup_round(module: &mut HirModule, timings: &TimingCollector) -> bool 
         "dead-labels",
         dead_labels::remove_unused_labels_in_proto,
     );
+    let empty_facts = ProtoPromotionFacts::default();
     changed |= apply_timed_proto_pass(
         module,
         timings,
@@ -193,7 +206,12 @@ fn run_cleanup_round(module: &mut HirModule, timings: &TimingCollector) -> bool 
         // `close-scopes` 会把 `<close>` cleanup 重新收成词法块，期间可能重新露出
         // 可直接命名的 temp/local 边界。这里显式把第二轮 locals 放在 cleanup 阶段，
         // 而不是继续当成“某个神秘的多跑一遍”。
-        locals::promote_temps_to_locals_in_proto,
+        |proto| {
+            let facts = promotion_facts
+                .get(proto.id.index())
+                .unwrap_or(&empty_facts);
+            locals::promote_temps_to_locals_in_proto_with_facts(proto, facts)
+        },
     );
     changed
 }

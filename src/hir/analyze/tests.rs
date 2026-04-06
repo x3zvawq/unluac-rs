@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use super::lower::{ChildAnalyses, lower_proto};
+use super::lower::{ChildAnalyses, LowerArtifacts, lower_proto};
 use crate::cfg::{analyze_dataflow, analyze_graph_facts, build_cfg_graph};
 use crate::hir::common::{HirBinaryOpKind, HirExpr, HirLValue, HirModule, HirStmt};
 use crate::hir::dump_hir;
@@ -122,7 +122,7 @@ fn lua55_fixed_multiresult_call_keeps_all_fixed_defs_before_simplify() {
     );
 
     let structure = analyze_structure(&lowered, &cfg_graph, &graph_facts, &dataflow);
-    let mut protos = Vec::new();
+    let mut artifacts = LowerArtifacts::default();
     let entry = lower_proto(
         &lowered.main,
         &cfg_graph.cfg,
@@ -135,9 +135,12 @@ fn lua55_fixed_multiresult_call_keeps_all_fixed_defs_before_simplify() {
             dataflow: &dataflow.children,
             structure: &structure.children,
         },
-        &mut protos,
+        &mut artifacts,
     );
-    let module = HirModule { entry, protos };
+    let module = HirModule {
+        entry,
+        protos: artifacts.protos,
+    };
     let proto = &module.protos[module.entry.index()];
 
     assert!(
@@ -168,7 +171,7 @@ fn lower_luau_fixture_to_hir(source_relative: &str) -> HirModule {
     let dataflow = analyze_dataflow(&lowered, &cfg_graph, &graph_facts);
     let structure = analyze_structure(&lowered, &cfg_graph, &graph_facts, &dataflow);
 
-    let mut protos = Vec::new();
+    let mut artifacts = LowerArtifacts::default();
     let entry = lower_proto(
         &lowered.main,
         &cfg_graph.cfg,
@@ -181,10 +184,13 @@ fn lower_luau_fixture_to_hir(source_relative: &str) -> HirModule {
             dataflow: &dataflow.children,
             structure: &structure.children,
         },
-        &mut protos,
+        &mut artifacts,
     );
 
-    HirModule { entry, protos }
+    HirModule {
+        entry,
+        protos: artifacts.protos,
+    }
 }
 
 fn compile_luau_fixture(source_relative: &str) -> Vec<u8> {

@@ -8,6 +8,7 @@ use crate::hir::common::{
     HirGenericFor, HirGlobalRef, HirIf, HirModule, HirNumericFor, HirProtoRef, HirReturn,
     HirUnaryExpr, HirUnaryOpKind, LocalId, ParamId,
 };
+use crate::hir::promotion::ProtoPromotionFacts;
 
 #[test]
 fn removes_immediate_temp_forwarding_chain() {
@@ -726,6 +727,68 @@ fn does_not_inline_temp_into_closure_capture() {
                     [HirExpr::Closure(closure)]
                         if matches!(closure.captures.as_slice(), [HirCapture { value: HirExpr::TempRef(TempId(0)) }])
                 )
+    ));
+}
+
+#[test]
+fn does_not_inline_rebind_after_captured_home_slot_writeback() {
+    let mut proto = HirProto {
+        temps: vec![TempId(0), TempId(1), TempId(2)],
+        temp_debug_locals: vec![None, None, None],
+        local_debug_hints: Vec::new(),
+        ..dummy_proto(HirBlock {
+            stmts: vec![
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Temp(TempId(0))],
+                    values: vec![HirExpr::Integer(1)],
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Temp(TempId(1))],
+                    values: vec![HirExpr::Closure(Box::new(HirClosureExpr {
+                        proto: HirProtoRef(1),
+                        captures: vec![HirCapture {
+                            value: HirExpr::TempRef(TempId(0)),
+                        }],
+                    }))],
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Temp(TempId(2))],
+                    values: vec![HirExpr::Integer(2)],
+                })),
+                HirStmt::CallStmt(Box::new(HirCallStmt {
+                    call: HirCallExpr {
+                        callee: HirExpr::GlobalRef(HirGlobalRef {
+                            name: "print".to_owned(),
+                        }),
+                        args: vec![HirExpr::TempRef(TempId(2))],
+                        multiret: false,
+                        method: false,
+                        method_name: None,
+                    },
+                })),
+            ],
+        })
+    };
+    let facts = ProtoPromotionFacts::for_test(vec![Some(0), Some(1), Some(0)]);
+
+    assert!(!inline_temps_in_proto_with_facts(
+        &mut proto,
+        crate::readability::ReadabilityOptions::default(),
+        &facts,
+    ));
+    assert!(matches!(
+        proto.body.stmts.as_slice(),
+        [HirStmt::Assign(_), HirStmt::Assign(_), HirStmt::Assign(assign), HirStmt::CallStmt(call_stmt)]
+            if matches!(
+                assign.targets.as_slice(),
+                [HirLValue::Temp(TempId(2))]
+            ) && matches!(
+                assign.values.as_slice(),
+                [HirExpr::Integer(2)]
+            ) && matches!(
+                call_stmt.call.args.as_slice(),
+                [HirExpr::TempRef(TempId(2))]
+            )
     ));
 }
 

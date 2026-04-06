@@ -13,7 +13,7 @@ mod structure;
 #[cfg(test)]
 mod tests;
 
-use self::lower::{ChildAnalyses, lower_proto};
+use self::lower::{ChildAnalyses, LowerArtifacts, lower_proto};
 use super::simplify::simplify_hir_with_timing;
 use crate::cfg::{CfgGraph, DataflowFacts, GraphFacts};
 use crate::hir::common::HirModule;
@@ -59,13 +59,13 @@ pub(crate) fn analyze_hir_with_timing(
     timings: &TimingCollector,
     readability: ReadabilityOptions,
 ) -> HirModule {
-    let mut protos = Vec::new();
     let child_analyses = ChildAnalyses {
         cfg_graphs: &cfg_graph.children,
         graph_facts: &graph_facts.children,
         dataflow: &dataflow.children,
         structure: &structure.children,
     };
+    let mut artifacts = LowerArtifacts::default();
     let entry = timings.record("lower", || {
         lower_proto(
             &chunk.main,
@@ -74,13 +74,21 @@ pub(crate) fn analyze_hir_with_timing(
             dataflow,
             structure,
             child_analyses,
-            &mut protos,
+            &mut artifacts,
         )
     });
 
-    let mut module = HirModule { entry, protos };
+    let mut module = HirModule {
+        entry,
+        protos: artifacts.protos,
+    };
     timings.record("simplify", || {
-        simplify_hir_with_timing(&mut module, readability, timings);
+        simplify_hir_with_timing(
+            &mut module,
+            readability,
+            timings,
+            &artifacts.promotion_facts,
+        );
     });
     module
 }

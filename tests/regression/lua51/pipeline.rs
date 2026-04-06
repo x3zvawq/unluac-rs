@@ -76,6 +76,50 @@ mod decompile_pipeline {
     }
 
     #[test]
+    fn captured_local_rebind_hir_preserves_writeback_to_the_captured_binding() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/functions/08_captured_local_rebind.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                debug: DebugOptions {
+                    enable: true,
+                    output_stages: vec![DecompileStage::Hir],
+                    timing: false,
+                    color: DebugColorMode::Never,
+                    detail: DebugDetail::Verbose,
+                    filters: Default::default(),
+                },
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("captured_local_rebind hir stage should succeed");
+
+        let dump = &result.debug_output[0].content;
+        assert!(dump.contains("closure(proto#1 captures=l0)"), "{dump}");
+        assert!(dump.contains("assign l0 = 2"), "{dump}");
+        assert!(
+            dump.contains(
+                "call call(normal) global(print)(\"number-second\", call(normal) l1() multiret=false, l0) multiret=false"
+            ),
+            "{dump}"
+        );
+        assert!(
+            !dump.contains(
+                "call call(normal) global(print)(\"number-second\", call(normal) l1() multiret=false, 2) multiret=false"
+            ),
+            "{dump}"
+        );
+        assert!(dump.contains("closure(proto#2 captures=l2)"), "{dump}");
+        assert!(
+            dump.contains("assign l2 = table(array=0, record=0, trailing=-)"),
+            "{dump}"
+        );
+    }
+
+    #[test]
     fn ultimate_mess_hir_folds_single_access_segments_without_collapsing_the_whole_chain() {
         let result = decompile(
             &compile_lua_case(

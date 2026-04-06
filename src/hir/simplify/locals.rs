@@ -4,27 +4,46 @@
 //! 当前 block 顶层先有一次初始化，后面这批 SSA temp 通过简单别名链继续流动，并且
 //! 在后续语句里继续被读/写。对这类值，继续保留 `t12 / t13 / ...` 只会让 HIR 充满
 //! 版本噪音，把它们折回同一个 `LocalId` 更接近源码，也能为后续 AST/Naming 铺路。
+//!
+//! 另外，如果某个 local 已经被 closure capture 观察到，后续来自同一寄存器槽位的
+//! 新 def 不该再长成新的 local，而应继续写回原绑定。否则 closure 会继续指向旧 local，
+//! 后半段写回却被拆到新绑定里，直接改掉源码语义。
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::visit::{HirVisitor, visit_expr, visit_stmts};
 use crate::hir::common::{
-    HirBlock, HirCallExpr, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt,
+    HirAssign, HirBlock, HirCallExpr, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt,
     HirTableConstructor, HirTableField, HirTableKey, LocalId, TempId,
 };
+use crate::hir::promotion::ProtoPromotionFacts;
 
 /// 对单个 proto 执行保守的 temp -> local 提升。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn promote_temps_to_locals_in_proto(proto: &mut HirProto) -> bool {
+    promote_temps_to_locals_in_proto_with_facts(proto, &ProtoPromotionFacts::default())
+}
+
+/// 对单个 proto 执行带 promotion facts 的 temp -> local 提升。
+pub(super) fn promote_temps_to_locals_in_proto_with_facts(
+    proto: &mut HirProto,
+    facts: &ProtoPromotionFacts,
+) -> bool {
     let mut next_local_index = proto.locals.len();
     let mut new_locals = Vec::new();
     let mut new_local_debug_hints = Vec::new();
+    let mut ctx = PromotionCtx {
+        facts,
+        temp_debug_locals: &proto.temp_debug_locals,
+        next_local_index: &mut next_local_index,
+        new_locals: &mut new_locals,
+        new_local_debug_hints: &mut new_local_debug_hints,
+    };
     let result = promote_block(
-        &proto.temp_debug_locals,
+        &mut ctx,
         &mut proto.body,
         &BTreeMap::new(),
-        &mut next_local_index,
-        &mut new_locals,
-        &mut new_local_debug_hints,
+        &BTreeMap::new(),
     );
     proto.locals.extend(new_locals);
     proto.local_debug_hints.extend(new_local_debug_hints);
@@ -35,15 +54,23 @@ pub(super) fn promote_temps_to_locals_in_proto(proto: &mut HirProto) -> bool {
 struct PromotionPlan {
     decl_index: usize,
     local: LocalId,
+    home_slot: Option<usize>,
     temps: BTreeSet<TempId>,
     removable_aliases: BTreeSet<usize>,
     init: PromotionInit,
+    action: PromotionAction,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum PromotionInit {
     FromAssign,
     Empty,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PromotionAction {
+    AllocateLocal,
+    ReuseExistingLocal,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -57,6 +84,14 @@ struct PromotionResult {
     trailing_mapping: BTreeMap<TempId, LocalId>,
 }
 
+struct PromotionCtx<'a> {
+    facts: &'a ProtoPromotionFacts,
+    temp_debug_locals: &'a [Option<String>],
+    next_local_index: &'a mut usize,
+    new_locals: &'a mut Vec<LocalId>,
+    new_local_debug_hints: &'a mut Vec<Option<String>>,
+}
+
 struct PlanAllocator<'a> {
     temp_debug_locals: &'a [Option<String>],
     plans: &'a mut Vec<PromotionPlan>,
@@ -68,9 +103,10 @@ struct PlanAllocator<'a> {
 }
 
 impl PlanAllocator<'_> {
-    fn allocate(
+    fn allocate_local(
         &mut self,
         decl_index: usize,
+        home_slot: Option<usize>,
         temps: BTreeSet<TempId>,
         removable_aliases: BTreeSet<usize>,
         init: PromotionInit,
@@ -86,29 +122,45 @@ impl PlanAllocator<'_> {
         self.plans.push(PromotionPlan {
             decl_index,
             local,
+            home_slot,
             temps,
             removable_aliases,
             init,
+            action: PromotionAction::AllocateLocal,
+        });
+    }
+
+    fn reuse_existing_local(
+        &mut self,
+        decl_index: usize,
+        local: LocalId,
+        home_slot: Option<usize>,
+        temps: BTreeSet<TempId>,
+        removable_aliases: BTreeSet<usize>,
+        init: PromotionInit,
+    ) {
+        self.reserved_temps.extend(temps.iter().copied());
+        self.reserved_alias_indices
+            .extend(removable_aliases.iter().copied());
+        self.plans.push(PromotionPlan {
+            decl_index,
+            local,
+            home_slot,
+            temps,
+            removable_aliases,
+            init,
+            action: PromotionAction::ReuseExistingLocal,
         });
     }
 }
 
 fn promote_block(
-    temp_debug_locals: &[Option<String>],
+    ctx: &mut PromotionCtx<'_>,
     block: &mut HirBlock,
     inherited: &BTreeMap<TempId, LocalId>,
-    next_local_index: &mut usize,
-    new_locals: &mut Vec<LocalId>,
-    new_local_debug_hints: &mut Vec<Option<String>>,
+    inherited_sticky_slots: &BTreeMap<usize, LocalId>,
 ) -> PromotionResult {
-    let plans = collect_plans(
-        temp_debug_locals,
-        block,
-        inherited,
-        next_local_index,
-        new_locals,
-        new_local_debug_hints,
-    );
+    let plans = collect_plans(ctx, block, inherited, inherited_sticky_slots);
     let plan_by_decl = plans.iter().fold(
         BTreeMap::<usize, Vec<&PromotionPlan>>::new(),
         |mut grouped, plan| {
@@ -123,6 +175,8 @@ fn promote_block(
 
     let mut changed = !plans.is_empty();
     let mut mapping = inherited.clone();
+    let mut slot_candidates = inherited_sticky_slots.clone();
+    let mut active_sticky_slots = inherited_sticky_slots.clone();
     let original_stmts = std::mem::take(&mut block.stmts);
     let mut rewritten = Vec::with_capacity(original_stmts.len());
 
@@ -131,17 +185,28 @@ fn promote_block(
         if let Some(plans) = plan_by_decl.get(&index) {
             let mapping_before_decl = mapping.clone();
             for plan in plans {
-                if let Some(local_decl) =
-                    rewrite_decl_stmt(&stmt, plan.local, &mapping_before_decl, plan.init)
+                if let Some(anchor_stmt) =
+                    rewrite_plan_anchor_stmt(&stmt, plan, &mapping_before_decl)
                 {
-                    for temp in &plan.temps {
-                        mapping.insert(*temp, plan.local);
-                    }
-                    replaced_stmt |= matches!(plan.init, PromotionInit::FromAssign);
-                    rewritten.push(local_decl);
+                    rewritten.push(anchor_stmt);
                 }
+                for temp in &plan.temps {
+                    mapping.insert(*temp, plan.local);
+                }
+                if let Some(slot) = plan.home_slot
+                    && matches!(plan.action, PromotionAction::AllocateLocal)
+                {
+                    slot_candidates.entry(slot).or_insert(plan.local);
+                }
+                replaced_stmt |= plan_replaces_original_stmt(plan);
             }
         }
+        activate_captured_slots_in_stmt(
+            &stmt,
+            ctx.facts,
+            &slot_candidates,
+            &mut active_sticky_slots,
+        );
         if replaced_stmt {
             continue;
         }
@@ -150,14 +215,7 @@ fn promote_block(
             continue;
         }
 
-        let stmt_changed = rewrite_stmt(
-            temp_debug_locals,
-            &mut stmt,
-            &mapping,
-            next_local_index,
-            new_locals,
-            new_local_debug_hints,
-        );
+        let stmt_changed = rewrite_stmt(ctx, &mut stmt, &mapping, &active_sticky_slots);
         changed |= stmt_changed;
         rewritten.push(stmt);
     }
@@ -170,12 +228,10 @@ fn promote_block(
 }
 
 fn collect_plans(
-    temp_debug_locals: &[Option<String>],
+    ctx: &mut PromotionCtx<'_>,
     block: &HirBlock,
     inherited: &BTreeMap<TempId, LocalId>,
-    next_local_index: &mut usize,
-    new_locals: &mut Vec<LocalId>,
-    new_local_debug_hints: &mut Vec<Option<String>>,
+    inherited_sticky_slots: &BTreeMap<usize, LocalId>,
 ) -> Vec<PromotionPlan> {
     if block.stmts.iter().any(|stmt| {
         matches!(
@@ -186,25 +242,33 @@ fn collect_plans(
         return Vec::new();
     }
 
+    let facts = ctx.facts;
+    let temp_debug_locals = ctx.temp_debug_locals;
     let mut plans = Vec::new();
     let mut reserved_temps = inherited.keys().copied().collect::<BTreeSet<_>>();
     let mut reserved_alias_indices = BTreeSet::new();
+    let mut slot_candidates = inherited_sticky_slots.clone();
+    let mut sticky_slots = inherited_sticky_slots.clone();
 
     for (decl_index, stmt) in block.stmts.iter().enumerate() {
         if reserved_alias_indices.contains(&decl_index) {
+            activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
             continue;
         }
 
         let Some(root_temp) = simple_temp_assign_target(stmt) else {
+            activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
             continue;
         };
         if reserved_temps.contains(&root_temp) {
+            activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
             continue;
         }
         // 目标 temp 自己又出现在 RHS 里时，这条赋值表达的是“沿用同一状态槽位继续更新”，
         // 不能在 locals pass 里把它误提升成新的 block-local。否则像 loop carried state
         // 或分支内的状态写回，会被拆成 `local next = step(state)`，原状态槽位反而失去写回。
         if stmt_self_updates_temp(stmt, root_temp) {
+            activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
             continue;
         }
 
@@ -233,51 +297,81 @@ fn collect_plans(
             }
         }
 
-        if !has_future_touch {
+        let sticky_local = facts
+            .home_slot(root_temp)
+            .and_then(|slot| sticky_slots.get(&slot).copied());
+
+        if sticky_local.is_none() && !has_future_touch {
+            activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
             continue;
         }
-        // 只在控制头里单次消费的 temp，更像机械性的结构参数而不是源码级 local。
-        // 如果这里先把它们提升成 local，后面的 temp-inline 就再也无法把
-        // `for i = 1, #values, 1 do`、`if value > 0 then` 这类头部形状收回来。
-        // 因此只要它们的唯一未来使用点仍局限在单条控制语句的头部，就把机会留给
-        // temp-inline，而不是在 locals pass 里过早物化成新 local。
-        let touching_stmt_indices = (decl_index + 1..block.stmts.len())
-            .filter(|future_index| !removable_aliases.contains(future_index))
-            .filter(|future_index| stmt_touches_any_temp(&block.stmts[*future_index], &group))
-            .collect::<Vec<_>>();
-        if touching_stmt_indices.len() == 1
-            && stmt_consumes_temps_only_in_control_head(
-                &block.stmts[touching_stmt_indices[0]],
-                &group,
-            )
-        {
-            continue;
-        }
-        if touching_stmt_indices
-            .iter()
-            .copied()
-            .any(|stmt_index| stmt_contains_nested_nonlocal_control(&block.stmts[stmt_index]))
-        {
-            continue;
+        if sticky_local.is_none() {
+            // 只在控制头里单次消费的 temp，更像机械性的结构参数而不是源码级 local。
+            // 如果这里先把它们提升成 local，后面的 temp-inline 就再也无法把
+            // `for i = 1, #values, 1 do`、`if value > 0 then` 这类头部形状收回来。
+            // 因此只要它们的唯一未来使用点仍局限在单条控制语句的头部，就把机会留给
+            // temp-inline，而不是在 locals pass 里过早物化成新 local。
+            let touching_stmt_indices = (decl_index + 1..block.stmts.len())
+                .filter(|future_index| !removable_aliases.contains(future_index))
+                .filter(|future_index| stmt_touches_any_temp(&block.stmts[*future_index], &group))
+                .collect::<Vec<_>>();
+            if touching_stmt_indices.len() == 1
+                && stmt_consumes_temps_only_in_control_head(
+                    &block.stmts[touching_stmt_indices[0]],
+                    &group,
+                )
+            {
+                activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
+                continue;
+            }
+            if touching_stmt_indices
+                .iter()
+                .copied()
+                .any(|stmt_index| stmt_contains_nested_nonlocal_control(&block.stmts[stmt_index]))
+            {
+                activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
+                continue;
+            }
         }
 
-        PlanAllocator {
+        let mut allocator = PlanAllocator {
             temp_debug_locals,
             plans: &mut plans,
             reserved_temps: &mut reserved_temps,
             reserved_alias_indices: &mut reserved_alias_indices,
-            next_local_index,
-            new_locals,
-            new_local_debug_hints,
+            next_local_index: ctx.next_local_index,
+            new_locals: ctx.new_locals,
+            new_local_debug_hints: ctx.new_local_debug_hints,
+        };
+        if let Some(local) = sticky_local {
+            allocator.reuse_existing_local(
+                decl_index,
+                local,
+                facts.home_slot(root_temp),
+                group,
+                removable_aliases,
+                PromotionInit::FromAssign,
+            );
+        } else {
+            let slot = facts.home_slot(root_temp);
+            allocator.allocate_local(
+                decl_index,
+                slot,
+                group,
+                removable_aliases,
+                PromotionInit::FromAssign,
+            );
+            if let Some(slot) = slot
+                && let Some(local) = allocator.plans.last().map(|plan| plan.local)
+            {
+                slot_candidates.entry(slot).or_insert(local);
+            }
         }
-        .allocate(
-            decl_index,
-            group,
-            removable_aliases,
-            PromotionInit::FromAssign,
-        );
+
+        activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
     }
 
+    let mut sticky_slots = inherited_sticky_slots.clone();
     for (decl_index, stmt) in block.stmts.iter().enumerate() {
         let merge_temps = if_merge_candidate_temps(
             stmt,
@@ -287,25 +381,62 @@ fn collect_plans(
         );
 
         for temp in merge_temps {
-            PlanAllocator {
+            let mut allocator = PlanAllocator {
                 temp_debug_locals,
                 plans: &mut plans,
                 reserved_temps: &mut reserved_temps,
                 reserved_alias_indices: &mut reserved_alias_indices,
-                next_local_index,
-                new_locals,
-                new_local_debug_hints,
+                next_local_index: ctx.next_local_index,
+                new_locals: ctx.new_locals,
+                new_local_debug_hints: ctx.new_local_debug_hints,
+            };
+            if let Some(local) = facts
+                .home_slot(temp)
+                .and_then(|slot| sticky_slots.get(&slot).copied())
+            {
+                allocator.reuse_existing_local(
+                    decl_index,
+                    local,
+                    facts.home_slot(temp),
+                    BTreeSet::from([temp]),
+                    BTreeSet::new(),
+                    PromotionInit::Empty,
+                );
+            } else {
+                let slot = facts.home_slot(temp);
+                allocator.allocate_local(
+                    decl_index,
+                    slot,
+                    BTreeSet::from([temp]),
+                    BTreeSet::new(),
+                    PromotionInit::Empty,
+                );
+                if let Some(slot) = slot
+                    && let Some(local) = allocator.plans.last().map(|plan| plan.local)
+                {
+                    slot_candidates.entry(slot).or_insert(local);
+                }
             }
-            .allocate(
-                decl_index,
-                BTreeSet::from([temp]),
-                BTreeSet::new(),
-                PromotionInit::Empty,
-            );
         }
+        activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
     }
 
     plans
+}
+
+fn activate_captured_slots_in_stmt(
+    stmt: &HirStmt,
+    facts: &ProtoPromotionFacts,
+    slot_candidates: &BTreeMap<usize, LocalId>,
+    sticky_slots: &mut BTreeMap<usize, LocalId>,
+) {
+    let mut captured_slots = BTreeSet::new();
+    facts.collect_captured_home_slots_in_stmt(stmt, &mut captured_slots);
+    for slot in captured_slots {
+        if let Some(local) = slot_candidates.get(&slot).copied() {
+            sticky_slots.insert(slot, local);
+        }
+    }
 }
 
 fn simple_temp_assign_target(stmt: &HirStmt) -> Option<TempId> {
@@ -469,13 +600,12 @@ fn intersect_fallthrough_assignment_sets<'a>(
     Some(intersection)
 }
 
-fn rewrite_decl_stmt(
+fn rewrite_plan_anchor_stmt(
     stmt: &HirStmt,
-    local: LocalId,
+    plan: &PromotionPlan,
     mapping: &BTreeMap<TempId, LocalId>,
-    init: PromotionInit,
 ) -> Option<HirStmt> {
-    let values = match init {
+    let values = match plan.init {
         PromotionInit::FromAssign => {
             let HirStmt::Assign(assign) = stmt else {
                 return None;
@@ -497,19 +627,30 @@ fn rewrite_decl_stmt(
         PromotionInit::Empty => Vec::new(),
     };
 
-    Some(HirStmt::LocalDecl(Box::new(HirLocalDecl {
-        bindings: vec![local],
-        values,
-    })))
+    match (plan.action, plan.init) {
+        (PromotionAction::AllocateLocal, _) => Some(HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![plan.local],
+            values,
+        }))),
+        (PromotionAction::ReuseExistingLocal, PromotionInit::FromAssign) => {
+            Some(HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Local(plan.local)],
+                values,
+            })))
+        }
+        (PromotionAction::ReuseExistingLocal, PromotionInit::Empty) => None,
+    }
+}
+
+fn plan_replaces_original_stmt(plan: &PromotionPlan) -> bool {
+    matches!(plan.init, PromotionInit::FromAssign)
 }
 
 fn rewrite_stmt(
-    temp_debug_locals: &[Option<String>],
+    ctx: &mut PromotionCtx<'_>,
     stmt: &mut HirStmt,
     mapping: &BTreeMap<TempId, LocalId>,
-    next_local_index: &mut usize,
-    new_locals: &mut Vec<LocalId>,
-    new_local_debug_hints: &mut Vec<Option<String>>,
+    sticky_slots: &BTreeMap<usize, LocalId>,
 ) -> bool {
     match stmt {
         HirStmt::LocalDecl(local_decl) => {
@@ -545,53 +686,24 @@ fn rewrite_stmt(
         }),
         HirStmt::If(if_stmt) => {
             let cond_changed = rewrite_expr(&mut if_stmt.cond, mapping);
-            let then_changed = promote_block(
-                temp_debug_locals,
-                &mut if_stmt.then_block,
-                mapping,
-                next_local_index,
-                new_locals,
-                new_local_debug_hints,
-            )
-            .changed;
+            let then_changed =
+                promote_block(ctx, &mut if_stmt.then_block, mapping, sticky_slots).changed;
             let else_changed = if_stmt.else_block.as_mut().is_some_and(|else_block| {
-                promote_block(
-                    temp_debug_locals,
-                    else_block,
-                    mapping,
-                    next_local_index,
-                    new_locals,
-                    new_local_debug_hints,
-                )
-                .changed
+                promote_block(ctx, else_block, mapping, sticky_slots).changed
             });
             cond_changed || then_changed || else_changed
         }
         HirStmt::While(while_stmt) => {
             let cond_changed = rewrite_expr(&mut while_stmt.cond, mapping);
-            let body_changed = promote_block(
-                temp_debug_locals,
-                &mut while_stmt.body,
-                mapping,
-                next_local_index,
-                new_locals,
-                new_local_debug_hints,
-            )
-            .changed;
+            let body_changed =
+                promote_block(ctx, &mut while_stmt.body, mapping, sticky_slots).changed;
             cond_changed || body_changed
         }
         HirStmt::Repeat(repeat_stmt) => {
             // `repeat ... until` 的条件和 loop body 共享同一个词法作用域。
             // body 里刚刚提升出来的 local 如果不继续带到条件里，条件就会继续挂着旧 temp，
             // 最后得到“body 已经是 l2，until 里还是 t3”这种半截 HIR。
-            let body_result = promote_block(
-                temp_debug_locals,
-                &mut repeat_stmt.body,
-                mapping,
-                next_local_index,
-                new_locals,
-                new_local_debug_hints,
-            );
+            let body_result = promote_block(ctx, &mut repeat_stmt.body, mapping, sticky_slots);
             let cond_changed = rewrite_expr(&mut repeat_stmt.cond, &body_result.trailing_mapping);
             body_result.changed || cond_changed
         }
@@ -599,15 +711,8 @@ fn rewrite_stmt(
             let start_changed = rewrite_expr(&mut numeric_for.start, mapping);
             let limit_changed = rewrite_expr(&mut numeric_for.limit, mapping);
             let step_changed = rewrite_expr(&mut numeric_for.step, mapping);
-            let body_changed = promote_block(
-                temp_debug_locals,
-                &mut numeric_for.body,
-                mapping,
-                next_local_index,
-                new_locals,
-                new_local_debug_hints,
-            )
-            .changed;
+            let body_changed =
+                promote_block(ctx, &mut numeric_for.body, mapping, sticky_slots).changed;
             start_changed || limit_changed || step_changed || body_changed
         }
         HirStmt::GenericFor(generic_for) => {
@@ -617,38 +722,13 @@ fn rewrite_stmt(
                 .fold(false, |changed, expr| {
                     rewrite_expr(expr, mapping) || changed
                 });
-            let body_changed = promote_block(
-                temp_debug_locals,
-                &mut generic_for.body,
-                mapping,
-                next_local_index,
-                new_locals,
-                new_local_debug_hints,
-            )
-            .changed;
+            let body_changed =
+                promote_block(ctx, &mut generic_for.body, mapping, sticky_slots).changed;
             iterator_changed || body_changed
         }
-        HirStmt::Block(block) => {
-            promote_block(
-                temp_debug_locals,
-                block,
-                mapping,
-                next_local_index,
-                new_locals,
-                new_local_debug_hints,
-            )
-            .changed
-        }
+        HirStmt::Block(block) => promote_block(ctx, block, mapping, sticky_slots).changed,
         HirStmt::Unstructured(unstructured) => {
-            promote_block(
-                temp_debug_locals,
-                &mut unstructured.body,
-                mapping,
-                next_local_index,
-                new_locals,
-                new_local_debug_hints,
-            )
-            .changed
+            promote_block(ctx, &mut unstructured.body, mapping, sticky_slots).changed
         }
         HirStmt::Break
         | HirStmt::Close(_)
