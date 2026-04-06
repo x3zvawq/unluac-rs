@@ -1,19 +1,40 @@
 # unluac-js
 
-`unluac-js` 是 [unluac-rs](https://github.com/X3ZvaWQ/unluac-rs) 的 npm 包装。
+`unluac-js` is the published JavaScript / TypeScript wrapper for
+[unluac-rs](https://github.com/x3zvawq/unluac-rs).
 
-它会消费 `unluac-wasm` 产出的构建结果，并对外提供适合 JavaScript /
-TypeScript 环境的发布入口与包装 API。
+It consumes the WebAssembly build produced by `packages/unluac-wasm` and
+exposes a small JS-friendly API for decompiling Lua bytecode in Node.js and
+bundler-based browser environments.
 
-## 安装
+## Installation
 
 ```bash
 npm install unluac-js
 ```
 
-## Node.js 使用
+Requirements:
 
-在 Node.js 里，默认初始化逻辑会自动从包目录读取 wasm 文件，所以通常不需要手动传 wasm 路径。
+- Node.js `>= 18` for Node usage
+- A bundler that can emit package-relative wasm assets for browser usage
+
+## What This Package Provides
+
+- `init(input?)`: initialize the wasm module explicitly
+- `decompile(bytes, options?)`: decompile a compiled Lua chunk and return the final source string
+- `supportedOptionValues()`: inspect supported enum-like option values
+
+This package ships a slim wasm build for npm. In particular:
+
+- `decompile()` returns the final generated source string directly
+- debug dumps and timing reports are not exposed in the published npm build
+- if you need the full debug surface, use the Rust crate or `unluac-cli`
+
+## Node.js Usage
+
+In Node.js, the default initialization path automatically reads the packaged
+`unluac_wasm_bg.wasm` file, so you usually do not need to pass a wasm path
+manually.
 
 ```js
 import { decompile, supportedOptionValues } from "unluac-js";
@@ -25,13 +46,13 @@ const values = await supportedOptionValues();
 console.log(values.dialects);
 
 const source = await decompile(chunkBytes, {
-  dialect: "lua5.1"
+  dialect: "lua5.1",
 });
 
 console.log(source);
 ```
 
-如果你想更早完成初始化，也可以手动先调用：
+If you want to initialize earlier in your startup path, you can also call:
 
 ```js
 import { init } from "unluac-js";
@@ -39,12 +60,14 @@ import { init } from "unluac-js";
 await init();
 ```
 
-## 浏览器使用
+## Browser Usage
 
-在浏览器里，推荐通过现代打包器使用这个包，并确保 `unluac_wasm.js` 和
-`unluac_wasm_bg.wasm` 会随构建一起输出。
+In the browser, the recommended setup is to use this package through a modern
+bundler and make sure both `unluac_wasm.js` and `unluac_wasm_bg.wasm` are emitted
+as runtime assets.
 
-如果你的打包器能正确处理包内的相对资源路径，直接调用 `init()` 即可：
+If your bundler can resolve the package's relative wasm asset automatically,
+calling `init()` is enough:
 
 ```ts
 import { decompile, init } from "unluac-js";
@@ -58,10 +81,10 @@ const source = await decompile(chunkBytes, {
 console.log(source);
 ```
 
-如果你需要显式指定 wasm 文件位置，也可以传入 URL：
+If you need to provide the wasm location explicitly, pass a `URL`:
 
 ```ts
-import { init, decompile } from "unluac-js";
+import { decompile, init } from "unluac-js";
 
 await init(new URL("./unluac_wasm_bg.wasm", import.meta.url));
 
@@ -72,26 +95,82 @@ const source = await decompile(chunkBytes, {
 console.log(source);
 ```
 
-## 参数说明
+## API Notes
 
-`decompile(bytes, options?)` 的常用参数如下：
+### `decompile(bytes, options?)`
 
-- `dialect`: 目标字节码 dialect，如 `lua5.1`、`lua5.4`、`luajit`、`luau`
-- `parse.stringEncoding`: 字符串解码编码，支持 `utf-8` 和 `gbk`
-- `parse.stringDecodeMode`: 字符串解码失败策略，支持 `strict` 和 `lossy`
-- `naming.mode`: 命名策略，支持 `debug-like`、`simple`、`heuristic`
+- `bytes` accepts `BufferSource` or any `ArrayLike<number>`
+- the input must already be a compiled chunk; this package does not compile Lua source for you
+- the return value is always the final generated source string
 
-默认情况下，这个包会直接输出最终源码，并沿用仓库当前默认 preset：
+Supported top-level options:
+
+- `dialect`
+- `parse`
+- `readability`
+- `naming`
+- `generate`
+
+Unsupported in the published npm build:
+
+- `debug`
+- timing-report style output
+
+### `supportedOptionValues()`
+
+Returns the currently supported enum-like values for:
+
+- `dialects`
+- `parseModes`
+- `stringEncodings`
+- `stringDecodeModes`
+- `namingModes`
+- `quoteStyles`
+- `tableStyles`
+
+## Option Reference
+
+Common `decompile()` options:
+
+- `dialect`: target chunk dialect such as `lua5.1`, `lua5.4`, `luajit`, or `luau`
+- `parse.mode`: parser mode, `strict` or `permissive`
+- `parse.stringEncoding`: string decoding encoding, `utf-8` or `gbk`
+- `parse.stringDecodeMode`: string decode failure strategy, `strict` or `lossy`
+- `naming.mode`: naming strategy, `debug-like`, `simple`, or `heuristic`
+- `naming.debugLikeIncludeFunction`: whether debug-like naming should include function-shaped names
+
+`readability` sub-options:
+
+- `returnInlineMaxComplexity`
+- `indexInlineMaxComplexity`
+- `argsInlineMaxComplexity`
+- `accessBaseInlineMaxComplexity`
+
+`generate` sub-options:
+
+- `indentWidth`
+- `maxLineLength`
+- `quoteStyle`
+- `tableStyle`
+- `conservativeOutput`
+- `comment`
+
+Current library defaults used by this package:
 
 - `parse.mode = permissive`
+- `parse.stringEncoding = utf-8`
+- `parse.stringDecodeMode = strict`
 - `naming.mode = debug-like`
 - `naming.debugLikeIncludeFunction = true`
+- `generate.indentWidth = 4`
+- `generate.maxLineLength = 100`
+- `generate.quoteStyle = min-escape`
+- `generate.tableStyle = balanced`
+- `generate.conservativeOutput = true`
+- `generate.comment = true`
 
-`generate` 子选项：
+## Related Packages
 
-- `indentWidth`: 缩进宽度
-- `maxLineLength`: 软换行参考宽度
-- `quoteStyle`: 字符串引号风格
-- `tableStyle`: 表构造器布局风格
-- `conservativeOutput`: 是否偏向保守输出
-- `comment`: 是否输出文件头 / proto 注释，默认 `true`
+- Root project: [unluac-rs](https://github.com/x3zvawq/unluac-rs)
+- Rust crate: [unluac on crates.io](https://crates.io/crates/unluac)
+- CLI binaries: [GitHub Releases](https://github.com/x3zvawq/unluac-rs/releases)
