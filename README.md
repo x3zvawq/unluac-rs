@@ -1,6 +1,6 @@
 # unluac-rs
 
-[简体中文](./README.md) | English
+[简体中文](./README_cn.md) | English
 
 > This repository is still in a testing phase, and its behavior, APIs, and output details may continue to evolve. Bug reports, problematic test cases, incompatibility findings, usage feedback, and release-related suggestions are all very welcome.
 
@@ -40,40 +40,41 @@ The repository is currently organized around these integration and distribution 
 The most direct CLI entry point inside this repository is:
 
 ```bash
-cargo unluac -- --input /absolute/path/to/chunk.out --dialect=lua5.1
-cargo unluac -- --source tests/lua_cases/lua5.1/01_setfenv.lua --dialect=lua5.1
-```
-
-Equivalent command:
-
-```bash
-cargo run -p unluac-cli -- --input /absolute/path/to/chunk.out --dialect=lua5.1
+unluac-cli -i /absolute/path/to/chunk.out -D lua5.1
+unluac-cli -s tests/lua_cases/lua5.1/01_setfenv.lua -D lua5.1
+unluac-cli -i /absolute/path/to/chunk.out -D lua5.1 -o /tmp/case.lua
 ```
 
 Notes:
 
-- The CLI currently requires you to pass either `--input` or `--source`
-- When `--source` is provided, the CLI first invokes an external compiler to produce a chunk, then decompiles that generated chunk
-- The standalone `unluac-cli` binaries published on GitHub Release do not bundle a Lua compiler; `--source` only works when you pass `--luac` explicitly, or when a compatible compiler is available under `lua/build/<dialect>/` or on PATH
+- The CLI currently requires you to pass either `-i/--input` or `-s/--source`
+- When `-s/--source` is provided, the CLI first invokes an external compiler to produce a chunk, then decompiles that generated chunk
+- The standalone `unluac-cli` binaries published on GitHub Release do not bundle a Lua compiler; `-s/--source` only works when you pass `-l/--luac` explicitly, or when a compatible compiler is available under `lua/build/<dialect>/` or on PATH
+- When `-o/--output` is provided, the CLI writes the final generated source to the target file instead of stdout
+- `-o/--output` only works for pure final-source runs and cannot be combined with debug / timing flags or `--stop-after` earlier than `generate`
 - The CLI prints plain generated source by default and does not emit debug dumps
+- `unluac-cli --help` and `unluac-cli --version` both include the repository link
 - The default dialect / parse / readability / naming / generate values still share the same repo debug preset used by [examples/debug.rs](./examples/debug.rs)
-- If you want repo-debug-style dump output, explicitly add `--debug`
+- If you want repo-debug-style dump output, explicitly add `-d/--debug`
 
 | Argument | Description | Default |
 | - | - | - |
-| `--input` | Path to a compiled chunk | None |
-| `--source` | Path to Lua source; the CLI invokes an external compiler before decompiling | None |
-| `--luac` | Explicit compiler path used by `--source` | First tries `lua/build/<dialect>/`, otherwise falls back to a compatible compiler on PATH |
-| `--dialect` | Dialect used for compilation / decompilation | `lua5.1` |
+| `-i`, `--input` | Path to a compiled chunk | None |
+| `-s`, `--source` | Path to Lua source; the CLI invokes an external compiler before decompiling | None |
+| `-o`, `--output` | Write the final generated source to a file instead of stdout | stdout |
+| `-l`, `--luac` | Explicit compiler path used by `--source` | First tries `lua/build/<dialect>/`, otherwise falls back to a compatible compiler on PATH |
+| `-D`, `--dialect` | Dialect used for compilation / decompilation | `lua5.1` |
 | `--stop-after` | Last pipeline stage to run | `generate` |
-| `--debug` | Enable debug dumps | `false` |
-| `--detail` | Debug output detail level | `verbose` when debug is enabled |
-| `--color` | Debug color mode | `always` when debug is enabled |
-| `--timing` | Print timing report | `false` |
-| `--parse-mode` | Strict vs permissive parser mode | `permissive` |
-| `--encoding` | String decoding encoding | `utf-8` |
-| `--decode-mode` | String decode failure strategy | `strict` |
-| `--naming-mode` | Naming strategy | `debug-like` |
+| `-d`, `--debug` | Enable debug dumps | `false` |
+| `--detail` | Debug output detail level | `normal` when debug is enabled |
+| `-c`, `--color` | Debug color mode | `auto` when debug is enabled |
+| `-t`, `--timing` | Print timing report | `false` |
+| `-p`, `--parse-mode` | Strict vs permissive parser mode | `permissive` |
+| `-e`, `--encoding` | String decoding encoding | `utf-8` |
+| `-m`, `--decode-mode` | String decode failure strategy | `strict` |
+| `-n`, `--naming-mode` | Naming strategy | `debug-like` |
+| `-g`, `--generate-mode` | How to handle syntax not supported by the target dialect | `strict` |
+| `--comment` | Whether to emit generate-stage comments and metadata | `true` |
 
 For more debugging examples and flags, see [docs/debug.md](./docs/debug.md).
 

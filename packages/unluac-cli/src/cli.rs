@@ -1,8 +1,8 @@
 //! 这个文件实现仓库自带的命令行入口。
 //!
 //! 它负责把外部命令行参数映射成核心库的 `DecompileOptions`，并明确把 CLI 侧的
-//! 输入约束、编译器查找和调试输出拼装留在二进制包里，避免这些发布形态相关的
-//! 细节重新渗回核心库。
+//! 输入约束、编译器查找、输出路由和调试输出拼装留在二进制包里，避免这些
+//! 发布形态相关的细节重新渗回核心库。
 
 use std::env;
 use std::ffi::OsStr;
@@ -11,12 +11,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use clap::{Parser, builder::BoolishValueParser};
+use clap::{CommandFactory, Parser, builder::BoolishValueParser, error::ErrorKind};
 use unluac::decompile::{
     DebugColorMode, DebugDetail, DebugFilters, DecompileDialect, DecompileOptions, DecompileStage,
     GenerateMode, NamingMode, QuoteStyle, TableStyle, decompile, render_timing_report,
 };
 use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
+
+const CLI_VERSION_TEXT: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\n",
+    env!("CARGO_PKG_REPOSITORY")
+);
+const CLI_AFTER_HELP: &str = concat!("Repository: ", env!("CARGO_PKG_REPOSITORY"));
+const OUTPUT_ONLY_SUPPORTS_FINAL_SOURCE: &str = "`--output` only supports pure final generated \
+source output; remove `--output` or keep `--stop-after=generate` without debug or timing flags.";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum CompilerProtocol {
@@ -29,100 +38,177 @@ enum CompilerProtocol {
 struct CliOptions {
     input: Option<PathBuf>,
     source: Option<PathBuf>,
+    output: Option<PathBuf>,
     luac: Option<PathBuf>,
     decompile: DecompileOptions,
 }
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "unluac",
-    version,
+    name = "unluac-cli",
+    bin_name = "unluac-cli",
+    version = CLI_VERSION_TEXT,
+    long_version = CLI_VERSION_TEXT,
+    after_help = CLI_AFTER_HELP,
     about = "Decompile Lua, LuaJIT, and Luau bytecode inputs, or source inputs when an external compiler is available.",
     disable_help_subcommand = true
 )]
 struct CliArgs {
     /// Dialect to compile or decompile against.
-    #[arg(long, value_parser = parse_dialect_arg)]
+    #[arg(short = 'D', long, value_parser = parse_dialect_arg, help_heading = "Input")]
     dialect: Option<DecompileDialect>,
     /// Existing compiled chunk path.
-    #[arg(long, conflicts_with = "source", required_unless_present = "source")]
+    #[arg(
+        short = 'i',
+        long,
+        conflicts_with = "source",
+        required_unless_present = "source",
+        help_heading = "Input"
+    )]
     input: Option<PathBuf>,
     /// Lua source path to compile before decompilation. Requires an external compiler via `--luac`,
     /// a bundled compiler under `lua/build/<dialect>/`, or a compatible compiler on PATH.
-    #[arg(long, conflicts_with = "input", required_unless_present = "input")]
+    #[arg(
+        short = 's',
+        long,
+        conflicts_with = "input",
+        required_unless_present = "input",
+        help_heading = "Input"
+    )]
     source: Option<PathBuf>,
-    /// Enable debug output using the default final-source preset.
-    #[arg(long)]
-    debug: bool,
     /// Override the external compiler path used by `--source`.
-    #[arg(long)]
+    #[arg(short = 'l', long, help_heading = "Input")]
     luac: Option<PathBuf>,
     /// String decoding encoding.
-    #[arg(long, value_parser = parse_string_encoding_arg)]
+    #[arg(
+        short = 'e',
+        long,
+        value_parser = parse_string_encoding_arg,
+        help_heading = "Input"
+    )]
     encoding: Option<StringEncoding>,
     /// String decoding failure mode.
-    #[arg(long, value_parser = parse_string_decode_mode_arg)]
+    #[arg(
+        short = 'm',
+        long,
+        value_parser = parse_string_decode_mode_arg,
+        help_heading = "Input"
+    )]
     decode_mode: Option<StringDecodeMode>,
     /// Parser strictness.
-    #[arg(long, value_parser = parse_parse_mode_arg)]
+    #[arg(
+        short = 'p',
+        long,
+        value_parser = parse_parse_mode_arg,
+        help_heading = "Input"
+    )]
     parse_mode: Option<ParseMode>,
+    /// Enable debug output using the default final-source preset.
+    #[arg(short = 'd', long, help_heading = "Debug")]
+    debug: bool,
     /// Dump one or more pipeline stages.
-    #[arg(long, value_parser = parse_stage_arg)]
+    #[arg(long, value_parser = parse_stage_arg, help_heading = "Debug")]
     dump: Vec<DecompileStage>,
-    /// Stop the pipeline after a specific stage.
-    #[arg(long, value_parser = parse_stage_arg)]
-    stop_after: Option<DecompileStage>,
     /// Debug output detail level.
-    #[arg(long, value_parser = parse_debug_detail_arg)]
+    #[arg(long, value_parser = parse_debug_detail_arg, help_heading = "Debug")]
     detail: Option<DebugDetail>,
     /// Debug color mode.
-    #[arg(long, value_parser = parse_debug_color_arg)]
+    #[arg(
+        short = 'c',
+        long,
+        value_parser = parse_debug_color_arg,
+        help_heading = "Debug"
+    )]
     color: Option<DebugColorMode>,
     /// Restrict debug dumps to a specific proto id.
-    #[arg(long)]
+    #[arg(long, help_heading = "Debug")]
     proto: Option<usize>,
     /// Emit timing report.
-    #[arg(long)]
+    #[arg(short = 't', long, help_heading = "Debug")]
     timing: bool,
     /// Max inline complexity for returned expressions.
-    #[arg(long)]
+    #[arg(long, help_heading = "Generate")]
     return_inline_max_complexity: Option<usize>,
     /// Max inline complexity for table index expressions.
-    #[arg(long)]
+    #[arg(long, help_heading = "Generate")]
     index_inline_max_complexity: Option<usize>,
     /// Max inline complexity for call arguments.
-    #[arg(long)]
+    #[arg(long, help_heading = "Generate")]
     args_inline_max_complexity: Option<usize>,
     /// Max inline complexity for table access bases.
-    #[arg(long)]
+    #[arg(long, help_heading = "Generate")]
     access_base_inline_max_complexity: Option<usize>,
     /// Naming strategy.
-    #[arg(long, value_parser = parse_naming_mode_arg)]
+    #[arg(
+        short = 'n',
+        long,
+        value_parser = parse_naming_mode_arg,
+        help_heading = "Generate"
+    )]
     naming_mode: Option<NamingMode>,
     /// Whether debug-like names should include function-shaped names.
-    #[arg(long, value_name = "BOOL", value_parser = BoolishValueParser::new())]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = BoolishValueParser::new(),
+        help_heading = "Generate"
+    )]
     debug_like_include_function: Option<bool>,
     /// Generated source indentation width.
-    #[arg(long)]
+    #[arg(long, help_heading = "Generate")]
     indent_width: Option<usize>,
     /// Preferred maximum line length.
-    #[arg(long)]
+    #[arg(long, help_heading = "Generate")]
     max_line_length: Option<usize>,
     /// String quote style.
-    #[arg(long, value_parser = parse_quote_style_arg)]
+    #[arg(
+        long,
+        value_parser = parse_quote_style_arg,
+        help_heading = "Generate"
+    )]
     quote_style: Option<QuoteStyle>,
     /// Table constructor layout style.
-    #[arg(long, value_parser = parse_table_style_arg)]
+    #[arg(
+        long,
+        value_parser = parse_table_style_arg,
+        help_heading = "Generate"
+    )]
     table_style: Option<TableStyle>,
     /// Whether to prefer conservative source generation.
-    #[arg(long, value_name = "BOOL", value_parser = BoolishValueParser::new())]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = BoolishValueParser::new(),
+        help_heading = "Generate"
+    )]
     conservative_output: Option<bool>,
     /// Whether to emit generate-stage comments and metadata.
-    #[arg(long, value_name = "BOOL", value_parser = BoolishValueParser::new())]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = BoolishValueParser::new(),
+        help_heading = "Generate"
+    )]
     comment: Option<bool>,
     /// How to handle syntax not supported by the requested target dialect.
-    #[arg(long, value_parser = parse_generate_mode_arg)]
+    #[arg(
+        short = 'g',
+        long,
+        value_parser = parse_generate_mode_arg,
+        help_heading = "Generate"
+    )]
     generate_mode: Option<GenerateMode>,
+    /// Stop the pipeline after a specific stage.
+    #[arg(long, value_parser = parse_stage_arg, help_heading = "Output")]
+    stop_after: Option<DecompileStage>,
+    /// Write the final generated source to a file instead of stdout. Only available for pure final-source runs.
+    #[arg(
+        short = 'o',
+        long,
+        conflicts_with_all = ["debug", "dump", "detail", "color", "proto", "timing"],
+        help_heading = "Output"
+    )]
+    output: Option<PathBuf>,
 }
 
 pub fn run<I>(args: I) -> Result<(), CliError>
@@ -148,8 +234,15 @@ where
 
     if result.debug_output.is_empty() && result.timing_report.is_none() {
         if let Some(generated) = result.state.generated.as_ref() {
-            print!("{}", generated.source);
+            if let Some(source) =
+                emit_generated_source(&generated.source, options.output.as_deref())?
+            {
+                print!("{source}");
+            }
             return Ok(());
+        }
+        if options.output.is_some() {
+            return Err(output_argument_conflict());
         }
         println!(
             "pipeline stopped after {}",
@@ -159,6 +252,9 @@ where
                 .unwrap_or(DecompileStage::Parse)
         );
     } else {
+        if options.output.is_some() {
+            return Err(output_argument_conflict());
+        }
         for (index, output) in result.debug_output.iter().enumerate() {
             if index > 0 {
                 println!();
@@ -188,7 +284,7 @@ where
         Ok(args) => args,
         Err(error) => {
             if error.use_stderr() {
-                return Err(CliError::Usage(error.to_string()));
+                return Err(clap_usage_error(error));
             }
             error.print().map_err(CliError::WriteCliOutput)?;
             return Err(CliError::HelpShown);
@@ -234,7 +330,7 @@ where
     if has_explicit_debug_output {
         decompile.debug.enable = true;
         if has_explicit_dump {
-            decompile.debug.output_stages = args.dump;
+            decompile.debug.output_stages = args.dump.clone();
         } else {
             // 只要显式请求了 debug 输出但没指定 dump，就沿用默认 preset
             // 的“当前目标阶段”约定，而不是静默什么都不打印。
@@ -292,12 +388,61 @@ where
         decompile.generate.mode = mode;
     }
 
+    validate_output_request(&args, &decompile)?;
+
     Ok(CliOptions {
         input: args.input,
         source: args.source,
+        output: args.output,
         luac: args.luac,
         decompile,
     })
+}
+
+fn validate_output_request(args: &CliArgs, decompile: &DecompileOptions) -> Result<(), CliError> {
+    if args.output.is_some()
+        && (decompile.target_stage != DecompileStage::Generate
+            || decompile.debug.enable
+            || decompile.debug.timing
+            || !decompile.debug.output_stages.is_empty())
+    {
+        return Err(output_argument_conflict());
+    }
+
+    Ok(())
+}
+
+fn emit_generated_source<'a>(
+    source: &'a str,
+    output: Option<&Path>,
+) -> Result<Option<&'a str>, CliError> {
+    if let Some(path) = output {
+        fs::write(path, source).map_err(|source_error| CliError::Io {
+            action: "write output file",
+            path: path.to_path_buf(),
+            source: source_error,
+        })?;
+        return Ok(None);
+    }
+
+    Ok(Some(source))
+}
+
+fn output_argument_conflict() -> CliError {
+    let error = CliArgs::command().error(
+        ErrorKind::ArgumentConflict,
+        OUTPUT_ONLY_SUPPORTS_FINAL_SOURCE,
+    );
+    clap_usage_error(error)
+}
+
+fn clap_usage_error(error: clap::Error) -> CliError {
+    let rendered = error.to_string();
+    let message = rendered
+        .strip_prefix("error: ")
+        .unwrap_or(rendered.as_str())
+        .to_owned();
+    CliError::Usage(message)
 }
 
 fn resolve_input_path(options: &CliOptions) -> Result<PathBuf, CliError> {

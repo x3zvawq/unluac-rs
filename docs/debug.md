@@ -24,58 +24,65 @@ cargo run -p unluac-cli -- ...
 
 - 运行 [packages/unluac-cli/src/main.rs](/Users/x3zvawq/workspace/unluac-rs/packages/unluac-cli/src/main.rs)
 - 转到 [packages/unluac-cli/src/cli.rs](/Users/x3zvawq/workspace/unluac-rs/packages/unluac-cli/src/cli.rs)
-- 必须显式传入 `--input` 或 `--source`
-- 如果传的是 `--source`，会先调用对应 dialect 的编译器把 Lua 源码编译成 chunk
+- 必须显式传入 `-i/--input` 或 `-s/--source`
+- 如果传的是 `-s/--source`，会先调用对应 dialect 的编译器把 Lua 源码编译成 chunk
 - 默认直接输出最终源码，不打印 debug dump
-- 如果显式传入 `--debug` 或其他 debug 相关参数，才会打印对应阶段的 dump / timing
+- 如果显式传入 `-d/--debug` 或其他 debug 相关参数，才会打印对应阶段的 dump / timing
+- 如果传入 `-o/--output`，会把最终源码写进目标文件而不是 stdout
+- `unluac-cli --help` 和 `unluac-cli --version` 都会附带仓库链接
 
 最常用的命令：
 
 ```bash
-cargo unluac -- --input /absolute/path/to/chunk.out --dialect=lua5.1
-cargo unluac -- --source tests/lua_cases/luajit/09_ull_table_rotation.lua
-cargo unluac -- --source tests/lua_cases/lua5.1/01_setfenv.lua --dialect=lua5.1
-cargo unluac -- --source tests/lua_cases/lua5.1/01_setfenv.lua --debug
-cargo unluac -- --input /absolute/path/to/chunk.out --timing
-cargo unluac -- --input /absolute/path/to/chunk.out --stop-after=generate
-cargo run -p unluac-cli -- --input /absolute/path/to/chunk.out --dump=parse --detail=verbose
+cargo unluac -- -i /absolute/path/to/chunk.out -D lua5.1
+cargo unluac -- -s tests/lua_cases/luajit/09_ull_table_rotation.lua -D luajit
+cargo unluac -- -s tests/lua_cases/lua5.1/01_setfenv.lua -D lua5.1
+cargo unluac -- -i /absolute/path/to/chunk.out -D lua5.4 -o /tmp/case.lua
+cargo unluac -- -s tests/lua_cases/lua5.1/01_setfenv.lua -d
+cargo unluac -- -i /absolute/path/to/chunk.out -t
+cargo unluac -- -i /absolute/path/to/chunk.out --stop-after=generate
+cargo run -p unluac-cli -- -i /absolute/path/to/chunk.out --dump=parse --detail=verbose
+cargo run -p unluac-cli -- --help
 ```
 
 当前支持的一些实用参数：
 
-- `--dialect=lua5.1`
-- `--source=<lua 源码路径>`
-- `--input=<已编译 chunk 路径>`
-- `--debug`
-- `--encoding=utf8|gbk`
-- `--decode-mode=strict|lossy`
-- `--parse-mode=strict|permissive`
+- `-D, --dialect=lua5.1`
+- `-s, --source=<lua 源码路径>`
+- `-i, --input=<已编译 chunk 路径>`
+- `-o, --output=<源码输出路径>`
+- `-d, --debug`
+- `-e, --encoding=utf8|gbk`
+- `-m, --decode-mode=strict|lossy`
+- `-p, --parse-mode=strict|permissive`
 - `--dump=parse`
 - 多次写 `--dump` 可以同时查看多个阶段
 - `--stop-after=parse`
 - `--detail=summary|normal|verbose`
-- `--color=auto|always|never`
-- `--timing`
+- `-c, --color=auto|always|never`
+- `-t, --timing`
 - `--proto=<id>`
 - `--return-inline-max-complexity=<n>`
 - `--index-inline-max-complexity=<n>`
 - `--args-inline-max-complexity=<n>`
 - `--access-base-inline-max-complexity=<n>`
-- `--naming-mode=debug-like|simple|heuristic`
+- `-n, --naming-mode=debug-like|simple|heuristic`
 - `--debug-like-include-function=true|false`
 - `--indent-width=<n>`
 - `--max-line-length=<n>`
 - `--quote-style=prefer-double|prefer-single|min-escape`
 - `--table-style=compact|balanced|expanded`
 - `--conservative-output=true|false`
+- `-g, --generate-mode=strict|best-effort|permissive`
 
 这里有一个当前约定：
 
 - 默认不启用 debug，CLI 会直接输出纯源码
-- `--debug` 会按 repo debug preset 为当前 `target_stage` 打开一份默认 dump
+- `-d/--debug` 会按 repo debug preset 为当前 `target_stage` 打开一份默认 dump
 - `--stop-after` 决定 pipeline 实际跑到哪一层
 - `--dump` 只决定“已经跑到的层里哪些需要打印”
-- `--timing` 可以单独使用；如果没有同时请求 dump，它只会输出 timing report
+- `-t/--timing` 可以单独使用；如果没有同时请求 dump，它只会输出 timing report
+- `-o/--output` 只支持纯最终源码输出；如果你同时请求 debug / timing，或者把 `--stop-after` 停在 `generate` 之前，CLI 会直接报错
 
 也就是说，如果你写了更后的 `--dump`，但 `--stop-after` 停得更早，那么未到达的层不会输出，也不会因此强行继续执行。
 
@@ -83,20 +90,23 @@ cargo run -p unluac-cli -- --input /absolute/path/to/chunk.out --dump=parse --de
 
 ```bash
 # 已经有 chunk，直接反编译成纯源码
-cargo unluac -- --input /absolute/path/to/chunk.out --dialect=lua5.1
+cargo unluac -- -i /absolute/path/to/chunk.out -D lua5.1
 
 # 只有 Lua 源码，先编译再反编译成纯源码
-cargo unluac -- --source tests/lua_cases/lua5.1/01_setfenv.lua --dialect=lua5.1
+cargo unluac -- -s tests/lua_cases/lua5.1/01_setfenv.lua -D lua5.1
+
+# 需要把最终源码落盘
+cargo unluac -- -i /absolute/path/to/chunk.out -D lua5.1 -o /tmp/case.lua
 ```
 
 如果你要看 repo debug preset 风格的调试输出，最常用的是这两类：
 
 ```bash
 # 直接看当前 target_stage 的默认 dump
-cargo unluac -- --source tests/lua_cases/luajit/09_ull_table_rotation.lua --debug
+cargo unluac -- -s tests/lua_cases/luajit/09_ull_table_rotation.lua -D luajit -d
 
 # 只看 timing，不输出 dump
-cargo unluac -- --input /absolute/path/to/chunk.out --timing
+cargo unluac -- -i /absolute/path/to/chunk.out -t
 ```
 
 ## 2. `cargo run --example debug`

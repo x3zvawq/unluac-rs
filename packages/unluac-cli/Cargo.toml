@@ -3,6 +3,8 @@ name = "unluac-cli"
 version = "1.0.0"
 edition = "2024"
 publish = false
+repository = "https://github.com/x3zvawq/unluac-rs"
+homepage = "https://github.com/x3zvawq/unluac-rs"
 
 [lints]
 workspace = true

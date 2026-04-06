@@ -1,6 +1,6 @@
 # unluac-rs
 
-简体中文 | [English](./README_en.md)
+简体中文 | [English](./README.md)
 
 > 当前仓库仍处于测试阶段，行为、接口和输出细节后续都可能继续调整。非常欢迎提交反编译失败、输出不理想或存在兼容性问题的测试样例，也欢迎通过 issue / discussion 提出使用反馈、改进建议和发布体验上的意见。
 
@@ -40,41 +40,47 @@
 当前仓库里最直接的命令行入口是：
 
 ```bash
-cargo unluac -- --input /absolute/path/to/chunk.out --dialect=lua5.1
-cargo unluac -- --source tests/lua_cases/lua5.1/01_setfenv.lua --dialect=lua5.1
+cargo unluac -- -i /absolute/path/to/chunk.out -D lua5.1
+cargo unluac -- -s tests/lua_cases/lua5.1/01_setfenv.lua -D lua5.1
+cargo unluac -- -i /absolute/path/to/chunk.out -D lua5.1 -o /tmp/case.lua
 ```
 
 等价命令：
 
 ```bash
-cargo run -p unluac-cli -- --input /absolute/path/to/chunk.out --dialect=lua5.1
+cargo run -p unluac-cli -- -i /absolute/path/to/chunk.out -D lua5.1
 ```
 
 说明：
 
-- CLI 当前要求你显式传入 `--input` 或 `--source`
-- 如果传入 `--source`，CLI 会先调用外部编译器生成 chunk，再执行反编译
-- GitHub Release 提供的裸 `unluac-cli` 二进制不会自带 Lua 编译器；`--source` 只有在你显式传入 `--luac`，或运行环境中存在 `lua/build/<dialect>/` / PATH 上的兼容编译器时才可用
+- CLI 当前要求你显式传入 `-i/--input` 或 `-s/--source`
+- 如果传入 `-s/--source`，CLI 会先调用外部编译器生成 chunk，再执行反编译
+- GitHub Release 提供的裸 `unluac-cli` 二进制不会自带 Lua 编译器；`-s/--source` 只有在你显式传入 `-l/--luac`，或运行环境中存在 `lua/build/<dialect>/` / PATH 上的兼容编译器时才可用
+- 如果传入 `-o/--output`，CLI 会把最终生成源码直接写入目标文件，而不是输出到 stdout
+- `-o/--output` 只支持纯最终源码输出，不能和 debug / timing 参数一起使用，也不能和早于 `generate` 的 `--stop-after` 组合
 - CLI 默认直接输出纯源码，不打印 debug dump
+- `unluac-cli --help` 与 `unluac-cli --version` 都会附带仓库链接
 - `generate` 阶段默认会在输出源码中附带 chunk / proto 注释元信息；可通过 `--comment false` 关闭
 - CLI 的 dialect / parse / readability / naming / generate 默认值仍与 [examples/debug.rs](./examples/debug.rs) 共用同一份 repo 调试 preset
-- 如果你想看 repo debug preset 风格的调试输出，可以显式附加 `--debug`
+- 如果你想看 repo debug preset 风格的调试输出，可以显式附加 `-d/--debug`
 
 | 参数 | 说明 | 默认值 |
 | - | - | - |
-| `--input` | 已编译 chunk 路径 | 无 |
-| `--source` | Lua 源码路径，CLI 会先调用外部编译器，再执行反编译 | 无 |
-| `--luac` | 显式指定 `--source` 使用的外部编译器路径 | 先尝试仓库内 `lua/build/<dialect>/`，否则回退到 PATH 上的兼容编译器 |
-| `--dialect` | 反编译 / 编译时使用的 dialect | `lua5.1` |
+| `-i`, `--input` | 已编译 chunk 路径 | 无 |
+| `-s`, `--source` | Lua 源码路径，CLI 会先调用外部编译器，再执行反编译 | 无 |
+| `-o`, `--output` | 将最终生成源码写入文件，而不是输出到 stdout | stdout |
+| `-l`, `--luac` | 显式指定 `--source` 使用的外部编译器路径 | 先尝试仓库内 `lua/build/<dialect>/`，否则回退到 PATH 上的兼容编译器 |
+| `-D`, `--dialect` | 反编译 / 编译时使用的 dialect | `lua5.1` |
 | `--stop-after` | 反编译 pipeline 截止阶段 | `generate` |
-| `--debug` | 启用 debug dump | `false` |
-| `--detail` | 调试输出粒度 | `verbose`（启用 debug 时） |
-| `--color` | 调试输出颜色模式 | `always`（启用 debug 时） |
-| `--timing` | 输出耗时报告 | `false` |
-| `--parse-mode` | parser 宽松 / 严格模式 | `permissive` |
-| `--encoding` | 字符串解码编码 | `utf-8` |
-| `--decode-mode` | 字符串解码失败策略 | `strict` |
-| `--naming-mode` | 命名策略 | `debug-like` |
+| `-d`, `--debug` | 启用 debug dump | `false` |
+| `--detail` | 调试输出粒度 | `normal`（启用 debug 时） |
+| `-c`, `--color` | 调试输出颜色模式 | `auto`（启用 debug 时） |
+| `-t`, `--timing` | 输出耗时报告 | `false` |
+| `-p`, `--parse-mode` | parser 宽松 / 严格模式 | `permissive` |
+| `-e`, `--encoding` | 字符串解码编码 | `utf-8` |
+| `-m`, `--decode-mode` | 字符串解码失败策略 | `strict` |
+| `-n`, `--naming-mode` | 命名策略 | `debug-like` |
+| `-g`, `--generate-mode` | 目标 dialect 不支持语法时的处理策略 | `strict` |
 | `--comment` | 是否输出 generate 注释元信息 | `true` |
 
 更多调试相关命令和参数可参考 [docs/debug.md](./docs/debug.md)。
