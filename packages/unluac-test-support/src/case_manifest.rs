@@ -368,6 +368,10 @@ pub(crate) const ALL_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/lua_cases/common/tricky/33_inline_adjacent_result_sinks.lua",
         ALL_NON_LUAU_DIALECTS,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/lua_cases/common/tricky/34_self_assign_branch_shell.lua",
+        ALL_DIALECTS,
+    ),
     LuaCaseMatrixEntry::new("tests/lua_cases/lua5.1/01_setfenv.lua", PUC_LUA_51),
     LuaCaseMatrixEntry::new("tests/lua_cases/lua5.1/02_module_legacy.lua", PUC_LUA_51),
     LuaCaseMatrixEntry::new(

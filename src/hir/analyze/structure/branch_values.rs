@@ -2,7 +2,8 @@
 //!
 //! 这个 pass 只消费 StructureFacts 已经整理好的 branch-arm defs，不再回头拆
 //! `phi.incoming`。它负责决定这些 merge 值应该被翻成 entry override、共享 alias，
-//! 还是保守物化成 `Decision`。
+//! 还是保守物化成 `Decision`；如果某一臂只是“沿用当前值”，也会在普通 branch
+//! lowering 里补上必要的 entry seed，避免把 preserved arm 错降成“未初始化”。
 //!
 //! 例子：
 //! - `if c then x = a else x = b end` 若两臂都能稳定 inline，会恢复成 entry override
@@ -21,6 +22,43 @@ use super::rewrites::lvalue_as_expr;
 use super::*;
 
 impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
+    pub(super) fn branch_value_preserved_entry_stmts(
+        &self,
+        header: BlockRef,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Vec<HirStmt> {
+        let Some(candidate) = self.branch_value_merges_by_header.get(&header).copied() else {
+            return Vec::new();
+        };
+
+        let mut targets = Vec::new();
+        let mut values = Vec::new();
+
+        for value in &candidate.values {
+            if !branch_value_needs_preserved_entry_seed(value) {
+                continue;
+            }
+
+            let target = self.branch_value_arm_target(value, target_overrides);
+            let init = self.branch_value_preserved_entry_expr(header, value.reg, target_overrides);
+            if lvalue_as_expr(&target)
+                .as_ref()
+                .is_some_and(|target_expr| *target_expr == init)
+            {
+                continue;
+            }
+
+            targets.push(target);
+            values.push(init);
+        }
+
+        if targets.is_empty() {
+            Vec::new()
+        } else {
+            vec![assign_stmt(targets, values)]
+        }
+    }
+
     fn branch_value_arm_target(
         &self,
         value: &BranchValueMergeValue,
@@ -235,6 +273,25 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         })))
     }
 
+    fn branch_value_preserved_entry_expr(
+        &self,
+        header: BlockRef,
+        reg: Reg,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> HirExpr {
+        // 某一臂只是在“沿用进入分支前的当前值”时，shared target 需要先吃到一份 seed；
+        // 否则后面只改写“写新值”的那一臂，merge 后继续读取的状态槽位就会悬空成 nil。
+        if !self.block_redefines_reg(header, reg)
+            && let Some(expr) = self.overrides.carried_entry_expr(header, reg)
+        {
+            return expr.clone();
+        }
+
+        let mut expr = expr_for_reg_at_block_exit(self.lowering, header, reg);
+        rewrite_expr_temps(&mut expr, &temp_expr_overrides(target_overrides));
+        expr
+    }
+
     fn uniform_dup_safe_arm_expr(&self, arm: &BranchValueMergeArm) -> Option<HirExpr> {
         let mut arm_expr = None;
 
@@ -265,6 +322,17 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             overrides.insert(*def_temp, target.clone());
         }
     }
+}
+
+fn branch_value_needs_preserved_entry_seed(value: &BranchValueMergeValue) -> bool {
+    (branch_value_arm_preserves_current(&value.then_arm)
+        && !value.else_arm.non_header_defs.is_empty())
+        || (branch_value_arm_preserves_current(&value.else_arm)
+            && !value.then_arm.non_header_defs.is_empty())
+}
+
+fn branch_value_arm_preserves_current(arm: &BranchValueMergeArm) -> bool {
+    arm.non_header_defs.is_empty() && !arm.defs.is_empty()
 }
 
 fn branch_value_non_header_defs(value: &BranchValueMergeValue) -> impl Iterator<Item = DefId> + '_ {

@@ -17,7 +17,9 @@
 //! 这里把它认回原 local，删掉 handoff seed。它不会发明新 local，也不会在原 local
 //! 仍然活跃时强行合并两段状态。对于第二类“更新后交棒”，它只在旧 binding 后续不再
 //! 被读取、并且后续确实存在 `sY = tX` 这种直接写回时才会把 `tX` 重新折回旧
-//! binding，并顺手裁掉改写后形成的 `x = x` 冗余赋值分量。
+//! binding，并只裁掉“这次 rewrite 自己制造出来”的 `x = x` seed/self-copy。
+//! 像 branch merge 里“沿用当前值”的那一臂，即便在局部重写后暂时长成 `x = x`，
+//! 也仍然承载着 preserved-current-value 语义，不能在这里被当成纯噪音吞掉。
 //!
 //! 例子：
 //! - 输入：`local l0 = 1; do t4 = l0; ::L1:: if t4 < 3 then t4 = t4 + 1; goto L1 end end`
@@ -76,7 +78,6 @@ fn collapse_block_handoffs(block: &mut HirBlock) -> bool {
         index += 1;
     }
 
-    changed |= prune_redundant_self_assigns_in_block(block);
     changed
 }
 
@@ -146,13 +147,13 @@ fn collapse_boundary_alias_classes(block: &mut HirBlock) -> bool {
         return false;
     }
 
+    let prunable_bindings = collect_prunable_bindings(rewrites.values().copied());
     let mut pass = BindingClassRewritePass { rewrites };
     if !rewrite_stmts(&mut block.stmts, &mut pass) {
         return false;
     }
 
-    rewrite_stmts(&mut block.stmts, &mut RedundantSelfAssignPrunePass);
-    prune_empty_assign_stmts(block);
+    prune_boundary_snapshot_self_assigns(block, &prunable_bindings);
     true
 }
 
@@ -271,7 +272,10 @@ fn try_collapse_pure_binding_handoffs(block: &mut HirBlock, index: usize) -> boo
         return false;
     }
 
-    rewrite_stmts(&mut block.stmts, &mut RedundantSelfAssignPrunePass);
+    prune_redundant_self_assigns_in_stmts(
+        &mut block.stmts[index + 1..],
+        collect_prunable_bindings(seed.rewrites.iter().map(|rewrite| rewrite.to)),
+    );
     prune_empty_assign_stmts(block);
     true
 }
@@ -366,10 +370,9 @@ fn try_collapse_binding_update_handoff(block: &mut HirBlock, index: usize) -> bo
         return false;
     }
 
-    prune_redundant_self_assign_components_in_stmt(&mut block.stmts[index]);
     rewrite_stmts(
         &mut block.stmts[index + 1..],
-        &mut RedundantSelfAssignPrunePass,
+        &mut RedundantSelfAssignPrunePass::for_bindings([carried]),
     );
     prune_empty_assign_stmts(block);
     true
@@ -716,7 +719,10 @@ impl HirVisitor for DirectWritebackCollector {
     }
 }
 
-fn prune_redundant_self_assign_components_in_stmt(stmt: &mut HirStmt) -> bool {
+fn prune_redundant_self_assign_components_in_stmt(
+    stmt: &mut HirStmt,
+    prunable_bindings: &BTreeSet<CarryBinding>,
+) -> bool {
     let HirStmt::Assign(assign) = stmt else {
         return false;
     };
@@ -731,7 +737,7 @@ fn prune_redundant_self_assign_components_in_stmt(stmt: &mut HirStmt) -> bool {
         .cloned()
         .zip(assign.values.iter().cloned())
     {
-        if !is_redundant_self_assign_pair(&target, &value) {
+        if !matches_redundant_self_assign_pair(&target, &value, prunable_bindings) {
             rewritten.push((target, value));
         }
     }
@@ -745,15 +751,38 @@ fn prune_redundant_self_assign_components_in_stmt(stmt: &mut HirStmt) -> bool {
     true
 }
 
-fn is_redundant_self_assign_pair(target: &HirLValue, value: &HirExpr) -> bool {
+fn matches_redundant_self_assign_pair(
+    target: &HirLValue,
+    value: &HirExpr,
+    prunable_bindings: &BTreeSet<CarryBinding>,
+) -> bool {
+    redundant_self_assign_binding(target, value)
+        .is_some_and(|binding| prunable_bindings.contains(&binding))
+}
+
+fn redundant_self_assign_binding(target: &HirLValue, value: &HirExpr) -> Option<CarryBinding> {
     match (target, value) {
-        (HirLValue::Temp(target), HirExpr::TempRef(value)) => target == value,
-        (HirLValue::Local(target), HirExpr::LocalRef(value)) => target == value,
-        _ => false,
+        (HirLValue::Temp(target), HirExpr::TempRef(value)) if target == value => {
+            Some(CarryBinding::Temp(*target))
+        }
+        (HirLValue::Local(target), HirExpr::LocalRef(value)) if target == value => {
+            Some(CarryBinding::Local(*target))
+        }
+        _ => None,
     }
 }
 
-struct RedundantSelfAssignPrunePass;
+struct RedundantSelfAssignPrunePass {
+    prunable_bindings: BTreeSet<CarryBinding>,
+}
+
+impl RedundantSelfAssignPrunePass {
+    fn for_bindings(bindings: impl IntoIterator<Item = CarryBinding>) -> Self {
+        Self {
+            prunable_bindings: collect_prunable_bindings(bindings),
+        }
+    }
+}
 
 impl HirRewritePass for RedundantSelfAssignPrunePass {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
@@ -763,7 +792,7 @@ impl HirRewritePass for RedundantSelfAssignPrunePass {
     }
 
     fn rewrite_stmt(&mut self, stmt: &mut HirStmt) -> bool {
-        prune_redundant_self_assign_components_in_stmt(stmt)
+        prune_redundant_self_assign_components_in_stmt(stmt, &self.prunable_bindings)
     }
 }
 
@@ -777,11 +806,79 @@ fn prune_empty_assign_stmts(block: &mut HirBlock) -> bool {
     block.stmts.len() != original_len
 }
 
-fn prune_redundant_self_assigns_in_block(block: &mut HirBlock) -> bool {
-    let mut changed = false;
-    for stmt in &mut block.stmts {
-        changed |= prune_redundant_self_assign_components_in_stmt(stmt);
+fn prune_redundant_self_assigns_in_stmts(
+    stmts: &mut [HirStmt],
+    prunable_bindings: BTreeSet<CarryBinding>,
+) -> bool {
+    if prunable_bindings.is_empty() {
+        return false;
     }
+    let mut pass = RedundantSelfAssignPrunePass { prunable_bindings };
+    rewrite_stmts(stmts, &mut pass)
+}
+
+fn collect_prunable_bindings(
+    bindings: impl IntoIterator<Item = CarryBinding>,
+) -> BTreeSet<CarryBinding> {
+    bindings.into_iter().collect()
+}
+
+fn prune_boundary_snapshot_self_assigns(
+    block: &mut HirBlock,
+    prunable_bindings: &BTreeSet<CarryBinding>,
+) -> bool {
+    if prunable_bindings.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+
+    for index in 0..block.stmts.len() {
+        let top_level_boundary_snapshot = matches!(
+            block.stmts.get(index + 1),
+            Some(HirStmt::Goto(_) | HirStmt::Label(_))
+        );
+        let falls_through_to_label = matches!(block.stmts.get(index + 1), Some(HirStmt::Label(_)));
+
+        match &mut block.stmts[index] {
+            stmt @ HirStmt::Assign(_) if top_level_boundary_snapshot => {
+                changed |= prune_redundant_self_assign_components_in_stmt(stmt, prunable_bindings);
+            }
+            HirStmt::If(if_stmt) => {
+                changed |= prune_edge_snapshot_self_assigns(
+                    &mut if_stmt.then_block,
+                    falls_through_to_label,
+                    prunable_bindings,
+                );
+                if let Some(else_block) = &mut if_stmt.else_block {
+                    changed |= prune_edge_snapshot_self_assigns(
+                        else_block,
+                        falls_through_to_label,
+                        prunable_bindings,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    changed |= prune_empty_assign_stmts(block);
+    changed
+}
+
+fn prune_edge_snapshot_self_assigns(
+    block: &mut HirBlock,
+    allow_fallthrough_to_label: bool,
+    prunable_bindings: &BTreeSet<CarryBinding>,
+) -> bool {
+    let mut changed = match block.stmts.as_mut_slice() {
+        [stmt @ HirStmt::Assign(_), HirStmt::Goto(_)] => {
+            prune_redundant_self_assign_components_in_stmt(stmt, prunable_bindings)
+        }
+        [stmt @ HirStmt::Assign(_)] if allow_fallthrough_to_label => {
+            prune_redundant_self_assign_components_in_stmt(stmt, prunable_bindings)
+        }
+        _ => false,
+    };
     changed |= prune_empty_assign_stmts(block);
     changed
 }

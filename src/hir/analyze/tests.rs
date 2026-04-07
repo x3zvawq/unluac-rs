@@ -162,9 +162,127 @@ fn lua55_fixed_multiresult_call_keeps_all_fixed_defs_before_simplify() {
     );
 }
 
+#[test]
+fn lua55_self_assign_branch_keeps_preserved_entry_value_before_simplify() {
+    let module =
+        lower_lua55_fixture_to_hir("tests/lua_cases/common/tricky/34_self_assign_branch_shell.lua");
+    let proto = &module.protos[module.entry.index()];
+    let hir_dump = dump_hir(
+        &module,
+        crate::debug::DebugDetail::Verbose,
+        &crate::debug::DebugFilters::default(),
+        crate::debug::DebugColorMode::Never,
+    );
+
+    let init_temp = proto
+        .body
+        .stmts
+        .iter()
+        .find_map(|stmt| match stmt {
+            HirStmt::Assign(assign)
+                if matches!(assign.targets.as_slice(), [HirLValue::Temp(_)])
+                    && matches!(assign.values.as_slice(), [HirExpr::String(value)] if value == "x") =>
+            {
+                let HirLValue::Temp(temp) = assign.targets[0] else {
+                    unreachable!("guard above ensures a temp target");
+                };
+                Some(temp)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!("fixture should keep the preserved entry value temp before simplify:\n{hir_dump}")
+        });
+    let carried_temp = proto
+        .body
+        .stmts
+        .iter()
+        .find_map(|stmt| match stmt {
+            HirStmt::Assign(assign)
+                if matches!(assign.targets.as_slice(), [HirLValue::Temp(_)])
+                    && matches!(assign.values.as_slice(), [HirExpr::TempRef(source)] if *source == init_temp) =>
+            {
+                let HirLValue::Temp(temp) = assign.targets[0] else {
+                    unreachable!("guard above ensures a temp target");
+                };
+                Some(temp)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "fixture should keep an explicit preserved-value handoff temp before simplify:\n{hir_dump}"
+            )
+        });
+    let (if_index, if_stmt) = proto
+        .body
+        .stmts
+        .iter()
+        .enumerate()
+        .find_map(|(index, stmt)| match stmt {
+            HirStmt::If(if_stmt) => Some((index, if_stmt.as_ref())),
+            _ => None,
+        })
+        .expect("fixture should still lower into a conditional rewrite before simplify");
+
+    assert!(
+        if_writes_temp_with_string(if_stmt, carried_temp, "z"),
+        "conditional rewrite should keep the changed branch on the carried temp:\n{hir_dump}",
+    );
+    let then_writes = block_writes_temp(&if_stmt.then_block, carried_temp);
+    let else_writes = if_stmt
+        .else_block
+        .as_ref()
+        .is_some_and(|block| block_writes_temp(block, carried_temp));
+    assert!(
+        then_writes ^ else_writes,
+        "one branch should preserve the carried temp by not reassigning it:\n{hir_dump}",
+    );
+    assert!(
+        proto
+            .body
+            .stmts
+            .iter()
+            .skip(if_index + 1)
+            .any(|stmt| stmt_mentions_temp(stmt, carried_temp)),
+        "the carried temp should still be consumed after the conditional rewrite:\n{hir_dump}",
+    );
+}
+
 fn lower_luau_fixture_to_hir(source_relative: &str) -> HirModule {
     let bytes = compile_luau_fixture(source_relative);
     let raw = parse_luau_chunk(&bytes, ParseOptions::default()).expect("fixture should parse");
+    let lowered = lower_chunk(&raw).expect("fixture should lower into LIR");
+    let cfg_graph = build_cfg_graph(&lowered);
+    let graph_facts = analyze_graph_facts(&cfg_graph);
+    let dataflow = analyze_dataflow(&lowered, &cfg_graph, &graph_facts);
+    let structure = analyze_structure(&lowered, &cfg_graph, &graph_facts, &dataflow);
+
+    let mut artifacts = LowerArtifacts::default();
+    let entry = lower_proto(
+        &lowered.main,
+        &cfg_graph.cfg,
+        &graph_facts,
+        &dataflow,
+        &structure,
+        ChildAnalyses {
+            cfg_graphs: &cfg_graph.children,
+            graph_facts: &graph_facts.children,
+            dataflow: &dataflow.children,
+            structure: &structure.children,
+        },
+        &mut artifacts,
+    );
+
+    HirModule {
+        entry,
+        protos: artifacts.protos,
+    }
+}
+
+fn lower_lua55_fixture_to_hir(source_relative: &str) -> HirModule {
+    let bytes = unluac_test_support::compile_lua_case("lua5.5", source_relative);
+    let raw = parse_lua55_chunk(&bytes, ParseOptions::default()).expect("fixture should parse");
     let lowered = lower_chunk(&raw).expect("fixture should lower into LIR");
     let cfg_graph = build_cfg_graph(&lowered);
     let graph_facts = analyze_graph_facts(&cfg_graph);
@@ -298,6 +416,152 @@ fn stmt_contains_unresolved_expr(stmt: &HirStmt) -> bool {
     }
 }
 
+fn if_writes_temp_with_string(
+    if_stmt: &crate::hir::HirIf,
+    temp: crate::hir::TempId,
+    value: &str,
+) -> bool {
+    block_writes_temp_with_string(&if_stmt.then_block, temp, value)
+        || if_stmt
+            .else_block
+            .as_ref()
+            .is_some_and(|block| block_writes_temp_with_string(block, temp, value))
+}
+
+fn block_writes_temp_with_string(
+    block: &crate::hir::HirBlock,
+    temp: crate::hir::TempId,
+    value: &str,
+) -> bool {
+    block.stmts.iter().any(|stmt| {
+        matches!(
+            stmt,
+            HirStmt::Assign(assign)
+                if matches!(assign.targets.as_slice(), [HirLValue::Temp(id)] if *id == temp)
+                    && matches!(assign.values.as_slice(), [HirExpr::String(string)] if string == value)
+        )
+    })
+}
+
+fn block_writes_temp(block: &crate::hir::HirBlock, temp: crate::hir::TempId) -> bool {
+    block.stmts.iter().any(|stmt| {
+        matches!(
+            stmt,
+            HirStmt::Assign(assign)
+                if assign
+                    .targets
+                    .iter()
+                    .any(|target| matches!(target, HirLValue::Temp(id) if *id == temp))
+        )
+    })
+}
+
+fn stmt_mentions_temp(stmt: &HirStmt, temp: crate::hir::TempId) -> bool {
+    match stmt {
+        HirStmt::LocalDecl(local_decl) => local_decl
+            .values
+            .iter()
+            .any(|expr| expr_mentions_temp(expr, temp)),
+        HirStmt::Assign(assign) => {
+            assign
+                .targets
+                .iter()
+                .any(|target| matches!(target, HirLValue::Temp(id) if *id == temp))
+                || assign
+                    .values
+                    .iter()
+                    .any(|expr| expr_mentions_temp(expr, temp))
+        }
+        HirStmt::TableSetList(set_list) => {
+            expr_mentions_temp(&set_list.base, temp)
+                || set_list
+                    .values
+                    .iter()
+                    .any(|expr| expr_mentions_temp(expr, temp))
+                || set_list
+                    .trailing_multivalue
+                    .as_ref()
+                    .is_some_and(|expr| expr_mentions_temp(expr, temp))
+        }
+        HirStmt::ErrNil(err_nil) => expr_mentions_temp(&err_nil.value, temp),
+        HirStmt::ToBeClosed(to_be_closed) => expr_mentions_temp(&to_be_closed.value, temp),
+        HirStmt::CallStmt(call_stmt) => {
+            expr_mentions_temp(&call_stmt.call.callee, temp)
+                || call_stmt
+                    .call
+                    .args
+                    .iter()
+                    .any(|expr| expr_mentions_temp(expr, temp))
+        }
+        HirStmt::Return(ret) => ret.values.iter().any(|expr| expr_mentions_temp(expr, temp)),
+        HirStmt::If(if_stmt) => {
+            expr_mentions_temp(&if_stmt.cond, temp)
+                || if_stmt
+                    .then_block
+                    .stmts
+                    .iter()
+                    .any(|stmt| stmt_mentions_temp(stmt, temp))
+                || if_stmt.else_block.as_ref().is_some_and(|block| {
+                    block
+                        .stmts
+                        .iter()
+                        .any(|stmt| stmt_mentions_temp(stmt, temp))
+                })
+        }
+        HirStmt::While(while_stmt) => {
+            expr_mentions_temp(&while_stmt.cond, temp)
+                || while_stmt
+                    .body
+                    .stmts
+                    .iter()
+                    .any(|stmt| stmt_mentions_temp(stmt, temp))
+        }
+        HirStmt::Repeat(repeat_stmt) => {
+            repeat_stmt
+                .body
+                .stmts
+                .iter()
+                .any(|stmt| stmt_mentions_temp(stmt, temp))
+                || expr_mentions_temp(&repeat_stmt.cond, temp)
+        }
+        HirStmt::NumericFor(numeric_for) => {
+            expr_mentions_temp(&numeric_for.start, temp)
+                || expr_mentions_temp(&numeric_for.limit, temp)
+                || expr_mentions_temp(&numeric_for.step, temp)
+                || numeric_for
+                    .body
+                    .stmts
+                    .iter()
+                    .any(|stmt| stmt_mentions_temp(stmt, temp))
+        }
+        HirStmt::GenericFor(generic_for) => {
+            generic_for
+                .iterator
+                .iter()
+                .any(|expr| expr_mentions_temp(expr, temp))
+                || generic_for
+                    .body
+                    .stmts
+                    .iter()
+                    .any(|stmt| stmt_mentions_temp(stmt, temp))
+        }
+        HirStmt::Block(block) => block
+            .stmts
+            .iter()
+            .any(|stmt| stmt_mentions_temp(stmt, temp)),
+        HirStmt::Unstructured(unstructured) => unstructured
+            .body
+            .stmts
+            .iter()
+            .any(|stmt| stmt_mentions_temp(stmt, temp)),
+        HirStmt::Break
+        | HirStmt::Close(_)
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => false,
+    }
+}
+
 fn expr_contains_unresolved(expr: &HirExpr) -> bool {
     match expr {
         HirExpr::Unresolved(_) => true,
@@ -352,9 +616,75 @@ fn expr_contains_unresolved(expr: &HirExpr) -> bool {
     }
 }
 
+fn expr_mentions_temp(expr: &HirExpr, temp: crate::hir::TempId) -> bool {
+    match expr {
+        HirExpr::TempRef(id) => *id == temp,
+        HirExpr::TableAccess(access) => {
+            expr_mentions_temp(&access.base, temp) || expr_mentions_temp(&access.key, temp)
+        }
+        HirExpr::Unary(unary) => expr_mentions_temp(&unary.expr, temp),
+        HirExpr::Binary(binary) => {
+            expr_mentions_temp(&binary.lhs, temp) || expr_mentions_temp(&binary.rhs, temp)
+        }
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            expr_mentions_temp(&logical.lhs, temp) || expr_mentions_temp(&logical.rhs, temp)
+        }
+        HirExpr::Decision(decision) => decision.nodes.iter().any(|node| {
+            expr_mentions_temp(&node.test, temp)
+                || decision_target_mentions_temp(&node.truthy, temp)
+                || decision_target_mentions_temp(&node.falsy, temp)
+        }),
+        HirExpr::Call(call) => {
+            expr_mentions_temp(&call.callee, temp)
+                || call.args.iter().any(|expr| expr_mentions_temp(expr, temp))
+        }
+        HirExpr::TableConstructor(table) => table.fields.iter().any(|field| match field {
+            crate::hir::common::HirTableField::Array(value) => expr_mentions_temp(value, temp),
+            crate::hir::common::HirTableField::Record(field) => {
+                matches!(
+                    &field.key,
+                    crate::hir::common::HirTableKey::Expr(expr) if expr_mentions_temp(expr, temp)
+                ) || expr_mentions_temp(&field.value, temp)
+            }
+        }) || table
+            .trailing_multivalue
+            .as_ref()
+            .is_some_and(|expr| expr_mentions_temp(expr, temp)),
+        HirExpr::Closure(closure) => closure
+            .captures
+            .iter()
+            .any(|capture| expr_mentions_temp(&capture.value, temp)),
+        HirExpr::Unresolved(_)
+        | HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
+        | HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::VarArg => false,
+    }
+}
+
 fn decision_target_contains_unresolved(target: &crate::hir::common::HirDecisionTarget) -> bool {
     match target {
         crate::hir::common::HirDecisionTarget::Expr(expr) => expr_contains_unresolved(expr),
+        crate::hir::common::HirDecisionTarget::Node(_)
+        | crate::hir::common::HirDecisionTarget::CurrentValue => false,
+    }
+}
+
+fn decision_target_mentions_temp(
+    target: &crate::hir::common::HirDecisionTarget,
+    temp: crate::hir::TempId,
+) -> bool {
+    match target {
+        crate::hir::common::HirDecisionTarget::Expr(expr) => expr_mentions_temp(expr, temp),
         crate::hir::common::HirDecisionTarget::Node(_)
         | crate::hir::common::HirDecisionTarget::CurrentValue => false,
     }

@@ -674,7 +674,7 @@ fn keeps_partial_multi_target_handoff_when_original_binding_is_still_read() {
 }
 
 #[test]
-fn prunes_redundant_self_assign_stmt_without_handoff_rewrite() {
+fn keeps_plain_self_assign_without_handoff_rewrite_context() {
     let temp = TempId(0);
     let mut proto = empty_proto(
         Vec::new(),
@@ -694,11 +694,74 @@ fn prunes_redundant_self_assign_stmt_without_handoff_rewrite() {
         ],
     );
 
+    assert!(!collapse_carried_local_handoffs_in_proto(&mut proto));
+    assert!(matches!(
+        proto.body.stmts.as_slice(),
+        [HirStmt::Assign(_), HirStmt::Assign(assign), HirStmt::Return(ret)]
+            if matches!(assign.targets.as_slice(), [HirLValue::Temp(id)] if *id == temp)
+                && matches!(assign.values.as_slice(), [HirExpr::TempRef(id)] if *id == temp)
+                && matches!(ret.values.as_slice(), [HirExpr::TempRef(id)] if *id == temp)
+    ));
+}
+
+#[test]
+fn keeps_preserved_current_value_branch_when_single_handoff_rewrite_creates_self_assign() {
+    let local = LocalId(0);
+    let carried = TempId(0);
+    let mut proto = empty_proto(
+        vec![local],
+        vec![carried],
+        vec![
+            HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                bindings: vec![local],
+                values: vec![HirExpr::Integer(7)],
+            })),
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(carried)],
+                values: vec![HirExpr::LocalRef(local)],
+            })),
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::Boolean(true),
+                then_block: HirBlock {
+                    stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(carried)],
+                        values: vec![HirExpr::TempRef(carried)],
+                    }))],
+                },
+                else_block: Some(HirBlock {
+                    stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(carried)],
+                        values: vec![HirExpr::Integer(9)],
+                    }))],
+                }),
+            })),
+            HirStmt::Return(Box::new(HirReturn {
+                values: vec![HirExpr::TempRef(carried)],
+            })),
+        ],
+    );
+
     assert!(collapse_carried_local_handoffs_in_proto(&mut proto));
     assert!(matches!(
         proto.body.stmts.as_slice(),
-        [HirStmt::Assign(_), HirStmt::Return(ret)]
-            if matches!(ret.values.as_slice(), [HirExpr::TempRef(id)] if *id == temp)
+        [
+            HirStmt::LocalDecl(local_decl),
+            HirStmt::If(if_stmt),
+            HirStmt::Return(ret),
+        ] if matches!(local_decl.values.as_slice(), [HirExpr::Integer(7)])
+            && matches!(
+                if_stmt.then_block.stmts.as_slice(),
+                [HirStmt::Assign(assign)]
+                    if matches!(assign.targets.as_slice(), [HirLValue::Local(id)] if *id == local)
+                        && matches!(assign.values.as_slice(), [HirExpr::LocalRef(id)] if *id == local)
+            )
+            && matches!(
+                if_stmt.else_block.as_ref().map(|block| block.stmts.as_slice()),
+                Some([HirStmt::Assign(assign)])
+                    if matches!(assign.targets.as_slice(), [HirLValue::Local(id)] if *id == local)
+                        && matches!(assign.values.as_slice(), [HirExpr::Integer(9)])
+            )
+            && matches!(ret.values.as_slice(), [HirExpr::LocalRef(id)] if *id == local)
     ));
 }
 

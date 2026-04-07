@@ -72,6 +72,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 // HIR 也仍然能保住“分支里显式写值，merge 后继续读同一状态槽位”的结构。
                 self.branch_value_target_overrides(block, target_overrides)
             });
+        if let Some(branch_target_overrides) = branch_target_overrides.as_ref() {
+            stmts.extend(self.branch_value_preserved_entry_stmts(block, branch_target_overrides));
+        }
         let then_target_overrides = branch_target_overrides
             .as_ref()
             .map(|branch_target_overrides| {
