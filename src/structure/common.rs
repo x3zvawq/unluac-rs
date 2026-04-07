@@ -80,6 +80,143 @@ pub(super) struct IrreducibleRegion {
     pub entry_edges: Vec<EdgeRef>,
 }
 
+// ── 值合流统一查询接口 ──
+
+/// 值合流 arm 的逐 predecessor 来源。
+///
+/// Branch/Loop/ShortCircuit 都有"每个 predecessor 贡献了哪些 reaching defs"的结构，
+/// 这个类型统一表达这一层信息，避免下游 HIR helper 必须分类型处理。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueMergeIncoming {
+    pub pred: BlockRef,
+    pub defs: BTreeSet<DefId>,
+}
+
+/// 值合流的统一只读查询接口。
+///
+/// Branch 和 Loop 各自的 merge 类型实现此 trait，让下游 HIR 消费逻辑
+/// 可以提取共享 helper（如"所有 arm 是否写入同一目标"）而不必各自实现一遍。
+///
+/// ShortCircuit 的物化路径和 branch/loop 差异较大（DAG 递归 vs 线性 2-arm），
+/// 暂不接入此 trait。
+#[expect(dead_code, reason = "Phase B: shared HIR helpers will consume this")]
+pub trait ValueMergeQuery {
+    /// 返回 phi 标识。
+    fn phi_id(&self) -> PhiId;
+
+    /// 返回被合流的寄存器。
+    fn reg(&self) -> Reg;
+
+    /// 返回 arm 的数量（Branch = 2，Loop = 2）。
+    fn arm_count(&self) -> usize;
+
+    /// 返回第 `index` 个 arm 的所有 reaching defs。
+    fn arm_defs(&self, index: usize) -> impl Iterator<Item = DefId> + '_;
+
+    /// 返回第 `index` 个 arm 的逐 predecessor 来源。
+    fn arm_incomings(&self, index: usize) -> Vec<ValueMergeIncoming>;
+
+    /// 某个 arm 是否没有产生任何新写入（保留了合流前的值）。
+    ///
+    /// Branch: `non_header_defs` 为空说明这一臂没有 arm-local 写入。
+    /// Loop: inside_arm 的 defs 为空说明循环体没有写入。
+    fn arm_preserves_current(&self, index: usize) -> bool;
+}
+
+impl ValueMergeQuery for BranchValueMergeValue {
+    fn phi_id(&self) -> PhiId {
+        self.phi_id
+    }
+
+    fn reg(&self) -> Reg {
+        self.reg
+    }
+
+    fn arm_count(&self) -> usize {
+        2
+    }
+
+    fn arm_defs(&self, index: usize) -> impl Iterator<Item = DefId> + '_ {
+        let arm = match index {
+            0 => &self.then_arm,
+            1 => &self.else_arm,
+            _ => panic!("BranchValueMergeValue has 2 arms, got index {index}"),
+        };
+        arm.defs.iter().copied()
+    }
+
+    fn arm_incomings(&self, index: usize) -> Vec<ValueMergeIncoming> {
+        let arm = match index {
+            0 => &self.then_arm,
+            1 => &self.else_arm,
+            _ => panic!("BranchValueMergeValue has 2 arms, got index {index}"),
+        };
+        // Branch arm 的每个 pred 共享同一组 defs，逐 pred 展开为 incoming。
+        arm.preds
+            .iter()
+            .map(|&pred| ValueMergeIncoming {
+                pred,
+                defs: arm.defs.clone(),
+            })
+            .collect()
+    }
+
+    fn arm_preserves_current(&self, index: usize) -> bool {
+        let arm = match index {
+            0 => &self.then_arm,
+            1 => &self.else_arm,
+            _ => panic!("BranchValueMergeValue has 2 arms, got index {index}"),
+        };
+        arm.non_header_defs.is_empty() && !arm.defs.is_empty()
+    }
+}
+
+impl ValueMergeQuery for LoopValueMerge {
+    fn phi_id(&self) -> PhiId {
+        self.phi_id
+    }
+
+    fn reg(&self) -> Reg {
+        self.reg
+    }
+
+    fn arm_count(&self) -> usize {
+        2
+    }
+
+    fn arm_defs(&self, index: usize) -> impl Iterator<Item = DefId> + '_ {
+        let arm = match index {
+            0 => &self.inside_arm,
+            1 => &self.outside_arm,
+            _ => panic!("LoopValueMerge has 2 arms, got index {index}"),
+        };
+        arm.defs()
+    }
+
+    fn arm_incomings(&self, index: usize) -> Vec<ValueMergeIncoming> {
+        let arm = match index {
+            0 => &self.inside_arm,
+            1 => &self.outside_arm,
+            _ => panic!("LoopValueMerge has 2 arms, got index {index}"),
+        };
+        arm.incomings
+            .iter()
+            .map(|inc| ValueMergeIncoming {
+                pred: inc.pred,
+                defs: inc.defs.clone(),
+            })
+            .collect()
+    }
+
+    fn arm_preserves_current(&self, index: usize) -> bool {
+        match index {
+            0 => self.inside_arm.is_empty(),
+            1 => self.outside_arm.is_empty(),
+            _ => panic!("LoopValueMerge has 2 arms, got index {index}"),
+        }
+    }
+}
+
 /// 一个普通 branch 在 merge 点上产生的值合流候选。
 ///
 /// 它和 `ShortCircuitCandidate::ValueMerge` 的区别是：这里不假设整片区域更像 `and/or`，

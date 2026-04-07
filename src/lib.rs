@@ -14,6 +14,7 @@ pub mod hir;
 pub mod naming;
 pub mod parser;
 pub mod readability;
+pub(crate) mod scheduler;
 pub mod structure;
 mod timing;
 pub mod transformer;

@@ -27,6 +27,7 @@ mod walk;
 
 use super::common::{AstModule, AstTargetDialect};
 use crate::readability::ReadabilityOptions;
+use crate::scheduler::{run_invalidation_loop, InvalidationTag, PassDescriptor, PassPhase};
 use crate::timing::TimingCollector;
 
 #[derive(Clone, Copy)]
@@ -35,196 +36,156 @@ pub(super) struct ReadabilityContext {
     pub options: ReadabilityOptions,
 }
 
-#[derive(Clone, Copy)]
-struct ReadabilityPass {
-    name: &'static str,
+/// AST 可读性变化的粗粒度标签。
+///
+/// 每个 pass 声明自己依赖和产出哪些标签，调度器根据 dirty set 决定哪些 pass 需要重跑。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AstInvalidation {
+    /// 语句相邻关系变化（影响 statement-merge, local-coalesce, loop-header-merge）。
+    StatementAdjacency,
+    /// 控制流形状变化（影响 branch-pretty 及其下游）。
+    ControlFlowShape,
+    /// 表达式形状变化（影响 field-access-sugar, short-circuit-pretty, inline-exprs）。
+    ExprShape,
+    /// 绑定关系变化（影响 local-coalesce, function-sugar）。
+    BindingStructure,
+    /// temp 存在性变化（影响 temp-materialize, inline-exprs）。
+    TempPresence,
+}
+
+impl InvalidationTag for AstInvalidation {
+    fn all() -> &'static [Self] {
+        &[
+            Self::StatementAdjacency,
+            Self::ControlFlowShape,
+            Self::ExprShape,
+            Self::BindingStructure,
+            Self::TempPresence,
+        ]
+    }
+}
+
+/// pass 的可执行入口，与 `PASS_DESCRIPTORS` 按下标一一对应。
+struct ReadabilityPassEntry {
     apply: fn(&mut AstModule, ReadabilityContext) -> bool,
 }
 
-#[derive(Clone, Copy)]
-struct ReadabilityStage {
-    name: &'static str,
-    passes: &'static [ReadabilityPass],
-    cleanup_after_passes: bool,
-}
+use AstInvalidation::*;
 
-const CLEANUP_PASS: ReadabilityPass = ReadabilityPass {
-    name: "cleanup",
-    apply: cleanup::apply,
-};
-
-const fn stage(name: &'static str, passes: &'static [ReadabilityPass]) -> ReadabilityStage {
-    ReadabilityStage {
-        name,
-        passes,
-        cleanup_after_passes: false,
-    }
-}
-
-const fn stage_with_cleanup(
-    name: &'static str,
-    passes: &'static [ReadabilityPass],
-) -> ReadabilityStage {
-    ReadabilityStage {
-        name,
-        passes,
-        cleanup_after_passes: true,
-    }
-}
-
-const STRUCTURAL_CLEANUP_STAGE: ReadabilityStage = stage("structural-cleanup", &[CLEANUP_PASS]);
-
-const EXPR_INLINE_STAGE: ReadabilityStage = stage_with_cleanup(
-    "expr-inline",
-    &[
-        ReadabilityPass {
-            name: "inline-exprs",
-            apply: inline_exprs::apply,
-        },
-        ReadabilityPass {
-            name: "field-access-sugar-post-inline",
-            apply: field_access_sugar::apply,
-        },
-    ],
-);
-
-const ACCESS_SUGAR_STAGE: ReadabilityStage = stage(
-    "access-sugar",
-    &[ReadabilityPass {
-        name: "field-access-sugar",
-        apply: field_access_sugar::apply,
-    }],
-);
-
-const STATEMENT_MERGE_STAGE: ReadabilityStage = stage_with_cleanup(
-    "statement-merge",
-    &[ReadabilityPass {
-        name: "statement-merge",
-        apply: statement_merge::apply,
-    }],
-);
-
-const LOCAL_COALESCE_STAGE: ReadabilityStage = stage_with_cleanup(
-    "local-coalesce",
-    &[ReadabilityPass {
+// Pass 描述符：声明每个 pass 依赖和产出哪些 invalidation tag。
+//
+// 排列顺序决定同一轮内的执行先后——把"生产者"放在"消费者"前面可以减少
+// 不必要的多轮迭代。调度器会根据 dirty set 自动跳过不相关的 pass。
+//
+// Normal phase 处理主要形状收敛：
+//   cleanup → local-coalesce → statement-merge → loop-header-merge
+//   → branch-pretty → inline-exprs → field-access-sugar → short-circuit-pretty
+//
+// Deferred phase 在 Normal 全部收敛后执行终态物化和语法糖：
+//   temp-materialize → installer-iife → function-sugar → global-decl-pretty → luajit-goto-safety
+//
+// 如果 Deferred pass 产出新 invalidation，Normal phase 会重新收敛。
+const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
+    // ── Normal phase ──
+    PassDescriptor {
+        name: "cleanup",
+        phase: PassPhase::Normal,
+        depends_on: &[StatementAdjacency, ControlFlowShape, ExprShape, BindingStructure, TempPresence],
+        invalidates: &[StatementAdjacency],
+    },
+    PassDescriptor {
         name: "local-coalesce",
-        apply: local_coalesce::apply,
-    }],
-);
-
-const LOOP_HEADER_MERGE_STAGE: ReadabilityStage = stage_with_cleanup(
-    "loop-header-merge",
-    &[ReadabilityPass {
+        phase: PassPhase::Normal,
+        depends_on: &[StatementAdjacency, ControlFlowShape, BindingStructure],
+        invalidates: &[StatementAdjacency, BindingStructure],
+    },
+    PassDescriptor {
+        name: "statement-merge",
+        phase: PassPhase::Normal,
+        depends_on: &[StatementAdjacency, ControlFlowShape],
+        invalidates: &[StatementAdjacency, ExprShape],
+    },
+    PassDescriptor {
         name: "loop-header-merge",
-        apply: loop_header_merge::apply,
-    }],
-);
-
-const CONTROL_FLOW_PRETTY_STAGE: ReadabilityStage = stage(
-    "control-flow-pretty",
-    &[ReadabilityPass {
+        phase: PassPhase::Normal,
+        depends_on: &[StatementAdjacency],
+        invalidates: &[StatementAdjacency, BindingStructure],
+    },
+    PassDescriptor {
         name: "branch-pretty",
-        apply: branch_pretty::apply,
-    }],
-);
-
-const POST_CONTROL_FLOW_STATEMENT_MERGE_STAGE: ReadabilityStage = stage_with_cleanup(
-    "post-control-flow-statement-merge",
-    &[ReadabilityPass {
-        name: "statement-merge-post-control-flow",
-        apply: statement_merge::apply,
-    }],
-);
-
-const POST_CONTROL_FLOW_LOCAL_COALESCE_STAGE: ReadabilityStage = stage_with_cleanup(
-    "post-control-flow-local-coalesce",
-    &[ReadabilityPass {
-        name: "local-coalesce-post-control-flow",
-        apply: local_coalesce::apply,
-    }],
-);
-
-const SHORT_CIRCUIT_PRETTY_STAGE: ReadabilityStage = stage(
-    "short-circuit-pretty",
-    &[ReadabilityPass {
+        phase: PassPhase::Normal,
+        depends_on: &[ControlFlowShape],
+        invalidates: &[ControlFlowShape, StatementAdjacency],
+    },
+    PassDescriptor {
+        name: "inline-exprs",
+        phase: PassPhase::Normal,
+        depends_on: &[StatementAdjacency, ExprShape, TempPresence],
+        invalidates: &[StatementAdjacency, ExprShape],
+    },
+    PassDescriptor {
+        name: "field-access-sugar",
+        phase: PassPhase::Normal,
+        depends_on: &[ExprShape],
+        invalidates: &[ExprShape],
+    },
+    PassDescriptor {
         name: "short-circuit-pretty",
-        apply: short_circuit_pretty::apply,
-    }],
-);
-
-const FUNCTION_SUGAR_STAGE: ReadabilityStage = stage_with_cleanup(
-    "function-sugar",
-    &[
-        ReadabilityPass {
-            name: "installer-iife",
-            apply: installer_iife::apply,
-        },
-        ReadabilityPass {
-            name: "function-sugar",
-            apply: function_sugar::apply,
-        },
-    ],
-);
-
-const GLOBAL_DECL_PRETTY_STAGE: ReadabilityStage = stage_with_cleanup(
-    "global-decl-pretty",
-    &[ReadabilityPass {
-        name: "global-decl-pretty",
-        apply: global_decl_pretty::apply,
-    }],
-);
-
-const LUAJIT_GOTO_SAFETY_STAGE: ReadabilityStage = stage(
-    "luajit-goto-safety",
-    &[ReadabilityPass {
-        name: "luajit-goto-safety",
-        apply: luajit_goto_safety::apply,
-    }],
-);
-
-const TEMP_MATERIALIZE_STAGE: ReadabilityStage = stage(
-    "temp-materialize",
-    &[ReadabilityPass {
+        phase: PassPhase::Normal,
+        depends_on: &[ExprShape],
+        invalidates: &[ExprShape],
+    },
+    // ── Deferred phase ──
+    PassDescriptor {
         name: "materialize-temps",
-        apply: materialize_temps::apply,
-    }],
-);
-
-// Stage 顺序本身就是 readability 契约的一部分：
-// 1. 先把最机械的 local/stmt 壳压平，避免后续 sugar 看见被过度拆开的 AST。
-// 2. 再做 access / control-flow / expr sugar，让表达式和结构更接近源码。
-//    控制流整理之后，原先被 label/goto 壳挡住的 hoisted temp 往往会重新暴露成普通相邻
-//    assign 形状，所以这里会补一轮已有的 statement-merge，而不是平行新长一个 pass。
-//    同理，某些 carried local 直到 `branch_pretty` 把 goto 网收成普通 `if-else` 之后，
-//    才能稳定看出“这个 seed local 正在吸收前面 hoist 出来的 carried temp”；
-//    这里继续复用已有的 `local_coalesce`，而不是为 post-branch 形状再长一个新 pass。
-//    `inline-exprs` 可能会重新露出 `"name"` 这类字符串索引，所以 access sugar
-//    要在表达式内联之后再补一轮，避免新暴露的 key 停在 `["n"]` 这种半糖形态。
-// 3. `materialize-temps` 必须先于 `installer-iife/function-sugar`，否则后者会把仍处在
-//    临时槽位里的机械节点误当成稳定源码 binding，也没法给新引入的局部名分配 AST 自己的
-//    synthetic local。
-// 4. `function-sugar` 现在同时承接局部 alias 和已经物化出来的机械 direct call method sugar。
-//    branch-local 值壳已经前推到 HIR；到了 AST 这里只剩 `obj.field(obj, ...)` 这种保守
-//    调用形状，需要在同一个 owner 里统一决定能否收回 `obj:field(...)`。
-// 5. `global-decl-pretty` 和 `luajit-goto-safety` 放在后面，只消费前面已经稳定下来的 AST。
-const READABILITY_STAGES: &[ReadabilityStage] = &[
-    STRUCTURAL_CLEANUP_STAGE,
-    LOCAL_COALESCE_STAGE,
-    STATEMENT_MERGE_STAGE,
-    LOOP_HEADER_MERGE_STAGE,
-    ACCESS_SUGAR_STAGE,
-    CONTROL_FLOW_PRETTY_STAGE,
-    POST_CONTROL_FLOW_STATEMENT_MERGE_STAGE,
-    POST_CONTROL_FLOW_LOCAL_COALESCE_STAGE,
-    EXPR_INLINE_STAGE,
-    SHORT_CIRCUIT_PRETTY_STAGE,
-    TEMP_MATERIALIZE_STAGE,
-    FUNCTION_SUGAR_STAGE,
-    GLOBAL_DECL_PRETTY_STAGE,
-    LUAJIT_GOTO_SAFETY_STAGE,
+        phase: PassPhase::Deferred,
+        depends_on: &[TempPresence],
+        invalidates: &[TempPresence, BindingStructure, StatementAdjacency],
+    },
+    PassDescriptor {
+        name: "installer-iife",
+        phase: PassPhase::Deferred,
+        depends_on: &[TempPresence, BindingStructure],
+        invalidates: &[StatementAdjacency, ExprShape, BindingStructure],
+    },
+    PassDescriptor {
+        name: "function-sugar",
+        phase: PassPhase::Deferred,
+        depends_on: &[TempPresence, BindingStructure, ExprShape],
+        invalidates: &[StatementAdjacency, ExprShape],
+    },
+    PassDescriptor {
+        name: "global-decl-pretty",
+        phase: PassPhase::Deferred,
+        depends_on: &[StatementAdjacency],
+        invalidates: &[StatementAdjacency],
+    },
+    PassDescriptor {
+        name: "luajit-goto-safety",
+        phase: PassPhase::Deferred,
+        depends_on: &[ControlFlowShape],
+        invalidates: &[],
+    },
 ];
 
-const MAX_STAGE_ROUNDS: usize = 64;
+/// pass 执行入口，下标与 `PASS_DESCRIPTORS` 一一对应。
+const PASS_ENTRIES: &[ReadabilityPassEntry] = &[
+    ReadabilityPassEntry { apply: cleanup::apply },
+    ReadabilityPassEntry { apply: local_coalesce::apply },
+    ReadabilityPassEntry { apply: statement_merge::apply },
+    ReadabilityPassEntry { apply: loop_header_merge::apply },
+    ReadabilityPassEntry { apply: branch_pretty::apply },
+    ReadabilityPassEntry { apply: inline_exprs::apply },
+    ReadabilityPassEntry { apply: field_access_sugar::apply },
+    ReadabilityPassEntry { apply: short_circuit_pretty::apply },
+    ReadabilityPassEntry { apply: materialize_temps::apply },
+    ReadabilityPassEntry { apply: installer_iife::apply },
+    ReadabilityPassEntry { apply: function_sugar::apply },
+    ReadabilityPassEntry { apply: global_decl_pretty::apply },
+    ReadabilityPassEntry { apply: luajit_goto_safety::apply },
+];
+
+const MAX_ROUNDS: usize = 64;
 
 /// 对外的 readability 入口。
 pub fn make_readable(module: &AstModule, target: AstTargetDialect) -> AstModule {
@@ -249,32 +210,12 @@ pub(crate) fn make_readable_with_options_and_timing(
 ) -> AstModule {
     let mut module = module.clone();
     let context = ReadabilityContext { target, options };
-    for stage in READABILITY_STAGES {
-        timings.record(stage.name, || {
-            let mut rounds = 0;
-            loop {
-                let changed = timings.record("fixed-point-round", || {
-                    let mut changed = false;
-                    for pass in stage.passes {
-                        changed |= timings.record(pass.name, || (pass.apply)(&mut module, context));
-                    }
-                    if stage.cleanup_after_passes {
-                        changed |= timings.record(CLEANUP_PASS.name, || {
-                            (CLEANUP_PASS.apply)(&mut module, context)
-                        });
-                    }
-                    changed
-                });
-                if !changed {
-                    break;
-                }
-                rounds += 1;
-                assert!(
-                    rounds < MAX_STAGE_ROUNDS,
-                    "AST readability stage did not converge within {MAX_STAGE_ROUNDS} rounds"
-                );
-            }
-        });
-    }
+
+    run_invalidation_loop(
+        PASS_DESCRIPTORS,
+        |index, name| timings.record(name, || (PASS_ENTRIES[index].apply)(&mut module, context)),
+        MAX_ROUNDS,
+    );
+
     module
 }
