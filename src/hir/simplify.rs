@@ -17,6 +17,7 @@ mod locals;
 mod logical_simplify;
 mod table_constructors;
 mod temp_inline;
+mod traverse;
 mod visit;
 mod walk;
 

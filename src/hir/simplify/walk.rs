@@ -1,14 +1,14 @@
 //! 这个文件提供 HIR simplify pass 共享的递归 walker。
 //!
-//! 很多 simplify pass 都只是“后序遍历整棵 HIR，然后在局部 block/stmt/expr 上做保守
-//! 重写”。如果每个 pass 都各自维护一套 `block/stmt/lvalue/call/expr` 骨架，后面一旦
+//! 很多 simplify pass 都只是"后序遍历整棵 HIR，然后在局部 block/stmt/expr 上做保守
+//! 重写"。如果每个 pass 都各自维护一套 `block/stmt/lvalue/call/expr` 骨架，后面一旦
 //! 新增 HIR 节点或调整遍历顺序，就得在多处同步返工。
 //!
 //! 这里把公共遍历样板收成两层接口：
 //! - `HirRewritePass` 负责通用 block/stmt/expr 级重写
-//! - `ExprRewritePass` 作为兼容层，继续服务“只关心表达式”的现有 pass
+//! - `ExprRewritePass` 作为兼容层，继续服务"只关心表达式"的现有 pass
 //!
-//! 它不会替具体 pass 决定“哪些节点该改、哪些事实可信”；这些语义仍然由各个 pass
+//! 它不会替具体 pass 决定"哪些节点该改、哪些事实可信"；这些语义仍然由各个 pass
 //! 自己负责。这个文件只统一递归顺序和进入子节点的边界，避免不同 pass 各自长出
 //! 一套不一致的 walker。
 //!
@@ -19,8 +19,14 @@
 //!   下面的 `for_each_nested_block_mut / rewrite_nested_blocks_in_stmt`
 
 use crate::hir::common::{
-    HirBlock, HirCallExpr, HirDecisionExpr, HirDecisionTarget, HirExpr, HirLValue, HirProto,
-    HirStmt, HirTableConstructor, HirTableField, HirTableKey,
+    HirBlock, HirCallExpr, HirDecisionExpr, HirExpr, HirLValue, HirProto, HirStmt,
+    HirTableConstructor,
+};
+
+use super::traverse::{
+    traverse_hir_call_children, traverse_hir_decision_children, traverse_hir_expr_children,
+    traverse_hir_lvalue_children, traverse_hir_stmt_children,
+    traverse_hir_table_constructor_children,
 };
 
 pub(super) trait HirRewritePass {
@@ -55,7 +61,7 @@ pub(super) fn rewrite_proto(proto: &mut HirProto, pass: &mut impl HirRewritePass
 
 pub(super) fn rewrite_stmts(stmts: &mut [HirStmt], pass: &mut impl HirRewritePass) -> bool {
     stmts.iter_mut().fold(false, |changed, stmt| {
-        rewrite_stmt_tree(stmt, pass) || changed
+        rewrite_stmt(stmt, pass) || changed
     })
 }
 
@@ -112,10 +118,6 @@ pub(super) fn rewrite_nested_blocks_in_stmt(
     changed
 }
 
-pub(super) fn rewrite_stmt_tree(stmt: &mut HirStmt, pass: &mut impl HirRewritePass) -> bool {
-    rewrite_stmt(stmt, pass)
-}
-
 struct ExprRewritePassAdapter<'a, P> {
     pass: &'a mut P,
 }
@@ -140,201 +142,113 @@ fn rewrite_block(block: &mut HirBlock, pass: &mut impl HirRewritePass) -> bool {
 }
 
 fn rewrite_stmt(stmt: &mut HirStmt, pass: &mut impl HirRewritePass) -> bool {
-    let nested_changed = match stmt {
-        HirStmt::LocalDecl(local_decl) => local_decl
-            .values
-            .iter_mut()
-            .fold(false, |changed, expr| rewrite_expr(expr, pass) || changed),
-        HirStmt::Assign(assign) => {
-            let targets_changed = assign.targets.iter_mut().fold(false, |changed, target| {
-                rewrite_lvalue(target, pass) || changed
-            });
-            let values_changed = assign
-                .values
-                .iter_mut()
-                .fold(false, |changed, expr| rewrite_expr(expr, pass) || changed);
-            targets_changed || values_changed
+    let mut nested_changed = false;
+    traverse_hir_stmt_children!(
+        stmt,
+        iter = iter_mut,
+        opt = as_mut,
+        borrow = [&mut],
+        expr(expr) => {
+            nested_changed |= rewrite_expr(expr, pass);
+        },
+        lvalue(lvalue) => {
+            nested_changed |= rewrite_lvalue(lvalue, pass);
+        },
+        block(block) => {
+            nested_changed |= rewrite_block(block, pass);
+        },
+        call(call) => {
+            nested_changed |= rewrite_call_expr(call, pass);
+        },
+        condition(cond) => {
+            nested_changed |= rewrite_condition_expr(cond, pass);
         }
-        HirStmt::TableSetList(set_list) => {
-            let base_changed = rewrite_expr(&mut set_list.base, pass);
-            let values_changed = set_list
-                .values
-                .iter_mut()
-                .fold(false, |changed, expr| rewrite_expr(expr, pass) || changed);
-            let trailing_changed = set_list
-                .trailing_multivalue
-                .as_mut()
-                .is_some_and(|expr| rewrite_expr(expr, pass));
-            base_changed || values_changed || trailing_changed
-        }
-        HirStmt::ErrNil(err_nil) => rewrite_expr(&mut err_nil.value, pass),
-        HirStmt::ToBeClosed(to_be_closed) => rewrite_expr(&mut to_be_closed.value, pass),
-        HirStmt::CallStmt(call_stmt) => rewrite_call_expr(&mut call_stmt.call, pass),
-        HirStmt::Return(ret) => ret
-            .values
-            .iter_mut()
-            .fold(false, |changed, expr| rewrite_expr(expr, pass) || changed),
-        HirStmt::If(if_stmt) => {
-            let cond_changed = rewrite_condition_expr(&mut if_stmt.cond, pass);
-            let then_changed = rewrite_block(&mut if_stmt.then_block, pass);
-            let else_changed = if_stmt
-                .else_block
-                .as_mut()
-                .is_some_and(|else_block| rewrite_block(else_block, pass));
-            cond_changed || then_changed || else_changed
-        }
-        HirStmt::While(while_stmt) => {
-            let cond_changed = rewrite_condition_expr(&mut while_stmt.cond, pass);
-            let body_changed = rewrite_block(&mut while_stmt.body, pass);
-            cond_changed || body_changed
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            let body_changed = rewrite_block(&mut repeat_stmt.body, pass);
-            let cond_changed = rewrite_condition_expr(&mut repeat_stmt.cond, pass);
-            body_changed || cond_changed
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            let start_changed = rewrite_expr(&mut numeric_for.start, pass);
-            let limit_changed = rewrite_expr(&mut numeric_for.limit, pass);
-            let step_changed = rewrite_expr(&mut numeric_for.step, pass);
-            let body_changed = rewrite_block(&mut numeric_for.body, pass);
-            start_changed || limit_changed || step_changed || body_changed
-        }
-        HirStmt::GenericFor(generic_for) => {
-            let iterator_changed = generic_for
-                .iterator
-                .iter_mut()
-                .fold(false, |changed, expr| rewrite_expr(expr, pass) || changed);
-            let body_changed = rewrite_block(&mut generic_for.body, pass);
-            iterator_changed || body_changed
-        }
-        HirStmt::Block(block) => rewrite_block(block, pass),
-        HirStmt::Unstructured(unstructured) => rewrite_block(&mut unstructured.body, pass),
-        HirStmt::Break
-        | HirStmt::Close(_)
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => false,
-    };
+    );
 
     let stmt_changed = pass.rewrite_stmt(stmt);
     stmt_changed || nested_changed
 }
 
 fn rewrite_lvalue(lvalue: &mut HirLValue, pass: &mut impl HirRewritePass) -> bool {
-    let nested_changed = match lvalue {
-        HirLValue::TableAccess(access) => {
-            let base_changed = rewrite_expr(&mut access.base, pass);
-            let key_changed = rewrite_expr(&mut access.key, pass);
-            base_changed || key_changed
-        }
-        HirLValue::Temp(_) | HirLValue::Local(_) | HirLValue::Upvalue(_) | HirLValue::Global(_) => {
-            false
-        }
-    };
+    let mut nested_changed = false;
+    traverse_hir_lvalue_children!(lvalue, borrow = [&mut], expr(expr) => {
+        nested_changed |= rewrite_expr(expr, pass);
+    });
 
     let lvalue_changed = pass.rewrite_lvalue(lvalue);
     lvalue_changed || nested_changed
 }
 
 fn rewrite_call_expr(call: &mut HirCallExpr, pass: &mut impl HirRewritePass) -> bool {
-    let callee_changed = rewrite_expr(&mut call.callee, pass);
-    let args_changed = call
-        .args
-        .iter_mut()
-        .fold(false, |changed, arg| rewrite_expr(arg, pass) || changed);
+    let mut nested_changed = false;
+    traverse_hir_call_children!(call, iter = iter_mut, borrow = [&mut], expr(expr) => {
+        nested_changed |= rewrite_expr(expr, pass);
+    });
     let call_changed = pass.rewrite_call(call);
-    call_changed || callee_changed || args_changed
+    call_changed || nested_changed
 }
 
 fn rewrite_expr(expr: &mut HirExpr, pass: &mut impl HirRewritePass) -> bool {
-    let nested_changed = match expr {
-        HirExpr::TableAccess(access) => {
-            let base_changed = rewrite_expr(&mut access.base, pass);
-            let key_changed = rewrite_expr(&mut access.key, pass);
-            base_changed || key_changed
+    let mut nested_changed = false;
+    traverse_hir_expr_children!(
+        expr,
+        iter = iter_mut,
+        borrow = [&mut],
+        expr(e) => {
+            nested_changed |= rewrite_expr(e, pass);
+        },
+        call(c) => {
+            nested_changed |= rewrite_call_expr(c, pass);
+        },
+        decision(d) => {
+            nested_changed |= rewrite_decision_expr(d, pass);
+        },
+        table_constructor(t) => {
+            nested_changed |= rewrite_table_constructor(t, pass);
         }
-        HirExpr::Unary(unary) => rewrite_expr(&mut unary.expr, pass),
-        HirExpr::Binary(binary) => {
-            let lhs_changed = rewrite_expr(&mut binary.lhs, pass);
-            let rhs_changed = rewrite_expr(&mut binary.rhs, pass);
-            lhs_changed || rhs_changed
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            let lhs_changed = rewrite_expr(&mut logical.lhs, pass);
-            let rhs_changed = rewrite_expr(&mut logical.rhs, pass);
-            lhs_changed || rhs_changed
-        }
-        HirExpr::Decision(decision) => rewrite_decision_expr(decision, pass),
-        HirExpr::Call(call) => rewrite_call_expr(call, pass),
-        HirExpr::TableConstructor(table) => rewrite_table_constructor(table, pass),
-        HirExpr::Closure(closure) => closure.captures.iter_mut().fold(false, |changed, capture| {
-            rewrite_expr(&mut capture.value, pass) || changed
-        }),
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => false,
-    };
+    );
 
     let expr_changed = pass.rewrite_expr(expr);
     expr_changed || nested_changed
 }
 
-fn rewrite_condition_expr(expr: &mut HirExpr, pass: &mut impl HirRewritePass) -> bool {
-    let nested_changed = rewrite_expr(expr, pass);
-    pass.rewrite_condition_expr(expr) || nested_changed
-}
-
-fn rewrite_decision_expr(decision: &mut HirDecisionExpr, pass: &mut impl HirRewritePass) -> bool {
-    decision.nodes.iter_mut().fold(false, |changed, node| {
-        let test_changed = rewrite_condition_expr(&mut node.test, pass);
-        let truthy_changed = rewrite_decision_target(&mut node.truthy, pass);
-        let falsy_changed = rewrite_decision_target(&mut node.falsy, pass);
-        changed || test_changed || truthy_changed || falsy_changed
-    })
-}
-
-fn rewrite_decision_target(target: &mut HirDecisionTarget, pass: &mut impl HirRewritePass) -> bool {
-    match target {
-        HirDecisionTarget::Expr(expr) => rewrite_expr(expr, pass),
-        HirDecisionTarget::Node(_) | HirDecisionTarget::CurrentValue => false,
-    }
+fn rewrite_decision_expr(
+    decision: &mut HirDecisionExpr,
+    pass: &mut impl HirRewritePass,
+) -> bool {
+    let mut changed = false;
+    traverse_hir_decision_children!(
+        decision,
+        iter = iter_mut,
+        borrow = [&mut],
+        expr(e) => {
+            changed |= rewrite_expr(e, pass);
+        },
+        condition(cond) => {
+            changed |= rewrite_condition_expr(cond, pass);
+        }
+    );
+    changed
 }
 
 fn rewrite_table_constructor(
     table: &mut HirTableConstructor,
     pass: &mut impl HirRewritePass,
 ) -> bool {
-    let fields_changed = table.fields.iter_mut().fold(false, |changed, field| {
-        let field_changed = match field {
-            HirTableField::Array(expr) => rewrite_expr(expr, pass),
-            HirTableField::Record(field) => {
-                let key_changed = match &mut field.key {
-                    HirTableKey::Name(_) => false,
-                    HirTableKey::Expr(expr) => rewrite_expr(expr, pass),
-                };
-                let value_changed = rewrite_expr(&mut field.value, pass);
-                key_changed || value_changed
-            }
-        };
-        changed || field_changed
-    });
-    let trailing_changed = table
-        .trailing_multivalue
-        .as_mut()
-        .is_some_and(|expr| rewrite_expr(expr, pass));
+    let mut changed = false;
+    traverse_hir_table_constructor_children!(
+        table,
+        iter = iter_mut,
+        opt = as_mut,
+        borrow = [&mut],
+        expr(e) => {
+            changed |= rewrite_expr(e, pass);
+        }
+    );
+    changed
+}
 
-    fields_changed || trailing_changed
+fn rewrite_condition_expr(expr: &mut HirExpr, pass: &mut impl HirRewritePass) -> bool {
+    let nested_changed = rewrite_expr(expr, pass);
+    pass.rewrite_condition_expr(expr) || nested_changed
 }
