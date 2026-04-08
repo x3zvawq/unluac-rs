@@ -7,6 +7,7 @@ mod contracts;
 mod debug;
 mod error;
 mod options;
+mod output_plan;
 mod pipeline;
 mod state;
 

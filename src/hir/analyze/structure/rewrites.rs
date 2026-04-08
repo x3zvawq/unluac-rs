@@ -8,6 +8,11 @@ use std::collections::BTreeMap;
 
 use crate::cfg::DefId;
 use crate::hir::common::{HirExpr, HirLValue, HirStmt, TempId};
+use crate::hir::traverse::{
+    traverse_hir_call_children, traverse_hir_decision_children, traverse_hir_expr_children,
+    traverse_hir_lvalue_children, traverse_hir_stmt_children,
+    traverse_hir_table_constructor_children,
+};
 
 pub(super) fn apply_loop_rewrites(
     stmts: &mut [HirStmt],
@@ -82,6 +87,55 @@ where
     shared_expr
 }
 
+/// 检查一组 defs 是否全部 override 到同一个可表达为表达式的 lvalue。
+///
+/// 这是 `shared_expr_for_defs` 的 lvalue 版本——前者返回 `HirExpr`，这里返回
+/// `HirLValue`。Branch 和 Loop 都需要用这个来判断"是否所有写入都指向同一个目标"
+/// 从而决定能不能把 phi temp 直接收成 alias。
+pub(super) fn shared_lvalue_for_defs<I>(
+    fixed_temps: &[TempId],
+    defs: I,
+    target_overrides: &BTreeMap<TempId, HirLValue>,
+) -> Option<HirLValue>
+where
+    I: IntoIterator<Item = DefId>,
+{
+    let mut shared_target = None;
+
+    for def in defs {
+        let temp = *fixed_temps.get(def.index())?;
+        let target = target_overrides.get(&temp)?;
+        let _ = lvalue_as_expr(target)?;
+        if shared_target
+            .as_ref()
+            .is_some_and(|known_target: &HirLValue| *known_target != *target)
+        {
+            return None;
+        }
+        shared_target = Some(target.clone());
+    }
+
+    shared_target
+}
+
+/// 把一组 defs 的 target override 批量安装到 override map 里。
+///
+/// Branch 和 Loop 都有"遍历 arm defs → 查 fixed_temp → 插入 target override"的模式，
+/// 这里统一提取成 helper。
+pub(super) fn install_def_target_overrides(
+    fixed_temps: &[TempId],
+    defs: impl IntoIterator<Item = DefId>,
+    target: &HirLValue,
+    overrides: &mut BTreeMap<TempId, HirLValue>,
+) {
+    for def in defs {
+        let Some(def_temp) = fixed_temps.get(def.index()) else {
+            continue;
+        };
+        overrides.insert(*def_temp, target.clone());
+    }
+}
+
 pub(super) fn rewrite_stmt_targets(
     stmt: &mut HirStmt,
     target_overrides: &BTreeMap<TempId, HirLValue>,
@@ -100,162 +154,70 @@ pub(super) fn rewrite_stmt_targets(
 }
 
 pub(super) fn rewrite_stmt_exprs(stmt: &mut HirStmt, expr_overrides: &BTreeMap<TempId, HirExpr>) {
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => {
-            for value in &mut local_decl.values {
-                rewrite_expr_temps(value, expr_overrides);
-            }
-        }
-        HirStmt::Assign(assign) => {
-            for target in &mut assign.targets {
-                rewrite_lvalue_exprs(target, expr_overrides);
-            }
-            for value in &mut assign.values {
-                rewrite_expr_temps(value, expr_overrides);
-            }
-        }
-        HirStmt::TableSetList(set_list) => {
-            rewrite_expr_temps(&mut set_list.base, expr_overrides);
-            for value in &mut set_list.values {
-                rewrite_expr_temps(value, expr_overrides);
-            }
-            if let Some(trailing) = &mut set_list.trailing_multivalue {
-                rewrite_expr_temps(trailing, expr_overrides);
-            }
-        }
-        HirStmt::ErrNil(err_nil) => {
-            rewrite_expr_temps(&mut err_nil.value, expr_overrides);
-        }
-        HirStmt::ToBeClosed(to_be_closed) => {
-            rewrite_expr_temps(&mut to_be_closed.value, expr_overrides);
-        }
-        HirStmt::CallStmt(call_stmt) => {
-            rewrite_call_expr_temps(&mut call_stmt.call, expr_overrides)
-        }
-        HirStmt::Return(ret) => {
-            for value in &mut ret.values {
-                rewrite_expr_temps(value, expr_overrides);
-            }
-        }
-        HirStmt::If(if_stmt) => {
-            rewrite_expr_temps(&mut if_stmt.cond, expr_overrides);
-        }
-        HirStmt::While(while_stmt) => {
-            rewrite_expr_temps(&mut while_stmt.cond, expr_overrides);
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            rewrite_expr_temps(&mut repeat_stmt.cond, expr_overrides);
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            rewrite_expr_temps(&mut numeric_for.start, expr_overrides);
-            rewrite_expr_temps(&mut numeric_for.limit, expr_overrides);
-            rewrite_expr_temps(&mut numeric_for.step, expr_overrides);
-        }
-        HirStmt::GenericFor(generic_for) => {
-            for value in &mut generic_for.iterator {
-                rewrite_expr_temps(value, expr_overrides);
-            }
-        }
-        HirStmt::Break
-        | HirStmt::Close(_)
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_)
-        | HirStmt::Block(_)
-        | HirStmt::Unstructured(_) => {}
-    }
-}
-
-fn rewrite_call_expr_temps(
-    call: &mut crate::hir::common::HirCallExpr,
-    expr_overrides: &BTreeMap<TempId, HirExpr>,
-) {
-    rewrite_expr_temps(&mut call.callee, expr_overrides);
-    for arg in &mut call.args {
-        rewrite_expr_temps(arg, expr_overrides);
-    }
-}
-
-fn rewrite_lvalue_exprs(lvalue: &mut HirLValue, expr_overrides: &BTreeMap<TempId, HirExpr>) {
-    if let HirLValue::TableAccess(access) = lvalue {
-        rewrite_expr_temps(&mut access.base, expr_overrides);
-        rewrite_expr_temps(&mut access.key, expr_overrides);
-    }
+    traverse_hir_stmt_children!(
+        stmt,
+        iter = iter_mut,
+        opt = as_mut,
+        borrow = [&mut],
+        expr(e) => { rewrite_expr_temps(e, expr_overrides); },
+        lvalue(lv) => {
+            traverse_hir_lvalue_children!(
+                lv,
+                borrow = [&mut],
+                expr(e) => { rewrite_expr_temps(e, expr_overrides); }
+            );
+        },
+        block(_b) => {},
+        call(c) => {
+            traverse_hir_call_children!(
+                c,
+                iter = iter_mut,
+                borrow = [&mut],
+                expr(e) => { rewrite_expr_temps(e, expr_overrides); }
+            );
+        },
+        condition(cond) => { rewrite_expr_temps(cond, expr_overrides); }
+    );
 }
 
 pub(super) fn rewrite_expr_temps(expr: &mut HirExpr, expr_overrides: &BTreeMap<TempId, HirExpr>) {
-    match expr {
-        HirExpr::TempRef(temp) => {
-            if let Some(replacement) = expr_overrides.get(temp) {
-                *expr = replacement.clone();
-            }
-        }
-        HirExpr::TableAccess(access) => {
-            rewrite_expr_temps(&mut access.base, expr_overrides);
-            rewrite_expr_temps(&mut access.key, expr_overrides);
-        }
-        HirExpr::Unary(unary) => rewrite_expr_temps(&mut unary.expr, expr_overrides),
-        HirExpr::Binary(binary) => {
-            rewrite_expr_temps(&mut binary.lhs, expr_overrides);
-            rewrite_expr_temps(&mut binary.rhs, expr_overrides);
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            rewrite_expr_temps(&mut logical.lhs, expr_overrides);
-            rewrite_expr_temps(&mut logical.rhs, expr_overrides);
-        }
-        HirExpr::Decision(decision) => {
-            for node in &mut decision.nodes {
-                rewrite_expr_temps(&mut node.test, expr_overrides);
-                rewrite_decision_target_temps(&mut node.truthy, expr_overrides);
-                rewrite_decision_target_temps(&mut node.falsy, expr_overrides);
-            }
-        }
-        HirExpr::Call(call) => rewrite_call_expr_temps(call, expr_overrides),
-        HirExpr::TableConstructor(table) => {
-            for field in &mut table.fields {
-                match field {
-                    crate::hir::common::HirTableField::Array(expr) => {
-                        rewrite_expr_temps(expr, expr_overrides);
-                    }
-                    crate::hir::common::HirTableField::Record(field) => {
-                        if let crate::hir::common::HirTableKey::Expr(expr) = &mut field.key {
-                            rewrite_expr_temps(expr, expr_overrides);
-                        }
-                        rewrite_expr_temps(&mut field.value, expr_overrides);
-                    }
-                }
-            }
-            if let Some(trailing) = &mut table.trailing_multivalue {
-                rewrite_expr_temps(trailing, expr_overrides);
-            }
-        }
-        HirExpr::Closure(closure) => {
-            for capture in &mut closure.captures {
-                rewrite_expr_temps(&mut capture.value, expr_overrides);
-            }
-        }
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => {}
+    if let HirExpr::TempRef(temp) = expr
+        && let Some(replacement) = expr_overrides.get(temp)
+    {
+        *expr = replacement.clone();
+        return;
     }
-}
 
-fn rewrite_decision_target_temps(
-    target: &mut crate::hir::common::HirDecisionTarget,
-    expr_overrides: &BTreeMap<TempId, HirExpr>,
-) {
-    if let crate::hir::common::HirDecisionTarget::Expr(expr) = target {
-        rewrite_expr_temps(expr, expr_overrides);
-    }
+    traverse_hir_expr_children!(
+        expr,
+        iter = iter_mut,
+        borrow = [&mut],
+        expr(e) => { rewrite_expr_temps(e, expr_overrides); },
+        call(c) => {
+            traverse_hir_call_children!(
+                c,
+                iter = iter_mut,
+                borrow = [&mut],
+                expr(e) => { rewrite_expr_temps(e, expr_overrides); }
+            );
+        },
+        decision(d) => {
+            traverse_hir_decision_children!(
+                d,
+                iter = iter_mut,
+                borrow = [&mut],
+                expr(e) => { rewrite_expr_temps(e, expr_overrides); },
+                condition(cond) => { rewrite_expr_temps(cond, expr_overrides); }
+            );
+        },
+        table_constructor(t) => {
+            traverse_hir_table_constructor_children!(
+                t,
+                iter = iter_mut,
+                opt = as_mut,
+                borrow = [&mut],
+                expr(e) => { rewrite_expr_temps(e, expr_overrides); }
+            );
+        }
+    );
 }

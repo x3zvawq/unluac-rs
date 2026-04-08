@@ -157,7 +157,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         if let Some(expr) =
-            self.shared_incoming_override_expr(defs.iter().copied(), target_overrides)
+            shared_expr_for_defs(&self.lowering.bindings.fixed_temps, defs.iter().copied(), target_overrides)
         {
             return Some(expr);
         }
@@ -304,23 +304,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         arm: &LoopValueArm,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirLValue> {
-        let mut shared_target = None;
-
-        for def in arm.defs() {
-            let def_temp = *self.lowering.bindings.fixed_temps.get(def.index())?;
-            let target = target_overrides
-                .get(&def_temp)
-                .filter(|target| lvalue_as_expr(target).is_some())?;
-            if shared_target
-                .as_ref()
-                .is_some_and(|known_target: &HirLValue| *known_target != *target)
-            {
-                return None;
-            }
-            shared_target = Some(target.clone());
-        }
-
-        shared_target
+        shared_lvalue_for_defs(
+            &self.lowering.bindings.fixed_temps,
+            arm.defs(),
+            target_overrides,
+        )
     }
 
     pub(super) fn header_values(
@@ -591,13 +579,5 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         expr_overrides
-    }
-
-    fn shared_incoming_override_expr(
-        &self,
-        defs: impl IntoIterator<Item = crate::cfg::DefId>,
-        target_overrides: &BTreeMap<TempId, HirLValue>,
-    ) -> Option<HirExpr> {
-        shared_expr_for_defs(&self.lowering.bindings.fixed_temps, defs, target_overrides)
     }
 }

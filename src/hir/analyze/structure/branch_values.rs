@@ -89,15 +89,17 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         for value in &candidate.values {
             let target = self.branch_value_arm_target(value, target_overrides);
             if !value.then_arm.preds.is_disjoint(preds) {
-                self.install_branch_arm_target_overrides(
-                    &value.then_arm.non_header_defs,
+                install_def_target_overrides(
+                    &self.lowering.bindings.fixed_temps,
+                    value.then_arm.non_header_defs.iter().copied(),
                     &target,
                     &mut overrides,
                 );
             }
             if !value.else_arm.preds.is_disjoint(preds) {
-                self.install_branch_arm_target_overrides(
-                    &value.else_arm.non_header_defs,
+                install_def_target_overrides(
+                    &self.lowering.bindings.fixed_temps,
+                    value.else_arm.non_header_defs.iter().copied(),
                     &target,
                     &mut overrides,
                 );
@@ -213,22 +215,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         value: &BranchValueMergeValue,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirLValue> {
-        let mut shared_target = None;
-
-        for def in branch_value_non_header_defs(value) {
-            let temp = *self.lowering.bindings.fixed_temps.get(def.index())?;
-            let target = target_overrides.get(&temp)?;
-            let _ = lvalue_as_expr(target)?;
-            if shared_target
-                .as_ref()
-                .is_some_and(|known_target: &HirLValue| *known_target != *target)
-            {
-                return None;
-            }
-            shared_target = Some(target.clone());
-        }
-
-        shared_target
+        shared_lvalue_for_defs(
+            &self.lowering.bindings.fixed_temps,
+            branch_value_non_header_defs(value),
+            target_overrides,
+        )
     }
 
     fn shared_branch_target_expr(
@@ -307,20 +298,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         arm_expr
-    }
-
-    fn install_branch_arm_target_overrides(
-        &self,
-        defs: &std::collections::BTreeSet<DefId>,
-        target: &HirLValue,
-        overrides: &mut BTreeMap<TempId, HirLValue>,
-    ) {
-        for def in defs {
-            let Some(def_temp) = self.lowering.bindings.fixed_temps.get(def.index()) else {
-                continue;
-            };
-            overrides.insert(*def_temp, target.clone());
-        }
     }
 }
 

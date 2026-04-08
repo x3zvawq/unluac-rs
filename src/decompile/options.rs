@@ -7,7 +7,11 @@ use std::fmt;
 
 use crate::generate::GenerateOptions;
 use crate::naming::{NamingMode, NamingOptions};
-use crate::parser::{ParseMode, ParseOptions, StringDecodeMode, StringEncoding};
+use crate::parser::{
+    ParseMode, ParseOptions, RawChunk, StringDecodeMode, StringEncoding, parse_lua51_chunk,
+    parse_lua52_chunk, parse_lua53_chunk, parse_lua54_chunk, parse_lua55_chunk,
+    parse_luajit_chunk, parse_luau_chunk,
+};
 use crate::readability::ReadabilityOptions;
 
 use super::debug::DebugOptions;
@@ -50,6 +54,23 @@ impl DecompileDialect {
             "luajit" => Some(Self::Luajit),
             "luau" => Some(Self::Luau),
             _ => None,
+        }
+    }
+
+    /// 按 dialect 分派到对应的字节码 parser。
+    pub fn parse_chunk(
+        self,
+        bytes: &[u8],
+        options: ParseOptions,
+    ) -> Result<RawChunk, crate::parser::ParseError> {
+        match self {
+            Self::Lua51 => parse_lua51_chunk(bytes, options),
+            Self::Lua52 => parse_lua52_chunk(bytes, options),
+            Self::Lua53 => parse_lua53_chunk(bytes, options),
+            Self::Lua54 => parse_lua54_chunk(bytes, options),
+            Self::Lua55 => parse_lua55_chunk(bytes, options),
+            Self::Luajit => parse_luajit_chunk(bytes, options),
+            Self::Luau => parse_luau_chunk(bytes, options),
         }
     }
 }
