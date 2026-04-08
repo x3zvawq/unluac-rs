@@ -6,6 +6,7 @@ mod debug;
 mod error;
 pub(crate) mod pretty;
 mod readability;
+pub(crate) mod traverse;
 
 pub use crate::readability::ReadabilityOptions;
 pub use build::lower_ast;

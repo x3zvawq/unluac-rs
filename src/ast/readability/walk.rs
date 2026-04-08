@@ -10,7 +10,7 @@ use crate::ast::common::{
 };
 
 pub(super) use super::traverse::BlockKind;
-use super::traverse::{
+use crate::ast::traverse::{
     traverse_call_children, traverse_expr_children, traverse_lvalue_children,
     traverse_stmt_children,
 };
@@ -122,11 +122,11 @@ pub(super) fn rewrite_stmt(stmt: &mut AstStmt, pass: &mut impl AstRewritePass) -
         lvalue(lvalue) => {
             nested_changed |= rewrite_lvalue(lvalue, pass);
         },
-        block(block, block_kind) => {
-            nested_changed |= rewrite_block_with_kind(block, block_kind, pass);
+        block(block) => {
+            nested_changed |= rewrite_block_with_kind(block, BlockKind::Regular, pass);
         },
-        function(function, function_kind) => {
-            nested_changed |= rewrite_function_expr(function, function_kind, pass);
+        function(function) => {
+            nested_changed |= rewrite_function_expr(function, BlockKind::FunctionBody, pass);
         },
         condition(condition) => {
             nested_changed |= rewrite_condition_expr(condition, pass);
@@ -157,11 +157,11 @@ fn rewrite_stmt_scoped<P: ScopedAstRewritePass>(
         lvalue(lvalue) => {
             nested_changed |= rewrite_lvalue_scoped(lvalue, scope, pass);
         },
-        block(block, block_kind) => {
-            nested_changed |= rewrite_block_with_kind_scoped(block, block_kind, scope, pass);
+        block(block) => {
+            nested_changed |= rewrite_block_with_kind_scoped(block, BlockKind::Regular, scope, pass);
         },
-        function(function, function_kind) => {
-            nested_changed |= rewrite_function_expr_scoped(function, function_kind, scope, pass);
+        function(function) => {
+            nested_changed |= rewrite_function_expr_scoped(function, BlockKind::FunctionBody, scope, pass);
         },
         condition(condition) => {
             nested_changed |= rewrite_condition_expr_scoped(condition, scope, pass);
@@ -184,8 +184,8 @@ pub(super) fn rewrite_expr(expr: &mut AstExpr, pass: &mut impl AstRewritePass) -
         expr(expr) => {
             nested_changed |= rewrite_expr(expr, pass);
         },
-        function(function, function_kind) => {
-            nested_changed |= rewrite_function_expr(function, function_kind, pass);
+        function(function) => {
+            nested_changed |= rewrite_function_expr(function, BlockKind::FunctionBody, pass);
         }
     );
 
@@ -206,8 +206,8 @@ fn rewrite_expr_scoped<P: ScopedAstRewritePass>(
         expr(expr) => {
             nested_changed |= rewrite_expr_scoped(expr, scope, pass);
         },
-        function(function, function_kind) => {
-            nested_changed |= rewrite_function_expr_scoped(function, function_kind, scope, pass);
+        function(function) => {
+            nested_changed |= rewrite_function_expr_scoped(function, BlockKind::FunctionBody, scope, pass);
         }
     );
 

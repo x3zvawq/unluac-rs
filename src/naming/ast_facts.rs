@@ -8,7 +8,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::{
     AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue,
-    AstModule, AstNameRef, AstStmt, AstSyntheticLocalId, AstTableField, AstTableKey,
+    AstModule, AstNameRef, AstStmt, AstSyntheticLocalId,
+};
+use crate::ast::traverse::{
+    traverse_call_children, traverse_expr_children, traverse_lvalue_children,
+    traverse_stmt_children,
 };
 use crate::hir::{HirModule, HirProtoRef};
 
@@ -127,76 +131,54 @@ fn collect_stmt_facts(
     hir: &HirModule,
     facts: &mut AstNamingFacts,
 ) {
+    // 先处理各变体的自定义 binding 收集
     match stmt {
         AstStmt::LocalDecl(local_decl) => {
             for binding in &local_decl.bindings {
                 collector.note_binding(binding.id);
             }
-            for value in &local_decl.values {
-                collect_expr_facts(value, collector, hir, facts);
-            }
-        }
-        AstStmt::GlobalDecl(global_decl) => {
-            for value in &global_decl.values {
-                collect_expr_facts(value, collector, hir, facts);
-            }
-        }
-        AstStmt::Assign(assign) => {
-            for target in &assign.targets {
-                collect_lvalue_facts(target, collector, hir, facts);
-            }
-            for value in &assign.values {
-                collect_expr_facts(value, collector, hir, facts);
-            }
-        }
-        AstStmt::CallStmt(call_stmt) => collect_call_facts(&call_stmt.call, collector, hir, facts),
-        AstStmt::Return(ret) => {
-            for value in &ret.values {
-                collect_expr_facts(value, collector, hir, facts);
-            }
-        }
-        AstStmt::If(if_stmt) => {
-            collect_expr_facts(&if_stmt.cond, collector, hir, facts);
-            collect_block_facts(&if_stmt.then_block, collector, hir, facts);
-            if let Some(else_block) = &if_stmt.else_block {
-                collect_block_facts(else_block, collector, hir, facts);
-            }
-        }
-        AstStmt::While(while_stmt) => {
-            collect_expr_facts(&while_stmt.cond, collector, hir, facts);
-            collect_block_facts(&while_stmt.body, collector, hir, facts);
-        }
-        AstStmt::Repeat(repeat_stmt) => {
-            collect_block_facts(&repeat_stmt.body, collector, hir, facts);
-            collect_expr_facts(&repeat_stmt.cond, collector, hir, facts);
         }
         AstStmt::NumericFor(numeric_for) => {
             collector.note_binding(numeric_for.binding);
-            collect_expr_facts(&numeric_for.start, collector, hir, facts);
-            collect_expr_facts(&numeric_for.limit, collector, hir, facts);
-            collect_expr_facts(&numeric_for.step, collector, hir, facts);
-            collect_block_facts(&numeric_for.body, collector, hir, facts);
         }
         AstStmt::GenericFor(generic_for) => {
             for &binding in &generic_for.bindings {
                 collector.note_binding(binding);
             }
-            for expr in &generic_for.iterator {
-                collect_expr_facts(expr, collector, hir, facts);
-            }
-            collect_block_facts(&generic_for.body, collector, hir, facts);
         }
-        AstStmt::DoBlock(block) => collect_block_facts(block, collector, hir, facts),
         AstStmt::FunctionDecl(function_decl) => {
             collect_function_name_facts(&function_decl.target, collector);
-            collect_nested_function_facts(&function_decl.func, hir, facts);
         }
         AstStmt::LocalFunctionDecl(local_function_decl) => {
             collector.note_binding(local_function_decl.name);
-            collect_nested_function_facts(&local_function_decl.func, hir, facts);
         }
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => {}
+        _ => {}
     }
+    // 子节点递归全部交给宏
+    traverse_stmt_children!(
+        stmt,
+        iter = iter,
+        opt = as_ref,
+        borrow = [&],
+        expr(expr) => {
+            collect_expr_facts(expr, collector, hir, facts);
+        },
+        lvalue(lvalue) => {
+            collect_lvalue_facts(lvalue, collector, hir, facts);
+        },
+        block(block) => {
+            collect_block_facts(block, collector, hir, facts);
+        },
+        function(func) => {
+            collect_nested_function_facts(func, hir, facts);
+        },
+        condition(cond) => {
+            collect_expr_facts(cond, collector, hir, facts);
+        },
+        call(call) => {
+            collect_call_facts(call, collector, hir, facts);
+        }
+    );
 }
 
 fn collect_nested_function_facts(
@@ -221,20 +203,9 @@ fn collect_call_facts(
     hir: &HirModule,
     facts: &mut AstNamingFacts,
 ) {
-    match call {
-        AstCallKind::Call(call) => {
-            collect_expr_facts(&call.callee, collector, hir, facts);
-            for arg in &call.args {
-                collect_expr_facts(arg, collector, hir, facts);
-            }
-        }
-        AstCallKind::MethodCall(call) => {
-            collect_expr_facts(&call.receiver, collector, hir, facts);
-            for arg in &call.args {
-                collect_expr_facts(arg, collector, hir, facts);
-            }
-        }
-    }
+    traverse_call_children!(call, iter = iter, borrow = [&], expr(expr) => {
+        collect_expr_facts(expr, collector, hir, facts);
+    });
 }
 
 fn collect_lvalue_facts(
@@ -243,14 +214,12 @@ fn collect_lvalue_facts(
     hir: &HirModule,
     facts: &mut AstNamingFacts,
 ) {
-    match target {
-        AstLValue::Name(name) => collector.note_name_ref(name),
-        AstLValue::FieldAccess(access) => collect_expr_facts(&access.base, collector, hir, facts),
-        AstLValue::IndexAccess(access) => {
-            collect_expr_facts(&access.base, collector, hir, facts);
-            collect_expr_facts(&access.index, collector, hir, facts);
-        }
+    if let AstLValue::Name(name) = target {
+        collector.note_name_ref(name);
     }
+    traverse_lvalue_children!(target, borrow = [&], expr(expr) => {
+        collect_expr_facts(expr, collector, hir, facts);
+    });
 }
 
 fn collect_expr_facts(
@@ -259,59 +228,18 @@ fn collect_expr_facts(
     hir: &HirModule,
     facts: &mut AstNamingFacts,
 ) {
-    match expr {
-        AstExpr::Var(name) => collector.note_name_ref(name),
-        AstExpr::FieldAccess(access) => collect_expr_facts(&access.base, collector, hir, facts),
-        AstExpr::IndexAccess(access) => {
-            collect_expr_facts(&access.base, collector, hir, facts);
-            collect_expr_facts(&access.index, collector, hir, facts);
-        }
-        AstExpr::Unary(unary) => collect_expr_facts(&unary.expr, collector, hir, facts),
-        AstExpr::Binary(binary) => {
-            collect_expr_facts(&binary.lhs, collector, hir, facts);
-            collect_expr_facts(&binary.rhs, collector, hir, facts);
-        }
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            collect_expr_facts(&logical.lhs, collector, hir, facts);
-            collect_expr_facts(&logical.rhs, collector, hir, facts);
-        }
-        AstExpr::Call(call) => {
-            collect_expr_facts(&call.callee, collector, hir, facts);
-            for arg in &call.args {
-                collect_expr_facts(arg, collector, hir, facts);
-            }
-        }
-        AstExpr::MethodCall(call) => {
-            collect_expr_facts(&call.receiver, collector, hir, facts);
-            for arg in &call.args {
-                collect_expr_facts(arg, collector, hir, facts);
-            }
-        }
-        AstExpr::SingleValue(expr) => collect_expr_facts(expr, collector, hir, facts),
-        AstExpr::TableConstructor(table) => {
-            for field in &table.fields {
-                match field {
-                    AstTableField::Array(value) => collect_expr_facts(value, collector, hir, facts),
-                    AstTableField::Record(record) => {
-                        if let AstTableKey::Expr(key) = &record.key {
-                            collect_expr_facts(key, collector, hir, facts);
-                        }
-                        collect_expr_facts(&record.value, collector, hir, facts);
-                    }
-                }
-            }
-        }
-        AstExpr::FunctionExpr(function_expr) => {
-            collect_nested_function_facts(function_expr, hir, facts)
-        }
-        AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::VarArg => {}
+    if let AstExpr::Var(name) = expr {
+        collector.note_name_ref(name);
     }
+    traverse_expr_children!(
+        expr,
+        iter = iter,
+        borrow = [&],
+        expr(child) => {
+            collect_expr_facts(child, collector, hir, facts);
+        },
+        function(func) => {
+            collect_nested_function_facts(func, hir, facts);
+        }
+    );
 }

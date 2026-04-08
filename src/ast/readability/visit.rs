@@ -9,8 +9,9 @@ use crate::ast::common::{
     AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstModule, AstStmt,
 };
 
-use super::traverse::{
-    BlockKind, traverse_call_children, traverse_expr_children, traverse_lvalue_children,
+use super::traverse::BlockKind;
+use crate::ast::traverse::{
+    traverse_call_children, traverse_expr_children, traverse_lvalue_children,
     traverse_stmt_children,
 };
 
@@ -68,11 +69,11 @@ fn visit_stmt_impl(stmt: &AstStmt, visitor: &mut impl AstVisitor) {
         lvalue(lvalue) => {
             visit_lvalue(lvalue, visitor);
         },
-        block(block, block_kind) => {
-            visit_block_with_kind(block, block_kind, visitor);
+        block(block) => {
+            visit_block_with_kind(block, BlockKind::Regular, visitor);
         },
-        function(function, function_kind) => {
-            visit_function_expr(function, function_kind, visitor);
+        function(function) => {
+            visit_function_expr(function, BlockKind::FunctionBody, visitor);
         },
         condition(condition) => {
             visit_condition_expr(condition, visitor);
@@ -106,8 +107,8 @@ fn visit_expr(expr: &AstExpr, visitor: &mut impl AstVisitor) {
         expr(expr) => {
             visit_expr(expr, visitor);
         },
-        function(function, function_kind) => {
-            visit_function_expr(function, function_kind, visitor);
+        function(function) => {
+            visit_function_expr(function, BlockKind::FunctionBody, visitor);
         }
     );
 }

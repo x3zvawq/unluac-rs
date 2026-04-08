@@ -5,8 +5,12 @@
 //! 例如：子闭包捕获某个 local 时，这里会记录它对应的捕获来源链。
 
 use crate::hir::{
-    HirBlock, HirClosureExpr, HirDecisionTarget, HirExpr, HirLValue, HirModule, HirProtoRef,
-    HirStmt, HirTableField, HirTableKey,
+    HirBlock, HirClosureExpr, HirExpr, HirModule, HirProtoRef, HirStmt,
+};
+use crate::hir::traverse::{
+    traverse_hir_call_children, traverse_hir_decision_children, traverse_hir_expr_children,
+    traverse_hir_lvalue_children, traverse_hir_stmt_children,
+    traverse_hir_table_constructor_children,
 };
 
 use super::super::NamingError;
@@ -40,86 +44,30 @@ fn collect_capture_evidence_in_stmt(
     hir: &HirModule,
     evidence: &mut [Option<ClosureCaptureEvidence>],
 ) -> Result<(), NamingError> {
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => {
-            for value in &local_decl.values {
-                collect_capture_evidence_in_expr(function, value, hir, evidence)?;
-            }
-        }
-        HirStmt::Assign(assign) => {
-            for target in &assign.targets {
-                if let HirLValue::TableAccess(access) = target {
-                    collect_capture_evidence_in_expr(function, &access.base, hir, evidence)?;
-                    collect_capture_evidence_in_expr(function, &access.key, hir, evidence)?;
-                }
-            }
-            for value in &assign.values {
-                collect_capture_evidence_in_expr(function, value, hir, evidence)?;
-            }
-        }
-        HirStmt::TableSetList(set_list) => {
-            collect_capture_evidence_in_expr(function, &set_list.base, hir, evidence)?;
-            for value in &set_list.values {
-                collect_capture_evidence_in_expr(function, value, hir, evidence)?;
-            }
-            if let Some(expr) = &set_list.trailing_multivalue {
-                collect_capture_evidence_in_expr(function, expr, hir, evidence)?;
-            }
-        }
-        HirStmt::ErrNil(err_nil) => {
-            collect_capture_evidence_in_expr(function, &err_nil.value, hir, evidence)?;
-        }
-        HirStmt::ToBeClosed(to_be_closed) => {
-            collect_capture_evidence_in_expr(function, &to_be_closed.value, hir, evidence)?;
-        }
-        HirStmt::CallStmt(call_stmt) => {
-            collect_capture_evidence_in_expr(function, &call_stmt.call.callee, hir, evidence)?;
-            for arg in &call_stmt.call.args {
-                collect_capture_evidence_in_expr(function, arg, hir, evidence)?;
-            }
-        }
-        HirStmt::Return(ret) => {
-            for value in &ret.values {
-                collect_capture_evidence_in_expr(function, value, hir, evidence)?;
-            }
-        }
-        HirStmt::If(if_stmt) => {
-            collect_capture_evidence_in_expr(function, &if_stmt.cond, hir, evidence)?;
-            collect_capture_evidence_in_block(function, &if_stmt.then_block, hir, evidence)?;
-            if let Some(else_block) = &if_stmt.else_block {
-                collect_capture_evidence_in_block(function, else_block, hir, evidence)?;
-            }
-        }
-        HirStmt::While(while_stmt) => {
-            collect_capture_evidence_in_expr(function, &while_stmt.cond, hir, evidence)?;
-            collect_capture_evidence_in_block(function, &while_stmt.body, hir, evidence)?;
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            collect_capture_evidence_in_block(function, &repeat_stmt.body, hir, evidence)?;
-            collect_capture_evidence_in_expr(function, &repeat_stmt.cond, hir, evidence)?;
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            collect_capture_evidence_in_expr(function, &numeric_for.start, hir, evidence)?;
-            collect_capture_evidence_in_expr(function, &numeric_for.limit, hir, evidence)?;
-            collect_capture_evidence_in_expr(function, &numeric_for.step, hir, evidence)?;
-            collect_capture_evidence_in_block(function, &numeric_for.body, hir, evidence)?;
-        }
-        HirStmt::GenericFor(generic_for) => {
-            for iterator in &generic_for.iterator {
-                collect_capture_evidence_in_expr(function, iterator, hir, evidence)?;
-            }
-            collect_capture_evidence_in_block(function, &generic_for.body, hir, evidence)?;
-        }
-        HirStmt::Block(block) => collect_capture_evidence_in_block(function, block, hir, evidence)?,
-        HirStmt::Unstructured(unstructured) => {
-            collect_capture_evidence_in_block(function, &unstructured.body, hir, evidence)?;
-        }
-        HirStmt::Close(_)
-        | HirStmt::Break
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => {}
-    }
+    traverse_hir_stmt_children!(
+        stmt,
+        iter = iter,
+        opt = as_ref,
+        borrow = [&],
+        expr(e) => { collect_capture_evidence_in_expr(function, e, hir, evidence)?; },
+        lvalue(l) => {
+            traverse_hir_lvalue_children!(
+                l,
+                borrow = [&],
+                expr(e) => { collect_capture_evidence_in_expr(function, e, hir, evidence)?; }
+            );
+        },
+        block(b) => { collect_capture_evidence_in_block(function, b, hir, evidence)?; },
+        call(c) => {
+            traverse_hir_call_children!(
+                c,
+                iter = iter,
+                borrow = [&],
+                expr(e) => { collect_capture_evidence_in_expr(function, e, hir, evidence)?; }
+            );
+        },
+        condition(c) => { collect_capture_evidence_in_expr(function, c, hir, evidence)?; }
+    );
     Ok(())
 }
 
@@ -129,87 +77,42 @@ fn collect_capture_evidence_in_expr(
     hir: &HirModule,
     evidence: &mut [Option<ClosureCaptureEvidence>],
 ) -> Result<(), NamingError> {
-    match expr {
-        HirExpr::TableAccess(access) => {
-            collect_capture_evidence_in_expr(function, &access.base, hir, evidence)?;
-            collect_capture_evidence_in_expr(function, &access.key, hir, evidence)?;
-        }
-        HirExpr::Unary(unary) => {
-            collect_capture_evidence_in_expr(function, &unary.expr, hir, evidence)?;
-        }
-        HirExpr::Binary(binary) => {
-            collect_capture_evidence_in_expr(function, &binary.lhs, hir, evidence)?;
-            collect_capture_evidence_in_expr(function, &binary.rhs, hir, evidence)?;
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            collect_capture_evidence_in_expr(function, &logical.lhs, hir, evidence)?;
-            collect_capture_evidence_in_expr(function, &logical.rhs, hir, evidence)?;
-        }
-        HirExpr::Decision(decision) => {
-            for node in &decision.nodes {
-                collect_capture_evidence_in_expr(function, &node.test, hir, evidence)?;
-                collect_capture_evidence_in_decision_target(function, &node.truthy, hir, evidence)?;
-                collect_capture_evidence_in_decision_target(function, &node.falsy, hir, evidence)?;
-            }
-        }
-        HirExpr::Call(call) => {
-            collect_capture_evidence_in_expr(function, &call.callee, hir, evidence)?;
-            for arg in &call.args {
-                collect_capture_evidence_in_expr(function, arg, hir, evidence)?;
-            }
-        }
-        HirExpr::TableConstructor(table) => {
-            for field in &table.fields {
-                match field {
-                    HirTableField::Array(value) => {
-                        collect_capture_evidence_in_expr(function, value, hir, evidence)?;
-                    }
-                    HirTableField::Record(field) => {
-                        if let HirTableKey::Expr(key) = &field.key {
-                            collect_capture_evidence_in_expr(function, key, hir, evidence)?;
-                        }
-                        collect_capture_evidence_in_expr(function, &field.value, hir, evidence)?;
-                    }
-                }
-            }
-            if let Some(expr) = &table.trailing_multivalue {
-                collect_capture_evidence_in_expr(function, expr, hir, evidence)?;
-            }
-        }
-        HirExpr::Closure(closure) => {
-            record_closure_capture_evidence(function, closure, hir, evidence)?;
-            for capture in &closure.captures {
-                collect_capture_evidence_in_expr(function, &capture.value, hir, evidence)?;
-            }
-        }
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => {}
+    // Closure 需要额外记录 capture provenance，先处理再让宏走结构递归
+    if let HirExpr::Closure(closure) = expr {
+        record_closure_capture_evidence(function, closure, hir, evidence)?;
     }
-    Ok(())
-}
-
-fn collect_capture_evidence_in_decision_target(
-    function: HirProtoRef,
-    target: &HirDecisionTarget,
-    hir: &HirModule,
-    evidence: &mut [Option<ClosureCaptureEvidence>],
-) -> Result<(), NamingError> {
-    if let HirDecisionTarget::Expr(expr) = target {
-        collect_capture_evidence_in_expr(function, expr, hir, evidence)?;
-    }
+    traverse_hir_expr_children!(
+        expr,
+        iter = iter,
+        borrow = [&],
+        expr(e) => { collect_capture_evidence_in_expr(function, e, hir, evidence)?; },
+        call(c) => {
+            traverse_hir_call_children!(
+                c,
+                iter = iter,
+                borrow = [&],
+                expr(e) => { collect_capture_evidence_in_expr(function, e, hir, evidence)?; }
+            );
+        },
+        decision(d) => {
+            traverse_hir_decision_children!(
+                d,
+                iter = iter,
+                borrow = [&],
+                expr(e) => { collect_capture_evidence_in_expr(function, e, hir, evidence)?; },
+                condition(c) => { collect_capture_evidence_in_expr(function, c, hir, evidence)?; }
+            );
+        },
+        table_constructor(t) => {
+            traverse_hir_table_constructor_children!(
+                t,
+                iter = iter,
+                opt = as_ref,
+                borrow = [&],
+                expr(e) => { collect_capture_evidence_in_expr(function, e, hir, evidence)?; }
+            );
+        }
+    );
     Ok(())
 }
 

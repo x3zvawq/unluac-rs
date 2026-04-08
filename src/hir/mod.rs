@@ -9,6 +9,7 @@ mod debug;
 mod decision;
 mod promotion;
 mod simplify;
+pub(crate) mod traverse;
 
 pub use analyze::analyze_hir;
 pub(crate) use analyze::analyze_hir_with_timing;

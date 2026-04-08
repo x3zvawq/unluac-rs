@@ -71,46 +71,20 @@ pub(super) fn is_valid_identifier(candidate: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
+/// Lua 关键字列表（包含 `global` 作为保留标识符）。
+const LUA_KEYWORDS: &[&str] = &[
+    "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if", "in",
+    "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while", "global",
+];
+
 /// 判断是否为 Lua 关键字。
 pub(super) fn is_lua_keyword(candidate: &str) -> bool {
-    matches!(
-        candidate,
-        "and"
-            | "break"
-            | "do"
-            | "else"
-            | "elseif"
-            | "end"
-            | "false"
-            | "for"
-            | "function"
-            | "goto"
-            | "if"
-            | "in"
-            | "local"
-            | "nil"
-            | "not"
-            | "or"
-            | "repeat"
-            | "return"
-            | "then"
-            | "true"
-            | "until"
-            | "while"
-            | "global"
-    )
+    LUA_KEYWORDS.contains(&candidate)
 }
 
 /// 预置 Lua 关键字表。
 pub(super) fn lua_keywords() -> BTreeSet<String> {
-    [
-        "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if",
-        "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
-        "global",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect()
+    LUA_KEYWORDS.iter().map(|s| (*s).to_owned()).collect()
 }
 
 /// 在指定 pc 上，从 debug locals 里找寄存器对应的名字。

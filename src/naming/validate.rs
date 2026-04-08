@@ -5,7 +5,11 @@
 
 use crate::ast::{
     AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue, AstModule,
-    AstNameRef, AstStmt, AstTableField, AstTableKey,
+    AstNameRef, AstStmt,
+};
+use crate::ast::traverse::{
+    traverse_call_children, traverse_expr_children, traverse_lvalue_children,
+    traverse_stmt_children,
 };
 use crate::hir::{HirModule, HirProtoRef};
 
@@ -51,6 +55,7 @@ fn validate_stmt_has_no_temps(
     function: HirProtoRef,
     hir: &HirModule,
 ) -> Result<(), NamingError> {
+    // 只有少数变体有自定义 temp 检查，先处理
     match stmt {
         AstStmt::LocalDecl(local_decl) => {
             for binding in &local_decl.bindings {
@@ -61,60 +66,9 @@ fn validate_stmt_has_no_temps(
                     });
                 }
             }
-            for value in &local_decl.values {
-                validate_expr_has_no_temps(value, function, hir)?;
-            }
         }
-        AstStmt::GlobalDecl(global_decl) => {
-            for value in &global_decl.values {
-                validate_expr_has_no_temps(value, function, hir)?;
-            }
-        }
-        AstStmt::Assign(assign) => {
-            for target in &assign.targets {
-                validate_lvalue_has_no_temps(target, function, hir)?;
-            }
-            for value in &assign.values {
-                validate_expr_has_no_temps(value, function, hir)?;
-            }
-        }
-        AstStmt::CallStmt(call_stmt) => validate_call_has_no_temps(&call_stmt.call, function, hir)?,
-        AstStmt::Return(ret) => {
-            for value in &ret.values {
-                validate_expr_has_no_temps(value, function, hir)?;
-            }
-        }
-        AstStmt::If(if_stmt) => {
-            validate_expr_has_no_temps(&if_stmt.cond, function, hir)?;
-            validate_block_has_no_temps(&if_stmt.then_block, function, hir)?;
-            if let Some(else_block) = &if_stmt.else_block {
-                validate_block_has_no_temps(else_block, function, hir)?;
-            }
-        }
-        AstStmt::While(while_stmt) => {
-            validate_expr_has_no_temps(&while_stmt.cond, function, hir)?;
-            validate_block_has_no_temps(&while_stmt.body, function, hir)?;
-        }
-        AstStmt::Repeat(repeat_stmt) => {
-            validate_block_has_no_temps(&repeat_stmt.body, function, hir)?;
-            validate_expr_has_no_temps(&repeat_stmt.cond, function, hir)?;
-        }
-        AstStmt::NumericFor(numeric_for) => {
-            validate_expr_has_no_temps(&numeric_for.start, function, hir)?;
-            validate_expr_has_no_temps(&numeric_for.limit, function, hir)?;
-            validate_expr_has_no_temps(&numeric_for.step, function, hir)?;
-            validate_block_has_no_temps(&numeric_for.body, function, hir)?;
-        }
-        AstStmt::GenericFor(generic_for) => {
-            for expr in &generic_for.iterator {
-                validate_expr_has_no_temps(expr, function, hir)?;
-            }
-            validate_block_has_no_temps(&generic_for.body, function, hir)?;
-        }
-        AstStmt::DoBlock(block) => validate_block_has_no_temps(block, function, hir)?,
         AstStmt::FunctionDecl(function_decl) => {
             validate_function_name_has_no_temps(&function_decl.target, function)?;
-            validate_function_expr_has_no_temps(&function_decl.func, hir)?;
         }
         AstStmt::LocalFunctionDecl(local_function_decl) => {
             if let crate::ast::AstBindingRef::Temp(temp) = local_function_decl.name {
@@ -123,10 +77,34 @@ fn validate_stmt_has_no_temps(
                     temp: temp.index(),
                 });
             }
-            validate_function_expr_has_no_temps(&local_function_decl.func, hir)?;
         }
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => {}
+        _ => {}
     }
+    // 子节点递归全部交给宏
+    traverse_stmt_children!(
+        stmt,
+        iter = iter,
+        opt = as_ref,
+        borrow = [&],
+        expr(expr) => {
+            validate_expr_has_no_temps(expr, function, hir)?;
+        },
+        lvalue(lvalue) => {
+            validate_lvalue_has_no_temps(lvalue, function, hir)?;
+        },
+        block(block) => {
+            validate_block_has_no_temps(block, function, hir)?;
+        },
+        function(func) => {
+            validate_function_expr_has_no_temps(func, hir)?;
+        },
+        condition(cond) => {
+            validate_expr_has_no_temps(cond, function, hir)?;
+        },
+        call(call) => {
+            validate_call_has_no_temps(call, function, hir)?;
+        }
+    );
     Ok(())
 }
 
@@ -160,20 +138,9 @@ fn validate_call_has_no_temps(
     function: HirProtoRef,
     hir: &HirModule,
 ) -> Result<(), NamingError> {
-    match call {
-        AstCallKind::Call(call) => {
-            validate_expr_has_no_temps(&call.callee, function, hir)?;
-            for arg in &call.args {
-                validate_expr_has_no_temps(arg, function, hir)?;
-            }
-        }
-        AstCallKind::MethodCall(call) => {
-            validate_expr_has_no_temps(&call.receiver, function, hir)?;
-            for arg in &call.args {
-                validate_expr_has_no_temps(arg, function, hir)?;
-            }
-        }
-    }
+    traverse_call_children!(call, iter = iter, borrow = [&], expr(expr) => {
+        validate_expr_has_no_temps(expr, function, hir)?;
+    });
     Ok(())
 }
 
@@ -182,18 +149,16 @@ fn validate_lvalue_has_no_temps(
     function: HirProtoRef,
     hir: &HirModule,
 ) -> Result<(), NamingError> {
-    match target {
-        AstLValue::Name(AstNameRef::Temp(temp)) => Err(NamingError::UnexpectedTemp {
+    if let AstLValue::Name(AstNameRef::Temp(temp)) = target {
+        return Err(NamingError::UnexpectedTemp {
             function: function.index(),
             temp: temp.index(),
-        }),
-        AstLValue::Name(_) => Ok(()),
-        AstLValue::FieldAccess(access) => validate_expr_has_no_temps(&access.base, function, hir),
-        AstLValue::IndexAccess(access) => {
-            validate_expr_has_no_temps(&access.base, function, hir)?;
-            validate_expr_has_no_temps(&access.index, function, hir)
-        }
+        });
     }
+    traverse_lvalue_children!(target, borrow = [&], expr(expr) => {
+        validate_expr_has_no_temps(expr, function, hir)?;
+    });
+    Ok(())
 }
 
 fn validate_expr_has_no_temps(
@@ -201,68 +166,22 @@ fn validate_expr_has_no_temps(
     function: HirProtoRef,
     hir: &HirModule,
 ) -> Result<(), NamingError> {
-    match expr {
-        AstExpr::Var(AstNameRef::Temp(temp)) => Err(NamingError::UnexpectedTemp {
+    if let AstExpr::Var(AstNameRef::Temp(temp)) = expr {
+        return Err(NamingError::UnexpectedTemp {
             function: function.index(),
             temp: temp.index(),
-        }),
-        AstExpr::Var(_)
-        | AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::VarArg => Ok(()),
-        AstExpr::FieldAccess(access) => validate_expr_has_no_temps(&access.base, function, hir),
-        AstExpr::IndexAccess(access) => {
-            validate_expr_has_no_temps(&access.base, function, hir)?;
-            validate_expr_has_no_temps(&access.index, function, hir)
-        }
-        AstExpr::Unary(unary) => validate_expr_has_no_temps(&unary.expr, function, hir),
-        AstExpr::Binary(binary) => {
-            validate_expr_has_no_temps(&binary.lhs, function, hir)?;
-            validate_expr_has_no_temps(&binary.rhs, function, hir)
-        }
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            validate_expr_has_no_temps(&logical.lhs, function, hir)?;
-            validate_expr_has_no_temps(&logical.rhs, function, hir)
-        }
-        AstExpr::Call(call) => {
-            validate_expr_has_no_temps(&call.callee, function, hir)?;
-            for arg in &call.args {
-                validate_expr_has_no_temps(arg, function, hir)?;
-            }
-            Ok(())
-        }
-        AstExpr::MethodCall(call) => {
-            validate_expr_has_no_temps(&call.receiver, function, hir)?;
-            for arg in &call.args {
-                validate_expr_has_no_temps(arg, function, hir)?;
-            }
-            Ok(())
-        }
-        AstExpr::SingleValue(expr) => validate_expr_has_no_temps(expr, function, hir),
-        AstExpr::TableConstructor(table) => {
-            for field in &table.fields {
-                match field {
-                    AstTableField::Array(value) => {
-                        validate_expr_has_no_temps(value, function, hir)?
-                    }
-                    AstTableField::Record(record) => {
-                        if let AstTableKey::Expr(key) = &record.key {
-                            validate_expr_has_no_temps(key, function, hir)?;
-                        }
-                        validate_expr_has_no_temps(&record.value, function, hir)?;
-                    }
-                }
-            }
-            Ok(())
-        }
-        AstExpr::FunctionExpr(function_expr) => {
-            validate_function_expr_has_no_temps(function_expr, hir)
-        }
+        });
     }
+    traverse_expr_children!(
+        expr,
+        iter = iter,
+        borrow = [&],
+        expr(child) => {
+            validate_expr_has_no_temps(child, function, hir)?;
+        },
+        function(func) => {
+            validate_function_expr_has_no_temps(func, hir)?;
+        }
+    );
+    Ok(())
 }

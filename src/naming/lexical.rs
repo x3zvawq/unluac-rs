@@ -6,8 +6,10 @@
 
 use crate::ast::{
     AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue,
-    AstLocalDecl, AstLocalFunctionDecl, AstModule, AstStmt, AstSyntheticLocalId, AstTableField,
-    AstTableKey,
+    AstLocalDecl, AstLocalFunctionDecl, AstModule, AstStmt, AstSyntheticLocalId,
+};
+use crate::ast::traverse::{
+    traverse_call_children, traverse_expr_children, traverse_lvalue_children,
 };
 use crate::hir::{HirModule, HirProtoRef, LocalId, ParamId, UpvalueId};
 
@@ -402,26 +404,9 @@ fn collect_call_context(
     outer_visible_bindings: &[VisibleBinding],
     scopes: &mut Vec<Vec<VisibleBinding>>,
 ) -> Result<(), NamingError> {
-    match call {
-        AstCallKind::Call(call) => {
-            collect_expr_context(&call.callee, hir, contexts, outer_visible_bindings, scopes)?;
-            for arg in &call.args {
-                collect_expr_context(arg, hir, contexts, outer_visible_bindings, scopes)?;
-            }
-        }
-        AstCallKind::MethodCall(call) => {
-            collect_expr_context(
-                &call.receiver,
-                hir,
-                contexts,
-                outer_visible_bindings,
-                scopes,
-            )?;
-            for arg in &call.args {
-                collect_expr_context(arg, hir, contexts, outer_visible_bindings, scopes)?;
-            }
-        }
-    }
+    traverse_call_children!(call, iter = iter, borrow = [&], expr(expr) => {
+        collect_expr_context(expr, hir, contexts, outer_visible_bindings, scopes)?;
+    });
     Ok(())
 }
 
@@ -432,19 +417,10 @@ fn collect_lvalue_context(
     outer_visible_bindings: &[VisibleBinding],
     scopes: &mut Vec<Vec<VisibleBinding>>,
 ) -> Result<(), NamingError> {
-    match target {
-        AstLValue::Name(name) => {
-            let _ = name;
-            Ok(())
-        }
-        AstLValue::FieldAccess(access) => {
-            collect_expr_context(&access.base, hir, contexts, outer_visible_bindings, scopes)
-        }
-        AstLValue::IndexAccess(access) => {
-            collect_expr_context(&access.base, hir, contexts, outer_visible_bindings, scopes)?;
-            collect_expr_context(&access.index, hir, contexts, outer_visible_bindings, scopes)
-        }
-    }
+    traverse_lvalue_children!(target, borrow = [&], expr(expr) => {
+        collect_expr_context(expr, hir, contexts, outer_visible_bindings, scopes)?;
+    });
+    Ok(())
 }
 
 fn collect_expr_context(
@@ -454,97 +430,18 @@ fn collect_expr_context(
     outer_visible_bindings: &[VisibleBinding],
     scopes: &mut Vec<Vec<VisibleBinding>>,
 ) -> Result<(), NamingError> {
-    match expr {
-        AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::VarArg => Ok(()),
-        AstExpr::Var(name) => {
-            let _ = name;
-            Ok(())
+    traverse_expr_children!(
+        expr,
+        iter = iter,
+        borrow = [&],
+        expr(child) => {
+            collect_expr_context(child, hir, contexts, outer_visible_bindings, scopes)?;
+        },
+        function(func) => {
+            collect_nested_function_context(func, hir, contexts, outer_visible_bindings, scopes)?;
         }
-        AstExpr::FieldAccess(access) => {
-            collect_expr_context(&access.base, hir, contexts, outer_visible_bindings, scopes)
-        }
-        AstExpr::IndexAccess(access) => {
-            collect_expr_context(&access.base, hir, contexts, outer_visible_bindings, scopes)?;
-            collect_expr_context(&access.index, hir, contexts, outer_visible_bindings, scopes)
-        }
-        AstExpr::Unary(unary) => {
-            collect_expr_context(&unary.expr, hir, contexts, outer_visible_bindings, scopes)
-        }
-        AstExpr::Binary(binary) => {
-            collect_expr_context(&binary.lhs, hir, contexts, outer_visible_bindings, scopes)?;
-            collect_expr_context(&binary.rhs, hir, contexts, outer_visible_bindings, scopes)
-        }
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            collect_expr_context(&logical.lhs, hir, contexts, outer_visible_bindings, scopes)?;
-            collect_expr_context(&logical.rhs, hir, contexts, outer_visible_bindings, scopes)
-        }
-        AstExpr::Call(call) => {
-            collect_expr_context(&call.callee, hir, contexts, outer_visible_bindings, scopes)?;
-            for arg in &call.args {
-                collect_expr_context(arg, hir, contexts, outer_visible_bindings, scopes)?;
-            }
-            Ok(())
-        }
-        AstExpr::MethodCall(call) => {
-            collect_expr_context(
-                &call.receiver,
-                hir,
-                contexts,
-                outer_visible_bindings,
-                scopes,
-            )?;
-            for arg in &call.args {
-                collect_expr_context(arg, hir, contexts, outer_visible_bindings, scopes)?;
-            }
-            Ok(())
-        }
-        AstExpr::SingleValue(expr) => {
-            collect_expr_context(expr, hir, contexts, outer_visible_bindings, scopes)
-        }
-        AstExpr::TableConstructor(table) => {
-            for field in &table.fields {
-                match field {
-                    AstTableField::Array(value) => {
-                        collect_expr_context(value, hir, contexts, outer_visible_bindings, scopes)?;
-                    }
-                    AstTableField::Record(record) => {
-                        if let AstTableKey::Expr(key) = &record.key {
-                            collect_expr_context(
-                                key,
-                                hir,
-                                contexts,
-                                outer_visible_bindings,
-                                scopes,
-                            )?;
-                        }
-                        collect_expr_context(
-                            &record.value,
-                            hir,
-                            contexts,
-                            outer_visible_bindings,
-                            scopes,
-                        )?;
-                    }
-                }
-            }
-            Ok(())
-        }
-        AstExpr::FunctionExpr(function_expr) => collect_nested_function_context(
-            function_expr,
-            hir,
-            contexts,
-            outer_visible_bindings,
-            scopes,
-        ),
-    }
+    );
+    Ok(())
 }
 
 fn declare_ast_binding(

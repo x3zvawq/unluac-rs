@@ -7,8 +7,10 @@ use std::collections::BTreeMap;
 
 use crate::ast::{
     AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue,
-    AstLocalFunctionDecl, AstMethodCallExpr, AstModule, AstNameRef, AstStmt, AstSyntheticLocalId,
-    AstTableField, AstTableKey,
+    AstLocalFunctionDecl, AstModule, AstNameRef, AstStmt, AstSyntheticLocalId,
+};
+use crate::ast::traverse::{
+    traverse_call_children, traverse_expr_children, traverse_lvalue_children,
 };
 use crate::hir::{HirModule, HirProtoRef, ParamId};
 
@@ -202,20 +204,9 @@ fn collect_call_hints(
     hints: &mut [FunctionHints],
     hir: &HirModule,
 ) -> Result<(), NamingError> {
-    match call {
-        AstCallKind::Call(call) => {
-            collect_expr_hints(function, &call.callee, hints, hir)?;
-            for arg in &call.args {
-                collect_expr_hints(function, arg, hints, hir)?;
-            }
-        }
-        AstCallKind::MethodCall(call) => {
-            collect_expr_hints(function, &call.receiver, hints, hir)?;
-            for arg in &call.args {
-                collect_expr_hints(function, arg, hints, hir)?;
-            }
-        }
-    }
+    traverse_call_children!(call, iter = iter, borrow = [&], expr(expr) => {
+        collect_expr_hints(function, expr, hints, hir)?;
+    });
     Ok(())
 }
 
@@ -225,18 +216,13 @@ fn collect_lvalue_hints(
     hints: &mut [FunctionHints],
     hir: &HirModule,
 ) -> Result<(), NamingError> {
-    match target {
-        AstLValue::Name(AstNameRef::SyntheticLocal(local)) => {
-            record_synthetic_local(function, *local, hints);
-            Ok(())
-        }
-        AstLValue::Name(_) => Ok(()),
-        AstLValue::FieldAccess(access) => collect_expr_hints(function, &access.base, hints, hir),
-        AstLValue::IndexAccess(access) => {
-            collect_expr_hints(function, &access.base, hints, hir)?;
-            collect_expr_hints(function, &access.index, hints, hir)
-        }
+    if let AstLValue::Name(AstNameRef::SyntheticLocal(local)) = target {
+        record_synthetic_local(function, *local, hints);
     }
+    traverse_lvalue_children!(target, borrow = [&], expr(expr) => {
+        collect_expr_hints(function, expr, hints, hir)?;
+    });
+    Ok(())
 }
 
 fn collect_expr_hints(
@@ -245,74 +231,20 @@ fn collect_expr_hints(
     hints: &mut [FunctionHints],
     hir: &HirModule,
 ) -> Result<(), NamingError> {
-    match expr {
-        AstExpr::FieldAccess(access) => collect_expr_hints(function, &access.base, hints, hir),
-        AstExpr::IndexAccess(access) => {
-            collect_expr_hints(function, &access.base, hints, hir)?;
-            collect_expr_hints(function, &access.index, hints, hir)
-        }
-        AstExpr::Unary(unary) => collect_expr_hints(function, &unary.expr, hints, hir),
-        AstExpr::Binary(binary) => {
-            collect_expr_hints(function, &binary.lhs, hints, hir)?;
-            collect_expr_hints(function, &binary.rhs, hints, hir)
-        }
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            collect_expr_hints(function, &logical.lhs, hints, hir)?;
-            collect_expr_hints(function, &logical.rhs, hints, hir)
-        }
-        AstExpr::Call(call) => {
-            collect_expr_hints(function, &call.callee, hints, hir)?;
-            for arg in &call.args {
-                collect_expr_hints(function, arg, hints, hir)?;
-            }
-            Ok(())
-        }
-        AstExpr::MethodCall(call) => collect_method_call_hints(function, call, hints, hir),
-        AstExpr::SingleValue(expr) => collect_expr_hints(function, expr, hints, hir),
-        AstExpr::TableConstructor(table) => {
-            for field in &table.fields {
-                match field {
-                    AstTableField::Array(value) => collect_expr_hints(function, value, hints, hir)?,
-                    AstTableField::Record(record) => {
-                        if let AstTableKey::Expr(key) = &record.key {
-                            collect_expr_hints(function, key, hints, hir)?;
-                        }
-                        collect_expr_hints(function, &record.value, hints, hir)?;
-                    }
-                }
-            }
-            Ok(())
-        }
-        AstExpr::FunctionExpr(function_expr) => {
-            collect_function_expr_hints(function_expr, hints, hir)
-        }
-        AstExpr::Var(AstNameRef::SyntheticLocal(local)) => {
-            record_synthetic_local(function, *local, hints);
-            Ok(())
-        }
-        AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::Var(_)
-        | AstExpr::VarArg => Ok(()),
+    if let AstExpr::Var(AstNameRef::SyntheticLocal(local)) = expr {
+        record_synthetic_local(function, *local, hints);
     }
-}
-
-fn collect_method_call_hints(
-    function: HirProtoRef,
-    call: &AstMethodCallExpr,
-    hints: &mut [FunctionHints],
-    hir: &HirModule,
-) -> Result<(), NamingError> {
-    collect_expr_hints(function, &call.receiver, hints, hir)?;
-    for arg in &call.args {
-        collect_expr_hints(function, arg, hints, hir)?;
-    }
+    traverse_expr_children!(
+        expr,
+        iter = iter,
+        borrow = [&],
+        expr(child) => {
+            collect_expr_hints(function, child, hints, hir)?;
+        },
+        function(func) => {
+            collect_function_expr_hints(func, hints, hir)?;
+        }
+    );
     Ok(())
 }
 
