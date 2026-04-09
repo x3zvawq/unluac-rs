@@ -4,7 +4,7 @@
 //! 后续 transformer/cfg 和主 pipeline 共享同一套调试开关，同时避免低层反向
 //! 依赖 `decompile` 模块。
 
-use std::fmt;
+use std::{fmt, str::FromStr};
 use std::io::IsTerminal;
 
 use owo_colors::{OwoColorize, Style};
@@ -19,16 +19,7 @@ pub enum DebugDetail {
 }
 
 impl DebugDetail {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "summary" => Some(Self::Summary),
-            "normal" => Some(Self::Normal),
-            "verbose" => Some(Self::Verbose),
-            _ => None,
-        }
-    }
-
-    pub const fn label(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Summary => "summary",
             Self::Normal => "normal",
@@ -39,7 +30,20 @@ impl DebugDetail {
 
 impl fmt::Display for DebugDetail {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.label())
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DebugDetail {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "summary" => Ok(Self::Summary),
+            "normal" => Ok(Self::Normal),
+            "verbose" => Ok(Self::Verbose),
+            _ => Err(()),
+        }
     }
 }
 
@@ -53,16 +57,7 @@ pub enum DebugColorMode {
 }
 
 impl DebugColorMode {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "auto" => Some(Self::Auto),
-            "always" => Some(Self::Always),
-            "never" => Some(Self::Never),
-            _ => None,
-        }
-    }
-
-    pub const fn label(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
             Self::Always => "always",
@@ -81,7 +76,20 @@ impl DebugColorMode {
 
 impl fmt::Display for DebugColorMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.label())
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DebugColorMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "always" => Ok(Self::Always),
+            "never" => Ok(Self::Never),
+            _ => Err(()),
+        }
     }
 }
 

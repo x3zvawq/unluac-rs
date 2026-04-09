@@ -463,7 +463,7 @@ fn compile_source(options: &CliOptions, source: &Path) -> Result<PathBuf, CliErr
     let output_dir = repo_root()
         .join("target")
         .join("unluac-debug")
-        .join(options.decompile.dialect.label());
+        .join(options.decompile.dialect.as_str());
     fs::create_dir_all(&output_dir).map_err(|source_error| CliError::Io {
         action: "create debug build directory",
         path: output_dir.clone(),
@@ -557,7 +557,7 @@ fn resolve_compiler(options: &CliOptions) -> Result<PathBuf, CliError> {
     let bundled = repo_root()
         .join("lua")
         .join("build")
-        .join(options.decompile.dialect.label())
+        .join(options.decompile.dialect.as_str())
         .join(bundled_compiler_name(options.decompile.dialect));
     if bundled.exists() {
         return Ok(bundled);
@@ -619,47 +619,59 @@ fn repo_root() -> PathBuf {
 }
 
 fn parse_dialect_arg(value: &str) -> Result<DecompileDialect, String> {
-    DecompileDialect::parse(value).ok_or_else(|| format!("unsupported dialect: {value}"))
+    value.parse().map_err(|_| format!("unsupported dialect: {value}"))
 }
 
 fn parse_stage_arg(value: &str) -> Result<DecompileStage, String> {
-    DecompileStage::parse(value).ok_or_else(|| format!("unsupported stage: {value}"))
+    value.parse().map_err(|_| format!("unsupported stage: {value}"))
 }
 
 fn parse_debug_detail_arg(value: &str) -> Result<DebugDetail, String> {
-    DebugDetail::parse(value).ok_or_else(|| format!("unsupported debug detail: {value}"))
+    value
+        .parse()
+        .map_err(|_| format!("unsupported debug detail: {value}"))
 }
 
 fn parse_debug_color_arg(value: &str) -> Result<DebugColorMode, String> {
-    DebugColorMode::parse(value).ok_or_else(|| format!("unsupported debug color mode: {value}"))
+    value
+        .parse()
+        .map_err(|_| format!("unsupported debug color mode: {value}"))
 }
 
 fn parse_string_encoding_arg(value: &str) -> Result<StringEncoding, String> {
-    StringEncoding::parse(value).ok_or_else(|| format!("unsupported encoding: {value}"))
+    value.parse().map_err(|_| format!("unsupported encoding: {value}"))
 }
 
 fn parse_string_decode_mode_arg(value: &str) -> Result<StringDecodeMode, String> {
-    StringDecodeMode::parse(value).ok_or_else(|| format!("unsupported string decode mode: {value}"))
+    value
+        .parse()
+        .map_err(|_| format!("unsupported string decode mode: {value}"))
 }
 
 fn parse_parse_mode_arg(value: &str) -> Result<ParseMode, String> {
-    ParseMode::parse(value).ok_or_else(|| format!("unsupported parse mode: {value}"))
+    value.parse().map_err(|_| format!("unsupported parse mode: {value}"))
 }
 
 fn parse_naming_mode_arg(value: &str) -> Result<NamingMode, String> {
-    NamingMode::parse(value).ok_or_else(|| format!("unsupported naming mode: {value}"))
+    value.parse().map_err(|_| format!("unsupported naming mode: {value}"))
 }
 
 fn parse_quote_style_arg(value: &str) -> Result<QuoteStyle, String> {
-    QuoteStyle::parse(value).ok_or_else(|| format!("unsupported quote style: {value}"))
+    value
+        .parse()
+        .map_err(|_| format!("unsupported quote style: {value}"))
 }
 
 fn parse_table_style_arg(value: &str) -> Result<TableStyle, String> {
-    TableStyle::parse(value).ok_or_else(|| format!("unsupported table style: {value}"))
+    value
+        .parse()
+        .map_err(|_| format!("unsupported table style: {value}"))
 }
 
 fn parse_generate_mode_arg(value: &str) -> Result<GenerateMode, String> {
-    GenerateMode::parse(value).ok_or_else(|| format!("unsupported generate mode: {value}"))
+    value
+        .parse()
+        .map_err(|_| format!("unsupported generate mode: {value}"))
 }
 
 #[derive(Debug)]

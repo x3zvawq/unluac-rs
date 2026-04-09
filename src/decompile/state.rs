@@ -3,7 +3,7 @@
 //! 这里选择“固定阶段枚举 + 强类型槽位”，是因为当前项目的阶段顺序天然固定，
 //! 用静态结构能把每层的输入输出边界尽早钉死，后续排错和调试也更直接。
 
-use std::fmt;
+use std::{fmt, str::FromStr};
 
 use crate::parser::RawChunk;
 
@@ -31,7 +31,7 @@ pub enum DecompileStage {
 
 impl DecompileStage {
     /// 这里保留稳定标签，是为了让 CLI、错误消息和调试过滤器共用同一套名字。
-    pub const fn label(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Parse => "parse",
             Self::Transform => "transform",
@@ -64,28 +64,34 @@ impl DecompileStage {
         }
     }
 
-    /// CLI 和库层都会把字符串阶段名映射到这个枚举，所以入口统一放这里。
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "parse" => Some(Self::Parse),
-            "transform" => Some(Self::Transform),
-            "cfg" => Some(Self::Cfg),
-            "graph-facts" | "graph_facts" | "graphfacts" => Some(Self::GraphFacts),
-            "dataflow" => Some(Self::Dataflow),
-            "structure-facts" | "structure_facts" | "structurefacts" => Some(Self::StructureFacts),
-            "hir" => Some(Self::Hir),
-            "ast" => Some(Self::Ast),
-            "readability" => Some(Self::Readability),
-            "naming" => Some(Self::Naming),
-            "generate" => Some(Self::Generate),
-            _ => None,
-        }
-    }
 }
 
 impl fmt::Display for DecompileStage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.label())
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DecompileStage {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "parse" => Ok(Self::Parse),
+            "transform" => Ok(Self::Transform),
+            "cfg" => Ok(Self::Cfg),
+            "graph-facts" | "graph_facts" | "graphfacts" => Ok(Self::GraphFacts),
+            "dataflow" => Ok(Self::Dataflow),
+            "structure-facts" | "structure_facts" | "structurefacts" => {
+                Ok(Self::StructureFacts)
+            }
+            "hir" => Ok(Self::Hir),
+            "ast" => Ok(Self::Ast),
+            "readability" => Ok(Self::Readability),
+            "naming" => Ok(Self::Naming),
+            "generate" => Ok(Self::Generate),
+            _ => Err(()),
+        }
     }
 }
 

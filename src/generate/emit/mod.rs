@@ -131,7 +131,7 @@ impl<'a> Emitter<'a> {
         Some(Doc::join(
             [
                 Doc::text(format!("-- file: {file_name}")),
-                Doc::text(format!("-- dialect: {}", self.target.version.label())),
+                Doc::text(format!("-- dialect: {}", self.target.version.as_str())),
                 Doc::text(format!("-- encoding: {encoding}")),
                 Doc::text("-- decompiled by unluac-rs"),
             ],

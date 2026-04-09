@@ -37,28 +37,3 @@ pub fn lower_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
         DialectVersion::Luau => dialect::luau::lower_chunk(chunk),
     }
 }
-
-/// 直接按 Lua 5.1 规则 lowering，不做方言自动探测。
-pub fn lower_lua51_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
-    dialect::lua51::lower_chunk(chunk)
-}
-
-/// 直接按 Lua 5.2 规则 lowering，不做方言自动探测。
-pub fn lower_lua52_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
-    dialect::lua52::lower_chunk(chunk)
-}
-
-/// 直接按 Lua 5.3 规则 lowering，不做方言自动探测。
-pub fn lower_lua53_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
-    dialect::lua53::lower_chunk(chunk)
-}
-
-/// 直接按 Lua 5.4 规则 lowering，不做方言自动探测。
-pub fn lower_lua54_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
-    dialect::lua54::lower_chunk(chunk)
-}
-
-/// 直接按 Lua 5.5 规则 lowering，不做方言自动探测。
-pub fn lower_lua55_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
-    dialect::lua55::lower_chunk(chunk)
-}

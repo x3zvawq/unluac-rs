@@ -4,6 +4,7 @@
 //! 解码策略上遵循同一套调用约定，而不是把策略散落到各个实现里。
 
 use encoding_rs::GBK;
+use std::str::FromStr;
 
 use super::error::ParseError;
 
@@ -16,23 +17,27 @@ pub enum ParseMode {
 }
 
 impl ParseMode {
-    pub const fn label(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Strict => "strict",
             Self::Permissive => "permissive",
         }
     }
 
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "strict" => Some(Self::Strict),
-            "permissive" => Some(Self::Permissive),
-            _ => None,
-        }
-    }
-
     pub(crate) const fn is_permissive(self) -> bool {
         matches!(self, Self::Permissive)
+    }
+}
+
+impl FromStr for ParseMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "strict" => Ok(Self::Strict),
+            "permissive" => Ok(Self::Permissive),
+            _ => Err(()),
+        }
     }
 }
 
@@ -45,18 +50,10 @@ pub enum StringEncoding {
 }
 
 impl StringEncoding {
-    pub const fn label(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Utf8 => "utf-8",
             Self::Gbk => "gbk",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "utf8" | "utf-8" => Some(Self::Utf8),
-            "gbk" => Some(Self::Gbk),
-            _ => None,
         }
     }
 
@@ -73,7 +70,7 @@ impl StringEncoding {
                         .map(str::to_owned)
                         .map_err(|_| ParseError::StringDecode {
                             offset,
-                            encoding: self.label(),
+                            encoding: self.as_str(),
                         }),
                     StringDecodeMode::Lossy => Ok(String::from_utf8_lossy(bytes).into_owned()),
                 }
@@ -83,11 +80,23 @@ impl StringEncoding {
                 if had_errors && matches!(mode, StringDecodeMode::Strict) {
                     return Err(ParseError::StringDecode {
                         offset,
-                        encoding: self.label(),
+                        encoding: self.as_str(),
                     });
                 }
                 Ok(value.into_owned())
             }
+        }
+    }
+}
+
+impl FromStr for StringEncoding {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "utf8" | "utf-8" => Ok(Self::Utf8),
+            "gbk" => Ok(Self::Gbk),
+            _ => Err(()),
         }
     }
 }
@@ -101,18 +110,23 @@ pub enum StringDecodeMode {
 }
 
 impl StringDecodeMode {
-    pub const fn label(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Strict => "strict",
             Self::Lossy => "lossy",
         }
     }
 
-    pub fn parse(value: &str) -> Option<Self> {
+}
+
+impl FromStr for StringDecodeMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "strict" => Some(Self::Strict),
-            "lossy" => Some(Self::Lossy),
-            _ => None,
+            "strict" => Ok(Self::Strict),
+            "lossy" => Ok(Self::Lossy),
+            _ => Err(()),
         }
     }
 }

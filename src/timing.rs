@@ -83,7 +83,7 @@ mod enabled {
     }
 
     #[derive(Debug)]
-    struct ActiveTimingSpan<'a> {
+    pub(crate) struct TimingScope<'a> {
         collector: &'a TimingCollector,
         start: Option<Instant>,
     }
@@ -117,8 +117,24 @@ mod enabled {
                 return f();
             }
 
-            let _span = self.enter(label);
+            let _span = self.scope(label);
             f()
+        }
+
+        pub(crate) fn scope(&self, label: impl Into<String>) -> TimingScope<'_> {
+            if !self.enabled {
+                return TimingScope {
+                    collector: self,
+                    start: None,
+                };
+            }
+
+            let label = label.into();
+            self.inner.borrow_mut().stack.push(label);
+            TimingScope {
+                collector: self,
+                start: Some(Instant::now()),
+            }
         }
 
         pub(crate) fn finish(&self) -> Option<TimingReport> {
@@ -141,15 +157,6 @@ mod enabled {
                 .fold(Duration::ZERO, |acc, node| acc + node.total);
             Some(TimingReport { total, nodes })
         }
-
-        fn enter(&self, label: impl Into<String>) -> ActiveTimingSpan<'_> {
-            let label = label.into();
-            self.inner.borrow_mut().stack.push(label);
-            ActiveTimingSpan {
-                collector: self,
-                start: Some(Instant::now()),
-            }
-        }
     }
 
     impl TimingCollectorInner {
@@ -171,7 +178,7 @@ mod enabled {
         }
     }
 
-    impl Drop for ActiveTimingSpan<'_> {
+    impl Drop for TimingScope<'_> {
         fn drop(&mut self) {
             let Some(start) = self.start.take() else {
                 return;
@@ -309,6 +316,9 @@ mod enabled {
     #[derive(Debug, Default)]
     pub(crate) struct TimingCollector;
 
+    #[derive(Debug, Default)]
+    pub(crate) struct TimingScope;
+
     impl TimingCollector {
         pub(crate) fn new(_enabled: bool) -> Self {
             Self
@@ -324,6 +334,10 @@ mod enabled {
             F: FnOnce() -> T,
         {
             f()
+        }
+
+        pub(crate) fn scope(&self, _label: impl Into<String>) -> TimingScope {
+            TimingScope
         }
 
         pub(crate) fn finish(&self) -> Option<TimingReport> {

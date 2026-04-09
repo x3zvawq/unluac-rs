@@ -8,6 +8,7 @@
 
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use wasm_bindgen::prelude::*;
 
 use unluac::decompile::{
@@ -138,7 +139,7 @@ impl WasmDecompileOptions {
         let mut options = default_wasm_decompile_options();
 
         if let Some(value) = self.dialect {
-            options.dialect = parse_option("dialect", &value, DecompileDialect::parse)?;
+            options.dialect = parse_option("dialect", &value)?;
         }
         if let Some(parse) = self.parse {
             parse.apply(&mut options)?;
@@ -167,15 +168,13 @@ impl WasmDecompileOptions {
 impl WasmParseOptions {
     fn apply(self, options: &mut DecompileOptions) -> BridgeResult<()> {
         if let Some(value) = self.mode {
-            options.parse.mode = parse_option("parse.mode", &value, ParseMode::parse)?;
+            options.parse.mode = parse_option("parse.mode", &value)?;
         }
         if let Some(value) = self.string_encoding {
-            options.parse.string_encoding =
-                parse_option("parse.stringEncoding", &value, StringEncoding::parse)?;
+            options.parse.string_encoding = parse_option("parse.stringEncoding", &value)?;
         }
         if let Some(value) = self.string_decode_mode {
-            options.parse.string_decode_mode =
-                parse_option("parse.stringDecodeMode", &value, StringDecodeMode::parse)?;
+            options.parse.string_decode_mode = parse_option("parse.stringDecodeMode", &value)?;
         }
         Ok(())
     }
@@ -201,7 +200,7 @@ impl WasmReadabilityOptions {
 impl WasmNamingOptions {
     fn apply(self, options: &mut DecompileOptions) -> BridgeResult<()> {
         if let Some(value) = self.mode {
-            options.naming.mode = parse_option("naming.mode", &value, NamingMode::parse)?;
+            options.naming.mode = parse_option("naming.mode", &value)?;
         }
         if let Some(value) = self.debug_like_include_function {
             options.naming.debug_like_include_function = value;
@@ -219,12 +218,10 @@ impl WasmGenerateOptions {
             options.generate.max_line_length = value;
         }
         if let Some(value) = self.quote_style {
-            options.generate.quote_style =
-                parse_option("generate.quoteStyle", &value, QuoteStyle::parse)?;
+            options.generate.quote_style = parse_option("generate.quoteStyle", &value)?;
         }
         if let Some(value) = self.table_style {
-            options.generate.table_style =
-                parse_option("generate.tableStyle", &value, TableStyle::parse)?;
+            options.generate.table_style = parse_option("generate.tableStyle", &value)?;
         }
         if let Some(value) = self.conservative_output {
             options.generate.conservative_output = value;
@@ -236,12 +233,11 @@ impl WasmGenerateOptions {
     }
 }
 
-fn parse_option<T>(
-    field: &'static str,
-    value: &str,
-    parse: impl FnOnce(&str) -> Option<T>,
-) -> BridgeResult<T> {
-    parse(value).ok_or_else(|| {
+fn parse_option<T>(field: &'static str, value: &str) -> BridgeResult<T>
+where
+    T: FromStr,
+{
+    value.parse().map_err(|_| {
         WasmBridgeError::new(
             "invalid-enum-value",
             format!("unsupported value {value:?} for `{field}`"),
@@ -288,28 +284,28 @@ fn dialect_labels() -> Vec<&'static str> {
         DecompileDialect::Luau,
     ]
     .into_iter()
-    .map(DecompileDialect::label)
+    .map(DecompileDialect::as_str)
     .collect()
 }
 
 fn parse_mode_labels() -> Vec<&'static str> {
     [ParseMode::Strict, ParseMode::Permissive]
         .into_iter()
-        .map(ParseMode::label)
+        .map(ParseMode::as_str)
         .collect()
 }
 
 fn string_encoding_labels() -> Vec<&'static str> {
     [StringEncoding::Utf8, StringEncoding::Gbk]
         .into_iter()
-        .map(StringEncoding::label)
+        .map(StringEncoding::as_str)
         .collect()
 }
 
 fn string_decode_mode_labels() -> Vec<&'static str> {
     [StringDecodeMode::Strict, StringDecodeMode::Lossy]
         .into_iter()
-        .map(StringDecodeMode::label)
+        .map(StringDecodeMode::as_str)
         .collect()
 }
 
@@ -320,7 +316,7 @@ fn naming_mode_labels() -> Vec<&'static str> {
         NamingMode::Heuristic,
     ]
     .into_iter()
-    .map(NamingMode::label)
+    .map(NamingMode::as_str)
     .collect()
 }
 
@@ -331,7 +327,7 @@ fn quote_style_labels() -> Vec<&'static str> {
         QuoteStyle::MinEscape,
     ]
     .into_iter()
-    .map(QuoteStyle::label)
+    .map(QuoteStyle::as_str)
     .collect()
 }
 
@@ -342,7 +338,7 @@ fn table_style_labels() -> Vec<&'static str> {
         TableStyle::Expanded,
     ]
     .into_iter()
-    .map(TableStyle::label)
+    .map(TableStyle::as_str)
     .collect()
 }
 

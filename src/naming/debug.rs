@@ -18,7 +18,7 @@ pub fn dump_naming(
     let _ = writeln!(
         output,
         "naming mode={} functions={}",
-        names.mode.label(),
+        names.mode.as_str(),
         names.functions.len()
     );
     if let Some(proto_id) = filters.proto {
@@ -113,5 +113,5 @@ fn write_sparse_section<'a>(
 }
 
 fn source_label(source: NameSource) -> &'static str {
-    source.label()
+    source.as_str()
 }

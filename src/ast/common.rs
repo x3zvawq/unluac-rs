@@ -203,7 +203,7 @@ pub enum AstFeature {
 }
 
 impl AstFeature {
-    pub const fn label(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::GotoLabel => "goto",
             Self::ContinueStmt => "continue",
@@ -228,7 +228,7 @@ pub enum AstDialectVersion {
 }
 
 impl AstDialectVersion {
-    pub const fn label(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Lua51 => "lua5.1",
             Self::Lua52 => "lua5.2",
@@ -243,7 +243,7 @@ impl AstDialectVersion {
 
 impl fmt::Display for AstDialectVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.label())
+        f.write_str(self.as_str())
     }
 }
 

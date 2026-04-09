@@ -5,6 +5,7 @@
 
 use crate::ast::AstDialectVersion;
 use crate::hir::{HirProtoRef, ProtoLineRange, ProtoSignature};
+use std::str::FromStr;
 
 /// 最终生成的源码结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,7 +95,7 @@ pub enum GenerateMode {
 }
 
 impl GenerateMode {
-    pub const fn label(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Strict => "strict",
             Self::BestEffort => "best-effort",
@@ -102,12 +103,17 @@ impl GenerateMode {
         }
     }
 
-    pub fn parse(value: &str) -> Option<Self> {
+}
+
+impl FromStr for GenerateMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "strict" => Some(Self::Strict),
-            "best-effort" | "best_effort" | "besteffort" => Some(Self::BestEffort),
-            "permissive" => Some(Self::Permissive),
-            _ => None,
+            "strict" => Ok(Self::Strict),
+            "best-effort" | "best_effort" | "besteffort" => Ok(Self::BestEffort),
+            "permissive" => Ok(Self::Permissive),
+            _ => Err(()),
         }
     }
 }
@@ -122,7 +128,7 @@ pub enum QuoteStyle {
 }
 
 impl QuoteStyle {
-    pub const fn label(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::PreferDouble => "prefer-double",
             Self::PreferSingle => "prefer-single",
@@ -130,12 +136,17 @@ impl QuoteStyle {
         }
     }
 
-    pub fn parse(value: &str) -> Option<Self> {
+}
+
+impl FromStr for QuoteStyle {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "prefer-double" => Some(Self::PreferDouble),
-            "prefer-single" => Some(Self::PreferSingle),
-            "min-escape" => Some(Self::MinEscape),
-            _ => None,
+            "prefer-double" => Ok(Self::PreferDouble),
+            "prefer-single" => Ok(Self::PreferSingle),
+            "min-escape" => Ok(Self::MinEscape),
+            _ => Err(()),
         }
     }
 }
@@ -150,7 +161,7 @@ pub enum TableStyle {
 }
 
 impl TableStyle {
-    pub const fn label(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Compact => "compact",
             Self::Balanced => "balanced",
@@ -158,12 +169,17 @@ impl TableStyle {
         }
     }
 
-    pub fn parse(value: &str) -> Option<Self> {
+}
+
+impl FromStr for TableStyle {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "compact" => Some(Self::Compact),
-            "balanced" => Some(Self::Balanced),
-            "expanded" => Some(Self::Expanded),
-            _ => None,
+            "compact" => Ok(Self::Compact),
+            "balanced" => Ok(Self::Balanced),
+            "expanded" => Ok(Self::Expanded),
+            _ => Err(()),
         }
     }
 }

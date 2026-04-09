@@ -18,7 +18,7 @@ pub enum LuaCaseDialect {
 }
 
 impl LuaCaseDialect {
-    pub const fn label(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Lua51 => "lua5.1",
             Self::Lua52 => "lua5.2",

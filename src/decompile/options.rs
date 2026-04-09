@@ -3,8 +3,9 @@
 //! 入口层集中补默认值，比把默认逻辑散在各阶段里更稳；后续阶段变多后，
 //! 仍然只需要维护这一处归一化逻辑。
 
-use std::fmt;
+use std::{fmt, str::FromStr};
 
+use crate::ast::AstDialectVersion;
 use crate::generate::GenerateOptions;
 use crate::naming::{NamingMode, NamingOptions};
 use crate::parser::{
@@ -31,7 +32,7 @@ pub enum DecompileDialect {
 }
 
 impl DecompileDialect {
-    pub const fn label(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Lua51 => "lua5.1",
             Self::Lua52 => "lua5.2",
@@ -40,20 +41,6 @@ impl DecompileDialect {
             Self::Lua55 => "lua5.5",
             Self::Luajit => "luajit",
             Self::Luau => "luau",
-        }
-    }
-
-    /// 入口层统一做字符串解析，可以避免 CLI、wasm 绑定和测试各写一套映射。
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "lua5.1" | "lua51" => Some(Self::Lua51),
-            "lua5.2" | "lua52" => Some(Self::Lua52),
-            "lua5.3" | "lua53" => Some(Self::Lua53),
-            "lua5.4" | "lua54" => Some(Self::Lua54),
-            "lua5.5" | "lua55" => Some(Self::Lua55),
-            "luajit" => Some(Self::Luajit),
-            "luau" => Some(Self::Luau),
-            _ => None,
         }
     }
 
@@ -77,7 +64,38 @@ impl DecompileDialect {
 
 impl fmt::Display for DecompileDialect {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.label())
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DecompileDialect {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "lua5.1" | "lua51" => Ok(Self::Lua51),
+            "lua5.2" | "lua52" => Ok(Self::Lua52),
+            "lua5.3" | "lua53" => Ok(Self::Lua53),
+            "lua5.4" | "lua54" => Ok(Self::Lua54),
+            "lua5.5" | "lua55" => Ok(Self::Lua55),
+            "luajit" => Ok(Self::Luajit),
+            "luau" => Ok(Self::Luau),
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<DecompileDialect> for AstDialectVersion {
+    fn from(dialect: DecompileDialect) -> Self {
+        match dialect {
+            DecompileDialect::Lua51 => AstDialectVersion::Lua51,
+            DecompileDialect::Lua52 => AstDialectVersion::Lua52,
+            DecompileDialect::Lua53 => AstDialectVersion::Lua53,
+            DecompileDialect::Lua54 => AstDialectVersion::Lua54,
+            DecompileDialect::Lua55 => AstDialectVersion::Lua55,
+            DecompileDialect::Luajit => AstDialectVersion::LuaJit,
+            DecompileDialect::Luau => AstDialectVersion::Luau,
+        }
     }
 }
 

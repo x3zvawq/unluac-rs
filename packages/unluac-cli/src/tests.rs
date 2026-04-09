@@ -56,7 +56,7 @@ fn requires_explicit_input_or_source() {
 fn defaults_to_pure_source_output_when_only_source_is_given() {
     let options = parse_args(args(&["--source", "case.lua"])).expect("source should parse");
     assert_eq!(options.source, Some(PathBuf::from("case.lua")));
-    assert_eq!(options.decompile.dialect.label(), "lua5.1");
+    assert_eq!(options.decompile.dialect.as_str(), "lua5.1");
     assert_eq!(options.decompile.target_stage, DecompileStage::Generate);
     assert_eq!(options.decompile.naming.mode, NamingMode::DebugLike);
     assert!(!options.decompile.debug.enable);
@@ -151,7 +151,7 @@ fn short_flags_map_to_the_same_cli_fields() {
     .expect("short flags should parse");
     assert_eq!(options.source, Some(PathBuf::from("case.lua")));
     assert_eq!(options.luac, Some(PathBuf::from("lua54-luac")));
-    assert_eq!(options.decompile.dialect.label(), "lua5.4");
+    assert_eq!(options.decompile.dialect.as_str(), "lua5.4");
     assert_eq!(options.decompile.parse.string_encoding, StringEncoding::Gbk);
     assert_eq!(
         options.decompile.parse.string_decode_mode,

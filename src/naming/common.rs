@@ -5,6 +5,7 @@
 //! 每个子模块都从 `assign.rs` 反向依赖，后续继续拆分时边界也更稳定。
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::str::FromStr;
 
 use crate::ast::AstSyntheticLocalId;
 use crate::hir::{HirProtoRef, LocalId, ParamId, TempId, UpvalueId};
@@ -19,7 +20,7 @@ pub enum NamingMode {
 }
 
 impl NamingMode {
-    pub const fn label(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::DebugLike => "debug-like",
             Self::Simple => "simple",
@@ -27,12 +28,17 @@ impl NamingMode {
         }
     }
 
-    pub fn parse(value: &str) -> Option<Self> {
+}
+
+impl FromStr for NamingMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "debug-like" => Some(Self::DebugLike),
-            "simple" => Some(Self::Simple),
-            "heuristic" => Some(Self::Heuristic),
-            _ => None,
+            "debug-like" => Ok(Self::DebugLike),
+            "simple" => Ok(Self::Simple),
+            "heuristic" => Ok(Self::Heuristic),
+            _ => Err(()),
         }
     }
 }
@@ -72,7 +78,7 @@ pub enum NameSource {
 }
 
 impl NameSource {
-    pub const fn label(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Debug => "debug",
             Self::CaptureProvenance => "capture-provenance",

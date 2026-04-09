@@ -18,7 +18,7 @@ use crate::transformer::lower_chunk;
 use super::debug::{StageDebugOutput, collect_stage_dump};
 use super::error::DecompileError;
 use super::options::DecompileOptions;
-use super::output_plan::{ast_lowering_target, resolve_output_plan, target_ast_dialect};
+use super::output_plan::{ast_lowering_target, resolve_output_plan};
 use super::state::{DecompileStage, DecompileState};
 
 /// 一次主 pipeline 调用的返回值。
@@ -50,13 +50,12 @@ impl DecompilerPipeline {
         let mut state = DecompileState::new(options.dialect, options.target_stage);
         let mut debug_output = Vec::new();
         let timings = TimingCollector::new(options.debug.enable && options.debug.timing);
-        let requested_target = target_ast_dialect(options.dialect);
+        let requested_target = crate::ast::AstTargetDialect::new(options.dialect.into());
 
-        state.raw_chunk = Some(
-            timings.record(DecompileStage::Parse.label(), || {
-                options.dialect.parse_chunk(bytes, options.parse)
-            })?,
-        );
+        state.raw_chunk = Some({
+            let _timing = timings.scope(DecompileStage::Parse.as_str());
+            options.dialect.parse_chunk(bytes, options.parse)?
+        });
         state.mark_completed(DecompileStage::Parse);
 
         if let Some(output) = collect_stage_dump(&state, DecompileStage::Parse, &options.debug)? {
@@ -71,8 +70,10 @@ impl DecompilerPipeline {
             .raw_chunk
             .as_ref()
             .expect("parse stage completed must leave raw_chunk in state");
-        state.lowered =
-            Some(timings.record(DecompileStage::Transform.label(), || lower_chunk(raw_chunk))?);
+        state.lowered = Some({
+            let _timing = timings.scope(DecompileStage::Transform.as_str());
+            lower_chunk(raw_chunk)?
+        });
         state.mark_completed(DecompileStage::Transform);
 
         if let Some(output) = collect_stage_dump(&state, DecompileStage::Transform, &options.debug)?
@@ -84,13 +85,14 @@ impl DecompilerPipeline {
             return Ok(finish_result(state, debug_output, &timings));
         }
 
-        state.cfg = Some(timings.record(DecompileStage::Cfg.label(), || {
+        state.cfg = Some({
+            let _timing = timings.scope(DecompileStage::Cfg.as_str());
             let lowered = state
                 .lowered
                 .as_ref()
                 .expect("transform stage completed must leave lowered in state");
             build_cfg_graph(lowered)
-        }));
+        });
         state.mark_completed(DecompileStage::Cfg);
 
         if let Some(output) = collect_stage_dump(&state, DecompileStage::Cfg, &options.debug)? {
@@ -101,13 +103,14 @@ impl DecompilerPipeline {
             return Ok(finish_result(state, debug_output, &timings));
         }
 
-        state.graph_facts = Some(timings.record(DecompileStage::GraphFacts.label(), || {
+        state.graph_facts = Some({
+            let _timing = timings.scope(DecompileStage::GraphFacts.as_str());
             let cfg_graph = state
                 .cfg
                 .as_ref()
                 .expect("cfg stage completed must leave cfg graph in state");
             analyze_graph_facts(cfg_graph)
-        }));
+        });
         state.mark_completed(DecompileStage::GraphFacts);
 
         if let Some(output) =
@@ -120,7 +123,8 @@ impl DecompilerPipeline {
             return Ok(finish_result(state, debug_output, &timings));
         }
 
-        state.dataflow = Some(timings.record(DecompileStage::Dataflow.label(), || {
+        state.dataflow = Some({
+            let _timing = timings.scope(DecompileStage::Dataflow.as_str());
             let lowered = state
                 .lowered
                 .as_ref()
@@ -134,7 +138,7 @@ impl DecompilerPipeline {
                 .as_ref()
                 .expect("graph facts stage completed must leave graph facts in state");
             analyze_dataflow(lowered, cfg_graph, graph_facts)
-        }));
+        });
         state.mark_completed(DecompileStage::Dataflow);
 
         if let Some(output) = collect_stage_dump(&state, DecompileStage::Dataflow, &options.debug)?
@@ -146,8 +150,8 @@ impl DecompilerPipeline {
             return Ok(finish_result(state, debug_output, &timings));
         }
 
-        state.structure_facts =
-            Some(timings.record(DecompileStage::StructureFacts.label(), || {
+        state.structure_facts = Some({
+            let _timing = timings.scope(DecompileStage::StructureFacts.as_str());
                 let lowered = state
                     .lowered
                     .as_ref()
@@ -165,7 +169,7 @@ impl DecompilerPipeline {
                     .as_ref()
                     .expect("dataflow stage completed must leave dataflow in state");
                 analyze_structure(lowered, cfg_graph, graph_facts, dataflow)
-            }));
+        });
         state.mark_completed(DecompileStage::StructureFacts);
 
         if let Some(output) =
@@ -178,7 +182,8 @@ impl DecompilerPipeline {
             return Ok(finish_result(state, debug_output, &timings));
         }
 
-        state.hir = Some(timings.record(DecompileStage::Hir.label(), || {
+        state.hir = Some({
+            let _timing = timings.scope(DecompileStage::Hir.as_str());
             let lowered = state
                 .lowered
                 .as_ref()
@@ -208,7 +213,7 @@ impl DecompilerPipeline {
                 &timings,
                 options.readability,
             )
-        }));
+        });
         state.mark_completed(DecompileStage::Hir);
 
         if let Some(output) = collect_stage_dump(&state, DecompileStage::Hir, &options.debug)? {
@@ -219,7 +224,8 @@ impl DecompilerPipeline {
             return Ok(finish_result(state, debug_output, &timings));
         }
 
-        state.ast = Some(timings.record(DecompileStage::Ast.label(), || {
+        state.ast = Some({
+            let _timing = timings.scope(DecompileStage::Ast.as_str());
             let hir = state
                 .hir
                 .as_ref()
@@ -228,7 +234,7 @@ impl DecompilerPipeline {
                 hir,
                 ast_lowering_target(requested_target, options.generate.mode),
             )
-        })?);
+        }?);
         state.mark_completed(DecompileStage::Ast);
 
         if let Some(output) = collect_stage_dump(&state, DecompileStage::Ast, &options.debug)? {
@@ -239,7 +245,8 @@ impl DecompilerPipeline {
             return Ok(finish_result(state, debug_output, &timings));
         }
 
-        let output_plan = timings.record(DecompileStage::Readability.label(), || {
+        let output_plan = {
+            let _timing = timings.scope(DecompileStage::Readability.as_str());
             let ast = state
                 .ast
                 .as_ref()
@@ -251,7 +258,7 @@ impl DecompilerPipeline {
                 options.generate.mode,
                 &timings,
             )
-        });
+        };
         let output_target = output_plan.target;
         let output_generate_mode = output_plan.generate_mode;
         let output_warnings = output_plan.warnings;
@@ -268,7 +275,8 @@ impl DecompilerPipeline {
             return Ok(finish_result(state, debug_output, &timings));
         }
 
-        state.naming = Some(timings.record(DecompileStage::Naming.label(), || {
+        state.naming = Some({
+            let _timing = timings.scope(DecompileStage::Naming.as_str());
             let ast = state
                 .readability
                 .as_ref()
@@ -277,11 +285,12 @@ impl DecompilerPipeline {
                 .hir
                 .as_ref()
                 .expect("hir stage completed must leave hir module in state");
-            let evidence = timings.record("collect-evidence", || {
+            let evidence = {
+                let _timing = timings.scope("collect-evidence");
                 collect_naming_evidence(hir)
-            })?;
+            }?;
             assign_names_with_evidence(ast, hir, &evidence, options.naming)
-        })?);
+        }?);
         state.mark_completed(DecompileStage::Naming);
 
         if let Some(output) = collect_stage_dump(&state, DecompileStage::Naming, &options.debug)? {
@@ -292,7 +301,8 @@ impl DecompilerPipeline {
             return Ok(finish_result(state, debug_output, &timings));
         }
 
-        state.generated = Some(timings.record(DecompileStage::Generate.label(), || {
+        state.generated = Some({
+            let _timing = timings.scope(DecompileStage::Generate.as_str());
             let ast = state
                 .readability
                 .as_ref()
@@ -310,7 +320,7 @@ impl DecompilerPipeline {
                     .expect("hir stage completed must leave hir module in state");
                 Some(build_generate_comment_metadata(
                     hir,
-                    options.parse.string_encoding.label(),
+                    options.parse.string_encoding.as_str(),
                 ))
             } else {
                 None
@@ -322,9 +332,9 @@ impl DecompilerPipeline {
                 comment_metadata.as_ref(),
                 generate_options,
             )?;
-            generated.warnings = output_warnings.clone();
+            generated.warnings = output_warnings;
             Ok::<_, crate::generate::GenerateError>(generated)
-        })?);
+        }?);
         state.mark_completed(DecompileStage::Generate);
 
         if let Some(output) = collect_stage_dump(&state, DecompileStage::Generate, &options.debug)?

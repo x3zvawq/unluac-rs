@@ -12,8 +12,6 @@ use crate::ast::{
 use crate::generate::GenerateMode;
 use crate::timing::TimingCollector;
 
-use super::options::DecompileDialect;
-
 #[derive(Debug, Clone)]
 pub(super) struct OutputPlan {
     pub readability: AstModule,
@@ -235,22 +233,9 @@ fn candidate_output_versions(requested: AstDialectVersion) -> Vec<AstDialectVers
 fn format_ast_features(features: &BTreeSet<AstFeature>) -> String {
     features
         .iter()
-        .map(|feature| feature.label())
+        .map(|feature| feature.as_str())
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-pub(super) fn target_ast_dialect(dialect: DecompileDialect) -> AstTargetDialect {
-    let version = match dialect {
-        DecompileDialect::Lua51 => AstDialectVersion::Lua51,
-        DecompileDialect::Lua52 => AstDialectVersion::Lua52,
-        DecompileDialect::Lua53 => AstDialectVersion::Lua53,
-        DecompileDialect::Lua54 => AstDialectVersion::Lua54,
-        DecompileDialect::Lua55 => AstDialectVersion::Lua55,
-        DecompileDialect::Luajit => AstDialectVersion::LuaJit,
-        DecompileDialect::Luau => AstDialectVersion::Luau,
-    };
-    AstTargetDialect::new(version)
 }
 
 pub(super) fn ast_lowering_target(
