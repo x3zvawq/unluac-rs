@@ -25,5 +25,4 @@ pub use common::{
 pub use debug::{dump_ast, dump_readability};
 pub use error::AstLowerError;
 pub(crate) use features::collect_ast_features;
-pub(crate) use readability::make_readable_with_options_and_timing;
-pub use readability::{make_readable, make_readable_with_options};
+pub(crate) use readability::make_readable;

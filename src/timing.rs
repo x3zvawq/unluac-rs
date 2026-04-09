@@ -104,6 +104,7 @@ mod enabled {
             }
         }
 
+        #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) fn disabled() -> Self {
             Self::new(false)
         }
@@ -313,6 +314,7 @@ mod enabled {
             Self
         }
 
+        #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) fn disabled() -> Self {
             Self
         }

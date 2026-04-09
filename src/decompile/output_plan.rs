@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use crate::ast::{
     AstDialectVersion, AstFeature, AstModule, AstTargetDialect,
-    collect_ast_features, make_readable_with_options_and_timing,
+    collect_ast_features, make_readable,
 };
 use crate::generate::GenerateMode;
 use crate::timing::TimingCollector;
@@ -31,7 +31,7 @@ pub(super) fn resolve_output_plan(
 ) -> OutputPlan {
     match mode {
         GenerateMode::Strict => OutputPlan {
-            readability: make_readable_with_options_and_timing(
+            readability: make_readable(
                 ast,
                 requested_target,
                 readability_options,
@@ -42,7 +42,7 @@ pub(super) fn resolve_output_plan(
             warnings: Vec::new(),
         },
         GenerateMode::Permissive => {
-            let readability = make_readable_with_options_and_timing(
+            let readability = make_readable(
                 ast,
                 requested_target,
                 readability_options,
@@ -71,7 +71,7 @@ pub(super) fn resolve_output_plan(
                     .unwrap_or(requested_target);
 
             loop {
-                let readability = make_readable_with_options_and_timing(
+                let readability = make_readable(
                     ast,
                     target,
                     readability_options,

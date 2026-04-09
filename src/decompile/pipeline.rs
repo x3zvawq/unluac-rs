@@ -9,7 +9,7 @@ use crate::generate::{
     GenerateChunkCommentMetadata, GenerateCommentMetadata, GenerateFunctionCommentMetadata,
     generate_chunk,
 };
-use crate::hir::analyze_hir_with_timing;
+use crate::hir::analyze_hir;
 use crate::naming::{assign_names_with_evidence, collect_naming_evidence};
 use crate::structure::analyze_structure;
 use crate::timing::{TimingCollector, TimingReport};
@@ -199,7 +199,7 @@ impl DecompilerPipeline {
                 .structure_facts
                 .as_ref()
                 .expect("structure stage completed must leave structure facts in state");
-            analyze_hir_with_timing(
+            analyze_hir(
                 lowered,
                 cfg_graph,
                 graph_facts,

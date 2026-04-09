@@ -11,8 +11,7 @@ mod promotion;
 mod simplify;
 pub(crate) mod traverse;
 
-pub use analyze::analyze_hir;
-pub(crate) use analyze::analyze_hir_with_timing;
+pub(crate) use analyze::analyze_hir;
 pub use common::{
     HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirCallStmt, HirCapture,
     HirClose, HirClosureExpr, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef,

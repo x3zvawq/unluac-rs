@@ -14,7 +14,7 @@ mod structure;
 mod tests;
 
 use self::lower::{ChildAnalyses, LowerArtifacts, lower_proto};
-use super::simplify::simplify_hir_with_timing;
+use super::simplify::simplify_hir;
 use crate::cfg::{CfgGraph, DataflowFacts, GraphFacts};
 use crate::hir::common::HirModule;
 use crate::readability::ReadabilityOptions;
@@ -30,27 +30,7 @@ use self::lower::{
 };
 
 /// 对整个 lowered chunk 递归构造 HIR。
-pub fn analyze_hir(
-    chunk: &LoweredChunk,
-    cfg_graph: &CfgGraph,
-    graph_facts: &GraphFacts,
-    dataflow: &DataflowFacts,
-    structure: &StructureFacts,
-    readability: ReadabilityOptions,
-) -> HirModule {
-    let timings = TimingCollector::disabled();
-    analyze_hir_with_timing(
-        chunk,
-        cfg_graph,
-        graph_facts,
-        dataflow,
-        structure,
-        &timings,
-        readability,
-    )
-}
-
-pub(crate) fn analyze_hir_with_timing(
+pub(crate) fn analyze_hir(
     chunk: &LoweredChunk,
     cfg_graph: &CfgGraph,
     graph_facts: &GraphFacts,
@@ -83,7 +63,7 @@ pub(crate) fn analyze_hir_with_timing(
         protos: artifacts.protos,
     };
     timings.record("simplify", || {
-        simplify_hir_with_timing(
+        simplify_hir(
             &mut module,
             readability,
             timings,

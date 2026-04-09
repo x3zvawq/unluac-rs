@@ -188,21 +188,7 @@ const PASS_ENTRIES: &[ReadabilityPassEntry] = &[
 const MAX_ROUNDS: usize = 64;
 
 /// 对外的 readability 入口。
-pub fn make_readable(module: &AstModule, target: AstTargetDialect) -> AstModule {
-    make_readable_with_options(module, target, ReadabilityOptions::default())
-}
-
-/// 对外的 readability 入口，允许调用方调节局部可读性策略。
-pub fn make_readable_with_options(
-    module: &AstModule,
-    target: AstTargetDialect,
-    options: ReadabilityOptions,
-) -> AstModule {
-    let timings = TimingCollector::disabled();
-    make_readable_with_options_and_timing(module, target, options, &timings)
-}
-
-pub(crate) fn make_readable_with_options_and_timing(
+pub(crate) fn make_readable(
     module: &AstModule,
     target: AstTargetDialect,
     options: ReadabilityOptions,

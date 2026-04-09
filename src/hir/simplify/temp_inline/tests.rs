@@ -844,6 +844,8 @@ fn simplify_module_runs_until_fixed_point() {
     super::super::simplify_hir(
         &mut module,
         crate::readability::ReadabilityOptions::default(),
+        &crate::timing::TimingCollector::disabled(),
+        &[],
     );
 
     assert!(matches!(

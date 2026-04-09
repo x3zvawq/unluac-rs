@@ -5,9 +5,10 @@ use crate::ast::{
     AstFunctionDecl, AstFunctionExpr, AstFunctionName, AstLValue, AstLocalAttr, AstLocalBinding,
     AstLocalDecl, AstLocalFunctionDecl, AstLocalOrigin, AstModule, AstNamePath, AstNameRef,
     AstStmt, AstSyntheticLocalId, AstTableConstructor, AstTargetDialect,
-    make_readable_with_options,
+    make_readable,
 };
 use crate::hir::{HirProtoRef, ParamId, TempId};
+use crate::timing::TimingCollector;
 use crate::readability::ReadabilityOptions;
 
 fn installer_function() -> AstFunctionExpr {
@@ -119,10 +120,11 @@ fn installer_function_with_method_export() -> AstFunctionExpr {
 }
 
 fn make_lua55_readable(module: &AstModule) -> AstModule {
-    make_readable_with_options(
+    make_readable(
         module,
         AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
         ReadabilityOptions::default(),
+        &TimingCollector::disabled(),
     )
 }
 

@@ -27,6 +27,8 @@ fn simplifies_safe_lua_logical_absorption() {
     super::super::simplify_hir(
         &mut module,
         crate::readability::ReadabilityOptions::default(),
+        &crate::timing::TimingCollector::disabled(),
+        &[],
     );
 
     assert!(matches!(

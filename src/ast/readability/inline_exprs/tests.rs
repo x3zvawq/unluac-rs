@@ -11,6 +11,7 @@ use crate::ast::{
     AstNameRef, AstStmt, AstTargetDialect, AstUnaryExpr, AstUnaryOpKind,
 };
 use crate::hir::{LocalId, TempId};
+use crate::timing::TimingCollector;
 
 use crate::readability::ReadabilityOptions;
 
@@ -46,10 +47,11 @@ fn inlines_safe_expr_into_single_return_within_threshold() {
         },
     };
 
-    let module = crate::ast::make_readable_with_options(
+    let module = crate::ast::make_readable(
         &module,
         AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
         ReadabilityOptions::default(),
+        &TimingCollector::disabled(),
     );
     assert_eq!(
         module.body.stmts,
@@ -310,10 +312,11 @@ fn reruns_field_access_sugar_after_inlining_string_key_alias_in_lvalue() {
         },
     };
 
-    let module = crate::ast::make_readable_with_options(
+    let module = crate::ast::make_readable(
         &module,
         AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
         ReadabilityOptions::default(),
+        &TimingCollector::disabled(),
     );
 
     assert_eq!(
@@ -402,10 +405,11 @@ fn collapses_mechanical_lookup_chain_into_terminal_local_decl() {
         },
     };
 
-    let module = crate::ast::make_readable_with_options(
+    let module = crate::ast::make_readable(
         &module,
         AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
         ReadabilityOptions::default(),
+        &TimingCollector::disabled(),
     );
 
     assert_eq!(
@@ -506,10 +510,11 @@ fn collapses_lookup_only_run_into_index_assign() {
         },
     };
 
-    let module = crate::ast::make_readable_with_options(
+    let module = crate::ast::make_readable(
         &module,
         AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
         ReadabilityOptions::default(),
+        &TimingCollector::disabled(),
     );
 
     assert_eq!(
@@ -584,10 +589,11 @@ fn collapses_single_call_prep_alias_into_terminal_result_decl() {
         },
     };
 
-    let module = crate::ast::make_readable_with_options(
+    let module = crate::ast::make_readable(
         &module,
         AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
         ReadabilityOptions::default(),
+        &TimingCollector::disabled(),
     );
 
     assert_eq!(

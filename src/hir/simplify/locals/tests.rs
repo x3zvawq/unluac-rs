@@ -171,6 +171,8 @@ fn does_not_promote_single_use_numeric_for_header_temps_into_locals() {
     super::super::simplify_hir(
         &mut module,
         crate::readability::ReadabilityOptions::default(),
+        &crate::timing::TimingCollector::disabled(),
+        &[],
     );
 
     assert_eq!(module.protos[0].locals.len(), 1);
@@ -226,6 +228,8 @@ fn does_not_promote_self_referential_temp_update_inside_branch() {
     super::super::simplify_hir(
         &mut module,
         crate::readability::ReadabilityOptions::default(),
+        &crate::timing::TimingCollector::disabled(),
+        &[],
     );
 
     assert!(matches!(

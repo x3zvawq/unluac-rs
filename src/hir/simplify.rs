@@ -156,13 +156,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
 ];
 
 /// 对已经构造完成的 HIR 做 fixed-point 收敛。
-#[cfg_attr(not(test), allow(dead_code))]
-pub(super) fn simplify_hir(module: &mut HirModule, readability: ReadabilityOptions) {
-    let timings = TimingCollector::disabled();
-    simplify_hir_with_timing(module, readability, &timings, &[]);
-}
-
-pub(super) fn simplify_hir_with_timing(
+pub(super) fn simplify_hir(
     module: &mut HirModule,
     readability: ReadabilityOptions,
     timings: &TimingCollector,

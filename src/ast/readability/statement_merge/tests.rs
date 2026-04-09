@@ -6,9 +6,10 @@ use super::ReadabilityContext;
 use crate::ast::common::{AstCallExpr, AstCallKind, AstIndexAccess, AstLocalBinding};
 use crate::ast::{
     AstBlock, AstExpr, AstGoto, AstIf, AstLValue, AstLabel, AstLabelId, AstLocalAttr, AstLocalDecl,
-    AstModule, AstNameRef, AstStmt, AstTargetDialect, make_readable_with_options,
+    AstModule, AstNameRef, AstStmt, AstTargetDialect, make_readable,
 };
 use crate::hir::{LocalId, TempId};
+use crate::timing::TimingCollector;
 
 fn apply_statement_merge(module: &AstModule) -> AstModule {
     let mut module = module.clone();
@@ -48,10 +49,11 @@ fn merges_empty_local_decl_followed_by_matching_assign() {
         },
     };
 
-    let module = make_readable_with_options(
+    let module = make_readable(
         &module,
         AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
         Default::default(),
+        &TimingCollector::disabled(),
     );
     assert_eq!(
         module.body.stmts,
@@ -95,10 +97,11 @@ fn does_not_merge_when_assign_targets_do_not_match_decl_bindings() {
         },
     };
 
-    let module = make_readable_with_options(
+    let module = make_readable(
         &module,
         AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
         Default::default(),
+        &TimingCollector::disabled(),
     );
     assert_eq!(module.body.stmts.len(), 2);
 }
