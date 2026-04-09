@@ -255,6 +255,14 @@ impl<'a> ValueMergeDagBuilder<'a> {
         target: BlockRef,
     ) -> Option<ShortCircuitTarget> {
         if target == self.phi.block {
+            let has_phi_defs = self
+                .phi
+                .incoming
+                .iter()
+                .any(|inc| inc.pred == from_header && !inc.defs.is_empty());
+            if !has_phi_defs {
+                return None;
+            }
             self.value_leaves.insert(from_header);
             return Some(ShortCircuitTarget::Value(from_header));
         }

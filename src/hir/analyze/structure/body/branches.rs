@@ -92,6 +92,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             Some(else_entry) => {
                 Some(self.lower_region(else_entry, branch_stop, &else_target_overrides)?)
             }
+            None if branch_target_overrides.is_none() => {
+                self.build_implicit_else_phi_copies(block, plan.merge)
+            }
             None => None,
         };
         stmts.push(branch_stmt(plan.cond, then_block, else_block));
@@ -111,6 +114,39 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             Some(next) if next == self.lowering.cfg.exit_block => Some(None),
             Some(next) => Some(Some(next)),
             None => Some(None),
+        }
+    }
+
+    /// IfThen（无 else 臂）且 merge block 上有未覆盖 phi 时，显式发出
+    /// header→merge 边的 phi 初值赋值，确保 merge 之后读到的是正确的"保留原值"
+    /// 而不是未初始化的临时值。
+    fn build_implicit_else_phi_copies(
+        &self,
+        header: BlockRef,
+        merge: Option<BlockRef>,
+    ) -> Option<HirBlock> {
+        let merge = merge.filter(|&m| m != self.lowering.cfg.exit_block)?;
+        let phis = self.lowering.dataflow.phi_candidates_in_block(merge);
+        if phis.is_empty() {
+            return None;
+        }
+
+        let mut targets = Vec::new();
+        let mut values = Vec::new();
+        for phi in phis {
+            if self.overrides.phi_is_suppressed_for_block(merge, phi.id) {
+                continue;
+            }
+            targets.push(HirLValue::Temp(self.lowering.bindings.phi_temps[phi.id.index()]));
+            values.push(expr_for_reg_at_block_exit(self.lowering, header, phi.reg));
+        }
+
+        if targets.is_empty() {
+            None
+        } else {
+            Some(HirBlock {
+                stmts: vec![assign_stmt(targets, values)],
+            })
         }
     }
 

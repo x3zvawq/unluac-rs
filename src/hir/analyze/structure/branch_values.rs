@@ -309,7 +309,7 @@ fn branch_value_needs_preserved_entry_seed(value: &BranchValueMergeValue) -> boo
 }
 
 fn branch_value_arm_preserves_current(arm: &BranchValueMergeArm) -> bool {
-    arm.non_header_defs.is_empty() && !arm.defs.is_empty()
+    arm.non_header_defs.is_empty()
 }
 
 fn branch_value_non_header_defs(value: &BranchValueMergeValue) -> impl Iterator<Item = DefId> + '_ {

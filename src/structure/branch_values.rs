@@ -67,23 +67,32 @@ fn analyze_guard_short_circuit_branch_value_merges(
         let ShortCircuitExit::BranchExit { truthy, falsy } = short.exit else {
             continue;
         };
-        if !cfg.can_reach(truthy, falsy) || cfg.can_reach(falsy, truthy) {
-            continue;
-        }
 
-        let then_preds = collect_merge_arm_preds(cfg, &graph_facts.dominator_tree, truthy, falsy);
-        let else_preds = short.branch_exit_leaf_preds(false);
+        // Determine direction: one exit must reach the other (the "body" flows
+        // into the "merge"). Handle both truthy→falsy and falsy→truthy so that
+        // inverted comparisons (e.g. LuaJIT ISGE) work correctly.
+        let (body, merge, body_is_truthy) =
+            if cfg.can_reach(truthy, falsy) && !cfg.can_reach(falsy, truthy) {
+                (truthy, falsy, true)
+            } else if cfg.can_reach(falsy, truthy) && !cfg.can_reach(truthy, falsy) {
+                (falsy, truthy, false)
+            } else {
+                continue;
+            };
+
+        let then_preds = collect_merge_arm_preds(cfg, &graph_facts.dominator_tree, body, merge);
+        let else_preds = short.branch_exit_leaf_preds(!body_is_truthy);
         if then_preds.is_empty() || else_preds.is_empty() || !then_preds.is_disjoint(&else_preds) {
             continue;
         }
 
         let values =
-            branch_value_merges_in_block(short.header, dataflow, falsy, &then_preds, &else_preds);
+            branch_value_merges_in_block(short.header, dataflow, merge, &then_preds, &else_preds);
 
         if !values.is_empty() {
             candidates.push(BranchValueMergeCandidate {
                 header: short.header,
-                merge: falsy,
+                merge,
                 values,
             });
         }

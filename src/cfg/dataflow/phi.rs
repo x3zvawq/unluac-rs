@@ -56,6 +56,7 @@ fn build_phi_candidate(
 ) -> Option<PhiCandidate> {
     let mut incoming = Vec::new();
     let mut distinct_defs = BTreeSet::new();
+    let mut has_entry_incoming = false;
 
     for edge_ref in &cfg.preds[block.index()] {
         let pred = cfg.edges[edge_ref.index()].from;
@@ -68,7 +69,7 @@ fn build_phi_candidate(
             .map(|defs_by_reg| defs_by_reg.get(reg))?
             .clone();
         if defs.is_empty() {
-            return None;
+            has_entry_incoming = true;
         }
 
         distinct_defs.extend(defs.iter().copied());
@@ -78,7 +79,8 @@ fn build_phi_candidate(
         });
     }
 
-    if incoming.len() < 2 || distinct_defs.len() < 2 {
+    let distinct_sources = distinct_defs.len() + usize::from(has_entry_incoming);
+    if incoming.len() < 2 || distinct_sources < 2 {
         return None;
     }
 
