@@ -98,7 +98,7 @@ pub(super) fn structured_candidates(
 
     let truthy_expr = target_as_expr(subject, truthy);
     let falsy_expr = target_as_expr(subject, falsy);
-    let not_subject = super::super::negate_expr(subject.clone());
+    let not_subject = subject.clone().negate();
 
     candidates.push(super::super::logical_or(
         super::super::logical_and(subject.clone(), truthy_expr.clone()),
@@ -107,7 +107,7 @@ pub(super) fn structured_candidates(
     candidates.push(super::super::logical_or(
         super::super::logical_and(subject.clone(), truthy_expr.clone()),
         super::super::logical_and(
-            super::super::negate_expr(subject.clone()),
+            subject.clone().negate(),
             falsy_expr.clone(),
         ),
     ));

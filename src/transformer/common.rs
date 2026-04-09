@@ -4,6 +4,8 @@
 //! Dataflow、HIR 共同依赖的稳定契约；具体某个 dialect 的 lowering 规则可以
 //! 分目录演进，但这里的类型应该尽量保持统一、明确、可复用。
 
+use std::fmt;
+
 use crate::parser::{
     ChunkHeader, Origin, ProtoFrameInfo, ProtoLineRange, ProtoSignature, RawConstPool,
     RawDebugInfo, RawProto, RawString, RawUpvalueInfo,
@@ -107,6 +109,12 @@ impl InstrRef {
     }
 }
 
+impl fmt::Display for InstrRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "@{}", self.0)
+    }
+}
+
 /// raw 指令在线性 proto 指令数组里的稳定索引。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct RawInstrRef(pub usize);
@@ -124,6 +132,12 @@ pub struct Reg(pub usize);
 impl Reg {
     pub const fn index(self) -> usize {
         self.0
+    }
+}
+
+impl fmt::Display for Reg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "r{}", self.0)
     }
 }
 

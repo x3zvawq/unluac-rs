@@ -11,7 +11,6 @@ use crate::generate::{
 };
 use crate::hir::analyze_hir_with_timing;
 use crate::naming::{assign_names_with_evidence, collect_naming_evidence};
-use crate::parser::{RawChunk, RawString, StringEncoding};
 use crate::structure::analyze_structure;
 use crate::timing::{TimingCollector, TimingReport};
 use crate::transformer::lower_chunk;
@@ -278,12 +277,8 @@ impl DecompilerPipeline {
                 .hir
                 .as_ref()
                 .expect("hir stage completed must leave hir module in state");
-            let raw_chunk = state
-                .raw_chunk
-                .as_ref()
-                .expect("parse stage completed must leave raw chunk in state");
             let evidence = timings.record("collect-evidence", || {
-                collect_naming_evidence(raw_chunk, hir)
+                collect_naming_evidence(hir)
             })?;
             assign_names_with_evidence(ast, hir, &evidence, options.naming)
         })?);
@@ -309,18 +304,13 @@ impl DecompilerPipeline {
             let mut generate_options = options.generate;
             generate_options.mode = output_generate_mode;
             let comment_metadata = if generate_options.comment {
-                let raw_chunk = state
-                    .raw_chunk
-                    .as_ref()
-                    .expect("parse stage completed must leave raw chunk in state");
                 let hir = state
                     .hir
                     .as_ref()
                     .expect("hir stage completed must leave hir module in state");
                 Some(build_generate_comment_metadata(
-                    raw_chunk,
                     hir,
-                    options.parse.string_encoding,
+                    options.parse.string_encoding.label(),
                 ))
             } else {
                 None
@@ -359,14 +349,17 @@ fn finish_result(
 }
 
 fn build_generate_comment_metadata(
-    raw_chunk: &RawChunk,
     hir: &crate::hir::HirModule,
-    encoding: StringEncoding,
+    encoding: &str,
 ) -> GenerateCommentMetadata {
+    let entry_source = hir
+        .protos
+        .get(hir.entry.index())
+        .and_then(|proto| proto.source.clone());
     GenerateCommentMetadata {
         chunk: GenerateChunkCommentMetadata {
-            file_name: raw_chunk.main.common.source.as_ref().map(render_raw_string),
-            encoding,
+            file_name: entry_source,
+            encoding: encoding.to_owned(),
         },
         functions: hir
             .protos
@@ -381,13 +374,5 @@ fn build_generate_comment_metadata(
             })
             .collect(),
     }
-}
-
-fn render_raw_string(value: &RawString) -> String {
-    value
-        .text
-        .as_ref()
-        .map(|text| text.value.clone())
-        .unwrap_or_else(|| format!("<{} bytes>", value.bytes.len()))
 }
 

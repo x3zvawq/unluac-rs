@@ -196,7 +196,7 @@ pub(super) fn simplify_hir_with_timing(
                         8 => decision::eliminate_remaining_decisions_in_proto(proto),
                         9 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
                         10 => carried_locals::collapse_carried_local_handoffs_in_proto(proto),
-                        11 => dead_temps::remove_dead_unresolved_temp_materializations_in_proto(proto),
+                        11 => dead_temps::remove_dead_temp_materializations_in_proto(proto),
                         12 => dead_labels::remove_unused_labels_in_proto(proto),
                         _ => unreachable!("invalid HIR pass index: {index}"),
                     }

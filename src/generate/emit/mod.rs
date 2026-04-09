@@ -126,7 +126,7 @@ impl<'a> Emitter<'a> {
             .unwrap_or_else(|| "<unknown>".to_owned());
         let encoding = self
             .metadata
-            .map(|metadata| metadata.chunk.encoding.label())
+            .map(|metadata| metadata.chunk.encoding.as_str())
             .unwrap_or("unknown");
         Some(Doc::join(
             [

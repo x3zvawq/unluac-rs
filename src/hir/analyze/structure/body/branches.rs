@@ -308,7 +308,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         {
             stmts.extend(then_block.stmts);
             stmts.push(branch_stmt(
-                negate_expr(cond),
+                cond.negate(),
                 HirBlock {
                     stmts: vec![HirStmt::Break],
                 },
@@ -318,7 +318,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         if then_block.stmts.is_empty() {
-            stmts.push(branch_stmt(negate_expr(cond), break_block, None));
+            stmts.push(branch_stmt(cond.negate(), break_block, None));
         } else {
             stmts.push(branch_stmt(cond, then_block, Some(break_block)));
         }
@@ -396,7 +396,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         };
         let continue_else = (!continue_block.stmts.is_empty()).then_some(continue_block);
         stmts.push(branch_stmt(
-            negate_expr(keep_cond),
+            keep_cond.negate(),
             escape_block,
             continue_else,
         ));
@@ -459,7 +459,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         {
             self.visited.insert(break_exit);
             stmts.push(branch_stmt(
-                negate_expr(continue_cond),
+                continue_cond.negate(),
                 loop_context.break_exits[&break_exit].clone(),
                 None,
             ));
@@ -483,7 +483,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 // `continue` / `goto` 的 target dialect 会被我们平白制造出无法落地的语义。
                 if prefer_natural_fallthrough {
                     stmts.push(branch_stmt(
-                        negate_expr(continue_cond),
+                        continue_cond.negate(),
                         break_block.clone(),
                         None,
                     ));
@@ -493,7 +493,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     branch_stmt(continue_cond, continue_block, Some(break_block.clone()))
                 } else {
                     branch_stmt(
-                        negate_expr(continue_cond),
+                        continue_cond.negate(),
                         break_block.clone(),
                         Some(continue_block),
                     )
@@ -514,7 +514,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     &non_continue_target_overrides,
                 )?;
                 stmts.push(branch_stmt(
-                    negate_expr(continue_cond),
+                    continue_cond.negate(),
                     non_continue_block,
                     None,
                 ));
@@ -542,7 +542,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 branch_stmt(continue_cond, continue_block, Some(non_continue_block))
             } else {
                 branch_stmt(
-                    negate_expr(continue_cond),
+                    continue_cond.negate(),
                     non_continue_block,
                     Some(continue_block),
                 )
@@ -569,7 +569,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 let non_continue_block =
                     self.lower_region(non_continue_entry, stop, target_overrides)?;
                 stmts.push(branch_stmt(
-                    negate_expr(continue_cond),
+                    continue_cond.negate(),
                     non_continue_block,
                     None,
                 ));
@@ -602,7 +602,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 &then_target_overrides,
             )?;
             stmts.push(branch_stmt(
-                negate_expr(continue_cond),
+                continue_cond.negate(),
                 non_continue_block,
                 None,
             ));

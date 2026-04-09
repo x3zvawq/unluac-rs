@@ -35,9 +35,11 @@ use crate::transformer::{CallKind, InstrRef, LowInstr, LoweredProto, Reg, Result
 
 pub(super) struct ProtoBindings {
     pub(super) params: Vec<ParamId>,
+    pub(super) param_debug_hints: Vec<Option<String>>,
     pub(super) locals: Vec<LocalId>,
     pub(super) local_debug_hints: Vec<Option<String>>,
     pub(super) upvalues: Vec<UpvalueId>,
+    pub(super) upvalue_debug_hints: Vec<Option<String>>,
     pub(super) temps: Vec<TempId>,
     pub(super) temp_debug_locals: Vec<Option<String>>,
     pub(super) fixed_temps: Vec<TempId>,
@@ -134,9 +136,11 @@ pub(super) fn lower_proto(
         line_range: proto.line_range,
         signature: proto.signature,
         params: lowering.bindings.params.clone(),
+        param_debug_hints: lowering.bindings.param_debug_hints.clone(),
         locals: lowering.bindings.locals.clone(),
         local_debug_hints: lowering.bindings.local_debug_hints.clone(),
         upvalues: lowering.bindings.upvalues.clone(),
+        upvalue_debug_hints: lowering.bindings.upvalue_debug_hints.clone(),
         temps: lowering.bindings.temps.clone(),
         temp_debug_locals: lowering.bindings.temp_debug_locals.clone(),
         body: build_proto_body(&lowering),

@@ -4,8 +4,7 @@
 //! 避免把“生成选项”“注释元信息”和“最终产物”散落在 emit/render 两边。
 
 use crate::ast::AstDialectVersion;
-use crate::hir::HirProtoRef;
-use crate::parser::{ProtoLineRange, ProtoSignature, StringEncoding};
+use crate::hir::{HirProtoRef, ProtoLineRange, ProtoSignature};
 
 /// 最终生成的源码结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,7 +70,7 @@ impl GenerateCommentMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerateChunkCommentMetadata {
     pub file_name: Option<String>,
-    pub encoding: StringEncoding,
+    pub encoding: String,
 }
 
 /// proto 级注释要展示的元信息。

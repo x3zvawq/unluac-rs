@@ -380,7 +380,7 @@ fn materialize_logical_expr_into_target(
     let guard = if is_and {
         HirExpr::LocalRef(lhs_local)
     } else {
-        super::negate_expr(HirExpr::LocalRef(lhs_local))
+        HirExpr::LocalRef(lhs_local).negate()
     };
     let then_block = HirBlock {
         stmts: materialize_expr_into_target(logical.rhs, target, state),
@@ -465,7 +465,7 @@ fn materialize_decision_node(
 
     let (cond, then_block, else_block) = if then_block.stmts.is_empty() {
         (
-            super::negate_expr(cond),
+            cond.negate(),
             HirBlock { stmts: else_stmts },
             None,
         )

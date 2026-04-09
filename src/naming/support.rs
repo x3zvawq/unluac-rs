@@ -5,8 +5,6 @@
 
 use std::collections::BTreeSet;
 
-use crate::parser::{RawLocalVar, RawProto, RawString};
-
 /// 取简单参数名候选。
 pub(super) fn alphabetical_name(index: usize) -> Option<String> {
     const NAMES: &[&str] = &[
@@ -85,33 +83,4 @@ pub(super) fn is_lua_keyword(candidate: &str) -> bool {
 /// 预置 Lua 关键字表。
 pub(super) fn lua_keywords() -> BTreeSet<String> {
     LUA_KEYWORDS.iter().map(|s| (*s).to_owned()).collect()
-}
-
-/// 在指定 pc 上，从 debug locals 里找寄存器对应的名字。
-pub(super) fn debug_local_name_for_reg_at_pc(
-    proto: &RawProto,
-    reg: usize,
-    pc: u32,
-) -> Option<String> {
-    proto
-        .common
-        .debug_info
-        .common
-        .local_vars
-        .iter()
-        .filter(|local| debug_local_is_active_at_pc(local, pc))
-        .nth(reg)
-        .map(|local| decode_raw_string(&local.name))
-}
-
-fn debug_local_is_active_at_pc(local: &RawLocalVar, pc: u32) -> bool {
-    local.start_pc <= pc && pc < local.end_pc
-}
-
-/// 解码 raw string。
-pub(super) fn decode_raw_string(raw: &RawString) -> String {
-    raw.text
-        .as_ref()
-        .map(|text| text.value.clone())
-        .unwrap_or_else(|| String::from_utf8_lossy(&raw.bytes).into_owned())
 }

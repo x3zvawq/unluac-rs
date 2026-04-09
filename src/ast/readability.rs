@@ -79,7 +79,7 @@ use AstInvalidation::*;
 //
 // Normal phase 处理主要形状收敛：
 //   cleanup → local-coalesce → statement-merge → loop-header-merge
-//   → branch-pretty → inline-exprs → field-access-sugar → short-circuit-pretty
+//   → branch-pretty → field-access-sugar → inline-exprs → short-circuit-pretty
 //
 // Deferred phase 在 Normal 全部收敛后执行终态物化和语法糖：
 //   temp-materialize → installer-iife → function-sugar → global-decl-pretty → luajit-goto-safety
@@ -118,16 +118,16 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
         invalidates: &[ControlFlowShape, StatementAdjacency],
     },
     PassDescriptor {
-        name: "inline-exprs",
-        phase: PassPhase::Normal,
-        depends_on: &[StatementAdjacency, ExprShape, TempPresence],
-        invalidates: &[StatementAdjacency, ExprShape],
-    },
-    PassDescriptor {
         name: "field-access-sugar",
         phase: PassPhase::Normal,
         depends_on: &[ExprShape],
         invalidates: &[ExprShape],
+    },
+    PassDescriptor {
+        name: "inline-exprs",
+        phase: PassPhase::Normal,
+        depends_on: &[StatementAdjacency, ExprShape, TempPresence],
+        invalidates: &[StatementAdjacency, ExprShape],
     },
     PassDescriptor {
         name: "short-circuit-pretty",
@@ -175,8 +175,8 @@ const PASS_ENTRIES: &[ReadabilityPassEntry] = &[
     ReadabilityPassEntry { apply: statement_merge::apply },
     ReadabilityPassEntry { apply: loop_header_merge::apply },
     ReadabilityPassEntry { apply: branch_pretty::apply },
-    ReadabilityPassEntry { apply: inline_exprs::apply },
     ReadabilityPassEntry { apply: field_access_sugar::apply },
+    ReadabilityPassEntry { apply: inline_exprs::apply },
     ReadabilityPassEntry { apply: short_circuit_pretty::apply },
     ReadabilityPassEntry { apply: materialize_temps::apply },
     ReadabilityPassEntry { apply: installer_iife::apply },

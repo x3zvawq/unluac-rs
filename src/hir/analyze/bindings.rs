@@ -29,8 +29,21 @@ pub(super) fn build_bindings(
     let params = (0..usize::from(proto.signature.num_params))
         .map(ParamId)
         .collect::<Vec<_>>();
+    let param_debug_hints = (0..params.len())
+        .map(|reg| debug_local_name_for_reg_at_pc(proto, Reg(reg), 0))
+        .collect::<Vec<_>>();
     let upvalues = (0..usize::from(proto.upvalues.common.count))
         .map(UpvalueId)
+        .collect::<Vec<_>>();
+    let upvalue_debug_hints = (0..upvalues.len())
+        .map(|index| {
+            proto
+                .debug_info
+                .common
+                .upvalue_names
+                .get(index)
+                .map(decode_raw_string)
+        })
         .collect::<Vec<_>>();
     let mut locals = Vec::new();
     let mut local_debug_hints = Vec::new();
@@ -143,9 +156,11 @@ pub(super) fn build_bindings(
 
     ProtoBindings {
         params,
+        param_debug_hints,
         locals,
         local_debug_hints,
         upvalues,
+        upvalue_debug_hints,
         temps,
         temp_debug_locals,
         fixed_temps,

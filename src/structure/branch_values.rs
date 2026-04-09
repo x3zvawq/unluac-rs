@@ -37,16 +37,12 @@ pub(super) fn analyze_branch_value_merges(
         })
         .collect::<BTreeSet<_>>();
 
-    let mut candidates = Vec::new();
-
-    for branch_region in branch_regions {
-        let Some(candidate) =
+    let mut candidates: Vec<_> = branch_regions
+        .iter()
+        .filter_map(|branch_region| {
             analyze_branch_value_merge_candidate(dataflow, branch_region, &short_circuit_merges)
-        else {
-            continue;
-        };
-        candidates.push(candidate);
-    }
+        })
+        .collect();
 
     candidates.extend(analyze_guard_short_circuit_branch_value_merges(
         cfg,

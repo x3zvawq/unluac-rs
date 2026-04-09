@@ -82,27 +82,22 @@ fn rewrite_stmt_slice(stmts: &[HirStmt]) -> Vec<HirStmt> {
 }
 
 fn collect_scope_intervals(stmts: &[HirStmt]) -> Vec<ScopeInterval> {
-    let mut intervals = Vec::new();
-    for index in 0..stmts.len() {
-        let Some(scope_start) = scope_start(stmts, index) else {
-            continue;
-        };
-        let Some(end) = find_scope_end(
-            stmts,
-            scope_start.start + 2,
-            scope_start.binding,
-            scope_start.reg_index,
-        ) else {
-            continue;
-        };
-        if scope_start.start < end {
-            intervals.push(ScopeInterval {
+    let mut intervals: Vec<_> = (0..stmts.len())
+        .filter_map(|index| {
+            let scope_start = scope_start(stmts, index)?;
+            let end = find_scope_end(
+                stmts,
+                scope_start.start + 2,
+                scope_start.binding,
+                scope_start.reg_index,
+            )?;
+            (scope_start.start < end).then_some(ScopeInterval {
                 start: scope_start.start,
                 end,
                 reg_index: scope_start.reg_index,
-            });
-        }
-    }
+            })
+        })
+        .collect();
 
     intervals.sort_by_key(|interval| (interval.start, interval.end));
 

@@ -5,6 +5,7 @@
 //! 也应优先补在这里，而不是再在后层各自包一层小型 CFG API。
 
 use std::collections::{BTreeSet, VecDeque};
+use std::fmt;
 
 use crate::transformer::{InstrRef, LowInstr};
 
@@ -39,6 +40,12 @@ impl EdgeRef {
     }
 }
 
+impl fmt::Display for EdgeRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "#{}", self.0)
+    }
+}
+
 /// block 的稳定引用。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
 pub struct BlockRef(pub usize);
@@ -46,6 +53,12 @@ pub struct BlockRef(pub usize);
 impl BlockRef {
     pub const fn index(self) -> usize {
         self.0
+    }
+}
+
+impl fmt::Display for BlockRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "#{}", self.0)
     }
 }
 

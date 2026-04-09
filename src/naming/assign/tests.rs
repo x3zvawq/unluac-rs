@@ -12,83 +12,7 @@ use crate::hir::{
     HirReturn, HirStmt, LocalId, ParamId, TempId, UpvalueId,
 };
 use crate::naming::{NameSource, NamingMode, NamingOptions, assign_names};
-use crate::parser::{
-    ChunkHeader, ChunkLayout, Dialect, DialectConstPoolExtra, DialectDebugExtra,
-    DialectHeaderExtra, DialectProtoExtra, DialectUpvalueExtra, DialectVersion, Endianness, Origin,
-    ProtoFrameInfo, ProtoLineRange, ProtoSignature, PucLuaChunkLayout, RawChunk, RawConstPool,
-    RawConstPoolCommon, RawDebugInfo, RawDebugInfoCommon, RawProto, RawProtoCommon, RawUpvalueInfo,
-    RawUpvalueInfoCommon, Span,
-};
-use crate::parser::{
-    Lua51ConstPoolExtra, Lua51DebugExtra, Lua51HeaderExtra, Lua51ProtoExtra, Lua51UpvalueExtra,
-};
-
-fn empty_raw_chunk() -> RawChunk {
-    let origin = Origin {
-        span: Span { offset: 0, size: 0 },
-        raw_word: None,
-    };
-    RawChunk {
-        header: ChunkHeader {
-            dialect: Dialect::PucLua,
-            version: DialectVersion::Lua51,
-            layout: ChunkLayout::PucLua(PucLuaChunkLayout {
-                format: 0,
-                endianness: Endianness::Little,
-                integer_size: 4,
-                lua_integer_size: None,
-                size_t_size: 4,
-                instruction_size: 4,
-                number_size: 8,
-                integral_number: false,
-            }),
-            extra: DialectHeaderExtra::Lua51(Lua51HeaderExtra),
-            origin,
-        },
-        main: RawProto {
-            common: RawProtoCommon {
-                source: None,
-                line_range: ProtoLineRange {
-                    defined_start: 0,
-                    defined_end: 0,
-                },
-                signature: ProtoSignature {
-                    num_params: 4,
-                    is_vararg: false,
-                    has_vararg_param_reg: false,
-                    named_vararg_table: false,
-                },
-                frame: ProtoFrameInfo { max_stack_size: 4 },
-                instructions: Vec::new(),
-                constants: RawConstPool {
-                    common: RawConstPoolCommon {
-                        literals: Vec::new(),
-                    },
-                    extra: DialectConstPoolExtra::Lua51(Lua51ConstPoolExtra),
-                },
-                upvalues: RawUpvalueInfo {
-                    common: RawUpvalueInfoCommon {
-                        count: 0,
-                        descriptors: Vec::new(),
-                    },
-                    extra: DialectUpvalueExtra::Lua51(Lua51UpvalueExtra),
-                },
-                debug_info: RawDebugInfo {
-                    common: RawDebugInfoCommon {
-                        line_info: Vec::new(),
-                        local_vars: Vec::new(),
-                        upvalue_names: Vec::new(),
-                    },
-                    extra: DialectDebugExtra::Lua51(Lua51DebugExtra),
-                },
-                children: Vec::new(),
-            },
-            extra: DialectProtoExtra::Lua51(Lua51ProtoExtra { raw_is_vararg: 0 }),
-            origin,
-        },
-        origin,
-    }
-}
+use crate::parser::{ProtoLineRange, ProtoSignature};
 
 #[test]
 fn heuristic_mode_prefers_field_shape_for_local_chain() {
@@ -106,9 +30,11 @@ fn heuristic_mode_prefers_field_shape_for_local_chain() {
             named_vararg_table: false,
         },
         params: vec![ParamId(0), ParamId(1), ParamId(2), ParamId(3)],
+        param_debug_hints: Vec::new(),
         locals: vec![LocalId(0), LocalId(1)],
         local_debug_hints: Vec::new(),
         upvalues: Vec::new(),
+        upvalue_debug_hints: Vec::new(),
         temps: Vec::new(),
         temp_debug_locals: Vec::new(),
         body: HirBlock::default(),
@@ -160,7 +86,6 @@ fn heuristic_mode_prefers_field_shape_for_local_chain() {
     let names = assign_names(
         &ast,
         &hir,
-        &empty_raw_chunk(),
         NamingOptions {
             mode: NamingMode::Heuristic,
             ..NamingOptions::default()
@@ -191,8 +116,10 @@ fn debug_like_mode_uses_function_qualified_binding_ids() {
             named_vararg_table: false,
         },
         params: vec![ParamId(0), ParamId(1)],
+        param_debug_hints: Vec::new(),
         locals: vec![LocalId(0), LocalId(1), LocalId(2)],
         upvalues: Vec::new(),
+        upvalue_debug_hints: Vec::new(),
         temps: vec![TempId(0)],
         temp_debug_locals: vec![None],
         local_debug_hints: Vec::new(),
@@ -235,7 +162,6 @@ fn debug_like_mode_uses_function_qualified_binding_ids() {
     let names = assign_names(
         &ast,
         &hir,
-        &empty_raw_chunk(),
         NamingOptions {
             mode: NamingMode::DebugLike,
             debug_like_include_function: true,
@@ -274,9 +200,11 @@ fn simple_mode_uses_underscore_for_unused_synthetic_local() {
             named_vararg_table: false,
         },
         params: Vec::new(),
+        param_debug_hints: Vec::new(),
         locals: Vec::new(),
         local_debug_hints: Vec::new(),
         upvalues: Vec::new(),
+        upvalue_debug_hints: Vec::new(),
         temps: vec![TempId(0), TempId(1)],
         temp_debug_locals: vec![None, None],
         body: HirBlock::default(),
@@ -314,7 +242,7 @@ fn simple_mode_uses_underscore_for_unused_synthetic_local() {
         },
     };
 
-    let names = assign_names(&ast, &hir, &empty_raw_chunk(), NamingOptions::default())
+    let names = assign_names(&ast, &hir, NamingOptions::default())
         .expect("naming should succeed");
 
     let function = names.function(HirProtoRef(0)).expect("function names");
@@ -352,9 +280,11 @@ fn debug_like_mode_still_uses_self_for_method_receiver_param() {
             named_vararg_table: false,
         },
         params: vec![ParamId(0), ParamId(1)],
+        param_debug_hints: Vec::new(),
         locals: Vec::new(),
         local_debug_hints: Vec::new(),
         upvalues: Vec::new(),
+        upvalue_debug_hints: Vec::new(),
         temps: Vec::new(),
         temp_debug_locals: Vec::new(),
         body: HirBlock::default(),
@@ -389,9 +319,6 @@ fn debug_like_mode_still_uses_self_for_method_receiver_param() {
 
 #[test]
 fn capture_provenance_upvalue_keeps_parent_name_when_child_local_conflicts() {
-    let mut raw = empty_raw_chunk();
-    raw.main.common.children.push(raw.main.clone());
-
     let parent = HirProto {
         id: HirProtoRef(0),
         source: None,
@@ -406,9 +333,11 @@ fn capture_provenance_upvalue_keeps_parent_name_when_child_local_conflicts() {
             named_vararg_table: false,
         },
         params: Vec::new(),
+        param_debug_hints: Vec::new(),
         locals: vec![LocalId(0)],
         local_debug_hints: Vec::new(),
         upvalues: Vec::new(),
+        upvalue_debug_hints: Vec::new(),
         temps: Vec::new(),
         temp_debug_locals: Vec::new(),
         body: HirBlock {
@@ -443,9 +372,11 @@ fn capture_provenance_upvalue_keeps_parent_name_when_child_local_conflicts() {
             named_vararg_table: false,
         },
         params: Vec::new(),
+        param_debug_hints: Vec::new(),
         locals: vec![LocalId(0)],
         local_debug_hints: Vec::new(),
         upvalues: vec![UpvalueId(0)],
+        upvalue_debug_hints: Vec::new(),
         temps: Vec::new(),
         temp_debug_locals: Vec::new(),
         body: HirBlock {
@@ -512,7 +443,6 @@ fn capture_provenance_upvalue_keeps_parent_name_when_child_local_conflicts() {
     let names = assign_names(
         &ast,
         &hir,
-        &raw,
         NamingOptions {
             mode: NamingMode::DebugLike,
             debug_like_include_function: true,
@@ -543,9 +473,11 @@ fn capture_provenance_temp_uses_parent_synthetic_local_name() {
             named_vararg_table: false,
         },
         params: Vec::new(),
+        param_debug_hints: Vec::new(),
         locals: Vec::new(),
         local_debug_hints: Vec::new(),
         upvalues: vec![UpvalueId(0)],
+        upvalue_debug_hints: Vec::new(),
         temps: Vec::new(),
         temp_debug_locals: Vec::new(),
         body: HirBlock {

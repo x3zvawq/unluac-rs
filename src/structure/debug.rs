@@ -332,13 +332,13 @@ fn format_short_circuit_value_incomings(incomings: &[ShortCircuitValueIncoming])
         .iter()
         .map(|incoming| {
             format!(
-                "#{}=>{} local={}",
-                incoming.pred.index(),
+                "{}=>{} local={}",
+                incoming.pred,
                 format_def_set(&incoming.defs),
                 incoming
                     .latest_local_def
-                    .map(|def| format!("d{}", def.index()))
-                    .unwrap_or_else(|| "-".to_owned())
+                    .map(|def| def.to_string())
+                    .unwrap_or_else(|| "-".to_string())
             )
         })
         .collect::<Vec<_>>()
@@ -411,19 +411,19 @@ fn write_scopes(output: &mut String, indent: &str, scopes: &[ScopeCandidate]) {
 
 fn format_optional_block(block: Option<crate::cfg::BlockRef>) -> String {
     block
-        .map(|block| format!("#{}", block.index()))
-        .unwrap_or_else(|| "-".to_owned())
+        .map(|block| block.to_string())
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn format_block_set(blocks: &BTreeSet<crate::cfg::BlockRef>) -> String {
     if blocks.is_empty() {
-        "[-]".to_owned()
+        "[-]".to_string()
     } else {
         format!(
             "[{}]",
             blocks
                 .iter()
-                .map(|block| format!("#{}", block.index()))
+                .map(|block| block.to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -432,13 +432,13 @@ fn format_block_set(blocks: &BTreeSet<crate::cfg::BlockRef>) -> String {
 
 fn format_edge_refs(edges: &[crate::cfg::EdgeRef]) -> String {
     if edges.is_empty() {
-        "[-]".to_owned()
+        "[-]".to_string()
     } else {
         format!(
             "[{}]",
             edges
                 .iter()
-                .map(|edge| format!("#{}", edge.index()))
+                .map(|edge| edge.to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -447,13 +447,13 @@ fn format_edge_refs(edges: &[crate::cfg::EdgeRef]) -> String {
 
 fn format_instr_refs(instrs: &[crate::transformer::InstrRef]) -> String {
     if instrs.is_empty() {
-        "[-]".to_owned()
+        "[-]".to_string()
     } else {
         format!(
             "[{}]",
             instrs
                 .iter()
-                .map(|instr| format!("@{}", instr.index()))
+                .map(|instr| instr.to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -462,12 +462,12 @@ fn format_instr_refs(instrs: &[crate::transformer::InstrRef]) -> String {
 
 fn format_def_set(defs: &BTreeSet<crate::cfg::DefId>) -> String {
     if defs.is_empty() {
-        "[-]".to_owned()
+        "[-]".to_string()
     } else {
         format!(
             "[{}]",
             defs.iter()
-                .map(|def| format!("d{}", def.index()))
+                .map(|def| def.to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -475,7 +475,7 @@ fn format_def_set(defs: &BTreeSet<crate::cfg::DefId>) -> String {
 }
 
 fn format_reg(reg: crate::transformer::Reg) -> String {
-    format!("r{}", reg.index())
+    reg.to_string()
 }
 
 fn format_branch_kind(kind: super::common::BranchKind) -> &'static str {

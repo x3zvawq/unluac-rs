@@ -12,7 +12,6 @@
 
 use crate::ast::AstModule;
 use crate::hir::HirModule;
-use crate::parser::RawChunk;
 
 use super::NamingError;
 use super::allocate::{FunctionAssignContext, assign_names_for_function};
@@ -25,16 +24,15 @@ use super::validate::validate_readability_ast;
 
 /// 对外的 Naming 入口。
 ///
-/// 这个 convenience wrapper 仍然接受 `RawChunk`，但真正的分配核心已经下沉到
-/// `assign_names_with_evidence()`：后者只消费预先构建好的 Naming 证据，不再直接碰
-/// parser 原始结构。
+/// 这个 convenience wrapper 内部先收集 evidence 再做分配。
+/// 分配核心已经下沉到 `assign_names_with_evidence()`：后者只消费预先构建好的
+/// Naming 证据，不再直接碰 parser 原始结构。
 pub fn assign_names(
     module: &AstModule,
     hir: &HirModule,
-    raw: &RawChunk,
     options: NamingOptions,
 ) -> Result<NameMap, NamingError> {
-    let evidence = collect_naming_evidence(raw, hir)?;
+    let evidence = collect_naming_evidence(hir)?;
     assign_names_with_evidence(module, hir, &evidence, options)
 }
 

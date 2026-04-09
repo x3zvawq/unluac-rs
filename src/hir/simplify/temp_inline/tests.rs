@@ -568,6 +568,7 @@ fn still_inlines_temp_directly_in_index_context() {
 fn preserves_index_context_through_pure_wrapper_layers() {
     let mut proto = HirProto {
         upvalues: vec![crate::hir::common::UpvalueId(0)],
+        upvalue_debug_hints: Vec::new(),
         temps: vec![TempId(0), TempId(1)],
         temp_debug_locals: vec![None, None],
         ..dummy_proto(HirBlock {
@@ -807,9 +808,11 @@ fn dummy_proto(body: HirBlock) -> HirProto {
             named_vararg_table: false,
         },
         params: Vec::new(),
+        param_debug_hints: Vec::new(),
         locals: Vec::new(),
         local_debug_hints: Vec::new(),
         upvalues: Vec::new(),
+        upvalue_debug_hints: Vec::new(),
         temps: vec![TempId(0), TempId(1)],
         temp_debug_locals: vec![None, None],
         body,

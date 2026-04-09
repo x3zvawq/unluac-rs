@@ -434,11 +434,11 @@ impl ProtoChildren<GraphFacts> for GraphFacts {
 
 fn format_edge_refs(edge_refs: &[super::common::EdgeRef]) -> String {
     if edge_refs.is_empty() {
-        "-".to_owned()
+        "-".to_string()
     } else {
         edge_refs
             .iter()
-            .map(|edge| format!("#{}", edge.index()))
+            .map(|edge| edge.to_string())
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -446,13 +446,13 @@ fn format_edge_refs(edge_refs: &[super::common::EdgeRef]) -> String {
 
 fn format_block_set(blocks: &BTreeSet<BlockRef>) -> String {
     if blocks.is_empty() {
-        "[-]".to_owned()
+        "[-]".to_string()
     } else {
         format!(
             "[{}]",
             blocks
                 .iter()
-                .map(|block| format!("#{}", block.index()))
+                .map(|block| block.to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -461,13 +461,13 @@ fn format_block_set(blocks: &BTreeSet<BlockRef>) -> String {
 
 fn format_block_list(blocks: &[BlockRef]) -> String {
     if blocks.is_empty() {
-        "[-]".to_owned()
+        "[-]".to_string()
     } else {
         format!(
             "[{}]",
             blocks
                 .iter()
-                .map(|block| format!("#{}", block.index()))
+                .map(|block| block.to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -476,12 +476,12 @@ fn format_block_list(blocks: &[BlockRef]) -> String {
 
 fn format_reg_set(regs: &BTreeSet<Reg>) -> String {
     if regs.is_empty() {
-        "[-]".to_owned()
+        "[-]".to_string()
     } else {
         format!(
             "[{}]",
             regs.iter()
-                .map(|reg| format_reg(*reg))
+                .map(|reg| reg.to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -490,10 +490,10 @@ fn format_reg_set(regs: &BTreeSet<Reg>) -> String {
 
 fn format_reaching_defs(defs: &RegValueMap<DefId>) -> String {
     if defs.iter().next().is_none() {
-        "[-]".to_owned()
+        "[-]".to_string()
     } else {
         defs.iter()
-            .map(|(reg, defs)| format!("{}<-{}", format_reg(reg), format_def_set(defs)))
+            .map(|(reg, defs)| format!("{reg}<-{}", format_def_set(defs)))
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -510,12 +510,12 @@ fn format_btree_def_set(defs: &BTreeSet<DefId>) -> String {
 fn format_def_iter<'a>(defs: impl Iterator<Item = &'a DefId>) -> String {
     let defs = defs.collect::<Vec<_>>();
     if defs.is_empty() {
-        "[-]".to_owned()
+        "[-]".to_string()
     } else {
         format!(
             "[{}]",
             defs.into_iter()
-                .map(|def| format!("def{}", def.index()))
+                .map(|def| def.to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -524,11 +524,11 @@ fn format_def_iter<'a>(defs: impl Iterator<Item = &'a DefId>) -> String {
 
 fn format_reaching_values(values: ValueMapRef<'_>) -> String {
     if values.iter().next().is_none() {
-        "[-]".to_owned()
+        "[-]".to_string()
     } else {
         values
             .iter()
-            .map(|(reg, values)| format!("{}<-{}", format_reg(reg), format_value_set(values)))
+            .map(|(reg, values)| format!("{reg}<-{}", format_value_set(values)))
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -536,15 +536,15 @@ fn format_reaching_values(values: ValueMapRef<'_>) -> String {
 
 fn format_value_set(values: ValueSetRef<'_>) -> String {
     if values.is_empty() {
-        "[-]".to_owned()
+        "[-]".to_string()
     } else {
         format!(
             "[{}]",
             values
                 .iter()
                 .map(|value| match value {
-                    SsaValue::Def(def) => format!("def{}", def.index()),
-                    SsaValue::Phi(phi) => format!("phi{}", phi.index()),
+                    SsaValue::Def(def) => def.to_string(),
+                    SsaValue::Phi(phi) => phi.to_string(),
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -554,7 +554,7 @@ fn format_value_set(values: ValueSetRef<'_>) -> String {
 
 fn format_open_def_set(defs: &BTreeSet<OpenDefId>) -> String {
     if defs.is_empty() {
-        "[-]".to_owned()
+        "[-]".to_string()
     } else {
         format!(
             "[{}]",
@@ -568,7 +568,7 @@ fn format_open_def_set(defs: &BTreeSet<OpenDefId>) -> String {
 
 fn format_effect_tags(tags: &BTreeSet<EffectTag>) -> String {
     if tags.is_empty() {
-        "[-]".to_owned()
+        "[-]".to_string()
     } else {
         format!(
             "[{}]",
@@ -585,8 +585,8 @@ fn format_phi_incoming(incoming: &[super::common::PhiIncoming]) -> String {
         .iter()
         .map(|incoming| {
             format!(
-                "#{}:{}",
-                incoming.pred.index(),
+                "{}:{}",
+                incoming.pred,
                 format_btree_def_set(&incoming.defs)
             )
         })
@@ -595,7 +595,7 @@ fn format_phi_incoming(incoming: &[super::common::PhiIncoming]) -> String {
 }
 
 fn format_reg(reg: Reg) -> String {
-    format!("r{}", reg.index())
+    reg.to_string()
 }
 
 fn format_low_instr_head(instr: &LowInstr) -> &'static str {

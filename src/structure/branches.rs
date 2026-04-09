@@ -17,32 +17,25 @@ use super::common::{BranchCandidate, BranchKind, BranchRegionFact};
 use super::helpers::{collect_forward_region_blocks, collect_merge_arm_preds};
 
 pub(super) fn analyze_branches(cfg: &Cfg, graph_facts: &GraphFacts) -> Vec<BranchCandidate> {
-    let mut branch_candidates = Vec::new();
-
-    for header in &cfg.block_order {
-        let header = *header;
-        if !cfg.reachable_blocks.contains(&header) {
-            continue;
-        }
-
-        let Some((then_edge_ref, else_edge_ref)) = cfg.branch_edges(header) else {
-            continue;
-        };
-        let then_entry = cfg.edges[then_edge_ref.index()].to;
-        let else_entry = cfg.edges[else_edge_ref.index()].to;
-
-        if then_entry == else_entry {
-            continue;
-        }
-
-        if let Some(candidate) = classify_one_arm_branch(cfg, header, then_entry, else_entry)
-            .or_else(|| classify_if_else_branch(cfg, graph_facts, header, then_entry, else_entry))
-            .or_else(|| classify_guard_branch(cfg, header, then_entry, else_entry))
-        {
-            branch_candidates.push(candidate);
-        }
-    }
-
+    let mut branch_candidates: Vec<_> = cfg
+        .block_order
+        .iter()
+        .copied()
+        .filter(|header| cfg.reachable_blocks.contains(header))
+        .filter_map(|header| {
+            let (then_edge_ref, else_edge_ref) = cfg.branch_edges(header)?;
+            let then_entry = cfg.edges[then_edge_ref.index()].to;
+            let else_entry = cfg.edges[else_edge_ref.index()].to;
+            if then_entry == else_entry {
+                return None;
+            }
+            classify_one_arm_branch(cfg, header, then_entry, else_entry)
+                .or_else(|| {
+                    classify_if_else_branch(cfg, graph_facts, header, then_entry, else_entry)
+                })
+                .or_else(|| classify_guard_branch(cfg, header, then_entry, else_entry))
+        })
+        .collect();
     branch_candidates.sort_by_key(|candidate| candidate.header);
     branch_candidates
 }

@@ -5,6 +5,7 @@
 //! 这些事实在内存中的当前组织形状。
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::ops::Range;
 
 use crate::transformer::{InstrRef, Reg};
@@ -394,6 +395,12 @@ impl DefId {
     }
 }
 
+impl fmt::Display for DefId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "def{}", self.0)
+    }
+}
+
 /// 一个开放结果包定义的唯一身份。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct OpenDefId(pub usize);
@@ -480,6 +487,12 @@ pub struct PhiId(pub usize);
 impl PhiId {
     pub const fn index(self) -> usize {
         self.0
+    }
+}
+
+impl fmt::Display for PhiId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "phi{}", self.0)
     }
 }
 

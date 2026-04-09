@@ -22,5 +22,6 @@ pub use common::{
     HirTableField, HirTableKey, HirTableSetList, HirToBeClosed, HirUnaryExpr, HirUnaryOpKind,
     HirUnresolvedExpr, HirUnstructured, HirWhile, LocalId, ParamId, TempId, UpvalueId,
 };
+pub use crate::parser::{ProtoLineRange, ProtoSignature};
 pub use debug::dump_hir;
 pub(crate) use simplify::synthesize_readable_pure_logical_expr;

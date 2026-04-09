@@ -263,8 +263,7 @@ impl ShortCircuitCandidate {
             let node = short.nodes.get(node_ref.index())?;
             let leaves =
                 collect_target_value_leaves(short, &node.truthy, true, truthy_memo, falsy_memo)?;
-            truthy_memo.insert(node_ref, leaves.clone());
-            Some(leaves)
+            Some(truthy_memo.entry(node_ref).or_insert(leaves).clone())
         }
 
         fn collect_falsy_value_leaves(
@@ -280,8 +279,7 @@ impl ShortCircuitCandidate {
             let node = short.nodes.get(node_ref.index())?;
             let leaves =
                 collect_target_value_leaves(short, &node.falsy, false, truthy_memo, falsy_memo)?;
-            falsy_memo.insert(node_ref, leaves.clone());
-            Some(leaves)
+            Some(falsy_memo.entry(node_ref).or_insert(leaves).clone())
         }
 
         fn collect_target_value_leaves(
@@ -355,8 +353,7 @@ impl ShortCircuitCandidate {
 
         let mut leaves = self.target_leaves(&node.truthy, memo);
         leaves.extend(self.target_leaves(&node.falsy, memo));
-        memo.insert(node_ref, leaves.clone());
-        leaves
+        memo.entry(node_ref).or_insert(leaves).clone()
     }
 
     fn target_leaves(

@@ -27,34 +27,30 @@ pub(super) fn collect_region_exits(cfg: &Cfg, blocks: &BTreeSet<BlockRef>) -> BT
 }
 
 pub(super) fn collect_region_entry_edges(cfg: &Cfg, blocks: &BTreeSet<BlockRef>) -> Vec<EdgeRef> {
-    let mut entry_edges = Vec::new();
-
-    for block in blocks {
-        for edge_ref in &cfg.preds[block.index()] {
+    let mut entry_edges: Vec<_> = blocks
+        .iter()
+        .flat_map(|block| cfg.preds[block.index()].iter())
+        .filter(|edge_ref| {
             let edge = cfg.edges[edge_ref.index()];
-            if cfg.reachable_blocks.contains(&edge.from) && !blocks.contains(&edge.from) {
-                entry_edges.push(*edge_ref);
-            }
-        }
-    }
-
+            cfg.reachable_blocks.contains(&edge.from) && !blocks.contains(&edge.from)
+        })
+        .copied()
+        .collect();
     entry_edges.sort();
     entry_edges.dedup();
     entry_edges
 }
 
 pub(super) fn collect_region_exit_edges(cfg: &Cfg, blocks: &BTreeSet<BlockRef>) -> Vec<EdgeRef> {
-    let mut exit_edges = Vec::new();
-
-    for block in blocks {
-        for edge_ref in &cfg.succs[block.index()] {
+    let mut exit_edges: Vec<_> = blocks
+        .iter()
+        .flat_map(|block| cfg.succs[block.index()].iter())
+        .filter(|edge_ref| {
             let edge = cfg.edges[edge_ref.index()];
-            if cfg.reachable_blocks.contains(&edge.to) && !blocks.contains(&edge.to) {
-                exit_edges.push(*edge_ref);
-            }
-        }
-    }
-
+            cfg.reachable_blocks.contains(&edge.to) && !blocks.contains(&edge.to)
+        })
+        .copied()
+        .collect();
     exit_edges.sort();
     exit_edges.dedup();
     exit_edges

@@ -35,7 +35,7 @@ pub(super) fn compute_instr_effect(instr: &LowInstr) -> InstrEffect {
             effect.fixed_uses.insert(instr.src);
             effect.fixed_must_defs.insert(instr.dst);
         }
-        LowInstr::LoadNil(instr) => insert_reg_range_defs(&mut effect.fixed_must_defs, instr.dst),
+        LowInstr::LoadNil(instr) => insert_reg_range(&mut effect.fixed_must_defs, instr.dst),
         LowInstr::LoadBool(instr) => {
             effect.fixed_must_defs.insert(instr.dst);
         }
@@ -58,7 +58,7 @@ pub(super) fn compute_instr_effect(instr: &LowInstr) -> InstrEffect {
             effect.fixed_must_defs.insert(instr.dst);
         }
         LowInstr::Concat(instr) => {
-            insert_reg_range_uses(&mut effect.fixed_uses, instr.src);
+            insert_reg_range(&mut effect.fixed_uses, instr.src);
             effect.fixed_must_defs.insert(instr.dst);
         }
         LowInstr::GetUpvalue(instr) => {
@@ -133,7 +133,7 @@ pub(super) fn compute_instr_effect(instr: &LowInstr) -> InstrEffect {
             effect.fixed_must_defs.insert(instr.index);
         }
         LowInstr::GenericForCall(instr) => {
-            insert_reg_range_uses(&mut effect.fixed_uses, instr.state);
+            insert_reg_range(&mut effect.fixed_uses, instr.state);
             insert_result_pack_def(
                 &mut effect.fixed_must_defs,
                 &mut effect.open_must_def,
@@ -217,16 +217,8 @@ pub(super) fn compute_side_effect_summary(instr: &LowInstr) -> SideEffectSummary
     SideEffectSummary { tags }
 }
 
-fn insert_reg_range_uses(target: &mut BTreeSet<Reg>, range: RegRange) {
-    for offset in 0..range.len {
-        target.insert(Reg(range.start.index() + offset));
-    }
-}
-
-fn insert_reg_range_defs(target: &mut BTreeSet<Reg>, range: RegRange) {
-    for offset in 0..range.len {
-        target.insert(Reg(range.start.index() + offset));
-    }
+fn insert_reg_range(target: &mut BTreeSet<Reg>, range: RegRange) {
+    target.extend((0..range.len).map(|offset| Reg(range.start.index() + offset)));
 }
 
 fn insert_value_operand_use(target: &mut BTreeSet<Reg>, operand: ValueOperand) {
@@ -259,7 +251,7 @@ fn insert_value_pack_use(
     pack: ValuePack,
 ) {
     match pack {
-        ValuePack::Fixed(range) => insert_reg_range_uses(target, range),
+        ValuePack::Fixed(range) => insert_reg_range(target, range),
         ValuePack::Open(reg) => *open_target = Some(reg),
     }
 }
@@ -270,7 +262,7 @@ fn insert_result_pack_def(
     pack: ResultPack,
 ) {
     match pack {
-        ResultPack::Fixed(range) => insert_reg_range_defs(target, range),
+        ResultPack::Fixed(range) => insert_reg_range(target, range),
         ResultPack::Open(reg) => *open_target = Some(reg),
         ResultPack::Ignore => {}
     }

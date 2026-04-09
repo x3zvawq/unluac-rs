@@ -641,7 +641,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let mut cond = if target == then_target {
             control_cond
         } else if target == else_target {
-            negate_expr(control_cond)
+            control_cond.negate()
         } else {
             return None;
         };
@@ -761,14 +761,4 @@ fn shared_target_expr_from_overrides(
             .flat_map(|incoming| incoming.defs.iter().copied()),
         target_overrides,
     )
-}
-
-fn negate_expr(expr: HirExpr) -> HirExpr {
-    match expr {
-        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => unary.expr,
-        expr => HirExpr::Unary(Box::new(HirUnaryExpr {
-            op: HirUnaryOpKind::Not,
-            expr,
-        })),
-    }
 }

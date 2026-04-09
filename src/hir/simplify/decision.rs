@@ -16,7 +16,7 @@ mod synthesize;
 
 use super::walk::{ExprRewritePass, rewrite_proto_exprs};
 use helpers::{
-    expr_is_boolean_valued, expr_truthiness, logical_and, logical_or, negate_expr,
+    expr_is_boolean_valued, expr_truthiness, logical_and, logical_or,
     simplify_condition_truthiness_shape, simplify_lua_logical_shape,
 };
 
@@ -688,7 +688,7 @@ fn combine_value_expr(
             (CollapsedValueTarget::Expr(lhs), CollapsedValueTarget::Expr(rhs))
                 if is_false(lhs) && is_true(rhs) =>
             {
-                return Some(negate_expr(subject));
+                return Some(subject.negate());
             }
             (CollapsedValueTarget::CurrentValue, CollapsedValueTarget::Expr(rhs))
                 if is_false(rhs) =>
@@ -716,7 +716,7 @@ fn combine_value_expr(
             if expr_truthiness(&lhs) == Some(true) {
                 Some(logical_or(logical_and(subject, lhs), rhs))
             } else if expr_truthiness(&rhs) == Some(true) {
-                Some(logical_or(logical_and(negate_expr(subject), rhs), lhs))
+                Some(logical_or(logical_and(subject.negate(), rhs), lhs))
             } else {
                 None
             }
@@ -786,18 +786,18 @@ fn combine_condition_expr(subject: HirExpr, truthy: HirExpr, falsy: HirExpr) -> 
         return logical_and(subject, truthy);
     }
     if is_false(&truthy) && is_true(&falsy) {
-        return negate_expr(subject);
+        return subject.negate();
     }
     if is_false(&truthy) {
-        return logical_and(negate_expr(subject), falsy);
+        return logical_and(subject.negate(), falsy);
     }
     if is_true(&falsy) {
-        return logical_or(negate_expr(subject), truthy);
+        return logical_or(subject.negate(), truthy);
     }
 
     logical_or(
         logical_and(subject.clone(), truthy),
-        logical_and(negate_expr(subject), falsy),
+        logical_and(subject.negate(), falsy),
     )
 }
 

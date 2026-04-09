@@ -20,9 +20,11 @@ pub struct HirProto {
     pub line_range: ProtoLineRange,
     pub signature: ProtoSignature,
     pub params: Vec<ParamId>,
+    pub param_debug_hints: Vec<Option<String>>,
     pub locals: Vec<LocalId>,
     pub local_debug_hints: Vec<Option<String>>,
     pub upvalues: Vec<UpvalueId>,
+    pub upvalue_debug_hints: Vec<Option<String>>,
     pub temps: Vec<TempId>,
     pub temp_debug_locals: Vec<Option<String>>,
     pub body: HirBlock,
@@ -146,6 +148,19 @@ pub enum HirExpr {
     TableConstructor(Box<HirTableConstructor>),
     Closure(Box<HirClosureExpr>),
     Unresolved(Box<HirUnresolvedExpr>),
+}
+
+impl HirExpr {
+    /// 对表达式取逻辑否定，自动消除双重 `not`。
+    pub fn negate(self) -> Self {
+        match self {
+            HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => unary.expr,
+            expr => HirExpr::Unary(Box::new(HirUnaryExpr {
+                op: HirUnaryOpKind::Not,
+                expr,
+            })),
+        }
+    }
 }
 
 /// HIR 赋值左值。

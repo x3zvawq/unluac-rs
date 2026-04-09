@@ -6,7 +6,7 @@
 //! 选择策略，也只需要在这一处收紧语义边界。
 
 use crate::hir::common::{
-    HirBinaryOpKind, HirDecisionTarget, HirExpr, HirLogicalExpr, HirUnaryExpr, HirUnaryOpKind,
+    HirBinaryOpKind, HirDecisionTarget, HirExpr, HirLogicalExpr, HirUnaryOpKind,
 };
 
 pub(super) fn logical_and(lhs: HirExpr, rhs: HirExpr) -> HirExpr {
@@ -22,16 +22,6 @@ pub(super) fn logical_or(lhs: HirExpr, rhs: HirExpr) -> HirExpr {
         lhs
     } else {
         HirExpr::LogicalOr(Box::new(HirLogicalExpr { lhs, rhs }))
-    }
-}
-
-pub(super) fn negate_expr(expr: HirExpr) -> HirExpr {
-    match expr {
-        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => unary.expr,
-        expr => HirExpr::Unary(Box::new(HirUnaryExpr {
-            op: HirUnaryOpKind::Not,
-            expr,
-        })),
     }
 }
 
