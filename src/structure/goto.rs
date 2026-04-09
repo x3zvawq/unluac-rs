@@ -42,24 +42,24 @@ pub(super) fn analyze_goto_requirements(
         }
 
         if let Some(continue_target) = loop_candidate.continue_target {
-            let numeric_for_tail_carries_body = loop_candidate.kind_hint
-                == LoopKindHint::NumericForLike
-                && block_has_non_control_prefix(proto, cfg, continue_target);
+            // numeric-for 和 repeat-until 的 continue target block 可能在 terminator
+            // 前面挂着属于 loop body tail 的普通语句（如 state carry 或 body 尾部
+            // 计算）。这些前缀不是循环控制，跳到 block 开头只是让 branch merge 回
+            // body tail 的自然路径，语义上不是 continue。
+            //
+            // generic-for 的 continue target 是 header（GenericForCall +
+            // GenericForLoop）。这里的前缀 GenericForCall 是循环控制的一部分（调用
+            // 迭代器），跳到 header 等价于"重新迭代"，所以仍应视为 continue。
+            let tail_carries_body = matches!(
+                loop_candidate.kind_hint,
+                LoopKindHint::NumericForLike | LoopKindHint::RepeatLike
+            ) && block_has_non_control_prefix(proto, cfg, continue_target);
             for block in &loop_candidate.blocks {
                 for edge_ref in &cfg.succs[block.index()] {
                     let edge = cfg.edges[edge_ref.index()];
-                    // 顺着线性 body tail 自然落到 continue target 的边，本质上还是
-                    // 当前循环的正常执行路径，不应该被提前标成 continue-like requirement。
-                    // 这里保留的只应该是“主动提前跳到 continue target”的控制边，
-                    // 这样 HIR 才能区分自然 fallthrough 和真正的 continue 语义。
-                    //
-                    // numeric-for 的 continue target 是 `FORLOOP` 所在 block。本来如果这个
-                    // block 前面还挂着普通 low-IR 指令，那它就已经是 loop tail 的一部分：
-                    // 提前跳到 block 开头仍会执行这些语句，语义上不是 `continue`，只是
-                    // branch 正常 merge 回 tail。像 `branch_state_carry` 这类 case 必须在
-                    // facts 层把它排除掉，不能等 HIR 再兜底。
+
                     if edge.to == continue_target
-                        && !numeric_for_tail_carries_body
+                        && !tail_carries_body
                         && !loop_candidate.backedges.contains(edge_ref)
                         && edge.kind != EdgeKind::Fallthrough
                         && cfg.reachable_blocks.contains(&edge.from)
