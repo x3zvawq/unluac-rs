@@ -140,7 +140,7 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
         let mut node = original.clone();
 
         if let HirDecisionTarget::Node(child_ref) = &node.truthy
-            && nodes[child_ref.index()].test == node.test
+            && nodes.get(child_ref.index()).is_some_and(|child| child.test == node.test)
         {
             node.truthy = resolve_child_branch(&nodes, &replacements, *child_ref, true);
         } else {
@@ -148,7 +148,7 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
         }
 
         if let HirDecisionTarget::Node(child_ref) = &node.falsy
-            && nodes[child_ref.index()].test == node.test
+            && nodes.get(child_ref.index()).is_some_and(|child| child.test == node.test)
         {
             node.falsy = resolve_child_branch(&nodes, &replacements, *child_ref, false);
         } else {
@@ -183,7 +183,7 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
         nodes[index] = node;
     }
 
-    let root = if let Some(replacement) = &replacements[decision.entry.index()] {
+    let root = if let Some(Some(replacement)) = replacements.get(decision.entry.index()) {
         replacement.clone()
     } else {
         ResolvedDecisionTarget::Node(decision.entry)
@@ -339,7 +339,9 @@ impl<'a> DecisionSpecializer<'a> {
             return result.clone();
         }
 
-        let node = &self.decision.nodes[node_ref.index()];
+        let Some(node) = self.decision.nodes.get(node_ref.index()) else {
+            return ResolvedDecisionTarget::Node(node_ref);
+        };
         let result = if let Some(known_truthy) = known_truthiness_from_facts(&node.test, facts) {
             let chosen = if known_truthy {
                 &node.truthy
@@ -518,7 +520,7 @@ fn resolve_target_for_parent(
 ) -> HirDecisionTarget {
     match target {
         HirDecisionTarget::Node(node_ref) => {
-            if let Some(replacement) = &replacements[node_ref.index()] {
+            if let Some(Some(replacement)) = replacements.get(node_ref.index()) {
                 replacement_as_target(replacement)
             } else {
                 HirDecisionTarget::Node(*node_ref)
@@ -535,8 +537,9 @@ fn resolve_target_in_node_context(
     target: &HirDecisionTarget,
 ) -> ResolvedDecisionTarget {
     match target {
-        HirDecisionTarget::Node(node_ref) => replacements[node_ref.index()]
-            .clone()
+        HirDecisionTarget::Node(node_ref) => replacements
+            .get(node_ref.index())
+            .and_then(|r| r.clone())
             .unwrap_or(ResolvedDecisionTarget::Node(*node_ref)),
         HirDecisionTarget::CurrentValue => ResolvedDecisionTarget::Expr(node.test.clone()),
         HirDecisionTarget::Expr(expr) => ResolvedDecisionTarget::Expr(expr.clone()),
@@ -549,7 +552,9 @@ fn resolve_child_branch(
     child_ref: HirDecisionNodeRef,
     truthy: bool,
 ) -> HirDecisionTarget {
-    let child = &nodes[child_ref.index()];
+    let Some(child) = nodes.get(child_ref.index()) else {
+        return HirDecisionTarget::Node(child_ref);
+    };
     let branch = if truthy { &child.truthy } else { &child.falsy };
     replacement_as_target(&resolve_target_in_node_context(replacements, child, branch))
 }
@@ -570,9 +575,10 @@ fn rebuild_decision(entry: HirDecisionNodeRef, nodes: &[HirDecisionNode]) -> Hir
         if !visited.insert(node_ref) {
             continue;
         }
+        let Some(node) = nodes.get(node_ref.index()) else {
+            continue;
+        };
         reachable.push(node_ref);
-
-        let node = &nodes[node_ref.index()];
         for target in [&node.truthy, &node.falsy] {
             if let HirDecisionTarget::Node(next_ref) = target {
                 worklist.push_back(*next_ref);
@@ -588,14 +594,14 @@ fn rebuild_decision(entry: HirDecisionNodeRef, nodes: &[HirDecisionNode]) -> Hir
 
     let rebuilt_nodes = reachable
         .into_iter()
-        .map(|old_ref| {
-            let old = &nodes[old_ref.index()];
-            HirDecisionNode {
+        .filter_map(|old_ref| {
+            let old = nodes.get(old_ref.index())?;
+            Some(HirDecisionNode {
                 id: remap[&old_ref],
                 test: old.test.clone(),
                 truthy: remap_target(&old.truthy, &remap),
                 falsy: remap_target(&old.falsy, &remap),
-            }
+            })
         })
         .collect::<Vec<_>>();
 
@@ -810,13 +816,19 @@ fn is_false(expr: &HirExpr) -> bool {
 }
 
 pub(in crate::hir) fn decision_has_shared_nodes(decision: &HirDecisionExpr) -> bool {
+    if decision.nodes.is_empty() || decision.entry.index() >= decision.nodes.len() {
+        return false;
+    }
+
     let mut incoming = vec![0usize; decision.nodes.len()];
     incoming[decision.entry.index()] += 1;
 
     for node in &decision.nodes {
         for target in [&node.truthy, &node.falsy] {
-            if let HirDecisionTarget::Node(node_ref) = target {
-                incoming[node_ref.index()] += 1;
+            if let HirDecisionTarget::Node(node_ref) = target
+                && let Some(count) = incoming.get_mut(node_ref.index())
+            {
+                *count += 1;
             }
         }
     }
@@ -863,10 +875,10 @@ pub(in crate::hir) fn decision_has_cycles(decision: &HirDecisionExpr) -> bool {
             let HirDecisionTarget::Node(next_ref) = target else {
                 continue;
             };
-            match states[next_ref.index()] {
-                VisitState::Done => {}
-                VisitState::Visiting => return true,
-                VisitState::Unvisited => stack.push((*next_ref, false)),
+            match states.get(next_ref.index()) {
+                Some(VisitState::Done) | None => {}
+                Some(VisitState::Visiting) => return true,
+                Some(VisitState::Unvisited) => stack.push((*next_ref, false)),
             }
         }
     }

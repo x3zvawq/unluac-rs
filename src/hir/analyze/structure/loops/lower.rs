@@ -43,7 +43,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stmts: &mut Vec<HirStmt>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Option<BlockRef>> {
-        let preheader = unique_loop_preheader(candidate)?;
+        let preheader = unique_loop_preheader(candidate);
         let (body_entry, branch_exit) =
             loop_branch_body_and_exit(self.lowering, candidate.header, &candidate.blocks)?;
         let exit = branch_exit;
@@ -92,7 +92,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stmts: &mut Vec<HirStmt>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Option<BlockRef>> {
-        let preheader = unique_loop_preheader(candidate)?;
+        let preheader = unique_loop_preheader(candidate);
         let continue_block = candidate.continue_target?;
         let (loop_backedge_target, exit) =
             loop_branch_body_and_exit(self.lowering, continue_block, &candidate.blocks)?;
@@ -195,7 +195,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .get(&header)
             .copied()?;
         let plan =
-            self.build_loop_state_plan(candidate, block, exit, &[init.index], target_overrides)?;
+            self.build_loop_state_plan(candidate, Some(block), exit, &[init.index], target_overrides)?;
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
         let mut suppressed = plan
@@ -308,7 +308,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .map(|offset| Reg(loop_instr.bindings.start.index() + offset)),
         );
         let plan =
-            self.build_loop_state_plan(candidate, block, exit, &excluded_regs, target_overrides)?;
+            self.build_loop_state_plan(candidate, Some(block), exit, &excluded_regs, target_overrides)?;
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
 

@@ -15,14 +15,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     pub(super) fn build_loop_state_plan(
         &self,
         candidate: &LoopCandidate,
-        preheader: BlockRef,
+        preheader: Option<BlockRef>,
         exit: BlockRef,
         excluded_regs: &[Reg],
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<LoopStatePlan> {
-        // loop header 的 phi 在 HIR 里需要被“拆 SSA”成稳定的循环状态变量。
+        // loop header 的 phi 在 HIR 里需要被"拆 SSA"成稳定的循环状态变量。
         // 这里先把进入循环前的初值、回边写回目标和退出循环后的可见身份一次性整理好，
-        // 避免后面再靠局部规则去猜“这个 phi 其实是 while/repeat/for 的状态”。
+        // 避免后面再靠局部规则去猜"这个 phi 其实是 while/repeat/for 的状态"。
         let excluded = excluded_regs.iter().copied().collect::<BTreeSet<_>>();
         let mut plan = LoopStatePlan::default();
 
@@ -31,7 +31,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 continue;
             }
 
-            let init = self.loop_entry_expr(preheader, value, target_overrides)?;
+            let init = self.loop_entry_expr(preheader?, value, target_overrides)?;
             let temp = *self.lowering.bindings.phi_temps.get(value.phi_id.index())?;
             let target = self.loop_state_target(candidate, exit, value.reg, temp, target_overrides);
             plan.backedge_target_overrides.insert(temp, target.clone());
@@ -570,7 +570,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 continue;
             }
             for def in &self.lowering.dataflow.instr_defs[instr_index] {
-                let Some(mut expr) = expr_for_dup_safe_fixed_def(self.lowering, *def) else {
+                let Some(mut expr) = expr_for_fixed_def(self.lowering, *def) else {
                     continue;
                 };
                 rewrite_expr_temps(&mut expr, &expr_overrides);

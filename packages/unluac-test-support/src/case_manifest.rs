@@ -171,6 +171,14 @@ pub(crate) const ALL_CASES: &[LuaCaseMatrixEntry] = &[
         ALL_DIALECTS,
     ),
     LuaCaseMatrixEntry::new(
+        "tests/lua_cases/common/control_flow/09_repeat_cond_prefix.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/lua_cases/common/control_flow/10_while_call_condition.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
         "tests/lua_cases/common/edge_cases/01_return_truncation.lua",
         ALL_DIALECTS,
     ),

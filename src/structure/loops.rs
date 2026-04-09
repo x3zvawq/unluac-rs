@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cfg::{BlockRef, Cfg, DataflowFacts, EdgeRef, GraphFacts};
-use crate::transformer::{LowInstr, LoweredProto, Reg};
+use crate::transformer::{LowInstr, LoweredProto, Reg, ResultPack};
 
 use super::common::{
     LoopCandidate, LoopExitValueMergeCandidate, LoopKindHint, LoopSourceBindings, LoopValueMerge,
@@ -299,20 +299,29 @@ fn block_is_while_header_like(
     })
 }
 
+/// while 条件求值中不可能出现的指令。这些指令要么是控制流终结指令（已由
+/// terminator 位置单独处理），要么是纯副作用写出指令（SetUpvalue / SetTable /
+/// SetList），要么是 scope 管理指令（Close / Tbc），不可能出现在 Lua 编译器
+/// 为 expression 上下文生成的条件求值序列里。
+///
+/// 使用排除列表而非允许列表，避免新增 LowInstr 变体时遗漏导致合法的 while
+/// 条件被误判为 repeat/unknown。
 fn instr_is_while_header_prefix(instr: &LowInstr) -> bool {
-    matches!(
+    !matches!(
         instr,
-        LowInstr::Move(_)
-            | LowInstr::LoadNil(_)
-            | LowInstr::LoadBool(_)
-            | LowInstr::LoadConst(_)
-            | LowInstr::LoadInteger(_)
-            | LowInstr::LoadNumber(_)
-            | LowInstr::UnaryOp(_)
-            | LowInstr::BinaryOp(_)
-            | LowInstr::Concat(_)
-            | LowInstr::GetUpvalue(_)
-            | LowInstr::GetTable(_)
+        LowInstr::SetUpvalue(_)
+            | LowInstr::SetTable(_)
+            | LowInstr::SetList(_)
+            | LowInstr::TailCall(_)
+            | LowInstr::Return(_)
+            | LowInstr::Close(_)
+            | LowInstr::Tbc(_)
+            | LowInstr::NumericForInit(_)
+            | LowInstr::NumericForLoop(_)
+            | LowInstr::GenericForCall(_)
+            | LowInstr::GenericForLoop(_)
+            | LowInstr::Jump(_)
+            | LowInstr::Branch(_)
     )
 }
 
@@ -331,16 +340,18 @@ fn instr_writes_any_reg(instr: &LowInstr, regs: &BTreeSet<Reg>) -> bool {
         LowInstr::Concat(instr) => regs.contains(&instr.dst),
         LowInstr::GetUpvalue(instr) => regs.contains(&instr.dst),
         LowInstr::GetTable(instr) => regs.contains(&instr.dst),
+        LowInstr::NewTable(instr) => regs.contains(&instr.dst),
+        LowInstr::Closure(instr) => regs.contains(&instr.dst),
+        LowInstr::Call(instr) => result_pack_writes_any_reg(&instr.results, regs),
+        LowInstr::VarArg(instr) => result_pack_writes_any_reg(&instr.results, regs),
+        // ErrNil 只读 subject 不写寄存器。
+        LowInstr::ErrNil(_) => false,
+        // 以下指令要么不写寄存器，要么已被 instr_is_while_header_prefix 排除。
         LowInstr::SetUpvalue(_)
         | LowInstr::SetTable(_)
-        | LowInstr::ErrNil(_)
-        | LowInstr::NewTable(_)
         | LowInstr::SetList(_)
-        | LowInstr::Call(_)
         | LowInstr::TailCall(_)
-        | LowInstr::VarArg(_)
         | LowInstr::Return(_)
-        | LowInstr::Closure(_)
         | LowInstr::Close(_)
         | LowInstr::Tbc(_)
         | LowInstr::NumericForInit(_)
@@ -349,6 +360,20 @@ fn instr_writes_any_reg(instr: &LowInstr, regs: &BTreeSet<Reg>) -> bool {
         | LowInstr::GenericForLoop(_)
         | LowInstr::Jump(_)
         | LowInstr::Branch(_) => false,
+    }
+}
+
+fn result_pack_writes_any_reg(results: &ResultPack, regs: &BTreeSet<Reg>) -> bool {
+    match results {
+        ResultPack::Fixed(range) => (0..range.len)
+            .map(|offset| Reg(range.start.index() + offset))
+            .any(|reg| regs.contains(&reg)),
+        // Open result pack 从 start 开始向高位扩展，保守地检查 start 本身。
+        // 实际 while 条件求值中 open pack 极少出现，但如果出现则 start 之后的
+        // 所有寄存器理论上都可能被写入——这里保守处理即可，因为 carried_regs
+        // 通常只包含少量低位循环变量。
+        ResultPack::Open(start) => regs.iter().any(|reg| reg.index() >= start.index()),
+        ResultPack::Ignore => false,
     }
 }
 
