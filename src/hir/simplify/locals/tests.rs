@@ -96,20 +96,16 @@ fn promotes_if_merge_temp_into_local_decl() {
     ));
 
     assert_eq!(module.protos[0].locals.len(), 1);
+    // 后处理把 `local l0; if cond then l0=41 else l0=7 end` 直接折成了值表达式
     assert!(
         matches!(
             module.protos[0].body.stmts.as_slice(),
             [
                 HirStmt::LocalDecl(local_decl),
-                HirStmt::If(if_stmt),
                 HirStmt::Return(ret),
             ]
                 if matches!(local_decl.bindings.as_slice(), [LocalId(0)])
-                    && local_decl.values.is_empty()
-                    && matches!(if_stmt.then_block.stmts.as_slice(), [HirStmt::Assign(assign)]
-                        if matches!(assign.targets.as_slice(), [HirLValue::Local(LocalId(0))]))
-                    && matches!(if_stmt.else_block.as_ref().map(|block| block.stmts.as_slice()), Some([HirStmt::Assign(assign)])
-                        if matches!(assign.targets.as_slice(), [HirLValue::Local(LocalId(0))]))
+                    && local_decl.values.len() == 1
                     && matches!(ret.values.as_slice(), [HirExpr::LocalRef(LocalId(0))])
         ),
         "{:#?}",
@@ -422,4 +418,181 @@ fn proto_with_temps(id: HirProtoRef, body: HirBlock, temp_count: usize) -> HirPr
         body,
         children: Vec::new(),
     }
+}
+
+// ── branch-value fold 后处理测试 ──────────────────────────────────────
+
+#[test]
+fn fold_collapses_branch_assigned_local_into_initializer_expr() {
+    let mut stmts = vec![
+        HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![LocalId(0)],
+            values: vec![],
+        })),
+        HirStmt::If(Box::new(HirIf {
+            cond: HirExpr::ParamRef(crate::hir::common::ParamId(0)),
+            then_block: HirBlock {
+                stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(LocalId(0))],
+                    values: vec![HirExpr::String("neg".to_owned())],
+                }))],
+            },
+            else_block: Some(HirBlock {
+                stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(LocalId(0))],
+                    values: vec![HirExpr::String("pos".to_owned())],
+                }))],
+            }),
+        })),
+        HirStmt::Return(Box::new(HirReturn {
+            values: vec![HirExpr::LocalRef(LocalId(0))],
+        })),
+    ];
+
+    assert!(fold_branch_value_locals_in_block(&mut stmts));
+    assert!(matches!(
+        stmts.as_slice(),
+        [HirStmt::LocalDecl(local_decl), HirStmt::Return(_)]
+            if matches!(local_decl.bindings.as_slice(), [LocalId(0)])
+                && local_decl.values.len() == 1
+    ));
+}
+
+#[test]
+fn fold_keeps_branch_local_when_cond_reads_binding() {
+    let mut stmts = vec![
+        HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![LocalId(0)],
+            values: vec![],
+        })),
+        HirStmt::If(Box::new(HirIf {
+            cond: HirExpr::Binary(Box::new(crate::hir::common::HirBinaryExpr {
+                op: crate::hir::common::HirBinaryOpKind::Eq,
+                lhs: HirExpr::LocalRef(LocalId(0)),
+                rhs: HirExpr::Nil,
+            })),
+            then_block: HirBlock {
+                stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(LocalId(0))],
+                    values: vec![HirExpr::String("neg".to_owned())],
+                }))],
+            },
+            else_block: Some(HirBlock {
+                stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(LocalId(0))],
+                    values: vec![HirExpr::String("pos".to_owned())],
+                }))],
+            }),
+        })),
+    ];
+
+    assert!(!fold_branch_value_locals_in_block(&mut stmts));
+    assert_eq!(stmts.len(), 2);
+}
+
+#[test]
+fn fold_keeps_branch_local_when_decision_cannot_collapse() {
+    use crate::hir::common::{HirCallExpr, HirGlobalRef};
+
+    let mut stmts = vec![
+        HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![LocalId(0)],
+            values: vec![],
+        })),
+        HirStmt::If(Box::new(HirIf {
+            cond: HirExpr::ParamRef(crate::hir::common::ParamId(0)),
+            then_block: HirBlock {
+                stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(LocalId(0))],
+                    values: vec![HirExpr::Call(Box::new(HirCallExpr {
+                        callee: HirExpr::GlobalRef(HirGlobalRef {
+                            name: "truthy_branch".to_owned(),
+                        }),
+                        args: vec![],
+                        multiret: false,
+                        method: false,
+                        method_name: None,
+                    }))],
+                }))],
+            },
+            else_block: Some(HirBlock {
+                stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(LocalId(0))],
+                    values: vec![HirExpr::Call(Box::new(HirCallExpr {
+                        callee: HirExpr::GlobalRef(HirGlobalRef {
+                            name: "falsy_branch".to_owned(),
+                        }),
+                        args: vec![],
+                        multiret: false,
+                        method: false,
+                        method_name: None,
+                    }))],
+                }))],
+            }),
+        })),
+    ];
+
+    assert!(!fold_branch_value_locals_in_block(&mut stmts));
+    assert_eq!(stmts.len(), 2);
+}
+
+// ── adjacent local-assign merge 后处理测试 ────────────────────────────
+
+#[test]
+fn merge_combines_empty_local_decl_with_adjacent_assign() {
+    let mut stmts = vec![
+        HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![LocalId(0)],
+            values: vec![],
+        })),
+        HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Local(LocalId(0))],
+            values: vec![HirExpr::Integer(42)],
+        })),
+        HirStmt::Return(Box::new(HirReturn {
+            values: vec![HirExpr::LocalRef(LocalId(0))],
+        })),
+    ];
+
+    assert!(merge_adjacent_local_assigns_in_block(&mut stmts));
+    assert!(matches!(
+        stmts.as_slice(),
+        [HirStmt::LocalDecl(local_decl), HirStmt::Return(_)]
+            if matches!(local_decl.bindings.as_slice(), [LocalId(0)])
+                && matches!(local_decl.values.as_slice(), [HirExpr::Integer(42)])
+    ));
+}
+
+#[test]
+fn merge_skips_when_assign_target_does_not_match() {
+    let mut stmts = vec![
+        HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![LocalId(0)],
+            values: vec![],
+        })),
+        HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Local(LocalId(1))],
+            values: vec![HirExpr::Integer(42)],
+        })),
+    ];
+
+    assert!(!merge_adjacent_local_assigns_in_block(&mut stmts));
+    assert_eq!(stmts.len(), 2);
+}
+
+#[test]
+fn merge_skips_already_initialized_local_decl() {
+    let mut stmts = vec![
+        HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![LocalId(0)],
+            values: vec![HirExpr::Nil],
+        })),
+        HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Local(LocalId(0))],
+            values: vec![HirExpr::Integer(42)],
+        })),
+    ];
+
+    assert!(!merge_adjacent_local_assigns_in_block(&mut stmts));
+    assert_eq!(stmts.len(), 2);
 }

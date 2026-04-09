@@ -20,6 +20,7 @@ use crate::hir::common::{
     HirUnaryExpr, HirUnaryOpKind, LocalId, TempId,
 };
 
+use super::expr_facts::{expr_is_boolean_valued, expr_is_side_effect_free};
 use super::visit::{HirVisitor, visit_proto};
 use super::walk::{HirRewritePass, rewrite_proto};
 
@@ -209,20 +210,6 @@ fn booleanized_truthiness_expr(cond: HirExpr) -> HirExpr {
     }
 }
 
-fn expr_is_boolean_valued(expr: &HirExpr) -> bool {
-    match expr {
-        HirExpr::Boolean(_) => true,
-        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => true,
-        HirExpr::Binary(binary) => matches!(
-            binary.op,
-            crate::hir::common::HirBinaryOpKind::Eq
-                | crate::hir::common::HirBinaryOpKind::Lt
-                | crate::hir::common::HirBinaryOpKind::Le
-        ),
-        _ => false,
-    }
-}
-
 fn collect_temp_use_counts(proto: &HirProto) -> BTreeMap<TempId, usize> {
     let mut collector = TempUseCollector::default();
     visit_proto(proto, &mut collector);
@@ -239,50 +226,6 @@ impl HirVisitor for TempUseCollector {
         if let HirExpr::TempRef(temp) = expr {
             *self.use_counts.entry(*temp).or_default() += 1;
         }
-    }
-}
-
-fn expr_is_side_effect_free(expr: &HirExpr) -> bool {
-    match expr {
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::GlobalRef(_) => true,
-        HirExpr::Unary(unary) => expr_is_side_effect_free(&unary.expr),
-        HirExpr::Binary(binary) => {
-            expr_is_side_effect_free(&binary.lhs) && expr_is_side_effect_free(&binary.rhs)
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            expr_is_side_effect_free(&logical.lhs) && expr_is_side_effect_free(&logical.rhs)
-        }
-        HirExpr::Decision(decision) => decision.nodes.iter().all(|node| {
-            expr_is_side_effect_free(&node.test)
-                && decision_target_is_side_effect_free(&node.truthy)
-                && decision_target_is_side_effect_free(&node.falsy)
-        }),
-        HirExpr::TableAccess(_)
-        | HirExpr::Call(_)
-        | HirExpr::VarArg
-        | HirExpr::TableConstructor(_)
-        | HirExpr::Closure(_)
-        | HirExpr::Unresolved(_) => false,
-    }
-}
-
-fn decision_target_is_side_effect_free(target: &crate::hir::common::HirDecisionTarget) -> bool {
-    match target {
-        crate::hir::common::HirDecisionTarget::Node(_)
-        | crate::hir::common::HirDecisionTarget::CurrentValue => true,
-        crate::hir::common::HirDecisionTarget::Expr(expr) => expr_is_side_effect_free(expr),
     }
 }
 

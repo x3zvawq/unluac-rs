@@ -15,6 +15,10 @@
 //! - `x or x` 会折成 `x`
 //! - 它不会把一般 `if/branch` 结构强行改写成逻辑表达式，那仍然属于更前面的结构恢复职责
 
+use super::expr_facts::{
+    expr_is_side_effect_free, expr_truthiness, fold_associative_duplicate_and,
+    fold_associative_duplicate_or,
+};
 use super::walk::{ExprRewritePass, rewrite_proto_exprs};
 use crate::hir::common::{HirExpr, HirLogicalExpr, HirProto};
 
@@ -111,30 +115,6 @@ fn simplify_logical_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
             // `(x and y) or x == x` 在 Lua 值语义下也严格成立：
             // 当 `x` 为假时，左边退化成 `x`；当 `x` 为真时，右边短路保留 `x`。
             HirExpr::LogicalAnd(inner) if rhs == &inner.lhs || rhs == &inner.rhs => {
-                Some(rhs.clone())
-            }
-            _ => None,
-        },
-    }
-}
-
-fn fold_associative_duplicate_and(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
-    match lhs {
-        HirExpr::LogicalAnd(inner) if rhs == &inner.lhs || rhs == &inner.rhs => Some(lhs.clone()),
-        _ => match rhs {
-            HirExpr::LogicalAnd(inner) if lhs == &inner.lhs || lhs == &inner.rhs => {
-                Some(rhs.clone())
-            }
-            _ => None,
-        },
-    }
-}
-
-fn fold_associative_duplicate_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
-    match lhs {
-        HirExpr::LogicalOr(inner) if rhs == &inner.lhs || rhs == &inner.rhs => Some(lhs.clone()),
-        _ => match rhs {
-            HirExpr::LogicalOr(inner) if lhs == &inner.lhs || lhs == &inner.rhs => {
                 Some(rhs.clone())
             }
             _ => None,
@@ -337,79 +317,6 @@ fn strip_negation(expr: &HirExpr) -> Option<HirExpr> {
             Some(unary.expr.clone())
         }
         _ => None,
-    }
-}
-
-fn expr_truthiness(expr: &HirExpr) -> Option<bool> {
-    match expr {
-        HirExpr::Nil | HirExpr::Boolean(false) => Some(false),
-        HirExpr::Boolean(true)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::Closure(_)
-        | HirExpr::TableConstructor(_) => Some(true),
-        HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::TableAccess(_)
-        | HirExpr::Unary(_)
-        | HirExpr::Binary(_)
-        | HirExpr::LogicalAnd(_)
-        | HirExpr::LogicalOr(_)
-        | HirExpr::Decision(_)
-        | HirExpr::Call(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => None,
-    }
-}
-
-fn expr_is_side_effect_free(expr: &HirExpr) -> bool {
-    match expr {
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::GlobalRef(_) => true,
-        HirExpr::Unary(unary) => expr_is_side_effect_free(&unary.expr),
-        HirExpr::Binary(binary) => {
-            expr_is_side_effect_free(&binary.lhs) && expr_is_side_effect_free(&binary.rhs)
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            expr_is_side_effect_free(&logical.lhs) && expr_is_side_effect_free(&logical.rhs)
-        }
-        HirExpr::Decision(decision) => decision.nodes.iter().all(|node| {
-            expr_is_side_effect_free(&node.test)
-                && decision_target_is_side_effect_free(&node.truthy)
-                && decision_target_is_side_effect_free(&node.falsy)
-        }),
-        HirExpr::TableAccess(_)
-        | HirExpr::Call(_)
-        | HirExpr::VarArg
-        | HirExpr::TableConstructor(_)
-        | HirExpr::Closure(_)
-        | HirExpr::Unresolved(_) => false,
-    }
-}
-
-fn decision_target_is_side_effect_free(target: &crate::hir::common::HirDecisionTarget) -> bool {
-    match target {
-        crate::hir::common::HirDecisionTarget::Node(_)
-        | crate::hir::common::HirDecisionTarget::CurrentValue => true,
-        crate::hir::common::HirDecisionTarget::Expr(expr) => expr_is_side_effect_free(expr),
     }
 }
 

@@ -15,9 +15,9 @@ mod helpers;
 mod synthesize;
 
 use super::walk::{ExprRewritePass, rewrite_proto_exprs};
+use super::expr_facts::{expr_is_boolean_valued, expr_truthiness};
 use helpers::{
-    expr_is_boolean_valued, expr_truthiness, logical_and, logical_or,
-    simplify_condition_truthiness_shape, simplify_lua_logical_shape,
+    logical_and, logical_or, simplify_condition_truthiness_shape, simplify_lua_logical_shape,
 };
 
 use crate::hir::common::{

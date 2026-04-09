@@ -1,13 +1,16 @@
 //! 这个文件承载 decision simplify 共享的表达式辅助逻辑。
 //!
-//! `decision.rs`、`eliminate.rs` 和 `synthesize.rs` 都会用到“Lua truthiness 判断”、
-//! “逻辑短路形状整理”以及“基础逻辑表达式构造”这些共通能力。把它们集中到这里的
-//! 目的是避免三处各写一套近似实现，后续如果我们继续打磨 `Decision -> Expr`
-//! 选择策略，也只需要在这一处收紧语义边界。
+//! `decision.rs`、`eliminate.rs` 和 `synthesize.rs` 都会用到"逻辑短路形状整理"以及
+//! "基础逻辑表达式构造"这些共通能力。把它们集中到这里的目的是避免三处各写一套
+//! 近似实现，后续如果我们继续打磨 `Decision -> Expr` 选择策略，也只需要在这一处
+//! 收紧语义边界。
+//!
+//! 纯表达式谓词（truthiness、side-effect-free、boolean-valued）和基础的关联重复
+//! 折叠已迁移到 `super::super::expr_facts`，这里只保留 decision 专属的逻辑构造
+//! 和条件上下文整理。
 
-use crate::hir::common::{
-    HirBinaryOpKind, HirDecisionTarget, HirExpr, HirLogicalExpr, HirUnaryOpKind,
-};
+use super::super::expr_facts::{fold_associative_duplicate_and, fold_associative_duplicate_or};
+use crate::hir::common::{HirExpr, HirLogicalExpr};
 
 pub(super) fn logical_and(lhs: HirExpr, rhs: HirExpr) -> HirExpr {
     if lhs == rhs {
@@ -22,57 +25,6 @@ pub(super) fn logical_or(lhs: HirExpr, rhs: HirExpr) -> HirExpr {
         lhs
     } else {
         HirExpr::LogicalOr(Box::new(HirLogicalExpr { lhs, rhs }))
-    }
-}
-
-pub(super) fn expr_truthiness(expr: &HirExpr) -> Option<bool> {
-    match expr {
-        HirExpr::Nil => Some(false),
-        HirExpr::Boolean(value) => Some(*value),
-        HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::Closure(_)
-        | HirExpr::TableConstructor(_) => Some(true),
-        HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::TableAccess(_)
-        | HirExpr::Unary(_)
-        | HirExpr::Binary(_)
-        | HirExpr::LogicalAnd(_)
-        | HirExpr::LogicalOr(_)
-        | HirExpr::Decision(_)
-        | HirExpr::Call(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => None,
-    }
-}
-
-pub(super) fn expr_is_boolean_valued(expr: &HirExpr) -> bool {
-    match expr {
-        HirExpr::Boolean(_) => true,
-        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => true,
-        HirExpr::Binary(binary) => matches!(
-            binary.op,
-            HirBinaryOpKind::Eq | HirBinaryOpKind::Lt | HirBinaryOpKind::Le
-        ),
-        HirExpr::Decision(decision) => decision.nodes.iter().all(|node| {
-            decision_target_is_boolean(&node.truthy) && decision_target_is_boolean(&node.falsy)
-        }),
-        _ => false,
-    }
-}
-
-fn decision_target_is_boolean(target: &HirDecisionTarget) -> bool {
-    match target {
-        HirDecisionTarget::Node(_) | HirDecisionTarget::CurrentValue => false,
-        HirDecisionTarget::Expr(expr) => expr_is_boolean_valued(expr),
     }
 }
 
@@ -136,30 +88,6 @@ fn simplify_logical_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
         HirExpr::LogicalAnd(inner) if lhs == &inner.lhs => Some(lhs.clone()),
         _ => match lhs {
             HirExpr::LogicalAnd(inner) if rhs == &inner.lhs || rhs == &inner.rhs => {
-                Some(rhs.clone())
-            }
-            _ => None,
-        },
-    }
-}
-
-fn fold_associative_duplicate_and(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
-    match lhs {
-        HirExpr::LogicalAnd(inner) if rhs == &inner.lhs || rhs == &inner.rhs => Some(lhs.clone()),
-        _ => match rhs {
-            HirExpr::LogicalAnd(inner) if lhs == &inner.lhs || lhs == &inner.rhs => {
-                Some(rhs.clone())
-            }
-            _ => None,
-        },
-    }
-}
-
-fn fold_associative_duplicate_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
-    match lhs {
-        HirExpr::LogicalOr(inner) if rhs == &inner.lhs || rhs == &inner.rhs => Some(lhs.clone()),
-        _ => match rhs {
-            HirExpr::LogicalOr(inner) if lhs == &inner.lhs || lhs == &inner.rhs => {
                 Some(rhs.clone())
             }
             _ => None,

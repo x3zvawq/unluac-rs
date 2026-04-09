@@ -6,13 +6,13 @@
 //! 是细节实现”的混淆。
 
 mod boolean_shells;
-mod branch_value_exprs;
 mod carried_locals;
 mod close_scopes;
 mod closure_self_capture;
 mod dead_labels;
 mod dead_temps;
 pub(super) mod decision;
+mod expr_facts;
 mod locals;
 mod logical_simplify;
 mod residuals;
@@ -122,12 +122,6 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         depends_on: &[TempChain, LocalBinding, BlockStructure],
         invalidates: &[LocalBinding, TempChain],
     },
-    PassDescriptor {
-        name: "branch-value-exprs",
-        phase: PassPhase::Normal,
-        depends_on: &[LocalBinding],
-        invalidates: &[LocalBinding, TempChain],
-    },
     // ── Deferred phase ──
     PassDescriptor {
         name: "eliminate-decisions",
@@ -192,12 +186,11 @@ pub(super) fn simplify_hir_with_timing(
                         4 => closure_self_capture::resolve_recursive_closure_self_captures_in_proto(proto),
                         5 => temp_inline::inline_temps_in_proto_with_facts(proto, readability, facts),
                         6 => locals::promote_temps_to_locals_in_proto_with_facts(proto, facts),
-                        7 => branch_value_exprs::collapse_branch_value_locals_in_proto(proto),
-                        8 => decision::eliminate_remaining_decisions_in_proto(proto),
-                        9 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
-                        10 => carried_locals::collapse_carried_local_handoffs_in_proto(proto),
-                        11 => dead_temps::remove_dead_temp_materializations_in_proto(proto),
-                        12 => dead_labels::remove_unused_labels_in_proto(proto),
+                        7 => decision::eliminate_remaining_decisions_in_proto(proto),
+                        8 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
+                        9 => carried_locals::collapse_carried_local_handoffs_in_proto(proto),
+                        10 => dead_temps::remove_dead_temp_materializations_in_proto(proto),
+                        11 => dead_labels::remove_unused_labels_in_proto(proto),
                         _ => unreachable!("invalid HIR pass index: {index}"),
                     }
                 })

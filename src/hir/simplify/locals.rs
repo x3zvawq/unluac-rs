@@ -8,12 +8,20 @@
 //! 另外，如果某个 local 已经被 closure capture 观察到，后续来自同一寄存器槽位的
 //! 新 def 不该再长成新的 local，而应继续写回原绑定。否则 closure 会继续指向旧 local，
 //! 后半段写回却被拆到新绑定里，直接改掉源码语义。
+//!
+//! 提升完成后，同一个 block 里还会执行两步后处理：
+//! 1. branch-value 折叠：`local X; if cond then X=a else X=b end` → `local X = expr`
+//! 2. 相邻 local-assign 合并：`local X; X = expr` → `local X = expr`
+//!
+//! 这两步原先分别在独立的 `branch_value_exprs` pass 和 AST `statement_merge` 里执行，
+//! 整合到提升出口后可以减少跨 pass 迭代和跨层机械修补。
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::visit::{HirVisitor, visit_expr, visit_stmts};
 use crate::hir::common::{
-    HirAssign, HirBlock, HirCallExpr, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt,
+    HirAssign, HirBlock, HirCallExpr, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef,
+    HirDecisionTarget, HirExpr, HirIf, HirLValue, HirLocalDecl, HirProto, HirStmt,
     HirTableConstructor, HirTableField, HirTableKey, LocalId, TempId,
 };
 use crate::hir::promotion::ProtoPromotionFacts;
@@ -221,10 +229,201 @@ fn promote_block(
     }
 
     block.stmts = rewritten;
+
+    // 后处理：把 `local X; if cond then X=a else X=b end` 收回值表达式
+    changed |= fold_branch_value_locals_in_block(&mut block.stmts);
+    // 后处理：把相邻的 `local X; X = expr` 合并成 `local X = expr`
+    changed |= merge_adjacent_local_assigns_in_block(&mut block.stmts);
+
     PromotionResult {
         changed,
         trailing_mapping: mapping,
     }
+}
+
+// ── 后处理：branch-value-local 折叠 ──────────────────────────────────
+
+/// 扫描 block 中的 `local X; if cond then X=a else X=b end` 形状，
+/// 尝试把它收回 `local X = cond and a or b` 一类的值表达式。
+///
+/// 这里的规则和原 `branch_value_exprs` pass 完全一致，只是执行时机从独立的 Normal
+/// pass 前移到 `locals` 提升完成的收尾阶段，避免跨 pass 多轮迭代。
+fn fold_branch_value_locals_in_block(stmts: &mut Vec<HirStmt>) -> bool {
+    let mut changed = false;
+    let mut index = 1;
+
+    while index < stmts.len() {
+        let Some((binding, value)) =
+            collapsible_branch_value_local(&stmts[index - 1], &stmts[index])
+        else {
+            index += 1;
+            continue;
+        };
+
+        stmts[index - 1] = HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![binding],
+            values: vec![value],
+        }));
+        stmts.remove(index);
+        changed = true;
+    }
+
+    changed
+}
+
+fn collapsible_branch_value_local(
+    local_decl_stmt: &HirStmt,
+    if_stmt: &HirStmt,
+) -> Option<(LocalId, HirExpr)> {
+    let binding = empty_single_local_decl_binding(local_decl_stmt)?;
+    let if_stmt = single_binding_value_if(if_stmt, binding)?;
+    let value = branch_value_expr(binding, if_stmt)?;
+    Some((binding, value))
+}
+
+fn branch_value_expr(binding: LocalId, if_stmt: &HirIf) -> Option<HirExpr> {
+    let (truthy, falsy) = branch_assign_values(if_stmt, binding)?;
+    if expr_mentions_local(&if_stmt.cond, binding)
+        || expr_mentions_local(truthy, binding)
+        || expr_mentions_local(falsy, binding)
+    {
+        return None;
+    }
+
+    let decision = HirDecisionExpr {
+        entry: HirDecisionNodeRef(0),
+        nodes: vec![HirDecisionNode {
+            id: HirDecisionNodeRef(0),
+            test: if_stmt.cond.clone(),
+            truthy: HirDecisionTarget::Expr(truthy.clone()),
+            falsy: HirDecisionTarget::Expr(falsy.clone()),
+        }],
+    };
+    let value = crate::hir::decision::finalize_value_decision_expr(decision);
+    (!matches!(value, HirExpr::Decision(_))).then_some(value)
+}
+
+fn branch_assign_values(if_stmt: &HirIf, binding: LocalId) -> Option<(&HirExpr, &HirExpr)> {
+    let [HirStmt::Assign(then_assign)] = if_stmt.then_block.stmts.as_slice() else {
+        return None;
+    };
+    let else_block = if_stmt.else_block.as_ref()?;
+    let [HirStmt::Assign(else_assign)] = else_block.stmts.as_slice() else {
+        return None;
+    };
+    let [then_target] = then_assign.targets.as_slice() else {
+        return None;
+    };
+    let [then_value] = then_assign.values.as_slice() else {
+        return None;
+    };
+    let [else_target] = else_assign.targets.as_slice() else {
+        return None;
+    };
+    let [else_value] = else_assign.values.as_slice() else {
+        return None;
+    };
+    if !matches_local_lvalue(then_target, binding) || !matches_local_lvalue(else_target, binding) {
+        return None;
+    }
+    Some((then_value, else_value))
+}
+
+fn single_binding_value_if(stmt: &HirStmt, binding: LocalId) -> Option<&HirIf> {
+    let HirStmt::If(if_stmt) = stmt else {
+        return None;
+    };
+    let _ = branch_assign_values(if_stmt, binding)?;
+    Some(if_stmt)
+}
+
+fn empty_single_local_decl_binding(stmt: &HirStmt) -> Option<LocalId> {
+    let HirStmt::LocalDecl(local_decl) = stmt else {
+        return None;
+    };
+    let [binding] = local_decl.bindings.as_slice() else {
+        return None;
+    };
+    local_decl.values.is_empty().then_some(*binding)
+}
+
+fn matches_local_lvalue(target: &HirLValue, binding: LocalId) -> bool {
+    matches!(target, HirLValue::Local(local) if *local == binding)
+}
+
+fn expr_mentions_local(expr: &HirExpr, binding: LocalId) -> bool {
+    let mut visitor = LocalMentionVisitor {
+        binding,
+        mentioned: false,
+    };
+    super::visit::visit_expr(expr, &mut visitor);
+    visitor.mentioned
+}
+
+struct LocalMentionVisitor {
+    binding: LocalId,
+    mentioned: bool,
+}
+
+impl HirVisitor for LocalMentionVisitor {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        self.mentioned |= matches!(expr, HirExpr::LocalRef(local) if *local == self.binding);
+    }
+}
+
+// ── 后处理：相邻 local-assign 合并 ───────────────────────────────────
+
+/// 扫描 block 中相邻的 `local X; X = expr` 形状，合并成 `local X = expr`。
+///
+/// 这对应 AST readability `statement_merge` 的 `try_merge_local_decl_with_assign` 规则，
+/// 在 HIR 层提前执行可以减少流到 AST 层的机械拆分数量。
+fn merge_adjacent_local_assigns_in_block(stmts: &mut Vec<HirStmt>) -> bool {
+    let mut changed = false;
+    let mut index = 0;
+
+    while index + 1 < stmts.len() {
+        let Some(merged) = try_merge_empty_local_with_assign(&stmts[index], &stmts[index + 1])
+        else {
+            index += 1;
+            continue;
+        };
+
+        stmts[index] = HirStmt::LocalDecl(Box::new(merged));
+        stmts.remove(index + 1);
+        changed = true;
+    }
+
+    changed
+}
+
+fn try_merge_empty_local_with_assign(
+    decl_stmt: &HirStmt,
+    assign_stmt: &HirStmt,
+) -> Option<HirLocalDecl> {
+    let HirStmt::LocalDecl(local_decl) = decl_stmt else {
+        return None;
+    };
+    let HirStmt::Assign(assign) = assign_stmt else {
+        return None;
+    };
+    if !local_decl.values.is_empty() || local_decl.bindings.is_empty() {
+        return None;
+    }
+    if local_decl.bindings.len() != assign.targets.len() || assign.values.is_empty() {
+        return None;
+    }
+    if !local_decl
+        .bindings
+        .iter()
+        .zip(assign.targets.iter())
+        .all(|(binding, target)| matches_local_lvalue(target, *binding))
+    {
+        return None;
+    }
+    Some(HirLocalDecl {
+        bindings: local_decl.bindings.clone(),
+        values: assign.values.clone(),
+    })
 }
 
 fn collect_plans(
