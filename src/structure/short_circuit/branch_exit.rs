@@ -85,7 +85,25 @@ pub(super) fn analyze_linear_branch_exit_candidates(
             current = next;
         }
 
-        let Some(exit) = infer_linear_branch_exit(proto, cfg, &headers) else {
+        // If the full chain fails at `infer_linear_branch_exit`, the last block
+        // might be a body block mistakenly included because it is also a branch
+        // candidate. Detect this by checking whether every preceding header has
+        // the last header as one of its truthy/falsy targets (i.e. it is the
+        // common short-circuit exit). Only trim in that case to avoid producing
+        // spurious candidates elsewhere.
+        let mut exit = infer_linear_branch_exit(proto, cfg, &headers);
+        if exit.is_none() && headers.len() >= 3 {
+            let last = *headers.last().unwrap();
+            let is_common_exit = headers[..headers.len() - 1].iter().all(|h| {
+                truthy_falsy_targets(proto, cfg, *h)
+                    .is_some_and(|(t, f)| t == last || f == last)
+            });
+            if is_common_exit {
+                headers.pop();
+                exit = infer_linear_branch_exit(proto, cfg, &headers);
+            }
+        }
+        let Some(exit) = exit else {
             continue;
         };
         let Some(nodes) = build_linear_branch_exit_nodes(proto, cfg, &headers, &exit) else {

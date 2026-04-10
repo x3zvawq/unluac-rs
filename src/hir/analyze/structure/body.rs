@@ -593,7 +593,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if consumed_headers.len() == 1 && self.branch_by_header.contains_key(&header) {
             return Some(None);
         }
-
+        // 当 then_entry 恰好等于当前 scope 的 stop 时，short-circuit 的 then 体会
+        // 被 branch_stop_for_region 截断为空，同时 merge (falsy) 又超出 stop 所在
+        // 作用域——此时 consumed_headers 会提前吞掉 stop block 的 visit 标记，
+        // 导致外层 merge 回来后发现该 block 已经被 visit、结构化失败。
+        // 遇到这种情况直接回退到 plain branch 即可。
+        if let Some(stop) = stop {
+            if truthy == stop && falsy != stop {
+                return Some(None);
+            }
+        }
         if stop == Some(falsy) || self.lowering.cfg.can_reach(truthy, falsy) {
             return Some(Some(StructuredBranchPlan {
                 cond,

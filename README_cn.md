@@ -250,4 +250,4 @@ wasm 绑定层位于 [packages/unluac-wasm](./packages/unluac-wasm)。
 ## 鸣谢
 
 - [metaworms's lua decompiler](https://luadec.metaworm.site) - 本项目的设计与实现受到了它的启发，作者的教程也提供了很多帮助。当前该网站已经无法访问。
-- Codex + GPT-5.4 - 本项目有大量代码由 Codex 和 GPT-5.4 生成，感谢 OpenAI 提供的强大工具。
+- 本项目部分代码由 GPT-5.4 以及 Claude Opus 4.6 生成。
