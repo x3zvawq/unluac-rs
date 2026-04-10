@@ -101,13 +101,17 @@ pub(super) fn collect_region_predecessors_to_target(
         .collect()
 }
 
+/// 收集从 `entry` 出发到 `merge` 之间所有直接到达 `merge` 的前驱 block。
+///
+/// 不使用 entry 作为支配约束根——当条件表达式存在短路求值时，外层块可能有
+/// 直接跳入 entry 后续区域的边，导致 entry 并不支配所有 then-arm 内的 block。
+/// stop-at-merge 已经足够限制搜索范围，不会越界到 merge 之后。
 pub(super) fn collect_merge_arm_preds(
     cfg: &Cfg,
-    dom_tree: &DominatorTree,
     entry: BlockRef,
     merge: BlockRef,
 ) -> BTreeSet<BlockRef> {
-    let blocks = collect_forward_region_blocks(cfg, [entry], Some(merge), Some((entry, dom_tree)));
+    let blocks = collect_forward_region_blocks(cfg, [entry], Some(merge), None);
     collect_region_predecessors_to_target(cfg, &blocks, merge)
 }
 

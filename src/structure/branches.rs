@@ -65,14 +65,13 @@ pub(super) fn analyze_branch_regions(
             ),
             then_merge_preds: collect_merge_arm_preds(
                 cfg,
-                &graph_facts.dominator_tree,
                 candidate.then_entry,
                 merge,
             ),
             else_merge_preds: candidate
                 .else_entry
                 .map(|else_entry| {
-                    collect_merge_arm_preds(cfg, &graph_facts.dominator_tree, else_entry, merge)
+                    collect_merge_arm_preds(cfg, else_entry, merge)
                 })
                 .unwrap_or_default(),
         });

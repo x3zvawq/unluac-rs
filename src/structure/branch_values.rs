@@ -22,7 +22,7 @@ use super::phi_facts::branch_value_merges_in_block;
 
 pub(super) fn analyze_branch_value_merges(
     cfg: &Cfg,
-    graph_facts: &GraphFacts,
+    _graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
     branch_regions: &[BranchRegionFact],
     short_circuit_candidates: &[ShortCircuitCandidate],
@@ -46,7 +46,6 @@ pub(super) fn analyze_branch_value_merges(
 
     candidates.extend(analyze_guard_short_circuit_branch_value_merges(
         cfg,
-        graph_facts,
         dataflow,
         short_circuit_candidates,
     ));
@@ -57,7 +56,6 @@ pub(super) fn analyze_branch_value_merges(
 
 fn analyze_guard_short_circuit_branch_value_merges(
     cfg: &Cfg,
-    graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
     short_circuit_candidates: &[ShortCircuitCandidate],
 ) -> Vec<BranchValueMergeCandidate> {
@@ -80,7 +78,7 @@ fn analyze_guard_short_circuit_branch_value_merges(
                 continue;
             };
 
-        let then_preds = collect_merge_arm_preds(cfg, &graph_facts.dominator_tree, body, merge);
+        let then_preds = collect_merge_arm_preds(cfg, body, merge);
         let else_preds = short.branch_exit_leaf_preds(!body_is_truthy);
         if then_preds.is_empty() || else_preds.is_empty() || !then_preds.is_disjoint(&else_preds) {
             continue;
@@ -106,13 +104,23 @@ fn analyze_branch_value_merge_candidate(
     branch_region: &BranchRegionFact,
     short_circuit_merges: &BTreeSet<(BlockRef, BlockRef, Option<crate::transformer::Reg>)>,
 ) -> Option<BranchValueMergeCandidate> {
-    if branch_region.kind != BranchKind::IfElse {
-        return None;
-    }
-
     let merge = branch_region.merge;
     let then_preds = &branch_region.then_merge_preds;
-    let else_preds = &branch_region.else_merge_preds;
+
+    // IfElse：两臂的 merge predecessors 分别来自 then/else 侧。
+    // IfThen：只有 then 侧有 merge preds，else 侧相当于 header 直接跳到 merge。
+    // 需要用 header 作为 else_preds，这样 phi 的"保留当前值"语义才能被正确捕获。
+    // Guard：暂不处理值合流。
+    let header_as_else_preds;
+    let else_preds = match branch_region.kind {
+        BranchKind::IfElse => &branch_region.else_merge_preds,
+        BranchKind::IfThen => {
+            header_as_else_preds = BTreeSet::from([branch_region.header]);
+            &header_as_else_preds
+        }
+        BranchKind::Guard => return None,
+    };
+
     if then_preds.is_empty() || else_preds.is_empty() || !then_preds.is_disjoint(else_preds) {
         return None;
     }

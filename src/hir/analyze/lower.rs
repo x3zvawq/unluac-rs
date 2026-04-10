@@ -364,7 +364,22 @@ pub(super) fn lower_phi_materialization_with_allowed_blocks_except(
         let value =
             recover_short_value_merge_expr_with_allowed_blocks(lowering, short, allowed_blocks)
                 .unwrap_or_else(|| {
-                    unresolved_expr(format!("phi block=#{} reg=r{}", merge.index(), reg.index()))
+                    // 短路恢复失败时，兜底用支配者出口值近似。
+                    lowering
+                        .graph_facts
+                        .dominator_tree
+                        .parent
+                        .get(merge.index())
+                        .copied()
+                        .flatten()
+                        .map(|idom| expr_for_reg_at_block_exit(lowering, idom, reg))
+                        .unwrap_or_else(|| {
+                            unresolved_expr(format!(
+                                "phi block=#{} reg=r{}",
+                                merge.index(),
+                                reg.index()
+                            ))
+                        })
                 });
         stmts.push(assign_stmt(vec![HirLValue::Temp(temp)], vec![value]));
     }
@@ -379,11 +394,28 @@ pub(super) fn lower_phi_materialization_with_allowed_blocks_except(
                     .phi_temps
                     .get(phi.phi_id.index())
                     .copied()?;
-                let value = unresolved_expr(format!(
-                    "phi block=#{} reg=r{}",
-                    phi.block.index(),
-                    phi.reg.index()
-                ));
+                // 兜底策略：用 phi 所在 block 的直接支配者出口处的寄存器值
+                // 作为近似恢复。这是控制流分歧前的"初始值"——在大多数
+                // "部分路径赋值、其余路径保留原值"的模式下语义正确。
+                // 只有当所有到达路径都各自赋了不同的值、且没有被
+                // branch_value_merge / short_circuit / loop 任何一种
+                // 专用 pass 认领时，这个近似才可能偏离原始语义，但仍比
+                // unresolved_expr（直接输出 nil + 错误注释）好得多。
+                let value = lowering
+                    .graph_facts
+                    .dominator_tree
+                    .parent
+                    .get(phi.block.index())
+                    .copied()
+                    .flatten()
+                    .map(|idom| expr_for_reg_at_block_exit(lowering, idom, phi.reg))
+                    .unwrap_or_else(|| {
+                        unresolved_expr(format!(
+                            "phi block=#{} reg=r{}",
+                            phi.block.index(),
+                            phi.reg.index()
+                        ))
+                    });
                 Some(assign_stmt(vec![HirLValue::Temp(temp)], vec![value]))
             }),
     );
