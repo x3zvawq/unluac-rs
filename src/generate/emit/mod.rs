@@ -40,6 +40,9 @@ enum Assoc {
     Left,
     Right,
     Non,
+    /// Fully associative: `a op (b op c)` == `(a op b) op c`, so no
+    /// parentheses are needed on either side at the same precedence level.
+    Full,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -29,6 +29,7 @@ pub(super) fn maybe_parenthesize(
             Assoc::Left => matches!(side, ExprSide::Right),
             Assoc::Right => matches!(side, ExprSide::Left),
             Assoc::Non => !matches!(side, ExprSide::Standalone),
+            Assoc::Full => false,
         }
     };
     if needs_parens {

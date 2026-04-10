@@ -172,7 +172,7 @@ impl<'a> Emitter<'a> {
                 (
                     Doc::concat([lhs, Doc::text(" and "), rhs]),
                     PREC_AND,
-                    Assoc::Left,
+                    Assoc::Full,
                 )
             }
             AstExpr::LogicalOr(logical) => {
@@ -181,7 +181,7 @@ impl<'a> Emitter<'a> {
                 (
                     Doc::concat([lhs, Doc::text(" or "), rhs]),
                     PREC_OR,
-                    Assoc::Left,
+                    Assoc::Full,
                 )
             }
             AstExpr::Call(call) => (
