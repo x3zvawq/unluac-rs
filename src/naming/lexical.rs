@@ -327,7 +327,7 @@ fn collect_stmt_context(
                 scopes,
             )?;
         }
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => {}
+        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => {}
     }
     Ok(())
 }

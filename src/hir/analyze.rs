@@ -17,6 +17,7 @@ use self::lower::{ChildAnalyses, LowerArtifacts, lower_proto};
 use super::simplify::simplify_hir;
 use crate::cfg::{CfgGraph, DataflowFacts, GraphFacts};
 use crate::hir::common::HirModule;
+use crate::generate::GenerateMode;
 use crate::readability::ReadabilityOptions;
 use crate::structure::StructureFacts;
 use crate::timing::TimingCollector;
@@ -30,6 +31,7 @@ use self::lower::{
 };
 
 /// 对整个 lowered chunk 递归构造 HIR。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn analyze_hir(
     chunk: &LoweredChunk,
     cfg_graph: &CfgGraph,
@@ -38,6 +40,7 @@ pub(crate) fn analyze_hir(
     structure: &StructureFacts,
     timings: &TimingCollector,
     readability: ReadabilityOptions,
+    generate_mode: GenerateMode,
 ) -> HirModule {
     let child_analyses = ChildAnalyses {
         cfg_graphs: &cfg_graph.children,
@@ -68,6 +71,7 @@ pub(crate) fn analyze_hir(
             readability,
             timings,
             &artifacts.promotion_facts,
+            generate_mode,
         );
     });
     module

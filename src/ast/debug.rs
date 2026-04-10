@@ -248,6 +248,9 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock, names: &Func
                 );
                 let _ = writeln!(output, "{indent}end");
             }
+            AstStmt::Error(message) => {
+                let _ = writeln!(output, "{indent}-- [unluac error] {message}");
+            }
         }
     }
 }
@@ -364,6 +367,7 @@ fn format_expr(expr: &AstExpr, indent: &str, names: &FunctionRenderNames) -> Str
             format!("{{{fields}}}")
         }
         AstExpr::FunctionExpr(function) => format_function_expr(function, indent),
+        AstExpr::Error(message) => format!("nil --[[ [unluac error] {message} ]]"),
     }
 }
 
@@ -695,7 +699,7 @@ fn collect_function_render_names_in_stmt(
         AstStmt::LocalFunctionDecl(local_function_decl) => {
             collect_binding_ref(local_function_decl.name, max_local, synthetic_locals);
         }
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => {}
+        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => {}
     }
 }
 
@@ -817,7 +821,7 @@ fn collect_function_render_names_in_expr(
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
-        | AstExpr::VarArg => {}
+        | AstExpr::VarArg | AstExpr::Error(_) => {}
     }
 }
 

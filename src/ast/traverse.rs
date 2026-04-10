@@ -163,7 +163,8 @@ macro_rules! traverse_expr_children {
             | crate::ast::AstExpr::UInt64(_)
             | crate::ast::AstExpr::Complex { .. }
             | crate::ast::AstExpr::Var(_)
-            | crate::ast::AstExpr::VarArg => {}
+            | crate::ast::AstExpr::VarArg
+            | crate::ast::AstExpr::Error(_) => {}
         }
     }};
 }
@@ -283,7 +284,8 @@ macro_rules! traverse_stmt_children {
             crate::ast::AstStmt::Break
             | crate::ast::AstStmt::Continue
             | crate::ast::AstStmt::Goto(_)
-            | crate::ast::AstStmt::Label(_) => {}
+            | crate::ast::AstStmt::Label(_)
+            | crate::ast::AstStmt::Error(_) => {}
         }
     }};
 }

@@ -278,7 +278,7 @@ fn count_binding_uses_in_stmt_with_scope(
                 0
             }
         }
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => 0,
+        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => 0,
     }
 }
 
@@ -362,7 +362,7 @@ fn collect_binding_uses_in_stmt_with_scope(
                 collect_binding_uses_in_block_with_scope(&function_decl.func.body, scope, counts);
             }
         }
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => {}
+        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => {}
     }
 }
 
@@ -429,7 +429,7 @@ fn count_binding_mentions_in_stmt(stmt: &AstStmt, binding: AstBindingRef) -> usi
         }
         AstStmt::DoBlock(block) => count_binding_mentions_in_block(block, binding),
         AstStmt::FunctionDecl(_) | AstStmt::LocalFunctionDecl(_) => 0,
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => 0,
+        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => 0,
     }
 }
 
@@ -586,7 +586,7 @@ fn count_binding_uses_in_expr_with_scope(
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg => 0,
+        | AstExpr::VarArg | AstExpr::Error(_) => 0,
     }
 }
 
@@ -662,7 +662,7 @@ fn collect_binding_uses_in_expr_with_scope(
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
-        | AstExpr::VarArg => {}
+        | AstExpr::VarArg | AstExpr::Error(_) => {}
     }
 }
 
@@ -740,7 +740,7 @@ pub(super) fn stmt_references_any_binding(stmt: &AstStmt, bindings: &[AstLocalBi
         AstStmt::LocalFunctionDecl(function_decl) => bindings
             .iter()
             .any(|binding| binding.id == function_decl.name),
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => false,
+        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => false,
     }
 }
 
@@ -802,7 +802,7 @@ pub(super) fn expr_references_any_binding(expr: &AstExpr, bindings: &[AstLocalBi
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
-        | AstExpr::VarArg => false,
+        | AstExpr::VarArg | AstExpr::Error(_) => false,
     }
 }
 

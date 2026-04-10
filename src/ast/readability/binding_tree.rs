@@ -70,7 +70,7 @@ pub(super) fn expr_references_binding(expr: &AstExpr, binding: AstBindingRef) ->
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
-        | AstExpr::VarArg => false,
+        | AstExpr::VarArg | AstExpr::Error(_) => false,
     }
 }
 
@@ -161,7 +161,7 @@ pub(super) fn count_name_expr_uses(expr: &AstExpr, binding: AstBindingRef) -> us
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg => 0,
+        | AstExpr::VarArg | AstExpr::Error(_) => 0,
     }
 }
 
@@ -238,7 +238,7 @@ pub(super) fn replace_binding_use_in_expr(
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg => false,
+        | AstExpr::VarArg | AstExpr::Error(_) => false,
     }
 }
 
@@ -297,7 +297,7 @@ pub(super) fn rewrite_binding_in_stmt(stmt: &mut AstStmt, from: AstBindingRef, t
         }
         AstStmt::DoBlock(block) => rewrite_binding_in_stmts(&mut block.stmts, from, to),
         AstStmt::FunctionDecl(_) | AstStmt::LocalFunctionDecl(_) => {}
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => {}
+        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => {}
     }
 }
 
@@ -347,7 +347,7 @@ pub(super) fn stmt_mentions_binding_target(stmt: &AstStmt, binding: AstBindingRe
         | AstStmt::Break
         | AstStmt::Continue
         | AstStmt::Goto(_)
-        | AstStmt::Label(_) => false,
+        | AstStmt::Label(_) | AstStmt::Error(_) => false,
     }
 }
 
@@ -396,7 +396,7 @@ pub(super) fn stmt_has_nested_binding_use(stmt: &AstStmt, binding: AstBindingRef
         | AstStmt::Break
         | AstStmt::Continue
         | AstStmt::Goto(_)
-        | AstStmt::Label(_) => false,
+        | AstStmt::Label(_) | AstStmt::Error(_) => false,
     }
 }
 
@@ -447,7 +447,7 @@ pub(super) fn stmt_has_access_base_binding_use(stmt: &AstStmt, binding: AstBindi
         | AstStmt::Break
         | AstStmt::Continue
         | AstStmt::Goto(_)
-        | AstStmt::Label(_) => false,
+        | AstStmt::Label(_) | AstStmt::Error(_) => false,
     }
 }
 
@@ -496,7 +496,7 @@ pub(super) fn stmt_has_index_binding_use(stmt: &AstStmt, binding: AstBindingRef)
         | AstStmt::Break
         | AstStmt::Continue
         | AstStmt::Goto(_)
-        | AstStmt::Label(_) => false,
+        | AstStmt::Label(_) | AstStmt::Error(_) => false,
     }
 }
 
@@ -543,7 +543,7 @@ pub(super) fn stmt_has_direct_call_arg_binding_use(stmt: &AstStmt, binding: AstB
         | AstStmt::Break
         | AstStmt::Continue
         | AstStmt::Goto(_)
-        | AstStmt::Label(_) => false,
+        | AstStmt::Label(_) | AstStmt::Error(_) => false,
     }
 }
 
@@ -588,7 +588,7 @@ pub(super) fn stmt_has_call_callee_binding_use(stmt: &AstStmt, binding: AstBindi
         | AstStmt::Break
         | AstStmt::Continue
         | AstStmt::Goto(_)
-        | AstStmt::Label(_) => false,
+        | AstStmt::Label(_) | AstStmt::Error(_) => false,
     }
 }
 
@@ -631,7 +631,7 @@ pub(super) fn stmt_has_nested_binding_value_use(stmt: &AstStmt, binding: AstBind
         | AstStmt::Break
         | AstStmt::Continue
         | AstStmt::Goto(_)
-        | AstStmt::Label(_) => false,
+        | AstStmt::Label(_) | AstStmt::Error(_) => false,
     }
 }
 
@@ -834,7 +834,7 @@ fn expr_has_access_base_binding_use(
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg => false,
+        | AstExpr::VarArg | AstExpr::Error(_) => false,
     }
 }
 
@@ -890,7 +890,7 @@ fn expr_has_index_binding_use(expr: &AstExpr, binding: AstBindingRef, index: boo
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg => false,
+        | AstExpr::VarArg | AstExpr::Error(_) => false,
     }
 }
 
@@ -937,7 +937,7 @@ fn expr_has_direct_call_arg_binding_use(expr: &AstExpr, binding: AstBindingRef) 
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg => false,
+        | AstExpr::VarArg | AstExpr::Error(_) => false,
     }
 }
 
@@ -1000,7 +1000,7 @@ fn expr_has_call_callee_binding_use(
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
-        | AstExpr::VarArg => false,
+        | AstExpr::VarArg | AstExpr::Error(_) => false,
     }
 }
 
@@ -1056,7 +1056,7 @@ fn expr_has_nested_binding_use(expr: &AstExpr, binding: AstBindingRef, nested: b
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg => false,
+        | AstExpr::VarArg | AstExpr::Error(_) => false,
     }
 }
 
@@ -1140,7 +1140,7 @@ fn rewrite_binding_in_expr(expr: &mut AstExpr, from: AstBindingRef, to: AstBindi
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
-        | AstExpr::VarArg => {}
+        | AstExpr::VarArg | AstExpr::Error(_) => {}
     }
 }
 

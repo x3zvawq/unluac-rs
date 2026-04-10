@@ -173,7 +173,8 @@ fn does_not_promote_single_use_numeric_for_header_temps_into_locals() {
         crate::readability::ReadabilityOptions::default(),
         &crate::timing::TimingCollector::disabled(),
         &[],
-    );
+        crate::generate::GenerateMode::Strict,
+        );
 
     assert_eq!(module.protos[0].locals.len(), 1);
     assert!(matches!(
@@ -230,7 +231,8 @@ fn does_not_promote_self_referential_temp_update_inside_branch() {
         crate::readability::ReadabilityOptions::default(),
         &crate::timing::TimingCollector::disabled(),
         &[],
-    );
+        crate::generate::GenerateMode::Strict,
+        );
 
     assert!(matches!(
         module.protos[0].body.stmts.as_slice(),

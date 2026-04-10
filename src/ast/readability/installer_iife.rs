@@ -139,7 +139,7 @@ impl AstVisitor for SyntheticLocalCollector {
             | AstStmt::Break
             | AstStmt::Continue
             | AstStmt::Goto(_)
-            | AstStmt::Label(_) => {}
+            | AstStmt::Label(_) | AstStmt::Error(_) => {}
         }
     }
 
@@ -252,7 +252,8 @@ fn stmt_looks_like_installer_export(
         | AstStmt::Continue
         | AstStmt::Goto(_)
         | AstStmt::Label(_)
-        | AstStmt::DoBlock(_) => false,
+        | AstStmt::DoBlock(_)
+        | AstStmt::Error(_) => false,
     }
 }
 
@@ -324,6 +325,7 @@ fn expr_looks_like_exported_function_value(
         | AstExpr::MethodCall(_)
         | AstExpr::SingleValue(_)
         | AstExpr::VarArg
-        | AstExpr::TableConstructor(_) => false,
+        | AstExpr::TableConstructor(_)
+        | AstExpr::Error(_) => false,
     }
 }

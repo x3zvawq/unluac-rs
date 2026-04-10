@@ -21,7 +21,7 @@ pub(super) fn expr_complexity(expr: &AstExpr) -> usize {
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg => 1,
+        | AstExpr::VarArg | AstExpr::Error(_) => 1,
         AstExpr::Unary(unary) => 1 + expr_complexity(&unary.expr),
         AstExpr::Binary(binary) => 1 + expr_complexity(&binary.lhs) + expr_complexity(&binary.rhs),
         AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
@@ -92,7 +92,8 @@ pub(super) fn is_context_safe_expr(expr: &AstExpr) -> bool {
         | AstExpr::MethodCall(_)
         | AstExpr::VarArg
         | AstExpr::TableConstructor(_)
-        | AstExpr::FunctionExpr(_) => false,
+        | AstExpr::FunctionExpr(_)
+        | AstExpr::Error(_) => false,
     }
 }
 
@@ -141,7 +142,8 @@ pub(super) fn is_copy_like_expr(expr: &AstExpr) -> bool {
         | AstExpr::MethodCall(_)
         | AstExpr::VarArg
         | AstExpr::TableConstructor(_)
-        | AstExpr::FunctionExpr(_) => false,
+        | AstExpr::FunctionExpr(_)
+        | AstExpr::Error(_) => false,
     }
 }
 
@@ -174,7 +176,8 @@ pub(super) fn is_mechanical_run_inline_expr(expr: &AstExpr) -> bool {
         | AstExpr::MethodCall(_)
         | AstExpr::VarArg
         | AstExpr::TableConstructor(_)
-        | AstExpr::FunctionExpr(_) => false,
+        | AstExpr::FunctionExpr(_)
+        | AstExpr::Error(_) => false,
     }
 }
 
@@ -205,7 +208,7 @@ pub(super) fn is_always_truthy_expr(expr: &AstExpr) -> bool {
         | AstExpr::Call(_)
         | AstExpr::MethodCall(_)
         | AstExpr::SingleValue(_)
-        | AstExpr::VarArg => false,
+        | AstExpr::VarArg | AstExpr::Error(_) => false,
     }
 }
 

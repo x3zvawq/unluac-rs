@@ -281,7 +281,7 @@ fn stmt_allows_seed_to_absorb_carried(
             !function_name_references_binding(&function_decl.target, seed)
         }
         AstStmt::LocalFunctionDecl(function_decl) => function_decl.name != seed,
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => true,
+        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => true,
     }
 }
 
@@ -513,7 +513,7 @@ fn stmt_mentions_binding(stmt: &AstStmt, binding: AstBindingRef) -> bool {
             .iter()
             .any(|stmt| stmt_mentions_binding(stmt, binding)),
         AstStmt::FunctionDecl(_) | AstStmt::LocalFunctionDecl(_) => false,
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => false,
+        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => false,
     }
 }
 

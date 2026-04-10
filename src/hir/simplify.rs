@@ -22,6 +22,7 @@ mod traverse;
 mod visit;
 mod walk;
 
+use crate::generate::GenerateMode;
 use crate::hir::common::HirModule;
 use crate::hir::promotion::ProtoPromotionFacts;
 use crate::readability::ReadabilityOptions;
@@ -161,6 +162,7 @@ pub(super) fn simplify_hir(
     readability: ReadabilityOptions,
     timings: &TimingCollector,
     promotion_facts: &[ProtoPromotionFacts],
+    generate_mode: GenerateMode,
 ) {
     let empty_facts = ProtoPromotionFacts::default();
 
@@ -194,7 +196,7 @@ pub(super) fn simplify_hir(
     );
 
     let residuals = residuals::collect_hir_exit_residuals(module);
-    if residuals.has_soft_residuals() {
+    if residuals.has_soft_residuals() && generate_mode != GenerateMode::Permissive {
         residuals::emit_hir_warning(format!(
             "HIR exit still contains residual nodes: decision={}, unresolved={}, \
              fallback_unstructured={}, other_unstructured={}.",

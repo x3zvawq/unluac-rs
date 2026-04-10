@@ -212,6 +212,7 @@ impl DecompilerPipeline {
                 structure_facts,
                 &timings,
                 options.readability,
+                options.generate.mode,
             )
         });
         state.mark_completed(DecompileStage::Hir);
@@ -233,6 +234,7 @@ impl DecompilerPipeline {
             lower_ast(
                 hir,
                 ast_lowering_target(requested_target, options.generate.mode),
+                options.generate.mode,
             )
         }?);
         state.mark_completed(DecompileStage::Ast);

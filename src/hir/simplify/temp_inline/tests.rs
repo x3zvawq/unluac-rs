@@ -846,7 +846,8 @@ fn simplify_module_runs_until_fixed_point() {
         crate::readability::ReadabilityOptions::default(),
         &crate::timing::TimingCollector::disabled(),
         &[],
-    );
+        crate::generate::GenerateMode::Strict,
+        );
 
     assert!(matches!(
         &module.protos[0].body.stmts.as_slice(),

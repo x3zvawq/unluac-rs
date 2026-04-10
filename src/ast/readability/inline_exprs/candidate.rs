@@ -53,7 +53,7 @@ pub(super) fn stmt_is_adjacent_call_result_sink(stmt: &AstStmt) -> bool {
         | AstStmt::Break
         | AstStmt::Continue
         | AstStmt::Goto(_)
-        | AstStmt::Label(_) => false,
+        | AstStmt::Label(_) | AstStmt::Error(_) => false,
     }
 }
 
@@ -231,7 +231,7 @@ fn expr_contains_direct_call_callee_var(expr: &AstExpr) -> bool {
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg => false,
+        | AstExpr::VarArg | AstExpr::Error(_) => false,
     }
 }
 

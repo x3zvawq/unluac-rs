@@ -162,7 +162,8 @@ fn recover_method_call_sink(
         | AstStmt::LocalDecl(_)
         | AstStmt::GlobalDecl(_)
         | AstStmt::Assign(_)
-        | AstStmt::Return(_) => None,
+        | AstStmt::Return(_)
+        | AstStmt::Error(_) => None,
     })
 }
 
@@ -393,7 +394,8 @@ fn rewrite_single_method_alias_use(
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg
-        | AstExpr::FunctionExpr(_) => None,
+        | AstExpr::FunctionExpr(_)
+        | AstExpr::Error(_) => None,
     }
 }
 
@@ -669,7 +671,8 @@ where
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg
-        | AstExpr::FunctionExpr(_) => None,
+        | AstExpr::FunctionExpr(_)
+        | AstExpr::Error(_) => None,
     }
 }
 
@@ -790,7 +793,7 @@ fn rewrite_single_expr_sink_stmt(
         | AstStmt::Break
         | AstStmt::Continue
         | AstStmt::Goto(_)
-        | AstStmt::Label(_) => None,
+        | AstStmt::Label(_) | AstStmt::Error(_) => None,
     }
 }
 

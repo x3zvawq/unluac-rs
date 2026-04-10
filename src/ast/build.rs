@@ -6,6 +6,7 @@ mod patterns;
 
 use std::collections::BTreeSet;
 
+use crate::generate::GenerateMode;
 use crate::hir::{HirBlock, HirGenericFor, HirModule, HirStmt, TempId};
 
 use self::analysis::{
@@ -21,24 +22,40 @@ use super::common::{
 use super::error::AstLowerError;
 
 /// 对外的 AST lowering 入口。
-pub fn lower_ast(module: &HirModule, target: AstTargetDialect) -> Result<AstModule, AstLowerError> {
-    let mut lowerer = AstLowerer::new(module, target);
+///
+/// `generate_mode` 控制错误恢复行为：`Strict` 下任何 lowering 错误都直接上抛，
+/// 非严格模式下会把无法恢复的语句/表达式替换为 `AstStmt::Error` / `AstExpr::Error`
+/// 占位节点，最终在 Generate 阶段输出为 Lua 注释。
+pub fn lower_ast(
+    module: &HirModule,
+    target: AstTargetDialect,
+    generate_mode: GenerateMode,
+) -> Result<AstModule, AstLowerError> {
+    let mut lowerer = AstLowerer::new(module, target, generate_mode);
     lowerer.lower_module()
 }
 
 struct AstLowerer<'a> {
     module: &'a HirModule,
     target: AstTargetDialect,
+    generate_mode: GenerateMode,
     next_synthetic_label: usize,
 }
 
 impl<'a> AstLowerer<'a> {
-    fn new(module: &'a HirModule, target: AstTargetDialect) -> Self {
+    fn new(module: &'a HirModule, target: AstTargetDialect, generate_mode: GenerateMode) -> Self {
         Self {
             module,
             target,
+            generate_mode,
             next_synthetic_label: max_hir_label_id(module) + 1,
         }
+    }
+
+    /// 仅 Permissive 模式允许用 Error 占位节点替代失败的 lowering；
+    /// Strict 和 BestEffort 都会直接传播错误。
+    fn should_recover_errors(&self) -> bool {
+        self.generate_mode == GenerateMode::Permissive
     }
 
     fn lower_module(&mut self) -> Result<AstModule, AstLowerError> {
@@ -88,69 +105,93 @@ impl<'a> AstLowerer<'a> {
 
         let mut index = 0;
         while index < block.stmts.len() {
-            if let Some((stmt, consumed)) =
-                self.try_lower_global_decl(proto_index, &block.stmts, index)?
-            {
-                stmts.push(stmt);
-                index += consumed;
-                continue;
-            }
-
-            if let Some((stmt, consumed)) =
-                self.try_lower_local_close_decl(proto_index, &block.stmts, index)?
-            {
-                stmts.push(stmt);
-                index += consumed;
-                continue;
-            }
-
-            if let Some((stmt, consumed)) =
-                self.try_lower_generic_for_init(proto_index, &block.stmts, index, continue_target)?
-            {
-                stmts.push(stmt);
-                index += consumed;
-                continue;
-            }
-
-            if let Some((stmt, consumed)) =
-                self.try_lower_forwarded_multiret_call_stmt(proto_index, &block.stmts, index)?
-            {
-                stmts.push(stmt);
-                index += consumed;
-                continue;
-            }
-
-            if let Some((stmt, consumed)) =
-                self.try_lower_single_value_final_call_arg_stmt(proto_index, &block.stmts, index)?
-            {
-                stmts.push(stmt);
-                index += consumed;
-                continue;
-            }
-
-            if let Some((stmt, consumed)) =
-                self.try_lower_temp_close_decl(proto_index, &block.stmts, index)?
-            {
-                stmts.push(stmt);
-                index += consumed;
-                continue;
-            }
-
-            let stmt = match &block.stmts[index] {
-                HirStmt::LocalDecl(local_decl) => {
-                    AstStmt::LocalDecl(Box::new(self.lower_local_decl(proto_index, local_decl)?))
+            match self.lower_stmts_at(proto_index, block, index, continue_target) {
+                Ok((new_stmts, consumed)) => {
+                    stmts.extend(new_stmts);
+                    index += consumed;
                 }
-                HirStmt::Assign(assign) => {
-                    AstStmt::Assign(Box::new(self.lower_assign(proto_index, assign)?))
+                Err(err) if self.should_recover_errors() => {
+                    stmts.push(AstStmt::Error(err.to_string()));
+                    index += 1;
                 }
-                HirStmt::TableSetList(set_list) => {
-                    if set_list.trailing_multivalue.is_some() {
-                        return Err(AstLowerError::UnsupportedSetListTrailingMultivalue {
-                            proto: proto_index,
-                        });
-                    }
-                    let base = self.lower_expr(proto_index, &set_list.base)?;
-                    for (offset, value) in set_list.values.iter().enumerate() {
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(AstBlock { stmts })
+    }
+
+    /// 尝试对 `index` 位置起始的语句（们）进行 lowering。
+    ///
+    /// 返回 `(产出的 AstStmt 列表, 消耗的 HIR 语句数量)`。
+    fn lower_stmts_at(
+        &mut self,
+        proto_index: usize,
+        block: &HirBlock,
+        index: usize,
+        continue_target: Option<AstLabelId>,
+    ) -> Result<(Vec<AstStmt>, usize), AstLowerError> {
+        if let Some((stmt, consumed)) =
+            self.try_lower_global_decl(proto_index, &block.stmts, index)?
+        {
+            return Ok((vec![stmt], consumed));
+        }
+
+        if let Some((stmt, consumed)) =
+            self.try_lower_local_close_decl(proto_index, &block.stmts, index)?
+        {
+            return Ok((vec![stmt], consumed));
+        }
+
+        if let Some((stmt, consumed)) =
+            self.try_lower_generic_for_init(proto_index, &block.stmts, index, continue_target)?
+        {
+            return Ok((vec![stmt], consumed));
+        }
+
+        if let Some((stmt, consumed)) =
+            self.try_lower_forwarded_multiret_call_stmt(proto_index, &block.stmts, index)?
+        {
+            return Ok((vec![stmt], consumed));
+        }
+
+        if let Some((stmt, consumed)) =
+            self.try_lower_single_value_final_call_arg_stmt(proto_index, &block.stmts, index)?
+        {
+            return Ok((vec![stmt], consumed));
+        }
+
+        if let Some((stmt, consumed)) =
+            self.try_lower_temp_close_decl(proto_index, &block.stmts, index)?
+        {
+            return Ok((vec![stmt], consumed));
+        }
+
+        match &block.stmts[index] {
+            HirStmt::LocalDecl(local_decl) => Ok((
+                vec![AstStmt::LocalDecl(Box::new(
+                    self.lower_local_decl(proto_index, local_decl)?,
+                ))],
+                1,
+            )),
+            HirStmt::Assign(assign) => Ok((
+                vec![AstStmt::Assign(Box::new(
+                    self.lower_assign(proto_index, assign)?,
+                ))],
+                1,
+            )),
+            HirStmt::TableSetList(set_list) => {
+                if set_list.trailing_multivalue.is_some() {
+                    return Err(AstLowerError::UnsupportedSetListTrailingMultivalue {
+                        proto: proto_index,
+                    });
+                }
+                let base = self.lower_expr(proto_index, &set_list.base)?;
+                let stmts = set_list
+                    .values
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, value)| {
                         let index_value =
                             AstExpr::Integer(i64::from(set_list.start_index) + offset as i64);
                         let target =
@@ -158,37 +199,40 @@ impl<'a> AstLowerer<'a> {
                                 base: base.clone(),
                                 index: index_value,
                             }));
-                        stmts.push(AstStmt::Assign(Box::new(AstAssign {
+                        Ok(AstStmt::Assign(Box::new(AstAssign {
                             targets: vec![target],
                             values: vec![self.lower_expr(proto_index, value)?],
-                        })));
-                    }
-                    index += 1;
-                    continue;
-                }
-                HirStmt::ErrNil(_) => {
-                    return Err(AstLowerError::InvalidGlobalDeclPattern { proto: proto_index });
-                }
-                HirStmt::ToBeClosed(_) => {
-                    return Err(AstLowerError::InvalidToBeClosed {
-                        proto: proto_index,
-                        reason: "standalone to-be-closed has no attachable declaration",
-                    });
-                }
-                HirStmt::Close(_) => {
-                    return Err(AstLowerError::UnsupportedClose { proto: proto_index });
-                }
-                HirStmt::CallStmt(call_stmt) => AstStmt::CallStmt(Box::new(AstCallStmt {
+                        })))
+                    })
+                    .collect::<Result<Vec<_>, AstLowerError>>()?;
+                Ok((stmts, 1))
+            }
+            HirStmt::ErrNil(_) => {
+                Err(AstLowerError::InvalidGlobalDeclPattern { proto: proto_index })
+            }
+            HirStmt::ToBeClosed(_) => Err(AstLowerError::InvalidToBeClosed {
+                proto: proto_index,
+                reason: "standalone to-be-closed has no attachable declaration",
+            }),
+            HirStmt::Close(_) => Err(AstLowerError::UnsupportedClose { proto: proto_index }),
+            HirStmt::CallStmt(call_stmt) => Ok((
+                vec![AstStmt::CallStmt(Box::new(AstCallStmt {
                     call: self.lower_call(proto_index, &call_stmt.call)?,
-                })),
-                HirStmt::Return(ret) => AstStmt::Return(Box::new(AstReturn {
+                }))],
+                1,
+            )),
+            HirStmt::Return(ret) => Ok((
+                vec![AstStmt::Return(Box::new(AstReturn {
                     values: ret
                         .values
                         .iter()
                         .map(|value| self.lower_expr(proto_index, value))
                         .collect::<Result<Vec<_>, _>>()?,
-                })),
-                HirStmt::If(if_stmt) => AstStmt::If(Box::new(AstIf {
+                }))],
+                1,
+            )),
+            HirStmt::If(if_stmt) => Ok((
+                vec![AstStmt::If(Box::new(AstIf {
                     cond: self.lower_expr(proto_index, &if_stmt.cond)?,
                     then_block: self.lower_block(
                         proto_index,
@@ -203,127 +247,143 @@ impl<'a> AstLowerer<'a> {
                             self.lower_block(proto_index, else_block, None, continue_target)
                         })
                         .transpose()?,
-                })),
-                HirStmt::While(while_stmt) => {
-                    let loop_continue = self.loop_continue_label_if_needed(&while_stmt.body);
-                    let mut body = self.lower_block(
-                        proto_index,
-                        &while_stmt.body,
-                        None,
-                        loop_continue.or(continue_target),
-                    )?;
-                    if let Some(label) = loop_continue {
-                        body.stmts
-                            .push(AstStmt::Label(Box::new(AstLabel { id: label })));
-                    }
-                    AstStmt::While(Box::new(AstWhile {
+                }))],
+                1,
+            )),
+            HirStmt::While(while_stmt) => {
+                let loop_continue = self.loop_continue_label_if_needed(&while_stmt.body);
+                let mut body = self.lower_block(
+                    proto_index,
+                    &while_stmt.body,
+                    None,
+                    loop_continue.or(continue_target),
+                )?;
+                if let Some(label) = loop_continue {
+                    body.stmts
+                        .push(AstStmt::Label(Box::new(AstLabel { id: label })));
+                }
+                Ok((
+                    vec![AstStmt::While(Box::new(AstWhile {
                         cond: self.lower_expr(proto_index, &while_stmt.cond)?,
                         body,
-                    }))
+                    }))],
+                    1,
+                ))
+            }
+            HirStmt::Repeat(repeat_stmt) => {
+                let loop_continue = self.loop_continue_label_if_needed(&repeat_stmt.body);
+                let mut body = self.lower_block(
+                    proto_index,
+                    &repeat_stmt.body,
+                    None,
+                    loop_continue.or(continue_target),
+                )?;
+                if let Some(label) = loop_continue {
+                    body.stmts
+                        .push(AstStmt::Label(Box::new(AstLabel { id: label })));
                 }
-                HirStmt::Repeat(repeat_stmt) => {
-                    let loop_continue = self.loop_continue_label_if_needed(&repeat_stmt.body);
-                    let mut body = self.lower_block(
-                        proto_index,
-                        &repeat_stmt.body,
-                        None,
-                        loop_continue.or(continue_target),
-                    )?;
-                    if let Some(label) = loop_continue {
-                        body.stmts
-                            .push(AstStmt::Label(Box::new(AstLabel { id: label })));
-                    }
-                    AstStmt::Repeat(Box::new(AstRepeat {
+                Ok((
+                    vec![AstStmt::Repeat(Box::new(AstRepeat {
                         body,
                         cond: self.lower_expr(proto_index, &repeat_stmt.cond)?,
-                    }))
+                    }))],
+                    1,
+                ))
+            }
+            HirStmt::NumericFor(numeric_for) => {
+                let loop_continue = self.loop_continue_label_if_needed(&numeric_for.body);
+                let mut body = self.lower_block(
+                    proto_index,
+                    &numeric_for.body,
+                    None,
+                    loop_continue.or(continue_target),
+                )?;
+                if let Some(label) = loop_continue {
+                    body.stmts
+                        .push(AstStmt::Label(Box::new(AstLabel { id: label })));
                 }
-                HirStmt::NumericFor(numeric_for) => {
-                    let loop_continue = self.loop_continue_label_if_needed(&numeric_for.body);
-                    let mut body = self.lower_block(
-                        proto_index,
-                        &numeric_for.body,
-                        None,
-                        loop_continue.or(continue_target),
-                    )?;
-                    if let Some(label) = loop_continue {
-                        body.stmts
-                            .push(AstStmt::Label(Box::new(AstLabel { id: label })));
-                    }
-                    AstStmt::NumericFor(Box::new(AstNumericFor {
+                Ok((
+                    vec![AstStmt::NumericFor(Box::new(AstNumericFor {
                         binding: AstBindingRef::Local(numeric_for.binding),
                         start: self.lower_expr(proto_index, &numeric_for.start)?,
                         limit: self.lower_expr(proto_index, &numeric_for.limit)?,
                         step: self.lower_expr(proto_index, &numeric_for.step)?,
                         body,
-                    }))
-                }
-                HirStmt::GenericFor(generic_for) => {
-                    self.lower_generic_for_stmt(proto_index, generic_for, None, continue_target)?
-                }
-                HirStmt::Break => AstStmt::Break,
-                HirStmt::Continue => {
-                    if self.target.caps.continue_stmt {
-                        AstStmt::Continue
-                    } else if let Some(label) = continue_target {
-                        if !self.target.caps.goto_label {
-                            return Err(AstLowerError::UnsupportedFeature {
-                                dialect: self.target.version,
-                                feature: "continue",
-                                context: "continue statement",
-                            });
-                        }
-                        AstStmt::Goto(Box::new(AstGoto { target: label }))
-                    } else {
+                    }))],
+                    1,
+                ))
+            }
+            HirStmt::GenericFor(generic_for) => Ok((
+                vec![self.lower_generic_for_stmt(
+                    proto_index,
+                    generic_for,
+                    None,
+                    continue_target,
+                )?],
+                1,
+            )),
+            HirStmt::Break => Ok((vec![AstStmt::Break], 1)),
+            HirStmt::Continue => {
+                if self.target.caps.continue_stmt {
+                    Ok((vec![AstStmt::Continue], 1))
+                } else if let Some(label) = continue_target {
+                    if !self.target.caps.goto_label {
                         return Err(AstLowerError::UnsupportedFeature {
                             dialect: self.target.version,
                             feature: "continue",
                             context: "continue statement",
                         });
                     }
+                    Ok((vec![AstStmt::Goto(Box::new(AstGoto { target: label }))], 1))
+                } else {
+                    Err(AstLowerError::UnsupportedFeature {
+                        dialect: self.target.version,
+                        feature: "continue",
+                        context: "continue statement",
+                    })
                 }
-                HirStmt::Goto(goto_stmt) => {
-                    if !self.target.caps.goto_label {
-                        return Err(AstLowerError::UnsupportedFeature {
-                            dialect: self.target.version,
-                            feature: "goto",
-                            context: "goto statement",
-                        });
-                    }
-                    AstStmt::Goto(Box::new(AstGoto {
-                        target: goto_stmt.target.into(),
-                    }))
-                }
-                HirStmt::Label(label) => {
-                    if !self.target.caps.goto_label {
-                        return Err(AstLowerError::UnsupportedFeature {
-                            dialect: self.target.version,
-                            feature: "label",
-                            context: "label statement",
-                        });
-                    }
-                    AstStmt::Label(Box::new(AstLabel {
-                        id: label.id.into(),
-                    }))
-                }
-                HirStmt::Block(inner) => AstStmt::DoBlock(Box::new(self.lower_block(
-                    proto_index,
-                    inner,
-                    None,
-                    continue_target,
-                )?)),
-                HirStmt::Unstructured(_) => {
-                    return Err(AstLowerError::ResidualHir {
-                        proto: proto_index,
-                        kind: "unstructured stmt",
+            }
+            HirStmt::Goto(goto_stmt) => {
+                if !self.target.caps.goto_label {
+                    return Err(AstLowerError::UnsupportedFeature {
+                        dialect: self.target.version,
+                        feature: "goto",
+                        context: "goto statement",
                     });
                 }
-            };
-            stmts.push(stmt);
-            index += 1;
+                Ok((
+                    vec![AstStmt::Goto(Box::new(AstGoto {
+                        target: goto_stmt.target.into(),
+                    }))],
+                    1,
+                ))
+            }
+            HirStmt::Label(label) => {
+                if !self.target.caps.goto_label {
+                    return Err(AstLowerError::UnsupportedFeature {
+                        dialect: self.target.version,
+                        feature: "label",
+                        context: "label statement",
+                    });
+                }
+                Ok((
+                    vec![AstStmt::Label(Box::new(AstLabel {
+                        id: label.id.into(),
+                    }))],
+                    1,
+                ))
+            }
+            HirStmt::Block(inner) => Ok((
+                vec![AstStmt::DoBlock(Box::new(
+                    self.lower_block(proto_index, inner, None, continue_target)?,
+                ))],
+                1,
+            )),
+            HirStmt::Unstructured(_) => Err(AstLowerError::ResidualHir {
+                proto: proto_index,
+                kind: "unstructured stmt",
+            }),
         }
-
-        Ok(AstBlock { stmts })
     }
 
     fn lower_generic_for_stmt(

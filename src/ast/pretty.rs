@@ -126,6 +126,7 @@ fn expr_display_complexity(expr: &AstExpr) -> usize {
                 .sum::<usize>()
         }
         AstExpr::FunctionExpr(function) => 2 + function.body.stmts.len(),
+        AstExpr::Error(_) => 1,
     }
 }
 

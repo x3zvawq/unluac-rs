@@ -57,6 +57,7 @@ struct WasmNamingOptions {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct WasmGenerateOptions {
+    mode: Option<String>,
     indent_width: Option<usize>,
     max_line_length: Option<usize>,
     quote_style: Option<String>,
@@ -211,6 +212,9 @@ impl WasmNamingOptions {
 
 impl WasmGenerateOptions {
     fn apply(self, options: &mut DecompileOptions) -> BridgeResult<()> {
+        if let Some(value) = self.mode {
+            options.generate.mode = parse_option("generate.mode", &value)?;
+        }
         if let Some(value) = self.indent_width {
             options.generate.indent_width = value;
         }
@@ -247,7 +251,10 @@ where
 }
 
 fn default_wasm_decompile_options() -> DecompileOptions {
-    DecompileOptions::default()
+    let mut options = DecompileOptions::default();
+    // WASM 面向最终用户，默认使用 Permissive 以尽可能输出结果。
+    options.generate.mode = unluac::decompile::GenerateMode::Permissive;
+    options
 }
 
 impl WasmBridgeError {
@@ -380,6 +387,7 @@ mod tests {
                 debug_like_include_function: Some(false),
             }),
             generate: Some(WasmGenerateOptions {
+                mode: None,
                 indent_width: Some(2),
                 max_line_length: Some(120),
                 quote_style: Some("prefer-single".to_owned()),

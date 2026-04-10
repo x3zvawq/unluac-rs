@@ -50,7 +50,7 @@ fn collect_stmt_features(stmt: &AstStmt, features: &mut BTreeSet<AstFeature>) {
         AstStmt::Continue => {
             features.insert(AstFeature::ContinueStmt);
         }
-        AstStmt::Goto(_) | AstStmt::Label(_) => {
+        AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => {
             features.insert(AstFeature::GotoLabel);
         }
         _ => {}

@@ -447,7 +447,8 @@ fn stmt_always_terminates(stmt: &AstStmt) -> bool {
         | AstStmt::GenericFor(_)
         | AstStmt::Label(_)
         | AstStmt::FunctionDecl(_)
-        | AstStmt::LocalFunctionDecl(_) => false,
+        | AstStmt::LocalFunctionDecl(_)
+        | AstStmt::Error(_) => false,
     }
 }
 
@@ -504,7 +505,8 @@ fn stmt_contains_label_or_goto(stmt: &AstStmt) -> bool {
         | AstStmt::Continue
         | AstStmt::FunctionDecl(_)
         | AstStmt::LocalFunctionDecl(_)
-        | AstStmt::Return(_) => false,
+        | AstStmt::Return(_)
+        | AstStmt::Error(_) => false,
     }
 }
 

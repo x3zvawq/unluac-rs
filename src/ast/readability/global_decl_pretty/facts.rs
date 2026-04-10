@@ -221,7 +221,7 @@ impl AstVisitor for GlobalFactsCollector {
             | AstStmt::Break
             | AstStmt::Continue
             | AstStmt::Goto(_)
-            | AstStmt::Label(_) => {}
+            | AstStmt::Label(_) | AstStmt::Error(_) => {}
         }
     }
 

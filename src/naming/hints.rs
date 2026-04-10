@@ -170,7 +170,7 @@ fn collect_stmt_hints(
             );
             collect_local_function_hints(local_function_decl, hints, hir)?;
         }
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => {}
+        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => {}
     }
     Ok(())
 }
@@ -415,7 +415,7 @@ fn candidate_from_expr(expr: &AstExpr) -> Option<(String, NameSource)> {
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg => None,
+        | AstExpr::VarArg | AstExpr::Error(_) => None,
     }
 }
 

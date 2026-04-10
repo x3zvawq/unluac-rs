@@ -86,6 +86,13 @@ pub struct GenerateFunctionCommentMetadata {
 }
 
 /// 输出层在遇到目标方言不支持的语法时该如何处理。
+///
+/// - `Permissive`：无论如何都尝试输出代码，无法恢复的错误通过 Lua 注释占位。
+/// - `BestEffort`：仅在当前 dialect 不支持某语法时，尝试替换为等价语法（如 continue → goto-label）。
+///   遇到反编译阶段本身的错误（如 HIR 残留节点）依然终止。
+/// - `Strict`：遇到任何反编译错误或目标 dialect 不支持的语法时直接报错并终止。
+///
+/// 库层默认为 `Strict`（最安全的编程接口约定）；CLI 层默认为 `Permissive`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GenerateMode {
     #[default]

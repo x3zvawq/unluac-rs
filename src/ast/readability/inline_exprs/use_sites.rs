@@ -132,7 +132,7 @@ pub(super) fn rewrite_stmt_use_sites_with_policy(
         | AstStmt::Break
         | AstStmt::Continue
         | AstStmt::Goto(_)
-        | AstStmt::Label(_) => false,
+        | AstStmt::Label(_) | AstStmt::Error(_) => false,
     }
 }
 
@@ -516,7 +516,7 @@ fn rewrite_expr_use_sites(
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg => false,
+        | AstExpr::VarArg | AstExpr::Error(_) => false,
     }
 }
 

@@ -4,6 +4,7 @@
 //! 不再提前替 Readability 收回 method-call / installer-iife 这类源码 sugar。
 
 use crate::ast::{AstCallKind, AstExpr, AstStmt, AstTargetDialect, lower_ast};
+use crate::generate::GenerateMode;
 use crate::hir::{
     HirBlock, HirCallExpr, HirCallStmt, HirClosureExpr, HirExpr, HirGlobalRef, HirLocalDecl,
     HirModule, HirProto, HirProtoRef, HirReturn, HirStmt, HirTableAccess, LocalId, ParamId,
@@ -82,6 +83,7 @@ fn lower_ast_preserves_method_call_alias_scaffolding_for_readability() {
     let ast = lower_ast(
         &module,
         AstTargetDialect::new(crate::ast::AstDialectVersion::Lua51),
+        GenerateMode::Strict,
     )
     .expect("ast lowering should succeed");
 
@@ -188,6 +190,7 @@ fn lower_ast_forwards_multiret_call_carrier_into_final_call_arg() {
     let ast = lower_ast(
         &module,
         AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+        GenerateMode::Strict,
     )
     .expect("ast lowering should forward multiret call carrier");
 
@@ -327,6 +330,7 @@ fn lower_ast_preserves_installer_iife_scaffolding_for_readability() {
     let ast = lower_ast(
         &module,
         AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+        GenerateMode::Strict,
     )
     .expect("ast lowering should preserve installer iife for readability");
 
@@ -397,6 +401,7 @@ fn lower_ast_marks_single_value_final_call_arg_explicitly() {
     let ast = lower_ast(
         &module,
         AstTargetDialect::new(crate::ast::AstDialectVersion::Luau),
+        GenerateMode::Strict,
     )
     .expect("ast lowering should preserve final single-value call args");
 

@@ -29,7 +29,8 @@ fn simplifies_safe_lua_logical_absorption() {
         crate::readability::ReadabilityOptions::default(),
         &crate::timing::TimingCollector::disabled(),
         &[],
-    );
+        crate::generate::GenerateMode::Strict,
+        );
 
     assert!(matches!(
         &module.protos[0].body.stmts.as_slice(),

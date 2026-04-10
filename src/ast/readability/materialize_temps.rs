@@ -97,7 +97,7 @@ impl AstVisitor for FunctionTempCollector {
             | AstStmt::Break
             | AstStmt::Continue
             | AstStmt::Goto(_)
-            | AstStmt::Label(_) => {}
+            | AstStmt::Label(_) | AstStmt::Error(_) => {}
         }
     }
 
@@ -216,7 +216,7 @@ fn rewrite_function_stmt(stmt: &mut AstStmt, mapping: &BTreeMap<TempId, AstSynth
                 local_function_decl.name = AstBindingRef::SyntheticLocal(synthetic);
             }
         }
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => {}
+        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => {}
     }
 }
 
@@ -316,7 +316,7 @@ fn rewrite_function_expr(expr: &mut AstExpr, mapping: &BTreeMap<TempId, AstSynth
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
-        | AstExpr::VarArg => {}
+        | AstExpr::VarArg | AstExpr::Error(_) => {}
     }
 }
 

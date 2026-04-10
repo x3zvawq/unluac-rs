@@ -169,10 +169,19 @@ impl<'a> AstLowerer<'a> {
                 rhs: self.lower_expr(proto_index, &logical.rhs)?,
             })),
             HirExpr::Decision(_) => {
-                return Err(AstLowerError::ResidualHir {
-                    proto: proto_index,
-                    kind: "decision expr",
-                });
+                if !self.should_recover_errors() {
+                    return Err(AstLowerError::ResidualHir {
+                        proto: proto_index,
+                        kind: "decision expr",
+                    });
+                }
+                AstExpr::Error(
+                    AstLowerError::ResidualHir {
+                        proto: proto_index,
+                        kind: "decision expr",
+                    }
+                    .to_string(),
+                )
             }
             HirExpr::Call(call) => match self.lower_call(proto_index, call)? {
                 AstCallKind::Call(call) => AstExpr::Call(call),
@@ -214,10 +223,19 @@ impl<'a> AstLowerer<'a> {
                 AstExpr::FunctionExpr(Box::new(self.lower_function_expr(proto_index, closure)?))
             }
             HirExpr::Unresolved(_) => {
-                return Err(AstLowerError::ResidualHir {
-                    proto: proto_index,
-                    kind: "unresolved expr",
-                });
+                if !self.should_recover_errors() {
+                    return Err(AstLowerError::ResidualHir {
+                        proto: proto_index,
+                        kind: "unresolved expr",
+                    });
+                }
+                AstExpr::Error(
+                    AstLowerError::ResidualHir {
+                        proto: proto_index,
+                        kind: "unresolved expr",
+                    }
+                    .to_string(),
+                )
             }
         })
     }

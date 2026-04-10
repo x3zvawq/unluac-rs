@@ -256,7 +256,7 @@ fn stmt_captures_binding(stmt: &AstStmt, binding: AstBindingRef) -> bool {
         AstStmt::LocalFunctionDecl(function_decl) => {
             function_expr_captures_binding(&function_decl.func, binding)
         }
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => false,
+        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => false,
     }
 }
 
@@ -344,7 +344,8 @@ fn expr_captures_binding(expr: &crate::ast::AstExpr, binding: AstBindingRef) -> 
         | crate::ast::AstExpr::UInt64(_)
         | crate::ast::AstExpr::Complex { .. }
         | crate::ast::AstExpr::Var(_)
-        | crate::ast::AstExpr::VarArg => false,
+        | crate::ast::AstExpr::VarArg
+        | crate::ast::AstExpr::Error(_) => false,
     }
 }
 

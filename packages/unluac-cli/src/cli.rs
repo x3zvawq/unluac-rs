@@ -386,6 +386,9 @@ where
     }
     if let Some(mode) = args.generate_mode {
         decompile.generate.mode = mode;
+    } else {
+        // CLI 层默认使用 Permissive，让用户默认获得尽可能完整的输出。
+        decompile.generate.mode = GenerateMode::Permissive;
     }
 
     validate_output_request(&args, &decompile)?;

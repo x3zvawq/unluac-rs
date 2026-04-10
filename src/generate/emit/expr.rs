@@ -212,6 +212,11 @@ impl<'a> Emitter<'a> {
             AstExpr::FunctionExpr(func) => {
                 (self.emit_function_expr(func)?, PREC_LITERAL, Assoc::Non)
             }
+            AstExpr::Error(message) => (
+                Doc::text(format!("nil --[[ [unluac error] {message} ]]")),
+                PREC_LITERAL,
+                Assoc::Non,
+            ),
         };
         Ok(maybe_parenthesize(doc, prec, parent_prec, side, assoc))
     }

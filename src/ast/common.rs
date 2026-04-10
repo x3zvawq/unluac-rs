@@ -55,6 +55,8 @@ pub enum AstStmt {
     DoBlock(Box<AstBlock>),
     FunctionDecl(Box<AstFunctionDecl>),
     LocalFunctionDecl(Box<AstLocalFunctionDecl>),
+    /// 反编译过程中无法恢复的语句占位符，最终会被输出为 Lua 注释。
+    Error(String),
 }
 
 /// AST 表达式。
@@ -81,6 +83,8 @@ pub enum AstExpr {
     VarArg,
     TableConstructor(Box<AstTableConstructor>),
     FunctionExpr(Box<AstFunctionExpr>),
+    /// 反编译过程中无法恢复的表达式占位符，最终会被输出为带注释的 nil。
+    Error(String),
 }
 
 /// 赋值语句。

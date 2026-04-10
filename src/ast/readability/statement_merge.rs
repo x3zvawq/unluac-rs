@@ -355,7 +355,7 @@ fn try_sink_hoisted_decl_into_nested_stmt(
         | AstStmt::Break
         | AstStmt::Continue
         | AstStmt::Goto(_)
-        | AstStmt::Label(_) => None,
+        | AstStmt::Label(_) | AstStmt::Error(_) => None,
     }
 }
 

@@ -64,6 +64,7 @@ impl<'a> Emitter<'a> {
             AstStmt::LocalFunctionDecl(local_function_decl) => {
                 self.emit_local_function_decl(local_function_decl, function)
             }
+            AstStmt::Error(message) => Ok(Doc::text(format!("-- [unluac error] {message}"))),
         }
     }
 
