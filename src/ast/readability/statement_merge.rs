@@ -427,6 +427,17 @@ fn sink_pending_bindings_into_block(
             continue;
         }
         if stmt_references_any_binding(&block.stmts[index], remaining) {
+            // The binding is used in this statement but can't be merged
+            // directly or sunk into a nested block (e.g. it is assigned
+            // inside one nested `if` but read in a later sibling).  Insert
+            // a bare `local` declaration right before this statement so the
+            // declaration sits at the narrowest enclosing scope.
+            let decl = AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                bindings: remaining.to_vec(),
+                values: vec![],
+            }));
+            block.stmts.insert(index, decl);
+            consumed += remaining.len();
             break;
         }
         index += 1;
