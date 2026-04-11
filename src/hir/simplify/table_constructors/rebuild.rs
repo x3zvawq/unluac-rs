@@ -593,6 +593,27 @@ fn prepare_record_step(
     context: &mut RegionRebuildContext<'_>,
 ) -> Option<()> {
     let (key, value) = record_field_parts(context.block, stmt_index)?;
+    // 内联 record key 表达式：如果 key 是一个引用了 pending producer 的变量引用
+    // （例如 `local k = "name"; t[k] = v`），把 producer 值折叠进 key 并消费绑定。
+    let key = match key {
+        HirTableKey::Expr(key_expr) => {
+            let inlined = {
+                let scratch = &mut context.scratch;
+                let mut inline_context = InlineContext::new(
+                    context.block,
+                    context.binding_index,
+                    &scratch.pending_producers,
+                    &scratch.producer_index_by_binding,
+                    &mut scratch.consumed_bindings,
+                    &mut scratch.consumed_groups,
+                    context.remaining_uses,
+                );
+                inline_constructor_value(&mut inline_context, &key_expr)?
+            };
+            table_key_from_expr(&inlined)
+        }
+        name => name,
+    };
     let recursive_closure_slot = binding_is_recursive_closure_slot(
         context.block,
         value,

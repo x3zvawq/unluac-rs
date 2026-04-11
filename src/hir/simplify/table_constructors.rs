@@ -21,7 +21,10 @@ use std::collections::BTreeMap;
 
 use crate::hir::common::{HirAssign, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId};
 
-use self::bindings::collect_materialized_binding_counts;
+use self::bindings::{
+    collect_materialized_binding_counts, BindingIndex, StmtBindingSummary,
+    collect_stmt_binding_summary,
+};
 use self::scan::{
     constructor_seed, install_constructor_seed, trailing_constructor_handoff,
     try_rebuild_constructor_region,
@@ -118,6 +121,16 @@ impl HirRewritePass for TableConstructorPass {
     fn rewrite_block(&mut self, block: &mut crate::hir::common::HirBlock) -> bool {
         let mut changed = false;
         let mut scratch = RebuildScratch::default();
+        // 构建一次 binding 索引、per-stmt binding summary 和 materialized 计数，
+        // 在所有 seed 间复用，避免 O(seeds × stmts) 的重复遍历。
+        let mut binding_index = BindingIndex::default();
+        let mut stmt_bindings: Vec<StmtBindingSummary> = block
+            .stmts
+            .iter()
+            .map(|stmt| collect_stmt_binding_summary(stmt, &mut binding_index))
+            .collect();
+        let materialized_binding_counts =
+            binding_index.materialized_counts(&self.materialized_bindings);
         let mut index = 0;
         while index < block.stmts.len() {
             let Some((binding, seed_ctor)) = constructor_seed(&block.stmts[index]) else {
@@ -131,7 +144,9 @@ impl HirRewritePass for TableConstructorPass {
                     index,
                     binding,
                     seed_ctor.clone(),
-                    &self.materialized_bindings,
+                    &binding_index,
+                    &materialized_binding_counts,
+                    &stmt_bindings,
                     &mut scratch,
                 ) {
                     Some((rebuilt_ctor, end_index, retained)) => {
@@ -153,10 +168,12 @@ impl HirRewritePass for TableConstructorPass {
             if drain_end > index {
                 if retained_stmts.is_empty() {
                     block.stmts.drain(index + 1..=drain_end);
+                    stmt_bindings.drain(index + 1..=drain_end);
                 } else {
                     for i in (index + 1..=drain_end).rev() {
                         if !retained_stmts.contains(&i) {
                             block.stmts.remove(i);
+                            stmt_bindings.remove(i);
                         }
                     }
                 }

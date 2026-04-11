@@ -4,13 +4,11 @@
 //! setlist、producer 或 trailing handoff”，不会在这里直接改写语句。
 //! 例如：`local t = {}; t.x = 1; t.y = 2` 会在这里被扫描成一串 constructor steps。
 
-use std::collections::BTreeMap;
-
 use crate::hir::common::{HirExpr, HirLValue, HirStmt, HirTableConstructor};
 
 use super::bindings::{
-    BindingIndex, BindingUseSummary, binding_from_expr, binding_from_lvalue,
-    collect_stmt_binding_summary, expr_uses_binding, lvalue_uses_binding,
+    BindingIndex, BindingUseSummary, StmtBindingSummary, binding_from_expr, binding_from_lvalue,
+    expr_uses_binding, lvalue_uses_binding,
     stmt_slice_mentions_binding,
 };
 use super::rebuild::{ConstructorBuilder, RegionRebuildContext, try_extend_constructor_from_steps};
@@ -53,21 +51,17 @@ pub(super) fn install_constructor_seed(stmt: &mut HirStmt, constructor: HirTable
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn try_rebuild_constructor_region(
     block: &crate::hir::common::HirBlock,
     seed_index: usize,
     binding: TableBinding,
     constructor: HirTableConstructor,
-    materialized_bindings: &BTreeMap<TableBinding, usize>,
+    binding_index: &BindingIndex,
+    materialized_binding_counts: &[u32],
+    stmt_bindings: &[StmtBindingSummary],
     scratch: &mut RebuildScratch,
 ) -> Option<(HirTableConstructor, usize, Vec<usize>)> {
-    let mut binding_index = BindingIndex::default();
-    let stmt_bindings = block
-        .stmts
-        .iter()
-        .map(|stmt| collect_stmt_binding_summary(stmt, &mut binding_index))
-        .collect::<Vec<_>>();
-    let materialized_binding_counts = binding_index.materialized_counts(materialized_bindings);
     let mut steps = Vec::new();
     let mut best_end = None;
     let mut committed_builder = ConstructorBuilder::from_constructor(constructor);
@@ -88,10 +82,10 @@ pub(super) fn try_rebuild_constructor_region(
             pending_retained_stmts.clear();
             let mut rebuild_context = RegionRebuildContext::new(
                 block,
-                &binding_index,
+                binding_index,
                 &remaining_uses,
                 committed_contains_set_list,
-                &materialized_binding_counts,
+                materialized_binding_counts,
                 scratch,
             );
             if try_extend_constructor_from_steps(
@@ -117,10 +111,10 @@ pub(super) fn try_rebuild_constructor_region(
             pending_retained_stmts.clear();
             let mut rebuild_context = RegionRebuildContext::new(
                 block,
-                &binding_index,
+                binding_index,
                 &remaining_uses,
                 committed_contains_set_list,
-                &materialized_binding_counts,
+                materialized_binding_counts,
                 scratch,
             );
             if try_extend_constructor_from_steps(
