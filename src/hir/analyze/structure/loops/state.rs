@@ -171,7 +171,46 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return Some(expr);
         }
 
-        single_fixed_def_expr(self.lowering, defs)
+        if let Some(expr) = single_fixed_def_expr(self.lowering, defs.iter().copied()) {
+            return Some(expr);
+        }
+
+        // 嵌套 loop 的 preheader 上，某个寄存器的 reaching defs 可能包含多个原始定义
+        // （初值 + 内层循环回边写入），但在 reaching values 视角里它们早已被外层 loop 的
+        // header phi 合并成唯一的 SSA value。如果该 phi 对应的 temp 已经被外层 loop state
+        // plan 收录到 target_overrides 里，就可以直接沿用。
+        // 典型触发场景：外层 while 的 phi_use_count == 0（没有指令直接读取该 phi，只经由
+        // 内层 loop phi 间接消费），此时外层 plan 不把 inside_arm 的原始 def temps 加入
+        // override map，导致 shared_expr_for_defs 无法匹配。
+        self.reaching_phi_override_expr(pred, reg, target_overrides)
+    }
+
+    /// 查找 `pred` 块首条指令的 reaching values 里，`reg` 是否只有一个 phi，
+    /// 并且该 phi 的 temp 已在 `target_overrides` 中。
+    fn reaching_phi_override_expr(
+        &self,
+        pred: BlockRef,
+        reg: Reg,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<HirExpr> {
+        use crate::cfg::SsaValue;
+
+        let first_instr = self.lowering.cfg.blocks[pred.index()].instrs.start;
+        let reaching = self.lowering.dataflow.reaching_values_at(first_instr);
+        let values = reaching.get(reg)?;
+
+        let mut phi_ids = values.iter().filter_map(|v| match v {
+            SsaValue::Phi(phi_id) => Some(phi_id),
+            SsaValue::Def(_) => None,
+        });
+        let phi_id = phi_ids.next()?;
+        if phi_ids.next().is_some() {
+            return None;
+        }
+
+        let temp = *self.lowering.bindings.phi_temps.get(phi_id.index())?;
+        let lvalue = target_overrides.get(&temp)?;
+        lvalue_as_expr(lvalue)
     }
 
     pub(super) fn install_loop_exit_bindings(

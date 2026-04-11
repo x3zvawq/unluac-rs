@@ -183,6 +183,15 @@ pub(crate) fn build_branch_short_circuit_plan(
     // 一旦还引用这些 temp，就会得到“定义语句被吞掉，但 temp 仍留在条件/then 里”
     // 的悬空 HIR。多节点链条里只有入口 header 自己的 temp 能保证随后会被物化。
     let allowed_blocks = BTreeSet::from([header]);
+
+    // 被吞掉的非入口 header 中的定义如果被短路区域之外的指令引用，
+    // 消费该 header 会导致定义丢失，body 中出现悬空变量引用。
+    // 典型场景：`if cond and GetBuff(x) then DelBuff(x, r.nLevel) end`
+    // 其中 GetBuff 的返回值 r 在 then-body 中还被读取。
+    if consumed_headers_have_escaping_defs(lowering, short, &allowed_blocks) {
+        return None;
+    }
+
     let decision = if decision_references_forbidden_candidate_temps(
         lowering,
         short,
@@ -668,4 +677,39 @@ fn cond_operand_reg(operand: CondOperand) -> Option<Reg> {
         | CondOperand::Integer(_)
         | CondOperand::Number(_) => None,
     }
+}
+
+/// 检查被吞掉的非入口 header 中是否有定义被短路候选区域之外的代码引用。
+///
+/// 如果某个被消费 header 中的 def 有 use-site 落在 `short.blocks` 之外，
+/// 说明消费该 header 后这个定义会丢失，外部引用变成悬空。
+///
+/// 只检查被消费的 header（非入口 header 的节点 header），
+/// 不检查 then/else body 等其他块——它们的 def 可以合法地在短路区域外使用。
+fn consumed_headers_have_escaping_defs(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+    allowed_blocks: &BTreeSet<BlockRef>,
+) -> bool {
+    let consumed_headers: Vec<BlockRef> = short
+        .nodes
+        .iter()
+        .map(|node| node.header)
+        .filter(|h| !allowed_blocks.contains(h))
+        .collect();
+
+    for &block in &consumed_headers {
+        let range = lowering.cfg.blocks[block.index()].instrs;
+        for instr_idx in range.start.index()..range.end() {
+            for &def_id in &lowering.dataflow.instr_defs[instr_idx] {
+                for use_site in &lowering.dataflow.def_uses[def_id.index()] {
+                    let use_block = lowering.cfg.instr_to_block[use_site.instr.index()];
+                    if !short.blocks.contains(&use_block) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }

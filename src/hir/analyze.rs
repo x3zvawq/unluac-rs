@@ -65,6 +65,7 @@ pub(crate) fn analyze_hir(
         entry,
         protos: artifacts.protos,
     };
+
     timings.record("simplify", || {
         simplify_hir(
             &mut module,
