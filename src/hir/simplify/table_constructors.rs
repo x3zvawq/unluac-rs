@@ -125,17 +125,20 @@ impl HirRewritePass for TableConstructorPass {
                 continue;
             };
 
-            let (constructor, end_index, rebuilt_region) = match try_rebuild_constructor_region(
-                block,
-                index,
-                binding,
-                seed_ctor.clone(),
-                &self.materialized_bindings,
-                &mut scratch,
-            ) {
-                Some((rebuilt_ctor, end_index)) => (rebuilt_ctor, end_index, true),
-                None => (seed_ctor, index, false),
-            };
+            let (constructor, end_index, rebuilt_region, retained_stmts) =
+                match try_rebuild_constructor_region(
+                    block,
+                    index,
+                    binding,
+                    seed_ctor.clone(),
+                    &self.materialized_bindings,
+                    &mut scratch,
+                ) {
+                    Some((rebuilt_ctor, end_index, retained)) => {
+                        (rebuilt_ctor, end_index, true, retained)
+                    }
+                    None => (seed_ctor, index, false, Vec::new()),
+                };
 
             let handoff_target =
                 trailing_constructor_handoff(&block.stmts[(end_index + 1)..], binding);
@@ -148,7 +151,15 @@ impl HirRewritePass for TableConstructorPass {
             install_constructor_owner(&mut block.stmts[index], handoff_target, constructor);
             let drain_end = end_index + usize::from(consumed_handoff);
             if drain_end > index {
-                block.stmts.drain(index + 1..=drain_end);
+                if retained_stmts.is_empty() {
+                    block.stmts.drain(index + 1..=drain_end);
+                } else {
+                    for i in (index + 1..=drain_end).rev() {
+                        if !retained_stmts.contains(&i) {
+                            block.stmts.remove(i);
+                        }
+                    }
+                }
             }
             changed = true;
             index += 1;

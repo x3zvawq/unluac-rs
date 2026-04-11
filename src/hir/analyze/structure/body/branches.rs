@@ -67,9 +67,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .branch_value_merges_by_header
             .contains_key(&block)
             .then(|| {
-                // branch value merge 一旦存在，先把两臂里对应的 def 统一接到 merge target 身份。
-                // 这样即便 merge 值来源是 impure call / method call，后面没法折回 decision expr，
-                // HIR 也仍然能保住“分支里显式写值，merge 后继续读同一状态槽位”的结构。
                 self.branch_value_target_overrides(block, target_overrides)
             });
         if let Some(branch_target_overrides) = branch_target_overrides.as_ref() {
@@ -98,7 +95,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             // 避免双重物化导致冗余临时变量、多余引用和无意义 else 分支。
             None => None,
         };
-        stmts.push(branch_stmt(plan.cond, then_block, else_block));
+        stmts.push(branch_stmt({
+            let mut cond = plan.cond;
+            rewrite_expr_temps(&mut cond, &temp_expr_overrides(target_overrides));
+            cond
+        }, then_block, else_block));
         self.install_stop_boundary_value_merge_override(block, branch_stop, target_overrides);
         for header in &plan.consumed_headers {
             let branch_value_overrides = if *header == block {

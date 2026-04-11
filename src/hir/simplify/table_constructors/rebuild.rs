@@ -255,8 +255,10 @@ pub(super) fn try_extend_constructor_from_steps(
     builder: &mut ConstructorBuilder,
     steps: &[RegionStep],
     context: &mut RegionRebuildContext<'_>,
+    retained_producer_stmts: &mut Vec<usize>,
 ) -> bool {
     let checkpoint = builder.checkpoint(context.scratch);
+    let retained_checkpoint = retained_producer_stmts.len();
     let region_contains_set_list = context.region_contains_set_list(steps);
     let mut segment_start = 0;
 
@@ -268,10 +270,12 @@ pub(super) fn try_extend_constructor_from_steps(
                 Some(*stmt_index),
                 region_contains_set_list,
                 context,
+                retained_producer_stmts,
             )
             .is_none()
             {
                 builder.rollback(checkpoint, context.scratch);
+                retained_producer_stmts.truncate(retained_checkpoint);
                 return false;
             }
             segment_start = index + 1;
@@ -284,10 +288,12 @@ pub(super) fn try_extend_constructor_from_steps(
         None,
         region_contains_set_list,
         context,
+        retained_producer_stmts,
     )
     .is_none()
     {
         builder.rollback(checkpoint, context.scratch);
+        retained_producer_stmts.truncate(retained_checkpoint);
         return false;
     }
 
@@ -301,6 +307,7 @@ fn flush_constructor_segment(
     set_list_stmt_index: Option<usize>,
     allow_closure_records: bool,
     context: &mut RegionRebuildContext<'_>,
+    retained_producer_stmts: &mut Vec<usize>,
 ) -> Option<()> {
     let expected_set_list_start = builder.next_array_index();
     prepare_scratch(context.scratch, context.binding_index.len());
@@ -365,11 +372,10 @@ fn flush_constructor_segment(
                     }
                     match queued_values.front() {
                         Some(front) if matches_binding_ref(front, producer.binding) => {
-                            if context.remaining_uses.contains(producer.binding_id) {
-                                return None;
-                            }
                             let value = pending_producer_value(context.block, producer)?;
-                            context.scratch.consumed_bindings[producer.binding_id] = true;
+                            if !context.remaining_uses.contains(producer.binding_id) {
+                                context.scratch.consumed_bindings[producer.binding_id] = true;
+                            }
                             queued_values.pop_front();
                             builder.push_array_value(value.clone());
                         }
@@ -447,7 +453,12 @@ fn flush_constructor_segment(
             return false;
         }
         if context.remaining_uses.contains(producer.binding_id) {
-            return true;
+            // In SETLIST segments, unconsumed producers with remaining_uses are OK:
+            // their values were "borrowed" (inlined into the constructor without consuming
+            // the binding), and their definition stmts will be retained.
+            // In non-SETLIST segments, they must still fail because there's no SETLIST
+            // to consume them and they'd block the region.
+            return set_list_stmt_index.is_none();
         }
         match producer.group {
             Some(group) if context.scratch.consumed_groups[group] => false,
@@ -456,6 +467,19 @@ fn flush_constructor_segment(
         }
     }) {
         return None;
+    }
+
+    // Collect stmt indices for unconsumed producers whose bindings are still live.
+    // These stmts must be retained (not drained) because they define bindings used later.
+    if set_list_stmt_index.is_some() {
+        for producer in &context.scratch.pending_producers {
+            if !context.scratch.consumed_bindings[producer.binding_id]
+                && context.remaining_uses.contains(producer.binding_id)
+                && let PendingProducerSource::Value { stmt_index, .. } = producer.source
+            {
+                retained_producer_stmts.push(stmt_index);
+            }
+        }
     }
 
     if set_list_stmt_index.is_none() {

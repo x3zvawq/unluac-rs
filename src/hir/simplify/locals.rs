@@ -506,10 +506,6 @@ fn collect_plans(
         }
         if sticky_local.is_none() {
             // 只在控制头里单次消费的 temp，更像机械性的结构参数而不是源码级 local。
-            // 如果这里先把它们提升成 local，后面的 temp-inline 就再也无法把
-            // `for i = 1, #values, 1 do`、`if value > 0 then` 这类头部形状收回来。
-            // 因此只要它们的唯一未来使用点仍局限在单条控制语句的头部，就把机会留给
-            // temp-inline，而不是在 locals pass 里过早物化成新 local。
             let touching_stmt_indices = (decl_index + 1..block.stmts.len())
                 .filter(|future_index| !removable_aliases.contains(future_index))
                 .filter(|future_index| stmt_touches_any_temp(&block.stmts[*future_index], &group))
@@ -547,7 +543,7 @@ fn collect_plans(
                 decl_index,
                 local,
                 facts.home_slot(root_temp),
-                group,
+                group.clone(),
                 removable_aliases,
                 PromotionInit::FromAssign,
             );
@@ -556,7 +552,7 @@ fn collect_plans(
             allocator.allocate_local(
                 decl_index,
                 slot,
-                group,
+                group.clone(),
                 removable_aliases,
                 PromotionInit::FromAssign,
             );
