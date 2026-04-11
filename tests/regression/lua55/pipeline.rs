@@ -899,13 +899,13 @@ mod decompile_pipeline {
             generated.source
         );
         assert!(
-            generated.source.contains("(tbl:next() or 1)"),
+            generated.source.contains("(value3:next() or 1)"),
             "{}",
             generated.source
         );
         assert!(!generated.source.contains(".next("), "{}", generated.source);
         assert!(
-            generated.source.contains("value = value2 + (tbl:next() or 1)"),
+            generated.source.contains("value = value2 + (value3:next() or 1)"),
             "{}",
             generated.source
         );
@@ -954,7 +954,7 @@ mod decompile_pipeline {
             generated.source
         );
         assert!(
-            !generated.source.contains("local pick = result.pick"),
+            generated.source.contains("local pick = result.pick"),
             "{}",
             generated.source
         );

@@ -161,7 +161,7 @@ fn flattens_single_return_do_block_after_inner_locals_disappear() {
 }
 
 #[test]
-fn removes_unused_recovered_lookup_local_with_initializer() {
+fn keeps_unused_recovered_lookup_local_with_field_access_initializer() {
     let alias = LocalId(0);
     let mut module = AstModule {
         entry_function: Default::default(),
@@ -187,7 +187,8 @@ fn removes_unused_recovered_lookup_local_with_initializer() {
         },
     };
 
-    assert!(apply(
+    // FieldAccess 可能触发 __index，不应被删除
+    assert!(!apply(
         &mut module,
         ReadabilityContext {
             target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
@@ -197,7 +198,7 @@ fn removes_unused_recovered_lookup_local_with_initializer() {
 
     assert!(matches!(
         module.body.stmts.as_slice(),
-        [AstStmt::Return(ret)] if ret.values == vec![AstExpr::String("ok".to_owned())]
+        [AstStmt::LocalDecl(_), AstStmt::Return(ret)] if ret.values == vec![AstExpr::String("ok".to_owned())]
     ));
 }
 

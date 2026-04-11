@@ -15,7 +15,6 @@ use std::collections::BTreeMap;
 use super::super::common::{AstBindingRef, AstBlock, AstModule, AstStmt};
 use super::ReadabilityContext;
 use super::binding_flow::{count_binding_mentions_in_block, count_binding_uses_in_stmts};
-use super::expr_analysis::{is_context_safe_expr, is_copy_like_expr, is_lookup_inline_expr};
 use super::walk::{self, AstRewritePass, BlockKind};
 
 pub(super) fn apply(module: &mut AstModule, _context: ReadabilityContext) -> bool {
@@ -185,7 +184,28 @@ fn collect_discardable_unused_locals(
 }
 
 fn is_discard_safe_local_value(value: &crate::ast::AstExpr) -> bool {
-    is_context_safe_expr(value) || is_copy_like_expr(value) || is_lookup_inline_expr(value)
+    // 只允许删除确定无副作用的值：常量和局部/全局变量引用。
+    // 不包含 field/index access，因为它们可能触发 __index metamethod，
+    // 删除后会改变程序可观察行为。
+    is_definitely_pure_expr(value)
+}
+
+/// 只包含无法触发任何 metamethod 的表达式。
+fn is_definitely_pure_expr(expr: &crate::ast::AstExpr) -> bool {
+    use crate::ast::AstExpr;
+    match expr {
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::Var(_) => true,
+        AstExpr::SingleValue(inner) => is_definitely_pure_expr(inner),
+        _ => false,
+    }
 }
 
 fn block_captures_binding(block: &AstBlock, binding: AstBindingRef) -> bool {

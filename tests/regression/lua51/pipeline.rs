@@ -1639,7 +1639,7 @@ mod decompile_pipeline {
             .as_ref()
             .expect("generate stage should provide source");
         assert!(
-            generated.source.contains("value = value2 + (tbl:next() or 1)"),
+            generated.source.contains("value = value2 + (value3:next() or 1)"),
             "{}",
             generated.source
         );
@@ -1860,7 +1860,7 @@ mod decompile_pipeline {
             .as_ref()
             .expect("generate stage should provide source");
         assert!(
-            generated.source.contains("a:method1():method2(a.prop)"),
+            generated.source.contains("value:method1():method2(a.prop)"),
             "{}",
             generated.source
         );
@@ -2038,7 +2038,12 @@ mod decompile_pipeline {
             generated.source
         );
         assert!(
-            generated.source.contains("result:add(2):read()"),
+            generated.source.contains("result:add(2)"),
+            "{}",
+            generated.source
+        );
+        assert!(
+            generated.source.contains("result2:read()"),
             "{}",
             generated.source
         );
