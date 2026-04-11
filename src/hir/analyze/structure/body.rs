@@ -582,14 +582,19 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stop: Option<BlockRef>,
     ) -> Option<Option<StructuredBranchPlan>> {
         let Some(BranchShortCircuitPlan {
-            cond,
-            truthy,
+            mut cond,
+            mut truthy,
             falsy,
-            consumed_headers,
+            mut consumed_headers,
         }) = build_branch_short_circuit_plan(self.lowering, header)
         else {
             return Some(None);
         };
+
+        // 当短路的 truthy 出口是一个退化分支（两条 CFG 边都指向同一个后继 == falsy）时，
+        // 该 block 是 `(sc_cond) and guard then end` 中空体守卫的残留。
+        // 直接把守卫条件折叠进 SC 条件，避免它作为 body 被 lower_linear_block 丢弃。
+        self.absorb_degenerate_guards(&mut cond, &mut truthy, falsy, stop, &mut consumed_headers);
 
         // 单节点 short-circuit 和普通 branch 在结构信息上是重叠的。
         // 这里如果已经有 plain branch candidate，就优先走普通 branch 恢复：
@@ -600,6 +605,20 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if consumed_headers.len() == 1 && self.branch_by_header.contains_key(&header) {
             return Some(None);
         }
+
+        // 退化守卫吸收后 truthy 可能等于 falsy（body 完全为空），
+        // 直接产出空 body 的 if-then，避免后续 postdom 推导制造出
+        // then_entry == else_entry 的畸形 plan。
+        if truthy == falsy {
+            return Some(Some(StructuredBranchPlan {
+                cond,
+                then_entry: truthy,
+                else_entry: None,
+                merge: Some(falsy),
+                consumed_headers,
+            }));
+        }
+
         // 当 then_entry 恰好等于当前 scope 的 stop 时，short-circuit 的 then 体会
         // 被 branch_stop_for_region 截断为空，同时 merge (falsy) 又超出 stop 所在
         // 作用域——此时 consumed_headers 会提前吞掉 stop block 的 visit 标记，
@@ -630,6 +649,59 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             merge: (merge != self.lowering.cfg.exit_block).then_some(merge),
             consumed_headers,
         }))
+    }
+
+    /// 当短路候选的 truthy 出口指向一个退化分支 block（两条 CFG 边都流向同一目标），
+    /// 且该目标恰好等于 falsy 出口时，把那个退化 block 的条件吸收成 `cond and guard`。
+    ///
+    /// 典型场景：`if (A or B) and C then end`，编译器为空体保留了 TEST 退化 block，
+    /// 其 truthy/falsy 都流向 merge。如果不做吸收，该退化 block 会作为 body 被
+    /// `lower_linear_block` 直接跳过，丢失 `and C` 部分。
+    fn absorb_degenerate_guards(
+        &self,
+        cond: &mut HirExpr,
+        truthy: &mut BlockRef,
+        falsy: BlockRef,
+        stop: Option<BlockRef>,
+        consumed_headers: &mut Vec<BlockRef>,
+    ) {
+        loop {
+            // 如果当前 truthy 恰好是外层 region 的 stop（即上层分支的 merge），
+            // 吸收它会连带把 visit 标记提前打上，等外层 merge 回来时发现 block 已被
+            // 访问过而导致结构化整体失败。此时放弃吸收，让外层自然处理。
+            if Some(*truthy) == stop {
+                break;
+            }
+            let Some(degenerate_target) = self.degenerate_branch_target(*truthy) else {
+                break;
+            };
+            if degenerate_target != falsy {
+                break;
+            }
+            let Some(guard_subject) = lower_short_circuit_subject(self.lowering, *truthy) else {
+                break;
+            };
+            let old_cond = std::mem::replace(cond, HirExpr::Boolean(false));
+            *cond = HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+                lhs: old_cond,
+                rhs: guard_subject,
+            }));
+            consumed_headers.push(*truthy);
+            *truthy = degenerate_target;
+        }
+    }
+
+    /// 返回退化分支 block 的唯一后继（两条 CFG 边都指向同一 block），
+    /// 非退化分支或非分支 block 返回 None。
+    fn degenerate_branch_target(&self, block: BlockRef) -> Option<BlockRef> {
+        let (then_edge, else_edge) = self.lowering.cfg.branch_edges(block)?;
+        let then_target = self.lowering.cfg.edges[then_edge.index()].to;
+        let else_target = self.lowering.cfg.edges[else_edge.index()].to;
+        if then_target == else_target {
+            Some(then_target)
+        } else {
+            None
+        }
     }
 
     pub(super) fn lower_candidate_cond(

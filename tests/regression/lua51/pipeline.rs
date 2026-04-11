@@ -2553,6 +2553,51 @@ mod decompile_pipeline {
             generated_without_comments.source
         );
     }
+
+    #[test]
+    fn degenerate_guard_and_chain_generate_preserves_trailing_and_condition() {
+        let result = decompile(
+            &compile_lua_case(
+                "lua5.1",
+                "tests/lua_cases/common/tricky/36_degenerate_guard_and_chain.lua",
+            ),
+            DecompileOptions {
+                target_stage: DecompileStage::Generate,
+                ..DecompileOptions::default()
+            },
+        )
+        .expect("degenerate_guard_and_chain generate stage should succeed");
+
+        let generated = result
+            .state
+            .generated
+            .as_ref()
+            .expect("generate stage should provide source");
+        // `(A or B) and C then end` — the `and C` must not be silently dropped.
+        assert!(
+            generated.source.contains("r0_0 == 1 or r0_0 == 2) and r0_1 then"),
+            "empty-body degenerate guard 'and r0_1' was dropped:\n{}",
+            generated.source
+        );
+        // Non-empty body variant must also keep the guard.
+        assert!(
+            generated.source.contains("and r0_1 then\n    print(\"body\")\nend"),
+            "non-empty-body guard was dropped:\n{}",
+            generated.source
+        );
+        // Three-way or chain with trailing guard.
+        assert!(
+            generated.source.contains("r0_0 == 3) and r0_1 then"),
+            "three-way or-chain guard was dropped:\n{}",
+            generated.source
+        );
+        // Must NOT fall back to goto-label.
+        assert!(
+            !generated.source.contains("goto"),
+            "should use structured control flow:\n{}",
+            generated.source
+        );
+    }
 }
 
 fn compile_lua_case(dialect_label: &str, source_relative: &str) -> Vec<u8> {
