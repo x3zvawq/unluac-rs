@@ -74,17 +74,24 @@ pub(crate) fn recover_short_value_merge_expr_recovery_with_allowed_blocks(
             allowed_blocks,
         )
     {
-        return Some(ValueMergeExprRecovery::Pure {
+        let recovery = ValueMergeExprRecovery::Pure {
             expr,
             consumed_header_subject,
-        });
+        };
+        if !expr_references_consumed_subject_temps(lowering, short, &recovery) {
+            return Some(recovery);
+        }
     }
 
     let expr = build_impure_value_merge_expr(lowering, short, short.entry)?;
     if expr_references_forbidden_candidate_temps(lowering, short, &expr, allowed_blocks) {
         return None;
     }
-    Some(ValueMergeExprRecovery::Impure(expr))
+    let recovery = ValueMergeExprRecovery::Impure(expr);
+    if expr_references_consumed_subject_temps(lowering, short, &recovery) {
+        return None;
+    }
+    Some(recovery)
 }
 
 fn recover_pure_value_decision_expr_with_allowed_blocks(
@@ -521,7 +528,36 @@ pub(crate) fn value_merge_skipped_blocks(short: &ShortCircuitCandidate) -> BTree
         .filter(|block| *block != short.header)
         .collect()
 }
-
+/// 当值短路恢复把 header 的 subject 吸收进表达式后（`consumes_header_subject`），
+/// subject-producing 指令会被 suppress，其 def 对应的 temp 不再有独立的赋值语句。
+/// 如果已构建的表达式在 subject 以外的子树中仍引用了这些 temp（例如 `t999["key"]`），
+/// 就会产生"空 local"孤儿。该函数检测这种情况，让调用方能及时拒绝本次恢复。
+fn expr_references_consumed_subject_temps(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+    recovery: &ValueMergeExprRecovery,
+) -> bool {
+    if !recovery.consumes_header_subject() {
+        return false;
+    }
+    let consumed_instrs = consumed_value_merge_subject_instrs(lowering, short.header);
+    if consumed_instrs.is_empty() {
+        return false;
+    }
+    let consumed_temps: BTreeSet<TempId> = consumed_instrs
+        .into_iter()
+        .flat_map(|instr| {
+            lowering.dataflow.instr_defs[instr.index()]
+                .iter()
+                .copied()
+                .map(|def_id| lowering.bindings.fixed_temps[def_id.index()])
+        })
+        .collect();
+    let expr = match recovery {
+        ValueMergeExprRecovery::Pure { expr, .. } | ValueMergeExprRecovery::Impure(expr) => expr,
+    };
+    super::guards::expr_references_any_temp(expr, &consumed_temps)
+}
 /// 当值短路已经把某个 branch header 的 subject 直接吸收到表达式里时，紧邻 branch 的
 /// subject-producing def 不应该再作为 prefix 语句单独物化，否则就会出现“先求值一次，
 /// 表达式里又再求值一次”的重复。

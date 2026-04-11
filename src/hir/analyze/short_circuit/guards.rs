@@ -61,7 +61,7 @@ fn decision_target_references_any_temp(
     }
 }
 
-fn expr_references_any_temp(expr: &HirExpr, forbidden: &BTreeSet<TempId>) -> bool {
+pub(super) fn expr_references_any_temp(expr: &HirExpr, forbidden: &BTreeSet<TempId>) -> bool {
     match expr {
         HirExpr::TempRef(temp) => forbidden.contains(temp),
         HirExpr::TableAccess(access) => {
