@@ -45,7 +45,8 @@ impl AstRewritePass for BranchPrettyPass {
         let folded_else = fold_terminal_goto_else(block);
         let folded_guard = fold_guard_goto_labels(block);
         let folded_terminal_guard = fold_terminal_guard_return(block, kind);
-        changed || folded_else || folded_guard || folded_terminal_guard
+        let removed_nop_gotos = remove_nop_goto_labels(block);
+        changed || folded_else || folded_guard || folded_terminal_guard || removed_nop_gotos
     }
 
     fn rewrite_stmt(&mut self, stmt: &mut AstStmt) -> bool {
@@ -508,6 +509,47 @@ fn stmt_contains_label_or_goto(stmt: &AstStmt) -> bool {
         | AstStmt::Return(_)
         | AstStmt::Error(_) => false,
     }
+}
+
+/// Remove no-op `goto L; ::L::` pairs where the goto immediately precedes its
+/// target label. When the goto is the only reference to the label, both are
+/// removed; otherwise only the goto is dropped.
+fn remove_nop_goto_labels(block: &mut AstBlock) -> bool {
+    let mut remove_indices: Vec<usize> = Vec::new();
+
+    for i in 0..block.stmts.len().saturating_sub(1) {
+        let AstStmt::Goto(goto_stmt) = &block.stmts[i] else {
+            continue;
+        };
+        let AstStmt::Label(label_stmt) = &block.stmts[i + 1] else {
+            continue;
+        };
+        if goto_stmt.target != label_stmt.id {
+            continue;
+        }
+        remove_indices.push(i);
+        if count_goto_target_in_block(block, goto_stmt.target) == 1 {
+            remove_indices.push(i + 1);
+        }
+    }
+
+    if remove_indices.is_empty() {
+        return false;
+    }
+
+    let old_stmts = std::mem::take(&mut block.stmts);
+    block.stmts = old_stmts
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, stmt)| {
+            if remove_indices.contains(&i) {
+                None
+            } else {
+                Some(stmt)
+            }
+        })
+        .collect();
+    true
 }
 
 fn negate_guard_condition(expr: AstExpr) -> AstExpr {
