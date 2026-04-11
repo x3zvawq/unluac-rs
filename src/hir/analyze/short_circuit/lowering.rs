@@ -67,7 +67,13 @@ pub(crate) fn lower_value_leaf_expr(
     }
 
     let def = value_leaf_latest_local_def(short, block)?;
-    expr_for_fixed_def_single_eval(lowering, def)
+    // 优先用 inline（不深度展开 call）来恢复 leaf 值表达式；
+    // 只有 inline 无法给出结果时（例如 Move 指令），才退回 single_eval。
+    //
+    // 避免的问题：GETTABLE 叶子的 base 寄存器是已物化 temp（如 GetBuff 调用结果 t87）时，
+    // single_eval 会沿 expr_for_reg_use_single_eval → expr_for_fixed_def(call) 路径把整条
+    // call 链重新展开，生成重复调用的表达式，而不是引用已有的 TempRef(t87)。
+    expr_for_fixed_def(lowering, def).or_else(|| expr_for_fixed_def_single_eval(lowering, def))
 }
 
 /// 语句级短路恢复已经先把 leaf block 自己的副作用语句物化出来了。

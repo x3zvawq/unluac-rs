@@ -25,8 +25,9 @@ use super::super::common::{
 };
 use super::super::phi_facts::short_circuit_phi_facts;
 use super::shared::{
-    LinearFollowCtx, LinearFollowTarget, block_writes_reg, is_reducible_candidate,
-    prefer_short_circuit_candidate, short_circuit_nodes_are_acyclic, truthy_falsy_targets,
+    LinearFollowCtx, LinearFollowTarget, block_has_ignore_call, block_writes_reg,
+    is_reducible_candidate, prefer_short_circuit_candidate, short_circuit_nodes_are_acyclic,
+    truthy_falsy_targets,
 };
 
 pub(super) fn analyze_value_merge_candidates(
@@ -280,6 +281,8 @@ impl<'a> ValueMergeDagBuilder<'a> {
             |block, succs| {
                 matches!(succs, [succ] if *succ == self.phi.block)
                     && block_writes_reg(self.proto, self.dataflow, self.cfg, block, self.phi.reg)
+                    // 含 call 副作用的块不能作为纯值叶子：其副作用无法用 `x and expr` 表达
+                    && !block_has_ignore_call(self.proto, self.cfg, block)
             },
         )? {
             LinearFollowTarget::Header(header) => {

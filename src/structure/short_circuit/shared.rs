@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cfg::{BlockRef, Cfg, DataflowFacts, DominatorTree};
-use crate::transformer::{InstrRef, LowInstr, LoweredProto, Reg};
+use crate::transformer::{InstrRef, LowInstr, LoweredProto, Reg, ResultPack};
 
 use super::super::common::{
     BranchCandidate, ShortCircuitCandidate, ShortCircuitNode, ShortCircuitNodeRef,
@@ -188,6 +188,17 @@ fn block_is_passthrough(proto: &LoweredProto, cfg: &Cfg, block: BlockRef) -> boo
         ),
         _ => false,
     }
+}
+
+/// 如果 block 内含有 结果数为 0（`ResultPack::Ignore`）的 `Call` 指令，则返回 true。
+/// 这类调用只有副作用、不产生返回值，block 不能被当作纯值叶子节点，
+/// 否则调用副作用会在 `x and expr` 表达式中静默丢失。
+pub(super) fn block_has_ignore_call(proto: &LoweredProto, cfg: &Cfg, block: BlockRef) -> bool {
+    let range = cfg.blocks[block.index()].instrs;
+    (range.start.index()..range.end()).any(|i| match proto.instrs.get(i) {
+        Some(LowInstr::Call(c)) => matches!(c.results, ResultPack::Ignore),
+        _ => false,
+    })
 }
 
 pub(super) fn is_reducible_candidate(
