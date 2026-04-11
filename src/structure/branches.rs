@@ -137,11 +137,16 @@ fn classify_if_else_branch(
 ) -> Option<BranchCandidate> {
     let merge = graph_facts.nearest_common_postdom(then_entry, else_entry)?;
     if merge == cfg.exit_block {
+        // 严格后支配合流是 exit block，说明两侧都有提前 return 的路径。
+        // 但如果一侧的 ipostdom 是非 exit 块且从另一侧可达，那它仍然是
+        // 合法的 if-else merge：提前 return 只是 body 内的 early exit，
+        // 不影响外层的 merge 恢复。
+        let soft = find_soft_merge(cfg, graph_facts, then_entry, else_entry);
         return Some(BranchCandidate {
             header,
             then_entry,
             else_entry: Some(else_entry),
-            merge: None,
+            merge: soft,
             kind: BranchKind::IfElse,
             invert_hint: false,
         });
@@ -229,4 +234,58 @@ fn branch_continuation_score(cfg: &Cfg, start: BlockRef) -> usize {
     }
 
     visited.len()
+}
+
+/// 当严格后支配合流 = exit block 时，沿各分支的 ipostdom 链向上找一个
+/// "软合流"：它不是 exit block，且从另一侧可达。
+///
+/// 典型触发形状：
+/// ```text
+/// if A then        ← header
+///     if B then return end   ← then 侧提前 return，导致 postdom(then)=exit
+///     C
+/// else
+///     D
+/// end
+/// E                ← 软合流 = ipostdom(else)，且从 then 侧也可达
+/// ```
+fn find_soft_merge(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    then_entry: BlockRef,
+    else_entry: BlockRef,
+) -> Option<BlockRef> {
+    let pdom_parent = &graph_facts.post_dominator_tree.parent;
+
+    // 沿 ipostdom 链向上搜索，找到第一个非 exit 且从 `other` 可达的祖先。
+    let walk_chain = |start: BlockRef, other: BlockRef| -> Option<BlockRef> {
+        let mut cursor = start;
+        loop {
+            let parent = (*pdom_parent.get(cursor.index())?)?;
+            if parent == cfg.exit_block {
+                return None;
+            }
+            if cfg.can_reach(other, parent) {
+                return Some(parent);
+            }
+            cursor = parent;
+        }
+    };
+
+    let else_candidate = walk_chain(else_entry, then_entry);
+    let then_candidate = walk_chain(then_entry, else_entry);
+
+    match (else_candidate, then_candidate) {
+        (Some(e), Some(t)) => {
+            // 两侧都找到候选，取离分支更近的（被另一侧后支配的那个）
+            if graph_facts.post_dominates(t, e) {
+                Some(e)
+            } else {
+                Some(t)
+            }
+        }
+        (Some(e), None) => Some(e),
+        (None, Some(t)) => Some(t),
+        (None, None) => None,
+    }
 }

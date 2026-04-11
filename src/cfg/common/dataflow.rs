@@ -415,10 +415,10 @@ impl DataflowFacts {
             // 否则 reaching_values 反映了出口处的 SSA 值。
             if let Some(reg_values) = self.reaching_values_at(last_instr).get(reg) {
                 for value in reg_values.iter() {
-                    if let SsaValue::Phi(upstream) = value {
-                        if alive.insert(upstream) {
-                            queue.push_back(upstream);
-                        }
+                    if let SsaValue::Phi(upstream) = value
+                        && alive.insert(upstream)
+                    {
+                        queue.push_back(upstream);
                     }
                 }
             }
@@ -428,10 +428,9 @@ impl DataflowFacts {
             if let Some(phi) = self.phi_candidates[phi_range.clone()]
                 .iter()
                 .find(|p| p.reg == reg)
+                && alive.insert(phi.id)
             {
-                if alive.insert(phi.id) {
-                    queue.push_back(phi.id);
-                }
+                queue.push_back(phi.id);
             }
             // 若空 block 没有自己的 phi，入口值来源于前驱合并；保守地不再递归，
             // 以避免在大型 CFG 上产生过多开销。此时若有 upstream phi 漏标为 alive，
