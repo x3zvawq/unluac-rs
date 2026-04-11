@@ -171,7 +171,9 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock) -> bool {
                 block.stmts[lookahead] = attempt.rewritten;
                 remaining.drain(attempt.start..(attempt.start + attempt.consumed));
                 sink_changed = true;
-                lookahead += 1;
+                // 不要前进 lookahead：同一条 if / loop 语句可能还有其它分支可以
+                // 接收剩余 binding。例如 `local t12, t7; if ... then t12 = A else
+                // t7 = B end` —— 第一轮把 t12 沉进 then，第二轮把 t7 沉进 else。
                 continue;
             }
             if let Some((start, merged)) = try_sink_hoisted_decl_into_stmt_anywhere(
