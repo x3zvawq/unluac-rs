@@ -84,7 +84,41 @@ pub(crate) fn expr_for_fixed_def(lowering: &ProtoLowering<'_>, def_id: DefId) ->
         _ => None,
     }
 }
+/// `single-eval` 变体：允许沿着 Move/GetTable 链深度展开，
+/// 把 call 等非 dup-safe 的值也直接内联成表达式。
+/// 专门服务被吸收的短路分支里 temp 赋值不会出现的场景。
+pub(crate) fn expr_for_fixed_def_single_eval(
+    lowering: &ProtoLowering<'_>,
+    def_id: DefId,
+) -> Option<HirExpr> {
+    let def_instr = lowering.dataflow.def_instr(def_id);
+    let def_reg = lowering.dataflow.def_reg(def_id);
+    let def_block = lowering.dataflow.def_block(def_id);
+    let instr = lowering.proto.instrs.get(def_instr.index())?;
 
+    match instr {
+        LowInstr::Move(move_instr) if move_instr.dst == def_reg => {
+            return Some(expr_for_reg_use_single_eval(
+                lowering,
+                def_block,
+                def_instr,
+                move_instr.src,
+            ));
+        }
+        LowInstr::GetTable(get_table) if get_table.dst == def_reg => {
+            return Some(lower_table_access_expr_single_eval(
+                lowering,
+                def_block,
+                def_instr,
+                get_table.base,
+                get_table.key,
+            ));
+        }
+        _ => {}
+    }
+
+    expr_for_fixed_def(lowering, def_id)
+}
 /// 这类定义可以安全地在表达式里重复展开，不会额外增加副作用，也不会改变
 /// `newtable/closure/call` 这类“每次求值都不一样”的语义。
 pub(crate) fn expr_for_dup_safe_fixed_def(

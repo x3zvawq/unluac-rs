@@ -247,11 +247,20 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.visited
             .extend(loop_context.break_exits.keys().copied());
         self.install_loop_exit_bindings(candidate, exit, &plan, target_overrides);
+        let mut start = expr_for_reg_use(self.lowering, block, instr_ref, init.index);
+        let mut limit = expr_for_reg_use(self.lowering, block, instr_ref, init.limit);
+        let mut step = expr_for_reg_use(self.lowering, block, instr_ref, init.step);
+        if !target_overrides.is_empty() {
+            let expr_overrides = temp_expr_overrides(target_overrides);
+            rewrite_expr_temps(&mut start, &expr_overrides);
+            rewrite_expr_temps(&mut limit, &expr_overrides);
+            rewrite_expr_temps(&mut step, &expr_overrides);
+        }
         stmts.push(HirStmt::NumericFor(Box::new(HirNumericFor {
             binding,
-            start: expr_for_reg_use(self.lowering, block, instr_ref, init.index),
-            limit: expr_for_reg_use(self.lowering, block, instr_ref, init.limit),
-            step: expr_for_reg_use(self.lowering, block, instr_ref, init.step),
+            start,
+            limit,
+            step,
             body,
         })));
 

@@ -6,7 +6,7 @@
 
 use super::*;
 
-fn lower_open_value_pack<F>(
+fn lower_open_value_pack_single_eval<F>(
     lowering: &ProtoLowering<'_>,
     start_reg: Reg,
     instr_ref: InstrRef,
@@ -15,7 +15,8 @@ fn lower_open_value_pack<F>(
 where
     F: FnMut(Reg) -> HirExpr,
 {
-    let Some((tail_start, tail_expr)) = resolve_open_pack_tail(lowering, instr_ref, start_reg)
+    let Some((tail_start, tail_expr)) =
+        resolve_open_pack_tail_single_eval(lowering, instr_ref, start_reg)
     else {
         return vec![unresolved_expr(format!(
             "open-pack r{} @{}",
@@ -91,7 +92,7 @@ pub(crate) fn lower_value_pack_single_eval(
             })
             .collect(),
         crate::transformer::ValuePack::Open(reg) => {
-            lower_open_value_pack(lowering, reg, instr_ref, |reg| {
+            lower_open_value_pack_single_eval(lowering, reg, instr_ref, |reg| {
                 expr_for_reg_use_single_eval(lowering, block, instr_ref, reg)
             })
         }

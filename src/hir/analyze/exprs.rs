@@ -26,12 +26,18 @@ use crate::transformer::{
 pub(super) use self::access::{
     expr_for_const, expr_for_value_operand, lower_table_access_expr, lower_table_access_target,
 };
-use self::access::{expr_for_value_operand_inline, lower_table_access_expr_inline};
+use self::access::{
+    expr_for_value_operand_inline, lower_table_access_expr_inline,
+    lower_table_access_expr_single_eval,
+};
 pub(super) use self::branch::{
     lower_binary_op, lower_branch_cond, lower_branch_subject, lower_branch_subject_inline,
     lower_branch_subject_single_eval, lower_unary_op,
 };
-pub(super) use self::defs::{expr_for_dup_safe_fixed_def, expr_for_fixed_def, is_multiret_results};
+pub(super) use self::defs::{
+    expr_for_dup_safe_fixed_def, expr_for_fixed_def, expr_for_fixed_def_single_eval,
+    is_multiret_results,
+};
 use self::packs::lower_value_pack_single_eval;
 pub(super) use self::packs::{lower_value_pack, lower_value_pack_components};
 pub(super) use self::regs::{
@@ -75,6 +81,72 @@ fn resolve_open_pack_tail(
     }
 
     None
+}
+
+/// `single_eval` 版本：在短路恢复等已被吸收的 block 里，open temp 不会被物化，
+/// 这里尝试把 open def 直接内联成多返回 call 表达式。
+fn resolve_open_pack_tail_single_eval(
+    lowering: &ProtoLowering<'_>,
+    instr_ref: InstrRef,
+    start_reg: Reg,
+) -> Option<(Reg, HirExpr)> {
+    let defs = lowering.dataflow.open_use_defs_at(instr_ref);
+    if defs.len() == 1 {
+        let def = defs
+            .iter()
+            .next()
+            .expect("len checked above, exactly one reaching open def exists");
+        let open_def = lowering.dataflow.open_defs.get(def.index())?;
+        if open_def.start_reg.index() < start_reg.index() {
+            return None;
+        }
+        let expr = expr_for_open_def_single_eval(lowering, *def)
+            .unwrap_or_else(|| HirExpr::TempRef(lowering.bindings.open_temps[def.index()]));
+        return Some((open_def.start_reg, expr));
+    }
+
+    if defs.is_empty()
+        && lowering.proto.signature.is_vararg
+        && start_reg.index() == usize::from(lowering.proto.signature.num_params)
+    {
+        return Some((start_reg, HirExpr::VarArg));
+    }
+
+    None
+}
+
+/// 把一个 open def (多返回 call / vararg) 直接降成 HIR 表达式。
+fn expr_for_open_def_single_eval(
+    lowering: &ProtoLowering<'_>,
+    open_def_id: crate::cfg::OpenDefId,
+) -> Option<HirExpr> {
+    let open_def = lowering.dataflow.open_defs.get(open_def_id.index())?;
+    let instr = lowering.proto.instrs.get(open_def.instr.index())?;
+    match instr {
+        LowInstr::Call(call) if matches!(call.results, ResultPack::Open(_)) => {
+            Some(HirExpr::Call(Box::new(HirCallExpr {
+                callee: expr_for_reg_use_single_eval(
+                    lowering,
+                    open_def.block,
+                    open_def.instr,
+                    call.callee,
+                ),
+                args: lower_value_pack_single_eval(
+                    lowering,
+                    open_def.block,
+                    open_def.instr,
+                    call.args,
+                ),
+                multiret: true,
+                method: matches!(call.kind, CallKind::Method),
+                method_name: lower_method_name(lowering.proto, call.method_name),
+            })))
+        }
+        LowInstr::VarArg(vararg) if matches!(vararg.results, ResultPack::Open(_)) => {
+            Some(HirExpr::VarArg)
+        }
+        _ => None,
+    }
 }
 
 fn entry_reg_expr(lowering: &ProtoLowering<'_>, reg: Reg) -> HirExpr {

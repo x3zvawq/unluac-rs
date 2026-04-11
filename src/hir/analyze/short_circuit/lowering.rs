@@ -63,11 +63,11 @@ pub(crate) fn lower_value_leaf_expr(
     block: BlockRef,
 ) -> Option<HirExpr> {
     if short.nodes.iter().any(|node| node.header == block) {
-        return lower_short_circuit_subject(lowering, block);
+        return lower_short_circuit_subject_single_eval(lowering, block);
     }
 
     let def = value_leaf_latest_local_def(short, block)?;
-    expr_for_fixed_def(lowering, def)
+    expr_for_fixed_def_single_eval(lowering, def)
 }
 
 /// 语句级短路恢复已经先把 leaf block 自己的副作用语句物化出来了。

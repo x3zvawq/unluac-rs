@@ -50,8 +50,9 @@ pub(super) use self::recovery::{
 use self::recovery::{ChangedRegionEntry, ValueLeafKind, find_changed_region_entry};
 use super::ProtoLowering;
 use super::exprs::{
-    expr_for_dup_safe_fixed_def, expr_for_fixed_def, expr_for_reg_at_block_entry,
-    lower_branch_subject, lower_branch_subject_inline, lower_branch_subject_single_eval,
+    expr_for_dup_safe_fixed_def, expr_for_fixed_def, expr_for_fixed_def_single_eval,
+    expr_for_reg_at_block_entry, lower_branch_subject, lower_branch_subject_inline,
+    lower_branch_subject_single_eval,
 };
 
 #[cfg(test)]

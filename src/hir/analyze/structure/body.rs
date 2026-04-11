@@ -410,6 +410,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             |phi_id| self.overrides.phi_is_suppressed_for_block(block, phi_id),
             allowed_blocks,
         ));
+        // phi 物化语句里的 TempRef 可能引用被 target_overrides 重定向过的旧 temp。
+        if !target_overrides.is_empty() {
+            let phi_expr_overrides = temp_expr_overrides(target_overrides);
+            for stmt in &mut stmts {
+                rewrite_stmt_exprs(stmt, &phi_expr_overrides);
+            }
+        }
         let range = self.lowering.cfg.blocks[block.index()].instrs;
         if range.is_empty() {
             return Some(stmts);

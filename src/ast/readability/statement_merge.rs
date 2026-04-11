@@ -144,6 +144,7 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock) -> bool {
         let use_index = BindingUseIndex::for_stmts(&block.stmts);
 
         let mut remaining = pending_bindings;
+        let mut pinned: Vec<super::super::common::AstLocalBinding> = Vec::new();
         let mut sink_changed = false;
         let mut lookahead = index + 1;
         while lookahead < block.stmts.len() && !remaining.is_empty() {
@@ -173,8 +174,36 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock) -> bool {
                 lookahead += 1;
                 continue;
             }
+            if let Some((start, merged)) = try_sink_hoisted_decl_into_stmt_anywhere(
+                &remaining,
+                &block.stmts[lookahead],
+                &use_index,
+                lookahead + 1,
+            ) {
+                let consumed = merged.bindings.len();
+                block.stmts[lookahead] = AstStmt::LocalDecl(Box::new(merged));
+                remaining.drain(start..start + consumed);
+                sink_changed = true;
+                lookahead += 1;
+                continue;
+            }
             if stmt_references_any_binding(&block.stmts[lookahead], &remaining) {
-                break;
+                // Pin referenced-but-unsinkable bindings: their declarations must
+                // stay at the hoisted position, but other bindings may still be
+                // sinkable into later statements.
+                let mut i = 0;
+                while i < remaining.len() {
+                    if stmt_references_any_binding(
+                        &block.stmts[lookahead],
+                        std::slice::from_ref(&remaining[i]),
+                    ) {
+                        pinned.push(remaining.remove(i));
+                    } else {
+                        i += 1;
+                    }
+                }
+                lookahead += 1;
+                continue;
             }
             lookahead += 1;
         }
@@ -185,6 +214,13 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock) -> bool {
         }
 
         changed = true;
+
+        // Merge pinned (unsinkable) bindings back into remaining, preserving
+        // the original declaration order so that the emitted `local` list stays
+        // deterministic and readable.
+        remaining.extend(pinned);
+        remaining.sort_by_key(|b| b.id);
+
         if remaining.is_empty() {
             block.stmts.remove(index);
             continue;
@@ -501,6 +537,62 @@ fn is_temp_like_binding(binding: AstBindingRef) -> bool {
         binding,
         AstBindingRef::Temp(_) | AstBindingRef::SyntheticLocal(_)
     )
+}
+
+/// Like [`try_sink_hoisted_decl_into_stmt`], but searches for matching bindings
+/// *anywhere* in `pending` instead of requiring them at the front.  Returns
+/// `(start_index, AstLocalDecl)` on success, where `start_index` is the
+/// position in `pending` where the matched bindings begin.
+fn try_sink_hoisted_decl_into_stmt_anywhere(
+    pending: &[super::super::common::AstLocalBinding],
+    stmt: &AstStmt,
+    use_index: &BindingUseIndex,
+    suffix_start: usize,
+) -> Option<(usize, AstLocalDecl)> {
+    let AstStmt::Assign(assign) = stmt else {
+        return None;
+    };
+    if assign.values.is_empty() || assign.targets.is_empty() || assign.targets.len() > pending.len()
+    {
+        return None;
+    }
+    let target_len = assign.targets.len();
+    for start in 0..=pending.len() - target_len {
+        let candidate = &pending[start..start + target_len];
+        if !candidate
+            .iter()
+            .zip(assign.targets.iter())
+            .all(|(binding, target)| local_binding_matches_target(binding.id, target))
+        {
+            continue;
+        }
+        // Only sink if none of the candidate bindings are used after this statement.
+        if candidate
+            .iter()
+            .any(|b| use_index.count_uses_in_suffix(suffix_start, b.id) != 0)
+        {
+            continue;
+        }
+        // RHS must not reference any remaining pending bindings that come *after*
+        // the consumed slice (same safety check as the front-only variant).
+        let after = &pending[start + target_len..];
+        if !after.is_empty() && stmt_references_any_binding_in_assign(assign, after) {
+            continue;
+        }
+        // Also check bindings *before* the consumed slice.
+        let before = &pending[..start];
+        if !before.is_empty() && stmt_references_any_binding_in_assign(assign, before) {
+            continue;
+        }
+        return Some((
+            start,
+            AstLocalDecl {
+                bindings: candidate.to_vec(),
+                values: assign.values.clone(),
+            },
+        ));
+    }
+    None
 }
 
 fn stmt_references_any_binding_in_assign(
