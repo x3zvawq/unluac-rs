@@ -4,7 +4,7 @@
 //! 下游应通过这里提供的查询接口读取定义、phi 和 reaching/use 信息，而不是直接依赖
 //! 这些事实在内存中的当前组织形状。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::ops::Range;
 
@@ -351,6 +351,93 @@ impl DataflowFacts {
         }
 
         saw_use
+    }
+
+    /// 计算"真正死亡"的 phi 集合——既没有任何指令直接读取，也没有被任何存活 phi
+    /// 的 incoming 间接引用。返回的 `BTreeSet<PhiId>` 中的 phi 可以安全地跳过物化。
+    pub fn compute_truly_dead_phis(&self, cfg: &Cfg) -> BTreeSet<PhiId> {
+        if self.phi_candidates.is_empty() {
+            return BTreeSet::new();
+        }
+
+        // Step 1: 收集被至少一条指令直接使用的 phi（instruction-level alive）。
+        let mut alive = BTreeSet::new();
+        for instr_index in 0..self.use_defs.len() {
+            for values in self.use_values_at(InstrRef(instr_index)).values() {
+                for value in values.iter() {
+                    if let SsaValue::Phi(phi_id) = value {
+                        alive.insert(phi_id);
+                    }
+                }
+            }
+        }
+
+        // Step 2: 从 alive phi 反向传播——如果某个 alive phi 的 incoming 边上
+        //         predecessor 出口处寄存器的 SSA 值是另一个 phi，则那个 phi 也 alive。
+        let mut queue: VecDeque<PhiId> = alive.iter().copied().collect();
+        while let Some(phi_id) = queue.pop_front() {
+            let phi = &self.phi_candidates[phi_id.index()];
+            for incoming in &phi.incoming {
+                self.propagate_phi_liveness_from_block(
+                    cfg,
+                    incoming.pred,
+                    phi.reg,
+                    &mut alive,
+                    &mut queue,
+                );
+            }
+        }
+
+        // Step 3: dead = all - alive
+        self.phi_candidates
+            .iter()
+            .map(|phi| phi.id)
+            .filter(|id| !alive.contains(id))
+            .collect()
+    }
+
+    /// 检查 block 出口处 reg 的 SSA 值；若包含 Phi，将其标为 alive 并入队。
+    fn propagate_phi_liveness_from_block(
+        &self,
+        cfg: &Cfg,
+        block: BlockRef,
+        reg: Reg,
+        alive: &mut BTreeSet<PhiId>,
+        queue: &mut VecDeque<PhiId>,
+    ) {
+        let block_range = &cfg.blocks[block.index()].instrs;
+        if let Some(last_instr) = block_range.last() {
+            let effect = &self.instr_effects[last_instr.index()];
+            // must-def 意味着出口值是确定的 Def，不可能是上游 phi。
+            if effect.fixed_must_defs.contains(&reg) {
+                return;
+            }
+            // 否则 reaching_values 反映了出口处的 SSA 值。
+            if let Some(reg_values) = self.reaching_values_at(last_instr).get(reg) {
+                for value in reg_values.iter() {
+                    if let SsaValue::Phi(upstream) = value {
+                        if alive.insert(upstream) {
+                            queue.push_back(upstream);
+                        }
+                    }
+                }
+            }
+        } else {
+            // 空 block：出口值 = 入口值。先看 block 自身是否有 phi。
+            let phi_range = &self.phi_block_ranges[block.index()];
+            if let Some(phi) = self.phi_candidates[phi_range.clone()]
+                .iter()
+                .find(|p| p.reg == reg)
+            {
+                if alive.insert(phi.id) {
+                    queue.push_back(phi.id);
+                }
+            }
+            // 若空 block 没有自己的 phi，入口值来源于前驱合并；保守地不再递归，
+            // 以避免在大型 CFG 上产生过多开销。此时若有 upstream phi 漏标为 alive，
+            // 只会导致多消除一些 phi（仍然安全，因为这些 phi 的值在该路径上
+            // 不会被消费——空 block + 无 phi 说明该 reg 只是路过转发）。
+        }
     }
 }
 

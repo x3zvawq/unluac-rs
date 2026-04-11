@@ -35,10 +35,17 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             let temp = *self.lowering.bindings.phi_temps.get(value.phi_id.index())?;
             let target = self.loop_state_target(candidate, exit, value.reg, temp, target_overrides);
             plan.backedge_target_overrides.insert(temp, target.clone());
-            for def in value.inside_arm.defs() {
-                let def_temp = *self.lowering.bindings.fixed_temps.get(def.index())?;
-                plan.backedge_target_overrides
-                    .insert(def_temp, target.clone());
+            // phi_use_count == 0 表示整个 proto 没有任何指令真正读取这条 phi 的 SSA 值——
+            // 寄存器只是被循环体借用来做临时运算。此时跳过 inside_arm 重定向，让体内的
+            // 定义保留为独立 temp，后续 inline pass 就能把 `t = GetBuff; t2 = 10864;
+            // t(t2,1)` 折叠成 `GetBuff(10864,1)`。phi temp 本身仍保留在 plan 里，
+            // 以确保 init 赋值和 suppress 机制不受影响。
+            if self.lowering.dataflow.phi_use_count(value.phi_id) > 0 {
+                for def in value.inside_arm.defs() {
+                    let def_temp = *self.lowering.bindings.fixed_temps.get(def.index())?;
+                    plan.backedge_target_overrides
+                        .insert(def_temp, target.clone());
+                }
             }
 
             plan.states.push(LoopStateSlot {
@@ -73,10 +80,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             let temp = *self.lowering.bindings.phi_temps.get(value.phi_id.index())?;
             let target = self.loop_state_target(candidate, exit, value.reg, temp, target_overrides);
             plan.backedge_target_overrides.insert(temp, target.clone());
-            for def in value.inside_arm.defs() {
-                let def_temp = *self.lowering.bindings.fixed_temps.get(def.index())?;
-                plan.backedge_target_overrides
-                    .insert(def_temp, target.clone());
+            if self.lowering.dataflow.phi_use_count(value.phi_id) > 0 {
+                for def in value.inside_arm.defs() {
+                    let def_temp = *self.lowering.bindings.fixed_temps.get(def.index())?;
+                    plan.backedge_target_overrides
+                        .insert(def_temp, target.clone());
+                }
             }
 
             plan.states.push(LoopStateSlot {

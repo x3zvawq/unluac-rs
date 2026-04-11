@@ -61,6 +61,7 @@ pub(super) struct ProtoLowering<'a> {
     pub(super) structure: &'a StructureFacts,
     pub(super) child_refs: &'a [HirProtoRef],
     pub(super) bindings: ProtoBindings,
+    pub(super) dead_phis: BTreeSet<PhiId>,
 }
 
 #[derive(Clone, Copy)]
@@ -120,6 +121,7 @@ pub(super) fn lower_proto(
         .collect::<Vec<_>>();
 
     let bindings = build_bindings(proto, cfg, dataflow, structure);
+    let dead_phis = dataflow.compute_truly_dead_phis(cfg);
     let lowering = ProtoLowering {
         proto,
         cfg,
@@ -128,6 +130,7 @@ pub(super) fn lower_proto(
         structure,
         child_refs: &child_refs,
         bindings,
+        dead_phis,
     };
 
     artifacts.protos[id.index()] = HirProto {
@@ -299,6 +302,9 @@ fn lower_edge_phi_copies(
     let mut targets = Vec::new();
     let mut values = Vec::new();
     for phi in lowering.dataflow.phi_candidates_in_block(to) {
+        if lowering.dead_phis.contains(&phi.id) {
+            continue;
+        }
         targets.push(HirLValue::Temp(lowering.bindings.phi_temps[phi.id.index()]));
         values.push(expr_for_reg_at_block_exit(lowering, from, phi.reg));
     }
@@ -347,7 +353,7 @@ pub(super) fn lower_phi_materialization_with_allowed_blocks_except(
         let Some(phi_id) = short.result_phi_id else {
             unreachable!("value-merge short-circuit should carry a phi id");
         };
-        if is_suppressed(phi_id) {
+        if is_suppressed(phi_id) || lowering.dead_phis.contains(&phi_id) {
             continue;
         }
 
@@ -387,6 +393,7 @@ pub(super) fn lower_phi_materialization_with_allowed_blocks_except(
     stmts.extend(
         generic_phi_materializations_in_block(lowering, block)
             .filter(|phi| !is_suppressed(phi.phi_id))
+            .filter(|phi| !lowering.dead_phis.contains(&phi.phi_id))
             .filter(|phi| !covered_phi_ids.contains(&phi.phi_id))
             .filter_map(|phi| {
                 let temp = lowering
