@@ -4,6 +4,7 @@ use unluac::decompile::{
     DebugColorMode, DebugDetail, DebugOptions, DecompileDialect, DecompileOptions, DecompileStage,
     decompile,
 };
+use unluac::naming::NamingOptions;
 
 mod decompile_pipeline {
     use super::*;
@@ -27,6 +28,7 @@ mod decompile_pipeline {
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
+                naming: NamingOptions::default(),
                 ..DecompileOptions::default()
             },
         )
@@ -35,8 +37,8 @@ mod decompile_pipeline {
         assert_eq!(result.state.completed_stage, Some(DecompileStage::Ast));
         let dump = &result.debug_output[0].content;
         assert!(dump.contains("===== Dump AST ====="), "{dump}");
-        assert!(dump.contains("goto L"), "{dump}");
-        assert!(dump.contains("::L"), "{dump}");
+        assert!(!dump.contains("goto "), "{dump}");
+        assert!(dump.contains("if (l0 % 2) ~= 0 then"), "{dump}");
         assert!(!dump.contains("\ncontinue\n"), "{dump}");
     }
 
@@ -59,6 +61,7 @@ mod decompile_pipeline {
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
+                naming: NamingOptions::default(),
                 ..DecompileOptions::default()
             },
         )
@@ -120,6 +123,7 @@ mod decompile_pipeline {
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
+                naming: NamingOptions::default(),
                 ..DecompileOptions::default()
             },
         )
@@ -190,6 +194,7 @@ mod decompile_pipeline {
                     detail: DebugDetail::Verbose,
                     filters: Default::default(),
                 },
+                naming: NamingOptions::default(),
                 ..DecompileOptions::default()
             },
         )
@@ -233,6 +238,7 @@ mod decompile_pipeline {
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
+                naming: NamingOptions::default(),
                 ..DecompileOptions::default()
             },
         )
@@ -335,6 +341,7 @@ mod decompile_pipeline {
                     detail: DebugDetail::Verbose,
                     filters: Default::default(),
                 },
+                naming: NamingOptions::default(),
                 ..DecompileOptions::default()
             },
         )
@@ -368,6 +375,7 @@ mod decompile_pipeline {
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
+                naming: NamingOptions::default(),
                 ..DecompileOptions::default()
             },
         )
@@ -380,7 +388,7 @@ mod decompile_pipeline {
             .as_ref()
             .expect("generate stage should leave generated source in state");
         assert!(
-            generated.source.contains("for i = 1, a, 1 do"),
+            generated.source.contains("for i = 1, a do"),
             "{}",
             generated.source
         );
@@ -426,6 +434,7 @@ mod decompile_pipeline {
                     detail: DebugDetail::Verbose,
                     filters: Default::default(),
                 },
+                naming: NamingOptions::default(),
                 ..DecompileOptions::default()
             },
         )
@@ -462,6 +471,7 @@ mod decompile_pipeline {
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
+                naming: NamingOptions::default(),
                 ..DecompileOptions::default()
             },
         )
@@ -495,7 +505,7 @@ mod decompile_pipeline {
             generated.source
         );
         assert!(
-            generated.source.contains("for i = 1, 5, 1 do"),
+            generated.source.contains("for i = 1, 5 do"),
             "{}",
             generated.source
         );

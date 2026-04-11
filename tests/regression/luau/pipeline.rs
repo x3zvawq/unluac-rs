@@ -4,6 +4,7 @@ use unluac::decompile::{
     DebugColorMode, DebugDetail, DebugOptions, DecompileDialect, DecompileOptions, DecompileStage,
     decompile,
 };
+use unluac::naming::NamingOptions;
 
 mod decompile_pipeline {
     use super::*;
@@ -27,6 +28,7 @@ mod decompile_pipeline {
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
+                naming: NamingOptions::default(),
                 ..DecompileOptions::default()
             },
         )
@@ -53,6 +55,7 @@ mod decompile_pipeline {
             DecompileOptions {
                 dialect: DecompileDialect::Luau,
                 target_stage: DecompileStage::Generate,
+                naming: NamingOptions::default(),
                 ..DecompileOptions::default()
             },
         )
@@ -86,6 +89,7 @@ mod decompile_pipeline {
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
                 },
+                naming: NamingOptions::default(),
                 ..DecompileOptions::default()
             },
         )
@@ -116,6 +120,7 @@ mod decompile_pipeline {
                     detail: DebugDetail::Verbose,
                     filters: Default::default(),
                 },
+                naming: NamingOptions::default(),
                 ..DecompileOptions::default()
             },
         )
@@ -137,6 +142,7 @@ mod decompile_pipeline {
             DecompileOptions {
                 dialect: DecompileDialect::Luau,
                 target_stage: DecompileStage::Generate,
+                naming: NamingOptions::default(),
                 ..DecompileOptions::default()
             },
         )
