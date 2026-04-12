@@ -153,7 +153,7 @@ pub(super) fn resolve_output_plan(
     }
 }
 
-fn unsupported_ast_features(module: &AstModule, target: AstTargetDialect) -> BTreeSet<AstFeature> {
+pub(super) fn unsupported_ast_features(module: &AstModule, target: AstTargetDialect) -> BTreeSet<AstFeature> {
     collect_ast_features(module)
         .into_iter()
         .filter(|feature| !target.supports_feature(*feature))
@@ -246,67 +246,5 @@ pub(super) fn ast_lowering_target(
         target
     } else {
         AstTargetDialect::relaxed_for_lowering(target.version)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ast::{AstBlock, AstExpr, AstGoto, AstLabel, AstLabelId, AstStmt, AstWhile};
-    use crate::hir::HirProtoRef;
-
-    fn module_with_stmts(stmts: Vec<AstStmt>) -> AstModule {
-        AstModule {
-            entry_function: HirProtoRef(0),
-            body: AstBlock { stmts },
-        }
-    }
-
-    #[test]
-    fn best_effort_should_upgrade_lua51_goto_to_lua52() {
-        let label = AstLabelId(1);
-        let module = module_with_stmts(vec![
-            AstStmt::Goto(Box::new(AstGoto { target: label })),
-            AstStmt::Label(Box::new(AstLabel { id: label })),
-        ]);
-
-        let plan = resolve_output_plan(
-            &module,
-            AstTargetDialect::new(AstDialectVersion::Lua51),
-            crate::readability::ReadabilityOptions::default(),
-            GenerateMode::BestEffort,
-            &TimingCollector::disabled(),
-        );
-
-        assert_eq!(plan.target.version, AstDialectVersion::Lua52);
-        assert_eq!(plan.generate_mode, GenerateMode::Strict);
-        assert!(unsupported_ast_features(&plan.readability, plan.target).is_empty());
-        assert_eq!(plan.warnings.len(), 1);
-    }
-
-    #[test]
-    fn best_effort_should_fall_back_to_permissive_when_no_single_dialect_fits() {
-        let label = AstLabelId(1);
-        let module = module_with_stmts(vec![
-            AstStmt::While(Box::new(AstWhile {
-                cond: AstExpr::Boolean(true),
-                body: AstBlock {
-                    stmts: vec![AstStmt::Continue],
-                },
-            })),
-            AstStmt::Goto(Box::new(AstGoto { target: label })),
-            AstStmt::Label(Box::new(AstLabel { id: label })),
-        ]);
-
-        let plan = resolve_output_plan(
-            &module,
-            AstTargetDialect::new(AstDialectVersion::Lua51),
-            crate::readability::ReadabilityOptions::default(),
-            GenerateMode::BestEffort,
-            &TimingCollector::disabled(),
-        );
-
-        assert_eq!(plan.generate_mode, GenerateMode::Permissive);
-        assert!(!plan.warnings.is_empty());
     }
 }

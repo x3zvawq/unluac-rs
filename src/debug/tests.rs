@@ -2,7 +2,8 @@
 //!
 //! 我们把测试和实现分开存放，避免主实现文件被大段 `#[cfg(test)]` 代码淹没。
 
-use super::{DebugColorMode, DebugPalette, colorize_inline};
+use super::DebugColorMode;
+use super::colorize::{DebugPalette, colorize_inline};
 
 #[test]
 fn colorizes_elseif_as_keyword() {

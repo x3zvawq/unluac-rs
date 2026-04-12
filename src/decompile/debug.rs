@@ -3,24 +3,11 @@
 //! 默认构建会保留完整调试导出能力，方便 CLI 和仓库内调试工作流复用；
 //! 当关闭 `decompile-debug` feature 时，这里会退化成只保留公共类型与空实现，
 //! 让 wasm 发布产物不再把各阶段 dump 渲染逻辑一起打包进去。
+//!
+//! 所有 `dump_*` 公共函数通过 `define_stage_dump!` 宏统一生成，
+//! 避免每个阶段手写一对 `#[cfg]` / `#[cfg(not)]` 实现。
 
-#[cfg(feature = "decompile-debug")]
-use crate::ast;
-#[cfg(feature = "decompile-debug")]
-use crate::cfg;
 use crate::debug::{DebugDetail, DebugFilters};
-#[cfg(feature = "decompile-debug")]
-use crate::generate;
-#[cfg(feature = "decompile-debug")]
-use crate::hir;
-#[cfg(feature = "decompile-debug")]
-use crate::naming;
-#[cfg(feature = "decompile-debug")]
-use crate::parser;
-#[cfg(feature = "decompile-debug")]
-use crate::structure;
-#[cfg(feature = "decompile-debug")]
-use crate::transformer;
 
 use super::error::DecompileError;
 use super::state::{DecompileStage, DecompileState};
@@ -44,267 +31,107 @@ pub struct StageDebugOutput {
     pub content: String,
 }
 
-/// 对外保留 parser 阶段的统一包装，方便库层调用方继续从 decompile 命名空间访问。
-#[cfg(feature = "decompile-debug")]
-pub fn dump_parser(
-    chunk: &crate::parser::RawChunk,
-    options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Ok(StageDebugOutput {
-        stage: DecompileStage::Parse,
-        detail: options.detail,
-        content: parser::dump_parser(chunk, options.detail, &options.filters, options.color),
-    })
+/// 生成一对 `#[cfg(feature)]` / `#[cfg(not)]` 的阶段 dump 包装函数。
+///
+/// 启用 `decompile-debug` 时调用底层模块的 dump 函数并包装为 `StageDebugOutput`；
+/// 禁用时统一返回 `DebugUnavailable`，让 wasm 产物不带渲染逻辑。
+macro_rules! define_stage_dump {
+    (
+        $(#[doc = $doc:literal])*
+        pub fn $name:ident ( $($arg:ident : & $arg_ty:ty),+ $(,)? )
+            => $stage:expr, $inner:expr
+    ) => {
+        $(#[doc = $doc])*
+        #[cfg(feature = "decompile-debug")]
+        pub fn $name(
+            $($arg: &$arg_ty,)+
+            options: &DebugOptions,
+        ) -> Result<StageDebugOutput, DecompileError> {
+            Ok(StageDebugOutput {
+                stage: $stage,
+                detail: options.detail,
+                content: $inner($($arg,)+ options.detail, &options.filters, options.color),
+            })
+        }
+
+        $(#[doc = $doc])*
+        #[cfg(not(feature = "decompile-debug"))]
+        pub fn $name(
+            $(_: &$arg_ty,)+
+            _options: &DebugOptions,
+        ) -> Result<StageDebugOutput, DecompileError> {
+            Err(DecompileError::DebugUnavailable)
+        }
+    };
 }
 
-/// 对外保留 parser 阶段的统一包装，方便库层调用方继续从 decompile 命名空间访问。
-#[cfg(not(feature = "decompile-debug"))]
-pub fn dump_parser(
-    _chunk: &crate::parser::RawChunk,
-    _options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Err(DecompileError::DebugUnavailable)
+define_stage_dump! {
+    /// Parser 阶段的调试导出。
+    pub fn dump_parser(chunk: &crate::parser::RawChunk)
+        => DecompileStage::Parse, crate::parser::dump_parser
 }
 
-/// 对外保留 transformer 阶段的统一包装，方便库层调用方继续从 decompile 命名空间访问。
-#[cfg(feature = "decompile-debug")]
-pub fn dump_lir(
-    chunk: &crate::transformer::LoweredChunk,
-    options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Ok(StageDebugOutput {
-        stage: DecompileStage::Transform,
-        detail: options.detail,
-        content: transformer::dump_lir(chunk, options.detail, &options.filters, options.color),
-    })
+define_stage_dump! {
+    /// Transformer 阶段的调试导出。
+    pub fn dump_lir(chunk: &crate::transformer::LoweredChunk)
+        => DecompileStage::Transform, crate::transformer::dump_lir
 }
 
-/// 对外保留 transformer 阶段的统一包装，方便库层调用方继续从 decompile 命名空间访问。
-#[cfg(not(feature = "decompile-debug"))]
-pub fn dump_lir(
-    _chunk: &crate::transformer::LoweredChunk,
-    _options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Err(DecompileError::DebugUnavailable)
+define_stage_dump! {
+    /// CFG 阶段的调试导出。
+    pub fn dump_cfg(graph: &crate::cfg::CfgGraph)
+        => DecompileStage::Cfg, crate::cfg::dump_cfg
 }
 
-/// 对外保留 CFG 阶段的统一包装，方便库层调用方继续从 decompile 命名空间访问。
-#[cfg(feature = "decompile-debug")]
-pub fn dump_cfg(
-    graph: &crate::cfg::CfgGraph,
-    options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Ok(StageDebugOutput {
-        stage: DecompileStage::Cfg,
-        detail: options.detail,
-        content: cfg::dump_cfg(graph, options.detail, &options.filters, options.color),
-    })
+define_stage_dump! {
+    /// GraphFacts 阶段的调试导出。
+    pub fn dump_graph_facts(graph_facts: &crate::cfg::GraphFacts)
+        => DecompileStage::GraphFacts, crate::cfg::dump_graph_facts
 }
 
-/// 对外保留 CFG 阶段的统一包装，方便库层调用方继续从 decompile 命名空间访问。
-#[cfg(not(feature = "decompile-debug"))]
-pub fn dump_cfg(
-    _graph: &crate::cfg::CfgGraph,
-    _options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Err(DecompileError::DebugUnavailable)
+define_stage_dump! {
+    /// Dataflow 阶段的调试导出。
+    pub fn dump_dataflow(
+        lowered: &crate::transformer::LoweredChunk,
+        cfg_graph: &crate::cfg::CfgGraph,
+        dataflow: &crate::cfg::DataflowFacts
+    ) => DecompileStage::Dataflow, crate::cfg::dump_dataflow
 }
 
-/// 对外保留 GraphFacts 阶段的统一包装。
-#[cfg(feature = "decompile-debug")]
-pub fn dump_graph_facts(
-    graph_facts: &crate::cfg::GraphFacts,
-    options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Ok(StageDebugOutput {
-        stage: DecompileStage::GraphFacts,
-        detail: options.detail,
-        content: cfg::dump_graph_facts(
-            graph_facts,
-            options.detail,
-            &options.filters,
-            options.color,
-        ),
-    })
+define_stage_dump! {
+    /// StructureFacts 阶段的调试导出。
+    pub fn dump_structure(structure_facts: &crate::structure::StructureFacts)
+        => DecompileStage::StructureFacts, crate::structure::dump_structure
 }
 
-/// 对外保留 GraphFacts 阶段的统一包装。
-#[cfg(not(feature = "decompile-debug"))]
-pub fn dump_graph_facts(
-    _graph_facts: &crate::cfg::GraphFacts,
-    _options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Err(DecompileError::DebugUnavailable)
+define_stage_dump! {
+    /// HIR 阶段的调试导出。
+    pub fn dump_hir(hir_module: &crate::hir::HirModule)
+        => DecompileStage::Hir, crate::hir::dump_hir
 }
 
-/// 对外保留 Dataflow 阶段的统一包装。
-#[cfg(feature = "decompile-debug")]
-pub fn dump_dataflow(
-    lowered: &crate::transformer::LoweredChunk,
-    cfg_graph: &crate::cfg::CfgGraph,
-    dataflow: &crate::cfg::DataflowFacts,
-    options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Ok(StageDebugOutput {
-        stage: DecompileStage::Dataflow,
-        detail: options.detail,
-        content: cfg::dump_dataflow(
-            lowered,
-            cfg_graph,
-            dataflow,
-            options.detail,
-            &options.filters,
-            options.color,
-        ),
-    })
+define_stage_dump! {
+    /// AST 阶段的调试导出。
+    pub fn dump_ast(ast_module: &crate::ast::AstModule)
+        => DecompileStage::Ast, crate::ast::dump_ast
 }
 
-/// 对外保留 Dataflow 阶段的统一包装。
-#[cfg(not(feature = "decompile-debug"))]
-pub fn dump_dataflow(
-    _lowered: &crate::transformer::LoweredChunk,
-    _cfg_graph: &crate::cfg::CfgGraph,
-    _dataflow: &crate::cfg::DataflowFacts,
-    _options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Err(DecompileError::DebugUnavailable)
+define_stage_dump! {
+    /// Readability 阶段的调试导出。
+    pub fn dump_readability(ast_module: &crate::ast::AstModule)
+        => DecompileStage::Readability, crate::ast::dump_readability
 }
 
-/// 对外保留 StructureFacts 阶段的统一包装。
-#[cfg(feature = "decompile-debug")]
-pub fn dump_structure(
-    structure_facts: &crate::structure::StructureFacts,
-    options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Ok(StageDebugOutput {
-        stage: DecompileStage::StructureFacts,
-        detail: options.detail,
-        content: structure::dump_structure(
-            structure_facts,
-            options.detail,
-            &options.filters,
-            options.color,
-        ),
-    })
+define_stage_dump! {
+    /// Naming 阶段的调试导出。
+    pub fn dump_naming(names: &crate::naming::NameMap)
+        => DecompileStage::Naming, crate::naming::dump_naming
 }
 
-/// 对外保留 StructureFacts 阶段的统一包装。
-#[cfg(not(feature = "decompile-debug"))]
-pub fn dump_structure(
-    _structure_facts: &crate::structure::StructureFacts,
-    _options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Err(DecompileError::DebugUnavailable)
-}
-
-/// 对外保留 HIR 阶段的统一包装。
-#[cfg(feature = "decompile-debug")]
-pub fn dump_hir(
-    hir_module: &crate::hir::HirModule,
-    options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Ok(StageDebugOutput {
-        stage: DecompileStage::Hir,
-        detail: options.detail,
-        content: hir::dump_hir(hir_module, options.detail, &options.filters, options.color),
-    })
-}
-
-/// 对外保留 HIR 阶段的统一包装。
-#[cfg(not(feature = "decompile-debug"))]
-pub fn dump_hir(
-    _hir_module: &crate::hir::HirModule,
-    _options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Err(DecompileError::DebugUnavailable)
-}
-
-/// 对外保留 AST 阶段的统一包装。
-#[cfg(feature = "decompile-debug")]
-pub fn dump_ast(
-    ast_module: &crate::ast::AstModule,
-    options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Ok(StageDebugOutput {
-        stage: DecompileStage::Ast,
-        detail: options.detail,
-        content: ast::dump_ast(ast_module, options.detail, &options.filters, options.color),
-    })
-}
-
-/// 对外保留 AST 阶段的统一包装。
-#[cfg(not(feature = "decompile-debug"))]
-pub fn dump_ast(
-    _ast_module: &crate::ast::AstModule,
-    _options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Err(DecompileError::DebugUnavailable)
-}
-
-/// 对外保留 Readability 阶段的统一包装。
-#[cfg(feature = "decompile-debug")]
-pub fn dump_readability(
-    ast_module: &crate::ast::AstModule,
-    options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Ok(StageDebugOutput {
-        stage: DecompileStage::Readability,
-        detail: options.detail,
-        content: ast::dump_readability(ast_module, options.detail, &options.filters, options.color),
-    })
-}
-
-/// 对外保留 Readability 阶段的统一包装。
-#[cfg(not(feature = "decompile-debug"))]
-pub fn dump_readability(
-    _ast_module: &crate::ast::AstModule,
-    _options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Err(DecompileError::DebugUnavailable)
-}
-
-/// 对外保留 Naming 阶段的统一包装。
-#[cfg(feature = "decompile-debug")]
-pub fn dump_naming(
-    names: &crate::naming::NameMap,
-    options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Ok(StageDebugOutput {
-        stage: DecompileStage::Naming,
-        detail: options.detail,
-        content: naming::dump_naming(names, options.detail, &options.filters, options.color),
-    })
-}
-
-/// 对外保留 Naming 阶段的统一包装。
-#[cfg(not(feature = "decompile-debug"))]
-pub fn dump_naming(
-    _names: &crate::naming::NameMap,
-    _options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Err(DecompileError::DebugUnavailable)
-}
-
-/// 对外保留 Generate 阶段的统一包装。
-#[cfg(feature = "decompile-debug")]
-pub fn dump_generate(
-    chunk: &crate::generate::GeneratedChunk,
-    options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Ok(StageDebugOutput {
-        stage: DecompileStage::Generate,
-        detail: options.detail,
-        content: generate::dump_generate(chunk, options.detail, &options.filters, options.color),
-    })
-}
-
-/// 对外保留 Generate 阶段的统一包装。
-#[cfg(not(feature = "decompile-debug"))]
-pub fn dump_generate(
-    _chunk: &crate::generate::GeneratedChunk,
-    _options: &DebugOptions,
-) -> Result<StageDebugOutput, DecompileError> {
-    Err(DecompileError::DebugUnavailable)
+define_stage_dump! {
+    /// Generate 阶段的调试导出。
+    pub fn dump_generate(chunk: &crate::generate::GeneratedChunk)
+        => DecompileStage::Generate, crate::generate::dump_generate
 }
 
 #[cfg(feature = "decompile-debug")]
