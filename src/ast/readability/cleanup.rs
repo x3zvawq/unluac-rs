@@ -53,6 +53,21 @@ fn cleanup_block(block: &mut AstBlock, allow_trailing_empty_return_elision: bool
     }
     block.stmts = flattened_stmts;
 
+    // 尾部 do-end 展开：当 do-end 是块的最后一条语句时，其内部 local 的作用域
+    // 在父块结束处同样终止，do-end 仅是多余的缩进壳。
+    // 典型来源：guard-flip 把 `if cond then BODY else return end` 拉平成
+    // `if not cond then return end; do BODY end`，其中 BODY 含 local 声明。
+    // 例外：含 GlobalDecl（如 `global<const> *`）的 do-end 有实际作用域语义，保留。
+    while let Some(AstStmt::DoBlock(nested)) = block.stmts.last()
+        && !nested.stmts.iter().any(|s| matches!(s, AstStmt::GlobalDecl(_)))
+    {
+        let Some(AstStmt::DoBlock(nested)) = block.stmts.pop() else {
+            unreachable!();
+        };
+        block.stmts.extend(nested.stmts);
+        changed = true;
+    }
+
     let discardable_unused_locals = collect_discardable_unused_locals(block);
     let original_len = block.stmts.len();
     block.stmts.retain(|stmt| {
