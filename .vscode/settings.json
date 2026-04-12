@@ -65,6 +65,7 @@
         "preds",
         "preheader",
         "regs",
+        "setfenv",
         "SETFIELD",
         "SETI",
         "SETLIST",

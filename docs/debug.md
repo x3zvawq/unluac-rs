@@ -20,7 +20,7 @@ cargo run -p unluac-cli -- -i /path/to/chunk.out --dump=parse --detail=verbose
 实用参数：
 
 | 参数 | 说明 |
-|------|------|
+| ------ | ------ |
 | `-i/--input` | 已编译 chunk 路径 |
 | `-s/--source` | Lua 源码路径（自动编译） |
 | `-o/--output` | 源码输出路径 |
