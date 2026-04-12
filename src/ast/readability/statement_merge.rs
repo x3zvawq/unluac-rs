@@ -108,14 +108,23 @@ fn merge_adjacent_single_value_local_decls(block: &mut AstBlock) -> bool {
             lookahead += 1;
         }
 
-        let has_multi_use_binding = bindings
-            .iter()
-            .any(|binding| use_index.count_uses_in_suffix(lookahead, binding.id) > 1);
+        // 只把多次使用的 binding 纳入合并组；单次使用的 binding 留给 inline_exprs
+        // 去内联。否则 `local a = x; local b = t.f; local c = T.K` 中 b/c 只用一次，
+        // 却因为 a 多次使用而被一起合并成 multi-local，导致 inline_exprs 无法识别。
+        // 为了不破坏声明顺序，从连续序列尾部剥离单次使用的 binding。
+        while bindings.len() >= 2
+            && use_index.count_uses_in_suffix(lookahead, bindings.last().unwrap().id) <= 1
+        {
+            bindings.pop();
+            values.pop();
+            lookahead -= 1;
+        }
 
-        // 这里只合并真正有“阶段 local”味道的连续声明：
-        // 如果整组 binding 都只在后缀里被读一次，那往往只是调用前的机械 alias 准备序列，
-        // 更适合交给 inline_exprs 去收回，而不是在这里抢先并成一条 multi-local。
-        if bindings.len() >= 2 && has_multi_use_binding {
+        if bindings.len() >= 2
+            && bindings
+                .iter()
+                .any(|b| use_index.count_uses_in_suffix(lookahead, b.id) > 1)
+        {
             new_stmts.push(AstStmt::LocalDecl(Box::new(AstLocalDecl {
                 bindings,
                 values,

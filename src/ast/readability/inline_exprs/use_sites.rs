@@ -649,9 +649,11 @@ impl InlineSite {
             Self::ComparisonOperand => Self::ComparisonOperand,
             Self::ReturnValue => Self::ReturnNestedValue,
             Self::ReturnNestedValue => Self::ReturnNestedValue,
-            Self::Index | Self::CallArgNonFinal | Self::CallArgFinal | Self::AccessBase => {
-                Self::Neutral
-            }
+            // 调用参数中的 field access base 用 AccessBase 而非 Neutral：
+            // `f(r.KEY)` 内联 `r = T.F` 只是把 call arg 从 `r.KEY` 延长成 `T.F.KEY`，
+            // 仍然是同类型的命名字段链，不会引入新的副作用或可读性退化。
+            Self::CallArgNonFinal | Self::CallArgFinal => Self::AccessBase,
+            Self::Index | Self::AccessBase => Self::Neutral,
             Self::CallCallee => Self::CallCallee,
         }
     }
