@@ -8,7 +8,7 @@ use crate::hir::common::{
     HirBinaryOpKind, HirDecisionExpr, HirDecisionTarget, HirExpr, HirUnaryOpKind,
 };
 
-pub(super) fn decision_is_synth_safe(decision: &HirDecisionExpr) -> bool {
+pub(crate) fn decision_is_synth_safe(decision: &HirDecisionExpr) -> bool {
     decision.nodes.iter().all(|node| {
         expr_is_synth_safe(&node.test)
             && target_is_synth_safe(&node.truthy)

@@ -5,8 +5,8 @@
 //! 祖先作用域里当前可见的自动生成名字，而不是退化成全局禁名或拍脑袋加后缀。
 
 use crate::ast::{
-    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue,
-    AstLocalDecl, AstLocalFunctionDecl, AstModule, AstStmt, AstSyntheticLocalId,
+    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue,
+    AstLocalDecl, AstModule, AstStmt, AstSyntheticLocalId,
 };
 use crate::ast::traverse::{
     traverse_call_children, traverse_expr_children, traverse_lvalue_children,
@@ -300,13 +300,6 @@ fn collect_stmt_context(
             })?;
         }
         AstStmt::FunctionDecl(function_decl) => {
-            collect_function_name_context(
-                &function_decl.target,
-                hir,
-                contexts,
-                outer_visible_bindings,
-                scopes,
-            )?;
             collect_nested_function_context(
                 &function_decl.func,
                 hir,
@@ -319,8 +312,8 @@ fn collect_stmt_context(
             // `local function f() ... end` 里的 `f` 在函数体内也是可见的，
             // 所以要先把它放进当前作用域，再收集子函数的词法上下文。
             declare_ast_binding(function, local_function_decl.name, scopes);
-            collect_local_function_context(
-                local_function_decl,
+            collect_nested_function_context(
+                &local_function_decl.func,
                 hir,
                 contexts,
                 outer_visible_bindings,
@@ -349,22 +342,6 @@ fn collect_local_decl_context(
     Ok(())
 }
 
-fn collect_local_function_context(
-    function_decl: &AstLocalFunctionDecl,
-    hir: &HirModule,
-    contexts: &mut LexicalContexts,
-    outer_visible_bindings: &[VisibleBinding],
-    scopes: &[Vec<VisibleBinding>],
-) -> Result<(), NamingError> {
-    collect_nested_function_context(
-        &function_decl.func,
-        hir,
-        contexts,
-        outer_visible_bindings,
-        scopes,
-    )
-}
-
 fn collect_nested_function_context(
     function_expr: &AstFunctionExpr,
     hir: &HirModule,
@@ -380,21 +357,6 @@ fn collect_nested_function_context(
         contexts,
         &child_outer_visible,
     )
-}
-
-fn collect_function_name_context(
-    target: &AstFunctionName,
-    _hir: &HirModule,
-    _contexts: &mut LexicalContexts,
-    _outer_visible_bindings: &[VisibleBinding],
-    _scopes: &[Vec<VisibleBinding>],
-) -> Result<(), NamingError> {
-    let path = match target {
-        AstFunctionName::Plain(path) => path,
-        AstFunctionName::Method(path, _) => path,
-    };
-    let _ = &path.root;
-    Ok(())
 }
 
 fn collect_call_context(

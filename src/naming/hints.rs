@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use crate::ast::{
     AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue,
-    AstLocalFunctionDecl, AstModule, AstNameRef, AstStmt, AstSyntheticLocalId,
+    AstModule, AstNameRef, AstStmt, AstSyntheticLocalId,
 };
 use crate::ast::traverse::{
     traverse_call_children, traverse_expr_children, traverse_lvalue_children,
@@ -168,19 +168,11 @@ fn collect_stmt_hints(
                 NameSource::FunctionShape,
                 hints,
             );
-            collect_local_function_hints(local_function_decl, hints, hir)?;
+            collect_function_expr_hints(&local_function_decl.func, hints, hir)?;
         }
         AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => {}
     }
     Ok(())
-}
-
-fn collect_local_function_hints(
-    function_decl: &AstLocalFunctionDecl,
-    hints: &mut [FunctionHints],
-    hir: &HirModule,
-) -> Result<(), NamingError> {
-    collect_function_expr_hints(&function_decl.func, hints, hir)
 }
 
 fn collect_function_expr_hints(

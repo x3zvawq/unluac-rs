@@ -20,7 +20,7 @@ use super::safety::expr_is_synth_safe;
 use super::value::{SynthTarget, structured_candidates, validate_candidate_for_node};
 use super::{MAX_SYNTH_REFS, normalize_candidate_expr};
 
-pub(super) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
+pub(crate) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
     if !matches!(expr, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_)) {
         return None;
     }
@@ -70,7 +70,7 @@ pub(super) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
         .min_by_key(super::expr_cost)
 }
 
-pub(super) fn synthesize_readable_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
+pub(crate) fn synthesize_readable_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
     if !matches!(expr, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_)) {
         return None;
     }

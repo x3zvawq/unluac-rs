@@ -12,7 +12,7 @@ use super::domain::{SynthesisContext, collect_refs_from_decision};
 use super::safety::{decision_is_synth_safe, expr_is_synth_safe};
 use super::{expr_cost, normalize_candidate_expr};
 
-pub(super) fn synthesize_value_decision_expr(decision: &HirDecisionExpr) -> Option<HirExpr> {
+pub(crate) fn synthesize_value_decision_expr(decision: &HirDecisionExpr) -> Option<HirExpr> {
     if !decision_is_synth_safe(decision) {
         return None;
     }

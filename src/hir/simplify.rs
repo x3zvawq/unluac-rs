@@ -219,8 +219,4 @@ fn apply_proto_pass(
     changed
 }
 
-pub(crate) fn synthesize_readable_pure_logical_expr(
-    expr: &crate::hir::common::HirExpr,
-) -> Option<crate::hir::common::HirExpr> {
-    decision::synthesize_readable_pure_logical_expr(expr)
-}
+pub(crate) use decision::synthesize_readable_pure_logical_expr;

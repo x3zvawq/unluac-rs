@@ -13,7 +13,7 @@ const AND_WITH_OR_CHILD_PENALTY: usize = 8;
 const COMPLEX_AND_WITH_OR_EXTRA_PENALTY: usize = 4;
 const OR_WITH_AND_CHILD_PENALTY: usize = 0;
 
-pub(super) fn expr_cost(expr: &HirExpr) -> usize {
+pub(crate) fn expr_cost(expr: &HirExpr) -> usize {
     structural_expr_cost(expr) + duplicate_atom_penalty(expr) + logical_shape_penalty(expr)
 }
 

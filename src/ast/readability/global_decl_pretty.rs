@@ -24,12 +24,7 @@ mod insert;
 mod merge;
 mod rewrite;
 
-use super::ReadabilityContext;
-use crate::ast::common::AstModule;
-
-pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
-    rewrite::apply(module, context)
-}
+pub(super) use rewrite::apply;
 
 #[cfg(test)]
 mod tests;

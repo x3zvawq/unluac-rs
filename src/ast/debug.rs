@@ -552,13 +552,9 @@ fn format_arg_list(values: &[AstExpr], indent: &str, names: &FunctionRenderNames
 }
 
 fn format_function_expr(function: &AstFunctionExpr, indent: &str) -> String {
-    let params = format_decl_params(
-        function,
-        false,
-        &collect_function_render_names(&function.body),
-    );
-    let child_indent = format!("{indent}  ");
     let child_names = collect_function_render_names(&function.body);
+    let params = format_decl_params(function, false, &child_names);
+    let child_indent = format!("{indent}  ");
     let mut body = String::new();
     write_block(&mut body, &child_indent, &function.body, &child_names);
     format!("function({params})\n{body}{indent}end")

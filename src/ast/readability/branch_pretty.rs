@@ -511,9 +511,8 @@ fn stmt_contains_label_or_goto(stmt: &AstStmt) -> bool {
     }
 }
 
-/// Remove no-op `goto L; ::L::` pairs where the goto immediately precedes its
-/// target label. When the goto is the only reference to the label, both are
-/// removed; otherwise only the goto is dropped.
+/// 移除紧邻 `goto L; ::L::` 的无效跳转对。当 goto 是该 label 的唯一引用时，
+/// 两者一起移除；否则只移除 goto。
 fn remove_nop_goto_labels(block: &mut AstBlock) -> bool {
     let mut remove_indices: Vec<usize> = Vec::new();
 

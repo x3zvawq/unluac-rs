@@ -199,9 +199,8 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock) -> bool {
                 continue;
             }
             if stmt_references_any_binding(&block.stmts[lookahead], &remaining) {
-                // Pin referenced-but-unsinkable bindings: their declarations must
-                // stay at the hoisted position, but other bindings may still be
-                // sinkable into later statements.
+                // 钉住被引用但无法下沉的 binding：它们的声明必须留在提升位置，
+                // 但其他 binding 仍然可能被下沉到后续语句里。
                 let mut i = 0;
                 while i < remaining.len() {
                     if stmt_references_any_binding(
@@ -226,9 +225,8 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock) -> bool {
 
         changed = true;
 
-        // Merge pinned (unsinkable) bindings back into remaining, preserving
-        // the original declaration order so that the emitted `local` list stays
-        // deterministic and readable.
+        // 将钉住的（不可下沉的）binding 合并回 remaining，按原始声明顺序
+        // 排序，以保证输出的 `local` 列表确定且可读。
         remaining.extend(pinned);
         remaining.sort_by_key(|b| b.id);
 
@@ -438,11 +436,9 @@ fn sink_pending_bindings_into_block(
             continue;
         }
         if stmt_references_any_binding(&block.stmts[index], remaining) {
-            // The binding is used in this statement but can't be merged
-            // directly or sunk into a nested block (e.g. it is assigned
-            // inside one nested `if` but read in a later sibling).  Insert
-            // a bare `local` declaration right before this statement so the
-            // declaration sits at the narrowest enclosing scope.
+            // 该 binding 在此语句中被使用，但无法直接合并或下沉到嵌套块里
+            // （例如在某个嵌套 `if` 内赋值但在后续兄弟节点中读取）。
+            // 在此语句前插入裸 `local` 声明，使声明处于最窄的包围作用域。
             let decl = AstStmt::LocalDecl(Box::new(AstLocalDecl {
                 bindings: remaining.to_vec(),
                 values: vec![],
@@ -561,10 +557,9 @@ fn is_temp_like_binding(binding: AstBindingRef) -> bool {
     )
 }
 
-/// Like [`try_sink_hoisted_decl_into_stmt`], but searches for matching bindings
-/// *anywhere* in `pending` instead of requiring them at the front.  Returns
-/// `(start_index, AstLocalDecl)` on success, where `start_index` is the
-/// position in `pending` where the matched bindings begin.
+/// 与 [`try_sink_hoisted_decl_into_stmt`] 类似，但在 `pending` 中任意位置搜索
+/// 匹配的 binding，而非仅要求它们位于头部。成功时返回 `(start_index, AstLocalDecl)`，
+/// 其中 `start_index` 是匹配 binding 在 `pending` 中的起始位置。
 fn try_sink_hoisted_decl_into_stmt_anywhere(
     pending: &[super::super::common::AstLocalBinding],
     stmt: &AstStmt,
@@ -588,20 +583,20 @@ fn try_sink_hoisted_decl_into_stmt_anywhere(
         {
             continue;
         }
-        // Only sink if none of the candidate bindings are used after this statement.
+        // 只有当所有候选 binding 在此语句之后不再被使用时才允许下沉。
         if candidate
             .iter()
             .any(|b| use_index.count_uses_in_suffix(suffix_start, b.id) != 0)
         {
             continue;
         }
-        // RHS must not reference any remaining pending bindings that come *after*
-        // the consumed slice (same safety check as the front-only variant).
+        // RHS 不得引用 consumed 切片之后的其他待处理 binding
+        // （与前序变体相同的安全检查）。
         let after = &pending[start + target_len..];
         if !after.is_empty() && stmt_references_any_binding_in_assign(assign, after) {
             continue;
         }
-        // Also check bindings *before* the consumed slice.
+        // 同样检查 consumed 切片之前的 binding。
         let before = &pending[..start];
         if !before.is_empty() && stmt_references_any_binding_in_assign(assign, before) {
             continue;

@@ -12,12 +12,10 @@ mod forwarded;
 mod method_alias;
 mod rewrite;
 
-use super::ReadabilityContext;
-use crate::ast::common::AstModule;
+pub(super) use rewrite::apply;
 
-pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
-    rewrite::apply(module, context)
-}
+#[cfg(test)]
+pub(super) use super::ReadabilityContext;
 
 #[cfg(test)]
 mod tests;

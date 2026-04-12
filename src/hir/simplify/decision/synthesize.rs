@@ -15,32 +15,15 @@ mod readable;
 mod safety;
 mod value;
 
+pub(crate) use cost::expr_cost;
+pub(crate) use readable::{naturalize_pure_logical_expr, synthesize_readable_pure_logical_expr};
+pub(crate) use safety::decision_is_synth_safe;
+pub(crate) use value::synthesize_value_decision_expr;
+
 use crate::hir::common::{HirBinaryExpr, HirExpr, HirLogicalExpr, HirUnaryExpr, HirUnaryOpKind};
 
 const MAX_SYNTH_REFS: usize = 4;
 const EXTRA_TRUTHY_SYMBOLS: usize = 2;
-
-pub(super) fn synthesize_value_decision_expr(
-    decision: &crate::hir::common::HirDecisionExpr,
-) -> Option<HirExpr> {
-    value::synthesize_value_decision_expr(decision)
-}
-
-pub(super) fn decision_is_synth_safe(decision: &crate::hir::common::HirDecisionExpr) -> bool {
-    safety::decision_is_synth_safe(decision)
-}
-
-pub(super) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
-    readable::naturalize_pure_logical_expr(expr)
-}
-
-pub(super) fn synthesize_readable_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
-    readable::synthesize_readable_pure_logical_expr(expr)
-}
-
-pub(super) fn expr_cost(expr: &HirExpr) -> usize {
-    cost::expr_cost(expr)
-}
 
 fn normalize_candidate_expr(expr: HirExpr) -> HirExpr {
     match expr {

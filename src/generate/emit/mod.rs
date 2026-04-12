@@ -40,8 +40,8 @@ enum Assoc {
     Left,
     Right,
     Non,
-    /// Fully associative: `a op (b op c)` == `(a op b) op c`, so no
-    /// parentheses are needed on either side at the same precedence level.
+    /// 完全关联：`a op (b op c)` == `(a op b) op c`，同优先级时
+    /// 两侧都不需要括号。
     Full,
 }
 

@@ -38,21 +38,9 @@ pub(super) fn simplify_decision_exprs_in_proto(proto: &mut HirProto) -> bool {
 /// `Decision` 只应该是 HIR 内部为了保住共享短路子图而暂存的过渡节点；一旦进入最终
 /// HIR 输出，它就应该已经被重新线性化成普通 `if/local/assign` 或纯表达式，避免把
 /// 共享图的语义恢复继续后移给 AST。
-pub(super) fn eliminate_remaining_decisions_in_proto(proto: &mut HirProto) -> bool {
-    eliminate::eliminate_remaining_decisions_in_proto(proto)
-}
-
-pub(super) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
-    synthesize::naturalize_pure_logical_expr(expr)
-}
-
-pub(crate) fn synthesize_readable_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
-    synthesize::synthesize_readable_pure_logical_expr(expr)
-}
-
-pub(crate) fn decision_is_synth_safe(decision: &HirDecisionExpr) -> bool {
-    synthesize::decision_is_synth_safe(decision)
-}
+pub(crate) use eliminate::eliminate_remaining_decisions_in_proto;
+pub(crate) use synthesize::naturalize_pure_logical_expr;
+pub(crate) use synthesize::{decision_is_synth_safe, synthesize_readable_pure_logical_expr};
 
 struct DecisionExprPass;
 

@@ -14,7 +14,7 @@ use super::insert::insert_missing_global_decls;
 use super::merge::merge_seed_global_runs;
 use crate::ast::common::{AstBlock, AstDialectVersion, AstModule};
 
-pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
+pub(in crate::ast::readability) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
     if !context.target.caps.global_decl {
         return false;
     }

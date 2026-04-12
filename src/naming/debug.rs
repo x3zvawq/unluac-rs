@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 
 use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
 
-use super::{FunctionNameMap, NameMap, NameSource};
+use super::{FunctionNameMap, NameMap};
 
 /// 输出 Naming 的调试文本。
 pub fn dump_naming(
@@ -71,7 +71,7 @@ fn write_section(
         } else {
             ""
         };
-        let source = source_label(info.source);
+        let source = info.source.as_str();
         let _ = writeln!(
             output,
             "    {prefix}{index} -> {} (source={source}{rename_note})",
@@ -102,7 +102,7 @@ fn write_sparse_section<'a>(
         } else {
             ""
         };
-        let source = source_label(info.source);
+        let source = info.source.as_str();
         let _ = writeln!(
             output,
             "    {prefix}{} -> {} (source={source}{rename_note})",
@@ -110,8 +110,4 @@ fn write_sparse_section<'a>(
             info.text,
         );
     }
-}
-
-fn source_label(source: NameSource) -> &'static str {
-    source.as_str()
 }

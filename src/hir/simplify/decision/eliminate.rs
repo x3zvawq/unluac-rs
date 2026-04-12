@@ -20,7 +20,7 @@ use crate::hir::common::{
 use super::super::visit::{HirVisitor, visit_expr};
 use super::super::walk::rewrite_nested_blocks_in_stmt;
 
-pub(super) fn eliminate_remaining_decisions_in_proto(proto: &mut HirProto) -> bool {
+pub(crate) fn eliminate_remaining_decisions_in_proto(proto: &mut HirProto) -> bool {
     let mut next_local_index = proto.locals.len();
     let mut new_locals = Vec::new();
     let mut new_local_debug_hints = Vec::new();

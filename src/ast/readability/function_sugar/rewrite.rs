@@ -22,7 +22,7 @@ use crate::ast::common::{
     AstTableKey, AstTargetDialect,
 };
 
-pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
+pub(in crate::ast::readability) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
     let method_fields = collect_method_field_names(module);
     rewrite_block(&mut module.body, context.target, &method_fields)
 }
