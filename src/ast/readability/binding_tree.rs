@@ -351,288 +351,119 @@ pub(super) fn stmt_mentions_binding_target(stmt: &AstStmt, binding: AstBindingRe
     }
 }
 
-pub(super) fn stmt_has_nested_binding_use(stmt: &AstStmt, binding: AstBindingRef) -> bool {
+/// stmt 级别的 binding 使用查询统一入口。
+fn stmt_has_binding_use_by(
+    stmt: &AstStmt,
+    binding: AstBindingRef,
+    check_expr: impl Fn(&AstExpr, AstBindingRef) -> bool,
+    check_call: impl Fn(&AstCallKind, AstBindingRef) -> bool,
+    check_assign_target: impl Fn(&AstLValue, AstBindingRef) -> bool,
+) -> bool {
     match stmt {
         AstStmt::LocalDecl(local_decl) => local_decl
             .values
             .iter()
-            .any(|value| expr_has_nested_binding_use(value, binding, false)),
+            .any(|value| check_expr(value, binding)),
         AstStmt::GlobalDecl(global_decl) => global_decl
             .values
             .iter()
-            .any(|value| expr_has_nested_binding_use(value, binding, false)),
+            .any(|value| check_expr(value, binding)),
         AstStmt::Assign(assign) => {
             assign
                 .targets
                 .iter()
-                .any(|target| lvalue_has_nested_binding_use(target, binding))
+                .any(|target| check_assign_target(target, binding))
                 || assign
                     .values
                     .iter()
-                    .any(|value| expr_has_nested_binding_use(value, binding, false))
+                    .any(|value| check_expr(value, binding))
         }
-        AstStmt::CallStmt(call_stmt) => call_has_nested_binding_use(&call_stmt.call, binding),
+        AstStmt::CallStmt(call_stmt) => check_call(&call_stmt.call, binding),
         AstStmt::Return(ret) => ret
             .values
             .iter()
-            .any(|value| expr_has_nested_binding_use(value, binding, false)),
-        AstStmt::If(if_stmt) => expr_has_nested_binding_use(&if_stmt.cond, binding, false),
-        AstStmt::While(while_stmt) => expr_has_nested_binding_use(&while_stmt.cond, binding, false),
-        AstStmt::Repeat(repeat_stmt) => {
-            expr_has_nested_binding_use(&repeat_stmt.cond, binding, false)
-        }
+            .any(|value| check_expr(value, binding)),
+        AstStmt::If(if_stmt) => check_expr(&if_stmt.cond, binding),
+        AstStmt::While(while_stmt) => check_expr(&while_stmt.cond, binding),
+        AstStmt::Repeat(repeat_stmt) => check_expr(&repeat_stmt.cond, binding),
         AstStmt::NumericFor(numeric_for) => {
-            expr_has_nested_binding_use(&numeric_for.start, binding, false)
-                || expr_has_nested_binding_use(&numeric_for.limit, binding, false)
-                || expr_has_nested_binding_use(&numeric_for.step, binding, false)
+            check_expr(&numeric_for.start, binding)
+                || check_expr(&numeric_for.limit, binding)
+                || check_expr(&numeric_for.step, binding)
         }
         AstStmt::GenericFor(generic_for) => generic_for
             .iterator
             .iter()
-            .any(|expr| expr_has_nested_binding_use(expr, binding, false)),
+            .any(|expr| check_expr(expr, binding)),
         AstStmt::DoBlock(_)
         | AstStmt::FunctionDecl(_)
         | AstStmt::LocalFunctionDecl(_)
         | AstStmt::Break
         | AstStmt::Continue
         | AstStmt::Goto(_)
-        | AstStmt::Label(_) | AstStmt::Error(_) => false,
+        | AstStmt::Label(_)
+        | AstStmt::Error(_) => false,
     }
+}
+
+pub(super) fn stmt_has_nested_binding_use(stmt: &AstStmt, binding: AstBindingRef) -> bool {
+    stmt_has_binding_use_by(
+        stmt,
+        binding,
+        |e, b| expr_has_nested_binding_use(e, b, false),
+        call_has_nested_binding_use,
+        lvalue_has_nested_binding_use,
+    )
 }
 
 pub(super) fn stmt_has_access_base_binding_use(stmt: &AstStmt, binding: AstBindingRef) -> bool {
-    match stmt {
-        AstStmt::LocalDecl(local_decl) => local_decl
-            .values
-            .iter()
-            .any(|value| expr_has_access_base_binding_use(value, binding, false)),
-        AstStmt::GlobalDecl(global_decl) => global_decl
-            .values
-            .iter()
-            .any(|value| expr_has_access_base_binding_use(value, binding, false)),
-        AstStmt::Assign(assign) => {
-            assign
-                .targets
-                .iter()
-                .any(|target| lvalue_has_access_base_binding_use(target, binding))
-                || assign
-                    .values
-                    .iter()
-                    .any(|value| expr_has_access_base_binding_use(value, binding, false))
-        }
-        AstStmt::CallStmt(call_stmt) => call_has_access_base_binding_use(&call_stmt.call, binding),
-        AstStmt::Return(ret) => ret
-            .values
-            .iter()
-            .any(|value| expr_has_access_base_binding_use(value, binding, false)),
-        AstStmt::If(if_stmt) => expr_has_access_base_binding_use(&if_stmt.cond, binding, false),
-        AstStmt::While(while_stmt) => {
-            expr_has_access_base_binding_use(&while_stmt.cond, binding, false)
-        }
-        AstStmt::Repeat(repeat_stmt) => {
-            expr_has_access_base_binding_use(&repeat_stmt.cond, binding, false)
-        }
-        AstStmt::NumericFor(numeric_for) => {
-            expr_has_access_base_binding_use(&numeric_for.start, binding, false)
-                || expr_has_access_base_binding_use(&numeric_for.limit, binding, false)
-                || expr_has_access_base_binding_use(&numeric_for.step, binding, false)
-        }
-        AstStmt::GenericFor(generic_for) => generic_for
-            .iterator
-            .iter()
-            .any(|expr| expr_has_access_base_binding_use(expr, binding, false)),
-        AstStmt::DoBlock(_)
-        | AstStmt::FunctionDecl(_)
-        | AstStmt::LocalFunctionDecl(_)
-        | AstStmt::Break
-        | AstStmt::Continue
-        | AstStmt::Goto(_)
-        | AstStmt::Label(_) | AstStmt::Error(_) => false,
-    }
+    stmt_has_binding_use_by(
+        stmt,
+        binding,
+        |e, b| expr_has_access_base_binding_use(e, b, false),
+        call_has_access_base_binding_use,
+        lvalue_has_access_base_binding_use,
+    )
 }
 
 pub(super) fn stmt_has_index_binding_use(stmt: &AstStmt, binding: AstBindingRef) -> bool {
-    match stmt {
-        AstStmt::LocalDecl(local_decl) => local_decl
-            .values
-            .iter()
-            .any(|value| expr_has_index_binding_use(value, binding, false)),
-        AstStmt::GlobalDecl(global_decl) => global_decl
-            .values
-            .iter()
-            .any(|value| expr_has_index_binding_use(value, binding, false)),
-        AstStmt::Assign(assign) => {
-            assign
-                .targets
-                .iter()
-                .any(|target| lvalue_has_index_binding_use(target, binding))
-                || assign
-                    .values
-                    .iter()
-                    .any(|value| expr_has_index_binding_use(value, binding, false))
-        }
-        AstStmt::CallStmt(call_stmt) => call_has_index_binding_use(&call_stmt.call, binding),
-        AstStmt::Return(ret) => ret
-            .values
-            .iter()
-            .any(|value| expr_has_index_binding_use(value, binding, false)),
-        AstStmt::If(if_stmt) => expr_has_index_binding_use(&if_stmt.cond, binding, false),
-        AstStmt::While(while_stmt) => expr_has_index_binding_use(&while_stmt.cond, binding, false),
-        AstStmt::Repeat(repeat_stmt) => {
-            expr_has_index_binding_use(&repeat_stmt.cond, binding, false)
-        }
-        AstStmt::NumericFor(numeric_for) => {
-            expr_has_index_binding_use(&numeric_for.start, binding, false)
-                || expr_has_index_binding_use(&numeric_for.limit, binding, false)
-                || expr_has_index_binding_use(&numeric_for.step, binding, false)
-        }
-        AstStmt::GenericFor(generic_for) => generic_for
-            .iterator
-            .iter()
-            .any(|expr| expr_has_index_binding_use(expr, binding, false)),
-        AstStmt::DoBlock(_)
-        | AstStmt::FunctionDecl(_)
-        | AstStmt::LocalFunctionDecl(_)
-        | AstStmt::Break
-        | AstStmt::Continue
-        | AstStmt::Goto(_)
-        | AstStmt::Label(_) | AstStmt::Error(_) => false,
-    }
+    stmt_has_binding_use_by(
+        stmt,
+        binding,
+        |e, b| expr_has_index_binding_use(e, b, false),
+        call_has_index_binding_use,
+        lvalue_has_index_binding_use,
+    )
 }
 
 pub(super) fn stmt_has_direct_call_arg_binding_use(stmt: &AstStmt, binding: AstBindingRef) -> bool {
-    match stmt {
-        AstStmt::LocalDecl(local_decl) => local_decl
-            .values
-            .iter()
-            .any(|value| expr_has_direct_call_arg_binding_use(value, binding)),
-        AstStmt::GlobalDecl(global_decl) => global_decl
-            .values
-            .iter()
-            .any(|value| expr_has_direct_call_arg_binding_use(value, binding)),
-        AstStmt::Assign(assign) => assign
-            .values
-            .iter()
-            .any(|value| expr_has_direct_call_arg_binding_use(value, binding)),
-        AstStmt::CallStmt(call_stmt) => {
-            call_has_direct_call_arg_binding_use(&call_stmt.call, binding)
-        }
-        AstStmt::Return(ret) => ret
-            .values
-            .iter()
-            .any(|value| expr_has_direct_call_arg_binding_use(value, binding)),
-        AstStmt::If(if_stmt) => expr_has_direct_call_arg_binding_use(&if_stmt.cond, binding),
-        AstStmt::While(while_stmt) => {
-            expr_has_direct_call_arg_binding_use(&while_stmt.cond, binding)
-        }
-        AstStmt::Repeat(repeat_stmt) => {
-            expr_has_direct_call_arg_binding_use(&repeat_stmt.cond, binding)
-        }
-        AstStmt::NumericFor(numeric_for) => {
-            expr_has_direct_call_arg_binding_use(&numeric_for.start, binding)
-                || expr_has_direct_call_arg_binding_use(&numeric_for.limit, binding)
-                || expr_has_direct_call_arg_binding_use(&numeric_for.step, binding)
-        }
-        AstStmt::GenericFor(generic_for) => generic_for
-            .iterator
-            .iter()
-            .any(|expr| expr_has_direct_call_arg_binding_use(expr, binding)),
-        AstStmt::DoBlock(_)
-        | AstStmt::FunctionDecl(_)
-        | AstStmt::LocalFunctionDecl(_)
-        | AstStmt::Break
-        | AstStmt::Continue
-        | AstStmt::Goto(_)
-        | AstStmt::Label(_) | AstStmt::Error(_) => false,
-    }
+    stmt_has_binding_use_by(
+        stmt,
+        binding,
+        expr_has_direct_call_arg_binding_use,
+        call_has_direct_call_arg_binding_use,
+        |_, _| false,
+    )
 }
 
 pub(super) fn stmt_has_call_callee_binding_use(stmt: &AstStmt, binding: AstBindingRef) -> bool {
-    match stmt {
-        AstStmt::LocalDecl(local_decl) => local_decl
-            .values
-            .iter()
-            .any(|value| expr_has_call_callee_binding_use(value, binding, false)),
-        AstStmt::GlobalDecl(global_decl) => global_decl
-            .values
-            .iter()
-            .any(|value| expr_has_call_callee_binding_use(value, binding, false)),
-        AstStmt::Assign(assign) => assign
-            .values
-            .iter()
-            .any(|value| expr_has_call_callee_binding_use(value, binding, false)),
-        AstStmt::CallStmt(call_stmt) => call_has_call_callee_binding_use(&call_stmt.call, binding),
-        AstStmt::Return(ret) => ret
-            .values
-            .iter()
-            .any(|value| expr_has_call_callee_binding_use(value, binding, false)),
-        AstStmt::If(if_stmt) => expr_has_call_callee_binding_use(&if_stmt.cond, binding, false),
-        AstStmt::While(while_stmt) => {
-            expr_has_call_callee_binding_use(&while_stmt.cond, binding, false)
-        }
-        AstStmt::Repeat(repeat_stmt) => {
-            expr_has_call_callee_binding_use(&repeat_stmt.cond, binding, false)
-        }
-        AstStmt::NumericFor(numeric_for) => {
-            expr_has_call_callee_binding_use(&numeric_for.start, binding, false)
-                || expr_has_call_callee_binding_use(&numeric_for.limit, binding, false)
-                || expr_has_call_callee_binding_use(&numeric_for.step, binding, false)
-        }
-        AstStmt::GenericFor(generic_for) => generic_for
-            .iterator
-            .iter()
-            .any(|expr| expr_has_call_callee_binding_use(expr, binding, false)),
-        AstStmt::DoBlock(_)
-        | AstStmt::FunctionDecl(_)
-        | AstStmt::LocalFunctionDecl(_)
-        | AstStmt::Break
-        | AstStmt::Continue
-        | AstStmt::Goto(_)
-        | AstStmt::Label(_) | AstStmt::Error(_) => false,
-    }
+    stmt_has_binding_use_by(
+        stmt,
+        binding,
+        |e, b| expr_has_call_callee_binding_use(e, b, false),
+        call_has_call_callee_binding_use,
+        |_, _| false,
+    )
 }
 
 pub(super) fn stmt_has_nested_binding_value_use(stmt: &AstStmt, binding: AstBindingRef) -> bool {
-    match stmt {
-        AstStmt::LocalDecl(local_decl) => local_decl
-            .values
-            .iter()
-            .any(|value| expr_has_nested_binding_use(value, binding, false)),
-        AstStmt::GlobalDecl(global_decl) => global_decl
-            .values
-            .iter()
-            .any(|value| expr_has_nested_binding_use(value, binding, false)),
-        AstStmt::Assign(assign) => assign
-            .values
-            .iter()
-            .any(|value| expr_has_nested_binding_use(value, binding, false)),
-        AstStmt::CallStmt(call_stmt) => call_has_nested_binding_use(&call_stmt.call, binding),
-        AstStmt::Return(ret) => ret
-            .values
-            .iter()
-            .any(|value| expr_has_nested_binding_use(value, binding, false)),
-        AstStmt::If(if_stmt) => expr_has_nested_binding_use(&if_stmt.cond, binding, false),
-        AstStmt::While(while_stmt) => expr_has_nested_binding_use(&while_stmt.cond, binding, false),
-        AstStmt::Repeat(repeat_stmt) => {
-            expr_has_nested_binding_use(&repeat_stmt.cond, binding, false)
-        }
-        AstStmt::NumericFor(numeric_for) => {
-            expr_has_nested_binding_use(&numeric_for.start, binding, false)
-                || expr_has_nested_binding_use(&numeric_for.limit, binding, false)
-                || expr_has_nested_binding_use(&numeric_for.step, binding, false)
-        }
-        AstStmt::GenericFor(generic_for) => generic_for
-            .iterator
-            .iter()
-            .any(|expr| expr_has_nested_binding_use(expr, binding, false)),
-        AstStmt::DoBlock(_)
-        | AstStmt::FunctionDecl(_)
-        | AstStmt::LocalFunctionDecl(_)
-        | AstStmt::Break
-        | AstStmt::Continue
-        | AstStmt::Goto(_)
-        | AstStmt::Label(_) | AstStmt::Error(_) => false,
-    }
+    stmt_has_binding_use_by(
+        stmt,
+        binding,
+        |e, b| expr_has_nested_binding_use(e, b, false),
+        call_has_nested_binding_use,
+        |_, _| false,
+    )
 }
 
 fn block_mentions_binding_target(
@@ -652,23 +483,34 @@ fn lvalue_mentions_binding_target(lvalue: &AstLValue, binding: AstBindingRef) ->
     }
 }
 
-fn call_has_nested_binding_use(call: &AstCallKind, binding: AstBindingRef) -> bool {
+/// call 级别的 binding 使用查询统一入口。
+/// `call_has_{nested,access_base,index}_binding_use` 三个函数结构完全相同：
+/// 遍历 callee/receiver + args 并调用对应的 expr 检查器。
+fn call_has_binding_use_by(
+    call: &AstCallKind,
+    binding: AstBindingRef,
+    check_expr: impl Fn(&AstExpr, AstBindingRef) -> bool,
+) -> bool {
     match call {
         AstCallKind::Call(call) => {
-            expr_has_nested_binding_use(&call.callee, binding, false)
+            check_expr(&call.callee, binding)
                 || call
                     .args
                     .iter()
-                    .any(|arg| expr_has_nested_binding_use(arg, binding, false))
+                    .any(|arg| check_expr(arg, binding))
         }
         AstCallKind::MethodCall(call) => {
-            expr_has_nested_binding_use(&call.receiver, binding, false)
+            check_expr(&call.receiver, binding)
                 || call
                     .args
                     .iter()
-                    .any(|arg| expr_has_nested_binding_use(arg, binding, false))
+                    .any(|arg| check_expr(arg, binding))
         }
     }
+}
+
+fn call_has_nested_binding_use(call: &AstCallKind, binding: AstBindingRef) -> bool {
+    call_has_binding_use_by(call, binding, |e, b| expr_has_nested_binding_use(e, b, false))
 }
 
 fn lvalue_has_nested_binding_use(target: &AstLValue, binding: AstBindingRef) -> bool {
@@ -683,41 +525,13 @@ fn lvalue_has_nested_binding_use(target: &AstLValue, binding: AstBindingRef) -> 
 }
 
 fn call_has_access_base_binding_use(call: &AstCallKind, binding: AstBindingRef) -> bool {
-    match call {
-        AstCallKind::Call(call) => {
-            expr_has_access_base_binding_use(&call.callee, binding, false)
-                || call
-                    .args
-                    .iter()
-                    .any(|arg| expr_has_access_base_binding_use(arg, binding, false))
-        }
-        AstCallKind::MethodCall(call) => {
-            expr_has_access_base_binding_use(&call.receiver, binding, false)
-                || call
-                    .args
-                    .iter()
-                    .any(|arg| expr_has_access_base_binding_use(arg, binding, false))
-        }
-    }
+    call_has_binding_use_by(call, binding, |e, b| {
+        expr_has_access_base_binding_use(e, b, false)
+    })
 }
 
 fn call_has_index_binding_use(call: &AstCallKind, binding: AstBindingRef) -> bool {
-    match call {
-        AstCallKind::Call(call) => {
-            expr_has_index_binding_use(&call.callee, binding, false)
-                || call
-                    .args
-                    .iter()
-                    .any(|arg| expr_has_index_binding_use(arg, binding, false))
-        }
-        AstCallKind::MethodCall(call) => {
-            expr_has_index_binding_use(&call.receiver, binding, false)
-                || call
-                    .args
-                    .iter()
-                    .any(|arg| expr_has_index_binding_use(arg, binding, false))
-        }
-    }
+    call_has_binding_use_by(call, binding, |e, b| expr_has_index_binding_use(e, b, false))
 }
 
 fn call_has_direct_call_arg_binding_use(call: &AstCallKind, binding: AstBindingRef) -> bool {

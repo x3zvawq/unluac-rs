@@ -6,6 +6,7 @@
 //! 是细节实现”的混淆。
 
 mod boolean_shells;
+mod branch_value_folding;
 mod carried_locals;
 mod close_scopes;
 mod closure_self_capture;
@@ -18,6 +19,7 @@ mod logical_simplify;
 mod residuals;
 mod table_constructors;
 mod temp_inline;
+mod temp_touch;
 mod traverse;
 mod visit;
 mod walk;
