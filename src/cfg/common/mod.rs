@@ -7,6 +7,8 @@ mod cfg;
 mod dataflow;
 mod graph;
 mod storage;
+#[cfg(test)]
+mod tests;
 
 pub use cfg::{
     BasicBlock, BlockKind, BlockRef, Cfg, CfgEdge, CfgGraph, EdgeKind, EdgeRef, InstrRange,

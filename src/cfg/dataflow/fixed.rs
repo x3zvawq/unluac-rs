@@ -76,7 +76,7 @@ pub(super) fn materialize_instruction_facts(
             instruction_facts.open_reaching_defs[instr_index] = current_open.clone();
 
             let fixed_use_regs =
-                super::resolved_fixed_use_regs(scratch, effect, &current_open, open_defs);
+                scratch.fixed_use_regs.resolve(effect, &current_open, open_defs);
             let mut fixed_use_entries = Vec::with_capacity(fixed_use_regs.len());
             for &reg in fixed_use_regs {
                 let defs = current_fixed.get(reg).clone();

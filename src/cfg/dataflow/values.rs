@@ -43,8 +43,7 @@ pub(super) fn materialize_value_facts(
             let effect = &instr_effects[instr_index];
             reaching_values[instr_index] = snapshot_value_state(&mut current_fixed);
 
-            let fixed_use_regs = super::resolved_fixed_use_regs(
-                scratch,
+            let fixed_use_regs = scratch.fixed_use_regs.resolve(
                 effect,
                 &instruction_facts.open_reaching_defs[instr_index],
                 ctx.open_defs,

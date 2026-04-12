@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use crate::transformer::{
-    AccessBase, AccessKey, BranchOperands, CaptureSource, CondOperand, LowInstr, LoweredChunk,
-    LoweredProto, Reg, RegRange, ResultPack, ValueOperand, ValuePack,
+    AccessBase, AccessKey, BranchOperands, CaptureSource, CondOperand, LowInstr, LoweredProto,
+    Reg, RegRange, ResultPack, ValueOperand, ValuePack,
 };
 
 use self::effects::{compute_instr_effect, compute_reg_count, compute_side_effect_summary};
@@ -294,16 +294,8 @@ struct BlockLiveness {
     open_live_out: Vec<bool>,
 }
 
-/// 对整个 lowered chunk 递归计算数据流事实。
+/// 对 proto 树递归计算数据流事实。
 pub fn analyze_dataflow(
-    chunk: &LoweredChunk,
-    cfg: &CfgGraph,
-    graph_facts: &GraphFacts,
-) -> DataflowFacts {
-    analyze_proto_dataflow(&chunk.main, &cfg.cfg, graph_facts, &cfg.children)
-}
-
-fn analyze_proto_dataflow(
     proto: &LoweredProto,
     cfg: &Cfg,
     graph_facts: &GraphFacts,
@@ -461,7 +453,7 @@ fn analyze_proto_dataflow(
         .zip(child_cfgs.iter())
         .zip(graph_facts.children.iter())
         .map(|((child_proto, child_cfg), child_graph_facts)| {
-            analyze_proto_dataflow(
+            analyze_dataflow(
                 child_proto,
                 &child_cfg.cfg,
                 child_graph_facts,
@@ -493,20 +485,6 @@ fn analyze_proto_dataflow(
     }
 }
 
-/// `Open(start)` 表示“从 start 到当前 top 的连续值包”，而不是单个开放尾值。
-///
-/// 因此如果当前 reaching 的 open def 实际从更晚寄存器开始，那么 `start..tail_start-1`
-/// 这一段仍然是被这条指令真实读取的固定寄存器前缀，必须进入 use/liveness。
-fn resolved_fixed_use_regs<'a>(
-    scratch: &'a mut MaterializeScratch,
-    effect: &InstrEffect,
-    current_open: &CompactSet<OpenDefId>,
-    open_defs: &[OpenDef],
-) -> &'a [Reg] {
-    scratch
-        .fixed_use_regs
-        .resolve(effect, current_open, open_defs)
-}
 
 fn instr_indices(cfg: &Cfg, block: BlockRef) -> Option<impl Iterator<Item = usize>> {
     let range = cfg.blocks.get(block.index())?.instrs;
@@ -541,136 +519,4 @@ fn collect_open_sets(sets: &[CompactSet<OpenDefId>]) -> Vec<BTreeSet<OpenDefId>>
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tracked_state_snapshot_preserves_sparse_contents() {
-        let mut state = TrackedState::new(8);
-        state.set_singleton(Reg(4), DefId(11));
-        state.insert(Reg(4), DefId(12));
-        state.set_singleton(Reg(1), DefId(3));
-
-        let snapshot = state.snapshot_map();
-
-        assert_eq!(snapshot.keys().collect::<Vec<_>>(), vec![Reg(1), Reg(4)]);
-        assert_eq!(
-            snapshot.get(Reg(1)).cloned(),
-            Some(CompactSet::singleton(DefId(3)))
-        );
-        assert_eq!(
-            snapshot.get(Reg(4)).cloned(),
-            Some(CompactSet::Many(BTreeSet::from([DefId(11), DefId(12)])))
-        );
-        assert_eq!(snapshot.get(Reg(7)), None);
-    }
-
-    #[test]
-    fn resolved_fixed_use_regs_should_include_open_gap_prefix() {
-        let mut effect = InstrEffect::default();
-        effect.fixed_uses.extend([Reg(1), Reg(5)]);
-        effect.open_use = Some(Reg(2));
-
-        let open_defs = vec![OpenDef {
-            id: OpenDefId(0),
-            start_reg: Reg(4),
-            instr: crate::transformer::InstrRef(0),
-            block: BlockRef(0),
-        }];
-        let current_open = CompactSet::singleton(OpenDefId(0));
-        let mut scratch = MaterializeScratch::new(8);
-
-        let regs = resolved_fixed_use_regs(&mut scratch, &effect, &current_open, &open_defs);
-
-        assert_eq!(regs, &[Reg(1), Reg(2), Reg(3), Reg(5)]);
-    }
-
-    #[test]
-    fn block_phi_values_should_override_reaching_defs_in_snapshot() {
-        let mut state = ValueState::new(4);
-        state.set_singleton(Reg(1), SsaValue::Def(DefId(7)));
-
-        values::apply_block_phi_values(
-            &mut state,
-            &[PhiCandidate {
-                id: PhiId(2),
-                block: BlockRef(1),
-                reg: Reg(1),
-                incoming: Vec::new(),
-            }],
-        );
-
-        let snapshot = state.snapshot_map();
-
-        assert_eq!(
-            snapshot.get(Reg(1)).cloned(),
-            Some(CompactSet::singleton(SsaValue::Phi(PhiId(2))))
-        );
-    }
-
-    #[test]
-    fn no_phi_value_queries_should_wrap_defs_as_ssa_defs() {
-        let reaching_defs = InstrReachingDefs {
-            fixed: RegValueMap::from_sparse_entries(vec![
-                (Reg(0), CompactSet::singleton(DefId(1))),
-                (
-                    Reg(2),
-                    CompactSet::Many(BTreeSet::from([DefId(3), DefId(4)])),
-                ),
-            ]),
-        };
-        let use_defs = InstrUseDefs {
-            fixed: RegValueMap::from_sparse_entries(vec![(
-                Reg(2),
-                CompactSet::singleton(DefId(4)),
-            )]),
-            open: BTreeSet::new(),
-        };
-        let dataflow = DataflowFacts {
-            instr_effects: vec![InstrEffect::default()],
-            effect_summaries: vec![SideEffectSummary::default()],
-            defs: Vec::new(),
-            open_defs: Vec::new(),
-            instr_defs: vec![Vec::new()],
-            reaching_defs: vec![reaching_defs],
-            use_defs: vec![use_defs],
-            def_uses: Vec::new(),
-            open_reaching_defs: vec![BTreeSet::new()],
-            open_use_defs: vec![BTreeSet::new()],
-            open_def_uses: Vec::new(),
-            live_in: Vec::new(),
-            live_out: Vec::new(),
-            open_live_in: Vec::new(),
-            open_live_out: Vec::new(),
-            phi_candidates: Vec::new(),
-            phi_block_ranges: Vec::new(),
-            value_facts: ValueFactsStorage::NoPhi,
-            children: Vec::new(),
-        };
-
-        assert_eq!(
-            dataflow
-                .reaching_values_at(crate::transformer::InstrRef(0))
-                .get(Reg(0))
-                .map(|values| values.to_compact_set()),
-            Some(CompactSet::singleton(SsaValue::Def(DefId(1))))
-        );
-        assert_eq!(
-            dataflow
-                .reaching_values_at(crate::transformer::InstrRef(0))
-                .get(Reg(2))
-                .map(|values| values.to_compact_set()),
-            Some(CompactSet::Many(BTreeSet::from([
-                SsaValue::Def(DefId(3)),
-                SsaValue::Def(DefId(4)),
-            ])))
-        );
-        assert_eq!(
-            dataflow
-                .use_values_at(crate::transformer::InstrRef(0))
-                .get(Reg(2))
-                .map(|values| values.to_compact_set()),
-            Some(CompactSet::singleton(SsaValue::Def(DefId(4))))
-        );
-    }
-}
+mod tests;

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use super::lower::{ChildAnalyses, LowerArtifacts, lower_proto};
-use crate::cfg::{analyze_dataflow, analyze_graph_facts, build_cfg_graph};
+use crate::cfg::{analyze_dataflow, analyze_graph_facts, build_cfg_proto};
 use crate::hir::common::{HirBinaryOpKind, HirExpr, HirLValue, HirModule, HirStmt};
 use crate::hir::dump_hir;
 use crate::parser::{ParseOptions, parse_lua55_chunk, parse_luau_chunk};
@@ -111,9 +111,9 @@ fn lua55_fixed_multiresult_call_keeps_all_fixed_defs_before_simplify() {
     );
     let raw = parse_lua55_chunk(&bytes, ParseOptions::default()).expect("fixture should parse");
     let lowered = lower_chunk(&raw).expect("fixture should lower into LIR");
-    let cfg_graph = build_cfg_graph(&lowered);
+    let cfg_graph = build_cfg_proto(&lowered.main);
     let graph_facts = analyze_graph_facts(&cfg_graph);
-    let dataflow = analyze_dataflow(&lowered, &cfg_graph, &graph_facts);
+    let dataflow = analyze_dataflow(&lowered.main, &cfg_graph.cfg, &graph_facts, &cfg_graph.children);
 
     assert_eq!(
         dataflow.instr_defs[7].len(),
@@ -121,7 +121,7 @@ fn lua55_fixed_multiresult_call_keeps_all_fixed_defs_before_simplify() {
         "lua5.5 const gate call should define both fixed result registers",
     );
 
-    let structure = analyze_structure(&lowered, &cfg_graph, &graph_facts, &dataflow);
+    let structure = analyze_structure(&lowered.main, &cfg_graph.cfg, &graph_facts, &dataflow, &cfg_graph.children);
     let mut artifacts = LowerArtifacts::default();
     let entry = lower_proto(
         &lowered.main,
@@ -253,10 +253,10 @@ fn lower_luau_fixture_to_hir(source_relative: &str) -> HirModule {
     let bytes = compile_luau_fixture(source_relative);
     let raw = parse_luau_chunk(&bytes, ParseOptions::default()).expect("fixture should parse");
     let lowered = lower_chunk(&raw).expect("fixture should lower into LIR");
-    let cfg_graph = build_cfg_graph(&lowered);
+    let cfg_graph = build_cfg_proto(&lowered.main);
     let graph_facts = analyze_graph_facts(&cfg_graph);
-    let dataflow = analyze_dataflow(&lowered, &cfg_graph, &graph_facts);
-    let structure = analyze_structure(&lowered, &cfg_graph, &graph_facts, &dataflow);
+    let dataflow = analyze_dataflow(&lowered.main, &cfg_graph.cfg, &graph_facts, &cfg_graph.children);
+    let structure = analyze_structure(&lowered.main, &cfg_graph.cfg, &graph_facts, &dataflow, &cfg_graph.children);
 
     let mut artifacts = LowerArtifacts::default();
     let entry = lower_proto(
@@ -284,10 +284,10 @@ fn lower_lua55_fixture_to_hir(source_relative: &str) -> HirModule {
     let bytes = unluac_test_support::compile_lua_case("lua5.5", source_relative);
     let raw = parse_lua55_chunk(&bytes, ParseOptions::default()).expect("fixture should parse");
     let lowered = lower_chunk(&raw).expect("fixture should lower into LIR");
-    let cfg_graph = build_cfg_graph(&lowered);
+    let cfg_graph = build_cfg_proto(&lowered.main);
     let graph_facts = analyze_graph_facts(&cfg_graph);
-    let dataflow = analyze_dataflow(&lowered, &cfg_graph, &graph_facts);
-    let structure = analyze_structure(&lowered, &cfg_graph, &graph_facts, &dataflow);
+    let dataflow = analyze_dataflow(&lowered.main, &cfg_graph.cfg, &graph_facts, &cfg_graph.children);
+    let structure = analyze_structure(&lowered.main, &cfg_graph.cfg, &graph_facts, &dataflow, &cfg_graph.children);
 
     let mut artifacts = LowerArtifacts::default();
     let entry = lower_proto(

@@ -6,12 +6,12 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
-use crate::transformer::{LowInstr, LoweredChunk, LoweredProto, Reg};
+use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text, format_display_set};
+use crate::transformer::{LowInstr, LoweredChunk, LoweredProto};
 
 use super::common::{
-    BlockRef, CfgGraph, CompactSet, DataflowFacts, DefId, EffectTag, GraphFacts, OpenDefId,
-    RegValueMap, SsaValue, ValueMapRef, ValueSetRef,
+    BlockRef, CfgGraph, DataflowFacts, DefId, EffectTag, GraphFacts, OpenDefId, RegValueMap,
+    SsaValue, ValueMapRef, ValueSetRef,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -39,7 +39,7 @@ pub fn dump_cfg(
 ) -> String {
     let mut output = String::new();
     let entries = collect_proto_entries(graph);
-    let visible = visible_proto_ids(&entries, filters);
+    let visible = visible_ids(entries.iter().map(|e| e.id), filters);
 
     let _ = writeln!(output, "===== Dump CFG =====");
     let _ = writeln!(output, "cfg detail={} protos={}", detail, entries.len());
@@ -63,7 +63,7 @@ pub fn dump_cfg(
             cfg.edges.len(),
             cfg.entry_block.index(),
             cfg.exit_block.index(),
-            format_block_set(&cfg.reachable_blocks),
+            format_display_set(&cfg.reachable_blocks),
         );
 
         if matches!(detail, DebugDetail::Summary) {
@@ -116,7 +116,7 @@ pub fn dump_graph_facts(
 ) -> String {
     let mut output = String::new();
     let entries = collect_proto_entries(graph_facts);
-    let visible = visible_proto_ids(&entries, filters);
+    let visible = visible_ids(entries.iter().map(|e| e.id), filters);
 
     let _ = writeln!(output, "===== Dump GraphFacts =====");
     let _ = writeln!(
@@ -141,9 +141,9 @@ pub fn dump_graph_facts(
             output,
             "{indent}proto#{} rpo={} backedges={} loop_headers={}",
             entry.id,
-            format_block_list(&facts.rpo),
+            format_display_set(&facts.rpo),
             format_edge_refs(&facts.backedges),
-            format_block_set(&facts.loop_headers),
+            format_display_set(&facts.loop_headers),
         );
 
         if matches!(detail, DebugDetail::Summary) {
@@ -184,7 +184,7 @@ pub fn dump_graph_facts(
                 output,
                 "{indent}    block #{} frontier={}",
                 block_index,
-                format_block_list(&facts.dominance_frontier_blocks(block).collect::<Vec<_>>()),
+                format_display_set(facts.dominance_frontier_blocks(block)),
             );
         }
 
@@ -198,7 +198,7 @@ pub fn dump_graph_facts(
                     "{indent}    header=#{} backedge=#{} blocks={}",
                     natural_loop.header.index(),
                     natural_loop.backedge.index(),
-                    format_block_set(&natural_loop.blocks),
+                    format_display_set(&natural_loop.blocks),
                 );
             }
         }
@@ -218,7 +218,7 @@ pub fn dump_dataflow(
 ) -> String {
     let mut output = String::new();
     let entries = collect_dataflow_entries(&chunk.main, cfg, dataflow);
-    let visible = visible_dataflow_ids(&entries, filters);
+    let visible = visible_ids(entries.iter().map(|e| e.id), filters);
 
     let _ = writeln!(output, "===== Dump Dataflow =====");
     let _ = writeln!(
@@ -261,15 +261,15 @@ pub fn dump_dataflow(
                 "{indent}    @{instr_index:03} block=#{} {:<18} reads={} writes={} open-use={} open-def={} effects={}",
                 block.index(),
                 format_low_instr_head(instr),
-                format_reg_set(&effect.fixed_uses),
-                format_reg_set(&effect.fixed_must_defs),
+                format_display_set(&effect.fixed_uses),
+                format_display_set(&effect.fixed_must_defs),
                 effect
                     .open_use
-                    .map(format_reg)
+                    .map(|r| r.to_string())
                     .unwrap_or_else(|| "-".to_owned()),
                 effect
                     .open_must_def
-                    .map(format_reg)
+                    .map(|r| r.to_string())
                     .unwrap_or_else(|| "-".to_owned()),
                 format_effect_tags(&summary.tags),
             );
@@ -281,8 +281,8 @@ pub fn dump_dataflow(
                 output,
                 "{indent}    block #{} live_in={} live_out={} open_in={} open_out={}",
                 block.index(),
-                format_reg_set(entry.facts.live_in_regs(*block)),
-                format_reg_set(entry.facts.live_out_regs(*block)),
+                format_display_set(entry.facts.live_in_regs(*block)),
+                format_display_set(entry.facts.live_out_regs(*block)),
                 entry.facts.block_open_live_in(*block),
                 entry.facts.block_open_live_out(*block),
             );
@@ -297,7 +297,7 @@ pub fn dump_dataflow(
                     output,
                     "{indent}    block #{} reg={} incoming={}",
                     candidate.block.index(),
-                    format_reg(candidate.reg),
+                    candidate.reg,
                     format_phi_incoming(&candidate.incoming),
                 );
             }
@@ -400,19 +400,12 @@ fn collect_dataflow_entries_inner<'a>(
     }
 }
 
-fn visible_proto_ids<T>(entries: &[ProtoEntry<'_, T>], filters: &DebugFilters) -> Vec<usize> {
+fn visible_ids(entries: impl Iterator<Item = usize>, filters: &DebugFilters) -> Vec<usize> {
+    let all: Vec<usize> = entries.collect();
     match filters.proto {
-        Some(id) if entries.iter().any(|entry| entry.id == id) => vec![id],
+        Some(id) if all.contains(&id) => vec![id],
         Some(_) => Vec::new(),
-        None => entries.iter().map(|entry| entry.id).collect(),
-    }
-}
-
-fn visible_dataflow_ids(entries: &[DataflowProtoEntry<'_>], filters: &DebugFilters) -> Vec<usize> {
-    match filters.proto {
-        Some(id) if entries.iter().any(|entry| entry.id == id) => vec![id],
-        Some(_) => Vec::new(),
-        None => entries.iter().map(|entry| entry.id).collect(),
+        None => all,
     }
 }
 
@@ -444,81 +437,14 @@ fn format_edge_refs(edge_refs: &[super::common::EdgeRef]) -> String {
     }
 }
 
-fn format_block_set(blocks: &BTreeSet<BlockRef>) -> String {
-    if blocks.is_empty() {
-        "[-]".to_string()
-    } else {
-        format!(
-            "[{}]",
-            blocks
-                .iter()
-                .map(|block| block.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
-}
-
-fn format_block_list(blocks: &[BlockRef]) -> String {
-    if blocks.is_empty() {
-        "[-]".to_string()
-    } else {
-        format!(
-            "[{}]",
-            blocks
-                .iter()
-                .map(|block| block.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
-}
-
-fn format_reg_set(regs: &BTreeSet<Reg>) -> String {
-    if regs.is_empty() {
-        "[-]".to_string()
-    } else {
-        format!(
-            "[{}]",
-            regs.iter()
-                .map(|reg| reg.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
-}
-
 fn format_reaching_defs(defs: &RegValueMap<DefId>) -> String {
     if defs.iter().next().is_none() {
         "[-]".to_string()
     } else {
         defs.iter()
-            .map(|(reg, defs)| format!("{reg}<-{}", format_def_set(defs)))
+            .map(|(reg, defs)| format!("{reg}<-{}", format_display_set(defs)))
             .collect::<Vec<_>>()
             .join(" ")
-    }
-}
-
-fn format_def_set(defs: &CompactSet<DefId>) -> String {
-    format_def_iter(defs.iter())
-}
-
-fn format_btree_def_set(defs: &BTreeSet<DefId>) -> String {
-    format_def_iter(defs.iter())
-}
-
-fn format_def_iter<'a>(defs: impl Iterator<Item = &'a DefId>) -> String {
-    let defs = defs.collect::<Vec<_>>();
-    if defs.is_empty() {
-        "[-]".to_string()
-    } else {
-        format!(
-            "[{}]",
-            defs.into_iter()
-                .map(|def| def.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
     }
 }
 
@@ -587,15 +513,11 @@ fn format_phi_incoming(incoming: &[super::common::PhiIncoming]) -> String {
             format!(
                 "{}:{}",
                 incoming.pred,
-                format_btree_def_set(&incoming.defs)
+                format_display_set(&incoming.defs)
             )
         })
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-fn format_reg(reg: Reg) -> String {
-    reg.to_string()
 }
 
 fn format_low_instr_head(instr: &LowInstr) -> &'static str {

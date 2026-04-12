@@ -9,7 +9,7 @@ mod dataflow;
 mod debug;
 mod graph;
 
-pub use build::build_cfg_graph;
+pub use build::build_cfg_proto;
 pub use common::{
     BasicBlock, BlockKind, BlockRef, Cfg, CfgEdge, CfgGraph, CompactSet, DataflowFacts, Def, DefId,
     DominatorTree, EdgeKind, EdgeRef, EffectTag, GraphFacts, InstrEffect, InstrRange,

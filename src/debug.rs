@@ -801,5 +801,17 @@ fn is_opcode_token(token: &str) -> bool {
         )
 }
 
+/// 把一组 `Display` 元素格式化为 `[a, b, c]`，空集输出 `[-]`。
+///
+/// 各层 debug.rs 共享此通用格式化逻辑，避免每个模块各写一份。
+pub fn format_display_set(items: impl IntoIterator<Item = impl fmt::Display>) -> String {
+    let formatted: Vec<String> = items.into_iter().map(|item| item.to_string()).collect();
+    if formatted.is_empty() {
+        "[-]".to_string()
+    } else {
+        format!("[{}]", formatted.join(", "))
+    }
+}
+
 #[cfg(test)]
 mod tests;

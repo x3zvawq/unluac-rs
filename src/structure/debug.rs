@@ -3,10 +3,9 @@
 //! 结构候选本身就偏“解释型”事实，所以这里重点把 header / merge / exits /
 //! reducible 这些最值钱的信息稳定打印出来，方便我们快速排查恢复决策。
 
-use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
+use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text, format_display_set};
 
 use super::common::{
     BranchCandidate, BranchRegionFact, BranchValueMergeCandidate, GenericPhiMaterialization,
@@ -169,10 +168,10 @@ fn write_loops(output: &mut String, indent: &str, candidates: &[LoopCandidate]) 
             format_loop_kind(candidate.kind_hint),
             format_loop_source_bindings(candidate.source_bindings),
             format_optional_block(candidate.continue_target),
-            format_block_set(&candidate.exits),
+            format_display_set(&candidate.exits),
             candidate.reducible,
-            format_edge_refs(&candidate.backedges),
-            format_block_set(&candidate.blocks),
+            format_display_set(&candidate.backedges),
+            format_display_set(&candidate.blocks),
         );
         for value in &candidate.header_value_merges {
             write_loop_value_merge(output, indent, "header", value);
@@ -196,10 +195,10 @@ fn write_branch_regions(output: &mut String, indent: &str, facts: &[BranchRegion
             fact.header.index(),
             format_branch_kind(fact.kind),
             fact.merge.index(),
-            format_block_set(&fact.flow_blocks),
-            format_block_set(&fact.structured_blocks),
-            format_block_set(&fact.then_merge_preds),
-            format_block_set(&fact.else_merge_preds),
+            format_display_set(&fact.flow_blocks),
+            format_display_set(&fact.structured_blocks),
+            format_display_set(&fact.then_merge_preds),
+            format_display_set(&fact.else_merge_preds),
         );
     }
 }
@@ -220,7 +219,7 @@ fn write_generic_phi_materializations(
             "{indent}    block=#{} phi=p{} reg={}",
             candidate.block.index(),
             candidate.phi_id.index(),
-            format_reg(candidate.reg),
+            candidate.reg,
         );
     }
 }
@@ -248,13 +247,13 @@ fn write_branch_value_merges(
                 output,
                 "{indent}      phi=p{} reg={} then-preds={} then-defs={} then-non-header-defs={} else-preds={} else-defs={} else-non-header-defs={}",
                 value.phi_id.index(),
-                format_reg(value.reg),
-                format_block_set(&value.then_arm.preds),
-                format_def_set(&value.then_arm.defs),
-                format_def_set(&value.then_arm.non_header_defs),
-                format_block_set(&value.else_arm.preds),
-                format_def_set(&value.else_arm.defs),
-                format_def_set(&value.else_arm.non_header_defs),
+                value.reg,
+                format_display_set(&value.then_arm.preds),
+                format_display_set(&value.then_arm.defs),
+                format_display_set(&value.then_arm.non_header_defs),
+                format_display_set(&value.else_arm.preds),
+                format_display_set(&value.else_arm.defs),
+                format_display_set(&value.else_arm.non_header_defs),
             );
         }
     }
@@ -276,15 +275,15 @@ fn write_short_circuits(output: &mut String, indent: &str, candidates: &[ShortCi
             format_short_circuit_exit(&candidate.exit),
             candidate
                 .result_reg
-                .map(format_reg)
+                .map(|r| r.to_string())
                 .unwrap_or_else(|| "-".to_owned()),
             candidate
                 .result_phi_id
                 .map(|phi_id| format!("p{}", phi_id.index()))
                 .unwrap_or_else(|| "-".to_owned()),
             candidate.reducible,
-            format_block_set(&candidate.blocks),
-            format_def_set(&candidate.entry_defs),
+            format_display_set(&candidate.blocks),
+            format_display_set(&candidate.entry_defs),
         );
         if !candidate.value_incomings.is_empty() {
             let _ = writeln!(
@@ -334,7 +333,7 @@ fn format_short_circuit_value_incomings(incomings: &[ShortCircuitValueIncoming])
             format!(
                 "{}=>{} local={}",
                 incoming.pred,
-                format_def_set(&incoming.defs),
+                format_display_set(&incoming.defs),
                 incoming
                     .latest_local_def
                     .map(|def| def.to_string())
@@ -383,10 +382,10 @@ fn write_regions(output: &mut String, indent: &str, regions: &[RegionFact]) {
             "{indent}    entry=#{} kind={} exits={} reducible={} structureable={} blocks={}",
             region.entry.index(),
             format_region_kind(region.kind),
-            format_block_set(&region.exits),
+            format_display_set(&region.exits),
             region.reducible,
             region.structureable,
-            format_block_set(&region.blocks),
+            format_display_set(&region.blocks),
         );
     }
 }
@@ -404,7 +403,7 @@ fn write_scopes(output: &mut String, indent: &str, scopes: &[ScopeCandidate]) {
             scope.entry.index(),
             format_scope_kind(scope.kind),
             format_optional_block(scope.exit),
-            format_instr_refs(&scope.close_points),
+            format_display_set(&scope.close_points),
         );
     }
 }
@@ -413,69 +412,6 @@ fn format_optional_block(block: Option<crate::cfg::BlockRef>) -> String {
     block
         .map(|block| block.to_string())
         .unwrap_or_else(|| "-".to_string())
-}
-
-fn format_block_set(blocks: &BTreeSet<crate::cfg::BlockRef>) -> String {
-    if blocks.is_empty() {
-        "[-]".to_string()
-    } else {
-        format!(
-            "[{}]",
-            blocks
-                .iter()
-                .map(|block| block.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
-}
-
-fn format_edge_refs(edges: &[crate::cfg::EdgeRef]) -> String {
-    if edges.is_empty() {
-        "[-]".to_string()
-    } else {
-        format!(
-            "[{}]",
-            edges
-                .iter()
-                .map(|edge| edge.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
-}
-
-fn format_instr_refs(instrs: &[crate::transformer::InstrRef]) -> String {
-    if instrs.is_empty() {
-        "[-]".to_string()
-    } else {
-        format!(
-            "[{}]",
-            instrs
-                .iter()
-                .map(|instr| instr.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
-}
-
-fn format_def_set(defs: &BTreeSet<crate::cfg::DefId>) -> String {
-    if defs.is_empty() {
-        "[-]".to_string()
-    } else {
-        format!(
-            "[{}]",
-            defs.iter()
-                .map(|def| def.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
-}
-
-fn format_reg(reg: crate::transformer::Reg) -> String {
-    reg.to_string()
 }
 
 fn format_branch_kind(kind: super::common::BranchKind) -> &'static str {
@@ -498,10 +434,10 @@ fn format_loop_kind(kind: super::common::LoopKindHint) -> &'static str {
 
 fn format_loop_source_bindings(bindings: Option<LoopSourceBindings>) -> String {
     match bindings {
-        Some(LoopSourceBindings::Numeric(reg)) => format!("numeric:{}", format_reg(reg)),
+        Some(LoopSourceBindings::Numeric(reg)) => format!("numeric:{reg}"),
         Some(LoopSourceBindings::Generic(range)) => format!(
             "generic:{}..{}",
-            format_reg(range.start),
+            range.start,
             range.start.index() + range.len
         ),
         None => "-".to_owned(),
@@ -529,20 +465,12 @@ fn write_loop_value_merge(output: &mut String, indent: &str, label: &str, value:
         output,
         "{indent}      {label} phi=p{} reg={} inside-preds={} inside-defs={} outside-preds={} outside-defs={}",
         value.phi_id.index(),
-        format_reg(value.reg),
-        format_block_set_from_iter(value.inside_arm.preds()),
-        format_def_set_from_iter(value.inside_arm.defs()),
-        format_block_set_from_iter(value.outside_arm.preds()),
-        format_def_set_from_iter(value.outside_arm.defs()),
+        value.reg,
+        format_display_set(value.inside_arm.preds()),
+        format_display_set(value.inside_arm.defs()),
+        format_display_set(value.outside_arm.preds()),
+        format_display_set(value.outside_arm.defs()),
     );
-}
-
-fn format_block_set_from_iter(blocks: impl Iterator<Item = crate::cfg::BlockRef>) -> String {
-    format_block_set(&blocks.collect())
-}
-
-fn format_def_set_from_iter(defs: impl Iterator<Item = crate::cfg::DefId>) -> String {
-    format_def_set(&defs.collect())
 }
 
 fn format_goto_reason(reason: super::common::GotoReason) -> &'static str {

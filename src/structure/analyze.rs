@@ -12,30 +12,15 @@
 //! - 子 proto 会递归走完全相同的结构分析顺序，保证父子层结构事实口径一致
 
 use crate::cfg::{Cfg, CfgGraph, DataflowFacts, GraphFacts};
-use crate::transformer::{LoweredChunk, LoweredProto};
+use crate::transformer::LoweredProto;
 
 use super::common::StructureFacts;
 use super::{
     branch_values, branches, goto, helpers, loops, phi_facts, regions, scope, short_circuit,
 };
 
-/// 对整个 lowered chunk 递归提取结构候选。
+/// 对单个 proto 递归提取结构候选，子 proto 走完全相同的分析顺序。
 pub fn analyze_structure(
-    chunk: &LoweredChunk,
-    cfg_graph: &CfgGraph,
-    graph_facts: &GraphFacts,
-    dataflow: &DataflowFacts,
-) -> StructureFacts {
-    analyze_proto_structure(
-        &chunk.main,
-        &cfg_graph.cfg,
-        graph_facts,
-        dataflow,
-        &cfg_graph.children,
-    )
-}
-
-fn analyze_proto_structure(
     proto: &LoweredProto,
     cfg: &Cfg,
     graph_facts: &GraphFacts,
@@ -96,7 +81,7 @@ fn analyze_proto_structure(
         .zip(dataflow.children.iter())
         .map(
             |(((child_proto, child_cfg), child_graph_facts), child_dataflow)| {
-                analyze_proto_structure(
+                analyze_structure(
                     child_proto,
                     &child_cfg.cfg,
                     child_graph_facts,

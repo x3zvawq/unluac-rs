@@ -4,7 +4,7 @@
 //! 这样后续补层时只需要往这个骨架里填实现，不需要重写调用约定。
 
 use crate::ast::lower_ast;
-use crate::cfg::{analyze_dataflow, analyze_graph_facts, build_cfg_graph};
+use crate::cfg::{analyze_dataflow, analyze_graph_facts, build_cfg_proto};
 use crate::generate::{
     GenerateChunkCommentMetadata, GenerateCommentMetadata, GenerateFunctionCommentMetadata,
     generate_chunk,
@@ -91,7 +91,7 @@ impl DecompilerPipeline {
                 .lowered
                 .as_ref()
                 .expect("transform stage completed must leave lowered in state");
-            build_cfg_graph(lowered)
+            build_cfg_proto(&lowered.main)
         });
         state.mark_completed(DecompileStage::Cfg);
 
@@ -137,7 +137,7 @@ impl DecompilerPipeline {
                 .graph_facts
                 .as_ref()
                 .expect("graph facts stage completed must leave graph facts in state");
-            analyze_dataflow(lowered, cfg_graph, graph_facts)
+            analyze_dataflow(&lowered.main, &cfg_graph.cfg, graph_facts, &cfg_graph.children)
         });
         state.mark_completed(DecompileStage::Dataflow);
 
@@ -168,7 +168,7 @@ impl DecompilerPipeline {
                     .dataflow
                     .as_ref()
                     .expect("dataflow stage completed must leave dataflow in state");
-                analyze_structure(lowered, cfg_graph, graph_facts, dataflow)
+                analyze_structure(&lowered.main, &cfg_graph.cfg, graph_facts, dataflow, &cfg_graph.children)
         });
         state.mark_completed(DecompileStage::StructureFacts);
 
