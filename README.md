@@ -3,6 +3,7 @@
 [简体中文](./README_cn.md) | English
 
 > This repository is still in a testing phase, and its behavior, APIs, and output details may continue to evolve. Bug reports, problematic test cases, incompatibility findings, usage feedback, and release-related suggestions are all very welcome.
+> If you are using this decompiler and run into bytecode files that decompile poorly, please make sure to share a reproducible sample. Real-world samples are essential for improving the current logic, covering edge cases, and steadily raising output quality.
 
 A multi-dialect Lua decompiler written in Rust.
 
