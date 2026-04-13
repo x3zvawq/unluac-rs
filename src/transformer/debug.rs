@@ -189,7 +189,7 @@ fn dialect_label(version: DialectVersion) -> &'static str {
     }
 }
 
-fn format_low_instr(instr: &LowInstr) -> String {
+pub fn format_low_instr(instr: &LowInstr) -> String {
     match instr {
         LowInstr::Move(instr) => {
             format!(

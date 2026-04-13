@@ -93,7 +93,7 @@ Input options:
 | `-i`, `--input` | Path to a compiled chunk | None |
 | `-s`, `--source` | Path to Lua source; the CLI invokes an external compiler before decompiling | None |
 | `-l`, `--luac` | Explicit compiler path used by `--source` | First tries `lua/build/<dialect>/`, otherwise falls back to a compatible compiler on PATH |
-| `-e`, `--encoding` | String decoding encoding | `utf-8` |
+| `-e`, `--encoding` | String decoding encoding (any [Encoding Standard](https://encoding.spec.whatwg.org/) label, e.g. `utf-8`, `gbk`, `shift_jis`, `euc-kr`, `big5`) | `utf-8` |
 | `-m`, `--decode-mode` | String decode failure strategy | `strict` |
 | `-p`, `--parse-mode` | Strict vs permissive parser mode | `permissive` |
 

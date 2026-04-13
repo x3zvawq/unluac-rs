@@ -20,7 +20,7 @@ pub use common::{
     ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr, TbcInstr,
     UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
-pub use debug::dump_lir;
+pub use debug::{dump_lir, format_low_instr};
 pub use error::TransformError;
 
 use crate::parser::{DialectVersion, RawChunk};

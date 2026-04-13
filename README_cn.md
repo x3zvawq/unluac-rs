@@ -93,7 +93,7 @@ unluac-cli -i /absolute/path/to/chunk.out -D lua5.1 -o /tmp/case.lua
 | `-i`, `--input` | 已编译 chunk 路径 | 无 |
 | `-s`, `--source` | Lua 源码路径，CLI 会先调用外部编译器，再执行反编译 | 无 |
 | `-l`, `--luac` | 显式指定 `--source` 使用的外部编译器路径 | 先尝试 `lua/build/<dialect>/`，否则回退到 PATH 上的兼容编译器 |
-| `-e`, `--encoding` | 字符串解码编码 | `utf-8` |
+| `-e`, `--encoding` | 字符串解码编码（支持 [Encoding Standard](https://encoding.spec.whatwg.org/) 定义的所有标签，如 `utf-8`、`gbk`、`shift_jis`、`euc-kr`、`big5`） | `utf-8` |
 | `-m`, `--decode-mode` | 字符串解码失败策略 | `strict` |
 | `-p`, `--parse-mode` | parser 严格 / 宽松模式 | `permissive` |
 

@@ -303,10 +303,24 @@ fn parse_mode_labels() -> Vec<&'static str> {
 }
 
 fn string_encoding_labels() -> Vec<&'static str> {
-    [StringEncoding::Utf8, StringEncoding::Gbk]
-        .into_iter()
-        .map(StringEncoding::as_str)
-        .collect()
+    // 常用编码预设列表；实际上 StringEncoding::from_str 支持 encoding_rs 的所有编码标签
+    [
+        "utf-8",
+        "gbk",
+        "gb18030",
+        "big5",
+        "shift_jis",
+        "euc-jp",
+        "euc-kr",
+        "windows-1252",
+        "windows-1251",
+        "koi8-r",
+        "windows-874",
+    ]
+    .into_iter()
+    .filter_map(|label| label.parse::<StringEncoding>().ok())
+    .map(StringEncoding::as_str)
+    .collect()
 }
 
 fn string_decode_mode_labels() -> Vec<&'static str> {
@@ -357,7 +371,7 @@ mod tests {
     };
     use serde::de::IgnoredAny;
     use unluac::decompile::{DecompileDialect, NamingMode, QuoteStyle, TableStyle};
-    use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
+    use unluac::parser::{ParseMode, StringDecodeMode};
 
     #[test]
     fn wasm_options_default_to_repo_generate_preset() {
@@ -401,7 +415,7 @@ mod tests {
 
         assert_eq!(options.dialect, DecompileDialect::Luau);
         assert_eq!(options.parse.mode, ParseMode::Permissive);
-        assert_eq!(options.parse.string_encoding, StringEncoding::Gbk);
+        assert_eq!(options.parse.string_encoding, "gbk".parse().unwrap());
         assert_eq!(options.parse.string_decode_mode, StringDecodeMode::Lossy);
         assert_eq!(options.naming.mode, NamingMode::Heuristic);
         assert!(!options.naming.debug_like_include_function);

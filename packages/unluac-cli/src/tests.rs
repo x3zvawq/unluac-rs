@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::CommandFactory;
 use unluac::decompile::{DebugColorMode, DecompileStage, GenerateMode, NamingMode};
-use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
+use unluac::parser::{ParseMode, StringDecodeMode};
 
 use super::{CliArgs, OUTPUT_ONLY_SUPPORTS_FINAL_SOURCE, emit_generated_source, parse_args};
 
@@ -152,7 +152,7 @@ fn short_flags_map_to_the_same_cli_fields() {
     assert_eq!(options.source, Some(PathBuf::from("case.lua")));
     assert_eq!(options.luac, Some(PathBuf::from("lua54-luac")));
     assert_eq!(options.decompile.dialect.as_str(), "lua5.4");
-    assert_eq!(options.decompile.parse.string_encoding, StringEncoding::Gbk);
+    assert_eq!(options.decompile.parse.string_encoding, "gbk".parse().unwrap());
     assert_eq!(
         options.decompile.parse.string_decode_mode,
         StringDecodeMode::Lossy
