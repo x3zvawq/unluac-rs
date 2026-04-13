@@ -1,6 +1,6 @@
 [package]
 name = "unluac"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 description = "Multi-dialect Lua decompiler written in Rust."
 license = "MIT"
