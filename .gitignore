@@ -3,3 +3,7 @@
 /lua/build
 /lua/sources
 .DS_Store
+node_modules
+dist
+.vite
+*.tsbuildinfo

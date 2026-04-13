@@ -17,6 +17,7 @@ const targetFiles = [
   { kind: "cargo", path: "packages/unluac-wasm/Cargo.toml" },
   { kind: "json", path: "packages/unluac-js/package.json" },
   { kind: "package-lock", path: "packages/unluac-js/package-lock.json" },
+  { kind: "json", path: "packages/unluac-web/package.json" },
 ];
 
 const rootManifest = await readFile(rootManifestPath, "utf8");

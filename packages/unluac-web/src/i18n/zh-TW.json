@@ -1,0 +1,181 @@
+{
+  "app": {
+    "title": "unluac-web",
+    "subtitle": "Lua 反編譯器"
+  },
+  "header": {
+    "settings": "設定",
+    "theme": {
+      "light": "淺色模式",
+      "dark": "深色模式",
+      "system": "跟隨系統"
+    },
+    "language": "語言"
+  },
+  "filePanel": {
+    "title": "檔案列表",
+    "dropHint": "拖曳位元組碼檔案到此處",
+    "openFile": "開啟檔案",
+    "openFolder": "開啟資料夾",
+    "empty": "暫無檔案",
+    "status": {
+      "pending": "待處理",
+      "processing": "處理中",
+      "success": "成功",
+      "error": "失敗",
+      "skipped": "已跳過（原始檔案）"
+    },
+    "noFiles": "沒有匹配的檔案",
+    "globDialog": {
+      "title": "輸入檔案匹配模式（glob）",
+      "cancel": "取消"
+    },
+    "batchWarning": "選取了 {count} 個檔案，批次反編譯可能需要一些時間，是否繼續？",
+    "progress": "已完成 {done}/{total}",
+    "batchStats": "{success} 成功，{error} 失敗",
+    "dismissStats": "關閉",
+    "contextMenu": {
+      "recompile": "重新反編譯",
+      "compare": "比較…",
+      "download": "下載結果",
+      "remove": "移除"
+    },
+    "folderContextMenu": {
+      "removeFolder": "移除目錄"
+    }
+  },
+  "codeView": {
+    "placeholder": "選擇一個檔案開始反編譯",
+    "copy": "複製",
+    "copied": "已複製",
+    "download": "下載",
+    "downloadAll": "下載全部",
+    "fontSize": "字型大小",
+    "error": "反編譯失敗",
+    "modified": "已修改",
+    "modifiedHint": "目前內容已被手動編輯，與原始反編譯結果不同",
+    "restore": "恢復原始結果",
+    "restoreConfirm": "確定要放棄編輯並恢復為原始反編譯結果嗎？"
+  },
+  "tabs": {
+    "code": "原始碼",
+    "protos": "Proto",
+    "cfg": "CFG",
+    "diff": "比較",
+    "contextMenu": {
+      "close": "關閉",
+      "closeOthers": "關閉其他",
+      "closeRight": "關閉右側",
+      "closeAll": "關閉全部"
+    }
+  },
+  "analysis": {
+    "loading": "正在分析…",
+    "noFile": "選擇一個檔案以檢視分析結果",
+    "noData": "暫無結構化分析資料",
+    "noDataHint": "需要使用包含 decompileRich 匯出的 WASM 模組",
+    "sourceFile": "該檔案是原始檔案，無需反編譯",
+    "error": "分析出錯",
+    "selectProto": "選擇一個 Proto",
+    "protoGraph": {
+      "root": "根 Proto",
+      "params": "參數",
+      "lines": "行",
+      "vararg": "變長參數",
+      "upvalues": "上值",
+      "constants": "常數",
+      "instructions": "指令"
+    },
+    "constants": {
+      "title": "常數",
+      "empty": "暫無常數",
+      "type": "類型",
+      "value": "值"
+    },
+    "cfgViewer": {
+      "proto": "Proto",
+      "entry": "入口",
+      "exit": "出口",
+      "blocks": "基本區塊",
+      "edges": "邊",
+      "bytecode": "位元組碼",
+      "focusHint": "已聚焦 {block}（{hops} 跳鄰域）。雙擊其他區塊可切換聚焦。",
+      "clearFocus": "顯示全部"
+    }
+  },
+  "settings": {
+    "title": "設定",
+    "dialect": "Lua 方言",
+    "tabs": {
+      "general": "通用",
+      "parse": "解析",
+      "readability": "可讀性",
+      "naming": "命名",
+      "generate": "產生",
+      "about": "關於"
+    },
+    "parse": {
+      "title": "解析選項",
+      "mode": "解析模式",
+      "stringEncoding": "字串編碼",
+      "stringDecodeMode": "字串解碼模式"
+    },
+    "readability": {
+      "title": "可讀性選項",
+      "returnInlineMaxComplexity": "return 內聯最大複雜度",
+      "indexInlineMaxComplexity": "索引內聯最大複雜度",
+      "argsInlineMaxComplexity": "參數內聯最大複雜度",
+      "accessBaseInlineMaxComplexity": "存取基底表內聯最大複雜度"
+    },
+    "naming": {
+      "title": "命名選項",
+      "mode": "命名模式",
+      "debugLikeIncludeFunction": "debug-like 包含函式名"
+    },
+    "generate": {
+      "title": "產生選項",
+      "mode": "產生模式",
+      "indentWidth": "縮排寬度",
+      "maxLineLength": "最大行寬",
+      "quoteStyle": "引號風格",
+      "tableStyle": "表建構器風格",
+      "conservativeOutput": "保守輸出模式",
+      "comment": "產生註解"
+    },
+    "tips": {
+      "dialect": "目標 Lua 方言，決定解析器和產生器的行為。CLI: --dialect / -D",
+      "generateMode": "產生器錯誤處理策略。strict: 遇錯即停；best-effort: 嘗試替代語法；permissive: 盡可能輸出。CLI: --generate-mode / -g",
+      "parseMode": "解析器嚴格程度。strict: 嚴格校驗；permissive: 容忍不規範的位元組碼。CLI: --parse-mode / -p",
+      "stringEncoding": "字串常數的解碼編碼。CLI: --encoding / -e",
+      "stringDecodeMode": "字串解碼失敗時的處理策略。strict: 報錯；lossy: 替換為佔位符。CLI: --decode-mode / -m",
+      "returnInlineMaxComplexity": "return 陳述式中允許的最大內聯運算式複雜度。CLI: --return-inline-max-complexity",
+      "indexInlineMaxComplexity": "表索引中允許的最大內聯運算式複雜度。CLI: --index-inline-max-complexity",
+      "argsInlineMaxComplexity": "函式呼叫參數中允許的最大內聯運算式複雜度。CLI: --args-inline-max-complexity",
+      "accessBaseInlineMaxComplexity": "表存取基底表中允許的最大內聯運算式複雜度。CLI: --access-base-inline-max-complexity",
+      "namingMode": "變數命名策略。debug-like: 使用偵錯資訊命名；simple: 簡單序號；heuristic: 啟發式推斷。CLI: --naming-mode / -n",
+      "debugLikeIncludeFunction": "debug-like 命名模式下，是否包含函式形狀的名稱。CLI: --debug-like-include-function",
+      "indentWidth": "產生程式碼的縮排寬度（空格數）。CLI: --indent-width",
+      "maxLineLength": "產生程式碼的首選最大行寬。CLI: --max-line-length",
+      "quoteStyle": "字串引號風格。prefer-double: 偏好雙引號；prefer-single: 偏好單引號；min-escape: 選擇最少跳脫的。CLI: --quote-style",
+      "tableStyle": "表建構器排版風格。compact: 緊湊；balanced: 均衡；expanded: 展開。CLI: --table-style",
+      "conservativeOutput": "啟用保守輸出模式，產生更安全但可能更冗長的程式碼。CLI: --conservative-output",
+      "comment": "是否在產生的程式碼中輸出註解和中繼資訊。CLI: --comment"
+    },
+    "share": {
+      "button": "複製分享連結",
+      "copied": "連結已複製到剪貼簿",
+      "reset": "恢復預設設定"
+    },
+    "about": {
+      "title": "關於",
+      "repo": "GitHub 倉庫",
+      "version": "版本"
+    }
+  },
+  "diff": {
+    "left": "左側",
+    "right": "右側",
+    "selectFile": "選擇檔案",
+    "hint": "選擇兩個已反編譯的檔案進行比較"
+  }
+}

@@ -9,6 +9,7 @@
 
 当前已经发布的对外入口包括：
 
+- Web 页面 [unluac.x3zvawq.com](https://unluac.x3zvawq.com)
 - Rust crate [`unluac`](https://crates.io/crates/unluac)
 - GitHub Releases 上的独立 CLI 二进制
 - npm 包 [`unluac-js`](https://www.npmjs.com/package/unluac-js)
@@ -40,10 +41,21 @@
 
 项目当前主要通过以下几种入口分发：
 
-1. **命令行工具**：使用 GitHub Releases 提供的独立二进制，或者直接在本仓库中运行 / 构建 `unluac-cli`。
-2. **Rust 库**：在 Rust 项目中引入已发布的 `unluac` crate，直接调用反编译 pipeline。
-3. **npm 包**：安装 `unluac-js`，面向 Node.js 或基于打包器的浏览器环境。
-4. **WebAssembly**：直接使用 `packages/unluac-wasm`，适合继续为其他语言或运行时做封装。
+1. **Web 页面**：直接访问 [unluac.x3zvawq.com](https://unluac.x3zvawq.com)，无需安装，在浏览器中完成上传与反编译。
+2. **命令行工具**：使用 GitHub Releases 提供的独立二进制，或者直接在本仓库中运行 / 构建 `unluac-cli`。
+3. **Rust 库**：在 Rust 项目中引入已发布的 `unluac` crate，直接调用反编译 pipeline。
+4. **npm 包**：安装 `unluac-js`，面向 Node.js 或基于打包器的浏览器环境。
+5. **WebAssembly**：直接使用 `packages/unluac-wasm`，适合继续为其他语言或运行时做封装。
+
+### Web 页面
+
+访问 [unluac.x3zvawq.com](https://unluac.x3zvawq.com) 即可直接在浏览器中上传 `.luac` / `.out` 文件进行反编译，无需安装任何工具。
+
+站点部署在 Vercel 上，在部分网络环境（如中国大陆）可能存在访问限制。如遇无法访问的情况，可考虑以下替代方案：
+
+- 使用 CLI 二进制（离线，无需网络）
+- 使用 npm 包在本地浏览器环境中运行
+- 基于 `packages/unluac-wasm` 自建站点
 
 ### 命令行工具
 

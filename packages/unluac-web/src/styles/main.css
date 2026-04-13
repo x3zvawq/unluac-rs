@@ -1,0 +1,105 @@
+@import 'tailwindcss';
+
+/*
+ * Tailwind CSS v4 默认 dark: 变体使用 @media (prefers-color-scheme: dark)，
+ * 但本项目通过 html.dark class 手动管理深色模式，需要改为 class 策略。
+ */
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --app-header-height: 48px;
+  --file-panel-width: 280px;
+
+  /* 主题色 —— 由 .dark class 切换，跟随 naive-ui 的主题切换逻辑 */
+  --app-bg: #ffffff;
+  --app-bg-alt: #f9fafb;
+  --app-bg-hover: #f3f4f6;
+  --app-text: #111827;
+  --app-text-secondary: #6b7280;
+  --app-text-dim: #9ca3af;
+  --app-border: #e5e7eb;
+}
+
+.dark {
+  --app-bg: #111827;
+  --app-bg-alt: rgba(31, 41, 55, 0.5);
+  --app-bg-hover: #374151;
+  --app-text: #f3f4f6;
+  --app-text-secondary: #9ca3af;
+  --app-text-dim: #6b7280;
+  --app-border: #374151;
+}
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background-color: var(--app-bg);
+  color: var(--app-text);
+}
+
+/*
+ * Naive UI 弹出层自身已有合理的 z-index 逻辑。
+ * 不要手动覆盖 .n-drawer-mask / .n-drawer-container 等内部类的 z-index，
+ * 否则会破坏 mask 与 drawer 内容之间的层叠关系，导致 mask 遮挡可交互区域。
+ */
+
+/*
+ * 全局滚动条样式。
+ * 避免各组件各自声明滚动条样式，统一在此处定义。
+ * Firefox 通过 scrollbar-width / scrollbar-color 支持，
+ * Webkit 系通过 ::-webkit-scrollbar 伪元素支持。
+ */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--app-text-dim) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background-color: var(--app-text-dim);
+  border-radius: 4px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--app-text-secondary);
+}
+
+/*
+ * vue-flow Controls / MiniMap 深色模式适配。
+ * 这些组件内部没有跟随 Naive UI 的主题切换能力，
+ * 需要通过 .dark 祖先选择器手动覆盖。
+ * 放在全局而非 CfgViewer 的 <style> 内，
+ * 因为 CfgViewer 是 defineAsyncComponent 懒加载，
+ * 样式在组件首次挂载前不存在，导致 ProtoGraph 里的
+ * MiniMap/Controls 在未访问 CFG 时显示为白色。
+ */
+.dark .vue-flow__controls {
+  background: #1f2937;
+  border-color: #374151;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.4);
+}
+.dark .vue-flow__controls-button {
+  background: #1f2937;
+  fill: #d1d5db;
+  border-bottom-color: #374151;
+}
+.dark .vue-flow__controls-button:hover {
+  background: #374151;
+}
+.dark .vue-flow__minimap {
+  background: #1f2937;
+}
+.dark .vue-flow__minimap-mask {
+  fill: rgb(17 24 39 / 0.7);
+}
+.dark .vue-flow__minimap-node {
+  fill: #6b7280;
+  stroke: #4b5563;
+}

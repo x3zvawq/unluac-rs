@@ -1,0 +1,181 @@
+{
+  "app": {
+    "title": "unluac-web",
+    "subtitle": "Lua 디컴파일러"
+  },
+  "header": {
+    "settings": "설정",
+    "theme": {
+      "light": "라이트 모드",
+      "dark": "다크 모드",
+      "system": "시스템 설정"
+    },
+    "language": "언어"
+  },
+  "filePanel": {
+    "title": "파일",
+    "dropHint": "바이트코드 파일을 여기에 드롭하세요",
+    "openFile": "파일 열기",
+    "openFolder": "폴더 열기",
+    "empty": "파일 없음",
+    "status": {
+      "pending": "대기 중",
+      "processing": "처리 중",
+      "success": "성공",
+      "error": "오류",
+      "skipped": "건너뛰 (소스 파일)"
+    },
+    "noFiles": "일치하는 파일이 없습니다",
+    "globDialog": {
+      "title": "파일 일치 패턴 입력 (glob)",
+      "cancel": "취소"
+    },
+    "batchWarning": "{count}개의 파일이 선택되었습니다. 일괄 디컴파일에 시간이 걸릴 수 있습니다. 계속하시겠습니까?",
+    "progress": "{done}/{total} 완료",
+    "batchStats": "{success} 성공, {error} 실패",
+    "dismissStats": "닫기",
+    "contextMenu": {
+      "recompile": "다시 디컴파일",
+      "compare": "비교…",
+      "download": "결과 다운로드",
+      "remove": "제거"
+    },
+    "folderContextMenu": {
+      "removeFolder": "폴더 제거"
+    }
+  },
+  "codeView": {
+    "placeholder": "디컴파일할 파일을 선택하세요",
+    "copy": "복사",
+    "copied": "복사됨",
+    "download": "다운로드",
+    "downloadAll": "전체 다운로드",
+    "fontSize": "글꼴 크기",
+    "error": "디컴파일 실패",
+    "modified": "수정됨",
+    "modifiedHint": "내용이 수동으로 편집되어 원래 디컴파일 결과와 다릅니다",
+    "restore": "원래대로 복원",
+    "restoreConfirm": "편집을 취소하고 원래 디컴파일 결과로 복원하시겠습니까?"
+  },
+  "tabs": {
+    "code": "소스",
+    "protos": "Proto",
+    "cfg": "CFG",
+    "diff": "비교",
+    "contextMenu": {
+      "close": "닫기",
+      "closeOthers": "다른 탭 닫기",
+      "closeRight": "오른쪽 탭 닫기",
+      "closeAll": "모두 닫기"
+    }
+  },
+  "analysis": {
+    "loading": "분석 중…",
+    "noFile": "분석 결과를 보려면 파일을 선택하세요",
+    "noData": "구조 분석 데이터가 없습니다",
+    "noDataHint": "decompileRich 내보내기가 포함된 WASM 모듈이 필요합니다",
+    "sourceFile": "이 파일은 소스 파일입니다. 디컴파일 불필요",
+    "error": "분석 오류",
+    "selectProto": "Proto 선택",
+    "protoGraph": {
+      "root": "루트 Proto",
+      "params": "매개변수",
+      "lines": "행",
+      "vararg": "가변 인수",
+      "upvalues": "업밸류",
+      "constants": "상수",
+      "instructions": "명령어"
+    },
+    "constants": {
+      "title": "상수",
+      "empty": "상수 없음",
+      "type": "타입",
+      "value": "값"
+    },
+    "cfgViewer": {
+      "proto": "Proto",
+      "entry": "입구",
+      "exit": "출구",
+      "blocks": "블록",
+      "edges": "엣지",
+      "bytecode": "바이트코드",
+      "focusHint": "{block}에 포커스 중 ({hops}홉 이웃). 다른 블록을 더블 클릭하면 전환됩니다.",
+      "clearFocus": "전체 표시"
+    }
+  },
+  "settings": {
+    "title": "설정",
+    "dialect": "Lua 방언",
+    "tabs": {
+      "general": "일반",
+      "parse": "구문 분석",
+      "readability": "가독성",
+      "naming": "명명",
+      "generate": "생성",
+      "about": "정보"
+    },
+    "parse": {
+      "title": "파싱 옵션",
+      "mode": "파싱 모드",
+      "stringEncoding": "문자열 인코딩",
+      "stringDecodeMode": "문자열 디코드 모드"
+    },
+    "readability": {
+      "title": "가독성 옵션",
+      "returnInlineMaxComplexity": "return 인라인 최대 복잡도",
+      "indexInlineMaxComplexity": "인덱스 인라인 최대 복잡도",
+      "argsInlineMaxComplexity": "인자 인라인 최대 복잡도",
+      "accessBaseInlineMaxComplexity": "접근 기반 인라인 최대 복잡도"
+    },
+    "naming": {
+      "title": "네이밍 옵션",
+      "mode": "네이밍 모드",
+      "debugLikeIncludeFunction": "debug-like에 함수 이름 포함"
+    },
+    "generate": {
+      "title": "생성 옵션",
+      "mode": "생성 모드",
+      "indentWidth": "들여쓰기 너비",
+      "maxLineLength": "최대 줄 길이",
+      "quoteStyle": "따옴표 스타일",
+      "tableStyle": "테이블 스타일",
+      "conservativeOutput": "보수적 출력",
+      "comment": "주석 출력"
+    },
+    "tips": {
+      "dialect": "대상 Lua 방언으로, 파서와 생성기의 동작에 영향을 줍니다. CLI: --dialect / -D",
+      "generateMode": "오류 처리 전략. strict: 오류 시 중단; best-effort: 대체 구문 시도; permissive: 가능한 한 많이 출력. CLI: --generate-mode / -g",
+      "parseMode": "파서 엄격도. strict: 엄격한 검증; permissive: 비표준 바이트코드 허용. CLI: --parse-mode / -p",
+      "stringEncoding": "문자열 상수 디코딩에 사용할 인코딩. CLI: --encoding / -e",
+      "stringDecodeMode": "문자열 디코드 실패 시 동작. strict: 오류; lossy: 플레이스홀더로 대체. CLI: --decode-mode / -m",
+      "returnInlineMaxComplexity": "return 문에서 인라인 표현식의 최대 복잡도. CLI: --return-inline-max-complexity",
+      "indexInlineMaxComplexity": "테이블 인덱스 표현식의 최대 인라인 복잡도. CLI: --index-inline-max-complexity",
+      "argsInlineMaxComplexity": "함수 호출 인자의 최대 인라인 표현식 복잡도. CLI: --args-inline-max-complexity",
+      "accessBaseInlineMaxComplexity": "테이블 접근 기반의 최대 인라인 표현식 복잡도. CLI: --access-base-inline-max-complexity",
+      "namingMode": "변수 명명 전략. debug-like: 디버그 정보 사용; simple: 순차 번호; heuristic: 추론된 이름. CLI: --naming-mode / -n",
+      "debugLikeIncludeFunction": "debug-like 명명 모드에서 함수 형태의 이름을 포함할지 여부. CLI: --debug-like-include-function",
+      "indentWidth": "들여쓰기 너비 (공백 수). CLI: --indent-width",
+      "maxLineLength": "생성 코드의 기본 최대 줄 길이. CLI: --max-line-length",
+      "quoteStyle": "문자열 따옴표 스타일. prefer-double: \"를 선호; prefer-single: '를 선호; min-escape: 이스케이프 최소화. CLI: --quote-style",
+      "tableStyle": "테이블 생성자 레이아웃. compact: 한 줄; balanced: 자동; expanded: 항목당 한 줄. CLI: --table-style",
+      "conservativeOutput": "보수적 출력 모드를 활성화합니다. 더 안전하지만 더 장황할 수 있는 코드를 생성합니다. CLI: --conservative-output",
+      "comment": "생성된 코드에 주석과 메타데이터를 출력할지 여부. CLI: --comment"
+    },
+    "share": {
+      "button": "공유 링크 복사",
+      "copied": "링크가 클립보드에 복사되었습니다",
+      "reset": "기본값으로 재설정"
+    },
+    "about": {
+      "title": "정보",
+      "repo": "GitHub 저장소",
+      "version": "버전"
+    }
+  },
+  "diff": {
+    "left": "왼쪽",
+    "right": "오른쪽",
+    "selectFile": "파일 선택",
+    "hint": "비교할 디컴파일된 파일 2개를 선택하세요"
+  }
+}

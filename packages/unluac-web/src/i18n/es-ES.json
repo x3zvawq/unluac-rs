@@ -1,0 +1,181 @@
+{
+  "app": {
+    "title": "unluac-web",
+    "subtitle": "Lua Decompilador"
+  },
+  "header": {
+    "settings": "Configuración",
+    "theme": {
+      "light": "Modo claro",
+      "dark": "Modo oscuro",
+      "system": "Sistema"
+    },
+    "language": "Idioma"
+  },
+  "filePanel": {
+    "title": "Archivos",
+    "dropHint": "Arrastra archivos de bytecode aquí",
+    "openFile": "Abrir archivo",
+    "openFolder": "Abrir carpeta",
+    "empty": "Sin archivos",
+    "status": {
+      "pending": "Pendiente",
+      "processing": "Procesando",
+      "success": "Éxito",
+      "error": "Error",
+      "skipped": "Omitido (archivo fuente)"
+    },
+    "noFiles": "No hay archivos coincidentes",
+    "globDialog": {
+      "title": "Introduzca patrón de coincidencia (glob)",
+      "cancel": "Cancelar"
+    },
+    "batchWarning": "Se seleccionaron {count} archivos. La descompilación por lotes puede tardar un rato. ¿Continuar?",
+    "progress": "{done}/{total} completados",
+    "batchStats": "{success} exitosos, {error} fallidos",
+    "dismissStats": "Cerrar",
+    "contextMenu": {
+      "recompile": "Recompilar",
+      "compare": "Comparar con…",
+      "download": "Descargar resultado",
+      "remove": "Eliminar"
+    },
+    "folderContextMenu": {
+      "removeFolder": "Eliminar carpeta"
+    }
+  },
+  "codeView": {
+    "placeholder": "Selecciona un archivo para descompilar",
+    "copy": "Copiar",
+    "copied": "Copiado",
+    "download": "Descargar",
+    "downloadAll": "Descargar todo",
+    "fontSize": "Tamaño de fuente",
+    "error": "Error de descompilación",
+    "modified": "Modificado",
+    "modifiedHint": "El contenido ha sido editado manualmente y difiere del resultado de descompilación original",
+    "restore": "Restaurar original",
+    "restoreConfirm": "¿Descartar las ediciones y restaurar el resultado de descompilación original?"
+  },
+  "tabs": {
+    "code": "Fuente",
+    "protos": "Proto",
+    "cfg": "CFG",
+    "diff": "Diferencias",
+    "contextMenu": {
+      "close": "Cerrar",
+      "closeOthers": "Cerrar otras",
+      "closeRight": "Cerrar a la derecha",
+      "closeAll": "Cerrar todas"
+    }
+  },
+  "analysis": {
+    "loading": "Analizando…",
+    "noFile": "Selecciona un archivo para ver el análisis",
+    "noData": "No hay datos de análisis estructural",
+    "noDataHint": "Requiere un módulo WASM con exportación decompileRich",
+    "sourceFile": "Este archivo es un archivo fuente, no necesita descompilación",
+    "error": "Error de análisis",
+    "selectProto": "Seleccionar Proto",
+    "protoGraph": {
+      "root": "Proto raíz",
+      "params": "Parámetros",
+      "lines": "Líneas",
+      "vararg": "Argumentos variables",
+      "upvalues": "Upvalues",
+      "constants": "Constantes",
+      "instructions": "Instrucciones"
+    },
+    "constants": {
+      "title": "Constantes",
+      "empty": "Sin constantes",
+      "type": "Tipo",
+      "value": "Valor"
+    },
+    "cfgViewer": {
+      "proto": "Proto",
+      "entry": "Entrada",
+      "exit": "Salida",
+      "blocks": "Bloques",
+      "edges": "Aristas",
+      "bytecode": "Bytecode",
+      "focusHint": "Enfocado en {block} (vecindario de {hops} saltos). Doble clic en otro bloque para cambiar.",
+      "clearFocus": "Mostrar todo"
+    }
+  },
+  "settings": {
+    "title": "Configuración",
+    "dialect": "Dialecto Lua",
+    "tabs": {
+      "general": "General",
+      "parse": "Análisis",
+      "readability": "Legibilidad",
+      "naming": "Nombrado",
+      "generate": "Generación",
+      "about": "Acerca de"
+    },
+    "parse": {
+      "title": "Opciones de análisis",
+      "mode": "Modo de análisis",
+      "stringEncoding": "Codificación de cadenas",
+      "stringDecodeMode": "Modo de decodificación de cadenas"
+    },
+    "readability": {
+      "title": "Opciones de legibilidad",
+      "returnInlineMaxComplexity": "Complejidad máxima inline de return",
+      "indexInlineMaxComplexity": "Complejidad máxima inline de índice",
+      "argsInlineMaxComplexity": "Complejidad máxima inline de argumentos",
+      "accessBaseInlineMaxComplexity": "Complejidad máxima inline de base de acceso"
+    },
+    "naming": {
+      "title": "Opciones de nomenclatura",
+      "mode": "Modo de nomenclatura",
+      "debugLikeIncludeFunction": "Incluir nombre de función en debug-like"
+    },
+    "generate": {
+      "title": "Opciones de generación",
+      "mode": "Modo de generación",
+      "indentWidth": "Ancho de indentación",
+      "maxLineLength": "Longitud máxima de línea",
+      "quoteStyle": "Estilo de comillas",
+      "tableStyle": "Estilo de tabla",
+      "conservativeOutput": "Salida conservadora",
+      "comment": "Emitir comentarios"
+    },
+    "tips": {
+      "dialect": "Dialecto Lua de destino, afecta el comportamiento del analizador y generador. CLI: --dialect / -D",
+      "generateMode": "Estrategia de manejo de errores. strict: detener en error; best-effort: intentar sintaxis alternativa; permissive: generar lo máximo posible. CLI: --generate-mode / -g",
+      "parseMode": "Nivel de rigor del analizador. strict: validación estricta; permissive: tolerar bytecode no estándar. CLI: --parse-mode / -p",
+      "stringEncoding": "Codificación para decodificar constantes de cadena. CLI: --encoding / -e",
+      "stringDecodeMode": "Comportamiento ante fallo de decodificación de cadenas. strict: error; lossy: reemplazar con marcadores. CLI: --decode-mode / -m",
+      "returnInlineMaxComplexity": "Complejidad máxima de expresiones inline en sentencias return. CLI: --return-inline-max-complexity",
+      "indexInlineMaxComplexity": "Complejidad máxima de expresiones inline en índices de tabla. CLI: --index-inline-max-complexity",
+      "argsInlineMaxComplexity": "Complejidad máxima de expresiones inline en argumentos de llamada. CLI: --args-inline-max-complexity",
+      "accessBaseInlineMaxComplexity": "Complejidad máxima de expresiones inline en bases de acceso a tabla. CLI: --access-base-inline-max-complexity",
+      "namingMode": "Estrategia de nombrado de variables. debug-like: usar info de depuración; simple: números secuenciales; heuristic: nombres inferidos. CLI: --naming-mode / -n",
+      "debugLikeIncludeFunction": "En el modo debug-like, si se incluyen nombres con forma de función. CLI: --debug-like-include-function",
+      "indentWidth": "Ancho de indentación (número de espacios). CLI: --indent-width",
+      "maxLineLength": "Longitud máxima de línea preferida para el código generado. CLI: --max-line-length",
+      "quoteStyle": "Estilo de comillas para cadenas. prefer-double: preferir \"; prefer-single: preferir '; min-escape: minimizar escapes. CLI: --quote-style",
+      "tableStyle": "Diseño del constructor de tablas. compact: línea única; balanced: automático; expanded: una entrada por línea. CLI: --table-style",
+      "conservativeOutput": "Habilitar modo de salida conservadora para código más seguro pero potencialmente más verboso. CLI: --conservative-output",
+      "comment": "Si se emiten comentarios y metadatos en el código generado. CLI: --comment"
+    },
+    "share": {
+      "button": "Copiar enlace",
+      "copied": "Enlace copiado al portapapeles",
+      "reset": "Restablecer valores"
+    },
+    "about": {
+      "title": "Acerca de",
+      "repo": "Repositorio GitHub",
+      "version": "Versión"
+    }
+  },
+  "diff": {
+    "left": "Izquierda",
+    "right": "Derecha",
+    "selectFile": "Seleccionar archivo",
+    "hint": "Selecciona dos archivos descompilados para comparar"
+  }
+}

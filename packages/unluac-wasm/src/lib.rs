@@ -17,6 +17,8 @@ use unluac::decompile::{
 };
 use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
+mod rich;
+
 pub use unluac as core;
 
 #[derive(Debug, Default, Deserialize)]
@@ -109,6 +111,21 @@ pub fn decompile_wasm(bytes: &[u8], options: JsValue) -> Result<JsValue, JsValue
         })?;
 
     to_js_value(&generated_source)
+}
+
+/// 返回结构化 JSON，包含 proto 树、CFG 和反编译源码。
+///
+/// 与 `decompile` 的区别：`decompile` 只返回源码字符串，而 `decompileRich`
+/// 额外返回 proto 元数据和 CFG 拓扑，供前端可视化使用。
+#[wasm_bindgen(js_name = decompileRich)]
+pub fn decompile_rich_wasm(bytes: &[u8], options: JsValue) -> Result<JsValue, JsValue> {
+    let options = parse_wasm_options(options).map_err(WasmBridgeError::into_js_value)?;
+    let result = run_decompile(bytes, options).map_err(|error| {
+        WasmBridgeError::new("decompile-failed", error.to_string(), None).into_js_value()
+    })?;
+
+    let rich = rich::project_rich_result(&result);
+    to_js_value(&rich)
 }
 
 #[wasm_bindgen(js_name = supportedOptionValues)]

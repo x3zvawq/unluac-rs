@@ -1,0 +1,52 @@
+{
+  "name": "unluac-web",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Web interface for the unluac Lua decompiler.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && vue-tsc --build",
+    "preview": "vite preview",
+    "check": "biome check .",
+    "format": "biome format --write .",
+    "lint": "biome lint .",
+    "fix": "biome check --fix ."
+  },
+  "dependencies": {
+    "@codemirror/lang-javascript": "^6.2.5",
+    "@codemirror/language": "^6.12.3",
+    "@codemirror/legacy-modes": "^6.5.2",
+    "@codemirror/merge": "^6.12.1",
+    "@codemirror/search": "^6.6.0",
+    "@codemirror/state": "^6.6.0",
+    "@codemirror/theme-one-dark": "^6.1.3",
+    "@codemirror/view": "^6.41.0",
+    "@dagrejs/dagre": "^3.0.0",
+    "@vue-flow/background": "^1.3.2",
+    "@vue-flow/controls": "^1.1.3",
+    "@vue-flow/core": "^1.48.2",
+    "@vue-flow/minimap": "^1.5.4",
+    "codemirror": "^6.0.2",
+    "naive-ui": "^2.44.1",
+    "pinia": "^3.0.4",
+    "vue": "^3.5.32",
+    "vue-i18n": "^11.3.2",
+    "vue-router": "^5.0.4"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.11",
+    "@iconify-json/mdi": "^1.2.3",
+    "@tailwindcss/vite": "^4.2.2",
+    "@types/node": "^25.6.0",
+    "@vitejs/plugin-vue": "^6.0.5",
+    "@vue/tsconfig": "^0.9.1",
+    "tailwindcss": "^4.2.2",
+    "typescript": "^6.0.2",
+    "unplugin-auto-import": "^21.0.0",
+    "unplugin-icons": "^23.0.1",
+    "unplugin-vue-components": "^32.0.0",
+    "vite": "^8.0.8",
+    "vue-tsc": "^3.2.6"
+  }
+}

@@ -1,0 +1,181 @@
+{
+  "app": {
+    "title": "unluac-web",
+    "subtitle": "Lua デコンパイラ"
+  },
+  "header": {
+    "settings": "設定",
+    "theme": {
+      "light": "ライトモード",
+      "dark": "ダークモード",
+      "system": "システム設定"
+    },
+    "language": "言語"
+  },
+  "filePanel": {
+    "title": "ファイル",
+    "dropHint": "バイトコードファイルをここにドロップ",
+    "openFile": "ファイルを開く",
+    "openFolder": "フォルダを開く",
+    "empty": "ファイルがありません",
+    "status": {
+      "pending": "待機中",
+      "processing": "処理中",
+      "success": "成功",
+      "error": "エラー",
+      "skipped": "スキップ（ソースファイル）"
+    },
+    "noFiles": "一致するファイルがありません",
+    "globDialog": {
+      "title": "ファイルマッチパターンを入力（glob）",
+      "cancel": "キャンセル"
+    },
+    "batchWarning": "{count} ファイルが選択されています。一括デコンパイルには時間がかかる場合があります。続行しますか？",
+    "progress": "{done}/{total} 完了",
+    "batchStats": "{success} 成功、{error} 失敗",
+    "dismissStats": "閉じる",
+    "contextMenu": {
+      "recompile": "再デコンパイル",
+      "compare": "比較…",
+      "download": "結果をダウンロード",
+      "remove": "削除"
+    },
+    "folderContextMenu": {
+      "removeFolder": "フォルダを削除"
+    }
+  },
+  "codeView": {
+    "placeholder": "デコンパイルするファイルを選択してください",
+    "copy": "コピー",
+    "copied": "コピーしました",
+    "download": "ダウンロード",
+    "downloadAll": "すべてダウンロード",
+    "fontSize": "フォントサイズ",
+    "error": "デコンパイル失敗",
+    "modified": "編集済み",
+    "modifiedHint": "内容が手動で編集され、元のデコンパイル結果と異なります",
+    "restore": "元に戻す",
+    "restoreConfirm": "編集を破棄して元のデコンパイル結果に戻しますか？"
+  },
+  "tabs": {
+    "code": "ソース",
+    "protos": "Proto",
+    "cfg": "CFG",
+    "diff": "差分",
+    "contextMenu": {
+      "close": "閉じる",
+      "closeOthers": "他を閉じる",
+      "closeRight": "右側を閉じる",
+      "closeAll": "すべて閉じる"
+    }
+  },
+  "analysis": {
+    "loading": "分析中…",
+    "noFile": "ファイルを選択して分析結果を表示",
+    "noData": "構造分析データがありません",
+    "noDataHint": "decompileRich エクスポート付きの WASM モジュールが必要です",
+    "sourceFile": "このファイルはソースファイルです。デコンパイル不要",
+    "error": "分析エラー",
+    "selectProto": "Proto を選択",
+    "protoGraph": {
+      "root": "ルート Proto",
+      "params": "パラメータ",
+      "lines": "行",
+      "vararg": "可変長引数",
+      "upvalues": "上位値",
+      "constants": "定数",
+      "instructions": "命令"
+    },
+    "constants": {
+      "title": "定数",
+      "empty": "定数なし",
+      "type": "タイプ",
+      "value": "値"
+    },
+    "cfgViewer": {
+      "proto": "Proto",
+      "entry": "入口",
+      "exit": "出口",
+      "blocks": "ブロック",
+      "edges": "エッジ",
+      "bytecode": "バイトコード",
+      "focusHint": "{block} にフォーカス中（{hops} ホップ近傍）。他のブロックをダブルクリックで切替。",
+      "clearFocus": "すべて表示"
+    }
+  },
+  "settings": {
+    "title": "設定",
+    "dialect": "Lua ダイアレクト",
+    "tabs": {
+      "general": "一般",
+      "parse": "解析",
+      "readability": "可読性",
+      "naming": "命名",
+      "generate": "生成",
+      "about": "バージョン情報"
+    },
+    "parse": {
+      "title": "解析オプション",
+      "mode": "解析モード",
+      "stringEncoding": "文字列エンコーディング",
+      "stringDecodeMode": "文字列デコードモード"
+    },
+    "readability": {
+      "title": "可読性オプション",
+      "returnInlineMaxComplexity": "return インライン最大複雑度",
+      "indexInlineMaxComplexity": "インデックスインライン最大複雑度",
+      "argsInlineMaxComplexity": "引数インライン最大複雑度",
+      "accessBaseInlineMaxComplexity": "アクセスベースインライン最大複雑度"
+    },
+    "naming": {
+      "title": "命名オプション",
+      "mode": "命名モード",
+      "debugLikeIncludeFunction": "debug-like に関数名を含める"
+    },
+    "generate": {
+      "title": "生成オプション",
+      "mode": "生成モード",
+      "indentWidth": "インデント幅",
+      "maxLineLength": "最大行長",
+      "quoteStyle": "引用符スタイル",
+      "tableStyle": "テーブルスタイル",
+      "conservativeOutput": "保守的出力",
+      "comment": "コメント出力"
+    },
+    "tips": {
+      "dialect": "対象の Lua ダイアレクト。パーサーとジェネレーターの動作に影響します。CLI: --dialect / -D",
+      "generateMode": "エラー処理戦略。strict: エラーで停止；best-effort: 代替構文を試行；permissive: 可能な限り出力。CLI: --generate-mode / -g",
+      "parseMode": "パーサーの厳密さ。strict: 厳密な検証；permissive: 非標準バイトコードを許容。CLI: --parse-mode / -p",
+      "stringEncoding": "文字列定数のデコードに使用するエンコーディング。CLI: --encoding / -e",
+      "stringDecodeMode": "文字列デコード失敗時の動作。strict: エラー；lossy: プレースホルダーで置換。CLI: --decode-mode / -m",
+      "returnInlineMaxComplexity": "return 文のインライン式の最大複雑度。CLI: --return-inline-max-complexity",
+      "indexInlineMaxComplexity": "テーブルインデックス式のインライン式の最大複雑度。CLI: --index-inline-max-complexity",
+      "argsInlineMaxComplexity": "関数呼び出し引数のインライン式の最大複雑度。CLI: --args-inline-max-complexity",
+      "accessBaseInlineMaxComplexity": "テーブルアクセスベースのインライン式の最大複雑度。CLI: --access-base-inline-max-complexity",
+      "namingMode": "変数命名戦略。debug-like: デバッグ情報を使用；simple: 連番；heuristic: 推論された名前。CLI: --naming-mode / -n",
+      "debugLikeIncludeFunction": "debug-like 命名モードで、関数形状の名前を含めるかどうか。CLI: --debug-like-include-function",
+      "indentWidth": "インデント幅（スペース数）。CLI: --indent-width",
+      "maxLineLength": "生成コードの推奨最大行長。CLI: --max-line-length",
+      "quoteStyle": "文字列の引用符スタイル。prefer-double: \" を優先；prefer-single: ' を優先；min-escape: エスケープを最小化。CLI: --quote-style",
+      "tableStyle": "テーブルコンストラクタのレイアウト。compact: 単一行；balanced: 自動；expanded: 1エントリ1行。CLI: --table-style",
+      "conservativeOutput": "保守的出力モードを有効化。より安全だが冗長になる可能性のあるコードを生成。CLI: --conservative-output",
+      "comment": "生成コードにコメントやメタデータを出力するかどうか。CLI: --comment"
+    },
+    "share": {
+      "button": "共有リンクをコピー",
+      "copied": "リンクをクリップボードにコピーしました",
+      "reset": "デフォルトに戻す"
+    },
+    "about": {
+      "title": "バージョン情報",
+      "repo": "GitHub リポジトリ",
+      "version": "バージョン"
+    }
+  },
+  "diff": {
+    "left": "左",
+    "right": "右",
+    "selectFile": "ファイルを選択",
+    "hint": "比較するデコンパイル済みファイルを2つ選択してください"
+  }
+}

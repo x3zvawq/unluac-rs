@@ -1,0 +1,181 @@
+{
+  "app": {
+    "title": "unluac-web",
+    "subtitle": "Lua Decompiler"
+  },
+  "header": {
+    "settings": "Settings",
+    "theme": {
+      "light": "Light Mode",
+      "dark": "Dark Mode",
+      "system": "System"
+    },
+    "language": "Language"
+  },
+  "filePanel": {
+    "title": "Files",
+    "dropHint": "Drop bytecode files here",
+    "openFile": "Open File",
+    "openFolder": "Open Folder",
+    "empty": "No files yet",
+    "status": {
+      "pending": "Pending",
+      "processing": "Processing",
+      "success": "Success",
+      "error": "Error",
+      "skipped": "Skipped (source file)"
+    },
+    "noFiles": "No matching files",
+    "globDialog": {
+      "title": "Enter file matching pattern (glob)",
+      "cancel": "Cancel"
+    },
+    "batchWarning": "You selected {count} files. Batch decompilation may take a while. Continue?",
+    "progress": "Completed {done}/{total}",
+    "batchStats": "{success} succeeded, {error} failed",
+    "dismissStats": "Dismiss",
+    "contextMenu": {
+      "recompile": "Recompile",
+      "compare": "Compare with…",
+      "download": "Download Result",
+      "remove": "Remove"
+    },
+    "folderContextMenu": {
+      "removeFolder": "Remove Folder"
+    }
+  },
+  "codeView": {
+    "placeholder": "Select a file to start decompiling",
+    "copy": "Copy",
+    "copied": "Copied",
+    "download": "Download",
+    "downloadAll": "Download All",
+    "fontSize": "Font Size",
+    "error": "Decompilation failed",
+    "modified": "Modified",
+    "modifiedHint": "Content has been manually edited and differs from the original decompiled result",
+    "restore": "Restore Original",
+    "restoreConfirm": "Discard edits and restore the original decompiled result?"
+  },
+  "tabs": {
+    "code": "Source",
+    "protos": "Proto",
+    "cfg": "CFG",
+    "diff": "Diff",
+    "contextMenu": {
+      "close": "Close",
+      "closeOthers": "Close Others",
+      "closeRight": "Close to the Right",
+      "closeAll": "Close All"
+    }
+  },
+  "analysis": {
+    "loading": "Analyzing…",
+    "noFile": "Select a file to view analysis",
+    "noData": "No structural analysis data available",
+    "noDataHint": "Requires a WASM module with decompileRich export",
+    "sourceFile": "This file is a source file, no decompilation needed",
+    "error": "Analysis error",
+    "selectProto": "Select a Proto",
+    "protoGraph": {
+      "root": "Root Proto",
+      "params": "Params",
+      "lines": "Lines",
+      "vararg": "Vararg",
+      "upvalues": "Upvalues",
+      "constants": "Constants",
+      "instructions": "Instructions"
+    },
+    "constants": {
+      "title": "Constants",
+      "empty": "No constants",
+      "type": "Type",
+      "value": "Value"
+    },
+    "cfgViewer": {
+      "proto": "Proto",
+      "entry": "Entry",
+      "exit": "Exit",
+      "blocks": "Blocks",
+      "edges": "Edges",
+      "bytecode": "Bytecode",
+      "focusHint": "Focused on {block} ({hops}-hop neighborhood). Double-click another block to re-focus.",
+      "clearFocus": "Show All"
+    }
+  },
+  "settings": {
+    "title": "Settings",
+    "dialect": "Lua Dialect",
+    "tabs": {
+      "general": "General",
+      "parse": "Parse",
+      "readability": "Readability",
+      "naming": "Naming",
+      "generate": "Generate",
+      "about": "About"
+    },
+    "parse": {
+      "title": "Parse Options",
+      "mode": "Parse Mode",
+      "stringEncoding": "String Encoding",
+      "stringDecodeMode": "String Decode Mode"
+    },
+    "readability": {
+      "title": "Readability Options",
+      "returnInlineMaxComplexity": "Return Inline Max Complexity",
+      "indexInlineMaxComplexity": "Index Inline Max Complexity",
+      "argsInlineMaxComplexity": "Args Inline Max Complexity",
+      "accessBaseInlineMaxComplexity": "Access Base Inline Max Complexity"
+    },
+    "naming": {
+      "title": "Naming Options",
+      "mode": "Naming Mode",
+      "debugLikeIncludeFunction": "Include Function in Debug-like Names"
+    },
+    "generate": {
+      "title": "Generate Options",
+      "mode": "Generate Mode",
+      "indentWidth": "Indent Width",
+      "maxLineLength": "Max Line Length",
+      "quoteStyle": "Quote Style",
+      "tableStyle": "Table Style",
+      "conservativeOutput": "Conservative Output",
+      "comment": "Emit Comments"
+    },
+    "tips": {
+      "dialect": "Target Lua dialect, affects parser and generator behavior. CLI: --dialect / -D",
+      "generateMode": "Error handling strategy. strict: stop on error; best-effort: try alternative syntax; permissive: output as much as possible. CLI: --generate-mode / -g",
+      "parseMode": "Parser strictness. strict: strict validation; permissive: tolerate non-standard bytecode. CLI: --parse-mode / -p",
+      "stringEncoding": "Encoding for string constant decoding. CLI: --encoding / -e",
+      "stringDecodeMode": "Behavior on string decode failure. strict: error; lossy: replace with placeholders. CLI: --decode-mode / -m",
+      "returnInlineMaxComplexity": "Max inline expression complexity in return statements. CLI: --return-inline-max-complexity",
+      "indexInlineMaxComplexity": "Max inline expression complexity in table index expressions. CLI: --index-inline-max-complexity",
+      "argsInlineMaxComplexity": "Max inline expression complexity in call arguments. CLI: --args-inline-max-complexity",
+      "accessBaseInlineMaxComplexity": "Max inline expression complexity in table access bases. CLI: --access-base-inline-max-complexity",
+      "namingMode": "Variable naming strategy. debug-like: use debug info; simple: sequential numbers; heuristic: inferred names. CLI: --naming-mode / -n",
+      "debugLikeIncludeFunction": "In debug-like naming mode, whether to include function-shaped names. CLI: --debug-like-include-function",
+      "indentWidth": "Indentation width (number of spaces). CLI: --indent-width",
+      "maxLineLength": "Preferred maximum line length for generated code. CLI: --max-line-length",
+      "quoteStyle": "String quote style. prefer-double: prefer \"; prefer-single: prefer '; min-escape: minimize escapes. CLI: --quote-style",
+      "tableStyle": "Table constructor layout. compact: single line; balanced: auto; expanded: one entry per line. CLI: --table-style",
+      "conservativeOutput": "Enable conservative output mode for safer but potentially more verbose code. CLI: --conservative-output",
+      "comment": "Whether to emit comments and metadata in generated code. CLI: --comment"
+    },
+    "share": {
+      "button": "Copy Share URL",
+      "copied": "Link copied to clipboard",
+      "reset": "Reset to Defaults"
+    },
+    "about": {
+      "title": "About",
+      "repo": "GitHub Repository",
+      "version": "Version"
+    }
+  },
+  "diff": {
+    "left": "Left",
+    "right": "Right",
+    "selectFile": "Select file",
+    "hint": "Select two decompiled files to compare"
+  }
+}

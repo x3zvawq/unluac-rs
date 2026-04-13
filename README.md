@@ -9,6 +9,7 @@ A multi-dialect Lua decompiler written in Rust.
 
 Published entry points:
 
+- Web interface at [unluac.x3zvawq.com](https://unluac.x3zvawq.com)
 - Rust crate [`unluac`](https://crates.io/crates/unluac)
 - Standalone CLI binaries on [GitHub Releases](https://github.com/x3zvawq/unluac-rs/releases)
 - npm package [`unluac-js`](https://www.npmjs.com/package/unluac-js)
@@ -40,10 +41,21 @@ The repository is organized roughly like this:
 
 The project is currently distributed through these entry points:
 
-1. **CLI**: use the standalone binary from GitHub Releases, or run/build `unluac-cli` from this repository.
-2. **Rust library**: add the published crate `unluac` to a Rust project and call the decompilation pipeline directly.
-3. **npm package**: install `unluac-js` for Node.js or bundler-based browser environments.
-4. **WebAssembly**: use `packages/unluac-wasm` directly when you want to build your own runtime wrapper on top of the wasm layer.
+1. **Web interface**: visit [unluac.x3zvawq.com](https://unluac.x3zvawq.com) — upload and decompile directly in the browser with no installation required.
+2. **CLI**: use the standalone binary from GitHub Releases, or run/build `unluac-cli` from this repository.
+3. **Rust library**: add the published crate `unluac` to a Rust project and call the decompilation pipeline directly.
+4. **npm package**: install `unluac-js` for Node.js or bundler-based browser environments.
+5. **WebAssembly**: use `packages/unluac-wasm` directly when you want to build your own runtime wrapper on top of the wasm layer.
+
+### Web Interface
+
+Visit [unluac.x3zvawq.com](https://unluac.x3zvawq.com) to upload `.luac` / `.out` files and decompile them directly in the browser — no tooling required.
+
+The site is hosted on Vercel and may be inaccessible in some network environments (e.g. mainland China). If you run into connectivity issues, consider the alternatives below:
+
+- Use the standalone CLI binary — works fully offline
+- Use the npm package to run decompilation locally in a bundled browser environment
+- Self-host the web interface using `packages/unluac-wasm`
 
 ### CLI
 

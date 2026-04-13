@@ -1,0 +1,181 @@
+{
+  "app": {
+    "title": "unluac-web",
+    "subtitle": "Lua Декомпилятор"
+  },
+  "header": {
+    "settings": "Настройки",
+    "theme": {
+      "light": "Светлая тема",
+      "dark": "Тёмная тема",
+      "system": "Системная тема"
+    },
+    "language": "Язык"
+  },
+  "filePanel": {
+    "title": "Файлы",
+    "dropHint": "Перетащите файлы байткода сюда",
+    "openFile": "Открыть файл",
+    "openFolder": "Открыть папку",
+    "empty": "Нет файлов",
+    "status": {
+      "pending": "Ожидание",
+      "processing": "Обработка",
+      "success": "Успешно",
+      "error": "Ошибка",
+      "skipped": "Пропущено (исходный файл)"
+    },
+    "noFiles": "Нет совпадающих файлов",
+    "globDialog": {
+      "title": "Введите шаблон соответствия файлов (glob)",
+      "cancel": "Отмена"
+    },
+    "batchWarning": "Выбрано {count} файлов. Пакетная декомпиляция может занять некоторое время. Продолжить?",
+    "progress": "Выполнено {done}/{total}",
+    "batchStats": "{success} успешно, {error} ошибок",
+    "dismissStats": "Закрыть",
+    "contextMenu": {
+      "recompile": "Перекомпилировать",
+      "compare": "Сравнить с…",
+      "download": "Скачать результат",
+      "remove": "Удалить"
+    },
+    "folderContextMenu": {
+      "removeFolder": "Удалить папку"
+    }
+  },
+  "codeView": {
+    "placeholder": "Выберите файл для декомпиляции",
+    "copy": "Копировать",
+    "copied": "Скопировано",
+    "download": "Скачать",
+    "downloadAll": "Скачать все",
+    "fontSize": "Размер шрифта",
+    "error": "Ошибка декомпиляции",
+    "modified": "Изменено",
+    "modifiedHint": "Содержимое было отредактировано вручную и отличается от исходного результата декомпиляции",
+    "restore": "Восстановить оригинал",
+    "restoreConfirm": "Отменить изменения и восстановить исходный результат декомпиляции?"
+  },
+  "tabs": {
+    "code": "Исходный код",
+    "protos": "Proto",
+    "cfg": "CFG",
+    "diff": "Сравнение",
+    "contextMenu": {
+      "close": "Закрыть",
+      "closeOthers": "Закрыть другие",
+      "closeRight": "Закрыть справа",
+      "closeAll": "Закрыть все"
+    }
+  },
+  "analysis": {
+    "loading": "Анализ…",
+    "noFile": "Выберите файл для просмотра анализа",
+    "noData": "Нет данных структурного анализа",
+    "noDataHint": "Требуется WASM-модуль с экспортом decompileRich",
+    "sourceFile": "Это исходный файл, декомпиляция не требуется",
+    "error": "Ошибка анализа",
+    "selectProto": "Выберите Proto",
+    "protoGraph": {
+      "root": "Корневой Proto",
+      "params": "Параметры",
+      "lines": "Строки",
+      "vararg": "Переменные аргументы",
+      "upvalues": "Замыкания",
+      "constants": "Константы",
+      "instructions": "Инструкции"
+    },
+    "constants": {
+      "title": "Константы",
+      "empty": "Нет констант",
+      "type": "Тип",
+      "value": "Значение"
+    },
+    "cfgViewer": {
+      "proto": "Proto",
+      "entry": "Вход",
+      "exit": "Выход",
+      "blocks": "Блоки",
+      "edges": "Рёбра",
+      "bytecode": "Байткод",
+      "focusHint": "Фокус на {block} (соседство {hops} переходов). Дважды щёлкните другой блок для переключения.",
+      "clearFocus": "Показать все"
+    }
+  },
+  "settings": {
+    "title": "Настройки",
+    "dialect": "Диалект Lua",
+    "tabs": {
+      "general": "Общие",
+      "parse": "Парсер",
+      "readability": "Читаемость",
+      "naming": "Именование",
+      "generate": "Генерация",
+      "about": "О программе"
+    },
+    "parse": {
+      "title": "Параметры парсинга",
+      "mode": "Режим парсинга",
+      "stringEncoding": "Кодировка строк",
+      "stringDecodeMode": "Режим декодирования строк"
+    },
+    "readability": {
+      "title": "Параметры читаемости",
+      "returnInlineMaxComplexity": "Макс. сложность инлайна return",
+      "indexInlineMaxComplexity": "Макс. сложность инлайна индексов",
+      "argsInlineMaxComplexity": "Макс. сложность инлайна аргументов",
+      "accessBaseInlineMaxComplexity": "Макс. сложность инлайна базы доступа"
+    },
+    "naming": {
+      "title": "Параметры именования",
+      "mode": "Режим именования",
+      "debugLikeIncludeFunction": "Включать имя функции в debug-like"
+    },
+    "generate": {
+      "title": "Параметры генерации",
+      "mode": "Режим генерации",
+      "indentWidth": "Ширина отступа",
+      "maxLineLength": "Макс. длина строки",
+      "quoteStyle": "Стиль кавычек",
+      "tableStyle": "Стиль таблиц",
+      "conservativeOutput": "Консервативный вывод",
+      "comment": "Выводить комментарии"
+    },
+    "tips": {
+      "dialect": "Целевой диалект Lua, влияет на поведение парсера и генератора. CLI: --dialect / -D",
+      "generateMode": "Стратегия обработки ошибок. strict: остановка при ошибке; best-effort: попытка альтернативного синтаксиса; permissive: вывод максимально возможного. CLI: --generate-mode / -g",
+      "parseMode": "Строгость парсера. strict: строгая валидация; permissive: допускать нестандартный байткод. CLI: --parse-mode / -p",
+      "stringEncoding": "Кодировка для декодирования строковых констант. CLI: --encoding / -e",
+      "stringDecodeMode": "Поведение при ошибке декодирования строки. strict: ошибка; lossy: замена заполнителями. CLI: --decode-mode / -m",
+      "returnInlineMaxComplexity": "Макс. сложность инлайн-выражений в операторах return. CLI: --return-inline-max-complexity",
+      "indexInlineMaxComplexity": "Макс. сложность инлайн-выражений в индексных выражениях таблиц. CLI: --index-inline-max-complexity",
+      "argsInlineMaxComplexity": "Макс. сложность инлайн-выражений в аргументах вызовов. CLI: --args-inline-max-complexity",
+      "accessBaseInlineMaxComplexity": "Макс. сложность инлайн-выражений в базах доступа к таблицам. CLI: --access-base-inline-max-complexity",
+      "namingMode": "Стратегия именования переменных. debug-like: использовать отладочную информацию; simple: порядковые номера; heuristic: выведенные имена. CLI: --naming-mode / -n",
+      "debugLikeIncludeFunction": "В режиме именования debug-like, включать ли имена в форме функций. CLI: --debug-like-include-function",
+      "indentWidth": "Ширина отступа (количество пробелов). CLI: --indent-width",
+      "maxLineLength": "Предпочтительная максимальная длина строки для сгенерированного кода. CLI: --max-line-length",
+      "quoteStyle": "Стиль кавычек для строк. prefer-double: предпочитать \"; prefer-single: предпочитать '; min-escape: минимизировать экранирование. CLI: --quote-style",
+      "tableStyle": "Макет конструктора таблиц. compact: одна строка; balanced: автоматически; expanded: одна запись на строку. CLI: --table-style",
+      "conservativeOutput": "Включить консервативный режим вывода для более безопасного, но возможно более многословного кода. CLI: --conservative-output",
+      "comment": "Выводить ли комментарии и метаданные в сгенерированном коде. CLI: --comment"
+    },
+    "share": {
+      "button": "Копировать ссылку",
+      "copied": "Ссылка скопирована в буфер обмена",
+      "reset": "Сбросить настройки"
+    },
+    "about": {
+      "title": "О программе",
+      "repo": "Репозиторий GitHub",
+      "version": "Версия"
+    }
+  },
+  "diff": {
+    "left": "Левая",
+    "right": "Правая",
+    "selectFile": "Выбрать файл",
+    "hint": "Выберите два декомпилированных файла для сравнения"
+  }
+}

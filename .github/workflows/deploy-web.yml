@@ -1,0 +1,87 @@
+name: Deploy Web
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'packages/unluac-wasm/**'
+      - 'packages/unluac-web/**'
+      - 'Cargo.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '24'
+  WASM_PACK_VERSION: '0.14.0'
+  WASM_BINDGEN_CLI_VERSION: '0.2.115'
+
+jobs:
+  deploy:
+    name: Deploy to Vercel
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Restore wasm tool cache
+        id: wasm-tool-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/wasm-pack
+            ~/.cargo/bin/wasm-bindgen
+            ~/.cargo/bin/wasm-bindgen-test-runner
+            ~/.cargo/bin/wasm2es6js
+            ~/.cargo/.crates2.json
+            ~/.cargo/.crates.toml
+          key: ${{ runner.os }}-wasm-tools-wasm-pack-${{ env.WASM_PACK_VERSION }}-wasm-bindgen-${{ env.WASM_BINDGEN_CLI_VERSION }}
+
+      - name: Restore cargo build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('Cargo.lock', 'src/**', 'packages/unluac-wasm/**') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-wasm-
+
+      - name: Install wasm-pack
+        if: steps.wasm-tool-cache.outputs.cache-hit != 'true'
+        run: cargo install wasm-pack --version ${{ env.WASM_PACK_VERSION }} --locked
+
+      - name: Install wasm-bindgen CLI
+        if: steps.wasm-tool-cache.outputs.cache-hit != 'true'
+        run: cargo install wasm-bindgen-cli --version ${{ env.WASM_BINDGEN_CLI_VERSION }} --locked
+
+      - name: Install dependencies
+        working-directory: packages/unluac-web
+        run: npm install
+
+      - name: Build
+        working-directory: packages/unluac-web
+        run: npm run build
+
+      - name: Deploy to Vercel
+        uses: amondnet/vercel-action@v42.2.0
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          target: production
+          working-directory: ${{ github.workspace }}/packages/unluac-web

@@ -22,6 +22,7 @@ Requirements:
 
 - `init(input?)`: initialize the wasm module explicitly
 - `decompile(bytes, options?)`: decompile a compiled Lua chunk and return the final source string
+- `decompileRich(bytes, options?)`: decompile and return structured analysis result (source + proto metadata + CFGs)
 - `supportedOptionValues()`: inspect supported enum-like option values
 
 This package ships a slim wasm build for npm. In particular:
@@ -103,6 +104,28 @@ console.log(source);
 - the input must already be a compiled chunk; this package does not compile Lua source for you
 - the return value is always the final generated source string
 
+### `decompileRich(bytes, options?)`
+
+Returns a structured analysis result instead of a plain source string:
+
+```ts
+import { decompileRich } from "unluac-js";
+
+const result = await decompileRich(chunkBytes, { dialect: "lua5.1" });
+
+console.log(result.source);    // final Lua source
+console.log(result.warnings);  // generation warnings
+console.log(result.protos);    // proto metadata (DFS order)
+console.log(result.cfgs);      // per-proto CFG with blocks and edges
+```
+
+The result includes:
+
+- `source`: generated Lua source string
+- `warnings`: array of generation-stage warnings
+- `protos`: array of `UnluacProtoMeta` with function metadata (name, line range, params, upvalues, constants, instructions, children)
+- `cfgs`: array of `UnluacProtoCfg` with control flow graph data (blocks with Low-IR and raw bytecode instructions, edges with type labels)
+
 Supported top-level options:
 
 - `dialect`
@@ -134,7 +157,7 @@ Common `decompile()` options:
 
 - `dialect`: target chunk dialect such as `lua5.1`, `lua5.4`, `luajit`, or `luau`
 - `parse.mode`: parser mode, `strict` or `permissive`
-- `parse.stringEncoding`: string decoding encoding, `utf-8` or `gbk`
+- `parse.stringEncoding`: string decoding encoding; accepts any [Encoding Standard](https://encoding.spec.whatwg.org/) label (e.g. `utf-8`, `gbk`, `shift_jis`, `euc-kr`, `big5`)
 - `parse.stringDecodeMode`: string decode failure strategy, `strict` or `lossy`
 - `naming.mode`: naming strategy, `debug-like`, `simple`, or `heuristic`
 - `naming.debugLikeIncludeFunction`: whether debug-like naming should include function-shaped names
