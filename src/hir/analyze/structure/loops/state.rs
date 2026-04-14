@@ -31,25 +31,37 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 continue;
             }
 
-            // 内层循环（如嵌套的 numeric-for）的控制寄存器在外层循环的 preheader
-            // 处尚未定义，dataflow 仍然会为其生成 header phi（backedge 写入了值），
-            // 但 outside_arm 的 defs 为空。此时该 phi 不代表真正的"循环携带状态"，
-            // 跳过即可，不应因此让整个外层 loop 的 state plan 失败。
-            let Some(init) = self.loop_entry_expr(preheader?, value, target_overrides) else {
-                if value.outside_arm.defs().count() == 0 {
-                    continue;
+            // outside_arm.defs 为空 → preheader 处该寄存器不存在显式定义。
+            // 两种可能：
+            //  1) 内层循环控制寄存器的幻影 phi：外层循环不关心这个寄存器，
+            //     exit phi 也不引用它 → 安全跳过。
+            //  2) nil 初始化的循环携带变量（如 `local last_positive`）：
+            //     循环结束后仍需使用（exit phi 引用了该寄存器）→ 用 nil 作为初值。
+            let init = match self.loop_entry_expr(preheader?, value, target_overrides) {
+                Some(init) => init,
+                None => {
+                    if value.outside_arm.defs().count() == 0 {
+                        if Self::exit_value_for_reg(candidate, exit, value.reg).is_some() {
+                            HirExpr::Nil
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        return None;
+                    }
                 }
-                return None;
             };
             let temp = *self.lowering.bindings.phi_temps.get(value.phi_id.index())?;
             let target = self.loop_state_target(candidate, exit, value.reg, temp, target_overrides);
             plan.backedge_target_overrides.insert(temp, target.clone());
-            // phi_use_count == 0 表示整个 proto 没有任何指令真正读取这条 phi 的 SSA 值——
-            // 寄存器只是被循环体借用来做临时运算。此时跳过 inside_arm 重定向，让体内的
-            // 定义保留为独立 temp，后续 inline pass 就能把 `t = GetBuff; t2 = 10864;
-            // t(t2,1)` 折叠成 `GetBuff(10864,1)`。phi temp 本身仍保留在 plan 里，
-            // 以确保 init 赋值和 suppress 机制不受影响。
-            if self.lowering.dataflow.phi_use_count(value.phi_id) > 0 {
+            // phi_use_count == 0 表示循环体内没有指令直接读取 phi 的 SSA 值——如果该
+            // 寄存器同样不出现在 exit phi 中，说明它只是被借用来做临时运算（如内层
+            // for-loop 控制变量），可以跳过 inside_arm 重定向，让体内定义保留为独立
+            // temp 供 inline pass 折叠。但如果 exit phi 引用了该寄存器，则循环体
+            // 内的写入仍需路由到 state target，否则出口处拿不到正确的值。
+            if self.lowering.dataflow.phi_use_count(value.phi_id) > 0
+                || Self::exit_value_for_reg(candidate, exit, value.reg).is_some()
+            {
                 for def in value.inside_arm.defs() {
                     let def_temp = *self.lowering.bindings.fixed_temps.get(def.index())?;
                     plan.backedge_target_overrides

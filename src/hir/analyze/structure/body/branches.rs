@@ -146,6 +146,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         }
 
+        // try_lower_statement_value_merge_branch 处的同类守卫：条件重赋值同样把
+        // phi temp 直接内联进语句，跳过了 apply_loop_rewrites，当 entry_defs
+        // 被 loop state 接管时，写入会被遗漏。
+        if value_merge_entry_defs_are_overridden(self.lowering, short, target_overrides) {
+            return None;
+        }
+
         stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
         self.visited.insert(block);
         self.visited.extend(value_merge_skipped_blocks(short));
@@ -194,6 +201,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             && stop != merge
             && short.blocks.contains(&stop)
         {
+            return None;
+        }
+
+        // 短路值合流的 lower_value_merge_leaf 不会传递 target_overrides 给
+        // lower_block_prefix，导致循环 state plan 的写入重定向被跳过。如果
+        // 值合流消费的 entry_defs 中有任何一个被 target_overrides 接管，说明
+        // 这些 def 的写入需要被路由到循环 state 变量——此时应退让给普通分支
+        // 降级，让 apply_loop_rewrites 在正确的 override 上下文中生效。
+        if value_merge_entry_defs_are_overridden(self.lowering, short, target_overrides) {
             return None;
         }
 
@@ -839,4 +855,25 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         self.replace_phi_with_entry_expr(merge, phi_id, reg, expr);
     }
+}
+
+/// 如果值合流候选的 entry_defs 中有任一 def 的 temp 已被 target_overrides 接管，
+/// 说明该 def 的写入经由循环 state plan 被重定向到了 state 变量。此时如果仍走
+/// SC value-merge 的快捷路径，lower_value_merge_leaf 会用空 override map 调用
+/// lower_block_prefix，导致 state 写入重定向被跳过。
+fn value_merge_entry_defs_are_overridden(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+    target_overrides: &BTreeMap<TempId, HirLValue>,
+) -> bool {
+    if target_overrides.is_empty() {
+        return false;
+    }
+    short.entry_defs.iter().any(|def| {
+        lowering
+            .bindings
+            .fixed_temps
+            .get(def.index())
+            .is_some_and(|temp| target_overrides.contains_key(temp))
+    })
 }
