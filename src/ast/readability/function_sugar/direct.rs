@@ -7,18 +7,21 @@
 use std::collections::BTreeSet;
 
 use crate::ast::common::{
-    AstAssign, AstExpr, AstFunctionDecl, AstFunctionExpr, AstFunctionName, AstGlobalBindingTarget,
-    AstGlobalDecl, AstLValue, AstLocalAttr, AstLocalDecl, AstLocalFunctionDecl, AstNamePath,
-    AstNameRef, AstStmt, AstTargetDialect,
+    AstAssign, AstBindingRef, AstExpr, AstFunctionDecl, AstFunctionExpr, AstFunctionName,
+    AstGlobalBindingTarget, AstGlobalDecl, AstLValue, AstLocalAttr, AstLocalDecl,
+    AstLocalFunctionDecl, AstNamePath, AstNameRef, AstStmt, AstTargetDialect,
 };
 
 pub(super) fn lower_direct_function_stmt(
     stmt: AstStmt,
     target: AstTargetDialect,
     method_fields: &BTreeSet<String>,
+    blocked_bindings: &BTreeSet<AstBindingRef>,
 ) -> AstStmt {
     match &stmt {
-        AstStmt::LocalDecl(local_decl) => try_lower_local_function_decl((**local_decl).clone()),
+        AstStmt::LocalDecl(local_decl) => {
+            try_lower_local_function_decl((**local_decl).clone(), blocked_bindings)
+        }
         AstStmt::GlobalDecl(global_decl) => {
             try_lower_global_function_decl((**global_decl).clone(), target).unwrap_or(stmt)
         }
@@ -29,7 +32,10 @@ pub(super) fn lower_direct_function_stmt(
     }
 }
 
-fn try_lower_local_function_decl(local_decl: AstLocalDecl) -> AstStmt {
+fn try_lower_local_function_decl(
+    local_decl: AstLocalDecl,
+    blocked_bindings: &BTreeSet<AstBindingRef>,
+) -> AstStmt {
     if local_decl.bindings.len() != 1 || local_decl.values.len() != 1 {
         return AstStmt::LocalDecl(Box::new(local_decl));
     }
@@ -51,6 +57,12 @@ fn try_lower_local_function_decl(local_decl: AstLocalDecl) -> AstStmt {
     let AstExpr::FunctionExpr(func) = &local_decl.values[0] else {
         return AstStmt::LocalDecl(Box::new(local_decl));
     };
+    // 互递归/前向声明模式：如果当前 binding 在 blocked_bindings 中（由
+    // collect_forward_capture_blocked 计算），说明它参与了一个互递归前向声明组，
+    // 不能使用 `local function` 语法。必须保持 `local X = function() end` 形式。
+    if blocked_bindings.contains(&name) {
+        return AstStmt::LocalDecl(Box::new(local_decl));
+    }
     AstStmt::LocalFunctionDecl(Box::new(AstLocalFunctionDecl {
         name,
         func: func.as_ref().clone(),

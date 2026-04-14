@@ -57,6 +57,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             });
         }
 
+        // exit phi 的 incoming 里可能混入 break exit pad 块（形如"先做 cleanup，
+        // 再 jump 到 post-loop"的线性垫片）。它们在 CFG 上不属于 candidate.blocks，
+        // 但语义上传递的仍是循环体内部的值。这里和 install_loop_exit_bindings 保持一致，
+        // 把这些 pad 块也视为"循环内"来计算 outside-arm 的唯一初值。
+        let inside_exit_blocks = self
+            .loop_state_inside_exit_blocks(candidate, exit)
+            .unwrap_or_else(|| candidate.blocks.clone());
+
         for value in Self::exit_values(candidate, exit) {
             if excluded.contains(&value.reg)
                 || plan.states.iter().any(|state| state.reg == value.reg)
@@ -68,7 +76,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
             let Some(init) = self.loop_exit_entry_expr_with_inside_blocks(
                 value,
-                &candidate.blocks,
+                &inside_exit_blocks,
                 target_overrides,
             ) else {
                 // exit-only merge 只是“循环结束后也许还能继续复用这条 state”的附加收益，
@@ -293,7 +301,52 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return target;
         }
 
+        // 嵌套循环场景：内层 loop 和外层 loop 可能在同一个寄存器上建立各自的 header phi。
+        // 外层 loop 的 phi_use_count 可能为 0（因为没有指令直接读取外层 phi，而是通过内层
+        // phi 间接消费）。此时外层 plan 不会把 inside_arm defs 加入 target_overrides，
+        // 导致前面几个检查都无法匹配到外层的 state target。
+        // 这里通过 preheader 上的 reaching values 查找是否存在一个已由外层收纳的 phi，
+        // 如果存在就直接沿用外层的 state target，使得内层循环的写入自动传播到外层变量。
+        if let Some(preheader) = unique_loop_preheader(candidate)
+            && let Some(target) =
+                self.reaching_phi_lvalue_override(preheader, reg, target_overrides)
+        {
+            return target;
+        }
+
         HirLValue::Temp(temp)
+    }
+
+    /// 查找 `block` 首条指令的 reaching values 里，`reg` 是否只有一个 phi，
+    /// 并且该 phi 的 temp 已在 `target_overrides` 中——返回对应的 `HirLValue`。
+    ///
+    /// 与 `reaching_phi_override_expr` 平行，这里返回 lvalue 而非 expr，供
+    /// `loop_state_target` 直接用作内层 loop 的 state 写入目标。
+    fn reaching_phi_lvalue_override(
+        &self,
+        block: BlockRef,
+        reg: Reg,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<HirLValue> {
+        use crate::cfg::SsaValue;
+
+        let first_instr = self.lowering.cfg.blocks[block.index()].instrs.start;
+        let reaching = self.lowering.dataflow.reaching_values_at(first_instr);
+        let values = reaching.get(reg)?;
+
+        let mut phi_ids = values.iter().filter_map(|v| match v {
+            SsaValue::Phi(phi_id) => Some(phi_id),
+            SsaValue::Def(_) => None,
+        });
+        let phi_id = phi_ids.next()?;
+        if phi_ids.next().is_some() {
+            return None;
+        }
+
+        let temp = *self.lowering.bindings.phi_temps.get(phi_id.index())?;
+        let lvalue = target_overrides.get(&temp)?;
+        lvalue_as_expr(lvalue)?;
+        Some(lvalue.clone())
     }
 
     fn exit_value_is_owned_by_inherited_state(

@@ -157,6 +157,10 @@ fn inlineable_local_table_function_stmt(
             if path.fields.len() != 1 || !name_matches_binding(&path.root, binding) {
                 return None;
             }
+            // 同 assign 分支：闭包捕获了 constructor binding 时不能折入
+            if function_decl.func.captured_bindings.contains(&binding) {
+                return None;
+            }
             Some((path.fields[0].clone(), function_decl.func.clone()))
         }
         _ => None,
@@ -183,6 +187,11 @@ fn inlineable_local_table_function_assign(
     let AstExpr::FunctionExpr(function) = &assign.values[0] else {
         return None;
     };
+    // 如果闭包体捕获了 constructor binding 自身（如 `obj.inc = function() obj.count = ... end`），		
+    // 折入 constructor 后 binding 可能因 return-handoff 被消除，导致闭包中引用悬空。
+    if function.captured_bindings.contains(&binding) {
+        return None;
+    }
     Some((field.clone(), function.as_ref().clone()))
 }
 

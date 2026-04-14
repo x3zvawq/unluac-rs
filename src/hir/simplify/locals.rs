@@ -235,6 +235,15 @@ fn promote_block(
 
     block.stmts = rewritten;
 
+    // 互递归前向引用修补：closure capture 可能引用在当前语句之后才被提升的 temp，
+    // 第一次遍历时该 temp 还不在 mapping 里。用最终映射对 closure capture 做一次
+    // 定向重写，避免留下悬空的 TempRef。
+    if mapping.len() > inherited.len() {
+        for stmt in &mut block.stmts {
+            rewrite_forward_capture_refs(stmt, &mapping);
+        }
+    }
+
     // 后处理：把 `local X; if cond then X=a else X=b end` 收回值表达式
     changed |= fold_branch_value_locals_in_block(&mut block.stmts);
     // 后处理：把相邻的 `local X; X = expr` 合并成 `local X = expr`
@@ -933,6 +942,36 @@ fn rewrite_lvalue(lvalue: &mut HirLValue, mapping: &BTreeMap<TempId, LocalId>) -
             base_changed || key_changed
         }
         HirLValue::Local(_) | HirLValue::Upvalue(_) | HirLValue::Global(_) => false,
+    }
+}
+
+/// 对语句中 closure capture 里残留的 TempRef 做定向重写。
+///
+/// 互递归/前向声明模式下（`local a, b; a = function() b()… end; b = function() a()… end`），
+/// 第一次遍历 promote_block 时 b 的 temp 尚未加入 mapping，导致 a 的 capture 仍是
+/// TempRef。这里用最终 mapping 补一次定向重写，只处理 closure capture 这一种残留，
+/// 避免做全量二次遍历。
+fn rewrite_forward_capture_refs(stmt: &mut HirStmt, mapping: &BTreeMap<TempId, LocalId>) {
+    match stmt {
+        HirStmt::Assign(assign) => {
+            for expr in &mut assign.values {
+                rewrite_closure_capture_temps(expr, mapping);
+            }
+        }
+        HirStmt::LocalDecl(local_decl) => {
+            for expr in &mut local_decl.values {
+                rewrite_closure_capture_temps(expr, mapping);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_closure_capture_temps(expr: &mut HirExpr, mapping: &BTreeMap<TempId, LocalId>) {
+    if let HirExpr::Closure(closure) = expr {
+        for capture in &mut closure.captures {
+            rewrite_expr(&mut capture.value, mapping);
+        }
     }
 }
 

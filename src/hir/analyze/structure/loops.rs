@@ -26,6 +26,11 @@ fn merge_target_overrides(
 fn loop_state_init_stmts(plan: &LoopStatePlan) -> Vec<HirStmt> {
     plan.states
         .iter()
+        .filter(|state| {
+            // 嵌套循环场景下，内层 loop reuse 外层 state target 时 init == target，
+            // 会产生无意义的 `x = x` 自赋值；跳过这些 no-op。
+            lvalue_as_expr(&state.target) != Some(state.init.clone())
+        })
         .map(|state| assign_stmt(vec![state.target.clone()], vec![state.init.clone()]))
         .collect()
 }
