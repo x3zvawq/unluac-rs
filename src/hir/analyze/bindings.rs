@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::cfg::{Cfg, DataflowFacts, OpenDef};
+use crate::cfg::{BlockRef, Cfg, DataflowFacts, GraphFacts, OpenDef};
 use crate::hir::common::{LocalId, ParamId, TempId, UpvalueId};
 use crate::parser::RawLocalVar;
 use crate::structure::{LoopSourceBindings, StructureFacts};
@@ -23,6 +23,7 @@ use super::helpers::decode_raw_string;
 pub(super) fn build_bindings(
     proto: &LoweredProto,
     cfg: &Cfg,
+    graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
     structure: &StructureFacts,
 ) -> ProtoBindings {
@@ -74,7 +75,16 @@ pub(super) fn build_bindings(
                 local_debug_hints.push(None);
                 numeric_for_locals.insert(candidate.header, local);
 
-                for block in &candidate.blocks {
+                // 除 natural loop body 内的块外，还需要为从循环体提前退出（如
+                // return/break 分支）且被 header 支配的出口块注册绑定映射。
+                let binding_blocks = loop_binding_scope(
+                    &candidate.blocks,
+                    &candidate.exits,
+                    candidate.header,
+                    cfg,
+                    graph_facts,
+                );
+                for block in &binding_blocks {
                     block_local_regs
                         .entry(*block)
                         .or_insert_with(BTreeMap::new)
@@ -82,6 +92,13 @@ pub(super) fn build_bindings(
                 }
             }
             Some(LoopSourceBindings::Generic(bindings)) => {
+                let binding_blocks = loop_binding_scope(
+                    &candidate.blocks,
+                    &candidate.exits,
+                    candidate.header,
+                    cfg,
+                    graph_facts,
+                );
                 let mut locals_for_loop = Vec::with_capacity(bindings.len);
                 for offset in 0..bindings.len {
                     let local = LocalId(locals.len());
@@ -90,7 +107,7 @@ pub(super) fn build_bindings(
                     let reg = crate::transformer::Reg(bindings.start.index() + offset);
                     locals_for_loop.push(local);
 
-                    for block in &candidate.blocks {
+                    for block in &binding_blocks {
                         block_local_regs
                             .entry(*block)
                             .or_insert_with(BTreeMap::new)
@@ -220,4 +237,46 @@ fn debug_local_name_for_reg_at_pc(proto: &LoweredProto, reg: Reg, pc: u32) -> Op
 
 fn debug_local_is_active_at_pc(local: &RawLocalVar, pc: u32) -> bool {
     local.start_pc <= pc && pc < local.end_pc
+}
+
+/// 计算 for-loop binding 的可见作用域块集合。
+///
+/// natural loop 拓扑只包含能回到 header 的 body 块，不含通过 return/break
+/// 提前离开循环的块。但在 Lua 语义下，这些提前退出的块仍处于 for-binding
+/// 的词法作用域中（如 `for i = 1, n do if cond then return i end end`）。
+///
+/// 策略：在 candidate.blocks 基础上，追加被 header 严格支配的 **提前退出** 块。
+/// 只有不是通过 LoopExit 边到达的出口块才被视为提前退出——LoopExit 边的
+/// 目标是循环正常结束后的后继块，for-binding 在那里已失效。
+///
+/// 示例：
+/// - `for i = 1, n do if cond then return i end end`
+///   return 所在块通过 BranchFalse 从 header 到达，被 header 支配 → 纳入作用域
+/// - `for k, v in pairs(t) do ... end; print(k)`
+///   print 所在块通过 LoopExit 从 body 到达 → 不纳入，for-binding 不可见
+fn loop_binding_scope(
+    body_blocks: &std::collections::BTreeSet<BlockRef>,
+    exits: &std::collections::BTreeSet<BlockRef>,
+    header: BlockRef,
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+) -> std::collections::BTreeSet<BlockRef> {
+    use crate::cfg::EdgeKind;
+
+    let mut scope = body_blocks.clone();
+    for &exit in exits {
+        if exit == header || !graph_facts.dominator_tree.dominates(header, exit) {
+            continue;
+        }
+        // 检查该出口块是否通过 LoopExit 边从循环体到达——如果是，
+        // 说明它是循环正常完成后的后继块，for-binding 在那里不可见。
+        let reached_via_loop_exit = cfg.preds[exit.index()].iter().any(|edge_ref| {
+            let edge = &cfg.edges[edge_ref.index()];
+            body_blocks.contains(&edge.from) && edge.kind == EdgeKind::LoopExit
+        });
+        if !reached_via_loop_exit {
+            scope.insert(exit);
+        }
+    }
+    scope
 }

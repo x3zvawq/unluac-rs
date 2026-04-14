@@ -120,7 +120,7 @@ pub(super) fn lower_proto(
         )
         .collect::<Vec<_>>();
 
-    let bindings = build_bindings(proto, cfg, dataflow, structure);
+    let bindings = build_bindings(proto, cfg, graph_facts, dataflow, structure);
     let dead_phis = dataflow.compute_truly_dead_phis(cfg);
     let lowering = ProtoLowering {
         proto,
