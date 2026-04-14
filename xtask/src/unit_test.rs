@@ -14,6 +14,7 @@ use owo_colors::OwoColorize;
 const OUTPUT_ENV: &str = "UNLUAC_TEST_OUTPUT";
 const PROGRESS_ENV: &str = "UNLUAC_TEST_PROGRESS";
 const COLOR_ENV: &str = "UNLUAC_TEST_COLOR";
+const RECOMPILE_ROUNDS_ENV: &str = "UNLUAC_TEST_RECOMPILE_ROUNDS";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum FailureOutputMode {
@@ -91,6 +92,7 @@ pub(crate) struct Options {
     color: ColorMode,
     plain_progress_detail: PlainProgressDetail,
     jobs: usize,
+    recompile_rounds: u32,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -239,7 +241,7 @@ impl Reporter {
             options.case_filters.join(", ")
         };
         eprintln!(
-            "running {total} unit case(s) with output={} timeout={}s progress={} color={} jobs={} case-filter={}",
+            "running {total} unit case(s) with output={} timeout={}s progress={} color={} jobs={} recompile-rounds={} case-filter={}",
             options.output.label(),
             options.timeout_seconds,
             match options.progress {
@@ -253,6 +255,7 @@ impl Reporter {
                 ColorMode::Never => "never",
             },
             jobs,
+            options.recompile_rounds,
             filters,
         );
     }
@@ -486,6 +489,7 @@ where
         runner,
         cases,
         options.output.label().to_owned(),
+        options.recompile_rounds,
         timeout,
         jobs,
     )?;
@@ -604,6 +608,7 @@ pub(crate) fn print_help() {
     println!("                  [--progress <auto|on|off>] [--color <auto|always|never>]");
     println!("                  [--verbose]");
     println!("                  [--jobs <n>]");
+    println!("                  [--recompile-rounds <n>]");
 }
 
 fn parse_args<I>(args: I) -> Result<Options>
@@ -622,6 +627,7 @@ where
         color: parse_env_or_default(COLOR_ENV, "auto", ColorMode::parse)?,
         plain_progress_detail: PlainProgressDetail::Sparse,
         jobs: 1,
+        recompile_rounds: 1,
     };
 
     let mut cursor = 0;
@@ -685,6 +691,15 @@ where
                 if options.jobs == 0 {
                     bail!("jobs must be greater than zero");
                 }
+            }
+            "--recompile-rounds" => {
+                cursor += 1;
+                let value = args
+                    .get(cursor)
+                    .context("missing value for `--recompile-rounds`")?;
+                options.recompile_rounds = value
+                    .parse::<u32>()
+                    .with_context(|| format!("invalid recompile rounds: {value}"))?;
             }
             "--verbose" => {
                 options.plain_progress_detail = PlainProgressDetail::Verbose;
@@ -823,6 +838,7 @@ fn spawn_workers(
     runner: PathBuf,
     cases: Vec<UnitCaseDescriptor>,
     output_mode: String,
+    recompile_rounds: u32,
     timeout: Duration,
     jobs: usize,
 ) -> Result<SpawnedWorkers> {
@@ -860,6 +876,7 @@ fn spawn_workers(
                     &runner,
                     &scheduled.case,
                     &output_mode,
+                    recompile_rounds,
                     timeout,
                 ) {
                     Ok(execution) => event_tx
@@ -900,6 +917,7 @@ fn run_unit_case_with_timeout(
     runner: &Path,
     case: &UnitCaseDescriptor,
     output_mode: &str,
+    recompile_rounds: u32,
     timeout: Duration,
 ) -> Result<UnitCaseExecution> {
     let mut child = Command::new(runner)
@@ -914,6 +932,7 @@ fn run_unit_case_with_timeout(
             case.path.as_str(),
         ])
         .env(OUTPUT_ENV, output_mode)
+        .env(RECOMPILE_ROUNDS_ENV, recompile_rounds.to_string())
         .current_dir(root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1112,6 +1131,8 @@ mod tests {
             "--verbose",
             "--jobs",
             "4",
+            "--recompile-rounds",
+            "2",
         ])
         .expect("test-unit options should parse");
 
@@ -1127,6 +1148,7 @@ mod tests {
                 color: ColorMode::Always,
                 plain_progress_detail: PlainProgressDetail::Verbose,
                 jobs: 4,
+                recompile_rounds: 2,
             }
         );
     }

@@ -105,6 +105,7 @@ fn repo_relative_display(path: &Path) -> String {
 }
 
 const TEST_OUTPUT_ENV: &str = "UNLUAC_TEST_OUTPUT";
+const RECOMPILE_ROUNDS_ENV: &str = "UNLUAC_TEST_RECOMPILE_ROUNDS";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum TestOutputMode {
@@ -134,6 +135,19 @@ fn test_output_mode() -> TestOutputMode {
     })
 }
 
+static RECOMPILE_ROUNDS: OnceLock<u32> = OnceLock::new();
+
+fn recompile_rounds() -> u32 {
+    *RECOMPILE_ROUNDS.get_or_init(|| match std::env::var(RECOMPILE_ROUNDS_ENV) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<u32>()
+            .unwrap_or_else(|error| panic!("invalid {RECOMPILE_ROUNDS_ENV}={raw:?}: {error}")),
+        Err(std::env::VarError::NotPresent) => 0,
+        Err(error) => panic!("failed to read {RECOMPILE_ROUNDS_ENV}: {error}"),
+    })
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum FailureKind {
     RunSourceFailed,
@@ -153,6 +167,11 @@ pub enum FailureKind {
     RunGeneratedChunkFailed,
     GeneratedChunkExecutionFailed,
     GeneratedOutputMismatch,
+    RecompileDecompileFailed,
+    RecompileGeneratedSourceCompilationFailed,
+    RecompileGeneratedChunkExecutionFailed,
+    RecompileGeneratedOutputMismatch,
+    RecompileConvergenceMismatch,
 }
 
 impl FailureKind {
@@ -175,6 +194,15 @@ impl FailureKind {
             Self::RunGeneratedChunkFailed => "run-generated-chunk-failed",
             Self::GeneratedChunkExecutionFailed => "generated-chunk-execution-failed",
             Self::GeneratedOutputMismatch => "generated-output-mismatch",
+            Self::RecompileDecompileFailed => "recompile-decompile-failed",
+            Self::RecompileGeneratedSourceCompilationFailed => {
+                "recompile-generated-source-compilation-failed"
+            }
+            Self::RecompileGeneratedChunkExecutionFailed => {
+                "recompile-generated-chunk-execution-failed"
+            }
+            Self::RecompileGeneratedOutputMismatch => "recompile-generated-output-mismatch",
+            Self::RecompileConvergenceMismatch => "recompile-convergence-mismatch",
         }
     }
 }
@@ -465,6 +493,7 @@ pub(crate) fn run_decompile_pipeline_health(
     entry: &LuaCaseManifestEntry,
 ) -> Result<(), TestFailure> {
     let dialect_label = entry.dialect.as_str();
+    let suite_label = UnitSuite::DecompilePipelineHealth.label();
     let toolchain = lua_toolchain(dialect_label).map_err(|error| {
         TestFailure::new(
             FailureKind::RunGeneratedChunkFailed,
@@ -472,7 +501,7 @@ pub(crate) fn run_decompile_pipeline_health(
             format!("unknown test dialect {dialect_label}: {error}"),
         )
     })?;
-    let baseline = build_case_health_baseline(entry, UnitSuite::DecompilePipelineHealth.label())
+    let baseline = build_case_health_baseline(entry, suite_label)
         .map_err(|failure| {
             TestFailure::new(
                 FailureKind::CaseHealthBaselineFailed,
@@ -515,7 +544,7 @@ pub(crate) fn run_decompile_pipeline_health(
     })?;
     let generated_source_path = write_generated_case_source(
         dialect_label,
-        UnitSuite::DecompilePipelineHealth.label(),
+        suite_label,
         entry.path,
         &generated.source,
     )
@@ -530,7 +559,7 @@ pub(crate) fn run_decompile_pipeline_health(
     let (generated_chunk_path, compile_output) = compile_generated_source_to_suite_artifact(
         dialect_label,
         entry.path,
-        UnitSuite::DecompilePipelineHealth.label(),
+        suite_label,
         &generated_source_path,
         true,
     )
@@ -619,6 +648,207 @@ pub(crate) fn run_decompile_pipeline_health(
                 generated.source
             ),
         ));
+    }
+
+    // 重编译轮次：拿上一轮生成的源码，再走一遍 compile → decompile → compile → run → 对比 baseline，
+    // 同时做前后两轮生成源码的文本收敛检查。
+    let rounds = recompile_rounds();
+    let mut prev_generated_source = generated.source.clone();
+    for round in 1..=rounds {
+        let round_label = format!("recompile-round-{round}");
+
+        // 把上一轮生成的源码编译成 chunk
+        let prev_source_path = write_generated_case_source(
+            dialect_label,
+            &format!("{suite_label}/{round_label}"),
+            entry.path,
+            &prev_generated_source,
+        )
+        .map_err(|error| {
+            TestFailure::new(
+                FailureKind::WriteGeneratedSourceFailed,
+                format!("[{round_label}] write generated source failed"),
+                format!("[{round_label}] write generated source failed: {error}"),
+            )
+        })?;
+        let (prev_chunk_path, prev_compile_output) =
+            compile_generated_source_to_suite_artifact(
+                dialect_label,
+                entry.path,
+                &format!("{suite_label}/{round_label}"),
+                &prev_source_path,
+                true,
+            )
+            .map_err(|error| {
+                TestFailure::new(
+                    FailureKind::RecompileGeneratedSourceCompilationFailed,
+                    format!("[{round_label}] compile generated source failed"),
+                    format!("[{round_label}] compile generated source failed: {error}"),
+                )
+            })?;
+        if !prev_compile_output.success() {
+            let reason = primary_command_reason(&prev_compile_output)
+                .map(|reason| format!(": {reason}"))
+                .unwrap_or_default();
+            let summary = format!(
+                "[{round_label}] generated source compilation failed{reason} (status: {})",
+                prev_compile_output.status_code.unwrap_or_default(),
+            );
+            return Err(TestFailure::new(
+                FailureKind::RecompileGeneratedSourceCompilationFailed,
+                summary.clone(),
+                format!(
+                    "{summary}\nsource artifact: {}\nchunk artifact: {}\n{}\ngenerated source:\n{}",
+                    repo_relative_display(&prev_source_path),
+                    repo_relative_display(&prev_chunk_path),
+                    prev_compile_output.render(),
+                    prev_generated_source,
+                ),
+            ));
+        }
+
+        // 反编译 chunk
+        let prev_chunk_bytes = fs::read(&prev_chunk_path).map_err(|error| {
+            TestFailure::new(
+                FailureKind::RecompileDecompileFailed,
+                format!("[{round_label}] read recompiled chunk failed"),
+                format!(
+                    "[{round_label}] read recompiled chunk {}: {error}",
+                    repo_relative_display(&prev_chunk_path)
+                ),
+            )
+        })?;
+        let recompile_result = decompile(
+            &prev_chunk_bytes,
+            DecompileOptions {
+                dialect,
+                target_stage: DecompileStage::Generate,
+                debug: Default::default(),
+                ..DecompileOptions::default()
+            },
+        )
+        .map_err(|error| {
+            TestFailure::new(
+                FailureKind::RecompileDecompileFailed,
+                format!("[{round_label}] decompile failed: {error}"),
+                format!("[{round_label}] decompile failed: {error}"),
+            )
+        })?;
+        let recompile_generated = recompile_result.state.generated.as_ref().ok_or_else(|| {
+            TestFailure::new(
+                FailureKind::RecompileDecompileFailed,
+                format!("[{round_label}] generate stage finished without source"),
+                format!(
+                    "[{round_label}] generate stage finished without source for {}",
+                    entry.path
+                ),
+            )
+        })?;
+
+        // 写出、编译、执行再次生成的源码
+        let regen_source_path = write_generated_case_source(
+            dialect_label,
+            &format!("{suite_label}/{round_label}-regen"),
+            entry.path,
+            &recompile_generated.source,
+        )
+        .map_err(|error| {
+            TestFailure::new(
+                FailureKind::WriteGeneratedSourceFailed,
+                format!("[{round_label}] write regen source failed"),
+                format!("[{round_label}] write regen source failed: {error}"),
+            )
+        })?;
+        let (regen_chunk_path, regen_compile_output) =
+            compile_generated_source_to_suite_artifact(
+                dialect_label,
+                entry.path,
+                &format!("{suite_label}/{round_label}-regen"),
+                &regen_source_path,
+                true,
+            )
+            .map_err(|error| {
+                TestFailure::new(
+                    FailureKind::RecompileGeneratedSourceCompilationFailed,
+                    format!("[{round_label}] compile regen source failed"),
+                    format!("[{round_label}] compile regen source failed: {error}"),
+                )
+            })?;
+        if !regen_compile_output.success() {
+            let reason = primary_command_reason(&regen_compile_output)
+                .map(|reason| format!(": {reason}"))
+                .unwrap_or_default();
+            let summary = format!(
+                "[{round_label}] regen source compilation failed{reason} (status: {})",
+                regen_compile_output.status_code.unwrap_or_default(),
+            );
+            return Err(TestFailure::new(
+                FailureKind::RecompileGeneratedSourceCompilationFailed,
+                summary.clone(),
+                format!(
+                    "{summary}\nsource artifact: {}\nchunk artifact: {}\n{}\ngenerated source:\n{}",
+                    repo_relative_display(&regen_source_path),
+                    repo_relative_display(&regen_chunk_path),
+                    regen_compile_output.render(),
+                    recompile_generated.source,
+                ),
+            ));
+        }
+
+        let regen_runtime_path = if toolchain.can_run_compiled_chunks {
+            &regen_chunk_path
+        } else {
+            &regen_source_path
+        };
+        let regen_output = run_lua_file(dialect_label, regen_runtime_path).map_err(|error| {
+            TestFailure::new(
+                FailureKind::RecompileGeneratedChunkExecutionFailed,
+                format!("[{round_label}] run regen artifact failed"),
+                format!("[{round_label}] run regen artifact failed: {error}"),
+            )
+        })?;
+        if !regen_output.success() {
+            let reason = primary_command_reason(&regen_output)
+                .map(|reason| format!(": {reason}"))
+                .unwrap_or_default();
+            let summary = format!(
+                "[{round_label}] regen artifact execution failed{reason} (status: {})",
+                regen_output.status_code.unwrap_or_default(),
+            );
+            return Err(TestFailure::new(
+                FailureKind::RecompileGeneratedChunkExecutionFailed,
+                summary.clone(),
+                format!(
+                    "{summary}\nruntime artifact: {}\n{}\ngenerated source:\n{}",
+                    repo_relative_display(regen_runtime_path),
+                    regen_output.render(),
+                    recompile_generated.source,
+                ),
+            ));
+        }
+
+        // 语义检查：执行输出应与 baseline 一致
+        if let Some(diff) = diff_command_outputs(
+            "expected-source",
+            &baseline.source_output,
+            &format!("{round_label}-regen"),
+            &regen_output,
+        ) {
+            let summary = format!(
+                "[{round_label}] regen output mismatch (runtime artifact: {})",
+                repo_relative_display(regen_runtime_path),
+            );
+            return Err(TestFailure::new(
+                FailureKind::RecompileGeneratedOutputMismatch,
+                summary.clone(),
+                format!(
+                    "{summary}\n{diff}\ngenerated source:\n{}",
+                    recompile_generated.source,
+                ),
+            ));
+        }
+
+        prev_generated_source = recompile_generated.source.clone();
     }
 
     Ok(())
