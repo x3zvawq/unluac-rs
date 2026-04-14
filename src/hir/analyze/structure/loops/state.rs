@@ -31,7 +31,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 continue;
             }
 
-            let init = self.loop_entry_expr(preheader?, value, target_overrides)?;
+            // 内层循环（如嵌套的 numeric-for）的控制寄存器在外层循环的 preheader
+            // 处尚未定义，dataflow 仍然会为其生成 header phi（backedge 写入了值），
+            // 但 outside_arm 的 defs 为空。此时该 phi 不代表真正的"循环携带状态"，
+            // 跳过即可，不应因此让整个外层 loop 的 state plan 失败。
+            let Some(init) = self.loop_entry_expr(preheader?, value, target_overrides) else {
+                if value.outside_arm.defs().count() == 0 {
+                    continue;
+                }
+                return None;
+            };
             let temp = *self.lowering.bindings.phi_temps.get(value.phi_id.index())?;
             let target = self.loop_state_target(candidate, exit, value.reg, temp, target_overrides);
             plan.backedge_target_overrides.insert(temp, target.clone());
@@ -449,6 +458,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         &self,
         candidate: &LoopCandidate,
         post_loop: BlockRef,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+        states: &[LoopStateSlot],
     ) -> Option<ActiveLoopContext> {
         let downstream_post_loop = self.normalized_post_loop_successor(post_loop);
         let mut break_exits = BTreeMap::new();
@@ -469,7 +480,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             }
             break_exits.insert(
                 exit,
-                self.lower_break_exit_pad(exit, post_loop, downstream_post_loop)?,
+                self.lower_break_exit_pad(exit, post_loop, downstream_post_loop, target_overrides, states)?,
             );
         }
         let continue_target = candidate.continue_target;
@@ -530,7 +541,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             if downstream_post_loop == Some(exit) {
                 continue;
             }
-            self.lower_break_exit_pad(exit, post_loop, downstream_post_loop)?;
+            self.lower_break_exit_pad(exit, post_loop, downstream_post_loop, &BTreeMap::new(), &[])?;
             inside_blocks.insert(exit);
         }
         Some(inside_blocks)
@@ -571,11 +582,31 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         block: BlockRef,
         post_loop: BlockRef,
         downstream_post_loop: Option<BlockRef>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+        states: &[LoopStateSlot],
     ) -> Option<HirBlock> {
-        // 这里只接受“线性的 break 垫片 block”：它允许先做一些必须保留的 cleanup，
+        // 这里只接受"线性的 break 垫片 block"：它允许先做一些必须保留的 cleanup，
         // 但最终必须无条件跳到循环之后的统一 continuation。更复杂的 exit 形状留给后续轮次，
         // 避免这一步又退化成拼命堆 break 特判。
-        let mut stmts = self.lower_block_prefix(block, false, &BTreeMap::new())?;
+        //
+        // break pad 里的赋值（如 `found = true; idx = i`）写入的 def temp 与 loop 回边
+        // 上的 phi temp 不同，因此仅靠 combined_target_overrides 无法将它们重定向到
+        // 循环 state 变量。这里额外扫描 pad 的 def，把匹配 state 寄存器的 def temp
+        // 也加入 override map，使 apply_loop_rewrites 能正确替换。
+        let mut combined = target_overrides.clone();
+        if !states.is_empty() {
+            let range = self.lowering.cfg.blocks[block.index()].instrs;
+            for instr_index in range.start.index()..range.end() {
+                for def_id in &self.lowering.dataflow.instr_defs[instr_index] {
+                    let def = &self.lowering.dataflow.defs[def_id.index()];
+                    if let Some(state) = states.iter().find(|s| s.reg == def.reg) {
+                        let temp = self.lowering.bindings.fixed_temps[def_id.index()];
+                        combined.insert(temp, state.target.clone());
+                    }
+                }
+            }
+        }
+        let mut stmts = self.lower_block_prefix(block, false, &combined)?;
         let target = match self.block_terminator(block) {
             Some((_instr_ref, LowInstr::Jump(jump))) => {
                 self.lowering.cfg.instr_to_block[jump.target.index()]

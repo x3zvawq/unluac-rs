@@ -482,7 +482,23 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let source_temp = self.block_entry_source_temp(block, reg);
         let carries_through_block = !self.block_redefines_reg(block, reg);
         self.overrides
-            .insert_entry_expr(block, reg, expr, source_temp, carries_through_block);
+            .insert_entry_expr(block, reg, expr.clone(), source_temp, carries_through_block);
+        // 当 override 能穿透当前 block（该 register 未被重定义），需要继续向唯一线性
+        // 后继传播。否则 loop exit block 到 post-loop continuation 之间如果隔了一个
+        // 纯 JMP pad，后续 block 的 lower_block_prefix 看不到 entry_temp_expr override，
+        // 循环 state 变量在 post-loop 使用点就无法被正确替换。
+        if carries_through_block
+            && let Some(successor) = self.lowering.cfg.unique_reachable_successor(block)
+            // 只在后继 block 没有该 register 的 phi 时传播：有 phi 说明有多个来源
+            // 合流，不能用单条路径的 override 覆盖整个 merge 点。
+            && self
+                .lowering
+                .dataflow
+                .phi_candidate_for_reg(successor, reg)
+                .is_none()
+        {
+            self.install_entry_override(successor, reg, expr);
+        }
     }
 
     pub(super) fn replace_phi_with_entry_expr(
