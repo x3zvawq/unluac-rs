@@ -10,6 +10,11 @@
 //! - `if cond then return end else tail()` 会拉平成 `if cond then return end; tail()`
 //! - `if exit then goto L1 end; body; ::L1:: tail` 会收成 `if not exit then body end; tail`
 //! - `if cond then a(); goto L1 end; b(); ::L1::` 会收成 `if cond then a() else b() end`
+//!
+//! 当同一 label 被多个 goto 引用时（常见于 continue-like 模式），通过从距 label
+//! 最近的 guard-goto 开始逐层折叠，最终将多个 skip-goto 收回成嵌套 if 结构：
+//! - `if c1 then goto L end; if c2 then goto L end; body; ::L::` →
+//!   `if not c1 then if not c2 then body end end`
 
 use super::super::common::{
     AstBinaryExpr, AstBinaryOpKind, AstBlock, AstExpr, AstFunctionExpr, AstIf, AstLabelId,
@@ -156,6 +161,10 @@ fn fold_terminal_goto_else(block: &mut AstBlock) -> bool {
     let mut changed = false;
 
     while let Some(fold) = find_terminal_goto_else_fold(block) {
+        // 折叠前计算引用计数：如果还有其他 goto 指向同一 label，折叠后保留该 label。
+        let keep_label = matches!(&block.stmts[fold.label_index], AstStmt::Label(label)
+            if count_goto_target_in_block(block, label.id) > 1);
+
         let old_stmts = std::mem::take(&mut block.stmts);
         let mut rewritten =
             Vec::with_capacity(old_stmts.len() - (fold.label_index - fold.if_index));
@@ -181,7 +190,7 @@ fn fold_terminal_goto_else(block: &mut AstBlock) -> bool {
                 else_body.push(stmt);
                 continue;
             }
-            if index == fold.label_index {
+            if index == fold.label_index && !keep_label {
                 continue;
             }
             rewritten.push(stmt);
@@ -202,6 +211,10 @@ fn fold_guard_goto_labels(block: &mut AstBlock) -> bool {
     let mut changed = false;
 
     while let Some(fold) = find_guard_goto_label_fold(block) {
+        // 折叠前计算引用计数：如果还有其他 goto 指向同一 label，折叠后保留该 label。
+        let keep_label = matches!(&block.stmts[fold.label_index], AstStmt::Label(label)
+            if count_goto_target_in_block(block, label.id) > 1);
+
         let old_stmts = std::mem::take(&mut block.stmts);
         let mut rewritten =
             Vec::with_capacity(old_stmts.len() - (fold.label_index - fold.if_index));
@@ -227,7 +240,7 @@ fn fold_guard_goto_labels(block: &mut AstBlock) -> bool {
                 guarded_body.push(stmt);
                 continue;
             }
-            if index == fold.label_index {
+            if index == fold.label_index && !keep_label {
                 continue;
             }
             rewritten.push(stmt);
@@ -304,13 +317,12 @@ struct GuardGotoFold {
 }
 
 fn find_terminal_goto_else_fold(block: &AstBlock) -> Option<GuardGotoFold> {
-    for if_index in 0..block.stmts.len() {
+    // 从右向左扫描：优先折叠距 label 最近的 terminal-goto-else，这样外层的
+    // 同类模式在下一轮迭代时可以正常收回，支持多个 goto 指向同一 label 的情况。
+    for if_index in (0..block.stmts.len()).rev() {
         let Some(target) = terminal_goto_else_target(&block.stmts[if_index]) else {
             continue;
         };
-        if count_goto_target_in_block(block, target) != 1 {
-            continue;
-        }
         let Some(label_index) = block.stmts[if_index + 1..]
             .iter()
             .position(|stmt| matches!(stmt, AstStmt::Label(label) if label.id == target))
@@ -334,13 +346,13 @@ fn find_terminal_goto_else_fold(block: &AstBlock) -> Option<GuardGotoFold> {
 }
 
 fn find_guard_goto_label_fold(block: &AstBlock) -> Option<GuardGotoFold> {
-    for if_index in 0..block.stmts.len() {
+    // 从右向左扫描：优先折叠距 label 最近的 guard-goto，这样外层的
+    // guard-goto 在下一轮迭代时可以把已折叠的 if 整体收入 body，
+    // 从而支持同一 label 被多个 goto 引用的 continue-like 模式。
+    for if_index in (0..block.stmts.len()).rev() {
         let Some(target) = guard_goto_target(&block.stmts[if_index]) else {
             continue;
         };
-        if count_goto_target_in_block(block, target) != 1 {
-            continue;
-        }
         let Some(label_index) = block.stmts[if_index + 1..]
             .iter()
             .position(|stmt| matches!(stmt, AstStmt::Label(label) if label.id == target))
