@@ -57,7 +57,7 @@ const typeColorMap: Record<string, string> = {
           >
             <td class="px-2 py-0.5 tabular-nums" style="color: var(--app-text-dim)">{{ c.index }}</td>
             <td class="px-2 py-0.5" :class="typeColorMap[c.type] ?? ''">{{ c.type }}</td>
-            <td class="max-w-[200px] truncate px-2 py-0.5 font-mono" :title="c.display">{{ c.display }}</td>
+            <td class="max-w-50 truncate px-2 py-0.5 font-mono" :title="c.display">{{ c.display }}</td>
           </tr>
         </tbody>
       </table>
