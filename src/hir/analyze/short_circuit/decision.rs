@@ -175,9 +175,20 @@ fn build_value_decision_expr_with_subject(
         subject_for_block,
         |node, target| match target {
             ShortCircuitTarget::Node(next_ref) => Some(DecisionEdge::Node(*next_ref)),
-            ShortCircuitTarget::Value(block) if *block == node.header => {
+            // 只有当 header 处的分支是对 result_reg 的 Truthiness 测试时，subject 的
+            // 运行时值才恰好等于被保留的旧寄存器值（如 `x or y` 中 x 同时是条件和值）。
+            // 对比较类分支（EQ/LT/LE），subject 是布尔结果而非目标寄存器值，
+            // 使用 CurrentValue 会把 `false` 当成保留值，导致语义错误。
+            ShortCircuitTarget::Value(block)
+                if *block == node.header
+                    && header_subject_is_value_carrier(lowering, node.header, short.result_reg) =>
+            {
                 Some(DecisionEdge::Leaf(HirDecisionTarget::CurrentValue))
             }
+            // header 处的比较类分支无法通过 subject 传递 result_reg 的保留值，
+            // 回退到 lower_value_leaf_expr 也只会拿到 subject（布尔），直接放弃
+            // 让外层 fallback 到 if-then 结构。
+            ShortCircuitTarget::Value(block) if *block == node.header => None,
             ShortCircuitTarget::Value(block) => Some(DecisionEdge::Leaf(HirDecisionTarget::Expr(
                 lower_value_leaf_expr(lowering, short, *block)?,
             ))),
@@ -253,9 +264,20 @@ fn build_impure_value_merge_target(
         ShortCircuitTarget::Node(next_ref) => Some(ImpureValueMergeTarget::Plan(
             build_impure_value_merge_plan(lowering, short, *next_ref)?,
         )),
-        ShortCircuitTarget::Value(block) if *block == current_header => {
+        // 与上面 build_value_decision_expr_with_subject 同理：只有 Truthiness 测试
+        // 在 result_reg 上时，subject 运行时值才等于保留的旧寄存器值。
+        ShortCircuitTarget::Value(block)
+            if *block == current_header
+                && header_subject_is_value_carrier(
+                    lowering,
+                    current_header,
+                    short.result_reg,
+                ) =>
+        {
             Some(ImpureValueMergeTarget::Current)
         }
+        // 同上：比较类分支无法携带 result_reg 的值，放弃恢复。
+        ShortCircuitTarget::Value(block) if *block == current_header => None,
         ShortCircuitTarget::Value(block) => Some(ImpureValueMergeTarget::Plan(
             ImpureValueMergePlan::Expr(lower_value_leaf_expr(lowering, short, *block)?),
         )),
@@ -336,6 +358,31 @@ fn split_and_guard_with_shared_rhs(expr: &HirExpr, rhs: &HirExpr) -> Option<HirE
         HirExpr::LogicalAnd(logical) if logical.rhs == *rhs => Some(logical.lhs.clone()),
         _ => None,
     }
+}
+
+/// 判断 header 处的分支条件是否直接测试 result 寄存器的 truthiness。
+///
+/// 只有 Truthiness 测试才能让 subject 运行时值等于被保留的旧寄存器值；
+/// 比较类分支 (EQ/LT/LE) 的 subject 是布尔结果，不携带目标寄存器的值。
+pub(crate) fn header_subject_is_value_carrier(
+    lowering: &ProtoLowering<'_>,
+    header: BlockRef,
+    result_reg: Option<Reg>,
+) -> bool {
+    let Some(result_reg) = result_reg else {
+        return false;
+    };
+    let Some(instr_ref) = lowering.cfg.blocks[header.index()].instrs.last() else {
+        return false;
+    };
+    let LowInstr::Branch(branch) = &lowering.proto.instrs[instr_ref.index()] else {
+        return false;
+    };
+    branch.cond.predicate == BranchPredicate::Truthy
+        && matches!(
+            branch.cond.operands,
+            BranchOperands::Unary(CondOperand::Reg(reg)) if reg == result_reg
+        )
 }
 
 #[derive(Debug, Clone)]

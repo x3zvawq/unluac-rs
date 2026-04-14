@@ -62,7 +62,12 @@ pub(crate) fn lower_value_leaf_expr(
     short: &ShortCircuitCandidate,
     block: BlockRef,
 ) -> Option<HirExpr> {
-    if short.nodes.iter().any(|node| node.header == block) {
+    // 只有当 header 处分支是对 result_reg 的 Truthiness 测试时，subject 才等于
+    // 被保留的旧寄存器值。比较类分支的 subject 是布尔，跳过提前返回让下面的
+    // local def / entry value 路径正确恢复保留值。
+    if short.nodes.iter().any(|node| node.header == block)
+        && header_subject_is_value_carrier(lowering, block, short.result_reg)
+    {
         return lower_short_circuit_subject_single_eval(lowering, block);
     }
 
@@ -87,7 +92,11 @@ pub(crate) fn lower_materialized_value_leaf_expr(
     block: BlockRef,
 ) -> Option<HirExpr> {
     let reg = short.result_reg?;
-    if short.nodes.iter().any(|node| node.header == block) {
+    // 与 lower_value_leaf_expr 同理：只有 Truthiness 测试在 result_reg 上时
+    // subject 才等于保留值。比较类分支跳过，让 local def / entry value 接管。
+    if short.nodes.iter().any(|node| node.header == block)
+        && header_subject_is_value_carrier(lowering, block, short.result_reg)
+    {
         return lower_short_circuit_subject(lowering, block);
     }
 

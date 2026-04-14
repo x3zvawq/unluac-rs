@@ -28,8 +28,9 @@ use super::exprs::{
 };
 use super::short_circuit::{
     BranchShortCircuitPlan, build_branch_short_circuit_plan, build_conditional_reassign_plan,
-    consumed_value_merge_subject_instrs, lower_materialized_value_leaf_expr,
-    lower_short_circuit_subject, recover_short_value_merge_expr_recovery_with_allowed_blocks,
+    consumed_value_merge_subject_instrs, header_subject_is_value_carrier,
+    lower_materialized_value_leaf_expr, lower_short_circuit_subject,
+    recover_short_value_merge_expr_recovery_with_allowed_blocks,
     recover_short_value_merge_expr_with_allowed_blocks, value_merge_candidate_by_header,
     value_merge_skipped_blocks,
 };

@@ -794,7 +794,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         } else {
             self.lower_block_prefix(block, false, &BTreeMap::new())?
         };
-        let value = if block == current_header {
+        let value = if block == current_header
+            && header_subject_is_value_carrier(self.lowering, current_header, short.result_reg)
+        {
+            // Truthiness 测试在 result_reg 上：subject 运行时值即保留值。
             lower_short_circuit_subject(self.lowering, block)?
         } else {
             lower_materialized_value_leaf_expr(self.lowering, short, block)?
