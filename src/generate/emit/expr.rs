@@ -143,6 +143,13 @@ impl<'a> Emitter<'a> {
                     let inner = self.emit_expr(&unary.expr, function, prec, ExprSide::Right)?;
                     let op = match unary.op {
                         AstUnaryOpKind::Not => "not ",
+                        // 当 -(-x) 时直接拼接会产出 `--x`，而 `--` 在 Lua 中是行注释，
+                        // 因此检测到内层也是 Neg 时需要插入空格来打破歧义。
+                        AstUnaryOpKind::Neg
+                            if matches!(&unary.expr, AstExpr::Unary(inner) if inner.op == AstUnaryOpKind::Neg) =>
+                        {
+                            "- "
+                        }
                         AstUnaryOpKind::Neg => "-",
                         AstUnaryOpKind::BitNot => "~",
                         AstUnaryOpKind::Length => "#",
