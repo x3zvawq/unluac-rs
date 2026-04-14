@@ -29,7 +29,7 @@ fn simplifies_safe_lua_logical_absorption() {
         crate::readability::ReadabilityOptions::default(),
         &crate::timing::TimingCollector::disabled(),
         &[],
-        crate::generate::GenerateMode::Strict,
+        crate::generate::GenerateMode::Strict, crate::ast::AstDialectVersion::Lua51,
         );
 
     assert!(matches!(

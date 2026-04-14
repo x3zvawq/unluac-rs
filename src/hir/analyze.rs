@@ -41,6 +41,7 @@ pub(crate) fn analyze_hir(
     timings: &TimingCollector,
     readability: ReadabilityOptions,
     generate_mode: GenerateMode,
+    dialect: crate::ast::AstDialectVersion,
 ) -> HirModule {
     let child_analyses = ChildAnalyses {
         cfg_graphs: &cfg_graph.children,
@@ -73,6 +74,7 @@ pub(crate) fn analyze_hir(
             timings,
             &artifacts.promotion_facts,
             generate_mode,
+            dialect,
         );
     });
     module

@@ -243,6 +243,64 @@ impl AstDialectVersion {
             Self::Luau => "luau",
         }
     }
+
+    /// 判断 `name` 是否是该方言版本下的保留关键字。
+    ///
+    /// `goto`、`continue`、`global` 是 dialect-specific 的：
+    /// - `goto`：Lua 5.2+ / LuaJIT
+    /// - `continue`：Luau
+    /// - `global`：Lua 5.5
+    pub fn is_keyword(self, name: &str) -> bool {
+        if is_base_lua_keyword(name) {
+            return true;
+        }
+        match name {
+            "goto" => matches!(
+                self,
+                Self::Lua52 | Self::Lua53 | Self::Lua54 | Self::Lua55 | Self::LuaJit
+            ),
+            "continue" => matches!(self, Self::Luau),
+            "global" => matches!(self, Self::Lua55),
+            _ => false,
+        }
+    }
+
+    /// 判断 `name` 是否在 **任意** 受支持方言中可能是保留关键字。
+    ///
+    /// HIR 层在目标方言未知时使用此保守全集，保证不会生成任何方言下
+    /// 不合法的裸标识符。
+    pub fn is_keyword_in_any_dialect(name: &str) -> bool {
+        is_base_lua_keyword(name)
+            || matches!(name, "goto" | "continue" | "global")
+    }
+}
+
+/// 所有方言共有的 21 个基础关键字（Lua 5.1 关键字集）。
+fn is_base_lua_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "and"
+            | "break"
+            | "do"
+            | "else"
+            | "elseif"
+            | "end"
+            | "false"
+            | "for"
+            | "function"
+            | "if"
+            | "in"
+            | "local"
+            | "nil"
+            | "not"
+            | "or"
+            | "repeat"
+            | "return"
+            | "then"
+            | "true"
+            | "until"
+            | "while"
+    )
 }
 
 impl fmt::Display for AstDialectVersion {

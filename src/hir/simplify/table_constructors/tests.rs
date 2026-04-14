@@ -4,6 +4,7 @@
 
 use super::*;
 
+use crate::ast::AstDialectVersion;
 use crate::hir::common::{
     HirAssign, HirBlock, HirCallExpr, HirClosureExpr, HirExpr, HirGlobalRef, HirLValue,
     HirLocalDecl, HirReturn, HirStmt, HirTableField, HirTableKey, HirTableSetList,
@@ -71,7 +72,7 @@ fn greedily_consumes_adjacent_set_list_chunks_in_single_pass() {
         children: Vec::new(),
     };
 
-    let changed = stabilize_table_constructors_in_proto(&mut proto);
+    let changed = stabilize_table_constructors_in_proto(&mut proto, AstDialectVersion::Lua51);
     assert!(changed);
 
     let body = &proto.body;
@@ -149,7 +150,7 @@ fn reorders_prior_integer_record_when_later_field_unblocks_next_array_slot() {
         children: Vec::new(),
     };
 
-    let changed = stabilize_table_constructors_in_proto(&mut proto);
+    let changed = stabilize_table_constructors_in_proto(&mut proto, AstDialectVersion::Lua51);
     assert!(changed);
 
     let HirStmt::Assign(assign) = &proto.body.stmts[0] else {
@@ -231,7 +232,7 @@ fn keeps_pending_integer_record_when_set_list_values_advance_array_tail() {
         children: Vec::new(),
     };
 
-    let changed = stabilize_table_constructors_in_proto(&mut proto);
+    let changed = stabilize_table_constructors_in_proto(&mut proto, AstDialectVersion::Lua51);
     assert!(changed);
 
     let HirStmt::Assign(assign) = &proto.body.stmts[0] else {
@@ -319,7 +320,7 @@ fn drains_multiple_integer_gaps_after_backfill_in_single_constructor_region() {
         children: Vec::new(),
     };
 
-    let changed = stabilize_table_constructors_in_proto(&mut proto);
+    let changed = stabilize_table_constructors_in_proto(&mut proto, AstDialectVersion::Lua51);
     assert!(changed);
 
     let HirStmt::Assign(assign) = &proto.body.stmts[0] else {
@@ -401,7 +402,7 @@ fn keeps_record_order_when_open_pack_group_mixes_with_set_list_and_records() {
         children: Vec::new(),
     };
 
-    let changed = stabilize_table_constructors_in_proto(&mut proto);
+    let changed = stabilize_table_constructors_in_proto(&mut proto, AstDialectVersion::Lua51);
     assert!(changed);
 
     let HirStmt::LocalDecl(seed) = &proto.body.stmts[0] else {
@@ -489,7 +490,7 @@ fn absorbs_long_set_list_constructor_region_before_terminal_global_handoff() {
         children: Vec::new(),
     };
 
-    let changed = stabilize_table_constructors_in_proto(&mut proto);
+    let changed = stabilize_table_constructors_in_proto(&mut proto, AstDialectVersion::Lua51);
     assert!(changed);
     assert_eq!(proto.body.stmts.len(), 2);
 
@@ -570,7 +571,7 @@ fn absorbs_terminal_global_handoff_for_single_use_constructor_seed() {
         children: Vec::new(),
     };
 
-    assert!(stabilize_table_constructors_in_proto(&mut proto));
+    assert!(stabilize_table_constructors_in_proto(&mut proto, AstDialectVersion::Lua51));
     assert_eq!(proto.body.stmts.len(), 2);
 
     let HirStmt::Assign(assign) = &proto.body.stmts[0] else {
@@ -645,7 +646,7 @@ fn absorbs_constructor_region_before_terminal_global_handoff() {
         children: Vec::new(),
     };
 
-    assert!(stabilize_table_constructors_in_proto(&mut proto));
+    assert!(stabilize_table_constructors_in_proto(&mut proto, AstDialectVersion::Lua51));
     assert_eq!(proto.body.stmts.len(), 1);
 
     let HirStmt::Assign(assign) = &proto.body.stmts[0] else {
@@ -707,7 +708,7 @@ fn keeps_constructor_seed_when_binding_is_used_after_handoff() {
         children: Vec::new(),
     };
 
-    assert!(!stabilize_table_constructors_in_proto(&mut proto));
+    assert!(!stabilize_table_constructors_in_proto(&mut proto, AstDialectVersion::Lua51));
     assert!(matches!(
         proto.body.stmts.as_slice(),
         [
@@ -830,7 +831,7 @@ fn folds_set_list_with_trailing_multivalue_into_constructor_tail() {
         children: Vec::new(),
     };
 
-    let changed = stabilize_table_constructors_in_proto(&mut proto);
+    let changed = stabilize_table_constructors_in_proto(&mut proto, AstDialectVersion::Lua51);
     assert!(changed);
 
     assert_eq!(proto.body.stmts.len(), 7);
@@ -925,7 +926,7 @@ fn folds_set_list_with_open_pack_barrier_into_constructor_tail() {
         children: Vec::new(),
     };
 
-    let changed = stabilize_table_constructors_in_proto(&mut proto);
+    let changed = stabilize_table_constructors_in_proto(&mut proto, AstDialectVersion::Lua51);
     assert!(changed);
     assert_eq!(proto.body.stmts.len(), 2);
     assert!(
@@ -1076,7 +1077,7 @@ fn folds_mixed_record_and_array_constructor_with_closure_field_and_trailing_mult
         children: vec![crate::hir::common::HirProtoRef(1)],
     };
 
-    let changed = stabilize_table_constructors_in_proto(&mut proto);
+    let changed = stabilize_table_constructors_in_proto(&mut proto, AstDialectVersion::Lua51);
     assert!(changed);
     assert!(
         proto
@@ -1182,7 +1183,7 @@ fn does_not_fold_closure_backed_record_writes_into_constructor() {
         children: Vec::new(),
     };
 
-    let changed = stabilize_table_constructors_in_proto(&mut proto);
+    let changed = stabilize_table_constructors_in_proto(&mut proto, AstDialectVersion::Lua51);
     assert!(!changed);
     assert_eq!(proto.body.stmts.len(), 3);
     let HirStmt::LocalDecl(seed) = &proto.body.stmts[0] else {
@@ -1247,7 +1248,7 @@ fn folds_expr_keyed_closure_backed_record_writes_into_constructor() {
         children: Vec::new(),
     };
 
-    let changed = stabilize_table_constructors_in_proto(&mut proto);
+    let changed = stabilize_table_constructors_in_proto(&mut proto, AstDialectVersion::Lua51);
     assert!(changed);
     assert_eq!(proto.body.stmts.len(), 1);
     let HirStmt::LocalDecl(seed) = &proto.body.stmts[0] else {
@@ -1321,7 +1322,7 @@ fn folds_name_keyed_closure_record_after_set_list_chunk_into_constructor() {
         children: vec![crate::hir::common::HirProtoRef(1)],
     };
 
-    let changed = stabilize_table_constructors_in_proto(&mut proto);
+    let changed = stabilize_table_constructors_in_proto(&mut proto, AstDialectVersion::Lua51);
     assert!(changed);
     assert_eq!(proto.body.stmts.len(), 2);
 
@@ -1396,7 +1397,7 @@ fn does_not_fold_recursive_local_function_slot_into_expr_keyed_constructor_field
         children: Vec::new(),
     };
 
-    let changed = stabilize_table_constructors_in_proto(&mut proto);
+    let changed = stabilize_table_constructors_in_proto(&mut proto, AstDialectVersion::Lua51);
     assert!(!changed);
     assert_eq!(proto.body.stmts.len(), 3);
 }
@@ -1452,7 +1453,7 @@ fn does_not_fold_direct_recursive_closure_when_capture_slot_has_no_surviving_bin
         children: Vec::new(),
     };
 
-    let changed = stabilize_table_constructors_in_proto(&mut proto);
+    let changed = stabilize_table_constructors_in_proto(&mut proto, AstDialectVersion::Lua51);
     assert!(!changed);
     assert_eq!(proto.body.stmts.len(), 2);
 }

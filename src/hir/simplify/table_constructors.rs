@@ -19,6 +19,7 @@ mod scan;
 
 use std::collections::BTreeMap;
 
+use crate::ast::AstDialectVersion;
 use crate::hir::common::{HirAssign, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId};
 
 use self::bindings::{
@@ -105,16 +106,21 @@ struct RebuildScratch {
     restored_pending_integer_fields: Vec<RestoredPendingIntegerField>,
 }
 
-pub(super) fn stabilize_table_constructors_in_proto(proto: &mut HirProto) -> bool {
+pub(super) fn stabilize_table_constructors_in_proto(
+    proto: &mut HirProto,
+    dialect: AstDialectVersion,
+) -> bool {
     let materialized_bindings = collect_materialized_binding_counts(&proto.body);
     let mut pass = TableConstructorPass {
         materialized_bindings,
+        dialect,
     };
     rewrite_proto(proto, &mut pass)
 }
 
 struct TableConstructorPass {
     materialized_bindings: BTreeMap<TableBinding, usize>,
+    dialect: AstDialectVersion,
 }
 
 impl HirRewritePass for TableConstructorPass {
@@ -147,6 +153,7 @@ impl HirRewritePass for TableConstructorPass {
                     &binding_index,
                     &materialized_binding_counts,
                     &stmt_bindings,
+                    self.dialect,
                     &mut scratch,
                 ) {
                     Some((rebuilt_ctor, end_index, retained)) => {

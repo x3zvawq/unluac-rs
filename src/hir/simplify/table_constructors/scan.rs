@@ -4,6 +4,7 @@
 //! setlist、producer 或 trailing handoff”，不会在这里直接改写语句。
 //! 例如：`local t = {}; t.x = 1; t.y = 2` 会在这里被扫描成一串 constructor steps。
 
+use crate::ast::AstDialectVersion;
 use crate::hir::common::{HirExpr, HirLValue, HirStmt, HirTableConstructor};
 
 use super::bindings::{
@@ -60,6 +61,7 @@ pub(super) fn try_rebuild_constructor_region(
     binding_index: &BindingIndex,
     materialized_binding_counts: &[u32],
     stmt_bindings: &[StmtBindingSummary],
+    dialect: AstDialectVersion,
     scratch: &mut RebuildScratch,
 ) -> Option<(HirTableConstructor, usize, Vec<usize>)> {
     let mut steps = Vec::new();
@@ -86,6 +88,7 @@ pub(super) fn try_rebuild_constructor_region(
                 &remaining_uses,
                 committed_contains_set_list,
                 materialized_binding_counts,
+                dialect,
                 scratch,
             );
             if try_extend_constructor_from_steps(
@@ -115,6 +118,7 @@ pub(super) fn try_rebuild_constructor_region(
                 &remaining_uses,
                 committed_contains_set_list,
                 materialized_binding_counts,
+                dialect,
                 scratch,
             );
             if try_extend_constructor_from_steps(

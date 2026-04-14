@@ -5,6 +5,8 @@
 
 use std::collections::BTreeSet;
 
+use crate::ast::AstDialectVersion;
+
 /// 取简单参数名候选。
 pub(super) fn alphabetical_name(index: usize) -> Option<String> {
     const NAMES: &[&str] = &[
@@ -69,18 +71,20 @@ pub(super) fn is_valid_identifier(candidate: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-/// Lua 关键字列表（包含 `global` 作为保留标识符）。
-const LUA_KEYWORDS: &[&str] = &[
-    "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if", "in",
-    "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while", "global",
-];
-
-/// 判断是否为 Lua 关键字。
+/// 判断是否为 Lua 关键字（保守全集，覆盖所有方言）。
 pub(super) fn is_lua_keyword(candidate: &str) -> bool {
-    LUA_KEYWORDS.contains(&candidate)
+    AstDialectVersion::is_keyword_in_any_dialect(candidate)
 }
 
-/// 预置 Lua 关键字表。
+/// 预置 Lua 关键字表（保守全集）。
 pub(super) fn lua_keywords() -> BTreeSet<String> {
-    LUA_KEYWORDS.iter().map(|s| (*s).to_owned()).collect()
+    // 基础 21 关键字 + dialect-specific: goto, continue, global
+    [
+        "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if",
+        "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
+        "continue", "global",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect()
 }

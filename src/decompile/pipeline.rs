@@ -213,6 +213,7 @@ impl DecompilerPipeline {
                 &timings,
                 options.readability,
                 options.generate.mode,
+                requested_target.version,
             )
         });
         state.mark_completed(DecompileStage::Hir);

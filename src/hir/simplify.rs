@@ -165,6 +165,7 @@ pub(super) fn simplify_hir(
     timings: &TimingCollector,
     promotion_facts: &[ProtoPromotionFacts],
     generate_mode: GenerateMode,
+    dialect: crate::ast::AstDialectVersion,
 ) {
     let empty_facts = ProtoPromotionFacts::default();
 
@@ -180,7 +181,7 @@ pub(super) fn simplify_hir(
                         0 => decision::simplify_decision_exprs_in_proto(proto),
                         1 => boolean_shells::remove_boolean_materialization_shells_in_proto(proto),
                         2 => logical_simplify::simplify_logical_exprs_in_proto(proto),
-                        3 => table_constructors::stabilize_table_constructors_in_proto(proto),
+                        3 => table_constructors::stabilize_table_constructors_in_proto(proto, dialect),
                         4 => closure_self_capture::resolve_recursive_closure_self_captures_in_proto(proto),
                         5 => temp_inline::inline_temps_in_proto_with_facts(proto, readability, facts),
                         6 => locals::promote_temps_to_locals_in_proto_with_facts(proto, facts),

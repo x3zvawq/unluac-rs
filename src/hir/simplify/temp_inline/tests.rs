@@ -846,7 +846,7 @@ fn simplify_module_runs_until_fixed_point() {
         crate::readability::ReadabilityOptions::default(),
         &crate::timing::TimingCollector::disabled(),
         &[],
-        crate::generate::GenerateMode::Strict,
+        crate::generate::GenerateMode::Strict, crate::ast::AstDialectVersion::Lua51,
         );
 
     assert!(matches!(

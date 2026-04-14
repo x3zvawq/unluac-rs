@@ -9,10 +9,10 @@ use crate::hir::{
 
 use super::{AstLowerError, AstLowerer};
 use crate::ast::common::{
-    AstAssign, AstBinaryExpr, AstBinaryOpKind, AstCallExpr, AstCallKind, AstExpr, AstFieldAccess,
-    AstFunctionExpr, AstGlobalName, AstIndexAccess, AstLValue, AstLocalDecl, AstLogicalExpr,
-    AstMethodCallExpr, AstNameRef, AstTableConstructor, AstTableField, AstTableKey, AstUnaryExpr,
-    AstUnaryOpKind,
+    AstAssign, AstBinaryExpr, AstBinaryOpKind, AstCallExpr, AstCallKind, AstDialectVersion,
+    AstExpr, AstFieldAccess, AstFunctionExpr, AstGlobalName, AstIndexAccess, AstLValue,
+    AstLocalDecl, AstLogicalExpr, AstMethodCallExpr, AstNameRef, AstTableConstructor,
+    AstTableField, AstTableKey, AstUnaryExpr, AstUnaryOpKind,
 };
 
 impl<'a> AstLowerer<'a> {
@@ -314,7 +314,7 @@ where
     FIndex: FnOnce(AstIndexAccess) -> T,
 {
     let base = lowerer.lower_expr(proto_index, &access.base)?;
-    if let Some(field_name) = field_name_from_key(&access.key) {
+    if let Some(field_name) = field_name_from_key(&access.key, lowerer.target.version) {
         return Ok(make_field(AstFieldAccess {
             base,
             field: field_name,
@@ -356,14 +356,14 @@ fn lower_binary_op(op: HirBinaryOpKind) -> AstBinaryOpKind {
     }
 }
 
-fn field_name_from_key(key: &HirExpr) -> Option<String> {
+fn field_name_from_key(key: &HirExpr, dialect: AstDialectVersion) -> Option<String> {
     match key {
-        HirExpr::String(name) if is_lua_identifier(name) => Some(name.clone()),
+        HirExpr::String(name) if is_lua_identifier(name, dialect) => Some(name.clone()),
         _ => None,
     }
 }
 
-fn is_lua_identifier(name: &str) -> bool {
+fn is_lua_identifier(name: &str, dialect: AstDialectVersion) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -374,30 +374,5 @@ fn is_lua_identifier(name: &str) -> bool {
     if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
         return false;
     }
-    !matches!(
-        name,
-        "and"
-            | "break"
-            | "do"
-            | "else"
-            | "elseif"
-            | "end"
-            | "false"
-            | "for"
-            | "function"
-            | "goto"
-            | "if"
-            | "in"
-            | "local"
-            | "nil"
-            | "not"
-            | "or"
-            | "repeat"
-            | "return"
-            | "then"
-            | "true"
-            | "until"
-            | "while"
-            | "global"
-    )
+    !dialect.is_keyword(name)
 }

@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use crate::ast::AstDialectVersion;
 use crate::hir::common::{
     HirBlock, HirCallExpr, HirCapture, HirDecisionTarget, HirExpr, HirLValue, HirStmt,
     HirTableConstructor, HirTableField, HirTableKey, HirTableSetList,
@@ -57,6 +58,7 @@ pub(super) struct RegionRebuildContext<'a> {
     remaining_uses: &'a BindingUseSummary,
     allow_closure_records_prefix: bool,
     materialized_binding_counts: &'a [u32],
+    dialect: AstDialectVersion,
     scratch: &'a mut RebuildScratch,
 }
 
@@ -67,6 +69,7 @@ impl<'a> RegionRebuildContext<'a> {
         remaining_uses: &'a BindingUseSummary,
         allow_closure_records_prefix: bool,
         materialized_binding_counts: &'a [u32],
+        dialect: AstDialectVersion,
         scratch: &'a mut RebuildScratch,
     ) -> Self {
         Self {
@@ -75,6 +78,7 @@ impl<'a> RegionRebuildContext<'a> {
             remaining_uses,
             allow_closure_records_prefix,
             materialized_binding_counts,
+            dialect,
             scratch,
         }
     }
@@ -592,7 +596,7 @@ fn prepare_record_step(
     allow_closure_records: bool,
     context: &mut RegionRebuildContext<'_>,
 ) -> Option<()> {
-    let (key, value) = record_field_parts(context.block, stmt_index)?;
+    let (key, value) = record_field_parts(context.block, stmt_index, context.dialect)?;
     // 内联 record key 表达式：如果 key 是一个引用了 pending producer 的变量引用
     // （例如 `local k = "name"; t[k] = v`），把 producer 值折叠进 key 并消费绑定。
     let key = match key {
@@ -610,7 +614,7 @@ fn prepare_record_step(
                 );
                 inline_constructor_value(&mut inline_context, &key_expr)?
             };
-            table_key_from_expr(&inlined)
+            table_key_from_expr(&inlined, context.dialect)
         }
         name => name,
     };
@@ -659,7 +663,11 @@ fn prepare_record_step(
     Some(())
 }
 
-fn record_field_parts(block: &HirBlock, stmt_index: usize) -> Option<(HirTableKey, &HirExpr)> {
+fn record_field_parts(
+    block: &HirBlock,
+    stmt_index: usize,
+    dialect: AstDialectVersion,
+) -> Option<(HirTableKey, &HirExpr)> {
     let HirStmt::Assign(assign) = block.stmts.get(stmt_index)? else {
         return None;
     };
@@ -669,7 +677,7 @@ fn record_field_parts(block: &HirBlock, stmt_index: usize) -> Option<(HirTableKe
     let [value] = assign.values.as_slice() else {
         return None;
     };
-    Some((table_key_from_expr(&access.key), value))
+    Some((table_key_from_expr(&access.key, dialect), value))
 }
 
 fn set_list_stmt(block: &HirBlock, stmt_index: usize) -> Option<&HirTableSetList> {
