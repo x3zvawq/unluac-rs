@@ -13,8 +13,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cfg::{BlockRef, PhiId};
 use crate::hir::common::{
-    HirBlock, HirExpr, HirGenericFor, HirLValue, HirLabel, HirLabelId, HirLogicalExpr,
-    HirNumericFor, HirRepeat, HirStmt, HirWhile, TempId,
+    HirBlock, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr,
+    HirGenericFor, HirLValue, HirLabel, HirLabelId, HirLogicalExpr, HirNumericFor, HirRepeat,
+    HirStmt, HirWhile, TempId,
 };
 use crate::structure::{
     BranchCandidate, BranchKind, BranchRegionFact, BranchValueMergeArm, BranchValueMergeCandidate,

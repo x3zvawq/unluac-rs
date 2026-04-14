@@ -4,6 +4,18 @@
 //! 恢复逻辑。把后者单独拆出来，是为了让“主流程如何行走 block”与“某个分支具体怎么
 //! 降”分开维护；后面继续打磨 branch merge 或 continue/break 语义时，不需要在一个
 //! 超大文件里来回跳转。
+//!
+//! 当一个 header 同时拥有 SC (ShortCircuit) 值合流候选和 BranchValueMerge
+//! 候选时，SC 只处理一个 result_reg 的 phi，而 BVM 认领了其余 phi。SC 系列
+//! 快捷路径（conditional_reassign / statement_value_merge / value_merge）消费
+//! 整个分支结构后，BVM 的 phi 就会因无人物化而丢失。为此：
+//! - value_merge / conditional_reassign 路径在检测到 BVM 共存时退让给普通分支，
+//!   让 BVM 通过 target_overrides 处理自身 phi，SC phi 则在 merge block 恢复。
+//! - statement_value_merge 路径在 SC 表达式生成后，以 SC 树结构为骨架为 BVM
+//!   phi 构建 Decision 表达式。
+//!
+//! 例子：SC 覆盖 r4 → `x and (y and 2 or 3) or 6`，BVM 覆盖 r3 →
+//! 普通分支路径产出 `if x then ... end` 中的条件赋值。
 
 use super::*;
 
@@ -112,6 +124,21 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             self.install_branch_value_merge_overrides(*header, &branch_value_overrides);
         }
 
+        // 当普通分支路径处理了一个 header，而该 header 同时拥有 SC 值合流候选
+        // 时（SC 由于 BVM 共存而退让到了这里），需要把 header 加入
+        // merge_allowed_blocks。这样 merge block 的 lower_phi_materialization
+        // 才能在 SC 恢复时识别 header 内的 temp 为"安全可引用"，正确恢复
+        // SC phi 的值表达式。
+        if let Some(sc) = value_merge_candidate_by_header(self.lowering, block)
+            && let ShortCircuitExit::ValueMerge(sc_merge) = sc.exit
+            && branch_stop == Some(sc_merge)
+        {
+            self.merge_allowed_blocks
+                .entry(sc_merge)
+                .or_default()
+                .insert(block);
+        }
+
         match branch_stop {
             Some(next) if next == self.lowering.cfg.exit_block => Some(None),
             Some(next) => Some(Some(next)),
@@ -137,6 +164,18 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if Some(merge) == stop {
             return None;
         }
+
+        // 与 try_lower_value_merge_branch 同理：SC 系列快捷路径只处理一个
+        // result_reg，BVM 认领的其他 phi 会因分支结构被消费而孤立。
+        if let Some(bvm) = self.branch_value_merges_by_header.get(&block)
+            && bvm
+                .values
+                .iter()
+                .any(|v| Some(v.phi_id) != short.result_phi_id)
+        {
+            return None;
+        }
+
         let plan = build_conditional_reassign_plan(self.lowering, block)?;
 
         if let Some(stop) = stop
@@ -229,6 +268,28 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.overrides.suppress_phi(short.result_phi_id?);
         stmts.extend(short_stmts);
 
+        // SC 值合流只处理了 result_phi 对应的一个寄存器。如果同一 header 下还有
+        // BranchValueMerge 认领的其他 phi，它们的分支结构已被 SC 消费——正常
+        // 分支路径不会再运行。这里利用 SC 的树结构，为每个孤立的 BVM phi 构建
+        // 平行的 Decision 表达式，避免这些 phi 因无人物化而丢失。
+        if let Some(bvm) = self.branch_value_merges_by_header.get(&block) {
+            for value in &bvm.values {
+                if Some(value.phi_id) == short.result_phi_id {
+                    continue;
+                }
+                if let Some(decision_expr) =
+                    self.build_secondary_value_merge_decision(short, value.reg)
+                {
+                    let bvm_temp = self.lowering.bindings.phi_temps[value.phi_id.index()];
+                    stmts.push(assign_stmt(
+                        vec![HirLValue::Temp(bvm_temp)],
+                        vec![decision_expr],
+                    ));
+                    self.overrides.suppress_phi(value.phi_id);
+                }
+            }
+        }
+
         Some(Some(merge))
     }
 
@@ -246,6 +307,20 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if Some(merge) == stop {
             return None;
         }
+
+        // SC 值合流只处理一个 result_reg。如果同一 header 下 BranchValueMerge
+        // 还认领了其他 phi，SC 消费分支结构后那些 phi 就无人物化。此时退让给
+        // 普通分支路径：BVM 通过 target_overrides 处理自己的 phi，SC 的 phi 则
+        // 在 merge block 的 lower_phi_materialization 中恢复。
+        if let Some(bvm) = self.branch_value_merges_by_header.get(&block)
+            && bvm
+                .values
+                .iter()
+                .any(|v| Some(v.phi_id) != short.result_phi_id)
+        {
+            return None;
+        }
+
         let allowed_blocks = BTreeSet::from([block]);
         let recovery = recover_short_value_merge_expr_recovery_with_allowed_blocks(
             self.lowering,
@@ -821,6 +896,75 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stmts.push(assign_stmt(vec![HirLValue::Temp(target_temp)], vec![value]));
 
         Some(HirBlock { stmts })
+    }
+
+    /// 以 SC 的树结构为骨架，对一个不由 SC 覆盖的寄存器构建 Decision 表达式。
+    ///
+    /// 在每个叶子节点处读取该寄存器的 block 出口值，用与 SC 相同的分支条件
+    /// 串联成一棵嵌套决策树。例子：SC 树为 `x and (y and 2 or 3) or 6` 只
+    /// 覆盖 r4；对于 r3（叶子值 #2→1, #3→4, #4→5），这里会产出
+    /// `Decision(x ? Decision(y ? 1 : 4) : 5)` 赋值到 r3 的 phi temp。
+    fn build_secondary_value_merge_decision(
+        &self,
+        short: &ShortCircuitCandidate,
+        reg: Reg,
+    ) -> Option<HirExpr> {
+        let mut nodes = Vec::new();
+        self.build_secondary_decision_node(short, short.entry, reg, &mut nodes)?;
+        Some(HirExpr::Decision(Box::new(HirDecisionExpr {
+            entry: HirDecisionNodeRef(0),
+            nodes,
+        })))
+    }
+
+    fn build_secondary_decision_node(
+        &self,
+        short: &ShortCircuitCandidate,
+        node_ref: ShortCircuitNodeRef,
+        reg: Reg,
+        nodes: &mut Vec<HirDecisionNode>,
+    ) -> Option<HirDecisionNodeRef> {
+        let node = short.nodes.get(node_ref.index())?;
+        let my_ref = HirDecisionNodeRef(nodes.len());
+        // 先占位，后续填充 test/truthy/falsy
+        nodes.push(HirDecisionNode {
+            id: my_ref,
+            test: HirExpr::Nil,
+            truthy: HirDecisionTarget::CurrentValue,
+            falsy: HirDecisionTarget::CurrentValue,
+        });
+
+        let cond = lower_short_circuit_subject(self.lowering, node.header)?;
+        let truthy =
+            self.build_secondary_decision_target(short, &node.truthy, reg, nodes)?;
+        let falsy =
+            self.build_secondary_decision_target(short, &node.falsy, reg, nodes)?;
+
+        nodes[my_ref.index()].test = cond;
+        nodes[my_ref.index()].truthy = truthy;
+        nodes[my_ref.index()].falsy = falsy;
+        Some(my_ref)
+    }
+
+    fn build_secondary_decision_target(
+        &self,
+        short: &ShortCircuitCandidate,
+        target: &ShortCircuitTarget,
+        reg: Reg,
+        nodes: &mut Vec<HirDecisionNode>,
+    ) -> Option<HirDecisionTarget> {
+        match target {
+            ShortCircuitTarget::Node(next_ref) => {
+                let node_ref =
+                    self.build_secondary_decision_node(short, *next_ref, reg, nodes)?;
+                Some(HirDecisionTarget::Node(node_ref))
+            }
+            ShortCircuitTarget::Value(block) => {
+                let value = expr_for_reg_at_block_exit(self.lowering, *block, reg);
+                Some(HirDecisionTarget::Expr(value))
+            }
+            ShortCircuitTarget::TruthyExit | ShortCircuitTarget::FalsyExit => None,
+        }
     }
 
     fn install_stop_boundary_value_merge_override(
