@@ -8,6 +8,52 @@ use std::collections::BTreeMap;
 
 use crate::cfg::DefId;
 use crate::hir::common::{HirExpr, HirLValue, HirStmt, TempId};
+
+/// 检查表达式中是否仍残留未被替换的 `TempRef`。
+///
+/// 当循环头部前缀包含无法内联的指令（如多返回值调用）时，
+/// `block_prefix_temp_expr_overrides` 无法为所有 temp 生成 override，
+/// 条件表达式里就会残留 TempRef 节点。这个 helper 用来检测这种情况，
+/// 驱动 `lower_while_loop` 回退到 `while true + if-break` 模式。
+pub(super) fn expr_has_temp_ref(expr: &HirExpr) -> bool {
+    if matches!(expr, HirExpr::TempRef(_)) {
+        return true;
+    }
+    let mut found = false;
+    traverse_hir_expr_children!(
+        expr,
+        iter = iter,
+        borrow = [&],
+        expr(e) => { if expr_has_temp_ref(e) { found = true; } },
+        call(c) => {
+            traverse_hir_call_children!(
+                c,
+                iter = iter,
+                borrow = [&],
+                expr(e) => { if expr_has_temp_ref(e) { found = true; } }
+            );
+        },
+        decision(d) => {
+            traverse_hir_decision_children!(
+                d,
+                iter = iter,
+                borrow = [&],
+                expr(e) => { if expr_has_temp_ref(e) { found = true; } },
+                condition(cond) => { if expr_has_temp_ref(cond) { found = true; } }
+            );
+        },
+        table_constructor(t) => {
+            traverse_hir_table_constructor_children!(
+                t,
+                iter = iter,
+                opt = as_ref,
+                borrow = [&],
+                expr(e) => { if expr_has_temp_ref(e) { found = true; } }
+            );
+        }
+    );
+    found
+}
 use crate::hir::traverse::{
     traverse_hir_call_children, traverse_hir_decision_children, traverse_hir_expr_children,
     traverse_hir_lvalue_children, traverse_hir_stmt_children,

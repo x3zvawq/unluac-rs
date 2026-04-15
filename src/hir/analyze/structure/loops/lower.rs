@@ -80,7 +80,35 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let mut cond_expr_overrides = self.block_prefix_temp_expr_overrides(candidate.header);
         cond_expr_overrides.extend(temp_expr_overrides(&combined_target_overrides));
         rewrite_expr_temps(&mut cond, &cond_expr_overrides);
-        stmts.push(HirStmt::While(Box::new(HirWhile { cond, body })));
+
+        // 循环头部存在无法内联到条件表达式的指令时（如多返回值调用），
+        // 条件中会残留 TempRef。此时回退为 `while true do prefix; if-break; body end`，
+        // 把原来的头部前缀显式作为循环体开头，条件取反作为 break 守卫。
+        // 输入形状：header=[call multi_ret; branch ok] + body_entry=[short-circuit/continue]
+        // 输出形状：while true do local ok,val=call(); if not ok then break end; <body> end
+        if expr_has_temp_ref(&cond) {
+            let prefix = self.lower_block_prefix(
+                candidate.header,
+                true,
+                &combined_target_overrides,
+            )?;
+            let break_cond = cond.negate();
+            let mut full_body = prefix;
+            full_body.push(HirStmt::If(Box::new(HirIf {
+                cond: break_cond,
+                then_block: HirBlock {
+                    stmts: vec![HirStmt::Break],
+                },
+                else_block: None,
+            })));
+            full_body.extend(body.stmts);
+            stmts.push(HirStmt::While(Box::new(HirWhile {
+                cond: HirExpr::Boolean(true),
+                body: HirBlock { stmts: full_body },
+            })));
+        } else {
+            stmts.push(HirStmt::While(Box::new(HirWhile { cond, body })));
+        }
 
         Some(Some(exit))
     }

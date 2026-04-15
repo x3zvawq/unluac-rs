@@ -8,7 +8,7 @@
 mod lower;
 mod state;
 
-use super::rewrites::{lvalue_as_expr, rewrite_expr_temps, temp_expr_overrides};
+use super::rewrites::{expr_has_temp_ref, lvalue_as_expr, rewrite_expr_temps, temp_expr_overrides};
 use super::*;
 
 fn merge_target_overrides(
