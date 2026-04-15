@@ -19,6 +19,8 @@
 
 use super::*;
 
+use crate::cfg::DefId;
+
 impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     pub(super) fn lower_branch(
         &mut self,
@@ -188,7 +190,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // try_lower_statement_value_merge_branch 处的同类守卫：条件重赋值同样把
         // phi temp 直接内联进语句，跳过了 apply_loop_rewrites，当 entry_defs
         // 被 loop state 接管时，写入会被遗漏。
-        if value_merge_entry_defs_are_overridden(self.lowering, short, target_overrides) {
+        if value_merge_defs_are_overridden(self.lowering, short, target_overrides) {
             return None;
         }
 
@@ -244,11 +246,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         // 短路值合流的 lower_value_merge_leaf 不会传递 target_overrides 给
-        // lower_block_prefix，导致循环 state plan 的写入重定向被跳过。如果
-        // 值合流消费的 entry_defs 中有任何一个被 target_overrides 接管，说明
-        // 这些 def 的写入需要被路由到循环 state 变量——此时应退让给普通分支
-        // 降级，让 apply_loop_rewrites 在正确的 override 上下文中生效。
-        if value_merge_entry_defs_are_overridden(self.lowering, short, target_overrides) {
+        // lower_block_prefix，导致循环 state plan 或外层 BVM 的写入重定向被跳过。
+        // 如果值合流涉及的 def（含 entry_defs 和 leaf 的 value_incomings）中有任何
+        // 一个被 target_overrides 接管，应退让给普通分支降级。
+        if value_merge_defs_are_overridden(self.lowering, short, target_overrides) {
             return None;
         }
 
@@ -304,9 +305,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let ShortCircuitExit::ValueMerge(merge) = short.exit else {
             return None;
         };
-        if Some(merge) == stop {
-            return None;
-        }
+        // 注意：merge == stop 时仍然允许值合流消费分支结构块。调用方的循环会在
+        // current == stop 时自然 break，不会再尝试进入 merge block。
+        // merge block 的 block_prefix（含值合流 phi 物化）由外层调用方显式处理，
+        // 例如 numeric-for body 会在 region 返回后单独 lower continue_block 的 prefix。
 
         // SC 值合流只处理一个 result_reg。如果同一 header 下 BranchValueMerge
         // 还认领了其他 phi，SC 消费分支结构后那些 phi 就无人物化。此时退让给
@@ -1031,7 +1033,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 /// 说明该 def 的写入经由循环 state plan 被重定向到了 state 变量。此时如果仍走
 /// SC value-merge 的快捷路径，lower_value_merge_leaf 会用空 override map 调用
 /// lower_block_prefix，导致 state 写入重定向被跳过。
-fn value_merge_entry_defs_are_overridden(
+/// 检查值型短路候选内是否有被 target_overrides 接管的 def。
+///
+/// 包含两类来源：
+/// 1. `entry_defs`——从 SC 外部流入的初始值，作为值合流某条路径的"保留原值"语义；
+/// 2. `value_incomings` 中的 leaf defs——SC 内部叶子块写入 result_reg 的具体值。
+///
+/// 当外层 BVM 通过 target_overrides 要求将这些 def 的写入重定向到合并 temp 时，
+/// SC 快捷路径因为不会传递 target_overrides 给叶子展开逻辑，会导致重定向写入丢失。
+/// 此时应退让给普通分支降级，在 apply_loop_rewrites / BVM 管道中正确路由。
+fn value_merge_defs_are_overridden(
     lowering: &ProtoLowering<'_>,
     short: &ShortCircuitCandidate,
     target_overrides: &BTreeMap<TempId, HirLValue>,
@@ -1039,11 +1050,16 @@ fn value_merge_entry_defs_are_overridden(
     if target_overrides.is_empty() {
         return false;
     }
-    short.entry_defs.iter().any(|def| {
+    let is_overridden = |def: &DefId| {
         lowering
             .bindings
             .fixed_temps
             .get(def.index())
             .is_some_and(|temp| target_overrides.contains_key(temp))
-    })
+    };
+    short.entry_defs.iter().any(is_overridden)
+        || short
+            .value_incomings
+            .iter()
+            .any(|inc| inc.defs.iter().any(is_overridden))
 }
