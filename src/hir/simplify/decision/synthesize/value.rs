@@ -151,7 +151,13 @@ pub(super) fn validate_candidate_for_node(
 ) -> bool {
     context.environments.iter().all(|env| {
         let decision_value = context.eval_node(node_ref, env);
+        // 当 decision_value 为 None 时，表示原始 Decision 在该环境下会因类型不兼容
+        // （如 nil <= nil）而运行时报错；任何候选表达式在该环境下也同样会报错或产生
+        // 不可达的值，因此这类环境对等价性判定没有区分意义，可以安全跳过。
+        let Some(decision_value) = decision_value else {
+            return true;
+        };
         let candidate_value = context.eval_expr(candidate, env);
-        decision_value.is_some() && decision_value == candidate_value
+        candidate_value.as_ref() == Some(&decision_value)
     })
 }

@@ -31,7 +31,14 @@ pub(super) fn expr_is_synth_safe(expr: &HirExpr) -> bool {
         | HirExpr::UpvalueRef(_)
         | HirExpr::TempRef(_) => true,
         HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => expr_is_synth_safe(&unary.expr),
-        HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Eq => {
+        // 所有纯比较运算符（Eq/Lt/Le）本身无副作用，可安全内嵌到 and/or 表达式中。
+        // 算术运算符（Add/Sub/...）因可能触发 __add 等元方法而被排除。
+        HirExpr::Binary(binary)
+            if matches!(
+                binary.op,
+                HirBinaryOpKind::Eq | HirBinaryOpKind::Lt | HirBinaryOpKind::Le
+            ) =>
+        {
             expr_is_synth_safe(&binary.lhs) && expr_is_synth_safe(&binary.rhs)
         }
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {

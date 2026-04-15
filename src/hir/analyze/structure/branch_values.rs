@@ -10,7 +10,7 @@
 //!   或 `Decision(a, b)`
 //! - 如果两臂最终其实都写回同一个 lvalue，则这里会收成共享 alias，而不会再保留一层 phi
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cfg::DefId;
 use crate::hir::common::{
@@ -88,7 +88,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         for value in &candidate.values {
             let target = self.branch_value_arm_target(value, target_overrides);
+            let mut arm_defs = BTreeSet::new();
             if !value.then_arm.preds.is_disjoint(preds) {
+                arm_defs.extend(value.then_arm.non_header_defs.iter().copied());
                 install_def_target_overrides(
                     &self.lowering.bindings.fixed_temps,
                     value.then_arm.non_header_defs.iter().copied(),
@@ -97,9 +99,23 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 );
             }
             if !value.else_arm.preds.is_disjoint(preds) {
+                arm_defs.extend(value.else_arm.non_header_defs.iter().copied());
                 install_def_target_overrides(
                     &self.lowering.bindings.fixed_temps,
                     value.else_arm.non_header_defs.iter().copied(),
+                    &target,
+                    &mut overrides,
+                );
+            }
+            // 当 BVM 的 arm defs 中有一部分被内层短路候选吸收时，短路产出的 phi temp
+            // 是这些 defs 在 HIR 层面的唯一代表——原始 def 的 fixed_temp 不再出现在
+            // 赋值语句中。此时外层 BVM 的 target override 必须覆盖到这个 phi temp，
+            // 否则内层短路的物化结果会写入一个"无人读取"的 temp 而丢失。
+            if !arm_defs.is_empty() {
+                install_short_circuit_phi_overrides(
+                    self.lowering,
+                    header,
+                    &arm_defs,
                     &target,
                     &mut overrides,
                 );
@@ -324,4 +340,52 @@ fn branch_value_non_header_defs(value: &BranchValueMergeValue) -> impl Iterator<
 enum BranchValueOverride {
     Alias(HirExpr),
     Snapshot(HirExpr),
+}
+
+/// 当外层 BVM 的 arm defs 被内层短路候选吸收后，短路的 phi temp 是这些 defs
+/// 在 HIR 层面的唯一写入点。如果外层 BVM 的 target override 没有覆盖到这个
+/// phi temp，物化结果就会写入一个"无人读取"的孤儿 temp，后续被 dead_temps 清除
+/// 导致值丢失。
+///
+/// 这里检查所有 value-merge 型短路候选：只要其 value_incoming defs 与当前 BVM arm
+/// 的 defs 有交集 **且** 短路的 header 被 BVM 的 header 严格支配（即短路确实嵌套
+/// 在 BVM 的分支体内部），就把该短路的 phi temp 也加入 override 映射。不做支配检查
+/// 会误伤那些"只是与 BVM 共享相同 reaching defs 但结构上位于 BVM 之前"的短路，
+/// 导致其 phi temp 被错误重定向。
+fn install_short_circuit_phi_overrides(
+    lowering: &ProtoLowering<'_>,
+    bvm_header: BlockRef,
+    arm_defs: &BTreeSet<DefId>,
+    target: &HirLValue,
+    overrides: &mut BTreeMap<TempId, HirLValue>,
+) {
+    let dom_tree = &lowering.graph_facts.dominator_tree;
+    for short in &lowering.structure.short_circuit_candidates {
+        if !short.reducible {
+            continue;
+        }
+        let ShortCircuitExit::ValueMerge(_) = short.exit else {
+            continue;
+        };
+        let Some(phi_id) = short.result_phi_id else {
+            continue;
+        };
+        // 短路必须嵌套在 BVM 的分支体内部——其 header 应被 BVM header 严格支配。
+        // 如果不做这个检查，位于 BVM 之前（上游）且共享相同 reaching defs 的短路
+        // 会被误匹配，其 phi temp 会被错误重定向到 BVM 的 target。
+        if short.header == bvm_header || !dom_tree.dominates(bvm_header, short.header) {
+            continue;
+        }
+        let has_overlap = short
+            .value_incomings
+            .iter()
+            .any(|vi| vi.defs.iter().any(|d| arm_defs.contains(d)));
+        if !has_overlap {
+            continue;
+        }
+        let Some(phi_temp) = lowering.bindings.phi_temps.get(phi_id.index()).copied() else {
+            continue;
+        };
+        overrides.insert(phi_temp, target.clone());
+    }
 }

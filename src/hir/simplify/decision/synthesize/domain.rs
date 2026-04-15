@@ -36,6 +36,34 @@ pub(super) enum AbstractValue {
     TruthySymbol(u8),
 }
 
+/// 模拟 Lua 对两个抽象值的 `<` / `<=` 比较语义。
+///
+/// Lua 只允许两个数字或两个字符串之间的比较（不考虑元方法）。
+/// `TruthySymbol` 是综合域里的标记值，按索引给出确定序以保证验证可判定。
+/// 其余类型组合（如 Nil 与数字）在运行时会抛出错误，此处返回 `None`。
+fn abstract_value_partial_cmp(
+    lhs: &AbstractValue,
+    rhs: &AbstractValue,
+) -> Option<std::cmp::Ordering> {
+    match (lhs, rhs) {
+        (AbstractValue::Integer(a), AbstractValue::Integer(b)) => Some(a.cmp(b)),
+        (AbstractValue::Number(a), AbstractValue::Number(b)) => {
+            f64::from_bits(*a).partial_cmp(&f64::from_bits(*b))
+        }
+        (AbstractValue::Integer(a), AbstractValue::Number(b)) => {
+            (*a as f64).partial_cmp(&f64::from_bits(*b))
+        }
+        (AbstractValue::Number(a), AbstractValue::Integer(b)) => {
+            f64::from_bits(*a).partial_cmp(&(*b as f64))
+        }
+        (AbstractValue::String(a), AbstractValue::String(b)) => Some(a.cmp(b)),
+        (AbstractValue::Int64(a), AbstractValue::Int64(b)) => Some(a.cmp(b)),
+        (AbstractValue::UInt64(a), AbstractValue::UInt64(b)) => Some(a.cmp(b)),
+        (AbstractValue::TruthySymbol(a), AbstractValue::TruthySymbol(b)) => Some(a.cmp(b)),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct SynthesisContext<'a> {
     pub(super) decision: &'a HirDecisionExpr,
@@ -132,6 +160,23 @@ pub(super) fn eval_pure_expr(
             let lhs = eval_pure_expr(&binary.lhs, env, ref_positions)?;
             let rhs = eval_pure_expr(&binary.rhs, env, ref_positions)?;
             Some(if lhs == rhs {
+                AbstractValue::True
+            } else {
+                AbstractValue::False
+            })
+        }
+        HirExpr::Binary(binary)
+            if matches!(binary.op, HirBinaryOpKind::Lt | HirBinaryOpKind::Le) =>
+        {
+            let lhs = eval_pure_expr(&binary.lhs, env, ref_positions)?;
+            let rhs = eval_pure_expr(&binary.rhs, env, ref_positions)?;
+            let ordering = abstract_value_partial_cmp(&lhs, &rhs)?;
+            let result = match binary.op {
+                HirBinaryOpKind::Lt => ordering == std::cmp::Ordering::Less,
+                HirBinaryOpKind::Le => ordering != std::cmp::Ordering::Greater,
+                _ => unreachable!(),
+            };
+            Some(if result {
                 AbstractValue::True
             } else {
                 AbstractValue::False

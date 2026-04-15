@@ -410,11 +410,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             |phi_id| self.overrides.phi_is_suppressed_for_block(block, phi_id),
             allowed_blocks,
         ));
-        // phi 物化语句里的 TempRef 可能引用被 target_overrides 重定向过的旧 temp。
+        // phi 物化语句里的 TempRef 和赋值目标都可能引用被 target_overrides
+        // 重定向过的 temp。典型场景：内层短路的 phi temp 被外层 BVM 收编后，
+        // 物化结果的写入目标需要跟着改到外层 BVM 的 arm target。
         if !target_overrides.is_empty() {
             let phi_expr_overrides = temp_expr_overrides(target_overrides);
             for stmt in &mut stmts {
                 rewrite_stmt_exprs(stmt, &phi_expr_overrides);
+                rewrite_stmt_targets(stmt, target_overrides);
             }
         }
         let range = self.lowering.cfg.blocks[block.index()].instrs;
