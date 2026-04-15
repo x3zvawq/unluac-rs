@@ -369,9 +369,35 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let break_block = if break_exit == loop_context.post_loop
             || Some(break_exit) == loop_context.downstream_post_loop
         {
-            HirBlock {
-                stmts: vec![HirStmt::Break],
-            }
+            // 当 break 路径上存在中间块（如 `found = {i,j}; break`），需要提取
+            // 中间块的指令前缀到 break 之前，避免丢失赋值等副作用。
+            // 仅处理 else_entry 直跳 break_exit 的单块线性情形。
+            let pad_stmts = if let Some(else_entry) =
+                candidate.else_entry.filter(|e| *e != break_exit)
+            {
+                let is_direct_jump = self.block_terminator(else_entry).is_some_and(|(_, instr)| {
+                    if let LowInstr::Jump(jump) = instr {
+                        let target = self.lowering.cfg.instr_to_block[jump.target.index()];
+                        target == break_exit
+                            || Some(target) == loop_context.downstream_post_loop
+                    } else {
+                        false
+                    }
+                });
+                if is_direct_jump {
+                    self.lower_block_prefix(else_entry, false, target_overrides)
+                        .inspect(|_| {
+                            self.visited.insert(else_entry);
+                        })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let mut stmts = pad_stmts.unwrap_or_default();
+            stmts.push(HirStmt::Break);
+            HirBlock { stmts }
         } else {
             loop_context.break_exits[&break_exit].clone()
         };
