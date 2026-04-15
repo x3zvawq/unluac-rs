@@ -688,13 +688,18 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .collect()
     }
 
+    /// 返回 (expr_overrides, all_prefix_temps)，其中：
+    /// - `expr_overrides`：前缀指令能成功内联的 temp → 表达式映射
+    /// - `all_prefix_temps`：前缀指令定义的所有 temp 集合
+    ///
+    /// 调用方可通过 `all_prefix_temps - expr_overrides.keys()` 得到"无法内联的前缀 temp"。
     pub(super) fn block_prefix_temp_expr_overrides(
         &self,
         block: BlockRef,
-    ) -> BTreeMap<TempId, HirExpr> {
+    ) -> (BTreeMap<TempId, HirExpr>, BTreeSet<TempId>) {
         let range = self.lowering.cfg.blocks[block.index()].instrs;
         if range.is_empty() {
-            return BTreeMap::new();
+            return (BTreeMap::new(), BTreeSet::new());
         }
 
         let end = if let Some((_instr_ref, instr)) = self.block_terminator(block) {
@@ -708,20 +713,23 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         };
 
         let mut expr_overrides = BTreeMap::new();
+        let mut all_prefix_temps = BTreeSet::new();
         for instr_index in range.start.index()..end {
             let instr_ref = InstrRef(instr_index);
             if self.overrides.instr_is_suppressed(instr_ref) {
                 continue;
             }
             for def in &self.lowering.dataflow.instr_defs[instr_index] {
+                let temp = self.lowering.bindings.fixed_temps[def.index()];
+                all_prefix_temps.insert(temp);
                 let Some(mut expr) = expr_for_fixed_def(self.lowering, *def) else {
                     continue;
                 };
                 rewrite_expr_temps(&mut expr, &expr_overrides);
-                expr_overrides.insert(self.lowering.bindings.fixed_temps[def.index()], expr);
+                expr_overrides.insert(temp, expr);
             }
         }
 
-        expr_overrides
+        (expr_overrides, all_prefix_temps)
     }
 }

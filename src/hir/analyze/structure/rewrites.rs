@@ -4,33 +4,35 @@
 //! 结构已经确定之后，把 loop state/temp 身份同步改写到同一批 HIR 语句里。
 //! 单独拆出来之后，主流程文件更容易看出控制流决策，重写细节也更容易局部维护。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cfg::DefId;
 use crate::hir::common::{HirExpr, HirLValue, HirStmt, TempId};
 
-/// 检查表达式中是否仍残留未被替换的 `TempRef`。
+/// 检查表达式中是否引用了给定集合中的 `TempRef`。
 ///
 /// 当循环头部前缀包含无法内联的指令（如多返回值调用）时，
-/// `block_prefix_temp_expr_overrides` 无法为所有 temp 生成 override，
-/// 条件表达式里就会残留 TempRef 节点。这个 helper 用来检测这种情况，
-/// 驱动 `lower_while_loop` 回退到 `while true + if-break` 模式。
-pub(super) fn expr_has_temp_ref(expr: &HirExpr) -> bool {
-    if matches!(expr, HirExpr::TempRef(_)) {
-        return true;
+/// `block_prefix_temp_expr_overrides` 无法为所有 prefix 内 temp 生成 override，
+/// 经过 `rewrite_expr_temps` 之后条件表达式里就会残留指向 prefix 内部的 TempRef。
+/// 但指向 prefix 外部（如局部变量、upvalue）的 TempRef 是合法的，不应触发回退。
+/// 调用方应传入"前缀中未被解析的 temp 集合"（prefix 定义但不在 override map 中的 temp），
+/// 只有当条件引用了这个集合里的 temp 才需要回退到 `while true + if-break` 模式。
+pub(super) fn expr_has_temp_ref_in(expr: &HirExpr, unresolvable: &BTreeSet<TempId>) -> bool {
+    if let HirExpr::TempRef(temp) = expr {
+        return unresolvable.contains(temp);
     }
     let mut found = false;
     traverse_hir_expr_children!(
         expr,
         iter = iter,
         borrow = [&],
-        expr(e) => { if expr_has_temp_ref(e) { found = true; } },
+        expr(e) => { if expr_has_temp_ref_in(e, unresolvable) { found = true; } },
         call(c) => {
             traverse_hir_call_children!(
                 c,
                 iter = iter,
                 borrow = [&],
-                expr(e) => { if expr_has_temp_ref(e) { found = true; } }
+                expr(e) => { if expr_has_temp_ref_in(e, unresolvable) { found = true; } }
             );
         },
         decision(d) => {
@@ -38,8 +40,8 @@ pub(super) fn expr_has_temp_ref(expr: &HirExpr) -> bool {
                 d,
                 iter = iter,
                 borrow = [&],
-                expr(e) => { if expr_has_temp_ref(e) { found = true; } },
-                condition(cond) => { if expr_has_temp_ref(cond) { found = true; } }
+                expr(e) => { if expr_has_temp_ref_in(e, unresolvable) { found = true; } },
+                condition(cond) => { if expr_has_temp_ref_in(cond, unresolvable) { found = true; } }
             );
         },
         table_constructor(t) => {
@@ -48,7 +50,7 @@ pub(super) fn expr_has_temp_ref(expr: &HirExpr) -> bool {
                 iter = iter,
                 opt = as_ref,
                 borrow = [&],
-                expr(e) => { if expr_has_temp_ref(e) { found = true; } }
+                expr(e) => { if expr_has_temp_ref_in(e, unresolvable) { found = true; } }
             );
         }
     );
