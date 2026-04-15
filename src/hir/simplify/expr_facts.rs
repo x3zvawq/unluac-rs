@@ -70,6 +70,30 @@ pub(super) fn expr_truthiness(expr: &HirExpr) -> Option<bool> {
         | HirExpr::Complex { .. }
         | HirExpr::Closure(_)
         | HirExpr::TableConstructor(_) => Some(true),
+        // `a or b`: a 为真则返回 a（真），a 为假则返回 b。
+        // 因此只要 a 或 b 其中一个恒真，整个表达式就恒真；
+        // a 恒假时结果完全取决于 b。
+        HirExpr::LogicalOr(logical) => {
+            let a = expr_truthiness(&logical.lhs);
+            let b = expr_truthiness(&logical.rhs);
+            match (a, b) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), b_val) => b_val,
+                _ => None,
+            }
+        }
+        // `a and b`: a 为假则返回 a（假），a 为真则返回 b。
+        // 因此只要 a 或 b 其中一个恒假，整个表达式就恒假；
+        // a 恒真时结果完全取决于 b。
+        HirExpr::LogicalAnd(logical) => {
+            let a = expr_truthiness(&logical.lhs);
+            let b = expr_truthiness(&logical.rhs);
+            match (a, b) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), b_val) => b_val,
+                _ => None,
+            }
+        }
         HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)
         | HirExpr::UpvalueRef(_)
@@ -78,8 +102,6 @@ pub(super) fn expr_truthiness(expr: &HirExpr) -> Option<bool> {
         | HirExpr::TableAccess(_)
         | HirExpr::Unary(_)
         | HirExpr::Binary(_)
-        | HirExpr::LogicalAnd(_)
-        | HirExpr::LogicalOr(_)
         | HirExpr::Decision(_)
         | HirExpr::Call(_)
         | HirExpr::VarArg
@@ -110,12 +132,22 @@ fn decision_target_is_boolean(target: &HirDecisionTarget) -> bool {
     }
 }
 
-/// 折叠关联重复 `and`：`(a and b) and a` → `a and b`。
+/// 折叠关联重复 `and`。
+///
+/// 仅允许"不改变短路求值顺序"的两种形态：
+/// - `(a and b) and b` → `a and b`：b 从内层已经被求值，外层重复冗余
+/// - `a and (a and b)` → `a and b`：内层首项和外层相同，先 guard 再 guard 等价
+///
+/// 不能折叠 `(a and b) and a` 和 `a and (b and a)`：
+/// 前者改变了结果值（truthy 时返回 a 而非 b），后者丢掉了 a 对 b 的短路保护
+/// （若 a 为 nil/false 而 b 含比较，b 会运行时报错）。
 pub(super) fn fold_associative_duplicate_and(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
     match lhs {
-        HirExpr::LogicalAnd(inner) if rhs == &inner.lhs || rhs == &inner.rhs => Some(lhs.clone()),
+        // (a and b) and b → a and b
+        HirExpr::LogicalAnd(inner) if *rhs == inner.rhs => Some(lhs.clone()),
         _ => match rhs {
-            HirExpr::LogicalAnd(inner) if lhs == &inner.lhs || lhs == &inner.rhs => {
+            // a and (a and b) → a and b
+            HirExpr::LogicalAnd(inner) if *lhs == inner.lhs => {
                 Some(rhs.clone())
             }
             _ => None,
@@ -123,12 +155,21 @@ pub(super) fn fold_associative_duplicate_and(lhs: &HirExpr, rhs: &HirExpr) -> Op
     }
 }
 
-/// 折叠关联重复 `or`：`(a or b) or a` → `a or b`。
+/// 折叠关联重复 `or`。
+///
+/// 仅允许"不改变短路求值顺序"的两种形态：
+/// - `(a or b) or b` → `a or b`
+/// - `a or (a or b)` → `a or b`
+///
+/// 不能折叠 `(a or b) or a` 和 `a or (b or a)`：
+/// 前者 falsy 路径返回值不同（a vs b），后者丢掉了 a 对 b 的优先拦截。
 pub(super) fn fold_associative_duplicate_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
     match lhs {
-        HirExpr::LogicalOr(inner) if rhs == &inner.lhs || rhs == &inner.rhs => Some(lhs.clone()),
+        // (a or b) or b → a or b
+        HirExpr::LogicalOr(inner) if *rhs == inner.rhs => Some(lhs.clone()),
         _ => match rhs {
-            HirExpr::LogicalOr(inner) if lhs == &inner.lhs || lhs == &inner.rhs => {
+            // a or (a or b) → a or b
+            HirExpr::LogicalOr(inner) if *lhs == inner.lhs => {
                 Some(rhs.clone())
             }
             _ => None,
