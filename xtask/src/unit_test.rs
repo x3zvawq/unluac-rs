@@ -114,12 +114,16 @@ struct UnitCaseExecution {
     outcome: UnitCaseOutcome,
     classification: Option<String>,
     rendered_failure: Option<String>,
+    proto_count: usize,
+    failed_proto_tags: Vec<String>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 struct MachineFailure {
     classification: String,
     rendered: String,
+    proto_count: usize,
+    failed_proto_tags: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -291,12 +295,14 @@ impl Reporter {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_failure(
         &self,
         counts: ProgressCounts,
         case: &UnitCaseDescriptor,
         outcome: UnitCaseOutcome,
         rendered_failure: Option<&str>,
+        failed_proto_tags: &[String],
         timeout_seconds: u64,
         output_mode: FailureOutputMode,
     ) {
@@ -306,6 +312,7 @@ impl Reporter {
                 counts,
                 case,
                 rendered_failure.unwrap_or("runner exited with failure but did not report details"),
+                failed_proto_tags,
                 output_mode,
             ),
             UnitCaseOutcome::Passed => return,
@@ -323,14 +330,17 @@ impl Reporter {
         failed: usize,
         timed_out: usize,
         failure_counts: &BTreeMap<String, usize>,
+        total_protos: usize,
+        failed_protos: usize,
     ) {
         if let ReporterMode::Interactive(progress) = &self.mode {
             progress.finish_and_clear();
         }
 
         let passed = total - failed;
+        let passed_protos = total_protos.saturating_sub(failed_protos);
         eprintln!(
-            "unit runner finished: total={}, passed={}, failed={}, timed_out={}",
+            "unit runner finished: files: total={}, passed={}, failed={}, timed_out={}",
             total,
             self.palette.green(passed.to_string()),
             if failed == 0 {
@@ -344,6 +354,18 @@ impl Reporter {
                 self.palette.yellow(timed_out.to_string())
             },
         );
+        if total_protos > 0 {
+            eprintln!(
+                "                     protos: total={}, passed={}, failed={}",
+                total_protos,
+                self.palette.green(passed_protos.to_string()),
+                if failed_protos == 0 {
+                    self.palette.green(failed_protos.to_string())
+                } else {
+                    self.palette.red(failed_protos.to_string())
+                },
+            );
+        }
 
         if failure_counts.is_empty() {
             return;
@@ -389,28 +411,36 @@ impl Reporter {
         counts: ProgressCounts,
         case: &UnitCaseDescriptor,
         raw: &str,
+        failed_proto_tags: &[String],
         output_mode: FailureOutputMode,
     ) -> String {
         let normalized = normalize_runner_failure(raw, case, output_mode);
+        let tag_suffix = if failed_proto_tags.is_empty() {
+            String::new()
+        } else {
+            format!("\t[{}]", failed_proto_tags.join(", "))
+        };
         match output_mode {
             FailureOutputMode::Simple => format!(
-                "{} [{}/{}]\tdialect: {}\tcase: {}\t{}",
+                "{} [{}/{}]\tdialect: {}\tcase: {}\t{}{}",
                 self.palette.red("FAIL"),
                 counts.completed,
                 counts.total,
                 self.palette.cyan(&case.dialect),
                 case.path,
-                self.palette.red(normalized)
+                self.palette.red(&normalized),
+                self.palette.yellow(&tag_suffix),
             ),
             FailureOutputMode::Verbose => {
                 let mut lines = Vec::new();
                 lines.push(format!(
-                    "{} [{}/{}]\tdialect: {}\tcase: {}",
+                    "{} [{}/{}]\tdialect: {}\tcase: {}{}",
                     self.palette.red("FAIL"),
                     counts.completed,
                     counts.total,
                     self.palette.cyan(&case.dialect),
-                    case.path
+                    case.path,
+                    self.palette.yellow(&tag_suffix),
                 ));
                 lines.extend(
                     normalized
@@ -500,6 +530,8 @@ where
     let mut timed_out = 0usize;
     let mut failure_counts = BTreeMap::new();
     let mut worker_error = None;
+    let mut total_protos = 0usize;
+    let mut failed_protos = 0usize;
 
     while completed < total && worker_error.is_none() {
         match event_rx.recv() {
@@ -525,9 +557,13 @@ where
                 );
 
                 match execution.outcome {
-                    UnitCaseOutcome::Passed => {}
+                    UnitCaseOutcome::Passed => {
+                        total_protos += execution.proto_count;
+                    }
                     UnitCaseOutcome::Failed => {
                         failed += 1;
+                        total_protos += execution.proto_count;
+                        failed_protos += execution.failed_proto_tags.len();
                         if let Some(classification) = execution.classification {
                             *failure_counts.entry(classification).or_insert(0) += 1;
                         }
@@ -536,6 +572,7 @@ where
                             &case,
                             execution.outcome,
                             execution.rendered_failure.as_deref(),
+                            &execution.failed_proto_tags,
                             options.timeout_seconds,
                             options.output,
                         );
@@ -549,6 +586,7 @@ where
                             &case,
                             execution.outcome,
                             execution.rendered_failure.as_deref(),
+                            &execution.failed_proto_tags,
                             options.timeout_seconds,
                             options.output,
                         );
@@ -588,7 +626,7 @@ where
         bail!("{error}");
     }
 
-    reporter.finish(total, failed, timed_out, &failure_counts);
+    reporter.finish(total, failed, timed_out, &failure_counts, total_protos, failed_protos);
 
     if failed == 0 {
         Ok(())
@@ -949,17 +987,24 @@ fn run_unit_case_with_timeout(
                 .wait_with_output()
                 .with_context(|| format!("failed to read `{}` output", runner.display()))?;
             return match status.code() {
-                Some(0) => Ok(UnitCaseExecution {
-                    outcome: UnitCaseOutcome::Passed,
-                    classification: None,
-                    rendered_failure: None,
-                }),
+                Some(0) => {
+                    let proto_count = parse_machine_success(&output);
+                    Ok(UnitCaseExecution {
+                        outcome: UnitCaseOutcome::Passed,
+                        classification: None,
+                        rendered_failure: None,
+                        proto_count,
+                        failed_proto_tags: Vec::new(),
+                    })
+                }
                 Some(1) => {
                     let failure = parse_machine_failure(&output)?;
                     Ok(UnitCaseExecution {
                         outcome: UnitCaseOutcome::Failed,
                         classification: Some(failure.classification),
                         rendered_failure: Some(failure.rendered),
+                        proto_count: failure.proto_count,
+                        failed_proto_tags: failure.failed_proto_tags,
                     })
                 }
                 _ => bail!(
@@ -984,6 +1029,8 @@ fn run_unit_case_with_timeout(
                 outcome: UnitCaseOutcome::TimedOut,
                 classification: Some("timed-out".to_owned()),
                 rendered_failure: (!rendered_failure.trim().is_empty()).then_some(rendered_failure),
+                proto_count: 0,
+                failed_proto_tags: Vec::new(),
             });
         }
 
@@ -991,24 +1038,65 @@ fn run_unit_case_with_timeout(
     }
 }
 
+/// 解析 machine 模式成功输出中的 `proto-count` 行。
+fn parse_machine_success(output: &std::process::Output) -> usize {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(v) = line.strip_prefix("proto-count\t") {
+            return v.trim().parse().unwrap_or(0);
+        }
+    }
+    0
+}
+
+/// 解析 machine 模式失败输出：支持 `kind`、`proto-count`、`failed-protos` 三种头部行，
+/// 余下内容作为渲染后的失败详情。
 fn parse_machine_failure(output: &std::process::Output) -> Result<MachineFailure> {
     let stdout = String::from_utf8(output.stdout.clone())
         .context("unit case runner machine output is not valid UTF-8")?;
     let trimmed = stdout.trim_end_matches('\n');
-    let (header, rendered) = trimmed
-        .split_once('\n')
-        .context("unit case runner machine output is missing rendered failure content")?;
-    let classification = header
-        .strip_prefix("kind\t")
+
+    let mut classification = None;
+    let mut proto_count = 0usize;
+    let mut failed_proto_tags = Vec::new();
+    let mut body_start = 0usize;
+
+    for (i, line) in trimmed.lines().enumerate() {
+        if let Some(v) = line.strip_prefix("kind\t") {
+            classification = Some(v.trim().to_owned());
+            body_start = i + 1;
+        } else if let Some(v) = line.strip_prefix("proto-count\t") {
+            proto_count = v.trim().parse().unwrap_or(0);
+            body_start = i + 1;
+        } else if let Some(v) = line.strip_prefix("failed-protos\t") {
+            failed_proto_tags = v
+                .split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
+            body_start = i + 1;
+        } else {
+            break;
+        }
+    }
+
+    let classification = classification
         .context("unit case runner machine output is missing kind header")?;
-    let rendered = rendered.trim();
-    if classification.trim().is_empty() || rendered.is_empty() {
+    let rendered: String = trimmed
+        .lines()
+        .skip(body_start)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let rendered = rendered.trim().to_owned();
+    if classification.is_empty() || rendered.is_empty() {
         bail!("unit case runner machine output contained an empty failure payload");
     }
 
     Ok(MachineFailure {
-        classification: classification.trim().to_owned(),
-        rendered: rendered.to_owned(),
+        classification,
+        rendered,
+        proto_count,
+        failed_proto_tags,
     })
 }
 
@@ -1234,6 +1322,28 @@ mod tests {
             MachineFailure {
                 classification: "generated-output-mismatch".to_owned(),
                 rendered: "tests/example.lua :: mismatch".to_owned(),
+                proto_count: 0,
+                failed_proto_tags: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_machine_failure_should_decode_proto_stats() {
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: b"kind\tgenerated-output-mismatch\nproto-count\t5\nfailed-protos\tcommon_01#2,common_01#4\ntests/example.lua :: mismatch".to_vec(),
+            stderr: Vec::new(),
+        };
+        let failure = parse_machine_failure(&output).expect("machine output should parse");
+
+        assert_eq!(
+            failure,
+            MachineFailure {
+                classification: "generated-output-mismatch".to_owned(),
+                rendered: "tests/example.lua :: mismatch".to_owned(),
+                proto_count: 5,
+                failed_proto_tags: vec!["common_01#2".to_owned(), "common_01#4".to_owned()],
             }
         );
     }

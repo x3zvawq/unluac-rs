@@ -81,13 +81,25 @@ fn run() -> Result<ExitKind, String> {
             })?;
 
             match run_unit_case(spec) {
-                Ok(()) => Ok(ExitKind::Success),
+                Ok(success) => {
+                    if report == ReportFormat::Machine {
+                        println!("proto-count\t{}", success.proto_count);
+                    }
+                    Ok(ExitKind::Success)
+                }
                 Err(failure) => {
                     let rendered = format_case_failure(spec.entry.path, &failure);
                     match report {
                         ReportFormat::Human => eprintln!("{rendered}"),
                         ReportFormat::Machine => {
                             println!("kind\t{}", failure.kind().label());
+                            println!("proto-count\t{}", failure.proto_count());
+                            if !failure.failed_proto_tags().is_empty() {
+                                println!(
+                                    "failed-protos\t{}",
+                                    failure.failed_proto_tags().join(",")
+                                );
+                            }
                             print!("{rendered}");
                             if !rendered.ends_with('\n') {
                                 println!();

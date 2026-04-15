@@ -208,10 +208,17 @@ impl FailureKind {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TestSuccess {
+    pub proto_count: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TestFailure {
     kind: FailureKind,
     summary: String,
     detail: String,
+    proto_count: usize,
+    failed_proto_tags: Vec<String>,
 }
 
 impl TestFailure {
@@ -220,7 +227,19 @@ impl TestFailure {
             kind,
             summary: summary.into(),
             detail: detail.into(),
+            proto_count: 0,
+            failed_proto_tags: Vec::new(),
         }
+    }
+
+    fn with_proto_stats(
+        mut self,
+        proto_count: usize,
+        failed_proto_tags: Vec<String>,
+    ) -> Self {
+        self.proto_count = proto_count;
+        self.failed_proto_tags = failed_proto_tags;
+        self
     }
 
     pub fn kind(&self) -> FailureKind {
@@ -233,6 +252,14 @@ impl TestFailure {
 
     pub fn detail(&self) -> &str {
         &self.detail
+    }
+
+    pub fn proto_count(&self) -> usize {
+        self.proto_count
+    }
+
+    pub fn failed_proto_tags(&self) -> &[String] {
+        &self.failed_proto_tags
     }
 }
 
@@ -306,7 +333,7 @@ pub fn find_unit_case_spec(
     })
 }
 
-pub fn run_unit_case(spec: UnitCaseSpec) -> Result<(), TestFailure> {
+pub fn run_unit_case(spec: UnitCaseSpec) -> Result<TestSuccess, TestFailure> {
     match spec.suite {
         UnitSuite::CaseHealth => run_case_health(&spec.entry),
         UnitSuite::DecompilePipelineHealth => run_decompile_pipeline_health(&spec.entry),
@@ -485,13 +512,15 @@ pub(crate) fn build_case_health_baseline(
     Ok(CaseHealthBaseline { source_output })
 }
 
-pub(crate) fn run_case_health(entry: &LuaCaseManifestEntry) -> Result<(), TestFailure> {
-    build_case_health_baseline(entry, UnitSuite::CaseHealth.label()).map(|_| ())
+pub(crate) fn run_case_health(entry: &LuaCaseManifestEntry) -> Result<TestSuccess, TestFailure> {
+    let baseline = build_case_health_baseline(entry, UnitSuite::CaseHealth.label())?;
+    let proto_count = count_output_tags(&baseline.source_output.stdout);
+    Ok(TestSuccess { proto_count })
 }
 
 pub(crate) fn run_decompile_pipeline_health(
     entry: &LuaCaseManifestEntry,
-) -> Result<(), TestFailure> {
+) -> Result<TestSuccess, TestFailure> {
     let dialect_label = entry.dialect.as_str();
     let suite_label = UnitSuite::DecompilePipelineHealth.label();
     let toolchain = lua_toolchain(dialect_label).map_err(|error| {
@@ -633,6 +662,8 @@ pub(crate) fn run_decompile_pipeline_health(
         "generated-artifact",
         &generated_output,
     ) {
+        let proto_count = count_output_tags(&baseline.source_output.stdout);
+        let failed_tags = diff_output_tags(&baseline.source_output.stdout, &generated_output.stdout);
         let summary = format!(
             "generated output mismatch (runtime artifact: {})",
             repo_relative_display(generated_runtime_path),
@@ -647,7 +678,7 @@ pub(crate) fn run_decompile_pipeline_health(
                 repo_relative_display(generated_runtime_path),
                 generated.source
             ),
-        ));
+        ).with_proto_stats(proto_count, failed_tags));
     }
 
     // 重编译轮次：拿上一轮生成的源码，再走一遍 compile → decompile → compile → run → 对比 baseline，
@@ -834,6 +865,8 @@ pub(crate) fn run_decompile_pipeline_health(
             &format!("{round_label}-regen"),
             &regen_output,
         ) {
+            let proto_count = count_output_tags(&baseline.source_output.stdout);
+            let failed_tags = diff_output_tags(&baseline.source_output.stdout, &regen_output.stdout);
             let summary = format!(
                 "[{round_label}] regen output mismatch (runtime artifact: {})",
                 repo_relative_display(regen_runtime_path),
@@ -845,13 +878,14 @@ pub(crate) fn run_decompile_pipeline_health(
                     "{summary}\n{diff}\ngenerated source:\n{}",
                     recompile_generated.source,
                 ),
-            ));
+            ).with_proto_stats(proto_count, failed_tags));
         }
 
         prev_generated_source = recompile_generated.source.clone();
     }
 
-    Ok(())
+    let proto_count = count_output_tags(&baseline.source_output.stdout);
+    Ok(TestSuccess { proto_count })
 }
 
 /// 使用 vendored 的 `luac` 把某个仓库内 Lua case 编译成测试 chunk。
@@ -987,6 +1021,59 @@ pub(crate) fn diff_command_outputs(
     }
 
     (!diffs.is_empty()).then(|| diffs.join("\n"))
+}
+
+/// 从 stdout 行中提取 `file#N` 风格标签（每行第一个 tab 之前的字段，需包含 `#`）。
+fn extract_line_tag(line: &str) -> Option<&str> {
+    let field = line.split('\t').next()?;
+    if field.contains('#') { Some(field) } else { None }
+}
+
+/// 统计 stdout 中出现过的不重复 tag 数量，即文件内的 proto 数量。
+fn count_output_tags(stdout: &[u8]) -> usize {
+    let text = String::from_utf8_lossy(stdout);
+    let mut seen = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        if let Some(tag) = extract_line_tag(line) {
+            seen.insert(tag.to_owned());
+        }
+    }
+    seen.len()
+}
+
+/// 按 tag 对比两份 stdout，返回不一致的 tag 列表。
+fn diff_output_tags(expected_stdout: &[u8], actual_stdout: &[u8]) -> Vec<String> {
+    use std::collections::BTreeMap;
+
+    fn group_by_tag(stdout: &[u8]) -> BTreeMap<String, Vec<String>> {
+        let text = String::from_utf8_lossy(stdout);
+        let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for line in text.lines() {
+            if let Some(tag) = extract_line_tag(line) {
+                map.entry(tag.to_owned()).or_default().push(line.to_owned());
+            }
+        }
+        map
+    }
+
+    let expected = group_by_tag(expected_stdout);
+    let actual = group_by_tag(actual_stdout);
+    let mut failed = Vec::new();
+
+    // 在 expected 中出现但 actual 不同（或缺失）的 tag
+    for (tag, expected_lines) in &expected {
+        match actual.get(tag) {
+            Some(actual_lines) if actual_lines == expected_lines => {}
+            _ => failed.push(tag.clone()),
+        }
+    }
+    // 在 actual 中出现但 expected 没有的 tag（不应发生，但防御性记录）
+    for tag in actual.keys() {
+        if !expected.contains_key(tag) && !failed.contains(tag) {
+            failed.push(tag.clone());
+        }
+    }
+    failed
 }
 
 fn repo_root() -> &'static PathBuf {
