@@ -347,6 +347,7 @@ fn capture_provenance_upvalue_keeps_parent_name_when_child_local_conflicts() {
                     values: vec![HirExpr::Nil],
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::Closure(Box::new(HirClosureExpr {
                         proto: HirProtoRef(1),
                         captures: vec![HirCapture {
@@ -386,6 +387,7 @@ fn capture_provenance_upvalue_keeps_parent_name_when_child_local_conflicts() {
                     values: vec![HirExpr::UpvalueRef(UpvalueId(0))],
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::LocalRef(LocalId(0))],
                 })),
             ],
@@ -482,6 +484,7 @@ fn capture_provenance_temp_uses_parent_synthetic_local_name() {
         temp_debug_locals: Vec::new(),
         body: HirBlock {
             stmts: vec![HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::UpvalueRef(UpvalueId(0))],
             }))],
         },

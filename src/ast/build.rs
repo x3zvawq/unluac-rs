@@ -7,7 +7,7 @@ mod patterns;
 use std::collections::BTreeSet;
 
 use crate::generate::GenerateMode;
-use crate::hir::{HirBlock, HirGenericFor, HirModule, HirStmt, TempId};
+use crate::hir::{HirBlock, HirExpr, HirGenericFor, HirModule, HirStmt, TempId};
 
 use self::analysis::{
     block_has_continue, collect_close_temps, collect_referenced_temps_in_encounter_order,
@@ -221,16 +221,35 @@ impl<'a> AstLowerer<'a> {
                 }))],
                 1,
             )),
-            HirStmt::Return(ret) => Ok((
-                vec![AstStmt::Return(Box::new(AstReturn {
-                    values: ret
-                        .values
-                        .iter()
-                        .map(|value| self.lower_expr(proto_index, value))
-                        .collect::<Result<Vec<_>, _>>()?,
-                }))],
-                1,
-            )),
+            HirStmt::Return(ret) => {
+                let mut values = ret
+                    .values
+                    .iter()
+                    .map(|value| self.lower_expr(proto_index, value))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                // 当 return 的 value pack 是 Fixed 时（trailing_multiret == false），
+                // 末尾如果是多返回表达式（Call 或 VarArg），需要包裹 SingleValue
+                // 以在源码层面产生 `(expr)` 来截断多返回展开。
+                if !ret.trailing_multiret
+                    && let Some(last) = values.last_mut()
+                {
+                    let needs_truncation = matches!(
+                        ret.values.last(),
+                        Some(HirExpr::Call(call)) if !call.multiret
+                    ) || matches!(ret.values.last(), Some(HirExpr::VarArg));
+
+                    if needs_truncation {
+                        let taken = std::mem::replace(last, AstExpr::Nil);
+                        *last = AstExpr::SingleValue(Box::new(taken));
+                    }
+                }
+
+                Ok((
+                    vec![AstStmt::Return(Box::new(AstReturn { values }))],
+                    1,
+                ))
+            }
             HirStmt::If(if_stmt) => Ok((
                 vec![AstStmt::If(Box::new(AstIf {
                     cond: self.lower_expr(proto_index, &if_stmt.cond)?,

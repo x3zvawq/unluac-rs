@@ -13,6 +13,7 @@ fn simplifies_safe_lua_logical_absorption() {
         entry: HirProtoRef(0),
         protos: vec![dummy_proto(HirBlock {
             stmts: vec![HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::LogicalOr(Box::new(HirLogicalExpr {
                     lhs: HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
                         lhs: HirExpr::TempRef(TempId(0)),
@@ -78,6 +79,7 @@ fn keeps_non_safe_lua_and_or_absorption_shape() {
 fn folds_constant_short_circuit_when_rhs_is_safe() {
     let mut proto = dummy_proto(HirBlock {
         stmts: vec![HirStmt::Return(Box::new(HirReturn {
+            trailing_multiret: false,
             values: vec![HirExpr::LogicalOr(Box::new(HirLogicalExpr {
                 lhs: HirExpr::Boolean(true),
                 rhs: HirExpr::Boolean(false),
@@ -96,6 +98,7 @@ fn folds_constant_short_circuit_when_rhs_is_safe() {
 fn folds_shared_fallback_tail_back_into_single_or_expr() {
     let mut proto = dummy_proto(HirBlock {
         stmts: vec![HirStmt::Return(Box::new(HirReturn {
+            trailing_multiret: false,
             values: vec![HirExpr::LogicalOr(Box::new(HirLogicalExpr {
                 lhs: HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
                     lhs: HirExpr::Unary(Box::new(crate::hir::common::HirUnaryExpr {
@@ -130,6 +133,7 @@ fn factors_shared_tail_across_or_chain() {
     let shared_tail = HirExpr::TempRef(TempId(3));
     let mut proto = dummy_proto(HirBlock {
         stmts: vec![HirStmt::Return(Box::new(HirReturn {
+            trailing_multiret: false,
             values: vec![HirExpr::LogicalOr(Box::new(HirLogicalExpr {
                 lhs: HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
                     lhs: HirExpr::TempRef(TempId(0)),

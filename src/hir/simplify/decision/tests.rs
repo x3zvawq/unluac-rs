@@ -14,6 +14,7 @@ fn collapses_repeated_same_test_in_decision_chain() {
         entry: HirProtoRef(0),
         protos: vec![dummy_proto(HirBlock {
             stmts: vec![HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::Decision(Box::new(HirDecisionExpr {
                     entry: HirDecisionNodeRef(0),
                     nodes: vec![
@@ -61,6 +62,7 @@ fn folds_constant_truthy_decision_to_leaf_expr() {
         entry: HirProtoRef(0),
         protos: vec![dummy_proto(HirBlock {
             stmts: vec![HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::Decision(Box::new(HirDecisionExpr {
                     entry: HirDecisionNodeRef(0),
                     nodes: vec![HirDecisionNode {
@@ -95,6 +97,7 @@ fn specializes_descendant_when_stable_test_truthiness_is_already_known() {
         entry: HirProtoRef(0),
         protos: vec![dummy_proto(HirBlock {
             stmts: vec![HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::Decision(Box::new(HirDecisionExpr {
                     entry: HirDecisionNodeRef(0),
                     nodes: vec![
@@ -171,6 +174,7 @@ fn collapses_value_decision_when_then_branch_is_definitely_truthy() {
         entry: HirProtoRef(0),
         protos: vec![dummy_proto(HirBlock {
             stmts: vec![HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::Decision(Box::new(HirDecisionExpr {
                     entry: HirDecisionNodeRef(0),
                     nodes: vec![
@@ -213,6 +217,7 @@ fn keeps_collapsible_decision_inside_short_circuit_expr_as_value_expr() {
         entry: HirProtoRef(0),
         protos: vec![dummy_proto(HirBlock {
             stmts: vec![HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
                     lhs: HirExpr::TempRef(TempId(1)),
                     rhs: HirExpr::Decision(Box::new(HirDecisionExpr {
@@ -276,6 +281,7 @@ fn keeps_cyclic_value_decision_stable_during_simplify() {
         entry: HirProtoRef(0),
         protos: vec![dummy_proto(HirBlock {
             stmts: vec![HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::Decision(Box::new(HirDecisionExpr {
                     entry: HirDecisionNodeRef(0),
                     nodes: vec![

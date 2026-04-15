@@ -34,6 +34,7 @@ fn promotes_temp_alias_chain_into_single_local() {
                     else_block: None,
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::TempRef(TempId(1))],
                 })),
             ],
@@ -85,6 +86,7 @@ fn promotes_if_merge_temp_into_local_decl() {
                     }),
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::TempRef(TempId(0))],
                 })),
             ],
@@ -216,6 +218,7 @@ fn does_not_promote_self_referential_temp_update_inside_branch() {
                                 ))],
                             })),
                             HirStmt::Return(Box::new(HirReturn {
+                                trailing_multiret: false,
                                 values: vec![HirExpr::TempRef(TempId(0))],
                             })),
                         ],
@@ -270,6 +273,7 @@ fn reuses_existing_local_when_captured_slot_is_rebound_after_capture() {
                     values: vec![HirExpr::Integer(2)],
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::TempRef(TempId(2))],
                 })),
             ],
@@ -337,6 +341,7 @@ fn reuses_existing_local_for_nested_block_rebind_after_capture() {
                     else_block: None,
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::TempRef(TempId(0))],
                 })),
             ],
@@ -451,6 +456,7 @@ fn fold_collapses_branch_assigned_local_into_initializer_expr() {
             }),
         })),
         HirStmt::Return(Box::new(HirReturn {
+            trailing_multiret: false,
             values: vec![HirExpr::LocalRef(LocalId(0))],
         })),
     ];
@@ -556,6 +562,7 @@ fn merge_combines_empty_local_decl_with_adjacent_assign() {
             values: vec![HirExpr::Integer(42)],
         })),
         HirStmt::Return(Box::new(HirReturn {
+            trailing_multiret: false,
             values: vec![HirExpr::LocalRef(LocalId(0))],
         })),
     ];

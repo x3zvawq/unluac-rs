@@ -46,6 +46,7 @@ fn collapses_single_temp_handoff_back_into_original_local() {
                 else_block: None,
             })),
             HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::TempRef(temp)],
             })),
         ],
@@ -100,6 +101,7 @@ fn keeps_multivalue_call_assignments_intact_when_pruning_self_assigns() {
                 values: vec![HirExpr::TempRef(call_result)],
             })),
             HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::TempRef(call_result), HirExpr::TempRef(carried)],
             })),
         ],
@@ -147,6 +149,7 @@ fn keeps_handoff_when_original_local_is_still_used_after_seed() {
                 values: vec![HirExpr::Integer(2)],
             })),
             HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::TempRef(temp)],
             })),
         ],
@@ -199,6 +202,7 @@ fn collapses_single_temp_handoff_back_into_original_temp() {
                 },
             })),
             HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::TempRef(carried)],
             })),
         ],
@@ -242,6 +246,7 @@ fn keeps_single_temp_handoff_when_original_temp_is_still_observable() {
                 values: vec![HirExpr::TempRef(seed)],
             })),
             HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::TempRef(carried), HirExpr::TempRef(seed)],
             })),
         ],
@@ -394,6 +399,7 @@ fn keeps_updated_handoff_when_old_carried_value_stays_observable() {
                 }))],
             })),
             HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::TempRef(next), HirExpr::TempRef(carried)],
             })),
         ],
@@ -435,6 +441,7 @@ fn keeps_updated_handoff_without_direct_writeback() {
                 }))],
             })),
             HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::TempRef(next)],
             })),
         ],
@@ -488,6 +495,7 @@ fn collapses_multi_target_pure_temp_handoff_back_into_original_bindings() {
                 ],
             })),
             HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![
                     HirExpr::TempRef(carried_index),
                     HirExpr::TempRef(carried_total),
@@ -575,6 +583,7 @@ fn collapses_partial_multi_target_handoff_and_keeps_non_alias_seed_parts() {
                 values: vec![HirExpr::TempRef(next_index), HirExpr::TempRef(next_total)],
             })),
             HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![
                     HirExpr::TempRef(next_index),
                     HirExpr::TempRef(next_total),
@@ -648,6 +657,7 @@ fn keeps_partial_multi_target_handoff_when_original_binding_is_still_read() {
                 }))],
             })),
             HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::TempRef(next), HirExpr::TempRef(observer)],
             })),
         ],
@@ -689,6 +699,7 @@ fn keeps_plain_self_assign_without_handoff_rewrite_context() {
                 values: vec![HirExpr::TempRef(temp)],
             })),
             HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::TempRef(temp)],
             })),
         ],
@@ -736,6 +747,7 @@ fn keeps_preserved_current_value_branch_when_single_handoff_rewrite_creates_self
                 }),
             })),
             HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::TempRef(carried)],
             })),
         ],
@@ -887,6 +899,7 @@ fn collapses_goto_mesh_boundary_aliases_back_into_two_carried_slots() {
             })),
             HirStmt::Label(Box::new(HirLabel { id: l5 })),
             HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::TempRef(left_x), HirExpr::TempRef(left_y)],
             })),
         ],

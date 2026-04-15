@@ -361,9 +361,14 @@ pub struct HirClose {
 }
 
 /// 返回语句。
+///
+/// `trailing_multiret` 标记最后一个值是否会展开为多个返回值（对应字节码层面的 Open pack）。
+/// 当为 `false` 时，所有值都是"固定"的，AST 层面需要对末尾的 Call/VarArg 加上 `()`
+/// 来阻止多返回展开（即包裹为 `SingleValue`）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirReturn {
     pub values: Vec<HirExpr>,
+    pub trailing_multiret: bool,
 }
 
 /// if 语句。

@@ -65,6 +65,7 @@ fn greedily_consumes_adjacent_set_list_chunks_in_single_pass() {
                     start_index: 2,
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::TempRef(table)],
                 })),
             ],
@@ -143,6 +144,7 @@ fn reorders_prior_integer_record_when_later_field_unblocks_next_array_slot() {
                     values: vec![HirExpr::Integer(1)],
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::TempRef(table)],
                 })),
             ],
@@ -225,6 +227,7 @@ fn keeps_pending_integer_record_when_set_list_values_advance_array_tail() {
                     start_index: 1,
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::TempRef(table)],
                 })),
             ],
@@ -313,6 +316,7 @@ fn drains_multiple_integer_gaps_after_backfill_in_single_constructor_region() {
                     values: vec![HirExpr::Integer(1)],
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::TempRef(table)],
                 })),
             ],
@@ -395,6 +399,7 @@ fn keeps_record_order_when_open_pack_group_mixes_with_set_list_and_records() {
                     start_index: 1,
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::LocalRef(table_local)],
                 })),
             ],
@@ -481,6 +486,7 @@ fn absorbs_long_set_list_constructor_region_before_terminal_global_handoff() {
                     values: vec![HirExpr::LocalRef(table_local)],
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::GlobalRef(HirGlobalRef {
                         name: "payload".to_owned(),
                     })],
@@ -562,6 +568,7 @@ fn absorbs_terminal_global_handoff_for_single_use_constructor_seed() {
                     values: vec![HirExpr::LocalRef(table_local)],
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::GlobalRef(HirGlobalRef {
                         name: "payload".to_owned(),
                     })],
@@ -701,6 +708,7 @@ fn keeps_constructor_seed_when_binding_is_used_after_handoff() {
                     values: vec![HirExpr::LocalRef(table_local)],
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::LocalRef(table_local)],
                 })),
             ],
@@ -824,6 +832,7 @@ fn folds_set_list_with_trailing_multivalue_into_constructor_tail() {
                     },
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::LocalRef(table_local)],
                 })),
             ],
@@ -919,6 +928,7 @@ fn folds_set_list_with_open_pack_barrier_into_constructor_tail() {
                     start_index: 1,
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::LocalRef(table_local)],
                 })),
             ],
@@ -1070,6 +1080,7 @@ fn folds_mixed_record_and_array_constructor_with_closure_field_and_trailing_mult
                     start_index: 1,
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::LocalRef(table_local)],
                 })),
             ],
@@ -1315,6 +1326,7 @@ fn folds_name_keyed_closure_record_after_set_list_chunk_into_constructor() {
                     }))],
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::LocalRef(table_local)],
                 })),
             ],

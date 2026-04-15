@@ -72,6 +72,7 @@ fn lower_ast_preserves_method_call_alias_scaffolding_for_readability() {
                         },
                     })),
                     HirStmt::Return(Box::new(HirReturn {
+                        trailing_multiret: false,
                         values: vec![HirExpr::ParamRef(ParamId(0))],
                     })),
                 ],
@@ -291,7 +292,7 @@ fn lower_ast_preserves_installer_iife_scaffolding_for_readability() {
                             })],
                             values: vec![HirExpr::LocalRef(LocalId(0))],
                         })),
-                        HirStmt::Return(Box::new(HirReturn { values: vec![] })),
+                        HirStmt::Return(Box::new(HirReturn { trailing_multiret: false, values: vec![] })),
                     ],
                 },
                 children: vec![HirProtoRef(2)],
@@ -319,6 +320,7 @@ fn lower_ast_preserves_installer_iife_scaffolding_for_readability() {
                 local_debug_hints: Vec::new(),
                 body: HirBlock {
                     stmts: vec![HirStmt::Return(Box::new(HirReturn {
+                        trailing_multiret: false,
                         values: vec![HirExpr::ParamRef(ParamId(0))],
                     }))],
                 },

@@ -17,8 +17,11 @@ pub(super) fn assign_stmt(targets: Vec<HirLValue>, values: Vec<HirExpr>) -> HirS
     HirStmt::Assign(Box::new(HirAssign { targets, values }))
 }
 
-pub(super) fn return_stmt(values: Vec<HirExpr>) -> HirStmt {
-    HirStmt::Return(Box::new(HirReturn { values }))
+pub(super) fn return_stmt(values: Vec<HirExpr>, trailing_multiret: bool) -> HirStmt {
+    HirStmt::Return(Box::new(HirReturn {
+        values,
+        trailing_multiret,
+    }))
 }
 
 pub(super) fn goto_stmt(target: HirLabelId) -> HirStmt {

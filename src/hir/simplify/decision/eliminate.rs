@@ -174,7 +174,10 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
         }
         HirStmt::Return(ret) => {
             let (mut prefix, values, changed) = extract_value_exprs(ret.values, state);
-            prefix.push(HirStmt::Return(Box::new(HirReturn { values })));
+            prefix.push(HirStmt::Return(Box::new(HirReturn {
+                values,
+                trailing_multiret: ret.trailing_multiret,
+            })));
             (prefix, changed)
         }
         HirStmt::If(mut if_stmt) => {

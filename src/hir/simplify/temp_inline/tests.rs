@@ -34,6 +34,7 @@ fn removes_immediate_temp_forwarding_chain() {
                 },
             })),
             HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::TempRef(TempId(0))],
             })),
         ],
@@ -63,6 +64,7 @@ fn does_not_inline_across_control_barrier() {
                 id: crate::hir::common::HirLabelId(0),
             })),
             HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::TempRef(TempId(0))],
             })),
         ],
@@ -88,6 +90,7 @@ fn collapses_terminal_forwarding_chain_in_single_proto_pass() {
                 values: vec![HirExpr::TempRef(TempId(0))],
             })),
             HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::TempRef(TempId(1))],
             })),
         ],
@@ -119,6 +122,7 @@ fn does_not_inline_temp_into_nested_return_base_access() {
                 ))],
             })),
             HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::TableAccess(Box::new(
                     crate::hir::common::HirTableAccess {
                         base: HirExpr::TempRef(TempId(0)),
@@ -346,6 +350,7 @@ fn does_not_inline_generic_for_carried_state_update_from_loop_prefix() {
                     },
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::TempRef(TempId(9))],
                 })),
             ],
@@ -412,6 +417,7 @@ fn inlines_named_field_access_base_into_immediate_assign_when_threshold_allows()
                     ))],
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::TableAccess(Box::new(
                         crate::hir::common::HirTableAccess {
                             base: HirExpr::TempRef(TempId(1)),
@@ -484,6 +490,7 @@ fn does_not_chain_access_base_inline_past_single_segment() {
                     ))],
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::TempRef(TempId(2))],
                 })),
             ],
@@ -539,6 +546,7 @@ fn still_inlines_temp_directly_in_index_context() {
                     ))],
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::TempRef(TempId(1))],
                 })),
             ],
@@ -598,6 +606,7 @@ fn preserves_index_context_through_pure_wrapper_layers() {
                     values: vec![HirExpr::ParamRef(crate::hir::common::ParamId(0))],
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::ParamRef(crate::hir::common::ParamId(1))],
                 })),
             ],
@@ -664,6 +673,7 @@ fn does_not_inline_direct_return_when_temp_has_debug_local_hint() {
                 values: vec![HirExpr::Integer(41)],
             })),
             HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::TempRef(TempId(0))],
             })),
         ],
@@ -699,6 +709,7 @@ fn does_not_inline_temp_into_closure_capture() {
                     values: vec![HirExpr::ParamRef(ParamId(0))],
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::Closure(Box::new(HirClosureExpr {
                         proto: HirProtoRef(1),
                         captures: vec![HirCapture {
@@ -835,6 +846,7 @@ fn simplify_module_runs_until_fixed_point() {
                     values: vec![HirExpr::TempRef(TempId(0))],
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
                     values: vec![HirExpr::TempRef(TempId(1))],
                 })),
             ],

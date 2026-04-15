@@ -142,7 +142,17 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
                 let _ = writeln!(output, "{indent}call {}", format_call_expr(&call_stmt.call));
             }
             HirStmt::Return(ret) => {
-                let _ = writeln!(output, "{indent}return {}", format_expr_list(&ret.values));
+                let multiret_hint = if ret.trailing_multiret {
+                    " multiret"
+                } else {
+                    ""
+                };
+                let _ = writeln!(
+                    output,
+                    "{indent}return {}{}",
+                    format_expr_list(&ret.values),
+                    multiret_hint
+                );
             }
             HirStmt::If(if_stmt) => {
                 let _ = writeln!(output, "{indent}if {}", format_expr(&if_stmt.cond));

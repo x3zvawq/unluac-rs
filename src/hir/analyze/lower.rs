@@ -563,18 +563,26 @@ pub(super) fn lower_regular_instr(
         LowInstr::SetList(set_list) => lower_set_list(lowering, block, instr_ref, set_list),
         LowInstr::Call(call) => lower_call(lowering, block, instr_ref, call),
         LowInstr::TailCall(tail_call) => {
-            vec![return_stmt(vec![HirExpr::Call(Box::new(HirCallExpr {
-                callee: expr_for_reg_use(lowering, block, instr_ref, tail_call.callee),
-                args: lower_value_pack(lowering, block, instr_ref, tail_call.args),
-                multiret: true,
-                method: matches!(tail_call.kind, CallKind::Method),
-                method_name: lower_method_name(lowering.proto, tail_call.method_name),
-            }))])]
+            // TailCall 总是展开所有返回值
+            vec![return_stmt(
+                vec![HirExpr::Call(Box::new(HirCallExpr {
+                    callee: expr_for_reg_use(lowering, block, instr_ref, tail_call.callee),
+                    args: lower_value_pack(lowering, block, instr_ref, tail_call.args),
+                    multiret: true,
+                    method: matches!(tail_call.kind, CallKind::Method),
+                    method_name: lower_method_name(lowering.proto, tail_call.method_name),
+                }))],
+                true,
+            )]
         }
         LowInstr::VarArg(vararg) => lower_vararg(lowering, instr_ref, vararg.results),
-        LowInstr::Return(ret) => vec![return_stmt(lower_value_pack(
-            lowering, block, instr_ref, ret.values,
-        ))],
+        LowInstr::Return(ret) => {
+            let trailing_multiret = matches!(ret.values, crate::transformer::ValuePack::Open(_));
+            vec![return_stmt(
+                lower_value_pack(lowering, block, instr_ref, ret.values),
+                trailing_multiret,
+            )]
+        }
         LowInstr::Closure(closure) => fixed_assign(
             lowering,
             instr_ref,
@@ -682,17 +690,24 @@ pub(super) fn lower_control_instr(
                 branch.else_target,
             ))),
         )],
-        LowInstr::Return(ret) => vec![return_stmt(lower_value_pack(
-            lowering, block, instr_ref, ret.values,
-        ))],
+        LowInstr::Return(ret) => {
+            let trailing_multiret = matches!(ret.values, crate::transformer::ValuePack::Open(_));
+            vec![return_stmt(
+                lower_value_pack(lowering, block, instr_ref, ret.values),
+                trailing_multiret,
+            )]
+        }
         LowInstr::TailCall(tail_call) => {
-            vec![return_stmt(vec![HirExpr::Call(Box::new(HirCallExpr {
-                callee: expr_for_reg_use(lowering, block, instr_ref, tail_call.callee),
-                args: lower_value_pack(lowering, block, instr_ref, tail_call.args),
-                multiret: true,
-                method: matches!(tail_call.kind, CallKind::Method),
-                method_name: lower_method_name(lowering.proto, tail_call.method_name),
-            }))])]
+            vec![return_stmt(
+                vec![HirExpr::Call(Box::new(HirCallExpr {
+                    callee: expr_for_reg_use(lowering, block, instr_ref, tail_call.callee),
+                    args: lower_value_pack(lowering, block, instr_ref, tail_call.args),
+                    multiret: true,
+                    method: matches!(tail_call.kind, CallKind::Method),
+                    method_name: lower_method_name(lowering.proto, tail_call.method_name),
+                }))],
+                true,
+            )]
         }
         LowInstr::NumericForInit(instr) => vec![
             assign_stmt(

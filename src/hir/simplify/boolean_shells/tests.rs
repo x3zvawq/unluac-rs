@@ -75,7 +75,7 @@ fn removes_dead_pure_value_materialization_shell() {
                     }))],
                 }),
             })),
-            HirStmt::Return(Box::new(crate::hir::common::HirReturn { values: vec![] })),
+            HirStmt::Return(Box::new(crate::hir::common::HirReturn { trailing_multiret: false, values: vec![] })),
         ],
     });
 
@@ -114,6 +114,7 @@ fn collapses_live_boolean_materialization_shell_into_local_initializer() {
                 }),
             })),
             HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::LocalRef(crate::hir::common::LocalId(0))],
             })),
         ],
@@ -151,6 +152,7 @@ fn booleanizes_truthiness_shell_for_non_boolean_condition() {
                 }),
             })),
             HirStmt::Return(Box::new(HirReturn {
+                trailing_multiret: false,
                 values: vec![HirExpr::TempRef(TempId(0))],
             })),
         ],
