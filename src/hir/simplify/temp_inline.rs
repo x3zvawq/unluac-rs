@@ -190,14 +190,24 @@ fn inline_temps_in_nested_blocks(
             protected_temps,
             inherited_captured_slots,
         ),
-        HirStmt::Repeat(repeat_stmt) => inline_temps_in_block(
-            &mut repeat_stmt.body,
-            scratch,
-            readability,
-            facts,
-            protected_temps,
-            inherited_captured_slots,
-        ),
+        HirStmt::Repeat(repeat_stmt) => {
+            // repeat-until 的 cond 在 body 之后求值，但与 body 共享词法作用域。
+            // body 里定义的 temp 如果同时出现在 cond 里，内联会导致 cond 引用
+            // 到已被消除的 temp。因此将 cond 里提及的所有 temp 加入保护集。
+            let mut repeat_protected = protected_temps.clone();
+            mentioned::collect_expr_mentioned_temps(
+                &repeat_stmt.cond,
+                &mut repeat_protected,
+            );
+            inline_temps_in_block(
+                &mut repeat_stmt.body,
+                scratch,
+                readability,
+                facts,
+                &repeat_protected,
+                inherited_captured_slots,
+            )
+        }
         HirStmt::NumericFor(numeric_for) => inline_temps_in_block(
             &mut numeric_for.body,
             scratch,

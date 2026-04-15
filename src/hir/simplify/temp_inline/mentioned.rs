@@ -145,7 +145,7 @@ fn collect_lvalue_mentioned_temps(lvalue: &HirLValue, temps: &mut BTreeSet<TempI
     }
 }
 
-fn collect_expr_mentioned_temps(expr: &HirExpr, temps: &mut BTreeSet<TempId>) {
+pub(super) fn collect_expr_mentioned_temps(expr: &HirExpr, temps: &mut BTreeSet<TempId>) {
     match expr {
         HirExpr::TempRef(temp) => {
             temps.insert(*temp);
