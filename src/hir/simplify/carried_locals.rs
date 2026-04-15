@@ -37,39 +37,83 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId};
 
+use super::temp_touch::collect_temp_refs_in_stmts;
 use super::visit::{HirVisitor, visit_stmts};
-use super::walk::{HirRewritePass, rewrite_proto, rewrite_stmts};
+use super::walk::{for_each_nested_block_mut, HirRewritePass, rewrite_stmts};
 
 pub(super) fn collapse_carried_local_handoffs_in_proto(proto: &mut HirProto) -> bool {
-    rewrite_proto(proto, &mut CarriedLocalPass)
+    collapse_handoffs_recursive(&mut proto.body, &BTreeSet::new())
 }
 
-struct CarriedLocalPass;
+/// 自定义后序遍历：先递归处理子块（同时把外层 temp 引用集传下去），再在当前块做 handoff 折叠。
+/// `outer_temps` 包含当前块的所有祖先作用域中引用过的 temp，如果一个 temp 在 `outer_temps` 中，
+/// 说明它在当前块外部仍被消费，不能在当前块内被折叠消除。
+fn collapse_handoffs_recursive(
+    block: &mut HirBlock,
+    outer_temps: &BTreeSet<TempId>,
+) -> bool {
+    let mut changed = false;
 
-impl HirRewritePass for CarriedLocalPass {
-    fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
-        collapse_block_handoffs(block)
+    // 为每个嵌套语句预计算"进入该子块时需要保护的 temp 集"。
+    // 对于 index 处的语句，保护集 = 继承的 outer_temps ∪ 本块中「其他语句」引用的 temps。
+    // 注意不能用 `all - self` 来近似——如果某个 temp 同时出现在当前语句和其他语句中，
+    // 差集会把它减掉，导致跨作用域的引用失去保护。这里用前缀+后缀并集来精确计算。
+    let per_stmt_temps: Vec<BTreeSet<TempId>> = block
+        .stmts
+        .iter()
+        .map(|stmt| collect_temp_refs_in_stmts(std::slice::from_ref(stmt)))
+        .collect();
+
+    // 累积前缀 temp 集合
+    let mut prefix_temps = BTreeSet::new();
+    // 预计算完整后缀 temp 集合（逐步缩小）
+    let mut suffix_temps_vec: Vec<BTreeSet<TempId>> = Vec::with_capacity(per_stmt_temps.len());
+    {
+        let mut suffix = BTreeSet::new();
+        for stmt_temps in per_stmt_temps.iter().rev() {
+            suffix_temps_vec.push(suffix.clone());
+            suffix.extend(stmt_temps.iter().copied());
+        }
+        suffix_temps_vec.reverse();
     }
+
+    for (index, _) in per_stmt_temps.iter().enumerate() {
+        let child_outer: BTreeSet<TempId> = outer_temps
+            .union(&prefix_temps)
+            .chain(suffix_temps_vec[index].iter())
+            .copied()
+            .collect();
+
+        for_each_nested_block_mut(&mut block.stmts[index], &mut |nested_block| {
+            changed |= collapse_handoffs_recursive(nested_block, &child_outer);
+        });
+
+        prefix_temps.extend(per_stmt_temps[index].iter().copied());
+    }
+
+    // 后序：子块都处理完之后，再处理当前块的 handoff
+    changed |= collapse_block_handoffs(block, outer_temps);
+    changed
 }
 
-fn collapse_block_handoffs(block: &mut HirBlock) -> bool {
+fn collapse_block_handoffs(block: &mut HirBlock, outer_temps: &BTreeSet<TempId>) -> bool {
     let mut changed = collapse_boundary_alias_classes(block);
     let mut index = 0;
 
     while index < block.stmts.len() {
-        if try_collapse_pure_binding_handoffs(block, index) {
+        if try_collapse_pure_binding_handoffs(block, index, outer_temps) {
             changed = true;
             continue;
         }
-        if try_collapse_single_binding_handoff(block, index) {
+        if try_collapse_single_binding_handoff(block, index, outer_temps) {
             changed = true;
             continue;
         }
-        if try_collapse_pure_local_handoff(block, index) {
+        if try_collapse_pure_local_handoff(block, index, outer_temps) {
             changed = true;
             continue;
         }
-        if try_collapse_binding_update_handoff(block, index) {
+        if try_collapse_binding_update_handoff(block, index, outer_temps) {
             changed = true;
             index += 1;
             continue;
@@ -239,10 +283,23 @@ fn binding_canonical_key(binding: CarryBinding) -> (u8, usize) {
     }
 }
 
-fn try_collapse_pure_binding_handoffs(block: &mut HirBlock, index: usize) -> bool {
+fn try_collapse_pure_binding_handoffs(
+    block: &mut HirBlock,
+    index: usize,
+    outer_temps: &BTreeSet<TempId>,
+) -> bool {
     let Some(seed) = binding_handoff_seed(&block.stmts[index]) else {
         return false;
     };
+
+    // 如果被折叠的 temp 在外层作用域中仍被引用，不能消除
+    if seed
+        .rewrites
+        .iter()
+        .any(|rewrite| outer_temps.contains(&rewrite.from))
+    {
+        return false;
+    }
 
     let suffix = &block.stmts[index + 1..];
     if suffix.is_empty()
@@ -280,10 +337,19 @@ fn try_collapse_pure_binding_handoffs(block: &mut HirBlock, index: usize) -> boo
     true
 }
 
-fn try_collapse_pure_local_handoff(block: &mut HirBlock, index: usize) -> bool {
+fn try_collapse_pure_local_handoff(
+    block: &mut HirBlock,
+    index: usize,
+    outer_temps: &BTreeSet<TempId>,
+) -> bool {
     let Some((temp, local)) = local_handoff_seed(&block.stmts[index]) else {
         return false;
     };
+
+    // 如果被折叠的 temp 在外层作用域中仍被引用，不能消除
+    if outer_temps.contains(&temp) {
+        return false;
+    }
 
     let suffix = &block.stmts[index + 1..];
     if suffix.is_empty()
@@ -302,10 +368,19 @@ fn try_collapse_pure_local_handoff(block: &mut HirBlock, index: usize) -> bool {
     true
 }
 
-fn try_collapse_single_binding_handoff(block: &mut HirBlock, index: usize) -> bool {
+fn try_collapse_single_binding_handoff(
+    block: &mut HirBlock,
+    index: usize,
+    outer_temps: &BTreeSet<TempId>,
+) -> bool {
     let Some((temp, binding)) = single_binding_handoff_seed(&block.stmts[index]) else {
         return false;
     };
+
+    // 如果被折叠的 temp 在外层作用域中仍被引用，不能消除
+    if outer_temps.contains(&temp) {
+        return false;
+    }
 
     let suffix = &block.stmts[index + 1..];
     if suffix.is_empty()
@@ -333,10 +408,19 @@ fn try_collapse_single_binding_handoff(block: &mut HirBlock, index: usize) -> bo
     true
 }
 
-fn try_collapse_binding_update_handoff(block: &mut HirBlock, index: usize) -> bool {
+fn try_collapse_binding_update_handoff(
+    block: &mut HirBlock,
+    index: usize,
+    outer_temps: &BTreeSet<TempId>,
+) -> bool {
     let Some((target_temp, carried)) = update_handoff_seed(&block.stmts[index]) else {
         return false;
     };
+
+    // 如果被折叠的 temp 在外层作用域中仍被引用，不能消除
+    if outer_temps.contains(&target_temp) {
+        return false;
+    }
 
     let suffix = &block.stmts[index + 1..];
     if suffix.is_empty()

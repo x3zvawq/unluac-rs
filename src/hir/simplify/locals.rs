@@ -22,8 +22,9 @@ use super::branch_value_folding::{
     fold_branch_value_locals_in_block, matches_local_lvalue,
 };
 use super::temp_touch::{
-    expr_touches_any_temp, stmt_consumes_temps_only_in_control_head,
-    stmt_contains_nested_nonlocal_control, stmt_touches_any_temp, stmts_touch_temp,
+    collect_temp_refs_in_stmts, expr_touches_any_temp,
+    stmt_consumes_temps_only_in_control_head, stmt_contains_nested_nonlocal_control,
+    stmt_touches_any_temp, stmts_touch_temp,
 };
 use crate::hir::common::{
     HirAssign, HirBlock, HirCallExpr, HirExpr, HirLValue, HirLocalDecl,
@@ -57,6 +58,7 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
         &mut proto.body,
         &BTreeMap::new(),
         &BTreeMap::new(),
+        &BTreeSet::new(),
     );
     proto.locals.extend(new_locals);
     proto.local_debug_hints.extend(new_local_debug_hints);
@@ -172,8 +174,15 @@ fn promote_block(
     block: &mut HirBlock,
     inherited: &BTreeMap<TempId, LocalId>,
     inherited_sticky_slots: &BTreeMap<usize, LocalId>,
+    outer_used_temps: &BTreeSet<TempId>,
 ) -> PromotionResult {
-    let plans = collect_plans(ctx, block, inherited, inherited_sticky_slots);
+    // 预计算后缀 temp 引用集：suffix_temps[i] 包含 stmts[i..] 中出现的所有 temp。
+    // 当递归进入子作用域（while/if/for 等）时，合并 outer_used_temps 和
+    // suffix_temps[i+1] 传给子 promote_block，防止子作用域将外层仍需引用的 temp
+    // 错误地提升为块级局部变量。
+    let suffix_temps = compute_suffix_temp_refs(&block.stmts);
+
+    let plans = collect_plans(ctx, block, inherited, inherited_sticky_slots, outer_used_temps);
     let plan_by_decl = plans.iter().fold(
         BTreeMap::<usize, Vec<&PromotionPlan>>::new(),
         |mut grouped, plan| {
@@ -228,7 +237,15 @@ fn promote_block(
             continue;
         }
 
-        let stmt_changed = rewrite_stmt(ctx, &mut stmt, &mapping, &active_sticky_slots);
+        // 子作用域的 outer temps = 当前块后续语句的 temp 引用 ∪ 来自祖先作用域的保护集
+        let child_outer_temps = merge_temp_sets(outer_used_temps, &suffix_temps[index + 1]);
+        let stmt_changed = rewrite_stmt(
+            ctx,
+            &mut stmt,
+            &mapping,
+            &active_sticky_slots,
+            &child_outer_temps,
+        );
         changed |= stmt_changed;
         rewritten.push(stmt);
     }
@@ -253,6 +270,22 @@ fn promote_block(
         changed,
         trailing_mapping: mapping,
     }
+}
+
+/// 计算后缀 temp 引用集。suffix[i] = stmts[i..] 中出现的所有 temp 的集合。
+fn compute_suffix_temp_refs(stmts: &[HirStmt]) -> Vec<BTreeSet<TempId>> {
+    let mut suffix = vec![BTreeSet::new(); stmts.len() + 1];
+    for i in (0..stmts.len()).rev() {
+        suffix[i] = suffix[i + 1].clone();
+        let stmt_temps = collect_temp_refs_in_stmts(std::slice::from_ref(&stmts[i]));
+        suffix[i].extend(stmt_temps);
+    }
+    suffix
+}
+
+/// 合并两个 temp 集合，返回并集。
+fn merge_temp_sets(a: &BTreeSet<TempId>, b: &BTreeSet<TempId>) -> BTreeSet<TempId> {
+    a.union(b).copied().collect()
 }
 
 // ── 后处理：相邻 local-assign 合并 ───────────────────────────────────
@@ -315,6 +348,7 @@ fn collect_plans(
     block: &HirBlock,
     inherited: &BTreeMap<TempId, LocalId>,
     inherited_sticky_slots: &BTreeMap<usize, LocalId>,
+    outer_used_temps: &BTreeSet<TempId>,
 ) -> Vec<PromotionPlan> {
     if block.stmts.iter().any(|stmt| {
         matches!(
@@ -344,6 +378,12 @@ fn collect_plans(
             continue;
         };
         if reserved_temps.contains(&root_temp) {
+            activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
+            continue;
+        }
+        // 外层作用域仍在引用的 temp 不能在子作用域提升为块级 local，
+        // 否则外层读到的是一个永远未被赋值的孤儿 temp。
+        if outer_used_temps.contains(&root_temp) {
             activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
             continue;
         }
@@ -730,6 +770,7 @@ fn rewrite_stmt(
     stmt: &mut HirStmt,
     mapping: &BTreeMap<TempId, LocalId>,
     sticky_slots: &BTreeMap<usize, LocalId>,
+    outer_used_temps: &BTreeSet<TempId>,
 ) -> bool {
     match stmt {
         HirStmt::LocalDecl(local_decl) => {
@@ -766,23 +807,26 @@ fn rewrite_stmt(
         HirStmt::If(if_stmt) => {
             let cond_changed = rewrite_expr(&mut if_stmt.cond, mapping);
             let then_changed =
-                promote_block(ctx, &mut if_stmt.then_block, mapping, sticky_slots).changed;
+                promote_block(ctx, &mut if_stmt.then_block, mapping, sticky_slots, outer_used_temps)
+                    .changed;
             let else_changed = if_stmt.else_block.as_mut().is_some_and(|else_block| {
-                promote_block(ctx, else_block, mapping, sticky_slots).changed
+                promote_block(ctx, else_block, mapping, sticky_slots, outer_used_temps).changed
             });
             cond_changed || then_changed || else_changed
         }
         HirStmt::While(while_stmt) => {
             let cond_changed = rewrite_expr(&mut while_stmt.cond, mapping);
             let body_changed =
-                promote_block(ctx, &mut while_stmt.body, mapping, sticky_slots).changed;
+                promote_block(ctx, &mut while_stmt.body, mapping, sticky_slots, outer_used_temps)
+                    .changed;
             cond_changed || body_changed
         }
         HirStmt::Repeat(repeat_stmt) => {
             // `repeat ... until` 的条件和 loop body 共享同一个词法作用域。
             // body 里刚刚提升出来的 local 如果不继续带到条件里，条件就会继续挂着旧 temp，
             // 最后得到“body 已经是 l2，until 里还是 t3”这种半截 HIR。
-            let body_result = promote_block(ctx, &mut repeat_stmt.body, mapping, sticky_slots);
+            let body_result =
+                promote_block(ctx, &mut repeat_stmt.body, mapping, sticky_slots, outer_used_temps);
             let cond_changed = rewrite_expr(&mut repeat_stmt.cond, &body_result.trailing_mapping);
             body_result.changed || cond_changed
         }
@@ -791,7 +835,8 @@ fn rewrite_stmt(
             let limit_changed = rewrite_expr(&mut numeric_for.limit, mapping);
             let step_changed = rewrite_expr(&mut numeric_for.step, mapping);
             let body_changed =
-                promote_block(ctx, &mut numeric_for.body, mapping, sticky_slots).changed;
+                promote_block(ctx, &mut numeric_for.body, mapping, sticky_slots, outer_used_temps)
+                    .changed;
             start_changed || limit_changed || step_changed || body_changed
         }
         HirStmt::GenericFor(generic_for) => {
@@ -802,12 +847,16 @@ fn rewrite_stmt(
                     rewrite_expr(expr, mapping) || changed
                 });
             let body_changed =
-                promote_block(ctx, &mut generic_for.body, mapping, sticky_slots).changed;
+                promote_block(ctx, &mut generic_for.body, mapping, sticky_slots, outer_used_temps)
+                    .changed;
             iterator_changed || body_changed
         }
-        HirStmt::Block(block) => promote_block(ctx, block, mapping, sticky_slots).changed,
+        HirStmt::Block(block) => {
+            promote_block(ctx, block, mapping, sticky_slots, outer_used_temps).changed
+        }
         HirStmt::Unstructured(unstructured) => {
-            promote_block(ctx, &mut unstructured.body, mapping, sticky_slots).changed
+            promote_block(ctx, &mut unstructured.body, mapping, sticky_slots, outer_used_temps)
+                .changed
         }
         HirStmt::Break
         | HirStmt::Close(_)

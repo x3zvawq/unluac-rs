@@ -173,3 +173,35 @@ impl HirVisitor for TempTouchCollector<'_> {
         }
     }
 }
+
+// ── temp 引用收集 ────────────────────────────────────────────────────
+
+/// 收集一段语句中所有被引用的 TempId（含读和写，深入子作用域）。
+///
+/// 用于 locals pass 计算"外层仍然在用的 temp 集合"，防止子作用域
+/// 错误地将跨作用域存活的 temp 提升为块级局部变量。
+pub(super) fn collect_temp_refs_in_stmts(stmts: &[HirStmt]) -> BTreeSet<TempId> {
+    let mut collector = TempRefCollector {
+        temps: BTreeSet::new(),
+    };
+    visit_stmts(stmts, &mut collector);
+    collector.temps
+}
+
+struct TempRefCollector {
+    temps: BTreeSet<TempId>,
+}
+
+impl HirVisitor for TempRefCollector {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        if let HirExpr::TempRef(temp) = expr {
+            self.temps.insert(*temp);
+        }
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        if let HirLValue::Temp(temp) = lvalue {
+            self.temps.insert(*temp);
+        }
+    }
+}

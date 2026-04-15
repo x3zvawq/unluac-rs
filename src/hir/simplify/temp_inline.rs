@@ -127,6 +127,7 @@ fn inline_temps_in_block(
                 .and_then(|next_stmt| inline_site_in_stmt(next_stmt, temp))
                 .is_some_and(|site| site.allows(value, readability))
         {
+
             state.temp_uses.remove_from_totals(&mut suffix_use_totals);
             let next_stmt = kept_rev
                 .last_mut()

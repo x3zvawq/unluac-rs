@@ -22,13 +22,19 @@ pub(super) fn protected_temps_for_nested_stmt(
         return protected;
     }
 
-    let prefix_temps = mentioned_temp_set_for_stmt_slice(&stmts[..stmt_index]);
-    if prefix_temps.is_empty() {
-        return protected;
-    }
-
     let nested_temps = mentioned_temp_set_for_stmt(stmt);
+
+    // 前缀中已引用的 temp 如果也出现在嵌套体中，不能在嵌套体内被内联掉，
+    // 否则会把外层定义的值的求值点移进循环。
+    let prefix_temps = mentioned_temp_set_for_stmt_slice(&stmts[..stmt_index]);
     protected.extend(prefix_temps.intersection(&nested_temps).copied());
+
+    // 后缀中引用的 temp 如果也出现在嵌套体中，说明该 temp 在嵌套体中定义、
+    // 在外层后续语句中消费。如果在嵌套体内被内联成另一个 temp，外层的引用
+    // 就会变成孤儿——指向一个不再被赋值的 temp。
+    let suffix_temps = mentioned_temp_set_for_stmt_slice(&stmts[stmt_index + 1..]);
+    protected.extend(suffix_temps.intersection(&nested_temps).copied());
+
     protected
 }
 
