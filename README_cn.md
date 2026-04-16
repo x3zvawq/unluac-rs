@@ -119,6 +119,7 @@ unluac-cli -i /absolute/path/to/chunk.out -D lua5.1 -o /tmp/case.lua
 | `-c`, `--color` | 调试输出颜色模式 | `auto` |
 | `--proto` | 仅输出指定 proto id 的调试结果 | 无 |
 | `-t`, `--timing` | 输出耗时报告 | `false` |
+| `--dump-pass` | 输出指定 pass 的 before/after 快照（逗号分隔，如 `carried-locals,temp-inline`） | 无 |
 
 可读性与命名参数：
 

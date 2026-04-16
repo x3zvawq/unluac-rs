@@ -34,10 +34,30 @@ cargo run -p unluac-cli -- -i /path/to/chunk.out --dump=parse --detail=verbose
 | `--detail` | `summary\|normal\|verbose` |
 | `-t/--timing` | 输出 timing report |
 | `--proto` | 按 proto id 过滤 |
+| `--dump-pass` | 输出指定 pass 的 before/after 快照（逗号分隔） |
 | `-n/--naming-mode` | `debug-like\|simple\|heuristic` |
 | `-c/--color` | `auto\|always\|never` |
 
 约定：`--stop-after` 决定 pipeline 跑到哪层，`--dump` 只打印已到达层；`-o` 只支持纯源码输出，与 debug/timing 冲突时报错。
+
+### 1.1 `--dump-pass` 用法
+
+当需要调试某个具体 pass 的行为时，`--dump-pass` 可以输出该 pass 执行前后每个 proto/function 的文本快照（仅在 pass 产生了变化时输出）。输出到 stderr，不影响正常的 stdout 源码输出。
+
+```bash
+# 查看 carried-locals pass 的 before/after
+cargo unluac -- -s tests/lua_cases/common_11_runtime.lua -D lua5.1 --dump-pass carried-locals
+
+# 同时查看多个 pass
+cargo unluac -- -i chunk.out -D lua5.4 --dump-pass temp-inline,locals,carried-locals
+
+# 配合 --proto 过滤只看某个 proto
+cargo unluac -- -i chunk.out -D lua5.4 --dump-pass temp-inline --proto 2
+```
+
+支持的 HIR pass 名称：`decision`, `boolean-shells`, `logical-simplify`, `table-constructors`, `closure-self-capture`, `temp-inline`, `locals`, `eliminate-decisions`, `close-scopes`, `carried-locals`, `dead-unresolved-temps`, `dead-labels`。
+
+支持的 AST readability pass 名称：`cleanup`, `local-coalesce`, `statement-merge`, `loop-header-merge`, `branch-pretty`, `field-access-sugar`, `inline-exprs`, `short-circuit-pretty`, `materialize-temps`, `installer-iife`, `function-sugar`, `global-decl-pretty`, `luajit-goto-safety`。
 
 ## 2. `cargo unit-test`
 
