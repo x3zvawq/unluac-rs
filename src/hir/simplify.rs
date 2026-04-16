@@ -31,6 +31,15 @@ use crate::readability::ReadabilityOptions;
 use crate::scheduler::{run_invalidation_loop, InvalidationTag, PassDescriptor, PassPhase};
 use crate::timing::TimingCollector;
 
+/// pass dump 需要的参数包，避免在 simplify_hir 签名上增加太多松散参数。
+#[derive(Clone, Default)]
+pub(crate) struct PassDumpConfig {
+    /// 需要 dump 的 pass 名称集合（空则不启用 dump）。
+    pub pass_names: Vec<String>,
+    /// proto 过滤。
+    pub proto_filter: Option<usize>,
+}
+
 const MAX_SIMPLIFY_ITERATIONS: usize = 128;
 
 /// HIR 化简阶段的粗粒度变化标签。
@@ -166,13 +175,22 @@ pub(super) fn simplify_hir(
     promotion_facts: &[ProtoPromotionFacts],
     generate_mode: GenerateMode,
     dialect: crate::ast::AstDialectVersion,
+    dump_config: &PassDumpConfig,
 ) {
     let empty_facts = ProtoPromotionFacts::default();
+    let dump_active = !dump_config.pass_names.is_empty();
 
     run_invalidation_loop(
         PASS_DESCRIPTORS,
         |index, name| {
-            timings.record(name, || {
+            // 如果当前 pass 在 dump 列表中，先快照 before
+            let before_snapshots = if dump_active && dump_config.pass_names.iter().any(|p| p == name) {
+                Some(capture_hir_snapshots(module, dump_config.proto_filter))
+            } else {
+                None
+            };
+
+            let changed = timings.record(name, || {
                 apply_proto_pass(module, |proto| {
                     let facts = promotion_facts
                         .get(proto.id.index())
@@ -193,7 +211,14 @@ pub(super) fn simplify_hir(
                         _ => unreachable!("invalid HIR pass index: {index}"),
                     }
                 })
-            })
+            });
+
+            // pass 产生变化时输出 before/after diff
+            if let Some(before) = before_snapshots.filter(|_| changed) {
+                emit_hir_pass_diff(name, &before, module, dump_config.proto_filter);
+            }
+
+            changed
         },
         MAX_SIMPLIFY_ITERATIONS,
     );
@@ -220,6 +245,36 @@ fn apply_proto_pass(
         changed |= pass(proto);
     }
     changed
+}
+
+/// 拍摄所有（或指定）proto 的文本快照，用于 pass dump before/after 对比。
+fn capture_hir_snapshots(module: &HirModule, proto_filter: Option<usize>) -> Vec<(usize, String)> {
+    module
+        .protos
+        .iter()
+        .filter(|proto| proto_filter.is_none_or(|f| f == proto.id.index()))
+        .map(|proto| (proto.id.index(), super::debug::dump_proto_snapshot(proto)))
+        .collect()
+}
+
+/// 对比 before 快照与当前 module 状态，输出有变化的 proto 到 stderr。
+fn emit_hir_pass_diff(
+    pass_name: &str,
+    before: &[(usize, String)],
+    module: &HirModule,
+    proto_filter: Option<usize>,
+) {
+    let after = capture_hir_snapshots(module, proto_filter);
+    for ((idx, before_text), (_, after_text)) in before.iter().zip(after.iter()) {
+        if before_text != after_text {
+            eprintln!("=== [hir] pass={pass_name} proto#{idx} CHANGED ===");
+            eprintln!("--- before ---");
+            eprint!("{before_text}");
+            eprintln!("--- after ---");
+            eprint!("{after_text}");
+            eprintln!("=== end ===");
+        }
+    }
 }
 
 pub(crate) use decision::synthesize_readable_pure_logical_expr;

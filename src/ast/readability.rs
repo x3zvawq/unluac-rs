@@ -193,13 +193,37 @@ pub(crate) fn make_readable(
     target: AstTargetDialect,
     options: ReadabilityOptions,
     timings: &TimingCollector,
+    dump_passes: &[String],
 ) -> AstModule {
     let mut module = module.clone();
     let context = ReadabilityContext { target, options };
+    let dump_active = !dump_passes.is_empty();
 
     run_invalidation_loop(
         PASS_DESCRIPTORS,
-        |index, name| timings.record(name, || (PASS_ENTRIES[index].apply)(&mut module, context)),
+        |index, name| {
+            // 如果当前 pass 在 dump 列表中，先快照 before
+            let before_snapshot = if dump_active && dump_passes.iter().any(|p| p == name) {
+                Some(super::debug::dump_ast_snapshot(&module))
+            } else {
+                None
+            };
+
+            let changed = timings.record(name, || (PASS_ENTRIES[index].apply)(&mut module, context));
+
+            // pass 产生变化时输出 before/after diff
+            if let Some(before) = before_snapshot.filter(|_| changed) {
+                let after = super::debug::dump_ast_snapshot(&module);
+                eprintln!("=== [readability] pass={name} CHANGED ===");
+                eprintln!("--- before ---");
+                eprint!("{before}");
+                eprintln!("--- after ---");
+                eprint!("{after}");
+                eprintln!("=== end ===");
+            }
+
+            changed
+        },
         MAX_ROUNDS,
     );
 

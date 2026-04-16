@@ -421,3 +421,20 @@ fn format_proto_refs(protos: &[super::common::HirProtoRef]) -> String {
             .join(", ")
     }
 }
+
+/// 输出单个 proto 的快照文本（不着色），用于 pass dump 的 before/after 对比。
+pub(crate) fn dump_proto_snapshot(proto: &super::common::HirProto) -> String {
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "proto#{} params={} locals={} upvalues={} temps={}",
+        proto.id.index(),
+        proto.params.len(),
+        proto.locals.len(),
+        proto.upvalues.len(),
+        proto.temps.len(),
+    );
+    let _ = writeln!(output, "  body");
+    write_block(&mut output, "    ", &proto.body);
+    output
+}

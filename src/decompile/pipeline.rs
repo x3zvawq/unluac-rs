@@ -9,7 +9,7 @@ use crate::generate::{
     GenerateChunkCommentMetadata, GenerateCommentMetadata, GenerateFunctionCommentMetadata,
     generate_chunk,
 };
-use crate::hir::analyze_hir;
+use crate::hir::{analyze_hir, PassDumpConfig};
 use crate::naming::{assign_names_with_evidence, collect_naming_evidence};
 use crate::structure::analyze_structure;
 use crate::timing::{TimingCollector, TimingReport};
@@ -204,6 +204,10 @@ impl DecompilerPipeline {
                 .structure_facts
                 .as_ref()
                 .expect("structure stage completed must leave structure facts in state");
+            let dump_config = PassDumpConfig {
+                pass_names: options.debug.dump_passes.clone(),
+                proto_filter: options.debug.filters.proto,
+            };
             analyze_hir(
                 lowered,
                 cfg_graph,
@@ -214,6 +218,7 @@ impl DecompilerPipeline {
                 options.readability,
                 options.generate.mode,
                 requested_target.version,
+                &dump_config,
             )
         });
         state.mark_completed(DecompileStage::Hir);
@@ -260,6 +265,7 @@ impl DecompilerPipeline {
                 options.readability,
                 options.generate.mode,
                 &timings,
+                &options.debug.dump_passes,
             )
         };
         let output_target = output_plan.target;

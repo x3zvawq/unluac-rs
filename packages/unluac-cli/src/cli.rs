@@ -126,6 +126,11 @@ struct CliArgs {
     /// Emit timing report.
     #[arg(short = 't', long, help_heading = "Debug")]
     timing: bool,
+    /// Dump before/after snapshots for specific passes (comma-separated names).
+    /// Supports HIR simplify passes (e.g. `carried-locals`, `temp-inline`) and
+    /// AST readability passes (e.g. `inline-exprs`, `branch-pretty`).
+    #[arg(long, value_delimiter = ',', help_heading = "Debug")]
+    dump_pass: Vec<String>,
     /// Max inline complexity for returned expressions.
     #[arg(long, help_heading = "Generate")]
     return_inline_max_complexity: Option<usize>,
@@ -205,7 +210,7 @@ struct CliArgs {
     #[arg(
         short = 'o',
         long,
-        conflicts_with_all = ["debug", "dump", "detail", "color", "proto", "timing"],
+        conflicts_with_all = ["debug", "dump", "detail", "color", "proto", "timing", "dump_pass"],
         help_heading = "Output"
     )]
     output: Option<PathBuf>,
@@ -344,6 +349,10 @@ where
         if !has_explicit_debug_output {
             decompile.debug.output_stages.clear();
         }
+    }
+
+    if !args.dump_pass.is_empty() {
+        decompile.debug.dump_passes = args.dump_pass.clone();
     }
 
     if let Some(value) = args.return_inline_max_complexity {

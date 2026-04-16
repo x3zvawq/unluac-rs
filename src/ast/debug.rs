@@ -40,6 +40,14 @@ pub fn dump_readability(
     dump_module(module, detail, "Readability", "readability", color)
 }
 
+/// 输出 AST module 的不着色快照文本，用于 pass dump 的 before/after 对比。
+pub(crate) fn dump_ast_snapshot(module: &AstModule) -> String {
+    let mut output = String::new();
+    let names = collect_function_render_names(&module.body);
+    write_block(&mut output, "", &module.body, &names);
+    output
+}
+
 fn dump_module(
     module: &AstModule,
     detail: DebugDetail,

@@ -26,6 +26,7 @@ pub(super) fn resolve_output_plan(
     readability_options: crate::readability::ReadabilityOptions,
     mode: GenerateMode,
     timings: &TimingCollector,
+    dump_passes: &[String],
 ) -> OutputPlan {
     match mode {
         GenerateMode::Strict => OutputPlan {
@@ -34,6 +35,7 @@ pub(super) fn resolve_output_plan(
                 requested_target,
                 readability_options,
                 timings,
+                dump_passes,
             ),
             target: requested_target,
             generate_mode: GenerateMode::Strict,
@@ -45,6 +47,7 @@ pub(super) fn resolve_output_plan(
                 requested_target,
                 readability_options,
                 timings,
+                dump_passes,
             );
             let unsupported = unsupported_ast_features(&readability, requested_target);
             let warnings = if unsupported.is_empty() {
@@ -74,6 +77,7 @@ pub(super) fn resolve_output_plan(
                     target,
                     readability_options,
                     timings,
+                    dump_passes,
                 );
                 let unsupported_in_target = unsupported_ast_features(&readability, target);
                 if unsupported_in_target.is_empty() {

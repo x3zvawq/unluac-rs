@@ -14,7 +14,7 @@ mod structure;
 mod tests;
 
 use self::lower::{ChildAnalyses, LowerArtifacts, lower_proto};
-use super::simplify::simplify_hir;
+use super::simplify::{PassDumpConfig, simplify_hir};
 use crate::cfg::{CfgGraph, DataflowFacts, GraphFacts};
 use crate::hir::common::HirModule;
 use crate::generate::GenerateMode;
@@ -42,6 +42,7 @@ pub(crate) fn analyze_hir(
     readability: ReadabilityOptions,
     generate_mode: GenerateMode,
     dialect: crate::ast::AstDialectVersion,
+    dump_config: &PassDumpConfig,
 ) -> HirModule {
     let child_analyses = ChildAnalyses {
         cfg_graphs: &cfg_graph.children,
@@ -75,6 +76,7 @@ pub(crate) fn analyze_hir(
             &artifacts.promotion_facts,
             generate_mode,
             dialect,
+            dump_config,
         );
     });
     module

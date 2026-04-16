@@ -21,6 +21,12 @@ pub struct DebugOptions {
     pub color: crate::debug::DebugColorMode,
     pub detail: DebugDetail,
     pub filters: DebugFilters,
+    /// 需要输出 before/after 快照的 pass 名称列表。
+    ///
+    /// 支持 HIR simplify pass（如 `carried-locals`、`temp-inline`）和
+    /// AST readability pass（如 `inline-exprs`、`branch-pretty`）。
+    /// 当 pass 执行且产生了变化时，向 stderr 输出变化前后的 proto/function dump。
+    pub dump_passes: Vec<String>,
 }
 
 /// 某个阶段导出的调试文本。
