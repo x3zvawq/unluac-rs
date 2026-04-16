@@ -34,6 +34,7 @@ fn best_effort_should_upgrade_lua51_goto_to_lua52() {
         ReadabilityOptions::default(),
         GenerateMode::BestEffort,
         &TimingCollector::disabled(),
+        &[],
     );
 
     assert_eq!(plan.target.version, AstDialectVersion::Lua52);
@@ -62,6 +63,7 @@ fn best_effort_should_fall_back_to_permissive_when_no_single_dialect_fits() {
         ReadabilityOptions::default(),
         GenerateMode::BestEffort,
         &TimingCollector::disabled(),
+        &[],
     );
 
     assert_eq!(plan.generate_mode, GenerateMode::Permissive);

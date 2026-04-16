@@ -859,6 +859,7 @@ fn simplify_module_runs_until_fixed_point() {
         &crate::timing::TimingCollector::disabled(),
         &[],
         crate::generate::GenerateMode::Strict, crate::ast::AstDialectVersion::Lua51,
+        &super::super::PassDumpConfig::default(),
         );
 
     assert!(matches!(

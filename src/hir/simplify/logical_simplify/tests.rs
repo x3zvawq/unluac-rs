@@ -31,6 +31,7 @@ fn simplifies_safe_lua_logical_absorption() {
         &crate::timing::TimingCollector::disabled(),
         &[],
         crate::generate::GenerateMode::Strict, crate::ast::AstDialectVersion::Lua51,
+        &super::super::PassDumpConfig::default(),
         );
 
     assert!(matches!(

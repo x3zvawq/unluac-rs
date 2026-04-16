@@ -54,6 +54,7 @@ fn hir_dump_for(source_relative: &str) -> String {
                 color: DebugColorMode::Never,
                 detail: DebugDetail::Normal,
                 filters: Default::default(),
+                    dump_passes: Vec::new(),
             },
             ..DecompileOptions::default()
         },

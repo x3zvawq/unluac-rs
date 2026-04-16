@@ -125,6 +125,7 @@ fn make_lua55_readable(module: &AstModule) -> AstModule {
         AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
         ReadabilityOptions::default(),
         &TimingCollector::disabled(),
+        &[],
     )
 }
 

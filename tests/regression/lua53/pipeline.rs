@@ -27,6 +27,7 @@ mod decompile_pipeline {
                     color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
+                    dump_passes: Vec::new(),
                 },
                 naming: NamingOptions::default(),
                 ..DecompileOptions::default()
@@ -62,6 +63,7 @@ mod decompile_pipeline {
                     color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
+                    dump_passes: Vec::new(),
                 },
                 naming: NamingOptions::default(),
                 ..DecompileOptions::default()
@@ -141,6 +143,7 @@ mod decompile_pipeline {
                     color: DebugColorMode::Never,
                     detail: DebugDetail::Summary,
                     filters: Default::default(),
+                    dump_passes: Vec::new(),
                 },
                 naming: NamingOptions::default(),
                 ..DecompileOptions::default()
@@ -172,6 +175,7 @@ mod decompile_pipeline {
                     color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
+                    dump_passes: Vec::new(),
                 },
                 naming: NamingOptions::default(),
                 ..DecompileOptions::default()
@@ -204,6 +208,7 @@ mod decompile_pipeline {
                     color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
+                    dump_passes: Vec::new(),
                 },
                 naming: NamingOptions::default(),
                 ..DecompileOptions::default()
@@ -238,6 +243,7 @@ mod decompile_pipeline {
                     color: DebugColorMode::Never,
                     detail: DebugDetail::Normal,
                     filters: Default::default(),
+                    dump_passes: Vec::new(),
                 },
                 naming: NamingOptions::default(),
                 ..DecompileOptions::default()
@@ -282,6 +288,7 @@ mod decompile_pipeline {
                     color: DebugColorMode::Never,
                     detail: DebugDetail::Verbose,
                     filters: Default::default(),
+                    dump_passes: Vec::new(),
                 },
                 naming: NamingOptions::default(),
                 ..DecompileOptions::default()

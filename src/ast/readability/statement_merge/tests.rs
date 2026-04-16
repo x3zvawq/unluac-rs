@@ -54,6 +54,7 @@ fn merges_empty_local_decl_followed_by_matching_assign() {
         AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
         Default::default(),
         &TimingCollector::disabled(),
+        &[],
     );
     assert_eq!(
         module.body.stmts,
@@ -102,6 +103,7 @@ fn does_not_merge_when_assign_targets_do_not_match_decl_bindings() {
         AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
         Default::default(),
         &TimingCollector::disabled(),
+        &[],
     );
     assert_eq!(module.body.stmts.len(), 2);
 }
