@@ -774,24 +774,29 @@ fn rewrite_stmt(
 ) -> bool {
     match stmt {
         HirStmt::LocalDecl(local_decl) => {
-            local_decl.values.iter_mut().fold(false, |changed, expr| {
-                rewrite_expr(expr, mapping) || changed
-            })
+            let mut changed = false;
+            for expr in &mut local_decl.values {
+                changed |= rewrite_expr(expr, mapping);
+            }
+            changed
         }
         HirStmt::Assign(assign) => {
-            let targets_changed = assign.targets.iter_mut().fold(false, |changed, target| {
-                rewrite_lvalue(target, mapping) || changed
-            });
-            let values_changed = assign.values.iter_mut().fold(false, |changed, expr| {
-                rewrite_expr(expr, mapping) || changed
-            });
+            let mut targets_changed = false;
+            for target in &mut assign.targets {
+                targets_changed |= rewrite_lvalue(target, mapping);
+            }
+            let mut values_changed = false;
+            for expr in &mut assign.values {
+                values_changed |= rewrite_expr(expr, mapping);
+            }
             targets_changed || values_changed
         }
         HirStmt::TableSetList(set_list) => {
             let base_changed = rewrite_expr(&mut set_list.base, mapping);
-            let values_changed = set_list.values.iter_mut().fold(false, |changed, expr| {
-                rewrite_expr(expr, mapping) || changed
-            });
+            let mut values_changed = false;
+            for expr in &mut set_list.values {
+                values_changed |= rewrite_expr(expr, mapping);
+            }
             let trailing_changed = set_list
                 .trailing_multivalue
                 .as_mut()
@@ -801,9 +806,13 @@ fn rewrite_stmt(
         HirStmt::ErrNil(err_nil) => rewrite_expr(&mut err_nil.value, mapping),
         HirStmt::ToBeClosed(to_be_closed) => rewrite_expr(&mut to_be_closed.value, mapping),
         HirStmt::CallStmt(call_stmt) => rewrite_call_expr(&mut call_stmt.call, mapping),
-        HirStmt::Return(ret) => ret.values.iter_mut().fold(false, |changed, expr| {
-            rewrite_expr(expr, mapping) || changed
-        }),
+        HirStmt::Return(ret) => {
+            let mut changed = false;
+            for expr in &mut ret.values {
+                changed |= rewrite_expr(expr, mapping);
+            }
+            changed
+        }
         HirStmt::If(if_stmt) => {
             let cond_changed = rewrite_expr(&mut if_stmt.cond, mapping);
             let then_changed =
@@ -840,12 +849,10 @@ fn rewrite_stmt(
             start_changed || limit_changed || step_changed || body_changed
         }
         HirStmt::GenericFor(generic_for) => {
-            let iterator_changed = generic_for
-                .iterator
-                .iter_mut()
-                .fold(false, |changed, expr| {
-                    rewrite_expr(expr, mapping) || changed
-                });
+            let mut iterator_changed = false;
+            for expr in &mut generic_for.iterator {
+                iterator_changed |= rewrite_expr(expr, mapping);
+            }
             let body_changed =
                 promote_block(ctx, &mut generic_for.body, mapping, sticky_slots, outer_used_temps)
                     .changed;
@@ -877,10 +884,10 @@ fn debug_hint_for_temp_group(
 
 fn rewrite_call_expr(call: &mut HirCallExpr, mapping: &BTreeMap<TempId, LocalId>) -> bool {
     let callee_changed = rewrite_expr(&mut call.callee, mapping);
-    let args_changed = call
-        .args
-        .iter_mut()
-        .fold(false, |changed, arg| rewrite_expr(arg, mapping) || changed);
+    let mut args_changed = false;
+    for arg in &mut call.args {
+        args_changed |= rewrite_expr(arg, mapping);
+    }
     callee_changed || args_changed
 }
 
@@ -910,17 +917,25 @@ fn rewrite_expr(expr: &mut HirExpr, mapping: &BTreeMap<TempId, LocalId>) -> bool
             let rhs_changed = rewrite_expr(&mut logical.rhs, mapping);
             lhs_changed || rhs_changed
         }
-        HirExpr::Decision(decision) => decision.nodes.iter_mut().fold(false, |changed, node| {
-            let test_changed = rewrite_expr(&mut node.test, mapping);
-            let truthy_changed = rewrite_decision_target(&mut node.truthy, mapping);
-            let falsy_changed = rewrite_decision_target(&mut node.falsy, mapping);
-            changed || test_changed || truthy_changed || falsy_changed
-        }),
+        HirExpr::Decision(decision) => {
+            let mut changed = false;
+            for node in &mut decision.nodes {
+                let test_changed = rewrite_expr(&mut node.test, mapping);
+                let truthy_changed = rewrite_decision_target(&mut node.truthy, mapping);
+                let falsy_changed = rewrite_decision_target(&mut node.falsy, mapping);
+                changed |= test_changed || truthy_changed || falsy_changed;
+            }
+            changed
+        }
         HirExpr::Call(call) => rewrite_call_expr(call, mapping),
         HirExpr::TableConstructor(table) => rewrite_table_constructor(table, mapping),
-        HirExpr::Closure(closure) => closure.captures.iter_mut().fold(false, |changed, capture| {
-            rewrite_expr(&mut capture.value, mapping) || changed
-        }),
+        HirExpr::Closure(closure) => {
+            let mut changed = false;
+            for capture in &mut closure.captures {
+                changed |= rewrite_expr(&mut capture.value, mapping);
+            }
+            changed
+        }
         HirExpr::Nil
         | HirExpr::Boolean(_)
         | HirExpr::Integer(_)
@@ -953,7 +968,8 @@ fn rewrite_table_constructor(
     table: &mut HirTableConstructor,
     mapping: &BTreeMap<TempId, LocalId>,
 ) -> bool {
-    let fields_changed = table.fields.iter_mut().fold(false, |changed, field| {
+    let mut fields_changed = false;
+    for field in &mut table.fields {
         let field_changed = match field {
             HirTableField::Array(expr) => rewrite_expr(expr, mapping),
             HirTableField::Record(field) => {
@@ -965,8 +981,8 @@ fn rewrite_table_constructor(
                 key_changed || value_changed
             }
         };
-        changed || field_changed
-    });
+        fields_changed |= field_changed;
+    }
     let trailing_changed = table
         .trailing_multivalue
         .as_mut()

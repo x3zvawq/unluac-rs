@@ -234,12 +234,13 @@ fn rewrite_loop_header_binding(
             changed |= replace_exact_name_expr(&mut numeric_for.step, binding, replacement);
             changed
         }
-        AstStmt::GenericFor(generic_for) => generic_for
-            .iterator
-            .iter_mut()
-            .fold(false, |changed, expr| {
-                replace_exact_name_expr(expr, binding, replacement) || changed
-            }),
+        AstStmt::GenericFor(generic_for) => {
+            let mut changed = false;
+            for expr in &mut generic_for.iterator {
+                changed |= replace_exact_name_expr(expr, binding, replacement);
+            }
+            changed
+        }
         _ => false,
     }
 }

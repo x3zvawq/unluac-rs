@@ -80,10 +80,10 @@ fn rewrite_block_with_kind(
     kind: BlockKind,
     pass: &mut impl AstRewritePass,
 ) -> bool {
-    let nested_changed = block
-        .stmts
-        .iter_mut()
-        .fold(false, |changed, stmt| rewrite_stmt(stmt, pass) || changed);
+    let mut nested_changed = false;
+    for stmt in &mut block.stmts {
+        nested_changed |= rewrite_stmt(stmt, pass);
+    }
     let block_changed = pass.rewrite_block(block, kind);
     block_changed || nested_changed
 }
@@ -103,9 +103,10 @@ fn rewrite_block_with_kind_scoped<P: ScopedAstRewritePass>(
     pass: &mut P,
 ) -> bool {
     let (block_changed, scope) = pass.enter_block(block, kind, outer_scope);
-    let nested_changed = block.stmts.iter_mut().fold(false, |changed, stmt| {
-        rewrite_stmt_scoped(stmt, &scope, pass) || changed
-    });
+    let mut nested_changed = false;
+    for stmt in &mut block.stmts {
+        nested_changed |= rewrite_stmt_scoped(stmt, &scope, pass);
+    }
     block_changed || nested_changed
 }
 

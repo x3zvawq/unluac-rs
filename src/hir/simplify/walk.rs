@@ -60,9 +60,11 @@ pub(super) fn rewrite_proto(proto: &mut HirProto, pass: &mut impl HirRewritePass
 }
 
 pub(super) fn rewrite_stmts(stmts: &mut [HirStmt], pass: &mut impl HirRewritePass) -> bool {
-    stmts.iter_mut().fold(false, |changed, stmt| {
-        rewrite_stmt(stmt, pass) || changed
-    })
+    let mut changed = false;
+    for stmt in stmts {
+        changed |= rewrite_stmt(stmt, pass);
+    }
+    changed
 }
 
 pub(super) trait ExprRewritePass {
@@ -133,10 +135,10 @@ impl<P: ExprRewritePass> HirRewritePass for ExprRewritePassAdapter<'_, P> {
 }
 
 fn rewrite_block(block: &mut HirBlock, pass: &mut impl HirRewritePass) -> bool {
-    let nested_changed = block
-        .stmts
-        .iter_mut()
-        .fold(false, |changed, stmt| rewrite_stmt(stmt, pass) || changed);
+    let mut nested_changed = false;
+    for stmt in &mut block.stmts {
+        nested_changed |= rewrite_stmt(stmt, pass);
+    }
     let block_changed = pass.rewrite_block(block);
     block_changed || nested_changed
 }
