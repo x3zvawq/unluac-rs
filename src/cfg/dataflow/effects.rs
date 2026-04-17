@@ -125,12 +125,22 @@ pub(super) fn compute_instr_effect(instr: &LowInstr) -> InstrEffect {
             effect.fixed_uses.insert(instr.limit);
             effect.fixed_uses.insert(instr.step);
             effect.fixed_must_defs.insert(instr.index);
+            // `binding` 是循环可见变量槽位；在 CFG 模型下 NumericForInit 直接跳
+            // 向循环体入口（body_target），此时体内首次读取 binding 前，它已经
+            // 被 FORLOOP/FORI 写入。如果不把 binding 计入 must-def，则体外对该
+            // 寄存器的值会经过 phi 合流进入循环体，制造出虚假的 exit phi，把
+            // 纯粹的体内作用域寄存器误判为循环承载变量（见 luajit_01 回归）。
+            effect.fixed_must_defs.insert(instr.binding);
         }
         LowInstr::NumericForLoop(instr) => {
             effect.fixed_uses.insert(instr.index);
             effect.fixed_uses.insert(instr.limit);
             effect.fixed_uses.insert(instr.step);
             effect.fixed_must_defs.insert(instr.index);
+            // FORLOOP/IFORL/JFORL 回边在迭代继续时会把新的 index 写入
+            // binding，与 NumericForInit 对称，避免体内重新定义前的 phi 被错
+            // 误当成真正的入口值。
+            effect.fixed_must_defs.insert(instr.binding);
         }
         LowInstr::GenericForCall(instr) => {
             insert_reg_range(&mut effect.fixed_uses, instr.state);
