@@ -108,6 +108,7 @@
     "dialect": "Lua ダイアレクト",
     "tabs": {
       "general": "一般",
+      "advanced": "詳細",
       "parse": "解析",
       "readability": "可読性",
       "naming": "命名",
@@ -169,7 +170,24 @@
     "about": {
       "title": "バージョン情報",
       "repo": "GitHub リポジトリ",
-      "version": "バージョン"
+      "version": "バージョン",
+      "summary": "ブラウザー上で Lua バイトコードを直接解析・逆コンパイル",
+      "description": "unluac-web は unluac-rs と WebAssembly を基盤にしており、逆コンパイル結果の確認、出力比較、さらに必要に応じた Proto / CFG ビューの確認に向いています。",
+      "metaTitle": "プロジェクト情報",
+      "highlights": {
+        "multiDialect": {
+          "title": "複数バージョン・複数方言に対応",
+          "description": "Lua 5.1–5.5、LuaJIT、Luau をカバーし、対象方言ごとに解析・生成の挙動を切り替えられます。"
+        },
+        "localFirst": {
+          "title": "完全ローカル実行",
+          "description": "逆コンパイルと解析はすべて現在のブラウザー内で完結し、バイトコードをサーバーへ送信しません。"
+        },
+        "tooling": {
+          "title": "ソース出力だけではない",
+          "description": "ソースコードに加えて、バッチ処理、出力比較、Proto / CFG などの構造化解析も利用できます。"
+        }
+      }
     }
   },
   "diff": {

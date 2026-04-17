@@ -144,6 +144,7 @@
     },
     "tips": {
       "dialect": "대상 Lua 방언으로, 파서와 생성기의 동작에 영향을 줍니다. CLI: --dialect / -D",
+      "advanced": "고급",
       "generateMode": "오류 처리 전략. strict: 오류 시 중단; best-effort: 대체 구문 시도; permissive: 가능한 한 많이 출력. CLI: --generate-mode / -g",
       "parseMode": "파서 엄격도. strict: 엄격한 검증; permissive: 비표준 바이트코드 허용. CLI: --parse-mode / -p",
       "stringEncoding": "문자열 상수 디코딩에 사용할 인코딩. CLI: --encoding / -e",
@@ -169,7 +170,24 @@
     "about": {
       "title": "정보",
       "repo": "GitHub 저장소",
-      "version": "버전"
+      "version": "버전",
+      "summary": "브라우저에서 바로 Lua 바이트코드를 분석하고 디컴파일",
+      "description": "unluac-web은 unluac-rs와 WebAssembly 기반으로 만들어졌으며, 디컴파일 결과 확인, 출력 비교, 필요 시 Proto / CFG 뷰 탐색에 적합합니다.",
+      "metaTitle": "프로젝트 정보",
+      "highlights": {
+        "multiDialect": {
+          "title": "다중 버전·다중 방언 지원",
+          "description": "Lua 5.1–5.5, LuaJIT, Luau를 지원하며 대상 방언에 맞춰 파서와 생성기 동작을 전환할 수 있습니다."
+        },
+        "localFirst": {
+          "title": "완전한 로컬 실행",
+          "description": "모든 디컴파일과 분석은 현재 브라우저 안에서 수행되며, 바이트코드를 서버에 업로드하지 않습니다."
+        },
+        "tooling": {
+          "title": "소스 출력 그 이상",
+          "description": "소스 코드뿐 아니라 일괄 처리, 결과 비교, Proto / CFG 같은 구조화 분석도 함께 사용할 수 있습니다."
+        }
+      }
     }
   },
   "diff": {

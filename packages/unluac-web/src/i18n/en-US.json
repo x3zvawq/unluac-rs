@@ -108,6 +108,7 @@
     "dialect": "Lua Dialect",
     "tabs": {
       "general": "General",
+      "advanced": "Advanced",
       "parse": "Parse",
       "readability": "Readability",
       "naming": "Naming",
@@ -169,7 +170,24 @@
     "about": {
       "title": "About",
       "repo": "GitHub Repository",
-      "version": "Version"
+      "version": "Version",
+      "summary": "Analyze and decompile Lua bytecode directly in your browser",
+      "description": "unluac-web is built on top of unluac-rs and WebAssembly for quickly inspecting decompiled output, comparing results, and drilling into Proto / CFG views when you need more structure.",
+      "metaTitle": "Project Info",
+      "highlights": {
+        "multiDialect": {
+          "title": "Multi-version, multi-dialect support",
+          "description": "Covers Lua 5.1–5.5, LuaJIT, and Luau, with parser and generator behavior configurable per target dialect."
+        },
+        "localFirst": {
+          "title": "Runs fully on-device",
+          "description": "Decompilation and analysis happen inside the current browser via WebAssembly, without uploading bytecode to a server."
+        },
+        "tooling": {
+          "title": "More than plain source output",
+          "description": "Alongside source code, you can batch process files, compare outputs, and inspect structured Proto / CFG analysis."
+        }
+      }
     }
   },
   "diff": {

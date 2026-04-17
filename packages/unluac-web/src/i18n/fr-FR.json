@@ -108,6 +108,7 @@
     "dialect": "Dialecte Lua",
     "tabs": {
       "general": "Général",
+      "advanced": "Avancé",
       "parse": "Analyse",
       "readability": "Lisibilité",
       "naming": "Nommage",
@@ -169,7 +170,24 @@
     "about": {
       "title": "À propos",
       "repo": "Dépôt GitHub",
-      "version": "Version"
+      "version": "Version",
+      "summary": "Analysez et décompilez du bytecode Lua directement dans le navigateur",
+      "description": "unluac-web s'appuie sur unluac-rs et WebAssembly pour consulter rapidement le résultat décompilé, comparer les sorties et explorer les vues Proto / CFG lorsque plus de structure est nécessaire.",
+      "metaTitle": "Informations du projet",
+      "highlights": {
+        "multiDialect": {
+          "title": "Prise en charge multi-versions et multi-dialectes",
+          "description": "Couvre Lua 5.1–5.5, LuaJIT et Luau, avec un comportement du parseur et du générateur configurable selon le dialecte cible."
+        },
+        "localFirst": {
+          "title": "Exécution entièrement locale",
+          "description": "Toute la décompilation et l'analyse sont effectuées dans le navigateur courant, sans envoyer le bytecode à un serveur."
+        },
+        "tooling": {
+          "title": "Plus qu'un simple code source",
+          "description": "En plus du code généré, vous pouvez traiter des fichiers en lot, comparer les sorties et inspecter les analyses structurées Proto / CFG."
+        }
+      }
     }
   },
   "diff": {

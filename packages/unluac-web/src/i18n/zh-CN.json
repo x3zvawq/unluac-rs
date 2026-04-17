@@ -108,6 +108,7 @@
     "dialect": "Lua 方言",
     "tabs": {
       "general": "通用",
+      "advanced": "高级",
       "parse": "解析",
       "readability": "可读性",
       "naming": "命名",
@@ -169,7 +170,24 @@
     "about": {
       "title": "关于",
       "repo": "GitHub 仓库",
-      "version": "版本"
+      "version": "版本",
+      "summary": "在浏览器里直接分析与反编译 Lua 字节码",
+      "description": "unluac-web 基于 unluac-rs 和 WebAssembly 构建，适合快速查看反编译结果、比对输出，并结合 Proto / CFG 视图做进一步分析。",
+      "metaTitle": "项目信息",
+      "highlights": {
+        "multiDialect": {
+          "title": "支持多版本多方言",
+          "description": "覆盖 Lua 5.1–5.5、LuaJIT 与 Luau，可按目标方言切换解析与生成策略。"
+        },
+        "localFirst": {
+          "title": "完全本地运行",
+          "description": "所有反编译和分析都在当前浏览器内完成，无需把字节码上传到服务器。"
+        },
+        "tooling": {
+          "title": "不止是导出源码",
+          "description": "除了源码结果，还可以批量处理、对比输出，并查看 Proto / CFG 等结构化分析信息。"
+        }
+      }
     }
   },
   "diff": {

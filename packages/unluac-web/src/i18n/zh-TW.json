@@ -108,6 +108,7 @@
     "dialect": "Lua 方言",
     "tabs": {
       "general": "通用",
+      "advanced": "高級",
       "parse": "解析",
       "readability": "可讀性",
       "naming": "命名",
@@ -169,7 +170,24 @@
     "about": {
       "title": "關於",
       "repo": "GitHub 倉庫",
-      "version": "版本"
+      "version": "版本",
+      "summary": "直接在瀏覽器裡分析與反編譯 Lua 位元組碼",
+      "description": "unluac-web 基於 unluac-rs 與 WebAssembly 構建，適合快速查看反編譯結果、比對輸出，並在需要時深入 Proto / CFG 視圖。",
+      "metaTitle": "項目資訊",
+      "highlights": {
+        "multiDialect": {
+          "title": "支援多版本多方言",
+          "description": "涵蓋 Lua 5.1–5.5、LuaJIT 與 Luau，可依目標方言切換解析與生成策略。"
+        },
+        "localFirst": {
+          "title": "完全本地執行",
+          "description": "所有反編譯與分析都在目前瀏覽器內完成，不需將位元組碼上傳到伺服器。"
+        },
+        "tooling": {
+          "title": "不只是輸出原始碼",
+          "description": "除了原始碼結果，也能批次處理、比對輸出，並查看 Proto / CFG 等結構化分析資訊。"
+        }
+      }
     }
   },
   "diff": {

@@ -2,7 +2,10 @@
 /**
  * 设置面板。
  *
- * 使用 NTabs 按参数类别分组，每个参数附带 tooltip 说明其用途及 CLI 对应参数。
+ * 当前将设置收敛为“通用 / 高级 / 关于”三组：
+ * - 通用：最常改、最影响输出风格的少量选项；
+ * - 高级：保留所有细粒度调参项，避免默认界面过于拥挤；
+ * - 关于：补充产品定位、能力边界与项目入口，减少面板信息过干的问题。
  */
 
 import { shallowRef } from 'vue'
@@ -131,11 +134,55 @@ const tableStyleOptions = [
                 size="small"
               />
             </div>
+            <div>
+              <div class="mb-1 flex items-center gap-1">
+                <label class="text-sm">{{ t('settings.parse.stringEncoding') }}</label>
+                <NTooltip>
+                  <template #trigger>
+                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
+                  </template>
+                  {{ t('settings.tips.stringEncoding') }}
+                </NTooltip>
+              </div>
+              <NSelect
+                v-model:value="settings.options.parse.stringEncoding"
+                :options="stringEncodingOptions"
+                size="small"
+              />
+            </div>
+            <div>
+              <div class="mb-1 flex items-center gap-1">
+                <label class="text-sm">{{ t('settings.naming.mode') }}</label>
+                <NTooltip>
+                  <template #trigger>
+                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
+                  </template>
+                  {{ t('settings.tips.namingMode') }}
+                </NTooltip>
+              </div>
+              <NSelect
+                v-model:value="settings.options.naming.mode"
+                :options="namingModeOptions"
+                size="small"
+              />
+            </div>
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-1">
+                <label class="text-sm">{{ t('settings.generate.comment') }}</label>
+                <NTooltip>
+                  <template #trigger>
+                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
+                  </template>
+                  {{ t('settings.tips.comment') }}
+                </NTooltip>
+              </div>
+              <NSwitch v-model:value="settings.options.generate.comment" size="small" />
+            </div>
           </NSpace>
         </NTabPane>
 
-        <!-- Parse Tab -->
-        <NTabPane :name="t('settings.tabs.parse')" :tab="t('settings.tabs.parse')">
+        <!-- Advanced Tab -->
+        <NTabPane :name="t('settings.tabs.advanced')" :tab="t('settings.tabs.advanced')">
           <NSpace vertical :size="14" class="pt-3">
             <div>
               <div class="mb-1 flex items-center gap-1">
@@ -155,22 +202,6 @@ const tableStyleOptions = [
             </div>
             <div>
               <div class="mb-1 flex items-center gap-1">
-                <label class="text-sm">{{ t('settings.parse.stringEncoding') }}</label>
-                <NTooltip>
-                  <template #trigger>
-                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
-                  </template>
-                  {{ t('settings.tips.stringEncoding') }}
-                </NTooltip>
-              </div>
-              <NSelect
-                v-model:value="settings.options.parse.stringEncoding"
-                :options="stringEncodingOptions"
-                size="small"
-              />
-            </div>
-            <div>
-              <div class="mb-1 flex items-center gap-1">
                 <label class="text-sm">{{ t('settings.parse.stringDecodeMode') }}</label>
                 <NTooltip>
                   <template #trigger>
@@ -185,12 +216,18 @@ const tableStyleOptions = [
                 size="small"
               />
             </div>
-          </NSpace>
-        </NTabPane>
-
-        <!-- Readability Tab -->
-        <NTabPane :name="t('settings.tabs.readability')" :tab="t('settings.tabs.readability')">
-          <NSpace vertical :size="14" class="pt-3">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-1">
+                <label class="text-sm">{{ t('settings.naming.debugLikeIncludeFunction') }}</label>
+                <NTooltip>
+                  <template #trigger>
+                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
+                  </template>
+                  {{ t('settings.tips.debugLikeIncludeFunction') }}
+                </NTooltip>
+              </div>
+              <NSwitch v-model:value="settings.options.naming.debugLikeIncludeFunction" size="small" />
+            </div>
             <div>
               <div class="mb-1 flex items-center gap-1">
                 <label class="text-sm">{{ t('settings.readability.returnInlineMaxComplexity') }}</label>
@@ -259,46 +296,6 @@ const tableStyleOptions = [
                 size="small"
               />
             </div>
-          </NSpace>
-        </NTabPane>
-
-        <!-- Naming Tab -->
-        <NTabPane :name="t('settings.tabs.naming')" :tab="t('settings.tabs.naming')">
-          <NSpace vertical :size="14" class="pt-3">
-            <div>
-              <div class="mb-1 flex items-center gap-1">
-                <label class="text-sm">{{ t('settings.naming.mode') }}</label>
-                <NTooltip>
-                  <template #trigger>
-                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
-                  </template>
-                  {{ t('settings.tips.namingMode') }}
-                </NTooltip>
-              </div>
-              <NSelect
-                v-model:value="settings.options.naming.mode"
-                :options="namingModeOptions"
-                size="small"
-              />
-            </div>
-            <div class="flex items-center justify-between">
-              <div class="flex items-center gap-1">
-                <label class="text-sm">{{ t('settings.naming.debugLikeIncludeFunction') }}</label>
-                <NTooltip>
-                  <template #trigger>
-                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
-                  </template>
-                  {{ t('settings.tips.debugLikeIncludeFunction') }}
-                </NTooltip>
-              </div>
-              <NSwitch v-model:value="settings.options.naming.debugLikeIncludeFunction" size="small" />
-            </div>
-          </NSpace>
-        </NTabPane>
-
-        <!-- Generate Tab -->
-        <NTabPane :name="t('settings.tabs.generate')" :tab="t('settings.tabs.generate')">
-          <NSpace vertical :size="14" class="pt-3">
             <div>
               <div class="mb-1 flex items-center gap-1">
                 <label class="text-sm">{{ t('settings.generate.indentWidth') }}</label>
@@ -377,34 +374,57 @@ const tableStyleOptions = [
               </div>
               <NSwitch v-model:value="settings.options.generate.conservativeOutput" size="small" />
             </div>
-            <div class="flex items-center justify-between">
-              <div class="flex items-center gap-1">
-                <label class="text-sm">{{ t('settings.generate.comment') }}</label>
-                <NTooltip>
-                  <template #trigger>
-                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
-                  </template>
-                  {{ t('settings.tips.comment') }}
-                </NTooltip>
-              </div>
-              <NSwitch v-model:value="settings.options.generate.comment" size="small" />
-            </div>
           </NSpace>
         </NTabPane>
 
         <!-- About Tab -->
         <NTabPane :name="t('settings.tabs.about')" :tab="t('settings.tabs.about')">
-          <NSpace vertical :size="10" class="pt-3">
-            <div class="flex items-center justify-between">
-              <span class="text-sm">{{ t('settings.about.version') }}</span>
-              <span class="text-sm opacity-60">{{ appVersion }}</span>
+          <NSpace vertical :size="12" class="pt-3">
+            <div class="rounded-lg border px-3 py-3" style="border-color: var(--app-border); background: var(--app-bg-alt)">
+              <div class="text-sm font-medium">{{ t('settings.about.summary') }}</div>
+              <p class="mt-2 text-xs leading-5" style="color: var(--app-text-secondary)">
+                {{ t('settings.about.description') }}
+              </p>
             </div>
-            <div>
-              <NA href="https://github.com/x3zvawq/unluac-rs" target="_blank">
-                {{ t('settings.about.repo') }}
-              </NA>
+
+            <div class="grid gap-2">
+              <div class="rounded-lg border px-3 py-3" style="border-color: var(--app-border)">
+                <div class="text-sm font-medium">{{ t('settings.about.highlights.multiDialect.title') }}</div>
+                <p class="mt-1 text-xs leading-5" style="color: var(--app-text-secondary)">
+                  {{ t('settings.about.highlights.multiDialect.description') }}
+                </p>
+              </div>
+              <div class="rounded-lg border px-3 py-3" style="border-color: var(--app-border)">
+                <div class="text-sm font-medium">{{ t('settings.about.highlights.localFirst.title') }}</div>
+                <p class="mt-1 text-xs leading-5" style="color: var(--app-text-secondary)">
+                  {{ t('settings.about.highlights.localFirst.description') }}
+                </p>
+              </div>
+              <div class="rounded-lg border px-3 py-3" style="border-color: var(--app-border)">
+                <div class="text-sm font-medium">{{ t('settings.about.highlights.tooling.title') }}</div>
+                <p class="mt-1 text-xs leading-5" style="color: var(--app-text-secondary)">
+                  {{ t('settings.about.highlights.tooling.description') }}
+                </p>
+              </div>
             </div>
-            <div class="flex gap-2 pt-2">
+
+            <div class="rounded-lg border px-3 py-3" style="border-color: var(--app-border)">
+              <div class="mb-2 text-xs font-medium uppercase tracking-wide" style="color: var(--app-text-dim)">
+                {{ t('settings.about.metaTitle') }}
+              </div>
+              <div class="flex items-center justify-between">
+                <span class="text-sm">{{ t('settings.about.version') }}</span>
+                <span class="text-sm opacity-60">{{ appVersion }}</span>
+              </div>
+              <div class="mt-3 flex items-center justify-between gap-3">
+                <span class="text-sm">{{ t('settings.about.repo') }}</span>
+                <NA href="https://github.com/x3zvawq/unluac-rs" target="_blank">
+                  github.com/x3zvawq/unluac-rs
+                </NA>
+              </div>
+            </div>
+
+            <div class="flex gap-2 pt-1">
               <NButton size="small" secondary @click="copyShareUrl">
                 {{ copied ? t('settings.share.copied') : t('settings.share.button') }}
               </NButton>

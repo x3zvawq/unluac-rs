@@ -144,6 +144,7 @@
     },
     "tips": {
       "dialect": "Dialecto Lua de destino, afecta el comportamiento del analizador y generador. CLI: --dialect / -D",
+      "advanced": "Avanzado",
       "generateMode": "Estrategia de manejo de errores. strict: detener en error; best-effort: intentar sintaxis alternativa; permissive: generar lo máximo posible. CLI: --generate-mode / -g",
       "parseMode": "Nivel de rigor del analizador. strict: validación estricta; permissive: tolerar bytecode no estándar. CLI: --parse-mode / -p",
       "stringEncoding": "Codificación para decodificar constantes de cadena. CLI: --encoding / -e",
@@ -169,7 +170,24 @@
     "about": {
       "title": "Acerca de",
       "repo": "Repositorio GitHub",
-      "version": "Versión"
+      "version": "Versión",
+      "summary": "Analiza y decompila bytecode de Lua directamente en tu navegador",
+      "description": "unluac-web está construido sobre unluac-rs y WebAssembly, y está pensado para revisar rápidamente el resultado descompilado, comparar salidas y profundizar en vistas Proto / CFG cuando haga falta.",
+      "metaTitle": "Información del proyecto",
+      "highlights": {
+        "multiDialect": {
+          "title": "Soporte para múltiples versiones y dialectos",
+          "description": "Cubre Lua 5.1–5.5, LuaJIT y Luau, con comportamiento del parser y del generador configurable según el dialecto objetivo."
+        },
+        "localFirst": {
+          "title": "Ejecución totalmente local",
+          "description": "Toda la descompilación y el análisis se realizan dentro del navegador actual, sin subir bytecode a ningún servidor."
+        },
+        "tooling": {
+          "title": "Más que solo código fuente",
+          "description": "Además del código fuente, puedes procesar archivos por lotes, comparar resultados e inspeccionar análisis estructurados Proto / CFG."
+        }
+      }
     }
   },
   "diff": {
