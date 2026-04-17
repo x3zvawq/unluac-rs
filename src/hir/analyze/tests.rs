@@ -42,7 +42,7 @@ fn luau_generic_for_keeps_loop_state_assignment_before_simplify() {
         dump_hir(
             &module,
             crate::debug::DebugDetail::Normal,
-            &crate::debug::DebugFilters::default(),
+            &crate::debug::DebugFilters::unfiltered(),
             crate::debug::DebugColorMode::Never,
         ),
     );
@@ -67,7 +67,7 @@ fn luau_while_header_consts_stay_in_condition_expr() {
             dump_hir(
                 &module,
                 crate::debug::DebugDetail::Normal,
-                &crate::debug::DebugFilters::default(),
+                &crate::debug::DebugFilters::unfiltered(),
                 crate::debug::DebugColorMode::Never,
             )
         );
@@ -79,7 +79,7 @@ fn luau_while_header_consts_stay_in_condition_expr() {
         dump_hir(
             &module,
             crate::debug::DebugDetail::Normal,
-            &crate::debug::DebugFilters::default(),
+            &crate::debug::DebugFilters::unfiltered(),
             crate::debug::DebugColorMode::Never,
         ),
     );
@@ -93,7 +93,7 @@ fn luau_branch_carried_state_stays_resolved_across_nested_loops() {
     let hir_dump = dump_hir(
         &module,
         crate::debug::DebugDetail::Normal,
-        &crate::debug::DebugFilters::default(),
+        &crate::debug::DebugFilters::unfiltered(),
         crate::debug::DebugColorMode::Never,
     );
 
@@ -156,7 +156,7 @@ fn lua55_fixed_multiresult_call_keeps_all_fixed_defs_before_simplify() {
         dump_hir(
             &module,
             crate::debug::DebugDetail::Verbose,
-            &crate::debug::DebugFilters::default(),
+            &crate::debug::DebugFilters::unfiltered(),
             crate::debug::DebugColorMode::Never,
         ),
     );
@@ -170,7 +170,7 @@ fn lua55_self_assign_branch_keeps_preserved_entry_value_before_simplify() {
     let hir_dump = dump_hir(
         &module,
         crate::debug::DebugDetail::Verbose,
-        &crate::debug::DebugFilters::default(),
+        &crate::debug::DebugFilters::unfiltered(),
         crate::debug::DebugColorMode::Never,
     );
 

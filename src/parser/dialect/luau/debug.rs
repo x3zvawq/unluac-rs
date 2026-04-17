@@ -5,7 +5,11 @@
 
 use std::fmt::Write as _;
 
-use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
+use crate::debug::{
+    DebugColorMode, DebugDetail, DebugFilters, build_proto_nodes, colorize_debug_text,
+    compute_focus_plan, format_breadcrumb, format_proto_summary_row,
+};
+use crate::parser::debug::{ParserProtoEntry, build_parser_summary_row};
 use crate::parser::raw::{DecodedText, RawChunk, RawInstr, RawProto, RawString};
 
 use super::raw::{
@@ -20,7 +24,11 @@ pub(crate) fn dump_chunk(
 ) -> String {
     let mut output = String::new();
     let mut protos = Vec::new();
-    collect_protos(&chunk.main, 0, &mut protos);
+    collect_protos(&chunk.main, None, 0, &mut protos);
+
+    let parents: Vec<Option<usize>> = protos.iter().map(|(_, parent, _, _)| *parent).collect();
+    let nodes = build_proto_nodes(&parents);
+    let plan = compute_focus_plan(&nodes, &filters.as_focus_request());
 
     let layout = chunk
         .header
@@ -45,10 +53,34 @@ pub(crate) fn dump_chunk(
     if let Some(proto_id) = filters.proto {
         let _ = writeln!(output, "filters proto=proto#{proto_id}");
     }
+    let _ = writeln!(output, "filters proto_depth={}", filters.proto_depth);
+    if let Some(breadcrumb) = format_breadcrumb(&plan) {
+        let _ = writeln!(output, "focus {breadcrumb}");
+    }
     let _ = writeln!(output);
 
-    for (id, depth, proto) in protos {
-        if filters.proto.is_some_and(|proto_id| proto_id != id) {
+    if plan.focus.is_none() {
+        let _ = writeln!(output, "  <no proto matched filters>");
+        return colorize_debug_text(&output, color);
+    }
+
+    for (id, parent, depth, proto) in protos {
+        if plan.is_elided(id) {
+            let indent = "  ".repeat(depth);
+            let entry = ParserProtoEntry {
+                id,
+                parent,
+                depth,
+                proto,
+            };
+            let _ = writeln!(
+                output,
+                "{indent}{}",
+                format_proto_summary_row(&build_parser_summary_row(&entry)),
+            );
+            continue;
+        }
+        if !plan.is_visible(id) {
             continue;
         }
 
@@ -147,13 +179,14 @@ pub(crate) fn dump_chunk(
 
 fn collect_protos<'a>(
     proto: &'a RawProto,
+    parent: Option<usize>,
     depth: usize,
-    out: &mut Vec<(usize, usize, &'a RawProto)>,
+    out: &mut Vec<(usize, Option<usize>, usize, &'a RawProto)>,
 ) {
     let id = out.len();
-    out.push((id, depth, proto));
+    out.push((id, parent, depth, proto));
     for child in &proto.common.children {
-        collect_protos(child, depth + 1, out);
+        collect_protos(child, Some(id), depth + 1, out);
     }
 }
 

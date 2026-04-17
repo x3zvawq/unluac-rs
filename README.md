@@ -118,8 +118,10 @@ Debug options:
 | `--detail` | Debug output detail level | `normal` when debug is enabled |
 | `-c`, `--color` | Debug color mode | `auto` |
 | `--proto` | Restrict debug dumps to a specific proto id | None |
+| `--proto-depth` | Max depth of child protos expanded relative to the focused proto (`0`/`1`/`2`/…/`all`; default keeps only the focus, elided children appear as single-line summaries) | `0` |
 | `-t`, `--timing` | Print timing report | `false` |
 | `--dump-pass` | Dump before/after snapshots for specific passes (comma-separated names, e.g. `carried-locals,temp-inline`) | None |
+| `--list-protos` | Print a flat listing of every proto (id, parent, lines, instrs, children) and exit after the parse stage | `false` |
 
 Readability and naming options:
 

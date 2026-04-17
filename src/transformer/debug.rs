@@ -5,7 +5,10 @@
 
 use std::fmt::Write as _;
 
-use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
+use crate::debug::{
+    DebugColorMode, DebugDetail, DebugFilters, FocusPlan, ProtoSummaryRow, build_proto_nodes,
+    colorize_debug_text, compute_focus_plan, format_breadcrumb, format_proto_summary_row,
+};
 use crate::parser::DialectVersion;
 
 use super::{
@@ -31,7 +34,7 @@ pub fn dump_lir(
 ) -> String {
     let mut output = String::new();
     let protos = collect_proto_entries(&chunk.main);
-    let visible_protos = visible_proto_ids(&protos, filters);
+    let plan = plan_focus(&protos, filters);
 
     let _ = writeln!(output, "===== Dump LIR =====");
     let _ = writeln!(
@@ -44,11 +47,15 @@ pub fn dump_lir(
     if let Some(proto_id) = filters.proto {
         let _ = writeln!(output, "filters proto=proto#{proto_id}");
     }
+    let _ = writeln!(output, "filters proto_depth={}", filters.proto_depth);
+    if let Some(breadcrumb) = format_breadcrumb(&plan) {
+        let _ = writeln!(output, "focus {breadcrumb}");
+    }
     let _ = writeln!(output);
 
-    write_proto_tree_view(&mut output, &protos, &visible_protos, detail);
+    write_proto_tree_view(&mut output, &protos, &plan, detail);
     let _ = writeln!(output);
-    write_lir_listing(&mut output, &protos, &visible_protos);
+    write_lir_listing(&mut output, &protos, &plan);
 
     colorize_debug_text(&output, color)
 }
@@ -78,28 +85,50 @@ fn collect_proto_entries_inner<'a>(
     }
 }
 
-fn visible_proto_ids(protos: &[ProtoEntry<'_>], filters: &DebugFilters) -> Vec<usize> {
-    match filters.proto {
-        Some(id) if protos.iter().any(|entry| entry.id == id) => vec![id],
-        Some(_) => Vec::new(),
-        None => protos.iter().map(|entry| entry.id).collect(),
+fn plan_focus(protos: &[ProtoEntry<'_>], filters: &DebugFilters) -> FocusPlan {
+    let parents: Vec<Option<usize>> = protos.iter().map(|e| e.parent).collect();
+    let nodes = build_proto_nodes(&parents);
+    compute_focus_plan(&nodes, &filters.as_focus_request())
+}
+
+fn build_summary_row(entry: &ProtoEntry<'_>) -> ProtoSummaryRow {
+    ProtoSummaryRow {
+        id: entry.id,
+        depth_below_focus: entry.depth,
+        name: None,
+        first: None,
+        lines: Some((
+            entry.proto.line_range.defined_start,
+            entry.proto.line_range.defined_end,
+        )),
+        instrs: Some(entry.proto.instrs.len()),
+        children: Some(entry.proto.children.len()),
     }
 }
 
 fn write_proto_tree_view(
     output: &mut String,
     protos: &[ProtoEntry<'_>],
-    visible_protos: &[usize],
+    plan: &FocusPlan,
     detail: DebugDetail,
 ) {
     let _ = writeln!(output, "proto tree");
-    if visible_protos.is_empty() {
+    if plan.focus.is_none() {
         let _ = writeln!(output, "  <no proto matched filters>");
         return;
     }
 
     for entry in protos {
-        if !visible_protos.contains(&entry.id) {
+        if plan.is_elided(entry.id) {
+            let indent = "  ".repeat(entry.depth + 1);
+            let _ = writeln!(
+                output,
+                "{indent}{}",
+                format_proto_summary_row(&build_summary_row(entry)),
+            );
+            continue;
+        }
+        if !plan.is_visible(entry.id) {
             continue;
         }
 
@@ -133,15 +162,23 @@ fn write_proto_tree_view(
     }
 }
 
-fn write_lir_listing(output: &mut String, protos: &[ProtoEntry<'_>], visible_protos: &[usize]) {
+fn write_lir_listing(output: &mut String, protos: &[ProtoEntry<'_>], plan: &FocusPlan) {
     let _ = writeln!(output, "low-ir listing");
-    if visible_protos.is_empty() {
+    if plan.focus.is_none() {
         let _ = writeln!(output, "  <no proto matched filters>");
         return;
     }
 
     for entry in protos {
-        if !visible_protos.contains(&entry.id) {
+        if plan.is_elided(entry.id) {
+            let _ = writeln!(
+                output,
+                "  {}",
+                format_proto_summary_row(&build_summary_row(entry)),
+            );
+            continue;
+        }
+        if !plan.is_visible(entry.id) {
             continue;
         }
 

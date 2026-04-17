@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
+use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, ProtoDepth, colorize_debug_text};
 
 use super::{FunctionNameMap, NameMap};
 
@@ -24,14 +24,30 @@ pub fn dump_naming(
     if let Some(proto_id) = filters.proto {
         let _ = writeln!(output, "filters proto=proto#{proto_id}");
     }
+    let _ = writeln!(output, "filters proto_depth={}", filters.proto_depth);
     let _ = writeln!(output);
 
+    // Naming 不持有 proto 父子拓扑；按「focus=proto」+「depth 控制是否展开其他 proto」
+    // 的最小化语义来消费 filters：
+    // - depth = Fixed(0) 时：只展示焦点 proto（未指定则默认 proto 0）；其余以单行
+    //   `<elided>` 占位，提醒调用者存在其他 proto。
+    // - depth = Fixed(N>=1) 或 All：展示全部 proto（naming 没有层级可言，简化处理）。
+    let focus = filters.proto.unwrap_or(0);
+    let expand_all = !matches!(filters.proto_depth, ProtoDepth::Fixed(0));
+
     for (index, function) in names.functions.iter().enumerate() {
-        if filters.proto.is_some_and(|proto_id| proto_id != index) {
-            continue;
+        if expand_all || index == focus {
+            let _ = writeln!(output, "proto#{index}");
+            write_function(&mut output, function, detail);
+        } else {
+            let _ = writeln!(
+                output,
+                "proto#{index} <elided> params={} locals={} upvalues={}",
+                function.params.len(),
+                function.locals.len(),
+                function.upvalues.len(),
+            );
         }
-        let _ = writeln!(output, "proto#{index}");
-        write_function(&mut output, function, detail);
     }
 
     colorize_debug_text(&output, color)

@@ -206,7 +206,7 @@ impl DecompilerPipeline {
                 .expect("structure stage completed must leave structure facts in state");
             let dump_config = PassDumpConfig {
                 pass_names: options.debug.dump_passes.clone(),
-                proto_filter: options.debug.filters.proto,
+                filters: options.debug.filters,
             };
             analyze_hir(
                 lowered,

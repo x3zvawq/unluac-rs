@@ -6,7 +6,11 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text, format_display_set};
+use crate::debug::{
+    DebugColorMode, DebugDetail, DebugFilters, FocusPlan, ProtoSummaryRow, build_proto_nodes,
+    colorize_debug_text, compute_focus_plan, format_breadcrumb, format_display_set,
+    format_proto_summary_row,
+};
 use crate::transformer::{LowInstr, LoweredChunk, LoweredProto};
 
 use super::common::{
@@ -17,6 +21,7 @@ use super::common::{
 #[derive(Debug, Clone, Copy)]
 struct ProtoEntry<'a, T> {
     id: usize,
+    parent: Option<usize>,
     depth: usize,
     facts: &'a T,
 }
@@ -24,6 +29,7 @@ struct ProtoEntry<'a, T> {
 #[derive(Debug, Clone, Copy)]
 struct DataflowProtoEntry<'a> {
     id: usize,
+    parent: Option<usize>,
     depth: usize,
     proto: &'a LoweredProto,
     cfg: &'a CfgGraph,
@@ -39,17 +45,29 @@ pub fn dump_cfg(
 ) -> String {
     let mut output = String::new();
     let entries = collect_proto_entries(graph);
-    let visible = visible_ids(entries.iter().map(|e| e.id), filters);
+    let plan = plan_focus(&entries, filters);
 
     let _ = writeln!(output, "===== Dump CFG =====");
     let _ = writeln!(output, "cfg detail={} protos={}", detail, entries.len());
-    if let Some(proto_id) = filters.proto {
-        let _ = writeln!(output, "filters proto=proto#{proto_id}");
-    }
+    write_focus_header(&mut output, filters, &plan);
     let _ = writeln!(output);
 
+    if plan.focus.is_none() {
+        let _ = writeln!(output, "  <no proto matched filters>");
+        return colorize_debug_text(&output, color);
+    }
+
     for entry in &entries {
-        if !visible.contains(&entry.id) {
+        if plan.is_elided(entry.id) {
+            let indent = "  ".repeat(entry.depth);
+            let _ = writeln!(
+                output,
+                "{indent}{}",
+                format_proto_summary_row(&build_cfg_summary_row(entry)),
+            );
+            continue;
+        }
+        if !plan.is_visible(entry.id) {
             continue;
         }
 
@@ -116,7 +134,7 @@ pub fn dump_graph_facts(
 ) -> String {
     let mut output = String::new();
     let entries = collect_proto_entries(graph_facts);
-    let visible = visible_ids(entries.iter().map(|e| e.id), filters);
+    let plan = plan_focus(&entries, filters);
 
     let _ = writeln!(output, "===== Dump GraphFacts =====");
     let _ = writeln!(
@@ -125,13 +143,25 @@ pub fn dump_graph_facts(
         detail,
         entries.len()
     );
-    if let Some(proto_id) = filters.proto {
-        let _ = writeln!(output, "filters proto=proto#{proto_id}");
-    }
+    write_focus_header(&mut output, filters, &plan);
     let _ = writeln!(output);
 
+    if plan.focus.is_none() {
+        let _ = writeln!(output, "  <no proto matched filters>");
+        return colorize_debug_text(&output, color);
+    }
+
     for entry in &entries {
-        if !visible.contains(&entry.id) {
+        if plan.is_elided(entry.id) {
+            let indent = "  ".repeat(entry.depth);
+            let _ = writeln!(
+                output,
+                "{indent}{}",
+                format_proto_summary_row(&build_graph_facts_summary_row(entry)),
+            );
+            continue;
+        }
+        if !plan.is_visible(entry.id) {
             continue;
         }
 
@@ -218,7 +248,7 @@ pub fn dump_dataflow(
 ) -> String {
     let mut output = String::new();
     let entries = collect_dataflow_entries(&chunk.main, cfg, dataflow);
-    let visible = visible_ids(entries.iter().map(|e| e.id), filters);
+    let plan = plan_focus_dataflow(&entries, filters);
 
     let _ = writeln!(output, "===== Dump Dataflow =====");
     let _ = writeln!(
@@ -227,13 +257,25 @@ pub fn dump_dataflow(
         detail,
         entries.len()
     );
-    if let Some(proto_id) = filters.proto {
-        let _ = writeln!(output, "filters proto=proto#{proto_id}");
-    }
+    write_focus_header(&mut output, filters, &plan);
     let _ = writeln!(output);
 
+    if plan.focus.is_none() {
+        let _ = writeln!(output, "  <no proto matched filters>");
+        return colorize_debug_text(&output, color);
+    }
+
     for entry in &entries {
-        if !visible.contains(&entry.id) {
+        if plan.is_elided(entry.id) {
+            let indent = "  ".repeat(entry.depth);
+            let _ = writeln!(
+                output,
+                "{indent}{}",
+                format_proto_summary_row(&build_dataflow_summary_row(entry)),
+            );
+            continue;
+        }
+        if !plan.is_visible(entry.id) {
             continue;
         }
 
@@ -341,12 +383,13 @@ where
     T: ProtoChildren<T>,
 {
     let mut entries = Vec::new();
-    collect_proto_entries_inner(root, 0, &mut entries);
+    collect_proto_entries_inner(root, None, 0, &mut entries);
     entries
 }
 
 fn collect_proto_entries_inner<'a, T>(
     node: &'a T,
+    parent: Option<usize>,
     depth: usize,
     entries: &mut Vec<ProtoEntry<'a, T>>,
 ) where
@@ -355,12 +398,13 @@ fn collect_proto_entries_inner<'a, T>(
     let id = entries.len();
     entries.push(ProtoEntry {
         id,
+        parent,
         depth,
         facts: node,
     });
 
     for child in node.children() {
-        collect_proto_entries_inner(child, depth + 1, entries);
+        collect_proto_entries_inner(child, Some(id), depth + 1, entries);
     }
 }
 
@@ -370,7 +414,7 @@ fn collect_dataflow_entries<'a>(
     dataflow: &'a DataflowFacts,
 ) -> Vec<DataflowProtoEntry<'a>> {
     let mut entries = Vec::new();
-    collect_dataflow_entries_inner(proto, cfg, dataflow, 0, &mut entries);
+    collect_dataflow_entries_inner(proto, cfg, dataflow, None, 0, &mut entries);
     entries
 }
 
@@ -378,12 +422,14 @@ fn collect_dataflow_entries_inner<'a>(
     proto: &'a LoweredProto,
     cfg: &'a CfgGraph,
     dataflow: &'a DataflowFacts,
+    parent: Option<usize>,
     depth: usize,
     entries: &mut Vec<DataflowProtoEntry<'a>>,
 ) {
     let id = entries.len();
     entries.push(DataflowProtoEntry {
         id,
+        parent,
         depth,
         proto,
         cfg,
@@ -396,16 +442,75 @@ fn collect_dataflow_entries_inner<'a>(
         .zip(cfg.children.iter())
         .zip(dataflow.children.iter())
     {
-        collect_dataflow_entries_inner(child_proto, child_cfg, child_dataflow, depth + 1, entries);
+        collect_dataflow_entries_inner(
+            child_proto,
+            child_cfg,
+            child_dataflow,
+            Some(id),
+            depth + 1,
+            entries,
+        );
     }
 }
 
-fn visible_ids(entries: impl Iterator<Item = usize>, filters: &DebugFilters) -> Vec<usize> {
-    let all: Vec<usize> = entries.collect();
-    match filters.proto {
-        Some(id) if all.contains(&id) => vec![id],
-        Some(_) => Vec::new(),
-        None => all,
+fn plan_focus<T>(entries: &[ProtoEntry<'_, T>], filters: &DebugFilters) -> FocusPlan {
+    let parents: Vec<Option<usize>> = entries.iter().map(|e| e.parent).collect();
+    let nodes = build_proto_nodes(&parents);
+    compute_focus_plan(&nodes, &filters.as_focus_request())
+}
+
+fn plan_focus_dataflow(entries: &[DataflowProtoEntry<'_>], filters: &DebugFilters) -> FocusPlan {
+    let parents: Vec<Option<usize>> = entries.iter().map(|e| e.parent).collect();
+    let nodes = build_proto_nodes(&parents);
+    compute_focus_plan(&nodes, &filters.as_focus_request())
+}
+
+fn write_focus_header(output: &mut String, filters: &DebugFilters, plan: &FocusPlan) {
+    if let Some(proto_id) = filters.proto {
+        let _ = writeln!(output, "filters proto=proto#{proto_id}");
+    }
+    let _ = writeln!(output, "filters proto_depth={}", filters.proto_depth);
+    if let Some(breadcrumb) = format_breadcrumb(plan) {
+        let _ = writeln!(output, "focus {breadcrumb}");
+    }
+}
+
+fn build_cfg_summary_row<T>(entry: &ProtoEntry<'_, T>) -> ProtoSummaryRow
+where
+    T: ProtoChildren<T>,
+{
+    ProtoSummaryRow {
+        id: entry.id,
+        depth_below_focus: entry.depth,
+        name: None,
+        first: None,
+        lines: None,
+        instrs: None,
+        children: Some(entry.facts.children().len()),
+    }
+}
+
+fn build_graph_facts_summary_row(entry: &ProtoEntry<'_, GraphFacts>) -> ProtoSummaryRow {
+    ProtoSummaryRow {
+        id: entry.id,
+        depth_below_focus: entry.depth,
+        name: None,
+        first: None,
+        lines: None,
+        instrs: None,
+        children: Some(entry.facts.children.len()),
+    }
+}
+
+fn build_dataflow_summary_row(entry: &DataflowProtoEntry<'_>) -> ProtoSummaryRow {
+    ProtoSummaryRow {
+        id: entry.id,
+        depth_below_focus: entry.depth,
+        name: None,
+        first: None,
+        lines: None,
+        instrs: Some(entry.proto.instrs.len()),
+        children: Some(entry.proto.children.len()),
     }
 }
 

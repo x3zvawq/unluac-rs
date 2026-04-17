@@ -5,7 +5,11 @@
 
 use std::fmt::Write as _;
 
-use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text, format_display_set};
+use crate::debug::{
+    DebugColorMode, DebugDetail, DebugFilters, FocusPlan, ProtoSummaryRow, build_proto_nodes,
+    colorize_debug_text, compute_focus_plan, format_breadcrumb, format_display_set,
+    format_proto_summary_row,
+};
 
 use super::common::{
     BranchCandidate, BranchRegionFact, BranchValueMergeCandidate, GenericPhiMaterialization,
@@ -17,6 +21,7 @@ use super::common::{
 #[derive(Debug, Clone, Copy)]
 struct ProtoEntry<'a> {
     id: usize,
+    parent: Option<usize>,
     depth: usize,
     facts: &'a StructureFacts,
 }
@@ -30,7 +35,7 @@ pub fn dump_structure(
 ) -> String {
     let mut output = String::new();
     let entries = collect_proto_entries(structure);
-    let visible = visible_proto_ids(&entries, filters);
+    let plan = plan_focus(&entries, filters);
 
     let _ = writeln!(output, "===== Dump Structure =====");
     let _ = writeln!(
@@ -42,10 +47,28 @@ pub fn dump_structure(
     if let Some(proto_id) = filters.proto {
         let _ = writeln!(output, "filters proto=proto#{proto_id}");
     }
+    let _ = writeln!(output, "filters proto_depth={}", filters.proto_depth);
+    if let Some(breadcrumb) = format_breadcrumb(&plan) {
+        let _ = writeln!(output, "focus {breadcrumb}");
+    }
     let _ = writeln!(output);
 
+    if plan.focus.is_none() {
+        let _ = writeln!(output, "  <no proto matched filters>");
+        return colorize_debug_text(&output, color);
+    }
+
     for entry in &entries {
-        if !visible.contains(&entry.id) {
+        if plan.is_elided(entry.id) {
+            let indent = "  ".repeat(entry.depth);
+            let _ = writeln!(
+                output,
+                "{indent}{}",
+                format_proto_summary_row(&build_summary_row(entry)),
+            );
+            continue;
+        }
+        if !plan.is_visible(entry.id) {
             continue;
         }
 
@@ -109,27 +132,43 @@ pub fn dump_structure(
 
 fn collect_proto_entries(root: &StructureFacts) -> Vec<ProtoEntry<'_>> {
     let mut entries = Vec::new();
-    collect_proto_entries_inner(root, 0, &mut entries);
+    collect_proto_entries_inner(root, None, 0, &mut entries);
     entries
 }
 
 fn collect_proto_entries_inner<'a>(
     facts: &'a StructureFacts,
+    parent: Option<usize>,
     depth: usize,
     entries: &mut Vec<ProtoEntry<'a>>,
 ) {
     let id = entries.len();
-    entries.push(ProtoEntry { id, depth, facts });
+    entries.push(ProtoEntry {
+        id,
+        parent,
+        depth,
+        facts,
+    });
     for child in &facts.children {
-        collect_proto_entries_inner(child, depth + 1, entries);
+        collect_proto_entries_inner(child, Some(id), depth + 1, entries);
     }
 }
 
-fn visible_proto_ids(entries: &[ProtoEntry<'_>], filters: &DebugFilters) -> Vec<usize> {
-    match filters.proto {
-        Some(id) if entries.iter().any(|entry| entry.id == id) => vec![id],
-        Some(_) => Vec::new(),
-        None => entries.iter().map(|entry| entry.id).collect(),
+fn plan_focus(entries: &[ProtoEntry<'_>], filters: &DebugFilters) -> FocusPlan {
+    let parents: Vec<Option<usize>> = entries.iter().map(|e| e.parent).collect();
+    let nodes = build_proto_nodes(&parents);
+    compute_focus_plan(&nodes, &filters.as_focus_request())
+}
+
+fn build_summary_row(entry: &ProtoEntry<'_>) -> ProtoSummaryRow {
+    ProtoSummaryRow {
+        id: entry.id,
+        depth_below_focus: entry.depth,
+        name: None,
+        first: None,
+        lines: None,
+        instrs: None,
+        children: Some(entry.facts.children.len()),
     }
 }
 

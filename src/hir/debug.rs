@@ -4,14 +4,26 @@
 //! 的 `Temp / Goto / Label / Continue / Unstructured` 一眼可见。如果最终 dump 里
 //! 还出现 `decision(...)`，那说明 HIR 末端的决策图消除退化了。
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
+use crate::debug::{
+    DebugColorMode, DebugDetail, DebugFilters, FocusPlan, ProtoSummaryRow, build_proto_nodes,
+    colorize_debug_text, compute_focus_plan, format_breadcrumb, format_proto_summary_row,
+};
 
 use super::common::{
-    HirBlock, HirDecisionExpr, HirDecisionTarget, HirExpr, HirLValue, HirModule, HirStmt,
-    HirTableField, HirUnaryOpKind,
+    HirBlock, HirDecisionExpr, HirDecisionTarget, HirExpr, HirLValue, HirModule, HirProto,
+    HirProtoRef, HirStmt, HirTableField, HirUnaryOpKind,
 };
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct HirProtoEntry<'a> {
+    pub id: usize,
+    pub parent: Option<usize>,
+    pub depth: usize,
+    pub proto: &'a HirProto,
+}
 
 /// 输出 HIR 的人类可读摘要。
 pub fn dump_hir(
@@ -33,15 +45,34 @@ pub fn dump_hir(
     if let Some(proto_id) = filters.proto {
         let _ = writeln!(output, "filters proto=proto#{proto_id}");
     }
+    let _ = writeln!(output, "filters proto_depth={}", filters.proto_depth);
+
+    let entries = collect_hir_entries(module);
+    let plan = plan_focus(&entries, filters);
+    if let Some(breadcrumb) = format_breadcrumb(&plan) {
+        let _ = writeln!(output, "focus {breadcrumb}");
+    }
     let _ = writeln!(output);
 
-    for proto in &module.protos {
-        if filters
-            .proto
-            .is_some_and(|proto_id| proto_id != proto.id.index())
-        {
+    if plan.focus.is_none() {
+        let _ = writeln!(output, "  <no proto matched filters>");
+        return colorize_debug_text(&output, color);
+    }
+
+    for entry in &entries {
+        if plan.is_elided(entry.id) {
+            let _ = writeln!(
+                output,
+                "{}",
+                format_proto_summary_row(&build_summary_row(entry)),
+            );
             continue;
         }
+        if !plan.is_visible(entry.id) {
+            continue;
+        }
+
+        let proto = entry.proto;
 
         let _ = writeln!(
             output,
@@ -419,6 +450,84 @@ fn format_proto_refs(protos: &[super::common::HirProtoRef]) -> String {
             .map(|proto| format!("proto#{}", proto.index()))
             .collect::<Vec<_>>()
             .join(", ")
+    }
+}
+
+pub(super) fn collect_hir_entries<'a>(module: &'a HirModule) -> Vec<HirProtoEntry<'a>> {
+    // HIR 的 proto 存在扁平数组里，`HirProtoRef(id)` 指 `protos[id]`。
+    // 为了生成 focus plan 需要的 DFS 序，我们按 entry 从根开始 DFS 展开。
+    let proto_by_id: BTreeMap<usize, &'a HirProto> =
+        module.protos.iter().map(|p| (p.id.index(), p)).collect();
+
+    let mut entries = Vec::new();
+    walk(module.entry, None, 0, &proto_by_id, &mut entries);
+    // 兜底：如果 module.protos 里有孤岛 proto（没被 entry 可达到），附在末尾，
+    // 保证线性下标的稳定性，elided 计数也才准。
+    let seen: std::collections::BTreeSet<usize> =
+        entries.iter().map(|e| e.proto.id.index()).collect();
+    for proto in &module.protos {
+        if !seen.contains(&proto.id.index()) {
+            let id = entries.len();
+            entries.push(HirProtoEntry {
+                id,
+                parent: None,
+                depth: 0,
+                proto,
+            });
+        }
+    }
+    return entries;
+
+    fn walk<'a>(
+        current: HirProtoRef,
+        parent_slot: Option<usize>,
+        depth: usize,
+        proto_by_id: &BTreeMap<usize, &'a HirProto>,
+        entries: &mut Vec<HirProtoEntry<'a>>,
+    ) {
+        let Some(proto) = proto_by_id.get(&current.index()).copied() else {
+            return;
+        };
+        let slot = entries.len();
+        entries.push(HirProtoEntry {
+            id: slot,
+            parent: parent_slot,
+            depth,
+            proto,
+        });
+        for child in &proto.children {
+            walk(*child, Some(slot), depth + 1, proto_by_id, entries);
+        }
+    }
+}
+
+pub(super) fn plan_focus(entries: &[HirProtoEntry<'_>], filters: &DebugFilters) -> FocusPlan {
+    let parents: Vec<Option<usize>> = entries.iter().map(|e| e.parent).collect();
+    let nodes = build_proto_nodes(&parents);
+    // DebugFilters.proto 走的是 "HirProtoRef.index()" 语义；我们需要把它映射回
+    // 当前 entries 数组里的 slot。
+    let focus_slot = filters.proto.and_then(|target| {
+        entries
+            .iter()
+            .position(|entry| entry.proto.id.index() == target)
+    });
+    let mut request = filters.as_focus_request();
+    request.proto = focus_slot;
+    compute_focus_plan(&nodes, &request)
+}
+
+pub(super) fn build_summary_row(entry: &HirProtoEntry<'_>) -> ProtoSummaryRow {
+    ProtoSummaryRow {
+        id: entry.proto.id.index(),
+        depth_below_focus: entry.depth,
+        name: None,
+        first: None,
+        lines: Some((
+            entry.proto.line_range.defined_start,
+            entry.proto.line_range.defined_end,
+        )),
+        instrs: None,
+        children: Some(entry.proto.children.len()),
     }
 }
 

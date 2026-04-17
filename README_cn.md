@@ -118,8 +118,10 @@ unluac-cli -i /absolute/path/to/chunk.out -D lua5.1 -o /tmp/case.lua
 | `--detail` | 调试输出粒度 | `normal`（启用 debug 时） |
 | `-c`, `--color` | 调试输出颜色模式 | `auto` |
 | `--proto` | 仅输出指定 proto id 的调试结果 | 无 |
+| `--proto-depth` | 相对聚焦 proto 向下展开的子 proto 层数（`0`/`1`/`2`/…/`all`；默认只保留焦点本身，未展开的子 proto 以单行摘要呈现） | `0` |
 | `-t`, `--timing` | 输出耗时报告 | `false` |
 | `--dump-pass` | 输出指定 pass 的 before/after 快照（逗号分隔，如 `carried-locals,temp-inline`） | 无 |
+| `--list-protos` | 打印所有 proto 的扁平列表（id/parent/行号/指令数/子 proto 数），解析完成后直接退出 | `false` |
 
 可读性与命名参数：
 

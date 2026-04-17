@@ -24,6 +24,7 @@ mod traverse;
 mod visit;
 mod walk;
 
+use crate::debug::DebugFilters;
 use crate::generate::GenerateMode;
 use crate::hir::common::HirModule;
 use crate::hir::promotion::ProtoPromotionFacts;
@@ -31,13 +32,18 @@ use crate::readability::ReadabilityOptions;
 use crate::scheduler::{run_invalidation_loop, InvalidationTag, PassDescriptor, PassPhase};
 use crate::timing::TimingCollector;
 
-/// pass dump 需要的参数包，避免在 simplify_hir 签名上增加太多松散参数。
+/// pass dump 需要的参数包。
+///
+/// 聚焦与深度语义由 `filters` 提供，这里不再单独记录 `proto_filter`。
+/// 所有层级的 dump 对齐到同一套 `compute_focus_plan`：pass 快照对可见
+/// proto 走完整 before/after，对“elided” proto 只发送一行 `<elided>` 摘要标记，
+/// 对完全不可见的 proto 直接跳过。
 #[derive(Clone, Default)]
 pub(crate) struct PassDumpConfig {
     /// 需要 dump 的 pass 名称集合（空则不启用 dump）。
     pub pass_names: Vec<String>,
-    /// proto 过滤。
-    pub proto_filter: Option<usize>,
+    /// 用户传入的调试过滤器，同时承载 focus proto 和 proto_depth。
+    pub filters: DebugFilters,
 }
 
 const MAX_SIMPLIFY_ITERATIONS: usize = 128;
@@ -185,7 +191,7 @@ pub(super) fn simplify_hir(
         |index, name| {
             // 如果当前 pass 在 dump 列表中，先快照 before
             let before_snapshots = if dump_active && dump_config.pass_names.iter().any(|p| p == name) {
-                Some(capture_hir_snapshots(module, dump_config.proto_filter))
+                Some(capture_hir_snapshots(module, &dump_config.filters))
             } else {
                 None
             };
@@ -215,7 +221,7 @@ pub(super) fn simplify_hir(
 
             // pass 产生变化时输出 before/after diff
             if let Some(before) = before_snapshots.filter(|_| changed) {
-                emit_hir_pass_diff(name, &before, module, dump_config.proto_filter);
+                emit_hir_pass_diff(name, &before, module, &dump_config.filters);
             }
 
             changed
@@ -247,32 +253,71 @@ fn apply_proto_pass(
     changed
 }
 
-/// 拍摄所有（或指定）proto 的文本快照，用于 pass dump before/after 对比。
-fn capture_hir_snapshots(module: &HirModule, proto_filter: Option<usize>) -> Vec<(usize, String)> {
-    module
-        .protos
+/// 拍摄所有可见 proto 的文本快照，用于 pass dump before/after 对比。
+///
+/// 返回值的第三个字段是“是否被 focus plan 归为 visible”；false 表示这个 proto
+/// 处于 elided 档位，下游 diff 只会在发生变化时打一行 `<elided>` 摘要。
+/// 完全不可见的 proto 不会进入返回数组。
+fn capture_hir_snapshots(
+    module: &HirModule,
+    filters: &DebugFilters,
+) -> Vec<(usize, String, bool)> {
+    let entries = super::debug::collect_hir_entries(module);
+    let plan = super::debug::plan_focus(&entries, filters);
+    if plan.focus.is_none() {
+        return Vec::new();
+    }
+    entries
         .iter()
-        .filter(|proto| proto_filter.is_none_or(|f| f == proto.id.index()))
-        .map(|proto| (proto.id.index(), super::debug::dump_proto_snapshot(proto)))
+        .filter_map(|entry| {
+            if plan.is_visible(entry.id) {
+                Some((
+                    entry.proto.id.index(),
+                    super::debug::dump_proto_snapshot(entry.proto),
+                    true,
+                ))
+            } else if plan.is_elided(entry.id) {
+                Some((
+                    entry.proto.id.index(),
+                    super::debug::dump_proto_snapshot(entry.proto),
+                    false,
+                ))
+            } else {
+                None
+            }
+        })
         .collect()
 }
 
 /// 对比 before 快照与当前 module 状态，输出有变化的 proto 到 stderr。
+///
+/// 可见 proto 打印完整 before/after；elided proto 只打一行 `<elided>` 摘要标记
+/// `=== [hir] pass=X proto#N CHANGED (elided) <summary> === end ===`，避免击穿用户
+/// 没有要求关注的下层 proto 细节。
 fn emit_hir_pass_diff(
     pass_name: &str,
-    before: &[(usize, String)],
+    before: &[(usize, String, bool)],
     module: &HirModule,
-    proto_filter: Option<usize>,
+    filters: &DebugFilters,
 ) {
-    let after = capture_hir_snapshots(module, proto_filter);
-    for ((idx, before_text), (_, after_text)) in before.iter().zip(after.iter()) {
-        if before_text != after_text {
+    let after = capture_hir_snapshots(module, filters);
+    for ((idx, before_text, before_visible), (_, after_text, _)) in
+        before.iter().zip(after.iter())
+    {
+        if before_text == after_text {
+            continue;
+        }
+        if *before_visible {
             eprintln!("=== [hir] pass={pass_name} proto#{idx} CHANGED ===");
             eprintln!("--- before ---");
             eprint!("{before_text}");
             eprintln!("--- after ---");
             eprint!("{after_text}");
             eprintln!("=== end ===");
+        } else {
+            // elided proto 只留一行标记；不再重复推算 summary row，
+            // 用户想看完整 diff 可以把 focus 换到该 proto 再跑一遍。
+            eprintln!("=== [hir] pass={pass_name} proto#{idx} CHANGED (elided) ===");
         }
     }
 }

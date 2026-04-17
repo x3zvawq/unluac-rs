@@ -5,7 +5,11 @@
 
 use std::fmt::Write as _;
 
-use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text};
+use crate::debug::{
+    DebugColorMode, DebugDetail, DebugFilters, FocusPlan, colorize_debug_text,
+    format_proto_summary_row,
+};
+use crate::parser::debug::{build_parser_summary_row, ParserProtoEntry};
 use crate::parser::{
     ChunkHeader, DecodedText, Endianness, Origin, RawChunk, RawInstr, RawLiteralConst, RawProto,
     RawString,
@@ -29,7 +33,7 @@ pub(crate) fn dump_chunk(
 ) -> String {
     let mut output = String::new();
     let protos = collect_proto_entries(&chunk.main);
-    let visible_protos = visible_proto_ids(&protos, filters);
+    let plan = plan_focus(&protos, filters);
 
     let _ = writeln!(output, "===== Dump Parser =====");
     let _ = writeln!(
@@ -41,17 +45,21 @@ pub(crate) fn dump_chunk(
     if let Some(proto_id) = filters.proto {
         let _ = writeln!(output, "filters proto=proto#{proto_id}");
     }
+    let _ = writeln!(output, "filters proto_depth={}", filters.proto_depth);
+    if let Some(breadcrumb) = crate::debug::format_breadcrumb(&plan) {
+        let _ = writeln!(output, "focus {breadcrumb}");
+    }
     let _ = writeln!(output);
 
     write_header_view(&mut output, &chunk.header);
     let _ = writeln!(output);
-    write_proto_tree_view(&mut output, &protos, &visible_protos, detail);
+    write_proto_tree_view(&mut output, &protos, &plan, detail);
 
     if !matches!(detail, DebugDetail::Summary) {
         let _ = writeln!(output);
-        write_constants_view(&mut output, &protos, &visible_protos);
+        write_constants_view(&mut output, &protos, &plan);
         let _ = writeln!(output);
-        write_raw_instructions_view(&mut output, &protos, &visible_protos, detail);
+        write_raw_instructions_view(&mut output, &protos, &plan, detail);
     }
 
     colorize_debug_text(&output, color)
@@ -82,12 +90,27 @@ fn collect_proto_entries_inner<'a>(
     }
 }
 
-fn visible_proto_ids(protos: &[ProtoEntry<'_>], filters: &DebugFilters) -> Vec<usize> {
-    match filters.proto {
-        Some(id) if protos.iter().any(|entry| entry.id == id) => vec![id],
-        Some(_) => Vec::new(),
-        None => protos.iter().map(|entry| entry.id).collect(),
+fn plan_focus(protos: &[ProtoEntry<'_>], filters: &DebugFilters) -> FocusPlan {
+    let parents: Vec<Option<usize>> = protos.iter().map(|e| e.parent).collect();
+    let nodes = crate::debug::build_proto_nodes(&parents);
+    crate::debug::compute_focus_plan(&nodes, &filters.as_focus_request())
+}
+
+fn to_shared_entry<'a>(entry: &ProtoEntry<'a>) -> ParserProtoEntry<'a> {
+    ParserProtoEntry {
+        id: entry.id,
+        parent: entry.parent,
+        depth: entry.depth,
+        proto: entry.proto,
     }
+}
+
+fn write_elided_row(output: &mut String, indent: &str, entry: &ProtoEntry<'_>) {
+    let _ = writeln!(
+        output,
+        "{indent}{}",
+        format_proto_summary_row(&build_parser_summary_row(&to_shared_entry(entry))),
+    );
 }
 
 fn write_header_view(output: &mut String, header: &ChunkHeader) {
@@ -117,17 +140,22 @@ fn write_header_view(output: &mut String, header: &ChunkHeader) {
 fn write_proto_tree_view(
     output: &mut String,
     protos: &[ProtoEntry<'_>],
-    visible_protos: &[usize],
+    plan: &FocusPlan,
     detail: DebugDetail,
 ) {
     let _ = writeln!(output, "proto tree");
-    if visible_protos.is_empty() {
+    if plan.focus.is_none() {
         let _ = writeln!(output, "  <no proto matched filters>");
         return;
     }
 
     for entry in protos {
-        if !visible_protos.contains(&entry.id) {
+        if plan.is_elided(entry.id) {
+            let indent = "  ".repeat(entry.depth + 1);
+            write_elided_row(output, &indent, entry);
+            continue;
+        }
+        if !plan.is_visible(entry.id) {
             continue;
         }
 
@@ -170,15 +198,19 @@ fn write_proto_tree_view(
     }
 }
 
-fn write_constants_view(output: &mut String, protos: &[ProtoEntry<'_>], visible_protos: &[usize]) {
+fn write_constants_view(output: &mut String, protos: &[ProtoEntry<'_>], plan: &FocusPlan) {
     let _ = writeln!(output, "constants");
-    if visible_protos.is_empty() {
+    if plan.focus.is_none() {
         let _ = writeln!(output, "  <no proto matched filters>");
         return;
     }
 
     for entry in protos {
-        if !visible_protos.contains(&entry.id) {
+        if plan.is_elided(entry.id) {
+            write_elided_row(output, "  ", entry);
+            continue;
+        }
+        if !plan.is_visible(entry.id) {
             continue;
         }
 
@@ -197,17 +229,21 @@ fn write_constants_view(output: &mut String, protos: &[ProtoEntry<'_>], visible_
 fn write_raw_instructions_view(
     output: &mut String,
     protos: &[ProtoEntry<'_>],
-    visible_protos: &[usize],
+    plan: &FocusPlan,
     detail: DebugDetail,
 ) {
     let _ = writeln!(output, "raw instructions");
-    if visible_protos.is_empty() {
+    if plan.focus.is_none() {
         let _ = writeln!(output, "  <no proto matched filters>");
         return;
     }
 
     for entry in protos {
-        if !visible_protos.contains(&entry.id) {
+        if plan.is_elided(entry.id) {
+            write_elided_row(output, "  ", entry);
+            continue;
+        }
+        if !plan.is_visible(entry.id) {
             continue;
         }
 

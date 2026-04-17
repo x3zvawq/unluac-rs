@@ -14,7 +14,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-pub use crate::debug::{DebugColorMode, DebugDetail, DebugFilters};
+pub use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, ProtoDepth};
 pub use crate::generate::{GenerateMode, GenerateOptions, QuoteStyle, TableStyle};
 pub use crate::naming::{
     FunctionNameMap, NameInfo, NameMap, NameSource, NamingMode, NamingOptions,

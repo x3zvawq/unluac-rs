@@ -14,7 +14,7 @@ use std::process::Command;
 use clap::{CommandFactory, Parser, builder::BoolishValueParser, error::ErrorKind};
 use unluac::decompile::{
     DebugColorMode, DebugDetail, DebugFilters, DecompileDialect, DecompileOptions, DecompileStage,
-    GenerateMode, NamingMode, QuoteStyle, TableStyle, decompile, render_timing_report,
+    GenerateMode, NamingMode, ProtoDepth, QuoteStyle, TableStyle, decompile, render_timing_report,
 };
 use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
@@ -41,6 +41,8 @@ struct CliOptions {
     output: Option<PathBuf>,
     luac: Option<PathBuf>,
     decompile: DecompileOptions,
+    /// 请求仅打印 proto 列表后直接退出。
+    list_protos: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -123,6 +125,11 @@ struct CliArgs {
     /// Restrict debug dumps to a specific proto id.
     #[arg(long, help_heading = "Debug")]
     proto: Option<usize>,
+    /// Max depth of child protos to expand in debug dumps, relative to the focused proto.
+    /// `0` (default) hides all child protos (replaced with single-line summaries);
+    /// `1` expands direct children; `all` restores full output.
+    #[arg(long, value_parser = parse_proto_depth_arg, help_heading = "Debug")]
+    proto_depth: Option<ProtoDepth>,
     /// Emit timing report.
     #[arg(short = 't', long, help_heading = "Debug")]
     timing: bool,
@@ -131,6 +138,10 @@ struct CliArgs {
     /// AST readability passes (e.g. `inline-exprs`, `branch-pretty`).
     #[arg(long, value_delimiter = ',', help_heading = "Debug")]
     dump_pass: Vec<String>,
+    /// List all protos in the chunk (id, parent, lines, instrs, children) and exit.
+    /// Runs up to the parse stage only; useful for picking a `--proto` target.
+    #[arg(long, help_heading = "Debug")]
+    list_protos: bool,
     /// Max inline complexity for returned expressions.
     #[arg(long, help_heading = "Generate")]
     return_inline_max_complexity: Option<usize>,
@@ -210,7 +221,7 @@ struct CliArgs {
     #[arg(
         short = 'o',
         long,
-        conflicts_with_all = ["debug", "dump", "detail", "color", "proto", "timing", "dump_pass"],
+        conflicts_with_all = ["debug", "dump", "detail", "color", "proto", "proto_depth", "timing", "dump_pass", "list_protos"],
         help_heading = "Output"
     )]
     output: Option<PathBuf>,
@@ -230,7 +241,15 @@ where
     })?;
     let debug_detail = options.decompile.debug.detail;
     let debug_color = options.decompile.debug.color;
+    let list_protos = options.list_protos;
     let result = decompile(&bytes, options.decompile)?;
+    if list_protos {
+        let chunk = result.state.raw_chunk.as_ref().ok_or_else(|| {
+            CliError::Usage("list-protos requires the parse stage to complete".into())
+        })?;
+        print!("{}", render_proto_listing(chunk));
+        return Ok(());
+    }
     if let Some(generated) = result.state.generated.as_ref() {
         for warning in &generated.warnings {
             eprintln!("[unluac][generate-warning] {warning}");
@@ -302,7 +321,8 @@ where
         || has_explicit_dump
         || args.detail.is_some()
         || args.color.is_some()
-        || args.proto.is_some();
+        || args.proto.is_some()
+        || args.proto_depth.is_some();
 
     // CLI 默认直接输出最终源码；只有显式请求时才启用 repo debug preset 的调试行为。
     decompile.debug.enable = false;
@@ -330,7 +350,10 @@ where
     if let Some(color) = args.color {
         decompile.debug.color = color;
     }
-    decompile.debug.filters = DebugFilters { proto: args.proto };
+    decompile.debug.filters = DebugFilters {
+        proto: args.proto,
+        proto_depth: args.proto_depth.unwrap_or(ProtoDepth::Fixed(0)),
+    };
 
     if has_explicit_debug_output {
         decompile.debug.enable = true;
@@ -353,6 +376,15 @@ where
 
     if !args.dump_pass.is_empty() {
         decompile.debug.dump_passes = args.dump_pass.clone();
+    }
+
+    if args.list_protos {
+        // 列 proto 不需要跑整条 pipeline，停在 parse；也不启用 debug 输出，
+        // 避免 run() 里走到 debug 分支而再二次渲染。
+        decompile.target_stage = DecompileStage::Parse;
+        decompile.debug.enable = false;
+        decompile.debug.timing = false;
+        decompile.debug.output_stages.clear();
     }
 
     if let Some(value) = args.return_inline_max_complexity {
@@ -408,6 +440,7 @@ where
         output: args.output,
         luac: args.luac,
         decompile,
+        list_protos: args.list_protos,
     })
 }
 
@@ -650,6 +683,16 @@ fn parse_debug_color_arg(value: &str) -> Result<DebugColorMode, String> {
         .map_err(|_| format!("unsupported debug color mode: {value}"))
 }
 
+fn parse_proto_depth_arg(value: &str) -> Result<ProtoDepth, String> {
+    match value {
+        "all" | "max" | "*" => Ok(ProtoDepth::All),
+        other => other
+            .parse::<usize>()
+            .map(ProtoDepth::Fixed)
+            .map_err(|_| format!("unsupported proto depth: {value} (expected a non-negative integer or `all`)")),
+    }
+}
+
 fn parse_string_encoding_arg(value: &str) -> Result<StringEncoding, String> {
     value.parse().map_err(|_| format!("unsupported encoding: {value}"))
 }
@@ -684,6 +727,70 @@ fn parse_generate_mode_arg(value: &str) -> Result<GenerateMode, String> {
     value
         .parse()
         .map_err(|_| format!("unsupported generate mode: {value}"))
+}
+
+/// 把 RawChunk 渲染成 `--list-protos` 需要的扁平表格。
+///
+/// 这里故意只依赖 parser 层已经掌握的事实（行号、指令数、子 proto 数），
+/// 让这个命令不触发后续任何 pass。用户拿到 id 之后可以再用 `--proto <id>`
+/// 配合 `--proto-depth` 去观察具体 pass 的细节。
+fn render_proto_listing(chunk: &unluac::parser::RawChunk) -> String {
+    use std::fmt::Write as _;
+
+    let mut rows: Vec<ProtoListRow> = Vec::new();
+    collect_proto_rows(&chunk.main, None, 0, &mut rows);
+
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "{:<6} {:<6} {:<12} {:<8} {:<8}  name",
+        "id", "parent", "lines", "instrs", "children",
+    );
+    for row in &rows {
+        let indent = "  ".repeat(row.depth);
+        let parent = row
+            .parent
+            .map(|p| format!("{p}"))
+            .unwrap_or_else(|| "-".to_owned());
+        let lines = format!("{}..{}", row.line_start, row.line_end);
+        let _ = writeln!(
+            output,
+            "{:<6} {:<6} {:<12} {:<8} {:<8}  {indent}proto#{}",
+            row.id, parent, lines, row.instrs, row.children, row.id,
+        );
+    }
+    output
+}
+
+struct ProtoListRow {
+    id: usize,
+    parent: Option<usize>,
+    depth: usize,
+    line_start: u32,
+    line_end: u32,
+    instrs: usize,
+    children: usize,
+}
+
+fn collect_proto_rows(
+    proto: &unluac::parser::RawProto,
+    parent: Option<usize>,
+    depth: usize,
+    rows: &mut Vec<ProtoListRow>,
+) {
+    let id = rows.len();
+    rows.push(ProtoListRow {
+        id,
+        parent,
+        depth,
+        line_start: proto.common.line_range.defined_start,
+        line_end: proto.common.line_range.defined_end,
+        instrs: proto.common.instructions.len(),
+        children: proto.common.children.len(),
+    });
+    for child in &proto.common.children {
+        collect_proto_rows(child, Some(id), depth + 1, rows);
+    }
 }
 
 #[derive(Debug)]

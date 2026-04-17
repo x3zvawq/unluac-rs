@@ -1,89 +1,65 @@
-# Debug 使用说明
+# 调试手册
 
-## 1. `cargo unluac`
+> 本文只回答“怎么调”。调试设施的实现位置见 `docs/design/10.debugging.md`，测试体系见 `docs/design/11.test.md`。
 
-CLI 调试入口，等价于 `cargo run -p unluac-cli -- ...`。
+## 适用范围
 
-默认直接输出源码，传 `-d` 启用 debug dump，传 `-t` 看 timing。
+- 用 `cargo unluac -- ...` 复现问题、观察中间层结果、缩小根因范围。
+- 不在这里解释调试代码如何实现，也不记录测试命令与测试规范。
 
-常用命令：
+## 常用入口
 
 ```bash
+# 直接反编译
 cargo unluac -- -i /path/to/chunk.out -D lua5.1
+
+# 从源码编译后再反编译
 cargo unluac -- -s tests/lua_cases/lua5.1/01_setfenv.lua -D lua5.1
-cargo unluac -- -i /path/to/chunk.out -D lua5.1 -o /tmp/case.lua
-cargo unluac -- -s tests/lua_cases/luajit/09_ull_table_rotation.lua -D luajit -d
-cargo unluac -- -i /path/to/chunk.out -t
-cargo run -p unluac-cli -- -i /path/to/chunk.out --dump=parse --detail=verbose
+
+# 查看某一层的 dump
+cargo unluac -- -i /path/to/chunk.out -D lua5.4 --dump hir --detail verbose
+
+# 停在某一层并聚焦某个 proto
+cargo unluac -- -i /path/to/chunk.out -D lua5.4 --stop-after readability --proto 3 --proto-depth 1
+
+# 查看某个 pass 的前后变化
+cargo unluac -- -i /path/to/chunk.out -D lua5.4 --dump-pass temp-inline --proto 2
 ```
 
-实用参数：
+## 调试参数速查
 
-| 参数 | 说明 |
-| ------ | ------ |
-| `-i/--input` | 已编译 chunk 路径 |
-| `-s/--source` | Lua 源码路径（自动编译） |
-| `-o/--output` | 源码输出路径 |
-| `-D/--dialect` | `lua5.1\|lua5.2\|lua5.3\|lua5.4\|lua5.5\|luajit\|luau` |
-| `-d/--debug` | 启用 repo debug preset dump |
-| `-e/--encoding` | `utf8\|gbk` |
-| `-p/--parse-mode` | `strict\|permissive` |
-| `-g/--generate-mode` | `strict\|best-effort\|permissive` |
-| `--dump` | 指定 dump 阶段（可多次） |
-| `--stop-after` | pipeline 停在哪一层 |
-| `--detail` | `summary\|normal\|verbose` |
-| `-t/--timing` | 输出 timing report |
-| `--proto` | 按 proto id 过滤 |
-| `--dump-pass` | 输出指定 pass 的 before/after 快照（逗号分隔） |
-| `-n/--naming-mode` | `debug-like\|simple\|heuristic` |
-| `-c/--color` | `auto\|always\|never` |
+| 参数 | 作用 |
+| --- | --- |
+| `-i/--input` | 输入已编译 chunk |
+| `-s/--source` | 输入 Lua 源码并自动编译 |
+| `-D/--dialect` | 指定方言 |
+| `-d/--debug` | 使用仓库默认 debug dump 预设 |
+| `--dump` | 指定要打印的阶段，可重复传入 |
+| `--stop-after` | 在指定阶段后停止 pipeline |
+| `--detail` | 控制 dump 详略 |
+| `--proto` | 只看某个 proto |
+| `--proto-depth` | 控制焦点 proto 向下展开的层数 |
+| `--dump-pass` | 看 pass 的 before/after 快照 |
+| `--list-protos` | 先列出 proto，便于决定 `--proto` |
+| `-t/--timing` | 输出阶段耗时 |
 
-约定：`--stop-after` 决定 pipeline 跑到哪层，`--dump` 只打印已到达层；`-o` 只支持纯源码输出，与 debug/timing 冲突时报错。
+## 使用约定
 
-### 1.1 `--dump-pass` 用法
+- `--stop-after` 决定 pipeline 跑到哪一层，`--dump` 只能打印已到达的层。
+- `--proto` / `--proto-depth` 适合在 parse、HIR、AST、readability 之间来回比对同一子函数。
+- `--dump-pass` 只在 pass 实际改动内容时输出快照；未变化时不会刷屏。
+- `-o/--output` 面向最终源码输出，不适合与调试输出混用。
 
-当需要调试某个具体 pass 的行为时，`--dump-pass` 可以输出该 pass 执行前后每个 proto/function 的文本快照（仅在 pass 产生了变化时输出）。输出到 stderr，不影响正常的 stdout 源码输出。
+## 推荐排错流程
 
-```bash
-# 查看 carried-locals pass 的 before/after
-cargo unluac -- -s tests/lua_cases/common_11_runtime.lua -D lua5.1 --dump-pass carried-locals
+1. 先用 `--list-protos` 确认目标函数，避免在大 chunk 里盲看全量输出。
+2. 从 `--dump parse` 或 `--stop-after parse` 开始，逐层向后推进，找到第一层“不对”的结果。
+3. 若问题只出现在某个子函数，立刻加 `--proto N --proto-depth 1` 缩小范围。
+4. 若怀疑某个 pass 改坏了结果，用 `--dump-pass pass-name` 看它的 before/after。
+5. 锁定层次后，再去看对应设计文档，而不是在后层堆特判。
 
-# 同时查看多个 pass
-cargo unluac -- -i chunk.out -D lua5.4 --dump-pass temp-inline,locals,carried-locals
+## 跳转
 
-# 配合 --proto 过滤只看某个 proto
-cargo unluac -- -i chunk.out -D lua5.4 --dump-pass temp-inline --proto 2
-```
-
-支持的 HIR pass 名称：`decision`, `boolean-shells`, `logical-simplify`, `table-constructors`, `closure-self-capture`, `temp-inline`, `locals`, `eliminate-decisions`, `close-scopes`, `carried-locals`, `dead-unresolved-temps`, `dead-labels`。
-
-支持的 AST readability pass 名称：`cleanup`, `local-coalesce`, `statement-merge`, `loop-header-merge`, `branch-pretty`, `field-access-sugar`, `inline-exprs`, `short-circuit-pretty`, `materialize-temps`, `installer-iife`, `function-sugar`, `global-decl-pretty`, `luajit-goto-safety`。
-
-## 2. `cargo unit-test`
-
-全量健康检查：原始源码 → 编译 → 反编译 → 重编译执行 → 语义等价校验。
-
-```bash
-cargo unit-test                                        # 全量
-cargo unit-test --suite decompile-pipeline-health      # 只跑反编译 pipeline
-cargo unit-test --dialect lua5.4 --case-filter generic_for
-cargo unit-test --jobs 4
-UNLUAC_TEST_OUTPUT=verbose cargo unit-test              # 查看失败细节
-```
-
-两个 suite：`case-health`（源码可编译执行）、`decompile-pipeline-health`（反编译语义等价）。
-
-## 3. `cargo test --test regression`
-
-防回归测试，锁定已修复 bug 和语义决策。测试在 `tests/regression/` 下按 dialect 组织。
-
-```bash
-cargo test --test regression                           # 全量
-cargo test --test regression -- degenerate_guard       # 按名称过滤
-```
-
-## 分工
-
-- `cargo unluac` — 高频排错
-- `cargo unit-test` — 全量健康检查
-- `cargo test --test regression` — 防回归
+- 调试设施 code-map：`docs/design/10.debugging.md`
+- 测试命令与测试规范：`docs/design/11.test.md`
+- 各层设计入口：`docs/design.md`
