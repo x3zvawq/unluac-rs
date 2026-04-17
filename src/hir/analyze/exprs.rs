@@ -124,13 +124,21 @@ fn expr_for_open_def_single_eval(
     let instr = lowering.proto.instrs.get(open_def.instr.index())?;
     match instr {
         LowInstr::Call(call) if matches!(call.results, ResultPack::Open(_)) => {
-            Some(HirExpr::Call(Box::new(HirCallExpr {
-                callee: expr_for_reg_use_single_eval(
+            let method_name = lower_method_name(lowering.proto, call.method_name);
+            let is_method_sugar =
+                matches!(call.kind, CallKind::Method) && method_name.is_some();
+            let callee = if is_method_sugar {
+                HirExpr::Nil
+            } else {
+                expr_for_reg_use_single_eval(
                     lowering,
                     open_def.block,
                     open_def.instr,
                     call.callee,
-                ),
+                )
+            };
+            Some(HirExpr::Call(Box::new(HirCallExpr {
+                callee,
                 args: lower_value_pack_single_eval(
                     lowering,
                     open_def.block,
@@ -139,7 +147,7 @@ fn expr_for_open_def_single_eval(
                 ),
                 multiret: true,
                 method: matches!(call.kind, CallKind::Method),
-                method_name: lower_method_name(lowering.proto, call.method_name),
+                method_name,
             })))
         }
         LowInstr::VarArg(vararg) if matches!(vararg.results, ResultPack::Open(_)) => {

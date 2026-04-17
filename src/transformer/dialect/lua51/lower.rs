@@ -180,6 +180,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst,
                             base: AccessBase::Env,
                             key: AccessKey::Const(self.const_ref(raw_pc, bx as usize)?),
+                            method_load: false,
                         })),
                     );
                     raw_index += 1;
@@ -195,6 +196,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst,
                             base: AccessBase::Reg(reg_from_u16(b)),
                             key: self.access_key(raw_pc, c)?,
+                            method_load: false,
                         })),
                     );
                     raw_index += 1;
@@ -274,6 +276,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst: callee,
                             base: AccessBase::Reg(reg_from_u16(b)),
                             key: method_key,
+                            method_load: true,
                         })),
                     );
                     self.set_pending_method(callee, self_arg, method_name);

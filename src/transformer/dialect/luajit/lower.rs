@@ -400,6 +400,7 @@ impl<'a> ProtoLowerer<'a> {
                             key: AccessKey::Const(
                                 self.kgc_string_const_ref(raw_pc, usize::from(d))?,
                             ),
+                            method_load: false,
                         })),
                     );
                     raw_index += 1;
@@ -428,6 +429,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst: reg_from_u8(a),
                             base: AccessBase::Reg(reg_from_u8(b)),
                             key: AccessKey::Reg(reg_from_u8(c)),
+                            method_load: false,
                         })),
                     );
                     raw_index += 1;
@@ -443,6 +445,7 @@ impl<'a> ProtoLowerer<'a> {
                             key: AccessKey::Const(
                                 self.kgc_string_const_ref(raw_pc, usize::from(c))?,
                             ),
+                            method_load: false,
                         })),
                     );
                     raw_index += 1;
@@ -456,6 +459,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst: reg_from_u8(a),
                             base: AccessBase::Reg(reg_from_u8(b)),
                             key: AccessKey::Integer(i64::from(c)),
+                            method_load: false,
                         })),
                     );
                     raw_index += 1;

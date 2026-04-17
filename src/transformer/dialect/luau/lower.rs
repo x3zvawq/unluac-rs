@@ -220,6 +220,7 @@ impl<'a> ProtoLowerer<'a> {
                                 dst,
                                 base,
                                 key: AccessKey::Const(key),
+                                method_load: false,
                             })),
                         );
                     }
@@ -239,6 +240,7 @@ impl<'a> ProtoLowerer<'a> {
                             key: AccessKey::Const(
                                 self.string_const_ref(raw_pc, aux_u24(raw_pc, opcode, extra)?)?,
                             ),
+                            method_load: false,
                         })),
                     );
                     raw_index += 1;
@@ -295,6 +297,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst,
                             base: AccessBase::Reg(reg_from_u8(b)),
                             key: AccessKey::Reg(reg_from_u8(c)),
+                            method_load: false,
                         })),
                     );
                     raw_index += 1;
@@ -325,6 +328,7 @@ impl<'a> ProtoLowerer<'a> {
                             key: AccessKey::Const(
                                 self.string_const_ref(raw_pc, aux_u24(raw_pc, opcode, extra)?)?,
                             ),
+                            method_load: false,
                         })),
                     );
                     raw_index += 1;
@@ -355,6 +359,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst,
                             base: AccessBase::Reg(reg_from_u8(b)),
                             key: AccessKey::Integer(i64::from(c) + 1),
+                            method_load: false,
                         })),
                     );
                     raw_index += 1;
@@ -419,6 +424,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst: callee,
                             base: AccessBase::Reg(base),
                             key: AccessKey::Const(method_name),
+                            method_load: true,
                         })),
                     );
                     self.set_pending_method(callee, self_arg, Some(method_name));
@@ -1269,7 +1275,7 @@ impl<'a> ProtoLowerer<'a> {
         callee: Reg,
         raw_b: u16,
     ) -> (CallKind, Option<crate::transformer::MethodNameHint>) {
-        self.pending_methods.call_info_if(callee, raw_b > 1)
+        self.pending_methods.call_info_if(callee, raw_b != 1)
     }
 
     fn invalidate_written_reg(&mut self, reg: Reg) {

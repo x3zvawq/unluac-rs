@@ -248,6 +248,7 @@ impl<'a> ProtoLowerer<'a> {
                                 b as usize,
                             )?,
                             key: AccessKey::Const(self.const_ref(raw_pc, c as usize)?),
+                            method_load: false,
                         })),
                     );
                     raw_index += 1;
@@ -263,6 +264,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst,
                             base: AccessBase::Reg(reg_from_u8(b)),
                             key: AccessKey::Reg(reg_from_u8(c)),
+                            method_load: false,
                         })),
                     );
                     raw_index += 1;
@@ -278,6 +280,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst,
                             base: AccessBase::Reg(reg_from_u8(b)),
                             key: AccessKey::Integer(i64::from(c)),
+                            method_load: false,
                         })),
                     );
                     raw_index += 1;
@@ -293,6 +296,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst,
                             base: AccessBase::Reg(reg_from_u8(b)),
                             key: AccessKey::Const(self.const_ref(raw_pc, c as usize)?),
+                            method_load: false,
                         })),
                     );
                     raw_index += 1;
@@ -403,6 +407,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst: callee,
                             base: AccessBase::Reg(reg_from_u8(b)),
                             key: method_key,
+                            method_load: true,
                         })),
                     );
                     self.set_pending_method(callee, self_arg, method_name);

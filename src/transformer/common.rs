@@ -442,6 +442,15 @@ pub struct GetTableInstr {
     pub dst: Reg,
     pub base: AccessBase,
     pub key: AccessKey,
+    /// 来自 `SELF` / `NAMECALL` 三元式的 method-load 位。
+    ///
+    /// Lua 的 `obj:name(args)` 在 bytecode 层展开成"先把 `obj` 搬到 self 槽位、再从
+    /// `obj[name]` 载入 method、然后 CALL"三步。后两步中的 GetTable 只用于把 method
+    /// 值物化到调用点寄存器，真正的方法名事实由紧随其后的 `CallInstr.method_name` 承载，
+    /// 本身是装饰性的。打上这个标志是为了让 HIR 层知道："如果 method_name 能恢复成
+    /// 字符串，这条 GetTable 对源码语义没有独立贡献"，从而避免在输出里留下机械的
+    /// `local x = obj.name` 残影。
+    pub method_load: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]

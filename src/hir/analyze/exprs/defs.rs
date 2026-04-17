@@ -195,12 +195,20 @@ fn expr_for_fixed_call(
         return None;
     }
 
+    let method_name = lower_method_name(lowering.proto, call.method_name);
+    let is_method_sugar = matches!(call.kind, CallKind::Method) && method_name.is_some();
+    let callee = if is_method_sugar {
+        HirExpr::Nil
+    } else {
+        expr_for_reg_use_single_eval(lowering, block, instr_ref, call.callee)
+    };
+
     Some(HirExpr::Call(Box::new(HirCallExpr {
-        callee: expr_for_reg_use_single_eval(lowering, block, instr_ref, call.callee),
+        callee,
         args: lower_value_pack_single_eval(lowering, block, instr_ref, call.args),
         multiret: false,
         method: matches!(call.kind, CallKind::Method),
-        method_name: lower_method_name(lowering.proto, call.method_name),
+        method_name,
     })))
 }
 
