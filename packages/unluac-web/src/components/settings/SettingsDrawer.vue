@@ -21,6 +21,7 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const settings = useSettingsStore()
 const copied = shallowRef(false)
+const appVersion = __APP_VERSION__
 
 function copyShareUrl() {
   const url = generateShareUrl()
@@ -396,7 +397,7 @@ const tableStyleOptions = [
           <NSpace vertical :size="10" class="pt-3">
             <div class="flex items-center justify-between">
               <span class="text-sm">{{ t('settings.about.version') }}</span>
-              <span class="text-sm opacity-60">1.1.0</span>
+              <span class="text-sm opacity-60">{{ appVersion }}</span>
             </div>
             <div>
               <NA href="https://github.com/x3zvawq/unluac-rs" target="_blank">
