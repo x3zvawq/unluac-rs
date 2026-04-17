@@ -73,7 +73,7 @@ fn inline_constructor_value_at_site(
         }
         let producer_value = pending_producer_value(context.block, producer)?;
         if !matches!(site, ConstructorInlineSite::Neutral)
-            && !is_constructor_access_base_inline_expr(producer_value)
+            && !producer_value_reaches_access_base_shape(context, producer_value)
         {
             return None;
         }
@@ -81,7 +81,18 @@ fn inline_constructor_value_at_site(
         if let Some(group) = producer.group {
             context.consumed_groups[group] = true;
         }
-        return Some(producer_value.clone());
+        let producer_value = producer_value.clone();
+        // 已经决定把这个 producer 值内联到当前站点，接下来要继续展开它内部的
+        // 子表达式。被内联进来的表达式的内部位置在语法上没有 callee/access-base
+        // 级别的形状约束（它们是这个值的内部组合），所以这里把站点重置为
+        // Neutral 再递归。不然像 `trailing=t47 → call(t4)` 这类形状会因为
+        // `t4` 出现在 CallCallee 位置时被 access-base 过滤掉，导致 producer
+        // t4 仍然未消费，整段 region 回滚而无法折回构造器。
+        return inline_constructor_value_at_site(
+            context,
+            &producer_value,
+            ConstructorInlineSite::Neutral,
+        );
     }
 
     match value {
@@ -333,7 +344,21 @@ fn expr_depends_on_any_pending_binding(
     }
 }
 
-fn is_constructor_access_base_inline_expr(expr: &HirExpr) -> bool {
+/// 判断一个 producer-value 内联到 callee / access-base 位置后，经过后续
+/// 内联展开，最终形态是否是合法的 access-base 形状。
+///
+/// 这个谓词是 `is_constructor_access_base_inline_expr` 的“透视版”：当值中
+/// 出现 `TempRef`/`LocalRef` 时，若该绑定是 pending 的 producer 且尚未消费，
+/// 我们会沿着 producer chain 再判一次；这样像
+/// `call(t4)` ← `t4=t3["status"]` ← `t3=require("jit")` 这种形状也可以被
+/// 接受 —— 因为最终折出的是 `require("jit")["status"](...)`，访问基本身
+/// 本就是合法 access-base。
+///
+/// 不做修改（不消费 consumed_bindings），只做只读判定。
+fn producer_value_reaches_access_base_shape(
+    context: &InlineContext<'_>,
+    expr: &HirExpr,
+) -> bool {
     match expr {
         HirExpr::Nil
         | HirExpr::Boolean(_)
@@ -347,7 +372,35 @@ fn is_constructor_access_base_inline_expr(expr: &HirExpr) -> bool {
         | HirExpr::LocalRef(_)
         | HirExpr::UpvalueRef(_)
         | HirExpr::GlobalRef(_) => true,
-        HirExpr::TableAccess(access) => is_constructor_access_base_inline_expr(&access.base),
+        HirExpr::TableAccess(access) => {
+            producer_value_reaches_access_base_shape(context, &access.base)
+        }
+        // Lua 的 prefixexp 语法允许 `Call` 结果继续作为下标/调用前缀
+        // （例如 `require("jit")["status"]()`）。因此 Call 本身也是合法的
+        // callee / access-base 形状，只要其 callee 本身是合法前缀表达式。
+        HirExpr::Call(call) => {
+            producer_value_reaches_access_base_shape(context, &call.callee)
+        }
+        HirExpr::TempRef(_) => {
+            // TempRef 对应的 binding 如果还在 pending producer 列表里，
+            // 说明它有机会被继续内联展开；透视到它的 producer 值再次判断一次。
+            if let Some(binding) = binding_from_expr(expr)
+                && let Some(binding_id) = context.binding_index.id_of(binding)
+                && let Some(producer_index) = context
+                    .producer_index_by_binding
+                    .get(binding_id)
+                    .and_then(|producer_index| *producer_index)
+            {
+                let producer = &context.pending_producers[producer_index];
+                if context.remaining_uses.contains(producer.binding_id) {
+                    return false;
+                }
+                if let Some(inner) = pending_producer_value(context.block, producer) {
+                    return producer_value_reaches_access_base_shape(context, inner);
+                }
+            }
+            false
+        }
         _ => false,
     }
 }
