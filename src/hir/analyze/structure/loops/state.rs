@@ -299,7 +299,48 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .loop_state_inside_exit_blocks(candidate, exit)
             .unwrap_or_else(|| candidate.blocks.clone());
 
-        for value in Self::exit_values(candidate, exit) {
+        self.apply_exit_phi_bindings(candidate, exit, &inside_exit_blocks, plan, target_overrides);
+
+        // branch_exit 本身可能只是一条 "cond 不成立 → JMP 到真正 post-loop" 的
+        // 线性 pad（典型触发：lua5.4 下 `while cond do ... goto L end` 让
+        // normal-exit 和 goto-exit 在同一个 continuation 合流）。结构层已经把
+        // 合并点记在 exit_value_merges 里指向下游真正的 continuation，但
+        // lower_while_loop 只把 branch_exit 作为 `exit` 传下来，phi 在当前
+        // `exit` 上找不到对应 state，也不会在下游物化成赋值。结果 post-loop
+        // 里引用 reg 的指令最终只能绑到一批悬空 phi temp，naming 再按悬空
+        // temp 直接声明一组未初始化的 local，从而把 print(outer,inner,total)
+        // 错写成 print(<uninit>, <uninit>, <uninit>)。
+        //
+        // 这里沿着 exit 的唯一线性后继再做一次替换：此时 `exit` 本身已经是
+        // pad，必须把它加到 inside_exit_blocks，下游 exit phi 的“从 pad 过来”
+        // 那条 outside incoming 才能被认成“仍在循环内侧”，从而被顶成同一条
+        // loop state。
+        if let Some(downstream) = self.normalized_post_loop_successor(exit) {
+            let mut inside_with_pad = inside_exit_blocks.clone();
+            inside_with_pad.insert(exit);
+            self.apply_exit_phi_bindings(
+                candidate,
+                downstream,
+                &inside_with_pad,
+                plan,
+                target_overrides,
+            );
+        }
+    }
+
+    /// 在指定 block 上尝试把 loop exit phi 替换成对应的 loop state 表达式。
+    ///
+    /// 抽出这段逻辑是为了让 `install_loop_exit_bindings` 可以在 `branch_exit`
+    /// 自身以及它下游的线性 continuation 上各跑一遍，而不在两处复制分支判定。
+    fn apply_exit_phi_bindings(
+        &mut self,
+        candidate: &LoopCandidate,
+        at_block: BlockRef,
+        inside_exit_blocks: &BTreeSet<BlockRef>,
+        plan: &LoopStatePlan,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) {
+        for value in Self::exit_values(candidate, at_block) {
             if let Some(state) = plan.states.iter().find(|state| state.reg == value.reg) {
                 let Some(state_expr) = lvalue_as_expr(&state.target) else {
                     continue;
@@ -307,13 +348,18 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 // break 先落在线性 cleanup pad、再跳到 post-loop continuation 时，
                 // exit phi 的 incoming 里会混进这些 pad block。它们虽然 CFG 上已不在
                 // `candidate.blocks` 内，但语义上仍然是 loop state 的内部出口。
-                if loop_value_incoming_all_within_blocks(value, &inside_exit_blocks) {
-                    self.replace_phi_with_target_expr(exit, value.phi_id, state.temp, state_expr);
+                if loop_value_incoming_all_within_blocks(value, inside_exit_blocks) {
+                    self.replace_phi_with_target_expr(
+                        at_block,
+                        value.phi_id,
+                        state.temp,
+                        state_expr,
+                    );
                     continue;
                 }
                 let Some(exit_init) = self.loop_exit_entry_expr_with_inside_blocks(
                     value,
-                    &inside_exit_blocks,
+                    inside_exit_blocks,
                     target_overrides,
                 ) else {
                     continue;
@@ -325,7 +371,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 if exit_init != state.init {
                     continue;
                 }
-                self.replace_phi_with_target_expr(exit, value.phi_id, state.temp, state_expr);
+                self.replace_phi_with_target_expr(at_block, value.phi_id, state.temp, state_expr);
                 continue;
             }
 
@@ -344,7 +390,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 // 仍然会保留原 phi temp 的引用；这里我们已经知道要把整条 phi 的物化
                 // 改成 `t_phi = l2` 形式，必须走 insert_phi_expr 才能在 block 前缀
                 // 里真的产出这条赋值。
-                self.overrides.insert_phi_expr(exit, value.phi_id, expr);
+                self.overrides.insert_phi_expr(at_block, value.phi_id, expr);
             }
         }
     }
