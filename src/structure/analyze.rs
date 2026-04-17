@@ -36,6 +36,7 @@ pub fn analyze_structure(
         proto,
         cfg,
         &loop_candidates,
+        &branch_candidates,
         &branch_region_facts,
         &irreducible_regions,
     );

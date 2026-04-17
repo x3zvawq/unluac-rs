@@ -211,7 +211,42 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // 典型触发场景：外层 while 的 phi_use_count == 0（没有指令直接读取该 phi，只经由
         // 内层 loop phi 间接消费），此时外层 plan 不把 inside_arm 的原始 def temps 加入
         // override map，导致 shared_expr_for_defs 无法匹配。
-        self.reaching_phi_override_expr(pred, reg, target_overrides)
+        if let Some(expr) = self.reaching_phi_override_expr(pred, reg, target_overrides) {
+            return Some(expr);
+        }
+
+        // 空 defs + 该 pred 入口处也没有任何 reaching value → 该寄存器从未写过，
+        // 语义等价于未初始化 local，即 Lua 里的 nil。典型触发：函数入口是 loop
+        // preheader，携带变量（如 `local found = nil`）并没有显式的 LOADNIL，
+        // 编译器依赖栈槽默认 nil。此时 exit phi 的 preheader 分支如果不被识别成
+        // nil，外层 loop state 与 exit 值的初值就对不上，phi 只能作为孤立 temp
+        // 被生成到 HIR 里。
+        if defs.is_empty() && self.pred_has_no_reaching_value(pred, reg) {
+            return Some(HirExpr::Nil);
+        }
+
+        None
+    }
+
+    /// 判断 `pred` 块入口处 `reg` 是否完全没有 reaching value（既无 def 也无 phi）。
+    ///
+    /// 用于 `loop_incoming_expr` 里的“空 defs → Nil”兜底。只在 pred 本身没有再次
+    /// 写该寄存器的情况下成立，否则 pred 内部的写入会在 edge 上提供一个真正的 def。
+    fn pred_has_no_reaching_value(&self, pred: BlockRef, reg: Reg) -> bool {
+        let range = self.lowering.cfg.blocks[pred.index()].instrs;
+        if range.is_empty() {
+            return false;
+        }
+        let values = self.lowering.dataflow.reaching_values_at(range.start);
+        let entry_empty = values.get(reg).is_none_or(|set| set.is_empty());
+        if !entry_empty {
+            return false;
+        }
+        // pred 内部如果有任何 def 写到该寄存器，edge 上就不再是 undef。
+        !(range.start.index()..range.end()).any(|instr_index| {
+            let effect = &self.lowering.dataflow.instr_effects[instr_index];
+            effect.fixed_must_defs.contains(&reg) || effect.fixed_may_defs.contains(&reg)
+        })
     }
 
     /// 查找 `pred` 块首条指令的 reaching values 里，`reg` 是否只有一个 phi，
@@ -249,9 +284,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         plan: &LoopStatePlan,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) {
-        if plan.states.is_empty() {
-            return;
-        }
+        // 即便当前 loop 自己没有任何 state（比如 numeric-for 的整个携带变量都被
+        // 外层 loop 接管，本地 plan 只剩 index 这种被 excluded 的寄存器），exit phi
+        // 里仍然可能有需要借助外层 target_overrides 重定向的 phi。这些 phi 如果在
+        // 这里被跳过，就会在后续 branch 条件 / post-loop 引用里残留成悬空 temp。
 
         for state in &plan.states {
             let Some(state_expr) = lvalue_as_expr(&state.target) else {
@@ -264,35 +300,73 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .unwrap_or_else(|| candidate.blocks.clone());
 
         for value in Self::exit_values(candidate, exit) {
-            let Some(state) = plan.states.iter().find(|state| state.reg == value.reg) else {
-                continue;
-            };
-            let Some(state_expr) = lvalue_as_expr(&state.target) else {
-                continue;
-            };
-            // break 先落在线性 cleanup pad、再跳到 post-loop continuation 时，
-            // exit phi 的 incoming 里会混进这些 pad block。它们虽然 CFG 上已不在
-            // `candidate.blocks` 内，但语义上仍然是 loop state 的内部出口。
-            if loop_value_incoming_all_within_blocks(value, &inside_exit_blocks) {
+            if let Some(state) = plan.states.iter().find(|state| state.reg == value.reg) {
+                let Some(state_expr) = lvalue_as_expr(&state.target) else {
+                    continue;
+                };
+                // break 先落在线性 cleanup pad、再跳到 post-loop continuation 时，
+                // exit phi 的 incoming 里会混进这些 pad block。它们虽然 CFG 上已不在
+                // `candidate.blocks` 内，但语义上仍然是 loop state 的内部出口。
+                if loop_value_incoming_all_within_blocks(value, &inside_exit_blocks) {
+                    self.replace_phi_with_target_expr(exit, value.phi_id, state.temp, state_expr);
+                    continue;
+                }
+                let Some(exit_init) = self.loop_exit_entry_expr_with_inside_blocks(
+                    value,
+                    &inside_exit_blocks,
+                    target_overrides,
+                ) else {
+                    continue;
+                };
+                // 只有当 exit phi 的“循环外初值”与当前 loop state 的初值确实是同一个语义槽位时，
+                // 才能直接把 exit merge 认成这条 loop state。否则像外层 if/elseif/else 包着 loop
+                // 的 case，exit block 上同寄存器号的 phi 还在和其他分支路径合流，不能被 loop state
+                // 直接顶掉。
+                if exit_init != state.init {
+                    continue;
+                }
                 self.replace_phi_with_target_expr(exit, value.phi_id, state.temp, state_expr);
                 continue;
             }
-            let Some(exit_init) = self.loop_exit_entry_expr_with_inside_blocks(
-                value,
-                &inside_exit_blocks,
-                target_overrides,
-            ) else {
-                continue;
-            };
-            // 只有当 exit phi 的“循环外初值”与当前 loop state 的初值确实是同一个语义槽位时，
-            // 才能直接把 exit merge 认成这条 loop state。否则像外层 if/elseif/else 包着 loop
-            // 的 case，exit block 上同寄存器号的 phi 还在和其他分支路径合流，不能被 loop state
-            // 直接顶掉。
-            if exit_init != state.init {
-                continue;
+
+            // 嵌套循环场景：当前 loop 的某个 exit phi 对应的寄存器不在 plan.states 里
+            // （典型是内层循环遇到外层 loop-carried 的变量：因为 build_loop_state_plan
+            // 里 `exit_value_is_owned_by_inherited_state` 命中后会跳过），但外层 loop
+            // 已经把这个寄存器的所有 def 统一改写到自己的 state target。此时 exit phi
+            // 的临时值在 HIR 里不会有任何物化路径，必须在这里显式用外层 state 的
+            // lvalue 去替换，否则 branch 条件 / post-loop 引用会保留孤立的 phi temp，
+            // 后端看到 `if t28` 这种形状就只好硬着头皮当未初始化变量渲染出来。
+            if let Some(target) = self.inherited_exit_target_for_value(value, target_overrides)
+                && let Some(expr) = lvalue_as_expr(&target)
+            {
+                // 直接用 insert_phi_expr 而不是 replace_phi_with_target_expr：
+                // 后者在 target_temp == phi_temp 时只会 suppress phi，结果 `if t_phi`
+                // 仍然会保留原 phi temp 的引用；这里我们已经知道要把整条 phi 的物化
+                // 改成 `t_phi = l2` 形式，必须走 insert_phi_expr 才能在 block 前缀
+                // 里真的产出这条赋值。
+                self.overrides.insert_phi_expr(exit, value.phi_id, expr);
             }
-            self.replace_phi_with_target_expr(exit, value.phi_id, state.temp, state_expr);
         }
+    }
+
+    /// 当 exit phi 的 inside/outside arm 所有 defs 都统一指向同一个已继承的
+    /// `target_overrides` 目标时，返回该目标。用于把嵌套循环里被外层 loop state
+    /// 吸收的 phi 及时替换掉，避免留下没有赋值的 phi temp。
+    fn inherited_exit_target_for_value(
+        &self,
+        value: &LoopValueMerge,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<HirLValue> {
+        let fixed_temps = &self.lowering.bindings.fixed_temps;
+        let combined_defs = value
+            .inside_arm
+            .defs()
+            .chain(value.outside_arm.defs())
+            .collect::<Vec<_>>();
+        if combined_defs.is_empty() {
+            return None;
+        }
+        shared_lvalue_for_defs(fixed_temps, combined_defs, target_overrides)
     }
 
     fn loop_state_target(

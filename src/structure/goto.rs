@@ -17,13 +17,16 @@ use crate::cfg::{Cfg, EdgeKind};
 use crate::transformer::{LowInstr, LoweredProto};
 
 use super::common::IrreducibleRegion;
-use super::common::{BranchRegionFact, GotoReason, GotoRequirement, LoopCandidate, LoopKindHint};
+use super::common::{
+    BranchCandidate, BranchRegionFact, GotoReason, GotoRequirement, LoopCandidate, LoopKindHint,
+};
 use super::helpers::{collect_region_entry_edges, collect_region_exit_edges};
 
 pub(super) fn analyze_goto_requirements(
     proto: &LoweredProto,
     cfg: &Cfg,
     loop_candidates: &[LoopCandidate],
+    branch_candidates: &[BranchCandidate],
     branch_regions: &[BranchRegionFact],
     irreducible_regions: &[IrreducibleRegion],
 ) -> Vec<GotoRequirement> {
@@ -63,6 +66,16 @@ pub(super) fn analyze_goto_requirements(
                         && !loop_candidate.backedges.contains(edge_ref)
                         && edge.kind != EdgeKind::Fallthrough
                         && cfg.reachable_blocks.contains(&edge.from)
+                        // 如果 edge.from 是某个 branch candidate 的 header，
+                        // 且 continue_target 是它的一个分支臂或 merge，
+                        // 那么这条边会被结构化 branch lowering 自然吸收
+                        // （表现为 `if cond then body end` 的自然落回），
+                        // 不应标记为 unstructured continue。
+                        && !is_branch_arm_to_target(
+                            branch_candidates,
+                            edge.from,
+                            continue_target,
+                        )
                     {
                         requirements.insert(GotoRequirement {
                             from: edge.from,
@@ -134,4 +147,20 @@ fn is_control_terminator(instr: &LowInstr) -> bool {
             | LowInstr::NumericForLoop(_)
             | LowInstr::GenericForLoop(_)
     )
+}
+
+/// 判断 `from` 是否是某个 branch candidate 的 header，且该 branch 的某个分支臂
+/// 直接指向 `target`。这种边会被结构化 branch lowering 自然吸收为
+/// `if cond then ... end` 的隐式 fallthrough，不需要标记为 unstructured continue。
+fn is_branch_arm_to_target(
+    branch_candidates: &[BranchCandidate],
+    from: crate::cfg::BlockRef,
+    target: crate::cfg::BlockRef,
+) -> bool {
+    branch_candidates.iter().any(|candidate| {
+        candidate.header == from
+            && (candidate.then_entry == target
+                || candidate.else_entry == Some(target)
+                || candidate.merge == Some(target))
+    })
 }

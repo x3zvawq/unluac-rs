@@ -757,19 +757,25 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         else {
             return false;
         };
+        // 当 structure 层的 goto 分析没有把该 block 标记为 continue source 时，
+        // 说明这条指向 continue_target 的边完全可以被结构化 branch 自然吸收
+        // （比如 `if cond then body end` 的隐式落回到循环头），不需要提升为显式
+        // continue。只有 goto 分析确认了 unstructured continue-like 的 block 才
+        // 需要后续的 terminal-exit / break-funnel 判定。
+        if !loop_context.continue_sources.contains(&block) {
+            return true;
+        }
         // 只有当非 continue 臂本身就是 terminal exit，且从 CFG 上根本到不了当前
         // continue target 时，才能确定它是“提前结束本轮/本函数”的 guard 分支。
         // 像 repeat 里的 break funnel 虽然最终也可能不回到 continue target，但它本身
         // 仍然是一个需要继续展开的控制块，不能在这里过早压平成 guard-return。
-        if !loop_context.continue_sources.contains(&block)
-            && matches!(
-                self.block_terminator(non_continue_entry),
-                Some((_instr_ref, LowInstr::Return(_) | LowInstr::TailCall(_)))
-            )
-            && !self
-                .lowering
-                .cfg
-                .can_reach(non_continue_entry, continue_target)
+        if matches!(
+            self.block_terminator(non_continue_entry),
+            Some((_instr_ref, LowInstr::Return(_) | LowInstr::TailCall(_)))
+        ) && !self
+            .lowering
+            .cfg
+            .can_reach(non_continue_entry, continue_target)
         {
             return true;
         }
