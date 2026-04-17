@@ -138,13 +138,35 @@ fn find_scope_end(
 ) -> Option<usize> {
     let mut saw_close = false;
     let mut last_activity = None;
+    // 一个寄存器可能在 scope 内有多次 `close from rX`（如 goto 反复进入的
+    // iteration early-exit），真正的词法 scope 结束应是能覆盖到当前寄存器的
+    // 最“靠后”的一次 close 事件（可能是精确匹配，也可能是更外层 scope 的
+    // 组合 close）。早期的 close 只是 scope 内部的 iteration 边界，把它们
+    // 当成 scope 末端会把后续仍在同一 scope 内的表达式错误地挤出块外。
+    let mut last_scope_close: Option<(usize, bool)> = None;
 
     for (index, stmt) in stmts.iter().enumerate().skip(start_index) {
+        if let HirStmt::Close(close) = stmt
+            && close.from_reg != 0
+            && close.from_reg <= reg_index
+        {
+            let is_exact = close.from_reg == reg_index;
+            last_scope_close = Some((index, is_exact));
+            saw_close = true;
+        }
+
         let activity = scope_activity_in_stmt(stmt, binding, reg_index);
         if activity.any() {
             last_activity = Some(index + 1);
         }
         saw_close |= activity.closes_scope;
+    }
+
+    if let Some((close_idx, is_exact)) = last_scope_close {
+        // 精确匹配的 close 语句属于当前 scope，自身会被 `strip_matching_close_from_stmt`
+        // 吸收，因此 end 要包含它；组合匹配的 close 属于外层 scope，end 只到它之前。
+        let end = if is_exact { close_idx + 1 } else { close_idx };
+        return Some(last_activity.map_or(end, |la| la.max(end)));
     }
 
     if saw_close { last_activity } else { None }
