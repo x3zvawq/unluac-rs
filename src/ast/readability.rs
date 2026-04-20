@@ -17,6 +17,7 @@ mod inline_exprs;
 mod installer_iife;
 mod local_coalesce;
 mod loop_header_merge;
+mod param_alias_coalesce;
 mod luajit_goto_safety;
 mod materialize_temps;
 mod short_circuit_pretty;
@@ -100,6 +101,12 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
         invalidates: &[StatementAdjacency, BindingStructure],
     },
     PassDescriptor {
+        name: "param-alias-coalesce",
+        phase: PassPhase::Normal,
+        depends_on: &[BindingStructure],
+        invalidates: &[StatementAdjacency, BindingStructure, ExprShape],
+    },
+    PassDescriptor {
         name: "statement-merge",
         phase: PassPhase::Normal,
         depends_on: &[StatementAdjacency, ControlFlowShape],
@@ -172,6 +179,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
 const PASS_ENTRIES: &[ReadabilityPassEntry] = &[
     ReadabilityPassEntry { apply: cleanup::apply },
     ReadabilityPassEntry { apply: local_coalesce::apply },
+    ReadabilityPassEntry { apply: param_alias_coalesce::apply },
     ReadabilityPassEntry { apply: statement_merge::apply },
     ReadabilityPassEntry { apply: loop_header_merge::apply },
     ReadabilityPassEntry { apply: branch_pretty::apply },
