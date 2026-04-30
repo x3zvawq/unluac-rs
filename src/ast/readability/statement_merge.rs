@@ -23,8 +23,8 @@ use super::super::common::{
 };
 use super::ReadabilityContext;
 use super::binding_flow::{
-    BindingUseIndex, block_references_any_binding, expr_references_any_binding,
-    stmt_references_any_binding,
+    BindingUseIndex, binding_mentions_in_stmt, block_references_any_binding,
+    expr_references_any_binding, stmt_references_any_binding,
 };
 use super::expr_analysis::{expr_complexity, is_copy_like_expr};
 use super::visit::{self, AstVisitor};
@@ -256,36 +256,69 @@ fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
     use_index: &BindingUseIndex,
     suffix_start: usize,
 ) -> Option<NestedSinkAttempt> {
-    for start in 0..pending.len() {
+    if !stmt_can_accept_nested_hoisted_sink(stmt) {
+        return None;
+    }
+
+    let mentions = binding_mentions_in_stmt(stmt);
+    let mut start = 0usize;
+    while start < pending.len() {
         if use_index.count_uses_in_suffix(suffix_start, pending[start].id) != 0 {
+            start += 1;
             continue;
         }
 
-        let mut end = start;
-        while end < pending.len()
-            && use_index.count_uses_in_suffix(suffix_start, pending[end].id) == 0
+        let run_start = start;
+        let mut run_end = start;
+        let mut first_mentioned = None;
+        let mut mentioned_starts = Vec::new();
+        while run_end < pending.len()
+            && use_index.count_uses_in_suffix(suffix_start, pending[run_end].id) == 0
         {
-            end += 1;
+            if mentions.contains(&pending[run_end].id) {
+                if first_mentioned.is_none() {
+                    first_mentioned = Some(run_end);
+                    mentioned_starts.push(run_start);
+                }
+                if run_end != run_start {
+                    mentioned_starts.push(run_end);
+                }
+            }
+            run_end += 1;
         }
 
-        // 这里允许跳过前面仍需跨后缀存活的 carried binding，只把后面“只在某个嵌套块里
-        // 用完”的 hoisted local 单独沉进去；否则像
-        // `local next, staged; if ... else staged = ...; next = staged end`
-        // 这种形状会因为 `next` 还要在 if 之后继续用，把 `staged` 也一起卡在块顶。
-        for slice_end in (start + 1..=end).rev() {
-            if let Some((rewritten, consumed)) = try_sink_hoisted_decl_into_nested_stmt(
-                &pending[start..slice_end],
-                stmt,
-                use_index,
-                suffix_start,
-            ) {
-                return Some(NestedSinkAttempt {
-                    rewritten,
-                    start,
-                    consumed,
-                });
+        let Some(first_mentioned) = first_mentioned else {
+            start = run_end;
+            continue;
+        };
+
+        // mention 集合这里只做候选缓存：跳过必不可能成功的无 mention 切片，
+        // 但仍保留从 sinkable run 起点整体下沉的既有行为。
+        mentioned_starts.sort_unstable();
+        mentioned_starts.dedup();
+        for slice_start in mentioned_starts {
+            let slice_end_min = if slice_start > first_mentioned {
+                slice_start + 1
+            } else {
+                first_mentioned + 1
+            };
+            for slice_end in (slice_end_min..=run_end).rev() {
+                if let Some((rewritten, consumed)) = try_sink_hoisted_decl_into_nested_stmt(
+                    &pending[slice_start..slice_end],
+                    stmt,
+                    use_index,
+                    suffix_start,
+                ) {
+                    return Some(NestedSinkAttempt {
+                        rewritten,
+                        start: slice_start,
+                        consumed,
+                    });
+                }
             }
         }
+
+        start = run_end;
     }
 
     None
@@ -297,6 +330,10 @@ fn try_sink_hoisted_decl_into_nested_stmt(
     use_index: &BindingUseIndex,
     suffix_start: usize,
 ) -> Option<(AstStmt, usize)> {
+    if !stmt_can_accept_nested_hoisted_sink(stmt) {
+        return None;
+    }
+
     let sinkable_len = pending
         .iter()
         .take_while(|binding| use_index.count_uses_in_suffix(suffix_start, binding.id) == 0)
@@ -403,6 +440,20 @@ fn try_sink_hoisted_decl_into_nested_stmt(
         | AstStmt::Label(_)
         | AstStmt::Error(_) => None,
     }
+}
+
+fn stmt_can_accept_nested_hoisted_sink(stmt: &AstStmt) -> bool {
+    // 嵌套下沉只可能改写带子 block 的语句。对普通赋值/调用/return 先做
+    // pending 全量搜索没有语义收益，在大函数的块首 hoisted local 上会放大成性能黑洞。
+    matches!(
+        stmt,
+        AstStmt::If(_)
+            | AstStmt::While(_)
+            | AstStmt::Repeat(_)
+            | AstStmt::NumericFor(_)
+            | AstStmt::GenericFor(_)
+            | AstStmt::DoBlock(_)
+    )
 }
 
 fn sink_pending_bindings_into_block(

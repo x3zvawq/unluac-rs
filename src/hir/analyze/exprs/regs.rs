@@ -313,7 +313,7 @@ pub(crate) fn expr_for_reg_use_single_eval(
             .next()
             .expect("len checked above, exactly one SSA-like value exists");
         return match value {
-            SsaValue::Def(def) => expr_for_fixed_def(lowering, def)
+            SsaValue::Def(def) => expr_for_fixed_def_single_eval(lowering, def)
                 .unwrap_or_else(|| HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()])),
             SsaValue::Phi(phi) => HirExpr::TempRef(lowering.bindings.phi_temps[phi.index()]),
         };

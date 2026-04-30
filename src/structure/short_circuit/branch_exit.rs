@@ -1,8 +1,9 @@
 //! 这个文件负责“条件出口型”短路候选提取。
 //!
-//! 它解决的是 `if a and b then ... end`、`if a or b then ... end` 这类最终直接流向
-//! “整体为真/整体为假”两个出口的形状。这里特意不碰 value merge，让“条件出口识别”
-//! 和“值合流 DAG 提取”各自拥有单一职责。
+//! 它解决的是 `if a and b then ... end`、`if a or b then ... end`，以及
+//! `if a or b then ... else ... end` 这类最终直接流向“整体为真/整体为假”两个出口的
+//! 形状。这里特意不碰 value merge，让“条件出口识别”和“值合流 DAG 提取”各自拥有
+//! 单一职责。
 //!
 //! 它依赖 branch 候选、支配/后支配关系和共享线性跟随规则，只负责回答
 //! “这一串判断是不是一个纯条件出口短路”；它不会越权去拆 phi，也不会替 value merge
@@ -135,6 +136,62 @@ pub(super) fn analyze_linear_branch_exit_candidates(
     candidates
 }
 
+pub(super) fn analyze_if_else_branch_exit_candidates(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    branch_by_header: &BTreeMap<BlockRef, &BranchCandidate>,
+    branch_candidates: &[BranchCandidate],
+) -> Vec<ShortCircuitCandidate> {
+    let mut candidates = Vec::new();
+
+    for candidate in branch_candidates {
+        if candidate.kind != BranchKind::IfElse {
+            continue;
+        }
+
+        let headers = collect_if_else_branch_exit_chain(proto, cfg, branch_by_header, candidate);
+        if headers.len() < 2 {
+            continue;
+        }
+
+        for prefix_len in (2..=headers.len()).rev() {
+            let prefix = &headers[..prefix_len];
+            let Some(exit) = infer_linear_branch_exit(proto, cfg, prefix)
+                .or_else(|| infer_relaxed_linear_branch_exit(proto, cfg, prefix))
+            else {
+                continue;
+            };
+            let Some(nodes) = build_linear_branch_exit_nodes(proto, cfg, prefix, &exit) else {
+                continue;
+            };
+            let blocks = prefix.iter().copied().collect::<BTreeSet<_>>();
+            let reducible = is_reducible_candidate(cfg, candidate.header, &blocks);
+            candidates.push(ShortCircuitCandidate {
+                header: candidate.header,
+                blocks,
+                entry: ShortCircuitNodeRef(0),
+                nodes,
+                exit,
+                result_reg: None,
+                result_phi_id: None,
+                entry_defs: BTreeSet::new(),
+                value_incomings: Vec::new(),
+                reducible,
+            });
+            break;
+        }
+    }
+
+    candidates.sort_by_key(|candidate| candidate.header);
+    candidates.dedup_by(|left, right| {
+        left.header == right.header
+            && left.exit == right.exit
+            && left.blocks == right.blocks
+            && left.nodes == right.nodes
+    });
+    candidates
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GuardExitTempNode {
     id: ShortCircuitNodeRef,
@@ -187,10 +244,7 @@ impl<'a> GuardBranchExitDagBuilder<'a> {
     }
 
     fn build(mut self) -> Option<ShortCircuitCandidate> {
-        let root_candidate = *self.branch_by_header.get(&self.root)?;
-        if root_candidate.kind == BranchKind::IfElse {
-            return None;
-        }
+        let _root_candidate = *self.branch_by_header.get(&self.root)?;
 
         let entry = self.build_node(self.root)?;
         if entry != ShortCircuitNodeRef(0) || self.nodes.len() < 2 || self.exits.len() != 2 {
@@ -203,7 +257,7 @@ impl<'a> GuardBranchExitDagBuilder<'a> {
             return None;
         };
         let (truthy_exit, falsy_exit) =
-            classify_guard_branch_exits(self.cfg, *first_exit, *second_exit)?;
+            classify_guard_branch_exits(self.cfg, self.post_dom_tree, *first_exit, *second_exit)?;
 
         let nodes = self
             .nodes
@@ -276,17 +330,40 @@ impl<'a> GuardBranchExitDagBuilder<'a> {
     }
 
     fn resolve_target(&mut self, target: BlockRef) -> Option<GuardExitTempTarget> {
-        let LinearFollowTarget::Header(target) = LinearFollowCtx {
+        let original_target = target;
+        if target != self.root && self.cfg.preds[target.index()].len() > 1 {
+            self.exits.insert(target);
+            return Some(GuardExitTempTarget::Exit(target));
+        }
+        let followed = LinearFollowCtx {
             proto: self.proto,
             cfg: self.cfg,
             branch_by_header: self.branch_by_header,
             dom_tree: self.dom_tree,
             root: self.root,
         }
-        .follow(target, |_| true, |_, _| false)?
-        else {
-            return None;
+        .follow(target, |_| true, |_, _| false);
+        let target = match followed {
+            Some(LinearFollowTarget::Header(target)) => target,
+            Some(LinearFollowTarget::Terminal(target)) => {
+                if self.is_exit_target(target) {
+                    self.exits.insert(target);
+                    return Some(GuardExitTempTarget::Exit(target));
+                }
+                return None;
+            }
+            None => {
+                if self.is_exit_target(original_target) {
+                    self.exits.insert(original_target);
+                    return Some(GuardExitTempTarget::Exit(original_target));
+                }
+                return None;
+            }
         };
+        if target != self.root && self.cfg.preds[target.index()].len() > 1 {
+            self.exits.insert(target);
+            return Some(GuardExitTempTarget::Exit(target));
+        }
         if self.should_include_header(target) {
             Some(GuardExitTempTarget::Node(self.build_node(target)?))
         } else {
@@ -295,13 +372,20 @@ impl<'a> GuardBranchExitDagBuilder<'a> {
         }
     }
 
+    fn is_exit_target(&self, target: BlockRef) -> bool {
+        target != self.cfg.exit_block
+            && self.cfg.reachable_blocks.contains(&target)
+            && (self.dom_tree.dominates(self.root, target)
+                || self.post_dom_tree.dominates(target, self.root))
+    }
+
     fn should_include_header(&self, header: BlockRef) -> bool {
         let Some(candidate) = self.branch_by_header.get(&header) else {
             return false;
         };
 
-        candidate.kind != BranchKind::IfElse
-            && (header == self.root || !self.post_dom_tree.dominates(header, self.root))
+        let _candidate = candidate;
+        header == self.root || !self.post_dom_tree.dominates(header, self.root)
     }
 }
 
@@ -319,6 +403,53 @@ fn next_chain_header<'a>(
         None
     } else {
         Some(next)
+    }
+}
+
+fn collect_if_else_branch_exit_chain(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    branch_by_header: &BTreeMap<BlockRef, &BranchCandidate>,
+    root: &BranchCandidate,
+) -> Vec<BlockRef> {
+    let mut headers = Vec::new();
+    let mut visited = BTreeSet::new();
+    let mut current = root.header;
+
+    while visited.insert(current) {
+        headers.push(current);
+        let Some(next) = next_cfg_chain_header(proto, cfg, branch_by_header, current, &visited)
+        else {
+            break;
+        };
+        current = next;
+    }
+
+    headers
+}
+
+fn next_cfg_chain_header(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    branch_by_header: &BTreeMap<BlockRef, &BranchCandidate>,
+    header: BlockRef,
+    visited: &BTreeSet<BlockRef>,
+) -> Option<BlockRef> {
+    let (truthy_target, falsy_target) = truthy_falsy_targets(proto, cfg, header)?;
+    let mut next_headers = [truthy_target, falsy_target]
+        .into_iter()
+        .filter(|target| {
+            branch_by_header.contains_key(target)
+                && !visited.contains(target)
+                && cfg.preds[target.index()].len() <= 1
+        })
+        .collect::<Vec<_>>();
+    next_headers.sort();
+    next_headers.dedup();
+
+    match next_headers.as_slice() {
+        [next] => Some(*next),
+        _ => None,
     }
 }
 
@@ -361,6 +492,34 @@ fn infer_linear_branch_exit(
     Some(ShortCircuitExit::BranchExit {
         truthy: truthy_exit?,
         falsy: falsy_exit?,
+    })
+}
+
+fn infer_relaxed_linear_branch_exit(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    headers: &[BlockRef],
+) -> Option<ShortCircuitExit> {
+    let mut exits = BTreeSet::new();
+
+    for (index, header) in headers.iter().enumerate() {
+        let next = headers.get(index + 1).copied();
+        let (truthy_target, falsy_target) = truthy_falsy_targets(proto, cfg, *header)?;
+        for target in [truthy_target, falsy_target] {
+            if Some(target) != next {
+                exits.insert(target);
+            }
+        }
+    }
+
+    let exits = exits.into_iter().collect::<Vec<_>>();
+    let [first_exit, second_exit] = exits.as_slice() else {
+        return None;
+    };
+
+    Some(ShortCircuitExit::BranchExit {
+        truthy: *first_exit,
+        falsy: *second_exit,
     })
 }
 
@@ -420,16 +579,27 @@ fn classify_linear_target(
 
 fn classify_guard_branch_exits(
     cfg: &Cfg,
+    post_dom_tree: &PostDominatorTree,
     first_exit: BlockRef,
     second_exit: BlockRef,
 ) -> Option<(BlockRef, BlockRef)> {
+    match (
+        post_dom_tree.dominates(first_exit, second_exit),
+        post_dom_tree.dominates(second_exit, first_exit),
+    ) {
+        (true, false) => return Some((second_exit, first_exit)),
+        (false, true) => return Some((first_exit, second_exit)),
+        _ => {}
+    }
+
     match (
         cfg.can_reach(first_exit, second_exit),
         cfg.can_reach(second_exit, first_exit),
     ) {
         (true, false) => Some((first_exit, second_exit)),
         (false, true) => Some((second_exit, first_exit)),
-        _ => None,
+        (false, false) => Some((first_exit, second_exit)),
+        (true, true) => Some((first_exit, second_exit)),
     }
 }
 

@@ -8,9 +8,11 @@ use std::process::Command;
 
 use super::lower::{ChildAnalyses, LowerArtifacts, lower_proto};
 use crate::cfg::{analyze_dataflow, analyze_graph_facts, build_cfg_proto};
-use crate::hir::common::{HirBinaryOpKind, HirExpr, HirLValue, HirModule, HirStmt};
+use crate::hir::common::{
+    HirBinaryOpKind, HirDecisionTarget, HirExpr, HirLValue, HirModule, HirStmt,
+};
 use crate::hir::dump_hir;
-use crate::parser::{ParseOptions, parse_lua55_chunk, parse_luau_chunk};
+use crate::parser::{ParseOptions, parse_lua51_chunk, parse_lua55_chunk, parse_luau_chunk};
 use crate::structure::analyze_structure;
 use crate::transformer::lower_chunk;
 
@@ -100,6 +102,41 @@ fn luau_branch_carried_state_stays_resolved_across_nested_loops() {
     assert!(
         !proto.body.stmts.iter().any(stmt_contains_unresolved_expr),
         "nested branch-carried loop state should not fall back to unresolved phi:\n{hir_dump}",
+    );
+}
+
+#[test]
+fn lua51_if_else_short_circuit_shared_body_keeps_generic_for_structured() {
+    let module = lower_lua51_fixture_to_hir(
+        "tests/lua_cases/regress_05_if_else_short_circuit_shared_body.lua",
+    );
+    let hir_dump = dump_hir(
+        &module,
+        crate::debug::DebugDetail::Normal,
+        &crate::debug::DebugFilters::unfiltered(),
+        crate::debug::DebugColorMode::Never,
+    );
+    let proto = module
+        .protos
+        .iter()
+        .find(|proto| block_contains_generic_for(&proto.body))
+        .unwrap_or_else(|| {
+            panic!(
+                "generic-for should stay structured when its body contains an if-else short-circuit with a shared then body:\n{hir_dump}"
+            )
+        });
+
+    assert!(
+        !proto.body.stmts.iter().any(stmt_contains_unresolved_expr),
+        "generic-for body should not fall back to unresolved generic-for control:\n{hir_dump}",
+    );
+    assert!(
+        !block_contains_label_or_goto(&proto.body),
+        "structured generic-for should not force label/goto fallback:\n{hir_dump}",
+    );
+    assert!(
+        block_contains_logical_or_condition(&proto.body),
+        "shared body guard should keep the recovered logical-or condition:\n{hir_dump}",
     );
 }
 
@@ -302,6 +339,48 @@ fn lower_luau_fixture_to_hir(source_relative: &str) -> HirModule {
     }
 }
 
+fn lower_lua51_fixture_to_hir(source_relative: &str) -> HirModule {
+    let bytes = unluac_test_support::compile_lua_case("lua5.1", source_relative);
+    let raw = parse_lua51_chunk(&bytes, ParseOptions::default()).expect("fixture should parse");
+    let lowered = lower_chunk(&raw).expect("fixture should lower into LIR");
+    let cfg_graph = build_cfg_proto(&lowered.main);
+    let graph_facts = analyze_graph_facts(&cfg_graph);
+    let dataflow = analyze_dataflow(
+        &lowered.main,
+        &cfg_graph.cfg,
+        &graph_facts,
+        &cfg_graph.children,
+    );
+    let structure = analyze_structure(
+        &lowered.main,
+        &cfg_graph.cfg,
+        &graph_facts,
+        &dataflow,
+        &cfg_graph.children,
+    );
+
+    let mut artifacts = LowerArtifacts::default();
+    let entry = lower_proto(
+        &lowered.main,
+        &cfg_graph.cfg,
+        &graph_facts,
+        &dataflow,
+        &structure,
+        ChildAnalyses {
+            cfg_graphs: &cfg_graph.children,
+            graph_facts: &graph_facts.children,
+            dataflow: &dataflow.children,
+            structure: &structure.children,
+        },
+        &mut artifacts,
+    );
+
+    HirModule {
+        entry,
+        protos: artifacts.protos,
+    }
+}
+
 fn lower_lua55_fixture_to_hir(source_relative: &str) -> HirModule {
     let bytes = unluac_test_support::compile_lua_case("lua5.5", source_relative);
     let raw = parse_lua55_chunk(&bytes, ParseOptions::default()).expect("fixture should parse");
@@ -446,6 +525,169 @@ fn stmt_contains_unresolved_expr(stmt: &HirStmt) -> bool {
         | HirStmt::Continue
         | HirStmt::Goto(_)
         | HirStmt::Label(_) => false,
+    }
+}
+
+fn block_contains_generic_for(block: &crate::hir::HirBlock) -> bool {
+    block.stmts.iter().any(stmt_contains_generic_for)
+}
+
+fn stmt_contains_generic_for(stmt: &HirStmt) -> bool {
+    match stmt {
+        HirStmt::GenericFor(_) => true,
+        HirStmt::If(if_stmt) => {
+            block_contains_generic_for(&if_stmt.then_block)
+                || if_stmt
+                    .else_block
+                    .as_ref()
+                    .is_some_and(block_contains_generic_for)
+        }
+        HirStmt::While(while_stmt) => block_contains_generic_for(&while_stmt.body),
+        HirStmt::Repeat(repeat_stmt) => block_contains_generic_for(&repeat_stmt.body),
+        HirStmt::NumericFor(numeric_for) => block_contains_generic_for(&numeric_for.body),
+        HirStmt::Block(block) => block_contains_generic_for(block),
+        HirStmt::Unstructured(unstructured) => block_contains_generic_for(&unstructured.body),
+        HirStmt::LocalDecl(_)
+        | HirStmt::Assign(_)
+        | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::Return(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Close(_)
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => false,
+    }
+}
+
+fn block_contains_label_or_goto(block: &crate::hir::HirBlock) -> bool {
+    block.stmts.iter().any(stmt_contains_label_or_goto)
+}
+
+fn stmt_contains_label_or_goto(stmt: &HirStmt) -> bool {
+    match stmt {
+        HirStmt::Goto(_) | HirStmt::Label(_) => true,
+        HirStmt::If(if_stmt) => {
+            block_contains_label_or_goto(&if_stmt.then_block)
+                || if_stmt
+                    .else_block
+                    .as_ref()
+                    .is_some_and(block_contains_label_or_goto)
+        }
+        HirStmt::While(while_stmt) => block_contains_label_or_goto(&while_stmt.body),
+        HirStmt::Repeat(repeat_stmt) => block_contains_label_or_goto(&repeat_stmt.body),
+        HirStmt::NumericFor(numeric_for) => block_contains_label_or_goto(&numeric_for.body),
+        HirStmt::GenericFor(generic_for) => block_contains_label_or_goto(&generic_for.body),
+        HirStmt::Block(block) => block_contains_label_or_goto(block),
+        HirStmt::Unstructured(unstructured) => block_contains_label_or_goto(&unstructured.body),
+        HirStmt::LocalDecl(_)
+        | HirStmt::Assign(_)
+        | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::Return(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Close(_) => false,
+    }
+}
+
+fn block_contains_logical_or_condition(block: &crate::hir::HirBlock) -> bool {
+    block.stmts.iter().any(stmt_contains_logical_or_condition)
+}
+
+fn stmt_contains_logical_or_condition(stmt: &HirStmt) -> bool {
+    match stmt {
+        HirStmt::If(if_stmt) => {
+            expr_contains_logical_or(&if_stmt.cond)
+                || block_contains_logical_or_condition(&if_stmt.then_block)
+                || if_stmt
+                    .else_block
+                    .as_ref()
+                    .is_some_and(block_contains_logical_or_condition)
+        }
+        HirStmt::While(while_stmt) => block_contains_logical_or_condition(&while_stmt.body),
+        HirStmt::Repeat(repeat_stmt) => block_contains_logical_or_condition(&repeat_stmt.body),
+        HirStmt::NumericFor(numeric_for) => block_contains_logical_or_condition(&numeric_for.body),
+        HirStmt::GenericFor(generic_for) => block_contains_logical_or_condition(&generic_for.body),
+        HirStmt::Block(block) => block_contains_logical_or_condition(block),
+        HirStmt::Unstructured(unstructured) => {
+            block_contains_logical_or_condition(&unstructured.body)
+        }
+        HirStmt::LocalDecl(_)
+        | HirStmt::Assign(_)
+        | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::Return(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Close(_)
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => false,
+    }
+}
+
+fn expr_contains_logical_or(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::LogicalOr(_) => true,
+        HirExpr::Unary(unary) => expr_contains_logical_or(&unary.expr),
+        HirExpr::Binary(binary) => {
+            expr_contains_logical_or(&binary.lhs) || expr_contains_logical_or(&binary.rhs)
+        }
+        HirExpr::LogicalAnd(logical) => {
+            expr_contains_logical_or(&logical.lhs) || expr_contains_logical_or(&logical.rhs)
+        }
+        HirExpr::Decision(decision) => decision.nodes.iter().any(|node| {
+            expr_contains_logical_or(&node.test)
+                || decision_target_contains_logical_or(&node.truthy)
+                || decision_target_contains_logical_or(&node.falsy)
+        }),
+        HirExpr::Call(call) => {
+            expr_contains_logical_or(&call.callee) || call.args.iter().any(expr_contains_logical_or)
+        }
+        HirExpr::TableAccess(access) => {
+            expr_contains_logical_or(&access.base) || expr_contains_logical_or(&access.key)
+        }
+        HirExpr::TableConstructor(table) => {
+            table.fields.iter().any(|field| match field {
+                crate::hir::HirTableField::Array(value) => expr_contains_logical_or(value),
+                crate::hir::HirTableField::Record(record) => {
+                    matches!(&record.key, crate::hir::HirTableKey::Expr(key) if expr_contains_logical_or(key))
+                        || expr_contains_logical_or(&record.value)
+                }
+            }) || table
+                .trailing_multivalue
+                .as_ref()
+                .is_some_and(expr_contains_logical_or)
+        }
+        HirExpr::Closure(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::ParamRef(_)
+        | HirExpr::TempRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
+        | HirExpr::VarArg
+        | HirExpr::Unresolved(_) => false,
+    }
+}
+
+fn decision_target_contains_logical_or(target: &HirDecisionTarget) -> bool {
+    match target {
+        HirDecisionTarget::Expr(expr) => expr_contains_logical_or(expr),
+        HirDecisionTarget::Node(_) | HirDecisionTarget::CurrentValue => false,
     }
 }
 

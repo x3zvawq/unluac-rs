@@ -27,8 +27,8 @@ pub(super) use self::access::{
     expr_for_const, expr_for_value_operand, lower_table_access_expr, lower_table_access_target,
 };
 use self::access::{
-    expr_for_value_operand_inline, lower_table_access_expr_inline,
-    lower_table_access_expr_single_eval,
+    expr_for_value_operand_inline, expr_for_value_operand_single_eval,
+    lower_table_access_expr_inline, lower_table_access_expr_single_eval,
 };
 pub(super) use self::branch::{
     lower_binary_op, lower_branch_cond, lower_branch_subject, lower_branch_subject_inline,

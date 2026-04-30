@@ -6,6 +6,7 @@
 
 mod branches;
 
+use super::rewrites::expr_has_temp_ref_in;
 use super::*;
 
 /// 尝试基于现有结构候选恢复一个更接近源码的 HIR block。
@@ -76,11 +77,51 @@ pub(super) struct ActiveLoopContext {
     pub(super) downstream_post_loop: Option<BlockRef>,
     pub(super) continue_target: Option<BlockRef>,
     pub(super) continue_sources: BTreeSet<BlockRef>,
-    pub(super) break_exits: BTreeMap<BlockRef, HirBlock>,
+    pub(super) break_exits: BTreeMap<BlockRef, BreakExitBlock>,
     pub(super) state_slots: Vec<LoopStateSlot>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct BreakExitBlock {
+    pub(super) block: HirBlock,
+    pub(super) blocks: BTreeSet<BlockRef>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct StructureStateCheckpoint {
+    required_labels: BTreeSet<BlockRef>,
+    merge_allowed_blocks: BTreeMap<BlockRef, BTreeSet<BlockRef>>,
+    overrides: StructureOverrideState,
+    visited: BTreeSet<BlockRef>,
+    active_loops: Vec<ActiveLoopContext>,
+    stmts_len: usize,
+}
+
 impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
+    pub(super) fn checkpoint_state(&self, stmts_len: usize) -> StructureStateCheckpoint {
+        StructureStateCheckpoint {
+            required_labels: self.required_labels.clone(),
+            merge_allowed_blocks: self.merge_allowed_blocks.clone(),
+            overrides: self.overrides.clone(),
+            visited: self.visited.clone(),
+            active_loops: self.active_loops.clone(),
+            stmts_len,
+        }
+    }
+
+    pub(super) fn restore_state_checkpoint(
+        &mut self,
+        checkpoint: StructureStateCheckpoint,
+        stmts: &mut Vec<HirStmt>,
+    ) {
+        self.required_labels = checkpoint.required_labels;
+        self.merge_allowed_blocks = checkpoint.merge_allowed_blocks;
+        self.overrides = checkpoint.overrides;
+        self.visited = checkpoint.visited;
+        self.active_loops = checkpoint.active_loops;
+        stmts.truncate(checkpoint.stmts_len);
+    }
+
     fn new(lowering: &'b ProtoLowering<'a>) -> Self {
         let branch_by_header = lowering
             .structure
@@ -172,6 +213,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             if Some(block) == stop || block == self.lowering.cfg.exit_block {
                 break;
             }
+            if let Some(loop_escape_stmts) = self.active_loop_escape_stmts(block) {
+                stmts.extend(loop_escape_stmts);
+                break;
+            }
             if !self.lowering.cfg.reachable_blocks.contains(&block) || self.visited.contains(&block)
             {
                 return None;
@@ -180,15 +225,34 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             self.emit_required_label(block, &mut stmts);
 
             if self.loop_by_header.contains_key(&block) && Some(block) != suppressed_loop_header {
-                current = self.lower_loop(block, stop, &mut stmts, target_overrides)?;
+                let next = self.lower_loop(block, stop, &mut stmts, target_overrides);
+                current = next?;
             } else if self.branch_by_header.contains_key(&block) {
-                current = self.lower_branch(block, stop, &mut stmts, target_overrides)?;
+                let next = self.lower_branch(block, stop, &mut stmts, target_overrides);
+                current = next?;
             } else {
-                current = self.lower_linear_block(block, stop, &mut stmts, target_overrides)?;
+                let next = self.lower_linear_block(block, stop, &mut stmts, target_overrides);
+                current = next?;
             }
         }
 
         Some(HirBlock { stmts })
+    }
+
+    fn active_loop_escape_stmts(&mut self, block: BlockRef) -> Option<Vec<HirStmt>> {
+        let loop_context = self.active_loops.last()?.clone();
+        if loop_context.continue_target == Some(block) && self.loop_continue_target_is_empty(block)
+        {
+            return Some(vec![HirStmt::Continue]);
+        }
+        if block == loop_context.post_loop || Some(block) == loop_context.downstream_post_loop {
+            return Some(vec![HirStmt::Break]);
+        }
+        if let Some(break_block) = loop_context.break_exits.get(&block) {
+            self.visited.extend(break_block.blocks.iter().copied());
+            return Some(break_block.block.stmts.clone());
+        }
+        None
     }
 
     pub(super) fn lower_escape_edge(
@@ -283,15 +347,19 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stmts: &mut Vec<HirStmt>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Option<BlockRef>> {
+        let checkpoint = self.checkpoint_state(stmts.len());
         if let Some(next) = self.try_lower_numeric_for_init(block, stop, stmts, target_overrides) {
             return Some(next);
         }
+        self.restore_state_checkpoint(checkpoint, stmts);
 
+        let checkpoint = self.checkpoint_state(stmts.len());
         if let Some(next) =
             self.try_lower_generic_for_preheader(block, stop, stmts, target_overrides)
         {
             return Some(next);
         }
+        self.restore_state_checkpoint(checkpoint, stmts);
 
         self.visited.insert(block);
         stmts.extend(self.lower_block_prefix(block, false, target_overrides)?);
@@ -343,9 +411,17 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stop: Option<BlockRef>,
         stmts: &mut Vec<HirStmt>,
     ) -> Option<Option<BlockRef>> {
+        if Some(target) == stop || target == self.lowering.cfg.exit_block {
+            return Some(if target == self.lowering.cfg.exit_block {
+                None
+            } else {
+                Some(target)
+            });
+        }
         if let Some(loop_context) = self.active_loops.last() {
             if loop_context.continue_target == Some(target)
                 && loop_context.continue_sources.contains(&block)
+                && self.loop_continue_target_is_empty(target)
             {
                 stmts.push(HirStmt::Continue);
                 return Some(None);
@@ -366,18 +442,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 return Some(None);
             }
             if let Some(break_block) = loop_context.break_exits.get(&target) {
-                stmts.extend(break_block.stmts.clone());
-                self.visited.insert(target);
+                stmts.extend(break_block.block.stmts.clone());
+                self.visited.extend(break_block.blocks.iter().copied());
                 return Some(None);
             }
         }
-        if Some(target) == stop || target == self.lowering.cfg.exit_block {
-            Some(if target == self.lowering.cfg.exit_block {
-                None
-            } else {
-                Some(target)
-            })
-        } else if self.lowering.cfg.reachable_blocks.contains(&target) {
+        if self.lowering.cfg.reachable_blocks.contains(&target) {
             Some(Some(target))
         } else {
             None
@@ -469,7 +539,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         Some(stmts)
     }
 
-    fn block_entry_expr_overrides(&self, block: BlockRef) -> Option<&BTreeMap<TempId, HirExpr>> {
+    pub(super) fn block_entry_expr_overrides(
+        &self,
+        block: BlockRef,
+    ) -> Option<&BTreeMap<TempId, HirExpr>> {
         self.overrides.block_entry_temp_exprs(block)
     }
 
@@ -626,17 +699,63 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let Some(BranchShortCircuitPlan {
             mut cond,
             mut truthy,
-            falsy,
+            mut falsy,
             mut consumed_headers,
         }) = build_branch_short_circuit_plan(self.lowering, header)
         else {
             return Some(None);
         };
+        if self.block_exits_outer_active_loop(truthy) || self.block_exits_outer_active_loop(falsy) {
+            return Some(None);
+        }
+        if let Some(stop) = stop
+            && self.active_loops.last().is_some_and(|loop_context| {
+                loop_context.continue_target == Some(stop)
+                    && !self.loop_continue_target_is_empty(stop)
+            })
+        {
+            let can_falsy_stop = self.can_short_circuit_falsy_to_non_empty_continue();
+            if truthy == stop && can_falsy_stop {
+                cond = cond.negate();
+                std::mem::swap(&mut truthy, &mut falsy);
+            }
+            if truthy == stop
+                || consumed_headers.contains(&stop)
+                || (falsy == stop && !can_falsy_stop)
+            {
+                return Some(None);
+            }
+        }
 
         // 当短路的 truthy 出口是一个退化分支（两条 CFG 边都指向同一个后继 == falsy）时，
         // 该 block 是 `(sc_cond) and guard then end` 中空体守卫的残留。
         // 直接把守卫条件折叠进 SC 条件，避免它作为 body 被 lower_linear_block 丢弃。
         self.absorb_degenerate_guards(&mut cond, &mut truthy, falsy, stop, &mut consumed_headers);
+        let fallback_cond = cond.clone();
+        let fallback_truthy = truthy;
+        let fallback_falsy = falsy;
+        let fallback_consumed_headers = consumed_headers.clone();
+        self.extend_branch_short_circuit_exits(
+            &mut cond,
+            &mut truthy,
+            &mut falsy,
+            stop,
+            &mut consumed_headers,
+        );
+        if !self.rewrite_short_circuit_skipped_header_prefixes(header, &consumed_headers, &mut cond)
+        {
+            cond = fallback_cond;
+            truthy = fallback_truthy;
+            falsy = fallback_falsy;
+            consumed_headers = fallback_consumed_headers;
+            if !self.rewrite_short_circuit_skipped_header_prefixes(
+                header,
+                &consumed_headers,
+                &mut cond,
+            ) {
+                return Some(None);
+            }
+        }
 
         // 单节点 short-circuit 和普通 branch 在结构信息上是重叠的。
         // 这里如果已经有 plain branch candidate，就优先走普通 branch 恢复：
@@ -661,15 +780,31 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             }));
         }
 
-        // 当 then_entry 恰好等于当前 scope 的 stop 时，short-circuit 的 then 体会
-        // 被 branch_stop_for_region 截断为空，同时 merge (falsy) 又超出 stop 所在
-        // 作用域——此时 consumed_headers 会提前吞掉 stop block 的 visit 标记，
-        // 导致外层 merge 回来后发现该 block 已经被 visit、结构化失败。
-        // 遇到这种情况直接回退到 plain branch 即可。
-        if stop == Some(truthy) && falsy != truthy {
+        // 当 then_entry 恰好等于当前 scope 的 stop 时，多数情况下可以恢复成
+        // “一臂为空并回到 stop，另一臂显式 break/continue”的结构。只有候选本身
+        // 把 stop block 放进 consumed_headers，才会提前 visit 外层还要消费的 stop。
+        if stop == Some(truthy) && falsy != truthy && consumed_headers.contains(&truthy) {
             return Some(None);
         }
-        if stop == Some(falsy) || self.lowering.cfg.can_reach(truthy, falsy) {
+        if stop == Some(truthy) && falsy != truthy && self.block_is_active_loop_escape(falsy) {
+            return Some(Some(StructuredBranchPlan {
+                cond,
+                then_entry: truthy,
+                else_entry: Some(falsy),
+                merge: Some(falsy),
+                consumed_headers,
+            }));
+        }
+        let truthy_flows_to_falsy = self.lowering.cfg.can_reach(truthy, falsy)
+            && self
+                .lowering
+                .graph_facts
+                .nearest_common_postdom(truthy, falsy)
+                == Some(falsy);
+        // 在 loop 内，全图 can_reach 可能经由回边从 then body 绕到 else body。
+        // 只有 falsy 本身就是两条出口的最近共同后支配点时，才说明这是
+        // `if cond then ... end` 的自然 fallthrough，而不是 `if cond then ... else ... end`。
+        if stop == Some(falsy) || truthy_flows_to_falsy {
             return Some(Some(StructuredBranchPlan {
                 cond,
                 then_entry: truthy,
@@ -691,6 +826,187 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             merge: (merge != self.lowering.cfg.exit_block).then_some(merge),
             consumed_headers,
         }))
+    }
+
+    fn extend_branch_short_circuit_exits(
+        &self,
+        cond: &mut HirExpr,
+        truthy: &mut BlockRef,
+        falsy: &mut BlockRef,
+        stop: Option<BlockRef>,
+        consumed_headers: &mut Vec<BlockRef>,
+    ) {
+        loop {
+            if self.extend_truthy_branch_short_circuit_exit(
+                cond,
+                truthy,
+                falsy,
+                stop,
+                consumed_headers,
+            ) || self.extend_falsy_branch_short_circuit_exit(
+                cond,
+                truthy,
+                falsy,
+                stop,
+                consumed_headers,
+            ) {
+                continue;
+            }
+            break;
+        }
+    }
+
+    fn extend_truthy_branch_short_circuit_exit(
+        &self,
+        cond: &mut HirExpr,
+        truthy: &mut BlockRef,
+        falsy: &mut BlockRef,
+        stop: Option<BlockRef>,
+        consumed_headers: &mut Vec<BlockRef>,
+    ) -> bool {
+        let Some(next) = self.nestable_branch_short_circuit_plan(*truthy, stop, consumed_headers)
+        else {
+            return false;
+        };
+        if next.truthy == *falsy {
+            let old_cond = std::mem::replace(cond, HirExpr::Boolean(false));
+            *cond = HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+                lhs: old_cond.negate(),
+                rhs: next.cond,
+            }));
+            *truthy = *falsy;
+            *falsy = next.falsy;
+        } else if next.falsy == *falsy {
+            let old_cond = std::mem::replace(cond, HirExpr::Boolean(false));
+            *cond = HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+                lhs: old_cond,
+                rhs: next.cond,
+            }));
+            *truthy = next.truthy;
+        } else {
+            return false;
+        }
+        consumed_headers.extend(next.consumed_headers);
+        true
+    }
+
+    fn extend_falsy_branch_short_circuit_exit(
+        &self,
+        cond: &mut HirExpr,
+        truthy: &mut BlockRef,
+        falsy: &mut BlockRef,
+        stop: Option<BlockRef>,
+        consumed_headers: &mut Vec<BlockRef>,
+    ) -> bool {
+        let Some(next) = self.nestable_branch_short_circuit_plan(*falsy, stop, consumed_headers)
+        else {
+            return false;
+        };
+        if next.truthy == *truthy {
+            let old_cond = std::mem::replace(cond, HirExpr::Boolean(false));
+            *cond = HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+                lhs: old_cond,
+                rhs: next.cond,
+            }));
+            *falsy = next.falsy;
+        } else if next.falsy == *truthy {
+            let old_cond = std::mem::replace(cond, HirExpr::Boolean(false));
+            *cond = HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+                lhs: old_cond.negate(),
+                rhs: next.cond,
+            }));
+            *truthy = next.truthy;
+            *falsy = next.falsy;
+        } else {
+            return false;
+        }
+        consumed_headers.extend(next.consumed_headers);
+        true
+    }
+
+    fn nestable_branch_short_circuit_plan(
+        &self,
+        header: BlockRef,
+        stop: Option<BlockRef>,
+        consumed_headers: &[BlockRef],
+    ) -> Option<BranchShortCircuitPlan> {
+        if Some(header) == stop || consumed_headers.contains(&header) {
+            return None;
+        }
+        let next = build_branch_short_circuit_plan(self.lowering, header)?;
+        if next
+            .consumed_headers
+            .iter()
+            .any(|header| Some(*header) == stop || consumed_headers.contains(header))
+        {
+            return None;
+        }
+        Some(next)
+    }
+
+    fn rewrite_short_circuit_skipped_header_prefixes(
+        &self,
+        header: BlockRef,
+        consumed_headers: &[BlockRef],
+        cond: &mut HirExpr,
+    ) -> bool {
+        let target_overrides = BTreeMap::new();
+        consumed_headers
+            .iter()
+            .copied()
+            .filter(|consumed| *consumed != header)
+            .all(|consumed| {
+                if self.branch_value_merges_by_header.contains_key(&consumed) {
+                    return true;
+                }
+                let Some(prefix) = self.lower_block_prefix(consumed, true, &target_overrides)
+                else {
+                    return false;
+                };
+                if prefix.is_empty() {
+                    return true;
+                }
+
+                let (expr_overrides, all_prefix_temps) =
+                    self.block_prefix_temp_expr_overrides(consumed);
+                rewrite_expr_temps(cond, &expr_overrides);
+
+                let mut prefix_temps = BTreeSet::new();
+                for stmt in prefix {
+                    let HirStmt::Assign(assign) = stmt else {
+                        return false;
+                    };
+                    if assign.targets.len() != assign.values.len() {
+                        return false;
+                    }
+                    for target in assign.targets {
+                        let HirLValue::Temp(temp) = target else {
+                            return false;
+                        };
+                        prefix_temps.insert(temp);
+                    }
+                }
+                let mut unresolved_prefix_temps = prefix_temps;
+                unresolved_prefix_temps.extend(all_prefix_temps);
+                for temp in expr_overrides.keys() {
+                    unresolved_prefix_temps.remove(temp);
+                }
+                !expr_has_temp_ref_in(cond, &unresolved_prefix_temps)
+            })
+    }
+
+    fn can_short_circuit_falsy_to_non_empty_continue(&self) -> bool {
+        let Some(loop_context) = self.active_loops.last() else {
+            return false;
+        };
+        self.loop_by_header
+            .get(&loop_context.header)
+            .is_some_and(|candidate| {
+                matches!(
+                    candidate.kind_hint,
+                    LoopKindHint::NumericForLike | LoopKindHint::GenericForLike
+                )
+            })
     }
 
     /// 当短路候选的 truthy 出口指向一个退化分支 block（两条 CFG 边都流向同一目标），
@@ -831,13 +1147,130 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let Some(stop) = stop else {
             return merge;
         };
+        if let Some(merge) = merge
+            && merge != stop
+            && self.block_is_terminal_exit(merge)
+        {
+            return Some(stop);
+        }
+        if then_entry == stop || else_entry == Some(stop) {
+            return Some(stop);
+        }
         if merge == Some(stop)
+            || merge.is_some_and(|merge| {
+                merge != stop
+                    && self.branch_can_truncate_to_stop_or_loop_escape(
+                        then_entry, else_entry, stop, merge,
+                    )
+            })
             || self.branch_can_truncate_to_stop(block, then_entry, else_entry, stop)
         {
             return Some(stop);
         }
 
         merge.or(Some(stop))
+    }
+
+    fn branch_can_truncate_to_stop_or_loop_escape(
+        &self,
+        then_entry: BlockRef,
+        else_entry: Option<BlockRef>,
+        stop: BlockRef,
+        boundary: BlockRef,
+    ) -> bool {
+        self.branch_arm_reaches_stop_or_loop_escape(then_entry, stop, boundary)
+            && else_entry.is_none_or(|else_entry| {
+                self.branch_arm_reaches_stop_or_loop_escape(else_entry, stop, boundary)
+            })
+    }
+
+    fn branch_arm_reaches_stop_or_loop_escape(
+        &self,
+        entry: BlockRef,
+        stop: BlockRef,
+        boundary: BlockRef,
+    ) -> bool {
+        fn visit(
+            lowerer: &StructuredBodyLowerer<'_, '_>,
+            block: BlockRef,
+            stop: BlockRef,
+            boundary: BlockRef,
+            visiting: &mut BTreeSet<BlockRef>,
+            memo: &mut BTreeMap<BlockRef, bool>,
+        ) -> bool {
+            if block == stop {
+                return true;
+            }
+            if block == boundary {
+                return lowerer.block_is_active_loop_escape(block);
+            }
+            if block == lowerer.lowering.cfg.exit_block || lowerer.block_is_terminal_exit(block) {
+                return true;
+            }
+            if !lowerer.lowering.cfg.reachable_blocks.contains(&block) {
+                return false;
+            }
+            if let Some(result) = memo.get(&block).copied() {
+                return result;
+            }
+            if !visiting.insert(block) {
+                return false;
+            }
+
+            let result = lowerer.lowering.cfg.succs[block.index()]
+                .iter()
+                .all(|edge_ref| {
+                    let successor = lowerer.lowering.cfg.edges[edge_ref.index()].to;
+                    visit(lowerer, successor, stop, boundary, visiting, memo)
+                });
+            visiting.remove(&block);
+            memo.insert(block, result);
+            result
+        }
+
+        visit(
+            self,
+            entry,
+            stop,
+            boundary,
+            &mut BTreeSet::new(),
+            &mut BTreeMap::new(),
+        )
+    }
+
+    fn block_is_active_loop_escape(&self, block: BlockRef) -> bool {
+        self.active_loops.last().is_some_and(|loop_context| {
+            loop_context.continue_target == Some(block)
+                || loop_context.post_loop == block
+                || loop_context.downstream_post_loop == Some(block)
+                || loop_context.break_exits.contains_key(&block)
+        })
+    }
+
+    fn block_exits_outer_active_loop(&self, block: BlockRef) -> bool {
+        self.active_loops.iter().rev().skip(1).any(|loop_context| {
+            loop_context.post_loop == block
+                || loop_context.downstream_post_loop == Some(block)
+                || loop_context.break_exits.contains_key(&block)
+        })
+    }
+
+    fn loop_continue_target_is_empty(&self, block: BlockRef) -> bool {
+        if self.branch_by_header.contains_key(&block) {
+            return false;
+        }
+        let terminator = self.block_terminator(block).map(|(instr_ref, _)| instr_ref);
+        let range = self.lowering.cfg.blocks[block.index()].instrs;
+        (range.start.index()..range.end()).all(|instr_idx| {
+            let instr_ref = InstrRef(instr_idx);
+            Some(instr_ref) == terminator
+                || self
+                    .lowering
+                    .proto
+                    .instrs
+                    .get(instr_idx)
+                    .is_some_and(is_control_terminator)
+        })
     }
 
     pub(super) fn branch_arm_stop(
@@ -857,7 +1290,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // 当一条臂本身就是外层 stop 时，另一条臂如果继续使用外层 stop 作为边界，
         // 会沿 CFG 一直降到自己的 merge 之后，提前 visit 掉外层 stop 也需要消费的
         // 共享尾部块。此时分支整体仍回到外层 stop，但非 stop 臂只降到自己的 merge。
-        if merge != branch_stop && sibling_entry == Some(branch_stop) && entry != branch_stop {
+        if merge != branch_stop
+            && sibling_entry == Some(branch_stop)
+            && entry != branch_stop
+            && entry != merge
+        {
             Some(merge)
         } else {
             Some(branch_stop)

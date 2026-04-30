@@ -206,6 +206,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return Some(expr);
         }
 
+        if defs.len() > 1 {
+            let mut expr = expr_for_reg_at_block_exit(self.lowering, pred, reg);
+            rewrite_expr_temps(&mut expr, &temp_expr_overrides(target_overrides));
+            return Some(expr);
+        }
+
         // 嵌套 loop 的 preheader 上，某个寄存器的 reaching defs 可能包含多个原始定义
         // （初值 + 内层循环回边写入），但在 reaching values 视角里它们早已被外层 loop 的
         // header phi 合并成唯一的 SSA value。如果该 phi 对应的 temp 已经被外层 loop state
@@ -730,10 +736,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         downstream_post_loop: Option<BlockRef>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
         states: &[LoopStateSlot],
-    ) -> Option<HirBlock> {
-        // 这里只接受"线性的 break 垫片 block"：它允许先做一些必须保留的 cleanup，
-        // 但最终必须无条件跳到循环之后的统一 continuation。更复杂的 exit 形状留给后续轮次，
-        // 避免这一步又退化成拼命堆 break 特判。
+    ) -> Option<BreakExitBlock> {
+        // break 垫片允许是线性 cleanup，也允许是一个小型 if cleanup，再统一跳到
+        // 循环之后的 continuation。继续限制在单入口、单 merge 的 pad 内，是为了只消费
+        // StructureFacts 已能证明属于 break 出口的局部结构，避免退化成任意 exit 拼图。
         //
         // break pad 里的赋值（如 `found = true; idx = i`）写入的 def temp 与 loop 回边
         // 上的 phi temp 不同，因此仅靠 combined_target_overrides 无法将它们重定向到
@@ -752,6 +758,18 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 }
             }
         }
+        if matches!(
+            self.block_terminator(block),
+            Some((_instr_ref, LowInstr::Branch(_)))
+        ) {
+            return self.lower_branch_break_exit_pad(
+                block,
+                post_loop,
+                downstream_post_loop,
+                &combined,
+            );
+        }
+
         let mut stmts = self.lower_block_prefix(block, false, &combined)?;
         let target = match self.block_terminator(block) {
             Some((_instr_ref, LowInstr::Jump(jump))) => {
@@ -772,7 +790,97 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         stmts.push(HirStmt::Break);
-        Some(HirBlock { stmts })
+        Some(BreakExitBlock {
+            block: HirBlock { stmts },
+            blocks: BTreeSet::from([block]),
+        })
+    }
+
+    fn lower_branch_break_exit_pad(
+        &self,
+        block: BlockRef,
+        post_loop: BlockRef,
+        downstream_post_loop: Option<BlockRef>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<BreakExitBlock> {
+        let candidate = *self.branch_by_header.get(&block)?;
+        let merge = candidate.merge?;
+        if merge != post_loop && Some(merge) != downstream_post_loop {
+            return None;
+        }
+
+        let mut blocks = BTreeSet::from([block]);
+        let mut stmts = self.lower_block_prefix(block, true, target_overrides)?;
+        let mut cond = self.lower_candidate_cond(block, candidate)?;
+        if let Some(entry_expr_overrides) = self.block_entry_expr_overrides(block) {
+            rewrite_expr_temps(&mut cond, entry_expr_overrides);
+        }
+
+        let then_pad = self.lower_break_exit_pad_arm(
+            candidate.then_entry,
+            merge,
+            post_loop,
+            downstream_post_loop,
+            target_overrides,
+        )?;
+        blocks.extend(then_pad.blocks.iter().copied());
+        let else_pad = match candidate.else_entry {
+            Some(else_entry) => {
+                let pad = self.lower_break_exit_pad_arm(
+                    else_entry,
+                    merge,
+                    post_loop,
+                    downstream_post_loop,
+                    target_overrides,
+                )?;
+                blocks.extend(pad.blocks.iter().copied());
+                Some(pad.block)
+            }
+            None => None,
+        };
+
+        stmts.push(branch_stmt(cond, then_pad.block, else_pad));
+        stmts.push(HirStmt::Break);
+        Some(BreakExitBlock {
+            block: HirBlock { stmts },
+            blocks,
+        })
+    }
+
+    fn lower_break_exit_pad_arm(
+        &self,
+        block: BlockRef,
+        merge: BlockRef,
+        post_loop: BlockRef,
+        downstream_post_loop: Option<BlockRef>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<BreakExitBlock> {
+        if block == merge || block == post_loop || Some(block) == downstream_post_loop {
+            return Some(BreakExitBlock {
+                block: HirBlock::default(),
+                blocks: BTreeSet::new(),
+            });
+        }
+
+        let stmts = self.lower_block_prefix(block, false, target_overrides)?;
+        let target = match self.block_terminator(block) {
+            Some((_instr_ref, LowInstr::Jump(jump))) => {
+                self.lowering.cfg.instr_to_block[jump.target.index()]
+            }
+            Some((_instr_ref, instr)) if !is_control_terminator(instr) => {
+                self.lowering.cfg.unique_reachable_successor(block)?
+            }
+            None => self.lowering.cfg.unique_reachable_successor(block)?,
+            Some(_) => return None,
+        };
+        if target != merge && target != post_loop && Some(target) != downstream_post_loop {
+            return None;
+        }
+
+        Some(BreakExitBlock {
+            block: HirBlock { stmts },
+            blocks: BTreeSet::from([block]),
+        })
     }
 
     pub(super) fn generic_for_header_instrs(
@@ -827,7 +935,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     /// - `all_prefix_temps`：前缀指令定义的所有 temp 集合
     ///
     /// 调用方可通过 `all_prefix_temps - expr_overrides.keys()` 得到"无法内联的前缀 temp"。
-    pub(super) fn block_prefix_temp_expr_overrides(
+    pub(crate) fn block_prefix_temp_expr_overrides(
         &self,
         block: BlockRef,
     ) -> (BTreeMap<TempId, HirExpr>, BTreeSet<TempId>) {

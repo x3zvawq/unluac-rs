@@ -36,6 +36,21 @@ pub(crate) fn expr_for_value_operand_inline(
     }
 }
 
+pub(crate) fn expr_for_value_operand_single_eval(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    operand: ValueOperand,
+) -> HirExpr {
+    match operand {
+        ValueOperand::Reg(reg) => expr_for_reg_use_single_eval(lowering, block, instr_ref, reg),
+        ValueOperand::Const(const_ref) => expr_for_const(lowering.proto, const_ref),
+        ValueOperand::Integer(value) => HirExpr::Integer(value),
+        ValueOperand::Nil => HirExpr::Nil,
+        ValueOperand::Boolean(value) => HirExpr::Boolean(value),
+    }
+}
+
 pub(crate) fn expr_for_const(proto: &LoweredProto, const_ref: ConstRef) -> HirExpr {
     match proto.constants.common.literals.get(const_ref.index()) {
         Some(RawLiteralConst::Nil) => HirExpr::Nil,

@@ -137,37 +137,56 @@ pub(crate) fn build_branch_short_circuit_plan(
     lowering: &ProtoLowering<'_>,
     header: BlockRef,
 ) -> Option<BranchShortCircuitPlan> {
-    let short = lowering
+    let candidates = lowering
         .structure
         .short_circuit_candidates
         .iter()
-        .find(|candidate| {
+        .filter(|candidate| {
             candidate.header == header
                 && candidate.reducible
                 && matches!(
                     candidate.exit,
                     ShortCircuitExit::BranchExit { .. } | ShortCircuitExit::ValueMerge(_)
                 )
-        })?;
+        });
+
+    for short in candidates {
+        if let Some(plan) = build_branch_short_circuit_plan_from_candidate(lowering, short) {
+            return Some(plan);
+        }
+        let allowed_blocks = BTreeSet::from([header]);
+        if let Some(plan) =
+            truncate_branch_exit_candidate_at_escaping_header(lowering, short, &allowed_blocks)
+                .and_then(|truncated| {
+                    build_branch_short_circuit_plan_from_candidate(lowering, &truncated)
+                })
+        {
+            return Some(plan);
+        }
+    }
+
+    None
+}
+
+fn build_branch_short_circuit_plan_from_candidate(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+) -> Option<BranchShortCircuitPlan> {
     let (truthy, falsy, decision) = match short.exit {
-        ShortCircuitExit::BranchExit { truthy, falsy } => (
-            truthy,
-            falsy,
-            build_branch_decision_expr(lowering, short, short.entry)?,
-        ),
+        ShortCircuitExit::BranchExit { truthy, falsy } => {
+            let decision = build_branch_decision_expr(lowering, short, short.entry)?;
+            (truthy, falsy, decision)
+        }
         ShortCircuitExit::ValueMerge(_) => {
             let (truthy, falsy, truthy_leaves, falsy_leaves) =
                 branch_exit_blocks_from_value_merge_candidate(short)?;
-            (
-                truthy,
-                falsy,
-                build_branch_decision_expr_for_value_merge_candidate(
-                    lowering,
-                    short,
-                    &truthy_leaves,
-                    &falsy_leaves,
-                )?,
-            )
+            let decision = build_branch_decision_expr_for_value_merge_candidate(
+                lowering,
+                short,
+                &truthy_leaves,
+                &falsy_leaves,
+            )?;
+            (truthy, falsy, decision)
         }
     };
 
@@ -182,6 +201,7 @@ pub(crate) fn build_branch_short_circuit_plan(
     // 因此这里不能把“后续 header 里定义出来的 temp”也算进允许范围，否则 cond
     // 一旦还引用这些 temp，就会得到“定义语句被吞掉，但 temp 仍留在条件/then 里”
     // 的悬空 HIR。多节点链条里只有入口 header 自己的 temp 能保证随后会被物化。
+    let header = short.header;
     let allowed_blocks = BTreeSet::from([header]);
 
     // 被吞掉的非入口 header 中的定义如果被短路区域之外的指令引用，
@@ -236,6 +256,66 @@ pub(crate) fn build_branch_short_circuit_plan(
         truthy,
         falsy,
         consumed_headers,
+    })
+}
+
+fn truncate_branch_exit_candidate_at_escaping_header(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+    allowed_blocks: &BTreeSet<BlockRef>,
+) -> Option<ShortCircuitCandidate> {
+    let ShortCircuitExit::BranchExit { falsy, .. } = short.exit else {
+        return None;
+    };
+    let cut_index = short
+        .nodes
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(index, node)| {
+            block_has_escaping_defs(lowering, short, node.header, allowed_blocks).then_some(index)
+        })?;
+    let cut_ref = ShortCircuitNodeRef(cut_index);
+    let cut_header = short.nodes.get(cut_index)?.header;
+
+    let mut nodes = short.nodes[..cut_index].to_vec();
+    let mut replaced_cut_ref = false;
+    for node in &mut nodes {
+        for target in [&mut node.truthy, &mut node.falsy] {
+            if matches!(target, ShortCircuitTarget::TruthyExit) {
+                return None;
+            }
+            if *target == ShortCircuitTarget::Node(cut_ref) {
+                *target = ShortCircuitTarget::TruthyExit;
+                replaced_cut_ref = true;
+            } else if matches!(target, ShortCircuitTarget::Node(node_ref) if node_ref.index() >= cut_index)
+            {
+                return None;
+            }
+        }
+    }
+    if !replaced_cut_ref {
+        return None;
+    }
+
+    let blocks = nodes
+        .iter()
+        .map(|node| node.header)
+        .collect::<BTreeSet<_>>();
+    Some(ShortCircuitCandidate {
+        header: short.header,
+        blocks,
+        entry: short.entry,
+        nodes,
+        exit: ShortCircuitExit::BranchExit {
+            truthy: cut_header,
+            falsy,
+        },
+        result_reg: None,
+        result_phi_id: None,
+        entry_defs: BTreeSet::new(),
+        value_incomings: Vec::new(),
+        reducible: short.reducible,
     })
 }
 
@@ -705,14 +785,30 @@ fn consumed_headers_have_escaping_defs(
         .collect();
 
     for &block in &consumed_headers {
-        let range = lowering.cfg.blocks[block.index()].instrs;
-        for instr_idx in range.start.index()..range.end() {
-            for &def_id in &lowering.dataflow.instr_defs[instr_idx] {
-                for use_site in &lowering.dataflow.def_uses[def_id.index()] {
-                    let use_block = lowering.cfg.instr_to_block[use_site.instr.index()];
-                    if !short.blocks.contains(&use_block) {
-                        return true;
-                    }
+        if block_has_escaping_defs(lowering, short, block, allowed_blocks) {
+            return true;
+        }
+    }
+    false
+}
+
+fn block_has_escaping_defs(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+    block: BlockRef,
+    allowed_blocks: &BTreeSet<BlockRef>,
+) -> bool {
+    if allowed_blocks.contains(&block) {
+        return false;
+    }
+
+    let range = lowering.cfg.blocks[block.index()].instrs;
+    for instr_idx in range.start.index()..range.end() {
+        for &def_id in &lowering.dataflow.instr_defs[instr_idx] {
+            for use_site in &lowering.dataflow.def_uses[def_id.index()] {
+                let use_block = lowering.cfg.instr_to_block[use_site.instr.index()];
+                if !short.blocks.contains(&use_block) {
+                    return true;
                 }
             }
         }

@@ -76,8 +76,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             &combined_target_overrides,
         )?;
         self.active_loops.pop();
-        self.visited
-            .extend(loop_context.break_exits.keys().copied());
+        self.visited.extend(
+            loop_context
+                .break_exits
+                .values()
+                .flat_map(|break_exit| break_exit.blocks.iter().copied()),
+        );
         if let Some(continue_target) = loop_context.continue_target {
             self.visited.insert(continue_target);
         }
@@ -187,8 +191,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if let Some(backedge_pad) = backedge_pad {
             self.visited.insert(backedge_pad);
         }
-        self.visited
-            .extend(loop_context.break_exits.keys().copied());
+        self.visited.extend(
+            loop_context
+                .break_exits
+                .values()
+                .flat_map(|break_exit| break_exit.blocks.iter().copied()),
+        );
         self.install_loop_exit_bindings(candidate, exit, &plan, target_overrides);
         stmts.push(HirStmt::Repeat(Box::new(HirRepeat {
             body: HirBlock { stmts: body },
@@ -298,8 +306,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         self.visited.insert(continue_block);
-        self.visited
-            .extend(loop_context.break_exits.keys().copied());
+        self.visited.extend(
+            loop_context
+                .break_exits
+                .values()
+                .flat_map(|break_exit| break_exit.blocks.iter().copied()),
+        );
         self.install_loop_exit_bindings(candidate, exit, &plan, target_overrides);
         let mut start = expr_for_reg_use(self.lowering, block, instr_ref, init.index);
         let mut limit = expr_for_reg_use(self.lowering, block, instr_ref, init.limit);
@@ -396,8 +408,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let body = self.lower_region(body_entry, Some(header), &combined_target_overrides)?;
         self.active_loops.pop();
         self.visited.insert(header);
-        self.visited
-            .extend(loop_context.break_exits.keys().copied());
+        self.visited.extend(
+            loop_context
+                .break_exits
+                .values()
+                .flat_map(|break_exit| break_exit.blocks.iter().copied()),
+        );
         self.install_loop_exit_bindings(candidate, exit, &plan, target_overrides);
         stmts.push(HirStmt::GenericFor(Box::new(HirGenericFor {
             bindings,

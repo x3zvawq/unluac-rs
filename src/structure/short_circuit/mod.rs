@@ -49,6 +49,12 @@ pub(super) fn analyze_short_circuits(
         &branch_by_header,
         branch_candidates,
     );
+    candidates.extend(branch_exit::analyze_if_else_branch_exit_candidates(
+        proto,
+        cfg,
+        &branch_by_header,
+        branch_candidates,
+    ));
     candidates.extend(branch_exit::analyze_guard_branch_exit_dag_candidates(
         proto,
         cfg,

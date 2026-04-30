@@ -84,7 +84,7 @@ pub(crate) fn expr_for_fixed_def(lowering: &ProtoLowering<'_>, def_id: DefId) ->
         _ => None,
     }
 }
-/// `single-eval` 变体：允许沿着 Move/GetTable 链深度展开，
+/// `single-eval` 变体：允许沿着 Move/GetTable 以及纯表达式操作链深度展开，
 /// 把 call 等非 dup-safe 的值也直接内联成表达式。
 /// 专门服务被吸收的短路分支里 temp 赋值不会出现的场景。
 pub(crate) fn expr_for_fixed_def_single_eval(
@@ -98,12 +98,15 @@ pub(crate) fn expr_for_fixed_def_single_eval(
 
     match instr {
         LowInstr::Move(move_instr) if move_instr.dst == def_reg => {
-            return Some(expr_for_reg_use_single_eval(
-                lowering,
-                def_block,
-                def_instr,
-                move_instr.src,
-            ));
+            let expr = expr_for_reg_use_single_eval(lowering, def_block, def_instr, move_instr.src);
+            // closure capture provenance 依赖“同一个子 proto 的闭包表达式”看到稳定的
+            // 父作用域来源。Move 链如果把 local function 的 closure 复制进条件表达式，
+            // 可能绕过后续 local override，让 capture 从 `local pos` 退回字面量初值。
+            // 这种值保留 temp 更安全，也和普通 single-eval 的“只恢复操作数本体”边界一致。
+            if matches!(expr, HirExpr::Closure(_)) {
+                return None;
+            }
+            return Some(expr);
         }
         LowInstr::GetTable(get_table) if get_table.dst == def_reg => {
             return Some(lower_table_access_expr_single_eval(
@@ -113,6 +116,30 @@ pub(crate) fn expr_for_fixed_def_single_eval(
                 get_table.base,
                 get_table.key,
             ));
+        }
+        LowInstr::UnaryOp(unary) if unary.dst == def_reg => {
+            return Some(HirExpr::Unary(Box::new(HirUnaryExpr {
+                op: lower_unary_op(unary.op),
+                expr: expr_for_reg_use_single_eval(lowering, def_block, def_instr, unary.src),
+            })));
+        }
+        LowInstr::BinaryOp(binary) if binary.dst == def_reg => {
+            return Some(super::super::helpers::binary_expr(
+                lower_binary_op(binary.op),
+                expr_for_value_operand_single_eval(lowering, def_block, def_instr, binary.lhs),
+                expr_for_value_operand_single_eval(lowering, def_block, def_instr, binary.rhs),
+            ));
+        }
+        LowInstr::Concat(concat) if concat.dst == def_reg => {
+            let value = concat_expr((0..concat.src.len).map(|offset| {
+                expr_for_reg_use_single_eval(
+                    lowering,
+                    def_block,
+                    def_instr,
+                    Reg(concat.src.start.index() + offset),
+                )
+            }));
+            return Some(value);
         }
         _ => {}
     }

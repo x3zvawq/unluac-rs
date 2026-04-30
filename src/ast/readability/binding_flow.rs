@@ -2,6 +2,7 @@
 //!
 //! 这些 pass 经常需要回答同一类问题：
 //! - 某个 binding 在一段语句里还会不会再被读取？
+//! - 某个语句实际提到了哪些 binding（包括赋值目标这种 mention，而不只是读取）？
 //! - 某个语句/块会不会提前引用一组待下沉的 hoisted local？
 //! - 某个 binding 在当前函数体里一共被用了几次？
 //!
@@ -11,7 +12,7 @@
 //! 但 `FunctionExpr.captured_bindings` 是闭包创建时对当前词法 binding 的显式引用，
 //! 必须按当前语句的一次使用统计，否则后续 pass 可能误删仍被闭包持有的局部。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::common::{
     AstBindingRef, AstBlock, AstCallKind, AstExpr, AstLValue, AstLocalBinding, AstNameRef, AstStmt,
@@ -171,6 +172,12 @@ pub(super) fn count_binding_mentions_in_block(block: &AstBlock, binding: AstBind
         .iter()
         .map(|stmt| count_binding_mentions_in_stmt(stmt, binding))
         .sum()
+}
+
+pub(super) fn binding_mentions_in_stmt(stmt: &AstStmt) -> BTreeSet<AstBindingRef> {
+    let mut mentions = BTreeSet::new();
+    collect_binding_mentions_in_stmt(stmt, &mut mentions);
+    mentions
 }
 
 pub(super) fn count_binding_uses_in_stmt(stmt: &AstStmt, binding: AstBindingRef) -> usize {
@@ -448,6 +455,193 @@ fn count_binding_mentions_in_stmt(stmt: &AstStmt, binding: AstBindingRef) -> usi
         | AstStmt::Goto(_)
         | AstStmt::Label(_)
         | AstStmt::Error(_) => 0,
+    }
+}
+
+fn collect_binding_mentions_in_block(block: &AstBlock, mentions: &mut BTreeSet<AstBindingRef>) {
+    for stmt in &block.stmts {
+        collect_binding_mentions_in_stmt(stmt, mentions);
+    }
+}
+
+fn collect_binding_mentions_in_stmt(stmt: &AstStmt, mentions: &mut BTreeSet<AstBindingRef>) {
+    match stmt {
+        AstStmt::LocalDecl(local_decl) => {
+            mentions.extend(local_decl.bindings.iter().map(|binding| binding.id));
+            for value in &local_decl.values {
+                collect_binding_mentions_in_expr(value, mentions);
+            }
+        }
+        AstStmt::GlobalDecl(global_decl) => {
+            for value in &global_decl.values {
+                collect_binding_mentions_in_expr(value, mentions);
+            }
+        }
+        AstStmt::Assign(assign) => {
+            for target in &assign.targets {
+                collect_binding_mentions_in_lvalue(target, mentions);
+            }
+            for value in &assign.values {
+                collect_binding_mentions_in_expr(value, mentions);
+            }
+        }
+        AstStmt::CallStmt(call_stmt) => collect_binding_mentions_in_call(&call_stmt.call, mentions),
+        AstStmt::Return(ret) => {
+            for value in &ret.values {
+                collect_binding_mentions_in_expr(value, mentions);
+            }
+        }
+        AstStmt::If(if_stmt) => {
+            collect_binding_mentions_in_expr(&if_stmt.cond, mentions);
+            collect_binding_mentions_in_block(&if_stmt.then_block, mentions);
+            if let Some(else_block) = &if_stmt.else_block {
+                collect_binding_mentions_in_block(else_block, mentions);
+            }
+        }
+        AstStmt::While(while_stmt) => {
+            collect_binding_mentions_in_expr(&while_stmt.cond, mentions);
+            collect_binding_mentions_in_block(&while_stmt.body, mentions);
+        }
+        AstStmt::Repeat(repeat_stmt) => {
+            collect_binding_mentions_in_block(&repeat_stmt.body, mentions);
+            collect_binding_mentions_in_expr(&repeat_stmt.cond, mentions);
+        }
+        AstStmt::NumericFor(numeric_for) => {
+            mentions.insert(numeric_for.binding);
+            collect_binding_mentions_in_expr(&numeric_for.start, mentions);
+            collect_binding_mentions_in_expr(&numeric_for.limit, mentions);
+            collect_binding_mentions_in_expr(&numeric_for.step, mentions);
+            collect_binding_mentions_in_block(&numeric_for.body, mentions);
+        }
+        AstStmt::GenericFor(generic_for) => {
+            mentions.extend(generic_for.bindings.iter().copied());
+            for expr in &generic_for.iterator {
+                collect_binding_mentions_in_expr(expr, mentions);
+            }
+            collect_binding_mentions_in_block(&generic_for.body, mentions);
+        }
+        AstStmt::DoBlock(block) => collect_binding_mentions_in_block(block, mentions),
+        AstStmt::FunctionDecl(function_decl) => {
+            collect_function_name_mentions(&function_decl.target, mentions);
+        }
+        AstStmt::LocalFunctionDecl(function_decl) => {
+            mentions.insert(function_decl.name);
+        }
+        AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_)
+        | AstStmt::Error(_) => {}
+    }
+}
+
+fn collect_binding_mentions_in_call(call: &AstCallKind, mentions: &mut BTreeSet<AstBindingRef>) {
+    match call {
+        AstCallKind::Call(call) => {
+            collect_binding_mentions_in_expr(&call.callee, mentions);
+            for arg in &call.args {
+                collect_binding_mentions_in_expr(arg, mentions);
+            }
+        }
+        AstCallKind::MethodCall(call) => {
+            collect_binding_mentions_in_expr(&call.receiver, mentions);
+            for arg in &call.args {
+                collect_binding_mentions_in_expr(arg, mentions);
+            }
+        }
+    }
+}
+
+fn collect_binding_mentions_in_lvalue(target: &AstLValue, mentions: &mut BTreeSet<AstBindingRef>) {
+    match target {
+        AstLValue::Name(name) => {
+            if let Some(binding) = binding_from_name_ref(name) {
+                mentions.insert(binding);
+            }
+        }
+        AstLValue::FieldAccess(access) => {
+            collect_binding_mentions_in_expr(&access.base, mentions);
+        }
+        AstLValue::IndexAccess(access) => {
+            collect_binding_mentions_in_expr(&access.base, mentions);
+            collect_binding_mentions_in_expr(&access.index, mentions);
+        }
+    }
+}
+
+fn collect_binding_mentions_in_expr(expr: &AstExpr, mentions: &mut BTreeSet<AstBindingRef>) {
+    match expr {
+        AstExpr::Var(name) => {
+            if let Some(binding) = binding_from_name_ref(name) {
+                mentions.insert(binding);
+            }
+        }
+        AstExpr::FieldAccess(access) => collect_binding_mentions_in_expr(&access.base, mentions),
+        AstExpr::IndexAccess(access) => {
+            collect_binding_mentions_in_expr(&access.base, mentions);
+            collect_binding_mentions_in_expr(&access.index, mentions);
+        }
+        AstExpr::Unary(unary) => collect_binding_mentions_in_expr(&unary.expr, mentions),
+        AstExpr::Binary(binary) => {
+            collect_binding_mentions_in_expr(&binary.lhs, mentions);
+            collect_binding_mentions_in_expr(&binary.rhs, mentions);
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            collect_binding_mentions_in_expr(&logical.lhs, mentions);
+            collect_binding_mentions_in_expr(&logical.rhs, mentions);
+        }
+        AstExpr::Call(call) => {
+            collect_binding_mentions_in_expr(&call.callee, mentions);
+            for arg in &call.args {
+                collect_binding_mentions_in_expr(arg, mentions);
+            }
+        }
+        AstExpr::MethodCall(call) => {
+            collect_binding_mentions_in_expr(&call.receiver, mentions);
+            for arg in &call.args {
+                collect_binding_mentions_in_expr(arg, mentions);
+            }
+        }
+        AstExpr::SingleValue(expr) => collect_binding_mentions_in_expr(expr, mentions),
+        AstExpr::TableConstructor(table) => {
+            for field in &table.fields {
+                match field {
+                    AstTableField::Array(value) => {
+                        collect_binding_mentions_in_expr(value, mentions);
+                    }
+                    AstTableField::Record(record) => {
+                        if let AstTableKey::Expr(key) = &record.key {
+                            collect_binding_mentions_in_expr(key, mentions);
+                        }
+                        collect_binding_mentions_in_expr(&record.value, mentions);
+                    }
+                }
+            }
+        }
+        AstExpr::FunctionExpr(_) => {}
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => {}
+    }
+}
+
+fn collect_function_name_mentions(
+    target: &super::super::common::AstFunctionName,
+    mentions: &mut BTreeSet<AstBindingRef>,
+) {
+    let path = match target {
+        super::super::common::AstFunctionName::Plain(path) => path,
+        super::super::common::AstFunctionName::Method(path, _) => path,
+    };
+    if let Some(binding) = binding_from_name_ref(&path.root) {
+        mentions.insert(binding);
     }
 }
 
