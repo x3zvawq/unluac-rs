@@ -118,7 +118,8 @@ fn collect_declared_bindings(stmts: &[AstStmt]) -> Vec<AstLocalBinding> {
             | AstStmt::Break
             | AstStmt::Continue
             | AstStmt::Goto(_)
-            | AstStmt::Label(_) | AstStmt::Error(_) => {}
+            | AstStmt::Label(_)
+            | AstStmt::Error(_) => {}
         }
     }
     bindings

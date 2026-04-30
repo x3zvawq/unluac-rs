@@ -84,15 +84,17 @@ impl StringEncoding {
         mode: StringDecodeMode,
     ) -> Result<String, ParseError> {
         match self {
-            Self::Utf8 => match mode {
-                StringDecodeMode::Strict => std::str::from_utf8(bytes)
-                    .map(str::to_owned)
-                    .map_err(|_| ParseError::StringDecode {
-                        offset,
-                        encoding: self.as_str(),
-                    }),
-                StringDecodeMode::Lossy => Ok(String::from_utf8_lossy(bytes).into_owned()),
-            },
+            Self::Utf8 => {
+                match mode {
+                    StringDecodeMode::Strict => std::str::from_utf8(bytes)
+                        .map(str::to_owned)
+                        .map_err(|_| ParseError::StringDecode {
+                            offset,
+                            encoding: self.as_str(),
+                        }),
+                    StringDecodeMode::Lossy => Ok(String::from_utf8_lossy(bytes).into_owned()),
+                }
+            }
             Self::EncodingRs(enc) => {
                 let (value, _, had_errors) = enc.decode(bytes);
                 if had_errors && matches!(mode, StringDecodeMode::Strict) {
@@ -137,7 +139,6 @@ impl StringDecodeMode {
             Self::Lossy => "lossy",
         }
     }
-
 }
 
 impl FromStr for StringDecodeMode {

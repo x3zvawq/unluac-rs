@@ -23,7 +23,7 @@ use crate::ast::AstDialectVersion;
 use crate::hir::common::{HirAssign, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId};
 
 use self::bindings::{
-    collect_materialized_binding_counts, BindingIndex, StmtBindingSummary,
+    BindingIndex, StmtBindingSummary, collect_materialized_binding_counts,
     collect_stmt_binding_summary,
 };
 use self::scan::{

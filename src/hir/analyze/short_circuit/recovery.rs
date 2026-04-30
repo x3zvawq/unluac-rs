@@ -203,17 +203,23 @@ pub(crate) fn build_branch_short_circuit_plan(
             // 当后续 consumed header 的 subject 只是被保守地留成 temp ref 时，
             // 这里允许沿既有 decision builder 退回到 single-eval lowering，
             // 把那一跳恢复成源码级操作数本体，而不是直接整段退化成布尔壳。
-            ShortCircuitExit::BranchExit { .. } => {
-                build_branch_decision_expr_single_eval(lowering, short, short.entry)?
-            }
+            // 入口 header 的 prefix 会在 `lower_branch` 中显式物化；这里继续
+            // 引用它的 temp，避免把同一次调用同时保留成前缀语句和条件表达式。
+            ShortCircuitExit::BranchExit { .. } => build_branch_decision_expr_mixed_eval(
+                lowering,
+                short,
+                short.entry,
+                &allowed_blocks,
+            )?,
             ShortCircuitExit::ValueMerge(_) => {
                 let (_, _, truthy_leaves, falsy_leaves) =
                     branch_exit_blocks_from_value_merge_candidate(short)?;
-                build_branch_decision_expr_for_value_merge_candidate_single_eval(
+                build_branch_decision_expr_for_value_merge_candidate_mixed_eval(
                     lowering,
                     short,
                     &truthy_leaves,
                     &falsy_leaves,
+                    &allowed_blocks,
                 )?
             }
         }

@@ -578,7 +578,10 @@ fn absorbs_terminal_global_handoff_for_single_use_constructor_seed() {
         children: Vec::new(),
     };
 
-    assert!(stabilize_table_constructors_in_proto(&mut proto, AstDialectVersion::Lua51));
+    assert!(stabilize_table_constructors_in_proto(
+        &mut proto,
+        AstDialectVersion::Lua51
+    ));
     assert_eq!(proto.body.stmts.len(), 2);
 
     let HirStmt::Assign(assign) = &proto.body.stmts[0] else {
@@ -653,7 +656,10 @@ fn absorbs_constructor_region_before_terminal_global_handoff() {
         children: Vec::new(),
     };
 
-    assert!(stabilize_table_constructors_in_proto(&mut proto, AstDialectVersion::Lua51));
+    assert!(stabilize_table_constructors_in_proto(
+        &mut proto,
+        AstDialectVersion::Lua51
+    ));
     assert_eq!(proto.body.stmts.len(), 1);
 
     let HirStmt::Assign(assign) = &proto.body.stmts[0] else {
@@ -716,7 +722,10 @@ fn keeps_constructor_seed_when_binding_is_used_after_handoff() {
         children: Vec::new(),
     };
 
-    assert!(!stabilize_table_constructors_in_proto(&mut proto, AstDialectVersion::Lua51));
+    assert!(!stabilize_table_constructors_in_proto(
+        &mut proto,
+        AstDialectVersion::Lua51
+    ));
     assert!(matches!(
         proto.body.stmts.as_slice(),
         [

@@ -57,7 +57,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let plan = self.build_loop_state_plan(candidate, preheader, exit, &[], target_overrides)?;
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
-        let mut loop_context = self.build_active_loop_context(candidate, exit, &combined_target_overrides, &plan.states)?;
+        let mut loop_context = self.build_active_loop_context(
+            candidate,
+            exit,
+            &combined_target_overrides,
+            &plan.states,
+        )?;
         loop_context.loop_blocks = candidate.blocks.clone();
         loop_context.state_slots = plan.states.clone();
         stmts.extend(loop_state_init_stmts(&plan));
@@ -96,11 +101,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // 输入形状：header=[call multi_ret; branch ok] + body_entry=[short-circuit/continue]
         // 输出形状：while true do local ok,val=call(); if not ok then break end; <body> end
         if expr_has_temp_ref_in(&cond, &unresolvable_prefix_temps) {
-            let prefix = self.lower_block_prefix(
-                candidate.header,
-                true,
-                &combined_target_overrides,
-            )?;
+            let prefix =
+                self.lower_block_prefix(candidate.header, true, &combined_target_overrides)?;
             let break_cond = cond.negate();
             let mut full_body = prefix;
             full_body.push(HirStmt::If(Box::new(HirIf {
@@ -143,7 +145,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let plan = self.build_loop_state_plan(candidate, preheader, exit, &[], target_overrides)?;
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
-        let mut loop_context = self.build_active_loop_context(candidate, exit, &combined_target_overrides, &plan.states)?;
+        let mut loop_context = self.build_active_loop_context(
+            candidate,
+            exit,
+            &combined_target_overrides,
+            &plan.states,
+        )?;
         loop_context.loop_blocks = candidate.blocks.clone();
         loop_context.state_slots = plan.states.clone();
         let backedge_pad = self.repeat_backedge_pad(
@@ -231,8 +238,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .numeric_for_locals
             .get(&header)
             .copied()?;
-        let plan =
-            self.build_loop_state_plan(candidate, Some(block), exit, &[init.index], target_overrides)?;
+        let plan = self.build_loop_state_plan(
+            candidate,
+            Some(block),
+            exit,
+            &[init.index],
+            target_overrides,
+        )?;
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
         let mut suppressed = plan
@@ -254,7 +266,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             self.overrides.suppress_phi(*phi_id);
         }
         let continue_block = candidate.continue_target.unwrap_or(header);
-        let mut loop_context = self.build_active_loop_context(candidate, exit, &combined_target_overrides, &plan.states)?;
+        let mut loop_context = self.build_active_loop_context(
+            candidate,
+            exit,
+            &combined_target_overrides,
+            &plan.states,
+        )?;
         loop_context.loop_blocks = candidate.blocks.clone();
         loop_context.state_slots = plan.states.clone();
         self.active_loops.push(loop_context.clone());
@@ -353,8 +370,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             (0..loop_instr.bindings.len)
                 .map(|offset| Reg(loop_instr.bindings.start.index() + offset)),
         );
-        let plan =
-            self.build_loop_state_plan(candidate, Some(block), exit, &excluded_regs, target_overrides)?;
+        let plan = self.build_loop_state_plan(
+            candidate,
+            Some(block),
+            exit,
+            &excluded_regs,
+            target_overrides,
+        )?;
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
 
@@ -362,7 +384,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stmts.extend(self.lower_block_prefix(block, false, target_overrides)?);
         stmts.extend(loop_state_init_stmts(&plan));
 
-        let mut loop_context = self.build_active_loop_context(candidate, exit, &combined_target_overrides, &plan.states)?;
+        let mut loop_context = self.build_active_loop_context(
+            candidate,
+            exit,
+            &combined_target_overrides,
+            &plan.states,
+        )?;
         loop_context.loop_blocks = candidate.blocks.clone();
         loop_context.state_slots = plan.states.clone();
         self.active_loops.push(loop_context.clone());

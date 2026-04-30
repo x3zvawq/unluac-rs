@@ -232,11 +232,7 @@ impl TestFailure {
         }
     }
 
-    fn with_proto_stats(
-        mut self,
-        proto_count: usize,
-        failed_proto_tags: Vec<String>,
-    ) -> Self {
+    fn with_proto_stats(mut self, proto_count: usize, failed_proto_tags: Vec<String>) -> Self {
         self.proto_count = proto_count;
         self.failed_proto_tags = failed_proto_tags;
         self
@@ -530,14 +526,13 @@ pub(crate) fn run_decompile_pipeline_health(
             format!("unknown test dialect {dialect_label}: {error}"),
         )
     })?;
-    let baseline = build_case_health_baseline(entry, suite_label)
-        .map_err(|failure| {
-            TestFailure::new(
-                FailureKind::CaseHealthBaselineFailed,
-                format!("case-health baseline failed first: {}", failure.summary()),
-                format!("case-health baseline failed first\n{}", failure.detail()),
-            )
-        })?;
+    let baseline = build_case_health_baseline(entry, suite_label).map_err(|failure| {
+        TestFailure::new(
+            FailureKind::CaseHealthBaselineFailed,
+            format!("case-health baseline failed first: {}", failure.summary()),
+            format!("case-health baseline failed first\n{}", failure.detail()),
+        )
+    })?;
     let dialect = entry.dialect.decompile_dialect().ok_or_else(|| {
         TestFailure::new(
             FailureKind::UnsupportedDecompileDialect,
@@ -571,19 +566,15 @@ pub(crate) fn run_decompile_pipeline_health(
             format!("generate stage finished without source for {}", entry.path),
         )
     })?;
-    let generated_source_path = write_generated_case_source(
-        dialect_label,
-        suite_label,
-        entry.path,
-        &generated.source,
-    )
-    .map_err(|error| {
-        TestFailure::new(
-            FailureKind::WriteGeneratedSourceFailed,
-            "write generated source failed",
-            format!("write generated source failed: {error}"),
-        )
-    })?;
+    let generated_source_path =
+        write_generated_case_source(dialect_label, suite_label, entry.path, &generated.source)
+            .map_err(|error| {
+                TestFailure::new(
+                    FailureKind::WriteGeneratedSourceFailed,
+                    "write generated source failed",
+                    format!("write generated source failed: {error}"),
+                )
+            })?;
 
     let (generated_chunk_path, compile_output) = compile_generated_source_to_suite_artifact(
         dialect_label,
@@ -663,7 +654,8 @@ pub(crate) fn run_decompile_pipeline_health(
         &generated_output,
     ) {
         let proto_count = count_output_tags(&baseline.source_output.stdout);
-        let failed_tags = diff_output_tags(&baseline.source_output.stdout, &generated_output.stdout);
+        let failed_tags =
+            diff_output_tags(&baseline.source_output.stdout, &generated_output.stdout);
         let summary = format!(
             "generated output mismatch (runtime artifact: {})",
             repo_relative_display(generated_runtime_path),
@@ -702,21 +694,20 @@ pub(crate) fn run_decompile_pipeline_health(
                 format!("[{round_label}] write generated source failed: {error}"),
             )
         })?;
-        let (prev_chunk_path, prev_compile_output) =
-            compile_generated_source_to_suite_artifact(
-                dialect_label,
-                entry.path,
-                &format!("{suite_label}/{round_label}"),
-                &prev_source_path,
-                true,
+        let (prev_chunk_path, prev_compile_output) = compile_generated_source_to_suite_artifact(
+            dialect_label,
+            entry.path,
+            &format!("{suite_label}/{round_label}"),
+            &prev_source_path,
+            true,
+        )
+        .map_err(|error| {
+            TestFailure::new(
+                FailureKind::RecompileGeneratedSourceCompilationFailed,
+                format!("[{round_label}] compile generated source failed"),
+                format!("[{round_label}] compile generated source failed: {error}"),
             )
-            .map_err(|error| {
-                TestFailure::new(
-                    FailureKind::RecompileGeneratedSourceCompilationFailed,
-                    format!("[{round_label}] compile generated source failed"),
-                    format!("[{round_label}] compile generated source failed: {error}"),
-                )
-            })?;
+        })?;
         if !prev_compile_output.success() {
             let reason = primary_command_reason(&prev_compile_output)
                 .map(|reason| format!(": {reason}"))
@@ -790,21 +781,20 @@ pub(crate) fn run_decompile_pipeline_health(
                 format!("[{round_label}] write regen source failed: {error}"),
             )
         })?;
-        let (regen_chunk_path, regen_compile_output) =
-            compile_generated_source_to_suite_artifact(
-                dialect_label,
-                entry.path,
-                &format!("{suite_label}/{round_label}-regen"),
-                &regen_source_path,
-                true,
+        let (regen_chunk_path, regen_compile_output) = compile_generated_source_to_suite_artifact(
+            dialect_label,
+            entry.path,
+            &format!("{suite_label}/{round_label}-regen"),
+            &regen_source_path,
+            true,
+        )
+        .map_err(|error| {
+            TestFailure::new(
+                FailureKind::RecompileGeneratedSourceCompilationFailed,
+                format!("[{round_label}] compile regen source failed"),
+                format!("[{round_label}] compile regen source failed: {error}"),
             )
-            .map_err(|error| {
-                TestFailure::new(
-                    FailureKind::RecompileGeneratedSourceCompilationFailed,
-                    format!("[{round_label}] compile regen source failed"),
-                    format!("[{round_label}] compile regen source failed: {error}"),
-                )
-            })?;
+        })?;
         if !regen_compile_output.success() {
             let reason = primary_command_reason(&regen_compile_output)
                 .map(|reason| format!(": {reason}"))
@@ -866,7 +856,8 @@ pub(crate) fn run_decompile_pipeline_health(
             &regen_output,
         ) {
             let proto_count = count_output_tags(&baseline.source_output.stdout);
-            let failed_tags = diff_output_tags(&baseline.source_output.stdout, &regen_output.stdout);
+            let failed_tags =
+                diff_output_tags(&baseline.source_output.stdout, &regen_output.stdout);
             let summary = format!(
                 "[{round_label}] regen output mismatch (runtime artifact: {})",
                 repo_relative_display(regen_runtime_path),
@@ -878,7 +869,8 @@ pub(crate) fn run_decompile_pipeline_health(
                     "{summary}\n{diff}\ngenerated source:\n{}",
                     recompile_generated.source,
                 ),
-            ).with_proto_stats(proto_count, failed_tags));
+            )
+            .with_proto_stats(proto_count, failed_tags));
         }
 
         prev_generated_source = recompile_generated.source.clone();
@@ -1026,7 +1018,11 @@ pub(crate) fn diff_command_outputs(
 /// 从 stdout 行中提取 `file#N` 风格标签（每行第一个 tab 之前的字段，需包含 `#`）。
 fn extract_line_tag(line: &str) -> Option<&str> {
     let field = line.split('\t').next()?;
-    if field.contains('#') { Some(field) } else { None }
+    if field.contains('#') {
+        Some(field)
+    } else {
+        None
+    }
 }
 
 /// 统计 stdout 中出现过的不重复 tag 数量，即文件内的 proto 数量。

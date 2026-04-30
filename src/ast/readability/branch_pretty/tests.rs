@@ -325,6 +325,101 @@ fn collapses_nested_guard_if_chain_into_single_short_circuit_condition() {
 }
 
 #[test]
+fn removes_empty_else_block_from_positive_if() {
+    let cond = ParamId(0);
+    let callee = ParamId(1);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: AstBlock {
+            stmts: vec![AstStmt::If(Box::new(AstIf {
+                cond: AstExpr::Var(AstNameRef::Param(cond)),
+                then_block: AstBlock {
+                    stmts: vec![AstStmt::CallStmt(Box::new(AstCallStmt {
+                        call: AstCallKind::Call(Box::new(AstCallExpr {
+                            callee: AstExpr::Var(AstNameRef::Param(callee)),
+                            args: Vec::new(),
+                        })),
+                    }))],
+                },
+                else_block: Some(AstBlock { stmts: Vec::new() }),
+            }))],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(AstDialectVersion::Lua55),
+            options: Default::default(),
+        }
+    ));
+
+    let AstStmt::If(if_stmt) = &module.body.stmts[0] else {
+        panic!("expected if statement");
+    };
+    assert!(if_stmt.else_block.is_none(), "{if_stmt:?}");
+    assert_eq!(if_stmt.cond, AstExpr::Var(AstNameRef::Param(cond)));
+}
+
+#[test]
+fn flips_empty_then_else_into_positive_if_without_empty_else() {
+    let event = ParamId(0);
+    let callee = ParamId(1);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: AstBlock {
+            stmts: vec![AstStmt::If(Box::new(AstIf {
+                cond: AstExpr::Unary(Box::new(AstUnaryExpr {
+                    op: AstUnaryOpKind::Not,
+                    expr: AstExpr::Binary(Box::new(AstBinaryExpr {
+                        op: AstBinaryOpKind::Eq,
+                        lhs: AstExpr::Var(AstNameRef::Param(event)),
+                        rhs: AstExpr::String("PRESS".to_owned()),
+                    })),
+                })),
+                then_block: AstBlock { stmts: Vec::new() },
+                else_block: Some(AstBlock {
+                    stmts: vec![AstStmt::CallStmt(Box::new(AstCallStmt {
+                        call: AstCallKind::Call(Box::new(AstCallExpr {
+                            callee: AstExpr::Var(AstNameRef::Param(callee)),
+                            args: Vec::new(),
+                        })),
+                    }))],
+                }),
+            }))],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(AstDialectVersion::Lua55),
+            options: Default::default(),
+        }
+    ));
+
+    assert_eq!(
+        module.body.stmts,
+        vec![AstStmt::If(Box::new(AstIf {
+            cond: AstExpr::Binary(Box::new(AstBinaryExpr {
+                op: AstBinaryOpKind::Eq,
+                lhs: AstExpr::Var(AstNameRef::Param(event)),
+                rhs: AstExpr::String("PRESS".to_owned()),
+            })),
+            then_block: AstBlock {
+                stmts: vec![AstStmt::CallStmt(Box::new(AstCallStmt {
+                    call: AstCallKind::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Param(callee)),
+                        args: Vec::new(),
+                    })),
+                }))],
+            },
+            else_block: None,
+        }))]
+    );
+}
+
+#[test]
 fn folds_terminal_goto_shell_back_into_if_else() {
     let cond = ParamId(0);
     let local = LocalId(0);

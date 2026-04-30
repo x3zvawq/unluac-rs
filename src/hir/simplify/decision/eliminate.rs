@@ -467,11 +467,7 @@ fn materialize_decision_node(
     }
 
     let (cond, then_block, else_block) = if then_block.stmts.is_empty() {
-        (
-            cond.negate(),
-            HirBlock { stmts: else_stmts },
-            None,
-        )
+        (cond.negate(), HirBlock { stmts: else_stmts }, None)
     } else if else_stmts.is_empty() {
         (cond, then_block, None)
     } else {

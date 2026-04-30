@@ -63,7 +63,6 @@ impl DecompileStage {
             Self::Generate => None,
         }
     }
-
 }
 
 impl fmt::Display for DecompileStage {
@@ -82,9 +81,7 @@ impl FromStr for DecompileStage {
             "cfg" => Ok(Self::Cfg),
             "graph-facts" | "graph_facts" | "graphfacts" => Ok(Self::GraphFacts),
             "dataflow" => Ok(Self::Dataflow),
-            "structure-facts" | "structure_facts" | "structurefacts" => {
-                Ok(Self::StructureFacts)
-            }
+            "structure-facts" | "structure_facts" | "structurefacts" => Ok(Self::StructureFacts),
             "hir" => Ok(Self::Hir),
             "ast" => Ok(Self::Ast),
             "readability" => Ok(Self::Readability),

@@ -151,7 +151,10 @@ pub(crate) const ALL_CASES: &[LuaCaseMatrixEntry] = &[
         ALL_DIALECTS,
     ),
     LuaCaseMatrixEntry::new("tests/lua_cases/common_08_closures.lua", ALL_DIALECTS),
-    LuaCaseMatrixEntry::new("tests/lua_cases/common_09_method_and_self.lua", ALL_DIALECTS),
+    LuaCaseMatrixEntry::new(
+        "tests/lua_cases/common_09_method_and_self.lua",
+        ALL_DIALECTS,
+    ),
     LuaCaseMatrixEntry::new("tests/lua_cases/common_10_tables.lua", ALL_DIALECTS),
     LuaCaseMatrixEntry::new("tests/lua_cases/common_11_runtime.lua", ALL_DIALECTS),
     // ── dialect-specific cases ──

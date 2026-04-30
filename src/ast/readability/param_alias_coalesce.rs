@@ -33,11 +33,11 @@ use super::super::common::{
 use super::ReadabilityContext;
 use super::walk::{self, AstRewritePass, BlockKind};
 use crate::ast::common::AstBindingRef;
-use crate::hir::{LocalId, ParamId};
 use crate::ast::traverse::{
     traverse_call_children, traverse_expr_children, traverse_lvalue_children,
     traverse_stmt_children,
 };
+use crate::hir::{LocalId, ParamId};
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
     let _ = context.target;
@@ -112,7 +112,9 @@ fn single_plain_local_binding(local_decl: &AstLocalDecl) -> Option<LocalId> {
 // === 闭包捕获扫描 =========================================================
 
 fn any_closure_captures_local(stmts: &[AstStmt], local: LocalId) -> bool {
-    stmts.iter().any(|stmt| stmt_has_closure_capturing_local(stmt, local))
+    stmts
+        .iter()
+        .any(|stmt| stmt_has_closure_capturing_local(stmt, local))
 }
 
 fn block_has_closure_capturing_local(block: &AstBlock, local: LocalId) -> bool {
@@ -158,7 +160,10 @@ fn lvalue_has_closure_capturing_local(lvalue: &AstLValue, local: LocalId) -> boo
     found
 }
 
-fn call_has_closure_capturing_local(call: &crate::ast::common::AstCallKind, local: LocalId) -> bool {
+fn call_has_closure_capturing_local(
+    call: &crate::ast::common::AstCallKind,
+    local: LocalId,
+) -> bool {
     let mut found = false;
     traverse_call_children!(
         call,
@@ -231,7 +236,9 @@ fn lvalue_writes_local(lvalue: &AstLValue, local: LocalId) -> bool {
 
 // 检查 L 是否在 stmts 中的任何循环体内被写入。
 fn any_local_write_inside_loop(stmts: &[AstStmt], local: LocalId) -> bool {
-    stmts.iter().any(|s| stmt_has_local_write_inside_loop(s, local))
+    stmts
+        .iter()
+        .any(|s| stmt_has_local_write_inside_loop(s, local))
 }
 
 fn stmt_has_local_write_inside_loop(stmt: &AstStmt, local: LocalId) -> bool {

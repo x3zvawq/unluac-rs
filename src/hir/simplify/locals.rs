@@ -18,17 +18,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::branch_value_folding::{
-    fold_branch_value_locals_in_block, matches_local_lvalue,
-};
+use super::branch_value_folding::{fold_branch_value_locals_in_block, matches_local_lvalue};
 use super::temp_touch::{
-    collect_temp_refs_in_stmts, expr_touches_any_temp,
-    stmt_consumes_temps_only_in_control_head, stmt_contains_nested_nonlocal_control,
-    stmt_touches_any_temp, stmts_touch_temp,
+    collect_temp_refs_in_stmts, expr_touches_any_temp, stmt_consumes_temps_only_in_control_head,
+    stmt_contains_nested_nonlocal_control, stmt_touches_any_temp, stmts_touch_temp,
 };
 use crate::hir::common::{
-    HirAssign, HirBlock, HirCallExpr, HirExpr, HirLValue, HirLocalDecl,
-    HirProto, HirStmt, HirTableConstructor, HirTableField, HirTableKey, LocalId, TempId,
+    HirAssign, HirBlock, HirCallExpr, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt,
+    HirTableConstructor, HirTableField, HirTableKey, LocalId, TempId,
 };
 use crate::hir::promotion::ProtoPromotionFacts;
 
@@ -182,7 +179,13 @@ fn promote_block(
     // 错误地提升为块级局部变量。
     let suffix_temps = compute_suffix_temp_refs(&block.stmts);
 
-    let plans = collect_plans(ctx, block, inherited, inherited_sticky_slots, outer_used_temps);
+    let plans = collect_plans(
+        ctx,
+        block,
+        inherited,
+        inherited_sticky_slots,
+        outer_used_temps,
+    );
     let plan_by_decl = plans.iter().fold(
         BTreeMap::<usize, Vec<&PromotionPlan>>::new(),
         |mut grouped, plan| {
@@ -815,9 +818,14 @@ fn rewrite_stmt(
         }
         HirStmt::If(if_stmt) => {
             let cond_changed = rewrite_expr(&mut if_stmt.cond, mapping);
-            let then_changed =
-                promote_block(ctx, &mut if_stmt.then_block, mapping, sticky_slots, outer_used_temps)
-                    .changed;
+            let then_changed = promote_block(
+                ctx,
+                &mut if_stmt.then_block,
+                mapping,
+                sticky_slots,
+                outer_used_temps,
+            )
+            .changed;
             let else_changed = if_stmt.else_block.as_mut().is_some_and(|else_block| {
                 promote_block(ctx, else_block, mapping, sticky_slots, outer_used_temps).changed
             });
@@ -825,17 +833,27 @@ fn rewrite_stmt(
         }
         HirStmt::While(while_stmt) => {
             let cond_changed = rewrite_expr(&mut while_stmt.cond, mapping);
-            let body_changed =
-                promote_block(ctx, &mut while_stmt.body, mapping, sticky_slots, outer_used_temps)
-                    .changed;
+            let body_changed = promote_block(
+                ctx,
+                &mut while_stmt.body,
+                mapping,
+                sticky_slots,
+                outer_used_temps,
+            )
+            .changed;
             cond_changed || body_changed
         }
         HirStmt::Repeat(repeat_stmt) => {
             // `repeat ... until` 的条件和 loop body 共享同一个词法作用域。
             // body 里刚刚提升出来的 local 如果不继续带到条件里，条件就会继续挂着旧 temp，
             // 最后得到“body 已经是 l2，until 里还是 t3”这种半截 HIR。
-            let body_result =
-                promote_block(ctx, &mut repeat_stmt.body, mapping, sticky_slots, outer_used_temps);
+            let body_result = promote_block(
+                ctx,
+                &mut repeat_stmt.body,
+                mapping,
+                sticky_slots,
+                outer_used_temps,
+            );
             let cond_changed = rewrite_expr(&mut repeat_stmt.cond, &body_result.trailing_mapping);
             body_result.changed || cond_changed
         }
@@ -843,9 +861,14 @@ fn rewrite_stmt(
             let start_changed = rewrite_expr(&mut numeric_for.start, mapping);
             let limit_changed = rewrite_expr(&mut numeric_for.limit, mapping);
             let step_changed = rewrite_expr(&mut numeric_for.step, mapping);
-            let body_changed =
-                promote_block(ctx, &mut numeric_for.body, mapping, sticky_slots, outer_used_temps)
-                    .changed;
+            let body_changed = promote_block(
+                ctx,
+                &mut numeric_for.body,
+                mapping,
+                sticky_slots,
+                outer_used_temps,
+            )
+            .changed;
             start_changed || limit_changed || step_changed || body_changed
         }
         HirStmt::GenericFor(generic_for) => {
@@ -853,17 +876,28 @@ fn rewrite_stmt(
             for expr in &mut generic_for.iterator {
                 iterator_changed |= rewrite_expr(expr, mapping);
             }
-            let body_changed =
-                promote_block(ctx, &mut generic_for.body, mapping, sticky_slots, outer_used_temps)
-                    .changed;
+            let body_changed = promote_block(
+                ctx,
+                &mut generic_for.body,
+                mapping,
+                sticky_slots,
+                outer_used_temps,
+            )
+            .changed;
             iterator_changed || body_changed
         }
         HirStmt::Block(block) => {
             promote_block(ctx, block, mapping, sticky_slots, outer_used_temps).changed
         }
         HirStmt::Unstructured(unstructured) => {
-            promote_block(ctx, &mut unstructured.body, mapping, sticky_slots, outer_used_temps)
-                .changed
+            promote_block(
+                ctx,
+                &mut unstructured.body,
+                mapping,
+                sticky_slots,
+                outer_used_temps,
+            )
+            .changed
         }
         HirStmt::Break
         | HirStmt::Close(_)

@@ -194,9 +194,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return Some(expr.clone());
         }
 
-        if let Some(expr) =
-            shared_expr_for_defs(&self.lowering.bindings.fixed_temps, defs.iter().copied(), target_overrides)
-        {
+        if let Some(expr) = shared_expr_for_defs(
+            &self.lowering.bindings.fixed_temps,
+            defs.iter().copied(),
+            target_overrides,
+        ) {
             return Some(expr);
         }
 
@@ -612,7 +614,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             }
             break_exits.insert(
                 exit,
-                self.lower_break_exit_pad(exit, post_loop, downstream_post_loop, target_overrides, states)?,
+                self.lower_break_exit_pad(
+                    exit,
+                    post_loop,
+                    downstream_post_loop,
+                    target_overrides,
+                    states,
+                )?,
             );
         }
         let continue_target = candidate.continue_target;
@@ -673,7 +681,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             if downstream_post_loop == Some(exit) {
                 continue;
             }
-            self.lower_break_exit_pad(exit, post_loop, downstream_post_loop, &BTreeMap::new(), &[])?;
+            self.lower_break_exit_pad(
+                exit,
+                post_loop,
+                downstream_post_loop,
+                &BTreeMap::new(),
+                &[],
+            )?;
             inside_blocks.insert(exit);
         }
         Some(inside_blocks)

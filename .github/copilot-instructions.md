@@ -3,7 +3,7 @@
 当前仓库的核心文档入口如下：
 
 - 设计文档见 [design.md](../docs/design.md)，当你刚开始接手这个项目的时候务必阅读。如果需要修改某一层次的业务实现的时候 **必须** 先阅读对应层次的文档。并且如果在修改了仓库中的业务代码（比如增加了某些 helper 方法，或者某些 facts 可以给后层消费的）需要同步更新文档。
-- 调试手册见 [debug.md](../docs/debug.md)，排查错误、需要调试 cli 以及库的时候务必阅读。
+- 调试手册见 [debug.md](../docs/debug.md)，排查错误、需要调试 cli 以及库的时候**务必阅读**。
 - 仓库内有完整的lua执行环境，见 [lua/README.md](../lua/README.md)。
 
 ## 工作时一定、必须遵循的规则
@@ -24,4 +24,5 @@
   - `packages/unluac-js/src/index.ts` js包装库中的类型声明
   - `packages/unluac-cli/src/cli.rs` cli工具中的参数解析部分
   - `packages/unluac-wasm/src/lib.rs` wasm库中的参数解析部分
+  - `packages/unluac-web` 前端入口的setting panel、参数说明、传入等
 - 提交信息应该只使用一行："type(scope): description"，其中 type 是 feat/fix/refactor/test/doc/chore 之一，scope 是修改的模块或者层次，description 是简短的描述。比如 "fix(transformer): handle missing loop body"。不需要描述修改细节，使用中文。

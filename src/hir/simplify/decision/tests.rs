@@ -41,9 +41,10 @@ fn collapses_repeated_same_test_in_decision_chain() {
         crate::readability::ReadabilityOptions::default(),
         &crate::timing::TimingCollector::disabled(),
         &[],
-        crate::generate::GenerateMode::Strict, crate::ast::AstDialectVersion::Lua51,
+        crate::generate::GenerateMode::Strict,
+        crate::ast::AstDialectVersion::Lua51,
         &super::super::PassDumpConfig::default(),
-        );
+    );
 
     assert!(matches!(
         &module.protos[0].body.stmts.as_slice(),
@@ -82,9 +83,10 @@ fn folds_constant_truthy_decision_to_leaf_expr() {
         crate::readability::ReadabilityOptions::default(),
         &crate::timing::TimingCollector::disabled(),
         &[],
-        crate::generate::GenerateMode::Strict, crate::ast::AstDialectVersion::Lua51,
+        crate::generate::GenerateMode::Strict,
+        crate::ast::AstDialectVersion::Lua51,
         &super::super::PassDumpConfig::default(),
-        );
+    );
 
     assert!(matches!(
         &module.protos[0].body.stmts.as_slice(),
@@ -132,9 +134,10 @@ fn specializes_descendant_when_stable_test_truthiness_is_already_known() {
         crate::readability::ReadabilityOptions::default(),
         &crate::timing::TimingCollector::disabled(),
         &[],
-        crate::generate::GenerateMode::Strict, crate::ast::AstDialectVersion::Lua51,
+        crate::generate::GenerateMode::Strict,
+        crate::ast::AstDialectVersion::Lua51,
         &super::super::PassDumpConfig::default(),
-        );
+    );
 
     assert!(matches!(
         &module.protos[0].body.stmts.as_slice(),
@@ -204,9 +207,10 @@ fn collapses_value_decision_when_then_branch_is_definitely_truthy() {
         crate::readability::ReadabilityOptions::default(),
         &crate::timing::TimingCollector::disabled(),
         &[],
-        crate::generate::GenerateMode::Strict, crate::ast::AstDialectVersion::Lua51,
+        crate::generate::GenerateMode::Strict,
+        crate::ast::AstDialectVersion::Lua51,
         &super::super::PassDumpConfig::default(),
-        );
+    );
 
     assert!(matches!(
         &module.protos[0].body.stmts.as_slice(),
@@ -243,9 +247,10 @@ fn keeps_collapsible_decision_inside_short_circuit_expr_as_value_expr() {
         crate::readability::ReadabilityOptions::default(),
         &crate::timing::TimingCollector::disabled(),
         &[],
-        crate::generate::GenerateMode::Strict, crate::ast::AstDialectVersion::Lua51,
+        crate::generate::GenerateMode::Strict,
+        crate::ast::AstDialectVersion::Lua51,
         &super::super::PassDumpConfig::default(),
-        );
+    );
 
     assert!(matches!(
         module.protos[0].body.stmts.as_slice(),
@@ -313,9 +318,10 @@ fn keeps_cyclic_value_decision_stable_during_simplify() {
         crate::readability::ReadabilityOptions::default(),
         &crate::timing::TimingCollector::disabled(),
         &[],
-        crate::generate::GenerateMode::Strict, crate::ast::AstDialectVersion::Lua51,
+        crate::generate::GenerateMode::Strict,
+        crate::ast::AstDialectVersion::Lua51,
         &super::super::PassDumpConfig::default(),
-        );
+    );
 
     assert!(matches!(
         &module.protos[0].body.stmts.as_slice(),
@@ -348,9 +354,10 @@ fn removes_boolean_shells_in_condition_context() {
         crate::readability::ReadabilityOptions::default(),
         &crate::timing::TimingCollector::disabled(),
         &[],
-        crate::generate::GenerateMode::Strict, crate::ast::AstDialectVersion::Lua51,
+        crate::generate::GenerateMode::Strict,
+        crate::ast::AstDialectVersion::Lua51,
         &super::super::PassDumpConfig::default(),
-        );
+    );
 
     assert!(matches!(
         module.protos[0].body.stmts.as_slice(),

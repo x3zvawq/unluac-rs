@@ -918,7 +918,9 @@ mod decompile_pipeline {
         );
         assert!(!generated.source.contains(".next("), "{}", generated.source);
         assert!(
-            generated.source.contains("value = value2 + (value3:next() or 1)"),
+            generated
+                .source
+                .contains("value = value2 + (value3:next() or 1)"),
             "{}",
             generated.source
         );

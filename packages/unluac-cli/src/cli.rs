@@ -664,11 +664,15 @@ fn repo_root() -> PathBuf {
 }
 
 fn parse_dialect_arg(value: &str) -> Result<DecompileDialect, String> {
-    value.parse().map_err(|_| format!("unsupported dialect: {value}"))
+    value
+        .parse()
+        .map_err(|_| format!("unsupported dialect: {value}"))
 }
 
 fn parse_stage_arg(value: &str) -> Result<DecompileStage, String> {
-    value.parse().map_err(|_| format!("unsupported stage: {value}"))
+    value
+        .parse()
+        .map_err(|_| format!("unsupported stage: {value}"))
 }
 
 fn parse_debug_detail_arg(value: &str) -> Result<DebugDetail, String> {
@@ -686,15 +690,16 @@ fn parse_debug_color_arg(value: &str) -> Result<DebugColorMode, String> {
 fn parse_proto_depth_arg(value: &str) -> Result<ProtoDepth, String> {
     match value {
         "all" | "max" | "*" => Ok(ProtoDepth::All),
-        other => other
-            .parse::<usize>()
-            .map(ProtoDepth::Fixed)
-            .map_err(|_| format!("unsupported proto depth: {value} (expected a non-negative integer or `all`)")),
+        other => other.parse::<usize>().map(ProtoDepth::Fixed).map_err(|_| {
+            format!("unsupported proto depth: {value} (expected a non-negative integer or `all`)")
+        }),
     }
 }
 
 fn parse_string_encoding_arg(value: &str) -> Result<StringEncoding, String> {
-    value.parse().map_err(|_| format!("unsupported encoding: {value}"))
+    value
+        .parse()
+        .map_err(|_| format!("unsupported encoding: {value}"))
 }
 
 fn parse_string_decode_mode_arg(value: &str) -> Result<StringDecodeMode, String> {
@@ -704,11 +709,15 @@ fn parse_string_decode_mode_arg(value: &str) -> Result<StringDecodeMode, String>
 }
 
 fn parse_parse_mode_arg(value: &str) -> Result<ParseMode, String> {
-    value.parse().map_err(|_| format!("unsupported parse mode: {value}"))
+    value
+        .parse()
+        .map_err(|_| format!("unsupported parse mode: {value}"))
 }
 
 fn parse_naming_mode_arg(value: &str) -> Result<NamingMode, String> {
-    value.parse().map_err(|_| format!("unsupported naming mode: {value}"))
+    value
+        .parse()
+        .map_err(|_| format!("unsupported naming mode: {value}"))
 }
 
 fn parse_quote_style_arg(value: &str) -> Result<QuoteStyle, String> {

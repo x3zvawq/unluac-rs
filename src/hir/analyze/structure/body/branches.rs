@@ -80,9 +80,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let branch_target_overrides = self
             .branch_value_merges_by_header
             .contains_key(&block)
-            .then(|| {
-                self.branch_value_target_overrides(block, target_overrides)
-            });
+            .then(|| self.branch_value_target_overrides(block, target_overrides));
         if let Some(branch_target_overrides) = branch_target_overrides.as_ref() {
             stmts.extend(self.branch_value_preserved_entry_stmts(block, branch_target_overrides));
         }
@@ -98,10 +96,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 self.branch_value_else_target_overrides(block, branch_target_overrides)
             })
             .unwrap_or_else(|| target_overrides.clone());
-        let then_block = self.lower_region(plan.then_entry, branch_stop, &then_target_overrides)?;
+        let then_stop =
+            self.branch_arm_stop(plan.then_entry, plan.else_entry, plan.merge, branch_stop);
+        let else_stop = plan.else_entry.and_then(|else_entry| {
+            self.branch_arm_stop(else_entry, Some(plan.then_entry), plan.merge, branch_stop)
+        });
+        let then_block = self.lower_region(plan.then_entry, then_stop, &then_target_overrides)?;
         let else_block = match plan.else_entry {
             Some(else_entry) => {
-                Some(self.lower_region(else_entry, branch_stop, &else_target_overrides)?)
+                Some(self.lower_region(else_entry, else_stop, &else_target_overrides)?)
             }
             // IfThen 无 else 臂时，不再为 merge block 上的 phi 生成隐式 else 赋值。
             // 这些 phi 会在 merge block 的 lower_block_prefix 中由 idom 兜底统一
@@ -109,11 +112,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             // 避免双重物化导致冗余临时变量、多余引用和无意义 else 分支。
             None => None,
         };
-        stmts.push(branch_stmt({
-            let mut cond = plan.cond;
-            rewrite_expr_temps(&mut cond, &temp_expr_overrides(target_overrides));
-            cond
-        }, then_block, else_block));
+        stmts.push(branch_stmt(
+            {
+                let mut cond = plan.cond;
+                rewrite_expr_temps(&mut cond, &temp_expr_overrides(target_overrides));
+                cond
+            },
+            then_block,
+            else_block,
+        ));
         self.install_stop_boundary_value_merge_override(block, branch_stop, target_overrides);
         for header in &plan.consumed_headers {
             let branch_value_overrides = if *header == block {
@@ -380,8 +387,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 let is_direct_jump = self.block_terminator(else_entry).is_some_and(|(_, instr)| {
                     if let LowInstr::Jump(jump) = instr {
                         let target = self.lowering.cfg.instr_to_block[jump.target.index()];
-                        target == break_exit
-                            || Some(target) == loop_context.downstream_post_loop
+                        target == break_exit || Some(target) == loop_context.downstream_post_loop
                     } else {
                         false
                     }
@@ -519,11 +525,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             )?
         };
         let continue_else = (!continue_block.stmts.is_empty()).then_some(continue_block);
-        stmts.push(branch_stmt(
-            keep_cond.negate(),
-            escape_block,
-            continue_else,
-        ));
+        stmts.push(branch_stmt(keep_cond.negate(), escape_block, continue_else));
 
         Some(Some(continue_target))
     }
@@ -969,10 +971,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         });
 
         let cond = lower_short_circuit_subject(self.lowering, node.header)?;
-        let truthy =
-            self.build_secondary_decision_target(short, &node.truthy, reg, nodes)?;
-        let falsy =
-            self.build_secondary_decision_target(short, &node.falsy, reg, nodes)?;
+        let truthy = self.build_secondary_decision_target(short, &node.truthy, reg, nodes)?;
+        let falsy = self.build_secondary_decision_target(short, &node.falsy, reg, nodes)?;
 
         nodes[my_ref.index()].test = cond;
         nodes[my_ref.index()].truthy = truthy;
@@ -989,8 +989,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     ) -> Option<HirDecisionTarget> {
         match target {
             ShortCircuitTarget::Node(next_ref) => {
-                let node_ref =
-                    self.build_secondary_decision_node(short, *next_ref, reg, nodes)?;
+                let node_ref = self.build_secondary_decision_node(short, *next_ref, reg, nodes)?;
                 Some(HirDecisionTarget::Node(node_ref))
             }
             ShortCircuitTarget::Value(block) => {

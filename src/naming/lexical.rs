@@ -4,12 +4,12 @@
 //! “某个函数在定义点到底能看到哪些外层绑定”。这样后续参数命名就能避开
 //! 祖先作用域里当前可见的自动生成名字，而不是退化成全局禁名或拍脑袋加后缀。
 
-use crate::ast::{
-    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue,
-    AstLocalDecl, AstModule, AstStmt, AstSyntheticLocalId,
-};
 use crate::ast::traverse::{
     traverse_call_children, traverse_expr_children, traverse_lvalue_children,
+};
+use crate::ast::{
+    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstLocalDecl,
+    AstModule, AstStmt, AstSyntheticLocalId,
 };
 use crate::hir::{HirModule, HirProtoRef, LocalId, ParamId, UpvalueId};
 
@@ -320,7 +320,11 @@ fn collect_stmt_context(
                 scopes,
             )?;
         }
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => {}
+        AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_)
+        | AstStmt::Error(_) => {}
     }
     Ok(())
 }

@@ -5,6 +5,7 @@
 //! - 后续只使用一次
 //! - 使用点出现在 return / 调用参数 / 索引位 / 调用目标
 //! - 被内联表达式必须是我们能证明“纯且无元方法副作用”的安全子集
+//! - 相邻调用准备 run 中的简单表构造参数，可以随同 receiver/callee 一起收回调用位
 //! - 相邻 recovered local run 里，只有末尾 local 仍会跨语句存活的机械链
 
 mod candidate;
@@ -213,7 +214,7 @@ fn collapse_adjacent_call_alias_runs(block: &mut AstBlock, options: ReadabilityO
 
         if run_end == index
             || run_end >= old_stmts.len()
-            || !matches!(old_stmts[run_end], AstStmt::CallStmt(_))
+            || !stmt_is_terminal_call_alias_sink(&old_stmts[run_end])
         {
             new_stmts.push(old_stmts[index].clone());
             index += 1;
@@ -285,6 +286,20 @@ fn collapse_adjacent_call_alias_runs(block: &mut AstBlock, options: ReadabilityO
 
     block.stmts = new_stmts;
     changed
+}
+
+fn stmt_is_terminal_call_alias_sink(stmt: &AstStmt) -> bool {
+    match stmt {
+        AstStmt::CallStmt(_) => true,
+        // `return f(...)` 在字节码里也常由同一段调用准备 run 供给 callee/args。
+        // 这里只接单个返回值，避免把别名内联进 `return a(), f(x)` 这类多返回式时
+        // 改变 alias 求值相对前置返回值的顺序。
+        AstStmt::Return(ret) => matches!(
+            ret.values.as_slice(),
+            [super::super::common::AstExpr::Call(_)]
+        ),
+        _ => false,
+    }
 }
 
 fn collapse_terminal_call_result_alias_runs(

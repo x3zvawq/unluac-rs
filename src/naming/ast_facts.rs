@@ -6,13 +6,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ast::{
-    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue,
-    AstModule, AstNameRef, AstStmt, AstSyntheticLocalId,
-};
 use crate::ast::traverse::{
     traverse_call_children, traverse_expr_children, traverse_lvalue_children,
     traverse_stmt_children,
+};
+use crate::ast::{
+    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue,
+    AstModule, AstNameRef, AstStmt, AstSyntheticLocalId,
 };
 use crate::hir::{HirModule, HirProtoRef};
 

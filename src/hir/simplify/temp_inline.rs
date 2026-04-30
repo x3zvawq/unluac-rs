@@ -127,7 +127,6 @@ fn inline_temps_in_block(
                 .and_then(|next_stmt| inline_site_in_stmt(next_stmt, temp))
                 .is_some_and(|site| site.allows(value, readability))
         {
-
             state.temp_uses.remove_from_totals(&mut suffix_use_totals);
             let next_stmt = kept_rev
                 .last_mut()
@@ -196,10 +195,7 @@ fn inline_temps_in_nested_blocks(
             // body 里定义的 temp 如果同时出现在 cond 里，内联会导致 cond 引用
             // 到已被消除的 temp。因此将 cond 里提及的所有 temp 加入保护集。
             let mut repeat_protected = protected_temps.clone();
-            mentioned::collect_expr_mentioned_temps(
-                &repeat_stmt.cond,
-                &mut repeat_protected,
-            );
+            mentioned::collect_expr_mentioned_temps(&repeat_stmt.cond, &mut repeat_protected);
             inline_temps_in_block(
                 &mut repeat_stmt.body,
                 scratch,

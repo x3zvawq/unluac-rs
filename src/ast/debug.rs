@@ -196,7 +196,9 @@ fn translate_breadcrumb(breadcrumb: &str, proto_ids: &[usize]) -> String {
     while let Some(start) = rest.find("proto#") {
         out.push_str(&rest[..start]);
         let after = &rest[start + "proto#".len()..];
-        let digit_end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+        let digit_end = after
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after.len());
         let (digits, tail) = after.split_at(digit_end);
         if let Ok(local) = digits.parse::<usize>()
             && let Some(real) = proto_ids.get(local)
@@ -218,9 +220,7 @@ fn state_from_plan(proto_ids: &[usize], plan: &FocusPlan) -> AstFocusState {
         .iter()
         .filter_map(|local| proto_ids.get(*local).copied())
         .collect();
-    let focus = plan
-        .focus
-        .and_then(|local| proto_ids.get(local).copied());
+    let focus = plan.focus.and_then(|local| proto_ids.get(local).copied());
     AstFocusState {
         focus_proto_id: focus,
         visible_proto_ids: visible,
@@ -335,7 +335,8 @@ fn find_function_in_block(block: &AstBlock, proto_id: usize) -> Option<&AstFunct
 }
 
 fn find_function_in_stmt<'a>(stmt: &'a AstStmt, proto_id: usize) -> Option<&'a AstFunctionExpr> {
-    let mut result: Option<&'a AstFunctionExpr> = None;    traverse_stmt_children! {
+    let mut result: Option<&'a AstFunctionExpr> = None;
+    traverse_stmt_children! {
         stmt,
         iter = iter,
         opt = as_ref,
@@ -588,10 +589,7 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock, names: &Func
                     ),
                 );
                 if !ast_focus_is_visible(proto_id) {
-                    let _ = writeln!(
-                        output,
-                        "{header} --[[ body elided proto#{proto_id} ]] end",
-                    );
+                    let _ = writeln!(output, "{header} --[[ body elided proto#{proto_id} ]] end",);
                     continue;
                 }
                 let _ = writeln!(output, "{header}");
@@ -612,10 +610,7 @@ fn write_block(output: &mut String, indent: &str, block: &AstBlock, names: &Func
                     format_decl_params(&local_function_decl.func, false, names),
                 );
                 if !ast_focus_is_visible(proto_id) {
-                    let _ = writeln!(
-                        output,
-                        "{header} --[[ body elided proto#{proto_id} ]] end",
-                    );
+                    let _ = writeln!(output, "{header} --[[ body elided proto#{proto_id} ]] end",);
                     continue;
                 }
                 let _ = writeln!(output, "{header}");
@@ -1080,7 +1075,11 @@ fn collect_function_render_names_in_stmt(
         AstStmt::LocalFunctionDecl(local_function_decl) => {
             collect_binding_ref(local_function_decl.name, max_local, synthetic_locals);
         }
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => {}
+        AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_)
+        | AstStmt::Error(_) => {}
     }
 }
 
@@ -1202,7 +1201,8 @@ fn collect_function_render_names_in_expr(
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
-        | AstExpr::VarArg | AstExpr::Error(_) => {}
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => {}
     }
 }
 

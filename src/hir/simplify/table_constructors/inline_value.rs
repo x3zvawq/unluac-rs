@@ -355,10 +355,7 @@ fn expr_depends_on_any_pending_binding(
 /// 本就是合法 access-base。
 ///
 /// 不做修改（不消费 consumed_bindings），只做只读判定。
-fn producer_value_reaches_access_base_shape(
-    context: &InlineContext<'_>,
-    expr: &HirExpr,
-) -> bool {
+fn producer_value_reaches_access_base_shape(context: &InlineContext<'_>, expr: &HirExpr) -> bool {
     match expr {
         HirExpr::Nil
         | HirExpr::Boolean(_)
@@ -378,9 +375,7 @@ fn producer_value_reaches_access_base_shape(
         // Lua 的 prefixexp 语法允许 `Call` 结果继续作为下标/调用前缀
         // （例如 `require("jit")["status"]()`）。因此 Call 本身也是合法的
         // callee / access-base 形状，只要其 callee 本身是合法前缀表达式。
-        HirExpr::Call(call) => {
-            producer_value_reaches_access_base_shape(context, &call.callee)
-        }
+        HirExpr::Call(call) => producer_value_reaches_access_base_shape(context, &call.callee),
         HirExpr::TempRef(_) => {
             // TempRef 对应的 binding 如果还在 pending producer 列表里，
             // 说明它有机会被继续内联展开；透视到它的 producer 值再次判断一次。

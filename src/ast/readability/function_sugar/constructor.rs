@@ -187,7 +187,7 @@ fn inlineable_local_table_function_assign(
     let AstExpr::FunctionExpr(function) = &assign.values[0] else {
         return None;
     };
-    // 如果闭包体捕获了 constructor binding 自身（如 `obj.inc = function() obj.count = ... end`），		
+    // 如果闭包体捕获了 constructor binding 自身（如 `obj.inc = function() obj.count = ... end`），
     // 折入 constructor 后 binding 可能因 return-handoff 被消除，导致闭包中引用悬空。
     if function.captured_bindings.contains(&binding) {
         return None;

@@ -10,8 +10,8 @@ use crate::generate::GenerateOptions;
 use crate::naming::{NamingMode, NamingOptions};
 use crate::parser::{
     ParseMode, ParseOptions, RawChunk, StringDecodeMode, StringEncoding, parse_lua51_chunk,
-    parse_lua52_chunk, parse_lua53_chunk, parse_lua54_chunk, parse_lua55_chunk,
-    parse_luajit_chunk, parse_luau_chunk,
+    parse_lua52_chunk, parse_lua53_chunk, parse_lua54_chunk, parse_lua55_chunk, parse_luajit_chunk,
+    parse_luau_chunk,
 };
 use crate::readability::ReadabilityOptions;
 

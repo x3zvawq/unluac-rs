@@ -1792,6 +1792,242 @@ fn collapses_adjacent_local_alias_run_into_final_call_stmt() {
 }
 
 #[test]
+fn collapses_adjacent_method_call_alias_run_with_table_arg() {
+    let manager_alias = LocalId(0);
+    let payload_alias = LocalId(1);
+    let table_expr = AstExpr::TableConstructor(Box::new(AstTableConstructor {
+        fields: vec![AstTableField::Record(AstRecordField {
+            key: AstTableKey::Name("id".to_owned()),
+            value: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                base: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                    base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                        text: "gamelua".to_owned(),
+                    })),
+                    field: "events".to_owned(),
+                })),
+                field: "EID_CRIMSON_SUPPORT_JOIN_US_CLICKED".to_owned(),
+            })),
+        })],
+    }));
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(manager_alias),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "gamelua".to_owned(),
+                        })),
+                        field: "eventManager".to_owned(),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(payload_alias),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![table_expr.clone()],
+                })),
+                AstStmt::CallStmt(Box::new(crate::ast::AstCallStmt {
+                    call: AstCallKind::MethodCall(Box::new(AstMethodCallExpr {
+                        receiver: AstExpr::Var(AstNameRef::Local(manager_alias)),
+                        method: "notify".to_owned(),
+                        args: vec![AstExpr::Var(AstNameRef::Local(payload_alias))],
+                    })),
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+    assert_eq!(
+        module.body.stmts,
+        vec![AstStmt::CallStmt(Box::new(crate::ast::AstCallStmt {
+            call: AstCallKind::MethodCall(Box::new(AstMethodCallExpr {
+                receiver: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                    base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                        text: "gamelua".to_owned(),
+                    })),
+                    field: "eventManager".to_owned(),
+                })),
+                method: "notify".to_owned(),
+                args: vec![table_expr],
+            })),
+        }))]
+    );
+}
+
+#[test]
+fn does_not_collapse_method_call_alias_run_with_effectful_table_arg() {
+    let manager_alias = LocalId(0);
+    let payload_alias = LocalId(1);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(manager_alias),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "gamelua".to_owned(),
+                        })),
+                        field: "eventManager".to_owned(),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(payload_alias),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::TableConstructor(Box::new(AstTableConstructor {
+                        fields: vec![AstTableField::Record(AstRecordField {
+                            key: AstTableKey::Name("id".to_owned()),
+                            value: AstExpr::Call(Box::new(AstCallExpr {
+                                callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                                    text: "next_event".to_owned(),
+                                })),
+                                args: Vec::new(),
+                            })),
+                        })],
+                    }))],
+                })),
+                AstStmt::CallStmt(Box::new(crate::ast::AstCallStmt {
+                    call: AstCallKind::MethodCall(Box::new(AstMethodCallExpr {
+                        receiver: AstExpr::Var(AstNameRef::Local(manager_alias)),
+                        method: "notify".to_owned(),
+                        args: vec![AstExpr::Var(AstNameRef::Local(payload_alias))],
+                    })),
+                })),
+            ],
+        },
+    };
+    let original = module.clone();
+
+    assert!(!apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+    assert_eq!(module, original);
+}
+
+#[test]
+fn collapses_adjacent_local_alias_run_into_terminal_return_call() {
+    let max_alias = LocalId(0);
+    let zero_alias = LocalId(1);
+    let min_alias = LocalId(2);
+    let param = crate::hir::ParamId(0);
+    let mut module = AstModule {
+        entry_function: Default::default(),
+        body: crate::ast::AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(max_alias),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "math".to_owned(),
+                        })),
+                        field: "max".to_owned(),
+                    }))],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(zero_alias),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Integer(0)],
+                })),
+                AstStmt::LocalDecl(Box::new(crate::ast::AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: crate::ast::AstBindingRef::Local(min_alias),
+                        attr: AstLocalAttr::None,
+                        origin: crate::ast::AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "math".to_owned(),
+                        })),
+                        field: "min".to_owned(),
+                    }))],
+                })),
+                AstStmt::Return(Box::new(AstReturn {
+                    values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Local(max_alias)),
+                        args: vec![
+                            AstExpr::Var(AstNameRef::Local(zero_alias)),
+                            AstExpr::Call(Box::new(AstCallExpr {
+                                callee: AstExpr::Var(AstNameRef::Local(min_alias)),
+                                args: vec![
+                                    AstExpr::Integer(1),
+                                    AstExpr::Var(AstNameRef::Param(param)),
+                                ],
+                            })),
+                        ],
+                    }))],
+                })),
+            ],
+        },
+    };
+
+    assert!(apply(
+        &mut module,
+        ReadabilityContext {
+            target: AstTargetDialect::new(crate::ast::AstDialectVersion::Lua55),
+            options: ReadabilityOptions::default(),
+        }
+    ));
+    assert_eq!(
+        module.body.stmts,
+        vec![AstStmt::Return(Box::new(AstReturn {
+            values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                    base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                        text: "math".to_owned(),
+                    })),
+                    field: "max".to_owned(),
+                })),
+                args: vec![
+                    AstExpr::Integer(0),
+                    AstExpr::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                            base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                                text: "math".to_owned(),
+                            })),
+                            field: "min".to_owned(),
+                        })),
+                        args: vec![AstExpr::Integer(1), AstExpr::Var(AstNameRef::Param(param))],
+                    })),
+                ],
+            }))],
+        }))]
+    );
+}
+
+#[test]
 fn inlines_raw_global_alias_into_adjacent_first_call_arg() {
     let overview = LocalId(0);
     let active = LocalId(1);

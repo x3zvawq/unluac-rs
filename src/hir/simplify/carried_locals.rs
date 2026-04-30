@@ -39,7 +39,7 @@ use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirProto, HirStmt, LocalI
 
 use super::temp_touch::collect_temp_refs_in_stmts;
 use super::visit::{HirVisitor, visit_stmts};
-use super::walk::{for_each_nested_block_mut, HirRewritePass, rewrite_stmts};
+use super::walk::{HirRewritePass, for_each_nested_block_mut, rewrite_stmts};
 
 pub(super) fn collapse_carried_local_handoffs_in_proto(proto: &mut HirProto) -> bool {
     collapse_handoffs_recursive(&mut proto.body, &BTreeSet::new())
@@ -48,10 +48,7 @@ pub(super) fn collapse_carried_local_handoffs_in_proto(proto: &mut HirProto) -> 
 /// 自定义后序遍历：先递归处理子块（同时把外层 temp 引用集传下去），再在当前块做 handoff 折叠。
 /// `outer_temps` 包含当前块的所有祖先作用域中引用过的 temp，如果一个 temp 在 `outer_temps` 中，
 /// 说明它在当前块外部仍被消费，不能在当前块内被折叠消除。
-fn collapse_handoffs_recursive(
-    block: &mut HirBlock,
-    outer_temps: &BTreeSet<TempId>,
-) -> bool {
+fn collapse_handoffs_recursive(block: &mut HirBlock, outer_temps: &BTreeSet<TempId>) -> bool {
     let mut changed = false;
 
     // 为每个嵌套语句预计算"进入该子块时需要保护的 temp 集"。

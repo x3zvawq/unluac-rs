@@ -17,8 +17,8 @@ pub use focus::{
     compute_focus_plan, format_breadcrumb, format_proto_summary_row,
 };
 
-use std::{fmt, str::FromStr};
 use std::io::IsTerminal;
+use std::{fmt, str::FromStr};
 
 /// 调试输出详细程度。
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]

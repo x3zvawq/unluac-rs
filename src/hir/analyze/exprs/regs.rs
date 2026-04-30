@@ -72,8 +72,7 @@ pub(crate) fn expr_for_closure_capture(
                 _ => false,
             };
             if should_forward
-                && let Some(forward_expr) =
-                    forward_def_in_block(lowering, block, instr_ref, reg)
+                && let Some(forward_expr) = forward_def_in_block(lowering, block, instr_ref, reg)
             {
                 return forward_expr;
             }
@@ -91,11 +90,7 @@ pub(crate) fn expr_for_closure_capture(
 /// 后者在 `local a, b, c` + 三路互递归编译结果中出现：
 /// LOADNIL r2..r4 之后紧跟 CLOSURE r2/r3/r4，capture 的 SSA 到达定义
 /// 虽然存在（不是 Unresolved）但只是 LOADNIL 的占位 nil。
-fn is_loadnil_def(
-    lowering: &ProtoLowering<'_>,
-    instr_ref: InstrRef,
-    reg: Reg,
-) -> bool {
+fn is_loadnil_def(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, reg: Reg) -> bool {
     let Some(values) = lowering.dataflow.use_values_at(instr_ref).get(reg) else {
         return false;
     };

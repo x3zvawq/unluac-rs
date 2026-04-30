@@ -28,20 +28,22 @@ cargo unluac -i /path/to/chunk.out -D lua5.4 --dump-pass temp-inline --proto 2
 
 ## 调试参数速查
 
-| 参数 | 作用 |
-| --- | --- |
-| `-i/--input` | 输入已编译 chunk |
-| `-s/--source` | 输入 Lua 源码并自动编译 |
-| `-D/--dialect` | 指定方言 |
-| `-d/--debug` | 使用仓库默认 debug dump 预设 |
-| `--dump` | 指定要打印的阶段，可重复传入 |
-| `--stop-after` | 在指定阶段后停止 pipeline |
-| `--detail` | 控制 dump 详略 |
-| `--proto` | 只看某个 proto |
-| `--proto-depth` | 控制焦点 proto 向下展开的层数 |
-| `--dump-pass` | 看 pass 的 before/after 快照 |
+| 参数            | 作用                             |
+| --------------- | -------------------------------- |
+| `-i/--input`    | 输入已编译 chunk                 |
+| `-s/--source`   | 输入 Lua 源码并自动编译          |
+| `-D/--dialect`  | 指定方言                         |
+| `-d/--debug`    | 使用仓库默认 debug dump 预设     |
+| `--dump`        | 指定要打印的阶段，可重复传入     |
+| `--stop-after`  | 在指定阶段后停止 pipeline        |
+| `--detail`      | 控制 dump 详略                   |
+| `--proto`       | 只看某个 proto                   |
+| `--proto-depth` | 控制焦点 proto 向下展开的层数    |
+| `--dump-pass`   | 看 pass 的 before/after 快照     |
 | `--list-protos` | 先列出 proto，便于决定 `--proto` |
-| `-t/--timing` | 输出阶段耗时 |
+| `-t/--timing`   | 输出阶段耗时                     |
+
+> 其中，dump参数支持的阶段包括：`parse`, `transform`, `graph-facts`, `dataflow`, `structure-facts`, `hir`, `ast`, `readability`, `naming`, `generate`
 
 ## 使用约定
 

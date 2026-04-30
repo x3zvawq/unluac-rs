@@ -70,7 +70,8 @@ pub(super) fn expr_references_binding(expr: &AstExpr, binding: AstBindingRef) ->
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
-        | AstExpr::VarArg | AstExpr::Error(_) => false,
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => false,
     }
 }
 
@@ -161,7 +162,8 @@ pub(super) fn count_name_expr_uses(expr: &AstExpr, binding: AstBindingRef) -> us
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg | AstExpr::Error(_) => 0,
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => 0,
     }
 }
 
@@ -238,7 +240,8 @@ pub(super) fn replace_binding_use_in_expr(
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg | AstExpr::Error(_) => false,
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => false,
     }
 }
 
@@ -297,7 +300,11 @@ pub(super) fn rewrite_binding_in_stmt(stmt: &mut AstStmt, from: AstBindingRef, t
         }
         AstStmt::DoBlock(block) => rewrite_binding_in_stmts(&mut block.stmts, from, to),
         AstStmt::FunctionDecl(_) | AstStmt::LocalFunctionDecl(_) => {}
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => {}
+        AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_)
+        | AstStmt::Error(_) => {}
     }
 }
 
@@ -347,7 +354,8 @@ pub(super) fn stmt_mentions_binding_target(stmt: &AstStmt, binding: AstBindingRe
         | AstStmt::Break
         | AstStmt::Continue
         | AstStmt::Goto(_)
-        | AstStmt::Label(_) | AstStmt::Error(_) => false,
+        | AstStmt::Label(_)
+        | AstStmt::Error(_) => false,
     }
 }
 
@@ -373,16 +381,10 @@ fn stmt_has_binding_use_by(
                 .targets
                 .iter()
                 .any(|target| check_assign_target(target, binding))
-                || assign
-                    .values
-                    .iter()
-                    .any(|value| check_expr(value, binding))
+                || assign.values.iter().any(|value| check_expr(value, binding))
         }
         AstStmt::CallStmt(call_stmt) => check_call(&call_stmt.call, binding),
-        AstStmt::Return(ret) => ret
-            .values
-            .iter()
-            .any(|value| check_expr(value, binding)),
+        AstStmt::Return(ret) => ret.values.iter().any(|value| check_expr(value, binding)),
         AstStmt::If(if_stmt) => check_expr(&if_stmt.cond, binding),
         AstStmt::While(while_stmt) => check_expr(&while_stmt.cond, binding),
         AstStmt::Repeat(repeat_stmt) => check_expr(&repeat_stmt.cond, binding),
@@ -494,23 +496,19 @@ fn call_has_binding_use_by(
     match call {
         AstCallKind::Call(call) => {
             check_expr(&call.callee, binding)
-                || call
-                    .args
-                    .iter()
-                    .any(|arg| check_expr(arg, binding))
+                || call.args.iter().any(|arg| check_expr(arg, binding))
         }
         AstCallKind::MethodCall(call) => {
             check_expr(&call.receiver, binding)
-                || call
-                    .args
-                    .iter()
-                    .any(|arg| check_expr(arg, binding))
+                || call.args.iter().any(|arg| check_expr(arg, binding))
         }
     }
 }
 
 fn call_has_nested_binding_use(call: &AstCallKind, binding: AstBindingRef) -> bool {
-    call_has_binding_use_by(call, binding, |e, b| expr_has_nested_binding_use(e, b, false))
+    call_has_binding_use_by(call, binding, |e, b| {
+        expr_has_nested_binding_use(e, b, false)
+    })
 }
 
 fn lvalue_has_nested_binding_use(target: &AstLValue, binding: AstBindingRef) -> bool {
@@ -531,7 +529,9 @@ fn call_has_access_base_binding_use(call: &AstCallKind, binding: AstBindingRef) 
 }
 
 fn call_has_index_binding_use(call: &AstCallKind, binding: AstBindingRef) -> bool {
-    call_has_binding_use_by(call, binding, |e, b| expr_has_index_binding_use(e, b, false))
+    call_has_binding_use_by(call, binding, |e, b| {
+        expr_has_index_binding_use(e, b, false)
+    })
 }
 
 fn call_has_direct_call_arg_binding_use(call: &AstCallKind, binding: AstBindingRef) -> bool {
@@ -648,7 +648,8 @@ fn expr_has_access_base_binding_use(
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg | AstExpr::Error(_) => false,
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => false,
     }
 }
 
@@ -704,7 +705,8 @@ fn expr_has_index_binding_use(expr: &AstExpr, binding: AstBindingRef, index: boo
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg | AstExpr::Error(_) => false,
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => false,
     }
 }
 
@@ -751,7 +753,8 @@ fn expr_has_direct_call_arg_binding_use(expr: &AstExpr, binding: AstBindingRef) 
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg | AstExpr::Error(_) => false,
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => false,
     }
 }
 
@@ -814,7 +817,8 @@ fn expr_has_call_callee_binding_use(
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
-        | AstExpr::VarArg | AstExpr::Error(_) => false,
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => false,
     }
 }
 
@@ -870,7 +874,8 @@ fn expr_has_nested_binding_use(expr: &AstExpr, binding: AstBindingRef, nested: b
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg | AstExpr::Error(_) => false,
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => false,
     }
 }
 
@@ -954,7 +959,8 @@ fn rewrite_binding_in_expr(expr: &mut AstExpr, from: AstBindingRef, to: AstBindi
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
-        | AstExpr::VarArg | AstExpr::Error(_) => {}
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => {}
     }
 }
 

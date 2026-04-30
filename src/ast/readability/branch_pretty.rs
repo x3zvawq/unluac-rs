@@ -6,6 +6,7 @@
 //!
 //! 例子：
 //! - `if not cond then a() else b() end` 会整理成 `if cond then b() else a() end`
+//! - `if cond then body else end` 会整理成 `if cond then body end`
 //! - `if a then if b then return end end` 会折成 `if a and b then return end`
 //! - `if cond then return end else tail()` 会拉平成 `if cond then return end; tail()`
 //! - `if exit then goto L1 end; body; ::L1:: tail` 会收成 `if not exit then body end; tail`
@@ -68,6 +69,7 @@ impl AstRewritePass for BranchPrettyPass {
                     if_stmt.cond = inner;
                     changed = true;
                 }
+                changed |= normalize_empty_if_arms(if_stmt);
                 changed || collapse_nested_guard_if(if_stmt)
             }
             AstStmt::Repeat(repeat_stmt) => {
@@ -130,6 +132,30 @@ fn collapse_nested_guard_if(if_stmt: &mut AstIf) -> bool {
         rhs: inner_if.cond.clone(),
     }));
     if_stmt.then_block = inner_if.then_block.clone();
+    true
+}
+
+fn normalize_empty_if_arms(if_stmt: &mut AstIf) -> bool {
+    if if_stmt
+        .else_block
+        .as_ref()
+        .is_some_and(|else_block| else_block.stmts.is_empty())
+    {
+        if_stmt.else_block = None;
+        return true;
+    }
+
+    let Some(else_block) = if_stmt.else_block.take() else {
+        return false;
+    };
+    if !if_stmt.then_block.stmts.is_empty() {
+        if_stmt.else_block = Some(else_block);
+        return false;
+    }
+
+    let old_cond = std::mem::replace(&mut if_stmt.cond, AstExpr::Boolean(false));
+    if_stmt.cond = negate_guard_condition(old_cond);
+    if_stmt.then_block = else_block;
     true
 }
 

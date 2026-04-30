@@ -109,7 +109,6 @@ impl GenerateMode {
             Self::Permissive => "permissive",
         }
     }
-
 }
 
 impl FromStr for GenerateMode {
@@ -142,7 +141,6 @@ impl QuoteStyle {
             Self::MinEscape => "min-escape",
         }
     }
-
 }
 
 impl FromStr for QuoteStyle {
@@ -175,7 +173,6 @@ impl TableStyle {
             Self::Expanded => "expanded",
         }
     }
-
 }
 
 impl FromStr for TableStyle {

@@ -23,7 +23,10 @@ use crate::ast::common::{
     AstTableField, AstTableKey, AstTargetDialect,
 };
 
-pub(in crate::ast::readability) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
+pub(in crate::ast::readability) fn apply(
+    module: &mut AstModule,
+    context: ReadabilityContext,
+) -> bool {
     let method_fields = collect_method_field_names(module);
     rewrite_block(&mut module.body, context.target, &method_fields)
 }
@@ -184,7 +187,11 @@ fn rewrite_nested(
             }
             changed
         }
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => false,
+        AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_)
+        | AstStmt::Error(_) => false,
     }
 }
 
@@ -285,7 +292,8 @@ fn rewrite_function_exprs_in_expr(expr: &mut AstExpr, target: AstTargetDialect) 
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg | AstExpr::Error(_) => false,
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => false,
     }
 }
 

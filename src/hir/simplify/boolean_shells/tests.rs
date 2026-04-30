@@ -75,7 +75,10 @@ fn removes_dead_pure_value_materialization_shell() {
                     }))],
                 }),
             })),
-            HirStmt::Return(Box::new(crate::hir::common::HirReturn { trailing_multiret: false, values: vec![] })),
+            HirStmt::Return(Box::new(crate::hir::common::HirReturn {
+                trailing_multiret: false,
+                values: vec![],
+            })),
         ],
     });
 

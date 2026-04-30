@@ -14,8 +14,8 @@ mod eliminate;
 mod helpers;
 mod synthesize;
 
-use super::walk::{ExprRewritePass, rewrite_proto_exprs};
 use super::expr_facts::{expr_is_boolean_valued, expr_truthiness};
+use super::walk::{ExprRewritePass, rewrite_proto_exprs};
 use helpers::{
     logical_and, logical_or, simplify_condition_truthiness_shape, simplify_lua_logical_shape,
 };
@@ -128,7 +128,9 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
         let mut node = original.clone();
 
         if let HirDecisionTarget::Node(child_ref) = &node.truthy
-            && nodes.get(child_ref.index()).is_some_and(|child| child.test == node.test)
+            && nodes
+                .get(child_ref.index())
+                .is_some_and(|child| child.test == node.test)
         {
             node.truthy = resolve_child_branch(&nodes, &replacements, *child_ref, true);
         } else {
@@ -136,7 +138,9 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
         }
 
         if let HirDecisionTarget::Node(child_ref) = &node.falsy
-            && nodes.get(child_ref.index()).is_some_and(|child| child.test == node.test)
+            && nodes
+                .get(child_ref.index())
+                .is_some_and(|child| child.test == node.test)
         {
             node.falsy = resolve_child_branch(&nodes, &replacements, *child_ref, false);
         } else {

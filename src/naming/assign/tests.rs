@@ -242,8 +242,7 @@ fn simple_mode_uses_underscore_for_unused_synthetic_local() {
         },
     };
 
-    let names = assign_names(&ast, &hir, NamingOptions::default())
-        .expect("naming should succeed");
+    let names = assign_names(&ast, &hir, NamingOptions::default()).expect("naming should succeed");
 
     let function = names.function(HirProtoRef(0)).expect("function names");
     assert_eq!(

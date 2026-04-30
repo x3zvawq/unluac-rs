@@ -793,7 +793,8 @@ fn rewrite_single_expr_sink_stmt(
         | AstStmt::Break
         | AstStmt::Continue
         | AstStmt::Goto(_)
-        | AstStmt::Label(_) | AstStmt::Error(_) => None,
+        | AstStmt::Label(_)
+        | AstStmt::Error(_) => None,
     }
 }
 

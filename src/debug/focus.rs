@@ -147,7 +147,14 @@ pub fn compute_focus_plan(nodes: &[ProtoNode], filters: &FocusRequest) -> FocusP
     // 同时把被裁掉的直接子节点加入 `elided_at`，保证在 DFS 原序中出现。
     let mut visible = BTreeSet::new();
     let mut elided_at = Vec::new();
-    walk_below(nodes, focus_id, 0, filters.depth, &mut visible, &mut elided_at);
+    walk_below(
+        nodes,
+        focus_id,
+        0,
+        filters.depth,
+        &mut visible,
+        &mut elided_at,
+    );
 
     FocusPlan {
         focus: Some(focus_id),
@@ -332,7 +339,10 @@ mod tests {
                 depth: ProtoDepth::Fixed(1),
             },
         );
-        assert_eq!(plan.visible.iter().copied().collect::<Vec<_>>(), vec![0, 1, 3]);
+        assert_eq!(
+            plan.visible.iter().copied().collect::<Vec<_>>(),
+            vec![0, 1, 3]
+        );
         assert_eq!(plan.elided_at, vec![2]);
     }
 

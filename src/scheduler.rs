@@ -86,12 +86,8 @@ where
         // 还没跑过，必须给它们至少一次执行机会，因此在 Deferred round 前把所有 tag
         // 重新标记为 dirty。
         dirty = T::all().iter().copied().collect();
-        let deferred_changed = run_single_round(
-            passes,
-            PassPhase::Deferred,
-            &mut dirty,
-            &mut run_pass,
-        );
+        let deferred_changed =
+            run_single_round(passes, PassPhase::Deferred, &mut dirty, &mut run_pass);
         any_change_overall |= deferred_changed;
 
         if deferred_changed {

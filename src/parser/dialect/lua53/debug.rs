@@ -10,7 +10,7 @@ use crate::debug::{
     DebugColorMode, DebugDetail, DebugFilters, FocusPlan, colorize_debug_text,
     format_proto_summary_row,
 };
-use crate::parser::debug::{build_parser_summary_row, ParserProtoEntry};
+use crate::parser::debug::{ParserProtoEntry, build_parser_summary_row};
 use crate::parser::{
     ChunkHeader, DecodedText, Endianness, Origin, RawChunk, RawInstr, RawLiteralConst, RawProto,
     RawString,

@@ -4,6 +4,7 @@
 //! - 表达式复杂度
 //! - 是否属于保守安全子集
 //! - 是否是 copy-like / lookup-like / 机械纯值表达式
+//! - 是否是能安全收回调用参数位的简单表构造
 //!
 //! 它们不试图替代更前层的语义分析，只给 AST readability 提供统一边界，
 //! 避免各个 pass 再各写一套相似但略有偏差的判断。
@@ -21,7 +22,8 @@ pub(super) fn expr_complexity(expr: &AstExpr) -> usize {
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg | AstExpr::Error(_) => 1,
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => 1,
         AstExpr::Unary(unary) => 1 + expr_complexity(&unary.expr),
         AstExpr::Binary(binary) => 1 + expr_complexity(&binary.lhs) + expr_complexity(&binary.rhs),
         AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
@@ -185,6 +187,28 @@ pub(super) fn is_direct_return_constructor_inline_expr(expr: &AstExpr) -> bool {
     matches!(expr, AstExpr::TableConstructor(_))
 }
 
+pub(super) fn is_call_arg_constructor_inline_expr(expr: &AstExpr) -> bool {
+    let AstExpr::TableConstructor(table) = expr else {
+        return false;
+    };
+    table.fields.iter().all(|field| match field {
+        AstTableField::Array(value) => is_call_arg_constructor_field_expr(value),
+        AstTableField::Record(record) => {
+            let key_is_safe = match &record.key {
+                AstTableKey::Name(_) => true,
+                AstTableKey::Expr(key) => is_context_safe_expr(key) || is_lookup_inline_expr(key),
+            };
+            key_is_safe && is_call_arg_constructor_field_expr(&record.value)
+        }
+    })
+}
+
+fn is_call_arg_constructor_field_expr(expr: &AstExpr) -> bool {
+    is_context_safe_expr(expr)
+        || is_lookup_inline_expr(expr)
+        || is_call_arg_constructor_inline_expr(expr)
+}
+
 pub(super) fn is_always_truthy_expr(expr: &AstExpr) -> bool {
     match expr {
         AstExpr::Boolean(true)
@@ -208,7 +232,8 @@ pub(super) fn is_always_truthy_expr(expr: &AstExpr) -> bool {
         | AstExpr::Call(_)
         | AstExpr::MethodCall(_)
         | AstExpr::SingleValue(_)
-        | AstExpr::VarArg | AstExpr::Error(_) => false,
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => false,
     }
 }
 

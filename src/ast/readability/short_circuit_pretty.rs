@@ -94,7 +94,11 @@ fn rewrite_stmt(stmt: &mut AstStmt) -> bool {
             }
             changed
         }
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => false,
+        AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_)
+        | AstStmt::Error(_) => false,
     }
 }
 
@@ -182,7 +186,8 @@ fn rewrite_expr(expr: &mut AstExpr) -> bool {
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg | AstExpr::Error(_) => false,
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => false,
     };
 
     if let Some(hir_expr) = hir_from_ast_expr(expr)

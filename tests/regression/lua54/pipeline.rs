@@ -204,9 +204,15 @@ mod decompile_pipeline {
         // AST 阶段条件方向可能尚未优化，readability/generate 会把多余的 goto/label 收回。
         // 这里放宽到 ≤2，确保 AST 至少不做出无限退化。
         let goto_count = dump.matches("goto L").count();
-        assert!((1..=2).contains(&goto_count), "goto count={goto_count}\n{dump}");
+        assert!(
+            (1..=2).contains(&goto_count),
+            "goto count={goto_count}\n{dump}"
+        );
         let label_count = dump.matches("::L").count();
-        assert!((1..=2).contains(&label_count), "label count={label_count}\n{dump}");
+        assert!(
+            (1..=2).contains(&label_count),
+            "label count={label_count}\n{dump}"
+        );
         assert!(!dump.contains("close from"), "{dump}");
     }
 

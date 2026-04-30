@@ -12,8 +12,8 @@ use super::super::super::common::{
 };
 use super::super::binding_flow::name_matches_binding;
 use super::super::expr_analysis::{
-    expr_complexity, is_access_base_inline_expr, is_direct_return_constructor_inline_expr,
-    is_mechanical_run_inline_expr,
+    expr_complexity, is_access_base_inline_expr, is_call_arg_constructor_inline_expr,
+    is_direct_return_constructor_inline_expr, is_mechanical_run_inline_expr,
 };
 use super::candidate::{
     InlineCandidate, InlinePolicy, is_call_callee_inline_expr,
@@ -132,7 +132,8 @@ pub(super) fn rewrite_stmt_use_sites_with_policy(
         | AstStmt::Break
         | AstStmt::Continue
         | AstStmt::Goto(_)
-        | AstStmt::Label(_) | AstStmt::Error(_) => false,
+        | AstStmt::Label(_)
+        | AstStmt::Error(_) => false,
     }
 }
 
@@ -516,7 +517,8 @@ fn rewrite_expr_use_sites(
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg | AstExpr::Error(_) => false,
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => false,
     }
 }
 
@@ -685,11 +687,15 @@ impl InlineSite {
             Self::CallArgNonFinal => {
                 is_extended_call_arg_local_alias_expr(replacement)
                     || is_recallable_inline_expr(replacement)
+                    || is_call_arg_constructor_inline_expr(replacement)
             }
             // 这里只有在“局部别名包折回最终调用”时，才允许把纯 lookup 收回参数位。
             // 这能把 `local x = t[1]; local y = t.a; print(x, y)` 这类机械展开收回去，
             // 同时仍然不放宽到任意调用结果，避免把阶段 local 继续吞掉。
-            Self::CallArgFinal => is_extended_call_arg_local_alias_expr(replacement),
+            Self::CallArgFinal => {
+                is_extended_call_arg_local_alias_expr(replacement)
+                    || is_call_arg_constructor_inline_expr(replacement)
+            }
             Self::AccessBase => is_access_base_inline_expr(replacement),
             Self::ReturnValue | Self::Index => false,
         }

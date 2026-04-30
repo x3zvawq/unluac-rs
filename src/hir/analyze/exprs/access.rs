@@ -175,7 +175,8 @@ fn lower_access_base_expr_single_eval(
             // NewTable def 返回空 `{}`，但实际运行时这个寄存器持有的是被后续
             // SetTable/SetList 填充过的完整表。作为 GetTable 的 base，空表会
             // 丢掉所有条目的语义，因此退回到安全的 inline 模式。
-            if matches!(&expr, HirExpr::TableConstructor(tc) if tc.fields.is_empty() && tc.trailing_multivalue.is_none()) {
+            if matches!(&expr, HirExpr::TableConstructor(tc) if tc.fields.is_empty() && tc.trailing_multivalue.is_none())
+            {
                 return expr_for_reg_use_inline(lowering, block, instr_ref, reg);
             }
             expr

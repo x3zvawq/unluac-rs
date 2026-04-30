@@ -9,7 +9,7 @@ use crate::generate::{
     GenerateChunkCommentMetadata, GenerateCommentMetadata, GenerateFunctionCommentMetadata,
     generate_chunk,
 };
-use crate::hir::{analyze_hir, PassDumpConfig};
+use crate::hir::{PassDumpConfig, analyze_hir};
 use crate::naming::{assign_names_with_evidence, collect_naming_evidence};
 use crate::structure::analyze_structure;
 use crate::timing::{TimingCollector, TimingReport};
@@ -137,7 +137,12 @@ impl DecompilerPipeline {
                 .graph_facts
                 .as_ref()
                 .expect("graph facts stage completed must leave graph facts in state");
-            analyze_dataflow(&lowered.main, &cfg_graph.cfg, graph_facts, &cfg_graph.children)
+            analyze_dataflow(
+                &lowered.main,
+                &cfg_graph.cfg,
+                graph_facts,
+                &cfg_graph.children,
+            )
         });
         state.mark_completed(DecompileStage::Dataflow);
 
@@ -152,23 +157,29 @@ impl DecompilerPipeline {
 
         state.structure_facts = Some({
             let _timing = timings.scope(DecompileStage::StructureFacts.as_str());
-                let lowered = state
-                    .lowered
-                    .as_ref()
-                    .expect("transform stage completed must leave lowered in state");
-                let cfg_graph = state
-                    .cfg
-                    .as_ref()
-                    .expect("cfg stage completed must leave cfg graph in state");
-                let graph_facts = state
-                    .graph_facts
-                    .as_ref()
-                    .expect("graph facts stage completed must leave graph facts in state");
-                let dataflow = state
-                    .dataflow
-                    .as_ref()
-                    .expect("dataflow stage completed must leave dataflow in state");
-                analyze_structure(&lowered.main, &cfg_graph.cfg, graph_facts, dataflow, &cfg_graph.children)
+            let lowered = state
+                .lowered
+                .as_ref()
+                .expect("transform stage completed must leave lowered in state");
+            let cfg_graph = state
+                .cfg
+                .as_ref()
+                .expect("cfg stage completed must leave cfg graph in state");
+            let graph_facts = state
+                .graph_facts
+                .as_ref()
+                .expect("graph facts stage completed must leave graph facts in state");
+            let dataflow = state
+                .dataflow
+                .as_ref()
+                .expect("dataflow stage completed must leave dataflow in state");
+            analyze_structure(
+                &lowered.main,
+                &cfg_graph.cfg,
+                graph_facts,
+                dataflow,
+                &cfg_graph.children,
+            )
         });
         state.mark_completed(DecompileStage::StructureFacts);
 
@@ -394,4 +405,3 @@ fn build_generate_comment_metadata(
             .collect(),
     }
 }
-

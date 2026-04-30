@@ -27,7 +27,6 @@ impl NamingMode {
             Self::Heuristic => "heuristic",
         }
     }
-
 }
 
 impl FromStr for NamingMode {

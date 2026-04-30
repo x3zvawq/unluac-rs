@@ -4,3 +4,4 @@
 //! decompiler 回归 case，也继续沿这个目录扩展。
 
 mod pipeline;
+mod structure;

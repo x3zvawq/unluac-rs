@@ -22,7 +22,10 @@ fn materializes_simple_tbc_region_into_block() {
             values: vec![HirExpr::Integer(2)],
         })),
         HirStmt::Close(Box::new(HirClose { from_reg: 2 })),
-        HirStmt::Return(Box::new(crate::hir::HirReturn { trailing_multiret: false, values: Vec::new() })),
+        HirStmt::Return(Box::new(crate::hir::HirReturn {
+            trailing_multiret: false,
+            values: Vec::new(),
+        })),
     ]);
 
     assert!(materialize_tbc_close_scopes_in_proto(&mut proto));
@@ -109,7 +112,10 @@ fn materializes_scope_when_close_lives_in_child_branch() {
                 ],
             },
             else_block: Some(HirBlock {
-                stmts: vec![HirStmt::Return(Box::new(HirReturn { trailing_multiret: false, values: Vec::new() }))],
+                stmts: vec![HirStmt::Return(Box::new(HirReturn {
+                    trailing_multiret: false,
+                    values: Vec::new(),
+                }))],
             }),
         })),
     ]);

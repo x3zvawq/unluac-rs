@@ -15,7 +15,10 @@ fn drops_dead_unresolved_temp_assignments() {
                 summary: "phi block=#1 reg=r0".into(),
             }))],
         })),
-        HirStmt::Return(Box::new(HirReturn { trailing_multiret: false, values: Vec::new() })),
+        HirStmt::Return(Box::new(HirReturn {
+            trailing_multiret: false,
+            values: Vec::new(),
+        })),
     ]);
 
     assert!(remove_dead_temp_materializations_in_proto(&mut proto));
@@ -33,7 +36,10 @@ fn drops_dead_pure_ref_temp_assignments() {
             targets: vec![HirLValue::Temp(TempId(1))],
             values: vec![HirExpr::LocalRef(crate::hir::LocalId(0))],
         })),
-        HirStmt::Return(Box::new(HirReturn { trailing_multiret: false, values: Vec::new() })),
+        HirStmt::Return(Box::new(HirReturn {
+            trailing_multiret: false,
+            values: Vec::new(),
+        })),
     ]);
 
     assert!(remove_dead_temp_materializations_in_proto(&mut proto));
@@ -46,16 +52,17 @@ fn keeps_dead_temp_assignments_with_side_effects() {
         HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Temp(TempId(0))],
             values: vec![HirExpr::Call(Box::new(crate::hir::HirCallExpr {
-                callee: HirExpr::GlobalRef(crate::hir::HirGlobalRef {
-                    name: "f".into(),
-                }),
+                callee: HirExpr::GlobalRef(crate::hir::HirGlobalRef { name: "f".into() }),
                 args: Vec::new(),
                 multiret: false,
                 method: false,
                 method_name: None,
             }))],
         })),
-        HirStmt::Return(Box::new(HirReturn { trailing_multiret: false, values: Vec::new() })),
+        HirStmt::Return(Box::new(HirReturn {
+            trailing_multiret: false,
+            values: Vec::new(),
+        })),
     ]);
 
     assert!(!remove_dead_temp_materializations_in_proto(&mut proto));

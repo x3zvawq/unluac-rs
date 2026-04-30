@@ -80,10 +80,7 @@ fn no_phi_value_queries_should_wrap_defs_as_ssa_defs() {
         ]),
     };
     let use_defs = InstrUseDefs {
-        fixed: RegValueMap::from_sparse_entries(vec![(
-            Reg(2),
-            CompactSet::singleton(DefId(4)),
-        )]),
+        fixed: RegValueMap::from_sparse_entries(vec![(Reg(2), CompactSet::singleton(DefId(4)))]),
         open: BTreeSet::new(),
     };
     let dataflow = DataflowFacts {

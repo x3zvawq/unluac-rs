@@ -75,8 +75,9 @@ pub(super) fn materialize_instruction_facts(
             instruction_facts.reaching_defs[instr_index] = snapshot_fixed_state(&mut current_fixed);
             instruction_facts.open_reaching_defs[instr_index] = current_open.clone();
 
-            let fixed_use_regs =
-                scratch.fixed_use_regs.resolve(effect, &current_open, open_defs);
+            let fixed_use_regs = scratch
+                .fixed_use_regs
+                .resolve(effect, &current_open, open_defs);
             let mut fixed_use_entries = Vec::with_capacity(fixed_use_regs.len());
             for &reg in fixed_use_regs {
                 let defs = current_fixed.get(reg).clone();

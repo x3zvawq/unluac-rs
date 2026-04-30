@@ -8,6 +8,8 @@
 //! 这里故意把“当前函数体”作为边界，不继续钻进嵌套函数体。
 //! 原因是 AST 的 `LocalId` / `SyntheticLocalId` 都是按函数局部编号的，跨闭包继续统计
 //! 很容易把不同函数里碰巧同号的 binding 错算成同一个变量。
+//! 但 `FunctionExpr.captured_bindings` 是闭包创建时对当前词法 binding 的显式引用，
+//! 必须按当前语句的一次使用统计，否则后续 pass 可能误删仍被闭包持有的局部。
 
 use std::collections::BTreeMap;
 
@@ -265,20 +267,26 @@ fn count_binding_uses_in_stmt_with_scope(
         }
         AstStmt::DoBlock(block) => count_binding_uses_in_block_with_scope(block, binding, scope),
         AstStmt::FunctionDecl(function_decl) => {
-            if matches!(scope, BindingUseScope::IncludingNestedFunctions) {
-                count_binding_uses_in_block_with_scope(&function_decl.func.body, binding, scope)
-            } else {
-                0
-            }
+            count_function_capture_use(&function_decl.func, binding)
+                + if matches!(scope, BindingUseScope::IncludingNestedFunctions) {
+                    count_binding_uses_in_block_with_scope(&function_decl.func.body, binding, scope)
+                } else {
+                    0
+                }
         }
         AstStmt::LocalFunctionDecl(function_decl) => {
-            if matches!(scope, BindingUseScope::IncludingNestedFunctions) {
-                count_binding_uses_in_block_with_scope(&function_decl.func.body, binding, scope)
-            } else {
-                0
-            }
+            count_function_capture_use(&function_decl.func, binding)
+                + if matches!(scope, BindingUseScope::IncludingNestedFunctions) {
+                    count_binding_uses_in_block_with_scope(&function_decl.func.body, binding, scope)
+                } else {
+                    0
+                }
         }
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => 0,
+        AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_)
+        | AstStmt::Error(_) => 0,
     }
 }
 
@@ -353,16 +361,22 @@ fn collect_binding_uses_in_stmt_with_scope(
         }
         AstStmt::DoBlock(block) => collect_binding_uses_in_block_with_scope(block, scope, counts),
         AstStmt::FunctionDecl(function_decl) => {
+            collect_function_capture_uses(&function_decl.func, counts);
             if matches!(scope, BindingUseScope::IncludingNestedFunctions) {
                 collect_binding_uses_in_block_with_scope(&function_decl.func.body, scope, counts);
             }
         }
         AstStmt::LocalFunctionDecl(function_decl) => {
+            collect_function_capture_uses(&function_decl.func, counts);
             if matches!(scope, BindingUseScope::IncludingNestedFunctions) {
                 collect_binding_uses_in_block_with_scope(&function_decl.func.body, scope, counts);
             }
         }
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => {}
+        AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_)
+        | AstStmt::Error(_) => {}
     }
 }
 
@@ -429,7 +443,11 @@ fn count_binding_mentions_in_stmt(stmt: &AstStmt, binding: AstBindingRef) -> usi
         }
         AstStmt::DoBlock(block) => count_binding_mentions_in_block(block, binding),
         AstStmt::FunctionDecl(_) | AstStmt::LocalFunctionDecl(_) => 0,
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => 0,
+        AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_)
+        | AstStmt::Error(_) => 0,
     }
 }
 
@@ -571,11 +589,12 @@ fn count_binding_uses_in_expr_with_scope(
             })
             .sum(),
         AstExpr::FunctionExpr(function) => {
-            if matches!(scope, BindingUseScope::IncludingNestedFunctions) {
-                count_binding_uses_in_block_with_scope(&function.body, binding, scope)
-            } else {
-                0
-            }
+            count_function_capture_use(function, binding)
+                + if matches!(scope, BindingUseScope::IncludingNestedFunctions) {
+                    count_binding_uses_in_block_with_scope(&function.body, binding, scope)
+                } else {
+                    0
+                }
         }
         AstExpr::Nil
         | AstExpr::Boolean(_)
@@ -586,7 +605,8 @@ fn count_binding_uses_in_expr_with_scope(
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg | AstExpr::Error(_) => 0,
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => 0,
     }
 }
 
@@ -650,6 +670,7 @@ fn collect_binding_uses_in_expr_with_scope(
             }
         }
         AstExpr::FunctionExpr(function) => {
+            collect_function_capture_uses(function, counts);
             if matches!(scope, BindingUseScope::IncludingNestedFunctions) {
                 collect_binding_uses_in_block_with_scope(&function.body, scope, counts);
             }
@@ -662,7 +683,24 @@ fn collect_binding_uses_in_expr_with_scope(
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
-        | AstExpr::VarArg | AstExpr::Error(_) => {}
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => {}
+    }
+}
+
+fn count_function_capture_use(
+    function: &super::super::common::AstFunctionExpr,
+    binding: AstBindingRef,
+) -> usize {
+    usize::from(function.captured_bindings.contains(&binding))
+}
+
+fn collect_function_capture_uses(
+    function: &super::super::common::AstFunctionExpr,
+    counts: &mut BTreeMap<AstBindingRef, usize>,
+) {
+    for binding in &function.captured_bindings {
+        *counts.entry(*binding).or_insert(0) += 1;
     }
 }
 
@@ -740,7 +778,11 @@ pub(super) fn stmt_references_any_binding(stmt: &AstStmt, bindings: &[AstLocalBi
         AstStmt::LocalFunctionDecl(function_decl) => bindings
             .iter()
             .any(|binding| binding.id == function_decl.name),
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => false,
+        AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_)
+        | AstStmt::Error(_) => false,
     }
 }
 
@@ -802,7 +844,8 @@ pub(super) fn expr_references_any_binding(expr: &AstExpr, bindings: &[AstLocalBi
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
-        | AstExpr::VarArg | AstExpr::Error(_) => false,
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => false,
     }
 }
 

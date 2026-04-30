@@ -626,7 +626,14 @@ where
         bail!("{error}");
     }
 
-    reporter.finish(total, failed, timed_out, &failure_counts, total_protos, failed_protos);
+    reporter.finish(
+        total,
+        failed,
+        timed_out,
+        &failure_counts,
+        total_protos,
+        failed_protos,
+    );
 
     if failed == 0 {
         Ok(())
@@ -1080,8 +1087,8 @@ fn parse_machine_failure(output: &std::process::Output) -> Result<MachineFailure
         }
     }
 
-    let classification = classification
-        .context("unit case runner machine output is missing kind header")?;
+    let classification =
+        classification.context("unit case runner machine output is missing kind header")?;
     let rendered: String = trimmed
         .lines()
         .skip(body_start)

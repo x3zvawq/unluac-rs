@@ -9,8 +9,7 @@ use crate::hir::common::{HirExpr, HirLValue, HirStmt, HirTableConstructor};
 
 use super::bindings::{
     BindingIndex, BindingUseSummary, StmtBindingSummary, binding_from_expr, binding_from_lvalue,
-    expr_uses_binding, lvalue_uses_binding,
-    stmt_slice_mentions_binding,
+    expr_uses_binding, lvalue_uses_binding, stmt_slice_mentions_binding,
 };
 use super::rebuild::{ConstructorBuilder, RegionRebuildContext, try_extend_constructor_from_steps};
 use super::{RebuildScratch, RegionStep, TableBinding};
@@ -146,7 +145,11 @@ pub(super) fn try_rebuild_constructor_region(
     best_end.map(|end_index| {
         committed_retained_stmts.sort_unstable();
         committed_retained_stmts.dedup();
-        (committed_builder.into_constructor(), end_index, committed_retained_stmts)
+        (
+            committed_builder.into_constructor(),
+            end_index,
+            committed_retained_stmts,
+        )
     })
 }
 

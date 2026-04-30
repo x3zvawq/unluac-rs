@@ -17,9 +17,9 @@ mod inline_exprs;
 mod installer_iife;
 mod local_coalesce;
 mod loop_header_merge;
-mod param_alias_coalesce;
 mod luajit_goto_safety;
 mod materialize_temps;
+mod param_alias_coalesce;
 mod short_circuit_pretty;
 mod statement_merge;
 mod traverse;
@@ -28,7 +28,7 @@ mod walk;
 
 use super::common::{AstModule, AstTargetDialect};
 use crate::readability::ReadabilityOptions;
-use crate::scheduler::{run_invalidation_loop, InvalidationTag, PassDescriptor, PassPhase};
+use crate::scheduler::{InvalidationTag, PassDescriptor, PassPhase, run_invalidation_loop};
 use crate::timing::TimingCollector;
 
 #[derive(Clone, Copy)]
@@ -91,7 +91,13 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
     PassDescriptor {
         name: "cleanup",
         phase: PassPhase::Normal,
-        depends_on: &[StatementAdjacency, ControlFlowShape, ExprShape, BindingStructure, TempPresence],
+        depends_on: &[
+            StatementAdjacency,
+            ControlFlowShape,
+            ExprShape,
+            BindingStructure,
+            TempPresence,
+        ],
         invalidates: &[StatementAdjacency],
     },
     PassDescriptor {
@@ -177,20 +183,48 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
 
 /// pass 执行入口，下标与 `PASS_DESCRIPTORS` 一一对应。
 const PASS_ENTRIES: &[ReadabilityPassEntry] = &[
-    ReadabilityPassEntry { apply: cleanup::apply },
-    ReadabilityPassEntry { apply: local_coalesce::apply },
-    ReadabilityPassEntry { apply: param_alias_coalesce::apply },
-    ReadabilityPassEntry { apply: statement_merge::apply },
-    ReadabilityPassEntry { apply: loop_header_merge::apply },
-    ReadabilityPassEntry { apply: branch_pretty::apply },
-    ReadabilityPassEntry { apply: field_access_sugar::apply },
-    ReadabilityPassEntry { apply: inline_exprs::apply },
-    ReadabilityPassEntry { apply: short_circuit_pretty::apply },
-    ReadabilityPassEntry { apply: materialize_temps::apply },
-    ReadabilityPassEntry { apply: installer_iife::apply },
-    ReadabilityPassEntry { apply: function_sugar::apply },
-    ReadabilityPassEntry { apply: global_decl_pretty::apply },
-    ReadabilityPassEntry { apply: luajit_goto_safety::apply },
+    ReadabilityPassEntry {
+        apply: cleanup::apply,
+    },
+    ReadabilityPassEntry {
+        apply: local_coalesce::apply,
+    },
+    ReadabilityPassEntry {
+        apply: param_alias_coalesce::apply,
+    },
+    ReadabilityPassEntry {
+        apply: statement_merge::apply,
+    },
+    ReadabilityPassEntry {
+        apply: loop_header_merge::apply,
+    },
+    ReadabilityPassEntry {
+        apply: branch_pretty::apply,
+    },
+    ReadabilityPassEntry {
+        apply: field_access_sugar::apply,
+    },
+    ReadabilityPassEntry {
+        apply: inline_exprs::apply,
+    },
+    ReadabilityPassEntry {
+        apply: short_circuit_pretty::apply,
+    },
+    ReadabilityPassEntry {
+        apply: materialize_temps::apply,
+    },
+    ReadabilityPassEntry {
+        apply: installer_iife::apply,
+    },
+    ReadabilityPassEntry {
+        apply: function_sugar::apply,
+    },
+    ReadabilityPassEntry {
+        apply: global_decl_pretty::apply,
+    },
+    ReadabilityPassEntry {
+        apply: luajit_goto_safety::apply,
+    },
 ];
 
 const MAX_ROUNDS: usize = 64;
@@ -217,7 +251,8 @@ pub(crate) fn make_readable(
                 None
             };
 
-            let changed = timings.record(name, || (PASS_ENTRIES[index].apply)(&mut module, context));
+            let changed =
+                timings.record(name, || (PASS_ENTRIES[index].apply)(&mut module, context));
 
             // pass 产生变化时输出 before/after diff
             if let Some(before) = before_snapshot.filter(|_| changed) {

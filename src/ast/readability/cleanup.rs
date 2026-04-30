@@ -59,7 +59,10 @@ fn cleanup_block(block: &mut AstBlock, allow_trailing_empty_return_elision: bool
     // `if not cond then return end; do BODY end`，其中 BODY 含 local 声明。
     // 例外：含 GlobalDecl（如 `global<const> *`）的 do-end 有实际作用域语义，保留。
     while let Some(AstStmt::DoBlock(nested)) = block.stmts.last()
-        && !nested.stmts.iter().any(|s| matches!(s, AstStmt::GlobalDecl(_)))
+        && !nested
+            .stmts
+            .iter()
+            .any(|s| matches!(s, AstStmt::GlobalDecl(_)))
     {
         let Some(AstStmt::DoBlock(nested)) = block.stmts.pop() else {
             unreachable!();
@@ -291,7 +294,11 @@ fn stmt_captures_binding(stmt: &AstStmt, binding: AstBindingRef) -> bool {
         AstStmt::LocalFunctionDecl(function_decl) => {
             function_expr_captures_binding(&function_decl.func, binding)
         }
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => false,
+        AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_)
+        | AstStmt::Error(_) => false,
     }
 }
 

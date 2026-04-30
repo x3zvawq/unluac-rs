@@ -245,10 +245,7 @@ impl<'a> AstLowerer<'a> {
                     }
                 }
 
-                Ok((
-                    vec![AstStmt::Return(Box::new(AstReturn { values }))],
-                    1,
-                ))
+                Ok((vec![AstStmt::Return(Box::new(AstReturn { values }))], 1))
             }
             HirStmt::If(if_stmt) => Ok((
                 vec![AstStmt::If(Box::new(AstIf {
@@ -393,9 +390,12 @@ impl<'a> AstLowerer<'a> {
                 ))
             }
             HirStmt::Block(inner) => Ok((
-                vec![AstStmt::DoBlock(Box::new(
-                    self.lower_block(proto_index, inner, None, continue_target)?,
-                ))],
+                vec![AstStmt::DoBlock(Box::new(self.lower_block(
+                    proto_index,
+                    inner,
+                    None,
+                    continue_target,
+                )?))],
                 1,
             )),
             HirStmt::Unstructured(_) => Err(AstLowerError::ResidualHir {

@@ -24,17 +24,17 @@ use crate::structure::{
 };
 use crate::transformer::{BranchOperands, BranchPredicate, CondOperand, InstrRef, LowInstr, Reg};
 
+pub(super) use self::decision::header_subject_is_value_carrier;
 use self::decision::{
     DecisionEdge, branch_exit_blocks_from_value_merge_candidate, build_branch_decision_expr,
     build_branch_decision_expr_for_value_merge_candidate,
-    build_branch_decision_expr_for_value_merge_candidate_single_eval,
-    build_branch_decision_expr_single_eval, build_decision_expr, build_impure_value_merge_expr,
+    build_branch_decision_expr_for_value_merge_candidate_mixed_eval,
+    build_branch_decision_expr_mixed_eval, build_decision_expr, build_impure_value_merge_expr,
     build_value_decision_expr, build_value_decision_expr_single_eval,
 };
 use self::guards::{
     decision_references_forbidden_candidate_temps, expr_references_forbidden_candidate_temps,
 };
-pub(super) use self::decision::header_subject_is_value_carrier;
 pub(super) use self::lowering::{
     lower_materialized_value_leaf_expr, lower_short_circuit_subject,
     lower_short_circuit_subject_single_eval,

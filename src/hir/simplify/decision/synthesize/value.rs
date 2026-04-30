@@ -106,10 +106,7 @@ pub(super) fn structured_candidates(
     ));
     candidates.push(super::super::logical_or(
         super::super::logical_and(subject.clone(), truthy_expr.clone()),
-        super::super::logical_and(
-            subject.clone().negate(),
-            falsy_expr.clone(),
-        ),
+        super::super::logical_and(subject.clone().negate(), falsy_expr.clone()),
     ));
     candidates.push(super::super::logical_or(
         super::super::logical_and(not_subject.clone(), falsy_expr.clone()),

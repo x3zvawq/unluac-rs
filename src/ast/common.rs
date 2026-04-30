@@ -69,7 +69,10 @@ pub enum AstExpr {
     String(String),
     Int64(i64),
     UInt64(u64),
-    Complex { real: f64, imag: f64 },
+    Complex {
+        real: f64,
+        imag: f64,
+    },
     Var(AstNameRef),
     FieldAccess(Box<AstFieldAccess>),
     IndexAccess(Box<AstIndexAccess>),
@@ -270,8 +273,7 @@ impl AstDialectVersion {
     /// HIR 层在目标方言未知时使用此保守全集，保证不会生成任何方言下
     /// 不合法的裸标识符。
     pub fn is_keyword_in_any_dialect(name: &str) -> bool {
-        is_base_lua_keyword(name)
-            || matches!(name, "goto" | "continue" | "global")
+        is_base_lua_keyword(name) || matches!(name, "goto" | "continue" | "global")
     }
 }
 

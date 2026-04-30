@@ -63,4 +63,3 @@ pub(crate) fn build_parser_summary_row(entry: &ParserProtoEntry<'_>) -> ProtoSum
         children: Some(entry.proto.common.children.len()),
     }
 }
-

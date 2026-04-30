@@ -3,13 +3,13 @@
 //! Naming 假定 Readability 已经把 raw temp 完全物化掉，所以这里先把这些边界钉死。
 //! 一旦检测到 temp 泄漏或函数引用缺失，就直接报结构错误，而不是让 Naming 继续兜底。
 
-use crate::ast::{
-    AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue, AstModule,
-    AstNameRef, AstStmt,
-};
 use crate::ast::traverse::{
     traverse_call_children, traverse_expr_children, traverse_lvalue_children,
     traverse_stmt_children,
+};
+use crate::ast::{
+    AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue, AstModule,
+    AstNameRef, AstStmt,
 };
 use crate::hir::{HirModule, HirProtoRef};
 

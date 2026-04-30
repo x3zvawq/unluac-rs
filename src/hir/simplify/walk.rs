@@ -214,10 +214,7 @@ fn rewrite_expr(expr: &mut HirExpr, pass: &mut impl HirRewritePass) -> bool {
     expr_changed || nested_changed
 }
 
-fn rewrite_decision_expr(
-    decision: &mut HirDecisionExpr,
-    pass: &mut impl HirRewritePass,
-) -> bool {
+fn rewrite_decision_expr(decision: &mut HirDecisionExpr, pass: &mut impl HirRewritePass) -> bool {
     let mut changed = false;
     traverse_hir_decision_children!(
         decision,

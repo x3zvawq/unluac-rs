@@ -5,12 +5,12 @@
 
 use std::collections::BTreeMap;
 
+use crate::ast::traverse::{
+    traverse_call_children, traverse_expr_children, traverse_lvalue_children,
+};
 use crate::ast::{
     AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue,
     AstModule, AstNameRef, AstStmt, AstSyntheticLocalId,
-};
-use crate::ast::traverse::{
-    traverse_call_children, traverse_expr_children, traverse_lvalue_children,
 };
 use crate::hir::{HirModule, HirProtoRef, ParamId};
 
@@ -170,7 +170,11 @@ fn collect_stmt_hints(
             );
             collect_function_expr_hints(&local_function_decl.func, hints, hir)?;
         }
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => {}
+        AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_)
+        | AstStmt::Error(_) => {}
     }
     Ok(())
 }
@@ -407,7 +411,8 @@ fn candidate_from_expr(expr: &AstExpr) -> Option<(String, NameSource)> {
         | AstExpr::UInt64(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
-        | AstExpr::VarArg | AstExpr::Error(_) => None,
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => None,
     }
 }
 

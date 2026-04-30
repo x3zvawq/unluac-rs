@@ -28,7 +28,9 @@ mod decompile_pipeline {
             .generated
             .as_ref()
             .expect("generate stage should leave generated source in state");
-        let first_code_line = generated.source.lines()
+        let first_code_line = generated
+            .source
+            .lines()
             .find(|l| !l.trim().is_empty() && !l.trim().starts_with("--"))
             .expect("fixture should emit at least one code line");
         let (lhs, rhs) = first_code_line

@@ -17,7 +17,7 @@ use serde::Serialize;
 use unluac::cfg::{BlockKind, CfgGraph, EdgeKind};
 use unluac::decompile::DecompileResult;
 use unluac::parser::{RawLiteralConst, RawProto, RawString, format_raw_instr};
-use unluac::transformer::{format_low_instr, LoweredProto, RawInstrRef};
+use unluac::transformer::{LoweredProto, RawInstrRef, format_low_instr};
 
 // ── 顶层结果 ──────────────────────────────────────────────
 
@@ -314,9 +314,5 @@ fn project_constant(index: usize, lit: &RawLiteralConst) -> WasmConstant {
         RawLiteralConst::UInt64(n) => ("uint64", format!("{n}ULL")),
         RawLiteralConst::Complex { real, imag } => ("complex", format!("{real}+{imag}i")),
     };
-    WasmConstant {
-        index,
-        ty,
-        display,
-    }
+    WasmConstant { index, ty, display }
 }

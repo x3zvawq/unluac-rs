@@ -4,12 +4,11 @@ use crate::ast::{
     AstAssign, AstBindingRef, AstBlock, AstCallExpr, AstCallKind, AstCallStmt, AstExpr,
     AstFunctionDecl, AstFunctionExpr, AstFunctionName, AstLValue, AstLocalAttr, AstLocalBinding,
     AstLocalDecl, AstLocalFunctionDecl, AstLocalOrigin, AstModule, AstNamePath, AstNameRef,
-    AstStmt, AstSyntheticLocalId, AstTableConstructor, AstTargetDialect,
-    make_readable,
+    AstStmt, AstSyntheticLocalId, AstTableConstructor, AstTargetDialect, make_readable,
 };
 use crate::hir::{HirProtoRef, ParamId, TempId};
-use crate::timing::TimingCollector;
 use crate::readability::ReadabilityOptions;
+use crate::timing::TimingCollector;
 
 fn installer_function() -> AstFunctionExpr {
     AstFunctionExpr {

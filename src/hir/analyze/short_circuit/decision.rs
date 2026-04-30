@@ -38,25 +38,30 @@ pub(crate) fn build_branch_decision_expr(
     build_branch_decision_expr_with_subject(lowering, short, entry, lower_short_circuit_subject)
 }
 
-pub(crate) fn build_branch_decision_expr_single_eval(
+pub(crate) fn build_branch_decision_expr_mixed_eval(
     lowering: &ProtoLowering<'_>,
     short: &ShortCircuitCandidate,
     entry: ShortCircuitNodeRef,
+    materialized_blocks: &BTreeSet<BlockRef>,
 ) -> Option<HirDecisionExpr> {
-    build_branch_decision_expr_with_subject(
-        lowering,
-        short,
-        entry,
-        lower_short_circuit_subject_single_eval,
-    )
+    build_branch_decision_expr_with_subject(lowering, short, entry, |lowering, block| {
+        if materialized_blocks.contains(&block) {
+            lower_short_circuit_subject(lowering, block)
+        } else {
+            lower_short_circuit_subject_single_eval(lowering, block)
+        }
+    })
 }
 
-fn build_branch_decision_expr_with_subject(
+fn build_branch_decision_expr_with_subject<FSubject>(
     lowering: &ProtoLowering<'_>,
     short: &ShortCircuitCandidate,
     entry: ShortCircuitNodeRef,
-    subject_for_block: fn(&ProtoLowering<'_>, BlockRef) -> Option<HirExpr>,
-) -> Option<HirDecisionExpr> {
+    subject_for_block: FSubject,
+) -> Option<HirDecisionExpr>
+where
+    FSubject: Fn(&ProtoLowering<'_>, BlockRef) -> Option<HirExpr>,
+{
     build_decision_expr(
         lowering,
         short,
@@ -93,28 +98,38 @@ pub(crate) fn build_branch_decision_expr_for_value_merge_candidate(
     )
 }
 
-pub(crate) fn build_branch_decision_expr_for_value_merge_candidate_single_eval(
+pub(crate) fn build_branch_decision_expr_for_value_merge_candidate_mixed_eval(
     lowering: &ProtoLowering<'_>,
     short: &ShortCircuitCandidate,
     truthy_leaves: &BTreeSet<BlockRef>,
     falsy_leaves: &BTreeSet<BlockRef>,
+    materialized_blocks: &BTreeSet<BlockRef>,
 ) -> Option<HirDecisionExpr> {
     build_branch_decision_expr_for_value_merge_candidate_with_subject(
         lowering,
         short,
         truthy_leaves,
         falsy_leaves,
-        lower_short_circuit_subject_single_eval,
+        |lowering, block| {
+            if materialized_blocks.contains(&block) {
+                lower_short_circuit_subject_inline(lowering, block)
+            } else {
+                lower_short_circuit_subject_single_eval(lowering, block)
+            }
+        },
     )
 }
 
-fn build_branch_decision_expr_for_value_merge_candidate_with_subject(
+fn build_branch_decision_expr_for_value_merge_candidate_with_subject<FSubject>(
     lowering: &ProtoLowering<'_>,
     short: &ShortCircuitCandidate,
     truthy_leaves: &BTreeSet<BlockRef>,
     falsy_leaves: &BTreeSet<BlockRef>,
-    subject_for_block: fn(&ProtoLowering<'_>, BlockRef) -> Option<HirExpr>,
-) -> Option<HirDecisionExpr> {
+    subject_for_block: FSubject,
+) -> Option<HirDecisionExpr>
+where
+    FSubject: Fn(&ProtoLowering<'_>, BlockRef) -> Option<HirExpr>,
+{
     let _ = branch_exit_blocks_from_value_merge_candidate(short)?;
     build_decision_expr(
         lowering,
@@ -268,11 +283,7 @@ fn build_impure_value_merge_target(
         // 在 result_reg 上时，subject 运行时值才等于保留的旧寄存器值。
         ShortCircuitTarget::Value(block)
             if *block == current_header
-                && header_subject_is_value_carrier(
-                    lowering,
-                    current_header,
-                    short.result_reg,
-                ) =>
+                && header_subject_is_value_carrier(lowering, current_header, short.result_reg) =>
         {
             Some(ImpureValueMergeTarget::Current)
         }

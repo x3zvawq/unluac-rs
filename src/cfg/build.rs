@@ -95,20 +95,60 @@ fn build_cfg(instrs: &[LowInstr]) -> Cfg {
                 builder.add_target_edge(&instr_to_block, block_ref, instr.target, EdgeKind::Jump);
             }
             LowInstr::Branch(instr) => {
-                builder.add_target_edge(&instr_to_block, block_ref, instr.then_target, EdgeKind::BranchTrue);
-                builder.add_target_edge(&instr_to_block, block_ref, instr.else_target, EdgeKind::BranchFalse);
+                builder.add_target_edge(
+                    &instr_to_block,
+                    block_ref,
+                    instr.then_target,
+                    EdgeKind::BranchTrue,
+                );
+                builder.add_target_edge(
+                    &instr_to_block,
+                    block_ref,
+                    instr.else_target,
+                    EdgeKind::BranchFalse,
+                );
             }
             LowInstr::NumericForInit(instr) => {
-                builder.add_target_edge(&instr_to_block, block_ref, instr.body_target, EdgeKind::LoopBody);
-                builder.add_target_edge(&instr_to_block, block_ref, instr.exit_target, EdgeKind::LoopExit);
+                builder.add_target_edge(
+                    &instr_to_block,
+                    block_ref,
+                    instr.body_target,
+                    EdgeKind::LoopBody,
+                );
+                builder.add_target_edge(
+                    &instr_to_block,
+                    block_ref,
+                    instr.exit_target,
+                    EdgeKind::LoopExit,
+                );
             }
             LowInstr::NumericForLoop(instr) => {
-                builder.add_target_edge(&instr_to_block, block_ref, instr.body_target, EdgeKind::LoopBody);
-                builder.add_target_edge(&instr_to_block, block_ref, instr.exit_target, EdgeKind::LoopExit);
+                builder.add_target_edge(
+                    &instr_to_block,
+                    block_ref,
+                    instr.body_target,
+                    EdgeKind::LoopBody,
+                );
+                builder.add_target_edge(
+                    &instr_to_block,
+                    block_ref,
+                    instr.exit_target,
+                    EdgeKind::LoopExit,
+                );
             }
             LowInstr::GenericForLoop(instr) => {
-                builder.add_target_edge(&instr_to_block, block_ref, instr.body_target, EdgeKind::LoopBody);
-                builder.add_target_edge(&instr_to_block, block_ref, instr.exit_target, EdgeKind::LoopExit);
+                builder.add_target_edge(
+                    &instr_to_block,
+                    block_ref,
+                    instr.body_target,
+                    EdgeKind::LoopBody,
+                );
+                builder.add_target_edge(
+                    &instr_to_block,
+                    block_ref,
+                    instr.exit_target,
+                    EdgeKind::LoopExit,
+                );
             }
             LowInstr::Return(_) => {
                 builder.add_edge(block_ref, exit_block, EdgeKind::Return);

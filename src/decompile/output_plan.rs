@@ -6,8 +6,7 @@
 use std::collections::BTreeSet;
 
 use crate::ast::{
-    AstDialectVersion, AstFeature, AstModule, AstTargetDialect,
-    collect_ast_features, make_readable,
+    AstDialectVersion, AstFeature, AstModule, AstTargetDialect, collect_ast_features, make_readable,
 };
 use crate::generate::GenerateMode;
 use crate::timing::TimingCollector;
@@ -72,13 +71,8 @@ pub(super) fn resolve_output_plan(
                     .unwrap_or(requested_target);
 
             loop {
-                let readability = make_readable(
-                    ast,
-                    target,
-                    readability_options,
-                    timings,
-                    dump_passes,
-                );
+                let readability =
+                    make_readable(ast, target, readability_options, timings, dump_passes);
                 let unsupported_in_target = unsupported_ast_features(&readability, target);
                 if unsupported_in_target.is_empty() {
                     let unsupported_in_requested =
@@ -157,7 +151,10 @@ pub(super) fn resolve_output_plan(
     }
 }
 
-pub(super) fn unsupported_ast_features(module: &AstModule, target: AstTargetDialect) -> BTreeSet<AstFeature> {
+pub(super) fn unsupported_ast_features(
+    module: &AstModule,
+    target: AstTargetDialect,
+) -> BTreeSet<AstFeature> {
     collect_ast_features(module)
         .into_iter()
         .filter(|feature| !target.supports_feature(*feature))

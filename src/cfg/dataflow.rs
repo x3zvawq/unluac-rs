@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use crate::transformer::{
-    AccessBase, AccessKey, BranchOperands, CaptureSource, CondOperand, LowInstr, LoweredProto,
-    Reg, RegRange, ResultPack, ValueOperand, ValuePack,
+    AccessBase, AccessKey, BranchOperands, CaptureSource, CondOperand, LowInstr, LoweredProto, Reg,
+    RegRange, ResultPack, ValueOperand, ValuePack,
 };
 
 use self::effects::{compute_instr_effect, compute_reg_count, compute_side_effect_summary};
@@ -484,7 +484,6 @@ pub fn analyze_dataflow(
         children,
     }
 }
-
 
 fn instr_indices(cfg: &Cfg, block: BlockRef) -> Option<impl Iterator<Item = usize>> {
     let range = cfg.blocks.get(block.index())?.instrs;

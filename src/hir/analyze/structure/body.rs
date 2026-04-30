@@ -493,8 +493,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         let source_temp = self.block_entry_source_temp(block, reg);
         let carries_through_block = !self.block_redefines_reg(block, reg);
-        self.overrides
-            .insert_entry_expr(block, reg, expr.clone(), source_temp, carries_through_block);
+        self.overrides.insert_entry_expr(
+            block,
+            reg,
+            expr.clone(),
+            source_temp,
+            carries_through_block,
+        );
         // 当 override 能穿透当前 block（该 register 未被重定义），需要继续向后继传播。
         // 否则后续 block 的 lower_block_prefix 看不到 entry_temp_expr override，
         // 被 suppress 的 phi temp 在 RHS 表达式中就无法被正确替换。
@@ -835,6 +840,30 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         merge.or(Some(stop))
     }
 
+    pub(super) fn branch_arm_stop(
+        &self,
+        entry: BlockRef,
+        sibling_entry: Option<BlockRef>,
+        merge: Option<BlockRef>,
+        branch_stop: Option<BlockRef>,
+    ) -> Option<BlockRef> {
+        let Some(branch_stop) = branch_stop else {
+            return merge;
+        };
+        let Some(merge) = merge else {
+            return Some(branch_stop);
+        };
+
+        // 当一条臂本身就是外层 stop 时，另一条臂如果继续使用外层 stop 作为边界，
+        // 会沿 CFG 一直降到自己的 merge 之后，提前 visit 掉外层 stop 也需要消费的
+        // 共享尾部块。此时分支整体仍回到外层 stop，但非 stop 臂只降到自己的 merge。
+        if merge != branch_stop && sibling_entry == Some(branch_stop) && entry != branch_stop {
+            Some(merge)
+        } else {
+            Some(branch_stop)
+        }
+    }
+
     fn branch_can_truncate_to_stop(
         &self,
         block: BlockRef,
@@ -851,19 +880,104 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         let mut allowed_blocks = region.structured_blocks.clone();
         allowed_blocks.insert(stop);
-        let arm_reaches_stop = |entry| {
-            entry == stop
-                || self
-                    .lowering
-                    .cfg
-                    .can_reach_within(entry, stop, &allowed_blocks)
-        };
+        let arm_can_truncate_to_stop =
+            |entry| self.branch_arm_can_truncate_to_stop(entry, stop, &allowed_blocks);
 
         // `if-then` / guard 没有显式 else 臂时，缺席的那一臂本来就代表“当前 region 不再
         // 产生额外语句，直接把控制权交回外层 stop”。这里如果仍然要求 else_entry 存在，
         // 嵌套 guard 会被错误地强推到自己的 merge 上，跨出外层 region，最后在更深的
         // merge block 上重入并把整片结构化打回失败。
-        arm_reaches_stop(then_entry) && else_entry.is_none_or(arm_reaches_stop)
+        arm_can_truncate_to_stop(then_entry) && else_entry.is_none_or(arm_can_truncate_to_stop)
+    }
+
+    fn branch_arm_can_truncate_to_stop(
+        &self,
+        entry: BlockRef,
+        stop: BlockRef,
+        allowed_blocks: &BTreeSet<BlockRef>,
+    ) -> bool {
+        if entry == stop {
+            return true;
+        }
+
+        if self.branch_arm_crosses_live_continuation(entry, stop) {
+            return false;
+        }
+
+        self.lowering
+            .cfg
+            .can_reach_within(entry, stop, allowed_blocks)
+            || self.branch_arm_terminates_before_stop(entry, stop)
+    }
+
+    fn branch_arm_crosses_live_continuation(&self, entry: BlockRef, stop: BlockRef) -> bool {
+        let mut visited = BTreeSet::new();
+        let mut stack = vec![entry];
+
+        while let Some(block) = stack.pop() {
+            if block == stop
+                || block == self.lowering.cfg.exit_block
+                || !self.lowering.cfg.reachable_blocks.contains(&block)
+                || !visited.insert(block)
+            {
+                continue;
+            }
+
+            // 如果某条内层分支绕过外层 stop 直接进入 stop 之后的普通延续块，
+            // 把它截断到外层 stop 会把后续语句吸进当前分支臂，破坏外层 region。
+            // 但 Lua 5.1 的 guard/elseif 链常会让“处理完的路径”直接跳到函数尾
+            // return；这种终止块没有可继续结构化的 fallthrough，可以安全地留在臂内。
+            if self.lowering.cfg.can_reach(stop, block) && !self.block_is_terminal_exit(block) {
+                return true;
+            }
+
+            for edge_ref in &self.lowering.cfg.succs[block.index()] {
+                stack.push(self.lowering.cfg.edges[edge_ref.index()].to);
+            }
+        }
+
+        false
+    }
+
+    fn branch_arm_terminates_before_stop(&self, entry: BlockRef, stop: BlockRef) -> bool {
+        let mut visited = BTreeSet::new();
+        let mut stack = vec![entry];
+        let mut saw_terminal = false;
+
+        while let Some(block) = stack.pop() {
+            if block == stop || block == self.lowering.cfg.exit_block {
+                return true;
+            }
+            if !self.lowering.cfg.reachable_blocks.contains(&block) || !visited.insert(block) {
+                continue;
+            }
+            if self.block_is_terminal_exit(block) {
+                saw_terminal = true;
+                continue;
+            }
+
+            for edge_ref in &self.lowering.cfg.succs[block.index()] {
+                let successor = self.lowering.cfg.edges[edge_ref.index()].to;
+                if successor != stop {
+                    stack.push(successor);
+                }
+            }
+        }
+
+        saw_terminal
+    }
+
+    fn block_is_terminal_exit(&self, block: BlockRef) -> bool {
+        let succs = &self.lowering.cfg.succs[block.index()];
+        !succs.is_empty()
+            && succs.iter().all(|edge_ref| {
+                let edge = self.lowering.cfg.edges[edge_ref.index()];
+                edge.to == self.lowering.cfg.exit_block
+                    && matches!(
+                        edge.kind,
+                        crate::cfg::EdgeKind::Return | crate::cfg::EdgeKind::TailCall
+                    )
+            })
     }
 }
 

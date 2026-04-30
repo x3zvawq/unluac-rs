@@ -95,8 +95,7 @@ pub(super) fn analyze_linear_branch_exit_candidates(
         if exit.is_none() && headers.len() >= 3 {
             let last = *headers.last().unwrap();
             let is_common_exit = headers[..headers.len() - 1].iter().all(|h| {
-                truthy_falsy_targets(proto, cfg, *h)
-                    .is_some_and(|(t, f)| t == last || f == last)
+                truthy_falsy_targets(proto, cfg, *h).is_some_and(|(t, f)| t == last || f == last)
             });
             if is_common_exit {
                 headers.pop();

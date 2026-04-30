@@ -4,14 +4,12 @@
 //! 不会在这里分配最终名字。
 //! 例如：子闭包捕获某个 local 时，这里会记录它对应的捕获来源链。
 
-use crate::hir::{
-    HirBlock, HirClosureExpr, HirExpr, HirModule, HirProtoRef, HirStmt,
-};
 use crate::hir::traverse::{
     traverse_hir_call_children, traverse_hir_decision_children, traverse_hir_expr_children,
     traverse_hir_lvalue_children, traverse_hir_stmt_children,
     traverse_hir_table_constructor_children,
 };
+use crate::hir::{HirBlock, HirClosureExpr, HirExpr, HirModule, HirProtoRef, HirStmt};
 
 use super::super::NamingError;
 use super::super::common::{CapturedBinding, ClosureCaptureEvidence};

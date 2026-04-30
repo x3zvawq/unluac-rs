@@ -29,7 +29,7 @@ use crate::generate::GenerateMode;
 use crate::hir::common::HirModule;
 use crate::hir::promotion::ProtoPromotionFacts;
 use crate::readability::ReadabilityOptions;
-use crate::scheduler::{run_invalidation_loop, InvalidationTag, PassDescriptor, PassPhase};
+use crate::scheduler::{InvalidationTag, PassDescriptor, PassPhase, run_invalidation_loop};
 use crate::timing::TimingCollector;
 
 /// pass dump 需要的参数包。
@@ -190,11 +190,12 @@ pub(super) fn simplify_hir(
         PASS_DESCRIPTORS,
         |index, name| {
             // 如果当前 pass 在 dump 列表中，先快照 before
-            let before_snapshots = if dump_active && dump_config.pass_names.iter().any(|p| p == name) {
-                Some(capture_hir_snapshots(module, &dump_config.filters))
-            } else {
-                None
-            };
+            let before_snapshots =
+                if dump_active && dump_config.pass_names.iter().any(|p| p == name) {
+                    Some(capture_hir_snapshots(module, &dump_config.filters))
+                } else {
+                    None
+                };
 
             let changed = timings.record(name, || {
                 apply_proto_pass(module, |proto| {
@@ -205,9 +206,17 @@ pub(super) fn simplify_hir(
                         0 => decision::simplify_decision_exprs_in_proto(proto),
                         1 => boolean_shells::remove_boolean_materialization_shells_in_proto(proto),
                         2 => logical_simplify::simplify_logical_exprs_in_proto(proto),
-                        3 => table_constructors::stabilize_table_constructors_in_proto(proto, dialect),
-                        4 => closure_self_capture::resolve_recursive_closure_self_captures_in_proto(proto),
-                        5 => temp_inline::inline_temps_in_proto_with_facts(proto, readability, facts),
+                        3 => table_constructors::stabilize_table_constructors_in_proto(
+                            proto, dialect,
+                        ),
+                        4 => {
+                            closure_self_capture::resolve_recursive_closure_self_captures_in_proto(
+                                proto,
+                            )
+                        }
+                        5 => {
+                            temp_inline::inline_temps_in_proto_with_facts(proto, readability, facts)
+                        }
                         6 => locals::promote_temps_to_locals_in_proto_with_facts(proto, facts),
                         7 => decision::eliminate_remaining_decisions_in_proto(proto),
                         8 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
@@ -258,10 +267,7 @@ fn apply_proto_pass(
 /// 返回值的第三个字段是“是否被 focus plan 归为 visible”；false 表示这个 proto
 /// 处于 elided 档位，下游 diff 只会在发生变化时打一行 `<elided>` 摘要。
 /// 完全不可见的 proto 不会进入返回数组。
-fn capture_hir_snapshots(
-    module: &HirModule,
-    filters: &DebugFilters,
-) -> Vec<(usize, String, bool)> {
+fn capture_hir_snapshots(module: &HirModule, filters: &DebugFilters) -> Vec<(usize, String, bool)> {
     let entries = super::debug::collect_hir_entries(module);
     let plan = super::debug::plan_focus(&entries, filters);
     if plan.focus.is_none() {
@@ -301,8 +307,7 @@ fn emit_hir_pass_diff(
     filters: &DebugFilters,
 ) {
     let after = capture_hir_snapshots(module, filters);
-    for ((idx, before_text, before_visible), (_, after_text, _)) in
-        before.iter().zip(after.iter())
+    for ((idx, before_text, before_visible), (_, after_text, _)) in before.iter().zip(after.iter())
     {
         if before_text == after_text {
             continue;

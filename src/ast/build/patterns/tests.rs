@@ -292,7 +292,10 @@ fn lower_ast_preserves_installer_iife_scaffolding_for_readability() {
                             })],
                             values: vec![HirExpr::LocalRef(LocalId(0))],
                         })),
-                        HirStmt::Return(Box::new(HirReturn { trailing_multiret: false, values: vec![] })),
+                        HirStmt::Return(Box::new(HirReturn {
+                            trailing_multiret: false,
+                            values: vec![],
+                        })),
                     ],
                 },
                 children: vec![HirProtoRef(2)],

@@ -139,7 +139,8 @@ impl AstVisitor for SyntheticLocalCollector {
             | AstStmt::Break
             | AstStmt::Continue
             | AstStmt::Goto(_)
-            | AstStmt::Label(_) | AstStmt::Error(_) => {}
+            | AstStmt::Label(_)
+            | AstStmt::Error(_) => {}
         }
     }
 

@@ -11,8 +11,8 @@ mod promotion;
 mod simplify;
 pub(crate) mod traverse;
 
+pub use crate::parser::{ProtoLineRange, ProtoSignature};
 pub(crate) use analyze::analyze_hir;
-pub(crate) use simplify::PassDumpConfig;
 pub use common::{
     HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirCallStmt, HirCapture,
     HirClose, HirClosureExpr, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef,
@@ -22,6 +22,6 @@ pub use common::{
     HirTableField, HirTableKey, HirTableSetList, HirToBeClosed, HirUnaryExpr, HirUnaryOpKind,
     HirUnresolvedExpr, HirUnstructured, HirWhile, LocalId, ParamId, TempId, UpvalueId,
 };
-pub use crate::parser::{ProtoLineRange, ProtoSignature};
 pub use debug::dump_hir;
+pub(crate) use simplify::PassDumpConfig;
 pub(crate) use simplify::synthesize_readable_pure_logical_expr;

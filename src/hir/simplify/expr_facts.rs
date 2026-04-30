@@ -5,9 +5,7 @@
 //! 恒等式集中在这里，避免同一组 match arm 在三处各写一份、任何一边增删变体时
 //! 另外几处漏掉。
 
-use crate::hir::common::{
-    HirBinaryOpKind, HirDecisionTarget, HirExpr, HirUnaryOpKind,
-};
+use crate::hir::common::{HirBinaryOpKind, HirDecisionTarget, HirExpr, HirUnaryOpKind};
 
 /// 判断表达式是否保证没有运行时副作用。
 ///
@@ -147,9 +145,7 @@ pub(super) fn fold_associative_duplicate_and(lhs: &HirExpr, rhs: &HirExpr) -> Op
         HirExpr::LogicalAnd(inner) if *rhs == inner.rhs => Some(lhs.clone()),
         _ => match rhs {
             // a and (a and b) → a and b
-            HirExpr::LogicalAnd(inner) if *lhs == inner.lhs => {
-                Some(rhs.clone())
-            }
+            HirExpr::LogicalAnd(inner) if *lhs == inner.lhs => Some(rhs.clone()),
             _ => None,
         },
     }
@@ -169,9 +165,7 @@ pub(super) fn fold_associative_duplicate_or(lhs: &HirExpr, rhs: &HirExpr) -> Opt
         HirExpr::LogicalOr(inner) if *rhs == inner.rhs => Some(lhs.clone()),
         _ => match rhs {
             // a or (a or b) → a or b
-            HirExpr::LogicalOr(inner) if *lhs == inner.lhs => {
-                Some(rhs.clone())
-            }
+            HirExpr::LogicalOr(inner) if *lhs == inner.lhs => Some(rhs.clone()),
             _ => None,
         },
     }

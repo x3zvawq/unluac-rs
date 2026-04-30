@@ -1549,8 +1549,7 @@ mod decompile_pipeline {
         // HIR 当前把 upvalue 读取和 or-表达式各自 materialize 成 local，
         // 后续 readability 阶段会折叠回 `value = value + (step or 1)` 的紧凑形式。
         assert!(
-            dump.contains("assign u0 = (l0 + l1)")
-                || dump.contains("assign u0 = (u0 + (p0 or 1))"),
+            dump.contains("assign u0 = (l0 + l1)") || dump.contains("assign u0 = (u0 + (p0 or 1))"),
             "{dump}"
         );
         assert!(!dump.contains("if p0"), "{dump}");
@@ -1662,7 +1661,9 @@ mod decompile_pipeline {
             .as_ref()
             .expect("generate stage should provide source");
         assert!(
-            generated.source.contains("value = value2 + (value3:next() or 1)"),
+            generated
+                .source
+                .contains("value = value2 + (value3:next() or 1)"),
             "{}",
             generated.source
         );
@@ -2604,13 +2605,17 @@ mod decompile_pipeline {
             .expect("generate stage should provide source");
         // `(A or B) and C then end` — the `and C` must not be silently dropped.
         assert!(
-            generated.source.contains("r0_0 == 1 or r0_0 == 2) and r0_1 then"),
+            generated
+                .source
+                .contains("r0_0 == 1 or r0_0 == 2) and r0_1 then"),
             "empty-body degenerate guard 'and r0_1' was dropped:\n{}",
             generated.source
         );
         // Non-empty body variant must also keep the guard.
         assert!(
-            generated.source.contains("and r0_1 then\n    print(\"body\")\nend"),
+            generated
+                .source
+                .contains("and r0_1 then\n    print(\"body\")\nend"),
             "non-empty-body guard was dropped:\n{}",
             generated.source
         );
