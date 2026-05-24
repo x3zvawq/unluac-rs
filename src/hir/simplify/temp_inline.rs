@@ -22,7 +22,7 @@ use self::mentioned::protected_temps_for_nested_stmt;
 use self::rewrite::replace_temp_in_stmt;
 use self::site::{expr_touches_temp, inline_site_in_stmt};
 use self::usage::{
-    NextStmtState, TempUseScratch, collect_stmt_temp_uses, inline_candidate,
+    NextStmtState, TempUseScratch, TempUseSummary, collect_stmt_temp_uses, inline_candidate,
     max_temp_index_in_block,
 };
 
@@ -88,6 +88,10 @@ fn inline_temps_in_block(
 
     // 逆向扫描只需要维护“后缀里每个 temp 当前被用了多少次”以及最近一个保留下来的
     // 语句。这样可以在不反复重扫整个后缀的前提下，保留“只内联到最近简单语句”的约束。
+    // fallback label/goto 可能让回边快照在文本上早于 temp 定义出现；这种 prefix read
+    // 不能被当成普通死用法，否则会把 loop-carried 值只内联到条件里，删掉回边需要的
+    // 中间状态。
+    let total_use_totals = collect_block_temp_use_totals(&block.stmts, scratch);
     let mut suffix_use_totals = vec![0; scratch.temp_count()];
     let mut kept_rev = Vec::with_capacity(block.stmts.len());
     let mut next_stmt_state: Option<NextStmtState> = None;
@@ -97,6 +101,7 @@ fn inline_temps_in_block(
         .enumerate()
         .rev()
     {
+        let stmt_uses = collect_stmt_temp_uses(&stmt, scratch);
         if let Some((temp, value)) = inline_candidate(&stmt)
             && !scratch.has_debug_local_hint(temp)
             && !protected_temps.contains(&temp)
@@ -113,6 +118,7 @@ fn inline_temps_in_block(
             // 后续再也没有地方记录“状态已经更新过”。
             // 因此这里只允许折叠真正的 forwarding temp，不折叠自引用状态槽位。
             && !expr_touches_temp(value, temp)
+            && prefix_use_count(temp, &total_use_totals, &suffix_use_totals, &stmt_uses) == 0
             && suffix_use_totals.get(temp.index()).copied().unwrap_or(0) == 1
             && let Some(state) = &mut next_stmt_state
             && state.temp_uses.count(temp) == 1
@@ -132,7 +138,6 @@ fn inline_temps_in_block(
             continue;
         }
 
-        let stmt_uses = collect_stmt_temp_uses(&stmt, scratch);
         stmt_uses.add_to_totals(&mut suffix_use_totals);
         next_stmt_state = Some(NextStmtState {
             temp_uses: stmt_uses,
@@ -144,6 +149,33 @@ fn inline_temps_in_block(
     block.stmts = kept_rev;
 
     changed
+}
+
+fn collect_block_temp_use_totals(stmts: &[HirStmt], scratch: &mut TempUseScratch) -> Vec<usize> {
+    let mut totals = vec![0; scratch.temp_count()];
+    for stmt in stmts {
+        collect_stmt_temp_uses(stmt, scratch).add_to_totals(&mut totals);
+    }
+    totals
+}
+
+fn prefix_use_count(
+    temp: TempId,
+    total_use_totals: &[usize],
+    suffix_use_totals: &[usize],
+    current_stmt_uses: &TempUseSummary,
+) -> usize {
+    total_use_totals
+        .get(temp.index())
+        .copied()
+        .unwrap_or_default()
+        .saturating_sub(
+            suffix_use_totals
+                .get(temp.index())
+                .copied()
+                .unwrap_or_default(),
+        )
+        .saturating_sub(current_stmt_uses.count(temp))
 }
 
 fn inline_temps_in_nested_blocks(

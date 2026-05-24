@@ -12,6 +12,9 @@
 //! - 更新后交棒：`assign tX = (sY + 1); ... sY = tX`
 //! - 显式 `goto/label` mesh 里的边界别名：若多条边界快照把同一组状态 temp 串成一个
 //!   等价类，这里会在当前 fallback block 内把它们统一认回同一批 binding
+//! - 非支配 label 入口的更新交棒：`state = next; ::entry:: ... next = state + 1;
+//!   if cond(next) then goto handoff end` 会把 `next` 认回 `state`，但只在 `next`
+//!   没有前缀读取、且回边确实跳回 handoff label 时才做
 //!
 //! 满足这几个条件时，说明这个 block 已经把“后半段状态身份”完全交给了 temp；
 //! 这里把它认回原 local，删掉 handoff seed。它不会发明新 local，也不会在原 local
@@ -20,6 +23,9 @@
 //! binding，并只裁掉“这次 rewrite 自己制造出来”的 `x = x` seed/self-copy。
 //! 像 branch merge 里“沿用当前值”的那一臂，即便在局部重写后暂时长成 `x = x`，
 //! 也仍然承载着 preserved-current-value 语义，不能在这里被当成纯噪音吞掉。
+//! 同理，若 handoff seed 后面紧跟一个 label，而前面已有 goto 能直接进入这个 label，
+//! 这个 seed 只属于其中一条边界快照；它不能支配 label 后的所有路径，因此不能把整个
+//! suffix 统一改写到 seed 的 RHS 身份。
 //!
 //! 例子：
 //! - 输入：`local l0 = 1; do t4 = l0; ::L1:: if t4 < 3 then t4 = t4 + 1; goto L1 end end`
@@ -35,7 +41,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId};
+use crate::hir::common::{
+    HirBlock, HirExpr, HirLValue, HirLabelId, HirProto, HirStmt, LocalId, TempId,
+};
 
 use super::temp_touch::collect_temp_refs_in_stmts;
 use super::visit::{HirVisitor, visit_stmts};
@@ -98,6 +106,10 @@ fn collapse_block_handoffs(block: &mut HirBlock, outer_temps: &BTreeSet<TempId>)
     let mut index = 0;
 
     while index < block.stmts.len() {
+        if try_collapse_label_loop_update_handoff(block, index, outer_temps) {
+            changed = true;
+            continue;
+        }
         if try_collapse_pure_binding_handoffs(block, index, outer_temps) {
             changed = true;
             continue;
@@ -196,6 +208,54 @@ fn collapse_boundary_alias_classes(block: &mut HirBlock) -> bool {
 
     prune_boundary_snapshot_self_assigns(block, &prunable_bindings);
     true
+}
+
+fn next_label_has_prior_goto(stmts: &[HirStmt], index: usize) -> bool {
+    let Some(HirStmt::Label(label)) = stmts.get(index + 1) else {
+        return false;
+    };
+    stmts[..index]
+        .iter()
+        .any(|stmt| stmt_contains_goto_to_label(stmt, label.id))
+}
+
+fn stmt_contains_goto_to_label(stmt: &HirStmt, target: HirLabelId) -> bool {
+    match stmt {
+        HirStmt::Goto(goto) => goto.target == target,
+        HirStmt::If(if_stmt) => {
+            block_contains_goto_to_label(&if_stmt.then_block, target)
+                || if_stmt
+                    .else_block
+                    .as_ref()
+                    .is_some_and(|else_block| block_contains_goto_to_label(else_block, target))
+        }
+        HirStmt::While(while_stmt) => block_contains_goto_to_label(&while_stmt.body, target),
+        HirStmt::Repeat(repeat_stmt) => block_contains_goto_to_label(&repeat_stmt.body, target),
+        HirStmt::Block(block) => block_contains_goto_to_label(block, target),
+        HirStmt::Unstructured(unstructured) => {
+            block_contains_goto_to_label(&unstructured.body, target)
+        }
+        HirStmt::NumericFor(numeric_for) => block_contains_goto_to_label(&numeric_for.body, target),
+        HirStmt::GenericFor(generic_for) => block_contains_goto_to_label(&generic_for.body, target),
+        HirStmt::LocalDecl(_)
+        | HirStmt::Assign(_)
+        | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::Return(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Label(_) => false,
+    }
+}
+
+fn block_contains_goto_to_label(block: &HirBlock, target: HirLabelId) -> bool {
+    block
+        .stmts
+        .iter()
+        .any(|stmt| stmt_contains_goto_to_label(stmt, target))
 }
 
 fn collect_boundary_alias_pairs(block: &HirBlock) -> Vec<Vec<(CarryBinding, CarryBinding)>> {
@@ -297,6 +357,9 @@ fn try_collapse_pure_binding_handoffs(
     {
         return false;
     }
+    if next_label_has_prior_goto(&block.stmts, index) {
+        return false;
+    }
 
     let suffix = &block.stmts[index + 1..];
     if suffix.is_empty()
@@ -334,6 +397,103 @@ fn try_collapse_pure_binding_handoffs(
     true
 }
 
+fn try_collapse_label_loop_update_handoff(
+    block: &mut HirBlock,
+    index: usize,
+    outer_temps: &BTreeSet<TempId>,
+) -> bool {
+    let Some((carried, update_temp)) = direct_temp_writeback_stmt(&block.stmts[index]) else {
+        return false;
+    };
+    if outer_temps.contains(&update_temp)
+        || suffix_mentions_temp(&block.stmts[..index], update_temp)
+    {
+        return false;
+    }
+    if !next_label_has_prior_goto(&block.stmts, index) {
+        return false;
+    }
+    let Some(handoff_label) = nearest_prior_label(&block.stmts, index) else {
+        return false;
+    };
+    if !block.stmts[index + 1..]
+        .iter()
+        .any(|stmt| stmt_contains_goto_to_label(stmt, handoff_label))
+    {
+        return false;
+    }
+
+    let suffix = &block.stmts[index + 1..];
+    let Some(relative_update_index) = find_label_loop_update(suffix, carried, update_temp) else {
+        return false;
+    };
+    let update_index = index + 1 + relative_update_index;
+    if block.stmts[update_index + 1..]
+        .iter()
+        .any(|stmt| stmt_writes_temp(stmt, update_temp))
+    {
+        return false;
+    }
+
+    let mut pass = TempToBindingPass {
+        rewrites: vec![TempBindingRewrite {
+            from: update_temp,
+            to: carried,
+        }],
+    };
+    if !rewrite_stmts(&mut block.stmts[index..], &mut pass) {
+        return false;
+    }
+
+    prune_redundant_self_assigns_in_stmts(
+        &mut block.stmts[index..],
+        collect_prunable_bindings([carried]),
+    );
+    prune_empty_assign_stmts(block);
+    true
+}
+
+fn direct_temp_writeback_stmt(stmt: &HirStmt) -> Option<(CarryBinding, TempId)> {
+    let HirStmt::Assign(assign) = stmt else {
+        return None;
+    };
+    let [target] = assign.targets.as_slice() else {
+        return None;
+    };
+    let [HirExpr::TempRef(update_temp)] = assign.values.as_slice() else {
+        return None;
+    };
+    let carried = carry_binding_from_lvalue(target)?;
+    if matches!(carried, CarryBinding::Temp(temp) if temp == *update_temp) {
+        return None;
+    }
+    Some((carried, *update_temp))
+}
+
+fn nearest_prior_label(stmts: &[HirStmt], index: usize) -> Option<HirLabelId> {
+    stmts[..index].iter().rev().find_map(|stmt| match stmt {
+        HirStmt::Label(label) => Some(label.id),
+        _ => None,
+    })
+}
+
+fn find_label_loop_update(
+    stmts: &[HirStmt],
+    carried: CarryBinding,
+    update_temp: TempId,
+) -> Option<usize> {
+    for (index, stmt) in stmts.iter().enumerate() {
+        if stmt_writes_temp(stmt, update_temp) {
+            return matches!(update_handoff_seed(stmt), Some((target, source)) if target == update_temp && source == carried)
+                .then_some(index);
+        }
+        if stmt_reads_binding(stmt, CarryBinding::Temp(update_temp)) {
+            return None;
+        }
+    }
+    None
+}
+
 fn try_collapse_pure_local_handoff(
     block: &mut HirBlock,
     index: usize,
@@ -345,6 +505,9 @@ fn try_collapse_pure_local_handoff(
 
     // 如果被折叠的 temp 在外层作用域中仍被引用，不能消除
     if outer_temps.contains(&temp) {
+        return false;
+    }
+    if next_label_has_prior_goto(&block.stmts, index) {
         return false;
     }
 
@@ -376,6 +539,9 @@ fn try_collapse_single_binding_handoff(
 
     // 如果被折叠的 temp 在外层作用域中仍被引用，不能消除
     if outer_temps.contains(&temp) {
+        return false;
+    }
+    if next_label_has_prior_goto(&block.stmts, index) {
         return false;
     }
 
@@ -416,6 +582,9 @@ fn try_collapse_binding_update_handoff(
 
     // 如果被折叠的 temp 在外层作用域中仍被引用，不能消除
     if outer_temps.contains(&target_temp) {
+        return false;
+    }
+    if next_label_has_prior_goto(&block.stmts, index) {
         return false;
     }
 
@@ -1107,6 +1276,21 @@ fn suffix_mentions_temp(stmts: &[HirStmt], temp: TempId) -> bool {
     collector.mentioned
 }
 
+fn stmt_reads_binding(stmt: &HirStmt, binding: CarryBinding) -> bool {
+    let mut collector = BindingReadCollector::default();
+    collector.collect_stmts(std::slice::from_ref(stmt));
+    collector.reads.contains(&binding)
+}
+
+fn stmt_writes_temp(stmt: &HirStmt, temp: TempId) -> bool {
+    let mut collector = TempWriteCollector {
+        temp,
+        written: false,
+    };
+    visit_stmts(std::slice::from_ref(stmt), &mut collector);
+    collector.written
+}
+
 struct TempToLocalPass {
     temp: TempId,
     local: LocalId,
@@ -1188,5 +1372,16 @@ impl HirVisitor for TempMentionCollector {
 
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
         self.mentioned |= matches!(lvalue, HirLValue::Temp(temp) if *temp == self.temp);
+    }
+}
+
+struct TempWriteCollector {
+    temp: TempId,
+    written: bool,
+}
+
+impl HirVisitor for TempWriteCollector {
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        self.written |= matches!(lvalue, HirLValue::Temp(temp) if *temp == self.temp);
     }
 }

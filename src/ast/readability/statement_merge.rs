@@ -14,6 +14,8 @@
 //!   后面的 `staged` 之类一次性临时 binding 仍应允许单独沉回某个分支
 //! - 但如果当前位置之前已经有会跳到更后面 label 的 forward goto，
 //!   这里会停止继续下沉，避免生成“goto 跳进 local 作用域”的非法 Lua
+//! - 如果某个 hoisted temp 在声明点与候选下沉点之间已经被读取过，也不能把它下沉
+//!   成后置 `local`，否则 fallback/goto 回边会读到未初始化的局部变量
 
 use std::collections::BTreeSet;
 
@@ -161,9 +163,13 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock) -> bool {
                 lookahead += 1;
                 continue;
             }
-            if let Some(merged) =
-                try_sink_hoisted_decl_into_stmt(&remaining, &block.stmts[lookahead])
-            {
+            if let Some(merged) = try_sink_hoisted_decl_into_stmt(
+                &remaining,
+                &block.stmts[lookahead],
+                &use_index,
+                index + 1,
+                lookahead,
+            ) {
                 let consumed = merged.bindings.len();
                 block.stmts[lookahead] = AstStmt::LocalDecl(Box::new(merged));
                 remaining.drain(..consumed);
@@ -189,6 +195,8 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock) -> bool {
                 &remaining,
                 &block.stmts[lookahead],
                 &use_index,
+                index + 1,
+                lookahead,
                 lookahead + 1,
             ) {
                 let consumed = merged.bindings.len();
@@ -469,7 +477,9 @@ fn sink_pending_bindings_into_block(
             index += 1;
             continue;
         }
-        if let Some(merged) = try_sink_hoisted_decl_into_stmt(remaining, &block.stmts[index]) {
+        if let Some(merged) =
+            try_sink_hoisted_decl_into_stmt(remaining, &block.stmts[index], &use_index, 0, index)
+        {
             let merged_len = merged.bindings.len();
             block.stmts[index] = AstStmt::LocalDecl(Box::new(merged));
             consumed += merged_len;
@@ -577,6 +587,9 @@ fn hoisted_temp_bindings(stmt: &AstStmt) -> Option<Vec<super::super::common::Ast
 fn try_sink_hoisted_decl_into_stmt(
     pending: &[super::super::common::AstLocalBinding],
     stmt: &AstStmt,
+    use_index: &BindingUseIndex,
+    prior_start: usize,
+    target_index: usize,
 ) -> Option<AstLocalDecl> {
     let AstStmt::Assign(assign) = stmt else {
         return None;
@@ -586,6 +599,12 @@ fn try_sink_hoisted_decl_into_stmt(
         return None;
     }
     let candidate = &pending[..assign.targets.len()];
+    if candidate
+        .iter()
+        .any(|binding| use_index.count_uses_in_range(prior_start, target_index, binding.id) != 0)
+    {
+        return None;
+    }
     if !candidate
         .iter()
         .zip(assign.targets.iter())
@@ -616,6 +635,8 @@ fn try_sink_hoisted_decl_into_stmt_anywhere(
     pending: &[super::super::common::AstLocalBinding],
     stmt: &AstStmt,
     use_index: &BindingUseIndex,
+    prior_start: usize,
+    target_index: usize,
     suffix_start: usize,
 ) -> Option<(usize, AstLocalDecl)> {
     let AstStmt::Assign(assign) = stmt else {
@@ -628,6 +649,11 @@ fn try_sink_hoisted_decl_into_stmt_anywhere(
     let target_len = assign.targets.len();
     for start in 0..=pending.len() - target_len {
         let candidate = &pending[start..start + target_len];
+        if candidate.iter().any(|binding| {
+            use_index.count_uses_in_range(prior_start, target_index, binding.id) != 0
+        }) {
+            continue;
+        }
         if !candidate
             .iter()
             .zip(assign.targets.iter())

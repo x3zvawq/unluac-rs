@@ -12,6 +12,8 @@
 //! - `while ... do ... end` 的 header/exit phi 会被整理成 `inside/outside` 两臂的
 //!   incoming facts，后续 HIR 直接消费这些结构事实，不再自己回头拆 `phi.incoming`
 //! - 普通 `while/repeat` 只保留形态 hint，不会伪造额外 binding 证据
+//! - `WhileLike` 的 header 前缀必须属于 branch 条件的数据依赖链，或是可丢弃的
+//!   无副作用残留；带副作用但不参与条件的语句应保守留给 repeat/unknown/goto 形态
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -48,15 +50,16 @@ pub(super) fn analyze_loops(
             let exits = collect_region_exits(cfg, &blocks);
             let reducible = is_reducible_region(cfg, header, &blocks);
             let header_value_merges = analyze_loop_header_value_merges(dataflow, header, &blocks);
-            let (kind_hint, continue_target, source_bindings) = infer_loop_shape(
+            let (kind_hint, continue_target, source_bindings) = infer_loop_shape(LoopShapeInput {
                 proto,
                 cfg,
+                dataflow,
                 header,
-                &blocks,
-                &backedges,
+                blocks: &blocks,
+                backedges: &backedges,
                 preheader,
-                &header_value_merges,
-            );
+                header_value_merges: &header_value_merges,
+            });
             let exit_value_merges = analyze_loop_exit_value_merges(dataflow, &exits, &blocks);
 
             LoopCandidate {
@@ -79,15 +82,30 @@ pub(super) fn analyze_loops(
     loop_candidates
 }
 
-fn infer_loop_shape(
-    proto: &LoweredProto,
-    cfg: &Cfg,
+struct LoopShapeInput<'a> {
+    proto: &'a LoweredProto,
+    cfg: &'a Cfg,
+    dataflow: &'a DataflowFacts,
     header: BlockRef,
-    blocks: &BTreeSet<BlockRef>,
-    backedges: &[EdgeRef],
+    blocks: &'a BTreeSet<BlockRef>,
+    backedges: &'a [EdgeRef],
     preheader: Option<BlockRef>,
-    header_value_merges: &[LoopValueMerge],
+    header_value_merges: &'a [LoopValueMerge],
+}
+
+fn infer_loop_shape(
+    input: LoopShapeInput<'_>,
 ) -> (LoopKindHint, Option<BlockRef>, Option<LoopSourceBindings>) {
+    let LoopShapeInput {
+        proto,
+        cfg,
+        dataflow,
+        header,
+        blocks,
+        backedges,
+        preheader,
+        header_value_merges,
+    } = input;
     let backedge_sources = backedges
         .iter()
         .map(|edge_ref| cfg.edges[edge_ref.index()].from)
@@ -128,7 +146,7 @@ fn infer_loop_shape(
     // 这些前缀仍然属于“每轮先算条件、再决定进不进 body”的源码语义；如果这里只接受
     // 纯常量加载，像 `while i <= #values do`、`while (x & mask) ~= 0 do` 这类最普通的
     // 条件都会被误打成 repeat/unknown，后面整片 loop state 恢复就只能回退成 label/goto。
-    if block_is_while_header_like(proto, cfg, header, header_value_merges)
+    if block_is_while_header_like(proto, cfg, dataflow, header, header_value_merges)
         && branch_has_loop_body_and_exit(cfg, header, blocks)
     {
         return (LoopKindHint::WhileLike, Some(header), None);
@@ -275,6 +293,7 @@ fn branch_has_header_and_exit(
 fn block_is_while_header_like(
     proto: &LoweredProto,
     cfg: &Cfg,
+    dataflow: &DataflowFacts,
     block: BlockRef,
     header_value_merges: &[LoopValueMerge],
 ) -> bool {
@@ -293,10 +312,47 @@ fn block_is_while_header_like(
         .iter()
         .map(|value| value.reg)
         .collect::<BTreeSet<_>>();
-    (range.start.index()..range.end() - 1).all(|instr_index| {
-        let instr = &proto.instrs[instr_index];
-        instr_is_while_header_prefix(instr) && !instr_writes_any_reg(instr, &carried_regs)
-    })
+    let terminator_index = range.end() - 1;
+    let Some(branch_effect) = dataflow.instr_effects.get(terminator_index) else {
+        return false;
+    };
+    let mut needed_regs = branch_effect.fixed_uses.clone();
+
+    (range.start.index()..terminator_index)
+        .rev()
+        .all(|instr_index| {
+            let instr = &proto.instrs[instr_index];
+            if instr_writes_any_reg(instr, &carried_regs) || !instr_is_while_header_prefix(instr) {
+                return false;
+            }
+
+            let Some(effect) = dataflow.instr_effects.get(instr_index) else {
+                return false;
+            };
+            let writes_needed = instr_writes_any_reg_set(effect, &needed_regs);
+            if !writes_needed {
+                return dataflow
+                    .effect_summaries
+                    .get(instr_index)
+                    .is_some_and(|summary| summary.tags.is_empty());
+            }
+
+            for reg in effect
+                .fixed_must_defs
+                .iter()
+                .chain(effect.fixed_may_defs.iter())
+            {
+                needed_regs.remove(reg);
+            }
+            if let Some(open_def) = effect.open_must_def.or(effect.open_may_def) {
+                needed_regs.retain(|reg| reg.index() < open_def.index());
+            }
+            needed_regs.extend(effect.fixed_uses.iter().copied());
+            if let Some(open_use) = effect.open_use {
+                needed_regs.insert(open_use);
+            }
+            true
+        })
 }
 
 /// while 条件求值中不可能出现的指令。这些指令要么是控制流终结指令（已由
@@ -361,6 +417,18 @@ fn instr_writes_any_reg(instr: &LowInstr, regs: &BTreeSet<Reg>) -> bool {
         | LowInstr::Jump(_)
         | LowInstr::Branch(_) => false,
     }
+}
+
+fn instr_writes_any_reg_set(effect: &crate::cfg::InstrEffect, regs: &BTreeSet<Reg>) -> bool {
+    effect
+        .fixed_must_defs
+        .iter()
+        .chain(effect.fixed_may_defs.iter())
+        .any(|reg| regs.contains(reg))
+        || effect
+            .open_must_def
+            .or(effect.open_may_def)
+            .is_some_and(|start| regs.iter().any(|reg| reg.index() >= start.index()))
 }
 
 fn result_pack_writes_any_reg(results: &ResultPack, regs: &BTreeSet<Reg>) -> bool {

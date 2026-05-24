@@ -10,6 +10,8 @@
 //! `close from rX` 纳入身份；close 后复用同一个寄存器号不能再写回旧 upvalue。
 //! 否则 closure 会继续指向旧 local，后半段写回却被拆到新绑定里，或把 close 后的
 //! 普通临时值误写进已关闭 upvalue，直接改掉源码语义。
+//! fallback label/goto 还可能让 loop 回边快照在文本上早于 temp 定义出现；这种 temp
+//! 不能在定义点提升成 `local`，否则前缀快照会读到尚未初始化的局部变量。
 //!
 //! 提升完成后，同一个 block 里还会执行两步后处理：
 //! 1. branch-value 折叠：`local X; if cond then X=a else X=b end` → `local X = expr`
@@ -380,6 +382,10 @@ fn collect_plans(
             continue;
         };
         if reserved_temps.contains(&root_temp) {
+            sticky_slots = sticky_slots_for_stmt;
+            continue;
+        }
+        if stmts_touch_temp(&block.stmts[..decl_index], root_temp) {
             sticky_slots = sticky_slots_for_stmt;
             continue;
         }
