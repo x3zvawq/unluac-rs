@@ -6,6 +6,7 @@
  */
 
 import { onMounted, onUnmounted } from 'vue'
+import { shouldIgnoreDocumentShortcutTarget } from '@/utils/keyboard'
 
 export interface UseShortcutsCallbacks {
   openFile: () => void
@@ -19,8 +20,7 @@ export function useShortcuts(callbacks: UseShortcutsCallbacks) {
     if (!mod) return
 
     // 不要拦截输入框内的快捷键
-    const target = e.target as HTMLElement
-    if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) {
+    if (shouldIgnoreDocumentShortcutTarget(e.target)) {
       return
     }
 

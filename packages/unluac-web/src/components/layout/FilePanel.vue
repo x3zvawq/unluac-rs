@@ -29,6 +29,7 @@ import type { useDecompiler } from '@/composables/useDecompiler'
 import { matchGlob, useFileDrop } from '@/composables/useFileDrop'
 import { useFilesStore } from '@/stores/files'
 import { useSettingsStore } from '@/stores/settings'
+import { shouldIgnoreDocumentShortcutTarget } from '@/utils/keyboard'
 
 const { t } = useI18n()
 const filesStore = useFilesStore()
@@ -263,8 +264,10 @@ function openFolderPicker() {
   folderInputRef.value?.click()
 }
 
-/** 键盘上下导航文件列表 */
+/** 键盘上下导航文件列表，Delete 删除当前选中文件 */
 function handleKeyNavigation(e: KeyboardEvent) {
+  if (shouldIgnoreDocumentShortcutTarget(e.target)) return
+
   const files = filesStore.files
   if (files.length === 0) return
 
@@ -278,7 +281,7 @@ function handleKeyNavigation(e: KeyboardEvent) {
       nextIndex = currentIndex > 0 ? currentIndex - 1 : files.length - 1
     }
     filesStore.selectFile(files[nextIndex].id)
-  } else if (e.key === 'Delete' || e.key === 'Backspace') {
+  } else if (e.key === 'Delete') {
     if (filesStore.selectedFileId) {
       filesStore.removeFile(filesStore.selectedFileId)
     }
