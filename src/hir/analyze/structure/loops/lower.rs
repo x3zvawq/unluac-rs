@@ -4,6 +4,8 @@
 //! 状态，不会在这里重新识别循环种类。
 //! 例如：`NumericForLike` 的候选会在这里降成 `HirStmt::NumericFor`。
 
+use crate::cfg::SsaValue;
+
 use super::*;
 
 impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
@@ -88,6 +90,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let mut cond = self.lower_branch_cond_for_target(candidate.header, body_entry)?;
         let (mut cond_expr_overrides, all_prefix_temps) =
             self.block_prefix_temp_expr_overrides(candidate.header);
+        let condition_prefix_temps = self.block_condition_prefix_temps(candidate.header);
+        let header_prefix_must_stay_in_body = self
+            .header_prefix_has_live_non_condition_defs(candidate.header, &condition_prefix_temps);
         cond_expr_overrides.extend(temp_expr_overrides(&combined_target_overrides));
         rewrite_expr_temps(&mut cond, &cond_expr_overrides);
 
@@ -104,7 +109,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // 把原来的头部前缀显式作为循环体开头，条件取反作为 break 守卫。
         // 输入形状：header=[call multi_ret; branch ok] + body_entry=[short-circuit/continue]
         // 输出形状：while true do local ok,val=call(); if not ok then break end; <body> end
-        if expr_has_temp_ref_in(&cond, &unresolvable_prefix_temps) {
+        if header_prefix_must_stay_in_body
+            || expr_has_temp_ref_in(&cond, &unresolvable_prefix_temps)
+        {
             let prefix =
                 self.lower_block_prefix(candidate.header, true, &combined_target_overrides)?;
             let break_cond = cond.negate();
@@ -126,6 +133,76 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         Some(Some(exit))
+    }
+
+    fn block_condition_prefix_temps(&self, block: BlockRef) -> BTreeSet<TempId> {
+        let Some((branch_ref, LowInstr::Branch(_))) = self.block_terminator(block) else {
+            return BTreeSet::new();
+        };
+        let range = self.lowering.cfg.blocks[block.index()].instrs;
+        let prefix_start = range.start.index();
+        let prefix_end = branch_ref.index();
+        let mut temps = BTreeSet::new();
+        let mut seen_defs = BTreeSet::new();
+        let mut pending_defs = self
+            .lowering
+            .dataflow
+            .use_values_at(branch_ref)
+            .values()
+            .flat_map(|values| values.iter())
+            .filter_map(|value| match value {
+                SsaValue::Def(def) => Some(def),
+                SsaValue::Phi(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        while let Some(def) = pending_defs.pop() {
+            if !seen_defs.insert(def) {
+                continue;
+            }
+            let def_instr = self.lowering.dataflow.def_instr(def);
+            if (prefix_start..prefix_end).contains(&def_instr.index()) {
+                temps.insert(self.lowering.bindings.fixed_temps[def.index()]);
+            }
+            for values in self.lowering.dataflow.use_values_at(def_instr).values() {
+                pending_defs.extend(values.iter().filter_map(|value| match value {
+                    SsaValue::Def(upstream) => Some(upstream),
+                    SsaValue::Phi(_) => None,
+                }));
+            }
+        }
+
+        temps
+    }
+
+    fn header_prefix_has_live_non_condition_defs(
+        &self,
+        block: BlockRef,
+        condition_prefix_temps: &BTreeSet<TempId>,
+    ) -> bool {
+        let Some((terminator_ref, LowInstr::Branch(_))) = self.block_terminator(block) else {
+            return false;
+        };
+        let range = self.lowering.cfg.blocks[block.index()].instrs;
+        let live_out = self.lowering.dataflow.live_out_regs(block);
+
+        for instr_index in range.start.index()..terminator_ref.index() {
+            let instr_ref = InstrRef(instr_index);
+            if self.overrides.instr_is_suppressed(instr_ref) {
+                continue;
+            }
+            for def in &self.lowering.dataflow.instr_defs[instr_index] {
+                let temp = self.lowering.bindings.fixed_temps[def.index()];
+                if condition_prefix_temps.contains(&temp) {
+                    continue;
+                }
+                if live_out.contains(&self.lowering.dataflow.def_reg(*def)) {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     fn lower_repeat_loop(
