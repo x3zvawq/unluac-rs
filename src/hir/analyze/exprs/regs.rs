@@ -313,8 +313,19 @@ pub(crate) fn expr_for_reg_use_single_eval(
             .next()
             .expect("len checked above, exactly one SSA-like value exists");
         return match value {
-            SsaValue::Def(def) => expr_for_fixed_def_single_eval(lowering, def)
-                .unwrap_or_else(|| HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()])),
+            SsaValue::Def(def) => {
+                if lowering.dataflow.def_block(def) != block {
+                    return HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()]);
+                }
+                if def_has_intervening_use(lowering, def, instr_ref) {
+                    return HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()]);
+                }
+                if def_is_call_consumed_by_non_branch(lowering, def, instr_ref) {
+                    return HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()]);
+                }
+                expr_for_fixed_def_single_eval(lowering, def)
+                    .unwrap_or_else(|| HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()]))
+            }
             SsaValue::Phi(phi) => HirExpr::TempRef(lowering.bindings.phi_temps[phi.index()]),
         };
     }
@@ -324,4 +335,36 @@ pub(crate) fn expr_for_reg_use_single_eval(
         reg.index(),
         instr_ref.index()
     ))
+}
+
+fn def_is_call_consumed_by_non_branch(
+    lowering: &ProtoLowering<'_>,
+    def: DefId,
+    consumer_instr: InstrRef,
+) -> bool {
+    let def_instr = lowering.dataflow.def_instr(def);
+    matches!(lowering.proto.instrs[def_instr.index()], LowInstr::Call(_))
+        && !matches!(
+            lowering.proto.instrs[consumer_instr.index()],
+            LowInstr::Branch(_)
+        )
+}
+
+fn def_has_intervening_use(
+    lowering: &ProtoLowering<'_>,
+    def: DefId,
+    consumer_instr: InstrRef,
+) -> bool {
+    let def_instr = lowering.dataflow.def_instr(def);
+    if def_instr.index() >= consumer_instr.index() {
+        return false;
+    }
+    let effect = &lowering.dataflow.instr_effects[def_instr.index()];
+    effect.fixed_must_defs.iter().any(|reg| {
+        ((def_instr.index() + 1)..consumer_instr.index()).any(|instr_index| {
+            lowering.dataflow.instr_effects[instr_index]
+                .fixed_uses
+                .contains(reg)
+        })
+    })
 }

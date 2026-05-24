@@ -1,15 +1,17 @@
 //! 这个文件实现 HIR 的第一批 temp inlining。
 //!
-//! 我们故意把规则收得很保守：只折叠“单目标 temp 赋值，并且被紧邻下一条简单语句
-//! 使用一次”的情况。这样可以先清掉大量机械性的寄存器搬运，又不会把求值顺序、
-//! 控制流边界或 debug 语义悄悄改坏。
+//! 我们故意把规则收得很保守：常规路径只折叠“单目标 temp 赋值，并且被紧邻下一条
+//! 简单语句使用一次”的情况。调用表达式另有一条更窄的连续融合规则，用来处理
+//! `callee_temp = f; arg_temp = expr; callee_temp(arg_temp)` 这种 bytecode 为保持 Lua
+//! “先求 callee、再求参数”而拆出的形状；融合时必须把 callee 和参数一起放回同一条
+//! call，不能只把 callee 延后到参数求值之后。
 
 mod mentioned;
 mod rewrite;
 mod site;
 mod usage;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
     HirBlock, HirCallExpr, HirExpr, HirLValue, HirProto, HirStmt, HirTableField, HirTableKey,
@@ -86,6 +88,18 @@ fn inline_temps_in_block(
         facts.collect_captured_home_slots_in_stmt(stmt, &mut active_captured_slots);
     }
 
+    if inline_call_callee_across_argument_materialization(
+        block,
+        scratch,
+        facts,
+        protected_temps,
+        &captured_slots_before_stmt,
+    ) {
+        changed = true;
+        captured_slots_before_stmt =
+            captured_slots_before_stmts(block, facts, inherited_captured_slots);
+    }
+
     // 逆向扫描只需要维护“后缀里每个 temp 当前被用了多少次”以及最近一个保留下来的
     // 语句。这样可以在不反复重扫整个后缀的前提下，保留“只内联到最近简单语句”的约束。
     // fallback label/goto 可能让回边快照在文本上早于 temp 定义出现；这种 prefix read
@@ -149,6 +163,219 @@ fn inline_temps_in_block(
     block.stmts = kept_rev;
 
     changed
+}
+
+fn captured_slots_before_stmts(
+    block: &HirBlock,
+    facts: &ProtoPromotionFacts,
+    inherited_captured_slots: &BTreeSet<HomeSlotKey>,
+) -> Vec<BTreeSet<HomeSlotKey>> {
+    let mut captured_slots = Vec::with_capacity(block.stmts.len());
+    let mut active_captured_slots = inherited_captured_slots.clone();
+    for stmt in &block.stmts {
+        captured_slots.push(active_captured_slots.clone());
+        facts.collect_captured_home_slots_in_stmt(stmt, &mut active_captured_slots);
+    }
+    captured_slots
+}
+
+fn inline_call_callee_across_argument_materialization(
+    block: &mut HirBlock,
+    scratch: &mut TempUseScratch,
+    facts: &ProtoPromotionFacts,
+    protected_temps: &BTreeSet<TempId>,
+    captured_slots_before_stmt: &[BTreeSet<HomeSlotKey>],
+) -> bool {
+    let total_use_totals = collect_block_temp_use_totals(&block.stmts, scratch);
+    let mut changed = false;
+    let mut index = 0;
+
+    while index + 2 < block.stmts.len() {
+        let Some((callee_temp, callee_value)) = inline_candidate(&block.stmts[index]) else {
+            index += 1;
+            continue;
+        };
+        if !cross_call_inline_candidate_is_safe(
+            callee_temp,
+            callee_value,
+            index,
+            scratch,
+            facts,
+            protected_temps,
+            captured_slots_before_stmt,
+        ) || total_use_count(callee_temp, &total_use_totals) != 1
+            || expr_has_open_multivalue(callee_value)
+        {
+            index += 1;
+            continue;
+        }
+
+        let mut arg_values = Vec::new();
+        let mut arg_temps = Vec::new();
+        let mut call_index = index + 1;
+        while call_index < block.stmts.len() {
+            if matches!(block.stmts[call_index], HirStmt::CallStmt(_)) {
+                break;
+            }
+            let Some((arg_temp, arg_value)) = inline_candidate(&block.stmts[call_index]) else {
+                break;
+            };
+            if !cross_call_inline_candidate_is_safe(
+                arg_temp,
+                arg_value,
+                call_index,
+                scratch,
+                facts,
+                protected_temps,
+                captured_slots_before_stmt,
+            ) || total_use_count(arg_temp, &total_use_totals) != 1
+                || expr_has_open_multivalue(arg_value)
+            {
+                break;
+            }
+            arg_temps.push(arg_temp);
+            arg_values.push(arg_value.clone());
+            call_index += 1;
+        }
+
+        if arg_temps.is_empty() || call_index >= block.stmts.len() {
+            index += 1;
+            continue;
+        }
+
+        let HirStmt::CallStmt(call_stmt) = &block.stmts[call_index] else {
+            index += 1;
+            continue;
+        };
+        if !matches!(&call_stmt.call.callee, HirExpr::TempRef(temp) if *temp == callee_temp)
+            || !call_args_are_exact_temp_refs(&call_stmt.call.args, &arg_temps)
+        {
+            index += 1;
+            continue;
+        }
+
+        let callee_value = callee_value.clone();
+        let arg_replacements = arg_temps
+            .iter()
+            .copied()
+            .zip(arg_values)
+            .collect::<BTreeMap<_, _>>();
+        if let HirStmt::CallStmt(call_stmt) = &mut block.stmts[call_index] {
+            call_stmt.call.callee = callee_value;
+            for arg in &mut call_stmt.call.args {
+                let HirExpr::TempRef(temp) = arg else {
+                    continue;
+                };
+                if let Some(value) = arg_replacements.get(temp) {
+                    *arg = value.clone();
+                }
+            }
+        }
+        block.stmts.drain(index..call_index);
+        changed = true;
+    }
+
+    changed
+}
+
+fn cross_call_inline_candidate_is_safe(
+    temp: TempId,
+    value: &HirExpr,
+    stmt_index: usize,
+    scratch: &TempUseScratch,
+    facts: &ProtoPromotionFacts,
+    protected_temps: &BTreeSet<TempId>,
+    captured_slots_before_stmt: &[BTreeSet<HomeSlotKey>],
+) -> bool {
+    !scratch.has_debug_local_hint(temp)
+        && !protected_temps.contains(&temp)
+        && !temp_rebinds_captured_slot(
+            temp,
+            facts,
+            captured_slots_before_stmt
+                .get(stmt_index)
+                .expect("captured slot scan should cover every statement"),
+        )
+        && !expr_touches_temp(value, temp)
+}
+
+fn total_use_count(temp: TempId, total_use_totals: &[usize]) -> usize {
+    total_use_totals
+        .get(temp.index())
+        .copied()
+        .unwrap_or_default()
+}
+
+fn call_args_are_exact_temp_refs(args: &[HirExpr], expected_temps: &[TempId]) -> bool {
+    args.len() == expected_temps.len()
+        && args
+            .iter()
+            .zip(expected_temps.iter().copied())
+            .all(|(arg, expected)| matches!(arg, HirExpr::TempRef(temp) if *temp == expected))
+}
+
+fn expr_has_open_multivalue(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::VarArg => true,
+        HirExpr::Call(call) => {
+            call.multiret
+                || expr_has_open_multivalue(&call.callee)
+                || call.args.iter().any(expr_has_open_multivalue)
+        }
+        HirExpr::TableAccess(access) => {
+            expr_has_open_multivalue(&access.base) || expr_has_open_multivalue(&access.key)
+        }
+        HirExpr::Unary(unary) => expr_has_open_multivalue(&unary.expr),
+        HirExpr::Binary(binary) => {
+            expr_has_open_multivalue(&binary.lhs) || expr_has_open_multivalue(&binary.rhs)
+        }
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            expr_has_open_multivalue(&logical.lhs) || expr_has_open_multivalue(&logical.rhs)
+        }
+        HirExpr::Decision(decision) => decision.nodes.iter().any(|node| {
+            expr_has_open_multivalue(&node.test)
+                || decision_target_has_open_multivalue(&node.truthy)
+                || decision_target_has_open_multivalue(&node.falsy)
+        }),
+        HirExpr::TableConstructor(table) => {
+            table.fields.iter().any(|field| match field {
+                HirTableField::Array(value) => expr_has_open_multivalue(value),
+                HirTableField::Record(field) => {
+                    matches!(&field.key, HirTableKey::Expr(key) if expr_has_open_multivalue(key))
+                        || expr_has_open_multivalue(&field.value)
+                }
+            }) || table
+                .trailing_multivalue
+                .as_ref()
+                .is_some_and(expr_has_open_multivalue)
+        }
+        HirExpr::Closure(closure) => closure
+            .captures
+            .iter()
+            .any(|capture| expr_has_open_multivalue(&capture.value)),
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
+        | HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::TempRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::Unresolved(_) => false,
+    }
+}
+
+fn decision_target_has_open_multivalue(target: &crate::hir::common::HirDecisionTarget) -> bool {
+    match target {
+        crate::hir::common::HirDecisionTarget::Expr(expr) => expr_has_open_multivalue(expr),
+        crate::hir::common::HirDecisionTarget::Node(_)
+        | crate::hir::common::HirDecisionTarget::CurrentValue => false,
+    }
 }
 
 fn collect_block_temp_use_totals(stmts: &[HirStmt], scratch: &mut TempUseScratch) -> Vec<usize> {

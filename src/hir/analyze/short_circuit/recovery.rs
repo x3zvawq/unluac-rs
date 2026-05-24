@@ -721,11 +721,21 @@ fn collect_consumed_single_eval_defs(
         return;
     }
 
+    if consumed_def_has_intervening_use(lowering, def_id, consumer_instr) {
+        out.remove(&def_id);
+        return;
+    }
+    if consumed_def_is_call_consumed_by_non_branch(lowering, def_id, consumer_instr) {
+        out.remove(&def_id);
+        return;
+    }
+
     let recoverable = if consumer_instr == lowering.cfg.blocks[block.index()].instrs.last().unwrap()
     {
         expr_for_fixed_def(lowering, def_id).is_some()
     } else {
-        expr_for_dup_safe_fixed_def(lowering, def_id).is_some()
+        expr_for_fixed_def_single_eval(lowering, def_id).is_some()
+            || expr_for_dup_safe_fixed_def(lowering, def_id).is_some()
     };
     if !recoverable {
         out.remove(&def_id);
@@ -736,6 +746,38 @@ fn collect_consumed_single_eval_defs(
     for used_reg in &effect.fixed_uses {
         collect_consumed_single_eval_defs(lowering, block, def_instr, *used_reg, out);
     }
+}
+
+fn consumed_def_is_call_consumed_by_non_branch(
+    lowering: &ProtoLowering<'_>,
+    def_id: DefId,
+    consumer_instr: InstrRef,
+) -> bool {
+    let def_instr = lowering.dataflow.def_instr(def_id);
+    matches!(lowering.proto.instrs[def_instr.index()], LowInstr::Call(_))
+        && !matches!(
+            lowering.proto.instrs[consumer_instr.index()],
+            LowInstr::Branch(_)
+        )
+}
+
+fn consumed_def_has_intervening_use(
+    lowering: &ProtoLowering<'_>,
+    def_id: DefId,
+    consumer_instr: InstrRef,
+) -> bool {
+    let def_instr = lowering.dataflow.def_instr(def_id);
+    if def_instr.index() >= consumer_instr.index() {
+        return false;
+    }
+    let effect = &lowering.dataflow.instr_effects[def_instr.index()];
+    effect.fixed_must_defs.iter().any(|reg| {
+        ((def_instr.index() + 1)..consumer_instr.index()).any(|instr_index| {
+            lowering.dataflow.instr_effects[instr_index]
+                .fixed_uses
+                .contains(reg)
+        })
+    })
 }
 
 fn branch_cond_regs(cond: crate::transformer::BranchCond) -> Vec<Reg> {

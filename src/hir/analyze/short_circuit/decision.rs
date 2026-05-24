@@ -302,6 +302,44 @@ fn combine_impure_value_merge_targets(
     falsy: ImpureValueMergeTarget,
 ) -> Option<ImpureValueMergePlan> {
     match (truthy, falsy) {
+        (ImpureValueMergeTarget::Plan(truthy), ImpureValueMergeTarget::Plan(falsy))
+            if impure_subject_is_boolean_valued(&subject)
+                && impure_plan_is_boolean(&truthy, true)
+                && impure_plan_is_boolean(&falsy, false) =>
+        {
+            Some(ImpureValueMergePlan::Expr(subject))
+        }
+        (ImpureValueMergeTarget::Plan(truthy), ImpureValueMergeTarget::Plan(falsy))
+            if impure_subject_is_boolean_valued(&subject)
+                && impure_plan_is_boolean(&truthy, false)
+                && impure_plan_is_boolean(&falsy, true) =>
+        {
+            Some(ImpureValueMergePlan::Expr(subject.negate()))
+        }
+        (ImpureValueMergeTarget::Plan(truthy), ImpureValueMergeTarget::Plan(falsy))
+            if impure_subject_is_boolean_valued(&subject)
+                && impure_plan_is_boolean(&falsy, false) =>
+        {
+            let truthy = impure_plan_boolean_expr(&truthy)?;
+            Some(ImpureValueMergePlan::Expr(HirExpr::LogicalAnd(Box::new(
+                crate::hir::common::HirLogicalExpr {
+                    lhs: subject,
+                    rhs: truthy,
+                },
+            ))))
+        }
+        (ImpureValueMergeTarget::Plan(truthy), ImpureValueMergeTarget::Plan(falsy))
+            if impure_subject_is_boolean_valued(&subject)
+                && impure_plan_is_boolean(&truthy, true) =>
+        {
+            let falsy = impure_plan_boolean_expr(&falsy)?;
+            Some(ImpureValueMergePlan::Expr(HirExpr::LogicalOr(Box::new(
+                crate::hir::common::HirLogicalExpr {
+                    lhs: subject,
+                    rhs: falsy,
+                },
+            ))))
+        }
         (ImpureValueMergeTarget::Current, ImpureValueMergeTarget::Current) => {
             Some(ImpureValueMergePlan::Expr(subject))
         }
@@ -340,6 +378,37 @@ fn combine_impure_value_merge_targets(
             }),
         ) if fallback == falsy_fallback => {
             combine_shared_fallback_impure_heads(subject, truthy_head, falsy_head, fallback)
+        }
+        _ => None,
+    }
+}
+
+fn impure_subject_is_boolean_valued(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::Boolean(_) => true,
+        HirExpr::Unary(unary) => unary.op == crate::hir::common::HirUnaryOpKind::Not,
+        HirExpr::Binary(binary) => matches!(
+            binary.op,
+            crate::hir::common::HirBinaryOpKind::Eq
+                | crate::hir::common::HirBinaryOpKind::Lt
+                | crate::hir::common::HirBinaryOpKind::Le
+        ),
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            impure_subject_is_boolean_valued(&logical.lhs)
+                && impure_subject_is_boolean_valued(&logical.rhs)
+        }
+        _ => false,
+    }
+}
+
+fn impure_plan_is_boolean(plan: &ImpureValueMergePlan, value: bool) -> bool {
+    matches!(plan, ImpureValueMergePlan::Expr(HirExpr::Boolean(v)) if *v == value)
+}
+
+fn impure_plan_boolean_expr(plan: &ImpureValueMergePlan) -> Option<HirExpr> {
+    match plan {
+        ImpureValueMergePlan::Expr(expr) if impure_subject_is_boolean_valued(expr) => {
+            Some(expr.clone())
         }
         _ => None,
     }
