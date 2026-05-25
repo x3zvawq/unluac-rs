@@ -151,7 +151,7 @@ fn expr_for_open_def_single_eval(
     }
 }
 
-fn entry_reg_expr(lowering: &ProtoLowering<'_>, reg: Reg) -> HirExpr {
+pub(crate) fn expr_for_entry_reg(lowering: &ProtoLowering<'_>, reg: Reg) -> HirExpr {
     if reg.index() < lowering.bindings.params.len() {
         HirExpr::ParamRef(lowering.bindings.params[reg.index()])
     } else if let Some(local) = lowering.bindings.entry_local_regs.get(&reg) {

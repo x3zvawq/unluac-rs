@@ -73,6 +73,8 @@ pub(super) fn compute_phi_candidates(
         phi_candidates.extend(placed_phis.into_values());
     }
 
+    add_entry_header_loop_phi_candidates(cfg, graph_facts, live_in, block_out, &mut phi_candidates);
+
     phi_candidates.sort_by_key(|candidate| (candidate.block, candidate.reg));
     for (index, candidate) in phi_candidates.iter_mut().enumerate() {
         candidate.id = PhiId(index);
@@ -150,7 +152,7 @@ fn build_phi_candidate(
         });
 
         incoming.push(PhiIncoming {
-            pred,
+            pred: Some(pred),
             defs: defs.iter().copied().collect(),
         });
     }
@@ -166,6 +168,75 @@ fn build_phi_candidate(
         reg,
         incoming,
     })
+}
+
+/// 函数入口块本身作为 loop header 时，没有真实 preheader edge 能代表“入函数初值”。
+/// 对这种形状，普通 def-frontier phi 放置只能看到回边 defs，后续 HIR 会把 header
+/// 条件读到的寄存器判成多来源 unresolved。这里补一条 entry pseudo-incoming，形成
+/// “entry 初值 + loop backedge defs”的 header phi，让 loop state 恢复在结构层完成。
+fn add_entry_header_loop_phi_candidates(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    live_in: &[BTreeSet<Reg>],
+    block_out: &[FixedState],
+    phi_candidates: &mut Vec<PhiCandidate>,
+) {
+    let header = cfg.entry_block;
+    if !cfg.reachable_blocks.contains(&header) {
+        return;
+    }
+
+    let loop_blocks = graph_facts
+        .natural_loops
+        .iter()
+        .filter(|natural_loop| natural_loop.header == header)
+        .flat_map(|natural_loop| natural_loop.blocks.iter().copied())
+        .collect::<BTreeSet<_>>();
+    if loop_blocks.is_empty() {
+        return;
+    }
+
+    let existing = phi_candidates
+        .iter()
+        .filter(|candidate| candidate.block == header)
+        .map(|candidate| candidate.reg)
+        .collect::<BTreeSet<_>>();
+
+    for &reg in &live_in[header.index()] {
+        if existing.contains(&reg) {
+            continue;
+        }
+
+        let mut incoming = vec![PhiIncoming {
+            pred: None,
+            defs: BTreeSet::new(),
+        }];
+        let mut has_backedge_def = false;
+
+        for edge_ref in &cfg.preds[header.index()] {
+            let pred = cfg.edges[edge_ref.index()].from;
+            if !cfg.reachable_blocks.contains(&pred) || !loop_blocks.contains(&pred) {
+                continue;
+            }
+
+            let defs = block_out[pred.index()].get(reg).clone();
+            has_backedge_def |= !defs.is_empty();
+            incoming.push(PhiIncoming {
+                pred: Some(pred),
+                defs: defs.iter().copied().collect(),
+            });
+        }
+
+        if has_backedge_def && incoming.len() >= 2 {
+            incoming.sort_by_key(|incoming| incoming.pred);
+            phi_candidates.push(PhiCandidate {
+                id: PhiId(0),
+                block: header,
+                reg,
+                incoming,
+            });
+        }
+    }
 }
 
 /// 从 `pred` 沿 dominator 链向上查找最近的 def-block 或 phi-block，二者以先遇到的

@@ -646,7 +646,13 @@ fn format_effect_tags(tags: &BTreeSet<EffectTag>) -> String {
 fn format_phi_incoming(incoming: &[super::common::PhiIncoming]) -> String {
     incoming
         .iter()
-        .map(|incoming| format!("{}:{}", incoming.pred, format_display_set(&incoming.defs)))
+        .map(|incoming| {
+            let pred = incoming
+                .pred
+                .map(|pred| pred.to_string())
+                .unwrap_or_else(|| "entry".to_string());
+            format!("{}:{}", pred, format_display_set(&incoming.defs))
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }

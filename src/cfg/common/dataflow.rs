@@ -378,13 +378,10 @@ impl DataflowFacts {
         while let Some(phi_id) = queue.pop_front() {
             let phi = &self.phi_candidates[phi_id.index()];
             for incoming in &phi.incoming {
-                self.propagate_phi_liveness_from_block(
-                    cfg,
-                    incoming.pred,
-                    phi.reg,
-                    &mut alive,
-                    &mut queue,
-                );
+                let Some(pred) = incoming.pred else {
+                    continue;
+                };
+                self.propagate_phi_liveness_from_block(cfg, pred, phi.reg, &mut alive, &mut queue);
             }
         }
 
@@ -585,7 +582,9 @@ impl fmt::Display for PhiId {
 /// 一个 predecessor 边给 phi 提供的候选版本。
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct PhiIncoming {
-    pub pred: BlockRef,
+    /// `None` 表示函数入口的初始寄存器值。这个伪来源只用于入口块本身就是
+    /// loop header 的形状；它让 loop state 可以同时看到“入函数初值”和回边写回。
+    pub pred: Option<BlockRef>,
     pub defs: BTreeSet<DefId>,
 }
 

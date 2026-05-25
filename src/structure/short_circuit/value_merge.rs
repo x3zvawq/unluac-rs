@@ -260,7 +260,7 @@ impl<'a> ValueMergeDagBuilder<'a> {
                 .phi
                 .incoming
                 .iter()
-                .any(|inc| inc.pred == from_header && !inc.defs.is_empty());
+                .any(|inc| inc.pred == Some(from_header) && !inc.defs.is_empty());
             if !has_phi_defs {
                 return None;
             }
@@ -297,11 +297,20 @@ impl<'a> ValueMergeDagBuilder<'a> {
     }
 
     fn value_leaves_feed_phi(&self) -> bool {
+        if self
+            .phi
+            .incoming
+            .iter()
+            .any(|incoming| incoming.pred.is_none())
+        {
+            return false;
+        }
+
         let mut incoming_preds = self
             .phi
             .incoming
             .iter()
-            .map(|incoming| incoming.pred)
+            .filter_map(|incoming| incoming.pred)
             .collect::<Vec<_>>();
         incoming_preds.sort();
         incoming_preds.dedup();

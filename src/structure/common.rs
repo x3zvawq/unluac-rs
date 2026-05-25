@@ -145,7 +145,7 @@ pub enum LoopSourceBindings {
 /// 这样 HIR 才能直接消费 preheader/exit 的来源，不必再回头拆 `phi.incoming`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoopValueIncoming {
-    pub pred: BlockRef,
+    pub pred: Option<BlockRef>,
     pub defs: BTreeSet<DefId>,
 }
 
@@ -161,15 +161,25 @@ impl LoopValueArm {
     }
 
     pub fn contains_pred(&self, pred: BlockRef) -> bool {
-        self.incomings.iter().any(|incoming| incoming.pred == pred)
+        self.incomings
+            .iter()
+            .any(|incoming| incoming.pred == Some(pred))
     }
 
     pub fn incoming_for_pred(&self, pred: BlockRef) -> Option<&LoopValueIncoming> {
-        self.incomings.iter().find(|incoming| incoming.pred == pred)
+        self.incomings
+            .iter()
+            .find(|incoming| incoming.pred == Some(pred))
+    }
+
+    pub fn entry_incoming(&self) -> Option<&LoopValueIncoming> {
+        self.incomings
+            .iter()
+            .find(|incoming| incoming.pred.is_none())
     }
 
     pub fn preds(&self) -> impl Iterator<Item = BlockRef> + '_ {
-        self.incomings.iter().map(|incoming| incoming.pred)
+        self.incomings.iter().filter_map(|incoming| incoming.pred)
     }
 
     pub fn defs(&self) -> impl Iterator<Item = DefId> + '_ {
@@ -179,9 +189,11 @@ impl LoopValueArm {
     }
 
     pub fn all_preds_within(&self, allowed_blocks: &BTreeSet<BlockRef>) -> bool {
-        self.incomings
-            .iter()
-            .all(|incoming| allowed_blocks.contains(&incoming.pred))
+        self.incomings.iter().all(|incoming| {
+            incoming
+                .pred
+                .is_some_and(|pred| allowed_blocks.contains(&pred))
+        })
     }
 }
 

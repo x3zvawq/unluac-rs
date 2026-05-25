@@ -25,7 +25,8 @@ use crate::structure::{
 use crate::transformer::{InstrRef, LowInstr, Reg};
 
 use super::exprs::{
-    expr_for_dup_safe_fixed_def, expr_for_fixed_def, expr_for_reg_at_block_exit, expr_for_reg_use,
+    expr_for_dup_safe_fixed_def, expr_for_entry_reg, expr_for_fixed_def,
+    expr_for_reg_at_block_exit, expr_for_reg_use,
 };
 use super::short_circuit::{
     BranchShortCircuitPlan, build_branch_short_circuit_plan, build_conditional_reassign_plan,

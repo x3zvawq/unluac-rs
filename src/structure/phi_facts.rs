@@ -51,9 +51,12 @@ pub(super) fn branch_value_merge_from_phi(
     };
 
     for incoming in &phi.incoming {
-        if then_preds.contains(&incoming.pred) {
+        let Some(pred) = incoming.pred else {
+            return None;
+        };
+        if then_preds.contains(&pred) {
             extend_branch_value_arm(header, dataflow, &mut then_arm, incoming);
-        } else if else_preds.contains(&incoming.pred) {
+        } else if else_preds.contains(&pred) {
             extend_branch_value_arm(header, dataflow, &mut else_arm, incoming);
         } else {
             return None;
@@ -92,7 +95,10 @@ pub(super) fn loop_value_merge_from_phi(
     let mut outside_arm = LoopValueArm::default();
 
     for incoming in &phi.incoming {
-        let arm = if loop_blocks.contains(&incoming.pred) {
+        let arm = if incoming
+            .pred
+            .is_some_and(|pred| loop_blocks.contains(&pred))
+        {
             &mut inside_arm
         } else {
             &mut outside_arm
@@ -135,14 +141,13 @@ pub(super) fn short_circuit_phi_facts(
         value_incomings: phi
             .incoming
             .iter()
-            .map(|incoming| ShortCircuitValueIncoming {
-                pred: incoming.pred,
-                defs: incoming.defs.clone(),
-                latest_local_def: latest_local_incoming_def(
-                    dataflow,
-                    incoming.pred,
-                    &incoming.defs,
-                ),
+            .filter_map(|incoming| {
+                let pred = incoming.pred?;
+                Some(ShortCircuitValueIncoming {
+                    pred,
+                    defs: incoming.defs.clone(),
+                    latest_local_def: latest_local_incoming_def(dataflow, pred, &incoming.defs),
+                })
             })
             .collect(),
     }
@@ -185,7 +190,10 @@ fn extend_branch_value_arm(
     arm: &mut BranchValueMergeArm,
     incoming: &crate::cfg::PhiIncoming,
 ) {
-    arm.preds.insert(incoming.pred);
+    let Some(pred) = incoming.pred else {
+        return;
+    };
+    arm.preds.insert(pred);
     for &def in &incoming.defs {
         arm.defs.insert(def);
         if dataflow.def_block(def) != header {

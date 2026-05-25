@@ -37,7 +37,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             //     exit phi 也不引用它 → 安全跳过。
             //  2) nil 初始化的循环携带变量（如 `local last_positive`）：
             //     循环结束后仍需使用（exit phi 引用了该寄存器）→ 用 nil 作为初值。
-            let init = match self.loop_entry_expr(preheader?, value, target_overrides) {
+            let init = match self.loop_entry_expr(preheader, value, target_overrides) {
                 Some(init) => init,
                 None => {
                     if value.outside_arm.defs().count() == 0 {
@@ -131,17 +131,25 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
     fn loop_entry_expr(
         &self,
-        preheader: BlockRef,
+        preheader: Option<BlockRef>,
         value: &LoopValueMerge,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirExpr> {
-        let incoming = value.outside_arm.incoming_for_pred(preheader)?;
-        self.loop_incoming_expr(
-            preheader,
-            value.reg,
-            incoming.defs.iter().copied(),
-            target_overrides,
-        )
+        match preheader {
+            Some(preheader) => {
+                let incoming = value.outside_arm.incoming_for_pred(preheader)?;
+                self.loop_incoming_expr(
+                    preheader,
+                    value.reg,
+                    incoming.defs.iter().copied(),
+                    target_overrides,
+                )
+            }
+            None => value
+                .outside_arm
+                .entry_incoming()
+                .map(|_| self.loop_entry_initial_expr(value.reg)),
+        }
     }
 
     fn loop_exit_entry_expr_with_inside_blocks(
@@ -157,14 +165,21 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .incomings
             .iter()
             .chain(value.outside_arm.incomings.iter())
-            .filter(|incoming| !inside_blocks.contains(&incoming.pred))
+            .filter(|incoming| {
+                incoming
+                    .pred
+                    .is_none_or(|pred| !inside_blocks.contains(&pred))
+            })
         {
-            let expr = self.loop_incoming_expr(
-                incoming.pred,
-                value.reg,
-                incoming.defs.iter().copied(),
-                target_overrides,
-            )?;
+            let expr = match incoming.pred {
+                Some(pred) => self.loop_incoming_expr(
+                    pred,
+                    value.reg,
+                    incoming.defs.iter().copied(),
+                    target_overrides,
+                )?,
+                None => self.loop_entry_initial_expr(value.reg),
+            };
             if init_expr
                 .as_ref()
                 .is_some_and(|known_expr: &HirExpr| *known_expr != expr)
@@ -175,6 +190,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         init_expr
+    }
+
+    fn loop_entry_initial_expr(&self, reg: Reg) -> HirExpr {
+        if reg.index() < self.lowering.bindings.params.len() {
+            expr_for_entry_reg(self.lowering, reg)
+        } else if let Some(local) = self.lowering.bindings.entry_local_regs.get(&reg) {
+            HirExpr::LocalRef(*local)
+        } else {
+            HirExpr::Nil
+        }
     }
 
     fn loop_incoming_expr(

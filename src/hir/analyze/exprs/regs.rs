@@ -16,11 +16,11 @@ pub(crate) fn expr_for_reg_use(
         return HirExpr::LocalRef(local);
     }
     let Some(values) = lowering.dataflow.use_values_at(instr_ref).get(reg) else {
-        return entry_reg_expr(lowering, reg);
+        return expr_for_entry_reg(lowering, reg);
     };
 
     if values.is_empty() {
-        return entry_reg_expr(lowering, reg);
+        return expr_for_entry_reg(lowering, reg);
     }
 
     if values.len() == 1 {
@@ -146,15 +146,15 @@ pub(crate) fn expr_for_reg_at_block_entry(
     }
     let range = lowering.cfg.blocks[block.index()].instrs;
     if range.is_empty() {
-        return entry_reg_expr(lowering, reg);
+        return expr_for_entry_reg(lowering, reg);
     }
 
     let Some(values) = lowering.dataflow.reaching_values_at(range.start).get(reg) else {
-        return entry_reg_expr(lowering, reg);
+        return expr_for_entry_reg(lowering, reg);
     };
 
     if values.is_empty() {
-        return entry_reg_expr(lowering, reg);
+        return expr_for_entry_reg(lowering, reg);
     }
 
     if values.len() == 1 {
@@ -191,7 +191,7 @@ pub(crate) fn expr_for_reg_at_block_exit(
 
     let range = lowering.cfg.blocks[block.index()].instrs;
     let Some(last_instr_ref) = range.last() else {
-        return entry_reg_expr(lowering, reg);
+        return expr_for_entry_reg(lowering, reg);
     };
 
     let effect = &lowering.dataflow.instr_effects[last_instr_ref.index()];
@@ -224,7 +224,7 @@ pub(crate) fn expr_for_reg_at_block_exit(
     }
 
     if values.is_empty() {
-        return entry_reg_expr(lowering, reg);
+        return expr_for_entry_reg(lowering, reg);
     }
 
     if values.len() == 1 {
@@ -260,11 +260,11 @@ pub(crate) fn expr_for_reg_use_inline(
         return HirExpr::LocalRef(local);
     }
     let Some(values) = lowering.dataflow.use_values_at(instr_ref).get(reg) else {
-        return entry_reg_expr(lowering, reg);
+        return expr_for_entry_reg(lowering, reg);
     };
 
     if values.is_empty() {
-        return entry_reg_expr(lowering, reg);
+        return expr_for_entry_reg(lowering, reg);
     }
 
     if values.len() == 1 {
@@ -300,11 +300,11 @@ pub(crate) fn expr_for_reg_use_single_eval(
         return HirExpr::LocalRef(local);
     }
     let Some(values) = lowering.dataflow.use_values_at(instr_ref).get(reg) else {
-        return entry_reg_expr(lowering, reg);
+        return expr_for_entry_reg(lowering, reg);
     };
 
     if values.is_empty() {
-        return entry_reg_expr(lowering, reg);
+        return expr_for_entry_reg(lowering, reg);
     }
 
     if values.len() == 1 {
