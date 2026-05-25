@@ -1247,11 +1247,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             visiting: &mut BTreeSet<BlockRef>,
             memo: &mut BTreeMap<BlockRef, bool>,
         ) -> bool {
-            if block == continuation || lowerer.block_is_active_loop_escape(block) {
+            if block == continuation {
                 return true;
             }
             if block == stop || block == lowerer.lowering.cfg.exit_block {
                 return false;
+            }
+            if lowerer.block_is_active_loop_escape(block) {
+                return true;
             }
             if !lowerer.lowering.cfg.reachable_blocks.contains(&block) {
                 return false;

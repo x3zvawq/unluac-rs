@@ -51,9 +51,7 @@ pub(super) fn branch_value_merge_from_phi(
     };
 
     for incoming in &phi.incoming {
-        let Some(pred) = incoming.pred else {
-            return None;
-        };
+        let pred = incoming.pred?;
         if then_preds.contains(&pred) {
             extend_branch_value_arm(header, dataflow, &mut then_arm, incoming);
         } else if else_preds.contains(&pred) {
