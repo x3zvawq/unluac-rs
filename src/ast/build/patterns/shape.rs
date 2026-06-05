@@ -64,7 +64,18 @@ impl<'a> AstLowerer<'a> {
         let Some(HirStmt::CallStmt(call_stmt)) = stmts.get(index) else {
             return Ok(None);
         };
-        let Some(HirExpr::Call(arg_call)) = call_stmt.call.args.last() else {
+        let syntax_args = if call_stmt.call.method {
+            let Some(args) = call_stmt.call.args.get(1..) else {
+                return Ok(None);
+            };
+            args
+        } else {
+            call_stmt.call.args.as_slice()
+        };
+        let Some(final_arg) = syntax_args.last() else {
+            return Ok(None);
+        };
+        let HirExpr::Call(arg_call) = final_arg else {
             return Ok(None);
         };
         if arg_call.multiret {
@@ -72,19 +83,14 @@ impl<'a> AstLowerer<'a> {
         }
 
         // Lua/Luau 只有“语法上的最后一个调用参数”会展开多返回。
+        // method call 的 args[0] 是隐式 receiver，不是源码里可见的参数。
+        // receiver-only 链式调用如 `obj:getChild():open()` 没有 final arg 需要截断；
+        // 如果把 receiver 当成参数，lower_call 回收 `:open()` 后参数会消失。
         // HIR 里这里已经明确是单值调用；如果 AST 不把这个事实继续带下去，
         // 后面的 Generate 看到 `print(x, values())` 时就分不清这里是单值还是展开调用。
         let mut lowered_call = self.lower_call(proto_index, &call_stmt.call)?;
-        let lowered_last_arg = AstExpr::SingleValue(Box::new(
-            self.lower_expr(
-                proto_index,
-                call_stmt
-                    .call
-                    .args
-                    .last()
-                    .expect("checked above, final arg must exist"),
-            )?,
-        ));
+        let lowered_last_arg =
+            AstExpr::SingleValue(Box::new(self.lower_expr(proto_index, final_arg)?));
 
         match &mut lowered_call {
             AstCallKind::Call(call) => {
