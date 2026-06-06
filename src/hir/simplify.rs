@@ -117,6 +117,12 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         invalidates: &[LogicalExpr, DecisionShape],
     },
     PassDescriptor {
+        name: "branch-value-gotos",
+        phase: PassPhase::Normal,
+        depends_on: &[LabelGoto],
+        invalidates: &[LabelGoto, BlockStructure, TempChain],
+    },
+    PassDescriptor {
         name: "table-constructors",
         phase: PassPhase::Normal,
         depends_on: &[TablePattern, LocalBinding],
@@ -206,23 +212,24 @@ pub(super) fn simplify_hir(
                         0 => decision::simplify_decision_exprs_in_proto(proto),
                         1 => boolean_shells::remove_boolean_materialization_shells_in_proto(proto),
                         2 => logical_simplify::simplify_logical_exprs_in_proto(proto),
-                        3 => table_constructors::stabilize_table_constructors_in_proto(
+                        3 => branch_value_folding::fold_branch_value_goto_labels_in_proto(proto),
+                        4 => table_constructors::stabilize_table_constructors_in_proto(
                             proto, dialect,
                         ),
-                        4 => {
+                        5 => {
                             closure_self_capture::resolve_recursive_closure_self_captures_in_proto(
                                 proto,
                             )
                         }
-                        5 => {
+                        6 => {
                             temp_inline::inline_temps_in_proto_with_facts(proto, readability, facts)
                         }
-                        6 => locals::promote_temps_to_locals_in_proto_with_facts(proto, facts),
-                        7 => decision::eliminate_remaining_decisions_in_proto(proto),
-                        8 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
-                        9 => carried_locals::collapse_carried_local_handoffs_in_proto(proto),
-                        10 => dead_temps::remove_dead_temp_materializations_in_proto(proto),
-                        11 => dead_labels::remove_unused_labels_in_proto(proto),
+                        7 => locals::promote_temps_to_locals_in_proto_with_facts(proto, facts),
+                        8 => decision::eliminate_remaining_decisions_in_proto(proto),
+                        9 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
+                        10 => carried_locals::collapse_carried_local_handoffs_in_proto(proto),
+                        11 => dead_temps::remove_dead_temp_materializations_in_proto(proto),
+                        12 => dead_labels::remove_unused_labels_in_proto(proto),
                         _ => unreachable!("invalid HIR pass index: {index}"),
                     }
                 })
