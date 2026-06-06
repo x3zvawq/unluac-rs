@@ -491,7 +491,7 @@ fn collapse_adjacent_mechanical_alias_runs(
             {
                 continue;
             }
-            if !stmt_has_nested_binding_use(&rewritten_sink, candidate.binding()) {
+            if !stmt_has_mechanical_run_sink_binding_use(&rewritten_sink, candidate.binding()) {
                 continue;
             }
 
@@ -669,7 +669,21 @@ fn stmt_prefers_pure_lookup_run_collapse(stmt: &AstStmt) -> bool {
                 .targets
                 .iter()
                 .any(|target| !matches!(target, super::super::common::AstLValue::Name(_)))
+    ) || matches!(
+        stmt,
+        // generic-for 的迭代器位天然就是机械准备 run 的消费点：
+        // `local f = _G.ipairs; local t = obj.items; for k, v in f(t) do`
+        // 保留这些 lookup local 只会把迭代器表达式拆散。
+        AstStmt::GenericFor(_)
     )
+}
+
+fn stmt_has_mechanical_run_sink_binding_use(stmt: &AstStmt, binding: AstBindingRef) -> bool {
+    stmt_has_nested_binding_use(stmt, binding)
+        || stmt_has_access_base_binding_use(stmt, binding)
+        || stmt_has_call_callee_binding_use(stmt, binding)
+        || stmt_has_direct_call_arg_binding_use(stmt, binding)
+        || stmt_has_index_binding_use(stmt, binding)
 }
 
 fn stmt_prefers_dependent_lookup_run_collapse(stmt: &AstStmt) -> bool {

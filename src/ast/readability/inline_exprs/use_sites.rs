@@ -613,7 +613,9 @@ impl InlineSite {
                     }
                 },
                 InlinePolicy::MechanicalRun => match origin {
-                    super::super::super::common::AstLocalOrigin::DebugHinted => false,
+                    super::super::super::common::AstLocalOrigin::DebugHinted => {
+                        self.allows_mechanical_run_expr(replacement)
+                    }
                     super::super::super::common::AstLocalOrigin::Recovered => {
                         self.allows_mechanical_run_expr(replacement)
                     }
@@ -645,6 +647,9 @@ impl InlineSite {
             Self::Index => Some(options.index_inline_max_complexity),
             Self::CallArgNonFinal | Self::CallArgFinal => match policy {
                 InlinePolicy::LoopHeaderCall => Some(usize::MAX),
+                // MechanicalRun 已经证明这一组相邻 local 只服务于同一个消费点；
+                // 这里适度放宽到 return 阈值，让长 lookup 迭代器不会残留成两行脚手架。
+                InlinePolicy::MechanicalRun => Some(options.return_inline_max_complexity),
                 _ => Some(options.args_inline_max_complexity),
             },
             // 这里刻意复用 access-base 的阈值：
@@ -792,7 +797,10 @@ impl InlineSite {
             Self::AccessBase => {
                 is_access_base_inline_expr(replacement) || is_lookup_inline_expr(replacement)
             }
-            Self::ReturnValue | Self::CallArgNonFinal | Self::CallArgFinal => false,
+            Self::CallArgNonFinal | Self::CallArgFinal => {
+                is_mechanical_run_inline_expr(replacement)
+            }
+            Self::ReturnValue => false,
         }
     }
 }

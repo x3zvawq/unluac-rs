@@ -44,6 +44,7 @@ cargo unluac -i /path/to/chunk.out -D lua5.4 --dump-pass temp-inline --proto 2
 | `-t/--timing`   | 输出阶段耗时                     |
 
 > 其中，dump参数支持的阶段包括：`parse`, `transform`, `graph-facts`, `dataflow`, `structure-facts`, `hir`, `ast`, `readability`, `naming`, `generate`
+> `--dump-pass` 接受的参数见 `src/hir/simplify.rs` 以及 `src/ast/readability.rs` 的 `PASS_DESCRIPTORS` 定义
 
 ## 使用约定
 

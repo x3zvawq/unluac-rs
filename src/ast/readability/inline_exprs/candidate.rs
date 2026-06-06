@@ -108,7 +108,10 @@ impl InlineCandidate {
             Self::LocalAlias {
                 origin: AstLocalOrigin::DebugHinted,
                 ..
-            } => is_access_base_inline_expr(expr),
+            } => match policy {
+                InlinePolicy::MechanicalRun => is_mechanical_run_inline_expr(expr),
+                _ => is_access_base_inline_expr(expr),
+            },
             Self::LocalAlias {
                 origin: AstLocalOrigin::Recovered,
                 ..

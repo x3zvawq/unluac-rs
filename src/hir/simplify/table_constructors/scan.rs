@@ -66,8 +66,6 @@ pub(super) fn try_rebuild_constructor_region(
     let mut steps = Vec::new();
     let mut best_end = None;
     let mut committed_builder = ConstructorBuilder::from_constructor(constructor);
-    let mut committed_contains_set_list = false;
-    let mut pending_contains_set_list = false;
     let mut committed_retained_stmts: Vec<usize> = Vec::new();
     let mut pending_retained_stmts: Vec<usize> = Vec::new();
     let scan_stmts = &block.stmts[(seed_index + 1)..];
@@ -85,7 +83,6 @@ pub(super) fn try_rebuild_constructor_region(
                 block,
                 binding_index,
                 &remaining_uses,
-                committed_contains_set_list,
                 materialized_binding_counts,
                 dialect,
                 scratch,
@@ -97,10 +94,8 @@ pub(super) fn try_rebuild_constructor_region(
                 &mut pending_retained_stmts,
             ) {
                 best_end = Some(index);
-                committed_contains_set_list |= pending_contains_set_list;
                 committed_retained_stmts.append(&mut pending_retained_stmts);
                 steps.clear();
-                pending_contains_set_list = false;
             }
             continue;
         }
@@ -109,13 +104,11 @@ pub(super) fn try_rebuild_constructor_region(
         }
         if table_set_list_step(stmt, binding) {
             steps.push(RegionStep::SetList { stmt_index: index });
-            pending_contains_set_list = true;
             pending_retained_stmts.clear();
             let mut rebuild_context = RegionRebuildContext::new(
                 block,
                 binding_index,
                 &remaining_uses,
-                committed_contains_set_list,
                 materialized_binding_counts,
                 dialect,
                 scratch,
@@ -127,10 +120,8 @@ pub(super) fn try_rebuild_constructor_region(
                 &mut pending_retained_stmts,
             ) {
                 best_end = Some(index);
-                committed_contains_set_list = true;
                 committed_retained_stmts.append(&mut pending_retained_stmts);
                 steps.clear();
-                pending_contains_set_list = false;
             }
             continue;
         }

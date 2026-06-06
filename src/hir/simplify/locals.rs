@@ -4,6 +4,8 @@
 //! 当前 block 顶层先有一次初始化，后面这批 SSA temp 通过简单别名链继续流动，并且
 //! 在后续语句里继续被读/写。对这类值，继续保留 `t12 / t13 / ...` 只会让 HIR 充满
 //! 版本噪音，把它们折回同一个 `LocalId` 更接近源码，也能为后续 AST/Naming 铺路。
+//! 如果整条 temp 链只被一个后续语句消费，则仍把它视为寄存器级中转值，不在这里提升；
+//! 后续 temp-inline / table-constructor 会结合具体消费站点继续收敛。
 //!
 //! 另外，如果某个 local 已经被 closure capture 观察到，后续来自同一词法槽位的
 //! 新 def 不该再长成新的 local，而应继续写回原绑定。这里的“同一词法槽位”会把
@@ -442,11 +444,19 @@ fn collect_plans(
                 .filter(|future_index| !removable_aliases.contains(future_index))
                 .filter(|future_index| stmt_touches_any_temp(&block.stmts[*future_index], &group))
                 .collect::<Vec<_>>();
+            // 只有一次后续消费的全局别名或字符串常量，必须结合消费站点判定：
+            // 全局别名只有作为表字段安装的 base，字符串常量只有作为调用实参，
+            // 才更像寄存器级脚手架而不是源码 local。数字/布尔/nil 等也可能是
+            // 捕获 local 的重绑定值，仍按原规则保守提升。
             if touching_stmt_indices.len() == 1
-                && stmt_consumes_temps_only_in_control_head(
+                && (stmt_consumes_temps_only_in_control_head(
                     &block.stmts[touching_stmt_indices[0]],
                     &group,
-                )
+                ) || single_use_seed_can_stay_temp(
+                    stmt,
+                    root_temp,
+                    &block.stmts[touching_stmt_indices[0]],
+                ))
             {
                 sticky_slots = sticky_slots_for_stmt;
                 continue;
@@ -601,6 +611,82 @@ fn stmt_self_updates_temp(stmt: &HirStmt, temp: TempId) -> bool {
             .values
             .iter()
             .any(|value| expr_touches_any_temp(value, &BTreeSet::from([temp])))
+}
+
+fn single_use_seed_can_stay_temp(def_stmt: &HirStmt, temp: TempId, use_stmt: &HirStmt) -> bool {
+    let Some(value) = single_temp_assign_value(def_stmt, temp) else {
+        return false;
+    };
+    match value {
+        HirExpr::GlobalRef(_) => stmt_uses_temp_as_assign_table_base(use_stmt, temp),
+        HirExpr::String(_) => stmt_uses_temp_as_assign_call_arg(use_stmt, temp),
+        _ => false,
+    }
+}
+
+fn single_temp_assign_value(stmt: &HirStmt, temp: TempId) -> Option<&HirExpr> {
+    let HirStmt::Assign(assign) = stmt else {
+        return None;
+    };
+    let [HirLValue::Temp(target)] = assign.targets.as_slice() else {
+        return None;
+    };
+    let [value] = assign.values.as_slice() else {
+        return None;
+    };
+    if *target != temp {
+        return None;
+    }
+    Some(value)
+}
+
+fn stmt_uses_temp_as_assign_table_base(stmt: &HirStmt, temp: TempId) -> bool {
+    let HirStmt::Assign(assign) = stmt else {
+        return false;
+    };
+    assign
+        .targets
+        .iter()
+        .any(|target| lvalue_uses_temp_as_table_base(target, temp))
+}
+
+fn lvalue_uses_temp_as_table_base(lvalue: &HirLValue, temp: TempId) -> bool {
+    let HirLValue::TableAccess(access) = lvalue else {
+        return false;
+    };
+    expr_is_temp_ref(&access.base, temp) || expr_uses_temp_as_table_access_base(&access.base, temp)
+}
+
+fn stmt_uses_temp_as_assign_call_arg(stmt: &HirStmt, temp: TempId) -> bool {
+    let HirStmt::Assign(assign) = stmt else {
+        return false;
+    };
+    assign
+        .values
+        .iter()
+        .any(|value| expr_uses_temp_as_call_arg(value, temp))
+}
+
+fn expr_uses_temp_as_call_arg(expr: &HirExpr, temp: TempId) -> bool {
+    match expr {
+        HirExpr::Call(call) => call.args.iter().any(|arg| expr_is_temp_ref(arg, temp)),
+        HirExpr::TableAccess(access) => {
+            expr_uses_temp_as_call_arg(&access.base, temp)
+                || expr_uses_temp_as_call_arg(&access.key, temp)
+        }
+        _ => false,
+    }
+}
+
+fn expr_uses_temp_as_table_access_base(expr: &HirExpr, temp: TempId) -> bool {
+    let HirExpr::TableAccess(access) = expr else {
+        return false;
+    };
+    expr_is_temp_ref(&access.base, temp) || expr_uses_temp_as_table_access_base(&access.base, temp)
+}
+
+fn expr_is_temp_ref(expr: &HirExpr, temp: TempId) -> bool {
+    matches!(expr, HirExpr::TempRef(other) if *other == temp)
 }
 
 fn if_merge_candidate_temps(

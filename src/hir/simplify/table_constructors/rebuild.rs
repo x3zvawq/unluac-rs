@@ -56,7 +56,6 @@ pub(super) struct RegionRebuildContext<'a> {
     block: &'a HirBlock,
     binding_index: &'a BindingIndex,
     remaining_uses: &'a BindingUseSummary,
-    allow_closure_records_prefix: bool,
     materialized_binding_counts: &'a [u32],
     dialect: DecompileDialect,
     scratch: &'a mut RebuildScratch,
@@ -67,7 +66,6 @@ impl<'a> RegionRebuildContext<'a> {
         block: &'a HirBlock,
         binding_index: &'a BindingIndex,
         remaining_uses: &'a BindingUseSummary,
-        allow_closure_records_prefix: bool,
         materialized_binding_counts: &'a [u32],
         dialect: DecompileDialect,
         scratch: &'a mut RebuildScratch,
@@ -76,18 +74,10 @@ impl<'a> RegionRebuildContext<'a> {
             block,
             binding_index,
             remaining_uses,
-            allow_closure_records_prefix,
             materialized_binding_counts,
             dialect,
             scratch,
         }
-    }
-
-    fn region_contains_set_list(&self, steps: &[RegionStep]) -> bool {
-        self.allow_closure_records_prefix
-            || steps
-                .iter()
-                .any(|step| matches!(step, RegionStep::SetList { .. }))
     }
 }
 
@@ -263,7 +253,6 @@ pub(super) fn try_extend_constructor_from_steps(
 ) -> bool {
     let checkpoint = builder.checkpoint(context.scratch);
     let retained_checkpoint = retained_producer_stmts.len();
-    let region_contains_set_list = context.region_contains_set_list(steps);
     let mut segment_start = 0;
 
     for (index, step) in steps.iter().enumerate() {
@@ -272,7 +261,6 @@ pub(super) fn try_extend_constructor_from_steps(
                 builder,
                 &steps[segment_start..index],
                 Some(*stmt_index),
-                region_contains_set_list,
                 context,
                 retained_producer_stmts,
             )
@@ -290,7 +278,6 @@ pub(super) fn try_extend_constructor_from_steps(
         builder,
         &steps[segment_start..],
         None,
-        region_contains_set_list,
         context,
         retained_producer_stmts,
     )
@@ -309,7 +296,6 @@ fn flush_constructor_segment(
     builder: &mut ConstructorBuilder,
     segment: &[RegionStep],
     set_list_stmt_index: Option<usize>,
-    allow_closure_records: bool,
     context: &mut RegionRebuildContext<'_>,
     retained_producer_stmts: &mut Vec<usize>,
 ) -> Option<()> {
@@ -351,9 +337,7 @@ fn flush_constructor_segment(
                 *stmt_index,
                 context.scratch,
             )?,
-            RegionStep::Record { stmt_index } => {
-                prepare_record_step(*stmt_index, allow_closure_records, context)?
-            }
+            RegionStep::Record { stmt_index } => prepare_record_step(*stmt_index, context)?,
             RegionStep::SetList { .. } => {
                 unreachable!("set-list should terminate constructor segment")
             }
@@ -591,11 +575,7 @@ fn register_producer_group(
     Some(())
 }
 
-fn prepare_record_step(
-    stmt_index: usize,
-    allow_closure_records: bool,
-    context: &mut RegionRebuildContext<'_>,
-) -> Option<()> {
+fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>) -> Option<()> {
     let (key, value) = record_field_parts(context.block, stmt_index, context.dialect)?;
     // 内联 record key 表达式：如果 key 是一个引用了 pending producer 的变量引用
     // （例如 `local k = "name"; t[k] = v`），把 producer 值折叠进 key 并消费绑定。
@@ -638,10 +618,7 @@ fn prepare_record_step(
         );
         inline_constructor_value(&mut inline_context, value)?
     };
-    if matches!(value, HirExpr::Closure(_))
-        && (recursive_closure_slot
-            || (!allow_closure_records && matches!(key, HirTableKey::Name(_))))
-    {
+    if matches!(value, HirExpr::Closure(_)) && recursive_closure_slot {
         return None;
     }
     if expr_captures_orphaned_binding(
