@@ -5,6 +5,11 @@
 //! 例如：前缀语句和循环体都提到同一个 temp 时，这里会把它列入保护集。
 
 use super::*;
+use crate::hir::traverse::{
+    traverse_hir_call_children, traverse_hir_decision_children, traverse_hir_expr_children,
+    traverse_hir_lvalue_children, traverse_hir_stmt_children,
+    traverse_hir_table_constructor_children,
+};
 
 pub(super) fn protected_temps_for_nested_stmt(
     stmts: &[HirStmt],
@@ -15,14 +20,20 @@ pub(super) fn protected_temps_for_nested_stmt(
     let Some(stmt) = stmts.get(stmt_index) else {
         return protected;
     };
-    if !matches!(
-        stmt,
-        HirStmt::While(_) | HirStmt::Repeat(_) | HirStmt::NumericFor(_) | HirStmt::GenericFor(_)
-    ) {
+    if !stmt_has_nested_inline_scope(stmt) {
         return protected;
     }
 
     let nested_temps = mentioned_temp_set_for_stmt(stmt);
+    if !stmt_needs_full_nested_scope_protection(stmt) {
+        // if/block 本身不会改变求值次数；这里不套用 loop 的完整前后缀保护，
+        // 只保护会成为子 proto upvalue provenance 的 closure capture。否则普通
+        // boolean 分支里的临时值会被过度保留，影响既有结构恢复和运行等价性。
+        let suffix_capture_temps =
+            mentioned_temp_set_for_closure_captures_in_stmt_slice(&stmts[stmt_index + 1..]);
+        protected.extend(suffix_capture_temps.intersection(&nested_temps).copied());
+        return protected;
+    }
 
     // 前缀中已引用的 temp 如果也出现在嵌套体中，不能在嵌套体内被内联掉，
     // 否则会把外层定义的值的求值点移进循环。
@@ -38,10 +49,38 @@ pub(super) fn protected_temps_for_nested_stmt(
     protected
 }
 
+fn stmt_has_nested_inline_scope(stmt: &HirStmt) -> bool {
+    matches!(
+        stmt,
+        HirStmt::If(_)
+            | HirStmt::While(_)
+            | HirStmt::Repeat(_)
+            | HirStmt::NumericFor(_)
+            | HirStmt::GenericFor(_)
+            | HirStmt::Block(_)
+            | HirStmt::Unstructured(_)
+    )
+}
+
+fn stmt_needs_full_nested_scope_protection(stmt: &HirStmt) -> bool {
+    matches!(
+        stmt,
+        HirStmt::While(_) | HirStmt::Repeat(_) | HirStmt::NumericFor(_) | HirStmt::GenericFor(_)
+    )
+}
+
 fn mentioned_temp_set_for_stmt_slice(stmts: &[HirStmt]) -> BTreeSet<TempId> {
     let mut temps = BTreeSet::new();
     for stmt in stmts {
         collect_stmt_mentioned_temps(stmt, &mut temps);
+    }
+    temps
+}
+
+fn mentioned_temp_set_for_closure_captures_in_stmt_slice(stmts: &[HirStmt]) -> BTreeSet<TempId> {
+    let mut temps = BTreeSet::new();
+    for stmt in stmts {
+        collect_stmt_closure_capture_temps(stmt, &mut temps);
     }
     temps
 }
@@ -131,11 +170,46 @@ fn collect_block_mentioned_temps(block: &HirBlock, temps: &mut BTreeSet<TempId>)
     }
 }
 
+fn collect_stmt_closure_capture_temps(stmt: &HirStmt, temps: &mut BTreeSet<TempId>) {
+    traverse_hir_stmt_children!(
+        stmt,
+        iter = iter,
+        opt = as_ref,
+        borrow = [&],
+        expr(expr) => { collect_expr_closure_capture_temps(expr, temps); },
+        lvalue(lvalue) => {
+            traverse_hir_lvalue_children!(
+                lvalue,
+                borrow = [&],
+                expr(expr) => { collect_expr_closure_capture_temps(expr, temps); }
+            );
+        },
+        block(block) => { collect_block_closure_capture_temps(block, temps); },
+        call(call) => { collect_call_closure_capture_temps(call, temps); },
+        condition(cond) => { collect_expr_closure_capture_temps(cond, temps); }
+    );
+}
+
+fn collect_block_closure_capture_temps(block: &HirBlock, temps: &mut BTreeSet<TempId>) {
+    for stmt in &block.stmts {
+        collect_stmt_closure_capture_temps(stmt, temps);
+    }
+}
+
 fn collect_call_mentioned_temps(call: &HirCallExpr, temps: &mut BTreeSet<TempId>) {
     collect_expr_mentioned_temps(&call.callee, temps);
     for arg in &call.args {
         collect_expr_mentioned_temps(arg, temps);
     }
+}
+
+fn collect_call_closure_capture_temps(call: &HirCallExpr, temps: &mut BTreeSet<TempId>) {
+    traverse_hir_call_children!(
+        call,
+        iter = iter,
+        borrow = [&],
+        expr(expr) => { collect_expr_closure_capture_temps(expr, temps); }
+    );
 }
 
 fn collect_lvalue_mentioned_temps(lvalue: &HirLValue, temps: &mut BTreeSet<TempId>) {
@@ -213,6 +287,40 @@ pub(super) fn collect_expr_mentioned_temps(expr: &HirExpr, temps: &mut BTreeSet<
         | HirExpr::VarArg
         | HirExpr::Unresolved(_) => {}
     }
+}
+
+fn collect_expr_closure_capture_temps(expr: &HirExpr, temps: &mut BTreeSet<TempId>) {
+    if let HirExpr::Closure(closure) = expr {
+        for capture in &closure.captures {
+            collect_expr_mentioned_temps(&capture.value, temps);
+        }
+    }
+
+    traverse_hir_expr_children!(
+        expr,
+        iter = iter,
+        borrow = [&],
+        expr(child) => { collect_expr_closure_capture_temps(child, temps); },
+        call(call) => { collect_call_closure_capture_temps(call, temps); },
+        decision(decision) => {
+            traverse_hir_decision_children!(
+                decision,
+                iter = iter,
+                borrow = [&],
+                expr(child) => { collect_expr_closure_capture_temps(child, temps); },
+                condition(cond) => { collect_expr_closure_capture_temps(cond, temps); }
+            );
+        },
+        table_constructor(table) => {
+            traverse_hir_table_constructor_children!(
+                table,
+                iter = iter,
+                opt = as_ref,
+                borrow = [&],
+                expr(child) => { collect_expr_closure_capture_temps(child, temps); }
+            );
+        }
+    );
 }
 
 fn collect_decision_target_mentioned_temps(
