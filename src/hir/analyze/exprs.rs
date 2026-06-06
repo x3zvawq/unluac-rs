@@ -157,7 +157,9 @@ pub(crate) fn expr_for_entry_reg(lowering: &ProtoLowering<'_>, reg: Reg) -> HirE
     } else if let Some(local) = lowering.bindings.entry_local_regs.get(&reg) {
         HirExpr::LocalRef(*local)
     } else {
-        unresolved_expr(format!("entry-reg r{}", reg.index()))
+        // Lua 调用帧里的寄存器槽默认是 nil。数据流没有到达定义、bindings 也没有
+        // 入口 local 身份时，这不是“无法表达”的值，而是源码层面的 nil。
+        HirExpr::Nil
     }
 }
 

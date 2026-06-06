@@ -223,7 +223,19 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         PUC_LUA_51,
     ),
     LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_16_numeric_for_terminal_body.lua",
+        PUC_LUA_51,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_17_generic_for_break_pad.lua",
+        PUC_LUA_51,
+    ),
+    LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_18_short_circuit_loop_shared_tail.lua",
+        PUC_LUA_51,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_19_generic_for_break_tail_binding.lua",
         PUC_LUA_51,
     ),
     LuaCaseMatrixEntry::new(

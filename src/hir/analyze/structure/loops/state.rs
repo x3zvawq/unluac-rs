@@ -95,11 +95,21 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 continue;
             }
 
-            let Some(init) = self.loop_exit_entry_expr_with_inside_blocks(
-                value,
-                &inside_exit_blocks,
-                target_overrides,
-            ) else {
+            let Some(init) = self
+                .loop_exit_entry_expr_with_inside_blocks(
+                    value,
+                    &inside_exit_blocks,
+                    target_overrides,
+                )
+                .or_else(|| {
+                    self.loop_exit_state_preheader_init(
+                        preheader,
+                        value,
+                        &inside_exit_blocks,
+                        target_overrides,
+                    )
+                })
+            else {
                 // exit-only merge 只是“循环结束后也许还能继续复用这条 state”的附加收益，
                 // 不是 numeric-for / generic-for 能否结构化的必要前提。
                 // 如果循环外 incoming 本身已经是多路语义合流，强行要求这里解出唯一初值，
@@ -127,6 +137,29 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         Some(plan)
+    }
+
+    fn loop_exit_state_preheader_init(
+        &self,
+        preheader: Option<BlockRef>,
+        value: &LoopValueMerge,
+        inside_exit_blocks: &BTreeSet<BlockRef>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<HirExpr> {
+        if !loop_value_incoming_all_within_blocks(value, inside_exit_blocks) {
+            return None;
+        }
+        let preheader = preheader?;
+
+        // 有些 generic/numeric for 会用“循环前默认值 + break pad 写入”的方式
+        // 表达循环查找结果：`found = false; for ... do found = true; break end`。
+        // exit phi 的 incoming 全部来自 loop body 或 break pad 后，已经没有一个
+        // CFG predecessor 能代表“循环外初值”，但源码初值仍然在 preheader 出口。
+        // 这时把 preheader 出口值作为 loop state 初值，才能让 break pad 写回同一
+        // 个状态槽位，而不是在 post-loop 条件里留下孤立 phi temp。
+        let mut expr = expr_for_reg_at_block_exit(self.lowering, preheader, value.reg);
+        rewrite_expr_temps(&mut expr, &temp_expr_overrides(target_overrides));
+        Some(expr)
     }
 
     fn loop_entry_expr(
@@ -637,6 +670,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             if block_is_terminal_exit(self.lowering, exit) {
                 continue;
             }
+            if self.loop_exit_region_is_terminal(candidate, exit, post_loop, downstream_post_loop) {
+                continue;
+            }
             // 有些 loop 的“直接退出块”只是一个线性 pad，真正的 post-loop continuation
             // 在这个 pad 后面。对这种形状，pad 的下游不应该再被当成额外的 break exit，
             // 否则 repeat/for 会被误判成“多出口 break loop”，整片结构都会回退。
@@ -709,6 +745,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             if block_is_terminal_exit(self.lowering, exit) {
                 continue;
             }
+            if self.loop_exit_region_is_terminal(candidate, exit, post_loop, downstream_post_loop) {
+                continue;
+            }
             if downstream_post_loop == Some(exit) {
                 continue;
             }
@@ -722,6 +761,75 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             inside_blocks.insert(exit);
         }
         Some(inside_blocks)
+    }
+
+    fn loop_exit_region_is_terminal(
+        &self,
+        candidate: &LoopCandidate,
+        exit: BlockRef,
+        post_loop: BlockRef,
+        downstream_post_loop: Option<BlockRef>,
+    ) -> bool {
+        fn visit(
+            lowerer: &StructuredBodyLowerer<'_, '_>,
+            candidate: &LoopCandidate,
+            block: BlockRef,
+            post_loop: BlockRef,
+            downstream_post_loop: Option<BlockRef>,
+            visiting: &mut BTreeSet<BlockRef>,
+            memo: &mut BTreeMap<BlockRef, bool>,
+        ) -> bool {
+            if block == post_loop
+                || Some(block) == downstream_post_loop
+                || candidate.blocks.contains(&block)
+                || !lowerer.lowering.cfg.reachable_blocks.contains(&block)
+            {
+                return false;
+            }
+            if block == lowerer.lowering.cfg.exit_block
+                || block_is_terminal_exit(lowerer.lowering, block)
+            {
+                return true;
+            }
+            if let Some(result) = memo.get(&block).copied() {
+                return result;
+            }
+            if !visiting.insert(block) {
+                return false;
+            }
+
+            let result = lowerer.lowering.cfg.succs[block.index()]
+                .iter()
+                .all(|edge_ref| {
+                    let successor = lowerer.lowering.cfg.edges[edge_ref.index()].to;
+                    visit(
+                        lowerer,
+                        candidate,
+                        successor,
+                        post_loop,
+                        downstream_post_loop,
+                        visiting,
+                        memo,
+                    )
+                });
+            visiting.remove(&block);
+            memo.insert(block, result);
+            result
+        }
+
+        // numeric/generic for 的 body 可能只有“命中后 return”的路径；CFG 上这会表现为
+        // loop header 的一个非 post-loop exit，但它不是 break pad，不需要合成 break。
+        // 只有当 exit region 的所有路径都在回到 post-loop 或 loop blocks 前终结时，
+        // 才把它归为 terminal body exit。
+        visit(
+            self,
+            candidate,
+            exit,
+            post_loop,
+            downstream_post_loop,
+            &mut BTreeSet::new(),
+            &mut BTreeMap::new(),
+        )
     }
 
     pub(super) fn repeat_backedge_pad(
@@ -770,19 +878,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // 上的 phi temp 不同，因此仅靠 combined_target_overrides 无法将它们重定向到
         // 循环 state 变量。这里额外扫描 pad 的 def，把匹配 state 寄存器的 def temp
         // 也加入 override map，使 apply_loop_rewrites 能正确替换。
-        let mut combined = target_overrides.clone();
-        if !states.is_empty() {
-            let range = self.lowering.cfg.blocks[block.index()].instrs;
-            for instr_index in range.start.index()..range.end() {
-                for def_id in &self.lowering.dataflow.instr_defs[instr_index] {
-                    let def = &self.lowering.dataflow.defs[def_id.index()];
-                    if let Some(state) = states.iter().find(|s| s.reg == def.reg) {
-                        let temp = self.lowering.bindings.fixed_temps[def_id.index()];
-                        combined.insert(temp, state.target.clone());
-                    }
-                }
-            }
-        }
+        let combined = self.break_pad_target_overrides(block, target_overrides, states);
         if matches!(
             self.block_terminator(block),
             Some((_instr_ref, LowInstr::Branch(_)))
@@ -792,6 +888,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 post_loop,
                 downstream_post_loop,
                 &combined,
+                states,
             );
         }
 
@@ -821,12 +918,38 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         })
     }
 
+    fn break_pad_target_overrides(
+        &self,
+        block: BlockRef,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+        states: &[LoopStateSlot],
+    ) -> BTreeMap<TempId, HirLValue> {
+        let mut combined = target_overrides.clone();
+        if states.is_empty() {
+            return combined;
+        }
+
+        let range = self.lowering.cfg.blocks[block.index()].instrs;
+        for instr_index in range.start.index()..range.end() {
+            for def_id in &self.lowering.dataflow.instr_defs[instr_index] {
+                let def = &self.lowering.dataflow.defs[def_id.index()];
+                if let Some(state) = states.iter().find(|state| state.reg == def.reg) {
+                    let temp = self.lowering.bindings.fixed_temps[def_id.index()];
+                    combined.insert(temp, state.target.clone());
+                }
+            }
+        }
+
+        combined
+    }
+
     fn lower_branch_break_exit_pad(
         &self,
         block: BlockRef,
         post_loop: BlockRef,
         downstream_post_loop: Option<BlockRef>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
+        states: &[LoopStateSlot],
     ) -> Option<BreakExitBlock> {
         // break pad 不一定只是单层 if；`elseif x then ... if a or b then ... end; break`
         // 这种形状会把短路 header 放在 break 前的 cleanup 里。这里复用 branch lowering
@@ -836,9 +959,26 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .try_build_short_circuit_plan(block, Some(post_loop))?
             .or_else(|| self.build_plain_branch_plan(block))?;
         let merge = plan.merge?;
-        if merge != post_loop && Some(merge) != downstream_post_loop {
-            return None;
-        }
+        let tail = if merge == post_loop || Some(merge) == downstream_post_loop {
+            BreakExitBlock {
+                block: HirBlock {
+                    stmts: vec![HirStmt::Break],
+                },
+                blocks: BTreeSet::new(),
+            }
+        } else {
+            // break pad 可能先做一个局部 if-cleanup，再落到一段线性 tail
+            // （例如 `if registered then unregister end; table.remove(...); break`）。
+            // 这段 tail 仍然只允许通过已有的 break-pad 校验通往 post-loop，
+            // 不能把任意 branch merge 都吞进循环出口。
+            self.lower_break_exit_pad(
+                merge,
+                post_loop,
+                downstream_post_loop,
+                target_overrides,
+                states,
+            )?
+        };
 
         let mut blocks = plan
             .consumed_headers
@@ -857,6 +997,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             post_loop,
             downstream_post_loop,
             target_overrides,
+            states,
         )?;
         blocks.extend(then_pad.blocks.iter().copied());
         let else_pad = match plan.else_entry {
@@ -867,6 +1008,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     post_loop,
                     downstream_post_loop,
                     target_overrides,
+                    states,
                 )?;
                 blocks.extend(pad.blocks.iter().copied());
                 Some(pad.block)
@@ -875,7 +1017,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         };
 
         stmts.push(branch_stmt(cond, then_pad.block, else_pad));
-        stmts.push(HirStmt::Break);
+        stmts.extend(tail.block.stmts);
+        blocks.extend(tail.blocks);
         Some(BreakExitBlock {
             block: HirBlock { stmts },
             blocks,
@@ -889,6 +1032,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         post_loop: BlockRef,
         downstream_post_loop: Option<BlockRef>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
+        states: &[LoopStateSlot],
     ) -> Option<BreakExitBlock> {
         if block == merge || block == post_loop || Some(block) == downstream_post_loop {
             return Some(BreakExitBlock {
@@ -897,7 +1041,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             });
         }
 
-        let stmts = self.lower_block_prefix(block, false, target_overrides)?;
+        let target_overrides = self.break_pad_target_overrides(block, target_overrides, states);
+        let stmts = self.lower_block_prefix(block, false, &target_overrides)?;
         let target = match self.block_terminator(block) {
             Some((_instr_ref, LowInstr::Jump(jump))) => {
                 self.lowering.cfg.instr_to_block[jump.target.index()]

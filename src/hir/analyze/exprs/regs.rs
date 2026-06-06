@@ -61,13 +61,15 @@ pub(crate) fn expr_for_closure_capture(
             let expr = expr_for_reg_use(lowering, block, instr_ref, reg);
             // 互递归前向声明模式：Lua upvalue 是引用变量槽而非快照，closure 实际执行
             // 时看到的是寄存器的最终值。需要 forward_def 的场景有两种：
-            //  1. Unresolved：寄存器在捕获点没有到达定义（entry-reg），说明没有显式
-            //     初始化（如 `local a, b; a = function() b()... end`）。
+            //  1. 入口空值：寄存器在捕获点没有到达定义（entry-reg），说明没有显式
+            //     初始化；普通读取会把它解释成 nil，但 closure 捕获的是槽位，需要继续
+            //     向后找同一 block 里的最终定义（如 `local a, b; a = function() b()... end`）。
             //  2. LOADNIL 前缀：三路互递归 `local a, b, c` 编译时先 LOADNIL r2..r4
             //     再依次 CLOSURE，此时 SSA 能看到 LOADNIL 的定义（TempRef），但该
             //     定义只是占位 nil。真正的值是后续 CLOSURE 写入的同一寄存器。
+            let entry_empty = reg_use_is_entry_empty(lowering, instr_ref, reg);
             let should_forward = match &expr {
-                HirExpr::Unresolved(_) => true,
+                _ if entry_empty => true,
                 HirExpr::TempRef(_) => is_loadnil_def(lowering, instr_ref, reg),
                 _ => false,
             };
@@ -82,6 +84,16 @@ pub(crate) fn expr_for_closure_capture(
             HirExpr::UpvalueRef(UpvalueId(upvalue.index()))
         }
     }
+}
+
+fn reg_use_is_entry_empty(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, reg: Reg) -> bool {
+    lowering
+        .dataflow
+        .use_values_at(instr_ref)
+        .get(reg)
+        .is_none_or(|values| values.is_empty())
+        && reg.index() >= lowering.bindings.params.len()
+        && !lowering.bindings.entry_local_regs.contains_key(&reg)
 }
 
 /// 检查某条指令读取的寄存器的 SSA 到达定义是否来自 LOADNIL 指令。

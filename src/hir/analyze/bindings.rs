@@ -9,7 +9,7 @@
 //! - `for k, v in iter() do ... end` 对应的 `LoopSourceBindings::Generic(rA..)` 会直接产出
 //!   一组 header locals，而不是再从 `GenericForLoop` terminator 回扫一次
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cfg::{BlockRef, Cfg, DataflowFacts, GraphFacts, OpenDef};
 use crate::hir::common::{LocalId, ParamId, TempId, UpvalueId};
@@ -245,9 +245,11 @@ fn debug_local_is_active_at_pc(local: &RawLocalVar, pc: u32) -> bool {
 /// 提前离开循环的块。但在 Lua 语义下，这些提前退出的块仍处于 for-binding
 /// 的词法作用域中（如 `for i = 1, n do if cond then return i end end`）。
 ///
-/// 策略：在 candidate.blocks 基础上，追加被 header 严格支配的 **提前退出** 块。
+/// 策略：在 candidate.blocks 基础上，追加被 header 严格支配的 **提前退出** 区域。
 /// 只有不是通过 LoopExit 边到达的出口块才被视为提前退出——LoopExit 边的
-/// 目标是循环正常结束后的后继块，for-binding 在那里已失效。
+/// 目标是循环正常结束后的后继块，for-binding 在那里已失效。提前退出区域可以
+/// 含有 cleanup tail，例如 `if cond then cleanup end; table.remove(list, i); break`，
+/// tail 里的 `i` 仍属于 for-binding 的词法作用域。
 ///
 /// 示例：
 /// - `for i = 1, n do if cond then return i end end`
@@ -255,15 +257,26 @@ fn debug_local_is_active_at_pc(local: &RawLocalVar, pc: u32) -> bool {
 /// - `for k, v in pairs(t) do ... end; print(k)`
 ///   print 所在块通过 LoopExit 从 body 到达 → 不纳入，for-binding 不可见
 fn loop_binding_scope(
-    body_blocks: &std::collections::BTreeSet<BlockRef>,
-    exits: &std::collections::BTreeSet<BlockRef>,
+    body_blocks: &BTreeSet<BlockRef>,
+    exits: &BTreeSet<BlockRef>,
     header: BlockRef,
     cfg: &Cfg,
     graph_facts: &GraphFacts,
-) -> std::collections::BTreeSet<BlockRef> {
+) -> BTreeSet<BlockRef> {
     use crate::cfg::EdgeKind;
 
     let mut scope = body_blocks.clone();
+    let normal_exits = exits
+        .iter()
+        .copied()
+        .filter(|exit| {
+            cfg.preds[exit.index()].iter().any(|edge_ref| {
+                let edge = &cfg.edges[edge_ref.index()];
+                body_blocks.contains(&edge.from) && edge.kind == EdgeKind::LoopExit
+            })
+        })
+        .collect::<BTreeSet<_>>();
+
     for &exit in exits {
         if exit == header || !graph_facts.dominator_tree.dominates(header, exit) {
             continue;
@@ -275,8 +288,44 @@ fn loop_binding_scope(
             body_blocks.contains(&edge.from) && edge.kind == EdgeKind::LoopExit
         });
         if !reached_via_loop_exit {
-            scope.insert(exit);
+            scope.extend(loop_binding_early_exit_scope(
+                exit,
+                header,
+                &normal_exits,
+                cfg,
+                graph_facts,
+            ));
         }
     }
+    scope
+}
+
+fn loop_binding_early_exit_scope(
+    exit: BlockRef,
+    header: BlockRef,
+    normal_exits: &BTreeSet<BlockRef>,
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+) -> BTreeSet<BlockRef> {
+    let mut scope = BTreeSet::new();
+    let mut stack = vec![exit];
+
+    while let Some(block) = stack.pop() {
+        if block == cfg.exit_block
+            || normal_exits.contains(&block)
+            || !graph_facts.dominator_tree.dominates(header, block)
+            || !scope.insert(block)
+        {
+            continue;
+        }
+
+        for edge_ref in &cfg.succs[block.index()] {
+            let successor = cfg.edges[edge_ref.index()].to;
+            if !normal_exits.contains(&successor) {
+                stack.push(successor);
+            }
+        }
+    }
+
     scope
 }
