@@ -129,6 +129,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             self.restore_state_checkpoint(checkpoint, stmts);
         }
 
+        if let Some(shared) = self.terminal_loop_continuation_branch(&plan, stop) {
+            let checkpoint = self.checkpoint_state(stmts.len());
+            if let Some(next) =
+                self.lower_shared_continuation_branch(shared, &plan, stmts, target_overrides)
+            {
+                return Some(next);
+            }
+            self.restore_state_checkpoint(checkpoint, stmts);
+        }
+
         for header in &plan.consumed_headers {
             self.visited.insert(*header);
         }
@@ -176,10 +186,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             && effective_else_entry == plan.merge
             && branch_stop != plan.merge
             && Some(plan.then_entry) != branch_stop
-            && plan
-                .merge
-                .is_some_and(|merge| !self.block_is_terminal_exit(merge))
-        {
+            && plan.merge.is_some_and(|merge| {
+                !self.block_is_terminal_exit(merge)
+                    && !branch_stop.is_some_and(|stop| {
+                        self.can_reach_avoiding_block(plan.then_entry, stop, merge)
+                    })
+            }) {
             plan.merge
         } else {
             self.branch_arm_stop(
@@ -373,6 +385,70 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             gated_entry: plan.then_entry,
             shared_entry: else_entry,
             negate_cond: false,
+        })
+    }
+
+    fn terminal_loop_continuation_branch(
+        &self,
+        plan: &StructuredBranchPlan,
+        stop: Option<BlockRef>,
+    ) -> Option<SharedContinuationBranch> {
+        if stop.is_some()
+            || plan.merge.is_some()
+            || plan.consumed_headers.len() != 1
+            || plan
+                .consumed_headers
+                .iter()
+                .any(|header| self.branch_value_merges_by_header.contains_key(header))
+        {
+            return None;
+        }
+        let else_entry = plan.else_entry?;
+        if self.block_has_unstructured_continue_requirement(plan.then_entry)
+            || self.block_has_unstructured_continue_requirement(else_entry)
+        {
+            return None;
+        }
+
+        if self.entry_is_terminal_generic_for_guard(else_entry, plan.then_entry) {
+            return Some(SharedContinuationBranch {
+                gated_entry: else_entry,
+                shared_entry: plan.then_entry,
+                negate_cond: true,
+            });
+        }
+        self.entry_is_terminal_generic_for_guard(plan.then_entry, else_entry)
+            .then_some(SharedContinuationBranch {
+                gated_entry: plan.then_entry,
+                shared_entry: else_entry,
+                negate_cond: false,
+            })
+    }
+
+    fn entry_is_terminal_generic_for_guard(&self, entry: BlockRef, shared: BlockRef) -> bool {
+        if self.lowering.cfg.can_reach(entry, shared) {
+            return false;
+        }
+        let Some(header) = self.lowering.cfg.unique_reachable_successor(entry) else {
+            return false;
+        };
+        let Some(candidate) = self.loop_by_header.get(&header).copied() else {
+            return false;
+        };
+        if !candidate.reducible
+            || candidate.kind_hint != LoopKindHint::GenericForLike
+            || candidate.preheader != Some(entry)
+        {
+            return false;
+        }
+
+        candidate.exits.iter().all(|exit| {
+            !self.lowering.cfg.can_reach(*exit, shared)
+                && self.entry_must_reach_shared_or_terminate(
+                    *exit,
+                    shared,
+                    self.lowering.cfg.exit_block,
+                )
         })
     }
 

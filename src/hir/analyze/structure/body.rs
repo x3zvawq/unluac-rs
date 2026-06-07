@@ -240,6 +240,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     stmts.extend(cloned.stmts);
                     break;
                 }
+                if let Some(stop) = stop
+                    && let Some(cloned) =
+                        self.lower_shared_stop_tail_block_clone(block, stop, target_overrides)
+                {
+                    stmts.extend(cloned.stmts);
+                    break;
+                }
                 return None;
             }
 
@@ -564,6 +571,38 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         Some(stmts)
+    }
+
+    fn lower_shared_stop_tail_block_clone(
+        &self,
+        block: BlockRef,
+        stop: BlockRef,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<HirBlock> {
+        if self.required_labels.contains(&block)
+            || self.branch_by_header.contains_key(&block)
+            || self.loop_by_header.contains_key(&block)
+            || !self
+                .lowering
+                .dataflow
+                .phi_candidates_in_block(block)
+                .is_empty()
+            || self.lowering.cfg.unique_reachable_successor(block) != Some(stop)
+        {
+            return None;
+        }
+        if let Some((_instr_ref, instr)) = self.block_terminator(block)
+            && is_control_terminator(instr)
+            && !matches!(instr, LowInstr::Jump(_))
+        {
+            return None;
+        }
+
+        // 多个嵌套分支可共享同一个直线 continuation block。这里复制的是“到当前
+        // stop 为止”的无 phi 线性尾块，运行时仍只会沿被选中的分支执行一次。
+        Some(HirBlock {
+            stmts: self.lower_block_prefix(block, false, target_overrides)?,
+        })
     }
 
     pub(super) fn block_entry_expr_overrides(
