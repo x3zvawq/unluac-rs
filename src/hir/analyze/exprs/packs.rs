@@ -83,17 +83,20 @@ pub(crate) fn lower_value_pack_single_eval(
     match pack {
         crate::transformer::ValuePack::Fixed(range) => (0..range.len)
             .map(|offset| {
-                expr_for_reg_use_single_eval(
+                expr_for_reg_use_single_eval_with_call_policy(
                     lowering,
                     block,
                     instr_ref,
                     Reg(range.start.index() + offset),
+                    false,
                 )
             })
             .collect(),
         crate::transformer::ValuePack::Open(reg) => {
             lower_open_value_pack_single_eval(lowering, reg, instr_ref, |reg| {
-                expr_for_reg_use_single_eval(lowering, block, instr_ref, reg)
+                expr_for_reg_use_single_eval_with_call_policy(
+                    lowering, block, instr_ref, reg, false,
+                )
             })
         }
     }

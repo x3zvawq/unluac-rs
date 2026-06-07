@@ -180,7 +180,9 @@ fn lower_cond_operand_single_eval(
     operand: CondOperand,
 ) -> HirExpr {
     match operand {
-        CondOperand::Reg(reg) => expr_for_reg_use_single_eval(lowering, block, instr_ref, reg),
+        CondOperand::Reg(reg) => {
+            expr_for_reg_use_single_eval_with_call_policy(lowering, block, instr_ref, reg, false)
+        }
         CondOperand::Const(const_ref) => expr_for_const(lowering.proto, const_ref),
         CondOperand::Nil => HirExpr::Nil,
         CondOperand::Boolean(value) => HirExpr::Boolean(value),

@@ -36,14 +36,16 @@ pub(crate) fn expr_for_value_operand_inline(
     }
 }
 
-pub(crate) fn expr_for_value_operand_single_eval(
+pub(crate) fn expr_for_value_operand_single_eval_pure_operand(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,
     instr_ref: InstrRef,
     operand: ValueOperand,
 ) -> HirExpr {
     match operand {
-        ValueOperand::Reg(reg) => expr_for_reg_use_single_eval(lowering, block, instr_ref, reg),
+        ValueOperand::Reg(reg) => {
+            expr_for_reg_use_single_eval_with_call_policy(lowering, block, instr_ref, reg, true)
+        }
         ValueOperand::Const(const_ref) => expr_for_const(lowering.proto, const_ref),
         ValueOperand::Integer(value) => HirExpr::Integer(value),
         ValueOperand::Nil => HirExpr::Nil,
@@ -186,7 +188,9 @@ fn lower_access_base_expr_single_eval(
 ) -> HirExpr {
     match base {
         AccessBase::Reg(reg) => {
-            let expr = expr_for_reg_use_single_eval(lowering, block, instr_ref, reg);
+            let expr = expr_for_reg_use_single_eval_with_call_policy(
+                lowering, block, instr_ref, reg, false,
+            );
             // NewTable def 返回空 `{}`，但实际运行时这个寄存器持有的是被后续
             // SetTable/SetList 填充过的完整表。作为 GetTable 的 base，空表会
             // 丢掉所有条目的语义，因此退回到安全的 inline 模式。
@@ -212,7 +216,9 @@ fn lower_access_key_expr_single_eval(
     key: AccessKey,
 ) -> HirExpr {
     match key {
-        AccessKey::Reg(reg) => expr_for_reg_use_single_eval(lowering, block, instr_ref, reg),
+        AccessKey::Reg(reg) => {
+            expr_for_reg_use_single_eval_with_call_policy(lowering, block, instr_ref, reg, false)
+        }
         AccessKey::Const(const_ref) => expr_for_const(lowering.proto, const_ref),
         AccessKey::Integer(value) => HirExpr::Integer(value),
     }

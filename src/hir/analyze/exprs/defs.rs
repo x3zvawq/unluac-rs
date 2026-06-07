@@ -98,7 +98,13 @@ pub(crate) fn expr_for_fixed_def_single_eval(
 
     match instr {
         LowInstr::Move(move_instr) if move_instr.dst == def_reg => {
-            let expr = expr_for_reg_use_single_eval(lowering, def_block, def_instr, move_instr.src);
+            let expr = expr_for_reg_use_single_eval_with_call_policy(
+                lowering,
+                def_block,
+                def_instr,
+                move_instr.src,
+                false,
+            );
             // closure capture provenance 依赖“同一个子 proto 的闭包表达式”看到稳定的
             // 父作用域来源。Move 链如果把 local function 的 closure 复制进条件表达式，
             // 可能绕过后续 local override，让 capture 从 `local pos` 退回字面量初值。
@@ -120,23 +126,30 @@ pub(crate) fn expr_for_fixed_def_single_eval(
         LowInstr::UnaryOp(unary) if unary.dst == def_reg => {
             return Some(HirExpr::Unary(Box::new(HirUnaryExpr {
                 op: lower_unary_op(unary.op),
-                expr: expr_for_reg_use_single_eval(lowering, def_block, def_instr, unary.src),
+                expr: expr_for_reg_use_single_eval_with_call_policy(
+                    lowering, def_block, def_instr, unary.src, true,
+                ),
             })));
         }
         LowInstr::BinaryOp(binary) if binary.dst == def_reg => {
             return Some(super::super::helpers::binary_expr(
                 lower_binary_op(binary.op),
-                expr_for_value_operand_single_eval(lowering, def_block, def_instr, binary.lhs),
-                expr_for_value_operand_single_eval(lowering, def_block, def_instr, binary.rhs),
+                expr_for_value_operand_single_eval_pure_operand(
+                    lowering, def_block, def_instr, binary.lhs,
+                ),
+                expr_for_value_operand_single_eval_pure_operand(
+                    lowering, def_block, def_instr, binary.rhs,
+                ),
             ));
         }
         LowInstr::Concat(concat) if concat.dst == def_reg => {
             let value = concat_expr((0..concat.src.len).map(|offset| {
-                expr_for_reg_use_single_eval(
+                expr_for_reg_use_single_eval_with_call_policy(
                     lowering,
                     def_block,
                     def_instr,
                     Reg(concat.src.start.index() + offset),
+                    true,
                 )
             }));
             return Some(value);
@@ -227,7 +240,13 @@ fn expr_for_fixed_call(
     let callee = if is_method_sugar {
         HirExpr::Nil
     } else {
-        expr_for_reg_use_single_eval(lowering, block, instr_ref, call.callee)
+        expr_for_reg_use_single_eval_with_call_policy(
+            lowering,
+            block,
+            instr_ref,
+            call.callee,
+            false,
+        )
     };
 
     Some(HirExpr::Call(Box::new(HirCallExpr {

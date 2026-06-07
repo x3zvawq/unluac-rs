@@ -302,11 +302,17 @@ pub(crate) fn expr_for_reg_use_inline(
 ///
 /// 这条语义专门服务短路节点的单次 test：像 `call(...)` 这种不可复制但可单次出现的值，
 /// 在这里应该优先恢复成本体表达式，而不是先掉回 temp。
-pub(crate) fn expr_for_reg_use_single_eval(
+///
+/// 纯表达式壳层（如 `not call()` / `call() + 1`）本身不会额外观察 call 的结果，
+/// 被短路 header 整体吸收时也不会单独物化这些中间 temp。因此
+/// `allow_call_consumed_by_pure_wrapper` 只应在 unary/binary/concat 这类纯壳层 operand
+/// 中打开；普通 call-arg / table-base 仍传 `false`。
+pub(crate) fn expr_for_reg_use_single_eval_with_call_policy(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,
     instr_ref: InstrRef,
     reg: Reg,
+    allow_call_consumed_by_pure_wrapper: bool,
 ) -> HirExpr {
     if let Some(local) = loop_local_for_reg(lowering, block, reg) {
         return HirExpr::LocalRef(local);
@@ -332,7 +338,10 @@ pub(crate) fn expr_for_reg_use_single_eval(
                 if def_has_intervening_use(lowering, def, instr_ref) {
                     return HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()]);
                 }
-                if def_is_call_consumed_by_non_branch(lowering, def, instr_ref) {
+                if def_is_call_consumed_by_non_branch(lowering, def, instr_ref)
+                    && (!allow_call_consumed_by_pure_wrapper
+                        || def_has_later_use_after_pure_wrapper(lowering, def, instr_ref))
+                {
                     return HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()]);
                 }
                 expr_for_fixed_def_single_eval(lowering, def)
@@ -360,6 +369,35 @@ fn def_is_call_consumed_by_non_branch(
             lowering.proto.instrs[consumer_instr.index()],
             LowInstr::Branch(_)
         )
+}
+
+// 纯壳层只代表同一次条件求值；如果 call 结果在壳层之后还被非 branch 指令读取，
+// 展开 call 会把一次求值变成多次求值，因此必须退回 temp。最终 branch/test
+// 读取同一个结果是这条条件求值的一部分，不应算作额外消费。
+fn def_has_later_use_after_pure_wrapper(
+    lowering: &ProtoLowering<'_>,
+    def: DefId,
+    wrapper_instr: InstrRef,
+) -> bool {
+    let def_reg = lowering.dataflow.def_reg(def);
+    let def_block = lowering.dataflow.def_block(def);
+    if lowering.cfg.instr_to_block.get(wrapper_instr.index()) != Some(&def_block) {
+        return true;
+    }
+
+    let range = lowering.cfg.blocks[def_block.index()].instrs;
+    for instr_index in (wrapper_instr.index() + 1)..range.end() {
+        let effect = &lowering.dataflow.instr_effects[instr_index];
+        if effect.fixed_uses.contains(&def_reg)
+            && !matches!(lowering.proto.instrs[instr_index], LowInstr::Branch(_))
+        {
+            return true;
+        }
+        if effect.fixed_must_defs.contains(&def_reg) {
+            return false;
+        }
+    }
+    false
 }
 
 fn def_has_intervening_use(

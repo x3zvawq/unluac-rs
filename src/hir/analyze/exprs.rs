@@ -27,7 +27,7 @@ pub(super) use self::access::{
     expr_for_const, expr_for_value_operand, lower_table_access_expr, lower_table_access_target,
 };
 use self::access::{
-    expr_for_value_operand_inline, expr_for_value_operand_single_eval,
+    expr_for_value_operand_inline, expr_for_value_operand_single_eval_pure_operand,
     lower_table_access_expr_inline, lower_table_access_expr_single_eval,
 };
 pub(super) use self::branch::{
@@ -44,7 +44,7 @@ pub(super) use self::regs::{
     expr_for_closure_capture, expr_for_reg_at_block_entry, expr_for_reg_at_block_exit,
     expr_for_reg_use,
 };
-use self::regs::{expr_for_reg_use_inline, expr_for_reg_use_single_eval};
+use self::regs::{expr_for_reg_use_inline, expr_for_reg_use_single_eval_with_call_policy};
 use super::ProtoLowering;
 use super::helpers::{concat_expr, decode_raw_string, unresolved_expr};
 
@@ -129,7 +129,13 @@ fn expr_for_open_def_single_eval(
             let callee = if is_method_sugar {
                 HirExpr::Nil
             } else {
-                expr_for_reg_use_single_eval(lowering, open_def.block, open_def.instr, call.callee)
+                expr_for_reg_use_single_eval_with_call_policy(
+                    lowering,
+                    open_def.block,
+                    open_def.instr,
+                    call.callee,
+                    false,
+                )
             };
             Some(HirExpr::Call(Box::new(HirCallExpr {
                 callee,
