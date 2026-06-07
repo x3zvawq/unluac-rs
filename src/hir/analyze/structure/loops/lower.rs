@@ -25,6 +25,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             LoopKindHint::WhileLike => {
                 self.lower_while_loop(candidate, stop, stmts, target_overrides)
             }
+            LoopKindHint::WhileTrueLike => {
+                self.lower_while_true_loop(candidate, stop, stmts, target_overrides)
+            }
             LoopKindHint::RepeatLike => {
                 self.lower_repeat_loop(candidate, stop, stmts, target_overrides)
             }
@@ -133,6 +136,80 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         Some(Some(exit))
+    }
+
+    fn lower_while_true_loop(
+        &mut self,
+        candidate: &LoopCandidate,
+        stop: Option<BlockRef>,
+        stmts: &mut Vec<HirStmt>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<Option<BlockRef>> {
+        let continue_target = candidate.continue_target?;
+        if let Some(stop) = stop
+            && candidate.blocks.contains(&stop)
+            && stop != continue_target
+        {
+            return None;
+        }
+        if self
+            .lowering
+            .cfg
+            .unique_reachable_successor(continue_target)
+            != Some(candidate.header)
+        {
+            return None;
+        }
+        if candidate
+            .exits
+            .iter()
+            .any(|exit| !block_is_terminal_exit(self.lowering, *exit))
+        {
+            return None;
+        }
+
+        let preheader = unique_loop_preheader(candidate);
+        let post_loop = self.lowering.cfg.exit_block;
+        let plan =
+            self.build_loop_state_plan(candidate, preheader, post_loop, &[], target_overrides)?;
+        let combined_target_overrides =
+            merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
+        let mut loop_context = self.build_active_loop_context(
+            candidate,
+            post_loop,
+            &combined_target_overrides,
+            &plan.states,
+        )?;
+        loop_context.loop_blocks = candidate.blocks.clone();
+        loop_context.state_slots = plan.states.clone();
+
+        self.active_loops.push(loop_context.clone());
+        let mut body = self
+            .lower_region_with_suppressed_loop(
+                candidate.header,
+                Some(continue_target),
+                &combined_target_overrides,
+                Some(candidate.header),
+            )?
+            .stmts;
+        body.extend(self.lower_block_prefix(continue_target, false, &combined_target_overrides)?);
+        self.active_loops.pop();
+
+        stmts.extend(loop_state_init_stmts(&plan));
+        self.visited.insert(continue_target);
+        self.visited.extend(
+            loop_context
+                .break_exits
+                .values()
+                .flat_map(|break_exit| break_exit.blocks.iter().copied()),
+        );
+        self.install_loop_exit_bindings(candidate, post_loop, &plan, target_overrides);
+        stmts.push(HirStmt::While(Box::new(HirWhile {
+            cond: HirExpr::Boolean(true),
+            body: HirBlock { stmts: body },
+        })));
+
+        Some(None)
     }
 
     fn block_condition_prefix_temps(&self, block: BlockRef) -> BTreeSet<TempId> {

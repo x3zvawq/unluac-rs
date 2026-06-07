@@ -159,6 +159,15 @@ fn infer_loop_shape(
             .expect("set length already checked");
         if matches!(
             cfg.terminator(&proto.instrs, source),
+            Some(LowInstr::Jump(jump)) if cfg.instr_to_block[jump.target.index()] == header
+        ) && !region_has_scope_cleanup(proto, cfg, blocks)
+            && exits_are_terminal(proto, cfg, &collect_region_exits(cfg, blocks))
+        {
+            return (LoopKindHint::WhileTrueLike, Some(source), None);
+        }
+
+        if matches!(
+            cfg.terminator(&proto.instrs, source),
             Some(LowInstr::Branch(_instr)) if branch_has_header_and_exit(cfg, source, header, blocks)
         ) {
             return (LoopKindHint::RepeatLike, Some(source), None);
@@ -185,6 +194,30 @@ fn infer_loop_shape(
     };
 
     (LoopKindHint::Unknown, continue_target, None)
+}
+
+fn region_has_scope_cleanup(proto: &LoweredProto, cfg: &Cfg, blocks: &BTreeSet<BlockRef>) -> bool {
+    blocks.iter().copied().any(|block| {
+        let range = cfg.blocks[block.index()].instrs;
+        (range.start.index()..range.end()).any(|instr_index| {
+            matches!(
+                proto.instrs[instr_index],
+                LowInstr::Close(_) | LowInstr::Tbc(_)
+            )
+        })
+    })
+}
+
+fn exits_are_terminal(proto: &LoweredProto, cfg: &Cfg, exits: &BTreeSet<BlockRef>) -> bool {
+    exits.iter().copied().all(|exit| {
+        let Some(instr_ref) = cfg.blocks[exit.index()].instrs.last() else {
+            return exit == cfg.exit_block;
+        };
+        matches!(
+            proto.instrs[instr_ref.index()],
+            LowInstr::Return(_) | LowInstr::TailCall(_)
+        )
+    })
 }
 
 fn numeric_for_source_bindings(

@@ -217,6 +217,7 @@ pub struct LoopExitValueMergeCandidate {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum LoopKindHint {
     WhileLike,
+    WhileTrueLike,
     RepeatLike,
     NumericForLike,
     GenericForLike,

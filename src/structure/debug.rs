@@ -476,6 +476,7 @@ fn format_branch_kind(kind: super::common::BranchKind) -> &'static str {
 fn format_loop_kind(kind: super::common::LoopKindHint) -> &'static str {
     match kind {
         super::common::LoopKindHint::WhileLike => "while-like",
+        super::common::LoopKindHint::WhileTrueLike => "while-true-like",
         super::common::LoopKindHint::RepeatLike => "repeat-like",
         super::common::LoopKindHint::NumericForLike => "numeric-for-like",
         super::common::LoopKindHint::GenericForLike => "generic-for-like",

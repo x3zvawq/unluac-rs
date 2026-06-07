@@ -55,7 +55,9 @@ pub(super) fn analyze_goto_requirements(
             // 迭代器），跳到 header 等价于"重新迭代"，所以仍应视为 continue。
             let tail_carries_body = matches!(
                 loop_candidate.kind_hint,
-                LoopKindHint::NumericForLike | LoopKindHint::RepeatLike
+                LoopKindHint::NumericForLike
+                    | LoopKindHint::RepeatLike
+                    | LoopKindHint::WhileTrueLike
             ) && block_has_non_control_prefix(proto, cfg, continue_target);
             for block in &loop_candidate.blocks {
                 for edge_ref in &cfg.succs[block.index()] {
