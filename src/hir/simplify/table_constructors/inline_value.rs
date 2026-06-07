@@ -4,7 +4,7 @@
 //! callee/access-base 值，不会在这里决定整段 region 的分段边界。
 //! 例如：`local v = f(); t.x = v` 可能在这里折叠成 `t.x = f()`。
 
-use crate::hir::common::{HirBlock, HirCallExpr, HirExpr};
+use crate::hir::common::{HirBlock, HirCallExpr, HirExpr, HirLogicalExpr};
 
 use super::bindings::{BindingIndex, BindingUseSummary, binding_from_expr};
 use super::{PendingProducer, PendingProducerSource};
@@ -135,6 +135,12 @@ fn inline_constructor_value_at_site(
                 method_name: call.method_name.clone(),
             })));
         }
+        HirExpr::LogicalAnd(logical) => {
+            return inline_short_circuit_expr(context, logical, HirExpr::LogicalAnd);
+        }
+        HirExpr::LogicalOr(logical) => {
+            return inline_short_circuit_expr(context, logical, HirExpr::LogicalOr);
+        }
         _ => {}
     }
 
@@ -147,6 +153,128 @@ fn inline_constructor_value_at_site(
         None
     } else {
         Some(value.clone())
+    }
+}
+
+fn inline_short_circuit_expr(
+    context: &mut InlineContext<'_>,
+    logical: &HirLogicalExpr,
+    ctor: fn(Box<HirLogicalExpr>) -> HirExpr,
+) -> Option<HirExpr> {
+    // 短路右侧不是无条件求值位置；如果它引用 pending producer，
+    // 把 producer 折进去会把原本已执行的求值变成条件执行，或留下未定义引用。
+    if expr_mentions_any_pending_binding(
+        &logical.rhs,
+        context.binding_index,
+        context.pending_producers,
+    ) {
+        return None;
+    }
+
+    Some(ctor(Box::new(HirLogicalExpr {
+        lhs: inline_constructor_value_at_site(
+            context,
+            &logical.lhs,
+            ConstructorInlineSite::Neutral,
+        )?,
+        rhs: logical.rhs.clone(),
+    })))
+}
+
+fn expr_mentions_any_pending_binding(
+    expr: &HirExpr,
+    binding_index: &BindingIndex,
+    pending_producers: &[PendingProducer],
+) -> bool {
+    if let Some(binding) = binding_from_expr(expr)
+        && let Some(binding_id) = binding_index.id_of(binding)
+        && pending_producers
+            .iter()
+            .any(|producer| producer.binding_id == binding_id)
+    {
+        return true;
+    }
+
+    match expr {
+        HirExpr::TableAccess(access) => {
+            expr_mentions_any_pending_binding(&access.base, binding_index, pending_producers)
+                || expr_mentions_any_pending_binding(&access.key, binding_index, pending_producers)
+        }
+        HirExpr::Unary(unary) => {
+            expr_mentions_any_pending_binding(&unary.expr, binding_index, pending_producers)
+        }
+        HirExpr::Binary(binary) => {
+            expr_mentions_any_pending_binding(&binary.lhs, binding_index, pending_producers)
+                || expr_mentions_any_pending_binding(&binary.rhs, binding_index, pending_producers)
+        }
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            expr_mentions_any_pending_binding(&logical.lhs, binding_index, pending_producers)
+                || expr_mentions_any_pending_binding(&logical.rhs, binding_index, pending_producers)
+        }
+        HirExpr::Call(call) => {
+            expr_mentions_any_pending_binding(&call.callee, binding_index, pending_producers)
+                || call.args.iter().any(|arg| {
+                    expr_mentions_any_pending_binding(arg, binding_index, pending_producers)
+                })
+        }
+        HirExpr::TableConstructor(table) => {
+            table.fields.iter().any(|field| match field {
+                crate::hir::common::HirTableField::Array(value) => {
+                    expr_mentions_any_pending_binding(value, binding_index, pending_producers)
+                }
+                crate::hir::common::HirTableField::Record(field) => {
+                    expr_mentions_any_pending_binding(
+                        &field.value,
+                        binding_index,
+                        pending_producers,
+                    ) || matches!(
+                        &field.key,
+                        crate::hir::common::HirTableKey::Expr(key_expr)
+                            if expr_mentions_any_pending_binding(
+                                key_expr,
+                                binding_index,
+                                pending_producers,
+                            )
+                    )
+                }
+            }) || table.trailing_multivalue.as_ref().is_some_and(|value| {
+                expr_mentions_any_pending_binding(value, binding_index, pending_producers)
+            })
+        }
+        HirExpr::Decision(decision) => decision.nodes.iter().any(|node| {
+            expr_mentions_any_pending_binding(&node.test, binding_index, pending_producers)
+                || match &node.truthy {
+                    crate::hir::common::HirDecisionTarget::Expr(expr) => {
+                        expr_mentions_any_pending_binding(expr, binding_index, pending_producers)
+                    }
+                    crate::hir::common::HirDecisionTarget::Node(_)
+                    | crate::hir::common::HirDecisionTarget::CurrentValue => false,
+                }
+                || match &node.falsy {
+                    crate::hir::common::HirDecisionTarget::Expr(expr) => {
+                        expr_mentions_any_pending_binding(expr, binding_index, pending_producers)
+                    }
+                    crate::hir::common::HirDecisionTarget::Node(_)
+                    | crate::hir::common::HirDecisionTarget::CurrentValue => false,
+                }
+        }),
+        HirExpr::Closure(closure) => closure.captures.iter().any(|capture| {
+            expr_mentions_any_pending_binding(&capture.value, binding_index, pending_producers)
+        }),
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
+        | HirExpr::ParamRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::VarArg
+        | HirExpr::Unresolved(_) => false,
+        HirExpr::TempRef(_) | HirExpr::LocalRef(_) => false,
     }
 }
 
