@@ -5,7 +5,8 @@
 //! 避免把不同函数里碰巧同号的 binding 混成同一个局部变量。
 
 use crate::ast::common::{
-    AstBindingRef, AstCallKind, AstExpr, AstLValue, AstNameRef, AstStmt, AstTableField, AstTableKey,
+    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstNameRef, AstStmt,
+    AstTableField, AstTableKey,
 };
 
 use super::binding_flow::name_matches_binding;
@@ -103,6 +104,154 @@ pub(super) fn lvalue_references_binding(target: &AstLValue, binding: AstBindingR
                 || expr_references_binding(&access.index, binding)
         }
     }
+}
+
+pub(super) fn stmt_captures_binding(stmt: &AstStmt, binding: AstBindingRef) -> bool {
+    match stmt {
+        AstStmt::LocalDecl(local_decl) => local_decl
+            .values
+            .iter()
+            .any(|value| expr_captures_binding(value, binding)),
+        AstStmt::GlobalDecl(global_decl) => global_decl
+            .values
+            .iter()
+            .any(|value| expr_captures_binding(value, binding)),
+        AstStmt::Assign(assign) => assign
+            .values
+            .iter()
+            .any(|value| expr_captures_binding(value, binding)),
+        AstStmt::CallStmt(call_stmt) => call_captures_binding(&call_stmt.call, binding),
+        AstStmt::Return(ret) => ret
+            .values
+            .iter()
+            .any(|value| expr_captures_binding(value, binding)),
+        AstStmt::If(if_stmt) => {
+            expr_captures_binding(&if_stmt.cond, binding)
+                || block_captures_binding(&if_stmt.then_block, binding)
+                || if_stmt
+                    .else_block
+                    .as_ref()
+                    .is_some_and(|block| block_captures_binding(block, binding))
+        }
+        AstStmt::While(while_stmt) => {
+            expr_captures_binding(&while_stmt.cond, binding)
+                || block_captures_binding(&while_stmt.body, binding)
+        }
+        AstStmt::Repeat(repeat_stmt) => {
+            block_captures_binding(&repeat_stmt.body, binding)
+                || expr_captures_binding(&repeat_stmt.cond, binding)
+        }
+        AstStmt::NumericFor(numeric_for) => {
+            expr_captures_binding(&numeric_for.start, binding)
+                || expr_captures_binding(&numeric_for.limit, binding)
+                || expr_captures_binding(&numeric_for.step, binding)
+                || block_captures_binding(&numeric_for.body, binding)
+        }
+        AstStmt::GenericFor(generic_for) => {
+            generic_for
+                .iterator
+                .iter()
+                .any(|expr| expr_captures_binding(expr, binding))
+                || block_captures_binding(&generic_for.body, binding)
+        }
+        AstStmt::DoBlock(block) => block_captures_binding(block, binding),
+        AstStmt::FunctionDecl(function_decl) => {
+            function_expr_captures_binding(&function_decl.func, binding)
+        }
+        AstStmt::LocalFunctionDecl(function_decl) => {
+            function_expr_captures_binding(&function_decl.func, binding)
+        }
+        AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_)
+        | AstStmt::Error(_) => false,
+    }
+}
+
+fn block_captures_binding(block: &AstBlock, binding: AstBindingRef) -> bool {
+    block
+        .stmts
+        .iter()
+        .any(|stmt| stmt_captures_binding(stmt, binding))
+}
+
+fn call_captures_binding(call: &AstCallKind, binding: AstBindingRef) -> bool {
+    match call {
+        AstCallKind::Call(call) => {
+            expr_captures_binding(&call.callee, binding)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_captures_binding(arg, binding))
+        }
+        AstCallKind::MethodCall(call) => {
+            expr_captures_binding(&call.receiver, binding)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_captures_binding(arg, binding))
+        }
+    }
+}
+
+fn expr_captures_binding(expr: &AstExpr, binding: AstBindingRef) -> bool {
+    match expr {
+        AstExpr::FieldAccess(access) => expr_captures_binding(&access.base, binding),
+        AstExpr::IndexAccess(access) => {
+            expr_captures_binding(&access.base, binding)
+                || expr_captures_binding(&access.index, binding)
+        }
+        AstExpr::Unary(unary) => expr_captures_binding(&unary.expr, binding),
+        AstExpr::Binary(binary) => {
+            expr_captures_binding(&binary.lhs, binding)
+                || expr_captures_binding(&binary.rhs, binding)
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            expr_captures_binding(&logical.lhs, binding)
+                || expr_captures_binding(&logical.rhs, binding)
+        }
+        AstExpr::Call(call) => {
+            expr_captures_binding(&call.callee, binding)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_captures_binding(arg, binding))
+        }
+        AstExpr::MethodCall(call) => {
+            expr_captures_binding(&call.receiver, binding)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_captures_binding(arg, binding))
+        }
+        AstExpr::SingleValue(expr) => expr_captures_binding(expr, binding),
+        AstExpr::TableConstructor(table) => table.fields.iter().any(|field| match field {
+            AstTableField::Array(value) => expr_captures_binding(value, binding),
+            AstTableField::Record(record) => {
+                (match &record.key {
+                    AstTableKey::Name(_) => false,
+                    AstTableKey::Expr(key) => expr_captures_binding(key, binding),
+                }) || expr_captures_binding(&record.value, binding)
+            }
+        }),
+        AstExpr::FunctionExpr(function) => function_expr_captures_binding(function, binding),
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::Var(_)
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => false,
+    }
+}
+
+fn function_expr_captures_binding(function: &AstFunctionExpr, binding: AstBindingRef) -> bool {
+    function.captured_bindings.contains(&binding) || block_captures_binding(&function.body, binding)
 }
 
 pub(super) fn count_name_expr_uses(expr: &AstExpr, binding: AstBindingRef) -> usize {

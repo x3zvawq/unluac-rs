@@ -18,7 +18,7 @@ use super::ReadabilityContext;
 use super::binding_flow::name_matches_binding;
 use super::binding_tree::{
     call_references_binding, expr_references_binding, lvalue_references_binding,
-    rewrite_binding_in_stmt,
+    rewrite_binding_in_stmt, stmt_captures_binding,
 };
 use super::walk::{self, AstRewritePass, BlockKind};
 
@@ -37,6 +37,7 @@ impl AstRewritePass for LocalCoalescePass {
             if index + 1 < block.stmts.len()
                 && let Some(seed) = single_initialized_local_decl(&block.stmts[index])
                 && let Some(carried) = single_empty_local_decl(&block.stmts[index + 1])
+                && stmt_allows_coalescing_binding_identity(&block.stmts[index], seed, carried)
                 && seed_can_absorb_carried(&block.stmts[(index + 2)..], seed, carried)
             {
                 let mut tail = block.stmts.split_off(index + 2);
@@ -204,6 +205,10 @@ fn stmt_allows_seed_to_absorb_carried(
     seed: AstBindingRef,
     carried: AstBindingRef,
 ) -> bool {
+    if !stmt_allows_coalescing_binding_identity(stmt, seed, carried) {
+        return false;
+    }
+
     match stmt {
         AstStmt::LocalDecl(local_decl) => {
             local_decl
@@ -287,6 +292,14 @@ fn stmt_allows_seed_to_absorb_carried(
         | AstStmt::Label(_)
         | AstStmt::Error(_) => true,
     }
+}
+
+fn stmt_allows_coalescing_binding_identity(
+    stmt: &AstStmt,
+    seed: AstBindingRef,
+    carried: AstBindingRef,
+) -> bool {
+    !stmt_captures_binding(stmt, seed) && !stmt_captures_binding(stmt, carried)
 }
 
 fn is_supported_seed_writeback_assign(
@@ -437,6 +450,10 @@ fn is_exact_seed_copy_assign(
 }
 
 fn stmt_mentions_binding(stmt: &AstStmt, binding: AstBindingRef) -> bool {
+    if stmt_captures_binding(stmt, binding) {
+        return true;
+    }
+
     match stmt {
         AstStmt::LocalDecl(local_decl) => local_decl
             .values
