@@ -17,6 +17,7 @@ use crate::hir::common::{
     HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr, HirLValue,
     TempId,
 };
+use crate::transformer::Reg;
 
 use super::rewrites::lvalue_as_expr;
 use super::*;
@@ -288,13 +289,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     ) -> HirExpr {
         // 某一臂只是在“沿用进入分支前的当前值”时，shared target 需要先吃到一份 seed；
         // 否则后面只改写“写新值”的那一臂，merge 后继续读取的状态槽位就会悬空成 nil。
-        if !self.block_redefines_reg(header, reg)
+        let mut expr = if !self.block_redefines_reg(header, reg)
             && let Some(expr) = self.overrides.carried_entry_expr(header, reg)
         {
-            return expr.clone();
-        }
-
-        let mut expr = expr_for_reg_at_block_exit(self.lowering, header, reg);
+            expr.clone()
+        } else {
+            expr_for_reg_at_block_exit(self.lowering, header, reg)
+        };
+        expr = nil_if_uninitialized_preserved_reg(self.lowering, reg, expr);
         rewrite_expr_temps(&mut expr, &temp_expr_overrides(target_overrides));
         expr
     }
@@ -315,6 +317,26 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         arm_expr
     }
+}
+
+/// 分支合流某一臂“沿用当前值”时，若寄存器在进入分支前从未定义，Lua 语义上就是 `nil`。
+fn nil_if_uninitialized_preserved_reg(
+    lowering: &ProtoLowering<'_>,
+    reg: Reg,
+    expr: HirExpr,
+) -> HirExpr {
+    let HirExpr::Unresolved(unresolved) = &expr else {
+        return expr;
+    };
+    if unresolved.summary != format!("entry-reg r{}", reg.index()) {
+        return expr;
+    }
+    if reg.index() < lowering.bindings.params.len()
+        || lowering.bindings.entry_local_regs.contains_key(&reg)
+    {
+        return expr;
+    }
+    HirExpr::Nil
 }
 
 fn branch_value_needs_preserved_entry_seed(value: &BranchValueMergeValue) -> bool {
