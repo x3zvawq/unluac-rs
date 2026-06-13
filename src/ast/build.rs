@@ -206,30 +206,41 @@ impl<'a> AstLowerer<'a> {
                 1,
             )),
             HirStmt::TableSetList(set_list) => {
-                if set_list.trailing_multivalue.is_some() {
-                    return Err(AstLowerError::UnsupportedSetListTrailingMultivalue {
-                        proto: proto_index,
-                    });
-                }
                 let base = self.lower_expr(proto_index, &set_list.base)?;
-                let stmts = set_list
-                    .values
-                    .iter()
-                    .enumerate()
-                    .map(|(offset, value)| {
-                        let index_value =
-                            AstExpr::Integer(i64::from(set_list.start_index) + offset as i64);
-                        let target =
-                            super::common::AstLValue::IndexAccess(Box::new(AstIndexAccess {
-                                base: base.clone(),
-                                index: index_value,
-                            }));
-                        Ok(AstStmt::Assign(Box::new(AstAssign {
-                            targets: vec![target],
-                            values: vec![self.lower_expr(proto_index, value)?],
-                        })))
-                    })
-                    .collect::<Result<Vec<_>, AstLowerError>>()?;
+                let mut stmts = Vec::with_capacity(
+                    set_list.values.len() + usize::from(set_list.trailing_multivalue.is_some()),
+                );
+                for (offset, value) in set_list.values.iter().enumerate() {
+                    let index_value =
+                        AstExpr::Integer(i64::from(set_list.start_index) + offset as i64);
+                    let target =
+                        super::common::AstLValue::IndexAccess(Box::new(AstIndexAccess {
+                            base: base.clone(),
+                            index: index_value,
+                        }));
+                    stmts.push(AstStmt::Assign(Box::new(AstAssign {
+                        targets: vec![target],
+                        values: vec![self.lower_expr(proto_index, value)?],
+                    })));
+                }
+                if let Some(trailing) = &set_list.trailing_multivalue {
+                    let mut value = self.lower_expr(proto_index, trailing)?;
+                    // SETLIST 的 open 尾值通常只占一个数组槽；多返回 call 需要截断为单值。
+                    if matches!(trailing, HirExpr::Call(call) if call.multiret) {
+                        value = AstExpr::SingleValue(Box::new(value));
+                    }
+                    let index_value =
+                        AstExpr::Integer(i64::from(set_list.start_index) + set_list.values.len() as i64);
+                    let target =
+                        super::common::AstLValue::IndexAccess(Box::new(AstIndexAccess {
+                            base,
+                            index: index_value,
+                        }));
+                    stmts.push(AstStmt::Assign(Box::new(AstAssign {
+                        targets: vec![target],
+                        values: vec![value],
+                    })));
+                }
                 Ok((stmts, 1))
             }
             HirStmt::ErrNil(_) => {
