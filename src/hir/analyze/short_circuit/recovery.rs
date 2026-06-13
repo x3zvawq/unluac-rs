@@ -211,6 +211,13 @@ fn build_branch_short_circuit_plan_from_candidate(
     if consumed_headers_have_escaping_defs(lowering, short, &allowed_blocks) {
         return None;
     }
+    // 单节点候选的 entry header 也会被整段吞掉（extend 嵌套时常见），
+    // 需同样检查其定义是否在 `short.blocks` 外仍被读取。
+    if short.nodes.len() == 1
+        && header_defs_escape_short_circuit_region(lowering, short, short.header)
+    {
+        return None;
+    }
 
     let has_forbidden =
         decision_references_forbidden_candidate_temps(lowering, short, &decision, &allowed_blocks);
@@ -838,6 +845,15 @@ fn block_has_escaping_defs(
         return false;
     }
 
+    header_defs_escape_short_circuit_region(lowering, short, block)
+}
+
+/// 检查某个 header block 内的定义是否在短路候选区域外仍被读取。
+fn header_defs_escape_short_circuit_region(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+    block: BlockRef,
+) -> bool {
     let range = lowering.cfg.blocks[block.index()].instrs;
     for instr_idx in range.start.index()..range.end() {
         for &def_id in &lowering.dataflow.instr_defs[instr_idx] {

@@ -643,6 +643,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             if downstream_post_loop == Some(exit) {
                 continue;
             }
+            // 自然循环的 region exit 有时只是循环体内部的 early-return 路径，
+            // 并不会回到 post-loop continuation。这种出口不能按 break pad 处理，
+            // 否则 `lower_break_exit_pad` 会失败并把整片 numeric-for 打回 goto。
+            if !self.exit_reaches_post_loop(exit, post_loop, downstream_post_loop) {
+                continue;
+            }
             break_exits.insert(
                 exit,
                 self.lower_break_exit_pad(
@@ -693,6 +699,34 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         Some(target)
     }
 
+    fn exit_reaches_post_loop(
+        &self,
+        exit: BlockRef,
+        post_loop: BlockRef,
+        downstream_post_loop: Option<BlockRef>,
+    ) -> bool {
+        let mut visiting = BTreeSet::new();
+        let mut stack = vec![exit];
+        while let Some(block) = stack.pop() {
+            if block == post_loop || Some(block) == downstream_post_loop {
+                return true;
+            }
+            if block == self.lowering.cfg.exit_block || block_is_terminal_exit(self.lowering, block) {
+                continue;
+            }
+            if !self.lowering.cfg.reachable_blocks.contains(&block) {
+                continue;
+            }
+            if !visiting.insert(block) {
+                continue;
+            }
+            for edge_ref in &self.lowering.cfg.succs[block.index()] {
+                stack.push(self.lowering.cfg.edges[edge_ref.index()].to);
+            }
+        }
+        false
+    }
+
     fn loop_state_inside_exit_blocks(
         &self,
         candidate: &LoopCandidate,
@@ -710,6 +744,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 continue;
             }
             if downstream_post_loop == Some(exit) {
+                continue;
+            }
+            if !self.exit_reaches_post_loop(exit, post_loop, downstream_post_loop) {
                 continue;
             }
             self.lower_break_exit_pad(

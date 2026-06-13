@@ -64,6 +64,11 @@ impl<'a> AstLowerer<'a> {
         let Some(HirStmt::CallStmt(call_stmt)) = stmts.get(index) else {
             return Ok(None);
         };
+        // 方法糖下 args[0] 是 receiver；若整个调用只有一个参数，那它一定是
+        // receiver 而不是“最后一个实参里的单值调用”，不能走 SingleValue 包装。
+        if call_stmt.call.method && call_stmt.call.args.len() <= 1 {
+            return Ok(None);
+        }
         let Some(HirExpr::Call(arg_call)) = call_stmt.call.args.last() else {
             return Ok(None);
         };
