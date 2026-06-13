@@ -13,7 +13,7 @@ use super::exprs::{
     expr_for_closure_capture, expr_for_const, expr_for_reg_at_block_exit, expr_for_reg_use,
     expr_for_value_operand, is_multiret_results, lower_binary_op, lower_branch_cond,
     lower_method_name, lower_table_access_expr, lower_table_access_target, lower_unary_op,
-    lower_value_pack, lower_value_pack_components,
+    lower_value_pack, lower_value_pack_components, try_recover_bound_method_call,
 };
 use super::helpers::{
     assign_stmt, binary_expr, branch_stmt, build_label_map_for_summary, concat_expr,
@@ -838,24 +838,30 @@ fn lower_call(
     instr_ref: InstrRef,
     call: &crate::transformer::CallInstr,
 ) -> Vec<HirStmt> {
-    let method_name = lower_method_name(lowering.proto, call.method_name);
-    let is_method_sugar = matches!(call.kind, CallKind::Method) && method_name.is_some();
-    // 当调用会被 AST 渲染成 `obj:method()` 糖时，AST 只读 args[0] 和
-    // method_name，callee 被丢弃。这里直接把 callee 置为 Nil，从而让源自
-    // `SELF` / `NAMECALL` 的 method-load GetTable 在 HIR 中也真正失去读者，
-    // 配合同一 pass 里对 `method_load` 的跳过逻辑建立闭环。
-    let callee = if is_method_sugar {
-        HirExpr::Nil
+    let expr = if let Some(bound_method) =
+        try_recover_bound_method_call(lowering, block, instr_ref, call)
+    {
+        HirExpr::Call(Box::new(bound_method))
     } else {
-        expr_for_reg_use(lowering, block, instr_ref, call.callee)
+        let method_name = lower_method_name(lowering.proto, call.method_name);
+        let is_method_sugar = matches!(call.kind, CallKind::Method) && method_name.is_some();
+        // 当调用会被 AST 渲染成 `obj:method()` 糖时，AST 只读 args[0] 和
+        // method_name，callee 被丢弃。这里直接把 callee 置为 Nil，从而让源自
+        // `SELF` / `NAMECALL` 的 method-load GetTable 在 HIR 中也真正失去读者，
+        // 配合同一 pass 里对 `method_load` 的跳过逻辑建立闭环。
+        let callee = if is_method_sugar {
+            HirExpr::Nil
+        } else {
+            expr_for_reg_use(lowering, block, instr_ref, call.callee)
+        };
+        HirExpr::Call(Box::new(HirCallExpr {
+            callee,
+            args: lower_value_pack(lowering, block, instr_ref, call.args),
+            multiret: is_multiret_results(call.results),
+            method: matches!(call.kind, CallKind::Method),
+            method_name,
+        }))
     };
-    let expr = HirExpr::Call(Box::new(HirCallExpr {
-        callee,
-        args: lower_value_pack(lowering, block, instr_ref, call.args),
-        multiret: is_multiret_results(call.results),
-        method: matches!(call.kind, CallKind::Method),
-        method_name,
-    }));
 
     if matches!(call.results, ResultPack::Ignore) {
         vec![HirStmt::CallStmt(Box::new(HirCallStmt {

@@ -5,6 +5,7 @@
 //! 因此这里专门承载“值如何解释”的规则，让 `analyze.rs` 更多只关心语句和控制流骨架。
 
 mod access;
+mod bound_method;
 mod branch;
 mod defs;
 mod packs;
@@ -23,6 +24,7 @@ use crate::transformer::{
     UnaryOpKind, ValueOperand,
 };
 
+pub(super) use self::bound_method::try_recover_bound_method_call;
 pub(super) use self::access::{
     expr_for_const, expr_for_value_operand, lower_table_access_expr, lower_table_access_target,
 };
