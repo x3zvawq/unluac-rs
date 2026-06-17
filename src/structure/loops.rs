@@ -41,6 +41,7 @@ pub(super) fn analyze_loops(
         entry.1.push(natural_loop.backedge);
     }
 
+    let grouped_headers = grouped_loops.keys().copied().collect::<BTreeSet<_>>();
     let mut loop_candidates = grouped_loops
         .into_iter()
         .map(|(header, (blocks, mut backedges))| {
@@ -78,8 +79,72 @@ pub(super) fn analyze_loops(
         })
         .collect::<Vec<_>>();
 
+    loop_candidates.extend(analyze_degenerate_generic_for_loops(
+        proto,
+        cfg,
+        dataflow,
+        &grouped_headers,
+    ));
     loop_candidates.sort_by_key(|candidate| candidate.header);
     loop_candidates
+}
+
+fn analyze_degenerate_generic_for_loops(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    grouped_headers: &BTreeSet<BlockRef>,
+) -> Vec<LoopCandidate> {
+    cfg.reachable_blocks
+        .iter()
+        .copied()
+        .filter(|header| !grouped_headers.contains(header))
+        .filter_map(|header| degenerate_generic_for_loop(proto, cfg, dataflow, header))
+        .collect()
+}
+
+fn degenerate_generic_for_loop(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    header: BlockRef,
+) -> Option<LoopCandidate> {
+    let Some(LowInstr::GenericForLoop(instr)) = cfg.terminator(&proto.instrs, header) else {
+        return None;
+    };
+    let body = cfg.instr_to_block[instr.body_target.index()];
+    let exit = cfg.instr_to_block[instr.exit_target.index()];
+    let blocks = BTreeSet::from([header, body]);
+    if body == header
+        || exit == header
+        || blocks.contains(&exit)
+        || !generic_for_has_loop_body_and_exit(proto, cfg, header, instr, &blocks)
+    {
+        return None;
+    }
+
+    let exits = collect_region_exits(cfg, &blocks);
+    if !exits.contains(&exit) || !is_reducible_region(cfg, header, &blocks) {
+        return None;
+    }
+
+    let preheader = unique_loop_preheader(cfg, header, &blocks);
+    let header_value_merges = analyze_loop_header_value_merges(dataflow, header, &blocks);
+    let exit_value_merges = analyze_loop_exit_value_merges(dataflow, &exits, &blocks);
+
+    Some(LoopCandidate {
+        header,
+        preheader,
+        blocks,
+        backedges: Vec::new(),
+        exits,
+        continue_target: Some(header),
+        kind_hint: LoopKindHint::GenericForLike,
+        source_bindings: generic_for_source_bindings(proto, cfg, header),
+        header_value_merges,
+        exit_value_merges,
+        reducible: true,
+    })
 }
 
 struct LoopShapeInput<'a> {
