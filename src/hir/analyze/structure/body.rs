@@ -1019,6 +1019,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if Some(header) == stop || consumed_headers.contains(&header) {
             return None;
         }
+        if self.loop_by_header.contains_key(&header) {
+            return None;
+        }
         let next = build_branch_short_circuit_plan(self.lowering, header)
             .or_else(|| self.nestable_plain_branch_plan(header))?;
         if next

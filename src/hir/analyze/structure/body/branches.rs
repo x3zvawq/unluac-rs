@@ -95,6 +95,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.restore_state_checkpoint(checkpoint, stmts);
 
         let checkpoint = self.checkpoint_state(stmts.len());
+        if let Some(next) =
+            self.try_lower_loop_terminal_else_branch(block, stop, stmts, target_overrides)
+        {
+            return Some(next);
+        }
+        self.restore_state_checkpoint(checkpoint, stmts);
+
+        let checkpoint = self.checkpoint_state(stmts.len());
         if let Some(escape_target) = self.cross_structure_escape_target(block)
             && let Some(next) = self.lower_cross_structure_escape_branch(
                 block,
@@ -1287,6 +1295,43 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
     }
 
+    fn try_lower_loop_terminal_else_branch(
+        &mut self,
+        block: BlockRef,
+        stop: Option<BlockRef>,
+        stmts: &mut Vec<HirStmt>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<Option<BlockRef>> {
+        let loop_context = self.active_loops.last()?.clone();
+        let stop = stop?;
+        if loop_context.continue_target != Some(stop) {
+            return None;
+        }
+        let candidate = *self.branch_by_header.get(&block)?;
+        let merge = candidate.merge?;
+        if candidate.else_entry.is_some()
+            || merge == stop
+            || self.branch_value_merges_by_header.contains_key(&block)
+            || !self.can_reach_avoiding_block(candidate.then_entry, stop, merge)
+            || !self.branch_arm_terminates_before_stop(merge, stop)
+        {
+            return None;
+        }
+
+        let then_target_overrides =
+            self.branch_entry_target_overrides(block, Some(candidate.then_entry), target_overrides);
+        let then_block =
+            self.lower_region(candidate.then_entry, Some(stop), &then_target_overrides)?;
+        let else_block = self.lower_region(merge, Some(stop), target_overrides)?;
+        let mut cond = self.lower_candidate_cond(block, candidate)?;
+        rewrite_expr_temps(&mut cond, &temp_expr_overrides(target_overrides));
+
+        stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
+        self.visited.insert(block);
+        stmts.push(branch_stmt(cond, then_block, Some(else_block)));
+        Some(Some(stop))
+    }
+
     fn cross_structure_escape_target(&self, block: BlockRef) -> Option<BlockRef> {
         let loop_context = self.active_loops.last()?;
         let candidate = self.branch_by_header.get(&block).copied()?;
@@ -1378,7 +1423,17 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // active loop 的本地语义时才吸收；否则宁可保持 fallback，也不把跨结构跳转误判成 continue。
         let loop_context = self.active_loops.last()?.clone();
         let continue_target = loop_context.continue_target?;
-        if !self.loop_continue_target_is_empty(continue_target) {
+        let continue_target_is_empty = self.loop_continue_target_is_empty(continue_target);
+        let can_fallthrough_to_non_empty_continue = self
+            .loop_by_header
+            .get(&loop_context.header)
+            .is_some_and(|candidate| {
+                matches!(
+                    candidate.kind_hint,
+                    LoopKindHint::NumericForLike | LoopKindHint::GenericForLike
+                )
+            });
+        if !continue_target_is_empty && !can_fallthrough_to_non_empty_continue {
             return None;
         }
         if self
@@ -1430,6 +1485,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             continue_target,
             &loop_context,
         );
+        if !continue_target_is_empty
+            && !prefer_natural_fallthrough
+            && candidate.merge != Some(continue_target)
+        {
+            return None;
+        }
         let then_target_overrides =
             self.branch_entry_target_overrides(block, Some(candidate.then_entry), target_overrides);
 

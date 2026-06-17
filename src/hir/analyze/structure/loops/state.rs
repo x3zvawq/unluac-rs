@@ -36,12 +36,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             //  1) 内层循环控制寄存器的幻影 phi：外层循环不关心这个寄存器，
             //     exit phi 也不引用它 → 安全跳过。
             //  2) nil 初始化的循环携带变量（如 `local last_positive`）：
-            //     循环结束后仍需使用（exit phi 引用了该寄存器）→ 用 nil 作为初值。
+            //     循环体或循环结束后仍需使用 → 用 nil 作为初值。
             let init = match self.loop_entry_expr(preheader, value, target_overrides) {
                 Some(init) => init,
                 None => {
                     if value.outside_arm.defs().count() == 0 {
-                        if Self::exit_value_for_reg(candidate, exit, value.reg).is_some() {
+                        if self.lowering.dataflow.phi_use_count(value.phi_id) > 0
+                            || Self::exit_value_for_reg(candidate, exit, value.reg).is_some()
+                        {
                             HirExpr::Nil
                         } else {
                             continue;
