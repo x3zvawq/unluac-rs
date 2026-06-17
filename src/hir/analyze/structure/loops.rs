@@ -95,3 +95,15 @@ fn single_fixed_def_expr(
     }
     Some(HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()]))
 }
+
+fn single_fixed_def_lvalue(
+    lowering: &ProtoLowering<'_>,
+    defs: impl IntoIterator<Item = crate::cfg::DefId>,
+) -> Option<HirLValue> {
+    let mut defs = defs.into_iter();
+    let def = defs.next()?;
+    if defs.next().is_some() {
+        return None;
+    }
+    Some(HirLValue::Temp(lowering.bindings.fixed_temps[def.index()]))
+}

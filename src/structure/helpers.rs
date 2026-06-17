@@ -176,7 +176,11 @@ pub(super) fn compute_irreducible_regions(cfg: &Cfg) -> Vec<IrreducibleRegion> {
         }
 
         let entry_edges = collect_region_entry_edges(cfg, &component);
-        if entry_edges.len() <= 1 {
+        let entry_targets = entry_edges
+            .iter()
+            .map(|edge_ref| cfg.edges[edge_ref.index()].to)
+            .collect::<BTreeSet<_>>();
+        if entry_targets.len() <= 1 {
             continue;
         }
 

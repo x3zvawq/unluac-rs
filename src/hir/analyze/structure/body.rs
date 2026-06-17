@@ -61,7 +61,6 @@ pub(super) struct StructuredBranchPlan {
 pub(super) struct LoopStateSlot {
     pub(super) phi_id: Option<PhiId>,
     pub(super) reg: Reg,
-    pub(super) temp: TempId,
     pub(super) target: HirLValue,
     pub(super) init: HirExpr,
 }
@@ -698,10 +697,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         &mut self,
         block: BlockRef,
         phi_id: PhiId,
-        target_temp: TempId,
+        target: &HirLValue,
         expr: HirExpr,
     ) {
-        if target_temp == self.lowering.bindings.phi_temps[phi_id.index()] {
+        let phi_temp = self.lowering.bindings.phi_temps[phi_id.index()];
+        if lvalue_as_expr(target) == Some(HirExpr::TempRef(phi_temp)) {
             self.overrides.suppress_phi(phi_id);
         } else {
             self.overrides.insert_phi_expr(block, phi_id, expr);
