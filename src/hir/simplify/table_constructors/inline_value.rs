@@ -4,7 +4,9 @@
 //! callee/access-base 值，不会在这里决定整段 region 的分段边界。
 //! 例如：`local v = f(); t.x = v` 可能在这里折叠成 `t.x = f()`。
 
-use crate::hir::common::{HirBlock, HirCallExpr, HirExpr, HirLogicalExpr};
+use crate::hir::common::{
+    HirBinaryExpr, HirBlock, HirCallExpr, HirExpr, HirLogicalExpr, HirUnaryExpr,
+};
 
 use super::bindings::{BindingIndex, BindingUseSummary, binding_from_expr};
 use super::{PendingProducer, PendingProducerSource};
@@ -96,6 +98,31 @@ fn inline_constructor_value_at_site(
     }
 
     match value {
+        HirExpr::Unary(unary) => {
+            return Some(HirExpr::Unary(Box::new(HirUnaryExpr {
+                op: unary.op,
+                expr: inline_constructor_value_at_site(
+                    context,
+                    &unary.expr,
+                    ConstructorInlineSite::Neutral,
+                )?,
+            })));
+        }
+        HirExpr::Binary(binary) => {
+            return Some(HirExpr::Binary(Box::new(HirBinaryExpr {
+                op: binary.op,
+                lhs: inline_constructor_value_at_site(
+                    context,
+                    &binary.lhs,
+                    ConstructorInlineSite::Neutral,
+                )?,
+                rhs: inline_constructor_value_at_site(
+                    context,
+                    &binary.rhs,
+                    ConstructorInlineSite::Neutral,
+                )?,
+            })));
+        }
         HirExpr::TableAccess(access) => {
             return Some(HirExpr::TableAccess(Box::new(
                 crate::hir::common::HirTableAccess {
