@@ -17,21 +17,26 @@
 //!
 //! 提升完成后，同一个 block 里还会执行两步后处理：
 //! 1. branch-value 折叠：`local X; if cond then X=a else X=b end` → `local X = expr`
-//! 2. 相邻 local-assign 合并：`local X; X = expr` → `local X = expr`
+//! 2. nil fallback 收敛：`local X; if A == nil then X=b else X=A end` →
+//!    `local X=A; if X == nil then X=b end`
+//! 3. 相邻 local-assign 合并：`local X; X = expr` → `local X = expr`
 //!
 //! 这两步原先分别在独立的 `branch_value_exprs` pass 和 AST `statement_merge` 里执行，
 //! 整合到提升出口后可以减少跨 pass 迭代和跨层机械修补。
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::branch_value_folding::{fold_branch_value_locals_in_block, matches_local_lvalue};
+use super::branch_value_folding::{
+    empty_single_local_decl_binding, fold_branch_value_locals_in_block, matches_local_lvalue,
+};
 use super::temp_touch::{
     collect_temp_refs_in_stmts, expr_touches_any_temp, stmt_consumes_temps_only_in_control_head,
     stmt_contains_nested_nonlocal_control, stmt_touches_any_temp, stmts_touch_temp,
 };
 use crate::hir::common::{
-    HirAssign, HirBlock, HirCallExpr, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt,
-    HirTableConstructor, HirTableField, HirTableKey, LocalId, TempId,
+    HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirExpr, HirIf, HirLValue,
+    HirLocalDecl, HirProto, HirStmt, HirTableConstructor, HirTableField, HirTableKey, LocalId,
+    TempId,
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
@@ -266,6 +271,8 @@ fn promote_block(
 
     // 后处理：把 `local X; if cond then X=a else X=b end` 收回值表达式
     changed |= fold_branch_value_locals_in_block(&mut block.stmts);
+    // 后处理：保留 nil 判断语义，去掉只负责搬运 fallback 值的 if/else 壳
+    changed |= fold_nil_fallback_alias_locals_in_block(&mut block.stmts);
     // 后处理：把相邻的 `local X; X = expr` 合并成 `local X = expr`
     changed |= merge_adjacent_local_assigns_in_block(&mut block.stmts);
 
@@ -289,6 +296,214 @@ fn compute_suffix_temp_refs(stmts: &[HirStmt]) -> Vec<BTreeSet<TempId>> {
 /// 合并两个 temp 集合，返回并集。
 fn merge_temp_sets(a: &BTreeSet<TempId>, b: &BTreeSet<TempId>) -> BTreeSet<TempId> {
     a.union(b).copied().collect()
+}
+
+// ── 后处理：nil fallback alias 收敛 ─────────────────────────────────
+
+/// 扫描 block 中相邻的 `local X; if A == nil then X=b else X=A end` 形状，
+/// 改写成 `local X=A; if X == nil then X=b end`。
+///
+/// 这里不能恢复成 `A or b`：Lua 的 `or` 会把 `false` 也视为 fallback 条件，而
+/// 这个字节码形状只在值为 nil 时才走 fallback。
+fn fold_nil_fallback_alias_locals_in_block(stmts: &mut [HirStmt]) -> bool {
+    let mut changed = false;
+    let mut index = 0;
+
+    while index + 1 < stmts.len() {
+        let Some(rewrite) = nil_fallback_alias_rewrite(&stmts[index], &stmts[index + 1]) else {
+            index += 1;
+            continue;
+        };
+
+        stmts[index] = HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![rewrite.target],
+            values: vec![HirExpr::LocalRef(rewrite.source)],
+        }));
+        stmts[index + 1] = HirStmt::If(Box::new(HirIf {
+            cond: nil_check_for_local(rewrite.target),
+            then_block: rewrite.then_block,
+            else_block: None,
+        }));
+        changed = true;
+        index += 2;
+    }
+
+    changed
+}
+
+struct NilFallbackAliasRewrite {
+    target: LocalId,
+    source: LocalId,
+    then_block: HirBlock,
+}
+
+fn nil_fallback_alias_rewrite(
+    decl_stmt: &HirStmt,
+    if_stmt: &HirStmt,
+) -> Option<NilFallbackAliasRewrite> {
+    let target = empty_single_local_decl_binding(decl_stmt)?;
+    let HirStmt::If(if_stmt) = if_stmt else {
+        return None;
+    };
+    let else_block = if_stmt.else_block.as_ref()?;
+    let (source, fallback_block) = if let Some(source) = nil_check_local(&if_stmt.cond) {
+        let then_value = terminal_local_assign_value(&if_stmt.then_block, target)?;
+        let else_value = single_local_assign_value(else_block, target)?;
+        if !matches!(else_value, HirExpr::LocalRef(local) if *local == source)
+            || expr_mentions_specific_local(then_value, target)
+        {
+            return None;
+        }
+        (source, if_stmt.then_block.clone())
+    } else {
+        let source = negated_nil_check_local(&if_stmt.cond)?;
+        let then_value = single_local_assign_value(&if_stmt.then_block, target)?;
+        let else_value = terminal_local_assign_value(else_block, target)?;
+        if !matches!(then_value, HirExpr::LocalRef(local) if *local == source)
+            || expr_mentions_specific_local(else_value, target)
+        {
+            return None;
+        }
+        (source, else_block.clone())
+    };
+    Some(NilFallbackAliasRewrite {
+        target,
+        source,
+        then_block: fallback_block,
+    })
+}
+
+fn nil_check_local(expr: &HirExpr) -> Option<LocalId> {
+    let HirExpr::Binary(binary) = expr else {
+        return None;
+    };
+    if binary.op != HirBinaryOpKind::Eq {
+        return None;
+    }
+    match (&binary.lhs, &binary.rhs) {
+        (HirExpr::LocalRef(local), HirExpr::Nil) | (HirExpr::Nil, HirExpr::LocalRef(local)) => {
+            Some(*local)
+        }
+        _ => None,
+    }
+}
+
+fn negated_nil_check_local(expr: &HirExpr) -> Option<LocalId> {
+    let HirExpr::Unary(unary) = expr else {
+        return None;
+    };
+    (unary.op == crate::hir::common::HirUnaryOpKind::Not)
+        .then(|| nil_check_local(&unary.expr))
+        .flatten()
+}
+
+fn nil_check_for_local(local: LocalId) -> HirExpr {
+    HirExpr::Binary(Box::new(HirBinaryExpr {
+        op: HirBinaryOpKind::Eq,
+        lhs: HirExpr::LocalRef(local),
+        rhs: HirExpr::Nil,
+    }))
+}
+
+fn single_local_assign_value(block: &HirBlock, target: LocalId) -> Option<&HirExpr> {
+    let [HirStmt::Assign(assign)] = block.stmts.as_slice() else {
+        return None;
+    };
+    let [assign_target] = assign.targets.as_slice() else {
+        return None;
+    };
+    let [value] = assign.values.as_slice() else {
+        return None;
+    };
+    matches_local_lvalue(assign_target, target).then_some(value)
+}
+
+fn terminal_local_assign_value(block: &HirBlock, target: LocalId) -> Option<&HirExpr> {
+    let HirStmt::Assign(assign) = block.stmts.last()? else {
+        return None;
+    };
+    let [assign_target] = assign.targets.as_slice() else {
+        return None;
+    };
+    let [value] = assign.values.as_slice() else {
+        return None;
+    };
+    matches_local_lvalue(assign_target, target).then_some(value)
+}
+
+fn expr_mentions_specific_local(expr: &HirExpr, local: LocalId) -> bool {
+    match expr {
+        HirExpr::LocalRef(candidate) => *candidate == local,
+        HirExpr::TableAccess(access) => {
+            expr_mentions_specific_local(&access.base, local)
+                || expr_mentions_specific_local(&access.key, local)
+        }
+        HirExpr::Unary(unary) => expr_mentions_specific_local(&unary.expr, local),
+        HirExpr::Binary(binary) => {
+            expr_mentions_specific_local(&binary.lhs, local)
+                || expr_mentions_specific_local(&binary.rhs, local)
+        }
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            expr_mentions_specific_local(&logical.lhs, local)
+                || expr_mentions_specific_local(&logical.rhs, local)
+        }
+        HirExpr::Decision(decision) => decision.nodes.iter().any(|node| {
+            expr_mentions_specific_local(&node.test, local)
+                || match &node.truthy {
+                    crate::hir::common::HirDecisionTarget::Expr(expr) => {
+                        expr_mentions_specific_local(expr, local)
+                    }
+                    crate::hir::common::HirDecisionTarget::Node(_)
+                    | crate::hir::common::HirDecisionTarget::CurrentValue => false,
+                }
+                || match &node.falsy {
+                    crate::hir::common::HirDecisionTarget::Expr(expr) => {
+                        expr_mentions_specific_local(expr, local)
+                    }
+                    crate::hir::common::HirDecisionTarget::Node(_)
+                    | crate::hir::common::HirDecisionTarget::CurrentValue => false,
+                }
+        }),
+        HirExpr::Call(call) => {
+            expr_mentions_specific_local(&call.callee, local)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_mentions_specific_local(arg, local))
+        }
+        HirExpr::TableConstructor(table) => {
+            table.fields.iter().any(|field| match field {
+                HirTableField::Array(expr) => expr_mentions_specific_local(expr, local),
+                HirTableField::Record(field) => {
+                    matches!(
+                        &field.key,
+                        HirTableKey::Expr(expr) if expr_mentions_specific_local(expr, local)
+                    ) || expr_mentions_specific_local(&field.value, local)
+                }
+            }) || table
+                .trailing_multivalue
+                .as_ref()
+                .is_some_and(|expr| expr_mentions_specific_local(expr, local))
+        }
+        HirExpr::Closure(closure) => closure
+            .captures
+            .iter()
+            .any(|capture| expr_mentions_specific_local(&capture.value, local)),
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
+        | HirExpr::ParamRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::TempRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::VarArg
+        | HirExpr::Unresolved(_) => false,
+    }
 }
 
 // ── 后处理：相邻 local-assign 合并 ───────────────────────────────────
