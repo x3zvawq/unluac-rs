@@ -28,12 +28,15 @@ use crate::ast::AstTargetDialect;
 use crate::cfg::{BlockRef, Cfg, CfgGraph, DataflowFacts, GraphFacts, PhiId};
 use crate::decompile::{DecompileContext, DecompileState};
 use crate::hir::common::{
-    HirBlock, HirCallExpr, HirCallStmt, HirCapture, HirClose, HirClosureExpr, HirExpr, HirLValue,
-    HirLabel, HirLabelId, HirProto, HirProtoRef, HirStmt, HirTableSetList, HirToBeClosed,
-    HirUnaryExpr, LocalId, ParamId, TempId, UpvalueId,
+    HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirCallStmt, HirCapture, HirClose,
+    HirClosureExpr, HirExpr, HirLValue, HirLabel, HirLabelId, HirProto, HirProtoRef, HirStmt,
+    HirTableSetList, HirToBeClosed, HirUnaryExpr, LocalId, ParamId, TempId, UpvalueId,
 };
 use crate::structure::{ShortCircuitExit, StructureFacts};
-use crate::transformer::{AccessKey, CallKind, InstrRef, LowInstr, LoweredProto, Reg, ResultPack};
+use crate::transformer::{
+    AccessKey, CallKind, GenericForCallInstr, GenericForLoopInstr, InstrRef, LowInstr,
+    LoweredProto, Reg, ResultPack,
+};
 
 pub(super) struct ProtoBindings {
     pub(super) params: Vec<ParamId>,
@@ -283,6 +286,17 @@ fn lower_control_instr_with_edge_copies(
                 )),
             )]
         }
+        LowInstr::GenericForLoop(generic_for) => vec![branch_stmt(
+            generic_for_loop_continue_cond(lowering, block, instr_ref, generic_for),
+            lower_generic_for_body_edge_block(lowering, block, generic_for, next_block, label_map),
+            Some(lower_edge_block(
+                lowering,
+                block,
+                lowering.cfg.instr_to_block[generic_for.exit_target.index()],
+                next_block,
+                label_map,
+            )),
+        )],
         _ => lower_control_instr(lowering, block, instr_ref, instr, label_map),
     }
 }
@@ -325,6 +339,23 @@ fn lower_edge_phi_copies(
     } else {
         vec![assign_stmt(targets, values)]
     }
+}
+
+fn lower_generic_for_body_edge_block(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    generic_for: &GenericForLoopInstr,
+    next_block: Option<BlockRef>,
+    label_map: &BTreeMap<BlockRef, HirLabelId>,
+) -> HirBlock {
+    let instr_ref = lowering.cfg.blocks[block.index()]
+        .instrs
+        .last()
+        .expect("generic-for-loop block should contain its terminator");
+    let target = lowering.cfg.instr_to_block[generic_for.body_target.index()];
+    let mut stmts = generic_for_control_update(lowering, block, instr_ref, generic_for);
+    stmts.extend(lower_edge_block(lowering, block, target, next_block, label_map).stmts);
+    HirBlock { stmts }
 }
 
 fn generic_phi_materializations_in_block<'a>(
@@ -706,11 +737,9 @@ pub(super) fn lower_regular_instr(
                 ))),
             ),
         ],
-        LowInstr::GenericForCall(_instr) => fixed_or_open_assign(
-            lowering,
-            instr_ref,
-            vec![unresolved_expr("generic-for-call")],
-        ),
+        LowInstr::GenericForCall(instr) => {
+            lower_generic_for_call(lowering, block, instr_ref, instr)
+        }
         LowInstr::GenericForLoop(_instr) => vec![unstructured_stmt("generic-for-loop")],
         LowInstr::Jump(_) | LowInstr::Branch(_) => Vec::new(),
     }
@@ -802,8 +831,14 @@ pub(super) fn lower_control_instr(
             ),
         ],
         LowInstr::GenericForLoop(instr) => vec![branch_stmt(
-            unresolved_expr("generic-for-loop cond"),
-            goto_block(label_for_block(lowering.cfg, label_map, instr.body_target)),
+            generic_for_loop_continue_cond(lowering, block, instr_ref, instr),
+            {
+                let mut body = generic_for_control_update(lowering, block, instr_ref, instr);
+                body.extend(
+                    goto_block(label_for_block(lowering.cfg, label_map, instr.body_target)).stmts,
+                );
+                HirBlock { stmts: body }
+            },
             Some(goto_block(label_for_block(
                 lowering.cfg,
                 label_map,
@@ -841,6 +876,96 @@ fn lower_set_list(
         values,
         trailing_multivalue,
     }))]
+}
+
+fn lower_generic_for_call(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    instr: &GenericForCallInstr,
+) -> Vec<HirStmt> {
+    fixed_or_open_assign(
+        lowering,
+        instr_ref,
+        vec![generic_for_iterator_call(lowering, block, instr_ref, instr)],
+    )
+}
+
+fn generic_for_iterator_call(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    instr: &GenericForCallInstr,
+) -> HirExpr {
+    let callee = expr_for_reg_use(lowering, block, instr_ref, instr.state.start);
+    let args = (1..instr.state.len)
+        .map(|offset| {
+            expr_for_reg_use(
+                lowering,
+                block,
+                instr_ref,
+                Reg(instr.state.start.index() + offset),
+            )
+        })
+        .collect();
+
+    HirExpr::Call(Box::new(HirCallExpr {
+        callee,
+        args,
+        multiret: true,
+        method: false,
+        method_name: None,
+    }))
+}
+
+fn generic_for_loop_continue_cond(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    instr: &GenericForLoopInstr,
+) -> HirExpr {
+    let first_binding = generic_for_loop_first_binding_expr(lowering, block, instr_ref, instr);
+    HirExpr::Binary(Box::new(HirBinaryExpr {
+        op: HirBinaryOpKind::Eq,
+        lhs: first_binding,
+        rhs: HirExpr::Nil,
+    }))
+    .negate()
+}
+
+fn generic_for_control_update(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    instr: &GenericForLoopInstr,
+) -> Vec<HirStmt> {
+    let target = match expr_for_reg_use(lowering, block, instr_ref, instr.control) {
+        HirExpr::TempRef(temp) => HirLValue::Temp(temp),
+        HirExpr::LocalRef(local) => HirLValue::Local(local),
+        _ => return Vec::new(),
+    };
+    let value = generic_for_loop_first_binding_expr(lowering, block, instr_ref, instr);
+    vec![assign_stmt(vec![target], vec![value])]
+}
+
+fn generic_for_loop_first_binding_expr(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    instr: &GenericForLoopInstr,
+) -> HirExpr {
+    // `TFORLOOP` 的判空对象是同一 header 中前一条 `GenericForCall` 刚写出的
+    // 第一个返回值；不能用 loop 指令处对 binding 寄存器的 reaching value，否则会
+    // 读到上一轮迭代的源码 local。
+    let range = lowering.cfg.blocks[block.index()].instrs;
+    if instr_ref.index() > range.start.index()
+        && let Some(LowInstr::GenericForCall(_)) = lowering.proto.instrs.get(instr_ref.index() - 1)
+        && let Some(temp) = lowering.bindings.instr_fixed_defs[instr_ref.index() - 1].first()
+    {
+        return HirExpr::TempRef(*temp);
+    }
+
+    expr_for_reg_use(lowering, block, instr_ref, instr.bindings.start)
 }
 
 fn lower_call(

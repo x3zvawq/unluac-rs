@@ -1183,11 +1183,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // 这样后面的 AST/readability 就不用再对着 `close + jump` 反推源码意图。
         let loop_context = self.active_loops.last()?.clone();
         let candidate = *self.branch_by_header.get(&block)?;
-        if candidate.else_entry.is_some()
-            && loop_context.continue_target == Some(candidate.then_entry)
-        {
-            return None;
-        }
         let break_exit = candidate.merge.filter(|merge| {
             loop_context.break_exits.contains_key(merge)
                 || *merge == loop_context.post_loop
@@ -1251,7 +1246,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let body_stop = loop_context
             .continue_target
             .filter(|target| {
-                *target != break_exit && self.lowering.cfg.can_reach(candidate.then_entry, *target)
+                *target != break_exit
+                    && (candidate.then_entry == *target
+                        || self.lowering.cfg.can_reach(candidate.then_entry, *target))
             })
             .or(Some(break_exit));
         let then_block = self.lower_region(candidate.then_entry, body_stop, target_overrides)?;
@@ -1430,18 +1427,20 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .is_some_and(|candidate| {
                 matches!(
                     candidate.kind_hint,
-                    LoopKindHint::NumericForLike | LoopKindHint::GenericForLike
+                    LoopKindHint::NumericForLike
+                        | LoopKindHint::GenericForLike
+                        | LoopKindHint::Unknown
                 )
             });
         if !continue_target_is_empty && !can_fallthrough_to_non_empty_continue {
             return None;
         }
-        if self
-            .try_build_short_circuit_plan(block, stop)
-            .flatten()
-            .is_some()
-        {
-            return None;
+        if let Some(short_plan) = self.try_build_short_circuit_plan(block, stop).flatten() {
+            let short_plan_has_continue_edge = short_plan.then_entry == continue_target
+                || short_plan.else_entry == Some(continue_target);
+            if !short_plan_has_continue_edge {
+                return None;
+            }
         }
         let branch_points_to_continue =
             self.branch_by_header.get(&block).is_some_and(|candidate| {
@@ -1565,7 +1564,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     non_continue_block,
                     None,
                 ));
-                return Some(Some(continue_target));
+                return if !continue_target_is_empty && continue_target == loop_context.header {
+                    Some(None)
+                } else {
+                    Some(Some(continue_target))
+                };
             }
 
             let continue_block = self.explicit_continue_block()?;
@@ -1614,8 +1617,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 continue_target,
                 &loop_context,
             ) {
+                let branch_stop = if continue_target_is_empty {
+                    stop
+                } else {
+                    Some(continue_target)
+                };
                 let non_continue_block =
-                    self.lower_region(non_continue_entry, stop, target_overrides)?;
+                    self.lower_region(non_continue_entry, branch_stop, target_overrides)?;
                 stmts.push(branch_stmt(
                     continue_cond.negate(),
                     non_continue_block,
@@ -1661,7 +1669,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let merge = candidate.merge.or(stop)?;
         let continue_block = self.explicit_continue_block()?;
         stmts.push(branch_stmt(continue_cond, continue_block, None));
-        if merge == self.lowering.cfg.exit_block {
+        if merge == self.lowering.cfg.exit_block
+            || (!continue_target_is_empty && continue_target == loop_context.header)
+        {
             Some(None)
         } else {
             Some(Some(merge))

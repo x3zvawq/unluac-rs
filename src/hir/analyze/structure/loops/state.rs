@@ -10,6 +10,7 @@
 //!   属于同一个语义槽位后，直接复用已有 loop state，而不是再物化一层假的 phi
 
 use super::*;
+use crate::cfg::SsaValue;
 
 impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     pub(super) fn build_loop_state_plan(
@@ -72,7 +73,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             }
 
             plan.states.push(LoopStateSlot {
-                phi_id: value.phi_id,
+                phi_id: Some(value.phi_id),
                 reg: value.reg,
                 temp,
                 target,
@@ -130,7 +131,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             }
 
             plan.states.push(LoopStateSlot {
-                phi_id: value.phi_id,
+                phi_id: Some(value.phi_id),
                 reg: value.reg,
                 temp,
                 target,
@@ -138,7 +139,107 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             });
         }
 
+        self.add_loop_live_out_states(
+            candidate,
+            preheader,
+            exit,
+            &excluded,
+            target_overrides,
+            &mut plan,
+        );
+
         Some(plan)
+    }
+
+    fn add_loop_live_out_states(
+        &self,
+        candidate: &LoopCandidate,
+        preheader: Option<BlockRef>,
+        exit: BlockRef,
+        excluded: &BTreeSet<Reg>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+        plan: &mut LoopStatePlan,
+    ) {
+        let range = self.lowering.cfg.blocks[exit.index()].instrs;
+        if range.is_empty() {
+            return;
+        }
+        let live_in = self.lowering.dataflow.live_in_regs(exit);
+        let reaching = self.lowering.dataflow.reaching_values_at(range.start);
+
+        for reg in live_in {
+            if excluded.contains(reg) || plan.states.iter().any(|state| state.reg == *reg) {
+                continue;
+            }
+            let Some(values) = reaching.get(*reg) else {
+                continue;
+            };
+            let values = values.iter().collect::<Vec<_>>();
+            if values.is_empty()
+                || !values
+                    .iter()
+                    .all(|value| self.value_belongs_to_loop(candidate, *value))
+            {
+                continue;
+            }
+            let Some(temp) = self.live_out_state_temp(&values) else {
+                continue;
+            };
+            let mut init = preheader
+                .map(|preheader| expr_for_reg_at_block_exit(self.lowering, preheader, *reg))
+                .unwrap_or_else(|| self.loop_entry_initial_expr(*reg));
+            rewrite_expr_temps(&mut init, &temp_expr_overrides(target_overrides));
+            let target = target_overrides
+                .get(&temp)
+                .filter(|target| lvalue_as_expr(target).is_some())
+                .cloned()
+                .unwrap_or(HirLValue::Temp(temp));
+
+            for value in values {
+                match value {
+                    SsaValue::Def(def) => {
+                        let def_temp = self.lowering.bindings.fixed_temps[def.index()];
+                        plan.backedge_target_overrides
+                            .insert(def_temp, target.clone());
+                    }
+                    SsaValue::Phi(phi_id) => {
+                        let phi_temp = self.lowering.bindings.phi_temps[phi_id.index()];
+                        plan.backedge_target_overrides
+                            .insert(phi_temp, target.clone());
+                    }
+                }
+            }
+            plan.states.push(LoopStateSlot {
+                phi_id: None,
+                reg: *reg,
+                temp,
+                target,
+                init,
+            });
+        }
+    }
+
+    fn value_belongs_to_loop(&self, candidate: &LoopCandidate, value: SsaValue) -> bool {
+        match value {
+            SsaValue::Def(def) => candidate
+                .blocks
+                .contains(&self.lowering.dataflow.def_block(def)),
+            SsaValue::Phi(phi_id) => candidate
+                .blocks
+                .contains(&self.lowering.dataflow.phi_candidates[phi_id.index()].block),
+        }
+    }
+
+    fn live_out_state_temp(&self, values: &[SsaValue]) -> Option<TempId> {
+        values.iter().find_map(|value| match *value {
+            SsaValue::Def(def) => self.lowering.bindings.fixed_temps.get(def.index()).copied(),
+            SsaValue::Phi(phi_id) => self
+                .lowering
+                .bindings
+                .phi_temps
+                .get(phi_id.index())
+                .copied(),
+        })
     }
 
     fn loop_exit_state_preheader_init(

@@ -56,7 +56,7 @@ pub(super) struct StructuredBranchPlan {
 
 #[derive(Debug, Clone)]
 pub(super) struct LoopStateSlot {
-    pub(super) phi_id: PhiId,
+    pub(super) phi_id: Option<PhiId>,
     pub(super) reg: Reg,
     pub(super) temp: TempId,
     pub(super) target: HirLValue,
@@ -1109,7 +1109,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .is_some_and(|candidate| {
                 matches!(
                     candidate.kind_hint,
-                    LoopKindHint::NumericForLike | LoopKindHint::GenericForLike
+                    LoopKindHint::NumericForLike
+                        | LoopKindHint::GenericForLike
+                        | LoopKindHint::Unknown
                 )
             })
     }

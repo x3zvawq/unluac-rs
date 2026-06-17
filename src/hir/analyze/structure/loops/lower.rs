@@ -1,7 +1,8 @@
 //! 这个子模块负责把已确认的 `LoopCandidate` 真正降成 HIR 循环语句。
 //!
 //! 它依赖 StructureFacts 已区分好的 while/repeat/numeric-for/generic-for 形态和 override
-//! 状态，不会在这里重新识别循环种类。
+//! 状态，不会在这里重新识别循环种类；对于仍归为 Unknown 但已经证明可规约且只有单一
+//! 出口的 retry loop，会保守降成 `while true ... break`。
 //! 例如：`NumericForLike` 的候选会在这里降成 `HirStmt::NumericFor`。
 
 use crate::cfg::SsaValue;
@@ -37,8 +38,69 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             LoopKindHint::GenericForLike => {
                 self.try_lower_generic_for_preheader(block, stop, stmts, target_overrides)
             }
-            LoopKindHint::Unknown => None,
+            LoopKindHint::Unknown => {
+                self.lower_unknown_retry_loop(candidate, stop, stmts, target_overrides)
+            }
         }
+    }
+
+    fn lower_unknown_retry_loop(
+        &mut self,
+        candidate: &LoopCandidate,
+        stop: Option<BlockRef>,
+        stmts: &mut Vec<HirStmt>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<Option<BlockRef>> {
+        if candidate.exits.len() != 1 {
+            return None;
+        }
+        let post_loop = candidate.exits.iter().next().copied()?;
+        if let Some(stop) = stop
+            && stop != post_loop
+            && candidate.blocks.contains(&stop)
+        {
+            return None;
+        }
+
+        let preheader = unique_loop_preheader(candidate);
+        let plan =
+            self.build_loop_state_plan(candidate, preheader, post_loop, &[], target_overrides)?;
+        let combined_target_overrides =
+            merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
+        let mut loop_context = self.build_active_loop_context(
+            candidate,
+            post_loop,
+            &combined_target_overrides,
+            &plan.states,
+        )?;
+        loop_context.loop_blocks = candidate.blocks.clone();
+        loop_context.continue_target = Some(candidate.header);
+        loop_context.continue_sources.clear();
+        loop_context.state_slots = plan.states.clone();
+
+        self.active_loops.push(loop_context.clone());
+        let body = self.lower_region_with_suppressed_loop(
+            candidate.header,
+            Some(post_loop),
+            &combined_target_overrides,
+            Some(candidate.header),
+        )?;
+        self.active_loops.pop();
+
+        stmts.extend(loop_state_init_stmts(&plan));
+        self.visited.extend(
+            loop_context
+                .break_exits
+                .values()
+                .flat_map(|break_exit| break_exit.blocks.iter().copied()),
+        );
+        self.install_loop_exit_bindings(candidate, post_loop, &plan, target_overrides);
+        stmts.push(HirStmt::While(Box::new(HirWhile {
+            cond: HirExpr::Boolean(true),
+            body,
+        })));
+
+        Some(Some(post_loop))
     }
 
     fn lower_while_loop(
@@ -319,7 +381,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let suppressed = plan
             .states
             .iter()
-            .map(|state| state.phi_id)
+            .filter_map(|state| state.phi_id)
             .collect::<Vec<_>>();
         for phi_id in &suppressed {
             self.overrides.suppress_phi(*phi_id);
@@ -412,7 +474,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let mut suppressed = plan
             .states
             .iter()
-            .map(|state| state.phi_id)
+            .filter_map(|state| state.phi_id)
             .collect::<Vec<_>>();
         suppressed.extend(
             Self::header_values(candidate)
