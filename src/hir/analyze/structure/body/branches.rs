@@ -149,8 +149,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             self.restore_state_checkpoint(checkpoint, stmts);
         }
 
-        for header in &plan.consumed_headers {
-            self.visited.insert(*header);
+        for block in &plan.consumed_blocks {
+            self.visited.insert(*block);
         }
         let mut branch_stop =
             self.branch_stop_for_region(block, plan.then_entry, plan.else_entry, plan.merge, stop);
@@ -802,8 +802,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stmts: &mut Vec<HirStmt>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Option<BlockRef>> {
-        for header in &plan.consumed_headers {
-            self.visited.insert(*header);
+        for block in &plan.consumed_blocks {
+            self.visited.insert(*block);
         }
 
         let gated_block = self.lower_region(

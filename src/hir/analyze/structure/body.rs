@@ -52,6 +52,9 @@ pub(super) struct StructuredBranchPlan {
     pub(super) else_entry: Option<BlockRef>,
     pub(super) merge: Option<BlockRef>,
     pub(super) consumed_headers: Vec<BlockRef>,
+    // 短路候选的语义节点只包含条件 header；某些出口会先经过空 jump pad 再到
+    // truthy/falsy 出口。pad 不参与条件重写，但需要计入覆盖性检查。
+    pub(super) consumed_blocks: Vec<BlockRef>,
 }
 
 #[derive(Debug, Clone)]
@@ -749,6 +752,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 else_entry: candidate.else_entry,
                 merge: candidate.merge,
                 consumed_headers: vec![block],
+                consumed_blocks: vec![block],
             }),
             BranchKind::IfThen | BranchKind::Guard => Some(StructuredBranchPlan {
                 cond: self.lower_candidate_cond(block, candidate)?,
@@ -756,6 +760,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 else_entry: None,
                 merge: candidate.merge,
                 consumed_headers: vec![block],
+                consumed_blocks: vec![block],
             }),
         }
     }
@@ -840,12 +845,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // 直接产出空 body 的 if-then，避免后续 postdom 推导制造出
         // then_entry == else_entry 的畸形 plan。
         if truthy == falsy {
+            let consumed_blocks =
+                self.branch_short_circuit_consumed_blocks(&consumed_headers, truthy, falsy, stop);
             return Some(Some(StructuredBranchPlan {
                 cond,
                 then_entry: truthy,
                 else_entry: None,
                 merge: Some(falsy),
                 consumed_headers,
+                consumed_blocks,
             }));
         }
 
@@ -856,12 +864,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return Some(None);
         }
         if stop == Some(truthy) && falsy != truthy && self.block_is_active_loop_escape(falsy) {
+            let consumed_blocks =
+                self.branch_short_circuit_consumed_blocks(&consumed_headers, truthy, falsy, stop);
             return Some(Some(StructuredBranchPlan {
                 cond,
                 then_entry: truthy,
                 else_entry: Some(falsy),
                 merge: Some(falsy),
                 consumed_headers,
+                consumed_blocks,
             }));
         }
         let truthy_flows_to_falsy = self.lowering.cfg.can_reach(truthy, falsy)
@@ -874,12 +885,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // 只有 falsy 本身就是两条出口的最近共同后支配点时，才说明这是
         // `if cond then ... end` 的自然 fallthrough，而不是 `if cond then ... else ... end`。
         if stop == Some(falsy) || truthy_flows_to_falsy {
+            let consumed_blocks =
+                self.branch_short_circuit_consumed_blocks(&consumed_headers, truthy, falsy, stop);
             return Some(Some(StructuredBranchPlan {
                 cond,
                 then_entry: truthy,
                 else_entry: None,
                 merge: Some(falsy),
                 consumed_headers,
+                consumed_blocks,
             }));
         }
 
@@ -896,12 +910,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             && stop.is_none_or(|stop| self.can_reach_avoiding_block(truthy, falsy, stop))
             && self.lowering.cfg.can_reach(truthy, falsy)
         {
+            let consumed_blocks =
+                self.branch_short_circuit_consumed_blocks(&consumed_headers, truthy, falsy, stop);
             return Some(Some(StructuredBranchPlan {
                 cond,
                 then_entry: truthy,
                 else_entry: None,
                 merge: None,
                 consumed_headers,
+                consumed_blocks,
             }));
         }
 
@@ -910,13 +927,90 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .graph_facts
             .nearest_common_postdom(truthy, falsy)?;
 
+        let consumed_blocks =
+            self.branch_short_circuit_consumed_blocks(&consumed_headers, truthy, falsy, stop);
         Some(Some(StructuredBranchPlan {
             cond,
             then_entry: truthy,
             else_entry: Some(falsy),
             merge: (merge != self.lowering.cfg.exit_block).then_some(merge),
             consumed_headers,
+            consumed_blocks,
         }))
+    }
+
+    fn branch_short_circuit_consumed_blocks(
+        &self,
+        consumed_headers: &[BlockRef],
+        truthy: BlockRef,
+        falsy: BlockRef,
+        stop: Option<BlockRef>,
+    ) -> Vec<BlockRef> {
+        let mut consumed = consumed_headers.iter().copied().collect::<BTreeSet<_>>();
+        let exits = BTreeSet::from([truthy, falsy]);
+        for header in consumed_headers {
+            for edge_ref in &self.lowering.cfg.succs[header.index()] {
+                let successor = self.lowering.cfg.edges[edge_ref.index()].to;
+                self.collect_transparent_short_circuit_exit_pads(
+                    successor,
+                    &exits,
+                    stop,
+                    &mut consumed,
+                );
+            }
+        }
+        consumed.into_iter().collect()
+    }
+
+    fn collect_transparent_short_circuit_exit_pads(
+        &self,
+        start: BlockRef,
+        exits: &BTreeSet<BlockRef>,
+        stop: Option<BlockRef>,
+        consumed: &mut BTreeSet<BlockRef>,
+    ) -> bool {
+        if exits.contains(&start) || Some(start) == stop || consumed.contains(&start) {
+            return exits.contains(&start);
+        }
+        if !self.block_is_transparent_short_circuit_exit_pad(start) {
+            return false;
+        }
+        consumed.insert(start);
+        let Some(successor) = self.lowering.cfg.unique_reachable_successor(start) else {
+            consumed.remove(&start);
+            return false;
+        };
+        if !exits.contains(&successor)
+            && !self.collect_transparent_short_circuit_exit_pads(successor, exits, stop, consumed)
+        {
+            consumed.remove(&start);
+            return false;
+        }
+        true
+    }
+
+    fn block_is_transparent_short_circuit_exit_pad(&self, block: BlockRef) -> bool {
+        if block == self.lowering.cfg.exit_block
+            || self.branch_by_header.contains_key(&block)
+            || self.loop_by_header.contains_key(&block)
+            || !self
+                .lowering
+                .dataflow
+                .phi_candidates_in_block(block)
+                .is_empty()
+        {
+            return false;
+        }
+
+        let range = self.lowering.cfg.blocks[block.index()].instrs;
+        match range.len {
+            0 => true,
+            1 => matches!(
+                self.lowering.proto.instrs.get(range.start.index()),
+                Some(LowInstr::Jump(_))
+            ),
+            _ => false,
+        }
     }
 
     fn extend_branch_short_circuit_exits(
