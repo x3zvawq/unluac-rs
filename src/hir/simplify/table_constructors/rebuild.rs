@@ -16,7 +16,9 @@ use super::bindings::{
     BindingIndex, BindingUseSummary, binding_from_expr, binding_from_lvalue, matches_binding_ref,
     table_key_from_expr,
 };
-use super::inline_value::{InlineContext, inline_constructor_value};
+use super::inline_value::{
+    InlineContext, expr_mentions_any_pending_binding, inline_constructor_value,
+};
 use super::{
     PendingProducer, PendingProducerSource, ProducerGroupMeta, RebuildScratch, RegionStep,
     RestoredPendingIntegerField, SegmentToken, TableBinding,
@@ -351,21 +353,32 @@ fn flush_constructor_segment(
         }
 
         let mut queued_values = VecDeque::from_iter(set_list.values.iter());
-        for token in &context.scratch.tokens {
+        let tokens = context.scratch.tokens.clone();
+        for token in &tokens {
             match token {
                 SegmentToken::Producer { producer_index } => {
-                    let producer = &context.scratch.pending_producers[*producer_index];
+                    let producer = context.scratch.pending_producers[*producer_index].clone();
                     if context.scratch.consumed_bindings[producer.binding_id] {
                         continue;
                     }
+                    flush_set_list_values_before_producer(
+                        builder,
+                        &mut queued_values,
+                        producer.binding,
+                        context,
+                    )?;
                     match queued_values.front() {
                         Some(front) if matches_binding_ref(front, producer.binding) => {
-                            let value = pending_producer_value(context.block, producer)?;
+                            let value = pending_producer_value(context.block, &producer)?;
                             if !context.remaining_uses.contains(producer.binding_id) {
                                 context.scratch.consumed_bindings[producer.binding_id] = true;
+                                if let Some(group) = producer.group {
+                                    context.scratch.consumed_groups[group] = true;
+                                }
                             }
                             queued_values.pop_front();
-                            builder.push_array_value(value.clone());
+                            let value = inline_set_list_value(context, value)?;
+                            builder.push_array_value(value);
                         }
                         Some(_)
                             if queued_values
@@ -389,36 +402,12 @@ fn flush_constructor_segment(
         }
 
         for value in queued_values {
-            let value = {
-                let scratch = &mut context.scratch;
-                let mut inline_context = InlineContext::new(
-                    context.block,
-                    context.binding_index,
-                    &scratch.pending_producers,
-                    &scratch.producer_index_by_binding,
-                    &mut scratch.consumed_bindings,
-                    &mut scratch.consumed_groups,
-                    context.remaining_uses,
-                );
-                inline_constructor_value(&mut inline_context, value)?
-            };
+            let value = inline_set_list_value(context, value)?;
             builder.push_array_value(value);
         }
 
         if let Some(trailing) = &set_list.trailing_multivalue {
-            let trailing = {
-                let scratch = &mut context.scratch;
-                let mut inline_context = InlineContext::new(
-                    context.block,
-                    context.binding_index,
-                    &scratch.pending_producers,
-                    &scratch.producer_index_by_binding,
-                    &mut scratch.consumed_bindings,
-                    &mut scratch.consumed_groups,
-                    context.remaining_uses,
-                );
-                inline_constructor_value(&mut inline_context, trailing)?
-            };
+            let trailing = inline_set_list_value(context, trailing)?;
             builder.trailing_multivalue = Some(trailing);
         }
     }
@@ -475,6 +464,54 @@ fn flush_constructor_segment(
     }
 
     Some(())
+}
+
+fn flush_set_list_values_before_producer(
+    builder: &mut ConstructorBuilder,
+    queued_values: &mut VecDeque<&HirExpr>,
+    producer_binding: TableBinding,
+    context: &mut RegionRebuildContext<'_>,
+) -> Option<()> {
+    while queued_values
+        .front()
+        .is_some_and(|front| !matches_binding_ref(front, producer_binding))
+    {
+        if !queued_values
+            .iter()
+            .any(|value| matches_binding_ref(value, producer_binding))
+        {
+            return Some(());
+        }
+        let front = queued_values.front()?;
+        if expr_mentions_any_pending_binding(
+            front,
+            context.binding_index,
+            &context.scratch.pending_producers,
+        ) {
+            return None;
+        }
+        let value = queued_values.pop_front()?;
+        let value = inline_set_list_value(context, value)?;
+        builder.push_array_value(value);
+    }
+    Some(())
+}
+
+fn inline_set_list_value(
+    context: &mut RegionRebuildContext<'_>,
+    value: &HirExpr,
+) -> Option<HirExpr> {
+    let scratch = &mut context.scratch;
+    let mut inline_context = InlineContext::new(
+        context.block,
+        context.binding_index,
+        &scratch.pending_producers,
+        &scratch.producer_index_by_binding,
+        &mut scratch.consumed_bindings,
+        &mut scratch.consumed_groups,
+        context.remaining_uses,
+    );
+    inline_constructor_value(&mut inline_context, value)
 }
 
 fn prepare_scratch(scratch: &mut RebuildScratch, binding_count: usize) {

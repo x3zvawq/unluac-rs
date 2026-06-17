@@ -181,7 +181,7 @@ fn inline_short_circuit_expr(
     })))
 }
 
-fn expr_mentions_any_pending_binding(
+pub(super) fn expr_mentions_any_pending_binding(
     expr: &HirExpr,
     binding_index: &BindingIndex,
     pending_producers: &[PendingProducer],

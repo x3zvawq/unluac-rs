@@ -890,7 +890,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // proto 退化成 goto-label fallback。这里把这种形状显式降级成 IfThen，merge 留空：
         // 终结块由 then 内部的早返回路径自然消费，SC falsy 边落到外层 region 的自然末尾，
         // 语义上正好对齐 `if cond then ... <early return inside> ... end` 加函数末尾隐式 return。
-        if self.block_is_terminal_exit(falsy) && self.lowering.cfg.can_reach(truthy, falsy) {
+        // 如果这条“可达”必须先经过当前 region 的 stop（如 numeric-for 的 FORLOOP latch），
+        // 那就是经由下一轮循环绕回来的可达性，不能据此省略当前分支的 terminal else 臂。
+        if self.block_is_terminal_exit(falsy)
+            && stop.is_none_or(|stop| self.can_reach_avoiding_block(truthy, falsy, stop))
+            && self.lowering.cfg.can_reach(truthy, falsy)
+        {
             return Some(Some(StructuredBranchPlan {
                 cond,
                 then_entry: truthy,
