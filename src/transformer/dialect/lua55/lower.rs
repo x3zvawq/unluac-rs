@@ -769,14 +769,15 @@ impl<'a> ProtoLowerer<'a> {
                 }
                 Lua55Opcode::Call => {
                     let (a, b, c, _) = expect_abck(raw_pc, opcode, operands)?;
-                    let (kind, method_name) = self.take_call_info(reg_from_u8(a), u16::from(b));
-                    self.clear_all_method_hints();
+                    let results = call_result_pack(a, u16::from(c));
+                    let (kind, method_name) =
+                        self.take_call_info(reg_from_u8(a), u16::from(b), results);
                     emit_call(
                         &mut self.lowering,
                         raw_index,
                         reg_from_u8(a),
                         call_args_pack(a, u16::from(b)),
-                        call_result_pack(a, u16::from(c)),
+                        results,
                         kind,
                         method_name,
                     );
@@ -784,8 +785,8 @@ impl<'a> ProtoLowerer<'a> {
                 }
                 Lua55Opcode::TailCall => {
                     let (a, b, _, k) = expect_abck(raw_pc, opcode, operands)?;
-                    let (kind, method_name) = self.take_call_info(reg_from_u8(a), u16::from(b));
-                    self.clear_all_method_hints();
+                    let (kind, method_name) =
+                        self.take_call_info(reg_from_u8(a), u16::from(b), ResultPack::Ignore);
                     emit_tail_call(
                         &mut self.lowering,
                         raw_index,
@@ -1183,8 +1184,10 @@ impl<'a> ProtoLowerer<'a> {
         &mut self,
         callee: Reg,
         raw_b: u16,
+        results: ResultPack,
     ) -> (CallKind, Option<crate::transformer::MethodNameHint>) {
-        self.pending_methods.call_info(callee, raw_b)
+        self.pending_methods
+            .consume_call_info(callee, raw_b, results)
     }
 
     fn invalidate_written_reg(&mut self, reg: Reg) {

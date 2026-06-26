@@ -440,13 +440,10 @@ impl<'a> ProtoLowerer<'a> {
                 }
                 LuauOpcode::Call => {
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
-                    let (kind, method_name) = self.take_call_info(reg_from_u8(a), u16::from(b));
-                    self.clear_all_method_hints();
                     let (result_pack, consumed_extra_raw) =
                         self.fold_single_result_call_move(raw_index, a, c)?;
-                    if let ResultPack::Fixed(range) = result_pack {
-                        self.invalidate_written_range(range);
-                    }
+                    let (kind, method_name) =
+                        self.take_call_info(reg_from_u8(a), u16::from(b), result_pack);
                     self.emit(
                         Some(raw_index),
                         if let Some(extra_raw) = consumed_extra_raw {
@@ -1296,8 +1293,10 @@ impl<'a> ProtoLowerer<'a> {
         &mut self,
         callee: Reg,
         raw_b: u16,
+        results: ResultPack,
     ) -> (CallKind, Option<crate::transformer::MethodNameHint>) {
-        self.pending_methods.call_info_if(callee, raw_b != 1)
+        self.pending_methods
+            .consume_call_info_if(callee, raw_b != 1, results)
     }
 
     fn invalidate_written_reg(&mut self, reg: Reg) {

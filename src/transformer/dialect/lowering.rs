@@ -8,7 +8,7 @@ use crate::parser::{RawInstr, RawProto};
 use crate::transformer::{
     BranchCond, BranchInstr, CallKind, ConstRef, GenericForLoopInstr, InstrRef, JumpInstr,
     LowInstr, LoweringMap, MethodNameHint, NumericForInitInstr, NumericForLoopInstr, RawInstrRef,
-    Reg, RegRange, TransformError,
+    Reg, RegRange, ResultPack, TransformError,
 };
 
 #[derive(Debug, Clone)]
@@ -214,6 +214,30 @@ impl PendingMethodHints {
         self.call_info_if(callee, raw_b != 1)
     }
 
+    pub(crate) fn consume_call_info(
+        &mut self,
+        callee: Reg,
+        raw_b: u16,
+        results: ResultPack,
+    ) -> (CallKind, Option<MethodNameHint>) {
+        let info = self.call_info(callee, raw_b);
+        self.invalidate_reg(callee);
+        self.invalidate_result_pack(results);
+        info
+    }
+
+    pub(crate) fn consume_call_info_if(
+        &mut self,
+        callee: Reg,
+        hint_allowed: bool,
+        results: ResultPack,
+    ) -> (CallKind, Option<MethodNameHint>) {
+        let info = self.call_info_if(callee, hint_allowed);
+        self.invalidate_reg(callee);
+        self.invalidate_result_pack(results);
+        info
+    }
+
     pub(crate) fn call_info_if(
         &self,
         callee: Reg,
@@ -228,6 +252,18 @@ impl PendingMethodHints {
 
     pub(crate) fn invalidate_range(&mut self, range: RegRange) {
         invalidate_pending_method_range(&mut self.slots, range);
+    }
+
+    fn invalidate_result_pack(&mut self, results: ResultPack) {
+        match results {
+            ResultPack::Fixed(range) => self.invalidate_range(range),
+            ResultPack::Open(start) => {
+                for index in start.index()..self.slots.len() {
+                    self.invalidate_reg(Reg(index));
+                }
+            }
+            ResultPack::Ignore => {}
+        }
     }
 
     pub(crate) fn clear(&mut self) {
