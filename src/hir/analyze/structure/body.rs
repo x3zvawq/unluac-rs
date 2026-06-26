@@ -1366,7 +1366,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             && else_entry.is_some()
             && self.block_is_terminal_exit(merge)
         {
-            return Some(stop);
+            return if self.terminal_exit_block_is_clone_safe(merge) {
+                Some(stop)
+            } else {
+                Some(merge)
+            };
         }
         // if-then 的 terminal merge 既可能是共享尾部（`if cond then body end; return`），
         // 也可能是缺席 else 臂的早返回（`if not cond then return end; continue`）。
@@ -1720,6 +1724,24 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     .instrs
                     .get(instr_idx)
                     .is_some_and(is_control_terminator)
+        })
+    }
+
+    pub(super) fn terminal_exit_block_is_clone_safe(&self, block: BlockRef) -> bool {
+        if !self.block_is_terminal_exit(block) {
+            return false;
+        }
+        let terminator = self.block_terminator(block).map(|(instr_ref, _)| instr_ref);
+        let range = self.lowering.cfg.blocks[block.index()].instrs;
+        (range.start.index()..range.end()).all(|instr_idx| {
+            let instr_ref = InstrRef(instr_idx);
+            // Closure capture 记录的是父级词法槽位身份；复制同一条 raw CLOSURE 会把
+            // 一个 child proto 伪造成多个创建点，后续 naming 无法得到单一 provenance。
+            Some(instr_ref) == terminator
+                || !matches!(
+                    self.lowering.proto.instrs.get(instr_idx),
+                    Some(LowInstr::Closure(_))
+                )
         })
     }
 

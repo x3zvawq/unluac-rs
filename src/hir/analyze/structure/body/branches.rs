@@ -942,7 +942,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         block: BlockRef,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirBlock> {
-        if !self.block_is_terminal_exit(block) {
+        if !self.terminal_exit_block_is_clone_safe(block) {
             return None;
         }
         let mut stmts = self.lower_block_prefix(block, false, target_overrides)?;
