@@ -5,7 +5,7 @@
 //! 例如：`local f = obj.m; f(obj, 1)` 会在这里尝试折回 `obj:m(1)`。
 
 use super::super::binding_flow::{count_binding_uses_in_stmts_deep, name_matches_binding};
-use crate::ast::common::{AstCallKind, AstExpr, AstLocalAttr, AstStmt};
+use crate::ast::common::{AstBindingRef, AstCallKind, AstExpr, AstLocalAttr, AstStmt};
 
 pub(super) fn try_chain_local_method_call_stmt(stmts: &[AstStmt]) -> Option<(AstStmt, usize)> {
     let [first, second, third, ..] = stmts else {
@@ -25,6 +25,11 @@ pub(super) fn try_chain_local_method_call_stmt(stmts: &[AstStmt]) -> Option<(Ast
         return try_chain_local_method_call_stmt_without_dead_alias(stmts);
     }
 
+    let chained_binding = single_method_call_local_binding(second)?;
+    if count_binding_uses_in_stmts_deep(&stmts[3..], chained_binding) != 0 {
+        return try_chain_local_method_call_stmt_without_dead_alias(stmts);
+    }
+
     let chained = chain_local_method_call_stmt(second, third)?;
     Some((chained, 3))
 }
@@ -35,7 +40,27 @@ fn try_chain_local_method_call_stmt_without_dead_alias(
     let [first, second, ..] = stmts else {
         return None;
     };
+    let chained_binding = single_method_call_local_binding(first)?;
+    if count_binding_uses_in_stmts_deep(&stmts[2..], chained_binding) != 0 {
+        return None;
+    }
     Some((chain_local_method_call_stmt(first, second)?, 2))
+}
+
+fn single_method_call_local_binding(stmt: &AstStmt) -> Option<AstBindingRef> {
+    let AstStmt::LocalDecl(local_decl) = stmt else {
+        return None;
+    };
+    if local_decl.bindings.len() != 1
+        || local_decl.values.len() != 1
+        || local_decl.bindings[0].attr != AstLocalAttr::None
+    {
+        return None;
+    }
+    if !matches!(local_decl.values[0], AstExpr::MethodCall(_)) {
+        return None;
+    }
+    Some(local_decl.bindings[0].id)
 }
 
 fn chain_local_method_call_stmt(first: &AstStmt, second: &AstStmt) -> Option<AstStmt> {
