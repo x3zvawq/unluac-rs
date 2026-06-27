@@ -668,7 +668,7 @@ where
         dialect: "all".to_owned(),
         case_filters: Vec::new(),
         output: parse_env_or_default(OUTPUT_ENV, "simple", FailureOutputMode::parse)?,
-        timeout_seconds: 10,
+        timeout_seconds: 25,
         progress: parse_env_or_default(PROGRESS_ENV, "auto", ProgressMode::parse)?,
         color: parse_env_or_default(COLOR_ENV, "auto", ColorMode::parse)?,
         plain_progress_detail: PlainProgressDetail::Sparse,
