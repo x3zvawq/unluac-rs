@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             result
                 .state
                 .completed_stage
-                .unwrap_or(DecompileStage::Parse)
+                .unwrap_or(DecompileStage::Parser)
         );
     } else {
         for (index, output) in result.debug_output.iter().enumerate() {

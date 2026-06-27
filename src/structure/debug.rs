@@ -1,8 +1,7 @@
-//! 这个文件承载 StructureFacts 层的共享调试输出。
+//! 这个文件承载 Structure 层的共享调试输出。
 //!
-//! 结构候选本身就偏“解释型”事实，所以这里重点把 header / merge / exits /
-//! reducible 这些最值钱的信息稳定打印出来。stage dump 入口直接从主 pipeline state
-//! 读取 StructureFacts，方便阶段表引用本层函数。
+//! 对外只有一个 Structure dump；内部仍按 CFG、GraphFacts、Dataflow、StructureFacts
+//! 分段输出，方便排查时沿着结构层内部事实链向后看。
 
 use std::fmt::Write as _;
 
@@ -11,6 +10,7 @@ use crate::debug::{
     colorize_debug_text, compute_focus_plan, define_stage_dump, format_breadcrumb,
     format_display_set, format_proto_summary_row,
 };
+use crate::decompile::{DebugOptions, DecompileState};
 
 use super::common::{
     BranchCandidate, BranchRegionFact, BranchValueMergeCandidate, GenericPhiMaterialization,
@@ -28,14 +28,64 @@ struct ProtoEntry<'a> {
 }
 
 define_stage_dump! {
-    /// StructureFacts 阶段的调试导出。
-    pub fn dump_structure(state, options) => StructureFacts,
+    /// Structure 阶段的调试导出。
+    pub fn dump_structure(state, options) => Structure,
+        dump_structure_stage(state, options);
+}
+
+fn dump_structure_stage(state: &DecompileState, options: &DebugOptions) -> String {
+    let mut output = String::new();
+
+    append_section(
+        &mut output,
+        super::cfg::dump_cfg_graph(
+            state.cfg.as_ref().unwrap(),
+            options.detail,
+            &options.filters,
+            options.color,
+        ),
+    );
+    append_section(
+        &mut output,
+        super::cfg::dump_graph_facts_tree(
+            state.graph_facts.as_ref().unwrap(),
+            options.detail,
+            &options.filters,
+            options.color,
+        ),
+    );
+    append_section(
+        &mut output,
+        super::cfg::dump_dataflow_facts(
+            state.lowered.as_ref().unwrap(),
+            state.cfg.as_ref().unwrap(),
+            state.dataflow.as_ref().unwrap(),
+            options.detail,
+            &options.filters,
+            options.color,
+        ),
+    );
+    append_section(
+        &mut output,
         dump_structure_facts(
             state.structure_facts.as_ref().unwrap(),
             options.detail,
             &options.filters,
-            options.color
-        );
+            options.color,
+        ),
+    );
+
+    output
+}
+
+fn append_section(output: &mut String, section: String) {
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    output.push_str(&section);
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
 }
 
 /// 输出 StructureFacts 的人类可读摘要。
@@ -459,7 +509,7 @@ fn write_scopes(output: &mut String, indent: &str, scopes: &[ScopeCandidate]) {
     }
 }
 
-fn format_optional_block(block: Option<crate::cfg::BlockRef>) -> String {
+fn format_optional_block(block: Option<crate::structure::BlockRef>) -> String {
     block
         .map(|block| block.to_string())
         .unwrap_or_else(|| "-".to_string())

@@ -28,9 +28,28 @@ mod walk;
 
 use super::common::{AstModule, AstTargetDialect};
 use crate::decompile::{DecompileContext, DecompileError, DecompileState};
-use crate::readability::ReadabilityOptions;
 use crate::scheduler::{InvalidationTag, PassDescriptor, PassPhase, run_invalidation_loop};
 use crate::timing::TimingCollector;
+
+/// 可调的源码形状阈值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadabilityOptions {
+    pub return_inline_max_complexity: usize,
+    pub index_inline_max_complexity: usize,
+    pub args_inline_max_complexity: usize,
+    pub access_base_inline_max_complexity: usize,
+}
+
+impl Default for ReadabilityOptions {
+    fn default() -> Self {
+        Self {
+            return_inline_max_complexity: 10,
+            index_inline_max_complexity: 10,
+            args_inline_max_complexity: 6,
+            access_base_inline_max_complexity: 5,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct ReadabilityContext {

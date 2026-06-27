@@ -114,7 +114,7 @@ Debug options:
 | Argument | Description | Default |
 | - | - | - |
 | `-d`, `--debug` | Enable debug output using the current target stage as the default dump stage | `false` |
-| `--dump` | Dump one or more pipeline stages; repeat to request multiple stages | None |
+| `--dump` | Dump one or more outer pipeline stages; repeat to request multiple stages | None |
 | `--detail` | Debug output detail level | `normal` when debug is enabled |
 | `-c`, `--color` | Debug color mode | `auto` |
 | `--proto` | Restrict debug dumps to a specific proto id | None |
@@ -148,8 +148,9 @@ Generate and output options:
 | `--stop-after` | Last pipeline stage to run | `generate` |
 | `-o`, `--output` | Write the final generated source to a file instead of stdout | stdout |
 
-Stage-valued options such as `--dump` and `--stop-after` accept:
-`parse`, `transform`, `cfg`, `graph-facts`, `dataflow`, `structure-facts`, `hir`, `ast`, `readability`, `naming`, `generate`.
+Pipeline checkpoint options such as `--dump` and `--stop-after` accept:
+`parser` (`parse`), `transformer` (`transform`), `structure`, `hir`, `ast`, `generate`.
+The `structure` dump includes CFG, graph-facts, dataflow, and structure-facts sections; the `ast` dump includes AST, readability, and naming sections.
 
 For more debugging examples and CLI workflow details, see [docs/debug.md](./docs/debug.md).
 

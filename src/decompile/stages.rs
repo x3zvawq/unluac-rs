@@ -4,9 +4,9 @@
 //! 阶段 timing、完成标记、target-stage 停止点和 debug dump 分派。阶段表直接用模块路径绑定
 //! `DecompileStage` 与对应层主体入口，调度循环只按表调用，不再手写阶段 match。
 //!
-//! 这种拆分保留了“固定阶段枚举 + 强类型槽位”的可排错性，同时避免主入口里反复出现
-//! `xxx_stage()` 后立刻 `dump_xxx()` 的手工编排。Generate 相关 warning 也在 Generate
-//! 阶段内基于最终 Readability 产物计算，不再由 Readability 阶段提前返回计划对象。
+//! 这种拆分保留了“固定阶段枚举 + 强类型槽位”的可排错性，同时让 Structure / AST
+//! 自己调度内部子步骤。Generate 相关 warning 也在 Generate 阶段内基于最终 AST
+//! 产物计算，不再由 AST 内部步骤提前返回计划对象。
 
 use super::error::DecompileError;
 use super::options::DebugOptions;
@@ -20,33 +20,18 @@ struct StageDescriptor {
 
 const PIPELINE_STAGES: &[StageDescriptor] = &[
     StageDescriptor {
-        stage: DecompileStage::Parse,
+        stage: DecompileStage::Parser,
         run: crate::parser::parse_input,
         dump: crate::parser::dump_parser,
     },
     StageDescriptor {
-        stage: DecompileStage::Transform,
+        stage: DecompileStage::Transformer,
         run: crate::transformer::lower_chunk,
         dump: crate::transformer::dump_lir,
     },
     StageDescriptor {
-        stage: DecompileStage::Cfg,
-        run: crate::cfg::build_cfg_proto,
-        dump: crate::cfg::dump_cfg,
-    },
-    StageDescriptor {
-        stage: DecompileStage::GraphFacts,
-        run: crate::cfg::analyze_graph_facts,
-        dump: crate::cfg::dump_graph_facts,
-    },
-    StageDescriptor {
-        stage: DecompileStage::Dataflow,
-        run: crate::cfg::analyze_dataflow,
-        dump: crate::cfg::dump_dataflow,
-    },
-    StageDescriptor {
-        stage: DecompileStage::StructureFacts,
-        run: crate::structure::analyze_structure,
+        stage: DecompileStage::Structure,
+        run: crate::structure::analyze_structure_stage,
         dump: crate::structure::dump_structure,
     },
     StageDescriptor {
@@ -56,18 +41,8 @@ const PIPELINE_STAGES: &[StageDescriptor] = &[
     },
     StageDescriptor {
         stage: DecompileStage::Ast,
-        run: crate::ast::lower_ast_for_generate,
+        run: crate::ast::analyze_ast_stage,
         dump: crate::ast::dump_ast,
-    },
-    StageDescriptor {
-        stage: DecompileStage::Readability,
-        run: crate::ast::make_readable,
-        dump: crate::ast::dump_readability,
-    },
-    StageDescriptor {
-        stage: DecompileStage::Naming,
-        run: crate::naming::assign_names,
-        dump: crate::naming::dump_naming,
     },
     StageDescriptor {
         stage: DecompileStage::Generate,

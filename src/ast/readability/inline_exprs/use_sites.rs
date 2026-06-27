@@ -4,7 +4,7 @@
 //! 候选本身是否安全。
 //! 例如：`local r0 = print; r0(1)` 选中后，会在这里把调用位点改成 `print(1)`。
 
-use crate::readability::ReadabilityOptions;
+use crate::ast::ReadabilityOptions;
 
 use super::super::super::common::{
     AstCallExpr, AstCallKind, AstExpr, AstGlobalDecl, AstLValue, AstMethodCallExpr, AstStmt,

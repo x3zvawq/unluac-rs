@@ -12,11 +12,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::cfg::DefId;
 use crate::hir::common::{
     HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr, HirLValue,
     TempId,
 };
+use crate::structure::DefId;
 
 use super::rewrites::lvalue_as_expr;
 use super::*;

@@ -1,13 +1,13 @@
 //! 这个文件集中放结构化 lowering 里的局部重写 helper。
 //!
-//! `structure.rs` 主体更适合表达“什么时候能结构化恢复”，而这些函数只负责在
+//! `structure/mod.rs` 主体更适合表达“什么时候能结构化恢复”，而这些函数只负责在
 //! 结构已经确定之后，把 loop state/temp 身份同步改写到同一批 HIR 语句里。
 //! 单独拆出来之后，主流程文件更容易看出控制流决策，重写细节也更容易局部维护。
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::cfg::DefId;
 use crate::hir::common::{HirExpr, HirLValue, HirStmt, TempId};
+use crate::structure::DefId;
 
 /// 检查表达式中是否引用了给定集合中的 `TempRef`。
 ///

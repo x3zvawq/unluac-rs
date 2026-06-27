@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::cfg::{BlockRef, Cfg, GraphFacts};
+use crate::structure::{BlockRef, Cfg, GraphFacts};
 use crate::transformer::{InstrRef, LowInstr, LoweredProto};
 
 use super::common::{BranchRegionFact, LoopCandidate, ScopeCandidate, ScopeKind};

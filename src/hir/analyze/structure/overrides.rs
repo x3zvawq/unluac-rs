@@ -6,8 +6,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::cfg::{BlockRef, PhiId};
 use crate::hir::common::{HirExpr, TempId};
+use crate::structure::{BlockRef, PhiId};
 use crate::transformer::{InstrRef, Reg};
 
 #[derive(Debug, Clone, Default)]

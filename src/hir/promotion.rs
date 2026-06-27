@@ -13,10 +13,10 @@
 //!   `t7(slot 0, epoch 0)` 会被 locals 认成同一个源码 local 的写回；若中间经过
 //!   `close from r0`，后续 `t8(slot 0, epoch 1)` 会被视为新的词法槽位
 
-use crate::cfg::DataflowFacts;
 use crate::hir::common::{
     HirBlock, HirExpr, HirLValue, HirStmt, HirTableField, HirTableKey, TempId,
 };
+use crate::structure::DataflowFacts;
 use crate::transformer::{LowInstr, LoweredProto};
 use std::collections::BTreeSet;
 

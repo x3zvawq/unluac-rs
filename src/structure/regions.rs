@@ -12,7 +12,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::cfg::Cfg;
+use crate::structure::Cfg;
 
 use super::common::{BranchRegionFact, IrreducibleRegion, LoopCandidate, RegionFact, RegionKind};
 use super::helpers::collect_region_exits;

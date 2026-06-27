@@ -26,7 +26,7 @@ use super::dialect::luau;
 
 define_stage_dump! {
     /// Parser 阶段的调试导出。
-    pub fn dump_parser(state, options) => Parse,
+    pub fn dump_parser(state, options) => Parser,
         dump_parser_chunk(
             state.raw_chunk.as_ref().unwrap(),
             options.detail,

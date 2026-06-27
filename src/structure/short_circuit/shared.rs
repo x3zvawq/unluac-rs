@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::cfg::{BlockRef, Cfg, DataflowFacts, DominatorTree};
+use crate::structure::{BlockRef, Cfg, DataflowFacts, DominatorTree};
 use crate::transformer::{InstrRef, LowInstr, LoweredProto, Reg, ResultPack};
 
 use super::super::common::{

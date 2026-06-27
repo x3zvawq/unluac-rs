@@ -4,7 +4,7 @@
 //! `return`、重复 `end` 匹配等），任何局部裁剪都会产出非法 Lua。所以这一层
 //! stage dump 入口直接从主 pipeline state 读取最终生成结果。不支持 `--proto` /
 //! `--proto-depth`：若用户传了 `--proto` 这里只会打一条
-//! 提示行指向 `--stop-after readability --proto N`，然后照样 dump 完整文件。
+//! 提示行指向 `--stop-after ast --proto N`，然后照样 dump 完整文件。
 
 use std::fmt::Write as _;
 
@@ -39,7 +39,7 @@ fn dump_generated_chunk(
     if filters.proto.is_some() {
         let _ = writeln!(
             output,
-            "note: --proto has no effect on generate stage (final source would not be syntactically valid if sliced); use --stop-after readability --proto N to preview a single function",
+            "note: --proto has no effect on generate stage (final source would not be syntactically valid if sliced); use --stop-after ast --proto N to preview a single function",
         );
     }
     if !chunk.warnings.is_empty() {

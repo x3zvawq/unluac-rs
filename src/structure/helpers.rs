@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
-use crate::cfg::{BlockRef, Cfg, DominatorTree, EdgeRef};
+use crate::structure::{BlockRef, Cfg, DominatorTree, EdgeRef};
 
 use super::common::IrreducibleRegion;
 

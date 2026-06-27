@@ -3,11 +3,11 @@
 //! 入口层集中补默认值，比把默认逻辑散在各阶段里更稳；后续阶段变多后，
 //! 仍然只需要维护这一处归一化逻辑。
 
+use crate::ast::ReadabilityOptions;
+use crate::ast::{NamingMode, NamingOptions};
 use crate::debug::{DebugColorMode, DebugDetail, DebugFilters};
 use crate::generate::GenerateOptions;
-use crate::naming::{NamingMode, NamingOptions};
 use crate::parser::{ParseMode, ParseOptions, StringDecodeMode, StringEncoding};
-use crate::readability::ReadabilityOptions;
 use strum_macros::{Display, EnumString, IntoStaticStr};
 
 use super::state::DecompileStage;
@@ -68,12 +68,7 @@ impl Default for DecompileOptions {
             // 默认更偏向直接拿到最终源码，仓库内 CLI / wasm / 集成调用方都共享这套预期。
             target_stage: DecompileStage::Generate,
             debug: DebugOptions::default(),
-            readability: ReadabilityOptions {
-                return_inline_max_complexity: 10,
-                index_inline_max_complexity: 10,
-                args_inline_max_complexity: 6,
-                access_base_inline_max_complexity: 5,
-            },
+            readability: ReadabilityOptions::default(),
             naming: NamingOptions {
                 mode: NamingMode::DebugLike,
                 debug_like_include_function: true,

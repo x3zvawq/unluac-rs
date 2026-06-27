@@ -14,9 +14,9 @@
 
 use serde::Serialize;
 
-use unluac::cfg::{BlockKind, CfgGraph, EdgeKind};
 use unluac::decompile::DecompileResult;
 use unluac::parser::{RawLiteralConst, RawProto, RawString, format_raw_instr};
+use unluac::structure::{BlockKind, CfgGraph, EdgeKind};
 use unluac::transformer::{LoweredProto, RawInstrRef, format_low_instr};
 
 // ── 顶层结果 ──────────────────────────────────────────────

@@ -20,34 +20,16 @@ use super::options::{DecompileDialect, DecompileOptions};
     Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Display, EnumString, IntoStaticStr,
 )]
 pub enum DecompileStage {
-    #[strum(serialize = "parse")]
-    Parse,
-    #[strum(serialize = "transform")]
-    Transform,
-    #[strum(serialize = "cfg")]
-    Cfg,
-    #[strum(
-        serialize = "graph-facts",
-        serialize = "graph_facts",
-        serialize = "graphfacts"
-    )]
-    GraphFacts,
-    #[strum(serialize = "dataflow")]
-    Dataflow,
-    #[strum(
-        serialize = "structure-facts",
-        serialize = "structure_facts",
-        serialize = "structurefacts"
-    )]
-    StructureFacts,
+    #[strum(serialize = "parser", serialize = "parse")]
+    Parser,
+    #[strum(serialize = "transformer", serialize = "transform")]
+    Transformer,
+    #[strum(serialize = "structure")]
+    Structure,
     #[strum(serialize = "hir")]
     Hir,
     #[strum(serialize = "ast")]
     Ast,
-    #[strum(serialize = "readability")]
-    Readability,
-    #[strum(serialize = "naming")]
-    Naming,
     #[strum(serialize = "generate")]
     Generate,
 }
@@ -76,16 +58,11 @@ impl DecompileStage {
     /// 主 pipeline 目前固定线性推进，所以“下一个阶段”也在这里集中维护。
     pub const fn next(self) -> Option<Self> {
         match self {
-            Self::Parse => Some(Self::Transform),
-            Self::Transform => Some(Self::Cfg),
-            Self::Cfg => Some(Self::GraphFacts),
-            Self::GraphFacts => Some(Self::Dataflow),
-            Self::Dataflow => Some(Self::StructureFacts),
-            Self::StructureFacts => Some(Self::Hir),
+            Self::Parser => Some(Self::Transformer),
+            Self::Transformer => Some(Self::Structure),
+            Self::Structure => Some(Self::Hir),
             Self::Hir => Some(Self::Ast),
-            Self::Ast => Some(Self::Readability),
-            Self::Readability => Some(Self::Naming),
-            Self::Naming => Some(Self::Generate),
+            Self::Ast => Some(Self::Generate),
             Self::Generate => None,
         }
     }

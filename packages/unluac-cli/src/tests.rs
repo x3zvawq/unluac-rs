@@ -111,7 +111,27 @@ fn explicit_dump_replaces_repo_debug_dump_stage() {
     assert!(options.decompile.debug.enable);
     assert_eq!(
         options.decompile.debug.output_stages,
-        vec![DecompileStage::Parse, DecompileStage::Hir]
+        vec![DecompileStage::Parser, DecompileStage::Hir]
+    );
+}
+
+#[test]
+fn stop_after_only_accepts_outer_stages() {
+    let error = parse_args(args(&["--source", "case.lua", "--stop-after", "cfg"]))
+        .expect_err("cfg is internal to structure and should not be a stop target");
+    assert!(
+        error.to_string().contains("unsupported stage: cfg"),
+        "unexpected clap error: {error}"
+    );
+}
+
+#[test]
+fn dump_only_accepts_outer_stages() {
+    let error = parse_args(args(&["--source", "case.lua", "--dump", "dataflow"]))
+        .expect_err("dataflow is included in the structure dump");
+    assert!(
+        error.to_string().contains("unsupported stage: dataflow"),
+        "unexpected clap error: {error}"
     );
 }
 
@@ -285,7 +305,7 @@ fn help_is_grouped_by_section_and_includes_repo_link() {
 #[test]
 fn version_includes_binary_name_and_repo_link() {
     let version = render_version();
-    assert!(version.contains("unluac-cli 1.0.0"));
+    assert!(version.contains(&format!("unluac-cli {}", env!("CARGO_PKG_VERSION"))));
     assert!(version.contains("https://github.com/x3zvawq/unluac-rs"));
 }
 

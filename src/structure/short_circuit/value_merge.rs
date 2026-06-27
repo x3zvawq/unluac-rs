@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::cfg::{BlockRef, Cfg, DataflowFacts, DominatorTree, GraphFacts, PhiCandidate};
+use crate::structure::{BlockRef, Cfg, DataflowFacts, DominatorTree, GraphFacts, PhiCandidate};
 use crate::transformer::{LoweredProto, Reg};
 
 use super::super::common::{

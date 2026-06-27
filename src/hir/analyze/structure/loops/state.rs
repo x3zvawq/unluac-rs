@@ -10,7 +10,7 @@
 //!   属于同一个语义槽位后，直接复用已有 loop state，而不是再物化一层假的 phi
 
 use super::*;
-use crate::cfg::SsaValue;
+use crate::structure::SsaValue;
 
 impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     pub(super) fn build_loop_state_plan(
@@ -406,7 +406,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         &self,
         pred: BlockRef,
         reg: Reg,
-        defs: impl IntoIterator<Item = crate::cfg::DefId>,
+        defs: impl IntoIterator<Item = crate::structure::DefId>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirExpr> {
         self.loop_incoming_expr_with_carried_override(pred, reg, defs, target_overrides, true)
@@ -416,7 +416,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         &self,
         pred: BlockRef,
         reg: Reg,
-        defs: impl IntoIterator<Item = crate::cfg::DefId>,
+        defs: impl IntoIterator<Item = crate::structure::DefId>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirExpr> {
         self.loop_incoming_expr_with_carried_override(pred, reg, defs, target_overrides, false)
@@ -426,7 +426,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         &self,
         pred: BlockRef,
         reg: Reg,
-        defs: impl IntoIterator<Item = crate::cfg::DefId>,
+        defs: impl IntoIterator<Item = crate::structure::DefId>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
         allow_carried_override: bool,
     ) -> Option<HirExpr> {
@@ -511,7 +511,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         reg: Reg,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirExpr> {
-        use crate::cfg::SsaValue;
+        use crate::structure::SsaValue;
 
         let first_instr = self.lowering.cfg.blocks[pred.index()].instrs.start;
         let reaching = self.lowering.dataflow.reaching_values_at(first_instr);
@@ -777,7 +777,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         &self,
         pred: BlockRef,
         reg: Reg,
-        defs: impl IntoIterator<Item = crate::cfg::DefId>,
+        defs: impl IntoIterator<Item = crate::structure::DefId>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirLValue> {
         self.loop_incoming_lvalue_with_carried_override(pred, reg, defs, target_overrides, true)
@@ -787,7 +787,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         &self,
         pred: BlockRef,
         reg: Reg,
-        defs: impl IntoIterator<Item = crate::cfg::DefId>,
+        defs: impl IntoIterator<Item = crate::structure::DefId>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirLValue> {
         self.loop_incoming_lvalue_with_carried_override(pred, reg, defs, target_overrides, false)
@@ -797,7 +797,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         &self,
         pred: BlockRef,
         reg: Reg,
-        defs: impl IntoIterator<Item = crate::cfg::DefId>,
+        defs: impl IntoIterator<Item = crate::structure::DefId>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
         allow_carried_override: bool,
     ) -> Option<HirLValue> {
@@ -842,7 +842,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         reg: Reg,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirLValue> {
-        use crate::cfg::SsaValue;
+        use crate::structure::SsaValue;
 
         let first_instr = self.lowering.cfg.blocks[block.index()].instrs.start;
         let reaching = self.lowering.dataflow.reaching_values_at(first_instr);

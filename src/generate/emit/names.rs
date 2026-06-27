@@ -1,15 +1,15 @@
 //! 这个子模块负责把 AST 中的 name/binding 引用解析成最终文本。
 //!
-//! 它依赖 Naming 层已经产出的 `NameMap`，只做查表和错误暴露，不会在这里临时发明兜底名。
+//! 它依赖 AST naming 已经产出的 `NameMap`，只做查表和错误暴露，不会在这里临时发明兜底名。
 //! 例如：残留的 `TempRef` 若没被命名收掉，这里会直接报错而不是静默生成假名字。
 
+use crate::ast::NameMap;
 use crate::ast::{
     AstBindingRef, AstFeature, AstFunctionDecl, AstFunctionName, AstGlobalBinding,
     AstGlobalBindingTarget, AstLocalAttr, AstLocalBinding, AstNameRef,
 };
 use crate::generate::doc::Doc;
 use crate::hir::HirProtoRef;
-use crate::naming::NameMap;
 
 use super::super::error::GenerateError;
 use super::Emitter;

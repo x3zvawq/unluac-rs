@@ -2,7 +2,7 @@
 //!
 //! `while / repeat / numeric-for / generic-for` 的恢复需要同时处理 header phi、
 //! backedge 重写、多出口 break pad 和 Lua VM 特有的 for 头部形状。如果这些逻辑继续
-//! 混在 `structure.rs` 入口文件里，很快就会把“分支恢复”和“循环恢复”搅成一团，
+//! 混在 `structure/mod.rs` 入口文件里，很快就会把“分支恢复”和“循环恢复”搅成一团，
 //! 也更难看出每一步为什么安全。
 
 mod lower;
@@ -86,7 +86,7 @@ fn loop_value_incoming_all_within_blocks(
 
 fn single_fixed_def_expr(
     lowering: &ProtoLowering<'_>,
-    defs: impl IntoIterator<Item = crate::cfg::DefId>,
+    defs: impl IntoIterator<Item = crate::structure::DefId>,
 ) -> Option<HirExpr> {
     let mut defs = defs.into_iter();
     let def = defs.next()?;
@@ -98,7 +98,7 @@ fn single_fixed_def_expr(
 
 fn single_fixed_def_lvalue(
     lowering: &ProtoLowering<'_>,
-    defs: impl IntoIterator<Item = crate::cfg::DefId>,
+    defs: impl IntoIterator<Item = crate::structure::DefId>,
 ) -> Option<HirLValue> {
     let mut defs = defs.into_iter();
     let def = defs.next()?;

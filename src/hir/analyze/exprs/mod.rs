@@ -2,7 +2,7 @@
 //!
 //! HIR 的主流程需要频繁把寄存器、常量、表访问和分支条件翻译成表达式节点，如果
 //! 这些逻辑散落在主 lowering 里，后面做短路恢复、临时变量消解时会很难判断修改边界。
-//! 因此这里专门承载“值如何解释”的规则，让 `analyze.rs` 更多只关心语句和控制流骨架。
+//! 因此这里专门承载“值如何解释”的规则，让 `analyze/mod.rs` 更多只关心语句和控制流骨架。
 
 mod access;
 mod branch;
@@ -10,13 +10,13 @@ mod defs;
 mod packs;
 mod regs;
 
-use crate::cfg::BlockRef;
-use crate::cfg::{DefId, SsaValue};
 use crate::hir::common::{
     HirBinaryExpr, HirBinaryOpKind, HirCallExpr, HirCapture, HirClosureExpr, HirExpr, HirGlobalRef,
     HirLValue, HirTableAccess, HirUnaryExpr, HirUnaryOpKind, UpvalueId,
 };
 use crate::parser::RawLiteralConst;
+use crate::structure::BlockRef;
+use crate::structure::{DefId, SsaValue};
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpKind, BranchCond, BranchOperands, BranchPredicate, CallKind,
     CondOperand, ConstRef, InstrRef, LowInstr, LoweredProto, MethodNameHint, Reg, ResultPack,
@@ -118,7 +118,7 @@ fn resolve_open_pack_tail_single_eval(
 /// 把一个 open def (多返回 call / vararg) 直接降成 HIR 表达式。
 fn expr_for_open_def_single_eval(
     lowering: &ProtoLowering<'_>,
-    open_def_id: crate::cfg::OpenDefId,
+    open_def_id: crate::structure::OpenDefId,
 ) -> Option<HirExpr> {
     let open_def = lowering.dataflow.open_defs.get(open_def_id.index())?;
     let instr = lowering.proto.instrs.get(open_def.instr.index())?;

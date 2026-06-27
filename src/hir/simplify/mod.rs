@@ -1,6 +1,6 @@
 //! 这个文件承载 HIR 的后处理收敛入口。
 //!
-//! 和 [analyze.rs](/Users/x3zvawq/workspace/unluac-rs/src/hir/analyze.rs) 一样，外层文件只
+//! 和 [analyze.rs](/Users/x3zvawq/workspace/unluac-rs/src/hir/analyze/mod.rs) 一样，外层文件只
 //! 负责声明 simplify 子模块并暴露主入口；真正的 pass 实现都放在目录内部。这样
 //! `src/hir` 下两条主线在结构上保持一致，后续维护时更不容易产生“哪边是入口、哪边
 //! 是细节实现”的混淆。
@@ -24,11 +24,11 @@ mod traverse;
 mod visit;
 mod walk;
 
+use crate::ast::ReadabilityOptions;
 use crate::debug::DebugFilters;
 use crate::generate::GenerateMode;
 use crate::hir::common::HirModule;
 use crate::hir::promotion::ProtoPromotionFacts;
-use crate::readability::ReadabilityOptions;
 use crate::scheduler::{InvalidationTag, PassDescriptor, PassPhase, run_invalidation_loop};
 use crate::timing::TimingCollector;
 

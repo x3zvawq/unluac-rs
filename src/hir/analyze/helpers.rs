@@ -6,11 +6,11 @@
 
 use std::collections::BTreeMap;
 
-use crate::cfg::{BlockRef, Cfg};
 use crate::hir::common::{
     HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirExpr, HirGoto, HirIf, HirLValue,
     HirLabelId, HirProto, HirProtoRef, HirReturn, HirStmt, HirUnresolvedExpr, HirUnstructured,
 };
+use crate::structure::{BlockRef, Cfg};
 use crate::transformer::InstrRef;
 
 pub(super) fn assign_stmt(targets: Vec<HirLValue>, values: Vec<HirExpr>) -> HirStmt {

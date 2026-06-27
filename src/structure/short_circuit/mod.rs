@@ -26,7 +26,7 @@ mod value_merge;
 
 use std::collections::BTreeMap;
 
-use crate::cfg::{BlockRef, Cfg, DataflowFacts, GraphFacts};
+use crate::structure::{BlockRef, Cfg, DataflowFacts, GraphFacts};
 use crate::transformer::{LoweredProto, Reg};
 
 use super::common::{BranchCandidate, ShortCircuitCandidate};

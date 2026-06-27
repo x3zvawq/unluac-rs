@@ -29,7 +29,7 @@ struct ProtoEntry<'a> {
 
 define_stage_dump! {
     /// Transformer 阶段的调试导出。
-    pub fn dump_lir(state, options) => Transform,
+    pub fn dump_lir(state, options) => Transformer,
         dump_lir_chunk(
             state.lowered.as_ref().unwrap(),
             options.detail,

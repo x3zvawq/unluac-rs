@@ -13,7 +13,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::cfg::{Cfg, EdgeKind};
+use crate::structure::{Cfg, EdgeKind};
 use crate::transformer::{LowInstr, LoweredProto};
 
 use super::common::IrreducibleRegion;
@@ -120,7 +120,7 @@ pub(super) fn analyze_goto_requirements(
 fn block_has_non_control_prefix(
     proto: &LoweredProto,
     cfg: &Cfg,
-    block: crate::cfg::BlockRef,
+    block: crate::structure::BlockRef,
 ) -> bool {
     let range = cfg.blocks[block.index()].instrs;
     let Some(last_instr_ref) = range.last() else {
@@ -156,8 +156,8 @@ fn is_control_terminator(instr: &LowInstr) -> bool {
 /// `if cond then ... end` 的隐式 fallthrough，不需要标记为 unstructured continue。
 fn is_branch_arm_to_target(
     branch_candidates: &[BranchCandidate],
-    from: crate::cfg::BlockRef,
-    target: crate::cfg::BlockRef,
+    from: crate::structure::BlockRef,
+    target: crate::structure::BlockRef,
 ) -> bool {
     branch_candidates.iter().any(|candidate| {
         candidate.header == from

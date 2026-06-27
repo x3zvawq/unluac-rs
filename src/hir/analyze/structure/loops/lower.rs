@@ -5,7 +5,7 @@
 //! 出口的 retry loop，会保守降成 `while true ... break`。
 //! 例如：`NumericForLike` 的候选会在这里降成 `HirStmt::NumericFor`。
 
-use crate::cfg::SsaValue;
+use crate::structure::SsaValue;
 
 use super::*;
 

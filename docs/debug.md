@@ -20,7 +20,7 @@ cargo unluac -s tests/unit-case/lua51_01.lua -D lua5.1
 cargo unluac -i /path/to/chunk.out -D lua5.4 --dump hir --detail verbose
 
 # 停在某一层并聚焦某个 proto
-cargo unluac -i /path/to/chunk.out -D lua5.4 --stop-after readability --proto 3 --proto-depth 1
+cargo unluac -i /path/to/chunk.out -D lua5.4 --stop-after ast --proto 3 --proto-depth 1
 
 # 查看某个 pass 的前后变化
 cargo unluac -i /path/to/chunk.out -D lua5.4 --dump-pass temp-inline --proto 2
@@ -34,7 +34,7 @@ cargo unluac -i /path/to/chunk.out -D lua5.4 --dump-pass temp-inline --proto 2
 | `-s/--source`   | 输入 Lua 源码并自动编译          |
 | `-D/--dialect`  | 指定方言                         |
 | `-d/--debug`    | 使用仓库默认 debug dump 预设     |
-| `--dump`        | 指定要打印的阶段，可重复传入     |
+| `--dump`        | 指定要打印的外层阶段，可重复传入 |
 | `--stop-after`  | 在指定阶段后停止 pipeline        |
 | `--detail`      | 控制 dump 详略                   |
 | `--proto`       | 只看某个 proto                   |
@@ -43,20 +43,21 @@ cargo unluac -i /path/to/chunk.out -D lua5.4 --dump-pass temp-inline --proto 2
 | `--list-protos` | 先列出 proto，便于决定 `--proto` |
 | `-t/--timing`   | 输出阶段耗时                     |
 
-> 其中，dump参数支持的阶段包括：`parse`, `transform`, `graph-facts`, `dataflow`, `structure-facts`, `hir`, `ast`, `readability`, `naming`, `generate`
-> `--dump-pass` 接受的参数见 `src/hir/simplify.rs` 以及 `src/ast/readability.rs` 的 `PASS_DESCRIPTORS` 定义
+> 其中，`--dump` 和 `--stop-after` 支持的阶段包括：`parser`（兼容 `parse`）、`transformer`（兼容 `transform`）、`structure`, `hir`, `ast`, `generate`。
+> `structure` dump 内含 CFG / graph-facts / dataflow / structure-facts 分段；`ast` dump 内含 AST / readability / naming 分段。
+> `--dump-pass` 接受的参数见 `src/hir/simplify/mod.rs` 以及 `src/ast/readability/mod.rs` 的 `PASS_DESCRIPTORS` 定义
 
 ## 使用约定
 
 - `--stop-after` 决定 pipeline 跑到哪一层，`--dump` 只能打印已到达的层。
-- `--proto` / `--proto-depth` 适合在 parse、HIR、AST、readability 之间来回比对同一子函数。
+- `--proto` / `--proto-depth` 适合在 parser、HIR、AST 之间来回比对同一子函数。
 - `--dump-pass` 只在 pass 实际改动内容时输出快照；未变化时不会刷屏。
 - `-o/--output` 面向最终源码输出，不适合与调试输出混用。
 
 ## 推荐排错流程
 
 1. 先用 `--list-protos` 确认目标函数，避免在大 chunk 里盲看全量输出。
-2. 从 `--dump parse` 或 `--stop-after parse` 开始，逐层向后推进，找到第一层“不对”的结果。
+2. 从 `--dump parser` 或 `--stop-after parser` 开始，逐层向后推进，找到第一层“不对”的结果。
 3. 若问题只出现在某个子函数，立刻加 `--proto N --proto-depth 1` 缩小范围。
 4. 若怀疑某个 pass 改坏了结果，用 `--dump-pass pass-name` 看它的 before/after。
 5. 锁定层次后，再去看对应设计文档，而不是在后层堆特判。

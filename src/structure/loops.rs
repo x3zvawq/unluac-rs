@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::cfg::{BlockRef, Cfg, DataflowFacts, EdgeRef, GraphFacts};
+use crate::structure::{BlockRef, Cfg, DataflowFacts, EdgeRef, GraphFacts};
 use crate::transformer::{LowInstr, LoweredProto, Reg, ResultPack};
 
 use super::common::{
@@ -517,7 +517,7 @@ fn instr_writes_any_reg(instr: &LowInstr, regs: &BTreeSet<Reg>) -> bool {
     }
 }
 
-fn instr_writes_any_reg_set(effect: &crate::cfg::InstrEffect, regs: &BTreeSet<Reg>) -> bool {
+fn instr_writes_any_reg_set(effect: &crate::structure::InstrEffect, regs: &BTreeSet<Reg>) -> bool {
     effect
         .fixed_must_defs
         .iter()

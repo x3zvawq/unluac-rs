@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::cfg::{BlockRef, Cfg, GraphFacts, PostDominatorTree};
+use crate::structure::{BlockRef, Cfg, GraphFacts, PostDominatorTree};
 use crate::transformer::LoweredProto;
 
 use super::super::common::{
@@ -210,7 +210,7 @@ struct GuardBranchExitDagBuilder<'a> {
     proto: &'a LoweredProto,
     cfg: &'a Cfg,
     branch_by_header: &'a BTreeMap<BlockRef, &'a BranchCandidate>,
-    dom_tree: &'a crate::cfg::DominatorTree,
+    dom_tree: &'a crate::structure::DominatorTree,
     post_dom_tree: &'a PostDominatorTree,
     root: BlockRef,
     nodes: Vec<GuardExitTempNode>,

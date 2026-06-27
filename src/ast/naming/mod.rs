@@ -1,4 +1,4 @@
-//! Naming 层入口。
+//! AST naming 入口。
 
 mod allocate;
 mod assign;
@@ -18,6 +18,6 @@ pub use assign::{assign_name_map, assign_names_with_evidence};
 pub use common::{
     FunctionNameMap, NameInfo, NameMap, NameSource, NamingEvidence, NamingMode, NamingOptions,
 };
-pub use debug::dump_naming;
+pub(super) use debug::dump_name_map;
 pub use error::NamingError;
 pub use evidence::collect_naming_evidence;

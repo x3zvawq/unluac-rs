@@ -1,6 +1,6 @@
 //! 这个文件承载 HIR 结构恢复的主体实现。
 //!
-//! 外层 `structure.rs` 只负责做入口和模块拼装，这里集中放真正的分支/merge/region
+//! 外层 `structure/mod.rs` 只负责做入口和模块拼装，这里集中放真正的分支/merge/region
 //! 结构恢复逻辑。这样后续继续拆 `branch merge`、`loop exits` 之类的细节时，
 //! 不会再把 facade 文件重新撑回一个巨型实现。
 
@@ -733,8 +733,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .next()
                 .expect("len checked above, exactly one reaching value exists")
             {
-                crate::cfg::SsaValue::Def(def) => self.lowering.bindings.fixed_temps[def.index()],
-                crate::cfg::SsaValue::Phi(phi) => self.lowering.bindings.phi_temps[phi.index()],
+                crate::structure::SsaValue::Def(def) => {
+                    self.lowering.bindings.fixed_temps[def.index()]
+                }
+                crate::structure::SsaValue::Phi(phi) => {
+                    self.lowering.bindings.phi_temps[phi.index()]
+                }
             },
         )
     }
@@ -1901,7 +1905,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 edge.to == self.lowering.cfg.exit_block
                     && matches!(
                         edge.kind,
-                        crate::cfg::EdgeKind::Return | crate::cfg::EdgeKind::TailCall
+                        crate::structure::EdgeKind::Return | crate::structure::EdgeKind::TailCall
                     )
             })
     }

@@ -1,6 +1,6 @@
 //! 这个文件承载 structured body lowering 里的分支恢复细节。
 //!
-//! `body.rs` 里既有 region 主循环，也有各种 branch/value-merge/loop-control 的细分
+//! `body/mod.rs` 里既有 region 主循环，也有各种 branch/value-merge/loop-control 的细分
 //! 恢复逻辑。把后者单独拆出来，是为了让“主流程如何行走 block”与“某个分支具体怎么
 //! 降”分开维护；后面继续打磨 branch merge 或 continue/break 语义时，不需要在一个
 //! 超大文件里来回跳转。
@@ -19,7 +19,7 @@
 
 use super::*;
 
-use crate::cfg::DefId;
+use crate::structure::DefId;
 
 #[derive(Debug, Clone, Copy)]
 struct SharedContinuationBranch {

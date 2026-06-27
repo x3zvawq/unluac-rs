@@ -108,7 +108,7 @@ struct CliArgs {
     /// Enable debug output using the default final-source preset.
     #[arg(short = 'd', long, help_heading = "Debug")]
     debug: bool,
-    /// Dump one or more pipeline stages.
+    /// Dump one or more outer pipeline stages.
     #[arg(long, value_parser = parse_stage_arg, help_heading = "Debug")]
     dump: Vec<DecompileStage>,
     /// Debug output detail level.
@@ -273,7 +273,7 @@ where
             result
                 .state
                 .completed_stage
-                .unwrap_or(DecompileStage::Parse)
+                .unwrap_or(DecompileStage::Parser)
         );
     } else {
         if options.output.is_some() {
@@ -381,7 +381,7 @@ where
     if args.list_protos {
         // 列 proto 不需要跑整条 pipeline，停在 parse；也不启用 debug 输出，
         // 避免 run() 里走到 debug 分支而再二次渲染。
-        decompile.target_stage = DecompileStage::Parse;
+        decompile.target_stage = DecompileStage::Parser;
         decompile.debug.enable = false;
         decompile.debug.timing = false;
         decompile.debug.output_stages.clear();

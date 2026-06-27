@@ -1,6 +1,6 @@
 //! 这个文件承载 decision simplify 共享的表达式辅助逻辑。
 //!
-//! `decision.rs`、`eliminate.rs` 和 `synthesize.rs` 都会用到"逻辑短路形状整理"以及
+//! `decision/mod.rs`、`eliminate.rs` 和 `synthesize/mod.rs` 都会用到"逻辑短路形状整理"以及
 //! "基础逻辑表达式构造"这些共通能力。把它们集中到这里的目的是避免三处各写一套
 //! 近似实现，后续如果我们继续打磨 `Decision -> Expr` 选择策略，也只需要在这一处
 //! 收紧语义边界。

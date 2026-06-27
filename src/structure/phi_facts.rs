@@ -18,7 +18,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::cfg::{BlockRef, Cfg, DataflowFacts, DefId, PhiCandidate};
+use crate::structure::{BlockRef, Cfg, DataflowFacts, DefId, PhiCandidate};
 use crate::transformer::Reg;
 
 use super::common::{
@@ -186,7 +186,7 @@ fn extend_branch_value_arm(
     header: BlockRef,
     dataflow: &DataflowFacts,
     arm: &mut BranchValueMergeArm,
-    incoming: &crate::cfg::PhiIncoming,
+    incoming: &crate::structure::PhiIncoming,
 ) {
     let Some(pred) = incoming.pred else {
         return;
@@ -228,7 +228,7 @@ fn value_merge_entry_defs(
 
 fn loop_value_merge_ids(
     loop_candidates: &[LoopCandidate],
-) -> impl Iterator<Item = crate::cfg::PhiId> + '_ {
+) -> impl Iterator<Item = crate::structure::PhiId> + '_ {
     loop_candidates.iter().flat_map(|candidate| {
         candidate
             .header_value_merges

@@ -11,9 +11,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::cfg::{BlockRef, Cfg, DataflowFacts, GraphFacts, OpenDef};
 use crate::hir::common::{LocalId, ParamId, TempId, UpvalueId};
 use crate::parser::RawLocalVar;
+use crate::structure::{BlockRef, Cfg, DataflowFacts, GraphFacts, OpenDef};
 use crate::structure::{LoopSourceBindings, StructureFacts};
 use crate::transformer::{InstrRef, LoweredProto, Reg};
 
@@ -213,7 +213,7 @@ fn debug_local_name_for_reg_at_instr(
 fn debug_local_name_for_reg_at_block_entry(
     proto: &LoweredProto,
     cfg: &Cfg,
-    block: crate::cfg::BlockRef,
+    block: crate::structure::BlockRef,
     reg: Reg,
 ) -> Option<String> {
     let instrs = cfg.blocks[block.index()].instrs;
@@ -263,7 +263,7 @@ fn loop_binding_scope(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
 ) -> BTreeSet<BlockRef> {
-    use crate::cfg::EdgeKind;
+    use crate::structure::EdgeKind;
 
     let mut scope = body_blocks.clone();
     let normal_exits = exits

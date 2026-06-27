@@ -11,7 +11,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::cfg::{BlockRef, Cfg, DominatorTree, GraphFacts};
+use crate::structure::{BlockRef, Cfg, DominatorTree, GraphFacts};
 
 use super::common::{BranchCandidate, BranchKind, BranchRegionFact};
 use super::helpers::{collect_forward_region_blocks, collect_merge_arm_preds};

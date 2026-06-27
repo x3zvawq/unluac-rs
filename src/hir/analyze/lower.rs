@@ -1,6 +1,6 @@
 //! 这个文件承载 HIR 初始恢复里真正的 lowering 内核。
 //!
-//! 外层 [analyze.rs](/Users/x3zvawq/workspace/unluac-rs/src/hir/analyze.rs) 只负责组织模块和
+//! 外层 [analyze.rs](/Users/x3zvawq/workspace/unluac-rs/src/hir/analyze/mod.rs) 只负责组织模块和
 //! 暴露主入口，这里集中放 proto 递归构造、线性 block 降低、phi 物化和 low-IR 语句
 //! 映射。这样做是为了让“公开入口”和“内部 lowering 细节”分开，后续继续拆 analyze
 //! 子模块时边界会更清楚。
@@ -25,13 +25,13 @@ use super::short_circuit::{
 };
 use super::structure::try_build_structured_body;
 use crate::ast::AstTargetDialect;
-use crate::cfg::{BlockRef, Cfg, CfgGraph, DataflowFacts, GraphFacts, PhiId};
 use crate::decompile::{DecompileContext, DecompileState};
 use crate::hir::common::{
     HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirCallStmt, HirCapture, HirClose,
     HirClosureExpr, HirExpr, HirLValue, HirLabel, HirLabelId, HirProto, HirProtoRef, HirStmt,
     HirTableSetList, HirToBeClosed, HirUnaryExpr, LocalId, ParamId, TempId, UpvalueId,
 };
+use crate::structure::{BlockRef, Cfg, CfgGraph, DataflowFacts, GraphFacts, PhiId};
 use crate::structure::{ShortCircuitExit, StructureFacts};
 use crate::transformer::{
     AccessKey, CallKind, GenericForCallInstr, GenericForLoopInstr, InstrRef, LowInstr,

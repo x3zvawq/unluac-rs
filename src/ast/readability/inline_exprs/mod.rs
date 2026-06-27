@@ -11,7 +11,7 @@
 mod candidate;
 mod use_sites;
 
-use crate::readability::ReadabilityOptions;
+use crate::ast::ReadabilityOptions;
 
 use self::candidate::{
     InlinePolicy, inline_candidate, stmt_is_adjacent_call_result_sink,

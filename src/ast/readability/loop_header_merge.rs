@@ -5,7 +5,7 @@
 //! 这些 local 往往只是前层为了保持单值边界而提前物化的中间 binding。
 //! 当它们只在 loop header 被读取时，把它们重新折回控制头会更接近源码。
 
-use crate::readability::ReadabilityOptions;
+use crate::ast::ReadabilityOptions;
 
 use super::super::common::{AstBlock, AstExpr, AstLocalAttr, AstLocalOrigin, AstModule, AstStmt};
 use super::ReadabilityContext;

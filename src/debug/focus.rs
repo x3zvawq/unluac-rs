@@ -193,9 +193,9 @@ pub struct FocusRequest {
 /// 再用 `format_proto_summary_row` 渲染成稳定格式的单行文本。
 ///
 /// 不是每一层都能填齐所有字段：
-/// - parser / transformer / cfg / graph-facts / dataflow / structure 只有
+/// - parser / transformer / structure 内部片段通常只有
 ///   `lines / instrs / children / first`（`name=-`）。
-/// - HIR / AST / readability / naming / generate 可额外填 `name`。
+/// - HIR / AST / generate 可额外填 `name`。
 #[derive(Debug, Clone, Default)]
 pub struct ProtoSummaryRow {
     pub id: usize,

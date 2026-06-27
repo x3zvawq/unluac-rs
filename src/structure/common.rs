@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::cfg::{BlockRef, DefId, EdgeRef, PhiId};
+use crate::structure::{BlockRef, DefId, EdgeRef, PhiId};
 use crate::transformer::{InstrRef, Reg, RegRange};
 
 /// 一个 proto 的结构候选集合，以及它的子 proto 结果。

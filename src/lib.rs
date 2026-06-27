@@ -6,14 +6,11 @@
 //! 就可以被单测、集成测试和调试工具直接复用。
 
 pub mod ast;
-pub mod cfg;
 pub mod debug;
 pub mod decompile;
 pub mod generate;
 pub mod hir;
-pub mod naming;
 pub mod parser;
-pub mod readability;
 pub(crate) mod scheduler;
 pub mod structure;
 mod timing;

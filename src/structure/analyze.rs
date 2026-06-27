@@ -1,27 +1,52 @@
-//! 这个文件负责 StructureFacts 的总调度。
+//! 这个文件负责 Structure 层的总调度。
 //!
 //! 各类候选的提取规则已经拆到独立模块里，避免结构层继续膨胀成单个巨型文件；
-//! 这里仅保留“按顺序汇总事实并递归处理子 proto”的壳。
+//! 这里仅保留“先准备底层事实，再按顺序汇总结构候选”的壳。
 //!
-//! 它从主 pipeline 的 `DecompileState` 读取 CFG / GraphFacts / Dataflow 等已经完成的
-//! 产物，并把这些底层事实按固定顺序翻译成 StructureFacts；它不会越权恢复 HIR/AST
-//! 语法，只负责调度各个结构 pass 并汇总结果。
+//! 它从主 pipeline 的 `DecompileState` 读取 low-IR，依次写回 CFG、GraphFacts、
+//! Dataflow 和 StructureFacts；它不会越权恢复 HIR/AST 语法，只负责调度结构层内部
+//! 分析并汇总结果。
 //!
 //! 例子：
 //! - 一个 proto 如果同时包含 loop、branch 和 short-circuit 候选，这里会先提 loop/
 //!   branch 骨架，再在同一套共享事实上继续推 short-circuit、region、scope 和 goto 约束
 //! - 子 proto 会递归走完全相同的结构分析顺序，保证父子层结构事实口径一致
 
-use crate::cfg::{Cfg, CfgGraph, DataflowFacts, GraphFacts};
 use crate::decompile::{DecompileContext, DecompileError, DecompileState};
+use crate::structure::{Cfg, CfgGraph, DataflowFacts, GraphFacts};
 use crate::transformer::LoweredProto;
 
 use super::common::StructureFacts;
 use super::{
-    branch_values, branches, goto, helpers, loops, phi_facts, regions, scope, short_circuit,
+    branch_values, branches, cfg, goto, helpers, loops, phi_facts, regions, scope, short_circuit,
 };
 
-/// StructureFacts 阶段入口：从前序槽位读取图与数据流事实，写回结构候选。
+/// Structure 阶段入口：内部固定推进 CFG、图事实、数据流和结构候选。
+pub(crate) fn analyze_structure_stage(
+    state: &mut DecompileState,
+    context: &DecompileContext<'_>,
+) -> Result<(), DecompileError> {
+    {
+        let _timing = context.timings.scope("cfg");
+        cfg::build_cfg_proto(state, context)?;
+    }
+    {
+        let _timing = context.timings.scope("graph-facts");
+        cfg::analyze_graph_facts(state, context)?;
+    }
+    {
+        let _timing = context.timings.scope("dataflow");
+        cfg::analyze_dataflow(state, context)?;
+    }
+    {
+        let _timing = context.timings.scope("structure-facts");
+        analyze_structure(state, context)?;
+    }
+
+    Ok(())
+}
+
+/// 从已经完成的底层事实读取图与数据流结果，写回结构候选。
 pub(crate) fn analyze_structure(
     state: &mut DecompileState,
     _context: &DecompileContext<'_>,

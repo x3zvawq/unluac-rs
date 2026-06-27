@@ -11,7 +11,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::cfg::{BlockRef, Cfg, DataflowFacts, GraphFacts};
+use crate::structure::{BlockRef, Cfg, DataflowFacts, GraphFacts};
 
 use super::common::{
     BranchKind, BranchRegionFact, BranchValueMergeCandidate, ShortCircuitCandidate,

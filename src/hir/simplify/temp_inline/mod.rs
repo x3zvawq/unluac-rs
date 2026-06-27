@@ -13,12 +13,12 @@ mod usage;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::ast::ReadabilityOptions;
 use crate::hir::common::{
     HirBlock, HirCallExpr, HirExpr, HirLValue, HirProto, HirStmt, HirTableField, HirTableKey,
     TempId,
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
-use crate::readability::ReadabilityOptions;
 
 use self::mentioned::protected_temps_for_nested_stmt;
 use self::rewrite::replace_temp_in_stmt;

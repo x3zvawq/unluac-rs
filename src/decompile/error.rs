@@ -7,8 +7,8 @@ use thiserror::Error;
 
 use super::state::DecompileStage;
 use crate::ast::AstLowerError;
+use crate::ast::NamingError;
 use crate::generate::GenerateError;
-use crate::naming::NamingError;
 use crate::parser::ParseError;
 use crate::transformer::TransformError;
 

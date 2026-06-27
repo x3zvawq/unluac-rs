@@ -16,11 +16,10 @@
 //!   分支，统一在渲染 body 前查询 thread-local：不可见的函数退化为一行
 //!   `function(...) --[[ body elided proto#K ]] end` 占位。
 //!
-//! stage dump 入口直接从主 pipeline state 读取 AST 或 Readability 产物，阶段表可以
-//! 直接引用 AST 层导出的函数。选择不在 generate 层做 elision 的原因：generate 层产出的是最终 Lua 源码，
+//! stage dump 入口直接从主 pipeline state 读取 AST / Readability / Naming 产物并
+//! 拼成一个 AST 层输出。选择不在 generate 层做 elision 的原因：generate 层产出的是最终 Lua 源码，
 //! 对它做局部截断会输出非法语法。对于"只看某个函数最终长什么样"的需求，用
-//! `--stop-after readability --proto N` 或 `--stop-after ast --proto N` 得到的
-//! 函数形状已足够；generate 层改为整文件直出，文档里也这么声明。
+//! `--stop-after ast --proto N` 得到的函数形状已足够；generate 层改为整文件直出。
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,6 +34,7 @@ use crate::debug::{
     build_proto_nodes, colorize_debug_text, compute_focus_plan, define_stage_dump,
     format_breadcrumb,
 };
+use crate::decompile::{DebugOptions, DecompileState};
 use crate::hir::LocalId;
 
 use super::common::{
@@ -83,21 +83,51 @@ fn install_ast_focus(state: AstFocusState) -> AstFocusGuard {
 define_stage_dump! {
     /// AST 阶段的调试导出。
     pub fn dump_ast(state, options) => Ast,
+        dump_ast_stage(state, options);
+}
+
+fn dump_ast_stage(state: &DecompileState, options: &DebugOptions) -> String {
+    let mut output = String::new();
+
+    append_section(
+        &mut output,
         dump_ast_module(
             state.ast.as_ref().unwrap(),
             options.detail,
             &options.filters,
-            options.color
-        );
-
-    /// Readability 阶段的调试导出。
-    pub fn dump_readability(state, options) => Readability,
+            options.color,
+        ),
+    );
+    append_section(
+        &mut output,
         dump_readability_module(
             state.readability.as_ref().unwrap(),
             options.detail,
             &options.filters,
-            options.color
-        );
+            options.color,
+        ),
+    );
+    append_section(
+        &mut output,
+        super::naming::dump_name_map(
+            state.naming.as_ref().unwrap(),
+            options.detail,
+            &options.filters,
+            options.color,
+        ),
+    );
+
+    output
+}
+
+fn append_section(output: &mut String, section: String) {
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    output.push_str(&section);
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
 }
 
 /// 查询某个 proto 是否应渲染完整 body。默认（thread-local 尚未装载）视作可见，

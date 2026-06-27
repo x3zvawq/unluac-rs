@@ -10,17 +10,14 @@ mod pipeline;
 mod stages;
 mod state;
 
-pub use crate::ast::{dump_ast, dump_readability};
-pub use crate::cfg::{dump_cfg, dump_dataflow, dump_graph_facts};
+pub use crate::ast::ReadabilityOptions;
+pub use crate::ast::dump_ast;
+pub use crate::ast::{FunctionNameMap, NameInfo, NameMap, NameSource, NamingMode, NamingOptions};
 pub use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, ProtoDepth};
 pub use crate::generate::dump_generate;
 pub use crate::generate::{GenerateMode, GenerateOptions, QuoteStyle, TableStyle};
 pub use crate::hir::dump_hir;
-pub use crate::naming::{
-    FunctionNameMap, NameInfo, NameMap, NameSource, NamingMode, NamingOptions, dump_naming,
-};
 pub use crate::parser::dump_parser;
-pub use crate::readability::ReadabilityOptions;
 pub use crate::structure::dump_structure;
 pub use crate::timing::{TimingNode, TimingReport, render_timing_report};
 pub use crate::transformer::dump_lir;

@@ -11,13 +11,13 @@ mod recovery;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::cfg::{BlockRef, DefId, PhiId, SsaValue};
 use crate::hir::common::{
     HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr, TempId,
 };
 use crate::hir::decision::{
     decision_is_synth_safe, finalize_condition_decision_expr, finalize_value_decision_expr,
 };
+use crate::structure::{BlockRef, DefId, PhiId, SsaValue};
 use crate::structure::{
     ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNode, ShortCircuitNodeRef,
     ShortCircuitTarget,
