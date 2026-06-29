@@ -15,8 +15,9 @@ pub use common::{
     BasicBlock, BlockKind, BlockRef, Cfg, CfgEdge, CfgGraph, CompactSet, DataflowFacts, Def, DefId,
     DominatorTree, EdgeKind, EdgeRef, EffectTag, GraphFacts, InstrEffect, InstrRange,
     InstrReachingDefs, InstrReachingValues, InstrUseDefs, InstrUseValues, NaturalLoop, OpenDef,
-    OpenDefId, OpenUseSite, PhiCandidate, PhiId, PhiIncoming, PostDominatorTree, RegValueMap,
-    SideEffectSummary, SsaValue, UseSite, ValueMapRef, ValueSetRef,
+    OpenDefId, OpenUseSite, PhiCandidate, PhiId, PhiIncoming, PostDominatorTree,
+    ReachableSuccessorShape, RegValueMap, SideEffectSummary, SsaValue, UseSite, ValueMapRef,
+    ValueSetRef,
 };
 pub(crate) use dataflow::analyze_dataflow;
 pub use dataflow::compute_dataflow_facts;

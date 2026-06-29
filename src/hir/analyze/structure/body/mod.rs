@@ -1374,20 +1374,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         block: BlockRef,
         stop: Option<BlockRef>,
     ) -> Option<Option<BlockRef>> {
-        let mut successors = self.lowering.cfg.succs[block.index()]
-            .iter()
-            .map(|edge_ref| self.lowering.cfg.edges[edge_ref.index()].to)
-            .filter(|succ| self.lowering.cfg.reachable_blocks.contains(succ))
-            .collect::<Vec<_>>();
-        successors.sort();
-        successors.dedup();
-
-        match successors.as_slice() {
-            [] => Some(None),
-            [succ] if *succ == self.lowering.cfg.exit_block => Some(None),
-            [succ] if Some(*succ) == stop => Some(Some(*succ)),
-            [succ] => Some(Some(*succ)),
-            _ => None,
+        match self.lowering.cfg.reachable_successor_shape(block) {
+            ReachableSuccessorShape::Empty => Some(None),
+            ReachableSuccessorShape::Single(succ) if succ == self.lowering.cfg.exit_block => {
+                Some(None)
+            }
+            ReachableSuccessorShape::Single(succ) if Some(succ) == stop => Some(Some(succ)),
+            ReachableSuccessorShape::Single(succ) => Some(Some(succ)),
+            ReachableSuccessorShape::Multiple => None,
         }
     }
 

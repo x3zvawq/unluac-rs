@@ -18,7 +18,7 @@ use crate::hir::common::{
     HirRepeat, HirStmt, HirWhile, TempId,
 };
 use crate::hir::decision::finalize_condition_decision_expr;
-use crate::structure::{BlockRef, PhiId};
+use crate::structure::{BlockRef, PhiId, ReachableSuccessorShape};
 use crate::structure::{
     BranchCandidate, BranchKind, BranchRegionFact, BranchValueMergeArm, BranchValueMergeCandidate,
     BranchValueMergeValue, GotoReason, LoopCandidate, LoopKindHint, LoopValueArm, LoopValueMerge,

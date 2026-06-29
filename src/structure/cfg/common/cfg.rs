@@ -30,6 +30,23 @@ pub struct Cfg {
     pub reachable_blocks: BTreeSet<BlockRef>,
 }
 
+/// 去重后的 reachable successor 数量形态。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ReachableSuccessorShape {
+    Empty,
+    Single(BlockRef),
+    Multiple,
+}
+
+impl ReachableSuccessorShape {
+    pub const fn unique(self) -> Option<BlockRef> {
+        match self {
+            Self::Single(block) => Some(block),
+            Self::Empty | Self::Multiple => None,
+        }
+    }
+}
+
 /// 边的稳定引用。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
 pub struct EdgeRef(pub usize);
@@ -185,17 +202,50 @@ impl Cfg {
         preds
     }
 
-    /// 如果 block 只有一个 reachable successor，返回它。
+    /// 如果 block 在筛选后只有一个去重 reachable predecessor，返回它。
+    pub fn unique_reachable_predecessor_matching(
+        &self,
+        block: BlockRef,
+        mut matches: impl FnMut(BlockRef) -> bool,
+    ) -> Option<BlockRef> {
+        let mut unique = None;
+        for edge_ref in &self.preds[block.index()] {
+            let pred = self.edges[edge_ref.index()].from;
+            if !self.reachable_blocks.contains(&pred) || !matches(pred) {
+                continue;
+            }
+            match unique {
+                None => unique = Some(pred),
+                Some(existing) if existing == pred => {}
+                Some(_) => return None,
+            }
+        }
+        unique
+    }
+
+    /// 如果 block 去重后只有一个 reachable successor，返回它。
     pub fn unique_reachable_successor(&self, block: BlockRef) -> Option<BlockRef> {
-        let mut successors = self.succs[block.index()]
-            .iter()
-            .map(|edge_ref| self.edges[edge_ref.index()].to)
-            .filter(|succ| self.reachable_blocks.contains(succ));
-        let succ = successors.next()?;
-        if successors.next().is_none() {
-            Some(succ)
-        } else {
-            None
+        self.reachable_successor_shape(block).unique()
+    }
+
+    /// 返回去重后 reachable successor 的数量形态，不为常见线性查询分配临时 Vec。
+    pub fn reachable_successor_shape(&self, block: BlockRef) -> ReachableSuccessorShape {
+        let mut unique = None;
+        for edge_ref in &self.succs[block.index()] {
+            let succ = self.edges[edge_ref.index()].to;
+            if !self.reachable_blocks.contains(&succ) {
+                continue;
+            }
+            match unique {
+                None => unique = Some(succ),
+                Some(existing) if existing == succ => {}
+                Some(_) => return ReachableSuccessorShape::Multiple,
+            }
+        }
+
+        match unique {
+            Some(succ) => ReachableSuccessorShape::Single(succ),
+            None => ReachableSuccessorShape::Empty,
         }
     }
 

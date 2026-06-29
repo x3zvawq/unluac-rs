@@ -10,6 +10,7 @@ mod storage;
 
 pub use cfg::{
     BasicBlock, BlockKind, BlockRef, Cfg, CfgEdge, CfgGraph, EdgeKind, EdgeRef, InstrRange,
+    ReachableSuccessorShape,
 };
 pub(crate) use dataflow::ValueFactsStorage;
 pub use dataflow::{

@@ -350,15 +350,7 @@ fn unique_loop_preheader(
     header: BlockRef,
     loop_blocks: &BTreeSet<BlockRef>,
 ) -> Option<BlockRef> {
-    let preds = cfg
-        .reachable_predecessors(header)
-        .into_iter()
-        .filter(|pred| !loop_blocks.contains(pred))
-        .collect::<Vec<_>>();
-    let [preheader] = preds.as_slice() else {
-        return None;
-    };
-    Some(*preheader)
+    cfg.unique_reachable_predecessor_matching(header, |pred| !loop_blocks.contains(&pred))
 }
 
 fn branch_has_loop_body_and_exit(cfg: &Cfg, header: BlockRef, blocks: &BTreeSet<BlockRef>) -> bool {
@@ -549,30 +541,24 @@ fn repeat_continue_target_via_backedge_pad(
     backedge_source: BlockRef,
     blocks: &BTreeSet<BlockRef>,
 ) -> Option<BlockRef> {
-    let preds = cfg
-        .reachable_predecessors(backedge_source)
-        .into_iter()
-        .filter(|pred| blocks.contains(pred))
-        .collect::<Vec<_>>();
-    let [continue_target] = preds.as_slice() else {
-        return None;
-    };
+    let continue_target =
+        cfg.unique_reachable_predecessor_matching(backedge_source, |pred| blocks.contains(&pred))?;
 
     if !matches!(
-        cfg.terminator(&proto.instrs, *continue_target),
+        cfg.terminator(&proto.instrs, continue_target),
         Some(LowInstr::Branch(_))
     ) {
         return None;
     }
 
-    let (then_edge_ref, else_edge_ref) = cfg.branch_edges(*continue_target)?;
+    let (then_edge_ref, else_edge_ref) = cfg.branch_edges(continue_target)?;
     let then_block = cfg.edges[then_edge_ref.index()].to;
     let else_block = cfg.edges[else_edge_ref.index()].to;
 
     if (then_block == backedge_source && !blocks.contains(&else_block))
         || (else_block == backedge_source && !blocks.contains(&then_block))
     {
-        Some(*continue_target)
+        Some(continue_target)
     } else {
         None
     }

@@ -22,9 +22,9 @@ pub use cfg::{
     BasicBlock, BlockKind, BlockRef, Cfg, CfgEdge, CfgGraph, CompactSet, DataflowFacts, Def, DefId,
     DominatorTree, EdgeKind, EdgeRef, EffectTag, GraphFacts, InstrEffect, InstrRange,
     InstrReachingDefs, InstrReachingValues, InstrUseDefs, InstrUseValues, NaturalLoop, OpenDef,
-    OpenDefId, OpenUseSite, PhiCandidate, PhiId, PhiIncoming, PostDominatorTree, RegValueMap,
-    SideEffectSummary, SsaValue, UseSite, ValueMapRef, ValueSetRef, build_cfg_graph,
-    compute_dataflow_facts,
+    OpenDefId, OpenUseSite, PhiCandidate, PhiId, PhiIncoming, PostDominatorTree,
+    ReachableSuccessorShape, RegValueMap, SideEffectSummary, SsaValue, UseSite, ValueMapRef,
+    ValueSetRef, build_cfg_graph, compute_dataflow_facts,
 };
 pub use common::{
     BranchCandidate, BranchKind, BranchRegionFact, BranchValueMergeArm, BranchValueMergeCandidate,
