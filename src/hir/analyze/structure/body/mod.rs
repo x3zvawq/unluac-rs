@@ -1134,6 +1134,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         {
             return None;
         }
+        if self.short_circuit_consumed_headers_have_escaping_prefix_defs(&next.consumed_headers) {
+            return None;
+        }
         Some(next)
     }
 
@@ -1201,6 +1204,48 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 }
                 !expr_has_temp_ref_in(cond, &unresolved_prefix_temps)
             })
+    }
+
+    fn short_circuit_consumed_headers_have_escaping_prefix_defs(
+        &self,
+        consumed_headers: &[BlockRef],
+    ) -> bool {
+        let consumed_headers = consumed_headers.iter().copied().collect::<BTreeSet<_>>();
+        consumed_headers.iter().copied().any(|header| {
+            self.short_circuit_consumed_header_has_escaping_prefix_defs(header, &consumed_headers)
+        })
+    }
+
+    fn short_circuit_consumed_header_has_escaping_prefix_defs(
+        &self,
+        header: BlockRef,
+        consumed_headers: &BTreeSet<BlockRef>,
+    ) -> bool {
+        let range = self.lowering.cfg.blocks[header.index()].instrs;
+        if range.is_empty() {
+            return false;
+        }
+        let end = if let Some((_instr_ref, instr)) = self.block_terminator(header) {
+            if is_control_terminator(instr) {
+                range.end() - 1
+            } else {
+                range.end()
+            }
+        } else {
+            range.end()
+        };
+
+        for instr_index in range.start.index()..end {
+            for def in &self.lowering.dataflow.instr_defs[instr_index] {
+                for use_site in &self.lowering.dataflow.def_uses[def.index()] {
+                    let use_block = self.lowering.cfg.instr_to_block[use_site.instr.index()];
+                    if !consumed_headers.contains(&use_block) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     fn can_short_circuit_falsy_to_non_empty_continue(&self) -> bool {

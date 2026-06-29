@@ -318,6 +318,10 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_39_method_hint_open_arg_call.lua",
         PUC_LUA_51,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_40_branch_state_and_short_prefix_escape.lua",
+        PUC_LUA_51,
+    ),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {

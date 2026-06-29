@@ -35,12 +35,18 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let mut values = Vec::new();
 
         for value in &candidate.values {
-            if !branch_value_needs_preserved_entry_seed(value) {
+            let needs_preserved_seed = branch_value_needs_preserved_entry_seed(value);
+            let needs_shared_seed = self.branch_value_needs_shared_entry_seed(header, value);
+            if !needs_preserved_seed && !needs_shared_seed {
                 continue;
             }
 
             let target = self.branch_value_arm_target(value, target_overrides);
-            let init = self.branch_value_preserved_entry_expr(header, value.reg, target_overrides);
+            let init = if needs_shared_seed {
+                self.branch_value_preserved_entry_expr_without_target_rewrite(header, value.reg)
+            } else {
+                self.branch_value_preserved_entry_expr(header, value.reg, target_overrides)
+            };
             if lvalue_as_expr(&target)
                 .as_ref()
                 .is_some_and(|target_expr| *target_expr == init)
@@ -297,6 +303,62 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let mut expr = expr_for_reg_at_block_exit(self.lowering, header, reg);
         rewrite_expr_temps(&mut expr, &temp_expr_overrides(target_overrides));
         expr
+    }
+
+    fn branch_value_preserved_entry_expr_without_target_rewrite(
+        &self,
+        header: BlockRef,
+        reg: Reg,
+    ) -> HirExpr {
+        if !self.block_redefines_reg(header, reg)
+            && let Some(expr) = self.overrides.carried_entry_expr(header, reg)
+        {
+            return expr.clone();
+        }
+
+        expr_for_reg_at_block_exit(self.lowering, header, reg)
+    }
+
+    fn branch_value_needs_shared_entry_seed(
+        &self,
+        header: BlockRef,
+        value: &BranchValueMergeValue,
+    ) -> bool {
+        if value.then_arm.non_header_defs.is_empty() || value.else_arm.non_header_defs.is_empty() {
+            return false;
+        }
+
+        let shared_entry_defs = value
+            .then_arm
+            .defs
+            .intersection(&value.else_arm.defs)
+            .copied()
+            .filter(|def| {
+                let def_block = self.lowering.dataflow.def_block(*def);
+                def_block == header
+                    || self
+                        .lowering
+                        .graph_facts
+                        .dominator_tree
+                        .dominates(def_block, header)
+            })
+            .collect::<BTreeSet<_>>();
+        if shared_entry_defs.is_empty() {
+            return false;
+        }
+
+        let has_then_update = value
+            .then_arm
+            .non_header_defs
+            .iter()
+            .any(|def| !shared_entry_defs.contains(def));
+        let has_else_update = value
+            .else_arm
+            .non_header_defs
+            .iter()
+            .any(|def| !shared_entry_defs.contains(def));
+
+        has_then_update || has_else_update
     }
 
     fn uniform_dup_safe_arm_expr(&self, arm: &BranchValueMergeArm) -> Option<HirExpr> {
