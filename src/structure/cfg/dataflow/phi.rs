@@ -8,7 +8,6 @@ pub(super) fn compute_phi_candidates(
     defs: &[Def],
     live_in: &[BTreeSet<Reg>],
     block_out: &[FixedState],
-    fixed_def_lookup: &[FixedDefLookup],
 ) -> Vec<PhiCandidate> {
     let mut def_blocks = BTreeMap::<Reg, BTreeSet<BlockRef>>::new();
     for def in defs {
@@ -51,7 +50,7 @@ pub(super) fn compute_phi_candidates(
                             reg,
                             block_out,
                             &phi_blocks,
-                            fixed_def_lookup,
+                            &blocks,
                         )
                     {
                         phi_blocks.insert(frontier_block);
@@ -59,7 +58,7 @@ pub(super) fn compute_phi_candidates(
                         changed = true;
                     }
 
-                    if !block_defines_reg(cfg, frontier_block, reg, fixed_def_lookup) {
+                    if !blocks.contains(&frontier_block) {
                         worklist.push_back(frontier_block);
                     }
                 }
@@ -117,7 +116,7 @@ fn build_phi_candidate(
     reg: Reg,
     block_out: &[FixedState],
     phi_blocks: &BTreeSet<BlockRef>,
-    fixed_def_lookup: &[FixedDefLookup],
+    def_blocks: &BTreeSet<BlockRef>,
 ) -> Option<PhiCandidate> {
     let mut incoming = Vec::new();
     let mut distinct_sources = BTreeSet::<PredSource>::new();
@@ -136,15 +135,8 @@ fn build_phi_candidate(
         let mut reaching_defs: Vec<DefId> = defs.iter().copied().collect();
         reaching_defs.sort();
 
-        let ancestor = nearest_def_or_phi_ancestor(
-            cfg,
-            graph_facts,
-            phi_blocks,
-            fixed_def_lookup,
-            pred,
-            reg,
-            block,
-        );
+        let ancestor =
+            nearest_def_or_phi_ancestor(graph_facts, phi_blocks, def_blocks, pred, block);
 
         distinct_sources.insert(PredSource {
             reaching_defs,
@@ -244,19 +236,17 @@ fn add_entry_header_loop_phi_candidates(
 /// 虑的 frontier_block 自身，避免自引用。若整条链都没有 def/phi，返回 None，表示
 /// 该 pred 来自入口。
 fn nearest_def_or_phi_ancestor(
-    cfg: &Cfg,
     graph_facts: &GraphFacts,
     phi_blocks: &BTreeSet<BlockRef>,
-    fixed_def_lookup: &[FixedDefLookup],
+    def_blocks: &BTreeSet<BlockRef>,
     pred: BlockRef,
-    reg: Reg,
     exclude: BlockRef,
 ) -> Option<AncestorKind> {
     let parents = &graph_facts.dominator_tree.parent;
     let mut cursor = Some(pred);
     while let Some(node) = cursor {
         if node != exclude {
-            if block_defines_reg(cfg, node, reg, fixed_def_lookup) {
+            if def_blocks.contains(&node) {
                 return Some(AncestorKind::DefBlock(node));
             }
             if phi_blocks.contains(&node) {
@@ -266,17 +256,4 @@ fn nearest_def_or_phi_ancestor(
         cursor = parents.get(node.index()).copied().flatten();
     }
     None
-}
-
-fn block_defines_reg(
-    cfg: &Cfg,
-    block: BlockRef,
-    reg: Reg,
-    fixed_def_lookup: &[FixedDefLookup],
-) -> bool {
-    let Some(mut instr_indices) = super::instr_indices(cfg, block) else {
-        return false;
-    };
-
-    instr_indices.any(|instr_index| fixed_def_lookup[instr_index].defines(reg))
 }

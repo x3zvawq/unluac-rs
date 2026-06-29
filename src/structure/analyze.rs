@@ -51,10 +51,10 @@ pub(crate) fn analyze_structure(
     state: &mut DecompileState,
     _context: &DecompileContext<'_>,
 ) -> Result<(), DecompileError> {
-    let lowered = state.lowered.as_ref().unwrap();
-    let cfg = state.cfg.as_ref().unwrap();
-    let graph_facts = state.graph_facts.as_ref().unwrap();
-    let dataflow = state.dataflow.as_ref().unwrap();
+    let lowered = state.require_lowered()?;
+    let cfg = state.require_cfg()?;
+    let graph_facts = state.require_graph_facts()?;
+    let dataflow = state.require_dataflow()?;
     state.structure_facts = Some(analyze_structure_proto(
         &lowered.main,
         &cfg.cfg,

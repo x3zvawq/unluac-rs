@@ -69,14 +69,13 @@ fn analyze_guard_short_circuit_branch_value_merges(
         // Determine direction: one exit must reach the other (the "body" flows
         // into the "merge"). Handle both truthy→falsy and falsy→truthy so that
         // inverted comparisons (e.g. LuaJIT ISGE) work correctly.
-        let (body, merge, body_is_truthy) =
-            if cfg.can_reach(truthy, falsy) && !cfg.can_reach(falsy, truthy) {
-                (truthy, falsy, true)
-            } else if cfg.can_reach(falsy, truthy) && !cfg.can_reach(truthy, falsy) {
-                (falsy, truthy, false)
-            } else {
-                continue;
-            };
+        let truthy_reaches_falsy = cfg.can_reach(truthy, falsy);
+        let falsy_reaches_truthy = cfg.can_reach(falsy, truthy);
+        let (body, merge, body_is_truthy) = match (truthy_reaches_falsy, falsy_reaches_truthy) {
+            (true, false) => (truthy, falsy, true),
+            (false, true) => (falsy, truthy, false),
+            _ => continue,
+        };
 
         let then_preds = collect_merge_arm_preds(cfg, body, merge);
         let else_preds = short.branch_exit_leaf_preds(!body_is_truthy);

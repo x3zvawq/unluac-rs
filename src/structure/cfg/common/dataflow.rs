@@ -42,6 +42,8 @@ pub struct DataflowFacts {
     pub open_live_out: Vec<bool>,
     pub phi_candidates: Vec<PhiCandidate>,
     pub(crate) phi_block_ranges: Vec<Range<usize>>,
+    pub(crate) phi_use_counts: Vec<usize>,
+    pub(crate) phi_use_blocks: Vec<Option<BlockRef>>,
     pub(crate) value_facts: ValueFactsStorage,
     pub children: Vec<DataflowFacts>,
 }
@@ -278,15 +280,10 @@ impl DataflowFacts {
     }
 
     pub fn phi_use_count(&self, phi_id: PhiId) -> usize {
-        if self.phi_candidates.is_empty() {
-            return 0;
-        }
-
-        (0..self.use_defs.len())
-            .map(|instr_index| self.use_values_at(InstrRef(instr_index)))
-            .flat_map(ValueMapRef::values)
-            .filter(|values| values.contains(&SsaValue::Phi(phi_id)))
-            .count()
+        self.phi_use_counts
+            .get(phi_id.index())
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn def_reg(&self, def_id: DefId) -> Reg {
@@ -328,29 +325,9 @@ impl DataflowFacts {
             .max_by_key(|def_id| self.def_instr(*def_id).index())
     }
 
-    pub fn phi_used_only_in_block(&self, cfg: &Cfg, phi_id: PhiId, block: BlockRef) -> bool {
-        if self.phi_candidates.is_empty() {
-            return false;
-        }
-
-        let mut saw_use = false;
-
-        for instr_index in 0..self.use_defs.len() {
-            let used_here = self
-                .use_values_at(InstrRef(instr_index))
-                .values()
-                .any(|values| values.contains(&SsaValue::Phi(phi_id)));
-            if !used_here {
-                continue;
-            }
-
-            saw_use = true;
-            if cfg.instr_to_block[instr_index] != block {
-                return false;
-            }
-        }
-
-        saw_use
+    pub fn phi_used_only_in_block(&self, phi_id: PhiId, block: BlockRef) -> bool {
+        self.phi_use_count(phi_id) > 0
+            && self.phi_use_blocks.get(phi_id.index()).copied().flatten() == Some(block)
     }
 
     /// 计算"真正死亡"的 phi 集合——既没有任何指令直接读取，也没有被任何存活 phi

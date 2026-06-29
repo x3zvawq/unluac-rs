@@ -107,7 +107,7 @@ pub(crate) fn analyze_graph_facts(
         analysis.into_graph_facts(children)
     }
 
-    let cfg = state.cfg.as_ref().unwrap();
+    let cfg = state.require_cfg()?;
     state.graph_facts = Some(analyze_cfg_graph(cfg));
     Ok(())
 }

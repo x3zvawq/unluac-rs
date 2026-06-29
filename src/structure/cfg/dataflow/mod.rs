@@ -44,15 +44,6 @@ struct FixedDefLookup {
     may: Vec<(Reg, DefId)>,
 }
 
-impl FixedDefLookup {
-    fn defines(&self, reg: Reg) -> bool {
-        self.must
-            .iter()
-            .chain(self.may.iter())
-            .any(|(candidate, _)| *candidate == reg)
-    }
-}
-
 struct BlockReachingState {
     fixed_in: Vec<FixedState>,
     fixed_out: Vec<FixedState>,
@@ -301,9 +292,9 @@ pub(crate) fn analyze_dataflow(
     state: &mut DecompileState,
     _context: &DecompileContext<'_>,
 ) -> Result<(), DecompileError> {
-    let lowered = state.lowered.as_ref().unwrap();
-    let cfg = state.cfg.as_ref().unwrap();
-    let graph_facts = state.graph_facts.as_ref().unwrap();
+    let lowered = state.require_lowered()?;
+    let cfg = state.require_cfg()?;
+    let graph_facts = state.require_graph_facts()?;
     state.dataflow = Some(compute_dataflow_facts(
         &lowered.main,
         &cfg.cfg,
@@ -431,7 +422,13 @@ pub fn compute_dataflow_facts(
         &mut instruction_facts,
     );
 
-    let liveness = solve_liveness(cfg, graph_facts, &instr_effects, &instruction_facts);
+    let liveness = solve_liveness(
+        cfg,
+        graph_facts,
+        &instr_effects,
+        &instruction_facts,
+        reg_count,
+    );
 
     let phi_candidates = compute_phi_candidates(
         cfg,
@@ -439,7 +436,6 @@ pub fn compute_dataflow_facts(
         &defs,
         &liveness.live_in,
         &block_state.fixed_out,
-        &lookups.fixed,
     );
     let phi_block_ranges = index_phi_candidate_ranges(cfg, &phi_candidates);
 
@@ -465,6 +461,7 @@ pub fn compute_dataflow_facts(
             use_values: materialized.use_values,
         }
     };
+    let (phi_use_counts, phi_use_blocks) = index_phi_uses(cfg, phi_candidates.len(), &value_facts);
 
     let children = proto
         .children
@@ -499,6 +496,8 @@ pub fn compute_dataflow_facts(
         open_live_out: liveness.open_live_out,
         phi_candidates,
         phi_block_ranges,
+        phi_use_counts,
+        phi_use_blocks,
         value_facts,
         children,
     }
@@ -528,6 +527,39 @@ fn index_phi_candidate_ranges(cfg: &Cfg, phi_candidates: &[PhiCandidate]) -> Vec
     }
 
     ranges
+}
+
+fn index_phi_uses(
+    cfg: &Cfg,
+    phi_count: usize,
+    value_facts: &ValueFactsStorage,
+) -> (Vec<usize>, Vec<Option<BlockRef>>) {
+    let mut counts = vec![0; phi_count];
+    let mut blocks = vec![None; phi_count];
+    let ValueFactsStorage::Materialized { use_values, .. } = value_facts else {
+        return (counts, blocks);
+    };
+
+    for (instr_index, values) in use_values.iter().enumerate() {
+        let block = cfg.instr_to_block[instr_index];
+        for value_set in values.fixed.values() {
+            for value in value_set.iter() {
+                let SsaValue::Phi(phi_id) = value else {
+                    continue;
+                };
+                let index = phi_id.index();
+                counts[index] += 1;
+                match blocks[index] {
+                    Some(existing) if existing != block => blocks[index] = None,
+                    Some(_) => {}
+                    None if counts[index] == 1 => blocks[index] = Some(block),
+                    None => {}
+                }
+            }
+        }
+    }
+
+    (counts, blocks)
 }
 
 fn collect_open_sets(sets: &[CompactSet<OpenDefId>]) -> Vec<BTreeSet<OpenDefId>> {

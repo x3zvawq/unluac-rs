@@ -9,7 +9,7 @@
 //! - `if cond then ... else ... end` 会产出 `BranchKind::IfElse`
 //! - `if not cond then return end; ...` 这种守卫形状会被标成 `BranchKind::Guard`
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::structure::{BlockRef, Cfg, DominatorTree, GraphFacts};
 
@@ -17,6 +17,7 @@ use super::common::{BranchCandidate, BranchKind, BranchRegionFact};
 use super::helpers::{collect_forward_region_blocks, collect_merge_arm_preds};
 
 pub(super) fn analyze_branches(cfg: &Cfg, graph_facts: &GraphFacts) -> Vec<BranchCandidate> {
+    let mut reachability = ReachabilityCache::new(cfg);
     let mut branch_candidates: Vec<_> = cfg
         .block_order
         .iter()
@@ -29,11 +30,20 @@ pub(super) fn analyze_branches(cfg: &Cfg, graph_facts: &GraphFacts) -> Vec<Branc
             if then_entry == else_entry {
                 return None;
             }
-            classify_one_arm_branch(cfg, header, then_entry, else_entry)
+            classify_one_arm_branch(&mut reachability, header, then_entry, else_entry)
                 .or_else(|| {
-                    classify_if_else_branch(cfg, graph_facts, header, then_entry, else_entry)
+                    classify_if_else_branch(
+                        cfg,
+                        graph_facts,
+                        &mut reachability,
+                        header,
+                        then_entry,
+                        else_entry,
+                    )
                 })
-                .or_else(|| classify_guard_branch(cfg, header, then_entry, else_entry))
+                .or_else(|| {
+                    classify_guard_branch(cfg, &mut reachability, header, then_entry, else_entry)
+                })
         })
         .collect();
     branch_candidates.sort_by_key(|candidate| candidate.header);
@@ -92,14 +102,35 @@ fn collect_branch_region_blocks(
     blocks
 }
 
+struct ReachabilityCache<'a> {
+    cfg: &'a Cfg,
+    memo: BTreeMap<(BlockRef, BlockRef), bool>,
+}
+
+impl<'a> ReachabilityCache<'a> {
+    fn new(cfg: &'a Cfg) -> Self {
+        Self {
+            cfg,
+            memo: BTreeMap::new(),
+        }
+    }
+
+    fn can_reach(&mut self, from: BlockRef, to: BlockRef) -> bool {
+        *self
+            .memo
+            .entry((from, to))
+            .or_insert_with(|| self.cfg.can_reach(from, to))
+    }
+}
+
 fn classify_one_arm_branch(
-    cfg: &Cfg,
+    reachability: &mut ReachabilityCache<'_>,
     header: BlockRef,
     then_entry: BlockRef,
     else_entry: BlockRef,
 ) -> Option<BranchCandidate> {
-    let then_reaches_else = cfg.can_reach(then_entry, else_entry);
-    let else_reaches_then = cfg.can_reach(else_entry, then_entry);
+    let then_reaches_else = reachability.can_reach(then_entry, else_entry);
+    let else_reaches_then = reachability.can_reach(else_entry, then_entry);
 
     match (then_reaches_else, else_reaches_then) {
         (true, false) => Some(BranchCandidate {
@@ -125,6 +156,7 @@ fn classify_one_arm_branch(
 fn classify_if_else_branch(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
+    reachability: &mut ReachabilityCache<'_>,
     header: BlockRef,
     then_entry: BlockRef,
     else_entry: BlockRef,
@@ -135,7 +167,7 @@ fn classify_if_else_branch(
         // 但如果一侧的 ipostdom 是非 exit 块且从另一侧可达，那它仍然是
         // 合法的 if-else merge：提前 return 只是 body 内的 early exit，
         // 不影响外层的 merge 恢复。
-        let soft = find_soft_merge(cfg, graph_facts, then_entry, else_entry);
+        let soft = find_soft_merge(cfg, graph_facts, reachability, then_entry, else_entry);
         return Some(BranchCandidate {
             header,
             then_entry,
@@ -180,11 +212,14 @@ fn classify_if_else_branch(
 
 fn classify_guard_branch(
     cfg: &Cfg,
+    reachability: &mut ReachabilityCache<'_>,
     header: BlockRef,
     then_entry: BlockRef,
     else_entry: BlockRef,
 ) -> Option<BranchCandidate> {
-    if cfg.can_reach(then_entry, else_entry) || cfg.can_reach(else_entry, then_entry) {
+    if reachability.can_reach(then_entry, else_entry)
+        || reachability.can_reach(else_entry, then_entry)
+    {
         return None;
     }
 
@@ -246,20 +281,21 @@ fn branch_continuation_score(cfg: &Cfg, start: BlockRef) -> usize {
 fn find_soft_merge(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
+    reachability: &mut ReachabilityCache<'_>,
     then_entry: BlockRef,
     else_entry: BlockRef,
 ) -> Option<BlockRef> {
     let pdom_parent = &graph_facts.post_dominator_tree.parent;
 
     // 沿 ipostdom 链向上搜索，找到第一个非 exit 且从 `other` 可达的祖先。
-    let walk_chain = |start: BlockRef, other: BlockRef| -> Option<BlockRef> {
+    let mut walk_chain = |start: BlockRef, other: BlockRef| -> Option<BlockRef> {
         let mut cursor = start;
         loop {
             let parent = (*pdom_parent.get(cursor.index())?)?;
             if parent == cfg.exit_block {
                 return None;
             }
-            if cfg.can_reach(other, parent) {
+            if reachability.can_reach(other, parent) {
                 return Some(parent);
             }
             cursor = parent;

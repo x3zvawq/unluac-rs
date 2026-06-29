@@ -30,16 +30,19 @@ struct ProtoEntry<'a> {
 define_stage_dump! {
     /// Structure 阶段的调试导出。
     pub fn dump_structure(state, options) => Structure,
-        dump_structure_stage(state, options);
+        dump_structure_stage(state, options)?;
 }
 
-fn dump_structure_stage(state: &DecompileState, options: &DebugOptions) -> String {
+fn dump_structure_stage(
+    state: &DecompileState,
+    options: &DebugOptions,
+) -> Result<String, crate::decompile::DecompileError> {
     let mut output = String::new();
 
     append_section(
         &mut output,
         super::cfg::dump_cfg_graph(
-            state.cfg.as_ref().unwrap(),
+            state.require_cfg()?,
             options.detail,
             &options.filters,
             options.color,
@@ -48,7 +51,7 @@ fn dump_structure_stage(state: &DecompileState, options: &DebugOptions) -> Strin
     append_section(
         &mut output,
         super::cfg::dump_graph_facts_tree(
-            state.graph_facts.as_ref().unwrap(),
+            state.require_graph_facts()?,
             options.detail,
             &options.filters,
             options.color,
@@ -57,9 +60,9 @@ fn dump_structure_stage(state: &DecompileState, options: &DebugOptions) -> Strin
     append_section(
         &mut output,
         super::cfg::dump_dataflow_facts(
-            state.lowered.as_ref().unwrap(),
-            state.cfg.as_ref().unwrap(),
-            state.dataflow.as_ref().unwrap(),
+            state.require_lowered()?,
+            state.require_cfg()?,
+            state.require_dataflow()?,
             options.detail,
             &options.filters,
             options.color,
@@ -68,14 +71,14 @@ fn dump_structure_stage(state: &DecompileState, options: &DebugOptions) -> Strin
     append_section(
         &mut output,
         dump_structure_facts(
-            state.structure_facts.as_ref().unwrap(),
+            state.require_structure_facts()?,
             options.detail,
             &options.filters,
             options.color,
         ),
     );
 
-    output
+    Ok(output)
 }
 
 fn append_section(output: &mut String, section: String) {

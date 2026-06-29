@@ -20,7 +20,7 @@ pub(crate) fn build_cfg_proto(
     state: &mut DecompileState,
     _context: &DecompileContext<'_>,
 ) -> Result<(), DecompileError> {
-    let lowered = state.lowered.as_ref().unwrap();
+    let lowered = state.require_lowered()?;
     state.cfg = Some(build_cfg_graph(&lowered.main));
     Ok(())
 }
