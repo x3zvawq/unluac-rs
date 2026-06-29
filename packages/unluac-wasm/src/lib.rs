@@ -286,7 +286,12 @@ impl WasmBridgeError {
     }
 
     fn into_js_value(self) -> JsValue {
-        serde_wasm_bindgen::to_value(&self).expect("serializing bridge error should not fail")
+        serde_wasm_bindgen::to_value(&self).unwrap_or_else(|error| {
+            JsValue::from_str(&format!(
+                "bridge error serialization failed: {}; original error [{}]: {}",
+                error, self.code, self.message
+            ))
+        })
     }
 }
 
