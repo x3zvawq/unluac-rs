@@ -18,7 +18,7 @@ define_stage_dump! {
     /// Generate 阶段的调试导出。
     pub fn dump_generate(state, options) => Generate,
         dump_generated_chunk(
-            state.generated.as_ref().unwrap(),
+            state.require_generated()?,
             options.detail,
             &options.filters,
             options.color

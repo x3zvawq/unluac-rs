@@ -13,6 +13,7 @@ use super::contracts::{
     AstChunk, CfgGraph, DataflowFacts, GeneratedChunk, GraphFacts, HirChunk, LoweredChunk,
     NamingResult, ReadabilityResult, StructureFacts,
 };
+use super::error::DecompileError;
 use super::options::{DecompileDialect, DecompileOptions};
 
 /// 主反编译 pipeline 的固定阶段顺序。
@@ -110,4 +111,55 @@ impl DecompileState {
     pub(crate) fn mark_completed(&mut self, stage: DecompileStage) {
         self.completed_stage = Some(stage);
     }
+
+    pub(crate) fn require_raw_chunk(&self) -> Result<&RawChunk, DecompileError> {
+        require_stage_output(self.raw_chunk.as_ref(), DecompileStage::Parser)
+    }
+
+    pub(crate) fn require_lowered(&self) -> Result<&LoweredChunk, DecompileError> {
+        require_stage_output(self.lowered.as_ref(), DecompileStage::Transformer)
+    }
+
+    pub(crate) fn require_cfg(&self) -> Result<&CfgGraph, DecompileError> {
+        require_stage_output(self.cfg.as_ref(), DecompileStage::Structure)
+    }
+
+    pub(crate) fn require_graph_facts(&self) -> Result<&GraphFacts, DecompileError> {
+        require_stage_output(self.graph_facts.as_ref(), DecompileStage::Structure)
+    }
+
+    pub(crate) fn require_dataflow(&self) -> Result<&DataflowFacts, DecompileError> {
+        require_stage_output(self.dataflow.as_ref(), DecompileStage::Structure)
+    }
+
+    pub(crate) fn require_structure_facts(&self) -> Result<&StructureFacts, DecompileError> {
+        require_stage_output(self.structure_facts.as_ref(), DecompileStage::Structure)
+    }
+
+    pub(crate) fn require_hir(&self) -> Result<&HirChunk, DecompileError> {
+        require_stage_output(self.hir.as_ref(), DecompileStage::Hir)
+    }
+
+    pub(crate) fn require_ast(&self) -> Result<&AstChunk, DecompileError> {
+        require_stage_output(self.ast.as_ref(), DecompileStage::Ast)
+    }
+
+    pub(crate) fn require_readability(&self) -> Result<&ReadabilityResult, DecompileError> {
+        require_stage_output(self.readability.as_ref(), DecompileStage::Ast)
+    }
+
+    pub(crate) fn require_naming(&self) -> Result<&NamingResult, DecompileError> {
+        require_stage_output(self.naming.as_ref(), DecompileStage::Ast)
+    }
+
+    pub(crate) fn require_generated(&self) -> Result<&GeneratedChunk, DecompileError> {
+        require_stage_output(self.generated.as_ref(), DecompileStage::Generate)
+    }
+}
+
+fn require_stage_output<T>(
+    output: Option<&T>,
+    stage: DecompileStage,
+) -> Result<&T, DecompileError> {
+    output.ok_or(DecompileError::MissingStageOutput { stage })
 }

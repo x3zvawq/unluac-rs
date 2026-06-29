@@ -58,9 +58,9 @@ pub(crate) fn generate_chunk(
     context: &DecompileContext<'_>,
 ) -> Result<(), DecompileError> {
     let options = context.options.generate;
-    let hir = state.hir.as_ref().unwrap();
-    let module = state.readability.as_ref().unwrap();
-    let names = state.naming.as_ref().unwrap();
+    let hir = state.require_hir()?;
+    let module = state.require_readability()?;
+    let names = state.require_naming()?;
     let metadata = if options.comment {
         Some(GenerateCommentMetadata::from_hir(
             hir,
