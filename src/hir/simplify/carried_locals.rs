@@ -45,6 +45,7 @@ use crate::hir::common::{
     HirBlock, HirExpr, HirLValue, HirLabelId, HirProto, HirStmt, LocalId, TempId,
 };
 
+use super::mention::{stmt_writes_temp, stmts_mention_local, stmts_mention_temp};
 use super::temp_touch::collect_temp_refs_in_stmts;
 use super::visit::{HirVisitor, visit_stmts};
 use super::walk::{HirRewritePass, for_each_nested_block_mut, rewrite_stmts};
@@ -1250,45 +1251,24 @@ fn single_binding_handoff_seed(stmt: &HirStmt) -> Option<(TempId, CarryBinding)>
 }
 
 fn suffix_mentions_local(stmts: &[HirStmt], local: LocalId) -> bool {
-    let mut collector = LocalMentionCollector {
-        local,
-        mentioned: false,
-    };
-    visit_stmts(stmts, &mut collector);
-    collector.mentioned
+    stmts_mention_local(stmts, local)
 }
 
 fn suffix_mentions_binding(stmts: &[HirStmt], binding: CarryBinding) -> bool {
-    let mut collector = BindingMentionCollector {
-        binding,
-        mentioned: false,
-    };
-    visit_stmts(stmts, &mut collector);
-    collector.mentioned
+    match binding {
+        CarryBinding::Local(local) => stmts_mention_local(stmts, local),
+        CarryBinding::Temp(temp) => stmts_mention_temp(stmts, temp),
+    }
 }
 
 fn suffix_mentions_temp(stmts: &[HirStmt], temp: TempId) -> bool {
-    let mut collector = TempMentionCollector {
-        temp,
-        mentioned: false,
-    };
-    visit_stmts(stmts, &mut collector);
-    collector.mentioned
+    stmts_mention_temp(stmts, temp)
 }
 
 fn stmt_reads_binding(stmt: &HirStmt, binding: CarryBinding) -> bool {
     let mut collector = BindingReadCollector::default();
     collector.collect_stmts(std::slice::from_ref(stmt));
     collector.reads.contains(&binding)
-}
-
-fn stmt_writes_temp(stmt: &HirStmt, temp: TempId) -> bool {
-    let mut collector = TempWriteCollector {
-        temp,
-        written: false,
-    };
-    visit_stmts(std::slice::from_ref(stmt), &mut collector);
-    collector.written
 }
 
 struct TempToLocalPass {
@@ -1317,71 +1297,5 @@ impl HirRewritePass for TempToLocalPass {
         }
         *lvalue = HirLValue::Local(self.local);
         true
-    }
-}
-
-#[derive(Clone, Copy)]
-struct BindingMentionCollector {
-    binding: CarryBinding,
-    mentioned: bool,
-}
-
-impl HirVisitor for BindingMentionCollector {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        let binding = match expr {
-            HirExpr::LocalRef(local) => Some(CarryBinding::Local(*local)),
-            HirExpr::TempRef(temp) => Some(CarryBinding::Temp(*temp)),
-            _ => None,
-        };
-        if binding == Some(self.binding) {
-            self.mentioned = true;
-        }
-    }
-
-    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
-        if binding_matches_lvalue(lvalue, self.binding) {
-            self.mentioned = true;
-        }
-    }
-}
-
-struct LocalMentionCollector {
-    local: LocalId,
-    mentioned: bool,
-}
-
-impl HirVisitor for LocalMentionCollector {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        self.mentioned |= matches!(expr, HirExpr::LocalRef(local) if *local == self.local);
-    }
-
-    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
-        self.mentioned |= matches!(lvalue, HirLValue::Local(local) if *local == self.local);
-    }
-}
-
-struct TempMentionCollector {
-    temp: TempId,
-    mentioned: bool,
-}
-
-impl HirVisitor for TempMentionCollector {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        self.mentioned |= matches!(expr, HirExpr::TempRef(temp) if *temp == self.temp);
-    }
-
-    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
-        self.mentioned |= matches!(lvalue, HirLValue::Temp(temp) if *temp == self.temp);
-    }
-}
-
-struct TempWriteCollector {
-    temp: TempId,
-    written: bool,
-}
-
-impl HirVisitor for TempWriteCollector {
-    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
-        self.written |= matches!(lvalue, HirLValue::Temp(temp) if *temp == self.temp);
     }
 }

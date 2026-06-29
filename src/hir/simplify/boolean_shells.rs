@@ -17,10 +17,11 @@ use std::collections::BTreeMap;
 
 use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirLValue, HirLocalDecl, HirLogicalExpr, HirProto, HirStmt,
-    HirUnaryExpr, HirUnaryOpKind, LocalId, TempId,
+    HirUnaryExpr, HirUnaryOpKind, TempId,
 };
 
 use super::expr_facts::{expr_is_boolean_valued, expr_is_side_effect_free};
+use super::local_shapes::empty_single_local_decl_binding;
 use super::visit::{HirVisitor, visit_proto};
 use super::walk::{HirRewritePass, rewrite_proto};
 
@@ -47,18 +48,11 @@ fn remove_dead_materialization_shells_from_block(
     block: &mut HirBlock,
     use_counts: &BTreeMap<TempId, usize>,
 ) -> bool {
-    let mut index = 0;
-    let mut changed = false;
-    while index < block.stmts.len() {
-        if removable_dead_materialization_shell(&block.stmts[index], use_counts) {
-            block.stmts.remove(index);
-            changed = true;
-            continue;
-        }
-        index += 1;
-    }
-
-    changed
+    let old_len = block.stmts.len();
+    block
+        .stmts
+        .retain(|stmt| !removable_dead_materialization_shell(stmt, use_counts));
+    block.stmts.len() != old_len
 }
 
 struct CollapseBooleanShellPass;
@@ -181,19 +175,6 @@ fn pure_assign_pattern(block: &HirBlock) -> Option<(&HirLValue, &HirExpr)> {
     };
 
     Some((target, value))
-}
-
-fn empty_single_local_decl_binding(stmt: &HirStmt) -> Option<LocalId> {
-    let HirStmt::LocalDecl(local_decl) = stmt else {
-        return None;
-    };
-    let [binding] = local_decl.bindings.as_slice() else {
-        return None;
-    };
-    if !local_decl.values.is_empty() {
-        return None;
-    }
-    Some(*binding)
 }
 
 fn booleanized_truthiness_expr(cond: HirExpr) -> HirExpr {

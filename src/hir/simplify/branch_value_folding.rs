@@ -24,6 +24,8 @@
 
 use std::collections::BTreeMap;
 
+use super::local_shapes::{empty_single_local_decl_binding, matches_local_lvalue};
+use super::mention::{block_mentions_local, expr_mentions_local};
 use super::visit::HirVisitor;
 use super::walk::{HirRewritePass, rewrite_proto};
 use crate::hir::HirLabelId;
@@ -510,47 +512,4 @@ fn collapse_temp_guard_pattern(
     }
 
     finalize_branch_value(lx_value, lx_value.clone(), rest_value)
-}
-
-pub(super) fn empty_single_local_decl_binding(stmt: &HirStmt) -> Option<LocalId> {
-    let HirStmt::LocalDecl(local_decl) = stmt else {
-        return None;
-    };
-    let [binding] = local_decl.bindings.as_slice() else {
-        return None;
-    };
-    local_decl.values.is_empty().then_some(*binding)
-}
-
-pub(super) fn matches_local_lvalue(target: &HirLValue, binding: LocalId) -> bool {
-    matches!(target, HirLValue::Local(local) if *local == binding)
-}
-
-fn expr_mentions_local(expr: &HirExpr, binding: LocalId) -> bool {
-    let mut visitor = LocalMentionVisitor {
-        binding,
-        mentioned: false,
-    };
-    super::visit::visit_expr(expr, &mut visitor);
-    visitor.mentioned
-}
-
-fn block_mentions_local(block: &HirBlock, binding: LocalId) -> bool {
-    let mut visitor = LocalMentionVisitor {
-        binding,
-        mentioned: false,
-    };
-    super::visit::visit_block(block, &mut visitor);
-    visitor.mentioned
-}
-
-struct LocalMentionVisitor {
-    binding: LocalId,
-    mentioned: bool,
-}
-
-impl HirVisitor for LocalMentionVisitor {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        self.mentioned |= matches!(expr, HirExpr::LocalRef(local) if *local == self.binding);
-    }
 }

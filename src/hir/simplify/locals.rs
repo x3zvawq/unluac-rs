@@ -26,9 +26,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::branch_value_folding::{
-    empty_single_local_decl_binding, fold_branch_value_locals_in_block, matches_local_lvalue,
-};
+use super::branch_value_folding::fold_branch_value_locals_in_block;
+use super::local_shapes::{empty_single_local_decl_binding, matches_local_lvalue};
+use super::mention::expr_mentions_local;
 use super::temp_touch::{
     collect_temp_refs_in_stmts, expr_touches_any_temp, stmt_consumes_temps_only_in_control_head,
     stmt_contains_nested_nonlocal_control, stmt_touches_any_temp, stmts_touch_temp,
@@ -350,7 +350,7 @@ fn nil_fallback_alias_rewrite(
         let then_value = terminal_local_assign_value(&if_stmt.then_block, target)?;
         let else_value = single_local_assign_value(else_block, target)?;
         if !matches!(else_value, HirExpr::LocalRef(local) if *local == source)
-            || expr_mentions_specific_local(then_value, target)
+            || expr_mentions_local(then_value, target)
         {
             return None;
         }
@@ -360,7 +360,7 @@ fn nil_fallback_alias_rewrite(
         let then_value = single_local_assign_value(&if_stmt.then_block, target)?;
         let else_value = terminal_local_assign_value(else_block, target)?;
         if !matches!(then_value, HirExpr::LocalRef(local) if *local == source)
-            || expr_mentions_specific_local(else_value, target)
+            || expr_mentions_local(else_value, target)
         {
             return None;
         }
@@ -429,81 +429,6 @@ fn terminal_local_assign_value(block: &HirBlock, target: LocalId) -> Option<&Hir
         return None;
     };
     matches_local_lvalue(assign_target, target).then_some(value)
-}
-
-fn expr_mentions_specific_local(expr: &HirExpr, local: LocalId) -> bool {
-    match expr {
-        HirExpr::LocalRef(candidate) => *candidate == local,
-        HirExpr::TableAccess(access) => {
-            expr_mentions_specific_local(&access.base, local)
-                || expr_mentions_specific_local(&access.key, local)
-        }
-        HirExpr::Unary(unary) => expr_mentions_specific_local(&unary.expr, local),
-        HirExpr::Binary(binary) => {
-            expr_mentions_specific_local(&binary.lhs, local)
-                || expr_mentions_specific_local(&binary.rhs, local)
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            expr_mentions_specific_local(&logical.lhs, local)
-                || expr_mentions_specific_local(&logical.rhs, local)
-        }
-        HirExpr::Decision(decision) => decision.nodes.iter().any(|node| {
-            expr_mentions_specific_local(&node.test, local)
-                || match &node.truthy {
-                    crate::hir::common::HirDecisionTarget::Expr(expr) => {
-                        expr_mentions_specific_local(expr, local)
-                    }
-                    crate::hir::common::HirDecisionTarget::Node(_)
-                    | crate::hir::common::HirDecisionTarget::CurrentValue => false,
-                }
-                || match &node.falsy {
-                    crate::hir::common::HirDecisionTarget::Expr(expr) => {
-                        expr_mentions_specific_local(expr, local)
-                    }
-                    crate::hir::common::HirDecisionTarget::Node(_)
-                    | crate::hir::common::HirDecisionTarget::CurrentValue => false,
-                }
-        }),
-        HirExpr::Call(call) => {
-            expr_mentions_specific_local(&call.callee, local)
-                || call
-                    .args
-                    .iter()
-                    .any(|arg| expr_mentions_specific_local(arg, local))
-        }
-        HirExpr::TableConstructor(table) => {
-            table.fields.iter().any(|field| match field {
-                HirTableField::Array(expr) => expr_mentions_specific_local(expr, local),
-                HirTableField::Record(field) => {
-                    matches!(
-                        &field.key,
-                        HirTableKey::Expr(expr) if expr_mentions_specific_local(expr, local)
-                    ) || expr_mentions_specific_local(&field.value, local)
-                }
-            }) || table
-                .trailing_multivalue
-                .as_ref()
-                .is_some_and(|expr| expr_mentions_specific_local(expr, local))
-        }
-        HirExpr::Closure(closure) => closure
-            .captures
-            .iter()
-            .any(|capture| expr_mentions_specific_local(&capture.value, local)),
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => false,
-    }
 }
 
 // ── 后处理：相邻 local-assign 合并 ───────────────────────────────────
