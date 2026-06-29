@@ -39,7 +39,8 @@ macro_rules! traverse_hir_lvalue_children {
                     $on_expr
                 }
             }
-            crate::hir::HirLValue::Temp(_)
+            crate::hir::HirLValue::Param(_)
+            | crate::hir::HirLValue::Temp(_)
             | crate::hir::HirLValue::Local(_)
             | crate::hir::HirLValue::Upvalue(_)
             | crate::hir::HirLValue::Global(_) => {}

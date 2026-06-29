@@ -46,7 +46,7 @@ use crate::hir::common::{
 };
 
 use super::mention::{stmt_writes_temp, stmts_mention_local, stmts_mention_temp};
-use super::temp_touch::collect_temp_refs_in_stmts;
+use super::temp_touch::{TempRefScopeTracker, collect_temp_refs_by_stmt};
 use super::visit::{HirVisitor, visit_stmts};
 use super::walk::{HirRewritePass, for_each_nested_block_mut, rewrite_stmts};
 
@@ -64,37 +64,17 @@ fn collapse_handoffs_recursive(block: &mut HirBlock, outer_temps: &BTreeSet<Temp
     // 对于 index 处的语句，保护集 = 继承的 outer_temps ∪ 本块中「其他语句」引用的 temps。
     // 注意不能用 `all - self` 来近似——如果某个 temp 同时出现在当前语句和其他语句中，
     // 差集会把它减掉，导致跨作用域的引用失去保护。这里用前缀+后缀并集来精确计算。
-    let per_stmt_temps: Vec<BTreeSet<TempId>> = block
-        .stmts
-        .iter()
-        .map(|stmt| collect_temp_refs_in_stmts(std::slice::from_ref(stmt)))
-        .collect();
-
-    // 累积前缀 temp 集合
-    let mut prefix_temps = BTreeSet::new();
-    // 预计算完整后缀 temp 集合（逐步缩小）
-    let mut suffix_temps_vec: Vec<BTreeSet<TempId>> = Vec::with_capacity(per_stmt_temps.len());
-    {
-        let mut suffix = BTreeSet::new();
-        for stmt_temps in per_stmt_temps.iter().rev() {
-            suffix_temps_vec.push(suffix.clone());
-            suffix.extend(stmt_temps.iter().copied());
-        }
-        suffix_temps_vec.reverse();
-    }
-
-    for (index, _) in per_stmt_temps.iter().enumerate() {
-        let child_outer: BTreeSet<TempId> = outer_temps
-            .union(&prefix_temps)
-            .chain(suffix_temps_vec[index].iter())
-            .copied()
-            .collect();
+    let stmt_temp_refs = collect_temp_refs_by_stmt(&block.stmts);
+    let mut temp_refs = TempRefScopeTracker::new(&stmt_temp_refs);
+    for index in 0..temp_refs.len() {
+        temp_refs.enter_stmt(index);
+        let child_outer = temp_refs.outer_with_prefix_and_suffix(outer_temps);
 
         for_each_nested_block_mut(&mut block.stmts[index], &mut |nested_block| {
             changed |= collapse_handoffs_recursive(nested_block, &child_outer);
         });
 
-        prefix_temps.extend(per_stmt_temps[index].iter().copied());
+        temp_refs.leave_stmt(index);
     }
 
     // 后序：子块都处理完之后，再处理当前块的 handoff
@@ -647,7 +627,10 @@ fn carry_binding_from_lvalue(lvalue: &HirLValue) -> Option<CarryBinding> {
     match lvalue {
         HirLValue::Local(local) => Some(CarryBinding::Local(*local)),
         HirLValue::Temp(temp) => Some(CarryBinding::Temp(*temp)),
-        HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => None,
+        HirLValue::Param(_)
+        | HirLValue::Upvalue(_)
+        | HirLValue::Global(_)
+        | HirLValue::TableAccess(_) => None,
     }
 }
 

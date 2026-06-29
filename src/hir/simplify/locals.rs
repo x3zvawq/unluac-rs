@@ -16,22 +16,17 @@
 //! 不能在定义点提升成 `local`，否则前缀快照会读到尚未初始化的局部变量。
 //!
 //! 提升完成后，同一个 block 里还会执行两步后处理：
-//! 1. branch-value 折叠：`local X; if cond then X=a else X=b end` → `local X = expr`
-//! 2. nil fallback 收敛：`local X; if A == nil then X=b else X=A end` →
+//! 1. nil fallback 收敛：`local X; if A == nil then X=b else X=A end` →
 //!    `local X=A; if X == nil then X=b end`
-//! 3. 相邻 local-assign 合并：`local X; X = expr` → `local X = expr`
-//!
-//! 这两步原先分别在独立的 `branch_value_exprs` pass 和 AST `statement_merge` 里执行，
-//! 整合到提升出口后可以减少跨 pass 迭代和跨层机械修补。
+//! 2. 相邻 local-assign 合并：`local X; X = expr` → `local X = expr`
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::branch_value_folding::fold_branch_value_locals_in_block;
 use super::local_shapes::{empty_single_local_decl_binding, matches_local_lvalue};
 use super::mention::expr_mentions_local;
 use super::temp_touch::{
-    collect_temp_refs_in_stmts, expr_touches_any_temp, stmt_consumes_temps_only_in_control_head,
-    stmt_contains_nested_nonlocal_control, stmt_touches_any_temp, stmts_touch_temp,
+    TempRefScopeTracker, TempTouchIndex, collect_temp_refs_by_stmt, expr_touches_any_temp,
+    stmt_consumes_temps_only_in_control_head, stmt_contains_nested_nonlocal_control,
 };
 use crate::hir::common::{
     HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirExpr, HirIf, HirLValue,
@@ -178,15 +173,15 @@ fn promote_block(
     inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
     outer_used_temps: &BTreeSet<TempId>,
 ) -> PromotionResult {
-    // 预计算后缀 temp 引用集：suffix_temps[i] 包含 stmts[i..] 中出现的所有 temp。
-    // 当递归进入子作用域（while/if/for 等）时，合并 outer_used_temps 和
-    // suffix_temps[i+1] 传给子 promote_block，防止子作用域将外层仍需引用的 temp
-    // 错误地提升为块级局部变量。
-    let suffix_temps = compute_suffix_temp_refs(&block.stmts);
+    // 递归进入子作用域时，把当前语句之后仍被外层引用的 temp 传给子 block。
+    // tracker 用引用计数维护后缀集合，避免为每个 index 克隆一份成长中的 BTreeSet。
+    let stmt_temp_refs = collect_temp_refs_by_stmt(&block.stmts);
+    let mut temp_refs = TempRefScopeTracker::new(&stmt_temp_refs);
 
     let plans = collect_plans(
         ctx,
         block,
+        &stmt_temp_refs,
         inherited,
         inherited_sticky_slots,
         outer_used_temps,
@@ -211,6 +206,7 @@ fn promote_block(
     let mut rewritten = Vec::with_capacity(original_stmts.len());
 
     for (index, mut stmt) in original_stmts.into_iter().enumerate() {
+        temp_refs.enter_stmt(index);
         let mut replaced_stmt = false;
         if let Some(plans) = plan_by_decl.get(&index) {
             let mapping_before_decl = mapping.clone();
@@ -238,15 +234,17 @@ fn promote_block(
             &mut active_sticky_slots,
         );
         if replaced_stmt {
+            temp_refs.leave_stmt(index);
             continue;
         }
 
         if removable.contains(&index) {
+            temp_refs.leave_stmt(index);
             continue;
         }
 
         // 子作用域的 outer temps = 当前块后续语句的 temp 引用 ∪ 来自祖先作用域的保护集
-        let child_outer_temps = merge_temp_sets(outer_used_temps, &suffix_temps[index + 1]);
+        let child_outer_temps = temp_refs.outer_with_suffix(outer_used_temps);
         let stmt_changed = rewrite_stmt(
             ctx,
             &mut stmt,
@@ -256,6 +254,7 @@ fn promote_block(
         );
         changed |= stmt_changed;
         rewritten.push(stmt);
+        temp_refs.leave_stmt(index);
     }
 
     block.stmts = rewritten;
@@ -269,8 +268,6 @@ fn promote_block(
         }
     }
 
-    // 后处理：把 `local X; if cond then X=a else X=b end` 收回值表达式
-    changed |= fold_branch_value_locals_in_block(&mut block.stmts);
     // 后处理：保留 nil 判断语义，去掉只负责搬运 fallback 值的 if/else 壳
     changed |= fold_nil_fallback_alias_locals_in_block(&mut block.stmts);
     // 后处理：把相邻的 `local X; X = expr` 合并成 `local X = expr`
@@ -280,22 +277,6 @@ fn promote_block(
         changed,
         trailing_mapping: mapping,
     }
-}
-
-/// 计算后缀 temp 引用集。suffix[i] = stmts[i..] 中出现的所有 temp 的集合。
-fn compute_suffix_temp_refs(stmts: &[HirStmt]) -> Vec<BTreeSet<TempId>> {
-    let mut suffix = vec![BTreeSet::new(); stmts.len() + 1];
-    for i in (0..stmts.len()).rev() {
-        suffix[i] = suffix[i + 1].clone();
-        let stmt_temps = collect_temp_refs_in_stmts(std::slice::from_ref(&stmts[i]));
-        suffix[i].extend(stmt_temps);
-    }
-    suffix
-}
-
-/// 合并两个 temp 集合，返回并集。
-fn merge_temp_sets(a: &BTreeSet<TempId>, b: &BTreeSet<TempId>) -> BTreeSet<TempId> {
-    a.union(b).copied().collect()
 }
 
 // ── 后处理：nil fallback alias 收敛 ─────────────────────────────────
@@ -489,6 +470,7 @@ fn try_merge_empty_local_with_assign(
 fn collect_plans(
     ctx: &mut PromotionCtx<'_>,
     block: &HirBlock,
+    stmt_temp_refs: &[BTreeSet<TempId>],
     inherited: &BTreeMap<TempId, LocalId>,
     inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
     outer_used_temps: &BTreeSet<TempId>,
@@ -505,6 +487,7 @@ fn collect_plans(
     let facts = ctx.facts;
     let temp_debug_locals = ctx.temp_debug_locals;
     let mut plans = Vec::new();
+    let temp_touches = TempTouchIndex::new(stmt_temp_refs);
     let mut reserved_temps = inherited.keys().copied().collect::<BTreeSet<_>>();
     let mut reserved_alias_indices = BTreeSet::new();
     let mut slot_candidates = inherited_sticky_slots.clone();
@@ -527,7 +510,7 @@ fn collect_plans(
             sticky_slots = sticky_slots_for_stmt;
             continue;
         }
-        if stmts_touch_temp(&block.stmts[..decl_index], root_temp) {
+        if temp_touches.touches_before(decl_index, root_temp) {
             sticky_slots = sticky_slots_for_stmt;
             continue;
         }
@@ -558,14 +541,14 @@ fn collect_plans(
             if let Some(alias_temp) = alias_temp_for_group(future_stmt, &group)
                 && !reserved_temps.contains(&alias_temp)
                 && !group.contains(&alias_temp)
-                && !stmts_touch_temp(&block.stmts[decl_index + 1..future_index], alias_temp)
+                && !temp_touches.touches_in_range(decl_index + 1, future_index, alias_temp)
             {
                 group.insert(alias_temp);
                 removable_aliases.insert(future_index);
                 continue;
             }
 
-            if stmt_touches_any_temp(future_stmt, &group) {
+            if temp_touches.stmt_touches_any(future_index, &group) {
                 has_future_touch = true;
             }
         }
@@ -582,7 +565,7 @@ fn collect_plans(
             // 只在控制头里单次消费的 temp，更像机械性的结构参数而不是源码级 local。
             let touching_stmt_indices = (decl_index + 1..block.stmts.len())
                 .filter(|future_index| !removable_aliases.contains(future_index))
-                .filter(|future_index| stmt_touches_any_temp(&block.stmts[*future_index], &group))
+                .filter(|future_index| temp_touches.stmt_touches_any(*future_index, &group))
                 .collect::<Vec<_>>();
             // 只有一次后续消费的全局别名或字符串常量，必须结合消费站点判定：
             // 全局别名只有作为表字段安装的 base，字符串常量只有作为调用实参，
@@ -650,12 +633,8 @@ fn collect_plans(
 
     let mut sticky_slots = inherited_sticky_slots.clone();
     for (decl_index, stmt) in block.stmts.iter().enumerate() {
-        let merge_temps = if_merge_candidate_temps(
-            stmt,
-            &block.stmts[..decl_index],
-            &block.stmts[decl_index + 1..],
-            &reserved_temps,
-        );
+        let merge_temps =
+            if_merge_candidate_temps(stmt, &temp_touches, decl_index, &reserved_temps);
 
         for temp in merge_temps {
             let mut allocator = PlanAllocator {
@@ -831,8 +810,8 @@ fn expr_is_temp_ref(expr: &HirExpr, temp: TempId) -> bool {
 
 fn if_merge_candidate_temps(
     stmt: &HirStmt,
-    prior_stmts: &[HirStmt],
-    future_stmts: &[HirStmt],
+    temp_touches: &TempTouchIndex,
+    stmt_index: usize,
     reserved_temps: &BTreeSet<TempId>,
 ) -> Vec<TempId> {
     let HirStmt::If(if_stmt) = stmt else {
@@ -853,8 +832,8 @@ fn if_merge_candidate_temps(
     common_temps
         .into_iter()
         .filter(|temp| !reserved_temps.contains(temp))
-        .filter(|temp| !stmts_touch_temp(prior_stmts, *temp))
-        .filter(|temp| stmts_touch_temp(future_stmts, *temp))
+        .filter(|temp| !temp_touches.touches_before(stmt_index, *temp))
+        .filter(|temp| temp_touches.touches_after(stmt_index + 1, *temp))
         .collect()
 }
 
@@ -899,7 +878,8 @@ fn summarize_stmt_fallthrough_assignments(stmt: &HirStmt) -> Option<FallthroughS
                 .iter()
                 .filter_map(|target| match target {
                     HirLValue::Temp(temp) => Some(*temp),
-                    HirLValue::Local(_)
+                    HirLValue::Param(_)
+                    | HirLValue::Local(_)
                     | HirLValue::Upvalue(_)
                     | HirLValue::Global(_)
                     | HirLValue::TableAccess(_) => None,
@@ -1271,7 +1251,10 @@ fn rewrite_lvalue(lvalue: &mut HirLValue, mapping: &BTreeMap<TempId, LocalId>) -
             let key_changed = rewrite_expr(&mut access.key, mapping);
             base_changed || key_changed
         }
-        HirLValue::Local(_) | HirLValue::Upvalue(_) | HirLValue::Global(_) => false,
+        HirLValue::Param(_)
+        | HirLValue::Local(_)
+        | HirLValue::Upvalue(_)
+        | HirLValue::Global(_) => false,
     }
 }
 

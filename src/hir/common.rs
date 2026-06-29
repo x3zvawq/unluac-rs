@@ -166,6 +166,7 @@ impl HirExpr {
 /// HIR 赋值左值。
 #[derive(Debug, Clone, PartialEq)]
 pub enum HirLValue {
+    Param(ParamId),
     Temp(TempId),
     Local(LocalId),
     Upvalue(UpvalueId),

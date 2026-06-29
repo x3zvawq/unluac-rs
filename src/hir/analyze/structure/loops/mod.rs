@@ -10,6 +10,7 @@ mod state;
 
 use super::rewrites::{
     expr_has_temp_ref_in, lvalue_as_expr, rewrite_expr_temps, temp_expr_overrides,
+    uniform_mapped_value,
 };
 use super::*;
 

@@ -34,15 +34,17 @@ use crate::hir::common::{
     HirExpr, HirIf, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId,
 };
 
-pub(super) fn fold_branch_value_goto_labels_in_proto(proto: &mut HirProto) -> bool {
-    rewrite_proto(proto, &mut BranchValueGotoLabelPass)
+pub(super) fn fold_branch_values_in_proto(proto: &mut HirProto) -> bool {
+    rewrite_proto(proto, &mut BranchValuePass)
 }
 
-struct BranchValueGotoLabelPass;
+struct BranchValuePass;
 
-impl HirRewritePass for BranchValueGotoLabelPass {
+impl HirRewritePass for BranchValuePass {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
-        fold_branch_value_goto_labels_in_block(&mut block.stmts)
+        let goto_changed = fold_branch_value_goto_labels_in_block(&mut block.stmts);
+        let local_changed = fold_branch_value_locals_in_block(&mut block.stmts);
+        goto_changed || local_changed
     }
 }
 
@@ -82,7 +84,7 @@ fn fold_branch_value_goto_labels_in_block(stmts: &mut Vec<HirStmt>) -> bool {
 
 /// 扫描 block 中的 `local X; if cond then X=a else X=b end` 形状，
 /// 尝试把它收回 `local X = cond and a or b` 一类的值表达式。
-pub(super) fn fold_branch_value_locals_in_block(stmts: &mut Vec<HirStmt>) -> bool {
+fn fold_branch_value_locals_in_block(stmts: &mut Vec<HirStmt>) -> bool {
     let mut changed = false;
     let mut index = 1;
 

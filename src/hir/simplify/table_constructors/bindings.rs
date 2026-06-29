@@ -18,7 +18,10 @@ pub(super) fn binding_from_lvalue(lvalue: &HirLValue) -> Option<TableBinding> {
     match lvalue {
         HirLValue::Temp(temp) => Some(TableBinding::Temp(*temp)),
         HirLValue::Local(local) => Some(TableBinding::Local(*local)),
-        HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => None,
+        HirLValue::Param(_)
+        | HirLValue::Upvalue(_)
+        | HirLValue::Global(_)
+        | HirLValue::TableAccess(_) => None,
     }
 }
 
@@ -245,6 +248,7 @@ pub(super) fn lvalue_uses_binding(lvalue: &HirLValue, binding: TableBinding) -> 
     match lvalue {
         HirLValue::Temp(temp) => TableBinding::Temp(*temp) == binding,
         HirLValue::Local(local) => TableBinding::Local(*local) == binding,
+        HirLValue::Param(_) => false,
         HirLValue::Upvalue(_) => false,
         HirLValue::Global(_) => false,
         HirLValue::TableAccess(access) => {

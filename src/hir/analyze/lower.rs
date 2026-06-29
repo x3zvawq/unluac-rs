@@ -79,13 +79,13 @@ pub(super) fn lower_proto(
     state: &DecompileState,
     context: &DecompileContext<'_>,
     artifacts: &mut LowerArtifacts,
-) -> HirProtoRef {
-    let lowered = state.lowered.as_ref().unwrap();
-    let cfg = state.cfg.as_ref().unwrap();
-    let graph_facts = state.graph_facts.as_ref().unwrap();
-    let dataflow = state.dataflow.as_ref().unwrap();
-    let structure = state.structure_facts.as_ref().unwrap();
-    lower_proto_node(
+) -> Result<HirProtoRef, crate::decompile::DecompileError> {
+    let lowered = state.require_lowered()?;
+    let cfg = state.require_cfg()?;
+    let graph_facts = state.require_graph_facts()?;
+    let dataflow = state.require_dataflow()?;
+    let structure = state.require_structure_facts()?;
+    Ok(lower_proto_node(
         context.requested_target,
         &lowered.main,
         cfg,
@@ -93,7 +93,7 @@ pub(super) fn lower_proto(
         dataflow,
         structure,
         artifacts,
-    )
+    ))
 }
 
 fn lower_proto_node(

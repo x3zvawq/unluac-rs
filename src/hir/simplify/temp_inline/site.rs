@@ -80,9 +80,11 @@ fn find_site_in_lvalue(lvalue: &HirLValue, temp: TempId, site: InlineSite) -> Op
             find_site_in_expr(&access.base, temp, site.descend_access_base())
                 .or_else(|| find_site_in_expr(&access.key, temp, InlineSite::Index))
         }
-        HirLValue::Temp(_) | HirLValue::Local(_) | HirLValue::Upvalue(_) | HirLValue::Global(_) => {
-            None
-        }
+        HirLValue::Param(_)
+        | HirLValue::Temp(_)
+        | HirLValue::Local(_)
+        | HirLValue::Upvalue(_)
+        | HirLValue::Global(_) => None,
     }
 }
 

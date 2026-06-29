@@ -11,42 +11,101 @@ use crate::hir::traverse::{
     traverse_hir_table_constructor_children,
 };
 
-pub(super) fn protected_temps_for_nested_stmt(
-    stmts: &[HirStmt],
-    stmt_index: usize,
-    inherited: &BTreeSet<TempId>,
-) -> BTreeSet<TempId> {
-    let mut protected = inherited.clone();
-    let Some(stmt) = stmts.get(stmt_index) else {
-        return protected;
-    };
-    if !stmt_has_nested_inline_scope(stmt) {
-        return protected;
+pub(super) struct NestedTempProtection {
+    stmt_temps: Vec<BTreeSet<TempId>>,
+    stmt_capture_temps: Vec<BTreeSet<TempId>>,
+    scope_kinds: Vec<NestedScopeKind>,
+    prefix_temps: BTreeSet<TempId>,
+    suffix_temp_counts: BTreeMap<TempId, usize>,
+    suffix_capture_counts: BTreeMap<TempId, usize>,
+}
+
+impl NestedTempProtection {
+    pub(super) fn new(stmts: &[HirStmt]) -> Self {
+        let stmt_temps = stmts
+            .iter()
+            .map(mentioned_temp_set_for_stmt)
+            .collect::<Vec<_>>();
+        let stmt_capture_temps = stmts
+            .iter()
+            .map(closure_capture_temp_set_for_stmt)
+            .collect::<Vec<_>>();
+        let suffix_temp_counts = temp_counts(&stmt_temps);
+        let suffix_capture_counts = temp_counts(&stmt_capture_temps);
+        let scope_kinds = stmts.iter().map(nested_scope_kind).collect();
+
+        Self {
+            stmt_temps,
+            stmt_capture_temps,
+            scope_kinds,
+            prefix_temps: BTreeSet::new(),
+            suffix_temp_counts,
+            suffix_capture_counts,
+        }
     }
 
-    let nested_temps = mentioned_temp_set_for_stmt(stmt);
-    if !stmt_needs_full_nested_scope_protection(stmt) {
-        // if/block 本身不会改变求值次数；这里不套用 loop 的完整前后缀保护，
-        // 只保护会成为子 proto upvalue provenance 的 closure capture。否则普通
-        // boolean 分支里的临时值会被过度保留，影响既有结构恢复和运行等价性。
-        let suffix_capture_temps =
-            mentioned_temp_set_for_closure_captures_in_stmt_slice(&stmts[stmt_index + 1..]);
-        protected.extend(suffix_capture_temps.intersection(&nested_temps).copied());
-        return protected;
+    pub(super) fn begin_stmt(
+        &mut self,
+        stmt_index: usize,
+        inherited: &BTreeSet<TempId>,
+    ) -> BTreeSet<TempId> {
+        decrement_counts(&mut self.suffix_temp_counts, &self.stmt_temps[stmt_index]);
+        decrement_counts(
+            &mut self.suffix_capture_counts,
+            &self.stmt_capture_temps[stmt_index],
+        );
+
+        let mut protected = inherited.clone();
+        match self.scope_kinds[stmt_index] {
+            NestedScopeKind::None => {}
+            NestedScopeKind::ClosureCaptureOnly => {
+                // if/block 本身不会改变求值次数；这里不套用 loop 的完整前后缀保护，
+                // 只保护会成为子 proto upvalue provenance 的 closure capture。
+                protected.extend(
+                    self.stmt_temps[stmt_index]
+                        .iter()
+                        .filter(|temp| self.suffix_capture_counts.contains_key(temp))
+                        .copied(),
+                );
+            }
+            NestedScopeKind::Full => {
+                // 前缀保护求值点，后缀保护外层继续消费的 temp，二者都只对当前
+                // nested stmt 中实际出现的 temp 生效。
+                protected.extend(
+                    self.stmt_temps[stmt_index]
+                        .iter()
+                        .filter(|temp| {
+                            self.prefix_temps.contains(temp)
+                                || self.suffix_temp_counts.contains_key(temp)
+                        })
+                        .copied(),
+                );
+            }
+        }
+
+        protected
     }
 
-    // 前缀中已引用的 temp 如果也出现在嵌套体中，不能在嵌套体内被内联掉，
-    // 否则会把外层定义的值的求值点移进循环。
-    let prefix_temps = mentioned_temp_set_for_stmt_slice(&stmts[..stmt_index]);
-    protected.extend(prefix_temps.intersection(&nested_temps).copied());
+    pub(super) fn finish_stmt(&mut self, stmt: &HirStmt) {
+        self.prefix_temps.extend(mentioned_temp_set_for_stmt(stmt));
+    }
+}
 
-    // 后缀中引用的 temp 如果也出现在嵌套体中，说明该 temp 在嵌套体中定义、
-    // 在外层后续语句中消费。如果在嵌套体内被内联成另一个 temp，外层的引用
-    // 就会变成孤儿——指向一个不再被赋值的 temp。
-    let suffix_temps = mentioned_temp_set_for_stmt_slice(&stmts[stmt_index + 1..]);
-    protected.extend(suffix_temps.intersection(&nested_temps).copied());
+#[derive(Debug, Clone, Copy)]
+enum NestedScopeKind {
+    None,
+    ClosureCaptureOnly,
+    Full,
+}
 
-    protected
+fn nested_scope_kind(stmt: &HirStmt) -> NestedScopeKind {
+    if stmt_needs_full_nested_scope_protection(stmt) {
+        NestedScopeKind::Full
+    } else if stmt_has_nested_inline_scope(stmt) {
+        NestedScopeKind::ClosureCaptureOnly
+    } else {
+        NestedScopeKind::None
+    }
 }
 
 fn stmt_has_nested_inline_scope(stmt: &HirStmt) -> bool {
@@ -69,25 +128,37 @@ fn stmt_needs_full_nested_scope_protection(stmt: &HirStmt) -> bool {
     )
 }
 
-fn mentioned_temp_set_for_stmt_slice(stmts: &[HirStmt]) -> BTreeSet<TempId> {
-    let mut temps = BTreeSet::new();
-    for stmt in stmts {
-        collect_stmt_mentioned_temps(stmt, &mut temps);
+fn temp_counts(temp_sets: &[BTreeSet<TempId>]) -> BTreeMap<TempId, usize> {
+    let mut counts = BTreeMap::new();
+    for temps in temp_sets {
+        for temp in temps {
+            *counts.entry(*temp).or_insert(0) += 1;
+        }
     }
-    temps
+    counts
 }
 
-fn mentioned_temp_set_for_closure_captures_in_stmt_slice(stmts: &[HirStmt]) -> BTreeSet<TempId> {
-    let mut temps = BTreeSet::new();
-    for stmt in stmts {
-        collect_stmt_closure_capture_temps(stmt, &mut temps);
+fn decrement_counts(counts: &mut BTreeMap<TempId, usize>, temps: &BTreeSet<TempId>) {
+    for temp in temps {
+        let count = counts
+            .get_mut(temp)
+            .expect("stmt temp sets must be reflected in suffix counts");
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(temp);
+        }
     }
-    temps
 }
 
 fn mentioned_temp_set_for_stmt(stmt: &HirStmt) -> BTreeSet<TempId> {
     let mut temps = BTreeSet::new();
     collect_stmt_mentioned_temps(stmt, &mut temps);
+    temps
+}
+
+fn closure_capture_temp_set_for_stmt(stmt: &HirStmt) -> BTreeSet<TempId> {
+    let mut temps = BTreeSet::new();
+    collect_stmt_closure_capture_temps(stmt, &mut temps);
     temps
 }
 
@@ -221,7 +292,10 @@ fn collect_lvalue_mentioned_temps(lvalue: &HirLValue, temps: &mut BTreeSet<TempI
             collect_expr_mentioned_temps(&access.base, temps);
             collect_expr_mentioned_temps(&access.key, temps);
         }
-        HirLValue::Local(_) | HirLValue::Upvalue(_) | HirLValue::Global(_) => {}
+        HirLValue::Param(_)
+        | HirLValue::Local(_)
+        | HirLValue::Upvalue(_)
+        | HirLValue::Global(_) => {}
     }
 }
 

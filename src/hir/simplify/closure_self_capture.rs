@@ -82,6 +82,7 @@ fn rewrite_closure_self_captures(
 
 fn lvalue_as_expr(target: &HirLValue) -> Option<HirExpr> {
     match target {
+        HirLValue::Param(param) => Some(HirExpr::ParamRef(*param)),
         HirLValue::Temp(temp) => Some(HirExpr::TempRef(*temp)),
         HirLValue::Local(local) => Some(HirExpr::LocalRef(*local)),
         HirLValue::Upvalue(upvalue) => Some(HirExpr::UpvalueRef(*upvalue)),

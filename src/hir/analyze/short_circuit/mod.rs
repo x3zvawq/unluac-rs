@@ -24,15 +24,15 @@ use crate::structure::{
 };
 use crate::transformer::{BranchOperands, BranchPredicate, CondOperand, InstrRef, LowInstr, Reg};
 
-use self::decision::{
-    DecisionEdge, branch_exit_blocks_from_value_merge_candidate, build_branch_decision_expr,
-    build_branch_decision_expr_for_value_merge_candidate,
-    build_branch_decision_expr_for_value_merge_candidate_mixed_eval, build_decision_expr,
-    build_impure_value_merge_expr, build_value_decision_expr,
-    build_value_decision_expr_single_eval,
-};
 pub(super) use self::decision::{
-    build_branch_decision_expr_mixed_eval, header_subject_is_value_carrier,
+    DecisionEdge, build_branch_decision_expr_mixed_eval, build_decision_expr,
+    header_subject_is_value_carrier,
+};
+use self::decision::{
+    branch_exit_blocks_from_value_merge_candidate, build_branch_decision_expr,
+    build_branch_decision_expr_for_value_merge_candidate,
+    build_branch_decision_expr_for_value_merge_candidate_mixed_eval, build_impure_value_merge_expr,
+    build_value_decision_expr, build_value_decision_expr_single_eval,
 };
 use self::guards::decision_references_forbidden_candidate_temps;
 pub(super) use self::guards::expr_references_forbidden_candidate_temps;

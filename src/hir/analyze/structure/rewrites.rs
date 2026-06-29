@@ -91,6 +91,7 @@ pub(super) fn temp_expr_overrides(
 
 pub(super) fn lvalue_as_expr(lvalue: &HirLValue) -> Option<HirExpr> {
     match lvalue {
+        HirLValue::Param(param) => Some(HirExpr::ParamRef(*param)),
         HirLValue::Temp(temp) => Some(HirExpr::TempRef(*temp)),
         HirLValue::Local(local) => Some(HirExpr::LocalRef(*local)),
         HirLValue::Upvalue(upvalue) => Some(HirExpr::UpvalueRef(*upvalue)),
@@ -109,6 +110,27 @@ pub(super) fn expr_as_lvalue(expr: &HirExpr) -> Option<HirLValue> {
     }
 }
 
+pub(super) fn uniform_mapped_value<I, T>(
+    items: impl IntoIterator<Item = I>,
+    mut value_for_item: impl FnMut(I) -> Option<T>,
+) -> Option<T>
+where
+    T: PartialEq,
+{
+    let mut uniform_value = None;
+    for item in items {
+        let value = value_for_item(item)?;
+        if uniform_value
+            .as_ref()
+            .is_some_and(|known_value: &T| *known_value != value)
+        {
+            return None;
+        }
+        uniform_value = Some(value);
+    }
+    uniform_value
+}
+
 pub(super) fn shared_expr_for_defs<I>(
     fixed_temps: &[TempId],
     defs: I,
@@ -117,22 +139,11 @@ pub(super) fn shared_expr_for_defs<I>(
 where
     I: IntoIterator<Item = DefId>,
 {
-    let mut shared_expr = None;
-
-    for def in defs {
+    uniform_mapped_value(defs, |def| {
         let temp = *fixed_temps.get(def.index())?;
         let lvalue = target_overrides.get(&temp)?;
-        let expr = lvalue_as_expr(lvalue)?;
-        if shared_expr
-            .as_ref()
-            .is_some_and(|known_expr: &HirExpr| *known_expr != expr)
-        {
-            return None;
-        }
-        shared_expr = Some(expr);
-    }
-
-    shared_expr
+        lvalue_as_expr(lvalue)
+    })
 }
 
 /// 检查一组 defs 是否全部 override 到同一个可表达为表达式的 lvalue。
@@ -148,22 +159,12 @@ pub(super) fn shared_lvalue_for_defs<I>(
 where
     I: IntoIterator<Item = DefId>,
 {
-    let mut shared_target = None;
-
-    for def in defs {
+    uniform_mapped_value(defs, |def| {
         let temp = *fixed_temps.get(def.index())?;
         let target = target_overrides.get(&temp)?;
         let _ = lvalue_as_expr(target)?;
-        if shared_target
-            .as_ref()
-            .is_some_and(|known_target: &HirLValue| *known_target != *target)
-        {
-            return None;
-        }
-        shared_target = Some(target.clone());
-    }
-
-    shared_target
+        Some(target.clone())
+    })
 }
 
 /// 把一组 defs 的 target override 批量安装到 override map 里。

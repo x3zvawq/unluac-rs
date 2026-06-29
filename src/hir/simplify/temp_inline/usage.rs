@@ -223,8 +223,11 @@ fn collect_call_temp_uses(call: &HirCallExpr, scratch: &mut TempUseScratch) {
 
 fn collect_lvalue_temp_uses(lvalue: &HirLValue, scratch: &mut TempUseScratch) {
     match lvalue {
-        HirLValue::Temp(_) | HirLValue::Local(_) | HirLValue::Upvalue(_) | HirLValue::Global(_) => {
-        }
+        HirLValue::Param(_)
+        | HirLValue::Temp(_)
+        | HirLValue::Local(_)
+        | HirLValue::Upvalue(_)
+        | HirLValue::Global(_) => {}
         HirLValue::TableAccess(access) => {
             collect_expr_temp_uses(&access.base, scratch);
             collect_expr_temp_uses(&access.key, scratch);
@@ -397,7 +400,10 @@ fn max_temp_index_in_lvalue(lvalue: &HirLValue) -> Option<usize> {
             .chain(std::iter::once(max_temp_index_in_expr(&access.key)))
             .flatten()
             .max(),
-        HirLValue::Local(_) | HirLValue::Upvalue(_) | HirLValue::Global(_) => None,
+        HirLValue::Param(_)
+        | HirLValue::Local(_)
+        | HirLValue::Upvalue(_)
+        | HirLValue::Global(_) => None,
     }
 }
 

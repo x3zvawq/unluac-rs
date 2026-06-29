@@ -368,7 +368,10 @@ impl HirVisitor for ScopeActivityCollector {
             HirLValue::Local(local) => {
                 self.activity.mentions_binding |= self.binding_matches_local(*local);
             }
-            HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => {}
+            HirLValue::Param(_)
+            | HirLValue::Upvalue(_)
+            | HirLValue::Global(_)
+            | HirLValue::TableAccess(_) => {}
         }
     }
 }

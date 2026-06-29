@@ -6,6 +6,8 @@
 
 mod branches;
 
+use std::cell::RefCell;
+
 use super::rewrites::expr_has_temp_ref_in;
 use super::*;
 
@@ -43,6 +45,7 @@ pub(super) struct StructuredBodyLowerer<'a, 'b> {
     pub(super) tbc_scope_regs: BTreeSet<usize>,
     pub(super) visited: BTreeSet<BlockRef>,
     pub(super) active_loops: Vec<ActiveLoopContext>,
+    reachability: RefCell<BTreeMap<(BlockRef, BlockRef), bool>>,
 }
 
 #[derive(Debug)]
@@ -180,7 +183,19 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             tbc_scope_regs,
             visited: BTreeSet::new(),
             active_loops: Vec::new(),
+            reachability: RefCell::new(BTreeMap::new()),
         }
+    }
+
+    pub(super) fn can_reach(&self, from: BlockRef, to: BlockRef) -> bool {
+        let key = (from, to);
+        if let Some(can_reach) = self.reachability.borrow().get(&key).copied() {
+            return can_reach;
+        }
+
+        let can_reach = self.lowering.cfg.can_reach(from, to);
+        self.reachability.borrow_mut().insert(key, can_reach);
+        can_reach
     }
 
     fn all_reachable_blocks_covered(&self) -> bool {
@@ -682,11 +697,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         reg: Reg,
         expr: HirExpr,
     ) {
-        if self
-            .lowering
-            .dataflow
-            .phi_used_only_in_block(self.lowering.cfg, phi_id, block)
-        {
+        if self.lowering.dataflow.phi_used_only_in_block(phi_id, block) {
             self.replace_phi_with_entry_expr(block, phi_id, reg, expr);
         } else {
             self.overrides.insert_phi_expr(block, phi_id, expr);
@@ -879,7 +890,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 consumed_blocks,
             }));
         }
-        let truthy_flows_to_falsy = self.lowering.cfg.can_reach(truthy, falsy)
+        let truthy_flows_to_falsy = self.can_reach(truthy, falsy)
             && self
                 .lowering
                 .graph_facts
@@ -912,7 +923,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // 那就是经由下一轮循环绕回来的可达性，不能据此省略当前分支的 terminal else 臂。
         if self.block_is_terminal_exit(falsy)
             && stop.is_none_or(|stop| self.can_reach_avoiding_block(truthy, falsy, stop))
-            && self.lowering.cfg.can_reach(truthy, falsy)
+            && self.can_reach(truthy, falsy)
         {
             let consumed_blocks =
                 self.branch_short_circuit_consumed_blocks(&consumed_headers, truthy, falsy, stop);
@@ -1482,8 +1493,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .iter()
             .copied()
             .find(|candidate| {
-                self.lowering.cfg.can_reach(then_entry, *candidate)
-                    && self.lowering.cfg.can_reach(else_entry, *candidate)
+                self.can_reach(then_entry, *candidate)
+                    && self.can_reach(else_entry, *candidate)
                     && self.branch_shared_continuation_candidate_is_valid(
                         block,
                         then_entry,
@@ -1512,8 +1523,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return false;
         }
         if let Some(region_stop) = region_stop
-            && (self.lowering.cfg.can_reach(region_stop, candidate)
-                || !self.lowering.cfg.can_reach(candidate, region_stop))
+            && (self.can_reach(region_stop, candidate) || !self.can_reach(candidate, region_stop))
         {
             return false;
         }
@@ -1531,49 +1541,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         continuation: BlockRef,
         boundary: BlockRef,
     ) -> bool {
-        fn visit(
-            lowerer: &StructuredBodyLowerer<'_, '_>,
-            block: BlockRef,
-            continuation: BlockRef,
-            boundary: BlockRef,
-            visiting: &mut BTreeSet<BlockRef>,
-            memo: &mut BTreeMap<BlockRef, bool>,
-        ) -> bool {
+        self.branch_arm_paths_all_match(entry, |block| {
             if block == continuation {
-                return true;
+                return Some(true);
             }
-            if block == boundary || !lowerer.lowering.cfg.reachable_blocks.contains(&block) {
-                return false;
+            if block == boundary || !self.lowering.cfg.reachable_blocks.contains(&block) {
+                return Some(false);
             }
-            if block == lowerer.lowering.cfg.exit_block || lowerer.block_is_terminal_exit(block) {
-                return true;
-            }
-            if let Some(result) = memo.get(&block).copied() {
-                return result;
-            }
-            if !visiting.insert(block) {
-                return true;
-            }
-
-            let result = lowerer.lowering.cfg.succs[block.index()]
-                .iter()
-                .all(|edge_ref| {
-                    let successor = lowerer.lowering.cfg.edges[edge_ref.index()].to;
-                    visit(lowerer, successor, continuation, boundary, visiting, memo)
-                });
-            visiting.remove(&block);
-            memo.insert(block, result);
-            result
-        }
-
-        visit(
-            self,
-            entry,
-            continuation,
-            boundary,
-            &mut BTreeSet::new(),
-            &mut BTreeMap::new(),
-        )
+            (block == self.lowering.cfg.exit_block || self.block_is_terminal_exit(block))
+                .then_some(true)
+        })
     }
 
     fn loop_body_shared_continuation_stop(
@@ -1620,52 +1597,18 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         continuation: BlockRef,
         stop: BlockRef,
     ) -> bool {
-        fn visit(
-            lowerer: &StructuredBodyLowerer<'_, '_>,
-            block: BlockRef,
-            continuation: BlockRef,
-            stop: BlockRef,
-            visiting: &mut BTreeSet<BlockRef>,
-            memo: &mut BTreeMap<BlockRef, bool>,
-        ) -> bool {
+        self.branch_arm_paths_all_match(entry, |block| {
             if block == continuation {
-                return true;
+                return Some(true);
             }
-            if block == stop || block == lowerer.lowering.cfg.exit_block {
-                return false;
+            if block == stop || block == self.lowering.cfg.exit_block {
+                return Some(false);
             }
-            if lowerer.block_is_active_loop_escape(block) {
-                return true;
+            if self.block_is_active_loop_escape(block) {
+                return Some(true);
             }
-            if !lowerer.lowering.cfg.reachable_blocks.contains(&block) {
-                return false;
-            }
-            if let Some(result) = memo.get(&block).copied() {
-                return result;
-            }
-            if !visiting.insert(block) {
-                return true;
-            }
-
-            let result = lowerer.lowering.cfg.succs[block.index()]
-                .iter()
-                .all(|edge_ref| {
-                    let successor = lowerer.lowering.cfg.edges[edge_ref.index()].to;
-                    visit(lowerer, successor, continuation, stop, visiting, memo)
-                });
-            visiting.remove(&block);
-            memo.insert(block, result);
-            result
-        }
-
-        visit(
-            self,
-            entry,
-            continuation,
-            stop,
-            &mut BTreeSet::new(),
-            &mut BTreeMap::new(),
-        )
+            (!self.lowering.cfg.reachable_blocks.contains(&block)).then_some(false)
+        })
     }
 
     fn branch_can_truncate_to_stop_or_loop_escape(
@@ -1687,25 +1630,34 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stop: BlockRef,
         boundary: BlockRef,
     ) -> bool {
+        self.branch_arm_paths_all_match(entry, |block| {
+            if block == stop {
+                return Some(true);
+            }
+            if block == boundary {
+                return Some(self.block_is_active_loop_escape(block));
+            }
+            if block == self.lowering.cfg.exit_block || self.block_is_terminal_exit(block) {
+                return Some(true);
+            }
+            (!self.lowering.cfg.reachable_blocks.contains(&block)).then_some(false)
+        })
+    }
+
+    fn branch_arm_paths_all_match(
+        &self,
+        entry: BlockRef,
+        classify_boundary: impl Fn(BlockRef) -> Option<bool>,
+    ) -> bool {
         fn visit(
             lowerer: &StructuredBodyLowerer<'_, '_>,
             block: BlockRef,
-            stop: BlockRef,
-            boundary: BlockRef,
+            classify_boundary: &impl Fn(BlockRef) -> Option<bool>,
             visiting: &mut BTreeSet<BlockRef>,
             memo: &mut BTreeMap<BlockRef, bool>,
         ) -> bool {
-            if block == stop {
-                return true;
-            }
-            if block == boundary {
-                return lowerer.block_is_active_loop_escape(block);
-            }
-            if block == lowerer.lowering.cfg.exit_block || lowerer.block_is_terminal_exit(block) {
-                return true;
-            }
-            if !lowerer.lowering.cfg.reachable_blocks.contains(&block) {
-                return false;
+            if let Some(result) = classify_boundary(block) {
+                return result;
             }
             if let Some(result) = memo.get(&block).copied() {
                 return result;
@@ -1718,7 +1670,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .iter()
                 .all(|edge_ref| {
                     let successor = lowerer.lowering.cfg.edges[edge_ref.index()].to;
-                    visit(lowerer, successor, stop, boundary, visiting, memo)
+                    visit(lowerer, successor, classify_boundary, visiting, memo)
                 });
             visiting.remove(&block);
             memo.insert(block, result);
@@ -1728,8 +1680,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         visit(
             self,
             entry,
-            stop,
-            boundary,
+            &classify_boundary,
             &mut BTreeSet::new(),
             &mut BTreeMap::new(),
         )
@@ -1896,7 +1847,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             // 把它截断到外层 stop 会把后续语句吸进当前分支臂，破坏外层 region。
             // 但 Lua 5.1 的 guard/elseif 链常会让“处理完的路径”直接跳到函数尾
             // return；这种终止块没有可继续结构化的 fallthrough，可以安全地留在臂内。
-            if self.lowering.cfg.can_reach(stop, block) && !self.block_is_terminal_exit(block) {
+            if self.can_reach(stop, block) && !self.block_is_terminal_exit(block) {
                 return true;
             }
 

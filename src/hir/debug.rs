@@ -31,7 +31,7 @@ define_stage_dump! {
     /// HIR 阶段的调试导出。
     pub fn dump_hir(state, options) => Hir,
         dump_hir_module(
-            state.hir.as_ref().unwrap(),
+            state.require_hir()?,
             options.detail,
             &options.filters,
             options.color
@@ -396,6 +396,7 @@ fn format_decision_target(target: &HirDecisionTarget) -> String {
 
 fn format_lvalue(target: &HirLValue) -> String {
     match target {
+        HirLValue::Param(param) => format!("p{}", param.index()),
         HirLValue::Temp(temp) => format!("t{}", temp.index()),
         HirLValue::Local(local) => format!("l{}", local.index()),
         HirLValue::Upvalue(upvalue) => format!("u{}", upvalue.index()),

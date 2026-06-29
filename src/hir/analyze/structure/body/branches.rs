@@ -19,6 +19,7 @@
 
 use super::*;
 
+use crate::hir::analyze::short_circuit::{DecisionEdge, build_decision_expr};
 use crate::structure::DefId;
 
 #[derive(Debug, Clone, Copy)]
@@ -436,7 +437,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     }
 
     fn entry_is_terminal_generic_for_guard(&self, entry: BlockRef, shared: BlockRef) -> bool {
-        if self.lowering.cfg.can_reach(entry, shared) {
+        if self.can_reach(entry, shared) {
             return false;
         }
         let Some(header) = self.lowering.cfg.unique_reachable_successor(entry) else {
@@ -453,7 +454,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         candidate.exits.iter().all(|exit| {
-            !self.lowering.cfg.can_reach(*exit, shared)
+            !self.can_reach(*exit, shared)
                 && self.entry_must_reach_shared_or_terminate(
                     *exit,
                     shared,
@@ -1248,7 +1249,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .filter(|target| {
                 *target != break_exit
                     && (candidate.then_entry == *target
-                        || self.lowering.cfg.can_reach(candidate.then_entry, *target))
+                        || self.can_reach(candidate.then_entry, *target))
             })
             .or(Some(break_exit));
         let then_block = self.lower_region(candidate.then_entry, body_stop, target_overrides)?;
@@ -1336,10 +1337,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let continue_target = loop_context.continue_target?;
         if self.block_exits_outer_active_loop(merge)
             && (candidate.then_entry == continue_target
-                || self
-                    .lowering
-                    .cfg
-                    .can_reach(candidate.then_entry, continue_target))
+                || self.can_reach(candidate.then_entry, continue_target))
         {
             return Some(merge);
         }
@@ -1367,10 +1365,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         (candidate.then_entry == continue_target
-            || self
-                .lowering
-                .cfg
-                .can_reach(candidate.then_entry, continue_target))
+            || self.can_reach(candidate.then_entry, continue_target))
         .then_some(merge)
     }
 
@@ -1708,10 +1703,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if matches!(
             self.block_terminator(non_continue_entry),
             Some((_instr_ref, LowInstr::Return(_) | LowInstr::TailCall(_)))
-        ) && !self
-            .lowering
-            .cfg
-            .can_reach(non_continue_entry, continue_target)
+        ) && !self.can_reach(non_continue_entry, continue_target)
         {
             return true;
         }
@@ -1897,59 +1889,20 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         short: &ShortCircuitCandidate,
         reg: Reg,
     ) -> Option<HirExpr> {
-        let mut nodes = Vec::new();
-        self.build_secondary_decision_node(short, short.entry, reg, &mut nodes)?;
-        Some(HirExpr::Decision(Box::new(HirDecisionExpr {
-            entry: HirDecisionNodeRef(0),
-            nodes,
-        })))
-    }
-
-    fn build_secondary_decision_node(
-        &self,
-        short: &ShortCircuitCandidate,
-        node_ref: ShortCircuitNodeRef,
-        reg: Reg,
-        nodes: &mut Vec<HirDecisionNode>,
-    ) -> Option<HirDecisionNodeRef> {
-        let node = short.nodes.get(node_ref.index())?;
-        let my_ref = HirDecisionNodeRef(nodes.len());
-        // 先占位，后续填充 test/truthy/falsy
-        nodes.push(HirDecisionNode {
-            id: my_ref,
-            test: HirExpr::Nil,
-            truthy: HirDecisionTarget::CurrentValue,
-            falsy: HirDecisionTarget::CurrentValue,
-        });
-
-        let cond = lower_short_circuit_subject(self.lowering, node.header)?;
-        let truthy = self.build_secondary_decision_target(short, &node.truthy, reg, nodes)?;
-        let falsy = self.build_secondary_decision_target(short, &node.falsy, reg, nodes)?;
-
-        nodes[my_ref.index()].test = cond;
-        nodes[my_ref.index()].truthy = truthy;
-        nodes[my_ref.index()].falsy = falsy;
-        Some(my_ref)
-    }
-
-    fn build_secondary_decision_target(
-        &self,
-        short: &ShortCircuitCandidate,
-        target: &ShortCircuitTarget,
-        reg: Reg,
-        nodes: &mut Vec<HirDecisionNode>,
-    ) -> Option<HirDecisionTarget> {
-        match target {
-            ShortCircuitTarget::Node(next_ref) => {
-                let node_ref = self.build_secondary_decision_node(short, *next_ref, reg, nodes)?;
-                Some(HirDecisionTarget::Node(node_ref))
-            }
-            ShortCircuitTarget::Value(block) => {
-                let value = expr_for_reg_at_block_exit(self.lowering, *block, reg);
-                Some(HirDecisionTarget::Expr(value))
-            }
-            ShortCircuitTarget::TruthyExit | ShortCircuitTarget::FalsyExit => None,
-        }
+        let decision = build_decision_expr(
+            self.lowering,
+            short,
+            short.entry,
+            lower_short_circuit_subject,
+            |_, target| match target {
+                ShortCircuitTarget::Node(next_ref) => Some(DecisionEdge::Node(*next_ref)),
+                ShortCircuitTarget::Value(block) => Some(DecisionEdge::Leaf(
+                    HirDecisionTarget::Expr(expr_for_reg_at_block_exit(self.lowering, *block, reg)),
+                )),
+                ShortCircuitTarget::TruthyExit | ShortCircuitTarget::FalsyExit => None,
+            },
+        )?;
+        Some(HirExpr::Decision(Box::new(decision)))
     }
 
     fn install_stop_boundary_value_merge_override(

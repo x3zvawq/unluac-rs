@@ -4,6 +4,7 @@
 //! 布尔表达式，不会越权放松语义约束。
 //! 例如：`not (a == nil)` 可能在这里被整理成更顺的逻辑表达式。
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
@@ -170,8 +171,8 @@ fn readable_structured_candidate(
     let decision = build_readable_decision(expr)?;
     let context = SynthesisContext {
         decision: &decision,
-        ref_positions: ref_positions.clone(),
-        environments: environments.to_vec(),
+        ref_positions: Cow::Borrowed(ref_positions),
+        environments: Cow::Borrowed(environments),
     };
     let mut memo = BTreeMap::new();
     synthesize_readable_value_node_expr(&context, decision.entry, &mut memo)

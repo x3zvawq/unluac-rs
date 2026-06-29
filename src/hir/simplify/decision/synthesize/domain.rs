@@ -4,6 +4,7 @@
 //! 不会在这里决定哪一种源码形状更可读。
 //! 例如：`temp == nil` 会在这里被解释成可枚举的抽象真假环境。
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
@@ -67,8 +68,8 @@ fn abstract_value_partial_cmp(
 #[derive(Clone)]
 pub(super) struct SynthesisContext<'a> {
     pub(super) decision: &'a HirDecisionExpr,
-    pub(super) ref_positions: BTreeMap<RefKey, usize>,
-    pub(super) environments: Vec<Vec<AbstractValue>>,
+    pub(super) ref_positions: Cow<'a, BTreeMap<RefKey, usize>>,
+    pub(super) environments: Cow<'a, [Vec<AbstractValue>]>,
 }
 
 impl<'a> SynthesisContext<'a> {
@@ -82,8 +83,8 @@ impl<'a> SynthesisContext<'a> {
         let environments = enumerate_environments(refs.len(), &domain)?;
         Some(Self {
             decision,
-            ref_positions,
-            environments,
+            ref_positions: Cow::Owned(ref_positions),
+            environments: Cow::Owned(environments),
         })
     }
 

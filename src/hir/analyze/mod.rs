@@ -31,7 +31,7 @@ pub(crate) fn analyze_hir(
     let mut artifacts = LowerArtifacts::default();
     let entry = context
         .timings
-        .record("lower", || lower_proto(state, context, &mut artifacts));
+        .record("lower", || lower_proto(state, context, &mut artifacts))?;
 
     let mut module = HirModule {
         entry,

@@ -13,9 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::AstTargetDialect;
 use crate::hir::common::{
-    HirBlock, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr,
-    HirGenericFor, HirIf, HirLValue, HirLabel, HirLabelId, HirLogicalExpr, HirNumericFor,
-    HirRepeat, HirStmt, HirWhile, TempId,
+    HirBlock, HirDecisionTarget, HirExpr, HirGenericFor, HirIf, HirLValue, HirLabel, HirLabelId,
+    HirLogicalExpr, HirNumericFor, HirRepeat, HirStmt, HirWhile, TempId,
 };
 use crate::hir::decision::finalize_condition_decision_expr;
 use crate::structure::{BlockRef, PhiId, ReachableSuccessorShape};

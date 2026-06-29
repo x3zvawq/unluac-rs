@@ -20,7 +20,7 @@ use crate::hir::common::{
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
-use self::mentioned::protected_temps_for_nested_stmt;
+use self::mentioned::NestedTempProtection;
 use self::rewrite::replace_temp_in_stmt;
 use self::site::{expr_touches_temp, inline_site_in_stmt};
 use self::usage::{
@@ -66,11 +66,11 @@ fn inline_temps_in_block(
     let mut changed = false;
     let mut captured_slots_before_stmt = Vec::with_capacity(block.stmts.len());
     let mut active_captured_slots = inherited_captured_slots.clone();
+    let mut nested_protection = NestedTempProtection::new(&block.stmts);
 
     for index in 0..block.stmts.len() {
         captured_slots_before_stmt.push(active_captured_slots.clone());
-        let nested_protected =
-            protected_temps_for_nested_stmt(&block.stmts, index, protected_temps);
+        let nested_protected = nested_protection.begin_stmt(index, protected_temps);
         let mut nested_captured_slots = active_captured_slots.clone();
         facts.collect_prefix_captured_home_slots_in_stmt(
             &block.stmts[index],
@@ -86,6 +86,7 @@ fn inline_temps_in_block(
             &nested_captured_slots,
         );
         facts.collect_captured_home_slots_in_stmt(stmt, &mut active_captured_slots);
+        nested_protection.finish_stmt(stmt);
     }
 
     if inline_call_callee_across_argument_materialization(
