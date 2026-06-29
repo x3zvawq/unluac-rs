@@ -7,7 +7,7 @@
 use crate::parser::{Lua55Opcode, Lua55Operands, RawChunk, RawInstr, RawProto};
 use crate::transformer::dialect::lowering::{
     PendingLowInstr, PendingLoweringState, PendingMethodHints, TargetPlaceholder, WordCodeIndex,
-    instr_pc, instr_word_len, resolve_pending_instr_with,
+    instr_pc, instr_word_len, next_raw_pc, raw_pc_at, resolve_pending_instr_with,
 };
 use crate::transformer::dialect::puc_lua::{
     GenericForPairAbxSpec, GenericForPairInfo as GenericForPair, HelperJumpAsjSpec,
@@ -15,19 +15,20 @@ use crate::transformer::dialect::puc_lua::{
     addi_binary_shape, call_args_pack, call_result_pack, checked_const_ref, checked_proto_ref,
     checked_upvalue_ref, emit_call, emit_generic_for_call, emit_generic_for_loop,
     emit_numeric_for_init, emit_numeric_for_loop, emit_return, emit_tail_call, emit_tforprep,
-    finish_lowered_proto, generic_for_pair_abx, helper_jump_asj, jump_target_forward_bx,
+    finish_lowered_proto, generic_for_pair_abx, helper_jump_asj, immediate_cond_operand,
+    jump_target_back_bx, jump_target_forward_bx, jump_target_sj, k_value_operand,
     lower_chunk_with_env, numeric_for_regs, prepare_env_lowering, range_len_inclusive, reg_from_u8,
     return_pack,
 };
 use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchOperands,
-    BranchPredicate, CallKind, Capture, CaptureSource, CloseInstr, ClosureInstr, ConcatInstr,
-    CondOperand, ConstRef, DialectCaptureExtra, ErrNilInstr, GetTableInstr, GetUpvalueInstr,
-    InstrRef, LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr,
-    LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, NumberLiteral,
-    ProtoRef, Reg, RegRange, ResultPack, SetListInstr, SetTableInstr, SetUpvalueInstr, TbcInstr,
-    TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    BranchPredicate, Capture, CaptureSource, CloseInstr, ClosureInstr, ConcatInstr, CondOperand,
+    ConstRef, DialectCaptureExtra, ErrNilInstr, GetTableInstr, GetUpvalueInstr, InstrRef,
+    LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr,
+    LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange,
+    ResultPack, SetListInstr, SetTableInstr, SetUpvalueInstr, TbcInstr, TransformError,
+    UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
 const EXTRAARG_SCALE_10: u32 = 1_u32 << 10;
@@ -84,7 +85,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::Move => {
                     let (a, b) = expect_ab(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -98,7 +99,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::LoadI => {
                     let (a, sbx) = expect_asbx(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -112,7 +113,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::LoadF => {
                     let (a, sbx) = expect_asbx(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -126,7 +127,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::LoadK => {
                     let (a, bx) = expect_abx(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -140,7 +141,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::LoadKx => {
                     let a = expect_a(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -157,7 +158,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::LoadFalse => {
                     let a = expect_a(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -171,7 +172,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::LFalseSkip => {
                     let a = expect_a(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -180,7 +181,7 @@ impl<'a> ProtoLowerer<'a> {
                             value: false,
                         })),
                     );
-                    self.clear_all_method_hints();
+                    self.pending_methods.clear();
                     self.emit(
                         None,
                         vec![raw_index],
@@ -195,7 +196,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::LoadTrue => {
                     let a = expect_a(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -210,7 +211,7 @@ impl<'a> ProtoLowerer<'a> {
                     let (a, b) = expect_ab(raw_pc, opcode, operands)?;
                     let len = range_len_inclusive(usize::from(a), usize::from(a) + usize::from(b));
                     let dst = RegRange::new(reg_from_u8(a), len);
-                    self.invalidate_written_range(dst);
+                    self.pending_methods.invalidate_range(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -221,7 +222,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::GetUpVal => {
                     let (a, b) = expect_ab(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -235,7 +236,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::GetTabUp => {
                     let (a, b, c, _) = expect_abck(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -256,7 +257,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::GetTable => {
                     let (a, b, c, _) = expect_abck(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -272,7 +273,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::GetI => {
                     let (a, b, c, _) = expect_abck(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -288,7 +289,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::GetField => {
                     let (a, b, c, _) = expect_abck(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -304,7 +305,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::GetVarg => {
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -330,7 +331,7 @@ impl<'a> ProtoLowerer<'a> {
                                 a as usize,
                             )?,
                             key: AccessKey::Const(self.const_ref(raw_pc, b as usize)?),
-                            value: self.value_operand(raw_pc, c, k)?,
+                            value: k_value_operand(self.raw, raw_pc, c, k)?,
                         })),
                     );
                     raw_index += 1;
@@ -355,7 +356,7 @@ impl<'a> ProtoLowerer<'a> {
                         PendingLowInstr::Ready(LowInstr::SetTable(SetTableInstr {
                             base: AccessBase::Reg(reg_from_u8(a)),
                             key: AccessKey::Reg(reg_from_u8(b)),
-                            value: self.value_operand(raw_pc, c, k)?,
+                            value: k_value_operand(self.raw, raw_pc, c, k)?,
                         })),
                     );
                     raw_index += 1;
@@ -368,7 +369,7 @@ impl<'a> ProtoLowerer<'a> {
                         PendingLowInstr::Ready(LowInstr::SetTable(SetTableInstr {
                             base: AccessBase::Reg(reg_from_u8(a)),
                             key: AccessKey::Integer(i64::from(b)),
-                            value: self.value_operand(raw_pc, c, k)?,
+                            value: k_value_operand(self.raw, raw_pc, c, k)?,
                         })),
                     );
                     raw_index += 1;
@@ -381,7 +382,7 @@ impl<'a> ProtoLowerer<'a> {
                         PendingLowInstr::Ready(LowInstr::SetTable(SetTableInstr {
                             base: AccessBase::Reg(reg_from_u8(a)),
                             key: AccessKey::Const(self.const_ref(raw_pc, b as usize)?),
-                            value: self.value_operand(raw_pc, c, k)?,
+                            value: k_value_operand(self.raw, raw_pc, c, k)?,
                         })),
                     );
                     raw_index += 1;
@@ -405,7 +406,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::NewTable => {
                     let (a, _, _, _) = expect_avbck(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -418,8 +419,8 @@ impl<'a> ProtoLowerer<'a> {
                     let callee = reg_from_u8(a);
                     let self_arg = Reg(callee.index() + 1);
                     let method_name = self.const_ref(raw_pc, c as usize)?;
-                    self.invalidate_written_reg(callee);
-                    self.invalidate_written_reg(self_arg);
+                    self.pending_methods.invalidate_reg(callee);
+                    self.pending_methods.invalidate_reg(self_arg);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -444,7 +445,8 @@ impl<'a> ProtoLowerer<'a> {
                             method_load: true,
                         })),
                     );
-                    self.set_pending_method(callee, self_arg, Some(method_name));
+                    self.pending_methods
+                        .set(callee, self_arg, Some(method_name));
                     raw_index += 1;
                 }
                 Lua55Opcode::AddI => {
@@ -459,7 +461,7 @@ impl<'a> ProtoLowerer<'a> {
                         inspect_lua55_asbck_helper,
                         instr_pc,
                     )?;
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -484,7 +486,7 @@ impl<'a> ProtoLowerer<'a> {
                 | Lua55Opcode::BxorK => {
                     let (a, b, c, _) = expect_abck(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -500,7 +502,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::ShrI | Lua55Opcode::ShlI => {
                     let (a, b, sc, _) = expect_absck(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     let (lhs, rhs) = match opcode {
                         Lua55Opcode::ShrI => (
                             ValueOperand::Reg(reg_from_u8(b)),
@@ -538,7 +540,7 @@ impl<'a> ProtoLowerer<'a> {
                 | Lua55Opcode::Shr => {
                     let (a, b, c, _) = expect_abck(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -557,7 +559,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::Unm | Lua55Opcode::BNot | Lua55Opcode::Not | Lua55Opcode::Len => {
                     let (a, b) = expect_ab(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -572,7 +574,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::Concat => {
                     let (a, b) = expect_ab(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -584,7 +586,7 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 1;
                 }
                 Lua55Opcode::Close => {
-                    self.clear_all_method_hints();
+                    self.pending_methods.clear();
                     let a = expect_a(raw_pc, opcode, operands)?;
                     self.emit(
                         Some(raw_index),
@@ -607,21 +609,24 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 1;
                 }
                 Lua55Opcode::Jmp => {
-                    self.clear_all_method_hints();
+                    self.pending_methods.clear();
                     let sj = expect_asj(raw_pc, opcode, operands)?;
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Jump {
-                            target: TargetPlaceholder::Raw(
-                                self.jump_target_sj(raw_pc, extra.pc, sj)?,
-                            ),
+                            target: TargetPlaceholder::Raw(jump_target_sj(
+                                &self.word_code_index,
+                                raw_pc,
+                                extra.pc,
+                                sj,
+                            )?),
                         },
                     );
                     raw_index += 1;
                 }
                 Lua55Opcode::Eq | Lua55Opcode::Lt | Lua55Opcode::Le => {
-                    self.clear_all_method_hints();
+                    self.pending_methods.clear();
                     let (a, b, k) = expect_abk(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let cond = BranchCond {
@@ -645,7 +650,7 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index = helper.next_index;
                 }
                 Lua55Opcode::EqK => {
-                    self.clear_all_method_hints();
+                    self.pending_methods.clear();
                     let (a, b, k) = expect_abk(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let cond = BranchCond {
@@ -673,10 +678,10 @@ impl<'a> ProtoLowerer<'a> {
                 | Lua55Opcode::LeI
                 | Lua55Opcode::GtI
                 | Lua55Opcode::GeI => {
-                    self.clear_all_method_hints();
+                    self.pending_methods.clear();
                     let (a, sb, c, k) = expect_asbck(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
-                    let rhs = self.compare_immediate(sb, c != 0);
+                    let rhs = immediate_cond_operand(sb, c != 0);
                     let (predicate, lhs, rhs) =
                         compare_immediate_shape(opcode, reg_from_u8(a), rhs);
                     let cond = BranchCond {
@@ -697,7 +702,7 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index = helper.next_index;
                 }
                 Lua55Opcode::Test => {
-                    self.clear_all_method_hints();
+                    self.pending_methods.clear();
                     let (a, k) = expect_ak(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let cond = BranchCond {
@@ -718,7 +723,7 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index = helper.next_index;
                 }
                 Lua55Opcode::TestSet => {
-                    self.clear_all_method_hints();
+                    self.pending_methods.clear();
                     let (a, b, k) = expect_abk(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let cond = BranchCond {
@@ -770,8 +775,11 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::Call => {
                     let (a, b, c, _) = expect_abck(raw_pc, opcode, operands)?;
                     let results = call_result_pack(a, u16::from(c));
-                    let (kind, method_name) =
-                        self.take_call_info(reg_from_u8(a), u16::from(b), results);
+                    let (kind, method_name) = self.pending_methods.consume_call_info(
+                        reg_from_u8(a),
+                        u16::from(b),
+                        results,
+                    );
                     emit_call(
                         &mut self.lowering,
                         raw_index,
@@ -785,8 +793,11 @@ impl<'a> ProtoLowerer<'a> {
                 }
                 Lua55Opcode::TailCall => {
                     let (a, b, _, k) = expect_abck(raw_pc, opcode, operands)?;
-                    let (kind, method_name) =
-                        self.take_call_info(reg_from_u8(a), u16::from(b), ResultPack::Ignore);
+                    let (kind, method_name) = self.pending_methods.consume_call_info(
+                        reg_from_u8(a),
+                        u16::from(b),
+                        ResultPack::Ignore,
+                    );
                     emit_tail_call(
                         &mut self.lowering,
                         raw_index,
@@ -800,7 +811,7 @@ impl<'a> ProtoLowerer<'a> {
                 }
                 Lua55Opcode::Return => {
                     let (a, b, _, k) = expect_abck(raw_pc, opcode, operands)?;
-                    self.clear_all_method_hints();
+                    self.pending_methods.clear();
                     emit_return(
                         &mut self.lowering,
                         raw_index,
@@ -810,7 +821,7 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 1;
                 }
                 Lua55Opcode::Return0 => {
-                    self.clear_all_method_hints();
+                    self.pending_methods.clear();
                     emit_return(
                         &mut self.lowering,
                         raw_index,
@@ -821,7 +832,7 @@ impl<'a> ProtoLowerer<'a> {
                 }
                 Lua55Opcode::Return1 => {
                     let a = expect_a(raw_pc, opcode, operands)?;
-                    self.clear_all_method_hints();
+                    self.pending_methods.clear();
                     emit_return(
                         &mut self.lowering,
                         raw_index,
@@ -831,14 +842,15 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 1;
                 }
                 Lua55Opcode::ForLoop => {
-                    self.clear_all_method_hints();
+                    self.pending_methods.clear();
                     let (a, bx) = expect_abx(raw_pc, opcode, operands)?;
                     // Lua 5.5 的 numeric-for 体里会直接复用 A+2 这格作为当前 binding；
                     // 如果继续沿用 5.4 的 A+3，循环体里读到的就会是旧 step 槽位。
                     let regs = numeric_for_regs(reg_from_u8(a), 2);
-                    let body_target = self.jump_target_back_bx(raw_pc, extra.pc, bx)?;
+                    let body_target =
+                        jump_target_back_bx(&self.word_code_index, raw_pc, extra.pc, bx)?;
                     let exit_target =
-                        self.ensure_targetable_pc(raw_pc, self.next_raw_pc(raw_index))?;
+                        self.ensure_targetable_pc(raw_pc, next_raw_pc(self.raw, raw_index))?;
                     emit_numeric_for_loop(
                         &mut self.lowering,
                         raw_index,
@@ -849,7 +861,7 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 1;
                 }
                 Lua55Opcode::ForPrep => {
-                    self.clear_all_method_hints();
+                    self.pending_methods.clear();
                     let (a, bx) = expect_abx(raw_pc, opcode, operands)?;
                     let loop_raw =
                         jump_target_forward_bx(&self.word_code_index, raw_pc, extra.pc, bx)?;
@@ -863,9 +875,9 @@ impl<'a> ProtoLowerer<'a> {
                     }
                     let regs = numeric_for_regs(reg_from_u8(a), 2);
                     let body_target =
-                        self.ensure_targetable_pc(raw_pc, self.next_raw_pc(raw_index))?;
+                        self.ensure_targetable_pc(raw_pc, next_raw_pc(self.raw, raw_index))?;
                     let exit_target =
-                        self.ensure_targetable_pc(raw_pc, self.next_raw_pc(loop_raw))?;
+                        self.ensure_targetable_pc(raw_pc, next_raw_pc(self.raw, loop_raw))?;
                     emit_numeric_for_init(
                         &mut self.lowering,
                         raw_index,
@@ -876,7 +888,7 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 1;
                 }
                 Lua55Opcode::TForPrep => {
-                    self.clear_all_method_hints();
+                    self.pending_methods.clear();
                     let (a, bx) = expect_abx(raw_pc, opcode, operands)?;
                     let tbc_reg = Reg(usize::from(a) + 3);
                     let call_target =
@@ -885,7 +897,7 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 1;
                 }
                 Lua55Opcode::TForCall => {
-                    self.clear_all_method_hints();
+                    self.pending_methods.clear();
                     let (a, c) = expect_ac(raw_pc, opcode, operands)?;
                     let pair = self.generic_for_pair(raw_index, a, c)?;
                     let state_start = reg_from_u8(a);
@@ -937,7 +949,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua55Opcode::Closure => {
                     let (a, bx) = expect_abx(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.invalidate_written_reg(dst);
+                    self.pending_methods.invalidate_reg(dst);
                     let proto = self.proto_ref(raw_pc, bx as usize)?;
                     let child = &self.raw.common.children[proto.index()];
                     let captures = child
@@ -974,7 +986,7 @@ impl<'a> ProtoLowerer<'a> {
                 }
                 Lua55Opcode::VarArg => {
                     let (a, _, c, _) = expect_abck(raw_pc, opcode, operands)?;
-                    self.clear_all_method_hints();
+                    self.pending_methods.clear();
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
@@ -1064,52 +1076,6 @@ impl<'a> ProtoLowerer<'a> {
         })
     }
 
-    fn value_operand(
-        &self,
-        raw_pc: u32,
-        operand: u8,
-        k: bool,
-    ) -> Result<ValueOperand, TransformError> {
-        if k {
-            Ok(ValueOperand::Const(
-                self.const_ref(raw_pc, operand as usize)?,
-            ))
-        } else {
-            Ok(ValueOperand::Reg(reg_from_u8(operand)))
-        }
-    }
-
-    fn compare_immediate(&self, operand: i16, is_float: bool) -> CondOperand {
-        if is_float {
-            CondOperand::Number(NumberLiteral::from_f64(f64::from(operand)))
-        } else {
-            CondOperand::Integer(i64::from(operand))
-        }
-    }
-
-    fn jump_target_sj(&self, raw_pc: u32, base_pc: u32, sj: i32) -> Result<usize, TransformError> {
-        let target_pc = i64::from(base_pc) + 1 + i64::from(sj);
-        self.ensure_targetable_jump_pc(raw_pc, target_pc)
-    }
-
-    fn jump_target_back_bx(
-        &self,
-        raw_pc: u32,
-        base_pc: u32,
-        bx: u32,
-    ) -> Result<usize, TransformError> {
-        let target_pc = i64::from(base_pc) + 1 - i64::from(bx);
-        self.ensure_targetable_jump_pc(raw_pc, target_pc)
-    }
-
-    fn ensure_targetable_jump_pc(
-        &self,
-        raw_pc: u32,
-        target_pc: i64,
-    ) -> Result<usize, TransformError> {
-        self.word_code_index.ensure_valid_jump_pc(raw_pc, target_pc)
-    }
-
     fn ensure_targetable_pc(&self, raw_pc: u32, target_pc: u32) -> Result<usize, TransformError> {
         self.word_code_index.ensure_targetable_pc(raw_pc, target_pc)
     }
@@ -1128,11 +1094,13 @@ impl<'a> ProtoLowerer<'a> {
                 helper_jump_opcode: Lua55Opcode::Jmp,
                 inspect_helper: inspect_lua55_asj_helper,
                 raw_pc_at: instr_pc,
-                jump_target: |raw_pc, base_pc, sj| self.jump_target_sj(raw_pc, base_pc, sj),
+                jump_target: |raw_pc, base_pc, sj| {
+                    jump_target_sj(&self.word_code_index, raw_pc, base_pc, sj)
+                },
                 ensure_targetable_pc: |raw_pc, target_pc| {
                     self.ensure_targetable_pc(raw_pc, target_pc)
                 },
-                next_raw_pc: |index| self.next_raw_pc(index),
+                next_raw_pc: |index| next_raw_pc(self.raw, index),
                 opcode_label: Lua55Opcode::label,
             },
         )
@@ -1154,11 +1122,13 @@ impl<'a> ProtoLowerer<'a> {
                 helper_loop_opcode: Lua55Opcode::TForLoop,
                 inspect_helper: inspect_lua55_abx_helper,
                 raw_pc_at: instr_pc,
-                jump_target: |raw_pc, base_pc, bx| self.jump_target_back_bx(raw_pc, base_pc, bx),
+                jump_target: |raw_pc, base_pc, bx| {
+                    jump_target_back_bx(&self.word_code_index, raw_pc, base_pc, bx)
+                },
                 ensure_targetable_pc: |raw_pc, target_pc| {
                     self.ensure_targetable_pc(raw_pc, target_pc)
                 },
-                next_raw_pc: |index| self.next_raw_pc(index),
+                next_raw_pc: |index| next_raw_pc(self.raw, index),
                 opcode_label: Lua55Opcode::label,
                 validate_loop_base: |loop_a, call_a| loop_a == call_a,
                 build_pair: |loop_a, result_count| {
@@ -1169,37 +1139,6 @@ impl<'a> ProtoLowerer<'a> {
                 },
             },
         )
-    }
-
-    fn next_raw_pc(&self, raw_index: usize) -> u32 {
-        let instr = &self.raw.common.instructions[raw_index];
-        instr.pc() + u32::from(instr_word_len(instr))
-    }
-
-    fn set_pending_method(&mut self, callee: Reg, self_arg: Reg, method_name: Option<ConstRef>) {
-        self.pending_methods.set(callee, self_arg, method_name);
-    }
-
-    fn take_call_info(
-        &mut self,
-        callee: Reg,
-        raw_b: u16,
-        results: ResultPack,
-    ) -> (CallKind, Option<crate::transformer::MethodNameHint>) {
-        self.pending_methods
-            .consume_call_info(callee, raw_b, results)
-    }
-
-    fn invalidate_written_reg(&mut self, reg: Reg) {
-        self.pending_methods.invalidate_reg(reg);
-    }
-
-    fn invalidate_written_range(&mut self, range: RegRange) {
-        self.pending_methods.invalidate_range(range);
-    }
-
-    fn clear_all_method_hints(&mut self) {
-        self.pending_methods.clear();
     }
 }
 
@@ -1225,10 +1164,6 @@ fn inspect_lua55_asbck_helper(raw: &RawInstr) -> Result<(Lua55Opcode, i16, u8), 
         .expect("lua55 lowerer should only decode lua55 instructions");
     let (_a, sb, c, _k) = expect_asbck(extra.pc, opcode, operands)?;
     Ok((opcode, sb, c))
-}
-
-fn raw_pc_at(raw: &RawProto, index: usize) -> u32 {
-    raw.common.instructions[index].pc()
 }
 
 fn opcode_at(raw: &RawProto, index: usize) -> Lua55Opcode {

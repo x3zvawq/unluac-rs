@@ -30,7 +30,7 @@ pub(crate) fn lower_chunk(
     state: &mut DecompileState,
     _context: &DecompileContext<'_>,
 ) -> Result<(), DecompileError> {
-    let raw_chunk = state.raw_chunk.as_ref().unwrap();
+    let raw_chunk = state.require_raw_chunk()?;
     state.lowered = Some(match raw_chunk.header.version {
         DecompileDialect::Lua51 => dialect::lua51::lower_chunk(raw_chunk),
         DecompileDialect::Lua52 => dialect::lua52::lower_chunk(raw_chunk),

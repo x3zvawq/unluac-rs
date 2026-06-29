@@ -13,7 +13,8 @@ use crate::transformer::dialect::lowering::{
     instr_pc, instr_word_len, resolve_pending_instr_with,
 };
 use crate::transformer::dialect::puc_lua::{
-    call_args_pack, call_result_pack, range_len_inclusive, reg_from_u8, return_pack,
+    call_args_pack, call_result_pack, finish_lowered_proto, range_len_inclusive, reg_from_u8,
+    return_pack,
 };
 use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
@@ -44,19 +45,7 @@ fn lower_proto(raw: &RawProto) -> Result<LoweredProto, TransformError> {
     let mut lowerer = ProtoLowerer::new(raw);
     let (instrs, lowering_map) = lowerer.lower()?;
 
-    Ok(LoweredProto {
-        source: raw.common.source.clone(),
-        line_range: raw.common.line_range,
-        signature: raw.common.signature,
-        frame: raw.common.frame,
-        constants: raw.common.constants.clone(),
-        upvalues: raw.common.upvalues.clone(),
-        debug_info: raw.common.debug_info.clone(),
-        children,
-        instrs,
-        lowering_map,
-        origin: raw.origin,
-    })
+    Ok(finish_lowered_proto(raw, children, instrs, lowering_map))
 }
 
 struct ProtoLowerer<'a> {

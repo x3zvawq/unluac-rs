@@ -67,6 +67,15 @@ pub(crate) fn instr_word_len(raw: &RawInstr) -> u8 {
         .expect("shared lowering word_len should only be used for word-len-bearing dialects")
 }
 
+pub(crate) fn raw_pc_at(raw: &RawProto, index: usize) -> u32 {
+    instr_pc(&raw.common.instructions[index])
+}
+
+pub(crate) fn next_raw_pc(raw: &RawProto, index: usize) -> u32 {
+    let instr = &raw.common.instructions[index];
+    instr_pc(instr) + u32::from(instr_word_len(instr))
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PendingLoweringState {
     emitted: Vec<EmittedInstr>,

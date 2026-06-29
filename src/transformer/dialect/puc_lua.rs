@@ -9,10 +9,10 @@ use crate::transformer::dialect::lowering::{
     PendingLowInstr, PendingLoweringState, TargetPlaceholder, WordCodeIndex,
 };
 use crate::transformer::{
-    AccessBase, BinaryOpKind, CallInstr, CallKind, CloseInstr, ConstRef, GenericForCallInstr,
-    LowInstr, LoweredChunk, LoweredProto, LoweringMap, MethodNameHint, ProtoRef, Reg, RegRange,
-    ResultPack, ReturnInstr, TailCallInstr, TbcInstr, TransformError, UpvalueRef, ValueOperand,
-    ValuePack,
+    AccessBase, AccessKey, BinaryOpKind, CallInstr, CallKind, CloseInstr, CondOperand, ConstRef,
+    GenericForCallInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MethodNameHint,
+    NumberLiteral, ProtoRef, Reg, RegRange, ResultPack, ReturnInstr, TailCallInstr, TbcInstr,
+    TransformError, UpvalueRef, ValueOperand, ValuePack,
 };
 
 pub(crate) const BITRK: u16 = 1 << 8;
@@ -475,6 +475,79 @@ pub(crate) fn index_k(value: u16) -> usize {
     usize::from(value & !BITRK)
 }
 
+pub(crate) fn rk_value_operand(
+    raw: &RawProto,
+    raw_pc: u32,
+    rk: u16,
+) -> Result<ValueOperand, TransformError> {
+    if is_k(rk) {
+        Ok(ValueOperand::Const(checked_const_ref(
+            raw,
+            raw_pc,
+            index_k(rk),
+        )?))
+    } else {
+        Ok(ValueOperand::Reg(reg_from_u16(rk)))
+    }
+}
+
+pub(crate) fn rk_access_key(
+    raw: &RawProto,
+    raw_pc: u32,
+    rk: u16,
+) -> Result<AccessKey, TransformError> {
+    if is_k(rk) {
+        Ok(AccessKey::Const(checked_const_ref(
+            raw,
+            raw_pc,
+            index_k(rk),
+        )?))
+    } else {
+        Ok(AccessKey::Reg(reg_from_u16(rk)))
+    }
+}
+
+pub(crate) fn rk_cond_operand(
+    raw: &RawProto,
+    raw_pc: u32,
+    rk: u16,
+) -> Result<CondOperand, TransformError> {
+    if is_k(rk) {
+        Ok(CondOperand::Const(checked_const_ref(
+            raw,
+            raw_pc,
+            index_k(rk),
+        )?))
+    } else {
+        Ok(CondOperand::Reg(reg_from_u16(rk)))
+    }
+}
+
+pub(crate) fn k_value_operand(
+    raw: &RawProto,
+    raw_pc: u32,
+    operand: u8,
+    k: bool,
+) -> Result<ValueOperand, TransformError> {
+    if k {
+        Ok(ValueOperand::Const(checked_const_ref(
+            raw,
+            raw_pc,
+            operand as usize,
+        )?))
+    } else {
+        Ok(ValueOperand::Reg(reg_from_u8(operand)))
+    }
+}
+
+pub(crate) fn immediate_cond_operand(operand: i16, is_float: bool) -> CondOperand {
+    if is_float {
+        CondOperand::Number(NumberLiteral::from_f64(f64::from(operand)))
+    } else {
+        CondOperand::Integer(i64::from(operand))
+    }
+}
+
 pub(crate) fn range_len_inclusive(start: usize, end: usize) -> usize {
     end.saturating_sub(start) + 1
 }
@@ -813,5 +886,35 @@ pub(crate) fn jump_target_forward_bx(
     bx: u32,
 ) -> Result<usize, TransformError> {
     let target_pc = i64::from(base_pc) + 1 + i64::from(bx);
+    word_code_index.ensure_valid_jump_pc(raw_pc, target_pc)
+}
+
+pub(crate) fn jump_target_back_bx(
+    word_code_index: &WordCodeIndex,
+    raw_pc: u32,
+    base_pc: u32,
+    bx: u32,
+) -> Result<usize, TransformError> {
+    let target_pc = i64::from(base_pc) + 1 - i64::from(bx);
+    word_code_index.ensure_valid_jump_pc(raw_pc, target_pc)
+}
+
+pub(crate) fn jump_target_sbx(
+    word_code_index: &WordCodeIndex,
+    raw_pc: u32,
+    base_pc: u32,
+    sbx: i32,
+) -> Result<usize, TransformError> {
+    let target_pc = i64::from(base_pc) + 1 + i64::from(sbx);
+    word_code_index.ensure_valid_jump_pc(raw_pc, target_pc)
+}
+
+pub(crate) fn jump_target_sj(
+    word_code_index: &WordCodeIndex,
+    raw_pc: u32,
+    base_pc: u32,
+    sj: i32,
+) -> Result<usize, TransformError> {
+    let target_pc = i64::from(base_pc) + 1 + i64::from(sj);
     word_code_index.ensure_valid_jump_pc(raw_pc, target_pc)
 }

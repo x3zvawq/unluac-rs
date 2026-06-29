@@ -31,7 +31,7 @@ define_stage_dump! {
     /// Transformer 阶段的调试导出。
     pub fn dump_lir(state, options) => Transformer,
         dump_lir_chunk(
-            state.lowered.as_ref().unwrap(),
+            state.require_lowered()?,
             options.detail,
             &options.filters,
             options.color
