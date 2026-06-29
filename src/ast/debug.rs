@@ -83,16 +83,19 @@ fn install_ast_focus(state: AstFocusState) -> AstFocusGuard {
 define_stage_dump! {
     /// AST 阶段的调试导出。
     pub fn dump_ast(state, options) => Ast,
-        dump_ast_stage(state, options);
+        dump_ast_stage(state, options)?;
 }
 
-fn dump_ast_stage(state: &DecompileState, options: &DebugOptions) -> String {
+fn dump_ast_stage(
+    state: &DecompileState,
+    options: &DebugOptions,
+) -> Result<String, crate::decompile::DecompileError> {
     let mut output = String::new();
 
     append_section(
         &mut output,
         dump_ast_module(
-            state.ast.as_ref().unwrap(),
+            state.require_ast()?,
             options.detail,
             &options.filters,
             options.color,
@@ -101,7 +104,7 @@ fn dump_ast_stage(state: &DecompileState, options: &DebugOptions) -> String {
     append_section(
         &mut output,
         dump_readability_module(
-            state.readability.as_ref().unwrap(),
+            state.require_readability()?,
             options.detail,
             &options.filters,
             options.color,
@@ -110,14 +113,14 @@ fn dump_ast_stage(state: &DecompileState, options: &DebugOptions) -> String {
     append_section(
         &mut output,
         super::naming::dump_name_map(
-            state.naming.as_ref().unwrap(),
+            state.require_naming()?,
             options.detail,
             &options.filters,
             options.color,
         ),
     );
 
-    output
+    Ok(output)
 }
 
 fn append_section(output: &mut String, section: String) {

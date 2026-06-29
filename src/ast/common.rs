@@ -125,6 +125,29 @@ pub enum AstBindingRef {
     SyntheticLocal(AstSyntheticLocalId),
 }
 
+impl AstBindingRef {
+    pub fn from_name_ref(name: &AstNameRef) -> Option<Self> {
+        match name {
+            AstNameRef::Local(local) => Some(Self::Local(*local)),
+            AstNameRef::Temp(temp) => Some(Self::Temp(*temp)),
+            AstNameRef::SyntheticLocal(local) => Some(Self::SyntheticLocal(*local)),
+            AstNameRef::Param(_) | AstNameRef::Upvalue(_) | AstNameRef::Global(_) => None,
+        }
+    }
+
+    pub fn to_name_ref(self) -> AstNameRef {
+        match self {
+            Self::Local(local) => AstNameRef::Local(local),
+            Self::Temp(temp) => AstNameRef::Temp(temp),
+            Self::SyntheticLocal(local) => AstNameRef::SyntheticLocal(local),
+        }
+    }
+
+    pub fn matches_name_ref(self, name: &AstNameRef) -> bool {
+        Self::from_name_ref(name) == Some(self)
+    }
+}
+
 /// 全局名。
 #[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash)]
 pub struct AstGlobalName {

@@ -20,13 +20,13 @@
 use std::collections::BTreeSet;
 
 use super::super::common::{
-    AstBindingRef, AstBlock, AstLValue, AstLabelId, AstLocalAttr, AstLocalDecl, AstModule,
-    AstNameRef, AstStmt,
+    AstBindingRef, AstBlock, AstLValue, AstLabelId, AstLocalAttr, AstLocalDecl, AstModule, AstStmt,
 };
 use super::ReadabilityContext;
 use super::binding_flow::{
-    BindingUseIndex, binding_mentions_in_stmt, block_references_any_binding,
-    expr_references_any_binding, stmt_references_any_binding,
+    BindingRefSet, BindingUseIndex, binding_mentions_in_stmt, block_references_binding_set,
+    expr_references_any_binding, expr_references_binding_set, stmt_references_any_binding,
+    stmt_references_binding_set,
 };
 use super::expr_analysis::{expr_complexity, is_copy_like_expr};
 use super::visit::{self, AstVisitor};
@@ -145,21 +145,21 @@ fn merge_adjacent_single_value_local_decls(block: &mut AstBlock) -> bool {
 }
 
 fn sink_hoisted_temp_decls(block: &mut AstBlock) -> bool {
-    let mut changed = false;
+    let use_index = BindingUseIndex::for_stmts(&block.stmts);
+    let forward_gotos = ForwardGotoIndex::new(&block.stmts);
     let mut index = 0;
     while index < block.stmts.len() {
         let Some(pending_bindings) = hoisted_temp_bindings(&block.stmts[index]) else {
             index += 1;
             continue;
         };
-        let use_index = BindingUseIndex::for_stmts(&block.stmts);
 
         let mut remaining = pending_bindings;
         let mut pinned: Vec<super::super::common::AstLocalBinding> = Vec::new();
         let mut sink_changed = false;
         let mut lookahead = index + 1;
         while lookahead < block.stmts.len() && !remaining.is_empty() {
-            if block_has_forward_goto_past_index(&block.stmts, lookahead) {
+            if forward_gotos.has_forward_goto_past_index(lookahead) {
                 lookahead += 1;
                 continue;
             }
@@ -206,7 +206,8 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock) -> bool {
                 lookahead += 1;
                 continue;
             }
-            if stmt_references_any_binding(&block.stmts[lookahead], &remaining) {
+            let remaining_refs = BindingRefSet::from_bindings(&remaining);
+            if stmt_references_binding_set(&block.stmts[lookahead], &remaining_refs) {
                 // 钉住被引用但无法下沉的 binding：它们的声明必须留在提升位置，
                 // 但其他 binding 仍然可能被下沉到后续语句里。
                 let mut i = 0;
@@ -231,25 +232,24 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock) -> bool {
             continue;
         }
 
-        changed = true;
-
         // 将钉住的（不可下沉的）binding 合并回 remaining，按原始声明顺序
         // 排序，以保证输出的 `local` 列表确定且可读。
         remaining.extend(pinned);
         remaining.sort_by_key(|b| b.id);
 
+        // use/forward-goto 索引只对本轮 block 快照有效；改写后交给下一轮重建。
         if remaining.is_empty() {
             block.stmts.remove(index);
-            continue;
+            return true;
         }
 
         let AstStmt::LocalDecl(local_decl) = &mut block.stmts[index] else {
             unreachable!("hoisted temp decl scan must point at local decl");
         };
         local_decl.bindings = remaining;
-        index += 1;
+        return true;
     }
-    changed
+    false
 }
 
 struct NestedSinkAttempt {
@@ -350,17 +350,18 @@ fn try_sink_hoisted_decl_into_nested_stmt(
         return None;
     }
     let sinkable = &pending[..sinkable_len];
+    let sinkable_refs = BindingRefSet::from_bindings(sinkable);
 
     match stmt {
         AstStmt::If(if_stmt) => {
-            if expr_references_any_binding(&if_stmt.cond, sinkable) {
+            if expr_references_binding_set(&if_stmt.cond, &sinkable_refs) {
                 return None;
             }
-            let then_refs = block_references_any_binding(&if_stmt.then_block, sinkable);
+            let then_refs = block_references_binding_set(&if_stmt.then_block, &sinkable_refs);
             let else_refs = if_stmt
                 .else_block
                 .as_ref()
-                .is_some_and(|block| block_references_any_binding(block, sinkable));
+                .is_some_and(|block| block_references_binding_set(block, &sinkable_refs));
             if then_refs == else_refs {
                 return None;
             }
@@ -378,7 +379,7 @@ fn try_sink_hoisted_decl_into_nested_stmt(
             (consumed > 0).then_some((rewritten, consumed))
         }
         AstStmt::While(while_stmt) => {
-            if expr_references_any_binding(&while_stmt.cond, sinkable) {
+            if expr_references_binding_set(&while_stmt.cond, &sinkable_refs) {
                 return None;
             }
             let mut rewritten = stmt.clone();
@@ -389,7 +390,7 @@ fn try_sink_hoisted_decl_into_nested_stmt(
             (consumed > 0).then_some((rewritten, consumed))
         }
         AstStmt::Repeat(repeat_stmt) => {
-            if expr_references_any_binding(&repeat_stmt.cond, sinkable) {
+            if expr_references_binding_set(&repeat_stmt.cond, &sinkable_refs) {
                 return None;
             }
             let mut rewritten = stmt.clone();
@@ -400,9 +401,9 @@ fn try_sink_hoisted_decl_into_nested_stmt(
             (consumed > 0).then_some((rewritten, consumed))
         }
         AstStmt::NumericFor(numeric_for) => {
-            if expr_references_any_binding(&numeric_for.start, sinkable)
-                || expr_references_any_binding(&numeric_for.limit, sinkable)
-                || expr_references_any_binding(&numeric_for.step, sinkable)
+            if expr_references_binding_set(&numeric_for.start, &sinkable_refs)
+                || expr_references_binding_set(&numeric_for.limit, &sinkable_refs)
+                || expr_references_binding_set(&numeric_for.step, &sinkable_refs)
             {
                 return None;
             }
@@ -417,7 +418,7 @@ fn try_sink_hoisted_decl_into_nested_stmt(
             if generic_for
                 .iterator
                 .iter()
-                .any(|expr| expr_references_any_binding(expr, sinkable))
+                .any(|expr| expr_references_binding_set(expr, &sinkable_refs))
             {
                 return None;
             }
@@ -469,11 +470,12 @@ fn sink_pending_bindings_into_block(
     pending: &[super::super::common::AstLocalBinding],
 ) -> usize {
     let use_index = BindingUseIndex::for_stmts(&block.stmts);
+    let forward_gotos = ForwardGotoIndex::new(&block.stmts);
     let mut consumed = 0usize;
     let mut index = 0usize;
     while index < block.stmts.len() && consumed < pending.len() {
         let remaining = &pending[consumed..];
-        if block_has_forward_goto_past_index(&block.stmts, index) {
+        if forward_gotos.has_forward_goto_past_index(index) {
             index += 1;
             continue;
         }
@@ -497,7 +499,8 @@ fn sink_pending_bindings_into_block(
             index += 1;
             continue;
         }
-        if stmt_references_any_binding(&block.stmts[index], remaining) {
+        let remaining_refs = BindingRefSet::from_bindings(remaining);
+        if stmt_references_binding_set(&block.stmts[index], &remaining_refs) {
             // 该 binding 在此语句中被使用，但无法直接合并或下沉到嵌套块里
             // （例如在某个嵌套 `if` 内赋值但在后续兄弟节点中读取）。
             // 在此语句前插入裸 `local` 声明，使声明处于最窄的包围作用域。
@@ -694,10 +697,11 @@ fn stmt_references_any_binding_in_assign(
     assign: &super::super::common::AstAssign,
     bindings: &[super::super::common::AstLocalBinding],
 ) -> bool {
+    let refs = BindingRefSet::from_bindings(bindings);
     assign
         .values
         .iter()
-        .any(|value| expr_references_any_binding(value, bindings))
+        .any(|value| expr_references_binding_set(value, &refs))
 }
 
 fn is_mergeable_adjacent_local_value(expr: &super::super::common::AstExpr) -> bool {
@@ -705,57 +709,76 @@ fn is_mergeable_adjacent_local_value(expr: &super::super::common::AstExpr) -> bo
 }
 
 fn local_binding_matches_target(binding: AstBindingRef, target: &AstLValue) -> bool {
-    match (binding, target) {
-        (AstBindingRef::Local(local), AstLValue::Name(AstNameRef::Local(target_local))) => {
-            local == *target_local
+    matches!(target, AstLValue::Name(name) if binding.matches_name_ref(name))
+}
+
+struct ForwardGotoIndex {
+    has_forward_goto_past_index: Vec<bool>,
+}
+
+impl ForwardGotoIndex {
+    fn new(stmts: &[AstStmt]) -> Self {
+        let goto_targets_by_stmt = stmts.iter().map(collect_goto_targets).collect::<Vec<_>>();
+        let labels_by_stmt = stmts
+            .iter()
+            .map(|stmt| match stmt {
+                AstStmt::Label(label) => Some(label.id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        let mut future_labels: BTreeSet<AstLabelId> =
+            labels_by_stmt.iter().skip(1).flatten().copied().collect();
+        let mut prefix_goto_targets = BTreeSet::new();
+        let mut matched_forward_targets = 0usize;
+        let mut has_forward_goto_past_index = Vec::with_capacity(stmts.len());
+
+        for (index, targets) in goto_targets_by_stmt.iter().enumerate() {
+            has_forward_goto_past_index.push(matched_forward_targets > 0);
+
+            for target in targets {
+                if prefix_goto_targets.insert(*target) && future_labels.contains(target) {
+                    matched_forward_targets += 1;
+                }
+            }
+
+            if let Some(label) = labels_by_stmt.get(index + 1).and_then(|label| *label)
+                && future_labels.remove(&label)
+                && prefix_goto_targets.contains(&label)
+            {
+                matched_forward_targets -= 1;
+            }
         }
-        (
-            AstBindingRef::SyntheticLocal(local),
-            AstLValue::Name(AstNameRef::SyntheticLocal(target_local)),
-        ) => local == *target_local,
-        (AstBindingRef::Temp(temp), AstLValue::Name(AstNameRef::Temp(target_temp))) => {
-            temp == *target_temp
+
+        Self {
+            has_forward_goto_past_index,
         }
-        _ => false,
+    }
+
+    fn has_forward_goto_past_index(&self, index: usize) -> bool {
+        self.has_forward_goto_past_index
+            .get(index)
+            .copied()
+            .unwrap_or(false)
     }
 }
 
-fn block_has_forward_goto_past_index(stmts: &[AstStmt], index: usize) -> bool {
-    let future_labels = stmts[(index + 1)..]
-        .iter()
-        .filter_map(|stmt| match stmt {
-            AstStmt::Label(label) => Some(label.id),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
-    if future_labels.is_empty() {
-        return false;
-    }
-    stmts[..index]
-        .iter()
-        .any(|stmt| stmt_contains_goto_to_any(stmt, &future_labels))
-}
-
-fn stmt_contains_goto_to_any(stmt: &AstStmt, targets: &BTreeSet<AstLabelId>) -> bool {
-    let mut visitor = GotoTargetVisitor {
-        targets,
-        found: false,
+fn collect_goto_targets(stmt: &AstStmt) -> BTreeSet<AstLabelId> {
+    let mut visitor = GotoTargetCollector {
+        targets: BTreeSet::new(),
     };
     visit::visit_stmt(stmt, &mut visitor);
-    visitor.found
+    visitor.targets
 }
 
-struct GotoTargetVisitor<'a> {
-    targets: &'a BTreeSet<AstLabelId>,
-    found: bool,
+struct GotoTargetCollector {
+    targets: BTreeSet<AstLabelId>,
 }
 
-impl AstVisitor for GotoTargetVisitor<'_> {
+impl AstVisitor for GotoTargetCollector {
     fn visit_stmt(&mut self, stmt: &AstStmt) {
-        if let AstStmt::Goto(goto_stmt) = stmt
-            && self.targets.contains(&goto_stmt.target)
-        {
-            self.found = true;
+        if let AstStmt::Goto(goto_stmt) = stmt {
+            self.targets.insert(goto_stmt.target);
         }
     }
 

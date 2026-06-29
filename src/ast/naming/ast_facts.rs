@@ -54,16 +54,13 @@ impl FunctionAstCollector {
     }
 
     fn note_name_ref(&mut self, name: &AstNameRef) {
-        match name {
-            AstNameRef::Local(local) => self.note_binding(AstBindingRef::Local(*local)),
-            AstNameRef::SyntheticLocal(local) => {
-                self.note_binding(AstBindingRef::SyntheticLocal(*local));
-                self.mentioned_synthetic_locals.insert(*local);
+        match AstBindingRef::from_name_ref(name) {
+            Some(AstBindingRef::Local(local)) => self.note_binding(AstBindingRef::Local(local)),
+            Some(AstBindingRef::SyntheticLocal(local)) => {
+                self.note_binding(AstBindingRef::SyntheticLocal(local));
+                self.mentioned_synthetic_locals.insert(local);
             }
-            AstNameRef::Param(_)
-            | AstNameRef::Temp(_)
-            | AstNameRef::Upvalue(_)
-            | AstNameRef::Global(_) => {}
+            Some(AstBindingRef::Temp(_)) | None => {}
         }
     }
 

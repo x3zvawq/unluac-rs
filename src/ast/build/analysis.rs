@@ -164,7 +164,10 @@ fn collect_referenced_temps_in_lvalue(target: &HirLValue, temps: &mut Referenced
             collect_referenced_temps_in_expr(&access.base, temps);
             collect_referenced_temps_in_expr(&access.key, temps);
         }
-        HirLValue::Local(_) | HirLValue::Upvalue(_) | HirLValue::Global(_) => {}
+        HirLValue::Param(_)
+        | HirLValue::Local(_)
+        | HirLValue::Upvalue(_)
+        | HirLValue::Global(_) => {}
     }
 }
 

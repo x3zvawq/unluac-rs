@@ -18,7 +18,7 @@ use super::ReadabilityContext;
 use super::binding_flow::name_matches_binding;
 use super::binding_tree::{
     call_references_binding, expr_references_binding, lvalue_references_binding,
-    rewrite_binding_in_stmt, stmt_captures_binding,
+    rewrite_binding_in_stmt, stmt_captures_binding, stmt_references_or_captures_binding,
 };
 use super::walk::{self, AstRewritePass, BlockKind};
 
@@ -115,14 +115,12 @@ fn find_later_seed_local(
     carried_index: usize,
     carried: AstBindingRef,
 ) -> Option<(usize, AstBindingRef)> {
+    let mut prior_seed_decl_mentions_carried = false;
     for seed_index in carried_index + 1..stmts.len() {
         let AstStmt::LocalDecl(_) = &stmts[seed_index] else {
             break;
         };
-        if stmts[(carried_index + 1)..seed_index]
-            .iter()
-            .any(|stmt| stmt_mentions_binding(stmt, carried))
-        {
+        if prior_seed_decl_mentions_carried {
             return None;
         }
         for seed in initialized_local_decl_bindings(&stmts[seed_index]) {
@@ -131,6 +129,8 @@ fn find_later_seed_local(
                 return Some((seed_index, seed));
             }
         }
+        prior_seed_decl_mentions_carried |=
+            stmt_references_or_captures_binding(&stmts[seed_index], carried);
     }
     None
 }
@@ -140,6 +140,11 @@ fn tail_has_structured_carried_writeback(
     seed: AstBindingRef,
     carried: AstBindingRef,
 ) -> bool {
+    if stmts.len() < 2 {
+        return false;
+    }
+
+    let carried_mentions = BindingMentionSpans::new(stmts, carried);
     for index in 0..stmts.len().saturating_sub(1) {
         let AstStmt::If(if_stmt) = &stmts[index] else {
             continue;
@@ -148,12 +153,8 @@ fn tail_has_structured_carried_writeback(
             continue;
         };
         if !is_supported_seed_writeback_assign(writeback, seed, carried)
-            || stmts[..index]
-                .iter()
-                .any(|stmt| stmt_mentions_binding(stmt, carried))
-            || stmts[(index + 2)..]
-                .iter()
-                .any(|stmt| stmt_mentions_binding(stmt, carried))
+            || carried_mentions.has_before(index)
+            || carried_mentions.has_from(index + 2)
             || !if_branches_end_with_carried_assign(if_stmt, carried)
         {
             continue;
@@ -161,6 +162,42 @@ fn tail_has_structured_carried_writeback(
         return true;
     }
     false
+}
+
+struct BindingMentionSpans {
+    prefix_before: Vec<bool>,
+    suffix_from: Vec<bool>,
+}
+
+impl BindingMentionSpans {
+    fn new(stmts: &[AstStmt], binding: AstBindingRef) -> Self {
+        let mut prefix_before = Vec::with_capacity(stmts.len() + 1);
+        prefix_before.push(false);
+        for stmt in stmts {
+            let mentions_binding = stmt_references_or_captures_binding(stmt, binding);
+            let previous = prefix_before.last().copied().unwrap_or(false);
+            prefix_before.push(previous || mentions_binding);
+        }
+
+        let mut suffix_from = vec![false; stmts.len() + 1];
+        for (index, stmt) in stmts.iter().enumerate().rev() {
+            suffix_from[index] =
+                suffix_from[index + 1] || stmt_references_or_captures_binding(stmt, binding);
+        }
+
+        Self {
+            prefix_before,
+            suffix_from,
+        }
+    }
+
+    fn has_before(&self, index: usize) -> bool {
+        self.prefix_before[index]
+    }
+
+    fn has_from(&self, index: usize) -> bool {
+        self.suffix_from[index]
+    }
 }
 
 fn if_branches_end_with_carried_assign(
@@ -180,7 +217,7 @@ fn block_ends_with_carried_assign(block: &AstBlock, carried: AstBindingRef) -> b
     };
     prefix
         .iter()
-        .all(|stmt| !stmt_mentions_binding(stmt, carried))
+        .all(|stmt| !stmt_references_or_captures_binding(stmt, carried))
         && matches!(last, AstStmt::Assign(assign) if is_direct_carried_store(assign, carried))
 }
 
@@ -447,99 +484,6 @@ fn is_exact_seed_copy_assign(
         return false;
     };
     name_matches_binding(target, carried) && name_matches_binding(value, seed)
-}
-
-fn stmt_mentions_binding(stmt: &AstStmt, binding: AstBindingRef) -> bool {
-    if stmt_captures_binding(stmt, binding) {
-        return true;
-    }
-
-    match stmt {
-        AstStmt::LocalDecl(local_decl) => local_decl
-            .values
-            .iter()
-            .any(|value| expr_references_binding(value, binding)),
-        AstStmt::GlobalDecl(global_decl) => global_decl
-            .values
-            .iter()
-            .any(|value| expr_references_binding(value, binding)),
-        AstStmt::Assign(assign) => {
-            assign
-                .targets
-                .iter()
-                .any(|target| lvalue_references_binding(target, binding))
-                || assign
-                    .values
-                    .iter()
-                    .any(|value| expr_references_binding(value, binding))
-        }
-        AstStmt::CallStmt(call_stmt) => call_references_binding(&call_stmt.call, binding),
-        AstStmt::Return(ret) => ret
-            .values
-            .iter()
-            .any(|value| expr_references_binding(value, binding)),
-        AstStmt::If(if_stmt) => {
-            expr_references_binding(&if_stmt.cond, binding)
-                || if_stmt
-                    .then_block
-                    .stmts
-                    .iter()
-                    .any(|stmt| stmt_mentions_binding(stmt, binding))
-                || if_stmt.else_block.as_ref().is_some_and(|block| {
-                    block
-                        .stmts
-                        .iter()
-                        .any(|stmt| stmt_mentions_binding(stmt, binding))
-                })
-        }
-        AstStmt::While(while_stmt) => {
-            expr_references_binding(&while_stmt.cond, binding)
-                || while_stmt
-                    .body
-                    .stmts
-                    .iter()
-                    .any(|stmt| stmt_mentions_binding(stmt, binding))
-        }
-        AstStmt::Repeat(repeat_stmt) => {
-            repeat_stmt
-                .body
-                .stmts
-                .iter()
-                .any(|stmt| stmt_mentions_binding(stmt, binding))
-                || expr_references_binding(&repeat_stmt.cond, binding)
-        }
-        AstStmt::NumericFor(numeric_for) => {
-            expr_references_binding(&numeric_for.start, binding)
-                || expr_references_binding(&numeric_for.limit, binding)
-                || expr_references_binding(&numeric_for.step, binding)
-                || numeric_for
-                    .body
-                    .stmts
-                    .iter()
-                    .any(|stmt| stmt_mentions_binding(stmt, binding))
-        }
-        AstStmt::GenericFor(generic_for) => {
-            generic_for
-                .iterator
-                .iter()
-                .any(|expr| expr_references_binding(expr, binding))
-                || generic_for
-                    .body
-                    .stmts
-                    .iter()
-                    .any(|stmt| stmt_mentions_binding(stmt, binding))
-        }
-        AstStmt::DoBlock(block) => block
-            .stmts
-            .iter()
-            .any(|stmt| stmt_mentions_binding(stmt, binding)),
-        AstStmt::FunctionDecl(_) | AstStmt::LocalFunctionDecl(_) => false,
-        AstStmt::Break
-        | AstStmt::Continue
-        | AstStmt::Goto(_)
-        | AstStmt::Label(_)
-        | AstStmt::Error(_) => false,
-    }
 }
 
 fn assign_targets_binding(assign: &AstAssign, binding: AstBindingRef) -> bool {

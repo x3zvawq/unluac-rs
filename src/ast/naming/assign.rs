@@ -28,8 +28,8 @@ pub(crate) fn assign_names(
     state: &mut DecompileState,
     context: &DecompileContext<'_>,
 ) -> Result<(), DecompileError> {
-    let readability = state.readability.as_ref().unwrap();
-    let hir = state.hir.as_ref().unwrap();
+    let readability = state.require_readability()?;
+    let hir = state.require_hir()?;
     state.naming = Some(assign_name_map(readability, hir, context.options.naming)?);
     Ok(())
 }

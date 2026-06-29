@@ -10,7 +10,7 @@ use crate::ast::ReadabilityOptions;
 use super::super::common::{AstBlock, AstExpr, AstLocalAttr, AstLocalOrigin, AstModule, AstStmt};
 use super::ReadabilityContext;
 use super::binding_flow::{
-    count_binding_uses_in_stmt, count_binding_uses_in_stmts, name_matches_binding,
+    BindingUseIndex, count_binding_uses_in_stmt, count_binding_uses_in_stmts, name_matches_binding,
 };
 use super::binding_tree::{
     binding_from_name_ref, count_name_expr_uses, replace_binding_use_in_expr,
@@ -45,6 +45,7 @@ impl AstRewritePass for LoopHeaderMergePass {
         }
 
         let old_stmts = std::mem::take(&mut block.stmts);
+        let use_index = BindingUseIndex::for_stmts(&old_stmts);
         let mut new_stmts = Vec::with_capacity(old_stmts.len());
         let mut index = 0;
         while index < old_stmts.len() {
@@ -72,21 +73,14 @@ impl AstRewritePass for LoopHeaderMergePass {
                 if !is_loop_header_inline_expr(value, self.options) {
                     continue;
                 }
-                if count_binding_uses_in_stmts(
-                    &old_stmts[(candidate_index + 1)..(run_end + 1)],
-                    binding.id,
-                ) != 1
+                if use_index.count_uses_in_range(candidate_index + 1, run_end + 1, binding.id) != 1
                 {
                     continue;
                 }
-                if count_binding_uses_in_stmts(&old_stmts[(run_end + 1)..], binding.id) != 0 {
+                if use_index.count_uses_in_suffix(run_end + 1, binding.id) != 0 {
                     continue;
                 }
-                if count_binding_uses_in_stmts(
-                    &old_stmts[(candidate_index + 1)..run_end],
-                    binding.id,
-                ) != 0
-                {
+                if use_index.count_uses_in_range(candidate_index + 1, run_end, binding.id) != 0 {
                     continue;
                 }
                 if !header_uses_binding_exactly_once(&rewritten_loop, binding.id) {

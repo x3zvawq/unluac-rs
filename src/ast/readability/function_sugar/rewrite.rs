@@ -9,6 +9,8 @@
 use std::collections::BTreeSet;
 
 use super::super::ReadabilityContext;
+use super::super::binding_flow::BindingUseIndex;
+use super::super::binding_ref::name_ref_from_binding;
 use super::analysis::{collect_method_field_names, collect_method_field_names_in_block};
 use super::chain::try_chain_local_method_call_stmt;
 use super::constructor::{
@@ -19,8 +21,8 @@ use super::forwarded::try_lower_forwarded_function_stmt;
 use super::method_alias::try_recover_method_alias_stmt;
 use crate::ast::common::{
     AstAssign, AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue,
-    AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstModule, AstNameRef, AstStmt,
-    AstTableField, AstTableKey, AstTargetDialect,
+    AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstModule, AstStmt, AstTableField,
+    AstTableKey, AstTargetDialect,
 };
 
 pub(in crate::ast::readability) fn apply(
@@ -42,6 +44,7 @@ fn rewrite_block(
     }
 
     let old_stmts = std::mem::take(&mut block.stmts);
+    let use_index = BindingUseIndex::for_stmts_deep(&old_stmts);
 
     // 收集互递归/前向声明组：如果某个 local-closure 声明捕获了后面才声明的 binding，
     // 该组的所有成员都不能用 `local function` 语法。
@@ -59,22 +62,8 @@ fn rewrite_block(
         }
 
         if let Some((stmt, consumed)) =
-            try_inline_terminal_constructor_call(&old_stmts[index..], method_fields)
+            try_inline_terminal_constructor_call(&old_stmts[index..], &use_index, index)
         {
-            new_stmts.push(stmt);
-            changed = true;
-            index += consumed;
-            continue;
-        }
-
-        if let Some((stmt, consumed)) = try_recover_method_alias_stmt(&old_stmts[index..]) {
-            new_stmts.push(stmt);
-            changed = true;
-            index += consumed;
-            continue;
-        }
-
-        if let Some((stmt, consumed)) = try_chain_local_method_call_stmt(&old_stmts[index..]) {
             new_stmts.push(stmt);
             changed = true;
             index += consumed;
@@ -82,8 +71,30 @@ fn rewrite_block(
         }
 
         if let Some((stmt, consumed)) =
-            try_lower_forwarded_function_stmt(&old_stmts[index..], target, method_fields)
+            try_recover_method_alias_stmt(&old_stmts[index..], &use_index, index)
         {
+            new_stmts.push(stmt);
+            changed = true;
+            index += consumed;
+            continue;
+        }
+
+        if let Some((stmt, consumed)) =
+            try_chain_local_method_call_stmt(&old_stmts[index..], &use_index, index)
+        {
+            new_stmts.push(stmt);
+            changed = true;
+            index += consumed;
+            continue;
+        }
+
+        if let Some((stmt, consumed)) = try_lower_forwarded_function_stmt(
+            &old_stmts[index..],
+            &use_index,
+            index,
+            target,
+            method_fields,
+        ) {
             new_stmts.push(stmt);
             changed = true;
             index += consumed;
@@ -347,7 +358,7 @@ fn split_forward_capture_locals(
                     unreachable!();
                 };
                 let binding_ref = local_decl.bindings[0].id;
-                let lvalue = AstLValue::Name(name_ref_from_binding_ref(binding_ref));
+                let lvalue = AstLValue::Name(name_ref_from_binding(binding_ref));
                 AstStmt::Assign(Box::new(AstAssign {
                     targets: vec![lvalue],
                     values: local_decl.values.clone(),
@@ -365,14 +376,6 @@ fn split_forward_capture_locals(
         i = group_start + 1 + group_len;
     }
     changed
-}
-
-fn name_ref_from_binding_ref(binding: AstBindingRef) -> AstNameRef {
-    match binding {
-        AstBindingRef::Local(id) => AstNameRef::Local(id),
-        AstBindingRef::SyntheticLocal(id) => AstNameRef::SyntheticLocal(id),
-        AstBindingRef::Temp(id) => AstNameRef::Temp(id),
-    }
 }
 
 /// 从一条 stmt 中提取它声明的 local bindings 和 closure 的 captured_bindings。

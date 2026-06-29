@@ -105,6 +105,7 @@ impl<'a> AstLowerer<'a> {
         target: &HirLValue,
     ) -> Result<AstLValue, AstLowerError> {
         Ok(match target {
+            HirLValue::Param(param) => AstLValue::Name(AstNameRef::Param(*param)),
             HirLValue::Temp(temp) => AstLValue::Name(AstNameRef::Temp(*temp)),
             HirLValue::Local(local) => AstLValue::Name(AstNameRef::Local(*local)),
             HirLValue::Upvalue(upvalue) => AstLValue::Name(AstNameRef::Upvalue(*upvalue)),

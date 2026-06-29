@@ -81,7 +81,7 @@ fn collect_stmt_hints(
             }
             if let ([AstLValue::Name(name)], [value]) =
                 (assign.targets.as_slice(), assign.values.as_slice())
-                && let Some(binding) = binding_from_name_ref(name)
+                && let Some(binding) = final_binding_from_name_ref(name)
             {
                 record_binding_presence(function, binding, hints);
                 register_binding_expr_hint(function, binding, value, hints);
@@ -445,15 +445,12 @@ fn singularize_field_name(field: &str) -> String {
     normalize_identifier(&singular).unwrap_or_else(|| "item".to_owned())
 }
 
-fn binding_from_name_ref(name: &AstNameRef) -> Option<AstBindingRef> {
-    match name {
-        AstNameRef::Local(local) => Some(AstBindingRef::Local(*local)),
-        AstNameRef::SyntheticLocal(local) => Some(AstBindingRef::SyntheticLocal(*local)),
-        AstNameRef::Temp(_) => {
-            unreachable!("readability output must not leak raw temp refs into naming")
-        }
-        AstNameRef::Param(_) | AstNameRef::Upvalue(_) | AstNameRef::Global(_) => None,
+fn final_binding_from_name_ref(name: &AstNameRef) -> Option<AstBindingRef> {
+    let binding = AstBindingRef::from_name_ref(name);
+    if matches!(binding, Some(AstBindingRef::Temp(_))) {
+        unreachable!("readability output must not leak raw temp refs into naming");
     }
+    binding
 }
 
 fn numeric_loop_name(depth: usize) -> &'static str {

@@ -6,6 +6,7 @@
 //! - 只在前层事实已经足够稳定时，做源码可读性层面的保守整形
 
 mod binding_flow;
+mod binding_ref;
 mod binding_tree;
 mod branch_pretty;
 mod cleanup;
@@ -19,7 +20,6 @@ mod local_coalesce;
 mod loop_header_merge;
 mod luajit_goto_safety;
 mod materialize_temps;
-mod param_alias_coalesce;
 mod short_circuit_pretty;
 mod statement_merge;
 mod traverse;
@@ -127,12 +127,6 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
         invalidates: &[StatementAdjacency, BindingStructure],
     },
     PassDescriptor {
-        name: "param-alias-coalesce",
-        phase: PassPhase::Normal,
-        depends_on: &[BindingStructure],
-        invalidates: &[StatementAdjacency, BindingStructure, ExprShape],
-    },
-    PassDescriptor {
         name: "statement-merge",
         phase: PassPhase::Normal,
         depends_on: &[StatementAdjacency, ControlFlowShape],
@@ -210,9 +204,6 @@ const PASS_ENTRIES: &[ReadabilityPassEntry] = &[
         apply: local_coalesce::apply,
     },
     ReadabilityPassEntry {
-        apply: param_alias_coalesce::apply,
-    },
-    ReadabilityPassEntry {
         apply: statement_merge::apply,
     },
     ReadabilityPassEntry {
@@ -254,7 +245,7 @@ pub(crate) fn make_readable(
     state: &mut DecompileState,
     context: &DecompileContext<'_>,
 ) -> Result<(), DecompileError> {
-    let ast = state.ast.as_ref().unwrap();
+    let ast = state.require_ast()?;
     state.readability = Some(make_readable_module(
         ast,
         context.requested_target,

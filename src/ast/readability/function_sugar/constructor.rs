@@ -12,9 +12,8 @@
 //! 这里不会去猜任意跨语句的数据流；只有“构造器 local -> 构造器字段接线 -> 终端返回/终端局部初始化”
 //! 这一整段都还保持机械脚手架形状时，才会收回源码结构。
 
-use std::collections::BTreeSet;
-
-use super::super::binding_flow::{count_binding_uses_in_stmts_deep, name_matches_binding};
+use super::super::binding_flow::{BindingUseIndex, name_matches_binding};
+use super::super::binding_tree::binding_from_name_ref;
 use crate::ast::common::{
     AstAssign, AstBindingRef, AstExpr, AstFieldAccess, AstFunctionExpr, AstFunctionName, AstLValue,
     AstLocalAttr, AstLocalDecl, AstReturn, AstStmt, AstTableField, AstTableKey,
@@ -76,7 +75,8 @@ pub(super) fn try_inline_terminal_constructor_fields(
 
 pub(super) fn try_inline_terminal_constructor_call(
     stmts: &[AstStmt],
-    _method_fields: &BTreeSet<String>,
+    use_index: &BindingUseIndex,
+    stmt_base: usize,
 ) -> Option<(AstStmt, usize)> {
     let (callee_binding, callee_expr) = single_local_alias_decl(stmts.first()?)?;
     let mut consumed = 1usize;
@@ -114,7 +114,8 @@ pub(super) fn try_inline_terminal_constructor_call(
         rewrite_terminal_constructor_call_sink(sink, callee_binding, callee_expr, &arg_locals)?;
     if !matches!(sink, AstStmt::Return(_))
         && !removed_constructor_locals_are_dead_after_sink(
-            stmts.get((consumed + 1)..).unwrap_or_default(),
+            use_index,
+            stmt_base + consumed + 1,
             callee_binding,
             &arg_locals,
         )
@@ -275,23 +276,10 @@ fn inlineable_nested_table_assign(
         return None;
     };
     Some((
-        binding_from_name(outer_name)?,
+        binding_from_name_ref(outer_name)?,
         access.field.clone(),
-        binding_from_name(inner_name)?,
+        binding_from_name_ref(inner_name)?,
     ))
-}
-
-fn binding_from_name(name: &crate::ast::common::AstNameRef) -> Option<AstBindingRef> {
-    match name {
-        crate::ast::common::AstNameRef::Local(local) => Some(AstBindingRef::Local(*local)),
-        crate::ast::common::AstNameRef::SyntheticLocal(local) => {
-            Some(AstBindingRef::SyntheticLocal(*local))
-        }
-        crate::ast::common::AstNameRef::Temp(temp) => Some(AstBindingRef::Temp(*temp)),
-        crate::ast::common::AstNameRef::Param(_)
-        | crate::ast::common::AstNameRef::Upvalue(_)
-        | crate::ast::common::AstNameRef::Global(_) => None,
-    }
 }
 
 fn rewrite_terminal_constructor_call_sink(
@@ -363,14 +351,15 @@ fn rewrite_terminal_constructor_call_expr(
 }
 
 fn removed_constructor_locals_are_dead_after_sink(
-    tail: &[AstStmt],
+    use_index: &BindingUseIndex,
+    suffix_start: usize,
     callee_binding: AstBindingRef,
     arg_locals: &[ConstructorArg],
 ) -> bool {
-    if count_binding_uses_in_stmts_deep(tail, callee_binding) != 0 {
+    if use_index.count_uses_in_suffix(suffix_start, callee_binding) != 0 {
         return false;
     }
     arg_locals
         .iter()
-        .all(|arg| count_binding_uses_in_stmts_deep(tail, arg.binding) == 0)
+        .all(|arg| use_index.count_uses_in_suffix(suffix_start, arg.binding) == 0)
 }

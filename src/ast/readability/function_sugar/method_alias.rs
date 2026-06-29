@@ -8,21 +8,29 @@
 //!
 //! 它不会去猜更模糊的任意等价调用，也不会越权给 AST build 没表达清楚的 call 形状兜底。
 
-use super::super::binding_flow::{count_binding_uses_in_stmts_deep, name_matches_binding};
+use super::super::binding_flow::{BindingUseIndex, name_matches_binding};
 use crate::ast::common::{
     AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstExpr, AstFieldAccess, AstGlobalDecl,
     AstIf, AstIndexAccess, AstLocalAttr, AstLogicalExpr, AstMethodCallExpr, AstRepeat, AstReturn,
     AstStmt, AstTableConstructor, AstTableField, AstTableKey, AstUnaryExpr, AstWhile,
 };
 
-pub(super) fn try_recover_method_alias_stmt(stmts: &[AstStmt]) -> Option<(AstStmt, usize)> {
-    try_recover_with_receiver_alias(stmts)
-        .or_else(|| try_recover_receiver_alias_direct_method_call(stmts))
-        .or_else(|| try_recover_direct_receiver(stmts))
+pub(super) fn try_recover_method_alias_stmt(
+    stmts: &[AstStmt],
+    use_index: &BindingUseIndex,
+    stmt_base: usize,
+) -> Option<(AstStmt, usize)> {
+    try_recover_with_receiver_alias(stmts, use_index, stmt_base)
+        .or_else(|| try_recover_receiver_alias_direct_method_call(stmts, use_index, stmt_base))
+        .or_else(|| try_recover_direct_receiver(stmts, use_index, stmt_base))
         .or_else(|| try_recover_direct_method_call_stmt(stmts))
 }
 
-fn try_recover_with_receiver_alias(stmts: &[AstStmt]) -> Option<(AstStmt, usize)> {
+fn try_recover_with_receiver_alias(
+    stmts: &[AstStmt],
+    use_index: &BindingUseIndex,
+    stmt_base: usize,
+) -> Option<(AstStmt, usize)> {
     let [receiver_alias, field_alias, sink, ..] = stmts else {
         return None;
     };
@@ -34,8 +42,8 @@ fn try_recover_with_receiver_alias(stmts: &[AstStmt]) -> Option<(AstStmt, usize)
     if !name_matches_binding(receiver_name, receiver_binding) {
         return None;
     }
-    if count_binding_uses_in_stmts_deep(&stmts[1..], receiver_binding) != 2
-        || count_binding_uses_in_stmts_deep(&stmts[2..], field_binding) != 1
+    if use_index.count_uses_in_suffix(stmt_base + 1, receiver_binding) != 2
+        || use_index.count_uses_in_suffix(stmt_base + 2, field_binding) != 1
     {
         return None;
     }
@@ -52,7 +60,11 @@ fn try_recover_with_receiver_alias(stmts: &[AstStmt]) -> Option<(AstStmt, usize)
     ))
 }
 
-fn try_recover_direct_receiver(stmts: &[AstStmt]) -> Option<(AstStmt, usize)> {
+fn try_recover_direct_receiver(
+    stmts: &[AstStmt],
+    use_index: &BindingUseIndex,
+    stmt_base: usize,
+) -> Option<(AstStmt, usize)> {
     let [field_alias, sink, ..] = stmts else {
         return None;
     };
@@ -60,7 +72,7 @@ fn try_recover_direct_receiver(stmts: &[AstStmt]) -> Option<(AstStmt, usize)> {
     let AstExpr::Var(receiver_name) = &field_access.base else {
         return None;
     };
-    if count_binding_uses_in_stmts_deep(&stmts[1..], field_binding) != 1 {
+    if use_index.count_uses_in_suffix(stmt_base + 1, field_binding) != 1 {
         return None;
     }
 
@@ -76,12 +88,16 @@ fn try_recover_direct_receiver(stmts: &[AstStmt]) -> Option<(AstStmt, usize)> {
     ))
 }
 
-fn try_recover_receiver_alias_direct_method_call(stmts: &[AstStmt]) -> Option<(AstStmt, usize)> {
+fn try_recover_receiver_alias_direct_method_call(
+    stmts: &[AstStmt],
+    use_index: &BindingUseIndex,
+    stmt_base: usize,
+) -> Option<(AstStmt, usize)> {
     let [receiver_alias, sink, ..] = stmts else {
         return None;
     };
     let (receiver_binding, receiver_expr) = single_local_alias_decl(receiver_alias)?;
-    if count_binding_uses_in_stmts_deep(&stmts[1..], receiver_binding) != 1 {
+    if use_index.count_uses_in_suffix(stmt_base + 1, receiver_binding) != 1 {
         return None;
     }
 
@@ -174,7 +190,21 @@ fn recover_method_call_expr(
     receiver: &AstExpr,
     receiver_matches: &dyn Fn(&AstExpr) -> bool,
 ) -> Option<AstExpr> {
-    rewrite_single_method_alias_use(expr, callee_binding, method, receiver, receiver_matches)
+    rewrite_method_call_expr_nested(expr, |expr| {
+        if let AstExpr::Call(call) = expr
+            && let Some(method_call) = recover_method_call(
+                call,
+                callee_binding,
+                method.to_owned(),
+                receiver.clone(),
+                receiver_matches,
+            )
+        {
+            return Some(AstExpr::MethodCall(Box::new(method_call)));
+        }
+
+        None
+    })
 }
 
 fn recover_method_call(
@@ -201,286 +231,6 @@ fn recover_method_call(
         method,
         args: args.to_vec(),
     })
-}
-
-fn rewrite_single_method_alias_use(
-    expr: &AstExpr,
-    callee_binding: AstBindingRef,
-    method: &str,
-    receiver: &AstExpr,
-    receiver_matches: &dyn Fn(&AstExpr) -> bool,
-) -> Option<AstExpr> {
-    match expr {
-        AstExpr::Call(call) => {
-            if let Some(method_call) = recover_method_call(
-                call,
-                callee_binding,
-                method.to_owned(),
-                receiver.clone(),
-                receiver_matches,
-            ) {
-                return Some(AstExpr::MethodCall(Box::new(method_call)));
-            }
-
-            if let Some(callee) = rewrite_single_method_alias_use(
-                &call.callee,
-                callee_binding,
-                method,
-                receiver,
-                receiver_matches,
-            ) {
-                return Some(AstExpr::Call(Box::new(AstCallExpr {
-                    callee,
-                    args: call.args.clone(),
-                })));
-            }
-
-            for (index, arg) in call.args.iter().enumerate() {
-                let Some(rewritten_arg) = rewrite_single_method_alias_use(
-                    arg,
-                    callee_binding,
-                    method,
-                    receiver,
-                    receiver_matches,
-                ) else {
-                    continue;
-                };
-                let mut args = call.args.clone();
-                args[index] = rewritten_arg;
-                return Some(AstExpr::Call(Box::new(AstCallExpr {
-                    callee: call.callee.clone(),
-                    args,
-                })));
-            }
-
-            None
-        }
-        AstExpr::MethodCall(call) => {
-            if let Some(rewritten_receiver) = rewrite_single_method_alias_use(
-                &call.receiver,
-                callee_binding,
-                method,
-                receiver,
-                receiver_matches,
-            ) {
-                return Some(AstExpr::MethodCall(Box::new(AstMethodCallExpr {
-                    receiver: rewritten_receiver,
-                    method: call.method.clone(),
-                    args: call.args.clone(),
-                })));
-            }
-
-            for (index, arg) in call.args.iter().enumerate() {
-                let Some(rewritten_arg) = rewrite_single_method_alias_use(
-                    arg,
-                    callee_binding,
-                    method,
-                    receiver,
-                    receiver_matches,
-                ) else {
-                    continue;
-                };
-                let mut args = call.args.clone();
-                args[index] = rewritten_arg;
-                return Some(AstExpr::MethodCall(Box::new(AstMethodCallExpr {
-                    receiver: call.receiver.clone(),
-                    method: call.method.clone(),
-                    args,
-                })));
-            }
-
-            None
-        }
-        AstExpr::Unary(unary) => Some(AstExpr::Unary(Box::new(AstUnaryExpr {
-            op: unary.op,
-            expr: rewrite_single_method_alias_use(
-                &unary.expr,
-                callee_binding,
-                method,
-                receiver,
-                receiver_matches,
-            )?,
-        }))),
-        AstExpr::Binary(binary) => rewrite_binary_like_expr(
-            &binary.lhs,
-            &binary.rhs,
-            callee_binding,
-            method,
-            receiver,
-            receiver_matches,
-            |lhs, rhs| {
-                AstExpr::Binary(Box::new(crate::ast::common::AstBinaryExpr {
-                    op: binary.op,
-                    lhs,
-                    rhs,
-                }))
-            },
-        ),
-        AstExpr::LogicalAnd(logical) => rewrite_binary_like_expr(
-            &logical.lhs,
-            &logical.rhs,
-            callee_binding,
-            method,
-            receiver,
-            receiver_matches,
-            |lhs, rhs| AstExpr::LogicalAnd(Box::new(AstLogicalExpr { lhs, rhs })),
-        ),
-        AstExpr::LogicalOr(logical) => rewrite_binary_like_expr(
-            &logical.lhs,
-            &logical.rhs,
-            callee_binding,
-            method,
-            receiver,
-            receiver_matches,
-            |lhs, rhs| AstExpr::LogicalOr(Box::new(AstLogicalExpr { lhs, rhs })),
-        ),
-        AstExpr::FieldAccess(access) => Some(AstExpr::FieldAccess(Box::new(AstFieldAccess {
-            base: rewrite_single_method_alias_use(
-                &access.base,
-                callee_binding,
-                method,
-                receiver,
-                receiver_matches,
-            )?,
-            field: access.field.clone(),
-        }))),
-        AstExpr::IndexAccess(access) => {
-            if let Some(base) = rewrite_single_method_alias_use(
-                &access.base,
-                callee_binding,
-                method,
-                receiver,
-                receiver_matches,
-            ) {
-                return Some(AstExpr::IndexAccess(Box::new(AstIndexAccess {
-                    base,
-                    index: access.index.clone(),
-                })));
-            }
-            Some(AstExpr::IndexAccess(Box::new(AstIndexAccess {
-                base: access.base.clone(),
-                index: rewrite_single_method_alias_use(
-                    &access.index,
-                    callee_binding,
-                    method,
-                    receiver,
-                    receiver_matches,
-                )?,
-            })))
-        }
-        AstExpr::SingleValue(inner) => Some(AstExpr::SingleValue(Box::new(
-            rewrite_single_method_alias_use(
-                inner,
-                callee_binding,
-                method,
-                receiver,
-                receiver_matches,
-            )?,
-        ))),
-        AstExpr::TableConstructor(table) => rewrite_table_constructor_expr(
-            table,
-            callee_binding,
-            method,
-            receiver,
-            receiver_matches,
-        ),
-        AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::Var(_)
-        | AstExpr::VarArg
-        | AstExpr::FunctionExpr(_)
-        | AstExpr::Error(_) => None,
-    }
-}
-
-fn rewrite_binary_like_expr(
-    lhs: &AstExpr,
-    rhs: &AstExpr,
-    callee_binding: AstBindingRef,
-    method: &str,
-    receiver: &AstExpr,
-    receiver_matches: &dyn Fn(&AstExpr) -> bool,
-    make_expr: impl FnOnce(AstExpr, AstExpr) -> AstExpr,
-) -> Option<AstExpr> {
-    if let Some(rewritten_lhs) =
-        rewrite_single_method_alias_use(lhs, callee_binding, method, receiver, receiver_matches)
-    {
-        return Some(make_expr(rewritten_lhs, rhs.clone()));
-    }
-
-    Some(make_expr(
-        lhs.clone(),
-        rewrite_single_method_alias_use(rhs, callee_binding, method, receiver, receiver_matches)?,
-    ))
-}
-
-fn rewrite_table_constructor_expr(
-    table: &AstTableConstructor,
-    callee_binding: AstBindingRef,
-    method: &str,
-    receiver: &AstExpr,
-    receiver_matches: &dyn Fn(&AstExpr) -> bool,
-) -> Option<AstExpr> {
-    table
-        .fields
-        .iter()
-        .enumerate()
-        .find_map(|(index, field)| match field {
-            AstTableField::Array(value) => rewrite_single_method_alias_use(
-                value,
-                callee_binding,
-                method,
-                receiver,
-                receiver_matches,
-            )
-            .map(|rewritten_value| {
-                rebuild_table_with_field(table, index, AstTableField::Array(rewritten_value))
-            }),
-            AstTableField::Record(field) => {
-                if let AstTableKey::Expr(key) = &field.key
-                    && let Some(rewritten_key) = rewrite_single_method_alias_use(
-                        key,
-                        callee_binding,
-                        method,
-                        receiver,
-                        receiver_matches,
-                    )
-                {
-                    return Some(rebuild_table_with_field(
-                        table,
-                        index,
-                        AstTableField::Record(crate::ast::common::AstRecordField {
-                            key: AstTableKey::Expr(rewritten_key),
-                            value: field.value.clone(),
-                        }),
-                    ));
-                }
-
-                rewrite_single_method_alias_use(
-                    &field.value,
-                    callee_binding,
-                    method,
-                    receiver,
-                    receiver_matches,
-                )
-                .map(|rewritten_value| {
-                    rebuild_table_with_field(
-                        table,
-                        index,
-                        AstTableField::Record(crate::ast::common::AstRecordField {
-                            key: field.key.clone(),
-                            value: rewritten_value,
-                        }),
-                    )
-                })
-            }
-        })
 }
 
 fn try_recover_direct_method_call_stmt(stmts: &[AstStmt]) -> Option<(AstStmt, usize)> {

@@ -11,6 +11,8 @@
 //! - `if cond then return end else tail()` 会拉平成 `if cond then return end; tail()`
 //! - `if exit then goto L1 end; body; ::L1:: tail` 会收成 `if not exit then body end; tail`
 //! - `if cond then a(); goto L1 end; b(); ::L1::` 会收成 `if cond then a() else b() end`
+//! - `if cond then x=a; goto L1 end; x=b; ::L1::` 不在这里折叠；同一 lvalue 选值
+//!   属于 HIR branch-value 语义 owner
 //!
 //! 当同一 label 被多个 goto 引用时（常见于 continue-like 模式），通过从距 label
 //! 最近的 guard-goto 开始逐层折叠，最终将多个 skip-goto 收回成嵌套 if 结构：
@@ -366,7 +368,10 @@ fn find_terminal_goto_else_fold(block: &AstBlock) -> Option<GuardGotoFold> {
         let else_body = &block.stmts[if_index + 1..label_index];
         // 这里会把线性尾部搬进 `else` block；如果尾部自己再声明 local/label，
         // 就会引入新的词法边界变化。Readability 只在这类结构风险不存在时才收回源码 sugar。
-        if !else_body.is_empty() && can_fold_guard_goto_body(else_body) {
+        if !else_body.is_empty()
+            && can_fold_guard_goto_body(else_body)
+            && !is_terminal_goto_branch_value_assignment(&block.stmts[if_index], else_body)
+        {
             return Some(GuardGotoFold {
                 if_index,
                 label_index,
@@ -441,6 +446,21 @@ fn can_fold_guard_goto_body(stmts: &[AstStmt]) -> bool {
             AstStmt::Label(_) | AstStmt::LocalDecl(_) | AstStmt::LocalFunctionDecl(_)
         )
     })
+}
+
+fn is_terminal_goto_branch_value_assignment(if_stmt: &AstStmt, else_body: &[AstStmt]) -> bool {
+    let AstStmt::If(if_stmt) = if_stmt else {
+        return false;
+    };
+    let [AstStmt::Assign(then_assign), AstStmt::Goto(_)] = if_stmt.then_block.stmts.as_slice()
+    else {
+        return false;
+    };
+    let [AstStmt::Assign(else_assign)] = else_body else {
+        return false;
+    };
+
+    then_assign.targets == else_assign.targets
 }
 
 fn count_goto_target_in_block(block: &AstBlock, target: AstLabelId) -> usize {

@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use super::super::binding_flow::{
-    count_binding_uses_in_block_deep, count_binding_uses_in_stmts_deep, name_matches_binding,
+    BindingUseIndex, count_binding_uses_in_block_deep, name_matches_binding,
 };
 use super::direct::function_decl_target_from_lvalue;
 use crate::ast::common::{
@@ -17,6 +17,8 @@ use crate::ast::common::{
 
 pub(super) fn try_lower_forwarded_function_stmt(
     stmts: &[AstStmt],
+    use_index: &BindingUseIndex,
+    stmt_base: usize,
     target: AstTargetDialect,
     method_fields: &BTreeSet<String>,
 ) -> Option<(AstStmt, usize)> {
@@ -42,7 +44,7 @@ pub(super) fn try_lower_forwarded_function_stmt(
     {
         return None;
     }
-    if count_binding_uses_in_stmts_deep(&stmts[1..], binding) != 1 {
+    if use_index.count_uses_in_suffix(stmt_base + 1, binding) != 1 {
         return None;
     }
     let function = function.as_ref().clone();

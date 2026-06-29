@@ -51,7 +51,7 @@ pub(crate) fn lower_ast_for_generate(
             AstTargetDialect::relaxed_for_lowering(context.requested_target.version)
         }
     };
-    let hir = state.hir.as_ref().unwrap();
+    let hir = state.require_hir()?;
     state.ast = Some(lower_ast(
         hir,
         lowering_target,

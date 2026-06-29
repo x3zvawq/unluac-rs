@@ -15,9 +15,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::common::{
-    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstLValue, AstLocalBinding, AstNameRef, AstStmt,
-    AstTableField, AstTableKey,
+    AstBindingRef, AstBlock, AstCallExpr, AstCallKind, AstExpr, AstLValue, AstLocalBinding,
+    AstMethodCallExpr, AstNameRef, AstStmt, AstTableField, AstTableKey,
 };
+use super::binding_ref::binding_from_name_ref;
+
+pub(super) use super::binding_ref::name_matches_binding;
 
 #[derive(Clone, Copy)]
 enum BindingUseScope {
@@ -38,18 +41,51 @@ struct BindingUseSuffixCounts {
     suffix_totals: Vec<usize>,
 }
 
+#[derive(Debug, Default)]
+pub(super) struct BindingRefSet {
+    ids: BTreeSet<AstBindingRef>,
+}
+
+impl BindingRefSet {
+    pub(super) fn from_bindings(bindings: &[AstLocalBinding]) -> Self {
+        Self {
+            ids: bindings.iter().map(|binding| binding.id).collect(),
+        }
+    }
+}
+
+trait BindingLookup {
+    fn contains_binding(&self, binding: AstBindingRef) -> bool;
+}
+
+impl BindingLookup for BindingRefSet {
+    fn contains_binding(&self, binding: AstBindingRef) -> bool {
+        self.ids.contains(&binding)
+    }
+}
+
+impl BindingLookup for &[AstLocalBinding] {
+    fn contains_binding(&self, binding: AstBindingRef) -> bool {
+        self.iter().any(|local| local.id == binding)
+    }
+}
+
 impl BindingUseIndex {
     pub(super) fn for_stmts(stmts: &[AstStmt]) -> Self {
+        Self::for_stmts_with_scope(stmts, BindingUseScope::CurrentFunctionOnly)
+    }
+
+    pub(super) fn for_stmts_deep(stmts: &[AstStmt]) -> Self {
+        Self::for_stmts_with_scope(stmts, BindingUseScope::IncludingNestedFunctions)
+    }
+
+    fn for_stmts_with_scope(stmts: &[AstStmt], scope: BindingUseScope) -> Self {
         let mut stmt_counts = Vec::with_capacity(stmts.len());
         let mut occurrences = BTreeMap::<AstBindingRef, Vec<(usize, usize)>>::new();
 
         for (stmt_index, stmt) in stmts.iter().enumerate() {
             let mut counts = BTreeMap::new();
-            collect_binding_uses_in_stmt_with_scope(
-                stmt,
-                BindingUseScope::CurrentFunctionOnly,
-                &mut counts,
-            );
+            collect_binding_uses_in_stmt_with_scope(stmt, scope, &mut counts);
             for (&binding, &count) in &counts {
                 occurrences
                     .entry(binding)
@@ -135,27 +171,8 @@ impl BindingUseIndex {
     }
 }
 
-pub(super) fn name_matches_binding(name: &AstNameRef, binding: AstBindingRef) -> bool {
-    match (binding, name) {
-        (AstBindingRef::Local(local), AstNameRef::Local(target)) => local == *target,
-        (AstBindingRef::Temp(temp), AstNameRef::Temp(target)) => temp == *target,
-        (AstBindingRef::SyntheticLocal(local), AstNameRef::SyntheticLocal(target)) => {
-            local == *target
-        }
-        _ => false,
-    }
-}
-
 pub(super) fn count_binding_uses_in_stmts(stmts: &[AstStmt], binding: AstBindingRef) -> usize {
     count_binding_uses_in_stmts_with_scope(stmts, binding, BindingUseScope::CurrentFunctionOnly)
-}
-
-pub(super) fn count_binding_uses_in_stmts_deep(stmts: &[AstStmt], binding: AstBindingRef) -> usize {
-    count_binding_uses_in_stmts_with_scope(
-        stmts,
-        binding,
-        BindingUseScope::IncludingNestedFunctions,
-    )
 }
 
 pub(super) fn count_binding_uses_in_block_deep(block: &AstBlock, binding: AstBindingRef) -> usize {
@@ -659,23 +676,40 @@ fn count_binding_uses_in_call_with_scope(
     scope: BindingUseScope,
 ) -> usize {
     match call {
-        AstCallKind::Call(call) => {
-            count_binding_uses_in_expr_with_scope(&call.callee, binding, scope)
-                + call
-                    .args
-                    .iter()
-                    .map(|arg| count_binding_uses_in_expr_with_scope(arg, binding, scope))
-                    .sum::<usize>()
-        }
+        AstCallKind::Call(call) => count_call_expr_uses_with_scope(call, binding, scope),
         AstCallKind::MethodCall(call) => {
-            count_binding_uses_in_expr_with_scope(&call.receiver, binding, scope)
-                + call
-                    .args
-                    .iter()
-                    .map(|arg| count_binding_uses_in_expr_with_scope(arg, binding, scope))
-                    .sum::<usize>()
+            count_method_call_expr_uses_with_scope(call, binding, scope)
         }
     }
+}
+
+fn count_call_expr_uses_with_scope(
+    call: &AstCallExpr,
+    binding: AstBindingRef,
+    scope: BindingUseScope,
+) -> usize {
+    count_binding_uses_in_expr_with_scope(&call.callee, binding, scope)
+        + count_expr_list_uses_with_scope(&call.args, binding, scope)
+}
+
+fn count_method_call_expr_uses_with_scope(
+    call: &AstMethodCallExpr,
+    binding: AstBindingRef,
+    scope: BindingUseScope,
+) -> usize {
+    count_binding_uses_in_expr_with_scope(&call.receiver, binding, scope)
+        + count_expr_list_uses_with_scope(&call.args, binding, scope)
+}
+
+fn count_expr_list_uses_with_scope(
+    exprs: &[AstExpr],
+    binding: AstBindingRef,
+    scope: BindingUseScope,
+) -> usize {
+    exprs
+        .iter()
+        .map(|expr| count_binding_uses_in_expr_with_scope(expr, binding, scope))
+        .sum()
 }
 
 fn collect_binding_uses_in_call_with_scope(
@@ -756,14 +790,8 @@ fn count_binding_uses_in_expr_with_scope(
             count_binding_uses_in_expr_with_scope(&logical.lhs, binding, scope)
                 + count_binding_uses_in_expr_with_scope(&logical.rhs, binding, scope)
         }
-        AstExpr::Call(call) => {
-            count_binding_uses_in_call_with_scope(&AstCallKind::Call(call.clone()), binding, scope)
-        }
-        AstExpr::MethodCall(call) => count_binding_uses_in_call_with_scope(
-            &AstCallKind::MethodCall(call.clone()),
-            binding,
-            scope,
-        ),
+        AstExpr::Call(call) => count_call_expr_uses_with_scope(call, binding, scope),
+        AstExpr::MethodCall(call) => count_method_call_expr_uses_with_scope(call, binding, scope),
         AstExpr::SingleValue(expr) => count_binding_uses_in_expr_with_scope(expr, binding, scope),
         AstExpr::TableConstructor(table) => table
             .fields
@@ -899,79 +927,83 @@ fn collect_function_capture_uses(
 }
 
 pub(super) fn stmt_references_any_binding(stmt: &AstStmt, bindings: &[AstLocalBinding]) -> bool {
+    stmt_references_binding_lookup(stmt, &bindings)
+}
+
+pub(super) fn stmt_references_binding_set(stmt: &AstStmt, bindings: &BindingRefSet) -> bool {
+    stmt_references_binding_lookup(stmt, bindings)
+}
+
+fn stmt_references_binding_lookup(stmt: &AstStmt, bindings: &dyn BindingLookup) -> bool {
     match stmt {
         AstStmt::LocalDecl(local_decl) => {
             local_decl
                 .bindings
                 .iter()
-                .any(|binding| bindings.iter().any(|pending| pending.id == binding.id))
+                .any(|binding| bindings.contains_binding(binding.id))
                 || local_decl
                     .values
                     .iter()
-                    .any(|value| expr_references_any_binding(value, bindings))
+                    .any(|value| expr_references_binding_lookup(value, bindings))
         }
         AstStmt::GlobalDecl(global_decl) => global_decl
             .values
             .iter()
-            .any(|value| expr_references_any_binding(value, bindings)),
+            .any(|value| expr_references_binding_lookup(value, bindings)),
         AstStmt::Assign(assign) => {
             assign
                 .targets
                 .iter()
-                .any(|target| lvalue_references_any_binding(target, bindings))
+                .any(|target| lvalue_references_binding_lookup(target, bindings))
                 || assign
                     .values
                     .iter()
-                    .any(|value| expr_references_any_binding(value, bindings))
+                    .any(|value| expr_references_binding_lookup(value, bindings))
         }
-        AstStmt::CallStmt(call_stmt) => call_references_any_binding(&call_stmt.call, bindings),
+        AstStmt::CallStmt(call_stmt) => call_references_binding_lookup(&call_stmt.call, bindings),
         AstStmt::Return(ret) => ret
             .values
             .iter()
-            .any(|value| expr_references_any_binding(value, bindings)),
+            .any(|value| expr_references_binding_lookup(value, bindings)),
         AstStmt::If(if_stmt) => {
-            expr_references_any_binding(&if_stmt.cond, bindings)
-                || block_references_any_binding(&if_stmt.then_block, bindings)
+            expr_references_binding_lookup(&if_stmt.cond, bindings)
+                || block_references_binding_lookup(&if_stmt.then_block, bindings)
                 || if_stmt
                     .else_block
                     .as_ref()
-                    .is_some_and(|block| block_references_any_binding(block, bindings))
+                    .is_some_and(|block| block_references_binding_lookup(block, bindings))
         }
         AstStmt::While(while_stmt) => {
-            expr_references_any_binding(&while_stmt.cond, bindings)
-                || block_references_any_binding(&while_stmt.body, bindings)
+            expr_references_binding_lookup(&while_stmt.cond, bindings)
+                || block_references_binding_lookup(&while_stmt.body, bindings)
         }
         AstStmt::Repeat(repeat_stmt) => {
-            block_references_any_binding(&repeat_stmt.body, bindings)
-                || expr_references_any_binding(&repeat_stmt.cond, bindings)
+            block_references_binding_lookup(&repeat_stmt.body, bindings)
+                || expr_references_binding_lookup(&repeat_stmt.cond, bindings)
         }
         AstStmt::NumericFor(numeric_for) => {
-            bindings
-                .iter()
-                .any(|binding| binding.id == numeric_for.binding)
-                || expr_references_any_binding(&numeric_for.start, bindings)
-                || expr_references_any_binding(&numeric_for.limit, bindings)
-                || expr_references_any_binding(&numeric_for.step, bindings)
-                || block_references_any_binding(&numeric_for.body, bindings)
+            bindings.contains_binding(numeric_for.binding)
+                || expr_references_binding_lookup(&numeric_for.start, bindings)
+                || expr_references_binding_lookup(&numeric_for.limit, bindings)
+                || expr_references_binding_lookup(&numeric_for.step, bindings)
+                || block_references_binding_lookup(&numeric_for.body, bindings)
         }
         AstStmt::GenericFor(generic_for) => {
             generic_for
                 .bindings
                 .iter()
-                .any(|binding| bindings.iter().any(|pending| pending.id == *binding))
+                .any(|binding| bindings.contains_binding(*binding))
                 || generic_for
                     .iterator
                     .iter()
-                    .any(|expr| expr_references_any_binding(expr, bindings))
-                || block_references_any_binding(&generic_for.body, bindings)
+                    .any(|expr| expr_references_binding_lookup(expr, bindings))
+                || block_references_binding_lookup(&generic_for.body, bindings)
         }
-        AstStmt::DoBlock(block) => block_references_any_binding(block, bindings),
+        AstStmt::DoBlock(block) => block_references_binding_lookup(block, bindings),
         AstStmt::FunctionDecl(function_decl) => {
-            function_name_references_any_binding(&function_decl.target, bindings)
+            function_name_references_binding_lookup(&function_decl.target, bindings)
         }
-        AstStmt::LocalFunctionDecl(function_decl) => bindings
-            .iter()
-            .any(|binding| binding.id == function_decl.name),
+        AstStmt::LocalFunctionDecl(function_decl) => bindings.contains_binding(function_decl.name),
         AstStmt::Break
         | AstStmt::Continue
         | AstStmt::Goto(_)
@@ -980,53 +1012,65 @@ pub(super) fn stmt_references_any_binding(stmt: &AstStmt, bindings: &[AstLocalBi
     }
 }
 
-pub(super) fn block_references_any_binding(block: &AstBlock, bindings: &[AstLocalBinding]) -> bool {
+pub(super) fn block_references_binding_set(block: &AstBlock, bindings: &BindingRefSet) -> bool {
+    block_references_binding_lookup(block, bindings)
+}
+
+fn block_references_binding_lookup(block: &AstBlock, bindings: &dyn BindingLookup) -> bool {
     block
         .stmts
         .iter()
-        .any(|stmt| stmt_references_any_binding(stmt, bindings))
+        .any(|stmt| stmt_references_binding_lookup(stmt, bindings))
 }
 
 pub(super) fn expr_references_any_binding(expr: &AstExpr, bindings: &[AstLocalBinding]) -> bool {
+    expr_references_binding_lookup(expr, &bindings)
+}
+
+pub(super) fn expr_references_binding_set(expr: &AstExpr, bindings: &BindingRefSet) -> bool {
+    expr_references_binding_lookup(expr, bindings)
+}
+
+fn expr_references_binding_lookup(expr: &AstExpr, bindings: &dyn BindingLookup) -> bool {
     match expr {
-        AstExpr::Var(name) => name_ref_matches_any_binding(name, bindings),
-        AstExpr::FieldAccess(access) => expr_references_any_binding(&access.base, bindings),
+        AstExpr::Var(name) => name_ref_matches_binding_lookup(name, bindings),
+        AstExpr::FieldAccess(access) => expr_references_binding_lookup(&access.base, bindings),
         AstExpr::IndexAccess(access) => {
-            expr_references_any_binding(&access.base, bindings)
-                || expr_references_any_binding(&access.index, bindings)
+            expr_references_binding_lookup(&access.base, bindings)
+                || expr_references_binding_lookup(&access.index, bindings)
         }
-        AstExpr::Unary(unary) => expr_references_any_binding(&unary.expr, bindings),
+        AstExpr::Unary(unary) => expr_references_binding_lookup(&unary.expr, bindings),
         AstExpr::Binary(binary) => {
-            expr_references_any_binding(&binary.lhs, bindings)
-                || expr_references_any_binding(&binary.rhs, bindings)
+            expr_references_binding_lookup(&binary.lhs, bindings)
+                || expr_references_binding_lookup(&binary.rhs, bindings)
         }
         AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            expr_references_any_binding(&logical.lhs, bindings)
-                || expr_references_any_binding(&logical.rhs, bindings)
+            expr_references_binding_lookup(&logical.lhs, bindings)
+                || expr_references_binding_lookup(&logical.rhs, bindings)
         }
         AstExpr::Call(call) => {
-            expr_references_any_binding(&call.callee, bindings)
+            expr_references_binding_lookup(&call.callee, bindings)
                 || call
                     .args
                     .iter()
-                    .any(|arg| expr_references_any_binding(arg, bindings))
+                    .any(|arg| expr_references_binding_lookup(arg, bindings))
         }
         AstExpr::MethodCall(call) => {
-            expr_references_any_binding(&call.receiver, bindings)
+            expr_references_binding_lookup(&call.receiver, bindings)
                 || call
                     .args
                     .iter()
-                    .any(|arg| expr_references_any_binding(arg, bindings))
+                    .any(|arg| expr_references_binding_lookup(arg, bindings))
         }
-        AstExpr::SingleValue(expr) => expr_references_any_binding(expr, bindings),
+        AstExpr::SingleValue(expr) => expr_references_binding_lookup(expr, bindings),
         AstExpr::TableConstructor(table) => table.fields.iter().any(|field| match field {
-            AstTableField::Array(value) => expr_references_any_binding(value, bindings),
+            AstTableField::Array(value) => expr_references_binding_lookup(value, bindings),
             AstTableField::Record(record) => {
                 let key_references_binding = match &record.key {
                     AstTableKey::Name(_) => false,
-                    AstTableKey::Expr(expr) => expr_references_any_binding(expr, bindings),
+                    AstTableKey::Expr(expr) => expr_references_binding_lookup(expr, bindings),
                 };
-                key_references_binding || expr_references_any_binding(&record.value, bindings)
+                key_references_binding || expr_references_binding_lookup(&record.value, bindings)
             }
         }),
         AstExpr::FunctionExpr(_) => false,
@@ -1055,62 +1099,51 @@ fn count_binding_mentions_in_lvalue(target: &AstLValue, binding: AstBindingRef) 
     }
 }
 
-fn call_references_any_binding(call: &AstCallKind, bindings: &[AstLocalBinding]) -> bool {
+fn call_references_binding_lookup(call: &AstCallKind, bindings: &dyn BindingLookup) -> bool {
     match call {
         AstCallKind::Call(call) => {
-            expr_references_any_binding(&call.callee, bindings)
+            expr_references_binding_lookup(&call.callee, bindings)
                 || call
                     .args
                     .iter()
-                    .any(|arg| expr_references_any_binding(arg, bindings))
+                    .any(|arg| expr_references_binding_lookup(arg, bindings))
         }
         AstCallKind::MethodCall(call) => {
-            expr_references_any_binding(&call.receiver, bindings)
+            expr_references_binding_lookup(&call.receiver, bindings)
                 || call
                     .args
                     .iter()
-                    .any(|arg| expr_references_any_binding(arg, bindings))
+                    .any(|arg| expr_references_binding_lookup(arg, bindings))
         }
     }
 }
 
-fn function_name_references_any_binding(
+fn function_name_references_binding_lookup(
     target: &super::super::common::AstFunctionName,
-    bindings: &[AstLocalBinding],
+    bindings: &dyn BindingLookup,
 ) -> bool {
     let path = match target {
         super::super::common::AstFunctionName::Plain(path) => path,
         super::super::common::AstFunctionName::Method(path, _) => path,
     };
-    name_ref_matches_any_binding(&path.root, bindings)
+    name_ref_matches_binding_lookup(&path.root, bindings)
 }
 
-fn lvalue_references_any_binding(target: &AstLValue, bindings: &[AstLocalBinding]) -> bool {
+fn lvalue_references_binding_lookup(target: &AstLValue, bindings: &dyn BindingLookup) -> bool {
     match target {
-        AstLValue::Name(name) => name_ref_matches_any_binding(name, bindings),
-        AstLValue::FieldAccess(access) => expr_references_any_binding(&access.base, bindings),
+        AstLValue::Name(name) => name_ref_matches_binding_lookup(name, bindings),
+        AstLValue::FieldAccess(access) => expr_references_binding_lookup(&access.base, bindings),
         AstLValue::IndexAccess(access) => {
-            expr_references_any_binding(&access.base, bindings)
-                || expr_references_any_binding(&access.index, bindings)
+            expr_references_binding_lookup(&access.base, bindings)
+                || expr_references_binding_lookup(&access.index, bindings)
         }
     }
 }
 
-fn name_ref_matches_any_binding(name: &AstNameRef, bindings: &[AstLocalBinding]) -> bool {
-    bindings
-        .iter()
-        .any(|binding| name_ref_matches_binding(name, binding.id))
+fn name_ref_matches_binding_lookup(name: &AstNameRef, bindings: &dyn BindingLookup) -> bool {
+    binding_from_name_ref(name).is_some_and(|binding| bindings.contains_binding(binding))
 }
 
 fn name_ref_matches_binding(name: &AstNameRef, binding: AstBindingRef) -> bool {
     name_matches_binding(name, binding)
-}
-
-fn binding_from_name_ref(name: &AstNameRef) -> Option<AstBindingRef> {
-    match name {
-        AstNameRef::Local(local) => Some(AstBindingRef::Local(*local)),
-        AstNameRef::Temp(temp) => Some(AstBindingRef::Temp(*temp)),
-        AstNameRef::SyntheticLocal(local) => Some(AstBindingRef::SyntheticLocal(*local)),
-        AstNameRef::Param(_) | AstNameRef::Upvalue(_) | AstNameRef::Global(_) => None,
-    }
 }

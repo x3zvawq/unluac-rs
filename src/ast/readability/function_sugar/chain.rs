@@ -4,47 +4,56 @@
 //! 函数 sugar。
 //! 例如：`local f = obj.m; f(obj, 1)` 会在这里尝试折回 `obj:m(1)`。
 
-use super::super::binding_flow::{count_binding_uses_in_stmts_deep, name_matches_binding};
+use super::super::binding_flow::{BindingUseIndex, name_matches_binding};
 use crate::ast::common::{AstBindingRef, AstCallKind, AstExpr, AstLocalAttr, AstStmt};
 
-pub(super) fn try_chain_local_method_call_stmt(stmts: &[AstStmt]) -> Option<(AstStmt, usize)> {
+pub(super) fn try_chain_local_method_call_stmt(
+    stmts: &[AstStmt],
+    use_index: &BindingUseIndex,
+    stmt_base: usize,
+) -> Option<(AstStmt, usize)> {
     let [first, second, third, ..] = stmts else {
-        return try_chain_local_method_call_stmt_without_dead_alias(stmts);
+        return try_chain_local_method_call_stmt_without_dead_alias(stmts, use_index, stmt_base);
     };
 
     let AstStmt::LocalDecl(dead_alias) = first else {
-        return try_chain_local_method_call_stmt_without_dead_alias(stmts);
+        return try_chain_local_method_call_stmt_without_dead_alias(stmts, use_index, stmt_base);
     };
     if dead_alias.bindings.len() != 1
         || dead_alias.values.len() != 1
         || dead_alias.bindings[0].attr != AstLocalAttr::None
     {
-        return try_chain_local_method_call_stmt_without_dead_alias(stmts);
+        return try_chain_local_method_call_stmt_without_dead_alias(stmts, use_index, stmt_base);
     }
-    if count_binding_uses_in_stmts_deep(&stmts[1..], dead_alias.bindings[0].id) != 0 {
-        return try_chain_local_method_call_stmt_without_dead_alias(stmts);
+    if use_index.count_uses_in_suffix(stmt_base + 1, dead_alias.bindings[0].id) != 0 {
+        return try_chain_local_method_call_stmt_without_dead_alias(stmts, use_index, stmt_base);
     }
 
     let chained_binding = single_method_call_local_binding(second)?;
-    if count_binding_uses_in_stmts_deep(&stmts[3..], chained_binding) != 0 {
-        return try_chain_local_method_call_stmt_without_dead_alias(stmts);
+    if use_index.count_uses_in_suffix(stmt_base + 3, chained_binding) != 0 {
+        return try_chain_local_method_call_stmt_without_dead_alias(stmts, use_index, stmt_base);
     }
 
-    let chained = chain_local_method_call_stmt(second, third)?;
+    let chained = chain_local_method_call_stmt(second, third, use_index, stmt_base + 2)?;
     Some((chained, 3))
 }
 
 fn try_chain_local_method_call_stmt_without_dead_alias(
     stmts: &[AstStmt],
+    use_index: &BindingUseIndex,
+    stmt_base: usize,
 ) -> Option<(AstStmt, usize)> {
     let [first, second, ..] = stmts else {
         return None;
     };
     let chained_binding = single_method_call_local_binding(first)?;
-    if count_binding_uses_in_stmts_deep(&stmts[2..], chained_binding) != 0 {
+    if use_index.count_uses_in_suffix(stmt_base + 2, chained_binding) != 0 {
         return None;
     }
-    Some((chain_local_method_call_stmt(first, second)?, 2))
+    Some((
+        chain_local_method_call_stmt(first, second, use_index, stmt_base + 1)?,
+        2,
+    ))
 }
 
 fn single_method_call_local_binding(stmt: &AstStmt) -> Option<AstBindingRef> {
@@ -63,7 +72,12 @@ fn single_method_call_local_binding(stmt: &AstStmt) -> Option<AstBindingRef> {
     Some(local_decl.bindings[0].id)
 }
 
-fn chain_local_method_call_stmt(first: &AstStmt, second: &AstStmt) -> Option<AstStmt> {
+fn chain_local_method_call_stmt(
+    first: &AstStmt,
+    second: &AstStmt,
+    use_index: &BindingUseIndex,
+    second_index: usize,
+) -> Option<AstStmt> {
     let AstStmt::LocalDecl(local_decl) = first else {
         return None;
     };
@@ -86,7 +100,7 @@ fn chain_local_method_call_stmt(first: &AstStmt, second: &AstStmt) -> Option<Ast
         return None;
     };
     if !name_matches_binding(name, local_decl.bindings[0].id)
-        || count_binding_uses_in_stmts_deep(std::slice::from_ref(second), local_decl.bindings[0].id)
+        || use_index.count_uses_in_range(second_index, second_index + 1, local_decl.bindings[0].id)
             != 1
     {
         return None;

@@ -275,12 +275,14 @@ fn collapse_adjacent_call_alias_runs(block: &mut AstBlock, options: ReadabilityO
         // 而不是把源码里本来就有阶段语义的 local（例如 stage1 / stage2）继续吞掉。
         if collapsed_count >= 2 {
             changed = true;
-            for (offset, stmt) in old_stmts[index..run_end].iter().enumerate() {
-                if !removed[offset] {
-                    new_stmts.push(stmt.clone());
-                }
-            }
-            new_stmts.push(rewritten_sink);
+            push_collapsed_run(
+                &mut new_stmts,
+                &old_stmts,
+                index,
+                run_end,
+                &removed,
+                rewritten_sink,
+            );
             index = run_end + 1;
             continue;
         }
@@ -389,12 +391,14 @@ fn collapse_terminal_call_result_alias_runs(
         // 这类形状和最终 `call_stmt(...)` 属于同一 owner，只是 sink 还保留在结果声明里。
         if collapsed_count >= 2 {
             changed = true;
-            for (offset, stmt) in old_stmts[index..sink_index].iter().enumerate() {
-                if !removed[offset] {
-                    new_stmts.push(stmt.clone());
-                }
-            }
-            new_stmts.push(rewritten_sink);
+            push_collapsed_run(
+                &mut new_stmts,
+                &old_stmts,
+                index,
+                sink_index,
+                &removed,
+                rewritten_sink,
+            );
             index = sink_index + 1;
             continue;
         }
@@ -523,12 +527,14 @@ fn collapse_adjacent_mechanical_alias_runs(
                     && stmt_prefers_dependent_lookup_run_collapse(&rewritten_sink)))
         {
             changed = true;
-            for (offset, stmt) in old_stmts[index..run_end].iter().enumerate() {
-                if !removed[offset] {
-                    new_stmts.push(stmt.clone());
-                }
-            }
-            new_stmts.push(rewritten_sink);
+            push_collapsed_run(
+                &mut new_stmts,
+                &old_stmts,
+                index,
+                run_end,
+                &removed,
+                rewritten_sink,
+            );
             index = run_end + 1;
             continue;
         }
@@ -627,12 +633,14 @@ fn collapse_terminal_local_mechanical_runs(
 
         if collapsed_count >= 2 {
             changed = true;
-            for (offset, stmt) in old_stmts[index..(run_end - 1)].iter().enumerate() {
-                if !removed[offset] {
-                    new_stmts.push(stmt.clone());
-                }
-            }
-            new_stmts.push(rewritten_sink);
+            push_collapsed_run(
+                &mut new_stmts,
+                &old_stmts,
+                index,
+                run_end - 1,
+                &removed,
+                rewritten_sink,
+            );
             index = run_end;
             continue;
         }
@@ -657,6 +665,22 @@ fn stmt_can_absorb_mechanical_run(stmt: &AstStmt) -> bool {
             | AstStmt::NumericFor(_)
             | AstStmt::GenericFor(_)
     )
+}
+
+fn push_collapsed_run(
+    new_stmts: &mut Vec<AstStmt>,
+    old_stmts: &[AstStmt],
+    run_start: usize,
+    run_end: usize,
+    removed: &[bool],
+    rewritten_sink: AstStmt,
+) {
+    for (offset, stmt) in old_stmts[run_start..run_end].iter().enumerate() {
+        if !removed[offset] {
+            new_stmts.push(stmt.clone());
+        }
+    }
+    new_stmts.push(rewritten_sink);
 }
 
 fn stmt_prefers_pure_lookup_run_collapse(stmt: &AstStmt) -> bool {
