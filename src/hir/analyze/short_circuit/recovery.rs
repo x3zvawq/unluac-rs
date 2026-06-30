@@ -596,15 +596,45 @@ pub(crate) fn value_merge_candidate_by_header<'a>(
     lowering: &'a ProtoLowering<'_>,
     header: BlockRef,
 ) -> Option<&'a ShortCircuitCandidate> {
-    lowering
+    let mut candidates = lowering
         .structure
         .short_circuit_candidates
         .iter()
-        .find(|candidate| {
+        .filter(|candidate| {
             candidate.header == header
                 && candidate.reducible
                 && matches!(candidate.exit, ShortCircuitExit::ValueMerge(_))
-        })
+        });
+    let first = candidates.next()?;
+    candidates
+        .all(|candidate| same_value_merge_shape(first, candidate))
+        .then_some(first)
+}
+
+pub(crate) fn same_value_merge_shape(
+    base: &ShortCircuitCandidate,
+    candidate: &ShortCircuitCandidate,
+) -> bool {
+    let (ShortCircuitExit::ValueMerge(base_merge), ShortCircuitExit::ValueMerge(candidate_merge)) =
+        (&base.exit, &candidate.exit)
+    else {
+        return false;
+    };
+    base.header == candidate.header
+        && base_merge == candidate_merge
+        && base.blocks == candidate.blocks
+        && base.entry == candidate.entry
+        && base.nodes.len() == candidate.nodes.len()
+        && base
+            .nodes
+            .iter()
+            .zip(&candidate.nodes)
+            .all(|(base, candidate)| {
+                base.id == candidate.id
+                    && base.header == candidate.header
+                    && base.truthy == candidate.truthy
+                    && base.falsy == candidate.falsy
+            })
 }
 
 /// 值型短路被消费时，需要把候选区域里的其余 block 标记成“已经由表达式吸收”。

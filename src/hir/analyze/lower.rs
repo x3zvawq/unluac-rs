@@ -28,8 +28,8 @@ use crate::ast::AstTargetDialect;
 use crate::decompile::{DecompileContext, DecompileState};
 use crate::hir::common::{
     HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirCallStmt, HirCapture, HirClose,
-    HirClosureExpr, HirExpr, HirLValue, HirLabel, HirLabelId, HirProto, HirProtoRef, HirStmt,
-    HirTableSetList, HirToBeClosed, HirUnaryExpr, LocalId, ParamId, TempId, UpvalueId,
+    HirClosureExpr, HirExpr, HirLValue, HirLabel, HirLabelId, HirLocalDecl, HirProto, HirProtoRef,
+    HirStmt, HirTableSetList, HirToBeClosed, HirUnaryExpr, LocalId, ParamId, TempId, UpvalueId,
 };
 use crate::structure::{BlockRef, Cfg, CfgGraph, DataflowFacts, GraphFacts, PhiId};
 use crate::structure::{ShortCircuitExit, StructureFacts};
@@ -52,10 +52,59 @@ pub(super) struct ProtoBindings {
     pub(super) phi_temps: Vec<TempId>,
     pub(super) instr_fixed_defs: Vec<Vec<TempId>>,
     pub(super) instr_open_defs: Vec<Option<TempId>>,
+    pub(super) captured_temp_targets: BTreeMap<TempId, BoundSlotTarget>,
+    pub(super) captured_temp_decl_locals: BTreeMap<TempId, LocalId>,
+    pub(super) capture_empty_local_decls: BTreeMap<usize, Vec<LocalId>>,
+    pub(super) closure_capture_targets: BTreeMap<(usize, usize), BoundSlotTarget>,
     pub(super) entry_local_regs: BTreeMap<Reg, LocalId>,
     pub(super) numeric_for_locals: BTreeMap<BlockRef, LocalId>,
     pub(super) generic_for_locals: BTreeMap<BlockRef, Vec<LocalId>>,
     pub(super) block_local_regs: BTreeMap<BlockRef, BTreeMap<Reg, LocalId>>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum BoundSlotTarget {
+    Local(LocalId),
+}
+
+impl BoundSlotTarget {
+    pub(super) fn expr(self) -> HirExpr {
+        match self {
+            Self::Local(local) => HirExpr::LocalRef(local),
+        }
+    }
+
+    pub(super) fn lvalue(self) -> HirLValue {
+        match self {
+            Self::Local(local) => HirLValue::Local(local),
+        }
+    }
+}
+
+impl ProtoBindings {
+    pub(super) fn expr_for_temp(&self, temp: TempId) -> HirExpr {
+        self.captured_temp_targets
+            .get(&temp)
+            .copied()
+            .map_or(HirExpr::TempRef(temp), BoundSlotTarget::expr)
+    }
+
+    pub(super) fn lvalue_for_temp(&self, temp: TempId) -> HirLValue {
+        self.captured_temp_targets
+            .get(&temp)
+            .copied()
+            .map_or(HirLValue::Temp(temp), BoundSlotTarget::lvalue)
+    }
+
+    pub(super) fn closure_capture_target(
+        &self,
+        instr_ref: InstrRef,
+        reg: Reg,
+    ) -> Option<BoundSlotTarget> {
+        self.closure_capture_targets
+            .get(&(instr_ref.index(), reg.index()))
+            .copied()
+    }
 }
 
 pub(super) struct ProtoLowering<'a> {
@@ -411,24 +460,7 @@ pub(super) fn lower_phi_materialization_with_allowed_blocks_except(
         covered_phi_ids.insert(phi_id);
         let value =
             recover_short_value_merge_expr_with_allowed_blocks(lowering, short, allowed_blocks)
-                .unwrap_or_else(|| {
-                    // 短路恢复失败时，兜底用支配者出口值近似。
-                    lowering
-                        .graph_facts
-                        .dominator_tree
-                        .parent
-                        .get(merge.index())
-                        .copied()
-                        .flatten()
-                        .map(|idom| expr_for_reg_at_block_exit(lowering, idom, reg))
-                        .unwrap_or_else(|| {
-                            unresolved_expr(format!(
-                                "phi block=#{} reg=r{}",
-                                merge.index(),
-                                reg.index()
-                            ))
-                        })
-                });
+                .unwrap_or_else(|| unresolved_phi_expr("short-circuit value merge", merge, reg));
         stmts.push(assign_stmt(vec![HirLValue::Temp(temp)], vec![value]));
     }
 
@@ -443,33 +475,72 @@ pub(super) fn lower_phi_materialization_with_allowed_blocks_except(
                     .phi_temps
                     .get(phi.phi_id.index())
                     .copied()?;
-                // 兜底策略：用 phi 所在 block 的直接支配者出口处的寄存器值
-                // 作为近似恢复。这是控制流分歧前的"初始值"——在大多数
-                // "部分路径赋值、其余路径保留原值"的模式下语义正确。
-                // 只有当所有到达路径都各自赋了不同的值、且没有被
-                // branch_value_merge / short_circuit / loop 任何一种
-                // 专用 pass 认领时，这个近似才可能偏离原始语义，但仍比
-                // unresolved_expr（直接输出 nil + 错误注释）好得多。
-                let value = lowering
-                    .graph_facts
-                    .dominator_tree
-                    .parent
-                    .get(phi.block.index())
-                    .copied()
-                    .flatten()
-                    .map(|idom| expr_for_reg_at_block_exit(lowering, idom, phi.reg))
-                    .unwrap_or_else(|| {
-                        unresolved_expr(format!(
-                            "phi block=#{} reg=r{}",
-                            phi.block.index(),
-                            phi.reg.index()
-                        ))
-                    });
+                let value = recover_preserved_idom_phi_value(lowering, phi)
+                    .unwrap_or_else(|| unresolved_phi_expr("generic phi", phi.block, phi.reg));
                 Some(assign_stmt(vec![HirLValue::Temp(temp)], vec![value]))
             }),
     );
 
     stmts
+}
+
+fn recover_preserved_idom_phi_value(
+    lowering: &ProtoLowering<'_>,
+    phi: crate::structure::GenericPhiMaterialization,
+) -> Option<HirExpr> {
+    let candidate = lowering.dataflow.phi_candidate(phi.phi_id)?;
+    let idom = lowering
+        .graph_facts
+        .dominator_tree
+        .parent
+        .get(phi.block.index())
+        .copied()
+        .flatten()?;
+    let idom_defs = block_exit_defs_for_reg(lowering, idom, phi.reg)?;
+    candidate
+        .incoming
+        .iter()
+        .all(|incoming| incoming.defs == idom_defs)
+        .then(|| expr_for_reg_at_block_exit(lowering, idom, phi.reg))
+}
+
+fn block_exit_defs_for_reg(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    reg: Reg,
+) -> Option<BTreeSet<crate::structure::DefId>> {
+    let range = lowering.cfg.blocks[block.index()].instrs;
+    let Some(last_instr_ref) = range.last() else {
+        return Some(BTreeSet::new());
+    };
+
+    let effect = &lowering.dataflow.instr_effects[last_instr_ref.index()];
+    if effect.fixed_must_defs.contains(&reg) {
+        return lowering
+            .dataflow
+            .instr_def_for_reg(last_instr_ref, reg)
+            .map(|def| BTreeSet::from([def]));
+    }
+
+    let mut defs = lowering
+        .dataflow
+        .reaching_defs_at(last_instr_ref)
+        .fixed
+        .get(reg)
+        .map(|defs| defs.iter().copied().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    if effect.fixed_may_defs.contains(&reg) {
+        defs.insert(lowering.dataflow.instr_def_for_reg(last_instr_ref, reg)?);
+    }
+    Some(defs)
+}
+
+fn unresolved_phi_expr(reason: &str, block: BlockRef, reg: Reg) -> HirExpr {
+    unresolved_expr(format!(
+        "{reason} block=#{} reg=r{}",
+        block.index(),
+        reg.index()
+    ))
 }
 
 pub(super) fn lower_regular_instr(
@@ -662,26 +733,30 @@ pub(super) fn lower_regular_instr(
                 trailing_multiret,
             )]
         }
-        LowInstr::Closure(closure) => fixed_assign(
-            lowering,
-            instr_ref,
-            vec![HirExpr::Closure(Box::new(HirClosureExpr {
-                proto: lowering.child_refs[closure.proto.index()],
-                captures: closure
-                    .captures
-                    .iter()
-                    .map(|capture| HirCapture {
-                        value: expr_for_closure_capture(
-                            lowering,
-                            block,
-                            instr_ref,
-                            closure.dst,
-                            capture.source,
-                        ),
-                    })
-                    .collect(),
-            }))],
-        ),
+        LowInstr::Closure(closure) => {
+            let mut stmts = capture_empty_local_decl_stmts(lowering, instr_ref);
+            stmts.extend(fixed_assign(
+                lowering,
+                instr_ref,
+                vec![HirExpr::Closure(Box::new(HirClosureExpr {
+                    proto: lowering.child_refs[closure.proto.index()],
+                    captures: closure
+                        .captures
+                        .iter()
+                        .map(|capture| HirCapture {
+                            value: expr_for_closure_capture(
+                                lowering,
+                                block,
+                                instr_ref,
+                                closure.dst,
+                                capture.source,
+                            ),
+                        })
+                        .collect(),
+                }))],
+            ));
+            stmts
+        }
         LowInstr::Close(close) => vec![HirStmt::Close(Box::new(HirClose {
             from_reg: close.from.index(),
         }))],
@@ -1022,11 +1097,54 @@ fn fixed_assign(
     instr_ref: InstrRef,
     values: Vec<HirExpr>,
 ) -> Vec<HirStmt> {
+    let temps = &lowering.bindings.instr_fixed_defs[instr_ref.index()];
+    let decl_locals = temps
+        .iter()
+        .filter_map(|temp| {
+            lowering
+                .bindings
+                .captured_temp_decl_locals
+                .get(temp)
+                .copied()
+        })
+        .collect::<Vec<_>>();
     let targets = lower_fixed_targets(lowering, instr_ref);
     if targets.is_empty() {
         Vec::new()
+    } else if decl_locals.len() == targets.len() && decl_locals.len() == values.len() {
+        vec![HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: decl_locals,
+            values,
+        }))]
     } else {
-        vec![assign_stmt(targets, values)]
+        let mut stmts = local_decl_stmts(decl_locals);
+        stmts.push(assign_stmt(targets, values));
+        stmts
+    }
+}
+
+fn capture_empty_local_decl_stmts(
+    lowering: &ProtoLowering<'_>,
+    instr_ref: InstrRef,
+) -> Vec<HirStmt> {
+    local_decl_stmts(
+        lowering
+            .bindings
+            .capture_empty_local_decls
+            .get(&instr_ref.index())
+            .cloned()
+            .unwrap_or_default(),
+    )
+}
+
+fn local_decl_stmts(locals: Vec<LocalId>) -> Vec<HirStmt> {
+    if locals.is_empty() {
+        Vec::new()
+    } else {
+        vec![HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: locals,
+            values: Vec::new(),
+        }))]
     }
 }
 
@@ -1050,6 +1168,6 @@ fn fixed_or_open_assign(
 fn lower_fixed_targets(lowering: &ProtoLowering<'_>, instr_ref: InstrRef) -> Vec<HirLValue> {
     lowering.bindings.instr_fixed_defs[instr_ref.index()]
         .iter()
-        .map(|temp| HirLValue::Temp(*temp))
+        .map(|temp| lowering.bindings.lvalue_for_temp(*temp))
         .collect()
 }

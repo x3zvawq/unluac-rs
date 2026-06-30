@@ -20,6 +20,19 @@ pub(super) fn empty_single_local_decl_binding(stmt: &HirStmt) -> Option<LocalId>
     local_decl.values.is_empty().then_some(*binding)
 }
 
+pub(super) fn initialized_single_local_decl_binding(stmt: &HirStmt) -> Option<LocalId> {
+    let HirStmt::LocalDecl(local_decl) = stmt else {
+        return None;
+    };
+    let [binding] = local_decl.bindings.as_slice() else {
+        return None;
+    };
+    let [_value] = local_decl.values.as_slice() else {
+        return None;
+    };
+    Some(*binding)
+}
+
 pub(super) fn matches_local_lvalue(target: &HirLValue, binding: LocalId) -> bool {
     matches!(target, HirLValue::Local(local) if *local == binding)
 }

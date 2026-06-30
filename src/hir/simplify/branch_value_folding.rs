@@ -2,11 +2,13 @@
 //!
 //! 这个文件承接两类已经进入 HIR、但还没有完全结构化的 branch-value 形状：
 //! 1. fallback CFG 遗留的 `if cond then x=v; goto L end; x=d; label L` 壳；
-//! 2. `locals` pass 提升 temp 后暴露出来的 `local X; if cond then X=a else X=b end` 壳。
+//! 2. `locals` pass 提升 temp 后暴露出来的 `local X; if cond then X=a else X=b end` 壳；
+//! 3. nil-only fallback alias：`local X; if A == nil then X=b else X=A end`。
 //!
 //! 它依赖前层 HIR/StructureFacts 已经给出合法的 branch、label/goto 和 binding 边界；
 //! 这里只做 HIR 内部的语义收敛，不重新解释 CFG，也不会跨过仍有其它入边的 label。
 //! 对需要复制默认值的形状，只允许复制无副作用的常量或引用，避免为了可读性改变求值语义。
+//! nil fallback 不会被恢复成 `A or b`，因为 `or` 会把 `false` 也视为 fallback 条件。
 //!
 //! 对 local 形态，除了平铺的两臂形状以外，结构恢复阶段经常因为短路条件被翻译成多层嵌套 `if`
 //! 而把同一个 binding 的赋值散落在树形 if/else 的所有叶子上。这里通过 `try_collapse_block_to_value`
@@ -30,8 +32,9 @@ use super::visit::HirVisitor;
 use super::walk::{HirRewritePass, rewrite_proto};
 use crate::hir::HirLabelId;
 use crate::hir::common::{
-    HirAssign, HirBlock, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget,
-    HirExpr, HirIf, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId,
+    HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirDecisionExpr, HirDecisionNode,
+    HirDecisionNodeRef, HirDecisionTarget, HirExpr, HirIf, HirLValue, HirLocalDecl, HirProto,
+    HirStmt, HirUnaryOpKind, LocalId,
 };
 
 pub(super) fn fold_branch_values_in_proto(proto: &mut HirProto) -> bool {
@@ -43,8 +46,9 @@ struct BranchValuePass;
 impl HirRewritePass for BranchValuePass {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
         let goto_changed = fold_branch_value_goto_labels_in_block(&mut block.stmts);
+        let nil_fallback_changed = fold_nil_fallback_alias_locals_in_block(&mut block.stmts);
         let local_changed = fold_branch_value_locals_in_block(&mut block.stmts);
-        goto_changed || local_changed
+        goto_changed || nil_fallback_changed || local_changed
     }
 }
 
@@ -105,6 +109,122 @@ fn fold_branch_value_locals_in_block(stmts: &mut Vec<HirStmt>) -> bool {
     }
 
     changed
+}
+
+/// 扫描 block 中相邻的 `local X; if A == nil then X=b else X=A end` 形状，
+/// 改写成 `local X=A; if X == nil then X=b end`。
+fn fold_nil_fallback_alias_locals_in_block(stmts: &mut [HirStmt]) -> bool {
+    let mut changed = false;
+    let mut index = 0;
+
+    while index + 1 < stmts.len() {
+        let Some(rewrite) = nil_fallback_alias_rewrite(&stmts[index], &stmts[index + 1]) else {
+            index += 1;
+            continue;
+        };
+
+        stmts[index] = HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![rewrite.target],
+            values: vec![HirExpr::LocalRef(rewrite.source)],
+        }));
+        stmts[index + 1] = HirStmt::If(Box::new(HirIf {
+            cond: nil_check_for_local(rewrite.target),
+            then_block: rewrite.then_block,
+            else_block: None,
+        }));
+        changed = true;
+        index += 2;
+    }
+
+    changed
+}
+
+struct NilFallbackAliasRewrite {
+    target: LocalId,
+    source: LocalId,
+    then_block: HirBlock,
+}
+
+fn nil_fallback_alias_rewrite(
+    decl_stmt: &HirStmt,
+    if_stmt: &HirStmt,
+) -> Option<NilFallbackAliasRewrite> {
+    let target = empty_single_local_decl_binding(decl_stmt)?;
+    let HirStmt::If(if_stmt) = if_stmt else {
+        return None;
+    };
+    let else_block = if_stmt.else_block.as_ref()?;
+    let (source, fallback_block) = if let Some(source) = nil_check_local(&if_stmt.cond) {
+        let then_value = terminal_local_assign_value(&if_stmt.then_block, target)?;
+        let else_value = single_local_assign_value(else_block, target)?;
+        if !matches!(else_value, HirExpr::LocalRef(local) if *local == source)
+            || expr_mentions_local(then_value, target)
+        {
+            return None;
+        }
+        (source, if_stmt.then_block.clone())
+    } else {
+        let source = negated_nil_check_local(&if_stmt.cond)?;
+        let then_value = single_local_assign_value(&if_stmt.then_block, target)?;
+        let else_value = terminal_local_assign_value(else_block, target)?;
+        if !matches!(then_value, HirExpr::LocalRef(local) if *local == source)
+            || expr_mentions_local(else_value, target)
+        {
+            return None;
+        }
+        (source, else_block.clone())
+    };
+    Some(NilFallbackAliasRewrite {
+        target,
+        source,
+        then_block: fallback_block,
+    })
+}
+
+fn nil_check_local(expr: &HirExpr) -> Option<LocalId> {
+    let HirExpr::Binary(binary) = expr else {
+        return None;
+    };
+    if binary.op != HirBinaryOpKind::Eq {
+        return None;
+    }
+    match (&binary.lhs, &binary.rhs) {
+        (HirExpr::LocalRef(local), HirExpr::Nil) | (HirExpr::Nil, HirExpr::LocalRef(local)) => {
+            Some(*local)
+        }
+        _ => None,
+    }
+}
+
+fn negated_nil_check_local(expr: &HirExpr) -> Option<LocalId> {
+    let HirExpr::Unary(unary) = expr else {
+        return None;
+    };
+    (unary.op == HirUnaryOpKind::Not)
+        .then(|| nil_check_local(&unary.expr))
+        .flatten()
+}
+
+fn nil_check_for_local(local: LocalId) -> HirExpr {
+    HirExpr::Binary(Box::new(HirBinaryExpr {
+        op: HirBinaryOpKind::Eq,
+        lhs: HirExpr::LocalRef(local),
+        rhs: HirExpr::Nil,
+    }))
+}
+
+fn single_local_assign_value(block: &HirBlock, target: LocalId) -> Option<&HirExpr> {
+    let [HirStmt::Assign(assign)] = block.stmts.as_slice() else {
+        return None;
+    };
+    single_assign_value(assign, target)
+}
+
+fn terminal_local_assign_value(block: &HirBlock, target: LocalId) -> Option<&HirExpr> {
+    let HirStmt::Assign(assign) = block.stmts.last()? else {
+        return None;
+    };
+    single_assign_value(assign, target)
 }
 
 fn collapsible_branch_value_local(
@@ -180,7 +300,8 @@ enum BranchValueGotoFoldKind {
 
 fn find_branch_value_goto_label_fold(stmts: &[HirStmt]) -> Option<BranchValueGotoFold> {
     let label_refs = count_label_references(stmts);
-    find_nested_default_goto_label_fold(stmts, &label_refs)
+    let label_indices = index_top_level_labels(stmts);
+    find_nested_default_goto_label_fold(stmts, &label_refs, &label_indices)
         .or_else(|| find_direct_goto_label_fold(stmts, &label_refs))
 }
 
@@ -216,16 +337,22 @@ fn find_direct_goto_label_fold(
 fn find_nested_default_goto_label_fold(
     stmts: &[HirStmt],
     label_refs: &BTreeMap<HirLabelId, usize>,
+    label_indices: &BTreeMap<HirLabelId, usize>,
 ) -> Option<BranchValueGotoFold> {
     if stmts.len() < 5 {
         return None;
     }
 
     for if_index in (0..stmts.len()).rev() {
-        let Some((default_label_index, default_label)) = find_default_label_index(stmts, if_index)
-        else {
+        let Some(default_label) = single_goto_if_target(&stmts[if_index]) else {
             continue;
         };
+        let Some(default_label_index) = label_indices.get(&default_label).copied() else {
+            continue;
+        };
+        if default_label_index <= if_index {
+            continue;
+        }
         let Some(label_index) = default_label_index.checked_add(2) else {
             continue;
         };
@@ -259,12 +386,15 @@ fn find_nested_default_goto_label_fold(
     None
 }
 
-fn find_default_label_index(stmts: &[HirStmt], if_index: usize) -> Option<(usize, HirLabelId)> {
-    let target = single_goto_if_target(stmts.get(if_index)?)?;
-    stmts[(if_index + 1)..]
+fn index_top_level_labels(stmts: &[HirStmt]) -> BTreeMap<HirLabelId, usize> {
+    stmts
         .iter()
-        .position(|stmt| matches!(stmt, HirStmt::Label(label) if label.id == target))
-        .map(|offset| (if_index + 1 + offset, target))
+        .enumerate()
+        .filter_map(|(index, stmt)| match stmt {
+            HirStmt::Label(label) => Some((label.id, index)),
+            _ => None,
+        })
+        .collect()
 }
 
 fn direct_goto_value_matches(

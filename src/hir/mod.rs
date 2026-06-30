@@ -1,12 +1,13 @@
 //! 这个模块承载 HIR 层的共享实现。
 //!
-//! 这一层开始正式做“恢复决策”，但第一版仍然允许大量 fallback，重点是先把
-//! low-IR 可靠提升到变量世界，并让后续 AST/Readability 有稳定的中间表示可吃。
+//! 这一层正式消费 StructureFacts 做恢复决策，把 low-IR 提升到变量世界，并让
+//! 后续 AST/Readability 有稳定的语义中间表示可消费。
 
 mod analyze;
 mod common;
 mod debug;
 mod decision;
+mod expr_safety;
 mod promotion;
 mod simplify;
 pub(crate) mod traverse;

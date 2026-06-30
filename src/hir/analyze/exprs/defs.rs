@@ -56,7 +56,9 @@ pub(crate) fn expr_for_fixed_def(lowering: &ProtoLowering<'_>, def_id: DefId) ->
                     .map(|capture| HirCapture {
                         value: match capture.source {
                             crate::transformer::CaptureSource::Reg(reg) if reg == closure.dst => {
-                                HirExpr::TempRef(lowering.bindings.fixed_temps[def_id.index()])
+                                lowering
+                                    .bindings
+                                    .expr_for_temp(lowering.bindings.fixed_temps[def_id.index()])
                             }
                             crate::transformer::CaptureSource::Reg(reg) => {
                                 expr_for_reg_use_inline(lowering, def_block, def_instr, reg)

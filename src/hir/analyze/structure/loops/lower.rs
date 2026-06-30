@@ -8,6 +8,8 @@
 use crate::structure::SsaValue;
 
 use super::*;
+use crate::hir::expr_safety::expr_observes_eval_order;
+use crate::hir::{HirTableField, HirTableKey};
 
 impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     pub(crate) fn lower_loop(
@@ -158,6 +160,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let condition_prefix_temps = self.block_condition_prefix_temps(candidate.header);
         let header_prefix_must_stay_in_body = self
             .header_prefix_has_live_non_condition_defs(candidate.header, &condition_prefix_temps);
+        self.remove_reordered_condition_prefix_overrides(
+            candidate.header,
+            &cond,
+            &mut cond_expr_overrides,
+        );
         cond_expr_overrides.extend(temp_expr_overrides(&combined_target_overrides));
         rewrite_expr_temps(&mut cond, &cond_expr_overrides);
 
@@ -198,6 +205,36 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         Some(Some(exit))
+    }
+
+    fn remove_reordered_condition_prefix_overrides(
+        &self,
+        header: BlockRef,
+        cond: &HirExpr,
+        expr_overrides: &mut BTreeMap<TempId, HirExpr>,
+    ) {
+        let def_order = self.block_prefix_temp_def_order(header);
+        let mut last_order = None;
+        let mut reordered = false;
+        for temp in temp_refs_in_eval_order(cond) {
+            let Some(expr) = expr_overrides.get(&temp) else {
+                continue;
+            };
+            if !expr_observes_eval_order(expr) {
+                continue;
+            }
+            let Some(order) = def_order.get(&temp).copied() else {
+                continue;
+            };
+            if last_order.is_some_and(|last| order < last) {
+                reordered = true;
+                break;
+            }
+            last_order = Some(order);
+        }
+        if reordered {
+            expr_overrides.retain(|_, expr| !expr_observes_eval_order(expr));
+        }
     }
 
     fn lower_while_true_loop(
@@ -638,5 +675,84 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         })));
 
         Some(Some(exit))
+    }
+}
+
+fn temp_refs_in_eval_order(expr: &HirExpr) -> Vec<TempId> {
+    let mut refs = Vec::new();
+    collect_temp_refs_in_eval_order(expr, &mut refs);
+    refs
+}
+
+fn collect_temp_refs_in_eval_order(expr: &HirExpr, refs: &mut Vec<TempId>) {
+    match expr {
+        HirExpr::TempRef(temp) => refs.push(*temp),
+        HirExpr::TableAccess(access) => {
+            collect_temp_refs_in_eval_order(&access.base, refs);
+            collect_temp_refs_in_eval_order(&access.key, refs);
+        }
+        HirExpr::Unary(unary) => collect_temp_refs_in_eval_order(&unary.expr, refs),
+        HirExpr::Binary(binary) => {
+            collect_temp_refs_in_eval_order(&binary.lhs, refs);
+            collect_temp_refs_in_eval_order(&binary.rhs, refs);
+        }
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            collect_temp_refs_in_eval_order(&logical.lhs, refs);
+            collect_temp_refs_in_eval_order(&logical.rhs, refs);
+        }
+        HirExpr::Decision(decision) => {
+            for node in &decision.nodes {
+                collect_temp_refs_in_eval_order(&node.test, refs);
+                collect_decision_target_temp_refs(&node.truthy, refs);
+                collect_decision_target_temp_refs(&node.falsy, refs);
+            }
+        }
+        HirExpr::Call(call) => {
+            collect_temp_refs_in_eval_order(&call.callee, refs);
+            for arg in &call.args {
+                collect_temp_refs_in_eval_order(arg, refs);
+            }
+        }
+        HirExpr::TableConstructor(table) => {
+            for field in &table.fields {
+                match field {
+                    HirTableField::Array(value) => collect_temp_refs_in_eval_order(value, refs),
+                    HirTableField::Record(record) => {
+                        if let HirTableKey::Expr(key) = &record.key {
+                            collect_temp_refs_in_eval_order(key, refs);
+                        }
+                        collect_temp_refs_in_eval_order(&record.value, refs);
+                    }
+                }
+            }
+            if let Some(trailing) = &table.trailing_multivalue {
+                collect_temp_refs_in_eval_order(trailing, refs);
+            }
+        }
+        HirExpr::Closure(closure) => {
+            for capture in &closure.captures {
+                collect_temp_refs_in_eval_order(&capture.value, refs);
+            }
+        }
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
+        | HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::VarArg
+        | HirExpr::Unresolved(_) => {}
+    }
+}
+
+fn collect_decision_target_temp_refs(target: &HirDecisionTarget, refs: &mut Vec<TempId>) {
+    if let HirDecisionTarget::Expr(expr) = target {
+        collect_temp_refs_in_eval_order(expr, refs);
     }
 }

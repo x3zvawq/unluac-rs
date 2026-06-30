@@ -22,6 +22,7 @@ pub(super) fn inline_candidate(stmt: &HirStmt) -> Option<(TempId, &HirExpr)> {
 
 pub(super) struct NextStmtState {
     pub temp_uses: TempUseSummary,
+    pub call_callee_materialized_at: Option<usize>,
 }
 
 pub(super) enum TempUseSummary {

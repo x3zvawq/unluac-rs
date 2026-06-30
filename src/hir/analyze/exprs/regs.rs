@@ -29,8 +29,12 @@ pub(crate) fn expr_for_reg_use(
             .next()
             .expect("len checked above, exactly one SSA-like value exists");
         return match value {
-            SsaValue::Def(def) => HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()]),
-            SsaValue::Phi(phi) => HirExpr::TempRef(lowering.bindings.phi_temps[phi.index()]),
+            SsaValue::Def(def) => lowering
+                .bindings
+                .expr_for_temp(lowering.bindings.fixed_temps[def.index()]),
+            SsaValue::Phi(phi) => lowering
+                .bindings
+                .expr_for_temp(lowering.bindings.phi_temps[phi.index()]),
         };
     }
 
@@ -54,9 +58,12 @@ pub(crate) fn expr_for_closure_capture(
                 .first()
                 .copied()
                 .expect("closure writes exactly one fixed target");
-            HirExpr::TempRef(self_temp)
+            lowering.bindings.expr_for_temp(self_temp)
         }
         crate::transformer::CaptureSource::Reg(reg) => {
+            if let Some(target) = lowering.bindings.closure_capture_target(instr_ref, reg) {
+                return target.expr();
+            }
             // 先尝试正常的 SSA use-def 解析
             let expr = expr_for_reg_use(lowering, block, instr_ref, reg);
             // 互递归前向声明模式：Lua upvalue 是引用变量槽而非快照，closure 实际执行
@@ -141,7 +148,7 @@ fn forward_def_in_block(
             }
         }
     }
-    last_def_temp.map(HirExpr::TempRef)
+    last_def_temp.map(|temp| lowering.bindings.expr_for_temp(temp))
 }
 
 /// 某些结构恢复需要读取“进入 block 时这个寄存器代表哪个稳定值”，而不是某条真实 use。
@@ -175,8 +182,12 @@ pub(crate) fn expr_for_reg_at_block_entry(
             .next()
             .expect("len checked above, exactly one SSA-like value exists");
         return match value {
-            SsaValue::Def(def) => HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()]),
-            SsaValue::Phi(phi) => HirExpr::TempRef(lowering.bindings.phi_temps[phi.index()]),
+            SsaValue::Def(def) => lowering
+                .bindings
+                .expr_for_temp(lowering.bindings.fixed_temps[def.index()]),
+            SsaValue::Phi(phi) => lowering
+                .bindings
+                .expr_for_temp(lowering.bindings.phi_temps[phi.index()]),
         };
     }
 
@@ -215,7 +226,9 @@ pub(crate) fn expr_for_reg_at_block_exit(
                 block.index()
             ));
         };
-        return HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()]);
+        return lowering
+            .bindings
+            .expr_for_temp(lowering.bindings.fixed_temps[def.index()]);
     }
 
     let mut values = lowering
@@ -245,8 +258,12 @@ pub(crate) fn expr_for_reg_at_block_exit(
             .next()
             .expect("len checked above, exactly one SSA-like value exists");
         return match value {
-            SsaValue::Def(def) => HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()]),
-            SsaValue::Phi(phi) => HirExpr::TempRef(lowering.bindings.phi_temps[phi.index()]),
+            SsaValue::Def(def) => lowering
+                .bindings
+                .expr_for_temp(lowering.bindings.fixed_temps[def.index()]),
+            SsaValue::Phi(phi) => lowering
+                .bindings
+                .expr_for_temp(lowering.bindings.phi_temps[phi.index()]),
         };
     }
 
@@ -285,9 +302,14 @@ pub(crate) fn expr_for_reg_use_inline(
             .next()
             .expect("len checked above, exactly one SSA-like value exists");
         return match value {
-            SsaValue::Def(def) => expr_for_dup_safe_fixed_def(lowering, def)
-                .unwrap_or_else(|| HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()])),
-            SsaValue::Phi(phi) => HirExpr::TempRef(lowering.bindings.phi_temps[phi.index()]),
+            SsaValue::Def(def) => expr_for_dup_safe_fixed_def(lowering, def).unwrap_or_else(|| {
+                lowering
+                    .bindings
+                    .expr_for_temp(lowering.bindings.fixed_temps[def.index()])
+            }),
+            SsaValue::Phi(phi) => lowering
+                .bindings
+                .expr_for_temp(lowering.bindings.phi_temps[phi.index()]),
         };
     }
 
@@ -333,21 +355,32 @@ pub(crate) fn expr_for_reg_use_single_eval_with_call_policy(
         return match value {
             SsaValue::Def(def) => {
                 if lowering.dataflow.def_block(def) != block {
-                    return HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()]);
+                    return lowering
+                        .bindings
+                        .expr_for_temp(lowering.bindings.fixed_temps[def.index()]);
                 }
                 if def_has_intervening_use(lowering, def, instr_ref) {
-                    return HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()]);
+                    return lowering
+                        .bindings
+                        .expr_for_temp(lowering.bindings.fixed_temps[def.index()]);
                 }
                 if def_is_call_consumed_by_non_branch(lowering, def, instr_ref)
                     && (!allow_call_consumed_by_pure_wrapper
                         || def_has_later_use_after_pure_wrapper(lowering, def, instr_ref))
                 {
-                    return HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()]);
+                    return lowering
+                        .bindings
+                        .expr_for_temp(lowering.bindings.fixed_temps[def.index()]);
                 }
-                expr_for_fixed_def_single_eval(lowering, def)
-                    .unwrap_or_else(|| HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()]))
+                expr_for_fixed_def_single_eval(lowering, def).unwrap_or_else(|| {
+                    lowering
+                        .bindings
+                        .expr_for_temp(lowering.bindings.fixed_temps[def.index()])
+                })
             }
-            SsaValue::Phi(phi) => HirExpr::TempRef(lowering.bindings.phi_temps[phi.index()]),
+            SsaValue::Phi(phi) => lowering
+                .bindings
+                .expr_for_temp(lowering.bindings.phi_temps[phi.index()]),
         };
     }
 

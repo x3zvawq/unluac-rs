@@ -13,12 +13,25 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{LocalId, ParamId, TempId, UpvalueId};
 use crate::parser::RawLocalVar;
-use crate::structure::{BlockRef, Cfg, DataflowFacts, GraphFacts, OpenDef};
+use crate::structure::{BlockRef, Cfg, DataflowFacts, DefId, GraphFacts, OpenDef};
 use crate::structure::{LoopSourceBindings, StructureFacts};
-use crate::transformer::{InstrRef, LoweredProto, Reg};
+use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto, Reg};
 
 use super::ProtoBindings;
 use super::helpers::decode_raw_string;
+use super::lower::BoundSlotTarget;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+struct CapturedSlotKey {
+    slot: usize,
+    epoch: usize,
+}
+
+impl CapturedSlotKey {
+    fn new(slot: usize, epoch: usize) -> Self {
+        Self { slot, epoch }
+    }
+}
 
 pub(super) fn build_bindings(
     proto: &LoweredProto,
@@ -66,6 +79,15 @@ pub(super) fn build_bindings(
             local,
         );
     }
+
+    let captured_slots = collect_captured_slot_targets(
+        proto,
+        dataflow,
+        &params,
+        &entry_local_regs,
+        &mut locals,
+        &mut local_debug_hints,
+    );
 
     for candidate in &structure.loop_candidates {
         match candidate.source_bindings {
@@ -153,6 +175,15 @@ pub(super) fn build_bindings(
             debug_local_name_for_reg_at_block_entry(proto, cfg, phi.block, phi.reg);
     }
 
+    let captured_temp_facts = collect_captured_temp_facts(
+        proto,
+        cfg,
+        dataflow,
+        &fixed_temps,
+        &phi_temps,
+        &captured_slots,
+    );
+
     let instr_fixed_defs = dataflow
         .instr_defs
         .iter()
@@ -185,10 +216,200 @@ pub(super) fn build_bindings(
         phi_temps,
         instr_fixed_defs,
         instr_open_defs,
+        captured_temp_targets: captured_temp_facts.targets,
+        captured_temp_decl_locals: captured_temp_facts.decl_temps,
+        capture_empty_local_decls: captured_temp_facts.empty_decls,
+        closure_capture_targets: captured_slots.capture_targets,
         entry_local_regs,
         numeric_for_locals,
         generic_for_locals,
         block_local_regs,
+    }
+}
+
+struct CapturedSlotTargets {
+    slot_targets: BTreeMap<CapturedSlotKey, BoundSlotTarget>,
+    capture_targets: BTreeMap<(usize, usize), BoundSlotTarget>,
+}
+
+fn collect_captured_slot_targets(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    params: &[ParamId],
+    entry_local_regs: &BTreeMap<Reg, LocalId>,
+    locals: &mut Vec<LocalId>,
+    local_debug_hints: &mut Vec<Option<String>>,
+) -> CapturedSlotTargets {
+    let mut slot_targets = BTreeMap::new();
+    let mut capture_targets = BTreeMap::new();
+    let mut epochs = vec![0usize; usize::from(proto.frame.max_stack_size).saturating_add(1)];
+
+    for (instr_index, instr) in proto.instrs.iter().enumerate() {
+        if let LowInstr::Closure(closure) = instr {
+            for capture in &closure.captures {
+                let CaptureSource::Reg(reg) = capture.source else {
+                    continue;
+                };
+                if reg == closure.dst {
+                    continue;
+                }
+                if reg.index() < params.len()
+                    || entry_local_regs.contains_key(&reg)
+                    || !capture_has_no_reaching_value(dataflow, InstrRef(instr_index), reg)
+                {
+                    continue;
+                }
+
+                ensure_epoch_slot(&mut epochs, reg);
+                let key = CapturedSlotKey::new(reg.index(), epochs[reg.index()]);
+                let target = if let Some(target) = slot_targets.get(&key).copied() {
+                    target
+                } else {
+                    let local = LocalId(locals.len());
+                    locals.push(local);
+                    local_debug_hints.push(debug_local_name_for_reg_at_instr(
+                        proto,
+                        reg,
+                        InstrRef(instr_index),
+                    ));
+                    let target = BoundSlotTarget::Local(local);
+                    slot_targets.insert(key, target);
+                    target
+                };
+                slot_targets.entry(key).or_insert(target);
+                capture_targets.insert((instr_index, reg.index()), target);
+            }
+        }
+
+        if let LowInstr::Close(close) = instr {
+            ensure_epoch_slot(&mut epochs, close.from);
+            for epoch in epochs.iter_mut().skip(close.from.index()) {
+                *epoch += 1;
+            }
+        }
+    }
+
+    CapturedSlotTargets {
+        slot_targets,
+        capture_targets,
+    }
+}
+
+fn capture_has_no_reaching_value(dataflow: &DataflowFacts, instr_ref: InstrRef, reg: Reg) -> bool {
+    dataflow
+        .use_values_at(instr_ref)
+        .get(reg)
+        .is_none_or(|values| values.is_empty())
+}
+
+struct CapturedTempFacts {
+    targets: BTreeMap<TempId, BoundSlotTarget>,
+    decl_temps: BTreeMap<TempId, LocalId>,
+    empty_decls: BTreeMap<usize, Vec<LocalId>>,
+}
+
+fn collect_captured_temp_facts(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    fixed_temps: &[TempId],
+    phi_temps: &[TempId],
+    captured_slots: &CapturedSlotTargets,
+) -> CapturedTempFacts {
+    if captured_slots.slot_targets.is_empty() {
+        return CapturedTempFacts {
+            targets: BTreeMap::new(),
+            decl_temps: BTreeMap::new(),
+            empty_decls: BTreeMap::new(),
+        };
+    }
+
+    let mut targets = BTreeMap::new();
+    let mut decl_temps = BTreeMap::new();
+    let mut empty_decls = BTreeMap::<usize, Vec<LocalId>>::new();
+    let mut declared_locals = BTreeSet::new();
+    let mut defs_by_instr = vec![Vec::<(DefId, Reg)>::new(); proto.instrs.len()];
+    for def in &dataflow.defs {
+        defs_by_instr[def.instr.index()].push((def.id, def.reg));
+    }
+
+    let mut phis_by_instr = vec![Vec::<(crate::structure::PhiId, Reg)>::new(); proto.instrs.len()];
+    for phi in &dataflow.phi_candidates {
+        let instrs = cfg.blocks[phi.block.index()].instrs;
+        if instrs.is_empty() {
+            continue;
+        }
+        phis_by_instr[instrs.start.index()].push((phi.id, phi.reg));
+    }
+
+    let mut epochs = vec![0usize; usize::from(proto.frame.max_stack_size).saturating_add(1)];
+    for (instr_index, instr) in proto.instrs.iter().enumerate() {
+        if let LowInstr::Closure(closure) = instr {
+            for capture in &closure.captures {
+                let CaptureSource::Reg(reg) = capture.source else {
+                    continue;
+                };
+                let Some(BoundSlotTarget::Local(local)) =
+                    target_for_slot(reg, &mut epochs, captured_slots)
+                else {
+                    continue;
+                };
+                if declared_locals.insert(local) {
+                    empty_decls.entry(instr_index).or_default().push(local);
+                }
+            }
+        }
+
+        for (phi_id, reg) in phis_by_instr[instr_index].iter().copied() {
+            if let Some(target) = target_for_slot(reg, &mut epochs, captured_slots)
+                && let Some(temp) = phi_temps.get(phi_id.index()).copied()
+            {
+                targets.insert(temp, target);
+            }
+        }
+
+        for (def_id, reg) in defs_by_instr[instr_index].iter().copied() {
+            if let Some(target) = target_for_slot(reg, &mut epochs, captured_slots)
+                && let Some(temp) = fixed_temps.get(def_id.index()).copied()
+            {
+                targets.insert(temp, target);
+                let BoundSlotTarget::Local(local) = target;
+                if declared_locals.insert(local) {
+                    decl_temps.insert(temp, local);
+                }
+            }
+        }
+
+        if let LowInstr::Close(close) = instr {
+            ensure_epoch_slot(&mut epochs, close.from);
+            for epoch in epochs.iter_mut().skip(close.from.index()) {
+                *epoch += 1;
+            }
+        }
+    }
+
+    CapturedTempFacts {
+        targets,
+        decl_temps,
+        empty_decls,
+    }
+}
+
+fn target_for_slot(
+    reg: Reg,
+    epochs: &mut Vec<usize>,
+    captured_slots: &CapturedSlotTargets,
+) -> Option<BoundSlotTarget> {
+    ensure_epoch_slot(epochs, reg);
+    captured_slots
+        .slot_targets
+        .get(&CapturedSlotKey::new(reg.index(), epochs[reg.index()]))
+        .copied()
+}
+
+fn ensure_epoch_slot(epochs: &mut Vec<usize>, reg: Reg) {
+    if reg.index() >= epochs.len() {
+        epochs.resize(reg.index() + 1, 0);
     }
 }
 

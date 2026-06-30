@@ -20,6 +20,10 @@ pub(super) fn expr_mentions_local(expr: &HirExpr, local: LocalId) -> bool {
     LocalMentionCollector::mentions_in_expr(expr, local)
 }
 
+pub(super) fn stmt_captures_local(stmt: &HirStmt, local: LocalId) -> bool {
+    LocalCaptureCollector::captures_in_stmt(stmt, local)
+}
+
 pub(super) fn stmts_mention_temp(stmts: &[HirStmt], temp: TempId) -> bool {
     TempMentionCollector::mentions_in_stmts(stmts, temp)
 }
@@ -69,6 +73,33 @@ impl HirVisitor for LocalMentionCollector {
 
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
         self.mentioned |= matches!(lvalue, HirLValue::Local(local) if *local == self.local);
+    }
+}
+
+struct LocalCaptureCollector {
+    local: LocalId,
+    captured: bool,
+}
+
+impl LocalCaptureCollector {
+    fn captures_in_stmt(stmt: &HirStmt, local: LocalId) -> bool {
+        let mut collector = Self {
+            local,
+            captured: false,
+        };
+        visit_stmts(std::slice::from_ref(stmt), &mut collector);
+        collector.captured
+    }
+}
+
+impl HirVisitor for LocalCaptureCollector {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        if let HirExpr::Closure(closure) = expr {
+            self.captured |= closure
+                .captures
+                .iter()
+                .any(|capture| expr_mentions_local(&capture.value, self.local));
+        }
     }
 }
 

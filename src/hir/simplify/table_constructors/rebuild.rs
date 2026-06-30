@@ -380,13 +380,6 @@ fn flush_constructor_segment(
                             let value = inline_set_list_value(context, value)?;
                             builder.push_array_value(value);
                         }
-                        Some(_)
-                            if queued_values
-                                .iter()
-                                .any(|value| matches_binding_ref(value, producer.binding)) =>
-                        {
-                            return None;
-                        }
                         _ => {}
                     }
                 }
@@ -472,16 +465,14 @@ fn flush_set_list_values_before_producer(
     producer_binding: TableBinding,
     context: &mut RegionRebuildContext<'_>,
 ) -> Option<()> {
-    while queued_values
-        .front()
-        .is_some_and(|front| !matches_binding_ref(front, producer_binding))
-    {
-        if !queued_values
-            .iter()
-            .any(|value| matches_binding_ref(value, producer_binding))
-        {
-            return Some(());
-        }
+    let Some(target_offset) = queued_values
+        .iter()
+        .position(|value| matches_binding_ref(value, producer_binding))
+    else {
+        return Some(());
+    };
+
+    for _ in 0..target_offset {
         let front = queued_values.front()?;
         if expr_mentions_any_pending_binding(
             front,

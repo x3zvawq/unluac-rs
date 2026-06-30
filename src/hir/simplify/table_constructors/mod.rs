@@ -181,7 +181,7 @@ impl HirRewritePass for TableConstructorPass {
                     stmt_bindings.drain(index + 1..=drain_end);
                 } else {
                     for i in (index + 1..=drain_end).rev() {
-                        if !retained_stmts.contains(&i) {
+                        if retained_stmts.binary_search(&i).is_err() {
                             block.stmts.remove(i);
                             stmt_bindings.remove(i);
                         }

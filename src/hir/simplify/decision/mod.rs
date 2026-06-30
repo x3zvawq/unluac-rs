@@ -60,24 +60,25 @@ impl ExprRewritePass for DecisionExprPass {
             *expr = replacement;
             changed = true;
         }
-        if let Some(replacement) = simplify_condition_truthiness_shape(expr) {
-            *expr = replacement;
-            changed = true;
-        }
 
         changed
     }
 
     fn rewrite_condition_expr(&mut self, expr: &mut HirExpr) -> bool {
+        let mut changed = false;
         if let HirExpr::Decision(decision) = expr
             && !decision_has_shared_nodes(decision)
             && !decision_has_cycles(decision)
             && let Some(replacement) = collapse_condition_decision_expr(decision)
         {
             *expr = replacement;
-            return true;
+            changed = true;
         }
-        false
+        if let Some(replacement) = simplify_condition_truthiness_shape(expr) {
+            *expr = replacement;
+            changed = true;
+        }
+        changed
     }
 }
 

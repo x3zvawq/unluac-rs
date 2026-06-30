@@ -6,7 +6,7 @@
 
 mod branches;
 
-use std::cell::RefCell;
+use std::{cell::RefCell, ops::Range};
 
 use super::rewrites::expr_has_temp_ref_in;
 use super::*;
@@ -134,12 +134,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .iter()
             .map(|candidate| (candidate.header, candidate))
             .collect();
-        let branch_value_merges_by_header = lowering
-            .structure
-            .branch_value_merge_candidates
-            .iter()
-            .map(|candidate| (candidate.header, candidate))
-            .collect();
+        let branch_value_merges_by_header =
+            unique_branch_value_merges_by_header(&lowering.structure.branch_value_merge_candidates);
         let branch_regions_by_header = lowering
             .structure
             .branch_region_facts
@@ -541,28 +537,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 rewrite_stmt_targets(stmt, target_overrides);
             }
         }
-        let range = self.lowering.cfg.blocks[block.index()].instrs;
-        if range.is_empty() {
-            return Some(stmts);
-        }
-
         let entry_expr_overrides = self.block_entry_expr_overrides(block);
-
-        let end = if let Some((_instr_ref, instr)) = self.block_terminator(block) {
-            if expect_branch_terminator && !matches!(instr, LowInstr::Branch(_)) {
-                return None;
-            }
-
-            if is_control_terminator(instr) {
-                range.end() - 1
-            } else {
-                range.end()
-            }
-        } else {
-            range.end()
-        };
-
-        for instr_index in range.start.index()..end {
+        for instr_index in self.block_prefix_instr_indices(block, expect_branch_terminator)? {
             let instr_ref = InstrRef(instr_index);
             let instr = &self.lowering.proto.instrs[instr_index];
             if self.overrides.instr_is_suppressed(instr_ref) {
@@ -1232,21 +1208,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         header: BlockRef,
         consumed_headers: &BTreeSet<BlockRef>,
     ) -> bool {
-        let range = self.lowering.cfg.blocks[header.index()].instrs;
-        if range.is_empty() {
+        let Some(prefix_indices) = self.block_prefix_instr_indices(header, false) else {
             return false;
-        }
-        let end = if let Some((_instr_ref, instr)) = self.block_terminator(header) {
-            if is_control_terminator(instr) {
-                range.end() - 1
-            } else {
-                range.end()
-            }
-        } else {
-            range.end()
         };
-
-        for instr_index in range.start.index()..end {
+        for instr_index in prefix_indices {
             for def in &self.lowering.dataflow.instr_defs[instr_index] {
                 for use_site in &self.lowering.dataflow.def_uses[def.index()] {
                     let use_block = self.lowering.cfg.instr_to_block[use_site.instr.index()];
@@ -1378,6 +1343,32 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     pub(super) fn block_terminator(&self, block: BlockRef) -> Option<(InstrRef, &LowInstr)> {
         let instr_ref = self.lowering.cfg.blocks[block.index()].instrs.last()?;
         Some((instr_ref, &self.lowering.proto.instrs[instr_ref.index()]))
+    }
+
+    pub(super) fn block_prefix_instr_indices(
+        &self,
+        block: BlockRef,
+        expect_branch_terminator: bool,
+    ) -> Option<Range<usize>> {
+        let range = self.lowering.cfg.blocks[block.index()].instrs;
+        if range.is_empty() {
+            return Some(range.start.index()..range.start.index());
+        }
+
+        let end = if let Some((_instr_ref, instr)) = self.block_terminator(block) {
+            if expect_branch_terminator && !matches!(instr, LowInstr::Branch(_)) {
+                return None;
+            }
+
+            if is_control_terminator(instr) {
+                range.end() - 1
+            } else {
+                range.end()
+            }
+        } else {
+            range.end()
+        };
+        Some(range.start.index()..end)
     }
 
     fn next_linear_successor(
@@ -1662,8 +1653,20 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             if let Some(result) = memo.get(&block).copied() {
                 return result;
             }
+            if let Some(loop_candidate) = lowerer.loop_by_header.get(&block).copied()
+                && loop_candidate.reducible
+            {
+                let result = loop_candidate
+                    .exits
+                    .iter()
+                    .all(|exit| visit(lowerer, *exit, classify_boundary, visiting, memo));
+                memo.insert(block, result);
+                return result;
+            }
             if !visiting.insert(block) {
-                return true;
+                // 已分类的 loop escape/continuation 会在 classify_boundary 里返回。
+                // 走到这里的回环还没有结构化 owner，不能证明所有路径都到达目标边界。
+                return false;
             }
 
             let result = lowerer.lowering.cfg.succs[block.index()]
@@ -1899,6 +1902,25 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     )
             })
     }
+}
+
+fn unique_branch_value_merges_by_header(
+    candidates: &[BranchValueMergeCandidate],
+) -> BTreeMap<BlockRef, &BranchValueMergeCandidate> {
+    let mut by_header = BTreeMap::new();
+    let mut duplicated_headers = BTreeSet::new();
+
+    for candidate in candidates {
+        if by_header.insert(candidate.header, candidate).is_some() {
+            duplicated_headers.insert(candidate.header);
+        }
+    }
+
+    for header in duplicated_headers {
+        by_header.remove(&header);
+    }
+
+    by_header
 }
 
 fn supports_structured_goto_requirement(reason: GotoReason) -> bool {

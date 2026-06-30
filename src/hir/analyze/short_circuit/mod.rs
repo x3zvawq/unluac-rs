@@ -45,8 +45,8 @@ pub(super) use self::recovery::{
     BranchShortCircuitPlan, build_branch_short_circuit_plan, build_conditional_reassign_plan,
     consumed_value_merge_subject_instrs,
     recover_short_value_merge_expr_recovery_with_allowed_blocks,
-    recover_short_value_merge_expr_with_allowed_blocks, value_merge_candidate_by_header,
-    value_merge_candidates_in_block, value_merge_skipped_blocks,
+    recover_short_value_merge_expr_with_allowed_blocks, same_value_merge_shape,
+    value_merge_candidate_by_header, value_merge_candidates_in_block, value_merge_skipped_blocks,
 };
 use super::ProtoLowering;
 use super::exprs::{

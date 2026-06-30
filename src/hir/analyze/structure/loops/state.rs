@@ -544,7 +544,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .loop_state_inside_exit_blocks(candidate, exit)
             .unwrap_or_else(|| candidate.blocks.clone());
 
-        self.apply_exit_phi_bindings(candidate, exit, &inside_exit_blocks, plan, target_overrides);
+        let state_by_reg = state_slots_by_reg(&plan.states);
+        self.apply_exit_phi_bindings(
+            candidate,
+            exit,
+            &inside_exit_blocks,
+            &state_by_reg,
+            target_overrides,
+        );
 
         // branch_exit 本身可能只是一条 "cond 不成立 → JMP 到真正 post-loop" 的
         // 线性 pad（典型触发：lua5.4 下 `while cond do ... goto L end` 让
@@ -567,7 +574,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 candidate,
                 downstream,
                 &inside_with_pad,
-                plan,
+                &state_by_reg,
                 target_overrides,
             );
         }
@@ -582,14 +589,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         candidate: &LoopCandidate,
         at_block: BlockRef,
         inside_exit_blocks: &BTreeSet<BlockRef>,
-        plan: &LoopStatePlan,
+        state_by_reg: &BTreeMap<Reg, &LoopStateSlot>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) {
-        let state_by_reg = plan
-            .states
-            .iter()
-            .map(|state| (state.reg, state))
-            .collect::<BTreeMap<_, _>>();
         for value in Self::exit_values(candidate, at_block) {
             if let Some(state) = state_by_reg.get(&value.reg) {
                 let Some(state_expr) = lvalue_as_expr(&state.target) else {
@@ -1203,10 +1205,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return combined;
         }
 
-        let state_by_reg = states
-            .iter()
-            .map(|state| (state.reg, state))
-            .collect::<BTreeMap<_, _>>();
+        let state_by_reg = state_slots_by_reg(states);
         let range = self.lowering.cfg.blocks[block.index()].instrs;
         for instr_index in range.start.index()..range.end() {
             for def_id in &self.lowering.dataflow.instr_defs[instr_index] {
@@ -1397,24 +1396,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         &self,
         block: BlockRef,
     ) -> (BTreeMap<TempId, HirExpr>, BTreeSet<TempId>) {
-        let range = self.lowering.cfg.blocks[block.index()].instrs;
-        if range.is_empty() {
+        let Some(prefix_indices) = self.block_prefix_instr_indices(block, false) else {
             return (BTreeMap::new(), BTreeSet::new());
-        }
-
-        let end = if let Some((_instr_ref, instr)) = self.block_terminator(block) {
-            if is_control_terminator(instr) {
-                range.end() - 1
-            } else {
-                range.end()
-            }
-        } else {
-            range.end()
         };
 
         let mut expr_overrides = BTreeMap::new();
         let mut all_prefix_temps = BTreeSet::new();
-        for instr_index in range.start.index()..end {
+        for instr_index in prefix_indices {
             let instr_ref = InstrRef(instr_index);
             if self.overrides.instr_is_suppressed(instr_ref) {
                 continue;
@@ -1432,4 +1420,23 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         (expr_overrides, all_prefix_temps)
     }
+
+    pub(crate) fn block_prefix_temp_def_order(&self, block: BlockRef) -> BTreeMap<TempId, usize> {
+        let Some(prefix_indices) = self.block_prefix_instr_indices(block, false) else {
+            return BTreeMap::new();
+        };
+
+        let mut def_order = BTreeMap::new();
+        for instr_index in prefix_indices {
+            for def in &self.lowering.dataflow.instr_defs[instr_index] {
+                let temp = self.lowering.bindings.fixed_temps[def.index()];
+                def_order.insert(temp, instr_index);
+            }
+        }
+        def_order
+    }
+}
+
+fn state_slots_by_reg(states: &[LoopStateSlot]) -> BTreeMap<Reg, &LoopStateSlot> {
+    states.iter().map(|state| (state.reg, state)).collect()
 }

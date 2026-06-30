@@ -2,7 +2,8 @@
 //!
 //! HIR 的 `locals` pass 会把跨语句存活的 temp 提升成 `local`。当这个 temp 只是函数
 //! 参数的 SSA merge 结果时，继续把它交给 AST readability 会让后层承担 binding
-//! 身份修复。这里直接在 HIR 把窄形状 `local L = P` 收回为对参数 `P` 的读写。
+//! 身份修复。这里直接在 HIR 把窄形状 `local L = P` / `local L; L = P`
+//! 收回为对参数 `P` 的读写。
 //!
 //! 输入形状 -> 输出形状：
 //! ```text
@@ -20,32 +21,50 @@ use crate::hir::common::{
     HirBlock, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId, ParamId,
 };
 
-use super::mention::expr_mentions_local;
+use super::mention::stmt_captures_local;
 use super::visit::{self, HirVisitor};
 use super::walk::{self, HirRewritePass};
 
 pub(super) fn coalesce_param_aliases_in_proto(proto: &mut HirProto) -> bool {
-    let Some((local, param)) = match_param_alias_first_stmt(&proto.body) else {
+    let Some(alias) = match_param_alias_prefix(&proto.body) else {
         return false;
     };
-    let rest = &proto.body.stmts[1..];
-    if rest.iter().any(|stmt| stmt_captures_local(stmt, local))
-        || !rest_reads_of_param_safe_against_writes_of_local(rest, local, param)
-        || any_local_write_inside_loop(rest, local)
+    let rest = &proto.body.stmts[alias.consumed..];
+    if rest
+        .iter()
+        .any(|stmt| stmt_captures_local(stmt, alias.local))
+        || !rest_reads_of_param_safe_against_writes_of_local(rest, alias.local, alias.param)
+        || any_local_write_inside_loop(rest, alias.local)
     {
         return false;
     }
 
-    let mut tail = proto.body.stmts.split_off(1);
-    walk::rewrite_stmts(&mut tail, &mut LocalToParamRewrite { local, param });
+    let mut tail = proto.body.stmts.split_off(alias.consumed);
+    walk::rewrite_stmts(
+        &mut tail,
+        &mut LocalToParamRewrite {
+            local: alias.local,
+            param: alias.param,
+        },
+    );
     proto.body.stmts.append(&mut tail);
-    proto.body.stmts.remove(0);
+    proto.body.stmts.drain(..alias.consumed);
     true
 }
 
-fn match_param_alias_first_stmt(block: &HirBlock) -> Option<(LocalId, ParamId)> {
-    let first = block.stmts.first()?;
-    let HirStmt::LocalDecl(local_decl) = first else {
+#[derive(Clone, Copy)]
+struct ParamAliasPrefix {
+    local: LocalId,
+    param: ParamId,
+    consumed: usize,
+}
+
+fn match_param_alias_prefix(block: &HirBlock) -> Option<ParamAliasPrefix> {
+    match_param_alias_local_decl(block).or_else(|| match_param_alias_decl_assign(block))
+}
+
+fn match_param_alias_local_decl(block: &HirBlock) -> Option<ParamAliasPrefix> {
+    let HirStmt::LocalDecl(local_decl) = block.stmts.first()? else {
         return None;
     };
     let local = single_local_binding(local_decl)?;
@@ -55,7 +74,39 @@ fn match_param_alias_first_stmt(block: &HirBlock) -> Option<(LocalId, ParamId)> 
     let HirExpr::ParamRef(param) = value else {
         return None;
     };
-    Some((local, *param))
+    Some(ParamAliasPrefix {
+        local,
+        param: *param,
+        consumed: 1,
+    })
+}
+
+fn match_param_alias_decl_assign(block: &HirBlock) -> Option<ParamAliasPrefix> {
+    let [HirStmt::LocalDecl(local_decl), HirStmt::Assign(assign), ..] = block.stmts.as_slice()
+    else {
+        return None;
+    };
+    if !local_decl.values.is_empty() {
+        return None;
+    }
+    let local = single_local_binding(local_decl)?;
+    let [target] = assign.targets.as_slice() else {
+        return None;
+    };
+    let [value] = assign.values.as_slice() else {
+        return None;
+    };
+    if !matches!(target, HirLValue::Local(target) if *target == local) {
+        return None;
+    }
+    let HirExpr::ParamRef(param) = value else {
+        return None;
+    };
+    Some(ParamAliasPrefix {
+        local,
+        param: *param,
+        consumed: 2,
+    })
 }
 
 fn single_local_binding(local_decl: &HirLocalDecl) -> Option<LocalId> {
@@ -159,31 +210,6 @@ struct ParamReadCollector {
 impl HirVisitor for ParamReadCollector {
     fn visit_expr(&mut self, expr: &HirExpr) {
         self.read |= matches!(expr, HirExpr::ParamRef(param) if *param == self.param);
-    }
-}
-
-fn stmt_captures_local(stmt: &HirStmt, local: LocalId) -> bool {
-    let mut collector = LocalCaptureCollector {
-        local,
-        captured: false,
-    };
-    visit::visit_stmts(std::slice::from_ref(stmt), &mut collector);
-    collector.captured
-}
-
-struct LocalCaptureCollector {
-    local: LocalId,
-    captured: bool,
-}
-
-impl HirVisitor for LocalCaptureCollector {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        if let HirExpr::Closure(closure) = expr {
-            self.captured |= closure
-                .captures
-                .iter()
-                .any(|capture| expr_mentions_local(&capture.value, self.local));
-        }
     }
 }
 

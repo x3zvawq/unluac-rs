@@ -57,6 +57,47 @@ pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<Inline
     }
 }
 
+pub(super) fn temp_is_first_eval_in_stmt(stmt: &HirStmt, temp: TempId) -> bool {
+    match stmt {
+        HirStmt::If(if_stmt) => temp_is_first_eval_in_expr(&if_stmt.cond, temp),
+        HirStmt::While(while_stmt) => temp_is_first_eval_in_expr(&while_stmt.cond, temp),
+        HirStmt::Repeat(repeat_stmt) => temp_is_first_eval_in_expr(&repeat_stmt.cond, temp),
+        _ => true,
+    }
+}
+
+fn temp_is_first_eval_in_expr(expr: &HirExpr, temp: TempId) -> bool {
+    match expr {
+        HirExpr::TempRef(other) => *other == temp,
+        HirExpr::TableAccess(access) => temp_is_first_eval_in_expr(&access.base, temp),
+        HirExpr::Unary(unary) => temp_is_first_eval_in_expr(&unary.expr, temp),
+        HirExpr::Binary(binary) => {
+            expr_touches_temp(&binary.lhs, temp) && temp_is_first_eval_in_expr(&binary.lhs, temp)
+        }
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            expr_touches_temp(&logical.lhs, temp) && temp_is_first_eval_in_expr(&logical.lhs, temp)
+        }
+        HirExpr::Call(call) => temp_is_first_eval_in_expr(&call.callee, temp),
+        HirExpr::Decision(_)
+        | HirExpr::TableConstructor(_)
+        | HirExpr::Closure(_)
+        | HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
+        | HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::VarArg
+        | HirExpr::Unresolved(_) => false,
+    }
+}
+
 fn find_site_in_exprs(exprs: &[HirExpr], temp: TempId, site: InlineSite) -> Option<InlineSite> {
     exprs
         .iter()
@@ -65,7 +106,7 @@ fn find_site_in_exprs(exprs: &[HirExpr], temp: TempId, site: InlineSite) -> Opti
 
 fn find_site_in_call(call: &HirCallExpr, temp: TempId, site: InlineSite) -> Option<InlineSite> {
     let callee_site = if matches!(site, InlineSite::Direct) {
-        InlineSite::Direct
+        InlineSite::CallCallee
     } else {
         InlineSite::Nested
     };
@@ -254,13 +295,14 @@ fn table_key_complexity(key: &HirTableKey) -> usize {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum InlineSite {
     Direct,
     Nested,
     ReturnValue,
     Index,
     CallArg,
+    CallCallee,
     AccessBase,
     Condition,
     LoopHead,
@@ -270,6 +312,7 @@ impl InlineSite {
     pub(super) fn allows(self, replacement: &HirExpr, options: ReadabilityOptions) -> bool {
         match self {
             Self::Direct => true,
+            Self::CallCallee => true,
             Self::Nested => {
                 expr_complexity(replacement) <= NESTED_INLINE_MAX_COMPLEXITY
                     && is_small_pure_nested_inline_expr(replacement)
@@ -292,7 +335,9 @@ impl InlineSite {
 
     fn complexity_limit(self, options: ReadabilityOptions) -> Option<usize> {
         match self {
-            Self::Direct | Self::Nested | Self::Condition | Self::LoopHead => None,
+            Self::Direct | Self::Nested | Self::CallCallee | Self::Condition | Self::LoopHead => {
+                None
+            }
             Self::ReturnValue => Some(options.return_inline_max_complexity),
             Self::Index => Some(options.index_inline_max_complexity),
             Self::CallArg => Some(options.args_inline_max_complexity),
@@ -307,6 +352,7 @@ impl InlineSite {
             | Self::ReturnValue
             | Self::Index
             | Self::CallArg
+            | Self::CallCallee
             | Self::AccessBase
             | Self::Condition
             | Self::LoopHead => Self::Nested,
@@ -324,9 +370,12 @@ impl InlineSite {
             // 从机械 temp 链里收回来。
             Self::Condition => Self::Condition,
             Self::LoopHead => Self::LoopHead,
-            Self::Direct | Self::Nested | Self::ReturnValue | Self::CallArg | Self::AccessBase => {
-                Self::Nested
-            }
+            Self::Direct
+            | Self::Nested
+            | Self::ReturnValue
+            | Self::CallArg
+            | Self::CallCallee
+            | Self::AccessBase => Self::Nested,
         }
     }
 }

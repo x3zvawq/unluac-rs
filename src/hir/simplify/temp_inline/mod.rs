@@ -18,11 +18,12 @@ use crate::hir::common::{
     HirBlock, HirCallExpr, HirExpr, HirLValue, HirProto, HirStmt, HirTableField, HirTableKey,
     TempId,
 };
+use crate::hir::expr_safety::expr_observes_eval_order;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use self::mentioned::NestedTempProtection;
 use self::rewrite::replace_temp_in_stmt;
-use self::site::{expr_touches_temp, inline_site_in_stmt};
+use self::site::{InlineSite, expr_touches_temp, inline_site_in_stmt, temp_is_first_eval_in_stmt};
 use self::usage::{
     NextStmtState, TempUseScratch, TempUseSummary, collect_stmt_temp_uses, inline_candidate,
     max_temp_index_in_block,
@@ -137,10 +138,11 @@ fn inline_temps_in_block(
             && suffix_use_totals.get(temp.index()).copied().unwrap_or(0) == 1
             && let Some(state) = &mut next_stmt_state
             && state.temp_uses.count(temp) == 1
-            && kept_rev
-                .last()
-                .and_then(|next_stmt| inline_site_in_stmt(next_stmt, temp))
-                .is_some_and(|site| site.allows(value, readability))
+            && let Some(next_stmt) = kept_rev.last()
+            && let Some(site) = inline_site_in_stmt(next_stmt, temp)
+            && !call_arg_inline_crosses_materialized_callee(site, value, index, state)
+            && !condition_inline_moves_order_sensitive_expr(site, value, next_stmt, temp)
+            && site.allows(value, readability)
         {
             state.temp_uses.remove_from_totals(&mut suffix_use_totals);
             let next_stmt = kept_rev
@@ -148,6 +150,9 @@ fn inline_temps_in_block(
                 .expect("next stmt metadata must track the last kept stmt");
             replace_temp_in_stmt(next_stmt, temp, value);
             state.temp_uses = collect_stmt_temp_uses(next_stmt, scratch);
+            if site == InlineSite::CallCallee {
+                state.call_callee_materialized_at = Some(index);
+            }
             state.temp_uses.add_to_totals(&mut suffix_use_totals);
             changed = true;
             continue;
@@ -156,6 +161,7 @@ fn inline_temps_in_block(
         stmt_uses.add_to_totals(&mut suffix_use_totals);
         next_stmt_state = Some(NextStmtState {
             temp_uses: stmt_uses,
+            call_callee_materialized_at: None,
         });
         kept_rev.push(stmt);
     }
@@ -164,6 +170,17 @@ fn inline_temps_in_block(
     block.stmts = kept_rev;
 
     changed
+}
+
+fn condition_inline_moves_order_sensitive_expr(
+    site: InlineSite,
+    value: &HirExpr,
+    next_stmt: &HirStmt,
+    temp: TempId,
+) -> bool {
+    site == InlineSite::Condition
+        && expr_observes_eval_order(value)
+        && !temp_is_first_eval_in_stmt(next_stmt, temp)
 }
 
 fn captured_slots_before_stmts(
@@ -188,6 +205,9 @@ fn inline_call_callee_across_argument_materialization(
     captured_slots_before_stmt: &[BTreeSet<HomeSlotKey>],
 ) -> bool {
     let total_use_totals = collect_block_temp_use_totals(&block.stmts, scratch);
+    let prior_order_sensitive_defs =
+        order_sensitive_temp_def_indices(&block.stmts, scratch.temp_count());
+    let mut stmt_order = (0..block.stmts.len()).collect::<Vec<_>>();
     let mut changed = false;
     let mut index = 0;
 
@@ -229,6 +249,10 @@ fn inline_call_callee_across_argument_materialization(
                 facts,
                 protected_temps,
                 captured_slots_before_stmt,
+            ) || arg_value_forwards_prior_order_sensitive_expr(
+                arg_value,
+                stmt_order[index],
+                &prior_order_sensitive_defs,
             ) || total_use_count(arg_temp, &total_use_totals) != 1
                 || expr_has_open_multivalue(arg_value)
             {
@@ -273,10 +297,53 @@ fn inline_call_callee_across_argument_materialization(
             }
         }
         block.stmts.drain(index..call_index);
+        stmt_order.drain(index..call_index);
         changed = true;
     }
 
     changed
+}
+
+fn call_arg_inline_crosses_materialized_callee(
+    site: InlineSite,
+    value: &HirExpr,
+    stmt_index: usize,
+    state: &NextStmtState,
+) -> bool {
+    site == InlineSite::CallArg
+        && expr_observes_eval_order(value)
+        && state
+            .call_callee_materialized_at
+            .is_some_and(|callee_index| stmt_index < callee_index)
+}
+
+fn order_sensitive_temp_def_indices(stmts: &[HirStmt], temp_count: usize) -> Vec<Option<usize>> {
+    let mut defs = vec![None; temp_count];
+    for (index, stmt) in stmts.iter().enumerate() {
+        let Some((temp, value)) = inline_candidate(stmt) else {
+            continue;
+        };
+        if expr_observes_eval_order(value)
+            && let Some(slot) = defs.get_mut(temp.index())
+        {
+            *slot = Some(index);
+        }
+    }
+    defs
+}
+
+fn arg_value_forwards_prior_order_sensitive_expr(
+    arg_value: &HirExpr,
+    callee_def_index: usize,
+    prior_order_sensitive_defs: &[Option<usize>],
+) -> bool {
+    let HirExpr::TempRef(temp) = arg_value else {
+        return false;
+    };
+    prior_order_sensitive_defs
+        .get(temp.index())
+        .and_then(|def_index| *def_index)
+        .is_some_and(|arg_def_index| arg_def_index < callee_def_index)
 }
 
 fn cross_call_inline_candidate_is_safe(

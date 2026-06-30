@@ -15,23 +15,15 @@
 //! fallback label/goto 还可能让 loop 回边快照在文本上早于 temp 定义出现；这种 temp
 //! 不能在定义点提升成 `local`，否则前缀快照会读到尚未初始化的局部变量。
 //!
-//! 提升完成后，同一个 block 里还会执行两步后处理：
-//! 1. nil fallback 收敛：`local X; if A == nil then X=b else X=A end` →
-//!    `local X=A; if X == nil then X=b end`
-//! 2. 相邻 local-assign 合并：`local X; X = expr` → `local X = expr`
-
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::local_shapes::{empty_single_local_decl_binding, matches_local_lvalue};
-use super::mention::expr_mentions_local;
 use super::temp_touch::{
     TempRefScopeTracker, TempTouchIndex, collect_temp_refs_by_stmt, expr_touches_any_temp,
     stmt_consumes_temps_only_in_control_head, stmt_contains_nested_nonlocal_control,
 };
 use crate::hir::common::{
-    HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirExpr, HirIf, HirLValue,
-    HirLocalDecl, HirProto, HirStmt, HirTableConstructor, HirTableField, HirTableKey, LocalId,
-    TempId,
+    HirAssign, HirBlock, HirCallExpr, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt,
+    HirTableConstructor, HirTableField, HirTableKey, LocalId, TempId,
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
@@ -268,203 +260,10 @@ fn promote_block(
         }
     }
 
-    // 后处理：保留 nil 判断语义，去掉只负责搬运 fallback 值的 if/else 壳
-    changed |= fold_nil_fallback_alias_locals_in_block(&mut block.stmts);
-    // 后处理：把相邻的 `local X; X = expr` 合并成 `local X = expr`
-    changed |= merge_adjacent_local_assigns_in_block(&mut block.stmts);
-
     PromotionResult {
         changed,
         trailing_mapping: mapping,
     }
-}
-
-// ── 后处理：nil fallback alias 收敛 ─────────────────────────────────
-
-/// 扫描 block 中相邻的 `local X; if A == nil then X=b else X=A end` 形状，
-/// 改写成 `local X=A; if X == nil then X=b end`。
-///
-/// 这里不能恢复成 `A or b`：Lua 的 `or` 会把 `false` 也视为 fallback 条件，而
-/// 这个字节码形状只在值为 nil 时才走 fallback。
-fn fold_nil_fallback_alias_locals_in_block(stmts: &mut [HirStmt]) -> bool {
-    let mut changed = false;
-    let mut index = 0;
-
-    while index + 1 < stmts.len() {
-        let Some(rewrite) = nil_fallback_alias_rewrite(&stmts[index], &stmts[index + 1]) else {
-            index += 1;
-            continue;
-        };
-
-        stmts[index] = HirStmt::LocalDecl(Box::new(HirLocalDecl {
-            bindings: vec![rewrite.target],
-            values: vec![HirExpr::LocalRef(rewrite.source)],
-        }));
-        stmts[index + 1] = HirStmt::If(Box::new(HirIf {
-            cond: nil_check_for_local(rewrite.target),
-            then_block: rewrite.then_block,
-            else_block: None,
-        }));
-        changed = true;
-        index += 2;
-    }
-
-    changed
-}
-
-struct NilFallbackAliasRewrite {
-    target: LocalId,
-    source: LocalId,
-    then_block: HirBlock,
-}
-
-fn nil_fallback_alias_rewrite(
-    decl_stmt: &HirStmt,
-    if_stmt: &HirStmt,
-) -> Option<NilFallbackAliasRewrite> {
-    let target = empty_single_local_decl_binding(decl_stmt)?;
-    let HirStmt::If(if_stmt) = if_stmt else {
-        return None;
-    };
-    let else_block = if_stmt.else_block.as_ref()?;
-    let (source, fallback_block) = if let Some(source) = nil_check_local(&if_stmt.cond) {
-        let then_value = terminal_local_assign_value(&if_stmt.then_block, target)?;
-        let else_value = single_local_assign_value(else_block, target)?;
-        if !matches!(else_value, HirExpr::LocalRef(local) if *local == source)
-            || expr_mentions_local(then_value, target)
-        {
-            return None;
-        }
-        (source, if_stmt.then_block.clone())
-    } else {
-        let source = negated_nil_check_local(&if_stmt.cond)?;
-        let then_value = single_local_assign_value(&if_stmt.then_block, target)?;
-        let else_value = terminal_local_assign_value(else_block, target)?;
-        if !matches!(then_value, HirExpr::LocalRef(local) if *local == source)
-            || expr_mentions_local(else_value, target)
-        {
-            return None;
-        }
-        (source, else_block.clone())
-    };
-    Some(NilFallbackAliasRewrite {
-        target,
-        source,
-        then_block: fallback_block,
-    })
-}
-
-fn nil_check_local(expr: &HirExpr) -> Option<LocalId> {
-    let HirExpr::Binary(binary) = expr else {
-        return None;
-    };
-    if binary.op != HirBinaryOpKind::Eq {
-        return None;
-    }
-    match (&binary.lhs, &binary.rhs) {
-        (HirExpr::LocalRef(local), HirExpr::Nil) | (HirExpr::Nil, HirExpr::LocalRef(local)) => {
-            Some(*local)
-        }
-        _ => None,
-    }
-}
-
-fn negated_nil_check_local(expr: &HirExpr) -> Option<LocalId> {
-    let HirExpr::Unary(unary) = expr else {
-        return None;
-    };
-    (unary.op == crate::hir::common::HirUnaryOpKind::Not)
-        .then(|| nil_check_local(&unary.expr))
-        .flatten()
-}
-
-fn nil_check_for_local(local: LocalId) -> HirExpr {
-    HirExpr::Binary(Box::new(HirBinaryExpr {
-        op: HirBinaryOpKind::Eq,
-        lhs: HirExpr::LocalRef(local),
-        rhs: HirExpr::Nil,
-    }))
-}
-
-fn single_local_assign_value(block: &HirBlock, target: LocalId) -> Option<&HirExpr> {
-    let [HirStmt::Assign(assign)] = block.stmts.as_slice() else {
-        return None;
-    };
-    let [assign_target] = assign.targets.as_slice() else {
-        return None;
-    };
-    let [value] = assign.values.as_slice() else {
-        return None;
-    };
-    matches_local_lvalue(assign_target, target).then_some(value)
-}
-
-fn terminal_local_assign_value(block: &HirBlock, target: LocalId) -> Option<&HirExpr> {
-    let HirStmt::Assign(assign) = block.stmts.last()? else {
-        return None;
-    };
-    let [assign_target] = assign.targets.as_slice() else {
-        return None;
-    };
-    let [value] = assign.values.as_slice() else {
-        return None;
-    };
-    matches_local_lvalue(assign_target, target).then_some(value)
-}
-
-// ── 后处理：相邻 local-assign 合并 ───────────────────────────────────
-
-/// 扫描 block 中相邻的 `local X; X = expr` 形状，合并成 `local X = expr`。
-///
-/// 这对应 AST readability `statement_merge` 的 `try_merge_local_decl_with_assign` 规则，
-/// 在 HIR 层提前执行可以减少流到 AST 层的机械拆分数量。
-fn merge_adjacent_local_assigns_in_block(stmts: &mut Vec<HirStmt>) -> bool {
-    let mut changed = false;
-    let mut index = 0;
-
-    while index + 1 < stmts.len() {
-        let Some(merged) = try_merge_empty_local_with_assign(&stmts[index], &stmts[index + 1])
-        else {
-            index += 1;
-            continue;
-        };
-
-        stmts[index] = HirStmt::LocalDecl(Box::new(merged));
-        stmts.remove(index + 1);
-        changed = true;
-    }
-
-    changed
-}
-
-fn try_merge_empty_local_with_assign(
-    decl_stmt: &HirStmt,
-    assign_stmt: &HirStmt,
-) -> Option<HirLocalDecl> {
-    let HirStmt::LocalDecl(local_decl) = decl_stmt else {
-        return None;
-    };
-    let HirStmt::Assign(assign) = assign_stmt else {
-        return None;
-    };
-    if !local_decl.values.is_empty() || local_decl.bindings.is_empty() {
-        return None;
-    }
-    if local_decl.bindings.len() != assign.targets.len() || assign.values.is_empty() {
-        return None;
-    }
-    if !local_decl
-        .bindings
-        .iter()
-        .zip(assign.targets.iter())
-        .all(|(binding, target)| matches_local_lvalue(target, *binding))
-    {
-        return None;
-    }
-    Some(HirLocalDecl {
-        bindings: local_decl.bindings.clone(),
-        values: assign.values.clone(),
-    })
 }
 
 fn collect_plans(

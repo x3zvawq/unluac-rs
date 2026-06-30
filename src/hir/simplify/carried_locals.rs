@@ -1,11 +1,13 @@
-//! 这个文件负责把 fallback label/goto 区域里“交棒出去的 carried 状态”认回原绑定。
+//! 这个文件负责把 fallback label/goto 区域里“交棒出去的 carried 状态”认回原绑定，
+//! 也会收敛结构化分支/循环里相邻的 `seed local + empty carried local`。
 //!
 //! 某些 `<close> + goto` 形状因为暂时无法整体结构化，只能先在 HIR 里保留成
 //! `assign tX = lY; ... label/goto ...; tX = ...` 这样的状态 temp。语义虽然对，
 //! 但它会把本来是同一个源码 local 的身份拆成“两段 binding”，最终长成
 //! `local turn = 1; do state = turn; ... state = state + 1 end` 这种机械形状。
 //!
-//! 这个 pass 只吃两类很窄的 handoff：
+//! 这个 pass 只吃几类很窄的 handoff：
+//! - 结构化相邻 seed/carried：`local state = 0; local next; ... next = state; ...`
 //! - 纯别名交棒：`assign tX = lY; ... tX ...`
 //! - 多目标纯别名交棒：`assign tA, tB = sA, sB; ... tA/tB ...`
 //! - 多目标混合交棒：`assign tA, tB, tC = sA, sB, 0; ... sA, sB = tA, tB`
@@ -42,11 +44,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
-    HirBlock, HirExpr, HirLValue, HirLabelId, HirProto, HirStmt, LocalId, TempId,
+    HirAssign, HirBlock, HirCallExpr, HirExpr, HirLValue, HirLabelId, HirProto, HirStmt, LocalId,
+    TempId,
 };
 
-use super::mention::{stmt_writes_temp, stmts_mention_local, stmts_mention_temp};
-use super::temp_touch::{TempRefScopeTracker, collect_temp_refs_by_stmt};
+use super::local_shapes::{empty_single_local_decl_binding, initialized_single_local_decl_binding};
+use super::mention::{
+    expr_mentions_local, stmt_captures_local, stmt_writes_temp, stmts_mention_local,
+    stmts_mention_temp,
+};
+use super::temp_touch::{TempRefScopeTracker, TempTouchIndex, collect_temp_refs_by_stmt};
 use super::visit::{HirVisitor, visit_stmts};
 use super::walk::{HirRewritePass, for_each_nested_block_mut, rewrite_stmts};
 
@@ -85,34 +92,252 @@ fn collapse_handoffs_recursive(block: &mut HirBlock, outer_temps: &BTreeSet<Temp
 fn collapse_block_handoffs(block: &mut HirBlock, outer_temps: &BTreeSet<TempId>) -> bool {
     let mut changed = collapse_boundary_alias_classes(block);
     let mut index = 0;
+    let mut stmt_temp_refs = collect_temp_refs_by_stmt(&block.stmts);
 
-    while index < block.stmts.len() {
-        if try_collapse_label_loop_update_handoff(block, index, outer_temps) {
-            changed = true;
-            continue;
-        }
-        if try_collapse_pure_binding_handoffs(block, index, outer_temps) {
-            changed = true;
-            continue;
-        }
-        if try_collapse_single_binding_handoff(block, index, outer_temps) {
-            changed = true;
-            continue;
-        }
-        if try_collapse_pure_local_handoff(block, index, outer_temps) {
-            changed = true;
-            continue;
-        }
-        if try_collapse_binding_update_handoff(block, index, outer_temps) {
-            changed = true;
+    loop {
+        let action = {
+            let temp_touches = TempTouchIndex::new(&stmt_temp_refs);
+            let mut action = None;
+            while index < block.stmts.len() {
+                if try_collapse_adjacent_local_seed_handoff(block, index)
+                    || try_collapse_label_loop_update_handoff(
+                        block,
+                        index,
+                        outer_temps,
+                        &temp_touches,
+                    )
+                    || try_collapse_pure_binding_handoffs(block, index, outer_temps, &temp_touches)
+                    || try_collapse_single_binding_handoff(block, index, outer_temps, &temp_touches)
+                    || try_collapse_pure_local_handoff(block, index, outer_temps, &temp_touches)
+                {
+                    action = Some(false);
+                    break;
+                }
+                if try_collapse_binding_update_handoff(block, index, outer_temps, &temp_touches) {
+                    action = Some(true);
+                    break;
+                }
+
+                index += 1;
+            }
+            action
+        };
+
+        let Some(advance_index) = action else {
+            break;
+        };
+        changed = true;
+        if advance_index {
             index += 1;
-            continue;
         }
-
-        index += 1;
+        stmt_temp_refs = collect_temp_refs_by_stmt(&block.stmts);
     }
 
     changed
+}
+
+fn try_collapse_adjacent_local_seed_handoff(block: &mut HirBlock, index: usize) -> bool {
+    let Some(seed) = initialized_single_local_decl_binding(&block.stmts[index]) else {
+        return false;
+    };
+    let Some(carried) = block
+        .stmts
+        .get(index + 1)
+        .and_then(empty_single_local_decl_binding)
+    else {
+        return false;
+    };
+
+    let tail = &block.stmts[index + 2..];
+    if tail.is_empty()
+        || !stmts_mention_local(tail, carried)
+        || tail.iter().any(|stmt| {
+            stmt_captures_local(stmt, seed)
+                || stmt_captures_local(stmt, carried)
+                || !stmt_allows_seed_to_absorb_carried(stmt, seed, carried)
+        })
+    {
+        return false;
+    }
+
+    let mut tail = block.stmts.split_off(index + 2);
+    rewrite_carried_local_in_stmts(&mut tail, carried, seed);
+    block.stmts.append(&mut tail);
+    block.stmts.remove(index + 1);
+    prune_empty_assign_stmts(block);
+    true
+}
+
+fn rewrite_carried_local_in_stmts(stmts: &mut [HirStmt], carried: LocalId, seed: LocalId) {
+    let mut rewrites = BTreeMap::new();
+    rewrites.insert(CarryBinding::Local(carried), CarryBinding::Local(seed));
+    let mut pass = BindingClassRewritePass { rewrites };
+    rewrite_stmts(stmts, &mut pass);
+    prune_redundant_self_assigns_in_stmts(
+        stmts,
+        collect_prunable_bindings([CarryBinding::Local(seed)]),
+    );
+}
+
+fn stmt_allows_seed_to_absorb_carried(stmt: &HirStmt, seed: LocalId, carried: LocalId) -> bool {
+    match stmt {
+        HirStmt::LocalDecl(local_decl) => {
+            local_decl
+                .bindings
+                .iter()
+                .all(|binding| *binding != seed && *binding != carried)
+                && local_decl
+                    .values
+                    .iter()
+                    .all(|value| !expr_mentions_local(value, seed))
+        }
+        HirStmt::Assign(assign) => {
+            if is_exact_local_copy_assign(assign, carried, seed)
+                || is_supported_local_writeback_assign(assign, seed, carried)
+            {
+                true
+            } else {
+                !assign_targets_local(assign, seed)
+                    && assign
+                        .targets
+                        .iter()
+                        .all(|target| !lvalue_mentions_local(target, seed))
+                    && assign
+                        .values
+                        .iter()
+                        .all(|value| !expr_mentions_local(value, seed))
+            }
+        }
+        HirStmt::TableSetList(set_list) => {
+            !expr_mentions_local(&set_list.base, seed)
+                && set_list
+                    .values
+                    .iter()
+                    .all(|value| !expr_mentions_local(value, seed))
+                && set_list
+                    .trailing_multivalue
+                    .as_ref()
+                    .is_none_or(|value| !expr_mentions_local(value, seed))
+        }
+        HirStmt::ErrNil(err_nil) => !expr_mentions_local(&err_nil.value, seed),
+        HirStmt::ToBeClosed(to_be_closed) => !expr_mentions_local(&to_be_closed.value, seed),
+        HirStmt::CallStmt(call_stmt) => !call_mentions_local(&call_stmt.call, seed),
+        HirStmt::Return(ret) => ret
+            .values
+            .iter()
+            .all(|value| !expr_mentions_local(value, seed)),
+        HirStmt::If(if_stmt) => {
+            !expr_mentions_local(&if_stmt.cond, seed)
+                && stmts_allow_seed_to_absorb_carried(&if_stmt.then_block.stmts, seed, carried)
+                && if_stmt.else_block.as_ref().is_none_or(|else_block| {
+                    stmts_allow_seed_to_absorb_carried(&else_block.stmts, seed, carried)
+                })
+        }
+        HirStmt::While(while_stmt) => {
+            !expr_mentions_local(&while_stmt.cond, seed)
+                && stmts_allow_seed_to_absorb_carried(&while_stmt.body.stmts, seed, carried)
+        }
+        HirStmt::Repeat(repeat_stmt) => {
+            stmts_allow_seed_to_absorb_carried(&repeat_stmt.body.stmts, seed, carried)
+                && !expr_mentions_local(&repeat_stmt.cond, seed)
+        }
+        HirStmt::NumericFor(numeric_for) => {
+            numeric_for.binding != seed
+                && numeric_for.binding != carried
+                && !expr_mentions_local(&numeric_for.start, seed)
+                && !expr_mentions_local(&numeric_for.limit, seed)
+                && !expr_mentions_local(&numeric_for.step, seed)
+                && stmts_allow_seed_to_absorb_carried(&numeric_for.body.stmts, seed, carried)
+        }
+        HirStmt::GenericFor(generic_for) => {
+            !generic_for
+                .bindings
+                .iter()
+                .any(|binding| *binding == seed || *binding == carried)
+                && generic_for
+                    .iterator
+                    .iter()
+                    .all(|value| !expr_mentions_local(value, seed))
+                && stmts_allow_seed_to_absorb_carried(&generic_for.body.stmts, seed, carried)
+        }
+        HirStmt::Block(block) => stmts_allow_seed_to_absorb_carried(&block.stmts, seed, carried),
+        HirStmt::Unstructured(unstructured) => {
+            stmts_allow_seed_to_absorb_carried(&unstructured.body.stmts, seed, carried)
+        }
+        HirStmt::Close(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => true,
+    }
+}
+
+fn stmts_allow_seed_to_absorb_carried(stmts: &[HirStmt], seed: LocalId, carried: LocalId) -> bool {
+    stmts
+        .iter()
+        .all(|stmt| stmt_allows_seed_to_absorb_carried(stmt, seed, carried))
+}
+
+fn is_exact_local_copy_assign(assign: &HirAssign, carried: LocalId, seed: LocalId) -> bool {
+    let [HirLValue::Local(target)] = assign.targets.as_slice() else {
+        return false;
+    };
+    let [HirExpr::LocalRef(value)] = assign.values.as_slice() else {
+        return false;
+    };
+    *target == carried && *value == seed
+}
+
+fn is_supported_local_writeback_assign(
+    assign: &HirAssign,
+    seed: LocalId,
+    carried: LocalId,
+) -> bool {
+    if assign.targets.len() != assign.values.len() || assign.targets.is_empty() {
+        return false;
+    }
+
+    let mut saw_writeback = false;
+    for (target, value) in assign.targets.iter().zip(&assign.values) {
+        let is_writeback = matches!(
+            (target, value),
+            (HirLValue::Local(target), HirExpr::LocalRef(value))
+                if *target == seed && *value == carried
+        );
+        if is_writeback {
+            saw_writeback = true;
+            continue;
+        }
+        if lvalue_mentions_local(target, seed) || expr_mentions_local(value, seed) {
+            return false;
+        }
+    }
+
+    saw_writeback
+}
+
+fn assign_targets_local(assign: &HirAssign, local: LocalId) -> bool {
+    assign
+        .targets
+        .iter()
+        .any(|target| matches!(target, HirLValue::Local(target) if *target == local))
+}
+
+fn lvalue_mentions_local(lvalue: &HirLValue, local: LocalId) -> bool {
+    match lvalue {
+        HirLValue::Local(target) => *target == local,
+        HirLValue::TableAccess(access) => {
+            expr_mentions_local(&access.base, local) || expr_mentions_local(&access.key, local)
+        }
+        HirLValue::Param(_) | HirLValue::Temp(_) | HirLValue::Upvalue(_) | HirLValue::Global(_) => {
+            false
+        }
+    }
+}
+
+fn call_mentions_local(call: &HirCallExpr, local: LocalId) -> bool {
+    expr_mentions_local(&call.callee, local)
+        || call.args.iter().any(|arg| expr_mentions_local(arg, local))
 }
 
 fn collapse_boundary_alias_classes(block: &mut HirBlock) -> bool {
@@ -325,6 +550,7 @@ fn try_collapse_pure_binding_handoffs(
     block: &mut HirBlock,
     index: usize,
     outer_temps: &BTreeSet<TempId>,
+    temp_touches: &TempTouchIndex<'_>,
 ) -> bool {
     let Some(seed) = binding_handoff_seed(&block.stmts[index]) else {
         return false;
@@ -351,7 +577,7 @@ fn try_collapse_pure_binding_handoffs(
                     rewrite.to,
                     rewrite.from,
                 )
-                || !suffix_mentions_temp(suffix, rewrite.from)
+                || !temp_touches.touches_after(index + 1, rewrite.from)
         })
     {
         return false;
@@ -382,13 +608,12 @@ fn try_collapse_label_loop_update_handoff(
     block: &mut HirBlock,
     index: usize,
     outer_temps: &BTreeSet<TempId>,
+    temp_touches: &TempTouchIndex<'_>,
 ) -> bool {
     let Some((carried, update_temp)) = direct_temp_writeback_stmt(&block.stmts[index]) else {
         return false;
     };
-    if outer_temps.contains(&update_temp)
-        || suffix_mentions_temp(&block.stmts[..index], update_temp)
-    {
+    if outer_temps.contains(&update_temp) || temp_touches.touches_before(index, update_temp) {
         return false;
     }
     if !next_label_has_prior_goto(&block.stmts, index) {
@@ -479,6 +704,7 @@ fn try_collapse_pure_local_handoff(
     block: &mut HirBlock,
     index: usize,
     outer_temps: &BTreeSet<TempId>,
+    temp_touches: &TempTouchIndex<'_>,
 ) -> bool {
     let Some((temp, local)) = local_handoff_seed(&block.stmts[index]) else {
         return false;
@@ -495,7 +721,7 @@ fn try_collapse_pure_local_handoff(
     let suffix = &block.stmts[index + 1..];
     if suffix.is_empty()
         || suffix_mentions_local(suffix, local)
-        || !suffix_mentions_temp(suffix, temp)
+        || !temp_touches.touches_after(index + 1, temp)
     {
         return false;
     }
@@ -513,6 +739,7 @@ fn try_collapse_single_binding_handoff(
     block: &mut HirBlock,
     index: usize,
     outer_temps: &BTreeSet<TempId>,
+    temp_touches: &TempTouchIndex<'_>,
 ) -> bool {
     let Some((temp, binding)) = single_binding_handoff_seed(&block.stmts[index]) else {
         return false;
@@ -529,7 +756,7 @@ fn try_collapse_single_binding_handoff(
     let suffix = &block.stmts[index + 1..];
     if suffix.is_empty()
         || suffix_mentions_binding(suffix, binding)
-        || !suffix_mentions_temp(suffix, temp)
+        || !temp_touches.touches_after(index + 1, temp)
     {
         return false;
     }
@@ -556,6 +783,7 @@ fn try_collapse_binding_update_handoff(
     block: &mut HirBlock,
     index: usize,
     outer_temps: &BTreeSet<TempId>,
+    temp_touches: &TempTouchIndex<'_>,
 ) -> bool {
     let Some((target_temp, carried)) = update_handoff_seed(&block.stmts[index]) else {
         return false;
@@ -573,7 +801,7 @@ fn try_collapse_binding_update_handoff(
     if suffix.is_empty()
         || suffix_reads_binding(suffix, carried)
         || !suffix_contains_direct_writeback(suffix, carried, target_temp)
-        || !suffix_mentions_temp(suffix, target_temp)
+        || !temp_touches.touches_after(index + 1, target_temp)
     {
         return false;
     }
@@ -770,12 +998,10 @@ fn update_handoff_seed(stmt: &HirStmt) -> Option<(TempId, CarryBinding)> {
     }
     let mut collector = BindingReadCollector::default();
     collector.collect_expr(value);
-    let [carried] = collector.reads.as_slice() else {
-        return None;
-    };
+    let carried = collector.single_read()?;
     match carried {
-        CarryBinding::Temp(temp) if *temp == *target_temp => None,
-        _ => Some((*target_temp, *carried)),
+        CarryBinding::Temp(temp) if temp == *target_temp => None,
+        _ => Some((*target_temp, carried)),
     }
 }
 
@@ -904,7 +1130,7 @@ fn binding_matches_lvalue(lvalue: &HirLValue, binding: CarryBinding) -> bool {
 
 #[derive(Default)]
 struct BindingReadCollector {
-    reads: Vec<CarryBinding>,
+    reads: BTreeSet<CarryBinding>,
 }
 
 impl BindingReadCollector {
@@ -915,6 +1141,12 @@ impl BindingReadCollector {
     fn collect_expr(&mut self, expr: &HirExpr) {
         super::visit::visit_expr(expr, self);
     }
+
+    fn single_read(&self) -> Option<CarryBinding> {
+        let mut reads = self.reads.iter();
+        let read = *reads.next()?;
+        reads.next().is_none().then_some(read)
+    }
 }
 
 impl HirVisitor for BindingReadCollector {
@@ -924,10 +1156,8 @@ impl HirVisitor for BindingReadCollector {
             HirExpr::TempRef(temp) => Some(CarryBinding::Temp(*temp)),
             _ => None,
         };
-        if let Some(binding) = binding
-            && !self.reads.contains(&binding)
-        {
-            self.reads.push(binding);
+        if let Some(binding) = binding {
+            self.reads.insert(binding);
         }
     }
 }
@@ -1242,10 +1472,6 @@ fn suffix_mentions_binding(stmts: &[HirStmt], binding: CarryBinding) -> bool {
         CarryBinding::Local(local) => stmts_mention_local(stmts, local),
         CarryBinding::Temp(temp) => stmts_mention_temp(stmts, temp),
     }
-}
-
-fn suffix_mentions_temp(stmts: &[HirStmt], temp: TempId) -> bool {
-    stmts_mention_temp(stmts, temp)
 }
 
 fn stmt_reads_binding(stmt: &HirStmt, binding: CarryBinding) -> bool {

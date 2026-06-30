@@ -19,7 +19,9 @@
 
 use super::*;
 
-use crate::hir::analyze::short_circuit::{DecisionEdge, build_decision_expr};
+use crate::hir::analyze::short_circuit::{
+    DecisionEdge, build_decision_expr, same_value_merge_shape,
+};
 use crate::structure::DefId;
 
 #[derive(Debug, Clone, Copy)]
@@ -991,8 +993,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         }
 
-        let plan = build_conditional_reassign_plan(self.lowering, block)?;
-
         if let Some(stop) = stop
             && stop != merge
             && short.blocks.contains(&stop)
@@ -1004,6 +1004,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // phi temp 直接内联进语句，跳过了 apply_loop_rewrites，当 entry_defs
         // 被 loop state 接管时，写入会被遗漏。
         if value_merge_defs_are_overridden(self.lowering, short, target_overrides) {
+            return None;
+        }
+
+        let plan = build_conditional_reassign_plan(self.lowering, block)?;
+        if merge_has_other_live_phi(self.lowering, plan.merge, plan.phi_id) {
             return None;
         }
 
@@ -1964,41 +1969,29 @@ fn value_merge_defs_are_overridden(
             .any(|inc| inc.defs.iter().any(is_overridden))
 }
 
+fn merge_has_other_live_phi(
+    lowering: &ProtoLowering<'_>,
+    merge: BlockRef,
+    consumed_phi_id: PhiId,
+) -> bool {
+    lowering
+        .dataflow
+        .phi_candidates_in_block(merge)
+        .iter()
+        .any(|phi| phi.id != consumed_phi_id && !lowering.dead_phis.contains(&phi.id))
+}
+
 fn same_statement_value_merge_tree(
     base: &ShortCircuitCandidate,
     candidate: &ShortCircuitCandidate,
 ) -> bool {
-    if !base.reducible
-        || !candidate.reducible
-        || base.header != candidate.header
-        || base.blocks != candidate.blocks
-        || base.entry != candidate.entry
-        || base.nodes.len() != candidate.nodes.len()
-        || base.result_phi_id.is_none()
-        || candidate.result_phi_id.is_none()
-        || base.result_reg.is_none()
-        || candidate.result_reg.is_none()
-    {
-        return false;
-    }
-    let (ShortCircuitExit::ValueMerge(base_merge), ShortCircuitExit::ValueMerge(candidate_merge)) =
-        (&base.exit, &candidate.exit)
-    else {
-        return false;
-    };
-    if base_merge != candidate_merge {
-        return false;
-    }
-
-    base.nodes
-        .iter()
-        .zip(&candidate.nodes)
-        .all(|(base, candidate)| {
-            base.id == candidate.id
-                && base.header == candidate.header
-                && base.truthy == candidate.truthy
-                && base.falsy == candidate.falsy
-        })
+    base.reducible
+        && candidate.reducible
+        && base.result_phi_id.is_some()
+        && candidate.result_phi_id.is_some()
+        && base.result_reg.is_some()
+        && candidate.result_reg.is_some()
+        && same_value_merge_shape(base, candidate)
 }
 
 fn branch_exit_value_assignment_leaf_stmts_are_safe(

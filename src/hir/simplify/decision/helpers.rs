@@ -9,7 +9,9 @@
 //! 折叠已迁移到 `super::super::expr_facts`，这里只保留 decision 专属的逻辑构造
 //! 和条件上下文整理。
 
-use super::super::expr_facts::{fold_associative_duplicate_and, fold_associative_duplicate_or};
+use super::super::expr_facts::{
+    expr_is_side_effect_free, fold_associative_duplicate_and, fold_associative_duplicate_or,
+};
 use crate::hir::common::{HirExpr, HirLogicalExpr};
 
 pub(super) fn logical_and(lhs: HirExpr, rhs: HirExpr) -> HirExpr {
@@ -108,14 +110,14 @@ fn factor_shared_and_guards_one_side(lhs: &HirExpr, rhs: &HirExpr) -> Option<Hir
         return None;
     };
 
-    if lhs_and.lhs == rhs_and.lhs {
+    if lhs_and.lhs == rhs_and.lhs && expr_is_side_effect_free(&lhs_and.lhs) {
         return Some(logical_and(
             lhs_and.lhs.clone(),
             logical_or(lhs_and.rhs.clone(), rhs_and.rhs.clone()),
         ));
     }
 
-    if lhs_and.rhs == rhs_and.rhs {
+    if lhs_and.rhs == rhs_and.rhs && expr_is_side_effect_free(&lhs_and.rhs) {
         return Some(logical_and(
             logical_or(lhs_and.lhs.clone(), rhs_and.lhs.clone()),
             lhs_and.rhs.clone(),
@@ -137,6 +139,9 @@ fn pull_shared_or_tail_one_side(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr>
         return None;
     };
     if rhs != &inner_or.rhs {
+        return None;
+    }
+    if !expr_is_side_effect_free(rhs) {
         return None;
     }
 
