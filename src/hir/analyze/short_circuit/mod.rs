@@ -4,6 +4,7 @@
 //! 的线性链。这里的职责就是把这些 DAG 重新折回 HIR 的 `LogicalAnd / LogicalOr`，
 //! 同时保留值位置和条件位置在 Lua 里的不同语义。
 
+mod conditional_reassign;
 mod decision;
 mod guards;
 mod lowering;
@@ -24,6 +25,7 @@ use crate::structure::{
 };
 use crate::transformer::{BranchOperands, BranchPredicate, CondOperand, InstrRef, LowInstr, Reg};
 
+pub(super) use self::conditional_reassign::build_conditional_reassign_plan;
 pub(super) use self::decision::{
     DecisionEdge, build_branch_decision_expr_mixed_eval, build_decision_expr,
     header_subject_is_value_carrier,
@@ -42,8 +44,7 @@ pub(super) use self::lowering::{
 };
 use self::lowering::{lower_short_circuit_subject_inline, lower_value_leaf_expr};
 pub(super) use self::recovery::{
-    BranchShortCircuitPlan, build_branch_short_circuit_plan, build_conditional_reassign_plan,
-    consumed_value_merge_subject_instrs,
+    BranchShortCircuitPlan, build_branch_short_circuit_plan, consumed_value_merge_subject_instrs,
     recover_short_value_merge_expr_recovery_with_allowed_blocks,
     recover_short_value_merge_expr_with_allowed_blocks, same_value_merge_shape,
     value_merge_candidate_by_header, value_merge_candidates_in_block, value_merge_skipped_blocks,

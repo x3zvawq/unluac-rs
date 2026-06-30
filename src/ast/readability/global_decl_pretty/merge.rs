@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use super::super::binding_flow::BindingUseIndex;
-use super::super::binding_tree::binding_from_name_ref;
+use super::super::binding_ref::binding_from_name_ref;
 use crate::ast::common::{
     AstBindingRef, AstBlock, AstExpr, AstGlobalBinding, AstGlobalDecl, AstLocalAttr, AstStmt,
 };

@@ -8,7 +8,8 @@
 //!
 //! 它不会去猜更模糊的任意等价调用，也不会越权给 AST build 没表达清楚的 call 形状兜底。
 
-use super::super::binding_flow::{BindingUseIndex, name_matches_binding};
+use super::super::binding_flow::BindingUseIndex;
+use super::super::binding_ref::name_matches_binding;
 use super::super::expr_analysis::is_context_safe_expr;
 use crate::ast::common::{
     AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstExpr, AstFieldAccess, AstGlobalDecl,
@@ -25,6 +26,29 @@ pub(super) fn try_recover_method_alias_stmt(
         .or_else(|| try_recover_receiver_alias_direct_method_call(stmts, use_index, stmt_base))
         .or_else(|| try_recover_direct_receiver(stmts, use_index, stmt_base))
         .or_else(|| try_recover_direct_method_call_stmt(stmts))
+}
+
+pub(in crate::ast::readability) fn run_belongs_to_method_alias_owner(
+    stmts: &[AstStmt],
+    index: usize,
+    sink_index: usize,
+    use_index: &BindingUseIndex,
+) -> bool {
+    let Some(sink) = stmts.get(sink_index) else {
+        return false;
+    };
+    if matches!(sink, AstStmt::GenericFor(_)) {
+        return false;
+    }
+    let run = &stmts[index..];
+    match sink_index.checked_sub(index) {
+        Some(1) => {
+            try_recover_direct_receiver(run, use_index, index).is_some()
+                || try_recover_receiver_alias_direct_method_call(run, use_index, index).is_some()
+        }
+        Some(2) => try_recover_with_receiver_alias(run, use_index, index).is_some(),
+        _ => false,
+    }
 }
 
 fn try_recover_with_receiver_alias(

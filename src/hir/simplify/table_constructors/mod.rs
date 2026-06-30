@@ -16,6 +16,7 @@
 //! 这里也会把 owner 直接认回最终目标，避免后层继续携带机械性的中转 local。
 
 mod bindings;
+mod builder;
 mod inline_value;
 mod rebuild;
 mod scan;

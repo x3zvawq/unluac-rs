@@ -18,13 +18,13 @@
 
 use std::collections::BTreeSet;
 
-use crate::structure::{BlockRef, Cfg, DataflowFacts, DefId, PhiCandidate};
+use crate::structure::{BlockRef, Cfg, DataflowFacts, DefId, GraphFacts, PhiCandidate};
 use crate::transformer::Reg;
 
 use super::common::{
     BranchValueMergeArm, BranchValueMergeCandidate, BranchValueMergeValue,
-    GenericPhiMaterialization, LoopCandidate, LoopValueArm, LoopValueIncoming, LoopValueMerge,
-    ShortCircuitCandidate, ShortCircuitValueIncoming,
+    GenericPhiMaterialization, GenericPhiSource, LoopCandidate, LoopValueArm, LoopValueIncoming,
+    LoopValueMerge, ShortCircuitCandidate, ShortCircuitValueIncoming,
 };
 
 pub(super) struct ShortCircuitPhiFacts {
@@ -152,6 +152,8 @@ pub(super) fn short_circuit_phi_facts(
 }
 
 pub(super) fn analyze_generic_phi_materializations(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
     branch_value_merge_candidates: &[BranchValueMergeCandidate],
     loop_candidates: &[LoopCandidate],
@@ -177,10 +179,70 @@ pub(super) fn analyze_generic_phi_materializations(
             block: phi.block,
             phi_id: phi.id,
             reg: phi.reg,
+            source: generic_phi_source(cfg, graph_facts, dataflow, phi),
         })
         .collect::<Vec<_>>();
     generic.sort_by_key(|phi| (phi.block, phi.phi_id));
     generic
+}
+
+fn generic_phi_source(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    dataflow: &DataflowFacts,
+    phi: &PhiCandidate,
+) -> GenericPhiSource {
+    let Some(idom) = graph_facts
+        .dominator_tree
+        .parent
+        .get(phi.block.index())
+        .copied()
+        .flatten()
+    else {
+        return GenericPhiSource::Unresolved;
+    };
+    let Some(idom_defs) = block_exit_defs_for_reg(cfg, dataflow, idom, phi.reg) else {
+        return GenericPhiSource::Unresolved;
+    };
+    if phi
+        .incoming
+        .iter()
+        .all(|incoming| incoming.defs == idom_defs)
+    {
+        GenericPhiSource::IdomExit(idom)
+    } else {
+        GenericPhiSource::Unresolved
+    }
+}
+
+fn block_exit_defs_for_reg(
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    block: BlockRef,
+    reg: Reg,
+) -> Option<BTreeSet<DefId>> {
+    let range = cfg.blocks[block.index()].instrs;
+    let Some(last_instr_ref) = range.last() else {
+        return Some(BTreeSet::new());
+    };
+
+    let effect = &dataflow.instr_effects[last_instr_ref.index()];
+    if effect.fixed_must_defs.contains(&reg) {
+        return dataflow
+            .instr_def_for_reg(last_instr_ref, reg)
+            .map(|def| BTreeSet::from([def]));
+    }
+
+    let mut defs = dataflow
+        .reaching_defs_at(last_instr_ref)
+        .fixed
+        .get(reg)
+        .map(|defs| defs.iter().copied().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    if effect.fixed_may_defs.contains(&reg) {
+        defs.insert(dataflow.instr_def_for_reg(last_instr_ref, reg)?);
+    }
+    Some(defs)
 }
 
 fn extend_branch_value_arm(

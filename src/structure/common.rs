@@ -32,6 +32,18 @@ pub struct GenericPhiMaterialization {
     pub block: BlockRef,
     pub phi_id: PhiId,
     pub reg: Reg,
+    pub source: GenericPhiSource,
+}
+
+/// generic phi fallback 的保守来源事实。
+///
+/// `IdomExit` 表示所有 incoming defs 都等于该支配块出口处的寄存器值；HIR 可以用这个
+/// block 降表达式。`Unresolved` 表示 Structure 无法证明单一来源，后层应显式暴露
+/// unresolved，而不是猜某个 predecessor。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash)]
+pub enum GenericPhiSource {
+    IdomExit(BlockRef),
+    Unresolved,
 }
 
 /// 一个分支结构候选。
@@ -119,6 +131,12 @@ pub struct LoopCandidate {
     pub header: BlockRef,
     pub preheader: Option<BlockRef>,
     pub blocks: BTreeSet<BlockRef>,
+    /// for-loop 源码绑定在词法上可见的 block。
+    ///
+    /// natural loop blocks 不包含提前退出 tail，但 `for i = ... do if c then return i end end`
+    /// 里的 `return i` 仍在 `i` 的作用域内。Structure 在这里统一保存作用域事实，
+    /// HIR bindings 只消费它来分配寄存器到 local 的映射。
+    pub binding_scope_blocks: BTreeSet<BlockRef>,
     pub backedges: Vec<EdgeRef>,
     pub exits: BTreeSet<BlockRef>,
     pub continue_target: Option<BlockRef>,

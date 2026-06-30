@@ -22,10 +22,7 @@ pub(super) struct NestedTempProtection {
 
 impl NestedTempProtection {
     pub(super) fn new(stmts: &[HirStmt]) -> Self {
-        let stmt_temps = stmts
-            .iter()
-            .map(mentioned_temp_set_for_stmt)
-            .collect::<Vec<_>>();
+        let stmt_temps = super::super::temp_touch::collect_temp_refs_by_stmt(stmts);
         let stmt_capture_temps = stmts
             .iter()
             .map(closure_capture_temp_set_for_stmt)
@@ -87,7 +84,10 @@ impl NestedTempProtection {
     }
 
     pub(super) fn finish_stmt(&mut self, stmt: &HirStmt) {
-        self.prefix_temps.extend(mentioned_temp_set_for_stmt(stmt));
+        self.prefix_temps
+            .extend(super::super::temp_touch::collect_temp_refs_in_stmts(
+                std::slice::from_ref(stmt),
+            ));
     }
 }
 
@@ -150,95 +150,10 @@ fn decrement_counts(counts: &mut BTreeMap<TempId, usize>, temps: &BTreeSet<TempI
     }
 }
 
-fn mentioned_temp_set_for_stmt(stmt: &HirStmt) -> BTreeSet<TempId> {
-    let mut temps = BTreeSet::new();
-    collect_stmt_mentioned_temps(stmt, &mut temps);
-    temps
-}
-
 fn closure_capture_temp_set_for_stmt(stmt: &HirStmt) -> BTreeSet<TempId> {
     let mut temps = BTreeSet::new();
     collect_stmt_closure_capture_temps(stmt, &mut temps);
     temps
-}
-
-fn collect_stmt_mentioned_temps(stmt: &HirStmt, temps: &mut BTreeSet<TempId>) {
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => {
-            for value in &local_decl.values {
-                collect_expr_mentioned_temps(value, temps);
-            }
-        }
-        HirStmt::Assign(assign) => {
-            for target in &assign.targets {
-                collect_lvalue_mentioned_temps(target, temps);
-            }
-            for value in &assign.values {
-                collect_expr_mentioned_temps(value, temps);
-            }
-        }
-        HirStmt::TableSetList(set_list) => {
-            collect_expr_mentioned_temps(&set_list.base, temps);
-            for value in &set_list.values {
-                collect_expr_mentioned_temps(value, temps);
-            }
-            if let Some(trailing) = &set_list.trailing_multivalue {
-                collect_expr_mentioned_temps(trailing, temps);
-            }
-        }
-        HirStmt::ErrNil(err_nil) => collect_expr_mentioned_temps(&err_nil.value, temps),
-        HirStmt::ToBeClosed(to_be_closed) => {
-            collect_expr_mentioned_temps(&to_be_closed.value, temps);
-        }
-        HirStmt::CallStmt(call_stmt) => collect_call_mentioned_temps(&call_stmt.call, temps),
-        HirStmt::Return(ret) => {
-            for value in &ret.values {
-                collect_expr_mentioned_temps(value, temps);
-            }
-        }
-        HirStmt::If(if_stmt) => {
-            collect_expr_mentioned_temps(&if_stmt.cond, temps);
-            collect_block_mentioned_temps(&if_stmt.then_block, temps);
-            if let Some(else_block) = &if_stmt.else_block {
-                collect_block_mentioned_temps(else_block, temps);
-            }
-        }
-        HirStmt::While(while_stmt) => {
-            collect_expr_mentioned_temps(&while_stmt.cond, temps);
-            collect_block_mentioned_temps(&while_stmt.body, temps);
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            collect_block_mentioned_temps(&repeat_stmt.body, temps);
-            collect_expr_mentioned_temps(&repeat_stmt.cond, temps);
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            collect_expr_mentioned_temps(&numeric_for.start, temps);
-            collect_expr_mentioned_temps(&numeric_for.limit, temps);
-            collect_expr_mentioned_temps(&numeric_for.step, temps);
-            collect_block_mentioned_temps(&numeric_for.body, temps);
-        }
-        HirStmt::GenericFor(generic_for) => {
-            for value in &generic_for.iterator {
-                collect_expr_mentioned_temps(value, temps);
-            }
-            collect_block_mentioned_temps(&generic_for.body, temps);
-        }
-        HirStmt::Block(block) => collect_block_mentioned_temps(block, temps),
-        HirStmt::Unstructured(unstructured) => {
-            collect_block_mentioned_temps(&unstructured.body, temps)
-        }
-        HirStmt::Break
-        | HirStmt::Close(_)
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => {}
-    }
-}
-
-fn collect_block_mentioned_temps(block: &HirBlock, temps: &mut BTreeSet<TempId>) {
-    for stmt in &block.stmts {
-        collect_stmt_mentioned_temps(stmt, temps);
-    }
 }
 
 fn collect_stmt_closure_capture_temps(stmt: &HirStmt, temps: &mut BTreeSet<TempId>) {
@@ -281,22 +196,6 @@ fn collect_call_closure_capture_temps(call: &HirCallExpr, temps: &mut BTreeSet<T
         borrow = [&],
         expr(expr) => { collect_expr_closure_capture_temps(expr, temps); }
     );
-}
-
-fn collect_lvalue_mentioned_temps(lvalue: &HirLValue, temps: &mut BTreeSet<TempId>) {
-    match lvalue {
-        HirLValue::Temp(temp) => {
-            temps.insert(*temp);
-        }
-        HirLValue::TableAccess(access) => {
-            collect_expr_mentioned_temps(&access.base, temps);
-            collect_expr_mentioned_temps(&access.key, temps);
-        }
-        HirLValue::Param(_)
-        | HirLValue::Local(_)
-        | HirLValue::Upvalue(_)
-        | HirLValue::Global(_) => {}
-    }
 }
 
 pub(super) fn collect_expr_mentioned_temps(expr: &HirExpr, temps: &mut BTreeSet<TempId>) {

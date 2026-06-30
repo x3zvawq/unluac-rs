@@ -4,7 +4,8 @@
 //! 函数 sugar。
 //! 例如：`local f = obj.m; f(obj, 1)` 会在这里尝试折回 `obj:m(1)`。
 
-use super::super::binding_flow::{BindingUseIndex, name_matches_binding};
+use super::super::binding_flow::BindingUseIndex;
+use super::super::binding_ref::name_matches_binding;
 use super::super::expr_analysis::is_discard_safe_expr;
 use crate::ast::common::{AstBindingRef, AstCallKind, AstExpr, AstLocalAttr, AstStmt};
 

@@ -28,10 +28,10 @@ pub use cfg::{
 };
 pub use common::{
     BranchCandidate, BranchKind, BranchRegionFact, BranchValueMergeArm, BranchValueMergeCandidate,
-    BranchValueMergeValue, GenericPhiMaterialization, GotoReason, GotoRequirement, LoopCandidate,
-    LoopExitValueMergeCandidate, LoopKindHint, LoopSourceBindings, LoopValueArm, LoopValueIncoming,
-    LoopValueMerge, RegionFact, RegionKind, ScopeCandidate, ScopeKind, ShortCircuitCandidate,
-    ShortCircuitExit, ShortCircuitNode, ShortCircuitNodeRef, ShortCircuitTarget,
-    ShortCircuitValueIncoming, StructureFacts,
+    BranchValueMergeValue, GenericPhiMaterialization, GenericPhiSource, GotoReason,
+    GotoRequirement, LoopCandidate, LoopExitValueMergeCandidate, LoopKindHint, LoopSourceBindings,
+    LoopValueArm, LoopValueIncoming, LoopValueMerge, RegionFact, RegionKind, ScopeCandidate,
+    ScopeKind, ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNode, ShortCircuitNodeRef,
+    ShortCircuitTarget, ShortCircuitValueIncoming, StructureFacts,
 };
 pub use debug::dump_structure;

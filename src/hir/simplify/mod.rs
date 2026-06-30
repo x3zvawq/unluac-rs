@@ -18,12 +18,10 @@ mod local_shapes;
 mod locals;
 mod logical_simplify;
 mod mention;
-mod param_alias_coalesce;
 mod residuals;
 mod table_constructors;
 mod temp_inline;
 mod temp_touch;
-mod traverse;
 mod visit;
 mod walk;
 
@@ -68,8 +66,6 @@ enum HirInvalidation {
     TempChain,
     /// local 绑定变化（影响 branch-value-exprs, table-constructors）。
     LocalBinding,
-    /// 参数 alias local 的绑定身份变化。
-    ParamAlias,
     /// block 嵌套结构变化（影响 close-scopes 及其下游 locals）。
     BlockStructure,
     /// label/goto 存在性变化。
@@ -87,7 +83,6 @@ impl InvalidationTag for HirInvalidation {
             Self::TablePattern,
             Self::TempChain,
             Self::LocalBinding,
-            Self::ParamAlias,
             Self::BlockStructure,
             Self::LabelGoto,
             Self::ClosureCapture,
@@ -144,7 +139,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         name: "locals",
         phase: PassPhase::Normal,
         depends_on: &[TempChain, LocalBinding, BlockStructure],
-        invalidates: &[LocalBinding, TempChain, ParamAlias],
+        invalidates: &[LocalBinding, TempChain],
     },
     PassDescriptor {
         name: "branch-values",
@@ -157,12 +152,6 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
             LocalBinding,
             LogicalExpr,
         ],
-    },
-    PassDescriptor {
-        name: "param-alias-coalesce",
-        phase: PassPhase::Normal,
-        depends_on: &[ParamAlias],
-        invalidates: &[LocalBinding, ParamAlias],
     },
     // ── Deferred phase ──
     PassDescriptor {
@@ -243,12 +232,11 @@ pub(super) fn simplify_hir(
                         }
                         6 => locals::promote_temps_to_locals_in_proto_with_facts(proto, facts),
                         7 => branch_value_folding::fold_branch_values_in_proto(proto),
-                        8 => param_alias_coalesce::coalesce_param_aliases_in_proto(proto),
-                        9 => decision::eliminate_remaining_decisions_in_proto(proto),
-                        10 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
-                        11 => carried_locals::collapse_carried_local_handoffs_in_proto(proto),
-                        12 => dead_temps::remove_dead_temp_materializations_in_proto(proto),
-                        13 => dead_labels::remove_unused_labels_in_proto(proto),
+                        8 => decision::eliminate_remaining_decisions_in_proto(proto),
+                        9 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
+                        10 => carried_locals::collapse_carried_local_handoffs_in_proto(proto),
+                        11 => dead_temps::remove_dead_temp_materializations_in_proto(proto),
+                        12 => dead_labels::remove_unused_labels_in_proto(proto),
                         _ => unreachable!("invalid HIR pass index: {index}"),
                     }
                 })

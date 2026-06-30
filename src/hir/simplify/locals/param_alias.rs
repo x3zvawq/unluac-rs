@@ -1,9 +1,8 @@
-//! 这个 pass 负责消除“参数槽位被提升成 local 后又只作为参数别名”的机械拆分。
+//! 参数 alias 收敛是 locals pass 的后置步骤。
 //!
-//! HIR 的 `locals` pass 会把跨语句存活的 temp 提升成 `local`。当这个 temp 只是函数
-//! 参数的 SSA merge 结果时，继续把它交给 AST readability 会让后层承担 binding
-//! 身份修复。这里直接在 HIR 把窄形状 `local L = P` / `local L; L = P`
-//! 收回为对参数 `P` 的读写。
+//! locals pass 把跨语句存活的 temp 提升成 local 后，函数入口处可能出现机械别名：
+//! `local L = P` 或 `local L; L = P`。如果后续代码只通过这个别名继续读写参数槽位，
+//! 保留新 local 会把同一个源码身份拆成两个 binding，并把修复压力推给 AST/Naming。
 //!
 //! 输入形状 -> 输出形状：
 //! ```text
@@ -14,16 +13,16 @@
 //! return l0
 //! ```
 //!
-//! 这个 pass 不重新推断前层 phi，也不处理循环累加器。只在参数原值不会被后续读取、
-//! alias local 没有被闭包捕获、且 alias 不在循环体内写入时才改写。
+//! 这里不重新推断前层 phi，也不处理循环累加器；只有参数原值不会在 alias 写入后继续
+//! 被读取、alias local 没有被闭包捕获、且 alias 不在循环体内写入时才改写。
 
 use crate::hir::common::{
     HirBlock, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId, ParamId,
 };
 
-use super::mention::stmt_captures_local;
-use super::visit::{self, HirVisitor};
-use super::walk::{self, HirRewritePass};
+use super::super::mention::stmt_captures_local;
+use super::super::visit::{self, HirVisitor};
+use super::super::walk::{self, HirRewritePass};
 
 pub(super) fn coalesce_param_aliases_in_proto(proto: &mut HirProto) -> bool {
     let Some(alias) = match_param_alias_prefix(&proto.body) else {

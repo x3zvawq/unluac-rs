@@ -12,8 +12,8 @@
 //! 这里不会去猜任意跨语句的数据流；只有“构造器 local -> 构造器字段接线 -> 终端返回/终端局部初始化”
 //! 这一整段都还保持机械脚手架形状时，才会收回源码结构。
 
-use super::super::binding_flow::{BindingUseIndex, name_matches_binding};
-use super::super::binding_tree::binding_from_name_ref;
+use super::super::binding_flow::BindingUseIndex;
+use super::super::binding_ref::{binding_from_name_ref, name_matches_binding};
 use crate::ast::common::{
     AstAssign, AstBindingRef, AstExpr, AstFieldAccess, AstFunctionExpr, AstFunctionName, AstLValue,
     AstLocalAttr, AstLocalDecl, AstReturn, AstStmt, AstTableField, AstTableKey,

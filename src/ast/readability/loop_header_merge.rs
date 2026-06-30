@@ -9,10 +9,10 @@ use crate::ast::ReadabilityOptions;
 
 use super::super::common::{AstBlock, AstExpr, AstLocalAttr, AstLocalOrigin, AstModule, AstStmt};
 use super::ReadabilityContext;
-use super::binding_flow::{BindingUseIndex, count_binding_uses_in_stmt, name_matches_binding};
+use super::binding_flow::{BindingUseIndex, count_binding_uses_in_stmt};
+use super::binding_ref::{binding_from_name_ref, name_matches_binding};
 use super::binding_tree::{
-    binding_from_name_ref, count_name_expr_uses, replace_binding_use_in_expr,
-    stmt_mentions_binding_target,
+    count_name_expr_uses, replace_binding_use_in_expr, stmt_mentions_binding_target,
 };
 use super::expr_analysis::expr_complexity;
 use super::walk::{self, AstRewritePass, BlockKind};

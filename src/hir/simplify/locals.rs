@@ -1,4 +1,5 @@
-//! 这个文件负责把“已经明显跨语句存活的 temp”提升成 HIR local。
+//! 这个文件负责把“已经明显跨语句存活的 temp”提升成 HIR local，并收回由此暴露的
+//! 函数入口参数别名。
 //!
 //! 我们这里故意不去猜所有 temp 都是不是源码变量，而是只抓一类非常稳的形状：
 //! 当前 block 顶层先有一次初始化，后面这批 SSA temp 通过简单别名链继续流动，并且
@@ -14,7 +15,15 @@
 //! 普通临时值误写进已关闭 upvalue，直接改掉源码语义。
 //! fallback label/goto 还可能让 loop 回边快照在文本上早于 temp 定义出现；这种 temp
 //! 不能在定义点提升成 `local`，否则前缀快照会读到尚未初始化的局部变量。
+//! 参数别名收敛是 locals 的收尾步骤：如果提升后只得到 `local L = param` / `local L; L = param`
+//! 这类函数入口机械别名，且后续不会观察到参数原值和 alias local 的差异，就直接把
+//! 后续读写改回参数身份。它不重新推断 phi 或 loop state，只处理 locals 自己稳定暴露的
+//! binding 形状。
 //!
+mod branch_merge;
+mod param_alias;
+mod rewrite;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::temp_touch::{
@@ -22,8 +31,7 @@ use super::temp_touch::{
     stmt_consumes_temps_only_in_control_head, stmt_contains_nested_nonlocal_control,
 };
 use crate::hir::common::{
-    HirAssign, HirBlock, HirCallExpr, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt,
-    HirTableConstructor, HirTableField, HirTableKey, LocalId, TempId,
+    HirAssign, HirBlock, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId, TempId,
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
@@ -51,7 +59,8 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     );
     proto.locals.extend(new_locals);
     proto.local_debug_hints.extend(new_local_debug_hints);
-    result.changed
+    let alias_changed = param_alias::coalesce_param_aliases_in_proto(proto);
+    result.changed || alias_changed
 }
 
 #[derive(Debug, Clone)]
@@ -75,12 +84,6 @@ enum PromotionInit {
 enum PromotionAction {
     AllocateLocal,
     ReuseExistingLocal,
-}
-
-#[derive(Debug, Clone, Default)]
-struct FallthroughSummary {
-    falls_through: bool,
-    assigned_temps: BTreeSet<TempId>,
 }
 
 struct PromotionResult {
@@ -256,7 +259,7 @@ fn promote_block(
     // 定向重写，避免留下悬空的 TempRef。
     if mapping.len() > inherited.len() {
         for stmt in &mut block.stmts {
-            rewrite_forward_capture_refs(stmt, &mapping);
+            rewrite::forward_capture_refs(stmt, &mapping);
         }
     }
 
@@ -433,7 +436,7 @@ fn collect_plans(
     let mut sticky_slots = inherited_sticky_slots.clone();
     for (decl_index, stmt) in block.stmts.iter().enumerate() {
         let merge_temps =
-            if_merge_candidate_temps(stmt, &temp_touches, decl_index, &reserved_temps);
+            branch_merge::candidate_temps(stmt, &temp_touches, decl_index, &reserved_temps);
 
         for temp in merge_temps {
             let mut allocator = PlanAllocator {
@@ -607,131 +610,6 @@ fn expr_is_temp_ref(expr: &HirExpr, temp: TempId) -> bool {
     matches!(expr, HirExpr::TempRef(other) if *other == temp)
 }
 
-fn if_merge_candidate_temps(
-    stmt: &HirStmt,
-    temp_touches: &TempTouchIndex,
-    stmt_index: usize,
-    reserved_temps: &BTreeSet<TempId>,
-) -> Vec<TempId> {
-    let HirStmt::If(if_stmt) = stmt else {
-        return Vec::new();
-    };
-    let Some(else_block) = &if_stmt.else_block else {
-        return Vec::new();
-    };
-
-    let then_summary = summarize_block_fallthrough_assignments(&if_stmt.then_block);
-    let else_summary = summarize_block_fallthrough_assignments(else_block);
-    let Some(common_temps) =
-        intersect_fallthrough_assignment_sets([then_summary.as_ref(), else_summary.as_ref()])
-    else {
-        return Vec::new();
-    };
-
-    common_temps
-        .into_iter()
-        .filter(|temp| !reserved_temps.contains(temp))
-        .filter(|temp| !temp_touches.touches_before(stmt_index, *temp))
-        .filter(|temp| temp_touches.touches_after(stmt_index + 1, *temp))
-        .collect()
-}
-
-fn summarize_block_fallthrough_assignments(block: &HirBlock) -> Option<FallthroughSummary> {
-    let mut assigned_temps = BTreeSet::new();
-    let mut falls_through = true;
-
-    for stmt in &block.stmts {
-        if !falls_through {
-            break;
-        }
-
-        let stmt_summary = summarize_stmt_fallthrough_assignments(stmt)?;
-        if stmt_summary.falls_through {
-            assigned_temps.extend(stmt_summary.assigned_temps);
-        } else {
-            falls_through = false;
-        }
-    }
-
-    Some(FallthroughSummary {
-        falls_through,
-        assigned_temps,
-    })
-}
-
-fn summarize_stmt_fallthrough_assignments(stmt: &HirStmt) -> Option<FallthroughSummary> {
-    match stmt {
-        HirStmt::LocalDecl(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
-        | HirStmt::CallStmt(_)
-        | HirStmt::Label(_) => Some(FallthroughSummary {
-            falls_through: true,
-            assigned_temps: BTreeSet::new(),
-        }),
-        HirStmt::Assign(assign) => Some(FallthroughSummary {
-            falls_through: true,
-            assigned_temps: assign
-                .targets
-                .iter()
-                .filter_map(|target| match target {
-                    HirLValue::Temp(temp) => Some(*temp),
-                    HirLValue::Param(_)
-                    | HirLValue::Local(_)
-                    | HirLValue::Upvalue(_)
-                    | HirLValue::Global(_)
-                    | HirLValue::TableAccess(_) => None,
-                })
-                .collect(),
-        }),
-        HirStmt::TableSetList(_) => None,
-        HirStmt::Return(_) | HirStmt::Goto(_) | HirStmt::Break | HirStmt::Continue => {
-            Some(FallthroughSummary {
-                falls_through: false,
-                assigned_temps: BTreeSet::new(),
-            })
-        }
-        HirStmt::If(if_stmt) => {
-            let else_block = if_stmt.else_block.as_ref()?;
-            let then_summary = summarize_block_fallthrough_assignments(&if_stmt.then_block)?;
-            let else_summary = summarize_block_fallthrough_assignments(else_block)?;
-            let assigned_temps =
-                intersect_fallthrough_assignment_sets([Some(&then_summary), Some(&else_summary)])
-                    .unwrap_or_default();
-
-            Some(FallthroughSummary {
-                falls_through: then_summary.falls_through || else_summary.falls_through,
-                assigned_temps,
-            })
-        }
-        HirStmt::Block(block) => summarize_block_fallthrough_assignments(block),
-        HirStmt::While(_)
-        | HirStmt::Repeat(_)
-        | HirStmt::NumericFor(_)
-        | HirStmt::GenericFor(_)
-        | HirStmt::Unstructured(_) => None,
-    }
-}
-
-fn intersect_fallthrough_assignment_sets<'a>(
-    summaries: impl IntoIterator<Item = Option<&'a FallthroughSummary>>,
-) -> Option<BTreeSet<TempId>> {
-    let mut fallthrough_sets = summaries
-        .into_iter()
-        .flatten()
-        .filter(|summary| summary.falls_through)
-        .map(|summary| summary.assigned_temps.clone());
-    let mut intersection = fallthrough_sets.next()?;
-    for set in fallthrough_sets {
-        intersection = intersection
-            .intersection(&set)
-            .copied()
-            .collect::<BTreeSet<_>>();
-    }
-    Some(intersection)
-}
-
 fn rewrite_plan_anchor_stmt(
     stmt: &HirStmt,
     plan: &PromotionPlan,
@@ -751,7 +629,7 @@ fn rewrite_plan_anchor_stmt(
                 .iter()
                 .cloned()
                 .map(|mut expr| {
-                    rewrite_expr(&mut expr, mapping);
+                    rewrite::expr(&mut expr, mapping);
                     expr
                 })
                 .collect::<Vec<_>>()
@@ -789,45 +667,45 @@ fn rewrite_stmt(
         HirStmt::LocalDecl(local_decl) => {
             let mut changed = false;
             for expr in &mut local_decl.values {
-                changed |= rewrite_expr(expr, mapping);
+                changed |= rewrite::expr(expr, mapping);
             }
             changed
         }
         HirStmt::Assign(assign) => {
             let mut targets_changed = false;
             for target in &mut assign.targets {
-                targets_changed |= rewrite_lvalue(target, mapping);
+                targets_changed |= rewrite::lvalue(target, mapping);
             }
             let mut values_changed = false;
             for expr in &mut assign.values {
-                values_changed |= rewrite_expr(expr, mapping);
+                values_changed |= rewrite::expr(expr, mapping);
             }
             targets_changed || values_changed
         }
         HirStmt::TableSetList(set_list) => {
-            let base_changed = rewrite_expr(&mut set_list.base, mapping);
+            let base_changed = rewrite::expr(&mut set_list.base, mapping);
             let mut values_changed = false;
             for expr in &mut set_list.values {
-                values_changed |= rewrite_expr(expr, mapping);
+                values_changed |= rewrite::expr(expr, mapping);
             }
             let trailing_changed = set_list
                 .trailing_multivalue
                 .as_mut()
-                .is_some_and(|expr| rewrite_expr(expr, mapping));
+                .is_some_and(|expr| rewrite::expr(expr, mapping));
             base_changed || values_changed || trailing_changed
         }
-        HirStmt::ErrNil(err_nil) => rewrite_expr(&mut err_nil.value, mapping),
-        HirStmt::ToBeClosed(to_be_closed) => rewrite_expr(&mut to_be_closed.value, mapping),
-        HirStmt::CallStmt(call_stmt) => rewrite_call_expr(&mut call_stmt.call, mapping),
+        HirStmt::ErrNil(err_nil) => rewrite::expr(&mut err_nil.value, mapping),
+        HirStmt::ToBeClosed(to_be_closed) => rewrite::expr(&mut to_be_closed.value, mapping),
+        HirStmt::CallStmt(call_stmt) => rewrite::call_expr(&mut call_stmt.call, mapping),
         HirStmt::Return(ret) => {
             let mut changed = false;
             for expr in &mut ret.values {
-                changed |= rewrite_expr(expr, mapping);
+                changed |= rewrite::expr(expr, mapping);
             }
             changed
         }
         HirStmt::If(if_stmt) => {
-            let cond_changed = rewrite_expr(&mut if_stmt.cond, mapping);
+            let cond_changed = rewrite::expr(&mut if_stmt.cond, mapping);
             let then_changed = promote_block(
                 ctx,
                 &mut if_stmt.then_block,
@@ -842,7 +720,7 @@ fn rewrite_stmt(
             cond_changed || then_changed || else_changed
         }
         HirStmt::While(while_stmt) => {
-            let cond_changed = rewrite_expr(&mut while_stmt.cond, mapping);
+            let cond_changed = rewrite::expr(&mut while_stmt.cond, mapping);
             let body_changed = promote_block(
                 ctx,
                 &mut while_stmt.body,
@@ -864,13 +742,13 @@ fn rewrite_stmt(
                 sticky_slots,
                 outer_used_temps,
             );
-            let cond_changed = rewrite_expr(&mut repeat_stmt.cond, &body_result.trailing_mapping);
+            let cond_changed = rewrite::expr(&mut repeat_stmt.cond, &body_result.trailing_mapping);
             body_result.changed || cond_changed
         }
         HirStmt::NumericFor(numeric_for) => {
-            let start_changed = rewrite_expr(&mut numeric_for.start, mapping);
-            let limit_changed = rewrite_expr(&mut numeric_for.limit, mapping);
-            let step_changed = rewrite_expr(&mut numeric_for.step, mapping);
+            let start_changed = rewrite::expr(&mut numeric_for.start, mapping);
+            let limit_changed = rewrite::expr(&mut numeric_for.limit, mapping);
+            let step_changed = rewrite::expr(&mut numeric_for.step, mapping);
             let body_changed = promote_block(
                 ctx,
                 &mut numeric_for.body,
@@ -884,7 +762,7 @@ fn rewrite_stmt(
         HirStmt::GenericFor(generic_for) => {
             let mut iterator_changed = false;
             for expr in &mut generic_for.iterator {
-                iterator_changed |= rewrite_expr(expr, mapping);
+                iterator_changed |= rewrite::expr(expr, mapping);
             }
             let body_changed = promote_block(
                 ctx,
@@ -924,165 +802,4 @@ fn debug_hint_for_temp_group(
     temps
         .iter()
         .find_map(|temp| temp_debug_locals.get(temp.index()).cloned().flatten())
-}
-
-fn rewrite_call_expr(call: &mut HirCallExpr, mapping: &BTreeMap<TempId, LocalId>) -> bool {
-    let callee_changed = rewrite_expr(&mut call.callee, mapping);
-    let mut args_changed = false;
-    for arg in &mut call.args {
-        args_changed |= rewrite_expr(arg, mapping);
-    }
-    callee_changed || args_changed
-}
-
-fn rewrite_expr(expr: &mut HirExpr, mapping: &BTreeMap<TempId, LocalId>) -> bool {
-    match expr {
-        HirExpr::TempRef(temp) => {
-            if let Some(local) = mapping.get(temp) {
-                *expr = HirExpr::LocalRef(*local);
-                true
-            } else {
-                false
-            }
-        }
-        HirExpr::TableAccess(access) => {
-            let base_changed = rewrite_expr(&mut access.base, mapping);
-            let key_changed = rewrite_expr(&mut access.key, mapping);
-            base_changed || key_changed
-        }
-        HirExpr::Unary(unary) => rewrite_expr(&mut unary.expr, mapping),
-        HirExpr::Binary(binary) => {
-            let lhs_changed = rewrite_expr(&mut binary.lhs, mapping);
-            let rhs_changed = rewrite_expr(&mut binary.rhs, mapping);
-            lhs_changed || rhs_changed
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            let lhs_changed = rewrite_expr(&mut logical.lhs, mapping);
-            let rhs_changed = rewrite_expr(&mut logical.rhs, mapping);
-            lhs_changed || rhs_changed
-        }
-        HirExpr::Decision(decision) => {
-            let mut changed = false;
-            for node in &mut decision.nodes {
-                let test_changed = rewrite_expr(&mut node.test, mapping);
-                let truthy_changed = rewrite_decision_target(&mut node.truthy, mapping);
-                let falsy_changed = rewrite_decision_target(&mut node.falsy, mapping);
-                changed |= test_changed || truthy_changed || falsy_changed;
-            }
-            changed
-        }
-        HirExpr::Call(call) => rewrite_call_expr(call, mapping),
-        HirExpr::TableConstructor(table) => rewrite_table_constructor(table, mapping),
-        HirExpr::Closure(closure) => {
-            let mut changed = false;
-            for capture in &mut closure.captures {
-                changed |= rewrite_expr(&mut capture.value, mapping);
-            }
-            changed
-        }
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => false,
-    }
-}
-
-fn rewrite_decision_target(
-    target: &mut crate::hir::common::HirDecisionTarget,
-    mapping: &BTreeMap<TempId, LocalId>,
-) -> bool {
-    match target {
-        crate::hir::common::HirDecisionTarget::Expr(expr) => rewrite_expr(expr, mapping),
-        crate::hir::common::HirDecisionTarget::Node(_)
-        | crate::hir::common::HirDecisionTarget::CurrentValue => false,
-    }
-}
-
-fn rewrite_table_constructor(
-    table: &mut HirTableConstructor,
-    mapping: &BTreeMap<TempId, LocalId>,
-) -> bool {
-    let mut fields_changed = false;
-    for field in &mut table.fields {
-        let field_changed = match field {
-            HirTableField::Array(expr) => rewrite_expr(expr, mapping),
-            HirTableField::Record(field) => {
-                let key_changed = match &mut field.key {
-                    HirTableKey::Name(_) => false,
-                    HirTableKey::Expr(expr) => rewrite_expr(expr, mapping),
-                };
-                let value_changed = rewrite_expr(&mut field.value, mapping);
-                key_changed || value_changed
-            }
-        };
-        fields_changed |= field_changed;
-    }
-    let trailing_changed = table
-        .trailing_multivalue
-        .as_mut()
-        .is_some_and(|expr| rewrite_expr(expr, mapping));
-
-    fields_changed || trailing_changed
-}
-
-fn rewrite_lvalue(lvalue: &mut HirLValue, mapping: &BTreeMap<TempId, LocalId>) -> bool {
-    match lvalue {
-        HirLValue::Temp(temp) => {
-            if let Some(local) = mapping.get(temp) {
-                *lvalue = HirLValue::Local(*local);
-                true
-            } else {
-                false
-            }
-        }
-        HirLValue::TableAccess(access) => {
-            let base_changed = rewrite_expr(&mut access.base, mapping);
-            let key_changed = rewrite_expr(&mut access.key, mapping);
-            base_changed || key_changed
-        }
-        HirLValue::Param(_)
-        | HirLValue::Local(_)
-        | HirLValue::Upvalue(_)
-        | HirLValue::Global(_) => false,
-    }
-}
-
-/// 对语句中 closure capture 里残留的 TempRef 做定向重写。
-///
-/// 互递归/前向声明模式下（`local a, b; a = function() b()… end; b = function() a()… end`），
-/// 第一次遍历 promote_block 时 b 的 temp 尚未加入 mapping，导致 a 的 capture 仍是
-/// TempRef。这里用最终 mapping 补一次定向重写，只处理 closure capture 这一种残留，
-/// 避免做全量二次遍历。
-fn rewrite_forward_capture_refs(stmt: &mut HirStmt, mapping: &BTreeMap<TempId, LocalId>) {
-    match stmt {
-        HirStmt::Assign(assign) => {
-            for expr in &mut assign.values {
-                rewrite_closure_capture_temps(expr, mapping);
-            }
-        }
-        HirStmt::LocalDecl(local_decl) => {
-            for expr in &mut local_decl.values {
-                rewrite_closure_capture_temps(expr, mapping);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn rewrite_closure_capture_temps(expr: &mut HirExpr, mapping: &BTreeMap<TempId, LocalId>) {
-    if let HirExpr::Closure(closure) = expr {
-        for capture in &mut closure.captures {
-            rewrite_expr(&mut capture.value, mapping);
-        }
-    }
 }

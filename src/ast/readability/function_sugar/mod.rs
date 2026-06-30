@@ -12,4 +12,5 @@ mod forwarded;
 mod method_alias;
 mod rewrite;
 
+pub(super) use method_alias::run_belongs_to_method_alias_owner;
 pub(super) use rewrite::apply;

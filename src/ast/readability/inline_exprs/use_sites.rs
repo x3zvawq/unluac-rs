@@ -10,7 +10,7 @@ use super::super::super::common::{
     AstCallExpr, AstCallKind, AstExpr, AstGlobalDecl, AstLValue, AstMethodCallExpr, AstStmt,
     AstTableField, AstTableKey,
 };
-use super::super::binding_flow::name_matches_binding;
+use super::super::binding_ref::name_matches_binding;
 use super::super::expr_analysis::{
     expr_complexity, is_access_base_inline_expr, is_call_arg_constructor_inline_expr,
     is_direct_return_constructor_inline_expr, is_mechanical_run_inline_expr,

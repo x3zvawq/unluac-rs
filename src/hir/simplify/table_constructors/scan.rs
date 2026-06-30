@@ -11,7 +11,8 @@ use super::bindings::{
     BindingIndex, BindingUseSummary, StmtBindingSummary, binding_from_expr, binding_from_lvalue,
     expr_uses_binding, lvalue_uses_binding, stmt_slice_mentions_binding,
 };
-use super::rebuild::{ConstructorBuilder, RegionRebuildContext, try_extend_constructor_from_steps};
+use super::builder::ConstructorBuilder;
+use super::rebuild::{RegionRebuildContext, try_extend_constructor_from_steps};
 use super::{RebuildScratch, RegionStep, TableBinding};
 
 pub(super) fn constructor_seed(stmt: &HirStmt) -> Option<(TableBinding, HirTableConstructor)> {

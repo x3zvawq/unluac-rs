@@ -5,8 +5,12 @@
 //! 混在 `structure/mod.rs` 入口文件里，很快就会把“分支恢复”和“循环恢复”搅成一团，
 //! 也更难看出每一步为什么安全。
 
+mod break_pads;
+mod context;
+mod generic_for;
 mod lower;
 mod state;
+mod state_bindings;
 
 use super::rewrites::{
     expr_has_temp_ref_in, lvalue_as_expr, rewrite_expr_temps, temp_expr_overrides,
@@ -36,6 +40,10 @@ fn loop_state_init_stmts(plan: &LoopStatePlan) -> Vec<HirStmt> {
         })
         .map(|state| assign_stmt(vec![state.target.clone()], vec![state.init.clone()]))
         .collect()
+}
+
+fn state_slots_by_reg(states: &[LoopStateSlot]) -> BTreeMap<Reg, &LoopStateSlot> {
+    states.iter().map(|state| (state.reg, state)).collect()
 }
 
 fn unique_loop_preheader(candidate: &LoopCandidate) -> Option<BlockRef> {

@@ -23,7 +23,7 @@ use crate::hir::common::{
     HirTableConstructor,
 };
 
-use super::traverse::{
+use crate::hir::traverse::{
     traverse_hir_call_children, traverse_hir_decision_children, traverse_hir_expr_children,
     traverse_hir_lvalue_children, traverse_hir_stmt_children,
     traverse_hir_table_constructor_children,

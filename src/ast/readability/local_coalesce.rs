@@ -12,7 +12,7 @@ use super::super::common::{
     AstAssign, AstBindingRef, AstBlock, AstExpr, AstLValue, AstLocalAttr, AstModule, AstStmt,
 };
 use super::ReadabilityContext;
-use super::binding_flow::name_matches_binding;
+use super::binding_ref::name_matches_binding;
 use super::binding_tree::{
     expr_references_binding, lvalue_references_binding, rewrite_binding_in_stmt,
     stmt_references_or_captures_binding,

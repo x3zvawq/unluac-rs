@@ -6,9 +6,8 @@
 
 use std::collections::BTreeSet;
 
-use super::super::binding_flow::{
-    BindingUseIndex, count_binding_uses_in_block_deep, name_matches_binding,
-};
+use super::super::binding_flow::{BindingUseIndex, count_binding_uses_in_block_deep};
+use super::super::binding_ref::name_matches_binding;
 use super::direct::function_decl_target_from_lvalue;
 use crate::ast::common::{
     AstBindingRef, AstExpr, AstFunctionDecl, AstFunctionExpr, AstGlobalBindingTarget, AstNamePath,

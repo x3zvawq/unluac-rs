@@ -7,6 +7,7 @@
 mod bindings;
 mod exprs;
 mod helpers;
+mod instrs;
 mod lower;
 mod short_circuit;
 mod structure;
@@ -18,9 +19,9 @@ use crate::hir::common::HirModule;
 
 use self::exprs::lower_branch_cond;
 use self::helpers::{assign_stmt, branch_stmt, build_label_map_for_summary, goto_block};
+use self::instrs::{is_control_terminator, lower_control_instr, lower_regular_instr};
 use self::lower::{
-    ProtoBindings, ProtoLowering, is_control_terminator, lower_control_instr,
-    lower_phi_materialization_with_allowed_blocks_except, lower_regular_instr,
+    ProtoBindings, ProtoLowering, lower_phi_materialization_with_allowed_blocks_except,
 };
 
 /// HIR 阶段入口：消费结构事实与前序控制/数据流事实，写回 HIR 模块。

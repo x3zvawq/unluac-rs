@@ -14,9 +14,10 @@ use crate::decompile::{DebugOptions, DecompileState};
 
 use super::common::{
     BranchCandidate, BranchRegionFact, BranchValueMergeCandidate, GenericPhiMaterialization,
-    GotoRequirement, LoopCandidate, LoopExitValueMergeCandidate, LoopSourceBindings,
-    LoopValueMerge, RegionFact, ScopeCandidate, ShortCircuitCandidate, ShortCircuitExit,
-    ShortCircuitNode, ShortCircuitTarget, ShortCircuitValueIncoming, StructureFacts,
+    GenericPhiSource, GotoRequirement, LoopCandidate, LoopExitValueMergeCandidate,
+    LoopSourceBindings, LoopValueMerge, RegionFact, ScopeCandidate, ShortCircuitCandidate,
+    ShortCircuitExit, ShortCircuitNode, ShortCircuitTarget, ShortCircuitValueIncoming,
+    StructureFacts,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -266,11 +267,12 @@ fn write_loops(output: &mut String, indent: &str, candidates: &[LoopCandidate]) 
     for candidate in candidates {
         let _ = writeln!(
             output,
-            "{indent}    header=#{} preheader={} kind={} bindings={} continue={} exits={} reducible={} backedges={} blocks={}",
+            "{indent}    header=#{} preheader={} kind={} bindings={} binding-scope={} continue={} exits={} reducible={} backedges={} blocks={}",
             candidate.header.index(),
             format_optional_block(candidate.preheader),
             format_loop_kind(candidate.kind_hint),
             format_loop_source_bindings(candidate.source_bindings),
+            format_display_set(&candidate.binding_scope_blocks),
             format_optional_block(candidate.continue_target),
             format_display_set(&candidate.exits),
             candidate.reducible,
@@ -320,11 +322,19 @@ fn write_generic_phi_materializations(
     for candidate in candidates {
         let _ = writeln!(
             output,
-            "{indent}    block=#{} phi=p{} reg={}",
+            "{indent}    block=#{} phi=p{} reg={} source={}",
             candidate.block.index(),
             candidate.phi_id.index(),
             candidate.reg,
+            format_generic_phi_source(candidate.source),
         );
+    }
+}
+
+fn format_generic_phi_source(source: GenericPhiSource) -> String {
+    match source {
+        GenericPhiSource::IdomExit(block) => format!("idom-exit:#{}", block.index()),
+        GenericPhiSource::Unresolved => "unresolved".to_string(),
     }
 }
 

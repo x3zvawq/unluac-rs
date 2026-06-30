@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::structure::{BlockRef, Cfg, DataflowFacts, EdgeRef, GraphFacts};
+use crate::structure::{BlockRef, Cfg, DataflowFacts, EdgeKind, EdgeRef, GraphFacts};
 use crate::transformer::{LowInstr, LoweredProto, Reg, ResultPack};
 
 use super::common::{
@@ -50,6 +50,8 @@ pub(super) fn analyze_loops(
             let preheader = unique_loop_preheader(cfg, header, &blocks);
             let exits = collect_region_exits(cfg, &blocks);
             let reducible = is_reducible_region(cfg, header, &blocks);
+            let binding_scope_blocks =
+                loop_binding_scope(&blocks, &exits, header, cfg, graph_facts);
             let header_value_merges = analyze_loop_header_value_merges(dataflow, header, &blocks);
             let (kind_hint, continue_target, source_bindings) = infer_loop_shape(LoopShapeInput {
                 proto,
@@ -67,6 +69,7 @@ pub(super) fn analyze_loops(
                 header,
                 preheader,
                 blocks,
+                binding_scope_blocks,
                 backedges,
                 exits,
                 continue_target,
@@ -83,6 +86,7 @@ pub(super) fn analyze_loops(
         proto,
         cfg,
         dataflow,
+        graph_facts,
         &grouped_headers,
     ));
     loop_candidates.sort_by_key(|candidate| candidate.header);
@@ -93,13 +97,14 @@ fn analyze_degenerate_generic_for_loops(
     proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,
+    graph_facts: &GraphFacts,
     grouped_headers: &BTreeSet<BlockRef>,
 ) -> Vec<LoopCandidate> {
     cfg.reachable_blocks
         .iter()
         .copied()
         .filter(|header| !grouped_headers.contains(header))
-        .filter_map(|header| degenerate_generic_for_loop(proto, cfg, dataflow, header))
+        .filter_map(|header| degenerate_generic_for_loop(proto, cfg, dataflow, graph_facts, header))
         .collect()
 }
 
@@ -107,6 +112,7 @@ fn degenerate_generic_for_loop(
     proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,
+    graph_facts: &GraphFacts,
     header: BlockRef,
 ) -> Option<LoopCandidate> {
     let Some(LowInstr::GenericForLoop(instr)) = cfg.terminator(&proto.instrs, header) else {
@@ -127,6 +133,7 @@ fn degenerate_generic_for_loop(
     if !exits.contains(&exit) || !is_reducible_region(cfg, header, &blocks) {
         return None;
     }
+    let binding_scope_blocks = loop_binding_scope(&blocks, &exits, header, cfg, graph_facts);
 
     let preheader = unique_loop_preheader(cfg, header, &blocks);
     let header_value_merges = analyze_loop_header_value_merges(dataflow, header, &blocks);
@@ -136,6 +143,7 @@ fn degenerate_generic_for_loop(
         header,
         preheader,
         blocks,
+        binding_scope_blocks,
         backedges: Vec::new(),
         exits,
         continue_target: Some(header),
@@ -310,6 +318,85 @@ fn generic_for_source_bindings(
         LowInstr::GenericForLoop(instr) => Some(LoopSourceBindings::Generic(instr.bindings)),
         _ => None,
     }
+}
+
+/// 计算 for-loop binding 的可见作用域块集合。
+///
+/// natural loop 拓扑只包含能回到 header 的 body 块，不含通过 return/break
+/// 提前离开循环的块。但在 Lua 语义下，这些提前退出的块仍处于 for-binding
+/// 的词法作用域中（如 `for i = 1, n do if cond then return i end end`）。
+///
+/// 策略：在 candidate.blocks 基础上，追加被 header 严格支配的提前退出区域。
+/// 只有不是通过 LoopExit 边到达的出口块才被视为提前退出；LoopExit 边的目标是循环
+/// 正常结束后的后继块，for-binding 在那里已失效。
+fn loop_binding_scope(
+    body_blocks: &BTreeSet<BlockRef>,
+    exits: &BTreeSet<BlockRef>,
+    header: BlockRef,
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+) -> BTreeSet<BlockRef> {
+    let mut scope = body_blocks.clone();
+    let normal_exits = exits
+        .iter()
+        .copied()
+        .filter(|exit| {
+            cfg.preds[exit.index()].iter().any(|edge_ref| {
+                let edge = &cfg.edges[edge_ref.index()];
+                body_blocks.contains(&edge.from) && edge.kind == EdgeKind::LoopExit
+            })
+        })
+        .collect::<BTreeSet<_>>();
+
+    for &exit in exits {
+        if exit == header || !graph_facts.dominator_tree.dominates(header, exit) {
+            continue;
+        }
+        let reached_via_loop_exit = cfg.preds[exit.index()].iter().any(|edge_ref| {
+            let edge = &cfg.edges[edge_ref.index()];
+            body_blocks.contains(&edge.from) && edge.kind == EdgeKind::LoopExit
+        });
+        if !reached_via_loop_exit {
+            scope.extend(loop_binding_early_exit_scope(
+                exit,
+                header,
+                &normal_exits,
+                cfg,
+                graph_facts,
+            ));
+        }
+    }
+    scope
+}
+
+fn loop_binding_early_exit_scope(
+    exit: BlockRef,
+    header: BlockRef,
+    normal_exits: &BTreeSet<BlockRef>,
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+) -> BTreeSet<BlockRef> {
+    let mut scope = BTreeSet::new();
+    let mut stack = vec![exit];
+
+    while let Some(block) = stack.pop() {
+        if block == cfg.exit_block
+            || normal_exits.contains(&block)
+            || !graph_facts.dominator_tree.dominates(header, block)
+            || !scope.insert(block)
+        {
+            continue;
+        }
+
+        for edge_ref in &cfg.succs[block.index()] {
+            let successor = cfg.edges[edge_ref.index()].to;
+            if !normal_exits.contains(&successor) {
+                stack.push(successor);
+            }
+        }
+    }
+
+    scope
 }
 
 fn analyze_loop_header_value_merges(

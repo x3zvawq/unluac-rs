@@ -58,9 +58,9 @@ pub fn assign_names_with_evidence(
     evidence: &NamingEvidence,
     options: NamingOptions,
 ) -> Result<NameMap, NamingError> {
+    validate_readability_ast(module, module.entry_function, hir)?;
     let ast_facts = collect_ast_naming_facts(module, hir);
     let lexical_contexts = collect_lexical_contexts(module, hir)?;
-    validate_readability_ast(module, module.entry_function, hir)?;
 
     let mut hints = vec![FunctionHints::default(); hir.protos.len()];
     collect_function_hints(module, hir, &mut hints)?;

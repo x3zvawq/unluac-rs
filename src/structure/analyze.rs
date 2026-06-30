@@ -107,6 +107,8 @@ pub(crate) fn analyze_structure_proto(
         &short_circuit_candidates,
     );
     let generic_phi_materializations = phi_facts::analyze_generic_phi_materializations(
+        cfg,
+        graph_facts,
         dataflow,
         &branch_value_merge_candidates,
         &loop_candidates,

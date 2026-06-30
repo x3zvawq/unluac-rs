@@ -23,6 +23,7 @@ use super::super::common::{
 };
 use super::ReadabilityContext;
 use super::binding_flow::BindingUseIndex;
+use super::binding_ref::name_matches_binding;
 use super::binding_tree::{
     expr_references_binding, stmt_has_access_base_binding_use, stmt_has_call_callee_binding_use,
     stmt_has_direct_call_arg_binding_use, stmt_has_index_binding_use, stmt_has_nested_binding_use,
@@ -275,7 +276,7 @@ fn binding_is_first_eval_in_call(call: &AstCallKind, binding: AstBindingRef) -> 
 
 fn binding_is_first_eval_in_expr(expr: &AstExpr, binding: AstBindingRef) -> bool {
     match expr {
-        AstExpr::Var(name) => super::binding_flow::name_matches_binding(name, binding),
+        AstExpr::Var(name) => name_matches_binding(name, binding),
         AstExpr::FieldAccess(access) => binding_is_first_eval_in_expr(&access.base, binding),
         AstExpr::IndexAccess(access) => binding_is_first_eval_in_expr(&access.base, binding),
         AstExpr::Unary(unary) => binding_is_first_eval_in_expr(&unary.expr, binding),
@@ -326,6 +327,13 @@ fn collapse_adjacent_call_alias_runs(block: &mut AstBlock, options: ReadabilityO
             index += 1;
             continue;
         };
+        if super::function_sugar::run_belongs_to_method_alias_owner(
+            &old_stmts, index, run_end, &use_index,
+        ) {
+            new_stmts.push(old_stmts[index].clone());
+            index += 1;
+            continue;
+        }
 
         let mut rewritten_sink = old_stmts[run_end].clone();
         let rewrite_policy = if stmt_is_generic_for_call_alias_sink(&old_stmts[run_end]) {
@@ -447,6 +455,13 @@ fn collapse_terminal_call_result_alias_runs(
             index += 1;
             continue;
         };
+        if super::function_sugar::run_belongs_to_method_alias_owner(
+            &old_stmts, index, sink_index, &use_index,
+        ) {
+            new_stmts.push(old_stmts[index].clone());
+            index += 1;
+            continue;
+        }
 
         let mut rewritten_sink = old_stmts[sink_index].clone();
         let mut removed = vec![false; sink_index - index];
