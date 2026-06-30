@@ -1,7 +1,7 @@
 -- regress_40_branch_state_and_short_prefix_escape#1: branch state 初值与短路前缀外逃值都要物化
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-contains [[local r1_3 = r1_1]]
--- unluac: expect-contains [[r1_4 = r1_7 * r1_8]]
+-- unluac: expect-contains [[r1_4 = r1_9 * r1_10]]
 
 local function choose_mode(fullscreen, width, height, handler)
     local selected, current, modes = handler:getCurrentMode()
