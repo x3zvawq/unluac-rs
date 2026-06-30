@@ -9,7 +9,7 @@
 //!   `then_arm = {preds, defs_of_1}`、`else_arm = {preds, defs_of_2}`
 //! - 这样 HIR 只消费 `then/else` 两臂已经分好的 defs，不再自己回头拆 `phi.incoming`
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::structure::{BlockRef, Cfg, DataflowFacts, GraphFacts};
 
@@ -50,8 +50,18 @@ pub(super) fn analyze_branch_value_merges(
         short_circuit_candidates,
     ));
 
-    candidates.sort_by_key(|candidate| (candidate.header, candidate.merge));
-    candidates
+    let mut best_by_region = BTreeMap::<(BlockRef, BlockRef), BranchValueMergeCandidate>::new();
+    for candidate in candidates {
+        let key = (candidate.header, candidate.merge);
+        match best_by_region.get(&key) {
+            Some(existing) if existing.values.len() >= candidate.values.len() => {}
+            _ => {
+                best_by_region.insert(key, candidate);
+            }
+        }
+    }
+
+    best_by_region.into_values().collect()
 }
 
 fn analyze_guard_short_circuit_branch_value_merges(
@@ -109,7 +119,8 @@ fn analyze_branch_value_merge_candidate(
     // IfElse：两臂的 merge predecessors 分别来自 then/else 侧。
     // IfThen：只有 then 侧有 merge preds，else 侧相当于 header 直接跳到 merge。
     // 需要用 header 作为 else_preds，这样 phi 的"保留当前值"语义才能被正确捕获。
-    // Guard：暂不处理值合流。
+    // Guard 的另一侧是外部 continuation，不是由两臂共同流入的 merge；这类形状
+    // 没有可分配给 then/else 的值合流 owner。
     let header_as_else_preds;
     let else_preds = match branch_region.kind {
         BranchKind::IfElse => &branch_region.else_merge_preds,

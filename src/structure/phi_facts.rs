@@ -159,6 +159,7 @@ pub(super) fn analyze_generic_phi_materializations(
 ) -> Vec<GenericPhiMaterialization> {
     let mut covered = short_circuit_candidates
         .iter()
+        .filter(|candidate| candidate.reducible)
         .filter_map(|candidate| candidate.result_phi_id)
         .collect::<BTreeSet<_>>();
     covered.extend(

@@ -39,6 +39,7 @@ pub(super) fn analyze_value_merge_candidates(
     branch_candidates: &[BranchCandidate],
 ) -> Vec<ShortCircuitCandidate> {
     let mut best_by_merge = BTreeMap::<(BlockRef, Reg), ShortCircuitCandidate>::new();
+    let mut reachability_by_merge = BTreeMap::<BlockRef, MergeReachability>::new();
     let dom_tree = &graph_facts.dominator_tree;
     let build_ctx = ValueMergeBuildCtx {
         proto,
@@ -53,7 +54,9 @@ pub(super) fn analyze_value_merge_candidates(
             continue;
         }
 
-        let merge_reachability = MergeReachability::for_merge(cfg, phi.block);
+        let merge_reachability = reachability_by_merge
+            .entry(phi.block)
+            .or_insert_with(|| MergeReachability::for_merge(cfg, phi.block));
 
         for root in branch_candidates {
             if root.header == phi.block
@@ -64,8 +67,7 @@ pub(super) fn analyze_value_merge_candidates(
             }
 
             let Some(candidate) =
-                ValueMergeDagBuilder::new(&build_ctx, root.header, phi, &merge_reachability)
-                    .build()
+                ValueMergeDagBuilder::new(&build_ctx, root.header, phi, merge_reachability).build()
             else {
                 continue;
             };
