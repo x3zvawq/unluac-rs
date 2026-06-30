@@ -64,12 +64,6 @@ impl BindingLookup for BindingRefSet {
     }
 }
 
-impl BindingLookup for &[AstLocalBinding] {
-    fn contains_binding(&self, binding: AstBindingRef) -> bool {
-        self.iter().any(|local| local.id == binding)
-    }
-}
-
 impl BindingUseIndex {
     pub(super) fn for_stmts(stmts: &[AstStmt]) -> Self {
         Self::for_stmts_with_scope(stmts, BindingUseScope::CurrentFunctionOnly)
@@ -171,24 +165,12 @@ impl BindingUseIndex {
     }
 }
 
-pub(super) fn count_binding_uses_in_stmts(stmts: &[AstStmt], binding: AstBindingRef) -> usize {
-    count_binding_uses_in_stmts_with_scope(stmts, binding, BindingUseScope::CurrentFunctionOnly)
-}
-
 pub(super) fn count_binding_uses_in_block_deep(block: &AstBlock, binding: AstBindingRef) -> usize {
     count_binding_uses_in_block_with_scope(
         block,
         binding,
         BindingUseScope::IncludingNestedFunctions,
     )
-}
-
-pub(super) fn count_binding_mentions_in_block(block: &AstBlock, binding: AstBindingRef) -> usize {
-    block
-        .stmts
-        .iter()
-        .map(|stmt| count_binding_mentions_in_stmt(stmt, binding))
-        .sum()
 }
 
 pub(super) fn binding_mentions_in_stmt(stmt: &AstStmt) -> BTreeSet<AstBindingRef> {
@@ -404,77 +386,6 @@ fn collect_binding_uses_in_stmt_with_scope(
     }
 }
 
-fn count_binding_mentions_in_stmt(stmt: &AstStmt, binding: AstBindingRef) -> usize {
-    match stmt {
-        AstStmt::LocalDecl(local_decl) => local_decl
-            .values
-            .iter()
-            .map(|value| count_binding_uses_in_expr(value, binding))
-            .sum(),
-        AstStmt::GlobalDecl(global_decl) => global_decl
-            .values
-            .iter()
-            .map(|value| count_binding_uses_in_expr(value, binding))
-            .sum(),
-        AstStmt::Assign(assign) => {
-            assign
-                .targets
-                .iter()
-                .map(|target| count_binding_mentions_in_lvalue(target, binding))
-                .sum::<usize>()
-                + assign
-                    .values
-                    .iter()
-                    .map(|value| count_binding_uses_in_expr(value, binding))
-                    .sum::<usize>()
-        }
-        AstStmt::CallStmt(call_stmt) => count_binding_uses_in_call(&call_stmt.call, binding),
-        AstStmt::Return(ret) => ret
-            .values
-            .iter()
-            .map(|value| count_binding_uses_in_expr(value, binding))
-            .sum(),
-        AstStmt::If(if_stmt) => {
-            count_binding_uses_in_expr(&if_stmt.cond, binding)
-                + count_binding_mentions_in_block(&if_stmt.then_block, binding)
-                + if_stmt
-                    .else_block
-                    .as_ref()
-                    .map(|else_block| count_binding_mentions_in_block(else_block, binding))
-                    .unwrap_or(0)
-        }
-        AstStmt::While(while_stmt) => {
-            count_binding_uses_in_expr(&while_stmt.cond, binding)
-                + count_binding_mentions_in_block(&while_stmt.body, binding)
-        }
-        AstStmt::Repeat(repeat_stmt) => {
-            count_binding_mentions_in_block(&repeat_stmt.body, binding)
-                + count_binding_uses_in_expr(&repeat_stmt.cond, binding)
-        }
-        AstStmt::NumericFor(numeric_for) => {
-            count_binding_uses_in_expr(&numeric_for.start, binding)
-                + count_binding_uses_in_expr(&numeric_for.limit, binding)
-                + count_binding_uses_in_expr(&numeric_for.step, binding)
-                + count_binding_mentions_in_block(&numeric_for.body, binding)
-        }
-        AstStmt::GenericFor(generic_for) => {
-            generic_for
-                .iterator
-                .iter()
-                .map(|expr| count_binding_uses_in_expr(expr, binding))
-                .sum::<usize>()
-                + count_binding_mentions_in_block(&generic_for.body, binding)
-        }
-        AstStmt::DoBlock(block) => count_binding_mentions_in_block(block, binding),
-        AstStmt::FunctionDecl(_) | AstStmt::LocalFunctionDecl(_) => 0,
-        AstStmt::Break
-        | AstStmt::Continue
-        | AstStmt::Goto(_)
-        | AstStmt::Label(_)
-        | AstStmt::Error(_) => 0,
-    }
-}
-
 fn collect_binding_mentions_in_block(block: &AstBlock, mentions: &mut BTreeSet<AstBindingRef>) {
     for stmt in &block.stmts {
         collect_binding_mentions_in_stmt(stmt, mentions);
@@ -540,9 +451,11 @@ fn collect_binding_mentions_in_stmt(stmt: &AstStmt, mentions: &mut BTreeSet<AstB
         AstStmt::DoBlock(block) => collect_binding_mentions_in_block(block, mentions),
         AstStmt::FunctionDecl(function_decl) => {
             collect_function_name_mentions(&function_decl.target, mentions);
+            collect_function_capture_mentions(&function_decl.func, mentions);
         }
         AstStmt::LocalFunctionDecl(function_decl) => {
             mentions.insert(function_decl.name);
+            collect_function_capture_mentions(&function_decl.func, mentions);
         }
         AstStmt::Break
         | AstStmt::Continue
@@ -635,7 +548,7 @@ fn collect_binding_mentions_in_expr(expr: &AstExpr, mentions: &mut BTreeSet<AstB
                 }
             }
         }
-        AstExpr::FunctionExpr(_) => {}
+        AstExpr::FunctionExpr(function) => collect_function_capture_mentions(function, mentions),
         AstExpr::Nil
         | AstExpr::Boolean(_)
         | AstExpr::Integer(_)
@@ -660,14 +573,6 @@ fn collect_function_name_mentions(
     if let Some(binding) = binding_from_name_ref(&path.root) {
         mentions.insert(binding);
     }
-}
-
-fn count_binding_uses_in_call(call: &AstCallKind, binding: AstBindingRef) -> usize {
-    count_binding_uses_in_call_with_scope(call, binding, BindingUseScope::CurrentFunctionOnly)
-}
-
-fn count_binding_uses_in_expr(expr: &AstExpr, binding: AstBindingRef) -> usize {
-    count_binding_uses_in_expr_with_scope(expr, binding, BindingUseScope::CurrentFunctionOnly)
 }
 
 fn count_binding_uses_in_call_with_scope(
@@ -926,8 +831,16 @@ fn collect_function_capture_uses(
     }
 }
 
+fn collect_function_capture_mentions(
+    function: &super::super::common::AstFunctionExpr,
+    mentions: &mut BTreeSet<AstBindingRef>,
+) {
+    mentions.extend(function.captured_bindings.iter().copied());
+}
+
 pub(super) fn stmt_references_any_binding(stmt: &AstStmt, bindings: &[AstLocalBinding]) -> bool {
-    stmt_references_binding_lookup(stmt, &bindings)
+    let refs = BindingRefSet::from_bindings(bindings);
+    stmt_references_binding_set(stmt, &refs)
 }
 
 pub(super) fn stmt_references_binding_set(stmt: &AstStmt, bindings: &BindingRefSet) -> bool {
@@ -1002,8 +915,12 @@ fn stmt_references_binding_lookup(stmt: &AstStmt, bindings: &dyn BindingLookup) 
         AstStmt::DoBlock(block) => block_references_binding_lookup(block, bindings),
         AstStmt::FunctionDecl(function_decl) => {
             function_name_references_binding_lookup(&function_decl.target, bindings)
+                || function_capture_references_binding_lookup(&function_decl.func, bindings)
         }
-        AstStmt::LocalFunctionDecl(function_decl) => bindings.contains_binding(function_decl.name),
+        AstStmt::LocalFunctionDecl(function_decl) => {
+            bindings.contains_binding(function_decl.name)
+                || function_capture_references_binding_lookup(&function_decl.func, bindings)
+        }
         AstStmt::Break
         | AstStmt::Continue
         | AstStmt::Goto(_)
@@ -1024,7 +941,8 @@ fn block_references_binding_lookup(block: &AstBlock, bindings: &dyn BindingLooku
 }
 
 pub(super) fn expr_references_any_binding(expr: &AstExpr, bindings: &[AstLocalBinding]) -> bool {
-    expr_references_binding_lookup(expr, &bindings)
+    let refs = BindingRefSet::from_bindings(bindings);
+    expr_references_binding_set(expr, &refs)
 }
 
 pub(super) fn expr_references_binding_set(expr: &AstExpr, bindings: &BindingRefSet) -> bool {
@@ -1073,7 +991,9 @@ fn expr_references_binding_lookup(expr: &AstExpr, bindings: &dyn BindingLookup) 
                 key_references_binding || expr_references_binding_lookup(&record.value, bindings)
             }
         }),
-        AstExpr::FunctionExpr(_) => false,
+        AstExpr::FunctionExpr(function) => {
+            function_capture_references_binding_lookup(function, bindings)
+        }
         AstExpr::Nil
         | AstExpr::Boolean(_)
         | AstExpr::Integer(_)
@@ -1084,18 +1004,6 @@ fn expr_references_binding_lookup(expr: &AstExpr, bindings: &dyn BindingLookup) 
         | AstExpr::Complex { .. }
         | AstExpr::VarArg
         | AstExpr::Error(_) => false,
-    }
-}
-
-fn count_binding_mentions_in_lvalue(target: &AstLValue, binding: AstBindingRef) -> usize {
-    match target {
-        AstLValue::Name(name) if name_ref_matches_binding(name, binding) => 1,
-        AstLValue::Name(_) => 0,
-        AstLValue::FieldAccess(access) => count_binding_uses_in_expr(&access.base, binding),
-        AstLValue::IndexAccess(access) => {
-            count_binding_uses_in_expr(&access.base, binding)
-                + count_binding_uses_in_expr(&access.index, binding)
-        }
     }
 }
 
@@ -1129,6 +1037,16 @@ fn function_name_references_binding_lookup(
     name_ref_matches_binding_lookup(&path.root, bindings)
 }
 
+fn function_capture_references_binding_lookup(
+    function: &super::super::common::AstFunctionExpr,
+    bindings: &dyn BindingLookup,
+) -> bool {
+    function
+        .captured_bindings
+        .iter()
+        .any(|binding| bindings.contains_binding(*binding))
+}
+
 fn lvalue_references_binding_lookup(target: &AstLValue, bindings: &dyn BindingLookup) -> bool {
     match target {
         AstLValue::Name(name) => name_ref_matches_binding_lookup(name, bindings),
@@ -1142,8 +1060,4 @@ fn lvalue_references_binding_lookup(target: &AstLValue, bindings: &dyn BindingLo
 
 fn name_ref_matches_binding_lookup(name: &AstNameRef, bindings: &dyn BindingLookup) -> bool {
     binding_from_name_ref(name).is_some_and(|binding| bindings.contains_binding(binding))
-}
-
-fn name_ref_matches_binding(name: &AstNameRef, binding: AstBindingRef) -> bool {
-    name_matches_binding(name, binding)
 }

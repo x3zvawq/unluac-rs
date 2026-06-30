@@ -18,7 +18,7 @@ use crate::ast::common::{
     AstLocalFunctionDecl, AstLocalOrigin, AstNameRef, AstStmt,
 };
 
-use super::super::binding_flow::stmt_references_any_binding;
+use super::super::binding_flow::{BindingRefSet, stmt_references_binding_set};
 use super::super::visit::{self, AstVisitor};
 use super::super::walk::BlockKind;
 use super::facts::MissingGlobals;
@@ -53,9 +53,10 @@ pub(super) fn try_wrap_missing_collective_suffix(
 
     loop {
         let bindings = collect_declared_bindings(&block.stmts[start..=end]);
+        let binding_refs = BindingRefSet::from_bindings(&bindings);
         let Some(next_offset) = block.stmts[(end + 1)..]
             .iter()
-            .position(|stmt| stmt_references_any_binding(stmt, &bindings))
+            .position(|stmt| stmt_references_binding_set(stmt, &binding_refs))
         else {
             break;
         };

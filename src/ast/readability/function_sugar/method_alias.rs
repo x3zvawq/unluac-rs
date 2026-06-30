@@ -9,6 +9,7 @@
 //! 它不会去猜更模糊的任意等价调用，也不会越权给 AST build 没表达清楚的 call 形状兜底。
 
 use super::super::binding_flow::{BindingUseIndex, name_matches_binding};
+use super::super::expr_analysis::is_context_safe_expr;
 use crate::ast::common::{
     AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstExpr, AstFieldAccess, AstGlobalDecl,
     AstIf, AstIndexAccess, AstLocalAttr, AstLogicalExpr, AstMethodCallExpr, AstRepeat, AstReturn,
@@ -98,6 +99,9 @@ fn try_recover_receiver_alias_direct_method_call(
     };
     let (receiver_binding, receiver_expr) = single_local_alias_decl(receiver_alias)?;
     if use_index.count_uses_in_suffix(stmt_base + 1, receiver_binding) != 1 {
+        return None;
+    }
+    if !is_context_safe_expr(receiver_expr) {
         return None;
     }
 

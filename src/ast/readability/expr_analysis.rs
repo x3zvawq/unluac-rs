@@ -99,6 +99,38 @@ pub(super) fn is_context_safe_expr(expr: &AstExpr) -> bool {
     }
 }
 
+pub(super) fn expr_observes_eval_order(expr: &AstExpr) -> bool {
+    match expr {
+        AstExpr::Var(AstNameRef::Global(_))
+        | AstExpr::FieldAccess(_)
+        | AstExpr::IndexAccess(_)
+        | AstExpr::Call(_)
+        | AstExpr::MethodCall(_) => true,
+        AstExpr::Unary(_) | AstExpr::Binary(_) | AstExpr::LogicalAnd(_) | AstExpr::LogicalOr(_) => {
+            true
+        }
+        AstExpr::TableConstructor(_) | AstExpr::FunctionExpr(_) => true,
+        AstExpr::SingleValue(expr) => expr_observes_eval_order(expr),
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::Var(
+            AstNameRef::Param(_)
+            | AstNameRef::Local(_)
+            | AstNameRef::SyntheticLocal(_)
+            | AstNameRef::Temp(_)
+            | AstNameRef::Upvalue(_),
+        )
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => false,
+    }
+}
+
 pub(super) fn is_access_base_inline_expr(expr: &AstExpr) -> bool {
     is_atomic_access_base_expr(expr) || is_named_field_chain_expr(expr)
 }
@@ -137,6 +169,33 @@ pub(super) fn is_copy_like_expr(expr: &AstExpr) -> bool {
             is_copy_like_expr(&access.base) && is_copy_like_expr(&access.index)
         }
         AstExpr::Unary(_)
+        | AstExpr::Binary(_)
+        | AstExpr::LogicalAnd(_)
+        | AstExpr::LogicalOr(_)
+        | AstExpr::Call(_)
+        | AstExpr::MethodCall(_)
+        | AstExpr::VarArg
+        | AstExpr::TableConstructor(_)
+        | AstExpr::FunctionExpr(_)
+        | AstExpr::Error(_) => false,
+    }
+}
+
+pub(super) fn is_discard_safe_expr(expr: &AstExpr) -> bool {
+    match expr {
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::Var(_) => true,
+        AstExpr::SingleValue(expr) => is_discard_safe_expr(expr),
+        AstExpr::FieldAccess(_)
+        | AstExpr::IndexAccess(_)
+        | AstExpr::Unary(_)
         | AstExpr::Binary(_)
         | AstExpr::LogicalAnd(_)
         | AstExpr::LogicalOr(_)

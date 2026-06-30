@@ -18,7 +18,9 @@ use self::candidate::{
     stmt_is_alias_initializer_sink, stmt_is_direct_return_value_sink,
 };
 use self::use_sites::rewrite_stmt_use_sites_with_policy;
-use super::super::common::{AstBindingRef, AstBlock, AstExpr, AstModule, AstStmt};
+use super::super::common::{
+    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstLValue, AstModule, AstStmt,
+};
 use super::ReadabilityContext;
 use super::binding_flow::BindingUseIndex;
 use super::binding_tree::{
@@ -152,6 +154,13 @@ fn rewrite_current_block(block: &mut AstBlock, options: ReadabilityOptions) -> b
             index += 1;
             continue;
         }
+        if super::expr_analysis::expr_observes_eval_order(value)
+            && !binding_is_first_stmt_eval(next_stmt, candidate.binding())
+        {
+            new_stmts.push(old_stmts[index].clone());
+            index += 1;
+            continue;
+        }
 
         let mut rewritten_next = next_stmt.clone();
         let mut rewrite_policy = effective_policy;
@@ -197,6 +206,103 @@ fn rewrite_current_block(block: &mut AstBlock, options: ReadabilityOptions) -> b
     changed |= collapse_terminal_local_mechanical_runs(block, options);
     changed |= collapse_adjacent_mechanical_alias_runs(block, options);
     changed
+}
+
+fn binding_is_first_stmt_eval(stmt: &AstStmt, binding: AstBindingRef) -> bool {
+    match stmt {
+        AstStmt::LocalDecl(local_decl) => {
+            binding_is_first_eval_in_exprs(&local_decl.values, binding)
+        }
+        AstStmt::GlobalDecl(global_decl) => {
+            binding_is_first_eval_in_exprs(&global_decl.values, binding)
+        }
+        AstStmt::Assign(assign) => {
+            binding_is_first_eval_in_assign(&assign.targets, &assign.values, binding)
+        }
+        AstStmt::CallStmt(call_stmt) => binding_is_first_eval_in_call(&call_stmt.call, binding),
+        AstStmt::Return(ret) => binding_is_first_eval_in_exprs(&ret.values, binding),
+        AstStmt::If(if_stmt) => binding_is_first_eval_in_expr(&if_stmt.cond, binding),
+        AstStmt::While(while_stmt) => binding_is_first_eval_in_expr(&while_stmt.cond, binding),
+        AstStmt::NumericFor(numeric_for) => {
+            binding_is_first_eval_in_expr(&numeric_for.start, binding)
+        }
+        AstStmt::GenericFor(generic_for) => {
+            binding_is_first_eval_in_exprs(&generic_for.iterator, binding)
+        }
+        AstStmt::Repeat(_)
+        | AstStmt::DoBlock(_)
+        | AstStmt::FunctionDecl(_)
+        | AstStmt::LocalFunctionDecl(_)
+        | AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_)
+        | AstStmt::Error(_) => false,
+    }
+}
+
+fn binding_is_first_eval_in_exprs(exprs: &[AstExpr], binding: AstBindingRef) -> bool {
+    exprs
+        .first()
+        .is_some_and(|expr| binding_is_first_eval_in_expr(expr, binding))
+}
+
+fn binding_is_first_eval_in_assign(
+    targets: &[AstLValue],
+    values: &[AstExpr],
+    binding: AstBindingRef,
+) -> bool {
+    for target in targets {
+        match target {
+            AstLValue::Name(_) => {}
+            AstLValue::FieldAccess(access) => {
+                return binding_is_first_eval_in_expr(&access.base, binding);
+            }
+            AstLValue::IndexAccess(access) => {
+                return binding_is_first_eval_in_expr(&access.base, binding);
+            }
+        }
+    }
+    binding_is_first_eval_in_exprs(values, binding)
+}
+
+fn binding_is_first_eval_in_call(call: &AstCallKind, binding: AstBindingRef) -> bool {
+    match call {
+        AstCallKind::Call(call) => binding_is_first_eval_in_expr(&call.callee, binding),
+        AstCallKind::MethodCall(call) => binding_is_first_eval_in_expr(&call.receiver, binding),
+    }
+}
+
+fn binding_is_first_eval_in_expr(expr: &AstExpr, binding: AstBindingRef) -> bool {
+    match expr {
+        AstExpr::Var(name) => super::binding_flow::name_matches_binding(name, binding),
+        AstExpr::FieldAccess(access) => binding_is_first_eval_in_expr(&access.base, binding),
+        AstExpr::IndexAccess(access) => binding_is_first_eval_in_expr(&access.base, binding),
+        AstExpr::Unary(unary) => binding_is_first_eval_in_expr(&unary.expr, binding),
+        AstExpr::Binary(binary) => {
+            expr_references_binding(&binary.lhs, binding)
+                && binding_is_first_eval_in_expr(&binary.lhs, binding)
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            expr_references_binding(&logical.lhs, binding)
+                && binding_is_first_eval_in_expr(&logical.lhs, binding)
+        }
+        AstExpr::Call(call) => binding_is_first_eval_in_expr(&call.callee, binding),
+        AstExpr::MethodCall(call) => binding_is_first_eval_in_expr(&call.receiver, binding),
+        AstExpr::SingleValue(expr) => binding_is_first_eval_in_expr(expr, binding),
+        AstExpr::TableConstructor(_)
+        | AstExpr::FunctionExpr(_)
+        | AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => false,
+    }
 }
 
 fn collapse_adjacent_call_alias_runs(block: &mut AstBlock, options: ReadabilityOptions) -> bool {

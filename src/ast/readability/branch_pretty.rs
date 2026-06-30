@@ -19,9 +19,11 @@
 //! - `if c1 then goto L end; if c2 then goto L end; body; ::L::` →
 //!   `if not c1 then if not c2 then body end end`
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use super::super::common::{
-    AstBinaryExpr, AstBinaryOpKind, AstBlock, AstExpr, AstFunctionExpr, AstIf, AstLabelId,
-    AstLogicalExpr, AstModule, AstReturn, AstStmt, AstUnaryExpr, AstUnaryOpKind,
+    AstBlock, AstExpr, AstFunctionExpr, AstIf, AstLabelId, AstLogicalExpr, AstModule, AstReturn,
+    AstStmt, AstUnaryExpr, AstUnaryOpKind,
 };
 use super::ReadabilityContext;
 use super::expr_analysis::is_always_truthy_expr;
@@ -73,11 +75,6 @@ impl AstRewritePass for BranchPrettyPass {
                 }
                 changed |= normalize_empty_if_arms(if_stmt);
                 changed || collapse_nested_guard_if(if_stmt)
-            }
-            AstStmt::Repeat(repeat_stmt) => {
-                // `until not (a < b)` → `until a >= b`：复用 if-cond 上的关系反转规则，
-                // 让 `repeat ... until` 也享受到同样的形态归一。
-                normalize_until_negation(&mut repeat_stmt.cond)
             }
             _ => false,
         }
@@ -193,11 +190,12 @@ fn flatten_terminating_if(stmt: AstStmt) -> Result<Vec<AstStmt>, AstStmt> {
 
 fn fold_terminal_goto_else(block: &mut AstBlock) -> bool {
     let mut changed = false;
+    let mut goto_counts = goto_target_counts_in_block(block);
 
     while let Some(fold) = find_terminal_goto_else_fold(block) {
-        // 折叠前计算引用计数：如果还有其他 goto 指向同一 label，折叠后保留该 label。
-        let keep_label = matches!(&block.stmts[fold.label_index], AstStmt::Label(label)
-            if count_goto_target_in_block(block, label.id) > 1);
+        let target = label_id_at(block, fold.label_index);
+        // 如果还有其他 goto 指向同一 label，折叠后保留该 label。
+        let keep_label = goto_counts.get(&target).copied().unwrap_or_default() > 1;
 
         let old_stmts = std::mem::take(&mut block.stmts);
         let mut rewritten =
@@ -235,6 +233,7 @@ fn fold_terminal_goto_else(block: &mut AstBlock) -> bool {
         rewritten_if.else_block = Some(AstBlock { stmts: else_body });
         rewritten.insert(fold.if_index, AstStmt::If(rewritten_if));
         block.stmts = rewritten;
+        decrement_goto_target_count(&mut goto_counts, target);
         changed = true;
     }
 
@@ -243,11 +242,12 @@ fn fold_terminal_goto_else(block: &mut AstBlock) -> bool {
 
 fn fold_guard_goto_labels(block: &mut AstBlock) -> bool {
     let mut changed = false;
+    let mut goto_counts = goto_target_counts_in_block(block);
 
     while let Some(fold) = find_guard_goto_label_fold(block) {
-        // 折叠前计算引用计数：如果还有其他 goto 指向同一 label，折叠后保留该 label。
-        let keep_label = matches!(&block.stmts[fold.label_index], AstStmt::Label(label)
-            if count_goto_target_in_block(block, label.id) > 1);
+        let target = label_id_at(block, fold.label_index);
+        // 如果还有其他 goto 指向同一 label，折叠后保留该 label。
+        let keep_label = goto_counts.get(&target).copied().unwrap_or_default() > 1;
 
         let old_stmts = std::mem::take(&mut block.stmts);
         let mut rewritten =
@@ -286,6 +286,7 @@ fn fold_guard_goto_labels(block: &mut AstBlock) -> bool {
         };
         rewritten.insert(fold.if_index, AstStmt::If(guarded_if));
         block.stmts = rewritten;
+        decrement_goto_target_count(&mut goto_counts, target);
         changed = true;
     }
 
@@ -351,17 +352,15 @@ struct GuardGotoFold {
 }
 
 fn find_terminal_goto_else_fold(block: &AstBlock) -> Option<GuardGotoFold> {
+    let label_indices = top_level_label_indices(block);
+
     // 从右向左扫描：优先折叠距 label 最近的 terminal-goto-else，这样外层的
     // 同类模式在下一轮迭代时可以正常收回，支持多个 goto 指向同一 label 的情况。
     for if_index in (0..block.stmts.len()).rev() {
         let Some(target) = terminal_goto_else_target(&block.stmts[if_index]) else {
             continue;
         };
-        let Some(label_index) = block.stmts[if_index + 1..]
-            .iter()
-            .position(|stmt| matches!(stmt, AstStmt::Label(label) if label.id == target))
-            .map(|offset| if_index + 1 + offset)
-        else {
+        let Some(label_index) = next_label_index_after(&label_indices, target, if_index) else {
             continue;
         };
 
@@ -383,6 +382,8 @@ fn find_terminal_goto_else_fold(block: &AstBlock) -> Option<GuardGotoFold> {
 }
 
 fn find_guard_goto_label_fold(block: &AstBlock) -> Option<GuardGotoFold> {
+    let label_indices = top_level_label_indices(block);
+
     // 从右向左扫描：优先折叠距 label 最近的 guard-goto，这样外层的
     // guard-goto 在下一轮迭代时可以把已折叠的 if 整体收入 body，
     // 从而支持同一 label 被多个 goto 引用的 continue-like 模式。
@@ -390,11 +391,7 @@ fn find_guard_goto_label_fold(block: &AstBlock) -> Option<GuardGotoFold> {
         let Some(target) = guard_goto_target(&block.stmts[if_index]) else {
             continue;
         };
-        let Some(label_index) = block.stmts[if_index + 1..]
-            .iter()
-            .position(|stmt| matches!(stmt, AstStmt::Label(label) if label.id == target))
-            .map(|offset| if_index + 1 + offset)
-        else {
+        let Some(label_index) = next_label_index_after(&label_indices, target, if_index) else {
             continue;
         };
 
@@ -408,6 +405,48 @@ fn find_guard_goto_label_fold(block: &AstBlock) -> Option<GuardGotoFold> {
     }
 
     None
+}
+
+fn top_level_label_indices(block: &AstBlock) -> BTreeMap<AstLabelId, Vec<usize>> {
+    let mut label_indices = BTreeMap::new();
+    for (index, stmt) in block.stmts.iter().enumerate() {
+        if let AstStmt::Label(label) = stmt {
+            label_indices
+                .entry(label.id)
+                .or_insert_with(Vec::new)
+                .push(index);
+        }
+    }
+    label_indices
+}
+
+fn next_label_index_after(
+    label_indices: &BTreeMap<AstLabelId, Vec<usize>>,
+    target: AstLabelId,
+    after: usize,
+) -> Option<usize> {
+    label_indices
+        .get(&target)?
+        .iter()
+        .copied()
+        .find(|index| *index > after)
+}
+
+fn label_id_at(block: &AstBlock, label_index: usize) -> AstLabelId {
+    let AstStmt::Label(label) = &block.stmts[label_index] else {
+        unreachable!("guard-goto fold should only target labels");
+    };
+    label.id
+}
+
+fn decrement_goto_target_count(counts: &mut BTreeMap<AstLabelId, usize>, target: AstLabelId) {
+    let Some(count) = counts.get_mut(&target) else {
+        return;
+    };
+    *count -= 1;
+    if *count == 0 {
+        counts.remove(&target);
+    }
 }
 
 fn terminal_goto_else_target(stmt: &AstStmt) -> Option<AstLabelId> {
@@ -463,23 +502,22 @@ fn is_terminal_goto_branch_value_assignment(if_stmt: &AstStmt, else_body: &[AstS
     then_assign.targets == else_assign.targets
 }
 
-fn count_goto_target_in_block(block: &AstBlock, target: AstLabelId) -> usize {
-    let mut collector = GotoTargetCollector { target, count: 0 };
+fn goto_target_counts_in_block(block: &AstBlock) -> BTreeMap<AstLabelId, usize> {
+    let mut collector = GotoTargetCollector {
+        counts: BTreeMap::new(),
+    };
     visit::visit_block(block, &mut collector);
-    collector.count
+    collector.counts
 }
 
 struct GotoTargetCollector {
-    target: AstLabelId,
-    count: usize,
+    counts: BTreeMap<AstLabelId, usize>,
 }
 
 impl AstVisitor for GotoTargetCollector {
     fn visit_stmt(&mut self, stmt: &AstStmt) {
-        if let AstStmt::Goto(goto_stmt) = stmt
-            && goto_stmt.target == self.target
-        {
-            self.count += 1;
+        if let AstStmt::Goto(goto_stmt) = stmt {
+            *self.counts.entry(goto_stmt.target).or_default() += 1;
         }
     }
 
@@ -578,7 +616,8 @@ fn stmt_contains_label_or_goto(stmt: &AstStmt) -> bool {
 /// 移除紧邻 `goto L; ::L::` 的无效跳转对。当 goto 是该 label 的唯一引用时，
 /// 两者一起移除；否则只移除 goto。
 fn remove_nop_goto_labels(block: &mut AstBlock) -> bool {
-    let mut remove_indices: Vec<usize> = Vec::new();
+    let goto_counts = goto_target_counts_in_block(block);
+    let mut remove_indices = BTreeSet::new();
 
     for i in 0..block.stmts.len().saturating_sub(1) {
         let AstStmt::Goto(goto_stmt) = &block.stmts[i] else {
@@ -590,9 +629,14 @@ fn remove_nop_goto_labels(block: &mut AstBlock) -> bool {
         if goto_stmt.target != label_stmt.id {
             continue;
         }
-        remove_indices.push(i);
-        if count_goto_target_in_block(block, goto_stmt.target) == 1 {
-            remove_indices.push(i + 1);
+        remove_indices.insert(i);
+        if goto_counts
+            .get(&goto_stmt.target)
+            .copied()
+            .unwrap_or_default()
+            == 1
+        {
+            remove_indices.insert(i + 1);
         }
     }
 
@@ -618,52 +662,11 @@ fn remove_nop_goto_labels(block: &mut AstBlock) -> bool {
 fn negate_guard_condition(expr: AstExpr) -> AstExpr {
     match expr {
         AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not => unary.expr,
-        AstExpr::Binary(binary) => negate_relational_expr(*binary),
+        // Lua 的 `<`/`<=` 可能走元方法，number 还可能遇到 NaN；`not (a < b)`
+        // 不能安全改写成 `b <= a`，所以这里只消除显式双重否定。
         other => AstExpr::Unary(Box::new(AstUnaryExpr {
             op: AstUnaryOpKind::Not,
             expr: other,
-        })),
-    }
-}
-
-/// 把 `until not (a < b)` 这种"否定后的关系比较"规范化成 `until a >= b`，
-/// 与 if-cond 的反转规则保持一致。仅在 `cond` 顶层是 `not <relational>` 时生效，
-/// 因此不会改变需要保留 `not` 的非关系语义（例如 `until not flag`）。
-fn normalize_until_negation(cond: &mut AstExpr) -> bool {
-    let AstExpr::Unary(unary) = cond else {
-        return false;
-    };
-    if unary.op != AstUnaryOpKind::Not {
-        return false;
-    }
-    let AstExpr::Binary(binary) = &unary.expr else {
-        return false;
-    };
-    if !matches!(binary.op, AstBinaryOpKind::Lt | AstBinaryOpKind::Le) {
-        return false;
-    }
-    let inner = std::mem::replace(&mut unary.expr, AstExpr::Nil);
-    *cond = negate_guard_condition(inner);
-    true
-}
-
-fn negate_relational_expr(binary: AstBinaryExpr) -> AstExpr {
-    match binary.op {
-        // Lua AST 目前没有 `>` / `>=` / `~=` 节点，所以这里通过交换 operands
-        // 只消掉那些可以无损改写成现有关系运算的情况；剩下的再回退成 `not (...)`。
-        AstBinaryOpKind::Lt => AstExpr::Binary(Box::new(AstBinaryExpr {
-            op: AstBinaryOpKind::Le,
-            lhs: binary.rhs,
-            rhs: binary.lhs,
-        })),
-        AstBinaryOpKind::Le => AstExpr::Binary(Box::new(AstBinaryExpr {
-            op: AstBinaryOpKind::Lt,
-            lhs: binary.rhs,
-            rhs: binary.lhs,
-        })),
-        _ => AstExpr::Unary(Box::new(AstUnaryExpr {
-            op: AstUnaryOpKind::Not,
-            expr: AstExpr::Binary(Box::new(binary)),
         })),
     }
 }

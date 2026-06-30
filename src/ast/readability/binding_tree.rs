@@ -335,7 +335,7 @@ fn expr_captures_binding(expr: &AstExpr, binding: AstBindingRef) -> bool {
 }
 
 fn function_expr_captures_binding(function: &AstFunctionExpr, binding: AstBindingRef) -> bool {
-    function.captured_bindings.contains(&binding) || block_captures_binding(&function.body, binding)
+    function.captured_bindings.contains(&binding)
 }
 
 pub(super) fn count_name_expr_uses(expr: &AstExpr, binding: AstBindingRef) -> usize {

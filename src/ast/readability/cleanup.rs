@@ -10,12 +10,12 @@
 //! - `local t0` 这种只剩机械 temp 壳、且没有值也没有使用的声明会被删除
 //! - 函数尾部的 `return` 会在没有返回值时被去掉
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::common::{AstBindingRef, AstBlock, AstModule, AstStmt};
 use super::ReadabilityContext;
-use super::binding_flow::{count_binding_mentions_in_block, count_binding_uses_in_stmts};
-use super::binding_tree::block_captures_binding;
+use super::binding_flow::{BindingUseIndex, binding_mentions_in_stmt};
+use super::expr_analysis::is_discard_safe_expr;
 use super::walk::{self, AstRewritePass, BlockKind};
 
 pub(super) fn apply(module: &mut AstModule, _context: ReadabilityContext) -> bool {
@@ -72,7 +72,8 @@ fn cleanup_block(block: &mut AstBlock, allow_trailing_empty_return_elision: bool
         changed = true;
     }
 
-    let discardable_unused_locals = collect_discardable_unused_locals(block);
+    let binding_flow = BlockBindingFlow::new(block);
+    let discardable_unused_locals = collect_discardable_unused_locals(block, &binding_flow);
     let original_len = block.stmts.len();
     block.stmts.retain(|stmt| {
         !matches!(
@@ -85,7 +86,8 @@ fn cleanup_block(block: &mut AstBlock, allow_trailing_empty_return_elision: bool
     });
     changed |= block.stmts.len() != original_len;
 
-    let mechanical_binding_uses = collect_mechanical_binding_uses(block);
+    let binding_flow = BlockBindingFlow::new(block);
+    let live_mechanical_bindings = collect_live_mechanical_bindings(block, &binding_flow);
     for stmt in &mut block.stmts {
         let AstStmt::LocalDecl(local_decl) = stmt else {
             continue;
@@ -96,11 +98,7 @@ fn cleanup_block(block: &mut AstBlock, allow_trailing_empty_return_elision: bool
         let original_len = local_decl.bindings.len();
         local_decl.bindings.retain(|binding| match binding.id {
             AstBindingRef::Temp(_) | AstBindingRef::SyntheticLocal(_) => {
-                mechanical_binding_uses
-                    .get(&binding.id)
-                    .copied()
-                    .unwrap_or_default()
-                    > 0
+                live_mechanical_bindings.contains(&binding.id)
             }
             AstBindingRef::Local(_) => true,
         });
@@ -148,8 +146,44 @@ fn can_elide_single_stmt_do_block(stmt: &AstStmt) -> bool {
     )
 }
 
-fn collect_mechanical_binding_uses(block: &AstBlock) -> BTreeMap<AstBindingRef, usize> {
-    let mut uses = BTreeMap::new();
+struct BlockBindingFlow {
+    mention_counts: BTreeMap<AstBindingRef, usize>,
+    use_index: BindingUseIndex,
+}
+
+impl BlockBindingFlow {
+    fn new(block: &AstBlock) -> Self {
+        let mut mention_counts = BTreeMap::<AstBindingRef, usize>::new();
+        for stmt in &block.stmts {
+            for binding in binding_mentions_in_stmt(stmt) {
+                *mention_counts.entry(binding).or_default() += 1;
+            }
+        }
+        Self {
+            mention_counts,
+            use_index: BindingUseIndex::for_stmts(&block.stmts),
+        }
+    }
+
+    fn mentioned_outside_own_decl(&self, binding: AstBindingRef) -> bool {
+        // local 声明自身也算一次 mention；只有声明外还有提及时，才需要保留词法槽位。
+        self.mention_counts.get(&binding).copied().unwrap_or(0) > 1
+    }
+
+    fn used_or_captured(&self, binding: AstBindingRef) -> bool {
+        self.use_index.count_uses_in_suffix(0, binding) != 0
+    }
+
+    fn keeps_decl_alive(&self, binding: AstBindingRef) -> bool {
+        self.mentioned_outside_own_decl(binding) || self.used_or_captured(binding)
+    }
+}
+
+fn collect_live_mechanical_bindings(
+    block: &AstBlock,
+    binding_flow: &BlockBindingFlow,
+) -> BTreeSet<AstBindingRef> {
+    let mut live_bindings = BTreeSet::new();
     for stmt in &block.stmts {
         let AstStmt::LocalDecl(local_decl) = stmt else {
             continue;
@@ -158,23 +192,18 @@ fn collect_mechanical_binding_uses(block: &AstBlock) -> BTreeMap<AstBindingRef, 
             if matches!(
                 binding.id,
                 AstBindingRef::Temp(_) | AstBindingRef::SyntheticLocal(_)
-            ) {
-                uses.entry(binding.id).or_insert_with(|| {
-                    let mentions = count_binding_mentions_in_block(block, binding.id);
-                    if block_captures_binding(block, binding.id) {
-                        mentions.max(1)
-                    } else {
-                        mentions
-                    }
-                });
+            ) && binding_flow.keeps_decl_alive(binding.id)
+            {
+                live_bindings.insert(binding.id);
             }
         }
     }
-    uses
+    live_bindings
 }
 
 fn collect_discardable_unused_locals(
     block: &AstBlock,
+    binding_flow: &BlockBindingFlow,
 ) -> std::collections::BTreeSet<AstBindingRef> {
     let mut bindings = std::collections::BTreeSet::new();
     for stmt in &block.stmts {
@@ -190,39 +219,12 @@ fn collect_discardable_unused_locals(
         if !matches!(binding.origin, crate::ast::AstLocalOrigin::Recovered) {
             continue;
         }
-        if count_binding_uses_in_stmts(&block.stmts, binding.id) != 0
-            || block_captures_binding(block, binding.id)
-        {
+        if binding_flow.keeps_decl_alive(binding.id) {
             continue;
         }
-        if is_discard_safe_local_value(value) {
+        if is_discard_safe_expr(value) {
             bindings.insert(binding.id);
         }
     }
     bindings
-}
-
-fn is_discard_safe_local_value(value: &crate::ast::AstExpr) -> bool {
-    // 只允许删除确定无副作用的值：常量和局部/全局变量引用。
-    // 不包含 field/index access，因为它们可能触发 __index metamethod，
-    // 删除后会改变程序可观察行为。
-    is_definitely_pure_expr(value)
-}
-
-/// 只包含无法触发任何 metamethod 的表达式。
-fn is_definitely_pure_expr(expr: &crate::ast::AstExpr) -> bool {
-    use crate::ast::AstExpr;
-    match expr {
-        AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::Var(_) => true,
-        AstExpr::SingleValue(inner) => is_definitely_pure_expr(inner),
-        _ => false,
-    }
 }

@@ -1,4 +1,4 @@
-//! LuaJIT 对 `return`/`break` 的块尾约束比我们当前 AST fallback 更敏感。
+//! LuaJIT 对 `return`/`break` 的块尾约束比通用 AST 块结构更敏感。
 //!
 //! 当 block 里还有后续 label/goto 需要继续承载控制流时，直接把 `return` 或 `break`
 //! 留在同一层 block 中会导致 LuaJIT parser 在后续 `::label::` 处报语法错误。

@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use super::super::binding_flow::count_binding_uses_in_stmts;
+use super::super::binding_flow::BindingUseIndex;
 use super::super::binding_tree::binding_from_name_ref;
 use crate::ast::common::{
     AstBindingRef, AstBlock, AstExpr, AstGlobalBinding, AstGlobalDecl, AstLocalAttr, AstStmt,
@@ -14,12 +14,13 @@ use crate::ast::common::{
 
 pub(super) fn merge_seed_global_runs(block: &mut AstBlock) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
+    let use_index = BindingUseIndex::for_stmts(&old_stmts);
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut index = 0usize;
     let mut changed = false;
 
     while index < old_stmts.len() {
-        if let Some((stmt, consumed)) = try_merge_seed_global_run(&old_stmts, index) {
+        if let Some((stmt, consumed)) = try_merge_seed_global_run(&old_stmts, &use_index, index) {
             new_stmts.push(stmt);
             index += consumed;
             changed = true;
@@ -33,7 +34,11 @@ pub(super) fn merge_seed_global_runs(block: &mut AstBlock) -> bool {
     changed
 }
 
-fn try_merge_seed_global_run(stmts: &[AstStmt], start: usize) -> Option<(AstStmt, usize)> {
+fn try_merge_seed_global_run(
+    stmts: &[AstStmt],
+    use_index: &BindingUseIndex,
+    start: usize,
+) -> Option<(AstStmt, usize)> {
     let mut seeds = Vec::<(AstBindingRef, AstExpr)>::new();
     let mut index = start;
     while let Some(stmt) = stmts.get(index) {
@@ -82,12 +87,11 @@ fn try_merge_seed_global_run(stmts: &[AstStmt], start: usize) -> Option<(AstStmt
         return None;
     }
 
-    let after_run = &stmts[index..];
     let mut merged_bindings = Vec::new();
     let mut merged_values = Vec::new();
     let mut matched = BTreeSet::new();
     for (binding, value) in &seeds {
-        if count_binding_uses_in_stmts(after_run, *binding) != 0 {
+        if use_index.count_uses_in_suffix(index, *binding) != 0 {
             return None;
         }
         let Some((_, global_binding)) = globals.iter().find(|(candidate, _)| candidate == binding)

@@ -9,9 +9,7 @@ use crate::ast::ReadabilityOptions;
 
 use super::super::common::{AstBlock, AstExpr, AstLocalAttr, AstLocalOrigin, AstModule, AstStmt};
 use super::ReadabilityContext;
-use super::binding_flow::{
-    BindingUseIndex, count_binding_uses_in_stmt, count_binding_uses_in_stmts, name_matches_binding,
-};
+use super::binding_flow::{BindingUseIndex, count_binding_uses_in_stmt, name_matches_binding};
 use super::binding_tree::{
     binding_from_name_ref, count_name_expr_uses, replace_binding_use_in_expr,
     stmt_mentions_binding_target,
@@ -35,17 +33,23 @@ struct LoopHeaderMergePass {
 impl AstRewritePass for LoopHeaderMergePass {
     fn rewrite_block(&mut self, block: &mut AstBlock, _kind: BlockKind) -> bool {
         let mut changed = false;
+        let mut old_stmts = std::mem::take(&mut block.stmts);
+        let mut use_index = BindingUseIndex::for_stmts(&old_stmts);
+        let mut repeat_changed = false;
 
-        for index in 0..block.stmts.len() {
-            let (head, tail) = block.stmts.split_at_mut(index + 1);
-            let Some(AstStmt::Repeat(repeat_stmt)) = head.last_mut() else {
+        for (index, stmt) in old_stmts.iter_mut().enumerate() {
+            let AstStmt::Repeat(repeat_stmt) = stmt else {
                 continue;
             };
-            changed |= collapse_repeat_tail_binding(repeat_stmt, tail, self.options);
+            let collapsed =
+                collapse_repeat_tail_binding(repeat_stmt, &use_index, index + 1, self.options);
+            repeat_changed |= collapsed;
+            changed |= collapsed;
+        }
+        if repeat_changed {
+            use_index = BindingUseIndex::for_stmts(&old_stmts);
         }
 
-        let old_stmts = std::mem::take(&mut block.stmts);
-        let use_index = BindingUseIndex::for_stmts(&old_stmts);
         let mut new_stmts = Vec::with_capacity(old_stmts.len());
         let mut index = 0;
         while index < old_stmts.len() {
@@ -136,13 +140,14 @@ fn loop_header_candidate(
 
 fn collapse_repeat_tail_binding(
     repeat_stmt: &mut super::super::common::AstRepeat,
-    tail_stmts: &[AstStmt],
+    suffix_use_index: &BindingUseIndex,
+    suffix_start: usize,
     options: ReadabilityOptions,
 ) -> bool {
     let Some((binding, replacement)) = repeat_tail_candidate(repeat_stmt, options) else {
         return false;
     };
-    if count_binding_uses_in_stmts(tail_stmts, binding) != 0 {
+    if suffix_use_index.count_uses_in_suffix(suffix_start, binding) != 0 {
         return false;
     }
     if !replace_binding_use_in_expr(&mut repeat_stmt.cond, binding, &replacement) {
@@ -169,7 +174,8 @@ fn repeat_tail_candidate(
     if !is_loop_header_inline_expr(value, options) {
         return None;
     }
-    if count_binding_uses_in_stmts(&repeat_stmt.body.stmts[..tail_index], binding) != 0 {
+    let body_use_index = BindingUseIndex::for_stmts(&repeat_stmt.body.stmts);
+    if body_use_index.count_uses_in_range(0, tail_index, binding) != 0 {
         return None;
     }
     if repeat_stmt.body.stmts[..tail_index]
@@ -179,6 +185,9 @@ fn repeat_tail_candidate(
         return None;
     }
     if count_name_expr_uses(&repeat_stmt.cond, binding) != 1 {
+        return None;
+    }
+    if !cond_evaluates_binding_first(&repeat_stmt.cond, binding) {
         return None;
     }
     Some((binding, value.clone()))
@@ -206,6 +215,37 @@ fn is_loop_header_inline_expr(expr: &AstExpr, options: ReadabilityOptions) -> bo
             expr,
             AstExpr::VarArg | AstExpr::TableConstructor(_) | AstExpr::FunctionExpr(_)
         )
+}
+
+fn cond_evaluates_binding_first(
+    expr: &AstExpr,
+    binding: super::super::common::AstBindingRef,
+) -> bool {
+    match expr {
+        AstExpr::Var(name) => name_matches_binding(name, binding),
+        AstExpr::SingleValue(expr) => cond_evaluates_binding_first(expr, binding),
+        AstExpr::Unary(unary) => cond_evaluates_binding_first(&unary.expr, binding),
+        AstExpr::Binary(binary) => cond_evaluates_binding_first(&binary.lhs, binding),
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            cond_evaluates_binding_first(&logical.lhs, binding)
+        }
+        AstExpr::FieldAccess(access) => cond_evaluates_binding_first(&access.base, binding),
+        AstExpr::IndexAccess(access) => cond_evaluates_binding_first(&access.base, binding),
+        AstExpr::Call(call) => cond_evaluates_binding_first(&call.callee, binding),
+        AstExpr::MethodCall(call) => cond_evaluates_binding_first(&call.receiver, binding),
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::VarArg
+        | AstExpr::TableConstructor(_)
+        | AstExpr::FunctionExpr(_)
+        | AstExpr::Error(_) => false,
+    }
 }
 
 fn header_uses_binding_exactly_once(

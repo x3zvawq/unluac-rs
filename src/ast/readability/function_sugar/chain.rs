@@ -5,6 +5,7 @@
 //! 例如：`local f = obj.m; f(obj, 1)` 会在这里尝试折回 `obj:m(1)`。
 
 use super::super::binding_flow::{BindingUseIndex, name_matches_binding};
+use super::super::expr_analysis::is_discard_safe_expr;
 use crate::ast::common::{AstBindingRef, AstCallKind, AstExpr, AstLocalAttr, AstStmt};
 
 pub(super) fn try_chain_local_method_call_stmt(
@@ -26,6 +27,9 @@ pub(super) fn try_chain_local_method_call_stmt(
         return try_chain_local_method_call_stmt_without_dead_alias(stmts, use_index, stmt_base);
     }
     if use_index.count_uses_in_suffix(stmt_base + 1, dead_alias.bindings[0].id) != 0 {
+        return try_chain_local_method_call_stmt_without_dead_alias(stmts, use_index, stmt_base);
+    }
+    if !is_discard_safe_expr(&dead_alias.values[0]) {
         return try_chain_local_method_call_stmt_without_dead_alias(stmts, use_index, stmt_base);
     }
 

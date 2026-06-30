@@ -11,7 +11,7 @@
 //! - 命名 vararg、capture binding、函数名路径里残留的 temp 也会一起收成
 //!   synthetic local 身份
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use crate::hir::TempId;
 
@@ -36,11 +36,7 @@ impl AstRewritePass for MaterializeTempsPass {
             return false;
         }
 
-        let mapping = temps
-            .into_iter()
-            .map(|temp| (temp, AstSyntheticLocalId(temp)))
-            .collect::<BTreeMap<_, _>>();
-        rewrite_function_block(block, &mapping);
+        rewrite_function_block(block, &temps);
         true
     }
 }
@@ -140,81 +136,81 @@ fn collect_function_temps_in_function_name(
     }
 }
 
-fn rewrite_function_block(block: &mut AstBlock, mapping: &BTreeMap<TempId, AstSyntheticLocalId>) {
+fn rewrite_function_block(block: &mut AstBlock, temps: &BTreeSet<TempId>) {
     for stmt in &mut block.stmts {
-        rewrite_function_stmt(stmt, mapping);
+        rewrite_function_stmt(stmt, temps);
     }
 }
 
-fn rewrite_function_stmt(stmt: &mut AstStmt, mapping: &BTreeMap<TempId, AstSyntheticLocalId>) {
+fn rewrite_function_stmt(stmt: &mut AstStmt, temps: &BTreeSet<TempId>) {
     match stmt {
         AstStmt::LocalDecl(local_decl) => {
             for binding in &mut local_decl.bindings {
                 if let AstBindingRef::Temp(temp) = binding.id
-                    && let Some(&synthetic) = mapping.get(&temp)
+                    && temps.contains(&temp)
                 {
-                    binding.id = AstBindingRef::SyntheticLocal(synthetic);
+                    binding.id = AstBindingRef::SyntheticLocal(AstSyntheticLocalId(temp));
                 }
             }
             for value in &mut local_decl.values {
-                rewrite_function_expr(value, mapping);
+                rewrite_function_expr(value, temps);
             }
         }
         AstStmt::GlobalDecl(global_decl) => {
             for value in &mut global_decl.values {
-                rewrite_function_expr(value, mapping);
+                rewrite_function_expr(value, temps);
             }
         }
         AstStmt::Assign(assign) => {
             for target in &mut assign.targets {
-                rewrite_function_lvalue(target, mapping);
+                rewrite_function_lvalue(target, temps);
             }
             for value in &mut assign.values {
-                rewrite_function_expr(value, mapping);
+                rewrite_function_expr(value, temps);
             }
         }
-        AstStmt::CallStmt(call_stmt) => rewrite_function_call(&mut call_stmt.call, mapping),
+        AstStmt::CallStmt(call_stmt) => rewrite_function_call(&mut call_stmt.call, temps),
         AstStmt::Return(ret) => {
             for value in &mut ret.values {
-                rewrite_function_expr(value, mapping);
+                rewrite_function_expr(value, temps);
             }
         }
         AstStmt::If(if_stmt) => {
-            rewrite_function_expr(&mut if_stmt.cond, mapping);
-            rewrite_function_block(&mut if_stmt.then_block, mapping);
+            rewrite_function_expr(&mut if_stmt.cond, temps);
+            rewrite_function_block(&mut if_stmt.then_block, temps);
             if let Some(else_block) = &mut if_stmt.else_block {
-                rewrite_function_block(else_block, mapping);
+                rewrite_function_block(else_block, temps);
             }
         }
         AstStmt::While(while_stmt) => {
-            rewrite_function_expr(&mut while_stmt.cond, mapping);
-            rewrite_function_block(&mut while_stmt.body, mapping);
+            rewrite_function_expr(&mut while_stmt.cond, temps);
+            rewrite_function_block(&mut while_stmt.body, temps);
         }
         AstStmt::Repeat(repeat_stmt) => {
-            rewrite_function_block(&mut repeat_stmt.body, mapping);
-            rewrite_function_expr(&mut repeat_stmt.cond, mapping);
+            rewrite_function_block(&mut repeat_stmt.body, temps);
+            rewrite_function_expr(&mut repeat_stmt.cond, temps);
         }
         AstStmt::NumericFor(numeric_for) => {
-            rewrite_function_expr(&mut numeric_for.start, mapping);
-            rewrite_function_expr(&mut numeric_for.limit, mapping);
-            rewrite_function_expr(&mut numeric_for.step, mapping);
-            rewrite_function_block(&mut numeric_for.body, mapping);
+            rewrite_function_expr(&mut numeric_for.start, temps);
+            rewrite_function_expr(&mut numeric_for.limit, temps);
+            rewrite_function_expr(&mut numeric_for.step, temps);
+            rewrite_function_block(&mut numeric_for.body, temps);
         }
         AstStmt::GenericFor(generic_for) => {
             for expr in &mut generic_for.iterator {
-                rewrite_function_expr(expr, mapping);
+                rewrite_function_expr(expr, temps);
             }
-            rewrite_function_block(&mut generic_for.body, mapping);
+            rewrite_function_block(&mut generic_for.body, temps);
         }
-        AstStmt::DoBlock(block) => rewrite_function_block(block, mapping),
+        AstStmt::DoBlock(block) => rewrite_function_block(block, temps),
         AstStmt::FunctionDecl(function_decl) => {
-            rewrite_function_name(&mut function_decl.target, mapping)
+            rewrite_function_name(&mut function_decl.target, temps)
         }
         AstStmt::LocalFunctionDecl(local_function_decl) => {
             if let AstBindingRef::Temp(temp) = local_function_decl.name
-                && let Some(&synthetic) = mapping.get(&temp)
+                && temps.contains(&temp)
             {
-                local_function_decl.name = AstBindingRef::SyntheticLocal(synthetic);
+                local_function_decl.name = AstBindingRef::SyntheticLocal(AstSyntheticLocalId(temp));
             }
         }
         AstStmt::Break
@@ -227,91 +223,88 @@ fn rewrite_function_stmt(stmt: &mut AstStmt, mapping: &BTreeMap<TempId, AstSynth
 
 fn rewrite_function_name(
     target: &mut super::super::common::AstFunctionName,
-    mapping: &BTreeMap<TempId, AstSyntheticLocalId>,
+    temps: &BTreeSet<TempId>,
 ) {
     let path = match target {
         super::super::common::AstFunctionName::Plain(path) => path,
         super::super::common::AstFunctionName::Method(path, _) => path,
     };
-    rewrite_name_ref(&mut path.root, mapping);
+    rewrite_name_ref(&mut path.root, temps);
 }
 
-fn rewrite_function_call(call: &mut AstCallKind, mapping: &BTreeMap<TempId, AstSyntheticLocalId>) {
+fn rewrite_function_call(call: &mut AstCallKind, temps: &BTreeSet<TempId>) {
     match call {
         AstCallKind::Call(call) => {
-            rewrite_function_expr(&mut call.callee, mapping);
+            rewrite_function_expr(&mut call.callee, temps);
             for arg in &mut call.args {
-                rewrite_function_expr(arg, mapping);
+                rewrite_function_expr(arg, temps);
             }
         }
         AstCallKind::MethodCall(call) => {
-            rewrite_function_expr(&mut call.receiver, mapping);
+            rewrite_function_expr(&mut call.receiver, temps);
             for arg in &mut call.args {
-                rewrite_function_expr(arg, mapping);
+                rewrite_function_expr(arg, temps);
             }
         }
     }
 }
 
-fn rewrite_function_lvalue(
-    target: &mut AstLValue,
-    mapping: &BTreeMap<TempId, AstSyntheticLocalId>,
-) {
+fn rewrite_function_lvalue(target: &mut AstLValue, temps: &BTreeSet<TempId>) {
     match target {
-        AstLValue::Name(name) => rewrite_name_ref(name, mapping),
-        AstLValue::FieldAccess(access) => rewrite_function_expr(&mut access.base, mapping),
+        AstLValue::Name(name) => rewrite_name_ref(name, temps),
+        AstLValue::FieldAccess(access) => rewrite_function_expr(&mut access.base, temps),
         AstLValue::IndexAccess(access) => {
-            rewrite_function_expr(&mut access.base, mapping);
-            rewrite_function_expr(&mut access.index, mapping);
+            rewrite_function_expr(&mut access.base, temps);
+            rewrite_function_expr(&mut access.index, temps);
         }
     }
 }
 
-fn rewrite_function_expr(expr: &mut AstExpr, mapping: &BTreeMap<TempId, AstSyntheticLocalId>) {
+fn rewrite_function_expr(expr: &mut AstExpr, temps: &BTreeSet<TempId>) {
     match expr {
-        AstExpr::Var(name) => rewrite_name_ref(name, mapping),
-        AstExpr::FieldAccess(access) => rewrite_function_expr(&mut access.base, mapping),
+        AstExpr::Var(name) => rewrite_name_ref(name, temps),
+        AstExpr::FieldAccess(access) => rewrite_function_expr(&mut access.base, temps),
         AstExpr::IndexAccess(access) => {
-            rewrite_function_expr(&mut access.base, mapping);
-            rewrite_function_expr(&mut access.index, mapping);
+            rewrite_function_expr(&mut access.base, temps);
+            rewrite_function_expr(&mut access.index, temps);
         }
-        AstExpr::Unary(unary) => rewrite_function_expr(&mut unary.expr, mapping),
+        AstExpr::Unary(unary) => rewrite_function_expr(&mut unary.expr, temps),
         AstExpr::Binary(binary) => {
-            rewrite_function_expr(&mut binary.lhs, mapping);
-            rewrite_function_expr(&mut binary.rhs, mapping);
+            rewrite_function_expr(&mut binary.lhs, temps);
+            rewrite_function_expr(&mut binary.rhs, temps);
         }
         AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            rewrite_function_expr(&mut logical.lhs, mapping);
-            rewrite_function_expr(&mut logical.rhs, mapping);
+            rewrite_function_expr(&mut logical.lhs, temps);
+            rewrite_function_expr(&mut logical.rhs, temps);
         }
         AstExpr::Call(call) => {
-            rewrite_function_expr(&mut call.callee, mapping);
+            rewrite_function_expr(&mut call.callee, temps);
             for arg in &mut call.args {
-                rewrite_function_expr(arg, mapping);
+                rewrite_function_expr(arg, temps);
             }
         }
         AstExpr::MethodCall(call) => {
-            rewrite_function_expr(&mut call.receiver, mapping);
+            rewrite_function_expr(&mut call.receiver, temps);
             for arg in &mut call.args {
-                rewrite_function_expr(arg, mapping);
+                rewrite_function_expr(arg, temps);
             }
         }
-        AstExpr::SingleValue(expr) => rewrite_function_expr(expr, mapping),
+        AstExpr::SingleValue(expr) => rewrite_function_expr(expr, temps),
         AstExpr::TableConstructor(table) => {
             for field in &mut table.fields {
                 match field {
-                    AstTableField::Array(value) => rewrite_function_expr(value, mapping),
+                    AstTableField::Array(value) => rewrite_function_expr(value, temps),
                     AstTableField::Record(record) => {
                         if let AstTableKey::Expr(key) = &mut record.key {
-                            rewrite_function_expr(key, mapping);
+                            rewrite_function_expr(key, temps);
                         }
-                        rewrite_function_expr(&mut record.value, mapping);
+                        rewrite_function_expr(&mut record.value, temps);
                     }
                 }
             }
         }
         AstExpr::FunctionExpr(function) => {
-            rewrite_function_capture_bindings(function, mapping);
+            rewrite_function_capture_bindings(function, temps);
         }
         AstExpr::Nil
         | AstExpr::Boolean(_)
@@ -326,18 +319,15 @@ fn rewrite_function_expr(expr: &mut AstExpr, mapping: &BTreeMap<TempId, AstSynth
     }
 }
 
-fn rewrite_name_ref(name: &mut AstNameRef, mapping: &BTreeMap<TempId, AstSyntheticLocalId>) {
+fn rewrite_name_ref(name: &mut AstNameRef, temps: &BTreeSet<TempId>) {
     if let AstNameRef::Temp(temp) = name
-        && let Some(&synthetic) = mapping.get(temp)
+        && temps.contains(temp)
     {
-        *name = AstNameRef::SyntheticLocal(synthetic);
+        *name = AstNameRef::SyntheticLocal(AstSyntheticLocalId(*temp));
     }
 }
 
-fn rewrite_function_capture_bindings(
-    function: &mut AstFunctionExpr,
-    mapping: &BTreeMap<TempId, AstSyntheticLocalId>,
-) {
+fn rewrite_function_capture_bindings(function: &mut AstFunctionExpr, temps: &BTreeSet<TempId>) {
     if function.captured_bindings.is_empty() {
         return;
     }
@@ -345,11 +335,10 @@ fn rewrite_function_capture_bindings(
         .captured_bindings
         .iter()
         .map(|binding| match binding {
-            AstBindingRef::Temp(temp) => mapping
-                .get(temp)
-                .copied()
-                .map(AstBindingRef::SyntheticLocal)
-                .unwrap_or(AstBindingRef::Temp(*temp)),
+            AstBindingRef::Temp(temp) if temps.contains(temp) => {
+                AstBindingRef::SyntheticLocal(AstSyntheticLocalId(*temp))
+            }
+            AstBindingRef::Temp(temp) => AstBindingRef::Temp(*temp),
             _ => *binding,
         })
         .collect();

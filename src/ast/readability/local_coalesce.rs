@@ -1,12 +1,9 @@
-//! 这个 pass 负责收回“seed local + carried local”这一类机械拆分。
+//! 这个 pass 负责收回 AST build hoist 后残留的 carried local 机械拆分。
 //!
-//! 在一些 branch-carried / loop-carried 结构里，前层为了保持 SSA 风格，会先落成：
-//! `local seed = expr; local carried; ... carried = seed ...`
-//! 但如果 `seed` 之后唯一的职责只是给 `carried` 提供初值，那么源码层更自然的形状
-//! 往往就是只保留一个最外层 local，并在各个分支里直接更新它。
+//! 相邻 `local seed = expr; local carried; ... carried = seed ...` 属于 HIR
+//! `carried-locals` 的身份收敛职责。这里只处理 AST build 把空 carried local
+//! hoist 到块首后，seed local 留在后面初始化声明串里的残余形状：
 //!
-//! 除了相邻的 `local seed = ...; local carried` 之外，这里也会处理 “hoisted 空 carried
-//! local 在前，真正的 seed local 还在后面的初始化声明串里” 这一类形状：
 //! - `local carried; local a = ...; local i, total = 1, 0; ... carried = next; i, total = ...`
 //! - 会收回成：`local a = ...; local i, total = 1, 0; ... total = next; i = ...`
 //!   这样后面的 `statement_merge / inline_exprs` 才能继续把分支内的中转 local 收回源码形状。
@@ -17,8 +14,8 @@ use super::super::common::{
 use super::ReadabilityContext;
 use super::binding_flow::name_matches_binding;
 use super::binding_tree::{
-    call_references_binding, expr_references_binding, lvalue_references_binding,
-    rewrite_binding_in_stmt, stmt_captures_binding, stmt_references_or_captures_binding,
+    expr_references_binding, lvalue_references_binding, rewrite_binding_in_stmt,
+    stmt_references_or_captures_binding,
 };
 use super::walk::{self, AstRewritePass, BlockKind};
 
@@ -34,20 +31,6 @@ impl AstRewritePass for LocalCoalescePass {
         let mut changed = false;
         let mut index = 0;
         while index < block.stmts.len() {
-            if index + 1 < block.stmts.len()
-                && let Some(seed) = single_initialized_local_decl(&block.stmts[index])
-                && let Some(carried) = single_empty_local_decl(&block.stmts[index + 1])
-                && stmt_allows_coalescing_binding_identity(&block.stmts[index], seed, carried)
-                && seed_can_absorb_carried(&block.stmts[(index + 2)..], seed, carried)
-            {
-                let mut tail = block.stmts.split_off(index + 2);
-                rewrite_carried_binding_in_stmts(&mut tail, carried, seed);
-                block.stmts.append(&mut tail);
-                block.stmts.remove(index + 1);
-                changed = true;
-                continue;
-            }
-
             let Some(carried) = single_empty_local_decl(&block.stmts[index]) else {
                 index += 1;
                 continue;
@@ -67,19 +50,6 @@ impl AstRewritePass for LocalCoalescePass {
 
         changed
     }
-}
-
-fn single_initialized_local_decl(stmt: &AstStmt) -> Option<AstBindingRef> {
-    let AstStmt::LocalDecl(local_decl) = stmt else {
-        return None;
-    };
-    let [binding] = local_decl.bindings.as_slice() else {
-        return None;
-    };
-    let [_value] = local_decl.values.as_slice() else {
-        return None;
-    };
-    (binding.attr == AstLocalAttr::None).then_some(binding.id)
 }
 
 fn initialized_local_decl_bindings(stmt: &AstStmt) -> Vec<AstBindingRef> {
@@ -115,37 +85,41 @@ fn find_later_seed_local(
     carried_index: usize,
     carried: AstBindingRef,
 ) -> Option<(usize, AstBindingRef)> {
-    let mut prior_seed_decl_mentions_carried = false;
+    let carried_mentions = BindingMentionSpans::new(stmts, carried);
     for seed_index in carried_index + 1..stmts.len() {
         let AstStmt::LocalDecl(_) = &stmts[seed_index] else {
             break;
         };
-        if prior_seed_decl_mentions_carried {
+        if carried_mentions.has_in_range(carried_index + 1, seed_index) {
             return None;
         }
         for seed in initialized_local_decl_bindings(&stmts[seed_index]) {
-            let tail = &stmts[(seed_index + 1)..];
-            if tail_has_structured_carried_writeback(tail, seed, carried) {
+            if tail_has_structured_carried_writeback(
+                stmts,
+                seed_index + 1,
+                seed,
+                carried,
+                &carried_mentions,
+            ) {
                 return Some((seed_index, seed));
             }
         }
-        prior_seed_decl_mentions_carried |=
-            stmt_references_or_captures_binding(&stmts[seed_index], carried);
     }
     None
 }
 
 fn tail_has_structured_carried_writeback(
     stmts: &[AstStmt],
+    tail_start: usize,
     seed: AstBindingRef,
     carried: AstBindingRef,
+    carried_mentions: &BindingMentionSpans,
 ) -> bool {
-    if stmts.len() < 2 {
+    if stmts.len().saturating_sub(tail_start) < 2 {
         return false;
     }
 
-    let carried_mentions = BindingMentionSpans::new(stmts, carried);
-    for index in 0..stmts.len().saturating_sub(1) {
+    for index in tail_start..stmts.len().saturating_sub(1) {
         let AstStmt::If(if_stmt) = &stmts[index] else {
             continue;
         };
@@ -153,7 +127,7 @@ fn tail_has_structured_carried_writeback(
             continue;
         };
         if !is_supported_seed_writeback_assign(writeback, seed, carried)
-            || carried_mentions.has_before(index)
+            || carried_mentions.has_in_range(tail_start, index)
             || carried_mentions.has_from(index + 2)
             || !if_branches_end_with_carried_assign(if_stmt, carried)
         {
@@ -165,38 +139,31 @@ fn tail_has_structured_carried_writeback(
 }
 
 struct BindingMentionSpans {
-    prefix_before: Vec<bool>,
-    suffix_from: Vec<bool>,
+    prefix_counts: Vec<usize>,
 }
 
 impl BindingMentionSpans {
     fn new(stmts: &[AstStmt], binding: AstBindingRef) -> Self {
-        let mut prefix_before = Vec::with_capacity(stmts.len() + 1);
-        prefix_before.push(false);
+        let mut prefix_counts = Vec::with_capacity(stmts.len() + 1);
+        prefix_counts.push(0);
         for stmt in stmts {
-            let mentions_binding = stmt_references_or_captures_binding(stmt, binding);
-            let previous = prefix_before.last().copied().unwrap_or(false);
-            prefix_before.push(previous || mentions_binding);
+            let count = usize::from(stmt_references_or_captures_binding(stmt, binding));
+            let previous = prefix_counts.last().copied().unwrap_or(0);
+            prefix_counts.push(previous + count);
         }
 
-        let mut suffix_from = vec![false; stmts.len() + 1];
-        for (index, stmt) in stmts.iter().enumerate().rev() {
-            suffix_from[index] =
-                suffix_from[index + 1] || stmt_references_or_captures_binding(stmt, binding);
-        }
-
-        Self {
-            prefix_before,
-            suffix_from,
-        }
+        Self { prefix_counts }
     }
 
-    fn has_before(&self, index: usize) -> bool {
-        self.prefix_before[index]
+    fn has_in_range(&self, start: usize, end: usize) -> bool {
+        if start >= end {
+            return false;
+        }
+        self.prefix_counts[end] > self.prefix_counts[start]
     }
 
     fn has_from(&self, index: usize) -> bool {
-        self.suffix_from[index]
+        self.prefix_counts.last().copied().unwrap_or(0) > self.prefix_counts[index]
     }
 }
 
@@ -212,12 +179,10 @@ fn if_branches_end_with_carried_assign(
 }
 
 fn block_ends_with_carried_assign(block: &AstBlock, carried: AstBindingRef) -> bool {
-    let Some((last, prefix)) = block.stmts.split_last() else {
+    let Some((last, _)) = block.stmts.split_last() else {
         return false;
     };
-    prefix
-        .iter()
-        .all(|stmt| !stmt_references_or_captures_binding(stmt, carried))
+    !BindingMentionSpans::new(&block.stmts, carried).has_in_range(0, block.stmts.len() - 1)
         && matches!(last, AstStmt::Assign(assign) if is_direct_carried_store(assign, carried))
 }
 
@@ -229,114 +194,6 @@ fn is_direct_carried_store(assign: &AstAssign, carried: AstBindingRef) -> bool {
         return false;
     };
     name_matches_binding(target, carried) && !expr_references_binding(value, carried)
-}
-
-fn seed_can_absorb_carried(stmts: &[AstStmt], seed: AstBindingRef, carried: AstBindingRef) -> bool {
-    stmts
-        .iter()
-        .all(|stmt| stmt_allows_seed_to_absorb_carried(stmt, seed, carried))
-}
-
-fn stmt_allows_seed_to_absorb_carried(
-    stmt: &AstStmt,
-    seed: AstBindingRef,
-    carried: AstBindingRef,
-) -> bool {
-    if !stmt_allows_coalescing_binding_identity(stmt, seed, carried) {
-        return false;
-    }
-
-    match stmt {
-        AstStmt::LocalDecl(local_decl) => {
-            local_decl
-                .bindings
-                .iter()
-                .all(|binding| binding.id != seed && binding.id != carried)
-                && local_decl
-                    .values
-                    .iter()
-                    .all(|value| !expr_references_binding(value, seed))
-        }
-        AstStmt::GlobalDecl(global_decl) => global_decl
-            .values
-            .iter()
-            .all(|value| !expr_references_binding(value, seed)),
-        AstStmt::Assign(assign) => {
-            if is_exact_seed_copy_assign(assign, carried, seed)
-                || is_supported_seed_writeback_assign(assign, seed, carried)
-            {
-                true
-            } else {
-                !assign_targets_binding(assign, seed)
-                    && assign
-                        .targets
-                        .iter()
-                        .all(|target| !lvalue_references_binding(target, seed))
-                    && assign
-                        .values
-                        .iter()
-                        .all(|value| !expr_references_binding(value, seed))
-            }
-        }
-        AstStmt::CallStmt(call_stmt) => !call_references_binding(&call_stmt.call, seed),
-        AstStmt::Return(ret) => ret
-            .values
-            .iter()
-            .all(|value| !expr_references_binding(value, seed)),
-        AstStmt::If(if_stmt) => {
-            !expr_references_binding(&if_stmt.cond, seed)
-                && seed_can_absorb_carried(&if_stmt.then_block.stmts, seed, carried)
-                && if_stmt
-                    .else_block
-                    .as_ref()
-                    .is_none_or(|block| seed_can_absorb_carried(&block.stmts, seed, carried))
-        }
-        AstStmt::While(while_stmt) => {
-            !expr_references_binding(&while_stmt.cond, seed)
-                && seed_can_absorb_carried(&while_stmt.body.stmts, seed, carried)
-        }
-        AstStmt::Repeat(repeat_stmt) => {
-            seed_can_absorb_carried(&repeat_stmt.body.stmts, seed, carried)
-                && !expr_references_binding(&repeat_stmt.cond, seed)
-        }
-        AstStmt::NumericFor(numeric_for) => {
-            numeric_for.binding != seed
-                && numeric_for.binding != carried
-                && !expr_references_binding(&numeric_for.start, seed)
-                && !expr_references_binding(&numeric_for.limit, seed)
-                && !expr_references_binding(&numeric_for.step, seed)
-                && seed_can_absorb_carried(&numeric_for.body.stmts, seed, carried)
-        }
-        AstStmt::GenericFor(generic_for) => {
-            !generic_for
-                .bindings
-                .iter()
-                .any(|binding| *binding == seed || *binding == carried)
-                && generic_for
-                    .iterator
-                    .iter()
-                    .all(|expr| !expr_references_binding(expr, seed))
-                && seed_can_absorb_carried(&generic_for.body.stmts, seed, carried)
-        }
-        AstStmt::DoBlock(block) => seed_can_absorb_carried(&block.stmts, seed, carried),
-        AstStmt::FunctionDecl(function_decl) => {
-            !function_name_references_binding(&function_decl.target, seed)
-        }
-        AstStmt::LocalFunctionDecl(function_decl) => function_decl.name != seed,
-        AstStmt::Break
-        | AstStmt::Continue
-        | AstStmt::Goto(_)
-        | AstStmt::Label(_)
-        | AstStmt::Error(_) => true,
-    }
-}
-
-fn stmt_allows_coalescing_binding_identity(
-    stmt: &AstStmt,
-    seed: AstBindingRef,
-    carried: AstBindingRef,
-) -> bool {
-    !stmt_captures_binding(stmt, seed) && !stmt_captures_binding(stmt, carried)
 }
 
 fn is_supported_seed_writeback_assign(
@@ -484,22 +341,4 @@ fn is_exact_seed_copy_assign(
         return false;
     };
     name_matches_binding(target, carried) && name_matches_binding(value, seed)
-}
-
-fn assign_targets_binding(assign: &AstAssign, binding: AstBindingRef) -> bool {
-    assign.targets.iter().any(|target| match target {
-        AstLValue::Name(name) => name_matches_binding(name, binding),
-        AstLValue::FieldAccess(_) | AstLValue::IndexAccess(_) => false,
-    })
-}
-
-fn function_name_references_binding(
-    target: &super::super::common::AstFunctionName,
-    binding: AstBindingRef,
-) -> bool {
-    let path = match target {
-        super::super::common::AstFunctionName::Plain(path) => path,
-        super::super::common::AstFunctionName::Method(path, _) => path,
-    };
-    name_matches_binding(&path.root, binding)
 }
