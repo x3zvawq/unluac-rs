@@ -361,7 +361,6 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 1;
                 }
                 Lua53Opcode::Jmp => {
-                    self.pending_methods.clear();
                     let (a, sbx) = expect_asbx(raw_pc, opcode, operands)?;
                     let target = TargetPlaceholder::Raw(jump_target_sbx(
                         &self.word_code_index,
@@ -389,7 +388,6 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 1;
                 }
                 Lua53Opcode::Eq | Lua53Opcode::Lt | Lua53Opcode::Le => {
-                    self.pending_methods.clear();
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let cond = BranchCond {
@@ -434,7 +432,6 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index = helper.next_index;
                 }
                 Lua53Opcode::Test => {
-                    self.pending_methods.clear();
                     let (a, c) = expect_ac(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let cond = BranchCond {
@@ -476,7 +473,6 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index = helper.next_index;
                 }
                 Lua53Opcode::TestSet => {
-                    self.pending_methods.clear();
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let cond = BranchCond {

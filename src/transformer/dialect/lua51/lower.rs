@@ -324,7 +324,6 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 1;
                 }
                 Lua51Opcode::Jmp => {
-                    self.pending_methods.clear();
                     let (_, sbx) = expect_asbx(raw_pc, opcode, operands)?;
                     self.emit(
                         Some(raw_index),
@@ -338,7 +337,6 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 1;
                 }
                 Lua51Opcode::Eq | Lua51Opcode::Lt | Lua51Opcode::Le => {
-                    self.pending_methods.clear();
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let cond = BranchCond {
@@ -361,7 +359,6 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 2;
                 }
                 Lua51Opcode::Test => {
-                    self.pending_methods.clear();
                     let (a, c) = expect_ac(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let cond = BranchCond {
@@ -381,7 +378,6 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 2;
                 }
                 Lua51Opcode::TestSet => {
-                    self.pending_methods.clear();
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let cond = BranchCond {

@@ -574,7 +574,6 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 1;
                 }
                 Lua54Opcode::Jmp => {
-                    self.pending_methods.clear();
                     let sj = expect_asj(raw_pc, opcode, operands)?;
                     self.emit(
                         Some(raw_index),
@@ -591,7 +590,6 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 1;
                 }
                 Lua54Opcode::Eq | Lua54Opcode::Lt | Lua54Opcode::Le => {
-                    self.pending_methods.clear();
                     let (a, b, k) = expect_abk(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let cond = BranchCond {
@@ -615,7 +613,6 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index = helper.next_index;
                 }
                 Lua54Opcode::EqK => {
-                    self.pending_methods.clear();
                     let (a, b, k) = expect_abk(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let cond = BranchCond {
@@ -643,7 +640,6 @@ impl<'a> ProtoLowerer<'a> {
                 | Lua54Opcode::LeI
                 | Lua54Opcode::GtI
                 | Lua54Opcode::GeI => {
-                    self.pending_methods.clear();
                     let (a, sb, c, k) = expect_asbck(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let rhs = immediate_cond_operand(sb, c != 0);
@@ -667,7 +663,6 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index = helper.next_index;
                 }
                 Lua54Opcode::Test => {
-                    self.pending_methods.clear();
                     let (a, k) = expect_ak(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let cond = BranchCond {
@@ -688,7 +683,6 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index = helper.next_index;
                 }
                 Lua54Opcode::TestSet => {
-                    self.pending_methods.clear();
                     let (a, b, k) = expect_abk(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let cond = BranchCond {
