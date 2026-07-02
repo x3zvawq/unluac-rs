@@ -16,9 +16,9 @@
 //! - short-circuit value merge 会提前带出 `entry_defs / value_incomings`，避免 HIR
 //!   再回头拆 phi
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::structure::{BlockRef, Cfg, DataflowFacts, DefId, GraphFacts, PhiCandidate};
+use crate::structure::{BlockRef, Cfg, DataflowFacts, DefId, GraphFacts, PhiCandidate, PhiId};
 use crate::transformer::Reg;
 
 use super::common::{
@@ -164,12 +164,10 @@ pub(super) fn analyze_generic_phi_materializations(
         .filter(|candidate| candidate.reducible)
         .filter_map(|candidate| candidate.result_phi_id)
         .collect::<BTreeSet<_>>();
-    covered.extend(
-        branch_value_merge_candidates
-            .iter()
-            .flat_map(|candidate| candidate.values.iter().map(|value| value.phi_id)),
-    );
-    covered.extend(loop_value_merge_ids(loop_candidates));
+    covered.extend(consumed_branch_value_merge_ids(
+        branch_value_merge_candidates,
+    ));
+    covered.extend(consumed_loop_value_merge_ids(loop_candidates));
 
     let mut generic = dataflow
         .phi_candidates
@@ -184,6 +182,24 @@ pub(super) fn analyze_generic_phi_materializations(
         .collect::<Vec<_>>();
     generic.sort_by_key(|phi| (phi.block, phi.phi_id));
     generic
+}
+
+fn consumed_branch_value_merge_ids(
+    candidates: &[BranchValueMergeCandidate],
+) -> impl Iterator<Item = PhiId> + '_ {
+    let mut by_header = BTreeMap::<BlockRef, Option<&BranchValueMergeCandidate>>::new();
+
+    for candidate in candidates {
+        by_header
+            .entry(candidate.header)
+            .and_modify(|entry| *entry = None)
+            .or_insert(Some(candidate));
+    }
+
+    by_header
+        .into_values()
+        .flatten()
+        .flat_map(|candidate| candidate.values.iter().map(|value| value.phi_id))
 }
 
 fn generic_phi_source(
@@ -289,19 +305,29 @@ fn value_merge_entry_defs(
         .unwrap_or_default()
 }
 
-fn loop_value_merge_ids(
-    loop_candidates: &[LoopCandidate],
-) -> impl Iterator<Item = crate::structure::PhiId> + '_ {
-    loop_candidates.iter().flat_map(|candidate| {
-        candidate
+fn consumed_loop_value_merge_ids(loop_candidates: &[LoopCandidate]) -> BTreeSet<PhiId> {
+    let mut ids = BTreeSet::new();
+
+    for candidate in loop_candidates {
+        let header_regs = candidate
             .header_value_merges
             .iter()
-            .map(|value| value.phi_id)
-            .chain(
-                candidate
-                    .exit_value_merges
-                    .iter()
-                    .flat_map(|exit| exit.values.iter().map(|value| value.phi_id)),
-            )
-    })
+            .map(|value| value.reg)
+            .collect::<BTreeSet<_>>();
+
+        ids.extend(
+            candidate
+                .header_value_merges
+                .iter()
+                .map(|value| value.phi_id),
+        );
+        ids.extend(candidate.exit_value_merges.iter().flat_map(|exit| {
+            exit.values
+                .iter()
+                .filter(|value| header_regs.contains(&value.reg))
+                .map(|value| value.phi_id)
+        }));
+    }
+
+    ids
 }
