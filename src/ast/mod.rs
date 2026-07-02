@@ -30,6 +30,7 @@ pub use debug::dump_ast;
 mod debug {
     crate::debug::define_unavailable_stage_dump!(dump_ast);
 }
+pub(crate) use common::is_lua_identifier_name;
 #[cfg(not(feature = "decompile-debug"))]
 pub use debug::dump_ast;
 pub use error::AstLowerError;

@@ -6,7 +6,9 @@
 
 use crate::ast::DecompileDialect;
 
-use super::super::common::{AstExpr, AstFieldAccess, AstIndexAccess, AstLValue, AstModule};
+use super::super::common::{
+    AstExpr, AstFieldAccess, AstIndexAccess, AstLValue, AstModule, is_lua_identifier_name,
+};
 use super::ReadabilityContext;
 use super::walk::{self, AstRewritePass};
 
@@ -54,25 +56,11 @@ fn field_access_from_index(
     let AstExpr::String(field) = &access.index else {
         return None;
     };
-    if !is_lua_identifier(field, dialect) {
+    if !is_lua_identifier_name(field, dialect) {
         return None;
     }
     Some(AstFieldAccess {
         base: access.base.clone(),
         field: field.clone(),
     })
-}
-
-fn is_lua_identifier(name: &str, dialect: DecompileDialect) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first == '_' || first.is_ascii_alphabetic()) {
-        return false;
-    }
-    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
-        return false;
-    }
-    !dialect.is_keyword(name)
 }

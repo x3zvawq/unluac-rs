@@ -13,7 +13,7 @@ use crate::ast::common::{
     AstAssign, AstBinaryExpr, AstBinaryOpKind, AstCallExpr, AstCallKind, AstExpr, AstFieldAccess,
     AstFunctionExpr, AstGlobalName, AstIndexAccess, AstLValue, AstLocalDecl, AstLogicalExpr,
     AstMethodCallExpr, AstNameRef, AstTableConstructor, AstTableField, AstTableKey, AstUnaryExpr,
-    AstUnaryOpKind,
+    AstUnaryOpKind, is_lua_identifier_name,
 };
 
 impl<'a> AstLowerer<'a> {
@@ -360,21 +360,7 @@ fn lower_binary_op(op: HirBinaryOpKind) -> AstBinaryOpKind {
 
 fn field_name_from_key(key: &HirExpr, dialect: DecompileDialect) -> Option<String> {
     match key {
-        HirExpr::String(name) if is_lua_identifier(name, dialect) => Some(name.clone()),
+        HirExpr::String(name) if is_lua_identifier_name(name, dialect) => Some(name.clone()),
         _ => None,
     }
-}
-
-fn is_lua_identifier(name: &str, dialect: DecompileDialect) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first == '_' || first.is_ascii_alphabetic()) {
-        return false;
-    }
-    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
-        return false;
-    }
-    !dialect.is_keyword(name)
 }

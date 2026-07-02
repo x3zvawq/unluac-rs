@@ -270,6 +270,24 @@ impl DecompileDialect {
     }
 }
 
+/// 判断字符串是否可作为目标方言下的裸字段名。
+///
+/// 这个规则同时服务 `obj.name` 和 `{ name = value }` 两种输出形状；集中在 AST
+/// 层，避免 HIR 构造器恢复与 Readability 字段 sugar 对关键字集合产生不同口径。
+pub(crate) fn is_lua_identifier_name(name: &str, dialect: DecompileDialect) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+        return false;
+    }
+    !dialect.is_keyword(name)
+}
+
 /// 所有方言共有的 21 个基础关键字（Lua 5.1 关键字集）。
 fn is_base_lua_keyword(name: &str) -> bool {
     matches!(
