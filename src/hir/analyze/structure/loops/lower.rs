@@ -53,6 +53,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stmts: &mut Vec<HirStmt>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Option<BlockRef>> {
+        if candidate.exits.is_empty() {
+            return self.lower_infinite_unknown_loop(candidate, stop, stmts, target_overrides);
+        }
         if candidate.exits.len() != 1 {
             return None;
         }
@@ -103,6 +106,61 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         })));
 
         Some(Some(post_loop))
+    }
+
+    fn lower_infinite_unknown_loop(
+        &mut self,
+        candidate: &LoopCandidate,
+        stop: Option<BlockRef>,
+        stmts: &mut Vec<HirStmt>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<Option<BlockRef>> {
+        if let Some(stop) = stop
+            && candidate.blocks.contains(&stop)
+        {
+            return None;
+        }
+
+        let preheader = unique_loop_preheader(candidate);
+        let post_loop = self.lowering.cfg.exit_block;
+        let plan =
+            self.build_loop_state_plan(candidate, preheader, post_loop, &[], target_overrides)?;
+        let combined_target_overrides =
+            merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
+        let mut loop_context = self.build_active_loop_context(
+            candidate,
+            post_loop,
+            &combined_target_overrides,
+            &plan.states,
+        )?;
+        loop_context.loop_blocks = candidate.blocks.clone();
+        loop_context.continue_target = Some(candidate.header);
+        loop_context.continue_sources.clear();
+        loop_context.state_slots = plan.states.clone();
+
+        self.active_loops.push(loop_context.clone());
+        let body = self.lower_region_with_suppressed_loop(
+            candidate.header,
+            None,
+            &combined_target_overrides,
+            Some(candidate.header),
+        )?;
+        self.active_loops.pop();
+
+        stmts.extend(loop_state_init_stmts(&plan));
+        self.visited.extend(
+            loop_context
+                .break_exits
+                .values()
+                .flat_map(|break_exit| break_exit.blocks.iter().copied()),
+        );
+        self.install_loop_exit_bindings(candidate, post_loop, &plan, target_overrides);
+        stmts.push(HirStmt::While(Box::new(HirWhile {
+            cond: HirExpr::Boolean(true),
+            body,
+        })));
+
+        Some(None)
     }
 
     fn lower_while_loop(

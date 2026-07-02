@@ -493,7 +493,11 @@ impl StructuredBodyLowerer<'_, '_> {
                 non_continue_block,
                 None,
             ));
-            return Some(Some(continue_target));
+            return if !continue_target_is_empty && continue_target == loop_context.header {
+                Some(None)
+            } else {
+                Some(Some(continue_target))
+            };
         }
 
         let merge = candidate.merge.or(stop)?;

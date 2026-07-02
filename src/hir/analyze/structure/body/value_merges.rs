@@ -43,6 +43,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         }
 
+        if short
+            .value_incomings
+            .iter()
+            .any(|incoming| incoming.latest_local_def.is_none())
+        {
+            return None;
+        }
+
         // 与 try_lower_value_merge_branch 同理：SC 系列快捷路径只处理一个
         // result_reg，BVM 认领的其他 phi 会因分支结构被消费而孤立。
         if let Some(bvm) = self.branch_value_merges_by_header.get(&block)
@@ -65,6 +73,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // phi temp 直接内联进语句，跳过了 apply_loop_rewrites，当 entry_defs
         // 被 loop state 接管时，写入会被遗漏。
         if value_merge_defs_are_overridden(self.lowering, short, target_overrides) {
+            return None;
+        }
+        if self.statement_value_merge_would_duplicate_nontrivial_leaf(short, target_overrides) {
             return None;
         }
 
@@ -110,8 +121,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // merge == stop 时仍可消费 value-merge 的分支块；merge block 自己的 prefix
         // 由外层 region（例如 numeric-for 的 continue pad）统一降低。
         let allowed_blocks = BTreeSet::from([block]);
+        let would_duplicate_nontrivial_leaf =
+            self.statement_value_merge_would_duplicate_nontrivial_leaf(short, target_overrides);
+        let can_defer_to_branch_value_merge =
+            self.statement_value_merge_can_defer_to_branch_value_merge(short);
+        let should_use_statement_value_merge =
+            would_duplicate_nontrivial_leaf && !can_defer_to_branch_value_merge;
         if recover_short_value_merge_expr_with_allowed_blocks(self.lowering, short, &allowed_blocks)
             .is_some()
+            && !should_use_statement_value_merge
         {
             return None;
         }
@@ -120,6 +138,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             && stop != merge
             && short.blocks.contains(&stop)
         {
+            return None;
+        }
+        if can_defer_to_branch_value_merge && would_duplicate_nontrivial_leaf {
             return None;
         }
 
@@ -179,6 +200,54 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             outputs.push((candidate, temp));
         }
         (!outputs.is_empty()).then_some(outputs)
+    }
+
+    fn statement_value_merge_would_duplicate_nontrivial_leaf(
+        &self,
+        short: &ShortCircuitCandidate,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> bool {
+        let mut leaf_counts = BTreeMap::<BlockRef, usize>::new();
+        for node in &short.nodes {
+            for target in [&node.truthy, &node.falsy] {
+                if let ShortCircuitTarget::Value(block) = target {
+                    *leaf_counts.entry(*block).or_default() += 1;
+                }
+            }
+        }
+
+        leaf_counts
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .any(|(block, _)| {
+                self.lower_block_prefix(block, false, target_overrides)
+                    .is_none_or(|stmts| !value_merge_leaf_is_simple_clone(&stmts))
+            })
+    }
+
+    fn statement_value_merge_can_defer_to_branch_value_merge(
+        &self,
+        short: &ShortCircuitCandidate,
+    ) -> bool {
+        let Some(result_phi_id) = short.result_phi_id else {
+            return false;
+        };
+        if short
+            .value_incomings
+            .iter()
+            .any(|incoming| incoming.latest_local_def.is_none())
+        {
+            return false;
+        }
+
+        short.nodes.iter().any(|node| {
+            self.branch_value_merges_by_header
+                .get(&node.header)
+                .is_some_and(|bvm| {
+                    bvm.values.len() > 1
+                        && bvm.values.iter().any(|value| value.phi_id == result_phi_id)
+                })
+        })
     }
 
     pub(super) fn try_lower_value_merge_branch(
@@ -330,9 +399,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         };
         for (short, target_temp) in outputs {
             let value = if block == current_header
-                && header_subject_is_value_carrier(self.lowering, current_header, short.result_reg)
-            {
-                // Truthiness 测试在 result_reg 上：subject 运行时值即保留值。
+                && (header_subject_is_value_carrier(
+                    self.lowering,
+                    current_header,
+                    short.result_reg,
+                ) || current_header_value_leaf_uses_subject(
+                    self.lowering,
+                    short,
+                    current_header,
+                )) {
+                // Truthiness 测试的当前 header leaf 没有本地 def 时，subject 运行时值就是 leaf 值。
                 lower_short_circuit_subject(self.lowering, block)?
             } else {
                 lower_materialized_value_leaf_expr(self.lowering, short, block)?
@@ -431,6 +507,30 @@ fn value_merge_defs_are_overridden(
             .any(|inc| inc.defs.iter().any(is_overridden))
 }
 
+fn current_header_value_leaf_uses_subject(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+    current_header: BlockRef,
+) -> bool {
+    if !short.nodes.iter().any(|node| node.header == current_header) {
+        return false;
+    }
+    if !short
+        .value_incomings
+        .iter()
+        .any(|incoming| incoming.pred == current_header && incoming.latest_local_def.is_none())
+    {
+        return false;
+    }
+    let Some(instr_ref) = lowering.cfg.blocks[current_header.index()].instrs.last() else {
+        return false;
+    };
+    matches!(
+        &lowering.proto.instrs[instr_ref.index()],
+        LowInstr::Branch(branch) if branch.cond.predicate == BranchPredicate::Truthy
+    )
+}
+
 fn merge_has_other_live_phi(
     lowering: &ProtoLowering<'_>,
     merge: BlockRef,
@@ -454,4 +554,51 @@ fn same_statement_value_merge_tree(
         && base.result_reg.is_some()
         && candidate.result_reg.is_some()
         && same_value_merge_shape(base, candidate)
+}
+
+fn value_merge_leaf_is_simple_clone(stmts: &[HirStmt]) -> bool {
+    let [stmt] = stmts else {
+        return stmts.is_empty();
+    };
+    let HirStmt::Assign(assign) = stmt else {
+        return false;
+    };
+    assign
+        .values
+        .iter()
+        .all(value_merge_leaf_expr_is_simple_clone)
+}
+
+fn value_merge_leaf_expr_is_simple_clone(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::TempRef(_)
+        | HirExpr::GlobalRef(_) => true,
+        HirExpr::Unary(unary) => value_merge_leaf_expr_is_simple_clone(&unary.expr),
+        HirExpr::Binary(binary) => {
+            value_merge_leaf_expr_is_simple_clone(&binary.lhs)
+                && value_merge_leaf_expr_is_simple_clone(&binary.rhs)
+        }
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            value_merge_leaf_expr_is_simple_clone(&logical.lhs)
+                && value_merge_leaf_expr_is_simple_clone(&logical.rhs)
+        }
+        HirExpr::TableAccess(_)
+        | HirExpr::Decision(_)
+        | HirExpr::Call(_)
+        | HirExpr::VarArg
+        | HirExpr::TableConstructor(_)
+        | HirExpr::Closure(_)
+        | HirExpr::Unresolved(_)
+        | HirExpr::Complex { .. } => false,
+    }
 }

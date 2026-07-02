@@ -20,7 +20,8 @@
 use std::collections::BTreeSet;
 
 use super::super::common::{
-    AstBindingRef, AstBlock, AstLValue, AstLabelId, AstLocalAttr, AstLocalDecl, AstModule, AstStmt,
+    AstBindingRef, AstBlock, AstLValue, AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl,
+    AstModule, AstStmt,
 };
 use super::ReadabilityContext;
 use super::binding_flow::{
@@ -67,9 +68,63 @@ impl AstRewritePass for StatementMergePass {
         }
 
         block.stmts = new_stmts;
+        changed |= merge_adjacent_empty_local_decls(block);
         changed |= merge_adjacent_single_value_local_decls(block);
         changed
     }
+}
+
+fn merge_adjacent_empty_local_decls(block: &mut AstBlock) -> bool {
+    let old_stmts = std::mem::take(&mut block.stmts);
+    let mut new_stmts = Vec::with_capacity(old_stmts.len());
+    let mut changed = false;
+    let mut index = 0;
+
+    while index < old_stmts.len() {
+        let Some(bindings) = empty_local_decl_bindings(&old_stmts[index]) else {
+            new_stmts.push(old_stmts[index].clone());
+            index += 1;
+            continue;
+        };
+
+        let mut merged_bindings = bindings.to_vec();
+        let mut lookahead = index + 1;
+        while let Some(next_bindings) = old_stmts.get(lookahead).and_then(empty_local_decl_bindings)
+        {
+            merged_bindings.extend_from_slice(next_bindings);
+            lookahead += 1;
+        }
+
+        if merged_bindings.len() > bindings.len() {
+            new_stmts.push(AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                bindings: merged_bindings,
+                values: Vec::new(),
+            })));
+            changed = true;
+            index = lookahead;
+        } else {
+            new_stmts.push(old_stmts[index].clone());
+            index += 1;
+        }
+    }
+
+    block.stmts = new_stmts;
+    changed
+}
+
+fn empty_local_decl_bindings(stmt: &AstStmt) -> Option<&[AstLocalBinding]> {
+    let AstStmt::LocalDecl(local_decl) = stmt else {
+        return None;
+    };
+    if !local_decl.values.is_empty()
+        || local_decl
+            .bindings
+            .iter()
+            .any(|binding| binding.attr != AstLocalAttr::None)
+    {
+        return None;
+    }
+    Some(&local_decl.bindings)
 }
 
 fn merge_adjacent_single_value_local_decls(block: &mut AstBlock) -> bool {

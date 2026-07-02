@@ -414,6 +414,14 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_62_keyword_method_name.lua",
         PUC_LUA_GE_55,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_63_shared_fallback_value_merge.lua",
+        PUC_LUA_51,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_64_multiret_global_and_return_alias.lua",
+        PUC_LUA_51,
+    ),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {

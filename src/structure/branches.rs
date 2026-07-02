@@ -13,11 +13,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::structure::{BlockRef, Cfg, DominatorTree, GraphFacts};
 
-use super::common::{BranchCandidate, BranchKind, BranchRegionFact};
+use super::common::{BranchCandidate, BranchKind, BranchRegionFact, LoopCandidate};
 use super::helpers::{collect_forward_region_blocks, collect_merge_arm_preds};
 
-pub(super) fn analyze_branches(cfg: &Cfg, graph_facts: &GraphFacts) -> Vec<BranchCandidate> {
-    let mut reachability = ReachabilityCache::new(cfg);
+pub(super) fn analyze_branches(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    loop_candidates: &[LoopCandidate],
+) -> Vec<BranchCandidate> {
+    let mut reachability = ReachabilityCache::new(cfg, loop_candidates);
     let mut branch_candidates: Vec<_> = cfg
         .block_order
         .iter()
@@ -35,6 +39,14 @@ pub(super) fn analyze_branches(cfg: &Cfg, graph_facts: &GraphFacts) -> Vec<Branc
                     classify_if_else_branch(
                         cfg,
                         graph_facts,
+                        &mut reachability,
+                        header,
+                        then_entry,
+                        else_entry,
+                    )
+                })
+                .or_else(|| {
+                    classify_loop_bounded_one_arm_branch(
                         &mut reachability,
                         header,
                         then_entry,
@@ -105,13 +117,22 @@ fn collect_branch_region_blocks(
 struct ReachabilityCache<'a> {
     cfg: &'a Cfg,
     memo: BTreeMap<(BlockRef, BlockRef), bool>,
+    loop_bounded_memo: BTreeMap<(BlockRef, BlockRef), bool>,
+    loop_exits_by_header: BTreeMap<BlockRef, BTreeSet<BlockRef>>,
 }
 
 impl<'a> ReachabilityCache<'a> {
-    fn new(cfg: &'a Cfg) -> Self {
+    fn new(cfg: &'a Cfg, loop_candidates: &[LoopCandidate]) -> Self {
+        let loop_exits_by_header = loop_candidates
+            .iter()
+            .filter(|candidate| candidate.reducible)
+            .map(|candidate| (candidate.header, candidate.exits.clone()))
+            .collect();
         Self {
             cfg,
             memo: BTreeMap::new(),
+            loop_bounded_memo: BTreeMap::new(),
+            loop_exits_by_header,
         }
     }
 
@@ -121,6 +142,46 @@ impl<'a> ReachabilityCache<'a> {
             .entry((from, to))
             .or_insert_with(|| self.cfg.can_reach(from, to))
     }
+
+    fn can_reach_without_entering_loop_header(&mut self, from: BlockRef, to: BlockRef) -> bool {
+        *self.loop_bounded_memo.entry((from, to)).or_insert_with(|| {
+            can_reach_without_entering_loop_body(self.cfg, from, to, &self.loop_exits_by_header)
+        })
+    }
+}
+
+fn can_reach_without_entering_loop_body(
+    cfg: &Cfg,
+    from: BlockRef,
+    to: BlockRef,
+    loop_exits_by_header: &BTreeMap<BlockRef, BTreeSet<BlockRef>>,
+) -> bool {
+    if from == to {
+        return true;
+    }
+    if loop_exits_by_header.contains_key(&from) {
+        return false;
+    }
+
+    let mut visited = BTreeSet::new();
+    let mut stack = vec![from];
+    while let Some(block) = stack.pop() {
+        if block == to {
+            return true;
+        }
+        if !visited.insert(block) {
+            continue;
+        }
+        if let Some(exits) = loop_exits_by_header.get(&block) {
+            stack.extend(exits.iter().copied());
+            continue;
+        }
+        for edge_ref in &cfg.succs[block.index()] {
+            stack.push(cfg.edges[edge_ref.index()].to);
+        }
+    }
+
+    false
 }
 
 fn classify_one_arm_branch(
@@ -131,6 +192,42 @@ fn classify_one_arm_branch(
 ) -> Option<BranchCandidate> {
     let then_reaches_else = reachability.can_reach(then_entry, else_entry);
     let else_reaches_then = reachability.can_reach(else_entry, then_entry);
+
+    match (then_reaches_else, else_reaches_then) {
+        (true, false) => Some(BranchCandidate {
+            header,
+            then_entry,
+            else_entry: None,
+            merge: Some(else_entry),
+            kind: BranchKind::IfThen,
+            invert_hint: false,
+        }),
+        (false, true) => Some(BranchCandidate {
+            header,
+            then_entry: else_entry,
+            else_entry: None,
+            merge: Some(then_entry),
+            kind: BranchKind::IfThen,
+            invert_hint: true,
+        }),
+        _ => None,
+    }
+}
+
+fn classify_loop_bounded_one_arm_branch(
+    reachability: &mut ReachabilityCache<'_>,
+    header: BlockRef,
+    then_entry: BlockRef,
+    else_entry: BlockRef,
+) -> Option<BranchCandidate> {
+    // 普通可达性在无出口或嵌套 loop 里会被回边污染：两个分支臂可能都能绕一整圈
+    // 回到对方，看起来不像 if-then。这里把 reducible nested loop 当成“只通向 exits
+    // 的结构化节点”，既保留 `if ... then skip nested-for end` 这种正常出口，又避免沿
+    // loop body/backedge 绕回另一条臂。
+    let then_reaches_else =
+        reachability.can_reach_without_entering_loop_header(then_entry, else_entry);
+    let else_reaches_then =
+        reachability.can_reach_without_entering_loop_header(else_entry, then_entry);
 
     match (then_reaches_else, else_reaches_then) {
         (true, false) => Some(BranchCandidate {

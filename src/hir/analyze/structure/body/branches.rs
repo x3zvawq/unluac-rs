@@ -144,12 +144,25 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if let Some(downstream) = self.if_then_downstream_merge_stop(&plan, branch_stop, stop) {
             branch_stop = Some(downstream);
         }
-        let branch_value_headers = plan
-            .consumed_headers
-            .iter()
-            .copied()
-            .filter(|header| self.branch_value_merges_by_header.contains_key(header))
-            .collect::<Vec<_>>();
+        let mut seen_branch_values: Vec<&BranchValueMergeCandidate> = Vec::new();
+        let branch_value_headers =
+            plan.consumed_headers
+                .iter()
+                .copied()
+                .filter(|header| {
+                    let Some(candidate) = self.branch_value_merges_by_header.get(header).copied()
+                    else {
+                        return false;
+                    };
+                    if seen_branch_values.iter().any(|seen| {
+                        seen.merge == candidate.merge && seen.values == candidate.values
+                    }) {
+                        return false;
+                    }
+                    seen_branch_values.push(candidate);
+                    true
+                })
+                .collect::<Vec<_>>();
         let branch_target_overrides = (!branch_value_headers.is_empty()).then(|| {
             let mut overrides = target_overrides.clone();
             for header in &branch_value_headers {

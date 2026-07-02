@@ -74,7 +74,7 @@ pub(crate) fn analyze_structure_proto(
     child_cfgs: &[CfgGraph],
 ) -> StructureFacts {
     let loop_candidates = loops::analyze_loops(proto, cfg, graph_facts, dataflow);
-    let branch_candidates = branches::analyze_branches(cfg, graph_facts);
+    let branch_candidates = branches::analyze_branches(cfg, graph_facts, &loop_candidates);
     let branch_region_facts =
         branches::analyze_branch_regions(cfg, graph_facts, &branch_candidates);
     let irreducible_regions = helpers::compute_irreducible_regions(cfg);

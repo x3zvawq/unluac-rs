@@ -170,10 +170,13 @@ impl StructuredBodyLowerer<'_, '_> {
             }));
         }
 
-        let merge = self
+        let Some(merge) = self
             .lowering
             .graph_facts
-            .nearest_common_postdom(truthy, falsy)?;
+            .nearest_common_postdom(truthy, falsy)
+        else {
+            return Some(None);
+        };
 
         let consumed_blocks =
             self.branch_short_circuit_consumed_blocks(&consumed_headers, truthy, falsy, stop);

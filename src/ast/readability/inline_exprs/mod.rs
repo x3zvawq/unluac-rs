@@ -19,7 +19,8 @@ use self::candidate::{
 };
 use self::use_sites::rewrite_stmt_use_sites_with_policy;
 use super::super::common::{
-    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstLValue, AstModule, AstStmt,
+    AstBindingRef, AstBlock, AstCallExpr, AstCallKind, AstExpr, AstLValue, AstLocalAttr,
+    AstLocalDecl, AstLocalOrigin, AstModule, AstStmt,
 };
 use super::ReadabilityContext;
 use super::binding_flow::BindingUseIndex;
@@ -202,11 +203,110 @@ fn rewrite_current_block(block: &mut AstBlock, options: ReadabilityOptions) -> b
     }
 
     block.stmts = new_stmts;
+    changed |= materialize_terminal_return_call_alias(block);
     changed |= collapse_adjacent_call_alias_runs(block, options);
     changed |= collapse_terminal_call_result_alias_runs(block, options);
     changed |= collapse_terminal_local_mechanical_runs(block, options);
     changed |= collapse_adjacent_mechanical_alias_runs(block, options);
     changed
+}
+
+fn materialize_terminal_return_call_alias(block: &mut AstBlock) -> bool {
+    let old_stmts = std::mem::take(&mut block.stmts);
+    let use_index = BindingUseIndex::for_stmts(&old_stmts);
+    let mut new_stmts = Vec::with_capacity(old_stmts.len());
+    let mut changed = false;
+    let mut index = 0;
+
+    while index < old_stmts.len() {
+        let Some(next_stmt) = old_stmts.get(index + 1) else {
+            new_stmts.push(old_stmts[index].clone());
+            index += 1;
+            continue;
+        };
+
+        if let Some((local_decl, ret)) = try_materialize_terminal_return_call_alias(
+            &old_stmts[index],
+            next_stmt,
+            &use_index,
+            index,
+        ) {
+            new_stmts.push(AstStmt::LocalDecl(Box::new(local_decl)));
+            new_stmts.push(AstStmt::Return(Box::new(ret)));
+            changed = true;
+            index += 2;
+            continue;
+        }
+
+        new_stmts.push(old_stmts[index].clone());
+        index += 1;
+    }
+
+    block.stmts = new_stmts;
+    changed
+}
+
+fn try_materialize_terminal_return_call_alias(
+    current: &AstStmt,
+    next: &AstStmt,
+    use_index: &BindingUseIndex,
+    current_index: usize,
+) -> Option<(AstLocalDecl, super::super::common::AstReturn)> {
+    let AstStmt::LocalDecl(local_decl) = current else {
+        return None;
+    };
+    let [binding] = local_decl.bindings.as_slice() else {
+        return None;
+    };
+    let [callee_value] = local_decl.values.as_slice() else {
+        return None;
+    };
+    if binding.attr != AstLocalAttr::None
+        || binding.origin != AstLocalOrigin::Recovered
+        || !candidate::is_lookup_inline_expr(callee_value)
+    {
+        return None;
+    }
+    if use_index.count_uses_in_suffix(current_index + 1, binding.id) != 1 {
+        return None;
+    }
+
+    let AstStmt::Return(ret) = next else {
+        return None;
+    };
+    if ret.values.len() < 2
+        || ret.values[..ret.values.len() - 1]
+            .iter()
+            .any(super::expr_analysis::expr_observes_eval_order)
+    {
+        return None;
+    }
+    let last_value = ret.values.last()?;
+    let call = terminal_direct_callee_call(last_value, binding.id)?;
+
+    let mut rewritten_local = local_decl.as_ref().clone();
+    rewritten_local.values = vec![AstExpr::Call(Box::new(AstCallExpr {
+        callee: callee_value.clone(),
+        args: call.args.clone(),
+    }))];
+
+    let mut rewritten_return = ret.as_ref().clone();
+    let last_index = rewritten_return.values.len() - 1;
+    rewritten_return.values[last_index] = AstExpr::Var(binding.id.to_name_ref());
+
+    Some((rewritten_local, rewritten_return))
+}
+
+fn terminal_direct_callee_call(expr: &AstExpr, binding: AstBindingRef) -> Option<&AstCallExpr> {
+    match expr {
+        AstExpr::Call(call) if call_callee_is_binding(call, binding) => Some(call),
+        AstExpr::SingleValue(inner) => terminal_direct_callee_call(inner, binding),
+        _ => None,
+    }
+}
+
+fn call_callee_is_binding(call: &AstCallExpr, binding: AstBindingRef) -> bool {
+    matches!(&call.callee, AstExpr::Var(name) if name_matches_binding(name, binding))
 }
 
 fn binding_is_first_stmt_eval(stmt: &AstStmt, binding: AstBindingRef) -> bool {
