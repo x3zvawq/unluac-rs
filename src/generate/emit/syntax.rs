@@ -5,7 +5,7 @@
 //! 例如：当子表达式优先级不足时，这里会决定是否补上一层括号。
 
 use crate::ast::{AstBinaryOpKind, AstGlobalAttr, AstGlobalBinding, AstLabelId};
-use crate::generate::common::QuoteStyle;
+use crate::generate::common::{NumberFormat, QuoteStyle};
 use crate::generate::doc::Doc;
 
 use super::{
@@ -87,6 +87,28 @@ pub(super) fn format_number(value: f64) -> String {
         };
     }
     value.to_string()
+}
+
+pub(super) fn format_integer(value: i64, number_format: NumberFormat) -> String {
+    match number_format {
+        NumberFormat::Decimal => value.to_string(),
+        NumberFormat::Hex => format_signed_hex(value),
+    }
+}
+
+pub(super) fn format_unsigned_integer(value: u64, number_format: NumberFormat) -> String {
+    match number_format {
+        NumberFormat::Decimal => value.to_string(),
+        NumberFormat::Hex => format!("0x{value:x}"),
+    }
+}
+
+fn format_signed_hex(value: i64) -> String {
+    if value.is_negative() {
+        format!("-0x{:x}", value.unsigned_abs())
+    } else {
+        format!("0x{:x}", value)
+    }
 }
 
 pub(super) fn format_complex_literal(real: f64, imag: f64) -> String {

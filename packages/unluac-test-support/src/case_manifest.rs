@@ -26,15 +26,15 @@ pub enum LuaCaseDialect {
 }
 
 impl LuaCaseDialect {
-    pub(crate) const fn decompile_dialect(self) -> Option<DecompileDialect> {
+    pub(crate) const fn decompile_dialect(self) -> DecompileDialect {
         match self {
-            Self::Lua51 => Some(DecompileDialect::Lua51),
-            Self::Lua52 => Some(DecompileDialect::Lua52),
-            Self::Lua53 => Some(DecompileDialect::Lua53),
-            Self::Lua54 => Some(DecompileDialect::Lua54),
-            Self::Lua55 => Some(DecompileDialect::Lua55),
-            Self::Luajit => Some(DecompileDialect::Luajit),
-            Self::Luau => Some(DecompileDialect::Luau),
+            Self::Lua51 => DecompileDialect::Lua51,
+            Self::Lua52 => DecompileDialect::Lua52,
+            Self::Lua53 => DecompileDialect::Lua53,
+            Self::Lua54 => DecompileDialect::Lua54,
+            Self::Lua55 => DecompileDialect::Lua55,
+            Self::Luajit => DecompileDialect::Luajit,
+            Self::Luau => DecompileDialect::Luau,
         }
     }
 }
@@ -117,6 +117,10 @@ const UNIT_CASES: &[LuaCaseMatrixEntry] = &[
     ),
     LuaCaseMatrixEntry::new("tests/unit-case/common_10_tables.lua", ALL_DIALECTS),
     LuaCaseMatrixEntry::new("tests/unit-case/common_11_runtime.lua", ALL_DIALECTS),
+    LuaCaseMatrixEntry::new(
+        "tests/unit-case/common_12_string_encoding.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
     // ── dialect-specific cases ──
     LuaCaseMatrixEntry::new("tests/unit-case/lua51_01.lua", PUC_LUA_51),
     LuaCaseMatrixEntry::new("tests/unit-case/lua52_01_env.lua", PUC_LUA_GE_52),

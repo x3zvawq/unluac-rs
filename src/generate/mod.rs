@@ -13,7 +13,7 @@ mod render;
 
 pub use common::{
     GenerateChunkCommentMetadata, GenerateCommentMetadata, GenerateFunctionCommentMetadata,
-    GenerateMode, GenerateOptions, GeneratedChunk, QuoteStyle, TableStyle,
+    GenerateMode, GenerateOptions, GeneratedChunk, NumberFormat, QuoteStyle, TableStyle,
 };
 pub use debug::dump_generate;
 pub(crate) use emit::generate_chunk;

@@ -165,6 +165,8 @@
     "share": {
       "button": "공유 링크 복사",
       "copied": "링크가 클립보드에 복사되었습니다",
+      "cliButton": "CLI 인수 복사",
+      "cliCopied": "CLI 인수가 복사되었습니다",
       "reset": "기본값으로 재설정"
     },
     "about": {

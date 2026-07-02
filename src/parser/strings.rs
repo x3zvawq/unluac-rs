@@ -14,8 +14,10 @@ pub(crate) fn build_raw_string(
     bytes: Vec<u8>,
     raw_size: usize,
 ) -> Result<RawString, ParseError> {
-    let encoding = options.string_encoding;
-    let value = encoding.decode(offset, &bytes, options.string_decode_mode)?;
+    let (encoding, value) =
+        options
+            .string_encoding
+            .decode(offset, &bytes, options.string_decode_mode)?;
     Ok(RawString {
         bytes,
         text: Some(DecodedText { encoding, value }),

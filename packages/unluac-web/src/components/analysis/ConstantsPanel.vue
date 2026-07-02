@@ -6,7 +6,6 @@
  * 以紧凑表格形式呈现，每行显示索引、类型标签和值。
  */
 
-import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { ProtoConstant } from '@/types/decompiler'
 

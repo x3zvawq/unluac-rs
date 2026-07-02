@@ -153,6 +153,9 @@ fn bundled_compiler_path(repo_root: &Path, dialect: DecompileDialect) -> PathBuf
 
 fn bundled_compiler_name(dialect: DecompileDialect) -> &'static str {
     match dialect {
+        DecompileDialect::Auto => {
+            unreachable!("source compilation examples require an explicit dialect")
+        }
         DecompileDialect::Lua51
         | DecompileDialect::Lua52
         | DecompileDialect::Lua53
@@ -165,6 +168,9 @@ fn bundled_compiler_name(dialect: DecompileDialect) -> &'static str {
 
 fn compiler_protocol(dialect: DecompileDialect) -> CompilerProtocol {
     match dialect {
+        DecompileDialect::Auto => {
+            unreachable!("source compilation examples require an explicit dialect")
+        }
         DecompileDialect::Lua51
         | DecompileDialect::Lua52
         | DecompileDialect::Lua53
@@ -177,6 +183,9 @@ fn compiler_protocol(dialect: DecompileDialect) -> CompilerProtocol {
 
 fn compiled_chunk_extension(dialect: DecompileDialect) -> &'static str {
     match dialect {
+        DecompileDialect::Auto => {
+            unreachable!("source compilation examples require an explicit dialect")
+        }
         DecompileDialect::Lua51
         | DecompileDialect::Lua52
         | DecompileDialect::Lua53

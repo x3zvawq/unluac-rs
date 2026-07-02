@@ -8,7 +8,7 @@ use crate::ast::AstTargetDialect;
 use crate::timing::{TimingCollector, TimingReport};
 
 use super::error::DecompileError;
-use super::options::DecompileOptions;
+use super::options::{DecompileDialect, DecompileOptions};
 use super::stages::run_decompile_stages;
 use super::state::{DecompileContext, DecompileState, StageDebugOutput};
 
@@ -36,7 +36,10 @@ impl DecompilerPipeline {
         bytes: &[u8],
         options: DecompileOptions,
     ) -> Result<DecompileResult, DecompileError> {
-        let options = options.normalized();
+        let mut options = options.normalized();
+        if options.dialect == DecompileDialect::Auto {
+            options.dialect = crate::parser::detect_dialect(bytes)?;
+        }
 
         let mut debug_output = Vec::new();
         let timings = TimingCollector::new(options.debug.enable && options.debug.timing);

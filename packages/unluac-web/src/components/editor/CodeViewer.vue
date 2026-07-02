@@ -16,7 +16,14 @@
 import { defaultHighlightStyle, StreamLanguage, syntaxHighlighting } from '@codemirror/language'
 import { lua } from '@codemirror/legacy-modes/mode/lua'
 import { highlightSelectionMatches, search, searchKeymap } from '@codemirror/search'
-import { Compartment, EditorState, type Extension, type Range, StateEffect, StateField } from '@codemirror/state'
+import {
+  Compartment,
+  EditorState,
+  type Extension,
+  type Range,
+  StateEffect,
+  StateField,
+} from '@codemirror/state'
 import { oneDark } from '@codemirror/theme-one-dark'
 import {
   Decoration,

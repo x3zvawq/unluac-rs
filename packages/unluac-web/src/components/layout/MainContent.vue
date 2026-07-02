@@ -16,8 +16,6 @@ import { useI18n } from 'vue-i18n'
 const ProtoGraph = defineAsyncComponent(() => import('@/components/analysis/ProtoGraph.vue'))
 const CfgViewer = defineAsyncComponent(() => import('@/components/analysis/CfgViewer.vue'))
 
-import ConstantsPanel from '@/components/analysis/ConstantsPanel.vue'
-
 import { useResizable } from '@/composables/useResizable'
 import { useFilesStore } from '@/stores/files'
 import { useSettingsStore } from '@/stores/settings'

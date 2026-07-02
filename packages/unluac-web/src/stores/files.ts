@@ -41,7 +41,10 @@ export const useFilesStore = defineStore('files', () => {
     const map = new Map(files.value.map((f) => [f.id, f]))
     return ids
       .map((id) => map.get(id))
-      .filter((f): f is FileEntry => f !== undefined && (f.status === 'success' || f.status === 'skipped'))
+      .filter(
+        (f): f is FileEntry =>
+          f !== undefined && (f.status === 'success' || f.status === 'skipped'),
+      )
   })
 
   const pendingCount = computed(() => files.value.filter((f) => f.status === 'pending').length)

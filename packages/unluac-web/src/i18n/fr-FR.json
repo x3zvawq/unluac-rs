@@ -165,6 +165,8 @@
     "share": {
       "button": "Copier le lien de partage",
       "copied": "Lien copié dans le presse-papiers",
+      "cliButton": "Copier les arguments CLI",
+      "cliCopied": "Arguments CLI copiés",
       "reset": "Réinitialiser"
     },
     "about": {

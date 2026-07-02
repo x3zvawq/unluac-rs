@@ -45,6 +45,7 @@ needless_collect = "deny"
 redundant_clone = "deny"
 
 [dependencies]
+chardetng = "1.0.0"
 encoding_rs = "0.8.35"
 owo-colors = "4.2.2"
 strum = "0.27.2"

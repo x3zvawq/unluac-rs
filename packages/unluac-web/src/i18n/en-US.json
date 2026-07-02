@@ -139,6 +139,7 @@
       "indentWidth": "Indent Width",
       "maxLineLength": "Max Line Length",
       "quoteStyle": "Quote Style",
+      "numberFormat": "Number Format",
       "tableStyle": "Table Style",
       "conservativeOutput": "Conservative Output",
       "comment": "Emit Comments"
@@ -147,7 +148,7 @@
       "dialect": "Target Lua dialect, affects parser and generator behavior. CLI: --dialect / -D",
       "generateMode": "Error handling strategy. strict: stop on unsupported syntax or errors; permissive: output as much as possible. CLI: --generate-mode / -g",
       "parseMode": "Parser strictness. strict: strict validation; permissive: tolerate non-standard bytecode. CLI: --parse-mode / -p",
-      "stringEncoding": "Encoding for string constant decoding. CLI: --encoding / -e",
+      "stringEncoding": "Encoding for string constant decoding. auto detects common legacy encodings. CLI: --encoding / -e",
       "stringDecodeMode": "Behavior on string decode failure. strict: error; lossy: replace with placeholders. CLI: --decode-mode / -m",
       "returnInlineMaxComplexity": "Max inline expression complexity in return statements. CLI: --return-inline-max-complexity",
       "indexInlineMaxComplexity": "Max inline expression complexity in table index expressions. CLI: --index-inline-max-complexity",
@@ -158,6 +159,7 @@
       "indentWidth": "Indentation width (number of spaces). CLI: --indent-width",
       "maxLineLength": "Preferred maximum line length for generated code. CLI: --max-line-length",
       "quoteStyle": "String quote style. prefer-double: prefer \"; prefer-single: prefer '; min-escape: minimize escapes. CLI: --quote-style",
+      "numberFormat": "Number literal style. decimal: regular numbers; hex: emit integer literals as 0x... when possible. CLI: --number-format",
       "tableStyle": "Table constructor layout. compact: single line; balanced: auto; expanded: one entry per line. CLI: --table-style",
       "conservativeOutput": "Enable conservative output mode for safer but potentially more verbose code. CLI: --conservative-output",
       "comment": "Whether to emit comments and metadata in generated code. CLI: --comment"
@@ -165,6 +167,8 @@
     "share": {
       "button": "Copy Share URL",
       "copied": "Link copied to clipboard",
+      "cliButton": "Copy CLI Args",
+      "cliCopied": "CLI args copied",
       "reset": "Reset to Defaults"
     },
     "about": {

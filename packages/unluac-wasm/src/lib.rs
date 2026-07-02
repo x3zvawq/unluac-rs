@@ -12,8 +12,8 @@ use std::str::FromStr;
 use wasm_bindgen::prelude::*;
 
 use unluac::decompile::{
-    DecompileDialect, DecompileOptions, GenerateMode, NamingMode, QuoteStyle, TableStyle,
-    decompile as run_decompile,
+    DecompileDialect, DecompileOptions, GenerateMode, NamingMode, NumberFormat, QuoteStyle,
+    TableStyle, decompile as run_decompile,
 };
 use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
@@ -62,6 +62,7 @@ struct WasmGenerateOptions {
     mode: Option<String>,
     indent_width: Option<usize>,
     max_line_length: Option<usize>,
+    number_format: Option<String>,
     quote_style: Option<String>,
     table_style: Option<String>,
     conservative_output: Option<bool>,
@@ -78,6 +79,7 @@ struct WasmSupportedOptionValues {
     naming_modes: Vec<&'static str>,
     generate_modes: Vec<&'static str>,
     quote_styles: Vec<&'static str>,
+    number_formats: Vec<&'static str>,
     table_styles: Vec<&'static str>,
 }
 
@@ -139,6 +141,7 @@ pub fn supported_option_values() -> Result<JsValue, JsValue> {
         naming_modes: naming_mode_labels(),
         generate_modes: generate_mode_labels(),
         quote_styles: quote_style_labels(),
+        number_formats: number_format_labels(),
         table_styles: table_style_labels(),
     })
 }
@@ -243,6 +246,9 @@ impl WasmGenerateOptions {
         if let Some(value) = self.quote_style {
             options.generate.quote_style = parse_option("generate.quoteStyle", &value)?;
         }
+        if let Some(value) = self.number_format {
+            options.generate.number_format = parse_option("generate.numberFormat", &value)?;
+        }
         if let Some(value) = self.table_style {
             options.generate.table_style = parse_option("generate.tableStyle", &value)?;
         }
@@ -306,6 +312,7 @@ where
 
 fn dialect_labels() -> Vec<&'static str> {
     [
+        DecompileDialect::Auto,
         DecompileDialect::Lua51,
         DecompileDialect::Lua52,
         DecompileDialect::Lua53,
@@ -329,6 +336,7 @@ fn parse_mode_labels() -> Vec<&'static str> {
 fn string_encoding_labels() -> Vec<&'static str> {
     // 常用编码预设列表；实际上 StringEncoding::from_str 支持 encoding_rs 的所有编码标签
     [
+        "auto",
         "utf-8",
         "gbk",
         "gb18030",
@@ -383,6 +391,13 @@ fn quote_style_labels() -> Vec<&'static str> {
     .collect()
 }
 
+fn number_format_labels() -> Vec<&'static str> {
+    [NumberFormat::Decimal, NumberFormat::Hex]
+        .into_iter()
+        .map(<&'static str>::from)
+        .collect()
+}
+
 fn table_style_labels() -> Vec<&'static str> {
     [
         TableStyle::Compact,
@@ -401,7 +416,7 @@ mod tests {
         default_wasm_decompile_options, parse_mode_labels, quote_style_labels,
     };
     use serde::de::IgnoredAny;
-    use unluac::decompile::{DecompileDialect, NamingMode, QuoteStyle, TableStyle};
+    use unluac::decompile::{DecompileDialect, NamingMode, NumberFormat, QuoteStyle, TableStyle};
     use unluac::parser::{ParseMode, StringDecodeMode};
 
     #[test]
@@ -435,6 +450,7 @@ mod tests {
                 mode: None,
                 indent_width: Some(2),
                 max_line_length: Some(120),
+                number_format: Some("hex".to_owned()),
                 quote_style: Some("prefer-single".to_owned()),
                 table_style: Some("expanded".to_owned()),
                 conservative_output: Some(false),
@@ -452,6 +468,7 @@ mod tests {
         assert!(!options.naming.debug_like_include_function);
         assert_eq!(options.generate.indent_width, 2);
         assert_eq!(options.generate.max_line_length, 120);
+        assert_eq!(options.generate.number_format, NumberFormat::Hex);
         assert_eq!(options.generate.quote_style, QuoteStyle::PreferSingle);
         assert_eq!(options.generate.table_style, TableStyle::Expanded);
         assert!(!options.generate.conservative_output);

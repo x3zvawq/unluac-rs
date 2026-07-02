@@ -11,7 +11,7 @@
 import { shallowRef } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { generateShareUrl } from '@/composables/useShareUrl'
-import { useSettingsStore } from '@/stores/settings'
+import { defaultOptions, useSettingsStore } from '@/stores/settings'
 
 defineProps<{
   show: boolean
@@ -24,6 +24,7 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const settings = useSettingsStore()
 const copied = shallowRef(false)
+const cliCopied = shallowRef(false)
 const appVersion = __APP_VERSION__
 
 function copyShareUrl() {
@@ -36,7 +37,92 @@ function copyShareUrl() {
   })
 }
 
+function copyCliArgs() {
+  const args = buildCliArgs()
+  navigator.clipboard.writeText(args).then(() => {
+    cliCopied.value = true
+    setTimeout(() => {
+      cliCopied.value = false
+    }, 2000)
+  })
+}
+
+function buildCliArgs(): string {
+  const defaults = defaultOptions()
+  const options = settings.options
+  const args: string[] = []
+  pushOption(args, '--dialect', options.dialect, defaults.dialect)
+  pushOption(args, '--encoding', options.parse.stringEncoding, defaults.parse.stringEncoding)
+  pushOption(args, '--decode-mode', options.parse.stringDecodeMode, defaults.parse.stringDecodeMode)
+  pushOption(args, '--parse-mode', options.parse.mode, defaults.parse.mode)
+  pushOption(
+    args,
+    '--return-inline-max-complexity',
+    options.readability.returnInlineMaxComplexity,
+    defaults.readability.returnInlineMaxComplexity,
+  )
+  pushOption(
+    args,
+    '--index-inline-max-complexity',
+    options.readability.indexInlineMaxComplexity,
+    defaults.readability.indexInlineMaxComplexity,
+  )
+  pushOption(
+    args,
+    '--args-inline-max-complexity',
+    options.readability.argsInlineMaxComplexity,
+    defaults.readability.argsInlineMaxComplexity,
+  )
+  pushOption(
+    args,
+    '--access-base-inline-max-complexity',
+    options.readability.accessBaseInlineMaxComplexity,
+    defaults.readability.accessBaseInlineMaxComplexity,
+  )
+  pushOption(args, '--naming-mode', options.naming.mode, defaults.naming.mode)
+  pushOption(
+    args,
+    '--debug-like-include-function',
+    options.naming.debugLikeIncludeFunction,
+    defaults.naming.debugLikeIncludeFunction,
+  )
+  pushOption(args, '--generate-mode', options.generate.mode, defaults.generate.mode)
+  pushOption(args, '--indent-width', options.generate.indentWidth, defaults.generate.indentWidth)
+  pushOption(
+    args,
+    '--max-line-length',
+    options.generate.maxLineLength,
+    defaults.generate.maxLineLength,
+  )
+  pushOption(args, '--number-format', options.generate.numberFormat, defaults.generate.numberFormat)
+  pushOption(args, '--quote-style', options.generate.quoteStyle, defaults.generate.quoteStyle)
+  pushOption(args, '--table-style', options.generate.tableStyle, defaults.generate.tableStyle)
+  pushOption(
+    args,
+    '--conservative-output',
+    options.generate.conservativeOutput,
+    defaults.generate.conservativeOutput,
+  )
+  pushOption(args, '--comment', options.generate.comment, defaults.generate.comment)
+  return args.join(' ')
+}
+
+function pushOption(
+  args: string[],
+  flag: string,
+  value: string | number | boolean,
+  defaultValue: string | number | boolean,
+) {
+  if (value === defaultValue) return
+  args.push(flag, shellQuote(String(value)))
+}
+
+function shellQuote(value: string): string {
+  return /^[A-Za-z0-9._/-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`
+}
+
 const dialectOptions = [
+  { label: 'Auto', value: 'auto' },
   { label: 'Lua 5.1', value: 'lua5.1' },
   { label: 'Lua 5.2', value: 'lua5.2' },
   { label: 'Lua 5.3', value: 'lua5.3' },
@@ -52,6 +138,7 @@ const parseModeOptions = [
 ]
 
 const stringEncodingOptions = [
+  { label: 'Auto', value: 'auto' },
   { label: 'UTF-8', value: 'utf-8' },
   { label: 'GBK', value: 'gbk' },
   { label: 'GB18030', value: 'gb18030' },
@@ -85,6 +172,11 @@ const quoteStyleOptions = [
   { label: 'prefer-double', value: 'prefer-double' },
   { label: 'prefer-single', value: 'prefer-single' },
   { label: 'min-escape', value: 'min-escape' },
+]
+
+const numberFormatOptions = [
+  { label: 'decimal', value: 'decimal' },
+  { label: 'hex', value: 'hex' },
 ]
 
 const tableStyleOptions = [
@@ -347,6 +439,22 @@ const tableStyleOptions = [
             </div>
             <div>
               <div class="mb-1 flex items-center gap-1">
+                <label class="text-sm">{{ t('settings.generate.numberFormat') }}</label>
+                <NTooltip>
+                  <template #trigger>
+                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
+                  </template>
+                  {{ t('settings.tips.numberFormat') }}
+                </NTooltip>
+              </div>
+              <NSelect
+                v-model:value="settings.options.generate.numberFormat"
+                :options="numberFormatOptions"
+                size="small"
+              />
+            </div>
+            <div>
+              <div class="mb-1 flex items-center gap-1">
                 <label class="text-sm">{{ t('settings.generate.tableStyle') }}</label>
                 <NTooltip>
                   <template #trigger>
@@ -426,6 +534,9 @@ const tableStyleOptions = [
             <div class="flex gap-2 pt-1">
               <NButton size="small" secondary @click="copyShareUrl">
                 {{ copied ? t('settings.share.copied') : t('settings.share.button') }}
+              </NButton>
+              <NButton size="small" secondary @click="copyCliArgs">
+                {{ cliCopied ? t('settings.share.cliCopied') : t('settings.share.cliButton') }}
               </NButton>
               <NButton size="small" secondary @click="settings.resetToDefaults()">
                 {{ t('settings.share.reset') }}

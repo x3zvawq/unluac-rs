@@ -16,7 +16,8 @@ use crate::hir::HirProtoRef;
 use super::super::common::TableStyle;
 use super::super::error::GenerateError;
 use super::syntax::{
-    binary_meta, format_complex_literal, format_number, format_string_literal, maybe_parenthesize,
+    binary_meta, format_complex_literal, format_integer, format_number, format_string_literal,
+    format_unsigned_integer, maybe_parenthesize,
 };
 use super::{
     Assoc, Emitter, ExprSide, PREC_AND, PREC_COMPARE, PREC_LITERAL, PREC_OR, PREC_PREFIX,
@@ -93,15 +94,33 @@ impl<'a> Emitter<'a> {
                 PREC_LITERAL,
                 Assoc::Non,
             ),
-            AstExpr::Integer(value) => (Doc::text(value.to_string()), PREC_LITERAL, Assoc::Non),
+            AstExpr::Integer(value) => (
+                Doc::text(format_integer(*value, self.options.number_format)),
+                PREC_LITERAL,
+                Assoc::Non,
+            ),
             AstExpr::Number(value) => (Doc::text(format_number(*value)), PREC_LITERAL, Assoc::Non),
             AstExpr::String(value) => (
                 Doc::text(format_string_literal(value, self.options.quote_style)),
                 PREC_LITERAL,
                 Assoc::Non,
             ),
-            AstExpr::Int64(value) => (Doc::text(format!("{value}LL")), PREC_LITERAL, Assoc::Non),
-            AstExpr::UInt64(value) => (Doc::text(format!("{value}ULL")), PREC_LITERAL, Assoc::Non),
+            AstExpr::Int64(value) => (
+                Doc::text(format!(
+                    "{}LL",
+                    format_integer(*value, self.options.number_format)
+                )),
+                PREC_LITERAL,
+                Assoc::Non,
+            ),
+            AstExpr::UInt64(value) => (
+                Doc::text(format!(
+                    "{}ULL",
+                    format_unsigned_integer(*value, self.options.number_format)
+                )),
+                PREC_LITERAL,
+                Assoc::Non,
+            ),
             AstExpr::Complex { real, imag } => (
                 Doc::text(format_complex_literal(*real, *imag)),
                 PREC_LITERAL,

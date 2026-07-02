@@ -43,6 +43,7 @@ fn dump_parser_chunk(
     color: DebugColorMode,
 ) -> String {
     match chunk.header.version {
+        DecompileDialect::Auto => unreachable!("parsed chunks must carry a resolved dialect"),
         DecompileDialect::Lua51 => lua51::dump_chunk(chunk, detail, filters, color),
         DecompileDialect::Lua52 => lua52::dump_chunk(chunk, detail, filters, color),
         DecompileDialect::Lua53 => lua53::dump_chunk(chunk, detail, filters, color),

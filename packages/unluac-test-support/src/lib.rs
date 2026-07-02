@@ -12,7 +12,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use unluac::decompile::{DecompileOptions, DecompileStage, decompile};
+use unluac::decompile::{DecompileDialect, DecompileOptions, DecompileStage, decompile};
 
 #[allow(dead_code)]
 mod case_manifest;
@@ -158,7 +158,7 @@ pub enum FailureKind {
     CompiledChunkExecutionFailed,
     SourceChunkOutputMismatch,
     BaselineFailed,
-    UnsupportedDecompileDialect,
+    AutoDialectMismatch,
     DecompileFailed,
     GenerateWithoutSource,
     WriteGeneratedSourceFailed,
@@ -186,7 +186,7 @@ impl FailureKind {
             Self::CompiledChunkExecutionFailed => "compiled-chunk-execution-failed",
             Self::SourceChunkOutputMismatch => "source-chunk-output-mismatch",
             Self::BaselineFailed => "baseline-failed",
-            Self::UnsupportedDecompileDialect => "unsupported-decompile-dialect",
+            Self::AutoDialectMismatch => "auto-dialect-mismatch",
             Self::DecompileFailed => "decompile-failed",
             Self::GenerateWithoutSource => "generate-without-source",
             Self::WriteGeneratedSourceFailed => "write-generated-source-failed",
@@ -259,6 +259,23 @@ impl TestFailure {
     pub fn failed_proto_tags(&self) -> &[String] {
         &self.failed_proto_tags
     }
+}
+
+fn assert_auto_dialect(
+    phase: &str,
+    actual: DecompileDialect,
+    expected: DecompileDialect,
+    case_path: &str,
+) -> Result<(), TestFailure> {
+    if actual == expected {
+        return Ok(());
+    }
+
+    Err(TestFailure::new(
+        FailureKind::AutoDialectMismatch,
+        format!("{phase} auto dialect mismatch: expected {expected}, got {actual}"),
+        format!("{phase} auto dialect mismatch for {case_path}: expected {expected}, got {actual}"),
+    ))
 }
 
 pub fn format_case_failure(path: &str, failure: &TestFailure) -> String {
@@ -739,19 +756,13 @@ pub(crate) fn run_pipeline_case(
             format!("baseline failed first\n{}", failure.detail()),
         )
     })?;
-    let dialect = entry.dialect.decompile_dialect().ok_or_else(|| {
-        TestFailure::new(
-            FailureKind::UnsupportedDecompileDialect,
-            "unsupported decompile dialect",
-            format!("unsupported decompile dialect for {}", entry.path),
-        )
-    })?;
+    let expected_dialect = entry.dialect.decompile_dialect();
 
     let chunk = compile_lua_case(dialect_label, entry.path);
     let result = decompile(
         &chunk,
         DecompileOptions {
-            dialect,
+            dialect: DecompileDialect::Auto,
             target_stage: DecompileStage::Generate,
             debug: Default::default(),
             ..DecompileOptions::default()
@@ -764,6 +775,12 @@ pub(crate) fn run_pipeline_case(
             format!("decompile failed: {error}"),
         )
     })?;
+    assert_auto_dialect(
+        "generated",
+        result.state.dialect,
+        expected_dialect,
+        entry.path,
+    )?;
 
     let generated = result.state.generated.as_ref().ok_or_else(|| {
         TestFailure::new(
@@ -950,7 +967,7 @@ pub(crate) fn run_pipeline_case(
         let recompile_result = decompile(
             &prev_chunk_bytes,
             DecompileOptions {
-                dialect,
+                dialect: DecompileDialect::Auto,
                 target_stage: DecompileStage::Generate,
                 debug: Default::default(),
                 ..DecompileOptions::default()
@@ -963,6 +980,12 @@ pub(crate) fn run_pipeline_case(
                 format!("[{round_label}] decompile failed: {error}"),
             )
         })?;
+        assert_auto_dialect(
+            &round_label,
+            recompile_result.state.dialect,
+            expected_dialect,
+            entry.path,
+        )?;
         let recompile_generated = recompile_result.state.generated.as_ref().ok_or_else(|| {
             TestFailure::new(
                 FailureKind::RecompileDecompileFailed,

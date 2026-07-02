@@ -14,7 +14,8 @@ use std::process::Command;
 use clap::{CommandFactory, Parser, builder::BoolishValueParser, error::ErrorKind};
 use unluac::decompile::{
     DebugColorMode, DebugDetail, DebugFilters, DecompileDialect, DecompileOptions, DecompileStage,
-    GenerateMode, NamingMode, ProtoDepth, QuoteStyle, TableStyle, decompile, render_timing_report,
+    GenerateMode, NamingMode, NumberFormat, ProtoDepth, QuoteStyle, TableStyle, decompile,
+    render_timing_report,
 };
 use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
@@ -81,7 +82,7 @@ struct CliArgs {
     /// Override the external compiler path used by `--source`.
     #[arg(short = 'l', long, help_heading = "Input")]
     luac: Option<PathBuf>,
-    /// String decoding encoding.
+    /// String decoding encoding (`auto` or any Encoding Standard label).
     #[arg(
         short = 'e',
         long,
@@ -183,6 +184,13 @@ struct CliArgs {
         help_heading = "Generate"
     )]
     quote_style: Option<QuoteStyle>,
+    /// Number literal style.
+    #[arg(
+        long,
+        value_parser = parse_number_format_arg,
+        help_heading = "Generate"
+    )]
+    number_format: Option<NumberFormat>,
     /// Table constructor layout style.
     #[arg(
         long,
@@ -416,6 +424,9 @@ where
     if let Some(style) = args.quote_style {
         decompile.generate.quote_style = style;
     }
+    if let Some(format) = args.number_format {
+        decompile.generate.number_format = format;
+    }
     if let Some(style) = args.table_style {
         decompile.generate.table_style = style;
     }
@@ -503,12 +514,13 @@ fn resolve_input_path(options: &CliOptions) -> Result<PathBuf, CliError> {
 }
 
 fn compile_source(options: &CliOptions, source: &Path) -> Result<PathBuf, CliError> {
-    let compiler = resolve_compiler(options)?;
-    let protocol = compiler_protocol(options.decompile.dialect);
+    let dialect = source_compile_dialect(options.decompile.dialect)?;
+    let compiler = resolve_compiler(options, dialect)?;
+    let protocol = compiler_protocol(dialect);
     let output_dir = repo_root()
         .join("target")
         .join("unluac-debug")
-        .join(<&'static str>::from(options.decompile.dialect));
+        .join(<&'static str>::from(dialect));
     fs::create_dir_all(&output_dir).map_err(|source_error| CliError::Io {
         action: "create debug build directory",
         path: output_dir.clone(),
@@ -520,10 +532,7 @@ fn compile_source(options: &CliOptions, source: &Path) -> Result<PathBuf, CliErr
         .and_then(OsStr::to_str)
         .unwrap_or("index")
         .to_owned();
-    let output = output_dir.join(format!(
-        "{file_stem}.{}",
-        compiled_chunk_extension(options.decompile.dialect)
-    ));
+    let output = output_dir.join(format!("{file_stem}.{}", compiled_chunk_extension(dialect)));
 
     match protocol {
         CompilerProtocol::LuacStyle => {
@@ -594,7 +603,16 @@ fn compile_source(options: &CliOptions, source: &Path) -> Result<PathBuf, CliErr
     Ok(output)
 }
 
-fn resolve_compiler(options: &CliOptions) -> Result<PathBuf, CliError> {
+fn source_compile_dialect(dialect: DecompileDialect) -> Result<DecompileDialect, CliError> {
+    if dialect == DecompileDialect::Auto {
+        return Err(CliError::Usage(
+            "`--source` requires an explicit `--dialect`; auto detection only applies to compiled bytecode inputs".to_owned(),
+        ));
+    }
+    Ok(dialect)
+}
+
+fn resolve_compiler(options: &CliOptions, dialect: DecompileDialect) -> Result<PathBuf, CliError> {
     if let Some(path) = options.luac.as_ref() {
         return Ok(path.clone());
     }
@@ -602,13 +620,14 @@ fn resolve_compiler(options: &CliOptions) -> Result<PathBuf, CliError> {
     let bundled = repo_root()
         .join("lua")
         .join("build")
-        .join(<&'static str>::from(options.decompile.dialect))
-        .join(bundled_compiler_name(options.decompile.dialect));
+        .join(<&'static str>::from(dialect))
+        .join(bundled_compiler_name(dialect));
     if bundled.exists() {
         return Ok(bundled);
     }
 
-    Ok(match options.decompile.dialect {
+    Ok(match dialect {
+        DecompileDialect::Auto => unreachable!("source compile dialect must be explicit"),
         DecompileDialect::Lua51 => PathBuf::from("lua5.1"),
         DecompileDialect::Lua52 => PathBuf::from("lua5.2"),
         DecompileDialect::Lua53 => PathBuf::from("lua5.3"),
@@ -621,6 +640,7 @@ fn resolve_compiler(options: &CliOptions) -> Result<PathBuf, CliError> {
 
 fn compiler_protocol(dialect: DecompileDialect) -> CompilerProtocol {
     match dialect {
+        DecompileDialect::Auto => unreachable!("source compile dialect must be explicit"),
         DecompileDialect::Lua51
         | DecompileDialect::Lua52
         | DecompileDialect::Lua53
@@ -633,6 +653,7 @@ fn compiler_protocol(dialect: DecompileDialect) -> CompilerProtocol {
 
 fn bundled_compiler_name(dialect: DecompileDialect) -> &'static str {
     match dialect {
+        DecompileDialect::Auto => unreachable!("source compile dialect must be explicit"),
         DecompileDialect::Lua51
         | DecompileDialect::Lua52
         | DecompileDialect::Lua53
@@ -645,6 +666,7 @@ fn bundled_compiler_name(dialect: DecompileDialect) -> &'static str {
 
 fn compiled_chunk_extension(dialect: DecompileDialect) -> &'static str {
     match dialect {
+        DecompileDialect::Auto => unreachable!("source compile dialect must be explicit"),
         DecompileDialect::Lua51
         | DecompileDialect::Lua52
         | DecompileDialect::Lua53
@@ -724,6 +746,12 @@ fn parse_quote_style_arg(value: &str) -> Result<QuoteStyle, String> {
     value
         .parse()
         .map_err(|_| format!("unsupported quote style: {value}"))
+}
+
+fn parse_number_format_arg(value: &str) -> Result<NumberFormat, String> {
+    value
+        .parse()
+        .map_err(|_| format!("unsupported number format: {value}"))
 }
 
 fn parse_table_style_arg(value: &str) -> Result<TableStyle, String> {

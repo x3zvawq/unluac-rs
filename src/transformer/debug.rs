@@ -229,6 +229,7 @@ fn format_optional_source(proto: &LoweredProto) -> String {
 
 fn dialect_label(version: DecompileDialect) -> &'static str {
     match version {
+        DecompileDialect::Auto => "auto",
         DecompileDialect::Lua51 => "lua5.1",
         DecompileDialect::Lua52 => "lua5.2",
         DecompileDialect::Lua53 => "lua5.3",

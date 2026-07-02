@@ -31,6 +31,7 @@ pub struct GenerateOptions {
     pub mode: GenerateMode,
     pub indent_width: usize,
     pub max_line_length: usize,
+    pub number_format: NumberFormat,
     pub quote_style: QuoteStyle,
     pub table_style: TableStyle,
     pub conservative_output: bool,
@@ -43,6 +44,7 @@ impl Default for GenerateOptions {
             mode: GenerateMode::Strict,
             indent_width: 4,
             max_line_length: 100,
+            number_format: NumberFormat::Decimal,
             quote_style: QuoteStyle::MinEscape,
             table_style: TableStyle::Balanced,
             conservative_output: true,
@@ -122,6 +124,15 @@ pub enum GenerateMode {
     #[default]
     Strict,
     Permissive,
+}
+
+/// 数字字面量输出策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Display, EnumString, IntoStaticStr)]
+#[strum(serialize_all = "kebab-case")]
+pub enum NumberFormat {
+    #[default]
+    Decimal,
+    Hex,
 }
 
 /// 字符串引号策略。

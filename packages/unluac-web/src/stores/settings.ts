@@ -13,10 +13,10 @@ const STORAGE_KEY = 'unluac-settings'
 
 export function defaultOptions(): DecompileOptions {
   return {
-    dialect: 'lua5.1',
+    dialect: 'auto',
     parse: {
       mode: 'permissive',
-      stringEncoding: 'utf-8',
+      stringEncoding: 'auto',
       stringDecodeMode: 'strict',
     },
     readability: {
@@ -33,6 +33,7 @@ export function defaultOptions(): DecompileOptions {
       mode: 'permissive',
       indentWidth: 4,
       maxLineLength: 100,
+      numberFormat: 'decimal',
       quoteStyle: 'min-escape',
       tableStyle: 'balanced',
       conservativeOutput: true,

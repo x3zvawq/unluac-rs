@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::CommandFactory;
-use unluac::decompile::{DebugColorMode, DecompileStage, GenerateMode, NamingMode};
-use unluac::parser::{ParseMode, StringDecodeMode};
+use unluac::decompile::{DebugColorMode, DecompileStage, GenerateMode, NamingMode, NumberFormat};
+use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
 use super::{CliArgs, OUTPUT_ONLY_SUPPORTS_FINAL_SOURCE, emit_generated_source, parse_args};
 
@@ -56,13 +56,17 @@ fn requires_explicit_input_or_source() {
 fn defaults_to_pure_source_output_when_only_source_is_given() {
     let options = parse_args(args(&["--source", "case.lua"])).expect("source should parse");
     assert_eq!(options.source, Some(PathBuf::from("case.lua")));
-    assert_eq!(<&'static str>::from(options.decompile.dialect), "lua5.1");
+    assert_eq!(<&'static str>::from(options.decompile.dialect), "auto");
     assert_eq!(options.decompile.target_stage, DecompileStage::Generate);
     assert_eq!(options.decompile.naming.mode, NamingMode::DebugLike);
     assert!(!options.decompile.debug.enable);
     assert!(!options.decompile.debug.timing);
     assert!(options.decompile.debug.output_stages.is_empty());
     assert!(options.decompile.generate.comment);
+    assert_eq!(
+        options.decompile.parse.string_encoding,
+        StringEncoding::Auto
+    );
 }
 
 #[test]
@@ -167,6 +171,8 @@ fn short_flags_map_to_the_same_cli_fields() {
         "simple",
         "-g",
         "strict",
+        "--number-format",
+        "hex",
     ]))
     .expect("short flags should parse");
     assert_eq!(options.source, Some(PathBuf::from("case.lua")));
@@ -186,6 +192,18 @@ fn short_flags_map_to_the_same_cli_fields() {
     assert!(options.decompile.debug.timing);
     assert_eq!(options.decompile.naming.mode, NamingMode::Simple);
     assert_eq!(options.decompile.generate.mode, GenerateMode::Strict);
+    assert_eq!(options.decompile.generate.number_format, NumberFormat::Hex);
+}
+
+#[test]
+fn encoding_auto_arg_maps_to_auto() {
+    let options = parse_args(args(&["--source", "case.lua", "--encoding", "auto"]))
+        .expect("auto encoding should parse");
+
+    assert_eq!(
+        options.decompile.parse.string_encoding,
+        StringEncoding::Auto
+    );
 }
 
 #[test]
@@ -298,6 +316,7 @@ fn help_is_grouped_by_section_and_includes_repo_link() {
     assert!(help.contains("Repository: https://github.com/x3zvawq/unluac-rs"));
     assert!(help.contains("-i, --input <INPUT>"));
     assert!(help.contains("-s, --source <SOURCE>"));
+    assert!(help.contains("--number-format <NUMBER_FORMAT>"));
     assert!(help.contains("-o, --output <OUTPUT>"));
     assert!(input < debug && debug < generate && generate < output);
 }

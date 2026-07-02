@@ -90,6 +90,7 @@ Notes:
 
 - The CLI requires either `-i/--input` or `-s/--source`
 - When `-s/--source` is provided, the CLI first invokes an external compiler to produce a chunk, then decompiles that generated chunk
+- `auto` dialect detection applies to compiled bytecode inputs; `--source` still needs an explicit `--dialect` so the CLI can pick the compiler
 - Standalone GitHub Release binaries do not bundle a Lua compiler; `-s/--source` only works when you pass `-l/--luac` explicitly, or when a compatible compiler is available under `lua/build/<dialect>/` or on PATH
 - When `-o/--output` is provided, the CLI writes the final generated source to the target file instead of stdout
 - `-o/--output` only works for pure final-source runs and cannot be combined with debug / timing flags or `--stop-after` earlier than `generate`
@@ -101,11 +102,11 @@ Input options:
 
 | Argument | Description | Default |
 | - | - | - |
-| `-D`, `--dialect` | Dialect used for compilation / decompilation | `lua5.1` |
+| `-D`, `--dialect` | Dialect used for compilation / decompilation (`auto` detects compiled bytecode headers) | `auto` |
 | `-i`, `--input` | Path to a compiled chunk | None |
 | `-s`, `--source` | Path to Lua source; the CLI invokes an external compiler before decompiling | None |
 | `-l`, `--luac` | Explicit compiler path used by `--source` | First tries `lua/build/<dialect>/`, otherwise falls back to a compatible compiler on PATH |
-| `-e`, `--encoding` | String decoding encoding (any [Encoding Standard](https://encoding.spec.whatwg.org/) label, e.g. `utf-8`, `gbk`, `shift_jis`, `euc-kr`, `big5`) | `utf-8` |
+| `-e`, `--encoding` | String decoding encoding (`auto` or any [Encoding Standard](https://encoding.spec.whatwg.org/) label, e.g. `utf-8`, `gbk`, `shift_jis`, `euc-kr`, `big5`) | `auto` |
 | `-m`, `--decode-mode` | String decode failure strategy | `strict` |
 | `-p`, `--parse-mode` | Strict vs permissive parser mode | `permissive` |
 
@@ -141,6 +142,7 @@ Generate and output options:
 | `--indent-width` | Generated source indentation width | `4` |
 | `--max-line-length` | Preferred maximum line length | `100` |
 | `--quote-style` | String quote style | `min-escape` |
+| `--number-format` | Number literal style: `decimal` or `hex` for integer literals | `decimal` |
 | `--table-style` | Table constructor layout style | `balanced` |
 | `--conservative-output` | Whether to prefer conservative source generation | `true` |
 | `--comment` | Whether to emit generate-stage comments and metadata | `true` |
@@ -233,7 +235,7 @@ import { readFile } from "node:fs/promises";
 
 const chunkBytes = await readFile("./sample.luac");
 const source = await decompile(chunkBytes, {
-  dialect: "lua5.1",
+  dialect: "auto",
 });
 
 console.log(source);

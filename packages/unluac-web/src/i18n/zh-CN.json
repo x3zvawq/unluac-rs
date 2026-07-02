@@ -139,6 +139,7 @@
       "indentWidth": "缩进宽度",
       "maxLineLength": "最大行宽",
       "quoteStyle": "引号风格",
+      "numberFormat": "数字格式",
       "tableStyle": "表构造器风格",
       "conservativeOutput": "保守输出模式",
       "comment": "生成注释"
@@ -147,7 +148,7 @@
       "dialect": "目标 Lua 方言，决定解析器和生成器的行为。CLI: --dialect / -D",
       "generateMode": "生成器错误处理策略。strict: 遇到不支持语法或错误时停止；permissive: 尽可能输出。CLI: --generate-mode / -g",
       "parseMode": "解析器严格程度。strict: 严格校验；permissive: 容忍不规范的字节码。CLI: --parse-mode / -p",
-      "stringEncoding": "字符串常量的解码编码。CLI: --encoding / -e",
+      "stringEncoding": "字符串常量的解码编码。auto 会自动识别常见旧编码。CLI: --encoding / -e",
       "stringDecodeMode": "字符串解码失败时的处理策略。strict: 报错；lossy: 替换为占位符。CLI: --decode-mode / -m",
       "returnInlineMaxComplexity": "return 语句中允许的最大内联表达式复杂度。CLI: --return-inline-max-complexity",
       "indexInlineMaxComplexity": "表索引中允许的最大内联表达式复杂度。CLI: --index-inline-max-complexity",
@@ -158,6 +159,7 @@
       "indentWidth": "生成代码的缩进宽度（空格数）。CLI: --indent-width",
       "maxLineLength": "生成代码的首选最大行宽。CLI: --max-line-length",
       "quoteStyle": "字符串引号风格。prefer-double: 偏好双引号；prefer-single: 偏好单引号；min-escape: 选择最少转义的。CLI: --quote-style",
+      "numberFormat": "数字字面量格式。decimal: 普通数字；hex: 尽可能把整数字面量输出为 0x...。CLI: --number-format",
       "tableStyle": "表构造器排版风格。compact: 紧凑；balanced: 均衡；expanded: 展开。CLI: --table-style",
       "conservativeOutput": "启用保守输出模式，生成更安全但可能更冗长的代码。CLI: --conservative-output",
       "comment": "是否在生成的代码中输出注释和元信息。CLI: --comment"
@@ -165,6 +167,8 @@
     "share": {
       "button": "复制分享链接",
       "copied": "链接已复制到剪贴板",
+      "cliButton": "复制 CLI 参数",
+      "cliCopied": "CLI 参数已复制",
       "reset": "恢复默认设置"
     },
     "about": {

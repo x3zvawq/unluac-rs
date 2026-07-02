@@ -301,6 +301,14 @@ fn is_base_lua_keyword(name: &str) -> bool {
 impl AstTargetDialect {
     pub const fn new(version: DecompileDialect) -> Self {
         let caps = match version {
+            DecompileDialect::Auto => AstDialectCaps {
+                goto_label: false,
+                continue_stmt: false,
+                local_const: false,
+                local_close: false,
+                global_decl: false,
+                global_const: false,
+            },
             DecompileDialect::Lua51 => AstDialectCaps {
                 goto_label: false,
                 continue_stmt: false,

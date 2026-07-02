@@ -81,15 +81,16 @@ cargo run -p unluac-cli -- --help
 常见用法：
 
 ```bash
-unluac-cli -i /absolute/path/to/chunk.out -D lua5.1
+unluac-cli -i /absolute/path/to/chunk.out
 unluac-cli -s tests/unit-case/lua51_01.lua -D lua5.1
-unluac-cli -i /absolute/path/to/chunk.out -D lua5.1 -o /tmp/case.lua
+unluac-cli -i /absolute/path/to/chunk.out -o /tmp/case.lua
 ```
 
 说明：
 
 - CLI 要求你显式传入 `-i/--input` 或 `-s/--source`
 - 如果传入 `-s/--source`，CLI 会先调用外部编译器生成 chunk，再执行反编译
+- `auto` dialect 检测只适用于已编译字节码输入；`--source` 仍需显式传入 `--dialect`，这样 CLI 才能选择编译器
 - GitHub Releases 提供的独立二进制不会自带 Lua 编译器；`-s/--source` 只有在你显式传入 `-l/--luac`，或运行环境里存在 `lua/build/<dialect>/` / PATH 上的兼容编译器时才可用
 - 如果传入 `-o/--output`，CLI 会把最终生成源码写入目标文件，而不是输出到 stdout
 - `-o/--output` 只支持纯最终源码输出，不能和 debug / timing 参数一起使用，也不能和早于 `generate` 的 `--stop-after` 组合
@@ -101,11 +102,11 @@ unluac-cli -i /absolute/path/to/chunk.out -D lua5.1 -o /tmp/case.lua
 
 | 参数 | 说明 | 默认值 |
 | - | - | - |
-| `-D`, `--dialect` | 反编译 / 编译时使用的 dialect | `lua5.1` |
+| `-D`, `--dialect` | 反编译 / 编译时使用的 dialect（`auto` 会检测已编译字节码头） | `auto` |
 | `-i`, `--input` | 已编译 chunk 路径 | 无 |
 | `-s`, `--source` | Lua 源码路径，CLI 会先调用外部编译器，再执行反编译 | 无 |
 | `-l`, `--luac` | 显式指定 `--source` 使用的外部编译器路径 | 先尝试 `lua/build/<dialect>/`，否则回退到 PATH 上的兼容编译器 |
-| `-e`, `--encoding` | 字符串解码编码（支持 [Encoding Standard](https://encoding.spec.whatwg.org/) 定义的所有标签，如 `utf-8`、`gbk`、`shift_jis`、`euc-kr`、`big5`） | `utf-8` |
+| `-e`, `--encoding` | 字符串解码编码（`auto` 或 [Encoding Standard](https://encoding.spec.whatwg.org/) 定义的任意标签，如 `utf-8`、`gbk`、`shift_jis`、`euc-kr`、`big5`） | `auto` |
 | `-m`, `--decode-mode` | 字符串解码失败策略 | `strict` |
 | `-p`, `--parse-mode` | parser 严格 / 宽松模式 | `permissive` |
 
@@ -141,6 +142,7 @@ unluac-cli -i /absolute/path/to/chunk.out -D lua5.1 -o /tmp/case.lua
 | `--indent-width` | 生成源码的缩进宽度 | `4` |
 | `--max-line-length` | 软换行参考宽度 | `100` |
 | `--quote-style` | 字符串引号风格 | `min-escape` |
+| `--number-format` | 数字字面量格式：`decimal` 或把整数字面量输出为 `hex` | `decimal` |
 | `--table-style` | 表构造器布局风格 | `balanced` |
 | `--conservative-output` | 是否偏向保守输出 | `true` |
 | `--comment` | 是否输出 generate 阶段注释和元信息 | `true` |
@@ -149,7 +151,8 @@ unluac-cli -i /absolute/path/to/chunk.out -D lua5.1 -o /tmp/case.lua
 | `-o`, `--output` | 将最终生成源码写入文件，而不是输出到 stdout | stdout |
 
 `--dump` 和 `--stop-after` 这类接收阶段名的参数支持以下取值：
-`parse`、`transform`、`cfg`、`graph-facts`、`dataflow`、`structure-facts`、`hir`、`ast`、`readability`、`naming`、`generate`。
+`parser`（`parse`）、`transformer`（`transform`）、`structure`、`hir`、`ast`、`generate`。
+其中 `structure` dump 会包含 CFG、graph-facts、dataflow 和 structure-facts。
 
 更多调试命令和 CLI 工作流可参考 [docs/debug.md](./docs/debug.md)。
 
@@ -232,7 +235,7 @@ import { readFile } from "node:fs/promises";
 
 const chunkBytes = await readFile("./sample.luac");
 const source = await decompile(chunkBytes, {
-  dialect: "lua5.1",
+  dialect: "auto",
 });
 
 console.log(source);

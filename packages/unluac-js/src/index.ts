@@ -1,4 +1,5 @@
 export type UnluacDialect =
+  | "auto"
   | "lua5.1"
   | "lua5.2"
   | "lua5.3"
@@ -9,6 +10,7 @@ export type UnluacDialect =
 
 export type UnluacParseMode = "strict" | "permissive";
 export type UnluacStringEncoding =
+  | "auto"
   | "utf-8"
   | "GBK"
   | "gb18030"
@@ -25,6 +27,7 @@ export type UnluacStringDecodeMode = "strict" | "lossy";
 export type UnluacNamingMode = "debug-like" | "simple" | "heuristic";
 export type UnluacGenerateMode = "strict" | "permissive";
 export type UnluacQuoteStyle = "prefer-double" | "prefer-single" | "min-escape";
+export type UnluacNumberFormat = "decimal" | "hex";
 export type UnluacTableStyle = "compact" | "balanced" | "expanded";
 
 export interface UnluacDecompileOptions {
@@ -50,6 +53,7 @@ export interface UnluacDecompileOptions {
     mode?: UnluacGenerateMode;
     indentWidth?: number;
     maxLineLength?: number;
+    numberFormat?: UnluacNumberFormat;
     quoteStyle?: UnluacQuoteStyle;
     tableStyle?: UnluacTableStyle;
     conservativeOutput?: boolean;
@@ -65,6 +69,7 @@ export interface UnluacSupportedOptionValues {
   namingModes: UnluacNamingMode[];
   generateModes: UnluacGenerateMode[];
   quoteStyles: UnluacQuoteStyle[];
+  numberFormats: UnluacNumberFormat[];
   tableStyles: UnluacTableStyle[];
 }
 

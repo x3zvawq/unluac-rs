@@ -28,6 +28,8 @@ pub struct DebugOptions {
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Display, EnumString, IntoStaticStr)]
 pub enum DecompileDialect {
     #[default]
+    #[strum(serialize = "auto")]
+    Auto,
     #[strum(serialize = "lua5.1", serialize = "lua51")]
     Lua51,
     #[strum(serialize = "lua5.2", serialize = "lua52")]
@@ -59,10 +61,10 @@ pub struct DecompileOptions {
 impl Default for DecompileOptions {
     fn default() -> Self {
         Self {
-            dialect: DecompileDialect::Lua51,
+            dialect: DecompileDialect::Auto,
             parse: ParseOptions {
                 mode: ParseMode::Permissive,
-                string_encoding: StringEncoding::Utf8,
+                string_encoding: StringEncoding::Auto,
                 string_decode_mode: StringDecodeMode::Strict,
             },
             // 默认更偏向直接拿到最终源码，仓库内 CLI / wasm / 集成调用方都共享这套预期。

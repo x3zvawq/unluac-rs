@@ -5,10 +5,19 @@
  * 统一在此处声明，避免各组件重复定义。
  */
 
-export type UnluacDialect = 'lua5.1' | 'lua5.2' | 'lua5.3' | 'lua5.4' | 'lua5.5' | 'luajit' | 'luau'
+export type UnluacDialect =
+  | 'auto'
+  | 'lua5.1'
+  | 'lua5.2'
+  | 'lua5.3'
+  | 'lua5.4'
+  | 'lua5.5'
+  | 'luajit'
+  | 'luau'
 
 export type UnluacParseMode = 'strict' | 'permissive'
 export type UnluacStringEncoding =
+  | 'auto'
   | 'utf-8'
   | 'gbk'
   | 'gb18030'
@@ -23,6 +32,7 @@ export type UnluacStringEncoding =
 export type UnluacStringDecodeMode = 'strict' | 'lossy'
 export type UnluacNamingMode = 'debug-like' | 'simple' | 'heuristic'
 export type UnluacQuoteStyle = 'prefer-double' | 'prefer-single' | 'min-escape'
+export type UnluacNumberFormat = 'decimal' | 'hex'
 export type UnluacTableStyle = 'compact' | 'balanced' | 'expanded'
 export type UnluacGenerateMode = 'strict' | 'permissive'
 
@@ -47,6 +57,7 @@ export interface DecompileOptions {
     mode: UnluacGenerateMode
     indentWidth: number
     maxLineLength: number
+    numberFormat: UnluacNumberFormat
     quoteStyle: UnluacQuoteStyle
     tableStyle: UnluacTableStyle
     conservativeOutput: boolean

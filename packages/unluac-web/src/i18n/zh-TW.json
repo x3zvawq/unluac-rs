@@ -165,6 +165,8 @@
     "share": {
       "button": "複製分享連結",
       "copied": "連結已複製到剪貼簿",
+      "cliButton": "複製 CLI 參數",
+      "cliCopied": "CLI 參數已複製",
       "reset": "恢復預設設定"
     },
     "about": {

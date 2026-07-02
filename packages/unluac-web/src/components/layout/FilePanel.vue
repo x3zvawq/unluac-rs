@@ -40,6 +40,10 @@ const message = useMessage()
 const decompiler = inject<ReturnType<typeof useDecompiler>>('decompiler')!
 const { isDragging, handleDrop, handleDragOver, handleDragLeave, handleFileInput } = useFileDrop()
 
+function browserTextEncoding(encoding: string): string {
+  return encoding === 'auto' ? 'utf-8' : encoding
+}
+
 // 编码变更时，重新解码所有 skipped（源码）文件
 // skipped 文件的 result 是由 TextDecoder 从原始 bytes 按编码解码而来，
 // 编码变了就必须重新解码，否则用户看到的是旧编码的结果
@@ -48,7 +52,9 @@ watch(
   (encoding) => {
     for (const file of filesStore.files) {
       if (file.status === 'skipped') {
-        const sourceText = new TextDecoder(encoding, { fatal: false }).decode(file.bytes)
+        const sourceText = new TextDecoder(browserTextEncoding(encoding), { fatal: false }).decode(
+          file.bytes,
+        )
         filesStore.updateFileStatus(file.id, 'skipped', sourceText)
       }
     }
@@ -156,7 +162,9 @@ async function decompileFile(fileId: string) {
   if (isLuaSource(file.bytes)) {
     // 遵循反编译参数中配置的字符串编码
     const encoding = settingsStore.options.parse.stringEncoding
-    const sourceText = new TextDecoder(encoding, { fatal: false }).decode(file.bytes)
+    const sourceText = new TextDecoder(browserTextEncoding(encoding), { fatal: false }).decode(
+      file.bytes,
+    )
     filesStore.updateFileStatus(fileId, 'skipped', sourceText)
     return
   }

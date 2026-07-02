@@ -47,7 +47,7 @@ const values = await supportedOptionValues();
 console.log(values.dialects);
 
 const source = await decompile(chunkBytes, {
-  dialect: "lua5.1",
+  dialect: "auto",
 });
 
 console.log(source);
@@ -111,7 +111,7 @@ Returns a structured analysis result instead of a plain source string:
 ```ts
 import { decompileRich } from "unluac-js";
 
-const result = await decompileRich(chunkBytes, { dialect: "lua5.1" });
+const result = await decompileRich(chunkBytes, { dialect: "auto" });
 
 console.log(result.source);    // final Lua source
 console.log(result.warnings);  // generation warnings
@@ -150,15 +150,16 @@ Returns the currently supported enum-like values for:
 - `namingModes`
 - `generateModes`
 - `quoteStyles`
+- `numberFormats`
 - `tableStyles`
 
 ## Option Reference
 
 Common `decompile()` options:
 
-- `dialect`: target chunk dialect such as `lua5.1`, `lua5.4`, `luajit`, or `luau`
+- `dialect`: target chunk dialect such as `auto`, `lua5.1`, `lua5.4`, `luajit`, or `luau`
 - `parse.mode`: parser mode, `strict` or `permissive`
-- `parse.stringEncoding`: string decoding encoding; accepts any [Encoding Standard](https://encoding.spec.whatwg.org/) label (e.g. `utf-8`, `gbk`, `shift_jis`, `euc-kr`, `big5`)
+- `parse.stringEncoding`: string decoding encoding; accepts `auto` or any [Encoding Standard](https://encoding.spec.whatwg.org/) label (e.g. `utf-8`, `gbk`, `shift_jis`, `euc-kr`, `big5`)
 - `parse.stringDecodeMode`: string decode failure strategy, `strict` or `lossy`
 - `naming.mode`: naming strategy, `debug-like`, `simple`, or `heuristic`
 - `naming.debugLikeIncludeFunction`: whether debug-like naming should include function-shaped names
@@ -175,6 +176,7 @@ Common `decompile()` options:
 - `mode`: generation mode, `strict` or `permissive`
 - `indentWidth`
 - `maxLineLength`
+- `numberFormat`
 - `quoteStyle`
 - `tableStyle`
 - `conservativeOutput`
@@ -182,14 +184,16 @@ Common `decompile()` options:
 
 Current library defaults used by this package:
 
+- `dialect = auto`
 - `parse.mode = permissive`
-- `parse.stringEncoding = utf-8`
+- `parse.stringEncoding = auto`
 - `parse.stringDecodeMode = strict`
 - `naming.mode = debug-like`
 - `naming.debugLikeIncludeFunction = true`
 - `generate.mode = permissive`
 - `generate.indentWidth = 4`
 - `generate.maxLineLength = 100`
+- `generate.numberFormat = decimal`
 - `generate.quoteStyle = min-escape`
 - `generate.tableStyle = balanced`
 - `generate.conservativeOutput = true`

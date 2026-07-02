@@ -32,6 +32,7 @@ pub(crate) fn lower_chunk(
 ) -> Result<(), DecompileError> {
     let raw_chunk = state.require_raw_chunk()?;
     state.lowered = Some(match raw_chunk.header.version {
+        DecompileDialect::Auto => unreachable!("raw chunks must carry a resolved dialect"),
         DecompileDialect::Lua51 => dialect::lua51::lower_chunk(raw_chunk),
         DecompileDialect::Lua52 => dialect::lua52::lower_chunk(raw_chunk),
         DecompileDialect::Lua53 => dialect::lua53::lower_chunk(raw_chunk),

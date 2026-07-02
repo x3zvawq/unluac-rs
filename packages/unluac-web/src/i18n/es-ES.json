@@ -165,6 +165,8 @@
     "share": {
       "button": "Copiar enlace",
       "copied": "Enlace copiado al portapapeles",
+      "cliButton": "Copiar argumentos CLI",
+      "cliCopied": "Argumentos CLI copiados",
       "reset": "Restablecer valores"
     },
     "about": {

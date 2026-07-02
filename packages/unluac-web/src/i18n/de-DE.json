@@ -165,6 +165,8 @@
     "share": {
       "button": "Link kopieren",
       "copied": "Link in Zwischenablage kopiert",
+      "cliButton": "CLI-Argumente kopieren",
+      "cliCopied": "CLI-Argumente kopiert",
       "reset": "Zurücksetzen"
     },
     "about": {

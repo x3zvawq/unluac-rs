@@ -165,6 +165,8 @@
     "share": {
       "button": "Copiar link de compartilhamento",
       "copied": "Link copiado para a área de transferência",
+      "cliButton": "Copiar args da CLI",
+      "cliCopied": "Args da CLI copiados",
       "reset": "Restaurar padrões"
     },
     "about": {
