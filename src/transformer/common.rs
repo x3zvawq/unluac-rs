@@ -60,7 +60,11 @@ pub(crate) fn resolve_env_upvalues(
         if index >= count {
             break;
         }
-        if raw_string_value(name).is_some_and(|value| value == "_ENV") {
+        if name
+            .as_ref()
+            .and_then(raw_string_value)
+            .is_some_and(|value| value == "_ENV")
+        {
             env_upvalues[index] = true;
         }
     }

@@ -218,7 +218,7 @@ pub struct RawDebugInfo {
 pub struct RawDebugInfoCommon {
     pub line_info: Vec<u32>,
     pub local_vars: Vec<RawLocalVar>,
-    pub upvalue_names: Vec<RawString>,
+    pub upvalue_names: Vec<Option<RawString>>,
 }
 
 /// 调试信息里记录的局部变量生命周期。

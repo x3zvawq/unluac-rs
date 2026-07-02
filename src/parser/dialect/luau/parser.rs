@@ -48,7 +48,7 @@ enum FlatProtoSlot {
 struct LuauSymbolDebugInfo {
     local_vars: Vec<RawLocalVar>,
     local_regs: Vec<u8>,
-    upvalue_names: Vec<RawString>,
+    upvalue_names: Vec<Option<RawString>>,
 }
 
 struct DecodedInstrs {
@@ -678,9 +678,7 @@ impl LuauParserState {
 
         let mut upvalue_names = Vec::with_capacity(encoded_upvalue_names);
         for _ in 0..encoded_upvalue_names {
-            if let Some(name) = self.read_string_ref(reader)? {
-                upvalue_names.push(name);
-            }
+            upvalue_names.push(self.read_string_ref(reader)?);
         }
 
         Ok(LuauSymbolDebugInfo {

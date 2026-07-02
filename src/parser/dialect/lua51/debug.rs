@@ -317,7 +317,11 @@ fn write_verbose_debug_info(output: &mut String, proto: &RawProto) {
     } else {
         let _ = writeln!(output, "      upvalue_names");
         for (index, name) in upvalue_names.iter().enumerate() {
-            let _ = writeln!(output, "        u{index}: {}", format_raw_string(name));
+            let value = name
+                .as_ref()
+                .map(format_raw_string)
+                .unwrap_or_else(|| "<none>".to_owned());
+            let _ = writeln!(output, "        u{index}: {value}");
         }
     }
 }

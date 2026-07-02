@@ -90,16 +90,14 @@ pub(crate) fn parse_upvalues_with_kinds(
     Ok(pairs.into_iter().unzip())
 }
 
-/// 统一读取可选的 upvalue 名字并丢弃 `None`。
+/// 统一读取可选的 upvalue 名字，并保留空槽与 upvalue slot 对齐。
 pub(crate) fn parse_upvalue_names(
     count: u32,
     mut parse_name: impl FnMut() -> Result<Option<RawString>, ParseError>,
-) -> Result<Vec<RawString>, ParseError> {
+) -> Result<Vec<Option<RawString>>, ParseError> {
     let mut names = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        if let Some(name) = parse_name()? {
-            names.push(name);
-        }
+        names.push(parse_name()?);
     }
     Ok(names)
 }

@@ -289,9 +289,7 @@ impl Lua51Parser {
         let upvalue_name_count = read_sized_u32(reader, layout, "upvalue name count")?;
         let mut upvalue_names = Vec::with_capacity(upvalue_name_count as usize);
         for _ in 0..upvalue_name_count {
-            if let Some(name) = self.parse_string(reader, layout)? {
-                upvalue_names.push(name);
-            }
+            upvalue_names.push(self.parse_string(reader, layout)?);
         }
 
         if !self.options.mode.is_permissive()

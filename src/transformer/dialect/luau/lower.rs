@@ -93,7 +93,8 @@ impl<'a> ProtoLowerer<'a> {
                 | LuauOpcode::FastCall1
                 | LuauOpcode::FastCall2
                 | LuauOpcode::FastCall2K
-                | LuauOpcode::FastCall3 => {
+                | LuauOpcode::FastCall3
+                | LuauOpcode::NativeCall => {
                     // 这些 opcode 在 Luau 里都是“VM 内部 hint / 无副作用占位”，对我们要恢复的源
                     // 级语义没有贡献，所以不发射任何 low-IR。但它们仍然占据真实 raw pc，并且
                     // 完全可能成为其它指令（典型如 LoadB.C != 0 的“跳过下一条”、JumpIfNot 跳到
@@ -1019,11 +1020,6 @@ impl<'a> ProtoLowerer<'a> {
                             target: TargetPlaceholder::Raw(self.jump_target(raw_pc, e)?),
                         },
                     );
-                    raw_index += 1;
-                }
-                LuauOpcode::NativeCall => {
-                    // NATIVECALL 是 Luau 给紧随其后的 CALL 加的"已经被 native code-gen 接管"
-                    // 标记，本身不修改任何寄存器、不改变控制流。反编译时直接跳过即可。
                     raw_index += 1;
                 }
             }

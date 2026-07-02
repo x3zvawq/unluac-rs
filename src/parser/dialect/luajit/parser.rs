@@ -14,8 +14,8 @@ use crate::parser::raw::{
     DialectHeaderExtra, DialectInstrExtra, DialectProtoExtra, DialectUpvalueExtra,
     LuaJitChunkLayout, Origin, ProtoFrameInfo, ProtoLineRange, ProtoSignature, RawChunk,
     RawConstPool, RawConstPoolCommon, RawDebugInfo, RawDebugInfoCommon, RawInstr, RawInstrOpcode,
-    RawInstrOperands, RawLiteralConst, RawProto, RawProtoCommon, RawString, RawUpvalueDescriptor,
-    RawUpvalueInfo, RawUpvalueInfoCommon, Span,
+    RawInstrOperands, RawLiteralConst, RawLocalVar, RawProto, RawProtoCommon, RawString,
+    RawUpvalueDescriptor, RawUpvalueInfo, RawUpvalueInfoCommon, Span,
 };
 use crate::parser::reader::BinaryReader;
 use crate::parser::strings::build_raw_string;
@@ -54,6 +54,14 @@ const BCDUMP_KTAB_STR: u32 = 5;
 const PROTO_VARARG: u8 = 0x02;
 const PROTO_UV_LOCAL: u16 = 0x8000;
 const PROTO_UV_IMMUTABLE: u16 = 0x4000;
+const LUAJIT_FIXED_VAR_NAMES: [&[u8]; 6] = [
+    b"(for index)",
+    b"(for limit)",
+    b"(for step)",
+    b"(for generator)",
+    b"(for state)",
+    b"(for control)",
+];
 
 pub(crate) struct LuaJitParser {
     options: ParseOptions,
@@ -68,6 +76,7 @@ struct LuaJitDebugInfoInput<'a> {
     line_count: u32,
     debug_size: u32,
     stripped: bool,
+    big_endian: bool,
 }
 
 impl LuaJitParser {
@@ -270,6 +279,7 @@ impl LuaJitParser {
                 line_count: line_count.unwrap_or_default(),
                 debug_size,
                 stripped,
+                big_endian: (layout.flags & BCDUMP_F_BE) != 0,
             })?
         };
 
@@ -607,6 +617,7 @@ impl LuaJitParser {
             line_count,
             debug_size,
             stripped,
+            big_endian,
         } = input;
 
         let mut reader = BinaryReader::new(bytes);
@@ -621,8 +632,22 @@ impl LuaJitParser {
         for _ in 0..instruction_count {
             let offset = match line_width {
                 1 => u32::from(reader.read_u8()?),
-                2 => u32::from(u16::from_le_bytes(reader.read_array::<2>()?)),
-                4 => u32::from_le_bytes(reader.read_array::<4>()?),
+                2 => {
+                    let bytes = reader.read_array::<2>()?;
+                    u32::from(if big_endian {
+                        u16::from_be_bytes(bytes)
+                    } else {
+                        u16::from_le_bytes(bytes)
+                    })
+                }
+                4 => {
+                    let bytes = reader.read_array::<4>()?;
+                    if big_endian {
+                        u32::from_be_bytes(bytes)
+                    } else {
+                        u32::from_le_bytes(bytes)
+                    }
+                }
                 _ => unreachable!(),
             };
             line_info.push(first_line.saturating_add(offset));
@@ -639,21 +664,19 @@ impl LuaJitParser {
                 }
                 bytes.push(byte);
             }
-            upvalue_names.push(self.decode_raw_string(
+            upvalue_names.push(Some(self.decode_raw_string(
                 base_offset + start,
                 reader.offset() - start,
                 bytes,
-            )?);
+            )?));
         }
 
-        if reader.remaining() != 0 {
-            let _ = reader.read_exact(reader.remaining())?;
-        }
+        let local_vars = self.parse_debug_varinfo(&mut reader, base_offset)?;
 
         Ok(RawDebugInfo {
             common: RawDebugInfoCommon {
                 line_info,
-                local_vars: Vec::new(),
+                local_vars,
                 upvalue_names,
             },
             extra: DialectDebugExtra::LuaJit(LuaJitDebugExtra {
@@ -670,6 +693,76 @@ impl LuaJitParser {
         bytes: Vec<u8>,
     ) -> Result<RawString, ParseError> {
         build_raw_string(self.options, offset, bytes, size)
+    }
+
+    fn parse_debug_varinfo(
+        &self,
+        reader: &mut BinaryReader<'_>,
+        base_offset: usize,
+    ) -> Result<Vec<RawLocalVar>, ParseError> {
+        let mut local_vars = Vec::new();
+        let mut last_pc = 0_u32;
+
+        while reader.remaining() != 0 {
+            let name_start = reader.offset();
+            let first = reader.read_u8()?;
+            if first == 0 {
+                if reader.remaining() != 0 {
+                    return Err(ParseError::UnsupportedValue {
+                        field: "luajit debug trailing bytes",
+                        value: reader.remaining() as u64,
+                    });
+                }
+                break;
+            }
+
+            let name = if let Some(bytes) = luajit_fixed_var_name(first) {
+                self.decode_raw_string(base_offset + name_start, 1, bytes.to_vec())?
+            } else {
+                let mut bytes = vec![first];
+                loop {
+                    let byte = reader.read_u8()?;
+                    if byte == 0 {
+                        break;
+                    }
+                    bytes.push(byte);
+                }
+                self.decode_raw_string(
+                    base_offset + name_start,
+                    reader.offset() - name_start,
+                    bytes,
+                )?
+            };
+
+            let delta = reader.read_uleb128_u32("luajit local start pc delta")?;
+            let len = reader.read_uleb128_u32("luajit local pc length")?;
+            let start_pc = last_pc
+                .checked_add(delta)
+                .ok_or(ParseError::IntegerOverflow {
+                    field: "luajit local start pc",
+                    value: u64::from(last_pc) + u64::from(delta),
+                })?;
+            let end_pc = start_pc
+                .checked_add(len)
+                .ok_or(ParseError::IntegerOverflow {
+                    field: "luajit local end pc",
+                    value: u64::from(start_pc) + u64::from(len),
+                })?;
+            last_pc = start_pc;
+
+            // LuaJIT varinfo uses internal proto pc; dump instructions omit pc=0.
+            let start_pc = start_pc.saturating_sub(1);
+            let end_pc = end_pc.saturating_sub(1);
+            if start_pc < end_pc {
+                local_vars.push(RawLocalVar {
+                    name,
+                    start_pc,
+                    end_pc,
+                });
+            }
+        }
+
+        Ok(local_vars)
     }
 
     fn read_u64_from_uleb(&self, reader: &mut BinaryReader<'_>) -> Result<u64, ParseError> {
@@ -689,7 +782,39 @@ impl LuaJitParser {
     }
 }
 
+fn luajit_fixed_var_name(tag: u8) -> Option<&'static [u8]> {
+    LUAJIT_FIXED_VAR_NAMES
+        .get(usize::from(tag.checked_sub(1)?))
+        .copied()
+}
+
 struct ParsedConstPool {
     const_pool: RawConstPool,
     children: Vec<RawProto>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LuaJitParser;
+    use crate::parser::ParseOptions;
+
+    #[test]
+    fn parses_big_endian_line_info_offsets() {
+        let chunk = [
+            0x1b, 0x4c, 0x4a, 0x02, 0x01, 0x00, // header, BE, empty name
+            0x13, // proto size
+            0x00, 0x00, 0x01, 0x00, // flags, params, frame, upvalues
+            0x00, 0x00, 0x01, // kgc, knum, instruction count
+            0x03, 0xe8, 0x07, 0xac, 0x02, // debug size, firstline=1000, numline=300
+            0x00, 0x00, 0x00, 0x00, // one BE instruction word
+            0x01, 0x02, 0x00, // line offset 258, varinfo terminator
+            0x00, // chunk footer
+        ];
+
+        let parsed = LuaJitParser::new(ParseOptions::default())
+            .parse(&chunk)
+            .expect("minimal BE LuaJIT chunk should parse");
+
+        assert_eq!(parsed.main.common.debug_info.common.line_info, [1258]);
+    }
 }

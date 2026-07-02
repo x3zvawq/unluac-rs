@@ -55,7 +55,7 @@ pub(super) fn build_bindings(
                 .common
                 .upvalue_names
                 .get(index)
-                .map(decode_raw_string)
+                .and_then(|name| name.as_ref().map(decode_raw_string))
         })
         .collect::<Vec<_>>();
     let mut locals = Vec::new();
@@ -429,6 +429,21 @@ fn debug_local_name_for_reg_at_block_entry(
 }
 
 fn debug_local_name_for_reg_at_pc(proto: &LoweredProto, reg: Reg, pc: u32) -> Option<String> {
+    if let Some(extra) = proto.debug_info.extra.luau()
+        && !extra.local_regs.is_empty()
+    {
+        return proto
+            .debug_info
+            .common
+            .local_vars
+            .iter()
+            .zip(extra.local_regs.iter().copied())
+            .find_map(|(local, local_reg)| {
+                (debug_local_is_active_at_pc(local, pc) && usize::from(local_reg) == reg.index())
+                    .then(|| decode_raw_string(&local.name))
+            });
+    }
+
     proto
         .debug_info
         .common

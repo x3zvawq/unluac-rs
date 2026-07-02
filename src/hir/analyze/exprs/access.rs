@@ -258,7 +258,10 @@ fn access_base_is_named_env(proto: &LoweredProto, base: AccessBase) -> bool {
             .common
             .upvalue_names
             .get(upvalue.index())
-            .is_some_and(|name| decode_raw_string(name) == "_ENV"),
+            .is_some_and(|name| {
+                name.as_ref()
+                    .is_some_and(|name| decode_raw_string(name) == "_ENV")
+            }),
         AccessBase::Reg(_) => false,
     }
 }

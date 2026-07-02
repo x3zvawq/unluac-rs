@@ -6,8 +6,8 @@
 
 use crate::parser::{Lua51Opcode, Lua51Operands, RawChunk, RawProto};
 use crate::transformer::dialect::lowering::{
-    PendingLowInstr, PendingLoweringState, PendingMethodHints, TargetPlaceholder, instr_pc,
-    resolve_pending_instr_with,
+    PendingLowInstr, PendingLoweringState, PendingMethodHints, TargetPlaceholder, WordCodeIndex,
+    instr_pc, instr_word_len, next_raw_pc, raw_pc_at, resolve_pending_instr_with,
 };
 use crate::transformer::dialect::puc_lua::{
     checked_const_ref, checked_proto_ref, checked_upvalue_ref, finish_lowered_proto,
@@ -51,6 +51,7 @@ struct ProtoLowerer<'a> {
     raw: &'a RawProto,
     lowering: PendingLoweringState,
     pending_methods: PendingMethodHints,
+    word_code_index: WordCodeIndex,
 }
 
 impl<'a> ProtoLowerer<'a> {
@@ -58,10 +59,12 @@ impl<'a> ProtoLowerer<'a> {
         let raw_instr_count = raw.common.instructions.len();
         let method_slots = usize::from(raw.common.frame.max_stack_size).saturating_add(2);
 
+        let word_code_index = WordCodeIndex::from_raw(raw, instr_pc, instr_word_len);
         Self {
             raw,
             lowering: PendingLoweringState::new(raw_instr_count),
             pending_methods: PendingMethodHints::new(method_slots),
+            word_code_index,
         }
     }
 
@@ -119,12 +122,13 @@ impl<'a> ProtoLowerer<'a> {
 
                     if c != 0 {
                         self.pending_methods.clear();
-                        let target_raw = self.ensure_targetable_raw(raw_pc, raw_index + 2)?;
                         self.emit(
                             None,
                             vec![raw_index],
                             PendingLowInstr::Jump {
-                                target: TargetPlaceholder::Raw(target_raw),
+                                target: TargetPlaceholder::Raw(
+                                    self.ensure_targetable_pc(raw_pc, raw_pc + 2)?,
+                                ),
                             },
                         );
                     }
@@ -329,9 +333,7 @@ impl<'a> ProtoLowerer<'a> {
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Jump {
-                            target: TargetPlaceholder::Raw(
-                                self.jump_target(raw_pc, raw_index, sbx)?,
-                            ),
+                            target: TargetPlaceholder::Raw(self.jump_target(raw_pc, raw_pc, sbx)?),
                         },
                     );
                     raw_index += 1;
@@ -489,10 +491,13 @@ impl<'a> ProtoLowerer<'a> {
                             step: Reg(index.index() + 2),
                             binding: Reg(index.index() + 3),
                             body_target: TargetPlaceholder::Raw(
-                                self.jump_target(raw_pc, raw_index, sbx)?,
+                                self.jump_target(raw_pc, raw_pc, sbx)?,
                             ),
                             exit_target: TargetPlaceholder::Raw(
-                                self.ensure_targetable_raw(raw_pc, raw_index + 1)?,
+                                self.ensure_targetable_pc(
+                                    raw_pc,
+                                    next_raw_pc(self.raw, raw_index),
+                                )?,
                             ),
                         },
                     );
@@ -501,7 +506,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua51Opcode::ForPrep => {
                     self.pending_methods.clear();
                     let (a, sbx) = expect_asbx(raw_pc, opcode, operands)?;
-                    let target_raw = self.jump_target(raw_pc, raw_index, sbx)?;
+                    let target_raw = self.jump_target(raw_pc, raw_pc, sbx)?;
                     let target_opcode = opcode_at(self.raw, target_raw);
                     if target_opcode != Lua51Opcode::ForLoop {
                         return Err(TransformError::InvalidNumericForPair {
@@ -521,10 +526,16 @@ impl<'a> ProtoLowerer<'a> {
                             step: Reg(index.index() + 2),
                             binding: Reg(index.index() + 3),
                             body_target: TargetPlaceholder::Raw(
-                                self.ensure_targetable_raw(raw_pc, raw_index + 1)?,
+                                self.ensure_targetable_pc(
+                                    raw_pc,
+                                    next_raw_pc(self.raw, raw_index),
+                                )?,
                             ),
                             exit_target: TargetPlaceholder::Raw(
-                                self.ensure_targetable_raw(raw_pc, target_raw + 1)?,
+                                self.ensure_targetable_pc(
+                                    raw_pc,
+                                    next_raw_pc(self.raw, target_raw),
+                                )?,
                             ),
                         },
                     );
@@ -689,13 +700,8 @@ impl<'a> ProtoLowerer<'a> {
             |owner_raw, pending| self.resolve_pending_instr(owner_raw, pending),
             instr_pc,
             |raw_index| {
-                self.raw
-                    .common
-                    .debug_info
-                    .common
-                    .line_info
-                    .get(raw_index)
-                    .copied()
+                let pc = raw_pc_at(self.raw, raw_index) as usize;
+                self.raw.common.debug_info.common.line_info.get(pc).copied()
             },
         )
     }
@@ -714,8 +720,9 @@ impl<'a> ProtoLowerer<'a> {
         owner_pc: u32,
         target: TargetPlaceholder,
     ) -> Result<InstrRef, TransformError> {
-        self.lowering
-            .resolve_target(owner_pc, target, std::convert::identity)
+        self.lowering.resolve_target(owner_pc, target, |raw_index| {
+            raw_pc_at(self.raw, raw_index) as usize
+        })
     }
 
     fn emit(
@@ -763,36 +770,13 @@ impl<'a> ProtoLowerer<'a> {
         }
     }
 
-    fn jump_target(
-        &self,
-        raw_pc: u32,
-        raw_index: usize,
-        sbx: i32,
-    ) -> Result<usize, TransformError> {
-        let target = raw_index as i64 + 1 + i64::from(sbx);
-        if target < 0 || target >= self.raw.common.instructions.len() as i64 {
-            return Err(TransformError::InvalidJumpTarget {
-                raw_pc,
-                target_raw: target.max(0) as usize,
-                instr_count: self.raw.common.instructions.len(),
-            });
-        }
-        Ok(target as usize)
+    fn jump_target(&self, raw_pc: u32, base_pc: u32, sbx: i32) -> Result<usize, TransformError> {
+        let target_pc = i64::from(base_pc) + 1 + i64::from(sbx);
+        self.word_code_index.ensure_valid_jump_pc(raw_pc, target_pc)
     }
 
-    fn ensure_targetable_raw(
-        &self,
-        raw_pc: u32,
-        target_raw: usize,
-    ) -> Result<usize, TransformError> {
-        if target_raw >= self.raw.common.instructions.len() {
-            return Err(TransformError::InvalidJumpTarget {
-                raw_pc,
-                target_raw,
-                instr_count: self.raw.common.instructions.len(),
-            });
-        }
-        Ok(target_raw)
+    fn ensure_targetable_pc(&self, raw_pc: u32, target_pc: u32) -> Result<usize, TransformError> {
+        self.word_code_index.ensure_targetable_pc(raw_pc, target_pc)
     }
 
     fn helper_jump(
@@ -822,8 +806,9 @@ impl<'a> ProtoLowerer<'a> {
 
         Ok(HelperJump {
             helper_index,
-            jump_target: self.jump_target(helper_extra.pc, helper_index, helper_sbx)?,
-            fallthrough_target: self.ensure_targetable_raw(raw_pc, raw_index + 2)?,
+            jump_target: self.jump_target(helper_extra.pc, helper_extra.pc, helper_sbx)?,
+            fallthrough_target: self
+                .ensure_targetable_pc(raw_pc, next_raw_pc(self.raw, helper_index))?,
         })
     }
 }

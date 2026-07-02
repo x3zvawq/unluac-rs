@@ -747,13 +747,8 @@ impl<'a> ProtoLowerer<'a> {
             |owner_raw, pending| self.resolve_pending_instr(owner_raw, pending),
             instr_pc,
             |raw_index| {
-                self.raw
-                    .common
-                    .debug_info
-                    .common
-                    .line_info
-                    .get(raw_index)
-                    .copied()
+                let pc = raw_pc_at(self.raw, raw_index) as usize;
+                self.raw.common.debug_info.common.line_info.get(pc).copied()
             },
         )
     }
