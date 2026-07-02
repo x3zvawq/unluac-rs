@@ -43,17 +43,28 @@ impl<'a> AstLowerer<'a> {
         } else {
             None
         };
+        let mut captured_bindings = BTreeSet::new();
+        let mut captured_params = BTreeSet::new();
+        for capture in &closure.captures {
+            match &capture.value {
+                HirExpr::ParamRef(param) => {
+                    captured_params.insert(*param);
+                }
+                value => {
+                    if let Some(binding) = capture_binding_from_hir_expr(value) {
+                        captured_bindings.insert(binding);
+                    }
+                }
+            }
+        }
         Ok(AstFunctionExpr {
             function: closure.proto,
             params: child.params.clone(),
             is_vararg: child.signature.is_vararg,
             named_vararg,
             body,
-            captured_bindings: closure
-                .captures
-                .iter()
-                .filter_map(|capture| capture_binding_from_hir_expr(&capture.value))
-                .collect::<BTreeSet<_>>(),
+            captured_bindings,
+            captured_params,
         })
     }
 

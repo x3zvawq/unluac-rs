@@ -1,0 +1,23 @@
+-- unluac: expect-contains [[function p1_0.init(p2_0, p2_1)]]
+-- unluac: expect-contains [[local r2_0, r2_1 = p1_0:getLoc()]]
+-- unluac: expect-contains [[p2_0:setLoc(0, 0)]]
+-- unluac: expect-not-contains [[function p1_0:init(]]
+-- unluac: expect-contains [[function p1_0.read(p3_0)]]
+-- unluac: expect-not-contains [[unluac error]]
+
+local function install(obj)
+    obj.init = function(self, parent)
+        local x, y = obj:getLoc()
+        self:setLoc(0, 0)
+        self:setParent(parent)
+        return x, y
+    end
+
+    obj.read = function(self)
+        return self.value
+    end
+
+    return obj
+end
+
+return install

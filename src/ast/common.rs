@@ -175,6 +175,8 @@ pub struct AstFunctionExpr {
     /// 如果一个函数值仍然依赖某个局部槽位，就不能把那个槽位前推消掉，
     /// 否则像递归 local function 这种形状会失去可见声明。
     pub captured_bindings: BTreeSet<AstBindingRef>,
+    /// 同上，但记录被闭包捕获的当前函数参数。
+    pub captured_params: BTreeSet<ParamId>,
 }
 
 /// 顶层/表字段函数声明。

@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 
+use super::super::binding_ref::binding_from_name_ref;
 use crate::ast::common::{
     AstAssign, AstBindingRef, AstExpr, AstFunctionDecl, AstFunctionExpr, AstFunctionName,
     AstGlobalBindingTarget, AstGlobalDecl, AstLValue, AstLocalAttr, AstLocalDecl,
@@ -128,7 +129,10 @@ pub(super) fn function_decl_target_from_lvalue(
         AstLValue::Name(_) => None,
         AstLValue::FieldAccess(access) => {
             let (root, mut fields) = name_path_from_expr(&access.base)?;
-            if method_fields.contains(&access.field) && !func.params.is_empty() {
+            if method_fields.contains(&access.field)
+                && !func.params.is_empty()
+                && !function_captures_name_path_root(func, &root)
+            {
                 return Some((
                     AstFunctionName::Method(AstNamePath { root, fields }, access.field.clone()),
                     func.clone(),
@@ -141,6 +145,14 @@ pub(super) fn function_decl_target_from_lvalue(
             ))
         }
         AstLValue::IndexAccess(_) => None,
+    }
+}
+
+fn function_captures_name_path_root(func: &AstFunctionExpr, root: &AstNameRef) -> bool {
+    match root {
+        AstNameRef::Param(param) => func.captured_params.contains(param),
+        _ => binding_from_name_ref(root)
+            .is_some_and(|binding| func.captured_bindings.contains(&binding)),
     }
 }
 
