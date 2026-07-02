@@ -285,159 +285,85 @@ where
     }
 
     match expr {
-        AstExpr::Unary(unary) => Some(AstExpr::Unary(Box::new(AstUnaryExpr {
-            op: unary.op,
-            expr: rewrite_method_call_expr_nested(&unary.expr, try_rewrite_here)?,
-        }))),
-        AstExpr::Binary(binary) => {
-            let lhs = rewrite_method_call_expr_nested(&binary.lhs, try_rewrite_here)
-                .unwrap_or(binary.lhs.clone());
-            let rhs = rewrite_method_call_expr_nested(&binary.rhs, try_rewrite_here)
-                .unwrap_or(binary.rhs.clone());
-            if lhs == binary.lhs && rhs == binary.rhs {
-                None
-            } else {
-                Some(AstExpr::Binary(Box::new(
-                    crate::ast::common::AstBinaryExpr {
-                        op: binary.op,
-                        lhs,
-                        rhs,
-                    },
-                )))
-            }
-        }
-        AstExpr::LogicalAnd(logical) => {
-            let lhs = rewrite_method_call_expr_nested(&logical.lhs, try_rewrite_here)
-                .unwrap_or(logical.lhs.clone());
-            let rhs = rewrite_method_call_expr_nested(&logical.rhs, try_rewrite_here)
-                .unwrap_or(logical.rhs.clone());
-            if lhs == logical.lhs && rhs == logical.rhs {
-                None
-            } else {
-                Some(AstExpr::LogicalAnd(Box::new(AstLogicalExpr { lhs, rhs })))
-            }
-        }
-        AstExpr::LogicalOr(logical) => {
-            let lhs = rewrite_method_call_expr_nested(&logical.lhs, try_rewrite_here)
-                .unwrap_or(logical.lhs.clone());
-            let rhs = rewrite_method_call_expr_nested(&logical.rhs, try_rewrite_here)
-                .unwrap_or(logical.rhs.clone());
-            if lhs == logical.lhs && rhs == logical.rhs {
-                None
-            } else {
-                Some(AstExpr::LogicalOr(Box::new(AstLogicalExpr { lhs, rhs })))
-            }
-        }
-        AstExpr::Call(call) => {
-            if let Some(callee) = rewrite_method_call_expr_nested(&call.callee, try_rewrite_here) {
-                return Some(AstExpr::Call(Box::new(AstCallExpr {
-                    callee,
-                    args: call.args.clone(),
-                })));
-            }
-            for (index, arg) in call.args.iter().enumerate() {
-                let Some(rewritten_arg) = rewrite_method_call_expr_nested(arg, try_rewrite_here)
-                else {
-                    continue;
-                };
-                let mut args = call.args.clone();
-                args[index] = rewritten_arg;
-                return Some(AstExpr::Call(Box::new(AstCallExpr {
-                    callee: call.callee.clone(),
-                    args,
-                })));
-            }
-            None
-        }
-        AstExpr::MethodCall(call) => {
-            if let Some(receiver) =
-                rewrite_method_call_expr_nested(&call.receiver, try_rewrite_here)
-            {
-                return Some(AstExpr::MethodCall(Box::new(AstMethodCallExpr {
-                    receiver,
-                    method: call.method.clone(),
-                    args: call.args.clone(),
-                })));
-            }
-            for (index, arg) in call.args.iter().enumerate() {
-                let Some(rewritten_arg) = rewrite_method_call_expr_nested(arg, try_rewrite_here)
-                else {
-                    continue;
-                };
-                let mut args = call.args.clone();
-                args[index] = rewritten_arg;
-                return Some(AstExpr::MethodCall(Box::new(AstMethodCallExpr {
-                    receiver: call.receiver.clone(),
-                    method: call.method.clone(),
-                    args,
-                })));
-            }
-            None
-        }
-        AstExpr::FieldAccess(access) => Some(AstExpr::FieldAccess(Box::new(AstFieldAccess {
-            base: rewrite_method_call_expr_nested(&access.base, try_rewrite_here)?,
-            field: access.field.clone(),
-        }))),
-        AstExpr::IndexAccess(access) => {
-            if let Some(base) = rewrite_method_call_expr_nested(&access.base, try_rewrite_here) {
-                return Some(AstExpr::IndexAccess(Box::new(AstIndexAccess {
-                    base,
-                    index: access.index.clone(),
-                })));
-            }
-            Some(AstExpr::IndexAccess(Box::new(AstIndexAccess {
-                base: access.base.clone(),
-                index: rewrite_method_call_expr_nested(&access.index, try_rewrite_here)?,
+        AstExpr::Unary(unary) => {
+            let (expr, changed) = rewrite_child_expr(&unary.expr, try_rewrite_here);
+            changed.then_some(AstExpr::Unary(Box::new(AstUnaryExpr {
+                op: unary.op,
+                expr,
             })))
         }
-        AstExpr::SingleValue(inner) => Some(AstExpr::SingleValue(Box::new(
-            rewrite_method_call_expr_nested(inner, try_rewrite_here)?,
-        ))),
+        AstExpr::Binary(binary) => {
+            let (lhs, lhs_changed) = rewrite_child_expr(&binary.lhs, try_rewrite_here);
+            let (rhs, rhs_changed) = rewrite_child_expr(&binary.rhs, try_rewrite_here);
+            (lhs_changed || rhs_changed).then_some(AstExpr::Binary(Box::new(
+                crate::ast::common::AstBinaryExpr {
+                    op: binary.op,
+                    lhs,
+                    rhs,
+                },
+            )))
+        }
+        AstExpr::LogicalAnd(logical) => {
+            let (lhs, lhs_changed) = rewrite_child_expr(&logical.lhs, try_rewrite_here);
+            let (rhs, rhs_changed) = rewrite_child_expr(&logical.rhs, try_rewrite_here);
+            (lhs_changed || rhs_changed)
+                .then_some(AstExpr::LogicalAnd(Box::new(AstLogicalExpr { lhs, rhs })))
+        }
+        AstExpr::LogicalOr(logical) => {
+            let (lhs, lhs_changed) = rewrite_child_expr(&logical.lhs, try_rewrite_here);
+            let (rhs, rhs_changed) = rewrite_child_expr(&logical.rhs, try_rewrite_here);
+            (lhs_changed || rhs_changed)
+                .then_some(AstExpr::LogicalOr(Box::new(AstLogicalExpr { lhs, rhs })))
+        }
+        AstExpr::Call(call) => {
+            let (callee, callee_changed) = rewrite_child_expr(&call.callee, try_rewrite_here);
+            let (args, args_changed) = rewrite_child_exprs(&call.args, try_rewrite_here);
+            (callee_changed || args_changed)
+                .then_some(AstExpr::Call(Box::new(AstCallExpr { callee, args })))
+        }
+        AstExpr::MethodCall(call) => {
+            let (receiver, receiver_changed) = rewrite_child_expr(&call.receiver, try_rewrite_here);
+            let (args, args_changed) = rewrite_child_exprs(&call.args, try_rewrite_here);
+            (receiver_changed || args_changed).then_some(AstExpr::MethodCall(Box::new(
+                AstMethodCallExpr {
+                    receiver,
+                    method: call.method.clone(),
+                    args,
+                },
+            )))
+        }
+        AstExpr::FieldAccess(access) => {
+            let (base, changed) = rewrite_child_expr(&access.base, try_rewrite_here);
+            changed.then_some(AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                base,
+                field: access.field.clone(),
+            })))
+        }
+        AstExpr::IndexAccess(access) => {
+            let (base, base_changed) = rewrite_child_expr(&access.base, try_rewrite_here);
+            let (index, index_changed) = rewrite_child_expr(&access.index, try_rewrite_here);
+            (base_changed || index_changed).then_some(AstExpr::IndexAccess(Box::new(
+                AstIndexAccess { base, index },
+            )))
+        }
+        AstExpr::SingleValue(inner) => {
+            let (expr, changed) = rewrite_child_expr(inner, try_rewrite_here);
+            changed.then_some(AstExpr::SingleValue(Box::new(expr)))
+        }
         AstExpr::TableConstructor(table) => {
-            table
+            let mut changed = false;
+            let fields = table
                 .fields
                 .iter()
-                .enumerate()
-                .find_map(|(index, field)| match field {
-                    AstTableField::Array(value) => {
-                        rewrite_method_call_expr_nested(value, try_rewrite_here).map(
-                            |rewritten_value| {
-                                rebuild_table_with_field(
-                                    table,
-                                    index,
-                                    AstTableField::Array(rewritten_value),
-                                )
-                            },
-                        )
-                    }
-                    AstTableField::Record(field) => {
-                        if let AstTableKey::Expr(key) = &field.key
-                            && let Some(rewritten_key) =
-                                rewrite_method_call_expr_nested(key, try_rewrite_here)
-                        {
-                            return Some(rebuild_table_with_field(
-                                table,
-                                index,
-                                AstTableField::Record(crate::ast::common::AstRecordField {
-                                    key: AstTableKey::Expr(rewritten_key),
-                                    value: field.value.clone(),
-                                }),
-                            ));
-                        }
-                        rewrite_method_call_expr_nested(&field.value, try_rewrite_here).map(
-                            |rewritten_value| {
-                                rebuild_table_with_field(
-                                    table,
-                                    index,
-                                    AstTableField::Record(crate::ast::common::AstRecordField {
-                                        key: field.key.clone(),
-                                        value: rewritten_value,
-                                    }),
-                                )
-                            },
-                        )
-                    }
+                .map(|field| {
+                    let (rewritten, field_changed) = rewrite_table_field(field, try_rewrite_here);
+                    changed |= field_changed;
+                    rewritten
                 })
+                .collect::<Vec<_>>();
+            changed.then_some(AstExpr::TableConstructor(Box::new(AstTableConstructor {
+                fields,
+            })))
         }
         AstExpr::Nil
         | AstExpr::Boolean(_)
@@ -451,6 +377,58 @@ where
         | AstExpr::VarArg
         | AstExpr::FunctionExpr(_)
         | AstExpr::Error(_) => None,
+    }
+}
+
+fn rewrite_child_expr<F>(expr: &AstExpr, try_rewrite_here: F) -> (AstExpr, bool)
+where
+    F: Fn(&AstExpr) -> Option<AstExpr> + Copy,
+{
+    match rewrite_method_call_expr_nested(expr, try_rewrite_here) {
+        Some(rewritten) => (rewritten, true),
+        None => (expr.clone(), false),
+    }
+}
+
+fn rewrite_child_exprs<F>(exprs: &[AstExpr], try_rewrite_here: F) -> (Vec<AstExpr>, bool)
+where
+    F: Fn(&AstExpr) -> Option<AstExpr> + Copy,
+{
+    let mut changed = false;
+    let rewritten = exprs
+        .iter()
+        .map(|expr| {
+            let (rewritten, expr_changed) = rewrite_child_expr(expr, try_rewrite_here);
+            changed |= expr_changed;
+            rewritten
+        })
+        .collect();
+    (rewritten, changed)
+}
+
+fn rewrite_table_field<F>(field: &AstTableField, try_rewrite_here: F) -> (AstTableField, bool)
+where
+    F: Fn(&AstExpr) -> Option<AstExpr> + Copy,
+{
+    match field {
+        AstTableField::Array(value) => {
+            let (value, changed) = rewrite_child_expr(value, try_rewrite_here);
+            (AstTableField::Array(value), changed)
+        }
+        AstTableField::Record(field) => {
+            let (key, key_changed) = match &field.key {
+                AstTableKey::Expr(key) => {
+                    let (key, changed) = rewrite_child_expr(key, try_rewrite_here);
+                    (AstTableKey::Expr(key), changed)
+                }
+                AstTableKey::Name(name) => (AstTableKey::Name(name.clone()), false),
+            };
+            let (value, value_changed) = rewrite_child_expr(&field.value, try_rewrite_here);
+            (
+                AstTableField::Record(crate::ast::common::AstRecordField { key, value }),
+                key_changed || value_changed,
+            )
+        }
     }
 }
 
@@ -574,14 +552,4 @@ fn rewrite_single_expr_sink_stmt(
         | AstStmt::Label(_)
         | AstStmt::Error(_) => None,
     }
-}
-
-fn rebuild_table_with_field(
-    table: &AstTableConstructor,
-    index: usize,
-    rewritten_field: AstTableField,
-) -> AstExpr {
-    let mut fields = table.fields.clone();
-    fields[index] = rewritten_field;
-    AstExpr::TableConstructor(Box::new(AstTableConstructor { fields }))
 }
