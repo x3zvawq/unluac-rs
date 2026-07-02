@@ -102,6 +102,7 @@ impl ProtoBindings {
 }
 
 pub(super) struct ProtoLowering<'a> {
+    pub(super) target: AstTargetDialect,
     pub(super) proto: &'a LoweredProto,
     pub(super) cfg: &'a Cfg,
     pub(super) graph_facts: &'a GraphFacts,
@@ -180,6 +181,7 @@ fn lower_proto_node(
     let bindings = build_bindings(proto, cfg, dataflow, structure);
     let dead_phis = dataflow.compute_truly_dead_phis(cfg);
     let lowering = ProtoLowering {
+        target,
         proto,
         cfg,
         graph_facts,

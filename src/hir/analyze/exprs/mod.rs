@@ -10,6 +10,7 @@ mod defs;
 mod packs;
 mod regs;
 
+use crate::ast::is_lua_identifier_name;
 use crate::hir::common::{
     HirBinaryExpr, HirBinaryOpKind, HirCallExpr, HirCapture, HirClosureExpr, HirExpr, HirGlobalRef,
     HirLValue, HirTableAccess, HirUnaryExpr, HirUnaryOpKind, UpvalueId,
@@ -124,7 +125,7 @@ fn expr_for_open_def_single_eval(
     let instr = lowering.proto.instrs.get(open_def.instr.index())?;
     match instr {
         LowInstr::Call(call) if matches!(call.results, ResultPack::Open(_)) => {
-            let method_name = lower_method_name(lowering.proto, call.method_name);
+            let method_name = lower_method_name(lowering, call.method_name);
             let is_method_sugar = matches!(call.kind, CallKind::Method) && method_name.is_some();
             let callee = if is_method_sugar {
                 HirExpr::Nil
@@ -191,12 +192,21 @@ fn reg_in_range(range: crate::transformer::RegRange, reg: Reg) -> bool {
 }
 
 pub(super) fn lower_method_name(
-    proto: &LoweredProto,
+    lowering: &ProtoLowering<'_>,
     method_name: Option<MethodNameHint>,
 ) -> Option<String> {
     let const_ref = method_name?.const_ref;
-    match proto.constants.common.literals.get(const_ref.index()) {
-        Some(RawLiteralConst::String(value)) => Some(decode_raw_string(value)),
+    match lowering
+        .proto
+        .constants
+        .common
+        .literals
+        .get(const_ref.index())
+    {
+        Some(RawLiteralConst::String(value)) => {
+            let name = decode_raw_string(value);
+            is_lua_identifier_name(&name, lowering.target.version).then_some(name)
+        }
         _ => None,
     }
 }

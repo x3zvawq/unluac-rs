@@ -231,7 +231,7 @@ fn expr_for_fixed_call(
         return None;
     }
 
-    let method_name = lower_method_name(lowering.proto, call.method_name);
+    let method_name = lower_method_name(lowering, call.method_name);
     let is_method_sugar = matches!(call.kind, CallKind::Method) && method_name.is_some();
     let callee = if is_method_sugar {
         HirExpr::Nil

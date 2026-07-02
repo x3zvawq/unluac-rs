@@ -29,8 +29,8 @@ use crate::hir::common::{
 };
 use crate::structure::BlockRef;
 use crate::transformer::{
-    AccessKey, CallKind, GenericForCallInstr, GenericForLoopInstr, InstrRef, LowInstr, Reg,
-    ResultPack,
+    AccessKey, CallKind, GenericForCallInstr, GenericForLoopInstr, InstrRef, LowInstr,
+    MethodNameHint, Reg, ResultPack,
 };
 
 pub(super) fn lower_regular_instr(
@@ -125,15 +125,7 @@ pub(super) fn lower_regular_instr(
             // 字符串（理论上不会出现，但保险），依然按普通表访问发射。
             if get_table.method_load
                 && let AccessKey::Const(const_ref) = get_table.key
-                && matches!(
-                    lowering
-                        .proto
-                        .constants
-                        .common
-                        .literals
-                        .get(const_ref.index()),
-                    Some(crate::parser::RawLiteralConst::String(_))
-                )
+                && lower_method_name(lowering, Some(MethodNameHint { const_ref })).is_some()
             {
                 Vec::new()
             } else {
@@ -193,7 +185,7 @@ pub(super) fn lower_regular_instr(
         LowInstr::Call(call) => lower_call(lowering, block, instr_ref, call),
         LowInstr::TailCall(tail_call) => {
             // TailCall 总是展开所有返回值
-            let method_name = lower_method_name(lowering.proto, tail_call.method_name);
+            let method_name = lower_method_name(lowering, tail_call.method_name);
             let is_method_sugar =
                 matches!(tail_call.kind, CallKind::Method) && method_name.is_some();
             let callee = if is_method_sugar {
@@ -340,7 +332,7 @@ pub(super) fn lower_control_instr(
             )]
         }
         LowInstr::TailCall(tail_call) => {
-            let method_name = lower_method_name(lowering.proto, tail_call.method_name);
+            let method_name = lower_method_name(lowering, tail_call.method_name);
             let is_method_sugar =
                 matches!(tail_call.kind, CallKind::Method) && method_name.is_some();
             let callee = if is_method_sugar {
@@ -539,7 +531,7 @@ fn lower_call(
     instr_ref: InstrRef,
     call: &crate::transformer::CallInstr,
 ) -> Vec<HirStmt> {
-    let method_name = lower_method_name(lowering.proto, call.method_name);
+    let method_name = lower_method_name(lowering, call.method_name);
     let is_method_sugar = matches!(call.kind, CallKind::Method) && method_name.is_some();
     // 当调用会被 AST 渲染成 `obj:method()` 糖时，AST 只读 args[0] 和
     // method_name，callee 被丢弃。这里直接把 callee 置为 Nil，从而让源自
