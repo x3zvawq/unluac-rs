@@ -284,7 +284,7 @@ fn format_expr(expr: &HirExpr) -> String {
         HirExpr::Boolean(value) => value.to_string(),
         HirExpr::Integer(value) => value.to_string(),
         HirExpr::Number(value) => value.to_string(),
-        HirExpr::String(value) => format!("{value:?}"),
+        HirExpr::String(value) => value.debug_literal(),
         HirExpr::Int64(value) => format!("{value}LL"),
         HirExpr::UInt64(value) => format!("{value}ULL"),
         HirExpr::Complex { real, imag } => format_complex_literal(*real, *imag),

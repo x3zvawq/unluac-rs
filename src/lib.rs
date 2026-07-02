@@ -10,8 +10,11 @@ pub mod debug;
 pub mod decompile;
 pub mod generate;
 pub mod hir;
+mod lua_string;
 pub mod parser;
 pub(crate) mod scheduler;
 pub mod structure;
 mod timing;
 pub mod transformer;
+
+pub use lua_string::LuaString;

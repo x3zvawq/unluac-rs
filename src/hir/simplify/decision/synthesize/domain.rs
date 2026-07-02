@@ -7,6 +7,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::LuaString;
 use crate::hir::common::{
     HirBinaryOpKind, HirDecisionExpr, HirDecisionNodeRef, HirDecisionTarget, HirExpr, LocalId,
     ParamId, TempId, UpvalueId,
@@ -30,7 +31,7 @@ pub(super) enum AbstractValue {
     True,
     Integer(i64),
     Number(u64),
-    String(String),
+    String(LuaString),
     Int64(i64),
     UInt64(u64),
     Complex { real_bits: u64, imag_bits: u64 },

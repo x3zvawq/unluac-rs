@@ -10,6 +10,7 @@ use crate::ast::{
     AstIndexAccess, AstLValue, AstMethodCallExpr, AstNamePath, AstNameRef, AstRecordField,
     AstTableConstructor, AstTableField, AstTableKey, AstUnaryOpKind,
 };
+use crate::decompile::DecompileDialect;
 use crate::generate::doc::Doc;
 use crate::hir::HirProtoRef;
 
@@ -99,7 +100,14 @@ impl<'a> Emitter<'a> {
                 PREC_LITERAL,
                 Assoc::Non,
             ),
-            AstExpr::Number(value) => (Doc::text(format_number(*value)), PREC_LITERAL, Assoc::Non),
+            AstExpr::Number(value) => (
+                Doc::text(format_number(
+                    *value,
+                    target_preserves_float_type(self.target.version),
+                )),
+                PREC_LITERAL,
+                Assoc::Non,
+            ),
             AstExpr::String(value) => (
                 Doc::text(format_string_literal(value, self.options.quote_style)),
                 PREC_LITERAL,
@@ -157,16 +165,17 @@ impl<'a> Emitter<'a> {
                         prec,
                         Assoc::Non,
                     )
+                } else if unary.op == AstUnaryOpKind::Neg
+                    && matches!(&unary.expr, AstExpr::Number(value) if *value == 0.0 && !value.is_sign_negative())
+                {
+                    (Doc::text("-0.0"), PREC_UNARY, Assoc::Right)
                 } else {
                     let prec = PREC_UNARY;
                     let inner = self.emit_expr(&unary.expr, function, prec, ExprSide::Right)?;
                     let op = match unary.op {
                         AstUnaryOpKind::Not => "not ",
-                        // 当 -(-x) 时直接拼接会产出 `--x`，而 `--` 在 Lua 中是行注释，
-                        // 因此检测到内层也是 Neg 时需要插入空格来打破歧义。
-                        AstUnaryOpKind::Neg if matches!(&unary.expr, AstExpr::Unary(inner) if inner.op == AstUnaryOpKind::Neg) => {
-                            "- "
-                        }
+                        // `--` 在 Lua 中是行注释；负数常量和内层取负都要插入空格。
+                        AstUnaryOpKind::Neg if neg_operand_starts_with_minus(&unary.expr) => "- ",
                         AstUnaryOpKind::Neg => "-",
                         AstUnaryOpKind::BitNot => "~",
                         AstUnaryOpKind::Length => "#",
@@ -418,5 +427,22 @@ impl<'a> Emitter<'a> {
             params.push(vararg);
         }
         Ok(self.emit_parenthesized_list(params))
+    }
+}
+
+fn target_preserves_float_type(dialect: DecompileDialect) -> bool {
+    matches!(
+        dialect,
+        DecompileDialect::Lua53 | DecompileDialect::Lua54 | DecompileDialect::Lua55
+    )
+}
+
+fn neg_operand_starts_with_minus(expr: &AstExpr) -> bool {
+    match expr {
+        AstExpr::Integer(value) => value.is_negative(),
+        AstExpr::Number(value) => value.is_sign_negative(),
+        AstExpr::Int64(value) => value.is_negative(),
+        AstExpr::Unary(unary) => unary.op == AstUnaryOpKind::Neg,
+        _ => false,
     }
 }

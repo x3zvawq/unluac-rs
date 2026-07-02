@@ -702,7 +702,7 @@ fn format_expr(expr: &AstExpr, indent: &str, names: &FunctionRenderNames) -> Str
         AstExpr::Boolean(value) => value.to_string(),
         AstExpr::Integer(value) => value.to_string(),
         AstExpr::Number(value) => value.to_string(),
-        AstExpr::String(value) => format!("{value:?}"),
+        AstExpr::String(value) => value.debug_literal(),
         AstExpr::Int64(value) => format!("{value}LL"),
         AstExpr::UInt64(value) => format!("{value}ULL"),
         AstExpr::Complex { real, imag } => format_complex_literal(*real, *imag),

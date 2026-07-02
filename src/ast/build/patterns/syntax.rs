@@ -212,7 +212,7 @@ fn lvalue_matches_global_name(target: &HirLValue, name: &str) -> bool {
     match target {
         HirLValue::Global(global) => global.name == name,
         HirLValue::TableAccess(access) => {
-            matches!(&access.key, HirExpr::String(key) if key == name)
+            matches!(&access.key, HirExpr::String(key) if key.as_utf8() == Some(name))
         }
         _ => false,
     }

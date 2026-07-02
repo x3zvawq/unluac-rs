@@ -59,7 +59,7 @@ pub(crate) fn expr_for_const(proto: &LoweredProto, const_ref: ConstRef) -> HirEx
         Some(RawLiteralConst::Boolean(value)) => HirExpr::Boolean(*value),
         Some(RawLiteralConst::Integer(value)) => HirExpr::Integer(*value),
         Some(RawLiteralConst::Number(value)) => HirExpr::Number(*value),
-        Some(RawLiteralConst::String(value)) => HirExpr::String(decode_raw_string(value)),
+        Some(RawLiteralConst::String(value)) => HirExpr::String(raw_lua_string(value)),
         Some(RawLiteralConst::Int64(value)) => HirExpr::Int64(*value),
         Some(RawLiteralConst::UInt64(value)) => HirExpr::UInt64(*value),
         Some(RawLiteralConst::Complex { real, imag }) => HirExpr::Complex {

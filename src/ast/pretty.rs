@@ -9,6 +9,7 @@ use super::common::{
     AstBinaryExpr, AstBinaryOpKind, AstExpr, AstTableField, AstTableKey, AstUnaryExpr,
     AstUnaryOpKind,
 };
+use crate::decompile::DecompileDialect;
 
 pub(crate) struct PreferredRelationalRender<'a> {
     pub(crate) lhs: &'a AstExpr,
@@ -69,6 +70,23 @@ pub(crate) fn is_default_numeric_for_step(step: &AstExpr) -> bool {
     match step {
         AstExpr::Integer(1) => true,
         AstExpr::Number(value) => *value == 1.0,
+        _ => false,
+    }
+}
+
+pub(crate) fn is_default_numeric_for_step_for_target(
+    step: &AstExpr,
+    dialect: DecompileDialect,
+) -> bool {
+    match step {
+        AstExpr::Integer(1) => true,
+        AstExpr::Number(value) => {
+            *value == 1.0
+                && !matches!(
+                    dialect,
+                    DecompileDialect::Lua53 | DecompileDialect::Lua54 | DecompileDialect::Lua55
+                )
+        }
         _ => false,
     }
 }

@@ -4,7 +4,7 @@
 //! 不会在这里补猜缺失的 global/function sugar。
 //! 例如：`AstStmt::GlobalDecl` 只有 AST 上确实存在时才会在这里输出对应声明。
 
-use crate::ast::pretty::is_default_numeric_for_step;
+use crate::ast::pretty::is_default_numeric_for_step_for_target;
 use crate::ast::{
     AstAssign, AstBlock, AstCallStmt, AstFeature, AstFunctionDecl, AstGenericFor, AstGlobalDecl,
     AstIf, AstLabel, AstLocalDecl, AstLocalFunctionDecl, AstNumericFor, AstRepeat, AstReturn,
@@ -257,7 +257,7 @@ impl<'a> Emitter<'a> {
             Doc::text(", "),
             limit,
         ];
-        if !is_default_numeric_for_step(&numeric_for.step) {
+        if !is_default_numeric_for_step_for_target(&numeric_for.step, self.target.version) {
             header_parts.push(Doc::text(", "));
             header_parts.push(self.emit_expr(
                 &numeric_for.step,

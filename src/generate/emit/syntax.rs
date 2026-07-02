@@ -4,6 +4,7 @@
 //! 不会在这里改变表达式语义。
 //! 例如：当子表达式优先级不足时，这里会决定是否补上一层括号。
 
+use crate::LuaString;
 use crate::ast::{AstBinaryOpKind, AstGlobalAttr, AstGlobalBinding, AstLabelId};
 use crate::generate::common::{NumberFormat, QuoteStyle};
 use crate::generate::doc::Doc;
@@ -75,7 +76,7 @@ pub(super) fn format_label_name(label: AstLabelId) -> String {
     format!("L{}", label.index())
 }
 
-pub(super) fn format_number(value: f64) -> String {
+pub(super) fn format_number(value: f64, preserve_integral_float: bool) -> String {
     if value.is_nan() {
         return "(0/0)".to_owned();
     }
@@ -86,11 +87,20 @@ pub(super) fn format_number(value: f64) -> String {
             "(1/0)".to_owned()
         };
     }
-    value.to_string()
+    if value == 0.0 && value.is_sign_negative() {
+        return "-0.0".to_owned();
+    }
+    let rendered = value.to_string();
+    if !preserve_integral_float || rendered.contains(['.', 'e', 'E']) {
+        rendered
+    } else {
+        format!("{rendered}.0")
+    }
 }
 
 pub(super) fn format_integer(value: i64, number_format: NumberFormat) -> String {
     match number_format {
+        NumberFormat::Decimal if value == i64::MIN => format_signed_hex(value),
         NumberFormat::Decimal => value.to_string(),
         NumberFormat::Hex => format_signed_hex(value),
     }
@@ -113,16 +123,23 @@ fn format_signed_hex(value: i64) -> String {
 
 pub(super) fn format_complex_literal(real: f64, imag: f64) -> String {
     if real == 0.0 {
-        return format!("{}i", format_number(imag));
+        return format!("{}i", format_number(imag, false));
     }
-    let imag_abs = format_number(imag.abs());
+    let imag_abs = format_number(imag.abs(), false);
     let imag_sign = if imag.is_sign_negative() { "-" } else { "+" };
-    format!("({} {} {}i)", format_number(real), imag_sign, imag_abs)
+    format!(
+        "({} {} {}i)",
+        format_number(real, false),
+        imag_sign,
+        imag_abs
+    )
 }
 
-pub(super) fn format_string_literal(value: &str, quote_style: QuoteStyle) -> String {
-    if value.contains(['\n', '\r']) {
-        return format_long_bracket_string(value);
+pub(super) fn format_string_literal(value: &LuaString, quote_style: QuoteStyle) -> String {
+    if let Some(text) = value.preferred_text().or_else(|| value.as_utf8())
+        && can_use_long_bracket_string(text)
+    {
+        return format_long_bracket_string(text);
     }
 
     let candidates = match quote_style {
@@ -141,24 +158,71 @@ pub(super) fn format_string_literal(value: &str, quote_style: QuoteStyle) -> Str
     };
     let mut rendered = String::new();
     rendered.push(preferred);
-    for ch in value.chars() {
+    push_quoted_string_body(&mut rendered, value, preferred);
+    rendered.push(preferred);
+    rendered
+}
+
+fn push_quoted_string_body(rendered: &mut String, value: &LuaString, quote: char) {
+    if let Some(text) = value.preferred_text().or_else(|| value.as_utf8()) {
+        push_utf8_string_body(rendered, text, quote);
+    } else {
+        push_byte_string_body(rendered, value.as_bytes(), quote);
+    }
+}
+
+fn push_utf8_string_body(rendered: &mut String, text: &str, quote: char) {
+    for ch in text.chars() {
         match ch {
             '\n' => rendered.push_str("\\n"),
             '\r' => rendered.push_str("\\r"),
             '\t' => rendered.push_str("\\t"),
             '\\' => rendered.push_str("\\\\"),
-            c if c == preferred => {
+            c if c == quote => {
                 rendered.push('\\');
                 rendered.push(c);
             }
             c if c.is_control() => {
-                rendered.push_str(&format!("\\{:03}", c as u32));
+                push_escaped_utf8_bytes(rendered, c);
             }
             c => rendered.push(c),
         }
     }
-    rendered.push(preferred);
-    rendered
+}
+
+fn push_byte_string_body(rendered: &mut String, bytes: &[u8], quote: char) {
+    for byte in bytes {
+        match *byte {
+            b'\n' => rendered.push_str("\\n"),
+            b'\r' => rendered.push_str("\\r"),
+            b'\t' => rendered.push_str("\\t"),
+            b'\\' => rendered.push_str("\\\\"),
+            b if char::from(b) == quote => {
+                rendered.push('\\');
+                rendered.push(char::from(b));
+            }
+            0x20..=0x7e => rendered.push(char::from(*byte)),
+            byte => push_decimal_escape(rendered, byte),
+        }
+    }
+}
+
+fn push_escaped_utf8_bytes(rendered: &mut String, ch: char) {
+    let mut bytes = [0; 4];
+    for byte in ch.encode_utf8(&mut bytes).as_bytes() {
+        push_decimal_escape(rendered, *byte);
+    }
+}
+
+fn push_decimal_escape(rendered: &mut String, byte: u8) {
+    rendered.push('\\');
+    rendered.push(char::from(b'0' + byte / 100));
+    rendered.push(char::from(b'0' + byte / 10 % 10));
+    rendered.push(char::from(b'0' + byte % 10));
+}
+
+fn can_use_long_bracket_string(value: &str) -> bool {
+    value.contains('\n') && !value.starts_with('\n') && !value.contains('\r')
 }
 
 fn format_long_bracket_string(value: &str) -> String {
@@ -178,14 +242,26 @@ fn long_bracket_eqs(value: &str) -> String {
     unreachable!("unbounded search over bracket delimiters should always terminate")
 }
 
-fn escape_cost(value: &str, quote: char) -> usize {
+fn escape_cost(value: &LuaString, quote: char) -> usize {
+    if let Some(text) = value.preferred_text().or_else(|| value.as_utf8()) {
+        return text
+            .chars()
+            .map(|ch| match ch {
+                '\n' | '\r' | '\t' | '\\' => 2,
+                c if c == quote => 2,
+                c if c.is_control() => c.len_utf8() * 4,
+                _ => ch.len_utf8(),
+            })
+            .sum();
+    }
     value
-        .chars()
-        .map(|ch| match ch {
-            '\n' | '\r' | '\t' | '\\' => 2,
-            c if c == quote => 2,
-            c if c.is_control() => 4,
-            _ => 1,
+        .as_bytes()
+        .iter()
+        .map(|byte| match *byte {
+            b'\n' | b'\r' | b'\t' | b'\\' => 2,
+            b if char::from(b) == quote => 2,
+            0x20..=0x7e => 1,
+            _ => 4,
         })
         .sum()
 }

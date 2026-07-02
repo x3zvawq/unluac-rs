@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::LuaString;
 use crate::hir::common::{
     HirBinaryOpKind, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget,
     HirExpr, HirUnaryOpKind,
@@ -43,7 +44,7 @@ enum TruthFactExprKey {
     Boolean(bool),
     Integer(i64),
     Number(u64),
-    String(String),
+    String(LuaString),
     Int64(i64),
     UInt64(u64),
     Complex { real_bits: u64, imag_bits: u64 },

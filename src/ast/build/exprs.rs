@@ -360,7 +360,10 @@ fn lower_binary_op(op: HirBinaryOpKind) -> AstBinaryOpKind {
 
 fn field_name_from_key(key: &HirExpr, dialect: DecompileDialect) -> Option<String> {
     match key {
-        HirExpr::String(name) if is_lua_identifier_name(name, dialect) => Some(name.clone()),
+        HirExpr::String(name) => {
+            let name = name.as_utf8()?;
+            is_lua_identifier_name(name, dialect).then(|| name.to_owned())
+        }
         _ => None,
     }
 }

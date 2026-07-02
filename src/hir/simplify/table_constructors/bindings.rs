@@ -39,9 +39,10 @@ pub(super) fn matches_binding_ref(expr: &HirExpr, binding: TableBinding) -> bool
 
 pub(super) fn table_key_from_expr(expr: &HirExpr, dialect: DecompileDialect) -> HirTableKey {
     if let HirExpr::String(name) = expr
+        && let Some(name) = name.as_utf8()
         && is_lua_identifier_name(name, dialect)
     {
-        return HirTableKey::Name(name.clone());
+        return HirTableKey::Name(name.to_owned());
     }
     HirTableKey::Expr(expr.clone())
 }

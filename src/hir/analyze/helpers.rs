@@ -124,6 +124,10 @@ pub(super) fn decode_raw_string(raw: &crate::parser::RawString) -> String {
         .unwrap_or_else(|| String::from_utf8_lossy(&raw.bytes).into_owned())
 }
 
+pub(super) fn raw_lua_string(raw: &crate::parser::RawString) -> crate::LuaString {
+    crate::LuaString::from_raw(raw)
+}
+
 pub(super) fn empty_proto(id: HirProtoRef) -> HirProto {
     HirProto {
         id,

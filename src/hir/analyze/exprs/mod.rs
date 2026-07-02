@@ -46,7 +46,7 @@ pub(super) use self::regs::{
 };
 use self::regs::{expr_for_reg_use_inline, expr_for_reg_use_single_eval_with_call_policy};
 use super::ProtoLowering;
-use super::helpers::{concat_expr, decode_raw_string, unresolved_expr};
+use super::helpers::{concat_expr, decode_raw_string, raw_lua_string, unresolved_expr};
 
 /// `Open(start)` 不是“只有一个开放尾值”，而是“从 start 到 top 的整段值包”。
 ///

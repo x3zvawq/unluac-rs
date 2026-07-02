@@ -9,6 +9,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::LuaString;
 use crate::decompile::DecompileDialect;
 use crate::hir::{HirLabelId, HirProtoRef, LocalId, ParamId, TempId, UpvalueId};
 use strum_macros::{Display, IntoStaticStr};
@@ -67,7 +68,7 @@ pub enum AstExpr {
     Boolean(bool),
     Integer(i64),
     Number(f64),
-    String(String),
+    String(LuaString),
     Int64(i64),
     UInt64(u64),
     Complex {

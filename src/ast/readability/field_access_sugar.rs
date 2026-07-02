@@ -53,14 +53,15 @@ fn field_access_from_index(
     access: &AstIndexAccess,
     dialect: DecompileDialect,
 ) -> Option<AstFieldAccess> {
-    let AstExpr::String(field) = &access.index else {
+    let AstExpr::String(field_value) = &access.index else {
         return None;
     };
+    let field = field_value.as_utf8()?;
     if !is_lua_identifier_name(field, dialect) {
         return None;
     }
     Some(AstFieldAccess {
         base: access.base.clone(),
-        field: field.clone(),
+        field: field.to_owned(),
     })
 }
