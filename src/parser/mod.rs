@@ -4,7 +4,12 @@
 //! 主 pipeline 的 Parse stage 入口也在这里落点，由 parser 自己按已解析的 `DecompileDialect` 分派。
 //! 具体某个 dialect 的 parser 本体与专属枚举都放到子目录里，避免公共层被单个版本的细节持续污染。
 
+#[cfg(feature = "decompile-debug")]
 mod debug;
+#[cfg(not(feature = "decompile-debug"))]
+mod debug {
+    crate::debug::define_unavailable_stage_dump!(dump_parser);
+}
 mod dialect;
 mod error;
 mod family;

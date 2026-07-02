@@ -2,6 +2,7 @@
 
 mod build;
 mod common;
+#[cfg(feature = "decompile-debug")]
 mod debug;
 mod error;
 mod features;
@@ -23,6 +24,13 @@ pub use common::{
     AstSyntheticLocalId, AstTableConstructor, AstTableField, AstTableKey, AstTargetDialect,
     AstUnaryExpr, AstUnaryOpKind, AstWhile,
 };
+#[cfg(feature = "decompile-debug")]
+pub use debug::dump_ast;
+#[cfg(not(feature = "decompile-debug"))]
+mod debug {
+    crate::debug::define_unavailable_stage_dump!(dump_ast);
+}
+#[cfg(not(feature = "decompile-debug"))]
 pub use debug::dump_ast;
 pub use error::AstLowerError;
 pub(crate) use features::collect_ast_features;

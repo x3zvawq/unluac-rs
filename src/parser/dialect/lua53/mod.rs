@@ -4,10 +4,12 @@
 //! 校验、改了字符串长度编码，还新增了一组位运算 opcode；这些差异应该显式落在
 //! 版本目录里，而不是继续塞回共享层。
 
+#[cfg(feature = "decompile-debug")]
 mod debug;
 mod parser;
 mod raw;
 
+#[cfg(feature = "decompile-debug")]
 pub(crate) use debug::dump_chunk;
 pub(crate) use parser::Lua53Parser;
 pub use raw::*;

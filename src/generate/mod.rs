@@ -5,6 +5,7 @@
 //! 分开，所以内部采用 `AST -> Doc -> String` 的两步结构。
 
 mod common;
+#[cfg(feature = "decompile-debug")]
 mod debug;
 mod doc;
 mod emit;
@@ -15,6 +16,13 @@ pub use common::{
     GenerateChunkCommentMetadata, GenerateCommentMetadata, GenerateFunctionCommentMetadata,
     GenerateMode, GenerateOptions, GeneratedChunk, NumberFormat, QuoteStyle, TableStyle,
 };
+#[cfg(feature = "decompile-debug")]
+pub use debug::dump_generate;
+#[cfg(not(feature = "decompile-debug"))]
+mod debug {
+    crate::debug::define_unavailable_stage_dump!(dump_generate);
+}
+#[cfg(not(feature = "decompile-debug"))]
 pub use debug::dump_generate;
 pub(crate) use emit::generate_chunk;
 pub use error::GenerateError;

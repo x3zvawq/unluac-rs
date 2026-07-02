@@ -8,9 +8,11 @@
 //! 在 `focus` 子模块中，每一层 dump 通过同一套 helper 决定哪些 proto 完整输出、
 //! 哪些以 summary 行占位。
 
+#[cfg(any(feature = "decompile-debug", feature = "timing-report"))]
 mod colorize;
 mod focus;
 
+#[cfg(any(feature = "decompile-debug", feature = "timing-report"))]
 pub(crate) use colorize::colorize_debug_text;
 pub use focus::{
     FocusPlan, FocusRequest, ProtoDepth, ProtoNode, ProtoSummaryRow, build_proto_nodes,
@@ -22,6 +24,7 @@ pub use focus::{
 /// 各业务层在自己的 `debug.rs` 里声明 stage dump：启用 `decompile-debug` 时从
 /// `DecompileState` 读取本层产物并渲染文本；禁用时只保留同签名空实现，避免 wasm
 /// 入口把调试渲染逻辑作为可用能力暴露出去。
+#[cfg(feature = "decompile-debug")]
 macro_rules! define_stage_dump {
     (
         $(
@@ -55,9 +58,31 @@ macro_rules! define_stage_dump {
     };
 }
 
+#[cfg(feature = "decompile-debug")]
 pub(crate) use define_stage_dump;
 
-use std::{fmt, io::IsTerminal};
+/// 生成关闭 `decompile-debug` feature 时的阶段 dump stub。
+///
+/// wasm/JS 这类发布入口不暴露调试渲染能力；只保留同签名函数，让主 pipeline
+/// 不需要为 feature 组合复制阶段表。
+#[cfg(not(feature = "decompile-debug"))]
+macro_rules! define_unavailable_stage_dump {
+    ($name:ident) => {
+        pub fn $name(
+            _state: &$crate::decompile::DecompileState,
+            _options: &$crate::decompile::DebugOptions,
+        ) -> Result<$crate::decompile::StageDebugOutput, $crate::decompile::DecompileError> {
+            Err($crate::decompile::DecompileError::DebugUnavailable)
+        }
+    };
+}
+
+#[cfg(not(feature = "decompile-debug"))]
+pub(crate) use define_unavailable_stage_dump;
+
+use std::fmt;
+#[cfg(any(feature = "decompile-debug", feature = "timing-report"))]
+use std::io::IsTerminal;
 use strum_macros::{Display, EnumString, IntoStaticStr};
 
 /// 调试输出详细程度。
@@ -80,6 +105,7 @@ pub enum DebugColorMode {
     Never,
 }
 
+#[cfg(any(feature = "decompile-debug", feature = "timing-report"))]
 impl DebugColorMode {
     pub(crate) fn enabled(self) -> bool {
         match self {

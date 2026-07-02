@@ -4,10 +4,12 @@
 //! / `EXTRAARG`、`GETTABUP` / `SETTABUP` 等规则都已经出现实质差异，所以继续保留
 //! 独立版本目录，让差异显式落在这里。
 
+#[cfg(feature = "decompile-debug")]
 mod debug;
 mod parser;
 mod raw;
 
+#[cfg(feature = "decompile-debug")]
 pub(crate) use debug::dump_chunk;
 pub(crate) use parser::Lua52Parser;
 pub use raw::*;

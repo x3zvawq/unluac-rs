@@ -266,30 +266,20 @@ pub(crate) fn make_readable_module(
 ) -> AstModule {
     let mut module = module.clone();
     let context = ReadabilityContext { target, options };
-    let dump_active = !dump_passes.is_empty();
 
     run_invalidation_loop(
         PASS_DESCRIPTORS,
         |index, name| {
-            // 如果当前 pass 在 dump 列表中，先快照 before
-            let before_snapshot = if dump_active && dump_passes.iter().any(|p| p == name) {
-                Some(super::debug::dump_ast_snapshot(&module))
-            } else {
-                None
-            };
+            // 如果当前 pass 在 dump 列表中，先快照 before。关闭 debug feature 的构建
+            // 不编译 AST renderer，因此这里会退化成 None。
+            let before_snapshot = capture_ast_snapshot_if_requested(&module, dump_passes, name);
 
             let changed =
                 timings.record(name, || (PASS_ENTRIES[index].apply)(&mut module, context));
 
             // pass 产生变化时输出 before/after diff
             if let Some(before) = before_snapshot.filter(|_| changed) {
-                let after = super::debug::dump_ast_snapshot(&module);
-                eprintln!("=== [readability] pass={name} CHANGED ===");
-                eprintln!("--- before ---");
-                eprint!("{before}");
-                eprintln!("--- after ---");
-                eprint!("{after}");
-                eprintln!("=== end ===");
+                emit_ast_pass_diff_if_requested(name, before, &module);
             }
 
             changed
@@ -299,3 +289,44 @@ pub(crate) fn make_readable_module(
 
     module
 }
+
+#[cfg(feature = "decompile-debug")]
+type AstPassSnapshot = String;
+
+#[cfg(not(feature = "decompile-debug"))]
+type AstPassSnapshot = ();
+
+#[cfg(feature = "decompile-debug")]
+fn capture_ast_snapshot_if_requested(
+    module: &AstModule,
+    dump_passes: &[String],
+    pass_name: &str,
+) -> Option<AstPassSnapshot> {
+    dump_passes
+        .iter()
+        .any(|name| name == pass_name)
+        .then(|| super::debug::dump_ast_snapshot(module))
+}
+
+#[cfg(not(feature = "decompile-debug"))]
+fn capture_ast_snapshot_if_requested(
+    _module: &AstModule,
+    _dump_passes: &[String],
+    _pass_name: &str,
+) -> Option<AstPassSnapshot> {
+    None
+}
+
+#[cfg(feature = "decompile-debug")]
+fn emit_ast_pass_diff_if_requested(name: &str, before: AstPassSnapshot, module: &AstModule) {
+    let after = super::debug::dump_ast_snapshot(module);
+    eprintln!("=== [readability] pass={name} CHANGED ===");
+    eprintln!("--- before ---");
+    eprint!("{before}");
+    eprintln!("--- after ---");
+    eprint!("{after}");
+    eprintln!("=== end ===");
+}
+
+#[cfg(not(feature = "decompile-debug"))]
+fn emit_ast_pass_diff_if_requested(_name: &str, _before: AstPassSnapshot, _module: &AstModule) {}

@@ -6,6 +6,7 @@
 mod build;
 mod common;
 mod dataflow;
+#[cfg(feature = "decompile-debug")]
 mod debug;
 mod graph;
 
@@ -21,5 +22,6 @@ pub use common::{
 };
 pub(crate) use dataflow::analyze_dataflow;
 pub use dataflow::compute_dataflow_facts;
+#[cfg(feature = "decompile-debug")]
 pub(super) use debug::{dump_cfg_graph, dump_dataflow_facts, dump_graph_facts_tree};
 pub(crate) use graph::analyze_graph_facts;

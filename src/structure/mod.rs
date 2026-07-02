@@ -8,6 +8,7 @@ mod branch_values;
 mod branches;
 mod cfg;
 mod common;
+#[cfg(feature = "decompile-debug")]
 mod debug;
 mod goto;
 mod helpers;
@@ -34,4 +35,11 @@ pub use common::{
     ScopeKind, ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNode, ShortCircuitNodeRef,
     ShortCircuitTarget, ShortCircuitValueIncoming, StructureFacts,
 };
+#[cfg(feature = "decompile-debug")]
+pub use debug::dump_structure;
+#[cfg(not(feature = "decompile-debug"))]
+mod debug {
+    crate::debug::define_unavailable_stage_dump!(dump_structure);
+}
+#[cfg(not(feature = "decompile-debug"))]
 pub use debug::dump_structure;

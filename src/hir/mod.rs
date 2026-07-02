@@ -5,6 +5,7 @@
 
 mod analyze;
 mod common;
+#[cfg(feature = "decompile-debug")]
 mod debug;
 mod decision;
 mod expr_safety;
@@ -23,5 +24,12 @@ pub use common::{
     HirTableField, HirTableKey, HirTableSetList, HirToBeClosed, HirUnaryExpr, HirUnaryOpKind,
     HirUnresolvedExpr, HirUnstructured, HirWhile, LocalId, ParamId, TempId, UpvalueId,
 };
+#[cfg(feature = "decompile-debug")]
+pub use debug::dump_hir;
+#[cfg(not(feature = "decompile-debug"))]
+mod debug {
+    crate::debug::define_unavailable_stage_dump!(dump_hir);
+}
+#[cfg(not(feature = "decompile-debug"))]
 pub use debug::dump_hir;
 pub(crate) use simplify::synthesize_readable_pure_logical_expr;

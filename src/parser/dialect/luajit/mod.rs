@@ -2,10 +2,12 @@
 //!
 //! LuaJIT dump 协议与 PUC-Lua / Luau 都不同，因此保持独立 family 边界。
 
+#[cfg(feature = "decompile-debug")]
 mod debug;
 mod parser;
 mod raw;
 
+#[cfg(feature = "decompile-debug")]
 pub(crate) use debug::dump_chunk;
 pub(crate) use parser::LuaJitParser;
 pub use raw::*;

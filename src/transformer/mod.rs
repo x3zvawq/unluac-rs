@@ -4,10 +4,16 @@
 //! lowering 成统一 low-IR，并顺手建立后续排错所需的 lowering 映射。
 
 mod common;
+#[cfg(feature = "decompile-debug")]
 mod debug;
 mod dialect;
 mod error;
+mod format;
 mod operands;
+#[cfg(not(feature = "decompile-debug"))]
+mod debug {
+    crate::debug::define_unavailable_stage_dump!(dump_lir);
+}
 
 pub use common::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchInstr, BranchOperands,
@@ -20,8 +26,9 @@ pub use common::{
     ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr, TbcInstr,
     UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
-pub use debug::{dump_lir, format_low_instr};
+pub use debug::dump_lir;
 pub use error::TransformError;
+pub use format::format_low_instr;
 
 use crate::decompile::{DecompileContext, DecompileDialect, DecompileError, DecompileState};
 

@@ -152,6 +152,7 @@ impl DecompileState {
         require_stage_output(self.naming.as_ref(), DecompileStage::Ast)
     }
 
+    #[cfg(feature = "decompile-debug")]
     pub(crate) fn require_generated(&self) -> Result<&GeneratedChunk, DecompileError> {
         require_stage_output(self.generated.as_ref(), DecompileStage::Generate)
     }

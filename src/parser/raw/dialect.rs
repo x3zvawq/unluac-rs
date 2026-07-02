@@ -125,6 +125,7 @@ macro_rules! define_dialect_ref_accessors {
     ($enum:ident {$($method:ident => $variant:ident($ty:ty)),+ $(,)?}) => {
         impl $enum {
             $(
+                #[cfg_attr(not(feature = "decompile-debug"), allow(dead_code))]
                 pub(crate) fn $method(&self) -> Option<&$ty> {
                     if let Self::$variant(extra) = self {
                         Some(extra)

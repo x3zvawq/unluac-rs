@@ -197,18 +197,13 @@ pub(super) fn simplify_hir(
     dump_config: &PassDumpConfig,
 ) {
     let empty_facts = ProtoPromotionFacts::default();
-    let dump_active = !dump_config.pass_names.is_empty();
 
     run_invalidation_loop(
         PASS_DESCRIPTORS,
         |index, name| {
-            // 如果当前 pass 在 dump 列表中，先快照 before
-            let before_snapshots =
-                if dump_active && dump_config.pass_names.iter().any(|p| p == name) {
-                    Some(capture_hir_snapshots(module, &dump_config.filters))
-                } else {
-                    None
-                };
+            // 如果当前 pass 在 dump 列表中，先快照 before。关闭 debug feature 的构建
+            // 不编译 HIR renderer，因此这里会退化成 None。
+            let before_snapshots = capture_hir_snapshots_if_requested(module, dump_config, name);
 
             let changed = timings.record(name, || {
                 apply_proto_pass(module, |proto| {
@@ -244,7 +239,7 @@ pub(super) fn simplify_hir(
 
             // pass 产生变化时输出 before/after diff
             if let Some(before) = before_snapshots.filter(|_| changed) {
-                emit_hir_pass_diff(name, &before, module, &dump_config.filters);
+                emit_hir_pass_diff_if_requested(name, &before, module, &dump_config.filters);
             }
 
             changed
@@ -265,6 +260,35 @@ pub(super) fn simplify_hir(
     }
 }
 
+#[cfg(feature = "decompile-debug")]
+type HirPassSnapshots = Vec<(usize, String, bool)>;
+
+#[cfg(not(feature = "decompile-debug"))]
+type HirPassSnapshots = ();
+
+#[cfg(feature = "decompile-debug")]
+fn capture_hir_snapshots_if_requested(
+    module: &HirModule,
+    dump_config: &PassDumpConfig,
+    pass_name: &str,
+) -> Option<HirPassSnapshots> {
+    dump_config
+        .pass_names
+        .iter()
+        .any(|name| name == pass_name)
+        .then(|| capture_hir_snapshots(module, &dump_config.filters))
+}
+
+#[cfg(not(feature = "decompile-debug"))]
+fn capture_hir_snapshots_if_requested(
+    _module: &HirModule,
+    dump_config: &PassDumpConfig,
+    _pass_name: &str,
+) -> Option<HirPassSnapshots> {
+    let _ = dump_config.pass_names.len();
+    None
+}
+
 fn apply_proto_pass(
     module: &mut HirModule,
     mut pass: impl FnMut(&mut crate::hir::common::HirProto) -> bool,
@@ -281,6 +305,7 @@ fn apply_proto_pass(
 /// 返回值的第三个字段是“是否被 focus plan 归为 visible”；false 表示这个 proto
 /// 处于 elided 档位，下游 diff 只会在发生变化时打一行 `<elided>` 摘要。
 /// 完全不可见的 proto 不会进入返回数组。
+#[cfg(feature = "decompile-debug")]
 fn capture_hir_snapshots(module: &HirModule, filters: &DebugFilters) -> Vec<(usize, String, bool)> {
     let entries = super::debug::collect_hir_entries(module);
     let plan = super::debug::plan_focus(&entries, filters);
@@ -314,7 +339,8 @@ fn capture_hir_snapshots(module: &HirModule, filters: &DebugFilters) -> Vec<(usi
 /// 可见 proto 打印完整 before/after；elided proto 只打一行 `<elided>` 摘要标记
 /// `=== [hir] pass=X proto#N CHANGED (elided) <summary> === end ===`，避免击穿用户
 /// 没有要求关注的下层 proto 细节。
-fn emit_hir_pass_diff(
+#[cfg(feature = "decompile-debug")]
+fn emit_hir_pass_diff_if_requested(
     pass_name: &str,
     before: &[(usize, String, bool)],
     module: &HirModule,
@@ -339,6 +365,15 @@ fn emit_hir_pass_diff(
             eprintln!("=== [hir] pass={pass_name} proto#{idx} CHANGED (elided) ===");
         }
     }
+}
+
+#[cfg(not(feature = "decompile-debug"))]
+fn emit_hir_pass_diff_if_requested(
+    _pass_name: &str,
+    _before: &HirPassSnapshots,
+    _module: &HirModule,
+    _filters: &DebugFilters,
+) {
 }
 
 pub(crate) use decision::synthesize_readable_pure_logical_expr;
