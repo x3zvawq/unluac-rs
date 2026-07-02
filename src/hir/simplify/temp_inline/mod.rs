@@ -65,12 +65,13 @@ fn inline_temps_in_block(
     inherited_captured_slots: &BTreeSet<HomeSlotKey>,
 ) -> bool {
     let mut changed = false;
-    let mut captured_slots_before_stmt = Vec::with_capacity(block.stmts.len());
+    let mut captured_slots_before_stmt =
+        CapturedSlotSnapshots::new(block.stmts.len(), inherited_captured_slots);
     let mut active_captured_slots = inherited_captured_slots.clone();
     let mut nested_protection = NestedTempProtection::new(&block.stmts);
 
     for index in 0..block.stmts.len() {
-        captured_slots_before_stmt.push(active_captured_slots.clone());
+        captured_slots_before_stmt.push(&active_captured_slots);
         let nested_protected = nested_protection.begin_stmt(index, protected_temps);
         let mut nested_captured_slots = active_captured_slots.clone();
         facts.collect_prefix_captured_home_slots_in_stmt(
@@ -187,14 +188,41 @@ fn captured_slots_before_stmts(
     block: &HirBlock,
     facts: &ProtoPromotionFacts,
     inherited_captured_slots: &BTreeSet<HomeSlotKey>,
-) -> Vec<BTreeSet<HomeSlotKey>> {
-    let mut captured_slots = Vec::with_capacity(block.stmts.len());
+) -> CapturedSlotSnapshots {
+    let mut snapshots = CapturedSlotSnapshots::new(block.stmts.len(), inherited_captured_slots);
     let mut active_captured_slots = inherited_captured_slots.clone();
     for stmt in &block.stmts {
-        captured_slots.push(active_captured_slots.clone());
+        snapshots.push(&active_captured_slots);
         facts.collect_captured_home_slots_in_stmt(stmt, &mut active_captured_slots);
     }
-    captured_slots
+    snapshots
+}
+
+struct CapturedSlotSnapshots {
+    snapshots: Vec<BTreeSet<HomeSlotKey>>,
+    before_stmt: Vec<usize>,
+}
+
+impl CapturedSlotSnapshots {
+    fn new(stmt_count: usize, inherited: &BTreeSet<HomeSlotKey>) -> Self {
+        Self {
+            snapshots: vec![inherited.clone()],
+            before_stmt: Vec::with_capacity(stmt_count),
+        }
+    }
+
+    fn push(&mut self, active: &BTreeSet<HomeSlotKey>) {
+        if self.snapshots.last().is_none_or(|last| last != active) {
+            self.snapshots.push(active.clone());
+        }
+        self.before_stmt.push(self.snapshots.len() - 1);
+    }
+
+    fn get(&self, stmt_index: usize) -> Option<&BTreeSet<HomeSlotKey>> {
+        self.before_stmt
+            .get(stmt_index)
+            .and_then(|snapshot_index| self.snapshots.get(*snapshot_index))
+    }
 }
 
 fn inline_call_callee_across_argument_materialization(
@@ -202,7 +230,7 @@ fn inline_call_callee_across_argument_materialization(
     scratch: &mut TempUseScratch,
     facts: &ProtoPromotionFacts,
     protected_temps: &BTreeSet<TempId>,
-    captured_slots_before_stmt: &[BTreeSet<HomeSlotKey>],
+    captured_slots_before_stmt: &CapturedSlotSnapshots,
 ) -> bool {
     let total_use_totals = collect_block_temp_use_totals(&block.stmts, scratch);
     let prior_order_sensitive_defs =
@@ -353,7 +381,7 @@ fn cross_call_inline_candidate_is_safe(
     scratch: &TempUseScratch,
     facts: &ProtoPromotionFacts,
     protected_temps: &BTreeSet<TempId>,
-    captured_slots_before_stmt: &[BTreeSet<HomeSlotKey>],
+    captured_slots_before_stmt: &CapturedSlotSnapshots,
 ) -> bool {
     !scratch.has_debug_local_hint(temp)
         && !protected_temps.contains(&temp)

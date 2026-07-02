@@ -110,6 +110,11 @@ fn flush_constructor_segment(
 ) -> Option<()> {
     let expected_set_list_start = builder.next_array_index();
     prepare_scratch(context.scratch, context.binding_index.len());
+    if builder.trailing_multivalue.is_some()
+        && (!segment.is_empty() || set_list_stmt_index.is_some())
+    {
+        return None;
+    }
 
     if segment.is_empty() {
         builder.drain_pending_integer_fields(&mut context.scratch.restored_pending_integer_fields);

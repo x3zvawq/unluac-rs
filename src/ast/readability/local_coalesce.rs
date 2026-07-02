@@ -93,6 +93,9 @@ fn find_later_seed_local(
         if carried_mentions.has_in_range(carried_index + 1, seed_index) {
             return None;
         }
+        if carried_mentions.has_in_range(seed_index, seed_index + 1) {
+            return None;
+        }
         for seed in initialized_local_decl_bindings(&stmts[seed_index]) {
             if tail_has_structured_carried_writeback(
                 stmts,

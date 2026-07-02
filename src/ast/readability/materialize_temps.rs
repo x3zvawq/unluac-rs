@@ -30,7 +30,11 @@ pub(super) fn apply(module: &mut AstModule, _context: ReadabilityContext) -> boo
 struct MaterializeTempsPass;
 
 impl AstRewritePass for MaterializeTempsPass {
-    fn rewrite_block(&mut self, block: &mut AstBlock, _kind: BlockKind) -> bool {
+    fn rewrite_block(&mut self, block: &mut AstBlock, kind: BlockKind) -> bool {
+        if !matches!(kind, BlockKind::ModuleBody | BlockKind::FunctionBody) {
+            return false;
+        }
+
         let temps = collect_function_temps_in_block(block);
         if temps.is_empty() {
             return false;

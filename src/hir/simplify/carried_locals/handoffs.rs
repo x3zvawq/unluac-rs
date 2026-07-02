@@ -13,7 +13,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirLabelId, HirStmt, LocalId, TempId};
+use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirStmt, LocalId, TempId};
 
 use super::super::mention::{stmt_writes_temp, stmts_mention_local, stmts_mention_temp};
 use super::super::temp_touch::TempTouchIndex;
@@ -22,7 +22,7 @@ use super::super::walk::rewrite_stmts;
 use super::binding::{
     CarryBinding, TempBindingRewrite, TempToBindingPass, TempToLocalPass, TempToTempPass,
 };
-use super::boundary::{next_label_has_prior_goto, stmt_contains_goto_to_label};
+use super::boundary::LabelJumpIndex;
 use super::prune::{
     RedundantSelfAssignPrunePass, collect_prunable_bindings, prune_empty_assign_stmts,
     prune_redundant_self_assigns_in_stmts,
@@ -44,15 +44,22 @@ pub(super) fn try_collapse_handoff_at(
     index: usize,
     outer_temps: &BTreeSet<TempId>,
     temp_touches: &TempTouchIndex<'_>,
+    label_jumps: &LabelJumpIndex,
 ) -> Option<HandoffAction> {
-    if try_collapse_pure_binding_handoffs(block, index, outer_temps, temp_touches)
-        || try_collapse_label_loop_update_handoff(block, index, outer_temps, temp_touches)
-        || try_collapse_single_binding_handoff(block, index, outer_temps, temp_touches)
-        || try_collapse_pure_local_handoff(block, index, outer_temps, temp_touches)
+    if try_collapse_pure_binding_handoffs(block, index, outer_temps, temp_touches, label_jumps)
+        || try_collapse_label_loop_update_handoff(
+            block,
+            index,
+            outer_temps,
+            temp_touches,
+            label_jumps,
+        )
+        || try_collapse_single_binding_handoff(block, index, outer_temps, temp_touches, label_jumps)
+        || try_collapse_pure_local_handoff(block, index, outer_temps, temp_touches, label_jumps)
     {
         return Some(HandoffAction::RetrySameIndex);
     }
-    if try_collapse_binding_update_handoff(block, index, outer_temps, temp_touches) {
+    if try_collapse_binding_update_handoff(block, index, outer_temps, temp_touches, label_jumps) {
         return Some(HandoffAction::AdvanceIndex);
     }
     None
@@ -63,6 +70,7 @@ fn try_collapse_pure_binding_handoffs(
     index: usize,
     outer_temps: &BTreeSet<TempId>,
     temp_touches: &TempTouchIndex<'_>,
+    label_jumps: &LabelJumpIndex,
 ) -> bool {
     let Some(seed) = binding_handoff_seed(&block.stmts[index]) else {
         return false;
@@ -76,7 +84,7 @@ fn try_collapse_pure_binding_handoffs(
     {
         return false;
     }
-    if next_label_has_prior_goto(&block.stmts, index) {
+    if label_jumps.next_label_has_prior_goto(&block.stmts, index) {
         return false;
     }
 
@@ -121,6 +129,7 @@ fn try_collapse_label_loop_update_handoff(
     index: usize,
     outer_temps: &BTreeSet<TempId>,
     temp_touches: &TempTouchIndex<'_>,
+    label_jumps: &LabelJumpIndex,
 ) -> bool {
     let Some((carried, update_temp)) = direct_temp_writeback_stmt(&block.stmts[index]) else {
         return false;
@@ -128,16 +137,13 @@ fn try_collapse_label_loop_update_handoff(
     if outer_temps.contains(&update_temp) || temp_touches.touches_before(index, update_temp) {
         return false;
     }
-    if !next_label_has_prior_goto(&block.stmts, index) {
+    if !label_jumps.next_label_has_prior_goto(&block.stmts, index) {
         return false;
     }
-    let Some(handoff_label) = nearest_prior_label(&block.stmts, index) else {
+    let Some(handoff_label) = label_jumps.nearest_prior_label(index) else {
         return false;
     };
-    if !block.stmts[index + 1..]
-        .iter()
-        .any(|stmt| stmt_contains_goto_to_label(stmt, handoff_label))
-    {
+    if !label_jumps.has_goto_at_or_after(index + 1, handoff_label) {
         return false;
     }
 
@@ -171,13 +177,6 @@ fn try_collapse_label_loop_update_handoff(
     true
 }
 
-fn nearest_prior_label(stmts: &[HirStmt], index: usize) -> Option<HirLabelId> {
-    stmts[..index].iter().rev().find_map(|stmt| match stmt {
-        HirStmt::Label(label) => Some(label.id),
-        _ => None,
-    })
-}
-
 fn find_label_loop_update(
     stmts: &[HirStmt],
     carried: CarryBinding,
@@ -200,6 +199,7 @@ fn try_collapse_pure_local_handoff(
     index: usize,
     outer_temps: &BTreeSet<TempId>,
     temp_touches: &TempTouchIndex<'_>,
+    label_jumps: &LabelJumpIndex,
 ) -> bool {
     let Some((temp, local)) = local_handoff_seed(&block.stmts[index]) else {
         return false;
@@ -209,7 +209,7 @@ fn try_collapse_pure_local_handoff(
     if outer_temps.contains(&temp) {
         return false;
     }
-    if next_label_has_prior_goto(&block.stmts, index) {
+    if label_jumps.next_label_has_prior_goto(&block.stmts, index) {
         return false;
     }
 
@@ -235,6 +235,7 @@ fn try_collapse_single_binding_handoff(
     index: usize,
     outer_temps: &BTreeSet<TempId>,
     temp_touches: &TempTouchIndex<'_>,
+    label_jumps: &LabelJumpIndex,
 ) -> bool {
     let Some((temp, binding)) = single_binding_handoff_seed(&block.stmts[index]) else {
         return false;
@@ -244,7 +245,7 @@ fn try_collapse_single_binding_handoff(
     if outer_temps.contains(&temp) {
         return false;
     }
-    if next_label_has_prior_goto(&block.stmts, index) {
+    if label_jumps.next_label_has_prior_goto(&block.stmts, index) {
         return false;
     }
 
@@ -279,6 +280,7 @@ fn try_collapse_binding_update_handoff(
     index: usize,
     outer_temps: &BTreeSet<TempId>,
     temp_touches: &TempTouchIndex<'_>,
+    label_jumps: &LabelJumpIndex,
 ) -> bool {
     let Some((target_temp, carried)) = update_handoff_seed(&block.stmts[index]) else {
         return false;
@@ -288,7 +290,7 @@ fn try_collapse_binding_update_handoff(
     if outer_temps.contains(&target_temp) {
         return false;
     }
-    if next_label_has_prior_goto(&block.stmts, index) {
+    if label_jumps.next_label_has_prior_goto(&block.stmts, index) {
         return false;
     }
 

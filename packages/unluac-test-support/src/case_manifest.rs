@@ -371,6 +371,10 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         PUC_LUA_51,
     ),
     LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_52_table_trailing_multivalue_boundary.lua",
+        PUC_LUA_51,
+    ),
+    LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_53_loop_exit_state_preheader.lua",
         PUC_LUA_51,
     ),

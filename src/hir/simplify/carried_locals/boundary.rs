@@ -19,6 +19,59 @@ use super::binding::{
 };
 use super::prune::{collect_prunable_bindings, prune_boundary_snapshot_self_assigns};
 
+pub(super) struct LabelJumpIndex {
+    gotos_by_label: BTreeMap<HirLabelId, Vec<usize>>,
+    nearest_prior_labels: Vec<Option<HirLabelId>>,
+}
+
+impl LabelJumpIndex {
+    pub(super) fn new(stmts: &[HirStmt]) -> Self {
+        let mut gotos_by_label = BTreeMap::<HirLabelId, Vec<usize>>::new();
+        let mut nearest_prior_labels = Vec::with_capacity(stmts.len());
+        let mut nearest_prior_label = None;
+
+        for (index, stmt) in stmts.iter().enumerate() {
+            nearest_prior_labels.push(nearest_prior_label);
+            for target in goto_targets(stmt) {
+                gotos_by_label.entry(target).or_default().push(index);
+            }
+            if let HirStmt::Label(label) = stmt {
+                nearest_prior_label = Some(label.id);
+            }
+        }
+
+        Self {
+            gotos_by_label,
+            nearest_prior_labels,
+        }
+    }
+
+    pub(super) fn next_label_has_prior_goto(&self, stmts: &[HirStmt], index: usize) -> bool {
+        let Some(HirStmt::Label(label)) = stmts.get(index + 1) else {
+            return false;
+        };
+        self.has_goto_before(index, label.id)
+    }
+
+    pub(super) fn nearest_prior_label(&self, index: usize) -> Option<HirLabelId> {
+        self.nearest_prior_labels.get(index).copied().flatten()
+    }
+
+    pub(super) fn has_goto_at_or_after(&self, start: usize, target: HirLabelId) -> bool {
+        let Some(indices) = self.gotos_by_label.get(&target) else {
+            return false;
+        };
+        let offset = indices.partition_point(|index| *index < start);
+        indices.get(offset).is_some()
+    }
+
+    fn has_goto_before(&self, end: usize, target: HirLabelId) -> bool {
+        self.gotos_by_label
+            .get(&target)
+            .is_some_and(|indices| indices.first().is_some_and(|index| *index < end))
+    }
+}
+
 pub(super) fn collapse_boundary_alias_classes(block: &mut HirBlock) -> bool {
     if !block
         .stmts
@@ -95,33 +148,31 @@ pub(super) fn collapse_boundary_alias_classes(block: &mut HirBlock) -> bool {
     true
 }
 
-pub(super) fn next_label_has_prior_goto(stmts: &[HirStmt], index: usize) -> bool {
-    let Some(HirStmt::Label(label)) = stmts.get(index + 1) else {
-        return false;
-    };
-    stmts[..index]
-        .iter()
-        .any(|stmt| stmt_contains_goto_to_label(stmt, label.id))
+fn goto_targets(stmt: &HirStmt) -> BTreeSet<HirLabelId> {
+    let mut targets = BTreeSet::new();
+    collect_goto_targets(stmt, &mut targets);
+    targets
 }
 
-pub(super) fn stmt_contains_goto_to_label(stmt: &HirStmt, target: HirLabelId) -> bool {
+fn collect_goto_targets(stmt: &HirStmt, targets: &mut BTreeSet<HirLabelId>) {
     match stmt {
-        HirStmt::Goto(goto) => goto.target == target,
+        HirStmt::Goto(goto) => {
+            targets.insert(goto.target);
+        }
         HirStmt::If(if_stmt) => {
-            block_contains_goto_to_label(&if_stmt.then_block, target)
-                || if_stmt
-                    .else_block
-                    .as_ref()
-                    .is_some_and(|else_block| block_contains_goto_to_label(else_block, target))
+            collect_block_goto_targets(&if_stmt.then_block, targets);
+            if let Some(else_block) = &if_stmt.else_block {
+                collect_block_goto_targets(else_block, targets);
+            }
         }
-        HirStmt::While(while_stmt) => block_contains_goto_to_label(&while_stmt.body, target),
-        HirStmt::Repeat(repeat_stmt) => block_contains_goto_to_label(&repeat_stmt.body, target),
-        HirStmt::Block(block) => block_contains_goto_to_label(block, target),
+        HirStmt::While(while_stmt) => collect_block_goto_targets(&while_stmt.body, targets),
+        HirStmt::Repeat(repeat_stmt) => collect_block_goto_targets(&repeat_stmt.body, targets),
+        HirStmt::Block(block) => collect_block_goto_targets(block, targets),
         HirStmt::Unstructured(unstructured) => {
-            block_contains_goto_to_label(&unstructured.body, target)
+            collect_block_goto_targets(&unstructured.body, targets);
         }
-        HirStmt::NumericFor(numeric_for) => block_contains_goto_to_label(&numeric_for.body, target),
-        HirStmt::GenericFor(generic_for) => block_contains_goto_to_label(&generic_for.body, target),
+        HirStmt::NumericFor(numeric_for) => collect_block_goto_targets(&numeric_for.body, targets),
+        HirStmt::GenericFor(generic_for) => collect_block_goto_targets(&generic_for.body, targets),
         HirStmt::LocalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
@@ -132,15 +183,14 @@ pub(super) fn stmt_contains_goto_to_label(stmt: &HirStmt, target: HirLabelId) ->
         | HirStmt::Return(_)
         | HirStmt::Break
         | HirStmt::Continue
-        | HirStmt::Label(_) => false,
+        | HirStmt::Label(_) => {}
     }
 }
 
-fn block_contains_goto_to_label(block: &HirBlock, target: HirLabelId) -> bool {
-    block
-        .stmts
-        .iter()
-        .any(|stmt| stmt_contains_goto_to_label(stmt, target))
+fn collect_block_goto_targets(block: &HirBlock, targets: &mut BTreeSet<HirLabelId>) {
+    for stmt in &block.stmts {
+        collect_goto_targets(stmt, targets);
+    }
 }
 
 fn collect_boundary_alias_pairs(block: &HirBlock) -> Vec<Vec<(CarryBinding, CarryBinding)>> {

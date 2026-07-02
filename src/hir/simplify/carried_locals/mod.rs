@@ -31,7 +31,7 @@ use super::temp_touch::{TempRefScopeTracker, TempTouchIndex, collect_temp_refs_b
 use super::walk::for_each_nested_block_mut;
 
 use self::adjacent::try_collapse_adjacent_local_seed_handoff;
-use self::boundary::collapse_boundary_alias_classes;
+use self::boundary::{LabelJumpIndex, collapse_boundary_alias_classes};
 use self::handoffs::{HandoffAction, try_collapse_handoff_at};
 
 pub(super) fn collapse_carried_local_handoffs_in_proto(proto: &mut HirProto) -> bool {
@@ -74,6 +74,7 @@ fn collapse_block_handoffs(block: &mut HirBlock, outer_temps: &BTreeSet<TempId>)
     loop {
         let action = {
             let temp_touches = TempTouchIndex::new(&stmt_temp_refs);
+            let label_jumps = LabelJumpIndex::new(&block.stmts);
             let mut action = None;
             while index < block.stmts.len() {
                 if try_collapse_adjacent_local_seed_handoff(block, index) {
@@ -81,7 +82,7 @@ fn collapse_block_handoffs(block: &mut HirBlock, outer_temps: &BTreeSet<TempId>)
                     break;
                 }
                 if let Some(handoff_action) =
-                    try_collapse_handoff_at(block, index, outer_temps, &temp_touches)
+                    try_collapse_handoff_at(block, index, outer_temps, &temp_touches, &label_jumps)
                 {
                     action = Some(handoff_action);
                     break;
