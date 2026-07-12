@@ -213,6 +213,7 @@ fn expr_references_binding_lookup(expr: &AstExpr, bindings: &dyn BindingLookup) 
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::VarArg
         | AstExpr::Error(_) => false,

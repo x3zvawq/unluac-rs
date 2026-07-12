@@ -117,6 +117,7 @@ pub(super) fn expr_references_any_temp(expr: &HirExpr, forbidden: &BTreeSet<Temp
         | HirExpr::String(_)
         | HirExpr::Int64(_)
         | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
         | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)

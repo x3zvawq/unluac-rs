@@ -98,6 +98,24 @@ pub(super) fn format_number(value: f64, preserve_integral_float: bool) -> String
     }
 }
 
+pub(super) fn format_vector_component(bits: u32) -> String {
+    let value = f32::from_bits(bits);
+    if value.is_nan() {
+        return "(0/0)".to_owned();
+    }
+    if value.is_infinite() {
+        return if value.is_sign_negative() {
+            "(-1/0)".to_owned()
+        } else {
+            "(1/0)".to_owned()
+        };
+    }
+    if value == 0.0 && value.is_sign_negative() {
+        return "-0.0".to_owned();
+    }
+    value.to_string()
+}
+
 pub(super) fn format_integer(value: i64, number_format: NumberFormat) -> String {
     match number_format {
         NumberFormat::Decimal if value == i64::MIN => format_signed_hex(value),

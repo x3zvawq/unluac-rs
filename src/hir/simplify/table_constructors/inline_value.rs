@@ -295,6 +295,7 @@ pub(super) fn expr_mentions_any_pending_binding(
         | HirExpr::String(_)
         | HirExpr::Int64(_)
         | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
         | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::UpvalueRef(_)
@@ -489,6 +490,7 @@ fn expr_depends_on_any_pending_binding(
         | HirExpr::String(_)
         | HirExpr::Int64(_)
         | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
         | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::UpvalueRef(_)
@@ -519,6 +521,7 @@ fn producer_value_reaches_access_base_shape(context: &InlineContext<'_>, expr: &
         | HirExpr::String(_)
         | HirExpr::Int64(_)
         | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
         | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)

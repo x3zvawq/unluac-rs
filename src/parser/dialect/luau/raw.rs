@@ -210,12 +210,6 @@ pub enum LuauConstEntry {
         proto_index: u32,
         child_proto_index: usize,
     },
-    Vector {
-        x: f32,
-        y: f32,
-        z: f32,
-        w: f32,
-    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

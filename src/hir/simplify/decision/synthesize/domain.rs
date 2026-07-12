@@ -34,6 +34,7 @@ pub(super) enum AbstractValue {
     String(LuaString),
     Int64(i64),
     UInt64(u64),
+    Vector([u32; 4]),
     Complex { real_bits: u64, imag_bits: u64 },
     TruthySymbol(u8),
 }
@@ -136,6 +137,7 @@ pub(super) fn eval_pure_expr(
         HirExpr::String(value) => Some(AbstractValue::String(value.clone())),
         HirExpr::Int64(value) => Some(AbstractValue::Int64(*value)),
         HirExpr::UInt64(value) => Some(AbstractValue::UInt64(*value)),
+        HirExpr::Vector(vector) => Some(AbstractValue::Vector(vector.components)),
         HirExpr::Complex { real, imag } => Some(AbstractValue::Complex {
             real_bits: real.to_bits(),
             imag_bits: imag.to_bits(),
@@ -264,6 +266,7 @@ pub(super) fn collect_refs_from_expr(expr: &HirExpr, refs: &mut BTreeSet<RefKey>
         | HirExpr::String(_)
         | HirExpr::Int64(_)
         | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
         | HirExpr::Complex { .. }
         | HirExpr::Decision(_)
         | HirExpr::GlobalRef(_)
@@ -292,6 +295,9 @@ pub(super) fn collect_literals_from_expr(expr: &HirExpr, literals: &mut BTreeSet
         }
         HirExpr::UInt64(value) => {
             literals.insert(AbstractValue::UInt64(*value));
+        }
+        HirExpr::Vector(vector) => {
+            literals.insert(AbstractValue::Vector(vector.components));
         }
         HirExpr::Complex { real, imag } => {
             literals.insert(AbstractValue::Complex {

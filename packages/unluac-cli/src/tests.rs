@@ -10,7 +10,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::CommandFactory;
-use unluac::decompile::{DebugColorMode, DecompileStage, GenerateMode, NamingMode, NumberFormat};
+use unluac::decompile::{
+    DebugColorMode, DecompileStage, GenerateMode, LuauVectorConstructor, LuauVectorSize,
+    NamingMode, NumberFormat,
+};
 use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
 use super::{CliArgs, OUTPUT_ONLY_SUPPORTS_FINAL_SOURCE, emit_generated_source, parse_args};
@@ -294,6 +297,62 @@ fn naming_mode_and_bool_options_override_defaults() {
     assert!(!options.decompile.generate.conservative_output);
     assert!(!options.decompile.generate.comment);
     assert_eq!(options.decompile.generate.mode, GenerateMode::Strict);
+}
+
+#[test]
+fn luau_vector_options_map_to_generate_config() {
+    let options = parse_args(args(&[
+        "--source",
+        "case.luau",
+        "--dialect",
+        "luau",
+        "--luau-vector-library",
+        "Vector3",
+        "--luau-vector-constructor",
+        "new",
+        "--luau-vector-size",
+        "3",
+    ]))
+    .expect("Luau vector options should parse");
+
+    assert_eq!(
+        options.decompile.generate.luau_vector_constructor,
+        Some(LuauVectorConstructor {
+            library: Some("Vector3".to_owned()),
+            constructor: "new".to_owned(),
+            size: LuauVectorSize::Three,
+        })
+    );
+}
+
+#[test]
+fn luau_vector_library_requires_constructor() {
+    let error = parse_args(args(&[
+        "--source",
+        "case.luau",
+        "--dialect",
+        "luau",
+        "--luau-vector-library",
+        "Vector3",
+    ]))
+    .expect_err("vector library without constructor should fail");
+
+    assert!(error.to_string().contains("--luau-vector-constructor"));
+}
+
+#[test]
+fn luau_vector_constructor_requires_size() {
+    let error = parse_args(args(&[
+        "--source",
+        "case.luau",
+        "--dialect",
+        "luau",
+        "--luau-vector-constructor",
+        "vector",
+    ]))
+    .expect_err("vector constructor without a size should fail");
+
+    assert!(error.to_string().contains("--luau-vector-size"));
 }
 
 #[test]

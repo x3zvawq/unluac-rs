@@ -241,6 +241,7 @@ fn expr_contains_direct_call_callee_var(expr: &AstExpr) -> bool {
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg

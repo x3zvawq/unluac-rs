@@ -2,7 +2,8 @@
 //!
 //! 它依赖 AST 已经保真的表达式形状、precedence helper 和 naming 结果，只负责发射语法，
 //! 不会在这里再猜补缺失的 sugar。
-//! 例如：`AstExpr::SingleValue(call)` 会在这里带括号输出成单值调用表达式。
+//! 例如：`AstExpr::SingleValue(call)` 会在这里带括号输出成单值调用表达式；Luau vector
+//! 只消费显式宿主构造器配置，不从 bytecode 猜 API 名。
 
 use crate::ast::pretty::{preferred_negated_relational_render, preferred_relational_render};
 use crate::ast::{
@@ -11,6 +12,7 @@ use crate::ast::{
     AstTableConstructor, AstTableField, AstTableKey, AstUnaryOpKind,
 };
 use crate::decompile::DecompileDialect;
+use crate::generate::LuauVectorSize;
 use crate::generate::doc::Doc;
 use crate::hir::HirProtoRef;
 
@@ -18,7 +20,7 @@ use super::super::common::TableStyle;
 use super::super::error::GenerateError;
 use super::syntax::{
     binary_meta, format_complex_literal, format_integer, format_number, format_string_literal,
-    format_unsigned_integer, maybe_parenthesize,
+    format_unsigned_integer, format_vector_component, maybe_parenthesize,
 };
 use super::{
     Assoc, Emitter, ExprSide, PREC_AND, PREC_COMPARE, PREC_LITERAL, PREC_OR, PREC_PREFIX,
@@ -134,6 +136,9 @@ impl<'a> Emitter<'a> {
                 PREC_LITERAL,
                 Assoc::Non,
             ),
+            AstExpr::Vector(vector) => {
+                (self.emit_vector_literal(*vector)?, PREC_PREFIX, Assoc::Left)
+            }
             AstExpr::Var(name) => (
                 self.emit_name_ref(name, function)?,
                 PREC_PREFIX,
@@ -252,6 +257,43 @@ impl<'a> Emitter<'a> {
             ),
         };
         Ok(maybe_parenthesize(doc, prec, parent_prec, side, assoc))
+    }
+
+    fn emit_vector_literal(
+        &self,
+        vector: crate::parser::VectorLiteral,
+    ) -> Result<Doc, GenerateError> {
+        let constructor = self
+            .options
+            .luau_vector_constructor
+            .as_ref()
+            .ok_or(GenerateError::MissingLuauVectorConstructor)?;
+        for name in constructor
+            .library
+            .iter()
+            .chain(std::iter::once(&constructor.constructor))
+        {
+            if !crate::ast::is_lua_identifier_name(name, DecompileDialect::Luau) {
+                return Err(GenerateError::InvalidLuauVectorConstructor { name: name.clone() });
+            }
+        }
+
+        let callee = constructor.library.as_ref().map_or_else(
+            || constructor.constructor.clone(),
+            |library| format!("{library}.{}", constructor.constructor),
+        );
+        let component_count = match constructor.size {
+            LuauVectorSize::Three => 3,
+            LuauVectorSize::Four => 4,
+        };
+        let args = vector.components[..component_count]
+            .iter()
+            .map(|bits| Doc::text(format_vector_component(*bits)))
+            .collect();
+        Ok(Doc::concat([
+            Doc::text(callee),
+            self.emit_parenthesized_list(args),
+        ]))
     }
 
     pub(super) fn emit_name_ref(

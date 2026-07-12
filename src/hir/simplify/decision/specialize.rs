@@ -47,6 +47,7 @@ enum TruthFactExprKey {
     String(LuaString),
     Int64(i64),
     UInt64(u64),
+    Vector([u32; 4]),
     Complex { real_bits: u64, imag_bits: u64 },
     Param(usize),
     Local(usize),
@@ -295,6 +296,7 @@ fn truth_fact_expr_key(expr: &HirExpr) -> Option<TruthFactExprKey> {
         HirExpr::String(value) => Some(TruthFactExprKey::String(value.clone())),
         HirExpr::Int64(value) => Some(TruthFactExprKey::Int64(*value)),
         HirExpr::UInt64(value) => Some(TruthFactExprKey::UInt64(*value)),
+        HirExpr::Vector(vector) => Some(TruthFactExprKey::Vector(vector.components)),
         HirExpr::Complex { real, imag } => Some(TruthFactExprKey::Complex {
             real_bits: real.to_bits(),
             imag_bits: imag.to_bits(),

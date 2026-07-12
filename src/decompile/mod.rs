@@ -15,7 +15,10 @@ pub use crate::ast::dump_ast;
 pub use crate::ast::{FunctionNameMap, NameInfo, NameMap, NameSource, NamingMode, NamingOptions};
 pub use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, ProtoDepth};
 pub use crate::generate::dump_generate;
-pub use crate::generate::{GenerateMode, GenerateOptions, NumberFormat, QuoteStyle, TableStyle};
+pub use crate::generate::{
+    GenerateMode, GenerateOptions, LuauVectorConstructor, LuauVectorSize, NumberFormat, QuoteStyle,
+    TableStyle,
+};
 pub use crate::hir::dump_hir;
 pub use crate::parser::dump_parser;
 pub use crate::structure::dump_structure;

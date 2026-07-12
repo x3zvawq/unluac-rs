@@ -12,8 +12,8 @@ use std::str::FromStr;
 use wasm_bindgen::prelude::*;
 
 use unluac::decompile::{
-    DecompileDialect, DecompileOptions, GenerateMode, NamingMode, NumberFormat, QuoteStyle,
-    TableStyle, decompile as run_decompile,
+    DecompileDialect, DecompileOptions, GenerateMode, LuauVectorConstructor, LuauVectorSize,
+    NamingMode, NumberFormat, QuoteStyle, TableStyle, decompile as run_decompile,
 };
 use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
@@ -65,8 +65,17 @@ struct WasmGenerateOptions {
     number_format: Option<String>,
     quote_style: Option<String>,
     table_style: Option<String>,
+    luau_vector_constructor: Option<WasmLuauVectorConstructor>,
     conservative_output: Option<bool>,
     comment: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WasmLuauVectorConstructor {
+    library: Option<String>,
+    constructor: String,
+    size: u8,
 }
 
 #[derive(Debug, Serialize)]
@@ -251,6 +260,23 @@ impl WasmGenerateOptions {
         }
         if let Some(value) = self.table_style {
             options.generate.table_style = parse_option("generate.tableStyle", &value)?;
+        }
+        if let Some(value) = self.luau_vector_constructor {
+            options.generate.luau_vector_constructor = Some(LuauVectorConstructor {
+                library: value.library,
+                constructor: value.constructor,
+                size: match value.size {
+                    3 => LuauVectorSize::Three,
+                    4 => LuauVectorSize::Four,
+                    size => {
+                        return Err(WasmBridgeError::new(
+                            "invalid-option-value",
+                            format!("unsupported Luau vector size: {size}"),
+                            Some("generate.luauVectorConstructor.size"),
+                        ));
+                    }
+                },
+            });
         }
         if let Some(value) = self.conservative_output {
             options.generate.conservative_output = value;
@@ -453,6 +479,11 @@ mod tests {
                 number_format: Some("hex".to_owned()),
                 quote_style: Some("prefer-single".to_owned()),
                 table_style: Some("expanded".to_owned()),
+                luau_vector_constructor: Some(super::WasmLuauVectorConstructor {
+                    library: Some("Vector3".to_owned()),
+                    constructor: "new".to_owned(),
+                    size: 3,
+                }),
                 conservative_output: Some(false),
                 comment: Some(false),
             }),
@@ -471,6 +502,14 @@ mod tests {
         assert_eq!(options.generate.number_format, NumberFormat::Hex);
         assert_eq!(options.generate.quote_style, QuoteStyle::PreferSingle);
         assert_eq!(options.generate.table_style, TableStyle::Expanded);
+        assert_eq!(
+            options.generate.luau_vector_constructor,
+            Some(unluac::decompile::LuauVectorConstructor {
+                library: Some("Vector3".to_owned()),
+                constructor: "new".to_owned(),
+                size: unluac::decompile::LuauVectorSize::Three,
+            })
+        );
         assert!(!options.generate.conservative_output);
         assert!(!options.generate.comment);
     }

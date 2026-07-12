@@ -1,7 +1,8 @@
 //! 这个文件集中声明 AST 层的共享语法节点。
 //!
 //! AST 是 target-dialect-aware 的语法树：它不再做控制流恢复，但要把 HIR 已经确定
-//! 的结构落成“某个目标 Lua 方言真正允许出现”的语法节点。
+//! 的结构落成“某个目标 Lua 方言真正允许出现”的语法节点，并显式保留需要宿主配置
+//! 才能渲染的字面量。
 //!
 //! 除了语法节点本身，这一层也会保留少量“readability 必须知道、但源码语法里看不见”
 //! 的 provenance。这样后续 pass 在做 sugar 时可以依赖前层已经确认过的结构事实，
@@ -75,6 +76,7 @@ pub enum AstExpr {
         real: f64,
         imag: f64,
     },
+    Vector(crate::parser::VectorLiteral),
     Var(AstNameRef),
     FieldAccess(Box<AstFieldAccess>),
     IndexAccess(Box<AstIndexAccess>),

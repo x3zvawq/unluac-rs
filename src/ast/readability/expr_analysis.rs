@@ -20,6 +20,7 @@ pub(super) fn expr_complexity(expr: &AstExpr) -> usize {
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg
@@ -70,6 +71,7 @@ pub(super) fn is_context_safe_expr(expr: &AstExpr) -> bool {
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. } => true,
         AstExpr::Var(
             AstNameRef::Param(_)
@@ -118,6 +120,7 @@ pub(super) fn expr_observes_eval_order(expr: &AstExpr) -> bool {
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(
             AstNameRef::Param(_)
@@ -161,6 +164,7 @@ pub(super) fn is_copy_like_expr(expr: &AstExpr) -> bool {
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_) => true,
         AstExpr::SingleValue(expr) => is_copy_like_expr(expr),
@@ -190,6 +194,7 @@ pub(super) fn is_discard_safe_expr(expr: &AstExpr) -> bool {
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_) => true,
         AstExpr::SingleValue(expr) => is_discard_safe_expr(expr),
@@ -217,6 +222,7 @@ pub(super) fn is_mechanical_run_inline_expr(expr: &AstExpr) -> bool {
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_) => true,
         AstExpr::SingleValue(expr) => is_mechanical_run_inline_expr(expr),
@@ -276,6 +282,7 @@ pub(super) fn is_always_truthy_expr(expr: &AstExpr) -> bool {
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::TableConstructor(_)
         | AstExpr::FunctionExpr(_) => true,
@@ -313,6 +320,7 @@ fn is_atomic_access_base_expr(expr: &AstExpr) -> bool {
             | AstExpr::String(_)
             | AstExpr::Int64(_)
             | AstExpr::UInt64(_)
+            | AstExpr::Vector(_)
             | AstExpr::Complex { .. }
             | AstExpr::Var(_)
     )

@@ -409,6 +409,7 @@ fn candidate_from_expr(expr: &AstExpr) -> Option<(String, NameSource)> {
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg

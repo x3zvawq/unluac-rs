@@ -53,6 +53,7 @@ fn hir_from_ast_expr(expr: &AstExpr) -> Option<HirExpr> {
         AstExpr::String(value) => Some(HirExpr::String(value.clone())),
         AstExpr::Int64(value) => Some(HirExpr::Int64(*value)),
         AstExpr::UInt64(value) => Some(HirExpr::UInt64(*value)),
+        AstExpr::Vector(vector) => Some(HirExpr::Vector(*vector)),
         AstExpr::Complex { real, imag } => Some(HirExpr::Complex {
             real: *real,
             imag: *imag,
@@ -111,6 +112,7 @@ fn ast_from_hir_expr(expr: &HirExpr) -> Option<AstExpr> {
         HirExpr::String(value) => Some(AstExpr::String(value.clone())),
         HirExpr::Int64(value) => Some(AstExpr::Int64(*value)),
         HirExpr::UInt64(value) => Some(AstExpr::UInt64(*value)),
+        HirExpr::Vector(vector) => Some(AstExpr::Vector(*vector)),
         HirExpr::Complex { real, imag } => Some(AstExpr::Complex {
             real: *real,
             imag: *imag,

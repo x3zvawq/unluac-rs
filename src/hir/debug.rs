@@ -287,6 +287,7 @@ fn format_expr(expr: &HirExpr) -> String {
         HirExpr::String(value) => value.debug_literal(),
         HirExpr::Int64(value) => format!("{value}LL"),
         HirExpr::UInt64(value) => format!("{value}ULL"),
+        HirExpr::Vector(vector) => format!("vector({:?})", vector.components.map(f32::from_bits)),
         HirExpr::Complex { real, imag } => format_complex_literal(*real, *imag),
         HirExpr::ParamRef(param) => format!("p{}", param.index()),
         HirExpr::LocalRef(local) => format!("l{}", local.index()),

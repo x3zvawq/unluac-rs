@@ -36,6 +36,12 @@ export type UnluacNumberFormat = 'decimal' | 'hex'
 export type UnluacTableStyle = 'compact' | 'balanced' | 'expanded'
 export type UnluacGenerateMode = 'strict' | 'permissive'
 
+export interface LuauVectorConstructor {
+  library: string | null
+  constructor: string
+  size: 3 | 4
+}
+
 export interface DecompileOptions {
   dialect: UnluacDialect
   parse: {
@@ -60,6 +66,7 @@ export interface DecompileOptions {
     numberFormat: UnluacNumberFormat
     quoteStyle: UnluacQuoteStyle
     tableStyle: UnluacTableStyle
+    luauVectorConstructor: LuauVectorConstructor | null
     conservativeOutput: boolean
     comment: boolean
   }
@@ -150,7 +157,16 @@ export interface ProtoMeta {
 
 export interface ProtoConstant {
   index: number
-  type: 'nil' | 'boolean' | 'integer' | 'number' | 'string' | 'int64' | 'uint64' | 'complex'
+  type:
+    | 'nil'
+    | 'boolean'
+    | 'integer'
+    | 'number'
+    | 'string'
+    | 'int64'
+    | 'uint64'
+    | 'complex'
+    | 'vector'
   display: string
 }
 

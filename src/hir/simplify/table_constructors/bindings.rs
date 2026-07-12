@@ -235,6 +235,7 @@ pub(super) fn expr_uses_binding(expr: &HirExpr, binding: TableBinding) -> bool {
         | HirExpr::String(_)
         | HirExpr::Int64(_)
         | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
         | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::UpvalueRef(_)

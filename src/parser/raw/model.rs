@@ -1,7 +1,7 @@
 //! 这个文件定义 parser raw 层的跨 dialect 通用模型。
 //!
 //! 这些结构表达后续阶段都会消费的稳定事实，例如 chunk/proto/instruction/source
-//! origin 等；具体 opcode、operand 和 dialect extra 只通过 wrapper 字段挂接进来，
+//! origin 和保留位模式的宿主字面量；具体 opcode、operand 和 dialect extra 只通过 wrapper 字段挂接进来，
 //! 避免公共模型被某个版本的协议细节撑大。
 
 use crate::decompile::DecompileDialect;
@@ -167,8 +167,8 @@ pub struct RawConstPool {
 pub struct RawConstPoolCommon {
     /// 这里存放所有 dialect 都能直接复用的“字面量子集”。
     ///
-    /// 像 Luau 这种拥有 import/table/closure/vector 常量的 dialect，会把完整常量表
-    /// 放进 `extra`，而公共层只保留后续 HIR/AST 能直接消费的字面量引用。
+    /// 像 Luau 这种拥有 import/table/closure 常量的 dialect，会把完整常量表放进
+    /// `extra`；vector 属于后层需要直接消费的运行时字面量，因此归一到这里。
     pub literals: Vec<RawLiteralConst>,
 }
 
@@ -183,6 +183,24 @@ pub enum RawLiteralConst {
     Int64(i64),
     UInt64(u64),
     Complex { real: f64, imag: f64 },
+    Vector(VectorLiteral),
+}
+
+/// Luau vector 常量的四个 IEEE-754 单精度分量。
+///
+/// bytecode 固定保存四个 `f32`，而宿主 VM 决定实际使用三个还是四个分量。这里保存
+/// bit pattern 而不是直接保存 `f32`，避免 NaN 和负零破坏常量身份与相等性。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct VectorLiteral {
+    pub components: [u32; 4],
+}
+
+impl VectorLiteral {
+    pub fn from_components(components: [f32; 4]) -> Self {
+        Self {
+            components: components.map(f32::to_bits),
+        }
+    }
 }
 
 /// parser 暴露给后续层的 upvalue 信息。

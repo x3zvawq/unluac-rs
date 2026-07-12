@@ -81,6 +81,7 @@ pub(in crate::ast::readability) fn replace_binding_use_in_expr(
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg
@@ -254,6 +255,7 @@ fn rewrite_binding_as_name_in_expr(expr: &mut AstExpr, from: AstBindingRef, to: 
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::VarArg
         | AstExpr::Error(_) => {}

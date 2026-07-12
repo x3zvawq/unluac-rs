@@ -189,6 +189,7 @@ fn branch_exit_condition_prefix_expr_is_safe(expr: &HirExpr) -> bool {
         | HirExpr::Closure(_)
         | HirExpr::Decision(_)
         | HirExpr::Unresolved(_)
+        | HirExpr::Vector(_)
         | HirExpr::Complex { .. } => false,
     }
 }

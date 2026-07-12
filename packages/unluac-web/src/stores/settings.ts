@@ -36,6 +36,7 @@ export function defaultOptions(): DecompileOptions {
       numberFormat: 'decimal',
       quoteStyle: 'min-escape',
       tableStyle: 'balanced',
+      luauVectorConstructor: null,
       conservativeOutput: true,
       comment: true,
     },

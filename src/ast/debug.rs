@@ -705,6 +705,7 @@ fn format_expr(expr: &AstExpr, indent: &str, names: &FunctionRenderNames) -> Str
         AstExpr::String(value) => value.debug_literal(),
         AstExpr::Int64(value) => format!("{value}LL"),
         AstExpr::UInt64(value) => format!("{value}ULL"),
+        AstExpr::Vector(vector) => format!("vector({:?})", vector.components.map(f32::from_bits)),
         AstExpr::Complex { real, imag } => format_complex_literal(*real, *imag),
         AstExpr::Var(name) => format_name_ref(name, names),
         AstExpr::FieldAccess(access) => {
@@ -1255,6 +1256,7 @@ fn collect_function_render_names_in_expr(
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::VarArg
         | AstExpr::Error(_) => {}

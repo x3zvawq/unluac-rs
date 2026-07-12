@@ -1,7 +1,7 @@
 //! 这个文件集中声明 HIR 层的共享类型。
 //!
 //! HIR 已经进入“变量世界”，因此这里的核心职责是提供稳定的绑定身份、结构化
-//! 语句节点以及少量受控 fallback 节点，供 AST/Readability/Naming 继续消费。
+//! 语句节点、保真的纯字面量以及少量受控 fallback 节点，供 AST/Readability/Naming 继续消费。
 
 use crate::LuaString;
 use crate::parser::{ProtoLineRange, ProtoSignature};
@@ -133,6 +133,7 @@ pub enum HirExpr {
     Int64(i64),
     UInt64(u64),
     Complex { real: f64, imag: f64 },
+    Vector(crate::parser::VectorLiteral),
     ParamRef(ParamId),
     LocalRef(LocalId),
     UpvalueRef(UpvalueId),

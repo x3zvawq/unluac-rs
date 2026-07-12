@@ -240,6 +240,7 @@ fn cond_evaluates_binding_first(
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::VarArg
         | AstExpr::TableConstructor(_)

@@ -30,6 +30,12 @@ export type UnluacQuoteStyle = "prefer-double" | "prefer-single" | "min-escape";
 export type UnluacNumberFormat = "decimal" | "hex";
 export type UnluacTableStyle = "compact" | "balanced" | "expanded";
 
+export interface UnluacLuauVectorConstructor {
+  library?: string;
+  constructor: string;
+  size: 3 | 4;
+}
+
 export interface UnluacDecompileOptions {
   dialect?: UnluacDialect;
   parse?: {
@@ -56,6 +62,7 @@ export interface UnluacDecompileOptions {
     numberFormat?: UnluacNumberFormat;
     quoteStyle?: UnluacQuoteStyle;
     tableStyle?: UnluacTableStyle;
+    luauVectorConstructor?: UnluacLuauVectorConstructor;
     conservativeOutput?: boolean;
     comment?: boolean;
   };
@@ -119,7 +126,16 @@ export interface UnluacConstant {
   /** 常量在池中的索引（0-based） */
   index: number;
   /** 类型标签 */
-  type: "nil" | "boolean" | "integer" | "number" | "string" | "int64" | "uint64" | "complex";
+  type:
+    | "nil"
+    | "boolean"
+    | "integer"
+    | "number"
+    | "string"
+    | "int64"
+    | "uint64"
+    | "complex"
+    | "vector";
   /** 人类可读的值表示 */
   display: string;
 }

@@ -313,6 +313,10 @@ fn project_constant(index: usize, lit: &RawLiteralConst) -> WasmConstant {
         RawLiteralConst::Int64(n) => ("int64", format!("{n}LL")),
         RawLiteralConst::UInt64(n) => ("uint64", format!("{n}ULL")),
         RawLiteralConst::Complex { real, imag } => ("complex", format!("{real}+{imag}i")),
+        RawLiteralConst::Vector(vector) => {
+            let [x, y, z, w] = vector.components.map(f32::from_bits);
+            ("vector", format!("vector({x},{y},{z},{w})"))
+        }
     };
     WasmConstant { index, ty, display }
 }

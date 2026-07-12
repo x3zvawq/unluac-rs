@@ -400,6 +400,7 @@ fn binding_is_first_eval_in_expr(expr: &AstExpr, binding: AstBindingRef) -> bool
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::VarArg
         | AstExpr::Error(_) => false,

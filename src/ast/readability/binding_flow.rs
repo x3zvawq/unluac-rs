@@ -538,6 +538,7 @@ fn collect_binding_mentions_in_expr(expr: &AstExpr, mentions: &mut BTreeSet<AstB
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::VarArg
         | AstExpr::Error(_) => {}
@@ -712,6 +713,7 @@ fn count_binding_uses_in_expr_with_scope(
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg
@@ -791,6 +793,7 @@ fn collect_binding_uses_in_expr_with_scope(
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::VarArg
         | AstExpr::Error(_) => {}

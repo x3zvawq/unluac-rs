@@ -13,11 +13,12 @@ use std::sync::{
 };
 
 use unluac::decompile::{DecompileDialect, DecompileOptions, DecompileStage, decompile};
+use unluac::generate::{LuauVectorConstructor, LuauVectorSize};
 
 #[allow(dead_code)]
 mod case_manifest;
 pub use case_manifest::{LuaCaseDialect, LuaCaseManifestEntry};
-use case_manifest::{regression_cases, unit_cases};
+use case_manifest::{LuaCaseOptions, regression_cases, unit_cases};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct LuaCommandOutput {
@@ -589,22 +590,23 @@ pub(crate) fn run_lua_file(
 
 /// 使用 vendored 的 `luac` 把一个仓库内 case 编译到 health suite 的稳定产物路径。
 pub(crate) fn compile_lua_case_to_suite_artifact(
-    dialect_label: &str,
-    source_relative: &str,
+    entry: &LuaCaseManifestEntry,
     suite_label: &str,
     artifact_label: &str,
     strip_debug: bool,
 ) -> Result<(PathBuf, LuaCommandOutput), String> {
+    let dialect_label = <&'static str>::from(entry.dialect);
     let toolchain = lua_toolchain(dialect_label)?;
-    let source = repo_root().join(source_relative);
+    let source = repo_root().join(entry.path);
     let output = suite_artifact_path(
         suite_label,
         dialect_label,
         artifact_label,
-        source_relative,
+        entry.path,
         toolchain.chunk_extension,
     );
-    let command_output = compile_lua_file_to_path(dialect_label, &source, &output, strip_debug)?;
+    let command_output =
+        compile_lua_file_to_path(dialect_label, &source, &output, strip_debug, entry.options)?;
     Ok((output, command_output))
 }
 
@@ -661,20 +663,16 @@ pub(crate) fn build_case_baseline(
         ));
     }
 
-    let (compiled_path, compile_output) = compile_lua_case_to_suite_artifact(
-        dialect_label,
-        entry.path,
-        suite_label,
-        "compiled-source",
-        true,
-    )
-    .map_err(|error| {
-        TestFailure::new(
-            FailureKind::CompileSourceFailed,
-            "compile source failed",
-            format!("compile source failed: {error}"),
-        )
-    })?;
+    let (compiled_path, compile_output) =
+        compile_lua_case_to_suite_artifact(entry, suite_label, "compiled-source", true).map_err(
+            |error| {
+                TestFailure::new(
+                    FailureKind::CompileSourceFailed,
+                    "compile source failed",
+                    format!("compile source failed: {error}"),
+                )
+            },
+        )?;
     if !compile_output.success() {
         let reason = primary_command_reason(&compile_output)
             .map(|reason| format!(": {reason}"))
@@ -758,17 +756,8 @@ pub(crate) fn run_pipeline_case(
     })?;
     let expected_dialect = entry.dialect.decompile_dialect();
 
-    let chunk = compile_lua_case(dialect_label, entry.path);
-    let result = decompile(
-        &chunk,
-        DecompileOptions {
-            dialect: DecompileDialect::Auto,
-            target_stage: DecompileStage::Generate,
-            debug: Default::default(),
-            ..DecompileOptions::default()
-        },
-    )
-    .map_err(|error| {
+    let chunk = compile_manifest_case(entry);
+    let result = decompile(&chunk, decompile_options(entry)).map_err(|error| {
         TestFailure::new(
             FailureKind::DecompileFailed,
             format!("decompile failed: {error}"),
@@ -801,8 +790,7 @@ pub(crate) fn run_pipeline_case(
             })?;
 
     let (generated_chunk_path, compile_output) = compile_generated_source_to_suite_artifact(
-        dialect_label,
-        entry.path,
+        entry,
         suite_label,
         &generated_source_path,
         true,
@@ -919,8 +907,7 @@ pub(crate) fn run_pipeline_case(
             )
         })?;
         let (prev_chunk_path, prev_compile_output) = compile_generated_source_to_suite_artifact(
-            dialect_label,
-            entry.path,
+            entry,
             &format!("{suite_label}/{round_label}"),
             &prev_source_path,
             true,
@@ -964,22 +951,14 @@ pub(crate) fn run_pipeline_case(
                 ),
             )
         })?;
-        let recompile_result = decompile(
-            &prev_chunk_bytes,
-            DecompileOptions {
-                dialect: DecompileDialect::Auto,
-                target_stage: DecompileStage::Generate,
-                debug: Default::default(),
-                ..DecompileOptions::default()
-            },
-        )
-        .map_err(|error| {
-            TestFailure::new(
-                FailureKind::RecompileDecompileFailed,
-                format!("[{round_label}] decompile failed: {error}"),
-                format!("[{round_label}] decompile failed: {error}"),
-            )
-        })?;
+        let recompile_result =
+            decompile(&prev_chunk_bytes, decompile_options(entry)).map_err(|error| {
+                TestFailure::new(
+                    FailureKind::RecompileDecompileFailed,
+                    format!("[{round_label}] decompile failed: {error}"),
+                    format!("[{round_label}] decompile failed: {error}"),
+                )
+            })?;
         assert_auto_dialect(
             &round_label,
             recompile_result.state.dialect,
@@ -1013,8 +992,7 @@ pub(crate) fn run_pipeline_case(
             )
         })?;
         let (regen_chunk_path, regen_compile_output) = compile_generated_source_to_suite_artifact(
-            dialect_label,
-            entry.path,
+            entry,
             &format!("{suite_label}/{round_label}-regen"),
             &regen_source_path,
             true,
@@ -1111,15 +1089,57 @@ pub(crate) fn run_pipeline_case(
     Ok(TestSuccess { proto_count })
 }
 
+fn decompile_options(entry: &LuaCaseManifestEntry) -> DecompileOptions {
+    let mut options = DecompileOptions {
+        dialect: DecompileDialect::Auto,
+        target_stage: DecompileStage::Generate,
+        debug: Default::default(),
+        ..DecompileOptions::default()
+    };
+    options.generate.luau_vector_constructor =
+        entry
+            .options
+            .luau_vector
+            .map(|vector| LuauVectorConstructor {
+                library: vector.library.map(str::to_owned),
+                constructor: vector.constructor.to_owned(),
+                size: match vector.components {
+                    3 => LuauVectorSize::Three,
+                    4 => LuauVectorSize::Four,
+                    components => panic!("unsupported Luau vector component count: {components}"),
+                },
+            });
+    options
+}
+
 /// 使用 vendored 的 `luac` 把某个仓库内 Lua case 编译成测试 chunk。
 #[allow(dead_code)]
 pub fn compile_lua_case(dialect_label: &str, source_relative: &str) -> Vec<u8> {
-    compile_lua_case_inner(dialect_label, source_relative, true)
+    compile_lua_case_inner(
+        dialect_label,
+        source_relative,
+        true,
+        LuaCaseOptions::default(),
+    )
 }
 
 #[allow(dead_code)]
 pub fn compile_lua_case_with_debug(dialect_label: &str, source_relative: &str) -> Vec<u8> {
-    compile_lua_case_inner(dialect_label, source_relative, false)
+    compile_lua_case_inner(
+        dialect_label,
+        source_relative,
+        false,
+        LuaCaseOptions::default(),
+    )
+}
+
+fn compile_manifest_case(entry: &LuaCaseManifestEntry) -> Vec<u8> {
+    compile_lua_case_inner(
+        <&'static str>::from(entry.dialect),
+        entry.path,
+        true,
+        entry.options,
+    )
 }
 
 static TEST_CHUNK_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -1128,6 +1148,7 @@ fn compile_lua_case_inner(
     dialect_label: &str,
     source_relative: &str,
     strip_debug: bool,
+    options: LuaCaseOptions,
 ) -> Vec<u8> {
     let repo_root = repo_root();
     let source = repo_root.join(source_relative);
@@ -1140,8 +1161,11 @@ fn compile_lua_case_inner(
         strip_debug,
         toolchain.chunk_extension,
     );
-    let command_output = compile_lua_file_to_path(dialect_label, &source, &output, strip_debug)
-        .unwrap_or_else(|error| panic!("should compile test chunk {}: {error}", source.display()));
+    let command_output =
+        compile_lua_file_to_path(dialect_label, &source, &output, strip_debug, options)
+            .unwrap_or_else(|error| {
+                panic!("should compile test chunk {}: {error}", source.display())
+            });
     assert!(
         command_output.success(),
         "bundled compiler failed for {}:\n{}",
@@ -1159,22 +1183,27 @@ fn compile_lua_case_inner(
 
 /// 使用 vendored 的 `luac` 把已经生成好的源码落成稳定的 health chunk 产物。
 pub(crate) fn compile_generated_source_to_suite_artifact(
-    dialect_label: &str,
-    source_relative: &str,
+    entry: &LuaCaseManifestEntry,
     suite_label: &str,
     generated_source_path: &Path,
     strip_debug: bool,
 ) -> Result<(PathBuf, LuaCommandOutput), String> {
+    let dialect_label = <&'static str>::from(entry.dialect);
     let toolchain = lua_toolchain(dialect_label)?;
     let output = suite_artifact_path(
         suite_label,
         dialect_label,
         "generated-chunk",
-        source_relative,
+        entry.path,
         toolchain.chunk_extension,
     );
-    let command_output =
-        compile_lua_file_to_path(dialect_label, generated_source_path, &output, strip_debug)?;
+    let command_output = compile_lua_file_to_path(
+        dialect_label,
+        generated_source_path,
+        &output,
+        strip_debug,
+        entry.options,
+    )?;
     Ok((output, command_output))
 }
 
@@ -1183,11 +1212,12 @@ fn compile_lua_file_to_path(
     source: &Path,
     output: &Path,
     strip_debug: bool,
+    options: LuaCaseOptions,
 ) -> Result<LuaCommandOutput, String> {
     let toolchain = lua_toolchain(dialect_label)?;
     let compiler = lua_tool_path(dialect_label, toolchain.compiler_name)?;
     ensure_parent_dir(output)?;
-    run_compiler_to_output_path(toolchain, &compiler, source, output, strip_debug)
+    run_compiler_to_output_path(toolchain, &compiler, source, output, strip_debug, options)
 }
 
 #[allow(dead_code)]
@@ -1397,7 +1427,14 @@ fn run_compiler_to_output_path(
     source: &Path,
     output: &Path,
     strip_debug: bool,
+    options: LuaCaseOptions,
 ) -> Result<LuaCommandOutput, String> {
+    if toolchain.compiler_protocol != LuaCompilerProtocol::LuauBinaryStdout
+        && options != LuaCaseOptions::default()
+    {
+        return Err("Luau case options require the Luau compiler".to_owned());
+    }
+
     match toolchain.compiler_protocol {
         LuaCompilerProtocol::LuacStyle => {
             let mut command = Command::new(compiler);
@@ -1438,18 +1475,39 @@ fn run_compiler_to_output_path(
         }
         LuaCompilerProtocol::LuauBinaryStdout => {
             let debug_level = if strip_debug { "-g0" } else { "-g2" };
-            let output_bytes = Command::new(compiler)
-                .arg("--binary")
-                .arg(debug_level)
-                .arg(source)
-                .output()
-                .map_err(|error| {
-                    format!(
-                        "should spawn compiler {} for {}: {error}",
-                        compiler.display(),
-                        source.display()
-                    )
-                })?;
+            let mut command = Command::new(compiler);
+            command.arg("--binary").arg(debug_level);
+            if let Some(level) = options.luau_optimization_level {
+                if level > 2 {
+                    return Err(format!("invalid Luau optimization level: {level}"));
+                }
+                command.arg(format!("-O{level}"));
+            }
+            if let Some(vector) = options.luau_vector {
+                if vector.constructor.is_empty() {
+                    return Err("Luau vector constructor must not be empty".to_owned());
+                }
+                if !matches!(vector.components, 3 | 4) {
+                    return Err(format!(
+                        "unsupported Luau vector component count: {}",
+                        vector.components
+                    ));
+                }
+                if let Some(library) = vector.library {
+                    if library.is_empty() {
+                        return Err("Luau vector library must not be empty".to_owned());
+                    }
+                    command.arg(format!("--vector-lib={library}"));
+                }
+                command.arg(format!("--vector-ctor={}", vector.constructor));
+            }
+            let output_bytes = command.arg(source).output().map_err(|error| {
+                format!(
+                    "should spawn compiler {} for {}: {error}",
+                    compiler.display(),
+                    source.display()
+                )
+            })?;
             if output_bytes.status.success() {
                 write_output_file(output, &output_bytes.stdout)?;
             }

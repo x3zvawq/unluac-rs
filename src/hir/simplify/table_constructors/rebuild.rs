@@ -750,6 +750,7 @@ fn expr_captures_orphaned_binding(
         | HirExpr::String(_)
         | HirExpr::Int64(_)
         | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
         | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)

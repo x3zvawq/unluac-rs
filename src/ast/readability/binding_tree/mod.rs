@@ -65,6 +65,7 @@ pub(super) fn expr_references_binding(expr: &AstExpr, binding: AstBindingRef) ->
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::VarArg
         | AstExpr::Error(_) => false,
@@ -330,6 +331,7 @@ fn expr_captures_binding(expr: &AstExpr, binding: AstBindingRef) -> bool {
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg
@@ -396,6 +398,7 @@ pub(super) fn count_name_expr_uses(expr: &AstExpr, binding: AstBindingRef) -> us
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg
@@ -858,6 +861,7 @@ fn expr_has_contextual_binding_use(
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg

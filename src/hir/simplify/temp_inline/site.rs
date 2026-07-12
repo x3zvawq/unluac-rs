@@ -88,6 +88,7 @@ fn temp_is_first_eval_in_expr(expr: &HirExpr, temp: TempId) -> bool {
         | HirExpr::String(_)
         | HirExpr::Int64(_)
         | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
         | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)
@@ -184,6 +185,7 @@ fn find_site_in_expr(expr: &HirExpr, temp: TempId, site: InlineSite) -> Option<I
         | HirExpr::String(_)
         | HirExpr::Int64(_)
         | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
         | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)
@@ -222,6 +224,7 @@ fn expr_complexity(expr: &HirExpr) -> usize {
         | HirExpr::String(_)
         | HirExpr::Int64(_)
         | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
         | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)
@@ -390,6 +393,7 @@ fn is_atomic_nested_inline_expr(expr: &HirExpr) -> bool {
             | HirExpr::String(_)
             | HirExpr::Int64(_)
             | HirExpr::UInt64(_)
+            | HirExpr::Vector(_)
             | HirExpr::Complex { .. }
             | HirExpr::ParamRef(_)
             | HirExpr::LocalRef(_)
@@ -409,6 +413,7 @@ fn is_small_pure_nested_inline_expr(expr: &HirExpr) -> bool {
         | HirExpr::String(_)
         | HirExpr::Int64(_)
         | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
         | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)
@@ -491,6 +496,7 @@ pub(super) fn expr_touches_temp(expr: &HirExpr, temp: TempId) -> bool {
         | HirExpr::String(_)
         | HirExpr::Int64(_)
         | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
         | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)

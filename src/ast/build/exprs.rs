@@ -150,6 +150,7 @@ impl<'a> AstLowerer<'a> {
                 real: *real,
                 imag: *imag,
             },
+            HirExpr::Vector(vector) => AstExpr::Vector(*vector),
             HirExpr::ParamRef(param) => AstExpr::Var(AstNameRef::Param(*param)),
             HirExpr::LocalRef(local) => AstExpr::Var(AstNameRef::Local(*local)),
             HirExpr::UpvalueRef(upvalue) => AstExpr::Var(AstNameRef::Upvalue(*upvalue)),

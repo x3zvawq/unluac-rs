@@ -14,7 +14,7 @@ use crate::parser::raw::{
     Origin, ProtoFrameInfo, ProtoLineRange, ProtoSignature, RawChunk, RawConstPool,
     RawConstPoolCommon, RawDebugInfo, RawDebugInfoCommon, RawInstr, RawInstrOpcode,
     RawInstrOperands, RawLiteralConst, RawLocalVar, RawProto, RawProtoCommon, RawString,
-    RawUpvalueInfo, RawUpvalueInfoCommon, Span,
+    RawUpvalueInfo, RawUpvalueInfoCommon, Span, VectorLiteral,
 };
 use crate::parser::reader::BinaryReader;
 use crate::parser::strings::build_raw_string;
@@ -473,12 +473,16 @@ impl LuauParserState {
                     proto_index: reader.read_varint_u32_luau("luau closure const proto")?,
                     child_proto_index: 0,
                 },
-                7 => LuauConstEntry::Vector {
-                    x: reader.read_f32_le()?,
-                    y: reader.read_f32_le()?,
-                    z: reader.read_f32_le()?,
-                    w: reader.read_f32_le()?,
-                },
+                7 => {
+                    let literal_index = literals.len();
+                    literals.push(RawLiteralConst::Vector(VectorLiteral::from_components([
+                        reader.read_f32_le()?,
+                        reader.read_f32_le()?,
+                        reader.read_f32_le()?,
+                        reader.read_f32_le()?,
+                    ])));
+                    LuauConstEntry::Literal { literal_index }
+                }
                 8 => {
                     let key_count = usize::try_from(
                         reader.read_varint_u32_luau("luau table-with-constants key count")?,

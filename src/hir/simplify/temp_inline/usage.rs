@@ -286,6 +286,7 @@ fn collect_expr_temp_uses(expr: &HirExpr, scratch: &mut TempUseScratch) {
         | HirExpr::String(_)
         | HirExpr::Int64(_)
         | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
         | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)
@@ -464,6 +465,7 @@ fn max_temp_index_in_expr(expr: &HirExpr) -> Option<usize> {
         | HirExpr::String(_)
         | HirExpr::Int64(_)
         | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
         | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)

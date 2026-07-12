@@ -178,7 +178,6 @@ fn format_const_entry(entry: &LuauConstEntry) -> String {
             proto_index,
             child_proto_index,
         } => format!("closure proto={proto_index} child={child_proto_index}"),
-        LuauConstEntry::Vector { x, y, z, w } => format!("vector ({x}, {y}, {z}, {w})"),
     }
 }
 

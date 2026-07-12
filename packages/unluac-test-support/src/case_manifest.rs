@@ -44,12 +44,44 @@ impl LuaCaseDialect {
 pub(crate) struct LuaCaseMatrixEntry {
     pub(crate) path: &'static str,
     pub(crate) dialects: &'static [LuaCaseDialect],
+    pub(crate) options: LuaCaseOptions,
 }
 
 impl LuaCaseMatrixEntry {
     const fn new(path: &'static str, dialects: &'static [LuaCaseDialect]) -> Self {
-        Self { path, dialects }
+        Self {
+            path,
+            dialects,
+            options: LuaCaseOptions::DEFAULT,
+        }
     }
+
+    const fn with_options(mut self, options: LuaCaseOptions) -> Self {
+        self.options = options;
+        self
+    }
+}
+
+/// 单个源码 case 需要的宿主编译与反编译选项。
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub(crate) struct LuaCaseOptions {
+    pub(crate) luau_optimization_level: Option<u8>,
+    pub(crate) luau_vector: Option<LuauVectorCaseOptions>,
+}
+
+impl LuaCaseOptions {
+    const DEFAULT: Self = Self {
+        luau_optimization_level: None,
+        luau_vector: None,
+    };
+}
+
+/// Luau 编译器和反编译器共同使用的 vector 宿主身份。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct LuauVectorCaseOptions {
+    pub(crate) library: Option<&'static str>,
+    pub(crate) constructor: &'static str,
+    pub(crate) components: u8,
 }
 
 /// 展开后的 `(case, dialect)` 测试单元。
@@ -57,6 +89,7 @@ impl LuaCaseMatrixEntry {
 pub struct LuaCaseManifestEntry {
     pub path: &'static str,
     pub dialect: LuaCaseDialect,
+    pub(crate) options: LuaCaseOptions,
 }
 
 const ALL_DIALECTS: &[LuaCaseDialect] = &[
@@ -92,6 +125,14 @@ const PUC_LUA_GE_54: &[LuaCaseDialect] = &[LuaCaseDialect::Lua54, LuaCaseDialect
 const PUC_LUA_GE_55: &[LuaCaseDialect] = &[LuaCaseDialect::Lua55];
 const LUAU_ONLY: &[LuaCaseDialect] = &[LuaCaseDialect::Luau];
 const LUAJIT_ONLY: &[LuaCaseDialect] = &[LuaCaseDialect::Luajit];
+const LUAU_VECTOR_OPTIONS: LuaCaseOptions = LuaCaseOptions {
+    luau_optimization_level: Some(2),
+    luau_vector: Some(LuauVectorCaseOptions {
+        library: Some("vector"),
+        constructor: "create",
+        components: 3,
+    }),
+};
 
 const UNIT_CASES: &[LuaCaseMatrixEntry] = &[
     // ── common cases ──
@@ -133,6 +174,8 @@ const UNIT_CASES: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new("tests/unit-case/lua55_02_named_vararg.lua", PUC_LUA_GE_55),
     LuaCaseMatrixEntry::new("tests/unit-case/luajit_01.lua", LUAJIT_ONLY),
     LuaCaseMatrixEntry::new("tests/unit-case/luau_01.lua", LUAU_ONLY),
+    LuaCaseMatrixEntry::new("tests/unit-case/luau_02_vector.lua", LUAU_ONLY)
+        .with_options(LUAU_VECTOR_OPTIONS),
 ];
 
 const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
@@ -475,6 +518,7 @@ fn manifest_entries(
             .map(move |dialect| LuaCaseManifestEntry {
                 path: entry.path,
                 dialect,
+                options: entry.options,
             })
     })
 }

@@ -38,6 +38,10 @@ pub enum GenerateError {
         dialect: DecompileDialect,
         feature: &'static str,
     },
+    #[error("generating a Luau vector constant requires an explicit vector constructor")]
+    MissingLuauVectorConstructor,
+    #[error("invalid Luau vector constructor identifier `{name}`")]
+    InvalidLuauVectorConstructor { name: String },
 }
 
 impl GenerateError {

@@ -14,7 +14,7 @@ enum LayoutMode {
 }
 
 /// 把 Doc 渲染成最终源码字符串。
-pub fn render_doc(doc: &Doc, options: GenerateOptions) -> String {
+pub fn render_doc(doc: &Doc, options: &GenerateOptions) -> String {
     let mut renderer = Renderer {
         output: String::new(),
         column: 0,
@@ -27,13 +27,13 @@ pub fn render_doc(doc: &Doc, options: GenerateOptions) -> String {
     renderer.output
 }
 
-struct Renderer {
+struct Renderer<'a> {
     output: String,
     column: usize,
-    options: GenerateOptions,
+    options: &'a GenerateOptions,
 }
 
-impl Renderer {
+impl Renderer<'_> {
     fn render(&mut self, doc: &Doc, mode: LayoutMode, indent: usize) {
         match doc {
             Doc::Text(text) => self.push_text(text),

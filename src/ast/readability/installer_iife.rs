@@ -312,6 +312,7 @@ fn expr_looks_like_exported_function_value(
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::FieldAccess(_)
         | AstExpr::IndexAccess(_)

@@ -144,6 +144,9 @@ Generate and output options:
 | `--quote-style` | String quote style | `min-escape` |
 | `--number-format` | Number literal style: `decimal` or `hex` for integer literals | `decimal` |
 | `--table-style` | Table constructor layout style | `balanced` |
+| `--luau-vector-library` | Optional library name for the Luau vector constructor; requires `--luau-vector-constructor` | None |
+| `--luau-vector-constructor` | Constructor used to render Luau vector constants and compile Luau `--source` inputs; requires `--luau-vector-size` | None |
+| `--luau-vector-size` | Luau vector width: `3` or `4`; required with `--luau-vector-constructor` | None |
 | `--conservative-output` | Whether to prefer conservative source generation | `true` |
 | `--comment` | Whether to emit generate-stage comments and metadata | `true` |
 | `-g`, `--generate-mode` | Generation mode: `strict` stops on unsupported target syntax or errors, `permissive` outputs as much as possible | `permissive` |
@@ -236,6 +239,10 @@ import { readFile } from "node:fs/promises";
 const chunkBytes = await readFile("./sample.luac");
 const source = await decompile(chunkBytes, {
   dialect: "auto",
+  generate: {
+    // Required when the chunk contains Luau vector constants.
+    luauVectorConstructor: { library: "Vector3", constructor: "new", size: 3 },
+  },
 });
 
 console.log(source);

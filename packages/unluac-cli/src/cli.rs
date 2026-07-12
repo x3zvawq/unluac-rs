@@ -14,8 +14,8 @@ use std::process::Command;
 use clap::{CommandFactory, Parser, builder::BoolishValueParser, error::ErrorKind};
 use unluac::decompile::{
     DebugColorMode, DebugDetail, DebugFilters, DecompileDialect, DecompileOptions, DecompileStage,
-    GenerateMode, NamingMode, NumberFormat, ProtoDepth, QuoteStyle, TableStyle, decompile,
-    render_timing_report,
+    GenerateMode, LuauVectorConstructor, LuauVectorSize, NamingMode, NumberFormat, ProtoDepth,
+    QuoteStyle, TableStyle, decompile, render_timing_report,
 };
 use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
@@ -198,6 +198,20 @@ struct CliArgs {
         help_heading = "Generate"
     )]
     table_style: Option<TableStyle>,
+    /// Optional Luau vector library name used with `--luau-vector-constructor`.
+    #[arg(long, requires = "luau_vector_constructor", help_heading = "Generate")]
+    luau_vector_library: Option<String>,
+    /// Luau vector constructor used to render vector constants and compile `--source` inputs.
+    #[arg(long, requires = "luau_vector_size", help_heading = "Generate")]
+    luau_vector_constructor: Option<String>,
+    /// Luau vector width (`3` or `4`); required with `--luau-vector-constructor`.
+    #[arg(
+        long,
+        requires = "luau_vector_constructor",
+        value_parser = parse_luau_vector_size_arg,
+        help_heading = "Generate"
+    )]
+    luau_vector_size: Option<LuauVectorSize>,
     /// Whether to prefer conservative source generation.
     #[arg(
         long,
@@ -430,6 +444,14 @@ where
     if let Some(style) = args.table_style {
         decompile.generate.table_style = style;
     }
+    if let (Some(constructor), Some(size)) = (&args.luau_vector_constructor, args.luau_vector_size)
+    {
+        decompile.generate.luau_vector_constructor = Some(LuauVectorConstructor {
+            library: args.luau_vector_library.clone(),
+            constructor: constructor.clone(),
+            size,
+        });
+    }
     if let Some(value) = args.conservative_output {
         decompile.generate.conservative_output = value;
     }
@@ -575,16 +597,23 @@ fn compile_source(options: &CliOptions, source: &Path) -> Result<PathBuf, CliErr
             }
         }
         CompilerProtocol::LuauBinaryStdout => {
-            let command_output = Command::new(&compiler)
-                .arg("--binary")
-                .arg("-g0")
-                .arg(source)
-                .output()
-                .map_err(|source_error| CliError::Io {
-                    action: "spawn compiler",
-                    path: compiler.clone(),
-                    source: source_error,
-                })?;
+            let mut command = Command::new(&compiler);
+            command.arg("--binary").arg("-g0");
+            if let Some(vector) = &options.decompile.generate.luau_vector_constructor {
+                if let Some(library) = &vector.library {
+                    command.arg(format!("--vector-lib={library}"));
+                }
+                command.arg(format!("--vector-ctor={}", vector.constructor));
+            }
+            let command_output =
+                command
+                    .arg(source)
+                    .output()
+                    .map_err(|source_error| CliError::Io {
+                        action: "spawn compiler",
+                        path: compiler.clone(),
+                        source: source_error,
+                    })?;
             if !command_output.status.success() {
                 return Err(CliError::Process(format!(
                     "compiler exited with status {} while compiling {}",
@@ -764,6 +793,14 @@ fn parse_generate_mode_arg(value: &str) -> Result<GenerateMode, String> {
     value
         .parse()
         .map_err(|_| format!("unsupported generate mode: {value}"))
+}
+
+fn parse_luau_vector_size_arg(value: &str) -> Result<LuauVectorSize, String> {
+    match value {
+        "3" => Ok(LuauVectorSize::Three),
+        "4" => Ok(LuauVectorSize::Four),
+        _ => Err(format!("unsupported Luau vector size: {value}")),
+    }
 }
 
 /// 把 RawChunk 渲染成 `--list-protos` 需要的扁平表格。

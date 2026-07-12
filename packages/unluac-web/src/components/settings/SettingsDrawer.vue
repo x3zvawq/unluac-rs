@@ -8,7 +8,7 @@
  * - 关于：补充产品定位、能力边界与项目入口，减少面板信息过干的问题。
  */
 
-import { shallowRef } from 'vue'
+import { computed, shallowRef } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { generateShareUrl } from '@/composables/useShareUrl'
 import { defaultOptions, useSettingsStore } from '@/stores/settings'
@@ -26,6 +26,21 @@ const settings = useSettingsStore()
 const copied = shallowRef(false)
 const cliCopied = shallowRef(false)
 const appVersion = __APP_VERSION__
+const luauVectorEnabled = computed({
+  get: () => settings.options.generate.luauVectorConstructor !== null,
+  set: (enabled: boolean) => {
+    settings.options.generate.luauVectorConstructor = enabled
+      ? { library: 'vector', constructor: 'create', size: 3 }
+      : null
+  },
+})
+const luauVectorLibrary = computed({
+  get: () => settings.options.generate.luauVectorConstructor?.library ?? '',
+  set: (library: string) => {
+    const vector = settings.options.generate.luauVectorConstructor
+    if (vector) vector.library = library || null
+  },
+})
 
 function copyShareUrl() {
   const url = generateShareUrl()
@@ -97,6 +112,16 @@ function buildCliArgs(): string {
   pushOption(args, '--number-format', options.generate.numberFormat, defaults.generate.numberFormat)
   pushOption(args, '--quote-style', options.generate.quoteStyle, defaults.generate.quoteStyle)
   pushOption(args, '--table-style', options.generate.tableStyle, defaults.generate.tableStyle)
+  if (options.generate.luauVectorConstructor) {
+    if (options.generate.luauVectorConstructor.library) {
+      args.push('--luau-vector-library', shellQuote(options.generate.luauVectorConstructor.library))
+    }
+    args.push(
+      '--luau-vector-constructor',
+      shellQuote(options.generate.luauVectorConstructor.constructor),
+    )
+    args.push('--luau-vector-size', String(options.generate.luauVectorConstructor.size))
+  }
   pushOption(
     args,
     '--conservative-output',
@@ -466,6 +491,39 @@ const tableStyleOptions = [
               <NSelect
                 v-model:value="settings.options.generate.tableStyle"
                 :options="tableStyleOptions"
+                size="small"
+              />
+            </div>
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-1">
+                <label class="text-sm">{{ t('settings.generate.luauVectorConstructor') }}</label>
+                <NTooltip>
+                  <template #trigger>
+                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
+                  </template>
+                  {{ t('settings.tips.luauVectorConstructor') }}
+                </NTooltip>
+              </div>
+              <NSwitch v-model:value="luauVectorEnabled" size="small" />
+            </div>
+            <div v-if="settings.options.generate.luauVectorConstructor" class="grid grid-cols-3 gap-2">
+              <NInput
+                v-model:value="luauVectorLibrary"
+                :placeholder="t('settings.generate.luauVectorLibrary')"
+                clearable
+                size="small"
+              />
+              <NInput
+                v-model:value="settings.options.generate.luauVectorConstructor.constructor"
+                :placeholder="t('settings.generate.luauVectorConstructorName')"
+                size="small"
+              />
+              <NSelect
+                v-model:value="settings.options.generate.luauVectorConstructor.size"
+                :options="[
+                  { label: '3D', value: 3 },
+                  { label: '4D', value: 4 },
+                ]"
                 size="small"
               />
             </div>

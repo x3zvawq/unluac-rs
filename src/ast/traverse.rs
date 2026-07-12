@@ -162,6 +162,7 @@ macro_rules! traverse_expr_children {
             | crate::ast::AstExpr::Int64(_)
             | crate::ast::AstExpr::UInt64(_)
             | crate::ast::AstExpr::Complex { .. }
+            | crate::ast::AstExpr::Vector(_)
             | crate::ast::AstExpr::Var(_)
             | crate::ast::AstExpr::VarArg
             | crate::ast::AstExpr::Error(_) => {}

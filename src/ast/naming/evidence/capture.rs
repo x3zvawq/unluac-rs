@@ -181,6 +181,7 @@ fn captured_binding_from_expr(parent: HirProtoRef, expr: &HirExpr) -> Option<Cap
         | HirExpr::String(_)
         | HirExpr::Int64(_)
         | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
         | HirExpr::Complex { .. }
         | HirExpr::GlobalRef(_)
         | HirExpr::VarArg

@@ -77,6 +77,9 @@ await init();
 
 const source = await decompile(chunkBytes, {
   dialect: "luau",
+  generate: {
+    luauVectorConstructor: { library: "Vector3", constructor: "new", size: 3 },
+  },
 });
 
 console.log(source);
@@ -179,6 +182,7 @@ Common `decompile()` options:
 - `numberFormat`
 - `quoteStyle`
 - `tableStyle`
+- `luauVectorConstructor`: optional object with an optional `library`, required `constructor`, and required `size` (`3` or `4`); required when rendering Luau vector constants
 - `conservativeOutput`
 - `comment`
 

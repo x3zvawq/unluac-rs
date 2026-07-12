@@ -562,6 +562,7 @@ fn value_merge_leaf_expr_is_simple_clone(expr: &HirExpr) -> bool {
         | HirExpr::TableConstructor(_)
         | HirExpr::Closure(_)
         | HirExpr::Unresolved(_)
+        | HirExpr::Vector(_)
         | HirExpr::Complex { .. } => false,
     }
 }

@@ -66,6 +66,7 @@ pub(crate) fn expr_for_const(proto: &LoweredProto, const_ref: ConstRef) -> HirEx
             real: *real,
             imag: *imag,
         },
+        Some(RawLiteralConst::Vector(vector)) => HirExpr::Vector(*vector),
         None => unresolved_expr(format!("const k{}", const_ref.index())),
     }
 }

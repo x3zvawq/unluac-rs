@@ -1,7 +1,7 @@
 //! Generate 层共享类型。
 //!
 //! 这些类型需要同时被 decompile 入口、renderer 和调试输出复用，所以单独抽到这里，
-//! 避免把“生成选项”“注释元信息”和“最终产物”散落在 emit/render 两边。
+//! 避免把“生成选项”“宿主构造器配置”“注释元信息”和“最终产物”散落在 emit/render 两边。
 
 use crate::ast::DecompileDialect;
 use crate::hir::{HirModule, HirProtoRef, ProtoLineRange, ProtoSignature};
@@ -26,7 +26,7 @@ impl Default for GeneratedChunk {
 }
 
 /// 代码生成选项。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerateOptions {
     pub mode: GenerateMode,
     pub indent_width: usize,
@@ -36,6 +36,8 @@ pub struct GenerateOptions {
     pub table_style: TableStyle,
     pub conservative_output: bool,
     pub comment: bool,
+    /// 把 Luau vector 常量重新表达成源码时使用的宿主构造器。
+    pub luau_vector_constructor: Option<LuauVectorConstructor>,
 }
 
 impl Default for GenerateOptions {
@@ -49,8 +51,29 @@ impl Default for GenerateOptions {
             table_style: TableStyle::Balanced,
             conservative_output: true,
             comment: true,
+            luau_vector_constructor: None,
         }
     }
+}
+
+/// Luau 宿主用于构造原生 vector 值的源码入口。
+///
+/// `library = Some("vector")`、`constructor = "create"` 表示 `vector.create(...)`；
+/// `library = None` 表示全局函数。bytecode 不保存这份宿主身份，因此必须由调用方显式提供。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuauVectorConstructor {
+    pub library: Option<String>,
+    pub constructor: String,
+    pub size: LuauVectorSize,
+}
+
+/// Luau VM 编译时选择的原生 vector 分量数。
+///
+/// bytecode 无法区分三维 vector 与 `w = 0` 的四维 vector，因此不能从常量值推断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LuauVectorSize {
+    Three,
+    Four,
 }
 
 /// Generate 注释模式需要的只读元信息。

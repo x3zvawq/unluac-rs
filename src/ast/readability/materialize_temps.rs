@@ -317,6 +317,7 @@ fn rewrite_function_expr(expr: &mut AstExpr, temps: &BTreeSet<TempId>) {
         | AstExpr::String(_)
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::VarArg
         | AstExpr::Error(_) => {}

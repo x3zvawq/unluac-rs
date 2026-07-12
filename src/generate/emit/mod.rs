@@ -57,7 +57,7 @@ pub(crate) fn generate_chunk(
     state: &mut DecompileState,
     context: &DecompileContext<'_>,
 ) -> Result<(), DecompileError> {
-    let options = context.options.generate;
+    let options = &context.options.generate;
     let hir = state.require_hir()?;
     let module = state.require_readability()?;
     let names = state.require_naming()?;
@@ -123,7 +123,7 @@ struct Emitter<'a> {
     names: NameResolver<'a>,
     target: AstTargetDialect,
     metadata: Option<&'a GenerateCommentMetadata>,
-    options: GenerateOptions,
+    options: &'a GenerateOptions,
 }
 
 impl<'a> Emitter<'a> {

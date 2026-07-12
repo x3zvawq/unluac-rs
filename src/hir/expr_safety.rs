@@ -23,6 +23,7 @@ pub(crate) fn expr_observes_eval_order(expr: &HirExpr) -> bool {
         | HirExpr::String(_)
         | HirExpr::Int64(_)
         | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
         | HirExpr::Complex { .. }
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)

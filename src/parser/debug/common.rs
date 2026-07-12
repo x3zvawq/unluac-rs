@@ -107,6 +107,9 @@ pub(crate) fn format_literal(literal: &RawLiteralConst) -> String {
         RawLiteralConst::String(value) => format!("str({})", format_raw_string(value)),
         RawLiteralConst::Int64(value) => format!("i64({value})"),
         RawLiteralConst::UInt64(value) => format!("u64({value})"),
+        RawLiteralConst::Vector(vector) => {
+            format!("vector({:?})", vector.components.map(f32::from_bits))
+        }
         RawLiteralConst::Complex { real, imag } => format!("complex({real},{imag})"),
     }
 }

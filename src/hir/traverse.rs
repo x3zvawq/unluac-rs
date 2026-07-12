@@ -181,6 +181,7 @@ macro_rules! traverse_hir_expr_children {
             | crate::hir::HirExpr::Int64(_)
             | crate::hir::HirExpr::UInt64(_)
             | crate::hir::HirExpr::Complex { .. }
+            | crate::hir::HirExpr::Vector(_)
             | crate::hir::HirExpr::ParamRef(_)
             | crate::hir::HirExpr::LocalRef(_)
             | crate::hir::HirExpr::UpvalueRef(_)
