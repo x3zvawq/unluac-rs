@@ -35,7 +35,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let mut values = Vec::new();
 
         for value in &candidate.values {
-            let needs_preserved_seed = branch_value_needs_preserved_entry_seed(value);
+            let needs_preserved_seed = self.branch_value_needs_preserved_entry_seed(header, value);
             let needs_shared_seed = self.branch_value_needs_shared_entry_seed(header, value);
             if !needs_preserved_seed && !needs_shared_seed {
                 continue;
@@ -377,17 +377,41 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         arm_expr
     }
-}
 
-fn branch_value_needs_preserved_entry_seed(value: &BranchValueMergeValue) -> bool {
-    (branch_value_arm_preserves_current(&value.then_arm)
-        && !value.else_arm.non_header_defs.is_empty())
-        || (branch_value_arm_preserves_current(&value.else_arm)
-            && !value.then_arm.non_header_defs.is_empty())
-}
+    fn branch_value_needs_preserved_entry_seed(
+        &self,
+        header: BlockRef,
+        value: &BranchValueMergeValue,
+    ) -> bool {
+        (self.branch_value_arm_preserves_current(header, &value.then_arm)
+            && self.branch_value_arm_updates_current(header, &value.else_arm))
+            || (self.branch_value_arm_preserves_current(header, &value.else_arm)
+                && self.branch_value_arm_updates_current(header, &value.then_arm))
+    }
 
-fn branch_value_arm_preserves_current(arm: &BranchValueMergeArm) -> bool {
-    arm.non_header_defs.is_empty()
+    fn branch_value_arm_preserves_current(
+        &self,
+        header: BlockRef,
+        arm: &BranchValueMergeArm,
+    ) -> bool {
+        !self.branch_value_arm_updates_current(header, arm)
+    }
+
+    fn branch_value_arm_updates_current(
+        &self,
+        header: BlockRef,
+        arm: &BranchValueMergeArm,
+    ) -> bool {
+        arm.non_header_defs.iter().any(|def| {
+            let def_block = self.lowering.dataflow.def_block(*def);
+            def_block != header
+                && self
+                    .lowering
+                    .graph_facts
+                    .dominator_tree
+                    .dominates(header, def_block)
+        })
+    }
 }
 
 fn branch_value_non_header_defs(value: &BranchValueMergeValue) -> impl Iterator<Item = DefId> + '_ {

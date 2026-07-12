@@ -8,10 +8,12 @@
 //! 当一个 header 同时拥有 SC 值合流候选和 BranchValueMerge 候选时，SC 只处理一个
 //! result_reg 的 phi，而 BVM 认领其余 phi。这里的策略是：
 //! - value_merge / conditional_reassign 路径遇到额外 BVM phi 时退让给普通分支；
-//! - statement_value_merge 路径用 SC 树结构为额外 BVM phi 构建平行 Decision 表达式。
+//! - statement_value_merge 路径只在 SC 独占该合流时使用；同一区域已有 BVM 时交给
+//!   普通分支路径统一写回，避免 SC 先消费一部分 phi 后让 BVM 的剩余输出失去同一
+//!   条分支里的槽位上下文。
 //!
 //! 输入形状：SC 覆盖 r4 → `x and (y and 2 or 3) or 6`，BVM 覆盖 r3。
-//! 输出形状：SC 路径额外生成 `Decision(x ? Decision(y ? leaf2 : leaf3) : leaf4)` 给 r3。
+//! 输出形状：普通分支路径在同一 `if` 中同时写回 r3/r4，不把两个 phi 拆成独立结构。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -125,8 +127,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             self.statement_value_merge_would_duplicate_nontrivial_leaf(short, target_overrides);
         let can_defer_to_branch_value_merge =
             self.statement_value_merge_can_defer_to_branch_value_merge(short);
-        let should_use_statement_value_merge =
-            would_duplicate_nontrivial_leaf && !can_defer_to_branch_value_merge;
+        if can_defer_to_branch_value_merge {
+            return None;
+        }
+        let should_use_statement_value_merge = would_duplicate_nontrivial_leaf;
         if recover_short_value_merge_expr_with_allowed_blocks(self.lowering, short, &allowed_blocks)
             .is_some()
             && !should_use_statement_value_merge
@@ -140,10 +144,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         {
             return None;
         }
-        if can_defer_to_branch_value_merge && would_duplicate_nontrivial_leaf {
-            return None;
-        }
-
         let outputs = self.statement_value_merge_outputs(short)?;
         let mut short_stmts = self.lower_block_prefix(block, true, target_overrides)?;
         short_stmts.extend(
@@ -232,13 +232,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let Some(result_phi_id) = short.result_phi_id else {
             return false;
         };
-        if short
-            .value_incomings
-            .iter()
-            .any(|incoming| incoming.latest_local_def.is_none())
-        {
-            return false;
-        }
 
         short.nodes.iter().any(|node| {
             self.branch_value_merges_by_header
@@ -399,16 +392,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         };
         for (short, target_temp) in outputs {
             let value = if block == current_header
-                && (header_subject_is_value_carrier(
-                    self.lowering,
-                    current_header,
-                    short.result_reg,
-                ) || current_header_value_leaf_uses_subject(
-                    self.lowering,
-                    short,
-                    current_header,
-                )) {
-                // Truthiness 测试的当前 header leaf 没有本地 def 时，subject 运行时值就是 leaf 值。
+                && header_subject_is_value_carrier(self.lowering, current_header, short.result_reg)
+            {
+                // 只有直接测试 result_reg 的 truthiness 时，subject 才是当前 leaf 值。
+                // 其它寄存器的 guard 只是在控制是否保留旧值，不能把 guard 本身当作结果。
                 lower_short_circuit_subject(self.lowering, block)?
             } else {
                 lower_materialized_value_leaf_expr(self.lowering, short, block)?
@@ -505,30 +492,6 @@ fn value_merge_defs_are_overridden(
             .value_incomings
             .iter()
             .any(|inc| inc.defs.iter().any(is_overridden))
-}
-
-fn current_header_value_leaf_uses_subject(
-    lowering: &ProtoLowering<'_>,
-    short: &ShortCircuitCandidate,
-    current_header: BlockRef,
-) -> bool {
-    if !short.nodes.iter().any(|node| node.header == current_header) {
-        return false;
-    }
-    if !short
-        .value_incomings
-        .iter()
-        .any(|incoming| incoming.pred == current_header && incoming.latest_local_def.is_none())
-    {
-        return false;
-    }
-    let Some(instr_ref) = lowering.cfg.blocks[current_header.index()].instrs.last() else {
-        return false;
-    };
-    matches!(
-        &lowering.proto.instrs[instr_ref.index()],
-        LowInstr::Branch(branch) if branch.cond.predicate == BranchPredicate::Truthy
-    )
 }
 
 fn merge_has_other_live_phi(

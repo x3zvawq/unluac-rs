@@ -67,7 +67,8 @@ impl NestedTempProtection {
             }
             NestedScopeKind::Full => {
                 // 前缀保护求值点，后缀保护外层继续消费的 temp，二者都只对当前
-                // nested stmt 中实际出现的 temp 生效。
+                // nested stmt 中实际出现的 temp 生效。`if` 子块内的状态写回也需要
+                // 这层保护，否则内联进条件后会删掉外层后续仍要读取的赋值。
                 protected.extend(
                     self.stmt_temps[stmt_index]
                         .iter()
@@ -124,7 +125,11 @@ fn stmt_has_nested_inline_scope(stmt: &HirStmt) -> bool {
 fn stmt_needs_full_nested_scope_protection(stmt: &HirStmt) -> bool {
     matches!(
         stmt,
-        HirStmt::While(_) | HirStmt::Repeat(_) | HirStmt::NumericFor(_) | HirStmt::GenericFor(_)
+        HirStmt::If(_)
+            | HirStmt::While(_)
+            | HirStmt::Repeat(_)
+            | HirStmt::NumericFor(_)
+            | HirStmt::GenericFor(_)
     )
 }
 

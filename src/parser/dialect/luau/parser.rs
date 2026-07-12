@@ -2,7 +2,8 @@
 //!
 //! Luau 的 serialized bytecode 不是 PUC-Lua 的 `lundump` 变体：它使用独立的
 //! 版本头、字符串表、平铺 proto 表和混合常量表。这里按 Luau loader 的真实格式
-//! 直接解码，避免在公共层伪造 PUC-Lua 头或常量池形状。
+//! 直接解码，并在读取任何版本相关布局前按仓库 pinned Luau 的兼容范围校验 header，
+//! 避免在公共层伪造 PUC-Lua 头，也避免把未知版本误读成当前常量池或 proto 形状。
 
 use crate::decompile::DecompileDialect;
 use crate::parser::error::ParseError;
@@ -24,6 +25,11 @@ use super::raw::{
 };
 
 const LUAU_ERROR_BLOB_VERSION: u8 = 0;
+// 与 lua/sources/luau/Common/include/Luau/Bytecode.h 的 loader 契约保持同步。
+const LUAU_BYTECODE_VERSION_MIN: u8 = 3;
+const LUAU_BYTECODE_VERSION_MAX: u8 = 7;
+const LUAU_TYPE_VERSION_MIN: u8 = 1;
+const LUAU_TYPE_VERSION_MAX: u8 = 3;
 
 pub(crate) struct LuauParser {
     options: ParseOptions,
@@ -132,9 +138,22 @@ impl LuauParserState {
                 value: 0,
             });
         }
+        if !(LUAU_BYTECODE_VERSION_MIN..=LUAU_BYTECODE_VERSION_MAX).contains(&bytecode_version) {
+            return Err(ParseError::UnsupportedValue {
+                field: "luau bytecode version",
+                value: u64::from(bytecode_version),
+            });
+        }
 
         let type_version = if bytecode_version >= 4 {
-            Some(reader.read_u8()?)
+            let type_version = reader.read_u8()?;
+            if !(LUAU_TYPE_VERSION_MIN..=LUAU_TYPE_VERSION_MAX).contains(&type_version) {
+                return Err(ParseError::UnsupportedValue {
+                    field: "luau type version",
+                    value: u64::from(type_version),
+                });
+            }
+            Some(type_version)
         } else {
             None
         };

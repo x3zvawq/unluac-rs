@@ -49,7 +49,6 @@ pub(super) fn analyze_loops(
             backedges.dedup();
             let preheader = unique_loop_preheader(cfg, header, &blocks);
             let exits = collect_region_exits(cfg, &blocks);
-            let reducible = is_reducible_region(cfg, header, &blocks);
             let binding_scope_blocks =
                 loop_binding_scope(&blocks, &exits, header, cfg, graph_facts);
             let header_value_merges = analyze_loop_header_value_merges(dataflow, header, &blocks);
@@ -77,7 +76,6 @@ pub(super) fn analyze_loops(
                 source_bindings,
                 header_value_merges,
                 exit_value_merges,
-                reducible,
             }
         })
         .collect::<Vec<_>>();
@@ -151,7 +149,6 @@ fn degenerate_generic_for_loop(
         source_bindings: generic_for_source_bindings(proto, cfg, header),
         header_value_merges,
         exit_value_merges,
-        reducible: true,
     })
 }
 

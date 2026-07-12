@@ -6,7 +6,8 @@
 //! 语义时，不需要在一个超大文件里来回跳转。
 //!
 //! 例子：`BranchCandidate { header, then, else, merge }` →
-//! `HirStmt::If { cond, then_block, else_block }`。
+//! `HirStmt::If { cond, then_block, else_block }`。所有路径覆盖判断统一交给
+//! `path_checks`；本文件不自行维护递归遍历或回环判定。
 
 use super::*;
 
@@ -259,6 +260,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         match branch_stop {
             Some(next) if next == self.lowering.cfg.exit_block => Some(None),
+            Some(next)
+                if self
+                    .active_loops
+                    .last()
+                    .is_some_and(|loop_context| loop_context.header == next) =>
+            {
+                Some(None)
+            }
             Some(next) => Some(Some(next)),
             None => Some(None),
         }
@@ -429,16 +438,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let Some(candidate) = self.loop_by_header.get(&header).copied() else {
             return false;
         };
-        if !candidate.reducible
-            || candidate.kind_hint != LoopKindHint::GenericForLike
-            || candidate.preheader != Some(entry)
+        if candidate.kind_hint != LoopKindHint::GenericForLike || candidate.preheader != Some(entry)
         {
             return false;
         }
 
         candidate.exits.iter().all(|exit| {
             !self.can_reach(*exit, shared)
-                && self.entry_must_reach_shared_or_terminate(
+                && self.branch_arm_reaches_shared_continuation_or_terminate(
                     *exit,
                     shared,
                     self.lowering.cfg.exit_block,
@@ -462,61 +469,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         boundary: BlockRef,
     ) -> bool {
         self.entry_must_reach_or_escape_before_boundary(entry, shared, boundary)
-            || self.entry_must_reach_shared_or_terminate(entry, shared, boundary)
-    }
-
-    fn entry_must_reach_shared_or_terminate(
-        &self,
-        entry: BlockRef,
-        shared: BlockRef,
-        boundary: BlockRef,
-    ) -> bool {
-        fn visit(
-            lowerer: &StructuredBodyLowerer<'_, '_>,
-            block: BlockRef,
-            shared: BlockRef,
-            boundary: BlockRef,
-            visiting: &mut BTreeSet<BlockRef>,
-            memo: &mut BTreeMap<BlockRef, bool>,
-        ) -> bool {
-            if block == shared {
-                return true;
-            }
-            if block == boundary || !lowerer.lowering.cfg.reachable_blocks.contains(&block) {
-                return false;
-            }
-            if block == lowerer.lowering.cfg.exit_block || lowerer.block_is_terminal_exit(block) {
-                return true;
-            }
-            if let Some(result) = memo.get(&block).copied() {
-                return result;
-            }
-            if !visiting.insert(block) {
-                return true;
-            }
-
-            let result = lowerer.lowering.cfg.succs[block.index()]
-                .iter()
-                .all(|edge_ref| {
-                    let successor = lowerer.lowering.cfg.edges[edge_ref.index()].to;
-                    visit(lowerer, successor, shared, boundary, visiting, memo)
-                });
-            visiting.remove(&block);
-            memo.insert(block, result);
-            result
-        }
-
-        // shared continuation 可能在 generic/numeric loop 的正常出口之后。
-        // 这类 arm 内部存在回边，不能因为看到 cycle 就认定它无法到达 shared；
-        // 只要所有非终止出口都被约束到 shared，就可以把 shared 留给外层顺序消费。
-        visit(
-            self,
-            entry,
-            shared,
-            boundary,
-            &mut BTreeSet::new(),
-            &mut BTreeMap::new(),
-        )
+            || self.branch_arm_reaches_shared_continuation_or_terminate(entry, shared, boundary)
     }
 
     // 有些 elseif 链在结构事实上已经有共享 tail，但其中几条臂会先跳到外层 merge
@@ -609,13 +562,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     && !self.loop_by_header.contains_key(tail)
                     && self.linear_tail_target(*tail) == Some(merge)
                     && self.region_predecessor_count(*tail, &region.structured_blocks) >= 2
-                    && self.branch_arm_reaches_target_or_boundary(
+                    && self.branch_arm_reaches_target_or_boundary_or_terminate(
                         candidate.then_entry,
                         *tail,
                         merge,
                     )
                     && candidate.else_entry.is_none_or(|else_entry| {
-                        self.branch_arm_reaches_target_or_boundary(else_entry, *tail, merge)
+                        self.branch_arm_reaches_target_or_boundary_or_terminate(
+                            else_entry, *tail, merge,
+                        )
                     })
             })
             .min()
@@ -644,57 +599,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .iter()
             .filter(|edge_ref| region.contains(&self.lowering.cfg.edges[edge_ref.index()].from))
             .count()
-    }
-
-    fn branch_arm_reaches_target_or_boundary(
-        &self,
-        entry: BlockRef,
-        target: BlockRef,
-        boundary: BlockRef,
-    ) -> bool {
-        fn visit(
-            lowerer: &StructuredBodyLowerer<'_, '_>,
-            block: BlockRef,
-            target: BlockRef,
-            boundary: BlockRef,
-            visiting: &mut BTreeSet<BlockRef>,
-            memo: &mut BTreeMap<BlockRef, bool>,
-        ) -> bool {
-            if block == target || block == boundary {
-                return true;
-            }
-            if block == lowerer.lowering.cfg.exit_block || lowerer.block_is_terminal_exit(block) {
-                return true;
-            }
-            if !lowerer.lowering.cfg.reachable_blocks.contains(&block) {
-                return false;
-            }
-            if let Some(result) = memo.get(&block).copied() {
-                return result;
-            }
-            if !visiting.insert(block) {
-                return true;
-            }
-
-            let result = lowerer.lowering.cfg.succs[block.index()]
-                .iter()
-                .all(|edge_ref| {
-                    let successor = lowerer.lowering.cfg.edges[edge_ref.index()].to;
-                    visit(lowerer, successor, target, boundary, visiting, memo)
-                });
-            visiting.remove(&block);
-            memo.insert(block, result);
-            result
-        }
-
-        visit(
-            self,
-            entry,
-            target,
-            boundary,
-            &mut BTreeSet::new(),
-            &mut BTreeMap::new(),
-        )
     }
 
     fn block_has_unstructured_continue_requirement(&self, block: BlockRef) -> bool {

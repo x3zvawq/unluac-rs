@@ -267,7 +267,7 @@ fn write_loops(output: &mut String, indent: &str, candidates: &[LoopCandidate]) 
     for candidate in candidates {
         let _ = writeln!(
             output,
-            "{indent}    header=#{} preheader={} kind={} bindings={} binding-scope={} continue={} exits={} reducible={} backedges={} blocks={}",
+            "{indent}    header=#{} preheader={} kind={} bindings={} binding-scope={} continue={} exits={} backedges={} blocks={}",
             candidate.header.index(),
             format_optional_block(candidate.preheader),
             format_loop_kind(candidate.kind_hint),
@@ -275,7 +275,6 @@ fn write_loops(output: &mut String, indent: &str, candidates: &[LoopCandidate]) 
             format_display_set(&candidate.binding_scope_blocks),
             format_optional_block(candidate.continue_target),
             format_display_set(&candidate.exits),
-            candidate.reducible,
             format_display_set(&candidate.backedges),
             format_display_set(&candidate.blocks),
         );

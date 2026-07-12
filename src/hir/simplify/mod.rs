@@ -31,7 +31,9 @@ use crate::debug::DebugFilters;
 use crate::generate::GenerateMode;
 use crate::hir::common::HirModule;
 use crate::hir::promotion::ProtoPromotionFacts;
-use crate::scheduler::{InvalidationTag, PassDescriptor, PassPhase, run_invalidation_loop};
+use crate::scheduler::{
+    InvalidationConvergence, InvalidationTag, PassDescriptor, PassPhase, run_invalidation_loop,
+};
 use crate::timing::TimingCollector;
 
 /// pass dump 需要的参数包。
@@ -202,10 +204,10 @@ pub(super) fn simplify_hir(
     generate_mode: GenerateMode,
     dialect: crate::ast::DecompileDialect,
     dump_config: &PassDumpConfig,
-) {
+) -> Result<(), crate::decompile::DecompileError> {
     let empty_facts = ProtoPromotionFacts::default();
 
-    run_invalidation_loop(
+    let convergence = run_invalidation_loop(
         PASS_DESCRIPTORS,
         |index, name| {
             // 如果当前 pass 在 dump 列表中，先快照 before。关闭 debug feature 的构建
@@ -256,6 +258,12 @@ pub(super) fn simplify_hir(
         },
         MAX_SIMPLIFY_ITERATIONS,
     );
+    if let InvalidationConvergence::LimitExceeded { rounds } = convergence {
+        return Err(crate::decompile::DecompileError::PassLimitExceeded {
+            stage: crate::decompile::DecompileStage::Hir,
+            rounds,
+        });
+    }
 
     let residuals = residuals::collect_hir_exit_residuals(module);
     if residuals.has_soft_residuals() && generate_mode != GenerateMode::Permissive {
@@ -268,6 +276,7 @@ pub(super) fn simplify_hir(
             residuals.other_unstructured
         ));
     }
+    Ok(())
 }
 
 #[cfg(feature = "decompile-debug")]

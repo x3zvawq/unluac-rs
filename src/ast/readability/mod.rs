@@ -28,7 +28,9 @@ mod walk;
 
 use super::common::{AstModule, AstTargetDialect};
 use crate::decompile::{DecompileContext, DecompileError, DecompileState};
-use crate::scheduler::{InvalidationTag, PassDescriptor, PassPhase, run_invalidation_loop};
+use crate::scheduler::{
+    InvalidationConvergence, InvalidationTag, PassDescriptor, PassPhase, run_invalidation_loop,
+};
 use crate::timing::TimingCollector;
 
 /// 可调的源码形状阈值。
@@ -252,7 +254,7 @@ pub(crate) fn make_readable(
         context.options.readability,
         context.timings,
         &context.options.debug.dump_passes,
-    ));
+    )?);
     Ok(())
 }
 
@@ -263,11 +265,11 @@ pub(crate) fn make_readable_module(
     options: ReadabilityOptions,
     timings: &TimingCollector,
     dump_passes: &[String],
-) -> AstModule {
+) -> Result<AstModule, DecompileError> {
     let mut module = module.clone();
     let context = ReadabilityContext { target, options };
 
-    run_invalidation_loop(
+    let convergence = run_invalidation_loop(
         PASS_DESCRIPTORS,
         |index, name| {
             // 如果当前 pass 在 dump 列表中，先快照 before。关闭 debug feature 的构建
@@ -286,8 +288,14 @@ pub(crate) fn make_readable_module(
         },
         MAX_ROUNDS,
     );
+    if let InvalidationConvergence::LimitExceeded { rounds } = convergence {
+        return Err(DecompileError::PassLimitExceeded {
+            stage: crate::decompile::DecompileStage::Ast,
+            rounds,
+        });
+    }
 
-    module
+    Ok(module)
 }
 
 #[cfg(feature = "decompile-debug")]

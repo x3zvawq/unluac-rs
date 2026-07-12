@@ -33,8 +33,8 @@ pub(super) fn analyze_regions(
             entry: loop_candidate.header,
             exits: loop_candidate.exits.clone(),
             kind: RegionKind::LoopRegion,
-            reducible: loop_candidate.reducible,
-            structureable: loop_candidate.reducible,
+            reducible: true,
+            structureable: true,
         });
     }
 

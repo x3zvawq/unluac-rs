@@ -14,6 +14,8 @@
 //! - **Phase**：可选的阶段分区。标记为 `Deferred` 的 pass 只在所有 `Normal` pass
 //!   收敛后才执行；如果 `Deferred` pass 又产出新 invalidation，会触发 `Normal` pass 重跑。
 //! - **收敛**：当一轮遍历中没有任何 pass 返回 `changed=true` 时收敛。
+//! - **上限**：达到轮数上限不等于收敛；调用层必须把它作为显式错误处理，不能继续消费
+//!   可能仍处于中间态的产物。
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -46,6 +48,13 @@ pub trait InvalidationTag: Copy + Eq + Ord + fmt::Debug + 'static {
     fn all() -> &'static [Self];
 }
 
+/// fixed-point 调度的终止状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidationConvergence {
+    Converged,
+    LimitExceeded { rounds: usize },
+}
+
 /// 调度器的运行时入口。
 ///
 /// 接受一组 pass 描述和对应的执行函数，按固定点策略执行。
@@ -59,27 +68,27 @@ pub fn run_invalidation_loop<T, F>(
     passes: &[PassDescriptor<T>],
     mut run_pass: F,
     max_rounds: usize,
-) -> bool
+) -> InvalidationConvergence
 where
     T: InvalidationTag,
     F: FnMut(usize, &str) -> bool,
 {
     // 初始：所有 tag 都 dirty（第一轮每个 pass 都要跑）
     let mut dirty: BTreeSet<T> = T::all().iter().copied().collect();
-    let mut any_change_overall = false;
     let mut rounds = 0;
 
     loop {
         // ── Normal phase: 固定点收敛 ──
-        let normal_changed = run_phase_until_converged(
+        if !run_phase_until_converged(
             passes,
             PassPhase::Normal,
             &mut dirty,
             &mut run_pass,
             max_rounds,
             &mut rounds,
-        );
-        any_change_overall |= normal_changed;
+        ) {
+            return InvalidationConvergence::LimitExceeded { rounds };
+        }
 
         // ── Deferred phase: 单遍执行 ──
         // Normal 收敛后 dirty set 通常为空（没有 pass 再产出变化）。但 Deferred pass
@@ -88,19 +97,15 @@ where
         dirty = T::all().iter().copied().collect();
         let deferred_changed =
             run_single_round(passes, PassPhase::Deferred, &mut dirty, &mut run_pass);
-        any_change_overall |= deferred_changed;
-
-        if deferred_changed {
-            rounds += 1;
+        if !deferred_changed {
+            return InvalidationConvergence::Converged;
         }
-
-        if !deferred_changed || rounds >= max_rounds {
-            break;
+        rounds += 1;
+        if rounds >= max_rounds {
+            return InvalidationConvergence::LimitExceeded { rounds };
         }
         // Deferred 产出了新 dirty → 回到 Normal 重新收敛
     }
-
-    any_change_overall
 }
 
 /// 反复执行某个 phase 的所有 pass 直到 dirty set 中没有该 phase 关心的 tag。
@@ -116,24 +121,19 @@ where
     T: InvalidationTag,
     F: FnMut(usize, &str) -> bool,
 {
-    let mut any_change = false;
-
     loop {
         if *rounds >= max_rounds {
-            break;
+            return false;
         }
 
         let round_changed = run_single_round(passes, phase, dirty, run_pass);
-        any_change |= round_changed;
 
         if round_changed {
             *rounds += 1;
         } else {
-            break;
+            return true;
         }
     }
-
-    any_change
 }
 
 /// 对某个 phase 的所有 pass 遍历一遍。

@@ -34,28 +34,35 @@ pub(super) fn analyze_branches(
             if then_entry == else_entry {
                 return None;
             }
-            classify_one_arm_branch(&mut reachability, header, then_entry, else_entry)
-                .or_else(|| {
-                    classify_if_else_branch(
-                        cfg,
-                        graph_facts,
-                        &mut reachability,
-                        header,
-                        then_entry,
-                        else_entry,
-                    )
-                })
-                .or_else(|| {
-                    classify_loop_bounded_one_arm_branch(
-                        &mut reachability,
-                        header,
-                        then_entry,
-                        else_entry,
-                    )
-                })
-                .or_else(|| {
-                    classify_guard_branch(cfg, &mut reachability, header, then_entry, else_entry)
-                })
+            classify_infinite_loop_bounded_branch(
+                &mut reachability,
+                loop_candidates,
+                header,
+                then_entry,
+                else_entry,
+            )
+            .or_else(|| classify_one_arm_branch(&mut reachability, header, then_entry, else_entry))
+            .or_else(|| {
+                classify_if_else_branch(
+                    cfg,
+                    graph_facts,
+                    &mut reachability,
+                    header,
+                    then_entry,
+                    else_entry,
+                )
+            })
+            .or_else(|| {
+                classify_loop_bounded_one_arm_branch(
+                    &mut reachability,
+                    header,
+                    then_entry,
+                    else_entry,
+                )
+            })
+            .or_else(|| {
+                classify_guard_branch(cfg, &mut reachability, header, then_entry, else_entry)
+            })
         })
         .collect();
     branch_candidates.sort_by_key(|candidate| candidate.header);
@@ -125,7 +132,6 @@ impl<'a> ReachabilityCache<'a> {
     fn new(cfg: &'a Cfg, loop_candidates: &[LoopCandidate]) -> Self {
         let loop_exits_by_header = loop_candidates
             .iter()
-            .filter(|candidate| candidate.reducible)
             .map(|candidate| (candidate.header, candidate.exits.clone()))
             .collect();
         Self {
@@ -210,6 +216,83 @@ fn classify_one_arm_branch(
             kind: BranchKind::IfThen,
             invert_hint: true,
         }),
+        _ => None,
+    }
+}
+
+fn classify_infinite_loop_bounded_branch(
+    reachability: &mut ReachabilityCache<'_>,
+    loop_candidates: &[LoopCandidate],
+    header: BlockRef,
+    then_entry: BlockRef,
+    else_entry: BlockRef,
+) -> Option<BranchCandidate> {
+    let loop_candidate = loop_candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.exits.is_empty()
+                && candidate.blocks.contains(&header)
+                && candidate.blocks.contains(&then_entry)
+                && candidate.blocks.contains(&else_entry)
+        })
+        .min_by_key(|candidate| candidate.blocks.len())?;
+
+    let then_reaches_else =
+        reachability.can_reach_without_entering_loop_header(then_entry, else_entry);
+    let else_reaches_then =
+        reachability.can_reach_without_entering_loop_header(else_entry, then_entry);
+    let local_merge = loop_candidate
+        .blocks
+        .iter()
+        .copied()
+        .filter(|candidate| *candidate != header && *candidate != loop_candidate.header)
+        .find(|candidate| {
+            reachability.can_reach_without_entering_loop_header(then_entry, *candidate)
+                && reachability.can_reach_without_entering_loop_header(else_entry, *candidate)
+        });
+
+    match (then_reaches_else, else_reaches_then) {
+        (true, false) => Some(BranchCandidate {
+            header,
+            then_entry,
+            else_entry: None,
+            merge: Some(else_entry),
+            kind: BranchKind::IfThen,
+            invert_hint: false,
+        }),
+        (false, true) => Some(BranchCandidate {
+            header,
+            then_entry: else_entry,
+            else_entry: None,
+            merge: Some(then_entry),
+            kind: BranchKind::IfThen,
+            invert_hint: true,
+        }),
+        (false, false) if local_merge.is_some() => Some(BranchCandidate {
+            header,
+            then_entry,
+            else_entry: Some(else_entry),
+            merge: local_merge,
+            kind: BranchKind::IfElse,
+            invert_hint: false,
+        }),
+        (false, false)
+            if reachability
+                .can_reach_without_entering_loop_header(then_entry, loop_candidate.header)
+                && reachability
+                    .can_reach_without_entering_loop_header(else_entry, loop_candidate.header) =>
+        {
+            // 无出口循环没有严格后支配点，但两臂都在本轮结束后回到同一 header，
+            // 该 header 就是源码层 if/else 的循环内合流边界。
+            Some(BranchCandidate {
+                header,
+                then_entry,
+                else_entry: Some(else_entry),
+                merge: Some(loop_candidate.header),
+                kind: BranchKind::IfElse,
+                invert_hint: false,
+            })
+        }
         _ => None,
     }
 }

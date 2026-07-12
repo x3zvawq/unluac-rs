@@ -20,10 +20,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Option<BlockRef>> {
         let candidate = *self.loop_by_header.get(&block)?;
-        if !candidate.reducible {
-            return None;
-        }
-
         match candidate.kind_hint {
             LoopKindHint::WhileLike => {
                 self.lower_while_loop(candidate, stop, stmts, target_overrides)
@@ -536,7 +532,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         let header = self.lowering.cfg.instr_to_block[init.body_target.index()];
         let candidate = *self.loop_by_header.get(&header)?;
-        if !candidate.reducible || candidate.kind_hint != LoopKindHint::NumericForLike {
+        if candidate.kind_hint != LoopKindHint::NumericForLike {
             return None;
         }
 
@@ -653,8 +649,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     ) -> Option<Option<BlockRef>> {
         let header = self.lowering.cfg.unique_reachable_successor(block)?;
         let candidate = self.loop_by_header.get(&header).copied()?;
-        if !candidate.reducible
-            || candidate.kind_hint != LoopKindHint::GenericForLike
+        if candidate.kind_hint != LoopKindHint::GenericForLike
             || candidate.continue_target != Some(header)
             || unique_loop_preheader(candidate)? != block
         {

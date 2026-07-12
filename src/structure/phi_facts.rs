@@ -12,7 +12,8 @@
 //! 例子：
 //! - branch merge 会把 `phi.incoming` 直接整理成 `then_arm / else_arm` 两臂 def 集
 //! - loop header/exit merge 会整理成 `inside_arm / outside_arm` 或按 predecessor
-//!   分组的 incoming facts
+//!   分组的 incoming facts；generic owner 只排除 natural loop 必然接管的 header phi，
+//!   exit phi 是否被接管仍由 HIR state 对齐结果决定
 //! - short-circuit value merge 会提前带出 `entry_defs / value_incomings`，避免 HIR
 //!   再回头拆 phi
 
@@ -167,7 +168,7 @@ pub(super) fn analyze_generic_phi_materializations(
     covered.extend(consumed_branch_value_merge_ids(
         branch_value_merge_candidates,
     ));
-    covered.extend(consumed_loop_value_merge_ids(loop_candidates));
+    covered.extend(consumed_loop_header_phi_ids(loop_candidates));
 
     let mut generic = dataflow
         .phi_candidates
@@ -305,29 +306,13 @@ fn value_merge_entry_defs(
         .unwrap_or_default()
 }
 
-fn consumed_loop_value_merge_ids(loop_candidates: &[LoopCandidate]) -> BTreeSet<PhiId> {
-    let mut ids = BTreeSet::new();
-
-    for candidate in loop_candidates {
-        let header_regs = candidate
+fn consumed_loop_header_phi_ids(
+    loop_candidates: &[LoopCandidate],
+) -> impl Iterator<Item = PhiId> + '_ {
+    loop_candidates.iter().flat_map(|candidate| {
+        candidate
             .header_value_merges
             .iter()
-            .map(|value| value.reg)
-            .collect::<BTreeSet<_>>();
-
-        ids.extend(
-            candidate
-                .header_value_merges
-                .iter()
-                .map(|value| value.phi_id),
-        );
-        ids.extend(candidate.exit_value_merges.iter().flat_map(|exit| {
-            exit.values
-                .iter()
-                .filter(|value| header_regs.contains(&value.reg))
-                .map(|value| value.phi_id)
-        }));
-    }
-
-    ids
+            .map(|value| value.phi_id)
+    })
 }

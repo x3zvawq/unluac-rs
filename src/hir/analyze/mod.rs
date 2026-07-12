@@ -53,8 +53,8 @@ pub(crate) fn analyze_hir(
             context.options.generate.mode,
             context.options.dialect,
             &dump_config,
-        );
-    });
+        )
+    })?;
     state.hir = Some(module);
     Ok(())
 }

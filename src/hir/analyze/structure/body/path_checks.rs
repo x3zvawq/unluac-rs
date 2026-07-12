@@ -7,6 +7,8 @@
 //!
 //! 输入形状：`then_entry` 所有非终止路径都到达 `shared`，另一条路径 return。
 //! 输出形状：返回 `true`，调用方可以把 `shared` 留给外层 continuation，而不是复制 tail。
+//! 未被 loop/branch owner 分类的回环返回 `false`；已有候选 owner 的 loop 只沿显式 exits
+//! 继续检查，避免各调用方复制 DFS 后对回环采用不同口径。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -44,6 +46,23 @@ impl StructuredBodyLowerer<'_, '_> {
             }
             (block == self.lowering.cfg.exit_block || self.block_is_terminal_exit(block))
                 .then_some(true)
+        })
+    }
+
+    pub(super) fn branch_arm_reaches_target_or_boundary_or_terminate(
+        &self,
+        entry: BlockRef,
+        target: BlockRef,
+        boundary: BlockRef,
+    ) -> bool {
+        self.branch_arm_paths_all_match(entry, |block| {
+            if block == target || block == boundary {
+                return Some(true);
+            }
+            if block == self.lowering.cfg.exit_block || self.block_is_terminal_exit(block) {
+                return Some(true);
+            }
+            (!self.lowering.cfg.reachable_blocks.contains(&block)).then_some(false)
         })
     }
 
@@ -118,9 +137,7 @@ impl StructuredBodyLowerer<'_, '_> {
             if let Some(result) = memo.get(&block).copied() {
                 return result;
             }
-            if let Some(loop_candidate) = lowerer.loop_by_header.get(&block).copied()
-                && loop_candidate.reducible
-            {
+            if let Some(loop_candidate) = lowerer.loop_by_header.get(&block).copied() {
                 let result = loop_candidate
                     .exits
                     .iter()

@@ -170,6 +170,28 @@ impl StructuredBodyLowerer<'_, '_> {
             }));
         }
 
+        if let Some(loop_header) = self.active_loops.last().and_then(|loop_context| {
+            consumed_headers
+                .last()
+                .and_then(|header| self.branch_by_header.get(header))
+                .and_then(|candidate| candidate.merge)
+                .filter(|merge| *merge == loop_context.header)
+        }) {
+            // 无出口循环没有共同后支配点；Structure 已证明短路链末端的两臂都以
+            // 当前 loop header 为本轮合流边界。保留该 merge，branch lowering 会在
+            // 两臂自然回到 header 后结束本轮，不会重复降低循环头。
+            let consumed_blocks =
+                self.branch_short_circuit_consumed_blocks(&consumed_headers, truthy, falsy, stop);
+            return Some(Some(StructuredBranchPlan {
+                cond,
+                then_entry: truthy,
+                else_entry: Some(falsy),
+                merge: Some(loop_header),
+                consumed_headers,
+                consumed_blocks,
+            }));
+        }
+
         let Some(merge) = self
             .lowering
             .graph_facts

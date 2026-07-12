@@ -23,7 +23,7 @@ use crate::structure::{
     BranchValueMergeValue, GotoReason, LoopCandidate, LoopKindHint, LoopValueArm, LoopValueMerge,
     ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNodeRef, ShortCircuitTarget,
 };
-use crate::transformer::{BranchPredicate, InstrRef, LowInstr, Reg};
+use crate::transformer::{InstrRef, LowInstr, Reg};
 
 use super::exprs::{
     expr_for_dup_safe_fixed_def, expr_for_entry_reg, expr_for_fixed_def,

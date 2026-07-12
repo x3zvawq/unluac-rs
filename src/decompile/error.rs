@@ -36,4 +36,9 @@ pub enum DecompileError {
     DebugUnavailable,
     #[error("requested debug output for stage `{stage}`, but that stage has no artifact yet")]
     MissingStageOutput { stage: DecompileStage },
+    #[error("stage `{stage}` did not converge after {rounds} fixed-point rounds")]
+    PassLimitExceeded {
+        stage: DecompileStage,
+        rounds: usize,
+    },
 }

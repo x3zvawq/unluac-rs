@@ -144,7 +144,6 @@ pub struct LoopCandidate {
     pub source_bindings: Option<LoopSourceBindings>,
     pub header_value_merges: Vec<LoopValueMerge>,
     pub exit_value_merges: Vec<LoopExitValueMergeCandidate>,
-    pub reducible: bool,
 }
 
 /// 循环头已经暴露给 HIR 的源码绑定证据。
