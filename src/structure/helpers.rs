@@ -68,8 +68,8 @@ pub(super) fn collect_forward_region_blocks(
     while let Some(block) = worklist.pop_front() {
         if Some(block) == stop
             || !cfg.reachable_blocks.contains(&block)
-            || !blocks.insert(block)
             || dom_limit.is_some_and(|(root, tree)| !tree.dominates(root, block))
+            || !blocks.insert(block)
         {
             continue;
         }

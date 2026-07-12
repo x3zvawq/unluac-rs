@@ -24,7 +24,7 @@ mod branch_exit;
 mod shared;
 mod value_merge;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::structure::{BlockRef, Cfg, DataflowFacts, GraphFacts};
 use crate::transformer::{LoweredProto, Reg};
@@ -70,6 +70,11 @@ pub(super) fn analyze_short_circuits(
         &branch_by_header,
         branch_candidates,
     ));
+    candidates = candidates
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     candidates.sort_by_key(|candidate| {
         (
             candidate.header,

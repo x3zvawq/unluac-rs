@@ -21,6 +21,8 @@ use super::safety::expr_is_synth_safe;
 use super::value::{SynthTarget, structured_candidates, validate_candidate_for_node};
 use super::{MAX_SYNTH_REFS, normalize_candidate_expr};
 
+const MAX_READABLE_ENVIRONMENTS: usize = 512;
+
 pub(crate) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
     if !matches!(expr, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_)) {
         return None;
@@ -104,6 +106,11 @@ pub(crate) fn synthesize_readable_pure_logical_expr(expr: &HirExpr) -> Option<Hi
         (0..super::EXTRA_TRUTHY_SYMBOLS).map(|index| AbstractValue::TruthySymbol(index as u8)),
     );
     let environments = enumerate_environments(refs.len(), &domain)?;
+    // 这里只改善可读性；超过这个穷举规模时保留前层已验证的等价表达式，避免
+    // 单个大布尔式把整个 AST readability 拖入候选数 x 环境数的高开销搜索。
+    if environments.len() > MAX_READABLE_ENVIRONMENTS {
+        return None;
+    }
     let mut best = current.clone();
     let mut visited = vec![current.clone()];
     let mut queue = vec![current.clone()];

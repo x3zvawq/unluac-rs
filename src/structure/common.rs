@@ -242,7 +242,7 @@ pub enum LoopKindHint {
 }
 
 /// 一个短路表达式候选。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ShortCircuitCandidate {
     pub header: BlockRef,
     pub blocks: BTreeSet<BlockRef>,
@@ -405,7 +405,7 @@ impl ShortCircuitCandidate {
 /// 再顺着 `PhiCandidate.incoming` 去拆 value leaf 的 defs。`latest_local_def` 进一步把
 /// “这个 leaf block 自己最后一次写 result_reg 的 def”前移出来，避免 HIR 再回头扫描
 /// block 指令去找叶子值来源。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ShortCircuitValueIncoming {
     pub pred: BlockRef,
     pub defs: BTreeSet<DefId>,
@@ -427,7 +427,7 @@ impl ShortCircuitNodeRef {
 /// 这里显式用 `truthy/falsy` 语义连边，而不是 raw `then/else`。原因是结构层的职责
 /// 是把 CFG 重新翻译成“按 Lua 求值语义理解”的候选，方便 HIR 直接基于真值流恢复
 /// `and/or`，而不用再次反查 `negated` 和 branch 边方向。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ShortCircuitNode {
     pub id: ShortCircuitNodeRef,
     pub header: BlockRef,

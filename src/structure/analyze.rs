@@ -73,7 +73,7 @@ pub(crate) fn analyze_structure_proto(
     dataflow: &DataflowFacts,
     child_cfgs: &[CfgGraph],
 ) -> StructureFacts {
-    let loop_candidates = loops::analyze_loops(proto, cfg, graph_facts, dataflow);
+    let mut loop_candidates = loops::analyze_loops(proto, cfg, graph_facts, dataflow);
     let branch_candidates = branches::analyze_branches(cfg, graph_facts, &loop_candidates);
     let branch_region_facts =
         branches::analyze_branch_regions(cfg, graph_facts, &branch_candidates);
@@ -105,6 +105,10 @@ pub(crate) fn analyze_structure_proto(
         dataflow,
         &branch_region_facts,
         &short_circuit_candidates,
+    );
+    phi_facts::remove_branch_owned_loop_exit_values(
+        &mut loop_candidates,
+        &branch_value_merge_candidates,
     );
     let generic_phi_materializations = phi_facts::analyze_generic_phi_materializations(
         cfg,

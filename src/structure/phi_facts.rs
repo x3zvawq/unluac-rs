@@ -12,8 +12,8 @@
 //! 例子：
 //! - branch merge 会把 `phi.incoming` 直接整理成 `then_arm / else_arm` 两臂 def 集
 //! - loop header/exit merge 会整理成 `inside_arm / outside_arm` 或按 predecessor
-//!   分组的 incoming facts；generic owner 只排除 natural loop 必然接管的 header phi，
-//!   exit phi 是否被接管仍由 HIR state 对齐结果决定
+//!   分组的 incoming facts；branch 已完整覆盖两臂时拥有更外层的 exit phi，loop 只保留
+//!   自己需要接管的出口值；generic owner 只排除确定已有结构 owner 的 phi
 //! - short-circuit value merge 会提前带出 `entry_defs / value_incomings`，避免 HIR
 //!   再回头拆 phi
 
@@ -183,6 +183,23 @@ pub(super) fn analyze_generic_phi_materializations(
         .collect::<Vec<_>>();
     generic.sort_by_key(|phi| (phi.block, phi.phi_id));
     generic
+}
+
+/// 外层 branch 已完整解释两臂来源时，不让内层 loop 再物化同一个出口 phi。
+pub(super) fn remove_branch_owned_loop_exit_values(
+    loop_candidates: &mut [LoopCandidate],
+    branch_candidates: &[BranchValueMergeCandidate],
+) {
+    let branch_owned = consumed_branch_value_merge_ids(branch_candidates).collect::<BTreeSet<_>>();
+    for candidate in loop_candidates {
+        for exit in &mut candidate.exit_value_merges {
+            exit.values
+                .retain(|value| !branch_owned.contains(&value.phi_id));
+        }
+        candidate
+            .exit_value_merges
+            .retain(|exit| !exit.values.is_empty());
+    }
 }
 
 fn consumed_branch_value_merge_ids(

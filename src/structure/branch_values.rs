@@ -20,6 +20,12 @@ use super::common::{
 use super::helpers::collect_merge_arm_preds;
 use super::phi_facts::branch_value_merges_in_block;
 
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum CandidateSource {
+    BranchRegion,
+    GuardShortCircuit,
+}
+
 pub(super) fn analyze_branch_value_merges(
     cfg: &Cfg,
     _graph_facts: &GraphFacts,
@@ -37,31 +43,40 @@ pub(super) fn analyze_branch_value_merges(
         })
         .collect::<BTreeSet<_>>();
 
-    let mut candidates: Vec<_> = branch_regions
+    let candidates = branch_regions
         .iter()
         .filter_map(|branch_region| {
             analyze_branch_value_merge_candidate(dataflow, branch_region, &short_circuit_merges)
         })
-        .collect();
+        .map(|candidate| (CandidateSource::BranchRegion, candidate))
+        .chain(
+            analyze_guard_short_circuit_branch_value_merges(
+                cfg,
+                dataflow,
+                short_circuit_candidates,
+            )
+            .into_iter()
+            .map(|candidate| (CandidateSource::GuardShortCircuit, candidate)),
+        );
 
-    candidates.extend(analyze_guard_short_circuit_branch_value_merges(
-        cfg,
-        dataflow,
-        short_circuit_candidates,
-    ));
-
-    let mut best_by_region = BTreeMap::<(BlockRef, BlockRef), BranchValueMergeCandidate>::new();
-    for candidate in candidates {
+    let mut best_by_region =
+        BTreeMap::<(BlockRef, BlockRef), (CandidateSource, BranchValueMergeCandidate)>::new();
+    for (source, candidate) in candidates {
         let key = (candidate.header, candidate.merge);
         match best_by_region.get(&key) {
-            Some(existing) if existing.values.len() >= candidate.values.len() => {}
+            Some((existing_source, existing))
+                if (existing.values.len(), *existing_source)
+                    >= (candidate.values.len(), source) => {}
             _ => {
-                best_by_region.insert(key, candidate);
+                best_by_region.insert(key, (source, candidate));
             }
         }
     }
 
-    best_by_region.into_values().collect()
+    best_by_region
+        .into_values()
+        .map(|(_, candidate)| candidate)
+        .collect()
 }
 
 fn analyze_guard_short_circuit_branch_value_merges(

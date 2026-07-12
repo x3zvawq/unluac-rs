@@ -23,7 +23,7 @@ use crate::transformer::{LowInstr, LoweredProto, Reg, ResultPack};
 use super::common::{
     LoopCandidate, LoopExitValueMergeCandidate, LoopKindHint, LoopSourceBindings, LoopValueMerge,
 };
-use super::helpers::{collect_region_exits, is_reducible_region};
+use super::helpers::{collect_forward_region_blocks, collect_region_exits, is_reducible_region};
 use super::phi_facts::loop_value_merges_in_block;
 
 pub(super) fn analyze_loops(
@@ -87,8 +87,95 @@ pub(super) fn analyze_loops(
         graph_facts,
         &grouped_headers,
     ));
+    loop_candidates.extend(
+        cfg.reachable_blocks
+            .iter()
+            .copied()
+            .filter_map(|preheader| {
+                degenerate_numeric_for_loop(
+                    proto,
+                    cfg,
+                    dataflow,
+                    graph_facts,
+                    &grouped_headers,
+                    preheader,
+                )
+            }),
+    );
     loop_candidates.sort_by_key(|candidate| candidate.header);
     loop_candidates
+}
+
+fn degenerate_numeric_for_loop(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    graph_facts: &GraphFacts,
+    grouped_headers: &BTreeSet<BlockRef>,
+    preheader: BlockRef,
+) -> Option<LoopCandidate> {
+    let Some(LowInstr::NumericForInit(init)) = cfg.terminator(&proto.instrs, preheader) else {
+        return None;
+    };
+    let header = cfg.instr_to_block[init.body_target.index()];
+    let exit = cfg.instr_to_block[init.exit_target.index()];
+    if grouped_headers.contains(&header) || header == exit {
+        return None;
+    }
+
+    let latch = proto
+        .instrs
+        .iter()
+        .enumerate()
+        .find_map(|(index, instr)| match instr {
+            LowInstr::NumericForLoop(loop_instr)
+                if loop_instr.index == init.index
+                    && loop_instr.limit == init.limit
+                    && loop_instr.step == init.step
+                    && loop_instr.binding == init.binding
+                    // Luau 会把不可达 latch 的 body edge 直接改指向 loop exit。
+                    && (loop_instr.body_target == init.body_target
+                        || loop_instr.body_target == init.exit_target)
+                    && loop_instr.exit_target == init.exit_target =>
+            {
+                Some(cfg.instr_to_block[index])
+            }
+            _ => None,
+        })?;
+    if cfg.reachable_blocks.contains(&latch)
+        || latch == preheader
+        || latch == header
+        || latch == exit
+    {
+        return None;
+    }
+
+    let mut blocks = collect_forward_region_blocks(
+        cfg,
+        [header],
+        Some(exit),
+        Some((header, &graph_facts.dominator_tree)),
+    );
+    blocks.insert(latch);
+    let exits = collect_region_exits(cfg, &blocks);
+    if !exits.contains(&exit) || !is_reducible_region(cfg, header, &blocks) {
+        return None;
+    }
+    let binding_scope_blocks = loop_binding_scope(&blocks, &exits, header, cfg, graph_facts);
+
+    Some(LoopCandidate {
+        header,
+        preheader: Some(preheader),
+        binding_scope_blocks,
+        backedges: Vec::new(),
+        exits: exits.clone(),
+        continue_target: Some(latch),
+        kind_hint: LoopKindHint::NumericForLike,
+        source_bindings: Some(LoopSourceBindings::Numeric(init.binding)),
+        header_value_merges: analyze_loop_header_value_merges(dataflow, header, &blocks),
+        exit_value_merges: analyze_loop_exit_value_merges(dataflow, &exits, &blocks),
+        blocks,
+    })
 }
 
 fn analyze_degenerate_generic_for_loops(

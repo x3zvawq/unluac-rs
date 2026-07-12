@@ -497,6 +497,18 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_72_loop_exit_generic_owner.lua",
         PUC_LUA_51,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_73_branch_owns_nested_loop_exit_phi.lua",
+        PUC_LUA_51,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_74_degenerate_numeric_for.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_75_guard_bvm_priority.lua",
+        PUC_LUA_51,
+    ),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {
