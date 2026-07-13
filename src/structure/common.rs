@@ -137,6 +137,8 @@ pub struct LoopCandidate {
     /// 里的 `return i` 仍在 `i` 的作用域内。Structure 在这里统一保存作用域事实，
     /// HIR bindings 只消费它来分配寄存器到 local 的映射。
     pub binding_scope_blocks: BTreeSet<BlockRef>,
+    /// 已被循环语法吸收、无需作为源码 body 单独降低的 VM 控制块。
+    pub control_blocks: BTreeSet<BlockRef>,
     pub backedges: Vec<EdgeRef>,
     pub exits: BTreeSet<BlockRef>,
     pub continue_target: Option<BlockRef>,

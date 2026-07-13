@@ -76,7 +76,17 @@ impl StructuredBodyLowerer<'_, '_> {
             if block == continuation {
                 return Some(true);
             }
-            if block == stop || block == self.lowering.cfg.exit_block {
+            if block == stop {
+                return Some(false);
+            }
+            // 纯 return 尾块可以直接终结当前 arm；带 Close/Tbc 等前缀的 terminal
+            // block 仍属于外层词法边界，不能为寻找 loop continuation 提前吸入分支。
+            if self.block_is_terminal_exit(block)
+                && self.lowering.cfg.blocks[block.index()].instrs.len == 1
+            {
+                return Some(true);
+            }
+            if block == self.lowering.cfg.exit_block {
                 return Some(false);
             }
             if self.block_is_active_loop_escape(block) {

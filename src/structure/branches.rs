@@ -130,10 +130,12 @@ struct ReachabilityCache<'a> {
 
 impl<'a> ReachabilityCache<'a> {
     fn new(cfg: &'a Cfg, loop_candidates: &[LoopCandidate]) -> Self {
-        let loop_exits_by_header = loop_candidates
-            .iter()
-            .map(|candidate| (candidate.header, candidate.exits.clone()))
-            .collect();
+        let mut loop_exits_by_header = BTreeMap::new();
+        for candidate in loop_candidates {
+            loop_exits_by_header
+                .entry(candidate.header)
+                .or_insert_with(|| candidate.exits.clone());
+        }
         Self {
             cfg,
             memo: BTreeMap::new(),

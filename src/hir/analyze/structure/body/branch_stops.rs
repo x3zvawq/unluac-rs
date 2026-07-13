@@ -17,6 +17,7 @@ impl StructuredBodyLowerer<'_, '_> {
         else_entry: Option<BlockRef>,
         merge: Option<BlockRef>,
         stop: Option<BlockRef>,
+        consumed_blocks: &[BlockRef],
     ) -> Option<BlockRef> {
         if stop.is_none() {
             return merge.or_else(|| {
@@ -26,6 +27,15 @@ impl StructuredBodyLowerer<'_, '_> {
         let Some(stop) = stop else {
             return merge;
         };
+        if let Some(loop_continuation) = self.loop_body_shared_continuation_stop(
+            block,
+            then_entry,
+            else_entry,
+            stop,
+            consumed_blocks,
+        ) {
+            return Some(loop_continuation);
+        }
         // if-then 没有显式 else 时，缺席的 else 路径本身就是落到 merge。
         // 即使 merge 是 terminal exit，也必须把它留作分支之后的共享 continuation；
         // 否则 then 臂会先消费 terminal merge，随后缺席 else 再次进入同一块而重入失败。
@@ -54,11 +64,6 @@ impl StructuredBodyLowerer<'_, '_> {
         }
         if then_entry == stop || else_entry == Some(stop) {
             return Some(stop);
-        }
-        if let Some(loop_continuation) =
-            self.loop_body_shared_continuation_stop(block, then_entry, else_entry, stop)
-        {
-            return Some(loop_continuation);
         }
         if let Some(shared_continuation) =
             self.branch_shared_continuation_stop(block, then_entry, else_entry, merge, Some(stop))
@@ -155,6 +160,7 @@ impl StructuredBodyLowerer<'_, '_> {
         then_entry: BlockRef,
         else_entry: Option<BlockRef>,
         stop: BlockRef,
+        consumed_blocks: &[BlockRef],
     ) -> Option<BlockRef> {
         // while 体内的 if/elseif 链经常有两类出口：一类是 break，另一类先汇合到
         // “本轮收尾”块（例如 i = i + 1）再回到 header。StructureFacts 的分支 merge
@@ -162,18 +168,44 @@ impl StructuredBodyLowerer<'_, '_> {
         // 消费同一个收尾块。这里只在所有非 escape 路径都能到达同一个回 header 块时，
         // 把该块作为当前分支的局部 stop，让它由外层 loop body 统一消费一次。
         let loop_context = self.active_loops.last()?;
-        if loop_context.header != stop {
+        if loop_context.header != stop && loop_context.continue_target != Some(stop) {
             return None;
         }
         let region = self.branch_regions_by_header.get(&block)?;
+        let active_candidate = self.loop_candidate(loop_context.candidate_id)?;
+        let nested_loop_interiors = self
+            .lowering
+            .structure
+            .loop_candidates
+            .iter()
+            .filter(|nested| {
+                nested.header != loop_context.header
+                    && nested.blocks.is_subset(loop_body_blocks(active_candidate))
+            })
+            .flat_map(|nested| {
+                nested
+                    .blocks
+                    .iter()
+                    .copied()
+                    .filter(|block| *block != nested.header && Some(*block) != nested.preheader)
+            })
+            .collect::<BTreeSet<_>>();
         let continuation = region
             .structured_blocks
             .iter()
             .copied()
             .filter(|candidate| *candidate != block)
+            .filter(|candidate| !consumed_blocks.contains(candidate))
+            .filter(|candidate| *candidate != stop)
             .filter(|candidate| *candidate != then_entry && Some(*candidate) != else_entry)
+            .filter(|candidate| !nested_loop_interiors.contains(candidate))
             .filter(|candidate| {
                 self.lowering.cfg.unique_reachable_successor(*candidate) == Some(stop)
+                    || self.branch_arm_reaches_loop_continuation_or_escape(
+                        *candidate,
+                        stop,
+                        loop_context.header,
+                    )
             })
             .find(|candidate| {
                 self.branch_arm_reaches_loop_continuation_or_escape(then_entry, *candidate, stop)

@@ -140,8 +140,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         for block in &plan.consumed_blocks {
             self.visited.insert(*block);
         }
-        let mut branch_stop =
-            self.branch_stop_for_region(block, plan.then_entry, plan.else_entry, plan.merge, stop);
+        let mut branch_stop = self.branch_stop_for_region(
+            block,
+            plan.then_entry,
+            plan.else_entry,
+            plan.merge,
+            stop,
+            &plan.consumed_blocks,
+        );
         if let Some(downstream) = self.if_then_downstream_merge_stop(&plan, branch_stop, stop) {
             branch_stop = Some(downstream);
         }
@@ -435,13 +441,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let Some(header) = self.lowering.cfg.unique_reachable_successor(entry) else {
             return false;
         };
-        let Some(candidate) = self.loop_by_header.get(&header).copied() else {
+        let Some(candidate) = self.loops_by_header.get(&header).and_then(|candidates| {
+            candidates.iter().find_map(|(_, candidate)| {
+                (candidate.kind_hint == LoopKindHint::GenericForLike
+                    && candidate.preheader == Some(entry))
+                .then_some(*candidate)
+            })
+        }) else {
             return false;
         };
-        if candidate.kind_hint != LoopKindHint::GenericForLike || candidate.preheader != Some(entry)
-        {
-            return false;
-        }
 
         candidate.exits.iter().all(|exit| {
             !self.can_reach(*exit, shared)
@@ -457,8 +465,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let Some(header) = self.lowering.cfg.unique_reachable_successor(preheader) else {
             return false;
         };
-        self.loop_by_header.get(&header).is_some_and(|candidate| {
-            candidate.preheader == Some(preheader) && candidate.exits.contains(&shared)
+        self.loops_by_header.get(&header).is_some_and(|candidates| {
+            candidates.iter().any(|(_, candidate)| {
+                candidate.preheader == Some(preheader) && candidate.exits.contains(&shared)
+            })
         })
     }
 
@@ -512,6 +522,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         let region = self.branch_regions_by_header.get(&block).copied()?;
         let loop_context = ActiveLoopContext {
+            candidate_id: self.loop_candidate_id(loop_candidate)?,
             header: block,
             loop_blocks: region.structured_blocks.clone(),
             post_loop: merge,
@@ -527,7 +538,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             block,
             Some(tail),
             target_overrides,
-            Some(block),
+            Some(self.loop_candidate_id(loop_candidate)?),
         );
         self.active_loops.pop();
         let mut body = body_result?.stmts;

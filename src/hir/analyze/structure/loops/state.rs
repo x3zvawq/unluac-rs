@@ -41,7 +41,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             //     exit phi 也不引用它 → 安全跳过。
             //  2) nil 初始化的循环携带变量（如 `local last_positive`）：
             //     循环体或循环结束后仍需使用 → 用 nil 作为初值。
-            let init = match self.loop_entry_expr(preheader, value, target_overrides) {
+            // 相邻结构化 loop 可能共享同一个 CFG header phi：前一个 loop 已在当前
+            // header 安装稳定 entry identity，后一个 loop 应直接继承，不能再从混有
+            // 前一 loop exit 与自身 backedge 的原始 incoming defs 重新猜初值。
+            let inherited_entry = self
+                .overrides
+                .carried_entry_expr(candidate.header, value.reg)
+                .cloned();
+            let init = match inherited_entry
+                .or_else(|| self.loop_entry_expr(preheader, value, target_overrides))
+            {
                 Some(init) => init,
                 None => {
                     if value.outside_arm.defs().count() == 0 {

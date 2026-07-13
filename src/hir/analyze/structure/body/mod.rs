@@ -45,6 +45,7 @@ pub(super) struct StructuredBodyLowerer<'a, 'b> {
     pub(super) branch_regions_by_header: BTreeMap<BlockRef, &'b BranchRegionFact>,
     pub(super) branch_value_merges_by_header: BTreeMap<BlockRef, &'b BranchValueMergeCandidate>,
     pub(super) loop_by_header: BTreeMap<BlockRef, &'b LoopCandidate>,
+    pub(super) loops_by_header: BTreeMap<BlockRef, Vec<(usize, &'b LoopCandidate)>>,
     pub(super) label_map: BTreeMap<BlockRef, HirLabelId>,
     pub(super) required_labels: BTreeSet<BlockRef>,
     pub(super) merge_allowed_blocks: BTreeMap<BlockRef, BTreeSet<BlockRef>>,
@@ -84,6 +85,7 @@ pub(super) struct LoopStatePlan {
 
 #[derive(Debug, Clone)]
 pub(super) struct ActiveLoopContext {
+    pub(super) candidate_id: usize,
     pub(super) header: BlockRef,
     pub(super) loop_blocks: BTreeSet<BlockRef>,
     pub(super) post_loop: BlockRef,
@@ -150,11 +152,20 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .iter()
             .map(|fact| (fact.header, fact))
             .collect();
-        let loop_by_header = lowering
-            .structure
-            .loop_candidates
+        let mut loops_by_header = BTreeMap::<BlockRef, Vec<_>>::new();
+        for (candidate_id, candidate) in lowering.structure.loop_candidates.iter().enumerate() {
+            loops_by_header
+                .entry(candidate.header)
+                .or_default()
+                .push((candidate_id, candidate));
+        }
+        let loop_by_header = loops_by_header
             .iter()
-            .map(|candidate| (candidate.header, candidate))
+            .filter_map(|(header, candidates)| {
+                candidates
+                    .first()
+                    .map(|(_, candidate)| (*header, *candidate))
+            })
             .collect();
         let structured_close_points = lowering
             .structure
@@ -179,6 +190,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             branch_regions_by_header,
             branch_value_merges_by_header,
             loop_by_header,
+            loops_by_header,
             label_map: build_label_map_for_summary(lowering.cfg),
             required_labels: BTreeSet::new(),
             merge_allowed_blocks: BTreeMap::new(),
@@ -236,7 +248,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         start: BlockRef,
         stop: Option<BlockRef>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
-        suppressed_loop_header: Option<BlockRef>,
+        suppressed_loop_id: Option<usize>,
     ) -> Option<HirBlock> {
         let mut current = Some(start);
         let mut stmts = Vec::new();
@@ -273,8 +285,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
             self.emit_required_label(block, &mut stmts);
 
-            if self.loop_by_header.contains_key(&block) && Some(block) != suppressed_loop_header {
-                current = self.lower_loop(block, stop, &mut stmts, target_overrides)?;
+            if let Some((candidate_id, _)) =
+                self.loop_candidate_for_entry(block, suppressed_loop_id)
+            {
+                current =
+                    self.lower_loop(block, candidate_id, stop, &mut stmts, target_overrides)?;
             } else if self.branch_by_header.contains_key(&block) {
                 current = self.lower_branch(block, stop, &mut stmts, target_overrides)?;
             } else {
@@ -283,6 +298,37 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         Some(HirBlock { stmts })
+    }
+
+    pub(super) fn loop_candidate_id(&self, candidate: &LoopCandidate) -> Option<usize> {
+        self.loops_by_header
+            .get(&candidate.header)?
+            .iter()
+            .find_map(|(candidate_id, known)| {
+                std::ptr::eq(*known, candidate).then_some(*candidate_id)
+            })
+    }
+
+    pub(super) fn loop_candidate(&self, candidate_id: usize) -> Option<&'b LoopCandidate> {
+        self.lowering.structure.loop_candidates.get(candidate_id)
+    }
+
+    fn loop_candidate_for_entry(
+        &self,
+        header: BlockRef,
+        suppressed_loop_id: Option<usize>,
+    ) -> Option<(usize, &'b LoopCandidate)> {
+        self.loops_by_header
+            .get(&header)?
+            .iter()
+            .find_map(|(candidate_id, candidate)| {
+                (Some(*candidate_id) != suppressed_loop_id
+                    && !self
+                        .active_loops
+                        .iter()
+                        .any(|active| active.candidate_id == *candidate_id))
+                .then_some((*candidate_id, *candidate))
+            })
     }
 
     fn emit_required_label(&self, block: BlockRef, stmts: &mut Vec<HirStmt>) {

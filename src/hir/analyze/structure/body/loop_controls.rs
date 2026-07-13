@@ -79,12 +79,21 @@ impl StructuredBodyLowerer<'_, '_> {
         // loop tail 就会被一起吞进去，随后整片 region 只能 fallback。这里优先把
         // 非 break 臂截到当前 loop 的 continue target；只有确实没有这条稳定回路时，
         // 才继续沿用 break exit 作为边界。
-        let body_stop = loop_context
-            .continue_target
-            .filter(|target| {
-                *target != break_exit
-                    && (candidate.then_entry == *target
-                        || self.can_reach(candidate.then_entry, *target))
+        let body_stop = stop
+            .filter(|stop| {
+                *stop != break_exit
+                    && self.branch_arm_reaches_stop_or_loop_escape(
+                        candidate.then_entry,
+                        *stop,
+                        break_exit,
+                    )
+            })
+            .or_else(|| {
+                loop_context.continue_target.filter(|target| {
+                    *target != break_exit
+                        && (candidate.then_entry == *target
+                            || self.can_reach(candidate.then_entry, *target))
+                })
             })
             .or(Some(break_exit));
         let then_block = self.lower_region(candidate.then_entry, body_stop, target_overrides)?;
@@ -194,7 +203,7 @@ impl StructuredBodyLowerer<'_, '_> {
             return None;
         }
 
-        let loop_candidate = self.loop_by_header.get(&loop_context.header).copied()?;
+        let loop_candidate = self.loop_candidate(loop_context.candidate_id)?;
         if loop_candidate.blocks.contains(&merge) {
             return None;
         }
@@ -252,8 +261,7 @@ impl StructuredBodyLowerer<'_, '_> {
         let continue_target = loop_context.continue_target?;
         let continue_target_is_empty = self.loop_continue_target_is_empty(continue_target);
         let can_fallthrough_to_non_empty_continue = self
-            .loop_by_header
-            .get(&loop_context.header)
+            .loop_candidate(loop_context.candidate_id)
             .is_some_and(|candidate| {
                 matches!(
                     candidate.kind_hint,
@@ -408,6 +416,7 @@ impl StructuredBodyLowerer<'_, '_> {
                 candidate.else_entry,
                 candidate.merge,
                 stop,
+                &[],
             );
             let non_continue_target_overrides = self.branch_entry_target_overrides(
                 block,

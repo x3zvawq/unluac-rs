@@ -427,7 +427,7 @@ impl StructuredBodyLowerer<'_, '_> {
         })
     }
 
-    fn rewrite_short_circuit_skipped_header_prefixes(
+    pub(in crate::hir::analyze::structure) fn rewrite_short_circuit_skipped_header_prefixes(
         &self,
         header: BlockRef,
         consumed_headers: &[BlockRef],
@@ -510,8 +510,7 @@ impl StructuredBodyLowerer<'_, '_> {
         let Some(loop_context) = self.active_loops.last() else {
             return false;
         };
-        self.loop_by_header
-            .get(&loop_context.header)
+        self.loop_candidate(loop_context.candidate_id)
             .is_some_and(|candidate| {
                 matches!(
                     candidate.kind_hint,

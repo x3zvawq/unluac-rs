@@ -20,12 +20,9 @@ impl StructuredBodyLowerer<'_, '_> {
     ) -> Option<ActiveLoopContext> {
         let downstream_post_loop = self.normalized_post_loop_successor(post_loop);
         let mut break_exits = BTreeMap::new();
-        for exit in candidate
-            .exits
-            .iter()
-            .copied()
-            .filter(|exit| *exit != post_loop)
-        {
+        for exit in candidate.exits.iter().copied().filter(|exit| {
+            *exit != post_loop && !self.loop_exit_enters_nested_loop(candidate, *exit)
+        }) {
             if block_is_terminal_exit(self.lowering, exit) {
                 continue;
             }
@@ -67,6 +64,7 @@ impl StructuredBodyLowerer<'_, '_> {
             .unwrap_or_default();
 
         Some(ActiveLoopContext {
+            candidate_id: self.loop_candidate_id(candidate)?,
             header: candidate.header,
             loop_blocks: BTreeSet::new(),
             post_loop,
@@ -94,13 +92,11 @@ impl StructuredBodyLowerer<'_, '_> {
         post_loop: BlockRef,
     ) -> Option<BTreeSet<BlockRef>> {
         let downstream_post_loop = self.normalized_post_loop_successor(post_loop);
-        let mut inside_blocks = candidate.blocks.clone();
-        for exit in candidate
-            .exits
-            .iter()
-            .copied()
-            .filter(|exit| *exit != post_loop)
-        {
+        let body_blocks = loop_body_blocks(candidate);
+        let mut inside_blocks = body_blocks.clone();
+        for exit in candidate.exits.iter().copied().filter(|exit| {
+            *exit != post_loop && !self.loop_exit_enters_nested_loop(candidate, *exit)
+        }) {
             if block_is_terminal_exit(self.lowering, exit) {
                 continue;
             }
@@ -120,6 +116,18 @@ impl StructuredBodyLowerer<'_, '_> {
             inside_blocks.insert(exit);
         }
         Some(inside_blocks)
+    }
+
+    fn loop_exit_enters_nested_loop(&self, candidate: &LoopCandidate, exit: BlockRef) -> bool {
+        self.lowering
+            .structure
+            .loop_candidates
+            .iter()
+            .any(|nested| {
+                !std::ptr::eq(nested, candidate)
+                    && nested.blocks.is_subset(loop_body_blocks(candidate))
+                    && (nested.header == exit || nested.preheader == Some(exit))
+            })
     }
 
     fn loop_exit_region_is_terminal(

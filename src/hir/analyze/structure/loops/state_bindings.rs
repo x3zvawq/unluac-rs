@@ -314,6 +314,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return target.clone();
         }
 
+        if let Some(target) = self
+            .overrides
+            .carried_entry_expr(candidate.header, reg)
+            .and_then(expr_as_lvalue)
+        {
+            return target;
+        }
+
         if candidate.preheader.is_none()
             && let Some(target) =
                 self.multi_entry_loop_entry_lvalue(candidate, reg, target_overrides)
@@ -329,6 +337,17 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         if let Some(target) =
             self.uniform_loop_exit_target_override(candidate, exit, reg, target_overrides)
+        {
+            return target;
+        }
+
+        if let Some(target) = self
+            .active_loops
+            .iter()
+            .rev()
+            .flat_map(|context| context.state_slots.iter())
+            .find(|state| state.reg == reg)
+            .map(|state| state.target.clone())
         {
             return target;
         }

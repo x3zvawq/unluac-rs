@@ -50,6 +50,17 @@ fn unique_loop_preheader(candidate: &LoopCandidate) -> Option<BlockRef> {
     candidate.preheader
 }
 
+pub(super) fn loop_body_blocks(candidate: &LoopCandidate) -> &BTreeSet<BlockRef> {
+    if matches!(
+        candidate.kind_hint,
+        LoopKindHint::NumericForLike | LoopKindHint::GenericForLike
+    ) {
+        &candidate.binding_scope_blocks
+    } else {
+        &candidate.blocks
+    }
+}
+
 fn block_is_terminal_exit(lowering: &ProtoLowering<'_>, block: BlockRef) -> bool {
     let Some(instr_ref) = lowering.cfg.blocks[block.index()].instrs.last() else {
         return false;

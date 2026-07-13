@@ -9,6 +9,15 @@
 
 use super::*;
 
+#[derive(Clone, Copy)]
+struct BreakExitPadArmContext<'a> {
+    post_loop: BlockRef,
+    downstream_post_loop: Option<BlockRef>,
+    target_overrides: &'a BTreeMap<TempId, HirLValue>,
+    states: &'a [LoopStateSlot],
+    allowed_blocks: &'a BTreeSet<BlockRef>,
+}
+
 impl StructuredBodyLowerer<'_, '_> {
     pub(super) fn repeat_backedge_pad(
         &self,
@@ -138,6 +147,14 @@ impl StructuredBodyLowerer<'_, '_> {
             .try_build_short_circuit_plan(block, Some(post_loop))?
             .or_else(|| self.build_plain_branch_plan(block))?;
         let merge = plan.merge?;
+        let allowed_blocks = &self.branch_regions_by_header.get(&block)?.structured_blocks;
+        let arm_context = BreakExitPadArmContext {
+            post_loop,
+            downstream_post_loop,
+            target_overrides,
+            states,
+            allowed_blocks,
+        };
         let tail = if merge == post_loop || Some(merge) == downstream_post_loop {
             BreakExitBlock {
                 block: HirBlock {
@@ -170,25 +187,11 @@ impl StructuredBodyLowerer<'_, '_> {
             rewrite_expr_temps(&mut cond, entry_expr_overrides);
         }
 
-        let then_pad = self.lower_break_exit_pad_arm(
-            plan.then_entry,
-            merge,
-            post_loop,
-            downstream_post_loop,
-            target_overrides,
-            states,
-        )?;
+        let then_pad = self.lower_break_exit_pad_arm(plan.then_entry, merge, &arm_context)?;
         blocks.extend(then_pad.blocks.iter().copied());
         let else_pad = match plan.else_entry {
             Some(else_entry) => {
-                let pad = self.lower_break_exit_pad_arm(
-                    else_entry,
-                    merge,
-                    post_loop,
-                    downstream_post_loop,
-                    target_overrides,
-                    states,
-                )?;
+                let pad = self.lower_break_exit_pad_arm(else_entry, merge, &arm_context)?;
                 blocks.extend(pad.blocks.iter().copied());
                 Some(pad.block)
             }
@@ -208,20 +211,38 @@ impl StructuredBodyLowerer<'_, '_> {
         &self,
         block: BlockRef,
         merge: BlockRef,
-        post_loop: BlockRef,
-        downstream_post_loop: Option<BlockRef>,
-        target_overrides: &BTreeMap<TempId, HirLValue>,
-        states: &[LoopStateSlot],
+        context: &BreakExitPadArmContext<'_>,
     ) -> Option<BreakExitBlock> {
-        if block == merge || block == post_loop || Some(block) == downstream_post_loop {
+        if block == merge
+            || block == context.post_loop
+            || Some(block) == context.downstream_post_loop
+        {
             return Some(BreakExitBlock {
                 block: HirBlock::default(),
                 blocks: BTreeSet::new(),
             });
         }
+        if !context.allowed_blocks.contains(&block) {
+            return None;
+        }
 
-        let target_overrides = self.break_pad_target_overrides(block, target_overrides, states);
-        let stmts = self.lower_block_prefix(block, false, &target_overrides)?;
+        if matches!(self.block_terminator(block), Some((_, LowInstr::Branch(_)))) {
+            let mut nested = self.lower_branch_break_exit_pad(
+                block,
+                merge,
+                None,
+                context.target_overrides,
+                context.states,
+            )?;
+            if !matches!(nested.block.stmts.pop(), Some(HirStmt::Break)) {
+                return None;
+            }
+            return Some(nested);
+        }
+
+        let target_overrides =
+            self.break_pad_target_overrides(block, context.target_overrides, context.states);
+        let mut stmts = self.lower_block_prefix(block, false, &target_overrides)?;
         let target = match self.block_terminator(block) {
             Some((_instr_ref, LowInstr::Jump(jump))) => {
                 self.lowering.cfg.instr_to_block[jump.target.index()]
@@ -232,13 +253,23 @@ impl StructuredBodyLowerer<'_, '_> {
             None => self.lowering.cfg.unique_reachable_successor(block)?,
             Some(_) => return None,
         };
-        if target != merge && target != post_loop && Some(target) != downstream_post_loop {
-            return None;
+        let mut blocks = BTreeSet::from([block]);
+        if target != merge
+            && target != context.post_loop
+            && Some(target) != context.downstream_post_loop
+        {
+            let nested_context = BreakExitPadArmContext {
+                target_overrides: &target_overrides,
+                ..*context
+            };
+            let tail = self.lower_break_exit_pad_arm(target, merge, &nested_context)?;
+            stmts.extend(tail.block.stmts);
+            blocks.extend(tail.blocks);
         }
 
         Some(BreakExitBlock {
             block: HirBlock { stmts },
-            blocks: BTreeSet::from([block]),
+            blocks,
         })
     }
 }
