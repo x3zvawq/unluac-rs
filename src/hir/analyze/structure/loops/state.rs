@@ -35,12 +35,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 continue;
             }
 
-            // outside_arm.defs 为空 → preheader 处该寄存器不存在显式定义。
-            // 两种可能：
-            //  1) 内层循环控制寄存器的幻影 phi：外层循环不关心这个寄存器，
-            //     exit phi 也不引用它 → 安全跳过。
-            //  2) nil 初始化的循环携带变量（如 `local last_positive`）：
-            //     循环体或循环结束后仍需使用 → 用 nil 作为初值。
+            // 无观察者的空 outside arm 只是内层循环控制槽留下的幻影 phi，
+            // 可以跳过；真正的携带值必须由 entry owner 区分参数、入口 local 与 nil。
+            // 若 owner 解析失败，拒绝候选而不猜 nil，避免把缺失事实静默变成错误源码。
             // 相邻结构化 loop 可能共享同一个 CFG header phi：前一个 loop 已在当前
             // header 安装稳定 entry identity，后一个 loop 应直接继承，不能再从混有
             // 前一 loop exit 与自身 backedge 的原始 incoming defs 重新猜初值。
@@ -53,17 +50,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             {
                 Some(init) => init,
                 None => {
-                    if value.outside_arm.defs().count() == 0 {
-                        if self.lowering.dataflow.phi_use_count(value.phi_id) > 0
-                            || Self::exit_value_for_reg(candidate, exit, value.reg).is_some()
-                        {
-                            HirExpr::Nil
-                        } else {
-                            continue;
-                        }
-                    } else {
-                        return None;
+                    if value.outside_arm.defs().count() == 0
+                        && self.lowering.dataflow.phi_use_count(value.phi_id) == 0
+                        && Self::exit_value_for_reg(candidate, exit, value.reg).is_none()
+                    {
+                        continue;
                     }
+                    return None;
                 }
             };
             let temp = *self.lowering.bindings.phi_temps.get(value.phi_id.index())?;

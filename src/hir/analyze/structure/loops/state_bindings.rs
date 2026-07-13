@@ -8,6 +8,8 @@
 //! 例子：
 //! - 输入：多入口 while-like loop 的多个 outside incoming 都指向同一个原始初值
 //! - 输出：复用同一个 entry lvalue 作为 loop state target，而不是新建只在分支内可见的 phi temp
+//! - 输入：参数寄存器在 numeric-for preheader 上没有 SSA def
+//! - 输出：沿用 `ParamRef` 入口值，而不是把“空 defs”误作未初始化 nil 槽
 
 use super::*;
 use crate::structure::SsaValue;
@@ -238,14 +240,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return Some(expr);
         }
 
-        // 空 defs + 该 pred 入口处也没有任何 reaching value → 该寄存器从未写过，
-        // 语义等价于未初始化 local，即 Lua 里的 nil。典型触发：函数入口是 loop
-        // preheader，携带变量（如 `local found = nil`）并没有显式的 LOADNIL，
-        // 编译器依赖栈槽默认 nil。此时 exit phi 的 preheader 分支如果不被识别成
-        // nil，外层 loop state 与 exit 值的初值就对不上，phi 只能作为孤立 temp
-        // 被生成到 HIR 里。
+        // 空 defs + 该 pred 入口处也没有 reaching value，表示该寄存器仍保持函数入口值。
+        // 参数和 vararg 参数槽已有稳定 binding；只有其余从未写过的栈槽才是 nil。
+        // 统一走 entry owner，避免把 numeric/generic-for 携带的参数错误初始化成 nil。
         if defs.is_empty() && self.pred_has_no_reaching_value(pred, reg) {
-            return Some(HirExpr::Nil);
+            return Some(self.loop_entry_initial_expr(reg));
         }
 
         None
@@ -253,7 +252,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
     /// 判断 `pred` 块入口处 `reg` 是否完全没有 reaching value（既无 def 也无 phi）。
     ///
-    /// 用于 `loop_incoming_expr` 里的“空 defs → Nil”兜底。只在 pred 本身没有再次
+    /// 用于 `loop_incoming_expr` 的“空 defs → 函数入口值”解析。只在 pred 本身没有再次
     /// 写该寄存器的情况下成立，否则 pred 内部的写入会在 edge 上提供一个真正的 def。
     fn pred_has_no_reaching_value(&self, pred: BlockRef, reg: Reg) -> bool {
         let range = self.lowering.cfg.blocks[pred.index()].instrs;

@@ -14,6 +14,8 @@
 //! - 普通 `while/repeat` 只保留形态 hint，不会伪造额外 binding 证据
 //! - branch 经共享 backedge pad 提前进入下一轮时，会在 branch 候选齐备后记录唯一
 //!   `continue_edges` owner，HIR 不再按 jump 形状猜测归属
+//! - 多条 break exit 若仅经 jump/close pad 汇入同一 continuation，该处 live-out phi
+//!   仍归 loop owner；带赋值或调用的 post-loop 路径不会被当成透明 pad
 //! - repeat body 的首个条件可能让 natural-loop 暂时呈现为 while；若该 header 的局部
 //!   break pad 严格汇入独立尾条件出口，则由 Structure 恢复真正的 repeat 形态
 //! - 普通内外循环可能共享 header；只有 successor 分区和真实 body/exit 都能证明层级
@@ -681,8 +683,13 @@ fn reachable_numeric_for_loop(
     if duplicated_terminal_exit {
         candidate.exits.insert(exit);
         candidate.control_blocks.insert(latch_exit);
-        candidate.exit_value_merges =
-            analyze_loop_exit_value_merges(dataflow, &candidate.exits, &candidate.blocks);
+        candidate.exit_value_merges = analyze_loop_exit_value_merges(
+            proto,
+            cfg,
+            dataflow,
+            &candidate.exits,
+            &candidate.blocks,
+        );
     }
     if candidate.kind_hint != LoopKindHint::NumericForLike
         || candidate.preheader != Some(preheader)
@@ -807,7 +814,7 @@ fn build_loop_candidate(
         preheader,
         header_value_merges: &header_value_merges,
     });
-    let exit_value_merges = analyze_loop_exit_value_merges(dataflow, &exits, &blocks);
+    let exit_value_merges = analyze_loop_exit_value_merges(proto, cfg, dataflow, &exits, &blocks);
 
     LoopCandidate {
         header,
@@ -901,7 +908,7 @@ fn degenerate_numeric_for_loop(
         kind_hint: LoopKindHint::NumericForLike,
         source_bindings: Some(LoopSourceBindings::Numeric(init.binding)),
         header_value_merges: analyze_loop_header_value_merges(dataflow, header, &blocks),
-        exit_value_merges: analyze_loop_exit_value_merges(dataflow, &exits, &blocks),
+        exit_value_merges: analyze_loop_exit_value_merges(proto, cfg, dataflow, &exits, &blocks),
         blocks,
     })
 }
@@ -1025,7 +1032,8 @@ fn degenerate_generic_for_loop(
     // 循环外初值；只有 body（含直属 nested loop）到 exit 的边才是循环内写回。
     let mut body_blocks = blocks.clone();
     body_blocks.remove(&header);
-    let exit_value_merges = analyze_loop_exit_value_merges(dataflow, &exits, &body_blocks);
+    let exit_value_merges =
+        analyze_loop_exit_value_merges(proto, cfg, dataflow, &exits, &body_blocks);
 
     Some(LoopCandidate {
         header,
@@ -1322,21 +1330,69 @@ fn analyze_loop_header_value_merges(
 }
 
 fn analyze_loop_exit_value_merges(
+    proto: &LoweredProto,
+    cfg: &Cfg,
     dataflow: &DataflowFacts,
     exits: &BTreeSet<BlockRef>,
     loop_blocks: &BTreeSet<BlockRef>,
 ) -> Vec<LoopExitValueMergeCandidate> {
-    exits
+    let shared_merge = shared_transparent_loop_exit_merge(proto, cfg, exits);
+    let mut candidates = exits
         .iter()
         .copied()
-        .filter_map(|exit| {
-            let values = loop_value_merges_in_block(dataflow, exit, loop_blocks)
-                .into_iter()
-                .filter(|value| !value.inside_arm.is_empty())
-                .collect::<Vec<_>>();
-            (!values.is_empty()).then_some(LoopExitValueMergeCandidate { exit, values })
-        })
-        .collect()
+        .filter(|exit| Some(*exit) != shared_merge)
+        .filter_map(|exit| loop_exit_value_merge_in_block(dataflow, exit, loop_blocks))
+        .collect::<Vec<_>>();
+
+    if let Some(shared_merge) = shared_merge {
+        let mut ownership_blocks = loop_blocks.clone();
+        ownership_blocks.extend(exits.iter().copied().filter(|exit| *exit != shared_merge));
+        if let Some(candidate) =
+            loop_exit_value_merge_in_block(dataflow, shared_merge, &ownership_blocks)
+        {
+            candidates.push(candidate);
+        }
+    }
+    candidates.sort_by_key(|candidate| candidate.exit);
+    candidates
+}
+
+fn loop_exit_value_merge_in_block(
+    dataflow: &DataflowFacts,
+    exit: BlockRef,
+    ownership_blocks: &BTreeSet<BlockRef>,
+) -> Option<LoopExitValueMergeCandidate> {
+    let values = loop_value_merges_in_block(dataflow, exit, ownership_blocks)
+        .into_iter()
+        .filter(|value| !value.inside_arm.is_empty())
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then_some(LoopExitValueMergeCandidate { exit, values })
+}
+
+fn shared_transparent_loop_exit_merge(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    exits: &BTreeSet<BlockRef>,
+) -> Option<BlockRef> {
+    if exits.len() < 2 {
+        return None;
+    }
+
+    let mut common = None::<BTreeSet<BlockRef>>;
+    for exit in exits.iter().copied() {
+        let mut reachable = BTreeSet::from([exit]);
+        if let Some(target) = transparent_jump_target(proto, cfg, exit) {
+            reachable.insert(target);
+        }
+        common = Some(match common {
+            Some(common) => common.intersection(&reachable).copied().collect(),
+            None => reachable,
+        });
+    }
+
+    let mut common = common?.into_iter().filter(|block| *block != cfg.exit_block);
+    let merge = common.next()?;
+    common.next().is_none().then_some(merge)
 }
 
 fn loop_value_has_inside_and_outside_incoming(value: &LoopValueMerge) -> bool {
@@ -1541,14 +1597,7 @@ fn repeat_continue_target_via_backedge_pad(
 ) -> Option<BlockRef> {
     // 条件 branch 后的纯 jump/close pad 可以属于 repeat 控制；普通赋值或调用则仍是
     // while/retry body 的尾部，若把它当条件 pad，HIR 会跳过本轮副作用。
-    let range = cfg.blocks[backedge_source.index()].instrs;
-    let last = range.last()?;
-    if !matches!(proto.instrs[last.index()], LowInstr::Jump(_))
-        || (range.start.index()..last.index())
-            .any(|instr_index| !matches!(proto.instrs[instr_index], LowInstr::Close(_)))
-    {
-        return None;
-    }
+    transparent_jump_target(proto, cfg, backedge_source)?;
     let continue_target =
         cfg.unique_reachable_predecessor_matching(backedge_source, |pred| blocks.contains(&pred))?;
 
@@ -1570,6 +1619,20 @@ fn repeat_continue_target_via_backedge_pad(
     } else {
         None
     }
+}
+
+fn transparent_jump_target(proto: &LoweredProto, cfg: &Cfg, block: BlockRef) -> Option<BlockRef> {
+    let range = cfg.blocks[block.index()].instrs;
+    let last = range.last()?;
+    let LowInstr::Jump(jump) = &proto.instrs[last.index()] else {
+        return None;
+    };
+    if (range.start.index()..last.index())
+        .any(|instr_index| !matches!(proto.instrs[instr_index], LowInstr::Close(_)))
+    {
+        return None;
+    }
+    Some(cfg.instr_to_block[jump.target.index()])
 }
 
 fn generic_for_has_loop_body_and_exit(

@@ -4,6 +4,10 @@
 //! `TFORCALL/TFORLOOP`，以及 `JMP(A)` 的 close 语义；这些规则都应该在这里被
 //! 一次性 lowering 掉，而不是留给 low-IR 消费方继续猜。
 
-mod lower;
+use crate::parser::RawChunk;
+use crate::transformer::dialect::puc_lua::lua52_53::{self, FamilyDialect};
+use crate::transformer::{LoweredChunk, TransformError};
 
-pub(crate) use lower::lower_chunk;
+pub(crate) fn lower_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
+    lua52_53::lower_chunk(chunk, FamilyDialect::Lua52)
+}

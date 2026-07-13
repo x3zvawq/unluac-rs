@@ -1,7 +1,10 @@
 //! 这个模块承载 PUC-Lua 5.x lowering 之间共享的 helper。
 //!
-//! 这些 helper 只负责 RK/寄存器区间/调用包、5.4+ 二元 metamethod 配对这类稳定
-//! 编码事实，避免各版本复制一套样板；真正的 opcode 语义仍留在版本目录里实现。
+//! 这里同时挂载协议语义确实一致的 family lowerer；版本目录仍负责选择协议，
+//! 共享实现只消费 parser 已经区分好的 typed raw 指令。
+
+pub(crate) mod lua52_53;
+pub(crate) mod lua54_55;
 
 use crate::parser::{RawChunk, RawInstr, RawProto};
 use crate::transformer::common::resolve_env_upvalues;

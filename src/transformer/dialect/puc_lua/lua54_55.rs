@@ -1,10 +1,9 @@
-//! 这个文件实现 Lua 5.4 到统一 low-IR 的 lowering。
+//! 这个文件唯一负责 Lua 5.4/5.5 共有的 low-IR lowering 语义。
 //!
-//! 相比 5.3，这里除了延续 `_ENV/upvalue table` 识别、`LOADKX/EXTRAARG` 这类路径外，
-//! 还需要显式处理 5.4 新增的 immediates、整数 key、`RETURN/TAILCALL` close 语义、
-//! `LFALSESKIP` 布尔物化，以及 `TFORPREP` 带来的额外控制流节点。
+//! parser typed opcode 与 operand 宽度差异留给 adapter；这里统一处理
+//! immediates、metamethod helper、close/TBC、for 布局、EXTRAARG 与调用协议。
 
-use crate::parser::{Lua54Opcode, Lua54Operands, RawChunk, RawInstr, RawProto};
+use crate::parser::{RawChunk, RawInstr, RawProto};
 use crate::transformer::dialect::lowering::{
     PendingLowInstr, PendingLoweringState, PendingMethodHints, TargetPlaceholder, WordCodeIndex,
     instr_pc, instr_word_len, next_raw_pc, raw_pc_at, resolve_pending_instr_with,
@@ -25,25 +24,54 @@ use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchOperands,
     BranchPredicate, Capture, CaptureSource, CloseInstr, ClosureInstr, ConcatInstr, CondOperand,
-    ConstRef, DialectCaptureExtra, GetTableInstr, GetUpvalueInstr, InstrRef, LoadBoolInstr,
-    LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr, LoweredChunk,
-    LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange, ResultPack,
-    SetListInstr, SetTableInstr, SetUpvalueInstr, TbcInstr, TransformError, UnaryOpInstr,
-    UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    ConstRef, DialectCaptureExtra, ErrNilInstr, GetTableInstr, GetUpvalueInstr, InstrRef,
+    LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr,
+    LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange,
+    ResultPack, SetListInstr, SetTableInstr, SetUpvalueInstr, TbcInstr, TransformError,
+    UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
-const EXTRAARG_SCALE_8: u32 = 1_u32 << 8;
+mod adapter;
 
-pub(crate) fn lower_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
+pub(crate) use adapter::FamilyDialect;
+use adapter::{FamilyOpcode, FamilyOperands, decode_instr};
+
+pub(crate) fn lower_chunk(
+    chunk: &RawChunk,
+    dialect: FamilyDialect,
+) -> Result<LoweredChunk, TransformError> {
+    let lower_proto = match dialect {
+        FamilyDialect::Lua54 => lower_lua54_proto,
+        FamilyDialect::Lua55 => lower_lua55_proto,
+    };
     lower_chunk_with_env(chunk, lower_proto)
+}
+
+fn lower_lua54_proto(
+    raw: &RawProto,
+    parent_env_upvalues: Option<&[bool]>,
+) -> Result<LoweredProto, TransformError> {
+    lower_proto(raw, parent_env_upvalues, FamilyDialect::Lua54)
+}
+
+fn lower_lua55_proto(
+    raw: &RawProto,
+    parent_env_upvalues: Option<&[bool]>,
+) -> Result<LoweredProto, TransformError> {
+    lower_proto(raw, parent_env_upvalues, FamilyDialect::Lua55)
 }
 
 fn lower_proto(
     raw: &RawProto,
     parent_env_upvalues: Option<&[bool]>,
+    dialect: FamilyDialect,
 ) -> Result<LoweredProto, TransformError> {
-    let (env_upvalues, children) = prepare_env_lowering(raw, parent_env_upvalues, lower_proto)?;
-    let mut lowerer = ProtoLowerer::new(raw, env_upvalues);
+    let child_lowerer = match dialect {
+        FamilyDialect::Lua54 => lower_lua54_proto,
+        FamilyDialect::Lua55 => lower_lua55_proto,
+    };
+    let (env_upvalues, children) = prepare_env_lowering(raw, parent_env_upvalues, child_lowerer)?;
+    let mut lowerer = ProtoLowerer::new(raw, env_upvalues, dialect);
     let (instrs, lowering_map) = lowerer.lower()?;
 
     Ok(finish_lowered_proto(raw, children, instrs, lowering_map))
@@ -51,6 +79,7 @@ fn lower_proto(
 
 struct ProtoLowerer<'a> {
     raw: &'a RawProto,
+    dialect: FamilyDialect,
     env_upvalues: Vec<bool>,
     lowering: PendingLoweringState,
     pending_methods: PendingMethodHints,
@@ -58,13 +87,14 @@ struct ProtoLowerer<'a> {
 }
 
 impl<'a> ProtoLowerer<'a> {
-    fn new(raw: &'a RawProto, env_upvalues: Vec<bool>) -> Self {
+    fn new(raw: &'a RawProto, env_upvalues: Vec<bool>, dialect: FamilyDialect) -> Self {
         let raw_instr_count = raw.common.instructions.len();
         let method_slots = usize::from(raw.common.frame.max_stack_size).saturating_add(4);
         let word_code_index = WordCodeIndex::from_raw(raw, instr_pc, instr_word_len);
 
         Self {
             raw,
+            dialect,
             env_upvalues,
             lowering: PendingLoweringState::new(raw_instr_count),
             pending_methods: PendingMethodHints::new(method_slots),
@@ -77,13 +107,13 @@ impl<'a> ProtoLowerer<'a> {
 
         while raw_index < self.raw.common.instructions.len() {
             let raw_instr = &self.raw.common.instructions[raw_index];
-            let (opcode, operands, extra) = raw_instr
-                .lua54()
-                .expect("lua54 lowerer should only decode lua54 instructions");
+            let extra = decode_instr(raw_instr, self.dialect);
+            let opcode = extra.opcode;
+            let operands = &extra.operands;
             let raw_pc = extra.pc;
 
             match opcode {
-                Lua54Opcode::Move => {
+                FamilyOpcode::Move => {
                     let (a, b) = expect_ab(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.pending_methods.invalidate_reg(dst);
@@ -97,7 +127,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::LoadI => {
+                FamilyOpcode::LoadI => {
                     let (a, sbx) = expect_asbx(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.pending_methods.invalidate_reg(dst);
@@ -111,7 +141,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::LoadF => {
+                FamilyOpcode::LoadF => {
                     let (a, sbx) = expect_asbx(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.pending_methods.invalidate_reg(dst);
@@ -125,7 +155,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::LoadK => {
+                FamilyOpcode::LoadK => {
                     let (a, bx) = expect_abx(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.pending_methods.invalidate_reg(dst);
@@ -139,7 +169,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::LoadKx => {
+                FamilyOpcode::LoadKx => {
                     let a = expect_a(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.pending_methods.invalidate_reg(dst);
@@ -156,7 +186,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::LoadFalse => {
+                FamilyOpcode::LoadFalse => {
                     let a = expect_a(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.pending_methods.invalidate_reg(dst);
@@ -170,7 +200,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::LFalseSkip => {
+                FamilyOpcode::LFalseSkip => {
                     let a = expect_a(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.pending_methods.invalidate_reg(dst);
@@ -194,7 +224,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::LoadTrue => {
+                FamilyOpcode::LoadTrue => {
                     let a = expect_a(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.pending_methods.invalidate_reg(dst);
@@ -208,7 +238,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::LoadNil => {
+                FamilyOpcode::LoadNil => {
                     let (a, b) = expect_ab(raw_pc, opcode, operands)?;
                     let len = range_len_inclusive(usize::from(a), usize::from(a) + usize::from(b));
                     let dst = RegRange::new(reg_from_u8(a), len);
@@ -220,7 +250,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::GetUpVal => {
+                FamilyOpcode::GetUpVal => {
                     let (a, b) = expect_ab(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.pending_methods.invalidate_reg(dst);
@@ -234,7 +264,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::GetTabUp => {
+                FamilyOpcode::GetTabUp => {
                     let (a, b, c, _) = expect_abck(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.pending_methods.invalidate_reg(dst);
@@ -255,7 +285,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::GetTable => {
+                FamilyOpcode::GetTable => {
                     let (a, b, c, _) = expect_abck(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.pending_methods.invalidate_reg(dst);
@@ -271,7 +301,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::GetI => {
+                FamilyOpcode::GetI => {
                     let (a, b, c, _) = expect_abck(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.pending_methods.invalidate_reg(dst);
@@ -287,7 +317,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::GetField => {
+                FamilyOpcode::GetField => {
                     let (a, b, c, _) = expect_abck(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.pending_methods.invalidate_reg(dst);
@@ -303,7 +333,23 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::SetTabUp => {
+                FamilyOpcode::GetVarg => {
+                    let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
+                    let dst = reg_from_u8(a);
+                    self.pending_methods.invalidate_reg(dst);
+                    self.emit(
+                        Some(raw_index),
+                        vec![raw_index],
+                        PendingLowInstr::Ready(LowInstr::GetTable(GetTableInstr {
+                            dst,
+                            base: AccessBase::Reg(reg_from_u8(b)),
+                            key: AccessKey::Reg(reg_from_u8(c)),
+                            method_load: false,
+                        })),
+                    );
+                    raw_index += 1;
+                }
+                FamilyOpcode::SetTabUp => {
                     let (a, b, c, k) = expect_abck(raw_pc, opcode, operands)?;
                     self.emit(
                         Some(raw_index),
@@ -321,7 +367,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::SetUpVal => {
+                FamilyOpcode::SetUpVal => {
                     let (a, b) = expect_ab(raw_pc, opcode, operands)?;
                     self.emit(
                         Some(raw_index),
@@ -333,7 +379,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::SetTable => {
+                FamilyOpcode::SetTable => {
                     let (a, b, c, k) = expect_abck(raw_pc, opcode, operands)?;
                     self.emit(
                         Some(raw_index),
@@ -346,7 +392,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::SetI => {
+                FamilyOpcode::SetI => {
                     let (a, b, c, k) = expect_abck(raw_pc, opcode, operands)?;
                     self.emit(
                         Some(raw_index),
@@ -359,7 +405,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::SetField => {
+                FamilyOpcode::SetField => {
                     let (a, b, c, k) = expect_abck(raw_pc, opcode, operands)?;
                     self.emit(
                         Some(raw_index),
@@ -372,8 +418,24 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::NewTable => {
-                    let (a, _, _, _) = expect_abck(raw_pc, opcode, operands)?;
+                FamilyOpcode::ErrNNil => {
+                    let (a, bx) = expect_abx(raw_pc, opcode, operands)?;
+                    self.emit(
+                        Some(raw_index),
+                        vec![raw_index],
+                        PendingLowInstr::Ready(LowInstr::ErrNil(ErrNilInstr {
+                            subject: reg_from_u8(a),
+                            name: if bx == 0 {
+                                None
+                            } else {
+                                Some(self.const_ref(raw_pc, (bx - 1) as usize)?)
+                            },
+                        })),
+                    );
+                    raw_index += 1;
+                }
+                FamilyOpcode::NewTable => {
+                    let (a, _, _, _) = self.table_operands(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.pending_methods.invalidate_reg(dst);
                     self.emit(
@@ -383,14 +445,19 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::Self_ => {
+                FamilyOpcode::Self_ => {
                     let (a, b, c, k) = expect_abck(raw_pc, opcode, operands)?;
                     let callee = reg_from_u8(a);
                     let self_arg = Reg(callee.index() + 1);
-                    let method_key = self.access_key(raw_pc, c, k)?;
+                    let method_key = match self.dialect {
+                        FamilyDialect::Lua54 => self.access_key(raw_pc, c, k)?,
+                        FamilyDialect::Lua55 => {
+                            AccessKey::Const(self.const_ref(raw_pc, c as usize)?)
+                        }
+                    };
                     let method_name = match method_key {
-                        crate::transformer::AccessKey::Const(const_ref) => Some(const_ref),
-                        _ => None,
+                        AccessKey::Const(const_ref) => Some(const_ref),
+                        AccessKey::Reg(_) | AccessKey::Integer(_) => None,
                     };
                     self.pending_methods.invalidate_reg(callee);
                     self.pending_methods.invalidate_reg(self_arg);
@@ -415,7 +482,7 @@ impl<'a> ProtoLowerer<'a> {
                     self.pending_methods.set(callee, self_arg, method_name);
                     raw_index += 1;
                 }
-                Lua54Opcode::AddI | Lua54Opcode::ShrI | Lua54Opcode::ShlI => {
+                FamilyOpcode::AddI | FamilyOpcode::ShrI | FamilyOpcode::ShlI => {
                     let (a, b, sc, _) = expect_absck(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     let shape = immediate_binary_shape(
@@ -427,9 +494,12 @@ impl<'a> ProtoLowerer<'a> {
                         sc,
                         MetamethodBinarySpec {
                             owner_opcode: opcode,
-                            helper_opcode: Lua54Opcode::MMBinI,
-                            inspect_helper: inspect_lua54_asbck_helper,
-                            opcode_label: Lua54Opcode::label,
+                            helper_opcode: FamilyOpcode::MMBinI,
+                            inspect_helper: match self.dialect {
+                                FamilyDialect::Lua54 => inspect_lua54_asbck_helper,
+                                FamilyDialect::Lua55 => inspect_lua55_asbck_helper,
+                            },
+                            opcode_label: FamilyOpcode::label,
                         },
                     )?;
                     let reg = ValueOperand::Reg(reg_from_u8(b));
@@ -452,16 +522,16 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index = shape.helper_index + 1;
                 }
-                Lua54Opcode::AddK
-                | Lua54Opcode::SubK
-                | Lua54Opcode::MulK
-                | Lua54Opcode::ModK
-                | Lua54Opcode::PowK
-                | Lua54Opcode::DivK
-                | Lua54Opcode::IdivK
-                | Lua54Opcode::BandK
-                | Lua54Opcode::BorK
-                | Lua54Opcode::BxorK => {
+                FamilyOpcode::AddK
+                | FamilyOpcode::SubK
+                | FamilyOpcode::MulK
+                | FamilyOpcode::ModK
+                | FamilyOpcode::PowK
+                | FamilyOpcode::DivK
+                | FamilyOpcode::IdivK
+                | FamilyOpcode::BandK
+                | FamilyOpcode::BorK
+                | FamilyOpcode::BxorK => {
                     let (a, b, c, _) = expect_abck(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     let op = binary_op_kind(opcode);
@@ -474,9 +544,12 @@ impl<'a> ProtoLowerer<'a> {
                         c,
                         MetamethodBinarySpec {
                             owner_opcode: opcode,
-                            helper_opcode: Lua54Opcode::MMBinK,
-                            inspect_helper: inspect_lua54_abck_helper,
-                            opcode_label: Lua54Opcode::label,
+                            helper_opcode: FamilyOpcode::MMBinK,
+                            inspect_helper: match self.dialect {
+                                FamilyDialect::Lua54 => inspect_lua54_abck_helper,
+                                FamilyDialect::Lua55 => inspect_lua55_abck_helper,
+                            },
+                            opcode_label: FamilyOpcode::label,
                         },
                     )?;
                     let reg = ValueOperand::Reg(reg_from_u8(b));
@@ -499,18 +572,18 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index = shape.helper_index + 1;
                 }
-                Lua54Opcode::Add
-                | Lua54Opcode::Sub
-                | Lua54Opcode::Mul
-                | Lua54Opcode::Mod
-                | Lua54Opcode::Pow
-                | Lua54Opcode::Div
-                | Lua54Opcode::Idiv
-                | Lua54Opcode::Band
-                | Lua54Opcode::Bor
-                | Lua54Opcode::Bxor
-                | Lua54Opcode::Shl
-                | Lua54Opcode::Shr => {
+                FamilyOpcode::Add
+                | FamilyOpcode::Sub
+                | FamilyOpcode::Mul
+                | FamilyOpcode::Mod
+                | FamilyOpcode::Pow
+                | FamilyOpcode::Div
+                | FamilyOpcode::Idiv
+                | FamilyOpcode::Band
+                | FamilyOpcode::Bor
+                | FamilyOpcode::Bxor
+                | FamilyOpcode::Shl
+                | FamilyOpcode::Shr => {
                     let (a, b, c, _) = expect_abck(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     let op = binary_op_kind(opcode);
@@ -523,9 +596,12 @@ impl<'a> ProtoLowerer<'a> {
                         c,
                         MetamethodBinarySpec {
                             owner_opcode: opcode,
-                            helper_opcode: Lua54Opcode::MMBin,
-                            inspect_helper: inspect_lua54_abck_helper,
-                            opcode_label: Lua54Opcode::label,
+                            helper_opcode: FamilyOpcode::MMBin,
+                            inspect_helper: match self.dialect {
+                                FamilyDialect::Lua54 => inspect_lua54_abck_helper,
+                                FamilyDialect::Lua55 => inspect_lua55_abck_helper,
+                            },
+                            opcode_label: FamilyOpcode::label,
                         },
                     )?;
                     self.pending_methods.invalidate_reg(dst);
@@ -541,13 +617,13 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index = shape.helper_index + 1;
                 }
-                Lua54Opcode::MMBin | Lua54Opcode::MMBinI | Lua54Opcode::MMBinK => {
+                FamilyOpcode::MMBin | FamilyOpcode::MMBinI | FamilyOpcode::MMBinK => {
                     return Err(TransformError::UnexpectedStandaloneMetamethodHelper {
                         raw_pc,
                         opcode: opcode.label(),
                     });
                 }
-                Lua54Opcode::Unm | Lua54Opcode::BNot | Lua54Opcode::Not | Lua54Opcode::Len => {
+                FamilyOpcode::Unm | FamilyOpcode::BNot | FamilyOpcode::Not | FamilyOpcode::Len => {
                     let (a, b) = expect_ab(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.pending_methods.invalidate_reg(dst);
@@ -562,7 +638,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::Concat => {
+                FamilyOpcode::Concat => {
                     let (a, b) = expect_ab(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.pending_methods.invalidate_reg(dst);
@@ -576,7 +652,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::Close => {
+                FamilyOpcode::Close => {
                     self.pending_methods.clear();
                     let a = expect_a(raw_pc, opcode, operands)?;
                     self.emit(
@@ -588,7 +664,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::Tbc => {
+                FamilyOpcode::Tbc => {
                     let a = expect_a(raw_pc, opcode, operands)?;
                     self.emit(
                         Some(raw_index),
@@ -599,7 +675,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::Jmp => {
+                FamilyOpcode::Jmp => {
                     let sj = expect_asj(raw_pc, opcode, operands)?;
                     self.emit(
                         Some(raw_index),
@@ -615,7 +691,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::Eq | Lua54Opcode::Lt | Lua54Opcode::Le => {
+                FamilyOpcode::Eq | FamilyOpcode::Lt | FamilyOpcode::Le => {
                     let (a, b, k) = expect_abk(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let cond = BranchCond {
@@ -638,7 +714,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index = helper.next_index;
                 }
-                Lua54Opcode::EqK => {
+                FamilyOpcode::EqK => {
                     let (a, b, k) = expect_abk(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let cond = BranchCond {
@@ -661,11 +737,11 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index = helper.next_index;
                 }
-                Lua54Opcode::EqI
-                | Lua54Opcode::LtI
-                | Lua54Opcode::LeI
-                | Lua54Opcode::GtI
-                | Lua54Opcode::GeI => {
+                FamilyOpcode::EqI
+                | FamilyOpcode::LtI
+                | FamilyOpcode::LeI
+                | FamilyOpcode::GtI
+                | FamilyOpcode::GeI => {
                     let (a, sb, c, k) = expect_asbck(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let rhs = immediate_cond_operand(sb, c != 0);
@@ -688,7 +764,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index = helper.next_index;
                 }
-                Lua54Opcode::Test => {
+                FamilyOpcode::Test => {
                     let (a, k) = expect_ak(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let cond = BranchCond {
@@ -708,7 +784,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index = helper.next_index;
                 }
-                Lua54Opcode::TestSet => {
+                FamilyOpcode::TestSet => {
                     let (a, b, k) = expect_abk(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
                     let cond = BranchCond {
@@ -757,7 +833,7 @@ impl<'a> ProtoLowerer<'a> {
 
                     raw_index = helper.next_index;
                 }
-                Lua54Opcode::Call => {
+                FamilyOpcode::Call => {
                     let (a, b, c, _) = expect_abck(raw_pc, opcode, operands)?;
                     let results = call_result_pack(a, u16::from(c));
                     let (kind, method_name) = self.pending_methods.consume_call_info(
@@ -776,7 +852,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::TailCall => {
+                FamilyOpcode::TailCall => {
                     let (a, b, _, k) = expect_abck(raw_pc, opcode, operands)?;
                     let (kind, method_name) = self.pending_methods.consume_call_info(
                         reg_from_u8(a),
@@ -794,7 +870,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::Return => {
+                FamilyOpcode::Return => {
                     let (a, b, _, k) = expect_abck(raw_pc, opcode, operands)?;
                     self.pending_methods.clear();
                     emit_return(
@@ -805,7 +881,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::Return0 => {
+                FamilyOpcode::Return0 => {
                     self.pending_methods.clear();
                     emit_return(
                         &mut self.lowering,
@@ -815,7 +891,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::Return1 => {
+                FamilyOpcode::Return1 => {
                     let a = expect_a(raw_pc, opcode, operands)?;
                     self.pending_methods.clear();
                     emit_return(
@@ -826,10 +902,11 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::ForLoop => {
+                FamilyOpcode::ForLoop => {
                     self.pending_methods.clear();
                     let (a, bx) = expect_abx(raw_pc, opcode, operands)?;
-                    let regs = numeric_for_regs(reg_from_u8(a), 3);
+                    let regs =
+                        numeric_for_regs(reg_from_u8(a), self.dialect.numeric_for_binding_offset());
                     let body_target =
                         jump_target_back_bx(&self.word_code_index, raw_pc, extra.pc, bx)?;
                     let exit_target =
@@ -843,20 +920,21 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::ForPrep => {
+                FamilyOpcode::ForPrep => {
                     self.pending_methods.clear();
                     let (a, bx) = expect_abx(raw_pc, opcode, operands)?;
                     let loop_raw =
                         jump_target_forward_bx(&self.word_code_index, raw_pc, extra.pc, bx)?;
-                    let target_opcode = opcode_at(self.raw, loop_raw);
-                    if target_opcode != Lua54Opcode::ForLoop {
+                    let target_opcode = opcode_at(self.raw, loop_raw, self.dialect);
+                    if target_opcode != FamilyOpcode::ForLoop {
                         return Err(TransformError::InvalidNumericForPair {
                             raw_pc,
                             target_raw: raw_pc_at(self.raw, loop_raw) as usize,
                             found: target_opcode.label(),
                         });
                     }
-                    let regs = numeric_for_regs(reg_from_u8(a), 3);
+                    let regs =
+                        numeric_for_regs(reg_from_u8(a), self.dialect.numeric_for_binding_offset());
                     let body_target =
                         self.ensure_targetable_pc(raw_pc, next_raw_pc(self.raw, raw_index))?;
                     let exit_target =
@@ -870,7 +948,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::TForPrep => {
+                FamilyOpcode::TForPrep => {
                     self.pending_methods.clear();
                     let (a, bx) = expect_abx(raw_pc, opcode, operands)?;
                     let tbc_reg = Reg(usize::from(a) + 3);
@@ -879,7 +957,7 @@ impl<'a> ProtoLowerer<'a> {
                     emit_tforprep(&mut self.lowering, raw_index, tbc_reg, call_target);
                     raw_index += 1;
                 }
-                Lua54Opcode::TForCall => {
+                FamilyOpcode::TForCall => {
                     self.pending_methods.clear();
                     let (a, c) = expect_ac(raw_pc, opcode, operands)?;
                     let pair = self.generic_for_pair(raw_index, a, c)?;
@@ -888,24 +966,25 @@ impl<'a> ProtoLowerer<'a> {
                         &mut self.lowering,
                         raw_index,
                         state_start,
-                        4,
+                        self.dialect.generic_for_binding_offset(),
                         usize::from(c),
                     );
                     emit_generic_for_loop(&mut self.lowering, pair);
                     raw_index = pair.next_index;
                 }
-                Lua54Opcode::TForLoop => {
+                FamilyOpcode::TForLoop => {
                     return Err(TransformError::InvalidGenericForLoop {
                         raw_pc,
                         helper_pc: raw_pc,
                         found: opcode.label(),
                     });
                 }
-                Lua54Opcode::SetList => {
-                    let (a, b, c, k) = expect_abck(raw_pc, opcode, operands)?;
+                FamilyOpcode::SetList => {
+                    let (a, b, c, k) = self.table_operands(raw_pc, opcode, operands)?;
                     let base_index = u32::from(c)
                         + if k {
-                            self.extra_arg(raw_pc, opcode, extra.extra_arg)? * EXTRAARG_SCALE_8
+                            self.extra_arg(raw_pc, opcode, extra.extra_arg)?
+                                * self.dialect.extraarg_scale()
                         } else {
                             0
                         };
@@ -925,7 +1004,7 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::Closure => {
+                FamilyOpcode::Closure => {
                     let (a, bx) = expect_abx(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.pending_methods.invalidate_reg(dst);
@@ -963,8 +1042,14 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::VarArg => {
-                    let (a, c) = expect_ac(raw_pc, opcode, operands)?;
+                FamilyOpcode::VarArg => {
+                    let (a, c) = match self.dialect {
+                        FamilyDialect::Lua54 => expect_ac(raw_pc, opcode, operands)?,
+                        FamilyDialect::Lua55 => {
+                            let (a, _, c, _) = expect_abck(raw_pc, opcode, operands)?;
+                            (a, c)
+                        }
+                    };
                     self.pending_methods.clear();
                     self.emit(
                         Some(raw_index),
@@ -979,10 +1064,10 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                Lua54Opcode::VarArgPrep => {
+                FamilyOpcode::VarArgPrep => {
                     raw_index += 1;
                 }
-                Lua54Opcode::ExtraArg => {
+                FamilyOpcode::ExtraArg => {
                     return Err(TransformError::UnexpectedStandaloneExtraArg { raw_pc });
                 }
             }
@@ -1046,7 +1131,7 @@ impl<'a> ProtoLowerer<'a> {
     fn extra_arg(
         &self,
         raw_pc: u32,
-        opcode: Lua54Opcode,
+        opcode: FamilyOpcode,
         extra_arg: Option<u32>,
     ) -> Result<u32, TransformError> {
         extra_arg.ok_or(TransformError::MissingExtraArg {
@@ -1063,6 +1148,21 @@ impl<'a> ProtoLowerer<'a> {
         }
     }
 
+    fn table_operands(
+        &self,
+        raw_pc: u32,
+        opcode: FamilyOpcode,
+        operands: &FamilyOperands,
+    ) -> Result<(u8, u8, u16, bool), TransformError> {
+        match self.dialect {
+            FamilyDialect::Lua54 => {
+                let (a, b, c, k) = expect_abck(raw_pc, opcode, operands)?;
+                Ok((a, b, u16::from(c), k))
+            }
+            FamilyDialect::Lua55 => expect_avbck(raw_pc, opcode, operands),
+        }
+    }
+
     fn ensure_targetable_pc(&self, raw_pc: u32, target_pc: u32) -> Result<usize, TransformError> {
         self.word_code_index.ensure_targetable_pc(raw_pc, target_pc)
     }
@@ -1070,7 +1170,7 @@ impl<'a> ProtoLowerer<'a> {
     fn helper_jump(
         &self,
         raw_index: usize,
-        opcode: Lua54Opcode,
+        opcode: FamilyOpcode,
     ) -> Result<HelperJump, TransformError> {
         helper_jump_asj(
             self.raw,
@@ -1078,8 +1178,11 @@ impl<'a> ProtoLowerer<'a> {
             raw_index,
             HelperJumpAsjSpec {
                 owner_opcode: opcode,
-                helper_jump_opcode: Lua54Opcode::Jmp,
-                inspect_helper: inspect_lua54_asj_helper,
+                helper_jump_opcode: FamilyOpcode::Jmp,
+                inspect_helper: match self.dialect {
+                    FamilyDialect::Lua54 => inspect_lua54_asj_helper,
+                    FamilyDialect::Lua55 => inspect_lua55_asj_helper,
+                },
                 raw_pc_at: instr_pc,
                 jump_target: |raw_pc, base_pc, sj| {
                     jump_target_sj(&self.word_code_index, raw_pc, base_pc, sj)
@@ -1088,7 +1191,7 @@ impl<'a> ProtoLowerer<'a> {
                     self.ensure_targetable_pc(raw_pc, target_pc)
                 },
                 next_raw_pc: |index| next_raw_pc(self.raw, index),
-                opcode_label: Lua54Opcode::label,
+                opcode_label: FamilyOpcode::label,
             },
         )
     }
@@ -1099,6 +1202,7 @@ impl<'a> ProtoLowerer<'a> {
         call_a: u8,
         result_count: u8,
     ) -> Result<GenericForPair, TransformError> {
+        let binding_offset = self.dialect.generic_for_binding_offset();
         generic_for_pair_abx(
             self.raw,
             &self.word_code_index,
@@ -1106,8 +1210,11 @@ impl<'a> ProtoLowerer<'a> {
             call_a,
             usize::from(result_count),
             GenericForPairAbxSpec {
-                helper_loop_opcode: Lua54Opcode::TForLoop,
-                inspect_helper: inspect_lua54_abx_helper,
+                helper_loop_opcode: FamilyOpcode::TForLoop,
+                inspect_helper: match self.dialect {
+                    FamilyDialect::Lua54 => inspect_lua54_abx_helper,
+                    FamilyDialect::Lua55 => inspect_lua55_abx_helper,
+                },
                 raw_pc_at: instr_pc,
                 jump_target: |raw_pc, base_pc, bx| {
                     jump_target_back_bx(&self.word_code_index, raw_pc, base_pc, bx)
@@ -1116,12 +1223,12 @@ impl<'a> ProtoLowerer<'a> {
                     self.ensure_targetable_pc(raw_pc, target_pc)
                 },
                 next_raw_pc: |index| next_raw_pc(self.raw, index),
-                opcode_label: Lua54Opcode::label,
+                opcode_label: FamilyOpcode::label,
                 validate_loop_base: |loop_a, call_a| loop_a == call_a,
                 build_pair: |loop_a, result_count| {
                     (
                         Reg(usize::from(loop_a) + 2),
-                        RegRange::new(Reg(usize::from(loop_a) + 4), result_count),
+                        RegRange::new(Reg(usize::from(loop_a) + binding_offset), result_count),
                     )
                 },
             },
@@ -1129,136 +1236,191 @@ impl<'a> ProtoLowerer<'a> {
     }
 }
 
-fn inspect_lua54_asj_helper(raw: &RawInstr) -> Result<(Lua54Opcode, u32, i32), TransformError> {
-    let (opcode, operands, extra) = raw
-        .lua54()
-        .expect("lua54 lowerer should only decode lua54 instructions");
+fn inspect_lua54_asj_helper(raw: &RawInstr) -> Result<(FamilyOpcode, u32, i32), TransformError> {
+    inspect_asj_helper(raw, FamilyDialect::Lua54)
+}
+
+fn inspect_lua55_asj_helper(raw: &RawInstr) -> Result<(FamilyOpcode, u32, i32), TransformError> {
+    inspect_asj_helper(raw, FamilyDialect::Lua55)
+}
+
+fn inspect_asj_helper(
+    raw: &RawInstr,
+    dialect: FamilyDialect,
+) -> Result<(FamilyOpcode, u32, i32), TransformError> {
+    let extra = decode_instr(raw, dialect);
+    let opcode = extra.opcode;
+    let operands = &extra.operands;
     let sj = expect_asj(extra.pc, opcode, operands)?;
     Ok((opcode, extra.pc, sj))
 }
 
-fn inspect_lua54_abx_helper(raw: &RawInstr) -> Result<(Lua54Opcode, u32, u8, u32), TransformError> {
-    let (opcode, operands, extra) = raw
-        .lua54()
-        .expect("lua54 lowerer should only decode lua54 instructions");
+fn inspect_lua54_abx_helper(
+    raw: &RawInstr,
+) -> Result<(FamilyOpcode, u32, u8, u32), TransformError> {
+    inspect_abx_helper(raw, FamilyDialect::Lua54)
+}
+
+fn inspect_lua55_abx_helper(
+    raw: &RawInstr,
+) -> Result<(FamilyOpcode, u32, u8, u32), TransformError> {
+    inspect_abx_helper(raw, FamilyDialect::Lua55)
+}
+
+fn inspect_abx_helper(
+    raw: &RawInstr,
+    dialect: FamilyDialect,
+) -> Result<(FamilyOpcode, u32, u8, u32), TransformError> {
+    let extra = decode_instr(raw, dialect);
+    let opcode = extra.opcode;
+    let operands = &extra.operands;
     let (a, bx) = expect_abx(extra.pc, opcode, operands)?;
     Ok((opcode, extra.pc, a, bx))
 }
 
 fn inspect_lua54_asbck_helper(
     raw: &RawInstr,
-) -> Result<(Lua54Opcode, u32, u8, i16, u8, bool), TransformError> {
-    let (opcode, operands, extra) = raw
-        .lua54()
-        .expect("lua54 lowerer should only decode lua54 instructions");
+) -> Result<(FamilyOpcode, u32, u8, i16, u8, bool), TransformError> {
+    inspect_asbck_helper(raw, FamilyDialect::Lua54)
+}
+
+fn inspect_lua55_asbck_helper(
+    raw: &RawInstr,
+) -> Result<(FamilyOpcode, u32, u8, i16, u8, bool), TransformError> {
+    inspect_asbck_helper(raw, FamilyDialect::Lua55)
+}
+
+fn inspect_asbck_helper(
+    raw: &RawInstr,
+    dialect: FamilyDialect,
+) -> Result<(FamilyOpcode, u32, u8, i16, u8, bool), TransformError> {
+    let extra = decode_instr(raw, dialect);
+    let opcode = extra.opcode;
+    let operands = &extra.operands;
     let (a, sb, c, k) = expect_asbck(extra.pc, opcode, operands)?;
     Ok((opcode, extra.pc, a, sb, c, k))
 }
 
 fn inspect_lua54_abck_helper(
     raw: &RawInstr,
-) -> Result<(Lua54Opcode, u32, u8, u8, u8, bool), TransformError> {
-    let (opcode, operands, extra) = raw
-        .lua54()
-        .expect("lua54 lowerer should only decode lua54 instructions");
+) -> Result<(FamilyOpcode, u32, u8, u8, u8, bool), TransformError> {
+    inspect_abck_helper(raw, FamilyDialect::Lua54)
+}
+
+fn inspect_lua55_abck_helper(
+    raw: &RawInstr,
+) -> Result<(FamilyOpcode, u32, u8, u8, u8, bool), TransformError> {
+    inspect_abck_helper(raw, FamilyDialect::Lua55)
+}
+
+fn inspect_abck_helper(
+    raw: &RawInstr,
+    dialect: FamilyDialect,
+) -> Result<(FamilyOpcode, u32, u8, u8, u8, bool), TransformError> {
+    let extra = decode_instr(raw, dialect);
+    let opcode = extra.opcode;
+    let operands = &extra.operands;
     let (a, b, c, k) = expect_abck(extra.pc, opcode, operands)?;
     Ok((opcode, extra.pc, a, b, c, k))
 }
 
-fn opcode_at(raw: &RawProto, index: usize) -> Lua54Opcode {
-    raw.common.instructions[index]
-        .lua54()
-        .expect("lua54 lowerer should only decode lua54 instructions")
-        .0
+fn opcode_at(raw: &RawProto, index: usize, dialect: FamilyDialect) -> FamilyOpcode {
+    decode_instr(&raw.common.instructions[index], dialect).opcode
 }
 
-fn unary_op_kind(opcode: Lua54Opcode) -> UnaryOpKind {
+fn unary_op_kind(opcode: FamilyOpcode) -> UnaryOpKind {
     match opcode {
-        Lua54Opcode::Unm => UnaryOpKind::Neg,
-        Lua54Opcode::BNot => UnaryOpKind::BitNot,
-        Lua54Opcode::Not => UnaryOpKind::Not,
-        Lua54Opcode::Len => UnaryOpKind::Length,
+        FamilyOpcode::Unm => UnaryOpKind::Neg,
+        FamilyOpcode::BNot => UnaryOpKind::BitNot,
+        FamilyOpcode::Not => UnaryOpKind::Not,
+        FamilyOpcode::Len => UnaryOpKind::Length,
         _ => unreachable!("only unary opcodes should reach unary_op_kind"),
     }
 }
 
-fn binary_op_kind(opcode: Lua54Opcode) -> BinaryOpKind {
+fn binary_op_kind(opcode: FamilyOpcode) -> BinaryOpKind {
     match opcode {
-        Lua54Opcode::AddI | Lua54Opcode::AddK | Lua54Opcode::Add => BinaryOpKind::Add,
-        Lua54Opcode::SubK | Lua54Opcode::Sub => BinaryOpKind::Sub,
-        Lua54Opcode::MulK | Lua54Opcode::Mul => BinaryOpKind::Mul,
-        Lua54Opcode::DivK | Lua54Opcode::Div => BinaryOpKind::Div,
-        Lua54Opcode::IdivK | Lua54Opcode::Idiv => BinaryOpKind::FloorDiv,
-        Lua54Opcode::ModK | Lua54Opcode::Mod => BinaryOpKind::Mod,
-        Lua54Opcode::PowK | Lua54Opcode::Pow => BinaryOpKind::Pow,
-        Lua54Opcode::BandK | Lua54Opcode::Band => BinaryOpKind::BitAnd,
-        Lua54Opcode::BorK | Lua54Opcode::Bor => BinaryOpKind::BitOr,
-        Lua54Opcode::BxorK | Lua54Opcode::Bxor => BinaryOpKind::BitXor,
-        Lua54Opcode::ShlI | Lua54Opcode::Shl => BinaryOpKind::Shl,
-        Lua54Opcode::ShrI | Lua54Opcode::Shr => BinaryOpKind::Shr,
+        FamilyOpcode::AddI | FamilyOpcode::AddK | FamilyOpcode::Add => BinaryOpKind::Add,
+        FamilyOpcode::SubK | FamilyOpcode::Sub => BinaryOpKind::Sub,
+        FamilyOpcode::MulK | FamilyOpcode::Mul => BinaryOpKind::Mul,
+        FamilyOpcode::DivK | FamilyOpcode::Div => BinaryOpKind::Div,
+        FamilyOpcode::IdivK | FamilyOpcode::Idiv => BinaryOpKind::FloorDiv,
+        FamilyOpcode::ModK | FamilyOpcode::Mod => BinaryOpKind::Mod,
+        FamilyOpcode::PowK | FamilyOpcode::Pow => BinaryOpKind::Pow,
+        FamilyOpcode::BandK | FamilyOpcode::Band => BinaryOpKind::BitAnd,
+        FamilyOpcode::BorK | FamilyOpcode::Bor => BinaryOpKind::BitOr,
+        FamilyOpcode::BxorK | FamilyOpcode::Bxor => BinaryOpKind::BitXor,
+        FamilyOpcode::ShlI | FamilyOpcode::Shl => BinaryOpKind::Shl,
+        FamilyOpcode::ShrI | FamilyOpcode::Shr => BinaryOpKind::Shr,
         _ => unreachable!("only arithmetic/bitwise opcodes should reach binary_op_kind"),
     }
 }
 
-fn branch_predicate(opcode: Lua54Opcode) -> BranchPredicate {
+fn branch_predicate(opcode: FamilyOpcode) -> BranchPredicate {
     match opcode {
-        Lua54Opcode::Eq | Lua54Opcode::EqK | Lua54Opcode::EqI => BranchPredicate::Eq,
-        Lua54Opcode::Lt | Lua54Opcode::LtI | Lua54Opcode::GtI => BranchPredicate::Lt,
-        Lua54Opcode::Le | Lua54Opcode::LeI | Lua54Opcode::GeI => BranchPredicate::Le,
+        FamilyOpcode::Eq | FamilyOpcode::EqK | FamilyOpcode::EqI => BranchPredicate::Eq,
+        FamilyOpcode::Lt | FamilyOpcode::LtI | FamilyOpcode::GtI => BranchPredicate::Lt,
+        FamilyOpcode::Le | FamilyOpcode::LeI | FamilyOpcode::GeI => BranchPredicate::Le,
         _ => unreachable!("only compare opcodes should reach branch_predicate"),
     }
 }
 
 fn compare_immediate_shape(
-    opcode: Lua54Opcode,
+    opcode: FamilyOpcode,
     reg: Reg,
     immediate: CondOperand,
 ) -> (BranchPredicate, CondOperand, CondOperand) {
     match opcode {
-        Lua54Opcode::EqI | Lua54Opcode::LtI | Lua54Opcode::LeI => {
+        FamilyOpcode::EqI | FamilyOpcode::LtI | FamilyOpcode::LeI => {
             (branch_predicate(opcode), CondOperand::Reg(reg), immediate)
         }
-        Lua54Opcode::GtI => (BranchPredicate::Lt, immediate, CondOperand::Reg(reg)),
-        Lua54Opcode::GeI => (BranchPredicate::Le, immediate, CondOperand::Reg(reg)),
+        FamilyOpcode::GtI => (BranchPredicate::Lt, immediate, CondOperand::Reg(reg)),
+        FamilyOpcode::GeI => (BranchPredicate::Le, immediate, CondOperand::Reg(reg)),
         _ => unreachable!("only compare-immediate opcodes should reach compare_immediate_shape"),
     }
 }
 
 define_operand_expecters! {
-    opcode = Lua54Opcode,
-    operands = Lua54Operands,
-    label = Lua54Opcode::label,
+    opcode = FamilyOpcode,
+    operands = FamilyOperands,
+    label = FamilyOpcode::label,
     fn expect_a("A") -> u8 {
-        Lua54Operands::A { a } => *a
+        FamilyOperands::A { a } => *a
     }
     fn expect_ak("Ak") -> (u8, bool) {
-        Lua54Operands::Ak { a, k } => (*a, *k)
+        FamilyOperands::Ak { a, k } => (*a, *k)
     }
     fn expect_ab("AB") -> (u8, u8) {
-        Lua54Operands::AB { a, b } => (*a, *b)
+        FamilyOperands::AB { a, b } => (*a, *b)
     }
     fn expect_ac("AC") -> (u8, u8) {
-        Lua54Operands::AC { a, c } => (*a, *c)
+        FamilyOperands::AC { a, c } => (*a, *c)
+    }
+    fn expect_abc("ABC") -> (u8, u8, u8) {
+        FamilyOperands::Abc { a, b, c } => (*a, *b, *c)
     }
     fn expect_abk("ABk") -> (u8, u8, bool) {
-        Lua54Operands::ABk { a, b, k } => (*a, *b, *k)
+        FamilyOperands::ABk { a, b, k } => (*a, *b, *k)
     }
     fn expect_abck("ABCk") -> (u8, u8, u8, bool) {
-        Lua54Operands::ABCk { a, b, c, k } => (*a, *b, *c, *k)
+        FamilyOperands::ABCk { a, b, c, k } => (*a, *b, *c, *k)
     }
     fn expect_abx("ABx") -> (u8, u32) {
-        Lua54Operands::ABx { a, bx } => (*a, *bx)
+        FamilyOperands::ABx { a, bx } => (*a, *bx)
     }
     fn expect_asbx("AsBx") -> (u8, i32) {
-        Lua54Operands::AsBx { a, sbx } => (*a, *sbx)
+        FamilyOperands::AsBx { a, sbx } => (*a, *sbx)
     }
     fn expect_asj("AsJ") -> i32 {
-        Lua54Operands::AsJ { sj } => *sj
+        FamilyOperands::AsJ { sj } => *sj
     }
     fn expect_absck("ABsCk") -> (u8, u8, i16, bool) {
-        Lua54Operands::ABsCk { a, b, sc, k } => (*a, *b, *sc, *k)
+        FamilyOperands::ABsCk { a, b, sc, k } => (*a, *b, *sc, *k)
     }
     fn expect_asbck("AsBCk") -> (u8, i16, u8, bool) {
-        Lua54Operands::AsBCk { a, sb, c, k } => (*a, *sb, *c, *k)
+        FamilyOperands::AsBCk { a, sb, c, k } => (*a, *sb, *c, *k)
+    }
+    fn expect_avbck("AvBCk") -> (u8, u8, u16, bool) {
+        FamilyOperands::AvBCk { a, vb, vc, k } => (*a, *vb, *vc, *k)
     }
 }
