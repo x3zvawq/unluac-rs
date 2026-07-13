@@ -76,7 +76,60 @@ impl StructuredBodyLowerer<'_, '_> {
         // 直接离开循环”。这里不把这类 pad 留给 fallback，而是在 HIR 里直接恢复成 break，
         // 这样后面的 AST/readability 就不用再对着 `close + jump` 反推源码意图。
         let loop_context = self.active_loops.last()?.clone();
+        let loop_body_target = loop_context.continue_target.unwrap_or(loop_context.header);
+        // 短路退出臂可能先完整执行内层 loop；必须在内层边界外追加外层 break。
+        if let Some(plan) = self.try_build_short_circuit_plan(block, stop).flatten()
+            && plan.merge == Some(loop_context.post_loop)
+            && let Some(else_entry) = plan.else_entry
+        {
+            let break_arm = match (
+                self.branch_arm_reaches_target_before_boundary(
+                    plan.then_entry,
+                    loop_context.post_loop,
+                    loop_body_target,
+                ),
+                self.branch_arm_reaches_target_before_boundary(
+                    plan.then_entry,
+                    loop_body_target,
+                    loop_context.post_loop,
+                ),
+                self.branch_arm_reaches_target_before_boundary(
+                    else_entry,
+                    loop_context.post_loop,
+                    loop_body_target,
+                ),
+                self.branch_arm_reaches_target_before_boundary(
+                    else_entry,
+                    loop_body_target,
+                    loop_context.post_loop,
+                ),
+            ) {
+                (true, false, false, true) => Some((plan.then_entry, else_entry, true)),
+                (false, true, true, false) => Some((else_entry, plan.then_entry, false)),
+                _ => None,
+            };
+            if let Some((break_entry, next_entry, break_on_truthy)) = break_arm {
+                let mut cond = if break_on_truthy {
+                    plan.cond
+                } else {
+                    plan.cond.negate()
+                };
+                rewrite_expr_temps(&mut cond, &temp_expr_overrides(target_overrides));
+                let mut break_block =
+                    self.lower_region(break_entry, Some(loop_context.post_loop), target_overrides)?;
+                break_block.stmts.push(HirStmt::Break);
+
+                stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
+                self.visited.extend(plan.consumed_blocks);
+                stmts.push(branch_stmt(cond, break_block, None));
+                return Some(Some(next_entry));
+            }
+        }
         let candidate = *self.branch_by_header.get(&block)?;
+        // 当前 header 可能同时是内层 break branch 与外层 state 的共享 merge。
+        // 必须在降低 header prefix 前继承已经由全 incoming 证明的 state owner，
+        // 否则 generic phi 会先被物化，外层 continuation 随后无法再接管。
+        self.install_proven_target_phi_overrides(block, target_overrides);
         let break_exit = candidate.merge.filter(|merge| {
             loop_context.break_exits.contains_key(merge)
                 || *merge == loop_context.post_loop
@@ -321,7 +374,7 @@ impl StructuredBodyLowerer<'_, '_> {
         // active loop 的本地语义时才吸收；否则宁可保持 fallback，也不把跨结构跳转误判成 continue。
         let loop_context = self.active_loops.last()?.clone();
         let continue_target = loop_context.continue_target?;
-        let owned_continue_entry = if self.can_emit_continue_stmt() {
+        let loop_continue_entry = if self.can_emit_continue_stmt() {
             self.loop_candidate(loop_context.candidate_id)?
                 .continue_edges
                 .iter()
@@ -332,28 +385,146 @@ impl StructuredBodyLowerer<'_, '_> {
         } else {
             None
         };
+        let active_candidate = self.loop_candidate(loop_context.candidate_id)?;
+        let short_circuit_non_continue = match self.multi_node_short_circuit_non_continue_exit(
+            block,
+            continue_target,
+            &active_candidate.binding_scope_blocks,
+        ) {
+            Ok(exit) => exit,
+            Err(()) => return None,
+        };
+        if short_circuit_non_continue.is_some_and(|exit| {
+            exit == loop_context.post_loop
+                || Some(exit) == loop_context.downstream_post_loop
+                || loop_context.break_exits.contains_key(&exit)
+        }) {
+            return None;
+        }
+        // 非空 repeat condition 前仍可能有更近的本轮 tail。if-then 的缺席 else
+        // 直接跳 condition，而显式臂完整执行 local tail；这不是自然 fallthrough，
+        // 必须先恢复显式 continue，才能把 tail 留给外层 region 单次消费。
+        if self.can_emit_continue_stmt()
+            && active_candidate.kind_hint == LoopKindHint::RepeatLike
+            && let Some(local_tail) = stop
+            && local_tail != continue_target
+            && let Some(candidate) = self.branch_by_header.get(&block).copied()
+            && candidate.else_entry.is_none()
+            && candidate.merge == Some(continue_target)
+            && self.branch_arm_reaches_target_before_boundary(
+                candidate.then_entry,
+                local_tail,
+                continue_target,
+            )
+        {
+            let mut continue_cond = self.lower_branch_cond_for_target(block, continue_target)?;
+            rewrite_expr_temps(&mut continue_cond, &temp_expr_overrides(target_overrides));
+            let then_target_overrides = self.branch_entry_target_overrides(
+                block,
+                Some(candidate.then_entry),
+                target_overrides,
+            );
+            let non_continue_block = self.lower_region(
+                candidate.then_entry,
+                Some(local_tail),
+                &then_target_overrides,
+            )?;
+
+            stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
+            self.visited.insert(block);
+            stmts.push(branch_stmt(
+                continue_cond,
+                HirBlock {
+                    stmts: vec![HirStmt::Continue],
+                },
+                None,
+            ));
+            stmts.extend(non_continue_block.stmts);
+            return Some(Some(local_tail));
+        }
+        let branch_continue_pad = if loop_continue_entry.is_none()
+            && active_candidate.kind_hint == LoopKindHint::RepeatLike
+        {
+            self.branch_by_header.get(&block).and_then(|candidate| {
+                [Some(candidate.then_entry), candidate.else_entry]
+                    .into_iter()
+                    .flatten()
+                    .find(|entry| {
+                        loop_context.continue_sources.contains(entry)
+                            && self.lowering.cfg.unique_reachable_successor(*entry)
+                                == Some(continue_target)
+                    })
+            })
+        } else {
+            None
+        };
+        let owned_continue_entry = branch_continue_pad.or(loop_continue_entry);
         let continue_entry = owned_continue_entry.unwrap_or(continue_target);
         let continue_target_is_empty = self.loop_continue_target_is_empty(continue_target);
-        let can_emit_owned_continue = owned_continue_entry.is_some();
-        let can_fallthrough_to_non_empty_continue = self
-            .loop_candidate(loop_context.candidate_id)
-            .is_some_and(|candidate| {
-                matches!(
-                    candidate.kind_hint,
-                    LoopKindHint::NumericForLike
-                        | LoopKindHint::GenericForLike
-                        | LoopKindHint::Unknown
-                )
-            });
+        let can_emit_owned_continue =
+            owned_continue_entry.is_some() || short_circuit_non_continue.is_some();
+        let can_fallthrough_to_non_empty_continue = matches!(
+            active_candidate.kind_hint,
+            LoopKindHint::NumericForLike | LoopKindHint::GenericForLike | LoopKindHint::Unknown
+        );
         if !(continue_target_is_empty
             || can_fallthrough_to_non_empty_continue
             || can_emit_owned_continue)
         {
             return None;
         }
+        // O2 会让自然循环尾的 if-body 与 header 直达边共享 continue pad；只消费
+        // 当前 region 的多出口 body，且不越过 body entry 上已有的 continue owner。
+        if let Some(candidate) = self.branch_by_header.get(&block).copied()
+            && owned_continue_entry.is_some()
+            && stop == Some(continue_target)
+            && candidate.else_entry.is_none()
+            && candidate.merge == Some(continue_entry)
+            && !loop_context
+                .continue_sources
+                .contains(&candidate.then_entry)
+            && self
+                .branch_regions_by_header
+                .get(&block)
+                .is_some_and(|fact| fact.merge == continue_entry && fact.then_merge_preds.len() > 1)
+            && self.lowering.cfg.unique_reachable_successor(continue_entry) == Some(continue_target)
+        {
+            let mut cond = self.lower_candidate_cond(block, candidate)?;
+            rewrite_expr_temps(&mut cond, &temp_expr_overrides(target_overrides));
+            let then_target_overrides = self.branch_entry_target_overrides(
+                block,
+                Some(candidate.then_entry),
+                target_overrides,
+            );
+            let then_block = self.lower_region(
+                candidate.then_entry,
+                Some(continue_entry),
+                &then_target_overrides,
+            )?;
+
+            stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
+            self.visited.insert(block);
+            stmts.push(branch_stmt(cond, then_block, None));
+            stmts.extend(self.lower_block_prefix(continue_entry, false, target_overrides)?);
+            self.visited.insert(continue_entry);
+            return Some(Some(continue_target));
+        }
         if let Some(short_plan) = self.try_build_short_circuit_plan(block, stop).flatten() {
-            if let Some((continue_entry, non_continue_entry, continue_on_truthy)) =
-                self.short_circuit_continue_arm(&short_plan, continue_target, &loop_context)
+            let implicit_continue_arm = short_circuit_non_continue.and_then(|non_continue_entry| {
+                (short_plan.else_entry.is_none()
+                    && short_plan.merge == Some(non_continue_entry)
+                    && (short_plan.then_entry == continue_target
+                        || (loop_context.loop_blocks.contains(&short_plan.then_entry)
+                            && self
+                                .lowering
+                                .cfg
+                                .unique_reachable_successor(short_plan.then_entry)
+                                == Some(continue_target))))
+                .then_some((short_plan.then_entry, non_continue_entry, true))
+            });
+            if let Some((continue_entry, non_continue_entry, continue_on_truthy)) = self
+                .short_circuit_continue_arm(&short_plan, continue_target, &loop_context)
+                .or(implicit_continue_arm)
             {
                 let mut continue_cond = if continue_on_truthy {
                     short_plan.cond
@@ -365,6 +536,26 @@ impl StructuredBodyLowerer<'_, '_> {
                 stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
                 self.visited
                     .extend(short_plan.consumed_blocks.iter().copied());
+                if active_candidate.kind_hint == LoopKindHint::RepeatLike
+                    && self.block_prefix_has_non_condition_effects(continue_target)
+                {
+                    let continue_block = if continue_entry == continue_target {
+                        HirBlock::default()
+                    } else {
+                        self.lower_region(continue_entry, Some(continue_target), target_overrides)?
+                    };
+                    let non_continue_block = self.lower_region(
+                        non_continue_entry,
+                        Some(continue_target),
+                        target_overrides,
+                    )?;
+                    stmts.push(branch_stmt(
+                        continue_cond,
+                        continue_block,
+                        Some(non_continue_block),
+                    ));
+                    return Some(Some(continue_target));
+                }
                 let mut continue_block = if continue_entry == continue_target {
                     HirBlock::default()
                 } else {
@@ -400,8 +591,8 @@ impl StructuredBodyLowerer<'_, '_> {
         }
         if candidate.merge == Some(continue_target)
             && candidate.else_entry.is_some()
-            && candidate.then_entry != continue_target
-            && candidate.else_entry != Some(continue_target)
+            && candidate.then_entry != branch_continue_pad.unwrap_or(continue_target)
+            && candidate.else_entry != Some(branch_continue_pad.unwrap_or(continue_target))
         {
             // 显式 if/else 的两条臂都先执行自己的 body，再共同落到当前 loop latch 时，
             // 这不是源码层的 early-continue，而是普通分支的自然收束。交给普通 branch
@@ -417,12 +608,13 @@ impl StructuredBodyLowerer<'_, '_> {
         }
         let mut continue_cond = self.lower_branch_cond_for_target(block, continue_entry)?;
         rewrite_expr_temps(&mut continue_cond, &temp_expr_overrides(target_overrides));
-        let prefer_natural_fallthrough = self.prefer_natural_fallthrough_over_continue(
-            block,
-            candidate,
-            continue_entry,
-            &loop_context,
-        );
+        let prefer_natural_fallthrough = branch_continue_pad.is_none()
+            && self.prefer_natural_fallthrough_over_continue(
+                block,
+                candidate,
+                continue_entry,
+                &loop_context,
+            );
         if !(continue_target_is_empty
             || prefer_natural_fallthrough
             || candidate.merge == Some(continue_target)
@@ -435,7 +627,7 @@ impl StructuredBodyLowerer<'_, '_> {
 
         stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
         self.visited.insert(block);
-        if let Some(entry) = owned_continue_entry.filter(|entry| *entry != continue_target) {
+        if let Some(entry) = loop_continue_entry.filter(|entry| *entry != continue_target) {
             self.visited.insert(entry);
         }
 
@@ -473,7 +665,11 @@ impl StructuredBodyLowerer<'_, '_> {
                     ));
                     return Some(None);
                 }
-                let continue_block = self.explicit_continue_block()?;
+                let continue_block = self.lower_continue_block(
+                    branch_continue_pad,
+                    continue_target,
+                    target_overrides,
+                )?;
                 let stmt = if candidate.then_entry == continue_entry {
                     branch_stmt(
                         continue_cond,
@@ -514,7 +710,8 @@ impl StructuredBodyLowerer<'_, '_> {
                 };
             }
 
-            let continue_block = self.explicit_continue_block()?;
+            let continue_block =
+                self.lower_continue_block(branch_continue_pad, continue_target, target_overrides)?;
             let branch_stop = self.branch_stop_for_region(
                 block,
                 candidate.then_entry,
@@ -555,12 +752,7 @@ impl StructuredBodyLowerer<'_, '_> {
             // 隐式 merge 臂”。这里把 merge 臂显式降成 else block，避免 loop body 因为
             // “只有 then、没有 else” 被迫整片 fallback。
             let non_continue_entry = candidate.merge?;
-            if self.prefer_natural_fallthrough_over_continue(
-                block,
-                candidate,
-                continue_entry,
-                &loop_context,
-            ) {
+            if prefer_natural_fallthrough {
                 let branch_stop = if continue_target_is_empty {
                     stop
                 } else {
@@ -577,7 +769,8 @@ impl StructuredBodyLowerer<'_, '_> {
             }
             let non_continue_block =
                 self.lower_region(non_continue_entry, stop, target_overrides)?;
-            let continue_block = self.explicit_continue_block()?;
+            let continue_block =
+                self.lower_continue_block(branch_continue_pad, continue_target, target_overrides)?;
             stmts.push(branch_stmt(
                 continue_cond,
                 continue_block,
@@ -615,7 +808,8 @@ impl StructuredBodyLowerer<'_, '_> {
         }
 
         let merge = candidate.merge.or(stop)?;
-        let continue_block = self.explicit_continue_block()?;
+        let continue_block =
+            self.lower_continue_block(branch_continue_pad, continue_target, target_overrides)?;
         stmts.push(branch_stmt(continue_cond, continue_block, None));
         if merge == self.lowering.cfg.exit_block
             || (!continue_target_is_empty && continue_target == loop_context.header)
@@ -624,6 +818,27 @@ impl StructuredBodyLowerer<'_, '_> {
         } else {
             Some(Some(merge))
         }
+    }
+
+    fn lower_continue_block(
+        &mut self,
+        entry: Option<BlockRef>,
+        target: BlockRef,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<HirBlock> {
+        if !self.can_emit_continue_stmt() {
+            return None;
+        }
+        let mut block = match entry {
+            Some(entry) if entry != target => {
+                self.lower_region(entry, Some(target), target_overrides)?
+            }
+            _ => HirBlock::default(),
+        };
+        if !matches!(block.stmts.last(), Some(HirStmt::Continue)) {
+            block.stmts.push(HirStmt::Continue);
+        }
+        Some(block)
     }
 
     pub(super) fn short_circuit_continue_arm(

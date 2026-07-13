@@ -33,31 +33,70 @@ pub(super) struct ShortCircuitPhiFacts {
     pub(super) value_incomings: Vec<ShortCircuitValueIncoming>,
 }
 
-pub(super) fn branch_value_merge_from_phi(
+pub(super) struct BranchValueMergeContext<'a> {
+    cfg: &'a Cfg,
     header: BlockRef,
-    dataflow: &DataflowFacts,
+    graph_facts: &'a GraphFacts,
+    dataflow: &'a DataflowFacts,
+}
+
+impl<'a> BranchValueMergeContext<'a> {
+    pub(super) fn new(
+        cfg: &'a Cfg,
+        header: BlockRef,
+        graph_facts: &'a GraphFacts,
+        dataflow: &'a DataflowFacts,
+    ) -> Self {
+        Self {
+            cfg,
+            header,
+            graph_facts,
+            dataflow,
+        }
+    }
+}
+
+fn branch_value_merge_from_phi(
+    context: &BranchValueMergeContext<'_>,
     phi: &PhiCandidate,
     then_preds: &BTreeSet<BlockRef>,
     else_preds: &BTreeSet<BlockRef>,
     ignored_preds: Option<&BTreeSet<BlockRef>>,
 ) -> Option<BranchValueMergeValue> {
+    let entry_defs = value_merge_entry_defs(context.cfg, context.dataflow, context.header, phi.reg);
     let mut then_arm = BranchValueMergeArm {
         preds: BTreeSet::new(),
         defs: BTreeSet::new(),
-        non_header_defs: BTreeSet::new(),
+        entry_defs: BTreeSet::new(),
+        update_defs: BTreeSet::new(),
     };
     let mut else_arm = BranchValueMergeArm {
         preds: BTreeSet::new(),
         defs: BTreeSet::new(),
-        non_header_defs: BTreeSet::new(),
+        entry_defs: BTreeSet::new(),
+        update_defs: BTreeSet::new(),
     };
 
     for incoming in &phi.incoming {
         let pred = incoming.pred?;
         if then_preds.contains(&pred) {
-            extend_branch_value_arm(header, dataflow, &mut then_arm, incoming);
+            extend_branch_value_arm(
+                context.header,
+                context.graph_facts,
+                context.dataflow,
+                &entry_defs,
+                &mut then_arm,
+                incoming,
+            );
         } else if else_preds.contains(&pred) {
-            extend_branch_value_arm(header, dataflow, &mut else_arm, incoming);
+            extend_branch_value_arm(
+                context.header,
+                context.graph_facts,
+                context.dataflow,
+                &entry_defs,
+                &mut else_arm,
+                incoming,
+            );
         } else if ignored_preds.is_some_and(|preds| preds.contains(&pred)) {
             continue;
         } else {
@@ -74,25 +113,18 @@ pub(super) fn branch_value_merge_from_phi(
 }
 
 pub(super) fn branch_value_merges_in_block(
-    header: BlockRef,
-    dataflow: &DataflowFacts,
+    context: &BranchValueMergeContext<'_>,
     block: BlockRef,
     then_preds: &BTreeSet<BlockRef>,
     else_preds: &BTreeSet<BlockRef>,
     ignored_preds: Option<&BTreeSet<BlockRef>>,
 ) -> Vec<BranchValueMergeValue> {
-    dataflow
+    context
+        .dataflow
         .phi_candidates_in_block(block)
         .iter()
         .filter_map(|phi| {
-            branch_value_merge_from_phi(
-                header,
-                dataflow,
-                phi,
-                then_preds,
-                else_preds,
-                ignored_preds,
-            )
+            branch_value_merge_from_phi(context, phi, then_preds, else_preds, ignored_preds)
         })
         .collect()
 }
@@ -315,7 +347,9 @@ fn block_exit_defs_for_reg(
 
 fn extend_branch_value_arm(
     header: BlockRef,
+    graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
+    entry_defs: &BTreeSet<DefId>,
     arm: &mut BranchValueMergeArm,
     incoming: &crate::structure::PhiIncoming,
 ) {
@@ -325,8 +359,13 @@ fn extend_branch_value_arm(
     arm.preds.insert(pred);
     for &def in &incoming.defs {
         arm.defs.insert(def);
-        if dataflow.def_block(def) != header {
-            arm.non_header_defs.insert(def);
+        let def_block = dataflow.def_block(def);
+        if !entry_defs.contains(&def)
+            || (def_block != header && graph_facts.dominator_tree.dominates(header, def_block))
+        {
+            arm.update_defs.insert(def);
+        } else {
+            arm.entry_defs.insert(def);
         }
     }
 }

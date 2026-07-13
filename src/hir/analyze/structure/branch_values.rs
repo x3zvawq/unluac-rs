@@ -35,18 +35,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let mut values = Vec::new();
 
         for value in &candidate.values {
-            let needs_preserved_seed = self.branch_value_needs_preserved_entry_seed(header, value);
-            let needs_shared_seed = self.branch_value_needs_shared_entry_seed(header, value);
-            if !needs_preserved_seed && !needs_shared_seed {
+            if !branch_value_needs_entry_seed(value) {
                 continue;
             }
 
             let target = self.branch_value_arm_target(value, target_overrides);
-            let init = if needs_shared_seed {
-                self.branch_value_preserved_entry_expr_without_target_rewrite(header, value.reg)
-            } else {
-                self.branch_value_preserved_entry_expr(header, value.reg, target_overrides)
-            };
+            let init = self.branch_value_entry_expr(header, value.reg);
             if lvalue_as_expr(&target)
                 .as_ref()
                 .is_some_and(|target_expr| *target_expr == init)
@@ -99,19 +93,19 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             let target = self.branch_value_arm_target(value, target_overrides);
             let mut arm_defs = BTreeSet::new();
             if !value.then_arm.preds.is_disjoint(preds) {
-                arm_defs.extend(value.then_arm.non_header_defs.iter().copied());
+                arm_defs.extend(value.then_arm.update_defs.iter().copied());
                 install_def_target_overrides(
                     &self.lowering.bindings.fixed_temps,
-                    value.then_arm.non_header_defs.iter().copied(),
+                    branch_value_arm_owned_defs(&value.then_arm),
                     &target,
                     &mut overrides,
                 );
             }
             if !value.else_arm.preds.is_disjoint(preds) {
-                arm_defs.extend(value.else_arm.non_header_defs.iter().copied());
+                arm_defs.extend(value.else_arm.update_defs.iter().copied());
                 install_def_target_overrides(
                     &self.lowering.bindings.fixed_temps,
-                    value.else_arm.non_header_defs.iter().copied(),
+                    branch_value_arm_owned_defs(&value.else_arm),
                     &target,
                     &mut overrides,
                 );
@@ -242,7 +236,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     ) -> Option<HirLValue> {
         shared_lvalue_for_defs(
             &self.lowering.bindings.fixed_temps,
-            branch_value_non_header_defs(value),
+            branch_value_update_defs(value),
             target_overrides,
         )
     }
@@ -253,7 +247,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirLValue> {
         let target = self.active_loop_state_target(value.reg)?;
-        branch_value_non_header_defs(value)
+        branch_value_update_defs(value)
             .map(|def| self.lowering.bindings.fixed_temps[def.index()])
             .any(|temp| target_overrides.get(&temp) == Some(&target))
             .then_some(target)
@@ -266,7 +260,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     ) -> Option<HirExpr> {
         shared_expr_for_defs(
             &self.lowering.bindings.fixed_temps,
-            branch_value_non_header_defs(value),
+            branch_value_update_defs(value),
             target_overrides,
         )
     }
@@ -301,30 +295,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         })))
     }
 
-    fn branch_value_preserved_entry_expr(
-        &self,
-        header: BlockRef,
-        reg: Reg,
-        target_overrides: &BTreeMap<TempId, HirLValue>,
-    ) -> HirExpr {
-        // 某一臂只是在“沿用进入分支前的当前值”时，shared target 需要先吃到一份 seed；
-        // 否则后面只改写“写新值”的那一臂，merge 后继续读取的状态槽位就会悬空成 nil。
-        if !self.block_redefines_reg(header, reg)
-            && let Some(expr) = self.overrides.carried_entry_expr(header, reg)
-        {
-            return expr.clone();
-        }
-
-        let mut expr = expr_for_reg_at_block_exit(self.lowering, header, reg);
-        rewrite_expr_temps(&mut expr, &temp_expr_overrides(target_overrides));
-        expr
-    }
-
-    fn branch_value_preserved_entry_expr_without_target_rewrite(
-        &self,
-        header: BlockRef,
-        reg: Reg,
-    ) -> HirExpr {
+    fn branch_value_entry_expr(&self, header: BlockRef, reg: Reg) -> HirExpr {
         if !self.block_redefines_reg(header, reg)
             && let Some(expr) = self.overrides.carried_entry_expr(header, reg)
         {
@@ -337,50 +308,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         {
             return expr;
         }
-
         expr_for_reg_at_block_exit(self.lowering, header, reg)
-    }
-
-    fn branch_value_needs_shared_entry_seed(
-        &self,
-        header: BlockRef,
-        value: &BranchValueMergeValue,
-    ) -> bool {
-        if value.then_arm.non_header_defs.is_empty() || value.else_arm.non_header_defs.is_empty() {
-            return false;
-        }
-
-        let shared_entry_defs = value
-            .then_arm
-            .defs
-            .intersection(&value.else_arm.defs)
-            .copied()
-            .filter(|def| {
-                let def_block = self.lowering.dataflow.def_block(*def);
-                def_block == header
-                    || self
-                        .lowering
-                        .graph_facts
-                        .dominator_tree
-                        .dominates(def_block, header)
-            })
-            .collect::<BTreeSet<_>>();
-        if shared_entry_defs.is_empty() {
-            return false;
-        }
-
-        let has_then_update = value
-            .then_arm
-            .non_header_defs
-            .iter()
-            .any(|def| !shared_entry_defs.contains(def));
-        let has_else_update = value
-            .else_arm
-            .non_header_defs
-            .iter()
-            .any(|def| !shared_entry_defs.contains(def));
-
-        has_then_update || has_else_update
     }
 
     fn uniform_dup_safe_arm_expr(&self, arm: &BranchValueMergeArm) -> Option<HirExpr> {
@@ -399,50 +327,35 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         arm_expr
     }
-
-    fn branch_value_needs_preserved_entry_seed(
-        &self,
-        header: BlockRef,
-        value: &BranchValueMergeValue,
-    ) -> bool {
-        (self.branch_value_arm_preserves_current(header, &value.then_arm)
-            && self.branch_value_arm_updates_current(header, &value.else_arm))
-            || (self.branch_value_arm_preserves_current(header, &value.else_arm)
-                && self.branch_value_arm_updates_current(header, &value.then_arm))
-    }
-
-    fn branch_value_arm_preserves_current(
-        &self,
-        header: BlockRef,
-        arm: &BranchValueMergeArm,
-    ) -> bool {
-        !self.branch_value_arm_updates_current(header, arm)
-    }
-
-    fn branch_value_arm_updates_current(
-        &self,
-        header: BlockRef,
-        arm: &BranchValueMergeArm,
-    ) -> bool {
-        arm.non_header_defs.iter().any(|def| {
-            let def_block = self.lowering.dataflow.def_block(*def);
-            def_block != header
-                && self
-                    .lowering
-                    .graph_facts
-                    .dominator_tree
-                    .dominates(header, def_block)
-        })
-    }
 }
 
-fn branch_value_non_header_defs(value: &BranchValueMergeValue) -> impl Iterator<Item = DefId> + '_ {
+fn branch_value_needs_entry_seed(value: &BranchValueMergeValue) -> bool {
+    let has_entry = [&value.then_arm, &value.else_arm]
+        .into_iter()
+        .any(|arm| !arm.entry_defs.is_empty() || arm.update_defs.is_empty());
+    let has_update =
+        !value.then_arm.update_defs.is_empty() || !value.else_arm.update_defs.is_empty();
+    has_entry && has_update
+}
+
+fn branch_value_update_defs(value: &BranchValueMergeValue) -> impl Iterator<Item = DefId> + '_ {
     value
         .then_arm
-        .non_header_defs
+        .update_defs
         .iter()
         .copied()
-        .chain(value.else_arm.non_header_defs.iter().copied())
+        .chain(value.else_arm.update_defs.iter().copied())
+}
+
+fn branch_value_arm_owned_defs(arm: &BranchValueMergeArm) -> impl Iterator<Item = DefId> + '_ {
+    arm.update_defs
+        .iter()
+        .chain(
+            arm.entry_defs
+                .iter()
+                .filter(|_| !arm.update_defs.is_empty()),
+        )
+        .copied()
 }
 
 enum BranchValueOverride {

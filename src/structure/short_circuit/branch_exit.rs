@@ -140,6 +140,23 @@ fn analyze_linear_branch_exit_candidates_with<'a>(
                 exit = infer_linear_branch_exit(proto, cfg, &headers);
             }
         }
+        // `a or b` 沿 falsy 边进入下一判断；其 truthy body 若也以 branch 开头，
+        // 线性跟随会越过条件链。AND 链可由嵌套 if 自然表达，不在证据不足时扩候选。
+        if exit.is_none()
+            && headers
+                .first()
+                .zip(headers.get(1))
+                .is_some_and(|(header, next)| {
+                    truthy_falsy_targets(proto, cfg, *header)
+                        .is_some_and(|(_, falsy)| falsy == *next)
+                })
+            && let Some((prefix_len, prefix_exit)) = (2..headers.len()).rev().find_map(|len| {
+                infer_linear_branch_exit(proto, cfg, &headers[..len]).map(|exit| (len, exit))
+            })
+        {
+            headers.truncate(prefix_len);
+            exit = Some(prefix_exit);
+        }
         let Some(exit) = exit else {
             continue;
         };

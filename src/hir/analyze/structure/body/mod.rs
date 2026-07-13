@@ -229,12 +229,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.target.caps.continue_stmt
     }
 
-    pub(super) fn explicit_continue_block(&self) -> Option<HirBlock> {
-        self.can_emit_continue_stmt().then(|| HirBlock {
-            stmts: vec![HirStmt::Continue],
-        })
-    }
-
     pub(super) fn lower_region(
         &mut self,
         start: BlockRef,
@@ -312,6 +306,27 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
     pub(super) fn loop_candidate(&self, candidate_id: usize) -> Option<&'b LoopCandidate> {
         self.lowering.structure.loop_candidates.get(candidate_id)
+    }
+
+    pub(super) fn nested_loop_owner_for_entry(
+        &self,
+        active: &LoopCandidate,
+        entry: BlockRef,
+    ) -> Option<&'b LoopCandidate> {
+        let candidate = self.loop_candidate_from_preheader(entry).or_else(|| {
+            self.loops_by_header
+                .get(&entry)?
+                .iter()
+                .find_map(|(_, candidate)| {
+                    (candidate.preheader.is_none()
+                        && candidate.header != active.header
+                        && candidate.blocks.is_subset(&active.binding_scope_blocks))
+                    .then_some(*candidate)
+                })
+        })?;
+        (candidate.header != active.header
+            && candidate.blocks.is_subset(&active.binding_scope_blocks))
+        .then_some(candidate)
     }
 
     fn loop_candidate_for_entry(

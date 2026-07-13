@@ -116,13 +116,14 @@ pub struct BranchValueMergeValue {
 /// branch merge 某一臂已经收敛好的来源事实。
 ///
 /// `preds` 保留结构边归属，`defs` 记录这一臂在 merge 前实际可见的所有 reaching defs。
-/// 其中 `non_header_defs` 进一步剔掉 branch header 公共前缀里定义的版本，避免 HIR 再顺着
-/// `DefId -> block` 去判断“这是不是 arm 内真正写出来的值”。
+/// `entry_defs` 是 branch header 入口沿非回边带入的值，`update_defs` 是各 arm 在本轮
+/// 产生的版本。HIR 只消费这份分类，不再顺着 `DefId -> block` 重判来源。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchValueMergeArm {
     pub preds: BTreeSet<BlockRef>,
     pub defs: BTreeSet<DefId>,
-    pub non_header_defs: BTreeSet<DefId>,
+    pub entry_defs: BTreeSet<DefId>,
+    pub update_defs: BTreeSet<DefId>,
 }
 
 /// 一个循环候选。

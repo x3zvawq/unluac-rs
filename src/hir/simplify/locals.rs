@@ -439,6 +439,10 @@ fn collect_plans(
             branch_merge::candidate_temps(stmt, &temp_touches, decl_index, &reserved_temps);
 
         for temp in merge_temps {
+            // 分支合流也不能在子作用域重新声明外层仍在使用的状态 temp。
+            if outer_used_temps.contains(&temp) {
+                continue;
+            }
             let mut allocator = PlanAllocator {
                 temp_debug_locals,
                 plans: &mut plans,

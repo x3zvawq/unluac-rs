@@ -663,6 +663,76 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         LUAU_ONLY,
     )
     .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_112_luau_continue_merge_state_owner.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_113_luau_short_circuit_outer_break.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_114_luau_repeat_shared_nested_loop_tail.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_115_luau_branch_mixed_entry_update_owner.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_116_luau_numeric_for_shared_nested_preheader.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_117_luau_repeat_continue_pad_shared_tail.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_118_luau_early_continue_nested_loop_tail.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_119_luau_repeat_continue_pad_owner.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_120_luau_short_continue_nested_tail_break.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_121_luau_short_circuit_immediate_repeat_break.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_122_luau_same_header_loop_break_owner.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_123_luau_dual_early_return_soft_merge.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_124_luau_loop_break_header_phi_owner.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_125_luau_repeat_condition_side_effect.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {

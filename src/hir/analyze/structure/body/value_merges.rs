@@ -23,7 +23,7 @@ use crate::hir::analyze::short_circuit::{
 };
 use crate::structure::DefId;
 
-type StatementValueMergeOutput<'c> = (&'c ShortCircuitCandidate, TempId);
+type StatementValueMergeOutput<'c> = (&'c ShortCircuitCandidate, HirLValue);
 
 impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     pub(super) fn try_lower_conditional_reassign_branch(
@@ -144,7 +144,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         {
             return None;
         }
-        let outputs = self.statement_value_merge_outputs(short)?;
+        let outputs = self.statement_value_merge_outputs(short, target_overrides)?;
         let mut short_stmts = self.lower_block_prefix(block, true, target_overrides)?;
         short_stmts.extend(
             self.lower_value_merge_node(short, short.entry, &outputs, true, target_overrides)?
@@ -186,18 +186,20 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     fn statement_value_merge_outputs(
         &self,
         short: &'b ShortCircuitCandidate,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Vec<StatementValueMergeOutput<'b>>> {
         let mut outputs = Vec::new();
         for candidate in &self.lowering.structure.short_circuit_candidates {
             if !same_statement_value_merge_tree(short, candidate) {
                 continue;
             }
-            let temp = *self
-                .lowering
-                .bindings
-                .phi_temps
-                .get(candidate.result_phi_id?.index())?;
-            outputs.push((candidate, temp));
+            let phi_id = candidate.result_phi_id?;
+            let temp = *self.lowering.bindings.phi_temps.get(phi_id.index())?;
+            let target = target_overrides
+                .get(&temp)
+                .cloned()
+                .unwrap_or(HirLValue::Temp(temp));
+            outputs.push((candidate, target));
         }
         (!outputs.is_empty()).then_some(outputs)
     }
@@ -390,7 +392,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         } else {
             self.lower_block_prefix(block, false, target_overrides)?
         };
-        for (short, target_temp) in outputs {
+        for (short, target) in outputs {
             let value = if block == current_header
                 && header_subject_is_value_carrier(self.lowering, current_header, short.result_reg)
             {
@@ -400,8 +402,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             } else {
                 lower_materialized_value_leaf_expr(self.lowering, short, block)?
             };
-            let mut stmt = assign_stmt(vec![HirLValue::Temp(*target_temp)], vec![value]);
+            let mut stmt = assign_stmt(vec![target.clone()], vec![value]);
             apply_loop_rewrites(std::slice::from_mut(&mut stmt), target_overrides);
+            if let HirStmt::Assign(assign) = &stmt
+                && assign.targets.len() == 1
+                && assign.values.len() == 1
+                && lvalue_as_expr(&assign.targets[0]).as_ref() == Some(&assign.values[0])
+            {
+                continue;
+            }
             stmts.push(stmt);
         }
 
@@ -444,7 +453,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let Some(merge) = branch_stop else {
             return;
         };
-        self.install_stop_boundary_target_phi_overrides(merge, target_overrides);
+        self.install_proven_target_phi_overrides(merge, target_overrides);
         let Some(short) = value_merge_candidate_by_header(self.lowering, header) else {
             return;
         };
@@ -469,7 +478,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.replace_phi_with_entry_expr(merge, phi_id, reg, expr);
     }
 
-    pub(super) fn install_stop_boundary_target_phi_overrides(
+    pub(super) fn install_proven_target_phi_overrides(
         &mut self,
         merge: BlockRef,
         target_overrides: &BTreeMap<TempId, HirLValue>,

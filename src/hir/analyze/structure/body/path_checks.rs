@@ -69,6 +69,27 @@ impl StructuredBodyLowerer<'_, '_> {
         })
     }
 
+    pub(super) fn branch_arm_reaches_target_before_boundary(
+        &self,
+        entry: BlockRef,
+        target: BlockRef,
+        boundary: BlockRef,
+    ) -> bool {
+        self.branch_arm_paths_all_match(entry, |block| {
+            if block == target {
+                return Some(true);
+            }
+            if block == boundary
+                || block == self.lowering.cfg.exit_block
+                || self.block_is_terminal_exit(block)
+                || self.block_is_active_loop_escape(block)
+            {
+                return Some(false);
+            }
+            (!self.lowering.cfg.reachable_blocks.contains(&block)).then_some(false)
+        })
+    }
+
     pub(super) fn branch_arm_reaches_loop_continuation_or_escape(
         &self,
         entry: BlockRef,

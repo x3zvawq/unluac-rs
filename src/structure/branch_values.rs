@@ -18,7 +18,7 @@ use super::common::{
     ShortCircuitExit,
 };
 use super::helpers::collect_merge_arm_preds;
-use super::phi_facts::branch_value_merges_in_block;
+use super::phi_facts::{BranchValueMergeContext, branch_value_merges_in_block};
 
 #[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 enum CandidateSource {
@@ -28,7 +28,7 @@ enum CandidateSource {
 
 pub(super) fn analyze_branch_value_merges(
     cfg: &Cfg,
-    _graph_facts: &GraphFacts,
+    graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
     branch_regions: &[BranchRegionFact],
     short_circuit_candidates: &[ShortCircuitCandidate],
@@ -49,6 +49,8 @@ pub(super) fn analyze_branch_value_merges(
         .iter()
         .filter_map(|branch_region| {
             analyze_branch_value_merge_candidate(
+                cfg,
+                graph_facts,
                 dataflow,
                 branch_region,
                 &short_circuit_merges,
@@ -59,6 +61,7 @@ pub(super) fn analyze_branch_value_merges(
         .chain(
             analyze_guard_short_circuit_branch_value_merges(
                 cfg,
+                graph_facts,
                 dataflow,
                 short_circuit_candidates,
                 &loop_owned_preds_by_header,
@@ -89,6 +92,7 @@ pub(super) fn analyze_branch_value_merges(
 
 fn analyze_guard_short_circuit_branch_value_merges(
     cfg: &Cfg,
+    graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
     short_circuit_candidates: &[ShortCircuitCandidate],
     loop_owned_preds_by_header: &BTreeMap<BlockRef, BTreeSet<BlockRef>>,
@@ -118,8 +122,7 @@ fn analyze_guard_short_circuit_branch_value_merges(
         }
 
         let values = branch_value_merges_in_block(
-            short.header,
-            dataflow,
+            &BranchValueMergeContext::new(cfg, short.header, graph_facts, dataflow),
             merge,
             &then_preds,
             &else_preds,
@@ -139,6 +142,8 @@ fn analyze_guard_short_circuit_branch_value_merges(
 }
 
 fn analyze_branch_value_merge_candidate(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
     branch_region: &BranchRegionFact,
     short_circuit_merges: &BTreeSet<(BlockRef, BlockRef, Option<crate::transformer::Reg>)>,
@@ -167,8 +172,7 @@ fn analyze_branch_value_merge_candidate(
     }
 
     let values = branch_value_merges_in_block(
-        branch_region.header,
-        dataflow,
+        &BranchValueMergeContext::new(cfg, branch_region.header, graph_facts, dataflow),
         merge,
         then_preds,
         else_preds,

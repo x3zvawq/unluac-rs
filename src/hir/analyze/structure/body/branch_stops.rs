@@ -176,6 +176,48 @@ impl StructuredBodyLowerer<'_, '_> {
         }
         let region = self.branch_regions_by_header.get(&block)?;
         let active_candidate = self.loop_candidate(loop_context.candidate_id)?;
+        let active_header_has_numeric_for_owner = self.target.caps.continue_stmt
+            && active_candidate.kind_hint == LoopKindHint::WhileLike
+            && self
+                .loops_by_header
+                .get(&active_candidate.header)
+                .is_some_and(|candidates| {
+                    candidates.iter().any(|(_, candidate)| {
+                        candidate.kind_hint == LoopKindHint::NumericForLike
+                            && candidate.preheader.is_some()
+                    })
+                });
+        if active_header_has_numeric_for_owner && let Some(else_entry) = else_entry {
+            for nested in &self.lowering.structure.loop_candidates {
+                let Some(candidate) = nested.preheader else {
+                    continue;
+                };
+                if nested.kind_hint != LoopKindHint::NumericForLike
+                    || nested.header == active_candidate.header
+                    || !nested
+                        .blocks
+                        .is_subset(&active_candidate.binding_scope_blocks)
+                    || !region.structured_blocks.contains(&candidate)
+                    || consumed_blocks.contains(&candidate)
+                    || candidate == block
+                    || candidate == stop
+                    || candidate == then_entry
+                    || candidate == else_entry
+                    || !self.branch_arm_reaches_loop_continuation_or_escape(
+                        candidate,
+                        stop,
+                        loop_context.header,
+                    )
+                {
+                    continue;
+                }
+                if self.nested_numeric_for_preheader_is_shared_continuation(
+                    then_entry, else_entry, candidate, stop,
+                ) {
+                    return Some(candidate);
+                }
+            }
+        }
         let nested_loop_interiors = self
             .lowering
             .structure
@@ -195,48 +237,219 @@ impl StructuredBodyLowerer<'_, '_> {
                     .filter(|block| *block != nested.header && Some(*block) != nested.preheader)
             })
             .collect::<BTreeSet<_>>();
-        let candidates = || {
-            region
-                .structured_blocks
-                .iter()
-                .copied()
-                .filter(|candidate| *candidate != block)
-                .filter(|candidate| !consumed_blocks.contains(candidate))
-                .filter(|candidate| *candidate != stop)
-                .filter(|candidate| *candidate != then_entry && Some(*candidate) != else_entry)
-                .filter(|candidate| !nested_loop_interiors.contains(candidate))
-                .filter(|candidate| {
-                    self.lowering.cfg.unique_reachable_successor(*candidate) == Some(stop)
-                        || self.branch_arm_reaches_loop_continuation_or_escape(
-                            *candidate,
+        let stop_predecessor_has_continue_owner = |from: BlockRef| {
+            loop_context.continue_sources.contains(&from)
+                || self.branch_by_header.get(&from).is_some_and(|branch| {
+                    branch.else_entry.is_none()
+                        && branch.merge == Some(stop)
+                        && self.branch_arm_reaches_target_before_boundary(
+                            branch.then_entry,
+                            region.merge,
                             stop,
-                            loop_context.header,
                         )
                 })
         };
-        if let Some(continuation) = candidates().find(|candidate| {
-            self.branch_arm_reaches_loop_continuation_or_escape(then_entry, *candidate, stop)
-                && else_entry.is_none_or(|else_entry| {
-                    self.branch_arm_reaches_loop_continuation_or_escape(
-                        else_entry, *candidate, stop,
-                    )
+        let stop_predecessors_have_expected_owners = || {
+            let mut has_continue_owner = false;
+            self.lowering.cfg.preds[stop.index()]
+                .iter()
+                .all(|edge_ref| {
+                    let from = self.lowering.cfg.edges[edge_ref.index()].from;
+                    let has_owner = stop_predecessor_has_continue_owner(from);
+                    has_continue_owner |= has_owner;
+                    from == region.merge || has_owner
                 })
-        }) {
-            return Some(continuation);
+                && has_continue_owner
+        };
+        if self.can_emit_continue_stmt()
+            && active_candidate.kind_hint == LoopKindHint::RepeatLike
+            && else_entry.is_none()
+            && region.merge != block
+            && region.merge != then_entry
+            && region.merge != stop
+            && !consumed_blocks.contains(&region.merge)
+            && !nested_loop_interiors.contains(&region.merge)
+            && (self.lowering.cfg.unique_reachable_successor(region.merge) == Some(stop)
+                || self.branch_arm_reaches_loop_continuation_or_escape(
+                    region.merge,
+                    stop,
+                    loop_context.header,
+                ))
+            && self.branch_arm_reaches_target_or_boundary_or_terminate(
+                then_entry,
+                region.merge,
+                stop,
+            )
+            && stop_predecessors_have_expected_owners()
+        {
+            return Some(region.merge);
+        }
+        let reaches_in_current_iteration = |entry, candidate| {
+            active_candidate.kind_hint != LoopKindHint::RepeatLike
+                || self.can_reach_avoiding_block(entry, candidate, loop_context.header)
+        };
+        let mut fallback_continuation = None;
+        for candidate in region
+            .structured_blocks
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != block)
+            .filter(|candidate| !consumed_blocks.contains(candidate))
+            .filter(|candidate| *candidate != stop)
+            .filter(|candidate| *candidate != then_entry && Some(*candidate) != else_entry)
+            .filter(|candidate| !nested_loop_interiors.contains(candidate))
+            .filter(|candidate| {
+                self.lowering.cfg.unique_reachable_successor(*candidate) == Some(stop)
+                    || self.branch_arm_reaches_loop_continuation_or_escape(
+                        *candidate,
+                        stop,
+                        loop_context.header,
+                    )
+            })
+        {
+            if reaches_in_current_iteration(then_entry, candidate)
+                && self.branch_arm_reaches_loop_continuation_or_escape(then_entry, candidate, stop)
+                && else_entry.is_none_or(|else_entry| {
+                    reaches_in_current_iteration(else_entry, candidate)
+                        && self.branch_arm_reaches_loop_continuation_or_escape(
+                            else_entry, candidate, stop,
+                        )
+                })
+            {
+                return Some(candidate);
+            }
+            if fallback_continuation.is_none()
+                && let Some(else_entry) = else_entry
+                && self
+                    .branch_by_header
+                    .get(&candidate)
+                    .is_some_and(|branch| branch.merge == Some(stop))
+                && self.can_reach_avoiding_block(then_entry, candidate, stop)
+                && self.can_reach_avoiding_block(else_entry, candidate, stop)
+                && self.branch_arm_reaches_stop_or_loop_escape(then_entry, candidate, stop)
+                && self.branch_arm_reaches_stop_or_loop_escape(else_entry, candidate, stop)
+            {
+                fallback_continuation = Some(candidate);
+            }
         }
 
         // early continue 可以让一条路径跳过 tail；只用 Structure 明确给出
         // `tail branch -> stop` owner 的双臂分支补充常规严格证明。
         let else_entry = else_entry?;
-        candidates().find(|candidate| {
-            self.branch_by_header
-                .get(candidate)
-                .is_some_and(|branch| branch.merge == Some(stop))
-                && self.can_reach_avoiding_block(then_entry, *candidate, stop)
-                && self.can_reach_avoiding_block(else_entry, *candidate, stop)
-                && self.branch_arm_reaches_stop_or_loop_escape(then_entry, *candidate, stop)
-                && self.branch_arm_reaches_stop_or_loop_escape(else_entry, *candidate, stop)
-        })
+        let continuation = fallback_continuation?;
+        self.promoted_early_continue_nested_tail(
+            continuation,
+            then_entry,
+            else_entry,
+            stop,
+            loop_context,
+            active_candidate,
+        )
+        .or(Some(continuation))
+    }
+
+    fn promoted_early_continue_nested_tail(
+        &self,
+        continuation: BlockRef,
+        then_entry: BlockRef,
+        else_entry: BlockRef,
+        stop: BlockRef,
+        loop_context: &ActiveLoopContext,
+        active_candidate: &LoopCandidate,
+    ) -> Option<BlockRef> {
+        let tail_branch = self.branch_by_header.get(&continuation)?;
+        if tail_branch.else_entry.is_some() {
+            return None;
+        }
+        let shared_tail = match self.multi_node_short_circuit_non_continue_exit(
+            continuation,
+            stop,
+            &active_candidate.binding_scope_blocks,
+        ) {
+            Ok(Some(exit)) => exit,
+            Ok(None) => tail_branch.then_entry,
+            Err(()) => return None,
+        };
+        let shared_tail = if self
+            .nested_loop_owner_for_entry(active_candidate, shared_tail)
+            .is_some()
+        {
+            shared_tail
+        } else if !self.branch_by_header.contains_key(&shared_tail)
+            && !self.loop_by_header.contains_key(&shared_tail)
+        {
+            let successor = self.lowering.cfg.unique_reachable_successor(shared_tail)?;
+            self.nested_loop_owner_for_entry(active_candidate, successor)?;
+            successor
+        } else {
+            return None;
+        };
+        let mut current_iteration = active_candidate.binding_scope_blocks.clone();
+        current_iteration.remove(&loop_context.header);
+        current_iteration.remove(&stop);
+        let predecessors = self.lowering.cfg.preds[shared_tail.index()]
+            .iter()
+            .map(|edge| self.lowering.cfg.edges[edge.index()].from)
+            .collect::<BTreeSet<_>>();
+        let then_reachable = self
+            .lowering
+            .cfg
+            .reachable_targets_within(then_entry, &current_iteration);
+        let else_reachable = self
+            .lowering
+            .cfg
+            .reachable_targets_within(else_entry, &current_iteration);
+        let distinct_arm_predecessors =
+            has_distinct_arm_predecessors(&predecessors, &then_reachable, &else_reachable);
+        (distinct_arm_predecessors
+            && self.branch_arm_reaches_target_or_loop_escape_before_boundary(
+                then_entry,
+                shared_tail,
+                Some(loop_context.header),
+            )
+            && self.branch_arm_reaches_target_or_loop_escape_before_boundary(
+                else_entry,
+                shared_tail,
+                Some(loop_context.header),
+            ))
+        .then_some(shared_tail)
+    }
+
+    fn nested_numeric_for_preheader_is_shared_continuation(
+        &self,
+        then_entry: BlockRef,
+        else_entry: BlockRef,
+        candidate: BlockRef,
+        continue_target: BlockRef,
+    ) -> bool {
+        let predecessors = self.lowering.cfg.preds[candidate.index()]
+            .iter()
+            .map(|edge| self.lowering.cfg.edges[edge.index()].from)
+            .collect::<BTreeSet<_>>();
+        let mut current_iteration = self.lowering.cfg.reachable_blocks.clone();
+        current_iteration.remove(&continue_target);
+        let mut then_reachable = self
+            .lowering
+            .cfg
+            .reachable_targets_within(then_entry, &current_iteration);
+        let mut else_reachable = self
+            .lowering
+            .cfg
+            .reachable_targets_within(else_entry, &current_iteration);
+        then_reachable.remove(&continue_target);
+        else_reachable.remove(&continue_target);
+        let has_distinct_arm_predecessors =
+            has_distinct_arm_predecessors(&predecessors, &then_reachable, &else_reachable);
+
+        has_distinct_arm_predecessors
+            && then_reachable.contains(&candidate)
+            && else_reachable.contains(&candidate)
+            && self.branch_arm_reaches_target_or_loop_escape_before_boundary(
+                then_entry, candidate, None,
+            )
+            && self.branch_arm_reaches_target_or_loop_escape_before_boundary(
+                else_entry, candidate, None,
+            )
     }
 
     pub(super) fn branch_arm_stop(
@@ -283,4 +496,22 @@ impl StructuredBodyLowerer<'_, '_> {
             Some(branch_stop)
         }
     }
+}
+
+fn has_distinct_arm_predecessors(
+    predecessors: &BTreeSet<BlockRef>,
+    then_reachable: &BTreeSet<BlockRef>,
+    else_reachable: &BTreeSet<BlockRef>,
+) -> bool {
+    predecessors
+        .intersection(then_reachable)
+        .next()
+        .zip(predecessors.intersection(else_reachable).next())
+        .is_some_and(|(then_pred, else_pred)| {
+            then_pred != else_pred
+                || predecessors.iter().any(|pred| {
+                    pred != then_pred
+                        && (then_reachable.contains(pred) || else_reachable.contains(pred))
+                })
+        })
 }

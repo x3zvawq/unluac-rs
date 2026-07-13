@@ -5,8 +5,6 @@
 //! 出口的 retry loop，会保守降成 `while true ... break`。
 //! 例如：`NumericForLike` 的候选会在这里降成 `HirStmt::NumericFor`。
 
-use crate::structure::SsaValue;
-
 use super::*;
 use crate::hir::expr_safety::expr_observes_eval_order;
 use crate::hir::{HirTableField, HirTableKey};
@@ -367,46 +365,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         })));
 
         Some(None)
-    }
-
-    fn block_condition_prefix_temps(&self, block: BlockRef) -> BTreeSet<TempId> {
-        let Some((branch_ref, LowInstr::Branch(_))) = self.block_terminator(block) else {
-            return BTreeSet::new();
-        };
-        let range = self.lowering.cfg.blocks[block.index()].instrs;
-        let prefix_start = range.start.index();
-        let prefix_end = branch_ref.index();
-        let mut temps = BTreeSet::new();
-        let mut seen_defs = BTreeSet::new();
-        let mut pending_defs = self
-            .lowering
-            .dataflow
-            .use_values_at(branch_ref)
-            .values()
-            .flat_map(|values| values.iter())
-            .filter_map(|value| match value {
-                SsaValue::Def(def) => Some(def),
-                SsaValue::Phi(_) => None,
-            })
-            .collect::<Vec<_>>();
-
-        while let Some(def) = pending_defs.pop() {
-            if !seen_defs.insert(def) {
-                continue;
-            }
-            let def_instr = self.lowering.dataflow.def_instr(def);
-            if (prefix_start..prefix_end).contains(&def_instr.index()) {
-                temps.insert(self.lowering.bindings.fixed_temps[def.index()]);
-            }
-            for values in self.lowering.dataflow.use_values_at(def_instr).values() {
-                pending_defs.extend(values.iter().filter_map(|value| match value {
-                    SsaValue::Def(upstream) => Some(upstream),
-                    SsaValue::Phi(_) => None,
-                }));
-            }
-        }
-
-        temps
     }
 
     fn header_prefix_has_live_non_condition_defs(

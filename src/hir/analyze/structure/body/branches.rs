@@ -309,8 +309,17 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // if-then 的缺席 else 会先经过 merge；但只有 then 臂能绕过 merge 直接到达
         // downstream 时，merge 才是在语义上独占的隐式 else 块。若 then 臂必须经过
         // merge，merge 就是两条路径共享的 tail，不能被提前放进 else 臂。
-        self.can_reach_avoiding_block(plan.then_entry, downstream, merge)
-            .then_some(downstream)
+        let repeat_condition_is_downstream = self.can_emit_continue_stmt()
+            && self.active_loops.last().is_some_and(|loop_context| {
+                loop_context.continue_target == Some(downstream)
+                    && self
+                        .loop_candidate(loop_context.candidate_id)
+                        .is_some_and(|candidate| candidate.kind_hint == LoopKindHint::RepeatLike)
+            });
+        (self.can_reach_avoiding_block(plan.then_entry, downstream, merge)
+            && (!repeat_condition_is_downstream
+                || !self.can_reach_avoiding_block(plan.then_entry, merge, downstream)))
+        .then_some(downstream)
     }
 
     fn current_loop_shared_tail(
@@ -334,18 +343,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 && !self.branch_by_header.contains_key(tail)
                 && !self.loop_by_header.contains_key(tail)
                 && self.region_predecessor_count(*tail, &region.structured_blocks) >= 2
-                && self.lowering.cfg.unique_reachable_successor(*tail) == Some(continue_target)
+                && self.shared_tail_reaches_loop_continue(*tail, continue_target, loop_context)
                 && [plan.then_entry, else_entry].into_iter().any(|entry| {
-                    self.try_build_short_circuit_plan(entry, Some(*tail))
-                        .flatten()
-                        .is_some_and(|short_plan| {
-                            self.short_circuit_continue_arm(
-                                &short_plan,
-                                continue_target,
-                                loop_context,
-                            )
-                            .is_some()
-                        })
+                    self.entry_has_continue_owner_before_tail(
+                        entry,
+                        *tail,
+                        boundary,
+                        continue_target,
+                        loop_context,
+                    )
                 })
                 && self.branch_arm_reaches_target_or_boundary_or_terminate(
                     plan.then_entry,
@@ -355,6 +361,47 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 && self
                     .branch_arm_reaches_target_or_boundary_or_terminate(else_entry, *tail, boundary)
         })
+    }
+
+    fn shared_tail_reaches_loop_continue(
+        &self,
+        tail: BlockRef,
+        continue_target: BlockRef,
+        loop_context: &ActiveLoopContext,
+    ) -> bool {
+        self.lowering.cfg.unique_reachable_successor(tail) == Some(continue_target)
+            || self
+                .loop_candidate_from_preheader(tail)
+                .is_some_and(|nested| {
+                    !nested.exits.is_empty()
+                        && nested.exits.iter().all(|exit| *exit == continue_target)
+                        && nested.blocks.is_subset(&loop_context.loop_blocks)
+                })
+    }
+
+    fn entry_has_continue_owner_before_tail(
+        &self,
+        entry: BlockRef,
+        tail: BlockRef,
+        boundary: BlockRef,
+        continue_target: BlockRef,
+        loop_context: &ActiveLoopContext,
+    ) -> bool {
+        self.try_build_short_circuit_plan(entry, Some(tail))
+            .flatten()
+            .is_some_and(|plan| {
+                self.short_circuit_continue_arm(&plan, continue_target, loop_context)
+                    .is_some()
+            })
+            || self.branch_by_header.get(&entry).is_some_and(|branch| {
+                branch.else_entry.is_none()
+                    && branch.merge == Some(continue_target)
+                    && self.branch_arm_reaches_target_or_boundary_or_terminate(
+                        branch.then_entry,
+                        tail,
+                        boundary,
+                    )
+            })
     }
 
     fn implicit_else_merge_entry(
@@ -598,7 +645,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             // header/iterator owner 去扩大分支 region。
             || (self.active_loops.last().is_some_and(|loop_context| {
                 self.loop_candidate(loop_context.candidate_id)
-                    .is_some_and(|candidate| candidate.kind_hint == LoopKindHint::RepeatLike)
+                    .is_some_and(|candidate| {
+                        candidate.kind_hint == LoopKindHint::RepeatLike
+                            && self.can_reach_avoiding_block(
+                                entry,
+                                shared,
+                                loop_context.header,
+                            )
+                    })
             }) && self.loop_by_header.contains_key(&entry)
                 && self.block_is_active_loop_escape(boundary)
                 && self.branch_arm_reaches_stop_or_loop_escape(entry, shared, boundary))
@@ -769,7 +823,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         };
         rewrite_expr_temps(&mut cond, &temp_expr_overrides(target_overrides));
         stmts.push(branch_stmt(cond, gated_block, None));
-        self.install_stop_boundary_target_phi_overrides(shared.shared_entry, target_overrides);
+        self.install_proven_target_phi_overrides(shared.shared_entry, target_overrides);
         Some(Some(shared.shared_entry))
     }
 

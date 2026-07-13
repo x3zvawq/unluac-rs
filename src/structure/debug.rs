@@ -361,15 +361,17 @@ fn write_branch_value_merges(
         for value in &candidate.values {
             let _ = writeln!(
                 output,
-                "{indent}      phi=p{} reg={} then-preds={} then-defs={} then-non-header-defs={} else-preds={} else-defs={} else-non-header-defs={}",
+                "{indent}      phi=p{} reg={} then-preds={} then-defs={} then-entry-defs={} then-update-defs={} else-preds={} else-defs={} else-entry-defs={} else-update-defs={}",
                 value.phi_id.index(),
                 value.reg,
                 format_display_set(&value.then_arm.preds),
                 format_display_set(&value.then_arm.defs),
-                format_display_set(&value.then_arm.non_header_defs),
+                format_display_set(&value.then_arm.entry_defs),
+                format_display_set(&value.then_arm.update_defs),
                 format_display_set(&value.else_arm.preds),
                 format_display_set(&value.else_arm.defs),
-                format_display_set(&value.else_arm.non_header_defs),
+                format_display_set(&value.else_arm.entry_defs),
+                format_display_set(&value.else_arm.update_defs),
             );
         }
     }

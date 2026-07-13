@@ -253,6 +253,36 @@ impl Cfg {
         self.can_reach_within(from, to, &self.reachable_blocks)
     }
 
+    /// 返回 `can_reach_within` 在给定入口与限定集合下可命中的全部目标。
+    pub fn reachable_targets_within(
+        &self,
+        from: BlockRef,
+        allowed_blocks: &BTreeSet<BlockRef>,
+    ) -> BTreeSet<BlockRef> {
+        let mut targets = BTreeSet::from([from]);
+        let mut visited = BTreeSet::new();
+        let mut worklist = VecDeque::from([from]);
+
+        while let Some(block) = worklist.pop_front() {
+            if !self.reachable_blocks.contains(&block)
+                || !allowed_blocks.contains(&block)
+                || !visited.insert(block)
+            {
+                continue;
+            }
+
+            for edge_ref in &self.succs[block.index()] {
+                let succ = self.edges[edge_ref.index()].to;
+                targets.insert(succ);
+                if allowed_blocks.contains(&succ) {
+                    worklist.push_back(succ);
+                }
+            }
+        }
+
+        targets
+    }
+
     pub fn can_reach_within(
         &self,
         from: BlockRef,

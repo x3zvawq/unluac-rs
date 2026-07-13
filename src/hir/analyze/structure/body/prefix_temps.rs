@@ -9,8 +9,70 @@
 //! 输出形状：可内联 temp 的表达式 override，以及所有 prefix temp / 定义顺序集合。
 
 use super::*;
+use crate::structure::SsaValue;
 
 impl StructuredBodyLowerer<'_, '_> {
+    pub(crate) fn block_prefix_has_non_condition_effects(&self, block: BlockRef) -> bool {
+        let condition_temps = self.block_condition_prefix_temps(block);
+        let Some((terminator_ref, LowInstr::Branch(_))) = self.block_terminator(block) else {
+            return false;
+        };
+        let range = self.lowering.cfg.blocks[block.index()].instrs;
+        (range.start.index()..terminator_ref.index()).any(|instr_index| {
+            if self.overrides.instr_is_suppressed(InstrRef(instr_index))
+                || self.lowering.dataflow.effect_summaries[instr_index]
+                    .tags
+                    .is_empty()
+            {
+                return false;
+            }
+            !self.lowering.dataflow.instr_defs[instr_index]
+                .iter()
+                .map(|def| self.lowering.bindings.fixed_temps[def.index()])
+                .any(|temp| condition_temps.contains(&temp))
+        })
+    }
+
+    pub(crate) fn block_condition_prefix_temps(&self, block: BlockRef) -> BTreeSet<TempId> {
+        let Some((branch_ref, LowInstr::Branch(_))) = self.block_terminator(block) else {
+            return BTreeSet::new();
+        };
+        let range = self.lowering.cfg.blocks[block.index()].instrs;
+        let prefix_start = range.start.index();
+        let prefix_end = branch_ref.index();
+        let mut temps = BTreeSet::new();
+        let mut seen_defs = BTreeSet::new();
+        let mut pending_defs = self
+            .lowering
+            .dataflow
+            .use_values_at(branch_ref)
+            .values()
+            .flat_map(|values| values.iter())
+            .filter_map(|value| match value {
+                SsaValue::Def(def) => Some(def),
+                SsaValue::Phi(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        while let Some(def) = pending_defs.pop() {
+            if !seen_defs.insert(def) {
+                continue;
+            }
+            let def_instr = self.lowering.dataflow.def_instr(def);
+            if (prefix_start..prefix_end).contains(&def_instr.index()) {
+                temps.insert(self.lowering.bindings.fixed_temps[def.index()]);
+            }
+            for values in self.lowering.dataflow.use_values_at(def_instr).values() {
+                pending_defs.extend(values.iter().filter_map(|value| match value {
+                    SsaValue::Def(upstream) => Some(upstream),
+                    SsaValue::Phi(_) => None,
+                }));
+            }
+        }
+
+        temps
+    }
+
     /// 返回 (expr_overrides, all_prefix_temps)，其中：
     /// - `expr_overrides`：前缀指令能成功内联的 temp → 表达式映射
     /// - `all_prefix_temps`：前缀指令定义的所有 temp 集合

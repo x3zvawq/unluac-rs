@@ -30,7 +30,9 @@ impl StructuredBodyLowerer<'_, '_> {
         if self.block_exits_outer_active_loop(truthy) || self.block_exits_outer_active_loop(falsy) {
             return Some(None);
         }
+        let continue_break_merge = self.short_circuit_continue_break_merge(truthy, falsy);
         if let Some(stop) = stop
+            && continue_break_merge.is_none()
             && self.active_loops.last().is_some_and(|loop_context| {
                 loop_context.continue_target == Some(stop)
                     && !self.loop_continue_target_is_empty(stop)
@@ -91,6 +93,21 @@ impl StructuredBodyLowerer<'_, '_> {
             return Some(None);
         }
 
+        let current_continue_break_merge = self.short_circuit_continue_break_merge(truthy, falsy);
+        if continue_break_merge.is_some() || current_continue_break_merge.is_some() {
+            let merge = current_continue_break_merge?;
+            let consumed_blocks =
+                self.branch_short_circuit_consumed_blocks(&consumed_headers, truthy, falsy, stop);
+            return Some(Some(StructuredBranchPlan {
+                cond,
+                then_entry: truthy,
+                else_entry: Some(falsy),
+                merge: Some(merge),
+                consumed_headers,
+                consumed_blocks,
+            }));
+        }
+
         // 退化守卫吸收后 truthy 可能等于 falsy（body 完全为空），
         // 直接产出空 body 的 if-then，避免后续 postdom 推导制造出
         // then_entry == else_entry 的畸形 plan。
@@ -114,6 +131,28 @@ impl StructuredBodyLowerer<'_, '_> {
             return Some(None);
         }
         if stop == Some(truthy) && falsy != truthy && self.block_is_active_loop_escape(falsy) {
+            let consumed_blocks =
+                self.branch_short_circuit_consumed_blocks(&consumed_headers, truthy, falsy, stop);
+            return Some(Some(StructuredBranchPlan {
+                cond,
+                then_entry: truthy,
+                else_entry: Some(falsy),
+                merge: Some(falsy),
+                consumed_headers,
+                consumed_blocks,
+            }));
+        }
+        // repeat body 的短路失败出口可以是当前 loop 的立即 break，而成功出口继续执行
+        // 本轮 body。全图后支配会把 post-loop 误看成自然 fallthrough；这里保留显式
+        // else，交给 loop break owner 区分“立即退出”和“先到 condition”。
+        if self.active_loops.last().is_some_and(|loop_context| {
+            falsy == loop_context.post_loop
+                && (loop_context
+                    .continue_target
+                    .is_some_and(|continue_target| stop == Some(continue_target))
+                    || (loop_context.continue_target.is_none()
+                        && stop == Some(loop_context.post_loop)))
+        }) {
             let consumed_blocks =
                 self.branch_short_circuit_consumed_blocks(&consumed_headers, truthy, falsy, stop);
             return Some(Some(StructuredBranchPlan {
@@ -391,7 +430,10 @@ impl StructuredBodyLowerer<'_, '_> {
         stop: Option<BlockRef>,
         consumed_headers: &[BlockRef],
     ) -> Option<BranchShortCircuitPlan> {
-        if Some(header) == stop || consumed_headers.contains(&header) {
+        if Some(header) == stop
+            || self.block_is_active_loop_control_header(header)
+            || consumed_headers.contains(&header)
+        {
             return None;
         }
         if self.loop_by_header.contains_key(&header) {
@@ -410,6 +452,63 @@ impl StructuredBodyLowerer<'_, '_> {
             return None;
         }
         Some(next)
+    }
+
+    fn block_is_active_loop_control_header(&self, header: BlockRef) -> bool {
+        self.active_loops.last().is_some_and(|loop_context| {
+            loop_context.continue_target == Some(header)
+                || self.branch_by_header.get(&header).is_some_and(|branch| {
+                    branch.merge == Some(loop_context.post_loop)
+                        && self.can_reach_avoiding_block(
+                            branch.then_entry,
+                            loop_context.header,
+                            loop_context.post_loop,
+                        )
+                })
+        })
+    }
+
+    fn short_circuit_continue_break_merge(
+        &self,
+        truthy: BlockRef,
+        falsy: BlockRef,
+    ) -> Option<BlockRef> {
+        let loop_context = self.active_loops.last()?;
+        let continue_target = loop_context.continue_target?;
+        ((truthy == continue_target && falsy == loop_context.post_loop)
+            || (falsy == continue_target && truthy == loop_context.post_loop))
+            .then_some(loop_context.post_loop)
+    }
+
+    pub(super) fn multi_node_short_circuit_non_continue_exit(
+        &self,
+        header: BlockRef,
+        continue_target: BlockRef,
+        active_blocks: &BTreeSet<BlockRef>,
+    ) -> Result<Option<BlockRef>, ()> {
+        let mut non_continue = None;
+        for short in &self.lowering.structure.short_circuit_candidates {
+            if short.header != header || !short.reducible || short.nodes.len() <= 1 {
+                continue;
+            }
+            let ShortCircuitExit::BranchExit { truthy, falsy } = short.exit else {
+                continue;
+            };
+            let exit = match (truthy == continue_target, falsy == continue_target) {
+                (true, false) => falsy,
+                (false, true) => truthy,
+                (false, false) => continue,
+                (true, true) => return Err(()),
+            };
+            if short.blocks.contains(&continue_target)
+                || !short.blocks.is_subset(active_blocks)
+                || non_continue.is_some_and(|known| known != exit)
+            {
+                return Err(());
+            }
+            non_continue = Some(exit);
+        }
+        Ok(non_continue)
     }
 
     // 普通 branch 只有在作为短路链的下一个出口时才被临时当作两出口计划。
