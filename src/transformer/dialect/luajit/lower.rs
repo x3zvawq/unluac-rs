@@ -1118,9 +1118,9 @@ impl<'a> ProtoLowerer<'a> {
     ) -> Result<BranchCond, TransformError> {
         match opcode {
             LuaJitOpcode::IsLt | LuaJitOpcode::IsGe | LuaJitOpcode::IsLe | LuaJitOpcode::IsGt => {
-                let (a, _b, c) = expect_abc(raw_pc, opcode, operands)?;
+                let (a, d) = expect_ad(raw_pc, opcode, operands)?;
                 let lhs = CondOperand::Reg(reg_from_u8(a));
-                let rhs = CondOperand::Reg(reg_from_u8(c));
+                let rhs = CondOperand::Reg(reg_from_u16(d));
                 let (predicate, left, right) = match opcode {
                     LuaJitOpcode::IsLt => (BranchPredicate::Lt, lhs, rhs),
                     LuaJitOpcode::IsLe => (BranchPredicate::Le, lhs, rhs),
@@ -1135,45 +1135,45 @@ impl<'a> ProtoLowerer<'a> {
                 })
             }
             LuaJitOpcode::IsEqV | LuaJitOpcode::IsNeV => {
-                let (a, _b, c) = expect_abc(raw_pc, opcode, operands)?;
+                let (a, d) = expect_ad(raw_pc, opcode, operands)?;
                 Ok(BranchCond {
                     predicate: BranchPredicate::Eq,
                     operands: BranchOperands::Binary(
                         CondOperand::Reg(reg_from_u8(a)),
-                        CondOperand::Reg(reg_from_u8(c)),
+                        CondOperand::Reg(reg_from_u16(d)),
                     ),
                     negated: matches!(opcode, LuaJitOpcode::IsNeV),
                 })
             }
             LuaJitOpcode::IsEqS | LuaJitOpcode::IsNeS => {
-                let (a, _b, c) = expect_abc(raw_pc, opcode, operands)?;
+                let (a, d) = expect_ad(raw_pc, opcode, operands)?;
                 Ok(BranchCond {
                     predicate: BranchPredicate::Eq,
                     operands: BranchOperands::Binary(
                         CondOperand::Reg(reg_from_u8(a)),
-                        CondOperand::Const(self.kgc_string_const_ref(raw_pc, usize::from(c))?),
+                        CondOperand::Const(self.kgc_string_const_ref(raw_pc, usize::from(d))?),
                     ),
                     negated: matches!(opcode, LuaJitOpcode::IsNeS),
                 })
             }
             LuaJitOpcode::IsEqN | LuaJitOpcode::IsNeN => {
-                let (a, _b, c) = expect_abc(raw_pc, opcode, operands)?;
+                let (a, d) = expect_ad(raw_pc, opcode, operands)?;
                 Ok(BranchCond {
                     predicate: BranchPredicate::Eq,
                     operands: BranchOperands::Binary(
                         CondOperand::Reg(reg_from_u8(a)),
-                        self.knum_cond_operand(raw_pc, usize::from(c))?,
+                        self.knum_cond_operand(raw_pc, usize::from(d))?,
                     ),
                     negated: matches!(opcode, LuaJitOpcode::IsNeN),
                 })
             }
             LuaJitOpcode::IsEqP | LuaJitOpcode::IsNeP => {
-                let (a, _b, c) = expect_abc(raw_pc, opcode, operands)?;
+                let (a, d) = expect_ad(raw_pc, opcode, operands)?;
                 Ok(BranchCond {
                     predicate: BranchPredicate::Eq,
                     operands: BranchOperands::Binary(
                         CondOperand::Reg(reg_from_u8(a)),
-                        pri_cond_operand(raw_pc, u16::from(c))?,
+                        pri_cond_operand(raw_pc, d)?,
                     ),
                     negated: matches!(opcode, LuaJitOpcode::IsNeP),
                 })

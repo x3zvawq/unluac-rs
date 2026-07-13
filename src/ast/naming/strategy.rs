@@ -89,6 +89,12 @@ pub(super) fn choose_local_candidate(
     ast_facts: &FunctionAstNamingFacts,
     options: NamingOptions,
 ) -> CandidateHint {
+    if proto.signature.legacy_arg_slot && index == 0 {
+        return CandidateHint {
+            text: "arg".to_owned(),
+            source: NameSource::LegacyArg,
+        };
+    }
     if options.mode == NamingMode::DebugLike {
         let visible_count = ast_facts.debug_like_binding_order.len();
         return mode_fallback_candidate(

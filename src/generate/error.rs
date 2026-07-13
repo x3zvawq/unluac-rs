@@ -42,6 +42,8 @@ pub enum GenerateError {
     MissingLuauVectorConstructor,
     #[error("invalid Luau vector constructor identifier `{name}`")]
     InvalidLuauVectorConstructor { name: String },
+    #[error("LuaJIT complex literal cannot represent real={real}, imag={imag}")]
+    UnrepresentableLuajitComplex { real: f64, imag: f64 },
 }
 
 impl GenerateError {

@@ -147,6 +147,7 @@ pub struct ProtoSignature {
     pub is_vararg: bool,
     pub has_vararg_param_reg: bool,
     pub named_vararg_table: bool,
+    pub legacy_arg_slot: bool,
 }
 
 /// 后续层需要的调用帧信息。

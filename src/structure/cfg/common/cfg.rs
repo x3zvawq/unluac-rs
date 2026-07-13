@@ -289,6 +289,22 @@ impl Cfg {
         to: BlockRef,
         allowed_blocks: &BTreeSet<BlockRef>,
     ) -> bool {
+        self.can_reach_filtered(from, to, |block| allowed_blocks.contains(&block))
+    }
+
+    pub fn can_reach_avoiding(&self, from: BlockRef, to: BlockRef, avoided: BlockRef) -> bool {
+        if from == avoided || to == avoided {
+            return false;
+        }
+        self.can_reach_filtered(from, to, |block| block != avoided)
+    }
+
+    fn can_reach_filtered(
+        &self,
+        from: BlockRef,
+        to: BlockRef,
+        is_allowed: impl Fn(BlockRef) -> bool,
+    ) -> bool {
         if from == to {
             return true;
         }
@@ -298,7 +314,7 @@ impl Cfg {
 
         while let Some(block) = worklist.pop_front() {
             if !self.reachable_blocks.contains(&block)
-                || !allowed_blocks.contains(&block)
+                || !is_allowed(block)
                 || !visited.insert(block)
             {
                 continue;
@@ -309,7 +325,7 @@ impl Cfg {
                 if succ == to {
                     return true;
                 }
-                if allowed_blocks.contains(&succ) {
+                if is_allowed(succ) {
                     worklist.push_back(succ);
                 }
             }

@@ -27,6 +27,15 @@ use super::{
     PREC_UNARY,
 };
 
+fn numeric_literal(rendered: String) -> (Doc, u8, Assoc) {
+    let precedence = if rendered.starts_with('-') {
+        PREC_UNARY
+    } else {
+        PREC_LITERAL
+    };
+    (Doc::text(rendered), precedence, Assoc::Non)
+}
+
 impl<'a> Emitter<'a> {
     pub(super) fn emit_call_kind(
         &self,
@@ -97,45 +106,29 @@ impl<'a> Emitter<'a> {
                 PREC_LITERAL,
                 Assoc::Non,
             ),
-            AstExpr::Integer(value) => (
-                Doc::text(format_integer(*value, self.options.number_format)),
-                PREC_LITERAL,
-                Assoc::Non,
-            ),
-            AstExpr::Number(value) => (
-                Doc::text(format_number(
-                    *value,
-                    target_preserves_float_type(self.target.version),
-                )),
-                PREC_LITERAL,
-                Assoc::Non,
-            ),
+            AstExpr::Integer(value) => {
+                numeric_literal(format_integer(*value, self.options.number_format))
+            }
+            AstExpr::Number(value) => numeric_literal(format_number(
+                *value,
+                target_preserves_float_type(self.target.version),
+            )),
             AstExpr::String(value) => (
                 Doc::text(format_string_literal(value, self.options.quote_style)),
                 PREC_LITERAL,
                 Assoc::Non,
             ),
-            AstExpr::Int64(value) => (
-                Doc::text(format!(
-                    "{}LL",
-                    format_integer(*value, self.options.number_format)
-                )),
-                PREC_LITERAL,
-                Assoc::Non,
-            ),
-            AstExpr::UInt64(value) => (
-                Doc::text(format!(
-                    "{}ULL",
-                    format_unsigned_integer(*value, self.options.number_format)
-                )),
-                PREC_LITERAL,
-                Assoc::Non,
-            ),
-            AstExpr::Complex { real, imag } => (
-                Doc::text(format_complex_literal(*real, *imag)),
-                PREC_LITERAL,
-                Assoc::Non,
-            ),
+            AstExpr::Int64(value) => numeric_literal(format!(
+                "{}LL",
+                format_integer(*value, self.options.number_format)
+            )),
+            AstExpr::UInt64(value) => numeric_literal(format!(
+                "{}ULL",
+                format_unsigned_integer(*value, self.options.number_format)
+            )),
+            AstExpr::Complex { real, imag } => {
+                numeric_literal(format_complex_literal(*real, *imag)?)
+            }
             AstExpr::Vector(vector) => {
                 (self.emit_vector_literal(*vector)?, PREC_PREFIX, Assoc::Left)
             }

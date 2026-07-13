@@ -30,6 +30,27 @@ pub enum TransformError {
         helper_pc: u32,
         found: &'static str,
     },
+    #[error("opcode `{opcode}` at raw pc {raw_pc} must be followed by a metamethod helper")]
+    MissingMetamethodHelper { raw_pc: u32, opcode: &'static str },
+    #[error(
+        "metamethod helper after raw pc {raw_pc} must match `{opcode}`, found `{found}` at raw pc {helper_pc}"
+    )]
+    InvalidMetamethodHelper {
+        raw_pc: u32,
+        helper_pc: u32,
+        opcode: &'static str,
+        found: &'static str,
+    },
+    #[error(
+        "metamethod helper at raw pc {helper_pc} is inconsistent with `{opcode}` at raw pc {raw_pc}"
+    )]
+    InconsistentMetamethodHelper {
+        raw_pc: u32,
+        helper_pc: u32,
+        opcode: &'static str,
+    },
+    #[error("unexpected standalone metamethod helper `{opcode}` at raw pc {raw_pc}")]
+    UnexpectedStandaloneMetamethodHelper { raw_pc: u32, opcode: &'static str },
     #[error("opcode `{opcode}` at raw pc {raw_pc} must be followed by EXTRAARG")]
     MissingExtraArg { raw_pc: u32, opcode: &'static str },
     #[error(

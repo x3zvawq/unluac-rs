@@ -308,6 +308,7 @@ impl LuauParserState {
                         is_vararg: raw_is_vararg,
                         has_vararg_param_reg: false,
                         named_vararg_table: false,
+                        legacy_arg_slot: false,
                     },
                     frame: ProtoFrameInfo { max_stack_size },
                     instructions: decoded.instrs,

@@ -8,6 +8,7 @@
 //! 例子：
 //! - `break` 或 `continue` 形状如果提前跳出了当前 loop body，会被记成
 //!   `UnstructuredBreakLike / UnstructuredContinueLike`
+//! - same-header 内层 loop 的结构化出口自然汇入外层条件时，不会误记成 continue
 //! - branch region 内部如果有一条边直接跳到 merge 之外，会被记成
 //!   `CrossStructureJump`
 
@@ -78,6 +79,11 @@ pub(super) fn analyze_goto_requirements(
                             edge.from,
                             continue_target,
                         )
+                        && !is_same_header_nested_loop_exit(
+                            loop_candidates,
+                            loop_candidate,
+                            edge.from,
+                        )
                         && !is_degenerate_branch_to_target(cfg, edge.from, continue_target)
                     {
                         requirements.insert(GotoRequirement {
@@ -116,6 +122,21 @@ pub(super) fn analyze_goto_requirements(
     }
 
     requirements.into_iter().collect()
+}
+
+fn is_same_header_nested_loop_exit(
+    candidates: &[LoopCandidate],
+    outer: &LoopCandidate,
+    from: crate::structure::BlockRef,
+) -> bool {
+    // 内层 exit block 属于外层区域却不属于内层 core；它汇入外层条件是正常的
+    // 嵌套控制流，不能因为目标恰是外层 continue target 就要求 goto。
+    candidates.iter().any(|inner| {
+        inner.header == outer.header
+            && inner.blocks.len() < outer.blocks.len()
+            && inner.blocks.is_subset(&outer.blocks)
+            && inner.exits.contains(&from)
+    })
 }
 
 fn is_degenerate_branch_to_target(

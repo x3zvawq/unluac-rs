@@ -109,6 +109,14 @@ const ALL_NON_LUAU_DIALECTS: &[LuaCaseDialect] = &[
     LuaCaseDialect::Lua55,
     LuaCaseDialect::Luajit,
 ];
+const ALL_NON_LUAJIT_DIALECTS: &[LuaCaseDialect] = &[
+    LuaCaseDialect::Lua51,
+    LuaCaseDialect::Lua52,
+    LuaCaseDialect::Lua53,
+    LuaCaseDialect::Lua54,
+    LuaCaseDialect::Lua55,
+    LuaCaseDialect::Luau,
+];
 const PUC_LUA_51: &[LuaCaseDialect] = &[LuaCaseDialect::Lua51];
 const PUC_LUA_GE_52: &[LuaCaseDialect] = &[
     LuaCaseDialect::Lua52,
@@ -207,7 +215,7 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_06_nested_repeat_continue_flag.lua",
-        PUC_LUA_51,
+        ALL_NON_LUAJIT_DIALECTS,
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_07_close_scope_slot_reuse.lua",
@@ -733,6 +741,62 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         LUAU_ONLY,
     )
     .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_126_lua51_legacy_arg_table.lua",
+        PUC_LUA_51,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_127_puc54_metamethod_operand_flip.lua",
+        PUC_LUA_GE_54,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_128_same_header_plain_nested_loops.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_129_lua51_nonempty_backedge_pad.lua",
+        PUC_LUA_51,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_130_env_keyword_table_access.lua",
+        PUC_LUA_GE_52,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_131_lua55_anonymous_vararg.lua",
+        PUC_LUA_GE_55,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_132_luajit_infinite_imaginary.lua",
+        LUAJIT_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_133_luajit_wide_compare_operand.lua",
+        LUAJIT_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_134_negative_literal_power.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_135_same_header_sibling_latches.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_136_luau_global_operands.lua",
+        LUAU_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_137_luajit_contextual_goto.lua",
+        LUAJIT_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_138_luau_contextual_continue.lua",
+        LUAU_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_139_lua55_contextual_global.lua",
+        PUC_LUA_GE_55,
+    ),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {

@@ -29,20 +29,18 @@ impl<'a> AstLowerer<'a> {
             },
         )?;
         let body = self.lower_proto_body(closure.proto.index())?;
-        let named_vararg = if child.signature.has_vararg_param_reg {
-            Some(
-                child
-                    .locals
-                    .first()
-                    .copied()
-                    .map(crate::ast::common::AstBindingRef::Local)
-                    .ok_or(AstLowerError::MissingNamedVarargBinding {
+        let named_vararg =
+            if child.signature.has_vararg_param_reg && !child.signature.legacy_arg_slot {
+                let local = child.locals.first().copied().ok_or(
+                    AstLowerError::MissingNamedVarargBinding {
                         proto: closure.proto.index(),
-                    })?,
-            )
-        } else {
-            None
-        };
+                    },
+                )?;
+                (super::analysis::count_local_uses_in_block(&child.body, local) != 0)
+                    .then_some(crate::ast::common::AstBindingRef::Local(local))
+            } else {
+                None
+            };
         let mut captured_bindings = BTreeSet::new();
         let mut captured_params = BTreeSet::new();
         for capture in &closure.captures {

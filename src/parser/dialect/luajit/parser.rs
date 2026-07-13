@@ -308,6 +308,7 @@ impl LuaJitParser {
                     is_vararg: (flags & PROTO_VARARG) != 0,
                     has_vararg_param_reg: false,
                     named_vararg_table: false,
+                    legacy_arg_slot: false,
                 },
                 frame: ProtoFrameInfo { max_stack_size },
                 instructions,

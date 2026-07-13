@@ -239,6 +239,14 @@ fn next_available_simple_param_name(
 }
 
 fn allocate_name(candidate: CandidateHint, used: &mut BTreeSet<String>) -> NameInfo {
+    if candidate.source == NameSource::LegacyArg {
+        used.insert(candidate.text.clone());
+        return NameInfo {
+            text: candidate.text,
+            source: candidate.source,
+            renamed: false,
+        };
+    }
     if candidate.source == NameSource::Discard {
         return NameInfo {
             text: candidate.text,

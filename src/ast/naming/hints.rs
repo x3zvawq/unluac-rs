@@ -368,6 +368,7 @@ fn insert_hint<K>(
 
 fn hint_priority(source: NameSource) -> usize {
     match source {
+        NameSource::LegacyArg => 110,
         NameSource::Debug => 100,
         NameSource::CaptureProvenance => 95,
         NameSource::SelfParam => 90,

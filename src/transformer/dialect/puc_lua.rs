@@ -1,7 +1,7 @@
 //! 这个模块承载 PUC-Lua 5.x lowering 之间共享的 helper。
 //!
-//! 这些 helper 只负责 RK/寄存器区间/调用包这类稳定编码事实，避免 5.1 和 5.2
-//! 各自复制一套样板；真正的 opcode 语义和模式识别仍留在版本目录里实现。
+//! 这些 helper 只负责 RK/寄存器区间/调用包、5.4+ 二元 metamethod 配对这类稳定
+//! 编码事实，避免各版本复制一套样板；真正的 opcode 语义仍留在版本目录里实现。
 
 use crate::parser::{RawChunk, RawInstr, RawProto};
 use crate::transformer::common::resolve_env_upvalues;
@@ -18,7 +18,21 @@ use crate::transformer::{
 pub(crate) const BITRK: u16 = 1 << 8;
 pub(crate) const LFIELDS_PER_FLUSH: u32 = 50;
 const TM_ADD_EVENT: u8 = 6;
-const TM_SUB_EVENT: u8 = 7;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BinaryHelperShape<Operand> {
+    pub(crate) helper_index: usize,
+    pub(crate) op: BinaryOpKind,
+    pub(crate) operand: Operand,
+    pub(crate) flipped: bool,
+}
+
+pub(crate) struct MetamethodBinarySpec<Opcode, InspectHelper, OpcodeLabel> {
+    pub(crate) owner_opcode: Opcode,
+    pub(crate) helper_opcode: Opcode,
+    pub(crate) inspect_helper: InspectHelper,
+    pub(crate) opcode_label: OpcodeLabel,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HelperJumpInfo {
@@ -210,53 +224,179 @@ where
     })
 }
 
-pub(crate) fn addi_binary_shape<Opcode, InspectHelper, RawPcAt>(
+pub(crate) fn immediate_binary_shape<Opcode, InspectHelper, OpcodeLabel>(
     raw: &RawProto,
     word_code_index: &WordCodeIndex,
     raw_index: usize,
+    encoded_op: BinaryOpKind,
+    encoded_reg: u8,
     immediate: i16,
-    helper_opcode: Opcode,
-    inspect_helper: InspectHelper,
-    raw_pc_at: RawPcAt,
-) -> Result<(BinaryOpKind, ValueOperand), TransformError>
+    spec: MetamethodBinarySpec<Opcode, InspectHelper, OpcodeLabel>,
+) -> Result<BinaryHelperShape<i16>, TransformError>
 where
     Opcode: Copy + Eq,
-    InspectHelper: Fn(&RawInstr) -> Result<(Opcode, i16, u8), TransformError>,
-    RawPcAt: Fn(&RawInstr) -> u32 + Copy,
+    InspectHelper: Fn(&RawInstr) -> Result<(Opcode, u32, u8, i16, u8, bool), TransformError>,
+    OpcodeLabel: Fn(Opcode) -> &'static str,
 {
-    let default_shape = (
-        BinaryOpKind::Add,
-        ValueOperand::Integer(i64::from(immediate)),
-    );
-    if immediate >= 0 {
-        return Ok(default_shape);
+    metamethod_binary_shape(
+        raw,
+        word_code_index,
+        raw_index,
+        encoded_reg,
+        spec,
+        |op, helper_immediate, flipped| {
+            let same_immediate = i32::from(helper_immediate) == i32::from(immediate);
+            let negated_immediate = i32::from(helper_immediate) == -i32::from(immediate);
+            match (encoded_op, op, flipped) {
+                (BinaryOpKind::Add, BinaryOpKind::Add, _) => same_immediate,
+                (BinaryOpKind::Add, BinaryOpKind::Sub, false) => negated_immediate,
+                (BinaryOpKind::Shl, BinaryOpKind::Shl, true) => same_immediate,
+                (BinaryOpKind::Shr, BinaryOpKind::Shr, false) => same_immediate,
+                (BinaryOpKind::Shr, BinaryOpKind::Shl, false) => negated_immediate,
+                _ => false,
+            }
+        },
+    )
+}
+
+pub(crate) fn constant_binary_shape<Opcode, InspectHelper, OpcodeLabel>(
+    raw: &RawProto,
+    word_code_index: &WordCodeIndex,
+    raw_index: usize,
+    op: BinaryOpKind,
+    encoded_reg: u8,
+    encoded_const: u8,
+    spec: MetamethodBinarySpec<Opcode, InspectHelper, OpcodeLabel>,
+) -> Result<BinaryHelperShape<u8>, TransformError>
+where
+    Opcode: Copy + Eq,
+    InspectHelper: Fn(&RawInstr) -> Result<(Opcode, u32, u8, u8, u8, bool), TransformError>,
+    OpcodeLabel: Fn(Opcode) -> &'static str,
+{
+    metamethod_binary_shape(
+        raw,
+        word_code_index,
+        raw_index,
+        encoded_reg,
+        spec,
+        |helper_op, helper_const, _flipped| helper_op == op && helper_const == encoded_const,
+    )
+}
+
+pub(crate) fn register_binary_shape<Opcode, InspectHelper, OpcodeLabel>(
+    raw: &RawProto,
+    word_code_index: &WordCodeIndex,
+    raw_index: usize,
+    op: BinaryOpKind,
+    encoded_lhs: u8,
+    encoded_rhs: u8,
+    spec: MetamethodBinarySpec<Opcode, InspectHelper, OpcodeLabel>,
+) -> Result<BinaryHelperShape<u8>, TransformError>
+where
+    Opcode: Copy + Eq,
+    InspectHelper: Fn(&RawInstr) -> Result<(Opcode, u32, u8, u8, u8, bool), TransformError>,
+    OpcodeLabel: Fn(Opcode) -> &'static str,
+{
+    metamethod_binary_shape(
+        raw,
+        word_code_index,
+        raw_index,
+        encoded_lhs,
+        spec,
+        |helper_op, helper_rhs, flipped| helper_op == op && helper_rhs == encoded_rhs && !flipped,
+    )
+}
+
+fn metamethod_binary_shape<Opcode, Operand, InspectHelper, OpcodeLabel, Validate>(
+    raw: &RawProto,
+    word_code_index: &WordCodeIndex,
+    raw_index: usize,
+    encoded_reg: u8,
+    spec: MetamethodBinarySpec<Opcode, InspectHelper, OpcodeLabel>,
+    validate: Validate,
+) -> Result<BinaryHelperShape<Operand>, TransformError>
+where
+    Opcode: Copy + Eq,
+    Operand: Copy,
+    InspectHelper: Fn(&RawInstr) -> Result<(Opcode, u32, u8, Operand, u8, bool), TransformError>,
+    OpcodeLabel: Fn(Opcode) -> &'static str,
+    Validate: FnOnce(BinaryOpKind, Operand, bool) -> bool,
+{
+    let MetamethodBinarySpec {
+        owner_opcode,
+        helper_opcode,
+        inspect_helper,
+        opcode_label,
+    } = spec;
+    let owner_opcode_label = opcode_label(owner_opcode);
+    let (raw_pc, helper_index, helper_instr) =
+        lookup_following_helper(raw, word_code_index, raw_index, RawInstr::pc, |raw_pc| {
+            TransformError::MissingMetamethodHelper {
+                raw_pc,
+                opcode: owner_opcode_label,
+            }
+        })?;
+    let (found_opcode, helper_pc, helper_reg, operand, event, flipped) =
+        inspect_helper(helper_instr)?;
+    if found_opcode != helper_opcode {
+        return Err(TransformError::InvalidMetamethodHelper {
+            raw_pc,
+            helper_pc,
+            opcode: owner_opcode_label,
+            found: opcode_label(found_opcode),
+        });
     }
-
-    let raw_pc = raw_pc_at(&raw.common.instructions[raw_index]);
-    let Some(helper_index) = word_code_index.raw_index_at_pc(raw_pc + 1) else {
-        return Ok(default_shape);
+    let Some(op) = metamethod_event_op(event) else {
+        return Err(inconsistent_metamethod_helper(
+            raw_pc,
+            helper_pc,
+            owner_opcode_label,
+        ));
     };
-    let (found_opcode, helper_immediate, event) =
-        inspect_helper(&raw.common.instructions[helper_index])?;
-
-    // `ADDI -1` 本身无法区分源码是 `x - 1` 还是 `x + -1`。
-    // 真正的语义线索来自紧随其后的 `MMBINI`：只有 helper 明确标成 `__sub`
-    // 且立即数幅值吻合时，我们才把它规范成共享 low-IR 的减法形状。
-    if found_opcode == helper_opcode
-        && event == TM_SUB_EVENT
-        && i32::from(helper_immediate) == -i32::from(immediate)
-    {
-        return Ok((
-            BinaryOpKind::Sub,
-            ValueOperand::Integer(i64::from(-i32::from(immediate))),
+    if helper_reg != encoded_reg || !validate(op, operand, flipped) {
+        return Err(inconsistent_metamethod_helper(
+            raw_pc,
+            helper_pc,
+            owner_opcode_label,
         ));
     }
 
-    if found_opcode == helper_opcode && event == TM_ADD_EVENT {
-        return Ok(default_shape);
-    }
+    Ok(BinaryHelperShape {
+        helper_index,
+        op,
+        operand,
+        flipped,
+    })
+}
 
-    Ok(default_shape)
+fn inconsistent_metamethod_helper(
+    raw_pc: u32,
+    helper_pc: u32,
+    opcode: &'static str,
+) -> TransformError {
+    TransformError::InconsistentMetamethodHelper {
+        raw_pc,
+        helper_pc,
+        opcode,
+    }
+}
+
+fn metamethod_event_op(event: u8) -> Option<BinaryOpKind> {
+    match event.checked_sub(TM_ADD_EVENT)? {
+        0 => Some(BinaryOpKind::Add),
+        1 => Some(BinaryOpKind::Sub),
+        2 => Some(BinaryOpKind::Mul),
+        3 => Some(BinaryOpKind::Mod),
+        4 => Some(BinaryOpKind::Pow),
+        5 => Some(BinaryOpKind::Div),
+        6 => Some(BinaryOpKind::FloorDiv),
+        7 => Some(BinaryOpKind::BitAnd),
+        8 => Some(BinaryOpKind::BitOr),
+        9 => Some(BinaryOpKind::BitXor),
+        10 => Some(BinaryOpKind::Shl),
+        11 => Some(BinaryOpKind::Shr),
+        _ => None,
+    }
 }
 
 pub(crate) fn helper_jump_asj<

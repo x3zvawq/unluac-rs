@@ -32,6 +32,8 @@ const LUA_TNIL: u8 = 0;
 const LUA_TBOOLEAN: u8 = 1;
 const LUA_TNUMBER: u8 = 3;
 const LUA_TSTRING: u8 = 4;
+const VARARG_HASARG: u8 = 1;
+const VARARG_ISVARARG: u8 = 2;
 
 pub(crate) struct Lua51Parser {
     options: ParseOptions,
@@ -168,9 +170,10 @@ impl Lua51Parser {
                 },
                 signature: ProtoSignature {
                     num_params,
-                    is_vararg: raw_is_vararg != 0,
-                    has_vararg_param_reg: false,
+                    is_vararg: raw_is_vararg & VARARG_ISVARARG != 0,
+                    has_vararg_param_reg: raw_is_vararg & VARARG_HASARG != 0,
                     named_vararg_table: false,
+                    legacy_arg_slot: raw_is_vararg & VARARG_HASARG != 0,
                 },
                 frame: ProtoFrameInfo { max_stack_size },
                 instructions,

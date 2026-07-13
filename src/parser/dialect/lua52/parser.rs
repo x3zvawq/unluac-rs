@@ -217,6 +217,7 @@ impl Lua52Parser {
                 is_vararg: raw_is_vararg != 0,
                 has_vararg_param_reg: false,
                 named_vararg_table: false,
+                legacy_arg_slot: false,
             },
             PucLuaProtoSections {
                 instructions,

@@ -27,8 +27,9 @@ mod rewrite;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::temp_touch::{
-    TempRefScopeTracker, TempTouchIndex, collect_temp_refs_by_stmt, expr_touches_any_temp,
-    stmt_consumes_temps_only_in_control_head, stmt_contains_nested_nonlocal_control,
+    TempRefScopeTracker, TempTouchIndex, collect_temp_refs_by_stmt, collect_temp_refs_in_expr,
+    expr_touches_any_temp, stmt_consumes_temps_only_in_control_head,
+    stmt_contains_nested_nonlocal_control,
 };
 use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId, TempId,
@@ -168,6 +169,24 @@ fn promote_block(
     inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
     outer_used_temps: &BTreeSet<TempId>,
 ) -> PromotionResult {
+    promote_block_with_child_protection(
+        ctx,
+        block,
+        inherited,
+        inherited_sticky_slots,
+        outer_used_temps,
+        &BTreeSet::new(),
+    )
+}
+
+fn promote_block_with_child_protection(
+    ctx: &mut PromotionCtx<'_>,
+    block: &mut HirBlock,
+    inherited: &BTreeMap<TempId, LocalId>,
+    inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
+    outer_used_temps: &BTreeSet<TempId>,
+    child_protected_temps: &BTreeSet<TempId>,
+) -> PromotionResult {
     // 递归进入子作用域时，把当前语句之后仍被外层引用的 temp 传给子 block。
     // tracker 用引用计数维护后缀集合，避免为每个 index 克隆一份成长中的 BTreeSet。
     let stmt_temp_refs = collect_temp_refs_by_stmt(&block.stmts);
@@ -239,7 +258,8 @@ fn promote_block(
         }
 
         // 子作用域的 outer temps = 当前块后续语句的 temp 引用 ∪ 来自祖先作用域的保护集
-        let child_outer_temps = temp_refs.outer_with_suffix(outer_used_temps);
+        let mut child_outer_temps = temp_refs.outer_with_suffix(outer_used_temps);
+        child_outer_temps.extend(child_protected_temps);
         let stmt_changed = rewrite_stmt(
             ctx,
             &mut stmt,
@@ -738,13 +758,16 @@ fn rewrite_stmt(
         HirStmt::Repeat(repeat_stmt) => {
             // `repeat ... until` 的条件和 loop body 共享同一个词法作用域。
             // body 里刚刚提升出来的 local 如果不继续带到条件里，条件就会继续挂着旧 temp，
-            // 最后得到“body 已经是 l2，until 里还是 t3”这种半截 HIR。
-            let body_result = promote_block(
+            // 最后得到“body 已经是 l2，until 里还是 t3”这种半截 HIR。条件引用同时是
+            // 更深子块的外部消费者，不能让嵌套 block 抢先声明同一个 temp。
+            let condition_temps = collect_temp_refs_in_expr(&repeat_stmt.cond);
+            let body_result = promote_block_with_child_protection(
                 ctx,
                 &mut repeat_stmt.body,
                 mapping,
                 sticky_slots,
                 outer_used_temps,
+                &condition_temps,
             );
             let cond_changed = rewrite::expr(&mut repeat_stmt.cond, &body_result.trailing_mapping);
             body_result.changed || cond_changed

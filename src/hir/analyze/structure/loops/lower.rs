@@ -1,8 +1,9 @@
 //! 这个子模块负责把已确认的 `LoopCandidate` 真正降成 HIR 循环语句。
 //!
 //! 它依赖 StructureFacts 已区分好的 while/repeat/numeric-for/generic-for 形态和 override
-//! 状态，不会在这里重新识别循环种类；对于仍归为 Unknown 但已经证明可规约且只有单一
-//! 出口的 retry loop，会保守降成 `while true ... break`。
+//! 状态，不会在这里重新识别循环种类；对于仍归为 Unknown 但已经证明可规约、且只有
+//! 一个普通 post-loop 的 retry loop，会保守降成 `while true ... break`，其他 terminal
+//! exits 仍留在循环体中原样终止。
 //! 例如：`NumericForLike` 的候选会在这里降成 `HirStmt::NumericFor`。
 
 use super::*;
@@ -54,10 +55,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if candidate.exits.is_empty() {
             return self.lower_infinite_unknown_loop(candidate, stop, stmts, target_overrides);
         }
-        if candidate.exits.len() != 1 {
-            return None;
-        }
-        let post_loop = candidate.exits.iter().next().copied()?;
+        let mut post_loops = candidate
+            .exits
+            .iter()
+            .copied()
+            .filter(|exit| !block_is_terminal_exit(self.lowering, *exit));
+        let post_loop = match (post_loops.next(), post_loops.next()) {
+            (Some(post_loop), None) => post_loop,
+            (None, None) if candidate.exits.len() == 1 => candidate.exits.iter().next().copied()?,
+            _ => return None,
+        };
         if let Some(stop) = stop
             && stop != post_loop
             && candidate.blocks.contains(&stop)

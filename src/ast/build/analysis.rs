@@ -392,7 +392,7 @@ fn count_local_uses_in_stmt(stmt: &HirStmt, local: LocalId) -> usize {
     }
 }
 
-fn count_local_uses_in_block(block: &HirBlock, local: LocalId) -> usize {
+pub(super) fn count_local_uses_in_block(block: &HirBlock, local: LocalId) -> usize {
     block
         .stmts
         .iter()

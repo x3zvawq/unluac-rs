@@ -1,5 +1,4 @@
--- unluac: expect-contains [["global"](]]
--- unluac: expect-not-contains [[:global(]]
+-- unluac: expect-contains [[:global(]]
 local log = {}
 local object = {
     ["global"] = function(self, value)

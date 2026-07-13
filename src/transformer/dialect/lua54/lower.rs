@@ -11,14 +11,15 @@ use crate::transformer::dialect::lowering::{
 };
 use crate::transformer::dialect::puc_lua::{
     GenericForPairAbxSpec, GenericForPairInfo as GenericForPair, HelperJumpAsjSpec,
-    HelperJumpInfo as HelperJump, access_base_for_upvalue as shared_access_base_for_upvalue,
-    addi_binary_shape, call_args_pack, call_result_pack, checked_const_ref, checked_proto_ref,
-    checked_upvalue_ref, emit_call, emit_generic_for_call, emit_generic_for_loop,
-    emit_numeric_for_init, emit_numeric_for_loop, emit_return, emit_tail_call, emit_tforprep,
-    finish_lowered_proto, generic_for_pair_abx, helper_jump_asj, immediate_cond_operand,
-    jump_target_back_bx, jump_target_forward_bx, jump_target_sj, k_value_operand,
-    lower_chunk_with_env, numeric_for_regs, prepare_env_lowering, range_len_inclusive, reg_from_u8,
-    return_pack,
+    HelperJumpInfo as HelperJump, MetamethodBinarySpec,
+    access_base_for_upvalue as shared_access_base_for_upvalue, call_args_pack, call_result_pack,
+    checked_const_ref, checked_proto_ref, checked_upvalue_ref, constant_binary_shape, emit_call,
+    emit_generic_for_call, emit_generic_for_loop, emit_numeric_for_init, emit_numeric_for_loop,
+    emit_return, emit_tail_call, emit_tforprep, finish_lowered_proto, generic_for_pair_abx,
+    helper_jump_asj, immediate_binary_shape, immediate_cond_operand, jump_target_back_bx,
+    jump_target_forward_bx, jump_target_sj, k_value_operand, lower_chunk_with_env,
+    numeric_for_regs, prepare_env_lowering, range_len_inclusive, reg_from_u8,
+    register_binary_shape, return_pack,
 };
 use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
@@ -414,30 +415,42 @@ impl<'a> ProtoLowerer<'a> {
                     self.pending_methods.set(callee, self_arg, method_name);
                     raw_index += 1;
                 }
-                Lua54Opcode::AddI => {
+                Lua54Opcode::AddI | Lua54Opcode::ShrI | Lua54Opcode::ShlI => {
                     let (a, b, sc, _) = expect_absck(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    let (op, rhs) = addi_binary_shape(
+                    let shape = immediate_binary_shape(
                         self.raw,
                         &self.word_code_index,
                         raw_index,
+                        binary_op_kind(opcode),
+                        b,
                         sc,
-                        Lua54Opcode::MMBinI,
-                        inspect_lua54_asbck_helper,
-                        instr_pc,
+                        MetamethodBinarySpec {
+                            owner_opcode: opcode,
+                            helper_opcode: Lua54Opcode::MMBinI,
+                            inspect_helper: inspect_lua54_asbck_helper,
+                            opcode_label: Lua54Opcode::label,
+                        },
                     )?;
+                    let reg = ValueOperand::Reg(reg_from_u8(b));
+                    let immediate = ValueOperand::Integer(i64::from(shape.operand));
+                    let (lhs, rhs) = if shape.flipped {
+                        (immediate, reg)
+                    } else {
+                        (reg, immediate)
+                    };
                     self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
-                        vec![raw_index],
+                        vec![raw_index, shape.helper_index],
                         PendingLowInstr::Ready(LowInstr::BinaryOp(BinaryOpInstr {
                             dst,
-                            op,
-                            lhs: ValueOperand::Reg(reg_from_u8(b)),
+                            op: shape.op,
+                            lhs,
                             rhs,
                         })),
                     );
-                    raw_index += 1;
+                    raw_index = shape.helper_index + 1;
                 }
                 Lua54Opcode::AddK
                 | Lua54Opcode::SubK
@@ -451,45 +464,40 @@ impl<'a> ProtoLowerer<'a> {
                 | Lua54Opcode::BxorK => {
                     let (a, b, c, _) = expect_abck(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
-                    self.pending_methods.invalidate_reg(dst);
-                    self.emit(
-                        Some(raw_index),
-                        vec![raw_index],
-                        PendingLowInstr::Ready(LowInstr::BinaryOp(BinaryOpInstr {
-                            dst,
-                            op: binary_op_kind(opcode),
-                            lhs: ValueOperand::Reg(reg_from_u8(b)),
-                            rhs: ValueOperand::Const(self.const_ref(raw_pc, c as usize)?),
-                        })),
-                    );
-                    raw_index += 1;
-                }
-                Lua54Opcode::ShrI | Lua54Opcode::ShlI => {
-                    let (a, b, sc, _) = expect_absck(raw_pc, opcode, operands)?;
-                    let dst = reg_from_u8(a);
-                    self.pending_methods.invalidate_reg(dst);
-                    let (lhs, rhs) = match opcode {
-                        Lua54Opcode::ShrI => (
-                            ValueOperand::Reg(reg_from_u8(b)),
-                            ValueOperand::Integer(i64::from(sc)),
-                        ),
-                        Lua54Opcode::ShlI => (
-                            ValueOperand::Integer(i64::from(sc)),
-                            ValueOperand::Reg(reg_from_u8(b)),
-                        ),
-                        _ => unreachable!("only shift-immediate opcodes should reach this branch"),
+                    let op = binary_op_kind(opcode);
+                    let shape = constant_binary_shape(
+                        self.raw,
+                        &self.word_code_index,
+                        raw_index,
+                        op,
+                        b,
+                        c,
+                        MetamethodBinarySpec {
+                            owner_opcode: opcode,
+                            helper_opcode: Lua54Opcode::MMBinK,
+                            inspect_helper: inspect_lua54_abck_helper,
+                            opcode_label: Lua54Opcode::label,
+                        },
+                    )?;
+                    let reg = ValueOperand::Reg(reg_from_u8(b));
+                    let constant = ValueOperand::Const(self.const_ref(raw_pc, c as usize)?);
+                    let (lhs, rhs) = if shape.flipped {
+                        (constant, reg)
+                    } else {
+                        (reg, constant)
                     };
+                    self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
-                        vec![raw_index],
+                        vec![raw_index, shape.helper_index],
                         PendingLowInstr::Ready(LowInstr::BinaryOp(BinaryOpInstr {
                             dst,
-                            op: binary_op_kind(opcode),
+                            op,
                             lhs,
                             rhs,
                         })),
                     );
-                    raw_index += 1;
+                    raw_index = shape.helper_index + 1;
                 }
                 Lua54Opcode::Add
                 | Lua54Opcode::Sub
@@ -505,21 +513,39 @@ impl<'a> ProtoLowerer<'a> {
                 | Lua54Opcode::Shr => {
                     let (a, b, c, _) = expect_abck(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
+                    let op = binary_op_kind(opcode);
+                    let shape = register_binary_shape(
+                        self.raw,
+                        &self.word_code_index,
+                        raw_index,
+                        op,
+                        b,
+                        c,
+                        MetamethodBinarySpec {
+                            owner_opcode: opcode,
+                            helper_opcode: Lua54Opcode::MMBin,
+                            inspect_helper: inspect_lua54_abck_helper,
+                            opcode_label: Lua54Opcode::label,
+                        },
+                    )?;
                     self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
-                        vec![raw_index],
+                        vec![raw_index, shape.helper_index],
                         PendingLowInstr::Ready(LowInstr::BinaryOp(BinaryOpInstr {
                             dst,
-                            op: binary_op_kind(opcode),
+                            op,
                             lhs: ValueOperand::Reg(reg_from_u8(b)),
                             rhs: ValueOperand::Reg(reg_from_u8(c)),
                         })),
                     );
-                    raw_index += 1;
+                    raw_index = shape.helper_index + 1;
                 }
                 Lua54Opcode::MMBin | Lua54Opcode::MMBinI | Lua54Opcode::MMBinK => {
-                    raw_index += 1;
+                    return Err(TransformError::UnexpectedStandaloneMetamethodHelper {
+                        raw_pc,
+                        opcode: opcode.label(),
+                    });
                 }
                 Lua54Opcode::Unm | Lua54Opcode::BNot | Lua54Opcode::Not | Lua54Opcode::Len => {
                     let (a, b) = expect_ab(raw_pc, opcode, operands)?;
@@ -1119,12 +1145,24 @@ fn inspect_lua54_abx_helper(raw: &RawInstr) -> Result<(Lua54Opcode, u32, u8, u32
     Ok((opcode, extra.pc, a, bx))
 }
 
-fn inspect_lua54_asbck_helper(raw: &RawInstr) -> Result<(Lua54Opcode, i16, u8), TransformError> {
+fn inspect_lua54_asbck_helper(
+    raw: &RawInstr,
+) -> Result<(Lua54Opcode, u32, u8, i16, u8, bool), TransformError> {
     let (opcode, operands, extra) = raw
         .lua54()
         .expect("lua54 lowerer should only decode lua54 instructions");
-    let (_a, sb, c, _k) = expect_asbck(extra.pc, opcode, operands)?;
-    Ok((opcode, sb, c))
+    let (a, sb, c, k) = expect_asbck(extra.pc, opcode, operands)?;
+    Ok((opcode, extra.pc, a, sb, c, k))
+}
+
+fn inspect_lua54_abck_helper(
+    raw: &RawInstr,
+) -> Result<(Lua54Opcode, u32, u8, u8, u8, bool), TransformError> {
+    let (opcode, operands, extra) = raw
+        .lua54()
+        .expect("lua54 lowerer should only decode lua54 instructions");
+    let (a, b, c, k) = expect_abck(extra.pc, opcode, operands)?;
+    Ok((opcode, extra.pc, a, b, c, k))
 }
 
 fn opcode_at(raw: &RawProto, index: usize) -> Lua54Opcode {

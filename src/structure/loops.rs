@@ -16,6 +16,8 @@
 //!   `continue_edges` owner，HIR 不再按 jump 形状猜测归属
 //! - repeat body 的首个条件可能让 natural-loop 暂时呈现为 while；若该 header 的局部
 //!   break pad 严格汇入独立尾条件出口，则由 Structure 恢复真正的 repeat 形态
+//! - 普通内外循环可能共享 header；只有 successor 分区和真实 body/exit 都能证明层级
+//!   时才拆成多个候选，避免把 retry 或无出口循环误拆
 //! - `WhileLike` 的 header 前缀必须属于 branch 条件的数据依赖链，或是可丢弃的
 //!   无副作用残留；带副作用但不参与条件的语句应保守留给 repeat/unknown/goto 形态
 
@@ -59,25 +61,27 @@ pub(super) fn analyze_loops(
         })
         .collect::<Vec<_>>();
 
-    let mut grouped_loops = BTreeMap::<BlockRef, (BTreeSet<BlockRef>, Vec<EdgeRef>)>::new();
-    for natural_loop in &graph_facts.natural_loops {
-        if claimed_backedges.contains(&natural_loop.backedge) {
-            continue;
-        }
-        let entry = grouped_loops
-            .entry(natural_loop.header)
-            .or_insert_with(|| (BTreeSet::new(), Vec::new()));
-        entry.0.extend(natural_loop.blocks.iter().copied());
-        entry.1.push(natural_loop.backedge);
-    }
-
-    loop_candidates.extend(
-        grouped_loops
+    for (header, natural_loops) in natural_loops_by_header {
+        let remaining = natural_loops
             .into_iter()
-            .map(|(header, (blocks, backedges))| {
-                build_loop_candidate(proto, cfg, graph_facts, dataflow, header, blocks, backedges)
-            }),
-    );
+            .filter(|natural_loop| !claimed_backedges.contains(&natural_loop.backedge))
+            .collect::<Vec<_>>();
+        loop_candidates.extend(
+            group_same_header_natural_loops(proto, cfg, header, remaining)
+                .into_iter()
+                .map(|(blocks, backedges)| {
+                    build_loop_candidate(
+                        proto,
+                        cfg,
+                        graph_facts,
+                        dataflow,
+                        header,
+                        blocks,
+                        backedges,
+                    )
+                }),
+        );
+    }
     let grouped_headers = loop_candidates
         .iter()
         .map(|candidate| candidate.header)
@@ -116,6 +120,84 @@ pub(super) fn analyze_loops(
     refine_ambiguous_repeat_candidates(proto, cfg, &mut loop_candidates);
     assign_same_header_merge_ownership(&mut loop_candidates);
     loop_candidates
+}
+
+fn group_same_header_natural_loops(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    header: BlockRef,
+    mut natural_loops: Vec<&crate::structure::NaturalLoop>,
+) -> Vec<(BTreeSet<BlockRef>, Vec<EdgeRef>)> {
+    natural_loops.sort_by_key(|natural_loop| (natural_loop.blocks.len(), natural_loop.backedge));
+    let mut groups = Vec::<(BTreeSet<BlockRef>, Vec<EdgeRef>)>::new();
+
+    for natural_loop in natural_loops {
+        if groups.is_empty() {
+            groups.push((natural_loop.blocks.clone(), vec![natural_loop.backedge]));
+            continue;
+        }
+        if let Some(outer_blocks) = groups.last().and_then(|(inner_blocks, _)| {
+            same_header_nested_outer_blocks(proto, cfg, header, inner_blocks, natural_loop)
+        }) {
+            groups.push((outer_blocks, vec![natural_loop.backedge]));
+            continue;
+        }
+
+        let group = groups
+            .last_mut()
+            .expect("first same-header natural loop starts a group");
+        group.0.extend(natural_loop.blocks.iter().copied());
+        group.1.push(natural_loop.backedge);
+    }
+
+    groups
+}
+
+fn same_header_nested_outer_blocks(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    header: BlockRef,
+    inner: &BTreeSet<BlockRef>,
+    next: &crate::structure::NaturalLoop,
+) -> Option<BTreeSet<BlockRef>> {
+    let outer = inner.union(&next.blocks).copied().collect::<BTreeSet<_>>();
+    // 单块自回边也可能只是同一 retry loop 的条件短路；无出口组合则常见于
+    // `while true + if/else`。两者拆层都缺少源码边界证据。
+    if inner.len() <= 1
+        || inner.len() >= outer.len()
+        || collect_region_exits(cfg, &outer).is_empty()
+    {
+        return None;
+    }
+    let successors = cfg.succs[header.index()]
+        .iter()
+        .map(|edge| cfg.edges[edge.index()].to)
+        .collect::<BTreeSet<_>>();
+    if successors.len() != 2
+        || successors
+            .iter()
+            .filter(|block| inner.contains(block))
+            .count()
+            != 1
+    {
+        return None;
+    }
+    let mut outer_only_successors = successors
+        .iter()
+        .copied()
+        .filter(|block| outer.contains(block) && !inner.contains(block));
+    let outer_only_successor = outer_only_successors.next()?;
+    if outer_only_successors.next().is_some() {
+        return None;
+    }
+
+    // 真正的外层 repeat 条件必须拥有回边；普通 sibling latch 中夹着赋值或调用，
+    // 只能是同一循环的分支尾部，不能据此拆出一个外层候选。
+    let backedge_source = cfg.edges[next.backedge.index()].from;
+    (backedge_source == outer_only_successor
+        || repeat_continue_target_via_backedge_pad(proto, cfg, backedge_source, &outer)
+            == Some(outer_only_successor))
+    .then_some(outer)
 }
 
 pub(super) fn assign_continue_edge_ownership(
@@ -1056,13 +1138,10 @@ fn infer_loop_shape(
             cfg.terminator(&proto.instrs, source),
             Some(LowInstr::Jump(jump))
                 if cfg.instr_to_block[jump.target.index()] == header
-                    && repeat_continue_target_via_backedge_pad(proto, cfg, source, blocks).is_some()
-        ) {
-            return (
-                LoopKindHint::RepeatLike,
-                repeat_continue_target_via_backedge_pad(proto, cfg, source, blocks),
-                None,
-            );
+        ) && let Some(continue_target) =
+            repeat_continue_target_via_backedge_pad(proto, cfg, source, blocks)
+        {
+            return (LoopKindHint::RepeatLike, Some(continue_target), None);
         }
     }
 
@@ -1460,6 +1539,16 @@ fn repeat_continue_target_via_backedge_pad(
     backedge_source: BlockRef,
     blocks: &BTreeSet<BlockRef>,
 ) -> Option<BlockRef> {
+    // 条件 branch 后的纯 jump/close pad 可以属于 repeat 控制；普通赋值或调用则仍是
+    // while/retry body 的尾部，若把它当条件 pad，HIR 会跳过本轮副作用。
+    let range = cfg.blocks[backedge_source.index()].instrs;
+    let last = range.last()?;
+    if !matches!(proto.instrs[last.index()], LowInstr::Jump(_))
+        || (range.start.index()..last.index())
+            .any(|instr_index| !matches!(proto.instrs[instr_index], LowInstr::Close(_)))
+    {
+        return None;
+    }
     let continue_target =
         cfg.unique_reachable_predecessor_matching(backedge_source, |pred| blocks.contains(&pred))?;
 

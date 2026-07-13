@@ -2,7 +2,8 @@
 //!
 //! 它依赖 Transformer 已经给好的 operand 形状、Dataflow 的 use/def 事实和常量池，不会
 //! 越权去恢复短路结构或 merge 来源。
-//! 例如：`GETTABLE r0, r1, "x"` 会先在这里变成 `r1.x` 对应的访问表达式骨架。
+//! 例如：`GETTABLE r0, r1, "x"` 会先在这里变成 `r1.x` 对应的访问表达式骨架；
+//! `_ENV["end"]` 这类非法裸标识符仍保留表访问，不会伪装成 global。
 
 use super::*;
 
@@ -79,7 +80,7 @@ pub(crate) fn lower_table_access_expr(
     key: AccessKey,
 ) -> HirExpr {
     if matches!(base, AccessBase::Env)
-        && let Some(name) = global_name_from_key(lowering.proto, key)
+        && let Some(name) = global_name_from_key(lowering, key)
     {
         return HirExpr::GlobalRef(HirGlobalRef { name });
     }
@@ -98,7 +99,7 @@ pub(crate) fn lower_table_access_target(
     key: AccessKey,
 ) -> HirLValue {
     if matches!(base, AccessBase::Env)
-        && let Some(name) = global_name_from_key(lowering.proto, key)
+        && let Some(name) = global_name_from_key(lowering, key)
     {
         return HirLValue::Global(HirGlobalRef { name });
     }
@@ -117,7 +118,7 @@ pub(crate) fn lower_table_access_expr_inline(
     key: AccessKey,
 ) -> HirExpr {
     if access_base_is_named_env(lowering.proto, base)
-        && let Some(name) = global_name_from_key(lowering.proto, key)
+        && let Some(name) = global_name_from_key(lowering, key)
     {
         return HirExpr::GlobalRef(HirGlobalRef { name });
     }
@@ -170,7 +171,7 @@ pub(crate) fn lower_table_access_expr_single_eval(
     key: AccessKey,
 ) -> HirExpr {
     if access_base_is_named_env(lowering.proto, base)
-        && let Some(name) = global_name_from_key(lowering.proto, key)
+        && let Some(name) = global_name_from_key(lowering, key)
     {
         return HirExpr::GlobalRef(HirGlobalRef { name });
     }
@@ -267,12 +268,19 @@ fn access_base_is_named_env(proto: &LoweredProto, base: AccessBase) -> bool {
     }
 }
 
-fn global_name_from_key(proto: &LoweredProto, key: AccessKey) -> Option<String> {
+fn global_name_from_key(lowering: &ProtoLowering<'_>, key: AccessKey) -> Option<String> {
     let AccessKey::Const(const_ref) = key else {
         return None;
     };
-    match proto.constants.common.literals.get(const_ref.index()) {
-        Some(RawLiteralConst::String(value)) => Some(decode_raw_string(value)),
-        _ => None,
-    }
+    let RawLiteralConst::String(value) = lowering
+        .proto
+        .constants
+        .common
+        .literals
+        .get(const_ref.index())?
+    else {
+        return None;
+    };
+    let name = decode_raw_string(value);
+    is_lua_identifier_name(&name, lowering.target.version).then_some(name)
 }

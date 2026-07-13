@@ -8,6 +8,7 @@ use crate::LuaString;
 use crate::ast::{AstBinaryOpKind, AstGlobalAttr, AstGlobalBinding, AstLabelId};
 use crate::generate::common::{NumberFormat, QuoteStyle};
 use crate::generate::doc::Doc;
+use crate::generate::error::GenerateError;
 
 use super::{
     Assoc, ExprSide, PREC_ADD, PREC_BIT_AND, PREC_BIT_OR, PREC_BIT_XOR, PREC_COMPARE, PREC_CONCAT,
@@ -139,18 +140,16 @@ fn format_signed_hex(value: i64) -> String {
     }
 }
 
-pub(super) fn format_complex_literal(real: f64, imag: f64) -> String {
-    if real == 0.0 {
-        return format!("{}i", format_number(imag, false));
+pub(super) fn format_complex_literal(real: f64, imag: f64) -> Result<String, GenerateError> {
+    if real.to_bits() != 0.0f64.to_bits() || imag.is_nan() {
+        return Err(GenerateError::UnrepresentableLuajitComplex { real, imag });
     }
-    let imag_abs = format_number(imag.abs(), false);
-    let imag_sign = if imag.is_sign_negative() { "-" } else { "+" };
-    format!(
-        "({} {} {}i)",
-        format_number(real, false),
-        imag_sign,
-        imag_abs
-    )
+    let coefficient = match (imag.is_infinite(), imag.is_sign_negative()) {
+        (true, true) => "-1e999".to_owned(),
+        (true, false) => "1e999".to_owned(),
+        (false, _) => format_number(imag, false),
+    };
+    Ok(format!("{coefficient}i"))
 }
 
 pub(super) fn format_string_literal(value: &LuaString, quote_style: QuoteStyle) -> String {

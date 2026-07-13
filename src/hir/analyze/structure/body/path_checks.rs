@@ -27,11 +27,7 @@ impl StructuredBodyLowerer<'_, '_> {
         if from == avoided || to == avoided {
             return false;
         }
-        let mut allowed_blocks = self.lowering.cfg.reachable_blocks.clone();
-        allowed_blocks.remove(&avoided);
-        self.lowering
-            .cfg
-            .can_reach_within(from, to, &allowed_blocks)
+        self.lowering.cfg.can_reach_avoiding(from, to, avoided)
     }
 
     pub(super) fn branch_arm_reaches_shared_continuation_or_terminate(

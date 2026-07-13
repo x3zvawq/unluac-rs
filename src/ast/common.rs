@@ -245,31 +245,24 @@ pub enum AstFeature {
 }
 
 impl DecompileDialect {
-    /// 判断 `name` 是否是该方言版本下的保留关键字。
+    /// 判断 `name` 是否是该方言版本下禁止作为标识符的硬关键字。
     ///
-    /// `goto`、`continue`、`global` 是 dialect-specific 的：
-    /// - `goto`：Lua 5.2+ / LuaJIT
-    /// - `continue`：Luau
-    /// - `global`：Lua 5.5
+    /// PUC Lua 5.2+ 的 `goto` 是硬关键字；LuaJIT `goto`、Luau `continue` 和
+    /// Lua 5.5 `global` 只在对应语句上下文中有特殊含义，仍可作为普通名字。
     pub fn is_keyword(self, name: &str) -> bool {
         if is_base_lua_keyword(name) {
             return true;
         }
         match name {
-            "goto" => matches!(
-                self,
-                Self::Lua52 | Self::Lua53 | Self::Lua54 | Self::Lua55 | Self::Luajit
-            ),
-            "continue" => matches!(self, Self::Luau),
-            "global" => matches!(self, Self::Lua55),
+            "goto" => matches!(self, Self::Lua52 | Self::Lua53 | Self::Lua54 | Self::Lua55),
             _ => false,
         }
     }
 
-    /// 判断 `name` 是否在 **任意** 受支持方言中可能是保留关键字。
+    /// 判断 `name` 是否在 **任意** 受支持方言中可能是关键字或上下文语法词。
     ///
-    /// HIR 层在目标方言未知时使用此保守全集，保证不会生成任何方言下
-    /// 不合法的裸标识符。
+    /// Naming 在目标方言未知时使用此保守全集，避免主动分配容易与语句语法冲突的名字；
+    /// 目标明确的已有 global / field 名仍由 `is_keyword` 按标识符位置精确判断。
     pub fn is_keyword_in_any_dialect(name: &str) -> bool {
         is_base_lua_keyword(name) || matches!(name, "goto" | "continue" | "global")
     }

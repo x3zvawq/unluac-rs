@@ -23,6 +23,14 @@ pub(super) fn expr_touches_any_temp(expr: &HirExpr, temps: &BTreeSet<TempId>) ->
     TempTouchCollector::touches_in_expr(expr, temps)
 }
 
+pub(super) fn collect_temp_refs_in_expr(expr: &HirExpr) -> BTreeSet<TempId> {
+    let mut collector = TempRefCollector {
+        temps: BTreeSet::new(),
+    };
+    visit_expr(expr, &mut collector);
+    collector.temps
+}
+
 /// 判断该语句是否 **只在控制头部** 消费了某些 temp，而 body 内不再引用。
 ///
 /// 用于提升计划构建时识别 temp 的消费边界：如果 temp 只出现在 if/while/for

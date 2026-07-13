@@ -40,6 +40,7 @@ impl Default for NamingOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, IntoStaticStr)]
 #[strum(serialize_all = "kebab-case")]
 pub enum NameSource {
+    LegacyArg,
     Debug,
     CaptureProvenance,
     SelfParam,

@@ -54,7 +54,7 @@ pub(super) struct StructuredBodyLowerer<'a, 'b> {
     pub(super) tbc_scope_regs: BTreeSet<usize>,
     pub(super) visited: BTreeSet<BlockRef>,
     pub(super) active_loops: Vec<ActiveLoopContext>,
-    reachability: RefCell<BTreeMap<(BlockRef, BlockRef), bool>>,
+    reachability: RefCell<BTreeMap<BlockRef, BTreeSet<BlockRef>>>,
 }
 
 #[derive(Debug)]
@@ -205,14 +205,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     }
 
     pub(super) fn can_reach(&self, from: BlockRef, to: BlockRef) -> bool {
-        let key = (from, to);
-        if let Some(can_reach) = self.reachability.borrow().get(&key).copied() {
-            return can_reach;
-        }
-
-        let can_reach = self.lowering.cfg.can_reach(from, to);
-        self.reachability.borrow_mut().insert(key, can_reach);
-        can_reach
+        self.reachability
+            .borrow_mut()
+            .entry(from)
+            .or_insert_with(|| {
+                self.lowering
+                    .cfg
+                    .reachable_targets_within(from, &self.lowering.cfg.reachable_blocks)
+            })
+            .contains(&to)
     }
 
     fn all_reachable_blocks_covered(&self) -> bool {
@@ -337,14 +338,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.loops_by_header
             .get(&header)?
             .iter()
-            .find_map(|(candidate_id, candidate)| {
-                (Some(*candidate_id) != suppressed_loop_id
-                    && !self
-                        .active_loops
-                        .iter()
-                        .any(|active| active.candidate_id == *candidate_id))
-                .then_some((*candidate_id, *candidate))
+            .filter(|(candidate_id, _)| Some(*candidate_id) != suppressed_loop_id)
+            .filter(|(candidate_id, _)| {
+                !self
+                    .active_loops
+                    .iter()
+                    .any(|active| active.candidate_id == *candidate_id)
             })
+            // 外层 active 后会被上面的 identity 过滤，同一 header 才轮到内层。
+            .max_by_key(|(_, candidate)| candidate.blocks.len())
+            .map(|(candidate_id, candidate)| (*candidate_id, *candidate))
     }
 
     fn emit_required_label(&self, block: BlockRef, stmts: &mut Vec<HirStmt>) {

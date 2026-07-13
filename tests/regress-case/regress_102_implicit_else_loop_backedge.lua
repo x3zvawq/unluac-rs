@@ -1,5 +1,6 @@
--- regress_102_implicit_else_loop_backedge#1: 缺省 else 的 merge 与显式 arm 分别回到同一 loop header
--- unluac: expect-contains [[while true do]]
+-- regress_102_implicit_else_loop_backedge#1: 内外 loop 共享 header 时保留各自的结构 owner
+-- unluac: expect-contains [[repeat]]
+-- unluac: expect-contains [[while not]]
 -- unluac: expect-contains [[else]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
