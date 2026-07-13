@@ -28,7 +28,7 @@ use super::{
 pub(super) struct RegionRebuildContext<'a> {
     block: &'a HirBlock,
     binding_index: &'a BindingIndex,
-    remaining_uses: &'a BindingUseSummary,
+    remaining_uses: BindingUseSummary<'a>,
     materialized_binding_counts: &'a [u32],
     dialect: DecompileDialect,
     scratch: &'a mut RebuildScratch,
@@ -38,7 +38,7 @@ impl<'a> RegionRebuildContext<'a> {
     pub(super) fn new(
         block: &'a HirBlock,
         binding_index: &'a BindingIndex,
-        remaining_uses: &'a BindingUseSummary,
+        remaining_uses: BindingUseSummary<'a>,
         materialized_binding_counts: &'a [u32],
         dialect: DecompileDialect,
         scratch: &'a mut RebuildScratch,

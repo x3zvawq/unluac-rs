@@ -682,7 +682,7 @@ impl<'a> ProtoLowerer<'a> {
                             results: if b == 0 {
                                 ResultPack::Open(reg_from_u8(a))
                             } else {
-                                ResultPack::Fixed(RegRange::new(reg_from_u8(a), usize::from(b)))
+                                ResultPack::Fixed(RegRange::new(reg_from_u8(a), usize::from(b - 1)))
                             },
                         })),
                     );

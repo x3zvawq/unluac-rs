@@ -9,7 +9,7 @@
 //! - `if cond then ... else ... end` 会产出 `BranchKind::IfElse`
 //! - `if not cond then return end; ...` 这种守卫形状会被标成 `BranchKind::Guard`
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::structure::{BlockRef, Cfg, DominatorTree, GraphFacts};
 
@@ -125,73 +125,101 @@ fn collect_branch_region_blocks(
 
 struct ReachabilityCache<'a> {
     cfg: &'a Cfg,
-    memo: BTreeMap<(BlockRef, BlockRef), bool>,
-    loop_bounded_memo: BTreeMap<(BlockRef, BlockRef), bool>,
-    loop_exits_by_header: BTreeMap<BlockRef, BTreeSet<BlockRef>>,
+    memo: BTreeMap<BlockRef, BTreeSet<BlockRef>>,
+    loop_bounded_memo: BTreeMap<BlockRef, BTreeSet<BlockRef>>,
+    loops_by_header: BTreeMap<BlockRef, Vec<&'a LoopCandidate>>,
 }
 
 impl<'a> ReachabilityCache<'a> {
-    fn new(cfg: &'a Cfg, loop_candidates: &[LoopCandidate]) -> Self {
-        let mut loop_exits_by_header = BTreeMap::new();
+    fn new(cfg: &'a Cfg, loop_candidates: &'a [LoopCandidate]) -> Self {
+        let mut loops_by_header = BTreeMap::<_, Vec<_>>::new();
         for candidate in loop_candidates {
-            loop_exits_by_header
+            loops_by_header
                 .entry(candidate.header)
-                .or_insert_with(|| candidate.exits.clone());
+                .or_default()
+                .push(candidate);
         }
         Self {
             cfg,
             memo: BTreeMap::new(),
             loop_bounded_memo: BTreeMap::new(),
-            loop_exits_by_header,
+            loops_by_header,
         }
     }
 
     fn can_reach(&mut self, from: BlockRef, to: BlockRef) -> bool {
-        *self
-            .memo
-            .entry((from, to))
-            .or_insert_with(|| self.cfg.can_reach(from, to))
+        self.memo
+            .entry(from)
+            .or_insert_with(|| {
+                self.cfg
+                    .reachable_targets_within(from, &self.cfg.reachable_blocks)
+            })
+            .contains(&to)
     }
 
     fn can_reach_without_entering_loop_header(&mut self, from: BlockRef, to: BlockRef) -> bool {
-        *self.loop_bounded_memo.entry((from, to)).or_insert_with(|| {
-            can_reach_without_entering_loop_body(self.cfg, from, to, &self.loop_exits_by_header)
-        })
+        self.loop_bounded_memo
+            .entry(from)
+            .or_insert_with(|| {
+                reachable_without_entering_loop_bodies(self.cfg, from, &self.loops_by_header)
+            })
+            .contains(&to)
     }
 }
 
-fn can_reach_without_entering_loop_body(
+fn loop_candidate_for_entry<'a>(
+    candidates: &[&'a LoopCandidate],
+    predecessor: Option<BlockRef>,
+) -> Option<&'a LoopCandidate> {
+    if let Some(predecessor) = predecessor {
+        let mut matching = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.preheader == Some(predecessor));
+        if let Some(candidate) = matching.next()
+            && matching.next().is_none()
+        {
+            return Some(candidate);
+        }
+    }
+
+    match candidates {
+        [candidate] => Some(*candidate),
+        _ => None,
+    }
+}
+
+fn reachable_without_entering_loop_bodies(
     cfg: &Cfg,
     from: BlockRef,
-    to: BlockRef,
-    loop_exits_by_header: &BTreeMap<BlockRef, BTreeSet<BlockRef>>,
-) -> bool {
-    if from == to {
-        return true;
-    }
-    if loop_exits_by_header.contains_key(&from) {
-        return false;
+    loops_by_header: &BTreeMap<BlockRef, Vec<&LoopCandidate>>,
+) -> BTreeSet<BlockRef> {
+    let mut reachable = BTreeSet::from([from]);
+    if loops_by_header.contains_key(&from) {
+        return reachable;
     }
 
     let mut visited = BTreeSet::new();
-    let mut stack = vec![from];
-    while let Some(block) = stack.pop() {
-        if block == to {
-            return true;
-        }
-        if !visited.insert(block) {
+    let mut worklist = VecDeque::from([(None, from)]);
+    while let Some((predecessor, block)) = worklist.pop_front() {
+        reachable.insert(block);
+        if !visited.insert((predecessor, block)) {
             continue;
         }
-        if let Some(exits) = loop_exits_by_header.get(&block) {
-            stack.extend(exits.iter().copied());
+        if let Some(candidates) = loops_by_header.get(&block) {
+            let Some(candidate) = loop_candidate_for_entry(candidates, predecessor) else {
+                // 同 header 候选无法按入口唯一选择时，不猜测任意 loop owner。
+                continue;
+            };
+            worklist.extend(candidate.exits.iter().map(|exit| (None, *exit)));
             continue;
         }
         for edge_ref in &cfg.succs[block.index()] {
-            stack.push(cfg.edges[edge_ref.index()].to);
+            worklist.push_back((Some(block), cfg.edges[edge_ref.index()].to));
         }
     }
 
-    false
+    reachable
 }
 
 fn classify_one_arm_branch(

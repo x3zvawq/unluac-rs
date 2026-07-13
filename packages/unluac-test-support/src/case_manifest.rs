@@ -109,14 +109,6 @@ const ALL_NON_LUAU_DIALECTS: &[LuaCaseDialect] = &[
     LuaCaseDialect::Lua55,
     LuaCaseDialect::Luajit,
 ];
-const ALL_NON_LUAJIT_DIALECTS: &[LuaCaseDialect] = &[
-    LuaCaseDialect::Lua51,
-    LuaCaseDialect::Lua52,
-    LuaCaseDialect::Lua53,
-    LuaCaseDialect::Lua54,
-    LuaCaseDialect::Lua55,
-    LuaCaseDialect::Luau,
-];
 const PUC_LUA_51: &[LuaCaseDialect] = &[LuaCaseDialect::Lua51];
 const PUC_LUA_GE_52: &[LuaCaseDialect] = &[
     LuaCaseDialect::Lua52,
@@ -215,7 +207,7 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_06_nested_repeat_continue_flag.lua",
-        ALL_NON_LUAJIT_DIALECTS,
+        ALL_DIALECTS,
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_07_close_scope_slot_reuse.lua",
@@ -796,6 +788,14 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_139_lua55_contextual_global.lua",
         PUC_LUA_GE_55,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_140_luajit_prior_handoff_target.lua",
+        LUAJIT_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_141_lua51_vararg_fixed_results.lua",
+        PUC_LUA_51,
     ),
 ];
 

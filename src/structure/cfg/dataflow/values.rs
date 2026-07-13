@@ -1,3 +1,9 @@
+//! SSA def/phi 值的 reaching-value 求解与指令级快照物化。
+//!
+//! 它消费 fixed reaching-def 已建立的 def、Structure 前的 phi 候选和 CFG predecessor，
+//! 只在 block out 变化时唤醒 reachable successor；不会重新识别 branch/loop owner。
+//! 例如 loop header 的 phi 会先覆盖 predecessor defs，再由 worklist 沿回边传播到稳定。
+
 use super::*;
 
 pub(super) struct MaterializedValueFacts {
@@ -78,40 +84,40 @@ fn solve_reaching_values(
     phi_block_ranges: &[std::ops::Range<usize>],
     block_state: &mut BlockValueState,
 ) {
-    let mut changed = true;
-    while changed {
-        changed = false;
+    let mut worklist = graph_facts.rpo.iter().copied().collect::<VecDeque<_>>();
+    let mut queued = vec![false; cfg.blocks.len()];
+    for block in &worklist {
+        queued[block.index()] = true;
+    }
 
-        for block in &graph_facts.rpo {
-            let block = *block;
-            let mut new_in = merge_predecessor_value_state(cfg, block, &block_state.fixed_out);
-            // phi 代表“进入这个 block 之后立刻可见的合流值”，因此它必须覆盖掉
-            // predecessor 合并出来的底层 def 集，否则后续 use 仍然会看到多定义。
-            apply_block_phi_values(
-                &mut new_in,
-                &phi_candidates[phi_block_ranges[block.index()].clone()],
-            );
+    while let Some(block) = worklist.pop_front() {
+        queued[block.index()] = false;
+        let mut new_in = merge_predecessor_value_state(cfg, block, &block_state.fixed_out);
+        // phi 代表“进入这个 block 之后立刻可见的合流值”，因此它必须覆盖掉
+        // predecessor 合并出来的底层 def 集，否则后续 use 仍然会看到多定义。
+        apply_block_phi_values(
+            &mut new_in,
+            &phi_candidates[phi_block_ranges[block.index()].clone()],
+        );
 
-            if block_state.fixed_in[block.index()] != new_in {
-                block_state.fixed_in[block.index()] = new_in.clone();
-                changed = true;
+        if block_state.fixed_in[block.index()] != new_in {
+            block_state.fixed_in[block.index()] = new_in.clone();
+        }
+
+        let mut current_fixed = new_in;
+        if let Some(instr_indices) = super::instr_indices(cfg, block) {
+            for instr_index in instr_indices {
+                apply_value_transfer(
+                    &instr_effects[instr_index],
+                    &lookups.fixed[instr_index],
+                    &mut current_fixed,
+                );
             }
+        }
 
-            let mut current_fixed = new_in;
-            if let Some(instr_indices) = super::instr_indices(cfg, block) {
-                for instr_index in instr_indices {
-                    apply_value_transfer(
-                        &instr_effects[instr_index],
-                        &lookups.fixed[instr_index],
-                        &mut current_fixed,
-                    );
-                }
-            }
-
-            if block_state.fixed_out[block.index()] != current_fixed {
-                block_state.fixed_out[block.index()] = current_fixed;
-                changed = true;
-            }
+        if block_state.fixed_out[block.index()] != current_fixed {
+            block_state.fixed_out[block.index()] = current_fixed;
+            enqueue_reachable_successors(cfg, block, &mut worklist, &mut queued);
         }
     }
 }

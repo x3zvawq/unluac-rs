@@ -9,7 +9,7 @@ mod liveness;
 mod phi;
 mod values;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Range;
 
 use crate::transformer::{
@@ -63,6 +63,36 @@ struct InstructionFacts {
 struct BlockValueState {
     fixed_in: Vec<ValueState>,
     fixed_out: Vec<ValueState>,
+}
+
+fn enqueue_reachable_successors(
+    cfg: &Cfg,
+    block: BlockRef,
+    worklist: &mut VecDeque<BlockRef>,
+    queued: &mut [bool],
+) {
+    for edge_ref in &cfg.succs[block.index()] {
+        let successor = cfg.edges[edge_ref.index()].to;
+        if cfg.reachable_blocks.contains(&successor) && !queued[successor.index()] {
+            queued[successor.index()] = true;
+            worklist.push_back(successor);
+        }
+    }
+}
+
+fn enqueue_reachable_predecessors(
+    cfg: &Cfg,
+    block: BlockRef,
+    worklist: &mut VecDeque<BlockRef>,
+    queued: &mut [bool],
+) {
+    for edge_ref in &cfg.preds[block.index()] {
+        let predecessor = cfg.edges[edge_ref.index()].from;
+        if cfg.reachable_blocks.contains(&predecessor) && !queued[predecessor.index()] {
+            queued[predecessor.index()] = true;
+            worklist.push_back(predecessor);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

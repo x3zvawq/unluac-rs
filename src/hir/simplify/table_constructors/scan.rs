@@ -8,8 +8,8 @@ use crate::ast::DecompileDialect;
 use crate::hir::common::{HirExpr, HirLValue, HirStmt, HirTableConstructor};
 
 use super::bindings::{
-    BindingIndex, BindingUseSummary, StmtBindingSummary, binding_from_expr, binding_from_lvalue,
-    expr_uses_binding, lvalue_uses_binding, stmt_slice_mentions_binding,
+    BindingIndex, BindingOccurrenceIndex, binding_from_expr, binding_from_lvalue,
+    expr_uses_binding, lvalue_uses_binding,
 };
 use super::builder::ConstructorBuilder;
 use super::rebuild::{RegionRebuildContext, try_extend_constructor_from_steps};
@@ -59,8 +59,9 @@ pub(super) fn try_rebuild_constructor_region(
     binding: TableBinding,
     constructor: HirTableConstructor,
     binding_index: &BindingIndex,
+    binding_occurrences: &BindingOccurrenceIndex,
     materialized_binding_counts: &[u32],
-    stmt_bindings: &[StmtBindingSummary],
+    stmt_ids: &[usize],
     dialect: DecompileDialect,
     scratch: &mut RebuildScratch,
 ) -> Option<(HirTableConstructor, usize, Vec<usize>)> {
@@ -70,20 +71,16 @@ pub(super) fn try_rebuild_constructor_region(
     let mut committed_retained_stmts: Vec<usize> = Vec::new();
     let mut pending_retained_stmts: Vec<usize> = Vec::new();
     let scan_stmts = &block.stmts[(seed_index + 1)..];
-    let mut remaining_uses = BindingUseSummary::with_binding_count(binding_index.len());
-    for bindings in &stmt_bindings[(seed_index + 1)..] {
-        remaining_uses.add_stmt_bindings(bindings);
-    }
     for (offset, stmt) in scan_stmts.iter().enumerate() {
         let index = seed_index + 1 + offset;
-        remaining_uses.remove_stmt_bindings(&stmt_bindings[index]);
+        let remaining_uses = binding_occurrences.remaining_uses_after(stmt_ids[index]);
         if keyed_write_step(stmt, binding) {
             steps.push(RegionStep::Record { stmt_index: index });
             pending_retained_stmts.clear();
             let mut rebuild_context = RegionRebuildContext::new(
                 block,
                 binding_index,
-                &remaining_uses,
+                remaining_uses,
                 materialized_binding_counts,
                 dialect,
                 scratch,
@@ -109,7 +106,7 @@ pub(super) fn try_rebuild_constructor_region(
             let mut rebuild_context = RegionRebuildContext::new(
                 block,
                 binding_index,
-                &remaining_uses,
+                remaining_uses,
                 materialized_binding_counts,
                 dialect,
                 scratch,
@@ -148,6 +145,7 @@ pub(super) fn try_rebuild_constructor_region(
 pub(super) fn trailing_constructor_handoff(
     stmts: &[HirStmt],
     binding: TableBinding,
+    binding_mentioned_after: bool,
 ) -> Option<HirLValue> {
     let HirStmt::Assign(assign) = stmts.first()? else {
         return None;
@@ -166,7 +164,7 @@ pub(super) fn trailing_constructor_handoff(
     // - handoff 之后也不能再出现这个 binding，否则后层还需要它的稳定身份。
     if binding_from_lvalue(target) == Some(binding)
         || lvalue_uses_binding(target, binding)
-        || stmt_slice_mentions_binding(&stmts[1..], binding)
+        || binding_mentioned_after
     {
         return None;
     }

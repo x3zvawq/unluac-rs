@@ -1,10 +1,11 @@
 //! 这个子模块负责 table-constructor pass 里的 binding 识别与字段键翻译。
 //!
-//! 它依赖 HIR 已经分好的 lvalue/expr 形状，只回答“这个读写是不是同一个构造器绑定”，
-//! 不会在这里扫描 region 或重建字段序列。
+//! 它依赖 HIR 已经分好的 lvalue/expr 形状，回答“这个读写是不是同一个构造器绑定”，
+//! 并用稳定 stmt id 索引 binding 的 use/mention 位置；不会扫描候选 region 或重建字段序列。
 //! 例如：`t.x = v` 会在这里把键翻成 `Name(\"x\")` 并识别 `t` 的绑定身份。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound::{Excluded, Unbounded};
 
 use crate::ast::{DecompileDialect, is_lua_identifier_name};
 use crate::hir::common::{
@@ -90,12 +91,17 @@ impl BindingIndex {
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct StmtBindingSummary {
-    ids: Vec<BindingId>,
+    uses: Vec<BindingId>,
+    mentions: Vec<BindingId>,
 }
 
 impl StmtBindingSummary {
-    pub(super) fn iter(&self) -> impl Iterator<Item = BindingId> + '_ {
-        self.ids.iter().copied()
+    fn uses(&self) -> impl Iterator<Item = BindingId> + '_ {
+        self.uses.iter().copied()
+    }
+
+    fn mentions(&self) -> impl Iterator<Item = BindingId> + '_ {
+        self.mentions.iter().copied()
     }
 }
 
@@ -153,40 +159,83 @@ pub(super) fn collect_stmt_slice_binding_summary(
 ) -> StmtBindingSummary {
     let mut collector = BindingUseCollector {
         binding_index,
-        ids: Vec::new(),
+        uses: Vec::new(),
+        mentions: Vec::new(),
     };
     visit_stmts(stmts, &mut collector);
-    collector.ids.sort_unstable();
-    collector.ids.dedup();
-    StmtBindingSummary { ids: collector.ids }
+    collector.uses.sort_unstable();
+    collector.uses.dedup();
+    collector.mentions.sort_unstable();
+    collector.mentions.dedup();
+    StmtBindingSummary {
+        uses: collector.uses,
+        mentions: collector.mentions,
+    }
 }
 
-#[derive(Debug, Clone, Default)]
-pub(super) struct BindingUseSummary {
-    counts: Vec<u32>,
+#[derive(Debug, Clone)]
+pub(super) struct BindingOccurrenceIndex {
+    uses: Vec<BTreeSet<usize>>,
+    mentions: Vec<BTreeSet<usize>>,
 }
 
-impl BindingUseSummary {
-    pub(super) fn with_binding_count(binding_count: usize) -> Self {
-        Self {
-            counts: vec![0; binding_count],
+impl BindingOccurrenceIndex {
+    pub(super) fn new(binding_count: usize, stmts: &[StmtBindingSummary]) -> Self {
+        let mut index = Self {
+            uses: vec![BTreeSet::new(); binding_count],
+            mentions: vec![BTreeSet::new(); binding_count],
+        };
+        for (stmt_id, summary) in stmts.iter().enumerate() {
+            for binding_id in summary.uses() {
+                index.uses[binding_id].insert(stmt_id);
+            }
+            for binding_id in summary.mentions() {
+                index.mentions[binding_id].insert(stmt_id);
+            }
+        }
+        index
+    }
+
+    pub(super) fn remaining_uses_after(&self, stmt_id: usize) -> BindingUseSummary<'_> {
+        BindingUseSummary {
+            index: self,
+            after_stmt: stmt_id,
         }
     }
 
-    pub(super) fn contains(&self, binding_id: BindingId) -> bool {
-        self.counts.get(binding_id).copied().unwrap_or_default() > 0
+    pub(super) fn mentions_after(&self, binding_id: BindingId, stmt_id: usize) -> bool {
+        self.mentions.get(binding_id).is_some_and(|occurrences| {
+            occurrences
+                .range((Excluded(stmt_id), Unbounded))
+                .next()
+                .is_some()
+        })
     }
 
-    pub(super) fn add_stmt_bindings(&mut self, bindings: &StmtBindingSummary) {
-        for binding_id in bindings.iter() {
-            self.counts[binding_id] += 1;
+    pub(super) fn remove_stmt(&mut self, stmt_id: usize, summary: &StmtBindingSummary) {
+        for binding_id in summary.uses() {
+            self.uses[binding_id].remove(&stmt_id);
+        }
+        for binding_id in summary.mentions() {
+            self.mentions[binding_id].remove(&stmt_id);
         }
     }
+}
 
-    pub(super) fn remove_stmt_bindings(&mut self, bindings: &StmtBindingSummary) {
-        for binding_id in bindings.iter() {
-            self.counts[binding_id] -= 1;
-        }
+#[derive(Debug, Clone, Copy)]
+pub(super) struct BindingUseSummary<'a> {
+    index: &'a BindingOccurrenceIndex,
+    after_stmt: usize,
+}
+
+impl BindingUseSummary<'_> {
+    pub(super) fn contains(self, binding_id: BindingId) -> bool {
+        self.index.uses.get(binding_id).is_some_and(|occurrences| {
+            occurrences
+                .range((Excluded(self.after_stmt), Unbounded))
+                .next()
+                .is_some()
+        })
     }
 }
 
@@ -259,98 +308,40 @@ pub(super) fn lvalue_uses_binding(lvalue: &HirLValue, binding: TableBinding) -> 
     }
 }
 
-pub(super) fn stmt_slice_mentions_binding(stmts: &[HirStmt], binding: TableBinding) -> bool {
-    stmts
-        .iter()
-        .any(|stmt| stmt_mentions_binding(stmt, binding))
-}
-
-fn stmt_mentions_binding(stmt: &HirStmt, binding: TableBinding) -> bool {
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => local_decl
-            .values
-            .iter()
-            .any(|value| expr_uses_binding(value, binding)),
-        HirStmt::Assign(assign) => {
-            assign
-                .targets
-                .iter()
-                .any(|target| lvalue_uses_binding(target, binding))
-                || assign
-                    .values
-                    .iter()
-                    .any(|value| expr_uses_binding(value, binding))
-        }
-        HirStmt::TableSetList(set_list) => {
-            expr_uses_binding(&set_list.base, binding)
-                || set_list
-                    .values
-                    .iter()
-                    .any(|value| expr_uses_binding(value, binding))
-                || set_list
-                    .trailing_multivalue
-                    .as_ref()
-                    .is_some_and(|value| expr_uses_binding(value, binding))
-        }
-        HirStmt::ErrNil(err_nil) => expr_uses_binding(&err_nil.value, binding),
-        HirStmt::ToBeClosed(to_be_closed) => expr_uses_binding(&to_be_closed.value, binding),
-        HirStmt::Close(_) => false,
-        HirStmt::CallStmt(call_stmt) => call_expr_uses_binding(&call_stmt.call, binding),
-        HirStmt::Return(ret) => ret
-            .values
-            .iter()
-            .any(|value| expr_uses_binding(value, binding)),
-        HirStmt::If(if_stmt) => {
-            expr_uses_binding(&if_stmt.cond, binding)
-                || stmt_slice_mentions_binding(&if_stmt.then_block.stmts, binding)
-                || if_stmt
-                    .else_block
-                    .as_ref()
-                    .is_some_and(|block| stmt_slice_mentions_binding(&block.stmts, binding))
-        }
-        HirStmt::While(while_stmt) => {
-            expr_uses_binding(&while_stmt.cond, binding)
-                || stmt_slice_mentions_binding(&while_stmt.body.stmts, binding)
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            stmt_slice_mentions_binding(&repeat_stmt.body.stmts, binding)
-                || expr_uses_binding(&repeat_stmt.cond, binding)
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            TableBinding::Local(numeric_for.binding) == binding
-                || expr_uses_binding(&numeric_for.start, binding)
-                || expr_uses_binding(&numeric_for.limit, binding)
-                || expr_uses_binding(&numeric_for.step, binding)
-                || stmt_slice_mentions_binding(&numeric_for.body.stmts, binding)
-        }
-        HirStmt::GenericFor(generic_for) => {
-            generic_for
-                .bindings
-                .iter()
-                .any(|local| TableBinding::Local(*local) == binding)
-                || generic_for
-                    .iterator
-                    .iter()
-                    .any(|expr| expr_uses_binding(expr, binding))
-                || stmt_slice_mentions_binding(&generic_for.body.stmts, binding)
-        }
-        HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => false,
-        HirStmt::Block(block) => stmt_slice_mentions_binding(&block.stmts, binding),
-        HirStmt::Unstructured(unstructured) => {
-            stmt_slice_mentions_binding(&unstructured.body.stmts, binding)
-        }
-    }
-}
-
 struct BindingUseCollector<'a> {
     binding_index: &'a mut BindingIndex,
-    ids: Vec<BindingId>,
+    uses: Vec<BindingId>,
+    mentions: Vec<BindingId>,
 }
 
 impl HirVisitor for BindingUseCollector<'_> {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        match stmt {
+            HirStmt::NumericFor(numeric_for) => self.mentions.push(
+                self.binding_index
+                    .intern(TableBinding::Local(numeric_for.binding)),
+            ),
+            HirStmt::GenericFor(generic_for) => self.mentions.extend(
+                generic_for
+                    .bindings
+                    .iter()
+                    .map(|binding| self.binding_index.intern(TableBinding::Local(*binding))),
+            ),
+            _ => {}
+        }
+    }
+
     fn visit_expr(&mut self, expr: &HirExpr) {
         if let Some(binding) = binding_from_expr(expr) {
-            self.ids.push(self.binding_index.intern(binding));
+            let binding_id = self.binding_index.intern(binding);
+            self.uses.push(binding_id);
+            self.mentions.push(binding_id);
+        }
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        if let Some(binding) = binding_from_lvalue(lvalue) {
+            self.mentions.push(self.binding_index.intern(binding));
         }
     }
 }

@@ -260,22 +260,37 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 continue;
             };
             let inherited_target = self.active_loop_state_target(*reg);
-            let mut init = preheader
-                .map(|preheader| expr_for_reg_at_block_exit(self.lowering, preheader, *reg))
-                .or_else(|| {
-                    Self::header_values(candidate)
-                        .find(|value| value.reg == *reg)
-                        .and_then(|value| self.multi_entry_loop_entry_expr(value, target_overrides))
-                })
-                .or_else(|| inherited_target.as_ref().and_then(lvalue_as_expr))
-                .unwrap_or_else(|| self.loop_entry_initial_expr(*reg));
-            rewrite_expr_temps(&mut init, &temp_expr_overrides(target_overrides));
             let target = target_overrides
                 .get(&temp)
                 .filter(|target| lvalue_as_expr(target).is_some())
                 .cloned()
-                .or(inherited_target)
+                .or_else(|| inherited_target.clone())
                 .unwrap_or(HirLValue::Temp(temp));
+            let repeat_defines_before_use = candidate.kind_hint == LoopKindHint::RepeatLike
+                && !self
+                    .lowering
+                    .dataflow
+                    .live_in_regs(candidate.header)
+                    .contains(reg)
+                && target == HirLValue::Temp(temp);
+            let mut init = if repeat_defines_before_use {
+                // repeat 首轮必经 header；不在 live-in 中的 live-out 寄存器一定先定义再流出。
+                // 新建 state 不需要从可能多值合流的 preheader 猜一个不可观察的旧值。
+                HirExpr::Nil
+            } else {
+                preheader
+                    .map(|preheader| expr_for_reg_at_block_exit(self.lowering, preheader, *reg))
+                    .or_else(|| {
+                        Self::header_values(candidate)
+                            .find(|value| value.reg == *reg)
+                            .and_then(|value| {
+                                self.multi_entry_loop_entry_expr(value, target_overrides)
+                            })
+                    })
+                    .or_else(|| inherited_target.as_ref().and_then(lvalue_as_expr))
+                    .unwrap_or_else(|| self.loop_entry_initial_expr(*reg))
+            };
+            rewrite_expr_temps(&mut init, &temp_expr_overrides(target_overrides));
 
             for value in values {
                 match value {

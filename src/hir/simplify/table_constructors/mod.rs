@@ -27,7 +27,7 @@ use crate::ast::DecompileDialect;
 use crate::hir::common::{HirAssign, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId};
 
 use self::bindings::{
-    BindingIndex, StmtBindingSummary, collect_materialized_binding_counts,
+    BindingIndex, BindingOccurrenceIndex, StmtBindingSummary, collect_materialized_binding_counts,
     collect_stmt_binding_summary,
 };
 use self::scan::{
@@ -131,14 +131,17 @@ impl HirRewritePass for TableConstructorPass {
     fn rewrite_block(&mut self, block: &mut crate::hir::common::HirBlock) -> bool {
         let mut changed = false;
         let mut scratch = RebuildScratch::default();
-        // 构建一次 binding 索引、per-stmt binding summary 和 materialized 计数，
-        // 在所有 seed 间复用，避免 O(seeds × stmts) 的重复遍历。
+        // 稳定 stmt id 让 occurrence index 在删除已折叠 region 后仍能按源码顺序查询；
+        // 每个 seed 只做当前位置之后的有序集合查找，不重建完整 suffix summary。
         let mut binding_index = BindingIndex::default();
         let mut stmt_bindings: Vec<StmtBindingSummary> = block
             .stmts
             .iter()
             .map(|stmt| collect_stmt_binding_summary(stmt, &mut binding_index))
             .collect();
+        let mut binding_occurrences =
+            BindingOccurrenceIndex::new(binding_index.len(), &stmt_bindings);
+        let mut stmt_ids = (0..block.stmts.len()).collect::<Vec<_>>();
         let materialized_binding_counts =
             binding_index.materialized_counts(&self.materialized_bindings);
         let mut index = 0;
@@ -155,8 +158,9 @@ impl HirRewritePass for TableConstructorPass {
                     binding,
                     seed_ctor.clone(),
                     &binding_index,
+                    &binding_occurrences,
                     &materialized_binding_counts,
-                    &stmt_bindings,
+                    &stmt_ids,
                     self.dialect,
                     &mut scratch,
                 ) {
@@ -166,8 +170,17 @@ impl HirRewritePass for TableConstructorPass {
                     None => (seed_ctor, index, false, Vec::new()),
                 };
 
-            let handoff_target =
-                trailing_constructor_handoff(&block.stmts[(end_index + 1)..], binding);
+            let handoff_index = end_index + 1;
+            let binding_id = binding_index
+                .id_of(binding)
+                .expect("constructor seed binding should be indexed");
+            let handoff_target = stmt_ids.get(handoff_index).and_then(|stmt_id| {
+                trailing_constructor_handoff(
+                    &block.stmts[handoff_index..],
+                    binding,
+                    binding_occurrences.mentions_after(binding_id, *stmt_id),
+                )
+            });
             if !rebuilt_region && handoff_target.is_none() {
                 index += 1;
                 continue;
@@ -178,13 +191,19 @@ impl HirRewritePass for TableConstructorPass {
             let drain_end = end_index + usize::from(consumed_handoff);
             if drain_end > index {
                 if retained_stmts.is_empty() {
+                    for i in index + 1..=drain_end {
+                        binding_occurrences.remove_stmt(stmt_ids[i], &stmt_bindings[i]);
+                    }
                     block.stmts.drain(index + 1..=drain_end);
                     stmt_bindings.drain(index + 1..=drain_end);
+                    stmt_ids.drain(index + 1..=drain_end);
                 } else {
                     for i in (index + 1..=drain_end).rev() {
                         if retained_stmts.binary_search(&i).is_err() {
+                            binding_occurrences.remove_stmt(stmt_ids[i], &stmt_bindings[i]);
                             block.stmts.remove(i);
                             stmt_bindings.remove(i);
+                            stmt_ids.remove(i);
                         }
                     }
                 }

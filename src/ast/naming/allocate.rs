@@ -5,7 +5,7 @@
 //! - 函数内冲突消解
 //! - 参数对外层当前可见绑定的避让
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::HirProto;
 
@@ -76,6 +76,62 @@ pub(super) struct FunctionAssignContext<'a> {
     pub module_names: &'a mut ModuleNameAllocator,
 }
 
+struct FunctionNameAllocator {
+    used: BTreeSet<String>,
+    next_suffix_by_base: BTreeMap<String, usize>,
+}
+
+impl FunctionNameAllocator {
+    fn new(used: BTreeSet<String>) -> Self {
+        Self {
+            used,
+            next_suffix_by_base: BTreeMap::new(),
+        }
+    }
+
+    fn allocate(&mut self, candidate: CandidateHint) -> NameInfo {
+        if candidate.source == NameSource::LegacyArg {
+            self.used.insert(candidate.text.clone());
+            return NameInfo {
+                text: candidate.text,
+                source: candidate.source,
+                renamed: false,
+            };
+        }
+        if candidate.source == NameSource::Discard {
+            return NameInfo {
+                text: candidate.text,
+                source: candidate.source,
+                renamed: false,
+            };
+        }
+
+        let base = candidate.text;
+        if !self.used.contains(&base) && !is_lua_keyword(&base) {
+            self.used.insert(base.clone());
+            return NameInfo {
+                text: base,
+                source: candidate.source,
+                renamed: false,
+            };
+        }
+
+        let suffix = self.next_suffix_by_base.entry(base.clone()).or_insert(2);
+        loop {
+            let renamed = format!("{base}{suffix}");
+            *suffix = suffix.saturating_add(1);
+            if !self.used.contains(&renamed) && !is_lua_keyword(&renamed) {
+                self.used.insert(renamed.clone());
+                return NameInfo {
+                    text: renamed,
+                    source: candidate.source,
+                    renamed: true,
+                };
+            }
+        }
+    }
+}
+
 /// 为单个函数分配最终名字。
 pub(super) fn assign_names_for_function(
     context: FunctionAssignContext<'_>,
@@ -90,7 +146,7 @@ pub(super) fn assign_names_for_function(
         assigned_functions,
         module_names,
     } = context;
-    let mut used = lua_keywords();
+    let mut names = FunctionNameAllocator::new(lua_keywords());
     let outer_visible_names = resolve_outer_visible_names(proto.id, lexical, assigned_functions)?;
     let upvalue_candidates = proto
         .upvalues
@@ -107,7 +163,7 @@ pub(super) fn assign_names_for_function(
     // 自由变量改成一个父作用域里根本不存在的名字，直接破坏运行语义。
     for candidate in &upvalue_candidates {
         if candidate.source == NameSource::CaptureProvenance {
-            used.insert(candidate.text.clone());
+            names.used.insert(candidate.text.clone());
         }
     }
 
@@ -119,12 +175,12 @@ pub(super) fn assign_names_for_function(
             allocate_param_name(
                 module_names.reserve_function_shape_name(
                     choose_param_candidate(proto, *param, index, evidence, hints, options),
-                    &used,
+                    &names.used,
                     options.mode,
                 ),
                 index,
                 options,
-                &mut used,
+                &mut names,
                 &outer_visible_names,
             )
         })
@@ -135,22 +191,18 @@ pub(super) fn assign_names_for_function(
         .iter()
         .enumerate()
         .map(|(index, local)| {
-            allocate_name(
-                module_names.reserve_function_shape_name(
-                    choose_local_candidate(
-                        proto, *local, index, evidence, hints, ast_facts, options,
-                    ),
-                    &used,
-                    options.mode,
-                ),
-                &mut used,
-            )
+            names.allocate(module_names.reserve_function_shape_name(
+                choose_local_candidate(proto, *local, index, evidence, hints, ast_facts, options),
+                &names.used,
+                options.mode,
+            ))
         })
         .collect::<Vec<_>>();
 
     let mut upvalues = Vec::with_capacity(proto.upvalues.len());
     for candidate in upvalue_candidates {
-        let candidate = module_names.reserve_function_shape_name(candidate, &used, options.mode);
+        let candidate =
+            module_names.reserve_function_shape_name(candidate, &names.used, options.mode);
         if candidate.source == NameSource::CaptureProvenance {
             upvalues.push(NameInfo {
                 text: candidate.text,
@@ -160,7 +212,7 @@ pub(super) fn assign_names_for_function(
             continue;
         }
 
-        upvalues.push(allocate_name(candidate, &mut used));
+        upvalues.push(names.allocate(candidate));
     }
 
     let synthetic_locals = hints
@@ -169,22 +221,19 @@ pub(super) fn assign_names_for_function(
         .copied()
         .enumerate()
         .map(|(synthetic_order, local)| {
-            let info = allocate_name(
-                module_names.reserve_function_shape_name(
-                    choose_synthetic_local_candidate(
-                        proto,
-                        local,
-                        synthetic_order,
-                        evidence,
-                        hints,
-                        ast_facts,
-                        options,
-                    ),
-                    &used,
-                    options.mode,
+            let info = names.allocate(module_names.reserve_function_shape_name(
+                choose_synthetic_local_candidate(
+                    proto,
+                    local,
+                    synthetic_order,
+                    evidence,
+                    hints,
+                    ast_facts,
+                    options,
                 ),
-                &mut used,
-            );
+                &names.used,
+                options.mode,
+            ));
             (local, info)
         })
         .collect();
@@ -201,24 +250,21 @@ fn allocate_param_name(
     candidate: CandidateHint,
     index: usize,
     options: NamingOptions,
-    used: &mut BTreeSet<String>,
+    names: &mut FunctionNameAllocator,
     outer_visible_names: &BTreeSet<String>,
 ) -> NameInfo {
     if options.mode == NamingMode::DebugLike || candidate.source != NameSource::Simple {
-        return allocate_name(candidate, used);
+        return names.allocate(candidate);
     }
     if !outer_visible_names.contains(&candidate.text) {
-        return allocate_name(candidate, used);
+        return names.allocate(candidate);
     }
 
-    let replacement = next_available_simple_param_name(index, used, outer_visible_names);
-    allocate_name(
-        CandidateHint {
-            text: replacement,
-            source: candidate.source,
-        },
-        used,
-    )
+    let replacement = next_available_simple_param_name(index, &names.used, outer_visible_names);
+    names.allocate(CandidateHint {
+        text: replacement,
+        source: candidate.source,
+    })
 }
 
 fn next_available_simple_param_name(
@@ -235,47 +281,5 @@ fn next_available_simple_param_name(
             return candidate;
         }
         index = index.saturating_add(1);
-    }
-}
-
-fn allocate_name(candidate: CandidateHint, used: &mut BTreeSet<String>) -> NameInfo {
-    if candidate.source == NameSource::LegacyArg {
-        used.insert(candidate.text.clone());
-        return NameInfo {
-            text: candidate.text,
-            source: candidate.source,
-            renamed: false,
-        };
-    }
-    if candidate.source == NameSource::Discard {
-        return NameInfo {
-            text: candidate.text,
-            source: candidate.source,
-            renamed: false,
-        };
-    }
-
-    let base = candidate.text;
-    if !used.contains(&base) && !is_lua_keyword(&base) {
-        used.insert(base.clone());
-        return NameInfo {
-            text: base,
-            source: candidate.source,
-            renamed: false,
-        };
-    }
-
-    let mut suffix = 2usize;
-    loop {
-        let renamed = format!("{base}{suffix}");
-        if !used.contains(&renamed) && !is_lua_keyword(&renamed) {
-            used.insert(renamed.clone());
-            return NameInfo {
-                text: renamed,
-                source: candidate.source,
-                renamed: true,
-            };
-        }
-        suffix = suffix.saturating_add(1);
     }
 }

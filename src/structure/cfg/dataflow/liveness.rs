@@ -63,46 +63,44 @@ pub(super) fn solve_liveness(
     let mut open_live_in = vec![false; cfg.blocks.len()];
     let mut open_live_out = vec![false; cfg.blocks.len()];
 
-    let reverse_rpo = graph_facts.rpo.iter().rev().copied().collect::<Vec<_>>();
-    let mut changed = true;
-    while changed {
-        changed = false;
+    let mut worklist = graph_facts
+        .rpo
+        .iter()
+        .rev()
+        .copied()
+        .collect::<VecDeque<_>>();
+    let mut queued = vec![false; cfg.blocks.len()];
+    for block in &worklist {
+        queued[block.index()] = true;
+    }
 
-        for block in &reverse_rpo {
-            let block = *block;
-            let mut new_live_out = DenseRegSet::new(reg_count);
-            let mut new_open_live_out = false;
+    while let Some(block) = worklist.pop_front() {
+        queued[block.index()] = false;
+        let mut new_live_out = DenseRegSet::new(reg_count);
+        let mut new_open_live_out = false;
 
-            for edge_ref in &cfg.succs[block.index()] {
-                let succ = cfg.edges[edge_ref.index()].to;
-                if !cfg.reachable_blocks.contains(&succ) {
-                    continue;
-                }
-                new_live_out.extend_from(&live_in[succ.index()]);
-                new_open_live_out |= open_live_in[succ.index()];
+        for edge_ref in &cfg.succs[block.index()] {
+            let succ = cfg.edges[edge_ref.index()].to;
+            if !cfg.reachable_blocks.contains(&succ) {
+                continue;
             }
+            new_live_out.extend_from(&live_in[succ.index()]);
+            new_open_live_out |= open_live_in[succ.index()];
+        }
 
-            let mut new_live_in = block_uses[block.index()].clone();
-            new_live_in.extend_without(&new_live_out, &block_defs[block.index()]);
-            let new_open_live_in = block_open_use[block.index()]
-                || (new_open_live_out && !block_open_def[block.index()]);
+        let mut new_live_in = block_uses[block.index()].clone();
+        new_live_in.extend_without(&new_live_out, &block_defs[block.index()]);
+        let new_open_live_in =
+            block_open_use[block.index()] || (new_open_live_out && !block_open_def[block.index()]);
+        let entry_changed = live_in[block.index()] != new_live_in
+            || open_live_in[block.index()] != new_open_live_in;
 
-            if live_out[block.index()] != new_live_out {
-                live_out[block.index()] = new_live_out;
-                changed = true;
-            }
-            if live_in[block.index()] != new_live_in {
-                live_in[block.index()] = new_live_in;
-                changed = true;
-            }
-            if open_live_out[block.index()] != new_open_live_out {
-                open_live_out[block.index()] = new_open_live_out;
-                changed = true;
-            }
-            if open_live_in[block.index()] != new_open_live_in {
-                open_live_in[block.index()] = new_open_live_in;
-                changed = true;
-            }
+        live_out[block.index()] = new_live_out;
+        live_in[block.index()] = new_live_in;
+        open_live_out[block.index()] = new_open_live_out;
+        open_live_in[block.index()] = new_open_live_in;
+        if entry_changed {
+            enqueue_reachable_predecessors(cfg, block, &mut worklist, &mut queued);
         }
     }
 

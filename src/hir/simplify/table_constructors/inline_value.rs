@@ -18,7 +18,7 @@ pub(super) struct InlineContext<'a> {
     producer_index_by_binding: &'a [Option<usize>],
     consumed_bindings: &'a mut [bool],
     consumed_groups: &'a mut [bool],
-    remaining_uses: &'a BindingUseSummary,
+    remaining_uses: BindingUseSummary<'a>,
 }
 
 impl<'a> InlineContext<'a> {
@@ -29,7 +29,7 @@ impl<'a> InlineContext<'a> {
         producer_index_by_binding: &'a [Option<usize>],
         consumed_bindings: &'a mut [bool],
         consumed_groups: &'a mut [bool],
-        remaining_uses: &'a BindingUseSummary,
+        remaining_uses: BindingUseSummary<'a>,
     ) -> Self {
         Self {
             block,

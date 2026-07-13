@@ -76,12 +76,10 @@ fn try_collapse_pure_binding_handoffs(
         return false;
     };
 
-    // 如果被折叠的 temp 在外层作用域中仍被引用，不能消除。
-    if seed
-        .rewrites
-        .iter()
-        .any(|rewrite| outer_temps.contains(&rewrite.from))
-    {
+    // 外层仍引用或 seed 前已有路径触碰的 temp 都不是当前 handoff 新建的身份。
+    if seed.rewrites.iter().any(|rewrite| {
+        outer_temps.contains(&rewrite.from) || temp_touches.touches_before(index, rewrite.from)
+    }) {
         return false;
     }
     if label_jumps.next_label_has_prior_goto(&block.stmts, index) {
@@ -205,8 +203,8 @@ fn try_collapse_pure_local_handoff(
         return false;
     };
 
-    // 如果被折叠的 temp 在外层作用域中仍被引用，不能消除。
-    if outer_temps.contains(&temp) {
+    // 外层仍引用或 seed 前已有路径触碰的 temp 都不是当前 handoff 新建的身份。
+    if outer_temps.contains(&temp) || temp_touches.touches_before(index, temp) {
         return false;
     }
     if label_jumps.next_label_has_prior_goto(&block.stmts, index) {
@@ -241,8 +239,8 @@ fn try_collapse_single_binding_handoff(
         return false;
     };
 
-    // 如果被折叠的 temp 在外层作用域中仍被引用，不能消除。
-    if outer_temps.contains(&temp) {
+    // 外层仍引用或 seed 前已有路径触碰的 temp 都不是当前 handoff 新建的身份。
+    if outer_temps.contains(&temp) || temp_touches.touches_before(index, temp) {
         return false;
     }
     if label_jumps.next_label_has_prior_goto(&block.stmts, index) {

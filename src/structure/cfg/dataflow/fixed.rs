@@ -1,3 +1,9 @@
+//! 固定寄存器与 open value 的 reaching-def 求解和指令级事实物化。
+//!
+//! 它消费 CFG predecessor、指令 effect 与预分配 def，只在 block out 变化时唤醒
+//! reachable successor；不会解释 phi、liveness 或源码结构。循环回边通过 worklist
+//! 继续传播，直到所有 block 的入口和出口状态稳定。
+
 use super::*;
 
 pub(super) fn solve_reaching_defs(
@@ -7,48 +13,50 @@ pub(super) fn solve_reaching_defs(
     lookups: &DefLookupTables,
     block_state: &mut BlockReachingState,
 ) {
-    let mut changed = true;
-    while changed {
-        changed = false;
+    let mut worklist = graph_facts.rpo.iter().copied().collect::<VecDeque<_>>();
+    let mut queued = vec![false; cfg.blocks.len()];
+    for block in &worklist {
+        queued[block.index()] = true;
+    }
 
-        for block in &graph_facts.rpo {
-            let block = *block;
-            let (new_in, new_open_in) =
-                merge_predecessor_state(cfg, block, &block_state.fixed_out, &block_state.open_out);
+    while let Some(block) = worklist.pop_front() {
+        queued[block.index()] = false;
+        let (new_in, new_open_in) =
+            merge_predecessor_state(cfg, block, &block_state.fixed_out, &block_state.open_out);
 
-            if block_state.fixed_in[block.index()] != new_in {
-                block_state.fixed_in[block.index()] = new_in.clone();
-                changed = true;
-            }
-            if block_state.open_in[block.index()] != new_open_in {
-                block_state.open_in[block.index()] = new_open_in.clone();
-                changed = true;
-            }
+        if block_state.fixed_in[block.index()] != new_in {
+            block_state.fixed_in[block.index()] = new_in.clone();
+        }
+        if block_state.open_in[block.index()] != new_open_in {
+            block_state.open_in[block.index()] = new_open_in.clone();
+        }
 
-            let mut current_fixed = new_in;
-            let mut current_open = new_open_in;
+        let mut current_fixed = new_in;
+        let mut current_open = new_open_in;
 
-            if let Some(instr_indices) = super::instr_indices(cfg, block) {
-                for instr_index in instr_indices {
-                    apply_transfer(
-                        &instr_effects[instr_index],
-                        &lookups.fixed[instr_index],
-                        lookups.open_must[instr_index],
-                        lookups.open_may[instr_index],
-                        &mut current_fixed,
-                        &mut current_open,
-                    );
-                }
+        if let Some(instr_indices) = super::instr_indices(cfg, block) {
+            for instr_index in instr_indices {
+                apply_transfer(
+                    &instr_effects[instr_index],
+                    &lookups.fixed[instr_index],
+                    lookups.open_must[instr_index],
+                    lookups.open_may[instr_index],
+                    &mut current_fixed,
+                    &mut current_open,
+                );
             }
+        }
 
-            if block_state.fixed_out[block.index()] != current_fixed {
-                block_state.fixed_out[block.index()] = current_fixed;
-                changed = true;
-            }
-            if block_state.open_out[block.index()] != current_open {
-                block_state.open_out[block.index()] = current_open;
-                changed = true;
-            }
+        let fixed_changed = block_state.fixed_out[block.index()] != current_fixed;
+        let open_changed = block_state.open_out[block.index()] != current_open;
+        if fixed_changed {
+            block_state.fixed_out[block.index()] = current_fixed;
+        }
+        if open_changed {
+            block_state.open_out[block.index()] = current_open;
+        }
+        if fixed_changed || open_changed {
+            enqueue_reachable_successors(cfg, block, &mut worklist, &mut queued);
         }
     }
 }
