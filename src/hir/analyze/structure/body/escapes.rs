@@ -3,7 +3,8 @@
 //! region walker 遇到当前 active loop 的 continue target、post-loop、break pad 或跨层
 //! escape edge 时，需要把这些 CFG 边翻成 `continue` / `break` / `goto`，并在必要时
 //! 快照 loop state。本文件只消费已经构建好的 `ActiveLoopContext`、entry override 与
-//! dataflow live-in 信息；它不重新判断 loop/branch 候选，也不替 StructureFacts 补事实。
+//! dataflow live-in 信息；共享 continue pad 也只接受 Structure 已认领的 edge target，
+//! 不重新判断 loop/branch 候选或替 StructureFacts 补事实。
 //!
 //! 输入形状：loop body 内一条边跳到外层 block。
 //! 输出形状：必要的 state assignment 加目标 label `goto`。
@@ -18,6 +19,15 @@ impl StructuredBodyLowerer<'_, '_> {
             return self
                 .can_emit_continue_stmt()
                 .then(|| vec![HirStmt::Continue]);
+        }
+        let owned_continue_entry = self
+            .loop_candidate(loop_context.candidate_id)?
+            .continue_edges
+            .iter()
+            .any(|edge| self.lowering.cfg.edges[edge.index()].to == block);
+        if owned_continue_entry && self.can_emit_continue_stmt() {
+            self.visited.insert(block);
+            return Some(vec![HirStmt::Continue]);
         }
         if block == loop_context.post_loop || Some(block) == loop_context.downstream_post_loop {
             return Some(vec![HirStmt::Break]);

@@ -752,7 +752,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         Some(Some(plan.then_entry))
     }
 
-    pub(super) fn lower_terminal_exit_block_clone(
+    pub(in crate::hir::analyze::structure) fn lower_terminal_exit_block_clone(
         &self,
         block: BlockRef,
         target_overrides: &BTreeMap<TempId, HirLValue>,

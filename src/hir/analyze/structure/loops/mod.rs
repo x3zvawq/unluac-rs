@@ -50,7 +50,7 @@ fn unique_loop_preheader(candidate: &LoopCandidate) -> Option<BlockRef> {
     candidate.preheader
 }
 
-pub(super) fn loop_body_blocks(candidate: &LoopCandidate) -> &BTreeSet<BlockRef> {
+fn loop_body_blocks(candidate: &LoopCandidate) -> &BTreeSet<BlockRef> {
     if matches!(
         candidate.kind_hint,
         LoopKindHint::NumericForLike | LoopKindHint::GenericForLike

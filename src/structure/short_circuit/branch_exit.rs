@@ -62,6 +62,41 @@ pub(super) fn analyze_linear_branch_exit_candidates(
     branch_by_header: &BTreeMap<BlockRef, &BranchCandidate>,
     branch_candidates: &[BranchCandidate],
 ) -> Vec<ShortCircuitCandidate> {
+    analyze_linear_branch_exit_candidates_with(
+        proto,
+        cfg,
+        branch_by_header,
+        branch_candidates,
+        |candidate, visited| {
+            next_chain_header(branch_by_header, candidate, visited).map(|next| next.header)
+        },
+    )
+}
+
+pub(super) fn analyze_cfg_linear_branch_exit_candidates(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    branch_by_header: &BTreeMap<BlockRef, &BranchCandidate>,
+    branch_candidates: &[BranchCandidate],
+) -> Vec<ShortCircuitCandidate> {
+    analyze_linear_branch_exit_candidates_with(
+        proto,
+        cfg,
+        branch_by_header,
+        branch_candidates,
+        |candidate, visited| {
+            next_cfg_chain_header(proto, cfg, branch_by_header, candidate.header, visited)
+        },
+    )
+}
+
+fn analyze_linear_branch_exit_candidates_with<'a>(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    branch_by_header: &BTreeMap<BlockRef, &'a BranchCandidate>,
+    branch_candidates: &'a [BranchCandidate],
+    mut next_header: impl FnMut(&'a BranchCandidate, &BTreeSet<BlockRef>) -> Option<BlockRef>,
+) -> Vec<ShortCircuitCandidate> {
     let mut candidates = Vec::new();
     for candidate in branch_candidates {
         if candidate.kind != BranchKind::IfThen {
@@ -80,7 +115,9 @@ pub(super) fn analyze_linear_branch_exit_candidates(
             }
             headers.push(current.header);
 
-            let Some(next) = next_chain_header(branch_by_header, current, &visited) else {
+            let Some(next) = next_header(current, &visited)
+                .and_then(|header| branch_by_header.get(&header).copied())
+            else {
                 break;
             };
             current = next;

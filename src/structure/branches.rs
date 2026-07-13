@@ -43,6 +43,17 @@ pub(super) fn analyze_branches(
             )
             .or_else(|| classify_one_arm_branch(&mut reachability, header, then_entry, else_entry))
             .or_else(|| {
+                classify_loop_exit_bounded_one_arm_branch(
+                    cfg,
+                    graph_facts,
+                    loop_candidates,
+                    &mut reachability,
+                    header,
+                    then_entry,
+                    else_entry,
+                )
+            })
+            .or_else(|| {
                 classify_if_else_branch(
                     cfg,
                     graph_facts,
@@ -297,6 +308,44 @@ fn classify_infinite_loop_bounded_branch(
         }
         _ => None,
     }
+}
+
+fn classify_loop_exit_bounded_one_arm_branch(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    loop_candidates: &[LoopCandidate],
+    reachability: &mut ReachabilityCache<'_>,
+    header: BlockRef,
+    then_entry: BlockRef,
+    else_entry: BlockRef,
+) -> Option<BranchCandidate> {
+    let strict_merge = graph_facts.nearest_common_postdom(then_entry, else_entry)?;
+    // 局部 break 会把严格后支配点推到外层 loop exit；但若一臂进入单跳回边 pad，
+    // 它表达的是下一轮 continue，不能借整轮回边伪装成对另一臂的局部可达。
+    let enters_continue_pad = loop_candidates.iter().any(|candidate| {
+        candidate.blocks.contains(&header)
+            && [then_entry, else_entry].into_iter().any(|entry| {
+                cfg.succs[entry.index()].len() == 1
+                    && candidate
+                        .backedges
+                        .iter()
+                        .any(|edge| cfg.edges[edge.index()].from == entry)
+            })
+    });
+    if enters_continue_pad {
+        return None;
+    }
+    loop_candidates
+        .iter()
+        .any(|candidate| {
+            candidate.blocks.contains(&header)
+                && candidate.blocks.contains(&then_entry)
+                && candidate.blocks.contains(&else_entry)
+                && candidate.exits.contains(&strict_merge)
+        })
+        .then(|| {
+            classify_loop_bounded_one_arm_branch(reachability, header, then_entry, else_entry)
+        })?
 }
 
 fn classify_loop_bounded_one_arm_branch(

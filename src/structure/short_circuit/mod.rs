@@ -85,3 +85,20 @@ pub(super) fn analyze_short_circuits(
     });
     candidates
 }
+
+pub(super) fn analyze_cfg_linear_branch_exits(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    branch_candidates: &[BranchCandidate],
+) -> Vec<ShortCircuitCandidate> {
+    let branch_by_header = branch_candidates
+        .iter()
+        .map(|candidate| (candidate.header, candidate))
+        .collect::<BTreeMap<BlockRef, _>>();
+    branch_exit::analyze_cfg_linear_branch_exit_candidates(
+        proto,
+        cfg,
+        &branch_by_header,
+        branch_candidates,
+    )
+}

@@ -467,8 +467,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .iter()
             .filter(|short| {
                 short.reducible
-                    && short.header != candidate.header
                     && short.blocks.contains(&continue_block)
+                    && match candidate.condition_header {
+                        Some(condition_header) => short.header == condition_header,
+                        None => short.header != candidate.header,
+                    }
             })
             .filter_map(|short| build_branch_short_circuit_plan(self.lowering, short.header))
             .find(|plan| {
@@ -727,7 +730,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         let body_entry = self.lowering.cfg.instr_to_block[loop_instr.body_target.index()];
-        if !candidate.blocks.contains(&body_entry) {
+        let immediate_break = body_entry == exit;
+        if !immediate_break && !candidate.blocks.contains(&body_entry) {
             return None;
         }
         let bindings = self
@@ -770,7 +774,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.active_loops.push(loop_context.clone());
         // Luau 会把空循环体或只含 `continue` 的 generic-for 直接编译成 header
         // 自回边。此时没有独立 body block 可降级，但循环本身仍是完整的结构候选。
-        let body = if body_entry == header {
+        let body = if immediate_break {
+            // body/exit 同目标编码的是首轮立即 break；不能降成空 body，否则会继续遍历。
+            HirBlock {
+                stmts: vec![HirStmt::Break],
+            }
+        } else if body_entry == header {
             HirBlock { stmts: Vec::new() }
         } else {
             self.lower_region(body_entry, Some(header), &combined_target_overrides)?

@@ -95,20 +95,22 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     ) -> Option<HirExpr> {
         let raw_target_overrides = BTreeMap::new();
 
+        // 外层 branch/loop 已明确接管的 target 是当前 HIR 状态槽位的事实源；先用它
+        // 归一多入口 incoming，只有尚未建立所有权时才回退到原始 SSA 表达式。
         uniform_mapped_value(incomings, |incoming| match incoming.pred {
             Some(pred) => self
                 .loop_incoming_expr_without_carried_override(
                     pred,
                     reg,
                     incoming.defs.iter().copied(),
-                    &raw_target_overrides,
+                    target_overrides,
                 )
                 .or_else(|| {
                     self.loop_incoming_expr_without_carried_override(
                         pred,
                         reg,
                         incoming.defs.iter().copied(),
-                        target_overrides,
+                        &raw_target_overrides,
                     )
                 })
                 .or_else(|| {
@@ -137,14 +139,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     pred,
                     reg,
                     incoming.defs.iter().copied(),
-                    &raw_target_overrides,
+                    target_overrides,
                 )
                 .or_else(|| {
                     self.loop_incoming_lvalue_without_carried_override(
                         pred,
                         reg,
                         incoming.defs.iter().copied(),
-                        target_overrides,
+                        &raw_target_overrides,
                     )
                 })
                 .or_else(|| {
@@ -322,9 +324,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return target;
         }
 
-        if candidate.preheader.is_none()
-            && let Some(target) =
-                self.multi_entry_loop_entry_lvalue(candidate, reg, target_overrides)
+        let has_normalized_terminal_exit = candidate
+            .control_blocks
+            .iter()
+            .any(|block| block_is_terminal_exit(self.lowering, *block));
+        if (candidate.preheader.is_none() || has_normalized_terminal_exit)
+            && let Some(target) = self.loop_entry_lvalue(candidate, reg, target_overrides)
         {
             return target;
         }
@@ -341,14 +346,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return target;
         }
 
-        if let Some(target) = self
-            .active_loops
-            .iter()
-            .rev()
-            .flat_map(|context| context.state_slots.iter())
-            .find(|state| state.reg == reg)
-            .map(|state| state.target.clone())
-        {
+        if let Some(target) = self.active_loop_state_target(reg) {
             return target;
         }
 
@@ -368,7 +366,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         HirLValue::Temp(temp)
     }
 
-    fn multi_entry_loop_entry_lvalue(
+    pub(super) fn active_loop_state_target(&self, reg: Reg) -> Option<HirLValue> {
+        self.active_loops
+            .iter()
+            .rev()
+            .flat_map(|context| context.state_slots.iter())
+            .find(|state| state.reg == reg)
+            .map(|state| state.target.clone())
+    }
+
+    fn loop_entry_lvalue(
         &self,
         candidate: &LoopCandidate,
         reg: Reg,

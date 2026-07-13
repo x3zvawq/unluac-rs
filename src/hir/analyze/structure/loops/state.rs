@@ -69,19 +69,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             let temp = *self.lowering.bindings.phi_temps.get(value.phi_id.index())?;
             let target = self.loop_state_target(candidate, exit, value.reg, temp, target_overrides);
             plan.backedge_target_overrides.insert(temp, target.clone());
-            // phi_use_count == 0 表示循环体内没有指令直接读取 phi 的 SSA 值——如果该
-            // 寄存器同样不出现在 exit phi 中，说明它只是被借用来做临时运算（如内层
-            // for-loop 控制变量），可以跳过 inside_arm 重定向，让体内定义保留为独立
-            // temp 供 inline pass 折叠。但如果 exit phi 引用了该寄存器，则循环体
-            // 内的写入仍需路由到 state target，否则出口处拿不到正确的值。
-            if self.lowering.dataflow.phi_use_count(value.phi_id) > 0
-                || Self::exit_value_for_reg(candidate, exit, value.reg).is_some()
-            {
-                for def in value.inside_arm.defs() {
-                    let def_temp = *self.lowering.bindings.fixed_temps.get(def.index())?;
-                    plan.backedge_target_overrides
-                        .insert(def_temp, target.clone());
-                }
+            // phi 也可能只被内层 loop 的另一个 phi 间接消费，use_count 因而为零；
+            // state 一旦建立，所有回边定义都必须写回同一槽位。
+            for def in value.inside_arm.defs() {
+                let def_temp = *self.lowering.bindings.fixed_temps.get(def.index())?;
+                plan.backedge_target_overrides
+                    .insert(def_temp, target.clone());
             }
 
             plan.states.push(LoopStateSlot {
@@ -202,6 +195,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             let Some(temp) = self.live_out_state_temp(&values) else {
                 continue;
             };
+            let inherited_target = self.active_loop_state_target(*reg);
             let mut init = preheader
                 .map(|preheader| expr_for_reg_at_block_exit(self.lowering, preheader, *reg))
                 .or_else(|| {
@@ -209,12 +203,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                         .find(|value| value.reg == *reg)
                         .and_then(|value| self.multi_entry_loop_entry_expr(value, target_overrides))
                 })
+                .or_else(|| inherited_target.as_ref().and_then(lvalue_as_expr))
                 .unwrap_or_else(|| self.loop_entry_initial_expr(*reg));
             rewrite_expr_temps(&mut init, &temp_expr_overrides(target_overrides));
             let target = target_overrides
                 .get(&temp)
                 .filter(|target| lvalue_as_expr(target).is_some())
                 .cloned()
+                .or(inherited_target)
                 .unwrap_or(HirLValue::Temp(temp));
 
             for value in values {
@@ -294,6 +290,29 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             &state_by_reg,
             target_overrides,
         );
+        // 同一 loop state 可能在主 post-loop 之后再次与另一条 body exit 合流；
+        // 主出口仍携带当前 state，应和 loop blocks 一起作为该 merge 的内部来源。
+        for other_exit in candidate
+            .exits
+            .iter()
+            .copied()
+            .filter(|other| *other != exit)
+        {
+            let mut shared_exit_blocks = candidate.blocks.clone();
+            shared_exit_blocks.insert(exit);
+            if let Some(region) = self.branch_regions_by_header.get(&exit)
+                && region.merge == other_exit
+            {
+                shared_exit_blocks.extend(region.structured_blocks.iter().copied());
+            }
+            self.apply_exit_phi_bindings(
+                candidate,
+                other_exit,
+                &shared_exit_blocks,
+                &state_by_reg,
+                target_overrides,
+            );
+        }
 
         // branch_exit 本身可能只是一条 "cond 不成立 → JMP 到真正 post-loop" 的
         // 线性 pad（典型触发：lua5.4 下 `while cond do ... goto L end` 让

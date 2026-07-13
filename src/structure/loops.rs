@@ -12,6 +12,10 @@
 //! - `while ... do ... end` 的 header/exit phi 会被整理成 `inside/outside` 两臂的
 //!   incoming facts，后续 HIR 直接消费这些结构事实，不再自己回头拆 `phi.incoming`
 //! - 普通 `while/repeat` 只保留形态 hint，不会伪造额外 binding 证据
+//! - branch 经共享 backedge pad 提前进入下一轮时，会在 branch 候选齐备后记录唯一
+//!   `continue_edges` owner，HIR 不再按 jump 形状猜测归属
+//! - repeat body 的首个条件可能让 natural-loop 暂时呈现为 while；若该 header 的局部
+//!   break pad 严格汇入独立尾条件出口，则由 Structure 恢复真正的 repeat 形态
 //! - `WhileLike` 的 header 前缀必须属于 branch 条件的数据依赖链，或是可丢弃的
 //!   无副作用残留；带副作用但不参与条件的语句应保守留给 repeat/unknown/goto 形态
 
@@ -21,7 +25,8 @@ use crate::structure::{BlockRef, Cfg, DataflowFacts, EdgeKind, EdgeRef, GraphFac
 use crate::transformer::{LowInstr, LoweredProto, Reg, ResultPack};
 
 use super::common::{
-    LoopCandidate, LoopExitValueMergeCandidate, LoopKindHint, LoopSourceBindings, LoopValueMerge,
+    BranchCandidate, LoopCandidate, LoopExitValueMergeCandidate, LoopKindHint, LoopSourceBindings,
+    LoopValueMerge, ShortCircuitCandidate, ShortCircuitExit, ShortCircuitTarget,
 };
 use super::helpers::{collect_forward_region_blocks, collect_region_exits, is_reducible_region};
 use super::phi_facts::loop_value_merges_in_block;
@@ -77,14 +82,21 @@ pub(super) fn analyze_loops(
         .iter()
         .map(|candidate| candidate.header)
         .collect::<BTreeSet<_>>();
+    let numeric_headers = loop_candidates
+        .iter()
+        .filter(|candidate| candidate.kind_hint == LoopKindHint::NumericForLike)
+        .map(|candidate| candidate.header)
+        .collect::<BTreeSet<_>>();
 
-    loop_candidates.extend(analyze_degenerate_generic_for_loops(
+    let degenerate_generic_for_loops = analyze_degenerate_generic_for_loops(
         proto,
         cfg,
         dataflow,
         graph_facts,
         &grouped_headers,
-    ));
+        &loop_candidates,
+    );
+    loop_candidates.extend(degenerate_generic_for_loops);
     loop_candidates.extend(
         cfg.reachable_blocks
             .iter()
@@ -95,25 +107,331 @@ pub(super) fn analyze_loops(
                     cfg,
                     dataflow,
                     graph_facts,
-                    &grouped_headers,
+                    &numeric_headers,
                     preheader,
                 )
             }),
     );
     loop_candidates.sort_by_key(|candidate| (candidate.header, candidate.blocks.len()));
-    refine_nested_repeat_candidates(proto, cfg, &mut loop_candidates);
+    refine_ambiguous_repeat_candidates(proto, cfg, &mut loop_candidates);
     assign_same_header_merge_ownership(&mut loop_candidates);
     loop_candidates
 }
 
-fn refine_nested_repeat_candidates(
+pub(super) fn assign_continue_edge_ownership(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    branches: &[BranchCandidate],
+    candidates: &mut [LoopCandidate],
+) {
+    let mut owners_by_entry = BTreeMap::<BlockRef, BTreeSet<usize>>::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        let Some(target) = candidate.continue_target else {
+            continue;
+        };
+        owners_by_entry.entry(target).or_default().insert(index);
+        for source in candidate
+            .backedges
+            .iter()
+            .map(|edge| cfg.edges[edge.index()].from)
+            .filter(|source| *source != target && jump_only_to(proto, cfg, *source, target))
+        {
+            owners_by_entry.entry(source).or_default().insert(index);
+        }
+    }
+
+    for branch in branches {
+        let Some((then_edge, else_edge)) = cfg.branch_edges(branch.header) else {
+            continue;
+        };
+        if cfg.edges[then_edge.index()].to == cfg.edges[else_edge.index()].to {
+            continue;
+        }
+        for edge_ref in [then_edge, else_edge] {
+            let edge = cfg.edges[edge_ref.index()];
+            let Some(owners) = owners_by_entry.get(&edge.to) else {
+                continue;
+            };
+            let eligible = || {
+                owners.iter().copied().filter(|index| {
+                    let candidate = &candidates[*index];
+                    // repeat 的 backedge pad 还承载条件求值，不能仅凭 jump 形状认作 continue。
+                    candidate.kind_hint != LoopKindHint::RepeatLike
+                        && candidate.continue_target != Some(branch.header)
+                        && candidate.blocks.contains(&branch.header)
+                        && !candidate.backedges.contains(&edge_ref)
+                })
+            };
+            let Some(owner) = eligible().min_by_key(|index| {
+                let candidate = &candidates[*index];
+                (candidate.binding_scope_blocks.len(), candidate.blocks.len())
+            }) else {
+                continue;
+            };
+            let owner_scope = (
+                candidates[owner].binding_scope_blocks.len(),
+                candidates[owner].blocks.len(),
+            );
+            if eligible().filter(|index| *index != owner).any(|index| {
+                let candidate = &candidates[index];
+                (candidate.binding_scope_blocks.len(), candidate.blocks.len()) == owner_scope
+            }) {
+                continue;
+            }
+            candidates[owner].continue_edges.insert(edge_ref);
+        }
+    }
+}
+
+fn jump_only_to(proto: &LoweredProto, cfg: &Cfg, block: BlockRef, target: BlockRef) -> bool {
+    cfg.blocks[block.index()].instrs.len == 1
+        && matches!(
+            cfg.terminator(&proto.instrs, block),
+            Some(LowInstr::Jump(jump))
+                if cfg.instr_to_block[jump.target.index()] == target
+        )
+}
+
+pub(super) fn refine_short_circuit_repeat_candidates(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    branches: &[BranchCandidate],
+    short_circuits: &mut Vec<ShortCircuitCandidate>,
+    supplements: &[ShortCircuitCandidate],
+    candidates: &mut [LoopCandidate],
+) {
+    let current_by_exit = short_circuits_by_exit(short_circuits);
+    let supplements_by_exit = short_circuits_by_exit(supplements);
+    let mut accepted_supplements = Vec::new();
+
+    for candidate in candidates {
+        if !matches!(
+            candidate.kind_hint,
+            LoopKindHint::Unknown | LoopKindHint::WhileLike | LoopKindHint::WhileTrueLike
+        ) || candidate.backedges.len() != 1
+        {
+            continue;
+        }
+        let backedge_source = cfg.edges[candidate.backedges[0].index()].from;
+        let jump_backedge = matches!(
+            cfg.terminator(&proto.instrs, backedge_source),
+            Some(LowInstr::Jump(jump))
+                if cfg.instr_to_block[jump.target.index()] == candidate.header
+        );
+
+        let matched = jump_backedge
+            .then(|| {
+                current_by_exit
+                    .get(&backedge_source)
+                    .into_iter()
+                    .flatten()
+                    .find_map(|short| {
+                        repeat_short_circuit_continue_target(
+                            cfg,
+                            graph_facts,
+                            short,
+                            candidate,
+                            backedge_source,
+                        )
+                        .map(|target| (target, None, None))
+                    })
+                    .or_else(|| {
+                        supplements_by_exit
+                            .get(&backedge_source)
+                            .into_iter()
+                            .flatten()
+                            .find_map(|short| {
+                                repeat_short_circuit_continue_target(
+                                    cfg,
+                                    graph_facts,
+                                    short,
+                                    candidate,
+                                    backedge_source,
+                                )
+                                .map(|target| (target, Some(short.header), Some((*short).clone())))
+                            })
+                    })
+            })
+            .flatten()
+            .or_else(|| {
+                direct_branch_repeat_continue_target(cfg, branches, candidate, backedge_source)
+                    .map(|target| (target, None, None))
+            });
+        let Some((continue_target, condition_header, supplement)) = matched else {
+            continue;
+        };
+        if let Some(supplement) = supplement {
+            accepted_supplements.push(supplement);
+        }
+
+        candidate.kind_hint = LoopKindHint::RepeatLike;
+        candidate.continue_target = Some(continue_target);
+        candidate.condition_header = condition_header;
+    }
+
+    short_circuits.extend(accepted_supplements);
+    let mut unique = std::mem::take(short_circuits)
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    unique.sort_by_key(|candidate| {
+        (
+            candidate.header,
+            candidate.blocks.len(),
+            candidate.nodes.len(),
+            candidate.result_reg.map(Reg::index),
+        )
+    });
+    *short_circuits = unique;
+}
+
+fn short_circuits_by_exit(
+    short_circuits: &[ShortCircuitCandidate],
+) -> BTreeMap<BlockRef, Vec<&ShortCircuitCandidate>> {
+    let mut by_exit = BTreeMap::<BlockRef, Vec<_>>::new();
+    for short in short_circuits {
+        if let ShortCircuitExit::BranchExit { truthy, falsy } = short.exit {
+            by_exit.entry(truthy).or_default().push(short);
+            by_exit.entry(falsy).or_default().push(short);
+        }
+    }
+    by_exit
+}
+
+fn repeat_short_circuit_continue_target(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    short: &ShortCircuitCandidate,
+    candidate: &LoopCandidate,
+    backedge_source: BlockRef,
+) -> Option<BlockRef> {
+    let ShortCircuitExit::BranchExit { truthy, falsy } = short.exit else {
+        return None;
+    };
+    let loop_exit = if truthy == backedge_source {
+        falsy
+    } else if falsy == backedge_source {
+        truthy
+    } else {
+        return None;
+    };
+    let header_exit_rejoins_tail =
+        while_header_exit_rejoins_repeat_exit(cfg, graph_facts, candidate, loop_exit);
+    if !short.reducible
+        || !candidate.blocks.contains(&short.header)
+        || (candidate.kind_hint == LoopKindHint::WhileLike && !header_exit_rejoins_tail)
+        || (short.nodes.len() == 1 && candidate.exits.len() != 1 && !header_exit_rejoins_tail)
+        || !short.blocks.is_subset(&candidate.blocks)
+        || !candidate.exits.contains(&loop_exit)
+    {
+        return None;
+    }
+
+    let mut final_nodes = short.nodes.iter().filter(|node| {
+        matches!(
+            node.truthy,
+            ShortCircuitTarget::TruthyExit | ShortCircuitTarget::FalsyExit
+        ) && matches!(
+            node.falsy,
+            ShortCircuitTarget::TruthyExit | ShortCircuitTarget::FalsyExit
+        )
+    });
+    let final_node = final_nodes.next()?;
+    final_nodes.next().is_none().then_some(final_node.header)
+}
+
+fn while_header_exit_rejoins_repeat_exit(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    candidate: &LoopCandidate,
+    repeat_exit: BlockRef,
+) -> bool {
+    if candidate.kind_hint != LoopKindHint::WhileLike {
+        return false;
+    }
+    let Some((then_edge, else_edge)) = cfg.branch_edges(candidate.header) else {
+        return false;
+    };
+    let mut header_exits = [then_edge, else_edge]
+        .into_iter()
+        .map(|edge| cfg.edges[edge.index()].to)
+        .filter(|target| !candidate.blocks.contains(target));
+    let Some(header_exit) = header_exits.next() else {
+        return false;
+    };
+
+    header_exits.next().is_none()
+        && header_exit != repeat_exit
+        && candidate.exits.contains(&header_exit)
+        && graph_facts.post_dominates(repeat_exit, header_exit)
+}
+
+fn direct_branch_repeat_continue_target(
+    cfg: &Cfg,
+    branches: &[BranchCandidate],
+    candidate: &LoopCandidate,
+    backedge_source: BlockRef,
+) -> Option<BlockRef> {
+    if candidate.kind_hint != LoopKindHint::WhileLike {
+        return None;
+    }
+    let (then_edge, else_edge) = cfg.branch_edges(backedge_source)?;
+    let (then_target, else_target) = (
+        cfg.edges[then_edge.index()].to,
+        cfg.edges[else_edge.index()].to,
+    );
+    let repeat_exit = match (
+        then_target == candidate.header,
+        else_target == candidate.header,
+    ) {
+        (true, false) => else_target,
+        (false, true) => then_target,
+        _ => return None,
+    };
+    if !candidate.exits.contains(&repeat_exit) {
+        return None;
+    }
+
+    let mut header_exits = cfg
+        .branch_edges(candidate.header)
+        .into_iter()
+        .flat_map(|(then_edge, else_edge)| [then_edge, else_edge])
+        .map(|edge| cfg.edges[edge.index()].to)
+        .filter(|target| !candidate.blocks.contains(target));
+    let header_exit = header_exits.next()?;
+    if header_exits.next().is_some()
+        || header_exit == repeat_exit
+        || !candidate.exits.contains(&header_exit)
+    {
+        return None;
+    }
+    // 标准 Lua 会让尾条件 exit 直接跳过 body 的 break pad；两条路径只在该 pad
+    // 已确认的 merge 重新汇合，因此这里消费 branch 候选关系，不按裸可达性猜测。
+    let merge = branches
+        .iter()
+        .find(|branch| branch.header == header_exit)?
+        .merge?;
+    if merge == cfg.exit_block
+        || candidate.blocks.contains(&merge)
+        || (repeat_exit != merge && cfg.unique_reachable_successor(repeat_exit) != Some(merge))
+    {
+        return None;
+    }
+
+    Some(backedge_source)
+}
+
+fn refine_ambiguous_repeat_candidates(
     proto: &LoweredProto,
     cfg: &Cfg,
     candidates: &mut [LoopCandidate],
 ) {
-    // `repeat ... until cond; break` 会让条件出口直接越过外层 for，CFG 上与
-    // “while true + terminal exit”相似；只有外层 for 的词法域和共享出口能证明
-    // 这个分支 pad 同时承担 repeat 条件，不能全局提高 repeat 启发式优先级。
+    // repeat body 若进入 nested loop，natural-loop core 会把该入口误看成 header exit；
+    // 只有独立尾条件与 header 分支读取同一主体时，才能排除“真实 while + 尾部 break”。
+    // repeat 后再 break 外层 for 时，条件出口又会像 while true 的 terminal exit。
+    // 两者都只能等候选齐全后用关系证据消歧，不能全局提高 repeat 启发式优先级。
     let for_owners = candidates
         .iter()
         .enumerate()
@@ -137,10 +455,24 @@ fn refine_nested_repeat_candidates(
                 owners
             },
         );
+    let mut loop_entries = BTreeMap::<BlockRef, Vec<usize>>::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        loop_entries
+            .entry(candidate.header)
+            .or_default()
+            .push(index);
+        if let Some(preheader) = candidate.preheader {
+            loop_entries.entry(preheader).or_default().push(index);
+        }
+    }
 
     for index in 0..candidates.len() {
         let candidate = &candidates[index];
-        if candidate.kind_hint != LoopKindHint::WhileTrueLike || candidate.backedges.len() != 1 {
+        if !matches!(
+            candidate.kind_hint,
+            LoopKindHint::WhileLike | LoopKindHint::WhileTrueLike
+        ) || candidate.backedges.len() != 1
+        {
             continue;
         }
         let source = cfg.edges[candidate.backedges[0].index()].from;
@@ -149,18 +481,59 @@ fn refine_nested_repeat_candidates(
         else {
             continue;
         };
-        let exits_enclosing_for = for_owners
-            .get(&candidate.header)
-            .into_iter()
-            .flatten()
-            .copied()
-            .filter(|owner| *owner != index)
-            .any(|owner| !candidate.exits.is_disjoint(&candidates[owner].exits));
-        if exits_enclosing_for {
+        let is_repeat = match candidate.kind_hint {
+            LoopKindHint::WhileLike => {
+                continue_target != candidate.header
+                    && branch_conditions_share_subject(
+                        proto,
+                        cfg,
+                        candidate.header,
+                        continue_target,
+                    )
+                    && cfg
+                        .branch_edges(candidate.header)
+                        .into_iter()
+                        .flat_map(|(then_edge, else_edge)| [then_edge, else_edge])
+                        .map(|edge| cfg.edges[edge.index()].to)
+                        .filter(|target| !candidate.blocks.contains(target))
+                        .flat_map(|target| loop_entries.get(&target).into_iter().flatten())
+                        .copied()
+                        .filter(|nested| *nested != index)
+                        .any(|nested| {
+                            candidates[nested]
+                                .blocks
+                                .is_subset(&candidate.binding_scope_blocks)
+                        })
+            }
+            LoopKindHint::WhileTrueLike => for_owners
+                .get(&candidate.header)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|owner| *owner != index)
+                .any(|owner| !candidate.exits.is_disjoint(&candidates[owner].exits)),
+            _ => false,
+        };
+        if is_repeat {
             candidates[index].kind_hint = LoopKindHint::RepeatLike;
             candidates[index].continue_target = Some(continue_target);
         }
     }
+}
+
+fn branch_conditions_share_subject(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    left: BlockRef,
+    right: BlockRef,
+) -> bool {
+    let (Some(LowInstr::Branch(left)), Some(LowInstr::Branch(right))) = (
+        cfg.terminator(&proto.instrs, left),
+        cfg.terminator(&proto.instrs, right),
+    ) else {
+        return false;
+    };
+    left.cond.predicate == right.cond.predicate && left.cond.operands == right.cond.operands
 }
 
 fn reachable_numeric_for_loop(
@@ -171,29 +544,16 @@ fn reachable_numeric_for_loop(
     natural_loops: &[&crate::structure::NaturalLoop],
     claimed_backedges: &mut BTreeSet<EdgeRef>,
 ) -> Option<LoopCandidate> {
-    let header = natural_loops.first()?.header;
+    let natural_header = natural_loops.first()?.header;
     let mut matches = natural_loops.iter().filter_map(|natural_loop| {
         let latch = cfg.edges[natural_loop.backedge.index()].from;
         let LowInstr::NumericForLoop(loop_instr) = cfg.terminator(&proto.instrs, latch)? else {
             return None;
         };
-        let mut preheaders = cfg
-            .reachable_predecessors(header)
-            .into_iter()
-            .filter(|preheader| {
-                matches!(
-                    cfg.terminator(&proto.instrs, *preheader),
-                    Some(LowInstr::NumericForInit(init))
-                        if numeric_for_instrs_match(proto, cfg, init, loop_instr)
-                )
-            });
-        let preheader = preheaders.next()?;
-        preheaders
-            .next()
-            .is_none()
-            .then_some((*natural_loop, preheader))
+        numeric_for_owner(proto, cfg, natural_header, loop_instr)
+            .map(|(header, preheader)| (*natural_loop, header, preheader))
     });
-    let (natural_loop, preheader) = matches.next()?;
+    let (natural_loop, header, preheader) = matches.next()?;
     if matches.next().is_some() {
         return None;
     }
@@ -201,6 +561,13 @@ fn reachable_numeric_for_loop(
         return None;
     };
     let exit = cfg.instr_to_block[init.exit_target.index()];
+    let latch = cfg.edges[natural_loop.backedge.index()].from;
+    let LowInstr::NumericForLoop(loop_instr) = cfg.terminator(&proto.instrs, latch)? else {
+        return None;
+    };
+    let latch_exit = cfg.instr_to_block[loop_instr.exit_target.index()];
+    let duplicated_terminal_exit = latch_exit != exit
+        && equivalent_single_return_targets(proto, cfg, loop_instr.exit_target, init.exit_target);
 
     let mut blocks = collect_forward_region_blocks(
         cfg,
@@ -208,6 +575,9 @@ fn reachable_numeric_for_loop(
         Some(exit),
         Some((header, &graph_facts.dominator_tree)),
     );
+    if duplicated_terminal_exit {
+        blocks.remove(&latch_exit);
+    }
     blocks.insert(cfg.edges[natural_loop.backedge.index()].from);
     if !natural_loops
         .iter()
@@ -226,21 +596,61 @@ fn reachable_numeric_for_loop(
         blocks,
         vec![natural_loop.backedge],
     );
+    if duplicated_terminal_exit {
+        candidate.exits.insert(exit);
+        candidate.control_blocks.insert(latch_exit);
+        candidate.exit_value_merges =
+            analyze_loop_exit_value_merges(dataflow, &candidate.exits, &candidate.blocks);
+    }
     if candidate.kind_hint != LoopKindHint::NumericForLike
         || candidate.preheader != Some(preheader)
         || !candidate.exits.contains(&exit)
     {
         return None;
     }
-    let latch = cfg.edges[natural_loop.backedge.index()].from;
-    if let Some(LowInstr::NumericForLoop(loop_instr)) = cfg.terminator(&proto.instrs, latch) {
-        let exit_pad = cfg.instr_to_block[loop_instr.exit_target.index()];
-        if exit_pad != exit {
-            candidate.control_blocks.insert(exit_pad);
-        }
+    if latch_exit != exit && !duplicated_terminal_exit {
+        candidate.control_blocks.insert(latch_exit);
     }
     claimed_backedges.insert(natural_loop.backedge);
     Some(candidate)
+}
+
+fn numeric_for_owner(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    natural_header: BlockRef,
+    loop_instr: &crate::transformer::NumericForLoopInstr,
+) -> Option<(BlockRef, BlockRef)> {
+    let mut body_entries = BTreeSet::from([natural_header]);
+    body_entries.extend(
+        cfg.reachable_predecessors(natural_header)
+            .into_iter()
+            .filter(|body| {
+                *body != natural_header
+                    && matches!(
+                        cfg.terminator(&proto.instrs, *body),
+                        Some(LowInstr::Jump(jump))
+                            if cfg.instr_to_block[jump.target.index()] == natural_header
+                    )
+            }),
+    );
+
+    let mut owners = body_entries.into_iter().flat_map(|header| {
+        cfg.reachable_predecessors(header)
+            .into_iter()
+            .filter_map(
+                move |preheader| match cfg.terminator(&proto.instrs, preheader) {
+                    Some(LowInstr::NumericForInit(init))
+                        if numeric_for_instrs_match(proto, cfg, init, loop_instr) =>
+                    {
+                        Some((header, preheader))
+                    }
+                    _ => None,
+                },
+            )
+    });
+    let owner = owners.next()?;
+    owners.next().is_none().then_some(owner)
 }
 
 fn numeric_for_instrs_match(
@@ -250,8 +660,14 @@ fn numeric_for_instrs_match(
     loop_instr: &crate::transformer::NumericForLoopInstr,
 ) -> bool {
     numeric_for_state_matches(init, loop_instr)
-        && loop_instr.body_target == init.body_target
-        && same_or_transparent_jump_target(proto, cfg, loop_instr.exit_target, init.exit_target)
+        && (loop_instr.body_target == init.body_target
+            || matches!(
+                cfg.terminator(&proto.instrs, cfg.instr_to_block[init.body_target.index()]),
+                Some(LowInstr::Jump(jump))
+                    if cfg.instr_to_block[jump.target.index()]
+                        == cfg.instr_to_block[loop_instr.body_target.index()]
+            ))
+        && same_or_equivalent_exit_target(proto, cfg, loop_instr.exit_target, init.exit_target)
 }
 
 fn numeric_for_state_matches(
@@ -320,6 +736,8 @@ fn build_loop_candidate(
         backedges,
         exits,
         continue_target,
+        continue_edges: BTreeSet::new(),
+        condition_header: None,
         kind_hint,
         source_bindings,
         header_value_merges,
@@ -332,7 +750,7 @@ fn degenerate_numeric_for_loop(
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     graph_facts: &GraphFacts,
-    grouped_headers: &BTreeSet<BlockRef>,
+    numeric_headers: &BTreeSet<BlockRef>,
     preheader: BlockRef,
 ) -> Option<LoopCandidate> {
     let Some(LowInstr::NumericForInit(init)) = cfg.terminator(&proto.instrs, preheader) else {
@@ -340,7 +758,7 @@ fn degenerate_numeric_for_loop(
     };
     let header = cfg.instr_to_block[init.body_target.index()];
     let exit = cfg.instr_to_block[init.exit_target.index()];
-    if grouped_headers.contains(&header) || header == exit {
+    if numeric_headers.contains(&header) || header == exit {
         return None;
     }
 
@@ -396,12 +814,24 @@ fn degenerate_numeric_for_loop(
         backedges: Vec::new(),
         exits: exits.clone(),
         continue_target: Some(latch),
+        continue_edges: BTreeSet::new(),
+        condition_header: None,
         kind_hint: LoopKindHint::NumericForLike,
         source_bindings: Some(LoopSourceBindings::Numeric(init.binding)),
         header_value_merges: analyze_loop_header_value_merges(dataflow, header, &blocks),
         exit_value_merges: analyze_loop_exit_value_merges(dataflow, &exits, &blocks),
         blocks,
     })
+}
+
+fn same_or_equivalent_exit_target(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    actual: crate::transformer::InstrRef,
+    expected: crate::transformer::InstrRef,
+) -> bool {
+    same_or_transparent_jump_target(proto, cfg, actual, expected)
+        || equivalent_single_return_targets(proto, cfg, actual, expected)
 }
 
 fn same_or_transparent_jump_target(
@@ -424,18 +854,42 @@ fn same_or_transparent_jump_target(
         )
 }
 
+fn equivalent_single_return_targets(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    actual: crate::transformer::InstrRef,
+    expected: crate::transformer::InstrRef,
+) -> bool {
+    let block = cfg.instr_to_block[actual.index()];
+    let range = cfg.blocks[block.index()].instrs;
+    let expected_block = cfg.instr_to_block[expected.index()];
+    cfg.blocks[expected_block.index()].instrs.len == 1
+        && range.len == 1
+        && matches!(
+            (
+                cfg.terminator(&proto.instrs, block),
+                cfg.terminator(&proto.instrs, expected_block),
+            ),
+            (Some(LowInstr::Return(actual)), Some(LowInstr::Return(expected)))
+                if actual == expected
+        )
+}
+
 fn analyze_degenerate_generic_for_loops(
     proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     graph_facts: &GraphFacts,
     grouped_headers: &BTreeSet<BlockRef>,
+    nested_loops: &[LoopCandidate],
 ) -> Vec<LoopCandidate> {
     cfg.reachable_blocks
         .iter()
         .copied()
         .filter(|header| !grouped_headers.contains(header))
-        .filter_map(|header| degenerate_generic_for_loop(proto, cfg, dataflow, graph_facts, header))
+        .filter_map(|header| {
+            degenerate_generic_for_loop(proto, cfg, dataflow, graph_facts, nested_loops, header)
+        })
         .collect()
 }
 
@@ -444,6 +898,7 @@ fn degenerate_generic_for_loop(
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     graph_facts: &GraphFacts,
+    nested_loops: &[LoopCandidate],
     header: BlockRef,
 ) -> Option<LoopCandidate> {
     let Some(LowInstr::GenericForLoop(instr)) = cfg.terminator(&proto.instrs, header) else {
@@ -451,10 +906,25 @@ fn degenerate_generic_for_loop(
     };
     let body = cfg.instr_to_block[instr.body_target.index()];
     let exit = cfg.instr_to_block[instr.exit_target.index()];
-    let blocks = BTreeSet::from([header, body]);
+    // Luau 会把 `for ... do break end` 编译成 body/exit 同目标；这不是“没有循环”，
+    // 而是 iterator 首次成功后立即退出，候选只需让 header 持有控制结构。
+    let immediate_break = body == exit;
+    let mut blocks = BTreeSet::from([header]);
+    if !immediate_break {
+        blocks.insert(body);
+    }
+    let mut owned_nested_loops = nested_loops
+        .iter()
+        .filter(|candidate| candidate.header == body && candidate.preheader == Some(header));
+    if let Some(nested) = owned_nested_loops.next() {
+        if owned_nested_loops.next().is_some() {
+            return None;
+        }
+        blocks.extend(nested.blocks.iter().copied());
+    }
     if body == header
         || exit == header
-        || blocks.contains(&exit)
+        || (!immediate_break && blocks.contains(&exit))
         || !generic_for_has_loop_body_and_exit(proto, cfg, header, instr, &blocks)
     {
         return None;
@@ -468,7 +938,11 @@ fn degenerate_generic_for_loop(
 
     let preheader = unique_loop_preheader(cfg, header, &blocks);
     let header_value_merges = analyze_loop_header_value_merges(dataflow, header, &blocks);
-    let exit_value_merges = analyze_loop_exit_value_merges(dataflow, &exits, &blocks);
+    // 退化 generic-for 没有自身回边：header -> exit 表示零次迭代，语义上属于
+    // 循环外初值；只有 body（含直属 nested loop）到 exit 的边才是循环内写回。
+    let mut body_blocks = blocks.clone();
+    body_blocks.remove(&header);
+    let exit_value_merges = analyze_loop_exit_value_merges(dataflow, &exits, &body_blocks);
 
     Some(LoopCandidate {
         header,
@@ -479,6 +953,8 @@ fn degenerate_generic_for_loop(
         backedges: Vec::new(),
         exits,
         continue_target: Some(header),
+        continue_edges: BTreeSet::new(),
+        condition_header: None,
         kind_hint: LoopKindHint::GenericForLike,
         source_bindings: generic_for_source_bindings(proto, cfg, header),
         header_value_merges,
@@ -1027,6 +1503,6 @@ fn generic_for_has_loop_body_and_exit(
     let exit_block = cfg.instr_to_block[instr.exit_target.index()];
 
     matches!(call.results, crate::transformer::ResultPack::Fixed(range) if range == instr.bindings)
-        && blocks.contains(&body_block)
+        && (body_block == exit_block || blocks.contains(&body_block))
         && !blocks.contains(&exit_block)
 }

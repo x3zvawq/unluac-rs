@@ -44,7 +44,6 @@ use super::{
     lower_phi_materialization_with_allowed_blocks_except, lower_regular_instr,
 };
 use body::*;
-use loops::loop_body_blocks;
 use overrides::StructureOverrideState;
 use rewrites::{
     apply_loop_rewrites, expr_as_lvalue, install_def_target_overrides, lvalue_as_expr,

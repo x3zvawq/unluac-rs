@@ -202,6 +202,29 @@ pub(super) fn remove_branch_owned_loop_exit_values(
     }
 }
 
+/// 相邻 loop 共用边界 block 时，后继 header phi 只归后继 loop state。
+pub(super) fn remove_loop_header_owned_loop_exit_values(candidates: &mut [LoopCandidate]) {
+    let header_owned = candidates
+        .iter()
+        .flat_map(|candidate| {
+            candidate
+                .header_value_merges
+                .iter()
+                .map(move |value| (candidate.header, value.phi_id))
+        })
+        .collect::<BTreeSet<_>>();
+
+    for candidate in candidates {
+        for exit in &mut candidate.exit_value_merges {
+            exit.values
+                .retain(|value| !header_owned.contains(&(exit.exit, value.phi_id)));
+        }
+        candidate
+            .exit_value_merges
+            .retain(|exit| !exit.values.is_empty());
+    }
+}
+
 fn consumed_branch_value_merge_ids(
     candidates: &[BranchValueMergeCandidate],
 ) -> impl Iterator<Item = PhiId> + '_ {

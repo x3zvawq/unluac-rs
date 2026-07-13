@@ -146,6 +146,16 @@ impl StructuredBodyLowerer<'_, '_> {
         let plan = self
             .try_build_short_circuit_plan(block, Some(post_loop))?
             .or_else(|| self.build_plain_branch_plan(block))?;
+        if plan.merge.is_none() {
+            return self.lower_terminal_or_break_split(
+                block,
+                plan,
+                post_loop,
+                downstream_post_loop,
+                target_overrides,
+                states,
+            );
+        }
         let merge = plan.merge?;
         let allowed_blocks = &self.branch_regions_by_header.get(&block)?.structured_blocks;
         let arm_context = BreakExitPadArmContext {
@@ -205,6 +215,72 @@ impl StructuredBodyLowerer<'_, '_> {
             block: HirBlock { stmts },
             blocks,
         })
+    }
+
+    fn lower_terminal_or_break_split(
+        &self,
+        block: BlockRef,
+        plan: StructuredBranchPlan,
+        post_loop: BlockRef,
+        downstream_post_loop: Option<BlockRef>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+        states: &[LoopStateSlot],
+    ) -> Option<BreakExitBlock> {
+        let else_entry = plan.else_entry?;
+        let (then_block, then_blocks) = self.lower_direct_terminal_or_break_arm(
+            plan.then_entry,
+            post_loop,
+            downstream_post_loop,
+            target_overrides,
+            states,
+        )?;
+        let (else_block, else_blocks) = self.lower_direct_terminal_or_break_arm(
+            else_entry,
+            post_loop,
+            downstream_post_loop,
+            target_overrides,
+            states,
+        )?;
+
+        let mut cond = plan.cond;
+        if let Some(entry_expr_overrides) = self.block_entry_expr_overrides(block) {
+            rewrite_expr_temps(&mut cond, entry_expr_overrides);
+        }
+        let mut stmts = self.lower_block_prefix(block, true, target_overrides)?;
+        stmts.push(branch_stmt(cond, then_block, Some(else_block)));
+        let mut blocks = plan.consumed_headers.into_iter().collect::<BTreeSet<_>>();
+        blocks.extend(then_blocks);
+        blocks.extend(else_blocks);
+        Some(BreakExitBlock {
+            block: HirBlock { stmts },
+            blocks,
+        })
+    }
+
+    fn lower_direct_terminal_or_break_arm(
+        &self,
+        block: BlockRef,
+        post_loop: BlockRef,
+        downstream_post_loop: Option<BlockRef>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+        states: &[LoopStateSlot],
+    ) -> Option<(HirBlock, BTreeSet<BlockRef>)> {
+        if block == post_loop || Some(block) == downstream_post_loop {
+            return Some((
+                HirBlock {
+                    stmts: vec![HirStmt::Break],
+                },
+                BTreeSet::new(),
+            ));
+        }
+        if !block_is_terminal_exit(self.lowering, block) {
+            return None;
+        }
+        let overrides = self.break_pad_target_overrides(block, target_overrides, states);
+        Some((
+            self.lower_terminal_exit_block_clone(block, &overrides)?,
+            BTreeSet::from([block]),
+        ))
     }
 
     fn lower_break_exit_pad_arm(

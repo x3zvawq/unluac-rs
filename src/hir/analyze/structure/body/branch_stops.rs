@@ -180,7 +180,9 @@ impl StructuredBodyLowerer<'_, '_> {
             .iter()
             .filter(|nested| {
                 nested.header != loop_context.header
-                    && nested.blocks.is_subset(loop_body_blocks(active_candidate))
+                    && nested
+                        .blocks
+                        .is_subset(&active_candidate.binding_scope_blocks)
             })
             .flat_map(|nested| {
                 nested

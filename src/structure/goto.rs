@@ -78,6 +78,7 @@ pub(super) fn analyze_goto_requirements(
                             edge.from,
                             continue_target,
                         )
+                        && !is_degenerate_branch_to_target(cfg, edge.from, continue_target)
                     {
                         requirements.insert(GotoRequirement {
                             from: edge.from,
@@ -115,6 +116,17 @@ pub(super) fn analyze_goto_requirements(
     }
 
     requirements.into_iter().collect()
+}
+
+fn is_degenerate_branch_to_target(
+    cfg: &Cfg,
+    from: crate::structure::BlockRef,
+    target: crate::structure::BlockRef,
+) -> bool {
+    cfg.branch_edges(from)
+        .is_some_and(|(then_edge, else_edge)| {
+            cfg.edges[then_edge.index()].to == target && cfg.edges[else_edge.index()].to == target
+        })
 }
 
 fn block_has_non_control_prefix(

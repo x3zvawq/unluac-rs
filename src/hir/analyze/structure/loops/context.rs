@@ -47,8 +47,17 @@ impl StructuredBodyLowerer<'_, '_> {
             );
         }
         let continue_target = candidate.continue_target;
-        let continue_sources = continue_target
-            .map(|target| {
+        let mut continue_sources = if self.can_emit_continue_stmt() {
+            candidate
+                .continue_edges
+                .iter()
+                .map(|edge| self.lowering.cfg.edges[edge.index()].from)
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
+        if let Some(target) = continue_target {
+            continue_sources.extend(
                 self.lowering
                     .structure
                     .goto_requirements
@@ -58,10 +67,9 @@ impl StructuredBodyLowerer<'_, '_> {
                             && requirement.to == target
                             && candidate.blocks.contains(&requirement.from)
                     })
-                    .map(|requirement| requirement.from)
-                    .collect::<BTreeSet<_>>()
-            })
-            .unwrap_or_default();
+                    .map(|requirement| requirement.from),
+            );
+        }
 
         Some(ActiveLoopContext {
             candidate_id: self.loop_candidate_id(candidate)?,
@@ -125,7 +133,7 @@ impl StructuredBodyLowerer<'_, '_> {
             .iter()
             .any(|nested| {
                 !std::ptr::eq(nested, candidate)
-                    && nested.blocks.is_subset(loop_body_blocks(candidate))
+                    && nested.blocks.is_subset(&candidate.binding_scope_blocks)
                     && (nested.header == exit || nested.preheader == Some(exit))
             })
     }
