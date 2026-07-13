@@ -1,7 +1,8 @@
 //! 这个文件承载 loop 内 branch-control 的专用恢复。
 //!
 //! 普通 `if` lowering 只关心分支 region 如何收束；这里处理的则是当前 active loop
-//! 语境下的 break/continue、loop terminal else，以及跨层 escape 判定。把它们从
+//! 语境下的 break/continue、loop-local backedge else、loop terminal else，以及跨层
+//! escape 判定。把它们从
 //! `branches.rs` 拆出来，是为了让普通 branch 结构和 loop 控制流策略分开演进。
 //! continue 臂只消费 `LoopCandidate::continue_edges` 已认领的间接 pad；不会在 HIR
 //! 根据单 jump 形状重新猜 owner。
@@ -9,6 +10,61 @@
 use super::*;
 
 impl StructuredBodyLowerer<'_, '_> {
+    pub(super) fn try_lower_loop_backedge_else_branch(
+        &mut self,
+        block: BlockRef,
+        stmts: &mut Vec<HirStmt>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<Option<BlockRef>> {
+        let loop_context = self.active_loops.last()?.clone();
+        let loop_candidate = self.loop_candidate(loop_context.candidate_id)?;
+        let candidate = *self.branch_by_header.get(&block)?;
+        let merge = candidate.merge?;
+        // 同一 header 上的嵌套 while/repeat 可能被编译器折叠成一个多回边 loop：
+        // 显式 arm 在 merge 前直接回到 header，缺席的 else 则从 merge 继续完成本轮。
+        // 两侧都已由 active loop 证明只会回边或退出时，用 if/else 表达这组路径，
+        // 避免为没有 continue 的 Lua 5.1 目标制造 goto。
+        if loop_candidate.kind_hint != LoopKindHint::Unknown
+            || loop_candidate.backedges.len() < 2
+            || candidate.then_entry == loop_context.header
+            || candidate.else_entry.is_some()
+            || merge == loop_context.post_loop
+            || Some(merge) == loop_context.downstream_post_loop
+            || loop_context.break_exits.contains_key(&merge)
+            || self.branch_value_merges_by_header.contains_key(&block)
+            || !self.can_reach_avoiding_block(candidate.then_entry, loop_context.header, merge)
+            || !self.branch_arm_reaches_target_or_loop_escape_before_boundary(
+                candidate.then_entry,
+                loop_context.header,
+                Some(merge),
+            )
+            || !self.branch_arm_reaches_target_or_loop_escape_before_boundary(
+                merge,
+                loop_context.header,
+                None,
+            )
+        {
+            return None;
+        }
+
+        let then_target_overrides =
+            self.branch_entry_target_overrides(block, Some(candidate.then_entry), target_overrides);
+        let then_block = self.lower_region(
+            candidate.then_entry,
+            Some(loop_context.header),
+            &then_target_overrides,
+        )?;
+        let else_block =
+            self.lower_region(merge, Some(loop_context.post_loop), target_overrides)?;
+        let mut cond = self.lower_candidate_cond(block, candidate)?;
+        rewrite_expr_temps(&mut cond, &temp_expr_overrides(target_overrides));
+
+        stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
+        self.visited.insert(block);
+        stmts.push(branch_stmt(cond, then_block, Some(else_block)));
+        Some(None)
+    }
+
     pub(super) fn try_lower_loop_break_branch(
         &mut self,
         block: BlockRef,
@@ -134,6 +190,7 @@ impl StructuredBodyLowerer<'_, '_> {
         match body_stop {
             Some(next) if next == break_exit => Some(None),
             Some(next) if next == self.lowering.cfg.exit_block => Some(None),
+            Some(next) if next == loop_context.header => Some(None),
             Some(next) => Some(Some(next)),
             None => Some(None),
         }
@@ -295,6 +352,29 @@ impl StructuredBodyLowerer<'_, '_> {
             return None;
         }
         if let Some(short_plan) = self.try_build_short_circuit_plan(block, stop).flatten() {
+            if let Some((continue_entry, non_continue_entry, continue_on_truthy)) =
+                self.short_circuit_continue_arm(&short_plan, continue_target, &loop_context)
+            {
+                let mut continue_cond = if continue_on_truthy {
+                    short_plan.cond
+                } else {
+                    short_plan.cond.negate()
+                };
+                rewrite_expr_temps(&mut continue_cond, &temp_expr_overrides(target_overrides));
+
+                stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
+                self.visited
+                    .extend(short_plan.consumed_blocks.iter().copied());
+                let mut continue_block = if continue_entry == continue_target {
+                    HirBlock::default()
+                } else {
+                    self.lower_region(continue_entry, Some(continue_target), target_overrides)?
+                };
+                continue_block.stmts.push(HirStmt::Continue);
+                stmts.push(branch_stmt(continue_cond, continue_block, None));
+                return Some(Some(non_continue_entry));
+            }
+
             let short_plan_has_continue_edge = short_plan.then_entry == continue_entry
                 || short_plan.else_entry == Some(continue_entry);
             if !short_plan_has_continue_edge {
@@ -543,6 +623,31 @@ impl StructuredBodyLowerer<'_, '_> {
             Some(None)
         } else {
             Some(Some(merge))
+        }
+    }
+
+    pub(super) fn short_circuit_continue_arm(
+        &self,
+        plan: &StructuredBranchPlan,
+        continue_target: BlockRef,
+        loop_context: &ActiveLoopContext,
+    ) -> Option<(BlockRef, BlockRef, bool)> {
+        if !self.can_emit_continue_stmt() {
+            return None;
+        }
+        let else_entry = plan.else_entry?;
+        let is_continue_entry = |entry: BlockRef| {
+            entry == continue_target
+                || (loop_context.loop_blocks.contains(&entry)
+                    && self.lowering.cfg.unique_reachable_successor(entry) == Some(continue_target))
+        };
+        match (
+            is_continue_entry(plan.then_entry),
+            is_continue_entry(else_entry),
+        ) {
+            (true, false) => Some((plan.then_entry, else_entry, true)),
+            (false, true) => Some((else_entry, plan.then_entry, false)),
+            _ => None,
         }
     }
 

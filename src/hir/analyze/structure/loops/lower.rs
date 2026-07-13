@@ -489,6 +489,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             &combined_target_overrides,
             &plan.states,
         )?;
+        loop_context.body_stop = Some(body_stop);
         loop_context.loop_blocks = loop_body_blocks(candidate).clone();
         loop_context.state_slots = plan.states.clone();
         let backedge_pad = self.repeat_backedge_pad(
@@ -730,10 +731,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         let body_entry = self.lowering.cfg.instr_to_block[loop_instr.body_target.index()];
-        let immediate_break = body_entry == exit;
-        if !immediate_break && !candidate.blocks.contains(&body_entry) {
-            return None;
-        }
+        let immediate_break = !candidate.blocks.contains(&body_entry);
         let bindings = self
             .lowering
             .bindings
@@ -772,10 +770,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         loop_context.loop_blocks = loop_body_blocks(candidate).clone();
         loop_context.state_slots = plan.states.clone();
         self.active_loops.push(loop_context.clone());
-        // Luau 会把空循环体或只含 `continue` 的 generic-for 直接编译成 header
-        // 自回边。此时没有独立 body block 可降级，但循环本身仍是完整的结构候选。
+        // Structure 不给立即 break 候选分配独立 body block；空循环体或只含
+        // `continue` 的 generic-for 则会把 body 编译成 header 自回边。
         let body = if immediate_break {
-            // body/exit 同目标编码的是首轮立即 break；不能降成空 body，否则会继续遍历。
+            // 无独立 body owner 编码的是首轮立即 break；不能降成空 body，否则会继续遍历。
             HirBlock {
                 stmts: vec![HirStmt::Break],
             }

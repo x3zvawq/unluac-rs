@@ -91,6 +91,7 @@ pub(super) struct ActiveLoopContext {
     pub(super) post_loop: BlockRef,
     pub(super) downstream_post_loop: Option<BlockRef>,
     pub(super) continue_target: Option<BlockRef>,
+    pub(super) body_stop: Option<BlockRef>,
     pub(super) continue_sources: BTreeSet<BlockRef>,
     pub(super) break_exits: BTreeMap<BlockRef, BreakExitBlock>,
     pub(super) state_slots: Vec<LoopStateSlot>,

@@ -78,6 +78,7 @@ impl StructuredBodyLowerer<'_, '_> {
             post_loop,
             downstream_post_loop,
             continue_target,
+            body_stop: None,
             continue_sources,
             break_exits,
             state_slots: Vec::new(),

@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::structure::{BlockRef, Cfg, DataflowFacts, GraphFacts};
 
 use super::common::{
-    BranchKind, BranchRegionFact, BranchValueMergeCandidate, ShortCircuitCandidate,
+    BranchKind, BranchRegionFact, BranchValueMergeCandidate, LoopCandidate, ShortCircuitCandidate,
     ShortCircuitExit,
 };
 use super::helpers::collect_merge_arm_preds;
@@ -32,7 +32,9 @@ pub(super) fn analyze_branch_value_merges(
     dataflow: &DataflowFacts,
     branch_regions: &[BranchRegionFact],
     short_circuit_candidates: &[ShortCircuitCandidate],
+    loop_candidates: &[LoopCandidate],
 ) -> Vec<BranchValueMergeCandidate> {
+    let loop_owned_preds_by_header = loop_owned_preds_by_header(loop_candidates);
     let short_circuit_merges = short_circuit_candidates
         .iter()
         .filter_map(|candidate| match candidate.exit {
@@ -46,7 +48,12 @@ pub(super) fn analyze_branch_value_merges(
     let candidates = branch_regions
         .iter()
         .filter_map(|branch_region| {
-            analyze_branch_value_merge_candidate(dataflow, branch_region, &short_circuit_merges)
+            analyze_branch_value_merge_candidate(
+                dataflow,
+                branch_region,
+                &short_circuit_merges,
+                &loop_owned_preds_by_header,
+            )
         })
         .map(|candidate| (CandidateSource::BranchRegion, candidate))
         .chain(
@@ -54,6 +61,7 @@ pub(super) fn analyze_branch_value_merges(
                 cfg,
                 dataflow,
                 short_circuit_candidates,
+                &loop_owned_preds_by_header,
             )
             .into_iter()
             .map(|candidate| (CandidateSource::GuardShortCircuit, candidate)),
@@ -83,6 +91,7 @@ fn analyze_guard_short_circuit_branch_value_merges(
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     short_circuit_candidates: &[ShortCircuitCandidate],
+    loop_owned_preds_by_header: &BTreeMap<BlockRef, BTreeSet<BlockRef>>,
 ) -> Vec<BranchValueMergeCandidate> {
     let mut candidates = Vec::new();
 
@@ -108,8 +117,14 @@ fn analyze_guard_short_circuit_branch_value_merges(
             continue;
         }
 
-        let values =
-            branch_value_merges_in_block(short.header, dataflow, merge, &then_preds, &else_preds);
+        let values = branch_value_merges_in_block(
+            short.header,
+            dataflow,
+            merge,
+            &then_preds,
+            &else_preds,
+            loop_owned_preds_by_header.get(&merge),
+        );
 
         if !values.is_empty() {
             candidates.push(BranchValueMergeCandidate {
@@ -127,6 +142,7 @@ fn analyze_branch_value_merge_candidate(
     dataflow: &DataflowFacts,
     branch_region: &BranchRegionFact,
     short_circuit_merges: &BTreeSet<(BlockRef, BlockRef, Option<crate::transformer::Reg>)>,
+    loop_owned_preds_by_header: &BTreeMap<BlockRef, BTreeSet<BlockRef>>,
 ) -> Option<BranchValueMergeCandidate> {
     let merge = branch_region.merge;
     let then_preds = &branch_region.then_merge_preds;
@@ -156,6 +172,7 @@ fn analyze_branch_value_merge_candidate(
         merge,
         then_preds,
         else_preds,
+        loop_owned_preds_by_header.get(&merge),
     )
     .into_iter()
     .filter(|value| !short_circuit_merges.contains(&(branch_region.header, merge, Some(value.reg))))
@@ -166,4 +183,17 @@ fn analyze_branch_value_merge_candidate(
         merge,
         values,
     })
+}
+
+fn loop_owned_preds_by_header(
+    loop_candidates: &[LoopCandidate],
+) -> BTreeMap<BlockRef, BTreeSet<BlockRef>> {
+    let mut by_header = BTreeMap::<BlockRef, BTreeSet<BlockRef>>::new();
+    for candidate in loop_candidates {
+        by_header
+            .entry(candidate.header)
+            .or_default()
+            .extend(candidate.blocks.iter().copied());
+    }
+    by_header
 }

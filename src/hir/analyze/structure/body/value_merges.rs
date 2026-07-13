@@ -444,6 +444,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let Some(merge) = branch_stop else {
             return;
         };
+        self.install_stop_boundary_target_phi_overrides(merge, target_overrides);
         let Some(short) = value_merge_candidate_by_header(self.lowering, header) else {
             return;
         };
@@ -466,6 +467,52 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         };
 
         self.replace_phi_with_entry_expr(merge, phi_id, reg, expr);
+    }
+
+    pub(super) fn install_stop_boundary_target_phi_overrides(
+        &mut self,
+        merge: BlockRef,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) {
+        if target_overrides.is_empty() {
+            return;
+        }
+        let replacements = self
+            .lowering
+            .dataflow
+            .phi_candidates_in_block(merge)
+            .iter()
+            .filter(|phi| !self.overrides.phi_is_suppressed_for_block(merge, phi.id))
+            .filter_map(|phi| {
+                let defs = || {
+                    phi.incoming
+                        .iter()
+                        .flat_map(|incoming| incoming.defs.iter().copied())
+                };
+                let target = shared_lvalue_for_defs(
+                    &self.lowering.bindings.fixed_temps,
+                    defs(),
+                    target_overrides,
+                )
+                .or_else(|| {
+                    let target = self.active_loop_state_target(phi.reg)?;
+                    defs()
+                        .all(|def| {
+                            let temp = self.lowering.bindings.fixed_temps[def.index()];
+                            target_overrides
+                                .get(&temp)
+                                .cloned()
+                                .unwrap_or(HirLValue::Temp(temp))
+                                == target
+                        })
+                        .then_some(target)
+                })?;
+                Some((phi.id, phi.reg, lvalue_as_expr(&target)?))
+            })
+            .collect::<Vec<_>>();
+        for (phi_id, reg, expr) in replacements {
+            self.replace_phi_with_entry_expr(merge, phi_id, reg, expr);
+        }
     }
 }
 

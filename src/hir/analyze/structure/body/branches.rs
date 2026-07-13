@@ -69,6 +69,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.restore_state_checkpoint(checkpoint, stmts);
 
         let checkpoint = self.checkpoint_state(stmts.len());
+        if let Some(next) = self.try_lower_loop_backedge_else_branch(block, stmts, target_overrides)
+        {
+            return Some(next);
+        }
+        self.restore_state_checkpoint(checkpoint, stmts);
+
+        let checkpoint = self.checkpoint_state(stmts.len());
         if let Some(next) =
             self.try_lower_loop_continue_branch(block, stop, stmts, target_overrides)
         {
@@ -115,7 +122,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
 
         let short_plan = self.try_build_short_circuit_plan(block, stop)?;
-        let plan = short_plan.or_else(|| self.build_plain_branch_plan(block))?;
+        let mut plan = short_plan.or_else(|| self.build_plain_branch_plan(block))?;
+        if let Some(tail) = self.current_loop_shared_tail(&plan, stop) {
+            plan.merge = Some(tail);
+        }
 
         if let Some(shared) = self.shared_continuation_branch(&plan, stop) {
             let checkpoint = self.checkpoint_state(stmts.len());
@@ -303,6 +313,50 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .then_some(downstream)
     }
 
+    fn current_loop_shared_tail(
+        &self,
+        plan: &StructuredBranchPlan,
+        stop: Option<BlockRef>,
+    ) -> Option<BlockRef> {
+        let loop_context = self.active_loops.last()?;
+        let continue_target = loop_context.continue_target?;
+        let boundary = plan.merge?;
+        let else_entry = plan.else_entry?;
+        let region = self
+            .branch_regions_by_header
+            .get(plan.consumed_headers.first()?)?;
+        if stop != Some(continue_target) || !self.block_is_active_loop_escape(boundary) {
+            return None;
+        }
+        region.structured_blocks.iter().copied().find(|tail| {
+            *tail != plan.then_entry
+                && *tail != else_entry
+                && !self.branch_by_header.contains_key(tail)
+                && !self.loop_by_header.contains_key(tail)
+                && self.region_predecessor_count(*tail, &region.structured_blocks) >= 2
+                && self.lowering.cfg.unique_reachable_successor(*tail) == Some(continue_target)
+                && [plan.then_entry, else_entry].into_iter().any(|entry| {
+                    self.try_build_short_circuit_plan(entry, Some(*tail))
+                        .flatten()
+                        .is_some_and(|short_plan| {
+                            self.short_circuit_continue_arm(
+                                &short_plan,
+                                continue_target,
+                                loop_context,
+                            )
+                            .is_some()
+                        })
+                })
+                && self.branch_arm_reaches_target_or_boundary_or_terminate(
+                    plan.then_entry,
+                    *tail,
+                    boundary,
+                )
+                && self
+                    .branch_arm_reaches_target_or_boundary_or_terminate(else_entry, *tail, boundary)
+        })
+    }
+
     fn implicit_else_merge_entry(
         &self,
         plan: &StructuredBranchPlan,
@@ -339,6 +393,27 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
         let else_entry = plan.else_entry?;
         let merge = plan.merge.unwrap_or(self.lowering.cfg.exit_block);
+        if let Some((stop, continue_target)) = stop.zip(
+            self.active_loops
+                .last()
+                .and_then(|loop_context| loop_context.continue_target),
+        ) && stop != continue_target
+        {
+            let non_continue_entry = if plan.then_entry == continue_target {
+                Some(else_entry)
+            } else if else_entry == continue_target {
+                Some(plan.then_entry)
+            } else {
+                None
+            };
+            if non_continue_entry
+                .is_some_and(|entry| self.can_reach_avoiding_block(entry, stop, continue_target))
+            {
+                // early continue 会跳过调用方持有的近端 tail；不能把另一臂
+                // 一直降到 loop condition，否则会提前消费这个 tail。
+                return None;
+            }
+        }
         if self.active_loops.last().is_some_and(|loop_context| {
             loop_context.continue_target.is_none()
                 && loop_context.post_loop == merge
@@ -375,7 +450,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let then_is_shared = else_entry != merge
             && plan.then_entry != merge
             && (merge_is_explicit
-                || self.loop_preheader_exits_to_shared(else_entry, plan.then_entry))
+                || self
+                    .loop_candidate_from_preheader(else_entry)
+                    .is_some_and(|candidate| candidate.exits.contains(&plan.then_entry)))
             && self.entry_reaches_shared_continuation(else_entry, plan.then_entry, merge);
         if then_is_shared {
             return Some(SharedContinuationBranch {
@@ -388,7 +465,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let else_is_shared = else_entry != merge
             && plan.then_entry != merge
             && (merge_is_explicit
-                || self.loop_preheader_exits_to_shared(plan.then_entry, else_entry))
+                || self
+                    .loop_candidate_from_preheader(plan.then_entry)
+                    .is_some_and(|candidate| candidate.exits.contains(&else_entry)))
             && self.entry_reaches_shared_continuation(plan.then_entry, else_entry, merge);
         else_is_shared.then_some(SharedContinuationBranch {
             gated_entry: plan.then_entry,
@@ -461,15 +540,22 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         })
     }
 
-    fn loop_preheader_exits_to_shared(&self, preheader: BlockRef, shared: BlockRef) -> bool {
-        let Some(header) = self.lowering.cfg.unique_reachable_successor(preheader) else {
-            return false;
+    pub(super) fn loop_candidate_from_preheader(
+        &self,
+        preheader: BlockRef,
+    ) -> Option<&'b LoopCandidate> {
+        let header = match self.block_terminator(preheader) {
+            Some((_instr_ref, LowInstr::NumericForInit(init))) => {
+                self.lowering.cfg.instr_to_block[init.body_target.index()]
+            }
+            _ => self.lowering.cfg.unique_reachable_successor(preheader)?,
         };
-        self.loops_by_header.get(&header).is_some_and(|candidates| {
-            candidates.iter().any(|(_, candidate)| {
-                candidate.preheader == Some(preheader) && candidate.exits.contains(&shared)
+        self.loops_by_header
+            .get(&header)?
+            .iter()
+            .find_map(|(_, candidate)| {
+                (candidate.preheader == Some(preheader)).then_some(*candidate)
             })
-        })
     }
 
     fn entry_reaches_shared_continuation(
@@ -478,8 +564,44 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         shared: BlockRef,
         boundary: BlockRef,
     ) -> bool {
-        self.entry_must_reach_or_escape_before_boundary(entry, shared, boundary)
-            || self.branch_arm_reaches_shared_continuation_or_terminate(entry, shared, boundary)
+        if self
+            .active_loops
+            .last()
+            .and_then(|loop_context| loop_context.continue_target)
+            .is_some_and(|continue_target| {
+                shared != continue_target
+                    && !self.can_reach_avoiding_block(entry, shared, continue_target)
+            })
+        {
+            return false;
+        }
+        self.branch_arm_reaches_shared_continuation_or_terminate(entry, shared, boundary)
+            || (self.active_loops.last().is_some_and(|loop_context| {
+                loop_context.continue_target == Some(boundary)
+                    || (self.block_is_active_loop_escape(boundary)
+                        && loop_context.continue_target.is_some_and(|continue_target| {
+                            self.try_build_short_circuit_plan(entry, Some(shared))
+                                .flatten()
+                                .is_some_and(|plan| {
+                                    self.short_circuit_continue_arm(
+                                        &plan,
+                                        continue_target,
+                                        loop_context,
+                                    )
+                                    .is_some()
+                                })
+                        }))
+            }) && self.branch_arm_reaches_stop_or_loop_escape(entry, shared, boundary))
+            // repeat 的条件位于 body 尾部；一条源码 arm 可以先完整执行内层 loop，
+            // 再选择进入本轮共享 tail 或直接 break。这里消费内层 loop 的显式 exits，
+            // while/for 则继续沿用普通 shared-continuation 证明，避免跨过它们各自的
+            // header/iterator owner 去扩大分支 region。
+            || (self.active_loops.last().is_some_and(|loop_context| {
+                self.loop_candidate(loop_context.candidate_id)
+                    .is_some_and(|candidate| candidate.kind_hint == LoopKindHint::RepeatLike)
+            }) && self.loop_by_header.contains_key(&entry)
+                && self.block_is_active_loop_escape(boundary)
+                && self.branch_arm_reaches_stop_or_loop_escape(entry, shared, boundary))
     }
 
     // 有些 elseif 链在结构事实上已经有共享 tail，但其中几条臂会先跳到外层 merge
@@ -528,6 +650,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             post_loop: merge,
             downstream_post_loop: None,
             continue_target: None,
+            body_stop: Some(tail),
             continue_sources: BTreeSet::new(),
             break_exits: BTreeMap::new(),
             state_slots: Vec::new(),
@@ -623,77 +746,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             })
     }
 
-    fn entry_must_reach_or_escape_before_boundary(
-        &self,
-        entry: BlockRef,
-        target: BlockRef,
-        boundary: BlockRef,
-    ) -> bool {
-        let boundary_is_loop_escape = self.active_loops.last().is_some_and(|loop_context| {
-            (loop_context.continue_target == Some(boundary)
-                && self.loop_continue_target_is_empty(boundary))
-                || loop_context.post_loop == boundary
-                || loop_context.downstream_post_loop == Some(boundary)
-        });
-
-        fn visit(
-            lowerer: &StructuredBodyLowerer<'_, '_>,
-            block: BlockRef,
-            target: BlockRef,
-            boundary: BlockRef,
-            boundary_is_loop_escape: bool,
-            visiting: &mut BTreeSet<BlockRef>,
-            memo: &mut BTreeMap<BlockRef, bool>,
-        ) -> bool {
-            if block == target {
-                return true;
-            }
-            if block == boundary {
-                return boundary_is_loop_escape;
-            }
-            if !lowerer.lowering.cfg.reachable_blocks.contains(&block) {
-                return false;
-            }
-            if block == lowerer.lowering.cfg.exit_block || lowerer.block_is_terminal_exit(block) {
-                return true;
-            }
-            if let Some(result) = memo.get(&block).copied() {
-                return result;
-            }
-            if !visiting.insert(block) {
-                return false;
-            }
-
-            let result = lowerer.lowering.cfg.succs[block.index()]
-                .iter()
-                .all(|edge_ref| {
-                    let successor = lowerer.lowering.cfg.edges[edge_ref.index()].to;
-                    visit(
-                        lowerer,
-                        successor,
-                        target,
-                        boundary,
-                        boundary_is_loop_escape,
-                        visiting,
-                        memo,
-                    )
-                });
-            visiting.remove(&block);
-            memo.insert(block, result);
-            result
-        }
-
-        visit(
-            self,
-            entry,
-            target,
-            boundary,
-            boundary_is_loop_escape,
-            &mut BTreeSet::new(),
-            &mut BTreeMap::new(),
-        )
-    }
-
     fn lower_shared_continuation_branch(
         &mut self,
         shared: SharedContinuationBranch,
@@ -717,6 +769,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         };
         rewrite_expr_temps(&mut cond, &temp_expr_overrides(target_overrides));
         stmts.push(branch_stmt(cond, gated_block, None));
+        self.install_stop_boundary_target_phi_overrides(shared.shared_entry, target_overrides);
         Some(Some(shared.shared_entry))
     }
 

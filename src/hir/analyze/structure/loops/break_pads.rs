@@ -65,11 +65,11 @@ impl StructuredBodyLowerer<'_, '_> {
         // 上的 phi temp 不同，因此仅靠 combined_target_overrides 无法将它们重定向到
         // 循环 state 变量。这里额外扫描 pad 的 def，把匹配 state 寄存器的 def temp
         // 也加入 override map，使 apply_loop_rewrites 能正确替换。
-        let combined = self.break_pad_target_overrides(block, target_overrides, states);
         if matches!(
             self.block_terminator(block),
             Some((_instr_ref, LowInstr::Branch(_)))
         ) {
+            let combined = self.break_pad_target_overrides(block, target_overrides, states);
             return self.lower_branch_break_exit_pad(
                 block,
                 post_loop,
@@ -79,30 +79,43 @@ impl StructuredBodyLowerer<'_, '_> {
             );
         }
 
-        let mut stmts = self.lower_block_prefix(block, false, &combined)?;
-        let target = match self.block_terminator(block) {
-            Some((_instr_ref, LowInstr::Jump(jump))) => {
-                self.lowering.cfg.instr_to_block[jump.target.index()]
+        let mut current = block;
+        let mut blocks = BTreeSet::new();
+        let mut stmts = Vec::new();
+        loop {
+            if !blocks.insert(current) {
+                return None;
             }
-            // Lua 5.4 的 close/capture cleanup pad 很常见的一种形状是“只有 cleanup，
-            // 然后直接 fallthrough 到 post-loop continuation”。如果这里仍然硬要求
-            // 显式 jump，像 `while ... if ... break end` 这种明明已经结构化的 loop
-            // 也会整片回退成 label/goto。
-            Some((_instr_ref, instr)) if !is_control_terminator(instr) => {
-                self.lowering.cfg.unique_reachable_successor(block)?
+            let combined = self.break_pad_target_overrides(current, target_overrides, states);
+            stmts.extend(self.lower_block_prefix(current, false, &combined)?);
+            let target = match self.block_terminator(current) {
+                Some((_instr_ref, LowInstr::Jump(jump))) => {
+                    self.lowering.cfg.instr_to_block[jump.target.index()]
+                }
+                // Lua 5.4 的 close/capture cleanup pad 可以直接 fallthrough 到后续块。
+                Some((_instr_ref, instr)) if !is_control_terminator(instr) => {
+                    self.lowering.cfg.unique_reachable_successor(current)?
+                }
+                None => self.lowering.cfg.unique_reachable_successor(current)?,
+                Some(_) => return None,
+            };
+            if target == post_loop || Some(target) == downstream_post_loop {
+                stmts.push(HirStmt::Break);
+                return Some(BreakExitBlock {
+                    block: HirBlock { stmts },
+                    blocks,
+                });
             }
-            None => self.lowering.cfg.unique_reachable_successor(block)?,
-            Some(_) => return None,
-        };
-        if target != post_loop && Some(target) != downstream_post_loop {
-            return None;
+            if self
+                .lowering
+                .cfg
+                .unique_reachable_predecessor_matching(target, |_| true)
+                != Some(current)
+            {
+                return None;
+            }
+            current = target;
         }
-
-        stmts.push(HirStmt::Break);
-        Some(BreakExitBlock {
-            block: HirBlock { stmts },
-            blocks: BTreeSet::from([block]),
-        })
     }
 
     fn break_pad_target_overrides(

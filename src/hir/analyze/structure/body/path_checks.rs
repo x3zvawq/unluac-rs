@@ -9,6 +9,9 @@
 //! 输出形状：返回 `true`，调用方可以把 `shared` 留给外层 continuation，而不是复制 tail。
 //! 未被 loop/branch owner 分类的回环返回 `false`；已有候选 owner 的 loop 只沿显式 exits
 //! 继续检查，避免各调用方复制 DFS 后对回环采用不同口径。
+//! 同一 header 存在多个 loop 候选时，路径查询用进入前驱选择确切 owner；
+//! 无法唯一确定时保持未证明，不猜测任意候选。
+//! terminal 形态查询还会区分可自然省略的空 `return` 与带返回值/前缀的显式出口。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -96,6 +99,29 @@ impl StructuredBodyLowerer<'_, '_> {
         })
     }
 
+    pub(super) fn branch_arm_reaches_target_or_loop_escape_before_boundary(
+        &self,
+        entry: BlockRef,
+        target: BlockRef,
+        boundary: Option<BlockRef>,
+    ) -> bool {
+        self.branch_arm_paths_all_match(entry, |block| {
+            if block == target {
+                return Some(true);
+            }
+            if Some(block) == boundary {
+                return Some(false);
+            }
+            if block == self.lowering.cfg.exit_block
+                || self.block_is_terminal_exit(block)
+                || self.block_is_active_loop_escape(block)
+            {
+                return Some(true);
+            }
+            (!self.lowering.cfg.reachable_blocks.contains(&block)).then_some(false)
+        })
+    }
+
     pub(super) fn branch_can_truncate_to_stop_or_loop_escape(
         &self,
         then_entry: BlockRef,
@@ -104,9 +130,11 @@ impl StructuredBodyLowerer<'_, '_> {
         boundary: BlockRef,
     ) -> bool {
         self.branch_arm_reaches_stop_or_loop_escape(then_entry, stop, boundary)
-            && else_entry.is_none_or(|else_entry| {
-                self.branch_arm_reaches_stop_or_loop_escape(else_entry, stop, boundary)
-            })
+            && self.branch_arm_reaches_stop_or_loop_escape(
+                else_entry.unwrap_or(boundary),
+                stop,
+                boundary,
+            )
     }
 
     pub(super) fn branch_arm_reaches_stop_or_loop_escape(
@@ -137,25 +165,46 @@ impl StructuredBodyLowerer<'_, '_> {
         fn visit(
             lowerer: &StructuredBodyLowerer<'_, '_>,
             block: BlockRef,
+            predecessor: Option<BlockRef>,
             classify_boundary: &impl Fn(BlockRef) -> Option<bool>,
-            visiting: &mut BTreeSet<BlockRef>,
-            memo: &mut BTreeMap<BlockRef, bool>,
+            visiting: &mut BTreeSet<(Option<BlockRef>, BlockRef)>,
+            memo: &mut BTreeMap<(Option<BlockRef>, BlockRef), bool>,
         ) -> bool {
             if let Some(result) = classify_boundary(block) {
                 return result;
             }
-            if let Some(result) = memo.get(&block).copied() {
+            let state = (predecessor, block);
+            if let Some(result) = memo.get(&state).copied() {
                 return result;
             }
-            if let Some(loop_candidate) = lowerer.loop_by_header.get(&block).copied() {
+            let loop_candidate = lowerer.loops_by_header.get(&block).and_then(|candidates| {
+                predecessor
+                    .and_then(|preheader| {
+                        candidates.iter().find_map(|(_, candidate)| {
+                            (candidate.preheader == Some(preheader)).then_some(*candidate)
+                        })
+                    })
+                    .or_else(|| {
+                        lowerer
+                            .active_loops
+                            .last()
+                            .filter(|active| active.header == block)
+                            .and_then(|active| lowerer.loop_candidate(active.candidate_id))
+                    })
+                    .or(match candidates.as_slice() {
+                        [(_, candidate)] => Some(*candidate),
+                        _ => None,
+                    })
+            });
+            if let Some(loop_candidate) = loop_candidate {
                 let result = loop_candidate
                     .exits
                     .iter()
-                    .all(|exit| visit(lowerer, *exit, classify_boundary, visiting, memo));
-                memo.insert(block, result);
+                    .all(|exit| visit(lowerer, *exit, None, classify_boundary, visiting, memo));
+                memo.insert(state, result);
                 return result;
             }
-            if !visiting.insert(block) {
+            if !visiting.insert(state) {
                 // 已分类的 loop escape/continuation 会在 classify_boundary 里返回。
                 // 走到这里的回环还没有结构化 owner，不能证明所有路径都到达目标边界。
                 return false;
@@ -165,16 +214,24 @@ impl StructuredBodyLowerer<'_, '_> {
                 .iter()
                 .all(|edge_ref| {
                     let successor = lowerer.lowering.cfg.edges[edge_ref.index()].to;
-                    visit(lowerer, successor, classify_boundary, visiting, memo)
+                    visit(
+                        lowerer,
+                        successor,
+                        Some(block),
+                        classify_boundary,
+                        visiting,
+                        memo,
+                    )
                 });
-            visiting.remove(&block);
-            memo.insert(block, result);
+            visiting.remove(&state);
+            memo.insert(state, result);
             result
         }
 
         visit(
             self,
             entry,
+            None,
             &classify_boundary,
             &mut BTreeSet::new(),
             &mut BTreeMap::new(),
@@ -352,5 +409,19 @@ impl StructuredBodyLowerer<'_, '_> {
                         crate::structure::EdgeKind::Return | crate::structure::EdgeKind::TailCall
                     )
             })
+    }
+
+    pub(super) fn block_is_empty_return(&self, block: BlockRef) -> bool {
+        let range = self.lowering.cfg.blocks[block.index()].instrs;
+        range.len == 1
+            && matches!(
+                self.block_terminator(block),
+                Some((
+                    _,
+                    LowInstr::Return(crate::transformer::ReturnInstr {
+                        values: crate::transformer::ValuePack::Fixed(values),
+                    }),
+                )) if values.len == 0
+            )
     }
 }

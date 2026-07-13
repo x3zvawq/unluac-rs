@@ -39,6 +39,7 @@ pub(super) fn branch_value_merge_from_phi(
     phi: &PhiCandidate,
     then_preds: &BTreeSet<BlockRef>,
     else_preds: &BTreeSet<BlockRef>,
+    ignored_preds: Option<&BTreeSet<BlockRef>>,
 ) -> Option<BranchValueMergeValue> {
     let mut then_arm = BranchValueMergeArm {
         preds: BTreeSet::new(),
@@ -57,6 +58,8 @@ pub(super) fn branch_value_merge_from_phi(
             extend_branch_value_arm(header, dataflow, &mut then_arm, incoming);
         } else if else_preds.contains(&pred) {
             extend_branch_value_arm(header, dataflow, &mut else_arm, incoming);
+        } else if ignored_preds.is_some_and(|preds| preds.contains(&pred)) {
+            continue;
         } else {
             return None;
         }
@@ -76,12 +79,20 @@ pub(super) fn branch_value_merges_in_block(
     block: BlockRef,
     then_preds: &BTreeSet<BlockRef>,
     else_preds: &BTreeSet<BlockRef>,
+    ignored_preds: Option<&BTreeSet<BlockRef>>,
 ) -> Vec<BranchValueMergeValue> {
     dataflow
         .phi_candidates_in_block(block)
         .iter()
         .filter_map(|phi| {
-            branch_value_merge_from_phi(header, dataflow, phi, then_preds, else_preds)
+            branch_value_merge_from_phi(
+                header,
+                dataflow,
+                phi,
+                then_preds,
+                else_preds,
+                ignored_preds,
+            )
         })
         .collect()
 }

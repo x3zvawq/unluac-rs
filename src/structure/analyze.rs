@@ -117,6 +117,7 @@ pub(crate) fn analyze_structure_proto(
         dataflow,
         &branch_region_facts,
         &short_circuit_candidates,
+        &loop_candidates,
     );
     phi_facts::remove_branch_owned_loop_exit_values(
         &mut loop_candidates,

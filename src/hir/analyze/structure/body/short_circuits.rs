@@ -36,7 +36,8 @@ impl StructuredBodyLowerer<'_, '_> {
                     && !self.loop_continue_target_is_empty(stop)
             })
         {
-            let can_falsy_stop = self.can_short_circuit_falsy_to_non_empty_continue();
+            let body_entry = if truthy == stop { falsy } else { truthy };
+            let can_falsy_stop = self.can_short_circuit_to_non_empty_continue(body_entry, stop);
             if truthy == stop && can_falsy_stop {
                 cond = cond.negate();
                 std::mem::swap(&mut truthy, &mut falsy);
@@ -52,11 +53,12 @@ impl StructuredBodyLowerer<'_, '_> {
         // 当短路的 truthy 出口是一个退化分支（两条 CFG 边都指向同一个后继 == falsy）时，
         // 该 block 是 `(sc_cond) and guard then end` 中空体守卫的残留。
         // 直接把守卫条件折叠进 SC 条件，避免它作为 body 被 lower_linear_block 丢弃。
-        self.absorb_degenerate_guards(&mut cond, &mut truthy, falsy, stop, &mut consumed_headers);
+        // guard 自带副作用前缀时，后续重写会拒绝吸收，因此回滚点必须位于试探之前。
         let fallback_cond = cond.clone();
         let fallback_truthy = truthy;
         let fallback_falsy = falsy;
         let fallback_consumed_headers = consumed_headers.clone();
+        self.absorb_degenerate_guards(&mut cond, &mut truthy, falsy, stop, &mut consumed_headers);
         self.extend_branch_short_circuit_exits(
             &mut cond,
             &mut truthy,
@@ -145,16 +147,17 @@ impl StructuredBodyLowerer<'_, '_> {
             }));
         }
 
-        // 当 SC 的 falsy 出口本身是 `return`/`tail-call` 终结块，并且 then 入口能
+        // 当 SC 的 falsy 出口本身是无返回值的隐式 `return`，并且 then 入口能
         // 经由内部控制流到达同一个终结块时（典型形状：then 内部还有 `if X then return end`
         // 的早返回守卫，与 SC 失败路径共用函数尾部的隐式 return），按 IfElse 处理会
         // 让 then 在 lower 时先 visit 掉这个共享终结块，导致随后 lower else 失败、整段
         // proto 退化成 goto-label fallback。这里把这种形状显式降级成 IfThen，merge 留空：
         // 终结块由 then 内部的早返回路径自然消费，SC falsy 边落到外层 region 的自然末尾，
         // 语义上正好对齐 `if cond then ... <early return inside> ... end` 加函数末尾隐式 return。
+        // 显式返回值或 return 前缀不能省略，否则 falsy 路径会丢失可见结果或副作用。
         // 如果这条“可达”必须先经过当前 region 的 stop（如 numeric-for 的 FORLOOP latch），
         // 那就是经由下一轮循环绕回来的可达性，不能据此省略当前分支的 terminal else 臂。
-        if self.block_is_terminal_exit(falsy)
+        if self.block_is_empty_return(falsy)
             && stop.is_none_or(|stop| self.can_reach_avoiding_block(truthy, falsy, stop))
             && self.can_reach(truthy, falsy)
         {
@@ -506,19 +509,42 @@ impl StructuredBodyLowerer<'_, '_> {
         false
     }
 
-    fn can_short_circuit_falsy_to_non_empty_continue(&self) -> bool {
+    fn can_short_circuit_to_non_empty_continue(
+        &self,
+        body_entry: BlockRef,
+        continue_target: BlockRef,
+    ) -> bool {
         let Some(loop_context) = self.active_loops.last() else {
             return false;
         };
-        self.loop_candidate(loop_context.candidate_id)
-            .is_some_and(|candidate| {
-                matches!(
-                    candidate.kind_hint,
-                    LoopKindHint::NumericForLike
-                        | LoopKindHint::GenericForLike
-                        | LoopKindHint::Unknown
-                )
-            })
+        let Some(candidate) = self.loop_candidate(loop_context.candidate_id) else {
+            return false;
+        };
+        if matches!(
+            candidate.kind_hint,
+            LoopKindHint::NumericForLike | LoopKindHint::GenericForLike | LoopKindHint::Unknown
+        ) {
+            return true;
+        }
+
+        // repeat 的 continue target 同时承载循环条件，不能把任意短路出口当成
+        // “自然继续”。另一臂的所有路径都必须在本轮回到条件块或退出 active repeat；
+        // 不能依赖 nested loop 的形状，因为优化器可能已经把固定轮数循环完全展开。
+        let body_has_loop_owner = candidate.blocks.contains(&body_entry)
+            || self
+                .loop_candidate_from_preheader(body_entry)
+                .is_some_and(|nested| {
+                    nested
+                        .binding_scope_blocks
+                        .is_subset(&candidate.binding_scope_blocks)
+                });
+        candidate.kind_hint == LoopKindHint::RepeatLike
+            && body_has_loop_owner
+            && self.branch_arm_reaches_stop_or_loop_escape(
+                body_entry,
+                continue_target,
+                loop_context.post_loop,
+            )
     }
 
     /// 当短路候选的 truthy 出口指向一个退化分支 block（两条 CFG 边都流向同一目标），

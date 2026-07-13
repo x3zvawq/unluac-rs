@@ -906,9 +906,10 @@ fn degenerate_generic_for_loop(
     };
     let body = cfg.instr_to_block[instr.body_target.index()];
     let exit = cfg.instr_to_block[instr.exit_target.index()];
-    // Luau 会把 `for ... do break end` 编译成 body/exit 同目标；这不是“没有循环”，
-    // 而是 iterator 首次成功后立即退出，候选只需让 header 持有控制结构。
-    let immediate_break = body == exit;
+    // Luau 会把 `for ... do break end` 编译成 body/exit 同目标，或让 exit 先经过
+    // 单条 jump pad 再汇入 body；这不是“没有循环”，候选只需让 header 持有控制结构。
+    let immediate_break = body == exit
+        || same_or_transparent_jump_target(proto, cfg, instr.exit_target, instr.body_target);
     let mut blocks = BTreeSet::from([header]);
     if !immediate_break {
         blocks.insert(body);
@@ -1503,6 +1504,8 @@ fn generic_for_has_loop_body_and_exit(
     let exit_block = cfg.instr_to_block[instr.exit_target.index()];
 
     matches!(call.results, crate::transformer::ResultPack::Fixed(range) if range == instr.bindings)
-        && (body_block == exit_block || blocks.contains(&body_block))
+        && (body_block == exit_block
+            || same_or_transparent_jump_target(proto, cfg, instr.exit_target, instr.body_target)
+            || blocks.contains(&body_block))
         && !blocks.contains(&exit_block)
 }

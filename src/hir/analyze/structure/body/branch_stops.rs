@@ -168,7 +168,10 @@ impl StructuredBodyLowerer<'_, '_> {
         // 消费同一个收尾块。这里只在所有非 escape 路径都能到达同一个回 header 块时，
         // 把该块作为当前分支的局部 stop，让它由外层 loop body 统一消费一次。
         let loop_context = self.active_loops.last()?;
-        if loop_context.header != stop && loop_context.continue_target != Some(stop) {
+        if loop_context.header != stop
+            && loop_context.continue_target != Some(stop)
+            && loop_context.body_stop != Some(stop)
+        {
             return None;
         }
         let region = self.branch_regions_by_header.get(&block)?;
@@ -192,33 +195,48 @@ impl StructuredBodyLowerer<'_, '_> {
                     .filter(|block| *block != nested.header && Some(*block) != nested.preheader)
             })
             .collect::<BTreeSet<_>>();
-        let continuation = region
-            .structured_blocks
-            .iter()
-            .copied()
-            .filter(|candidate| *candidate != block)
-            .filter(|candidate| !consumed_blocks.contains(candidate))
-            .filter(|candidate| *candidate != stop)
-            .filter(|candidate| *candidate != then_entry && Some(*candidate) != else_entry)
-            .filter(|candidate| !nested_loop_interiors.contains(candidate))
-            .filter(|candidate| {
-                self.lowering.cfg.unique_reachable_successor(*candidate) == Some(stop)
-                    || self.branch_arm_reaches_loop_continuation_or_escape(
-                        *candidate,
-                        stop,
-                        loop_context.header,
-                    )
-            })
-            .find(|candidate| {
-                self.branch_arm_reaches_loop_continuation_or_escape(then_entry, *candidate, stop)
-                    && else_entry.is_none_or(|else_entry| {
-                        self.branch_arm_reaches_loop_continuation_or_escape(
-                            else_entry, *candidate, stop,
+        let candidates = || {
+            region
+                .structured_blocks
+                .iter()
+                .copied()
+                .filter(|candidate| *candidate != block)
+                .filter(|candidate| !consumed_blocks.contains(candidate))
+                .filter(|candidate| *candidate != stop)
+                .filter(|candidate| *candidate != then_entry && Some(*candidate) != else_entry)
+                .filter(|candidate| !nested_loop_interiors.contains(candidate))
+                .filter(|candidate| {
+                    self.lowering.cfg.unique_reachable_successor(*candidate) == Some(stop)
+                        || self.branch_arm_reaches_loop_continuation_or_escape(
+                            *candidate,
+                            stop,
+                            loop_context.header,
                         )
-                    })
-            })?;
+                })
+        };
+        if let Some(continuation) = candidates().find(|candidate| {
+            self.branch_arm_reaches_loop_continuation_or_escape(then_entry, *candidate, stop)
+                && else_entry.is_none_or(|else_entry| {
+                    self.branch_arm_reaches_loop_continuation_or_escape(
+                        else_entry, *candidate, stop,
+                    )
+                })
+        }) {
+            return Some(continuation);
+        }
 
-        Some(continuation)
+        // early continue 可以让一条路径跳过 tail；只用 Structure 明确给出
+        // `tail branch -> stop` owner 的双臂分支补充常规严格证明。
+        let else_entry = else_entry?;
+        candidates().find(|candidate| {
+            self.branch_by_header
+                .get(candidate)
+                .is_some_and(|branch| branch.merge == Some(stop))
+                && self.can_reach_avoiding_block(then_entry, *candidate, stop)
+                && self.can_reach_avoiding_block(else_entry, *candidate, stop)
+                && self.branch_arm_reaches_stop_or_loop_escape(then_entry, *candidate, stop)
+                && self.branch_arm_reaches_stop_or_loop_escape(else_entry, *candidate, stop)
+        })
     }
 
     pub(super) fn branch_arm_stop(

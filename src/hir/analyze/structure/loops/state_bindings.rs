@@ -318,7 +318,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         if let Some(target) = self
             .overrides
-            .carried_entry_expr(candidate.header, reg)
+            .block_entry_expr(candidate.header, reg)
             .and_then(expr_as_lvalue)
         {
             return target;
@@ -366,7 +366,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         HirLValue::Temp(temp)
     }
 
-    pub(super) fn active_loop_state_target(&self, reg: Reg) -> Option<HirLValue> {
+    pub(in crate::hir::analyze::structure) fn active_loop_state_target(
+        &self,
+        reg: Reg,
+    ) -> Option<HirLValue> {
         self.active_loops
             .iter()
             .rev()

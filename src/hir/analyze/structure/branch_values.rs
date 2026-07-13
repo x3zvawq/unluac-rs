@@ -77,6 +77,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if let Some(target) = self.shared_branch_target_lvalue(value, target_overrides) {
             return target;
         }
+        if let Some(target) = self.inherited_loop_state_target(value, target_overrides) {
+            return target;
+        }
 
         HirLValue::Temp(phi_temp)
     }
@@ -244,6 +247,18 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         )
     }
 
+    fn inherited_loop_state_target(
+        &self,
+        value: &BranchValueMergeValue,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<HirLValue> {
+        let target = self.active_loop_state_target(value.reg)?;
+        branch_value_non_header_defs(value)
+            .map(|def| self.lowering.bindings.fixed_temps[def.index()])
+            .any(|temp| target_overrides.get(&temp) == Some(&target))
+            .then_some(target)
+    }
+
     fn shared_branch_target_expr(
         &self,
         value: &BranchValueMergeValue,
@@ -314,6 +329,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             && let Some(expr) = self.overrides.carried_entry_expr(header, reg)
         {
             return expr.clone();
+        }
+        if !self.block_redefines_reg(header, reg)
+            && let Some(expr) = self
+                .active_loop_state_target(reg)
+                .and_then(|target| lvalue_as_expr(&target))
+        {
+            return expr;
         }
 
         expr_for_reg_at_block_exit(self.lowering, header, reg)

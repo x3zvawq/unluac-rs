@@ -46,7 +46,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             // 前一 loop exit 与自身 backedge 的原始 incoming defs 重新猜初值。
             let inherited_entry = self
                 .overrides
-                .carried_entry_expr(candidate.header, value.reg)
+                .block_entry_expr(candidate.header, value.reg)
                 .cloned();
             let init = match inherited_entry
                 .or_else(|| self.loop_entry_expr(preheader, value, target_overrides))
@@ -69,13 +69,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             let temp = *self.lowering.bindings.phi_temps.get(value.phi_id.index())?;
             let target = self.loop_state_target(candidate, exit, value.reg, temp, target_overrides);
             plan.backedge_target_overrides.insert(temp, target.clone());
-            // phi 也可能只被内层 loop 的另一个 phi 间接消费，use_count 因而为零；
-            // state 一旦建立，所有回边定义都必须写回同一槽位。
-            for def in value.inside_arm.defs() {
-                let def_temp = *self.lowering.bindings.fixed_temps.get(def.index())?;
-                plan.backedge_target_overrides
-                    .insert(def_temp, target.clone());
-            }
+            self.extend_loop_state_input_overrides(
+                candidate,
+                value.reg,
+                value.inside_arm.defs().map(SsaValue::Def),
+                &target,
+                &mut plan.backedge_target_overrides,
+            );
 
             plan.states.push(LoopStateSlot {
                 phi_id: Some(value.phi_id),
@@ -128,11 +128,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             let target = self.loop_state_target(candidate, exit, value.reg, temp, target_overrides);
             plan.backedge_target_overrides.insert(temp, target.clone());
             if self.lowering.dataflow.phi_use_count(value.phi_id) > 0 {
-                for def in value.inside_arm.defs() {
-                    let def_temp = *self.lowering.bindings.fixed_temps.get(def.index())?;
-                    plan.backedge_target_overrides
-                        .insert(def_temp, target.clone());
-                }
+                self.extend_loop_state_input_overrides(
+                    candidate,
+                    value.reg,
+                    value.inside_arm.defs().map(SsaValue::Def),
+                    &target,
+                    &mut plan.backedge_target_overrides,
+                );
             }
 
             plan.states.push(LoopStateSlot {
@@ -154,6 +156,68 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         );
 
         Some(plan)
+    }
+
+    fn extend_loop_state_input_overrides(
+        &self,
+        candidate: &LoopCandidate,
+        reg: Reg,
+        values: impl IntoIterator<Item = SsaValue>,
+        target: &HirLValue,
+        overrides: &mut BTreeMap<TempId, HirLValue>,
+    ) {
+        let mut pending = values.into_iter().collect::<Vec<_>>();
+        let mut seen_defs = BTreeSet::new();
+        let mut seen_phis = BTreeSet::new();
+        while let Some(value) = pending.pop() {
+            match value {
+                SsaValue::Def(def) => {
+                    if !seen_defs.insert(def) {
+                        continue;
+                    }
+                    let temp = self.lowering.bindings.fixed_temps[def.index()];
+                    if target != &HirLValue::Temp(temp) {
+                        overrides.insert(temp, target.clone());
+                    }
+                    if !candidate
+                        .blocks
+                        .contains(&self.lowering.dataflow.def_block(def))
+                    {
+                        continue;
+                    }
+                    let instr = self.lowering.dataflow.def_instr(def);
+                    if let Some(inputs) = self.lowering.dataflow.use_values_at(instr).get(reg) {
+                        pending.extend(inputs.iter());
+                    }
+                }
+                SsaValue::Phi(phi_id) => {
+                    let Some(phi) = self.lowering.dataflow.phi_candidate(phi_id) else {
+                        continue;
+                    };
+                    if phi.reg != reg
+                        || !candidate.blocks.contains(&phi.block)
+                        || !seen_phis.insert(phi_id)
+                    {
+                        continue;
+                    }
+                    let temp = self.lowering.bindings.phi_temps[phi_id.index()];
+                    if target != &HirLValue::Temp(temp) {
+                        overrides.insert(temp, target.clone());
+                    }
+                    pending.extend(
+                        phi.incoming
+                            .iter()
+                            .filter(|incoming| {
+                                incoming
+                                    .pred
+                                    .is_some_and(|pred| candidate.blocks.contains(&pred))
+                            })
+                            .flat_map(|incoming| incoming.defs.iter().copied())
+                            .map(SsaValue::Def),
+                    );
+                }
+            }
+        }
     }
 
     fn add_loop_live_out_states(
@@ -403,6 +467,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             if let Some(target) = self.inherited_exit_target_for_value(value, target_overrides)
                 && let Some(expr) = lvalue_as_expr(&target)
             {
+                let phi_temp = self.lowering.bindings.phi_temps[value.phi_id.index()];
+                if target_overrides.get(&phi_temp) == Some(&target) {
+                    self.replace_phi_with_entry_expr(at_block, value.phi_id, value.reg, expr);
+                    continue;
+                }
                 // 直接用 insert_phi_expr 而不是 replace_phi_with_target_expr：
                 // 后者在 target_temp == phi_temp 时只会 suppress phi，结果 `if t_phi`
                 // 仍然会保留原 phi temp 的引用；这里我们已经知道要把整条 phi 的物化
