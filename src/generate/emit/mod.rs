@@ -228,7 +228,9 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_stmt_separator(&self, prev: &crate::ast::AstStmt, next: &crate::ast::AstStmt) -> Doc {
-        if is_function_stmt(prev) || is_function_stmt(next) {
+        if stmt_can_absorb_call_suffix(prev) && stmt_starts_with_parenthesized_call(next) {
+            Doc::concat([Doc::text(";"), Doc::line()])
+        } else if is_function_stmt(prev) || is_function_stmt(next) {
             Doc::concat([Doc::line(), Doc::line()])
         } else {
             Doc::line()
@@ -247,4 +249,43 @@ fn is_function_stmt(stmt: &crate::ast::AstStmt) -> bool {
         stmt,
         crate::ast::AstStmt::FunctionDecl(_) | crate::ast::AstStmt::LocalFunctionDecl(_)
     )
+}
+
+fn stmt_can_absorb_call_suffix(stmt: &crate::ast::AstStmt) -> bool {
+    match stmt {
+        crate::ast::AstStmt::LocalDecl(decl) => !decl.values.is_empty(),
+        crate::ast::AstStmt::GlobalDecl(decl) => !decl.values.is_empty(),
+        crate::ast::AstStmt::Assign(_) | crate::ast::AstStmt::CallStmt(_) => true,
+        crate::ast::AstStmt::Return(ret) => !ret.values.is_empty(),
+        _ => false,
+    }
+}
+
+fn stmt_starts_with_parenthesized_call(stmt: &crate::ast::AstStmt) -> bool {
+    let crate::ast::AstStmt::CallStmt(call) = stmt else {
+        return false;
+    };
+    match &call.call {
+        crate::ast::AstCallKind::Call(call) => prefix_expr_starts_with_parenthesis(&call.callee),
+        crate::ast::AstCallKind::MethodCall(call) => {
+            prefix_expr_starts_with_parenthesis(&call.receiver)
+        }
+    }
+}
+
+fn prefix_expr_starts_with_parenthesis(expr: &crate::ast::AstExpr) -> bool {
+    match expr {
+        crate::ast::AstExpr::Var(_) => false,
+        crate::ast::AstExpr::FieldAccess(access) => {
+            prefix_expr_starts_with_parenthesis(&access.base)
+        }
+        crate::ast::AstExpr::IndexAccess(access) => {
+            prefix_expr_starts_with_parenthesis(&access.base)
+        }
+        crate::ast::AstExpr::Call(call) => prefix_expr_starts_with_parenthesis(&call.callee),
+        crate::ast::AstExpr::MethodCall(call) => {
+            prefix_expr_starts_with_parenthesis(&call.receiver)
+        }
+        _ => true,
+    }
 }

@@ -58,11 +58,11 @@ pub fn format_low_instr(instr: &LowInstr) -> String {
         LowInstr::GetUpvalue(instr) => format!(
             "get-upvalue {} <- {}",
             format_reg(instr.dst),
-            format_upvalue(instr.src)
+            format_upvalue_operand(instr.src)
         ),
         LowInstr::SetUpvalue(instr) => format!(
             "set-upvalue {} <- {}",
-            format_upvalue(instr.dst),
+            format_upvalue_operand(instr.dst),
             format_value_operand(instr.src)
         ),
         LowInstr::GetTable(instr) => format!(
@@ -179,6 +179,13 @@ fn format_const(const_ref: super::ConstRef) -> String {
 
 fn format_upvalue(upvalue_ref: super::UpvalueRef) -> String {
     format!("u{}", upvalue_ref.index())
+}
+
+fn format_upvalue_operand(operand: super::UpvalueOperand) -> String {
+    match operand {
+        super::UpvalueOperand::Env => "env".to_owned(),
+        super::UpvalueOperand::Upvalue(upvalue) => format_upvalue(upvalue),
+    }
 }
 
 fn format_proto(proto_ref: super::ProtoRef) -> String {

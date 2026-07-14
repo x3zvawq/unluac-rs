@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 use super::exprs::{
     expr_for_closure_capture, expr_for_const, expr_for_reg_use, expr_for_value_operand,
     is_multiret_results, lower_binary_op, lower_branch_cond, lower_method_name,
-    lower_table_access_expr, lower_table_access_target, lower_unary_op, lower_value_pack,
-    lower_value_pack_components,
+    lower_table_access_expr, lower_table_access_target, lower_unary_op, lower_upvalue_operand_expr,
+    lower_upvalue_operand_target, lower_value_pack, lower_value_pack_components,
 };
 use super::helpers::{
     assign_stmt, binary_expr, branch_stmt, build_label_map_for_summary, concat_expr,
@@ -25,7 +25,7 @@ use super::lower::ProtoLowering;
 use crate::hir::common::{
     HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirCallStmt, HirCapture, HirClose,
     HirClosureExpr, HirExpr, HirLValue, HirLabelId, HirLocalDecl, HirStmt, HirTableSetList,
-    HirToBeClosed, HirUnaryExpr, LocalId, UpvalueId,
+    HirToBeClosed, HirUnaryExpr, LocalId,
 };
 use crate::structure::BlockRef;
 use crate::transformer::{
@@ -102,10 +102,10 @@ pub(super) fn lower_regular_instr(
         LowInstr::GetUpvalue(get_upvalue) => fixed_assign(
             lowering,
             instr_ref,
-            vec![HirExpr::UpvalueRef(UpvalueId(get_upvalue.src.index()))],
+            vec![lower_upvalue_operand_expr(lowering, get_upvalue.src)],
         ),
         LowInstr::SetUpvalue(set_upvalue) => vec![assign_stmt(
-            vec![HirLValue::Upvalue(UpvalueId(set_upvalue.dst.index()))],
+            vec![lower_upvalue_operand_target(lowering, set_upvalue.dst)],
             vec![expr_for_value_operand(
                 lowering,
                 block,

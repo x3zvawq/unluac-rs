@@ -14,8 +14,8 @@ use crate::parser::family::puc_lua::{
     inherit_source, parse_abs_debug_sections, parse_luac_data_header_prelude,
     parse_puc_lua_instruction_section, parse_tagged_literal_pool, parse_upvalues_with_kinds,
     read_f64_sentinel, read_i64_sentinel, read_i64_sentinel_endianness, read_proto_prelude,
-    require_present, validate_instruction_word_size, validate_main_proto_upvalue_count,
-    validate_optional_count_match,
+    read_sized_u32, require_present, validate_instruction_word_size,
+    validate_main_proto_upvalue_count, validate_optional_count_match,
 };
 use crate::parser::options::ParseOptions;
 use crate::parser::raw::{
@@ -92,8 +92,8 @@ impl<'a, 'bytes> AbsDebugDriver<'bytes> for Lua55AbsDebugDriver<'a> {
         reader: &mut BinaryReader<'bytes>,
     ) -> Result<(u32, u32), ParseError> {
         Ok((
-            reader.read_varint_u32_lua55("abs line info pc")?,
-            reader.read_varint_u32_lua55("abs line info line")?,
+            read_sized_u32(reader, self.layout, "abs line info pc")?,
+            read_sized_u32(reader, self.layout, "abs line info line")?,
         ))
     }
 

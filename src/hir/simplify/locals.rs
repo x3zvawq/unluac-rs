@@ -337,12 +337,6 @@ fn collect_plans(
             sticky_slots = sticky_slots_for_stmt;
             continue;
         }
-        // 外层作用域仍在引用的 temp 不能在子作用域提升为块级 local，
-        // 否则外层读到的是一个永远未被赋值的孤儿 temp。
-        if outer_used_temps.contains(&root_temp) {
-            sticky_slots = sticky_slots_for_stmt;
-            continue;
-        }
         // 目标 temp 自己又出现在 RHS 里时，这条赋值表达的是“沿用同一状态槽位继续更新”，
         // 不能在 locals pass 里把它误提升成新的 block-local。否则像 loop carried state
         // 或分支内的状态写回，会被拆成 `local next = step(state)`，原状态槽位反而失去写回。
@@ -377,6 +371,13 @@ fn collect_plans(
             if temp_touches.stmt_touches_any(future_index, &group) {
                 has_future_touch = true;
             }
+        }
+
+        // 别名扩张后的任一 temp 仍被外层读取时，整个组都不能在子作用域提升；
+        // 只检查 root 会让内层 local 吞掉外层 loop state 的别名。
+        if !group.is_disjoint(outer_used_temps) {
+            sticky_slots = sticky_slots_for_stmt;
+            continue;
         }
 
         let sticky_local = facts

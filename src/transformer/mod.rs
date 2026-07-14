@@ -24,7 +24,7 @@ pub use common::{
     LoweredProto, LoweringMap, MethodNameHint, MoveInstr, NewTableInstr, NumberLiteral,
     NumericForInitInstr, NumericForLoopInstr, ProtoRef, RawInstrRef, Reg, RegRange, ResultPack,
     ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr, TbcInstr,
-    UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    UnaryOpInstr, UnaryOpKind, UpvalueOperand, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 pub use debug::dump_lir;
 pub use error::TransformError;

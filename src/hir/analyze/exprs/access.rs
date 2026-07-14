@@ -79,9 +79,7 @@ pub(crate) fn lower_table_access_expr(
     base: AccessBase,
     key: AccessKey,
 ) -> HirExpr {
-    if matches!(base, AccessBase::Env)
-        && let Some(name) = global_name_from_key(lowering, key)
-    {
+    if let Some(name) = global_name_for_access(lowering, block, instr_ref, base, key) {
         return HirExpr::GlobalRef(HirGlobalRef { name });
     }
 
@@ -98,9 +96,7 @@ pub(crate) fn lower_table_access_target(
     base: AccessBase,
     key: AccessKey,
 ) -> HirLValue {
-    if matches!(base, AccessBase::Env)
-        && let Some(name) = global_name_from_key(lowering, key)
-    {
+    if let Some(name) = global_name_for_access(lowering, block, instr_ref, base, key) {
         return HirLValue::Global(HirGlobalRef { name });
     }
 
@@ -117,9 +113,7 @@ pub(crate) fn lower_table_access_expr_inline(
     base: AccessBase,
     key: AccessKey,
 ) -> HirExpr {
-    if access_base_is_named_env(lowering.proto, base)
-        && let Some(name) = global_name_from_key(lowering, key)
-    {
+    if let Some(name) = global_name_for_access(lowering, block, instr_ref, base, key) {
         return HirExpr::GlobalRef(HirGlobalRef { name });
     }
 
@@ -137,11 +131,9 @@ fn lower_access_base_expr(
 ) -> HirExpr {
     match base {
         AccessBase::Reg(reg) => expr_for_reg_use(lowering, block, instr_ref, reg),
-        AccessBase::Env => HirExpr::GlobalRef(HirGlobalRef {
-            name: "_ENV".to_owned(),
-        }),
+        AccessBase::Env => lower_upvalue_operand_expr(lowering, UpvalueOperand::Env),
         AccessBase::Upvalue(upvalue) => {
-            HirExpr::UpvalueRef(lowering.bindings.upvalues[upvalue.index()])
+            lower_upvalue_operand_expr(lowering, UpvalueOperand::Upvalue(upvalue))
         }
     }
 }
@@ -154,11 +146,37 @@ fn lower_access_base_expr_inline(
 ) -> HirExpr {
     match base {
         AccessBase::Reg(reg) => expr_for_reg_use_inline(lowering, block, instr_ref, reg),
-        AccessBase::Env => HirExpr::GlobalRef(HirGlobalRef {
+        AccessBase::Env => lower_upvalue_operand_expr(lowering, UpvalueOperand::Env),
+        AccessBase::Upvalue(upvalue) => {
+            lower_upvalue_operand_expr(lowering, UpvalueOperand::Upvalue(upvalue))
+        }
+    }
+}
+
+pub(in crate::hir::analyze) fn lower_upvalue_operand_expr(
+    lowering: &ProtoLowering<'_>,
+    operand: UpvalueOperand,
+) -> HirExpr {
+    match operand {
+        UpvalueOperand::Env => HirExpr::GlobalRef(HirGlobalRef {
             name: "_ENV".to_owned(),
         }),
-        AccessBase::Upvalue(upvalue) => {
+        UpvalueOperand::Upvalue(upvalue) => {
             HirExpr::UpvalueRef(lowering.bindings.upvalues[upvalue.index()])
+        }
+    }
+}
+
+pub(in crate::hir::analyze) fn lower_upvalue_operand_target(
+    lowering: &ProtoLowering<'_>,
+    operand: UpvalueOperand,
+) -> HirLValue {
+    match operand {
+        UpvalueOperand::Env => HirLValue::Global(HirGlobalRef {
+            name: "_ENV".to_owned(),
+        }),
+        UpvalueOperand::Upvalue(upvalue) => {
+            HirLValue::Upvalue(lowering.bindings.upvalues[upvalue.index()])
         }
     }
 }
@@ -170,9 +188,7 @@ pub(crate) fn lower_table_access_expr_single_eval(
     base: AccessBase,
     key: AccessKey,
 ) -> HirExpr {
-    if access_base_is_named_env(lowering.proto, base)
-        && let Some(name) = global_name_from_key(lowering, key)
-    {
+    if let Some(name) = global_name_for_access(lowering, block, instr_ref, base, key) {
         return HirExpr::GlobalRef(HirGlobalRef { name });
     }
 
@@ -252,35 +268,63 @@ fn lower_access_key_expr_inline(
     }
 }
 
-fn access_base_is_named_env(proto: &LoweredProto, base: AccessBase) -> bool {
+fn global_name_for_access(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    base: AccessBase,
+    key: AccessKey,
+) -> Option<String> {
+    access_base_is_env(lowering, block, instr_ref, base)
+        .then(|| global_name_from_key(lowering, block, instr_ref, key))?
+}
+
+fn access_base_is_env(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    base: AccessBase,
+) -> bool {
     match base {
         AccessBase::Env => true,
-        AccessBase::Upvalue(upvalue) => proto
-            .debug_info
-            .common
-            .upvalue_names
-            .get(upvalue.index())
-            .is_some_and(|name| {
-                name.as_ref()
-                    .is_some_and(|name| decode_raw_string(name) == "_ENV")
-            }),
-        AccessBase::Reg(_) => false,
+        AccessBase::Reg(reg) => matches!(
+            expr_for_reg_use_inline(lowering, block, instr_ref, reg),
+            HirExpr::GlobalRef(global) if global.name == "_ENV"
+        ),
+        AccessBase::Upvalue(_) => false,
     }
 }
 
-fn global_name_from_key(lowering: &ProtoLowering<'_>, key: AccessKey) -> Option<String> {
-    let AccessKey::Const(const_ref) = key else {
-        return None;
+fn global_name_from_key(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    key: AccessKey,
+) -> Option<String> {
+    let name = match key {
+        AccessKey::Const(const_ref) => {
+            let RawLiteralConst::String(value) = lowering
+                .proto
+                .constants
+                .common
+                .literals
+                .get(const_ref.index())?
+            else {
+                return None;
+            };
+            decode_raw_string(value)
+        }
+        AccessKey::Reg(reg) => {
+            let HirExpr::String(value) = expr_for_reg_use_inline(lowering, block, instr_ref, reg)
+            else {
+                return None;
+            };
+            value
+                .preferred_text()
+                .or_else(|| value.as_utf8())?
+                .to_owned()
+        }
+        AccessKey::Integer(_) => return None,
     };
-    let RawLiteralConst::String(value) = lowering
-        .proto
-        .constants
-        .common
-        .literals
-        .get(const_ref.index())?
-    else {
-        return None;
-    };
-    let name = decode_raw_string(value);
     is_lua_identifier_name(&name, lowering.target.version).then_some(name)
 }

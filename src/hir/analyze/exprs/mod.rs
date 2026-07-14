@@ -21,11 +21,12 @@ use crate::structure::{DefId, SsaValue};
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpKind, BranchCond, BranchOperands, BranchPredicate, CallKind,
     CondOperand, ConstRef, InstrRef, LowInstr, LoweredProto, MethodNameHint, Reg, ResultPack,
-    UnaryOpKind, ValueOperand,
+    UnaryOpKind, UpvalueOperand, ValueOperand,
 };
 
 pub(super) use self::access::{
     expr_for_const, expr_for_value_operand, lower_table_access_expr, lower_table_access_target,
+    lower_upvalue_operand_expr, lower_upvalue_operand_target,
 };
 use self::access::{
     expr_for_value_operand_inline, expr_for_value_operand_single_eval_pure_operand,

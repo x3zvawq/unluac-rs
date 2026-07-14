@@ -663,16 +663,19 @@ pub(crate) fn build_case_baseline(
         ));
     }
 
-    let (compiled_path, compile_output) =
-        compile_lua_case_to_suite_artifact(entry, suite_label, "compiled-source", true).map_err(
-            |error| {
-                TestFailure::new(
-                    FailureKind::CompileSourceFailed,
-                    "compile source failed",
-                    format!("compile source failed: {error}"),
-                )
-            },
-        )?;
+    let (compiled_path, compile_output) = compile_lua_case_to_suite_artifact(
+        entry,
+        suite_label,
+        "compiled-source",
+        !entry.options.retain_debug,
+    )
+    .map_err(|error| {
+        TestFailure::new(
+            FailureKind::CompileSourceFailed,
+            "compile source failed",
+            format!("compile source failed: {error}"),
+        )
+    })?;
     if !compile_output.success() {
         let reason = primary_command_reason(&compile_output)
             .map(|reason| format!(": {reason}"))
@@ -793,7 +796,7 @@ pub(crate) fn run_pipeline_case(
         entry,
         suite_label,
         &generated_source_path,
-        true,
+        !entry.options.retain_debug,
     )
     .map_err(|error| {
         TestFailure::new(
@@ -910,7 +913,7 @@ pub(crate) fn run_pipeline_case(
             entry,
             &format!("{suite_label}/{round_label}"),
             &prev_source_path,
-            true,
+            !entry.options.retain_debug,
         )
         .map_err(|error| {
             TestFailure::new(
@@ -995,7 +998,7 @@ pub(crate) fn run_pipeline_case(
             entry,
             &format!("{suite_label}/{round_label}-regen"),
             &regen_source_path,
-            true,
+            !entry.options.retain_debug,
         )
         .map_err(|error| {
             TestFailure::new(
@@ -1096,6 +1099,9 @@ fn decompile_options(entry: &LuaCaseManifestEntry) -> DecompileOptions {
         debug: Default::default(),
         ..DecompileOptions::default()
     };
+    if let Some(mode) = entry.options.naming_mode {
+        options.naming.mode = mode;
+    }
     options.generate.luau_vector_constructor =
         entry
             .options
@@ -1137,7 +1143,7 @@ fn compile_manifest_case(entry: &LuaCaseManifestEntry) -> Vec<u8> {
     compile_lua_case_inner(
         <&'static str>::from(entry.dialect),
         entry.path,
-        true,
+        !entry.options.retain_debug,
         entry.options,
     )
 }
@@ -1430,7 +1436,7 @@ fn run_compiler_to_output_path(
     options: LuaCaseOptions,
 ) -> Result<LuaCommandOutput, String> {
     if toolchain.compiler_protocol != LuaCompilerProtocol::LuauBinaryStdout
-        && options != LuaCaseOptions::default()
+        && (options.luau_optimization_level.is_some() || options.luau_vector.is_some())
     {
         return Err("Luau case options require the Luau compiler".to_owned());
     }

@@ -27,9 +27,11 @@ mod seeds;
 
 use std::collections::BTreeSet;
 
-use crate::hir::common::{HirBlock, HirProto, TempId};
+use crate::hir::common::{HirBlock, HirProto, HirStmt, TempId};
 
-use super::temp_touch::{TempRefScopeTracker, TempTouchIndex, collect_temp_refs_by_stmt};
+use super::temp_touch::{
+    TempRefScopeTracker, TempTouchIndex, collect_temp_refs_by_stmt, collect_temp_refs_in_expr,
+};
 use super::walk::for_each_nested_block_mut;
 
 use self::adjacent::try_collapse_adjacent_local_seed_handoff;
@@ -55,7 +57,10 @@ fn collapse_handoffs_recursive(block: &mut HirBlock, outer_temps: &BTreeSet<Temp
     let mut temp_refs = TempRefScopeTracker::new(&stmt_temp_refs);
     for index in 0..temp_refs.len() {
         temp_refs.enter_stmt(index);
-        let child_outer = temp_refs.outer_with_prefix_and_suffix(outer_temps);
+        let mut child_outer = temp_refs.outer_with_prefix_and_suffix(outer_temps);
+        if let HirStmt::Repeat(repeat_stmt) = &block.stmts[index] {
+            child_outer.extend(collect_temp_refs_in_expr(&repeat_stmt.cond));
+        }
 
         for_each_nested_block_mut(&mut block.stmts[index], &mut |nested_block| {
             changed |= collapse_handoffs_recursive(nested_block, &child_outer);

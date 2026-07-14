@@ -7,6 +7,7 @@
 use std::collections::BTreeSet;
 
 use super::super::binding_ref::binding_from_name_ref;
+use super::analysis::function_uses_global_name;
 use crate::ast::common::{
     AstAssign, AstBindingRef, AstExpr, AstFunctionDecl, AstFunctionExpr, AstFunctionName,
     AstGlobalBindingTarget, AstGlobalDecl, AstLValue, AstLocalAttr, AstLocalDecl,
@@ -132,6 +133,7 @@ pub(super) fn function_decl_target_from_lvalue(
             if method_fields.contains(&access.field)
                 && !func.params.is_empty()
                 && !function_captures_name_path_root(func, &root)
+                && !function_uses_global_name(func, "self")
             {
                 return Some((
                     AstFunctionName::Method(AstNamePath { root, fields }, access.field.clone()),

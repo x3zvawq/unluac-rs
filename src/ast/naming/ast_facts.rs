@@ -11,8 +11,8 @@ use crate::ast::traverse::{
     traverse_stmt_children,
 };
 use crate::ast::{
-    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue,
-    AstModule, AstNameRef, AstStmt, AstSyntheticLocalId,
+    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName,
+    AstGlobalBindingTarget, AstLValue, AstModule, AstNameRef, AstStmt, AstSyntheticLocalId,
 };
 use crate::hir::{HirModule, HirProtoRef};
 
@@ -25,6 +25,7 @@ pub(super) struct AstNamingFacts {
 pub(super) struct FunctionAstNamingFacts {
     pub(super) debug_like_binding_order: BTreeMap<AstBindingRef, usize>,
     pub(super) unused_synthetic_locals: BTreeSet<AstSyntheticLocalId>,
+    pub(super) reserved_global_names: BTreeSet<String>,
 }
 
 pub(super) fn collect_ast_naming_facts(module: &AstModule, hir: &HirModule) -> AstNamingFacts {
@@ -32,7 +33,23 @@ pub(super) fn collect_ast_naming_facts(module: &AstModule, hir: &HirModule) -> A
         functions: vec![FunctionAstNamingFacts::default(); hir.protos.len()],
     };
     collect_function_facts(module.entry_function, &module.body, hir, &mut facts);
+    propagate_subtree_global_names(module.entry_function, hir, &mut facts);
     facts
+}
+
+fn propagate_subtree_global_names(
+    function: HirProtoRef,
+    hir: &HirModule,
+    facts: &mut AstNamingFacts,
+) -> BTreeSet<String> {
+    let mut names = facts.functions[function.index()]
+        .reserved_global_names
+        .clone();
+    for child in &hir.protos[function.index()].children {
+        names.extend(propagate_subtree_global_names(*child, hir, facts));
+    }
+    facts.functions[function.index()].reserved_global_names = names.clone();
+    names
 }
 
 #[derive(Debug, Default)]
@@ -41,6 +58,7 @@ struct FunctionAstCollector {
     seen_bindings: BTreeSet<AstBindingRef>,
     declared_synthetic_locals: BTreeSet<AstSyntheticLocalId>,
     mentioned_synthetic_locals: BTreeSet<AstSyntheticLocalId>,
+    global_names: BTreeSet<String>,
 }
 
 impl FunctionAstCollector {
@@ -60,7 +78,12 @@ impl FunctionAstCollector {
                 self.note_binding(AstBindingRef::SyntheticLocal(local));
                 self.mentioned_synthetic_locals.insert(local);
             }
-            Some(AstBindingRef::Temp(_)) | None => {}
+            Some(AstBindingRef::Temp(_)) => {}
+            None => {
+                if let AstNameRef::Global(global) = name {
+                    self.global_names.insert(global.text.clone());
+                }
+            }
         }
     }
 
@@ -80,6 +103,7 @@ impl FunctionAstCollector {
         FunctionAstNamingFacts {
             debug_like_binding_order,
             unused_synthetic_locals,
+            reserved_global_names: self.global_names,
         }
     }
 }
@@ -133,6 +157,13 @@ fn collect_stmt_facts(
         AstStmt::LocalDecl(local_decl) => {
             for binding in &local_decl.bindings {
                 collector.note_binding(binding.id);
+            }
+        }
+        AstStmt::GlobalDecl(global_decl) => {
+            for binding in &global_decl.bindings {
+                if let AstGlobalBindingTarget::Name(name) = &binding.target {
+                    collector.global_names.insert(name.text.clone());
+                }
             }
         }
         AstStmt::NumericFor(numeric_for) => {

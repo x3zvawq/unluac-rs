@@ -98,7 +98,7 @@ impl FunctionNameAllocator {
                 renamed: false,
             };
         }
-        if candidate.source == NameSource::Discard {
+        if candidate.source == NameSource::Discard && !self.used.contains(&candidate.text) {
             return NameInfo {
                 text: candidate.text,
                 source: candidate.source,
@@ -146,7 +146,9 @@ pub(super) fn assign_names_for_function(
         assigned_functions,
         module_names,
     } = context;
-    let mut names = FunctionNameAllocator::new(lua_keywords());
+    let mut reserved_names = lua_keywords();
+    reserved_names.extend(ast_facts.reserved_global_names.iter().cloned());
+    let mut names = FunctionNameAllocator::new(reserved_names);
     let outer_visible_names = resolve_outer_visible_names(proto.id, lexical, assigned_functions)?;
     let upvalue_candidates = proto
         .upvalues

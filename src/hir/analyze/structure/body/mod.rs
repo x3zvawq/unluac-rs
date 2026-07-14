@@ -52,7 +52,7 @@ pub(super) struct StructuredBodyLowerer<'a, 'b> {
     pub(super) overrides: StructureOverrideState,
     pub(super) structured_close_points: BTreeSet<InstrRef>,
     pub(super) tbc_scope_regs: BTreeSet<usize>,
-    pub(super) visited: BTreeSet<BlockRef>,
+    pub(super) visited: TransactionalBlockSet,
     pub(super) active_loops: Vec<ActiveLoopContext>,
     reachability: RefCell<BTreeMap<BlockRef, BTreeSet<BlockRef>>>,
 }
@@ -105,12 +105,61 @@ pub(super) struct BreakExitBlock {
     pub(super) blocks: BTreeSet<BlockRef>,
 }
 
+#[derive(Debug)]
+pub(super) struct TransactionalBlockSet {
+    membership: Vec<bool>,
+    inserted: Vec<BlockRef>,
+}
+
+impl TransactionalBlockSet {
+    fn new(block_count: usize) -> Self {
+        Self {
+            membership: vec![false; block_count],
+            inserted: Vec::new(),
+        }
+    }
+
+    pub(super) fn contains(&self, block: &BlockRef) -> bool {
+        self.membership[block.index()]
+    }
+
+    pub(super) fn insert(&mut self, block: BlockRef) -> bool {
+        let member = &mut self.membership[block.index()];
+        if *member {
+            return false;
+        }
+        *member = true;
+        self.inserted.push(block);
+        true
+    }
+
+    pub(super) fn extend(&mut self, blocks: impl IntoIterator<Item = BlockRef>) {
+        for block in blocks {
+            self.insert(block);
+        }
+    }
+
+    fn checkpoint(&self) -> usize {
+        self.inserted.len()
+    }
+
+    fn rollback(&mut self, checkpoint: usize) {
+        while self.inserted.len() > checkpoint {
+            let block = self
+                .inserted
+                .pop()
+                .expect("visited rollback length should be valid");
+            self.membership[block.index()] = false;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct StructureStateCheckpoint {
     required_labels: BTreeSet<BlockRef>,
     merge_allowed_blocks: BTreeMap<BlockRef, BTreeSet<BlockRef>>,
     overrides: StructureOverrideState,
-    visited: BTreeSet<BlockRef>,
+    visited_len: usize,
     active_loops: Vec<ActiveLoopContext>,
     stmts_len: usize,
 }
@@ -121,7 +170,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             required_labels: self.required_labels.clone(),
             merge_allowed_blocks: self.merge_allowed_blocks.clone(),
             overrides: self.overrides.clone(),
-            visited: self.visited.clone(),
+            visited_len: self.visited.checkpoint(),
             active_loops: self.active_loops.clone(),
             stmts_len,
         }
@@ -135,7 +184,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.required_labels = checkpoint.required_labels;
         self.merge_allowed_blocks = checkpoint.merge_allowed_blocks;
         self.overrides = checkpoint.overrides;
-        self.visited = checkpoint.visited;
+        self.visited.rollback(checkpoint.visited_len);
         self.active_loops = checkpoint.active_loops;
         stmts.truncate(checkpoint.stmts_len);
     }
@@ -200,7 +249,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             overrides: StructureOverrideState::default(),
             structured_close_points,
             tbc_scope_regs,
-            visited: BTreeSet::new(),
+            visited: TransactionalBlockSet::new(lowering.cfg.blocks.len()),
             active_loops: Vec::new(),
             reachability: RefCell::new(BTreeMap::new()),
         }

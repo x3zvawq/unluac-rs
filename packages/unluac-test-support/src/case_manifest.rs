@@ -5,6 +5,7 @@
 //! 这样后续给 common case 显式挂多个 dialect 时，不需要回到“每行一个组合”的散乱写法。
 
 use strum_macros::{Display, IntoStaticStr};
+use unluac::ast::NamingMode;
 use unluac::decompile::DecompileDialect;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Display, IntoStaticStr)]
@@ -65,12 +66,16 @@ impl LuaCaseMatrixEntry {
 /// 单个源码 case 需要的宿主编译与反编译选项。
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub(crate) struct LuaCaseOptions {
+    pub(crate) retain_debug: bool,
+    pub(crate) naming_mode: Option<NamingMode>,
     pub(crate) luau_optimization_level: Option<u8>,
     pub(crate) luau_vector: Option<LuauVectorCaseOptions>,
 }
 
 impl LuaCaseOptions {
     const DEFAULT: Self = Self {
+        retain_debug: false,
+        naming_mode: None,
         luau_optimization_level: None,
         luau_vector: None,
     };
@@ -134,10 +139,14 @@ const PUC_LUA_GE_55: &[LuaCaseDialect] = &[LuaCaseDialect::Lua55];
 const LUAU_ONLY: &[LuaCaseDialect] = &[LuaCaseDialect::Luau];
 const LUAJIT_ONLY: &[LuaCaseDialect] = &[LuaCaseDialect::Luajit];
 const LUAU_OPTIMIZED_OPTIONS: LuaCaseOptions = LuaCaseOptions {
+    retain_debug: false,
+    naming_mode: None,
     luau_optimization_level: Some(2),
     luau_vector: None,
 };
 const LUAU_VECTOR_OPTIONS: LuaCaseOptions = LuaCaseOptions {
+    retain_debug: false,
+    naming_mode: None,
     luau_optimization_level: Some(2),
     luau_vector: Some(LuauVectorCaseOptions {
         library: Some("vector"),
@@ -176,7 +185,12 @@ const UNIT_CASES: &[LuaCaseMatrixEntry] = &[
     ),
     // ── dialect-specific cases ──
     LuaCaseMatrixEntry::new("tests/unit-case/lua51_01.lua", PUC_LUA_51),
-    LuaCaseMatrixEntry::new("tests/unit-case/lua52_01_env.lua", PUC_LUA_GE_52),
+    LuaCaseMatrixEntry::new("tests/unit-case/lua52_01_env.lua", PUC_LUA_GE_52).with_options(
+        LuaCaseOptions {
+            retain_debug: true,
+            ..LuaCaseOptions::DEFAULT
+        },
+    ),
     LuaCaseMatrixEntry::new("tests/unit-case/lua52_02_goto.lua", PUC_LUA_GE_52),
     // lua52_03_extraarg_boundary 太大，保留但不注册
     LuaCaseMatrixEntry::new("tests/unit-case/lua53_01.lua", PUC_LUA_GE_53),
@@ -216,7 +230,11 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_06_nested_repeat_continue_flag.lua",
         ALL_DIALECTS,
-    ),
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_07_close_scope_slot_reuse.lua",
         PUC_LUA_GE_53,
@@ -879,6 +897,39 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_160_captured_slot_receiver_eval.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_161_lua55_abs_line_info_layout.lua",
+        PUC_LUA_GE_55,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_162_table_checkpoint_new_pending_rollback.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_163_lua54_wide_env_upvalue.lua",
+        PUC_LUA_GE_54,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_164_lua55_wide_global_decl.lua",
+        PUC_LUA_GE_55,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_165_global_name_binding_shadow.lua",
+        PUC_LUA_GE_52,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        naming_mode: Some(NamingMode::Simple),
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_166_parenthesized_call_separator.lua",
         ALL_DIALECTS,
     ),
 ];

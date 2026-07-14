@@ -267,7 +267,7 @@ impl<'a> ProtoLowerer<'a> {
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::GetUpvalue(GetUpvalueInstr {
                             dst,
-                            src: self.upvalue_ref(raw_pc, b as usize)?,
+                            src: self.upvalue_ref(raw_pc, b as usize)?.into(),
                         })),
                     );
                     raw_index += 1;
@@ -278,7 +278,7 @@ impl<'a> ProtoLowerer<'a> {
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::SetUpvalue(SetUpvalueInstr {
-                            dst: self.upvalue_ref(raw_pc, b as usize)?,
+                            dst: self.upvalue_ref(raw_pc, b as usize)?.into(),
                             src: ValueOperand::Reg(reg_from_u8(a)),
                         })),
                     );

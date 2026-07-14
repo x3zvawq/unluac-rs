@@ -35,12 +35,10 @@ pub struct LoweredProto {
     pub origin: Origin,
 }
 
-/// 基于 proto upvalue 描述符和父链传播结果，恢复当前 proto 哪些 upvalue 表示 `_ENV`。
+/// 基于 proto upvalue 描述符和父链传播结果，恢复当前 proto 哪些 upvalue 表示根环境。
 ///
-/// 这里优先使用 debug upvalue 名字；当 chunk 被 `luac -s` 剥掉调试信息后，再退回到
-/// “根 proto 的第一个 upvalue 是环境、子 proto 通过 upvalue 链继承环境” 这条
-/// 结构事实。这样能把 5.2+ 的全局访问重新落回 `AccessBase::Env`，而不是在后层
-/// 继续把 `_ENV` 当普通表 upvalue 猜来猜去。
+/// debug 中名为 `_ENV` 的 upvalue 也可能捕获父函数的同名局部表；只有根 proto 的首个
+/// upvalue 和子 proto 沿非 in-stack 描述符继承的身份，才能安全升级为裸 global 访问。
 pub(crate) fn resolve_env_upvalues(
     raw: &RawProto,
     parent_env_upvalues: Option<&[bool]>,
@@ -48,26 +46,6 @@ pub(crate) fn resolve_env_upvalues(
     let count = usize::from(raw.common.upvalues.common.count);
     let descriptors = &raw.common.upvalues.common.descriptors;
     let mut env_upvalues = vec![false; count];
-
-    for (index, name) in raw
-        .common
-        .debug_info
-        .common
-        .upvalue_names
-        .iter()
-        .enumerate()
-    {
-        if index >= count {
-            break;
-        }
-        if name
-            .as_ref()
-            .and_then(raw_string_value)
-            .is_some_and(|value| value == "_ENV")
-        {
-            env_upvalues[index] = true;
-        }
-    }
 
     if let Some(parent_env_upvalues) = parent_env_upvalues {
         for (index, descriptor) in descriptors.iter().enumerate() {
@@ -82,16 +60,12 @@ pub(crate) fn resolve_env_upvalues(
                 env_upvalues[index] = true;
             }
         }
-    } else if !env_upvalues.iter().any(|is_env| *is_env) && !env_upvalues.is_empty() {
+    } else if !env_upvalues.is_empty() {
         // Lua 5.2+ 根 proto 在 load 时会把第一个 upvalue 绑定到当前环境。
         env_upvalues[0] = true;
     }
 
     env_upvalues
-}
-
-fn raw_string_value(raw: &RawString) -> Option<&str> {
-    raw.text.as_ref().map(|text| text.value.as_str())
 }
 
 /// low/raw/debug 之间的统一映射关系。
@@ -316,6 +290,19 @@ pub enum AccessBase {
     Upvalue(UpvalueRef),
 }
 
+/// 上值读写的语义目标。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum UpvalueOperand {
+    Env,
+    Upvalue(UpvalueRef),
+}
+
+impl From<UpvalueRef> for UpvalueOperand {
+    fn from(upvalue: UpvalueRef) -> Self {
+        Self::Upvalue(upvalue)
+    }
+}
+
 /// 表访问的 key。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum AccessKey {
@@ -439,7 +426,7 @@ pub struct ConcatInstr {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct GetUpvalueInstr {
     pub dst: Reg,
-    pub src: UpvalueRef,
+    pub src: UpvalueOperand,
 }
 
 /// 上值写入。
@@ -451,7 +438,7 @@ pub struct GetUpvalueInstr {
 /// 还原表达式即可，避免在 lowering 里临时凑寄存器。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct SetUpvalueInstr {
-    pub dst: UpvalueRef,
+    pub dst: UpvalueOperand,
     pub src: ValueOperand,
 }
 

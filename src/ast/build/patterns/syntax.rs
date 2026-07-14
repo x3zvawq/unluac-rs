@@ -58,12 +58,21 @@ impl<'a> AstLowerer<'a> {
         {
             return Ok(None);
         }
-        let Some(name) = err_nnil.name.as_ref() else {
+        let HirExpr::GlobalRef(probe_global) = &probe.values[0] else {
             return Ok(None);
         };
-        if !lvalue_matches_global_name(&assign.targets[0], name) {
+        let HirLValue::Global(assign_global) = &assign.targets[0] else {
+            return Ok(None);
+        };
+        if probe_global.name != assign_global.name
+            || err_nnil
+                .name
+                .as_ref()
+                .is_some_and(|name| name != &assign_global.name)
+        {
             return Ok(None);
         }
+        let name = assign_global.name.clone();
 
         let values = assign
             .values
@@ -73,7 +82,7 @@ impl<'a> AstLowerer<'a> {
         Ok(Some((
             AstStmt::GlobalDecl(Box::new(AstGlobalDecl {
                 bindings: vec![AstGlobalBinding {
-                    target: AstGlobalBindingTarget::Name(AstGlobalName { text: name.clone() }),
+                    target: AstGlobalBindingTarget::Name(AstGlobalName { text: name }),
                     attr: AstGlobalAttr::None,
                 }],
                 values,
@@ -205,16 +214,6 @@ impl<'a> AstLowerer<'a> {
             )?,
             consumed,
         )))
-    }
-}
-
-fn lvalue_matches_global_name(target: &HirLValue, name: &str) -> bool {
-    match target {
-        HirLValue::Global(global) => global.name == name,
-        HirLValue::TableAccess(access) => {
-            matches!(&access.key, HirExpr::String(key) if key.as_utf8() == Some(name))
-        }
-        _ => false,
     }
 }
 

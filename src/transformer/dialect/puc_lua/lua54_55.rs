@@ -18,7 +18,7 @@ use crate::transformer::dialect::puc_lua::{
     helper_jump_asj, immediate_binary_shape, immediate_cond_operand, jump_target_back_bx,
     jump_target_forward_bx, jump_target_sj, k_value_operand, lower_chunk_with_env,
     numeric_for_regs, prepare_env_lowering, range_len_inclusive, reg_from_u8,
-    register_binary_shape, return_pack,
+    register_binary_shape, return_pack, upvalue_operand as shared_upvalue_operand,
 };
 use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
@@ -259,7 +259,12 @@ impl<'a> ProtoLowerer<'a> {
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::GetUpvalue(GetUpvalueInstr {
                             dst,
-                            src: self.upvalue_ref(raw_pc, b as usize)?,
+                            src: shared_upvalue_operand(
+                                self.raw,
+                                &self.env_upvalues,
+                                raw_pc,
+                                b as usize,
+                            )?,
                         })),
                     );
                     raw_index += 1;
@@ -373,7 +378,12 @@ impl<'a> ProtoLowerer<'a> {
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::SetUpvalue(SetUpvalueInstr {
-                            dst: self.upvalue_ref(raw_pc, b as usize)?,
+                            dst: shared_upvalue_operand(
+                                self.raw,
+                                &self.env_upvalues,
+                                raw_pc,
+                                b as usize,
+                            )?,
                             src: ValueOperand::Reg(reg_from_u8(a)),
                         })),
                     );

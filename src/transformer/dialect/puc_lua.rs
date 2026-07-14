@@ -15,7 +15,7 @@ use crate::transformer::{
     AccessBase, AccessKey, BinaryOpKind, CallInstr, CallKind, CloseInstr, CondOperand, ConstRef,
     GenericForCallInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MethodNameHint,
     NumberLiteral, ProtoRef, Reg, RegRange, ResultPack, ReturnInstr, TailCallInstr, TbcInstr,
-    TransformError, UpvalueRef, ValueOperand, ValuePack,
+    TransformError, UpvalueOperand, UpvalueRef, ValueOperand, ValuePack,
 };
 
 pub(crate) const BITRK: u16 = 1 << 8;
@@ -998,11 +998,23 @@ pub(crate) fn access_base_for_upvalue(
     raw_pc: u32,
     index: usize,
 ) -> Result<AccessBase, TransformError> {
+    Ok(match upvalue_operand(raw, env_upvalues, raw_pc, index)? {
+        UpvalueOperand::Env => AccessBase::Env,
+        UpvalueOperand::Upvalue(upvalue) => AccessBase::Upvalue(upvalue),
+    })
+}
+
+pub(crate) fn upvalue_operand(
+    raw: &RawProto,
+    env_upvalues: &[bool],
+    raw_pc: u32,
+    index: usize,
+) -> Result<UpvalueOperand, TransformError> {
     let upvalue = checked_upvalue_ref(raw, raw_pc, index)?;
     Ok(if env_upvalues.get(index).copied().unwrap_or(false) {
-        AccessBase::Env
+        UpvalueOperand::Env
     } else {
-        AccessBase::Upvalue(upvalue)
+        UpvalueOperand::Upvalue(upvalue)
     })
 }
 

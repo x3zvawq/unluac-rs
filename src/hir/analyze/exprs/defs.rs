@@ -211,7 +211,7 @@ pub(crate) fn expr_for_dup_safe_fixed_def(
             Some(value)
         }
         LowInstr::GetUpvalue(get_upvalue) if get_upvalue.dst == def_reg => {
-            Some(HirExpr::UpvalueRef(UpvalueId(get_upvalue.src.index())))
+            Some(lower_upvalue_operand_expr(lowering, get_upvalue.src))
         }
         _ => None,
     }

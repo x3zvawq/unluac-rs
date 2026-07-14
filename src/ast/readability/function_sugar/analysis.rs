@@ -6,7 +6,10 @@
 
 use std::collections::BTreeSet;
 
-use crate::ast::common::{AstBlock, AstCallKind, AstExpr, AstFunctionName, AstModule, AstStmt};
+use crate::ast::common::{
+    AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstGlobalBindingTarget,
+    AstLValue, AstModule, AstNameRef, AstStmt,
+};
 
 use super::super::visit::{self, AstVisitor};
 
@@ -22,6 +25,54 @@ pub(super) fn collect_method_field_names_in_block(block: &AstBlock, fields: &mut
     };
     visit::visit_block(block, &mut visitor);
     *fields = visitor.fields;
+}
+
+pub(super) fn function_uses_global_name(function: &AstFunctionExpr, name: &str) -> bool {
+    let mut visitor = GlobalNameFinder { name, found: false };
+    visit::visit_block(&function.body, &mut visitor);
+    visitor.found
+}
+
+struct GlobalNameFinder<'a> {
+    name: &'a str,
+    found: bool,
+}
+
+impl AstVisitor for GlobalNameFinder<'_> {
+    fn visit_stmt(&mut self, stmt: &AstStmt) {
+        match stmt {
+            AstStmt::GlobalDecl(decl) => {
+                self.found |= decl.bindings.iter().any(|binding| {
+                    matches!(&binding.target, AstGlobalBindingTarget::Name(global) if global.text == self.name)
+                });
+            }
+            AstStmt::FunctionDecl(decl) => {
+                let path = match &decl.target {
+                    AstFunctionName::Plain(path) | AstFunctionName::Method(path, _) => path,
+                };
+                self.found |=
+                    matches!(&path.root, AstNameRef::Global(global) if global.text == self.name);
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &AstExpr) {
+        if matches!(expr, AstExpr::Var(AstNameRef::Global(global)) if global.text == self.name) {
+            self.found = true;
+        }
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &AstLValue) {
+        if matches!(lvalue, AstLValue::Name(AstNameRef::Global(global)) if global.text == self.name)
+        {
+            self.found = true;
+        }
+    }
+
+    fn visit_function_expr(&mut self, _function: &AstFunctionExpr) -> bool {
+        false
+    }
 }
 
 #[derive(Default)]

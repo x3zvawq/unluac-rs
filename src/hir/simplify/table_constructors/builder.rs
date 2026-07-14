@@ -39,7 +39,6 @@ pub(super) struct BuilderCheckpoint {
     fields_len: usize,
     trailing_multivalue: Option<HirExpr>,
     next_array_index: u32,
-    pending_integer_fields: BTreeMap<i64, usize>,
     restored_pending_integer_fields_len: usize,
 }
 
@@ -89,7 +88,6 @@ impl ConstructorBuilder {
             fields_len: self.fields.len(),
             trailing_multivalue: self.trailing_multivalue.clone(),
             next_array_index: self.next_array_index,
-            pending_integer_fields: self.pending_integer_fields.clone(),
             restored_pending_integer_fields_len: scratch.restored_pending_integer_fields.len(),
         }
     }
@@ -98,16 +96,21 @@ impl ConstructorBuilder {
         self.fields.truncate(checkpoint.fields_len);
         self.trailing_multivalue = checkpoint.trailing_multivalue;
         self.next_array_index = checkpoint.next_array_index;
-        self.pending_integer_fields = checkpoint.pending_integer_fields;
+        self.pending_integer_fields
+            .retain(|_, field_index| *field_index < checkpoint.fields_len);
         for restored in scratch.restored_pending_integer_fields
             [checkpoint.restored_pending_integer_fields_len..]
             .iter()
             .rev()
         {
-            self.fields[restored.field_index] = BuilderField::PendingInt {
-                key: restored.key,
-                value: restored.value.clone(),
-            };
+            if restored.field_index < checkpoint.fields_len {
+                self.fields[restored.field_index] = BuilderField::PendingInt {
+                    key: restored.key,
+                    value: restored.value.clone(),
+                };
+                self.pending_integer_fields
+                    .insert(restored.key, restored.field_index);
+            }
         }
         scratch
             .restored_pending_integer_fields

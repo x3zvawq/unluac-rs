@@ -551,7 +551,6 @@ fn sink_pending_bindings_into_block(
         ) {
             block.stmts[index] = rewritten;
             consumed += nested_consumed;
-            index += 1;
             continue;
         }
         let remaining_refs = BindingRefSet::from_bindings(remaining);
