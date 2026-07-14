@@ -361,17 +361,17 @@ fn write_branch_value_merges(
         for value in &candidate.values {
             let _ = writeln!(
                 output,
-                "{indent}      phi=p{} reg={} then-preds={} then-defs={} then-entry-defs={} then-update-defs={} else-preds={} else-defs={} else-entry-defs={} else-update-defs={}",
+                "{indent}      phi=p{} reg={} then-preds={} then-values={} then-entry-values={} then-update-values={} else-preds={} else-values={} else-entry-values={} else-update-values={}",
                 value.phi_id.index(),
                 value.reg,
                 format_display_set(&value.then_arm.preds),
-                format_display_set(&value.then_arm.defs),
-                format_display_set(&value.then_arm.entry_defs),
-                format_display_set(&value.then_arm.update_defs),
+                format_display_set(&value.then_arm.values),
+                format_display_set(&value.then_arm.entry_values),
+                format_display_set(&value.then_arm.update_values),
                 format_display_set(&value.else_arm.preds),
-                format_display_set(&value.else_arm.defs),
-                format_display_set(&value.else_arm.entry_defs),
-                format_display_set(&value.else_arm.update_defs),
+                format_display_set(&value.else_arm.values),
+                format_display_set(&value.else_arm.entry_values),
+                format_display_set(&value.else_arm.update_values),
             );
         }
     }
@@ -386,7 +386,7 @@ fn write_short_circuits(output: &mut String, indent: &str, candidates: &[ShortCi
     for candidate in candidates {
         let _ = writeln!(
             output,
-            "{indent}    header=#{} entry=n{} nodes={} exit={} result={} phi={} reducible={} blocks={} entry-defs={}",
+            "{indent}    header=#{} entry=n{} nodes={} exit={} result={} phi={} reducible={} blocks={} entry-value={}",
             candidate.header.index(),
             candidate.entry.index(),
             candidate.nodes.len(),
@@ -401,7 +401,10 @@ fn write_short_circuits(output: &mut String, indent: &str, candidates: &[ShortCi
                 .unwrap_or_else(|| "-".to_owned()),
             candidate.reducible,
             format_display_set(&candidate.blocks),
-            format_display_set(&candidate.entry_defs),
+            candidate
+                .entry_value
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
         );
         if !candidate.value_incomings.is_empty() {
             let _ = writeln!(
@@ -451,7 +454,7 @@ fn format_short_circuit_value_incomings(incomings: &[ShortCircuitValueIncoming])
             format!(
                 "{}=>{} local={}",
                 incoming.pred,
-                format_display_set(&incoming.defs),
+                incoming.value,
                 incoming
                     .latest_local_def
                     .map(|def| def.to_string())
@@ -582,13 +585,13 @@ fn write_loop_exit_value_merge(
 fn write_loop_value_merge(output: &mut String, indent: &str, label: &str, value: &LoopValueMerge) {
     let _ = writeln!(
         output,
-        "{indent}      {label} phi=p{} reg={} inside-preds={} inside-defs={} outside-preds={} outside-defs={}",
+        "{indent}      {label} phi=p{} reg={} inside-preds={} inside-values={} outside-preds={} outside-values={}",
         value.phi_id.index(),
         value.reg,
         format_display_set(value.inside_arm.preds()),
-        format_display_set(value.inside_arm.defs()),
+        format_display_set(value.inside_arm.values()),
         format_display_set(value.outside_arm.preds()),
-        format_display_set(value.outside_arm.defs()),
+        format_display_set(value.outside_arm.values()),
     );
 }
 

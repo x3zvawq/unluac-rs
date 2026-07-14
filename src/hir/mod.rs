@@ -32,4 +32,3 @@ mod debug {
 }
 #[cfg(not(feature = "decompile-debug"))]
 pub use debug::dump_hir;
-pub(crate) use simplify::synthesize_readable_pure_logical_expr;

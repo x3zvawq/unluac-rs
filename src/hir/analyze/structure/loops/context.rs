@@ -13,6 +13,7 @@ use super::*;
 impl StructuredBodyLowerer<'_, '_> {
     pub(super) fn build_active_loop_context(
         &self,
+        candidate_id: LoopCandidateId,
         candidate: &LoopCandidate,
         post_loop: BlockRef,
         target_overrides: &BTreeMap<TempId, HirLValue>,
@@ -21,7 +22,7 @@ impl StructuredBodyLowerer<'_, '_> {
         let downstream_post_loop = self.normalized_post_loop_successor(post_loop);
         let mut break_exits = BTreeMap::new();
         for exit in candidate.exits.iter().copied().filter(|exit| {
-            *exit != post_loop && !self.loop_exit_enters_nested_loop(candidate, *exit)
+            *exit != post_loop && !self.loop_exit_enters_nested_loop(candidate_id, candidate, *exit)
         }) {
             if block_is_terminal_exit(self.lowering, exit) {
                 continue;
@@ -72,7 +73,7 @@ impl StructuredBodyLowerer<'_, '_> {
         }
 
         Some(ActiveLoopContext {
-            candidate_id: self.loop_candidate_id(candidate)?,
+            candidate_id,
             header: candidate.header,
             loop_blocks: BTreeSet::new(),
             post_loop,
@@ -107,6 +108,7 @@ impl StructuredBodyLowerer<'_, '_> {
 
     pub(super) fn loop_state_inside_exit_blocks(
         &self,
+        candidate_id: LoopCandidateId,
         candidate: &LoopCandidate,
         post_loop: BlockRef,
     ) -> Option<BTreeSet<BlockRef>> {
@@ -114,7 +116,7 @@ impl StructuredBodyLowerer<'_, '_> {
         let body_blocks = loop_body_blocks(candidate);
         let mut inside_blocks = body_blocks.clone();
         for exit in candidate.exits.iter().copied().filter(|exit| {
-            *exit != post_loop && !self.loop_exit_enters_nested_loop(candidate, *exit)
+            *exit != post_loop && !self.loop_exit_enters_nested_loop(candidate_id, candidate, *exit)
         }) {
             if block_is_terminal_exit(self.lowering, exit) {
                 continue;
@@ -137,13 +139,19 @@ impl StructuredBodyLowerer<'_, '_> {
         Some(inside_blocks)
     }
 
-    fn loop_exit_enters_nested_loop(&self, candidate: &LoopCandidate, exit: BlockRef) -> bool {
+    fn loop_exit_enters_nested_loop(
+        &self,
+        candidate_id: LoopCandidateId,
+        candidate: &LoopCandidate,
+        exit: BlockRef,
+    ) -> bool {
         self.lowering
             .structure
             .loop_candidates
             .iter()
-            .any(|nested| {
-                !std::ptr::eq(nested, candidate)
+            .enumerate()
+            .any(|(index, nested)| {
+                LoopCandidateId(index) != candidate_id
                     && nested.blocks.is_subset(&candidate.binding_scope_blocks)
                     && (nested.header == exit || nested.preheader == Some(exit))
             })

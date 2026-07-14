@@ -10,6 +10,8 @@ use crate::hir::common::{HirExpr, TempId};
 use crate::structure::{BlockRef, PhiId};
 use crate::transformer::{InstrRef, Reg};
 
+use super::rewrites::{expr_has_temp_ref_in, rewrite_expr_temps};
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct BlockOverrideState {
     entry_exprs: BTreeMap<Reg, HirExpr>,
@@ -21,6 +23,7 @@ pub(super) struct BlockOverrideState {
 #[derive(Debug, Clone, Default)]
 pub(super) struct StructureOverrideState {
     by_block: BTreeMap<BlockRef, BlockOverrideState>,
+    phi_temp_aliases: BTreeMap<TempId, HirExpr>,
     suppressed_phis: BTreeSet<PhiId>,
     suppressed_instrs: BTreeSet<InstrRef>,
 }
@@ -47,6 +50,25 @@ impl StructureOverrideState {
         self.by_block.get(&block).and_then(|state| {
             (!state.entry_temp_exprs.is_empty()).then_some(&state.entry_temp_exprs)
         })
+    }
+
+    pub(super) fn phi_temp_aliases(&self) -> &BTreeMap<TempId, HirExpr> {
+        &self.phi_temp_aliases
+    }
+
+    pub(super) fn alias_phi_temp(&mut self, temp: TempId, mut expr: HirExpr) -> bool {
+        // owner 本身就是该 temp 时，def target 已经直接写入它；不需要额外 alias，
+        // 但这不是跨 Phi 环，仍允许原 Phi 物化被结构 owner 接管。
+        if expr == HirExpr::TempRef(temp) {
+            self.phi_temp_aliases.remove(&temp);
+            return true;
+        }
+        rewrite_expr_temps(&mut expr, &self.phi_temp_aliases);
+        if expr_has_temp_ref_in(&expr, &BTreeSet::from([temp])) {
+            return false;
+        }
+        self.phi_temp_aliases.insert(temp, expr);
+        true
     }
 
     pub(super) fn insert_entry_expr(

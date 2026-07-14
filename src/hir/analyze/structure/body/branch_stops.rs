@@ -375,7 +375,7 @@ impl StructuredBodyLowerer<'_, '_> {
         {
             shared_tail
         } else if !self.branch_by_header.contains_key(&shared_tail)
-            && !self.loop_by_header.contains_key(&shared_tail)
+            && !self.loop_headers.contains(&shared_tail)
         {
             let successor = self.lowering.cfg.unique_reachable_successor(shared_tail)?;
             self.nested_loop_owner_for_entry(active_candidate, successor)?;
@@ -477,11 +477,11 @@ impl StructuredBodyLowerer<'_, '_> {
         {
             if self.block_is_active_loop_escape(merge) {
                 Some(branch_stop)
-            } else if self
-                .loop_by_header
-                .get(&merge)
-                .is_some_and(|loop_candidate| loop_candidate.preheader == Some(entry))
-            {
+            } else if self.loops_by_header.get(&merge).is_some_and(|candidates| {
+                candidates
+                    .iter()
+                    .any(|(_, candidate)| candidate.preheader == Some(entry))
+            }) {
                 // 分支的一臂直接回到外层 loop continue，另一臂入口可能正好是嵌套
                 // for-loop 的 preheader；此时 postdom 给出的 merge 是内层 loop header，
                 // 但它语义上属于这一条 arm，而不是两臂共享 tail。若把 arm 截到

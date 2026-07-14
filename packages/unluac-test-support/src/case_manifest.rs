@@ -122,6 +122,13 @@ const MUTABLE_NUMERIC_FOR_BINDING_DIALECTS: &[LuaCaseDialect] = &[
     LuaCaseDialect::Luajit,
     LuaCaseDialect::Luau,
 ];
+const PUC_LUA_ALL: &[LuaCaseDialect] = &[
+    LuaCaseDialect::Lua51,
+    LuaCaseDialect::Lua52,
+    LuaCaseDialect::Lua53,
+    LuaCaseDialect::Lua54,
+    LuaCaseDialect::Lua55,
+];
 const PUC_LUA_51: &[LuaCaseDialect] = &[LuaCaseDialect::Lua51];
 const PUC_LUA_GE_52: &[LuaCaseDialect] = &[
     LuaCaseDialect::Lua52,
@@ -930,6 +937,34 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
     }),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_166_parenthesized_call_separator.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_167_same_header_repeat_short_circuit.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_168_puc_repeat_condition_exit.lua",
+        PUC_LUA_ALL,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_169_same_header_conditional_sibling_latch.lua",
+        PUC_LUA_ALL,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_170_same_header_repeat_body.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_171_captured_alias_group_home_slot.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_172_temp_inline_eval_regions.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_173_terminal_return_call_order.lua",
         ALL_DIALECTS,
     ),
 ];

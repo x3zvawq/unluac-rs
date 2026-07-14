@@ -19,13 +19,9 @@ use self::candidate::{
     stmt_is_alias_initializer_sink, stmt_is_direct_return_value_sink,
 };
 use self::use_sites::rewrite_stmt_use_sites_with_policy;
-use super::super::common::{
-    AstBindingRef, AstBlock, AstCallExpr, AstCallKind, AstExpr, AstLValue, AstLocalAttr,
-    AstLocalDecl, AstLocalOrigin, AstModule, AstStmt,
-};
+use super::super::common::{AstBindingRef, AstBlock, AstExpr, AstModule, AstStmt};
 use super::ReadabilityContext;
 use super::binding_flow::BindingUseIndex;
-use super::binding_ref::name_matches_binding;
 use super::binding_tree::{
     expr_references_binding, stmt_has_access_base_binding_use, stmt_has_call_callee_binding_use,
     stmt_has_direct_call_arg_binding_use, stmt_has_index_binding_use, stmt_has_nested_binding_use,
@@ -157,9 +153,7 @@ fn rewrite_current_block(block: &mut AstBlock, options: ReadabilityOptions) -> b
             index += 1;
             continue;
         }
-        if super::expr_analysis::expr_observes_eval_order(value)
-            && !binding_is_first_stmt_eval(next_stmt, candidate.binding())
-        {
+        if inline_crosses_evaluation_boundary(value, next_stmt, candidate.binding()) {
             new_stmts.push(old_stmts[index].clone());
             index += 1;
             continue;
@@ -204,7 +198,6 @@ fn rewrite_current_block(block: &mut AstBlock, options: ReadabilityOptions) -> b
     }
 
     block.stmts = new_stmts;
-    changed |= materialize_terminal_return_call_alias(block);
     changed |= collapse_adjacent_call_alias_runs(block, options);
     changed |= collapse_terminal_call_result_alias_runs(block, options);
     changed |= collapse_terminal_local_mechanical_runs(block, options);
@@ -212,200 +205,15 @@ fn rewrite_current_block(block: &mut AstBlock, options: ReadabilityOptions) -> b
     changed
 }
 
-fn materialize_terminal_return_call_alias(block: &mut AstBlock) -> bool {
-    let old_stmts = std::mem::take(&mut block.stmts);
-    let use_index = BindingUseIndex::for_stmts(&old_stmts);
-    let mut new_stmts = Vec::with_capacity(old_stmts.len());
-    let mut changed = false;
-    let mut index = 0;
-
-    while index < old_stmts.len() {
-        let Some(next_stmt) = old_stmts.get(index + 1) else {
-            new_stmts.push(old_stmts[index].clone());
-            index += 1;
-            continue;
-        };
-
-        if let Some((local_decl, ret)) = try_materialize_terminal_return_call_alias(
-            &old_stmts[index],
-            next_stmt,
-            &use_index,
-            index,
-        ) {
-            new_stmts.push(AstStmt::LocalDecl(Box::new(local_decl)));
-            new_stmts.push(AstStmt::Return(Box::new(ret)));
-            changed = true;
-            index += 2;
-            continue;
-        }
-
-        new_stmts.push(old_stmts[index].clone());
-        index += 1;
-    }
-
-    block.stmts = new_stmts;
-    changed
-}
-
-fn try_materialize_terminal_return_call_alias(
-    current: &AstStmt,
-    next: &AstStmt,
-    use_index: &BindingUseIndex,
-    current_index: usize,
-) -> Option<(AstLocalDecl, super::super::common::AstReturn)> {
-    let AstStmt::LocalDecl(local_decl) = current else {
-        return None;
-    };
-    let [binding] = local_decl.bindings.as_slice() else {
-        return None;
-    };
-    let [callee_value] = local_decl.values.as_slice() else {
-        return None;
-    };
-    if binding.attr != AstLocalAttr::None
-        || binding.origin != AstLocalOrigin::Recovered
-        || !candidate::is_lookup_inline_expr(callee_value)
-    {
-        return None;
-    }
-    if use_index.count_uses_in_suffix(current_index + 1, binding.id) != 1 {
-        return None;
-    }
-
-    let AstStmt::Return(ret) = next else {
-        return None;
-    };
-    if ret.values.len() < 2
-        || ret.values[..ret.values.len() - 1]
-            .iter()
-            .any(super::expr_analysis::expr_observes_eval_order)
-    {
-        return None;
-    }
-    let last_value = ret.values.last()?;
-    let call = terminal_direct_callee_call(last_value, binding.id)?;
-
-    let mut rewritten_local = local_decl.as_ref().clone();
-    rewritten_local.values = vec![AstExpr::Call(Box::new(AstCallExpr {
-        callee: callee_value.clone(),
-        args: call.args.clone(),
-    }))];
-
-    let mut rewritten_return = ret.as_ref().clone();
-    let last_index = rewritten_return.values.len() - 1;
-    rewritten_return.values[last_index] = AstExpr::Var(binding.id.to_name_ref());
-
-    Some((rewritten_local, rewritten_return))
-}
-
-fn terminal_direct_callee_call(expr: &AstExpr, binding: AstBindingRef) -> Option<&AstCallExpr> {
-    match expr {
-        AstExpr::Call(call) if call_callee_is_binding(call, binding) => Some(call),
-        AstExpr::SingleValue(inner) => terminal_direct_callee_call(inner, binding),
-        _ => None,
-    }
-}
-
-fn call_callee_is_binding(call: &AstCallExpr, binding: AstBindingRef) -> bool {
-    matches!(&call.callee, AstExpr::Var(name) if name_matches_binding(name, binding))
-}
-
-fn binding_is_first_stmt_eval(stmt: &AstStmt, binding: AstBindingRef) -> bool {
-    match stmt {
-        AstStmt::LocalDecl(local_decl) => {
-            binding_is_first_eval_in_exprs(&local_decl.values, binding)
-        }
-        AstStmt::GlobalDecl(global_decl) => {
-            binding_is_first_eval_in_exprs(&global_decl.values, binding)
-        }
-        AstStmt::Assign(assign) => {
-            binding_is_first_eval_in_assign(&assign.targets, &assign.values, binding)
-        }
-        AstStmt::CallStmt(call_stmt) => binding_is_first_eval_in_call(&call_stmt.call, binding),
-        AstStmt::Return(ret) => binding_is_first_eval_in_exprs(&ret.values, binding),
-        AstStmt::If(if_stmt) => binding_is_first_eval_in_expr(&if_stmt.cond, binding),
-        AstStmt::While(while_stmt) => binding_is_first_eval_in_expr(&while_stmt.cond, binding),
-        AstStmt::NumericFor(numeric_for) => {
-            binding_is_first_eval_in_expr(&numeric_for.start, binding)
-        }
-        AstStmt::GenericFor(generic_for) => {
-            binding_is_first_eval_in_exprs(&generic_for.iterator, binding)
-        }
-        AstStmt::Repeat(_)
-        | AstStmt::DoBlock(_)
-        | AstStmt::FunctionDecl(_)
-        | AstStmt::LocalFunctionDecl(_)
-        | AstStmt::Break
-        | AstStmt::Continue
-        | AstStmt::Goto(_)
-        | AstStmt::Label(_)
-        | AstStmt::Error(_) => false,
-    }
-}
-
-fn binding_is_first_eval_in_exprs(exprs: &[AstExpr], binding: AstBindingRef) -> bool {
-    exprs
-        .first()
-        .is_some_and(|expr| binding_is_first_eval_in_expr(expr, binding))
-}
-
-fn binding_is_first_eval_in_assign(
-    targets: &[AstLValue],
-    values: &[AstExpr],
+fn inline_crosses_evaluation_boundary(
+    value: &AstExpr,
+    next_stmt: &AstStmt,
     binding: AstBindingRef,
 ) -> bool {
-    for target in targets {
-        match target {
-            AstLValue::Name(_) => {}
-            AstLValue::FieldAccess(access) => {
-                return binding_is_first_eval_in_expr(&access.base, binding);
-            }
-            AstLValue::IndexAccess(access) => {
-                return binding_is_first_eval_in_expr(&access.base, binding);
-            }
-        }
-    }
-    binding_is_first_eval_in_exprs(values, binding)
-}
-
-fn binding_is_first_eval_in_call(call: &AstCallKind, binding: AstBindingRef) -> bool {
-    match call {
-        AstCallKind::Call(call) => binding_is_first_eval_in_expr(&call.callee, binding),
-        AstCallKind::MethodCall(call) => binding_is_first_eval_in_expr(&call.receiver, binding),
-    }
-}
-
-fn binding_is_first_eval_in_expr(expr: &AstExpr, binding: AstBindingRef) -> bool {
-    match expr {
-        AstExpr::Var(name) => name_matches_binding(name, binding),
-        AstExpr::FieldAccess(access) => binding_is_first_eval_in_expr(&access.base, binding),
-        AstExpr::IndexAccess(access) => binding_is_first_eval_in_expr(&access.base, binding),
-        AstExpr::Unary(unary) => binding_is_first_eval_in_expr(&unary.expr, binding),
-        AstExpr::Binary(binary) => {
-            expr_references_binding(&binary.lhs, binding)
-                && binding_is_first_eval_in_expr(&binary.lhs, binding)
-        }
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            expr_references_binding(&logical.lhs, binding)
-                && binding_is_first_eval_in_expr(&logical.lhs, binding)
-        }
-        AstExpr::Call(call) => binding_is_first_eval_in_expr(&call.callee, binding),
-        AstExpr::MethodCall(call) => binding_is_first_eval_in_expr(&call.receiver, binding),
-        AstExpr::SingleValue(expr) => binding_is_first_eval_in_expr(expr, binding),
-        AstExpr::TableConstructor(_)
-        | AstExpr::FunctionExpr(_)
-        | AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Vector(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::VarArg
-        | AstExpr::Error(_) => false,
-    }
+    (matches!(next_stmt, AstStmt::While(_) | AstStmt::Repeat(_))
+        && !super::expr_analysis::is_stable_inline_value(value))
+        || (super::expr_analysis::expr_observes_eval_order(value)
+            && !eval_order::preserves_adjacent_eval_order(next_stmt, binding, value))
 }
 
 fn collapse_adjacent_call_alias_runs(block: &mut AstBlock, options: ReadabilityOptions) -> bool {

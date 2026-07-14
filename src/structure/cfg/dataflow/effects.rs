@@ -8,7 +8,6 @@ pub(super) fn compute_reg_count(proto: &LoweredProto, instr_effects: &[InstrEffe
             .fixed_uses
             .iter()
             .chain(effect.fixed_must_defs.iter())
-            .chain(effect.fixed_may_defs.iter())
         {
             max_reg = max_reg.max(reg.index() + 1);
         }
@@ -17,9 +16,6 @@ pub(super) fn compute_reg_count(proto: &LoweredProto, instr_effects: &[InstrEffe
             max_reg = max_reg.max(reg.index() + 1);
         }
         if let Some(reg) = effect.open_must_def {
-            max_reg = max_reg.max(reg.index() + 1);
-        }
-        if let Some(reg) = effect.open_may_def {
             max_reg = max_reg.max(reg.index() + 1);
         }
     }

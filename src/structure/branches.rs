@@ -82,8 +82,84 @@ pub(super) fn analyze_branches(
             })
         })
         .collect();
+    refine_loop_iteration_if_else_branches(
+        cfg,
+        graph_facts,
+        loop_candidates,
+        &mut reachability,
+        &mut branch_candidates,
+    );
     branch_candidates.sort_by_key(|candidate| candidate.header);
     branch_candidates
+}
+
+fn refine_loop_iteration_if_else_branches(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    loop_candidates: &[LoopCandidate],
+    reachability: &mut ReachabilityCache<'_>,
+    branch_candidates: &mut [BranchCandidate],
+) {
+    let candidates_by_header = branch_candidates
+        .iter()
+        .map(|candidate| (candidate.header, candidate.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    for candidate in branch_candidates {
+        let Some(downstream_header) = candidate
+            .else_entry
+            .is_none()
+            .then_some(candidate.merge)
+            .flatten()
+        else {
+            continue;
+        };
+        let Some(downstream) = candidates_by_header.get(&downstream_header) else {
+            continue;
+        };
+        let Some((then_edge, else_edge)) = cfg.branch_edges(candidate.header) else {
+            continue;
+        };
+        let then_entry = cfg.edges[then_edge.index()].to;
+        let else_entry = cfg.edges[else_edge.index()].to;
+        let Some(owner) = loop_candidates
+            .iter()
+            .filter(|owner| {
+                owner.blocks.contains(&candidate.header)
+                    && owner.blocks.contains(&then_entry)
+                    && owner.blocks.contains(&else_entry)
+                    && owner.blocks.contains(&downstream.header)
+                    && downstream
+                        .merge
+                        .is_some_and(|merge| owner.exits.contains(&merge))
+            })
+            .min_by_key(|owner| owner.blocks.len())
+        else {
+            continue;
+        };
+        if reachability.can_reach_without_entering_loop_header(then_entry, else_entry)
+            || reachability.can_reach_without_entering_loop_header(else_entry, then_entry)
+        {
+            continue;
+        }
+        let Some(merge) =
+            find_soft_merge(cfg, graph_facts, candidate.header, then_entry, else_entry)
+        else {
+            continue;
+        };
+        if !owner.blocks.contains(&merge)
+            || !reachability.can_reach_without_entering_loop_header(then_entry, merge)
+            || !reachability.can_reach_without_entering_loop_header(else_entry, merge)
+        {
+            continue;
+        }
+
+        candidate.then_entry = then_entry;
+        candidate.else_entry = Some(else_entry);
+        candidate.merge = Some(merge);
+        candidate.kind = BranchKind::IfElse;
+        candidate.invert_hint = false;
+    }
 }
 
 pub(super) fn analyze_branch_regions(

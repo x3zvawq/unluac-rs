@@ -1,40 +1,39 @@
 //! 这个文件集中承载“StructureFacts 如何消费 Dataflow phi”的共享翻译规则。
 //!
 //! `loops / branch_values / short_circuit` 都会把 `phi.incoming` 重新整理成更贴近
-//! 源码恢复的结构事实。如果每个 pass 都各自维护一套 `incoming -> arm/value defs`
+//! 源码恢复的结构事实。如果每个 pass 都各自维护一套 `incoming -> arm/value identity`
 //! 转换，规则一变就会三处平行返工。这里把这层翻译集中成单一 owner，让结构层
 //! 共享同一套 phi 语义。
 //!
-//! 它依赖 Dataflow 已经提供稳定的 `phi_candidates / reaching_defs / def 元数据`，
+//! 它依赖 Dataflow 已经提供稳定的 `phi_candidates / SsaValue / def 元数据`，
 //! 这里只负责把这些底层 merge 事实改写成 StructureFacts 可直接消费的形状；
 //! 它不会越权决定最终 HIR 表达式或语法结构。
 //!
 //! 例子：
-//! - branch merge 会把 `phi.incoming` 直接整理成 `then_arm / else_arm` 两臂 def 集
+//! - branch merge 会把 `phi.incoming` 直接整理成 `then_arm / else_arm` 两臂 SSA 值集
 //! - loop header/exit merge 会整理成 `inside_arm / outside_arm` 或按 predecessor
 //!   分组的 incoming facts；branch 已完整覆盖两臂时拥有更外层的 exit phi，loop 只保留
 //!   自己需要接管的出口值；generic owner 只排除确定已有结构 owner 的 phi
-//! - short-circuit value merge 会提前带出 `entry_defs / value_incomings`，避免 HIR
+//! - short-circuit value merge 会提前带出 `entry_value / value_incomings`，避免 HIR
 //!   再回头拆 phi
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-use crate::structure::{BlockRef, Cfg, DataflowFacts, DefId, GraphFacts, PhiCandidate, PhiId};
+use crate::structure::{BlockRef, Cfg, DataflowFacts, GraphFacts, PhiCandidate, PhiId, SsaValue};
 use crate::transformer::Reg;
 
 use super::common::{
     BranchValueMergeArm, BranchValueMergeCandidate, BranchValueMergeValue,
     GenericPhiMaterialization, GenericPhiSource, LoopCandidate, LoopValueArm, LoopValueIncoming,
-    LoopValueMerge, ShortCircuitCandidate, ShortCircuitValueIncoming,
+    LoopValueMerge, ShortCircuitCandidate, ShortCircuitValueIncoming, StructurePlan,
 };
 
 pub(super) struct ShortCircuitPhiFacts {
-    pub(super) entry_defs: BTreeSet<DefId>,
+    pub(super) entry_value: SsaValue,
     pub(super) value_incomings: Vec<ShortCircuitValueIncoming>,
 }
 
 pub(super) struct BranchValueMergeContext<'a> {
-    cfg: &'a Cfg,
     header: BlockRef,
     graph_facts: &'a GraphFacts,
     dataflow: &'a DataflowFacts,
@@ -42,13 +41,12 @@ pub(super) struct BranchValueMergeContext<'a> {
 
 impl<'a> BranchValueMergeContext<'a> {
     pub(super) fn new(
-        cfg: &'a Cfg,
+        _cfg: &'a Cfg,
         header: BlockRef,
         graph_facts: &'a GraphFacts,
         dataflow: &'a DataflowFacts,
     ) -> Self {
         Self {
-            cfg,
             header,
             graph_facts,
             dataflow,
@@ -63,18 +61,18 @@ fn branch_value_merge_from_phi(
     else_preds: &BTreeSet<BlockRef>,
     ignored_preds: Option<&BTreeSet<BlockRef>>,
 ) -> Option<BranchValueMergeValue> {
-    let entry_defs = value_merge_entry_defs(context.cfg, context.dataflow, context.header, phi.reg);
+    let entry_value = context.dataflow.block_exit_value(context.header, phi.reg);
     let mut then_arm = BranchValueMergeArm {
         preds: BTreeSet::new(),
-        defs: BTreeSet::new(),
-        entry_defs: BTreeSet::new(),
-        update_defs: BTreeSet::new(),
+        values: BTreeSet::new(),
+        entry_values: BTreeSet::new(),
+        update_values: BTreeSet::new(),
     };
     let mut else_arm = BranchValueMergeArm {
         preds: BTreeSet::new(),
-        defs: BTreeSet::new(),
-        entry_defs: BTreeSet::new(),
-        update_defs: BTreeSet::new(),
+        values: BTreeSet::new(),
+        entry_values: BTreeSet::new(),
+        update_values: BTreeSet::new(),
     };
 
     for incoming in &phi.incoming {
@@ -84,7 +82,7 @@ fn branch_value_merge_from_phi(
                 context.header,
                 context.graph_facts,
                 context.dataflow,
-                &entry_defs,
+                entry_value,
                 &mut then_arm,
                 incoming,
             );
@@ -93,7 +91,7 @@ fn branch_value_merge_from_phi(
                 context.header,
                 context.graph_facts,
                 context.dataflow,
-                &entry_defs,
+                entry_value,
                 &mut else_arm,
                 incoming,
             );
@@ -130,6 +128,7 @@ pub(super) fn branch_value_merges_in_block(
 }
 
 pub(super) fn loop_value_merge_from_phi(
+    _dataflow: &DataflowFacts,
     phi: &PhiCandidate,
     loop_blocks: &BTreeSet<BlockRef>,
 ) -> Option<LoopValueMerge> {
@@ -147,7 +146,7 @@ pub(super) fn loop_value_merge_from_phi(
         };
         arm.incomings.push(LoopValueIncoming {
             pred: incoming.pred,
-            defs: incoming.defs.clone(),
+            value: incoming.value,
         });
     }
 
@@ -167,28 +166,32 @@ pub(super) fn loop_value_merges_in_block(
     dataflow
         .phi_candidates_in_block(block)
         .iter()
-        .filter_map(|phi| loop_value_merge_from_phi(phi, loop_blocks))
+        .filter_map(|phi| loop_value_merge_from_phi(dataflow, phi, loop_blocks))
         .collect()
 }
 
 pub(super) fn short_circuit_phi_facts(
-    cfg: &Cfg,
+    _cfg: &Cfg,
     dataflow: &DataflowFacts,
     header: BlockRef,
     reg: Reg,
     phi: &PhiCandidate,
 ) -> ShortCircuitPhiFacts {
     ShortCircuitPhiFacts {
-        entry_defs: value_merge_entry_defs(cfg, dataflow, header, reg),
+        entry_value: dataflow.block_exit_value(header, reg),
         value_incomings: phi
             .incoming
             .iter()
             .filter_map(|incoming| {
                 let pred = incoming.pred?;
+                let latest_local_def = match incoming.value {
+                    SsaValue::Def(def) if dataflow.def_block(def) == pred => Some(def),
+                    _ => None,
+                };
                 Some(ShortCircuitValueIncoming {
                     pred,
-                    defs: incoming.defs.clone(),
-                    latest_local_def: latest_local_incoming_def(dataflow, pred, &incoming.defs),
+                    latest_local_def,
+                    value: incoming.value,
                 })
             })
             .collect(),
@@ -200,6 +203,7 @@ pub(super) fn analyze_generic_phi_materializations(
     graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
     branch_value_merge_candidates: &[BranchValueMergeCandidate],
+    plan: &StructurePlan,
     loop_candidates: &[LoopCandidate],
     short_circuit_candidates: &[ShortCircuitCandidate],
 ) -> Vec<GenericPhiMaterialization> {
@@ -210,6 +214,7 @@ pub(super) fn analyze_generic_phi_materializations(
         .collect::<BTreeSet<_>>();
     covered.extend(consumed_branch_value_merge_ids(
         branch_value_merge_candidates,
+        plan,
     ));
     covered.extend(consumed_loop_header_phi_ids(loop_candidates));
 
@@ -232,8 +237,10 @@ pub(super) fn analyze_generic_phi_materializations(
 pub(super) fn remove_branch_owned_loop_exit_values(
     loop_candidates: &mut [LoopCandidate],
     branch_candidates: &[BranchValueMergeCandidate],
+    plan: &StructurePlan,
 ) {
-    let branch_owned = consumed_branch_value_merge_ids(branch_candidates).collect::<BTreeSet<_>>();
+    let branch_owned =
+        consumed_branch_value_merge_ids(branch_candidates, plan).collect::<BTreeSet<_>>();
     for candidate in loop_candidates {
         for exit in &mut candidate.exit_value_merges {
             exit.values
@@ -268,26 +275,18 @@ pub(super) fn remove_loop_header_owned_loop_exit_values(candidates: &mut [LoopCa
     }
 }
 
-fn consumed_branch_value_merge_ids(
-    candidates: &[BranchValueMergeCandidate],
-) -> impl Iterator<Item = PhiId> + '_ {
-    let mut by_header = BTreeMap::<BlockRef, Option<&BranchValueMergeCandidate>>::new();
-
-    for candidate in candidates {
-        by_header
-            .entry(candidate.header)
-            .and_modify(|entry| *entry = None)
-            .or_insert(Some(candidate));
-    }
-
-    by_header
-        .into_values()
-        .flatten()
+fn consumed_branch_value_merge_ids<'a>(
+    candidates: &'a [BranchValueMergeCandidate],
+    plan: &'a StructurePlan,
+) -> impl Iterator<Item = PhiId> + 'a {
+    plan.branch_value_merge_by_header
+        .values()
+        .filter_map(|id| candidates.get(id.index()))
         .flat_map(|candidate| candidate.values.iter().map(|value| value.phi_id))
 }
 
 fn generic_phi_source(
-    cfg: &Cfg,
+    _cfg: &Cfg,
     graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
     phi: &PhiCandidate,
@@ -301,13 +300,11 @@ fn generic_phi_source(
     else {
         return GenericPhiSource::Unresolved;
     };
-    let Some(idom_defs) = block_exit_defs_for_reg(cfg, dataflow, idom, phi.reg) else {
-        return GenericPhiSource::Unresolved;
-    };
+    let idom_value = dataflow.block_exit_value(idom, phi.reg);
     if phi
         .incoming
         .iter()
-        .all(|incoming| incoming.defs == idom_defs)
+        .all(|incoming| incoming.value == idom_value)
     {
         GenericPhiSource::IdomExit(idom)
     } else {
@@ -315,41 +312,11 @@ fn generic_phi_source(
     }
 }
 
-fn block_exit_defs_for_reg(
-    cfg: &Cfg,
-    dataflow: &DataflowFacts,
-    block: BlockRef,
-    reg: Reg,
-) -> Option<BTreeSet<DefId>> {
-    let range = cfg.blocks[block.index()].instrs;
-    let Some(last_instr_ref) = range.last() else {
-        return Some(BTreeSet::new());
-    };
-
-    let effect = &dataflow.instr_effects[last_instr_ref.index()];
-    if effect.fixed_must_defs.contains(&reg) {
-        return dataflow
-            .instr_def_for_reg(last_instr_ref, reg)
-            .map(|def| BTreeSet::from([def]));
-    }
-
-    let mut defs = dataflow
-        .reaching_defs_at(last_instr_ref)
-        .fixed
-        .get(reg)
-        .map(|defs| defs.iter().copied().collect::<BTreeSet<_>>())
-        .unwrap_or_default();
-    if effect.fixed_may_defs.contains(&reg) {
-        defs.insert(dataflow.instr_def_for_reg(last_instr_ref, reg)?);
-    }
-    Some(defs)
-}
-
 fn extend_branch_value_arm(
     header: BlockRef,
     graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
-    entry_defs: &BTreeSet<DefId>,
+    entry_value: SsaValue,
     arm: &mut BranchValueMergeArm,
     incoming: &crate::structure::PhiIncoming,
 ) {
@@ -357,43 +324,24 @@ fn extend_branch_value_arm(
         return;
     };
     arm.preds.insert(pred);
-    for &def in &incoming.defs {
-        arm.defs.insert(def);
-        let def_block = dataflow.def_block(def);
-        if !entry_defs.contains(&def)
-            || (def_block != header && graph_facts.dominator_tree.dominates(header, def_block))
-        {
-            arm.update_defs.insert(def);
-        } else {
-            arm.entry_defs.insert(def);
-        }
+    arm.values.insert(incoming.value);
+    let carries_entry = dataflow.value_contains(incoming.value, entry_value);
+    // 非循环 header 的当前入口值不可能包含一个由 header 严格支配的定义；若能从
+    // header 之后重新流回入口，就已经构成 backedge。顺序 branch 的 preserved arm
+    // 因而无需反复展开随前序分支增长的整条 Phi 链。
+    let needs_dominated_update_check = carries_entry
+        && (incoming.value != entry_value || graph_facts.loop_headers.contains(&header));
+    let is_dominated_update = needs_dominated_update_check
+        && dataflow.leaf_defs(incoming.value).iter().any(|def| {
+            let block = dataflow.def_block(*def);
+            block != header && graph_facts.dominator_tree.dominates(header, block)
+        });
+    if carries_entry {
+        arm.entry_values.insert(incoming.value);
     }
-}
-
-fn latest_local_incoming_def(
-    dataflow: &DataflowFacts,
-    block: BlockRef,
-    defs: &BTreeSet<DefId>,
-) -> Option<DefId> {
-    dataflow.latest_local_def_in_block(block, defs.iter().copied())
-}
-
-fn value_merge_entry_defs(
-    cfg: &Cfg,
-    dataflow: &DataflowFacts,
-    header: BlockRef,
-    reg: Reg,
-) -> BTreeSet<DefId> {
-    let Some(instr_ref) = cfg.blocks[header.index()].instrs.last() else {
-        return BTreeSet::new();
-    };
-
-    dataflow
-        .reaching_defs_at(instr_ref)
-        .fixed
-        .get(reg)
-        .map(|defs| defs.iter().copied().collect())
-        .unwrap_or_default()
+    if !carries_entry || is_dominated_update {
+        arm.update_values.insert(incoming.value);
+    }
 }
 
 fn consumed_loop_header_phi_ids(

@@ -39,8 +39,8 @@ pub(super) fn simplify_decision_exprs_in_proto(proto: &mut HirProto) -> bool {
 /// HIR 输出，它就应该已经被重新线性化成普通 `if/local/assign` 或纯表达式，避免把
 /// 共享图的语义恢复继续后移给 AST。
 pub(crate) use eliminate::eliminate_remaining_decisions_in_proto;
+pub(crate) use synthesize::decision_is_synth_safe;
 pub(crate) use synthesize::naturalize_pure_logical_expr;
-pub(crate) use synthesize::{decision_is_synth_safe, synthesize_readable_pure_logical_expr};
 
 struct DecisionExprPass;
 

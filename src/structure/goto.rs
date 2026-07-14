@@ -67,6 +67,7 @@ pub(super) fn analyze_goto_requirements(
                     if edge.to == continue_target
                         && !tail_carries_body
                         && !loop_candidate.backedges.contains(edge_ref)
+                        && !loop_candidate.continue_edges.contains(edge_ref)
                         && edge.kind != EdgeKind::Fallthrough
                         && cfg.reachable_blocks.contains(&edge.from)
                         // 如果 edge.from 是某个 branch candidate 的 header，

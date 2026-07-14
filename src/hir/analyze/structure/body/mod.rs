@@ -44,8 +44,8 @@ pub(super) struct StructuredBodyLowerer<'a, 'b> {
     pub(super) branch_by_header: BTreeMap<BlockRef, &'b BranchCandidate>,
     pub(super) branch_regions_by_header: BTreeMap<BlockRef, &'b BranchRegionFact>,
     pub(super) branch_value_merges_by_header: BTreeMap<BlockRef, &'b BranchValueMergeCandidate>,
-    pub(super) loop_by_header: BTreeMap<BlockRef, &'b LoopCandidate>,
-    pub(super) loops_by_header: BTreeMap<BlockRef, Vec<(usize, &'b LoopCandidate)>>,
+    pub(super) loop_headers: BTreeSet<BlockRef>,
+    pub(super) loops_by_header: BTreeMap<BlockRef, Vec<(LoopCandidateId, &'b LoopCandidate)>>,
     pub(super) label_map: BTreeMap<BlockRef, HirLabelId>,
     pub(super) required_labels: BTreeSet<BlockRef>,
     pub(super) merge_allowed_blocks: BTreeMap<BlockRef, BTreeSet<BlockRef>>,
@@ -87,7 +87,7 @@ pub(super) struct LoopStatePlan {
 
 #[derive(Debug, Clone)]
 pub(super) struct ActiveLoopContext {
-    pub(super) candidate_id: usize,
+    pub(super) candidate_id: LoopCandidateId,
     pub(super) header: BlockRef,
     pub(super) loop_blocks: BTreeSet<BlockRef>,
     pub(super) post_loop: BlockRef,
@@ -196,8 +196,17 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .iter()
             .map(|candidate| (candidate.header, candidate))
             .collect();
-        let branch_value_merges_by_header =
-            unique_branch_value_merges_by_header(&lowering.structure.branch_value_merge_candidates);
+        let branch_value_merges_by_header = lowering
+            .structure
+            .branch_candidates
+            .iter()
+            .filter_map(|branch| {
+                lowering
+                    .structure
+                    .branch_value_merge_for_header(branch.header)
+                    .map(|candidate| (branch.header, candidate))
+            })
+            .collect();
         let branch_regions_by_header = lowering
             .structure
             .branch_region_facts
@@ -205,20 +214,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .map(|fact| (fact.header, fact))
             .collect();
         let mut loops_by_header = BTreeMap::<BlockRef, Vec<_>>::new();
-        for (candidate_id, candidate) in lowering.structure.loop_candidates.iter().enumerate() {
+        for (index, candidate) in lowering.structure.loop_candidates.iter().enumerate() {
+            let candidate_id = LoopCandidateId(index);
             loops_by_header
                 .entry(candidate.header)
                 .or_default()
                 .push((candidate_id, candidate));
         }
-        let loop_by_header = loops_by_header
-            .iter()
-            .filter_map(|(header, candidates)| {
-                candidates
-                    .first()
-                    .map(|(_, candidate)| (*header, *candidate))
-            })
-            .collect();
+        let loop_headers = loops_by_header.keys().copied().collect();
         let structured_close_points = lowering
             .structure
             .scope_candidates
@@ -241,7 +244,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             branch_by_header,
             branch_regions_by_header,
             branch_value_merges_by_header,
-            loop_by_header,
+            loop_headers,
             loops_by_header,
             label_map: build_label_map_for_summary(lowering.cfg),
             required_labels: BTreeSet::new(),
@@ -295,7 +298,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         start: BlockRef,
         stop: Option<BlockRef>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
-        suppressed_loop_id: Option<usize>,
+        suppressed_loop_id: Option<LoopCandidateId>,
     ) -> Option<HirBlock> {
         let mut current = Some(start);
         let mut stmts = Vec::new();
@@ -347,17 +350,64 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         Some(HirBlock { stmts })
     }
 
-    pub(super) fn loop_candidate_id(&self, candidate: &LoopCandidate) -> Option<usize> {
-        self.loops_by_header
-            .get(&candidate.header)?
-            .iter()
-            .find_map(|(candidate_id, known)| {
-                std::ptr::eq(*known, candidate).then_some(*candidate_id)
-            })
+    pub(super) fn loop_candidate(
+        &self,
+        candidate_id: LoopCandidateId,
+    ) -> Option<&'b LoopCandidate> {
+        self.lowering.structure.loop_candidate(candidate_id)
     }
 
-    pub(super) fn loop_candidate(&self, candidate_id: usize) -> Option<&'b LoopCandidate> {
-        self.lowering.structure.loop_candidates.get(candidate_id)
+    pub(super) fn innermost_loop_candidate(
+        &self,
+        header: BlockRef,
+    ) -> Option<(LoopCandidateId, &'b LoopCandidate)> {
+        let candidates = self.loops_by_header.get(&header)?;
+        let minimum = candidates
+            .iter()
+            .map(|(_, candidate)| candidate.blocks.len())
+            .min()?;
+        let mut matching = candidates
+            .iter()
+            .filter(|(_, candidate)| candidate.blocks.len() == minimum);
+        let candidate = matching.next().copied()?;
+        matching.next().is_none().then_some(candidate)
+    }
+
+    pub(super) fn unique_loop_candidate_matching(
+        &self,
+        header: BlockRef,
+        mut matches: impl FnMut(&LoopCandidate) -> bool,
+    ) -> Option<(LoopCandidateId, &'b LoopCandidate)> {
+        let mut matching = self
+            .loops_by_header
+            .get(&header)?
+            .iter()
+            .filter(|(_, candidate)| matches(candidate));
+        let candidate = matching.next().copied()?;
+        matching.next().is_none().then_some(candidate)
+    }
+
+    pub(super) fn outermost_loop_candidate_matching(
+        &self,
+        header: BlockRef,
+        mut matches: impl FnMut(LoopCandidateId, &LoopCandidate) -> bool,
+    ) -> Option<(LoopCandidateId, &'b LoopCandidate)> {
+        let candidates = self
+            .loops_by_header
+            .get(&header)?
+            .iter()
+            .filter(|(id, candidate)| matches(*id, candidate))
+            .copied()
+            .collect::<Vec<_>>();
+        let maximum = candidates
+            .iter()
+            .map(|(_, candidate)| candidate.blocks.len())
+            .max()?;
+        let mut matching = candidates
+            .into_iter()
+            .filter(|(_, candidate)| candidate.blocks.len() == maximum);
+        let candidate = matching.next()?;
+        matching.next().is_none().then_some(candidate)
     }
 
     pub(super) fn nested_loop_owner_for_entry(
@@ -366,15 +416,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         entry: BlockRef,
     ) -> Option<&'b LoopCandidate> {
         let candidate = self.loop_candidate_from_preheader(entry).or_else(|| {
-            self.loops_by_header
-                .get(&entry)?
-                .iter()
-                .find_map(|(_, candidate)| {
-                    (candidate.preheader.is_none()
-                        && candidate.header != active.header
-                        && candidate.blocks.is_subset(&active.binding_scope_blocks))
-                    .then_some(*candidate)
-                })
+            self.outermost_loop_candidate_matching(entry, |_, candidate| {
+                candidate.preheader.is_none()
+                    && candidate.header != active.header
+                    && candidate.blocks.is_subset(&active.binding_scope_blocks)
+            })
+            .map(|(_, candidate)| candidate)
         })?;
         (candidate.header != active.header
             && candidate.blocks.is_subset(&active.binding_scope_blocks))
@@ -384,21 +431,24 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     fn loop_candidate_for_entry(
         &self,
         header: BlockRef,
-        suppressed_loop_id: Option<usize>,
-    ) -> Option<(usize, &'b LoopCandidate)> {
-        self.loops_by_header
-            .get(&header)?
+        suppressed_loop_id: Option<LoopCandidateId>,
+    ) -> Option<(LoopCandidateId, &'b LoopCandidate)> {
+        let active_parent = self
+            .active_loops
             .iter()
-            .filter(|(candidate_id, _)| Some(*candidate_id) != suppressed_loop_id)
-            .filter(|(candidate_id, _)| {
-                !self
+            .rev()
+            .find(|active| active.header == header)
+            .and_then(|active| self.loop_candidate(active.candidate_id));
+        self.outermost_loop_candidate_matching(header, |candidate_id, candidate| {
+            Some(candidate_id) != suppressed_loop_id
+                && !self
                     .active_loops
                     .iter()
-                    .any(|active| active.candidate_id == *candidate_id)
-            })
-            // 外层 active 后会被上面的 identity 过滤，同一 header 才轮到内层。
-            .max_by_key(|(_, candidate)| candidate.blocks.len())
-            .map(|(candidate_id, candidate)| (*candidate_id, *candidate))
+                    .any(|active| active.candidate_id == candidate_id)
+                && active_parent.is_none_or(|parent| {
+                    candidate.blocks != parent.blocks && candidate.blocks.is_subset(&parent.blocks)
+                })
+        })
     }
 
     fn emit_required_label(&self, block: BlockRef, stmts: &mut Vec<HirStmt>) {
@@ -557,9 +607,24 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             |phi_id| self.overrides.phi_is_suppressed_for_block(block, phi_id),
             allowed_blocks,
         ));
-        // phi 物化语句里的 TempRef 和赋值目标都可能引用被 target_overrides
-        // 重定向过的 temp。典型场景：内层短路的 phi temp 被外层 BVM 收编后，
-        // 物化结果的写入目标需要跟着改到外层 BVM 的 arm target。
+        // phi 恢复会从 predecessor def 重新构造表达式，其中可能引用一个已由更早
+        // 结构证明为 alias 的 phi temp；该寄存器若在当前 block 已不再 live，普通
+        // block-entry 传播看不到它，因此必须先应用全局 SSA alias 事实。
+        let phi_temp_aliases = self.overrides.phi_temp_aliases();
+        if !phi_temp_aliases.is_empty() {
+            for stmt in &mut stmts {
+                rewrite_stmt_exprs(stmt, phi_temp_aliases);
+            }
+        }
+        let entry_expr_overrides = self.block_entry_expr_overrides(block);
+        if let Some(entry_expr_overrides) = entry_expr_overrides {
+            for stmt in &mut stmts {
+                rewrite_stmt_exprs(stmt, entry_expr_overrides);
+            }
+        }
+        // entry override 先把跨结构边界传入的 SSA 身份还原成既有值槽，再应用
+        // target override。这样 `entry phi -> 外层 state` 的两段映射能在同一条
+        // 物化语句里完整收敛，不会留下只在 SSA 图中存在的中间 temp。
         if !target_overrides.is_empty() {
             let phi_expr_overrides = temp_expr_overrides(target_overrides);
             for stmt in &mut stmts {
@@ -567,7 +632,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 rewrite_stmt_targets(stmt, target_overrides);
             }
         }
-        let entry_expr_overrides = self.block_entry_expr_overrides(block);
         for instr_index in self.block_prefix_instr_indices(block, expect_branch_terminator)? {
             let instr_ref = InstrRef(instr_index);
             let instr = &self.lowering.proto.instrs[instr_index];
@@ -584,12 +648,17 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 continue;
             }
             let mut lowered = lower_regular_instr(self.lowering, block, instr_ref, instr);
-            apply_loop_rewrites(&mut lowered, target_overrides);
+            if !phi_temp_aliases.is_empty() {
+                for stmt in &mut lowered {
+                    rewrite_stmt_exprs(stmt, phi_temp_aliases);
+                }
+            }
             if let Some(entry_expr_overrides) = entry_expr_overrides {
                 for stmt in &mut lowered {
                     rewrite_stmt_exprs(stmt, entry_expr_overrides);
                 }
             }
+            apply_loop_rewrites(&mut lowered, target_overrides);
             stmts.extend(lowered);
         }
 
@@ -604,7 +673,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     ) -> Option<HirBlock> {
         if self.required_labels.contains(&block)
             || self.branch_by_header.contains_key(&block)
-            || self.loop_by_header.contains_key(&block)
+            || self.loop_headers.contains(&block)
             || !self
                 .lowering
                 .dataflow
@@ -682,6 +751,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         };
 
+        let phi_temp_aliases = self.overrides.phi_temp_aliases();
+        if !phi_temp_aliases.is_empty() {
+            rewrite_expr_temps(&mut cond, phi_temp_aliases);
+        }
         if let Some(entry_expr_overrides) = self.block_entry_expr_overrides(block) {
             rewrite_expr_temps(&mut cond, entry_expr_overrides);
         }
@@ -749,25 +822,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     }
 }
 
-fn unique_branch_value_merges_by_header(
-    candidates: &[BranchValueMergeCandidate],
-) -> BTreeMap<BlockRef, &BranchValueMergeCandidate> {
-    let mut by_header = BTreeMap::new();
-    let mut duplicated_headers = BTreeSet::new();
-
-    for candidate in candidates {
-        if by_header.insert(candidate.header, candidate).is_some() {
-            duplicated_headers.insert(candidate.header);
-        }
-    }
-
-    for header in duplicated_headers {
-        by_header.remove(&header);
-    }
-
-    by_header
-}
-
 fn supports_structured_goto_requirement(reason: GotoReason) -> bool {
     matches!(reason, GotoReason::UnstructuredContinueLike)
 }
@@ -782,7 +836,7 @@ fn shared_target_expr_from_overrides(
         short
             .value_incomings
             .iter()
-            .flat_map(|incoming| incoming.defs.iter().copied()),
+            .flat_map(|incoming| lowering.dataflow.leaf_defs(incoming.value)),
         target_overrides,
     )
 }

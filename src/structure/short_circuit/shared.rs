@@ -178,7 +178,7 @@ pub(super) fn short_circuit_nodes_are_acyclic(
     true
 }
 
-fn block_is_passthrough(proto: &LoweredProto, cfg: &Cfg, block: BlockRef) -> bool {
+pub(super) fn block_is_passthrough(proto: &LoweredProto, cfg: &Cfg, block: BlockRef) -> bool {
     let range = cfg.blocks[block.index()].instrs;
     match range.len {
         0 => true,

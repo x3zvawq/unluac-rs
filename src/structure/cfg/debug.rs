@@ -14,8 +14,7 @@ use crate::debug::{
 use crate::transformer::{LowInstr, LoweredChunk, LoweredProto};
 
 use super::common::{
-    BlockRef, CfgGraph, DataflowFacts, DefId, EffectTag, GraphFacts, OpenDefId, RegValueMap,
-    SsaValue, ValueMapRef, ValueSetRef,
+    BlockRef, CfgGraph, DataflowFacts, EffectTag, GraphFacts, OpenUseSources, SsaRegMap, SsaValue,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -346,29 +345,31 @@ pub(in crate::structure) fn dump_dataflow_facts(
         }
 
         if matches!(detail, DebugDetail::Verbose) {
-            let _ = writeln!(output, "{indent}  reaching defs");
-            for (instr_index, defs) in entry.facts.reaching_defs.iter().enumerate() {
+            let _ = writeln!(output, "{indent}  block SSA values");
+            for block in entry.cfg.cfg.block_order.iter().copied() {
                 let _ = writeln!(
                     output,
-                    "{indent}    @{instr_index:03} fixed={} open={}",
-                    format_reaching_defs(&defs.fixed),
-                    format_open_def_set(
-                        entry
-                            .facts
-                            .open_reaching_defs_at(crate::transformer::InstrRef(instr_index)),
-                    ),
+                    "{indent}    block #{} in={} out={}",
+                    block.index(),
+                    format_ssa_map(&entry.facts.block_entry_values[block.index()]),
+                    format_ssa_map(&entry.facts.block_exit_values[block.index()]),
                 );
             }
 
-            let _ = writeln!(output, "{indent}  reaching values");
+            let _ = writeln!(output, "{indent}  instruction uses");
             for instr_index in 0..entry.proto.instrs.len() {
                 let _ = writeln!(
                     output,
-                    "{indent}    @{instr_index:03} fixed={}",
-                    format_reaching_values(
+                    "{indent}    @{instr_index:03} fixed={} open={}",
+                    format_ssa_map(
                         entry
                             .facts
-                            .reaching_values_at(crate::transformer::InstrRef(instr_index)),
+                            .use_values_at(crate::transformer::InstrRef(instr_index))
+                    ),
+                    format_open_sources(
+                        entry
+                            .facts
+                            .open_use_sources_at(crate::transformer::InstrRef(instr_index))
                     ),
                 );
             }
@@ -542,58 +543,41 @@ fn format_edge_refs(edge_refs: &[super::common::EdgeRef]) -> String {
     }
 }
 
-fn format_reaching_defs(defs: &RegValueMap<DefId>) -> String {
-    if defs.iter().next().is_none() {
-        "[-]".to_string()
-    } else {
-        defs.iter()
-            .map(|(reg, defs)| format!("{reg}<-{}", format_display_set(defs)))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-}
-
-fn format_reaching_values(values: ValueMapRef<'_>) -> String {
+fn format_ssa_map(values: &SsaRegMap) -> String {
     if values.iter().next().is_none() {
         "[-]".to_string()
     } else {
         values
             .iter()
-            .map(|(reg, values)| format!("{reg}<-{}", format_value_set(values)))
+            .map(|(reg, value)| format!("{reg}<-{}", format_ssa_value(value)))
             .collect::<Vec<_>>()
             .join(" ")
     }
 }
 
-fn format_value_set(values: ValueSetRef<'_>) -> String {
-    if values.is_empty() {
-        "[-]".to_string()
-    } else {
-        format!(
-            "[{}]",
-            values
-                .iter()
-                .map(|value| match value {
-                    SsaValue::Def(def) => def.to_string(),
-                    SsaValue::Phi(phi) => phi.to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
+fn format_ssa_value(value: SsaValue) -> String {
+    match value {
+        SsaValue::Entry(reg) => format!("entry({reg})"),
+        SsaValue::Def(def) => def.to_string(),
+        SsaValue::Phi(phi) => phi.to_string(),
     }
 }
 
-fn format_open_def_set(defs: &BTreeSet<OpenDefId>) -> String {
-    if defs.is_empty() {
+fn format_open_sources(sources: &OpenUseSources) -> String {
+    if !sources.has_entry() && sources.defs().is_empty() {
         "[-]".to_string()
     } else {
-        format!(
-            "[{}]",
-            defs.iter()
-                .map(|def| format!("open{}", def.index()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
+        let mut values = Vec::new();
+        if sources.has_entry() {
+            values.push("entry".to_string());
+        }
+        values.extend(
+            sources
+                .defs()
+                .iter()
+                .map(|def| format!("open{}", def.index())),
+        );
+        format!("[{}]", values.join(", "))
     }
 }
 
@@ -619,7 +603,7 @@ fn format_phi_incoming(incoming: &[super::common::PhiIncoming]) -> String {
                 .pred
                 .map(|pred| pred.to_string())
                 .unwrap_or_else(|| "entry".to_string());
-            format!("{}:{}", pred, format_display_set(&incoming.defs))
+            format!("{}:{}", pred, format_ssa_value(incoming.value))
         })
         .collect::<Vec<_>>()
         .join(", ")

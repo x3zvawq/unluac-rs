@@ -16,7 +16,7 @@ mod safety;
 mod value;
 
 pub(crate) use cost::expr_cost;
-pub(crate) use readable::{naturalize_pure_logical_expr, synthesize_readable_pure_logical_expr};
+pub(crate) use readable::naturalize_pure_logical_expr;
 pub(crate) use safety::decision_is_synth_safe;
 pub(crate) use value::synthesize_value_decision_expr;
 

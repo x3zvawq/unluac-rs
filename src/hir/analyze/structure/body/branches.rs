@@ -189,9 +189,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         });
         if let Some(branch_target_overrides) = branch_target_overrides.as_ref() {
             for header in &branch_value_headers {
-                stmts.extend(
-                    self.branch_value_preserved_entry_stmts(*header, branch_target_overrides),
-                );
+                stmts.extend(self.branch_value_preserved_entry_stmts(
+                    *header,
+                    branch_target_overrides,
+                    target_overrides,
+                ));
             }
         }
         let then_target_overrides = branch_target_overrides
@@ -300,7 +302,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             || branch_stop != Some(merge)
             || region_stop == Some(merge)
             || self.branch_by_header.contains_key(&merge)
-            || self.loop_by_header.contains_key(&merge)
+            || self.loop_headers.contains(&merge)
             || self.block_is_terminal_exit(merge)
         {
             return None;
@@ -341,7 +343,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             *tail != plan.then_entry
                 && *tail != else_entry
                 && !self.branch_by_header.contains_key(tail)
-                && !self.loop_by_header.contains_key(tail)
+                && !self.loop_headers.contains(tail)
                 && self.region_predecessor_count(*tail, &region.structured_blocks) >= 2
                 && self.shared_tail_reaches_loop_continue(*tail, continue_target, loop_context)
                 && [plan.then_entry, else_entry].into_iter().any(|entry| {
@@ -585,12 +587,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let Some(header) = self.lowering.cfg.unique_reachable_successor(entry) else {
             return false;
         };
-        let Some(candidate) = self.loops_by_header.get(&header).and_then(|candidates| {
-            candidates.iter().find_map(|(_, candidate)| {
-                (candidate.kind_hint == LoopKindHint::GenericForLike
-                    && candidate.preheader == Some(entry))
-                .then_some(*candidate)
-            })
+        let Some((_, candidate)) = self.unique_loop_candidate_matching(header, |candidate| {
+            candidate.kind_hint == LoopKindHint::GenericForLike
+                && candidate.preheader == Some(entry)
         }) else {
             return false;
         };
@@ -615,12 +614,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             }
             _ => self.lowering.cfg.unique_reachable_successor(preheader)?,
         };
-        self.loops_by_header
-            .get(&header)?
-            .iter()
-            .find_map(|(_, candidate)| {
-                (candidate.preheader == Some(preheader)).then_some(*candidate)
-            })
+        self.unique_loop_candidate_matching(header, |candidate| {
+            candidate.preheader == Some(preheader)
+        })
+        .map(|(_, candidate)| candidate)
     }
 
     fn entry_reaches_shared_continuation(
@@ -677,7 +674,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                                 loop_context.header,
                             )
                     })
-            }) && self.loop_by_header.contains_key(&entry)
+            }) && self.loop_headers.contains(&entry)
                 && self.block_is_active_loop_escape(boundary)
                 && self.branch_arm_reaches_stop_or_loop_escape(entry, shared, boundary))
     }
@@ -696,7 +693,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let candidate = *self.branch_by_header.get(&block)?;
         // 目前只接管 repeat header 被当作普通 branch 重新 lower 的场景。普通
         // branch-value merge 若被强行套 fence，容易把结果 phi 隔在 fence 内外两侧。
-        let loop_candidate = self.loop_by_header.get(&block).copied()?;
+        let (loop_candidate_id, loop_candidate) = self.innermost_loop_candidate(block)?;
         if loop_candidate.kind_hint != LoopKindHint::RepeatLike {
             return None;
         }
@@ -722,7 +719,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         let region = self.branch_regions_by_header.get(&block).copied()?;
         let loop_context = ActiveLoopContext {
-            candidate_id: self.loop_candidate_id(loop_candidate)?,
+            candidate_id: loop_candidate_id,
             header: block,
             loop_blocks: region.structured_blocks.clone(),
             post_loop: merge,
@@ -739,7 +736,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             block,
             Some(tail),
             target_overrides,
-            Some(self.loop_candidate_id(loop_candidate)?),
+            Some(loop_candidate_id),
         );
         self.active_loops.pop();
         let mut body = body_result?.stmts;
@@ -771,7 +768,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     && *tail != merge
                     && !self.required_labels.contains(tail)
                     && !self.branch_by_header.contains_key(tail)
-                    && !self.loop_by_header.contains_key(tail)
+                    && !self.loop_headers.contains(tail)
                     && self.linear_tail_target(*tail) == Some(merge)
                     && self.region_predecessor_count(*tail, &region.structured_blocks) >= 2
                     && self.branch_arm_reaches_target_or_boundary_or_terminate(

@@ -63,11 +63,13 @@ pub struct DominatorTree {
     pub parent: Vec<Option<BlockRef>>,
     pub children: Vec<Vec<BlockRef>>,
     pub order: Vec<BlockRef>,
+    pub(crate) preorder_index: Vec<Option<usize>>,
+    pub(crate) subtree_end: Vec<Option<usize>>,
 }
 
 impl DominatorTree {
     pub fn dominates(&self, dom: BlockRef, block: BlockRef) -> bool {
-        tree_dominates(&self.parent, dom, block)
+        tree_dominates(&self.preorder_index, &self.subtree_end, dom, block)
     }
 
     pub fn nearest_common_ancestor(&self, left: BlockRef, right: BlockRef) -> Option<BlockRef> {
@@ -81,11 +83,13 @@ pub struct PostDominatorTree {
     pub parent: Vec<Option<BlockRef>>,
     pub children: Vec<Vec<BlockRef>>,
     pub order: Vec<BlockRef>,
+    pub(crate) preorder_index: Vec<Option<usize>>,
+    pub(crate) subtree_end: Vec<Option<usize>>,
 }
 
 impl PostDominatorTree {
     pub fn dominates(&self, dom: BlockRef, block: BlockRef) -> bool {
-        tree_dominates(&self.parent, dom, block)
+        tree_dominates(&self.preorder_index, &self.subtree_end, dom, block)
     }
 
     pub fn nearest_common_ancestor(&self, left: BlockRef, right: BlockRef) -> Option<BlockRef> {
@@ -101,19 +105,24 @@ pub struct NaturalLoop {
     pub blocks: BTreeSet<BlockRef>,
 }
 
-fn tree_dominates(parent: &[Option<BlockRef>], dom: BlockRef, mut block: BlockRef) -> bool {
+fn tree_dominates(
+    preorder_index: &[Option<usize>],
+    subtree_end: &[Option<usize>],
+    dom: BlockRef,
+    block: BlockRef,
+) -> bool {
     if dom == block {
         return true;
     }
 
-    while let Some(next) = parent[block.index()] {
-        if next == dom {
-            return true;
-        }
-        block = next;
-    }
-
-    false
+    let (Some(dom_start), Some(dom_end), Some(block_start)) = (
+        preorder_index.get(dom.index()).copied().flatten(),
+        subtree_end.get(dom.index()).copied().flatten(),
+        preorder_index.get(block.index()).copied().flatten(),
+    ) else {
+        return false;
+    };
+    dom_start <= block_start && block_start < dom_end
 }
 
 fn nearest_common_tree_ancestor(

@@ -28,7 +28,7 @@ impl StructuredBodyLowerer<'_, '_> {
         let range = self.lowering.cfg.blocks[block.index()].instrs;
         (range.start.index()..range.end()).any(|instr_index| {
             let effect = &self.lowering.dataflow.instr_effects[instr_index];
-            effect.fixed_must_defs.contains(&reg) || effect.fixed_may_defs.contains(&reg)
+            effect.fixed_must_defs.contains(&reg)
         })
     }
 
@@ -86,6 +86,11 @@ impl StructuredBodyLowerer<'_, '_> {
         reg: Reg,
         expr: HirExpr,
     ) {
+        let phi_temp = self.lowering.bindings.phi_temps[phi_id.index()];
+        if !self.overrides.alias_phi_temp(phi_temp, expr.clone()) {
+            self.overrides.unsuppress_phi(phi_id);
+            return;
+        }
         self.overrides.suppress_phi(phi_id);
         self.install_entry_override(block, reg, expr);
     }
@@ -120,37 +125,19 @@ impl StructuredBodyLowerer<'_, '_> {
     }
 
     fn block_entry_source_temp(&self, block: BlockRef, reg: Reg) -> Option<TempId> {
-        let range = self.lowering.cfg.blocks[block.index()].instrs;
-        if range.is_empty() {
-            return None;
-        }
         // 即使当前 block 内会重定义该寄存器（如 `SUB r1, r1, 1000` 先读后写），
         // 入口处的 reaching value 仍然是该寄存器在 block 首条指令前的 SSA 值，
         // 对应的 temp 会出现在 RHS 表达式中。移除旧有的 block_redefines_reg 守卫，
         // 让 entry_temp_exprs 能正确建立映射，使 lower_block_prefix 的 rewrite 生效。
 
-        let values = self
-            .lowering
-            .dataflow
-            .reaching_values_at(range.start)
-            .get(reg)?;
-        if values.len() != 1 {
-            return None;
+        match self.lowering.dataflow.block_entry_value(block, reg) {
+            crate::structure::SsaValue::Entry(_) => None,
+            crate::structure::SsaValue::Def(def) => {
+                Some(self.lowering.bindings.fixed_temps[def.index()])
+            }
+            crate::structure::SsaValue::Phi(phi) => {
+                Some(self.lowering.bindings.phi_temps[phi.index()])
+            }
         }
-
-        Some(
-            match values
-                .iter()
-                .next()
-                .expect("len checked above, exactly one reaching value exists")
-            {
-                crate::structure::SsaValue::Def(def) => {
-                    self.lowering.bindings.fixed_temps[def.index()]
-                }
-                crate::structure::SsaValue::Phi(phi) => {
-                    self.lowering.bindings.phi_temps[phi.index()]
-                }
-            },
-        )
     }
 }

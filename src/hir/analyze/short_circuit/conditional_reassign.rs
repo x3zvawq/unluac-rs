@@ -11,6 +11,7 @@
 
 use super::recovery::recover_pure_value_decision_expr_with_allowed_blocks;
 use super::*;
+use crate::hir::analyze::exprs::expr_for_entry_reg;
 
 /// 当值型 merge 本质上是在“保留旧值”和“条件写入新值”之间二选一时，
 /// HIR 更适合把它恢复成 `init + if cond then assign end`，而不是一整个大表达式。
@@ -37,12 +38,9 @@ pub(crate) fn build_conditional_reassign_plan(
     if phi_use_count(lowering, phi_id) <= 1 {
         return None;
     }
-    let entry_defs = short.entry_defs.clone();
-    if entry_defs.is_empty() {
-        return None;
-    }
+    let entry_value = short.entry_value?;
 
-    let leaf_kinds = classify_value_leaves(short, &entry_defs)?;
+    let leaf_kinds = classify_value_leaves(short, entry_value)?;
     let changed_region = find_changed_region_entry(short, &leaf_kinds)?;
     let cond_decision = build_region_reach_decision_expr(lowering, short, changed_region)?;
     let allowed_blocks = BTreeSet::from([header]);
@@ -56,7 +54,7 @@ pub(crate) fn build_conditional_reassign_plan(
     }
     let cond = finalize_condition_decision_expr(cond_decision);
     let assigned_value = build_changed_region_value_expr(lowering, short, changed_region)?;
-    let init_value = preserved_entry_value_expr(lowering, &entry_defs)?;
+    let init_value = preserved_entry_value_expr(lowering, entry_value)?;
     let target_temp = *lowering.bindings.phi_temps.get(phi_id.index())?;
 
     Some(ConditionalReassignPlan {
@@ -78,30 +76,19 @@ fn phi_use_count(lowering: &ProtoLowering<'_>, phi_id: PhiId) -> usize {
 
 fn preserved_entry_value_expr(
     lowering: &ProtoLowering<'_>,
-    entry_defs: &BTreeSet<DefId>,
+    entry_value: SsaValue,
 ) -> Option<HirExpr> {
-    if entry_defs.len() == 1 {
-        let def = *entry_defs
-            .iter()
-            .next()
-            .expect("len checked above, exactly one reaching def exists");
-        let temp = *lowering.bindings.fixed_temps.get(def.index())?;
-        return Some(HirExpr::TempRef(temp));
-    }
-
-    let mut shared_expr = None;
-    for def in entry_defs {
-        let expr = expr_for_dup_safe_fixed_def(lowering, *def)?;
-        if shared_expr
-            .as_ref()
-            .is_some_and(|known_expr: &HirExpr| *known_expr != expr)
-        {
-            return None;
+    match entry_value {
+        SsaValue::Entry(reg) => Some(expr_for_entry_reg(lowering, reg)),
+        SsaValue::Def(def) => {
+            let temp = *lowering.bindings.fixed_temps.get(def.index())?;
+            Some(HirExpr::TempRef(temp))
         }
-        shared_expr = Some(expr);
+        SsaValue::Phi(phi) => {
+            let temp = *lowering.bindings.phi_temps.get(phi.index())?;
+            Some(HirExpr::TempRef(temp))
+        }
     }
-
-    shared_expr
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -118,14 +105,14 @@ enum ChangedRegionEntry {
 
 fn classify_value_leaves(
     short: &ShortCircuitCandidate,
-    entry_defs: &BTreeSet<DefId>,
+    entry_value: SsaValue,
 ) -> Option<BTreeMap<BlockRef, ValueLeafKind>> {
     let mut leaf_kinds = BTreeMap::new();
     let mut has_preserved = false;
     let mut has_changed = false;
 
     for incoming in &short.value_incomings {
-        let kind = if incoming.defs.iter().eq(entry_defs.iter()) {
+        let kind = if incoming.value == entry_value {
             has_preserved = true;
             ValueLeafKind::Preserved
         } else {

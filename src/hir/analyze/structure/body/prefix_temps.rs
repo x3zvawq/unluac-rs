@@ -47,10 +47,9 @@ impl StructuredBodyLowerer<'_, '_> {
             .dataflow
             .use_values_at(branch_ref)
             .values()
-            .flat_map(|values| values.iter())
             .filter_map(|value| match value {
                 SsaValue::Def(def) => Some(def),
-                SsaValue::Phi(_) => None,
+                SsaValue::Entry(_) | SsaValue::Phi(_) => None,
             })
             .collect::<Vec<_>>();
 
@@ -62,12 +61,16 @@ impl StructuredBodyLowerer<'_, '_> {
             if (prefix_start..prefix_end).contains(&def_instr.index()) {
                 temps.insert(self.lowering.bindings.fixed_temps[def.index()]);
             }
-            for values in self.lowering.dataflow.use_values_at(def_instr).values() {
-                pending_defs.extend(values.iter().filter_map(|value| match value {
-                    SsaValue::Def(upstream) => Some(upstream),
-                    SsaValue::Phi(_) => None,
-                }));
-            }
+            pending_defs.extend(
+                self.lowering
+                    .dataflow
+                    .use_values_at(def_instr)
+                    .values()
+                    .filter_map(|value| match value {
+                        SsaValue::Def(upstream) => Some(upstream),
+                        SsaValue::Entry(_) | SsaValue::Phi(_) => None,
+                    }),
+            );
         }
 
         temps

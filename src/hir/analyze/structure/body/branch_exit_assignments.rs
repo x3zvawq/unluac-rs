@@ -42,7 +42,7 @@ impl StructuredBodyLowerer<'_, '_> {
         };
         if short.blocks.contains(&value_leaf)
             || self.branch_by_header.contains_key(&value_leaf)
-            || self.loop_by_header.contains_key(&value_leaf)
+            || self.loop_headers.contains(&value_leaf)
         {
             return None;
         }

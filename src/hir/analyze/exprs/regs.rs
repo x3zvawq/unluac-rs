@@ -15,34 +15,7 @@ pub(crate) fn expr_for_reg_use(
     if let Some(local) = lowering.bindings.local_for_reg_in_block(block, reg) {
         return HirExpr::LocalRef(local);
     }
-    let Some(values) = lowering.dataflow.use_values_at(instr_ref).get(reg) else {
-        return expr_for_entry_reg(lowering, reg);
-    };
-
-    if values.is_empty() {
-        return expr_for_entry_reg(lowering, reg);
-    }
-
-    if values.len() == 1 {
-        let value = values
-            .iter()
-            .next()
-            .expect("len checked above, exactly one SSA-like value exists");
-        return match value {
-            SsaValue::Def(def) => lowering
-                .bindings
-                .expr_for_temp(lowering.bindings.fixed_temps[def.index()]),
-            SsaValue::Phi(phi) => lowering
-                .bindings
-                .expr_for_temp(lowering.bindings.phi_temps[phi.index()]),
-        };
-    }
-
-    unresolved_expr(format!(
-        "multi-value use r{} @{}",
-        reg.index(),
-        instr_ref.index()
-    ))
+    expr_for_ssa_value(lowering, lowering.dataflow.use_value(instr_ref, reg))
 }
 
 pub(crate) fn expr_for_closure_capture(
@@ -98,7 +71,7 @@ fn reg_use_is_entry_empty(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, reg
         .dataflow
         .use_values_at(instr_ref)
         .get(reg)
-        .is_none_or(|values| values.is_empty())
+        .is_none_or(|value| matches!(value, SsaValue::Entry(_)))
         && reg.index() >= lowering.bindings.params.len()
         && !lowering.bindings.entry_local_regs.contains_key(&reg)
 }
@@ -110,13 +83,7 @@ fn reg_use_is_entry_empty(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, reg
 /// LOADNIL r2..r4 之后紧跟 CLOSURE r2/r3/r4，capture 的 SSA 到达定义
 /// 虽然存在（不是 Unresolved）但只是 LOADNIL 的占位 nil。
 fn is_loadnil_def(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, reg: Reg) -> bool {
-    let Some(values) = lowering.dataflow.use_values_at(instr_ref).get(reg) else {
-        return false;
-    };
-    if values.len() != 1 {
-        return false;
-    }
-    let value = values.iter().next().unwrap();
+    let value = lowering.dataflow.use_value(instr_ref, reg);
     let SsaValue::Def(def) = value else {
         return false;
     };
@@ -163,39 +130,7 @@ pub(crate) fn expr_for_reg_at_block_entry(
     if let Some(local) = lowering.bindings.local_for_reg_in_block(block, reg) {
         return HirExpr::LocalRef(local);
     }
-    let range = lowering.cfg.blocks[block.index()].instrs;
-    if range.is_empty() {
-        return expr_for_entry_reg(lowering, reg);
-    }
-
-    let Some(values) = lowering.dataflow.reaching_values_at(range.start).get(reg) else {
-        return expr_for_entry_reg(lowering, reg);
-    };
-
-    if values.is_empty() {
-        return expr_for_entry_reg(lowering, reg);
-    }
-
-    if values.len() == 1 {
-        let value = values
-            .iter()
-            .next()
-            .expect("len checked above, exactly one SSA-like value exists");
-        return match value {
-            SsaValue::Def(def) => lowering
-                .bindings
-                .expr_for_temp(lowering.bindings.fixed_temps[def.index()]),
-            SsaValue::Phi(phi) => lowering
-                .bindings
-                .expr_for_temp(lowering.bindings.phi_temps[phi.index()]),
-        };
-    }
-
-    unresolved_expr(format!(
-        "multi-value entry r{} block#{}",
-        reg.index(),
-        block.index()
-    ))
+    expr_for_ssa_value(lowering, lowering.dataflow.block_entry_value(block, reg))
 }
 
 /// 某些 `goto + label` 形状需要读取“离开 block 时这个寄存器的稳定值”。
@@ -212,66 +147,7 @@ pub(crate) fn expr_for_reg_at_block_exit(
         return HirExpr::LocalRef(local);
     }
 
-    let range = lowering.cfg.blocks[block.index()].instrs;
-    let Some(last_instr_ref) = range.last() else {
-        return expr_for_entry_reg(lowering, reg);
-    };
-
-    let effect = &lowering.dataflow.instr_effects[last_instr_ref.index()];
-    if effect.fixed_must_defs.contains(&reg) {
-        let Some(def) = fixed_def_for_reg(lowering, last_instr_ref, reg) else {
-            return unresolved_expr(format!(
-                "missing block-exit def r{} block#{}",
-                reg.index(),
-                block.index()
-            ));
-        };
-        return lowering
-            .bindings
-            .expr_for_temp(lowering.bindings.fixed_temps[def.index()]);
-    }
-
-    let mut values = lowering
-        .dataflow
-        .reaching_values_at(last_instr_ref)
-        .get(reg)
-        .map(|values| values.to_compact_set())
-        .unwrap_or_default();
-    if effect.fixed_may_defs.contains(&reg) {
-        let Some(def) = fixed_def_for_reg(lowering, last_instr_ref, reg) else {
-            return unresolved_expr(format!(
-                "missing block-exit may-def r{} block#{}",
-                reg.index(),
-                block.index()
-            ));
-        };
-        values.insert(SsaValue::Def(def));
-    }
-
-    if values.is_empty() {
-        return expr_for_entry_reg(lowering, reg);
-    }
-
-    if values.len() == 1 {
-        let value = values
-            .iter()
-            .next()
-            .expect("len checked above, exactly one SSA-like value exists");
-        return match value {
-            SsaValue::Def(def) => lowering
-                .bindings
-                .expr_for_temp(lowering.bindings.fixed_temps[def.index()]),
-            SsaValue::Phi(phi) => lowering
-                .bindings
-                .expr_for_temp(lowering.bindings.phi_temps[phi.index()]),
-        };
-    }
-
-    unresolved_expr(format!(
-        "multi-value exit r{} block#{}",
-        reg.index(),
-        block.index()
-    ))
+    expr_for_ssa_value(lowering, lowering.dataflow.block_exit_value(block, reg))
 }
 
 /// 当值恢复跨过被整体吸收的 branch 区域时，内部 leaf/node block 可能不会单独物化。
@@ -288,36 +164,17 @@ pub(crate) fn expr_for_reg_use_inline(
     if let Some(local) = lowering.bindings.local_for_reg_in_block(block, reg) {
         return HirExpr::LocalRef(local);
     }
-    let Some(values) = lowering.dataflow.use_values_at(instr_ref).get(reg) else {
-        return expr_for_entry_reg(lowering, reg);
-    };
-
-    if values.is_empty() {
-        return expr_for_entry_reg(lowering, reg);
-    }
-
-    if values.len() == 1 {
-        let value = values
-            .iter()
-            .next()
-            .expect("len checked above, exactly one SSA-like value exists");
-        return match value {
-            SsaValue::Def(def) => expr_for_dup_safe_fixed_def(lowering, def).unwrap_or_else(|| {
-                lowering
-                    .bindings
-                    .expr_for_temp(lowering.bindings.fixed_temps[def.index()])
-            }),
-            SsaValue::Phi(phi) => lowering
+    match lowering.dataflow.use_value(instr_ref, reg) {
+        SsaValue::Entry(entry_reg) => expr_for_entry_reg(lowering, entry_reg),
+        SsaValue::Def(def) => expr_for_dup_safe_fixed_def(lowering, def).unwrap_or_else(|| {
+            lowering
                 .bindings
-                .expr_for_temp(lowering.bindings.phi_temps[phi.index()]),
-        };
+                .expr_for_temp(lowering.bindings.fixed_temps[def.index()])
+        }),
+        SsaValue::Phi(phi) => lowering
+            .bindings
+            .expr_for_temp(lowering.bindings.phi_temps[phi.index()]),
     }
-
-    unresolved_expr(format!(
-        "multi-value use r{} @{}",
-        reg.index(),
-        instr_ref.index()
-    ))
 }
 
 /// `single-eval` 只承诺“这次求值可以直接表达出来”，并不承诺“可以重复复制很多次”。
@@ -339,56 +196,49 @@ pub(crate) fn expr_for_reg_use_single_eval_with_call_policy(
     if let Some(local) = lowering.bindings.local_for_reg_in_block(block, reg) {
         return HirExpr::LocalRef(local);
     }
-    let Some(values) = lowering.dataflow.use_values_at(instr_ref).get(reg) else {
-        return expr_for_entry_reg(lowering, reg);
-    };
-
-    if values.is_empty() {
-        return expr_for_entry_reg(lowering, reg);
-    }
-
-    if values.len() == 1 {
-        let value = values
-            .iter()
-            .next()
-            .expect("len checked above, exactly one SSA-like value exists");
-        return match value {
-            SsaValue::Def(def) => {
-                if lowering.dataflow.def_block(def) != block {
-                    return lowering
-                        .bindings
-                        .expr_for_temp(lowering.bindings.fixed_temps[def.index()]);
-                }
-                if def_has_intervening_use(lowering, def, instr_ref) {
-                    return lowering
-                        .bindings
-                        .expr_for_temp(lowering.bindings.fixed_temps[def.index()]);
-                }
-                if def_is_call_consumed_by_non_branch(lowering, def, instr_ref)
-                    && (!allow_call_consumed_by_pure_wrapper
-                        || def_has_later_use_after_pure_wrapper(lowering, def, instr_ref))
-                {
-                    return lowering
-                        .bindings
-                        .expr_for_temp(lowering.bindings.fixed_temps[def.index()]);
-                }
-                expr_for_fixed_def_single_eval(lowering, def).unwrap_or_else(|| {
-                    lowering
-                        .bindings
-                        .expr_for_temp(lowering.bindings.fixed_temps[def.index()])
-                })
+    match lowering.dataflow.use_value(instr_ref, reg) {
+        SsaValue::Entry(entry_reg) => expr_for_entry_reg(lowering, entry_reg),
+        SsaValue::Def(def) => {
+            if lowering.dataflow.def_block(def) != block {
+                return lowering
+                    .bindings
+                    .expr_for_temp(lowering.bindings.fixed_temps[def.index()]);
             }
-            SsaValue::Phi(phi) => lowering
-                .bindings
-                .expr_for_temp(lowering.bindings.phi_temps[phi.index()]),
-        };
+            if def_has_intervening_use(lowering, def, instr_ref) {
+                return lowering
+                    .bindings
+                    .expr_for_temp(lowering.bindings.fixed_temps[def.index()]);
+            }
+            if def_is_call_consumed_by_non_branch(lowering, def, instr_ref)
+                && (!allow_call_consumed_by_pure_wrapper
+                    || def_has_later_use_after_pure_wrapper(lowering, def, instr_ref))
+            {
+                return lowering
+                    .bindings
+                    .expr_for_temp(lowering.bindings.fixed_temps[def.index()]);
+            }
+            expr_for_fixed_def_single_eval(lowering, def).unwrap_or_else(|| {
+                lowering
+                    .bindings
+                    .expr_for_temp(lowering.bindings.fixed_temps[def.index()])
+            })
+        }
+        SsaValue::Phi(phi) => lowering
+            .bindings
+            .expr_for_temp(lowering.bindings.phi_temps[phi.index()]),
     }
+}
 
-    unresolved_expr(format!(
-        "multi-value use r{} @{}",
-        reg.index(),
-        instr_ref.index()
-    ))
+fn expr_for_ssa_value(lowering: &ProtoLowering<'_>, value: SsaValue) -> HirExpr {
+    match value {
+        SsaValue::Entry(reg) => expr_for_entry_reg(lowering, reg),
+        SsaValue::Def(def) => lowering
+            .bindings
+            .expr_for_temp(lowering.bindings.fixed_temps[def.index()]),
+        SsaValue::Phi(phi) => lowering
+            .bindings
+            .expr_for_temp(lowering.bindings.phi_temps[phi.index()]),
+    }
 }
 
 fn def_is_call_consumed_by_non_branch(

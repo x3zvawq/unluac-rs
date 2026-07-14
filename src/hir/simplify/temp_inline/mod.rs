@@ -5,6 +5,9 @@
 //! `callee_temp = f; arg_temp = expr; callee_temp(arg_temp)` 这种 bytecode 为保持 Lua
 //! “先求 callee、再求参数”而拆出的形状；融合时必须把 callee 和参数一起放回同一条
 //! call，不能只把 callee 延后到参数求值之后。
+//! 相邻内联以可观察事件前缀而非语法子节点顺序判定：纯 local/param 读取不是屏障，
+//! lookup、调用、运算和 method sugar 的隐式 lookup 是屏障；while/repeat 条件还属于
+//! 每轮重新求值的独立区域，不能接收循环外快照。
 
 mod mentioned;
 mod rewrite;
@@ -23,7 +26,10 @@ use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use self::mentioned::NestedTempProtection;
 use self::rewrite::replace_temp_in_stmt;
-use self::site::{InlineSite, expr_touches_temp, inline_site_in_stmt, temp_is_first_eval_in_stmt};
+use self::site::{
+    InlineSite, expr_touches_temp, inline_site_in_stmt, is_stable_inline_value,
+    temp_precedes_observable_eval_in_stmt,
+};
 use self::usage::{
     NextStmtState, TempUseScratch, TempUseSummary, collect_stmt_temp_uses, inline_candidate,
     max_temp_index_in_block,
@@ -142,7 +148,7 @@ fn inline_temps_in_block(
             && let Some(next_stmt) = kept_rev.last()
             && let Some(site) = inline_site_in_stmt(next_stmt, temp)
             && !call_arg_inline_crosses_materialized_callee(site, value, index, state)
-            && !condition_inline_moves_order_sensitive_expr(site, value, next_stmt, temp)
+            && !inline_crosses_evaluation_boundary(site, value, next_stmt, temp)
             && site.allows(value, readability)
         {
             state.temp_uses.remove_from_totals(&mut suffix_use_totals);
@@ -173,15 +179,32 @@ fn inline_temps_in_block(
     changed
 }
 
-fn condition_inline_moves_order_sensitive_expr(
+fn inline_crosses_evaluation_boundary(
     site: InlineSite,
     value: &HirExpr,
     next_stmt: &HirStmt,
     temp: TempId,
 ) -> bool {
-    site == InlineSite::Condition
-        && expr_observes_eval_order(value)
-        && !temp_is_first_eval_in_stmt(next_stmt, temp)
+    fixed_return_tail_call_prefers_materialization(site, value, next_stmt, temp)
+        || (site == InlineSite::LoopCondition && !is_stable_inline_value(value))
+        || (expr_observes_eval_order(value)
+            && !temp_precedes_observable_eval_in_stmt(next_stmt, temp))
+}
+
+fn fixed_return_tail_call_prefers_materialization(
+    site: InlineSite,
+    value: &HirExpr,
+    next_stmt: &HirStmt,
+    temp: TempId,
+) -> bool {
+    let HirStmt::Return(ret) = next_stmt else {
+        return false;
+    };
+    site == InlineSite::ReturnValue
+        && !ret.trailing_multiret
+        && ret.values.len() > 1
+        && matches!(value, HirExpr::Call(_))
+        && matches!(ret.values.last(), Some(HirExpr::TempRef(tail)) if *tail == temp)
 }
 
 fn captured_slots_before_stmts(

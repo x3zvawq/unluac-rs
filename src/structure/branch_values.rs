@@ -1,13 +1,14 @@
 //! 这个文件提取普通 branch 的值合流候选。
 //!
 //! 这个 pass 依赖 CFG / GraphFacts / Dataflow 已经给好的 branch 骨架和 phi 事实，
-//! 负责把“结构臂归属 + HIR 真正要用的 def 身份”一次性前移到 StructureFacts。
+//! 负责把“结构臂归属 + HIR 真正要用的 canonical SSA 身份”一次性前移到 StructureFacts。
 //! 它不会越权做 decision/alias 最终选择，那一步仍留给 HIR。
 //!
 //! 例子：
 //! - `if cond then x = 1 else x = 2 end` 会把 merge phi 记录成
-//!   `then_arm = {preds, defs_of_1}`、`else_arm = {preds, defs_of_2}`
-//! - 这样 HIR 只消费 `then/else` 两臂已经分好的 defs，不再自己回头拆 `phi.incoming`
+//!   `then_arm = {preds, values_of_1}`、`else_arm = {preds, values_of_2}`
+//! - 这样 HIR 只消费 `then/else` 两臂已经分好的 SSA values，不再自己回头拆
+//!   `phi.incoming`
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -104,11 +105,17 @@ fn analyze_guard_short_circuit_branch_value_merges(
             continue;
         };
 
-        // Determine direction: one exit must reach the other (the "body" flows
-        // into the "merge"). Handle both truthy→falsy and falsy→truthy so that
-        // inverted comparisons (e.g. LuaJIT ISGE) work correctly.
-        let truthy_reaches_falsy = cfg.can_reach(truthy, falsy);
-        let falsy_reaches_truthy = cfg.can_reach(falsy, truthy);
+        // 常规 guard 的 merge 会后支配 body，直接复用 GraphFacts 可避免为每个顺序
+        // branch 重跑一次全图 BFS。early-return 等不满足后支配的形状才退回普通可达性；
+        // 两个方向都保留，确保 LuaJIT 反向比较仍按真实控制流分类。
+        let (truthy_reaches_falsy, falsy_reaches_truthy) =
+            if graph_facts.post_dominates(falsy, truthy) {
+                (true, false)
+            } else if graph_facts.post_dominates(truthy, falsy) {
+                (false, true)
+            } else {
+                (cfg.can_reach(truthy, falsy), cfg.can_reach(falsy, truthy))
+            };
         let (body, merge, body_is_truthy) = match (truthy_reaches_falsy, falsy_reaches_truthy) {
             (true, false) => (truthy, falsy, true),
             (false, true) => (falsy, truthy, false),

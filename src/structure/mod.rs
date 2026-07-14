@@ -14,18 +14,18 @@ mod goto;
 mod helpers;
 mod loops;
 mod phi_facts;
+mod plan;
 mod regions;
 mod scope;
 mod short_circuit;
 
 pub(crate) use analyze::analyze_structure_stage;
 pub use cfg::{
-    BasicBlock, BlockKind, BlockRef, Cfg, CfgEdge, CfgGraph, CompactSet, DataflowFacts, Def, DefId,
+    BasicBlock, BlockKind, BlockRef, Cfg, CfgEdge, CfgGraph, DataflowFacts, Def, DefId,
     DominatorTree, EdgeKind, EdgeRef, EffectTag, GraphFacts, InstrEffect, InstrRange,
-    InstrReachingDefs, InstrReachingValues, InstrUseDefs, InstrUseValues, NaturalLoop, OpenDef,
-    OpenDefId, OpenUseSite, PhiCandidate, PhiId, PhiIncoming, PostDominatorTree,
-    ReachableSuccessorShape, RegValueMap, SideEffectSummary, SsaValue, UseSite, ValueMapRef,
-    ValueSetRef, build_cfg_graph, compute_dataflow_facts,
+    InstrUseValues, NaturalLoop, OpenDef, OpenDefId, OpenUseSources, PhiCandidate, PhiId,
+    PhiIncoming, PostDominatorTree, ReachableSuccessorShape, SideEffectSummary, SsaRegMap,
+    SsaValue, UseSite, build_cfg_graph, compute_dataflow_facts,
 };
 pub use common::{
     BranchCandidate, BranchKind, BranchRegionFact, BranchValueMergeArm, BranchValueMergeCandidate,
@@ -33,10 +33,11 @@ pub use common::{
     GotoRequirement, LoopCandidate, LoopExitValueMergeCandidate, LoopKindHint, LoopSourceBindings,
     LoopValueArm, LoopValueIncoming, LoopValueMerge, RegionFact, RegionKind, ScopeCandidate,
     ScopeKind, ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNode, ShortCircuitNodeRef,
-    ShortCircuitTarget, ShortCircuitValueIncoming, StructureFacts,
+    ShortCircuitTarget, ShortCircuitValueIncoming, StructureFacts, StructurePlan,
 };
 #[cfg(feature = "decompile-debug")]
 pub use debug::dump_structure;
+pub use plan::{BranchValueMergeId, LoopCandidateId};
 #[cfg(not(feature = "decompile-debug"))]
 mod debug {
     crate::debug::define_unavailable_stage_dump!(dump_structure);

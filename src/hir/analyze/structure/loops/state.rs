@@ -17,6 +17,7 @@ use crate::structure::SsaValue;
 impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     pub(super) fn build_loop_state_plan(
         &self,
+        candidate_id: LoopCandidateId,
         candidate: &LoopCandidate,
         preheader: Option<BlockRef>,
         exit: BlockRef,
@@ -50,7 +51,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             {
                 Some(init) => init,
                 None => {
-                    if value.outside_arm.defs().count() == 0
+                    if value.outside_arm.values().count() == 0
                         && self.lowering.dataflow.phi_use_count(value.phi_id) == 0
                         && Self::exit_value_for_reg(candidate, exit, value.reg).is_none()
                     {
@@ -65,9 +66,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             self.extend_loop_state_input_overrides(
                 candidate,
                 value.reg,
-                value.inside_arm.defs().map(SsaValue::Def),
+                value.inside_arm.values(),
                 &target,
                 &mut plan.backedge_target_overrides,
+                &mut plan.owned_phis,
             );
 
             plan.states.push(LoopStateSlot {
@@ -85,7 +87,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // 但语义上传递的仍是循环体内部的值。这里和 install_loop_exit_bindings 保持一致，
         // 把这些 pad 块也视为"循环内"来计算 outside-arm 的唯一初值。
         let inside_exit_blocks = self
-            .loop_state_inside_exit_blocks(candidate, exit)
+            .loop_state_inside_exit_blocks(candidate_id, candidate, exit)
             .unwrap_or_else(|| candidate.blocks.clone());
 
         for value in Self::exit_values(candidate, exit) {
@@ -125,9 +127,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 self.extend_loop_state_input_overrides(
                     candidate,
                     value.reg,
-                    value.inside_arm.defs().map(SsaValue::Def),
+                    value.inside_arm.values(),
                     &target,
                     &mut plan.backedge_target_overrides,
+                    &mut plan.owned_phis,
                 );
             }
 
@@ -161,6 +164,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         values: impl IntoIterator<Item = SsaValue>,
         target: &HirLValue,
         overrides: &mut BTreeMap<TempId, HirLValue>,
+        owned_phis: &mut BTreeSet<PhiId>,
     ) {
         let mut pending = values.into_iter().collect::<Vec<_>>();
         let mut seen_defs = BTreeSet::new();
@@ -182,9 +186,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                         continue;
                     }
                     let instr = self.lowering.dataflow.def_instr(def);
-                    if let Some(inputs) = self.lowering.dataflow.use_values_at(instr).get(reg) {
-                        pending.extend(inputs.iter());
-                    }
+                    pending.push(self.lowering.dataflow.use_value(instr, reg));
                 }
                 SsaValue::Phi(phi_id) => {
                     let Some(phi) = self.lowering.dataflow.phi_candidate(phi_id) else {
@@ -197,6 +199,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                         continue;
                     }
                     let temp = self.lowering.bindings.phi_temps[phi_id.index()];
+                    owned_phis.insert(phi_id);
                     if target != &HirLValue::Temp(temp) {
                         overrides.insert(temp, target.clone());
                     }
@@ -208,10 +211,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                                     .pred
                                     .is_some_and(|pred| candidate.blocks.contains(&pred))
                             })
-                            .flat_map(|incoming| incoming.defs.iter().copied())
-                            .map(SsaValue::Def),
+                            .map(|incoming| incoming.value),
                     );
                 }
+                SsaValue::Entry(_) => {}
             }
         }
     }
@@ -239,7 +242,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             let defs = phi
                 .incoming
                 .iter()
-                .flat_map(|incoming| incoming.defs.iter().copied())
+                .flat_map(|incoming| self.lowering.dataflow.leaf_defs(incoming.value))
                 .collect::<Vec<_>>();
             if defs.is_empty()
                 || shared_lvalue_for_defs(
@@ -270,12 +273,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         target_overrides: &BTreeMap<TempId, HirLValue>,
         plan: &mut LoopStatePlan,
     ) {
-        let range = self.lowering.cfg.blocks[exit.index()].instrs;
-        if range.is_empty() {
-            return;
-        }
         let live_in = self.lowering.dataflow.live_in_regs(exit);
-        let reaching = self.lowering.dataflow.reaching_values_at(range.start);
         let mut planned_regs = plan
             .states
             .iter()
@@ -286,18 +284,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             if excluded.contains(reg) || planned_regs.contains(reg) {
                 continue;
             }
-            let Some(values) = reaching.get(*reg) else {
-                continue;
-            };
-            let values = values.iter().collect::<Vec<_>>();
-            if values.is_empty()
-                || !values
-                    .iter()
-                    .all(|value| self.value_belongs_to_loop(candidate, *value))
-            {
+            let value = self.lowering.dataflow.block_entry_value(exit, *reg);
+            if !self.value_belongs_to_loop(candidate, value) {
                 continue;
             }
-            let Some(temp) = self.live_out_state_temp(&values) else {
+            let Some(temp) = self.live_out_state_temp(value) else {
                 continue;
             };
             let inherited_target = self.active_loop_state_target(*reg);
@@ -333,19 +324,18 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             };
             rewrite_expr_temps(&mut init, &temp_expr_overrides(target_overrides));
 
-            for value in values {
-                match value {
-                    SsaValue::Def(def) => {
-                        let def_temp = self.lowering.bindings.fixed_temps[def.index()];
-                        plan.backedge_target_overrides
-                            .insert(def_temp, target.clone());
-                    }
-                    SsaValue::Phi(phi_id) => {
-                        let phi_temp = self.lowering.bindings.phi_temps[phi_id.index()];
-                        plan.backedge_target_overrides
-                            .insert(phi_temp, target.clone());
-                    }
+            match value {
+                SsaValue::Def(def) => {
+                    let def_temp = self.lowering.bindings.fixed_temps[def.index()];
+                    plan.backedge_target_overrides
+                        .insert(def_temp, target.clone());
                 }
+                SsaValue::Phi(phi_id) => {
+                    let phi_temp = self.lowering.bindings.phi_temps[phi_id.index()];
+                    plan.backedge_target_overrides
+                        .insert(phi_temp, target.clone());
+                }
+                SsaValue::Entry(_) => {}
             }
             plan.states.push(LoopStateSlot {
                 phi_id: None,
@@ -360,6 +350,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
     fn value_belongs_to_loop(&self, candidate: &LoopCandidate, value: SsaValue) -> bool {
         match value {
+            SsaValue::Entry(_) => false,
             SsaValue::Def(def) => candidate
                 .blocks
                 .contains(&self.lowering.dataflow.def_block(def)),
@@ -369,8 +360,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
     }
 
-    fn live_out_state_temp(&self, values: &[SsaValue]) -> Option<TempId> {
-        values.iter().find_map(|value| match *value {
+    fn live_out_state_temp(&self, value: SsaValue) -> Option<TempId> {
+        match value {
+            SsaValue::Entry(_) => None,
             SsaValue::Def(def) => self.lowering.bindings.fixed_temps.get(def.index()).copied(),
             SsaValue::Phi(phi_id) => self
                 .lowering
@@ -378,11 +370,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .phi_temps
                 .get(phi_id.index())
                 .copied(),
-        })
+        }
     }
 
     pub(super) fn install_loop_exit_bindings(
         &mut self,
+        candidate_id: LoopCandidateId,
         candidate: &LoopCandidate,
         exit: BlockRef,
         plan: &LoopStatePlan,
@@ -397,10 +390,28 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             let Some(state_expr) = lvalue_as_expr(&state.target) else {
                 continue;
             };
+            if let Some(phi_id) = state.phi_id {
+                let phi_temp = self.lowering.bindings.phi_temps[phi_id.index()];
+                if !self.overrides.alias_phi_temp(phi_temp, state_expr.clone()) {
+                    self.overrides.unsuppress_phi(phi_id);
+                    continue;
+                }
+            }
             self.install_entry_override(exit, state.reg, state_expr);
         }
+        for phi_id in &plan.owned_phis {
+            let phi_temp = self.lowering.bindings.phi_temps[phi_id.index()];
+            if let Some(expr) = plan
+                .backedge_target_overrides
+                .get(&phi_temp)
+                .and_then(lvalue_as_expr)
+                && !self.overrides.alias_phi_temp(phi_temp, expr)
+            {
+                self.overrides.unsuppress_phi(*phi_id);
+            }
+        }
         let inside_exit_blocks = self
-            .loop_state_inside_exit_blocks(candidate, exit)
+            .loop_state_inside_exit_blocks(candidate_id, candidate, exit)
             .unwrap_or_else(|| candidate.blocks.clone());
 
         let state_by_reg = state_slots_by_reg(&plan.states);

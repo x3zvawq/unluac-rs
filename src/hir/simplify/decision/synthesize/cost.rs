@@ -7,7 +7,6 @@
 use crate::hir::common::{HirBinaryOpKind, HirExpr, HirUnaryOpKind};
 
 use super::domain::AbstractValue;
-use super::readable::flatten_or_chain;
 
 const AND_WITH_OR_CHILD_PENALTY: usize = 8;
 const COMPLEX_AND_WITH_OR_EXTRA_PENALTY: usize = 4;
@@ -17,25 +16,8 @@ pub(crate) fn expr_cost(expr: &HirExpr) -> usize {
     structural_expr_cost(expr) + duplicate_atom_penalty(expr) + logical_shape_penalty(expr)
 }
 
-pub(super) fn readable_expr_cost(expr: &HirExpr) -> ReadableExprCost {
-    ReadableExprCost {
-        duplicate_branch_penalty: duplicate_branch_penalty(expr),
-        duplicate_atom_penalty: duplicate_atom_penalty(expr),
-        or_chain_penalty: or_chain_penalty(expr),
-        structural_cost: structural_expr_cost(expr),
-    }
-}
-
 pub(super) fn is_truthy(value: &AbstractValue) -> bool {
     !matches!(value, AbstractValue::Nil | AbstractValue::False)
-}
-
-#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
-pub(super) struct ReadableExprCost {
-    duplicate_branch_penalty: usize,
-    duplicate_atom_penalty: usize,
-    or_chain_penalty: usize,
-    structural_cost: usize,
 }
 
 fn structural_expr_cost(expr: &HirExpr) -> usize {
@@ -91,171 +73,6 @@ fn duplicate_atom_penalty(expr: &HirExpr) -> usize {
         }
     }
     duplicates + run_len.saturating_sub(1)
-}
-
-fn duplicate_branch_penalty(expr: &HirExpr) -> usize {
-    let mut branches = Vec::new();
-    collect_branch_subexprs(expr, &mut branches);
-    let mut counts = std::collections::BTreeMap::<ExprShapeKey<'_>, (usize, usize)>::new();
-    for branch in branches {
-        let key = expr_shape_key(branch);
-        let cost = structural_expr_cost(branch);
-        let entry = counts.entry(key).or_insert((0, cost));
-        entry.0 += 1;
-    }
-    counts
-        .into_values()
-        .map(|(count, cost)| count.saturating_sub(1) * count / 2 * cost)
-        .sum()
-}
-
-fn collect_branch_subexprs<'a>(expr: &'a HirExpr, out: &mut Vec<&'a HirExpr>) {
-    match expr {
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            out.push(expr);
-            collect_branch_subexprs(&logical.lhs, out);
-            collect_branch_subexprs(&logical.rhs, out);
-        }
-        HirExpr::Unary(unary) => collect_branch_subexprs(&unary.expr, out),
-        HirExpr::Binary(binary) => {
-            collect_branch_subexprs(&binary.lhs, out);
-            collect_branch_subexprs(&binary.rhs, out);
-        }
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::Decision(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::TableAccess(_)
-        | HirExpr::Call(_)
-        | HirExpr::VarArg
-        | HirExpr::TableConstructor(_)
-        | HirExpr::Closure(_)
-        | HirExpr::Unresolved(_) => {}
-    }
-}
-
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
-enum ExprShapeKey<'a> {
-    Nil,
-    Boolean(bool),
-    Integer(i64),
-    Number(u64),
-    String(&'a [u8]),
-    Int64(i64),
-    UInt64(u64),
-    Vector([u32; 4]),
-    Complex { real_bits: u64, imag_bits: u64 },
-    Param(usize),
-    Local(usize),
-    Upvalue(usize),
-    Temp(usize),
-    Not(Box<ExprShapeKey<'a>>),
-    Eq(Box<ExprShapeKey<'a>>, Box<ExprShapeKey<'a>>),
-    LogicalAnd(Box<ExprShapeKey<'a>>, Box<ExprShapeKey<'a>>),
-    LogicalOr(Box<ExprShapeKey<'a>>, Box<ExprShapeKey<'a>>),
-    Global(&'a str),
-    TableAccess(Box<ExprShapeKey<'a>>, Box<ExprShapeKey<'a>>),
-    Call,
-    VarArg,
-    TableConstructor,
-    Closure,
-    Decision,
-    Unresolved,
-}
-
-fn expr_shape_key<'a>(expr: &'a HirExpr) -> ExprShapeKey<'a> {
-    match expr {
-        HirExpr::Nil => ExprShapeKey::Nil,
-        HirExpr::Boolean(value) => ExprShapeKey::Boolean(*value),
-        HirExpr::Integer(value) => ExprShapeKey::Integer(*value),
-        HirExpr::Number(value) => ExprShapeKey::Number(value.to_bits()),
-        HirExpr::String(value) => ExprShapeKey::String(value.as_bytes()),
-        HirExpr::Int64(value) => ExprShapeKey::Int64(*value),
-        HirExpr::UInt64(value) => ExprShapeKey::UInt64(*value),
-        HirExpr::Vector(vector) => ExprShapeKey::Vector(vector.components),
-        HirExpr::Complex { real, imag } => ExprShapeKey::Complex {
-            real_bits: real.to_bits(),
-            imag_bits: imag.to_bits(),
-        },
-        HirExpr::ParamRef(param) => ExprShapeKey::Param(param.index()),
-        HirExpr::LocalRef(local) => ExprShapeKey::Local(local.index()),
-        HirExpr::UpvalueRef(upvalue) => ExprShapeKey::Upvalue(upvalue.index()),
-        HirExpr::TempRef(temp) => ExprShapeKey::Temp(temp.index()),
-        HirExpr::GlobalRef(global) => ExprShapeKey::Global(global.name.as_str()),
-        HirExpr::TableAccess(access) => ExprShapeKey::TableAccess(
-            Box::new(expr_shape_key(&access.base)),
-            Box::new(expr_shape_key(&access.key)),
-        ),
-        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
-            ExprShapeKey::Not(Box::new(expr_shape_key(&unary.expr)))
-        }
-        HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Eq => ExprShapeKey::Eq(
-            Box::new(expr_shape_key(&binary.lhs)),
-            Box::new(expr_shape_key(&binary.rhs)),
-        ),
-        HirExpr::LogicalAnd(logical) => ExprShapeKey::LogicalAnd(
-            Box::new(expr_shape_key(&logical.lhs)),
-            Box::new(expr_shape_key(&logical.rhs)),
-        ),
-        HirExpr::LogicalOr(logical) => ExprShapeKey::LogicalOr(
-            Box::new(expr_shape_key(&logical.lhs)),
-            Box::new(expr_shape_key(&logical.rhs)),
-        ),
-        HirExpr::Unary(_other) => ExprShapeKey::Unresolved,
-        HirExpr::Binary(_other) => ExprShapeKey::Unresolved,
-        HirExpr::Decision(_) => ExprShapeKey::Decision,
-        HirExpr::Call(_) => ExprShapeKey::Call,
-        HirExpr::VarArg => ExprShapeKey::VarArg,
-        HirExpr::TableConstructor(_) => ExprShapeKey::TableConstructor,
-        HirExpr::Closure(_) => ExprShapeKey::Closure,
-        HirExpr::Unresolved(_) => ExprShapeKey::Unresolved,
-    }
-}
-
-fn or_chain_penalty(expr: &HirExpr) -> usize {
-    match expr {
-        HirExpr::LogicalOr(logical) => {
-            let chain_penalty = flatten_or_chain(expr).len().saturating_sub(2) * 4;
-            chain_penalty + or_chain_penalty(&logical.lhs) + or_chain_penalty(&logical.rhs)
-        }
-        HirExpr::LogicalAnd(logical) => {
-            or_chain_penalty(&logical.lhs) + or_chain_penalty(&logical.rhs)
-        }
-        HirExpr::Unary(unary) => or_chain_penalty(&unary.expr),
-        HirExpr::Binary(binary) => or_chain_penalty(&binary.lhs) + or_chain_penalty(&binary.rhs),
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::Decision(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::TableAccess(_)
-        | HirExpr::Call(_)
-        | HirExpr::VarArg
-        | HirExpr::TableConstructor(_)
-        | HirExpr::Closure(_)
-        | HirExpr::Unresolved(_) => 0,
-    }
 }
 
 fn logical_shape_penalty(expr: &HirExpr) -> usize {

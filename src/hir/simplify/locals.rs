@@ -238,7 +238,7 @@ fn promote_block_with_child_protection(
                 if let Some(slot) = plan.home_slot
                     && matches!(plan.action, PromotionAction::AllocateLocal)
                 {
-                    slot_candidates.entry(slot).or_insert(plan.local);
+                    slot_candidates.insert(slot, plan.local);
                 }
                 replaced_stmt |= plan_replaces_original_stmt(plan);
             }
@@ -361,6 +361,10 @@ fn collect_plans(
                     .home_slot(root_temp)
                     .zip(facts.home_slot(alias_temp))
                     .is_none_or(|(root, alias)| root == alias)
+                && !(facts.home_slot(root_temp).is_none()
+                    && facts
+                        .home_slot(alias_temp)
+                        .is_some_and(|slot| sticky_slots_for_stmt.contains_key(&slot)))
                 && !temp_touches.touches_in_range(decl_index + 1, future_index, alias_temp)
             {
                 group.insert(alias_temp);
@@ -451,7 +455,7 @@ fn collect_plans(
             if let Some(slot) = slot
                 && let Some(local) = allocator.plans.last().map(|plan| plan.local)
             {
-                slot_candidates.entry(slot).or_insert(local);
+                slot_candidates.insert(slot, local);
             }
         }
 
@@ -501,7 +505,7 @@ fn collect_plans(
                 if let Some(slot) = slot
                     && let Some(local) = allocator.plans.last().map(|plan| plan.local)
                 {
-                    slot_candidates.entry(slot).or_insert(local);
+                    slot_candidates.insert(slot, local);
                 }
             }
         }

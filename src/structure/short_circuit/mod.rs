@@ -68,7 +68,6 @@ pub(super) fn analyze_short_circuits(
         graph_facts,
         dataflow,
         &branch_by_header,
-        branch_candidates,
     ));
     candidates = candidates
         .into_iter()

@@ -72,7 +72,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         // try_lower_statement_value_merge_branch 处的同类守卫：条件重赋值同样把
-        // phi temp 直接内联进语句，跳过了 apply_loop_rewrites，当 entry_defs
+        // phi temp 直接内联进语句，跳过了 apply_loop_rewrites，当 entry value
         // 被 loop state 接管时，写入会被遗漏。
         if value_merge_defs_are_overridden(self.lowering, short, target_overrides) {
             return None;
@@ -496,7 +496,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 let defs = || {
                     phi.incoming
                         .iter()
-                        .flat_map(|incoming| incoming.defs.iter().copied())
+                        .flat_map(|incoming| self.lowering.dataflow.leaf_defs(incoming.value))
                 };
                 let target = shared_lvalue_for_defs(
                     &self.lowering.bindings.fixed_temps,
@@ -543,11 +543,16 @@ fn value_merge_defs_are_overridden(
             .get(def.index())
             .is_some_and(|temp| target_overrides.contains_key(temp))
     };
-    short.entry_defs.iter().any(is_overridden)
+    short
+        .entry_value
+        .into_iter()
+        .flat_map(|value| lowering.dataflow.leaf_defs(value))
+        .any(|def| is_overridden(&def))
         || short
             .value_incomings
             .iter()
-            .any(|inc| inc.defs.iter().any(is_overridden))
+            .flat_map(|incoming| lowering.dataflow.leaf_defs(incoming.value))
+            .any(|def| is_overridden(&def))
 }
 
 fn merge_has_other_live_phi(

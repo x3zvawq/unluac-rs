@@ -52,7 +52,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 self.loop_incoming_expr(
                     preheader,
                     value.reg,
-                    incoming.defs.iter().copied(),
+                    self.lowering.dataflow.leaf_defs(incoming.value),
                     target_overrides,
                 )
             }
@@ -106,14 +106,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .loop_incoming_expr_without_carried_override(
                     pred,
                     reg,
-                    incoming.defs.iter().copied(),
+                    self.lowering.dataflow.leaf_defs(incoming.value),
                     target_overrides,
                 )
                 .or_else(|| {
                     self.loop_incoming_expr_without_carried_override(
                         pred,
                         reg,
-                        incoming.defs.iter().copied(),
+                        self.lowering.dataflow.leaf_defs(incoming.value),
                         &raw_target_overrides,
                     )
                 })
@@ -121,7 +121,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     self.loop_incoming_expr(
                         pred,
                         reg,
-                        incoming.defs.iter().copied(),
+                        self.lowering.dataflow.leaf_defs(incoming.value),
                         target_overrides,
                     )
                 }),
@@ -142,14 +142,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .loop_incoming_lvalue_without_carried_override(
                     pred,
                     reg,
-                    incoming.defs.iter().copied(),
+                    self.lowering.dataflow.leaf_defs(incoming.value),
                     target_overrides,
                 )
                 .or_else(|| {
                     self.loop_incoming_lvalue_without_carried_override(
                         pred,
                         reg,
-                        incoming.defs.iter().copied(),
+                        self.lowering.dataflow.leaf_defs(incoming.value),
                         &raw_target_overrides,
                     )
                 })
@@ -157,7 +157,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     self.loop_incoming_lvalue(
                         pred,
                         reg,
-                        incoming.defs.iter().copied(),
+                        self.lowering.dataflow.leaf_defs(incoming.value),
                         target_overrides,
                     )
                 }),
@@ -235,9 +235,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return Some(expr);
         }
 
-        // 嵌套 loop 的 preheader 上，某个寄存器的 reaching defs 可能包含多个原始定义
-        // （初值 + 内层循环回边写入），但在 reaching values 视角里它们早已被外层 loop 的
-        // header phi 合并成唯一的 SSA value。如果该 phi 对应的 temp 已经被外层 loop state
+        // 嵌套 loop 的 preheader 上，某个寄存器的叶子 defs 可能包含多个原始定义
+        // （初值 + 内层循环回边写入），但 canonical SSA 已由外层 loop 的 header phi
+        // 合并成唯一身份。如果该 phi 对应的 temp 已经被外层 loop state
         // plan 收录到 target_overrides 里，就可以直接沿用。
         // 典型触发场景：外层 while 的 phi_use_count == 0（没有指令直接读取该 phi，只经由
         // 内层 loop phi 间接消费），此时外层 plan 不把 inside_arm 的原始 def temps 加入
@@ -265,19 +265,21 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if range.is_empty() {
             return false;
         }
-        let values = self.lowering.dataflow.reaching_values_at(range.start);
-        let entry_empty = values.get(reg).is_none_or(|set| set.is_empty());
+        let entry_empty = matches!(
+            self.lowering.dataflow.block_entry_value(pred, reg),
+            SsaValue::Entry(_)
+        );
         if !entry_empty {
             return false;
         }
         // pred 内部如果有任何 def 写到该寄存器，edge 上就不再是 undef。
         !(range.start.index()..range.end()).any(|instr_index| {
             let effect = &self.lowering.dataflow.instr_effects[instr_index];
-            effect.fixed_must_defs.contains(&reg) || effect.fixed_may_defs.contains(&reg)
+            effect.fixed_must_defs.contains(&reg)
         })
     }
 
-    /// 查找 `pred` 块首条指令的 reaching values 里，`reg` 是否只有一个 phi，
+    /// 查找 `pred` 的 canonical block-entry value 是否为一个 phi，
     /// 并且该 phi 的 temp 已在 `target_overrides` 中。
     fn reaching_phi_override_expr(
         &self,
@@ -297,8 +299,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let fixed_temps = &self.lowering.bindings.fixed_temps;
         let combined_defs = value
             .inside_arm
-            .defs()
-            .chain(value.outside_arm.defs())
+            .values()
+            .chain(value.outside_arm.values())
+            .flat_map(|value| self.lowering.dataflow.leaf_defs(value))
             .collect::<Vec<_>>();
         if combined_defs.is_empty() {
             return None;
@@ -367,7 +370,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // 外层 loop 的 phi_use_count 可能为 0（因为没有指令直接读取外层 phi，而是通过内层
         // phi 间接消费）。此时外层 plan 不会把 inside_arm defs 加入 target_overrides，
         // 导致前面几个检查都无法匹配到外层的 state target。
-        // 这里通过 preheader 上的 reaching values 查找是否存在一个已由外层收纳的 phi，
+        // 这里通过 preheader 上的 canonical SSA value 查找已由外层收纳的 phi，
         // 如果存在就直接沿用外层的 state target，使得内层循环的写入自动传播到外层变量。
         if let Some(preheader) = unique_loop_preheader(candidate)
             && let Some(target) =
@@ -463,7 +466,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         None
     }
 
-    /// 查找 `block` 首条指令的 reaching values 里，`reg` 是否只有一个 phi，
+    /// 查找 `block` 的 canonical block-entry value 是否为一个 phi，
     /// 并且该 phi 的 temp 已在 `target_overrides` 中——返回对应的 `HirLValue`。
     ///
     /// 与 `reaching_phi_override_expr` 平行，这里返回 lvalue 而非 expr，供
@@ -484,18 +487,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         reg: Reg,
         target_overrides: &'c BTreeMap<TempId, HirLValue>,
     ) -> Option<&'c HirLValue> {
-        let first_instr = self.lowering.cfg.blocks[block.index()].instrs.start;
-        let reaching = self.lowering.dataflow.reaching_values_at(first_instr);
-        let values = reaching.get(reg)?;
-
-        let mut phi_ids = values.iter().filter_map(|v| match v {
-            SsaValue::Phi(phi_id) => Some(phi_id),
-            SsaValue::Def(_) => None,
-        });
-        let phi_id = phi_ids.next()?;
-        if phi_ids.next().is_some() {
+        let SsaValue::Phi(phi_id) = self.lowering.dataflow.block_entry_value(block, reg) else {
             return None;
-        }
+        };
 
         let temp = *self.lowering.bindings.phi_temps.get(phi_id.index())?;
         let lvalue = target_overrides.get(&temp)?;
@@ -513,7 +507,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return true;
         }
 
-        for def in value.inside_arm.defs() {
+        for def in value
+            .inside_arm
+            .values()
+            .flat_map(|value| self.lowering.dataflow.leaf_defs(value))
+        {
             let def_temp = self.lowering.bindings.fixed_temps[def.index()];
             if target_overrides.contains_key(&def_temp) {
                 return true;
@@ -561,7 +559,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     ) -> Option<HirLValue> {
         shared_lvalue_for_defs(
             &self.lowering.bindings.fixed_temps,
-            arm.defs(),
+            arm.values()
+                .flat_map(|value| self.lowering.dataflow.leaf_defs(value)),
             target_overrides,
         )
     }

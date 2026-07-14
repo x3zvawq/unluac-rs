@@ -141,6 +141,8 @@ fn compute_post_dominator_tree(cfg: &Cfg, reverse_rpo: &[BlockRef]) -> PostDomin
         parent: tree.parent,
         children: tree.children,
         order: tree.order,
+        preorder_index: tree.preorder_index,
+        subtree_end: tree.subtree_end,
     }
 }
 
@@ -335,12 +337,34 @@ fn compute_tree(cfg: &Cfg, rpo: &[BlockRef], root: BlockRef, reverse: bool) -> D
     if position[root.index()].is_some() {
         collect_tree_order(root, &children, &mut order);
     }
+    let (preorder_index, subtree_end) = tree_intervals(&parent, &order);
 
     DominatorTree {
         parent,
         children,
         order,
+        preorder_index,
+        subtree_end,
     }
+}
+
+fn tree_intervals(
+    parent: &[Option<BlockRef>],
+    order: &[BlockRef],
+) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
+    let mut preorder_index = vec![None; parent.len()];
+    let mut subtree_end = vec![None; parent.len()];
+    for (index, block) in order.iter().copied().enumerate() {
+        preorder_index[block.index()] = Some(index);
+        subtree_end[block.index()] = Some(index + 1);
+    }
+    for block in order.iter().copied().rev() {
+        let Some(parent) = parent[block.index()] else {
+            continue;
+        };
+        subtree_end[parent.index()] = subtree_end[parent.index()].max(subtree_end[block.index()]);
+    }
+    (preorder_index, subtree_end)
 }
 
 fn incoming_blocks(cfg: &Cfg, block: BlockRef, reverse: bool) -> Vec<BlockRef> {

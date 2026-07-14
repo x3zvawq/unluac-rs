@@ -365,7 +365,7 @@ impl StructuredBodyLowerer<'_, '_> {
     fn block_is_transparent_short_circuit_exit_pad(&self, block: BlockRef) -> bool {
         if block == self.lowering.cfg.exit_block
             || self.branch_by_header.contains_key(&block)
-            || self.loop_by_header.contains_key(&block)
+            || self.loop_headers.contains(&block)
             || !self
                 .lowering
                 .dataflow
@@ -494,7 +494,7 @@ impl StructuredBodyLowerer<'_, '_> {
         {
             return None;
         }
-        if self.loop_by_header.contains_key(&header) {
+        if self.loop_headers.contains(&header) {
             return None;
         }
         let next = build_branch_short_circuit_plan(self.lowering, header)
@@ -655,11 +655,12 @@ impl StructuredBodyLowerer<'_, '_> {
         };
         for instr_index in prefix_indices {
             for def in &self.lowering.dataflow.instr_defs[instr_index] {
-                for use_site in &self.lowering.dataflow.def_uses[def.index()] {
-                    let use_block = self.lowering.cfg.instr_to_block[use_site.instr.index()];
-                    if !consumed_headers.contains(&use_block) {
-                        return true;
-                    }
+                if self.lowering.dataflow.def_has_use_outside(
+                    self.lowering.cfg,
+                    *def,
+                    consumed_headers,
+                ) {
+                    return true;
                 }
             }
         }

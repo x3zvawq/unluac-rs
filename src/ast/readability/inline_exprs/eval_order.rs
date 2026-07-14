@@ -1,8 +1,9 @@
-//! 多候选 run 搬运前的求值顺序证明。
+//! 相邻单候选和多候选 run 搬运前的求值顺序证明。
 //!
-//! run collapse 会把多条声明的 RHS 一次性搬进共同 sink。这里把可观察 RHS 当成
-//! 原子事件，递归展开它们之间的 binding 依赖，并要求这些事件仍是 sink 的同序前缀；
-//! 任一 retained 可观察声明或 sink 自身的可观察操作都会形成屏障。
+//! inline 会把声明 RHS 搬进 sink。这里把可观察 RHS 当成原子事件，递归展开它们之间
+//! 的 binding 依赖，并要求这些事件仍是 sink 的同序前缀；任一 retained 可观察声明
+//! 或 sink 自身的可观察操作都会形成屏障。table lvalue 的写入发生在 RHS 之后，只有
+//! base/key 自身的事件构成前缀；method lookup 则位于 receiver 与显式参数之间。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -13,6 +14,23 @@ use crate::ast::common::{
 use super::super::binding_ref::binding_from_name_ref;
 use super::super::expr_analysis::expr_observes_eval_order;
 use super::candidate::inline_candidate;
+
+pub(super) fn preserves_adjacent_eval_order(
+    sink: &AstStmt,
+    binding: AstBindingRef,
+    value: &AstExpr,
+) -> bool {
+    let values = BTreeMap::from([(binding, value)]);
+    let mut collector = EvalPrefixCollector {
+        values: &values,
+        visiting: BTreeSet::new(),
+        emitted: BTreeSet::new(),
+        prefix: Vec::new(),
+        blocked: false,
+    };
+    collector.stmt(sink);
+    !collector.blocked && collector.prefix == [binding]
+}
 
 pub(super) fn run_preserves_eval_order(
     stmts: &[AstStmt],
@@ -113,12 +131,10 @@ impl EvalPrefixCollector<'_> {
             AstLValue::Name(_) => {}
             AstLValue::FieldAccess(access) => {
                 self.expr(&access.base, WalkMode::Sink);
-                self.barrier();
             }
             AstLValue::IndexAccess(access) => {
                 self.expr(&access.base, WalkMode::Sink);
                 self.expr(&access.index, WalkMode::Sink);
-                self.barrier();
             }
         }
     }
@@ -131,6 +147,7 @@ impl EvalPrefixCollector<'_> {
             }
             AstCallKind::MethodCall(call) => {
                 self.expr(&call.receiver, WalkMode::Sink);
+                self.barrier();
                 self.exprs(&call.args, WalkMode::Sink);
             }
         }
@@ -180,6 +197,14 @@ impl EvalPrefixCollector<'_> {
             }
             AstExpr::MethodCall(call) => {
                 self.expr(&call.receiver, mode);
+                if matches!(mode, WalkMode::Sink)
+                    || call
+                        .args
+                        .iter()
+                        .any(|arg| contains_moved_binding(arg, self.values))
+                {
+                    self.barrier();
+                }
                 self.exprs(&call.args, mode);
             }
             AstExpr::SingleValue(value) => self.expr(value, mode),

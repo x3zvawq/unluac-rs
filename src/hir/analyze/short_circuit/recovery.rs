@@ -296,7 +296,7 @@ fn truncate_branch_exit_candidate_at_escaping_header(
         },
         result_reg: None,
         result_phi_id: None,
-        entry_defs: BTreeSet::new(),
+        entry_value: None,
         value_incomings: Vec::new(),
         reducible: short.reducible,
     })
@@ -446,13 +446,7 @@ fn collect_consumed_single_eval_defs(
     reg: Reg,
     out: &mut BTreeSet<DefId>,
 ) {
-    let Some(values) = lowering.dataflow.use_values_at(consumer_instr).get(reg) else {
-        return;
-    };
-    if values.len() != 1 {
-        return;
-    }
-    let Some(SsaValue::Def(def_id)) = values.iter().next() else {
+    let SsaValue::Def(def_id) = lowering.dataflow.use_value(consumer_instr, reg) else {
         return;
     };
     let def_block = lowering.dataflow.def_block(def_id);
@@ -581,11 +575,11 @@ fn block_has_escaping_defs(
     let range = lowering.cfg.blocks[block.index()].instrs;
     for instr_idx in range.start.index()..range.end() {
         for &def_id in &lowering.dataflow.instr_defs[instr_idx] {
-            for use_site in &lowering.dataflow.def_uses[def_id.index()] {
-                let use_block = lowering.cfg.instr_to_block[use_site.instr.index()];
-                if !short.blocks.contains(&use_block) {
-                    return true;
-                }
+            if lowering
+                .dataflow
+                .def_has_use_outside(lowering.cfg, def_id, &short.blocks)
+            {
+                return true;
             }
         }
     }

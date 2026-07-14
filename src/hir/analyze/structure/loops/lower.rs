@@ -14,7 +14,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     pub(crate) fn lower_loop(
         &mut self,
         block: BlockRef,
-        candidate_id: usize,
+        candidate_id: LoopCandidateId,
         stop: Option<BlockRef>,
         stmts: &mut Vec<HirStmt>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
@@ -25,13 +25,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
         match candidate.kind_hint {
             LoopKindHint::WhileLike => {
-                self.lower_while_loop(candidate, stop, stmts, target_overrides)
+                self.lower_while_loop(candidate_id, candidate, stop, stmts, target_overrides)
             }
             LoopKindHint::WhileTrueLike => {
-                self.lower_while_true_loop(candidate, stop, stmts, target_overrides)
+                self.lower_while_true_loop(candidate_id, candidate, stop, stmts, target_overrides)
             }
             LoopKindHint::RepeatLike => {
-                self.lower_repeat_loop(candidate, stop, stmts, target_overrides)
+                self.lower_repeat_loop(candidate_id, candidate, stop, stmts, target_overrides)
             }
             LoopKindHint::NumericForLike => {
                 self.try_lower_numeric_for_init(block, stop, stmts, target_overrides)
@@ -39,21 +39,32 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             LoopKindHint::GenericForLike => {
                 self.try_lower_generic_for_preheader(block, stop, stmts, target_overrides)
             }
-            LoopKindHint::Unknown => {
-                self.lower_unknown_retry_loop(candidate, stop, stmts, target_overrides)
-            }
+            LoopKindHint::Unknown => self.lower_unknown_retry_loop(
+                candidate_id,
+                candidate,
+                stop,
+                stmts,
+                target_overrides,
+            ),
         }
     }
 
     fn lower_unknown_retry_loop(
         &mut self,
+        candidate_id: LoopCandidateId,
         candidate: &LoopCandidate,
         stop: Option<BlockRef>,
         stmts: &mut Vec<HirStmt>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Option<BlockRef>> {
         if candidate.exits.is_empty() {
-            return self.lower_infinite_unknown_loop(candidate, stop, stmts, target_overrides);
+            return self.lower_infinite_unknown_loop(
+                candidate_id,
+                candidate,
+                stop,
+                stmts,
+                target_overrides,
+            );
         }
         let mut post_loops = candidate
             .exits
@@ -73,11 +84,18 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         let preheader = unique_loop_preheader(candidate);
-        let plan =
-            self.build_loop_state_plan(candidate, preheader, post_loop, &[], target_overrides)?;
+        let plan = self.build_loop_state_plan(
+            candidate_id,
+            candidate,
+            preheader,
+            post_loop,
+            &[],
+            target_overrides,
+        )?;
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
         let mut loop_context = self.build_active_loop_context(
+            candidate_id,
             candidate,
             post_loop,
             &combined_target_overrides,
@@ -88,14 +106,20 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         loop_context.continue_sources.clear();
         loop_context.state_slots = plan.states.clone();
 
+        for phi_id in &plan.owned_phis {
+            self.overrides.suppress_phi(*phi_id);
+        }
         self.active_loops.push(loop_context.clone());
         let body = self.lower_region_with_suppressed_loop(
             candidate.header,
             Some(post_loop),
             &combined_target_overrides,
-            Some(self.loop_candidate_id(candidate)?),
+            Some(candidate_id),
         )?;
         self.active_loops.pop();
+        for phi_id in &plan.owned_phis {
+            self.overrides.unsuppress_phi(*phi_id);
+        }
 
         stmts.extend(loop_state_init_stmts(&plan));
         self.visited.extend(
@@ -104,7 +128,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .values()
                 .flat_map(|break_exit| break_exit.blocks.iter().copied()),
         );
-        self.install_loop_exit_bindings(candidate, post_loop, &plan, target_overrides);
+        self.install_loop_exit_bindings(
+            candidate_id,
+            candidate,
+            post_loop,
+            &plan,
+            target_overrides,
+        );
         stmts.push(HirStmt::While(Box::new(HirWhile {
             cond: HirExpr::Boolean(true),
             body,
@@ -115,6 +145,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
     fn lower_infinite_unknown_loop(
         &mut self,
+        candidate_id: LoopCandidateId,
         candidate: &LoopCandidate,
         stop: Option<BlockRef>,
         stmts: &mut Vec<HirStmt>,
@@ -128,11 +159,18 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         let preheader = unique_loop_preheader(candidate);
         let post_loop = self.lowering.cfg.exit_block;
-        let plan =
-            self.build_loop_state_plan(candidate, preheader, post_loop, &[], target_overrides)?;
+        let plan = self.build_loop_state_plan(
+            candidate_id,
+            candidate,
+            preheader,
+            post_loop,
+            &[],
+            target_overrides,
+        )?;
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
         let mut loop_context = self.build_active_loop_context(
+            candidate_id,
             candidate,
             post_loop,
             &combined_target_overrides,
@@ -143,14 +181,20 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         loop_context.continue_sources.clear();
         loop_context.state_slots = plan.states.clone();
 
+        for phi_id in &plan.owned_phis {
+            self.overrides.suppress_phi(*phi_id);
+        }
         self.active_loops.push(loop_context.clone());
         let body = self.lower_region_with_suppressed_loop(
             candidate.header,
             None,
             &combined_target_overrides,
-            Some(self.loop_candidate_id(candidate)?),
+            Some(candidate_id),
         )?;
         self.active_loops.pop();
+        for phi_id in &plan.owned_phis {
+            self.overrides.unsuppress_phi(*phi_id);
+        }
 
         stmts.extend(loop_state_init_stmts(&plan));
         self.visited.extend(
@@ -159,7 +203,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .values()
                 .flat_map(|break_exit| break_exit.blocks.iter().copied()),
         );
-        self.install_loop_exit_bindings(candidate, post_loop, &plan, target_overrides);
+        self.install_loop_exit_bindings(
+            candidate_id,
+            candidate,
+            post_loop,
+            &plan,
+            target_overrides,
+        );
         stmts.push(HirStmt::While(Box::new(HirWhile {
             cond: HirExpr::Boolean(true),
             body,
@@ -170,6 +220,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
     fn lower_while_loop(
         &mut self,
+        candidate_id: LoopCandidateId,
         candidate: &LoopCandidate,
         stop: Option<BlockRef>,
         stmts: &mut Vec<HirStmt>,
@@ -186,10 +237,18 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         }
 
-        let plan = self.build_loop_state_plan(candidate, preheader, exit, &[], target_overrides)?;
+        let plan = self.build_loop_state_plan(
+            candidate_id,
+            candidate,
+            preheader,
+            exit,
+            &[],
+            target_overrides,
+        )?;
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
         let mut loop_context = self.build_active_loop_context(
+            candidate_id,
             candidate,
             exit,
             &combined_target_overrides,
@@ -199,8 +258,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         loop_context.state_slots = plan.states.clone();
         stmts.extend(loop_state_init_stmts(&plan));
         self.visited.insert(candidate.header);
-        self.install_loop_exit_bindings(candidate, exit, &plan, target_overrides);
+        self.install_loop_exit_bindings(candidate_id, candidate, exit, &plan, target_overrides);
 
+        for phi_id in &plan.owned_phis {
+            self.overrides.suppress_phi(*phi_id);
+        }
         self.active_loops.push(loop_context.clone());
         let body = self.lower_region(
             body_entry,
@@ -208,6 +270,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             &combined_target_overrides,
         )?;
         self.active_loops.pop();
+        for phi_id in &plan.owned_phis {
+            self.overrides.unsuppress_phi(*phi_id);
+        }
         self.visited.extend(
             loop_context
                 .break_exits
@@ -302,6 +367,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
     fn lower_while_true_loop(
         &mut self,
+        candidate_id: LoopCandidateId,
         candidate: &LoopCandidate,
         stop: Option<BlockRef>,
         stmts: &mut Vec<HirStmt>,
@@ -332,11 +398,18 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         let preheader = unique_loop_preheader(candidate);
         let post_loop = self.lowering.cfg.exit_block;
-        let plan =
-            self.build_loop_state_plan(candidate, preheader, post_loop, &[], target_overrides)?;
+        let plan = self.build_loop_state_plan(
+            candidate_id,
+            candidate,
+            preheader,
+            post_loop,
+            &[],
+            target_overrides,
+        )?;
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
         let mut loop_context = self.build_active_loop_context(
+            candidate_id,
             candidate,
             post_loop,
             &combined_target_overrides,
@@ -345,17 +418,23 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         loop_context.loop_blocks = loop_body_blocks(candidate).clone();
         loop_context.state_slots = plan.states.clone();
 
+        for phi_id in &plan.owned_phis {
+            self.overrides.suppress_phi(*phi_id);
+        }
         self.active_loops.push(loop_context.clone());
         let mut body = self
             .lower_region_with_suppressed_loop(
                 candidate.header,
                 Some(continue_target),
                 &combined_target_overrides,
-                Some(self.loop_candidate_id(candidate)?),
+                Some(candidate_id),
             )?
             .stmts;
         body.extend(self.lower_block_prefix(continue_target, false, &combined_target_overrides)?);
         self.active_loops.pop();
+        for phi_id in &plan.owned_phis {
+            self.overrides.unsuppress_phi(*phi_id);
+        }
 
         stmts.extend(loop_state_init_stmts(&plan));
         self.visited.insert(continue_target);
@@ -365,7 +444,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .values()
                 .flat_map(|break_exit| break_exit.blocks.iter().copied()),
         );
-        self.install_loop_exit_bindings(candidate, post_loop, &plan, target_overrides);
+        self.install_loop_exit_bindings(
+            candidate_id,
+            candidate,
+            post_loop,
+            &plan,
+            target_overrides,
+        );
         stmts.push(HirStmt::While(Box::new(HirWhile {
             cond: HirExpr::Boolean(true),
             body: HirBlock { stmts: body },
@@ -406,6 +491,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
     fn lower_repeat_loop(
         &mut self,
+        candidate_id: LoopCandidateId,
         candidate: &LoopCandidate,
         stop: Option<BlockRef>,
         stmts: &mut Vec<HirStmt>,
@@ -422,7 +508,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         }
 
-        let plan = self.build_loop_state_plan(candidate, preheader, exit, &[], target_overrides)?;
+        let plan = self.build_loop_state_plan(
+            candidate_id,
+            candidate,
+            preheader,
+            exit,
+            &[],
+            target_overrides,
+        )?;
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
         let repeat_condition = self
@@ -457,6 +550,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .and_then(|plan| plan.consumed_headers.first().copied())
             .unwrap_or(continue_block);
         let mut loop_context = self.build_active_loop_context(
+            candidate_id,
             candidate,
             exit,
             &combined_target_overrides,
@@ -470,11 +564,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             loop_backedge_target,
             &combined_target_overrides,
         )?;
-        let suppressed = plan
+        let mut suppressed = plan
             .states
             .iter()
             .filter_map(|state| state.phi_id)
             .collect::<Vec<_>>();
+        suppressed.extend(plan.owned_phis.iter().copied());
         for phi_id in &suppressed {
             self.overrides.suppress_phi(*phi_id);
         }
@@ -485,7 +580,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 candidate.header,
                 Some(body_stop),
                 &combined_target_overrides,
-                Some(self.loop_candidate_id(candidate)?),
+                Some(candidate_id),
             )?
             .stmts;
         let cond = if let Some(mut condition) = repeat_condition {
@@ -526,7 +621,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .values()
                 .flat_map(|break_exit| break_exit.blocks.iter().copied()),
         );
-        self.install_loop_exit_bindings(candidate, exit, &plan, target_overrides);
+        self.install_loop_exit_bindings(candidate_id, candidate, exit, &plan, target_overrides);
         stmts.push(HirStmt::Repeat(Box::new(HirRepeat {
             body: HirBlock { stmts: body },
             cond: {
@@ -554,15 +649,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         let header = self.lowering.cfg.instr_to_block[init.body_target.index()];
         let exit = self.lowering.cfg.instr_to_block[init.exit_target.index()];
-        let candidate = self
-            .loops_by_header
-            .get(&header)?
-            .iter()
-            .find_map(|(_, candidate)| {
-                (candidate.kind_hint == LoopKindHint::NumericForLike
+        let (candidate_id, candidate) =
+            self.unique_loop_candidate_matching(header, |candidate| {
+                candidate.kind_hint == LoopKindHint::NumericForLike
                     && candidate.preheader == Some(block)
-                    && candidate.exits.contains(&exit))
-                .then_some(*candidate)
+                    && candidate.exits.contains(&exit)
             })?;
         if let Some(stop) = stop
             && stop != exit
@@ -578,6 +669,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .get(&header)
             .copied()?;
         let mut plan = self.build_loop_state_plan(
+            candidate_id,
             candidate,
             Some(block),
             exit,
@@ -603,6 +695,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .filter(|value| value.reg == init.index)
                 .map(|value| value.phi_id),
         );
+        suppressed.extend(plan.owned_phis.iter().copied());
 
         self.visited.insert(block);
         stmts.extend(self.lower_block_prefix(block, false, target_overrides)?);
@@ -613,6 +706,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
         let continue_block = candidate.continue_target.unwrap_or(header);
         let mut loop_context = self.build_active_loop_context(
+            candidate_id,
             candidate,
             exit,
             &combined_target_overrides,
@@ -630,7 +724,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     header,
                     Some(continue_block),
                     &combined_target_overrides,
-                    Some(self.loop_candidate_id(candidate)?),
+                    Some(candidate_id),
                 )?
                 .stmts;
             let prefix =
@@ -652,7 +746,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .values()
                 .flat_map(|break_exit| break_exit.blocks.iter().copied()),
         );
-        self.install_loop_exit_bindings(candidate, exit, &plan, target_overrides);
+        self.install_loop_exit_bindings(candidate_id, candidate, exit, &plan, target_overrides);
         let mut start = expr_for_reg_use(self.lowering, block, instr_ref, init.index);
         let mut limit = expr_for_reg_use(self.lowering, block, instr_ref, init.limit);
         let mut step = expr_for_reg_use(self.lowering, block, instr_ref, init.step);
@@ -681,15 +775,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Option<BlockRef>> {
         let header = self.lowering.cfg.unique_reachable_successor(block)?;
-        let candidate = self
-            .loops_by_header
-            .get(&header)?
-            .iter()
-            .find_map(|(_, candidate)| {
-                (candidate.kind_hint == LoopKindHint::GenericForLike
+        let (candidate_id, candidate) =
+            self.unique_loop_candidate_matching(header, |candidate| {
+                candidate.kind_hint == LoopKindHint::GenericForLike
                     && candidate.continue_target == Some(header)
-                    && unique_loop_preheader(candidate) == Some(block))
-                .then_some(*candidate)
+                    && unique_loop_preheader(candidate) == Some(block)
             })?;
         let (call_instr_ref, call, loop_instr) = self.generic_for_header_instrs(header)?;
         let exit = self.lowering.cfg.instr_to_block[loop_instr.exit_target.index()];
@@ -721,6 +811,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .map(|offset| Reg(loop_instr.bindings.start.index() + offset)),
         );
         let plan = self.build_loop_state_plan(
+            candidate_id,
             candidate,
             Some(block),
             exit,
@@ -738,6 +829,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         let mut loop_context = self.build_active_loop_context(
+            candidate_id,
             candidate,
             exit,
             &combined_target_overrides,
@@ -769,7 +861,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .values()
                 .flat_map(|break_exit| break_exit.blocks.iter().copied()),
         );
-        self.install_loop_exit_bindings(candidate, exit, &plan, target_overrides);
+        self.install_loop_exit_bindings(candidate_id, candidate, exit, &plan, target_overrides);
         stmts.push(HirStmt::GenericFor(Box::new(HirGenericFor {
             bindings,
             iterator: self.lower_generic_for_iterator(header, call_instr_ref, call),

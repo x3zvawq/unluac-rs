@@ -4,18 +4,27 @@
 //! 一部分 case 里直接把它们吸收进 `while/if/do`，但像 `goto` 反复重入同一块时，
 //! HIR 仍可能留下“声明已经恢复、cleanup 还没变回词法边界”的中间形状。这里不去 AST
 //! 末端兜底，而是在 HIR 里基于 `<close>` 绑定和对应寄存器槽位，把它们重新收成
-//! `HirStmt::Block`，让后面的 AST lowering 自然落成 `do ... end`。
+//! `HirStmt::Block`，让后面的 AST lowering 自然落成 `do ... end`。一个 `close from rA`
+//! 会覆盖所有不小于 A 的 TBC 槽位，区间 owner 会消费词法范围内实际覆盖自己的 cleanup，
+//! 避免 fixed-point 每轮重复包块。
 
 use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId};
 
 use super::visit::{HirVisitor, visit_stmts};
 use super::walk::{HirRewritePass, for_each_nested_block_mut, rewrite_proto};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ScopeInterval {
     start: usize,
     end: usize,
     reg_index: usize,
+    covering_close_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScopeEnd {
+    end: usize,
+    covering_close_indices: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,16 +91,17 @@ fn collect_scope_intervals(stmts: &[HirStmt]) -> Vec<ScopeInterval> {
     let mut intervals: Vec<_> = (0..stmts.len())
         .filter_map(|index| {
             let scope_start = scope_start(stmts, index)?;
-            let end = find_scope_end(
+            let scope_end = find_scope_end(
                 stmts,
                 scope_start.start + 2,
                 scope_start.binding,
                 scope_start.reg_index,
             )?;
-            (scope_start.start < end).then_some(ScopeInterval {
+            (scope_start.start < scope_end.end).then_some(ScopeInterval {
                 start: scope_start.start,
-                end,
+                end: scope_end.end,
                 reg_index: scope_start.reg_index,
+                covering_close_indices: scope_end.covering_close_indices,
             })
         })
         .collect();
@@ -132,7 +142,7 @@ fn find_scope_end(
     start_index: usize,
     binding: ScopeBinding,
     reg_index: usize,
-) -> Option<usize> {
+) -> Option<ScopeEnd> {
     let mut saw_close = false;
     let mut last_activity = None;
     // 一个寄存器可能在 scope 内有多次 `close from rX`（如 goto 反复进入的
@@ -141,6 +151,7 @@ fn find_scope_end(
     // 组合 close）。早期的 close 只是 scope 内部的 iteration 边界，把它们
     // 当成 scope 末端会把后续仍在同一 scope 内的表达式错误地挤出块外。
     let mut last_scope_close: Option<(usize, bool)> = None;
+    let mut covering_close_indices = Vec::new();
 
     for (index, stmt) in stmts.iter().enumerate().skip(start_index) {
         if let HirStmt::Close(close) = stmt
@@ -149,6 +160,7 @@ fn find_scope_end(
         {
             let is_exact = close.from_reg == reg_index;
             last_scope_close = Some((index, is_exact));
+            covering_close_indices.push(index);
             saw_close = true;
         }
 
@@ -160,17 +172,32 @@ fn find_scope_end(
     }
 
     if let Some((close_idx, is_exact)) = last_scope_close {
-        // 精确匹配的 close 语句属于当前 scope，自身会被 `strip_matching_close_from_stmt`
-        // 吸收，因此 end 要包含它；组合匹配的 close 属于外层 scope，end 只到它之前。
+        // 最末端是精确 close 时把它纳入区间；若是更外层的组合 close，则它只负责划定
+        // 当前区间边界并留给外层 owner。此前落在区间内部的 covering close 仍由当前
+        // scope 消费，它们通常来自 goto/分支的提前 cleanup。
         let end = if is_exact { close_idx + 1 } else { close_idx };
-        return Some(last_activity.map_or(end, |la| la.max(end)));
+        let end = last_activity.map_or(end, |la| la.max(end));
+        // 同一 TBC scope 内可能有多个 goto/分支 cleanup。只记录最终词法区间真实包含的
+        // covering close；区间末端之外的组合 close 仍由外层 scope 接管。
+        covering_close_indices.retain(|index| *index < end);
+        return Some(ScopeEnd {
+            end,
+            covering_close_indices,
+        });
     }
 
-    if saw_close { last_activity } else { None }
+    if saw_close {
+        last_activity.map(|end| ScopeEnd {
+            end,
+            covering_close_indices,
+        })
+    } else {
+        None
+    }
 }
 
 fn well_nested_scope_intervals(intervals: &[ScopeInterval]) -> bool {
-    let mut stack = Vec::<ScopeInterval>::new();
+    let mut stack = Vec::<&ScopeInterval>::new();
 
     for interval in intervals {
         while let Some(top) = stack.last() {
@@ -187,7 +214,7 @@ fn well_nested_scope_intervals(intervals: &[ScopeInterval]) -> bool {
             return false;
         }
 
-        stack.push(*interval);
+        stack.push(interval);
     }
 
     true
@@ -199,7 +226,7 @@ fn rebuild_slice(
     end: usize,
     intervals: &[ScopeInterval],
     cursor: &mut usize,
-    active_scope_reg: Option<usize>,
+    active_scope: Option<&ScopeInterval>,
 ) -> Vec<HirStmt> {
     let mut rewritten = Vec::new();
     let mut index = start;
@@ -210,7 +237,7 @@ fn rebuild_slice(
         }
 
         if *cursor < intervals.len() {
-            let interval = intervals[*cursor];
+            let interval = &intervals[*cursor];
             if interval.start == index && interval.end <= end {
                 *cursor += 1;
                 let inner = rebuild_slice(
@@ -219,10 +246,13 @@ fn rebuild_slice(
                     interval.end,
                     intervals,
                     cursor,
-                    Some(interval.reg_index),
+                    Some(interval),
                 );
                 let mut block_stmt = HirStmt::Block(Box::new(HirBlock { stmts: inner }));
-                strip_matching_close_from_stmt(&mut block_stmt, active_scope_reg);
+                strip_matching_close_from_stmt(
+                    &mut block_stmt,
+                    active_scope.map(|scope| scope.reg_index),
+                );
                 rewritten.push(block_stmt);
                 index = interval.end;
                 continue;
@@ -230,7 +260,14 @@ fn rebuild_slice(
         }
 
         let mut cloned = stmts[index].clone();
-        if strip_matching_close_from_stmt(&mut cloned, active_scope_reg) {
+        let close_owned_by_scope = active_scope
+            .is_some_and(|scope| scope.covering_close_indices.binary_search(&index).is_ok());
+        if !close_owned_by_scope
+            && strip_matching_close_from_stmt(
+                &mut cloned,
+                active_scope.map(|scope| scope.reg_index),
+            )
+        {
             rewritten.push(cloned);
         }
         index += 1;

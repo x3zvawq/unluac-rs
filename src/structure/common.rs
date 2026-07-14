@@ -5,12 +5,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::structure::{BlockRef, DefId, EdgeRef, PhiId};
+use crate::structure::{BlockRef, DefId, EdgeRef, PhiId, SsaValue};
 use crate::transformer::{InstrRef, Reg, RegRange};
+
+use super::plan::{BranchValueMergeId, LoopCandidateId};
 
 /// 一个 proto 的结构候选集合，以及它的子 proto 结果。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StructureFacts {
+    pub plan: StructurePlan,
     pub branch_candidates: Vec<BranchCandidate>,
     pub branch_region_facts: Vec<BranchRegionFact>,
     pub branch_value_merge_candidates: Vec<BranchValueMergeCandidate>,
@@ -21,6 +24,56 @@ pub struct StructureFacts {
     pub region_facts: Vec<RegionFact>,
     pub scope_candidates: Vec<ScopeCandidate>,
     pub children: Vec<StructureFacts>,
+}
+
+/// Structure 已完成冲突消解后的稳定 owner 索引。
+///
+/// HIR 必须通过这里的 candidate identity 消费结构事实，不能再按 header 临时覆盖、
+/// 取首项或在重复时把整组候选删除。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StructurePlan {
+    pub(super) branch_value_merge_by_header: BTreeMap<BlockRef, BranchValueMergeId>,
+    pub(super) branch_value_merge_by_region: BTreeMap<(BlockRef, BlockRef), BranchValueMergeId>,
+    pub(super) loops_by_header: BTreeMap<BlockRef, Vec<LoopCandidateId>>,
+}
+
+impl StructureFacts {
+    pub fn branch_value_merge_for_header(
+        &self,
+        header: BlockRef,
+    ) -> Option<&BranchValueMergeCandidate> {
+        let id = self.plan.branch_value_merge_by_header.get(&header)?;
+        self.branch_value_merge_candidates.get(id.index())
+    }
+
+    pub fn branch_value_merge_for_region(
+        &self,
+        header: BlockRef,
+        merge: BlockRef,
+    ) -> Option<&BranchValueMergeCandidate> {
+        let id = self
+            .plan
+            .branch_value_merge_by_region
+            .get(&(header, merge))?;
+        self.branch_value_merge_candidates.get(id.index())
+    }
+
+    pub fn loop_candidate(&self, id: LoopCandidateId) -> Option<&LoopCandidate> {
+        self.loop_candidates.get(id.index())
+    }
+
+    pub fn loop_candidates_for_header(
+        &self,
+        header: BlockRef,
+    ) -> impl DoubleEndedIterator<Item = (LoopCandidateId, &LoopCandidate)> {
+        self.plan
+            .loops_by_header
+            .get(&header)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter_map(|id| self.loop_candidate(id).map(|candidate| (id, candidate)))
+    }
 }
 
 /// 一个仍需 generic unresolved 物化的 phi。
@@ -115,15 +168,16 @@ pub struct BranchValueMergeValue {
 
 /// branch merge 某一臂已经收敛好的来源事实。
 ///
-/// `preds` 保留结构边归属，`defs` 记录这一臂在 merge 前实际可见的所有 reaching defs。
-/// `entry_defs` 是 branch header 入口沿非回边带入的值，`update_defs` 是各 arm 在本轮
-/// 产生的版本。HIR 只消费这份分类，不再顺着 `DefId -> block` 重判来源。
+/// `preds` 保留结构边归属，`values` 记录这一臂在 merge 前实际可见的 canonical SSA
+/// 身份。`entry_values` 是 branch header 带入的值，`update_values` 是各 arm 在本轮
+/// 产生或传递更新的版本；同一个 Phi 可以同时属于两类。HIR 只消费这份分类，不再
+/// 把 Phi 压回叶子 def 后重判来源。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchValueMergeArm {
     pub preds: BTreeSet<BlockRef>,
-    pub defs: BTreeSet<DefId>,
-    pub entry_defs: BTreeSet<DefId>,
-    pub update_defs: BTreeSet<DefId>,
+    pub values: BTreeSet<SsaValue>,
+    pub entry_values: BTreeSet<SsaValue>,
+    pub update_values: BTreeSet<SsaValue>,
 }
 
 /// 一个循环候选。
@@ -170,7 +224,7 @@ pub enum LoopSourceBindings {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoopValueIncoming {
     pub pred: Option<BlockRef>,
-    pub defs: BTreeSet<DefId>,
+    pub value: SsaValue,
 }
 
 /// 一个 loop value merge 某一臂的 incoming 集合。
@@ -206,10 +260,8 @@ impl LoopValueArm {
         self.incomings.iter().filter_map(|incoming| incoming.pred)
     }
 
-    pub fn defs(&self) -> impl Iterator<Item = DefId> + '_ {
-        self.incomings
-            .iter()
-            .flat_map(|incoming| incoming.defs.iter().copied())
+    pub fn values(&self) -> impl Iterator<Item = SsaValue> + '_ {
+        self.incomings.iter().map(|incoming| incoming.value)
     }
 
     pub fn all_preds_within(&self, allowed_blocks: &BTreeSet<BlockRef>) -> bool {
@@ -258,7 +310,7 @@ pub struct ShortCircuitCandidate {
     pub exit: ShortCircuitExit,
     pub result_reg: Option<Reg>,
     pub result_phi_id: Option<PhiId>,
-    pub entry_defs: BTreeSet<DefId>,
+    pub entry_value: Option<SsaValue>,
     pub value_incomings: Vec<ShortCircuitValueIncoming>,
     pub reducible: bool,
 }
@@ -406,16 +458,16 @@ impl ShortCircuitCandidate {
     }
 }
 
-/// 值型 short-circuit merge 每个叶子最终送进 merge 的 reaching defs。
+/// 值型 short-circuit merge 每个叶子最终送进 merge 的 canonical SSA 值。
 ///
 /// 这份事实和 `result_phi_id` 一起构成了“叶子 -> merge 值身份”的前层表达，避免 HIR
-/// 再顺着 `PhiCandidate.incoming` 去拆 value leaf 的 defs。`latest_local_def` 进一步把
+/// 再顺着 `PhiCandidate.incoming` 去拆 value leaf。`latest_local_def` 进一步把
 /// “这个 leaf block 自己最后一次写 result_reg 的 def”前移出来，避免 HIR 再回头扫描
 /// block 指令去找叶子值来源。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ShortCircuitValueIncoming {
     pub pred: BlockRef,
-    pub defs: BTreeSet<DefId>,
+    pub value: SsaValue,
     pub latest_local_def: Option<DefId>,
 }
 

@@ -20,8 +20,8 @@
 //!   cleanup pad 把循环变量身份带到 post-loop
 //! - repeat body 的首个条件可能让 natural-loop 暂时呈现为 while；若该 header 的局部
 //!   break pad 严格汇入独立尾条件出口，则由 Structure 恢复真正的 repeat 形态
-//! - 普通内外循环可能共享 header；只有 successor 分区和真实 body/exit 都能证明层级
-//!   时才拆成多个候选，避免把 retry 或无出口循环误拆
+//! - 普通内外循环可能共享 header；只有 successor 分区、内层出口归属和真实
+//!   body/exit 都能证明层级时才拆成多个候选，避免把 sibling latch 或无出口循环误拆
 //! - `WhileLike` 的 header 前缀必须属于 branch 条件的数据依赖链，或是可丢弃的
 //!   无副作用残留；带副作用但不参与条件的语句应保守留给 repeat/unknown/goto 形态
 
@@ -170,6 +170,7 @@ fn same_header_nested_outer_blocks(
     if inner.len() <= 1
         || inner.len() >= outer.len()
         || collect_region_exits(cfg, &outer).is_empty()
+        || !collect_region_exits(cfg, inner).is_subset(&outer)
     {
         return None;
     }
@@ -195,12 +196,12 @@ fn same_header_nested_outer_blocks(
         return None;
     }
 
-    // 真正的外层 repeat 条件必须拥有回边；普通 sibling latch 中夹着赋值或调用，
-    // 只能是同一循环的分支尾部，不能据此拆出一个外层候选。
+    // outer body 可以包含任意语句；层级证据来自尾条件自身拥有回 header
+    // 和退出 outer 的两条边。条件后的 Close/jump pad 仍属于这个控制边界。
     let backedge_source = cfg.edges[next.backedge.index()].from;
     (backedge_source == outer_only_successor
-        || repeat_continue_target_via_backedge_pad(proto, cfg, backedge_source, &outer)
-            == Some(outer_only_successor))
+        || branch_has_header_and_exit(cfg, backedge_source, header, &outer)
+        || repeat_continue_target_via_backedge_pad(proto, cfg, backedge_source, &outer).is_some())
     .then_some(outer)
 }
 
@@ -266,7 +267,55 @@ pub(super) fn assign_continue_edge_ownership(
             }
             candidates[owner].continue_edges.insert(edge_ref);
         }
+
+        if branch.else_entry.is_some() {
+            continue;
+        }
+        for candidate in candidates.iter_mut().filter(|candidate| {
+            candidate.kind_hint != LoopKindHint::RepeatLike
+                && candidate.blocks.contains(&branch.header)
+                && candidate.blocks.contains(&branch.then_entry)
+        }) {
+            let Some(target) = candidate.continue_target else {
+                continue;
+            };
+            let Some(edge_ref) = linear_arm_continue_edge(
+                cfg,
+                &candidate.blocks,
+                branch.then_entry,
+                branch.merge,
+                target,
+            ) else {
+                continue;
+            };
+            candidate.continue_edges.insert(edge_ref);
+        }
     }
+}
+
+fn linear_arm_continue_edge(
+    cfg: &Cfg,
+    loop_blocks: &BTreeSet<BlockRef>,
+    start: BlockRef,
+    merge: Option<BlockRef>,
+    target: BlockRef,
+) -> Option<EdgeRef> {
+    let mut current = start;
+    let mut visited = BTreeSet::new();
+    while current != target && Some(current) != merge && visited.insert(current) {
+        if !loop_blocks.contains(&current) {
+            return None;
+        }
+        let [edge_ref] = cfg.succs[current.index()].as_slice() else {
+            return None;
+        };
+        let edge = cfg.edges[edge_ref.index()];
+        if edge.to == target {
+            return Some(*edge_ref);
+        }
+        current = edge.to;
+    }
+    None
 }
 
 fn jump_only_to(proto: &LoweredProto, cfg: &Cfg, block: BlockRef, target: BlockRef) -> bool {
@@ -320,7 +369,8 @@ pub(super) fn refine_short_circuit_repeat_candidates(
                             candidate,
                             backedge_source,
                         )
-                        .map(|target| (target, None, None))
+                        .filter(|_| graph_facts.dominates(short.header, backedge_source))
+                        .map(|target| (target, None, None, short.header))
                     })
                     .or_else(|| {
                         supplements_by_exit
@@ -335,18 +385,32 @@ pub(super) fn refine_short_circuit_repeat_candidates(
                                     candidate,
                                     backedge_source,
                                 )
-                                .map(|target| (target, Some(short.header), Some((*short).clone())))
+                                .filter(|_| graph_facts.dominates(short.header, backedge_source))
+                                .map(|target| {
+                                    (
+                                        target,
+                                        Some(short.header),
+                                        Some((*short).clone()),
+                                        short.header,
+                                    )
+                                })
                             })
                     })
             })
             .flatten()
             .or_else(|| {
                 direct_branch_repeat_continue_target(cfg, branches, candidate, backedge_source)
-                    .map(|target| (target, None, None))
+                    .map(|target| (target, None, None, target))
             });
-        let Some((continue_target, condition_header, supplement)) = matched else {
+        let Some((continue_target, condition_header, supplement, condition_entry)) = matched else {
             continue;
         };
+        // repeat 的条件入口必须支配最终回边源；否则存在不经过该条件就回到 header 的
+        // 路径，它只能是 while/while-true 中的提前 continue。把这种形状精化成 repeat
+        // 会让 continue 错误执行原本应跳过的尾条件。
+        if !graph_facts.dominates(condition_entry, backedge_source) {
+            continue;
+        }
         if let Some(supplement) = supplement {
             accepted_supplements.push(supplement);
         }
@@ -1497,14 +1561,10 @@ fn block_is_while_header_like(
                     .is_some_and(|summary| summary.tags.is_empty());
             }
 
-            for reg in effect
-                .fixed_must_defs
-                .iter()
-                .chain(effect.fixed_may_defs.iter())
-            {
+            for reg in &effect.fixed_must_defs {
                 needed_regs.remove(reg);
             }
-            if let Some(open_def) = effect.open_must_def.or(effect.open_may_def) {
+            if let Some(open_def) = effect.open_must_def {
                 needed_regs.retain(|reg| reg.index() < open_def.index());
             }
             needed_regs.extend(effect.fixed_uses.iter().copied());
@@ -1580,14 +1640,9 @@ fn instr_writes_any_reg(instr: &LowInstr, regs: &BTreeSet<Reg>) -> bool {
 }
 
 fn instr_writes_any_reg_set(effect: &crate::structure::InstrEffect, regs: &BTreeSet<Reg>) -> bool {
-    effect
-        .fixed_must_defs
-        .iter()
-        .chain(effect.fixed_may_defs.iter())
-        .any(|reg| regs.contains(reg))
+    effect.fixed_must_defs.iter().any(|reg| regs.contains(reg))
         || effect
             .open_must_def
-            .or(effect.open_may_def)
             .is_some_and(|start| regs.iter().any(|reg| reg.index() >= start.index()))
 }
 

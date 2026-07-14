@@ -134,6 +134,34 @@ pub(super) fn expr_observes_eval_order(expr: &AstExpr) -> bool {
     }
 }
 
+pub(super) fn is_stable_inline_value(expr: &AstExpr) -> bool {
+    match expr {
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
+        | AstExpr::Complex { .. } => true,
+        AstExpr::SingleValue(inner) => is_stable_inline_value(inner),
+        AstExpr::Var(_)
+        | AstExpr::FieldAccess(_)
+        | AstExpr::IndexAccess(_)
+        | AstExpr::Unary(_)
+        | AstExpr::Binary(_)
+        | AstExpr::LogicalAnd(_)
+        | AstExpr::LogicalOr(_)
+        | AstExpr::Call(_)
+        | AstExpr::MethodCall(_)
+        | AstExpr::VarArg
+        | AstExpr::TableConstructor(_)
+        | AstExpr::FunctionExpr(_)
+        | AstExpr::Error(_) => false,
+    }
+}
+
 pub(super) fn is_access_base_inline_expr(expr: &AstExpr) -> bool {
     is_atomic_access_base_expr(expr) || is_named_field_chain_expr(expr)
 }

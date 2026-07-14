@@ -7,6 +7,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{HirExpr, HirLValue, HirStmt, TempId};
+use crate::hir::traverse::{
+    traverse_hir_call_children, traverse_hir_decision_children, traverse_hir_expr_children,
+    traverse_hir_lvalue_children, traverse_hir_stmt_children,
+    traverse_hir_table_constructor_children,
+};
 use crate::structure::DefId;
 
 /// 检查表达式中是否引用了给定集合中的 `TempRef`。
@@ -56,11 +61,6 @@ pub(super) fn expr_has_temp_ref_in(expr: &HirExpr, unresolvable: &BTreeSet<TempI
     );
     found
 }
-use crate::hir::traverse::{
-    traverse_hir_call_children, traverse_hir_decision_children, traverse_hir_expr_children,
-    traverse_hir_lvalue_children, traverse_hir_stmt_children,
-    traverse_hir_table_constructor_children,
-};
 
 pub(super) fn apply_loop_rewrites(
     stmts: &mut [HirStmt],
@@ -230,10 +230,24 @@ pub(super) fn rewrite_stmt_exprs(stmt: &mut HirStmt, expr_overrides: &BTreeMap<T
 }
 
 pub(super) fn rewrite_expr_temps(expr: &mut HirExpr, expr_overrides: &BTreeMap<TempId, HirExpr>) {
+    rewrite_expr_temps_inner(expr, expr_overrides, &mut BTreeSet::new());
+}
+
+fn rewrite_expr_temps_inner(
+    expr: &mut HirExpr,
+    expr_overrides: &BTreeMap<TempId, HirExpr>,
+    resolving: &mut BTreeSet<TempId>,
+) {
     if let HirExpr::TempRef(temp) = expr
         && let Some(replacement) = expr_overrides.get(temp)
     {
+        let temp = *temp;
+        if !resolving.insert(temp) {
+            return;
+        }
         *expr = replacement.clone();
+        rewrite_expr_temps_inner(expr, expr_overrides, resolving);
+        resolving.remove(&temp);
         return;
     }
 
@@ -241,13 +255,13 @@ pub(super) fn rewrite_expr_temps(expr: &mut HirExpr, expr_overrides: &BTreeMap<T
         expr,
         iter = iter_mut,
         borrow = [&mut],
-        expr(e) => { rewrite_expr_temps(e, expr_overrides); },
+        expr(e) => { rewrite_expr_temps_inner(e, expr_overrides, resolving); },
         call(c) => {
             traverse_hir_call_children!(
                 c,
                 iter = iter_mut,
                 borrow = [&mut],
-                expr(e) => { rewrite_expr_temps(e, expr_overrides); }
+                expr(e) => { rewrite_expr_temps_inner(e, expr_overrides, resolving); }
             );
         },
         decision(d) => {
@@ -255,8 +269,8 @@ pub(super) fn rewrite_expr_temps(expr: &mut HirExpr, expr_overrides: &BTreeMap<T
                 d,
                 iter = iter_mut,
                 borrow = [&mut],
-                expr(e) => { rewrite_expr_temps(e, expr_overrides); },
-                condition(cond) => { rewrite_expr_temps(cond, expr_overrides); }
+                expr(e) => { rewrite_expr_temps_inner(e, expr_overrides, resolving); },
+                condition(cond) => { rewrite_expr_temps_inner(cond, expr_overrides, resolving); }
             );
         },
         table_constructor(t) => {
@@ -265,7 +279,7 @@ pub(super) fn rewrite_expr_temps(expr: &mut HirExpr, expr_overrides: &BTreeMap<T
                 iter = iter_mut,
                 opt = as_mut,
                 borrow = [&mut],
-                expr(e) => { rewrite_expr_temps(e, expr_overrides); }
+                expr(e) => { rewrite_expr_temps_inner(e, expr_overrides, resolving); }
             );
         }
     );

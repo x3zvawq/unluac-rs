@@ -394,5 +394,3 @@ fn emit_hir_pass_diff_if_requested(
     _filters: &DebugFilters,
 ) {
 }
-
-pub(crate) use decision::synthesize_readable_pure_logical_expr;

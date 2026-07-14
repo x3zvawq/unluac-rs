@@ -282,7 +282,7 @@ fn capture_has_no_reaching_value(dataflow: &DataflowFacts, instr_ref: InstrRef, 
     dataflow
         .use_values_at(instr_ref)
         .get(reg)
-        .is_none_or(|values| values.is_empty())
+        .is_none_or(|value| matches!(value, crate::structure::SsaValue::Entry(_)))
 }
 
 struct CapturedTempFacts {

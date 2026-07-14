@@ -18,7 +18,8 @@ use crate::transformer::LoweredProto;
 
 use super::common::StructureFacts;
 use super::{
-    branch_values, branches, cfg, goto, helpers, loops, phi_facts, regions, scope, short_circuit,
+    branch_values, branches, cfg, goto, helpers, loops, phi_facts, plan, regions, scope,
+    short_circuit,
 };
 
 /// Structure 阶段入口：内部固定推进 CFG、图事实、数据流和结构候选。
@@ -119,9 +120,15 @@ pub(crate) fn analyze_structure_proto(
         &short_circuit_candidates,
         &loop_candidates,
     );
+    let plan = plan::build_structure_plan(
+        &branch_candidates,
+        &branch_value_merge_candidates,
+        &loop_candidates,
+    );
     phi_facts::remove_branch_owned_loop_exit_values(
         &mut loop_candidates,
         &branch_value_merge_candidates,
+        &plan,
     );
     phi_facts::remove_loop_header_owned_loop_exit_values(&mut loop_candidates);
     let generic_phi_materializations = phi_facts::analyze_generic_phi_materializations(
@@ -129,6 +136,7 @@ pub(crate) fn analyze_structure_proto(
         graph_facts,
         dataflow,
         &branch_value_merge_candidates,
+        &plan,
         &loop_candidates,
         &short_circuit_candidates,
     );
@@ -160,6 +168,7 @@ pub(crate) fn analyze_structure_proto(
         .collect();
 
     StructureFacts {
+        plan,
         branch_candidates,
         branch_region_facts,
         branch_value_merge_candidates,

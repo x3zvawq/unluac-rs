@@ -556,12 +556,11 @@ impl StructuredBodyLowerer<'_, '_> {
                     ));
                     return Some(Some(continue_target));
                 }
-                let mut continue_block = if continue_entry == continue_target {
-                    HirBlock::default()
-                } else {
-                    self.lower_region(continue_entry, Some(continue_target), target_overrides)?
-                };
-                continue_block.stmts.push(HirStmt::Continue);
+                let continue_block = self.lower_continue_block(
+                    (continue_entry != continue_target).then_some(continue_entry),
+                    continue_target,
+                    target_overrides,
+                )?;
                 stmts.push(branch_stmt(continue_cond, continue_block, None));
                 return Some(Some(non_continue_entry));
             }

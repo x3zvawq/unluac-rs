@@ -174,7 +174,7 @@ fn analyze_linear_branch_exit_candidates_with<'a>(
             exit,
             result_reg: None,
             result_phi_id: None,
-            entry_defs: BTreeSet::new(),
+            entry_value: None,
             value_incomings: Vec::new(),
             reducible,
         });
@@ -228,7 +228,7 @@ pub(super) fn analyze_if_else_branch_exit_candidates(
                 exit,
                 result_reg: None,
                 result_phi_id: None,
-                entry_defs: BTreeSet::new(),
+                entry_value: None,
                 value_incomings: Vec::new(),
                 reducible,
             });
@@ -341,7 +341,7 @@ impl<'a> GuardBranchExitDagBuilder<'a> {
             },
             result_reg: None,
             result_phi_id: None,
-            entry_defs: BTreeSet::new(),
+            entry_value: None,
             value_incomings: Vec::new(),
             reducible,
         })

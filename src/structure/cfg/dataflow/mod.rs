@@ -1,321 +1,31 @@
-//! 这个文件实现基于 low-IR + CFG + GraphFacts 的基础数据流分析。
-//!
-//! 这里先把后续结构恢复必需的“读写、副作用、def-use、liveness、phi 候选”
-//! 一次性统一算出来，避免 StructureFacts 再反向重复扫底层 low-IR。
+//! low-IR 到 canonical SSA、liveness 与副作用事实的统一入口。
 
 mod effects;
-mod fixed;
 mod liveness;
-mod phi;
-mod values;
+mod open;
+mod ssa;
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::ops::Range;
+use std::collections::{BTreeSet, VecDeque};
 
+use crate::decompile::{DecompileContext, DecompileError, DecompileState};
 use crate::transformer::{
-    AccessBase, AccessKey, BranchOperands, CaptureSource, CondOperand, LowInstr, LoweredProto, Reg,
-    RegRange, ResultPack, ValueOperand, ValuePack,
+    AccessBase, AccessKey, BranchOperands, CaptureSource, CondOperand, InstrRef, LowInstr,
+    LoweredProto, Reg, RegRange, ResultPack, ValueOperand, ValuePack,
 };
 
 use self::effects::{compute_instr_effect, compute_reg_count, compute_side_effect_summary};
-use self::fixed::{materialize_instruction_facts, solve_reaching_defs};
 use self::liveness::solve_liveness;
-use self::phi::compute_phi_candidates;
-use self::values::materialize_value_facts;
+use self::open::analyze_open_values;
+use self::ssa::build_ssa;
 use super::common::{
-    BlockRef, Cfg, CfgGraph, CompactSet, DataflowFacts, Def, DefId, EffectTag, GraphFacts,
-    InstrEffect, InstrReachingDefs, InstrReachingValues, InstrUseDefs, InstrUseValues, OpenDef,
-    OpenDefId, OpenUseSite, PhiCandidate, PhiId, PhiIncoming, RegValueMap, SideEffectSummary,
-    SsaValue, UseSite, ValueFactsStorage,
+    BlockRef, Cfg, CfgGraph, DataflowFacts, Def, DefId, EffectTag, GraphFacts, InstrEffect,
+    PhiCandidate, SideEffectSummary, SsaValue,
 };
-
-type FixedState = TrackedState<DefId>;
-type ValueState = TrackedState<SsaValue>;
-
-struct DefLookupTables {
-    fixed: Vec<FixedDefLookup>,
-    open_must: Vec<Option<OpenDefId>>,
-    open_may: Vec<Option<OpenDefId>>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct FixedDefLookup {
-    must: Vec<(Reg, DefId)>,
-    may: Vec<(Reg, DefId)>,
-}
-
-struct BlockReachingState {
-    fixed_in: Vec<FixedState>,
-    fixed_out: Vec<FixedState>,
-    open_in: Vec<CompactSet<OpenDefId>>,
-    open_out: Vec<CompactSet<OpenDefId>>,
-}
-
-struct InstructionFacts {
-    reaching_defs: Vec<InstrReachingDefs>,
-    use_defs: Vec<InstrUseDefs>,
-    def_uses: Vec<Vec<UseSite>>,
-    open_reaching_defs: Vec<CompactSet<OpenDefId>>,
-    open_use_defs: Vec<CompactSet<OpenDefId>>,
-    open_def_uses: Vec<Vec<OpenUseSite>>,
-}
-
-struct BlockValueState {
-    fixed_in: Vec<ValueState>,
-    fixed_out: Vec<ValueState>,
-}
-
-fn enqueue_reachable_successors(
-    cfg: &Cfg,
-    block: BlockRef,
-    worklist: &mut VecDeque<BlockRef>,
-    queued: &mut [bool],
-) {
-    for edge_ref in &cfg.succs[block.index()] {
-        let successor = cfg.edges[edge_ref.index()].to;
-        if cfg.reachable_blocks.contains(&successor) && !queued[successor.index()] {
-            queued[successor.index()] = true;
-            worklist.push_back(successor);
-        }
-    }
-}
-
-fn enqueue_reachable_predecessors(
-    cfg: &Cfg,
-    block: BlockRef,
-    worklist: &mut VecDeque<BlockRef>,
-    queued: &mut [bool],
-) {
-    for edge_ref in &cfg.preds[block.index()] {
-        let predecessor = cfg.edges[edge_ref.index()].from;
-        if cfg.reachable_blocks.contains(&predecessor) && !queued[predecessor.index()] {
-            queued[predecessor.index()] = true;
-            worklist.push_back(predecessor);
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct TrackedState<T> {
-    regs: Vec<CompactSet<T>>,
-    active_regs: Vec<Reg>,
-    active_marks: Vec<bool>,
-    active_sorted: bool,
-}
-
-impl<T> TrackedState<T>
-where
-    T: Copy + Ord,
-{
-    fn new(reg_count: usize) -> Self {
-        Self {
-            regs: vec![CompactSet::Empty; reg_count],
-            active_regs: Vec::new(),
-            active_marks: vec![false; reg_count],
-            active_sorted: true,
-        }
-    }
-
-    fn get(&self, reg: Reg) -> &CompactSet<T> {
-        self.regs
-            .get(reg.index())
-            .expect("tracked state should have a slot for every reachable register")
-    }
-
-    fn set_singleton(&mut self, reg: Reg, value: T) -> bool {
-        self.set_compact(reg, CompactSet::singleton(value))
-    }
-
-    fn insert(&mut self, reg: Reg, value: T) -> bool {
-        let index = reg.index();
-        let changed = self.regs[index].insert(value);
-        if changed {
-            self.ensure_active(reg);
-        }
-        changed
-    }
-
-    fn extend_from(&mut self, other: &Self) -> bool {
-        let mut changed = false;
-
-        for reg in other.active_regs.iter().copied() {
-            match other.get(reg) {
-                CompactSet::Empty => {}
-                CompactSet::One(value) => {
-                    changed |= self.insert(reg, *value);
-                }
-                CompactSet::Many(values) => {
-                    for value in values {
-                        changed |= self.insert(reg, *value);
-                    }
-                }
-            }
-        }
-
-        changed
-    }
-
-    fn snapshot_map(&mut self) -> RegValueMap<T> {
-        if !self.active_sorted {
-            self.active_regs.sort_unstable_by_key(|reg| reg.index());
-            self.active_sorted = true;
-        }
-        let mut entries = Vec::with_capacity(self.active_regs.len());
-        for &reg in &self.active_regs {
-            let values = self
-                .regs
-                .get(reg.index())
-                .cloned()
-                .expect("tracked state should have a slot for every active register");
-            if !values.is_empty() {
-                entries.push((reg, values));
-            }
-        }
-        RegValueMap::from_sparse_entries(entries)
-    }
-
-    fn set_compact(&mut self, reg: Reg, values: CompactSet<T>) -> bool {
-        let index = reg.index();
-        if self.regs[index] == values {
-            return false;
-        }
-        self.regs[index] = values;
-        if !self.regs[index].is_empty() {
-            self.ensure_active(reg);
-        }
-        true
-    }
-
-    fn ensure_active(&mut self, reg: Reg) {
-        let index = reg.index();
-        if self.active_marks[index] {
-            return;
-        }
-
-        if let Some(last_reg) = self.active_regs.last().copied()
-            && last_reg.index() > index
-        {
-            self.active_sorted = false;
-        }
-        self.active_marks[index] = true;
-        self.active_regs.push(reg);
-    }
-}
-
-impl<T> PartialEq for TrackedState<T>
-where
-    T: Copy + Ord + PartialEq,
-{
-    fn eq(&self, other: &Self) -> bool {
-        self.regs == other.regs
-    }
-}
-
-impl<T> Eq for TrackedState<T> where T: Copy + Ord + Eq {}
-
-struct FixedUseScratch {
-    regs: Vec<Reg>,
-    seen: Vec<bool>,
-}
-
-impl FixedUseScratch {
-    fn new(reg_count: usize) -> Self {
-        Self {
-            regs: Vec::new(),
-            seen: vec![false; reg_count],
-        }
-    }
-
-    fn resolve<'a>(
-        &'a mut self,
-        effect: &InstrEffect,
-        current_open: &CompactSet<OpenDefId>,
-        open_defs: &[OpenDef],
-    ) -> &'a [Reg] {
-        self.clear();
-
-        for reg in effect.fixed_uses.iter().copied() {
-            self.push(reg);
-        }
-
-        let Some(start_reg) = effect.open_use else {
-            self.sort();
-            return &self.regs;
-        };
-
-        if current_open.len() != 1 {
-            self.sort();
-            return &self.regs;
-        }
-
-        let open_def_id = current_open
-            .iter()
-            .next()
-            .expect("len checked above, exactly one reaching open def exists");
-        let Some(open_def) = open_defs.get(open_def_id.index()) else {
-            self.sort();
-            return &self.regs;
-        };
-        if open_def.start_reg.index() <= start_reg.index() {
-            self.sort();
-            return &self.regs;
-        }
-
-        for index in start_reg.index()..open_def.start_reg.index() {
-            self.push(Reg(index));
-        }
-        self.sort();
-        &self.regs
-    }
-
-    fn clear(&mut self) {
-        for reg in self.regs.iter().copied() {
-            self.seen[reg.index()] = false;
-        }
-        self.regs.clear();
-    }
-
-    fn push(&mut self, reg: Reg) {
-        if self.seen[reg.index()] {
-            return;
-        }
-
-        self.seen[reg.index()] = true;
-        self.regs.push(reg);
-    }
-
-    fn sort(&mut self) {
-        self.regs.sort_unstable_by_key(|reg| reg.index());
-    }
-}
-
-struct MaterializeScratch {
-    fixed_use_regs: FixedUseScratch,
-}
-
-impl MaterializeScratch {
-    fn new(reg_count: usize) -> Self {
-        Self {
-            fixed_use_regs: FixedUseScratch::new(reg_count),
-        }
-    }
-}
-
-struct ValueMaterializeCtx<'a> {
-    lookups: &'a DefLookupTables,
-    open_defs: &'a [OpenDef],
-    phi_candidates: &'a [PhiCandidate],
-    phi_block_ranges: &'a [Range<usize>],
-}
 
 struct BlockLiveness {
     live_in: Vec<BTreeSet<Reg>>,
     live_out: Vec<BTreeSet<Reg>>,
-    open_live_in: Vec<bool>,
-    open_live_out: Vec<bool>,
 }
-
-use crate::decompile::{DecompileContext, DecompileError, DecompileState};
 
 /// Dataflow 阶段入口：从 low-IR、CFG 和 GraphFacts 槽位读取事实，写回数据流事实。
 pub(crate) fn analyze_dataflow(
@@ -353,156 +63,68 @@ pub fn compute_dataflow_facts(
         .collect::<Vec<_>>();
     let reg_count = compute_reg_count(proto, &instr_effects);
 
-    let mut defs = Vec::new();
-    let mut open_defs = Vec::new();
-    let mut instr_defs = vec![Vec::new(); proto.instrs.len()];
-    let mut lookups = DefLookupTables {
-        fixed: vec![FixedDefLookup::default(); proto.instrs.len()],
-        open_must: vec![None; proto.instrs.len()],
-        open_may: vec![None; proto.instrs.len()],
-    };
-
-    for block in cfg.block_order.iter().copied() {
-        let Some(instr_indices) = instr_indices(cfg, block) else {
-            continue;
-        };
-
-        for instr_index in instr_indices {
-            let effect = &instr_effects[instr_index];
-
-            for reg in &effect.fixed_must_defs {
-                let id = DefId(defs.len());
-                let reg = *reg;
-                let def = Def {
-                    id,
-                    reg,
-                    instr: crate::transformer::InstrRef(instr_index),
-                    block,
-                };
-                defs.push(def);
-                instr_defs[instr_index].push(id);
-                lookups.fixed[instr_index].must.push((reg, id));
-            }
-
-            for reg in &effect.fixed_may_defs {
-                let id = DefId(defs.len());
-                let reg = *reg;
-                let def = Def {
-                    id,
-                    reg,
-                    instr: crate::transformer::InstrRef(instr_index),
-                    block,
-                };
-                defs.push(def);
-                instr_defs[instr_index].push(id);
-                lookups.fixed[instr_index].may.push((reg, id));
-            }
-
-            if let Some(start_reg) = effect.open_must_def {
-                let id = OpenDefId(open_defs.len());
-                open_defs.push(OpenDef {
-                    id,
-                    start_reg,
-                    instr: crate::transformer::InstrRef(instr_index),
-                    block,
-                });
-                lookups.open_must[instr_index] = Some(id);
-            }
-
-            if let Some(start_reg) = effect.open_may_def {
-                let id = OpenDefId(open_defs.len());
-                open_defs.push(OpenDef {
-                    id,
-                    start_reg,
-                    instr: crate::transformer::InstrRef(instr_index),
-                    block,
-                });
-                lookups.open_may[instr_index] = Some(id);
-            }
-        }
-    }
-
-    let mut block_state = BlockReachingState {
-        fixed_in: vec![TrackedState::new(reg_count); cfg.blocks.len()],
-        fixed_out: vec![TrackedState::new(reg_count); cfg.blocks.len()],
-        open_in: vec![CompactSet::Empty; cfg.blocks.len()],
-        open_out: vec![CompactSet::Empty; cfg.blocks.len()],
-    };
-
-    solve_reaching_defs(cfg, graph_facts, &instr_effects, &lookups, &mut block_state);
-
-    let mut instruction_facts = InstructionFacts {
-        reaching_defs: vec![InstrReachingDefs::default(); proto.instrs.len()],
-        use_defs: vec![InstrUseDefs::default(); proto.instrs.len()],
-        def_uses: vec![Vec::new(); defs.len()],
-        open_reaching_defs: vec![CompactSet::Empty; proto.instrs.len()],
-        open_use_defs: vec![CompactSet::Empty; proto.instrs.len()],
-        open_def_uses: vec![Vec::new(); open_defs.len()],
-    };
-
-    let mut materialize_scratch = MaterializeScratch::new(reg_count);
-
-    materialize_instruction_facts(
+    let entry_open_start = proto
+        .signature
+        .is_vararg
+        .then_some(Reg(usize::from(proto.signature.num_params)));
+    let open = analyze_open_values(
         cfg,
+        graph_facts,
         &instr_effects,
-        &lookups,
-        &open_defs,
-        &block_state,
-        &mut materialize_scratch,
-        &mut instruction_facts,
+        reg_count,
+        entry_open_start,
     );
-
     let liveness = solve_liveness(
         cfg,
         graph_facts,
         &instr_effects,
-        &instruction_facts,
+        &open.fixed_liveness_use_regs,
         reg_count,
     );
 
-    let phi_candidates = compute_phi_candidates(
+    let mut defs = Vec::new();
+    let mut instr_defs = vec![Vec::new(); proto.instrs.len()];
+    let mut def_lookup = vec![Vec::new(); proto.instrs.len()];
+    for block in cfg.block_order.iter().copied() {
+        let Some(indices) = instr_indices(cfg, block) else {
+            continue;
+        };
+        for instr_index in indices {
+            for &reg in &instr_effects[instr_index].fixed_must_defs {
+                let id = DefId(defs.len());
+                defs.push(Def {
+                    id,
+                    reg,
+                    instr: InstrRef(instr_index),
+                    block,
+                });
+                instr_defs[instr_index].push(id);
+                def_lookup[instr_index].push((reg, id));
+            }
+        }
+    }
+
+    let ssa = build_ssa(
         cfg,
         graph_facts,
         &defs,
+        &def_lookup,
+        &open.fixed_ssa_use_regs,
         &liveness.live_in,
-        &block_state.fixed_out,
+        &liveness.live_out,
+        reg_count,
+        proto.instrs.len(),
     );
-    let phi_block_ranges = index_phi_candidate_ranges(cfg, &phi_candidates);
-
-    let value_facts = if phi_candidates.is_empty() {
-        ValueFactsStorage::NoPhi
-    } else {
-        let materialized = materialize_value_facts(
-            cfg,
-            graph_facts,
-            &instr_effects,
-            ValueMaterializeCtx {
-                lookups: &lookups,
-                open_defs: &open_defs,
-                phi_candidates: &phi_candidates,
-                phi_block_ranges: &phi_block_ranges,
-            },
-            reg_count,
-            &mut materialize_scratch,
-            &instruction_facts,
-        );
-        ValueFactsStorage::Materialized {
-            reaching_values: materialized.reaching_values,
-            use_values: materialized.use_values,
-        }
-    };
-    let (phi_use_counts, phi_use_blocks) = index_phi_uses(cfg, phi_candidates.len(), &value_facts);
-
     let children = proto
         .children
         .iter()
         .zip(child_cfgs.iter())
         .zip(graph_facts.children.iter())
-        .map(|((child_proto, child_cfg), child_graph_facts)| {
+        .map(|((child_proto, child_cfg), child_graph)| {
             compute_dataflow_facts(
                 child_proto,
                 &child_cfg.cfg,
-                child_graph_facts,
+                child_graph,
                 &child_cfg.children,
             )
         })
@@ -512,88 +134,54 @@ pub fn compute_dataflow_facts(
         instr_effects,
         effect_summaries,
         defs,
-        open_defs,
+        open_defs: open.defs,
         instr_defs,
-        reaching_defs: instruction_facts.reaching_defs,
-        use_defs: instruction_facts.use_defs,
-        def_uses: instruction_facts.def_uses,
-        open_reaching_defs: collect_open_sets(&instruction_facts.open_reaching_defs),
-        open_use_defs: collect_open_sets(&instruction_facts.open_use_defs),
-        open_def_uses: instruction_facts.open_def_uses,
+        block_entry_values: ssa.block_entry_values,
+        block_exit_values: ssa.block_exit_values,
+        use_values: ssa.use_values,
+        def_uses: ssa.def_uses,
+        def_phi_uses: ssa.def_phi_uses,
+        phi_uses: ssa.phi_uses,
+        phi_phi_uses: ssa.phi_phi_uses,
+        open_use_sources: open.use_sources,
         live_in: liveness.live_in,
         live_out: liveness.live_out,
-        open_live_in: liveness.open_live_in,
-        open_live_out: liveness.open_live_out,
-        phi_candidates,
-        phi_block_ranges,
-        phi_use_counts,
-        phi_use_blocks,
-        value_facts,
+        open_live_in: open.live_in,
+        open_live_out: open.live_out,
+        phi_candidates: ssa.phis,
+        phi_block_ranges: ssa.phi_block_ranges,
+        phi_use_blocks: ssa.phi_use_blocks,
         children,
     }
 }
 
 fn instr_indices(cfg: &Cfg, block: BlockRef) -> Option<impl Iterator<Item = usize>> {
     let range = cfg.blocks.get(block.index())?.instrs;
-    if range.is_empty() {
-        return None;
-    }
-
-    Some(range.start.index()..range.end())
+    (!range.is_empty()).then(|| range.start.index()..range.end())
 }
 
-fn index_phi_candidate_ranges(cfg: &Cfg, phi_candidates: &[PhiCandidate]) -> Vec<Range<usize>> {
+fn index_phi_candidate_ranges(cfg: &Cfg, phis: &[PhiCandidate]) -> Vec<std::ops::Range<usize>> {
     let mut ranges = vec![0..0; cfg.blocks.len()];
-    let mut next_phi = 0;
-
+    let mut next = 0;
     for (block_index, range) in ranges.iter_mut().enumerate() {
-        let start = next_phi;
-        while next_phi < phi_candidates.len()
-            && phi_candidates[next_phi].block.index() == block_index
-        {
-            next_phi += 1;
+        let start = next;
+        while next < phis.len() && phis[next].block.index() == block_index {
+            next += 1;
         }
-        *range = start..next_phi;
+        *range = start..next;
     }
-
     ranges
 }
 
-fn index_phi_uses(
-    cfg: &Cfg,
-    phi_count: usize,
-    value_facts: &ValueFactsStorage,
-) -> (Vec<usize>, Vec<Option<BlockRef>>) {
-    let mut counts = vec![0; phi_count];
-    let mut blocks = vec![None; phi_count];
-    let ValueFactsStorage::Materialized { use_values, .. } = value_facts else {
-        return (counts, blocks);
-    };
-
-    for (instr_index, values) in use_values.iter().enumerate() {
-        let block = cfg.instr_to_block[instr_index];
-        for value_set in values.fixed.values() {
-            for value in value_set.iter() {
-                let SsaValue::Phi(phi_id) = value else {
-                    continue;
-                };
-                let index = phi_id.index();
-                counts[index] += 1;
-                match blocks[index] {
-                    Some(existing) if existing != block => blocks[index] = None,
-                    Some(_) => {}
-                    None if counts[index] == 1 => blocks[index] = Some(block),
-                    None => {}
-                }
-            }
+fn canonical_value(mut value: SsaValue, replacements: &[SsaValue]) -> SsaValue {
+    let mut remaining = replacements.len() + 1;
+    while let SsaValue::Phi(phi) = value {
+        let next = replacements.get(phi.index()).copied().unwrap_or(value);
+        if next == value || remaining == 0 {
+            break;
         }
+        value = next;
+        remaining -= 1;
     }
-
-    (counts, blocks)
-}
-
-fn collect_open_sets(sets: &[CompactSet<OpenDefId>]) -> Vec<BTreeSet<OpenDefId>> {
-    sets.iter()
-        .map(|set| set.iter().copied().collect())
-        .collect()
+    value
 }

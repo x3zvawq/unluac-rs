@@ -59,8 +59,9 @@ fn resolve_open_pack_tail(
     instr_ref: InstrRef,
     start_reg: Reg,
 ) -> Option<(Reg, HirExpr)> {
-    let defs = lowering.dataflow.open_use_defs_at(instr_ref);
-    if defs.len() == 1 {
+    let sources = lowering.dataflow.open_use_sources_at(instr_ref);
+    let defs = sources.defs();
+    if !sources.has_entry() && defs.len() == 1 {
         let def = defs
             .iter()
             .next()
@@ -75,11 +76,15 @@ fn resolve_open_pack_tail(
         ));
     }
 
-    if defs.is_empty()
+    if sources.has_entry()
+        && defs.is_empty()
         && lowering.proto.signature.is_vararg
-        && start_reg.index() == usize::from(lowering.proto.signature.num_params)
+        && start_reg.index() <= usize::from(lowering.proto.signature.num_params)
     {
-        return Some((start_reg, HirExpr::VarArg));
+        return Some((
+            Reg(usize::from(lowering.proto.signature.num_params)),
+            HirExpr::VarArg,
+        ));
     }
 
     None
@@ -92,8 +97,9 @@ fn resolve_open_pack_tail_single_eval(
     instr_ref: InstrRef,
     start_reg: Reg,
 ) -> Option<(Reg, HirExpr)> {
-    let defs = lowering.dataflow.open_use_defs_at(instr_ref);
-    if defs.len() == 1 {
+    let sources = lowering.dataflow.open_use_sources_at(instr_ref);
+    let defs = sources.defs();
+    if !sources.has_entry() && defs.len() == 1 {
         let def = defs
             .iter()
             .next()
@@ -107,11 +113,15 @@ fn resolve_open_pack_tail_single_eval(
         return Some((open_def.start_reg, expr));
     }
 
-    if defs.is_empty()
+    if sources.has_entry()
+        && defs.is_empty()
         && lowering.proto.signature.is_vararg
-        && start_reg.index() == usize::from(lowering.proto.signature.num_params)
+        && start_reg.index() <= usize::from(lowering.proto.signature.num_params)
     {
-        return Some((start_reg, HirExpr::VarArg));
+        return Some((
+            Reg(usize::from(lowering.proto.signature.num_params)),
+            HirExpr::VarArg,
+        ));
     }
 
     None
@@ -169,10 +179,6 @@ pub(crate) fn expr_for_entry_reg(lowering: &ProtoLowering<'_>, reg: Reg) -> HirE
         // 入口 local 身份时，这不是“无法表达”的值，而是源码层面的 nil。
         HirExpr::Nil
     }
-}
-
-fn fixed_def_for_reg(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, reg: Reg) -> Option<DefId> {
-    lowering.dataflow.instr_def_for_reg(instr_ref, reg)
 }
 
 fn reg_in_range(range: crate::transformer::RegRange, reg: Reg) -> bool {

@@ -1,6 +1,6 @@
 //! 这个文件实现 Dataflow 内部的寄存器活跃性固定点求解。
 //!
-//! 它只消费 CFG 后继关系、指令 use/def 和 open vararg/use-def 事实，产出后续 phi
+//! 它只消费 CFG 后继关系与已经解析的真实寄存器 use/def，产出后续 phi
 //! 与 StructureFacts 可复用的 live-in/live-out 集合；这里不判断 branch/loop/短路候选，
 //! 也不把活跃性解释成源码级变量身份。
 //!
@@ -9,17 +9,30 @@
 
 use super::*;
 
+fn enqueue_predecessors(
+    cfg: &Cfg,
+    block: BlockRef,
+    worklist: &mut VecDeque<BlockRef>,
+    queued: &mut [bool],
+) {
+    for edge in &cfg.preds[block.index()] {
+        let pred = cfg.edges[edge.index()].from;
+        if cfg.reachable_blocks.contains(&pred) && !queued[pred.index()] {
+            queued[pred.index()] = true;
+            worklist.push_back(pred);
+        }
+    }
+}
+
 pub(super) fn solve_liveness(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     instr_effects: &[InstrEffect],
-    instruction_facts: &InstructionFacts,
+    fixed_use_regs: &[Vec<Reg>],
     reg_count: usize,
 ) -> BlockLiveness {
     let mut block_uses = vec![DenseRegSet::new(reg_count); cfg.blocks.len()];
     let mut block_defs = vec![DenseRegSet::new(reg_count); cfg.blocks.len()];
-    let mut block_open_use = vec![false; cfg.blocks.len()];
-    let mut block_open_def = vec![false; cfg.blocks.len()];
 
     for block in cfg.block_order.iter().copied() {
         let Some(instr_indices) = super::instr_indices(cfg, block) else {
@@ -27,41 +40,23 @@ pub(super) fn solve_liveness(
         };
 
         let mut seen_defs = DenseRegSet::new(reg_count);
-        let mut seen_open_def = false;
 
         for instr_index in instr_indices {
-            let effect = &instr_effects[instr_index];
-
-            for reg in instruction_facts.use_defs[instr_index].fixed.keys() {
+            for &reg in &fixed_use_regs[instr_index] {
                 if !seen_defs.contains(reg) {
                     block_uses[block.index()].insert(reg);
                 }
             }
 
-            if effect.open_use.is_some() && !seen_open_def {
-                block_open_use[block.index()] = true;
-            }
-
-            for reg in effect
-                .fixed_must_defs
-                .iter()
-                .chain(effect.fixed_may_defs.iter())
-            {
+            for reg in &instr_effects[instr_index].fixed_must_defs {
                 seen_defs.insert(*reg);
                 block_defs[block.index()].insert(*reg);
-            }
-
-            if effect.open_must_def.is_some() || effect.open_may_def.is_some() {
-                seen_open_def = true;
-                block_open_def[block.index()] = true;
             }
         }
     }
 
     let mut live_in = vec![DenseRegSet::new(reg_count); cfg.blocks.len()];
     let mut live_out = vec![DenseRegSet::new(reg_count); cfg.blocks.len()];
-    let mut open_live_in = vec![false; cfg.blocks.len()];
-    let mut open_live_out = vec![false; cfg.blocks.len()];
 
     let mut worklist = graph_facts
         .rpo
@@ -77,7 +72,6 @@ pub(super) fn solve_liveness(
     while let Some(block) = worklist.pop_front() {
         queued[block.index()] = false;
         let mut new_live_out = DenseRegSet::new(reg_count);
-        let mut new_open_live_out = false;
 
         for edge_ref in &cfg.succs[block.index()] {
             let succ = cfg.edges[edge_ref.index()].to;
@@ -85,30 +79,22 @@ pub(super) fn solve_liveness(
                 continue;
             }
             new_live_out.extend_from(&live_in[succ.index()]);
-            new_open_live_out |= open_live_in[succ.index()];
         }
 
         let mut new_live_in = block_uses[block.index()].clone();
         new_live_in.extend_without(&new_live_out, &block_defs[block.index()]);
-        let new_open_live_in =
-            block_open_use[block.index()] || (new_open_live_out && !block_open_def[block.index()]);
-        let entry_changed = live_in[block.index()] != new_live_in
-            || open_live_in[block.index()] != new_open_live_in;
+        let entry_changed = live_in[block.index()] != new_live_in;
 
         live_out[block.index()] = new_live_out;
         live_in[block.index()] = new_live_in;
-        open_live_out[block.index()] = new_open_live_out;
-        open_live_in[block.index()] = new_open_live_in;
         if entry_changed {
-            enqueue_reachable_predecessors(cfg, block, &mut worklist, &mut queued);
+            enqueue_predecessors(cfg, block, &mut worklist, &mut queued);
         }
     }
 
     BlockLiveness {
         live_in: live_in.into_iter().map(DenseRegSet::into_regs).collect(),
         live_out: live_out.into_iter().map(DenseRegSet::into_regs).collect(),
-        open_live_in,
-        open_live_out,
     }
 }
 

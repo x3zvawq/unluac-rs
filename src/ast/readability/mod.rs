@@ -20,7 +20,6 @@ mod local_coalesce;
 mod loop_header_merge;
 mod luajit_goto_safety;
 mod materialize_temps;
-mod short_circuit_pretty;
 mod statement_merge;
 mod traverse;
 mod visit;
@@ -68,7 +67,7 @@ enum AstInvalidation {
     StatementAdjacency,
     /// 控制流形状变化（影响 branch-pretty 及其下游）。
     ControlFlowShape,
-    /// 表达式形状变化（影响 field-access-sugar, short-circuit-pretty, inline-exprs）。
+    /// 表达式形状变化（影响 field-access-sugar, inline-exprs）。
     ExprShape,
     /// 绑定关系变化（影响 local-coalesce, function-sugar）。
     BindingStructure,
@@ -102,7 +101,7 @@ use AstInvalidation::*;
 //
 // Normal phase 处理主要形状收敛：
 //   cleanup → local-coalesce → statement-merge → loop-header-merge
-//   → branch-pretty → field-access-sugar → inline-exprs → short-circuit-pretty
+//   → branch-pretty → field-access-sugar → inline-exprs
 //
 // Deferred phase 在 Normal 全部收敛后执行终态物化和语法糖：
 //   temp-materialize → installer-iife → function-sugar → global-decl-pretty → luajit-goto-safety
@@ -157,12 +156,6 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
         phase: PassPhase::Normal,
         depends_on: &[StatementAdjacency, ExprShape, TempPresence],
         invalidates: &[StatementAdjacency, ExprShape],
-    },
-    PassDescriptor {
-        name: "short-circuit-pretty",
-        phase: PassPhase::Normal,
-        depends_on: &[ExprShape],
-        invalidates: &[ExprShape],
     },
     // ── Deferred phase ──
     PassDescriptor {
@@ -219,9 +212,6 @@ const PASS_ENTRIES: &[ReadabilityPassEntry] = &[
     },
     ReadabilityPassEntry {
         apply: inline_exprs::apply,
-    },
-    ReadabilityPassEntry {
-        apply: short_circuit_pretty::apply,
     },
     ReadabilityPassEntry {
         apply: materialize_temps::apply,
