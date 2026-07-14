@@ -75,6 +75,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 reg: value.reg,
                 target,
                 init,
+                initialize_target: true,
             });
             planned_regs.insert(value.reg);
         }
@@ -135,6 +136,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 reg: value.reg,
                 target,
                 init,
+                initialize_target: true,
             });
             planned_regs.insert(value.reg);
         }
@@ -147,6 +149,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             target_overrides,
             &mut plan,
         );
+        self.extend_generic_for_owned_phi_overrides(candidate, &mut plan);
 
         Some(plan)
     }
@@ -209,6 +212,51 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                             .map(SsaValue::Def),
                     );
                 }
+            }
+        }
+    }
+
+    fn extend_generic_for_owned_phi_overrides(
+        &self,
+        candidate: &LoopCandidate,
+        plan: &mut LoopStatePlan,
+    ) {
+        if candidate.kind_hint != LoopKindHint::GenericForLike {
+            return;
+        }
+        let targets = plan
+            .states
+            .iter()
+            .map(|state| (state.reg, &state.target))
+            .collect::<BTreeMap<_, _>>();
+        for phi in &self.lowering.dataflow.phi_candidates {
+            let Some(target) = targets.get(&phi.reg) else {
+                continue;
+            };
+            if !candidate.blocks.contains(&phi.block) {
+                continue;
+            }
+            let defs = phi
+                .incoming
+                .iter()
+                .flat_map(|incoming| incoming.defs.iter().copied())
+                .collect::<Vec<_>>();
+            if defs.is_empty()
+                || shared_lvalue_for_defs(
+                    &self.lowering.bindings.fixed_temps,
+                    defs,
+                    &plan.backedge_target_overrides,
+                )
+                .as_ref()
+                    != Some(*target)
+            {
+                continue;
+            }
+            let temp = self.lowering.bindings.phi_temps[phi.id.index()];
+            if *target != &HirLValue::Temp(temp) {
+                plan.backedge_target_overrides
+                    .insert(temp, (*target).clone());
+                plan.owned_phis.insert(phi.id);
             }
         }
     }
@@ -304,6 +352,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 reg: *reg,
                 target,
                 init,
+                initialize_target: true,
             });
             planned_regs.insert(*reg);
         }

@@ -10,6 +10,8 @@
 //! - 输出：复用同一个 entry lvalue 作为 loop state target，而不是新建只在分支内可见的 phi temp
 //! - 输入：参数寄存器在 numeric-for preheader 上没有 SSA def
 //! - 输出：沿用 `ParamRef` 入口值，而不是把“空 defs”误作未初始化 nil 槽
+//! - 输入：内层 while/repeat 写回外层 for binding
+//! - 输出：初值和 target 共同复用该词法 local，不另建一个只写不读的 state
 
 use super::*;
 use crate::structure::SsaValue;
@@ -203,6 +205,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     ) -> Option<HirExpr> {
         let defs = defs.into_iter().collect::<Vec<_>>();
 
+        if let Some(local) = self.lowering.bindings.local_for_reg_in_block(pred, reg) {
+            return Some(HirExpr::LocalRef(local));
+        }
+
         // 某些 loop 会直接跟在另一个已经结构化的 region 后面。此时 CFG/Dataflow 视角里，
         // predecessor 边上同一寄存器可能仍然带着“多个原始 def 合流”的痕迹；但对 HIR 来说，
         // 前一个结构已经把它稳定成了 entry override。这里只在 predecessor 本身没有再次改写
@@ -323,6 +329,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return target;
         }
 
+        if let Some(local) = self
+            .lowering
+            .bindings
+            .local_for_reg_in_block(candidate.header, reg)
+        {
+            return HirLValue::Local(local);
+        }
+
         let has_normalized_terminal_exit = candidate
             .control_blocks
             .iter()
@@ -416,6 +430,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         allow_carried_override: bool,
     ) -> Option<HirLValue> {
         let defs = defs.into_iter().collect::<Vec<_>>();
+
+        if let Some(local) = self.lowering.bindings.local_for_reg_in_block(pred, reg) {
+            return Some(HirLValue::Local(local));
+        }
 
         if allow_carried_override
             && let Some(target) = self

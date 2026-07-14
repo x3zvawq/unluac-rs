@@ -8,6 +8,8 @@
 //!
 //! 它不会发明新 local，也不会在原 local 仍然活跃时强行合并两段状态；所有折叠都必须
 //! 先证明 seed 在后续不再可观察、temp 不被外层作用域消费，并且写回形状可证明。
+//! captured local 也不能作为纯 alias handoff 的来源：闭包调用可能在后缀没有显式提及
+//! 该 local 时写回它，跨过这类调用消除快照会改变后续读值。
 //!
 //! 例子：
 //! - 输入：`local l0 = 1; do t4 = l0; ::L1:: if t4 < 3 then t4 = t4 + 1; goto L1 end end`
@@ -33,6 +35,7 @@ use super::walk::for_each_nested_block_mut;
 use self::adjacent::try_collapse_adjacent_local_seed_handoff;
 use self::boundary::{LabelJumpIndex, collapse_boundary_alias_classes};
 use self::handoffs::{HandoffAction, try_collapse_handoff_at};
+use super::mention::stmts_captured_locals;
 
 pub(super) fn collapse_carried_local_handoffs_in_proto(proto: &mut HirProto) -> bool {
     collapse_handoffs_recursive(&mut proto.body, &BTreeSet::new())
@@ -75,15 +78,21 @@ fn collapse_block_handoffs(block: &mut HirBlock, outer_temps: &BTreeSet<TempId>)
         let action = {
             let temp_touches = TempTouchIndex::new(&stmt_temp_refs);
             let label_jumps = LabelJumpIndex::new(&block.stmts);
+            let captured_locals = stmts_captured_locals(&block.stmts);
             let mut action = None;
             while index < block.stmts.len() {
                 if try_collapse_adjacent_local_seed_handoff(block, index) {
                     action = Some(HandoffAction::RetrySameIndex);
                     break;
                 }
-                if let Some(handoff_action) =
-                    try_collapse_handoff_at(block, index, outer_temps, &temp_touches, &label_jumps)
-                {
+                if let Some(handoff_action) = try_collapse_handoff_at(
+                    block,
+                    index,
+                    outer_temps,
+                    &temp_touches,
+                    &label_jumps,
+                    &captured_locals,
+                ) {
                     action = Some(handoff_action);
                     break;
                 }

@@ -135,19 +135,6 @@ pub(super) fn rewrite_update_handoff_seed(stmt: &mut HirStmt, carried: CarryBind
     true
 }
 
-pub(super) fn local_handoff_seed(stmt: &HirStmt) -> Option<(TempId, crate::hir::common::LocalId)> {
-    let HirStmt::Assign(assign) = stmt else {
-        return None;
-    };
-    let [HirLValue::Temp(temp)] = assign.targets.as_slice() else {
-        return None;
-    };
-    let [HirExpr::LocalRef(local)] = assign.values.as_slice() else {
-        return None;
-    };
-    Some((*temp, *local))
-}
-
 pub(super) fn single_binding_handoff_seed(stmt: &HirStmt) -> Option<(TempId, CarryBinding)> {
     let HirStmt::Assign(assign) = stmt else {
         return None;

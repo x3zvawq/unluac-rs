@@ -170,19 +170,6 @@ pub(crate) fn expr_for_entry_reg(lowering: &ProtoLowering<'_>, reg: Reg) -> HirE
     }
 }
 
-fn loop_local_for_reg(
-    lowering: &ProtoLowering<'_>,
-    block: BlockRef,
-    reg: Reg,
-) -> Option<crate::hir::common::LocalId> {
-    lowering
-        .bindings
-        .block_local_regs
-        .get(&block)
-        .and_then(|locals| locals.get(&reg))
-        .copied()
-}
-
 fn fixed_def_for_reg(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, reg: Reg) -> Option<DefId> {
     lowering.dataflow.instr_def_for_reg(instr_ref, reg)
 }

@@ -76,7 +76,7 @@ pub(crate) fn analyze_structure_proto(
     let mut loop_candidates = loops::analyze_loops(proto, cfg, graph_facts, dataflow);
     let branch_candidates = branches::analyze_branches(cfg, graph_facts, &loop_candidates);
     let branch_region_facts =
-        branches::analyze_branch_regions(cfg, graph_facts, &branch_candidates);
+        branches::analyze_branch_regions(cfg, graph_facts, &loop_candidates, &branch_candidates);
     let irreducible_regions = helpers::compute_irreducible_regions(cfg);
     let mut short_circuit_candidates = short_circuit::analyze_short_circuits(
         proto,

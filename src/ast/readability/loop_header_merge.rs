@@ -1,9 +1,10 @@
 //! 这个 pass 负责把“紧邻 loop header 的机械 local alias run”收回控制头。
 //!
 //! 常见形状是：
-//! `local start = 1; local limit = #list; local step = 1; for i = start, limit, step do`
+//! `local start = 1; local limit = 10; local step = 1; for i = start, limit, step do`
 //! 这些 local 往往只是前层为了保持单值边界而提前物化的中间 binding。
-//! 当它们只在 loop header 被读取时，把它们重新折回控制头会更接近源码。
+//! 普通 loop 只移动稳定字面量：当 alias run 中有未被删除的语句时，把元方法运算、
+//! lookup 或 binding 读取折进 header 会跨过这些语句，改变求值顺序或读到的值。
 
 use crate::ast::ReadabilityOptions;
 
@@ -74,7 +75,7 @@ impl AstRewritePass for LoopHeaderMergePass {
                 else {
                     continue;
                 };
-                if !is_loop_header_inline_expr(value, self.options) {
+                if !is_loop_header_reorder_safe_expr(value) {
                     continue;
                 }
                 if use_index.count_uses_in_range(candidate_index + 1, run_end + 1, binding.id) != 1
@@ -215,6 +216,22 @@ fn is_loop_header_inline_expr(expr: &AstExpr, options: ReadabilityOptions) -> bo
             expr,
             AstExpr::VarArg | AstExpr::TableConstructor(_) | AstExpr::FunctionExpr(_)
         )
+}
+
+fn is_loop_header_reorder_safe_expr(expr: &AstExpr) -> bool {
+    match expr {
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
+        | AstExpr::Complex { .. } => true,
+        AstExpr::SingleValue(expr) => is_loop_header_reorder_safe_expr(expr),
+        _ => false,
+    }
 }
 
 fn cond_evaluates_binding_first(

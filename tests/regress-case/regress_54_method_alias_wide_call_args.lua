@@ -1,5 +1,5 @@
--- unluac: expect-contains [[:m70()]]
--- unluac: expect-not-contains [[.m70(]]
+-- unluac: expect-contains [[.m70(]]
+-- unluac: expect-not-contains [[:m70()]]
 local object = {}
 
 for i = 1, 70 do

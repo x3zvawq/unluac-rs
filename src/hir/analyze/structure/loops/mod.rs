@@ -34,9 +34,11 @@ fn loop_state_init_stmts(plan: &LoopStatePlan) -> Vec<HirStmt> {
     plan.states
         .iter()
         .filter(|state| {
+            // for binding 这类由外层语法初始化的 owner 只保留 override，
+            // 不额外生成 state init。
             // 嵌套循环场景下，内层 loop reuse 外层 state target 时 init == target，
             // 会产生无意义的 `x = x` 自赋值；跳过这些 no-op。
-            lvalue_as_expr(&state.target) != Some(state.init.clone())
+            state.initialize_target && lvalue_as_expr(&state.target) != Some(state.init.clone())
         })
         .map(|state| assign_stmt(vec![state.target.clone()], vec![state.init.clone()]))
         .collect()

@@ -12,7 +12,7 @@ pub(crate) fn expr_for_reg_use(
     instr_ref: InstrRef,
     reg: Reg,
 ) -> HirExpr {
-    if let Some(local) = loop_local_for_reg(lowering, block, reg) {
+    if let Some(local) = lowering.bindings.local_for_reg_in_block(block, reg) {
         return HirExpr::LocalRef(local);
     }
     let Some(values) = lowering.dataflow.use_values_at(instr_ref).get(reg) else {
@@ -160,7 +160,7 @@ pub(crate) fn expr_for_reg_at_block_entry(
     block: BlockRef,
     reg: Reg,
 ) -> HirExpr {
-    if let Some(local) = loop_local_for_reg(lowering, block, reg) {
+    if let Some(local) = lowering.bindings.local_for_reg_in_block(block, reg) {
         return HirExpr::LocalRef(local);
     }
     let range = lowering.cfg.blocks[block.index()].instrs;
@@ -208,7 +208,7 @@ pub(crate) fn expr_for_reg_at_block_exit(
     block: BlockRef,
     reg: Reg,
 ) -> HirExpr {
-    if let Some(local) = loop_local_for_reg(lowering, block, reg) {
+    if let Some(local) = lowering.bindings.local_for_reg_in_block(block, reg) {
         return HirExpr::LocalRef(local);
     }
 
@@ -285,7 +285,7 @@ pub(crate) fn expr_for_reg_use_inline(
     instr_ref: InstrRef,
     reg: Reg,
 ) -> HirExpr {
-    if let Some(local) = loop_local_for_reg(lowering, block, reg) {
+    if let Some(local) = lowering.bindings.local_for_reg_in_block(block, reg) {
         return HirExpr::LocalRef(local);
     }
     let Some(values) = lowering.dataflow.use_values_at(instr_ref).get(reg) else {
@@ -336,7 +336,7 @@ pub(crate) fn expr_for_reg_use_single_eval_with_call_policy(
     reg: Reg,
     allow_call_consumed_by_pure_wrapper: bool,
 ) -> HirExpr {
-    if let Some(local) = loop_local_for_reg(lowering, block, reg) {
+    if let Some(local) = lowering.bindings.local_for_reg_in_block(block, reg) {
         return HirExpr::LocalRef(local);
     }
     let Some(values) = lowering.dataflow.use_values_at(instr_ref).get(reg) else {

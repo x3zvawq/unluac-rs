@@ -618,6 +618,9 @@ fn try_merge_local_decl_with_assign(current: &AstStmt, next: &AstStmt) -> Option
     {
         return None;
     }
+    if stmt_references_any_binding_in_assign(assign, &local_decl.bindings) {
+        return None;
+    }
 
     Some(AstLocalDecl {
         bindings: local_decl.bindings.clone(),
@@ -670,6 +673,9 @@ fn try_sink_hoisted_decl_into_stmt(
     {
         return None;
     }
+    if stmt_references_any_binding_in_assign(assign, candidate) {
+        return None;
+    }
     if stmt_references_any_binding_in_assign(assign, &pending[assign.targets.len()..]) {
         return None;
     }
@@ -717,6 +723,9 @@ fn try_sink_hoisted_decl_into_stmt_anywhere(
             .zip(assign.targets.iter())
             .all(|(binding, target)| local_binding_matches_target(binding.id, target))
         {
+            continue;
+        }
+        if stmt_references_any_binding_in_assign(assign, candidate) {
             continue;
         }
         // 只有当所有候选 binding 在此语句之后不再被使用时才允许下沉。

@@ -29,9 +29,8 @@ use super::prune::{
 };
 use super::reads::BindingReadCollector;
 use super::seeds::{
-    binding_handoff_seed, direct_temp_writeback_stmt, local_handoff_seed,
-    rewrite_binding_handoff_seed, rewrite_update_handoff_seed, single_binding_handoff_seed,
-    update_handoff_seed,
+    binding_handoff_seed, direct_temp_writeback_stmt, rewrite_binding_handoff_seed,
+    rewrite_update_handoff_seed, single_binding_handoff_seed, update_handoff_seed,
 };
 
 pub(super) enum HandoffAction {
@@ -45,18 +44,29 @@ pub(super) fn try_collapse_handoff_at(
     outer_temps: &BTreeSet<TempId>,
     temp_touches: &TempTouchIndex<'_>,
     label_jumps: &LabelJumpIndex,
+    captured_locals: &BTreeSet<LocalId>,
 ) -> Option<HandoffAction> {
-    if try_collapse_pure_binding_handoffs(block, index, outer_temps, temp_touches, label_jumps)
-        || try_collapse_label_loop_update_handoff(
-            block,
-            index,
-            outer_temps,
-            temp_touches,
-            label_jumps,
-        )
-        || try_collapse_single_binding_handoff(block, index, outer_temps, temp_touches, label_jumps)
-        || try_collapse_pure_local_handoff(block, index, outer_temps, temp_touches, label_jumps)
-    {
+    if try_collapse_pure_binding_handoffs(
+        block,
+        index,
+        outer_temps,
+        temp_touches,
+        label_jumps,
+        captured_locals,
+    ) || try_collapse_label_loop_update_handoff(
+        block,
+        index,
+        outer_temps,
+        temp_touches,
+        label_jumps,
+    ) || try_collapse_single_binding_handoff(
+        block,
+        index,
+        outer_temps,
+        temp_touches,
+        label_jumps,
+        captured_locals,
+    ) {
         return Some(HandoffAction::RetrySameIndex);
     }
     if try_collapse_binding_update_handoff(block, index, outer_temps, temp_touches, label_jumps) {
@@ -71,6 +81,7 @@ fn try_collapse_pure_binding_handoffs(
     outer_temps: &BTreeSet<TempId>,
     temp_touches: &TempTouchIndex<'_>,
     label_jumps: &LabelJumpIndex,
+    captured_locals: &BTreeSet<LocalId>,
 ) -> bool {
     let Some(seed) = binding_handoff_seed(&block.stmts[index]) else {
         return false;
@@ -78,7 +89,9 @@ fn try_collapse_pure_binding_handoffs(
 
     // 外层仍引用或 seed 前已有路径触碰的 temp 都不是当前 handoff 新建的身份。
     if seed.rewrites.iter().any(|rewrite| {
-        outer_temps.contains(&rewrite.from) || temp_touches.touches_before(index, rewrite.from)
+        outer_temps.contains(&rewrite.from)
+            || temp_touches.touches_before(index, rewrite.from)
+            || captured_binding(captured_locals, rewrite.to)
     }) {
         return false;
     }
@@ -192,48 +205,13 @@ fn find_label_loop_update(
     None
 }
 
-fn try_collapse_pure_local_handoff(
-    block: &mut HirBlock,
-    index: usize,
-    outer_temps: &BTreeSet<TempId>,
-    temp_touches: &TempTouchIndex<'_>,
-    label_jumps: &LabelJumpIndex,
-) -> bool {
-    let Some((temp, local)) = local_handoff_seed(&block.stmts[index]) else {
-        return false;
-    };
-
-    // 外层仍引用或 seed 前已有路径触碰的 temp 都不是当前 handoff 新建的身份。
-    if outer_temps.contains(&temp) || temp_touches.touches_before(index, temp) {
-        return false;
-    }
-    if label_jumps.next_label_has_prior_goto(&block.stmts, index) {
-        return false;
-    }
-
-    let suffix = &block.stmts[index + 1..];
-    if suffix.is_empty()
-        || suffix_mentions_local(suffix, local)
-        || !temp_touches.touches_after(index + 1, temp)
-    {
-        return false;
-    }
-
-    let mut pass = TempToLocalPass { temp, local };
-    if !rewrite_stmts(&mut block.stmts[index + 1..], &mut pass) {
-        return false;
-    }
-
-    block.stmts.remove(index);
-    true
-}
-
 fn try_collapse_single_binding_handoff(
     block: &mut HirBlock,
     index: usize,
     outer_temps: &BTreeSet<TempId>,
     temp_touches: &TempTouchIndex<'_>,
     label_jumps: &LabelJumpIndex,
+    captured_locals: &BTreeSet<LocalId>,
 ) -> bool {
     let Some((temp, binding)) = single_binding_handoff_seed(&block.stmts[index]) else {
         return false;
@@ -241,6 +219,9 @@ fn try_collapse_single_binding_handoff(
 
     // 外层仍引用或 seed 前已有路径触碰的 temp 都不是当前 handoff 新建的身份。
     if outer_temps.contains(&temp) || temp_touches.touches_before(index, temp) {
+        return false;
+    }
+    if captured_binding(captured_locals, binding) {
         return false;
     }
     if label_jumps.next_label_has_prior_goto(&block.stmts, index) {
@@ -336,6 +317,10 @@ fn suffix_reads_binding(stmts: &[HirStmt], binding: CarryBinding) -> bool {
     let mut collector = BindingReadCollector::default();
     collector.collect_stmts(stmts);
     collector.reads.contains(&binding)
+}
+
+fn captured_binding(captured_locals: &BTreeSet<LocalId>, binding: CarryBinding) -> bool {
+    matches!(binding, CarryBinding::Local(local) if captured_locals.contains(&local))
 }
 
 fn suffix_contains_direct_writeback(
@@ -474,10 +459,6 @@ fn matches_direct_writeback_pair(
             (CarryBinding::Temp(binding), HirLValue::Temp(target)) => binding == *target,
             _ => false,
         }
-}
-
-fn suffix_mentions_local(stmts: &[HirStmt], local: LocalId) -> bool {
-    stmts_mention_local(stmts, local)
 }
 
 fn suffix_mentions_binding(stmts: &[HirStmt], binding: CarryBinding) -> bool {

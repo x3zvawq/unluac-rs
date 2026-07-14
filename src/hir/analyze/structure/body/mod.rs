@@ -75,12 +75,14 @@ pub(super) struct LoopStateSlot {
     pub(super) reg: Reg,
     pub(super) target: HirLValue,
     pub(super) init: HirExpr,
+    pub(super) initialize_target: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct LoopStatePlan {
     pub(super) states: Vec<LoopStateSlot>,
     pub(super) backedge_target_overrides: BTreeMap<TempId, HirLValue>,
+    pub(super) owned_phis: BTreeSet<PhiId>,
 }
 
 #[derive(Debug, Clone)]

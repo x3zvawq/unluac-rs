@@ -16,6 +16,8 @@
 //!   `continue_edges` owner，HIR 不再按 jump 形状猜测归属
 //! - 多条 break exit 若仅经 jump/close pad 汇入同一 continuation，该处 live-out phi
 //!   仍归 loop owner；带赋值或调用的 post-loop 路径不会被当成透明 pad
+//! - for binding 的提前退出域在多个物理 exit 的共同后继前结束，不会穿过
+//!   cleanup pad 把循环变量身份带到 post-loop
 //! - repeat body 的首个条件可能让 natural-loop 暂时呈现为 while；若该 header 的局部
 //!   break pad 严格汇入独立尾条件出口，则由 Structure 恢复真正的 repeat 形态
 //! - 普通内外循环可能共享 header；只有 successor 分区和真实 body/exit 都能证明层级
@@ -1256,7 +1258,7 @@ fn loop_binding_scope(
     graph_facts: &GraphFacts,
 ) -> BTreeSet<BlockRef> {
     let mut scope = body_blocks.clone();
-    let normal_exits = exits
+    let mut scope_boundaries = exits
         .iter()
         .copied()
         .filter(|exit| {
@@ -1266,6 +1268,9 @@ fn loop_binding_scope(
             })
         })
         .collect::<BTreeSet<_>>();
+    if let Some(shared_successor) = shared_unique_exit_successor(exits, cfg) {
+        scope_boundaries.insert(shared_successor);
+    }
 
     for &exit in exits {
         if exit == header || !graph_facts.dominator_tree.dominates(header, exit) {
@@ -1279,7 +1284,7 @@ fn loop_binding_scope(
             scope.extend(loop_binding_early_exit_scope(
                 exit,
                 header,
-                &normal_exits,
+                &scope_boundaries,
                 cfg,
                 graph_facts,
             ));
@@ -1288,10 +1293,21 @@ fn loop_binding_scope(
     scope
 }
 
+fn shared_unique_exit_successor(exits: &BTreeSet<BlockRef>, cfg: &Cfg) -> Option<BlockRef> {
+    if exits.len() < 2 {
+        return None;
+    }
+    let mut exits = exits.iter().copied();
+    let shared = cfg.unique_reachable_successor(exits.next()?)?;
+    exits
+        .all(|exit| cfg.unique_reachable_successor(exit) == Some(shared))
+        .then_some(shared)
+}
+
 fn loop_binding_early_exit_scope(
     exit: BlockRef,
     header: BlockRef,
-    normal_exits: &BTreeSet<BlockRef>,
+    scope_boundaries: &BTreeSet<BlockRef>,
     cfg: &Cfg,
     graph_facts: &GraphFacts,
 ) -> BTreeSet<BlockRef> {
@@ -1300,7 +1316,7 @@ fn loop_binding_early_exit_scope(
 
     while let Some(block) = stack.pop() {
         if block == cfg.exit_block
-            || normal_exits.contains(&block)
+            || scope_boundaries.contains(&block)
             || !graph_facts.dominator_tree.dominates(header, block)
             || !scope.insert(block)
         {
@@ -1309,7 +1325,7 @@ fn loop_binding_early_exit_scope(
 
         for edge_ref in &cfg.succs[block.index()] {
             let successor = cfg.edges[edge_ref.index()].to;
-            if !normal_exits.contains(&successor) {
+            if !scope_boundaries.contains(&successor) {
                 stack.push(successor);
             }
         }

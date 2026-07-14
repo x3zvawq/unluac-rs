@@ -19,6 +19,8 @@
 //! 这类函数入口机械别名，且后续不会观察到参数原值和 alias local 的差异，就直接把
 //! 后续读写改回参数身份。它不重新推断 phi 或 loop state，只处理 locals 自己稳定暴露的
 //! binding 形状。
+//! 不同 home slot 上的 move alias 是当时值的快照，不能与来源槽位后续的状态合并；
+//! 没有 home slot 的 phi temp 仍可沿同一状态链归并。
 //!
 mod branch_merge;
 mod param_alias;
@@ -314,7 +316,6 @@ fn collect_plans(
     let mut reserved_alias_indices = BTreeSet::new();
     let mut slot_candidates = inherited_sticky_slots.clone();
     let mut sticky_slots = inherited_sticky_slots.clone();
-
     for (decl_index, stmt) in block.stmts.iter().enumerate() {
         if reserved_alias_indices.contains(&decl_index) {
             activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
@@ -353,7 +354,6 @@ fn collect_plans(
         let mut group = BTreeSet::from([root_temp]);
         let mut removable_aliases = BTreeSet::new();
         let mut has_future_touch = false;
-
         for future_index in decl_index + 1..block.stmts.len() {
             if removable_aliases.contains(&future_index) {
                 continue;
@@ -363,6 +363,10 @@ fn collect_plans(
             if let Some(alias_temp) = alias_temp_for_group(future_stmt, &group)
                 && !reserved_temps.contains(&alias_temp)
                 && !group.contains(&alias_temp)
+                && facts
+                    .home_slot(root_temp)
+                    .zip(facts.home_slot(alias_temp))
+                    .is_none_or(|(root, alias)| root == alias)
                 && !temp_touches.touches_in_range(decl_index + 1, future_index, alias_temp)
             {
                 group.insert(alias_temp);

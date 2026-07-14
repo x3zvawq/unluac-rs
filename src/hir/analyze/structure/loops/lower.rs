@@ -438,12 +438,20 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                         None => short.header != candidate.header,
                     }
             })
-            .filter_map(|short| build_branch_short_circuit_plan(self.lowering, short.header))
-            .find(|plan| {
-                plan.consumed_headers.len() > 1
+            .filter_map(|short| {
+                let mut plan = build_branch_short_circuit_plan(self.lowering, short.header)?;
+                let body_stop = plan.consumed_headers.first().copied()?;
+                (plan.consumed_headers.len() > 1
                     && ((plan.truthy == loop_backedge_target && plan.falsy == exit)
                         || (plan.falsy == loop_backedge_target && plan.truthy == exit))
-            });
+                    && self.rewrite_short_circuit_skipped_header_prefixes(
+                        body_stop,
+                        &plan.consumed_headers,
+                        &mut plan.cond,
+                    ))
+                .then_some(plan)
+            })
+            .next();
         let body_stop = repeat_condition
             .as_ref()
             .and_then(|plan| plan.consumed_headers.first().copied())
@@ -481,13 +489,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             )?
             .stmts;
         let cond = if let Some(mut condition) = repeat_condition {
-            if !self.rewrite_short_circuit_skipped_header_prefixes(
-                body_stop,
-                &condition.consumed_headers,
-                &mut condition.cond,
-            ) {
-                return None;
-            }
             for header in &condition.consumed_headers {
                 if let Some(entry_expr_overrides) = self.block_entry_expr_overrides(*header) {
                     rewrite_expr_temps(&mut condition.cond, entry_expr_overrides);
@@ -576,13 +577,20 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .numeric_for_locals
             .get(&header)
             .copied()?;
-        let plan = self.build_loop_state_plan(
+        let mut plan = self.build_loop_state_plan(
             candidate,
             Some(block),
             exit,
             &[init.index],
             target_overrides,
         )?;
+        for state in &mut plan.states {
+            if state.reg == init.binding {
+                // numeric-for 语法本身在每轮初始化 binding；这里只保留
+                // state owner 用于嵌套 loop 写回，不在 for 之前再生成赋值。
+                state.initialize_target = false;
+            }
+        }
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
         let mut suppressed = plan
@@ -725,6 +733,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.visited.insert(block);
         stmts.extend(self.lower_block_prefix(block, false, target_overrides)?);
         stmts.extend(loop_state_init_stmts(&plan));
+        for phi_id in &plan.owned_phis {
+            self.overrides.suppress_phi(*phi_id);
+        }
 
         let mut loop_context = self.build_active_loop_context(
             candidate,
@@ -748,6 +759,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             self.lower_region(body_entry, Some(header), &combined_target_overrides)?
         };
         self.active_loops.pop();
+        for phi_id in &plan.owned_phis {
+            self.overrides.unsuppress_phi(*phi_id);
+        }
         self.visited.insert(header);
         self.visited.extend(
             loop_context

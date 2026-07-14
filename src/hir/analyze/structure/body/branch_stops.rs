@@ -218,7 +218,7 @@ impl StructuredBodyLowerer<'_, '_> {
                 }
             }
         }
-        let nested_loop_interiors = self
+        let nested_loop_owned_blocks = self
             .lowering
             .structure
             .loop_candidates
@@ -230,11 +230,10 @@ impl StructuredBodyLowerer<'_, '_> {
                         .is_subset(&active_candidate.binding_scope_blocks)
             })
             .flat_map(|nested| {
-                nested
-                    .blocks
-                    .iter()
-                    .copied()
-                    .filter(|block| *block != nested.header && Some(*block) != nested.preheader)
+                nested.blocks.iter().copied().filter(|block| {
+                    else_entry.is_none()
+                        || (*block != nested.header && Some(*block) != nested.preheader)
+                })
             })
             .collect::<BTreeSet<_>>();
         let stop_predecessor_has_continue_owner = |from: BlockRef| {
@@ -268,7 +267,7 @@ impl StructuredBodyLowerer<'_, '_> {
             && region.merge != then_entry
             && region.merge != stop
             && !consumed_blocks.contains(&region.merge)
-            && !nested_loop_interiors.contains(&region.merge)
+            && !nested_loop_owned_blocks.contains(&region.merge)
             && (self.lowering.cfg.unique_reachable_successor(region.merge) == Some(stop)
                 || self.branch_arm_reaches_loop_continuation_or_escape(
                     region.merge,
@@ -297,7 +296,7 @@ impl StructuredBodyLowerer<'_, '_> {
             .filter(|candidate| !consumed_blocks.contains(candidate))
             .filter(|candidate| *candidate != stop)
             .filter(|candidate| *candidate != then_entry && Some(*candidate) != else_entry)
-            .filter(|candidate| !nested_loop_interiors.contains(candidate))
+            .filter(|candidate| !nested_loop_owned_blocks.contains(candidate))
             .filter(|candidate| {
                 self.lowering.cfg.unique_reachable_successor(*candidate) == Some(stop)
                     || self.branch_arm_reaches_loop_continuation_or_escape(

@@ -423,6 +423,24 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         {
             return Some(merge);
         }
+        if plan.else_entry.is_none()
+            && self.branch_by_header.get(&merge).is_some_and(|candidate| {
+                candidate.else_entry.is_none()
+                    && candidate.then_entry == stop
+                    && candidate.merge.is_some_and(|break_exit| {
+                        self.block_is_terminal_exit(break_exit)
+                            || self.active_loops.last().is_some_and(|loop_context| {
+                                break_exit == loop_context.post_loop
+                                    || Some(break_exit) == loop_context.downstream_post_loop
+                            })
+                    })
+            })
+            && self.branch_arm_reaches_stop_or_loop_escape(merge, stop, stop)
+        {
+            // 多后继 merge 若是“正常臂到 stop、另一臂 break”的结构 header，
+            // 必须作为隐式 else 完整降低，不能跳过后续 break owner。
+            return Some(merge);
+        }
         self.lowering
             .cfg
             .unique_reachable_successor(merge)
@@ -623,6 +641,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return false;
         }
         self.branch_arm_reaches_shared_continuation_or_terminate(entry, shared, boundary)
+            || self.branch_by_header.get(&entry).is_some_and(|candidate| {
+                candidate.else_entry.is_none()
+                    && candidate.then_entry == shared
+                    && candidate.merge == Some(boundary)
+                    && self.block_is_active_loop_escape(boundary)
+            })
             || (self.active_loops.last().is_some_and(|loop_context| {
                 loop_context.continue_target == Some(boundary)
                     || (self.block_is_active_loop_escape(boundary)

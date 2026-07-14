@@ -4,6 +4,8 @@
 //! temp”。这些问题属于只读树遍历，不应散落在各个 pass 里各写一套 visitor。
 //! 本模块只提供语法树提及事实，不判断 carried-local、branch-value 等业务形状。
 
+use std::collections::BTreeSet;
+
 use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirStmt, LocalId, TempId};
 
 use super::visit::{HirVisitor, visit_block, visit_expr, visit_stmts};
@@ -22,6 +24,12 @@ pub(super) fn expr_mentions_local(expr: &HirExpr, local: LocalId) -> bool {
 
 pub(super) fn stmt_captures_local(stmt: &HirStmt, local: LocalId) -> bool {
     LocalCaptureCollector::captures_in_stmt(stmt, local)
+}
+
+pub(super) fn stmts_captured_locals(stmts: &[HirStmt]) -> BTreeSet<LocalId> {
+    let mut collector = CapturedLocalSetCollector::default();
+    visit_stmts(stmts, &mut collector);
+    collector.locals
 }
 
 pub(super) fn stmts_mention_temp(stmts: &[HirStmt], temp: TempId) -> bool {
@@ -99,6 +107,37 @@ impl HirVisitor for LocalCaptureCollector {
                 .captures
                 .iter()
                 .any(|capture| expr_mentions_local(&capture.value, self.local));
+        }
+    }
+}
+
+#[derive(Default)]
+struct CapturedLocalSetCollector {
+    locals: BTreeSet<LocalId>,
+}
+
+impl HirVisitor for CapturedLocalSetCollector {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        let HirExpr::Closure(closure) = expr else {
+            return;
+        };
+        for capture in &closure.captures {
+            let mut collector = LocalRefSetCollector {
+                locals: &mut self.locals,
+            };
+            visit_expr(&capture.value, &mut collector);
+        }
+    }
+}
+
+struct LocalRefSetCollector<'a> {
+    locals: &'a mut BTreeSet<LocalId>,
+}
+
+impl HirVisitor for LocalRefSetCollector<'_> {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        if let HirExpr::LocalRef(local) = expr {
+            self.locals.insert(*local);
         }
     }
 }

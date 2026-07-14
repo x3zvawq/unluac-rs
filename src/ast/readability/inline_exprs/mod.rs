@@ -9,6 +9,7 @@
 //! - 相邻 recovered local run 里，只有末尾 local 仍会跨语句存活的机械链
 
 mod candidate;
+mod eval_order;
 mod use_sites;
 
 use crate::ast::ReadabilityOptions;
@@ -488,7 +489,9 @@ fn collapse_adjacent_call_alias_runs(block: &mut AstBlock, options: ReadabilityO
         // 这里只折叠真正的“局部别名包”：
         // 至少一次收回两层相邻别名，才能证明我们是在还原机械展开的调用准备序列，
         // 而不是把源码里本来就有阶段语义的 local（例如 stage1 / stage2）继续吞掉。
-        if collapsed_count >= 2 {
+        if collapsed_count >= 2
+            && eval_order::run_preserves_eval_order(&old_stmts, index, run_end, &removed)
+        {
             changed = true;
             push_collapsed_run(
                 &mut new_stmts,
@@ -611,7 +614,9 @@ fn collapse_terminal_call_result_alias_runs(
         // 这里专门处理“调用准备 run 的终点自己还是一个 local/assign”：
         // `local f = obj.m; local x = f(arg)`、`local a = t[i]; local v = call(a, ...)`
         // 这类形状和最终 `call_stmt(...)` 属于同一 owner，只是 sink 还保留在结果声明里。
-        if collapsed_count >= 2 {
+        if collapsed_count >= 2
+            && eval_order::run_preserves_eval_order(&old_stmts, index, sink_index, &removed)
+        {
             changed = true;
             push_collapsed_run(
                 &mut new_stmts,
@@ -747,6 +752,7 @@ fn collapse_adjacent_mechanical_alias_runs(
                 || stmt_prefers_pure_lookup_run_collapse(&rewritten_sink)
                 || (has_dependent_lookup_piece
                     && stmt_prefers_dependent_lookup_run_collapse(&rewritten_sink)))
+            && eval_order::run_preserves_eval_order(&old_stmts, index, run_end, &removed)
         {
             changed = true;
             push_collapsed_run(
@@ -853,7 +859,9 @@ fn collapse_terminal_local_mechanical_runs(
             }
         }
 
-        if collapsed_count >= 2 {
+        if collapsed_count >= 2
+            && eval_order::run_preserves_eval_order(&old_stmts, index, run_end - 1, &removed)
+        {
             changed = true;
             push_collapsed_run(
                 &mut new_stmts,

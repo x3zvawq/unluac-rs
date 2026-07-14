@@ -93,6 +93,36 @@ impl StructuredBodyLowerer<'_, '_> {
             return Some(None);
         }
 
+        if let Some(candidate) = self.branch_by_header.get(&header).copied()
+            && candidate.else_entry.is_none()
+            && let Some(merge) = candidate.merge
+            && (truthy == merge || falsy == merge)
+            && let Some(then_entry) = (truthy == merge)
+                .then_some(falsy)
+                .or_else(|| (falsy == merge).then_some(truthy))
+            && self.short_circuit_preserves_plain_if_then_merge(
+                header,
+                then_entry,
+                merge,
+                stop,
+                &consumed_headers,
+            )
+        {
+            if truthy == merge {
+                cond = cond.negate();
+            }
+            let consumed_blocks =
+                self.branch_short_circuit_consumed_blocks(&consumed_headers, truthy, falsy, stop);
+            return Some(Some(StructuredBranchPlan {
+                cond,
+                then_entry,
+                else_entry: None,
+                merge: Some(merge),
+                consumed_headers,
+                consumed_blocks,
+            }));
+        }
+
         let current_continue_break_merge = self.short_circuit_continue_break_merge(truthy, falsy);
         if continue_break_merge.is_some() || current_continue_break_merge.is_some() {
             let merge = current_continue_break_merge?;
@@ -252,6 +282,34 @@ impl StructuredBodyLowerer<'_, '_> {
             consumed_headers,
             consumed_blocks,
         }))
+    }
+
+    fn short_circuit_preserves_plain_if_then_merge(
+        &self,
+        header: BlockRef,
+        then_entry: BlockRef,
+        merge: BlockRef,
+        stop: Option<BlockRef>,
+        consumed_headers: &[BlockRef],
+    ) -> bool {
+        let Some(loop_context) = self.active_loops.last() else {
+            return false;
+        };
+        let Some(continue_target) = loop_context.continue_target else {
+            return false;
+        };
+        let tail_keeps_merge = consumed_headers
+            .last()
+            .and_then(|header| self.branch_by_header.get(header))
+            .is_some_and(|candidate| {
+                candidate.else_entry.is_none() && candidate.merge == Some(merge)
+            });
+        (continue_target == then_entry && self.block_prefix_has_non_condition_effects(then_entry))
+            || (tail_keeps_merge
+                && stop == Some(continue_target)
+                && then_entry != continue_target
+                && self.can_reach_avoiding_block(then_entry, merge, continue_target)
+                && self.can_reach_avoiding_block(merge, continue_target, header))
     }
 
     fn branch_short_circuit_consumed_blocks(

@@ -8,12 +8,14 @@
 //! - `if cond then ... end` 会产出 `BranchKind::IfThen`
 //! - `if cond then ... else ... end` 会产出 `BranchKind::IfElse`
 //! - `if not cond then return end; ...` 这种守卫形状会被标成 `BranchKind::Guard`
+//! - loop 内嵌套 early return 把严格后支配点推到 synthetic exit 时，单臂归属
+//!   仍由截断本轮回边的可达性证明，不直接猜 if/else
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::structure::{BlockRef, Cfg, DominatorTree, GraphFacts};
 
-use super::common::{BranchCandidate, BranchKind, BranchRegionFact, LoopCandidate};
+use super::common::{BranchCandidate, BranchKind, BranchRegionFact, LoopCandidate, LoopKindHint};
 use super::helpers::{collect_forward_region_blocks, collect_merge_arm_preds};
 
 pub(super) fn analyze_branches(
@@ -41,6 +43,19 @@ pub(super) fn analyze_branches(
                 then_entry,
                 else_entry,
             )
+            .or_else(|| {
+                classify_postdom_one_arm_branch(graph_facts, header, then_entry, else_entry)
+            })
+            .or_else(|| {
+                classify_numeric_for_exit_branch(
+                    cfg,
+                    graph_facts,
+                    loop_candidates,
+                    header,
+                    then_entry,
+                    else_entry,
+                )
+            })
             .or_else(|| classify_one_arm_branch(&mut reachability, header, then_entry, else_entry))
             .or_else(|| {
                 classify_loop_exit_bounded_one_arm_branch(
@@ -74,6 +89,7 @@ pub(super) fn analyze_branches(
 pub(super) fn analyze_branch_regions(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
+    loop_candidates: &[LoopCandidate],
     branch_candidates: &[BranchCandidate],
 ) -> Vec<BranchRegionFact> {
     let mut branch_regions = Vec::new();
@@ -81,6 +97,36 @@ pub(super) fn analyze_branch_regions(
     for candidate in branch_candidates {
         let Some(merge) = candidate.merge else {
             continue;
+        };
+        let disambiguate_overlap = candidate.else_entry.is_some_and(|else_entry| {
+            graph_facts
+                .nearest_common_postdom(candidate.then_entry, else_entry)
+                .is_some_and(|strict_merge| {
+                    strict_merge != merge
+                        && numeric_for_exit_owner(
+                            loop_candidates,
+                            candidate.header,
+                            candidate.then_entry,
+                            else_entry,
+                            strict_merge,
+                        )
+                        .is_some_and(|owner| {
+                            owner.header == candidate.header
+                                && owner.blocks.contains(&candidate.then_entry)
+                                && owner.blocks.contains(&else_entry)
+                        })
+                })
+        });
+        let (then_merge_preds, else_merge_preds) = if disambiguate_overlap {
+            collect_branch_merge_preds(cfg, graph_facts, candidate, merge)
+        } else {
+            (
+                collect_merge_arm_preds(cfg, candidate.then_entry, merge),
+                candidate
+                    .else_entry
+                    .map(|else_entry| collect_merge_arm_preds(cfg, else_entry, merge))
+                    .unwrap_or_default(),
+            )
         };
 
         branch_regions.push(BranchRegionFact {
@@ -94,16 +140,41 @@ pub(super) fn analyze_branch_regions(
                 merge,
                 Some(&graph_facts.dominator_tree),
             ),
-            then_merge_preds: collect_merge_arm_preds(cfg, candidate.then_entry, merge),
-            else_merge_preds: candidate
-                .else_entry
-                .map(|else_entry| collect_merge_arm_preds(cfg, else_entry, merge))
-                .unwrap_or_default(),
+            then_merge_preds,
+            else_merge_preds,
         });
     }
 
     branch_regions.sort_by_key(|fact| (fact.header, fact.merge));
     branch_regions
+}
+
+fn collect_branch_merge_preds(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    candidate: &BranchCandidate,
+    merge: BlockRef,
+) -> (BTreeSet<BlockRef>, BTreeSet<BlockRef>) {
+    let mut then_preds = collect_merge_arm_preds(cfg, candidate.then_entry, merge);
+    let Some(else_entry) = candidate.else_entry else {
+        return (then_preds, BTreeSet::new());
+    };
+    let mut else_preds = collect_merge_arm_preds(cfg, else_entry, merge);
+    let overlap = then_preds
+        .intersection(&else_preds)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    then_preds.retain(|pred| {
+        !overlap.contains(pred)
+            || !graph_facts.dominates(else_entry, *pred)
+            || graph_facts.dominates(candidate.then_entry, *pred)
+    });
+    else_preds.retain(|pred| {
+        !overlap.contains(pred)
+            || !graph_facts.dominates(candidate.then_entry, *pred)
+            || graph_facts.dominates(else_entry, *pred)
+    });
+    (then_preds, else_preds)
 }
 
 fn collect_branch_region_blocks(
@@ -125,7 +196,7 @@ fn collect_branch_region_blocks(
 
 struct ReachabilityCache<'a> {
     cfg: &'a Cfg,
-    memo: BTreeMap<BlockRef, BTreeSet<BlockRef>>,
+    memo: BTreeMap<(BlockRef, BlockRef), bool>,
     loop_bounded_memo: BTreeMap<BlockRef, BTreeSet<BlockRef>>,
     loops_by_header: BTreeMap<BlockRef, Vec<&'a LoopCandidate>>,
 }
@@ -148,13 +219,10 @@ impl<'a> ReachabilityCache<'a> {
     }
 
     fn can_reach(&mut self, from: BlockRef, to: BlockRef) -> bool {
-        self.memo
-            .entry(from)
-            .or_insert_with(|| {
-                self.cfg
-                    .reachable_targets_within(from, &self.cfg.reachable_blocks)
-            })
-            .contains(&to)
+        *self
+            .memo
+            .entry((from, to))
+            .or_insert_with(|| self.cfg.can_reach(from, to))
     }
 
     fn can_reach_without_entering_loop_header(&mut self, from: BlockRef, to: BlockRef) -> bool {
@@ -231,6 +299,22 @@ fn classify_one_arm_branch(
     let then_reaches_else = reachability.can_reach(then_entry, else_entry);
     let else_reaches_then = reachability.can_reach(else_entry, then_entry);
 
+    one_arm_candidate(
+        header,
+        then_entry,
+        else_entry,
+        then_reaches_else,
+        else_reaches_then,
+    )
+}
+
+fn one_arm_candidate(
+    header: BlockRef,
+    then_entry: BlockRef,
+    else_entry: BlockRef,
+    then_reaches_else: bool,
+    else_reaches_then: bool,
+) -> Option<BranchCandidate> {
     match (then_reaches_else, else_reaches_then) {
         (true, false) => Some(BranchCandidate {
             header,
@@ -250,6 +334,24 @@ fn classify_one_arm_branch(
         }),
         _ => None,
     }
+}
+
+fn classify_postdom_one_arm_branch(
+    graph_facts: &GraphFacts,
+    header: BlockRef,
+    then_entry: BlockRef,
+    else_entry: BlockRef,
+) -> Option<BranchCandidate> {
+    let then_reaches_else = graph_facts.post_dominates(else_entry, then_entry);
+    let else_reaches_then = graph_facts.post_dominates(then_entry, else_entry);
+
+    one_arm_candidate(
+        header,
+        then_entry,
+        else_entry,
+        then_reaches_else,
+        else_reaches_then,
+    )
 }
 
 fn classify_infinite_loop_bounded_branch(
@@ -360,11 +462,88 @@ fn classify_loop_exit_bounded_one_arm_branch(
             candidate.blocks.contains(&header)
                 && candidate.blocks.contains(&then_entry)
                 && candidate.blocks.contains(&else_entry)
-                && candidate.exits.contains(&strict_merge)
+                && (candidate.exits.contains(&strict_merge) || strict_merge == cfg.exit_block)
         })
         .then(|| {
             classify_loop_bounded_one_arm_branch(reachability, header, then_entry, else_entry)
         })?
+}
+
+fn classify_numeric_for_exit_branch(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    loop_candidates: &[LoopCandidate],
+    header: BlockRef,
+    then_entry: BlockRef,
+    else_entry: BlockRef,
+) -> Option<BranchCandidate> {
+    let strict_merge = graph_facts.nearest_common_postdom(then_entry, else_entry)?;
+    let owner = numeric_for_exit_owner(
+        loop_candidates,
+        header,
+        then_entry,
+        else_entry,
+        strict_merge,
+    )?;
+
+    match (
+        cfg.unique_reachable_successor(then_entry) == Some(strict_merge),
+        cfg.unique_reachable_successor(else_entry) == Some(strict_merge),
+    ) {
+        (true, false) => Some(BranchCandidate {
+            header,
+            then_entry,
+            else_entry: None,
+            merge: Some(else_entry),
+            kind: BranchKind::Guard,
+            invert_hint: false,
+        }),
+        (false, true) => Some(BranchCandidate {
+            header,
+            then_entry: else_entry,
+            else_entry: None,
+            merge: Some(then_entry),
+            kind: BranchKind::Guard,
+            invert_hint: true,
+        }),
+        _ if owner.header == header
+            && owner.blocks.contains(&then_entry)
+            && owner.blocks.contains(&else_entry) =>
+        {
+            let merge = find_soft_merge(cfg, graph_facts, header, then_entry, else_entry)?;
+            owner
+                .binding_scope_blocks
+                .contains(&merge)
+                .then_some(BranchCandidate {
+                    header,
+                    then_entry,
+                    else_entry: Some(else_entry),
+                    merge: Some(merge),
+                    kind: BranchKind::IfElse,
+                    invert_hint: false,
+                })
+        }
+        _ => None,
+    }
+}
+
+fn numeric_for_exit_owner(
+    loop_candidates: &[LoopCandidate],
+    header: BlockRef,
+    then_entry: BlockRef,
+    else_entry: BlockRef,
+    exit: BlockRef,
+) -> Option<&LoopCandidate> {
+    loop_candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.kind_hint == LoopKindHint::NumericForLike
+                && candidate.binding_scope_blocks.contains(&header)
+                && candidate.binding_scope_blocks.contains(&then_entry)
+                && candidate.binding_scope_blocks.contains(&else_entry)
+                && candidate.exits.contains(&exit)
+        })
+        .min_by_key(|candidate| candidate.binding_scope_blocks.len())
 }
 
 fn classify_loop_bounded_one_arm_branch(

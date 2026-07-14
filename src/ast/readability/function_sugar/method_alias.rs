@@ -1,12 +1,12 @@
 //! 收回 method-call 的局部别名脚手架。
 //!
 //! 这个 pass 只处理 AST build 明确留下来的机械壳：
-//! - `local f = obj.method; f(obj, 1)` -> `obj:method(1)`
 //! - `local r = expr; local f = r.method; local x = f(r)` -> `local x = expr:method()`
-//! - `local f = obj.method; local x = wrap(f(obj))` -> `local x = wrap(obj:method())`
-//! - `local sign = obj.method(obj, 1) and "a" or "b"` -> `local sign = obj:method(1) and "a" or "b"`
+//! - `local r = expr; local f = r.method; local x = wrap(f(r))` -> `local x = wrap(expr:method())`
+//! - `local r = expr; local x = r.method(r)` -> `local x = expr:method()`
 //!
-//! 它不会去猜更模糊的任意等价调用，也不会越权给 AST build 没表达清楚的 call 形状兜底。
+//! 普通 `obj.method(obj)` 不足以证明 method call：字段查询可能通过 `__index` 改写
+//! `obj`，而冒号调用只会求值一次 receiver。没有独立 receiver 快照的形状必须保留。
 
 use super::super::binding_flow::BindingUseIndex;
 use super::super::binding_ref::name_matches_binding;
@@ -24,8 +24,6 @@ pub(super) fn try_recover_method_alias_stmt(
 ) -> Option<(AstStmt, usize)> {
     try_recover_with_receiver_alias(stmts, use_index, stmt_base)
         .or_else(|| try_recover_receiver_alias_direct_method_call(stmts, use_index, stmt_base))
-        .or_else(|| try_recover_direct_receiver(stmts, use_index, stmt_base))
-        .or_else(|| try_recover_direct_method_call_stmt(stmts))
 }
 
 pub(in crate::ast::readability) fn run_belongs_to_method_alias_owner(
@@ -42,10 +40,7 @@ pub(in crate::ast::readability) fn run_belongs_to_method_alias_owner(
     }
     let run = &stmts[index..];
     match sink_index.checked_sub(index) {
-        Some(1) => {
-            try_recover_direct_receiver(run, use_index, index).is_some()
-                || try_recover_receiver_alias_direct_method_call(run, use_index, index).is_some()
-        }
+        Some(1) => try_recover_receiver_alias_direct_method_call(run, use_index, index).is_some(),
         Some(2) => try_recover_with_receiver_alias(run, use_index, index).is_some(),
         _ => false,
     }
@@ -82,34 +77,6 @@ fn try_recover_with_receiver_alias(
             |arg| matches!(arg, AstExpr::Var(name) if name_matches_binding(name, receiver_binding)),
         )?,
         3,
-    ))
-}
-
-fn try_recover_direct_receiver(
-    stmts: &[AstStmt],
-    use_index: &BindingUseIndex,
-    stmt_base: usize,
-) -> Option<(AstStmt, usize)> {
-    let [field_alias, sink, ..] = stmts else {
-        return None;
-    };
-    let (field_binding, field_access) = single_field_alias_decl(field_alias)?;
-    let AstExpr::Var(receiver_name) = &field_access.base else {
-        return None;
-    };
-    if use_index.count_uses_in_suffix(stmt_base + 1, field_binding) != 1 {
-        return None;
-    }
-
-    Some((
-        recover_method_call_sink(
-            sink,
-            field_binding,
-            field_access.field.clone(),
-            field_access.base.clone(),
-            |arg| matches!(arg, AstExpr::Var(name) if name == receiver_name),
-        )?,
-        2,
     ))
 }
 
@@ -259,21 +226,6 @@ fn recover_method_call(
         method,
         args: args.to_vec(),
     })
-}
-
-fn try_recover_direct_method_call_stmt(stmts: &[AstStmt]) -> Option<(AstStmt, usize)> {
-    let [stmt, ..] = stmts else {
-        return None;
-    };
-    Some((rewrite_direct_method_call_stmt(stmt)?, 1))
-}
-
-fn rewrite_direct_method_call_stmt(stmt: &AstStmt) -> Option<AstStmt> {
-    rewrite_single_expr_sink_stmt(stmt, rewrite_direct_method_call_expr_nested)
-}
-
-fn rewrite_direct_method_call_expr_nested(expr: &AstExpr) -> Option<AstExpr> {
-    rewrite_method_call_expr_nested(expr, recover_direct_method_call_expr)
 }
 
 fn rewrite_method_call_expr_nested<F>(expr: &AstExpr, try_rewrite_here: F) -> Option<AstExpr>
@@ -431,33 +383,6 @@ where
             )
         }
     }
-}
-
-fn recover_direct_method_call_expr(expr: &AstExpr) -> Option<AstExpr> {
-    let AstExpr::Call(call) = expr else {
-        return None;
-    };
-    let AstExpr::FieldAccess(access) = &call.callee else {
-        return None;
-    };
-    let AstExpr::Var(receiver_name) = &access.base else {
-        return None;
-    };
-    let [receiver_arg, args @ ..] = call.args.as_slice() else {
-        return None;
-    };
-    let AstExpr::Var(receiver_arg_name) = receiver_arg else {
-        return None;
-    };
-    if receiver_arg_name != receiver_name {
-        return None;
-    }
-
-    Some(AstExpr::MethodCall(Box::new(AstMethodCallExpr {
-        receiver: access.base.clone(),
-        method: access.field.clone(),
-        args: args.to_vec(),
-    })))
 }
 
 fn recover_direct_method_call_with_receiver_alias_expr(

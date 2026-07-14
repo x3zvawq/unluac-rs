@@ -109,6 +109,14 @@ const ALL_NON_LUAU_DIALECTS: &[LuaCaseDialect] = &[
     LuaCaseDialect::Lua55,
     LuaCaseDialect::Luajit,
 ];
+const MUTABLE_NUMERIC_FOR_BINDING_DIALECTS: &[LuaCaseDialect] = &[
+    LuaCaseDialect::Lua51,
+    LuaCaseDialect::Lua52,
+    LuaCaseDialect::Lua53,
+    LuaCaseDialect::Lua54,
+    LuaCaseDialect::Luajit,
+    LuaCaseDialect::Luau,
+];
 const PUC_LUA_51: &[LuaCaseDialect] = &[LuaCaseDialect::Lua51];
 const PUC_LUA_GE_52: &[LuaCaseDialect] = &[
     LuaCaseDialect::Lua52,
@@ -803,6 +811,74 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_143_loop_parameter_entry_value.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_144_loop_header_eval_order.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_145_loop_header_snapshot.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_146_direct_method_receiver_eval_count.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_147_inline_call_alias_eval_order.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_148_luau_repeat_recompile_state_owner.lua",
+        LUAU_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_149_lua51_single_arm_nested_generic_for.lua",
+        PUC_LUA_51,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_150_luau_numeric_for_branch_owner.lua",
+        LUAU_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_151_luau_nested_repeat_short_circuit_merge.lua",
+        LUAU_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_152_luau_while_continue_break_tail.lua",
+        LUAU_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_153_lua55_generic_for_close_break_pad.lua",
+        PUC_LUA_GE_55,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_154_lua55_generic_for_binding_scope.lua",
+        PUC_LUA_GE_55,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_155_outer_for_binding_inner_loops.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_156_numeric_for_binding_inner_loop.lua",
+        MUTABLE_NUMERIC_FOR_BINDING_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_157_repeat_nested_break_return.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_158_luau_short_circuit_break_shared_tail.lua",
+        LUAU_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_159_cross_slot_snapshot_loop_state.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_160_captured_slot_receiver_eval.lua",
         ALL_DIALECTS,
     ),
 ];

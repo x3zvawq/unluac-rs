@@ -86,13 +86,23 @@ impl StructuredBodyLowerer<'_, '_> {
     }
 
     pub(super) fn normalized_post_loop_successor(&self, post_loop: BlockRef) -> Option<BlockRef> {
-        let (_instr_ref, instr) = self.block_terminator(post_loop)?;
-        let LowInstr::Jump(jump) = instr else {
+        if !self
+            .lower_block_prefix(post_loop, false, &BTreeMap::new())?
+            .is_empty()
+        {
             return None;
-        };
-        let target = self.lowering.cfg.instr_to_block[jump.target.index()];
-        self.lower_block_prefix(post_loop, false, &BTreeMap::new())?;
-        Some(target)
+        }
+
+        match self.block_terminator(post_loop) {
+            Some((_instr_ref, LowInstr::Jump(jump))) => {
+                Some(self.lowering.cfg.instr_to_block[jump.target.index()])
+            }
+            Some((_instr_ref, instr)) if !is_control_terminator(instr) => {
+                self.lowering.cfg.unique_reachable_successor(post_loop)
+            }
+            None => self.lowering.cfg.unique_reachable_successor(post_loop),
+            Some(_) => None,
+        }
     }
 
     pub(super) fn loop_state_inside_exit_blocks(

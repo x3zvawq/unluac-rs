@@ -76,6 +76,13 @@ impl BoundSlotTarget {
 }
 
 impl ProtoBindings {
+    pub(super) fn local_for_reg_in_block(&self, block: BlockRef, reg: Reg) -> Option<LocalId> {
+        self.block_local_regs
+            .get(&block)
+            .and_then(|locals| locals.get(&reg))
+            .copied()
+    }
+
     pub(super) fn expr_for_temp(&self, temp: TempId) -> HirExpr {
         self.captured_temp_targets
             .get(&temp)
