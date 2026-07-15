@@ -24,28 +24,18 @@ impl StructuredBodyLowerer<'_, '_> {
         for exit in candidate.exits.iter().copied().filter(|exit| {
             *exit != post_loop && !self.loop_exit_enters_nested_loop(candidate_id, candidate, *exit)
         }) {
-            if block_is_terminal_exit(self.lowering, exit) {
-                continue;
-            }
-            if self.loop_exit_region_is_terminal(candidate, exit, post_loop, downstream_post_loop) {
-                continue;
-            }
-            // 有些 loop 的“直接退出块”只是一个线性 pad，真正的 post-loop continuation
-            // 在这个 pad 后面。对这种形状，pad 的下游不应该再被当成额外的 break exit，
-            // 否则 repeat/for 会被误判成“多出口 break loop”，整片结构都会回退。
-            if downstream_post_loop == Some(exit) {
-                continue;
-            }
-            break_exits.insert(
+            let Some(break_exit) = self.lower_loop_break_exit(
+                candidate,
                 exit,
-                self.lower_break_exit_pad(
-                    exit,
-                    post_loop,
-                    downstream_post_loop,
-                    target_overrides,
-                    states,
-                )?,
-            );
+                post_loop,
+                downstream_post_loop,
+                target_overrides,
+                states,
+            )?
+            else {
+                continue;
+            };
+            break_exits.insert(exit, break_exit);
         }
         let continue_target = candidate.continue_target;
         let mut continue_sources = if self.can_emit_continue_stmt() {
@@ -64,11 +54,12 @@ impl StructuredBodyLowerer<'_, '_> {
                     .goto_requirements
                     .iter()
                     .filter(|requirement| {
+                        let edge = self.lowering.cfg.edges[requirement.edge.index()];
                         requirement.reason == crate::structure::GotoReason::UnstructuredContinueLike
-                            && requirement.to == target
-                            && candidate.blocks.contains(&requirement.from)
+                            && edge.to == target
+                            && candidate.blocks.contains(&edge.from)
                     })
-                    .map(|requirement| requirement.from),
+                    .map(|requirement| self.lowering.cfg.edges[requirement.edge.index()].from),
             );
         }
 
@@ -118,25 +109,52 @@ impl StructuredBodyLowerer<'_, '_> {
         for exit in candidate.exits.iter().copied().filter(|exit| {
             *exit != post_loop && !self.loop_exit_enters_nested_loop(candidate_id, candidate, *exit)
         }) {
-            if block_is_terminal_exit(self.lowering, exit) {
-                continue;
+            if self
+                .lower_loop_break_exit(
+                    candidate,
+                    exit,
+                    post_loop,
+                    downstream_post_loop,
+                    &BTreeMap::new(),
+                    &[],
+                )?
+                .is_some()
+            {
+                inside_blocks.insert(exit);
             }
-            if self.loop_exit_region_is_terminal(candidate, exit, post_loop, downstream_post_loop) {
-                continue;
-            }
-            if downstream_post_loop == Some(exit) {
-                continue;
-            }
-            self.lower_break_exit_pad(
-                exit,
-                post_loop,
-                downstream_post_loop,
-                &BTreeMap::new(),
-                &[],
-            )?;
-            inside_blocks.insert(exit);
         }
         Some(inside_blocks)
+    }
+
+    fn lower_loop_break_exit(
+        &self,
+        candidate: &LoopCandidate,
+        exit: BlockRef,
+        post_loop: BlockRef,
+        downstream_post_loop: Option<BlockRef>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+        states: &[LoopStateSlot],
+    ) -> Option<Option<BreakExitBlock>> {
+        if block_is_terminal_exit(self.lowering, exit)
+            || self.loop_exit_region_is_terminal(candidate, exit, post_loop, downstream_post_loop)
+            || downstream_post_loop == Some(exit)
+        {
+            return Some(None);
+        }
+
+        match self.lower_break_exit_pad(
+            exit,
+            post_loop,
+            downstream_post_loop,
+            target_overrides,
+            states,
+        ) {
+            Some(break_exit) => Some(Some(break_exit)),
+            // for-like 的 natural-loop core 会把仍在词法 body 内的入口也暴露为 exit。
+            // 它不满足 break-pad 合同，应留给 body walker，而不应让整个 loop 回退。
+            None if loop_body_blocks(candidate).contains(&exit) => Some(None),
+            None => None,
+        }
     }
 
     fn loop_exit_enters_nested_loop(

@@ -19,14 +19,13 @@ mod synthesize;
 
 use super::expr_facts::{expr_is_boolean_valued, expr_truthiness};
 use super::walk::{ExprRewritePass, rewrite_proto_exprs};
-use helpers::{
-    logical_and, logical_or, simplify_condition_truthiness_shape, simplify_lua_logical_shape,
-};
+use helpers::{logical_and, logical_or};
 use specialize::specialize_decision_by_known_tests;
 
 use crate::hir::common::{
     HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr, HirProto,
 };
+use crate::hir::expr_safety::{expr_is_discard_safe, expr_is_repeatable};
 
 /// 对单个 proto 递归执行 decision DAG 归一化。
 pub(super) fn simplify_decision_exprs_in_proto(proto: &mut HirProto) -> bool {
@@ -59,11 +58,6 @@ impl ExprRewritePass for DecisionExprPass {
             changed = true;
         }
 
-        if let Some(replacement) = simplify_lua_logical_shape(expr) {
-            *expr = replacement;
-            changed = true;
-        }
-
         changed
     }
 
@@ -74,10 +68,6 @@ impl ExprRewritePass for DecisionExprPass {
             && !decision_has_cycles(decision)
             && let Some(replacement) = collapse_condition_decision_expr(decision)
         {
-            *expr = replacement;
-            changed = true;
-        }
-        if let Some(replacement) = simplify_condition_truthiness_shape(expr) {
             *expr = replacement;
             changed = true;
         }
@@ -132,6 +122,7 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
             && nodes
                 .get(child_ref.index())
                 .is_some_and(|child| child.test == node.test)
+            && expr_is_repeatable(&node.test)
         {
             node.truthy = resolve_child_branch(&nodes, &replacements, *child_ref, true);
         } else {
@@ -142,13 +133,16 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
             && nodes
                 .get(child_ref.index())
                 .is_some_and(|child| child.test == node.test)
+            && expr_is_repeatable(&node.test)
         {
             node.falsy = resolve_child_branch(&nodes, &replacements, *child_ref, false);
         } else {
             node.falsy = resolve_target_for_parent(&replacements, &node.falsy);
         }
 
-        if let Some(constant_truthy) = expr_truthiness(&node.test) {
+        if let Some(constant_truthy) = expr_truthiness(&node.test)
+            && expr_is_discard_safe(&node.test)
+        {
             replacements[node_ref.index()] = Some(resolve_target_in_node_context(
                 &replacements,
                 &node,
@@ -162,7 +156,7 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
             continue;
         }
 
-        if node.truthy == node.falsy {
+        if node.truthy == node.falsy && expr_is_discard_safe(&node.test) {
             replacements[node_ref.index()] = Some(resolve_target_in_node_context(
                 &replacements,
                 &node,
@@ -186,7 +180,12 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
         ResolvedDecisionTarget::Expr(expr) => Some(ReducedDecision::Expr(expr)),
         ResolvedDecisionTarget::Node(entry) => {
             let rebuilt = rebuild_decision(entry, &nodes);
-            let rebuilt = if decision_has_cycles(&rebuilt) {
+            let rebuilt = if decision_has_cycles(&rebuilt)
+                || !rebuilt
+                    .nodes
+                    .iter()
+                    .all(|node| expr_is_repeatable(&node.test))
+            {
                 rebuilt
             } else {
                 specialize_decision_by_known_tests(&rebuilt).unwrap_or(rebuilt)
@@ -452,7 +451,7 @@ fn collapse_condition_node(
     let node = decision.nodes.get(node_ref.index())?;
     let truthy = collapse_condition_target(decision, node, &node.truthy, memo)?;
     let falsy = collapse_condition_target(decision, node, &node.falsy, memo)?;
-    let expr = combine_condition_expr(node.test.clone(), truthy, falsy);
+    let expr = combine_condition_expr(node.test.clone(), truthy, falsy)?;
     memo.insert(node_ref, expr.clone());
     Some(expr)
 }
@@ -470,30 +469,26 @@ fn collapse_condition_target(
     }
 }
 
-fn combine_condition_expr(subject: HirExpr, truthy: HirExpr, falsy: HirExpr) -> HirExpr {
+fn combine_condition_expr(subject: HirExpr, truthy: HirExpr, falsy: HirExpr) -> Option<HirExpr> {
     if is_true(&truthy) && is_false(&falsy) {
-        return subject;
+        return Some(subject);
     }
     if is_true(&truthy) {
-        return logical_or(subject, falsy);
+        return Some(logical_or(subject, falsy));
     }
     if is_false(&falsy) {
-        return logical_and(subject, truthy);
+        return Some(logical_and(subject, truthy));
     }
     if is_false(&truthy) && is_true(&falsy) {
-        return subject.negate();
+        return Some(subject.negate());
     }
     if is_false(&truthy) {
-        return logical_and(subject.negate(), falsy);
+        return Some(logical_and(subject.negate(), falsy));
     }
     if is_true(&falsy) {
-        return logical_or(subject.negate(), truthy);
+        return Some(logical_or(subject.negate(), truthy));
     }
-
-    logical_or(
-        logical_and(subject.clone(), truthy),
-        logical_and(subject.negate(), falsy),
-    )
+    None
 }
 
 fn is_true(expr: &HirExpr) -> bool {

@@ -513,6 +513,23 @@ fn lower_edge_phi_copies(
     from: BlockRef,
     to: BlockRef,
 ) -> Vec<HirStmt> {
+    lower_edge_phi_copies_inner(lowering, from, to, None)
+}
+
+pub(super) fn lower_edge_phi_copies_for_edge(
+    lowering: &ProtoLowering<'_>,
+    edge_ref: crate::structure::EdgeRef,
+) -> Vec<HirStmt> {
+    let edge = lowering.cfg.edges[edge_ref.index()];
+    lower_edge_phi_copies_inner(lowering, edge.from, edge.to, Some(edge_ref))
+}
+
+fn lower_edge_phi_copies_inner(
+    lowering: &ProtoLowering<'_>,
+    from: BlockRef,
+    to: BlockRef,
+    edge_ref: Option<crate::structure::EdgeRef>,
+) -> Vec<HirStmt> {
     if to == lowering.cfg.exit_block {
         return Vec::new();
     }
@@ -522,6 +539,16 @@ fn lower_edge_phi_copies(
     for phi in lowering.dataflow.phi_candidates_in_block(to) {
         if lowering.dead_phis.contains(&phi.id) {
             continue;
+        }
+        if let Some(edge_ref) = edge_ref {
+            assert!(
+                phi.incoming
+                    .iter()
+                    .any(|incoming| incoming.edge == Some(edge_ref)),
+                "phi {} must have an incoming for edge {}",
+                phi.id,
+                edge_ref
+            );
         }
         targets.push(HirLValue::Temp(lowering.bindings.phi_temps[phi.id.index()]));
         values.push(expr_for_reg_at_block_exit(lowering, from, phi.reg));

@@ -268,7 +268,7 @@ fn lower_access_key_expr_inline(
     }
 }
 
-fn global_name_for_access(
+pub(crate) fn global_name_for_access(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,
     instr_ref: InstrRef,

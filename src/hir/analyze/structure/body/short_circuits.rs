@@ -680,7 +680,7 @@ impl StructuredBodyLowerer<'_, '_> {
         };
         if matches!(
             candidate.kind_hint,
-            LoopKindHint::NumericForLike | LoopKindHint::GenericForLike | LoopKindHint::Unknown
+            LoopKindHint::GenericForLike | LoopKindHint::Unknown
         ) {
             return true;
         }

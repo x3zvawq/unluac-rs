@@ -26,9 +26,9 @@
 
 use std::collections::BTreeMap;
 
+use super::label_refs::count_label_references;
 use super::local_shapes::{empty_single_local_decl_binding, matches_local_lvalue};
 use super::mention::{block_mentions_local, expr_mentions_local};
-use super::visit::HirVisitor;
 use super::walk::{HirRewritePass, rewrite_proto};
 use crate::hir::HirLabelId;
 use crate::hir::common::{
@@ -526,28 +526,8 @@ fn terminal_goto_assign_target(block: &HirBlock, label: HirLabelId) -> Option<&H
     Some(target)
 }
 
-fn count_label_references(stmts: &[HirStmt]) -> BTreeMap<HirLabelId, usize> {
-    let mut collector = LabelReferenceCount::default();
-    super::visit::visit_stmts(stmts, &mut collector);
-    collector.counts
-}
-
 fn label_ref_count(label_refs: &BTreeMap<HirLabelId, usize>, label: HirLabelId) -> usize {
     label_refs.get(&label).copied().unwrap_or(0)
-}
-
-#[derive(Default)]
-struct LabelReferenceCount {
-    counts: BTreeMap<HirLabelId, usize>,
-}
-
-impl HirVisitor for LabelReferenceCount {
-    fn visit_stmt(&mut self, stmt: &HirStmt) {
-        let HirStmt::Goto(goto_stmt) = stmt else {
-            return;
-        };
-        *self.counts.entry(goto_stmt.target).or_default() += 1;
-    }
 }
 
 fn single_assign(stmt: &HirStmt) -> Option<(&HirLValue, &HirExpr)> {

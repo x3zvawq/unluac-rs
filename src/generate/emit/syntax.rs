@@ -250,8 +250,10 @@ fn format_long_bracket_string(value: &str) -> String {
 fn long_bracket_eqs(value: &str) -> String {
     for count in 0.. {
         let eqs = "=".repeat(count);
-        let closing = format!("]{eqs}]");
-        if !value.contains(&closing) {
+        let mut closing = format!("]{eqs}");
+        let overlaps_suffix = value.ends_with(&closing);
+        closing.push(']');
+        if !overlaps_suffix && !value.contains(&closing) {
             return eqs;
         }
     }

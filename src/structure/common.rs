@@ -8,7 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::structure::{BlockRef, DefId, EdgeRef, PhiId, SsaValue};
 use crate::transformer::{InstrRef, Reg, RegRange};
 
-use super::plan::{BranchValueMergeId, LoopCandidateId};
+use super::plan::{
+    BlockOwner, BranchCandidateId, BranchValueMergeId, CleanupDisposition, EdgeOwner,
+    GotoRequirementId, LoopCandidateId, RegionId,
+};
 
 /// 一个 proto 的结构候选集合，以及它的子 proto 结果。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -32,12 +35,33 @@ pub struct StructureFacts {
 /// 取首项或在重复时把整组候选删除。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StructurePlan {
+    pub(super) branch_by_header: BTreeMap<BlockRef, BranchCandidateId>,
     pub(super) branch_value_merge_by_header: BTreeMap<BlockRef, BranchValueMergeId>,
     pub(super) branch_value_merge_by_region: BTreeMap<(BlockRef, BlockRef), BranchValueMergeId>,
     pub(super) loops_by_header: BTreeMap<BlockRef, Vec<LoopCandidateId>>,
+    pub(super) unstructured_region_by_block: Vec<Option<RegionId>>,
+    pub(super) block_owners: Vec<BlockOwner>,
+    pub(super) edge_owners: Vec<EdgeOwner>,
+    pub(super) cleanup_dispositions: Vec<Option<CleanupDisposition>>,
 }
 
 impl StructureFacts {
+    pub fn branch_candidate(&self, id: BranchCandidateId) -> Option<&BranchCandidate> {
+        self.branch_candidates.get(id.index())
+    }
+
+    pub fn branch_candidates_by_header(
+        &self,
+    ) -> impl Iterator<Item = (BlockRef, &BranchCandidate)> {
+        self.plan
+            .branch_by_header
+            .iter()
+            .filter_map(|(header, id)| {
+                self.branch_candidate(*id)
+                    .map(|candidate| (*header, candidate))
+            })
+    }
+
     pub fn branch_value_merge_for_header(
         &self,
         header: BlockRef,
@@ -62,6 +86,14 @@ impl StructureFacts {
         self.loop_candidates.get(id.index())
     }
 
+    pub fn goto_requirement(&self, id: GotoRequirementId) -> Option<&GotoRequirement> {
+        self.goto_requirements.get(id.index())
+    }
+
+    pub fn region(&self, id: RegionId) -> Option<&RegionFact> {
+        self.region_facts.get(id.index())
+    }
+
     pub fn loop_candidates_for_header(
         &self,
         header: BlockRef,
@@ -73,6 +105,35 @@ impl StructureFacts {
             .flatten()
             .copied()
             .filter_map(|id| self.loop_candidate(id).map(|candidate| (id, candidate)))
+    }
+
+    pub fn loop_headers(&self) -> impl Iterator<Item = BlockRef> + '_ {
+        self.plan.loops_by_header.keys().copied()
+    }
+
+    pub fn block_owner(&self, block: BlockRef) -> Option<BlockOwner> {
+        self.plan.block_owners.get(block.index()).copied()
+    }
+
+    pub fn edge_owner(&self, edge: EdgeRef) -> Option<EdgeOwner> {
+        self.plan.edge_owners.get(edge.index()).copied()
+    }
+
+    pub fn unstructured_region(&self, block: BlockRef) -> Option<RegionId> {
+        self.plan
+            .unstructured_region_by_block
+            .get(block.index())
+            .copied()
+            .flatten()
+    }
+
+    pub fn cleanup_disposition(&self, instr: InstrRef) -> CleanupDisposition {
+        self.plan
+            .cleanup_dispositions
+            .get(instr.index())
+            .copied()
+            .flatten()
+            .expect("cleanup instruction must have one disposition")
     }
 }
 
@@ -519,8 +580,7 @@ pub enum ShortCircuitExit {
 /// 一个必须保留跳转的要求。
 #[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash)]
 pub struct GotoRequirement {
-    pub from: BlockRef,
-    pub to: BlockRef,
+    pub edge: EdgeRef,
     pub reason: GotoReason,
 }
 

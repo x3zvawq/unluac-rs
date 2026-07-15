@@ -12,8 +12,8 @@ use std::collections::BTreeMap;
 
 use super::exprs::{
     expr_for_closure_capture, expr_for_const, expr_for_reg_use, expr_for_value_operand,
-    lower_binary_op, lower_branch_cond, lower_method_name, lower_table_access_expr,
-    lower_table_access_target, lower_unary_op, lower_upvalue_operand_expr,
+    global_name_for_access, lower_binary_op, lower_branch_cond, lower_method_name,
+    lower_table_access_expr, lower_table_access_target, lower_unary_op, lower_upvalue_operand_expr,
     lower_upvalue_operand_target, lower_value_pack,
 };
 use super::helpers::{
@@ -29,7 +29,7 @@ use crate::hir::common::{
 };
 use crate::structure::BlockRef;
 use crate::transformer::{
-    AccessKey, CallKind, GenericForCallInstr, GenericForLoopInstr, InstrRef, LowInstr,
+    AccessBase, AccessKey, CallKind, GenericForCallInstr, GenericForLoopInstr, InstrRef, LowInstr,
     MethodNameHint, Reg, ResultPack,
 };
 
@@ -98,6 +98,11 @@ pub(super) fn lower_regular_instr(
                 )
             }));
             fixed_assign(lowering, instr_ref, vec![value])
+        }
+        LowInstr::GetUpvalue(get_upvalue)
+            if env_upvalue_is_consumed_by_global_accesses(lowering, instr_ref, get_upvalue) =>
+        {
+            Vec::new()
         }
         LowInstr::GetUpvalue(get_upvalue) => fixed_assign(
             lowering,
@@ -297,6 +302,51 @@ pub(super) fn lower_regular_instr(
         LowInstr::GenericForLoop(_instr) => vec![unstructured_stmt("generic-for-loop")],
         LowInstr::Jump(_) | LowInstr::Branch(_) => Vec::new(),
     }
+}
+
+fn env_upvalue_is_consumed_by_global_accesses(
+    lowering: &ProtoLowering<'_>,
+    instr_ref: InstrRef,
+    get_upvalue: &crate::transformer::GetUpvalueInstr,
+) -> bool {
+    if !matches!(get_upvalue.src, crate::transformer::UpvalueOperand::Env) {
+        return false;
+    }
+    let Some(def) = lowering
+        .dataflow
+        .instr_def_for_reg(instr_ref, get_upvalue.dst)
+    else {
+        return false;
+    };
+    if lowering
+        .dataflow
+        .def_phi_uses
+        .get(def.index())
+        .is_some_and(|uses| !uses.is_empty())
+    {
+        return false;
+    }
+
+    lowering
+        .dataflow
+        .def_uses
+        .get(def.index())
+        .is_some_and(|uses| {
+            uses.iter().all(|site| {
+                let use_block = lowering.cfg.instr_to_block[site.instr.index()];
+                let access = match &lowering.proto.instrs[site.instr.index()] {
+                    LowInstr::GetTable(access) if access.base == AccessBase::Reg(site.reg) => {
+                        (access.base, access.key)
+                    }
+                    LowInstr::SetTable(access) if access.base == AccessBase::Reg(site.reg) => {
+                        (access.base, access.key)
+                    }
+                    _ => return false,
+                };
+                global_name_for_access(lowering, use_block, site.instr, access.0, access.1)
+                    .is_some()
+            })
+        })
 }
 
 pub(super) fn lower_control_instr(

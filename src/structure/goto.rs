@@ -15,13 +15,15 @@
 use std::collections::BTreeSet;
 
 use crate::structure::{Cfg, EdgeKind};
-use crate::transformer::{LowInstr, LoweredProto};
+use crate::transformer::LoweredProto;
 
 use super::common::IrreducibleRegion;
 use super::common::{
     BranchCandidate, BranchRegionFact, GotoReason, GotoRequirement, LoopCandidate, LoopKindHint,
 };
-use super::helpers::{collect_region_entry_edges, collect_region_exit_edges};
+use super::helpers::{
+    block_has_non_control_prefix, collect_region_entry_edges, collect_region_exit_edges,
+};
 
 pub(super) fn analyze_goto_requirements(
     proto: &LoweredProto,
@@ -38,8 +40,7 @@ pub(super) fn analyze_goto_requirements(
             let edge = cfg.edges[edge_ref.index()];
             if edge.to != loop_candidate.header {
                 requirements.insert(GotoRequirement {
-                    from: edge.from,
-                    to: edge.to,
+                    edge: edge_ref,
                     reason: GotoReason::MultiEntryRegion,
                 });
             }
@@ -88,8 +89,7 @@ pub(super) fn analyze_goto_requirements(
                         && !is_degenerate_branch_to_target(cfg, edge.from, continue_target)
                     {
                         requirements.insert(GotoRequirement {
-                            from: edge.from,
-                            to: edge.to,
+                            edge: *edge_ref,
                             reason: GotoReason::UnstructuredContinueLike,
                         });
                     }
@@ -100,10 +100,8 @@ pub(super) fn analyze_goto_requirements(
 
     for irreducible in irreducible_regions {
         for edge_ref in &irreducible.entry_edges {
-            let edge = cfg.edges[edge_ref.index()];
             requirements.insert(GotoRequirement {
-                from: edge.from,
-                to: edge.to,
+                edge: *edge_ref,
                 reason: GotoReason::IrreducibleFlow,
             });
         }
@@ -114,8 +112,7 @@ pub(super) fn analyze_goto_requirements(
             let edge = cfg.edges[edge_ref.index()];
             if edge.to != branch_region.merge {
                 requirements.insert(GotoRequirement {
-                    from: edge.from,
-                    to: edge.to,
+                    edge: edge_ref,
                     reason: GotoReason::CrossStructureJump,
                 });
             }
@@ -149,40 +146,6 @@ fn is_degenerate_branch_to_target(
         .is_some_and(|(then_edge, else_edge)| {
             cfg.edges[then_edge.index()].to == target && cfg.edges[else_edge.index()].to == target
         })
-}
-
-fn block_has_non_control_prefix(
-    proto: &LoweredProto,
-    cfg: &Cfg,
-    block: crate::structure::BlockRef,
-) -> bool {
-    let range = cfg.blocks[block.index()].instrs;
-    let Some(last_instr_ref) = range.last() else {
-        return false;
-    };
-    let Some(last_instr) = proto.instrs.get(last_instr_ref.index()) else {
-        return false;
-    };
-
-    let body_end = if is_control_terminator(last_instr) {
-        range.end().saturating_sub(1)
-    } else {
-        range.end()
-    };
-    range.start.index() < body_end
-}
-
-fn is_control_terminator(instr: &LowInstr) -> bool {
-    matches!(
-        instr,
-        LowInstr::Jump(_)
-            | LowInstr::Branch(_)
-            | LowInstr::Return(_)
-            | LowInstr::TailCall(_)
-            | LowInstr::NumericForInit(_)
-            | LowInstr::NumericForLoop(_)
-            | LowInstr::GenericForLoop(_)
-    )
 }
 
 /// 判断 `from` 是否是某个 branch candidate 的 header，且该 branch 的某个分支臂

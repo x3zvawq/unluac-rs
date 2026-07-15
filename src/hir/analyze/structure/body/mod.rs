@@ -13,9 +13,10 @@ mod loop_controls;
 mod path_checks;
 mod prefix_temps;
 mod short_circuits;
+mod unstructured;
 mod value_merges;
 
-use std::{cell::RefCell, collections::VecDeque, ops::Range};
+use std::{cell::RefCell, ops::Range};
 
 use super::*;
 
@@ -28,7 +29,13 @@ pub(super) fn build_structured_body(
         .structure
         .goto_requirements
         .iter()
-        .any(|requirement| !supports_structured_goto_requirement(requirement.reason))
+        .any(|requirement| {
+            requirement.reason != GotoReason::UnstructuredContinueLike
+                && lowering
+                    .structure
+                    .unstructured_region(lowering.cfg.edges[requirement.edge.index()].to)
+                    .is_none()
+        })
     {
         return None;
     }
@@ -50,8 +57,6 @@ pub(super) struct StructuredBodyLowerer<'a, 'b> {
     pub(super) required_labels: BTreeSet<BlockRef>,
     pub(super) merge_allowed_blocks: BTreeMap<BlockRef, BTreeSet<BlockRef>>,
     pub(super) overrides: StructureOverrideState,
-    pub(super) structured_close_points: BTreeSet<InstrRef>,
-    pub(super) explicit_tbc_close_points: BTreeSet<InstrRef>,
     pub(super) visited: TransactionalBlockSet,
     pub(super) active_loops: Vec<ActiveLoopContext>,
     reachability: RefCell<BTreeMap<BlockRef, BTreeSet<BlockRef>>>,
@@ -67,57 +72,6 @@ pub(super) struct StructuredBranchPlan {
     // 短路候选的语义节点只包含条件 header；某些出口会先经过空 jump pad 再到
     // truthy/falsy 出口。pad 不参与条件重写，但需要计入覆盖性检查。
     pub(super) consumed_blocks: Vec<BlockRef>,
-}
-
-fn explicit_tbc_close_points(lowering: &ProtoLowering<'_>) -> BTreeSet<InstrRef> {
-    let cfg = lowering.cfg;
-    let mut active_out = vec![BTreeSet::<usize>::new(); cfg.blocks.len()];
-    let mut close_points = BTreeSet::new();
-    let mut pending = VecDeque::from(cfg.block_order.clone());
-    let mut queued = vec![true; cfg.blocks.len()];
-
-    while let Some(block) = pending.pop_front() {
-        queued[block.index()] = false;
-        if !cfg.reachable_blocks.contains(&block) || block == cfg.exit_block {
-            continue;
-        }
-
-        let mut incoming = BTreeSet::new();
-        for edge_ref in &cfg.preds[block.index()] {
-            let predecessor = cfg.edges[edge_ref.index()].from;
-            incoming.extend(active_out[predecessor.index()].iter().copied());
-        }
-        let mut active = incoming;
-        let range = cfg.blocks[block.index()].instrs;
-        for instr_index in range.start.index()..range.end() {
-            match &lowering.proto.instrs[instr_index] {
-                LowInstr::Tbc(tbc) if tbc.kind == crate::transformer::TbcKind::Explicit => {
-                    active.insert(tbc.reg.index());
-                }
-                LowInstr::Close(close) => {
-                    if active.range(close.from.index()..).next().is_some() {
-                        close_points.insert(InstrRef(instr_index));
-                    }
-                    active.retain(|reg| *reg < close.from.index());
-                }
-                _ => {}
-            }
-        }
-
-        if active == active_out[block.index()] {
-            continue;
-        }
-        active_out[block.index()] = active;
-        for edge_ref in &cfg.succs[block.index()] {
-            let successor = cfg.edges[edge_ref.index()].to;
-            if !queued[successor.index()] {
-                queued[successor.index()] = true;
-                pending.push_back(successor);
-            }
-        }
-    }
-
-    close_points
 }
 
 #[derive(Debug, Clone)]
@@ -241,21 +195,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     }
 
     fn new(target: AstTargetDialect, lowering: &'b ProtoLowering<'a>) -> Self {
-        let branch_by_header = lowering
-            .structure
-            .branch_candidates
-            .iter()
-            .map(|candidate| (candidate.header, candidate))
-            .collect();
+        let branch_by_header = lowering.structure.branch_candidates_by_header().collect();
         let branch_value_merges_by_header = lowering
             .structure
-            .branch_candidates
-            .iter()
-            .filter_map(|branch| {
+            .branch_candidates_by_header()
+            .filter_map(|(header, _)| {
                 lowering
                     .structure
-                    .branch_value_merge_for_header(branch.header)
-                    .map(|candidate| (branch.header, candidate))
+                    .branch_value_merge_for_header(header)
+                    .map(|candidate| (header, candidate))
             })
             .collect();
         let branch_regions_by_header = lowering
@@ -265,21 +213,39 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .map(|fact| (fact.header, fact))
             .collect();
         let mut loops_by_header = BTreeMap::<BlockRef, Vec<_>>::new();
-        for (index, candidate) in lowering.structure.loop_candidates.iter().enumerate() {
-            let candidate_id = LoopCandidateId(index);
-            loops_by_header
-                .entry(candidate.header)
-                .or_default()
-                .push((candidate_id, candidate));
+        for header in lowering.structure.loop_headers() {
+            loops_by_header.insert(
+                header,
+                lowering
+                    .structure
+                    .loop_candidates_for_header(header)
+                    .collect(),
+            );
         }
         let loop_headers = loops_by_header.keys().copied().collect();
-        let structured_close_points = lowering
+        let required_labels = lowering
             .structure
-            .scope_candidates
+            .goto_requirements
             .iter()
-            .flat_map(|scope| scope.close_points.iter().copied())
+            .map(|requirement| lowering.cfg.edges[requirement.edge.index()].to)
+            .chain(
+                lowering
+                    .cfg
+                    .block_order
+                    .iter()
+                    .copied()
+                    .filter(|block| lowering.structure.unstructured_region(*block).is_some()),
+            )
+            .chain(
+                lowering
+                    .structure
+                    .region_facts
+                    .iter()
+                    .filter(|region| !region.structureable)
+                    .flat_map(|region| region.exits.iter().copied()),
+            )
+            .filter(|block| *block != lowering.cfg.exit_block)
             .collect();
-        let explicit_tbc_close_points = explicit_tbc_close_points(lowering);
 
         Self {
             target,
@@ -290,11 +256,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             loop_headers,
             loops_by_header,
             label_map: build_label_map_for_summary(lowering.cfg),
-            required_labels: BTreeSet::new(),
+            required_labels,
             merge_allowed_blocks: BTreeMap::new(),
             overrides: StructureOverrideState::default(),
-            structured_close_points,
-            explicit_tbc_close_points,
             visited: TransactionalBlockSet::new(lowering.cfg.blocks.len()),
             active_loops: Vec::new(),
             reachability: RefCell::new(BTreeMap::new()),
@@ -377,6 +341,24 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             }
 
             self.emit_required_label(block, &mut stmts);
+
+            if let Some(region_id) = self.lowering.structure.unstructured_region(block) {
+                current = self.lower_unstructured_region(
+                    block,
+                    region_id,
+                    stop,
+                    &mut stmts,
+                    target_overrides,
+                )?;
+                continue;
+            }
+
+            if let Some(next) =
+                self.try_lower_unstructured_entry_branch(block, &mut stmts, target_overrides)
+            {
+                current = next;
+                continue;
+            }
 
             if let Some((candidate_id, _)) =
                 self.loop_candidate_for_entry(block, suppressed_loop_id)
@@ -538,14 +520,20 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         match instr {
             LowInstr::Jump(jump) => {
                 let target = self.lowering.cfg.instr_to_block[jump.target.index()];
-                self.follow_linear_target(block, target, stop, stmts)
+                self.follow_linear_target(block, target, stop, stmts, target_overrides)
             }
             LowInstr::Branch(branch)
                 if self.lowering.cfg.instr_to_block[branch.then_target.index()]
                     == self.lowering.cfg.instr_to_block[branch.else_target.index()] =>
             {
                 let target = self.lowering.cfg.instr_to_block[branch.then_target.index()];
-                self.follow_linear_target(block, target, stop, stmts)
+                // 两条边汇合不代表条件求值可删除：全局读取和比较都可能触发元方法。
+                // 空 if 是 Lua 中保留一次任意条件求值而不引入伪绑定的最小表示。
+                let cond = self.lower_branch_cond_for_target(block, target)?;
+                let mut evaluation = vec![branch_stmt(cond, HirBlock::default(), None)];
+                apply_loop_rewrites(&mut evaluation, target_overrides);
+                stmts.extend(evaluation);
+                self.follow_linear_target(block, target, stop, stmts, target_overrides)
             }
             LowInstr::Return(_) | LowInstr::TailCall(_) => {
                 let empty_labels = BTreeMap::new();
@@ -577,7 +565,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         target: BlockRef,
         stop: Option<BlockRef>,
         stmts: &mut Vec<HirStmt>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Option<BlockRef>> {
+        if let Some(edge_ref) = self.required_goto_edge(block, target) {
+            let mut edge_stmts = lower_edge_phi_copies_for_edge(self.lowering, edge_ref);
+            apply_loop_rewrites(&mut edge_stmts, target_overrides);
+            edge_stmts.extend(goto_block(self.label_map[&target]).stmts);
+            stmts.extend(edge_stmts);
+            return Some(None);
+        }
         if Some(target) == stop || target == self.lowering.cfg.exit_block {
             return Some(if target == self.lowering.cfg.exit_block {
                 None
@@ -681,14 +677,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             if self.overrides.instr_is_suppressed(instr_ref) {
                 continue;
             }
-            // `Close` 只在 low-IR 里显式出现；一旦结构层已经用 `scope_candidates` 证明
-            // 这些 cleanup 点属于某个词法边界，HIR 就不该继续把它们暴露成伪语句。
-            // 否则 while/repeat/if 已经结构化了，dump 里仍会残留“close from rX”的噪音，
-            // 迫使后面的 AST/readability 再去反推这其实只是作用域结束。
-            if self.structured_close_points.contains(&instr_ref)
-                && !self.explicit_tbc_close_points.contains(&instr_ref)
-            {
-                continue;
+            if matches!(instr, LowInstr::Close(_) | LowInstr::Tbc(_)) {
+                match self.lowering.structure.cleanup_disposition(instr_ref) {
+                    CleanupDisposition::LexicalScope(_) | CleanupDisposition::Unreachable => {
+                        continue;
+                    }
+                    CleanupDisposition::ExplicitTbc
+                    | CleanupDisposition::GenericFor(_)
+                    | CleanupDisposition::ExplicitTbcBoundary => {}
+                }
             }
             let mut lowered = lower_regular_instr(self.lowering, block, instr_ref, instr);
             if !phi_temp_aliases.is_empty() {
@@ -863,10 +860,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             ReachableSuccessorShape::Multiple => None,
         }
     }
-}
-
-fn supports_structured_goto_requirement(reason: GotoReason) -> bool {
-    matches!(reason, GotoReason::UnstructuredContinueLike)
 }
 
 fn shared_target_expr_from_overrides(

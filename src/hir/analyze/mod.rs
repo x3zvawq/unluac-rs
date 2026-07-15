@@ -21,7 +21,8 @@ use self::exprs::lower_branch_cond;
 use self::helpers::{assign_stmt, branch_stmt, build_label_map_for_summary, goto_block};
 use self::instrs::{is_control_terminator, lower_control_instr, lower_regular_instr};
 use self::lower::{
-    ProtoBindings, ProtoLowering, lower_phi_materialization_with_allowed_blocks_except,
+    ProtoBindings, ProtoLowering, lower_edge_phi_copies_for_edge,
+    lower_phi_materialization_with_allowed_blocks_except,
 };
 
 /// HIR 阶段入口：消费结构事实与前序控制/数据流事实，写回 HIR 模块。

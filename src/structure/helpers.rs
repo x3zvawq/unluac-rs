@@ -16,8 +16,38 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use crate::structure::{BlockRef, Cfg, DominatorTree, EdgeRef};
+use crate::transformer::{LowInstr, LoweredProto};
 
 use super::common::IrreducibleRegion;
+
+pub(super) fn block_has_non_control_prefix(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    block: BlockRef,
+) -> bool {
+    let range = cfg.blocks[block.index()].instrs;
+    let Some(last_instr) = range
+        .last()
+        .and_then(|instr_ref| proto.instrs.get(instr_ref.index()))
+    else {
+        return false;
+    };
+    let body_end = if matches!(
+        last_instr,
+        LowInstr::Jump(_)
+            | LowInstr::Branch(_)
+            | LowInstr::Return(_)
+            | LowInstr::TailCall(_)
+            | LowInstr::NumericForInit(_)
+            | LowInstr::NumericForLoop(_)
+            | LowInstr::GenericForLoop(_)
+    ) {
+        range.end().saturating_sub(1)
+    } else {
+        range.end()
+    };
+    range.start.index() < body_end
+}
 
 pub(super) fn collect_region_exits(cfg: &Cfg, blocks: &BTreeSet<BlockRef>) -> BTreeSet<BlockRef> {
     collect_region_exit_edges(cfg, blocks)

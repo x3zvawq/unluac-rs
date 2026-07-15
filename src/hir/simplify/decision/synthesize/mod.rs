@@ -52,7 +52,7 @@ fn normalize_candidate_expr(expr: HirExpr) -> HirExpr {
                 HirExpr::Boolean(false)
             } else {
                 let expr = HirExpr::LogicalAnd(Box::new(HirLogicalExpr { lhs, rhs }));
-                super::simplify_lua_logical_shape(&expr).unwrap_or(expr)
+                super::super::logical_simplify::simplify_logical_shape(&expr).unwrap_or(expr)
             }
         }
         HirExpr::LogicalOr(logical) => {
@@ -67,7 +67,7 @@ fn normalize_candidate_expr(expr: HirExpr) -> HirExpr {
                 HirExpr::Boolean(true)
             } else {
                 let expr = HirExpr::LogicalOr(Box::new(HirLogicalExpr { lhs, rhs }));
-                super::simplify_lua_logical_shape(&expr).unwrap_or(expr)
+                super::super::logical_simplify::simplify_logical_shape(&expr).unwrap_or(expr)
             }
         }
         HirExpr::Binary(binary) => HirExpr::Binary(Box::new(HirBinaryExpr {

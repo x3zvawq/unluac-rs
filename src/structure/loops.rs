@@ -36,7 +36,10 @@ use super::common::{
     BranchCandidate, LoopCandidate, LoopExitValueMergeCandidate, LoopKindHint, LoopSourceBindings,
     LoopValueMerge, ShortCircuitCandidate, ShortCircuitExit, ShortCircuitTarget,
 };
-use super::helpers::{collect_forward_region_blocks, collect_region_exits, is_reducible_region};
+use super::helpers::{
+    block_has_non_control_prefix, collect_forward_region_blocks, collect_region_exits,
+    is_reducible_region,
+};
 use super::phi_facts::loop_value_merges_in_block;
 
 pub(super) fn analyze_loops(
@@ -215,6 +218,9 @@ pub(super) fn assign_continue_edge_ownership(
 ) {
     let mut owners_by_entry = BTreeMap::<BlockRef, BTreeSet<usize>>::new();
     for (index, candidate) in candidates.iter().enumerate() {
+        if numeric_continue_target_carries_body_tail(proto, cfg, candidate) {
+            continue;
+        }
         let Some(target) = candidate.continue_target else {
             continue;
         };
@@ -275,6 +281,7 @@ pub(super) fn assign_continue_edge_ownership(
         }
         for candidate in candidates.iter_mut().filter(|candidate| {
             candidate.kind_hint != LoopKindHint::RepeatLike
+                && !numeric_continue_target_carries_body_tail(proto, cfg, candidate)
                 && candidate.blocks.contains(&branch.header)
                 && candidate.blocks.contains(&branch.then_entry)
         }) {
@@ -293,6 +300,17 @@ pub(super) fn assign_continue_edge_ownership(
             candidate.continue_edges.insert(edge_ref);
         }
     }
+}
+
+fn numeric_continue_target_carries_body_tail(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    candidate: &LoopCandidate,
+) -> bool {
+    candidate.kind_hint == LoopKindHint::NumericForLike
+        && candidate
+            .continue_target
+            .is_some_and(|target| block_has_non_control_prefix(proto, cfg, target))
 }
 
 fn linear_arm_continue_edge(

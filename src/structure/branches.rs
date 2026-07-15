@@ -47,7 +47,7 @@ pub(super) fn analyze_branches(
                 classify_postdom_one_arm_branch(graph_facts, header, then_entry, else_entry)
             })
             .or_else(|| {
-                classify_numeric_for_exit_branch(
+                classify_for_loop_exit_branch(
                     cfg,
                     graph_facts,
                     loop_candidates,
@@ -179,7 +179,8 @@ pub(super) fn analyze_branch_regions(
                 .nearest_common_postdom(candidate.then_entry, else_entry)
                 .is_some_and(|strict_merge| {
                     strict_merge != merge
-                        && numeric_for_exit_owner(
+                        && for_loop_exit_owner(
+                            cfg,
                             loop_candidates,
                             candidate.header,
                             candidate.then_entry,
@@ -187,7 +188,7 @@ pub(super) fn analyze_branch_regions(
                             strict_merge,
                         )
                         .is_some_and(|owner| {
-                            owner.header == candidate.header
+                            for_loop_body_entry(cfg, owner) == Some(candidate.header)
                                 && owner.blocks.contains(&candidate.then_entry)
                                 && owner.blocks.contains(&else_entry)
                         })
@@ -545,7 +546,7 @@ fn classify_loop_exit_bounded_one_arm_branch(
         })?
 }
 
-fn classify_numeric_for_exit_branch(
+fn classify_for_loop_exit_branch(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     loop_candidates: &[LoopCandidate],
@@ -554,7 +555,8 @@ fn classify_numeric_for_exit_branch(
     else_entry: BlockRef,
 ) -> Option<BranchCandidate> {
     let strict_merge = graph_facts.nearest_common_postdom(then_entry, else_entry)?;
-    let owner = numeric_for_exit_owner(
+    let owner = for_loop_exit_owner(
+        cfg,
         loop_candidates,
         header,
         then_entry,
@@ -562,6 +564,7 @@ fn classify_numeric_for_exit_branch(
         strict_merge,
     )?;
 
+    let body_entry = for_loop_body_entry(cfg, owner)?;
     match (
         cfg.unique_reachable_successor(then_entry) == Some(strict_merge),
         cfg.unique_reachable_successor(else_entry) == Some(strict_merge),
@@ -582,7 +585,7 @@ fn classify_numeric_for_exit_branch(
             kind: BranchKind::Guard,
             invert_hint: true,
         }),
-        _ if owner.header == header
+        _ if body_entry == header
             && owner.blocks.contains(&then_entry)
             && owner.blocks.contains(&else_entry) =>
         {
@@ -603,23 +606,53 @@ fn classify_numeric_for_exit_branch(
     }
 }
 
-fn numeric_for_exit_owner(
-    loop_candidates: &[LoopCandidate],
+fn for_loop_exit_owner<'a>(
+    cfg: &Cfg,
+    loop_candidates: &'a [LoopCandidate],
     header: BlockRef,
     then_entry: BlockRef,
     else_entry: BlockRef,
-    exit: BlockRef,
-) -> Option<&LoopCandidate> {
+    boundary: BlockRef,
+) -> Option<&'a LoopCandidate> {
     loop_candidates
         .iter()
         .filter(|candidate| {
-            candidate.kind_hint == LoopKindHint::NumericForLike
-                && candidate.binding_scope_blocks.contains(&header)
+            matches!(
+                candidate.kind_hint,
+                LoopKindHint::NumericForLike | LoopKindHint::GenericForLike
+            ) && candidate.binding_scope_blocks.contains(&header)
                 && candidate.binding_scope_blocks.contains(&then_entry)
                 && candidate.binding_scope_blocks.contains(&else_entry)
-                && candidate.exits.contains(&exit)
+                && for_loop_exits_at(cfg, candidate, boundary)
         })
         .min_by_key(|candidate| candidate.binding_scope_blocks.len())
+}
+
+fn for_loop_exits_at(cfg: &Cfg, candidate: &LoopCandidate, boundary: BlockRef) -> bool {
+    candidate.exits.contains(&boundary)
+        || (!candidate.exits.is_empty()
+            && candidate
+                .exits
+                .iter()
+                .all(|exit| cfg.unique_reachable_successor(*exit) == Some(boundary)))
+}
+
+fn for_loop_body_entry(cfg: &Cfg, candidate: &LoopCandidate) -> Option<BlockRef> {
+    match candidate.kind_hint {
+        LoopKindHint::NumericForLike => Some(candidate.header),
+        LoopKindHint::GenericForLike => {
+            let mut entries = cfg.succs[candidate.header.index()]
+                .iter()
+                .map(|edge| cfg.edges[edge.index()].to)
+                .filter(|target| candidate.blocks.contains(target));
+            let entry = entries.next()?;
+            entries.next().is_none().then_some(entry)
+        }
+        LoopKindHint::Unknown
+        | LoopKindHint::WhileLike
+        | LoopKindHint::WhileTrueLike
+        | LoopKindHint::RepeatLike => None,
+    }
 }
 
 fn classify_loop_bounded_one_arm_branch(

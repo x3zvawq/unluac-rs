@@ -389,21 +389,31 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         continue_target: BlockRef,
         loop_context: &ActiveLoopContext,
     ) -> bool {
+        let plain_merge_can_be_continue = self.loop_continue_target_is_empty(continue_target)
+            || self
+                .loop_candidate(loop_context.candidate_id)
+                .is_some_and(|candidate| {
+                    matches!(
+                        candidate.kind_hint,
+                        LoopKindHint::GenericForLike | LoopKindHint::RepeatLike
+                    )
+                });
         self.try_build_short_circuit_plan(entry, Some(tail))
             .flatten()
             .is_some_and(|plan| {
                 self.short_circuit_continue_arm(&plan, continue_target, loop_context)
                     .is_some()
             })
-            || self.branch_by_header.get(&entry).is_some_and(|branch| {
-                branch.else_entry.is_none()
-                    && branch.merge == Some(continue_target)
-                    && self.branch_arm_reaches_target_or_boundary_or_terminate(
-                        branch.then_entry,
-                        tail,
-                        boundary,
-                    )
-            })
+            || (plain_merge_can_be_continue
+                && self.branch_by_header.get(&entry).is_some_and(|branch| {
+                    branch.else_entry.is_none()
+                        && branch.merge == Some(continue_target)
+                        && self.branch_arm_reaches_target_or_boundary_or_terminate(
+                            branch.then_entry,
+                            tail,
+                            boundary,
+                        )
+                }))
     }
 
     fn implicit_else_merge_entry(
@@ -816,7 +826,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .goto_requirements
             .iter()
             .any(|requirement| {
-                requirement.from == block
+                self.lowering.cfg.edges[requirement.edge.index()].from == block
                     && requirement.reason == GotoReason::UnstructuredContinueLike
             })
     }

@@ -1,33 +1,20 @@
 //! 这个文件负责把“结构等价但不好看”的条件语句收回更像源码的形状。
 //!
 //! 它依赖 AST build / HIR 已经保证语义正确，只在 Readability 阶段做局部可读性整理，
-//! 比如 guard flatten、`not` 交换 then/else、`not a and x or y` 还原成更自然的
-//! 真值条件组合。它不会越权补语义，也不会替前层兜底修错误控制流。
+//! 比如 guard flatten、`not` 交换 then/else。它不会越权补语义，也不会替前层兜底
+//! 修错误控制流。
 //!
 //! 例子：
 //! - `if not cond then a() else b() end` 会整理成 `if cond then b() else a() end`
 //! - `if cond then body else end` 会整理成 `if cond then body end`
 //! - `if a then if b then return end end` 会折成 `if a and b then return end`
 //! - `if cond then return end else tail()` 会拉平成 `if cond then return end; tail()`
-//! - `if exit then goto L1 end; body; ::L1:: tail` 会收成 `if not exit then body end; tail`
-//! - `if cond then a(); goto L1 end; b(); ::L1::` 会收成 `if cond then a() else b() end`
-//! - `if cond then x=a; goto L1 end; x=b; ::L1::` 不在这里折叠；同一 lvalue 选值
-//!   属于 HIR branch-value 语义 owner
-//!
-//! 当同一 label 被多个 goto 引用时（常见于 continue-like 模式），通过从距 label
-//! 最近的 guard-goto 开始逐层折叠，最终将多个 skip-goto 收回成嵌套 if 结构：
-//! - `if c1 then goto L end; if c2 then goto L end; body; ::L::` →
-//!   `if not c1 then if not c2 then body end end`
-
-use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::common::{
-    AstBlock, AstExpr, AstFunctionExpr, AstIf, AstLabelId, AstLogicalExpr, AstModule, AstReturn,
-    AstStmt, AstUnaryExpr, AstUnaryOpKind,
+    AstBlock, AstExpr, AstIf, AstLogicalExpr, AstModule, AstReturn, AstStmt, AstUnaryExpr,
+    AstUnaryOpKind,
 };
 use super::ReadabilityContext;
-use super::expr_analysis::is_always_truthy_expr;
-use super::visit::{self, AstVisitor};
 use super::walk::{self, AstRewritePass, BlockKind};
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
@@ -52,11 +39,8 @@ impl AstRewritePass for BranchPrettyPass {
             }
         }
         block.stmts = flattened_stmts;
-        let folded_else = fold_terminal_goto_else(block);
-        let folded_guard = fold_guard_goto_labels(block);
         let folded_terminal_guard = fold_terminal_guard_return(block, kind);
-        let removed_nop_gotos = remove_nop_goto_labels(block);
-        changed || folded_else || folded_guard || folded_terminal_guard || removed_nop_gotos
+        changed || folded_terminal_guard
     }
 
     fn rewrite_stmt(&mut self, stmt: &mut AstStmt) -> bool {
@@ -79,40 +63,6 @@ impl AstRewritePass for BranchPrettyPass {
             _ => false,
         }
     }
-
-    fn rewrite_expr(&mut self, expr: &mut AstExpr) -> bool {
-        let Some(pretty) = prettify_truthy_ternary(expr) else {
-            return false;
-        };
-        *expr = pretty;
-        true
-    }
-}
-
-fn prettify_truthy_ternary(expr: &AstExpr) -> Option<AstExpr> {
-    let AstExpr::LogicalOr(or_expr) = expr else {
-        return None;
-    };
-    let AstExpr::LogicalAnd(and_expr) = &or_expr.lhs else {
-        return None;
-    };
-    let AstExpr::Unary(unary) = &and_expr.lhs else {
-        return None;
-    };
-    if unary.op != AstUnaryOpKind::Not {
-        return None;
-    }
-    if !is_always_truthy_expr(&and_expr.rhs) || !is_always_truthy_expr(&or_expr.rhs) {
-        return None;
-    }
-
-    Some(AstExpr::LogicalOr(Box::new(AstLogicalExpr {
-        lhs: AstExpr::LogicalAnd(Box::new(AstLogicalExpr {
-            lhs: unary.expr.clone(),
-            rhs: or_expr.rhs.clone(),
-        })),
-        rhs: and_expr.rhs.clone(),
-    })))
 }
 
 fn collapse_nested_guard_if(if_stmt: &mut AstIf) -> bool {
@@ -188,111 +138,6 @@ fn flatten_terminating_if(stmt: AstStmt) -> Result<Vec<AstStmt>, AstStmt> {
     Err(AstStmt::If(if_stmt))
 }
 
-fn fold_terminal_goto_else(block: &mut AstBlock) -> bool {
-    let mut changed = false;
-    let mut goto_counts = goto_target_counts_in_block(block);
-
-    while let Some(fold) = find_terminal_goto_else_fold(block) {
-        let target = label_id_at(block, fold.label_index);
-        // 如果还有其他 goto 指向同一 label，折叠后保留该 label。
-        let keep_label = goto_counts.get(&target).copied().unwrap_or_default() > 1;
-
-        let old_stmts = std::mem::take(&mut block.stmts);
-        let mut rewritten =
-            Vec::with_capacity(old_stmts.len() - (fold.label_index - fold.if_index));
-        let mut rewritten_if = None;
-        let mut else_body = Vec::new();
-
-        for (index, stmt) in old_stmts.into_iter().enumerate() {
-            if index < fold.if_index {
-                rewritten.push(stmt);
-                continue;
-            }
-            if index == fold.if_index {
-                let AstStmt::If(mut if_stmt) = stmt else {
-                    unreachable!("terminal-goto else fold should only target if statements");
-                };
-                let popped = if_stmt.then_block.stmts.pop();
-                debug_assert!(matches!(popped, Some(AstStmt::Goto(_))));
-                if_stmt.else_block = Some(AstBlock { stmts: Vec::new() });
-                rewritten_if = Some(if_stmt);
-                continue;
-            }
-            if index < fold.label_index {
-                else_body.push(stmt);
-                continue;
-            }
-            if index == fold.label_index && !keep_label {
-                continue;
-            }
-            rewritten.push(stmt);
-        }
-
-        let mut rewritten_if =
-            rewritten_if.expect("terminal-goto else fold should capture the rewritten if");
-        rewritten_if.else_block = Some(AstBlock { stmts: else_body });
-        rewritten.insert(fold.if_index, AstStmt::If(rewritten_if));
-        block.stmts = rewritten;
-        decrement_goto_target_count(&mut goto_counts, target);
-        changed = true;
-    }
-
-    changed
-}
-
-fn fold_guard_goto_labels(block: &mut AstBlock) -> bool {
-    let mut changed = false;
-    let mut goto_counts = goto_target_counts_in_block(block);
-
-    while let Some(fold) = find_guard_goto_label_fold(block) {
-        let target = label_id_at(block, fold.label_index);
-        // 如果还有其他 goto 指向同一 label，折叠后保留该 label。
-        let keep_label = goto_counts.get(&target).copied().unwrap_or_default() > 1;
-
-        let old_stmts = std::mem::take(&mut block.stmts);
-        let mut rewritten =
-            Vec::with_capacity(old_stmts.len() - (fold.label_index - fold.if_index));
-        let mut guarded_if = None;
-        let mut guarded_body = Vec::new();
-
-        for (index, stmt) in old_stmts.into_iter().enumerate() {
-            if index < fold.if_index {
-                rewritten.push(stmt);
-                continue;
-            }
-            if index == fold.if_index {
-                let AstStmt::If(mut if_stmt) = stmt else {
-                    unreachable!("guard fold should only target if statements");
-                };
-                if_stmt.cond = negate_guard_condition(if_stmt.cond);
-                if_stmt.then_block = AstBlock { stmts: Vec::new() };
-                if_stmt.else_block = None;
-                guarded_if = Some(if_stmt);
-                continue;
-            }
-            if index < fold.label_index {
-                guarded_body.push(stmt);
-                continue;
-            }
-            if index == fold.label_index && !keep_label {
-                continue;
-            }
-            rewritten.push(stmt);
-        }
-
-        let mut guarded_if = guarded_if.expect("guard fold should capture the rewritten if");
-        guarded_if.then_block = AstBlock {
-            stmts: guarded_body,
-        };
-        rewritten.insert(fold.if_index, AstStmt::If(guarded_if));
-        block.stmts = rewritten;
-        decrement_goto_target_count(&mut goto_counts, target);
-        changed = true;
-    }
-
-    changed
-}
-
 fn fold_terminal_guard_return(block: &mut AstBlock, kind: BlockKind) -> bool {
     if !matches!(kind, BlockKind::ModuleBody | BlockKind::FunctionBody) {
         return false;
@@ -343,187 +188,6 @@ fn terminal_guard_return_candidate(block: &AstBlock) -> Option<(usize, bool)> {
     }
 
     Some((if_index, if_index + 1 < block.stmts.len()))
-}
-
-#[derive(Clone, Copy)]
-struct GuardGotoFold {
-    if_index: usize,
-    label_index: usize,
-}
-
-fn find_terminal_goto_else_fold(block: &AstBlock) -> Option<GuardGotoFold> {
-    let label_indices = top_level_label_indices(block);
-
-    // 从右向左扫描：优先折叠距 label 最近的 terminal-goto-else，这样外层的
-    // 同类模式在下一轮迭代时可以正常收回，支持多个 goto 指向同一 label 的情况。
-    for if_index in (0..block.stmts.len()).rev() {
-        let Some(target) = terminal_goto_else_target(&block.stmts[if_index]) else {
-            continue;
-        };
-        let Some(label_index) = next_label_index_after(&label_indices, target, if_index) else {
-            continue;
-        };
-
-        let else_body = &block.stmts[if_index + 1..label_index];
-        // 这里会把线性尾部搬进 `else` block；如果尾部自己再声明 local/label，
-        // 就会引入新的词法边界变化。Readability 只在这类结构风险不存在时才收回源码 sugar。
-        if !else_body.is_empty()
-            && can_fold_guard_goto_body(else_body)
-            && !is_terminal_goto_branch_value_assignment(&block.stmts[if_index], else_body)
-        {
-            return Some(GuardGotoFold {
-                if_index,
-                label_index,
-            });
-        }
-    }
-
-    None
-}
-
-fn find_guard_goto_label_fold(block: &AstBlock) -> Option<GuardGotoFold> {
-    let label_indices = top_level_label_indices(block);
-
-    // 从右向左扫描：优先折叠距 label 最近的 guard-goto，这样外层的
-    // guard-goto 在下一轮迭代时可以把已折叠的 if 整体收入 body，
-    // 从而支持同一 label 被多个 goto 引用的 continue-like 模式。
-    for if_index in (0..block.stmts.len()).rev() {
-        let Some(target) = guard_goto_target(&block.stmts[if_index]) else {
-            continue;
-        };
-        let Some(label_index) = next_label_index_after(&label_indices, target, if_index) else {
-            continue;
-        };
-
-        let guarded_body = &block.stmts[if_index + 1..label_index];
-        if !guarded_body.is_empty() && can_fold_guard_goto_body(guarded_body) {
-            return Some(GuardGotoFold {
-                if_index,
-                label_index,
-            });
-        }
-    }
-
-    None
-}
-
-fn top_level_label_indices(block: &AstBlock) -> BTreeMap<AstLabelId, Vec<usize>> {
-    let mut label_indices = BTreeMap::new();
-    for (index, stmt) in block.stmts.iter().enumerate() {
-        if let AstStmt::Label(label) = stmt {
-            label_indices
-                .entry(label.id)
-                .or_insert_with(Vec::new)
-                .push(index);
-        }
-    }
-    label_indices
-}
-
-fn next_label_index_after(
-    label_indices: &BTreeMap<AstLabelId, Vec<usize>>,
-    target: AstLabelId,
-    after: usize,
-) -> Option<usize> {
-    label_indices
-        .get(&target)?
-        .iter()
-        .copied()
-        .find(|index| *index > after)
-}
-
-fn label_id_at(block: &AstBlock, label_index: usize) -> AstLabelId {
-    let AstStmt::Label(label) = &block.stmts[label_index] else {
-        unreachable!("guard-goto fold should only target labels");
-    };
-    label.id
-}
-
-fn decrement_goto_target_count(counts: &mut BTreeMap<AstLabelId, usize>, target: AstLabelId) {
-    let Some(count) = counts.get_mut(&target) else {
-        return;
-    };
-    *count -= 1;
-    if *count == 0 {
-        counts.remove(&target);
-    }
-}
-
-fn terminal_goto_else_target(stmt: &AstStmt) -> Option<AstLabelId> {
-    let AstStmt::If(if_stmt) = stmt else {
-        return None;
-    };
-    if if_stmt.else_block.is_some() {
-        return None;
-    }
-    if if_stmt.then_block.stmts.len() < 2 {
-        return None;
-    }
-    let AstStmt::Goto(goto_stmt) = if_stmt.then_block.stmts.last()? else {
-        return None;
-    };
-    Some(goto_stmt.target)
-}
-
-fn guard_goto_target(stmt: &AstStmt) -> Option<AstLabelId> {
-    let AstStmt::If(if_stmt) = stmt else {
-        return None;
-    };
-    if if_stmt.else_block.is_some() {
-        return None;
-    }
-    let [AstStmt::Goto(goto_stmt)] = if_stmt.then_block.stmts.as_slice() else {
-        return None;
-    };
-    Some(goto_stmt.target)
-}
-
-fn can_fold_guard_goto_body(stmts: &[AstStmt]) -> bool {
-    stmts.iter().all(|stmt| {
-        !matches!(
-            stmt,
-            AstStmt::Label(_) | AstStmt::LocalDecl(_) | AstStmt::LocalFunctionDecl(_)
-        )
-    })
-}
-
-fn is_terminal_goto_branch_value_assignment(if_stmt: &AstStmt, else_body: &[AstStmt]) -> bool {
-    let AstStmt::If(if_stmt) = if_stmt else {
-        return false;
-    };
-    let [AstStmt::Assign(then_assign), AstStmt::Goto(_)] = if_stmt.then_block.stmts.as_slice()
-    else {
-        return false;
-    };
-    let [AstStmt::Assign(else_assign)] = else_body else {
-        return false;
-    };
-
-    then_assign.targets == else_assign.targets
-}
-
-fn goto_target_counts_in_block(block: &AstBlock) -> BTreeMap<AstLabelId, usize> {
-    let mut collector = GotoTargetCollector {
-        counts: BTreeMap::new(),
-    };
-    visit::visit_block(block, &mut collector);
-    collector.counts
-}
-
-struct GotoTargetCollector {
-    counts: BTreeMap<AstLabelId, usize>,
-}
-
-impl AstVisitor for GotoTargetCollector {
-    fn visit_stmt(&mut self, stmt: &AstStmt) {
-        if let AstStmt::Goto(goto_stmt) = stmt {
-            *self.counts.entry(goto_stmt.target).or_default() += 1;
-        }
-    }
-
-    fn visit_function_expr(&mut self, _function: &AstFunctionExpr) -> bool {
-        false
-    }
 }
 
 fn block_always_terminates(block: &AstBlock) -> bool {
@@ -611,52 +275,6 @@ fn stmt_contains_label_or_goto(stmt: &AstStmt) -> bool {
         | AstStmt::Return(_)
         | AstStmt::Error(_) => false,
     }
-}
-
-/// 移除紧邻 `goto L; ::L::` 的无效跳转对。当 goto 是该 label 的唯一引用时，
-/// 两者一起移除；否则只移除 goto。
-fn remove_nop_goto_labels(block: &mut AstBlock) -> bool {
-    let goto_counts = goto_target_counts_in_block(block);
-    let mut remove_indices = BTreeSet::new();
-
-    for i in 0..block.stmts.len().saturating_sub(1) {
-        let AstStmt::Goto(goto_stmt) = &block.stmts[i] else {
-            continue;
-        };
-        let AstStmt::Label(label_stmt) = &block.stmts[i + 1] else {
-            continue;
-        };
-        if goto_stmt.target != label_stmt.id {
-            continue;
-        }
-        remove_indices.insert(i);
-        if goto_counts
-            .get(&goto_stmt.target)
-            .copied()
-            .unwrap_or_default()
-            == 1
-        {
-            remove_indices.insert(i + 1);
-        }
-    }
-
-    if remove_indices.is_empty() {
-        return false;
-    }
-
-    let old_stmts = std::mem::take(&mut block.stmts);
-    block.stmts = old_stmts
-        .into_iter()
-        .enumerate()
-        .filter_map(|(i, stmt)| {
-            if remove_indices.contains(&i) {
-                None
-            } else {
-                Some(stmt)
-            }
-        })
-        .collect();
-    true
 }
 
 fn negate_guard_condition(expr: AstExpr) -> AstExpr {

@@ -25,8 +25,8 @@ use crate::transformer::{
 };
 
 pub(super) use self::access::{
-    expr_for_const, expr_for_value_operand, lower_table_access_expr, lower_table_access_target,
-    lower_upvalue_operand_expr, lower_upvalue_operand_target,
+    expr_for_const, expr_for_value_operand, global_name_for_access, lower_table_access_expr,
+    lower_table_access_target, lower_upvalue_operand_expr, lower_upvalue_operand_target,
 };
 use self::access::{
     expr_for_value_operand_inline, expr_for_value_operand_single_eval_pure_operand,

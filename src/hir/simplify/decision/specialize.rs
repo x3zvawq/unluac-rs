@@ -246,10 +246,6 @@ fn known_eq_truthiness_from_facts(
     rhs: &HirExpr,
     facts: &TruthFacts,
 ) -> Option<bool> {
-    if lhs == rhs {
-        return Some(true);
-    }
-
     match (
         truth_sensitive_literal(lhs),
         truth_sensitive_literal(rhs),

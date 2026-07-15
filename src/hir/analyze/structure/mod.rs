@@ -17,13 +17,14 @@ use crate::hir::common::{
     HirLogicalExpr, HirNumericFor, HirRepeat, HirStmt, HirWhile, TempId,
 };
 use crate::hir::decision::finalize_condition_decision_expr;
-use crate::structure::{BlockRef, PhiId, ReachableSuccessorShape};
 use crate::structure::{
-    BranchCandidate, BranchKind, BranchRegionFact, BranchValueMergeArm, BranchValueMergeCandidate,
-    BranchValueMergeValue, GotoReason, LoopCandidate, LoopCandidateId, LoopKindHint, LoopValueArm,
-    LoopValueMerge, ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNodeRef,
+    BlockOwner, BranchCandidate, BranchCandidateId, BranchKind, BranchRegionFact,
+    BranchValueMergeArm, BranchValueMergeCandidate, BranchValueMergeValue, CleanupDisposition,
+    EdgeOwner, GotoReason, LoopCandidate, LoopCandidateId, LoopKindHint, LoopValueArm,
+    LoopValueMerge, RegionId, ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNodeRef,
     ShortCircuitTarget,
 };
+use crate::structure::{BlockRef, PhiId, ReachableSuccessorShape};
 use crate::transformer::{InstrRef, LowInstr, Reg};
 
 use super::exprs::{
@@ -42,7 +43,8 @@ use super::short_circuit::{
 use super::{ProtoLowering, assign_stmt, branch_stmt, lower_branch_cond};
 use super::{
     build_label_map_for_summary, goto_block, is_control_terminator, lower_control_instr,
-    lower_phi_materialization_with_allowed_blocks_except, lower_regular_instr,
+    lower_edge_phi_copies_for_edge, lower_phi_materialization_with_allowed_blocks_except,
+    lower_regular_instr,
 };
 use body::*;
 use overrides::StructureOverrideState;

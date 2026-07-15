@@ -398,13 +398,13 @@ fn collapse_expr_to_pure(expr: HirExpr) -> Option<HirExpr> {
             let lhs = collapse_expr_to_pure(logical.lhs)?;
             let rhs = collapse_expr_to_pure(logical.rhs)?;
             let expr = HirExpr::LogicalAnd(Box::new(HirLogicalExpr { lhs, rhs }));
-            Some(super::simplify_lua_logical_shape(&expr).unwrap_or(expr))
+            Some(super::super::logical_simplify::simplify_logical_shape(&expr).unwrap_or(expr))
         }
         HirExpr::LogicalOr(logical) => {
             let lhs = collapse_expr_to_pure(logical.lhs)?;
             let rhs = collapse_expr_to_pure(logical.rhs)?;
             let expr = HirExpr::LogicalOr(Box::new(HirLogicalExpr { lhs, rhs }));
-            Some(super::simplify_lua_logical_shape(&expr).unwrap_or(expr))
+            Some(super::super::logical_simplify::simplify_logical_shape(&expr).unwrap_or(expr))
         }
         HirExpr::Call(call) => Some(HirExpr::Call(Box::new(collapse_call_to_pure(*call)?))),
         HirExpr::TableConstructor(table) => {
@@ -593,11 +593,13 @@ pub(super) fn eliminate_condition_expr(expr: &mut HirExpr) -> bool {
         | HirExpr::Unresolved(_) => false,
     };
 
-    if let Some(replacement) = super::simplify_lua_logical_shape(expr) {
+    if let Some(replacement) = super::super::logical_simplify::simplify_logical_shape(expr) {
         *expr = replacement;
         changed = true;
     }
-    if let Some(replacement) = super::simplify_condition_truthiness_shape(expr) {
+    if let Some(replacement) =
+        super::super::logical_simplify::simplify_condition_truthiness_shape(expr)
+    {
         *expr = replacement;
         changed = true;
     }

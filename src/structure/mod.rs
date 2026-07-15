@@ -37,7 +37,10 @@ pub use common::{
 };
 #[cfg(feature = "decompile-debug")]
 pub use debug::dump_structure;
-pub use plan::{BranchValueMergeId, LoopCandidateId};
+pub use plan::{
+    BlockOwner, BranchCandidateId, BranchValueMergeId, CleanupDisposition, EdgeOwner,
+    GotoRequirementId, LoopCandidateId, RegionId, ScopeCandidateId,
+};
 #[cfg(not(feature = "decompile-debug"))]
 mod debug {
     crate::debug::define_unavailable_stage_dump!(dump_structure);

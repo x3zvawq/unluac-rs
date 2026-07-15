@@ -465,7 +465,7 @@ impl StructuredBodyLowerer<'_, '_> {
             owned_continue_entry.is_some() || short_circuit_non_continue.is_some();
         let can_fallthrough_to_non_empty_continue = matches!(
             active_candidate.kind_hint,
-            LoopKindHint::NumericForLike | LoopKindHint::GenericForLike | LoopKindHint::Unknown
+            LoopKindHint::GenericForLike | LoopKindHint::Unknown
         );
         if !(continue_target_is_empty
             || can_fallthrough_to_non_empty_continue

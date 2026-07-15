@@ -19,6 +19,7 @@ use super::common::{
     ShortCircuitExit, ShortCircuitNode, ShortCircuitTarget, ShortCircuitValueIncoming,
     StructureFacts,
 };
+use super::{BlockOwner, CleanupDisposition, EdgeOwner};
 
 #[derive(Debug, Clone, Copy)]
 struct ProtoEntry<'a> {
@@ -160,6 +161,9 @@ fn dump_structure_facts(
         let _ = writeln!(output, "{indent}  branch candidates");
         write_branches(&mut output, &indent, &entry.facts.branch_candidates);
 
+        let _ = writeln!(output, "{indent}  structure plan");
+        write_plan(&mut output, &indent, entry.facts);
+
         let _ = writeln!(output, "{indent}  branch region facts");
         write_branch_regions(&mut output, &indent, &entry.facts.branch_region_facts);
 
@@ -194,6 +198,84 @@ fn dump_structure_facts(
     }
 
     colorize_debug_text(&output, color)
+}
+
+fn write_plan(output: &mut String, indent: &str, facts: &StructureFacts) {
+    let blocks = facts
+        .plan
+        .block_owners
+        .iter()
+        .enumerate()
+        .map(|(index, owner)| format!("#{index}={}", format_block_owner(*owner)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let edges = facts
+        .plan
+        .edge_owners
+        .iter()
+        .enumerate()
+        .map(|(index, owner)| format!("#{index}={}", format_edge_owner(*owner)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let unstructured_membership = facts
+        .plan
+        .unstructured_region_by_block
+        .iter()
+        .enumerate()
+        .filter_map(|(index, region)| region.map(|region| format!("#{index}=r{}", region.index())))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let cleanup_dispositions = facts
+        .plan
+        .cleanup_dispositions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, disposition)| {
+            disposition
+                .map(|disposition| format!("@{index}={}", format_cleanup_disposition(disposition)))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(output, "{indent}    blocks [{blocks}]");
+    let _ = writeln!(output, "{indent}    edges [{edges}]");
+    let _ = writeln!(
+        output,
+        "{indent}    unstructured-membership [{unstructured_membership}]"
+    );
+    let _ = writeln!(output, "{indent}    cleanups [{cleanup_dispositions}]");
+}
+
+fn format_cleanup_disposition(disposition: CleanupDisposition) -> String {
+    match disposition {
+        CleanupDisposition::Unreachable => "unreachable".to_owned(),
+        CleanupDisposition::ExplicitTbc => "explicit-tbc".to_owned(),
+        CleanupDisposition::GenericFor(id) => format!("generic-for:c{}", id.index()),
+        CleanupDisposition::ExplicitTbcBoundary => "explicit-tbc-boundary".to_owned(),
+        CleanupDisposition::LexicalScope(id) => format!("lexical-scope:s{}", id.index()),
+    }
+}
+
+fn format_block_owner(owner: BlockOwner) -> String {
+    match owner {
+        BlockOwner::Unreachable => "unreachable".to_owned(),
+        BlockOwner::Linear => "linear".to_owned(),
+        BlockOwner::Branch(id) => format!("branch:c{}", id.index()),
+        BlockOwner::Loop(id) => format!("loop:c{}", id.index()),
+        BlockOwner::Unstructured(id) => format!("unstructured:r{}", id.index()),
+        BlockOwner::Exit => "exit".to_owned(),
+    }
+}
+
+fn format_edge_owner(owner: EdgeOwner) -> String {
+    match owner {
+        EdgeOwner::Unreachable => "unreachable".to_owned(),
+        EdgeOwner::Linear => "linear".to_owned(),
+        EdgeOwner::Branch(id) => format!("branch:c{}", id.index()),
+        EdgeOwner::Loop(id) => format!("loop:c{}", id.index()),
+        EdgeOwner::Unstructured(id) => format!("unstructured:r{}", id.index()),
+        EdgeOwner::Goto(id) => format!("goto:g{}", id.index()),
+        EdgeOwner::Terminal => "terminal".to_owned(),
+    }
 }
 
 fn collect_proto_entries(root: &StructureFacts) -> Vec<ProtoEntry<'_>> {
@@ -483,9 +565,8 @@ fn write_gotos(output: &mut String, indent: &str, requirements: &[GotoRequiremen
     for requirement in requirements {
         let _ = writeln!(
             output,
-            "{indent}    #{} -> #{} reason={}",
-            requirement.from.index(),
-            requirement.to.index(),
+            "{indent}    edge={} reason={}",
+            requirement.edge,
             format_goto_reason(requirement.reason),
         );
     }

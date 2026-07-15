@@ -19,8 +19,9 @@ use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirLValue, HirLocalDecl, HirLogicalExpr, HirProto, HirStmt,
     HirUnaryExpr, HirUnaryOpKind, HirValuePack, TempId,
 };
+use crate::hir::expr_safety::expr_is_discard_safe;
 
-use super::expr_facts::{expr_is_boolean_valued, expr_is_side_effect_free};
+use super::expr_facts::expr_is_boolean_valued;
 use super::local_shapes::empty_single_local_decl_binding;
 use super::visit::{HirVisitor, visit_proto};
 use super::walk::{HirRewritePass, rewrite_proto};
@@ -139,7 +140,7 @@ fn removable_dead_materialization_shell(
     let Some(else_block) = &if_stmt.else_block else {
         return false;
     };
-    if !expr_is_side_effect_free(&if_stmt.cond) {
+    if !expr_is_discard_safe(&if_stmt.cond) {
         return false;
     }
 
@@ -160,7 +161,7 @@ fn removable_dead_materialization_shell(
         return false;
     }
 
-    expr_is_side_effect_free(then_value) && expr_is_side_effect_free(else_value)
+    expr_is_discard_safe(then_value) && expr_is_discard_safe(else_value)
 }
 
 fn pure_assign_pattern(block: &HirBlock) -> Option<(&HirLValue, &HirExpr)> {

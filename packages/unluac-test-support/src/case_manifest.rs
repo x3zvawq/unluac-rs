@@ -983,6 +983,46 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_177_lua55_generic_for_live_out.lua",
         PUC_LUA_GE_55,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_178_observable_expression_reads.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_179_long_bracket_suffix_delimiter.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_180_numeric_for_shared_tail.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_181_generic_for_branch_phi.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_182_numeric_for_before_irreducible_goto.lua",
+        PUC_LUA_GE_52,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_183_mixed_irreducible_explicit_close.lua",
+        PUC_LUA_GE_54,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_184_mixed_irreducible_generic_close.lua",
+        PUC_LUA_GE_54,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_185_branch_control_forward_guards.lua",
+        PUC_LUA_GE_52,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_186_truthy_ternary_hir_owner.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_187_irreducible_plain_loop_owner.lua",
+        PUC_LUA_GE_52,
+    ),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {

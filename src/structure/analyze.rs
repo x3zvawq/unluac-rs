@@ -120,10 +120,23 @@ pub(crate) fn analyze_structure_proto(
         &short_circuit_candidates,
         &loop_candidates,
     );
+    let scope_candidates = scope::analyze_scopes(
+        proto,
+        cfg,
+        graph_facts,
+        &loop_candidates,
+        &branch_region_facts,
+    );
+    let cleanup_dispositions =
+        scope::analyze_cleanup_dispositions(proto, cfg, &loop_candidates, &scope_candidates);
     let plan = plan::build_structure_plan(
+        cfg,
         &branch_candidates,
         &branch_value_merge_candidates,
         &loop_candidates,
+        &goto_requirements,
+        &region_facts,
+        cleanup_dispositions,
     );
     phi_facts::remove_branch_owned_loop_exit_values(
         &mut loop_candidates,
@@ -140,14 +153,6 @@ pub(crate) fn analyze_structure_proto(
         &loop_candidates,
         &short_circuit_candidates,
     );
-    let scope_candidates = scope::analyze_scopes(
-        proto,
-        cfg,
-        graph_facts,
-        &loop_candidates,
-        &branch_region_facts,
-    );
-
     let children = proto
         .children
         .iter()

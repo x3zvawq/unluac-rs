@@ -223,10 +223,17 @@ pub(super) fn is_discard_safe_expr(expr: &AstExpr) -> bool {
         | AstExpr::Int64(_)
         | AstExpr::UInt64(_)
         | AstExpr::Vector(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::Var(_) => true,
+        | AstExpr::Complex { .. } => true,
+        AstExpr::Var(
+            AstNameRef::Param(_)
+            | AstNameRef::Local(_)
+            | AstNameRef::SyntheticLocal(_)
+            | AstNameRef::Temp(_)
+            | AstNameRef::Upvalue(_),
+        ) => true,
         AstExpr::SingleValue(expr) => is_discard_safe_expr(expr),
-        AstExpr::FieldAccess(_)
+        AstExpr::Var(AstNameRef::Global(_))
+        | AstExpr::FieldAccess(_)
         | AstExpr::IndexAccess(_)
         | AstExpr::Unary(_)
         | AstExpr::Binary(_)
@@ -300,35 +307,6 @@ fn is_call_arg_constructor_field_expr(expr: &AstExpr) -> bool {
     is_context_safe_expr(expr)
         || is_lookup_inline_expr(expr)
         || is_call_arg_constructor_inline_expr(expr)
-}
-
-pub(super) fn is_always_truthy_expr(expr: &AstExpr) -> bool {
-    match expr {
-        AstExpr::Boolean(true)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Vector(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::TableConstructor(_)
-        | AstExpr::FunctionExpr(_) => true,
-        AstExpr::Nil
-        | AstExpr::Boolean(false)
-        | AstExpr::Var(_)
-        | AstExpr::FieldAccess(_)
-        | AstExpr::IndexAccess(_)
-        | AstExpr::Unary(_)
-        | AstExpr::Binary(_)
-        | AstExpr::LogicalAnd(_)
-        | AstExpr::LogicalOr(_)
-        | AstExpr::Call(_)
-        | AstExpr::MethodCall(_)
-        | AstExpr::SingleValue(_)
-        | AstExpr::VarArg
-        | AstExpr::Error(_) => false,
-    }
 }
 
 fn is_named_field_chain_expr(expr: &AstExpr) -> bool {

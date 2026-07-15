@@ -12,6 +12,7 @@
 use std::collections::BTreeSet;
 
 use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirProto, HirStmt, TempId};
+use crate::hir::expr_safety::expr_is_discard_safe;
 
 use super::visit::{HirVisitor, visit_proto};
 use super::walk::{HirRewritePass, rewrite_proto};
@@ -69,31 +70,5 @@ fn is_dead_pure_temp_assignment(stmt: &HirStmt, live_reads: &BTreeSet<TempId>) -
     if assign.values.tail.is_some() {
         return false;
     }
-    !live_reads.contains(temp) && is_pure_value(value)
-}
-
-/// RHS 不含任何潜在副作用时返回 true。
-///
-/// Lua 里 table access 可能触发 `__index`，算术/比较可能触发 metamethod，
-/// 函数调用当然有副作用 —— 这些都不能安全删除。只有确定无副作用的常量和引用可以消除。
-fn is_pure_value(expr: &HirExpr) -> bool {
-    matches!(
-        expr,
-        HirExpr::Nil
-            | HirExpr::Boolean(_)
-            | HirExpr::Integer(_)
-            | HirExpr::Number(_)
-            | HirExpr::String(_)
-            | HirExpr::Int64(_)
-            | HirExpr::UInt64(_)
-            | HirExpr::Vector(_)
-            | HirExpr::Complex { .. }
-            | HirExpr::ParamRef(_)
-            | HirExpr::LocalRef(_)
-            | HirExpr::UpvalueRef(_)
-            | HirExpr::TempRef(_)
-            | HirExpr::GlobalRef(_)
-            | HirExpr::VarArg
-            | HirExpr::Unresolved(_)
-    )
+    !live_reads.contains(temp) && expr_is_discard_safe(value)
 }
