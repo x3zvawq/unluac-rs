@@ -117,7 +117,9 @@ impl StructuredBodyLowerer<'_, '_> {
                 rewrite_expr_temps(&mut cond, &temp_expr_overrides(target_overrides));
                 let mut break_block =
                     self.lower_region(break_entry, Some(loop_context.post_loop), target_overrides)?;
-                break_block.stmts.push(HirStmt::Break);
+                break_block
+                    .stmts
+                    .extend(loop_context.break_stmts(loop_context.post_loop));
 
                 stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
                 self.visited.extend(plan.consumed_blocks);
@@ -180,7 +182,7 @@ impl StructuredBodyLowerer<'_, '_> {
             // 中间块的指令前缀到 break 之前，避免丢失赋值等副作用。若 else 臂
             // 不是这种单块线性 break pad，上面的校验会退让给普通分支 lowering。
             let mut stmts = pad_stmts;
-            stmts.push(HirStmt::Break);
+            stmts.extend(loop_context.break_stmts(break_exit));
             HirBlock { stmts }
         } else {
             loop_context.break_exits[&break_exit].block.clone()

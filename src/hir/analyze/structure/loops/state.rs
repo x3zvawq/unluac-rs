@@ -15,6 +15,34 @@ use super::*;
 use crate::structure::SsaValue;
 
 impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
+    pub(super) fn suppress_unstructured_preheader_state_phis(
+        &mut self,
+        preheader: BlockRef,
+        plan: &LoopStatePlan,
+    ) {
+        if self
+            .lowering
+            .structure
+            .unstructured_region(preheader)
+            .is_none()
+        {
+            return;
+        }
+
+        for phi in self.lowering.dataflow.phi_candidates_in_block(preheader) {
+            let temp = self.lowering.bindings.phi_temps[phi.id.index()];
+            // island 的显式入边已经按 edge 写入同一状态槽；再次 generic 物化只会
+            // 重复定义该槽，且 unresolved source 会把已证明的 loop owner 重新污染。
+            if plan
+                .states
+                .iter()
+                .any(|state| state.reg == phi.reg && state.target == HirLValue::Temp(temp))
+            {
+                self.overrides.suppress_phi(phi.id);
+            }
+        }
+    }
+
     pub(super) fn build_loop_state_plan(
         &self,
         candidate_id: LoopCandidateId,

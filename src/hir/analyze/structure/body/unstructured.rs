@@ -2,8 +2,8 @@
 //!
 //! island 只扩到不可规约 SCC 及其通往唯一后支配 continuation 的空 jump pad。每个
 //! block 仍按 `StructurePlan` 的直接 owner 分派：Branch 使用稳定 candidate identity，
-//! plain Loop header 可按真实 CFG 边局部降低；numeric/generic-for 协议仍不降级成 raw
-//! 控制。无法证明的 cleanup、循环控制或出口边界直接退让。
+//! plain Loop header 可按真实 CFG 边局部降低；numeric/generic-for 协议只复用既有 loop
+//! candidate，不降级成 raw 控制。无法证明的 cleanup、循环控制或出口边界直接退让。
 
 use super::*;
 
@@ -186,22 +186,6 @@ impl StructuredBodyLowerer<'_, '_> {
             .collect::<Vec<_>>();
         let start_index = blocks.iter().position(|block| *block == start)?;
         blocks.rotate_left(start_index);
-        if blocks.iter().copied().any(|block| {
-            let range = self.lowering.cfg.blocks[block.index()].instrs;
-            (range.start.index()..range.end()).any(|instr_ref| {
-                matches!(
-                    self.lowering.proto.instrs[instr_ref],
-                    LowInstr::Tbc(_)
-                        | LowInstr::NumericForInit(_)
-                        | LowInstr::NumericForLoop(_)
-                        | LowInstr::GenericForLoop(_)
-                ) || matches!(self.lowering.proto.instrs[instr_ref], LowInstr::Close(_))
-                    && !self.unstructured_prefix_instr_is_omitted(InstrRef(instr_ref))
-            })
-        }) {
-            return None;
-        }
-
         let continuation_is_loop_escape = self.unstructured_loop_escape_target(continuation);
         if continuation != self.lowering.cfg.exit_block {
             let has_outside_predecessor =
@@ -230,9 +214,33 @@ impl StructuredBodyLowerer<'_, '_> {
         }
 
         for (index, block) in blocks.iter().copied().enumerate() {
+            if self.visited.contains(&block) {
+                continue;
+            }
             if block != start {
                 self.emit_required_label(block, stmts);
             }
+            let checkpoint = self.checkpoint_state(stmts.len());
+            if let Some(loop_next) = self
+                .try_lower_unstructured_for(block, stop, stmts, target_overrides)
+                .flatten()
+            {
+                let layout_next = blocks[index + 1..]
+                    .iter()
+                    .copied()
+                    .find(|candidate| !self.visited.contains(candidate))
+                    .or_else(|| (!continuation_is_loop_escape).then_some(continuation));
+                if Some(loop_next) != layout_next {
+                    if self.unstructured_loop_escape_target(loop_next) {
+                        stmts.push(HirStmt::Break);
+                    } else if loop_next != self.lowering.cfg.exit_block {
+                        self.required_labels.insert(loop_next);
+                        stmts.extend(goto_block(self.label_map[&loop_next]).stmts);
+                    }
+                }
+                continue;
+            }
+            self.restore_state_checkpoint(checkpoint, stmts);
             if !self.visited.insert(block) {
                 return None;
             }
@@ -247,6 +255,29 @@ impl StructuredBodyLowerer<'_, '_> {
             (continuation != self.lowering.cfg.exit_block && !continuation_is_loop_escape)
                 .then_some(continuation),
         )
+    }
+
+    fn try_lower_unstructured_for(
+        &mut self,
+        block: BlockRef,
+        stop: Option<BlockRef>,
+        stmts: &mut Vec<HirStmt>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<Option<BlockRef>> {
+        let checkpoint = self.checkpoint_state(stmts.len());
+        if let Some(next) = self.try_lower_numeric_for_init(block, stop, stmts, target_overrides) {
+            return Some(next);
+        }
+        self.restore_state_checkpoint(checkpoint, stmts);
+
+        let checkpoint = self.checkpoint_state(stmts.len());
+        if let Some(next) =
+            self.try_lower_generic_for_preheader(block, stop, stmts, target_overrides)
+        {
+            return Some(next);
+        }
+        self.restore_state_checkpoint(checkpoint, stmts);
+        None
     }
 
     fn lower_unstructured_block(
@@ -356,6 +387,9 @@ impl StructuredBodyLowerer<'_, '_> {
             if matches!(
                 self.lowering.proto.instrs[index],
                 LowInstr::Close(_) | LowInstr::Tbc(_)
+            ) && matches!(
+                self.lowering.structure.cleanup_disposition(instr_ref),
+                CleanupDisposition::GenericFor(_)
             ) {
                 return None;
             }
@@ -438,7 +472,7 @@ impl StructuredBodyLowerer<'_, '_> {
                 Some(BlockOwner::Linear)
             ) || !self
                 .block_prefix_instr_indices(block, false)?
-                .all(|index| self.unstructured_prefix_instr_is_omitted(InstrRef(index)))
+                .all(|index| self.unstructured_exit_pad_instr_is_cleanup(InstrRef(index)))
             {
                 return None;
             }
@@ -451,11 +485,22 @@ impl StructuredBodyLowerer<'_, '_> {
     fn unstructured_prefix_instr_is_omitted(&self, instr_ref: InstrRef) -> bool {
         matches!(
             self.lowering.proto.instrs[instr_ref.index()],
-            LowInstr::Close(_)
+            LowInstr::Close(_) | LowInstr::Tbc(_)
         ) && matches!(
             self.lowering.structure.cleanup_disposition(instr_ref),
-            CleanupDisposition::LexicalScope(_)
+            CleanupDisposition::LexicalScope(_) | CleanupDisposition::Unreachable
         )
+    }
+
+    fn unstructured_exit_pad_instr_is_cleanup(&self, instr_ref: InstrRef) -> bool {
+        self.unstructured_prefix_instr_is_omitted(instr_ref)
+            || matches!(
+                self.lowering.proto.instrs[instr_ref.index()],
+                LowInstr::Close(_)
+            ) && matches!(
+                self.lowering.structure.cleanup_disposition(instr_ref),
+                CleanupDisposition::ExplicitTbcBoundary
+            )
     }
 
     pub(super) fn required_goto_edge(

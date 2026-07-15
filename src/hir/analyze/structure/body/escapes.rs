@@ -34,11 +34,15 @@ impl StructuredBodyLowerer<'_, '_> {
             return Some(vec![HirStmt::Continue]);
         }
         if block == loop_context.post_loop || Some(block) == loop_context.downstream_post_loop {
-            return Some(vec![HirStmt::Break]);
+            return Some(loop_context.break_stmts(block));
         }
         if let Some(break_block) = loop_context.break_exits.get(&block) {
             self.visited.extend(break_block.blocks.iter().copied());
             return Some(break_block.block.stmts.clone());
+        }
+        if loop_context.goto_exits.contains(&block) {
+            self.required_labels.insert(block);
+            return Some(goto_block(self.label_map[&block]).stmts);
         }
         None
     }

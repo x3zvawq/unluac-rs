@@ -12,6 +12,13 @@ use super::*;
 use crate::hir::expr_safety::expr_observes_eval_order;
 use crate::hir::{HirTableField, HirTableKey};
 
+struct PostLoopBreakPrefix {
+    instrs: Vec<InstrRef>,
+    boundary: InstrRef,
+    continuation: BlockRef,
+    tbc_regs: Vec<Reg>,
+}
+
 impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     pub(crate) fn lower_loop(
         &mut self,
@@ -99,13 +106,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         }
 
+        let post_loop_prefix = self.post_loop_break_prefix(candidate, post_loop);
         let preheader = unique_loop_preheader(candidate);
         let plan = self.build_loop_state_plan(
             candidate_id,
             candidate,
             preheader,
             post_loop,
-            &[],
+            post_loop_prefix
+                .as_ref()
+                .map_or(&[], |prefix| prefix.tbc_regs.as_slice()),
             target_overrides,
         )?;
         let combined_target_overrides =
@@ -121,6 +131,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         loop_context.continue_target = Some(candidate.header);
         loop_context.continue_sources.clear();
         loop_context.state_slots = plan.states.clone();
+        if let Some(prefix) = &post_loop_prefix {
+            if prefix.continuation != post_loop {
+                loop_context.downstream_post_loop = Some(prefix.continuation);
+            }
+            loop_context.post_loop_break = Some(self.lower_post_loop_break_prefix(
+                post_loop,
+                prefix,
+                &combined_target_overrides,
+            )?);
+        }
 
         for phi_id in &plan.owned_phis {
             self.overrides.suppress_phi(*phi_id);
@@ -135,6 +155,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.active_loops.pop();
         for phi_id in &plan.owned_phis {
             self.overrides.unsuppress_phi(*phi_id);
+        }
+        if let Some(prefix) = &post_loop_prefix {
+            self.overrides
+                .suppress_instrs(prefix.instrs.iter().copied().chain([prefix.boundary]));
+            if prefix.continuation != post_loop {
+                self.visited.insert(post_loop);
+            }
         }
 
         stmts.extend(loop_state_init_stmts(&plan));
@@ -156,7 +183,154 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             body,
         })));
 
-        Some(Some(post_loop))
+        Some(Some(
+            post_loop_prefix.map_or(post_loop, |prefix| prefix.continuation),
+        ))
+    }
+
+    fn post_loop_break_prefix(
+        &self,
+        candidate: &LoopCandidate,
+        post_loop: BlockRef,
+    ) -> Option<PostLoopBreakPrefix> {
+        if self
+            .lowering
+            .cfg
+            .reachable_predecessors(post_loop)
+            .iter()
+            .any(|pred| !candidate.blocks.contains(pred))
+            || self
+                .lowering
+                .dataflow
+                .phi_candidates_in_block(post_loop)
+                .iter()
+                .any(|phi| !self.lowering.dead_phis.contains(&phi.id))
+        {
+            return None;
+        }
+
+        let range = self.lowering.cfg.blocks[post_loop.index()].instrs;
+        let (instrs, boundary, continuation, close_from) =
+            if let Some((boundary, close_from)) = self.first_explicit_tbc_boundary(post_loop) {
+                (
+                    (range.start.index()..boundary.index())
+                        .map(InstrRef)
+                        .collect::<Vec<_>>(),
+                    boundary,
+                    post_loop,
+                    close_from,
+                )
+            } else {
+                let (jump_ref, LowInstr::Jump(jump)) = self.block_terminator(post_loop)? else {
+                    return None;
+                };
+                let continuation = self.lowering.cfg.instr_to_block[jump.target.index()];
+                if self.lowering.cfg.reachable_predecessors(continuation) != [post_loop]
+                    || self
+                        .lowering
+                        .dataflow
+                        .phi_candidates_in_block(continuation)
+                        .iter()
+                        .any(|phi| !self.lowering.dead_phis.contains(&phi.id))
+                {
+                    return None;
+                }
+                let (boundary, close_from) = self.first_explicit_tbc_boundary(continuation)?;
+                if boundary != self.lowering.cfg.blocks[continuation.index()].instrs.start {
+                    return None;
+                }
+                (
+                    (range.start.index()..jump_ref.index())
+                        .map(InstrRef)
+                        .collect::<Vec<_>>(),
+                    boundary,
+                    continuation,
+                    close_from,
+                )
+            };
+        if instrs.is_empty()
+            || instrs.iter().any(|instr_ref| {
+                matches!(
+                    self.lowering.proto.instrs[instr_ref.index()],
+                    LowInstr::Close(_) | LowInstr::Tbc(_)
+                )
+            })
+        {
+            return None;
+        }
+
+        let tbc_regs = candidate
+            .blocks
+            .iter()
+            .flat_map(|block| {
+                let range = self.lowering.cfg.blocks[block.index()].instrs;
+                range.start.index()..range.end()
+            })
+            .filter_map(|index| match self.lowering.proto.instrs[index] {
+                LowInstr::Tbc(tbc)
+                    if tbc.kind == crate::transformer::TbcKind::Explicit
+                        && tbc.reg.index() >= close_from.index() =>
+                {
+                    Some(tbc.reg)
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        if tbc_regs.is_empty()
+            || !instrs.iter().any(|instr_ref| {
+                self.lowering.dataflow.instr_effects[instr_ref.index()]
+                    .fixed_uses
+                    .iter()
+                    .any(|reg| tbc_regs.contains(reg))
+            })
+        {
+            return None;
+        }
+
+        Some(PostLoopBreakPrefix {
+            instrs,
+            boundary,
+            continuation,
+            tbc_regs: tbc_regs.into_iter().collect(),
+        })
+    }
+
+    fn first_explicit_tbc_boundary(&self, block: BlockRef) -> Option<(InstrRef, Reg)> {
+        let range = self.lowering.cfg.blocks[block.index()].instrs;
+        (range.start.index()..range.end()).find_map(|index| {
+            let instr_ref = InstrRef(index);
+            let LowInstr::Close(close) = self.lowering.proto.instrs[index] else {
+                return None;
+            };
+            matches!(
+                self.lowering.structure.cleanup_disposition(instr_ref),
+                CleanupDisposition::ExplicitTbcBoundary
+            )
+            .then_some((instr_ref, close.from))
+        })
+    }
+
+    fn lower_post_loop_break_prefix(
+        &self,
+        post_loop: BlockRef,
+        prefix: &PostLoopBreakPrefix,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<HirBlock> {
+        let mut stmts = Vec::new();
+        for instr_ref in &prefix.instrs {
+            if self.overrides.instr_is_suppressed(*instr_ref) {
+                return None;
+            }
+            stmts.extend(lower_regular_instr(
+                self.lowering,
+                post_loop,
+                *instr_ref,
+                &self.lowering.proto.instrs[instr_ref.index()],
+            ));
+        }
+        apply_loop_rewrites(&mut stmts, target_overrides);
+        stmts.push(HirStmt::Break);
+        Some(HirBlock { stmts })
     }
 
     fn lower_header_retry_while_true_loop(
@@ -708,6 +882,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 state.initialize_target = false;
             }
         }
+        self.suppress_unstructured_preheader_state_phis(block, &plan);
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
         let mut suppressed = plan
@@ -843,6 +1018,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             &excluded_regs,
             target_overrides,
         )?;
+        self.suppress_unstructured_preheader_state_phis(block, &plan);
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
 

@@ -21,9 +21,20 @@ impl StructuredBodyLowerer<'_, '_> {
     ) -> Option<ActiveLoopContext> {
         let downstream_post_loop = self.normalized_post_loop_successor(post_loop);
         let mut break_exits = BTreeMap::new();
+        let mut goto_exits = BTreeSet::new();
+        let unstructured_region = self
+            .lowering
+            .structure
+            .unstructured_region(candidate.header);
         for exit in candidate.exits.iter().copied().filter(|exit| {
             *exit != post_loop && !self.loop_exit_enters_nested_loop(candidate_id, candidate, *exit)
         }) {
+            if unstructured_region.is_some()
+                && self.lowering.structure.unstructured_region(exit) == unstructured_region
+            {
+                goto_exits.insert(exit);
+                continue;
+            }
             let Some(break_exit) = self.lower_loop_break_exit(
                 candidate,
                 exit,
@@ -73,7 +84,9 @@ impl StructuredBodyLowerer<'_, '_> {
             body_stop: None,
             continue_sources,
             break_exits,
+            goto_exits,
             state_slots: Vec::new(),
+            post_loop_break: None,
         })
     }
 

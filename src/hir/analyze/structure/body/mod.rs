@@ -101,7 +101,22 @@ pub(super) struct ActiveLoopContext {
     pub(super) body_stop: Option<BlockRef>,
     pub(super) continue_sources: BTreeSet<BlockRef>,
     pub(super) break_exits: BTreeMap<BlockRef, BreakExitBlock>,
+    // 同一不可规约 island 内的侧出口仍会回流到 loop preheader，不能伪装成 break。
+    pub(super) goto_exits: BTreeSet<BlockRef>,
     pub(super) state_slots: Vec<LoopStateSlot>,
+    pub(super) post_loop_break: Option<HirBlock>,
+}
+
+impl ActiveLoopContext {
+    pub(super) fn break_stmts(&self, target: BlockRef) -> Vec<HirStmt> {
+        if target == self.post_loop {
+            self.post_loop_break
+                .as_ref()
+                .map_or_else(|| vec![HirStmt::Break], |block| block.stmts.clone())
+        } else {
+            vec![HirStmt::Break]
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -342,7 +357,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
             self.emit_required_label(block, &mut stmts);
 
-            if let Some(region_id) = self.lowering.structure.unstructured_region(block) {
+            if let Some(region_id) = self.lowering.structure.unstructured_region(block)
+                && !self.active_loops.last().is_some_and(|loop_context| {
+                    loop_context.loop_blocks.contains(&block)
+                        && self
+                            .lowering
+                            .structure
+                            .unstructured_region(loop_context.header)
+                            == Some(region_id)
+                })
+            {
                 current = self.lower_unstructured_region(
                     block,
                     region_id,
@@ -574,6 +598,17 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             stmts.extend(edge_stmts);
             return Some(None);
         }
+        if self
+            .active_loops
+            .last()
+            .is_some_and(|loop_context| loop_context.goto_exits.contains(&target))
+        {
+            stmts.extend(
+                self.lower_escape_edge(block, target, target_overrides)?
+                    .stmts,
+            );
+            return Some(None);
+        }
         if Some(target) == stop || target == self.lowering.cfg.exit_block {
             return Some(if target == self.lowering.cfg.exit_block {
                 None
@@ -600,11 +635,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             // body lowering 就会错误地走出当前 loop，最终把 numeric-for/while
             // 整体打回 unresolved。对当前活跃 loop 来说，这条边的语义就是 break。
             if target == loop_context.post_loop {
-                stmts.push(HirStmt::Break);
+                stmts.extend(loop_context.break_stmts(target));
                 return Some(None);
             }
             if Some(target) == loop_context.downstream_post_loop {
-                stmts.push(HirStmt::Break);
+                stmts.extend(loop_context.break_stmts(target));
                 return Some(None);
             }
             if let Some(break_block) = loop_context.break_exits.get(&target) {
@@ -791,13 +826,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         };
 
-        let phi_temp_aliases = self.overrides.phi_temp_aliases();
-        if !phi_temp_aliases.is_empty() {
-            rewrite_expr_temps(&mut cond, phi_temp_aliases);
-        }
-        if let Some(entry_expr_overrides) = self.block_entry_expr_overrides(block) {
-            rewrite_expr_temps(&mut cond, entry_expr_overrides);
-        }
+        self.rewrite_expr_at_block_entry(block, &mut cond);
 
         Some(cond)
     }

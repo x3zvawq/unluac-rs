@@ -81,10 +81,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         }
 
-        let plan = build_conditional_reassign_plan(self.lowering, block)?;
+        let mut plan = build_conditional_reassign_plan(self.lowering, block)?;
         if merge_has_other_live_phi(self.lowering, plan.merge, plan.phi_id) {
             return None;
         }
+        self.rewrite_value_merge_entry_exprs(short, &mut plan.init_value);
+        self.rewrite_value_merge_entry_exprs(short, &mut plan.cond);
+        self.rewrite_value_merge_entry_exprs(short, &mut plan.assigned_value);
 
         stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
         self.visited.insert(block);
@@ -318,6 +321,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         let mut cond = lower_short_circuit_subject(self.lowering, node.header)?;
+        self.rewrite_expr_at_block_entry(node.header, &mut cond);
         rewrite_expr_temps(&mut cond, &temp_expr_overrides(target_overrides));
         let truthy = self.lower_value_merge_target(
             short,
@@ -393,7 +397,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             self.lower_block_prefix(block, false, target_overrides)?
         };
         for (short, target) in outputs {
-            let value = if block == current_header
+            let mut value = if block == current_header
                 && header_subject_is_value_carrier(self.lowering, current_header, short.result_reg)
             {
                 // 只有直接测试 result_reg 的 truthiness 时，subject 才是当前 leaf 值。
@@ -402,6 +406,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             } else {
                 lower_materialized_value_leaf_expr(self.lowering, short, block)?
             };
+            self.rewrite_expr_at_block_entry(block, &mut value);
             let mut stmt = assign_stmt(vec![target.clone()], vec![value]);
             apply_loop_rewrites(std::slice::from_mut(&mut stmt), target_overrides);
             if let HirStmt::Assign(assign) = &stmt
@@ -416,6 +421,18 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         Some(HirBlock { stmts })
+    }
+
+    fn rewrite_value_merge_entry_exprs(&self, short: &ShortCircuitCandidate, expr: &mut HirExpr) {
+        let blocks = short
+            .nodes
+            .iter()
+            .map(|node| node.header)
+            .chain(short.value_incomings.iter().map(|incoming| incoming.pred))
+            .collect::<BTreeSet<_>>();
+        for block in blocks {
+            self.rewrite_expr_at_block_entry(block, expr);
+        }
     }
 
     /// 以 SC 的树结构为骨架，对一个不由 SC 覆盖的寄存器构建 Decision 表达式。

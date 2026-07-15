@@ -1071,6 +1071,30 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_199_nested_local_scope_budget.lua",
         LUAU_ONLY,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_200_close_managed_writable_capture.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_201_repeat_live_out.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_202_irreducible_numeric_for_owner.lua",
+        PUC_LUA_GE_52,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_203_irreducible_generic_for_owner.lua",
+        PUC_LUA_GE_52,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_204_irreducible_explicit_close_owner.lua",
+        PUC_LUA_GE_54,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_205_while_true_header_guard.lua",
+        PUC_LUA_ALL,
+    ),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {

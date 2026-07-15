@@ -383,6 +383,7 @@ pub(super) fn refine_short_circuit_repeat_candidates(
                     .flatten()
                     .find_map(|short| {
                         repeat_short_circuit_continue_target(
+                            proto,
                             cfg,
                             graph_facts,
                             short,
@@ -399,6 +400,7 @@ pub(super) fn refine_short_circuit_repeat_candidates(
                             .flatten()
                             .find_map(|short| {
                                 repeat_short_circuit_continue_target(
+                                    proto,
                                     cfg,
                                     graph_facts,
                                     short,
@@ -471,6 +473,7 @@ fn short_circuits_by_exit(
 }
 
 fn repeat_short_circuit_continue_target(
+    proto: &LoweredProto,
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     short: &ShortCircuitCandidate,
@@ -491,6 +494,11 @@ fn repeat_short_circuit_continue_target(
         while_header_exit_rejoins_repeat_exit(cfg, graph_facts, candidate, loop_exit);
     if !short.reducible
         || !candidate.blocks.contains(&short.header)
+        // while true 的 header 可以同时承载本轮正文和提前 break guard。若它经一条
+        // 非 cleanup 正文路径到 jump latch，不能把这条路径反推成 repeat 尾条件；
+        // Close 仍可作为 goto/repeat 的词法清理 pad，由后续 scope owner 接管。
+        || (short.header == candidate.header
+            && backedge_has_non_cleanup_prefix(proto, cfg, backedge_source))
         || (candidate.kind_hint == LoopKindHint::WhileLike && !header_exit_rejoins_tail)
         || (short.nodes.len() == 1 && candidate.exits.len() != 1 && !header_exit_rejoins_tail)
         || !short.blocks.is_subset(&candidate.blocks)
@@ -510,6 +518,13 @@ fn repeat_short_circuit_continue_target(
     });
     let final_node = final_nodes.next()?;
     final_nodes.next().is_none().then_some(final_node.header)
+}
+
+fn backedge_has_non_cleanup_prefix(proto: &LoweredProto, cfg: &Cfg, block: BlockRef) -> bool {
+    let range = cfg.blocks[block.index()].instrs;
+    let end = range.last().map_or(range.end(), |last| last.index());
+    (range.start.index()..end)
+        .any(|instr_index| !matches!(proto.instrs[instr_index], LowInstr::Close(_)))
 }
 
 fn while_header_exit_rejoins_repeat_exit(

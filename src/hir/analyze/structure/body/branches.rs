@@ -701,13 +701,23 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Option<BlockRef>> {
         let candidate = *self.branch_by_header.get(&block)?;
-        // 目前只接管 repeat header 被当作普通 branch 重新 lower 的场景。普通
-        // branch-value merge 若被强行套 fence，容易把结果 phi 隔在 fence 内外两侧。
+        let merge = candidate.merge?;
+        // 除了直接被当作 branch 的 repeat header，LuaJIT 还会把“内层 repeat true
+        // fence + 外层 retry loop”压成同一个 Unknown natural-loop header。只有该
+        // Unknown owner 已经处于 active lowering，且 fence merge 仍在循环体内时，
+        // 才复用它已经建立的 state/value owner；不能从普通 branch 猜一层新循环。
         let (loop_candidate_id, loop_candidate) = self.innermost_loop_candidate(block)?;
-        if loop_candidate.kind_hint != LoopKindHint::RepeatLike {
+        let active_unknown_owner = self.active_loops.last().is_some_and(|loop_context| {
+            loop_context.candidate_id == loop_candidate_id
+                && loop_context.header == block
+                && loop_candidate.kind_hint == LoopKindHint::Unknown
+                && loop_context.loop_blocks.contains(&merge)
+                && merge != loop_context.post_loop
+                && Some(merge) != loop_context.downstream_post_loop
+        });
+        if loop_candidate.kind_hint != LoopKindHint::RepeatLike && !active_unknown_owner {
             return None;
         }
-        let merge = candidate.merge?;
         if self
             .lowering
             .structure
@@ -738,7 +748,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             body_stop: Some(tail),
             continue_sources: BTreeSet::new(),
             break_exits: BTreeMap::new(),
+            goto_exits: BTreeSet::new(),
             state_slots: Vec::new(),
+            post_loop_break: None,
         };
 
         self.active_loops.push(loop_context);

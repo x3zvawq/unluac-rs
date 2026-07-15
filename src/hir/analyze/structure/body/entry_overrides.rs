@@ -20,6 +20,20 @@ impl StructuredBodyLowerer<'_, '_> {
         self.overrides.block_entry_temp_exprs(block)
     }
 
+    pub(in crate::hir::analyze::structure) fn rewrite_expr_at_block_entry(
+        &self,
+        block: BlockRef,
+        expr: &mut HirExpr,
+    ) {
+        let phi_temp_aliases = self.overrides.phi_temp_aliases();
+        if !phi_temp_aliases.is_empty() {
+            rewrite_expr_temps(expr, phi_temp_aliases);
+        }
+        if let Some(entry_expr_overrides) = self.block_entry_expr_overrides(block) {
+            rewrite_expr_temps(expr, entry_expr_overrides);
+        }
+    }
+
     pub(in crate::hir::analyze::structure) fn block_redefines_reg(
         &self,
         block: BlockRef,
@@ -38,24 +52,32 @@ impl StructuredBodyLowerer<'_, '_> {
         reg: Reg,
         expr: HirExpr,
     ) {
-        // 防止循环传播：如果该 block 上这个 reg 已经有完全相同的 override，不再重入。
-        if self
-            .overrides
-            .carried_entry_expr(block, reg)
-            .is_some_and(|existing| *existing == expr)
-        {
-            return;
-        }
+        self.install_entry_override_with_source(block, reg, expr, None);
+    }
 
-        let source_temp = self.block_entry_source_temp(block, reg);
+    fn install_entry_override_with_source(
+        &mut self,
+        block: BlockRef,
+        reg: Reg,
+        expr: HirExpr,
+        carried_source_temp: Option<TempId>,
+    ) {
+        let source_temp = self
+            .block_entry_source_temp(block, reg)
+            .or(carried_source_temp);
         let carries_through_block = !self.block_redefines_reg(block, reg);
-        self.overrides.insert_entry_expr(
+        let changed = self.overrides.insert_entry_expr(
             block,
             reg,
             expr.clone(),
             source_temp,
             carries_through_block,
         );
+        // 同一个表达式可经不同前驱携带不同 source temp；新增 alias 时继续传播，
+        // 完全无变化或遇到冲突时停止，既避免环路，也不覆盖另一条已证明的 identity。
+        if !changed {
+            return;
+        }
         // 当 override 能穿透当前 block（该 register 未被重定义），需要继续向后继传播。
         // 否则后续 block 的 lower_block_prefix 看不到 entry_temp_expr override，
         // 被 suppress 的 phi temp 在 RHS 表达式中就无法被正确替换。
@@ -73,7 +95,12 @@ impl StructuredBodyLowerer<'_, '_> {
                     .phi_candidate_for_reg(successor, reg)
                     .is_none()
                 {
-                    self.install_entry_override(successor, reg, expr.clone());
+                    self.install_entry_override_with_source(
+                        successor,
+                        reg,
+                        expr.clone(),
+                        source_temp,
+                    );
                 }
             }
         }

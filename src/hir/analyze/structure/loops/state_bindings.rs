@@ -340,6 +340,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return HirLValue::Local(local);
         }
 
+        if let Some(target) = self.unstructured_preheader_state_target(candidate, reg) {
+            return target;
+        }
+
         let has_normalized_terminal_exit = candidate
             .control_blocks
             .iter()
@@ -380,6 +384,41 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         HirLValue::Temp(temp)
+    }
+
+    fn unstructured_preheader_state_target(
+        &self,
+        candidate: &LoopCandidate,
+        reg: Reg,
+    ) -> Option<HirLValue> {
+        let preheader = candidate.preheader?;
+        let region = self
+            .lowering
+            .structure
+            .unstructured_region(candidate.header)?;
+        if self.lowering.structure.unstructured_region(preheader) != Some(region) {
+            return None;
+        }
+
+        // preheader 可由 island 多次重入；只有它没有重定义该寄存器时，入口 Phi
+        // 才是所有入口与 loop 写回共享的稳定可写身份。
+        let range = self.lowering.cfg.blocks[preheader.index()].instrs;
+        if (range.start.index()..range.end()).any(|instr_index| {
+            self.lowering.dataflow.instr_effects[instr_index]
+                .fixed_must_defs
+                .contains(&reg)
+        }) {
+            return None;
+        }
+        let SsaValue::Phi(phi_id) = self.lowering.dataflow.block_entry_value(preheader, reg) else {
+            return None;
+        };
+        self.lowering
+            .bindings
+            .phi_temps
+            .get(phi_id.index())
+            .copied()
+            .map(HirLValue::Temp)
     }
 
     pub(in crate::hir::analyze::structure) fn active_loop_state_target(

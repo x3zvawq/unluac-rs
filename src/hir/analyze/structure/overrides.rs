@@ -78,15 +78,39 @@ impl StructureOverrideState {
         expr: HirExpr,
         source_temp: Option<TempId>,
         carries_through_block: bool,
-    ) {
+    ) -> bool {
         let state = self.by_block.entry(block).or_default();
-        state.entry_exprs.insert(reg, expr.clone());
-        if carries_through_block {
-            state.carried_entry_exprs.insert(reg, expr.clone());
+        let conflicts = state.entry_exprs.get(&reg).is_some_and(|old| old != &expr)
+            || carries_through_block
+                && state
+                    .carried_entry_exprs
+                    .get(&reg)
+                    .is_some_and(|old| old != &expr)
+            || source_temp.is_some_and(|temp| {
+                state
+                    .entry_temp_exprs
+                    .get(&temp)
+                    .is_some_and(|old| old != &expr)
+            });
+        if conflicts {
+            return false;
         }
-        if let Some(temp) = source_temp {
-            state.entry_temp_exprs.insert(temp, expr);
-        }
+        let entry_changed = state
+            .entry_exprs
+            .insert(reg, expr.clone())
+            .is_none_or(|old| old != expr);
+        let carried_changed = carries_through_block
+            && state
+                .carried_entry_exprs
+                .insert(reg, expr.clone())
+                .is_none_or(|old| old != expr);
+        let source_changed = source_temp.is_some_and(|temp| {
+            state
+                .entry_temp_exprs
+                .insert(temp, expr.clone())
+                .is_none_or(|old| old != expr)
+        });
+        entry_changed || carried_changed || source_changed
     }
 
     pub(super) fn insert_phi_expr(&mut self, block: BlockRef, phi_id: PhiId, expr: HirExpr) {

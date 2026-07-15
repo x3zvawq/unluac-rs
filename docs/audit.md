@@ -15,75 +15,26 @@
 
 | 优先级 | 状态 | 问题 | 建议主题 |
 |---|---|---|---|
-| P0 | 已复现 | Luau `events` 的 closure 可写 local、`math` 的 loop live-out 被拆成不同 binding，生成源码可编译但执行错误 | 先缩到最小 proto，再统一可写 local 身份 owner |
-| P0 | 部分解决 | plain branch/loop island 已能局部降低并保留外层 for 与词法 cleanup；island 自身含 numeric/generic-for 协议或显式 cleanup 时仍会整 proto fallback | `refactor(hir): 完成mixed lowering并删除整proto fallback` |
+| P0 | 部分解决 | island 内 for/显式 cleanup 已接管；phi incoming/共享尾 owner 与整 proto fallback 仍未收敛 | `refactor(hir): 完成mixed lowering并删除整proto fallback` |
 | P1 | 语料缺口 | Luau conformance 当前 48/49 完成严格反编译与二次编译；仅剩 AST 超时 | 先完成 P2 热点定位 |
 | P2 | 已复现 | `native_integer_spills.luau` 的 AST 阶段在 4327 条 low-IR 上单核运行超过 2 分 51 秒 | 定位 readability 热点并建立可扩展基准 |
 
-## P0：Luau 可写 local 身份在 closure / loop 边界被拆分
-
-官方 `events.luau` 与 `math.luau` 当前都能严格反编译并重新编译，但运行对拍失败：
-
-```bash
-cargo unluac -s lua/sources/luau/tests/conformance/events.luau -D luau -g strict -o /tmp/events.luau
-lua/build/luau/luau lua/sources/luau/tests/conformance/events.luau
-lua/build/luau/luau /tmp/events.luau
-
-cargo unluac -s lua/sources/luau/tests/conformance/math.luau -D luau -g strict -o /tmp/math.luau
-lua/build/luau/luau lua/sources/luau/tests/conformance/math.luau
-lua/build/luau/luau /tmp/math.luau
-```
-
-- `events` 源码的 `foi` 被 `__newindex` closure 写入后应由连续 reset/assert 读取；生成源码
-  中 closure 写 `r0_47`，reset/assert 却依次使用 `r0_56`、`r0_58`、`r0_60` 等新 local，
-  第一次需要观察 closure 写入的断言失败。
-- `math` 源码的 `Max` / `Min` 在 repeat 中更新并在退出后读取；生成源码循环更新
-  `r0_201` / `r0_202`，退出断言却读取从未赋值的 `r0_203` / `r0_204`，报
-  `attempt to compare number <= nil`。
-
-两者都不是 local 作用域分组造成的语句重写，而是更早的可写 local / carried identity
-已经分裂。下一步先锁定最小 proto，对比 HIR 的 `LocalId`、loop carried 与 child capture
-映射，不能在 AST 或 Generate 把同名变量猜回去。
-
-## P0：mixed lowering 尚未覆盖 island for 协议 / 显式 cleanup
+## P0：mixed lowering 尚未覆盖唯一 phi / 共享尾 owner
 
 ### 现象与证据
 
-`tests/unit-case/lua52_02_goto.lua` 的 `proto#4` 已证明 plain branch island 可以局部降低：
+仍未解决的是唯一 owner 不足的 island 会落回 `lower_label_goto_body`，所以 lowering 依然保留整 proto 双轨。审计已确认：
 
-```bash
-cargo unluac \
-  -s tests/unit-case/lua52_02_goto.lua \
-  -D lua5.2 \
-  --dump hir \
-  --proto 4 --proto-depth 0 \
-  --stop-after hir --detail verbose --color never
-```
-
-当前 HIR 保留 island 外已恢复的 branch，只在 `#2/#4` 不可规约区域输出必要的 label/goto；`regress_182_numeric_for_before_irreducible_goto.lua` 进一步证明 island 之前的 numeric-for 不再随整个 proto 退化。实现已经：
-
-- 将 proto 级门槛收窄为：只有显式边目标属于局部不可规约 island 时才进入 mixed lowering；
-- 按 `StructurePlan` 直接 owner 降低 plain Branch/Linear block，membership 不覆盖 Branch owner；
-- 每条显式边按精确 `EdgeRef` 物化 phi copy，只对同层真实下一块省略 goto；
-- 在真正生成非 fallthrough 边时补齐 label；continuation 有外部 predecessor 时仅在无 live phi 的条件下接回 structured walker；
-- 将 active loop 的 post-loop/downstream 出口降成 `break`，并透明跨过唯一 owner 为 `LexicalScope` 的 `Close` pad；
-- 在 `StructurePlan` 为每条 `Close/Tbc` 建立唯一 `CleanupDisposition`，HIR 不再从 scope 并集重跑显式 TBC 数据流；
-- 沿后支配链选择第一个 island 外 continuation，透明穿过版本相关的单前驱入口 jump pad，并按真实 CFG 边降低 island 内 plain loop owner；
-- `regress_183_mixed_irreducible_explicit_close.lua` 证明 island 外显式 `<close>` 不再因缺 label 生成非法源码；
-- `regress_184_mixed_irreducible_generic_close.lua` 证明包含 island 的 Lua 5.4/5.5 generic-for 仍保留结构化 `for`。
-
-仍未解决的是不受支持的 island 最终会落回 `lower_label_goto_body`，所以 lowering 依然保留整 proto 双轨。审计还确认：
-
+- 临时命中探针跑完全量 696 个 entry 后，当前 1250 个 proto 已无整 proto fallback 命中；备用路径本身仍存在，后续删除前必须继续保持全量零命中，不再按全库猜测覆盖面；
 - raw numeric-for lowering 会漏掉循环边 phi copy，并用 unresolved 多目标赋值代替真实循环状态；mixed emitter 不能复用它；
 
 cleanup owner 的前层唯一化已经完成，但下列缺口仍在：
 
-- island 自身含 numeric/generic-for 协议、显式 TBC 或显式 TBC boundary 时仍拒绝 mixed lowering；
 - `terminal_exit_block_is_clone_safe` 同时承担 branch/loop 边界选择与真实 clone eligibility，而 clone API 又没有 predecessor `EdgeRef`；含 cleanup 的合法 clone 确实存在，blanket 禁止会破坏 `regress_181_generic_for_branch_phi.lua`，必须先唯一化共享尾的 phi/cleanup owner；
 - 整 proto 的 `lower_label_goto_body` 仍绕过 `CleanupDisposition`，保留双轨 lowering；
 - phi incoming 还没有像 edge/cleanup 一样进入唯一 disposition。
 
-因此下一步不是放宽 raw emitter，而是先唯一化 terminal/shared-tail clone 与 phi incoming，再支持 island 内 Loop/显式 cleanup owner；全部形状由 mixed walker 接管后删除 `lower_label_goto_body`。
+因此下一步不是放宽 raw emitter，而是先唯一化 terminal/shared-tail clone 与 phi incoming；全部形状由 mixed walker 接管后删除 `lower_label_goto_body`。
 
 ### 目标不变量
 
@@ -98,8 +49,7 @@ cleanup owner 的前层唯一化已经完成，但下列缺口仍在：
 ### 推荐实施顺序
 
 1. 审核 terminal/shared-tail clone，在不破坏 `regress_181_generic_for_branch_phi.lua` 的前提下唯一化共享尾的 phi/cleanup owner。
-2. 支持 island 内 numeric/generic-for owner 与显式 cleanup；for 协议继续走结构候选，不能 raw 展开 terminator。
-3. 为 phi incoming 建立唯一 disposition，并删除整 proto fallback；无法以目标方言表示的局部边只在 island 内生成诊断伪源码。
+2. 为 phi incoming 建立唯一 disposition，并删除整 proto fallback；无法以目标方言表示的局部边只在 island 内生成诊断伪源码。
 
 最终同时删除自行从 raw candidates 重建的 `branch_by_header/loops_by_header` owner map；所有 block、edge、phi copy 与 close disposition 只消费 `StructurePlan`。
 
@@ -109,6 +59,7 @@ cleanup owner 的前层唯一化已经完成，但下列缺口仍在：
 - `regress_182_numeric_for_before_irreducible_goto.lua` 的 numeric-for 必须保持结构化，island 只覆盖后续不可规约流。
 - `regress_183_mixed_irreducible_explicit_close.lua` 在 Lua 5.4/5.5 必须重新编译通过，且显式 `<close>` 仍由原词法 owner 消费。
 - `regress_184_mixed_irreducible_generic_close.lua` 在 Lua 5.4/5.5 必须保留 generic-for，不得整 proto 退回 raw label/goto。
+- `regress_204_irreducible_explicit_close_owner.lua` 的外部入口 label 不得被包入 `<close>` local 作用域，Lua 5.4/5.5 运行输出必须一致。
 - `regress_187_irreducible_plain_loop_owner.lua` 必须只在 island 内保留必要 goto，plain loop header 的 phi copy 不能丢失。
 - Lua 5.1 / 无 goto 方言：可规约部分不得因同 proto 的不可规约区域一起退化；确实不可表达的边继续走宽松诊断伪源码。
 - 覆盖 nested branch/loop、phi edge copy、close scope、跨 region live-out 和真正不可规约 CFG。
@@ -117,8 +68,9 @@ cleanup owner 的前层唯一化已经完成，但下列缺口仍在：
 ## P1：Luau 官方语料仍有系统性缺口
 
 当前默认编译选项重新扫描 49 个官方 conformance 源码，48 个完成严格反编译和生成源码
-二次编译；该扫描没有逐个运行对拍，不能把 48 个记为语义通过，已运行发现的两项语义
-错误单列为上面的 P0。剩余未完成项只有：
+二次编译；该扫描没有逐个运行对拍，不能把 48 个记为语义通过。`events.luau` 与
+`math.luau` 已分别补充 close-managed capture / repeat live-out 回归并完成运行验证。
+剩余未完成项只有：
 
 - `native_integer_spills.luau` 在 AST 阶段触发已记录的性能问题，本轮在 2 分 51 秒后终止，尚未进入生成分类。
 
