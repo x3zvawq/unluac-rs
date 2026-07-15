@@ -1,7 +1,4 @@
-//! AST feature collection — 递归扫描 AST 以发现需要特定方言版本才能表达的特性。
-//!
-//! 这里使用 `src/ast/traverse.rs` 里的共享宏完成子节点递归骨架，
-//! 仅在宏不覆盖的 variant 前做少量手动 match（属性、Continue、Goto/Label）。
+//! AST 方言特性收集。
 
 use std::collections::BTreeSet;
 
@@ -11,20 +8,28 @@ use crate::ast::traverse::{
 };
 use crate::ast::{AstExpr, AstFeature, AstGlobalAttr, AstLocalAttr, AstModule, AstStmt};
 
-pub(crate) fn collect_ast_features(module: &AstModule) -> BTreeSet<AstFeature> {
+pub(crate) fn collect_ast_features(module: &AstModule) -> (BTreeSet<AstFeature>, bool) {
     let mut features = BTreeSet::new();
-    collect_block_features(&module.body, &mut features);
-    features
+    let mut has_errors = false;
+    collect_block_features(&module.body, &mut features, &mut has_errors);
+    (features, has_errors)
 }
 
-fn collect_block_features(block: &crate::ast::AstBlock, features: &mut BTreeSet<AstFeature>) {
+fn collect_block_features(
+    block: &crate::ast::AstBlock,
+    features: &mut BTreeSet<AstFeature>,
+    has_errors: &mut bool,
+) {
     for stmt in &block.stmts {
-        collect_stmt_features(stmt, features);
+        collect_stmt_features(stmt, features, has_errors);
     }
 }
 
-fn collect_stmt_features(stmt: &AstStmt, features: &mut BTreeSet<AstFeature>) {
-    // 宏不覆盖的 variant 特性：属性、continue、goto/label
+fn collect_stmt_features(
+    stmt: &AstStmt,
+    features: &mut BTreeSet<AstFeature>,
+    has_errors: &mut bool,
+) {
     match stmt {
         AstStmt::LocalDecl(local_decl) => {
             for binding in &local_decl.bindings {
@@ -41,10 +46,12 @@ fn collect_stmt_features(stmt: &AstStmt, features: &mut BTreeSet<AstFeature>) {
         }
         AstStmt::GlobalDecl(global_decl) => {
             features.insert(AstFeature::GlobalDecl);
-            for binding in &global_decl.bindings {
-                if binding.attr == AstGlobalAttr::Const {
-                    features.insert(AstFeature::GlobalConst);
-                }
+            if global_decl
+                .bindings
+                .iter()
+                .any(|binding| binding.attr == AstGlobalAttr::Const)
+            {
+                features.insert(AstFeature::GlobalConst);
             }
         }
         AstStmt::Continue => {
@@ -53,6 +60,7 @@ fn collect_stmt_features(stmt: &AstStmt, features: &mut BTreeSet<AstFeature>) {
         AstStmt::Goto(_) | AstStmt::Label(_) => {
             features.insert(AstFeature::GotoLabel);
         }
+        AstStmt::Error(_) => *has_errors = true,
         _ => {}
     }
 
@@ -61,34 +69,41 @@ fn collect_stmt_features(stmt: &AstStmt, features: &mut BTreeSet<AstFeature>) {
         iter = iter,
         opt = as_ref,
         borrow = [&],
-        expr(e) => { collect_expr_features(e, features); },
+        expr(e) => { collect_expr_features(e, features, has_errors); },
         lvalue(lv) => {
             traverse_lvalue_children!(
                 lv,
                 borrow = [&],
-                expr(e) => { collect_expr_features(e, features); }
+                expr(e) => { collect_expr_features(e, features, has_errors); }
             );
         },
-        block(b) => { collect_block_features(b, features); },
-        function(f) => { collect_block_features(&f.body, features); },
-        condition(c) => { collect_expr_features(c, features); },
+        block(b) => { collect_block_features(b, features, has_errors); },
+        function(f) => { collect_block_features(&f.body, features, has_errors); },
+        condition(c) => { collect_expr_features(c, features, has_errors); },
         call(c) => {
             traverse_call_children!(
                 c,
                 iter = iter,
                 borrow = [&],
-                expr(e) => { collect_expr_features(e, features); }
+                expr(e) => { collect_expr_features(e, features, has_errors); }
             );
         }
     );
 }
 
-fn collect_expr_features(expr: &AstExpr, features: &mut BTreeSet<AstFeature>) {
+fn collect_expr_features(
+    expr: &AstExpr,
+    features: &mut BTreeSet<AstFeature>,
+    has_errors: &mut bool,
+) {
+    if matches!(expr, AstExpr::Error(_)) {
+        *has_errors = true;
+    }
     traverse_expr_children!(
         expr,
         iter = iter,
         borrow = [&],
-        expr(e) => { collect_expr_features(e, features); },
-        function(f) => { collect_block_features(&f.body, features); }
+        expr(e) => { collect_expr_features(e, features, has_errors); },
+        function(f) => { collect_block_features(&f.body, features, has_errors); }
     );
 }

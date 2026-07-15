@@ -14,6 +14,7 @@ mod dead_labels;
 mod dead_temps;
 pub(super) mod decision;
 mod expr_facts;
+mod generic_for_iterators;
 mod local_shapes;
 mod locals;
 mod logical_simplify;
@@ -145,6 +146,12 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         invalidates: &[TempChain, LocalBinding],
     },
     PassDescriptor {
+        name: "generic-for-iterators",
+        phase: PassPhase::Normal,
+        depends_on: &[TempChain, BlockStructure],
+        invalidates: &[TempChain, LocalBinding],
+    },
+    PassDescriptor {
         name: "locals",
         phase: PassPhase::Normal,
         depends_on: &[TempChain, LocalBinding, BlockStructure],
@@ -237,13 +244,14 @@ pub(super) fn simplify_hir(
                         6 => multiret_assignments::collapse_multiret_global_assignments_in_proto(
                             proto,
                         ),
-                        7 => locals::promote_temps_to_locals_in_proto_with_facts(proto, facts),
-                        8 => branch_value_folding::fold_branch_values_in_proto(proto),
-                        9 => decision::eliminate_remaining_decisions_in_proto(proto),
-                        10 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
-                        11 => carried_locals::collapse_carried_local_handoffs_in_proto(proto),
-                        12 => dead_temps::remove_dead_temp_materializations_in_proto(proto),
-                        13 => dead_labels::remove_unused_labels_in_proto(proto),
+                        7 => generic_for_iterators::fold_generic_for_iterators_in_proto(proto),
+                        8 => locals::promote_temps_to_locals_in_proto_with_facts(proto, facts),
+                        9 => branch_value_folding::fold_branch_values_in_proto(proto),
+                        10 => decision::eliminate_remaining_decisions_in_proto(proto),
+                        11 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
+                        12 => carried_locals::collapse_carried_local_handoffs_in_proto(proto),
+                        13 => dead_temps::remove_dead_temp_materializations_in_proto(proto),
+                        14 => dead_labels::remove_unused_labels_in_proto(proto),
                         _ => unreachable!("invalid HIR pass index: {index}"),
                     }
                 })

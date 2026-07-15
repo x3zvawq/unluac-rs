@@ -61,10 +61,14 @@ fn is_dead_pure_temp_assignment(stmt: &HirStmt, live_reads: &BTreeSet<TempId>) -
     let HirStmt::Assign(assign) = stmt else {
         return false;
     };
-    let ([HirLValue::Temp(temp)], [value]) = (assign.targets.as_slice(), assign.values.as_slice())
+    let ([HirLValue::Temp(temp)], [value]) =
+        (assign.targets.as_slice(), assign.values.fixed.as_slice())
     else {
         return false;
     };
+    if assign.values.tail.is_some() {
+        return false;
+    }
     !live_reads.contains(temp) && is_pure_value(value)
 }
 

@@ -94,10 +94,10 @@ export type UnluacEdgeKind =
   | "tail-call";
 
 export interface UnluacRichResult {
-  /** 反编译生成的完整 Lua 源码 */
+  /** 反编译生成的源码或诊断伪源码 */
   source: string;
-  /** 生成阶段的警告 */
-  warnings: string[];
+  /** 可重编译源码或带 Error 标记的诊断伪源码 */
+  kind: "source" | "diagnostic-pseudocode";
   /** proto 元数据（DFS 序展平） */
   protos: UnluacProtoMeta[];
   /** 每个 proto 的 CFG（与 protos 平行数组） */

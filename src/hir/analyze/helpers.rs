@@ -9,19 +9,20 @@ use std::collections::BTreeMap;
 use crate::hir::common::{
     HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirExpr, HirGoto, HirIf, HirLValue,
     HirLabelId, HirProto, HirProtoRef, HirReturn, HirStmt, HirUnresolvedExpr, HirUnstructured,
+    HirValuePack,
 };
 use crate::structure::{BlockRef, Cfg};
 use crate::transformer::InstrRef;
 
-pub(super) fn assign_stmt(targets: Vec<HirLValue>, values: Vec<HirExpr>) -> HirStmt {
-    HirStmt::Assign(Box::new(HirAssign { targets, values }))
+pub(super) fn assign_stmt(targets: Vec<HirLValue>, values: impl Into<HirValuePack>) -> HirStmt {
+    HirStmt::Assign(Box::new(HirAssign {
+        targets,
+        values: values.into(),
+    }))
 }
 
-pub(super) fn return_stmt(values: Vec<HirExpr>, trailing_multiret: bool) -> HirStmt {
-    HirStmt::Return(Box::new(HirReturn {
-        values,
-        trailing_multiret,
-    }))
+pub(super) fn return_stmt(values: HirValuePack) -> HirStmt {
+    HirStmt::Return(Box::new(HirReturn { values }))
 }
 
 pub(super) fn goto_stmt(target: HirLabelId) -> HirStmt {

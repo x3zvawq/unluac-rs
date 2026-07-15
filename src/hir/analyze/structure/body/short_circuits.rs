@@ -616,7 +616,7 @@ impl StructuredBodyLowerer<'_, '_> {
                     let HirStmt::Assign(assign) = stmt else {
                         return false;
                     };
-                    if assign.targets.len() != assign.values.len() {
+                    if assign.targets.len() != assign.values.expr_len() {
                         return false;
                     }
                     for target in assign.targets {

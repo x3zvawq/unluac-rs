@@ -5,7 +5,8 @@
 //! 例如：`local v = f(); t.x = v` 可能在这里折叠成 `t.x = f()`。
 
 use crate::hir::common::{
-    HirBinaryExpr, HirBlock, HirCallExpr, HirExpr, HirLogicalExpr, HirUnaryExpr,
+    HirBinaryExpr, HirBlock, HirCallExpr, HirExpr, HirLogicalExpr, HirPackTail, HirUnaryExpr,
+    HirValuePack,
 };
 
 use super::bindings::{BindingIndex, BindingUseSummary, binding_from_expr};
@@ -140,27 +141,9 @@ fn inline_constructor_value_at_site(
             )));
         }
         HirExpr::Call(call) => {
-            return Some(HirExpr::Call(Box::new(HirCallExpr {
-                callee: inline_constructor_value_at_site(
-                    context,
-                    &call.callee,
-                    ConstructorInlineSite::CallCallee,
-                )?,
-                args: call
-                    .args
-                    .iter()
-                    .map(|arg| {
-                        inline_constructor_value_at_site(
-                            context,
-                            arg,
-                            ConstructorInlineSite::Neutral,
-                        )
-                    })
-                    .collect::<Option<Vec<_>>>()?,
-                multiret: call.multiret,
-                method: call.method,
-                method_name: call.method_name.clone(),
-            })));
+            return Some(HirExpr::Call(Box::new(inline_constructor_call(
+                context, call,
+            )?)));
         }
         HirExpr::LogicalAnd(logical) => {
             return inline_short_circuit_expr(context, logical, HirExpr::LogicalAnd);
@@ -181,6 +164,33 @@ fn inline_constructor_value_at_site(
     } else {
         Some(value.clone())
     }
+}
+
+pub(super) fn inline_constructor_call(
+    context: &mut InlineContext<'_>,
+    call: &HirCallExpr,
+) -> Option<HirCallExpr> {
+    let callee =
+        inline_constructor_value_at_site(context, &call.callee, ConstructorInlineSite::CallCallee)?;
+    let fixed = call
+        .args
+        .fixed
+        .iter()
+        .map(|arg| inline_constructor_value_at_site(context, arg, ConstructorInlineSite::Neutral))
+        .collect::<Option<Vec<_>>>()?;
+    let tail = match &call.args.tail {
+        Some(tail) => Some(
+            tail.clone()
+                .try_map_call(|call| inline_constructor_call(context, &call))?,
+        ),
+        None => None,
+    };
+    Some(HirCallExpr {
+        callee,
+        args: HirValuePack { fixed, tail },
+        method: call.method,
+        method_name: call.method_name.clone(),
+    })
 }
 
 fn inline_short_circuit_expr(
@@ -264,8 +274,8 @@ pub(super) fn expr_mentions_any_pending_binding(
                             )
                     )
                 }
-            }) || table.trailing_multivalue.as_ref().is_some_and(|value| {
-                expr_mentions_any_pending_binding(value, binding_index, pending_producers)
+            }) || table.trailing_multivalue.as_ref().is_some_and(|tail| {
+                expr_mentions_any_pending_binding(tail.as_expr(), binding_index, pending_producers)
             })
         }
         HirExpr::Decision(decision) => decision.nodes.iter().any(|node| {
@@ -315,7 +325,21 @@ fn pending_producer_value<'a>(
             stmt_index,
             value_index,
         } => producer_source_value(block, stmt_index, value_index),
+        PendingProducerSource::Tail { stmt_index } => producer_tail_source_value(block, stmt_index),
         PendingProducerSource::Empty => None,
+    }
+}
+
+fn producer_tail_source_value(block: &HirBlock, stmt_index: usize) -> Option<&HirExpr> {
+    let stmt = block.stmts.get(stmt_index)?;
+    match stmt {
+        crate::hir::common::HirStmt::LocalDecl(local_decl) => {
+            local_decl.values.tail.as_ref().map(HirPackTail::as_expr)
+        }
+        crate::hir::common::HirStmt::Assign(assign) => {
+            assign.values.tail.as_ref().map(HirPackTail::as_expr)
+        }
+        _ => None,
     }
 }
 
@@ -326,8 +350,10 @@ fn producer_source_value(
 ) -> Option<&HirExpr> {
     let stmt = block.stmts.get(stmt_index)?;
     match stmt {
-        crate::hir::common::HirStmt::LocalDecl(local_decl) => local_decl.values.get(value_index),
-        crate::hir::common::HirStmt::Assign(assign) => assign.values.get(value_index),
+        crate::hir::common::HirStmt::LocalDecl(local_decl) => {
+            local_decl.values.fixed.get(value_index)
+        }
+        crate::hir::common::HirStmt::Assign(assign) => assign.values.fixed.get(value_index),
         _ => None,
     }
 }
@@ -436,9 +462,9 @@ fn expr_depends_on_any_pending_binding(
                             )
                     )
                 }
-            }) || table.trailing_multivalue.as_ref().is_some_and(|value| {
+            }) || table.trailing_multivalue.as_ref().is_some_and(|tail| {
                 expr_depends_on_any_pending_binding(
-                    value,
+                    tail.as_expr(),
                     binding_index,
                     pending_producers,
                     consumed_bindings,

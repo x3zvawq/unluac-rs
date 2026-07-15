@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::hir::common::{HirExpr, HirTableConstructor, HirTableField, HirTableKey};
+use crate::hir::common::{HirExpr, HirPackTail, HirTableConstructor, HirTableField, HirTableKey};
 
 use super::{RebuildScratch, RestoredPendingIntegerField};
 
@@ -29,7 +29,7 @@ pub(super) enum RecordPromotionPolicy {
 #[derive(Debug, Clone)]
 pub(super) struct ConstructorBuilder {
     fields: Vec<BuilderField>,
-    pub(super) trailing_multivalue: Option<HirExpr>,
+    pub(super) trailing_multivalue: Option<HirPackTail>,
     next_array_index: u32,
     pending_integer_fields: BTreeMap<i64, usize>,
 }
@@ -37,7 +37,7 @@ pub(super) struct ConstructorBuilder {
 #[derive(Debug, Clone)]
 pub(super) struct BuilderCheckpoint {
     fields_len: usize,
-    trailing_multivalue: Option<HirExpr>,
+    trailing_multivalue: Option<HirPackTail>,
     next_array_index: u32,
     restored_pending_integer_fields_len: usize,
 }

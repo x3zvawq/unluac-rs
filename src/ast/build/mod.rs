@@ -1,4 +1,7 @@
 //! HIR -> AST build 阶段入口。
+//!
+//! 这里调度合法语法模式与逐节点机械 lowering，依赖 HIR 已经完成控制结构、binding 和
+//! value-pack 的语义恢复；不会通过相邻语句重组来补 HIR 丢失的多值或求值顺序事实。
 
 mod analysis;
 mod exprs;
@@ -8,12 +11,13 @@ use std::collections::BTreeSet;
 
 use crate::decompile::{DecompileContext, DecompileError, DecompileState};
 use crate::generate::GenerateMode;
-use crate::hir::{HirBlock, HirExpr, HirGenericFor, HirModule, HirStmt, TempId};
+use crate::hir::{HirBlock, HirGenericFor, HirModule, HirStmt, TempId};
 
 use self::analysis::{
     block_has_continue, collect_close_temps, collect_referenced_temps_in_encounter_order,
     max_hir_label_id,
 };
+use self::exprs::PackLoweringContext;
 use super::common::{
     AstAssign, AstBindingRef, AstBlock, AstCallStmt, AstExpr, AstGenericFor, AstGoto, AstIf,
     AstIndexAccess, AstLabel, AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl,
@@ -23,38 +27,29 @@ use super::common::{
 use super::error::AstLowerError;
 
 /// 对外的 AST lowering 入口。
-///
-/// `generate_mode` 控制错误恢复行为：`Strict` 下任何 lowering 错误都直接上抛，
-/// 非严格模式下会把无法恢复的语句/表达式替换为 `AstStmt::Error` / `AstExpr::Error`
-/// 占位节点，最终在 Generate 阶段输出为 Lua 注释。
 pub fn lower_ast(
     module: &HirModule,
     target: AstTargetDialect,
-    generate_mode: GenerateMode,
+    mode: GenerateMode,
 ) -> Result<AstModule, AstLowerError> {
-    let mut lowerer = AstLowerer::new(module, target, generate_mode);
+    let lowering_target = match mode {
+        GenerateMode::Strict => target,
+        GenerateMode::Permissive => AstTargetDialect::diagnostic_for_lowering(target.version),
+    };
+    let mut lowerer = AstLowerer::new(module, lowering_target, mode);
     lowerer.lower_module()
 }
 
-/// 按最终输出模式选择 AST lowering 使用的方言能力。
+/// 使用请求方言的真实语法能力执行 AST lowering。
 ///
-/// `Permissive` 输出允许 Generate 给出“目标方言不支持但仍尝试输出”的 warning，
-/// 因此 AST 阶段不能先用请求方言的严格能力把这些节点拦掉；这里集中放宽 lowering
-/// 能力，避免 decompile 调度层自己记住 AST 的 target 选择细节。
 pub(crate) fn lower_ast_for_generate(
     state: &mut DecompileState,
     context: &DecompileContext<'_>,
 ) -> Result<(), DecompileError> {
-    let lowering_target = match context.options.generate.mode {
-        GenerateMode::Strict => context.requested_target,
-        GenerateMode::Permissive => {
-            AstTargetDialect::relaxed_for_lowering(context.requested_target.version)
-        }
-    };
     let hir = state.require_hir()?;
     state.ast = Some(lower_ast(
         hir,
-        lowering_target,
+        context.requested_target,
         context.options.generate.mode,
     )?);
     Ok(())
@@ -77,8 +72,6 @@ impl<'a> AstLowerer<'a> {
         }
     }
 
-    /// 仅 Permissive 模式允许用 Error 占位节点替代失败的 lowering；
-    /// Strict 会直接传播错误。
     fn should_recover_errors(&self) -> bool {
         self.generate_mode == GenerateMode::Permissive
     }
@@ -169,24 +162,6 @@ impl<'a> AstLowerer<'a> {
         }
 
         if let Some((stmt, consumed)) =
-            self.try_lower_generic_for_init(proto_index, &block.stmts, index, continue_target)?
-        {
-            return Ok((vec![stmt], consumed));
-        }
-
-        if let Some((stmt, consumed)) =
-            self.try_lower_forwarded_multiret_call_stmt(proto_index, &block.stmts, index)?
-        {
-            return Ok((vec![stmt], consumed));
-        }
-
-        if let Some((stmt, consumed)) =
-            self.try_lower_single_value_final_call_arg_stmt(proto_index, &block.stmts, index)?
-        {
-            return Ok((vec![stmt], consumed));
-        }
-
-        if let Some((stmt, consumed)) =
             self.try_lower_temp_close_decl(proto_index, &block.stmts, index)?
         {
             return Ok((vec![stmt], consumed));
@@ -206,7 +181,7 @@ impl<'a> AstLowerer<'a> {
                 1,
             )),
             HirStmt::TableSetList(set_list) => {
-                if set_list.trailing_multivalue.is_some() {
+                if set_list.values.tail.is_some() {
                     return Err(AstLowerError::UnsupportedSetListTrailingMultivalue {
                         proto: proto_index,
                     });
@@ -214,6 +189,7 @@ impl<'a> AstLowerer<'a> {
                 let base = self.lower_expr(proto_index, &set_list.base)?;
                 let stmts = set_list
                     .values
+                    .fixed
                     .iter()
                     .enumerate()
                     .map(|(offset, value)| {
@@ -246,32 +222,16 @@ impl<'a> AstLowerer<'a> {
                 }))],
                 1,
             )),
-            HirStmt::Return(ret) => {
-                let mut values = ret
-                    .values
-                    .iter()
-                    .map(|value| self.lower_expr(proto_index, value))
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                // 当 return 的 value pack 是 Fixed 时（trailing_multiret == false），
-                // 末尾如果是多返回表达式（Call 或 VarArg），需要包裹 SingleValue
-                // 以在源码层面产生 `(expr)` 来截断多返回展开。
-                if !ret.trailing_multiret
-                    && let Some(last) = values.last_mut()
-                {
-                    let needs_truncation = matches!(
-                        ret.values.last(),
-                        Some(HirExpr::Call(call)) if !call.multiret
-                    ) || matches!(ret.values.last(), Some(HirExpr::VarArg));
-
-                    if needs_truncation {
-                        let taken = std::mem::replace(last, AstExpr::Nil);
-                        *last = AstExpr::SingleValue(Box::new(taken));
-                    }
-                }
-
-                Ok((vec![AstStmt::Return(Box::new(AstReturn { values }))], 1))
-            }
+            HirStmt::Return(ret) => Ok((
+                vec![AstStmt::Return(Box::new(AstReturn {
+                    values: self.lower_value_pack(
+                        proto_index,
+                        &ret.values,
+                        PackLoweringContext::Ordinary,
+                    )?,
+                }))],
+                1,
+            )),
             HirStmt::If(if_stmt) => Ok((
                 vec![AstStmt::If(Box::new(AstIf {
                     cond: self.lower_expr(proto_index, &if_stmt.cond)?,
@@ -355,12 +315,7 @@ impl<'a> AstLowerer<'a> {
                 ))
             }
             HirStmt::GenericFor(generic_for) => Ok((
-                vec![self.lower_generic_for_stmt(
-                    proto_index,
-                    generic_for,
-                    None,
-                    continue_target,
-                )?],
+                vec![self.lower_generic_for_stmt(proto_index, generic_for, continue_target)?],
                 1,
             )),
             HirStmt::Break => Ok((vec![AstStmt::Break], 1)),
@@ -434,7 +389,6 @@ impl<'a> AstLowerer<'a> {
         &mut self,
         proto_index: usize,
         generic_for: &HirGenericFor,
-        iterator_override: Option<&[crate::hir::HirExpr]>,
         continue_target: Option<AstLabelId>,
     ) -> Result<AstStmt, AstLowerError> {
         let loop_continue = self.loop_continue_label_if_needed(&generic_for.body);
@@ -448,7 +402,6 @@ impl<'a> AstLowerer<'a> {
             body.stmts
                 .push(AstStmt::Label(Box::new(AstLabel { id: label })));
         }
-        let iterator = iterator_override.unwrap_or(&generic_for.iterator);
         Ok(AstStmt::GenericFor(Box::new(AstGenericFor {
             bindings: generic_for
                 .bindings
@@ -456,10 +409,11 @@ impl<'a> AstLowerer<'a> {
                 .copied()
                 .map(AstBindingRef::Local)
                 .collect(),
-            iterator: iterator
-                .iter()
-                .map(|expr| self.lower_expr(proto_index, expr))
-                .collect::<Result<Vec<_>, _>>()?,
+            iterator: self.lower_value_pack(
+                proto_index,
+                &generic_for.iterator,
+                PackLoweringContext::Ordinary,
+            )?,
             body,
         })))
     }

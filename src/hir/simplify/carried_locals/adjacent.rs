@@ -97,10 +97,6 @@ fn stmt_allows_seed_to_absorb_carried(stmt: &HirStmt, seed: LocalId, carried: Lo
                     .values
                     .iter()
                     .all(|value| !expr_mentions_local(value, seed))
-                && set_list
-                    .trailing_multivalue
-                    .as_ref()
-                    .is_none_or(|value| !expr_mentions_local(value, seed))
         }
         HirStmt::ErrNil(err_nil) => !expr_mentions_local(&err_nil.value, seed),
         HirStmt::ToBeClosed(to_be_closed) => !expr_mentions_local(&to_be_closed.value, seed),
@@ -165,9 +161,12 @@ fn is_exact_local_copy_assign(assign: &HirAssign, carried: LocalId, seed: LocalI
     let [HirLValue::Local(target)] = assign.targets.as_slice() else {
         return false;
     };
-    let [HirExpr::LocalRef(value)] = assign.values.as_slice() else {
+    let [HirExpr::LocalRef(value)] = assign.values.fixed.as_slice() else {
         return false;
     };
+    if assign.values.tail.is_some() {
+        return false;
+    }
     *target == carried && *value == seed
 }
 
@@ -176,7 +175,10 @@ fn is_supported_local_writeback_assign(
     seed: LocalId,
     carried: LocalId,
 ) -> bool {
-    if assign.targets.len() != assign.values.len() || assign.targets.is_empty() {
+    if assign.values.tail.is_some()
+        || assign.targets.len() != assign.values.fixed.len()
+        || assign.targets.is_empty()
+    {
         return false;
     }
 

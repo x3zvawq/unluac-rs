@@ -286,14 +286,183 @@ pub enum HirBinaryOpKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirCallExpr {
     pub callee: HirExpr,
-    pub args: Vec<HirExpr>,
-    pub multiret: bool,
+    pub args: HirValuePack,
     pub method: bool,
     /// 来自 `SELF` / `NAMECALL` 的 method 名事实。
     ///
     /// 这一层显式保留字段名，是为了避免后面的 AST build 再去猜
     /// `obj.method(obj, ...)` 是否可以收回 `obj:method(...)`。
     pub method_name: Option<String>,
+}
+
+/// Lua 表达式列表：若存在尾包，它是列表中唯一会展开的值。
+///
+/// 普通 `HirExpr` 始终只产生一个标量值；开放结果不能再借普通 temp/local 保存。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HirValuePack {
+    pub fixed: Vec<HirExpr>,
+    pub tail: Option<HirPackTail>,
+}
+
+impl HirValuePack {
+    pub fn fixed(values: Vec<HirExpr>) -> Self {
+        Self {
+            fixed: values,
+            tail: None,
+        }
+    }
+
+    pub fn expanding(fixed: Vec<HirExpr>, tail: HirPackTail) -> Self {
+        Self {
+            fixed,
+            tail: Some(tail),
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &HirExpr> {
+        self.fixed
+            .iter()
+            .chain(self.tail.iter().map(HirPackTail::as_expr))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fixed.is_empty() && self.tail.is_none()
+    }
+
+    /// 返回源码表达式槽数；exact tail 仍只占一个槽，结果宽度见 `exact_result_len`。
+    pub fn expr_len(&self) -> usize {
+        self.fixed.len() + usize::from(self.tail.is_some())
+    }
+
+    pub fn exact_result_len(&self) -> Option<usize> {
+        Some(
+            self.fixed.len()
+                + match &self.tail {
+                    Some(tail) => tail.exact_width()?,
+                    None => 0,
+                },
+        )
+    }
+
+    pub fn first(&self) -> Option<&HirExpr> {
+        self.fixed
+            .first()
+            .or_else(|| self.tail.as_ref().map(HirPackTail::as_expr))
+    }
+
+    pub fn last(&self) -> Option<&HirExpr> {
+        self.tail
+            .as_ref()
+            .map(HirPackTail::as_expr)
+            .or_else(|| self.fixed.last())
+    }
+}
+
+impl From<Vec<HirExpr>> for HirValuePack {
+    fn from(values: Vec<HirExpr>) -> Self {
+        Self::fixed(values)
+    }
+}
+
+fn pack_tail_expr(tail: &HirPackTail) -> &HirExpr {
+    tail.as_expr()
+}
+
+impl<'a> IntoIterator for &'a HirValuePack {
+    type Item = &'a HirExpr;
+    type IntoIter = std::iter::Chain<
+        std::slice::Iter<'a, HirExpr>,
+        std::iter::Map<std::option::Iter<'a, HirPackTail>, fn(&'a HirPackTail) -> &'a HirExpr>,
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.fixed.iter().chain(
+            self.tail
+                .iter()
+                .map(pack_tail_expr as fn(&'a HirPackTail) -> &'a HirExpr),
+        )
+    }
+}
+
+/// 只能出现在显式多值尾槽中的展开值。
+///
+/// 普通值列表使用 [`HirValuePack::tail`]，表构造器使用
+/// [`HirTableConstructor::trailing_multivalue`]；其它位置不得承载展开语义。
+#[derive(Debug, Clone, PartialEq)]
+pub struct HirPackTail {
+    expr: HirExpr,
+    exact_width: Option<usize>,
+}
+
+impl HirPackTail {
+    pub fn open(expr: HirExpr) -> Self {
+        assert!(matches!(expr, HirExpr::Call(_) | HirExpr::VarArg));
+        Self {
+            expr,
+            exact_width: None,
+        }
+    }
+
+    pub fn exact(expr: HirExpr, width: usize) -> Self {
+        assert!(width > 1);
+        assert!(matches!(expr, HirExpr::Call(_) | HirExpr::VarArg));
+        Self {
+            expr,
+            exact_width: Some(width),
+        }
+    }
+
+    pub fn as_expr(&self) -> &HirExpr {
+        &self.expr
+    }
+
+    /// 返回开放尾调用的可变内容，但不暴露可替换根节点的 `&mut HirExpr`。
+    pub fn call_mut(&mut self) -> Option<&mut HirCallExpr> {
+        match &mut self.expr {
+            HirExpr::Call(call) => Some(call.as_mut()),
+            HirExpr::VarArg => None,
+            _ => unreachable!("pack tail root must remain a call or vararg"),
+        }
+    }
+
+    pub fn into_expr(self) -> HirExpr {
+        self.expr
+    }
+
+    pub fn map_call(self, map: impl FnOnce(HirCallExpr) -> HirCallExpr) -> Self {
+        let expr = match self.expr {
+            HirExpr::Call(call) => HirExpr::Call(Box::new(map(*call))),
+            HirExpr::VarArg => HirExpr::VarArg,
+            _ => unreachable!("pack tail root must remain a call or vararg"),
+        };
+        Self {
+            expr,
+            exact_width: self.exact_width,
+        }
+    }
+
+    pub fn try_map_call(
+        self,
+        map: impl FnOnce(HirCallExpr) -> Option<HirCallExpr>,
+    ) -> Option<Self> {
+        let expr = match self.expr {
+            HirExpr::Call(call) => HirExpr::Call(Box::new(map(*call)?)),
+            HirExpr::VarArg => HirExpr::VarArg,
+            _ => unreachable!("pack tail root must remain a call or vararg"),
+        };
+        Some(Self {
+            expr,
+            exact_width: self.exact_width,
+        })
+    }
+
+    pub fn into_open(self) -> Self {
+        Self::open(self.expr)
+    }
+
+    pub fn exact_width(&self) -> Option<usize> {
+        self.exact_width
+    }
 }
 
 /// 调用语句。
@@ -306,14 +475,14 @@ pub struct HirCallStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirLocalDecl {
     pub bindings: Vec<LocalId>,
-    pub values: Vec<HirExpr>,
+    pub values: HirValuePack,
 }
 
 /// 普通赋值。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirAssign {
     pub targets: Vec<HirLValue>,
-    pub values: Vec<HirExpr>,
+    pub values: HirValuePack,
 }
 
 /// 表数组段批量写入。
@@ -326,8 +495,7 @@ pub struct HirAssign {
 pub struct HirTableSetList {
     pub base: HirExpr,
     pub start_index: u32,
-    pub values: Vec<HirExpr>,
-    pub trailing_multivalue: Option<HirExpr>,
+    pub values: HirValuePack,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -365,13 +533,9 @@ pub struct HirClose {
 
 /// 返回语句。
 ///
-/// `trailing_multiret` 标记最后一个值是否会展开为多个返回值（对应字节码层面的 Open pack）。
-/// 当为 `false` 时，所有值都是"固定"的，AST 层面需要对末尾的 Call/VarArg 加上 `()`
-/// 来阻止多返回展开（即包裹为 `SingleValue`）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirReturn {
-    pub values: Vec<HirExpr>,
-    pub trailing_multiret: bool,
+    pub values: HirValuePack,
 }
 
 /// if 语句。
@@ -410,7 +574,7 @@ pub struct HirNumericFor {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirGenericFor {
     pub bindings: Vec<LocalId>,
-    pub iterator: Vec<HirExpr>,
+    pub iterator: HirValuePack,
     pub body: HirBlock,
 }
 
@@ -437,7 +601,7 @@ pub struct HirUnstructured {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct HirTableConstructor {
     pub fields: Vec<HirTableField>,
-    pub trailing_multivalue: Option<HirExpr>,
+    pub trailing_multivalue: Option<HirPackTail>,
 }
 
 /// 表构造器字段。

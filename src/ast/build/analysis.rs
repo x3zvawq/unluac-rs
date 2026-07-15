@@ -102,11 +102,11 @@ fn collect_referenced_temps_in_stmt(stmt: &HirStmt, temps: &mut ReferencedTempCo
         }
         HirStmt::TableSetList(set_list) => {
             collect_referenced_temps_in_expr(&set_list.base, temps);
-            for value in &set_list.values {
+            for value in &set_list.values.fixed {
                 collect_referenced_temps_in_expr(value, temps);
             }
-            if let Some(value) = &set_list.trailing_multivalue {
-                collect_referenced_temps_in_expr(value, temps);
+            if let Some(value) = &set_list.values.tail {
+                collect_referenced_temps_in_expr(value.as_expr(), temps);
             }
         }
         HirStmt::ErrNil(err_nnil) => collect_referenced_temps_in_expr(&err_nnil.value, temps),
@@ -217,7 +217,7 @@ fn collect_referenced_temps_in_expr(expr: &HirExpr, temps: &mut ReferencedTempCo
                 }
             }
             if let Some(value) = &table.trailing_multivalue {
-                collect_referenced_temps_in_expr(value, temps);
+                collect_referenced_temps_in_expr(value.as_expr(), temps);
             }
         }
         HirExpr::Closure(closure) => {
@@ -337,13 +337,15 @@ fn count_local_uses_in_stmt(stmt: &HirStmt, local: LocalId) -> usize {
             count_local_uses_in_expr(&set_list.base, local)
                 + set_list
                     .values
+                    .fixed
                     .iter()
                     .map(|value| count_local_uses_in_expr(value, local))
                     .sum::<usize>()
                 + set_list
-                    .trailing_multivalue
+                    .values
+                    .tail
                     .as_ref()
-                    .map(|value| count_local_uses_in_expr(value, local))
+                    .map(|value| count_local_uses_in_expr(value.as_expr(), local))
                     .unwrap_or(0)
         }
         HirStmt::ErrNil(err_nnil) => count_local_uses_in_expr(&err_nnil.value, local),
@@ -446,20 +448,27 @@ fn count_local_uses_in_expr(expr: &HirExpr, local: LocalId) -> usize {
             })
             .sum(),
         HirExpr::Call(call) => count_local_uses_in_call(call, local),
-        HirExpr::TableConstructor(table) => table
-            .fields
-            .iter()
-            .map(|field| match field {
-                HirTableField::Array(expr) => count_local_uses_in_expr(expr, local),
-                HirTableField::Record(record) => match &record.key {
-                    HirTableKey::Name(_) => count_local_uses_in_expr(&record.value, local),
-                    HirTableKey::Expr(expr) => {
-                        count_local_uses_in_expr(expr, local)
-                            + count_local_uses_in_expr(&record.value, local)
-                    }
-                },
-            })
-            .sum(),
+        HirExpr::TableConstructor(table) => {
+            table
+                .fields
+                .iter()
+                .map(|field| match field {
+                    HirTableField::Array(expr) => count_local_uses_in_expr(expr, local),
+                    HirTableField::Record(record) => match &record.key {
+                        HirTableKey::Name(_) => count_local_uses_in_expr(&record.value, local),
+                        HirTableKey::Expr(expr) => {
+                            count_local_uses_in_expr(expr, local)
+                                + count_local_uses_in_expr(&record.value, local)
+                        }
+                    },
+                })
+                .sum::<usize>()
+                + table
+                    .trailing_multivalue
+                    .as_ref()
+                    .map(|tail| count_local_uses_in_expr(tail.as_expr(), local))
+                    .unwrap_or(0)
+        }
         HirExpr::Closure(closure) => closure
             .captures
             .iter()

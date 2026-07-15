@@ -125,7 +125,7 @@ fn prune_redundant_self_assign_components_in_stmt(
     let HirStmt::Assign(assign) = stmt else {
         return false;
     };
-    if assign.targets.len() != assign.values.len() {
+    if assign.values.tail.is_some() || assign.targets.len() != assign.values.fixed.len() {
         return false;
     }
 
@@ -146,7 +146,7 @@ fn prune_redundant_self_assign_components_in_stmt(
     }
 
     assign.targets = rewritten.iter().map(|(target, _)| target.clone()).collect();
-    assign.values = rewritten.into_iter().map(|(_, value)| value).collect();
+    assign.values.fixed = rewritten.into_iter().map(|(_, value)| value).collect();
     true
 }
 

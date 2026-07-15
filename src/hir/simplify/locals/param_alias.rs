@@ -67,9 +67,12 @@ fn match_param_alias_local_decl(block: &HirBlock) -> Option<ParamAliasPrefix> {
         return None;
     };
     let local = single_local_binding(local_decl)?;
-    let [value] = local_decl.values.as_slice() else {
+    let [value] = local_decl.values.fixed.as_slice() else {
         return None;
     };
+    if local_decl.values.tail.is_some() {
+        return None;
+    }
     let HirExpr::ParamRef(param) = value else {
         return None;
     };
@@ -92,9 +95,12 @@ fn match_param_alias_decl_assign(block: &HirBlock) -> Option<ParamAliasPrefix> {
     let [target] = assign.targets.as_slice() else {
         return None;
     };
-    let [value] = assign.values.as_slice() else {
+    let [value] = assign.values.fixed.as_slice() else {
         return None;
     };
+    if assign.values.tail.is_some() {
+        return None;
+    }
     if !matches!(target, HirLValue::Local(target) if *target == local) {
         return None;
     }

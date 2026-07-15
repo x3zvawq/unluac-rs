@@ -12,9 +12,9 @@ use std::collections::BTreeMap;
 
 use super::exprs::{
     expr_for_closure_capture, expr_for_const, expr_for_reg_use, expr_for_value_operand,
-    is_multiret_results, lower_binary_op, lower_branch_cond, lower_method_name,
-    lower_table_access_expr, lower_table_access_target, lower_unary_op, lower_upvalue_operand_expr,
-    lower_upvalue_operand_target, lower_value_pack, lower_value_pack_components,
+    lower_binary_op, lower_branch_cond, lower_method_name, lower_table_access_expr,
+    lower_table_access_target, lower_unary_op, lower_upvalue_operand_expr,
+    lower_upvalue_operand_target, lower_value_pack,
 };
 use super::helpers::{
     assign_stmt, binary_expr, branch_stmt, build_label_map_for_summary, concat_expr,
@@ -24,8 +24,8 @@ use super::helpers::{
 use super::lower::ProtoLowering;
 use crate::hir::common::{
     HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirCallStmt, HirCapture, HirClose,
-    HirClosureExpr, HirExpr, HirLValue, HirLabelId, HirLocalDecl, HirStmt, HirTableSetList,
-    HirToBeClosed, HirUnaryExpr, LocalId,
+    HirClosureExpr, HirExpr, HirLValue, HirLabelId, HirLocalDecl, HirPackTail, HirStmt,
+    HirTableSetList, HirToBeClosed, HirUnaryExpr, HirValuePack, LocalId,
 };
 use crate::structure::BlockRef;
 use crate::transformer::{
@@ -51,7 +51,7 @@ pub(super) fn lower_regular_instr(
             lowering.bindings.instr_fixed_defs[instr_ref.index()]
                 .iter()
                 .map(|_temp| HirExpr::Nil)
-                .collect(),
+                .collect::<Vec<_>>(),
         ),
         LowInstr::LoadBool(load_bool) => {
             fixed_assign(lowering, instr_ref, vec![HirExpr::Boolean(load_bool.value)])
@@ -196,24 +196,21 @@ pub(super) fn lower_regular_instr(
             } else {
                 expr_for_reg_use(lowering, block, instr_ref, tail_call.callee)
             };
-            vec![return_stmt(
-                vec![HirExpr::Call(Box::new(HirCallExpr {
+            vec![return_stmt(HirValuePack::expanding(
+                Vec::new(),
+                HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
                     callee,
                     args: lower_value_pack(lowering, block, instr_ref, tail_call.args),
-                    multiret: true,
                     method: matches!(tail_call.kind, CallKind::Method),
                     method_name,
-                }))],
-                true,
-            )]
+                }))),
+            ))]
         }
         LowInstr::VarArg(vararg) => lower_vararg(lowering, instr_ref, vararg.results),
         LowInstr::Return(ret) => {
-            let trailing_multiret = matches!(ret.values, crate::transformer::ValuePack::Open(_));
-            vec![return_stmt(
-                lower_value_pack(lowering, block, instr_ref, ret.values),
-                trailing_multiret,
-            )]
+            vec![return_stmt(lower_value_pack(
+                lowering, block, instr_ref, ret.values,
+            ))]
         }
         LowInstr::Closure(closure) => {
             let mut stmts = capture_empty_local_decl_stmts(lowering, instr_ref);
@@ -325,11 +322,9 @@ pub(super) fn lower_control_instr(
             ))),
         )],
         LowInstr::Return(ret) => {
-            let trailing_multiret = matches!(ret.values, crate::transformer::ValuePack::Open(_));
-            vec![return_stmt(
-                lower_value_pack(lowering, block, instr_ref, ret.values),
-                trailing_multiret,
-            )]
+            vec![return_stmt(lower_value_pack(
+                lowering, block, instr_ref, ret.values,
+            ))]
         }
         LowInstr::TailCall(tail_call) => {
             let method_name = lower_method_name(lowering, tail_call.method_name);
@@ -340,16 +335,15 @@ pub(super) fn lower_control_instr(
             } else {
                 expr_for_reg_use(lowering, block, instr_ref, tail_call.callee)
             };
-            vec![return_stmt(
-                vec![HirExpr::Call(Box::new(HirCallExpr {
+            vec![return_stmt(HirValuePack::expanding(
+                Vec::new(),
+                HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
                     callee,
                     args: lower_value_pack(lowering, block, instr_ref, tail_call.args),
-                    multiret: true,
                     method: matches!(tail_call.kind, CallKind::Method),
                     method_name,
-                }))],
-                true,
-            )]
+                }))),
+            ))]
         }
         LowInstr::NumericForInit(instr) => vec![
             assign_stmt(
@@ -425,13 +419,11 @@ fn lower_set_list(
     instr_ref: InstrRef,
     set_list: &crate::transformer::SetListInstr,
 ) -> Vec<HirStmt> {
-    let (values, trailing_multivalue) =
-        lower_value_pack_components(lowering, block, instr_ref, set_list.values);
+    let values = lower_value_pack(lowering, block, instr_ref, set_list.values);
     vec![HirStmt::TableSetList(Box::new(HirTableSetList {
         base: expr_for_reg_use(lowering, block, instr_ref, set_list.base),
         start_index: set_list.start_index,
         values,
-        trailing_multivalue,
     }))]
 }
 
@@ -441,10 +433,11 @@ fn lower_generic_for_call(
     instr_ref: InstrRef,
     instr: &GenericForCallInstr,
 ) -> Vec<HirStmt> {
-    fixed_or_open_assign(
+    lower_result_assign(
         lowering,
         instr_ref,
-        vec![generic_for_iterator_call(lowering, block, instr_ref, instr)],
+        generic_for_iterator_call(lowering, block, instr_ref, instr),
+        instr.results,
     )
 }
 
@@ -464,12 +457,12 @@ fn generic_for_iterator_call(
                 Reg(instr.state.start.index() + offset),
             )
         })
-        .collect();
+        .collect::<Vec<_>>()
+        .into();
 
     HirExpr::Call(Box::new(HirCallExpr {
         callee,
         args,
-        multiret: true,
         method: false,
         method_name: None,
     }))
@@ -545,20 +538,15 @@ fn lower_call(
     let expr = HirExpr::Call(Box::new(HirCallExpr {
         callee,
         args: lower_value_pack(lowering, block, instr_ref, call.args),
-        multiret: is_multiret_results(call.results),
         method: matches!(call.kind, CallKind::Method),
         method_name,
     }));
 
-    if matches!(call.results, ResultPack::Ignore) {
-        vec![HirStmt::CallStmt(Box::new(HirCallStmt {
-            call: match expr {
-                HirExpr::Call(call) => *call,
-                _ => unreachable!("call lowering should always build a call expression"),
-            },
-        }))]
-    } else {
-        fixed_or_open_assign(lowering, instr_ref, vec![expr])
+    match call.results {
+        ResultPack::Ignore => call_stmt(expr),
+        ResultPack::Open(_) if lowering.open_pack_is_owned(instr_ref) => Vec::new(),
+        ResultPack::Open(_) => call_stmt(expr),
+        ResultPack::Fixed(_) => lower_result_assign(lowering, instr_ref, expr, call.results),
     }
 }
 
@@ -567,18 +555,44 @@ fn lower_vararg(
     instr_ref: InstrRef,
     results: ResultPack,
 ) -> Vec<HirStmt> {
-    let expr = HirExpr::VarArg;
     match results {
         ResultPack::Ignore => vec![unstructured_stmt("vararg ignore")],
-        _ => fixed_or_open_assign(lowering, instr_ref, vec![expr]),
+        ResultPack::Open(_) if lowering.open_pack_is_owned(instr_ref) => Vec::new(),
+        ResultPack::Open(_) => Vec::new(),
+        ResultPack::Fixed(_) => lower_result_assign(lowering, instr_ref, HirExpr::VarArg, results),
     }
+}
+
+fn call_stmt(expr: HirExpr) -> Vec<HirStmt> {
+    let HirExpr::Call(call) = expr else {
+        unreachable!("call lowering should always build a call expression");
+    };
+    vec![HirStmt::CallStmt(Box::new(HirCallStmt { call: *call }))]
+}
+
+fn lower_result_assign(
+    lowering: &ProtoLowering<'_>,
+    instr_ref: InstrRef,
+    expr: HirExpr,
+    results: ResultPack,
+) -> Vec<HirStmt> {
+    let ResultPack::Fixed(range) = results else {
+        unreachable!("only fixed results can be assigned as scalar HIR values");
+    };
+    let values = if range.len > 1 {
+        HirValuePack::expanding(Vec::new(), HirPackTail::exact(expr, range.len))
+    } else {
+        HirValuePack::fixed(vec![expr])
+    };
+    fixed_assign(lowering, instr_ref, values)
 }
 
 fn fixed_assign(
     lowering: &ProtoLowering<'_>,
     instr_ref: InstrRef,
-    values: Vec<HirExpr>,
+    values: impl Into<HirValuePack>,
 ) -> Vec<HirStmt> {
+    let values = values.into();
     let temps = &lowering.bindings.instr_fixed_defs[instr_ref.index()];
     let decl_locals = temps
         .iter()
@@ -593,7 +607,9 @@ fn fixed_assign(
     let targets = lower_fixed_targets(lowering, instr_ref);
     if targets.is_empty() {
         Vec::new()
-    } else if decl_locals.len() == targets.len() && decl_locals.len() == values.len() {
+    } else if decl_locals.len() == targets.len()
+        && values.exact_result_len() == Some(decl_locals.len())
+    {
         vec![HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: decl_locals,
             values,
@@ -625,25 +641,8 @@ fn local_decl_stmts(locals: Vec<LocalId>) -> Vec<HirStmt> {
     } else {
         vec![HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: locals,
-            values: Vec::new(),
+            values: HirValuePack::default(),
         }))]
-    }
-}
-
-fn fixed_or_open_assign(
-    lowering: &ProtoLowering<'_>,
-    instr_ref: InstrRef,
-    values: Vec<HirExpr>,
-) -> Vec<HirStmt> {
-    let mut targets = lower_fixed_targets(lowering, instr_ref);
-    if let Some(open_target) = lowering.bindings.instr_open_defs[instr_ref.index()] {
-        targets.push(HirLValue::Temp(open_target));
-    }
-
-    if targets.is_empty() {
-        Vec::new()
-    } else {
-        vec![assign_stmt(targets, values)]
     }
 }
 

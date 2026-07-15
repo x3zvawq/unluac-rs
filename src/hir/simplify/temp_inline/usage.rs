@@ -13,9 +13,12 @@ pub(super) fn inline_candidate(stmt: &HirStmt) -> Option<(TempId, &HirExpr)> {
     let [HirLValue::Temp(temp)] = assign.targets.as_slice() else {
         return None;
     };
-    let [value] = assign.values.as_slice() else {
+    let [value] = assign.values.fixed.as_slice() else {
         return None;
     };
+    if assign.values.tail.is_some() {
+        return None;
+    }
 
     Some((*temp, value))
 }
@@ -156,9 +159,6 @@ fn collect_stmt_temp_uses_into(stmt: &HirStmt, scratch: &mut TempUseScratch) {
             for value in &set_list.values {
                 collect_expr_temp_uses(value, scratch);
             }
-            if let Some(expr) = &set_list.trailing_multivalue {
-                collect_expr_temp_uses(expr, scratch);
-            }
         }
         HirStmt::ErrNil(err_nil) => {
             collect_expr_temp_uses(&err_nil.value, scratch);
@@ -270,8 +270,8 @@ fn collect_expr_temp_uses(expr: &HirExpr, scratch: &mut TempUseScratch) {
                     }
                 }
             }
-            if let Some(expr) = &table.trailing_multivalue {
-                collect_expr_temp_uses(expr, scratch);
+            if let Some(tail) = &table.trailing_multivalue {
+                collect_expr_temp_uses(tail.as_expr(), scratch);
             }
         }
         HirExpr::Closure(closure) => {
@@ -337,12 +337,6 @@ fn max_temp_index_in_stmt(stmt: &HirStmt) -> Option<usize> {
             .max(),
         HirStmt::TableSetList(set_list) => std::iter::once(max_temp_index_in_expr(&set_list.base))
             .chain(set_list.values.iter().map(max_temp_index_in_expr))
-            .chain(
-                set_list
-                    .trailing_multivalue
-                    .iter()
-                    .map(max_temp_index_in_expr),
-            )
             .flatten()
             .max(),
         HirStmt::ErrNil(err_nil) => max_temp_index_in_expr(&err_nil.value),
@@ -450,7 +444,12 @@ fn max_temp_index_in_expr(expr: &HirExpr) -> Option<usize> {
                     max_temp_index_in_expr(&field.value),
                 ],
             })
-            .chain(table.trailing_multivalue.iter().map(max_temp_index_in_expr))
+            .chain(
+                table
+                    .trailing_multivalue
+                    .iter()
+                    .map(|tail| max_temp_index_in_expr(tail.as_expr())),
+            )
             .flatten()
             .max(),
         HirExpr::Closure(closure) => closure

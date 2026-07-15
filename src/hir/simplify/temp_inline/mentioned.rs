@@ -241,8 +241,8 @@ pub(super) fn collect_expr_mentioned_temps(expr: &HirExpr, temps: &mut BTreeSet<
                     }
                 }
             }
-            if let Some(trailing) = &table.trailing_multivalue {
-                collect_expr_mentioned_temps(trailing, temps);
+            if let Some(tail) = &table.trailing_multivalue {
+                collect_expr_mentioned_temps(tail.as_expr(), temps);
             }
         }
         HirExpr::Closure(closure) => {

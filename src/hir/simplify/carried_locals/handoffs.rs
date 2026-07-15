@@ -354,10 +354,16 @@ fn stmt_writes_binding_only_via_direct_writeback(
 ) -> bool {
     match stmt {
         HirStmt::Assign(assign) => {
+            if assign.values.tail.is_some() || assign.targets.len() != assign.values.fixed.len() {
+                return !assign
+                    .targets
+                    .iter()
+                    .any(|target| binding_matches_lvalue(target, binding));
+            }
             assign
                 .targets
                 .iter()
-                .zip(&assign.values)
+                .zip(&assign.values.fixed)
                 .all(|(target, value)| {
                     !binding_matches_lvalue(target, binding)
                         || matches_direct_writeback_pair(target, value, binding, target_temp)
@@ -437,10 +443,13 @@ impl HirVisitor for DirectWritebackCollector {
         let HirStmt::Assign(assign) = stmt else {
             return;
         };
+        if assign.values.tail.is_some() || assign.targets.len() != assign.values.fixed.len() {
+            return;
+        }
         self.found |= assign
             .targets
             .iter()
-            .zip(&assign.values)
+            .zip(&assign.values.fixed)
             .any(|(target, value)| {
                 matches_direct_writeback_pair(target, value, self.binding, self.target_temp)
             });

@@ -5,7 +5,7 @@
 //! 例如：`local t = {}; t.x = 1; t.y = 2` 会在这里被扫描成一串 constructor steps。
 
 use crate::ast::DecompileDialect;
-use crate::hir::common::{HirExpr, HirLValue, HirStmt, HirTableConstructor};
+use crate::hir::common::{HirExpr, HirLValue, HirStmt, HirTableConstructor, HirValuePack};
 
 use super::bindings::{
     BindingIndex, BindingOccurrenceIndex, binding_from_expr, binding_from_lvalue,
@@ -21,7 +21,10 @@ pub(super) fn constructor_seed(stmt: &HirStmt) -> Option<(TableBinding, HirTable
             let [binding] = local_decl.bindings.as_slice() else {
                 return None;
             };
-            let [HirExpr::TableConstructor(table)] = local_decl.values.as_slice() else {
+            if local_decl.values.tail.is_some() {
+                return None;
+            }
+            let [HirExpr::TableConstructor(table)] = local_decl.values.fixed.as_slice() else {
                 return None;
             };
             Some((TableBinding::Local(*binding), (**table).clone()))
@@ -31,7 +34,10 @@ pub(super) fn constructor_seed(stmt: &HirStmt) -> Option<(TableBinding, HirTable
                 return None;
             };
             let binding = binding_from_lvalue(target)?;
-            let [HirExpr::TableConstructor(table)] = assign.values.as_slice() else {
+            if assign.values.tail.is_some() {
+                return None;
+            }
+            let [HirExpr::TableConstructor(table)] = assign.values.fixed.as_slice() else {
                 return None;
             };
             Some((binding, (**table).clone()))
@@ -43,10 +49,10 @@ pub(super) fn constructor_seed(stmt: &HirStmt) -> Option<(TableBinding, HirTable
 pub(super) fn install_constructor_seed(stmt: &mut HirStmt, constructor: HirTableConstructor) {
     match stmt {
         HirStmt::LocalDecl(local_decl) => {
-            local_decl.values = vec![HirExpr::TableConstructor(Box::new(constructor))];
+            local_decl.values = vec![HirExpr::TableConstructor(Box::new(constructor))].into();
         }
         HirStmt::Assign(assign) => {
-            assign.values = vec![HirExpr::TableConstructor(Box::new(constructor))];
+            assign.values = vec![HirExpr::TableConstructor(Box::new(constructor))].into();
         }
         _ => unreachable!("constructor region must start from a constructor seed"),
     }
@@ -153,7 +159,10 @@ pub(super) fn trailing_constructor_handoff(
     let [target] = assign.targets.as_slice() else {
         return None;
     };
-    let [value] = assign.values.as_slice() else {
+    if assign.values.tail.is_some() {
+        return None;
+    }
+    let [value] = assign.values.fixed.as_slice() else {
         return None;
     };
     if binding_from_expr(value) != Some(binding) {
@@ -178,7 +187,10 @@ fn keyed_write_step(stmt: &HirStmt, binding: TableBinding) -> bool {
     let [HirLValue::TableAccess(access)] = assign.targets.as_slice() else {
         return false;
     };
-    let [value] = assign.values.as_slice() else {
+    if assign.values.tail.is_some() {
+        return false;
+    }
+    let [value] = assign.values.fixed.as_slice() else {
         return false;
     };
     if binding_from_expr(&access.base) != Some(binding) {
@@ -232,7 +244,7 @@ fn producer_steps(
 
 fn producer_steps_from_bindings(
     bindings: Vec<TableBinding>,
-    values: &[HirExpr],
+    values: &HirValuePack,
     constructor_binding: TableBinding,
     stmt_index: usize,
     steps: &mut Vec<RegionStep>,
@@ -246,7 +258,7 @@ fn producer_steps_from_bindings(
         return false;
     }
 
-    if bindings.len() == values.len() {
+    if values.tail.is_none() && bindings.len() == values.fixed.len() {
         steps.extend((0..bindings.len()).map(|slot_index| RegionStep::Producer {
             stmt_index,
             slot_index,
@@ -254,19 +266,12 @@ fn producer_steps_from_bindings(
         return true;
     }
 
-    let [source] = values else {
-        return false;
-    };
-    if bindings.len() > 1 && is_open_pack_source(source) {
+    if bindings.len() > 1 && values.fixed.is_empty() && values.tail.is_some() {
         steps.push(RegionStep::ProducerGroup { stmt_index });
         return true;
     }
 
     false
-}
-
-fn is_open_pack_source(expr: &HirExpr) -> bool {
-    matches!(expr, HirExpr::VarArg) || matches!(expr, HirExpr::Call(call) if call.multiret)
 }
 
 fn table_set_list_step(stmt: &HirStmt, binding: TableBinding) -> bool {
@@ -278,12 +283,14 @@ fn table_set_list_step(stmt: &HirStmt, binding: TableBinding) -> bool {
     }
     if set_list
         .values
+        .fixed
         .iter()
         .any(|expr| expr_uses_binding(expr, binding))
         || set_list
-            .trailing_multivalue
+            .values
+            .tail
             .as_ref()
-            .is_some_and(|expr| expr_uses_binding(expr, binding))
+            .is_some_and(|tail| expr_uses_binding(tail.as_expr(), binding))
     {
         return false;
     }

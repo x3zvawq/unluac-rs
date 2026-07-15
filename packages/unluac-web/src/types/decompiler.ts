@@ -136,7 +136,7 @@ export type EdgeKind =
 
 export interface RichDecompileResult {
   source: string
-  warnings: string[]
+  kind: 'source' | 'diagnostic-pseudocode'
   protos: ProtoMeta[]
   cfgs: ProtoCfg[]
 }

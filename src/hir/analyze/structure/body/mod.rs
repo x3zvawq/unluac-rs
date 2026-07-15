@@ -15,7 +15,7 @@ mod prefix_temps;
 mod short_circuits;
 mod value_merges;
 
-use std::{cell::RefCell, ops::Range};
+use std::{cell::RefCell, collections::VecDeque, ops::Range};
 
 use super::*;
 
@@ -51,7 +51,7 @@ pub(super) struct StructuredBodyLowerer<'a, 'b> {
     pub(super) merge_allowed_blocks: BTreeMap<BlockRef, BTreeSet<BlockRef>>,
     pub(super) overrides: StructureOverrideState,
     pub(super) structured_close_points: BTreeSet<InstrRef>,
-    pub(super) tbc_scope_regs: BTreeSet<usize>,
+    pub(super) explicit_tbc_close_points: BTreeSet<InstrRef>,
     pub(super) visited: TransactionalBlockSet,
     pub(super) active_loops: Vec<ActiveLoopContext>,
     reachability: RefCell<BTreeMap<BlockRef, BTreeSet<BlockRef>>>,
@@ -67,6 +67,57 @@ pub(super) struct StructuredBranchPlan {
     // 短路候选的语义节点只包含条件 header；某些出口会先经过空 jump pad 再到
     // truthy/falsy 出口。pad 不参与条件重写，但需要计入覆盖性检查。
     pub(super) consumed_blocks: Vec<BlockRef>,
+}
+
+fn explicit_tbc_close_points(lowering: &ProtoLowering<'_>) -> BTreeSet<InstrRef> {
+    let cfg = lowering.cfg;
+    let mut active_out = vec![BTreeSet::<usize>::new(); cfg.blocks.len()];
+    let mut close_points = BTreeSet::new();
+    let mut pending = VecDeque::from(cfg.block_order.clone());
+    let mut queued = vec![true; cfg.blocks.len()];
+
+    while let Some(block) = pending.pop_front() {
+        queued[block.index()] = false;
+        if !cfg.reachable_blocks.contains(&block) || block == cfg.exit_block {
+            continue;
+        }
+
+        let mut incoming = BTreeSet::new();
+        for edge_ref in &cfg.preds[block.index()] {
+            let predecessor = cfg.edges[edge_ref.index()].from;
+            incoming.extend(active_out[predecessor.index()].iter().copied());
+        }
+        let mut active = incoming;
+        let range = cfg.blocks[block.index()].instrs;
+        for instr_index in range.start.index()..range.end() {
+            match &lowering.proto.instrs[instr_index] {
+                LowInstr::Tbc(tbc) if tbc.kind == crate::transformer::TbcKind::Explicit => {
+                    active.insert(tbc.reg.index());
+                }
+                LowInstr::Close(close) => {
+                    if active.range(close.from.index()..).next().is_some() {
+                        close_points.insert(InstrRef(instr_index));
+                    }
+                    active.retain(|reg| *reg < close.from.index());
+                }
+                _ => {}
+            }
+        }
+
+        if active == active_out[block.index()] {
+            continue;
+        }
+        active_out[block.index()] = active;
+        for edge_ref in &cfg.succs[block.index()] {
+            let successor = cfg.edges[edge_ref.index()].to;
+            if !queued[successor.index()] {
+                queued[successor.index()] = true;
+                pending.push_back(successor);
+            }
+        }
+    }
+
+    close_points
 }
 
 #[derive(Debug, Clone)]
@@ -228,15 +279,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .iter()
             .flat_map(|scope| scope.close_points.iter().copied())
             .collect();
-        let tbc_scope_regs = lowering
-            .proto
-            .instrs
-            .iter()
-            .filter_map(|instr| match instr {
-                LowInstr::Tbc(tbc) => Some(tbc.reg.index()),
-                _ => None,
-            })
-            .collect();
+        let explicit_tbc_close_points = explicit_tbc_close_points(lowering);
 
         Self {
             target,
@@ -251,7 +294,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             merge_allowed_blocks: BTreeMap::new(),
             overrides: StructureOverrideState::default(),
             structured_close_points,
-            tbc_scope_regs,
+            explicit_tbc_close_points,
             visited: TransactionalBlockSet::new(lowering.cfg.blocks.len()),
             active_loops: Vec::new(),
             reachability: RefCell::new(BTreeMap::new()),
@@ -643,7 +686,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             // 否则 while/repeat/if 已经结构化了，dump 里仍会残留“close from rX”的噪音，
             // 迫使后面的 AST/readability 再去反推这其实只是作用域结束。
             if self.structured_close_points.contains(&instr_ref)
-                && matches!(instr, LowInstr::Close(close) if !self.tbc_scope_regs.contains(&close.from.index()))
+                && !self.explicit_tbc_close_points.contains(&instr_ref)
             {
                 continue;
             }

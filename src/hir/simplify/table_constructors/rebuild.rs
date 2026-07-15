@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 
 use crate::ast::DecompileDialect;
 use crate::hir::common::{
-    HirBlock, HirCallExpr, HirCapture, HirDecisionTarget, HirExpr, HirLValue, HirStmt,
+    HirBlock, HirCallExpr, HirCapture, HirDecisionTarget, HirExpr, HirLValue, HirPackTail, HirStmt,
     HirTableField, HirTableKey, HirTableSetList,
 };
 
@@ -123,10 +123,10 @@ fn flush_constructor_segment(
             if set_list.start_index != builder.next_array_index() {
                 return None;
             }
-            for value in &set_list.values {
+            for value in &set_list.values.fixed {
                 builder.push_array_value(value.clone());
             }
-            if let Some(trailing) = &set_list.trailing_multivalue {
+            if let Some(trailing) = &set_list.values.tail {
                 builder.trailing_multivalue = Some(trailing.clone());
             }
         }
@@ -164,7 +164,7 @@ fn flush_constructor_segment(
             return None;
         }
 
-        let mut queued_values = VecDeque::from_iter(set_list.values.iter());
+        let mut queued_values = VecDeque::from_iter(set_list.values.fixed.iter());
         let tokens = context.scratch.tokens.clone();
         for token in &tokens {
             match token {
@@ -211,9 +211,14 @@ fn flush_constructor_segment(
             builder.push_array_value(value);
         }
 
-        if let Some(trailing) = &set_list.trailing_multivalue {
-            let trailing = inline_set_list_value(context, trailing)?;
-            builder.trailing_multivalue = Some(trailing);
+        if let Some(trailing) = &set_list.values.tail {
+            builder.trailing_multivalue = Some(trailing.clone().try_map_call(|call| {
+                let expr = inline_set_list_value(context, &HirExpr::Call(Box::new(call)))?;
+                let HirExpr::Call(call) = expr else {
+                    return None;
+                };
+                Some(*call)
+            })?);
         }
     }
 
@@ -257,7 +262,8 @@ fn flush_constructor_segment(
         for producer in &context.scratch.pending_producers {
             if !context.scratch.consumed_bindings[producer.binding_id]
                 && context.remaining_uses.contains(producer.binding_id)
-                && let PendingProducerSource::Value { stmt_index, .. } = producer.source
+                && let PendingProducerSource::Value { stmt_index, .. }
+                | PendingProducerSource::Tail { stmt_index } = producer.source
             {
                 retained_producer_stmts.push(stmt_index);
             }
@@ -390,10 +396,7 @@ fn register_producer_group(
     for (slot_index, binding) in bindings.into_iter().enumerate() {
         let binding_id = binding_index.id_of(binding)?;
         let source = if slot_index == 0 {
-            PendingProducerSource::Value {
-                stmt_index,
-                value_index: 0,
-            }
+            PendingProducerSource::Tail { stmt_index }
         } else {
             PendingProducerSource::Empty
         };
@@ -491,7 +494,10 @@ fn record_field_parts(
     let [HirLValue::TableAccess(access)] = assign.targets.as_slice() else {
         return None;
     };
-    let [value] = assign.values.as_slice() else {
+    if assign.values.tail.is_some() {
+        return None;
+    }
+    let [value] = assign.values.fixed.as_slice() else {
         return None;
     };
     Some((table_key_from_expr(&access.key, dialect), value))
@@ -543,13 +549,14 @@ fn single_producer(
 fn producer_group_stmt(
     block: &HirBlock,
     stmt_index: usize,
-) -> Option<(Vec<TableBinding>, &HirExpr)> {
+) -> Option<(Vec<TableBinding>, &HirPackTail)> {
     let stmt = block.stmts.get(stmt_index)?;
     match stmt {
         HirStmt::LocalDecl(local_decl) => {
-            let [source] = local_decl.values.as_slice() else {
+            if !local_decl.values.fixed.is_empty() {
                 return None;
-            };
+            }
+            let source = local_decl.values.tail.as_ref()?;
             Some((
                 local_decl
                     .bindings
@@ -561,9 +568,10 @@ fn producer_group_stmt(
             ))
         }
         HirStmt::Assign(assign) => {
-            let [source] = assign.values.as_slice() else {
+            if !assign.values.fixed.is_empty() {
                 return None;
-            };
+            }
+            let source = assign.values.tail.as_ref()?;
             let bindings = assign
                 .targets
                 .iter()
@@ -575,8 +583,8 @@ fn producer_group_stmt(
     }
 }
 
-fn can_drop_open_pack_source_if_unused(expr: &HirExpr) -> bool {
-    matches!(expr, HirExpr::VarArg)
+fn can_drop_open_pack_source_if_unused(tail: &HirPackTail) -> bool {
+    matches!(tail.as_expr(), HirExpr::VarArg)
 }
 
 fn pending_producer_value<'a>(
@@ -588,8 +596,15 @@ fn pending_producer_value<'a>(
             stmt_index,
             value_index,
         } => match block.stmts.get(stmt_index)? {
-            HirStmt::LocalDecl(local_decl) => local_decl.values.get(value_index),
-            HirStmt::Assign(assign) => assign.values.get(value_index),
+            HirStmt::LocalDecl(local_decl) => local_decl.values.fixed.get(value_index),
+            HirStmt::Assign(assign) => assign.values.fixed.get(value_index),
+            _ => None,
+        },
+        PendingProducerSource::Tail { stmt_index } => match block.stmts.get(stmt_index)? {
+            HirStmt::LocalDecl(local_decl) => {
+                local_decl.values.tail.as_ref().map(HirPackTail::as_expr)
+            }
+            HirStmt::Assign(assign) => assign.values.tail.as_ref().map(HirPackTail::as_expr),
             _ => None,
         },
         PendingProducerSource::Empty => None,
@@ -726,9 +741,9 @@ fn expr_captures_orphaned_binding(
                         removed_materializations,
                     )
                 }
-            }) || table.trailing_multivalue.as_ref().is_some_and(|value| {
+            }) || table.trailing_multivalue.as_ref().is_some_and(|tail| {
                 expr_captures_orphaned_binding(
-                    value,
+                    tail.as_expr(),
                     binding_index,
                     materialized_binding_counts,
                     removed_materializations,

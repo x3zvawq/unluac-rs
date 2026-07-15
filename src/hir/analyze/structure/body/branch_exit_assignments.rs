@@ -102,9 +102,12 @@ fn branch_exit_value_assignment_leaf_stmts_are_safe(
     let [target] = assign.targets.as_slice() else {
         return false;
     };
-    let [value] = assign.values.as_slice() else {
+    let [value] = assign.values.fixed.as_slice() else {
         return false;
     };
+    if assign.values.tail.is_some() {
+        return false;
+    }
     if !branch_exit_value_assignment_leaf_value_is_safe(value) {
         return false;
     }
@@ -143,9 +146,12 @@ fn branch_exit_condition_prefix_expr_overrides(
         let [HirLValue::Temp(target)] = assign.targets.as_slice() else {
             return None;
         };
-        let [value] = assign.values.as_slice() else {
+        let [value] = assign.values.fixed.as_slice() else {
             return None;
         };
+        if assign.values.tail.is_some() {
+            return None;
+        }
         if !branch_exit_condition_prefix_expr_is_safe(value) {
             continue;
         }

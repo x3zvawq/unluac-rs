@@ -34,20 +34,26 @@ impl HirRewritePass for RecursiveClosureSelfCapturePass<'_> {
     fn rewrite_stmt(&mut self, stmt: &mut HirStmt) -> bool {
         match stmt {
             HirStmt::LocalDecl(local_decl)
-                if local_decl.bindings.len() == 1 && local_decl.values.len() == 1 =>
+                if local_decl.bindings.len() == 1
+                    && local_decl.values.tail.is_none()
+                    && local_decl.values.fixed.len() == 1 =>
             {
                 rewrite_closure_self_captures(
-                    &mut local_decl.values[0],
+                    &mut local_decl.values.fixed[0],
                     HirExpr::LocalRef(local_decl.bindings[0]),
                     self.defined_temps,
                 )
             }
-            HirStmt::Assign(assign) if assign.targets.len() == 1 && assign.values.len() == 1 => {
+            HirStmt::Assign(assign)
+                if assign.targets.len() == 1
+                    && assign.values.tail.is_none()
+                    && assign.values.fixed.len() == 1 =>
+            {
                 let Some(binding_expr) = lvalue_as_expr(&assign.targets[0]) else {
                     return false;
                 };
                 rewrite_closure_self_captures(
-                    &mut assign.values[0],
+                    &mut assign.values.fixed[0],
                     binding_expr,
                     self.defined_temps,
                 )

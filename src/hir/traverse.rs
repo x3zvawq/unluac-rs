@@ -4,6 +4,61 @@
 //! 结构事实收成参数化宏，不同 pass 只需要提供回调就能得到完整的 child dispatch。
 //!
 //! 原先只在 `hir::simplify` 内部使用，现在提升到 `hir` 层面让 naming 等模块也能共享。
+//! 可变遍历不会把 value-pack tail 暴露成 `&mut HirExpr`：固定值仍按普通表达式遍历，
+//! tail 只能进入 Call 内部，因而任何 pass 都无法把其根节点改成非 Call/VarArg。
+
+macro_rules! traverse_hir_value_pack_children {
+    (
+        $pack:expr,
+        iter = iter,
+        expr($expr:ident) => $on_expr:block
+    ) => {{
+        for $expr in $pack.fixed.iter() {
+            $on_expr
+        }
+        if let Some($expr) = $pack.tail.as_ref().map(crate::hir::HirPackTail::as_expr) {
+            $on_expr
+        }
+    }};
+    (
+        $pack:expr,
+        iter = iter_mut,
+        expr($expr:ident) => $on_expr:block,
+        call($call:ident) => $on_call:block
+    ) => {{
+        for $expr in $pack.fixed.iter_mut() {
+            $on_expr
+        }
+        if let Some($call) = $pack
+            .tail
+            .as_mut()
+            .and_then(crate::hir::HirPackTail::call_mut)
+        {
+            $on_call
+        }
+    }};
+}
+
+macro_rules! traverse_hir_pack_tail {
+    (
+        $tail:expr,
+        iter = iter,
+        expr($expr:ident) => $on_expr:block
+    ) => {{
+        let $expr = $tail.as_expr();
+        $on_expr
+    }};
+    (
+        $tail:expr,
+        iter = iter_mut,
+        expr($expr:ident) => $on_expr:block,
+        call($call:ident) => $on_call:block
+    ) => {{
+        if let Some($call) = $tail.call_mut() {
+            $on_call
+        }
+    }};
+}
 
 macro_rules! traverse_hir_call_children {
     (
@@ -11,14 +66,18 @@ macro_rules! traverse_hir_call_children {
         iter = $iter:ident,
         borrow = [$($borrow:tt)+],
         expr($expr:ident) => $on_expr:block
+        $(, tail_call($tail_call:ident) => $on_tail_call:block)?
     ) => {{
         {
             let $expr = $($borrow)+ $call.callee;
             $on_expr
         }
-        for $expr in $call.args.$iter() {
-            $on_expr
-        }
+        crate::hir::traverse::traverse_hir_value_pack_children!(
+            $call.args,
+            iter = $iter,
+            expr($expr) => $on_expr
+            $(, call($tail_call) => $on_tail_call)?
+        );
     }};
 }
 
@@ -86,6 +145,7 @@ macro_rules! traverse_hir_table_constructor_children {
         opt = $opt:ident,
         borrow = [$($borrow:tt)+],
         expr($expr:ident) => $on_expr:block
+        $(, tail_call($tail_call:ident) => $on_tail_call:block)?
     ) => {{
         for field in $table.fields.$iter() {
             match field {
@@ -106,8 +166,13 @@ macro_rules! traverse_hir_table_constructor_children {
                 }
             }
         }
-        if let Some($expr) = $table.trailing_multivalue.$opt() {
-            $on_expr
+        if let Some(tail) = $table.trailing_multivalue.$opt() {
+            crate::hir::traverse::traverse_hir_pack_tail!(
+                tail,
+                iter = $iter,
+                expr($expr) => $on_expr
+                $(, call($tail_call) => $on_tail_call)?
+            );
         }
     }};
 }
@@ -200,6 +265,7 @@ macro_rules! traverse_hir_stmt_children {
         opt = $opt:ident,
         borrow = [$($borrow:tt)+],
         expr($expr:ident) => $on_expr:block,
+        $(tail_call($tail_call:ident) => $on_tail_call:block,)?
         lvalue($lvalue:ident) => $on_lvalue:block,
         block($block:ident) => $on_block:block,
         call($call:ident) => $on_call:block,
@@ -207,29 +273,35 @@ macro_rules! traverse_hir_stmt_children {
     ) => {{
         match $stmt {
             crate::hir::HirStmt::LocalDecl(local_decl) => {
-                for $expr in local_decl.values.$iter() {
-                    $on_expr
-                }
+                crate::hir::traverse::traverse_hir_value_pack_children!(
+                    local_decl.values,
+                    iter = $iter,
+                    expr($expr) => $on_expr
+                    $(, call($tail_call) => $on_tail_call)?
+                );
             }
             crate::hir::HirStmt::Assign(assign) => {
                 for $lvalue in assign.targets.$iter() {
                     $on_lvalue
                 }
-                for $expr in assign.values.$iter() {
-                    $on_expr
-                }
+                crate::hir::traverse::traverse_hir_value_pack_children!(
+                    assign.values,
+                    iter = $iter,
+                    expr($expr) => $on_expr
+                    $(, call($tail_call) => $on_tail_call)?
+                );
             }
             crate::hir::HirStmt::TableSetList(set_list) => {
                 {
                     let $expr = $($borrow)+ set_list.base;
                     $on_expr
                 }
-                for $expr in set_list.values.$iter() {
-                    $on_expr
-                }
-                if let Some($expr) = set_list.trailing_multivalue.$opt() {
-                    $on_expr
-                }
+                crate::hir::traverse::traverse_hir_value_pack_children!(
+                    set_list.values,
+                    iter = $iter,
+                    expr($expr) => $on_expr
+                    $(, call($tail_call) => $on_tail_call)?
+                );
             }
             crate::hir::HirStmt::ErrNil(err_nil) => {
                 let $expr = $($borrow)+ err_nil.value;
@@ -244,9 +316,12 @@ macro_rules! traverse_hir_stmt_children {
                 $on_call
             }
             crate::hir::HirStmt::Return(ret) => {
-                for $expr in ret.values.$iter() {
-                    $on_expr
-                }
+                crate::hir::traverse::traverse_hir_value_pack_children!(
+                    ret.values,
+                    iter = $iter,
+                    expr($expr) => $on_expr
+                    $(, call($tail_call) => $on_tail_call)?
+                );
             }
             crate::hir::HirStmt::If(if_stmt) => {
                 {
@@ -300,9 +375,12 @@ macro_rules! traverse_hir_stmt_children {
                 }
             }
             crate::hir::HirStmt::GenericFor(generic_for) => {
-                for $expr in generic_for.iterator.$iter() {
-                    $on_expr
-                }
+                crate::hir::traverse::traverse_hir_value_pack_children!(
+                    generic_for.iterator,
+                    iter = $iter,
+                    expr($expr) => $on_expr
+                    $(, call($tail_call) => $on_tail_call)?
+                );
                 {
                     let $block = $($borrow)+ generic_for.body;
                     $on_block
@@ -328,5 +406,7 @@ pub(crate) use traverse_hir_call_children;
 pub(crate) use traverse_hir_decision_children;
 pub(crate) use traverse_hir_expr_children;
 pub(crate) use traverse_hir_lvalue_children;
+pub(crate) use traverse_hir_pack_tail;
 pub(crate) use traverse_hir_stmt_children;
 pub(crate) use traverse_hir_table_constructor_children;
+pub(crate) use traverse_hir_value_pack_children;

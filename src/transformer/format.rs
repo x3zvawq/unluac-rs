@@ -116,7 +116,14 @@ pub fn format_low_instr(instr: &LowInstr) -> String {
                 .join(", ")
         ),
         LowInstr::Close(instr) => format!("close from {}", format_reg(instr.from)),
-        LowInstr::Tbc(instr) => format!("tbc {}", format_reg(instr.reg)),
+        LowInstr::Tbc(instr) => format!(
+            "tbc({}) {}",
+            match instr.kind {
+                crate::transformer::TbcKind::Explicit => "explicit",
+                crate::transformer::TbcKind::GenericFor => "generic-for",
+            },
+            format_reg(instr.reg)
+        ),
         LowInstr::NumericForInit(instr) => format!(
             "numeric-for-init index={} limit={} step={} binding={} body={} exit={}",
             format_reg(instr.index),

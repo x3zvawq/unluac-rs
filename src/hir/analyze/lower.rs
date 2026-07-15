@@ -28,7 +28,7 @@ use crate::hir::common::{
     HirBlock, HirExpr, HirLValue, HirLabel, HirLabelId, HirProto, HirProtoRef, HirStmt, LocalId,
     ParamId, TempId, UpvalueId,
 };
-use crate::structure::{BlockRef, Cfg, CfgGraph, DataflowFacts, GraphFacts, PhiId};
+use crate::structure::{BlockRef, Cfg, CfgGraph, DataflowFacts, GraphFacts, OpenDefId, PhiId};
 use crate::structure::{ShortCircuitExit, StructureFacts};
 use crate::transformer::{GenericForLoopInstr, InstrRef, LowInstr, LoweredProto, Reg};
 
@@ -42,10 +42,8 @@ pub(super) struct ProtoBindings {
     pub(super) temps: Vec<TempId>,
     pub(super) temp_debug_locals: Vec<Option<String>>,
     pub(super) fixed_temps: Vec<TempId>,
-    pub(super) open_temps: Vec<TempId>,
     pub(super) phi_temps: Vec<TempId>,
     pub(super) instr_fixed_defs: Vec<Vec<TempId>>,
-    pub(super) instr_open_defs: Vec<Option<TempId>>,
     pub(super) captured_temp_targets: BTreeMap<TempId, BoundSlotTarget>,
     pub(super) captured_temp_decl_locals: BTreeMap<TempId, LocalId>,
     pub(super) capture_empty_local_decls: BTreeMap<usize, Vec<LocalId>>,
@@ -117,6 +115,8 @@ pub(super) struct ProtoLowering<'a> {
     pub(super) structure: &'a StructureFacts,
     pub(super) child_refs: &'a [HirProtoRef],
     pub(super) bindings: ProtoBindings,
+    pub(super) open_pack_owners: Vec<Option<InstrRef>>,
+    pub(super) owned_open_producers: Vec<bool>,
     pub(super) dead_phis: BTreeSet<PhiId>,
 }
 
@@ -186,6 +186,13 @@ fn lower_proto_node(
         .collect::<Vec<_>>();
 
     let bindings = build_bindings(proto, cfg, dataflow, structure);
+    let open_pack_owners = build_open_pack_owners(proto, cfg, dataflow);
+    let mut owned_open_producers = vec![false; proto.instrs.len()];
+    for def in &dataflow.open_defs {
+        if open_pack_owners[def.id.index()].is_some() {
+            owned_open_producers[def.instr.index()] = true;
+        }
+    }
     let dead_phis = dataflow.compute_truly_dead_phis(cfg);
     let lowering = ProtoLowering {
         target,
@@ -196,6 +203,8 @@ fn lower_proto_node(
         structure,
         child_refs: &child_refs,
         bindings,
+        open_pack_owners,
+        owned_open_producers,
         dead_phis,
     };
 
@@ -218,6 +227,138 @@ fn lower_proto_node(
     artifacts.promotion_facts[id.index()] = ProtoPromotionFacts::from_dataflow(proto, dataflow);
 
     id
+}
+
+fn build_open_pack_owners(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+) -> Vec<Option<InstrRef>> {
+    let mut owners = vec![None; dataflow.open_defs.len()];
+    let mut conflicted = vec![false; dataflow.open_defs.len()];
+
+    for consumer_index in 0..proto.instrs.len() {
+        let consumer = InstrRef(consumer_index);
+        let sources = dataflow.open_use_sources_at(consumer);
+        if sources.has_entry() || sources.defs().len() != 1 {
+            continue;
+        }
+        let def_id = *sources
+            .defs()
+            .iter()
+            .next()
+            .expect("single open source checked above");
+        let Some(def) = dataflow.open_defs.get(def_id.index()) else {
+            continue;
+        };
+        let consumer_block = cfg.instr_to_block[consumer_index];
+        if def.block != consumer_block
+            || !open_pack_bridge_is_lifecycle_only(proto, def.instr, consumer)
+        {
+            continue;
+        }
+
+        match owners[def_id.index()] {
+            None => owners[def_id.index()] = Some(consumer),
+            Some(existing) if existing == consumer => {}
+            Some(_) => conflicted[def_id.index()] = true,
+        }
+    }
+
+    for (owner, conflicted) in owners.iter_mut().zip(conflicted) {
+        if conflicted {
+            *owner = None;
+        }
+    }
+    owners
+}
+
+fn open_pack_bridge_is_lifecycle_only(
+    proto: &LoweredProto,
+    producer: InstrRef,
+    consumer: InstrRef,
+) -> bool {
+    let Some(start) = producer.index().checked_add(1) else {
+        return false;
+    };
+    let Some(between) = proto.instrs.get(start..consumer.index()) else {
+        return false;
+    };
+
+    if between.is_empty() {
+        return true;
+    }
+
+    if between
+        .iter()
+        .all(|instr| matches!(instr, LowInstr::Close(_)))
+    {
+        // 只有 return/tail-call 协议会在表达式已经求值后、终结消费前执行词法 close。
+        // 一般 consumer 若跨过 Close，可能把 producer 移到可观察的 __close 之后。
+        return matches!(
+            proto.instrs.get(consumer.index()),
+            Some(LowInstr::Return(_) | LowInstr::TailCall(_))
+        );
+    }
+
+    open_pack_bridge_is_method_setup(proto, producer, consumer, between)
+}
+
+fn open_pack_bridge_is_method_setup(
+    proto: &LoweredProto,
+    producer: InstrRef,
+    consumer: InstrRef,
+    between: &[LowInstr],
+) -> bool {
+    let producer_start = match proto.instrs.get(producer.index()) {
+        Some(LowInstr::Call(call)) => match call.results {
+            crate::transformer::ResultPack::Open(start) => start,
+            _ => return false,
+        },
+        Some(LowInstr::VarArg(vararg)) => match vararg.results {
+            crate::transformer::ResultPack::Open(start) => start,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let Some(LowInstr::Call(call)) = proto.instrs.get(consumer.index()) else {
+        return false;
+    };
+    let crate::transformer::ValuePack::Open(self_arg) = call.args else {
+        return false;
+    };
+    let [LowInstr::Move(receiver), LowInstr::GetTable(method)] = between else {
+        return false;
+    };
+    let crate::transformer::AccessBase::Reg(base) = method.base else {
+        return false;
+    };
+    let crate::transformer::AccessKey::Const(method_key) = method.key else {
+        return false;
+    };
+
+    matches!(call.kind, crate::transformer::CallKind::Method)
+        && call
+            .method_name
+            .is_some_and(|hint| hint.const_ref == method_key)
+        && method.method_load
+        && method.dst == call.callee
+        && receiver.dst == self_arg
+        && receiver.src == base
+        && producer_start.index() == self_arg.index() + 1
+}
+
+impl ProtoLowering<'_> {
+    pub(super) fn owns_open_pack(&self, def: OpenDefId, consumer: InstrRef) -> bool {
+        self.open_pack_owners.get(def.index()).copied().flatten() == Some(consumer)
+    }
+
+    pub(super) fn open_pack_is_owned(&self, instr_ref: InstrRef) -> bool {
+        self.owned_open_producers
+            .get(instr_ref.index())
+            .copied()
+            .unwrap_or(false)
+    }
 }
 
 fn build_proto_body(target: AstTargetDialect, lowering: &ProtoLowering<'_>) -> HirBlock {

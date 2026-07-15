@@ -13,7 +13,7 @@ mod regs;
 use crate::ast::is_lua_identifier_name;
 use crate::hir::common::{
     HirBinaryExpr, HirBinaryOpKind, HirCallExpr, HirCapture, HirClosureExpr, HirExpr, HirGlobalRef,
-    HirLValue, HirTableAccess, HirUnaryExpr, HirUnaryOpKind, UpvalueId,
+    HirLValue, HirPackTail, HirTableAccess, HirUnaryExpr, HirUnaryOpKind, UpvalueId,
 };
 use crate::parser::RawLiteralConst;
 use crate::structure::BlockRef;
@@ -38,10 +38,9 @@ pub(super) use self::branch::{
 };
 pub(super) use self::defs::{
     expr_for_dup_safe_fixed_def, expr_for_fixed_def, expr_for_fixed_def_single_eval,
-    is_multiret_results,
 };
+pub(super) use self::packs::lower_value_pack;
 use self::packs::lower_value_pack_single_eval;
-pub(super) use self::packs::{lower_value_pack, lower_value_pack_components};
 pub(super) use self::regs::{
     expr_for_closure_capture, expr_for_reg_at_block_entry, expr_for_reg_at_block_exit,
     expr_for_reg_use,
@@ -58,7 +57,16 @@ fn resolve_open_pack_tail(
     lowering: &ProtoLowering<'_>,
     instr_ref: InstrRef,
     start_reg: Reg,
-) -> Option<(Reg, HirExpr)> {
+) -> Option<(Reg, HirPackTail)> {
+    resolve_open_pack_tail_with_policy(lowering, instr_ref, start_reg, false)
+}
+
+fn resolve_open_pack_tail_with_policy(
+    lowering: &ProtoLowering<'_>,
+    instr_ref: InstrRef,
+    start_reg: Reg,
+    single_eval: bool,
+) -> Option<(Reg, HirPackTail)> {
     let sources = lowering.dataflow.open_use_sources_at(instr_ref);
     let defs = sources.defs();
     if !sources.has_entry() && defs.len() == 1 {
@@ -70,9 +78,12 @@ fn resolve_open_pack_tail(
         if open_def.start_reg.index() < start_reg.index() {
             return None;
         }
+        if !lowering.owns_open_pack(*def, instr_ref) {
+            return None;
+        }
         return Some((
             open_def.start_reg,
-            HirExpr::TempRef(lowering.bindings.open_temps[def.index()]),
+            pack_tail_for_open_def(lowering, *def, single_eval)?,
         ));
     }
 
@@ -83,7 +94,7 @@ fn resolve_open_pack_tail(
     {
         return Some((
             Reg(usize::from(lowering.proto.signature.num_params)),
-            HirExpr::VarArg,
+            HirPackTail::open(HirExpr::VarArg),
         ));
     }
 
@@ -96,42 +107,16 @@ fn resolve_open_pack_tail_single_eval(
     lowering: &ProtoLowering<'_>,
     instr_ref: InstrRef,
     start_reg: Reg,
-) -> Option<(Reg, HirExpr)> {
-    let sources = lowering.dataflow.open_use_sources_at(instr_ref);
-    let defs = sources.defs();
-    if !sources.has_entry() && defs.len() == 1 {
-        let def = defs
-            .iter()
-            .next()
-            .expect("len checked above, exactly one reaching open def exists");
-        let open_def = lowering.dataflow.open_defs.get(def.index())?;
-        if open_def.start_reg.index() < start_reg.index() {
-            return None;
-        }
-        let expr = expr_for_open_def_single_eval(lowering, *def)
-            .unwrap_or_else(|| HirExpr::TempRef(lowering.bindings.open_temps[def.index()]));
-        return Some((open_def.start_reg, expr));
-    }
-
-    if sources.has_entry()
-        && defs.is_empty()
-        && lowering.proto.signature.is_vararg
-        && start_reg.index() <= usize::from(lowering.proto.signature.num_params)
-    {
-        return Some((
-            Reg(usize::from(lowering.proto.signature.num_params)),
-            HirExpr::VarArg,
-        ));
-    }
-
-    None
+) -> Option<(Reg, HirPackTail)> {
+    resolve_open_pack_tail_with_policy(lowering, instr_ref, start_reg, true)
 }
 
 /// 把一个 open def (多返回 call / vararg) 直接降成 HIR 表达式。
-fn expr_for_open_def_single_eval(
+fn pack_tail_for_open_def(
     lowering: &ProtoLowering<'_>,
     open_def_id: crate::structure::OpenDefId,
-) -> Option<HirExpr> {
+    single_eval: bool,
+) -> Option<HirPackTail> {
     let open_def = lowering.dataflow.open_defs.get(open_def_id.index())?;
     let instr = lowering.proto.instrs.get(open_def.instr.index())?;
     match instr {
@@ -140,7 +125,7 @@ fn expr_for_open_def_single_eval(
             let is_method_sugar = matches!(call.kind, CallKind::Method) && method_name.is_some();
             let callee = if is_method_sugar {
                 HirExpr::Nil
-            } else {
+            } else if single_eval {
                 expr_for_reg_use_single_eval_with_call_policy(
                     lowering,
                     open_def.block,
@@ -148,22 +133,27 @@ fn expr_for_open_def_single_eval(
                     call.callee,
                     false,
                 )
+            } else {
+                expr_for_reg_use(lowering, open_def.block, open_def.instr, call.callee)
             };
-            Some(HirExpr::Call(Box::new(HirCallExpr {
+            Some(HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
                 callee,
-                args: lower_value_pack_single_eval(
-                    lowering,
-                    open_def.block,
-                    open_def.instr,
-                    call.args,
-                ),
-                multiret: true,
+                args: if single_eval {
+                    lower_value_pack_single_eval(
+                        lowering,
+                        open_def.block,
+                        open_def.instr,
+                        call.args,
+                    )
+                } else {
+                    lower_value_pack(lowering, open_def.block, open_def.instr, call.args)
+                },
                 method: matches!(call.kind, CallKind::Method),
                 method_name,
-            })))
+            }))))
         }
         LowInstr::VarArg(vararg) if matches!(vararg.results, ResultPack::Open(_)) => {
-            Some(HirExpr::VarArg)
+            Some(HirPackTail::open(HirExpr::VarArg))
         }
         _ => None,
     }

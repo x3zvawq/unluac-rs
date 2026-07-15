@@ -12,16 +12,26 @@ use std::collections::BTreeMap;
 
 use crate::hir::common::{
     HirCallExpr, HirDecisionTarget, HirExpr, HirLValue, HirStmt, HirTableConstructor,
-    HirTableField, HirTableKey, LocalId, TempId,
+    HirTableField, HirTableKey, HirValuePack, LocalId, TempId,
 };
 
 pub(super) fn call_expr(call: &mut HirCallExpr, mapping: &BTreeMap<TempId, LocalId>) -> bool {
     let callee_changed = expr(&mut call.callee, mapping);
-    let mut args_changed = false;
-    for arg in &mut call.args {
-        args_changed |= expr(arg, mapping);
-    }
+    let args_changed = value_pack(&mut call.args, mapping);
     callee_changed || args_changed
+}
+
+pub(super) fn value_pack(pack: &mut HirValuePack, mapping: &BTreeMap<TempId, LocalId>) -> bool {
+    let mut fixed_changed = false;
+    for expr in &mut pack.fixed {
+        fixed_changed |= self::expr(expr, mapping);
+    }
+    let tail_changed = pack
+        .tail
+        .as_mut()
+        .and_then(crate::hir::HirPackTail::call_mut)
+        .is_some_and(|call| call_expr(call, mapping));
+    fixed_changed || tail_changed
 }
 
 pub(super) fn expr(node: &mut HirExpr, mapping: &BTreeMap<TempId, LocalId>) -> bool {
@@ -113,7 +123,8 @@ fn table_constructor(table: &mut HirTableConstructor, mapping: &BTreeMap<TempId,
     let trailing_changed = table
         .trailing_multivalue
         .as_mut()
-        .is_some_and(|expr| self::expr(expr, mapping));
+        .and_then(crate::hir::HirPackTail::call_mut)
+        .is_some_and(|call| call_expr(call, mapping));
 
     fields_changed || trailing_changed
 }
@@ -149,12 +160,12 @@ pub(super) fn lvalue(lvalue: &mut HirLValue, mapping: &BTreeMap<TempId, LocalId>
 pub(super) fn forward_capture_refs(stmt: &mut HirStmt, mapping: &BTreeMap<TempId, LocalId>) {
     match stmt {
         HirStmt::Assign(assign) => {
-            for expr in &mut assign.values {
+            for expr in &mut assign.values.fixed {
                 closure_capture_temps(expr, mapping);
             }
         }
         HirStmt::LocalDecl(local_decl) => {
-            for expr in &mut local_decl.values {
+            for expr in &mut local_decl.values.fixed {
                 closure_capture_temps(expr, mapping);
             }
         }

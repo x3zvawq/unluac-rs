@@ -14,14 +14,16 @@
 //! - 普通 `while/repeat` 只保留形态 hint，不会伪造额外 binding 证据
 //! - branch 经共享 backedge pad 提前进入下一轮时，会在 branch 候选齐备后记录唯一
 //!   `continue_edges` owner，HIR 不再按 jump 形状猜测归属
-//! - 多条 break exit 若仅经 jump/close pad 汇入同一 continuation，该处 live-out phi
-//!   仍归 loop owner；带赋值或调用的 post-loop 路径不会被当成透明 pad
+//! - 多条 break exit 若仅经 `Close + Jump` 或 `Close-only + fallthrough` pad 汇入同一
+//!   continuation，该处 live-out phi 仍归 loop owner；带赋值或调用的路径不透明
 //! - for binding 的提前退出域在多个物理 exit 的共同后继前结束，不会穿过
 //!   cleanup pad 把循环变量身份带到 post-loop
 //! - repeat body 的首个条件可能让 natural-loop 暂时呈现为 while；若该 header 的局部
 //!   break pad 严格汇入独立尾条件出口，则由 Structure 恢复真正的 repeat 形态
 //! - 普通内外循环可能共享 header；只有 successor 分区、内层出口归属和真实
 //!   body/exit 都能证明层级时才拆成多个候选，避免把 sibling latch 或无出口循环误拆
+//! - 全部出口都直接终止时，多条 sibling latch 仍共同归一个 while-true owner，header
+//!   作为它们共享的下一轮入口
 //! - `WhileLike` 的 header 前缀必须属于 branch 条件的数据依赖链，或是可丢弃的
 //!   无副作用残留；带副作用但不参与条件的语句应保守留给 repeat/unknown/goto 形态
 
@@ -1187,6 +1189,21 @@ fn infer_loop_shape(
         return (LoopKindHint::WhileLike, Some(header), None);
     }
 
+    let exits = collect_region_exits(cfg, blocks);
+    if backedge_sources.len() > 1
+        && exits.len() > 1
+        && matches!(
+            cfg.terminator(&proto.instrs, header),
+            Some(LowInstr::Branch(_))
+        )
+        && !region_has_scope_cleanup(proto, cfg, blocks)
+        && exits_are_terminal(proto, cfg, &exits)
+    {
+        // 多个 sibling latch 只是把同一轮尾部短路条件拆成多条回 header 的边；
+        // 没有普通 continuation 时，header 本身就是这些回边共同拥有的下一轮入口。
+        return (LoopKindHint::WhileTrueLike, Some(header), None);
+    }
+
     if backedge_sources.len() == 1 {
         let source = *backedge_sources
             .iter()
@@ -1196,7 +1213,7 @@ fn infer_loop_shape(
             cfg.terminator(&proto.instrs, source),
             Some(LowInstr::Jump(jump)) if cfg.instr_to_block[jump.target.index()] == header
         ) && !region_has_scope_cleanup(proto, cfg, blocks)
-            && exits_are_terminal(proto, cfg, &collect_region_exits(cfg, blocks))
+            && exits_are_terminal(proto, cfg, &exits)
         {
             return (LoopKindHint::WhileTrueLike, Some(source), None);
         }
@@ -1461,7 +1478,7 @@ fn shared_transparent_loop_exit_merge(
     let mut common = None::<BTreeSet<BlockRef>>;
     for exit in exits.iter().copied() {
         let mut reachable = BTreeSet::from([exit]);
-        if let Some(target) = transparent_jump_target(proto, cfg, exit) {
+        if let Some(target) = transparent_loop_exit_target(proto, cfg, exit) {
             reachable.insert(target);
         }
         common = Some(match common {
@@ -1473,6 +1490,24 @@ fn shared_transparent_loop_exit_merge(
     let mut common = common?.into_iter().filter(|block| *block != cfg.exit_block);
     let merge = common.next()?;
     common.next().is_none().then_some(merge)
+}
+
+fn transparent_loop_exit_target(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    block: BlockRef,
+) -> Option<BlockRef> {
+    if let Some(target) = transparent_jump_target(proto, cfg, block) {
+        return Some(target);
+    }
+    let range = cfg.blocks[block.index()].instrs;
+    if range.is_empty()
+        || (range.start.index()..range.end())
+            .any(|instr_index| !matches!(proto.instrs[instr_index], LowInstr::Close(_)))
+    {
+        return None;
+    }
+    cfg.unique_reachable_successor(block)
 }
 
 fn loop_value_has_inside_and_outside_incoming(value: &LoopValueMerge) -> bool {

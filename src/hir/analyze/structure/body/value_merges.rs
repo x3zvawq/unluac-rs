@@ -406,8 +406,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             apply_loop_rewrites(std::slice::from_mut(&mut stmt), target_overrides);
             if let HirStmt::Assign(assign) = &stmt
                 && assign.targets.len() == 1
-                && assign.values.len() == 1
-                && lvalue_as_expr(&assign.targets[0]).as_ref() == Some(&assign.values[0])
+                && assign.values.expr_len() == 1
+                && assign.values.tail.is_none()
+                && lvalue_as_expr(&assign.targets[0]).as_ref() == assign.values.fixed.first()
             {
                 continue;
             }

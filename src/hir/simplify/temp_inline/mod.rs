@@ -18,8 +18,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::ReadabilityOptions;
 use crate::hir::common::{
-    HirBlock, HirCallExpr, HirExpr, HirLValue, HirProto, HirStmt, HirTableField, HirTableKey,
-    TempId,
+    HirBlock, HirCallExpr, HirExpr, HirLValue, HirPackTail, HirProto, HirStmt, HirTableField,
+    HirTableKey, HirValuePack, TempId,
 };
 use crate::hir::expr_safety::expr_observes_eval_order;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
@@ -201,8 +201,8 @@ fn fixed_return_tail_call_prefers_materialization(
         return false;
     };
     site == InlineSite::ReturnValue
-        && !ret.trailing_multiret
-        && ret.values.len() > 1
+        && ret.values.tail.is_none()
+        && ret.values.expr_len() > 1
         && matches!(value, HirExpr::Call(_))
         && matches!(ret.values.last(), Some(HirExpr::TempRef(tail)) if *tail == temp)
 }
@@ -276,7 +276,6 @@ fn inline_call_callee_across_argument_materialization(
             protected_temps,
             captured_slots_before_stmt,
         ) || total_use_count(callee_temp, &total_use_totals) != 1
-            || expr_has_open_multivalue(callee_value)
         {
             index += 1;
             continue;
@@ -305,7 +304,6 @@ fn inline_call_callee_across_argument_materialization(
                 stmt_order[index],
                 &prior_order_sensitive_defs,
             ) || total_use_count(arg_temp, &total_use_totals) != 1
-                || expr_has_open_multivalue(arg_value)
             {
                 break;
             }
@@ -338,7 +336,7 @@ fn inline_call_callee_across_argument_materialization(
             .collect::<BTreeMap<_, _>>();
         if let HirStmt::CallStmt(call_stmt) = &mut block.stmts[call_index] {
             call_stmt.call.callee = callee_value;
-            for arg in &mut call_stmt.call.args {
+            for arg in &mut call_stmt.call.args.fixed {
                 let HirExpr::TempRef(temp) = arg else {
                     continue;
                 };
@@ -425,77 +423,14 @@ fn total_use_count(temp: TempId, total_use_totals: &[usize]) -> usize {
         .unwrap_or_default()
 }
 
-fn call_args_are_exact_temp_refs(args: &[HirExpr], expected_temps: &[TempId]) -> bool {
-    args.len() == expected_temps.len()
+fn call_args_are_exact_temp_refs(args: &HirValuePack, expected_temps: &[TempId]) -> bool {
+    args.tail.is_none()
+        && args.fixed.len() == expected_temps.len()
         && args
+            .fixed
             .iter()
             .zip(expected_temps.iter().copied())
             .all(|(arg, expected)| matches!(arg, HirExpr::TempRef(temp) if *temp == expected))
-}
-
-fn expr_has_open_multivalue(expr: &HirExpr) -> bool {
-    match expr {
-        HirExpr::VarArg => true,
-        HirExpr::Call(call) => {
-            call.multiret
-                || expr_has_open_multivalue(&call.callee)
-                || call.args.iter().any(expr_has_open_multivalue)
-        }
-        HirExpr::TableAccess(access) => {
-            expr_has_open_multivalue(&access.base) || expr_has_open_multivalue(&access.key)
-        }
-        HirExpr::Unary(unary) => expr_has_open_multivalue(&unary.expr),
-        HirExpr::Binary(binary) => {
-            expr_has_open_multivalue(&binary.lhs) || expr_has_open_multivalue(&binary.rhs)
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            expr_has_open_multivalue(&logical.lhs) || expr_has_open_multivalue(&logical.rhs)
-        }
-        HirExpr::Decision(decision) => decision.nodes.iter().any(|node| {
-            expr_has_open_multivalue(&node.test)
-                || decision_target_has_open_multivalue(&node.truthy)
-                || decision_target_has_open_multivalue(&node.falsy)
-        }),
-        HirExpr::TableConstructor(table) => {
-            table.fields.iter().any(|field| match field {
-                HirTableField::Array(value) => expr_has_open_multivalue(value),
-                HirTableField::Record(field) => {
-                    matches!(&field.key, HirTableKey::Expr(key) if expr_has_open_multivalue(key))
-                        || expr_has_open_multivalue(&field.value)
-                }
-            }) || table
-                .trailing_multivalue
-                .as_ref()
-                .is_some_and(expr_has_open_multivalue)
-        }
-        HirExpr::Closure(closure) => closure
-            .captures
-            .iter()
-            .any(|capture| expr_has_open_multivalue(&capture.value)),
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::Unresolved(_) => false,
-    }
-}
-
-fn decision_target_has_open_multivalue(target: &crate::hir::common::HirDecisionTarget) -> bool {
-    match target {
-        crate::hir::common::HirDecisionTarget::Expr(expr) => expr_has_open_multivalue(expr),
-        crate::hir::common::HirDecisionTarget::Node(_)
-        | crate::hir::common::HirDecisionTarget::CurrentValue => false,
-    }
 }
 
 fn collect_block_temp_use_totals(stmts: &[HirStmt], scratch: &mut TempUseScratch) -> Vec<usize> {

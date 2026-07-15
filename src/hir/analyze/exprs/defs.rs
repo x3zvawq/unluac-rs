@@ -6,14 +6,6 @@
 
 use super::*;
 
-pub(crate) fn is_multiret_results(results: crate::transformer::ResultPack) -> bool {
-    match results {
-        crate::transformer::ResultPack::Open(_) => true,
-        crate::transformer::ResultPack::Fixed(range) => range.len > 1,
-        crate::transformer::ResultPack::Ignore => false,
-    }
-}
-
 /// 尝试把一个固定定义直接解释成 HIR 表达式。
 ///
 /// 这主要服务 merge 点上的值恢复。我们只在“一个 def 能稳定对应一个值表达式”时
@@ -248,7 +240,6 @@ fn expr_for_fixed_call(
     Some(HirExpr::Call(Box::new(HirCallExpr {
         callee,
         args: lower_value_pack_single_eval(lowering, block, instr_ref, call.args),
-        multiret: false,
         method: matches!(call.kind, CallKind::Method),
         method_name,
     })))

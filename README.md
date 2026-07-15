@@ -149,7 +149,7 @@ Generate and output options:
 | `--luau-vector-size` | Luau vector width: `3` or `4`; required with `--luau-vector-constructor` | None |
 | `--conservative-output` | Whether to prefer conservative source generation | `true` |
 | `--comment` | Whether to emit generate-stage comments and metadata | `true` |
-| `-g`, `--generate-mode` | Generation mode: `strict` stops on unsupported target syntax or errors, `permissive` outputs as much as possible | `permissive` |
+| `-g`, `--generate-mode` | `strict` requires target-compatible source; `permissive` may emit Error-marked diagnostic pseudocode | `permissive` |
 | `--stop-after` | Last pipeline stage to run | `generate` |
 | `-o`, `--output` | Write the final generated source to a file instead of stdout | stdout |
 

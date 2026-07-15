@@ -525,6 +525,13 @@ pub struct CloseInstr {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct TbcInstr {
     pub reg: Reg,
+    pub kind: TbcKind,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum TbcKind {
+    Explicit,
+    GenericFor,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]

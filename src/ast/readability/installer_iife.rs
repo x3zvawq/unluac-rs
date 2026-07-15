@@ -12,7 +12,7 @@
 //! synthetic-local 命名空间，不会越权复用前层 temp。
 //!
 //! 它不负责：
-//! - 判断 forwarded multiret / final-call-arg 这类语义约束，它们仍属于 AST build；
+//! - 判断多值转发与物化约束，它们由 HIR value-pack owner 负责；
 //! - 把这个局部函数进一步降成方法声明或 `local function`，那属于 `function_sugar`。
 
 use std::collections::BTreeSet;

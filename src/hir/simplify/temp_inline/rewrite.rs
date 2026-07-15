@@ -9,26 +9,17 @@ use super::*;
 pub(super) fn replace_temp_in_stmt(stmt: &mut HirStmt, temp: TempId, replacement: &HirExpr) {
     match stmt {
         HirStmt::LocalDecl(local_decl) => {
-            for value in &mut local_decl.values {
-                replace_temp_in_expr(value, temp, replacement);
-            }
+            replace_temp_in_value_pack(&mut local_decl.values, temp, replacement);
         }
         HirStmt::Assign(assign) => {
             for target in &mut assign.targets {
                 replace_temp_in_lvalue(target, temp, replacement);
             }
-            for value in &mut assign.values {
-                replace_temp_in_expr(value, temp, replacement);
-            }
+            replace_temp_in_value_pack(&mut assign.values, temp, replacement);
         }
         HirStmt::TableSetList(set_list) => {
             replace_temp_in_expr(&mut set_list.base, temp, replacement);
-            for value in &mut set_list.values {
-                replace_temp_in_expr(value, temp, replacement);
-            }
-            if let Some(expr) = &mut set_list.trailing_multivalue {
-                replace_temp_in_expr(expr, temp, replacement);
-            }
+            replace_temp_in_value_pack(&mut set_list.values, temp, replacement);
         }
         HirStmt::ErrNil(err_nil) => {
             replace_temp_in_expr(&mut err_nil.value, temp, replacement);
@@ -40,9 +31,7 @@ pub(super) fn replace_temp_in_stmt(stmt: &mut HirStmt, temp: TempId, replacement
             replace_temp_in_call_expr(&mut call_stmt.call, temp, replacement)
         }
         HirStmt::Return(ret) => {
-            for value in &mut ret.values {
-                replace_temp_in_expr(value, temp, replacement);
-            }
+            replace_temp_in_value_pack(&mut ret.values, temp, replacement);
         }
         HirStmt::If(if_stmt) => {
             replace_temp_in_expr(&mut if_stmt.cond, temp, replacement);
@@ -66,9 +55,7 @@ pub(super) fn replace_temp_in_stmt(stmt: &mut HirStmt, temp: TempId, replacement
             replace_temp_in_block(&mut numeric_for.body, temp, replacement);
         }
         HirStmt::GenericFor(generic_for) => {
-            for expr in &mut generic_for.iterator {
-                replace_temp_in_expr(expr, temp, replacement);
-            }
+            replace_temp_in_value_pack(&mut generic_for.iterator, temp, replacement);
             replace_temp_in_block(&mut generic_for.body, temp, replacement);
         }
         HirStmt::Close(_)
@@ -91,8 +78,15 @@ fn replace_temp_in_block(block: &mut HirBlock, temp: TempId, replacement: &HirEx
 
 fn replace_temp_in_call_expr(call: &mut HirCallExpr, temp: TempId, replacement: &HirExpr) {
     replace_temp_in_expr(&mut call.callee, temp, replacement);
-    for arg in &mut call.args {
+    replace_temp_in_value_pack(&mut call.args, temp, replacement);
+}
+
+fn replace_temp_in_value_pack(pack: &mut HirValuePack, temp: TempId, replacement: &HirExpr) {
+    for arg in &mut pack.fixed {
         replace_temp_in_expr(arg, temp, replacement);
+    }
+    if let Some(call) = pack.tail.as_mut().and_then(HirPackTail::call_mut) {
+        replace_temp_in_call_expr(call, temp, replacement);
     }
 }
 
@@ -139,8 +133,10 @@ fn replace_temp_in_expr(expr: &mut HirExpr, temp: TempId, replacement: &HirExpr)
                     }
                 }
             }
-            if let Some(expr) = &mut table.trailing_multivalue {
-                replace_temp_in_expr(expr, temp, replacement);
+            if let Some(tail) = &mut table.trailing_multivalue
+                && let Some(call) = tail.call_mut()
+            {
+                replace_temp_in_call_expr(call, temp, replacement);
             }
         }
         HirExpr::Closure(closure) => {

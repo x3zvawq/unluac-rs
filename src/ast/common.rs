@@ -58,7 +58,7 @@ pub enum AstStmt {
     DoBlock(Box<AstBlock>),
     FunctionDecl(Box<AstFunctionDecl>),
     LocalFunctionDecl(Box<AstLocalFunctionDecl>),
-    /// 反编译过程中无法恢复的语句占位符，最终会被输出为 Lua 注释。
+    /// 宽松模式下无法恢复的语句占位。
     Error(String),
 }
 
@@ -90,7 +90,7 @@ pub enum AstExpr {
     VarArg,
     TableConstructor(Box<AstTableConstructor>),
     FunctionExpr(Box<AstFunctionExpr>),
-    /// 反编译过程中无法恢复的表达式占位符，最终会被输出为带注释的 nil。
+    /// 宽松模式下无法恢复的表达式占位。
     Error(String),
 }
 
@@ -377,14 +377,10 @@ impl AstTargetDialect {
         Self { version, caps }
     }
 
-    pub const fn relaxed_for_lowering(version: DecompileDialect) -> Self {
-        let mut caps = Self::new(version).caps;
-        caps.goto_label = true;
-        caps.local_const = true;
-        caps.local_close = true;
-        caps.global_decl = true;
-        caps.global_const = true;
-        Self { version, caps }
+    pub const fn diagnostic_for_lowering(version: DecompileDialect) -> Self {
+        let mut target = Self::new(version);
+        target.caps.goto_label = true;
+        target
     }
 
     pub const fn supports_feature(self, feature: AstFeature) -> bool {

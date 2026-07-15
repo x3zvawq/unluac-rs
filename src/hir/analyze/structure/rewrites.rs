@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::hir::common::{HirExpr, HirLValue, HirStmt, TempId};
+use crate::hir::common::{HirCallExpr, HirExpr, HirLValue, HirStmt, TempId};
 use crate::hir::traverse::{
     traverse_hir_call_children, traverse_hir_decision_children, traverse_hir_expr_children,
     traverse_hir_lvalue_children, traverse_hir_stmt_children,
@@ -209,6 +209,7 @@ pub(super) fn rewrite_stmt_exprs(stmt: &mut HirStmt, expr_overrides: &BTreeMap<T
         opt = as_mut,
         borrow = [&mut],
         expr(e) => { rewrite_expr_temps(e, expr_overrides); },
+        tail_call(c) => { rewrite_call_expr_temps(c, expr_overrides); },
         lvalue(lv) => {
             traverse_hir_lvalue_children!(
                 lv,
@@ -222,7 +223,8 @@ pub(super) fn rewrite_stmt_exprs(stmt: &mut HirStmt, expr_overrides: &BTreeMap<T
                 c,
                 iter = iter_mut,
                 borrow = [&mut],
-                expr(e) => { rewrite_expr_temps(e, expr_overrides); }
+                expr(e) => { rewrite_expr_temps(e, expr_overrides); },
+                tail_call(c) => { rewrite_call_expr_temps(c, expr_overrides); }
             );
         },
         condition(cond) => { rewrite_expr_temps(cond, expr_overrides); }
@@ -231,6 +233,25 @@ pub(super) fn rewrite_stmt_exprs(stmt: &mut HirStmt, expr_overrides: &BTreeMap<T
 
 pub(super) fn rewrite_expr_temps(expr: &mut HirExpr, expr_overrides: &BTreeMap<TempId, HirExpr>) {
     rewrite_expr_temps_inner(expr, expr_overrides, &mut BTreeSet::new());
+}
+
+fn rewrite_call_expr_temps(call: &mut HirCallExpr, expr_overrides: &BTreeMap<TempId, HirExpr>) {
+    let mut resolving = BTreeSet::new();
+    rewrite_call_expr_temps_inner(call, expr_overrides, &mut resolving);
+}
+
+fn rewrite_call_expr_temps_inner(
+    call: &mut HirCallExpr,
+    expr_overrides: &BTreeMap<TempId, HirExpr>,
+    resolving: &mut BTreeSet<TempId>,
+) {
+    traverse_hir_call_children!(
+        call,
+        iter = iter_mut,
+        borrow = [&mut],
+        expr(e) => { rewrite_expr_temps_inner(e, expr_overrides, resolving); },
+        tail_call(c) => { rewrite_call_expr_temps_inner(c, expr_overrides, resolving); }
+    );
 }
 
 fn rewrite_expr_temps_inner(
@@ -257,12 +278,7 @@ fn rewrite_expr_temps_inner(
         borrow = [&mut],
         expr(e) => { rewrite_expr_temps_inner(e, expr_overrides, resolving); },
         call(c) => {
-            traverse_hir_call_children!(
-                c,
-                iter = iter_mut,
-                borrow = [&mut],
-                expr(e) => { rewrite_expr_temps_inner(e, expr_overrides, resolving); }
-            );
+            rewrite_call_expr_temps_inner(c, expr_overrides, resolving);
         },
         decision(d) => {
             traverse_hir_decision_children!(
@@ -279,7 +295,10 @@ fn rewrite_expr_temps_inner(
                 iter = iter_mut,
                 opt = as_mut,
                 borrow = [&mut],
-                expr(e) => { rewrite_expr_temps_inner(e, expr_overrides, resolving); }
+                expr(e) => { rewrite_expr_temps_inner(e, expr_overrides, resolving); },
+                tail_call(c) => {
+                    rewrite_call_expr_temps_inner(c, expr_overrides, resolving);
+                }
             );
         }
     );

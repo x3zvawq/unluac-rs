@@ -7,7 +7,7 @@
 //! 主要暴露：
 //! - proto 树元数据（名称、行号、参数、upvalue 数等）
 //! - 每个 proto 的 CFG（block + edge + 人类可读指令文本）
-//! - 反编译生成的源码和警告
+//! - 反编译生成的源码
 //!
 //! 输入：`DecompileResult`
 //! 输出：`WasmRichResult` → JSON
@@ -24,10 +24,10 @@ use unluac::transformer::{LoweredProto, RawInstrRef, format_low_instr};
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WasmRichResult {
-    /// 反编译生成的完整 Lua 源码
+    /// 反编译生成的源码或诊断伪源码
     pub source: String,
-    /// 生成阶段的警告
-    pub warnings: Vec<String>,
+    /// `source` 或 `diagnostic-pseudocode`
+    pub kind: &'static str,
     /// proto 元数据（DFS 序展平）
     pub protos: Vec<WasmProtoMeta>,
     /// 每个 proto 的 CFG（与 protos 平行数组，index 一致）
@@ -106,11 +106,11 @@ pub struct WasmCfgEdge {
 
 /// 从 `DecompileResult` 提取前端所需的结构化数据。
 pub fn project_rich_result(result: &DecompileResult) -> WasmRichResult {
-    let (source, warnings) = result
+    let (source, kind) = result
         .state
         .generated
         .as_ref()
-        .map(|g| (g.source.clone(), g.warnings.clone()))
+        .map(|g| (g.source.clone(), <&'static str>::from(g.kind)))
         .unwrap_or_default();
 
     let mut protos = Vec::new();
@@ -129,7 +129,7 @@ pub fn project_rich_result(result: &DecompileResult) -> WasmRichResult {
 
     WasmRichResult {
         source,
-        warnings,
+        kind,
         protos,
         cfgs,
     }

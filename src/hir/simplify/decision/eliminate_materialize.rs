@@ -12,8 +12,8 @@
 use crate::hir::common::{
     HirAssign, HirBinaryExpr, HirBlock, HirCallExpr, HirClosureExpr, HirDecisionExpr,
     HirDecisionNode, HirDecisionTarget, HirExpr, HirGenericFor, HirIf, HirLValue, HirLocalDecl,
-    HirLogicalExpr, HirNumericFor, HirRecordField, HirStmt, HirTableAccess, HirTableConstructor,
-    HirTableField, HirTableKey, HirUnaryExpr, LocalId,
+    HirLogicalExpr, HirNumericFor, HirPackTail, HirRecordField, HirStmt, HirTableAccess,
+    HirTableConstructor, HirTableField, HirTableKey, HirUnaryExpr, HirValuePack, LocalId,
 };
 
 use super::super::visit::{HirVisitor, visit_expr};
@@ -44,7 +44,7 @@ pub(super) fn extract_generic_for(
     mut generic_for: Box<HirGenericFor>,
     state: &mut EliminationState<'_>,
 ) -> (Vec<HirStmt>, Box<HirGenericFor>, bool) {
-    let (prefix, iterator, iterator_changed) = extract_value_exprs(generic_for.iterator, state);
+    let (prefix, iterator, iterator_changed) = extract_value_pack(generic_for.iterator, state);
     generic_for.iterator = iterator;
     (prefix, generic_for, iterator_changed)
 }
@@ -54,19 +54,34 @@ pub(super) fn extract_call_expr(
     state: &mut EliminationState<'_>,
 ) -> (Vec<HirStmt>, HirCallExpr, bool) {
     let (mut prefix, callee, callee_changed) = extract_value_expr(call.callee, state);
-    let (arg_prefix, args, args_changed) = extract_value_exprs(call.args, state);
+    let (arg_prefix, args, args_changed) = extract_value_pack(call.args, state);
     prefix.extend(arg_prefix);
     (
         prefix,
         HirCallExpr {
             callee,
             args,
-            multiret: call.multiret,
             method: call.method,
             method_name: call.method_name,
         },
         callee_changed || args_changed,
     )
+}
+
+pub(super) fn extract_value_pack(
+    pack: HirValuePack,
+    state: &mut EliminationState<'_>,
+) -> (Vec<HirStmt>, HirValuePack, bool) {
+    let (mut prefix, fixed, mut changed) = extract_value_exprs(pack.fixed, state);
+    let tail = pack.tail.map(|tail| {
+        tail.map_call(|call| {
+            let (tail_prefix, call, call_changed) = extract_call_expr(call, state);
+            changed |= call_changed;
+            prefix.extend(tail_prefix);
+            call
+        })
+    });
+    (prefix, HirValuePack { fixed, tail }, changed)
 }
 
 pub(super) fn extract_value_exprs(
@@ -391,21 +406,7 @@ fn collapse_expr_to_pure(expr: HirExpr) -> Option<HirExpr> {
             let expr = HirExpr::LogicalOr(Box::new(HirLogicalExpr { lhs, rhs }));
             Some(super::simplify_lua_logical_shape(&expr).unwrap_or(expr))
         }
-        HirExpr::Call(call) => {
-            let callee = collapse_expr_to_pure(call.callee)?;
-            let args = call
-                .args
-                .into_iter()
-                .map(collapse_expr_to_pure)
-                .collect::<Option<Vec<_>>>()?;
-            Some(HirExpr::Call(Box::new(HirCallExpr {
-                callee,
-                args,
-                multiret: call.multiret,
-                method: call.method,
-                method_name: call.method_name,
-            })))
-        }
+        HirExpr::Call(call) => Some(HirExpr::Call(Box::new(collapse_call_to_pure(*call)?))),
         HirExpr::TableConstructor(table) => {
             let mut fields = Vec::with_capacity(table.fields.len());
             for field in table.fields {
@@ -428,7 +429,7 @@ fn collapse_expr_to_pure(expr: HirExpr) -> Option<HirExpr> {
                 }
             }
             let trailing_multivalue = match table.trailing_multivalue {
-                Some(expr) => Some(collapse_expr_to_pure(expr)?),
+                Some(tail) => Some(tail.try_map_call(collapse_call_to_pure)?),
                 None => None,
             };
             Some(HirExpr::TableConstructor(Box::new(HirTableConstructor {
@@ -445,6 +446,26 @@ fn collapse_expr_to_pure(expr: HirExpr) -> Option<HirExpr> {
         }
         expr => Some(expr),
     }
+}
+
+fn collapse_call_to_pure(call: HirCallExpr) -> Option<HirCallExpr> {
+    let callee = collapse_expr_to_pure(call.callee)?;
+    let fixed = call
+        .args
+        .fixed
+        .into_iter()
+        .map(collapse_expr_to_pure)
+        .collect::<Option<Vec<_>>>()?;
+    let tail = match call.args.tail {
+        Some(tail) => Some(tail.try_map_call(collapse_call_to_pure)?),
+        None => None,
+    };
+    Some(HirCallExpr {
+        callee,
+        args: HirValuePack { fixed, tail },
+        method: call.method,
+        method_name: call.method_name,
+    })
 }
 
 fn prepare_table_constructor(
@@ -479,9 +500,14 @@ fn prepare_table_constructor(
 
     let (trailing_prefix, trailing_multivalue) = table
         .trailing_multivalue
-        .map(|expr| {
-            let (prefix, expr) = prepare_pure_expr(expr, state);
-            (prefix, Some(expr))
+        .map(|tail| {
+            let mut prefix = Vec::new();
+            let tail = tail.map_call(|call| {
+                let (tail_prefix, call, _) = extract_call_expr(call, state);
+                prefix = tail_prefix;
+                call
+            });
+            (prefix, Some(tail))
         })
         .unwrap_or_default();
     prefix.extend(trailing_prefix);
@@ -528,10 +554,7 @@ pub(super) fn eliminate_condition_expr(expr: &mut HirExpr) -> bool {
                 false
             }
         }
-        HirExpr::Call(call) => {
-            eliminate_condition_expr(&mut call.callee)
-                || call.args.iter_mut().any(eliminate_condition_expr)
-        }
+        HirExpr::Call(call) => eliminate_condition_call(call),
         HirExpr::TableConstructor(table) => {
             table.fields.iter_mut().any(|field| match field {
                 HirTableField::Array(expr) => eliminate_condition_expr(expr),
@@ -545,7 +568,8 @@ pub(super) fn eliminate_condition_expr(expr: &mut HirExpr) -> bool {
             }) || table
                 .trailing_multivalue
                 .as_mut()
-                .is_some_and(eliminate_condition_expr)
+                .and_then(HirPackTail::call_mut)
+                .is_some_and(eliminate_condition_call)
         }
         HirExpr::Closure(closure) => closure
             .captures
@@ -581,6 +605,17 @@ pub(super) fn eliminate_condition_expr(expr: &mut HirExpr) -> bool {
     changed
 }
 
+fn eliminate_condition_call(call: &mut HirCallExpr) -> bool {
+    let mut changed = eliminate_condition_expr(&mut call.callee);
+    for arg in &mut call.args.fixed {
+        changed |= eliminate_condition_expr(arg);
+    }
+    if let Some(call) = call.args.tail.as_mut().and_then(HirPackTail::call_mut) {
+        changed |= eliminate_condition_call(call);
+    }
+    changed
+}
+
 pub(super) fn expr_contains_eliminable_decision(expr: &HirExpr) -> bool {
     let mut collector = EliminableDecisionCollector { found: false };
     visit_expr(expr, &mut collector);
@@ -601,20 +636,20 @@ impl HirVisitor for EliminableDecisionCollector {
 pub(super) fn empty_local_decl(local: LocalId) -> HirStmt {
     HirStmt::LocalDecl(Box::new(HirLocalDecl {
         bindings: vec![local],
-        values: Vec::new(),
+        values: HirValuePack::fixed(Vec::new()),
     }))
 }
 
 fn local_decl_with_value(local: LocalId, value: HirExpr) -> HirStmt {
     HirStmt::LocalDecl(Box::new(HirLocalDecl {
         bindings: vec![local],
-        values: vec![value],
+        values: HirValuePack::fixed(vec![value]),
     }))
 }
 
 fn assign_stmt(target: HirLValue, value: HirExpr) -> HirStmt {
     HirStmt::Assign(Box::new(HirAssign {
         targets: vec![target],
-        values: vec![value],
+        values: HirValuePack::fixed(vec![value]),
     }))
 }

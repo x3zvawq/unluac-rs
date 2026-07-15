@@ -150,7 +150,7 @@ fn find_scope_end(
     // 最“靠后”的一次 close 事件（可能是精确匹配，也可能是更外层 scope 的
     // 组合 close）。早期的 close 只是 scope 内部的 iteration 边界，把它们
     // 当成 scope 末端会把后续仍在同一 scope 内的表达式错误地挤出块外。
-    let mut last_scope_close: Option<(usize, bool)> = None;
+    let mut last_scope_close = None;
     let mut covering_close_indices = Vec::new();
 
     for (index, stmt) in stmts.iter().enumerate().skip(start_index) {
@@ -158,8 +158,7 @@ fn find_scope_end(
             && close.from_reg != 0
             && close.from_reg <= reg_index
         {
-            let is_exact = close.from_reg == reg_index;
-            last_scope_close = Some((index, is_exact));
+            last_scope_close = Some(index);
             covering_close_indices.push(index);
             saw_close = true;
         }
@@ -171,14 +170,13 @@ fn find_scope_end(
         saw_close |= activity.closes_scope;
     }
 
-    if let Some((close_idx, is_exact)) = last_scope_close {
-        // 最末端是精确 close 时把它纳入区间；若是更外层的组合 close，则它只负责划定
-        // 当前区间边界并留给外层 owner。此前落在区间内部的 covering close 仍由当前
-        // scope 消费，它们通常来自 goto/分支的提前 cleanup。
-        let end = if is_exact { close_idx + 1 } else { close_idx };
+    if let Some(close_idx) = last_scope_close {
+        // composite close 同时终结多个嵌套 TBC scope；所有 interval 会在重建前一次收集，
+        // 因此最内层可以消费这条 VM cleanup，外层仍由自己的词法 block 结束来表达。
+        let end = close_idx + 1;
         let end = last_activity.map_or(end, |la| la.max(end));
-        // 同一 TBC scope 内可能有多个 goto/分支 cleanup。只记录最终词法区间真实包含的
-        // covering close；区间末端之外的组合 close 仍由外层 scope 接管。
+        // 同一 TBC scope 内可能有多个 goto/分支 cleanup，只消费最终词法区间实际覆盖的
+        // close；区间之外的 cleanup 继续由对应 sibling/outer interval 接管。
         covering_close_indices.retain(|index| *index < end);
         return Some(ScopeEnd {
             end,

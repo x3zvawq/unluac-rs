@@ -14,8 +14,8 @@ mod render;
 
 pub use common::{
     GenerateChunkCommentMetadata, GenerateCommentMetadata, GenerateFunctionCommentMetadata,
-    GenerateMode, GenerateOptions, GeneratedChunk, LuauVectorConstructor, LuauVectorSize,
-    NumberFormat, QuoteStyle, TableStyle,
+    GenerateMode, GenerateOptions, GeneratedChunk, GeneratedChunkKind, LuauVectorConstructor,
+    LuauVectorSize, NumberFormat, QuoteStyle, TableStyle,
 };
 #[cfg(feature = "decompile-debug")]
 pub use debug::dump_generate;

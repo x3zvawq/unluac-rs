@@ -13,6 +13,7 @@
 
 use crate::hir::{HirExpr, HirLValue, HirStmt};
 
+use super::super::exprs::PackLoweringContext;
 use super::super::{AstLowerError, AstLowerer};
 use crate::ast::common::{
     AstBindingRef, AstGlobalAttr, AstGlobalBinding, AstGlobalBindingTarget, AstGlobalDecl,
@@ -44,7 +45,10 @@ impl<'a> AstLowerer<'a> {
             });
         }
 
-        if probe.bindings.len() != 1 || probe.values.len() != 1 || assign.targets.len() != 1 {
+        if probe.bindings.len() != 1
+            || !matches!((&probe.values.fixed[..], &probe.values.tail), ([_], None))
+            || assign.targets.len() != 1
+        {
             return Ok(None);
         }
         let HirExpr::LocalRef(probe_local) = &err_nnil.value else {
@@ -58,7 +62,7 @@ impl<'a> AstLowerer<'a> {
         {
             return Ok(None);
         }
-        let HirExpr::GlobalRef(probe_global) = &probe.values[0] else {
+        let HirExpr::GlobalRef(probe_global) = &probe.values.fixed[0] else {
             return Ok(None);
         };
         let HirLValue::Global(assign_global) = &assign.targets[0] else {
@@ -74,11 +78,11 @@ impl<'a> AstLowerer<'a> {
         }
         let name = assign_global.name.clone();
 
-        let values = assign
-            .values
-            .iter()
-            .map(|value| self.lower_expr(proto_index, value))
-            .collect::<Result<Vec<_>, _>>()?;
+        let values = self.lower_value_pack(
+            proto_index,
+            &assign.values,
+            PackLoweringContext::TargetCounted(assign.targets.len()),
+        )?;
         Ok(Some((
             AstStmt::GlobalDecl(Box::new(AstGlobalDecl {
                 bindings: vec![AstGlobalBinding {
@@ -119,11 +123,11 @@ impl<'a> AstLowerer<'a> {
         Ok(Some((
             AstStmt::LocalDecl(Box::new(AstLocalDecl {
                 bindings: vec![self.lower_local_binding(proto_index, *local, AstLocalAttr::Close)],
-                values: local_decl
-                    .values
-                    .iter()
-                    .map(|value| self.lower_expr(proto_index, value))
-                    .collect::<Result<Vec<_>, _>>()?,
+                values: self.lower_value_pack(
+                    proto_index,
+                    &local_decl.values,
+                    PackLoweringContext::TargetCounted(local_decl.bindings.len()),
+                )?,
             })),
             2,
         )))
@@ -144,18 +148,29 @@ impl<'a> AstLowerer<'a> {
         let HirExpr::TempRef(temp) = &to_be_closed.value else {
             return Ok(None);
         };
-        if assign.targets.len() != 1 || assign.values.len() != 1 {
+        if assign.values.exact_result_len() != Some(assign.targets.len()) {
             return Err(AstLowerError::InvalidToBeClosed {
                 proto: proto_index,
-                reason: "to-be-closed temp must be introduced by a single-value assignment",
+                reason: "to-be-closed declaration must have one value for every binding",
             });
         }
-        let HirLValue::Temp(target) = &assign.targets[0] else {
+        let Some(HirLValue::Temp(last_target)) = assign.targets.last() else {
             return Ok(None);
         };
-        if target != temp {
+        if last_target != temp {
             return Ok(None);
         }
+        let Some(bindings) = assign
+            .targets
+            .iter()
+            .map(|target| match target {
+                HirLValue::Temp(target) => Some(*target),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
         if !self.target.caps.local_close {
             return Err(AstLowerError::UnsupportedFeature {
                 dialect: self.target.version,
@@ -165,85 +180,26 @@ impl<'a> AstLowerer<'a> {
         }
         Ok(Some((
             AstStmt::LocalDecl(Box::new(AstLocalDecl {
-                bindings: vec![
-                    self.recovered_local_binding(AstBindingRef::Temp(*temp), AstLocalAttr::Close),
-                ],
-                values: vec![self.lower_expr(proto_index, &assign.values[0])?],
+                bindings: bindings
+                    .into_iter()
+                    .map(|binding| {
+                        self.recovered_local_binding(
+                            AstBindingRef::Temp(binding),
+                            if binding == *temp {
+                                AstLocalAttr::Close
+                            } else {
+                                AstLocalAttr::None
+                            },
+                        )
+                    })
+                    .collect(),
+                values: self.lower_value_pack(
+                    proto_index,
+                    &assign.values,
+                    PackLoweringContext::TargetCounted(assign.targets.len()),
+                )?,
             })),
             2,
         )))
-    }
-
-    pub(in crate::ast::build) fn try_lower_generic_for_init(
-        &mut self,
-        proto_index: usize,
-        stmts: &[HirStmt],
-        index: usize,
-        continue_target: Option<crate::ast::AstLabelId>,
-    ) -> Result<Option<(AstStmt, usize)>, AstLowerError> {
-        let Some(HirStmt::Assign(assign)) = stmts.get(index) else {
-            return Ok(None);
-        };
-
-        let (generic_for, consumed, close_temp) = match (stmts.get(index + 1), stmts.get(index + 2))
-        {
-            (Some(HirStmt::ToBeClosed(to_be_closed)), Some(HirStmt::GenericFor(generic_for))) => {
-                let HirExpr::TempRef(close_temp) = &to_be_closed.value else {
-                    return Ok(None);
-                };
-                (generic_for, 3, Some(*close_temp))
-            }
-            (Some(HirStmt::GenericFor(generic_for)), _) => (generic_for, 2, None),
-            _ => return Ok(None),
-        };
-
-        if !assign_targets_match_generic_for_init(
-            assign.targets.as_slice(),
-            generic_for,
-            close_temp,
-        ) {
-            return Ok(None);
-        }
-
-        Ok(Some((
-            self.lower_generic_for_stmt(
-                proto_index,
-                generic_for,
-                Some(assign.values.as_slice()),
-                continue_target,
-            )?,
-            consumed,
-        )))
-    }
-}
-
-fn assign_targets_match_generic_for_init(
-    targets: &[HirLValue],
-    generic_for: &crate::hir::HirGenericFor,
-    close_temp: Option<crate::hir::TempId>,
-) -> bool {
-    let expected_targets = generic_for.iterator.len() + usize::from(close_temp.is_some());
-    if targets.len() != expected_targets {
-        return false;
-    }
-
-    let iter_targets_match =
-        targets
-            .iter()
-            .zip(generic_for.iterator.iter())
-            .all(|(target, iterator)| match (target, iterator) {
-                (HirLValue::Temp(target_temp), HirExpr::TempRef(iterator_temp)) => {
-                    target_temp == iterator_temp
-                }
-                _ => false,
-            });
-    if !iter_targets_match {
-        return false;
-    }
-
-    match (close_temp, targets.last()) {
-        (Some(close_temp), Some(HirLValue::Temp(target_temp))) => *target_temp == close_temp,
-        (None, _) => true,
-        _ => false,
     }
 }

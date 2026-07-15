@@ -45,8 +45,7 @@ pub(super) struct ProtoPromotionFacts {
 impl ProtoPromotionFacts {
     /// 从 Dataflow 里提取当前 proto 所需的 temp -> home slot 对照表。
     pub(super) fn from_dataflow(proto: &LoweredProto, dataflow: &DataflowFacts) -> Self {
-        let total_temps =
-            dataflow.defs.len() + dataflow.open_defs.len() + dataflow.phi_candidates.len();
+        let total_temps = dataflow.defs.len() + dataflow.phi_candidates.len();
         let mut temp_home_slots = vec![None; total_temps];
 
         fill_fixed_def_home_slots(proto, dataflow, &mut temp_home_slots);
@@ -86,9 +85,6 @@ impl ProtoPromotionFacts {
                 self.collect_captured_home_slots_in_expr(&set_list.base, slots);
                 for value in &set_list.values {
                     self.collect_captured_home_slots_in_expr(value, slots);
-                }
-                if let Some(trailing) = &set_list.trailing_multivalue {
-                    self.collect_captured_home_slots_in_expr(trailing, slots);
                 }
             }
             HirStmt::ErrNil(err_nil) => {
@@ -243,7 +239,7 @@ impl ProtoPromotionFacts {
                     }
                 }
                 if let Some(trailing) = &table.trailing_multivalue {
-                    self.collect_captured_home_slots_in_expr(trailing, slots);
+                    self.collect_captured_home_slots_in_expr(trailing.as_expr(), slots);
                 }
             }
             HirExpr::Closure(closure) => {
@@ -329,7 +325,7 @@ impl ProtoPromotionFacts {
                     }
                 }
                 if let Some(trailing) = &table.trailing_multivalue {
-                    self.collect_temp_home_slots_in_expr(trailing, slots);
+                    self.collect_temp_home_slots_in_expr(trailing.as_expr(), slots);
                 }
             }
             HirExpr::Closure(closure) => {

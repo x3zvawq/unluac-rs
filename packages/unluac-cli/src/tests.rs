@@ -66,6 +66,7 @@ fn defaults_to_pure_source_output_when_only_source_is_given() {
     assert!(!options.decompile.debug.timing);
     assert!(options.decompile.debug.output_stages.is_empty());
     assert!(options.decompile.generate.comment);
+    assert_eq!(options.decompile.generate.mode, GenerateMode::Permissive);
     assert_eq!(
         options.decompile.parse.string_encoding,
         StringEncoding::Auto

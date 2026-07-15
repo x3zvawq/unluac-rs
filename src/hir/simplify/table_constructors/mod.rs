@@ -75,6 +75,9 @@ enum PendingProducerSource {
         stmt_index: usize,
         value_index: usize,
     },
+    Tail {
+        stmt_index: usize,
+    },
     Empty,
 }
 
@@ -224,7 +227,7 @@ fn install_constructor_owner(
     if let Some(target) = target {
         *stmt = HirStmt::Assign(Box::new(HirAssign {
             targets: vec![target],
-            values: vec![HirExpr::TableConstructor(Box::new(constructor))],
+            values: vec![HirExpr::TableConstructor(Box::new(constructor))].into(),
         }));
         return;
     }

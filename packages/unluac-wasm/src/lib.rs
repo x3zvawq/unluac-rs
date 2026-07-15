@@ -303,8 +303,7 @@ where
 
 fn default_wasm_decompile_options() -> DecompileOptions {
     let mut options = DecompileOptions::default();
-    // WASM 面向最终用户，默认使用 Permissive 以尽可能输出结果。
-    options.generate.mode = unluac::decompile::GenerateMode::Permissive;
+    options.generate.mode = GenerateMode::Permissive;
     options
 }
 

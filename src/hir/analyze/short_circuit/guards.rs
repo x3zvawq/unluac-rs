@@ -104,7 +104,7 @@ pub(super) fn expr_references_any_temp(expr: &HirExpr, forbidden: &BTreeSet<Temp
             }) || table
                 .trailing_multivalue
                 .as_ref()
-                .is_some_and(|expr| expr_references_any_temp(expr, forbidden))
+                .is_some_and(|tail| expr_references_any_temp(tail.as_expr(), forbidden))
         }
         HirExpr::Closure(closure) => closure
             .captures

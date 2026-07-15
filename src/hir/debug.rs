@@ -16,7 +16,7 @@ use crate::debug::{
 
 use super::common::{
     HirBlock, HirDecisionExpr, HirDecisionTarget, HirExpr, HirLValue, HirModule, HirProto,
-    HirProtoRef, HirStmt, HirTableField, HirUnaryOpKind,
+    HirProtoRef, HirStmt, HirTableField, HirUnaryOpKind, HirValuePack,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -134,7 +134,7 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
                         .iter()
                         .map(|binding| format!("l{}", binding.index()))
                         .collect::<Vec<_>>(),
-                    format_expr_list(&local_decl.values),
+                    format_value_pack(&local_decl.values),
                 );
             }
             HirStmt::Assign(assign) => {
@@ -147,21 +147,16 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
                         .map(format_lvalue)
                         .collect::<Vec<_>>()
                         .join(", "),
-                    format_expr_list(&assign.values),
+                    format_value_pack(&assign.values),
                 );
             }
             HirStmt::TableSetList(set_list) => {
                 let _ = writeln!(
                     output,
-                    "{indent}table-set-list {} start={} values={} trailing={}",
+                    "{indent}table-set-list {} start={} values={}",
                     format_expr(&set_list.base),
                     set_list.start_index,
-                    format_expr_list(&set_list.values),
-                    set_list
-                        .trailing_multivalue
-                        .as_ref()
-                        .map(format_expr)
-                        .unwrap_or_else(|| "-".to_owned()),
+                    format_value_pack(&set_list.values),
                 );
             }
             HirStmt::ErrNil(err_nnil) => {
@@ -186,17 +181,7 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
                 let _ = writeln!(output, "{indent}call {}", format_call_expr(&call_stmt.call));
             }
             HirStmt::Return(ret) => {
-                let multiret_hint = if ret.trailing_multiret {
-                    " multiret"
-                } else {
-                    ""
-                };
-                let _ = writeln!(
-                    output,
-                    "{indent}return {}{}",
-                    format_expr_list(&ret.values),
-                    multiret_hint
-                );
+                let _ = writeln!(output, "{indent}return {}", format_value_pack(&ret.values),);
             }
             HirStmt::If(if_stmt) => {
                 let _ = writeln!(output, "{indent}if {}", format_expr(&if_stmt.cond));
@@ -237,7 +222,7 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
                         .map(|binding| format!("l{}", binding.index()))
                         .collect::<Vec<_>>()
                         .join(", "),
-                    format_expr_list(&generic_for.iterator),
+                    format_value_pack(&generic_for.iterator),
                 );
                 write_block(output, &format!("{indent}  "), &generic_for.body);
             }
@@ -266,15 +251,18 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
     }
 }
 
-fn format_expr_list(values: &[HirExpr]) -> String {
+fn format_value_pack(values: &HirValuePack) -> String {
     if values.is_empty() {
         "-".to_owned()
     } else {
-        values
-            .iter()
-            .map(format_expr)
-            .collect::<Vec<_>>()
-            .join(", ")
+        let mut rendered = values.fixed.iter().map(format_expr).collect::<Vec<_>>();
+        if let Some(tail) = &values.tail {
+            let shape = tail
+                .exact_width()
+                .map_or_else(|| "open".to_owned(), |width| format!("exact:{width}"));
+            rendered.push(format!("{} <tail:{shape}>", format_expr(tail.as_expr())));
+        }
+        rendered.join(", ")
     }
 }
 
@@ -343,7 +331,7 @@ fn format_expr(expr: &HirExpr) -> String {
                 table
                     .trailing_multivalue
                     .as_ref()
-                    .map(format_expr)
+                    .map(|tail| format_expr(tail.as_expr()))
                     .unwrap_or_else(|| "-".to_owned()),
             )
         }
@@ -415,14 +403,9 @@ fn format_lvalue(target: &HirLValue) -> String {
 fn format_call_expr(call: &super::common::HirCallExpr) -> String {
     let kind = if call.method { "method" } else { "normal" };
     format!(
-        "call({kind}) {}({}) multiret={}",
+        "call({kind}) {}({})",
         format_expr(&call.callee),
-        call.args
-            .iter()
-            .map(format_expr)
-            .collect::<Vec<_>>()
-            .join(", "),
-        call.multiret
+        format_value_pack(&call.args),
     )
 }
 

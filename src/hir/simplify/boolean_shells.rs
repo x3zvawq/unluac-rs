@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirLValue, HirLocalDecl, HirLogicalExpr, HirProto, HirStmt,
-    HirUnaryExpr, HirUnaryOpKind, TempId,
+    HirUnaryExpr, HirUnaryOpKind, HirValuePack, TempId,
 };
 
 use super::expr_facts::{expr_is_boolean_valued, expr_is_side_effect_free};
@@ -80,7 +80,7 @@ fn collapse_live_boolean_materialization_shells_in_block(block: &mut HirBlock) -
         {
             block.stmts[index - 1] = HirStmt::LocalDecl(Box::new(HirLocalDecl {
                 bindings: vec![*local],
-                values: vec![value],
+                values: HirValuePack::fixed(vec![value]),
             }));
             block.stmts.remove(index);
             changed = true;
@@ -90,7 +90,7 @@ fn collapse_live_boolean_materialization_shells_in_block(block: &mut HirBlock) -
 
         block.stmts[index] = HirStmt::Assign(Box::new(HirAssign {
             targets: vec![target],
-            values: vec![value],
+            values: HirValuePack::fixed(vec![value]),
         }));
         changed = true;
         index += 1;
@@ -170,9 +170,12 @@ fn pure_assign_pattern(block: &HirBlock) -> Option<(&HirLValue, &HirExpr)> {
     let [target] = assign.targets.as_slice() else {
         return None;
     };
-    let [value] = assign.values.as_slice() else {
+    let [value] = assign.values.fixed.as_slice() else {
         return None;
     };
+    if assign.values.tail.is_some() {
+        return None;
+    }
 
     Some((target, value))
 }

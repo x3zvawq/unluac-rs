@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{LocalId, ParamId, TempId, UpvalueId};
 use crate::parser::RawLocalVar;
-use crate::structure::{Cfg, DataflowFacts, DefId, OpenDef};
+use crate::structure::{Cfg, DataflowFacts, DefId};
 use crate::structure::{LoopSourceBindings, StructureFacts};
 use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto, Reg};
 
@@ -126,11 +126,7 @@ pub(super) fn build_bindings(
     }
 
     let fixed_temps = (0..dataflow.defs.len()).map(TempId).collect::<Vec<_>>();
-    let open_base = fixed_temps.len();
-    let open_temps = (0..dataflow.open_defs.len())
-        .map(|index| TempId(open_base + index))
-        .collect::<Vec<_>>();
-    let mut next_temp_index = open_base + open_temps.len();
+    let mut next_temp_index = fixed_temps.len();
 
     let mut phi_temps = Vec::with_capacity(dataflow.phi_candidates.len());
     for _phi in &dataflow.phi_candidates {
@@ -145,11 +141,6 @@ pub(super) fn build_bindings(
         let temp = fixed_temps[def.id.index()];
         temp_debug_locals[temp.index()] =
             debug_local_name_for_reg_at_instr(proto, def.reg, def.instr);
-    }
-
-    for open_def in &dataflow.open_defs {
-        let temp = open_temps[open_def.id.index()];
-        temp_debug_locals[temp.index()] = debug_local_name_for_open_def_start(proto, open_def);
     }
 
     for phi in &dataflow.phi_candidates {
@@ -177,11 +168,6 @@ pub(super) fn build_bindings(
         })
         .collect::<Vec<_>>();
 
-    let mut instr_open_defs = vec![None; proto.instrs.len()];
-    for open_def in &dataflow.open_defs {
-        instr_open_defs[open_def.instr.index()] = Some(open_temps[open_def.id.index()]);
-    }
-
     // 这一层默认只消费 reachable 子图，所以 label/temp 也贴着 shared CFG/Dataflow 的约定。
     let _ = cfg;
 
@@ -195,10 +181,8 @@ pub(super) fn build_bindings(
         temps,
         temp_debug_locals,
         fixed_temps,
-        open_temps,
         phi_temps,
         instr_fixed_defs,
-        instr_open_defs,
         captured_temp_targets: captured_temp_facts.targets,
         captured_temp_decl_locals: captured_temp_facts.decl_temps,
         capture_empty_local_decls: captured_temp_facts.empty_decls,
@@ -394,10 +378,6 @@ fn ensure_epoch_slot(epochs: &mut Vec<usize>, reg: Reg) {
     if reg.index() >= epochs.len() {
         epochs.resize(reg.index() + 1, 0);
     }
-}
-
-fn debug_local_name_for_open_def_start(proto: &LoweredProto, open_def: &OpenDef) -> Option<String> {
-    debug_local_name_for_reg_at_instr(proto, open_def.start_reg, open_def.instr)
 }
 
 fn debug_local_name_for_reg_at_instr(

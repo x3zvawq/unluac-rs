@@ -271,7 +271,7 @@ pub(super) fn expr_uses_binding(expr: &HirExpr, binding: TableBinding) -> bool {
             }) || table
                 .trailing_multivalue
                 .as_ref()
-                .is_some_and(|expr| expr_uses_binding(expr, binding))
+                .is_some_and(|tail| expr_uses_binding(tail.as_expr(), binding))
         }
         HirExpr::Closure(closure) => closure
             .captures

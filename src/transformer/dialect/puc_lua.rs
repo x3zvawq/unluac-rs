@@ -15,7 +15,7 @@ use crate::transformer::{
     AccessBase, AccessKey, BinaryOpKind, CallInstr, CallKind, CloseInstr, CondOperand, ConstRef,
     GenericForCallInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MethodNameHint,
     NumberLiteral, ProtoRef, Reg, RegRange, ResultPack, ReturnInstr, TailCallInstr, TbcInstr,
-    TransformError, UpvalueOperand, UpvalueRef, ValueOperand, ValuePack,
+    TbcKind, TransformError, UpvalueOperand, UpvalueRef, ValueOperand, ValuePack,
 };
 
 pub(crate) const BITRK: u16 = 1 << 8;
@@ -875,7 +875,10 @@ pub(crate) fn emit_tforprep(
     lowering.emit(
         Some(raw_index),
         vec![raw_index],
-        PendingLowInstr::Ready(LowInstr::Tbc(TbcInstr { reg: tbc_reg })),
+        PendingLowInstr::Ready(LowInstr::Tbc(TbcInstr {
+            reg: tbc_reg,
+            kind: TbcKind::GenericFor,
+        })),
     );
     lowering.emit(
         None,

@@ -1,77 +1,22 @@
-//! 这个子模块负责把 fixed/open value pack 降成 HIR 多值表达式序列。
+//! 把 Transformer 的 fixed/open value pack 降成显式 HIR value pack。
 //!
-//! 它依赖 Transformer 已经区分好的 `ValuePack` / `ResultPack`，以及 Dataflow 对开放尾值
-//! 的事实，不会在这里猜补 pack 边界。
-//! 例如：`call(...)` 的开放返回包会在这里变成 `[..., tail_expr]` 这种 HIR 值序列。
+//! normal 与 single-eval 只在寄存器表达式和 open owner 的解析策略上不同；pack 边界、
+//! fixed prefix 和 unresolved fail-fast 共享同一条 lowering，避免两套实现漂移。
 
 use super::*;
-
-fn lower_open_value_pack_single_eval<F>(
-    lowering: &ProtoLowering<'_>,
-    start_reg: Reg,
-    instr_ref: InstrRef,
-    mut lower_reg: F,
-) -> Vec<HirExpr>
-where
-    F: FnMut(Reg) -> HirExpr,
-{
-    let Some((tail_start, tail_expr)) =
-        resolve_open_pack_tail_single_eval(lowering, instr_ref, start_reg)
-    else {
-        return vec![unresolved_expr(format!(
-            "open-pack r{} @{}",
-            start_reg.index(),
-            instr_ref.index()
-        ))];
-    };
-
-    let mut values = (start_reg.index()..tail_start.index())
-        .map(|index| lower_reg(Reg(index)))
-        .collect::<Vec<_>>();
-    values.push(tail_expr);
-    values
-}
 
 pub(crate) fn lower_value_pack(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,
     instr_ref: InstrRef,
     pack: crate::transformer::ValuePack,
-) -> Vec<HirExpr> {
-    let (mut values, trailing_multivalue) =
-        lower_value_pack_components(lowering, block, instr_ref, pack);
-    if let Some(trailing) = trailing_multivalue {
-        values.push(trailing);
-    }
-    values
-}
-
-pub(crate) fn lower_value_pack_components(
-    lowering: &ProtoLowering<'_>,
-    block: BlockRef,
-    instr_ref: InstrRef,
-    pack: crate::transformer::ValuePack,
-) -> (Vec<HirExpr>, Option<HirExpr>) {
-    match pack {
-        crate::transformer::ValuePack::Fixed(range) => (
-            (0..range.len)
-                .map(|offset| {
-                    expr_for_reg_use(
-                        lowering,
-                        block,
-                        instr_ref,
-                        Reg(range.start.index() + offset),
-                    )
-                })
-                .collect(),
-            None,
-        ),
-        crate::transformer::ValuePack::Open(reg) => {
-            lower_open_value_pack_components(lowering, reg, instr_ref, |reg| {
-                expr_for_reg_use(lowering, block, instr_ref, reg)
-            })
-        }
-    }
+) -> crate::hir::common::HirValuePack {
+    lower_value_pack_with(
+        pack,
+        |reg| expr_for_reg_use(lowering, block, instr_ref, reg),
+        |start| resolve_open_pack_tail(lowering, instr_ref, start),
+        instr_ref,
+    )
 }
 
 pub(crate) fn lower_value_pack_single_eval(
@@ -79,52 +24,41 @@ pub(crate) fn lower_value_pack_single_eval(
     block: BlockRef,
     instr_ref: InstrRef,
     pack: crate::transformer::ValuePack,
-) -> Vec<HirExpr> {
-    match pack {
-        crate::transformer::ValuePack::Fixed(range) => (0..range.len)
-            .map(|offset| {
-                expr_for_reg_use_single_eval_with_call_policy(
-                    lowering,
-                    block,
-                    instr_ref,
-                    Reg(range.start.index() + offset),
-                    false,
-                )
-            })
-            .collect(),
-        crate::transformer::ValuePack::Open(reg) => {
-            lower_open_value_pack_single_eval(lowering, reg, instr_ref, |reg| {
-                expr_for_reg_use_single_eval_with_call_policy(
-                    lowering, block, instr_ref, reg, false,
-                )
-            })
-        }
-    }
+) -> crate::hir::common::HirValuePack {
+    lower_value_pack_with(
+        pack,
+        |reg| expr_for_reg_use_single_eval_with_call_policy(lowering, block, instr_ref, reg, false),
+        |start| resolve_open_pack_tail_single_eval(lowering, instr_ref, start),
+        instr_ref,
+    )
 }
 
-fn lower_open_value_pack_components<F>(
-    lowering: &ProtoLowering<'_>,
-    start_reg: Reg,
+fn lower_value_pack_with(
+    pack: crate::transformer::ValuePack,
+    mut lower_reg: impl FnMut(Reg) -> HirExpr,
+    resolve_tail: impl FnOnce(Reg) -> Option<(Reg, crate::hir::common::HirPackTail)>,
     instr_ref: InstrRef,
-    mut lower_reg: F,
-) -> (Vec<HirExpr>, Option<HirExpr>)
-where
-    F: FnMut(Reg) -> HirExpr,
-{
-    let Some((tail_start, tail_expr)) = resolve_open_pack_tail(lowering, instr_ref, start_reg)
-    else {
-        return (
-            vec![unresolved_expr(format!(
-                "open-pack r{} @{}",
-                start_reg.index(),
-                instr_ref.index()
-            ))],
-            None,
-        );
+) -> crate::hir::common::HirValuePack {
+    let (start, end, tail) = match pack {
+        crate::transformer::ValuePack::Fixed(range) => {
+            (range.start.index(), range.start.index() + range.len, None)
+        }
+        crate::transformer::ValuePack::Open(start) => {
+            let Some((tail_start, tail)) = resolve_tail(start) else {
+                return vec![unresolved_expr(format!(
+                    "open-pack r{} @{}",
+                    start.index(),
+                    instr_ref.index()
+                ))]
+                .into();
+            };
+            (start.index(), tail_start.index(), Some(tail))
+        }
     };
 
-    let values = (start_reg.index()..tail_start.index())
-        .map(|index| lower_reg(Reg(index)))
-        .collect::<Vec<_>>();
-    (values, Some(tail_expr))
+    let fixed = (start..end).map(|index| lower_reg(Reg(index))).collect();
+    match tail {
+        Some(tail) => crate::hir::common::HirValuePack::expanding(fixed, tail),
+        None => crate::hir::common::HirValuePack::fixed(fixed),
+    }
 }

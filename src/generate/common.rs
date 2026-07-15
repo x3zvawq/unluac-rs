@@ -11,18 +11,27 @@ use strum_macros::{Display, EnumString, IntoStaticStr};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedChunk {
     pub dialect: DecompileDialect,
+    pub kind: GeneratedChunkKind,
     pub source: String,
-    pub warnings: Vec<String>,
 }
 
 impl Default for GeneratedChunk {
     fn default() -> Self {
         Self {
             dialect: DecompileDialect::Lua51,
+            kind: GeneratedChunkKind::Source,
             source: String::new(),
-            warnings: Vec::new(),
         }
     }
+}
+
+/// 生成文本是否仍是目标方言源码。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, IntoStaticStr)]
+#[strum(serialize_all = "kebab-case")]
+pub enum GeneratedChunkKind {
+    #[default]
+    Source,
+    DiagnosticPseudocode,
 }
 
 /// 代码生成选项。
@@ -135,12 +144,10 @@ pub struct GenerateFunctionCommentMetadata {
     pub upvalue_count: usize,
 }
 
-/// 输出层在遇到目标方言不支持的语法时该如何处理。
+/// 生成层面对无法由目标方言表达的控制流采取的策略。
 ///
-/// - `Permissive`：无论如何都尝试输出代码，无法恢复的错误通过 Lua 注释占位。
-/// - `Strict`：遇到任何反编译错误或目标 dialect 不支持的语法时直接报错并终止。
-///
-/// 库层默认为 `Strict`（最安全的编程接口约定）；CLI 层默认为 `Permissive`。
+/// `Permissive` 允许用 goto/label 和 Error 占位尽量展示恢复结果，并把包含缺口的产物
+/// 标为诊断伪源码；`Strict` 要求得到目标方言可表达的源码。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Display, EnumString, IntoStaticStr)]
 #[strum(serialize_all = "kebab-case")]
 pub enum GenerateMode {

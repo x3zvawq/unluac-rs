@@ -20,7 +20,7 @@ use super::super::walk::rewrite_nested_blocks_in_stmt;
 use super::eliminate_materialize::{
     assign_target_supports_direct_materialization, eliminate_condition_expr, empty_local_decl,
     expr_contains_eliminable_decision, extract_call_expr, extract_generic_for, extract_numeric_for,
-    extract_value_expr, extract_value_exprs, materialize_expr_into_target,
+    extract_value_expr, extract_value_pack, materialize_expr_into_target,
 };
 use super::eliminate_state::EliminationState;
 
@@ -68,12 +68,14 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
     match stmt {
         HirStmt::LocalDecl(local_decl)
             if local_decl.bindings.len() == 1
-                && local_decl.values.len() == 1
-                && expr_contains_eliminable_decision(&local_decl.values[0]) =>
+                && local_decl.values.tail.is_none()
+                && local_decl.values.fixed.len() == 1
+                && expr_contains_eliminable_decision(&local_decl.values.fixed[0]) =>
         {
             let binding = local_decl.bindings[0];
             let value = local_decl
                 .values
+                .fixed
                 .into_iter()
                 .next()
                 .expect("single-value local decl should stay non-empty");
@@ -87,9 +89,10 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
         }
         HirStmt::Assign(assign)
             if assign.targets.len() == 1
-                && assign.values.len() == 1
+                && assign.values.tail.is_none()
+                && assign.values.fixed.len() == 1
                 && assign_target_supports_direct_materialization(&assign.targets[0])
-                && expr_contains_eliminable_decision(&assign.values[0]) =>
+                && expr_contains_eliminable_decision(&assign.values.fixed[0]) =>
         {
             let target = assign
                 .targets
@@ -98,13 +101,14 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
                 .expect("single-target assign should stay non-empty");
             let value = assign
                 .values
+                .fixed
                 .into_iter()
                 .next()
                 .expect("single-value assign should stay non-empty");
             (materialize_expr_into_target(value, target, state), true)
         }
         HirStmt::LocalDecl(local_decl) => {
-            let (mut prefix, values, changed) = extract_value_exprs(local_decl.values, state);
+            let (mut prefix, values, changed) = extract_value_pack(local_decl.values, state);
             prefix.push(HirStmt::LocalDecl(Box::new(HirLocalDecl {
                 bindings: local_decl.bindings,
                 values,
@@ -112,7 +116,7 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
             (prefix, changed)
         }
         HirStmt::Assign(assign) => {
-            let (mut prefix, values, values_changed) = extract_value_exprs(assign.values, state);
+            let (mut prefix, values, values_changed) = extract_value_pack(assign.values, state);
             prefix.push(HirStmt::Assign(Box::new(HirAssign {
                 targets: assign.targets,
                 values,
@@ -121,23 +125,14 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
         }
         HirStmt::TableSetList(set_list) => {
             let (mut prefix, base, base_changed) = extract_value_expr(set_list.base, state);
-            let (value_prefix, values, values_changed) =
-                extract_value_exprs(set_list.values, state);
+            let (value_prefix, values, values_changed) = extract_value_pack(set_list.values, state);
             prefix.extend(value_prefix);
-            let (trailing_prefix, trailing_multivalue, trailing_changed) = set_list
-                .trailing_multivalue
-                .map(|expr| extract_value_expr(expr, state))
-                .map_or((Vec::new(), None, false), |(prefix, expr, changed)| {
-                    (prefix, Some(expr), changed)
-                });
-            prefix.extend(trailing_prefix);
             prefix.push(HirStmt::TableSetList(Box::new(HirTableSetList {
                 base,
                 start_index: set_list.start_index,
                 values,
-                trailing_multivalue,
             })));
-            (prefix, base_changed || values_changed || trailing_changed)
+            (prefix, base_changed || values_changed)
         }
         HirStmt::ErrNil(err_nil) => {
             let (mut prefix, value, changed) = extract_value_expr(err_nil.value, state);
@@ -161,11 +156,8 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
             (prefix, changed)
         }
         HirStmt::Return(ret) => {
-            let (mut prefix, values, changed) = extract_value_exprs(ret.values, state);
-            prefix.push(HirStmt::Return(Box::new(HirReturn {
-                values,
-                trailing_multiret: ret.trailing_multiret,
-            })));
+            let (mut prefix, values, changed) = extract_value_pack(ret.values, state);
+            prefix.push(HirStmt::Return(Box::new(HirReturn { values })));
             (prefix, changed)
         }
         HirStmt::If(mut if_stmt) => {

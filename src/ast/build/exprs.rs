@@ -1,10 +1,15 @@
-//! AST build：表达式和常规语句 lowering。
+//! AST build：表达式、左值和 value pack 的机械 lowering。
+//!
+//! 这里依赖 HIR 已经把标量表达式与唯一可展开的 pack tail 分开，不再从 Call/VarArg
+//! 形状猜多值语义。固定 pack 尾调用只在普通列表或目标槽位会暴露额外返回值时降成
+//! `SingleValue`，open tail 则保持展开；非 target-counted 上下文若仍收到 exact tail，
+//! 说明 HIR 物化尚未完成并直接报错。
 
 use std::collections::BTreeSet;
 
 use crate::hir::{
     HirAssign, HirBinaryOpKind, HirCallExpr, HirClosureExpr, HirExpr, HirLValue, HirLocalDecl,
-    HirTableAccess, HirTableField, HirTableKey, HirUnaryOpKind,
+    HirTableAccess, HirTableField, HirTableKey, HirUnaryOpKind, HirValuePack,
 };
 
 use super::{AstLowerError, AstLowerer};
@@ -17,6 +22,50 @@ use crate::ast::common::{
 };
 
 impl<'a> AstLowerer<'a> {
+    pub(super) fn lower_value_pack(
+        &mut self,
+        proto_index: usize,
+        pack: &HirValuePack,
+        context: PackLoweringContext,
+    ) -> Result<Vec<AstExpr>, AstLowerError> {
+        let mut values = pack
+            .fixed
+            .iter()
+            .map(|value| self.lower_expr(proto_index, value))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if let Some(tail) = &pack.tail {
+            if let Some(exact_width) = tail.exact_width() {
+                let PackLoweringContext::TargetCounted(target_count) = context else {
+                    return Err(AstLowerError::ResidualHir {
+                        proto: proto_index,
+                        kind: "exact-width pack tail outside target-counted value list",
+                    });
+                };
+                if target_count > pack.fixed.len().saturating_add(exact_width) {
+                    return Err(AstLowerError::ResidualHir {
+                        proto: proto_index,
+                        kind: "exact-width pack tail cannot fill target-counted value list",
+                    });
+                }
+            }
+            values.push(self.lower_expr(proto_index, tail.as_expr())?);
+        } else if matches!(pack.fixed.last(), Some(HirExpr::Call(_) | HirExpr::VarArg))
+            && match context {
+                PackLoweringContext::Ordinary => true,
+                PackLoweringContext::TargetCounted(target_count) => target_count > pack.fixed.len(),
+            }
+        {
+            let last = values
+                .last_mut()
+                .expect("non-empty fixed pack must lower to a final AST value");
+            let value = std::mem::replace(last, AstExpr::Nil);
+            *last = AstExpr::SingleValue(Box::new(value));
+        }
+
+        Ok(values)
+    }
+
     fn lower_function_expr(
         &mut self,
         owner_proto: usize,
@@ -81,11 +130,11 @@ impl<'a> AstLowerer<'a> {
                     self.lower_local_binding(proto_index, binding, crate::ast::AstLocalAttr::None)
                 })
                 .collect(),
-            values: local_decl
-                .values
-                .iter()
-                .map(|value| self.lower_expr(proto_index, value))
-                .collect::<Result<Vec<_>, _>>()?,
+            values: self.lower_value_pack(
+                proto_index,
+                &local_decl.values,
+                PackLoweringContext::TargetCounted(local_decl.bindings.len()),
+            )?,
         })
     }
 
@@ -100,11 +149,11 @@ impl<'a> AstLowerer<'a> {
                 .iter()
                 .map(|target| self.lower_lvalue(proto_index, target))
                 .collect::<Result<Vec<_>, _>>()?,
-            values: assign
-                .values
-                .iter()
-                .map(|value| self.lower_expr(proto_index, value))
-                .collect::<Result<Vec<_>, _>>()?,
+            values: self.lower_value_pack(
+                proto_index,
+                &assign.values,
+                PackLoweringContext::TargetCounted(assign.targets.len()),
+            )?,
         })
     }
 
@@ -222,12 +271,27 @@ impl<'a> AstLowerer<'a> {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 if let Some(trailing) = &table.trailing_multivalue {
+                    if trailing.exact_width().is_some() {
+                        return Err(AstLowerError::ResidualHir {
+                            proto: proto_index,
+                            kind: "exact-width pack tail in table constructor",
+                        });
+                    }
                     // AST 不需要再区分“尾部多返回”这个语义槽位；
                     // 只要把它保留成最后一个数组字段，Lua 语法自身就会在运行时
                     // 按表构造器上下文处理多返回展开。
                     fields.push(AstTableField::Array(
-                        self.lower_expr(proto_index, trailing)?,
+                        self.lower_expr(proto_index, trailing.as_expr())?,
                     ));
+                } else if matches!(
+                    table.fields.last(),
+                    Some(HirTableField::Array(HirExpr::Call(_) | HirExpr::VarArg))
+                ) {
+                    let Some(AstTableField::Array(last)) = fields.last_mut() else {
+                        unreachable!("HIR and AST table fields must preserve their order and kind");
+                    };
+                    let value = std::mem::replace(last, AstExpr::Nil);
+                    *last = AstExpr::SingleValue(Box::new(value));
                 }
                 AstExpr::TableConstructor(Box::new(AstTableConstructor { fields }))
             }
@@ -257,11 +321,8 @@ impl<'a> AstLowerer<'a> {
         proto_index: usize,
         call: &HirCallExpr,
     ) -> Result<AstCallKind, AstLowerError> {
-        let mut args = call
-            .args
-            .iter()
-            .map(|arg| self.lower_expr(proto_index, arg))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut args =
+            self.lower_value_pack(proto_index, &call.args, PackLoweringContext::Ordinary)?;
 
         if call.method
             && let Some(method_name) = &call.method_name
@@ -304,6 +365,12 @@ impl<'a> AstLowerer<'a> {
 
         Ok(AstCallKind::Call(Box::new(AstCallExpr { callee, args })))
     }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum PackLoweringContext {
+    Ordinary,
+    TargetCounted(usize),
 }
 
 fn capture_binding_from_hir_expr(expr: &HirExpr) -> Option<crate::ast::common::AstBindingRef> {

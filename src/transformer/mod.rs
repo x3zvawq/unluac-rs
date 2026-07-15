@@ -23,7 +23,7 @@ pub use common::{
     LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr, LoweredChunk,
     LoweredProto, LoweringMap, MethodNameHint, MoveInstr, NewTableInstr, NumberLiteral,
     NumericForInitInstr, NumericForLoopInstr, ProtoRef, RawInstrRef, Reg, RegRange, ResultPack,
-    ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr, TbcInstr,
+    ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr, TbcInstr, TbcKind,
     UnaryOpInstr, UnaryOpKind, UpvalueOperand, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 pub use debug::dump_lir;

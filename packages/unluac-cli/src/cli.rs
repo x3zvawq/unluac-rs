@@ -228,7 +228,7 @@ struct CliArgs {
         help_heading = "Generate"
     )]
     comment: Option<bool>,
-    /// How strictly to handle unsupported target syntax and generation errors.
+    /// Whether unstructured control flow may be emitted as diagnostic pseudocode.
     #[arg(
         short = 'g',
         long,
@@ -272,12 +272,6 @@ where
         print!("{}", render_proto_listing(chunk));
         return Ok(());
     }
-    if let Some(generated) = result.state.generated.as_ref() {
-        for warning in &generated.warnings {
-            eprintln!("[unluac][generate-warning] {warning}");
-        }
-    }
-
     if result.debug_output.is_empty() && result.timing_report.is_none() {
         if let Some(generated) = result.state.generated.as_ref() {
             if let Some(source) =
@@ -458,13 +452,7 @@ where
     if let Some(value) = args.comment {
         decompile.generate.comment = value;
     }
-    if let Some(mode) = args.generate_mode {
-        decompile.generate.mode = mode;
-    } else {
-        // CLI 层默认使用 Permissive，让用户默认获得尽可能完整的输出。
-        decompile.generate.mode = GenerateMode::Permissive;
-    }
-
+    decompile.generate.mode = args.generate_mode.unwrap_or(GenerateMode::Permissive);
     validate_output_request(&args, &decompile)?;
 
     Ok(CliOptions {

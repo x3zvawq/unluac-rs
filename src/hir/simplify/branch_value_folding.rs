@@ -34,7 +34,7 @@ use crate::hir::HirLabelId;
 use crate::hir::common::{
     HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirDecisionExpr, HirDecisionNode,
     HirDecisionNodeRef, HirDecisionTarget, HirExpr, HirIf, HirLValue, HirLocalDecl, HirProto,
-    HirStmt, HirUnaryOpKind, LocalId,
+    HirStmt, HirUnaryOpKind, HirValuePack, LocalId,
 };
 
 pub(super) fn fold_branch_values_in_proto(proto: &mut HirProto) -> bool {
@@ -102,7 +102,7 @@ fn fold_branch_value_locals_in_block(stmts: &mut Vec<HirStmt>) -> bool {
 
         stmts[index - 1] = HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: vec![binding],
-            values: vec![value],
+            values: HirValuePack::fixed(vec![value]),
         }));
         stmts.remove(index);
         changed = true;
@@ -125,7 +125,7 @@ fn fold_nil_fallback_alias_locals_in_block(stmts: &mut [HirStmt]) -> bool {
 
         stmts[index] = HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: vec![rewrite.target],
-            values: vec![HirExpr::LocalRef(rewrite.source)],
+            values: HirValuePack::fixed(vec![HirExpr::LocalRef(rewrite.source)]),
         }));
         stmts[index + 1] = HirStmt::If(Box::new(HirIf {
             cond: nil_check_for_local(rewrite.target),
@@ -517,9 +517,12 @@ fn terminal_goto_assign_target(block: &HirBlock, label: HirLabelId) -> Option<&H
     let [target] = assign.targets.as_slice() else {
         return None;
     };
-    let [_] = assign.values.as_slice() else {
+    let [_] = assign.values.fixed.as_slice() else {
         return None;
     };
+    if assign.values.tail.is_some() {
+        return None;
+    }
     Some(target)
 }
 
@@ -554,9 +557,12 @@ fn single_assign(stmt: &HirStmt) -> Option<(&HirLValue, &HirExpr)> {
     let [target] = assign.targets.as_slice() else {
         return None;
     };
-    let [value] = assign.values.as_slice() else {
+    let [value] = assign.values.fixed.as_slice() else {
         return None;
     };
+    if assign.values.tail.is_some() {
+        return None;
+    }
     Some((target, value))
 }
 
@@ -588,9 +594,12 @@ fn single_assign_value(assign: &HirAssign, binding: LocalId) -> Option<&HirExpr>
     let [target] = assign.targets.as_slice() else {
         return None;
     };
-    let [value] = assign.values.as_slice() else {
+    let [value] = assign.values.fixed.as_slice() else {
         return None;
     };
+    if assign.values.tail.is_some() {
+        return None;
+    }
     matches_local_lvalue(target, binding).then_some(value)
 }
 
@@ -607,9 +616,12 @@ fn collapse_temp_guard_pattern(
     let [lx] = decl.bindings.as_slice() else {
         return None;
     };
-    let [lx_value] = decl.values.as_slice() else {
+    let [lx_value] = decl.values.fixed.as_slice() else {
         return None;
     };
+    if decl.values.tail.is_some() {
+        return None;
+    }
     let lx = *lx;
 
     // cond 必须就是 `LocalRef(lx)`

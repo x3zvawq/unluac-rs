@@ -27,7 +27,7 @@ use crate::transformer::{
     ConstRef, DialectCaptureExtra, ErrNilInstr, GetTableInstr, GetUpvalueInstr, InstrRef,
     LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr,
     LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange,
-    ResultPack, SetListInstr, SetTableInstr, SetUpvalueInstr, TbcInstr, TransformError,
+    ResultPack, SetListInstr, SetTableInstr, SetUpvalueInstr, TbcInstr, TbcKind, TransformError,
     UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
@@ -681,6 +681,7 @@ impl<'a> ProtoLowerer<'a> {
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::Tbc(TbcInstr {
                             reg: reg_from_u8(a),
+                            kind: TbcKind::Explicit,
                         })),
                     );
                     raw_index += 1;

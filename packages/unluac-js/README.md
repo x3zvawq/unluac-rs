@@ -116,16 +116,16 @@ import { decompileRich } from "unluac-js";
 
 const result = await decompileRich(chunkBytes, { dialect: "auto" });
 
-console.log(result.source);    // final Lua source
-console.log(result.warnings);  // generation warnings
+console.log(result.source);    // source or Error-marked diagnostic pseudocode
+console.log(result.kind);      // "source" or "diagnostic-pseudocode"
 console.log(result.protos);    // proto metadata (DFS order)
 console.log(result.cfgs);      // per-proto CFG with blocks and edges
 ```
 
 The result includes:
 
-- `source`: generated Lua source string
-- `warnings`: array of generation-stage warnings
+- `source`: generated source or Error-marked diagnostic pseudocode
+- `kind`: `source` or `diagnostic-pseudocode`
 - `protos`: array of `UnluacProtoMeta` with function metadata (name, line range, params, upvalues, constants, instructions, children)
 - `cfgs`: array of `UnluacProtoCfg` with control flow graph data (blocks with Low-IR and raw bytecode instructions, edges with type labels)
 
@@ -176,7 +176,7 @@ Common `decompile()` options:
 
 `generate` sub-options:
 
-- `mode`: generation mode, `strict` or `permissive`
+- `mode`: `strict` requires target-compatible source; `permissive` may return clearly marked diagnostic pseudocode
 - `indentWidth`
 - `maxLineLength`
 - `numberFormat`

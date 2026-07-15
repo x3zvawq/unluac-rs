@@ -36,17 +36,12 @@ fn dump_generated_chunk(
     let _ = writeln!(output, "===== Dump Generate =====");
     let _ = writeln!(output, "generate detail={}", <&'static str>::from(detail));
     let _ = writeln!(output, "target={}", chunk.dialect);
+    let _ = writeln!(output, "kind={}", <&'static str>::from(chunk.kind));
     if filters.proto.is_some() {
         let _ = writeln!(
             output,
             "note: --proto has no effect on generate stage (final source would not be syntactically valid if sliced); use --stop-after ast --proto N to preview a single function",
         );
-    }
-    if !chunk.warnings.is_empty() {
-        let _ = writeln!(output, "warnings={}", chunk.warnings.len());
-        for warning in &chunk.warnings {
-            let _ = writeln!(output, "  - {warning}");
-        }
     }
     let _ = writeln!(output);
     let _ = write!(output, "{}", chunk.source);

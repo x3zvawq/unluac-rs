@@ -24,7 +24,10 @@ pub(super) fn binding_handoff_seed(stmt: &HirStmt) -> Option<BindingHandoffSeed>
     let HirStmt::Assign(assign) = stmt else {
         return None;
     };
-    if assign.targets.len() < 2 || assign.targets.len() != assign.values.len() {
+    if assign.values.tail.is_some()
+        || assign.targets.len() < 2
+        || assign.targets.len() != assign.values.fixed.len()
+    {
         return None;
     }
 
@@ -73,7 +76,7 @@ pub(super) fn rewrite_binding_handoff_seed(
         .iter()
         .map(|(target, _)| target.clone())
         .collect();
-    assign.values = retained_pairs
+    assign.values.fixed = retained_pairs
         .iter()
         .map(|(_, value)| value.clone())
         .collect();
@@ -87,9 +90,12 @@ pub(super) fn direct_temp_writeback_stmt(stmt: &HirStmt) -> Option<(CarryBinding
     let [target] = assign.targets.as_slice() else {
         return None;
     };
-    let [HirExpr::TempRef(update_temp)] = assign.values.as_slice() else {
+    let [HirExpr::TempRef(update_temp)] = assign.values.fixed.as_slice() else {
         return None;
     };
+    if assign.values.tail.is_some() {
+        return None;
+    }
     let carried = carry_binding_from_lvalue(target)?;
     if matches!(carried, CarryBinding::Temp(temp) if temp == *update_temp) {
         return None;
@@ -104,9 +110,12 @@ pub(super) fn update_handoff_seed(stmt: &HirStmt) -> Option<(TempId, CarryBindin
     let [HirLValue::Temp(target_temp)] = assign.targets.as_slice() else {
         return None;
     };
-    let [value] = assign.values.as_slice() else {
+    let [value] = assign.values.fixed.as_slice() else {
         return None;
     };
+    if assign.values.tail.is_some() {
+        return None;
+    }
     // `assign tX = lY` 这种纯别名交棒应继续走旧分支；这里只有“先算一个 next 状态，
     // 再把后半段身份完全交给它”的形状才应该继续往下看。
     if matches!(value, HirExpr::LocalRef(_) | HirExpr::TempRef(_)) {
@@ -142,9 +151,12 @@ pub(super) fn single_binding_handoff_seed(stmt: &HirStmt) -> Option<(TempId, Car
     let [HirLValue::Temp(temp)] = assign.targets.as_slice() else {
         return None;
     };
-    let [value] = assign.values.as_slice() else {
+    let [value] = assign.values.fixed.as_slice() else {
         return None;
     };
+    if assign.values.tail.is_some() {
+        return None;
+    }
     let binding = match value {
         HirExpr::LocalRef(local) => CarryBinding::Local(*local),
         HirExpr::TempRef(source) => CarryBinding::Temp(*source),

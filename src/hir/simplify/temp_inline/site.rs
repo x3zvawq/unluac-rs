@@ -19,12 +19,6 @@ pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<Inline
         HirStmt::TableSetList(set_list) => {
             find_site_in_expr(&set_list.base, temp, InlineSite::Direct)
                 .or_else(|| find_site_in_exprs(&set_list.values, temp, InlineSite::Direct))
-                .or_else(|| {
-                    set_list
-                        .trailing_multivalue
-                        .as_ref()
-                        .and_then(|expr| find_site_in_expr(expr, temp, InlineSite::Direct))
-                })
         }
         HirStmt::CallStmt(call_stmt) => {
             find_site_in_call(&call_stmt.call, temp, InlineSite::Direct)
@@ -70,9 +64,7 @@ pub(super) fn temp_precedes_observable_eval_in_stmt(stmt: &HirStmt, temp: TempId
             })
         }
         HirStmt::TableSetList(set_list) => temp_precedes_observable_eval_in_exprs(
-            std::iter::once(&set_list.base)
-                .chain(&set_list.values)
-                .chain(set_list.trailing_multivalue.iter()),
+            std::iter::once(&set_list.base).chain(&set_list.values),
             temp,
         ),
         HirStmt::CallStmt(call_stmt) => {
@@ -191,7 +183,8 @@ fn temp_precedes_observable_eval_in_expr(expr: &HirExpr, temp: TempId) -> bool {
                     }
                 }
             }
-            table.trailing_multivalue.as_ref().is_some_and(|trailing| {
+            table.trailing_multivalue.as_ref().is_some_and(|tail| {
+                let trailing = tail.as_expr();
                 prefix_clear
                     && expr_touches_temp(trailing, temp)
                     && temp_precedes_observable_eval_in_expr(trailing, temp)
@@ -217,9 +210,13 @@ fn temp_precedes_observable_eval_in_expr(expr: &HirExpr, temp: TempId) -> bool {
     }
 }
 
-fn find_site_in_exprs(exprs: &[HirExpr], temp: TempId, site: InlineSite) -> Option<InlineSite> {
+fn find_site_in_exprs<'a>(
+    exprs: impl IntoIterator<Item = &'a HirExpr>,
+    temp: TempId,
+    site: InlineSite,
+) -> Option<InlineSite> {
     exprs
-        .iter()
+        .into_iter()
         .find_map(|expr| find_site_in_expr(expr, temp, site))
 }
 
@@ -285,7 +282,7 @@ fn find_site_in_expr(expr: &HirExpr, temp: TempId, site: InlineSite) -> Option<I
                 table
                     .trailing_multivalue
                     .as_ref()
-                    .and_then(|expr| find_site_in_expr(expr, temp, InlineSite::Nested))
+                    .and_then(|tail| find_site_in_expr(tail.as_expr(), temp, InlineSite::Nested))
             }),
         HirExpr::Closure(_) => {
             // capture 一旦跨过函数边界，就会直接决定子 proto 的 upvalue provenance。
@@ -383,7 +380,7 @@ fn expr_complexity(expr: &HirExpr) -> usize {
                 + table
                     .trailing_multivalue
                     .as_ref()
-                    .map_or(0, expr_complexity)
+                    .map_or(0, |tail| expr_complexity(tail.as_expr()))
         }
         HirExpr::Closure(closure) => {
             1 + closure
@@ -622,7 +619,7 @@ pub(super) fn expr_touches_temp(expr: &HirExpr, temp: TempId) -> bool {
             }) || table
                 .trailing_multivalue
                 .as_ref()
-                .is_some_and(|expr| expr_touches_temp(expr, temp))
+                .is_some_and(|tail| expr_touches_temp(tail.as_expr(), temp))
         }
         HirExpr::Closure(closure) => closure
             .captures

@@ -27,9 +27,12 @@ pub(super) fn initialized_single_local_decl_binding(stmt: &HirStmt) -> Option<Lo
     let [binding] = local_decl.bindings.as_slice() else {
         return None;
     };
-    let [_value] = local_decl.values.as_slice() else {
+    let [_value] = local_decl.values.fixed.as_slice() else {
         return None;
     };
+    if local_decl.values.tail.is_some() {
+        return None;
+    }
     Some(*binding)
 }
 

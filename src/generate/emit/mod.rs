@@ -11,12 +11,13 @@ mod syntax;
 
 use crate::ast::{AstBlock, AstFeature, AstModule, AstTargetDialect, collect_ast_features};
 use crate::decompile::{DecompileContext, DecompileError, DecompileState};
-use crate::generate::GenerateMode;
 use crate::generate::doc::Doc;
 use crate::hir::HirProtoRef;
 use names::NameResolver;
 
-use super::common::{GenerateCommentMetadata, GenerateOptions, GeneratedChunk};
+use super::common::{
+    GenerateCommentMetadata, GenerateMode, GenerateOptions, GeneratedChunk, GeneratedChunkKind,
+};
 use super::error::GenerateError;
 use super::render::render_doc;
 
@@ -69,6 +70,12 @@ pub(crate) fn generate_chunk(
     } else {
         None
     };
+    let (features, has_errors) = collect_ast_features(module);
+    let unsupported = features
+        .into_iter()
+        .filter(|feature| !context.requested_target.supports_feature(*feature))
+        .collect::<Vec<_>>();
+    let diagnostic = has_errors || !unsupported.is_empty();
     let generated = {
         let emitter = Emitter {
             names: NameResolver::new(names),
@@ -76,39 +83,36 @@ pub(crate) fn generate_chunk(
             metadata: metadata.as_ref(),
             options,
         };
-        let doc = emitter.emit_module(module)?;
+        let mut doc = emitter.emit_module(module)?;
+        if diagnostic {
+            let features = format_ast_features(&unsupported);
+            let reason = match (unsupported.is_empty(), has_errors) {
+                (false, true) => format!("unsupported {features} and recovery errors"),
+                (false, false) => format!("unsupported {features}"),
+                (true, true) => "recovery errors".to_owned(),
+                (true, false) => unreachable!("diagnostic output must have a reason"),
+            };
+            doc = Doc::concat([
+                Doc::text(format!(
+                    "-- [unluac error] diagnostic pseudocode: {reason}; output may not recompile or preserve behavior"
+                )),
+                Doc::line(),
+                Doc::line(),
+                doc,
+            ]);
+        }
         GeneratedChunk {
             dialect: context.requested_target.version,
+            kind: if diagnostic {
+                GeneratedChunkKind::DiagnosticPseudocode
+            } else {
+                GeneratedChunkKind::Source
+            },
             source: render_doc(&doc, options),
-            warnings: permissive_output_warnings(module, context.requested_target, options.mode),
         }
     };
     state.generated = Some(generated);
     Ok(())
-}
-
-fn permissive_output_warnings(
-    module: &AstModule,
-    target: AstTargetDialect,
-    mode: GenerateMode,
-) -> Vec<String> {
-    if mode != GenerateMode::Permissive {
-        return Vec::new();
-    }
-
-    let unsupported = collect_ast_features(module)
-        .into_iter()
-        .filter(|feature| !target.supports_feature(*feature))
-        .collect::<Vec<_>>();
-    if unsupported.is_empty() {
-        return Vec::new();
-    }
-
-    vec![format!(
-        "requested target dialect `{}` does not support feature(s) {}; emitting permissive output.",
-        target.version,
-        format_ast_features(&unsupported)
-    )]
 }
 
 fn format_ast_features(features: &[AstFeature]) -> String {
@@ -128,7 +132,8 @@ struct Emitter<'a> {
 
 impl<'a> Emitter<'a> {
     fn allows_feature(&self, feature: AstFeature) -> bool {
-        self.target.supports_feature(feature) || self.options.mode != GenerateMode::Strict
+        self.target.supports_feature(feature)
+            || (self.options.mode == GenerateMode::Permissive && feature == AstFeature::GotoLabel)
     }
 
     fn emit_module(&self, module: &AstModule) -> Result<Doc, GenerateError> {

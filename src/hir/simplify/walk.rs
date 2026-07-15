@@ -153,6 +153,9 @@ fn rewrite_stmt(stmt: &mut HirStmt, pass: &mut impl HirRewritePass) -> bool {
         expr(expr) => {
             nested_changed |= rewrite_expr(expr, pass);
         },
+        tail_call(call) => {
+            nested_changed |= rewrite_call_expr(call, pass);
+        },
         lvalue(lvalue) => {
             nested_changed |= rewrite_lvalue(lvalue, pass);
         },
@@ -183,9 +186,17 @@ fn rewrite_lvalue(lvalue: &mut HirLValue, pass: &mut impl HirRewritePass) -> boo
 
 fn rewrite_call_expr(call: &mut HirCallExpr, pass: &mut impl HirRewritePass) -> bool {
     let mut nested_changed = false;
-    traverse_hir_call_children!(call, iter = iter_mut, borrow = [&mut], expr(expr) => {
-        nested_changed |= rewrite_expr(expr, pass);
-    });
+    traverse_hir_call_children!(
+        call,
+        iter = iter_mut,
+        borrow = [&mut],
+        expr(expr) => {
+            nested_changed |= rewrite_expr(expr, pass);
+        },
+        tail_call(call) => {
+            nested_changed |= rewrite_call_expr(call, pass);
+        }
+    );
     let call_changed = pass.rewrite_call(call);
     call_changed || nested_changed
 }
@@ -242,6 +253,9 @@ fn rewrite_table_constructor(
         borrow = [&mut],
         expr(e) => {
             changed |= rewrite_expr(e, pass);
+        },
+        tail_call(call) => {
+            changed |= rewrite_call_expr(call, pass);
         }
     );
     changed

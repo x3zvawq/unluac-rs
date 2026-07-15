@@ -246,7 +246,10 @@ fn edge_snapshot_alias_pairs(
 }
 
 fn pure_alias_pairs(assign: &HirAssign) -> Option<Vec<(CarryBinding, CarryBinding)>> {
-    if assign.targets.is_empty() || assign.targets.len() != assign.values.len() {
+    if assign.values.tail.is_some()
+        || assign.targets.is_empty()
+        || assign.targets.len() != assign.values.fixed.len()
+    {
         return None;
     }
 
@@ -254,7 +257,7 @@ fn pure_alias_pairs(assign: &HirAssign) -> Option<Vec<(CarryBinding, CarryBindin
     let mut seen_sources = BTreeSet::new();
     let mut pairs = Vec::with_capacity(assign.targets.len());
 
-    for (target, value) in assign.targets.iter().zip(&assign.values) {
+    for (target, value) in assign.targets.iter().zip(&assign.values.fixed) {
         let target = carry_binding_from_lvalue(target)?;
         let source = carry_binding_from_expr(value)?;
         if !seen_targets.insert(target) || !seen_sources.insert(source) {

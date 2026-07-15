@@ -4,6 +4,8 @@
 //! 状态，不会在这里重新识别循环种类；对于仍归为 Unknown 但已经证明可规约、且只有
 //! 一个普通 post-loop 的 retry loop，会保守降成 `while true ... break`，其他 terminal
 //! exits 仍留在循环体中原样终止。
+//! 多条 sibling latch 由 Structure 以 header 作为共同 continue target；这里复用
+//! header-retry 路径，不再要求挑出一个并不存在的唯一 latch。
 //! 例如：`NumericForLike` 的候选会在这里降成 `HirStmt::NumericFor`。
 
 use super::*;
@@ -58,7 +60,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Option<BlockRef>> {
         if candidate.exits.is_empty() {
-            return self.lower_infinite_unknown_loop(
+            return self.lower_header_retry_while_true_loop(
                 candidate_id,
                 candidate,
                 stop,
@@ -143,7 +145,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         Some(Some(post_loop))
     }
 
-    fn lower_infinite_unknown_loop(
+    fn lower_header_retry_while_true_loop(
         &mut self,
         candidate_id: LoopCandidateId,
         candidate: &LoopCandidate,
@@ -374,6 +376,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Option<BlockRef>> {
         let continue_target = candidate.continue_target?;
+        if continue_target == candidate.header {
+            return self.lower_header_retry_while_true_loop(
+                candidate_id,
+                candidate,
+                stop,
+                stmts,
+                target_overrides,
+            );
+        }
         if let Some(stop) = stop
             && candidate.blocks.contains(&stop)
             && stop != continue_target
@@ -864,7 +875,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.install_loop_exit_bindings(candidate_id, candidate, exit, &plan, target_overrides);
         stmts.push(HirStmt::GenericFor(Box::new(HirGenericFor {
             bindings,
-            iterator: self.lower_generic_for_iterator(header, call_instr_ref, call),
+            iterator: self
+                .lower_generic_for_iterator(header, call_instr_ref, call)
+                .into(),
             body,
         })));
 
@@ -920,7 +933,7 @@ fn collect_temp_refs_in_eval_order(expr: &HirExpr, refs: &mut Vec<TempId>) {
                 }
             }
             if let Some(trailing) = &table.trailing_multivalue {
-                collect_temp_refs_in_eval_order(trailing, refs);
+                collect_temp_refs_in_eval_order(trailing.as_expr(), refs);
             }
         }
         HirExpr::Closure(closure) => {

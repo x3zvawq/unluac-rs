@@ -537,9 +537,12 @@ fn simple_temp_assign_target(stmt: &HirStmt) -> Option<TempId> {
     let [HirLValue::Temp(temp)] = assign.targets.as_slice() else {
         return None;
     };
-    let [_value] = assign.values.as_slice() else {
+    let [_value] = assign.values.fixed.as_slice() else {
         return None;
     };
+    if assign.values.tail.is_some() {
+        return None;
+    }
     Some(*temp)
 }
 
@@ -550,9 +553,12 @@ fn alias_temp_for_group(stmt: &HirStmt, group: &BTreeSet<TempId>) -> Option<Temp
     let [HirLValue::Temp(alias)] = assign.targets.as_slice() else {
         return None;
     };
-    let [HirExpr::TempRef(source)] = assign.values.as_slice() else {
+    let [HirExpr::TempRef(source)] = assign.values.fixed.as_slice() else {
         return None;
     };
+    if assign.values.tail.is_some() {
+        return None;
+    }
     group.contains(source).then_some(*alias)
 }
 
@@ -585,9 +591,12 @@ fn single_temp_assign_value(stmt: &HirStmt, temp: TempId) -> Option<&HirExpr> {
     let [HirLValue::Temp(target)] = assign.targets.as_slice() else {
         return None;
     };
-    let [value] = assign.values.as_slice() else {
+    let [value] = assign.values.fixed.as_slice() else {
         return None;
     };
+    if assign.values.tail.is_some() {
+        return None;
+    }
     if *target != temp {
         return None;
     }
@@ -657,17 +666,11 @@ fn rewrite_plan_anchor_stmt(
                 return None;
             };
 
-            assign
-                .values
-                .iter()
-                .cloned()
-                .map(|mut expr| {
-                    rewrite::expr(&mut expr, mapping);
-                    expr
-                })
-                .collect::<Vec<_>>()
+            let mut values = assign.values.clone();
+            rewrite::value_pack(&mut values, mapping);
+            values
         }
-        PromotionInit::Empty => Vec::new(),
+        PromotionInit::Empty => crate::hir::common::HirValuePack::fixed(Vec::new()),
     };
 
     match (plan.action, plan.init) {
@@ -697,46 +700,24 @@ fn rewrite_stmt(
     outer_used_temps: &BTreeSet<TempId>,
 ) -> bool {
     match stmt {
-        HirStmt::LocalDecl(local_decl) => {
-            let mut changed = false;
-            for expr in &mut local_decl.values {
-                changed |= rewrite::expr(expr, mapping);
-            }
-            changed
-        }
+        HirStmt::LocalDecl(local_decl) => rewrite::value_pack(&mut local_decl.values, mapping),
         HirStmt::Assign(assign) => {
             let mut targets_changed = false;
             for target in &mut assign.targets {
                 targets_changed |= rewrite::lvalue(target, mapping);
             }
-            let mut values_changed = false;
-            for expr in &mut assign.values {
-                values_changed |= rewrite::expr(expr, mapping);
-            }
+            let values_changed = rewrite::value_pack(&mut assign.values, mapping);
             targets_changed || values_changed
         }
         HirStmt::TableSetList(set_list) => {
             let base_changed = rewrite::expr(&mut set_list.base, mapping);
-            let mut values_changed = false;
-            for expr in &mut set_list.values {
-                values_changed |= rewrite::expr(expr, mapping);
-            }
-            let trailing_changed = set_list
-                .trailing_multivalue
-                .as_mut()
-                .is_some_and(|expr| rewrite::expr(expr, mapping));
-            base_changed || values_changed || trailing_changed
+            let values_changed = rewrite::value_pack(&mut set_list.values, mapping);
+            base_changed || values_changed
         }
         HirStmt::ErrNil(err_nil) => rewrite::expr(&mut err_nil.value, mapping),
         HirStmt::ToBeClosed(to_be_closed) => rewrite::expr(&mut to_be_closed.value, mapping),
         HirStmt::CallStmt(call_stmt) => rewrite::call_expr(&mut call_stmt.call, mapping),
-        HirStmt::Return(ret) => {
-            let mut changed = false;
-            for expr in &mut ret.values {
-                changed |= rewrite::expr(expr, mapping);
-            }
-            changed
-        }
+        HirStmt::Return(ret) => rewrite::value_pack(&mut ret.values, mapping),
         HirStmt::If(if_stmt) => {
             let cond_changed = rewrite::expr(&mut if_stmt.cond, mapping);
             let then_changed = promote_block(
@@ -796,10 +777,7 @@ fn rewrite_stmt(
             start_changed || limit_changed || step_changed || body_changed
         }
         HirStmt::GenericFor(generic_for) => {
-            let mut iterator_changed = false;
-            for expr in &mut generic_for.iterator {
-                iterator_changed |= rewrite::expr(expr, mapping);
-            }
+            let iterator_changed = rewrite::value_pack(&mut generic_for.iterator, mapping);
             let body_changed = promote_block(
                 ctx,
                 &mut generic_for.body,
