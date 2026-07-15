@@ -68,6 +68,20 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 target_overrides,
             );
         }
+        if candidate.exits.len() > 1
+            && candidate
+                .exits
+                .iter()
+                .all(|exit| self.loop_exit_terminates(candidate, *exit))
+        {
+            return self.lower_while_true_loop(
+                candidate_id,
+                candidate,
+                stop,
+                stmts,
+                target_overrides,
+            );
+        }
         let mut post_loops = candidate
             .exits
             .iter()
@@ -402,7 +416,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if candidate
             .exits
             .iter()
-            .any(|exit| !block_is_terminal_exit(self.lowering, *exit))
+            .any(|exit| !self.loop_exit_terminates(candidate, *exit))
         {
             return None;
         }

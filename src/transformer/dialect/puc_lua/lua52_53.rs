@@ -21,10 +21,11 @@ use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
     AccessBase, BinaryOpInstr, BinaryOpKind, BranchCond, BranchOperands, BranchPredicate, Capture,
     CaptureSource, CloseInstr, ClosureInstr, ConcatInstr, CondOperand, ConstRef,
-    DialectCaptureExtra, GetTableInstr, GetUpvalueInstr, InstrRef, LoadBoolInstr, LoadConstInstr,
-    LoadNilInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr,
-    ProtoRef, Reg, RegRange, ResultPack, SetListInstr, SetTableInstr, SetUpvalueInstr,
-    TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    DialectCaptureExtra, GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, LoadBoolInstr,
+    LoadConstInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr,
+    NewTableInstr, ProtoRef, Reg, RegRange, ResultPack, SetListInstr, SetTableInstr,
+    SetUpvalueInstr, TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand,
+    ValuePack, VarArgInstr,
 };
 
 mod adapter;
@@ -229,7 +230,7 @@ impl<'a> ProtoLowerer<'a> {
                                 b as usize,
                             )?,
                             key: rk_access_key(self.raw, raw_pc, c)?,
-                            method_load: false,
+                            kind: GetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -245,7 +246,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst,
                             base: AccessBase::Reg(reg_from_u16(b)),
                             key: rk_access_key(self.raw, raw_pc, c)?,
-                            method_load: false,
+                            kind: GetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -335,7 +336,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst: callee,
                             base: AccessBase::Reg(reg_from_u16(b)),
                             key: method_key,
-                            method_load: true,
+                            kind: GetTableKind::Method,
                         })),
                     );
                     self.pending_methods.set(callee, self_arg, method_name);

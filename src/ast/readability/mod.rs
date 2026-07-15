@@ -17,6 +17,7 @@ mod global_decl_pretty;
 mod inline_exprs;
 mod installer_iife;
 mod local_coalesce;
+mod local_scope_limit;
 mod loop_header_merge;
 mod luajit_goto_safety;
 mod materialize_temps;
@@ -188,6 +189,12 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
         depends_on: &[ControlFlowShape],
         invalidates: &[],
     },
+    PassDescriptor {
+        name: "local-scope-limit",
+        phase: PassPhase::Deferred,
+        depends_on: &[StatementAdjacency, BindingStructure],
+        invalidates: &[],
+    },
 ];
 
 /// pass 执行入口，下标与 `PASS_DESCRIPTORS` 一一对应。
@@ -227,6 +234,9 @@ const PASS_ENTRIES: &[ReadabilityPassEntry] = &[
     },
     ReadabilityPassEntry {
         apply: luajit_goto_safety::apply,
+    },
+    ReadabilityPassEntry {
+        apply: local_scope_limit::apply,
     },
 ];
 

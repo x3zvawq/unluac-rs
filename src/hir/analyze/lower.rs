@@ -30,7 +30,10 @@ use crate::hir::common::{
 };
 use crate::structure::{BlockRef, Cfg, CfgGraph, DataflowFacts, GraphFacts, OpenDefId, PhiId};
 use crate::structure::{ShortCircuitExit, StructureFacts};
-use crate::transformer::{GenericForLoopInstr, InstrRef, LowInstr, LoweredProto, Reg};
+use crate::transformer::{
+    AccessBase, AccessKey, CallKind, GenericForLoopInstr, GetTableKind, InstrRef, LowInstr,
+    LoweredProto, Reg, ResultPack, ValuePack,
+};
 
 pub(super) struct ProtoBindings {
     pub(super) params: Vec<ParamId>,
@@ -126,6 +129,11 @@ pub(super) struct LowerArtifacts {
     pub(super) promotion_facts: Vec<ProtoPromotionFacts>,
 }
 
+struct LoweredProtoResult {
+    id: HirProtoRef,
+    mutable_upvalues: Vec<bool>,
+}
+
 pub(super) fn lower_proto(
     state: &DecompileState,
     context: &DecompileContext<'_>,
@@ -144,7 +152,8 @@ pub(super) fn lower_proto(
         dataflow,
         structure,
         artifacts,
-    ))
+    )
+    .id)
 }
 
 fn lower_proto_node(
@@ -155,7 +164,7 @@ fn lower_proto_node(
     dataflow: &DataflowFacts,
     structure: &StructureFacts,
     artifacts: &mut LowerArtifacts,
-) -> HirProtoRef {
+) -> LoweredProtoResult {
     let cfg = &cfg_graph.cfg;
     let id = HirProtoRef(artifacts.protos.len());
     artifacts.protos.push(empty_proto(id));
@@ -163,7 +172,7 @@ fn lower_proto_node(
         .promotion_facts
         .push(ProtoPromotionFacts::default());
 
-    let child_refs = proto
+    let child_results = proto
         .children
         .iter()
         .zip(cfg_graph.children.iter())
@@ -184,8 +193,16 @@ fn lower_proto_node(
             },
         )
         .collect::<Vec<_>>();
+    let child_refs = child_results
+        .iter()
+        .map(|child| child.id)
+        .collect::<Vec<_>>();
+    let child_mutable_upvalues = child_results
+        .into_iter()
+        .map(|child| child.mutable_upvalues)
+        .collect::<Vec<_>>();
 
-    let bindings = build_bindings(proto, cfg, dataflow, structure);
+    let bindings = build_bindings(proto, cfg, dataflow, structure, &child_mutable_upvalues);
     let open_pack_owners = build_open_pack_owners(proto, cfg, dataflow);
     let mut owned_open_producers = vec![false; proto.instrs.len()];
     for def in &dataflow.open_defs {
@@ -226,7 +243,51 @@ fn lower_proto_node(
     };
     artifacts.promotion_facts[id.index()] = ProtoPromotionFacts::from_dataflow(proto, dataflow);
 
-    id
+    LoweredProtoResult {
+        id,
+        mutable_upvalues: mutable_upvalues_for_proto(proto, &child_mutable_upvalues),
+    }
+}
+
+fn mutable_upvalues_for_proto(
+    proto: &LoweredProto,
+    child_mutable_upvalues: &[Vec<bool>],
+) -> Vec<bool> {
+    let mut mutable = vec![false; usize::from(proto.upvalues.common.count)];
+    for instr in &proto.instrs {
+        match instr {
+            LowInstr::SetUpvalue(set) => {
+                let crate::transformer::UpvalueOperand::Upvalue(dst) = set.dst else {
+                    continue;
+                };
+                if let Some(slot) = mutable.get_mut(dst.index()) {
+                    *slot = true;
+                }
+            }
+            LowInstr::Closure(closure) => {
+                let Some(child_mutable) = child_mutable_upvalues.get(closure.proto.index()) else {
+                    continue;
+                };
+                for (child_upvalue, can_write) in child_mutable.iter().copied().enumerate() {
+                    if !can_write {
+                        continue;
+                    }
+                    let Some(crate::transformer::CaptureSource::Upvalue(parent_upvalue)) = closure
+                        .captures
+                        .get(child_upvalue)
+                        .map(|capture| capture.source)
+                    else {
+                        continue;
+                    };
+                    if let Some(slot) = mutable.get_mut(parent_upvalue.index()) {
+                        *slot = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    mutable
 }
 
 fn build_open_pack_owners(
@@ -253,7 +314,7 @@ fn build_open_pack_owners(
         };
         let consumer_block = cfg.instr_to_block[consumer_index];
         if def.block != consumer_block
-            || !open_pack_bridge_is_lifecycle_only(proto, def.instr, consumer)
+            || !open_pack_bridge_has_owned_protocol(proto, def.instr, consumer)
         {
             continue;
         }
@@ -273,7 +334,7 @@ fn build_open_pack_owners(
     owners
 }
 
-fn open_pack_bridge_is_lifecycle_only(
+fn open_pack_bridge_has_owned_protocol(
     proto: &LoweredProto,
     producer: InstrRef,
     consumer: InstrRef,
@@ -286,6 +347,13 @@ fn open_pack_bridge_is_lifecycle_only(
     };
 
     if between.is_empty() {
+        return true;
+    }
+
+    if matches!(
+        proto.instrs.get(producer.index()),
+        Some(LowInstr::VarArg(vararg)) if matches!(vararg.results, ResultPack::Open(_))
+    ) {
         return true;
     }
 
@@ -302,6 +370,8 @@ fn open_pack_bridge_is_lifecycle_only(
     }
 
     open_pack_bridge_is_method_setup(proto, producer, consumer, between)
+        || open_pack_bridge_is_import_setup(proto, producer, consumer, between)
+        || open_pack_bridge_is_callee_move(proto, producer, consumer, between)
 }
 
 fn open_pack_bridge_is_method_setup(
@@ -310,21 +380,13 @@ fn open_pack_bridge_is_method_setup(
     consumer: InstrRef,
     between: &[LowInstr],
 ) -> bool {
-    let producer_start = match proto.instrs.get(producer.index()) {
-        Some(LowInstr::Call(call)) => match call.results {
-            crate::transformer::ResultPack::Open(start) => start,
-            _ => return false,
-        },
-        Some(LowInstr::VarArg(vararg)) => match vararg.results {
-            crate::transformer::ResultPack::Open(start) => start,
-            _ => return false,
-        },
-        _ => return false,
+    let Some(producer_start) = open_producer_start(proto, producer) else {
+        return false;
     };
     let Some(LowInstr::Call(call)) = proto.instrs.get(consumer.index()) else {
         return false;
     };
-    let crate::transformer::ValuePack::Open(self_arg) = call.args else {
+    let ValuePack::Open(self_arg) = call.args else {
         return false;
     };
     let [LowInstr::Move(receiver), LowInstr::GetTable(method)] = between else {
@@ -341,11 +403,88 @@ fn open_pack_bridge_is_method_setup(
         && call
             .method_name
             .is_some_and(|hint| hint.const_ref == method_key)
-        && method.method_load
+        && method.kind == GetTableKind::Method
         && method.dst == call.callee
         && receiver.dst == self_arg
         && receiver.src == base
         && producer_start.index() == self_arg.index() + 1
+}
+
+fn open_pack_bridge_is_import_setup(
+    proto: &LoweredProto,
+    producer: InstrRef,
+    consumer: InstrRef,
+    between: &[LowInstr],
+) -> bool {
+    let Some(producer_start) = open_producer_start(proto, producer) else {
+        return false;
+    };
+    let Some(LowInstr::Call(call)) = proto.instrs.get(consumer.index()) else {
+        return false;
+    };
+    let ValuePack::Open(args_start) = call.args else {
+        return false;
+    };
+    let Some((LowInstr::GetTable(first), rest)) = between.split_first() else {
+        return false;
+    };
+
+    matches!(call.kind, CallKind::Normal)
+        && producer_start.index() >= args_start.index()
+        && first.kind == GetTableKind::Import
+        && first.dst == call.callee
+        && matches!(first.base, AccessBase::Env)
+        && matches!(first.key, AccessKey::Const(_))
+        && rest.iter().all(|instr| {
+            matches!(
+                instr,
+                LowInstr::GetTable(get)
+                    if get.kind == GetTableKind::Import
+                        && get.dst == first.dst
+                        && get.base == AccessBase::Reg(first.dst)
+                        && matches!(get.key, AccessKey::Const(_))
+            )
+        })
+}
+
+fn open_pack_bridge_is_callee_move(
+    proto: &LoweredProto,
+    producer: InstrRef,
+    consumer: InstrRef,
+    between: &[LowInstr],
+) -> bool {
+    let Some(producer_start) = open_producer_start(proto, producer) else {
+        return false;
+    };
+    let Some(LowInstr::Call(call)) = proto.instrs.get(consumer.index()) else {
+        return false;
+    };
+    let ValuePack::Open(args_start) = call.args else {
+        return false;
+    };
+    let [LowInstr::Move(callee_move)] = between else {
+        return false;
+    };
+
+    matches!(call.kind, CallKind::Normal)
+        && producer_start.index() >= args_start.index()
+        && callee_move.src.index() < producer_start.index()
+        && callee_move.dst == call.callee
+        && callee_move.dst.index() < args_start.index()
+}
+
+fn open_producer_start(proto: &LoweredProto, producer: InstrRef) -> Option<Reg> {
+    match proto.instrs.get(producer.index())? {
+        LowInstr::Call(call) => match call.results {
+            ResultPack::Open(start) => Some(start),
+            _ => None,
+        },
+        LowInstr::VarArg(vararg) => match vararg.results {
+            ResultPack::Open(start) => Some(start),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 impl ProtoLowering<'_> {

@@ -14,7 +14,11 @@ use super::*;
 impl StructuredBodyLowerer<'_, '_> {
     pub(super) fn active_loop_escape_stmts(&mut self, block: BlockRef) -> Option<Vec<HirStmt>> {
         let loop_context = self.active_loops.last()?.clone();
-        if loop_context.continue_target == Some(block) && self.loop_continue_target_is_empty(block)
+        if loop_context.continue_target == Some(block)
+            && self.loop_continue_target_is_empty(block)
+            // 空的 self-loop header 首次进入时仍是循环体本身，必须交给 walker
+            // 消费；只有后续路径再次到达它时才表示提前开始下一轮。
+            && (block != loop_context.header || self.visited.contains(&block))
         {
             return self
                 .can_emit_continue_stmt()

@@ -243,4 +243,16 @@ impl StructuredBodyLowerer<'_, '_> {
             &mut BTreeMap::new(),
         )
     }
+
+    pub(super) fn loop_exit_terminates(&self, candidate: &LoopCandidate, exit: BlockRef) -> bool {
+        // LuaJIT UCLO 会把源码 return/break 的词法收尾拆成 Close + Jump pad；
+        // terminal owner 必须看完整出口 region，不能只看入口块的末条指令。
+        block_is_terminal_exit(self.lowering, exit)
+            || self.loop_exit_region_is_terminal(
+                candidate,
+                exit,
+                self.lowering.cfg.exit_block,
+                None,
+            )
+    }
 }

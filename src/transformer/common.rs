@@ -447,7 +447,16 @@ pub struct GetTableInstr {
     pub dst: Reg,
     pub base: AccessBase,
     pub key: AccessKey,
-    /// 来自 `SELF` / `NAMECALL` 三元式的 method-load 位。
+    pub kind: GetTableKind,
+}
+
+/// 表读取在源字节码中的协议身份。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum GetTableKind {
+    Normal,
+    /// Luau `GETIMPORT` 展开的稳定路径读取。
+    Import,
+    /// 来自 `SELF` / `NAMECALL` 三元式的 method-load。
     ///
     /// Lua 的 `obj:name(args)` 在 bytecode 层展开成"先把 `obj` 搬到 self 槽位、再从
     /// `obj[name]` 载入 method、然后 CALL"三步。后两步中的 GetTable 只用于把 method
@@ -455,7 +464,7 @@ pub struct GetTableInstr {
     /// 本身是装饰性的。打上这个标志是为了让 HIR 层知道："如果 method_name 能恢复成
     /// 字符串，这条 GetTable 对源码语义没有独立贡献"，从而避免在输出里留下机械的
     /// `local x = obj.name` 残影。
-    pub method_load: bool,
+    Method,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]

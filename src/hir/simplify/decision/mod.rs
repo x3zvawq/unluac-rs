@@ -83,9 +83,8 @@ fn simplify_decision_expr(decision: &mut HirDecisionExpr) -> (bool, Option<HirEx
     match reduced {
         ReducedDecision::Expr(expr) => (true, Some(expr)),
         ReducedDecision::Decision(reduced_decision) => {
-            let changed = reduced_decision != *decision;
             *decision = reduced_decision;
-            (changed, None)
+            (true, None)
         }
     }
 }
@@ -115,8 +114,8 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
 
     for index in (0..nodes.len()).rev() {
         let node_ref = HirDecisionNodeRef(index);
-        let original = nodes[index].clone();
-        let mut node = original.clone();
+        let mut node = nodes[index].clone();
+        let mut node_changed = false;
 
         if let HirDecisionTarget::Node(child_ref) = &node.truthy
             && nodes
@@ -125,8 +124,11 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
             && expr_is_repeatable(&node.test)
         {
             node.truthy = resolve_child_branch(&nodes, &replacements, *child_ref, true);
+            node_changed = true;
         } else {
-            node.truthy = resolve_target_for_parent(&replacements, &node.truthy);
+            let (truthy, resolved) = resolve_target_for_parent(&replacements, &node.truthy);
+            node.truthy = truthy;
+            node_changed |= resolved;
         }
 
         if let HirDecisionTarget::Node(child_ref) = &node.falsy
@@ -136,8 +138,11 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
             && expr_is_repeatable(&node.test)
         {
             node.falsy = resolve_child_branch(&nodes, &replacements, *child_ref, false);
+            node_changed = true;
         } else {
-            node.falsy = resolve_target_for_parent(&replacements, &node.falsy);
+            let (falsy, resolved) = resolve_target_for_parent(&replacements, &node.falsy);
+            node.falsy = falsy;
+            node_changed |= resolved;
         }
 
         if let Some(constant_truthy) = expr_truthiness(&node.test)
@@ -166,7 +171,7 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
             continue;
         }
 
-        changed |= node != original;
+        changed |= node_changed;
         nodes[index] = node;
     }
 
@@ -179,7 +184,8 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
     match root {
         ResolvedDecisionTarget::Expr(expr) => Some(ReducedDecision::Expr(expr)),
         ResolvedDecisionTarget::Node(entry) => {
-            let rebuilt = rebuild_decision(entry, &nodes);
+            let (rebuilt, topology_changed) = rebuild_decision(entry, &nodes);
+            changed |= topology_changed;
             let rebuilt = if decision_has_cycles(&rebuilt)
                 || !rebuilt
                     .nodes
@@ -187,13 +193,16 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
                     .all(|node| expr_is_repeatable(&node.test))
             {
                 rebuilt
+            } else if let Some(specialized) = specialize_decision_by_known_tests(&rebuilt) {
+                changed = true;
+                specialized
             } else {
-                specialize_decision_by_known_tests(&rebuilt).unwrap_or(rebuilt)
+                rebuilt
             };
             if let Some(expr) = collapse_value_decision_expr(&rebuilt) {
                 return Some(ReducedDecision::Expr(expr));
             }
-            if changed || rebuilt != *decision {
+            if changed {
                 Some(ReducedDecision::Decision(rebuilt))
             } else {
                 None
@@ -205,17 +214,17 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
 fn resolve_target_for_parent(
     replacements: &[Option<ResolvedDecisionTarget>],
     target: &HirDecisionTarget,
-) -> HirDecisionTarget {
+) -> (HirDecisionTarget, bool) {
     match target {
         HirDecisionTarget::Node(node_ref) => {
             if let Some(Some(replacement)) = replacements.get(node_ref.index()) {
-                replacement_as_target(replacement)
+                (replacement_as_target(replacement), true)
             } else {
-                HirDecisionTarget::Node(*node_ref)
+                (HirDecisionTarget::Node(*node_ref), false)
             }
         }
-        HirDecisionTarget::CurrentValue => HirDecisionTarget::CurrentValue,
-        HirDecisionTarget::Expr(expr) => HirDecisionTarget::Expr(expr.clone()),
+        HirDecisionTarget::CurrentValue => (HirDecisionTarget::CurrentValue, false),
+        HirDecisionTarget::Expr(expr) => (HirDecisionTarget::Expr(expr.clone()), false),
     }
 }
 
@@ -254,7 +263,10 @@ pub(super) fn replacement_as_target(target: &ResolvedDecisionTarget) -> HirDecis
     }
 }
 
-fn rebuild_decision(entry: HirDecisionNodeRef, nodes: &[HirDecisionNode]) -> HirDecisionExpr {
+fn rebuild_decision(
+    entry: HirDecisionNodeRef,
+    nodes: &[HirDecisionNode],
+) -> (HirDecisionExpr, bool) {
     let mut reachable = Vec::new();
     let mut visited = BTreeSet::new();
     let mut worklist = VecDeque::from([entry]);
@@ -274,6 +286,11 @@ fn rebuild_decision(entry: HirDecisionNodeRef, nodes: &[HirDecisionNode]) -> Hir
         }
     }
 
+    let topology_changed = reachable.len() != nodes.len()
+        || reachable
+            .iter()
+            .enumerate()
+            .any(|(index, old_ref)| old_ref.index() != index);
     let remap = reachable
         .iter()
         .enumerate()
@@ -293,10 +310,13 @@ fn rebuild_decision(entry: HirDecisionNodeRef, nodes: &[HirDecisionNode]) -> Hir
         })
         .collect::<Vec<_>>();
 
-    HirDecisionExpr {
-        entry: remap[&entry],
-        nodes: rebuilt_nodes,
-    }
+    (
+        HirDecisionExpr {
+            entry: remap[&entry],
+            nodes: rebuilt_nodes,
+        },
+        topology_changed,
+    )
 }
 
 fn remap_target(

@@ -15,64 +15,56 @@ use crate::ast::common::{
 };
 
 pub(super) fn lower_direct_function_stmt(
-    stmt: AstStmt,
+    stmt: &AstStmt,
     target: AstTargetDialect,
     method_fields: &BTreeSet<String>,
     blocked_bindings: &BTreeSet<AstBindingRef>,
-) -> AstStmt {
-    match &stmt {
+) -> Option<AstStmt> {
+    match stmt {
         AstStmt::LocalDecl(local_decl) => {
-            try_lower_local_function_decl((**local_decl).clone(), blocked_bindings)
+            try_lower_local_function_decl(local_decl, blocked_bindings)
         }
-        AstStmt::GlobalDecl(global_decl) => {
-            try_lower_global_function_decl((**global_decl).clone(), target).unwrap_or(stmt)
-        }
-        AstStmt::Assign(assign) => {
-            try_lower_function_assign((**assign).clone(), method_fields).unwrap_or(stmt)
-        }
-        _ => stmt,
+        AstStmt::GlobalDecl(global_decl) => try_lower_global_function_decl(global_decl, target),
+        AstStmt::Assign(assign) => try_lower_function_assign(assign, method_fields),
+        _ => None,
     }
 }
 
 fn try_lower_local_function_decl(
-    local_decl: AstLocalDecl,
+    local_decl: &AstLocalDecl,
     blocked_bindings: &BTreeSet<AstBindingRef>,
-) -> AstStmt {
+) -> Option<AstStmt> {
     if local_decl.bindings.len() != 1 || local_decl.values.len() != 1 {
-        return AstStmt::LocalDecl(Box::new(local_decl));
+        return None;
     }
     let binding = &local_decl.bindings[0];
     if binding.attr != AstLocalAttr::None {
-        return AstStmt::LocalDecl(Box::new(local_decl));
+        return None;
     }
     let name = match binding.id {
-        crate::ast::common::AstBindingRef::Local(name) => {
-            crate::ast::common::AstBindingRef::Local(name)
-        }
-        crate::ast::common::AstBindingRef::SyntheticLocal(name) => {
-            crate::ast::common::AstBindingRef::SyntheticLocal(name)
-        }
+        AstBindingRef::Local(name) => AstBindingRef::Local(name),
+        AstBindingRef::SyntheticLocal(name) => AstBindingRef::SyntheticLocal(name),
         crate::ast::common::AstBindingRef::Temp(_) => {
-            return AstStmt::LocalDecl(Box::new(local_decl));
+            return None;
         }
     };
     let AstExpr::FunctionExpr(func) = &local_decl.values[0] else {
-        return AstStmt::LocalDecl(Box::new(local_decl));
+        return None;
     };
     // 互递归/前向声明模式：如果当前 binding 在 blocked_bindings 中（由
     // collect_forward_capture_blocked 计算），说明它参与了一个互递归前向声明组，
     // 不能使用 `local function` 语法。必须保持 `local X = function() end` 形式。
     if blocked_bindings.contains(&name) {
-        return AstStmt::LocalDecl(Box::new(local_decl));
+        return None;
     }
-    AstStmt::LocalFunctionDecl(Box::new(AstLocalFunctionDecl {
+    Some(AstStmt::LocalFunctionDecl(Box::new(AstLocalFunctionDecl {
         name,
         func: func.as_ref().clone(),
-    }))
+    })))
 }
 
 fn try_lower_global_function_decl(
-    global_decl: AstGlobalDecl,
+    global_decl: &AstGlobalDecl,
     target: AstTargetDialect,
 ) -> Option<AstStmt> {
     if !target.caps.global_decl || global_decl.bindings.len() != 1 || global_decl.values.len() != 1
@@ -98,7 +90,7 @@ fn try_lower_global_function_decl(
 }
 
 fn try_lower_function_assign(
-    assign: AstAssign,
+    assign: &AstAssign,
     method_fields: &BTreeSet<String>,
 ) -> Option<AstStmt> {
     if assign.targets.len() != 1 || assign.values.len() != 1 {

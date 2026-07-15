@@ -182,6 +182,8 @@ fn terminal_guard_return_candidate(block: &AstBlock) -> Option<(usize, bool)> {
     if if_stmt.else_block.is_some()
         || !block_always_terminates(&if_stmt.then_block)
         || !matches!(if_stmt.then_block.stmts.last(), Some(AstStmt::Return(_)))
+        // 单独的空 return 没有可提升主体；取反只会与 cleanup 的尾 return 省略来回振荡。
+        || matches!(if_stmt.then_block.stmts.as_slice(), [stmt] if is_empty_return_stmt(stmt))
         || block_contains_label_or_goto(&if_stmt.then_block)
     {
         return None;

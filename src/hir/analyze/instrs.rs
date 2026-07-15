@@ -29,8 +29,8 @@ use crate::hir::common::{
 };
 use crate::structure::BlockRef;
 use crate::transformer::{
-    AccessBase, AccessKey, CallKind, GenericForCallInstr, GenericForLoopInstr, InstrRef, LowInstr,
-    MethodNameHint, Reg, ResultPack,
+    AccessBase, AccessKey, CallKind, GenericForCallInstr, GenericForLoopInstr, GetTableKind,
+    InstrRef, LowInstr, MethodNameHint, Reg, ResultPack,
 };
 
 pub(super) fn lower_regular_instr(
@@ -125,10 +125,10 @@ pub(super) fn lower_regular_instr(
             // GetTable，避免下游 `temp-inline` / `locals` 等 pass 把它保留成无意义的
             // `local x = obj.method` 语句。
             //
-            // 只在 method_load 标记为真、键是字符串常量时跳过：这样和
+            // 只在 Method 标记、键是字符串常量时跳过：这样和
             // `lower_method_name` 对 `MethodNameHint` 的成功条件一一对应，若常量不是
             // 字符串（理论上不会出现，但保险），依然按普通表访问发射。
-            if get_table.method_load
+            if get_table.kind == GetTableKind::Method
                 && let AccessKey::Const(const_ref) = get_table.key
                 && lower_method_name(lowering, Some(MethodNameHint { const_ref })).is_some()
             {
@@ -579,7 +579,7 @@ fn lower_call(
     // 当调用会被 AST 渲染成 `obj:method()` 糖时，AST 只读 args[0] 和
     // method_name，callee 被丢弃。这里直接把 callee 置为 Nil，从而让源自
     // `SELF` / `NAMECALL` 的 method-load GetTable 在 HIR 中也真正失去读者，
-    // 配合同一 pass 里对 `method_load` 的跳过逻辑建立闭环。
+    // 配合同一 pass 里对 Method 读取的跳过逻辑建立闭环。
     let callee = if is_method_sugar {
         HirExpr::Nil
     } else {

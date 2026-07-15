@@ -24,7 +24,10 @@ mod scan;
 use std::collections::BTreeMap;
 
 use crate::ast::DecompileDialect;
-use crate::hir::common::{HirAssign, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId};
+use crate::hir::common::{
+    HirAssign, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, HirTableConstructor,
+    HirTableField, LocalId, TempId,
+};
 
 use self::bindings::{
     BindingIndex, BindingOccurrenceIndex, StmtBindingSummary, collect_materialized_binding_counts,
@@ -118,21 +121,31 @@ pub(super) fn stabilize_table_constructors_in_proto(
     dialect: DecompileDialect,
 ) -> bool {
     let materialized_bindings = collect_materialized_binding_counts(&proto.body);
+    let first_new_local = proto.locals.len();
     let mut pass = TableConstructorPass {
         materialized_bindings,
         dialect,
+        next_local_index: first_new_local,
     };
-    rewrite_proto(proto, &mut pass)
+    let changed = rewrite_proto(proto, &mut pass);
+    proto
+        .local_debug_hints
+        .extend((first_new_local..pass.next_local_index).map(|_| None));
+    proto
+        .locals
+        .extend((first_new_local..pass.next_local_index).map(LocalId));
+    changed
 }
 
 struct TableConstructorPass {
     materialized_bindings: BTreeMap<TableBinding, usize>,
     dialect: DecompileDialect,
+    next_local_index: usize,
 }
 
 impl HirRewritePass for TableConstructorPass {
     fn rewrite_block(&mut self, block: &mut crate::hir::common::HirBlock) -> bool {
-        let mut changed = false;
+        let mut changed = self.materialize_discarded_inline_set_lists(block);
         let mut scratch = RebuildScratch::default();
         // 稳定 stmt id 让 occurrence index 在删除已折叠 region 后仍能按源码顺序查询；
         // 每个 seed 只做当前位置之后的有序集合查找，不重建完整 suffix summary。
@@ -217,6 +230,67 @@ impl HirRewritePass for TableConstructorPass {
 
         changed
     }
+}
+
+impl TableConstructorPass {
+    fn materialize_discarded_inline_set_lists(
+        &mut self,
+        block: &mut crate::hir::common::HirBlock,
+    ) -> bool {
+        let mut changed = false;
+        for stmt in &mut block.stmts {
+            let Some(constructor) = discarded_inline_set_list_constructor(stmt) else {
+                continue;
+            };
+            let local = LocalId(self.next_local_index);
+            self.next_local_index += 1;
+            *stmt = HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                bindings: vec![local],
+                values: vec![HirExpr::TableConstructor(Box::new(constructor))].into(),
+            }));
+            changed = true;
+        }
+        changed
+    }
+}
+
+fn discarded_inline_set_list_constructor(stmt: &HirStmt) -> Option<HirTableConstructor> {
+    let HirStmt::TableSetList(set_list) = stmt else {
+        return None;
+    };
+    let tail = set_list.values.tail.as_ref()?;
+    if tail.exact_width().is_some() {
+        return None;
+    }
+    let HirExpr::TableConstructor(base) = &set_list.base else {
+        return None;
+    };
+    if base.trailing_multivalue.is_some() {
+        return None;
+    }
+    let next_array_index = u32::try_from(
+        base.fields
+            .iter()
+            .filter(|field| matches!(field, HirTableField::Array(_)))
+            .count(),
+    )
+    .ok()?
+    .checked_add(1)?;
+    if set_list.start_index != next_array_index {
+        return None;
+    }
+
+    let mut constructor = (**base).clone();
+    constructor.fields.extend(
+        set_list
+            .values
+            .fixed
+            .iter()
+            .cloned()
+            .map(HirTableField::Array),
+    );
+    constructor.trailing_multivalue = Some(tail.clone());
+    Some(constructor)
 }
 
 fn install_constructor_owner(

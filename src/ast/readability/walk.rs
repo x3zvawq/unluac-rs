@@ -45,6 +45,14 @@ pub(super) trait AstRewritePass {
 pub(super) trait ScopedAstRewritePass {
     type Scope: Clone;
 
+    fn enter_function(
+        &mut self,
+        _function: &mut AstFunctionExpr,
+        outer_scope: &Self::Scope,
+    ) -> Self::Scope {
+        outer_scope.clone()
+    }
+
     fn enter_block(
         &mut self,
         _block: &mut AstBlock,
@@ -290,5 +298,6 @@ fn rewrite_function_expr_scoped<P: ScopedAstRewritePass>(
     scope: &P::Scope,
     pass: &mut P,
 ) -> bool {
-    rewrite_block_with_kind_scoped(&mut function.body, kind, scope, pass)
+    let function_scope = pass.enter_function(function, scope);
+    rewrite_block_with_kind_scoped(&mut function.body, kind, &function_scope, pass)
 }

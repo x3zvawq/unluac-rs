@@ -65,26 +65,40 @@ impl HirRewritePass for CloseScopePass {
 }
 
 fn materialize_block(block: &mut HirBlock) -> bool {
-    let rewritten = rewrite_stmt_slice(&block.stmts);
-    if rewritten != block.stmts {
-        block.stmts = rewritten;
-        return true;
-    }
-    false
+    let Some(rewritten) = rewrite_stmt_slice(&block.stmts) else {
+        return false;
+    };
+    block.stmts = rewritten;
+    true
 }
 
-fn rewrite_stmt_slice(stmts: &[HirStmt]) -> Vec<HirStmt> {
+fn rewrite_stmt_slice(stmts: &[HirStmt]) -> Option<Vec<HirStmt>> {
     let intervals = collect_scope_intervals(stmts);
     if intervals.is_empty() {
-        return stmts
+        if !stmts
             .iter()
-            .filter(|stmt| !matches!(stmt, HirStmt::Close(close) if close.from_reg == 0))
-            .cloned()
-            .collect();
+            .any(|stmt| matches!(stmt, HirStmt::Close(close) if close.from_reg == 0))
+        {
+            return None;
+        }
+        return Some(
+            stmts
+                .iter()
+                .filter(|stmt| !matches!(stmt, HirStmt::Close(close) if close.from_reg == 0))
+                .cloned()
+                .collect(),
+        );
     }
 
     let mut cursor = 0;
-    rebuild_slice(stmts, 0, stmts.len(), &intervals, &mut cursor, None)
+    Some(rebuild_slice(
+        stmts,
+        0,
+        stmts.len(),
+        &intervals,
+        &mut cursor,
+        None,
+    ))
 }
 
 fn collect_scope_intervals(stmts: &[HirStmt]) -> Vec<ScopeInterval> {

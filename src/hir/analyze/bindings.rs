@@ -38,6 +38,7 @@ pub(super) fn build_bindings(
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     structure: &StructureFacts,
+    child_mutable_upvalues: &[Vec<bool>],
 ) -> ProtoBindings {
     let params = (0..usize::from(proto.signature.num_params))
         .map(ParamId)
@@ -83,9 +84,10 @@ pub(super) fn build_bindings(
         proto,
         dataflow,
         &params,
-        &entry_local_regs,
+        &mut entry_local_regs,
         &mut locals,
         &mut local_debug_hints,
+        child_mutable_upvalues,
     );
 
     for candidate in &structure.loop_candidates {
@@ -203,26 +205,44 @@ fn collect_captured_slot_targets(
     proto: &LoweredProto,
     dataflow: &DataflowFacts,
     params: &[ParamId],
-    entry_local_regs: &BTreeMap<Reg, LocalId>,
+    entry_local_regs: &mut BTreeMap<Reg, LocalId>,
     locals: &mut Vec<LocalId>,
     local_debug_hints: &mut Vec<Option<String>>,
+    child_mutable_upvalues: &[Vec<bool>],
 ) -> CapturedSlotTargets {
     let mut slot_targets = BTreeMap::new();
     let mut capture_targets = BTreeMap::new();
     let mut epochs = vec![0usize; usize::from(proto.frame.max_stack_size).saturating_add(1)];
+    let lowest_closed_slot = proto
+        .instrs
+        .iter()
+        .filter_map(|instr| {
+            let LowInstr::Close(close) = instr else {
+                return None;
+            };
+            Some(close.from.index())
+        })
+        .min();
 
     for (instr_index, instr) in proto.instrs.iter().enumerate() {
         if let LowInstr::Closure(closure) = instr {
-            for capture in &closure.captures {
+            for (capture_index, capture) in closure.captures.iter().enumerate() {
                 let CaptureSource::Reg(reg) = capture.source else {
                     continue;
                 };
+                let child_can_write = child_mutable_upvalues
+                    .get(closure.proto.index())
+                    .and_then(|mutable| mutable.get(capture_index))
+                    .copied()
+                    .unwrap_or(false)
+                    && lowest_closed_slot.is_none_or(|from| reg.index() < from);
                 if reg == closure.dst {
                     continue;
                 }
                 if reg.index() < params.len()
                     || entry_local_regs.contains_key(&reg)
-                    || !capture_has_no_reaching_value(dataflow, InstrRef(instr_index), reg)
+                    || (!child_can_write
+                        && !capture_has_no_reaching_value(dataflow, InstrRef(instr_index), reg))
                 {
                     continue;
                 }
@@ -245,6 +265,13 @@ fn collect_captured_slot_targets(
                 };
                 slot_targets.entry(key).or_insert(target);
                 capture_targets.insert((instr_index, reg.index()), target);
+                if child_can_write
+                    || lowest_closed_slot.is_none_or(|from| reg.index() < from)
+                        && capture_has_no_reaching_value(dataflow, InstrRef(instr_index), reg)
+                {
+                    let BoundSlotTarget::Local(local) = target;
+                    entry_local_regs.entry(reg).or_insert(local);
+                }
             }
         }
 

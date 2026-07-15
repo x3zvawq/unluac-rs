@@ -33,7 +33,7 @@ pub(super) fn specialize_decision_by_known_tests(
                 entry,
                 nodes: specializer.nodes,
             };
-            (specialized != *decision).then_some(specialized)
+            specializer.changed.then_some(specialized)
         }
     }
 }
@@ -119,6 +119,7 @@ struct InternedDecisionNode {
 
 struct DecisionSpecializer<'a> {
     decision: &'a HirDecisionExpr,
+    changed: bool,
     memo: BTreeMap<HirDecisionNodeRef, BTreeMap<TruthFacts, ResolvedDecisionTarget>>,
     interner: Vec<InternedDecisionNode>,
     nodes: Vec<HirDecisionNode>,
@@ -128,6 +129,7 @@ impl<'a> DecisionSpecializer<'a> {
     fn new(decision: &'a HirDecisionExpr) -> Self {
         Self {
             decision,
+            changed: false,
             memo: BTreeMap::new(),
             interner: Vec::new(),
             nodes: Vec::new(),
@@ -151,6 +153,7 @@ impl<'a> DecisionSpecializer<'a> {
             return ResolvedDecisionTarget::Node(node_ref);
         };
         let result = if let Some(known_truthy) = known_truthiness_from_facts(&node.test, facts) {
+            self.changed = true;
             let chosen = if known_truthy {
                 &node.truthy
             } else {
@@ -164,10 +167,12 @@ impl<'a> DecisionSpecializer<'a> {
             let falsy = self.specialize_target(node, &node.falsy, &falsy_facts);
 
             if truthy == falsy {
+                self.changed = true;
                 truthy
             } else if let Some(existing) = self.interner.iter().find(|entry| {
                 entry.test == node.test && entry.truthy == truthy && entry.falsy == falsy
             }) {
+                self.changed = true;
                 ResolvedDecisionTarget::Node(existing.node_ref)
             } else {
                 let mapped = HirDecisionNodeRef(self.nodes.len());

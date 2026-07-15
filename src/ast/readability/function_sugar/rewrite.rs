@@ -101,14 +101,17 @@ fn rewrite_block(
             continue;
         }
 
-        let stmt = lower_direct_function_stmt(
-            old_stmts[index].clone(),
+        if let Some(stmt) = lower_direct_function_stmt(
+            &old_stmts[index],
             target,
             method_fields,
             &forward_capture_blocked,
-        );
-        changed |= stmt != old_stmts[index];
-        new_stmts.push(stmt);
+        ) {
+            new_stmts.push(stmt);
+            changed = true;
+        } else {
+            new_stmts.push(old_stmts[index].clone());
+        }
         index += 1;
     }
 

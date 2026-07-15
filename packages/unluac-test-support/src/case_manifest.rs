@@ -1023,6 +1023,54 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_187_irreducible_plain_loop_owner.lua",
         PUC_LUA_GE_52,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_188_luau_nan_fixed_point.lua",
+        LUAU_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_189_terminal_empty_return_guard.lua",
+        LUAU_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_190_luau_import_open_pack.lua",
+        LUAU_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_191_vararg_open_pack_setup.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_192_luau_open_pack_callee_move.lua",
+        LUAU_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_193_luau_unreachable_numeric_for_control.lua",
+        LUAU_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_194_discarded_table_open_tail.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_195_terminal_exit_unknown_loop.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_196_child_writes_parent_capture.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_197_long_bracket_control_byte.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_198_local_scope_limit.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_199_nested_local_scope_budget.lua",
+        LUAU_ONLY,
+    ),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {

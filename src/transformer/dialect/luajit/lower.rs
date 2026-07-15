@@ -18,10 +18,11 @@ use crate::transformer::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchOperands,
     BranchPredicate, CallInstr, CallKind, Capture, CaptureSource, CloseInstr, ClosureInstr,
     ConcatInstr, CondOperand, ConstRef, DialectCaptureExtra, GenericForCallInstr, GetTableInstr,
-    GetUpvalueInstr, InstrRef, LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr,
-    LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg,
-    RegRange, ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr,
-    TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    GetTableKind, GetUpvalueInstr, InstrRef, LoadBoolInstr, LoadConstInstr, LoadIntegerInstr,
+    LoadNilInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr,
+    ProtoRef, Reg, RegRange, ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr,
+    TailCallInstr, TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack,
+    VarArgInstr,
 };
 
 const NO_REG: u8 = 0xff;
@@ -449,7 +450,7 @@ impl<'a> ProtoLowerer<'a> {
                             key: AccessKey::Const(
                                 self.kgc_string_const_ref(raw_pc, usize::from(d))?,
                             ),
-                            method_load: false,
+                            kind: GetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -478,7 +479,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst: reg_from_u8(a),
                             base: AccessBase::Reg(reg_from_u8(b)),
                             key: AccessKey::Reg(reg_from_u8(c)),
-                            method_load: false,
+                            kind: GetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -494,7 +495,7 @@ impl<'a> ProtoLowerer<'a> {
                             key: AccessKey::Const(
                                 self.kgc_string_const_ref(raw_pc, usize::from(c))?,
                             ),
-                            method_load: false,
+                            kind: GetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -508,7 +509,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst: reg_from_u8(a),
                             base: AccessBase::Reg(reg_from_u8(b)),
                             key: AccessKey::Integer(i64::from(c)),
-                            method_load: false,
+                            kind: GetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;

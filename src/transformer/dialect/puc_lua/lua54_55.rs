@@ -24,11 +24,11 @@ use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchOperands,
     BranchPredicate, Capture, CaptureSource, CloseInstr, ClosureInstr, ConcatInstr, CondOperand,
-    ConstRef, DialectCaptureExtra, ErrNilInstr, GetTableInstr, GetUpvalueInstr, InstrRef,
-    LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr,
-    LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange,
-    ResultPack, SetListInstr, SetTableInstr, SetUpvalueInstr, TbcInstr, TbcKind, TransformError,
-    UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    ConstRef, DialectCaptureExtra, ErrNilInstr, GetTableInstr, GetTableKind, GetUpvalueInstr,
+    InstrRef, LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr,
+    LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg,
+    RegRange, ResultPack, SetListInstr, SetTableInstr, SetUpvalueInstr, TbcInstr, TbcKind,
+    TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
 mod adapter;
@@ -285,7 +285,7 @@ impl<'a> ProtoLowerer<'a> {
                                 b as usize,
                             )?,
                             key: AccessKey::Const(self.const_ref(raw_pc, c as usize)?),
-                            method_load: false,
+                            kind: GetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -301,7 +301,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst,
                             base: AccessBase::Reg(reg_from_u8(b)),
                             key: AccessKey::Reg(reg_from_u8(c)),
-                            method_load: false,
+                            kind: GetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -317,7 +317,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst,
                             base: AccessBase::Reg(reg_from_u8(b)),
                             key: AccessKey::Integer(i64::from(c)),
-                            method_load: false,
+                            kind: GetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -333,7 +333,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst,
                             base: AccessBase::Reg(reg_from_u8(b)),
                             key: AccessKey::Const(self.const_ref(raw_pc, c as usize)?),
-                            method_load: false,
+                            kind: GetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -349,7 +349,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst,
                             base: AccessBase::Reg(reg_from_u8(b)),
                             key: AccessKey::Reg(reg_from_u8(c)),
-                            method_load: false,
+                            kind: GetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -486,7 +486,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst: callee,
                             base: AccessBase::Reg(reg_from_u8(b)),
                             key: method_key,
-                            method_load: true,
+                            kind: GetTableKind::Method,
                         })),
                     );
                     self.pending_methods.set(callee, self_arg, method_name);

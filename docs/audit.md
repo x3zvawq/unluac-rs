@@ -15,8 +15,35 @@
 
 | 优先级 | 状态 | 问题 | 建议主题 |
 |---|---|---|---|
+| P0 | 已复现 | Luau `events` 的 closure 可写 local、`math` 的 loop live-out 被拆成不同 binding，生成源码可编译但执行错误 | 先缩到最小 proto，再统一可写 local 身份 owner |
 | P0 | 部分解决 | plain branch/loop island 已能局部降低并保留外层 for 与词法 cleanup；island 自身含 numeric/generic-for 协议或显式 cleanup 时仍会整 proto fallback | `refactor(hir): 完成mixed lowering并删除整proto fallback` |
-| P1 | 语料缺口 | Luau conformance 仅 16/49 完成严格反编译与二次编译，另有 unresolved、不收敛和非法 label | 按最小 proto 继续拆分 |
+| P1 | 语料缺口 | Luau conformance 当前 48/49 完成严格反编译与二次编译；仅剩 AST 超时 | 先完成 P2 热点定位 |
+| P2 | 已复现 | `native_integer_spills.luau` 的 AST 阶段在 4327 条 low-IR 上单核运行超过 2 分 51 秒 | 定位 readability 热点并建立可扩展基准 |
+
+## P0：Luau 可写 local 身份在 closure / loop 边界被拆分
+
+官方 `events.luau` 与 `math.luau` 当前都能严格反编译并重新编译，但运行对拍失败：
+
+```bash
+cargo unluac -s lua/sources/luau/tests/conformance/events.luau -D luau -g strict -o /tmp/events.luau
+lua/build/luau/luau lua/sources/luau/tests/conformance/events.luau
+lua/build/luau/luau /tmp/events.luau
+
+cargo unluac -s lua/sources/luau/tests/conformance/math.luau -D luau -g strict -o /tmp/math.luau
+lua/build/luau/luau lua/sources/luau/tests/conformance/math.luau
+lua/build/luau/luau /tmp/math.luau
+```
+
+- `events` 源码的 `foi` 被 `__newindex` closure 写入后应由连续 reset/assert 读取；生成源码
+  中 closure 写 `r0_47`，reset/assert 却依次使用 `r0_56`、`r0_58`、`r0_60` 等新 local，
+  第一次需要观察 closure 写入的断言失败。
+- `math` 源码的 `Max` / `Min` 在 repeat 中更新并在退出后读取；生成源码循环更新
+  `r0_201` / `r0_202`，退出断言却读取从未赋值的 `r0_203` / `r0_204`，报
+  `attempt to compare number <= nil`。
+
+两者都不是 local 作用域分组造成的语句重写，而是更早的可写 local / carried identity
+已经分裂。下一步先锁定最小 proto，对比 HIR 的 `LocalId`、loop carried 与 child capture
+映射，不能在 AST 或 Generate 把同名变量猜回去。
 
 ## P0：mixed lowering 尚未覆盖 island for 协议 / 显式 cleanup
 
@@ -89,10 +116,16 @@ cleanup owner 的前层唯一化已经完成，但下列缺口仍在：
 
 ## P1：Luau 官方语料仍有系统性缺口
 
-当前默认编译选项扫描 49 个官方 conformance 源码，仅 16 个完成严格反编译和生成源码二次编译；约 21 个 residual unresolved、10 个 fixed-point 不收敛、2 个生成非法 label。该扫描没有逐个运行对拍，不能把 16 个记为语义通过。后续按最小 proto/源码片段拆根因，不把 33 个文件混成一个修复。
+当前默认编译选项重新扫描 49 个官方 conformance 源码，48 个完成严格反编译和生成源码
+二次编译；该扫描没有逐个运行对拍，不能把 48 个记为语义通过，已运行发现的两项语义
+错误单列为上面的 P0。剩余未完成项只有：
 
-## P2：性能扫描结论
+- `native_integer_spills.luau` 在 AST 阶段触发已记录的性能问题，本轮在 2 分 51 秒后终止，尚未进入生成分类。
 
-当前没有尚未解决且已有复杂度证据的热点。本轮看到 `decision/eliminate_materialize.rs` 对固定三个元素执行 `remove(0)`，但长度有严格常数上界，不是大文件退化点，不应为它单独重构。
+后续按最小 proto/源码片段拆根因，不把剩余文件混成一个修复；修复一个类别后重新扫描并更新准确数量。
 
-后续性能工作仍应先提供可扩展输入、复杂度证明或 profile，再动实现；不要把普通 `BTreeSet::contains` 或小集合线性操作一概当热点。
+## P2：`native_integer_spills.luau` 暴露 AST 超线性热点
+
+当前官方输入只有 445 行，最大 proto 为 4327 条 low-IR；`--stop-after hir` 实测 2.17 秒，而完整严格反编译进入 AST 后单核持续 100%，运行 2 分 51 秒仍未结束，已人工终止。这说明热点位于 AST build/readability，而不是 parser/transformer/CFG/HIR，也不是无证据的容器选择猜测。
+
+下一步先用 pass 级 changed/timing 把耗时缩到具体 readability owner，再从该输入裁出可扩展基准并证明复杂度；在证据完成前不凭普通 `BTreeSet::contains` 或小集合线性操作猜热点。

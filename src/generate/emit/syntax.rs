@@ -239,7 +239,11 @@ fn push_decimal_escape(rendered: &mut String, byte: u8) {
 }
 
 fn can_use_long_bracket_string(value: &str) -> bool {
-    value.contains('\n') && !value.starts_with('\n') && !value.contains('\r')
+    value.contains('\n')
+        && !value.starts_with('\n')
+        && value
+            .chars()
+            .all(|ch| matches!(ch, '\n' | '\t') || !ch.is_control())
 }
 
 fn format_long_bracket_string(value: &str) -> String {
