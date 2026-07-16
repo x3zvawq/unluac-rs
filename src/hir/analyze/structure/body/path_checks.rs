@@ -372,11 +372,11 @@ impl StructuredBodyLowerer<'_, '_> {
         let Some(region) = self.branch_regions_by_header.get(&block).copied() else {
             return false;
         };
-        if !region.structured_blocks.contains(&stop) {
+        if !self.branch_region_contains(region, stop) {
             return false;
         }
 
-        let mut allowed_blocks = region.structured_blocks.clone();
+        let mut allowed_blocks = self.branch_region_blocks(region);
         allowed_blocks.insert(stop);
         let arm_can_truncate_to_stop =
             |entry| self.branch_arm_can_truncate_to_stop(entry, stop, &allowed_blocks);

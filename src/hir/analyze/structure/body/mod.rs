@@ -267,7 +267,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                         .structure
                         .region_facts
                         .iter()
-                        .filter(|region| !region.structureable)
                         .flat_map(|region| region.exits.iter().copied()),
                 )
                 .filter(|block| *block != lowering.cfg.exit_block),
@@ -297,6 +296,18 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     .reachable_targets_within(from, &self.lowering.cfg.reachable_blocks)
             })
             .contains(&to)
+    }
+
+    pub(super) fn branch_region_contains(
+        &self,
+        region: &BranchRegionFact,
+        block: BlockRef,
+    ) -> bool {
+        region.contains_structured_block(self.lowering.graph_facts, block)
+    }
+
+    pub(super) fn branch_region_blocks(&self, region: &BranchRegionFact) -> BTreeSet<BlockRef> {
+        region.materialize_structured_blocks(self.lowering.graph_facts)
     }
 
     fn all_reachable_blocks_covered(&self) -> bool {
@@ -757,6 +768,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     }
                     CleanupDisposition::ExplicitTbc
                     | CleanupDisposition::GenericFor(_)
+                    | CleanupDisposition::LoopTbcBoundary(_)
                     | CleanupDisposition::ExplicitTbcBoundary => {}
                 }
             }

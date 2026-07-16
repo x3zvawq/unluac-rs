@@ -117,11 +117,17 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let inside_exit_blocks = self
             .loop_state_inside_exit_blocks(candidate_id, candidate, exit)
             .unwrap_or_else(|| candidate.blocks.clone());
+        let state_exit = if Self::exit_values(candidate, exit).next().is_some() {
+            exit
+        } else {
+            self.normalized_post_loop_successor(exit)
+                .filter(|downstream| Self::exit_values(candidate, *downstream).next().is_some())
+                .unwrap_or(exit)
+        };
 
-        for value in Self::exit_values(candidate, exit) {
+        for value in Self::exit_values(candidate, state_exit) {
             if excluded.contains(&value.reg)
                 || planned_regs.contains(&value.reg)
-                || !loop_value_has_inside_and_outside_incoming(value)
                 || self.exit_value_is_owned_by_inherited_state(value, target_overrides)
             {
                 continue;
@@ -149,7 +155,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 continue;
             };
             let temp = *self.lowering.bindings.phi_temps.get(value.phi_id.index())?;
-            let target = self.loop_state_target(candidate, exit, value.reg, temp, target_overrides);
+            let target =
+                self.loop_state_target(candidate, state_exit, value.reg, temp, target_overrides);
             plan.backedge_target_overrides.insert(temp, target.clone());
             if self.lowering.dataflow.phi_use_count(value.phi_id) > 0 {
                 self.extend_loop_state_input_overrides(
@@ -467,7 +474,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             if let Some(region) = self.branch_regions_by_header.get(&exit)
                 && region.merge == other_exit
             {
-                shared_exit_blocks.extend(region.structured_blocks.iter().copied());
+                shared_exit_blocks.extend(self.branch_region_blocks(region));
             }
             self.apply_exit_phi_bindings(
                 candidate,

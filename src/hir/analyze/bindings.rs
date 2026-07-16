@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{LocalId, ParamId, TempId, UpvalueId};
 use crate::parser::RawLocalVar;
-use crate::structure::{Cfg, DataflowFacts, DefId, SsaValue};
+use crate::structure::{BlockRef, Cfg, DataflowFacts, DefId, SsaValue};
 use crate::structure::{LoopSourceBindings, StructureFacts};
 use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto, Reg};
 
@@ -79,13 +79,17 @@ pub(super) fn build_bindings(
     }
 
     let captured_slots = collect_captured_slot_targets(
-        proto,
-        dataflow,
-        captured_slot_epochs,
+        CapturedSlotInputs {
+            proto,
+            cfg,
+            dataflow,
+            structure,
+            epochs: captured_slot_epochs,
+            child_mutable_upvalues,
+        },
         &mut entry_local_regs,
         &mut locals,
         &mut local_debug_hints,
-        child_mutable_upvalues,
     );
 
     for candidate in &structure.loop_candidates {
@@ -241,18 +245,64 @@ struct CapturedSlotUse {
     entry_local_safe: bool,
 }
 
+struct CapturedSlotInputs<'a> {
+    proto: &'a LoweredProto,
+    cfg: &'a Cfg,
+    dataflow: &'a DataflowFacts,
+    structure: &'a StructureFacts,
+    epochs: &'a SlotEpochFacts,
+    child_mutable_upvalues: &'a [Vec<bool>],
+}
+
 fn collect_captured_slot_targets(
-    proto: &LoweredProto,
-    dataflow: &DataflowFacts,
-    epochs: &SlotEpochFacts,
+    inputs: CapturedSlotInputs<'_>,
     entry_local_regs: &mut BTreeMap<Reg, LocalId>,
     locals: &mut Vec<LocalId>,
     local_debug_hints: &mut Vec<Option<String>>,
-    child_mutable_upvalues: &[Vec<bool>],
 ) -> CapturedSlotTargets {
+    let CapturedSlotInputs {
+        proto,
+        cfg,
+        dataflow,
+        structure,
+        epochs,
+        child_mutable_upvalues,
+    } = inputs;
     let mut slot_targets = BTreeMap::<CapturedSlotKey, CapturedSlotBinding>::new();
     let mut capture_targets = BTreeMap::new();
     let mut captured_uses = Vec::new();
+    let mut loop_owned_slots = BTreeSet::new();
+    for candidate in &structure.loop_candidates {
+        for block in &candidate.body_scope_blocks {
+            match candidate.source_bindings {
+                Some(LoopSourceBindings::Numeric(reg)) => {
+                    loop_owned_slots.insert((*block, reg));
+                }
+                Some(LoopSourceBindings::Generic(bindings)) => {
+                    for offset in 0..bindings.len {
+                        loop_owned_slots.insert((*block, Reg(bindings.start.index() + offset)));
+                    }
+                }
+                None => {}
+            }
+            for value in &candidate.header_value_merges {
+                loop_owned_slots.insert((*block, value.reg));
+            }
+        }
+    }
+    let mut defs_by_slot = BTreeMap::<CapturedSlotKey, Vec<(usize, BlockRef)>>::new();
+    for def in &dataflow.defs {
+        let instr_index = def.instr.index();
+        defs_by_slot
+            .entry(CapturedSlotKey::new(
+                def.reg.index(),
+                epochs.epoch_at(def.reg, def.instr),
+            ))
+            .or_default()
+            .push((instr_index, cfg.instr_to_block[instr_index]));
+    }
+    let mut reachability = BTreeMap::new();
+    let mut cyclic_blocks = BTreeMap::new();
 
     for (instr_index, instr) in proto.instrs.iter().enumerate() {
         let LowInstr::Closure(closure) = instr else {
@@ -265,14 +315,10 @@ fn collect_captured_slot_targets(
             if reg == closure.dst
                 || reg.index() < usize::from(proto.signature.num_params)
                 || entry_local_regs.contains_key(&reg)
+                || loop_owned_slots.contains(&(cfg.instr_to_block[instr_index], reg))
             {
                 continue;
             }
-            let child_writes = child_mutable_upvalues
-                .get(closure.proto.index())
-                .and_then(|mutable| mutable.get(capture_index))
-                .copied()
-                .unwrap_or(false);
             let has_no_reaching_value =
                 capture_has_no_reaching_value(dataflow, InstrRef(instr_index), reg);
             let start_instr = captured_slot_start_instr(
@@ -281,12 +327,29 @@ fn collect_captured_slot_targets(
                 reg,
                 has_no_reaching_value,
             );
+            let key =
+                CapturedSlotKey::new(reg.index(), epochs.epoch_at(reg, InstrRef(start_instr)));
+            let child_writes = child_mutable_upvalues
+                .get(closure.proto.index())
+                .and_then(|mutable| mutable.get(capture_index))
+                .copied()
+                .unwrap_or(false);
+            let parent_writes_after_capture = parent_writes_after_capture_same_epoch(
+                cfg,
+                instr_index,
+                key,
+                &defs_by_slot,
+                &mut reachability,
+                &mut cyclic_blocks,
+            );
             captured_uses.push(CapturedSlotUse {
                 instr_index,
                 reg,
-                key: CapturedSlotKey::new(reg.index(), epochs.epoch_at(reg, InstrRef(start_instr))),
+                key,
                 start_instr,
-                requires_local: child_writes || has_no_reaching_value,
+                requires_local: child_writes
+                    || has_no_reaching_value
+                    || parent_writes_after_capture,
                 entry_local_safe: epochs.spans_entry(reg),
             });
         }
@@ -334,6 +397,62 @@ fn collect_captured_slot_targets(
         slot_targets,
         capture_targets,
     }
+}
+
+fn parent_writes_after_capture_same_epoch(
+    cfg: &Cfg,
+    capture_instr: usize,
+    key: CapturedSlotKey,
+    defs_by_slot: &BTreeMap<CapturedSlotKey, Vec<(usize, BlockRef)>>,
+    reachability: &mut BTreeMap<(BlockRef, BlockRef), bool>,
+    cyclic_blocks: &mut BTreeMap<BlockRef, bool>,
+) -> bool {
+    let capture_block = cfg.instr_to_block[capture_instr];
+    if !cfg.reachable_blocks.contains(&capture_block) {
+        return false;
+    }
+
+    defs_by_slot.get(&key).is_some_and(|defs| {
+        defs.iter().any(|&(def_instr, def_block)| {
+            if !cfg.reachable_blocks.contains(&def_block) {
+                return false;
+            }
+            if def_block != capture_block {
+                return cached_can_reach(cfg, capture_block, def_block, reachability);
+            }
+            def_instr > capture_instr
+                || (def_instr < capture_instr
+                    && block_has_real_cycle(cfg, capture_block, reachability, cyclic_blocks))
+        })
+    })
+}
+
+fn block_has_real_cycle(
+    cfg: &Cfg,
+    block: BlockRef,
+    reachability: &mut BTreeMap<(BlockRef, BlockRef), bool>,
+    cyclic_blocks: &mut BTreeMap<BlockRef, bool>,
+) -> bool {
+    if let Some(cyclic) = cyclic_blocks.get(&block) {
+        return *cyclic;
+    }
+    let cyclic = cfg.succs[block.index()].iter().any(|edge_ref| {
+        let succ = cfg.edges[edge_ref.index()].to;
+        succ == block || cached_can_reach(cfg, succ, block, reachability)
+    });
+    cyclic_blocks.insert(block, cyclic);
+    cyclic
+}
+
+fn cached_can_reach(
+    cfg: &Cfg,
+    from: BlockRef,
+    to: BlockRef,
+    reachability: &mut BTreeMap<(BlockRef, BlockRef), bool>,
+) -> bool {
+    *reachability
+        .entry((from, to))
+        .or_insert_with(|| cfg.can_reach(from, to))
 }
 
 fn captured_slot_start_instr(

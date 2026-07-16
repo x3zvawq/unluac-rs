@@ -31,10 +31,10 @@ pub use common::{
     BranchCandidate, BranchKind, BranchRegionFact, BranchValueMergeArm, BranchValueMergeCandidate,
     BranchValueMergeValue, GenericPhiMaterialization, GenericPhiSource, GotoReason,
     GotoRequirement, LoopCandidate, LoopExitValueMergeCandidate, LoopKindHint, LoopSourceBindings,
-    LoopValueArm, LoopValueIncoming, LoopValueMerge, PhiEdgeCopy, RegionFact, RegionKind,
-    ScopeCandidate, ScopeKind, ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNode,
-    ShortCircuitNodeRef, ShortCircuitTarget, ShortCircuitValueIncoming, StructureFacts,
-    StructurePlan, UnstructuredRegionLayout,
+    LoopValueArm, LoopValueIncoming, LoopValueMerge, PhiEdgeCopy, RegionFact, ScopeCandidate,
+    ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNode, ShortCircuitNodeRef,
+    ShortCircuitTarget, ShortCircuitValueIncoming, StructureFacts, StructurePlan,
+    UnstructuredRegionLayout,
 };
 #[cfg(feature = "decompile-debug")]
 pub use debug::dump_structure;

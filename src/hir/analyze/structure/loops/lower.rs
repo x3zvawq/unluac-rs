@@ -885,6 +885,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.suppress_unstructured_preheader_state_phis(block, &plan);
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
+        self.suppress_loop_tbc_boundaries(candidate_id, candidate);
         let mut suppressed = plan
             .states
             .iter()
@@ -1021,6 +1022,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.suppress_unstructured_preheader_state_phis(block, &plan);
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
+        self.suppress_loop_tbc_boundaries(candidate_id, candidate);
 
         self.visited.insert(block);
         stmts.extend(self.lower_block_prefix(block, false, target_overrides)?);
@@ -1072,6 +1074,38 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         })));
 
         Some(Some(exit))
+    }
+
+    /// 只消费 Structure 已绑定到本 candidate 的 VM cleanup。
+    ///
+    /// 调用点位于 for 的事务式结构探测内；后续 lowering 若失败，override checkpoint 会
+    /// 恢复这些指令，未证明归属的显式 close 因而仍能进入保守路径。
+    fn suppress_loop_tbc_boundaries(
+        &mut self,
+        candidate_id: LoopCandidateId,
+        candidate: &LoopCandidate,
+    ) {
+        let blocks = candidate
+            .body_scope_blocks
+            .union(&candidate.exits)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut boundaries = Vec::new();
+        for block in blocks {
+            let range = self.lowering.cfg.blocks[block.index()].instrs;
+            for index in range.start.index()..range.end() {
+                let instr_ref = InstrRef(index);
+                if matches!(self.lowering.proto.instrs[index], LowInstr::Close(_))
+                    && matches!(
+                        self.lowering.structure.cleanup_disposition(instr_ref),
+                        CleanupDisposition::LoopTbcBoundary(owner) if owner == candidate_id
+                    )
+                {
+                    boundaries.push(instr_ref);
+                }
+            }
+        }
+        self.overrides.suppress_instrs(boundaries);
     }
 }
 

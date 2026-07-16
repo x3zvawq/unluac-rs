@@ -233,32 +233,37 @@ pub(super) fn compute_irreducible_regions(cfg: &Cfg) -> Vec<IrreducibleRegion> {
 fn kosaraju_postorder(cfg: &Cfg, blocks: &[BlockRef]) -> Vec<BlockRef> {
     let mut visited = BTreeSet::new();
     let mut order = Vec::new();
+    let mut stack = Vec::with_capacity(blocks.len());
 
-    for block in blocks {
-        dfs_postorder(cfg, *block, &mut visited, &mut order);
-    }
+    for root in blocks.iter().copied() {
+        if !cfg.reachable_blocks.contains(&root) || !visited.insert(root) {
+            continue;
+        }
 
-    order
-}
+        stack.clear();
+        stack.push((root, 0));
+        while !stack.is_empty() {
+            let top = stack.len() - 1;
+            let (block, edge_index) = stack[top];
+            let successors = &cfg.succs[block.index()];
+            if edge_index == successors.len() {
+                order.push(block);
+                stack.pop();
+                continue;
+            }
 
-fn dfs_postorder(
-    cfg: &Cfg,
-    block: BlockRef,
-    visited: &mut BTreeSet<BlockRef>,
-    order: &mut Vec<BlockRef>,
-) {
-    if !cfg.reachable_blocks.contains(&block) || !visited.insert(block) {
-        return;
-    }
-
-    for edge_ref in &cfg.succs[block.index()] {
-        let succ = cfg.edges[edge_ref.index()].to;
-        if succ != cfg.exit_block {
-            dfs_postorder(cfg, succ, visited, order);
+            stack[top].1 += 1;
+            let successor = cfg.edges[successors[edge_index].index()].to;
+            if successor != cfg.exit_block
+                && cfg.reachable_blocks.contains(&successor)
+                && visited.insert(successor)
+            {
+                stack.push((successor, 0));
+            }
         }
     }
 
-    order.push(block);
+    order
 }
 
 fn has_self_loop(cfg: &Cfg, block: BlockRef) -> bool {

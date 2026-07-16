@@ -41,7 +41,7 @@ impl StructuredBodyLowerer<'_, '_> {
             return None;
         }
         let region = self.lowering.structure.region(then_arm.region_id)?;
-        if region.structureable || self.visited.contains(&region.entry) {
+        if self.visited.contains(&region.entry) {
             return None;
         }
 
@@ -151,7 +151,7 @@ impl StructuredBodyLowerer<'_, '_> {
             return None;
         }
         let region = self.lowering.structure.region(region_id)?;
-        if region.structureable || !region.blocks.contains(&start) {
+        if !region.blocks.contains(&start) {
             return None;
         }
         let layout = self.lowering.structure.unstructured_layout(region_id)?;

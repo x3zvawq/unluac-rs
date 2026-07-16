@@ -170,13 +170,14 @@ impl StructuredBodyLowerer<'_, '_> {
             );
         }
         let merge = plan.merge?;
-        let allowed_blocks = &self.branch_regions_by_header.get(&block)?.structured_blocks;
+        let region = self.branch_regions_by_header.get(&block)?;
+        let allowed_blocks = self.branch_region_blocks(region);
         let arm_context = BreakExitPadArmContext {
             post_loop,
             downstream_post_loop,
             target_overrides,
             states,
-            allowed_blocks,
+            allowed_blocks: &allowed_blocks,
         };
         let tail = if merge == post_loop || Some(merge) == downstream_post_loop {
             BreakExitBlock {

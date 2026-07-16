@@ -55,12 +55,15 @@ pub(super) fn analyze_short_circuits(
         &branch_by_header,
         branch_candidates,
     ));
+    let closed_linear_interiors =
+        branch_exit::closed_linear_interior_headers(cfg, &branch_by_header, &candidates);
     candidates.extend(branch_exit::analyze_guard_branch_exit_dag_candidates(
         proto,
         cfg,
         graph_facts,
         &branch_by_header,
         branch_candidates,
+        &closed_linear_interiors,
     ));
     candidates.extend(value_merge::analyze_value_merge_candidates(
         proto,

@@ -14,8 +14,8 @@
 //! - 普通 `while/repeat` 只保留形态 hint，不会伪造额外 binding 证据
 //! - branch 经共享 backedge pad 提前进入下一轮时，会在 branch 候选齐备后记录唯一
 //!   `continue_edges` owner，HIR 不再按 jump 形状猜测归属
-//! - 多条 break exit 若仅经 `Close + Jump` 或 `Close-only + fallthrough` pad 汇入同一
-//!   continuation，该处 live-out phi 仍归 loop owner；带赋值或调用的路径不透明
+//! - 多条 loop-exclusive exit 可先写回 live-out 再直接汇入同一 continuation；需要跨越
+//!   中间 pad 时仍只接受 `Close + Jump` 或 `Close-only + fallthrough`
 //! - for binding 的提前退出域在多个物理 exit 的共同后继前结束，不会穿过
 //!   cleanup pad 把循环变量身份带到 post-loop
 //! - repeat body 的首个条件可能让 natural-loop 暂时呈现为 while；若该 header 的局部
@@ -353,15 +353,28 @@ fn jump_only_to(proto: &LoweredProto, cfg: &Cfg, block: BlockRef, target: BlockR
         )
 }
 
+pub(super) struct RepeatRefinementInput<'a> {
+    pub(super) proto: &'a LoweredProto,
+    pub(super) cfg: &'a Cfg,
+    pub(super) graph_facts: &'a GraphFacts,
+    pub(super) dataflow: &'a DataflowFacts,
+    pub(super) branches: &'a [BranchCandidate],
+    pub(super) supplements: &'a [ShortCircuitCandidate],
+}
+
 pub(super) fn refine_short_circuit_repeat_candidates(
-    proto: &LoweredProto,
-    cfg: &Cfg,
-    graph_facts: &GraphFacts,
-    branches: &[BranchCandidate],
+    input: RepeatRefinementInput<'_>,
     short_circuits: &mut Vec<ShortCircuitCandidate>,
-    supplements: &[ShortCircuitCandidate],
     candidates: &mut [LoopCandidate],
 ) {
+    let RepeatRefinementInput {
+        proto,
+        cfg,
+        graph_facts,
+        dataflow,
+        branches,
+        supplements,
+    } = input;
     let current_by_exit = short_circuits_by_exit(short_circuits);
     let supplements_by_exit = short_circuits_by_exit(supplements);
     let mut accepted_supplements = Vec::new();
@@ -396,6 +409,7 @@ pub(super) fn refine_short_circuit_repeat_candidates(
                     target,
                     owned_sources.map(|_| short.header),
                     Option::<ShortCircuitCandidate>::None,
+                    Option::<BlockRef>::None,
                 )
             })
             .or_else(|| {
@@ -411,7 +425,7 @@ pub(super) fn refine_short_circuit_repeat_candidates(
                     backedge_target,
                     owned_sources,
                 )
-                .map(|(target, short)| (target, Some(short.header), Some(short.clone())))
+                .map(|(target, short)| (target, Some(short.header), Some(short.clone()), None))
             })
         };
         let grouped = match_at(candidate.header, Some(&backedge_sources));
@@ -427,10 +441,10 @@ pub(super) fn refine_short_circuit_repeat_candidates(
                 .flatten()
                 .or_else(|| {
                     direct_branch_repeat_continue_target(cfg, branches, candidate, backedge_source)
-                        .map(|target| (target, None, None))
+                        .map(|(target, exit_merge)| (target, None, None, Some(exit_merge)))
                 })
         });
-        let Some((continue_target, condition_header, supplement)) =
+        let Some((continue_target, condition_header, supplement, exit_merge)) =
             grouped.or_else(|| single.flatten())
         else {
             continue;
@@ -461,6 +475,9 @@ pub(super) fn refine_short_circuit_repeat_candidates(
             cfg,
             graph_facts,
         );
+        if let Some(exit_merge) = exit_merge {
+            install_refined_repeat_exit_merge(dataflow, candidate, exit_merge);
+        }
     }
 
     short_circuits.extend(accepted_supplements);
@@ -478,6 +495,28 @@ pub(super) fn refine_short_circuit_repeat_candidates(
         )
     });
     *short_circuits = unique;
+}
+
+fn install_refined_repeat_exit_merge(
+    dataflow: &DataflowFacts,
+    candidate: &mut LoopCandidate,
+    exit_merge: BlockRef,
+) {
+    let mut ownership_blocks = candidate.body_scope_blocks.clone();
+    ownership_blocks.extend(candidate.exits.iter().copied());
+    ownership_blocks.remove(&exit_merge);
+    let Some(exit_value_merge) =
+        loop_exit_value_merge_in_block(dataflow, exit_merge, &ownership_blocks)
+    else {
+        return;
+    };
+    candidate
+        .exit_value_merges
+        .retain(|candidate| candidate.exit != exit_merge);
+    candidate.exit_value_merges.push(exit_value_merge);
+    candidate
+        .exit_value_merges
+        .sort_by_key(|candidate| candidate.exit);
 }
 
 fn repeat_short_circuit_match<'a>(
@@ -554,10 +593,10 @@ fn repeat_short_circuit_continue_target(
         // while true 的 header 可以同时承载本轮正文和提前 break guard。若它经一条
         // 非 cleanup 正文路径到 jump latch，不能把这条路径反推成 repeat 尾条件；
         // Close 仍可作为 goto/repeat 的词法清理 pad，由后续 scope owner 接管。
-        || (short.header == candidate.header
-            && backedge_sources
-                .iter()
-                .any(|source| backedge_has_non_cleanup_prefix(proto, cfg, *source)))
+        || backedge_sources.iter().any(|source| {
+            (short.header == candidate.header || !short.blocks.contains(source))
+                && backedge_has_non_cleanup_prefix(proto, cfg, *source)
+        })
         || (candidate.kind_hint == LoopKindHint::WhileLike && !header_exit_rejoins_tail)
         || (short.nodes.len() == 1 && candidate.exits.len() != 1 && !header_exit_rejoins_tail)
         || !short.blocks.is_subset(&candidate.blocks)
@@ -623,7 +662,7 @@ fn direct_branch_repeat_continue_target(
     branches: &[BranchCandidate],
     candidate: &LoopCandidate,
     backedge_source: BlockRef,
-) -> Option<BlockRef> {
+) -> Option<(BlockRef, BlockRef)> {
     if candidate.kind_hint != LoopKindHint::WhileLike {
         return None;
     }
@@ -670,7 +709,7 @@ fn direct_branch_repeat_continue_target(
         return None;
     }
 
-    Some(backedge_source)
+    Some((backedge_source, merge))
 }
 
 fn refine_ambiguous_repeat_candidates(
@@ -1580,7 +1619,7 @@ fn analyze_loop_exit_value_merges(
     exits: &BTreeSet<BlockRef>,
     loop_blocks: &BTreeSet<BlockRef>,
 ) -> Vec<LoopExitValueMergeCandidate> {
-    let shared_merge = shared_transparent_loop_exit_merge(proto, cfg, exits);
+    let shared_merge = shared_loop_exit_merge(proto, cfg, exits, loop_blocks);
     let mut candidates = exits
         .iter()
         .copied()
@@ -1613,30 +1652,46 @@ fn loop_exit_value_merge_in_block(
     (!values.is_empty()).then_some(LoopExitValueMergeCandidate { exit, values })
 }
 
-fn shared_transparent_loop_exit_merge(
+fn shared_loop_exit_merge(
     proto: &LoweredProto,
     cfg: &Cfg,
     exits: &BTreeSet<BlockRef>,
+    loop_blocks: &BTreeSet<BlockRef>,
 ) -> Option<BlockRef> {
     if exits.len() < 2 {
         return None;
     }
-
-    let mut common = None::<BTreeSet<BlockRef>>;
-    for exit in exits.iter().copied() {
-        let mut reachable = BTreeSet::from([exit]);
-        if let Some(target) = transparent_loop_exit_target(proto, cfg, exit) {
-            reachable.insert(target);
+    // 出口块自身可以写回 live-out；只要它们直接汇入同一 block，merge 的 incoming
+    // 仍完整对应这些出口。透明性只约束继续跨越的中间 pad，不能反过来丢掉直接合流。
+    let merge = shared_unique_exit_successor(exits, cfg).or_else(|| {
+        let mut common = None::<BTreeSet<BlockRef>>;
+        for exit in exits.iter().copied() {
+            let mut reachable = BTreeSet::from([exit]);
+            if let Some(target) = transparent_loop_exit_target(proto, cfg, exit) {
+                reachable.insert(target);
+            }
+            common = Some(match common {
+                Some(common) => common.intersection(&reachable).copied().collect(),
+                None => reachable,
+            });
         }
-        common = Some(match common {
-            Some(common) => common.intersection(&reachable).copied().collect(),
-            None => reachable,
-        });
-    }
+        let mut common = common?.into_iter().filter(|block| *block != cfg.exit_block);
+        let merge = common.next()?;
+        common.next().is_none().then_some(merge)
+    })?;
 
-    let mut common = common?.into_iter().filter(|block| *block != cfg.exit_block);
-    let merge = common.next()?;
-    common.next().is_none().then_some(merge)
+    // ownership_blocks 会把这些 predecessor 的完整输出视为 loop 内值；只要某个块还能
+    // 从循环外进入，它的输出就可能已经混合外部路径，不能再整项交给 loop owner。
+    exits
+        .iter()
+        .filter(|exit| **exit != merge)
+        .all(|exit| {
+            cfg.preds[exit.index()].iter().all(|edge| {
+                let pred = cfg.edges[edge.index()].from;
+                !cfg.reachable_blocks.contains(&pred) || loop_blocks.contains(&pred)
+            })
+        })
+        .then_some(merge)
 }
 
 fn transparent_loop_exit_target(

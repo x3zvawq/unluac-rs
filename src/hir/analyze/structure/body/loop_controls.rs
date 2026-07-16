@@ -146,7 +146,7 @@ impl StructuredBodyLowerer<'_, '_> {
             && self
                 .branch_regions_by_header
                 .get(&block)
-                .is_some_and(|region| region.structured_blocks.contains(&stop))
+                .is_some_and(|region| self.branch_region_contains(region, stop))
         {
             return None;
         }
@@ -489,7 +489,18 @@ impl StructuredBodyLowerer<'_, '_> {
             && self
                 .branch_regions_by_header
                 .get(&block)
-                .is_some_and(|fact| fact.merge == continue_entry && fact.then_merge_preds.len() > 1)
+                .is_some_and(|fact| {
+                    fact.merge == continue_entry
+                        && self.lowering.cfg.preds[continue_entry.index()]
+                            .iter()
+                            .filter(|edge| {
+                                let pred = self.lowering.cfg.edges[edge.index()].from;
+                                pred != block && self.branch_region_contains(fact, pred)
+                            })
+                            .take(2)
+                            .count()
+                            > 1
+                })
             && self.lowering.cfg.unique_reachable_successor(continue_entry) == Some(continue_target)
         {
             let mut cond = self.lower_candidate_cond(block, candidate)?;

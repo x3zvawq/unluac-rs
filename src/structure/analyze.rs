@@ -77,7 +77,7 @@ pub(crate) fn analyze_structure_proto(
     let mut loop_candidates = loops::analyze_loops(proto, cfg, graph_facts, dataflow);
     let branch_candidates = branches::analyze_branches(cfg, graph_facts, &loop_candidates);
     let branch_region_facts =
-        branches::analyze_branch_regions(cfg, graph_facts, &loop_candidates, &branch_candidates);
+        branches::analyze_branch_regions(cfg, graph_facts, &branch_candidates);
     let irreducible_regions = helpers::compute_irreducible_regions(cfg);
     let mut short_circuit_candidates = short_circuit::analyze_short_circuits(
         proto,
@@ -89,12 +89,15 @@ pub(crate) fn analyze_structure_proto(
     let loop_condition_supplements =
         short_circuit::analyze_cfg_linear_branch_exits(proto, cfg, &branch_candidates);
     loops::refine_short_circuit_repeat_candidates(
-        proto,
-        cfg,
-        graph_facts,
-        &branch_candidates,
+        loops::RepeatRefinementInput {
+            proto,
+            cfg,
+            graph_facts,
+            dataflow,
+            branches: &branch_candidates,
+            supplements: &loop_condition_supplements,
+        },
         &mut short_circuit_candidates,
-        &loop_condition_supplements,
         &mut loop_candidates,
     );
     loops::assign_continue_edge_ownership(proto, cfg, &branch_candidates, &mut loop_candidates);
@@ -103,30 +106,18 @@ pub(crate) fn analyze_structure_proto(
         cfg,
         &loop_candidates,
         &branch_candidates,
-        &branch_region_facts,
         &irreducible_regions,
     );
-    let region_facts = regions::analyze_regions(
-        cfg,
-        &loop_candidates,
-        &branch_region_facts,
-        &irreducible_regions,
-    );
+    let region_facts = regions::analyze_regions(cfg, &irreducible_regions);
     let branch_value_merge_candidates = branch_values::analyze_branch_value_merges(
         cfg,
         graph_facts,
         dataflow,
-        &branch_region_facts,
+        &branch_candidates,
         &short_circuit_candidates,
         &loop_candidates,
     );
-    let scope_candidates = scope::analyze_scopes(
-        proto,
-        cfg,
-        graph_facts,
-        &loop_candidates,
-        &branch_region_facts,
-    );
+    let scope_candidates = scope::analyze_scopes(proto, cfg, graph_facts);
     let cleanup_dispositions =
         scope::analyze_cleanup_dispositions(proto, cfg, &loop_candidates, &scope_candidates);
     let mut plan = plan::build_structure_plan(

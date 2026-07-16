@@ -323,10 +323,85 @@ pub(in crate::hir) fn collapse_value_decision_expr(decision: &HirDecisionExpr) -
             collapse_value_node(decision, decision.entry, &mut memo)
         })
     } else {
+        if let Some(expr) = collapse_linear_value_chain(decision) {
+            return Some(expr);
+        }
         let mut memo = BTreeMap::new();
         collapse_value_node(decision, decision.entry, &mut memo)
             .or_else(|| synthesize::synthesize_value_decision_expr(decision))
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LinearValueOp {
+    And,
+    Or,
+}
+
+fn collapse_linear_value_chain(decision: &HirDecisionExpr) -> Option<HirExpr> {
+    let mut steps = Vec::new();
+    let mut current = decision.entry;
+    let tail = loop {
+        let node = decision.nodes.get(current.index())?;
+        match (&node.truthy, &node.falsy) {
+            (HirDecisionTarget::CurrentValue, HirDecisionTarget::Node(next)) => {
+                steps.push((LinearValueOp::Or, node.test.clone()));
+                current = *next;
+            }
+            (HirDecisionTarget::Node(next), HirDecisionTarget::CurrentValue) => {
+                steps.push((LinearValueOp::And, node.test.clone()));
+                current = *next;
+            }
+            (HirDecisionTarget::CurrentValue, HirDecisionTarget::Expr(expr)) => {
+                steps.push((LinearValueOp::Or, node.test.clone()));
+                break expr.clone();
+            }
+            (HirDecisionTarget::Expr(expr), HirDecisionTarget::CurrentValue) => {
+                steps.push((LinearValueOp::And, node.test.clone()));
+                break expr.clone();
+            }
+            (HirDecisionTarget::CurrentValue, HirDecisionTarget::CurrentValue) => {
+                break node.test.clone();
+            }
+            _ => return None,
+        }
+    };
+
+    let mut tail = tail;
+    let mut end = steps.len();
+    while end > 0 {
+        let op = steps[end - 1].0;
+        let start = steps[..end]
+            .iter()
+            .rposition(|(candidate, _)| *candidate != op)
+            .map_or(0, |index| index + 1);
+        let mut operands = steps[start..end]
+            .iter_mut()
+            .map(|(_, expr)| std::mem::replace(expr, HirExpr::Boolean(false)))
+            .collect::<Vec<_>>();
+        operands.push(tail);
+        tail = balanced_logical_expr(op, operands)?;
+        end = start;
+    }
+    Some(tail)
+}
+
+fn balanced_logical_expr(op: LinearValueOp, mut terms: Vec<HirExpr>) -> Option<HirExpr> {
+    while terms.len() > 1 {
+        let mut next = Vec::with_capacity(terms.len().div_ceil(2));
+        let mut current = std::mem::take(&mut terms).into_iter();
+        while let Some(lhs) = current.next() {
+            next.push(match current.next() {
+                Some(rhs) => match op {
+                    LinearValueOp::And => logical_and(lhs, rhs),
+                    LinearValueOp::Or => logical_or(lhs, rhs),
+                },
+                None => lhs,
+            });
+        }
+        terms = next;
+    }
+    terms.pop()
 }
 
 fn collapse_value_node(
@@ -566,7 +641,7 @@ fn collapse_condition_chain_with_fallback(
     }
 
     let mut current = node_ref;
-    let mut guard = None;
+    let mut guard_terms = Vec::new();
     let mut node_count = 0;
     let terminal = loop {
         let node = decision.nodes.get(current.index())?;
@@ -584,7 +659,7 @@ fn collapse_condition_chain_with_fallback(
         } else {
             node.test.clone().negate()
         };
-        guard = Some(guard.map_or(term.clone(), |prefix| logical_and(prefix, term)));
+        guard_terms.push(term);
         node_count += 1;
 
         let HirDecisionTarget::Node(next_ref) = next else {
@@ -615,7 +690,22 @@ fn collapse_condition_chain_with_fallback(
         HirDecisionTarget::Expr(expr) => expr.clone(),
         HirDecisionTarget::CurrentValue => return None,
     };
-    combine_condition_expr(guard?, terminal, shared)
+    combine_condition_expr(balanced_logical_and(guard_terms)?, terminal, shared)
+}
+
+fn balanced_logical_and(mut terms: Vec<HirExpr>) -> Option<HirExpr> {
+    while terms.len() > 1 {
+        let mut next = Vec::with_capacity(terms.len().div_ceil(2));
+        let mut current = std::mem::take(&mut terms).into_iter();
+        while let Some(lhs) = current.next() {
+            next.push(match current.next() {
+                Some(rhs) => logical_and(lhs, rhs),
+                None => lhs,
+            });
+        }
+        terms = next;
+    }
+    terms.pop()
 }
 
 fn collapse_condition_target(

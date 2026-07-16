@@ -598,45 +598,45 @@ impl StructuredBodyLowerer<'_, '_> {
         cond: &mut HirExpr,
     ) -> bool {
         let target_overrides = BTreeMap::new();
-        consumed_headers
+        let mut expr_overrides = BTreeMap::new();
+        let mut unresolved_prefix_temps = BTreeSet::new();
+        for consumed in consumed_headers
             .iter()
             .copied()
             .filter(|consumed| *consumed != header)
-            .all(|consumed| {
-                let Some(prefix) = self.lower_block_prefix(consumed, true, &target_overrides)
-                else {
+        {
+            let Some(prefix) = self.lower_block_prefix(consumed, true, &target_overrides) else {
+                return false;
+            };
+            if prefix.is_empty() {
+                continue;
+            }
+
+            let (block_overrides, all_prefix_temps) =
+                self.block_prefix_temp_expr_overrides(consumed);
+            for stmt in prefix {
+                let HirStmt::Assign(assign) = stmt else {
                     return false;
                 };
-                if prefix.is_empty() {
-                    return true;
+                if assign.targets.len() != assign.values.expr_len() {
+                    return false;
                 }
-
-                let (expr_overrides, all_prefix_temps) =
-                    self.block_prefix_temp_expr_overrides(consumed);
-                rewrite_expr_temps(cond, &expr_overrides);
-
-                let mut prefix_temps = BTreeSet::new();
-                for stmt in prefix {
-                    let HirStmt::Assign(assign) = stmt else {
+                for target in assign.targets {
+                    let HirLValue::Temp(temp) = target else {
                         return false;
                     };
-                    if assign.targets.len() != assign.values.expr_len() {
-                        return false;
-                    }
-                    for target in assign.targets {
-                        let HirLValue::Temp(temp) = target else {
-                            return false;
-                        };
-                        prefix_temps.insert(temp);
-                    }
+                    unresolved_prefix_temps.insert(temp);
                 }
-                let mut unresolved_prefix_temps = prefix_temps;
-                unresolved_prefix_temps.extend(all_prefix_temps);
-                for temp in expr_overrides.keys() {
-                    unresolved_prefix_temps.remove(temp);
-                }
-                !expr_has_temp_ref_in(cond, &unresolved_prefix_temps)
-            })
+            }
+            unresolved_prefix_temps.extend(all_prefix_temps);
+            for temp in block_overrides.keys() {
+                unresolved_prefix_temps.remove(temp);
+            }
+            expr_overrides.extend(block_overrides);
+        }
+
+        rewrite_expr_temps(cond, &expr_overrides);
+        !expr_has_temp_ref_in(cond, &unresolved_prefix_temps)
     }
 
     fn short_circuit_consumed_headers_have_escaping_prefix_defs(

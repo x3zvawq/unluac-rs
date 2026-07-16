@@ -34,10 +34,14 @@ pub(super) fn analyze_guard_branch_exit_dag_candidates(
     graph_facts: &GraphFacts,
     branch_by_header: &BTreeMap<BlockRef, &BranchCandidate>,
     branch_candidates: &[BranchCandidate],
+    closed_linear_interiors: &BTreeSet<BlockRef>,
 ) -> Vec<ShortCircuitCandidate> {
     let mut best_by_header = BTreeMap::<BlockRef, ShortCircuitCandidate>::new();
 
     for root in branch_candidates {
+        if closed_linear_interiors.contains(&root.header) {
+            continue;
+        }
         let Some(candidate) = GuardBranchExitDagBuilder::new(
             proto,
             cfg,
@@ -114,8 +118,11 @@ fn analyze_linear_branch_exit_candidates_with<'a>(
     mut next_header: impl FnMut(&'a BranchCandidate, &BTreeSet<BlockRef>) -> Option<BlockRef>,
 ) -> Vec<ShortCircuitCandidate> {
     let mut candidates = Vec::new();
+    let mut closed_linear_interiors = BTreeSet::new();
     for candidate in branch_candidates {
-        if candidate.kind != BranchKind::IfThen {
+        if candidate.kind != BranchKind::IfThen
+            || closed_linear_interiors.contains(&candidate.header)
+        {
             continue;
         }
 
@@ -182,7 +189,7 @@ fn analyze_linear_branch_exit_candidates_with<'a>(
 
         let blocks = headers.iter().copied().collect::<BTreeSet<_>>();
         let reducible = is_reducible_candidate(cfg, candidate.header, &blocks);
-        candidates.push(ShortCircuitCandidate {
+        let candidate = ShortCircuitCandidate {
             header: candidate.header,
             blocks,
             entry: ShortCircuitNodeRef(0),
@@ -193,7 +200,14 @@ fn analyze_linear_branch_exit_candidates_with<'a>(
             entry_value: None,
             value_incomings: Vec::new(),
             reducible,
-        });
+        };
+        if candidate.reducible
+            && let Some(interiors) =
+                closed_single_entry_linear_interiors(cfg, branch_by_header, &candidate)
+        {
+            closed_linear_interiors.extend(interiors);
+        }
+        candidates.push(candidate);
     }
 
     candidates.sort_by_key(|candidate| candidate.header);
@@ -204,6 +218,45 @@ fn analyze_linear_branch_exit_candidates_with<'a>(
             && left.nodes == right.nodes
     });
     candidates
+}
+
+pub(super) fn closed_linear_interior_headers(
+    cfg: &Cfg,
+    branch_by_header: &BTreeMap<BlockRef, &BranchCandidate>,
+    candidates: &[ShortCircuitCandidate],
+) -> BTreeSet<BlockRef> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.reducible)
+        .filter_map(|candidate| {
+            closed_single_entry_linear_interiors(cfg, branch_by_header, candidate)
+        })
+        .flatten()
+        .collect()
+}
+
+fn closed_single_entry_linear_interiors(
+    cfg: &Cfg,
+    branch_by_header: &BTreeMap<BlockRef, &BranchCandidate>,
+    candidate: &ShortCircuitCandidate,
+) -> Option<Vec<BlockRef>> {
+    let ShortCircuitExit::BranchExit { truthy, falsy } = candidate.exit else {
+        return None;
+    };
+    if branch_by_header.contains_key(&truthy) || branch_by_header.contains_key(&falsy) {
+        return None;
+    }
+
+    let interiors = candidate
+        .blocks
+        .iter()
+        .copied()
+        .filter(|block| *block != candidate.header)
+        .collect::<Vec<_>>();
+    interiors
+        .iter()
+        .all(|block| cfg.reachable_predecessors(*block).len() == 1)
+        .then_some(interiors)
 }
 
 pub(super) fn analyze_if_else_branch_exit_candidates(

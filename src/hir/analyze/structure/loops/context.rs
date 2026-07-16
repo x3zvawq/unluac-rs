@@ -90,7 +90,10 @@ impl StructuredBodyLowerer<'_, '_> {
         })
     }
 
-    pub(super) fn normalized_post_loop_successor(&self, post_loop: BlockRef) -> Option<BlockRef> {
+    pub(in crate::hir::analyze::structure) fn normalized_post_loop_successor(
+        &self,
+        post_loop: BlockRef,
+    ) -> Option<BlockRef> {
         if !self
             .lower_block_prefix(post_loop, false, &BTreeMap::new())?
             .is_empty()

@@ -297,6 +297,9 @@ fn format_cleanup_disposition(disposition: CleanupDisposition) -> String {
         CleanupDisposition::Unreachable => "unreachable".to_owned(),
         CleanupDisposition::ExplicitTbc => "explicit-tbc".to_owned(),
         CleanupDisposition::GenericFor(id) => format!("generic-for:c{}", id.index()),
+        CleanupDisposition::LoopTbcBoundary(id) => {
+            format!("loop-tbc-boundary:c{}", id.index())
+        }
         CleanupDisposition::ExplicitTbcBoundary => "explicit-tbc-boundary".to_owned(),
         CleanupDisposition::LexicalScope(id) => format!("lexical-scope:s{}", id.index()),
     }
@@ -426,16 +429,23 @@ fn write_branch_regions(output: &mut String, indent: &str, facts: &[BranchRegion
     }
 
     for fact in facts {
+        let structured = fact.explicit_structured_blocks().map_or_else(
+            || {
+                format!(
+                    "dom-subtree(#{}) - dom-subtree(#{})",
+                    fact.header.index(),
+                    fact.merge.index()
+                )
+            },
+            format_display_set,
+        );
         let _ = writeln!(
             output,
-            "{indent}    header=#{} kind={} merge=#{} flow={} structured={} then-preds={} else-preds={}",
+            "{indent}    header=#{} kind={} merge=#{} structured={}",
             fact.header.index(),
             format_branch_kind(fact.kind),
             fact.merge.index(),
-            format_display_set(&fact.flow_blocks),
-            format_display_set(&fact.structured_blocks),
-            format_display_set(&fact.then_merge_preds),
-            format_display_set(&fact.else_merge_preds),
+            structured,
         );
     }
 }
@@ -629,12 +639,9 @@ fn write_regions(output: &mut String, indent: &str, regions: &[RegionFact]) {
     for region in regions {
         let _ = writeln!(
             output,
-            "{indent}    entry=#{} kind={} exits={} reducible={} structureable={} blocks={}",
+            "{indent}    entry=#{} kind=irreducible exits={} blocks={}",
             region.entry.index(),
-            format_region_kind(region.kind),
             format_display_set(&region.exits),
-            region.reducible,
-            region.structureable,
             format_display_set(&region.blocks),
         );
     }
@@ -649,9 +656,8 @@ fn write_scopes(output: &mut String, indent: &str, scopes: &[ScopeCandidate]) {
     for scope in scopes {
         let _ = writeln!(
             output,
-            "{indent}    entry=#{} kind={} exit={} close-points={}",
+            "{indent}    entry=#{} kind=block-scope exit={} close-points={}",
             scope.entry.index(),
-            format_scope_kind(scope.kind),
             format_optional_block(scope.exit),
             format_display_set(&scope.close_points),
         );
@@ -727,26 +733,8 @@ fn write_loop_value_merge(output: &mut String, indent: &str, label: &str, value:
 fn format_goto_reason(reason: super::common::GotoReason) -> &'static str {
     match reason {
         super::common::GotoReason::IrreducibleFlow => "irreducible-flow",
-        super::common::GotoReason::CrossStructureJump => "cross-structure-jump",
         super::common::GotoReason::MultiEntryRegion => "multi-entry-region",
         super::common::GotoReason::UnstructuredBreakLike => "unstructured-break-like",
         super::common::GotoReason::UnstructuredContinueLike => "unstructured-continue-like",
-    }
-}
-
-fn format_region_kind(kind: super::common::RegionKind) -> &'static str {
-    match kind {
-        super::common::RegionKind::Linear => "linear",
-        super::common::RegionKind::BranchRegion => "branch-region",
-        super::common::RegionKind::LoopRegion => "loop-region",
-        super::common::RegionKind::Irreducible => "irreducible",
-    }
-}
-
-fn format_scope_kind(kind: super::common::ScopeKind) -> &'static str {
-    match kind {
-        super::common::ScopeKind::BlockScope => "block-scope",
-        super::common::ScopeKind::LoopScope => "loop-scope",
-        super::common::ScopeKind::BranchScope => "branch-scope",
     }
 }

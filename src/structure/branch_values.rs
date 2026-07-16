@@ -15,23 +15,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::structure::{BlockRef, Cfg, DataflowFacts, GraphFacts};
 
 use super::common::{
-    BranchKind, BranchRegionFact, BranchValueMergeCandidate, LoopCandidate, ShortCircuitCandidate,
+    BranchCandidate, BranchKind, BranchValueMergeCandidate, LoopCandidate, ShortCircuitCandidate,
     ShortCircuitExit,
 };
 use super::helpers::collect_merge_arm_preds;
 use super::phi_facts::{BranchValueMergeContext, branch_value_merges_in_block};
+use super::{branches::for_loop_body_entry, branches::for_loop_exit_owner};
 
 #[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 enum CandidateSource {
     BranchRegion,
-    GuardShortCircuit,
+    BranchExitShortCircuit,
 }
 
 pub(super) fn analyze_branch_value_merges(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
-    branch_regions: &[BranchRegionFact],
+    branch_candidates: &[BranchCandidate],
     short_circuit_candidates: &[ShortCircuitCandidate],
     loop_candidates: &[LoopCandidate],
 ) -> Vec<BranchValueMergeCandidate> {
@@ -46,21 +47,22 @@ pub(super) fn analyze_branch_value_merges(
         })
         .collect::<BTreeSet<_>>();
 
-    let candidates = branch_regions
+    let candidates = branch_candidates
         .iter()
-        .filter_map(|branch_region| {
+        .filter_map(|branch_candidate| {
             analyze_branch_value_merge_candidate(
                 cfg,
                 graph_facts,
                 dataflow,
-                branch_region,
+                branch_candidate,
                 &short_circuit_merges,
                 &loop_owned_preds_by_header,
+                loop_candidates,
             )
         })
         .map(|candidate| (CandidateSource::BranchRegion, candidate))
         .chain(
-            analyze_guard_short_circuit_branch_value_merges(
+            analyze_branch_exit_short_circuit_branch_value_merges(
                 cfg,
                 graph_facts,
                 dataflow,
@@ -68,7 +70,7 @@ pub(super) fn analyze_branch_value_merges(
                 &loop_owned_preds_by_header,
             )
             .into_iter()
-            .map(|candidate| (CandidateSource::GuardShortCircuit, candidate)),
+            .map(|candidate| (CandidateSource::BranchExitShortCircuit, candidate)),
         );
 
     let mut best_by_region =
@@ -91,7 +93,7 @@ pub(super) fn analyze_branch_value_merges(
         .collect()
 }
 
-fn analyze_guard_short_circuit_branch_value_merges(
+fn analyze_branch_exit_short_circuit_branch_value_merges(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
@@ -105,25 +107,41 @@ fn analyze_guard_short_circuit_branch_value_merges(
             continue;
         };
 
-        // 常规 guard 的 merge 会后支配 body，直接复用 GraphFacts 可避免为每个顺序
-        // branch 重跑一次全图 BFS。early-return 等不满足后支配的形状才退回普通可达性；
-        // 两个方向都保留，确保 LuaJIT 反向比较仍按真实控制流分类。
-        let (truthy_reaches_falsy, falsy_reaches_truthy) =
-            if graph_facts.post_dominates(falsy, truthy) {
-                (true, false)
-            } else if graph_facts.post_dominates(truthy, falsy) {
-                (false, true)
-            } else {
-                (cfg.can_reach(truthy, falsy), cfg.can_reach(falsy, truthy))
-            };
-        let (body, merge, body_is_truthy) = match (truthy_reaches_falsy, falsy_reaches_truthy) {
-            (true, false) => (truthy, falsy, true),
-            (false, true) => (falsy, truthy, false),
-            _ => continue,
+        // early-return guard 的 body 不一定被 continuation 后支配，但只要可达关系是
+        // 单向的，另一出口仍是实际 merge；双臂互不可达时才取共同后支配点。
+        let merge = if graph_facts.post_dominates(falsy, truthy) {
+            falsy
+        } else if graph_facts.post_dominates(truthy, falsy) {
+            truthy
+        } else {
+            match (cfg.can_reach(truthy, falsy), cfg.can_reach(falsy, truthy)) {
+                (true, false) => falsy,
+                (false, true) => truthy,
+                _ => {
+                    let Some(merge) = graph_facts.nearest_common_postdom(truthy, falsy) else {
+                        continue;
+                    };
+                    merge
+                }
+            }
         };
+        if merge == cfg.exit_block || dataflow.phi_candidates_in_block(merge).is_empty() {
+            continue;
+        }
 
-        let then_preds = collect_merge_arm_preds(cfg, body, merge);
-        let else_preds = short.branch_exit_leaf_preds(!body_is_truthy);
+        // 短路根表达的是完整条件 DAG。两侧在 merge 前各自到达哪些 predecessor，
+        // 应由这份根事实一次性划分；末端 branch header 可能被更早的短路边绕过，
+        // 因而不能用“header 支配 merge”作为完整性的必要条件。
+        let then_preds = if truthy == merge {
+            short.branch_exit_leaf_preds(true)
+        } else {
+            collect_merge_arm_preds(cfg, truthy, merge)
+        };
+        let else_preds = if falsy == merge {
+            short.branch_exit_leaf_preds(false)
+        } else {
+            collect_merge_arm_preds(cfg, falsy, merge)
+        };
         if then_preds.is_empty() || else_preds.is_empty() || !then_preds.is_disjoint(&else_preds) {
             continue;
         }
@@ -152,12 +170,21 @@ fn analyze_branch_value_merge_candidate(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
-    branch_region: &BranchRegionFact,
+    branch: &BranchCandidate,
     short_circuit_merges: &BTreeSet<(BlockRef, BlockRef, Option<crate::transformer::Reg>)>,
     loop_owned_preds_by_header: &BTreeMap<BlockRef, BTreeSet<BlockRef>>,
+    loop_candidates: &[LoopCandidate],
 ) -> Option<BranchValueMergeCandidate> {
-    let merge = branch_region.merge;
-    let then_preds = &branch_region.then_merge_preds;
+    let merge = branch.merge?;
+    if dataflow.phi_candidates_in_block(merge).is_empty()
+        || (!graph_facts.dominates(branch.header, merge)
+            && !loop_owned_preds_by_header.contains_key(&merge))
+    {
+        return None;
+    }
+
+    let (then_preds, explicit_else_preds) =
+        branch_merge_preds(cfg, graph_facts, branch, merge, loop_candidates);
 
     // IfElse：两臂的 merge predecessors 分别来自 then/else 侧。
     // IfThen：只有 then 侧有 merge preds，else 侧相当于 header 直接跳到 merge。
@@ -165,10 +192,10 @@ fn analyze_branch_value_merge_candidate(
     // Guard 的另一侧是外部 continuation，不是由两臂共同流入的 merge；这类形状
     // 没有可分配给 then/else 的值合流 owner。
     let header_as_else_preds;
-    let else_preds = match branch_region.kind {
-        BranchKind::IfElse => &branch_region.else_merge_preds,
+    let else_preds = match branch.kind {
+        BranchKind::IfElse => &explicit_else_preds,
         BranchKind::IfThen => {
-            header_as_else_preds = BTreeSet::from([branch_region.header]);
+            header_as_else_preds = BTreeSet::from([branch.header]);
             &header_as_else_preds
         }
         BranchKind::Guard => return None,
@@ -179,21 +206,72 @@ fn analyze_branch_value_merge_candidate(
     }
 
     let values = branch_value_merges_in_block(
-        &BranchValueMergeContext::new(cfg, branch_region.header, graph_facts, dataflow),
+        &BranchValueMergeContext::new(cfg, branch.header, graph_facts, dataflow),
         merge,
-        then_preds,
+        &then_preds,
         else_preds,
         loop_owned_preds_by_header.get(&merge),
     )
     .into_iter()
-    .filter(|value| !short_circuit_merges.contains(&(branch_region.header, merge, Some(value.reg))))
+    .filter(|value| !short_circuit_merges.contains(&(branch.header, merge, Some(value.reg))))
     .collect::<Vec<_>>();
 
     (!values.is_empty()).then_some(BranchValueMergeCandidate {
-        header: branch_region.header,
+        header: branch.header,
         merge,
         values,
     })
+}
+
+fn branch_merge_preds(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    candidate: &BranchCandidate,
+    merge: BlockRef,
+    loop_candidates: &[LoopCandidate],
+) -> (BTreeSet<BlockRef>, BTreeSet<BlockRef>) {
+    let mut then_preds = collect_merge_arm_preds(cfg, candidate.then_entry, merge);
+    let Some(else_entry) = candidate.else_entry else {
+        return (then_preds, BTreeSet::new());
+    };
+    let mut else_preds = collect_merge_arm_preds(cfg, else_entry, merge);
+    let disambiguate_overlap = graph_facts
+        .nearest_common_postdom(candidate.then_entry, else_entry)
+        .is_some_and(|strict_merge| {
+            strict_merge != merge
+                && for_loop_exit_owner(
+                    cfg,
+                    loop_candidates,
+                    candidate.header,
+                    candidate.then_entry,
+                    else_entry,
+                    strict_merge,
+                )
+                .is_some_and(|owner| {
+                    for_loop_body_entry(cfg, owner) == Some(candidate.header)
+                        && owner.blocks.contains(&candidate.then_entry)
+                        && owner.blocks.contains(&else_entry)
+                })
+        });
+    if !disambiguate_overlap {
+        return (then_preds, else_preds);
+    }
+
+    let overlap = then_preds
+        .intersection(&else_preds)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    then_preds.retain(|pred| {
+        !overlap.contains(pred)
+            || !graph_facts.dominates(else_entry, *pred)
+            || graph_facts.dominates(candidate.then_entry, *pred)
+    });
+    else_preds.retain(|pred| {
+        !overlap.contains(pred)
+            || !graph_facts.dominates(candidate.then_entry, *pred)
+            || graph_facts.dominates(else_entry, *pred)
+    });
+    (then_preds, else_preds)
 }
 
 fn loop_owned_preds_by_header(

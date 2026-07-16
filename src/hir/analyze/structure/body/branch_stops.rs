@@ -192,7 +192,7 @@ impl StructuredBodyLowerer<'_, '_> {
                 if nested.kind_hint != LoopKindHint::NumericForLike
                     || nested.header == active_candidate.header
                     || !nested.blocks.is_subset(&active_candidate.body_scope_blocks)
-                    || !region.structured_blocks.contains(&candidate)
+                    || !self.branch_region_contains(region, candidate)
                     || consumed_blocks.contains(&candidate)
                     || candidate == block
                     || candidate == stop
@@ -284,10 +284,9 @@ impl StructuredBodyLowerer<'_, '_> {
         };
         let implicit_else_entry = else_entry.unwrap_or(region.merge);
         let mut fallback_continuation = None;
-        for candidate in region
-            .structured_blocks
-            .iter()
-            .copied()
+        for candidate in self
+            .branch_region_blocks(region)
+            .into_iter()
             .filter(|candidate| *candidate != block)
             .filter(|candidate| !consumed_blocks.contains(candidate))
             .filter(|candidate| *candidate != stop)

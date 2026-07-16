@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::structure::{BlockRef, DefId, EdgeRef, PhiId, SsaValue};
 use crate::transformer::{InstrRef, Reg, RegRange};
 
+use super::cfg::GraphFacts;
+
 use super::plan::{
     BlockOwner, BranchCandidateId, BranchValueMergeId, CleanupDisposition, EdgeOwner,
     GotoRequirementId, LoopCandidateId, PhiIncomingDisposition, RegionId,
@@ -279,18 +281,51 @@ pub enum BranchKind {
 
 /// 一个普通 branch 区域的共享边界事实。
 ///
-/// `flow_blocks` 表示 CFG 角度里这片 branch 实际覆盖到的 block，
-/// `structured_blocks` 则额外收紧到“仍受 header 支配、适合结构化吸收”的子集。
-/// `goto / scope / regions` 都消费这份事实，不应再各自重复扫描分支区域。
+/// 普通非回环 branch 的结构区域精确等于 `header` 的支配子树减去 `merge` 的
+/// 支配子树，因此不为每个嵌套 branch 复制一份 block 集合。只有 `merge` 支配
+/// `header` 的循环边界无法用这个差集表达，才保留显式集合。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchRegionFact {
     pub header: BlockRef,
     pub merge: BlockRef,
     pub kind: BranchKind,
-    pub flow_blocks: BTreeSet<BlockRef>,
-    pub structured_blocks: BTreeSet<BlockRef>,
-    pub then_merge_preds: BTreeSet<BlockRef>,
-    pub else_merge_preds: BTreeSet<BlockRef>,
+    pub(super) explicit_structured_blocks: Option<BTreeSet<BlockRef>>,
+}
+
+impl BranchRegionFact {
+    pub fn contains_structured_block(&self, graph_facts: &GraphFacts, block: BlockRef) -> bool {
+        self.explicit_structured_blocks.as_ref().map_or_else(
+            || {
+                graph_facts.dominates(self.header, block)
+                    && !graph_facts.dominates(self.merge, block)
+            },
+            |blocks| blocks.contains(&block),
+        )
+    }
+
+    pub fn materialize_structured_blocks(&self, graph_facts: &GraphFacts) -> BTreeSet<BlockRef> {
+        self.explicit_structured_blocks.clone().unwrap_or_else(|| {
+            let Some(start) = graph_facts.dominator_tree.preorder_index[self.header.index()] else {
+                return BTreeSet::new();
+            };
+            let Some(end) = graph_facts.dominator_tree.subtree_end[self.header.index()] else {
+                return BTreeSet::new();
+            };
+            graph_facts
+                .dominator_tree
+                .order
+                .get(start..end)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|block| self.contains_structured_block(graph_facts, *block))
+                .collect()
+        })
+    }
+
+    pub(super) fn explicit_structured_blocks(&self) -> Option<&BTreeSet<BlockRef>> {
+        self.explicit_structured_blocks.as_ref()
+    }
 }
 
 /// 一个不可规约区域的共享边界事实。
@@ -686,7 +721,6 @@ pub struct GotoRequirement {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum GotoReason {
     IrreducibleFlow,
-    CrossStructureJump,
     MultiEntryRegion,
     UnstructuredBreakLike,
     UnstructuredContinueLike,
@@ -698,18 +732,6 @@ pub struct RegionFact {
     pub blocks: BTreeSet<BlockRef>,
     pub entry: BlockRef,
     pub exits: BTreeSet<BlockRef>,
-    pub kind: RegionKind,
-    pub reducible: bool,
-    pub structureable: bool,
-}
-
-/// 区域种类。
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub enum RegionKind {
-    Linear,
-    BranchRegion,
-    LoopRegion,
-    Irreducible,
 }
 
 /// 一个潜在的词法 scope。
@@ -718,13 +740,4 @@ pub struct ScopeCandidate {
     pub entry: BlockRef,
     pub exit: Option<BlockRef>,
     pub close_points: Vec<InstrRef>,
-    pub kind: ScopeKind,
-}
-
-/// scope 形态。
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub enum ScopeKind {
-    BlockScope,
-    LoopScope,
-    BranchScope,
 }

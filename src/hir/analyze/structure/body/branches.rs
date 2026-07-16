@@ -330,12 +330,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if stop != Some(continue_target) || !self.block_is_active_loop_escape(boundary) {
             return None;
         }
-        region.structured_blocks.iter().copied().find(|tail| {
+        let region_blocks = self.branch_region_blocks(region);
+        region_blocks.iter().copied().find(|tail| {
             *tail != plan.then_entry
                 && *tail != else_entry
                 && self.branch_candidate_for_header(*tail).is_none()
                 && !self.has_loop_header(*tail)
-                && self.region_predecessor_count(*tail, &region.structured_blocks) >= 2
+                && self.region_predecessor_count(*tail, &region_blocks) >= 2
                 && self.shared_tail_reaches_loop_continue(*tail, continue_target, loop_context)
                 && [plan.then_entry, else_entry].into_iter().any(|entry| {
                     self.entry_has_continue_owner_before_tail(
@@ -492,7 +493,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 && stop.is_some_and(|stop| {
                     self.branch_regions_by_header
                         .get(&plan.consumed_headers[0])
-                        .is_some_and(|region| region.structured_blocks.contains(&stop))
+                        .is_some_and(|region| self.branch_region_contains(region, stop))
                 })
         }) {
             return None;
@@ -521,10 +522,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let merge_is_explicit = plan.merge.is_some();
         let then_is_shared = else_entry != merge
             && plan.then_entry != merge
-            && (merge_is_explicit
-                || self
-                    .loop_candidate_from_preheader(else_entry)
-                    .is_some_and(|candidate| candidate.exits.contains(&plan.then_entry)))
+            && (merge_is_explicit || self.preheader_loop_exits_to(else_entry, plan.then_entry))
             && self.entry_reaches_shared_continuation(else_entry, plan.then_entry, merge);
         if then_is_shared {
             return Some(SharedContinuationBranch {
@@ -536,16 +534,22 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         let else_is_shared = else_entry != merge
             && plan.then_entry != merge
-            && (merge_is_explicit
-                || self
-                    .loop_candidate_from_preheader(plan.then_entry)
-                    .is_some_and(|candidate| candidate.exits.contains(&else_entry)))
+            && (merge_is_explicit || self.preheader_loop_exits_to(plan.then_entry, else_entry))
             && self.entry_reaches_shared_continuation(plan.then_entry, else_entry, merge);
         else_is_shared.then_some(SharedContinuationBranch {
             gated_entry: plan.then_entry,
             shared_entry: else_entry,
             negate_cond: false,
         })
+    }
+
+    fn preheader_loop_exits_to(&self, preheader: BlockRef, target: BlockRef) -> bool {
+        self.loop_candidate_from_preheader(preheader)
+            .is_some_and(|candidate| {
+                candidate.exits.iter().any(|exit| {
+                    *exit == target || self.normalized_post_loop_successor(*exit) == Some(target)
+                })
+            })
     }
 
     fn terminal_loop_continuation_branch(
@@ -736,7 +740,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let loop_context = ActiveLoopContext {
             candidate_id: loop_candidate_id,
             header: block,
-            loop_blocks: region.structured_blocks.clone(),
+            loop_blocks: self.branch_region_blocks(region),
             post_loop: merge,
             downstream_post_loop: None,
             continue_target: None,
@@ -784,8 +788,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     ) -> Option<BlockRef> {
         let merge = candidate.merge?;
         let region = self.branch_regions_by_header.get(&block).copied()?;
-        region
-            .structured_blocks
+        let region_blocks = self.branch_region_blocks(region);
+        region_blocks
             .iter()
             .copied()
             .filter(|tail| {
@@ -795,7 +799,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     && self.branch_candidate_for_header(*tail).is_none()
                     && !self.has_loop_header(*tail)
                     && self.linear_tail_target(*tail) == Some(merge)
-                    && self.region_predecessor_count(*tail, &region.structured_blocks) >= 2
+                    && self.region_predecessor_count(*tail, &region_blocks) >= 2
                     && self.branch_arm_reaches_target_or_boundary_or_terminate(
                         candidate.then_entry,
                         *tail,

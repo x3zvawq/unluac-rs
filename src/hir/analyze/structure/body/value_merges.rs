@@ -55,7 +55,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         // 与 try_lower_value_merge_branch 同理：SC 系列快捷路径只处理一个
         // result_reg，BVM 认领的其他 phi 会因分支结构被消费而孤立。
-        if let Some(bvm) = self.branch_value_merge_for_header(block)
+        if let Some(bvm) = self.branch_value_merge_for_region(block, merge)
             && bvm
                 .values
                 .iter()
@@ -94,17 +94,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.visited.extend(value_merge_skipped_blocks(short));
         self.overrides.suppress_phi(plan.phi_id);
 
-        stmts.push(assign_stmt(
-            vec![HirLValue::Temp(plan.target_temp)],
-            vec![plan.init_value],
-        ));
+        let target = self.lowering.bindings.lvalue_for_temp(plan.target_temp);
+        if lvalue_as_expr(&target).as_ref() != Some(&plan.init_value) {
+            stmts.push(assign_stmt(vec![target.clone()], vec![plan.init_value]));
+        }
         stmts.push(branch_stmt(
             plan.cond,
             HirBlock {
-                stmts: vec![assign_stmt(
-                    vec![HirLValue::Temp(plan.target_temp)],
-                    vec![plan.assigned_value],
-                )],
+                stmts: vec![assign_stmt(vec![target], vec![plan.assigned_value])],
             },
             None,
         ));
@@ -165,7 +162,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // BranchValueMerge 认领的其他 phi，它们的分支结构已被 SC 消费——正常
         // 分支路径不会再运行。这里利用 SC 的树结构，为每个孤立的 BVM phi 构建
         // 平行的 Decision 表达式，避免这些 phi 因无人物化而丢失。
-        if let Some(bvm) = self.branch_value_merge_for_header(block) {
+        if let Some(bvm) = self.branch_value_merge_for_region(block, merge) {
             for value in &bvm.values {
                 if Some(value.phi_id) == short.result_phi_id {
                     continue;
@@ -237,9 +234,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let Some(result_phi_id) = short.result_phi_id else {
             return false;
         };
+        let ShortCircuitExit::ValueMerge(merge) = short.exit else {
+            return false;
+        };
 
         short.nodes.iter().any(|node| {
-            self.branch_value_merge_for_header(node.header)
+            self.branch_value_merge_for_region(node.header, merge)
                 .is_some_and(|bvm| {
                     bvm.values.len() > 1
                         && bvm.values.iter().any(|value| value.phi_id == result_phi_id)
@@ -267,7 +267,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // 还认领了其他 phi，SC 消费分支结构后那些 phi 就无人物化。此时退让给
         // 普通分支路径：BVM 通过 target_overrides 处理自己的 phi，SC 的 phi 则
         // 在 merge block 的 lower_phi_materialization 中恢复。
-        if let Some(bvm) = self.branch_value_merge_for_header(block)
+        if let Some(bvm) = self.branch_value_merge_for_region(block, merge)
             && bvm
                 .values
                 .iter()

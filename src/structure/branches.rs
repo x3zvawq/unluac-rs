@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::structure::{BlockRef, Cfg, DominatorTree, GraphFacts};
 
 use super::common::{BranchCandidate, BranchKind, BranchRegionFact, LoopCandidate, LoopKindHint};
-use super::helpers::{collect_forward_region_blocks, collect_merge_arm_preds};
+use super::helpers::collect_forward_region_blocks;
 
 pub(super) fn analyze_branches(
     cfg: &Cfg,
@@ -165,107 +165,41 @@ fn refine_loop_iteration_if_else_branches(
 pub(super) fn analyze_branch_regions(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
-    loop_candidates: &[LoopCandidate],
     branch_candidates: &[BranchCandidate],
 ) -> Vec<BranchRegionFact> {
-    let mut branch_regions = Vec::new();
-
-    for candidate in branch_candidates {
-        let Some(merge) = candidate.merge else {
-            continue;
-        };
-        let disambiguate_overlap = candidate.else_entry.is_some_and(|else_entry| {
-            graph_facts
-                .nearest_common_postdom(candidate.then_entry, else_entry)
-                .is_some_and(|strict_merge| {
-                    strict_merge != merge
-                        && for_loop_exit_owner(
-                            cfg,
-                            loop_candidates,
-                            candidate.header,
-                            candidate.then_entry,
-                            else_entry,
-                            strict_merge,
-                        )
-                        .is_some_and(|owner| {
-                            for_loop_body_entry(cfg, owner) == Some(candidate.header)
-                                && owner.blocks.contains(&candidate.then_entry)
-                                && owner.blocks.contains(&else_entry)
-                        })
-                })
-        });
-        let (then_merge_preds, else_merge_preds) = if disambiguate_overlap {
-            collect_branch_merge_preds(cfg, graph_facts, candidate, merge)
-        } else {
-            (
-                collect_merge_arm_preds(cfg, candidate.then_entry, merge),
-                candidate
-                    .else_entry
-                    .map(|else_entry| collect_merge_arm_preds(cfg, else_entry, merge))
-                    .unwrap_or_default(),
-            )
-        };
-
-        branch_regions.push(BranchRegionFact {
-            header: candidate.header,
-            merge,
-            kind: candidate.kind,
-            flow_blocks: collect_branch_region_blocks(cfg, candidate, merge, None),
-            structured_blocks: collect_branch_region_blocks(
-                cfg,
-                candidate,
+    let mut branch_regions = branch_candidates
+        .iter()
+        .filter_map(|candidate| {
+            let merge = candidate.merge?;
+            let explicit_structured_blocks =
+                graph_facts.dominates(merge, candidate.header).then(|| {
+                    collect_branch_region_blocks(cfg, candidate, merge, &graph_facts.dominator_tree)
+                });
+            Some(BranchRegionFact {
+                header: candidate.header,
                 merge,
-                Some(&graph_facts.dominator_tree),
-            ),
-            then_merge_preds,
-            else_merge_preds,
-        });
-    }
+                kind: candidate.kind,
+                explicit_structured_blocks,
+            })
+        })
+        .collect::<Vec<_>>();
 
     branch_regions.sort_by_key(|fact| (fact.header, fact.merge));
     branch_regions
-}
-
-fn collect_branch_merge_preds(
-    cfg: &Cfg,
-    graph_facts: &GraphFacts,
-    candidate: &BranchCandidate,
-    merge: BlockRef,
-) -> (BTreeSet<BlockRef>, BTreeSet<BlockRef>) {
-    let mut then_preds = collect_merge_arm_preds(cfg, candidate.then_entry, merge);
-    let Some(else_entry) = candidate.else_entry else {
-        return (then_preds, BTreeSet::new());
-    };
-    let mut else_preds = collect_merge_arm_preds(cfg, else_entry, merge);
-    let overlap = then_preds
-        .intersection(&else_preds)
-        .copied()
-        .collect::<BTreeSet<_>>();
-    then_preds.retain(|pred| {
-        !overlap.contains(pred)
-            || !graph_facts.dominates(else_entry, *pred)
-            || graph_facts.dominates(candidate.then_entry, *pred)
-    });
-    else_preds.retain(|pred| {
-        !overlap.contains(pred)
-            || !graph_facts.dominates(candidate.then_entry, *pred)
-            || graph_facts.dominates(else_entry, *pred)
-    });
-    (then_preds, else_preds)
 }
 
 fn collect_branch_region_blocks(
     cfg: &Cfg,
     candidate: &BranchCandidate,
     merge: BlockRef,
-    dom_tree: Option<&DominatorTree>,
+    dom_tree: &DominatorTree,
 ) -> BTreeSet<BlockRef> {
     let mut blocks = BTreeSet::from([candidate.header]);
     blocks.extend(collect_forward_region_blocks(
         cfg,
         std::iter::once(candidate.then_entry).chain(candidate.else_entry),
         Some(merge),
-        dom_tree.map(|tree| (candidate.header, tree)),
+        Some((candidate.header, dom_tree)),
     ));
 
     blocks
@@ -606,7 +540,7 @@ fn classify_for_loop_exit_branch(
     }
 }
 
-fn for_loop_exit_owner<'a>(
+pub(super) fn for_loop_exit_owner<'a>(
     cfg: &Cfg,
     loop_candidates: &'a [LoopCandidate],
     header: BlockRef,
@@ -637,7 +571,7 @@ fn for_loop_exits_at(cfg: &Cfg, candidate: &LoopCandidate, boundary: BlockRef) -
                 .all(|exit| cfg.unique_reachable_successor(*exit) == Some(boundary)))
 }
 
-fn for_loop_body_entry(cfg: &Cfg, candidate: &LoopCandidate) -> Option<BlockRef> {
+pub(super) fn for_loop_body_entry(cfg: &Cfg, candidate: &LoopCandidate) -> Option<BlockRef> {
     match candidate.kind_hint {
         LoopKindHint::NumericForLike => Some(candidate.header),
         LoopKindHint::GenericForLike => {

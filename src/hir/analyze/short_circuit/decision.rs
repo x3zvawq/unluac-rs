@@ -470,13 +470,6 @@ pub(crate) enum DecisionEdge {
     Leaf(HirDecisionTarget),
 }
 
-/// 共享 DAG 恢复本身就是一次图重建过程，这里把中间状态收进一个结构体里，
-/// 避免在递归构图时把 `remap/nodes` 之类的细节参数层层外泄。
-struct DecisionBuildState {
-    remap: BTreeMap<ShortCircuitNodeRef, HirDecisionNodeRef>,
-    nodes: Vec<HirDecisionNode>,
-}
-
 pub(crate) fn build_decision_expr<FTest, FTarget>(
     lowering: &ProtoLowering<'_>,
     short: &ShortCircuitCandidate,
@@ -488,101 +481,57 @@ where
     FTest: Fn(&ProtoLowering<'_>, BlockRef) -> Option<HirExpr>,
     FTarget: Fn(&ShortCircuitNode, &ShortCircuitTarget) -> Option<DecisionEdge>,
 {
-    let mut state = DecisionBuildState {
-        remap: BTreeMap::new(),
-        nodes: Vec::new(),
-    };
-    let entry = build_decision_node(
-        lowering,
-        short,
-        entry,
-        &test_for_block,
-        &target_for_edge,
-        &mut state,
-    )?;
+    let mut remap = BTreeMap::new();
+    let mut pending = Vec::new();
+    let mut stack = vec![entry];
+
+    while let Some(node_ref) = stack.pop() {
+        if remap.contains_key(&node_ref) {
+            continue;
+        }
+        let node = short.nodes.get(node_ref.index())?;
+        let mapped = HirDecisionNodeRef(remap.len());
+        remap.insert(node_ref, mapped);
+        let truthy = target_for_edge(node, &node.truthy)?;
+        let falsy = target_for_edge(node, &node.falsy)?;
+        for edge in [&falsy, &truthy] {
+            if let DecisionEdge::Node(next_ref) = edge
+                && !remap.contains_key(next_ref)
+            {
+                stack.push(*next_ref);
+            }
+        }
+        pending.push((
+            mapped,
+            test_for_block(lowering, node.header)?,
+            truthy,
+            falsy,
+        ));
+    }
+
+    let nodes = pending
+        .into_iter()
+        .map(|(id, test, truthy, falsy)| {
+            Some(HirDecisionNode {
+                id,
+                test,
+                truthy: remap_decision_edge(truthy, &remap)?,
+                falsy: remap_decision_edge(falsy, &remap)?,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
     Some(HirDecisionExpr {
-        entry,
-        nodes: state.nodes,
+        entry: remap[&entry],
+        nodes,
     })
 }
 
-fn build_decision_node<FTest, FTarget>(
-    lowering: &ProtoLowering<'_>,
-    short: &ShortCircuitCandidate,
-    node_ref: ShortCircuitNodeRef,
-    test_for_block: &FTest,
-    target_for_edge: &FTarget,
-    state: &mut DecisionBuildState,
-) -> Option<HirDecisionNodeRef>
-where
-    FTest: Fn(&ProtoLowering<'_>, BlockRef) -> Option<HirExpr>,
-    FTarget: Fn(&ShortCircuitNode, &ShortCircuitTarget) -> Option<DecisionEdge>,
-{
-    if let Some(mapped) = state.remap.get(&node_ref) {
-        return Some(*mapped);
-    }
-
-    let node = short.nodes.get(node_ref.index())?;
-    let mapped = HirDecisionNodeRef(state.nodes.len());
-    state.remap.insert(node_ref, mapped);
-    state.nodes.push(HirDecisionNode {
-        id: mapped,
-        test: HirExpr::Boolean(false),
-        truthy: HirDecisionTarget::Expr(HirExpr::Boolean(false)),
-        falsy: HirDecisionTarget::Expr(HirExpr::Boolean(false)),
-    });
-
-    let test = test_for_block(lowering, node.header)?;
-    let truthy = build_decision_target(
-        lowering,
-        short,
-        node,
-        &node.truthy,
-        test_for_block,
-        target_for_edge,
-        state,
-    )?;
-    let falsy = build_decision_target(
-        lowering,
-        short,
-        node,
-        &node.falsy,
-        test_for_block,
-        target_for_edge,
-        state,
-    )?;
-
-    state.nodes[mapped.index()] = HirDecisionNode {
-        id: mapped,
-        test,
-        truthy,
-        falsy,
-    };
-    Some(mapped)
-}
-
-fn build_decision_target<FTest, FTarget>(
-    lowering: &ProtoLowering<'_>,
-    short: &ShortCircuitCandidate,
-    node: &ShortCircuitNode,
-    target: &ShortCircuitTarget,
-    test_for_block: &FTest,
-    target_for_edge: &FTarget,
-    state: &mut DecisionBuildState,
-) -> Option<HirDecisionTarget>
-where
-    FTest: Fn(&ProtoLowering<'_>, BlockRef) -> Option<HirExpr>,
-    FTarget: Fn(&ShortCircuitNode, &ShortCircuitTarget) -> Option<DecisionEdge>,
-{
-    match target_for_edge(node, target)? {
-        DecisionEdge::Node(next_ref) => Some(HirDecisionTarget::Node(build_decision_node(
-            lowering,
-            short,
-            next_ref,
-            test_for_block,
-            target_for_edge,
-            state,
-        )?)),
+fn remap_decision_edge(
+    edge: DecisionEdge,
+    remap: &BTreeMap<ShortCircuitNodeRef, HirDecisionNodeRef>,
+) -> Option<HirDecisionTarget> {
+    match edge {
+        DecisionEdge::Node(node_ref) => Some(HirDecisionTarget::Node(*remap.get(&node_ref)?)),
         DecisionEdge::Leaf(target) => Some(target),
     }
 }

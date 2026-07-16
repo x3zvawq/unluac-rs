@@ -537,14 +537,20 @@ fn prepare_closure(
 pub(super) fn eliminate_condition_expr(expr: &mut HirExpr) -> bool {
     let mut changed = match expr {
         HirExpr::TableAccess(access) => {
-            eliminate_condition_expr(&mut access.base) || eliminate_condition_expr(&mut access.key)
+            let base_changed = eliminate_condition_expr(&mut access.base);
+            let key_changed = eliminate_condition_expr(&mut access.key);
+            base_changed || key_changed
         }
         HirExpr::Unary(unary) => eliminate_condition_expr(&mut unary.expr),
         HirExpr::Binary(binary) => {
-            eliminate_condition_expr(&mut binary.lhs) || eliminate_condition_expr(&mut binary.rhs)
+            let lhs_changed = eliminate_condition_expr(&mut binary.lhs);
+            let rhs_changed = eliminate_condition_expr(&mut binary.rhs);
+            lhs_changed || rhs_changed
         }
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            eliminate_condition_expr(&mut logical.lhs) || eliminate_condition_expr(&mut logical.rhs)
+            let lhs_changed = eliminate_condition_expr(&mut logical.lhs);
+            let rhs_changed = eliminate_condition_expr(&mut logical.rhs);
+            lhs_changed || rhs_changed
         }
         HirExpr::Decision(decision) => {
             if let Some(replacement) = super::collapse_condition_decision_expr(decision) {
@@ -556,25 +562,36 @@ pub(super) fn eliminate_condition_expr(expr: &mut HirExpr) -> bool {
         }
         HirExpr::Call(call) => eliminate_condition_call(call),
         HirExpr::TableConstructor(table) => {
-            table.fields.iter_mut().any(|field| match field {
-                HirTableField::Array(expr) => eliminate_condition_expr(expr),
-                HirTableField::Record(field) => {
-                    let key_changed = match &mut field.key {
-                        HirTableKey::Name(_) => false,
-                        HirTableKey::Expr(expr) => eliminate_condition_expr(expr),
-                    };
-                    key_changed || eliminate_condition_expr(&mut field.value)
+            let mut changed = false;
+            for field in &mut table.fields {
+                match field {
+                    HirTableField::Array(expr) => {
+                        changed |= eliminate_condition_expr(expr);
+                    }
+                    HirTableField::Record(field) => {
+                        if let HirTableKey::Expr(expr) = &mut field.key {
+                            changed |= eliminate_condition_expr(expr);
+                        }
+                        changed |= eliminate_condition_expr(&mut field.value);
+                    }
                 }
-            }) || table
+            }
+            if let Some(call) = table
                 .trailing_multivalue
                 .as_mut()
                 .and_then(HirPackTail::call_mut)
-                .is_some_and(eliminate_condition_call)
+            {
+                changed |= eliminate_condition_call(call);
+            }
+            changed
         }
-        HirExpr::Closure(closure) => closure
-            .captures
-            .iter_mut()
-            .any(|capture| eliminate_condition_expr(&mut capture.value)),
+        HirExpr::Closure(closure) => {
+            let mut changed = false;
+            for capture in &mut closure.captures {
+                changed |= eliminate_condition_expr(&mut capture.value);
+            }
+            changed
+        }
         HirExpr::Nil
         | HirExpr::Boolean(_)
         | HirExpr::Integer(_)

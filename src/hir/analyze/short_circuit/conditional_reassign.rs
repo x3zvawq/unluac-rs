@@ -82,11 +82,11 @@ fn preserved_entry_value_expr(
         SsaValue::Entry(reg) => Some(expr_for_entry_reg(lowering, reg)),
         SsaValue::Def(def) => {
             let temp = *lowering.bindings.fixed_temps.get(def.index())?;
-            Some(HirExpr::TempRef(temp))
+            Some(lowering.bindings.expr_for_temp(temp))
         }
         SsaValue::Phi(phi) => {
             let temp = *lowering.bindings.phi_temps.get(phi.index())?;
-            Some(HirExpr::TempRef(temp))
+            Some(lowering.bindings.expr_for_temp(temp))
         }
     }
 }

@@ -79,6 +79,7 @@ pub enum CleanupDisposition {
     Unreachable,
     ExplicitTbc,
     GenericFor(LoopCandidateId),
+    LoopTbcBoundary(LoopCandidateId),
     ExplicitTbcBoundary,
     LexicalScope(ScopeCandidateId),
 }
@@ -182,9 +183,6 @@ pub(super) fn build_structure_plan(
 
     let mut unstructured_region_by_block = vec![None; cfg.blocks.len()];
     for (index, region) in regions.iter().enumerate() {
-        if region.structureable {
-            continue;
-        }
         let region_id = RegionId(index);
         for block in &region.blocks {
             assert!(
@@ -329,9 +327,6 @@ pub(super) fn install_unstructured_region_layouts(
     let mut layouts = vec![None; regions.len()];
     let mut layout_by_block = vec![None; cfg.blocks.len()];
     for (index, region) in regions.iter().enumerate() {
-        if region.structureable {
-            continue;
-        }
         let region_id = RegionId(index);
         let Some(layout) = build_unstructured_region_layout(plan, proto, cfg, graph_facts, region)
         else {

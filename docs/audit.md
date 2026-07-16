@@ -14,3 +14,4 @@
 ## 未解决问题
 
 1. **LuaJIT `ISTYPE/ISNUM` 尚无严格源码表达**：官方 `LJLIB_LUA` 内建函数用这两条指令实现 `CHECK_str/func/tab/int/num`；失败路径调用 `lj_meta_istype`，其中 string/integer/number 还会原地隐式转换。Transformer/HIR 现已保留 `TypeGuard` 的读取、顺序和具体 expected type，宽松模式能继续恢复余下函数，严格模式会拒绝 unresolved guard；但直接生成 `assert(type(...))` / `tonumber(...)` 会依赖可覆盖全局且不满足 LuaJIT 的错误与 `int32` 转换合同，不能冒充等价源码。后续若要关闭此项，需要先确定一个目标方言 helper 合同或正式的内建伪源码输出模式。
+2. **按需 branch region 集合仍有嵌套平方上界**：`BranchRegionFact` 已用支配区间消除 StructureFacts 中每个 suffix 的常驻集合，但 HIR 的 `branch_stops/path_checks/break_pads/loop state` 在需要集合接口时仍会 materialize 当前 header 的支配子树。普通短路根只消费一次，不再触发该成本；深层嵌套分支若逐层要求完整 region，累计访问量仍可能是 `Σregion_size`。后续应让这些消费者直接接受支配区间 membership/iterator，只有确实需要可变并集的局部路径才分配集合，不能用全局缓存重新引入平方内存。

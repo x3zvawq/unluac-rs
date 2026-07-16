@@ -9,8 +9,6 @@
 //! - `break` 或 `continue` 形状如果提前跳出了当前 loop body，会被记成
 //!   `UnstructuredBreakLike / UnstructuredContinueLike`
 //! - same-header 内层 loop 的结构化出口自然汇入外层条件时，不会误记成 continue
-//! - branch region 内部如果有一条边直接跳到 merge 之外，会被记成
-//!   `CrossStructureJump`
 
 use std::collections::BTreeSet;
 
@@ -18,19 +16,14 @@ use crate::structure::{Cfg, EdgeKind};
 use crate::transformer::LoweredProto;
 
 use super::common::IrreducibleRegion;
-use super::common::{
-    BranchCandidate, BranchRegionFact, GotoReason, GotoRequirement, LoopCandidate, LoopKindHint,
-};
-use super::helpers::{
-    block_has_non_control_prefix, collect_region_entry_edges, collect_region_exit_edges,
-};
+use super::common::{BranchCandidate, GotoReason, GotoRequirement, LoopCandidate, LoopKindHint};
+use super::helpers::{block_has_non_control_prefix, collect_region_entry_edges};
 
 pub(super) fn analyze_goto_requirements(
     proto: &LoweredProto,
     cfg: &Cfg,
     loop_candidates: &[LoopCandidate],
     branch_candidates: &[BranchCandidate],
-    branch_regions: &[BranchRegionFact],
     irreducible_regions: &[IrreducibleRegion],
 ) -> Vec<GotoRequirement> {
     let mut requirements = BTreeSet::new();
@@ -104,18 +97,6 @@ pub(super) fn analyze_goto_requirements(
                 edge: *edge_ref,
                 reason: GotoReason::IrreducibleFlow,
             });
-        }
-    }
-
-    for branch_region in branch_regions {
-        for edge_ref in collect_region_exit_edges(cfg, &branch_region.flow_blocks) {
-            let edge = cfg.edges[edge_ref.index()];
-            if edge.to != branch_region.merge {
-                requirements.insert(GotoRequirement {
-                    edge: edge_ref,
-                    reason: GotoReason::CrossStructureJump,
-                });
-            }
         }
     }
 
