@@ -16,8 +16,8 @@ mod debug {
 }
 
 pub use common::{
-    AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchInstr, BranchOperands,
-    BranchPredicate, CallInstr, CallKind, Capture, CaptureSource, CloseInstr, ClosureInstr,
+    AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchInstr, BranchPredicate,
+    BranchSubject, CallInstr, CallKind, Capture, CaptureSource, CloseInstr, ClosureInstr,
     ConcatInstr, CondOperand, ConstRef, DialectCaptureExtra, ErrNilInstr, GenericForCallInstr,
     GenericForLoopInstr, GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, JumpInstr,
     LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr,

@@ -389,10 +389,6 @@ macro_rules! traverse_hir_stmt_children {
             crate::hir::HirStmt::Block($block) => {
                 $on_block
             }
-            crate::hir::HirStmt::Unstructured(unstructured) => {
-                let $block = $($borrow)+ unstructured.body;
-                $on_block
-            }
             crate::hir::HirStmt::Break
             | crate::hir::HirStmt::Close(_)
             | crate::hir::HirStmt::Continue

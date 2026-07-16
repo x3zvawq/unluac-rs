@@ -31,15 +31,16 @@ pub use common::{
     BranchCandidate, BranchKind, BranchRegionFact, BranchValueMergeArm, BranchValueMergeCandidate,
     BranchValueMergeValue, GenericPhiMaterialization, GenericPhiSource, GotoReason,
     GotoRequirement, LoopCandidate, LoopExitValueMergeCandidate, LoopKindHint, LoopSourceBindings,
-    LoopValueArm, LoopValueIncoming, LoopValueMerge, RegionFact, RegionKind, ScopeCandidate,
-    ScopeKind, ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNode, ShortCircuitNodeRef,
-    ShortCircuitTarget, ShortCircuitValueIncoming, StructureFacts, StructurePlan,
+    LoopValueArm, LoopValueIncoming, LoopValueMerge, PhiEdgeCopy, RegionFact, RegionKind,
+    ScopeCandidate, ScopeKind, ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNode,
+    ShortCircuitNodeRef, ShortCircuitTarget, ShortCircuitValueIncoming, StructureFacts,
+    StructurePlan, UnstructuredRegionLayout,
 };
 #[cfg(feature = "decompile-debug")]
 pub use debug::dump_structure;
 pub use plan::{
     BlockOwner, BranchCandidateId, BranchValueMergeId, CleanupDisposition, EdgeOwner,
-    GotoRequirementId, LoopCandidateId, RegionId, ScopeCandidateId,
+    GotoRequirementId, LoopCandidateId, PhiIncomingDisposition, RegionId, ScopeCandidateId,
 };
 #[cfg(not(feature = "decompile-debug"))]
 mod debug {

@@ -34,24 +34,9 @@ pub(crate) fn lower_branch_subject(
     instr_ref: InstrRef,
     cond: BranchCond,
 ) -> HirExpr {
-    match cond.operands {
-        BranchOperands::Unary(operand) => match cond.predicate {
-            BranchPredicate::Truthy => lower_cond_operand(lowering, block, instr_ref, operand),
-            _ => unresolved_expr("unsupported unary branch predicate"),
-        },
-        BranchOperands::Binary(lhs, rhs) => HirExpr::Binary(Box::new(HirBinaryExpr {
-            op: match cond.predicate {
-                BranchPredicate::Eq => HirBinaryOpKind::Eq,
-                BranchPredicate::Lt => HirBinaryOpKind::Lt,
-                BranchPredicate::Le => HirBinaryOpKind::Le,
-                BranchPredicate::Truthy => {
-                    return unresolved_expr("unsupported truthy binary branch");
-                }
-            },
-            lhs: lower_cond_operand(lowering, block, instr_ref, lhs),
-            rhs: lower_cond_operand(lowering, block, instr_ref, rhs),
-        })),
-    }
+    lower_branch_subject_with(cond, |operand| {
+        lower_cond_operand(lowering, block, instr_ref, operand)
+    })
 }
 
 pub(crate) fn lower_branch_subject_inline(
@@ -60,26 +45,9 @@ pub(crate) fn lower_branch_subject_inline(
     instr_ref: InstrRef,
     cond: BranchCond,
 ) -> HirExpr {
-    match cond.operands {
-        BranchOperands::Unary(operand) => match cond.predicate {
-            BranchPredicate::Truthy => {
-                lower_cond_operand_inline(lowering, block, instr_ref, operand)
-            }
-            _ => unresolved_expr("unsupported unary branch predicate"),
-        },
-        BranchOperands::Binary(lhs, rhs) => HirExpr::Binary(Box::new(HirBinaryExpr {
-            op: match cond.predicate {
-                BranchPredicate::Eq => HirBinaryOpKind::Eq,
-                BranchPredicate::Lt => HirBinaryOpKind::Lt,
-                BranchPredicate::Le => HirBinaryOpKind::Le,
-                BranchPredicate::Truthy => {
-                    return unresolved_expr("unsupported truthy binary branch");
-                }
-            },
-            lhs: lower_cond_operand_inline(lowering, block, instr_ref, lhs),
-            rhs: lower_cond_operand_inline(lowering, block, instr_ref, rhs),
-        })),
-    }
+    lower_branch_subject_with(cond, |operand| {
+        lower_cond_operand_inline(lowering, block, instr_ref, operand)
+    })
 }
 
 /// 值型短路恢复需要的是“当前这一跳可以直接表达”的 subject，而不是“可任意复制”的值。
@@ -93,24 +61,29 @@ pub(crate) fn lower_branch_subject_single_eval(
     instr_ref: InstrRef,
     cond: BranchCond,
 ) -> HirExpr {
-    match cond.operands {
-        BranchOperands::Unary(operand) => match cond.predicate {
-            BranchPredicate::Truthy => {
-                lower_cond_operand_single_eval(lowering, block, instr_ref, operand)
-            }
-            _ => unresolved_expr("unsupported unary branch predicate"),
-        },
-        BranchOperands::Binary(lhs, rhs) => HirExpr::Binary(Box::new(HirBinaryExpr {
-            op: match cond.predicate {
+    lower_branch_subject_with(cond, |operand| {
+        lower_cond_operand_single_eval(lowering, block, instr_ref, operand)
+    })
+}
+
+fn lower_branch_subject_with(
+    cond: BranchCond,
+    mut lower_operand: impl FnMut(CondOperand) -> HirExpr,
+) -> HirExpr {
+    match cond.subject {
+        BranchSubject::Truthy(operand) => lower_operand(operand),
+        BranchSubject::Compare {
+            predicate,
+            lhs,
+            rhs,
+        } => HirExpr::Binary(Box::new(HirBinaryExpr {
+            op: match predicate {
                 BranchPredicate::Eq => HirBinaryOpKind::Eq,
                 BranchPredicate::Lt => HirBinaryOpKind::Lt,
                 BranchPredicate::Le => HirBinaryOpKind::Le,
-                BranchPredicate::Truthy => {
-                    return unresolved_expr("unsupported truthy binary branch");
-                }
             },
-            lhs: lower_cond_operand_single_eval(lowering, block, instr_ref, lhs),
-            rhs: lower_cond_operand_single_eval(lowering, block, instr_ref, rhs),
+            lhs: lower_operand(lhs),
+            rhs: lower_operand(rhs),
         })),
     }
 }

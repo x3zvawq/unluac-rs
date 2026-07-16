@@ -6,7 +6,7 @@
 //! `decompile-debug` feature 控制。
 
 use super::{
-    AccessBase, AccessKey, BinaryOpKind, BranchCond, BranchOperands, BranchPredicate, CallKind,
+    AccessBase, AccessKey, BinaryOpKind, BranchCond, BranchPredicate, BranchSubject, CallKind,
     CaptureSource, CondOperand, InstrRef, LowInstr, Reg, RegRange, ResultPack, UnaryOpKind,
     ValueOperand, ValuePack,
 };
@@ -281,17 +281,15 @@ fn format_binary_op(op: BinaryOpKind) -> &'static str {
 }
 
 fn format_branch_cond(cond: BranchCond) -> String {
-    let base = match cond.operands {
-        BranchOperands::Unary(operand) => {
-            format!(
-                "{} {}",
-                format_branch_predicate(cond.predicate),
-                format_cond_operand(operand)
-            )
-        }
-        BranchOperands::Binary(lhs, rhs) => format!(
+    let base = match cond.subject {
+        BranchSubject::Truthy(operand) => format!("truthy {}", format_cond_operand(operand)),
+        BranchSubject::Compare {
+            predicate,
+            lhs,
+            rhs,
+        } => format!(
             "{} {}, {}",
-            format_branch_predicate(cond.predicate),
+            format_branch_predicate(predicate),
             format_cond_operand(lhs),
             format_cond_operand(rhs)
         ),
@@ -306,7 +304,6 @@ fn format_branch_cond(cond: BranchCond) -> String {
 
 fn format_branch_predicate(predicate: BranchPredicate) -> &'static str {
     match predicate {
-        BranchPredicate::Truthy => "truthy",
         BranchPredicate::Eq => "eq",
         BranchPredicate::Lt => "lt",
         BranchPredicate::Le => "le",

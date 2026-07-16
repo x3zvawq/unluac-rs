@@ -156,9 +156,6 @@ fn stmt_has_local_write_inside_loop(stmt: &HirStmt, local: LocalId) -> bool {
                     .is_some_and(|block| any_local_write_inside_loop(&block.stmts, local))
         }
         HirStmt::Block(block) => any_local_write_inside_loop(&block.stmts, local),
-        HirStmt::Unstructured(unstructured) => {
-            any_local_write_inside_loop(&unstructured.body.stmts, local)
-        }
         HirStmt::LocalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)

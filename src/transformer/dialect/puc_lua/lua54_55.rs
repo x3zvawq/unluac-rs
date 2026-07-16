@@ -22,13 +22,13 @@ use crate::transformer::dialect::puc_lua::{
 };
 use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
-    AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchOperands,
-    BranchPredicate, Capture, CaptureSource, CloseInstr, ClosureInstr, ConcatInstr, CondOperand,
-    ConstRef, DialectCaptureExtra, ErrNilInstr, GetTableInstr, GetTableKind, GetUpvalueInstr,
-    InstrRef, LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr,
-    LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg,
-    RegRange, ResultPack, SetListInstr, SetTableInstr, SetUpvalueInstr, TbcInstr, TbcKind,
-    TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchPredicate, Capture,
+    CaptureSource, CloseInstr, ClosureInstr, ConcatInstr, CondOperand, ConstRef,
+    DialectCaptureExtra, ErrNilInstr, GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef,
+    LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr,
+    LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange,
+    ResultPack, SetListInstr, SetTableInstr, SetUpvalueInstr, TbcInstr, TbcKind, TransformError,
+    UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
 mod adapter;
@@ -705,14 +705,12 @@ impl<'a> ProtoLowerer<'a> {
                 FamilyOpcode::Eq | FamilyOpcode::Lt | FamilyOpcode::Le => {
                     let (a, b, k) = expect_abk(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
-                    let cond = BranchCond {
-                        predicate: branch_predicate(opcode),
-                        operands: BranchOperands::Binary(
-                            CondOperand::Reg(reg_from_u8(a)),
-                            CondOperand::Reg(reg_from_u8(b)),
-                        ),
-                        negated: !k,
-                    };
+                    let cond = BranchCond::compare(
+                        branch_predicate(opcode),
+                        CondOperand::Reg(reg_from_u8(a)),
+                        CondOperand::Reg(reg_from_u8(b)),
+                        !k,
+                    );
 
                     self.emit(
                         Some(raw_index),
@@ -728,14 +726,12 @@ impl<'a> ProtoLowerer<'a> {
                 FamilyOpcode::EqK => {
                     let (a, b, k) = expect_abk(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
-                    let cond = BranchCond {
-                        predicate: BranchPredicate::Eq,
-                        operands: BranchOperands::Binary(
-                            CondOperand::Reg(reg_from_u8(a)),
-                            CondOperand::Const(self.const_ref(raw_pc, b as usize)?),
-                        ),
-                        negated: !k,
-                    };
+                    let cond = BranchCond::compare(
+                        BranchPredicate::Eq,
+                        CondOperand::Reg(reg_from_u8(a)),
+                        CondOperand::Const(self.const_ref(raw_pc, b as usize)?),
+                        !k,
+                    );
 
                     self.emit(
                         Some(raw_index),
@@ -758,11 +754,7 @@ impl<'a> ProtoLowerer<'a> {
                     let rhs = immediate_cond_operand(sb, c != 0);
                     let (predicate, lhs, rhs) =
                         compare_immediate_shape(opcode, reg_from_u8(a), rhs);
-                    let cond = BranchCond {
-                        predicate,
-                        operands: BranchOperands::Binary(lhs, rhs),
-                        negated: !k,
-                    };
+                    let cond = BranchCond::compare(predicate, lhs, rhs, !k);
 
                     self.emit(
                         Some(raw_index),
@@ -778,11 +770,7 @@ impl<'a> ProtoLowerer<'a> {
                 FamilyOpcode::Test => {
                     let (a, k) = expect_ak(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
-                    let cond = BranchCond {
-                        predicate: BranchPredicate::Truthy,
-                        operands: BranchOperands::Unary(CondOperand::Reg(reg_from_u8(a))),
-                        negated: !k,
-                    };
+                    let cond = BranchCond::truthy(CondOperand::Reg(reg_from_u8(a)), !k);
 
                     self.emit(
                         Some(raw_index),
@@ -798,11 +786,7 @@ impl<'a> ProtoLowerer<'a> {
                 FamilyOpcode::TestSet => {
                     let (a, b, k) = expect_abk(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
-                    let cond = BranchCond {
-                        predicate: BranchPredicate::Truthy,
-                        operands: BranchOperands::Unary(CondOperand::Reg(reg_from_u8(b))),
-                        negated: !k,
-                    };
+                    let cond = BranchCond::truthy(CondOperand::Reg(reg_from_u8(b)), !k);
 
                     if a == b {
                         self.emit(

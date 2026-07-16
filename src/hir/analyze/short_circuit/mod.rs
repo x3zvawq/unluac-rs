@@ -23,7 +23,7 @@ use crate::structure::{
     ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNode, ShortCircuitNodeRef,
     ShortCircuitTarget,
 };
-use crate::transformer::{BranchOperands, BranchPredicate, CondOperand, InstrRef, LowInstr, Reg};
+use crate::transformer::{BranchSubject, CondOperand, InstrRef, LowInstr, Reg};
 
 pub(super) use self::conditional_reassign::build_conditional_reassign_plan;
 pub(super) use self::decision::{

@@ -12,8 +12,9 @@ use std::{cmp::Reverse, collections::BTreeMap};
 
 use super::{
     BlockRef, BranchCandidate, BranchValueMergeCandidate, Cfg, EdgeKind, GotoRequirement,
-    LoopCandidate, RegionFact, StructurePlan,
+    GraphFacts, LoopCandidate, RegionFact, StructurePlan, UnstructuredRegionLayout,
 };
+use crate::transformer::{LowInstr, LoweredProto};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BranchCandidateId(pub usize);
@@ -100,6 +101,19 @@ pub enum EdgeOwner {
     Unstructured(RegionId),
     Goto(GotoRequirementId),
     Terminal,
+}
+
+/// 一个 canonical phi incoming 的唯一执行归属。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhiIncomingDisposition {
+    /// 整个 phi 没有可观察消费者，不生成任何写回。
+    Dead,
+    /// incoming 对应不可达 CFG 边，不参与生成。
+    Unreachable,
+    /// 显式 goto / island 边在离开 predecessor 时写入 phi target。
+    EdgeCopy,
+    /// 由目标 block 的 branch/loop/short-circuit/generic merge owner 消费。
+    Merge,
 }
 
 pub(super) fn build_structure_plan(
@@ -290,10 +304,149 @@ pub(super) fn build_structure_plan(
         branch_value_merge_by_region,
         loops_by_header,
         unstructured_region_by_block,
+        unstructured_layouts: Vec::new(),
+        unstructured_layout_by_block: Vec::new(),
         block_owners,
         edge_owners,
         cleanup_dispositions,
+        generic_phi_materializations: Vec::new(),
+        generic_phi_materializations_by_block: Vec::new(),
+        phi_incoming_dispositions: Vec::new(),
+        phi_edge_copies: Vec::new(),
     }
+}
+
+pub(super) fn install_unstructured_region_layouts(
+    plan: &mut StructurePlan,
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    regions: &[RegionFact],
+) {
+    let mut layouts = vec![None; regions.len()];
+    let mut layout_by_block = vec![None; cfg.blocks.len()];
+    for (index, region) in regions.iter().enumerate() {
+        if region.structureable {
+            continue;
+        }
+        let region_id = RegionId(index);
+        let Some(layout) = build_unstructured_region_layout(plan, proto, cfg, graph_facts, region)
+        else {
+            continue;
+        };
+        for block in &layout.blocks {
+            let owner = &mut layout_by_block[block.index()];
+            assert!(
+                owner.is_none() || *owner == Some(region_id),
+                "unstructured layouts must not overlap at {block}"
+            );
+            *owner = Some(region_id);
+        }
+        layouts[index] = Some(layout);
+    }
+    plan.unstructured_layouts = layouts;
+    plan.unstructured_layout_by_block = layout_by_block;
+}
+
+fn build_unstructured_region_layout(
+    plan: &StructurePlan,
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    region: &RegionFact,
+) -> Option<UnstructuredRegionLayout> {
+    let mut continuation = region.entry;
+    while region.blocks.contains(&continuation) {
+        continuation = graph_facts.post_dominator_tree.parent[continuation.index()]?;
+    }
+
+    let mut blocks = region.blocks.clone();
+    for exit in &region.exits {
+        let mut block = *exit;
+        while block != continuation {
+            if blocks.contains(&block) {
+                break;
+            }
+            if !matches!(plan.block_owners[block.index()], BlockOwner::Linear)
+                || !unstructured_exit_pad_prefix_is_cleanup(plan, proto, cfg, block)
+            {
+                return None;
+            }
+            blocks.insert(block);
+            block = cfg.unique_reachable_successor(block)?;
+        }
+    }
+    blocks.remove(&continuation);
+    Some(UnstructuredRegionLayout {
+        blocks,
+        continuation,
+    })
+}
+
+fn unstructured_exit_pad_prefix_is_cleanup(
+    plan: &StructurePlan,
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    block: BlockRef,
+) -> bool {
+    let range = cfg.blocks[block.index()].instrs;
+    let end = range.last().map_or(range.end(), |last| {
+        if proto.instrs[last.index()].is_control_terminator() {
+            range.end() - 1
+        } else {
+            range.end()
+        }
+    });
+    (range.start.index()..end).all(|index| {
+        let disposition = plan.cleanup_dispositions[index];
+        match proto.instrs[index] {
+            LowInstr::Close(_) => matches!(
+                disposition,
+                Some(
+                    CleanupDisposition::LexicalScope(_)
+                        | CleanupDisposition::Unreachable
+                        | CleanupDisposition::ExplicitTbcBoundary
+                )
+            ),
+            LowInstr::Tbc(_) => matches!(
+                disposition,
+                Some(CleanupDisposition::LexicalScope(_) | CleanupDisposition::Unreachable)
+            ),
+            _ => false,
+        }
+    })
+}
+
+pub(super) fn install_phi_incoming_dispositions(
+    plan: &mut StructurePlan,
+    dispositions: Vec<Vec<PhiIncomingDisposition>>,
+    edge_copies: Vec<Vec<super::PhiEdgeCopy>>,
+) {
+    assert_eq!(edge_copies.len(), plan.edge_owners.len());
+    plan.phi_incoming_dispositions = dispositions;
+    plan.phi_edge_copies = edge_copies;
+}
+
+pub(super) fn install_generic_phi_materializations(
+    plan: &mut StructurePlan,
+    block_count: usize,
+    phi_count: usize,
+    materializations: Vec<super::GenericPhiMaterialization>,
+) {
+    let mut by_phi = vec![None; phi_count];
+    for materialization in materializations {
+        let slot = by_phi
+            .get_mut(materialization.phi_id.index())
+            .expect("generic phi materialization id must exist");
+        assert!(slot.is_none(), "generic phi must have one materialization");
+        *slot = Some(materialization);
+    }
+    let mut by_block = vec![Vec::new(); block_count];
+    for materialization in by_phi.iter().copied().flatten() {
+        by_block[materialization.block.index()].push(materialization);
+    }
+    plan.generic_phi_materializations = by_phi;
+    plan.generic_phi_materializations_by_block = by_block;
 }
 
 fn validate_plan(

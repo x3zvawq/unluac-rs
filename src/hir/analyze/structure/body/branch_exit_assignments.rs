@@ -41,8 +41,8 @@ impl StructuredBodyLowerer<'_, '_> {
             return None;
         };
         if short.blocks.contains(&value_leaf)
-            || self.branch_by_header.contains_key(&value_leaf)
-            || self.loop_headers.contains(&value_leaf)
+            || self.branch_candidate_for_header(value_leaf).is_some()
+            || self.has_loop_header(value_leaf)
         {
             return None;
         }

@@ -2,12 +2,14 @@
 //!
 //! `locals` pass 在构建提升计划时需要回答一系列关于 temp 引用的问题：
 //! - 一段语句中是否存在对某个/某些 temp 的引用？
+//! - 某个 temp 在当前位置之后只出现于哪些语句？
 //! - 某条语句是否只在控制头部（条件表达式）处消费了 temp，body 内不再引用？
 //! - 某条语句的子树中是否包含 goto/label/continue 等非局部控制流？
 //! - 递归进入子作用域时，外层前缀/后缀还保护着哪些 temp？
 //!
-//! 这些查询都是只读的，不会修改 HIR 结构，因此独立提取出来
-//! 既方便复用，也让 `locals.rs` 的主体逻辑更聚焦于提升决策本身。
+//! 这些查询都是只读的，不会修改 HIR 结构。按 temp 建立的 occurrence index 让候选扩张
+//! 只访问真实 touch 语句，不必为每个定义重复扫描完整后缀；独立提取也让 `locals.rs`
+//! 的主体逻辑更聚焦于提升决策本身。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -81,8 +83,7 @@ pub(super) fn stmt_consumes_temps_only_in_control_head(
         | HirStmt::Continue
         | HirStmt::Goto(_)
         | HirStmt::Label(_)
-        | HirStmt::Block(_)
-        | HirStmt::Unstructured(_) => false,
+        | HirStmt::Block(_) => false,
     }
 }
 
@@ -100,7 +101,6 @@ pub(super) fn stmt_contains_nested_nonlocal_control(stmt: &HirStmt) -> bool {
         HirStmt::NumericFor(numeric_for) => block_contains_nonlocal_control(&numeric_for.body),
         HirStmt::GenericFor(generic_for) => block_contains_nonlocal_control(&generic_for.body),
         HirStmt::Block(block) => block_contains_nonlocal_control(block),
-        HirStmt::Unstructured(_) => true,
         HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => true,
         HirStmt::LocalDecl(_)
         | HirStmt::Assign(_)
@@ -217,10 +217,17 @@ impl<'a> TempTouchIndex<'a> {
         indices.get(offset).is_some_and(|index| *index < end)
     }
 
-    pub(super) fn stmt_touches_any(&self, index: usize, temps: &BTreeSet<TempId>) -> bool {
-        self.stmt_refs[index]
-            .iter()
-            .any(|temp| temps.contains(temp))
+    pub(super) fn extend_touch_indices_after(
+        &self,
+        start: usize,
+        temp: TempId,
+        indices: &mut BTreeSet<usize>,
+    ) {
+        let Some(touches) = self.indices_by_temp.get(&temp) else {
+            return;
+        };
+        let offset = touches.partition_point(|index| *index < start);
+        indices.extend(touches[offset..].iter().copied());
     }
 }
 
@@ -268,12 +275,8 @@ impl<'a> TempRefScopeTracker<'a> {
             .extend(self.stmt_refs[index].iter().copied());
     }
 
-    pub(super) fn outer_with_suffix(&self, inherited: &BTreeSet<TempId>) -> BTreeSet<TempId> {
-        inherited
-            .iter()
-            .copied()
-            .chain(self.suffix_ref_counts.keys().copied())
-            .collect()
+    pub(super) fn suffix_contains(&self, temp: TempId) -> bool {
+        self.suffix_ref_counts.contains_key(&temp)
     }
 
     pub(super) fn outer_with_prefix_and_suffix(

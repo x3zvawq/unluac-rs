@@ -167,8 +167,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .iter()
                 .copied()
                 .filter(|header| {
-                    let Some(candidate) = self.branch_value_merges_by_header.get(header).copied()
-                    else {
+                    let Some(candidate) = self.branch_value_merge_for_header(*header) else {
                         return false;
                     };
                     if seen_branch_values.iter().any(|seen| {
@@ -270,10 +269,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             && let ShortCircuitExit::ValueMerge(sc_merge) = sc.exit
             && branch_stop == Some(sc_merge)
         {
-            self.merge_allowed_blocks
-                .entry(sc_merge)
-                .or_default()
-                .insert(block);
+            self.merge_allowed_blocks.insert(sc_merge, block);
         }
 
         match branch_stop {
@@ -301,8 +297,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if plan.else_entry.is_some()
             || branch_stop != Some(merge)
             || region_stop == Some(merge)
-            || self.branch_by_header.contains_key(&merge)
-            || self.loop_headers.contains(&merge)
+            || self.branch_candidate_for_header(merge).is_some()
+            || self.has_loop_header(merge)
             || self.block_is_terminal_exit(merge)
         {
             return None;
@@ -342,8 +338,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         region.structured_blocks.iter().copied().find(|tail| {
             *tail != plan.then_entry
                 && *tail != else_entry
-                && !self.branch_by_header.contains_key(tail)
-                && !self.loop_headers.contains(tail)
+                && self.branch_candidate_for_header(*tail).is_none()
+                && !self.has_loop_header(*tail)
                 && self.region_predecessor_count(*tail, &region.structured_blocks) >= 2
                 && self.shared_tail_reaches_loop_continue(*tail, continue_target, loop_context)
                 && [plan.then_entry, else_entry].into_iter().any(|entry| {
@@ -405,15 +401,17 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     .is_some()
             })
             || (plain_merge_can_be_continue
-                && self.branch_by_header.get(&entry).is_some_and(|branch| {
-                    branch.else_entry.is_none()
-                        && branch.merge == Some(continue_target)
-                        && self.branch_arm_reaches_target_or_boundary_or_terminate(
-                            branch.then_entry,
-                            tail,
-                            boundary,
-                        )
-                }))
+                && self
+                    .branch_candidate_for_header(entry)
+                    .is_some_and(|branch| {
+                        branch.else_entry.is_none()
+                            && branch.merge == Some(continue_target)
+                            && self.branch_arm_reaches_target_or_boundary_or_terminate(
+                                branch.then_entry,
+                                tail,
+                                boundary,
+                            )
+                    }))
     }
 
     fn implicit_else_merge_entry(
@@ -436,17 +434,19 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return Some(merge);
         }
         if plan.else_entry.is_none()
-            && self.branch_by_header.get(&merge).is_some_and(|candidate| {
-                candidate.else_entry.is_none()
-                    && candidate.then_entry == stop
-                    && candidate.merge.is_some_and(|break_exit| {
-                        self.block_is_terminal_exit(break_exit)
-                            || self.active_loops.last().is_some_and(|loop_context| {
-                                break_exit == loop_context.post_loop
-                                    || Some(break_exit) == loop_context.downstream_post_loop
-                            })
-                    })
-            })
+            && self
+                .branch_candidate_for_header(merge)
+                .is_some_and(|candidate| {
+                    candidate.else_entry.is_none()
+                        && candidate.then_entry == stop
+                        && candidate.merge.is_some_and(|break_exit| {
+                            self.block_is_terminal_exit(break_exit)
+                                || self.active_loops.last().is_some_and(|loop_context| {
+                                    break_exit == loop_context.post_loop
+                                        || Some(break_exit) == loop_context.downstream_post_loop
+                                })
+                        })
+                })
             && self.branch_arm_reaches_stop_or_loop_escape(merge, stop, stop)
         {
             // 多后继 merge 若是“正常臂到 stop、另一臂 break”的结构 header，
@@ -518,7 +518,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if plan
             .consumed_headers
             .iter()
-            .any(|header| self.branch_value_merges_by_header.contains_key(header))
+            .any(|header| self.branch_value_merge_for_header(*header).is_some())
         {
             return None;
         }
@@ -564,7 +564,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             || plan
                 .consumed_headers
                 .iter()
-                .any(|header| self.branch_value_merges_by_header.contains_key(header))
+                .any(|header| self.branch_value_merge_for_header(*header).is_some())
         {
             return None;
         }
@@ -648,7 +648,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return false;
         }
         self.branch_arm_reaches_shared_continuation_or_terminate(entry, shared, boundary)
-            || self.branch_by_header.get(&entry).is_some_and(|candidate| {
+            || self.branch_candidate_for_header(entry).is_some_and(|candidate| {
                 candidate.else_entry.is_none()
                     && candidate.then_entry == shared
                     && candidate.merge == Some(boundary)
@@ -684,7 +684,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                                 loop_context.header,
                             )
                     })
-            }) && self.loop_headers.contains(&entry)
+            }) && self.has_loop_header(entry)
                 && self.block_is_active_loop_escape(boundary)
                 && self.branch_arm_reaches_stop_or_loop_escape(entry, shared, boundary))
     }
@@ -700,7 +700,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stmts: &mut Vec<HirStmt>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Option<BlockRef>> {
-        let candidate = *self.branch_by_header.get(&block)?;
+        let candidate = self.branch_candidate_for_header(block)?;
         let merge = candidate.merge?;
         // 除了直接被当作 branch 的 repeat header，LuaJIT 还会把“内层 repeat true
         // fence + 外层 retry loop”压成同一个 Unknown natural-loop header。只有该
@@ -789,8 +789,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 *tail != block
                     && *tail != merge
                     && !self.required_labels.contains(tail)
-                    && !self.branch_by_header.contains_key(tail)
-                    && !self.loop_headers.contains(tail)
+                    && self.branch_candidate_for_header(*tail).is_none()
+                    && !self.has_loop_header(*tail)
                     && self.linear_tail_target(*tail) == Some(merge)
                     && self.region_predecessor_count(*tail, &region.structured_blocks) >= 2
                     && self.branch_arm_reaches_target_or_boundary_or_terminate(
@@ -907,7 +907,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         block: BlockRef,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirBlock> {
-        if !self.terminal_exit_block_is_clone_safe(block) {
+        if !self.terminal_exit_block_can_clone(block, target_overrides) {
             return None;
         }
         let mut stmts = self.lower_block_prefix(block, false, target_overrides)?;

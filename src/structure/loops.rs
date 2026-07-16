@@ -30,7 +30,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::structure::{BlockRef, Cfg, DataflowFacts, EdgeKind, EdgeRef, GraphFacts};
-use crate::transformer::{LowInstr, LoweredProto, Reg, ResultPack};
+use crate::transformer::{LowInstr, LoweredProto, Reg};
 
 use super::common::{
     BranchCandidate, LoopCandidate, LoopExitValueMergeCandidate, LoopKindHint, LoopSourceBindings,
@@ -126,7 +126,7 @@ pub(super) fn analyze_loops(
             }),
     );
     loop_candidates.sort_by_key(|candidate| (candidate.header, candidate.blocks.len()));
-    refine_ambiguous_repeat_candidates(proto, cfg, &mut loop_candidates);
+    refine_ambiguous_repeat_candidates(proto, cfg, graph_facts, &mut loop_candidates);
     assign_same_header_merge_ownership(&mut loop_candidates);
     loop_candidates
 }
@@ -217,7 +217,11 @@ pub(super) fn assign_continue_edge_ownership(
     candidates: &mut [LoopCandidate],
 ) {
     let mut owners_by_entry = BTreeMap::<BlockRef, BTreeSet<usize>>::new();
+    let mut owners_by_block = vec![Vec::new(); cfg.blocks.len()];
     for (index, candidate) in candidates.iter().enumerate() {
+        for block in &candidate.blocks {
+            owners_by_block[block.index()].push(index);
+        }
         if numeric_continue_target_carries_body_tail(proto, cfg, candidate) {
             continue;
         }
@@ -259,17 +263,17 @@ pub(super) fn assign_continue_edge_ownership(
             };
             let Some(owner) = eligible().min_by_key(|index| {
                 let candidate = &candidates[*index];
-                (candidate.binding_scope_blocks.len(), candidate.blocks.len())
+                (candidate.body_scope_blocks.len(), candidate.blocks.len())
             }) else {
                 continue;
             };
             let owner_scope = (
-                candidates[owner].binding_scope_blocks.len(),
+                candidates[owner].body_scope_blocks.len(),
                 candidates[owner].blocks.len(),
             );
             if eligible().filter(|index| *index != owner).any(|index| {
                 let candidate = &candidates[index];
-                (candidate.binding_scope_blocks.len(), candidate.blocks.len()) == owner_scope
+                (candidate.body_scope_blocks.len(), candidate.blocks.len()) == owner_scope
             }) {
                 continue;
             }
@@ -279,12 +283,14 @@ pub(super) fn assign_continue_edge_ownership(
         if branch.else_entry.is_some() {
             continue;
         }
-        for candidate in candidates.iter_mut().filter(|candidate| {
-            candidate.kind_hint != LoopKindHint::RepeatLike
-                && !numeric_continue_target_carries_body_tail(proto, cfg, candidate)
-                && candidate.blocks.contains(&branch.header)
-                && candidate.blocks.contains(&branch.then_entry)
-        }) {
+        for index in owners_by_block[branch.header.index()].iter().copied() {
+            let candidate = &mut candidates[index];
+            if candidate.kind_hint == LoopKindHint::RepeatLike
+                || numeric_continue_target_carries_body_tail(proto, cfg, candidate)
+                || !candidate.blocks.contains(&branch.then_entry)
+            {
+                continue;
+            }
             let Some(target) = candidate.continue_target else {
                 continue;
             };
@@ -440,6 +446,15 @@ pub(super) fn refine_short_circuit_repeat_candidates(
         candidate.kind_hint = LoopKindHint::RepeatLike;
         candidate.continue_target = Some(continue_target);
         candidate.condition_header = condition_header;
+        candidate.body_scope_blocks = loop_body_scope(
+            candidate.kind_hint,
+            candidate.continue_target,
+            &candidate.blocks,
+            &candidate.exits,
+            candidate.header,
+            cfg,
+            graph_facts,
+        );
     }
 
     short_circuits.extend(accepted_supplements);
@@ -611,6 +626,7 @@ fn direct_branch_repeat_continue_target(
 fn refine_ambiguous_repeat_candidates(
     proto: &LoweredProto,
     cfg: &Cfg,
+    graph_facts: &GraphFacts,
     candidates: &mut [LoopCandidate],
 ) {
     // repeat body 若进入 nested loop，natural-loop core 会把该入口误看成 header exit；
@@ -628,7 +644,7 @@ fn refine_ambiguous_repeat_candidates(
         })
         .flat_map(|(index, candidate)| {
             candidate
-                .binding_scope_blocks
+                .body_scope_blocks
                 .iter()
                 .copied()
                 .map(move |block| (block, index))
@@ -666,6 +682,15 @@ fn refine_ambiguous_repeat_candidates(
         else {
             continue;
         };
+        let repeat_body_scope = loop_body_scope(
+            LoopKindHint::RepeatLike,
+            Some(continue_target),
+            &candidate.blocks,
+            &candidate.exits,
+            candidate.header,
+            cfg,
+            graph_facts,
+        );
         let is_repeat = match candidate.kind_hint {
             LoopKindHint::WhileLike => {
                 continue_target != candidate.header
@@ -684,11 +709,7 @@ fn refine_ambiguous_repeat_candidates(
                         .flat_map(|target| loop_entries.get(&target).into_iter().flatten())
                         .copied()
                         .filter(|nested| *nested != index)
-                        .any(|nested| {
-                            candidates[nested]
-                                .blocks
-                                .is_subset(&candidate.binding_scope_blocks)
-                        })
+                        .any(|nested| candidates[nested].blocks.is_subset(&repeat_body_scope))
             }
             LoopKindHint::WhileTrueLike => for_owners
                 .get(&candidate.header)
@@ -702,6 +723,7 @@ fn refine_ambiguous_repeat_candidates(
         if is_repeat {
             candidates[index].kind_hint = LoopKindHint::RepeatLike;
             candidates[index].continue_target = Some(continue_target);
+            candidates[index].body_scope_blocks = repeat_body_scope;
         }
     }
 }
@@ -718,7 +740,7 @@ fn branch_conditions_share_subject(
     ) else {
         return false;
     };
-    left.cond.predicate == right.cond.predicate && left.cond.operands == right.cond.operands
+    left.cond.subject == right.cond.subject
 }
 
 fn reachable_numeric_for_loop(
@@ -903,7 +925,6 @@ fn build_loop_candidate(
     backedges.dedup();
     let preheader = unique_loop_preheader(cfg, header, &blocks);
     let exits = collect_region_exits(cfg, &blocks);
-    let binding_scope_blocks = loop_binding_scope(&blocks, &exits, header, cfg, graph_facts);
     let header_value_merges = analyze_loop_header_value_merges(dataflow, header, &blocks);
     let (kind_hint, continue_target, source_bindings) = infer_loop_shape(LoopShapeInput {
         proto,
@@ -915,13 +936,22 @@ fn build_loop_candidate(
         preheader,
         header_value_merges: &header_value_merges,
     });
+    let body_scope_blocks = loop_body_scope(
+        kind_hint,
+        continue_target,
+        &blocks,
+        &exits,
+        header,
+        cfg,
+        graph_facts,
+    );
     let exit_value_merges = analyze_loop_exit_value_merges(proto, cfg, dataflow, &exits, &blocks);
 
     LoopCandidate {
         header,
         preheader,
         blocks,
-        binding_scope_blocks,
+        body_scope_blocks,
         control_blocks: BTreeSet::new(),
         backedges,
         exits,
@@ -994,12 +1024,20 @@ fn degenerate_numeric_for_loop(
     if !exits.contains(&exit) || !is_reducible_region(cfg, header, &blocks) {
         return None;
     }
-    let binding_scope_blocks = loop_binding_scope(&blocks, &exits, header, cfg, graph_facts);
+    let body_scope_blocks = loop_body_scope(
+        LoopKindHint::NumericForLike,
+        Some(latch),
+        &blocks,
+        &exits,
+        header,
+        cfg,
+        graph_facts,
+    );
 
     Some(LoopCandidate {
         header,
         preheader: Some(preheader),
-        binding_scope_blocks,
+        body_scope_blocks,
         control_blocks: BTreeSet::new(),
         backedges: Vec::new(),
         exits: exits.clone(),
@@ -1125,7 +1163,15 @@ fn degenerate_generic_for_loop(
     if !exits.contains(&exit) || !is_reducible_region(cfg, header, &blocks) {
         return None;
     }
-    let binding_scope_blocks = loop_binding_scope(&blocks, &exits, header, cfg, graph_facts);
+    let body_scope_blocks = loop_body_scope(
+        LoopKindHint::GenericForLike,
+        Some(header),
+        &blocks,
+        &exits,
+        header,
+        cfg,
+        graph_facts,
+    );
 
     let preheader = unique_loop_preheader(cfg, header, &blocks);
     let header_value_merges = analyze_loop_header_value_merges(dataflow, header, &blocks);
@@ -1140,7 +1186,7 @@ fn degenerate_generic_for_loop(
         header,
         preheader,
         blocks,
-        binding_scope_blocks,
+        body_scope_blocks,
         control_blocks: BTreeSet::new(),
         backedges: Vec::new(),
         exits,
@@ -1355,22 +1401,30 @@ fn generic_for_source_bindings(
     }
 }
 
-/// 计算 for-loop binding 的可见作用域块集合。
+/// 计算源码 loop body 的词法作用域块集合。
 ///
 /// natural loop 拓扑只包含能回到 header 的 body 块，不含通过 return/break
-/// 提前离开循环的块。但在 Lua 语义下，这些提前退出的块仍处于 for-binding
-/// 的词法作用域中（如 `for i = 1, n do if cond then return i end end`）。
+/// 提前离开循环的块；repeat 的条件前分支还可能先进入 nested loop，再回到尾条件。
 ///
 /// 策略：在 candidate.blocks 基础上，追加被 header 严格支配的提前退出区域。
-/// 只有不是通过 LoopExit 边到达的出口块才被视为提前退出；LoopExit 边的目标是循环
-/// 正常结束后的后继块，for-binding 在那里已失效。
-fn loop_binding_scope(
+/// for 的 LoopExit 与 repeat 尾条件的循环外后继都是词法边界。while/while-true 不做
+/// 扩张，避免把普通 post-loop 和后续 sibling loop 误纳入当前 body。
+fn loop_body_scope(
+    kind_hint: LoopKindHint,
+    continue_target: Option<BlockRef>,
     body_blocks: &BTreeSet<BlockRef>,
     exits: &BTreeSet<BlockRef>,
     header: BlockRef,
     cfg: &Cfg,
     graph_facts: &GraphFacts,
 ) -> BTreeSet<BlockRef> {
+    if !matches!(
+        kind_hint,
+        LoopKindHint::NumericForLike | LoopKindHint::GenericForLike | LoopKindHint::RepeatLike
+    ) {
+        return body_blocks.clone();
+    }
+
     let mut scope = body_blocks.clone();
     let mut scope_boundaries = exits
         .iter()
@@ -1382,6 +1436,16 @@ fn loop_binding_scope(
             })
         })
         .collect::<BTreeSet<_>>();
+    if kind_hint == LoopKindHint::RepeatLike
+        && let Some(continue_target) = continue_target
+    {
+        scope_boundaries.extend(
+            cfg.succs[continue_target.index()]
+                .iter()
+                .map(|edge_ref| cfg.edges[edge_ref.index()].to)
+                .filter(|target| !body_blocks.contains(target)),
+        );
+    }
     if let Some(shared_successor) = shared_unique_exit_successor(exits, cfg) {
         scope_boundaries.insert(shared_successor);
     }
@@ -1614,14 +1678,15 @@ fn block_is_while_header_like(
         .rev()
         .all(|instr_index| {
             let instr = &proto.instrs[instr_index];
-            if instr_writes_any_reg(instr, &carried_regs) || !instr_is_while_header_prefix(instr) {
-                return false;
-            }
-
             let Some(effect) = dataflow.instr_effects.get(instr_index) else {
                 return false;
             };
-            let writes_needed = instr_writes_any_reg_set(effect, &needed_regs);
+            if carried_regs.iter().any(|reg| effect.must_define(*reg))
+                || !instr_is_while_header_prefix(instr)
+            {
+                return false;
+            }
+            let writes_needed = needed_regs.iter().any(|reg| effect.must_define(*reg));
             if !writes_needed {
                 return dataflow
                     .effect_summaries
@@ -1667,65 +1732,6 @@ fn instr_is_while_header_prefix(instr: &LowInstr) -> bool {
             | LowInstr::Jump(_)
             | LowInstr::Branch(_)
     )
-}
-
-fn instr_writes_any_reg(instr: &LowInstr, regs: &BTreeSet<Reg>) -> bool {
-    match instr {
-        LowInstr::Move(instr) => regs.contains(&instr.dst),
-        LowInstr::LoadNil(instr) => (0..instr.dst.len)
-            .map(|offset| Reg(instr.dst.start.index() + offset))
-            .any(|reg| regs.contains(&reg)),
-        LowInstr::LoadBool(instr) => regs.contains(&instr.dst),
-        LowInstr::LoadConst(instr) => regs.contains(&instr.dst),
-        LowInstr::LoadInteger(instr) => regs.contains(&instr.dst),
-        LowInstr::LoadNumber(instr) => regs.contains(&instr.dst),
-        LowInstr::UnaryOp(instr) => regs.contains(&instr.dst),
-        LowInstr::BinaryOp(instr) => regs.contains(&instr.dst),
-        LowInstr::Concat(instr) => regs.contains(&instr.dst),
-        LowInstr::GetUpvalue(instr) => regs.contains(&instr.dst),
-        LowInstr::GetTable(instr) => regs.contains(&instr.dst),
-        LowInstr::NewTable(instr) => regs.contains(&instr.dst),
-        LowInstr::Closure(instr) => regs.contains(&instr.dst),
-        LowInstr::Call(instr) => result_pack_writes_any_reg(&instr.results, regs),
-        LowInstr::VarArg(instr) => result_pack_writes_any_reg(&instr.results, regs),
-        // ErrNil 只读 subject 不写寄存器。
-        LowInstr::ErrNil(_) => false,
-        // 以下指令要么不写寄存器，要么已被 instr_is_while_header_prefix 排除。
-        LowInstr::SetUpvalue(_)
-        | LowInstr::SetTable(_)
-        | LowInstr::SetList(_)
-        | LowInstr::TailCall(_)
-        | LowInstr::Return(_)
-        | LowInstr::Close(_)
-        | LowInstr::Tbc(_)
-        | LowInstr::NumericForInit(_)
-        | LowInstr::NumericForLoop(_)
-        | LowInstr::GenericForCall(_)
-        | LowInstr::GenericForLoop(_)
-        | LowInstr::Jump(_)
-        | LowInstr::Branch(_) => false,
-    }
-}
-
-fn instr_writes_any_reg_set(effect: &crate::structure::InstrEffect, regs: &BTreeSet<Reg>) -> bool {
-    effect.fixed_must_defs.iter().any(|reg| regs.contains(reg))
-        || effect
-            .open_must_def
-            .is_some_and(|start| regs.iter().any(|reg| reg.index() >= start.index()))
-}
-
-fn result_pack_writes_any_reg(results: &ResultPack, regs: &BTreeSet<Reg>) -> bool {
-    match results {
-        ResultPack::Fixed(range) => (0..range.len)
-            .map(|offset| Reg(range.start.index() + offset))
-            .any(|reg| regs.contains(&reg)),
-        // Open result pack 从 start 开始向高位扩展，保守地检查 start 本身。
-        // 实际 while 条件求值中 open pack 极少出现，但如果出现则 start 之后的
-        // 所有寄存器理论上都可能被写入——这里保守处理即可，因为 carried_regs
-        // 通常只包含少量低位循环变量。
-        ResultPack::Open(start) => regs.iter().any(|reg| reg.index() >= start.index()),
-        ResultPack::Ignore => false,
-    }
 }
 
 fn repeat_continue_target_via_backedge_pad(

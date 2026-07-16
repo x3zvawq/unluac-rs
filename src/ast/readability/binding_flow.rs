@@ -134,16 +134,14 @@ impl BindingUseIndex {
         self.count_uses_in_suffix(start, binding) - self.count_uses_in_suffix(end, binding)
     }
 
-    pub(super) fn count_uses_in_stmt_index(
+    pub(super) fn uses_in_stmt_index(
         &self,
         stmt_index: usize,
-        binding: AstBindingRef,
-    ) -> usize {
+    ) -> impl Iterator<Item = (AstBindingRef, usize)> + '_ {
         self.stmt_counts
             .get(stmt_index)
-            .and_then(|counts| counts.get(&binding))
-            .copied()
-            .unwrap_or(0)
+            .into_iter()
+            .flat_map(|counts| counts.iter().map(|(binding, count)| (*binding, *count)))
     }
 }
 

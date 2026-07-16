@@ -477,7 +477,6 @@ impl HirVisitor for ScopeActivityCollector {
             | HirStmt::While(_)
             | HirStmt::Repeat(_)
             | HirStmt::Block(_)
-            | HirStmt::Unstructured(_)
             | HirStmt::Break
             | HirStmt::Continue
             | HirStmt::Goto(_)

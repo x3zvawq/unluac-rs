@@ -44,7 +44,7 @@ impl StructuredBodyLowerer<'_, '_> {
             && else_entry.is_some()
             && self.block_is_terminal_exit(merge)
         {
-            return if self.terminal_exit_block_is_clone_safe(merge) {
+            return if self.terminal_exit_block_is_clone_boundary(merge) {
                 Some(stop)
             } else {
                 Some(merge)
@@ -179,13 +179,10 @@ impl StructuredBodyLowerer<'_, '_> {
         let active_header_has_numeric_for_owner = self.target.caps.continue_stmt
             && active_candidate.kind_hint == LoopKindHint::WhileLike
             && self
-                .loops_by_header
-                .get(&active_candidate.header)
-                .is_some_and(|candidates| {
-                    candidates.iter().any(|(_, candidate)| {
-                        candidate.kind_hint == LoopKindHint::NumericForLike
-                            && candidate.preheader.is_some()
-                    })
+                .loop_candidates_for_header(active_candidate.header)
+                .any(|(_, candidate)| {
+                    candidate.kind_hint == LoopKindHint::NumericForLike
+                        && candidate.preheader.is_some()
                 });
         if active_header_has_numeric_for_owner && let Some(else_entry) = else_entry {
             for nested in &self.lowering.structure.loop_candidates {
@@ -194,9 +191,7 @@ impl StructuredBodyLowerer<'_, '_> {
                 };
                 if nested.kind_hint != LoopKindHint::NumericForLike
                     || nested.header == active_candidate.header
-                    || !nested
-                        .blocks
-                        .is_subset(&active_candidate.binding_scope_blocks)
+                    || !nested.blocks.is_subset(&active_candidate.body_scope_blocks)
                     || !region.structured_blocks.contains(&candidate)
                     || consumed_blocks.contains(&candidate)
                     || candidate == block
@@ -225,9 +220,7 @@ impl StructuredBodyLowerer<'_, '_> {
             .iter()
             .filter(|nested| {
                 nested.header != loop_context.header
-                    && nested
-                        .blocks
-                        .is_subset(&active_candidate.binding_scope_blocks)
+                    && nested.blocks.is_subset(&active_candidate.body_scope_blocks)
             })
             .flat_map(|nested| {
                 nested.blocks.iter().copied().filter(|block| {
@@ -238,15 +231,17 @@ impl StructuredBodyLowerer<'_, '_> {
             .collect::<BTreeSet<_>>();
         let stop_predecessor_has_continue_owner = |from: BlockRef| {
             loop_context.continue_sources.contains(&from)
-                || self.branch_by_header.get(&from).is_some_and(|branch| {
-                    branch.else_entry.is_none()
-                        && branch.merge == Some(stop)
-                        && self.branch_arm_reaches_target_before_boundary(
-                            branch.then_entry,
-                            region.merge,
-                            stop,
-                        )
-                })
+                || self
+                    .branch_candidate_for_header(from)
+                    .is_some_and(|branch| {
+                        branch.else_entry.is_none()
+                            && branch.merge == Some(stop)
+                            && self.branch_arm_reaches_target_before_boundary(
+                                branch.then_entry,
+                                region.merge,
+                                stop,
+                            )
+                    })
         };
         let stop_predecessors_have_expected_owners = || {
             let mut has_continue_owner = false;
@@ -320,8 +315,7 @@ impl StructuredBodyLowerer<'_, '_> {
             if fallback_continuation.is_none()
                 && let Some(else_entry) = else_entry
                 && self
-                    .branch_by_header
-                    .get(&candidate)
+                    .branch_candidate_for_header(candidate)
                     .is_some_and(|branch| branch.merge == Some(stop))
                 && self.can_reach_avoiding_block(then_entry, candidate, stop)
                 && self.can_reach_avoiding_block(else_entry, candidate, stop)
@@ -356,14 +350,14 @@ impl StructuredBodyLowerer<'_, '_> {
         loop_context: &ActiveLoopContext,
         active_candidate: &LoopCandidate,
     ) -> Option<BlockRef> {
-        let tail_branch = self.branch_by_header.get(&continuation)?;
+        let tail_branch = self.branch_candidate_for_header(continuation)?;
         if tail_branch.else_entry.is_some() {
             return None;
         }
         let shared_tail = match self.multi_node_short_circuit_non_continue_exit(
             continuation,
             stop,
-            &active_candidate.binding_scope_blocks,
+            &active_candidate.body_scope_blocks,
         ) {
             Ok(Some(exit)) => exit,
             Ok(None) => tail_branch.then_entry,
@@ -374,8 +368,8 @@ impl StructuredBodyLowerer<'_, '_> {
             .is_some()
         {
             shared_tail
-        } else if !self.branch_by_header.contains_key(&shared_tail)
-            && !self.loop_headers.contains(&shared_tail)
+        } else if self.branch_candidate_for_header(shared_tail).is_none()
+            && !self.has_loop_header(shared_tail)
         {
             let successor = self.lowering.cfg.unique_reachable_successor(shared_tail)?;
             self.nested_loop_owner_for_entry(active_candidate, successor)?;
@@ -383,7 +377,7 @@ impl StructuredBodyLowerer<'_, '_> {
         } else {
             return None;
         };
-        let mut current_iteration = active_candidate.binding_scope_blocks.clone();
+        let mut current_iteration = active_candidate.body_scope_blocks.clone();
         current_iteration.remove(&loop_context.header);
         current_iteration.remove(&stop);
         let predecessors = self.lowering.cfg.preds[shared_tail.index()]
@@ -477,11 +471,10 @@ impl StructuredBodyLowerer<'_, '_> {
         {
             if self.block_is_active_loop_escape(merge) {
                 Some(branch_stop)
-            } else if self.loops_by_header.get(&merge).is_some_and(|candidates| {
-                candidates
-                    .iter()
-                    .any(|(_, candidate)| candidate.preheader == Some(entry))
-            }) {
+            } else if self
+                .loop_candidates_for_header(merge)
+                .any(|(_, candidate)| candidate.preheader == Some(entry))
+            {
                 // 分支的一臂直接回到外层 loop continue，另一臂入口可能正好是嵌套
                 // for-loop 的 preheader；此时 postdom 给出的 merge 是内层 loop header，
                 // 但它语义上属于这一条 arm，而不是两臂共享 tail。若把 arm 截到

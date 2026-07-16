@@ -49,12 +49,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         match preheader {
             Some(preheader) => {
                 let incoming = value.outside_arm.incoming_for_pred(preheader)?;
-                self.loop_incoming_expr(
-                    preheader,
-                    value.reg,
-                    self.lowering.dataflow.leaf_defs(incoming.value),
-                    target_overrides,
-                )
+                self.loop_incoming_expr(preheader, value.reg, incoming.value, target_overrides)
             }
             None => self.multi_entry_loop_entry_expr(value, target_overrides),
         }
@@ -106,25 +101,18 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .loop_incoming_expr_without_carried_override(
                     pred,
                     reg,
-                    self.lowering.dataflow.leaf_defs(incoming.value),
+                    incoming.value,
                     target_overrides,
                 )
                 .or_else(|| {
                     self.loop_incoming_expr_without_carried_override(
                         pred,
                         reg,
-                        self.lowering.dataflow.leaf_defs(incoming.value),
+                        incoming.value,
                         &raw_target_overrides,
                     )
                 })
-                .or_else(|| {
-                    self.loop_incoming_expr(
-                        pred,
-                        reg,
-                        self.lowering.dataflow.leaf_defs(incoming.value),
-                        target_overrides,
-                    )
-                }),
+                .or_else(|| self.loop_incoming_expr(pred, reg, incoming.value, target_overrides)),
             None => Some(self.loop_entry_initial_expr(reg)),
         })
     }
@@ -142,25 +130,18 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .loop_incoming_lvalue_without_carried_override(
                     pred,
                     reg,
-                    self.lowering.dataflow.leaf_defs(incoming.value),
+                    incoming.value,
                     target_overrides,
                 )
                 .or_else(|| {
                     self.loop_incoming_lvalue_without_carried_override(
                         pred,
                         reg,
-                        self.lowering.dataflow.leaf_defs(incoming.value),
+                        incoming.value,
                         &raw_target_overrides,
                     )
                 })
-                .or_else(|| {
-                    self.loop_incoming_lvalue(
-                        pred,
-                        reg,
-                        self.lowering.dataflow.leaf_defs(incoming.value),
-                        target_overrides,
-                    )
-                }),
+                .or_else(|| self.loop_incoming_lvalue(pred, reg, incoming.value, target_overrides)),
             None => expr_as_lvalue(&self.loop_entry_initial_expr(reg)),
         })
     }
@@ -179,32 +160,30 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         &self,
         pred: BlockRef,
         reg: Reg,
-        defs: impl IntoIterator<Item = crate::structure::DefId>,
+        value: SsaValue,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirExpr> {
-        self.loop_incoming_expr_with_carried_override(pred, reg, defs, target_overrides, true)
+        self.loop_incoming_expr_with_carried_override(pred, reg, value, target_overrides, true)
     }
 
     fn loop_incoming_expr_without_carried_override(
         &self,
         pred: BlockRef,
         reg: Reg,
-        defs: impl IntoIterator<Item = crate::structure::DefId>,
+        value: SsaValue,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirExpr> {
-        self.loop_incoming_expr_with_carried_override(pred, reg, defs, target_overrides, false)
+        self.loop_incoming_expr_with_carried_override(pred, reg, value, target_overrides, false)
     }
 
     fn loop_incoming_expr_with_carried_override(
         &self,
         pred: BlockRef,
         reg: Reg,
-        defs: impl IntoIterator<Item = crate::structure::DefId>,
+        value: SsaValue,
         target_overrides: &BTreeMap<TempId, HirLValue>,
         allow_carried_override: bool,
     ) -> Option<HirExpr> {
-        let defs = defs.into_iter().collect::<Vec<_>>();
-
         if let Some(local) = self.lowering.bindings.local_for_reg_in_block(pred, reg) {
             return Some(HirExpr::LocalRef(local));
         }
@@ -216,6 +195,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if allow_carried_override && let Some(expr) = self.overrides.carried_entry_expr(pred, reg) {
             return Some(expr.clone());
         }
+
+        let defs = self
+            .lowering
+            .dataflow
+            .leaf_defs(value)
+            .into_iter()
+            .collect::<Vec<_>>();
 
         if let Some(expr) = shared_expr_for_defs(
             &self.lowering.bindings.fixed_temps,
@@ -275,7 +261,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // pred 内部如果有任何 def 写到该寄存器，edge 上就不再是 undef。
         !(range.start.index()..range.end()).any(|instr_index| {
             let effect = &self.lowering.dataflow.instr_effects[instr_index];
-            effect.fixed_must_defs.contains(&reg)
+            effect.must_define(reg)
         })
     }
 
@@ -403,11 +389,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // preheader 可由 island 多次重入；只有它没有重定义该寄存器时，入口 Phi
         // 才是所有入口与 loop 写回共享的稳定可写身份。
         let range = self.lowering.cfg.blocks[preheader.index()].instrs;
-        if (range.start.index()..range.end()).any(|instr_index| {
-            self.lowering.dataflow.instr_effects[instr_index]
-                .fixed_must_defs
-                .contains(&reg)
-        }) {
+        if (range.start.index()..range.end())
+            .any(|instr_index| self.lowering.dataflow.instr_effects[instr_index].must_define(reg))
+        {
             return None;
         }
         let SsaValue::Phi(phi_id) = self.lowering.dataflow.block_entry_value(preheader, reg) else {
@@ -447,32 +431,30 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         &self,
         pred: BlockRef,
         reg: Reg,
-        defs: impl IntoIterator<Item = crate::structure::DefId>,
+        value: SsaValue,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirLValue> {
-        self.loop_incoming_lvalue_with_carried_override(pred, reg, defs, target_overrides, true)
+        self.loop_incoming_lvalue_with_carried_override(pred, reg, value, target_overrides, true)
     }
 
     fn loop_incoming_lvalue_without_carried_override(
         &self,
         pred: BlockRef,
         reg: Reg,
-        defs: impl IntoIterator<Item = crate::structure::DefId>,
+        value: SsaValue,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirLValue> {
-        self.loop_incoming_lvalue_with_carried_override(pred, reg, defs, target_overrides, false)
+        self.loop_incoming_lvalue_with_carried_override(pred, reg, value, target_overrides, false)
     }
 
     fn loop_incoming_lvalue_with_carried_override(
         &self,
         pred: BlockRef,
         reg: Reg,
-        defs: impl IntoIterator<Item = crate::structure::DefId>,
+        value: SsaValue,
         target_overrides: &BTreeMap<TempId, HirLValue>,
         allow_carried_override: bool,
     ) -> Option<HirLValue> {
-        let defs = defs.into_iter().collect::<Vec<_>>();
-
         if let Some(local) = self.lowering.bindings.local_for_reg_in_block(pred, reg) {
             return Some(HirLValue::Local(local));
         }
@@ -485,6 +467,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         {
             return Some(target);
         }
+
+        let defs = self
+            .lowering
+            .dataflow
+            .leaf_defs(value)
+            .into_iter()
+            .collect::<Vec<_>>();
 
         if let Some(target) = shared_lvalue_for_defs(
             &self.lowering.bindings.fixed_temps,

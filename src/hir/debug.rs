@@ -242,11 +242,6 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
                 let _ = writeln!(output, "{indent}block");
                 write_block(output, &format!("{indent}  "), block);
             }
-            HirStmt::Unstructured(unstructured) => {
-                let summary = unstructured.summary.as_deref().unwrap_or("-");
-                let _ = writeln!(output, "{indent}unstructured summary={summary}");
-                write_block(output, &format!("{indent}  "), &unstructured.body);
-            }
         }
     }
 }

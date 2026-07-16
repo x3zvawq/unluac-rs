@@ -515,9 +515,9 @@ fn consumed_def_has_intervening_use(
 }
 
 fn branch_cond_regs(cond: crate::transformer::BranchCond) -> Vec<Reg> {
-    match cond.operands {
-        BranchOperands::Unary(operand) => cond_operand_reg(operand).into_iter().collect(),
-        BranchOperands::Binary(lhs, rhs) => cond_operand_reg(lhs)
+    match cond.subject {
+        BranchSubject::Truthy(operand) => cond_operand_reg(operand).into_iter().collect(),
+        BranchSubject::Compare { lhs, rhs, .. } => cond_operand_reg(lhs)
             .into_iter()
             .chain(cond_operand_reg(rhs))
             .collect(),

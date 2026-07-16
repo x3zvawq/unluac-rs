@@ -129,7 +129,7 @@ pub(crate) fn analyze_structure_proto(
     );
     let cleanup_dispositions =
         scope::analyze_cleanup_dispositions(proto, cfg, &loop_candidates, &scope_candidates);
-    let plan = plan::build_structure_plan(
+    let mut plan = plan::build_structure_plan(
         cfg,
         &branch_candidates,
         &branch_value_merge_candidates,
@@ -138,12 +138,17 @@ pub(crate) fn analyze_structure_proto(
         &region_facts,
         cleanup_dispositions,
     );
+    plan::install_unstructured_region_layouts(&mut plan, proto, cfg, graph_facts, &region_facts);
     phi_facts::remove_branch_owned_loop_exit_values(
         &mut loop_candidates,
         &branch_value_merge_candidates,
         &plan,
+        dataflow,
     );
     phi_facts::remove_loop_header_owned_loop_exit_values(&mut loop_candidates);
+    let (phi_incoming_dispositions, phi_edge_copies) =
+        phi_facts::analyze_phi_incoming_dispositions(cfg, dataflow, &plan, &goto_requirements);
+    plan::install_phi_incoming_dispositions(&mut plan, phi_incoming_dispositions, phi_edge_copies);
     let generic_phi_materializations = phi_facts::analyze_generic_phi_materializations(
         cfg,
         graph_facts,
@@ -152,6 +157,12 @@ pub(crate) fn analyze_structure_proto(
         &plan,
         &loop_candidates,
         &short_circuit_candidates,
+    );
+    plan::install_generic_phi_materializations(
+        &mut plan,
+        cfg.blocks.len(),
+        dataflow.phi_candidates.len(),
+        generic_phi_materializations,
     );
     let children = proto
         .children
@@ -177,7 +188,6 @@ pub(crate) fn analyze_structure_proto(
         branch_candidates,
         branch_region_facts,
         branch_value_merge_candidates,
-        generic_phi_materializations,
         loop_candidates,
         short_circuit_candidates,
         goto_requirements,

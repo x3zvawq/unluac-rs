@@ -65,6 +65,8 @@ pub struct DominatorTree {
     pub order: Vec<BlockRef>,
     pub(crate) preorder_index: Vec<Option<usize>>,
     pub(crate) subtree_end: Vec<Option<usize>>,
+    pub(crate) depth: Vec<Option<usize>>,
+    pub(crate) ancestors: Vec<Vec<Option<BlockRef>>>,
 }
 
 impl DominatorTree {
@@ -73,7 +75,7 @@ impl DominatorTree {
     }
 
     pub fn nearest_common_ancestor(&self, left: BlockRef, right: BlockRef) -> Option<BlockRef> {
-        nearest_common_tree_ancestor(&self.parent, left, right)
+        nearest_common_tree_ancestor(&self.parent, &self.depth, &self.ancestors, left, right)
     }
 }
 
@@ -85,6 +87,8 @@ pub struct PostDominatorTree {
     pub order: Vec<BlockRef>,
     pub(crate) preorder_index: Vec<Option<usize>>,
     pub(crate) subtree_end: Vec<Option<usize>>,
+    pub(crate) depth: Vec<Option<usize>>,
+    pub(crate) ancestors: Vec<Vec<Option<BlockRef>>>,
 }
 
 impl PostDominatorTree {
@@ -93,7 +97,7 @@ impl PostDominatorTree {
     }
 
     pub fn nearest_common_ancestor(&self, left: BlockRef, right: BlockRef) -> Option<BlockRef> {
-        nearest_common_tree_ancestor(&self.parent, left, right)
+        nearest_common_tree_ancestor(&self.parent, &self.depth, &self.ancestors, left, right)
     }
 }
 
@@ -127,23 +131,53 @@ fn tree_dominates(
 
 fn nearest_common_tree_ancestor(
     parent: &[Option<BlockRef>],
-    left: BlockRef,
-    right: BlockRef,
+    depth: &[Option<usize>],
+    ancestors: &[Vec<Option<BlockRef>>],
+    mut left: BlockRef,
+    mut right: BlockRef,
 ) -> Option<BlockRef> {
-    let mut ancestors = BTreeSet::new();
-    let mut cursor = Some(left);
-    while let Some(block) = cursor {
-        ancestors.insert(block);
-        cursor = parent[block.index()];
-    }
+    let mut left_depth = depth.get(left.index()).copied().flatten()?;
+    let mut right_depth = depth.get(right.index()).copied().flatten()?;
 
-    let mut cursor = Some(right);
-    while let Some(block) = cursor {
-        if ancestors.contains(&block) {
-            return Some(block);
+    if left_depth < right_depth {
+        std::mem::swap(&mut left, &mut right);
+        std::mem::swap(&mut left_depth, &mut right_depth);
+    }
+    left = lift_tree_node(ancestors, left, left_depth - right_depth)?;
+
+    if left == right {
+        return Some(left);
+    }
+    for level in (0..ancestors.len()).rev() {
+        let left_ancestor = ancestors[level][left.index()];
+        let right_ancestor = ancestors[level][right.index()];
+        if left_ancestor != right_ancestor
+            && let (Some(next_left), Some(next_right)) = (left_ancestor, right_ancestor)
+        {
+            left = next_left;
+            right = next_right;
         }
-        cursor = parent[block.index()];
     }
 
-    None
+    parent[left.index()]
+}
+
+fn lift_tree_node(
+    ancestors: &[Vec<Option<BlockRef>>],
+    mut block: BlockRef,
+    mut distance: usize,
+) -> Option<BlockRef> {
+    let mut level = 0;
+    while distance != 0 {
+        if distance & 1 != 0 {
+            block = ancestors
+                .get(level)?
+                .get(block.index())
+                .copied()
+                .flatten()?;
+        }
+        distance >>= 1;
+        level += 1;
+    }
+    Some(block)
 }

@@ -18,13 +18,13 @@ use crate::transformer::dialect::puc_lua::{
 };
 use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
-    AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchOperands,
-    BranchPredicate, CallInstr, CallKind, Capture, CaptureSource, CloseInstr, ClosureInstr,
-    ConcatInstr, CondOperand, ConstRef, DialectCaptureExtra, GenericForCallInstr, GetTableInstr,
-    GetTableKind, GetUpvalueInstr, InstrRef, LoadBoolInstr, LoadConstInstr, LoadIntegerInstr,
-    LoadNilInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr,
-    ProtoRef, Reg, RegRange, ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr,
-    TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchPredicate, CallInstr,
+    CallKind, Capture, CaptureSource, CloseInstr, ClosureInstr, ConcatInstr, CondOperand, ConstRef,
+    DialectCaptureExtra, GenericForCallInstr, GetTableInstr, GetTableKind, GetUpvalueInstr,
+    InstrRef, LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LowInstr,
+    LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange,
+    ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TransformError,
+    UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
 pub(crate) fn lower_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
@@ -483,11 +483,7 @@ impl<'a> ProtoLowerer<'a> {
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Branch {
-                            cond: BranchCond {
-                                predicate: BranchPredicate::Truthy,
-                                operands: BranchOperands::Unary(CondOperand::Reg(reg_from_u8(a))),
-                                negated: false,
-                            },
+                            cond: BranchCond::truthy(CondOperand::Reg(reg_from_u8(a)), false),
                             then_target: TargetPlaceholder::Raw(
                                 self.jump_target(raw_pc, i32::from(d))?,
                             ),
@@ -505,11 +501,7 @@ impl<'a> ProtoLowerer<'a> {
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Branch {
-                            cond: BranchCond {
-                                predicate: BranchPredicate::Truthy,
-                                operands: BranchOperands::Unary(CondOperand::Reg(reg_from_u8(a))),
-                                negated: true,
-                            },
+                            cond: BranchCond::truthy(CondOperand::Reg(reg_from_u8(a)), true),
                             then_target: TargetPlaceholder::Raw(
                                 self.jump_target(raw_pc, i32::from(d))?,
                             ),
@@ -532,14 +524,12 @@ impl<'a> ProtoLowerer<'a> {
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Branch {
-                            cond: BranchCond {
-                                predicate: compare_predicate(opcode),
-                                operands: BranchOperands::Binary(
-                                    CondOperand::Reg(reg_from_u8(a)),
-                                    CondOperand::Reg(reg_from_u8(aux_reg(raw_pc, opcode, extra)?)),
-                                ),
-                                negated: compare_negated(opcode),
-                            },
+                            cond: BranchCond::compare(
+                                compare_predicate(opcode),
+                                CondOperand::Reg(reg_from_u8(a)),
+                                CondOperand::Reg(reg_from_u8(aux_reg(raw_pc, opcode, extra)?)),
+                                compare_negated(opcode),
+                            ),
                             then_target: TargetPlaceholder::Raw(
                                 self.jump_target(raw_pc, i32::from(d))?,
                             ),
@@ -558,19 +548,14 @@ impl<'a> ProtoLowerer<'a> {
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Branch {
-                            cond: BranchCond {
-                                predicate: BranchPredicate::Eq,
-                                operands: BranchOperands::Binary(
-                                    CondOperand::Reg(reg_from_u8(a)),
-                                    CondOperand::Const(
-                                        self.literal_const_ref(
-                                            raw_pc,
-                                            (aux & 0x00ff_ffff) as usize,
-                                        )?,
-                                    ),
+                            cond: BranchCond::compare(
+                                BranchPredicate::Eq,
+                                CondOperand::Reg(reg_from_u8(a)),
+                                CondOperand::Const(
+                                    self.literal_const_ref(raw_pc, (aux & 0x00ff_ffff) as usize)?,
                                 ),
-                                negated: aux_not(aux),
-                            },
+                                aux_not(aux),
+                            ),
                             then_target: TargetPlaceholder::Raw(
                                 self.jump_target(raw_pc, i32::from(d))?,
                             ),
@@ -589,19 +574,14 @@ impl<'a> ProtoLowerer<'a> {
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Branch {
-                            cond: BranchCond {
-                                predicate: BranchPredicate::Eq,
-                                operands: BranchOperands::Binary(
-                                    CondOperand::Reg(reg_from_u8(a)),
-                                    CondOperand::Const(
-                                        self.string_const_ref(
-                                            raw_pc,
-                                            (aux & 0x00ff_ffff) as usize,
-                                        )?,
-                                    ),
+                            cond: BranchCond::compare(
+                                BranchPredicate::Eq,
+                                CondOperand::Reg(reg_from_u8(a)),
+                                CondOperand::Const(
+                                    self.string_const_ref(raw_pc, (aux & 0x00ff_ffff) as usize)?,
                                 ),
-                                negated: aux_not(aux),
-                            },
+                                aux_not(aux),
+                            ),
                             then_target: TargetPlaceholder::Raw(
                                 self.jump_target(raw_pc, i32::from(d))?,
                             ),
@@ -620,14 +600,12 @@ impl<'a> ProtoLowerer<'a> {
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Branch {
-                            cond: BranchCond {
-                                predicate: BranchPredicate::Eq,
-                                operands: BranchOperands::Binary(
-                                    CondOperand::Reg(reg_from_u8(a)),
-                                    CondOperand::Boolean((aux & 1) != 0),
-                                ),
-                                negated: aux_not(aux),
-                            },
+                            cond: BranchCond::compare(
+                                BranchPredicate::Eq,
+                                CondOperand::Reg(reg_from_u8(a)),
+                                CondOperand::Boolean((aux & 1) != 0),
+                                aux_not(aux),
+                            ),
                             then_target: TargetPlaceholder::Raw(
                                 self.jump_target(raw_pc, i32::from(d))?,
                             ),
@@ -646,14 +624,12 @@ impl<'a> ProtoLowerer<'a> {
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Branch {
-                            cond: BranchCond {
-                                predicate: BranchPredicate::Eq,
-                                operands: BranchOperands::Binary(
-                                    CondOperand::Reg(reg_from_u8(a)),
-                                    CondOperand::Nil,
-                                ),
-                                negated: aux_not(aux),
-                            },
+                            cond: BranchCond::compare(
+                                BranchPredicate::Eq,
+                                CondOperand::Reg(reg_from_u8(a)),
+                                CondOperand::Nil,
+                                aux_not(aux),
+                            ),
                             then_target: TargetPlaceholder::Raw(
                                 self.jump_target(raw_pc, i32::from(d))?,
                             ),
@@ -1322,11 +1298,7 @@ impl<'a> ProtoLowerer<'a> {
             Some(raw_index),
             vec![raw_index],
             PendingLowInstr::Branch {
-                cond: BranchCond {
-                    predicate: BranchPredicate::Truthy,
-                    operands: BranchOperands::Unary(CondOperand::Reg(condition)),
-                    negated: false,
-                },
+                cond: BranchCond::truthy(CondOperand::Reg(condition), false),
                 then_target: TargetPlaceholder::Low(truthy_low),
                 else_target: TargetPlaceholder::Low(falsy_low),
             },

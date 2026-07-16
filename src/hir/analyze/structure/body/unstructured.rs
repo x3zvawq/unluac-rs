@@ -9,7 +9,6 @@ use super::*;
 
 #[derive(Clone, Copy)]
 struct UnstructuredEntryArm {
-    entry_edge: crate::structure::EdgeRef,
     pad: Option<BlockRef>,
     island_edge: crate::structure::EdgeRef,
     region_id: RegionId,
@@ -70,7 +69,6 @@ impl StructuredBodyLowerer<'_, '_> {
                 Some(EdgeOwner::Goto(_))
             )
             .then_some(UnstructuredEntryArm {
-                entry_edge,
                 pad: None,
                 island_edge: entry_edge,
                 region_id,
@@ -114,7 +112,6 @@ impl StructuredBodyLowerer<'_, '_> {
             .structure
             .unstructured_region(self.lowering.cfg.edges[island_edge.index()].to)?;
         Some(UnstructuredEntryArm {
-            entry_edge,
             pad: Some(target),
             island_edge,
             region_id,
@@ -131,12 +128,10 @@ impl StructuredBodyLowerer<'_, '_> {
             return self.lower_required_goto_edge(arm.island_edge, next, target_overrides);
         };
 
-        let mut stmts = lower_edge_phi_copies_for_edge(self.lowering, arm.entry_edge);
-        apply_loop_rewrites(&mut stmts, target_overrides);
         if !self.visited.insert(pad) {
             return None;
         }
-        stmts.extend(self.lower_unstructured_prefix(pad, false)?);
+        let mut stmts = self.lower_block_prefix(pad, false, target_overrides)?;
         stmts.extend(
             self.lower_required_goto_edge(arm.island_edge, next, target_overrides)?
                 .stmts,
@@ -159,20 +154,9 @@ impl StructuredBodyLowerer<'_, '_> {
         if region.structureable || !region.blocks.contains(&start) {
             return None;
         }
-
-        // irreducible region 的入口可能先被 region 内的 loop header 后支配；真正的
-        // continuation 是后支配链上第一个离开 island 的 block。
-        let mut continuation = region.entry;
-        while region.blocks.contains(&continuation) {
-            continuation =
-                self.lowering.graph_facts.post_dominator_tree.parent[continuation.index()]?;
-        }
-        let mut layout = region.blocks.clone();
-        for exit in &region.exits {
-            self.extend_through_empty_exit_pads(*exit, continuation, &mut layout)?;
-        }
-        layout.remove(&continuation);
-        if stop.is_some_and(|stop| layout.contains(&stop)) {
+        let layout = self.lowering.structure.unstructured_layout(region_id)?;
+        let continuation = layout.continuation;
+        if stop.is_some_and(|stop| layout.blocks.contains(&stop)) {
             return None;
         }
 
@@ -182,7 +166,7 @@ impl StructuredBodyLowerer<'_, '_> {
             .block_order
             .iter()
             .copied()
-            .filter(|block| layout.contains(block))
+            .filter(|block| layout.blocks.contains(block))
             .collect::<Vec<_>>();
         let start_index = blocks.iter().position(|block| *block == start)?;
         blocks.rotate_left(start_index);
@@ -194,7 +178,7 @@ impl StructuredBodyLowerer<'_, '_> {
                     .any(|edge_ref| {
                         let predecessor = self.lowering.cfg.edges[edge_ref.index()].from;
                         self.lowering.cfg.reachable_blocks.contains(&predecessor)
-                            && !layout.contains(&predecessor)
+                            && !layout.blocks.contains(&predecessor)
                     });
             if has_outside_predecessor
                 && self
@@ -202,7 +186,7 @@ impl StructuredBodyLowerer<'_, '_> {
                     .dataflow
                     .phi_candidates_in_block(continuation)
                     .iter()
-                    .any(|phi| !self.lowering.dead_phis.contains(&phi.id))
+                    .any(|phi| !self.lowering.structure.phi_is_dead(phi.id))
             {
                 return None;
             }
@@ -338,7 +322,7 @@ impl StructuredBodyLowerer<'_, '_> {
             }
             return Some(stmts);
         };
-        if !is_control_terminator(instr) {
+        if !instr.is_control_terminator() {
             let target = self.lowering.cfg.unique_reachable_successor(block)?;
             stmts.extend(self.lower_unstructured_edge_to(block, target, next)?.stmts);
             return Some(stmts);
@@ -457,31 +441,6 @@ impl StructuredBodyLowerer<'_, '_> {
         Some(HirBlock { stmts })
     }
 
-    fn extend_through_empty_exit_pads(
-        &self,
-        mut block: BlockRef,
-        continuation: BlockRef,
-        layout: &mut BTreeSet<BlockRef>,
-    ) -> Option<()> {
-        while block != continuation {
-            if layout.contains(&block) {
-                return Some(());
-            }
-            if !matches!(
-                self.lowering.structure.block_owner(block),
-                Some(BlockOwner::Linear)
-            ) || !self
-                .block_prefix_instr_indices(block, false)?
-                .all(|index| self.unstructured_exit_pad_instr_is_cleanup(InstrRef(index)))
-            {
-                return None;
-            }
-            layout.insert(block);
-            block = self.lowering.cfg.unique_reachable_successor(block)?;
-        }
-        Some(())
-    }
-
     fn unstructured_prefix_instr_is_omitted(&self, instr_ref: InstrRef) -> bool {
         matches!(
             self.lowering.proto.instrs[instr_ref.index()],
@@ -490,17 +449,6 @@ impl StructuredBodyLowerer<'_, '_> {
             self.lowering.structure.cleanup_disposition(instr_ref),
             CleanupDisposition::LexicalScope(_) | CleanupDisposition::Unreachable
         )
-    }
-
-    fn unstructured_exit_pad_instr_is_cleanup(&self, instr_ref: InstrRef) -> bool {
-        self.unstructured_prefix_instr_is_omitted(instr_ref)
-            || matches!(
-                self.lowering.proto.instrs[instr_ref.index()],
-                LowInstr::Close(_)
-            ) && matches!(
-                self.lowering.structure.cleanup_disposition(instr_ref),
-                CleanupDisposition::ExplicitTbcBoundary
-            )
     }
 
     pub(super) fn required_goto_edge(

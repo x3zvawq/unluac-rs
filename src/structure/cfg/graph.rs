@@ -143,6 +143,8 @@ fn compute_post_dominator_tree(cfg: &Cfg, reverse_rpo: &[BlockRef]) -> PostDomin
         order: tree.order,
         preorder_index: tree.preorder_index,
         subtree_end: tree.subtree_end,
+        depth: tree.depth,
+        ancestors: tree.ancestors,
     }
 }
 
@@ -338,6 +340,7 @@ fn compute_tree(cfg: &Cfg, rpo: &[BlockRef], root: BlockRef, reverse: bool) -> D
         collect_tree_order(root, &children, &mut order);
     }
     let (preorder_index, subtree_end) = tree_intervals(&parent, &order);
+    let (depth, ancestors) = tree_lca_index(&parent, &order);
 
     DominatorTree {
         parent,
@@ -345,6 +348,8 @@ fn compute_tree(cfg: &Cfg, rpo: &[BlockRef], root: BlockRef, reverse: bool) -> D
         order,
         preorder_index,
         subtree_end,
+        depth,
+        ancestors,
     }
 }
 
@@ -365,6 +370,37 @@ fn tree_intervals(
         subtree_end[parent.index()] = subtree_end[parent.index()].max(subtree_end[block.index()]);
     }
     (preorder_index, subtree_end)
+}
+
+fn tree_lca_index(
+    parent: &[Option<BlockRef>],
+    order: &[BlockRef],
+) -> (Vec<Option<usize>>, Vec<Vec<Option<BlockRef>>>) {
+    let mut depth = vec![None; parent.len()];
+    for block in order.iter().copied() {
+        depth[block.index()] = Some(
+            parent[block.index()]
+                .and_then(|parent| depth[parent.index()])
+                .map_or(0, |parent_depth| parent_depth + 1),
+        );
+    }
+
+    let mut ancestors = Vec::new();
+    if !parent.is_empty() {
+        ancestors.push(parent.to_vec());
+    }
+    while (1usize << ancestors.len()) < parent.len() {
+        let previous = ancestors
+            .last()
+            .expect("non-empty tree has a first ancestor level");
+        ancestors.push(
+            previous
+                .iter()
+                .map(|ancestor| ancestor.and_then(|block| previous[block.index()]))
+                .collect(),
+        );
+    }
+    (depth, ancestors)
 }
 
 fn incoming_blocks(cfg: &Cfg, block: BlockRef, reverse: bool) -> Vec<BlockRef> {

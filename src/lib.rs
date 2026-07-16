@@ -18,3 +18,6 @@ mod timing;
 pub mod transformer;
 
 pub use lua_string::LuaString;
+
+/// Lua/Luau 编译器普遍把单函数局部槽限制在 200 左右；留出参数与控制变量余量。
+pub(crate) const SOURCE_LOCAL_LIMIT: usize = 180;

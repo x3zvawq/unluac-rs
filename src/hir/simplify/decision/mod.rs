@@ -5,8 +5,7 @@
 //! 与具体 case 无关的通用规则：
 //! 1. 常量 truthiness 驱动的分支裁剪；
 //! 2. `then/else` 指向同一结果时的节点消除；
-//! 3. 已知某条边上 test 结果后，对子节点同一 test 的重复判断消除；
-//! 4. 根节点和内部节点裁剪后留下的不可达节点清理。
+//! 3. 根节点和内部节点裁剪后留下的不可达节点清理。
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -14,18 +13,15 @@ mod eliminate;
 mod eliminate_materialize;
 mod eliminate_state;
 mod helpers;
-mod specialize;
 mod synthesize;
 
 use super::expr_facts::{expr_is_boolean_valued, expr_truthiness};
 use super::walk::{ExprRewritePass, rewrite_proto_exprs};
-use helpers::{logical_and, logical_or};
-use specialize::specialize_decision_by_known_tests;
-
 use crate::hir::common::{
     HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr, HirProto,
 };
 use crate::hir::expr_safety::{expr_is_discard_safe, expr_is_repeatable};
+use helpers::{logical_and, logical_or};
 
 /// 对单个 proto 递归执行 decision DAG 归一化。
 pub(super) fn simplify_decision_exprs_in_proto(proto: &mut HirProto) -> bool {
@@ -186,19 +182,6 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
         ResolvedDecisionTarget::Node(entry) => {
             let (rebuilt, topology_changed) = rebuild_decision(entry, &nodes);
             changed |= topology_changed;
-            let rebuilt = if decision_has_cycles(&rebuilt)
-                || !rebuilt
-                    .nodes
-                    .iter()
-                    .all(|node| expr_is_repeatable(&node.test))
-            {
-                rebuilt
-            } else if let Some(specialized) = specialize_decision_by_known_tests(&rebuilt) {
-                changed = true;
-                specialized
-            } else {
-                rebuilt
-            };
             if let Some(expr) = collapse_value_decision_expr(&rebuilt) {
                 return Some(ReducedDecision::Expr(expr));
             }
@@ -356,12 +339,79 @@ fn collapse_value_node(
         return Some(expr.clone());
     }
 
+    if let Some(expr) = collapse_shared_falsy_chain(decision, node_ref, memo) {
+        memo.insert(node_ref, expr.clone());
+        return Some(expr);
+    }
+
     let node = decision.nodes.get(node_ref.index())?;
     let truthy = collapse_value_target(decision, &node.truthy, memo)?;
     let falsy = collapse_value_target(decision, &node.falsy, memo)?;
     let expr = combine_value_expr(node.test.clone(), truthy, falsy)?;
     memo.insert(node_ref, expr.clone());
     Some(expr)
+}
+
+fn collapse_shared_falsy_chain(
+    decision: &HirDecisionExpr,
+    node_ref: HirDecisionNodeRef,
+    memo: &mut BTreeMap<HirDecisionNodeRef, HirExpr>,
+) -> Option<HirExpr> {
+    let mut next_ref = node_ref;
+    let mut terms = Vec::new();
+    let tail = loop {
+        let Some((term, fallback)) = collapse_shared_falsy_term(decision, next_ref) else {
+            if terms.is_empty() {
+                return None;
+            }
+            break collapse_value_node(decision, next_ref, memo)?;
+        };
+        terms.push(term);
+        match fallback {
+            HirDecisionTarget::Node(fallback_ref) => next_ref = fallback_ref,
+            HirDecisionTarget::Expr(expr) => break expr,
+            HirDecisionTarget::CurrentValue => return None,
+        }
+    };
+
+    terms.into_iter().rev().try_fold(tail, |fallback, term| {
+        combine_value_expr(
+            term,
+            CollapsedValueTarget::CurrentValue,
+            CollapsedValueTarget::Expr(fallback),
+        )
+    })
+}
+
+fn collapse_shared_falsy_term(
+    decision: &HirDecisionExpr,
+    node_ref: HirDecisionNodeRef,
+) -> Option<(HirExpr, HirDecisionTarget)> {
+    let node = decision.nodes.get(node_ref.index())?;
+    let fallback = match &node.falsy {
+        HirDecisionTarget::Node(_) | HirDecisionTarget::Expr(_) => node.falsy.clone(),
+        HirDecisionTarget::CurrentValue => return None,
+    };
+    let HirDecisionTarget::Node(mut child_ref) = node.truthy else {
+        return None;
+    };
+    let mut guard = node.test.clone();
+
+    loop {
+        let child = decision.nodes.get(child_ref.index())?;
+        if child.falsy != fallback {
+            return None;
+        }
+        guard = logical_and(guard, child.test.clone());
+        match &child.truthy {
+            HirDecisionTarget::CurrentValue => return Some((guard, fallback)),
+            HirDecisionTarget::Expr(expr) if expr == &child.test => {
+                return Some((guard, fallback));
+            }
+            HirDecisionTarget::Node(next_ref) => child_ref = *next_ref,
+            HirDecisionTarget::Expr(_) => return None,
+        }
+    }
 }
 
 #[derive(Clone)]

@@ -378,10 +378,6 @@ impl<'a> AstLowerer<'a> {
                 )?))],
                 1,
             )),
-            HirStmt::Unstructured(_) => Err(AstLowerError::ResidualHir {
-                proto: proto_index,
-                kind: "unstructured stmt",
-            }),
         }
     }
 

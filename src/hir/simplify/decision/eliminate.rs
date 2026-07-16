@@ -197,11 +197,6 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
             let changed = eliminate_nested_blocks_in_stmt(&mut stmt, state);
             (vec![stmt], changed)
         }
-        HirStmt::Unstructured(unstructured) => {
-            let mut stmt = HirStmt::Unstructured(unstructured);
-            let changed = eliminate_nested_blocks_in_stmt(&mut stmt, state);
-            (vec![stmt], changed)
-        }
         HirStmt::Break
         | HirStmt::Close(_)
         | HirStmt::Continue

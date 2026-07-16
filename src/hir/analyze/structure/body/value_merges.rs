@@ -55,7 +55,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         // 与 try_lower_value_merge_branch 同理：SC 系列快捷路径只处理一个
         // result_reg，BVM 认领的其他 phi 会因分支结构被消费而孤立。
-        if let Some(bvm) = self.branch_value_merges_by_header.get(&block)
+        if let Some(bvm) = self.branch_value_merge_for_header(block)
             && bvm
                 .values
                 .iter()
@@ -165,7 +165,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // BranchValueMerge 认领的其他 phi，它们的分支结构已被 SC 消费——正常
         // 分支路径不会再运行。这里利用 SC 的树结构，为每个孤立的 BVM phi 构建
         // 平行的 Decision 表达式，避免这些 phi 因无人物化而丢失。
-        if let Some(bvm) = self.branch_value_merges_by_header.get(&block) {
+        if let Some(bvm) = self.branch_value_merge_for_header(block) {
             for value in &bvm.values {
                 if Some(value.phi_id) == short.result_phi_id {
                     continue;
@@ -239,8 +239,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         };
 
         short.nodes.iter().any(|node| {
-            self.branch_value_merges_by_header
-                .get(&node.header)
+            self.branch_value_merge_for_header(node.header)
                 .is_some_and(|bvm| {
                     bvm.values.len() > 1
                         && bvm.values.iter().any(|value| value.phi_id == result_phi_id)
@@ -268,7 +267,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // 还认领了其他 phi，SC 消费分支结构后那些 phi 就无人物化。此时退让给
         // 普通分支路径：BVM 通过 target_overrides 处理自己的 phi，SC 的 phi 则
         // 在 merge block 的 lower_phi_materialization 中恢复。
-        if let Some(bvm) = self.branch_value_merges_by_header.get(&block)
+        if let Some(bvm) = self.branch_value_merge_for_header(block)
             && bvm
                 .values
                 .iter()
@@ -298,10 +297,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
         self.visited.insert(block);
         self.visited.extend(value_merge_skipped_blocks(short));
-        self.merge_allowed_blocks
-            .entry(merge)
-            .or_default()
-            .insert(block);
+        self.merge_allowed_blocks.insert(merge, block);
         Some(Some(merge))
     }
 
@@ -351,7 +347,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let Some(entry) = entry else {
             return target_overrides.clone();
         };
-        let Some(candidate) = self.branch_by_header.get(&header).copied() else {
+        let Some(candidate) = self.branch_candidate_for_header(header) else {
             return target_overrides.clone();
         };
 
@@ -582,7 +578,7 @@ fn merge_has_other_live_phi(
         .dataflow
         .phi_candidates_in_block(merge)
         .iter()
-        .any(|phi| phi.id != consumed_phi_id && !lowering.dead_phis.contains(&phi.id))
+        .any(|phi| phi.id != consumed_phi_id && !lowering.structure.phi_is_dead(phi.id))
 }
 
 fn same_statement_value_merge_tree(

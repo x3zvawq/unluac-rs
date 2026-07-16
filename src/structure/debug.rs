@@ -19,7 +19,7 @@ use super::common::{
     ShortCircuitExit, ShortCircuitNode, ShortCircuitTarget, ShortCircuitValueIncoming,
     StructureFacts,
 };
-use super::{BlockOwner, CleanupDisposition, EdgeOwner};
+use super::{BlockOwner, CleanupDisposition, EdgeOwner, PhiIncomingDisposition};
 
 #[derive(Debug, Clone, Copy)]
 struct ProtoEntry<'a> {
@@ -178,7 +178,7 @@ fn dump_structure_facts(
         write_generic_phi_materializations(
             &mut output,
             &indent,
-            &entry.facts.generic_phi_materializations,
+            entry.facts.generic_phi_materializations(),
         );
 
         let _ = writeln!(output, "{indent}  loop candidates");
@@ -236,13 +236,60 @@ fn write_plan(output: &mut String, indent: &str, facts: &StructureFacts) {
         })
         .collect::<Vec<_>>()
         .join(", ");
+    let unstructured_layouts = facts
+        .plan
+        .unstructured_layouts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, layout)| {
+            layout.as_ref().map(|layout| {
+                format!(
+                    "r{index}=blocks:{} continuation:#{}",
+                    format_display_set(&layout.blocks),
+                    layout.continuation.index()
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let phi_incomings = facts
+        .plan
+        .phi_incoming_dispositions
+        .iter()
+        .enumerate()
+        .map(|(index, owners)| {
+            format!(
+                "p{index}=[{}]",
+                owners
+                    .iter()
+                    .map(|owner| format_phi_incoming_disposition(*owner))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let _ = writeln!(output, "{indent}    blocks [{blocks}]");
     let _ = writeln!(output, "{indent}    edges [{edges}]");
     let _ = writeln!(
         output,
         "{indent}    unstructured-membership [{unstructured_membership}]"
     );
+    let _ = writeln!(
+        output,
+        "{indent}    unstructured-layouts [{unstructured_layouts}]"
+    );
+    let _ = writeln!(output, "{indent}    phi-incomings [{phi_incomings}]");
     let _ = writeln!(output, "{indent}    cleanups [{cleanup_dispositions}]");
+}
+
+fn format_phi_incoming_disposition(disposition: PhiIncomingDisposition) -> &'static str {
+    match disposition {
+        PhiIncomingDisposition::Dead => "dead",
+        PhiIncomingDisposition::Unreachable => "unreachable",
+        PhiIncomingDisposition::EdgeCopy => "edge-copy",
+        PhiIncomingDisposition::Merge => "merge",
+    }
 }
 
 fn format_cleanup_disposition(disposition: CleanupDisposition) -> String {
@@ -349,12 +396,12 @@ fn write_loops(output: &mut String, indent: &str, candidates: &[LoopCandidate]) 
     for candidate in candidates {
         let _ = writeln!(
             output,
-            "{indent}    header=#{} preheader={} kind={} bindings={} binding-scope={} control={} continue={} continue-edges={} condition={} exits={} backedges={} blocks={}",
+            "{indent}    header=#{} preheader={} kind={} bindings={} body-scope={} control={} continue={} continue-edges={} condition={} exits={} backedges={} blocks={}",
             candidate.header.index(),
             format_optional_block(candidate.preheader),
             format_loop_kind(candidate.kind_hint),
             format_loop_source_bindings(candidate.source_bindings),
-            format_display_set(&candidate.binding_scope_blocks),
+            format_display_set(&candidate.body_scope_blocks),
             format_display_set(&candidate.control_blocks),
             format_optional_block(candidate.continue_target),
             format_display_set(&candidate.continue_edges),
@@ -396,9 +443,10 @@ fn write_branch_regions(output: &mut String, indent: &str, facts: &[BranchRegion
 fn write_generic_phi_materializations(
     output: &mut String,
     indent: &str,
-    candidates: &[GenericPhiMaterialization],
+    candidates: impl IntoIterator<Item = GenericPhiMaterialization>,
 ) {
-    if candidates.is_empty() {
+    let mut candidates = candidates.into_iter().peekable();
+    if candidates.peek().is_none() {
         let _ = writeln!(output, "{indent}    <none>");
         return;
     }

@@ -9,7 +9,7 @@ use std::collections::{BTreeSet, VecDeque};
 
 use crate::decompile::{DecompileContext, DecompileError, DecompileState};
 use crate::transformer::{
-    AccessBase, AccessKey, BranchOperands, CaptureSource, CondOperand, InstrRef, LowInstr,
+    AccessBase, AccessKey, BranchSubject, CaptureSource, CondOperand, InstrRef, LowInstr,
     LoweredProto, Reg, RegRange, ResultPack, ValueOperand, ValuePack,
 };
 

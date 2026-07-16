@@ -64,9 +64,6 @@ pub(super) fn replace_temp_in_stmt(stmt: &mut HirStmt, temp: TempId, replacement
         | HirStmt::Goto(_)
         | HirStmt::Label(_) => {}
         HirStmt::Block(block) => replace_temp_in_block(block, temp, replacement),
-        HirStmt::Unstructured(unstructured) => {
-            replace_temp_in_block(&mut unstructured.body, temp, replacement);
-        }
     }
 }
 

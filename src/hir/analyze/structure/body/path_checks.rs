@@ -194,25 +194,26 @@ impl StructuredBodyLowerer<'_, '_> {
             if let Some(result) = memo.get(&state).copied() {
                 return result;
             }
-            let loop_candidate = lowerer.loops_by_header.get(&block).and_then(|candidates| {
-                predecessor
-                    .and_then(|preheader| {
-                        candidates.iter().find_map(|(_, candidate)| {
-                            (candidate.preheader == Some(preheader)).then_some(*candidate)
+            let loop_candidate = predecessor
+                .and_then(|preheader| {
+                    lowerer
+                        .loop_candidates_for_header(block)
+                        .find_map(|(_, candidate)| {
+                            (candidate.preheader == Some(preheader)).then_some(candidate)
                         })
-                    })
-                    .or_else(|| {
-                        lowerer
-                            .active_loops
-                            .last()
-                            .filter(|active| active.header == block)
-                            .and_then(|active| lowerer.loop_candidate(active.candidate_id))
-                    })
-                    .or(match candidates.as_slice() {
-                        [(_, candidate)] => Some(*candidate),
-                        _ => None,
-                    })
-            });
+                })
+                .or_else(|| {
+                    lowerer
+                        .active_loops
+                        .last()
+                        .filter(|active| active.header == block)
+                        .and_then(|active| lowerer.loop_candidate(active.candidate_id))
+                })
+                .or_else(|| {
+                    let mut candidates = lowerer.loop_candidates_for_header(block);
+                    let (_, candidate) = candidates.next()?;
+                    candidates.next().is_none().then_some(candidate)
+                });
             if let Some(loop_candidate) = loop_candidate {
                 let result = loop_candidate
                     .exits
@@ -273,7 +274,7 @@ impl StructuredBodyLowerer<'_, '_> {
     }
 
     pub(super) fn loop_continue_target_is_empty(&self, block: BlockRef) -> bool {
-        if self.branch_by_header.contains_key(&block) {
+        if self.branch_candidate_for_header(block).is_some() {
             return false;
         }
         let terminator = self.block_terminator(block).map(|(instr_ref, _)| instr_ref);
@@ -286,11 +287,11 @@ impl StructuredBodyLowerer<'_, '_> {
                     .proto
                     .instrs
                     .get(instr_idx)
-                    .is_some_and(is_control_terminator)
+                    .is_some_and(LowInstr::is_control_terminator)
         })
     }
 
-    pub(super) fn terminal_exit_block_is_clone_safe(&self, block: BlockRef) -> bool {
+    pub(super) fn terminal_exit_block_is_clone_boundary(&self, block: BlockRef) -> bool {
         if !self.block_is_terminal_exit(block) {
             return false;
         }
@@ -305,6 +306,59 @@ impl StructuredBodyLowerer<'_, '_> {
                     self.lowering.proto.instrs.get(instr_idx),
                     Some(LowInstr::Closure(_))
                 )
+        })
+    }
+
+    pub(super) fn terminal_exit_block_can_clone(
+        &self,
+        block: BlockRef,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> bool {
+        if !self.terminal_exit_block_is_clone_boundary(block) {
+            return false;
+        }
+
+        let phis_are_owned = self
+            .lowering
+            .dataflow
+            .phi_candidates_in_block(block)
+            .iter()
+            .filter(|phi| !self.lowering.structure.phi_is_dead(phi.id))
+            .all(|phi| {
+                let temp = self.lowering.bindings.phi_temps[phi.id.index()];
+                self.overrides.phi_is_suppressed_for_block(block, phi.id)
+                    || target_overrides
+                        .get(&temp)
+                        .is_some_and(|target| target != &HirLValue::Temp(temp))
+                    || self
+                        .lowering
+                        .structure
+                        .generic_phi_materialization(phi.id)
+                        .is_some_and(|materialization| {
+                            matches!(
+                                materialization.source,
+                                crate::structure::GenericPhiSource::IdomExit(_)
+                            )
+                        })
+            });
+        if !phis_are_owned {
+            return false;
+        }
+
+        let terminator = self.block_terminator(block).map(|(instr_ref, _)| instr_ref);
+        let range = self.lowering.cfg.blocks[block.index()].instrs;
+        (range.start.index()..range.end()).all(|instr_idx| {
+            let instr_ref = InstrRef(instr_idx);
+            if Some(instr_ref) == terminator || self.overrides.instr_is_suppressed(instr_ref) {
+                return true;
+            }
+            !matches!(
+                self.lowering.proto.instrs.get(instr_idx),
+                Some(LowInstr::Close(_) | LowInstr::Tbc(_))
+            ) || matches!(
+                self.lowering.structure.cleanup_disposition(instr_ref),
+                CleanupDisposition::LexicalScope(_) | CleanupDisposition::Unreachable
+            )
         })
     }
 

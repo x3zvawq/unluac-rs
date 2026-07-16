@@ -21,12 +21,19 @@
 //! binding 形状。
 //! 不同 home slot 上的 move alias 是当时值的快照，不能与来源槽位后续的状态合并；
 //! 没有 home slot 的 phi temp 仍可沿同一状态链归并。
+//! 对没有 debug local 证据、home-slot 定义数已经超过源码局部槽上限的大函数，同一
+//! `(slot, close epoch)` 会复用一个 local；物理覆盖保证旧值已死，close epoch 与 capture
+//! sticky 事实继续隔离不同词法身份。候选扩张只沿 temp occurrence index 访问真实 touch，
+//! 不按“每个定义 × 全部后缀语句”重复扫描。
 //!
 mod branch_merge;
 mod param_alias;
 mod rewrite;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+};
 
 use super::temp_touch::{
     TempRefScopeTracker, TempTouchIndex, collect_temp_refs_by_stmt, collect_temp_refs_in_expr,
@@ -43,6 +50,8 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     proto: &mut HirProto,
     facts: &ProtoPromotionFacts,
 ) -> bool {
+    let compact_home_slots = facts.home_slot_definition_count() > crate::SOURCE_LOCAL_LIMIT
+        && proto.temp_debug_locals.iter().all(Option::is_none);
     let mut next_local_index = proto.locals.len();
     let mut new_locals = Vec::new();
     let mut new_local_debug_hints = Vec::new();
@@ -52,13 +61,15 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
         next_local_index: &mut next_local_index,
         new_locals: &mut new_locals,
         new_local_debug_hints: &mut new_local_debug_hints,
+        compact_home_slots,
     };
+    let empty_mapping = Rc::new(BTreeMap::new());
     let result = promote_block(
         &mut ctx,
         &mut proto.body,
+        &empty_mapping,
         &BTreeMap::new(),
-        &BTreeMap::new(),
-        &BTreeSet::new(),
+        &|_| false,
     );
     proto.locals.extend(new_locals);
     proto.local_debug_hints.extend(new_local_debug_hints);
@@ -91,7 +102,15 @@ enum PromotionAction {
 
 struct PromotionResult {
     changed: bool,
-    trailing_mapping: BTreeMap<TempId, LocalId>,
+    trailing_mapping: LocalMapping,
+}
+
+type LocalMapping = Rc<BTreeMap<TempId, LocalId>>;
+
+struct PromotionGroup {
+    temps: BTreeSet<TempId>,
+    removable_aliases: BTreeSet<usize>,
+    touching_stmt_indices: BTreeSet<usize>,
 }
 
 struct PromotionCtx<'a> {
@@ -100,6 +119,7 @@ struct PromotionCtx<'a> {
     next_local_index: &'a mut usize,
     new_locals: &'a mut Vec<LocalId>,
     new_local_debug_hints: &'a mut Vec<Option<String>>,
+    compact_home_slots: bool,
 }
 
 struct PlanAllocator<'a> {
@@ -167,16 +187,16 @@ impl PlanAllocator<'_> {
 fn promote_block(
     ctx: &mut PromotionCtx<'_>,
     block: &mut HirBlock,
-    inherited: &BTreeMap<TempId, LocalId>,
+    inherited: &LocalMapping,
     inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
-    outer_used_temps: &BTreeSet<TempId>,
+    outer_uses_temp: &dyn Fn(TempId) -> bool,
 ) -> PromotionResult {
     promote_block_with_child_protection(
         ctx,
         block,
         inherited,
         inherited_sticky_slots,
-        outer_used_temps,
+        outer_uses_temp,
         &BTreeSet::new(),
     )
 }
@@ -184,9 +204,9 @@ fn promote_block(
 fn promote_block_with_child_protection(
     ctx: &mut PromotionCtx<'_>,
     block: &mut HirBlock,
-    inherited: &BTreeMap<TempId, LocalId>,
+    inherited: &LocalMapping,
     inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
-    outer_used_temps: &BTreeSet<TempId>,
+    outer_uses_temp: &dyn Fn(TempId) -> bool,
     child_protected_temps: &BTreeSet<TempId>,
 ) -> PromotionResult {
     // 递归进入子作用域时，把当前语句之后仍被外层引用的 temp 传给子 block。
@@ -198,9 +218,9 @@ fn promote_block_with_child_protection(
         ctx,
         block,
         &stmt_temp_refs,
-        inherited,
+        inherited.as_ref(),
         inherited_sticky_slots,
-        outer_used_temps,
+        outer_uses_temp,
     );
     let plan_by_decl = plans.iter().fold(
         BTreeMap::<usize, Vec<&PromotionPlan>>::new(),
@@ -215,7 +235,7 @@ fn promote_block_with_child_protection(
         .collect::<BTreeSet<_>>();
 
     let mut changed = !plans.is_empty();
-    let mut mapping = inherited.clone();
+    let mut mapping = Rc::clone(inherited);
     let mut slot_candidates = inherited_sticky_slots.clone();
     let mut active_sticky_slots = inherited_sticky_slots.clone();
     let original_stmts = std::mem::take(&mut block.stmts);
@@ -225,13 +245,13 @@ fn promote_block_with_child_protection(
         temp_refs.enter_stmt(index);
         let mut replaced_stmt = false;
         if let Some(plans) = plan_by_decl.get(&index) {
-            let mapping_before_decl = mapping.clone();
             for plan in plans {
-                if let Some(anchor_stmt) =
-                    rewrite_plan_anchor_stmt(&stmt, plan, &mapping_before_decl)
-                {
+                if let Some(anchor_stmt) = rewrite_plan_anchor_stmt(&stmt, plan, mapping.as_ref()) {
                     rewritten.push(anchor_stmt);
                 }
+            }
+            let mapping = Rc::make_mut(&mut mapping);
+            for plan in plans {
                 for temp in &plan.temps {
                     mapping.insert(*temp, plan.local);
                 }
@@ -260,14 +280,17 @@ fn promote_block_with_child_protection(
         }
 
         // 子作用域的 outer temps = 当前块后续语句的 temp 引用 ∪ 来自祖先作用域的保护集
-        let mut child_outer_temps = temp_refs.outer_with_suffix(outer_used_temps);
-        child_outer_temps.extend(child_protected_temps);
+        let child_uses_outer_temp = |temp| {
+            outer_uses_temp(temp)
+                || temp_refs.suffix_contains(temp)
+                || child_protected_temps.contains(&temp)
+        };
         let stmt_changed = rewrite_stmt(
             ctx,
             &mut stmt,
             &mapping,
             &active_sticky_slots,
-            &child_outer_temps,
+            &child_uses_outer_temp,
         );
         changed |= stmt_changed;
         rewritten.push(stmt);
@@ -281,7 +304,7 @@ fn promote_block_with_child_protection(
     // 定向重写，避免留下悬空的 TempRef。
     if mapping.len() > inherited.len() {
         for stmt in &mut block.stmts {
-            rewrite::forward_capture_refs(stmt, &mapping);
+            rewrite::forward_capture_refs(stmt, mapping.as_ref());
         }
     }
 
@@ -297,12 +320,12 @@ fn collect_plans(
     stmt_temp_refs: &[BTreeSet<TempId>],
     inherited: &BTreeMap<TempId, LocalId>,
     inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
-    outer_used_temps: &BTreeSet<TempId>,
+    outer_uses_temp: &dyn Fn(TempId) -> bool,
 ) -> Vec<PromotionPlan> {
     if block.stmts.iter().any(|stmt| {
         matches!(
             stmt,
-            HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) | HirStmt::Unstructured(_)
+            HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_)
         )
     }) {
         return Vec::new();
@@ -312,7 +335,7 @@ fn collect_plans(
     let temp_debug_locals = ctx.temp_debug_locals;
     let mut plans = Vec::new();
     let temp_touches = TempTouchIndex::new(stmt_temp_refs);
-    let mut reserved_temps = inherited.keys().copied().collect::<BTreeSet<_>>();
+    let mut reserved_temps = BTreeSet::new();
     let mut reserved_alias_indices = BTreeSet::new();
     let mut slot_candidates = inherited_sticky_slots.clone();
     let mut sticky_slots = inherited_sticky_slots.clone();
@@ -322,97 +345,78 @@ fn collect_plans(
             continue;
         }
 
-        let mut sticky_slots_for_stmt = sticky_slots.clone();
-        activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots_for_stmt);
+        activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
 
         let Some(root_temp) = simple_temp_assign_target(stmt) else {
-            sticky_slots = sticky_slots_for_stmt;
             continue;
         };
-        if reserved_temps.contains(&root_temp) {
-            sticky_slots = sticky_slots_for_stmt;
+        if inherited.contains_key(&root_temp) || reserved_temps.contains(&root_temp) {
             continue;
         }
         if temp_touches.touches_before(decl_index, root_temp) {
-            sticky_slots = sticky_slots_for_stmt;
             continue;
         }
         // 目标 temp 自己又出现在 RHS 里时，这条赋值表达的是“沿用同一状态槽位继续更新”，
         // 不能在 locals pass 里把它误提升成新的 block-local。否则像 loop carried state
         // 或分支内的状态写回，会被拆成 `local next = step(state)`，原状态槽位反而失去写回。
         if stmt_self_updates_temp(stmt, root_temp) {
-            sticky_slots = sticky_slots_for_stmt;
             continue;
         }
 
-        let mut group = BTreeSet::from([root_temp]);
-        let mut removable_aliases = BTreeSet::new();
-        let mut has_future_touch = false;
-        for future_index in decl_index + 1..block.stmts.len() {
-            if removable_aliases.contains(&future_index) {
-                continue;
-            }
-            let future_stmt = &block.stmts[future_index];
-
-            if let Some(alias_temp) = alias_temp_for_group(future_stmt, &group)
-                && !reserved_temps.contains(&alias_temp)
-                && !group.contains(&alias_temp)
-                && facts
-                    .home_slot(root_temp)
-                    .zip(facts.home_slot(alias_temp))
-                    .is_none_or(|(root, alias)| root == alias)
-                && !(facts.home_slot(root_temp).is_none()
-                    && facts
-                        .home_slot(alias_temp)
-                        .is_some_and(|slot| sticky_slots_for_stmt.contains_key(&slot)))
-                && !temp_touches.touches_in_range(decl_index + 1, future_index, alias_temp)
-            {
-                group.insert(alias_temp);
-                removable_aliases.insert(future_index);
-                continue;
-            }
-
-            if temp_touches.stmt_touches_any(future_index, &group) {
-                has_future_touch = true;
-            }
-        }
+        let is_reserved = |temp| inherited.contains_key(&temp) || reserved_temps.contains(&temp);
+        let PromotionGroup {
+            temps: group,
+            removable_aliases,
+            touching_stmt_indices,
+        } = collect_promotion_group(
+            block,
+            decl_index,
+            root_temp,
+            facts,
+            &sticky_slots,
+            &is_reserved,
+            &temp_touches,
+        );
 
         // 别名扩张后的任一 temp 仍被外层读取时，整个组都不能在子作用域提升；
         // 只检查 root 会让内层 local 吞掉外层 loop state 的别名。
-        if !group.is_disjoint(outer_used_temps) {
-            sticky_slots = sticky_slots_for_stmt;
+        if group.iter().copied().any(outer_uses_temp) {
             continue;
         }
 
         let sticky_local = facts
             .home_slot(root_temp)
-            .and_then(|slot| sticky_slots_for_stmt.get(&slot).copied());
+            .and_then(|slot| sticky_slots.get(&slot).copied());
+        let reusable_local = sticky_local.or_else(|| {
+            ctx.compact_home_slots
+                .then(|| {
+                    facts
+                        .home_slot(root_temp)
+                        .and_then(|slot| slot_candidates.get(&slot).copied())
+                })
+                .flatten()
+        });
 
-        if sticky_local.is_none() && !has_future_touch {
-            sticky_slots = sticky_slots_for_stmt;
+        if sticky_local.is_none() && touching_stmt_indices.is_empty() {
             continue;
         }
         if sticky_local.is_none() {
+            let first_touch_index = touching_stmt_indices.first().copied();
             // 只在控制头里单次消费的 temp，更像机械性的结构参数而不是源码级 local。
-            let touching_stmt_indices = (decl_index + 1..block.stmts.len())
-                .filter(|future_index| !removable_aliases.contains(future_index))
-                .filter(|future_index| temp_touches.stmt_touches_any(*future_index, &group))
-                .collect::<Vec<_>>();
             // 只有一次后续消费的全局别名或字符串常量，必须结合消费站点判定：
             // 全局别名只有作为表字段安装的 base，字符串常量只有作为调用实参，
             // 才更像寄存器级脚手架而不是源码 local。数字/布尔/nil 等也可能是
             // 捕获 local 的重绑定值，仍按原规则保守提升。
             if touching_stmt_indices.len() == 1
                 && (stmt_consumes_temps_only_in_control_head(
-                    &block.stmts[touching_stmt_indices[0]],
+                    &block.stmts[first_touch_index.expect("single touch must exist")],
                     &group,
                 ) || single_use_seed_can_stay_temp(
                     stmt,
                     root_temp,
-                    &block.stmts[touching_stmt_indices[0]],
+                    &block.stmts[first_touch_index.expect("single touch must exist")],
                 ))
             {
-                sticky_slots = sticky_slots_for_stmt;
                 continue;
             }
             if touching_stmt_indices
@@ -420,7 +424,6 @@ fn collect_plans(
                 .copied()
                 .any(|stmt_index| stmt_contains_nested_nonlocal_control(&block.stmts[stmt_index]))
             {
-                sticky_slots = sticky_slots_for_stmt;
                 continue;
             }
         }
@@ -434,7 +437,7 @@ fn collect_plans(
             new_locals: ctx.new_locals,
             new_local_debug_hints: ctx.new_local_debug_hints,
         };
-        if let Some(local) = sticky_local {
+        if let Some(local) = reusable_local {
             allocator.reuse_existing_local(
                 decl_index,
                 local,
@@ -458,18 +461,17 @@ fn collect_plans(
                 slot_candidates.insert(slot, local);
             }
         }
-
-        sticky_slots = sticky_slots_for_stmt;
     }
 
     let mut sticky_slots = inherited_sticky_slots.clone();
     for (decl_index, stmt) in block.stmts.iter().enumerate() {
+        let is_reserved = |temp| inherited.contains_key(&temp) || reserved_temps.contains(&temp);
         let merge_temps =
-            branch_merge::candidate_temps(stmt, &temp_touches, decl_index, &reserved_temps);
+            branch_merge::candidate_temps(stmt, &temp_touches, decl_index, &is_reserved);
 
         for temp in merge_temps {
             // 分支合流也不能在子作用域重新声明外层仍在使用的状态 temp。
-            if outer_used_temps.contains(&temp) {
+            if outer_uses_temp(temp) {
                 continue;
             }
             let mut allocator = PlanAllocator {
@@ -481,10 +483,13 @@ fn collect_plans(
                 new_locals: ctx.new_locals,
                 new_local_debug_hints: ctx.new_local_debug_hints,
             };
-            if let Some(local) = facts
-                .home_slot(temp)
-                .and_then(|slot| sticky_slots.get(&slot).copied())
-            {
+            if let Some(local) = facts.home_slot(temp).and_then(|slot| {
+                sticky_slots.get(&slot).copied().or_else(|| {
+                    ctx.compact_home_slots
+                        .then(|| slot_candidates.get(&slot).copied())
+                        .flatten()
+                })
+            }) {
                 allocator.reuse_existing_local(
                     decl_index,
                     local,
@@ -513,6 +518,60 @@ fn collect_plans(
     }
 
     plans
+}
+
+fn collect_promotion_group(
+    block: &HirBlock,
+    decl_index: usize,
+    root_temp: TempId,
+    facts: &ProtoPromotionFacts,
+    sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
+    is_reserved: &dyn Fn(TempId) -> bool,
+    temp_touches: &TempTouchIndex<'_>,
+) -> PromotionGroup {
+    let root_slot = facts.home_slot(root_temp);
+    let mut temps = BTreeSet::from([root_temp]);
+    let mut removable_aliases = BTreeSet::new();
+    let mut touching_stmt_indices = BTreeSet::new();
+    let mut pending_indices = BTreeSet::new();
+    temp_touches.extend_touch_indices_after(decl_index + 1, root_temp, &mut pending_indices);
+
+    while let Some(future_index) = pending_indices.pop_first() {
+        if removable_aliases.contains(&future_index) {
+            continue;
+        }
+        let future_stmt = &block.stmts[future_index];
+        let alias = alias_temp_for_group(future_stmt, &temps).filter(|alias_temp| {
+            let alias_slot = facts.home_slot(*alias_temp);
+            let same_slot = root_slot
+                .zip(alias_slot)
+                .is_none_or(|(root, alias)| root == alias);
+            let slot_is_available = root_slot.is_some()
+                || alias_slot.is_none_or(|slot| !sticky_slots.contains_key(&slot));
+            !is_reserved(*alias_temp)
+                && !temps.contains(alias_temp)
+                && same_slot
+                && slot_is_available
+                && !temp_touches.touches_in_range(decl_index + 1, future_index, *alias_temp)
+        });
+        if let Some(alias_temp) = alias {
+            temps.insert(alias_temp);
+            removable_aliases.insert(future_index);
+            temp_touches.extend_touch_indices_after(
+                future_index + 1,
+                alias_temp,
+                &mut pending_indices,
+            );
+        } else {
+            touching_stmt_indices.insert(future_index);
+        }
+    }
+
+    PromotionGroup {
+        temps,
+        removable_aliases,
+        touching_stmt_indices,
+    }
 }
 
 fn activate_captured_slots_in_stmt(
@@ -695,52 +754,56 @@ fn plan_replaces_original_stmt(plan: &PromotionPlan) -> bool {
 fn rewrite_stmt(
     ctx: &mut PromotionCtx<'_>,
     stmt: &mut HirStmt,
-    mapping: &BTreeMap<TempId, LocalId>,
+    mapping: &LocalMapping,
     sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
-    outer_used_temps: &BTreeSet<TempId>,
+    outer_uses_temp: &dyn Fn(TempId) -> bool,
 ) -> bool {
     match stmt {
-        HirStmt::LocalDecl(local_decl) => rewrite::value_pack(&mut local_decl.values, mapping),
+        HirStmt::LocalDecl(local_decl) => {
+            rewrite::value_pack(&mut local_decl.values, mapping.as_ref())
+        }
         HirStmt::Assign(assign) => {
             let mut targets_changed = false;
             for target in &mut assign.targets {
-                targets_changed |= rewrite::lvalue(target, mapping);
+                targets_changed |= rewrite::lvalue(target, mapping.as_ref());
             }
-            let values_changed = rewrite::value_pack(&mut assign.values, mapping);
+            let values_changed = rewrite::value_pack(&mut assign.values, mapping.as_ref());
             targets_changed || values_changed
         }
         HirStmt::TableSetList(set_list) => {
-            let base_changed = rewrite::expr(&mut set_list.base, mapping);
-            let values_changed = rewrite::value_pack(&mut set_list.values, mapping);
+            let base_changed = rewrite::expr(&mut set_list.base, mapping.as_ref());
+            let values_changed = rewrite::value_pack(&mut set_list.values, mapping.as_ref());
             base_changed || values_changed
         }
-        HirStmt::ErrNil(err_nil) => rewrite::expr(&mut err_nil.value, mapping),
-        HirStmt::ToBeClosed(to_be_closed) => rewrite::expr(&mut to_be_closed.value, mapping),
-        HirStmt::CallStmt(call_stmt) => rewrite::call_expr(&mut call_stmt.call, mapping),
-        HirStmt::Return(ret) => rewrite::value_pack(&mut ret.values, mapping),
+        HirStmt::ErrNil(err_nil) => rewrite::expr(&mut err_nil.value, mapping.as_ref()),
+        HirStmt::ToBeClosed(to_be_closed) => {
+            rewrite::expr(&mut to_be_closed.value, mapping.as_ref())
+        }
+        HirStmt::CallStmt(call_stmt) => rewrite::call_expr(&mut call_stmt.call, mapping.as_ref()),
+        HirStmt::Return(ret) => rewrite::value_pack(&mut ret.values, mapping.as_ref()),
         HirStmt::If(if_stmt) => {
-            let cond_changed = rewrite::expr(&mut if_stmt.cond, mapping);
+            let cond_changed = rewrite::expr(&mut if_stmt.cond, mapping.as_ref());
             let then_changed = promote_block(
                 ctx,
                 &mut if_stmt.then_block,
                 mapping,
                 sticky_slots,
-                outer_used_temps,
+                outer_uses_temp,
             )
             .changed;
             let else_changed = if_stmt.else_block.as_mut().is_some_and(|else_block| {
-                promote_block(ctx, else_block, mapping, sticky_slots, outer_used_temps).changed
+                promote_block(ctx, else_block, mapping, sticky_slots, outer_uses_temp).changed
             });
             cond_changed || then_changed || else_changed
         }
         HirStmt::While(while_stmt) => {
-            let cond_changed = rewrite::expr(&mut while_stmt.cond, mapping);
+            let cond_changed = rewrite::expr(&mut while_stmt.cond, mapping.as_ref());
             let body_changed = promote_block(
                 ctx,
                 &mut while_stmt.body,
                 mapping,
                 sticky_slots,
-                outer_used_temps,
+                outer_uses_temp,
             )
             .changed;
             cond_changed || body_changed
@@ -756,50 +819,41 @@ fn rewrite_stmt(
                 &mut repeat_stmt.body,
                 mapping,
                 sticky_slots,
-                outer_used_temps,
+                outer_uses_temp,
                 &condition_temps,
             );
-            let cond_changed = rewrite::expr(&mut repeat_stmt.cond, &body_result.trailing_mapping);
+            let cond_changed =
+                rewrite::expr(&mut repeat_stmt.cond, body_result.trailing_mapping.as_ref());
             body_result.changed || cond_changed
         }
         HirStmt::NumericFor(numeric_for) => {
-            let start_changed = rewrite::expr(&mut numeric_for.start, mapping);
-            let limit_changed = rewrite::expr(&mut numeric_for.limit, mapping);
-            let step_changed = rewrite::expr(&mut numeric_for.step, mapping);
+            let start_changed = rewrite::expr(&mut numeric_for.start, mapping.as_ref());
+            let limit_changed = rewrite::expr(&mut numeric_for.limit, mapping.as_ref());
+            let step_changed = rewrite::expr(&mut numeric_for.step, mapping.as_ref());
             let body_changed = promote_block(
                 ctx,
                 &mut numeric_for.body,
                 mapping,
                 sticky_slots,
-                outer_used_temps,
+                outer_uses_temp,
             )
             .changed;
             start_changed || limit_changed || step_changed || body_changed
         }
         HirStmt::GenericFor(generic_for) => {
-            let iterator_changed = rewrite::value_pack(&mut generic_for.iterator, mapping);
+            let iterator_changed = rewrite::value_pack(&mut generic_for.iterator, mapping.as_ref());
             let body_changed = promote_block(
                 ctx,
                 &mut generic_for.body,
                 mapping,
                 sticky_slots,
-                outer_used_temps,
+                outer_uses_temp,
             )
             .changed;
             iterator_changed || body_changed
         }
         HirStmt::Block(block) => {
-            promote_block(ctx, block, mapping, sticky_slots, outer_used_temps).changed
-        }
-        HirStmt::Unstructured(unstructured) => {
-            promote_block(
-                ctx,
-                &mut unstructured.body,
-                mapping,
-                sticky_slots,
-                outer_used_temps,
-            )
-            .changed
+            promote_block(ctx, block, mapping, sticky_slots, outer_uses_temp).changed
         }
         HirStmt::Break
         | HirStmt::Close(_)

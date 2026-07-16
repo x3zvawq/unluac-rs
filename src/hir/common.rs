@@ -119,7 +119,6 @@ pub enum HirStmt {
     Goto(Box<HirGoto>),
     Label(Box<HirLabel>),
     Block(Box<HirBlock>),
-    Unstructured(Box<HirUnstructured>),
 }
 
 /// HIR 表达式。
@@ -506,9 +505,8 @@ pub struct HirErrNil {
 
 /// 标记某个绑定在当前词法作用域结束时需要执行 Lua 5.4 的 to-be-closed 语义。
 ///
-/// 这一层先显式保留 “哪个绑定被标记为 `<close>`” 这个语义事实，而不是继续退回
-/// `unstructured "tbc rX"`。后续 AST 可以再根据 target dialect 把它收成真正的
-/// `<close>` 局部声明形式。
+/// 这一层显式保留 “哪个绑定被标记为 `<close>`” 这个语义事实，后续 AST 可以再根据
+/// target dialect 把它收成真正的 `<close>` 局部声明形式。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirToBeClosed {
     /// 对应 Lua VM 里的寄存器槽位。
@@ -523,9 +521,8 @@ pub struct HirToBeClosed {
 
 /// 显式表示一次 Lua VM `Close` cleanup 边界。
 ///
-/// 这里先保留“从哪个寄存器槽位开始关闭”活动值这个语义事实，避免在 HIR 里继续退回
-/// `unstructured "close from rX"`。后续 AST 可以基于它和 `ToBeClosed` 的组合，
-/// 再决定是否能恢复成 `<close>` 变量的词法块边界。
+/// 这里保留“从哪个寄存器槽位开始关闭”活动值这个语义事实。后续 AST 可以基于它和
+/// `ToBeClosed` 的组合，再决定是否能恢复成 `<close>` 变量的词法块边界。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirClose {
     pub from_reg: usize,
@@ -588,13 +585,6 @@ pub struct HirGoto {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirLabel {
     pub id: HirLabelId,
-}
-
-/// 保守 fallback 区域。
-#[derive(Debug, Clone, PartialEq)]
-pub struct HirUnstructured {
-    pub body: HirBlock,
-    pub summary: Option<String>,
 }
 
 /// 表构造器。

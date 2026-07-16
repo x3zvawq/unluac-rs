@@ -204,7 +204,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .dataflow
                 .phi_candidates_in_block(post_loop)
                 .iter()
-                .any(|phi| !self.lowering.dead_phis.contains(&phi.id))
+                .any(|phi| !self.lowering.structure.phi_is_dead(phi.id))
         {
             return None;
         }
@@ -231,7 +231,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                         .dataflow
                         .phi_candidates_in_block(continuation)
                         .iter()
-                        .any(|phi| !self.lowering.dead_phis.contains(&phi.id))
+                        .any(|phi| !self.lowering.structure.phi_is_dead(phi.id))
                 {
                     return None;
                 }

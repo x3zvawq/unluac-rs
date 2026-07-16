@@ -58,6 +58,10 @@ impl ProtoPromotionFacts {
         self.temp_home_slots.get(temp.index()).copied().flatten()
     }
 
+    pub(super) fn home_slot_definition_count(&self) -> usize {
+        self.temp_home_slots.iter().flatten().count()
+    }
+
     /// 把当前语句里所有 closure capture 观察到的 home slot 收集进集合。
     pub(super) fn collect_captured_home_slots_in_stmt(
         &self,
@@ -132,9 +136,6 @@ impl ProtoPromotionFacts {
                 self.collect_captured_home_slots_in_block(&generic_for.body, slots);
             }
             HirStmt::Block(block) => self.collect_captured_home_slots_in_block(block, slots),
-            HirStmt::Unstructured(unstructured) => {
-                self.collect_captured_home_slots_in_block(&unstructured.body, slots);
-            }
             HirStmt::Break
             | HirStmt::Close(_)
             | HirStmt::Continue
@@ -173,7 +174,6 @@ impl ProtoPromotionFacts {
             | HirStmt::Return(_)
             | HirStmt::Repeat(_)
             | HirStmt::Block(_)
-            | HirStmt::Unstructured(_)
             | HirStmt::Break
             | HirStmt::Close(_)
             | HirStmt::Continue

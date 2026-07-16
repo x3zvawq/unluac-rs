@@ -89,11 +89,11 @@ impl StructuredBodyLowerer<'_, '_> {
         // “经过回边才重新绕到另一臂”的路径也算进去，进而把简单的
         // `if cond then break end` / `if cond then ... end` 误折成错误的 then/merge。
         // 多节点 short-circuit 仍然保留，因为那类结构 plain branch 本来就表达不全。
-        if consumed_headers.len() == 1 && self.branch_by_header.contains_key(&header) {
+        if consumed_headers.len() == 1 && self.branch_candidate_for_header(header).is_some() {
             return Some(None);
         }
 
-        if let Some(candidate) = self.branch_by_header.get(&header).copied()
+        if let Some(candidate) = self.branch_candidate_for_header(header)
             && candidate.else_entry.is_none()
             && let Some(merge) = candidate.merge
             && (truthy == merge || falsy == merge)
@@ -245,7 +245,7 @@ impl StructuredBodyLowerer<'_, '_> {
         if let Some(loop_header) = self.active_loops.last().and_then(|loop_context| {
             consumed_headers
                 .last()
-                .and_then(|header| self.branch_by_header.get(header))
+                .and_then(|header| self.branch_candidate_for_header(*header))
                 .and_then(|candidate| candidate.merge)
                 .filter(|merge| *merge == loop_context.header)
         }) {
@@ -300,7 +300,7 @@ impl StructuredBodyLowerer<'_, '_> {
         };
         let tail_keeps_merge = consumed_headers
             .last()
-            .and_then(|header| self.branch_by_header.get(header))
+            .and_then(|header| self.branch_candidate_for_header(*header))
             .is_some_and(|candidate| {
                 candidate.else_entry.is_none() && candidate.merge == Some(merge)
             });
@@ -364,8 +364,8 @@ impl StructuredBodyLowerer<'_, '_> {
 
     fn block_is_transparent_short_circuit_exit_pad(&self, block: BlockRef) -> bool {
         if block == self.lowering.cfg.exit_block
-            || self.branch_by_header.contains_key(&block)
-            || self.loop_headers.contains(&block)
+            || self.branch_candidate_for_header(block).is_some()
+            || self.has_loop_header(block)
             || !self
                 .lowering
                 .dataflow
@@ -494,7 +494,7 @@ impl StructuredBodyLowerer<'_, '_> {
         {
             return None;
         }
-        if self.loop_headers.contains(&header) {
+        if self.has_loop_header(header) {
             return None;
         }
         let next = build_branch_short_circuit_plan(self.lowering, header)
@@ -515,14 +515,16 @@ impl StructuredBodyLowerer<'_, '_> {
     fn block_is_active_loop_control_header(&self, header: BlockRef) -> bool {
         self.active_loops.last().is_some_and(|loop_context| {
             loop_context.continue_target == Some(header)
-                || self.branch_by_header.get(&header).is_some_and(|branch| {
-                    branch.merge == Some(loop_context.post_loop)
-                        && self.can_reach_avoiding_block(
-                            branch.then_entry,
-                            loop_context.header,
-                            loop_context.post_loop,
-                        )
-                })
+                || self
+                    .branch_candidate_for_header(header)
+                    .is_some_and(|branch| {
+                        branch.merge == Some(loop_context.post_loop)
+                            && self.can_reach_avoiding_block(
+                                branch.then_entry,
+                                loop_context.header,
+                                loop_context.post_loop,
+                            )
+                    })
         })
     }
 
@@ -573,7 +575,7 @@ impl StructuredBodyLowerer<'_, '_> {
     // 真正消费前还会由 rewrite_short_circuit_skipped_header_prefixes 校验其 prefix
     // 能否安全内联进条件，避免把带副作用或不可表达的前置语句静默吞掉。
     fn nestable_plain_branch_plan(&self, header: BlockRef) -> Option<BranchShortCircuitPlan> {
-        let candidate = self.branch_by_header.get(&header).copied()?;
+        let candidate = self.branch_candidate_for_header(header)?;
         let falsy = match candidate.kind {
             BranchKind::IfElse => candidate.else_entry?,
             BranchKind::IfThen | BranchKind::Guard => candidate.merge?,
@@ -693,8 +695,8 @@ impl StructuredBodyLowerer<'_, '_> {
                 .loop_candidate_from_preheader(body_entry)
                 .is_some_and(|nested| {
                     nested
-                        .binding_scope_blocks
-                        .is_subset(&candidate.binding_scope_blocks)
+                        .body_scope_blocks
+                        .is_subset(&candidate.body_scope_blocks)
                 });
         candidate.kind_hint == LoopKindHint::RepeatLike
             && body_has_loop_owner

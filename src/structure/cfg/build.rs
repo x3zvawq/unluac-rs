@@ -233,7 +233,7 @@ fn collect_leaders(instrs: &[LowInstr]) -> BTreeSet<usize> {
             leaders.insert(target.index());
         });
 
-        if is_terminator(instr) && index + 1 < instrs.len() {
+        if instr.is_control_terminator() && index + 1 < instrs.len() {
             leaders.insert(index + 1);
         }
     }
@@ -263,19 +263,6 @@ fn collect_jump_targets(instr: &LowInstr, mut f: impl FnMut(InstrRef)) {
         }
         _ => {}
     }
-}
-
-fn is_terminator(instr: &LowInstr) -> bool {
-    matches!(
-        instr,
-        LowInstr::Jump(_)
-            | LowInstr::Branch(_)
-            | LowInstr::TailCall(_)
-            | LowInstr::Return(_)
-            | LowInstr::NumericForInit(_)
-            | LowInstr::NumericForLoop(_)
-            | LowInstr::GenericForLoop(_)
-    )
 }
 
 fn compute_reachable_blocks(

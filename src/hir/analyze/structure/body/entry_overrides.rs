@@ -42,7 +42,7 @@ impl StructuredBodyLowerer<'_, '_> {
         let range = self.lowering.cfg.blocks[block.index()].instrs;
         (range.start.index()..range.end()).any(|instr_index| {
             let effect = &self.lowering.dataflow.instr_effects[instr_index];
-            effect.fixed_must_defs.contains(&reg)
+            effect.must_define(reg)
         })
     }
 

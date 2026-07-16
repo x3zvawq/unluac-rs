@@ -10,7 +10,7 @@ use crate::transformer::{InstrRef, Reg, RegRange};
 
 use super::plan::{
     BlockOwner, BranchCandidateId, BranchValueMergeId, CleanupDisposition, EdgeOwner,
-    GotoRequirementId, LoopCandidateId, RegionId,
+    GotoRequirementId, LoopCandidateId, PhiIncomingDisposition, RegionId,
 };
 
 /// 一个 proto 的结构候选集合，以及它的子 proto 结果。
@@ -20,7 +20,6 @@ pub struct StructureFacts {
     pub branch_candidates: Vec<BranchCandidate>,
     pub branch_region_facts: Vec<BranchRegionFact>,
     pub branch_value_merge_candidates: Vec<BranchValueMergeCandidate>,
-    pub generic_phi_materializations: Vec<GenericPhiMaterialization>,
     pub loop_candidates: Vec<LoopCandidate>,
     pub short_circuit_candidates: Vec<ShortCircuitCandidate>,
     pub goto_requirements: Vec<GotoRequirement>,
@@ -40,12 +39,49 @@ pub struct StructurePlan {
     pub(super) branch_value_merge_by_region: BTreeMap<(BlockRef, BlockRef), BranchValueMergeId>,
     pub(super) loops_by_header: BTreeMap<BlockRef, Vec<LoopCandidateId>>,
     pub(super) unstructured_region_by_block: Vec<Option<RegionId>>,
+    pub(super) unstructured_layouts: Vec<Option<UnstructuredRegionLayout>>,
+    pub(super) unstructured_layout_by_block: Vec<Option<RegionId>>,
     pub(super) block_owners: Vec<BlockOwner>,
     pub(super) edge_owners: Vec<EdgeOwner>,
     pub(super) cleanup_dispositions: Vec<Option<CleanupDisposition>>,
+    pub(super) generic_phi_materializations: Vec<Option<GenericPhiMaterialization>>,
+    pub(super) generic_phi_materializations_by_block: Vec<Vec<GenericPhiMaterialization>>,
+    pub(super) phi_incoming_dispositions: Vec<Vec<PhiIncomingDisposition>>,
+    pub(super) phi_edge_copies: Vec<Vec<PhiEdgeCopy>>,
+}
+
+impl StructurePlan {
+    pub(super) fn phi_is_dead(&self, phi_id: PhiId) -> bool {
+        matches!(
+            self.phi_incoming_dispositions[phi_id.index()].first(),
+            Some(PhiIncomingDisposition::Dead)
+        )
+    }
+
+    pub(super) fn phi_has_edge_copy(&self, phi_id: PhiId) -> bool {
+        self.phi_incoming_dispositions[phi_id.index()]
+            .iter()
+            .any(|owner| matches!(owner, PhiIncomingDisposition::EdgeCopy))
+    }
+
+    pub(super) fn phi_is_edge_owned(&self, phi_id: PhiId) -> bool {
+        let owners = &self.phi_incoming_dispositions[phi_id.index()];
+        self.phi_has_edge_copy(phi_id)
+            && owners.iter().all(|owner| {
+                matches!(
+                    owner,
+                    PhiIncomingDisposition::EdgeCopy | PhiIncomingDisposition::Unreachable
+                )
+            })
+    }
 }
 
 impl StructureFacts {
+    pub fn branch_candidate_for_header(&self, header: BlockRef) -> Option<&BranchCandidate> {
+        let id = self.plan.branch_by_header.get(&header)?;
+        self.branch_candidate(*id)
+    }
+
     pub fn branch_candidate(&self, id: BranchCandidateId) -> Option<&BranchCandidate> {
         self.branch_candidates.get(id.index())
     }
@@ -111,6 +147,10 @@ impl StructureFacts {
         self.plan.loops_by_header.keys().copied()
     }
 
+    pub fn has_loop_header(&self, header: BlockRef) -> bool {
+        self.plan.loops_by_header.contains_key(&header)
+    }
+
     pub fn block_owner(&self, block: BlockRef) -> Option<BlockOwner> {
         self.plan.block_owners.get(block.index()).copied()
     }
@@ -127,6 +167,10 @@ impl StructureFacts {
             .flatten()
     }
 
+    pub fn unstructured_layout(&self, region: RegionId) -> Option<&UnstructuredRegionLayout> {
+        self.plan.unstructured_layouts.get(region.index())?.as_ref()
+    }
+
     pub fn cleanup_disposition(&self, instr: InstrRef) -> CleanupDisposition {
         self.plan
             .cleanup_dispositions
@@ -135,6 +179,60 @@ impl StructureFacts {
             .flatten()
             .expect("cleanup instruction must have one disposition")
     }
+
+    pub fn generic_phi_materialization(&self, phi_id: PhiId) -> Option<GenericPhiMaterialization> {
+        self.plan
+            .generic_phi_materializations
+            .get(phi_id.index())
+            .copied()
+            .flatten()
+    }
+
+    pub fn generic_phi_materializations(
+        &self,
+    ) -> impl Iterator<Item = GenericPhiMaterialization> + '_ {
+        self.plan
+            .generic_phi_materializations
+            .iter()
+            .copied()
+            .flatten()
+    }
+
+    pub fn generic_phi_materializations_in_block(
+        &self,
+        block: BlockRef,
+    ) -> &[GenericPhiMaterialization] {
+        self.plan
+            .generic_phi_materializations_by_block
+            .get(block.index())
+            .map_or(&[], Vec::as_slice)
+    }
+
+    pub fn phi_edge_copies(&self, edge: EdgeRef) -> &[PhiEdgeCopy] {
+        &self.plan.phi_edge_copies[edge.index()]
+    }
+
+    pub fn phi_is_dead(&self, phi_id: PhiId) -> bool {
+        self.plan.phi_is_dead(phi_id)
+    }
+
+    pub fn phi_is_edge_owned(&self, phi_id: PhiId) -> bool {
+        self.plan.phi_is_edge_owned(phi_id)
+    }
+}
+
+/// 显式 CFG edge 离开 predecessor 时需要执行的一条 phi copy。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhiEdgeCopy {
+    pub phi_id: PhiId,
+    pub value: SsaValue,
+}
+
+/// 不可规约 region 的实际 mixed-lowering 布局。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnstructuredRegionLayout {
+    pub blocks: BTreeSet<BlockRef>,
+    pub continuation: BlockRef,
 }
 
 /// 一个仍需 generic unresolved 物化的 phi。
@@ -247,12 +345,12 @@ pub struct LoopCandidate {
     pub header: BlockRef,
     pub preheader: Option<BlockRef>,
     pub blocks: BTreeSet<BlockRef>,
-    /// for-loop 源码绑定在词法上可见的 block。
+    /// 源码 loop body 在词法上覆盖的 block。
     ///
-    /// natural loop blocks 不包含提前退出 tail，但 `for i = ... do if c then return i end end`
-    /// 里的 `return i` 仍在 `i` 的作用域内。Structure 在这里统一保存作用域事实，
-    /// HIR bindings 只消费它来分配寄存器到 local 的映射。
-    pub binding_scope_blocks: BTreeSet<BlockRef>,
+    /// natural loop blocks 不包含提前退出 tail，也可能漏掉 repeat 分支进入的 nested
+    /// loop。Structure 在这里统一保存源码 body 边界；HIR bindings 与结构降低只消费
+    /// 这份事实，不回头用 CFG 扩张作用域。
+    pub body_scope_blocks: BTreeSet<BlockRef>,
     /// 已被循环语法或规范化出口吸收、无需作为源码 body 单独降低的 block。
     pub control_blocks: BTreeSet<BlockRef>,
     pub backedges: Vec<EdgeRef>,

@@ -157,6 +157,12 @@ impl DataflowFacts {
         self.phi_uses.get(phi_id.index()).map_or(0, Vec::len)
     }
 
+    pub fn phi_consumer_ids(&self, phi_id: PhiId) -> &[PhiId] {
+        self.phi_phi_uses
+            .get(phi_id.index())
+            .map_or(&[], Vec::as_slice)
+    }
+
     pub fn def_reg(&self, def_id: DefId) -> Reg {
         self.defs
             .get(def_id.index())
@@ -193,7 +199,7 @@ impl DataflowFacts {
 
     /// 计算"真正死亡"的 phi 集合——既没有任何指令直接读取，也没有被任何存活 phi
     /// 的 incoming 间接引用。返回的 `BTreeSet<PhiId>` 中的 phi 可以安全地跳过物化。
-    pub fn compute_truly_dead_phis(&self, _cfg: &Cfg) -> BTreeSet<PhiId> {
+    pub fn compute_truly_dead_phis(&self) -> BTreeSet<PhiId> {
         if self.phi_candidates.is_empty() {
             return BTreeSet::new();
         }
@@ -321,6 +327,16 @@ pub struct InstrEffect {
     pub fixed_must_defs: BTreeSet<Reg>,
     pub open_use: Option<Reg>,
     pub open_must_def: Option<Reg>,
+}
+
+impl InstrEffect {
+    /// 指令是否必定覆盖该固定寄存器；open result 从起始槽一直覆盖到栈顶。
+    pub fn must_define(&self, reg: Reg) -> bool {
+        self.fixed_must_defs.contains(&reg)
+            || self
+                .open_must_def
+                .is_some_and(|start| reg.index() >= start.index())
+    }
 }
 
 /// 一条指令的副作用摘要。

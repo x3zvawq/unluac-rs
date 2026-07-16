@@ -19,13 +19,12 @@ use crate::transformer::dialect::puc_lua::{
 };
 use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
-    AccessBase, BinaryOpInstr, BinaryOpKind, BranchCond, BranchOperands, BranchPredicate, Capture,
-    CaptureSource, CloseInstr, ClosureInstr, ConcatInstr, CondOperand, ConstRef,
-    DialectCaptureExtra, GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, LoadBoolInstr,
-    LoadConstInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr,
-    NewTableInstr, ProtoRef, Reg, RegRange, ResultPack, SetListInstr, SetTableInstr,
-    SetUpvalueInstr, TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand,
-    ValuePack, VarArgInstr,
+    AccessBase, BinaryOpInstr, BinaryOpKind, BranchCond, BranchPredicate, Capture, CaptureSource,
+    CloseInstr, ClosureInstr, ConcatInstr, CondOperand, ConstRef, DialectCaptureExtra,
+    GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, LoadBoolInstr, LoadConstInstr,
+    LoadNilInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr,
+    ProtoRef, Reg, RegRange, ResultPack, SetListInstr, SetTableInstr, SetUpvalueInstr,
+    TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
 mod adapter;
@@ -431,14 +430,12 @@ impl<'a> ProtoLowerer<'a> {
                 FamilyOpcode::Eq | FamilyOpcode::Lt | FamilyOpcode::Le => {
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
-                    let cond = BranchCond {
-                        predicate: branch_predicate(opcode),
-                        operands: BranchOperands::Binary(
-                            rk_cond_operand(self.raw, raw_pc, b)?,
-                            rk_cond_operand(self.raw, raw_pc, c)?,
-                        ),
-                        negated: a == 0,
-                    };
+                    let cond = BranchCond::compare(
+                        branch_predicate(opcode),
+                        rk_cond_operand(self.raw, raw_pc, b)?,
+                        rk_cond_operand(self.raw, raw_pc, c)?,
+                        a == 0,
+                    );
 
                     let then_target = if helper.close_from.is_some() {
                         TargetPlaceholder::Low(self.lowering.next_low_index())
@@ -475,11 +472,7 @@ impl<'a> ProtoLowerer<'a> {
                 FamilyOpcode::Test => {
                     let (a, c) = expect_ac(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
-                    let cond = BranchCond {
-                        predicate: BranchPredicate::Truthy,
-                        operands: BranchOperands::Unary(CondOperand::Reg(reg_from_u8(a))),
-                        negated: c == 0,
-                    };
+                    let cond = BranchCond::truthy(CondOperand::Reg(reg_from_u8(a)), c == 0);
 
                     let then_target = if helper.close_from.is_some() {
                         TargetPlaceholder::Low(self.lowering.next_low_index())
@@ -516,11 +509,7 @@ impl<'a> ProtoLowerer<'a> {
                 FamilyOpcode::TestSet => {
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
-                    let cond = BranchCond {
-                        predicate: BranchPredicate::Truthy,
-                        operands: BranchOperands::Unary(CondOperand::Reg(reg_from_u16(b))),
-                        negated: c == 0,
-                    };
+                    let cond = BranchCond::truthy(CondOperand::Reg(reg_from_u16(b)), c == 0);
 
                     if usize::from(a) == usize::from(b) {
                         let then_target = if helper.close_from.is_some() {

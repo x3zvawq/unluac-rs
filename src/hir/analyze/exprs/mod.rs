@@ -19,7 +19,7 @@ use crate::parser::RawLiteralConst;
 use crate::structure::BlockRef;
 use crate::structure::{DefId, SsaValue};
 use crate::transformer::{
-    AccessBase, AccessKey, BinaryOpKind, BranchCond, BranchOperands, BranchPredicate, CallKind,
+    AccessBase, AccessKey, BinaryOpKind, BranchCond, BranchPredicate, BranchSubject, CallKind,
     CondOperand, ConstRef, InstrRef, LowInstr, LoweredProto, MethodNameHint, Reg, ResultPack,
     UnaryOpKind, UpvalueOperand, ValueOperand,
 };
@@ -43,7 +43,7 @@ pub(super) use self::packs::lower_value_pack;
 use self::packs::lower_value_pack_single_eval;
 pub(super) use self::regs::{
     expr_for_closure_capture, expr_for_reg_at_block_entry, expr_for_reg_at_block_exit,
-    expr_for_reg_use,
+    expr_for_reg_use, expr_for_ssa_value,
 };
 use self::regs::{expr_for_reg_use_inline, expr_for_reg_use_single_eval_with_call_policy};
 use super::ProtoLowering;

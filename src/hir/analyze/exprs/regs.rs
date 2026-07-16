@@ -229,7 +229,10 @@ pub(crate) fn expr_for_reg_use_single_eval_with_call_policy(
     }
 }
 
-fn expr_for_ssa_value(lowering: &ProtoLowering<'_>, value: SsaValue) -> HirExpr {
+pub(in crate::hir::analyze) fn expr_for_ssa_value(
+    lowering: &ProtoLowering<'_>,
+    value: SsaValue,
+) -> HirExpr {
     match value {
         SsaValue::Entry(reg) => expr_for_entry_reg(lowering, reg),
         SsaValue::Def(def) => lowering
@@ -276,7 +279,7 @@ fn def_has_later_use_after_pure_wrapper(
         {
             return true;
         }
-        if effect.fixed_must_defs.contains(&def_reg) {
+        if effect.must_define(def_reg) {
             return false;
         }
     }

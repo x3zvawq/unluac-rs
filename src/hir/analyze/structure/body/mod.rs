@@ -24,38 +24,25 @@ use super::*;
 pub(super) fn build_structured_body(
     target: AstTargetDialect,
     lowering: &ProtoLowering<'_>,
-) -> Option<HirBlock> {
-    if lowering
-        .structure
-        .goto_requirements
-        .iter()
-        .any(|requirement| {
-            requirement.reason != GotoReason::UnstructuredContinueLike
-                && lowering
-                    .structure
-                    .unstructured_region(lowering.cfg.edges[requirement.edge.index()].to)
-                    .is_none()
-        })
-    {
-        return None;
-    }
-
+) -> HirBlock {
     let mut lowerer = StructuredBodyLowerer::new(target, lowering);
-    let body = lowerer.lower_region(lowering.cfg.entry_block, None, &BTreeMap::new())?;
-    lowerer.all_reachable_blocks_covered().then_some(body)
+    let body = lowerer
+        .lower_region(lowering.cfg.entry_block, None, &BTreeMap::new())
+        .expect("StructurePlan must lower every reachable region");
+    assert!(
+        lowerer.all_reachable_blocks_covered(),
+        "StructurePlan must cover every reachable block"
+    );
+    body
 }
 
 pub(super) struct StructuredBodyLowerer<'a, 'b> {
     pub(super) target: AstTargetDialect,
     pub(super) lowering: &'b ProtoLowering<'a>,
-    pub(super) branch_by_header: BTreeMap<BlockRef, &'b BranchCandidate>,
     pub(super) branch_regions_by_header: BTreeMap<BlockRef, &'b BranchRegionFact>,
-    pub(super) branch_value_merges_by_header: BTreeMap<BlockRef, &'b BranchValueMergeCandidate>,
-    pub(super) loop_headers: BTreeSet<BlockRef>,
-    pub(super) loops_by_header: BTreeMap<BlockRef, Vec<(LoopCandidateId, &'b LoopCandidate)>>,
     pub(super) label_map: BTreeMap<BlockRef, HirLabelId>,
-    pub(super) required_labels: BTreeSet<BlockRef>,
-    pub(super) merge_allowed_blocks: BTreeMap<BlockRef, BTreeSet<BlockRef>>,
+    pub(super) required_labels: TransactionalBlockSet,
+    pub(super) merge_allowed_blocks: TransactionalBlockRelation,
     pub(super) overrides: StructureOverrideState,
     pub(super) visited: TransactionalBlockSet,
     pub(super) active_loops: Vec<ActiveLoopContext>,
@@ -174,24 +161,65 @@ impl TransactionalBlockSet {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default)]
+pub(super) struct TransactionalBlockRelation {
+    members: BTreeMap<BlockRef, BTreeSet<BlockRef>>,
+    inserted: Vec<(BlockRef, BlockRef)>,
+}
+
+impl TransactionalBlockRelation {
+    pub(super) fn get(&self, block: &BlockRef) -> Option<&BTreeSet<BlockRef>> {
+        self.members.get(block)
+    }
+
+    pub(super) fn insert(&mut self, owner: BlockRef, member: BlockRef) -> bool {
+        if !self.members.entry(owner).or_default().insert(member) {
+            return false;
+        }
+        self.inserted.push((owner, member));
+        true
+    }
+
+    fn checkpoint(&self) -> usize {
+        self.inserted.len()
+    }
+
+    fn rollback(&mut self, checkpoint: usize) {
+        while self.inserted.len() > checkpoint {
+            let (owner, member) = self
+                .inserted
+                .pop()
+                .expect("relation rollback length should be valid");
+            let members = self
+                .members
+                .get_mut(&owner)
+                .expect("inserted relation owner should still exist");
+            assert!(members.remove(&member));
+            if members.is_empty() {
+                self.members.remove(&owner);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(super) struct StructureStateCheckpoint {
-    required_labels: BTreeSet<BlockRef>,
-    merge_allowed_blocks: BTreeMap<BlockRef, BTreeSet<BlockRef>>,
-    overrides: StructureOverrideState,
+    required_labels_len: usize,
+    merge_allowed_blocks_len: usize,
+    overrides_len: usize,
     visited_len: usize,
-    active_loops: Vec<ActiveLoopContext>,
+    active_loops_len: usize,
     stmts_len: usize,
 }
 
 impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     pub(super) fn checkpoint_state(&self, stmts_len: usize) -> StructureStateCheckpoint {
         StructureStateCheckpoint {
-            required_labels: self.required_labels.clone(),
-            merge_allowed_blocks: self.merge_allowed_blocks.clone(),
-            overrides: self.overrides.clone(),
+            required_labels_len: self.required_labels.checkpoint(),
+            merge_allowed_blocks_len: self.merge_allowed_blocks.checkpoint(),
+            overrides_len: self.overrides.checkpoint(),
             visited_len: self.visited.checkpoint(),
-            active_loops: self.active_loops.clone(),
+            active_loops_len: self.active_loops.len(),
             stmts_len,
         }
     }
@@ -201,78 +229,57 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         checkpoint: StructureStateCheckpoint,
         stmts: &mut Vec<HirStmt>,
     ) {
-        self.required_labels = checkpoint.required_labels;
-        self.merge_allowed_blocks = checkpoint.merge_allowed_blocks;
-        self.overrides = checkpoint.overrides;
+        self.required_labels
+            .rollback(checkpoint.required_labels_len);
+        self.merge_allowed_blocks
+            .rollback(checkpoint.merge_allowed_blocks_len);
+        self.overrides.rollback(checkpoint.overrides_len);
         self.visited.rollback(checkpoint.visited_len);
-        self.active_loops = checkpoint.active_loops;
+        assert!(self.active_loops.len() >= checkpoint.active_loops_len);
+        self.active_loops.truncate(checkpoint.active_loops_len);
         stmts.truncate(checkpoint.stmts_len);
     }
 
     fn new(target: AstTargetDialect, lowering: &'b ProtoLowering<'a>) -> Self {
-        let branch_by_header = lowering.structure.branch_candidates_by_header().collect();
-        let branch_value_merges_by_header = lowering
-            .structure
-            .branch_candidates_by_header()
-            .filter_map(|(header, _)| {
-                lowering
-                    .structure
-                    .branch_value_merge_for_header(header)
-                    .map(|candidate| (header, candidate))
-            })
-            .collect();
         let branch_regions_by_header = lowering
             .structure
             .branch_region_facts
             .iter()
             .map(|fact| (fact.header, fact))
             .collect();
-        let mut loops_by_header = BTreeMap::<BlockRef, Vec<_>>::new();
-        for header in lowering.structure.loop_headers() {
-            loops_by_header.insert(
-                header,
-                lowering
-                    .structure
-                    .loop_candidates_for_header(header)
-                    .collect(),
-            );
-        }
-        let loop_headers = loops_by_header.keys().copied().collect();
-        let required_labels = lowering
-            .structure
-            .goto_requirements
-            .iter()
-            .map(|requirement| lowering.cfg.edges[requirement.edge.index()].to)
-            .chain(
-                lowering
-                    .cfg
-                    .block_order
-                    .iter()
-                    .copied()
-                    .filter(|block| lowering.structure.unstructured_region(*block).is_some()),
-            )
-            .chain(
-                lowering
-                    .structure
-                    .region_facts
-                    .iter()
-                    .filter(|region| !region.structureable)
-                    .flat_map(|region| region.exits.iter().copied()),
-            )
-            .filter(|block| *block != lowering.cfg.exit_block)
-            .collect();
+        let mut required_labels = TransactionalBlockSet::new(lowering.cfg.blocks.len());
+        required_labels.extend(
+            lowering
+                .structure
+                .goto_requirements
+                .iter()
+                .map(|requirement| lowering.cfg.edges[requirement.edge.index()].to)
+                .chain(
+                    lowering
+                        .cfg
+                        .block_order
+                        .iter()
+                        .copied()
+                        .filter(|block| lowering.structure.unstructured_region(*block).is_some()),
+                )
+                .chain(
+                    lowering
+                        .structure
+                        .region_facts
+                        .iter()
+                        .filter(|region| !region.structureable)
+                        .flat_map(|region| region.exits.iter().copied()),
+                )
+                .filter(|block| *block != lowering.cfg.exit_block),
+        );
 
         Self {
             target,
             lowering,
-            branch_by_header,
             branch_regions_by_header,
-            branch_value_merges_by_header,
-            loop_headers,
-            loops_by_header,
             label_map: build_label_map_for_summary(lowering.cfg),
             required_labels,
-            merge_allowed_blocks: BTreeMap::new(),
+            merge_allowed_blocks: TransactionalBlockRelation::default(),
             overrides: StructureOverrideState::default(),
             visited: TransactionalBlockSet::new(lowering.cfg.blocks.len()),
             active_loops: Vec::new(),
@@ -389,7 +396,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             {
                 current =
                     self.lower_loop(block, candidate_id, stop, &mut stmts, target_overrides)?;
-            } else if self.branch_by_header.contains_key(&block) {
+            } else if self.branch_candidate_for_header(block).is_some() {
                 current = self.lower_branch(block, stop, &mut stmts, target_overrides)?;
             } else {
                 current = self.lower_linear_block(block, stop, &mut stmts, target_overrides)?;
@@ -406,19 +413,45 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.lowering.structure.loop_candidate(candidate_id)
     }
 
+    pub(super) fn branch_candidate_for_header(
+        &self,
+        header: BlockRef,
+    ) -> Option<&'b BranchCandidate> {
+        self.lowering.structure.branch_candidate_for_header(header)
+    }
+
+    pub(super) fn branch_value_merge_for_header(
+        &self,
+        header: BlockRef,
+    ) -> Option<&'b BranchValueMergeCandidate> {
+        self.lowering
+            .structure
+            .branch_value_merge_for_header(header)
+    }
+
+    pub(super) fn has_loop_header(&self, header: BlockRef) -> bool {
+        self.lowering.structure.has_loop_header(header)
+    }
+
+    pub(super) fn loop_candidates_for_header(
+        &self,
+        header: BlockRef,
+    ) -> impl DoubleEndedIterator<Item = (LoopCandidateId, &'b LoopCandidate)> {
+        self.lowering.structure.loop_candidates_for_header(header)
+    }
+
     pub(super) fn innermost_loop_candidate(
         &self,
         header: BlockRef,
     ) -> Option<(LoopCandidateId, &'b LoopCandidate)> {
-        let candidates = self.loops_by_header.get(&header)?;
-        let minimum = candidates
-            .iter()
+        let minimum = self
+            .loop_candidates_for_header(header)
             .map(|(_, candidate)| candidate.blocks.len())
             .min()?;
-        let mut matching = candidates
-            .iter()
+        let mut matching = self
+            .loop_candidates_for_header(header)
             .filter(|(_, candidate)| candidate.blocks.len() == minimum);
-        let candidate = matching.next().copied()?;
+        let candidate = matching.next()?;
         matching.next().is_none().then_some(candidate)
     }
 
@@ -428,11 +461,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         mut matches: impl FnMut(&LoopCandidate) -> bool,
     ) -> Option<(LoopCandidateId, &'b LoopCandidate)> {
         let mut matching = self
-            .loops_by_header
-            .get(&header)?
-            .iter()
+            .loop_candidates_for_header(header)
             .filter(|(_, candidate)| matches(candidate));
-        let candidate = matching.next().copied()?;
+        let candidate = matching.next()?;
         matching.next().is_none().then_some(candidate)
     }
 
@@ -442,11 +473,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         mut matches: impl FnMut(LoopCandidateId, &LoopCandidate) -> bool,
     ) -> Option<(LoopCandidateId, &'b LoopCandidate)> {
         let candidates = self
-            .loops_by_header
-            .get(&header)?
-            .iter()
+            .loop_candidates_for_header(header)
             .filter(|(id, candidate)| matches(*id, candidate))
-            .copied()
             .collect::<Vec<_>>();
         let maximum = candidates
             .iter()
@@ -468,13 +496,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             self.outermost_loop_candidate_matching(entry, |_, candidate| {
                 candidate.preheader.is_none()
                     && candidate.header != active.header
-                    && candidate.blocks.is_subset(&active.binding_scope_blocks)
+                    && candidate.blocks.is_subset(&active.body_scope_blocks)
             })
             .map(|(_, candidate)| candidate)
         })?;
-        (candidate.header != active.header
-            && candidate.blocks.is_subset(&active.binding_scope_blocks))
-        .then_some(candidate)
+        (candidate.header != active.header && candidate.blocks.is_subset(&active.body_scope_blocks))
+            .then_some(candidate)
     }
 
     fn loop_candidate_for_entry(
@@ -537,7 +564,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return self.next_linear_successor(block, stop);
         };
 
-        if !is_control_terminator(instr) {
+        if !instr.is_control_terminator() {
             return self.next_linear_successor(block, stop);
         }
 
@@ -670,6 +697,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let mut stmts = overridden_phis
             .into_iter()
             .flat_map(|phi_exprs| phi_exprs.iter())
+            .filter(|(phi_id, _)| !self.lowering.structure.phi_is_edge_owned(**phi_id))
             .map(|(phi_id, value)| {
                 let temp = self.lowering.bindings.phi_temps[phi_id.index()];
                 assign_stmt(vec![HirLValue::Temp(temp)], vec![value.clone()])
@@ -747,8 +775,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirBlock> {
         if self.required_labels.contains(&block)
-            || self.branch_by_header.contains_key(&block)
-            || self.loop_headers.contains(&block)
+            || self.branch_candidate_for_header(block).is_some()
+            || self.has_loop_header(block)
             || !self
                 .lowering
                 .dataflow
@@ -759,7 +787,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         }
         if let Some((_instr_ref, instr)) = self.block_terminator(block)
-            && is_control_terminator(instr)
+            && instr.is_control_terminator()
             && !matches!(instr, LowInstr::Jump(_))
         {
             return None;
@@ -776,7 +804,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         &self,
         block: BlockRef,
     ) -> Option<StructuredBranchPlan> {
-        let candidate = *self.branch_by_header.get(&block)?;
+        let candidate = self.branch_candidate_for_header(block)?;
 
         match candidate.kind {
             BranchKind::IfElse => Some(StructuredBranchPlan {
@@ -863,7 +891,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 return None;
             }
 
-            if is_control_terminator(instr) {
+            if instr.is_control_terminator() {
                 range.end() - 1
             } else {
                 range.end()

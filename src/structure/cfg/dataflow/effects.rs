@@ -153,11 +153,11 @@ pub(super) fn compute_instr_effect(instr: &LowInstr) -> InstrEffect {
             }
         }
         LowInstr::Jump(_instr) => {}
-        LowInstr::Branch(instr) => match instr.cond.operands {
-            BranchOperands::Unary(operand) => {
+        LowInstr::Branch(instr) => match instr.cond.subject {
+            BranchSubject::Truthy(operand) => {
                 insert_cond_operand_use(&mut effect.fixed_uses, operand)
             }
-            BranchOperands::Binary(lhs, rhs) => {
+            BranchSubject::Compare { lhs, rhs, .. } => {
                 insert_cond_operand_use(&mut effect.fixed_uses, lhs);
                 insert_cond_operand_use(&mut effect.fixed_uses, rhs);
             }

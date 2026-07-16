@@ -205,7 +205,6 @@ fn collect_stmt_temp_uses_into(stmt: &HirStmt, scratch: &mut TempUseScratch) {
         | HirStmt::Goto(_)
         | HirStmt::Label(_) => {}
         HirStmt::Block(block) => collect_block_temp_uses(block, scratch),
-        HirStmt::Unstructured(unstructured) => collect_block_temp_uses(&unstructured.body, scratch),
     }
 }
 
@@ -378,7 +377,6 @@ fn max_temp_index_in_stmt(stmt: &HirStmt) -> Option<usize> {
         | HirStmt::Goto(_)
         | HirStmt::Label(_) => None,
         HirStmt::Block(block) => max_temp_index_in_block(block),
-        HirStmt::Unstructured(unstructured) => max_temp_index_in_block(&unstructured.body),
     }
 }
 

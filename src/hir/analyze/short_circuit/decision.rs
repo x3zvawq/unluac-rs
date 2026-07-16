@@ -458,11 +458,10 @@ pub(crate) fn header_subject_is_value_carrier(
     let LowInstr::Branch(branch) = &lowering.proto.instrs[instr_ref.index()] else {
         return false;
     };
-    branch.cond.predicate == BranchPredicate::Truthy
-        && matches!(
-            branch.cond.operands,
-            BranchOperands::Unary(CondOperand::Reg(reg)) if reg == result_reg
-        )
+    matches!(
+        branch.cond.subject,
+        BranchSubject::Truthy(CondOperand::Reg(reg)) if reg == result_reg
+    )
 }
 
 #[derive(Debug, Clone)]

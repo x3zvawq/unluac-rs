@@ -405,11 +405,6 @@ fn stmt_writes_binding_only_via_direct_writeback(
         HirStmt::Block(block) => {
             suffix_writes_binding_only_via_direct_writeback(&block.stmts, binding, target_temp)
         }
-        HirStmt::Unstructured(unstructured) => suffix_writes_binding_only_via_direct_writeback(
-            &unstructured.body.stmts,
-            binding,
-            target_temp,
-        ),
         HirStmt::LocalDecl(_)
         | HirStmt::TableSetList(_)
         | HirStmt::ErrNil(_)

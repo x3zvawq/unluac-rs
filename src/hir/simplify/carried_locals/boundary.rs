@@ -168,9 +168,6 @@ fn collect_goto_targets(stmt: &HirStmt, targets: &mut BTreeSet<HirLabelId>) {
         HirStmt::While(while_stmt) => collect_block_goto_targets(&while_stmt.body, targets),
         HirStmt::Repeat(repeat_stmt) => collect_block_goto_targets(&repeat_stmt.body, targets),
         HirStmt::Block(block) => collect_block_goto_targets(block, targets),
-        HirStmt::Unstructured(unstructured) => {
-            collect_block_goto_targets(&unstructured.body, targets);
-        }
         HirStmt::NumericFor(numeric_for) => collect_block_goto_targets(&numeric_for.body, targets),
         HirStmt::GenericFor(generic_for) => collect_block_goto_targets(&generic_for.body, targets),
         HirStmt::LocalDecl(_)

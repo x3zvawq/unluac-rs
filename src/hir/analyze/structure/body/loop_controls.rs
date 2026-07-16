@@ -18,7 +18,7 @@ impl StructuredBodyLowerer<'_, '_> {
     ) -> Option<Option<BlockRef>> {
         let loop_context = self.active_loops.last()?.clone();
         let loop_candidate = self.loop_candidate(loop_context.candidate_id)?;
-        let candidate = *self.branch_by_header.get(&block)?;
+        let candidate = self.branch_candidate_for_header(block)?;
         let merge = candidate.merge?;
         // 同一 header 上的嵌套 while/repeat 可能被编译器折叠成一个多回边 loop：
         // 显式 arm 在 merge 前直接回到 header，缺席的 else 则从 merge 继续完成本轮。
@@ -31,7 +31,7 @@ impl StructuredBodyLowerer<'_, '_> {
             || merge == loop_context.post_loop
             || Some(merge) == loop_context.downstream_post_loop
             || loop_context.break_exits.contains_key(&merge)
-            || self.branch_value_merges_by_header.contains_key(&block)
+            || self.branch_value_merge_for_header(block).is_some()
             || !self.can_reach_avoiding_block(candidate.then_entry, loop_context.header, merge)
             || !self.branch_arm_reaches_target_or_loop_escape_before_boundary(
                 candidate.then_entry,
@@ -127,7 +127,7 @@ impl StructuredBodyLowerer<'_, '_> {
                 return Some(Some(next_entry));
             }
         }
-        let candidate = *self.branch_by_header.get(&block)?;
+        let candidate = self.branch_candidate_for_header(block)?;
         // 当前 header 可能同时是内层 break branch 与外层 state 的共享 merge。
         // 必须在降低 header prefix 前继承已经由全 incoming 证明的 state owner，
         // 否则 generic phi 会先被物化，外层 continuation 随后无法再接管。
@@ -263,11 +263,11 @@ impl StructuredBodyLowerer<'_, '_> {
         if loop_context.continue_target != Some(stop) {
             return None;
         }
-        let candidate = *self.branch_by_header.get(&block)?;
+        let candidate = self.branch_candidate_for_header(block)?;
         let merge = candidate.merge?;
         if candidate.else_entry.is_some()
             || merge == stop
-            || self.branch_value_merges_by_header.contains_key(&block)
+            || self.branch_value_merge_for_header(block).is_some()
             || !self.can_reach_avoiding_block(candidate.then_entry, stop, merge)
             || !self.branch_arm_terminates_before_stop(merge, stop)
         {
@@ -290,7 +290,7 @@ impl StructuredBodyLowerer<'_, '_> {
 
     pub(super) fn cross_structure_escape_target(&self, block: BlockRef) -> Option<BlockRef> {
         let loop_context = self.active_loops.last()?;
-        let candidate = self.branch_by_header.get(&block).copied()?;
+        let candidate = self.branch_candidate_for_header(block)?;
         let merge = candidate.merge?;
         let continue_target = loop_context.continue_target?;
         // 显式 else 臂可能在到达 merge 前仍有语句或分支，不能把它跳过后伪装成
@@ -340,7 +340,7 @@ impl StructuredBodyLowerer<'_, '_> {
     ) -> Option<Option<BlockRef>> {
         let loop_context = self.active_loops.last()?.clone();
         let continue_target = loop_context.continue_target?;
-        let candidate = *self.branch_by_header.get(&block)?;
+        let candidate = self.branch_candidate_for_header(block)?;
 
         let mut keep_cond = self.lower_candidate_cond(block, candidate)?;
         rewrite_expr_temps(&mut keep_cond, &temp_expr_overrides(target_overrides));
@@ -391,7 +391,7 @@ impl StructuredBodyLowerer<'_, '_> {
         let short_circuit_non_continue = match self.multi_node_short_circuit_non_continue_exit(
             block,
             continue_target,
-            &active_candidate.binding_scope_blocks,
+            &active_candidate.body_scope_blocks,
         ) {
             Ok(exit) => exit,
             Err(()) => return None,
@@ -410,7 +410,7 @@ impl StructuredBodyLowerer<'_, '_> {
             && active_candidate.kind_hint == LoopKindHint::RepeatLike
             && let Some(local_tail) = stop
             && local_tail != continue_target
-            && let Some(candidate) = self.branch_by_header.get(&block).copied()
+            && let Some(candidate) = self.branch_candidate_for_header(block)
             && candidate.else_entry.is_none()
             && candidate.merge == Some(continue_target)
             && self.branch_arm_reaches_target_before_boundary(
@@ -447,16 +447,17 @@ impl StructuredBodyLowerer<'_, '_> {
         let branch_continue_pad = if loop_continue_entry.is_none()
             && active_candidate.kind_hint == LoopKindHint::RepeatLike
         {
-            self.branch_by_header.get(&block).and_then(|candidate| {
-                [Some(candidate.then_entry), candidate.else_entry]
-                    .into_iter()
-                    .flatten()
-                    .find(|entry| {
-                        loop_context.continue_sources.contains(entry)
-                            && self.lowering.cfg.unique_reachable_successor(*entry)
-                                == Some(continue_target)
-                    })
-            })
+            self.branch_candidate_for_header(block)
+                .and_then(|candidate| {
+                    [Some(candidate.then_entry), candidate.else_entry]
+                        .into_iter()
+                        .flatten()
+                        .find(|entry| {
+                            loop_context.continue_sources.contains(entry)
+                                && self.lowering.cfg.unique_reachable_successor(*entry)
+                                    == Some(continue_target)
+                        })
+                })
         } else {
             None
         };
@@ -477,7 +478,7 @@ impl StructuredBodyLowerer<'_, '_> {
         }
         // O2 会让自然循环尾的 if-body 与 header 直达边共享 continue pad；只消费
         // 当前 region 的多出口 body，且不越过 body entry 上已有的 continue owner。
-        if let Some(candidate) = self.branch_by_header.get(&block).copied()
+        if let Some(candidate) = self.branch_candidate_for_header(block)
             && owned_continue_entry.is_some()
             && stop == Some(continue_target)
             && candidate.else_entry.is_none()
@@ -574,16 +575,17 @@ impl StructuredBodyLowerer<'_, '_> {
             }
         }
         let branch_points_to_continue =
-            self.branch_by_header.get(&block).is_some_and(|candidate| {
-                candidate.then_entry == continue_entry
-                    || candidate.else_entry == Some(continue_entry)
-                    || candidate.merge == Some(continue_target)
-            });
+            self.branch_candidate_for_header(block)
+                .is_some_and(|candidate| {
+                    candidate.then_entry == continue_entry
+                        || candidate.else_entry == Some(continue_entry)
+                        || candidate.merge == Some(continue_target)
+                });
         if !loop_context.continue_sources.contains(&block) && !branch_points_to_continue {
             return None;
         }
 
-        let candidate = *self.branch_by_header.get(&block)?;
+        let candidate = self.branch_candidate_for_header(block)?;
         if candidate.then_entry != continue_entry
             && candidate.else_entry != Some(continue_entry)
             && candidate.merge != Some(continue_target)
@@ -938,7 +940,7 @@ impl StructuredBodyLowerer<'_, '_> {
             return true;
         }
 
-        let Some(candidate) = self.branch_by_header.get(&entry).copied() else {
+        let Some(candidate) = self.branch_candidate_for_header(entry) else {
             return false;
         };
         let Some(non_continue_entry) =

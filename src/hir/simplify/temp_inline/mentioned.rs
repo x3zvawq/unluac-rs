@@ -118,7 +118,6 @@ fn stmt_has_nested_inline_scope(stmt: &HirStmt) -> bool {
             | HirStmt::NumericFor(_)
             | HirStmt::GenericFor(_)
             | HirStmt::Block(_)
-            | HirStmt::Unstructured(_)
     )
 }
 

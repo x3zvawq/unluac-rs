@@ -44,7 +44,6 @@ fn max_hir_label_id_in_block(block: &HirBlock) -> usize {
             HirStmt::NumericFor(numeric_for) => max_hir_label_id_in_block(&numeric_for.body),
             HirStmt::GenericFor(generic_for) => max_hir_label_id_in_block(&generic_for.body),
             HirStmt::Block(block) => max_hir_label_id_in_block(block),
-            HirStmt::Unstructured(unstructured) => max_hir_label_id_in_block(&unstructured.body),
             HirStmt::Goto(goto_stmt) => goto_stmt.target.index(),
             HirStmt::Label(label) => label.id.index(),
             _ => 0,
@@ -149,9 +148,6 @@ fn collect_referenced_temps_in_stmt(stmt: &HirStmt, temps: &mut ReferencedTempCo
         }
         HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => {}
         HirStmt::Block(block) => collect_referenced_temps_in_block(block, temps),
-        HirStmt::Unstructured(unstructured) => {
-            collect_referenced_temps_in_block(&unstructured.body, temps)
-        }
     }
 }
 
@@ -275,9 +271,6 @@ fn collect_close_temps_in_block(block: &HirBlock, temps: &mut BTreeSet<TempId>) 
                 collect_close_temps_in_block(&generic_for.body, temps)
             }
             HirStmt::Block(block) => collect_close_temps_in_block(block, temps),
-            HirStmt::Unstructured(unstructured) => {
-                collect_close_temps_in_block(&unstructured.body, temps)
-            }
             _ => {}
         }
     }
@@ -295,7 +288,6 @@ fn stmt_has_continue(stmt: &HirStmt) -> bool {
                 || if_stmt.else_block.as_ref().is_some_and(block_has_continue)
         }
         HirStmt::Block(block) => block_has_continue(block),
-        HirStmt::Unstructured(unstructured) => block_has_continue(&unstructured.body),
         // 内层 loop 自己会在各自的 AST lowering 里决定是否需要 synthetic continue label。
         // 这里如果继续递归进去，外层 loop 会错误地因为“子循环里出现 continue”
         // 也挂上一层无意义的 `::Lx::` label。
@@ -390,7 +382,6 @@ fn count_local_uses_in_stmt(stmt: &HirStmt, local: LocalId) -> usize {
         }
         HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => 0,
         HirStmt::Block(block) => count_local_uses_in_block(block, local),
-        HirStmt::Unstructured(unstructured) => count_local_uses_in_block(&unstructured.body, local),
     }
 }
 

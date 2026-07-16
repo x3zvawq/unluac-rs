@@ -42,9 +42,8 @@ use super::short_circuit::{
 };
 use super::{ProtoLowering, assign_stmt, branch_stmt, lower_branch_cond};
 use super::{
-    build_label_map_for_summary, goto_block, is_control_terminator, lower_control_instr,
-    lower_edge_phi_copies_for_edge, lower_phi_materialization_with_allowed_blocks_except,
-    lower_regular_instr,
+    build_label_map_for_summary, goto_block, lower_control_instr, lower_edge_phi_copies_for_edge,
+    lower_phi_materialization_with_allowed_blocks_except, lower_regular_instr,
 };
 use body::*;
 use overrides::StructureOverrideState;
@@ -54,10 +53,10 @@ use rewrites::{
     shared_lvalue_for_defs, temp_expr_overrides,
 };
 
-/// 尝试基于现有结构候选恢复一个更接近源码的 HIR block。
-pub(super) fn try_build_structured_body(
+/// 基于 StructurePlan 恢复一个更接近源码的 HIR block。
+pub(super) fn build_structured_body(
     target: AstTargetDialect,
     lowering: &ProtoLowering<'_>,
-) -> Option<HirBlock> {
+) -> HirBlock {
     body::build_structured_body(target, lowering)
 }

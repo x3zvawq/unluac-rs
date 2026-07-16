@@ -225,6 +225,21 @@ pub enum LowInstr {
     Branch(BranchInstr),
 }
 
+impl LowInstr {
+    pub fn is_control_terminator(&self) -> bool {
+        matches!(
+            self,
+            Self::Jump(_)
+                | Self::Branch(_)
+                | Self::Return(_)
+                | Self::TailCall(_)
+                | Self::NumericForInit(_)
+                | Self::NumericForLoop(_)
+                | Self::GenericForLoop(_)
+        )
+    }
+}
+
 /// 一元运算种类。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum UnaryOpKind {
@@ -335,7 +350,6 @@ pub struct Capture {
 /// 条件跳转的谓词。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum BranchPredicate {
-    Truthy,
     Eq,
     Lt,
     Le,
@@ -352,19 +366,47 @@ pub enum CondOperand {
     Number(NumberLiteral),
 }
 
-/// 条件的操作数形态。
+/// 条件的完整语义本体；truthiness 与二元比较在类型层互斥。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub enum BranchOperands {
-    Unary(CondOperand),
-    Binary(CondOperand, CondOperand),
+pub enum BranchSubject {
+    Truthy(CondOperand),
+    Compare {
+        predicate: BranchPredicate,
+        lhs: CondOperand,
+        rhs: CondOperand,
+    },
 }
 
 /// 无副作用条件本体。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct BranchCond {
-    pub predicate: BranchPredicate,
-    pub operands: BranchOperands,
+    pub subject: BranchSubject,
     pub negated: bool,
+}
+
+impl BranchCond {
+    pub const fn truthy(operand: CondOperand, negated: bool) -> Self {
+        Self {
+            subject: BranchSubject::Truthy(operand),
+            negated,
+        }
+    }
+
+    pub const fn compare(
+        predicate: BranchPredicate,
+        lhs: CondOperand,
+        rhs: CondOperand,
+        negated: bool,
+    ) -> Self {
+        Self {
+            subject: BranchSubject::Compare {
+                predicate,
+                lhs,
+                rhs,
+            },
+            negated,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]

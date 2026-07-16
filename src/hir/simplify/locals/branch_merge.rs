@@ -25,7 +25,7 @@ pub(super) fn candidate_temps(
     stmt: &HirStmt,
     temp_touches: &TempTouchIndex,
     stmt_index: usize,
-    reserved_temps: &BTreeSet<TempId>,
+    is_reserved: &dyn Fn(TempId) -> bool,
 ) -> Vec<TempId> {
     let HirStmt::If(if_stmt) = stmt else {
         return Vec::new();
@@ -44,7 +44,7 @@ pub(super) fn candidate_temps(
 
     common_temps
         .into_iter()
-        .filter(|temp| !reserved_temps.contains(temp))
+        .filter(|temp| !is_reserved(*temp))
         .filter(|temp| !temp_touches.touches_before(stmt_index, *temp))
         .filter(|temp| temp_touches.touches_after(stmt_index + 1, *temp))
         .collect()
@@ -123,8 +123,7 @@ fn summarize_stmt_fallthrough_assignments(stmt: &HirStmt) -> Option<FallthroughS
         HirStmt::While(_)
         | HirStmt::Repeat(_)
         | HirStmt::NumericFor(_)
-        | HirStmt::GenericFor(_)
-        | HirStmt::Unstructured(_) => None,
+        | HirStmt::GenericFor(_) => None,
     }
 }
 

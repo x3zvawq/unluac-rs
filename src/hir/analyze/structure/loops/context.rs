@@ -102,7 +102,7 @@ impl StructuredBodyLowerer<'_, '_> {
             Some((_instr_ref, LowInstr::Jump(jump))) => {
                 Some(self.lowering.cfg.instr_to_block[jump.target.index()])
             }
-            Some((_instr_ref, instr)) if !is_control_terminator(instr) => {
+            Some((_instr_ref, instr)) if !instr.is_control_terminator() => {
                 self.lowering.cfg.unique_reachable_successor(post_loop)
             }
             None => self.lowering.cfg.unique_reachable_successor(post_loop),
@@ -183,7 +183,7 @@ impl StructuredBodyLowerer<'_, '_> {
             .enumerate()
             .any(|(index, nested)| {
                 LoopCandidateId(index) != candidate_id
-                    && nested.blocks.is_subset(&candidate.binding_scope_blocks)
+                    && nested.blocks.is_subset(&candidate.body_scope_blocks)
                     && (nested.header == exit || nested.preheader == Some(exit))
             })
     }

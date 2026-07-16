@@ -8,8 +8,7 @@ use std::collections::BTreeMap;
 
 use crate::hir::common::{
     HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirExpr, HirGoto, HirIf, HirLValue,
-    HirLabelId, HirProto, HirProtoRef, HirReturn, HirStmt, HirUnresolvedExpr, HirUnstructured,
-    HirValuePack,
+    HirLabelId, HirProto, HirProtoRef, HirReturn, HirStmt, HirUnresolvedExpr, HirValuePack,
 };
 use crate::structure::{BlockRef, Cfg};
 use crate::transformer::InstrRef;
@@ -44,13 +43,6 @@ pub(super) fn branch_stmt(
         cond,
         then_block,
         else_block,
-    }))
-}
-
-pub(super) fn unstructured_stmt(summary: impl Into<String>) -> HirStmt {
-    HirStmt::Unstructured(Box::new(HirUnstructured {
-        body: HirBlock::default(),
-        summary: Some(summary.into()),
     }))
 }
 

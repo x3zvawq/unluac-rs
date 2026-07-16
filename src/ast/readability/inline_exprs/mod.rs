@@ -12,6 +12,8 @@ mod candidate;
 mod eval_order;
 mod use_sites;
 
+use std::collections::BTreeMap;
+
 use crate::ast::ReadabilityOptions;
 
 use self::candidate::{
@@ -253,8 +255,17 @@ fn collapse_adjacent_call_alias_runs(block: &mut AstBlock, options: ReadabilityO
         };
         let mut removed = vec![false; run_end - index];
         let mut collapsed_count = 0usize;
+        let mut remaining_run_uses = BTreeMap::new();
 
         for candidate_index in (index..run_end).rev() {
+            add_next_kept_stmt_uses(
+                &use_index,
+                candidate_index,
+                run_end,
+                index,
+                &removed,
+                &mut remaining_run_uses,
+            );
             let Some((candidate, value)) = inline_candidate(&old_stmts[candidate_index]) else {
                 continue;
             };
@@ -267,12 +278,10 @@ fn collapse_adjacent_call_alias_runs(block: &mut AstBlock, options: ReadabilityO
                 continue;
             }
             let intermediate_uses = if candidate::is_lookup_inline_expr(value) {
-                count_binding_uses_in_remaining_run(
-                    &use_index,
-                    candidate_index + 1,
-                    &removed[(candidate_index + 1 - index)..],
-                    candidate.binding(),
-                )
+                remaining_run_uses
+                    .get(&candidate.binding())
+                    .copied()
+                    .unwrap_or(0)
             } else {
                 use_index.count_uses_in_range(candidate_index + 1, run_end, candidate.binding())
             };
@@ -378,8 +387,17 @@ fn collapse_terminal_call_result_alias_runs(
         let mut rewritten_sink = old_stmts[sink_index].clone();
         let mut removed = vec![false; sink_index - index];
         let mut collapsed_count = 0usize;
+        let mut remaining_run_uses = BTreeMap::new();
 
         for candidate_index in (index..sink_index).rev() {
+            add_next_kept_stmt_uses(
+                &use_index,
+                candidate_index,
+                sink_index,
+                index,
+                &removed,
+                &mut remaining_run_uses,
+            );
             let Some((candidate, value)) = inline_candidate(&old_stmts[candidate_index]) else {
                 continue;
             };
@@ -390,12 +408,10 @@ fn collapse_terminal_call_result_alias_runs(
                 continue;
             }
             let intermediate_uses = if candidate::is_lookup_inline_expr(value) {
-                count_binding_uses_in_remaining_run(
-                    &use_index,
-                    candidate_index + 1,
-                    &removed[(candidate_index + 1 - index)..],
-                    candidate.binding(),
-                )
+                remaining_run_uses
+                    .get(&candidate.binding())
+                    .copied()
+                    .unwrap_or(0)
             } else {
                 use_index.count_uses_in_range(candidate_index + 1, sink_index, candidate.binding())
             };
@@ -505,8 +521,17 @@ fn collapse_adjacent_mechanical_alias_runs(
         let mut collapsed_count = 0usize;
         let mut has_non_lookup_piece = false;
         let mut has_dependent_lookup_piece = false;
+        let mut remaining_run_uses = BTreeMap::new();
 
         for candidate_index in (index..run_end).rev() {
+            add_next_kept_stmt_uses(
+                &use_index,
+                candidate_index,
+                run_end,
+                index,
+                &removed,
+                &mut remaining_run_uses,
+            );
             let Some((candidate, value)) = inline_candidate(&old_stmts[candidate_index]) else {
                 continue;
             };
@@ -521,12 +546,9 @@ fn collapse_adjacent_mechanical_alias_runs(
             if use_index.count_uses_in_suffix(run_end + 1, candidate.binding()) != 0 {
                 continue;
             }
-            if count_binding_uses_in_remaining_run(
-                &use_index,
-                candidate_index + 1,
-                &removed[(candidate_index + 1 - index)..],
-                candidate.binding(),
-            ) != 0
+            if remaining_run_uses
+                .get(&candidate.binding())
+                .is_some_and(|count| *count != 0)
             {
                 continue;
             }
@@ -626,8 +648,17 @@ fn collapse_terminal_local_mechanical_runs(
         let mut rewritten_sink = old_stmts[run_end - 1].clone();
         let mut removed = vec![false; run_end - index - 1];
         let mut collapsed_count = 0usize;
+        let mut remaining_run_uses = BTreeMap::new();
 
         for candidate_index in (index..(run_end - 1)).rev() {
+            add_next_kept_stmt_uses(
+                &use_index,
+                candidate_index,
+                run_end - 1,
+                index,
+                &removed,
+                &mut remaining_run_uses,
+            );
             let Some((candidate, value)) = inline_candidate(&old_stmts[candidate_index]) else {
                 continue;
             };
@@ -640,12 +671,9 @@ fn collapse_terminal_local_mechanical_runs(
             if use_index.count_uses_in_suffix(run_end, candidate.binding()) != 0 {
                 continue;
             }
-            if count_binding_uses_in_remaining_run(
-                &use_index,
-                candidate_index + 1,
-                &removed[(candidate_index + 1 - index)..],
-                candidate.binding(),
-            ) != 0
+            if remaining_run_uses
+                .get(&candidate.binding())
+                .is_some_and(|count| *count != 0)
             {
                 continue;
             }
@@ -814,16 +842,19 @@ fn lvalue_matches_lookup_expr(
     }
 }
 
-fn count_binding_uses_in_remaining_run(
+fn add_next_kept_stmt_uses(
     use_index: &BindingUseIndex,
-    start_index: usize,
+    candidate_index: usize,
+    run_end: usize,
+    run_start: usize,
     removed: &[bool],
-    binding: AstBindingRef,
-) -> usize {
-    removed
-        .iter()
-        .enumerate()
-        .filter(|(_, removed)| !**removed)
-        .map(|(offset, _)| use_index.count_uses_in_stmt_index(start_index + offset, binding))
-        .sum()
+    remaining_uses: &mut BTreeMap<AstBindingRef, usize>,
+) {
+    let next_index = candidate_index + 1;
+    if next_index >= run_end || removed[next_index - run_start] {
+        return;
+    }
+    for (binding, count) in use_index.uses_in_stmt_index(next_index) {
+        *remaining_uses.entry(binding).or_default() += count;
+    }
 }

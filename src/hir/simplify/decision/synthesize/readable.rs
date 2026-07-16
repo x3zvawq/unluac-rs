@@ -16,6 +16,8 @@ use super::domain::{
 use super::safety::expr_is_synth_safe;
 use super::{MAX_SYNTH_REFS, normalize_candidate_expr};
 
+const MAX_NATURALIZE_OR_TERMS: usize = 16;
+
 pub(crate) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
     if !matches!(expr, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_)) {
         return None;
@@ -25,15 +27,15 @@ pub(crate) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
     }
 
     let current = normalize_candidate_expr(expr.clone());
-    let candidates = direct_pure_logical_rewrite_candidates(&current);
-    if candidates.is_empty() {
-        return None;
-    }
-
     let mut refs = BTreeSet::new();
     collect_refs_from_expr(&current, &mut refs);
     let refs = refs.into_iter().collect::<Vec<_>>();
     if refs.len() > MAX_SYNTH_REFS {
+        return None;
+    }
+
+    let candidates = direct_pure_logical_rewrite_candidates(&current);
+    if candidates.is_empty() {
         return None;
     }
 
@@ -123,7 +125,7 @@ fn factor_or_of_ands(lhs: &HirExpr, rhs: &HirExpr) -> Vec<HirExpr> {
 
 fn factor_or_chain_of_ands(expr: &HirExpr) -> Vec<HirExpr> {
     let terms = flatten_or_chain(expr);
-    if terms.len() < 3 {
+    if !(3..=MAX_NATURALIZE_OR_TERMS).contains(&terms.len()) {
         return Vec::new();
     }
 

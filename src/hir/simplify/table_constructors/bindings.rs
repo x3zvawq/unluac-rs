@@ -148,8 +148,7 @@ pub(super) fn intern_stmt_bindings(stmt: &HirStmt, binding_index: &mut BindingIn
         | HirStmt::Continue
         | HirStmt::Goto(_)
         | HirStmt::Label(_)
-        | HirStmt::Block(_)
-        | HirStmt::Unstructured(_) => {}
+        | HirStmt::Block(_) => {}
     }
 }
 
@@ -393,7 +392,6 @@ impl HirVisitor for MaterializedBindingCollector {
             | HirStmt::While(_)
             | HirStmt::Repeat(_)
             | HirStmt::Block(_)
-            | HirStmt::Unstructured(_)
             | HirStmt::Break
             | HirStmt::Continue
             | HirStmt::Goto(_)

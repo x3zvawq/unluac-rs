@@ -94,7 +94,7 @@ pub(super) fn build_bindings(
                 local_debug_hints.push(None);
                 numeric_for_locals.insert(candidate.header, local);
 
-                for block in &candidate.binding_scope_blocks {
+                for block in &candidate.body_scope_blocks {
                     block_local_regs
                         .entry(*block)
                         .or_insert_with(BTreeMap::new)
@@ -110,7 +110,7 @@ pub(super) fn build_bindings(
                     let reg = crate::transformer::Reg(bindings.start.index() + offset);
                     locals_for_loop.push(local);
 
-                    for block in &candidate.binding_scope_blocks {
+                    for block in &candidate.body_scope_blocks {
                         block_local_regs
                             .entry(*block)
                             .or_insert_with(BTreeMap::new)

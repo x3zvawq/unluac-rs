@@ -591,7 +591,7 @@ fn classify_for_loop_exit_branch(
         {
             let merge = find_soft_merge(cfg, graph_facts, header, then_entry, else_entry)?;
             owner
-                .binding_scope_blocks
+                .body_scope_blocks
                 .contains(&merge)
                 .then_some(BranchCandidate {
                     header,
@@ -620,12 +620,12 @@ fn for_loop_exit_owner<'a>(
             matches!(
                 candidate.kind_hint,
                 LoopKindHint::NumericForLike | LoopKindHint::GenericForLike
-            ) && candidate.binding_scope_blocks.contains(&header)
-                && candidate.binding_scope_blocks.contains(&then_entry)
-                && candidate.binding_scope_blocks.contains(&else_entry)
+            ) && candidate.body_scope_blocks.contains(&header)
+                && candidate.body_scope_blocks.contains(&then_entry)
+                && candidate.body_scope_blocks.contains(&else_entry)
                 && for_loop_exits_at(cfg, candidate, boundary)
         })
-        .min_by_key(|candidate| candidate.binding_scope_blocks.len())
+        .min_by_key(|candidate| candidate.body_scope_blocks.len())
 }
 
 fn for_loop_exits_at(cfg: &Cfg, candidate: &LoopCandidate, boundary: BlockRef) -> bool {

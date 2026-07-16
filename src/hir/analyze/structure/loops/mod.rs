@@ -53,14 +53,7 @@ fn unique_loop_preheader(candidate: &LoopCandidate) -> Option<BlockRef> {
 }
 
 fn loop_body_blocks(candidate: &LoopCandidate) -> &BTreeSet<BlockRef> {
-    if matches!(
-        candidate.kind_hint,
-        LoopKindHint::NumericForLike | LoopKindHint::GenericForLike
-    ) {
-        &candidate.binding_scope_blocks
-    } else {
-        &candidate.blocks
-    }
+    &candidate.body_scope_blocks
 }
 
 fn block_is_terminal_exit(lowering: &ProtoLowering<'_>, block: BlockRef) -> bool {

@@ -93,7 +93,7 @@ impl StructuredBodyLowerer<'_, '_> {
                     self.lowering.cfg.instr_to_block[jump.target.index()]
                 }
                 // Lua 5.4 的 close/capture cleanup pad 可以直接 fallthrough 到后续块。
-                Some((_instr_ref, instr)) if !is_control_terminator(instr) => {
+                Some((_instr_ref, instr)) if !instr.is_control_terminator() => {
                     self.lowering.cfg.unique_reachable_successor(current)?
                 }
                 None => self.lowering.cfg.unique_reachable_successor(current)?,
@@ -336,7 +336,7 @@ impl StructuredBodyLowerer<'_, '_> {
             Some((_instr_ref, LowInstr::Jump(jump))) => {
                 self.lowering.cfg.instr_to_block[jump.target.index()]
             }
-            Some((_instr_ref, instr)) if !is_control_terminator(instr) => {
+            Some((_instr_ref, instr)) if !instr.is_control_terminator() => {
                 self.lowering.cfg.unique_reachable_successor(block)?
             }
             None => self.lowering.cfg.unique_reachable_successor(block)?,

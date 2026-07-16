@@ -46,8 +46,7 @@ pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<Inline
         | HirStmt::Continue
         | HirStmt::Goto(_)
         | HirStmt::Label(_)
-        | HirStmt::Block(_)
-        | HirStmt::Unstructured(_) => None,
+        | HirStmt::Block(_) => None,
     }
 }
 
@@ -90,8 +89,7 @@ pub(super) fn temp_precedes_observable_eval_in_stmt(stmt: &HirStmt, temp: TempId
         | HirStmt::Continue
         | HirStmt::Goto(_)
         | HirStmt::Label(_)
-        | HirStmt::Block(_)
-        | HirStmt::Unstructured(_) => false,
+        | HirStmt::Block(_) => false,
     }
 }
 

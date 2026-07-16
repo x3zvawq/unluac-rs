@@ -14,13 +14,13 @@ use crate::transformer::dialect::puc_lua::{
 };
 use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
-    AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchOperands,
-    BranchPredicate, CallInstr, Capture, CaptureSource, CloseInstr, ClosureInstr, ConcatInstr,
-    CondOperand, ConstRef, DialectCaptureExtra, GenericForCallInstr, GetTableInstr, GetTableKind,
-    GetUpvalueInstr, InstrRef, LoadBoolInstr, LoadConstInstr, LoadNilInstr, LowInstr, LoweredChunk,
-    LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange, ResultPack,
-    ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr, TransformError,
-    UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchPredicate, CallInstr,
+    Capture, CaptureSource, CloseInstr, ClosureInstr, ConcatInstr, CondOperand, ConstRef,
+    DialectCaptureExtra, GenericForCallInstr, GetTableInstr, GetTableKind, GetUpvalueInstr,
+    InstrRef, LoadBoolInstr, LoadConstInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto,
+    LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange, ResultPack, ReturnInstr,
+    SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr, TransformError, UnaryOpInstr,
+    UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
 const BITRK: u16 = 1 << 8;
@@ -341,14 +341,12 @@ impl<'a> ProtoLowerer<'a> {
                 Lua51Opcode::Eq | Lua51Opcode::Lt | Lua51Opcode::Le => {
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
-                    let cond = BranchCond {
-                        predicate: branch_predicate(opcode),
-                        operands: BranchOperands::Binary(
-                            self.cond_operand(raw_pc, b)?,
-                            self.cond_operand(raw_pc, c)?,
-                        ),
-                        negated: a == 0,
-                    };
+                    let cond = BranchCond::compare(
+                        branch_predicate(opcode),
+                        self.cond_operand(raw_pc, b)?,
+                        self.cond_operand(raw_pc, c)?,
+                        a == 0,
+                    );
                     self.emit(
                         Some(raw_index),
                         vec![raw_index, helper.helper_index],
@@ -363,11 +361,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua51Opcode::Test => {
                     let (a, c) = expect_ac(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
-                    let cond = BranchCond {
-                        predicate: BranchPredicate::Truthy,
-                        operands: BranchOperands::Unary(CondOperand::Reg(reg_from_u8(a))),
-                        negated: c == 0,
-                    };
+                    let cond = BranchCond::truthy(CondOperand::Reg(reg_from_u8(a)), c == 0);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index, helper.helper_index],
@@ -382,11 +376,7 @@ impl<'a> ProtoLowerer<'a> {
                 Lua51Opcode::TestSet => {
                     let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let helper = self.helper_jump(raw_index, opcode)?;
-                    let cond = BranchCond {
-                        predicate: BranchPredicate::Truthy,
-                        operands: BranchOperands::Unary(CondOperand::Reg(reg_from_u16(b))),
-                        negated: c == 0,
-                    };
+                    let cond = BranchCond::truthy(CondOperand::Reg(reg_from_u16(b)), c == 0);
 
                     if usize::from(a) == usize::from(b) {
                         self.emit(

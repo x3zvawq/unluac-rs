@@ -537,14 +537,6 @@ fn inline_temps_in_nested_blocks(
             protected_temps,
             inherited_captured_slots,
         ),
-        HirStmt::Unstructured(unstructured) => inline_temps_in_block(
-            &mut unstructured.body,
-            scratch,
-            readability,
-            facts,
-            protected_temps,
-            inherited_captured_slots,
-        ),
         HirStmt::LocalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)

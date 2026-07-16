@@ -15,14 +15,13 @@ use crate::transformer::dialect::lowering::{
 };
 use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
-    AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchOperands,
-    BranchPredicate, CallInstr, CallKind, Capture, CaptureSource, CloseInstr, ClosureInstr,
-    ConcatInstr, CondOperand, ConstRef, DialectCaptureExtra, GenericForCallInstr, GetTableInstr,
-    GetTableKind, GetUpvalueInstr, InstrRef, LoadBoolInstr, LoadConstInstr, LoadIntegerInstr,
-    LoadNilInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr,
-    ProtoRef, Reg, RegRange, ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr,
-    TailCallInstr, TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack,
-    VarArgInstr,
+    AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchPredicate, CallInstr,
+    CallKind, Capture, CaptureSource, CloseInstr, ClosureInstr, ConcatInstr, CondOperand, ConstRef,
+    DialectCaptureExtra, GenericForCallInstr, GetTableInstr, GetTableKind, GetUpvalueInstr,
+    InstrRef, LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LowInstr,
+    LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange,
+    ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr,
+    TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
 const NO_REG: u8 = 0xff;
@@ -839,11 +838,10 @@ impl<'a> ProtoLowerer<'a> {
                         Some(raw_index),
                         vec![raw_index, helper.helper_index],
                         PendingLowInstr::Branch {
-                            cond: BranchCond {
-                                predicate: BranchPredicate::Truthy,
-                                operands: BranchOperands::Unary(CondOperand::Reg(reg_from_u16(d))),
-                                negated: matches!(opcode, LuaJitOpcode::IsF),
-                            },
+                            cond: BranchCond::truthy(
+                                CondOperand::Reg(reg_from_u16(d)),
+                                matches!(opcode, LuaJitOpcode::IsF),
+                            ),
                             then_target: TargetPlaceholder::Raw(helper.jump_target),
                             else_target: TargetPlaceholder::Raw(helper.fallthrough_target),
                         },
@@ -858,13 +856,10 @@ impl<'a> ProtoLowerer<'a> {
                             Some(raw_index),
                             vec![raw_index, helper.helper_index],
                             PendingLowInstr::Branch {
-                                cond: BranchCond {
-                                    predicate: BranchPredicate::Truthy,
-                                    operands: BranchOperands::Unary(CondOperand::Reg(
-                                        reg_from_u16(d),
-                                    )),
-                                    negated: matches!(opcode, LuaJitOpcode::IsFC),
-                                },
+                                cond: BranchCond::truthy(
+                                    CondOperand::Reg(reg_from_u16(d)),
+                                    matches!(opcode, LuaJitOpcode::IsFC),
+                                ),
                                 then_target: TargetPlaceholder::Raw(helper.jump_target),
                                 else_target: TargetPlaceholder::Raw(helper.fallthrough_target),
                             },
@@ -875,13 +870,10 @@ impl<'a> ProtoLowerer<'a> {
                             Some(raw_index),
                             vec![raw_index, helper.helper_index],
                             PendingLowInstr::Branch {
-                                cond: BranchCond {
-                                    predicate: BranchPredicate::Truthy,
-                                    operands: BranchOperands::Unary(CondOperand::Reg(
-                                        reg_from_u16(d),
-                                    )),
-                                    negated: matches!(opcode, LuaJitOpcode::IsFC),
-                                },
+                                cond: BranchCond::truthy(
+                                    CondOperand::Reg(reg_from_u16(d)),
+                                    matches!(opcode, LuaJitOpcode::IsFC),
+                                ),
                                 then_target: TargetPlaceholder::Low(move_low),
                                 else_target: TargetPlaceholder::Raw(helper.fallthrough_target),
                             },
@@ -1129,55 +1121,43 @@ impl<'a> ProtoLowerer<'a> {
                     LuaJitOpcode::IsGt => (BranchPredicate::Lt, rhs, lhs),
                     _ => unreachable!(),
                 };
-                Ok(BranchCond {
-                    predicate,
-                    operands: BranchOperands::Binary(left, right),
-                    negated: false,
-                })
+                Ok(BranchCond::compare(predicate, left, right, false))
             }
             LuaJitOpcode::IsEqV | LuaJitOpcode::IsNeV => {
                 let (a, d) = expect_ad(raw_pc, opcode, operands)?;
-                Ok(BranchCond {
-                    predicate: BranchPredicate::Eq,
-                    operands: BranchOperands::Binary(
-                        CondOperand::Reg(reg_from_u8(a)),
-                        CondOperand::Reg(reg_from_u16(d)),
-                    ),
-                    negated: matches!(opcode, LuaJitOpcode::IsNeV),
-                })
+                Ok(BranchCond::compare(
+                    BranchPredicate::Eq,
+                    CondOperand::Reg(reg_from_u8(a)),
+                    CondOperand::Reg(reg_from_u16(d)),
+                    matches!(opcode, LuaJitOpcode::IsNeV),
+                ))
             }
             LuaJitOpcode::IsEqS | LuaJitOpcode::IsNeS => {
                 let (a, d) = expect_ad(raw_pc, opcode, operands)?;
-                Ok(BranchCond {
-                    predicate: BranchPredicate::Eq,
-                    operands: BranchOperands::Binary(
-                        CondOperand::Reg(reg_from_u8(a)),
-                        CondOperand::Const(self.kgc_string_const_ref(raw_pc, usize::from(d))?),
-                    ),
-                    negated: matches!(opcode, LuaJitOpcode::IsNeS),
-                })
+                Ok(BranchCond::compare(
+                    BranchPredicate::Eq,
+                    CondOperand::Reg(reg_from_u8(a)),
+                    CondOperand::Const(self.kgc_string_const_ref(raw_pc, usize::from(d))?),
+                    matches!(opcode, LuaJitOpcode::IsNeS),
+                ))
             }
             LuaJitOpcode::IsEqN | LuaJitOpcode::IsNeN => {
                 let (a, d) = expect_ad(raw_pc, opcode, operands)?;
-                Ok(BranchCond {
-                    predicate: BranchPredicate::Eq,
-                    operands: BranchOperands::Binary(
-                        CondOperand::Reg(reg_from_u8(a)),
-                        self.knum_cond_operand(raw_pc, usize::from(d))?,
-                    ),
-                    negated: matches!(opcode, LuaJitOpcode::IsNeN),
-                })
+                Ok(BranchCond::compare(
+                    BranchPredicate::Eq,
+                    CondOperand::Reg(reg_from_u8(a)),
+                    self.knum_cond_operand(raw_pc, usize::from(d))?,
+                    matches!(opcode, LuaJitOpcode::IsNeN),
+                ))
             }
             LuaJitOpcode::IsEqP | LuaJitOpcode::IsNeP => {
                 let (a, d) = expect_ad(raw_pc, opcode, operands)?;
-                Ok(BranchCond {
-                    predicate: BranchPredicate::Eq,
-                    operands: BranchOperands::Binary(
-                        CondOperand::Reg(reg_from_u8(a)),
-                        pri_cond_operand(raw_pc, d)?,
-                    ),
-                    negated: matches!(opcode, LuaJitOpcode::IsNeP),
-                })
+                Ok(BranchCond::compare(
+                    BranchPredicate::Eq,
+                    CondOperand::Reg(reg_from_u8(a)),
+                    pri_cond_operand(raw_pc, d)?,
+                    matches!(opcode, LuaJitOpcode::IsNeP),
+                ))
             }
             _ => unreachable!("only compare opcodes should reach compare_cond"),
         }

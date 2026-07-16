@@ -1,9 +1,9 @@
-//! low-IR 指令到 HIR 语句的直接 lowering。
+//! low-IR 普通指令与非循环控制终结到 HIR 语句的直接 lowering。
 //!
 //! 这个模块只处理“单条指令如何发射 HIR 语句”：普通赋值、调用、返回、vararg、
-//! set-list、for 控制指令和 fallback 控制指令。它依赖 `ProtoLowering` 中已经准备好的
-//! CFG / Dataflow / StructureFacts / binding 映射，不重新识别 block 结构，也不决定
-//! branch、loop、short-circuit 应该如何结构化。
+//! set-list 和显式 jump/branch。它依赖 `ProtoLowering` 中已经准备好的 CFG / Dataflow /
+//! StructureFacts / binding 映射，不重新识别 block 结构，也不接管 numeric/generic-for
+//! 控制协议；这些 terminator 只能由 StructurePlan 选中的 loop owner 消费。
 //!
 //! 输入形状：`CALL r0 ...` + 指令 def 映射。
 //! 输出形状：`t0 = f(args)` 或 `f(args)` 这类 HIR 语句。
@@ -17,20 +17,19 @@ use super::exprs::{
     lower_upvalue_operand_target, lower_value_pack,
 };
 use super::helpers::{
-    assign_stmt, binary_expr, branch_stmt, build_label_map_for_summary, concat_expr,
-    decode_raw_string, goto_block, label_for_block, return_stmt, unresolved_expr,
-    unstructured_stmt,
+    assign_stmt, binary_expr, branch_stmt, concat_expr, decode_raw_string, goto_block,
+    label_for_block, return_stmt,
 };
 use super::lower::ProtoLowering;
 use crate::hir::common::{
-    HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirCallStmt, HirCapture, HirClose,
-    HirClosureExpr, HirExpr, HirLValue, HirLabelId, HirLocalDecl, HirPackTail, HirStmt,
-    HirTableSetList, HirToBeClosed, HirUnaryExpr, HirValuePack, LocalId,
+    HirCallExpr, HirCallStmt, HirCapture, HirClose, HirClosureExpr, HirExpr, HirLValue, HirLabelId,
+    HirLocalDecl, HirPackTail, HirStmt, HirTableSetList, HirToBeClosed, HirUnaryExpr, HirValuePack,
+    LocalId,
 };
 use crate::structure::BlockRef;
 use crate::transformer::{
-    AccessBase, AccessKey, CallKind, GenericForCallInstr, GenericForLoopInstr, GetTableKind,
-    InstrRef, LowInstr, MethodNameHint, Reg, ResultPack,
+    AccessBase, AccessKey, CallKind, GenericForCallInstr, GetTableKind, InstrRef, LowInstr,
+    MethodNameHint, Reg, ResultPack,
 };
 
 pub(super) fn lower_regular_instr(
@@ -188,35 +187,7 @@ pub(super) fn lower_regular_instr(
         ),
         LowInstr::SetList(set_list) => lower_set_list(lowering, block, instr_ref, set_list),
         LowInstr::Call(call) => lower_call(lowering, block, instr_ref, call),
-        LowInstr::TailCall(tail_call) => {
-            // TailCall 总是展开所有返回值
-            let method_name = lower_method_name(lowering, tail_call.method_name);
-            let is_method_sugar =
-                matches!(tail_call.kind, CallKind::Method) && method_name.is_some();
-            let callee = if is_method_sugar {
-                // 方法调用糖下，AST 直接用 args[0]+method_name 重建 callee；
-                // 这里主动置空，避免上游 method-load GetTable 的目标温度被
-                // `temp-inline` / `locals` 等 pass 当成被读取的 live 值留下来。
-                HirExpr::Nil
-            } else {
-                expr_for_reg_use(lowering, block, instr_ref, tail_call.callee)
-            };
-            vec![return_stmt(HirValuePack::expanding(
-                Vec::new(),
-                HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
-                    callee,
-                    args: lower_value_pack(lowering, block, instr_ref, tail_call.args),
-                    method: matches!(tail_call.kind, CallKind::Method),
-                    method_name,
-                }))),
-            ))]
-        }
         LowInstr::VarArg(vararg) => lower_vararg(lowering, instr_ref, vararg.results),
-        LowInstr::Return(ret) => {
-            vec![return_stmt(lower_value_pack(
-                lowering, block, instr_ref, ret.values,
-            ))]
-        }
         LowInstr::Closure(closure) => {
             let mut stmts = capture_empty_local_decl_stmts(lowering, instr_ref);
             stmts.extend(fixed_assign(
@@ -248,59 +219,18 @@ pub(super) fn lower_regular_instr(
             reg_index: tbc.reg.index(),
             value: expr_for_reg_use(lowering, block, instr_ref, tbc.reg),
         }))],
-        LowInstr::NumericForInit(instr) => vec![
-            assign_stmt(
-                lower_fixed_targets(lowering, instr_ref),
-                vec![unresolved_expr(format!(
-                    "numeric-for-init index=r{} limit=r{} step=r{}",
-                    instr.index.index(),
-                    instr.limit.index(),
-                    instr.step.index()
-                ))],
-            ),
-            branch_stmt(
-                unresolved_expr("numeric-for-init cond"),
-                goto_block(label_for_block(
-                    lowering.cfg,
-                    &build_label_map_for_summary(lowering.cfg),
-                    instr.body_target,
-                )),
-                Some(goto_block(label_for_block(
-                    lowering.cfg,
-                    &build_label_map_for_summary(lowering.cfg),
-                    instr.exit_target,
-                ))),
-            ),
-        ],
-        LowInstr::NumericForLoop(instr) => vec![
-            assign_stmt(
-                lower_fixed_targets(lowering, instr_ref),
-                vec![unresolved_expr(format!(
-                    "numeric-for-loop index=r{} limit=r{} step=r{}",
-                    instr.index.index(),
-                    instr.limit.index(),
-                    instr.step.index()
-                ))],
-            ),
-            branch_stmt(
-                unresolved_expr("numeric-for-loop cond"),
-                goto_block(label_for_block(
-                    lowering.cfg,
-                    &build_label_map_for_summary(lowering.cfg),
-                    instr.body_target,
-                )),
-                Some(goto_block(label_for_block(
-                    lowering.cfg,
-                    &build_label_map_for_summary(lowering.cfg),
-                    instr.exit_target,
-                ))),
-            ),
-        ],
         LowInstr::GenericForCall(instr) => {
             lower_generic_for_call(lowering, block, instr_ref, instr)
         }
-        LowInstr::GenericForLoop(_instr) => vec![unstructured_stmt("generic-for-loop")],
-        LowInstr::Jump(_) | LowInstr::Branch(_) => Vec::new(),
+        LowInstr::TailCall(_)
+        | LowInstr::Return(_)
+        | LowInstr::NumericForInit(_)
+        | LowInstr::NumericForLoop(_)
+        | LowInstr::GenericForLoop(_)
+        | LowInstr::Jump(_)
+        | LowInstr::Branch(_) => {
+            unreachable!("control terminators must be lowered by their structure owner")
+        }
     }
 }
 
@@ -395,72 +325,11 @@ pub(super) fn lower_control_instr(
                 }))),
             ))]
         }
-        LowInstr::NumericForInit(instr) => vec![
-            assign_stmt(
-                lower_fixed_targets(lowering, instr_ref),
-                vec![unresolved_expr(format!(
-                    "numeric-for-init index=r{}",
-                    instr.index.index()
-                ))],
-            ),
-            branch_stmt(
-                unresolved_expr("numeric-for-init cond"),
-                goto_block(label_for_block(lowering.cfg, label_map, instr.body_target)),
-                Some(goto_block(label_for_block(
-                    lowering.cfg,
-                    label_map,
-                    instr.exit_target,
-                ))),
-            ),
-        ],
-        LowInstr::NumericForLoop(instr) => vec![
-            assign_stmt(
-                lower_fixed_targets(lowering, instr_ref),
-                vec![unresolved_expr(format!(
-                    "numeric-for-loop index=r{}",
-                    instr.index.index()
-                ))],
-            ),
-            branch_stmt(
-                unresolved_expr("numeric-for-loop cond"),
-                goto_block(label_for_block(lowering.cfg, label_map, instr.body_target)),
-                Some(goto_block(label_for_block(
-                    lowering.cfg,
-                    label_map,
-                    instr.exit_target,
-                ))),
-            ),
-        ],
-        LowInstr::GenericForLoop(instr) => vec![branch_stmt(
-            generic_for_loop_continue_cond(lowering, block, instr_ref, instr),
-            {
-                let mut body = generic_for_control_update(lowering, block, instr_ref, instr);
-                body.extend(
-                    goto_block(label_for_block(lowering.cfg, label_map, instr.body_target)).stmts,
-                );
-                HirBlock { stmts: body }
-            },
-            Some(goto_block(label_for_block(
-                lowering.cfg,
-                label_map,
-                instr.exit_target,
-            ))),
-        )],
-        _ => lower_regular_instr(lowering, block, instr_ref, instr),
+        LowInstr::NumericForInit(_) | LowInstr::NumericForLoop(_) | LowInstr::GenericForLoop(_) => {
+            unreachable!("for control terminators must be consumed by a loop owner")
+        }
+        _ => unreachable!("non-control instructions must use regular lowering"),
     }
-}
-
-pub(super) fn is_control_terminator(instr: &LowInstr) -> bool {
-    matches!(
-        instr,
-        LowInstr::Jump(_)
-            | LowInstr::Branch(_)
-            | LowInstr::Return(_)
-            | LowInstr::TailCall(_)
-            | LowInstr::NumericForInit(_)
-            | LowInstr::NumericForLoop(_)
-            | LowInstr::GenericForLoop(_)
-    )
 }
 
 fn lower_set_list(
@@ -518,56 +387,6 @@ fn generic_for_iterator_call(
     }))
 }
 
-pub(super) fn generic_for_loop_continue_cond(
-    lowering: &ProtoLowering<'_>,
-    block: BlockRef,
-    instr_ref: InstrRef,
-    instr: &GenericForLoopInstr,
-) -> HirExpr {
-    let first_binding = generic_for_loop_first_binding_expr(lowering, block, instr_ref, instr);
-    HirExpr::Binary(Box::new(HirBinaryExpr {
-        op: HirBinaryOpKind::Eq,
-        lhs: first_binding,
-        rhs: HirExpr::Nil,
-    }))
-    .negate()
-}
-
-pub(super) fn generic_for_control_update(
-    lowering: &ProtoLowering<'_>,
-    block: BlockRef,
-    instr_ref: InstrRef,
-    instr: &GenericForLoopInstr,
-) -> Vec<HirStmt> {
-    let target = match expr_for_reg_use(lowering, block, instr_ref, instr.control) {
-        HirExpr::TempRef(temp) => HirLValue::Temp(temp),
-        HirExpr::LocalRef(local) => HirLValue::Local(local),
-        _ => return Vec::new(),
-    };
-    let value = generic_for_loop_first_binding_expr(lowering, block, instr_ref, instr);
-    vec![assign_stmt(vec![target], vec![value])]
-}
-
-fn generic_for_loop_first_binding_expr(
-    lowering: &ProtoLowering<'_>,
-    block: BlockRef,
-    instr_ref: InstrRef,
-    instr: &GenericForLoopInstr,
-) -> HirExpr {
-    // `TFORLOOP` 的判空对象是同一 header 中前一条 `GenericForCall` 刚写出的
-    // 第一个返回值；不能用 loop 指令处对 binding 寄存器的 reaching value，否则会
-    // 读到上一轮迭代的源码 local。
-    let range = lowering.cfg.blocks[block.index()].instrs;
-    if instr_ref.index() > range.start.index()
-        && let Some(LowInstr::GenericForCall(_)) = lowering.proto.instrs.get(instr_ref.index() - 1)
-        && let Some(temp) = lowering.bindings.instr_fixed_defs[instr_ref.index() - 1].first()
-    {
-        return HirExpr::TempRef(*temp);
-    }
-
-    expr_for_reg_use(lowering, block, instr_ref, instr.bindings.start)
-}
-
 fn lower_call(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,
@@ -606,7 +425,8 @@ fn lower_vararg(
     results: ResultPack,
 ) -> Vec<HirStmt> {
     match results {
-        ResultPack::Ignore => vec![unstructured_stmt("vararg ignore")],
+        // VARARG 的结果数为零时，VM 不读取也不写入任何值；源码层没有对应语句。
+        ResultPack::Ignore => Vec::new(),
         ResultPack::Open(_) if lowering.open_pack_is_owned(instr_ref) => Vec::new(),
         ResultPack::Open(_) => Vec::new(),
         ResultPack::Fixed(_) => lower_result_assign(lowering, instr_ref, HirExpr::VarArg, results),

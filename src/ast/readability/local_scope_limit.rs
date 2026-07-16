@@ -15,7 +15,6 @@ use super::binding_flow::binding_mentions_in_stmt;
 use super::{ReadabilityContext, walk};
 use walk::{BlockKind, ScopedAstRewritePass};
 
-const DIRECT_LOCAL_LIMIT: usize = 180;
 const SCOPE_LOCAL_TARGET: usize = 64;
 
 pub(super) fn apply(module: &mut AstModule, _context: ReadabilityContext) -> bool {
@@ -41,7 +40,10 @@ impl ScopedAstRewritePass for LocalScopeLimitPass {
         _kind: BlockKind,
         outer_locals: &Self::Scope,
     ) -> (bool, Self::Scope) {
-        let changed = scope_locals(block, DIRECT_LOCAL_LIMIT.saturating_sub(*outer_locals));
+        let changed = scope_locals(
+            block,
+            crate::SOURCE_LOCAL_LIMIT.saturating_sub(*outer_locals),
+        );
         let direct_locals = block.stmts.iter().map(direct_local_count).sum::<usize>();
         (changed, outer_locals.saturating_add(direct_locals))
     }
@@ -49,7 +51,7 @@ impl ScopedAstRewritePass for LocalScopeLimitPass {
 
 fn scope_locals(block: &mut AstBlock, available_locals: usize) -> bool {
     let direct_local_count = block.stmts.iter().map(direct_local_count).sum::<usize>();
-    if direct_local_count <= available_locals {
+    if available_locals == 0 || direct_local_count <= available_locals {
         return false;
     }
 

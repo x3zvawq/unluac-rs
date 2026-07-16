@@ -140,9 +140,6 @@ fn stmt_allows_seed_to_absorb_carried(stmt: &HirStmt, seed: LocalId, carried: Lo
                 && stmts_allow_seed_to_absorb_carried(&generic_for.body.stmts, seed, carried)
         }
         HirStmt::Block(block) => stmts_allow_seed_to_absorb_carried(&block.stmts, seed, carried),
-        HirStmt::Unstructured(unstructured) => {
-            stmts_allow_seed_to_absorb_carried(&unstructured.body.stmts, seed, carried)
-        }
         HirStmt::Close(_)
         | HirStmt::Break
         | HirStmt::Continue

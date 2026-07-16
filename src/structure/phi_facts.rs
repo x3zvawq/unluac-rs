@@ -17,16 +17,18 @@
 //! - short-circuit value merge 会提前带出 `entry_value / value_incomings`，避免 HIR
 //!   再回头拆 phi
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 use crate::structure::{BlockRef, Cfg, DataflowFacts, GraphFacts, PhiCandidate, PhiId, SsaValue};
 use crate::transformer::Reg;
 
 use super::common::{
     BranchValueMergeArm, BranchValueMergeCandidate, BranchValueMergeValue,
-    GenericPhiMaterialization, GenericPhiSource, LoopCandidate, LoopValueArm, LoopValueIncoming,
-    LoopValueMerge, ShortCircuitCandidate, ShortCircuitValueIncoming, StructurePlan,
+    GenericPhiMaterialization, GenericPhiSource, GotoReason, GotoRequirement, LoopCandidate,
+    LoopValueArm, LoopValueIncoming, LoopValueMerge, PhiEdgeCopy, ShortCircuitCandidate,
+    ShortCircuitValueIncoming, StructurePlan,
 };
+use super::plan::{EdgeOwner, PhiIncomingDisposition};
 
 pub(super) struct ShortCircuitPhiFacts {
     pub(super) entry_value: SsaValue,
@@ -216,12 +218,26 @@ pub(super) fn analyze_generic_phi_materializations(
         branch_value_merge_candidates,
         plan,
     ));
-    covered.extend(consumed_loop_header_phi_ids(loop_candidates));
+    covered.extend(consumed_loop_phi_ids(loop_candidates));
+    extend_transitive_structured_phi_owners(dataflow, &mut covered);
+
+    for phi in &dataflow.phi_candidates {
+        assert!(
+            !plan.phi_has_edge_copy(phi.id)
+                || plan.phi_is_edge_owned(phi.id)
+                || covered.contains(&phi.id)
+                || plan.phi_is_dead(phi.id),
+            "mixed edge/merge {} must have a structured merge owner",
+            phi.id
+        );
+    }
 
     let mut generic = dataflow
         .phi_candidates
         .iter()
         .filter(|phi| !covered.contains(&phi.id))
+        .filter(|phi| !plan.phi_is_dead(phi.id))
+        .filter(|phi| !plan.phi_has_edge_copy(phi.id))
         .map(|phi| GenericPhiMaterialization {
             block: phi.block,
             phi_id: phi.id,
@@ -233,14 +249,100 @@ pub(super) fn analyze_generic_phi_materializations(
     generic
 }
 
+/// 结构 owner 会从目标 phi 递归读取 incoming 的 leaf defs，因此只作为这些目标的
+/// SSA 中继、且没有指令直接读取的上游 phi 不需要再单独物化。
+fn extend_transitive_structured_phi_owners(
+    dataflow: &DataflowFacts,
+    covered: &mut BTreeSet<PhiId>,
+) {
+    let mut pending = covered.iter().copied().collect::<VecDeque<_>>();
+    while let Some(phi_id) = pending.pop_front() {
+        let Some(phi) = dataflow.phi_candidate(phi_id) else {
+            continue;
+        };
+        for incoming in &phi.incoming {
+            let SsaValue::Phi(upstream) = incoming.value else {
+                continue;
+            };
+            if covered.contains(&upstream)
+                || dataflow.phi_use_count(upstream) != 0
+                || !dataflow
+                    .phi_consumer_ids(upstream)
+                    .iter()
+                    .all(|consumer| covered.contains(consumer))
+            {
+                continue;
+            }
+            covered.insert(upstream);
+            pending.push_back(upstream);
+        }
+    }
+}
+
+pub(super) fn analyze_phi_incoming_dispositions(
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    plan: &StructurePlan,
+    goto_requirements: &[GotoRequirement],
+) -> (Vec<Vec<PhiIncomingDisposition>>, Vec<Vec<PhiEdgeCopy>>) {
+    let dead_phis = dataflow.compute_truly_dead_phis();
+    let mut dispositions = Vec::with_capacity(dataflow.phi_candidates.len());
+    let mut edge_copies = vec![Vec::new(); cfg.edges.len()];
+    for phi in &dataflow.phi_candidates {
+        if dead_phis.contains(&phi.id) {
+            dispositions.push(vec![PhiIncomingDisposition::Dead; phi.incoming.len()]);
+            continue;
+        }
+
+        let mut phi_dispositions = Vec::with_capacity(phi.incoming.len());
+        for incoming in &phi.incoming {
+            let disposition = incoming
+                .edge
+                .map_or(PhiIncomingDisposition::Merge, |edge_ref| {
+                    let edge = cfg.edges[edge_ref.index()];
+                    if matches!(plan.edge_owners[edge_ref.index()], EdgeOwner::Unreachable) {
+                        PhiIncomingDisposition::Unreachable
+                    } else if matches!(
+                        plan.edge_owners[edge_ref.index()],
+                        EdgeOwner::Goto(id)
+                            if goto_requirements[id.index()].reason
+                                != GotoReason::UnstructuredContinueLike
+                    ) || plan.unstructured_layout_by_block[edge.from.index()].is_some()
+                    {
+                        edge_copies[edge_ref.index()].push(PhiEdgeCopy {
+                            phi_id: phi.id,
+                            value: incoming.value,
+                        });
+                        PhiIncomingDisposition::EdgeCopy
+                    } else {
+                        PhiIncomingDisposition::Merge
+                    }
+                });
+            phi_dispositions.push(disposition);
+        }
+        dispositions.push(phi_dispositions);
+    }
+    (dispositions, edge_copies)
+}
+
 /// 外层 branch 已完整解释两臂来源时，不让内层 loop 再物化同一个出口 phi。
 pub(super) fn remove_branch_owned_loop_exit_values(
     loop_candidates: &mut [LoopCandidate],
     branch_candidates: &[BranchValueMergeCandidate],
     plan: &StructurePlan,
+    dataflow: &DataflowFacts,
 ) {
-    let branch_owned =
-        consumed_branch_value_merge_ids(branch_candidates, plan).collect::<BTreeSet<_>>();
+    let branch_owned = consumed_branch_value_merge_values(branch_candidates, plan)
+        .filter(|value| {
+            let phi = &dataflow.phi_candidates[value.phi_id.index()];
+            phi.incoming.iter().all(|incoming| {
+                incoming.pred.is_some_and(|pred| {
+                    value.then_arm.preds.contains(&pred) || value.else_arm.preds.contains(&pred)
+                })
+            })
+        })
+        .map(|value| value.phi_id)
+        .collect::<BTreeSet<_>>();
     for candidate in loop_candidates {
         for exit in &mut candidate.exit_value_merges {
             exit.values
@@ -279,10 +381,17 @@ fn consumed_branch_value_merge_ids<'a>(
     candidates: &'a [BranchValueMergeCandidate],
     plan: &'a StructurePlan,
 ) -> impl Iterator<Item = PhiId> + 'a {
+    consumed_branch_value_merge_values(candidates, plan).map(|value| value.phi_id)
+}
+
+fn consumed_branch_value_merge_values<'a>(
+    candidates: &'a [BranchValueMergeCandidate],
+    plan: &'a StructurePlan,
+) -> impl Iterator<Item = &'a BranchValueMergeValue> + 'a {
     plan.branch_value_merge_by_header
         .values()
         .filter_map(|id| candidates.get(id.index()))
-        .flat_map(|candidate| candidate.values.iter().map(|value| value.phi_id))
+        .flat_map(|candidate| &candidate.values)
 }
 
 fn generic_phi_source(
@@ -344,13 +453,17 @@ fn extend_branch_value_arm(
     }
 }
 
-fn consumed_loop_header_phi_ids(
-    loop_candidates: &[LoopCandidate],
-) -> impl Iterator<Item = PhiId> + '_ {
+fn consumed_loop_phi_ids(loop_candidates: &[LoopCandidate]) -> impl Iterator<Item = PhiId> + '_ {
     loop_candidates.iter().flat_map(|candidate| {
         candidate
             .header_value_merges
             .iter()
             .map(|value| value.phi_id)
+            .chain(
+                candidate
+                    .exit_value_merges
+                    .iter()
+                    .flat_map(|exit| exit.values.iter().map(|value| value.phi_id)),
+            )
     })
 }

@@ -57,7 +57,7 @@ pub(crate) fn expr_for_fixed_def(lowering: &ProtoLowering<'_>, def_id: DefId) ->
                     .collect(),
             })))
         }
-        LowInstr::GenericForCall(for_call) => expr_for_generic_for_call(for_call.results, def_reg),
+        LowInstr::GenericForCall(_) => None,
         LowInstr::SetUpvalue(_)
         | LowInstr::SetTable(_)
         | LowInstr::SetList(_)
@@ -251,17 +251,6 @@ fn expr_for_fixed_vararg(results: ResultPack, reg: Reg) -> Option<HirExpr> {
     };
     if range.len == 1 && range.start == reg {
         Some(HirExpr::VarArg)
-    } else {
-        None
-    }
-}
-
-fn expr_for_generic_for_call(results: ResultPack, reg: Reg) -> Option<HirExpr> {
-    let ResultPack::Fixed(range) = results else {
-        return None;
-    };
-    if range.len == 1 && range.start == reg {
-        Some(unresolved_expr("generic-for-call"))
     } else {
         None
     }

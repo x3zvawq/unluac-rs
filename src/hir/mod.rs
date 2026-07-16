@@ -22,8 +22,7 @@ pub use common::{
     HirLabelId, HirLocalDecl, HirLogicalExpr, HirModule, HirNumericFor, HirPackTail, HirProto,
     HirProtoRef, HirRecordField, HirRepeat, HirReturn, HirStmt, HirTableAccess,
     HirTableConstructor, HirTableField, HirTableKey, HirTableSetList, HirToBeClosed, HirUnaryExpr,
-    HirUnaryOpKind, HirUnresolvedExpr, HirUnstructured, HirValuePack, HirWhile, LocalId, ParamId,
-    TempId, UpvalueId,
+    HirUnaryOpKind, HirUnresolvedExpr, HirValuePack, HirWhile, LocalId, ParamId, TempId, UpvalueId,
 };
 #[cfg(feature = "decompile-debug")]
 pub use debug::dump_hir;
