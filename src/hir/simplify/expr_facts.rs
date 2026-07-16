@@ -9,7 +9,7 @@ use crate::hir::common::{HirBinaryOpKind, HirDecisionTarget, HirExpr, HirUnaryOp
 /// 判断字面值的静态 truthiness。
 ///
 /// 返回 `Some(true/false)` 当表达式 truthiness 可在编译期确定，运行时可能为真或假时返回 `None`。
-pub(super) fn expr_truthiness(expr: &HirExpr) -> Option<bool> {
+pub(in crate::hir) fn expr_truthiness(expr: &HirExpr) -> Option<bool> {
     match expr {
         HirExpr::Nil => Some(false),
         HirExpr::Boolean(value) => Some(*value),

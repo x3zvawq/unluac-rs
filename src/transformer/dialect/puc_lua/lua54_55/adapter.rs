@@ -33,6 +33,13 @@ impl FamilyDialect {
             Self::Lua55 => 3,
         }
     }
+
+    pub(super) fn generic_for_control_offset(self) -> usize {
+        match self {
+            Self::Lua54 => 2,
+            Self::Lua55 => 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

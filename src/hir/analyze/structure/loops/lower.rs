@@ -146,11 +146,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             self.overrides.suppress_phi(*phi_id);
         }
         self.active_loops.push(loop_context.clone());
-        let body = self.lower_region_with_suppressed_loop(
+        let body = self.lower_active_loop_body_until_escape(
             candidate.header,
-            Some(post_loop),
+            candidate_id,
             &combined_target_overrides,
-            Some(candidate_id),
         )?;
         self.active_loops.pop();
         for phi_id in &plan.owned_phis {
@@ -267,12 +266,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 range.start.index()..range.end()
             })
             .filter_map(|index| match self.lowering.proto.instrs[index] {
-                LowInstr::Tbc(tbc)
-                    if tbc.kind == crate::transformer::TbcKind::Explicit
-                        && tbc.reg.index() >= close_from.index() =>
-                {
-                    Some(tbc.reg)
-                }
+                LowInstr::Tbc(tbc) if tbc.reg.index() >= close_from.index() => Some(tbc.reg),
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
@@ -375,11 +369,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             self.overrides.suppress_phi(*phi_id);
         }
         self.active_loops.push(loop_context.clone());
-        let body = self.lower_region_with_suppressed_loop(
+        let body = self.lower_active_loop_body_until_escape(
             candidate.header,
-            None,
+            candidate_id,
             &combined_target_overrides,
-            Some(candidate_id),
         )?;
         self.active_loops.pop();
         for phi_id in &plan.owned_phis {
@@ -982,7 +975,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     && candidate.continue_target == Some(header)
                     && unique_loop_preheader(candidate) == Some(block)
             })?;
-        let (call_instr_ref, call, loop_instr) = self.generic_for_header_instrs(header)?;
+        let (call, loop_instr) = self.generic_for_header_instrs(header)?;
+        let source = self.generic_for_source(block, call)?;
         let exit = self.lowering.cfg.instr_to_block[loop_instr.exit_target.index()];
         if !candidate.exits.contains(&exit) {
             return None;
@@ -1006,10 +1000,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         }
 
-        let mut excluded_regs = vec![loop_instr.control];
+        let mut excluded_regs = vec![loop_instr.control_target];
         excluded_regs.extend(
             (0..loop_instr.bindings.len)
-                .map(|offset| Reg(loop_instr.bindings.start.index() + offset)),
+                .map(|offset| Reg(loop_instr.bindings.start.index() + offset))
+                .filter(|reg| *reg != loop_instr.control_target),
         );
         let plan = self.build_loop_state_plan(
             candidate_id,
@@ -1023,6 +1018,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
         self.suppress_loop_tbc_boundaries(candidate_id, candidate);
+        self.overrides
+            .suppress_instrs(source.prep_instr_ref.iter().copied());
 
         self.visited.insert(block);
         stmts.extend(self.lower_block_prefix(block, false, target_overrides)?);
@@ -1067,9 +1064,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.install_loop_exit_bindings(candidate_id, candidate, exit, &plan, target_overrides);
         stmts.push(HirStmt::GenericFor(Box::new(HirGenericFor {
             bindings,
-            iterator: self
-                .lower_generic_for_iterator(header, call_instr_ref, call)
-                .into(),
+            iterator: self.lower_generic_for_iterator(&source).into(),
             body,
         })));
 

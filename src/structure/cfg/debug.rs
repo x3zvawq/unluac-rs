@@ -637,6 +637,7 @@ fn format_low_instr_head(instr: &LowInstr) -> &'static str {
         LowInstr::Tbc(_instr) => "tbc",
         LowInstr::NumericForInit(_instr) => "numeric-for-init",
         LowInstr::NumericForLoop(_instr) => "numeric-for-loop",
+        LowInstr::GenericForPrep(_instr) => "generic-for-prep",
         LowInstr::GenericForCall(_instr) => "generic-for-call",
         LowInstr::GenericForLoop(_instr) => "generic-for-loop",
         LowInstr::Jump(_instr) => "jump",

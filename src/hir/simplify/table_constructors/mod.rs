@@ -22,6 +22,7 @@ mod rebuild;
 mod scan;
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 use crate::ast::DecompileDialect;
 use crate::hir::common::{
@@ -96,10 +97,28 @@ enum SegmentToken {
     Record { prepared_record_index: usize },
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ConstructorEvalEvent {
+    Producer(usize),
+    Barrier,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedRecord {
+    field: crate::hir::common::HirRecordField,
+    eval_events: Range<usize>,
+}
+
 #[derive(Debug, Clone)]
 struct RestoredPendingIntegerField {
     field_index: usize,
     key: i64,
+    value: HirExpr,
+}
+
+#[derive(Debug, Clone)]
+struct RestoredArrayField {
+    field_index: usize,
     value: HirExpr,
 }
 
@@ -108,13 +127,17 @@ struct RebuildScratch {
     pending_producers: Vec<PendingProducer>,
     producer_groups: Vec<ProducerGroupMeta>,
     tokens: Vec<SegmentToken>,
-    prepared_records: Vec<crate::hir::common::HirRecordField>,
+    prepared_records: Vec<PreparedRecord>,
+    prepared_eval_events: Vec<ConstructorEvalEvent>,
+    source_eval_events: Vec<ConstructorEvalEvent>,
+    generated_eval_events: Vec<ConstructorEvalEvent>,
     producer_index_by_binding: Vec<Option<usize>>,
     consumed_bindings: Vec<bool>,
     consumed_groups: Vec<bool>,
     removed_materializations: Vec<u32>,
     touched_binding_ids: Vec<BindingId>,
     restored_pending_integer_fields: Vec<RestoredPendingIntegerField>,
+    restored_array_fields: Vec<RestoredArrayField>,
 }
 
 pub(super) fn stabilize_table_constructors_in_proto(
@@ -182,24 +205,21 @@ impl HirRewritePass for TableConstructorPass<'_> {
                 continue;
             };
 
-            let (constructor, end_index, rebuilt_region, retained_stmts) =
-                match try_rebuild_constructor_region(
-                    block,
-                    index,
-                    binding,
-                    seed_ctor.clone(),
-                    &binding_index,
-                    &binding_occurrences,
-                    &materialized_binding_counts,
-                    &stmt_ids,
-                    self.dialect,
-                    &mut scratch,
-                ) {
-                    Some((rebuilt_ctor, end_index, retained)) => {
-                        (rebuilt_ctor, end_index, true, retained)
-                    }
-                    None => (seed_ctor, index, false, Vec::new()),
-                };
+            let (constructor, end_index, rebuilt_region) = match try_rebuild_constructor_region(
+                block,
+                index,
+                binding,
+                seed_ctor.clone(),
+                &binding_index,
+                &binding_occurrences,
+                &materialized_binding_counts,
+                &stmt_ids,
+                self.dialect,
+                &mut scratch,
+            ) {
+                Some((rebuilt_ctor, end_index)) => (rebuilt_ctor, end_index, true),
+                None => (seed_ctor, index, false),
+            };
 
             let handoff_index = end_index + 1;
             let binding_id = binding_index
@@ -221,23 +241,12 @@ impl HirRewritePass for TableConstructorPass<'_> {
             install_constructor_owner(&mut block.stmts[index], handoff_target, constructor);
             let drain_end = end_index + usize::from(consumed_handoff);
             if drain_end > index {
-                if retained_stmts.is_empty() {
-                    for i in index + 1..=drain_end {
-                        binding_occurrences.remove_stmt(stmt_ids[i], &stmt_bindings[i]);
-                    }
-                    block.stmts.drain(index + 1..=drain_end);
-                    stmt_bindings.drain(index + 1..=drain_end);
-                    stmt_ids.drain(index + 1..=drain_end);
-                } else {
-                    for i in (index + 1..=drain_end).rev() {
-                        if retained_stmts.binary_search(&i).is_err() {
-                            binding_occurrences.remove_stmt(stmt_ids[i], &stmt_bindings[i]);
-                            block.stmts.remove(i);
-                            stmt_bindings.remove(i);
-                            stmt_ids.remove(i);
-                        }
-                    }
+                for i in index + 1..=drain_end {
+                    binding_occurrences.remove_stmt(stmt_ids[i], &stmt_bindings[i]);
                 }
+                block.stmts.drain(index + 1..=drain_end);
+                stmt_bindings.drain(index + 1..=drain_end);
+                stmt_ids.drain(index + 1..=drain_end);
             }
             changed = true;
             index += 1;

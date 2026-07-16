@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::structure::{BlockRef, Cfg, GraphFacts};
-use crate::transformer::{InstrRef, LowInstr, LoweredProto, Reg, TbcKind};
+use crate::transformer::{InstrRef, LowInstr, LoweredProto, Reg};
 
 use super::common::{LoopCandidate, ScopeCandidate};
 use super::plan::{CleanupDisposition, LoopCandidateId, ScopeCandidateId};
@@ -85,12 +85,7 @@ pub(super) fn analyze_cleanup_dispositions(
                 LowInstr::Close(_) | LowInstr::Tbc(_) if !reachable => {
                     Some(CleanupDisposition::Unreachable)
                 }
-                LowInstr::Tbc(tbc) => Some(match tbc.kind {
-                    TbcKind::Explicit => CleanupDisposition::ExplicitTbc,
-                    TbcKind::GenericFor => generic_for_owner(cfg, block, loop_candidates)
-                        .map(CleanupDisposition::GenericFor)
-                        .expect("reachable generic-for TBC must have one loop owner"),
-                }),
+                LowInstr::Tbc(_) => Some(CleanupDisposition::ExplicitTbc),
                 LowInstr::Close(_) if explicit_tbc_close_origins.contains_key(&instr_ref) => Some(
                     explicit_tbc_loop_owner(
                         proto,
@@ -122,25 +117,6 @@ pub(super) fn analyze_cleanup_dispositions(
     dispositions
 }
 
-fn generic_for_owner(
-    cfg: &Cfg,
-    preheader: BlockRef,
-    loop_candidates: &[LoopCandidate],
-) -> Option<LoopCandidateId> {
-    let mut owners = loop_candidates
-        .iter()
-        .enumerate()
-        .filter(|(_, candidate)| {
-            candidate.kind_hint == super::common::LoopKindHint::GenericForLike
-                && candidate.preheader == Some(preheader)
-                && candidate.continue_target == Some(candidate.header)
-                && cfg.unique_reachable_successor(preheader) == Some(candidate.header)
-        })
-        .map(|(index, _)| LoopCandidateId(index));
-    let owner = owners.next()?;
-    owners.next().is_none().then_some(owner)
-}
-
 fn validate_cleanup_dispositions(
     proto: &LoweredProto,
     cfg: &Cfg,
@@ -157,15 +133,8 @@ fn validate_cleanup_dispositions(
             (LowInstr::Close(_) | LowInstr::Tbc(_), Some(CleanupDisposition::Unreachable)) => {
                 assert!(!cfg.reachable_blocks.contains(&block));
             }
-            (LowInstr::Tbc(tbc), Some(CleanupDisposition::ExplicitTbc)) => {
-                assert_eq!(tbc.kind, TbcKind::Explicit);
+            (LowInstr::Tbc(_), Some(CleanupDisposition::ExplicitTbc)) => {
                 assert!(cfg.reachable_blocks.contains(&block));
-            }
-            (LowInstr::Tbc(tbc), Some(CleanupDisposition::GenericFor(id))) => {
-                let owner = &loop_candidates[id.index()];
-                assert_eq!(tbc.kind, TbcKind::GenericFor);
-                assert_eq!(generic_for_owner(cfg, block, loop_candidates), Some(id));
-                assert_eq!(owner.preheader, Some(block));
             }
             (LowInstr::Close(_), Some(CleanupDisposition::LoopTbcBoundary(id))) => {
                 assert!(cfg.reachable_blocks.contains(&block));
@@ -205,7 +174,7 @@ fn explicit_tbc_close_origins(
     if !proto
         .instrs
         .iter()
-        .any(|instr| matches!(instr, LowInstr::Tbc(tbc) if tbc.kind == TbcKind::Explicit))
+        .any(|instr| matches!(instr, LowInstr::Tbc(_)))
     {
         return BTreeMap::new();
     }
@@ -233,7 +202,7 @@ fn explicit_tbc_close_origins(
         let range = cfg.blocks[block.index()].instrs;
         for instr_index in range.start.index()..range.end() {
             match &proto.instrs[instr_index] {
-                LowInstr::Tbc(tbc) if tbc.kind == TbcKind::Explicit => {
+                LowInstr::Tbc(tbc) => {
                     active.insert(tbc.reg.index(), BTreeSet::from([InstrRef(instr_index)]));
                 }
                 LowInstr::Close(close) => {
@@ -330,7 +299,7 @@ fn loop_lexical_base(proto: &LoweredProto, cfg: &Cfg, candidate: &LoopCandidate)
         super::common::LoopKindHint::GenericForLike => {
             let range = cfg.blocks[candidate.header.index()].instrs;
             (range.start.index()..range.end()).find_map(|index| match proto.instrs[index] {
-                LowInstr::GenericForCall(call) => Some(call.state.start),
+                LowInstr::GenericForCall(call) => Some(call.iterator),
                 _ => None,
             })
         }

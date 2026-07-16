@@ -975,14 +975,16 @@ impl<'a> ProtoLowerer<'a> {
                     let (a, d) = expect_ad(raw_pc, opcode, operands)?;
                     let aux = required_aux(raw_pc, opcode, extra)?;
                     let var_count = (aux & 0xff) as usize;
-                    let state = RegRange::new(reg_from_u8(a), 3);
-                    let bindings = RegRange::new(Reg(state.start.index() + 3), var_count);
+                    let iterator = reg_from_u8(a);
+                    let bindings = RegRange::new(Reg(iterator.index() + 3), var_count);
                     self.clear_all_method_hints();
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::GenericForCall(GenericForCallInstr {
-                            state,
+                            iterator,
+                            state: Reg(iterator.index() + 1),
+                            control: Reg(iterator.index() + 2),
                             results: ResultPack::Fixed(bindings),
                         })),
                     );
@@ -990,7 +992,7 @@ impl<'a> ProtoLowerer<'a> {
                         None,
                         vec![raw_index],
                         PendingLowInstr::GenericForLoop {
-                            control: Reg(state.start.index() + 2),
+                            control_target: Reg(iterator.index() + 2),
                             bindings,
                             body_target: TargetPlaceholder::Raw(
                                 self.jump_target(raw_pc, i32::from(d))?,

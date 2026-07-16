@@ -126,6 +126,7 @@ pub(super) fn analyze_loops(
             }),
     );
     loop_candidates.sort_by_key(|candidate| (candidate.header, candidate.blocks.len()));
+    refine_nested_for_exit_loops(proto, cfg, graph_facts, &mut loop_candidates);
     refine_ambiguous_repeat_candidates(proto, cfg, graph_facts, &mut loop_candidates);
     assign_same_header_merge_ownership(&mut loop_candidates);
     loop_candidates
@@ -815,6 +816,75 @@ fn refine_ambiguous_repeat_candidates(
             candidates[index].body_scope_blocks = repeat_body_scope;
         }
     }
+}
+
+fn refine_nested_for_exit_loops(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    candidates: &mut [LoopCandidate],
+) {
+    let demoted = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, outer)| {
+            if outer.kind_hint != LoopKindHint::WhileTrueLike || outer.exits.len() != 1 {
+                return false;
+            }
+            let post_loop = *outer
+                .exits
+                .iter()
+                .next()
+                .expect("single-exit loop has one post-loop block");
+            candidates.iter().any(|nested| {
+                matches!(
+                    nested.kind_hint,
+                    LoopKindHint::NumericForLike | LoopKindHint::GenericForLike
+                ) && nested.blocks.len() < outer.blocks.len()
+                    && nested.blocks.is_subset(&outer.body_scope_blocks)
+                    && for_normal_exit(proto, cfg, nested) == Some(post_loop)
+            })
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+
+    for index in demoted {
+        let candidate = &mut candidates[index];
+        // nested for 的正常完成边已经证明 post-loop 可达；它不能因为该块恰好
+        // 以 return 结束，就把外层 retry loop 伪装成没有普通出口的 while true。
+        candidate.kind_hint = LoopKindHint::Unknown;
+        candidate.body_scope_blocks = loop_body_scope(
+            candidate.kind_hint,
+            candidate.continue_target,
+            &candidate.blocks,
+            &candidate.exits,
+            candidate.header,
+            cfg,
+            graph_facts,
+        );
+    }
+}
+
+fn for_normal_exit(proto: &LoweredProto, cfg: &Cfg, candidate: &LoopCandidate) -> Option<BlockRef> {
+    let target = match candidate.kind_hint {
+        LoopKindHint::NumericForLike => {
+            let preheader = candidate.preheader?;
+            let LowInstr::NumericForInit(instr) = cfg.terminator(&proto.instrs, preheader)? else {
+                return None;
+            };
+            instr.exit_target
+        }
+        LoopKindHint::GenericForLike => {
+            let LowInstr::GenericForLoop(instr) =
+                cfg.terminator(&proto.instrs, candidate.header)?
+            else {
+                return None;
+            };
+            instr.exit_target
+        }
+        _ => return None,
+    };
+    Some(cfg.instr_to_block[target.index()])
 }
 
 fn branch_conditions_share_subject(
@@ -1535,7 +1605,7 @@ fn loop_body_scope(
                 .filter(|target| !body_blocks.contains(target)),
         );
     }
-    if let Some(shared_successor) = shared_unique_exit_successor(exits, cfg) {
+    if let Some(shared_successor) = shared_exit_continuation(exits, cfg) {
         scope_boundaries.insert(shared_successor);
     }
 
@@ -1560,15 +1630,25 @@ fn loop_body_scope(
     scope
 }
 
-fn shared_unique_exit_successor(exits: &BTreeSet<BlockRef>, cfg: &Cfg) -> Option<BlockRef> {
+fn shared_exit_continuation(exits: &BTreeSet<BlockRef>, cfg: &Cfg) -> Option<BlockRef> {
     if exits.len() < 2 {
         return None;
     }
-    let mut exits = exits.iter().copied();
-    let shared = cfg.unique_reachable_successor(exits.next()?)?;
-    exits
-        .all(|exit| cfg.unique_reachable_successor(exit) == Some(shared))
-        .then_some(shared)
+    let first = *exits.first()?;
+    let first_successor = cfg.unique_reachable_successor(first);
+    let is_shared = |continuation| {
+        exits.iter().copied().all(|exit| {
+            exit == continuation || cfg.unique_reachable_successor(exit) == Some(continuation)
+        })
+    };
+    match first_successor {
+        Some(successor) if successor != first => match (is_shared(first), is_shared(successor)) {
+            (true, false) => Some(first),
+            (false, true) => Some(successor),
+            _ => None,
+        },
+        _ => is_shared(first).then_some(first),
+    }
 }
 
 fn loop_binding_early_exit_scope(
@@ -1663,7 +1743,7 @@ fn shared_loop_exit_merge(
     }
     // 出口块自身可以写回 live-out；只要它们直接汇入同一 block，merge 的 incoming
     // 仍完整对应这些出口。透明性只约束继续跨越的中间 pad，不能反过来丢掉直接合流。
-    let merge = shared_unique_exit_successor(exits, cfg).or_else(|| {
+    let merge = shared_exit_continuation(exits, cfg).or_else(|| {
         let mut common = None::<BTreeSet<BlockRef>>;
         for exit in exits.iter().copied() {
             let mut reachable = BTreeSet::from([exit]);
@@ -1832,6 +1912,7 @@ fn instr_is_while_header_prefix(instr: &LowInstr) -> bool {
             | LowInstr::Tbc(_)
             | LowInstr::NumericForInit(_)
             | LowInstr::NumericForLoop(_)
+            | LowInstr::GenericForPrep(_)
             | LowInstr::GenericForCall(_)
             | LowInstr::GenericForLoop(_)
             | LowInstr::Jump(_)
@@ -1905,7 +1986,8 @@ fn generic_for_has_loop_body_and_exit(
     let body_block = cfg.instr_to_block[instr.body_target.index()];
     let exit_block = cfg.instr_to_block[instr.exit_target.index()];
 
-    matches!(call.results, crate::transformer::ResultPack::Fixed(range) if range == instr.bindings)
+    call.control == instr.control_target
+        && matches!(call.results, crate::transformer::ResultPack::Fixed(range) if range == instr.bindings)
         && (body_block == exit_block
             || same_or_transparent_jump_target(proto, cfg, instr.exit_target, instr.body_target)
             || blocks.contains(&body_block))

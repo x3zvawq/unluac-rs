@@ -144,8 +144,26 @@ pub(super) fn compute_instr_effect(instr: &LowInstr) -> InstrEffect {
             // 误当成真正的入口值。
             effect.fixed_must_defs.insert(instr.binding);
         }
+        LowInstr::GenericForPrep(instr) => {
+            // Lua 5.5 在同一条 TFORPREP 内交换 control/closing；先登记全部 use、
+            // 再登记变化的 target，才能让 SSA 把它解释成并行复制而非顺序覆盖。
+            effect.fixed_uses.extend([
+                instr.iterator,
+                instr.state,
+                instr.control_source,
+                instr.closing_source,
+            ]);
+            if instr.control_target != instr.control_source {
+                effect.fixed_must_defs.insert(instr.control_target);
+            }
+            if instr.closing_target != instr.closing_source {
+                effect.fixed_must_defs.insert(instr.closing_target);
+            }
+        }
         LowInstr::GenericForCall(instr) => {
-            insert_reg_range(&mut effect.fixed_uses, instr.state);
+            effect
+                .fixed_uses
+                .extend([instr.iterator, instr.state, instr.control]);
             insert_result_pack_def(
                 &mut effect.fixed_must_defs,
                 &mut effect.open_must_def,
@@ -153,9 +171,13 @@ pub(super) fn compute_instr_effect(instr: &LowInstr) -> InstrEffect {
             );
         }
         LowInstr::GenericForLoop(instr) => {
-            effect.fixed_uses.insert(instr.control);
             if instr.bindings.len != 0 {
                 effect.fixed_uses.insert(instr.bindings.start);
+                // 5.1--5.4、LuaJIT 与 Luau 在继续迭代时把首个结果写回隐藏
+                // control 槽；缺少这个 def 会让下一轮仍读取首轮 control。
+                if instr.control_target != instr.bindings.start {
+                    effect.fixed_must_defs.insert(instr.control_target);
+                }
             }
         }
         LowInstr::Jump(_instr) => {}
@@ -220,7 +242,7 @@ pub(super) fn compute_side_effect_summary(instr: &LowInstr) -> SideEffectSummary
         LowInstr::SetList(_instr) => {
             tags.insert(EffectTag::WriteTable);
         }
-        LowInstr::Call(_instr) => {
+        LowInstr::Call(_) | LowInstr::GenericForCall(_) => {
             tags.insert(EffectTag::Call);
         }
         LowInstr::Close(_instr) => {

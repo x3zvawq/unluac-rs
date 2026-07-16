@@ -28,6 +28,8 @@ mod temp_touch;
 mod visit;
 mod walk;
 
+pub(in crate::hir) use expr_facts::expr_truthiness;
+
 use crate::ast::ReadabilityOptions;
 use crate::debug::DebugFilters;
 use crate::generate::GenerateMode;
@@ -147,22 +149,23 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         invalidates: &[TempChain, LocalBinding],
     },
     PassDescriptor {
-        name: "locals",
-        phase: PassPhase::Normal,
-        depends_on: &[TempChain, LocalBinding, BlockStructure],
-        invalidates: &[LocalBinding, TempChain],
-    },
-    PassDescriptor {
         name: "branch-values",
         phase: PassPhase::Normal,
-        depends_on: &[LabelGoto, LocalBinding],
+        depends_on: &[LabelGoto, TempChain, LocalBinding],
         invalidates: &[
             LabelGoto,
             BlockStructure,
+            DecisionShape,
             TempChain,
             LocalBinding,
             LogicalExpr,
         ],
+    },
+    PassDescriptor {
+        name: "locals",
+        phase: PassPhase::Normal,
+        depends_on: &[TempChain, LocalBinding, BlockStructure],
+        invalidates: &[LocalBinding, TempChain],
     },
     PassDescriptor {
         name: "branch-control",
@@ -249,8 +252,8 @@ pub(super) fn simplify_hir(
                             temp_inline::inline_temps_in_proto_with_facts(proto, readability, facts)
                         }
                         6 => generic_for_iterators::fold_generic_for_iterators_in_proto(proto),
-                        7 => locals::promote_temps_to_locals_in_proto_with_facts(proto, facts),
-                        8 => branch_value_folding::fold_branch_values_in_proto(proto),
+                        7 => branch_value_folding::fold_branch_values_in_proto(proto),
+                        8 => locals::promote_temps_to_locals_in_proto_with_facts(proto, facts),
                         9 => branch_control_folding::fold_branch_control_in_proto(proto),
                         10 => decision::eliminate_remaining_decisions_in_proto(proto),
                         11 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),

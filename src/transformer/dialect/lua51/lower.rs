@@ -540,7 +540,9 @@ impl<'a> ProtoLowerer<'a> {
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::GenericForCall(GenericForCallInstr {
-                            state: RegRange::new(state_start, 3),
+                            iterator: state_start,
+                            state: Reg(state_start.index() + 1),
+                            control: Reg(state_start.index() + 2),
                             results: ResultPack::Fixed(RegRange::new(
                                 Reg(state_start.index() + 3),
                                 usize::from(c),
@@ -551,7 +553,7 @@ impl<'a> ProtoLowerer<'a> {
                         None,
                         vec![raw_index, helper.helper_index],
                         PendingLowInstr::GenericForLoop {
-                            control: Reg(state_start.index() + 2),
+                            control_target: Reg(state_start.index() + 2),
                             bindings: RegRange::new(Reg(state_start.index() + 3), usize::from(c)),
                             body_target: TargetPlaceholder::Raw(helper.jump_target),
                             exit_target: TargetPlaceholder::Raw(helper.fallthrough_target),

@@ -39,6 +39,15 @@ pub(super) fn analyze_goto_requirements(
             }
         }
 
+        for edge_ref in &loop_candidate.backedges {
+            if backedge_crosses_nested_loop(cfg, loop_candidates, loop_candidate, *edge_ref) {
+                requirements.insert(GotoRequirement {
+                    edge: *edge_ref,
+                    reason: GotoReason::CrossLoopContinueLike,
+                });
+            }
+        }
+
         if let Some(continue_target) = loop_candidate.continue_target {
             // numeric-for 和 repeat-until 的 continue target block 可能在 terminator
             // 前面挂着属于 loop body tail 的普通语句（如 state carry 或 body 尾部
@@ -101,6 +110,22 @@ pub(super) fn analyze_goto_requirements(
     }
 
     requirements.into_iter().collect()
+}
+
+fn backedge_crosses_nested_loop(
+    cfg: &Cfg,
+    candidates: &[LoopCandidate],
+    outer: &LoopCandidate,
+    edge_ref: crate::structure::EdgeRef,
+) -> bool {
+    let edge = cfg.edges[edge_ref.index()];
+    edge.to == outer.header
+        && candidates.iter().any(|inner| {
+            inner.header != outer.header
+                && inner.blocks.len() < outer.blocks.len()
+                && inner.blocks.is_subset(&outer.body_scope_blocks)
+                && inner.body_scope_blocks.contains(&edge.from)
+        })
 }
 
 fn is_same_header_nested_loop_exit(

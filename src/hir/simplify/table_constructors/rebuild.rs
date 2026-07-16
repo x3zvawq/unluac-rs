@@ -2,7 +2,8 @@
 //!
 //! 它依赖 `scan` 产出的轻量 step 描述和 `inline_value` 的安全内联结果，只负责按顺序 flush
 //! 片段，不会回头重新判定哪个 stmt 属于候选 region。
-//! 例如：一串 `record/setlist/producer` step 会在这里重新拼成 `HirTableConstructor`。
+//! 例如：一串 `record/setlist/producer` step 会在这里重新拼成 `HirTableConstructor`；
+//! producer、record key/value 的求值事件序列不一致时，整个推测事务回滚。
 
 use std::collections::VecDeque;
 
@@ -11,6 +12,7 @@ use crate::hir::common::{
     HirBlock, HirCallExpr, HirCapture, HirDecisionTarget, HirExpr, HirLValue, HirPackTail, HirStmt,
     HirTableField, HirTableKey, HirTableSetList,
 };
+use crate::hir::expr_safety::expr_requires_ordered_snapshot;
 
 use super::bindings::{
     BindingIndex, BindingUseSummary, binding_from_expr, binding_from_lvalue, matches_binding_ref,
@@ -18,11 +20,11 @@ use super::bindings::{
 };
 use super::builder::{ConstructorBuilder, RecordPromotionPolicy};
 use super::inline_value::{
-    InlineContext, expr_mentions_any_pending_binding, inline_constructor_value,
+    InlineContext, InlineRewriteState, expr_mentions_any_pending_binding, inline_constructor_value,
 };
 use super::{
-    PendingProducer, PendingProducerSource, ProducerGroupMeta, RebuildScratch, RegionStep,
-    SegmentToken, TableBinding,
+    ConstructorEvalEvent, PendingProducer, PendingProducerSource, PreparedRecord,
+    ProducerGroupMeta, RebuildScratch, RegionStep, SegmentToken, TableBinding,
 };
 
 pub(super) struct RegionRebuildContext<'a> {
@@ -58,10 +60,8 @@ pub(super) fn try_extend_constructor_from_steps(
     builder: &mut ConstructorBuilder,
     steps: &[RegionStep],
     context: &mut RegionRebuildContext<'_>,
-    retained_producer_stmts: &mut Vec<usize>,
 ) -> bool {
     let checkpoint = builder.checkpoint(context.scratch);
-    let retained_checkpoint = retained_producer_stmts.len();
     let mut segment_start = 0;
 
     for (index, step) in steps.iter().enumerate() {
@@ -71,29 +71,18 @@ pub(super) fn try_extend_constructor_from_steps(
                 &steps[segment_start..index],
                 Some(*stmt_index),
                 context,
-                retained_producer_stmts,
             )
             .is_none()
             {
                 builder.rollback(checkpoint, context.scratch);
-                retained_producer_stmts.truncate(retained_checkpoint);
                 return false;
             }
             segment_start = index + 1;
         }
     }
 
-    if flush_constructor_segment(
-        builder,
-        &steps[segment_start..],
-        None,
-        context,
-        retained_producer_stmts,
-    )
-    .is_none()
-    {
+    if flush_constructor_segment(builder, &steps[segment_start..], None, context).is_none() {
         builder.rollback(checkpoint, context.scratch);
-        retained_producer_stmts.truncate(retained_checkpoint);
         return false;
     }
 
@@ -106,9 +95,7 @@ fn flush_constructor_segment(
     segment: &[RegionStep],
     set_list_stmt_index: Option<usize>,
     context: &mut RegionRebuildContext<'_>,
-    retained_producer_stmts: &mut Vec<usize>,
 ) -> Option<()> {
-    let expected_set_list_start = builder.next_array_index();
     prepare_scratch(context.scratch, context.binding_index.len());
     if builder.trailing_multivalue.is_some()
         && (!segment.is_empty() || set_list_stmt_index.is_some())
@@ -117,9 +104,21 @@ fn flush_constructor_segment(
     }
 
     if segment.is_empty() {
-        builder.drain_pending_integer_fields(&mut context.scratch.restored_pending_integer_fields);
+        if builder.trailing_multivalue.is_some() {
+            return set_list_stmt_index.is_none().then_some(());
+        }
         if let Some(stmt_index) = set_list_stmt_index {
             let set_list = set_list_stmt(context.block, stmt_index)?;
+            if set_list.start_index < builder.next_array_index()
+                && !builder.demote_array_suffix(
+                    set_list.start_index,
+                    &mut context.scratch.restored_array_fields,
+                )
+            {
+                return None;
+            }
+            builder
+                .drain_pending_integer_fields(&mut context.scratch.restored_pending_integer_fields);
             if set_list.start_index != builder.next_array_index() {
                 return None;
             }
@@ -129,9 +128,24 @@ fn flush_constructor_segment(
             if let Some(trailing) = &set_list.values.tail {
                 builder.trailing_multivalue = Some(trailing.clone());
             }
+        } else {
+            builder
+                .drain_pending_integer_fields(&mut context.scratch.restored_pending_integer_fields);
         }
         return Some(());
     }
+
+    let expected_set_list_start = if let Some(stmt_index) = set_list_stmt_index {
+        let start_index = set_list_stmt(context.block, stmt_index)?.start_index;
+        if start_index < builder.next_array_index()
+            && !builder.demote_array_suffix(start_index, &mut context.scratch.restored_array_fields)
+        {
+            return None;
+        }
+        builder.next_array_index()
+    } else {
+        builder.next_array_index()
+    };
 
     for step in segment {
         match step {
@@ -181,15 +195,8 @@ fn flush_constructor_segment(
                     )?;
                     match queued_values.front() {
                         Some(front) if matches_binding_ref(front, producer.binding) => {
-                            let value = pending_producer_value(context.block, &producer)?;
-                            if !context.remaining_uses.contains(producer.binding_id) {
-                                context.scratch.consumed_bindings[producer.binding_id] = true;
-                                if let Some(group) = producer.group {
-                                    context.scratch.consumed_groups[group] = true;
-                                }
-                            }
+                            let value = inline_set_list_value(context, front)?;
                             queued_values.pop_front();
-                            let value = inline_set_list_value(context, value)?;
                             builder.push_array_value(value);
                         }
                         _ => {}
@@ -197,12 +204,17 @@ fn flush_constructor_segment(
                 }
                 SegmentToken::Record {
                     prepared_record_index,
-                } => builder.push_record_field_with_policy(
-                    context.scratch.prepared_records[*prepared_record_index].clone(),
-                    RecordPromotionPolicy::PreserveSetListPrefix {
-                        start_index: expected_set_list_start,
-                    },
-                ),
+                } => {
+                    append_prepared_record_events(context.scratch, *prepared_record_index);
+                    builder.push_record_field_with_policy(
+                        context.scratch.prepared_records[*prepared_record_index]
+                            .field
+                            .clone(),
+                        RecordPromotionPolicy::PreserveSetListPrefix {
+                            start_index: expected_set_list_start,
+                        },
+                    );
+                }
             }
         }
 
@@ -223,13 +235,17 @@ fn flush_constructor_segment(
     }
 
     if set_list_stmt_index.is_none() {
-        for token in &context.scratch.tokens {
+        let tokens = context.scratch.tokens.clone();
+        for token in &tokens {
             if let SegmentToken::Record {
                 prepared_record_index,
             } = token
             {
+                append_prepared_record_events(context.scratch, *prepared_record_index);
                 builder.push_record_field(
-                    context.scratch.prepared_records[*prepared_record_index].clone(),
+                    context.scratch.prepared_records[*prepared_record_index]
+                        .field
+                        .clone(),
                 );
             }
         }
@@ -240,12 +256,7 @@ fn flush_constructor_segment(
             return false;
         }
         if context.remaining_uses.contains(producer.binding_id) {
-            // In SETLIST segments, unconsumed producers with remaining_uses are OK:
-            // their values were "borrowed" (inlined into the constructor without consuming
-            // the binding), and their definition stmts will be retained.
-            // In non-SETLIST segments, they must still fail because there's no SETLIST
-            // to consume them and they'd block the region.
-            return set_list_stmt_index.is_none();
+            return true;
         }
         match producer.group {
             Some(group) if context.scratch.consumed_groups[group] => false,
@@ -256,18 +267,8 @@ fn flush_constructor_segment(
         return None;
     }
 
-    // Collect stmt indices for unconsumed producers whose bindings are still live.
-    // These stmts must be retained (not drained) because they define bindings used later.
-    if set_list_stmt_index.is_some() {
-        for producer in &context.scratch.pending_producers {
-            if !context.scratch.consumed_bindings[producer.binding_id]
-                && context.remaining_uses.contains(producer.binding_id)
-                && let PendingProducerSource::Value { stmt_index, .. }
-                | PendingProducerSource::Tail { stmt_index } = producer.source
-            {
-                retained_producer_stmts.push(stmt_index);
-            }
-        }
+    if !constructor_eval_order_is_preserved(set_list_stmt_index, context) {
+        return None;
     }
 
     if set_list_stmt_index.is_none() {
@@ -316,11 +317,120 @@ fn inline_set_list_value(
         context.binding_index,
         &scratch.pending_producers,
         &scratch.producer_index_by_binding,
-        &mut scratch.consumed_bindings,
-        &mut scratch.consumed_groups,
+        InlineRewriteState {
+            consumed_bindings: &mut scratch.consumed_bindings,
+            consumed_groups: &mut scratch.consumed_groups,
+            eval_events: &mut scratch.generated_eval_events,
+        },
         context.remaining_uses,
     );
     inline_constructor_value(&mut inline_context, value)
+}
+
+fn append_prepared_record_events(scratch: &mut RebuildScratch, record_index: usize) {
+    let range = scratch.prepared_records[record_index].eval_events.clone();
+    scratch
+        .generated_eval_events
+        .extend_from_slice(&scratch.prepared_eval_events[range]);
+}
+
+fn constructor_eval_order_is_preserved(
+    set_list_stmt_index: Option<usize>,
+    context: &RegionRebuildContext<'_>,
+) -> bool {
+    let scratch = &context.scratch;
+    let mut expected = scratch.source_eval_events.clone();
+    if let Some(stmt_index) = set_list_stmt_index {
+        let Some(set_list) = set_list_stmt(context.block, stmt_index) else {
+            return false;
+        };
+        for value in &set_list.values.fixed {
+            collect_source_eval_events(
+                value,
+                context.binding_index,
+                &scratch.producer_index_by_binding,
+                &mut expected,
+            );
+        }
+        if let Some(tail) = &set_list.values.tail {
+            collect_source_eval_events(
+                tail.as_expr(),
+                context.binding_index,
+                &scratch.producer_index_by_binding,
+                &mut expected,
+            );
+        }
+    }
+    expected == scratch.generated_eval_events
+}
+
+fn collect_source_eval_events(
+    expr: &HirExpr,
+    binding_index: &BindingIndex,
+    producer_index_by_binding: &[Option<usize>],
+    events: &mut Vec<ConstructorEvalEvent>,
+) {
+    if binding_from_expr(expr)
+        .and_then(|binding| binding_index.id_of(binding))
+        .and_then(|binding_id| producer_index_by_binding.get(binding_id))
+        .is_some_and(Option::is_some)
+    {
+        return;
+    }
+
+    match expr {
+        HirExpr::Unary(unary) => collect_source_eval_events(
+            &unary.expr,
+            binding_index,
+            producer_index_by_binding,
+            events,
+        ),
+        HirExpr::Binary(binary) => {
+            for value in [&binary.lhs, &binary.rhs] {
+                collect_source_eval_events(value, binding_index, producer_index_by_binding, events);
+            }
+        }
+        HirExpr::TableAccess(access) => {
+            for value in [&access.base, &access.key] {
+                collect_source_eval_events(value, binding_index, producer_index_by_binding, events);
+            }
+        }
+        HirExpr::Call(call) => {
+            for value in std::iter::once(&call.callee).chain(&call.args) {
+                collect_source_eval_events(value, binding_index, producer_index_by_binding, events);
+            }
+        }
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            collect_source_eval_events(
+                &logical.lhs,
+                binding_index,
+                producer_index_by_binding,
+                events,
+            );
+        }
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
+        | HirExpr::Complex { .. }
+        | HirExpr::ParamRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::TempRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::VarArg
+        | HirExpr::TableConstructor(_)
+        | HirExpr::Closure(_)
+        | HirExpr::Decision(_)
+        | HirExpr::Unresolved(_) => {}
+    }
+    if expr_requires_ordered_snapshot(expr) {
+        events.push(ConstructorEvalEvent::Barrier);
+    }
 }
 
 fn prepare_scratch(scratch: &mut RebuildScratch, binding_count: usize) {
@@ -328,6 +438,9 @@ fn prepare_scratch(scratch: &mut RebuildScratch, binding_count: usize) {
     scratch.producer_groups.clear();
     scratch.tokens.clear();
     scratch.prepared_records.clear();
+    scratch.prepared_eval_events.clear();
+    scratch.source_eval_events.clear();
+    scratch.generated_eval_events.clear();
     scratch.consumed_groups.clear();
     reset_touched_bindings(scratch);
     ensure_binding_capacity(scratch, binding_count);
@@ -374,6 +487,13 @@ fn register_single_producer(
     scratch.producer_index_by_binding[producer.binding_id] = Some(producer_index);
     scratch.removed_materializations[producer.binding_id] += 1;
     scratch.pending_producers.push(producer);
+    if pending_producer_value(block, &scratch.pending_producers[producer_index])
+        .is_some_and(expr_requires_ordered_snapshot)
+    {
+        scratch
+            .source_eval_events
+            .push(ConstructorEvalEvent::Producer(producer_index));
+    }
     scratch
         .tokens
         .push(SegmentToken::Producer { producer_index });
@@ -410,6 +530,13 @@ fn register_producer_group(
             source,
             group: Some(group_id),
         });
+        if pending_producer_value(block, &scratch.pending_producers[producer_index])
+            .is_some_and(expr_requires_ordered_snapshot)
+        {
+            scratch
+                .source_eval_events
+                .push(ConstructorEvalEvent::Producer(producer_index));
+        }
         scratch
             .tokens
             .push(SegmentToken::Producer { producer_index });
@@ -420,6 +547,21 @@ fn register_producer_group(
 
 fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>) -> Option<()> {
     let (key, value) = record_field_parts(context.block, stmt_index, context.dialect)?;
+    if let HirTableKey::Expr(key_expr) = &key {
+        collect_source_eval_events(
+            key_expr,
+            context.binding_index,
+            &context.scratch.producer_index_by_binding,
+            &mut context.scratch.source_eval_events,
+        );
+    }
+    collect_source_eval_events(
+        value,
+        context.binding_index,
+        &context.scratch.producer_index_by_binding,
+        &mut context.scratch.source_eval_events,
+    );
+    let eval_event_start = context.scratch.prepared_eval_events.len();
     // 内联 record key 表达式：如果 key 是一个引用了 pending producer 的变量引用
     // （例如 `local k = "name"; t[k] = v`），把 producer 值折叠进 key 并消费绑定。
     let key = match key {
@@ -431,8 +573,11 @@ fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>
                     context.binding_index,
                     &scratch.pending_producers,
                     &scratch.producer_index_by_binding,
-                    &mut scratch.consumed_bindings,
-                    &mut scratch.consumed_groups,
+                    InlineRewriteState {
+                        consumed_bindings: &mut scratch.consumed_bindings,
+                        consumed_groups: &mut scratch.consumed_groups,
+                        eval_events: &mut scratch.prepared_eval_events,
+                    },
                     context.remaining_uses,
                 );
                 inline_constructor_value(&mut inline_context, &key_expr)?
@@ -455,8 +600,11 @@ fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>
             context.binding_index,
             &scratch.pending_producers,
             &scratch.producer_index_by_binding,
-            &mut scratch.consumed_bindings,
-            &mut scratch.consumed_groups,
+            InlineRewriteState {
+                consumed_bindings: &mut scratch.consumed_bindings,
+                consumed_groups: &mut scratch.consumed_groups,
+                eval_events: &mut scratch.prepared_eval_events,
+            },
             context.remaining_uses,
         );
         inline_constructor_value(&mut inline_context, value)?
@@ -473,10 +621,10 @@ fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>
         return None;
     }
     let prepared_record_index = context.scratch.prepared_records.len();
-    context
-        .scratch
-        .prepared_records
-        .push(crate::hir::common::HirRecordField { key, value });
+    context.scratch.prepared_records.push(PreparedRecord {
+        field: crate::hir::common::HirRecordField { key, value },
+        eval_events: eval_event_start..context.scratch.prepared_eval_events.len(),
+    });
     context.scratch.tokens.push(SegmentToken::Record {
         prepared_record_index,
     });

@@ -182,28 +182,28 @@ pub(super) fn loop_value_merges_in_block(
 }
 
 pub(super) fn short_circuit_phi_facts(
-    _cfg: &Cfg,
     dataflow: &DataflowFacts,
     header: BlockRef,
     reg: Reg,
-    phi: &PhiCandidate,
+    value_leaves: &BTreeSet<BlockRef>,
 ) -> ShortCircuitPhiFacts {
     ShortCircuitPhiFacts {
         entry_value: dataflow.block_exit_value(header, reg),
-        value_incomings: phi
-            .incoming
+        // 值叶可能先汇入中间 phi，再作为单个 incoming 进入最终 merge。这里记录
+        // DAG 的真实叶 block，而不是最终 phi 的物理 predecessor，避免 HIR 再展开 phi。
+        value_incomings: value_leaves
             .iter()
-            .filter_map(|incoming| {
-                let pred = incoming.pred?;
-                let latest_local_def = match incoming.value {
-                    SsaValue::Def(def) if dataflow.def_block(def) == pred => Some(def),
+            .map(|pred| {
+                let value = dataflow.block_exit_value(*pred, reg);
+                let latest_local_def = match value {
+                    SsaValue::Def(def) if dataflow.def_block(def) == *pred => Some(def),
                     _ => None,
                 };
-                Some(ShortCircuitValueIncoming {
-                    pred,
+                ShortCircuitValueIncoming {
+                    pred: *pred,
                     latest_local_def,
-                    value: incoming.value,
-                })
+                    value,
+                }
             })
             .collect(),
     }

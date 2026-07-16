@@ -70,19 +70,16 @@ pub(super) fn try_rebuild_constructor_region(
     stmt_ids: &[usize],
     dialect: DecompileDialect,
     scratch: &mut RebuildScratch,
-) -> Option<(HirTableConstructor, usize, Vec<usize>)> {
+) -> Option<(HirTableConstructor, usize)> {
     let mut steps = Vec::new();
     let mut best_end = None;
     let mut committed_builder = ConstructorBuilder::from_constructor(constructor);
-    let mut committed_retained_stmts: Vec<usize> = Vec::new();
-    let mut pending_retained_stmts: Vec<usize> = Vec::new();
     let scan_stmts = &block.stmts[(seed_index + 1)..];
     for (offset, stmt) in scan_stmts.iter().enumerate() {
         let index = seed_index + 1 + offset;
         let remaining_uses = binding_occurrences.remaining_uses_after(stmt_ids[index]);
         if keyed_write_step(stmt, binding) {
             steps.push(RegionStep::Record { stmt_index: index });
-            pending_retained_stmts.clear();
             let mut rebuild_context = RegionRebuildContext::new(
                 block,
                 binding_index,
@@ -95,10 +92,8 @@ pub(super) fn try_rebuild_constructor_region(
                 &mut committed_builder,
                 &steps,
                 &mut rebuild_context,
-                &mut pending_retained_stmts,
             ) {
                 best_end = Some(index);
-                committed_retained_stmts.append(&mut pending_retained_stmts);
                 steps.clear();
             }
             continue;
@@ -108,7 +103,6 @@ pub(super) fn try_rebuild_constructor_region(
         }
         if table_set_list_step(stmt, binding) {
             steps.push(RegionStep::SetList { stmt_index: index });
-            pending_retained_stmts.clear();
             let mut rebuild_context = RegionRebuildContext::new(
                 block,
                 binding_index,
@@ -121,10 +115,8 @@ pub(super) fn try_rebuild_constructor_region(
                 &mut committed_builder,
                 &steps,
                 &mut rebuild_context,
-                &mut pending_retained_stmts,
             ) {
                 best_end = Some(index);
-                committed_retained_stmts.append(&mut pending_retained_stmts);
                 steps.clear();
             }
             continue;
@@ -137,15 +129,7 @@ pub(super) fn try_rebuild_constructor_region(
     // 末尾那批未消费 producer 会让整段 region 失败，反而错过前面已经足够安全的
     // `{ ... }` 前缀。因此这里持续记住“最后一个成功前缀”，在真正遇到无关语句时
     // 回退到最近一次可证明安全的构造器边界。
-    best_end.map(|end_index| {
-        committed_retained_stmts.sort_unstable();
-        committed_retained_stmts.dedup();
-        (
-            committed_builder.into_constructor(),
-            end_index,
-            committed_retained_stmts,
-        )
-    })
+    best_end.map(|end_index| (committed_builder.into_constructor(), end_index))
 }
 
 pub(super) fn trailing_constructor_handoff(

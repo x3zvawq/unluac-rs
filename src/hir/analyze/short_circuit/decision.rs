@@ -5,6 +5,7 @@
 //! 例如：`a and b or c` 这类值级短路，会先在这里整理成 decision node/leaf 图。
 
 use super::*;
+use crate::hir::expr_safety::expr_is_repeatable;
 
 pub(crate) fn branch_exit_blocks_from_value_merge_candidate(
     short: &ShortCircuitCandidate,
@@ -246,8 +247,27 @@ impl ImpureValueMergePlan {
         }
     }
 
-    fn as_expr(&self) -> HirExpr {
-        self.clone().into_expr()
+    fn matches_expr(&self, expr: &HirExpr) -> bool {
+        match (self, expr) {
+            (Self::Expr(value), _) => value == expr,
+            (Self::OrFallback { head, fallback }, HirExpr::LogicalOr(logical)) => {
+                head == &logical.lhs && fallback == &logical.rhs
+            }
+            (Self::OrFallback { .. }, _) => false,
+        }
+    }
+
+    fn truthiness(&self) -> Option<bool> {
+        match self {
+            Self::Expr(expr) => expr_truthiness(expr),
+            Self::OrFallback { head, fallback } => {
+                match (expr_truthiness(head), expr_truthiness(fallback)) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), fallback) => fallback,
+                    _ => None,
+                }
+            }
+        }
     }
 }
 
@@ -301,6 +321,8 @@ fn combine_impure_value_merge_targets(
     truthy: ImpureValueMergeTarget,
     falsy: ImpureValueMergeTarget,
 ) -> Option<ImpureValueMergePlan> {
+    let truthy = normalize_impure_value_merge_target(&subject, truthy);
+    let falsy = normalize_impure_value_merge_target(&subject, falsy);
     match (truthy, falsy) {
         (ImpureValueMergeTarget::Plan(truthy), ImpureValueMergeTarget::Plan(falsy))
             if impure_subject_is_boolean_valued(&subject)
@@ -360,7 +382,7 @@ fn combine_impure_value_merge_targets(
         (
             ImpureValueMergeTarget::Plan(ImpureValueMergePlan::OrFallback { head, fallback }),
             ImpureValueMergeTarget::Plan(falsy),
-        ) if falsy.as_expr() == fallback => Some(ImpureValueMergePlan::OrFallback {
+        ) if falsy.matches_expr(&fallback) => Some(ImpureValueMergePlan::OrFallback {
             head: HirExpr::LogicalAnd(Box::new(crate::hir::common::HirLogicalExpr {
                 lhs: subject,
                 rhs: head,
@@ -379,7 +401,43 @@ fn combine_impure_value_merge_targets(
         ) if fallback == falsy_fallback => {
             combine_shared_fallback_impure_heads(subject, truthy_head, falsy_head, fallback)
         }
+        (ImpureValueMergeTarget::Plan(truthy), ImpureValueMergeTarget::Plan(falsy))
+            if truthy.truthiness() == Some(true) =>
+        {
+            Some(ImpureValueMergePlan::OrFallback {
+                head: HirExpr::LogicalAnd(Box::new(crate::hir::common::HirLogicalExpr {
+                    lhs: subject,
+                    rhs: truthy.into_expr(),
+                })),
+                fallback: falsy.into_expr(),
+            })
+        }
+        (ImpureValueMergeTarget::Plan(truthy), ImpureValueMergeTarget::Plan(falsy))
+            if falsy.truthiness() == Some(true) =>
+        {
+            Some(ImpureValueMergePlan::OrFallback {
+                head: HirExpr::LogicalAnd(Box::new(crate::hir::common::HirLogicalExpr {
+                    lhs: subject.negate(),
+                    rhs: falsy.into_expr(),
+                })),
+                fallback: truthy.into_expr(),
+            })
+        }
         _ => None,
+    }
+}
+
+fn normalize_impure_value_merge_target(
+    subject: &HirExpr,
+    target: ImpureValueMergeTarget,
+) -> ImpureValueMergeTarget {
+    match target {
+        ImpureValueMergeTarget::Plan(ImpureValueMergePlan::Expr(expr))
+            if &expr == subject && expr_is_repeatable(subject) =>
+        {
+            ImpureValueMergeTarget::Current
+        }
+        other => other,
     }
 }
 

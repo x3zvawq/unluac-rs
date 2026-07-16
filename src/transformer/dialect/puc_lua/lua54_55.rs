@@ -13,8 +13,8 @@ use crate::transformer::dialect::puc_lua::{
     HelperJumpInfo as HelperJump, MetamethodBinarySpec,
     access_base_for_upvalue as shared_access_base_for_upvalue, call_args_pack, call_result_pack,
     checked_const_ref, checked_proto_ref, checked_upvalue_ref, constant_binary_shape, emit_call,
-    emit_generic_for_call, emit_generic_for_loop, emit_numeric_for_init, emit_numeric_for_loop,
-    emit_return, emit_tail_call, emit_tforprep, finish_lowered_proto, generic_for_pair_abx,
+    emit_generic_for_call, emit_generic_for_loop, emit_generic_for_prep, emit_numeric_for_init,
+    emit_numeric_for_loop, emit_return, emit_tail_call, finish_lowered_proto, generic_for_pair_abx,
     helper_jump_asj, immediate_binary_shape, immediate_cond_operand, jump_target_back_bx,
     jump_target_forward_bx, jump_target_sj, k_value_operand, lower_chunk_with_env,
     numeric_for_regs, prepare_env_lowering, range_len_inclusive, reg_from_u8,
@@ -24,11 +24,11 @@ use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchPredicate, Capture,
     CaptureSource, CloseInstr, ClosureInstr, ConcatInstr, CondOperand, ConstRef, ErrNilInstr,
-    GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, LoadBoolInstr, LoadConstInstr,
-    LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr, LoweredChunk, LoweredProto,
-    LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange, ResultPack, SetListInstr,
-    SetTableInstr, SetUpvalueInstr, TbcInstr, TbcKind, TransformError, UnaryOpInstr, UnaryOpKind,
-    UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    GenericForPrepInstr, GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, LoadBoolInstr,
+    LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr, LoweredChunk,
+    LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange, ResultPack,
+    SetListInstr, SetTableInstr, SetUpvalueInstr, TbcInstr, TransformError, UnaryOpInstr,
+    UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
 mod adapter;
@@ -681,7 +681,6 @@ impl<'a> ProtoLowerer<'a> {
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::Tbc(TbcInstr {
                             reg: reg_from_u8(a),
-                            kind: TbcKind::Explicit,
                         })),
                     );
                     raw_index += 1;
@@ -946,10 +945,28 @@ impl<'a> ProtoLowerer<'a> {
                 FamilyOpcode::TForPrep => {
                     self.pending_methods.clear();
                     let (a, bx) = expect_abx(raw_pc, opcode, operands)?;
-                    let tbc_reg = Reg(usize::from(a) + 3);
+                    let iterator = reg_from_u8(a);
+                    let control_source = Reg(iterator.index() + 2);
+                    let closing_source = Reg(iterator.index() + 3);
+                    let (control_target, closing_target) = match self.dialect {
+                        FamilyDialect::Lua54 => (control_source, closing_source),
+                        FamilyDialect::Lua55 => (closing_source, control_source),
+                    };
                     let call_target =
                         jump_target_forward_bx(&self.word_code_index, raw_pc, extra.pc, bx)?;
-                    emit_tforprep(&mut self.lowering, raw_index, tbc_reg, call_target);
+                    emit_generic_for_prep(
+                        &mut self.lowering,
+                        raw_index,
+                        GenericForPrepInstr {
+                            iterator,
+                            state: Reg(iterator.index() + 1),
+                            control_source,
+                            closing_source,
+                            control_target,
+                            closing_target,
+                        },
+                        call_target,
+                    );
                     raw_index += 1;
                 }
                 FamilyOpcode::TForCall => {
@@ -961,6 +978,7 @@ impl<'a> ProtoLowerer<'a> {
                         &mut self.lowering,
                         raw_index,
                         state_start,
+                        self.dialect.generic_for_control_offset(),
                         self.dialect.generic_for_binding_offset(),
                         usize::from(c),
                     );
@@ -1219,7 +1237,7 @@ impl<'a> ProtoLowerer<'a> {
                 validate_loop_base: |loop_a, call_a| loop_a == call_a,
                 build_pair: |loop_a, result_count| {
                     (
-                        Reg(usize::from(loop_a) + 2),
+                        Reg(usize::from(loop_a) + self.dialect.generic_for_control_offset()),
                         RegRange::new(Reg(usize::from(loop_a) + binding_offset), result_count),
                     )
                 },

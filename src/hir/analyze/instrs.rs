@@ -243,6 +243,7 @@ pub(super) fn lower_regular_instr(
         | LowInstr::Return(_)
         | LowInstr::NumericForInit(_)
         | LowInstr::NumericForLoop(_)
+        | LowInstr::GenericForPrep(_)
         | LowInstr::GenericForLoop(_)
         | LowInstr::Jump(_)
         | LowInstr::Branch(_) => {
@@ -383,18 +384,12 @@ fn generic_for_iterator_call(
     instr_ref: InstrRef,
     instr: &GenericForCallInstr,
 ) -> HirExpr {
-    let callee = expr_for_reg_use(lowering, block, instr_ref, instr.state.start);
-    let args = (1..instr.state.len)
-        .map(|offset| {
-            expr_for_reg_use(
-                lowering,
-                block,
-                instr_ref,
-                Reg(instr.state.start.index() + offset),
-            )
-        })
-        .collect::<Vec<_>>()
-        .into();
+    let callee = expr_for_reg_use(lowering, block, instr_ref, instr.iterator);
+    let args = vec![
+        expr_for_reg_use(lowering, block, instr_ref, instr.state),
+        expr_for_reg_use(lowering, block, instr_ref, instr.control),
+    ]
+    .into();
 
     HirExpr::Call(Box::new(HirCallExpr {
         callee,

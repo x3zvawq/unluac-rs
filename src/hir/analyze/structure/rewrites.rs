@@ -100,6 +100,33 @@ pub(super) fn lvalue_as_expr(lvalue: &HirLValue) -> Option<HirExpr> {
     }
 }
 
+pub(super) fn prune_identity_assignments(stmts: &mut Vec<HirStmt>) {
+    for stmt in stmts.iter_mut() {
+        let HirStmt::Assign(assign) = stmt else {
+            continue;
+        };
+        if assign.values.tail.is_some() || assign.targets.len() != assign.values.fixed.len() {
+            continue;
+        }
+        let (targets, values) = std::mem::take(&mut assign.targets)
+            .into_iter()
+            .zip(std::mem::take(&mut assign.values.fixed))
+            .filter(|(target, value)| {
+                !matches!(
+                    target,
+                    HirLValue::Param(_)
+                        | HirLValue::Temp(_)
+                        | HirLValue::Local(_)
+                        | HirLValue::Upvalue(_)
+                ) || lvalue_as_expr(target).as_ref() != Some(value)
+            })
+            .unzip();
+        assign.targets = targets;
+        assign.values.fixed = values;
+    }
+    stmts.retain(|stmt| !matches!(stmt, HirStmt::Assign(assign) if assign.targets.is_empty()));
+}
+
 pub(super) fn expr_as_lvalue(expr: &HirExpr) -> Option<HirLValue> {
     match expr {
         HirExpr::TempRef(temp) => Some(HirLValue::Temp(*temp)),

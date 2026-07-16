@@ -296,7 +296,6 @@ fn format_cleanup_disposition(disposition: CleanupDisposition) -> String {
     match disposition {
         CleanupDisposition::Unreachable => "unreachable".to_owned(),
         CleanupDisposition::ExplicitTbc => "explicit-tbc".to_owned(),
-        CleanupDisposition::GenericFor(id) => format!("generic-for:c{}", id.index()),
         CleanupDisposition::LoopTbcBoundary(id) => {
             format!("loop-tbc-boundary:c{}", id.index())
         }
@@ -736,5 +735,6 @@ fn format_goto_reason(reason: super::common::GotoReason) -> &'static str {
         super::common::GotoReason::MultiEntryRegion => "multi-entry-region",
         super::common::GotoReason::UnstructuredBreakLike => "unstructured-break-like",
         super::common::GotoReason::UnstructuredContinueLike => "unstructured-continue-like",
+        super::common::GotoReason::CrossLoopContinueLike => "cross-loop-continue-like",
     }
 }

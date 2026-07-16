@@ -45,7 +45,7 @@ pub(crate) enum PendingLowInstr {
         exit_target: TargetPlaceholder,
     },
     GenericForLoop {
-        control: Reg,
+        control_target: Reg,
         bindings: RegRange,
         body_target: TargetPlaceholder,
         exit_target: TargetPlaceholder,
@@ -416,12 +416,12 @@ where
             exit_target: resolve_target(*exit_target)?,
         })),
         PendingLowInstr::GenericForLoop {
-            control,
+            control_target,
             bindings,
             body_target,
             exit_target,
         } => Ok(LowInstr::GenericForLoop(GenericForLoopInstr {
-            control: *control,
+            control_target: *control_target,
             bindings: *bindings,
             body_target: resolve_target(*body_target)?,
             exit_target: resolve_target(*exit_target)?,

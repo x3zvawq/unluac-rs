@@ -121,14 +121,7 @@ pub fn format_low_instr(instr: &LowInstr) -> String {
                 .join(", ")
         ),
         LowInstr::Close(instr) => format!("close from {}", format_reg(instr.from)),
-        LowInstr::Tbc(instr) => format!(
-            "tbc({}) {}",
-            match instr.kind {
-                crate::transformer::TbcKind::Explicit => "explicit",
-                crate::transformer::TbcKind::GenericFor => "generic-for",
-            },
-            format_reg(instr.reg)
-        ),
+        LowInstr::Tbc(instr) => format!("tbc {}", format_reg(instr.reg)),
         LowInstr::NumericForInit(instr) => format!(
             "numeric-for-init index={} limit={} step={} binding={} body={} exit={}",
             format_reg(instr.index),
@@ -147,14 +140,25 @@ pub fn format_low_instr(instr: &LowInstr) -> String {
             format_instr_ref(instr.body_target),
             format_instr_ref(instr.exit_target)
         ),
+        LowInstr::GenericForPrep(instr) => format!(
+            "generic-for-prep iterator={} state={} control={}->{} closing={}->{}",
+            format_reg(instr.iterator),
+            format_reg(instr.state),
+            format_reg(instr.control_source),
+            format_reg(instr.control_target),
+            format_reg(instr.closing_source),
+            format_reg(instr.closing_target)
+        ),
         LowInstr::GenericForCall(instr) => format!(
-            "generic-for-call state={} results={}",
-            format_reg_range(instr.state),
+            "generic-for-call iterator={} state={} control={} results={}",
+            format_reg(instr.iterator),
+            format_reg(instr.state),
+            format_reg(instr.control),
             format_result_pack(instr.results)
         ),
         LowInstr::GenericForLoop(instr) => format!(
             "generic-for-loop control={} bindings={} body={} exit={}",
-            format_reg(instr.control),
+            format_reg(instr.control_target),
             format_reg_range(instr.bindings),
             format_instr_ref(instr.body_target),
             format_instr_ref(instr.exit_target)

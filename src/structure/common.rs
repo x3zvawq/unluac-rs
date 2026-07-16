@@ -724,6 +724,7 @@ pub enum GotoReason {
     MultiEntryRegion,
     UnstructuredBreakLike,
     UnstructuredContinueLike,
+    CrossLoopContinueLike,
 }
 
 /// 某片 block 集合的区域事实。

@@ -16,7 +16,8 @@ use crate::hir::common::{
     HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr, TempId,
 };
 use crate::hir::decision::{
-    decision_is_synth_safe, finalize_condition_decision_expr, finalize_value_decision_expr,
+    decision_is_synth_safe, expr_truthiness, finalize_condition_decision_expr,
+    finalize_value_decision_expr,
 };
 use crate::structure::{BlockRef, DefId, PhiId, SsaValue};
 use crate::structure::{

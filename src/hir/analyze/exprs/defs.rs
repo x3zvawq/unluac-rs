@@ -57,7 +57,7 @@ pub(crate) fn expr_for_fixed_def(lowering: &ProtoLowering<'_>, def_id: DefId) ->
                     .collect(),
             })))
         }
-        LowInstr::GenericForCall(_) => None,
+        LowInstr::GenericForPrep(_) | LowInstr::GenericForCall(_) => None,
         LowInstr::SetUpvalue(_)
         | LowInstr::SetTable(_)
         | LowInstr::SetList(_)
@@ -204,6 +204,19 @@ pub(crate) fn expr_for_dup_safe_fixed_def(
         }
         LowInstr::GetUpvalue(get_upvalue) if get_upvalue.dst == def_reg => {
             Some(lower_upvalue_operand_expr(lowering, get_upvalue.src))
+        }
+        LowInstr::GenericForPrep(prep) => prep
+            .source_for_target(def_reg)
+            .map(|source| expr_for_reg_use_inline(lowering, def_block, def_instr, source)),
+        LowInstr::GenericForLoop(loop_instr)
+            if loop_instr.control_target == def_reg && loop_instr.bindings.len != 0 =>
+        {
+            Some(expr_for_reg_use_inline(
+                lowering,
+                def_block,
+                def_instr,
+                loop_instr.bindings.start,
+            ))
         }
         _ => None,
     }

@@ -78,7 +78,6 @@ impl ScopeCandidateId {
 pub enum CleanupDisposition {
     Unreachable,
     ExplicitTbc,
-    GenericFor(LoopCandidateId),
     LoopTbcBoundary(LoopCandidateId),
     ExplicitTbcBoundary,
     LexicalScope(ScopeCandidateId),
@@ -366,7 +365,7 @@ fn build_unstructured_region_layout(
                 break;
             }
             if !matches!(plan.block_owners[block.index()], BlockOwner::Linear)
-                || !unstructured_exit_pad_is_owned(plan, proto, cfg, &blocks, block)
+                || !unstructured_exit_pad_is_owned(proto, cfg, &blocks, block)
             {
                 return None;
             }
@@ -382,7 +381,6 @@ fn build_unstructured_region_layout(
 }
 
 fn unstructured_exit_pad_is_owned(
-    plan: &StructurePlan,
     proto: &LoweredProto,
     cfg: &Cfg,
     blocks: &BTreeSet<BlockRef>,
@@ -403,13 +401,8 @@ fn unstructured_exit_pad_is_owned(
             range.end()
         }
     });
-    (range.start.index()..end).all(|index| match proto.instrs[index] {
-        LowInstr::Close(_) | LowInstr::Tbc(_) => !matches!(
-            plan.cleanup_dispositions[index],
-            Some(CleanupDisposition::GenericFor(_))
-        ),
-        _ => true,
-    })
+    (range.start.index()..end)
+        .all(|index| !matches!(proto.instrs[index], LowInstr::GenericForPrep(_)))
 }
 
 pub(super) fn install_phi_incoming_dispositions(

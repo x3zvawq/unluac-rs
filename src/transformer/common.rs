@@ -220,6 +220,7 @@ pub enum LowInstr {
     Tbc(TbcInstr),
     NumericForInit(NumericForInitInstr),
     NumericForLoop(NumericForLoopInstr),
+    GenericForPrep(GenericForPrepInstr),
     GenericForCall(GenericForCallInstr),
     GenericForLoop(GenericForLoopInstr),
     Jump(JumpInstr),
@@ -603,13 +604,6 @@ pub struct CloseInstr {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct TbcInstr {
     pub reg: Reg,
-    pub kind: TbcKind,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub enum TbcKind {
-    Explicit,
-    GenericFor,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -633,14 +627,36 @@ pub struct NumericForLoopInstr {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct GenericForPrepInstr {
+    pub iterator: Reg,
+    pub state: Reg,
+    pub control_source: Reg,
+    pub closing_source: Reg,
+    pub control_target: Reg,
+    pub closing_target: Reg,
+}
+
+impl GenericForPrepInstr {
+    pub(crate) fn source_for_target(self, target: Reg) -> Option<Reg> {
+        match target {
+            target if target == self.control_target => Some(self.control_source),
+            target if target == self.closing_target => Some(self.closing_source),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct GenericForCallInstr {
-    pub state: RegRange,
+    pub iterator: Reg,
+    pub state: Reg,
+    pub control: Reg,
     pub results: ResultPack,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct GenericForLoopInstr {
-    pub control: Reg,
+    pub control_target: Reg,
     pub bindings: RegRange,
     pub body_target: InstrRef,
     pub exit_target: InstrRef,

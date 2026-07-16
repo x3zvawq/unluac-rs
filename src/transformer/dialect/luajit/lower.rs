@@ -754,11 +754,14 @@ impl<'a> ProtoLowerer<'a> {
                 LuaJitOpcode::IterC | LuaJitOpcode::IterN => {
                     let (a, b, _c) = expect_abc(raw_pc, opcode, operands)?;
                     let helper = self.iter_loop(raw_index, usize::from(b))?;
+                    let iterator = Reg(usize::from(a).saturating_sub(3));
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::GenericForCall(GenericForCallInstr {
-                            state: RegRange::new(Reg(usize::from(a).saturating_sub(3)), 3),
+                            iterator,
+                            state: Reg(iterator.index() + 1),
+                            control: Reg(iterator.index() + 2),
                             results: ResultPack::Fixed(RegRange::new(
                                 reg_from_u8(a),
                                 usize::from(b.saturating_sub(1)),
@@ -769,7 +772,7 @@ impl<'a> ProtoLowerer<'a> {
                         None,
                         vec![raw_index, helper.helper_index],
                         PendingLowInstr::GenericForLoop {
-                            control: Reg(usize::from(a).saturating_sub(1)),
+                            control_target: Reg(usize::from(a).saturating_sub(1)),
                             bindings: RegRange::new(
                                 reg_from_u8(a),
                                 usize::from(b.saturating_sub(1)),

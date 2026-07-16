@@ -27,8 +27,9 @@ use super::super::common::{
 };
 use super::super::phi_facts::short_circuit_phi_facts;
 use super::shared::{
-    LinearFollowCtx, LinearFollowTarget, block_has_ignore_call, block_writes_reg,
-    is_reducible_candidate, short_circuit_nodes_are_acyclic, truthy_falsy_targets,
+    LinearFollowCtx, LinearFollowTarget, block_has_ignore_call, block_is_passthrough,
+    block_writes_reg, is_reducible_candidate, short_circuit_nodes_are_acyclic,
+    truthy_falsy_targets,
 };
 
 pub(super) fn analyze_value_merge_candidates(
@@ -56,8 +57,10 @@ pub(super) fn analyze_value_merge_candidates(
         let Some(root) = value_merge_root(dom_tree, branch_by_header, phi) else {
             continue;
         };
-        let Some(candidate) = ValueMergeDagBuilder::new(&build_ctx, root.header, phi).build()
-        else {
+        let Some(builder) = ValueMergeDagBuilder::new(&build_ctx, root.header, phi) else {
+            continue;
+        };
+        let Some(candidate) = builder.build() else {
             continue;
         };
 
@@ -101,11 +104,32 @@ struct ValueMergeDagBuilder<'a> {
     visiting: BTreeSet<BlockRef>,
     blocks: BTreeSet<BlockRef>,
     value_leaves: BTreeSet<BlockRef>,
+    value_leaf_predecessors: BTreeSet<BlockRef>,
+    phi_predecessors: BTreeSet<BlockRef>,
+    phi_leaf_values: BTreeSet<crate::structure::SsaValue>,
 }
 
 impl<'a> ValueMergeDagBuilder<'a> {
-    fn new(ctx: &'a ValueMergeBuildCtx<'a>, root: BlockRef, phi: &'a PhiCandidate) -> Self {
-        Self {
+    fn new(ctx: &'a ValueMergeBuildCtx<'a>, root: BlockRef, phi: &'a PhiCandidate) -> Option<Self> {
+        let phi_value = crate::structure::SsaValue::Phi(phi.id);
+        if phi.incoming.iter().any(|incoming| {
+            incoming.pred.is_none() || ctx.dataflow.value_contains(incoming.value, phi_value)
+        }) {
+            return None;
+        }
+
+        let phi_predecessors = phi
+            .incoming
+            .iter()
+            .filter_map(|incoming| incoming.pred)
+            .collect();
+        let phi_leaf_values = phi
+            .incoming
+            .iter()
+            .flat_map(|incoming| ctx.dataflow.leaf_values(incoming.value))
+            .collect();
+
+        Some(Self {
             proto: ctx.proto,
             cfg: ctx.cfg,
             dataflow: ctx.dataflow,
@@ -118,7 +142,10 @@ impl<'a> ValueMergeDagBuilder<'a> {
             visiting: BTreeSet::new(),
             blocks: BTreeSet::new(),
             value_leaves: BTreeSet::new(),
-        }
+            value_leaf_predecessors: BTreeSet::new(),
+            phi_predecessors,
+            phi_leaf_values,
+        })
     }
 
     fn build(mut self) -> Option<ShortCircuitCandidate> {
@@ -149,7 +176,7 @@ impl<'a> ValueMergeDagBuilder<'a> {
         }
 
         let phi_facts =
-            short_circuit_phi_facts(self.cfg, self.dataflow, self.root, self.phi.reg, self.phi);
+            short_circuit_phi_facts(self.dataflow, self.root, self.phi.reg, &self.value_leaves);
         let reducible = is_reducible_candidate(self.cfg, self.root, &self.blocks);
         Some(ShortCircuitCandidate {
             header: self.root,
@@ -211,18 +238,21 @@ impl<'a> ValueMergeDagBuilder<'a> {
         target: BlockRef,
     ) -> Option<ShortCircuitTarget> {
         if target == self.phi.block {
-            let has_phi_defs = self.phi.incoming.iter().any(|inc| {
-                inc.pred == Some(from_header)
-                    && !matches!(inc.value, crate::structure::SsaValue::Entry(_))
-            });
-            if !has_phi_defs {
+            let incoming = self
+                .phi
+                .incoming
+                .iter()
+                .find(|incoming| incoming.pred == Some(from_header))?;
+            if matches!(incoming.value, crate::structure::SsaValue::Entry(_)) {
                 return None;
             }
             self.value_leaves.insert(from_header);
+            self.value_leaf_predecessors.insert(from_header);
             return Some(ShortCircuitTarget::Value(from_header));
         }
 
-        match (LinearFollowCtx {
+        let mut terminal = None;
+        let followed = (LinearFollowCtx {
             proto: self.proto,
             cfg: self.cfg,
             branch_by_header: self.branch_by_header,
@@ -232,45 +262,77 @@ impl<'a> ValueMergeDagBuilder<'a> {
         .follow(
             target,
             |block| block != self.phi.block && self.cfg.can_reach(block, self.phi.block),
-            |block, succs| {
-                matches!(succs, [succ] if *succ == self.phi.block)
-                    && block_writes_reg(self.proto, self.dataflow, self.cfg, block, self.phi.reg)
-                    // 含 call 副作用的块不能作为纯值叶子：其副作用无法用 `x and expr` 表达
-                    && !block_has_ignore_call(self.proto, self.cfg, block)
+            |block, _| {
+                terminal = self.value_leaf_carrier(block);
+                terminal.is_some()
             },
-        )? {
+        )?;
+        match followed {
             LinearFollowTarget::Header(header) => {
                 Some(ShortCircuitTarget::Node(self.build_node(header)?))
             }
             LinearFollowTarget::Terminal(block) => {
+                let (carriers, predecessor) = terminal?;
+                self.blocks.extend(carriers);
                 self.blocks.insert(block);
                 self.value_leaves.insert(block);
+                self.value_leaf_predecessors.insert(predecessor);
                 Some(ShortCircuitTarget::Value(block))
             }
         }
     }
 
-    fn value_leaves_feed_phi(&self) -> bool {
-        if self
-            .phi
-            .incoming
-            .iter()
-            .any(|incoming| incoming.pred.is_none())
+    /// 允许值叶先经过只携带同一 SSA 值的 jump/phi pad，再进入最终 merge。
+    /// carrier 必须是唯一后继、无普通写入的透明块；最终 incoming 还要确实包含
+    /// 当前叶值，不能仅凭 CFG 可达性把中途已被覆盖的 def 算进候选。
+    fn value_leaf_carrier(&self, leaf: BlockRef) -> Option<(BTreeSet<BlockRef>, BlockRef)> {
+        if !block_writes_reg(self.proto, self.dataflow, self.cfg, leaf, self.phi.reg)
+            || block_has_ignore_call(self.proto, self.cfg, leaf)
         {
+            return None;
+        }
+
+        let leaf_value = self.dataflow.block_exit_value(leaf, self.phi.reg);
+        let mut current = leaf;
+        let mut carriers = BTreeSet::new();
+        loop {
+            let successor = self.cfg.unique_reachable_successor(current)?;
+            if successor == self.phi.block {
+                let incoming = self
+                    .phi
+                    .incoming
+                    .iter()
+                    .find(|incoming| incoming.pred == Some(current))?;
+                return self
+                    .dataflow
+                    .value_contains(incoming.value, leaf_value)
+                    .then_some((carriers, current));
+            }
+            if successor == self.cfg.exit_block
+                || !self.dom_tree.dominates(self.root, successor)
+                || self.branch_by_header.contains_key(&successor)
+                || !block_is_passthrough(self.proto, self.cfg, successor)
+                || !carriers.insert(successor)
+            {
+                return None;
+            }
+            current = successor;
+        }
+    }
+
+    fn value_leaves_feed_phi(&self) -> bool {
+        if self.value_leaf_predecessors != self.phi_predecessors {
             return false;
         }
 
-        let mut incoming_preds = self
-            .phi
-            .incoming
+        let leaf_values = self
+            .value_leaves
             .iter()
-            .filter_map(|incoming| incoming.pred)
-            .collect::<Vec<_>>();
-        incoming_preds.sort();
-        incoming_preds.dedup();
-
-        let mut leaves = self.value_leaves.iter().copied().collect::<Vec<_>>();
-        leaves.sort();
-        leaves == incoming_preds
+            .flat_map(|leaf| {
+                self.dataflow
+                    .leaf_values(self.dataflow.block_exit_value(*leaf, self.phi.reg))
+            })
+            .collect::<BTreeSet<_>>();
+        leaf_values == self.phi_leaf_values
     }
 }

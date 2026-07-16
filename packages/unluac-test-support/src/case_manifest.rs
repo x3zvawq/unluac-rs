@@ -1204,6 +1204,42 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_232_parent_write_after_reference_capture.lua",
         ALL_DIALECTS,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_233_raw_branch_value_before_locals.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_234_nested_phi_short_value_merge.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_235_table_constructor_eval_ownership.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_236_table_constructor_pending_alias.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_237_table_constructor_open_overlap.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_238_nested_loop_owner_exit.lua",
+        PUC_LUA_GE_52,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_239_lua55_degenerate_generic_scope.lua",
+        PUC_LUA_GE_55,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_240_lua55_tforprep_swap.lua",
+        PUC_LUA_GE_55,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_241_branch_value_single_eval.lua",
+        PUC_LUA_ALL,
+    ),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {

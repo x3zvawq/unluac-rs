@@ -49,8 +49,8 @@ use body::*;
 use overrides::StructureOverrideState;
 use rewrites::{
     apply_loop_rewrites, expr_as_lvalue, install_def_target_overrides, lvalue_as_expr,
-    rewrite_expr_temps, rewrite_stmt_exprs, rewrite_stmt_targets, shared_expr_for_defs,
-    shared_lvalue_for_defs, temp_expr_overrides,
+    prune_identity_assignments, rewrite_expr_temps, rewrite_stmt_exprs, rewrite_stmt_targets,
+    shared_expr_for_defs, shared_lvalue_for_defs, temp_expr_overrides,
 };
 
 /// 基于 StructurePlan 恢复一个更接近源码的 HIR block。

@@ -56,6 +56,7 @@ pub(crate) fn recover_short_value_merge_expr_recovery_with_allowed_blocks(
     short: &ShortCircuitCandidate,
     allowed_blocks: &BTreeSet<BlockRef>,
 ) -> Option<ValueMergeExprRecovery> {
+    let mut deferred_decision = None;
     if let Some((expr, consumed_header_subject)) =
         recover_pure_value_decision_expr_with_allowed_blocks(
             lowering,
@@ -69,19 +70,29 @@ pub(crate) fn recover_short_value_merge_expr_recovery_with_allowed_blocks(
             consumed_header_subject,
         };
         if !expr_references_consumed_subject_temps(lowering, short, &recovery) {
-            return Some(recovery);
+            if matches!(
+                &recovery,
+                ValueMergeExprRecovery::Pure {
+                    expr: HirExpr::Decision(_),
+                    ..
+                }
+            ) {
+                deferred_decision = Some(recovery);
+            } else {
+                return Some(recovery);
+            }
         }
     }
 
-    let expr = build_impure_value_merge_expr(lowering, short, short.entry)?;
-    if expr_references_forbidden_candidate_temps(lowering, short, &expr, allowed_blocks) {
-        return None;
+    if let Some(expr) = build_impure_value_merge_expr(lowering, short, short.entry)
+        && !expr_references_forbidden_candidate_temps(lowering, short, &expr, allowed_blocks)
+    {
+        let recovery = ValueMergeExprRecovery::Impure(expr);
+        if !expr_references_consumed_subject_temps(lowering, short, &recovery) {
+            return Some(recovery);
+        }
     }
-    let recovery = ValueMergeExprRecovery::Impure(expr);
-    if expr_references_consumed_subject_temps(lowering, short, &recovery) {
-        return None;
-    }
-    Some(recovery)
+    deferred_decision
 }
 
 pub(super) fn recover_pure_value_decision_expr_with_allowed_blocks(

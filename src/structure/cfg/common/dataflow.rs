@@ -257,15 +257,15 @@ impl DataflowFacts {
             .collect()
     }
 
-    pub fn leaf_defs(&self, root: SsaValue) -> BTreeSet<DefId> {
-        let mut defs = BTreeSet::new();
+    /// 展开 phi 链，返回最终可到达的 entry/def 身份。
+    pub fn leaf_values(&self, root: SsaValue) -> BTreeSet<SsaValue> {
+        let mut leaves = BTreeSet::new();
         let mut seen = BTreeSet::new();
         let mut pending = vec![root];
         while let Some(value) = pending.pop() {
             match value {
-                SsaValue::Entry(_) => {}
-                SsaValue::Def(def) => {
-                    defs.insert(def);
+                SsaValue::Entry(_) | SsaValue::Def(_) => {
+                    leaves.insert(value);
                 }
                 SsaValue::Phi(phi) if seen.insert(phi) => {
                     if let Some(candidate) = self.phi_candidate(phi) {
@@ -275,7 +275,17 @@ impl DataflowFacts {
                 SsaValue::Phi(_) => {}
             }
         }
-        defs
+        leaves
+    }
+
+    pub fn leaf_defs(&self, root: SsaValue) -> BTreeSet<DefId> {
+        self.leaf_values(root)
+            .into_iter()
+            .filter_map(|value| match value {
+                SsaValue::Def(def) => Some(def),
+                SsaValue::Entry(_) | SsaValue::Phi(_) => None,
+            })
+            .collect()
     }
 
     pub fn value_contains(&self, root: SsaValue, target: SsaValue) -> bool {

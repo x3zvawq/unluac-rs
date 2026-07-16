@@ -351,6 +351,7 @@ impl StructuredBodyLowerer<'_, '_> {
             }
             LowInstr::NumericForInit(_)
             | LowInstr::NumericForLoop(_)
+            | LowInstr::GenericForPrep(_)
             | LowInstr::GenericForLoop(_) => return None,
             _ => return None,
         }
@@ -370,10 +371,7 @@ impl StructuredBodyLowerer<'_, '_> {
             }
             if matches!(
                 self.lowering.proto.instrs[index],
-                LowInstr::Close(_) | LowInstr::Tbc(_)
-            ) && matches!(
-                self.lowering.structure.cleanup_disposition(instr_ref),
-                CleanupDisposition::GenericFor(_)
+                LowInstr::GenericForPrep(_)
             ) {
                 return None;
             }
@@ -435,6 +433,7 @@ impl StructuredBodyLowerer<'_, '_> {
         let edge = self.lowering.cfg.edges.get(edge_ref.index())?;
         let mut stmts = lower_edge_phi_copies_for_edge(self.lowering, edge_ref);
         apply_loop_rewrites(&mut stmts, target_overrides);
+        prune_identity_assignments(&mut stmts);
         if Some(edge.to) != next {
             stmts.extend(goto_block(*self.label_map.get(&edge.to)?).stmts);
         }

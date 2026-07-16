@@ -13,9 +13,9 @@ use crate::transformer::dialect::lowering::{
 };
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpKind, CallInstr, CallKind, CloseInstr, CondOperand, ConstRef,
-    GenericForCallInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MethodNameHint,
-    NumberLiteral, ProtoRef, Reg, RegRange, ResultPack, ReturnInstr, TailCallInstr, TbcInstr,
-    TbcKind, TransformError, UpvalueOperand, UpvalueRef, ValueOperand, ValuePack,
+    GenericForCallInstr, GenericForPrepInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap,
+    MethodNameHint, NumberLiteral, ProtoRef, Reg, RegRange, ResultPack, ReturnInstr, TailCallInstr,
+    TransformError, UpvalueOperand, UpvalueRef, ValueOperand, ValuePack,
 };
 
 pub(crate) const BITRK: u16 = 1 << 8;
@@ -837,6 +837,7 @@ pub(crate) fn emit_generic_for_call(
     lowering: &mut PendingLoweringState,
     raw_index: usize,
     state_start: Reg,
+    control_offset: usize,
     result_start_offset: usize,
     result_count: usize,
 ) {
@@ -844,7 +845,9 @@ pub(crate) fn emit_generic_for_call(
         Some(raw_index),
         vec![raw_index],
         PendingLowInstr::Ready(LowInstr::GenericForCall(GenericForCallInstr {
-            state: RegRange::new(state_start, 3),
+            iterator: state_start,
+            state: Reg(state_start.index() + 1),
+            control: Reg(state_start.index() + control_offset),
             results: ResultPack::Fixed(RegRange::new(
                 Reg(state_start.index() + result_start_offset),
                 result_count,
@@ -858,7 +861,7 @@ pub(crate) fn emit_generic_for_loop(lowering: &mut PendingLoweringState, pair: G
         Some(pair.loop_index),
         vec![pair.loop_index],
         PendingLowInstr::GenericForLoop {
-            control: pair.control,
+            control_target: pair.control,
             bindings: pair.bindings,
             body_target: TargetPlaceholder::Raw(pair.body_target),
             exit_target: TargetPlaceholder::Raw(pair.exit_target),
@@ -866,19 +869,16 @@ pub(crate) fn emit_generic_for_loop(lowering: &mut PendingLoweringState, pair: G
     );
 }
 
-pub(crate) fn emit_tforprep(
+pub(crate) fn emit_generic_for_prep(
     lowering: &mut PendingLoweringState,
     raw_index: usize,
-    tbc_reg: Reg,
+    prep: GenericForPrepInstr,
     call_target: usize,
 ) {
     lowering.emit(
         Some(raw_index),
         vec![raw_index],
-        PendingLowInstr::Ready(LowInstr::Tbc(TbcInstr {
-            reg: tbc_reg,
-            kind: TbcKind::GenericFor,
-        })),
+        PendingLowInstr::Ready(LowInstr::GenericForPrep(prep)),
     );
     lowering.emit(
         None,

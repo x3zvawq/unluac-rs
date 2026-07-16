@@ -567,7 +567,9 @@ fn normalize_collapsed_target(
     target: CollapsedValueTarget,
 ) -> CollapsedValueTarget {
     match target {
-        CollapsedValueTarget::Expr(expr) if &expr == subject => CollapsedValueTarget::CurrentValue,
+        CollapsedValueTarget::Expr(expr) if &expr == subject && expr_is_repeatable(subject) => {
+            CollapsedValueTarget::CurrentValue
+        }
         other => other,
     }
 }

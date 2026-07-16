@@ -5,19 +5,26 @@
 //! 规则，不扫描语句，也不决定哪些语句可以进入构造器 region。
 //!
 //! 输入形状：已有构造器字段 + 后续 array / record / set-list 值。
-//! 输出形状：按 Lua 构造器语义重新排序后的 `HirTableConstructor`。
+//! 输出形状：按 Lua 构造器语义重新排序后的 `HirTableConstructor`。未来整数键只有在后续
+//! 写入可证明不别名时才能晋升为 array；open list 覆盖已有后缀时先降回显式整数字段。
 
 use std::collections::BTreeMap;
 
 use crate::hir::common::{HirExpr, HirPackTail, HirTableConstructor, HirTableField, HirTableKey};
 
-use super::{RebuildScratch, RestoredPendingIntegerField};
+use super::{RebuildScratch, RestoredArrayField, RestoredPendingIntegerField};
 
 #[derive(Debug, Clone)]
 enum BuilderField {
     Final(HirTableField),
     PendingInt { key: i64, value: HirExpr },
     MovedPendingInt,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingIntegerField {
+    field_index: usize,
+    shadowed_at: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -31,7 +38,7 @@ pub(super) struct ConstructorBuilder {
     fields: Vec<BuilderField>,
     pub(super) trailing_multivalue: Option<HirPackTail>,
     next_array_index: u32,
-    pending_integer_fields: BTreeMap<i64, usize>,
+    pending_integer_fields: BTreeMap<i64, PendingIntegerField>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +47,7 @@ pub(super) struct BuilderCheckpoint {
     trailing_multivalue: Option<HirPackTail>,
     next_array_index: u32,
     restored_pending_integer_fields_len: usize,
+    restored_array_fields_len: usize,
 }
 
 impl ConstructorBuilder {
@@ -89,6 +97,7 @@ impl ConstructorBuilder {
             trailing_multivalue: self.trailing_multivalue.clone(),
             next_array_index: self.next_array_index,
             restored_pending_integer_fields_len: scratch.restored_pending_integer_fields.len(),
+            restored_array_fields_len: scratch.restored_array_fields.len(),
         }
     }
 
@@ -96,8 +105,25 @@ impl ConstructorBuilder {
         self.fields.truncate(checkpoint.fields_len);
         self.trailing_multivalue = checkpoint.trailing_multivalue;
         self.next_array_index = checkpoint.next_array_index;
+        for restored in scratch.restored_array_fields[checkpoint.restored_array_fields_len..]
+            .iter()
+            .rev()
+        {
+            if restored.field_index < checkpoint.fields_len {
+                self.fields[restored.field_index] =
+                    BuilderField::Final(HirTableField::Array(restored.value.clone()));
+            }
+        }
         self.pending_integer_fields
-            .retain(|_, field_index| *field_index < checkpoint.fields_len);
+            .retain(|_, pending| pending.field_index < checkpoint.fields_len);
+        for pending in self.pending_integer_fields.values_mut() {
+            if pending
+                .shadowed_at
+                .is_some_and(|field_index| field_index >= checkpoint.fields_len)
+            {
+                pending.shadowed_at = None;
+            }
+        }
         for restored in scratch.restored_pending_integer_fields
             [checkpoint.restored_pending_integer_fields_len..]
             .iter()
@@ -108,19 +134,30 @@ impl ConstructorBuilder {
                     key: restored.key,
                     value: restored.value.clone(),
                 };
-                self.pending_integer_fields
-                    .insert(restored.key, restored.field_index);
+                self.pending_integer_fields.insert(
+                    restored.key,
+                    PendingIntegerField {
+                        field_index: restored.field_index,
+                        shadowed_at: None,
+                    },
+                );
             }
         }
         scratch
             .restored_pending_integer_fields
             .truncate(checkpoint.restored_pending_integer_fields_len);
+        scratch
+            .restored_array_fields
+            .truncate(checkpoint.restored_array_fields_len);
     }
 
     pub(super) fn commit(&mut self, checkpoint: &BuilderCheckpoint, scratch: &mut RebuildScratch) {
         scratch
             .restored_pending_integer_fields
             .truncate(checkpoint.restored_pending_integer_fields_len);
+        scratch
+            .restored_array_fields
+            .truncate(checkpoint.restored_array_fields_len);
     }
 
     pub(super) fn next_array_index(&self) -> u32 {
@@ -142,6 +179,7 @@ impl ConstructorBuilder {
         field: crate::hir::common::HirRecordField,
         policy: RecordPromotionPolicy,
     ) {
+        self.shadow_aliased_pending_integer_fields(&field.key);
         let current_next_index = i64::from(self.next_array_index);
         match field.key {
             HirTableKey::Expr(HirExpr::Integer(value))
@@ -166,7 +204,10 @@ impl ConstructorBuilder {
                         key: value,
                         value: field.value,
                     });
-                    entry.insert(field_index);
+                    entry.insert(PendingIntegerField {
+                        field_index,
+                        shadowed_at: None,
+                    });
                 } else {
                     self.fields.push(BuilderField::Final(HirTableField::Record(
                         crate::hir::common::HirRecordField {
@@ -189,10 +230,14 @@ impl ConstructorBuilder {
         &mut self,
         restored_pending_integer_fields: &mut Vec<RestoredPendingIntegerField>,
     ) {
-        while let Some(field_index) = self
+        while let Some(pending) = self
             .pending_integer_fields
             .remove(&i64::from(self.next_array_index))
         {
+            if pending.shadowed_at.is_some() {
+                continue;
+            }
+            let field_index = pending.field_index;
             let old_field =
                 std::mem::replace(&mut self.fields[field_index], BuilderField::MovedPendingInt);
             let BuilderField::PendingInt { key, value } = old_field else {
@@ -207,6 +252,102 @@ impl ConstructorBuilder {
                 .push(BuilderField::Final(HirTableField::Array(value)));
             self.next_array_index += 1;
         }
+    }
+
+    pub(super) fn demote_array_suffix(
+        &mut self,
+        start_index: u32,
+        restored_array_fields: &mut Vec<RestoredArrayField>,
+    ) -> bool {
+        if start_index == self.next_array_index {
+            return true;
+        }
+        if start_index == 0 || start_index > self.next_array_index {
+            return false;
+        }
+
+        let mut array_index = 1_u32;
+        for (field_index, field) in self.fields.iter_mut().enumerate() {
+            let BuilderField::Final(HirTableField::Array(value)) = field else {
+                continue;
+            };
+            if array_index >= start_index {
+                restored_array_fields.push(RestoredArrayField {
+                    field_index,
+                    value: value.clone(),
+                });
+                *field = BuilderField::Final(HirTableField::Record(
+                    crate::hir::common::HirRecordField {
+                        key: HirTableKey::Expr(HirExpr::Integer(i64::from(array_index))),
+                        value: value.clone(),
+                    },
+                ));
+            }
+            array_index += 1;
+        }
+        self.next_array_index = start_index;
+        true
+    }
+
+    fn shadow_aliased_pending_integer_fields(&mut self, key: &HirTableKey) {
+        let shadowed_at = self.fields.len();
+        match statically_known_numeric_key(key) {
+            Some(Some(value)) => {
+                if let Some(pending) = self.pending_integer_fields.get_mut(&value) {
+                    pending.shadowed_at.get_or_insert(shadowed_at);
+                }
+            }
+            Some(None) => {}
+            None => {
+                for pending in self.pending_integer_fields.values_mut() {
+                    pending.shadowed_at.get_or_insert(shadowed_at);
+                }
+            }
+        }
+    }
+}
+
+fn statically_known_numeric_key(key: &HirTableKey) -> Option<Option<i64>> {
+    match key {
+        HirTableKey::Name(_) => Some(None),
+        HirTableKey::Expr(HirExpr::Integer(value)) => Some(Some(*value)),
+        HirTableKey::Expr(HirExpr::Number(value)) => {
+            if value.is_finite()
+                && value.fract() == 0.0
+                && value.abs() <= ((1_u64 << f64::MANTISSA_DIGITS) as f64)
+            {
+                Some(Some(*value as i64))
+            } else {
+                None
+            }
+        }
+        HirTableKey::Expr(
+            HirExpr::Nil
+            | HirExpr::Boolean(_)
+            | HirExpr::String(_)
+            | HirExpr::Vector(_)
+            | HirExpr::Complex { .. }
+            | HirExpr::Closure(_)
+            | HirExpr::TableConstructor(_),
+        ) => Some(None),
+        HirTableKey::Expr(
+            HirExpr::Int64(_)
+            | HirExpr::UInt64(_)
+            | HirExpr::ParamRef(_)
+            | HirExpr::UpvalueRef(_)
+            | HirExpr::GlobalRef(_)
+            | HirExpr::TempRef(_)
+            | HirExpr::LocalRef(_)
+            | HirExpr::TableAccess(_)
+            | HirExpr::Unary(_)
+            | HirExpr::Binary(_)
+            | HirExpr::LogicalAnd(_)
+            | HirExpr::LogicalOr(_)
+            | HirExpr::Decision(_)
+            | HirExpr::Call(_)
+            | HirExpr::VarArg
+            | HirExpr::Unresolved(_),
+        ) => None,
     }
 }
 

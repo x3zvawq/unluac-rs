@@ -6,9 +6,8 @@
 //!
 //! 例子：
 //! - `local l0` → `Some(l0)`
-//! - 左值 `l0` 与 binding `l0` → `true`
 
-use crate::hir::common::{HirLValue, HirStmt, LocalId};
+use crate::hir::common::{HirStmt, LocalId};
 
 pub(super) fn empty_single_local_decl_binding(stmt: &HirStmt) -> Option<LocalId> {
     let HirStmt::LocalDecl(local_decl) = stmt else {
@@ -34,8 +33,4 @@ pub(super) fn initialized_single_local_decl_binding(stmt: &HirStmt) -> Option<Lo
         return None;
     }
     Some(*binding)
-}
-
-pub(super) fn matches_local_lvalue(target: &HirLValue, binding: LocalId) -> bool {
-    matches!(target, HirLValue::Local(local) if *local == binding)
 }

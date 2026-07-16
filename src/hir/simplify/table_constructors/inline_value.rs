@@ -2,15 +2,17 @@
 //!
 //! 它依赖 `bindings` 已经识别好的同一绑定和 pending producer 列表，只尝试安全内联字段/
 //! callee/access-base 值，不会在这里决定整段 region 的分段边界。
-//! 例如：`local v = f(); t.x = v` 可能在这里折叠成 `t.x = f()`。
+//! producer 只有一个消费 owner；内联同时记录其求值事件，region builder 证明事件顺序
+//! 未变后才提交。例如：`local v = f(); t.x = v` 只在 `f()` 仍位于同一事件位置时折叠。
 
 use crate::hir::common::{
     HirBinaryExpr, HirBlock, HirCallExpr, HirExpr, HirLogicalExpr, HirPackTail, HirUnaryExpr,
     HirValuePack,
 };
+use crate::hir::expr_safety::expr_requires_ordered_snapshot;
 
 use super::bindings::{BindingIndex, BindingUseSummary, binding_from_expr};
-use super::{PendingProducer, PendingProducerSource};
+use super::{ConstructorEvalEvent, PendingProducer, PendingProducerSource};
 
 pub(super) struct InlineContext<'a> {
     block: &'a HirBlock,
@@ -19,7 +21,15 @@ pub(super) struct InlineContext<'a> {
     producer_index_by_binding: &'a [Option<usize>],
     consumed_bindings: &'a mut [bool],
     consumed_groups: &'a mut [bool],
+    eval_events: &'a mut Vec<ConstructorEvalEvent>,
+    inside_producer_value: bool,
     remaining_uses: BindingUseSummary<'a>,
+}
+
+pub(super) struct InlineRewriteState<'a> {
+    pub(super) consumed_bindings: &'a mut [bool],
+    pub(super) consumed_groups: &'a mut [bool],
+    pub(super) eval_events: &'a mut Vec<ConstructorEvalEvent>,
 }
 
 impl<'a> InlineContext<'a> {
@@ -28,8 +38,7 @@ impl<'a> InlineContext<'a> {
         binding_index: &'a BindingIndex,
         pending_producers: &'a [PendingProducer],
         producer_index_by_binding: &'a [Option<usize>],
-        consumed_bindings: &'a mut [bool],
-        consumed_groups: &'a mut [bool],
+        state: InlineRewriteState<'a>,
         remaining_uses: BindingUseSummary<'a>,
     ) -> Self {
         Self {
@@ -37,8 +46,10 @@ impl<'a> InlineContext<'a> {
             binding_index,
             pending_producers,
             producer_index_by_binding,
-            consumed_bindings,
-            consumed_groups,
+            consumed_bindings: state.consumed_bindings,
+            consumed_groups: state.consumed_groups,
+            eval_events: state.eval_events,
+            inside_producer_value: false,
             remaining_uses,
         }
     }
@@ -71,7 +82,9 @@ fn inline_constructor_value_at_site(
             .and_then(|producer_index| *producer_index)
     {
         let producer = &context.pending_producers[producer_index];
-        if context.remaining_uses.contains(producer.binding_id) {
+        if context.remaining_uses.contains(producer.binding_id)
+            || context.consumed_bindings[producer.binding_id]
+        {
             return None;
         }
         let producer_value = pending_producer_value(context.block, producer)?;
@@ -91,79 +104,82 @@ fn inline_constructor_value_at_site(
         // Neutral 再递归。不然像 `trailing=t47 → call(t4)` 这类形状会因为
         // `t4` 出现在 CallCallee 位置时被 access-base 过滤掉，导致 producer
         // t4 仍然未消费，整段 region 回滚而无法折回构造器。
-        return inline_constructor_value_at_site(
+        let was_inside_producer_value = context.inside_producer_value;
+        context.inside_producer_value = true;
+        let inlined = inline_constructor_value_at_site(
             context,
             &producer_value,
             ConstructorInlineSite::Neutral,
         );
+        context.inside_producer_value = was_inside_producer_value;
+        let inlined = inlined?;
+        if expr_requires_ordered_snapshot(&producer_value) {
+            context
+                .eval_events
+                .push(ConstructorEvalEvent::Producer(producer_index));
+        }
+        return Some(inlined);
     }
 
-    match value {
-        HirExpr::Unary(unary) => {
-            return Some(HirExpr::Unary(Box::new(HirUnaryExpr {
-                op: unary.op,
-                expr: inline_constructor_value_at_site(
-                    context,
-                    &unary.expr,
-                    ConstructorInlineSite::Neutral,
-                )?,
-            })));
-        }
-        HirExpr::Binary(binary) => {
-            return Some(HirExpr::Binary(Box::new(HirBinaryExpr {
-                op: binary.op,
-                lhs: inline_constructor_value_at_site(
-                    context,
-                    &binary.lhs,
-                    ConstructorInlineSite::Neutral,
-                )?,
-                rhs: inline_constructor_value_at_site(
-                    context,
-                    &binary.rhs,
-                    ConstructorInlineSite::Neutral,
-                )?,
-            })));
-        }
+    let records_barrier = !context.inside_producer_value && expr_requires_ordered_snapshot(value);
+    let inlined = match value {
+        HirExpr::Unary(unary) => HirExpr::Unary(Box::new(HirUnaryExpr {
+            op: unary.op,
+            expr: inline_constructor_value_at_site(
+                context,
+                &unary.expr,
+                ConstructorInlineSite::Neutral,
+            )?,
+        })),
+        HirExpr::Binary(binary) => HirExpr::Binary(Box::new(HirBinaryExpr {
+            op: binary.op,
+            lhs: inline_constructor_value_at_site(
+                context,
+                &binary.lhs,
+                ConstructorInlineSite::Neutral,
+            )?,
+            rhs: inline_constructor_value_at_site(
+                context,
+                &binary.rhs,
+                ConstructorInlineSite::Neutral,
+            )?,
+        })),
         HirExpr::TableAccess(access) => {
-            return Some(HirExpr::TableAccess(Box::new(
-                crate::hir::common::HirTableAccess {
-                    base: inline_constructor_value_at_site(
-                        context,
-                        &access.base,
-                        ConstructorInlineSite::AccessBase,
-                    )?,
-                    key: inline_constructor_value_at_site(
-                        context,
-                        &access.key,
-                        ConstructorInlineSite::Neutral,
-                    )?,
-                },
-            )));
+            HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
+                base: inline_constructor_value_at_site(
+                    context,
+                    &access.base,
+                    ConstructorInlineSite::AccessBase,
+                )?,
+                key: inline_constructor_value_at_site(
+                    context,
+                    &access.key,
+                    ConstructorInlineSite::Neutral,
+                )?,
+            }))
         }
-        HirExpr::Call(call) => {
-            return Some(HirExpr::Call(Box::new(inline_constructor_call(
-                context, call,
-            )?)));
-        }
+        HirExpr::Call(call) => HirExpr::Call(Box::new(inline_constructor_call(context, call)?)),
         HirExpr::LogicalAnd(logical) => {
-            return inline_short_circuit_expr(context, logical, HirExpr::LogicalAnd);
+            inline_short_circuit_expr(context, logical, HirExpr::LogicalAnd)?
         }
         HirExpr::LogicalOr(logical) => {
-            return inline_short_circuit_expr(context, logical, HirExpr::LogicalOr);
+            inline_short_circuit_expr(context, logical, HirExpr::LogicalOr)?
         }
-        _ => {}
+        _ if expr_depends_on_any_pending_binding(
+            value,
+            context.binding_index,
+            context.pending_producers,
+            context.consumed_bindings,
+        ) =>
+        {
+            return None;
+        }
+        _ => value.clone(),
+    };
+    if records_barrier {
+        context.eval_events.push(ConstructorEvalEvent::Barrier);
     }
-
-    if expr_depends_on_any_pending_binding(
-        value,
-        context.binding_index,
-        context.pending_producers,
-        context.consumed_bindings,
-    ) {
-        None
-    } else {
-        Some(value.clone())
-    }
+    Some(inlined)
 }
 
 pub(super) fn inline_constructor_call(

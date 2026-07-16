@@ -674,6 +674,7 @@ impl<'a> ProtoLowerer<'a> {
                         &mut self.lowering,
                         raw_index,
                         state_start,
+                        2,
                         3,
                         usize::from(c),
                     );

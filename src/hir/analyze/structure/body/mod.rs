@@ -373,7 +373,20 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 return None;
             }
 
-            self.emit_required_label(block, &mut stmts);
+            // retry/terminal while-true 会在源码 loop 内再次降低 VM header。跨越
+            // nested loop 的回边必须把 label 放在那次真实 header 消费处；若这里先发，
+            // 递归 body 会产生同名 label，Lua 5.4+ 会直接拒绝生成源码。
+            let defer_label_to_retry_body = self
+                .loop_candidate_for_entry(block, suppressed_loop_id)
+                .is_some_and(|(_, candidate)| {
+                    matches!(
+                        candidate.kind_hint,
+                        LoopKindHint::Unknown | LoopKindHint::WhileTrueLike
+                    )
+                });
+            if !defer_label_to_retry_body {
+                self.emit_required_label(block, &mut stmts);
+            }
 
             if let Some(region_id) = self.lowering.structure.unstructured_region(block)
                 && !self.active_loops.last().is_some_and(|loop_context| {
@@ -415,6 +428,19 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
 
         Some(HirBlock { stmts })
+    }
+
+    pub(super) fn lower_active_loop_body_until_escape(
+        &mut self,
+        start: BlockRef,
+        candidate_id: LoopCandidateId,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<HirBlock> {
+        debug_assert_eq!(
+            self.active_loops.last().map(|context| context.candidate_id),
+            Some(candidate_id)
+        );
+        self.lower_region_with_suppressed_loop(start, None, target_overrides, Some(candidate_id))
     }
 
     pub(super) fn loop_candidate(
@@ -626,6 +652,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             LowInstr::Branch(_)
             | LowInstr::NumericForInit(_)
             | LowInstr::NumericForLoop(_)
+            | LowInstr::GenericForPrep(_)
             | LowInstr::GenericForLoop(_) => None,
             _ => None,
         }
@@ -642,6 +669,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if let Some(edge_ref) = self.required_goto_edge(block, target) {
             let mut edge_stmts = lower_edge_phi_copies_for_edge(self.lowering, edge_ref);
             apply_loop_rewrites(&mut edge_stmts, target_overrides);
+            prune_identity_assignments(&mut edge_stmts);
             edge_stmts.extend(goto_block(self.label_map[&target]).stmts);
             stmts.extend(edge_stmts);
             return Some(None);
@@ -761,13 +789,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             if self.overrides.instr_is_suppressed(instr_ref) {
                 continue;
             }
+            if matches!(instr, LowInstr::GenericForPrep(_)) {
+                return None;
+            }
             if matches!(instr, LowInstr::Close(_) | LowInstr::Tbc(_)) {
                 match self.lowering.structure.cleanup_disposition(instr_ref) {
                     CleanupDisposition::LexicalScope(_) | CleanupDisposition::Unreachable => {
                         continue;
                     }
                     CleanupDisposition::ExplicitTbc
-                    | CleanupDisposition::GenericFor(_)
                     | CleanupDisposition::LoopTbcBoundary(_)
                     | CleanupDisposition::ExplicitTbcBoundary => {}
                 }

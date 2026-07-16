@@ -43,6 +43,7 @@ impl StructuredBodyLowerer<'_, '_> {
         if short.blocks.contains(&value_leaf)
             || self.branch_candidate_for_header(value_leaf).is_some()
             || self.has_loop_header(value_leaf)
+            || self.lowering.cfg.unique_reachable_successor(value_leaf) != Some(stop)
         {
             return None;
         }
