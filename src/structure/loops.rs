@@ -370,73 +370,79 @@ pub(super) fn refine_short_circuit_repeat_candidates(
         if !matches!(
             candidate.kind_hint,
             LoopKindHint::Unknown | LoopKindHint::WhileLike | LoopKindHint::WhileTrueLike
-        ) || candidate.backedges.len() != 1
-        {
+        ) {
             continue;
         }
-        let backedge_source = cfg.edges[candidate.backedges[0].index()].from;
-        let jump_backedge = matches!(
-            cfg.terminator(&proto.instrs, backedge_source),
-            Some(LowInstr::Jump(jump))
-                if cfg.instr_to_block[jump.target.index()] == candidate.header
-        );
-
-        let matched = jump_backedge
-            .then(|| {
+        let backedge_sources = candidate
+            .backedges
+            .iter()
+            .map(|edge| cfg.edges[edge.index()].from)
+            .collect::<Vec<_>>();
+        let match_at = |backedge_target, owned_sources: Option<&[BlockRef]>| {
+            repeat_short_circuit_match(
+                proto,
+                cfg,
+                graph_facts,
+                candidate,
                 current_by_exit
-                    .get(&backedge_source)
-                    .into_iter()
-                    .flatten()
-                    .find_map(|short| {
-                        repeat_short_circuit_continue_target(
-                            proto,
-                            cfg,
-                            graph_facts,
-                            short,
-                            candidate,
-                            backedge_source,
-                        )
-                        .filter(|_| graph_facts.dominates(short.header, backedge_source))
-                        .map(|target| (target, None, None, short.header))
-                    })
-                    .or_else(|| {
-                        supplements_by_exit
-                            .get(&backedge_source)
-                            .into_iter()
-                            .flatten()
-                            .find_map(|short| {
-                                repeat_short_circuit_continue_target(
-                                    proto,
-                                    cfg,
-                                    graph_facts,
-                                    short,
-                                    candidate,
-                                    backedge_source,
-                                )
-                                .filter(|_| graph_facts.dominates(short.header, backedge_source))
-                                .map(|target| {
-                                    (
-                                        target,
-                                        Some(short.header),
-                                        Some((*short).clone()),
-                                        short.header,
-                                    )
-                                })
-                            })
-                    })
+                    .get(&backedge_target)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+                backedge_target,
+                owned_sources,
+            )
+            .map(|(target, short)| {
+                (
+                    target,
+                    owned_sources.map(|_| short.header),
+                    Option::<ShortCircuitCandidate>::None,
+                )
             })
-            .flatten()
             .or_else(|| {
-                direct_branch_repeat_continue_target(cfg, branches, candidate, backedge_source)
-                    .map(|target| (target, None, None, target))
-            });
-        let Some((continue_target, condition_header, supplement, condition_entry)) = matched else {
+                repeat_short_circuit_match(
+                    proto,
+                    cfg,
+                    graph_facts,
+                    candidate,
+                    supplements_by_exit
+                        .get(&backedge_target)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                    backedge_target,
+                    owned_sources,
+                )
+                .map(|(target, short)| (target, Some(short.header), Some(short.clone())))
+            })
+        };
+        let grouped = match_at(candidate.header, Some(&backedge_sources));
+        let single = (backedge_sources.len() == 1).then(|| {
+            let backedge_source = backedge_sources[0];
+            let jump_backedge = matches!(
+                cfg.terminator(&proto.instrs, backedge_source),
+                Some(LowInstr::Jump(jump))
+                    if cfg.instr_to_block[jump.target.index()] == candidate.header
+            );
+            jump_backedge
+                .then(|| match_at(backedge_source, None))
+                .flatten()
+                .or_else(|| {
+                    direct_branch_repeat_continue_target(cfg, branches, candidate, backedge_source)
+                        .map(|target| (target, None, None))
+                })
+        });
+        let Some((continue_target, condition_header, supplement)) =
+            grouped.or_else(|| single.flatten())
+        else {
             continue;
         };
         // repeat 的条件入口必须支配最终回边源；否则存在不经过该条件就回到 header 的
         // 路径，它只能是 while/while-true 中的提前 continue。把这种形状精化成 repeat
         // 会让 continue 错误执行原本应跳过的尾条件。
-        if !graph_facts.dominates(condition_entry, backedge_source) {
+        let condition_entry = condition_header.unwrap_or(continue_target);
+        if backedge_sources
+            .iter()
+            .any(|source| !graph_facts.dominates(condition_entry, *source))
+        {
             continue;
         }
         if let Some(supplement) = supplement {
@@ -474,6 +480,41 @@ pub(super) fn refine_short_circuit_repeat_candidates(
     *short_circuits = unique;
 }
 
+fn repeat_short_circuit_match<'a>(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    candidate: &LoopCandidate,
+    shorts: &[&'a ShortCircuitCandidate],
+    backedge_target: BlockRef,
+    owned_backedge_sources: Option<&[BlockRef]>,
+) -> Option<(BlockRef, &'a ShortCircuitCandidate)> {
+    let backedge_sources =
+        owned_backedge_sources.unwrap_or_else(|| std::slice::from_ref(&backedge_target));
+    shorts.iter().copied().find_map(|short| {
+        ((owned_backedge_sources.is_none()
+            || backedge_sources
+                .iter()
+                .all(|source| short.blocks.contains(source)))
+            && backedge_sources
+                .iter()
+                .all(|source| graph_facts.dominates(short.header, *source)))
+        .then(|| {
+            repeat_short_circuit_continue_target(
+                proto,
+                cfg,
+                graph_facts,
+                short,
+                candidate,
+                backedge_target,
+                backedge_sources,
+            )
+            .map(|target| (target, short))
+        })
+        .flatten()
+    })
+}
+
 fn short_circuits_by_exit(
     short_circuits: &[ShortCircuitCandidate],
 ) -> BTreeMap<BlockRef, Vec<&ShortCircuitCandidate>> {
@@ -493,27 +534,30 @@ fn repeat_short_circuit_continue_target(
     graph_facts: &GraphFacts,
     short: &ShortCircuitCandidate,
     candidate: &LoopCandidate,
-    backedge_source: BlockRef,
+    backedge_target: BlockRef,
+    backedge_sources: &[BlockRef],
 ) -> Option<BlockRef> {
     let ShortCircuitExit::BranchExit { truthy, falsy } = short.exit else {
         return None;
     };
-    let loop_exit = if truthy == backedge_source {
+    let loop_exit = if truthy == backedge_target {
         falsy
-    } else if falsy == backedge_source {
+    } else if falsy == backedge_target {
         truthy
     } else {
         return None;
     };
     let header_exit_rejoins_tail =
-        while_header_exit_rejoins_repeat_exit(cfg, graph_facts, candidate, loop_exit);
+        while_header_exit_rejoins_repeat_exit(proto, cfg, graph_facts, candidate, loop_exit);
     if !short.reducible
         || !candidate.blocks.contains(&short.header)
         // while true 的 header 可以同时承载本轮正文和提前 break guard。若它经一条
         // 非 cleanup 正文路径到 jump latch，不能把这条路径反推成 repeat 尾条件；
         // Close 仍可作为 goto/repeat 的词法清理 pad，由后续 scope owner 接管。
         || (short.header == candidate.header
-            && backedge_has_non_cleanup_prefix(proto, cfg, backedge_source))
+            && backedge_sources
+                .iter()
+                .any(|source| backedge_has_non_cleanup_prefix(proto, cfg, *source)))
         || (candidate.kind_hint == LoopKindHint::WhileLike && !header_exit_rejoins_tail)
         || (short.nodes.len() == 1 && candidate.exits.len() != 1 && !header_exit_rejoins_tail)
         || !short.blocks.is_subset(&candidate.blocks)
@@ -543,6 +587,7 @@ fn backedge_has_non_cleanup_prefix(proto: &LoweredProto, cfg: &Cfg, block: Block
 }
 
 fn while_header_exit_rejoins_repeat_exit(
+    proto: &LoweredProto,
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     candidate: &LoopCandidate,
@@ -563,9 +608,14 @@ fn while_header_exit_rejoins_repeat_exit(
     };
 
     header_exits.next().is_none()
-        && header_exit != repeat_exit
         && candidate.exits.contains(&header_exit)
-        && graph_facts.post_dominates(repeat_exit, header_exit)
+        && ((candidate.backedges.len() > 1
+            && (header_exit == repeat_exit
+                || matches!(
+                    cfg.terminator(&proto.instrs, header_exit),
+                    Some(LowInstr::Return(_) | LowInstr::TailCall(_))
+                )))
+            || (header_exit != repeat_exit && graph_facts.post_dominates(repeat_exit, header_exit)))
 }
 
 fn direct_branch_repeat_continue_target(

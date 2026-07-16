@@ -8,7 +8,10 @@
 //! 输出形状：SCC membership 与直接 owner 分开；其中可规约 header 仍归 `Branch/Loop`，
 //! 其余成员归 `Unstructured`，每条 CFG edge 同时得到唯一 owner。
 
-use std::{cmp::Reverse, collections::BTreeMap};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use super::{
     BlockRef, BranchCandidate, BranchValueMergeCandidate, Cfg, EdgeKind, GotoRequirement,
@@ -368,7 +371,7 @@ fn build_unstructured_region_layout(
                 break;
             }
             if !matches!(plan.block_owners[block.index()], BlockOwner::Linear)
-                || !unstructured_exit_pad_prefix_is_cleanup(plan, proto, cfg, block)
+                || !unstructured_exit_pad_is_owned(plan, proto, cfg, &blocks, block)
             {
                 return None;
             }
@@ -383,12 +386,20 @@ fn build_unstructured_region_layout(
     })
 }
 
-fn unstructured_exit_pad_prefix_is_cleanup(
+fn unstructured_exit_pad_is_owned(
     plan: &StructurePlan,
     proto: &LoweredProto,
     cfg: &Cfg,
+    blocks: &BTreeSet<BlockRef>,
     block: BlockRef,
 ) -> bool {
+    if cfg.preds[block.index()].iter().any(|edge_ref| {
+        let predecessor = cfg.edges[edge_ref.index()].from;
+        cfg.reachable_blocks.contains(&predecessor) && !blocks.contains(&predecessor)
+    }) {
+        return false;
+    }
+
     let range = cfg.blocks[block.index()].instrs;
     let end = range.last().map_or(range.end(), |last| {
         if proto.instrs[last.index()].is_control_terminator() {
@@ -397,23 +408,12 @@ fn unstructured_exit_pad_prefix_is_cleanup(
             range.end()
         }
     });
-    (range.start.index()..end).all(|index| {
-        let disposition = plan.cleanup_dispositions[index];
-        match proto.instrs[index] {
-            LowInstr::Close(_) => matches!(
-                disposition,
-                Some(
-                    CleanupDisposition::LexicalScope(_)
-                        | CleanupDisposition::Unreachable
-                        | CleanupDisposition::ExplicitTbcBoundary
-                )
-            ),
-            LowInstr::Tbc(_) => matches!(
-                disposition,
-                Some(CleanupDisposition::LexicalScope(_) | CleanupDisposition::Unreachable)
-            ),
-            _ => false,
-        }
+    (range.start.index()..end).all(|index| match proto.instrs[index] {
+        LowInstr::Close(_) | LowInstr::Tbc(_) => !matches!(
+            plan.cleanup_dispositions[index],
+            Some(CleanupDisposition::GenericFor(_))
+        ),
+        _ => true,
     })
 }
 

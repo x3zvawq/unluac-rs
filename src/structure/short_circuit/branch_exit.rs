@@ -38,10 +38,26 @@ pub(super) fn analyze_guard_branch_exit_dag_candidates(
     let mut best_by_header = BTreeMap::<BlockRef, ShortCircuitCandidate>::new();
 
     for root in branch_candidates {
-        let Some(candidate) =
-            GuardBranchExitDagBuilder::new(proto, cfg, graph_facts, branch_by_header, root.header)
-                .build()
-        else {
+        let Some(candidate) = GuardBranchExitDagBuilder::new(
+            proto,
+            cfg,
+            graph_facts,
+            branch_by_header,
+            root.header,
+            true,
+        )
+        .build()
+        .or_else(|| {
+            GuardBranchExitDagBuilder::new(
+                proto,
+                cfg,
+                graph_facts,
+                branch_by_header,
+                root.header,
+                false,
+            )
+            .build()
+        }) else {
             continue;
         };
 
@@ -267,6 +283,8 @@ struct GuardBranchExitDagBuilder<'a> {
     dom_tree: &'a crate::structure::DominatorTree,
     post_dom_tree: &'a PostDominatorTree,
     root: BlockRef,
+    allow_shared_headers: bool,
+    included_shared_header: bool,
     nodes: Vec<GuardExitTempNode>,
     node_by_header: BTreeMap<BlockRef, ShortCircuitNodeRef>,
     visiting: BTreeSet<BlockRef>,
@@ -281,6 +299,7 @@ impl<'a> GuardBranchExitDagBuilder<'a> {
         graph_facts: &'a GraphFacts,
         branch_by_header: &'a BTreeMap<BlockRef, &'a BranchCandidate>,
         root: BlockRef,
+        allow_shared_headers: bool,
     ) -> Self {
         Self {
             proto,
@@ -289,6 +308,8 @@ impl<'a> GuardBranchExitDagBuilder<'a> {
             dom_tree: &graph_facts.dominator_tree,
             post_dom_tree: &graph_facts.post_dominator_tree,
             root,
+            allow_shared_headers,
+            included_shared_header: false,
             nodes: Vec::new(),
             node_by_header: BTreeMap::new(),
             visiting: BTreeSet::new(),
@@ -302,6 +323,14 @@ impl<'a> GuardBranchExitDagBuilder<'a> {
 
         let entry = self.build_node(self.root)?;
         if entry != ShortCircuitNodeRef(0) || self.nodes.len() < 2 || self.exits.len() != 2 {
+            return None;
+        }
+        if self.included_shared_header
+            && !self
+                .exits
+                .iter()
+                .any(|exit| *exit != self.root && self.dom_tree.dominates(*exit, self.root))
+        {
             return None;
         }
 
@@ -330,6 +359,11 @@ impl<'a> GuardBranchExitDagBuilder<'a> {
         }
 
         let reducible = is_reducible_candidate(self.cfg, self.root, &self.blocks);
+        // 共享节点的前驱数不能替代区域入口校验；扩展后的 DAG 必须仍由 root
+        // 单入口控制。普通保守候选继续保留 reducible 事实交给既有消费者判断。
+        if self.included_shared_header && !reducible {
+            return None;
+        }
         Some(ShortCircuitCandidate {
             header: self.root,
             blocks: self.blocks,
@@ -385,7 +419,17 @@ impl<'a> GuardBranchExitDagBuilder<'a> {
 
     fn resolve_target(&mut self, target: BlockRef) -> Option<GuardExitTempTarget> {
         let original_target = target;
-        if target != self.root && self.cfg.preds[target.index()].len() > 1 {
+        if !self.allow_shared_headers
+            && target != self.root
+            && self.cfg.preds[target.index()].len() > 1
+        {
+            self.exits.insert(target);
+            return Some(GuardExitTempTarget::Exit(target));
+        }
+        // 回到候选 root 的严格支配祖先表示条件已经离开无环 DAG（典型是 repeat
+        // 回到 loop header），它是语义出口而不是后续条件节点。共享 descendant 则可有
+        // 多个前驱，不能在这里按前驱数一并截断。
+        if target != self.root && self.dom_tree.dominates(target, self.root) {
             self.exits.insert(target);
             return Some(GuardExitTempTarget::Exit(target));
         }
@@ -414,11 +458,16 @@ impl<'a> GuardBranchExitDagBuilder<'a> {
                 return None;
             }
         };
-        if target != self.root && self.cfg.preds[target.index()].len() > 1 {
+        if !self.allow_shared_headers
+            && target != self.root
+            && self.cfg.preds[target.index()].len() > 1
+        {
             self.exits.insert(target);
             return Some(GuardExitTempTarget::Exit(target));
         }
         if self.should_include_header(target) {
+            self.included_shared_header |=
+                target != self.root && self.cfg.preds[target.index()].len() > 1;
             Some(GuardExitTempTarget::Node(self.build_node(target)?))
         } else {
             self.exits.insert(target);

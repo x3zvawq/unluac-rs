@@ -9,8 +9,10 @@ use std::ops::Bound::{Excluded, Unbounded};
 
 use crate::ast::{DecompileDialect, is_lua_identifier_name};
 use crate::hir::common::{
-    HirCallExpr, HirDecisionTarget, HirExpr, HirLValue, HirStmt, HirTableField, HirTableKey,
+    HirCallExpr, HirCaptureMode, HirDecisionTarget, HirExpr, HirLValue, HirStmt, HirTableField,
+    HirTableKey,
 };
+use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::{BindingId, TableBinding};
 use crate::hir::simplify::visit::{HirVisitor, visit_block, visit_stmts};
@@ -54,6 +56,19 @@ pub(super) fn collect_materialized_binding_counts(
     let mut collector = MaterializedBindingCollector::default();
     visit_block(block, &mut collector);
     collector.counts
+}
+
+pub(super) fn collect_reference_captured_bindings(
+    block: &crate::hir::common::HirBlock,
+    promotion_facts: &ProtoPromotionFacts,
+) -> (BTreeSet<TableBinding>, BTreeSet<HomeSlotKey>) {
+    let mut collector = ReferenceCaptureCollector {
+        promotion_facts,
+        bindings: BTreeSet::new(),
+        home_slots: BTreeSet::new(),
+    };
+    visit_block(block, &mut collector);
+    (collector.bindings, collector.home_slots)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -176,13 +191,34 @@ pub(super) fn collect_stmt_slice_binding_summary(
 pub(super) struct BindingOccurrenceIndex {
     uses: Vec<BTreeSet<usize>>,
     mentions: Vec<BTreeSet<usize>>,
+    sticky_uses: Vec<bool>,
 }
 
 impl BindingOccurrenceIndex {
-    pub(super) fn new(binding_count: usize, stmts: &[StmtBindingSummary]) -> Self {
+    pub(super) fn new(
+        binding_index: &BindingIndex,
+        stmts: &[StmtBindingSummary],
+        reference_captured_bindings: &BTreeSet<TableBinding>,
+        reference_captured_home_slots: &BTreeSet<HomeSlotKey>,
+        promotion_facts: &ProtoPromotionFacts,
+    ) -> Self {
         let mut index = Self {
-            uses: vec![BTreeSet::new(); binding_count],
-            mentions: vec![BTreeSet::new(); binding_count],
+            uses: vec![BTreeSet::new(); binding_index.len()],
+            mentions: vec![BTreeSet::new(); binding_index.len()],
+            sticky_uses: binding_index
+                .bindings
+                .iter()
+                .map(|binding| {
+                    reference_captured_bindings.contains(binding)
+                        || matches!(
+                            binding,
+                            TableBinding::Temp(temp)
+                                if promotion_facts.home_slot(*temp).is_some_and(
+                                    |slot| reference_captured_home_slots.contains(&slot)
+                                )
+                        )
+                })
+                .collect(),
         };
         for (stmt_id, summary) in stmts.iter().enumerate() {
             for binding_id in summary.uses() {
@@ -229,12 +265,44 @@ pub(super) struct BindingUseSummary<'a> {
 
 impl BindingUseSummary<'_> {
     pub(super) fn contains(self, binding_id: BindingId) -> bool {
-        self.index.uses.get(binding_id).is_some_and(|occurrences| {
-            occurrences
-                .range((Excluded(self.after_stmt), Unbounded))
-                .next()
-                .is_some()
-        })
+        self.index
+            .sticky_uses
+            .get(binding_id)
+            .copied()
+            .unwrap_or_default()
+            || self.index.uses.get(binding_id).is_some_and(|occurrences| {
+                occurrences
+                    .range((Excluded(self.after_stmt), Unbounded))
+                    .next()
+                    .is_some()
+            })
+    }
+}
+
+struct ReferenceCaptureCollector<'a> {
+    promotion_facts: &'a ProtoPromotionFacts,
+    bindings: BTreeSet<TableBinding>,
+    home_slots: BTreeSet<HomeSlotKey>,
+}
+
+impl HirVisitor for ReferenceCaptureCollector<'_> {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        let HirExpr::Closure(closure) = expr else {
+            return;
+        };
+        for binding in closure
+            .captures
+            .iter()
+            .filter(|capture| capture.mode == HirCaptureMode::ByReference)
+            .filter_map(|capture| binding_from_expr(&capture.value))
+        {
+            self.bindings.insert(binding);
+            if let TableBinding::Temp(temp) = binding
+                && let Some(slot) = self.promotion_facts.home_slot(temp)
+            {
+                self.home_slots.insert(slot);
+            }
+        }
     }
 }
 

@@ -18,24 +18,32 @@ pub(crate) fn expr_for_reg_use(
     expr_for_ssa_value(lowering, lowering.dataflow.use_value(instr_ref, reg))
 }
 
-pub(crate) fn expr_for_closure_capture(
+pub(crate) fn lower_closure_capture(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,
     instr_ref: InstrRef,
     dst: Reg,
     source: crate::transformer::CaptureSource,
-) -> HirExpr {
-    match source {
-        crate::transformer::CaptureSource::Reg(reg) if reg == dst => {
-            let self_temp = lowering.bindings.instr_fixed_defs[instr_ref.index()]
-                .first()
-                .copied()
-                .expect("closure writes exactly one fixed target");
-            lowering.bindings.expr_for_temp(self_temp)
-        }
-        crate::transformer::CaptureSource::Reg(reg) => {
+) -> HirCapture {
+    let (mode, value) = match source {
+        crate::transformer::CaptureSource::ByValue(reg) if reg == dst => (
+            HirCaptureMode::ByValue,
+            closure_result_expr(lowering, instr_ref),
+        ),
+        crate::transformer::CaptureSource::ByValue(reg) => (
+            HirCaptureMode::ByValue,
+            expr_for_reg_use(lowering, block, instr_ref, reg),
+        ),
+        crate::transformer::CaptureSource::ByReference(reg) if reg == dst => (
+            HirCaptureMode::ByReference,
+            closure_result_expr(lowering, instr_ref),
+        ),
+        crate::transformer::CaptureSource::ByReference(reg) => {
             if let Some(target) = lowering.bindings.closure_capture_target(instr_ref, reg) {
-                return target.expr();
+                return HirCapture {
+                    mode: HirCaptureMode::ByReference,
+                    value: target.expr(),
+                };
             }
             // 先尝试正常的 SSA use-def 解析
             let expr = expr_for_reg_use(lowering, block, instr_ref, reg);
@@ -56,14 +64,27 @@ pub(crate) fn expr_for_closure_capture(
             if should_forward
                 && let Some(forward_expr) = forward_def_in_block(lowering, block, instr_ref, reg)
             {
-                return forward_expr;
+                return HirCapture {
+                    mode: HirCaptureMode::ByReference,
+                    value: forward_expr,
+                };
             }
-            expr
+            (HirCaptureMode::ByReference, expr)
         }
-        crate::transformer::CaptureSource::Upvalue(upvalue) => {
-            HirExpr::UpvalueRef(UpvalueId(upvalue.index()))
-        }
-    }
+        crate::transformer::CaptureSource::Upvalue(upvalue) => (
+            HirCaptureMode::ByReference,
+            HirExpr::UpvalueRef(UpvalueId(upvalue.index())),
+        ),
+    };
+    HirCapture { mode, value }
+}
+
+fn closure_result_expr(lowering: &ProtoLowering<'_>, instr_ref: InstrRef) -> HirExpr {
+    let self_temp = lowering.bindings.instr_fixed_defs[instr_ref.index()]
+        .first()
+        .copied()
+        .expect("closure writes exactly one fixed target");
+    lowering.bindings.expr_for_temp(self_temp)
 }
 
 fn reg_use_is_entry_empty(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, reg: Reg) -> bool {

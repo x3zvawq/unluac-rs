@@ -197,6 +197,27 @@ impl DataflowFacts {
             && self.phi_use_blocks.get(phi_id.index()).copied().flatten() == Some(block)
     }
 
+    /// SSA 值是否只被指定指令直接读取，且没有继续流入其他 phi。
+    pub(crate) fn value_used_only_by(&self, value: SsaValue, instr: InstrRef, reg: Reg) -> bool {
+        let is_only_site =
+            |uses: &[UseSite]| matches!(uses, [site] if site.instr == instr && site.reg == reg);
+        match value {
+            SsaValue::Def(def) => {
+                self.def_uses
+                    .get(def.index())
+                    .is_some_and(|uses| is_only_site(uses))
+                    && self.def_phi_uses.get(def.index()).is_none_or(Vec::is_empty)
+            }
+            SsaValue::Phi(phi) => {
+                self.phi_uses
+                    .get(phi.index())
+                    .is_some_and(|uses| is_only_site(uses))
+                    && self.phi_phi_uses.get(phi.index()).is_none_or(Vec::is_empty)
+            }
+            SsaValue::Entry(_) => false,
+        }
+    }
+
     /// 计算"真正死亡"的 phi 集合——既没有任何指令直接读取，也没有被任何存活 phi
     /// 的 incoming 间接引用。返回的 `BTreeSet<PhiId>` 中的 phi 可以安全地跳过物化。
     pub fn compute_truly_dead_phis(&self) -> BTreeSet<PhiId> {

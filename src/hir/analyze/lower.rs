@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::super::promotion::ProtoPromotionFacts;
+use super::super::promotion::{ProtoPromotionFacts, SlotEpochFacts};
 use super::bindings::build_bindings;
 use super::exprs::{expr_for_reg_at_block_exit, expr_for_ssa_value};
 use super::helpers::{assign_stmt, decode_raw_string, empty_proto, unresolved_expr};
@@ -194,7 +194,15 @@ fn lower_proto_node(
         .map(|child| child.mutable_upvalues)
         .collect::<Vec<_>>();
 
-    let bindings = build_bindings(proto, cfg, dataflow, structure, &child_mutable_upvalues);
+    let slot_epochs = SlotEpochFacts::analyze(proto, cfg, graph_facts, dataflow);
+    let bindings = build_bindings(
+        proto,
+        cfg,
+        dataflow,
+        structure,
+        &slot_epochs,
+        &child_mutable_upvalues,
+    );
     let open_pack_owners = build_open_pack_owners(proto, cfg, dataflow);
     let mut owned_open_producers = vec![false; proto.instrs.len()];
     for def in &dataflow.open_defs {
@@ -231,7 +239,8 @@ fn lower_proto_node(
         body: build_proto_body(target, &lowering),
         children: child_refs,
     };
-    artifacts.promotion_facts[id.index()] = ProtoPromotionFacts::from_dataflow(proto, dataflow);
+    artifacts.promotion_facts[id.index()] =
+        ProtoPromotionFacts::from_dataflow(dataflow, &slot_epochs);
 
     LoweredProtoResult {
         id,
@@ -397,7 +406,7 @@ fn open_pack_bridge_is_method_setup(
         && method.dst == call.callee
         && receiver.dst == self_arg
         && receiver.src == base
-        && producer_start.index() == self_arg.index() + 1
+        && producer_start.index() > self_arg.index()
 }
 
 fn open_pack_bridge_is_import_setup(

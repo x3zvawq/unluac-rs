@@ -731,7 +731,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     }
             })
             .filter_map(|short| {
-                let mut plan = build_branch_short_circuit_plan(self.lowering, short.header)?;
+                let mut plan = build_branch_short_circuit_plan_for_candidate(self.lowering, short)?;
                 let body_stop = plan.consumed_headers.first().copied()?;
                 (plan.consumed_headers.len() > 1
                     && ((plan.truthy == loop_backedge_target && plan.falsy == exit)

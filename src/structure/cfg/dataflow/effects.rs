@@ -76,6 +76,9 @@ pub(super) fn compute_instr_effect(instr: &LowInstr) -> InstrEffect {
         LowInstr::ErrNil(instr) => {
             effect.fixed_uses.insert(instr.subject);
         }
+        LowInstr::TypeGuard(instr) => {
+            effect.fixed_uses.insert(instr.subject);
+        }
         LowInstr::NewTable(instr) => {
             effect.fixed_must_defs.insert(instr.dst);
         }
@@ -107,8 +110,11 @@ pub(super) fn compute_instr_effect(instr: &LowInstr) -> InstrEffect {
         LowInstr::Closure(instr) => {
             effect.fixed_must_defs.insert(instr.dst);
             for capture in &instr.captures {
-                if let CaptureSource::Reg(reg) = capture.source {
-                    effect.fixed_uses.insert(reg);
+                match capture.source {
+                    CaptureSource::ByValue(reg) | CaptureSource::ByReference(reg) => {
+                        effect.fixed_uses.insert(reg);
+                    }
+                    CaptureSource::Upvalue(_) => {}
                 }
             }
         }
@@ -202,6 +208,9 @@ pub(super) fn compute_side_effect_summary(instr: &LowInstr) -> SideEffectSummary
             }
         }
         LowInstr::ErrNil(_instr) => {}
+        LowInstr::TypeGuard(_instr) => {
+            tags.insert(EffectTag::Call);
+        }
         LowInstr::NewTable(_instr) => {
             tags.insert(EffectTag::Alloc);
         }

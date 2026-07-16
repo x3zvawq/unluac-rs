@@ -20,6 +20,7 @@ use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto, Reg};
 use super::ProtoBindings;
 use super::helpers::decode_raw_string;
 use super::lower::BoundSlotTarget;
+use crate::hir::promotion::SlotEpochFacts;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 struct CapturedSlotKey {
@@ -38,6 +39,7 @@ pub(super) fn build_bindings(
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     structure: &StructureFacts,
+    captured_slot_epochs: &SlotEpochFacts,
     child_mutable_upvalues: &[Vec<bool>],
 ) -> ProtoBindings {
     let params = (0..usize::from(proto.signature.num_params))
@@ -79,7 +81,7 @@ pub(super) fn build_bindings(
     let captured_slots = collect_captured_slot_targets(
         proto,
         dataflow,
-        &params,
+        captured_slot_epochs,
         &mut entry_local_regs,
         &mut locals,
         &mut local_debug_hints,
@@ -154,6 +156,7 @@ pub(super) fn build_bindings(
         &fixed_temps,
         &phi_temps,
         &captured_slots,
+        captured_slot_epochs,
     );
 
     let instr_fixed_defs = dataflow
@@ -229,10 +232,19 @@ struct CapturedSlotBinding {
     start_instr: usize,
 }
 
+struct CapturedSlotUse {
+    instr_index: usize,
+    reg: Reg,
+    key: CapturedSlotKey,
+    start_instr: usize,
+    requires_local: bool,
+    entry_local_safe: bool,
+}
+
 fn collect_captured_slot_targets(
     proto: &LoweredProto,
     dataflow: &DataflowFacts,
-    params: &[ParamId],
+    epochs: &SlotEpochFacts,
     entry_local_regs: &mut BTreeMap<Reg, LocalId>,
     locals: &mut Vec<LocalId>,
     local_debug_hints: &mut Vec<Option<String>>,
@@ -240,86 +252,81 @@ fn collect_captured_slot_targets(
 ) -> CapturedSlotTargets {
     let mut slot_targets = BTreeMap::<CapturedSlotKey, CapturedSlotBinding>::new();
     let mut capture_targets = BTreeMap::new();
-    let mut epochs = vec![0usize; usize::from(proto.frame.max_stack_size).saturating_add(1)];
-    let lowest_closed_slot = proto
-        .instrs
-        .iter()
-        .filter_map(|instr| {
-            let LowInstr::Close(close) = instr else {
-                return None;
-            };
-            Some(close.from.index())
-        })
-        .min();
+    let mut captured_uses = Vec::new();
 
     for (instr_index, instr) in proto.instrs.iter().enumerate() {
-        if let LowInstr::Closure(closure) = instr {
-            for (capture_index, capture) in closure.captures.iter().enumerate() {
-                let CaptureSource::Reg(reg) = capture.source else {
-                    continue;
-                };
-                let child_writes = child_mutable_upvalues
-                    .get(closure.proto.index())
-                    .and_then(|mutable| mutable.get(capture_index))
-                    .copied()
-                    .unwrap_or(false);
-                let entry_local_safe = lowest_closed_slot.is_none_or(|from| reg.index() < from);
-                let has_no_reaching_value =
-                    capture_has_no_reaching_value(dataflow, InstrRef(instr_index), reg);
-                if reg == closure.dst {
-                    continue;
-                }
-                if reg.index() < params.len()
-                    || entry_local_regs.contains_key(&reg)
-                    || (!child_writes && !has_no_reaching_value)
-                {
-                    continue;
-                }
-
-                ensure_epoch_slot(&mut epochs, reg);
-                let key = CapturedSlotKey::new(reg.index(), epochs[reg.index()]);
-                let start_instr = captured_slot_start_instr(
-                    dataflow,
-                    InstrRef(instr_index),
-                    reg,
-                    has_no_reaching_value,
-                );
-                let target = if let Some(binding) = slot_targets.get_mut(&key) {
-                    binding.start_instr = binding.start_instr.min(start_instr);
-                    binding.target
-                } else {
-                    let local = LocalId(locals.len());
-                    locals.push(local);
-                    local_debug_hints.push(debug_local_name_for_reg_at_instr(
-                        proto,
-                        reg,
-                        InstrRef(instr_index),
-                    ));
-                    let target = BoundSlotTarget::Local(local);
-                    slot_targets.insert(
-                        key,
-                        CapturedSlotBinding {
-                            target,
-                            start_instr,
-                        },
-                    );
-                    target
-                };
-                capture_targets.insert((instr_index, reg.index()), target);
-                // Close 只禁止把同一物理寄存器提升成函数级 entry local；当前 epoch 内，
-                // child 可写 capture 仍必须有唯一 local，后续 def 才会写回同一个 upvalue。
-                if entry_local_safe && (child_writes || has_no_reaching_value) {
-                    let BoundSlotTarget::Local(local) = target;
-                    entry_local_regs.entry(reg).or_insert(local);
-                }
+        let LowInstr::Closure(closure) = instr else {
+            continue;
+        };
+        for (capture_index, capture) in closure.captures.iter().enumerate() {
+            let CaptureSource::ByReference(reg) = capture.source else {
+                continue;
+            };
+            if reg == closure.dst
+                || reg.index() < usize::from(proto.signature.num_params)
+                || entry_local_regs.contains_key(&reg)
+            {
+                continue;
             }
+            let child_writes = child_mutable_upvalues
+                .get(closure.proto.index())
+                .and_then(|mutable| mutable.get(capture_index))
+                .copied()
+                .unwrap_or(false);
+            let has_no_reaching_value =
+                capture_has_no_reaching_value(dataflow, InstrRef(instr_index), reg);
+            let start_instr = captured_slot_start_instr(
+                dataflow,
+                InstrRef(instr_index),
+                reg,
+                has_no_reaching_value,
+            );
+            captured_uses.push(CapturedSlotUse {
+                instr_index,
+                reg,
+                key: CapturedSlotKey::new(reg.index(), epochs.epoch_at(reg, InstrRef(start_instr))),
+                start_instr,
+                requires_local: child_writes || has_no_reaching_value,
+                entry_local_safe: epochs.spans_entry(reg),
+            });
         }
+    }
 
-        if let LowInstr::Close(close) = instr {
-            ensure_epoch_slot(&mut epochs, close.from);
-            for epoch in epochs.iter_mut().skip(close.from.index()) {
-                *epoch += 1;
-            }
+    for captured in captured_uses
+        .iter()
+        .filter(|captured| captured.requires_local)
+    {
+        let target = if let Some(binding) = slot_targets.get_mut(&captured.key) {
+            binding.start_instr = binding.start_instr.min(captured.start_instr);
+            binding.target
+        } else {
+            let local = LocalId(locals.len());
+            locals.push(local);
+            local_debug_hints.push(debug_local_name_for_reg_at_instr(
+                proto,
+                captured.reg,
+                InstrRef(captured.instr_index),
+            ));
+            let target = BoundSlotTarget::Local(local);
+            slot_targets.insert(
+                captured.key,
+                CapturedSlotBinding {
+                    target,
+                    start_instr: captured.start_instr,
+                },
+            );
+            target
+        };
+        if captured.entry_local_safe {
+            let BoundSlotTarget::Local(local) = target;
+            entry_local_regs.entry(captured.reg).or_insert(local);
+        }
+    }
+
+    for captured in captured_uses {
+        if let Some(binding) = slot_targets.get_mut(&captured.key) {
+            binding.start_instr = binding.start_instr.min(captured.start_instr);
+            capture_targets.insert((captured.instr_index, captured.reg.index()), binding.target);
         }
     }
 
@@ -367,6 +374,7 @@ fn collect_captured_temp_facts(
     fixed_temps: &[TempId],
     phi_temps: &[TempId],
     captured_slots: &CapturedSlotTargets,
+    epochs: &SlotEpochFacts,
 ) -> CapturedTempFacts {
     if captured_slots.slot_targets.is_empty() {
         return CapturedTempFacts {
@@ -394,15 +402,14 @@ fn collect_captured_temp_facts(
         phis_by_instr[instrs.start.index()].push((phi.id, phi.reg));
     }
 
-    let mut epochs = vec![0usize; usize::from(proto.frame.max_stack_size).saturating_add(1)];
     for (instr_index, instr) in proto.instrs.iter().enumerate() {
         if let LowInstr::Closure(closure) = instr {
             for capture in &closure.captures {
-                let CaptureSource::Reg(reg) = capture.source else {
+                let CaptureSource::ByReference(reg) = capture.source else {
                     continue;
                 };
                 let Some(BoundSlotTarget::Local(local)) =
-                    target_for_slot(reg, instr_index, &mut epochs, captured_slots)
+                    target_for_slot(reg, instr_index, epochs, captured_slots)
                 else {
                     continue;
                 };
@@ -413,7 +420,7 @@ fn collect_captured_temp_facts(
         }
 
         for (phi_id, reg) in phis_by_instr[instr_index].iter().copied() {
-            if let Some(target) = target_for_slot(reg, instr_index, &mut epochs, captured_slots)
+            if let Some(target) = target_for_slot(reg, instr_index, epochs, captured_slots)
                 && let Some(temp) = phi_temps.get(phi_id.index()).copied()
             {
                 targets.insert(temp, target);
@@ -421,7 +428,7 @@ fn collect_captured_temp_facts(
         }
 
         for (def_id, reg) in defs_by_instr[instr_index].iter().copied() {
-            if let Some(target) = target_for_slot(reg, instr_index, &mut epochs, captured_slots)
+            if let Some(target) = target_for_slot(reg, instr_index, epochs, captured_slots)
                 && let Some(temp) = fixed_temps.get(def_id.index()).copied()
             {
                 targets.insert(temp, target);
@@ -429,13 +436,6 @@ fn collect_captured_temp_facts(
                 if declared_locals.insert(local) {
                     decl_temps.insert(temp, local);
                 }
-            }
-        }
-
-        if let LowInstr::Close(close) = instr {
-            ensure_epoch_slot(&mut epochs, close.from);
-            for epoch in epochs.iter_mut().skip(close.from.index()) {
-                *epoch += 1;
             }
         }
     }
@@ -450,21 +450,17 @@ fn collect_captured_temp_facts(
 fn target_for_slot(
     reg: Reg,
     instr_index: usize,
-    epochs: &mut Vec<usize>,
+    epochs: &SlotEpochFacts,
     captured_slots: &CapturedSlotTargets,
 ) -> Option<BoundSlotTarget> {
-    ensure_epoch_slot(epochs, reg);
     captured_slots
         .slot_targets
-        .get(&CapturedSlotKey::new(reg.index(), epochs[reg.index()]))
+        .get(&CapturedSlotKey::new(
+            reg.index(),
+            epochs.epoch_at(reg, InstrRef(instr_index)),
+        ))
         .filter(|binding| instr_index >= binding.start_instr)
         .map(|binding| binding.target)
-}
-
-fn ensure_epoch_slot(epochs: &mut Vec<usize>, reg: Reg) {
-    if reg.index() >= epochs.len() {
-        epochs.resize(reg.index() + 1, 0);
-    }
 }
 
 fn debug_local_name_for_reg_at_instr(

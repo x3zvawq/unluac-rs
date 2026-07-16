@@ -5,9 +5,10 @@
 //! `callee_temp = f; arg_temp = expr; callee_temp(arg_temp)` 这种 bytecode 为保持 Lua
 //! “先求 callee、再求参数”而拆出的形状；融合时必须把 callee 和参数一起放回同一条
 //! call，不能只把 callee 延后到参数求值之后。
-//! 相邻内联以可观察事件前缀而非语法子节点顺序判定：纯 local/param 读取不是屏障，
-//! lookup、调用、运算和 method sugar 的隐式 lookup 是屏障；while/repeat 条件还属于
-//! 每轮重新求值的独立区域，不能接收循环外快照。
+//! 相邻内联以可观察事件前缀而非语法子节点顺序判定：纯 local/param 读取本身不是
+//! 屏障，但读取结果形成的 temp 快照不能越过可能改写 binding 的事件；lookup、调用、
+//! 运算和 method sugar 的隐式 lookup 是屏障。while/repeat 条件还属于每轮重新求值的
+//! 独立区域，不能接收循环外快照。
 
 mod mentioned;
 mod rewrite;
@@ -21,7 +22,7 @@ use crate::hir::common::{
     HirBlock, HirCallExpr, HirExpr, HirLValue, HirPackTail, HirProto, HirStmt, HirTableField,
     HirTableKey, HirValuePack, TempId,
 };
-use crate::hir::expr_safety::expr_observes_eval_order;
+use crate::hir::expr_safety::{expr_observes_eval_order, expr_requires_ordered_snapshot};
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use self::mentioned::NestedTempProtection;
@@ -187,7 +188,7 @@ fn inline_crosses_evaluation_boundary(
 ) -> bool {
     fixed_return_tail_call_prefers_materialization(site, value, next_stmt, temp)
         || (site == InlineSite::LoopCondition && !is_stable_inline_value(value))
-        || (expr_observes_eval_order(value)
+        || (expr_requires_ordered_snapshot(value)
             && !temp_precedes_observable_eval_in_stmt(next_stmt, temp))
 }
 

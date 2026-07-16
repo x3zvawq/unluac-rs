@@ -45,14 +45,14 @@ pub(crate) fn expr_for_fixed_def(lowering: &ProtoLowering<'_>, def_id: DefId) ->
                 captures: closure
                     .captures
                     .iter()
-                    .map(|capture| HirCapture {
-                        value: expr_for_closure_capture(
+                    .map(|capture| {
+                        lower_closure_capture(
                             lowering,
                             def_block,
                             def_instr,
                             closure.dst,
                             capture.source,
-                        ),
+                        )
                     })
                     .collect(),
             })))

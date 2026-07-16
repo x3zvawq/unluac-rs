@@ -11,18 +11,18 @@
 use std::collections::BTreeMap;
 
 use super::exprs::{
-    expr_for_closure_capture, expr_for_const, expr_for_reg_use, expr_for_value_operand,
-    global_name_for_access, lower_binary_op, lower_branch_cond, lower_method_name,
+    expr_for_const, expr_for_reg_use, expr_for_value_operand, global_name_for_access,
+    lower_binary_op, lower_branch_cond, lower_closure_capture, lower_method_name,
     lower_table_access_expr, lower_table_access_target, lower_unary_op, lower_upvalue_operand_expr,
     lower_upvalue_operand_target, lower_value_pack,
 };
 use super::helpers::{
     assign_stmt, binary_expr, branch_stmt, concat_expr, decode_raw_string, goto_block,
-    label_for_block, return_stmt,
+    label_for_block, return_stmt, unresolved_expr,
 };
 use super::lower::ProtoLowering;
 use crate::hir::common::{
-    HirCallExpr, HirCallStmt, HirCapture, HirClose, HirClosureExpr, HirExpr, HirLValue, HirLabelId,
+    HirCallExpr, HirCallStmt, HirClose, HirClosureExpr, HirExpr, HirLValue, HirLabelId,
     HirLocalDecl, HirPackTail, HirStmt, HirTableSetList, HirToBeClosed, HirUnaryExpr, HirValuePack,
     LocalId,
 };
@@ -180,6 +180,23 @@ pub(super) fn lower_regular_instr(
                 }),
             }))]
         }
+        LowInstr::TypeGuard(type_guard) => vec![HirStmt::CallStmt(Box::new(HirCallStmt {
+            call: HirCallExpr {
+                callee: unresolved_expr(format!(
+                    "LuaJIT {} type guard has no exact Lua source form",
+                    type_guard.kind.label()
+                )),
+                args: vec![expr_for_reg_use(
+                    lowering,
+                    block,
+                    instr_ref,
+                    type_guard.subject,
+                )]
+                .into(),
+                method: false,
+                method_name: None,
+            },
+        }))],
         LowInstr::NewTable(_new_table) => fixed_assign(
             lowering,
             instr_ref,
@@ -198,14 +215,14 @@ pub(super) fn lower_regular_instr(
                     captures: closure
                         .captures
                         .iter()
-                        .map(|capture| HirCapture {
-                            value: expr_for_closure_capture(
+                        .map(|capture| {
+                            lower_closure_capture(
                                 lowering,
                                 block,
                                 instr_ref,
                                 closure.dst,
                                 capture.source,
-                            ),
+                            )
                         })
                         .collect(),
                 }))],

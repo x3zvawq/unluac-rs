@@ -105,3 +105,18 @@ pub(crate) fn expr_observes_eval_order(expr: &HirExpr) -> bool {
         | HirExpr::Unresolved(_) => false,
     }
 }
+
+/// 临时值记录的结果是否必须保留在后续语句中的读取顺序。
+///
+/// local/upvalue/param/temp 读取本身不是可观察事件，但其结果是定义点的快照；若把这份
+/// 快照挪到更晚的调用或 lookup 之后，来源 binding 可能已经被改写。
+pub(crate) fn expr_requires_ordered_snapshot(expr: &HirExpr) -> bool {
+    expr_observes_eval_order(expr)
+        || matches!(
+            expr,
+            HirExpr::ParamRef(_)
+                | HirExpr::LocalRef(_)
+                | HirExpr::UpvalueRef(_)
+                | HirExpr::TempRef(_)
+        )
+}

@@ -282,6 +282,7 @@ impl StructuredBodyLowerer<'_, '_> {
             active_candidate.kind_hint != LoopKindHint::RepeatLike
                 || self.can_reach_avoiding_block(entry, candidate, loop_context.header)
         };
+        let implicit_else_entry = else_entry.unwrap_or(region.merge);
         let mut fallback_continuation = None;
         for candidate in region
             .structured_blocks
@@ -303,12 +304,13 @@ impl StructuredBodyLowerer<'_, '_> {
         {
             if reaches_in_current_iteration(then_entry, candidate)
                 && self.branch_arm_reaches_loop_continuation_or_escape(then_entry, candidate, stop)
-                && else_entry.is_none_or(|else_entry| {
-                    reaches_in_current_iteration(else_entry, candidate)
+                && (implicit_else_entry == candidate
+                    || (reaches_in_current_iteration(implicit_else_entry, candidate)
                         && self.branch_arm_reaches_loop_continuation_or_escape(
-                            else_entry, candidate, stop,
-                        )
-                })
+                            implicit_else_entry,
+                            candidate,
+                            stop,
+                        )))
             {
                 return Some(candidate);
             }

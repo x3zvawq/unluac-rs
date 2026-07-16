@@ -627,9 +627,19 @@ pub struct HirClosureExpr {
     pub captures: Vec<HirCapture>,
 }
 
+/// 闭包捕获父级值的方式。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum HirCaptureMode {
+    /// 创建闭包时保存当前值，不与父级寄存器的后续复用共享写入。
+    ByValue,
+    /// 捕获父级词法绑定，后续写入仍可由闭包观察。
+    ByReference,
+}
+
 /// 闭包 capture。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirCapture {
+    pub mode: HirCaptureMode,
     pub value: HirExpr,
 }
 

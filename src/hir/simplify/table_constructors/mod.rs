@@ -28,10 +28,11 @@ use crate::hir::common::{
     HirAssign, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, HirTableConstructor,
     HirTableField, LocalId, TempId,
 };
+use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use self::bindings::{
     BindingIndex, BindingOccurrenceIndex, StmtBindingSummary, collect_materialized_binding_counts,
-    collect_stmt_binding_summary,
+    collect_reference_captured_bindings, collect_stmt_binding_summary,
 };
 use self::scan::{
     constructor_seed, install_constructor_seed, trailing_constructor_handoff,
@@ -119,11 +120,17 @@ struct RebuildScratch {
 pub(super) fn stabilize_table_constructors_in_proto(
     proto: &mut HirProto,
     dialect: DecompileDialect,
+    promotion_facts: &ProtoPromotionFacts,
 ) -> bool {
     let materialized_bindings = collect_materialized_binding_counts(&proto.body);
+    let (reference_captured_bindings, reference_captured_home_slots) =
+        collect_reference_captured_bindings(&proto.body, promotion_facts);
     let first_new_local = proto.locals.len();
     let mut pass = TableConstructorPass {
         materialized_bindings,
+        reference_captured_bindings,
+        reference_captured_home_slots,
+        promotion_facts,
         dialect,
         next_local_index: first_new_local,
     };
@@ -137,13 +144,16 @@ pub(super) fn stabilize_table_constructors_in_proto(
     changed
 }
 
-struct TableConstructorPass {
+struct TableConstructorPass<'a> {
     materialized_bindings: BTreeMap<TableBinding, usize>,
+    reference_captured_bindings: std::collections::BTreeSet<TableBinding>,
+    reference_captured_home_slots: std::collections::BTreeSet<HomeSlotKey>,
+    promotion_facts: &'a ProtoPromotionFacts,
     dialect: DecompileDialect,
     next_local_index: usize,
 }
 
-impl HirRewritePass for TableConstructorPass {
+impl HirRewritePass for TableConstructorPass<'_> {
     fn rewrite_block(&mut self, block: &mut crate::hir::common::HirBlock) -> bool {
         let mut changed = self.materialize_discarded_inline_set_lists(block);
         let mut scratch = RebuildScratch::default();
@@ -155,8 +165,13 @@ impl HirRewritePass for TableConstructorPass {
             .iter()
             .map(|stmt| collect_stmt_binding_summary(stmt, &mut binding_index))
             .collect();
-        let mut binding_occurrences =
-            BindingOccurrenceIndex::new(binding_index.len(), &stmt_bindings);
+        let mut binding_occurrences = BindingOccurrenceIndex::new(
+            &binding_index,
+            &stmt_bindings,
+            &self.reference_captured_bindings,
+            &self.reference_captured_home_slots,
+            self.promotion_facts,
+        );
         let mut stmt_ids = (0..block.stmts.len()).collect::<Vec<_>>();
         let materialized_binding_counts =
             binding_index.materialized_counts(&self.materialized_bindings);
@@ -232,7 +247,7 @@ impl HirRewritePass for TableConstructorPass {
     }
 }
 
-impl TableConstructorPass {
+impl TableConstructorPass<'_> {
     fn materialize_discarded_inline_set_lists(
         &mut self,
         block: &mut crate::hir::common::HirBlock,

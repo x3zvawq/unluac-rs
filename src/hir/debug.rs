@@ -336,7 +336,13 @@ fn format_expr(expr: &HirExpr) -> String {
             closure
                 .captures
                 .iter()
-                .map(|capture| format_expr(&capture.value))
+                .map(|capture| {
+                    let mode = match capture.mode {
+                        crate::hir::common::HirCaptureMode::ByValue => "value",
+                        crate::hir::common::HirCaptureMode::ByReference => "ref",
+                    };
+                    format!("{mode}({})", format_expr(&capture.value))
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         ),

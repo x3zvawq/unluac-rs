@@ -21,7 +21,6 @@ mod local_shapes;
 mod locals;
 mod logical_simplify;
 mod mention;
-mod multiret_assignments;
 mod residuals;
 mod table_constructors;
 mod temp_inline;
@@ -142,12 +141,6 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         invalidates: &[TempChain, LocalBinding],
     },
     PassDescriptor {
-        name: "multiret-assignments",
-        phase: PassPhase::Normal,
-        depends_on: &[TempChain],
-        invalidates: &[TempChain, LocalBinding],
-    },
-    PassDescriptor {
         name: "generic-for-iterators",
         phase: PassPhase::Normal,
         depends_on: &[TempChain, BlockStructure],
@@ -245,7 +238,7 @@ pub(super) fn simplify_hir(
                         1 => boolean_shells::remove_boolean_materialization_shells_in_proto(proto),
                         2 => logical_simplify::simplify_logical_exprs_in_proto(proto),
                         3 => table_constructors::stabilize_table_constructors_in_proto(
-                            proto, dialect,
+                            proto, dialect, facts,
                         ),
                         4 => {
                             closure_self_capture::resolve_recursive_closure_self_captures_in_proto(
@@ -255,18 +248,15 @@ pub(super) fn simplify_hir(
                         5 => {
                             temp_inline::inline_temps_in_proto_with_facts(proto, readability, facts)
                         }
-                        6 => multiret_assignments::collapse_multiret_global_assignments_in_proto(
-                            proto,
-                        ),
-                        7 => generic_for_iterators::fold_generic_for_iterators_in_proto(proto),
-                        8 => locals::promote_temps_to_locals_in_proto_with_facts(proto, facts),
-                        9 => branch_value_folding::fold_branch_values_in_proto(proto),
-                        10 => branch_control_folding::fold_branch_control_in_proto(proto),
-                        11 => decision::eliminate_remaining_decisions_in_proto(proto),
-                        12 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
-                        13 => carried_locals::collapse_carried_local_handoffs_in_proto(proto),
-                        14 => dead_temps::remove_dead_temp_materializations_in_proto(proto),
-                        15 => dead_labels::remove_unused_labels_in_proto(proto),
+                        6 => generic_for_iterators::fold_generic_for_iterators_in_proto(proto),
+                        7 => locals::promote_temps_to_locals_in_proto_with_facts(proto, facts),
+                        8 => branch_value_folding::fold_branch_values_in_proto(proto),
+                        9 => branch_control_folding::fold_branch_control_in_proto(proto),
+                        10 => decision::eliminate_remaining_decisions_in_proto(proto),
+                        11 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
+                        12 => carried_locals::collapse_carried_local_handoffs_in_proto(proto),
+                        13 => dead_temps::remove_dead_temp_materializations_in_proto(proto),
+                        14 => dead_labels::remove_unused_labels_in_proto(proto),
                         _ => unreachable!("invalid HIR pass index: {index}"),
                     }
                 })

@@ -104,7 +104,16 @@ fn branch_value_merge_from_phi(
         }
     }
 
-    (!then_arm.preds.is_empty() && !else_arm.preds.is_empty()).then_some(BranchValueMergeValue {
+    if then_arm.preds.is_empty()
+        || else_arm.preds.is_empty()
+        || (then_arm.values == else_arm.values
+            && then_arm.update_values.is_empty()
+            && else_arm.update_values.is_empty())
+    {
+        return None;
+    }
+
+    Some(BranchValueMergeValue {
         phi_id: phi.id,
         reg: phi.reg,
         then_arm,
@@ -388,7 +397,7 @@ fn consumed_branch_value_merge_values<'a>(
     candidates: &'a [BranchValueMergeCandidate],
     plan: &'a StructurePlan,
 ) -> impl Iterator<Item = &'a BranchValueMergeValue> + 'a {
-    plan.branch_value_merge_by_header
+    plan.branch_value_merge_by_region
         .values()
         .filter_map(|id| candidates.get(id.index()))
         .flat_map(|candidate| &candidate.values)

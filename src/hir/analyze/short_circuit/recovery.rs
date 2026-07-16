@@ -141,21 +141,33 @@ pub(crate) fn build_branch_short_circuit_plan(
         });
 
     for short in candidates {
-        if let Some(plan) = build_branch_short_circuit_plan_from_candidate(lowering, short) {
-            return Some(plan);
-        }
-        let allowed_blocks = BTreeSet::from([header]);
-        if let Some(plan) =
-            truncate_branch_exit_candidate_at_escaping_header(lowering, short, &allowed_blocks)
-                .and_then(|truncated| {
-                    build_branch_short_circuit_plan_from_candidate(lowering, &truncated)
-                })
-        {
+        if let Some(plan) = build_branch_short_circuit_plan_for_candidate(lowering, short) {
             return Some(plan);
         }
     }
 
     None
+}
+
+/// 从 Structure 已选定的候选构建 branch 计划，不再按 header 重新挑选另一棵短路树。
+pub(crate) fn build_branch_short_circuit_plan_for_candidate(
+    lowering: &ProtoLowering<'_>,
+    short: &ShortCircuitCandidate,
+) -> Option<BranchShortCircuitPlan> {
+    if !short.reducible
+        || !matches!(
+            short.exit,
+            ShortCircuitExit::BranchExit { .. } | ShortCircuitExit::ValueMerge(_)
+        )
+    {
+        return None;
+    }
+    if let Some(plan) = build_branch_short_circuit_plan_from_candidate(lowering, short) {
+        return Some(plan);
+    }
+    let allowed_blocks = BTreeSet::from([short.header]);
+    truncate_branch_exit_candidate_at_escaping_header(lowering, short, &allowed_blocks)
+        .and_then(|truncated| build_branch_short_circuit_plan_from_candidate(lowering, &truncated))
 }
 
 fn build_branch_short_circuit_plan_from_candidate(

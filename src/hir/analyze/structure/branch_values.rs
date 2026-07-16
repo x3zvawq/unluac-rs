@@ -24,14 +24,10 @@ use super::*;
 impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     pub(super) fn branch_value_preserved_entry_stmts(
         &self,
-        header: BlockRef,
+        candidate: &BranchValueMergeCandidate,
         branch_target_overrides: &BTreeMap<TempId, HirLValue>,
         entry_target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Vec<HirStmt> {
-        let Some(candidate) = self.branch_value_merge_for_header(header) else {
-            return Vec::new();
-        };
-
         let mut targets = Vec::new();
         let mut values = Vec::new();
 
@@ -40,8 +36,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 continue;
             }
 
-            let target = self.branch_value_arm_target(header, value, branch_target_overrides);
-            let mut init = self.branch_value_entry_expr(header, value.reg);
+            let target = self.branch_value_arm_target(candidate, value, branch_target_overrides);
+            let mut init = self.branch_value_entry_expr(candidate.header, value.reg);
             rewrite_expr_temps(&mut init, &temp_expr_overrides(entry_target_overrides));
             if lvalue_as_expr(&target)
                 .as_ref()
@@ -63,7 +59,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
     fn branch_value_arm_target(
         &self,
-        header: BlockRef,
+        candidate: &BranchValueMergeCandidate,
         value: &BranchValueMergeValue,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> HirLValue {
@@ -71,7 +67,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if let Some(target) = target_overrides.get(&phi_temp) {
             return target.clone();
         }
-        if let Some(target) = self.preserved_branch_target_lvalue(header, value, target_overrides) {
+        if let Some(target) =
+            self.preserved_branch_target_lvalue(candidate.header, value, target_overrides)
+        {
             return target;
         }
         if let Some(target) = self.shared_branch_target_lvalue(value, target_overrides) {
@@ -174,17 +172,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
     pub(super) fn branch_value_target_overrides_for_preds(
         &self,
-        header: BlockRef,
+        candidate: &BranchValueMergeCandidate,
         preds: &std::collections::BTreeSet<BlockRef>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> BTreeMap<TempId, HirLValue> {
         let mut overrides = target_overrides.clone();
-        let Some(candidate) = self.branch_value_merge_for_header(header) else {
-            return overrides;
-        };
 
         for value in &candidate.values {
-            let target = self.branch_value_arm_target(header, value, target_overrides);
+            let target = self.branch_value_arm_target(candidate, value, target_overrides);
             let mut arm_defs = BTreeSet::new();
             if !value.then_arm.preds.is_disjoint(preds) {
                 arm_defs.extend(branch_value_arm_defs(
@@ -217,7 +212,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             if !arm_defs.is_empty() {
                 install_short_circuit_phi_overrides(
                     self.lowering,
-                    header,
+                    candidate.header,
                     &arm_defs,
                     &target,
                     &mut overrides,
@@ -230,48 +225,37 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
     pub(super) fn branch_value_then_target_overrides(
         &self,
-        header: BlockRef,
+        candidate: &BranchValueMergeCandidate,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> BTreeMap<TempId, HirLValue> {
-        let Some(candidate) = self.branch_value_merge_for_header(header) else {
-            return target_overrides.clone();
-        };
-
         let mut preds = BTreeSet::new();
         for value in &candidate.values {
             preds.extend(value.then_arm.preds.iter().copied());
         }
 
-        self.branch_value_target_overrides_for_preds(header, &preds, target_overrides)
+        self.branch_value_target_overrides_for_preds(candidate, &preds, target_overrides)
     }
 
     pub(super) fn branch_value_else_target_overrides(
         &self,
-        header: BlockRef,
+        candidate: &BranchValueMergeCandidate,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> BTreeMap<TempId, HirLValue> {
-        let Some(candidate) = self.branch_value_merge_for_header(header) else {
-            return target_overrides.clone();
-        };
-
         let mut preds = BTreeSet::new();
         for value in &candidate.values {
             preds.extend(value.else_arm.preds.iter().copied());
         }
 
-        self.branch_value_target_overrides_for_preds(header, &preds, target_overrides)
+        self.branch_value_target_overrides_for_preds(candidate, &preds, target_overrides)
     }
 
     pub(super) fn branch_value_target_overrides(
         &self,
-        header: BlockRef,
+        candidate: &BranchValueMergeCandidate,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> BTreeMap<TempId, HirLValue> {
-        let mut overrides = self.branch_value_then_target_overrides(header, target_overrides);
-        overrides.extend(self.branch_value_else_target_overrides(header, target_overrides));
-        let Some(candidate) = self.branch_value_merge_for_header(header) else {
-            return overrides;
-        };
+        let mut overrides = self.branch_value_then_target_overrides(candidate, target_overrides);
+        overrides.extend(self.branch_value_else_target_overrides(candidate, target_overrides));
 
         for value in &candidate.values {
             let Some(shared_target) = self.shared_branch_target_lvalue(value, &overrides) else {
@@ -285,16 +269,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
     pub(super) fn install_branch_value_merge_overrides(
         &mut self,
-        header: BlockRef,
+        candidate: &BranchValueMergeCandidate,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) {
-        let Some(candidate) = self.branch_value_merge_for_header(header) else {
-            return;
-        };
-
         for value in &candidate.values {
             let Some(override_value) =
-                self.branch_value_override_expr(header, value, target_overrides)
+                self.branch_value_override_expr(candidate, value, target_overrides)
             else {
                 continue;
             };
@@ -316,14 +296,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
     fn branch_value_override_expr(
         &self,
-        header: BlockRef,
+        candidate: &BranchValueMergeCandidate,
         value: &BranchValueMergeValue,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<BranchValueOverride> {
         self.shared_branch_target_expr(value, target_overrides)
             .map(BranchValueOverride::Alias)
             .or_else(|| {
-                self.branch_value_decision_expr(header, value, target_overrides)
+                self.branch_value_decision_expr(candidate.header, value, target_overrides)
                     .map(BranchValueOverride::Snapshot)
             })
     }

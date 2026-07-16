@@ -1,9 +1,10 @@
 //! 这个文件承载 HIR 内部给 simplify 使用的 promotion facts。
 //!
 //! `locals` pass 只看 HIR 语法本身时，能判断“哪些 temp 正在沿别名链流动”，却不知道
-//! “这个 temp 最早来自哪个词法槽位”。一旦某个 local 已经被 closure capture，后续
-//! 同一词法槽位的新 def 就不该再长成新的 local，而应继续写回原绑定；但 `close`
-//! 之后复用同一个寄存器号已经是新的词法槽位，不能继续沿用旧 upvalue 的 local。
+//! “这个 temp 最早来自哪个词法槽位”。一旦某个 local 已经被 closure reference capture，
+//! 后续同一词法槽位的新 def 就不该再长成新的 local，而应继续写回原绑定；按值 capture
+//! 只保存当前快照，不激活这条 sticky 身份。`close` 之后复用同一个寄存器号已经是新的
+//! 词法槽位，不能继续沿用旧 upvalue 的 local。
 //!
 //! 这里专门把那份“temp -> home slot”事实从 analyze 阶段带给 simplify：
 //! - 它依赖 Dataflow 已经给出的 fixed def/reg 身份，以及 Transformer 保留下来的
@@ -16,9 +17,9 @@
 use crate::hir::common::{
     HirBlock, HirExpr, HirLValue, HirStmt, HirTableField, HirTableKey, TempId,
 };
-use crate::structure::DataflowFacts;
-use crate::transformer::{LowInstr, LoweredProto};
-use std::collections::BTreeSet;
+use crate::structure::{BlockRef, Cfg, DataflowFacts, GraphFacts};
+use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto, Reg};
+use std::collections::{BTreeSet, VecDeque};
 
 /// temp promotion 使用的词法槽位身份。
 ///
@@ -28,6 +29,183 @@ use std::collections::BTreeSet;
 pub(super) struct HomeSlotKey {
     slot: usize,
     epoch: usize,
+}
+
+/// capture / promotion 共用的物理槽词法 epoch。
+///
+/// `Close` 只结束经过该 CFG 路径的 upvalue。这里把 close 当作槽位身份的 SSA 定义，
+/// 在 dominance frontier 建 merge epoch，再沿支配树给指令标注进入点身份；不能按线性
+/// PC 给所有后缀指令累加边界，否则 break/continue cleanup 会污染 sibling 路径。
+pub(super) struct SlotEpochFacts {
+    epochs_by_reg: Vec<Option<SlotEpochFlow>>,
+}
+
+struct SlotEpochFlow {
+    at_instr: Vec<usize>,
+    spans_entry: bool,
+}
+
+impl SlotEpochFacts {
+    pub(super) fn analyze(
+        proto: &LoweredProto,
+        cfg: &Cfg,
+        graph: &GraphFacts,
+        dataflow: &DataflowFacts,
+    ) -> Self {
+        let captured_regs = proto
+            .instrs
+            .iter()
+            .filter_map(|instr| match instr {
+                LowInstr::Closure(closure) => Some(&closure.captures),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|capture| match capture.source {
+                CaptureSource::ByReference(reg) => Some(reg),
+                CaptureSource::ByValue(_) | CaptureSource::Upvalue(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let reg_count = captured_regs
+            .iter()
+            .map(|reg| reg.index() + 1)
+            .max()
+            .unwrap_or_default()
+            .max(usize::from(proto.frame.max_stack_size));
+        let mut epochs_by_reg = (0..reg_count).map(|_| None).collect::<Vec<_>>();
+        for reg in captured_regs {
+            epochs_by_reg[reg.index()] = Some(analyze_slot_epoch(proto, cfg, graph, dataflow, reg));
+        }
+        Self { epochs_by_reg }
+    }
+
+    pub(super) fn epoch_at(&self, reg: Reg, instr: InstrRef) -> usize {
+        self.epochs_by_reg
+            .get(reg.index())
+            .and_then(Option::as_ref)
+            .and_then(|flow| flow.at_instr.get(instr.index()))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn spans_entry(&self, reg: Reg) -> bool {
+        self.epochs_by_reg
+            .get(reg.index())
+            .and_then(Option::as_ref)
+            .is_none_or(|flow| flow.spans_entry)
+    }
+}
+
+fn analyze_slot_epoch(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    graph: &GraphFacts,
+    dataflow: &DataflowFacts,
+    reg: Reg,
+) -> SlotEpochFlow {
+    let close_blocks = proto
+        .instrs
+        .iter()
+        .enumerate()
+        .filter_map(|(instr_index, instr)| {
+            let LowInstr::Close(close) = instr else {
+                return None;
+            };
+            let block = cfg.instr_to_block[instr_index];
+            (close.from.index() <= reg.index() && cfg.reachable_blocks.contains(&block))
+                .then_some(block)
+        })
+        .collect::<BTreeSet<_>>();
+    let merge_blocks = place_epoch_merges(cfg, graph, &close_blocks);
+    let mut at_instr = vec![0; proto.instrs.len()];
+    let mut stack = vec![0];
+    let mut events = vec![EpochRenameEvent::Enter(cfg.entry_block)];
+
+    while let Some(event) = events.pop() {
+        match event {
+            EpochRenameEvent::Exit(count) => stack.truncate(stack.len() - count),
+            EpochRenameEvent::Enter(block) => {
+                let mut pushed = 0;
+                if merge_blocks.contains(&block) {
+                    stack.push(1 + proto.instrs.len() + block.index());
+                    pushed += 1;
+                }
+                let range = cfg.blocks[block.index()].instrs;
+                for (instr_index, epoch) in at_instr
+                    .iter_mut()
+                    .enumerate()
+                    .take(range.end())
+                    .skip(range.start.index())
+                {
+                    *epoch = *stack.last().expect("epoch stack has entry identity");
+                    if matches!(
+                        proto.instrs[instr_index],
+                        LowInstr::Close(close) if close.from.index() <= reg.index()
+                    ) {
+                        stack.push(1 + instr_index);
+                        pushed += 1;
+                    }
+                }
+
+                events.push(EpochRenameEvent::Exit(pushed));
+                for child in graph.dominator_tree.children[block.index()].iter().rev() {
+                    events.push(EpochRenameEvent::Enter(*child));
+                }
+            }
+        }
+    }
+
+    let defs_span_entry = dataflow
+        .defs
+        .iter()
+        .filter(|def| def.reg == reg)
+        .all(|def| at_instr[def.instr.index()] == 0);
+    let captures_span_entry = proto.instrs.iter().enumerate().all(|(instr_index, instr)| {
+        let LowInstr::Closure(closure) = instr else {
+            return true;
+        };
+        !closure
+            .captures
+            .iter()
+            .any(|capture| capture.source == CaptureSource::ByReference(reg))
+            || at_instr[instr_index] == 0
+    });
+
+    SlotEpochFlow {
+        at_instr,
+        spans_entry: defs_span_entry && captures_span_entry,
+    }
+}
+
+fn place_epoch_merges(
+    cfg: &Cfg,
+    graph: &GraphFacts,
+    close_blocks: &BTreeSet<BlockRef>,
+) -> BTreeSet<BlockRef> {
+    let mut placed = BTreeSet::new();
+    let mut pending = close_blocks.iter().copied().collect::<VecDeque<_>>();
+    while let Some(block) = pending.pop_front() {
+        for frontier in graph.dominance_frontier_blocks(block) {
+            if placed.insert(frontier) && !close_blocks.contains(&frontier) {
+                pending.push_back(frontier);
+            }
+        }
+    }
+
+    if graph.natural_loops.iter().any(|natural_loop| {
+        natural_loop.header == cfg.entry_block
+            && natural_loop
+                .blocks
+                .iter()
+                .any(|block| close_blocks.contains(block))
+    }) {
+        placed.insert(cfg.entry_block);
+    }
+    placed
+}
+
+enum EpochRenameEvent {
+    Enter(BlockRef),
+    Exit(usize),
 }
 
 impl HomeSlotKey {
@@ -44,11 +222,11 @@ pub(super) struct ProtoPromotionFacts {
 
 impl ProtoPromotionFacts {
     /// 从 Dataflow 里提取当前 proto 所需的 temp -> home slot 对照表。
-    pub(super) fn from_dataflow(proto: &LoweredProto, dataflow: &DataflowFacts) -> Self {
+    pub(super) fn from_dataflow(dataflow: &DataflowFacts, slot_epochs: &SlotEpochFacts) -> Self {
         let total_temps = dataflow.defs.len() + dataflow.phi_candidates.len();
         let mut temp_home_slots = vec![None; total_temps];
 
-        fill_fixed_def_home_slots(proto, dataflow, &mut temp_home_slots);
+        fill_fixed_def_home_slots(dataflow, slot_epochs, &mut temp_home_slots);
 
         Self { temp_home_slots }
     }
@@ -244,7 +422,9 @@ impl ProtoPromotionFacts {
             }
             HirExpr::Closure(closure) => {
                 for capture in &closure.captures {
-                    self.collect_temp_home_slots_in_expr(&capture.value, slots);
+                    if capture.mode == crate::hir::common::HirCaptureMode::ByReference {
+                        self.collect_temp_home_slots_in_expr(&capture.value, slots);
+                    }
                     self.collect_captured_home_slots_in_expr(&capture.value, slots);
                 }
             }
@@ -363,30 +543,12 @@ impl ProtoPromotionFacts {
 }
 
 fn fill_fixed_def_home_slots(
-    proto: &LoweredProto,
     dataflow: &DataflowFacts,
+    slot_epochs: &SlotEpochFacts,
     temp_home_slots: &mut [Option<HomeSlotKey>],
 ) {
-    let mut defs_by_instr = vec![Vec::<(usize, usize)>::new(); proto.instrs.len()];
-    let mut max_slot = usize::from(proto.frame.max_stack_size);
-
     for def in &dataflow.defs {
-        let slot = def.reg.index();
-        max_slot = max_slot.max(slot);
-        defs_by_instr[def.instr.index()].push((def.id.index(), slot));
-    }
-
-    let mut epochs = vec![0usize; max_slot.saturating_add(1)];
-    for (instr_index, instr) in proto.instrs.iter().enumerate() {
-        for (temp_index, slot) in &defs_by_instr[instr_index] {
-            let epoch = epochs.get(*slot).copied().unwrap_or_default();
-            temp_home_slots[*temp_index] = Some(HomeSlotKey::new(*slot, epoch));
-        }
-
-        if let LowInstr::Close(close) = instr {
-            for epoch in epochs.iter_mut().skip(close.from.index()) {
-                *epoch += 1;
-            }
-        }
+        let epoch = slot_epochs.epoch_at(def.reg, def.instr);
+        temp_home_slots[def.id.index()] = Some(HomeSlotKey::new(def.reg.index(), epoch));
     }
 }

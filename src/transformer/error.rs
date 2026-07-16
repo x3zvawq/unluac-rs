@@ -20,6 +20,8 @@ pub enum TransformError {
         opcode: &'static str,
         expected: &'static str,
     },
+    #[error("invalid LuaJIT type guard id {type_id} at raw pc {raw_pc}")]
+    InvalidTypeGuard { raw_pc: u32, type_id: u16 },
     #[error("opcode `{opcode}` at raw pc {raw_pc} must be followed by a helper JMP")]
     MissingHelperJump { raw_pc: u32, opcode: &'static str },
     #[error(

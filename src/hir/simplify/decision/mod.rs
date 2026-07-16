@@ -60,7 +60,6 @@ impl ExprRewritePass for DecisionExprPass {
     fn rewrite_condition_expr(&mut self, expr: &mut HirExpr) -> bool {
         let mut changed = false;
         if let HirExpr::Decision(decision) = expr
-            && !decision_has_shared_nodes(decision)
             && !decision_has_cycles(decision)
             && let Some(replacement) = collapse_condition_decision_expr(decision)
         {
@@ -518,12 +517,105 @@ fn collapse_condition_node(
         return Some(expr.clone());
     }
 
+    if let Some(expr) = collapse_shared_condition_chain(decision, node_ref, memo) {
+        memo.insert(node_ref, expr.clone());
+        return Some(expr);
+    }
+
     let node = decision.nodes.get(node_ref.index())?;
     let truthy = collapse_condition_target(decision, node, &node.truthy, memo)?;
     let falsy = collapse_condition_target(decision, node, &node.falsy, memo)?;
     let expr = combine_condition_expr(node.test.clone(), truthy, falsy)?;
     memo.insert(node_ref, expr.clone());
     Some(expr)
+}
+
+fn collapse_shared_condition_chain(
+    decision: &HirDecisionExpr,
+    node_ref: HirDecisionNodeRef,
+    memo: &mut BTreeMap<HirDecisionNodeRef, HirExpr>,
+) -> Option<HirExpr> {
+    let node = decision.nodes.get(node_ref.index())?;
+    if matches!(node.truthy, HirDecisionTarget::Node(_))
+        && let Some(expr) =
+            collapse_condition_chain_with_fallback(decision, node_ref, true, &node.falsy, memo)
+    {
+        return Some(expr);
+    }
+    if matches!(node.falsy, HirDecisionTarget::Node(_)) {
+        return collapse_condition_chain_with_fallback(
+            decision,
+            node_ref,
+            false,
+            &node.truthy,
+            memo,
+        );
+    }
+    None
+}
+
+fn collapse_condition_chain_with_fallback(
+    decision: &HirDecisionExpr,
+    node_ref: HirDecisionNodeRef,
+    mut follow_truthy: bool,
+    shared: &HirDecisionTarget,
+    memo: &mut BTreeMap<HirDecisionNodeRef, HirExpr>,
+) -> Option<HirExpr> {
+    if matches!(shared, HirDecisionTarget::CurrentValue) {
+        return None;
+    }
+
+    let mut current = node_ref;
+    let mut guard = None;
+    let mut node_count = 0;
+    let terminal = loop {
+        let node = decision.nodes.get(current.index())?;
+        let (next, fallback) = if follow_truthy {
+            (&node.truthy, &node.falsy)
+        } else {
+            (&node.falsy, &node.truthy)
+        };
+        if fallback != shared {
+            return None;
+        }
+
+        let term = if follow_truthy {
+            node.test.clone()
+        } else {
+            node.test.clone().negate()
+        };
+        guard = Some(guard.map_or(term.clone(), |prefix| logical_and(prefix, term)));
+        node_count += 1;
+
+        let HirDecisionTarget::Node(next_ref) = next else {
+            break match next {
+                HirDecisionTarget::CurrentValue => HirExpr::Boolean(follow_truthy),
+                HirDecisionTarget::Expr(expr) => expr.clone(),
+                HirDecisionTarget::Node(_) => unreachable!(),
+            };
+        };
+        let child = decision.nodes.get(next_ref.index())?;
+        follow_truthy = if child.falsy == *shared {
+            true
+        } else if child.truthy == *shared {
+            false
+        } else {
+            return None;
+        };
+        current = *next_ref;
+    };
+
+    if node_count < 2 {
+        return None;
+    }
+    let shared = match shared {
+        HirDecisionTarget::Node(shared_ref) => {
+            collapse_condition_node(decision, *shared_ref, memo)?
+        }
+        HirDecisionTarget::Expr(expr) => expr.clone(),
+        HirDecisionTarget::CurrentValue => return None,
+    };
+    combine_condition_expr(guard?, terminal, shared)
 }
 
 fn collapse_condition_target(

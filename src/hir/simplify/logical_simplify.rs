@@ -289,6 +289,23 @@ pub(super) fn simplify_condition_truthiness_shape(expr: &HirExpr) -> Option<HirE
     match expr {
         HirExpr::LogicalAnd(logical) => simplify_condition_logical_and(&logical.lhs, &logical.rhs),
         HirExpr::LogicalOr(logical) => simplify_condition_logical_or(&logical.lhs, &logical.rhs),
+        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
+            de_morgan_condition(&unary.expr)
+        }
+        _ => None,
+    }
+}
+
+fn de_morgan_condition(expr: &HirExpr) -> Option<HirExpr> {
+    match expr {
+        HirExpr::LogicalAnd(logical) => Some(HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+            lhs: logical.lhs.clone().negate(),
+            rhs: logical.rhs.clone().negate(),
+        }))),
+        HirExpr::LogicalOr(logical) => Some(HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+            lhs: logical.lhs.clone().negate(),
+            rhs: logical.rhs.clone().negate(),
+        }))),
         _ => None,
     }
 }

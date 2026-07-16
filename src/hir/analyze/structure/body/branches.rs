@@ -161,52 +161,47 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if let Some(downstream) = self.if_then_downstream_merge_stop(&plan, branch_stop, stop) {
             branch_stop = Some(downstream);
         }
-        let mut seen_branch_values: Vec<&BranchValueMergeCandidate> = Vec::new();
-        let branch_value_headers =
-            plan.consumed_headers
-                .iter()
-                .copied()
-                .filter(|header| {
-                    let Some(candidate) = self.branch_value_merge_for_header(*header) else {
-                        return false;
-                    };
-                    if seen_branch_values.iter().any(|seen| {
-                        seen.merge == candidate.merge && seen.values == candidate.values
-                    }) {
-                        return false;
-                    }
-                    seen_branch_values.push(candidate);
-                    true
-                })
-                .collect::<Vec<_>>();
-        let branch_target_overrides = (!branch_value_headers.is_empty()).then(|| {
+        let mut branch_value_candidates: Vec<&BranchValueMergeCandidate> = Vec::new();
+        for header in &plan.consumed_headers {
+            let region_candidate =
+                branch_stop.and_then(|merge| self.branch_value_merge_for_region(*header, merge));
+            for candidate in [
+                region_candidate,
+                self.branch_value_merge_for_header(*header),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if branch_value_candidates.iter().any(|seen| {
+                    seen.merge == candidate.merge
+                        && seen
+                            .values
+                            .iter()
+                            .map(|value| value.phi_id)
+                            .eq(candidate.values.iter().map(|value| value.phi_id))
+                }) {
+                    continue;
+                }
+                branch_value_candidates.push(candidate);
+            }
+        }
+        let branch_target_overrides = (!branch_value_candidates.is_empty()).then(|| {
             let mut overrides = target_overrides.clone();
-            for header in &branch_value_headers {
-                overrides = self.branch_value_target_overrides(*header, &overrides);
+            for candidate in &branch_value_candidates {
+                overrides = self.branch_value_target_overrides(candidate, &overrides);
             }
             overrides
         });
         if let Some(branch_target_overrides) = branch_target_overrides.as_ref() {
-            for header in &branch_value_headers {
+            for candidate in &branch_value_candidates {
                 stmts.extend(self.branch_value_preserved_entry_stmts(
-                    *header,
+                    candidate,
                     branch_target_overrides,
                     target_overrides,
                 ));
             }
         }
-        let then_target_overrides = branch_target_overrides
-            .as_ref()
-            .map(|branch_target_overrides| {
-                self.branch_value_then_target_overrides(block, branch_target_overrides)
-            })
-            .unwrap_or_else(|| target_overrides.clone());
-        let else_target_overrides = branch_target_overrides
-            .as_ref()
-            .map(|branch_target_overrides| {
-                self.branch_value_else_target_overrides(block, branch_target_overrides)
-            })
-            .unwrap_or_else(|| target_overrides.clone());
+        let arm_target_overrides = branch_target_overrides.as_ref().unwrap_or(target_overrides);
         let effective_else_entry = plan
             .else_entry
             .or_else(|| self.implicit_else_merge_entry(&plan, branch_stop));
@@ -232,10 +227,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let else_stop = effective_else_entry.and_then(|else_entry| {
             self.branch_arm_stop(else_entry, Some(plan.then_entry), plan.merge, branch_stop)
         });
-        let then_block = self.lower_region(plan.then_entry, then_stop, &then_target_overrides)?;
+        let then_block = self.lower_region(plan.then_entry, then_stop, arm_target_overrides)?;
         let else_block = match effective_else_entry {
             Some(else_entry) => {
-                Some(self.lower_region(else_entry, else_stop, &else_target_overrides)?)
+                Some(self.lower_region(else_entry, else_stop, arm_target_overrides)?)
             }
             // IfThen 无 else 臂时，不再为 merge block 上的 phi 生成隐式 else 赋值。
             // 这些 phi 会在 merge block 的 lower_block_prefix 中由 idom 兜底统一
@@ -253,11 +248,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             else_block,
         ));
         self.install_stop_boundary_value_merge_override(block, branch_stop, target_overrides);
-        for header in &plan.consumed_headers {
+        for candidate in &branch_value_candidates {
             let branch_value_overrides = branch_target_overrides
                 .clone()
-                .unwrap_or_else(|| self.branch_value_target_overrides(*header, target_overrides));
-            self.install_branch_value_merge_overrides(*header, &branch_value_overrides);
+                .unwrap_or_else(|| self.branch_value_target_overrides(candidate, target_overrides));
+            self.install_branch_value_merge_overrides(candidate, &branch_value_overrides);
         }
 
         // 当普通分支路径处理了一个 header，而该 header 同时拥有 SC 值合流候选
@@ -763,8 +758,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.active_loops.pop();
         let mut body = body_result?.stmts;
         let tail_preds = BTreeSet::from([tail]);
-        let tail_target_overrides =
-            self.branch_value_target_overrides_for_preds(block, &tail_preds, target_overrides);
+        let tail_target_overrides = self
+            .branch_value_merge_for_header(block)
+            .map(|candidate| {
+                self.branch_value_target_overrides_for_preds(
+                    candidate,
+                    &tail_preds,
+                    target_overrides,
+                )
+            })
+            .unwrap_or_else(|| target_overrides.clone());
         body.extend(self.lower_block_prefix(tail, false, &tail_target_overrides)?);
         self.visited.insert(tail);
         stmts.push(HirStmt::Repeat(Box::new(HirRepeat {

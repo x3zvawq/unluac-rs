@@ -17,11 +17,11 @@ use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchPredicate, CallInstr,
     CallKind, Capture, CaptureSource, CloseInstr, ClosureInstr, ConcatInstr, CondOperand, ConstRef,
-    DialectCaptureExtra, GenericForCallInstr, GetTableInstr, GetTableKind, GetUpvalueInstr,
-    InstrRef, LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LowInstr,
-    LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange,
-    ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr,
-    TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    GenericForCallInstr, GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, LoadBoolInstr,
+    LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto,
+    LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange, ResultPack, ReturnInstr,
+    SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr, TransformError, TypeGuardInstr,
+    TypeGuardKind, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
 const NO_REG: u8 = 0xff;
@@ -96,6 +96,19 @@ impl<'a> ProtoLowerer<'a> {
             let raw_pc = extra.pc;
 
             match opcode {
+                LuaJitOpcode::IsType | LuaJitOpcode::IsNum => {
+                    let (a, d) = expect_ad(raw_pc, opcode, operands)?;
+                    let kind = lua_jit_type_guard_kind(raw_pc, opcode, d)?;
+                    self.emit(
+                        Some(raw_index),
+                        vec![raw_index],
+                        PendingLowInstr::Ready(LowInstr::TypeGuard(TypeGuardInstr {
+                            subject: reg_from_u8(a),
+                            kind,
+                        })),
+                    );
+                    raw_index += 1;
+                }
                 LuaJitOpcode::Mov => {
                     let (a, d) = expect_ad(raw_pc, opcode, operands)?;
                     self.emit(
@@ -365,16 +378,13 @@ impl<'a> ProtoLowerer<'a> {
                         .iter()
                         .map(|descriptor| {
                             let source = if descriptor.in_stack {
-                                CaptureSource::Reg(Reg(descriptor.index as usize))
+                                CaptureSource::ByReference(Reg(descriptor.index as usize))
                             } else {
                                 CaptureSource::Upvalue(
                                     self.upvalue_ref(raw_pc, descriptor.index as usize)?,
                                 )
                             };
-                            Ok(Capture {
-                                source,
-                                extra: DialectCaptureExtra::None,
-                            })
+                            Ok(Capture { source })
                         })
                         .collect::<Result<Vec<_>, TransformError>>()?;
                     self.emit(
@@ -1392,6 +1402,22 @@ fn unary_op_kind(opcode: LuaJitOpcode) -> UnaryOpKind {
         LuaJitOpcode::Len => UnaryOpKind::Length,
         _ => unreachable!("only unary luajit opcodes should reach unary_op_kind"),
     }
+}
+
+fn lua_jit_type_guard_kind(
+    raw_pc: u32,
+    opcode: LuaJitOpcode,
+    type_id: u16,
+) -> Result<TypeGuardKind, TransformError> {
+    let kind = match (opcode, type_id) {
+        (LuaJitOpcode::IsType, 5) => TypeGuardKind::String,
+        (LuaJitOpcode::IsType, 9) => TypeGuardKind::Function,
+        (LuaJitOpcode::IsType, 12) => TypeGuardKind::Table,
+        (LuaJitOpcode::IsType, 14) => TypeGuardKind::Integer,
+        (LuaJitOpcode::IsType, 15) | (LuaJitOpcode::IsNum, 15) => TypeGuardKind::Number,
+        _ => return Err(TransformError::InvalidTypeGuard { raw_pc, type_id }),
+    };
+    Ok(kind)
 }
 
 fn binary_op_kind(opcode: LuaJitOpcode) -> BinaryOpKind {

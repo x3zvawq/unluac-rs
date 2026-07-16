@@ -20,11 +20,11 @@ use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchPredicate, CallInstr,
     CallKind, Capture, CaptureSource, CloseInstr, ClosureInstr, ConcatInstr, CondOperand, ConstRef,
-    DialectCaptureExtra, GenericForCallInstr, GetTableInstr, GetTableKind, GetUpvalueInstr,
-    InstrRef, LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LowInstr,
-    LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange,
-    ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TransformError,
-    UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    GenericForCallInstr, GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, LoadBoolInstr,
+    LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto,
+    LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange, ResultPack, ReturnInstr,
+    SetListInstr, SetTableInstr, SetUpvalueInstr, TransformError, UnaryOpInstr, UnaryOpKind,
+    UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
 pub(crate) fn lower_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
@@ -95,6 +95,25 @@ impl<'a> ProtoLowerer<'a> {
                 | LuauOpcode::FastCall2K
                 | LuauOpcode::FastCall3
                 | LuauOpcode::NativeCall => {
+                    match opcode {
+                        LuauOpcode::PrepVarArgs => {
+                            expect_a(raw_pc, opcode, operands)?;
+                        }
+                        LuauOpcode::Coverage => {
+                            expect_e(raw_pc, opcode, operands)?;
+                        }
+                        LuauOpcode::FastCall => {
+                            expect_ac(raw_pc, opcode, operands)?;
+                        }
+                        LuauOpcode::FastCall1
+                        | LuauOpcode::FastCall2
+                        | LuauOpcode::FastCall2K
+                        | LuauOpcode::FastCall3 => {
+                            expect_abc(raw_pc, opcode, operands)?;
+                        }
+                        LuauOpcode::Nop | LuauOpcode::Break | LuauOpcode::NativeCall => {}
+                        _ => unreachable!("only no-op Luau opcodes should reach this arm"),
+                    }
                     // 这些 opcode 在 Luau 里都是“VM 内部 hint / 无副作用占位”，对我们要恢复的源
                     // 级语义没有贡献，所以不发射任何 low-IR。但它们仍然占据真实 raw pc，并且
                     // 完全可能成为其它指令（典型如 LoadB.C != 0 的“跳过下一条”、JumpIfNot 跳到
@@ -376,7 +395,7 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 1;
                 }
                 LuauOpcode::NewTable => {
-                    let (a, _, _) = expect_abc(raw_pc, opcode, operands)?;
+                    let (a, _) = expect_ab(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.invalidate_written_reg(dst);
                     self.emit(
@@ -452,8 +471,7 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += if consumed_extra_raw.is_some() { 2 } else { 1 };
                 }
                 LuauOpcode::Return => {
-                    let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
-                    debug_assert_eq!(c, 0, "luau return should leave C unused");
+                    let (a, b) = expect_ab(raw_pc, opcode, operands)?;
                     self.clear_all_method_hints();
                     self.emit(
                         Some(raw_index),
@@ -1185,7 +1203,8 @@ impl<'a> ProtoLowerer<'a> {
                 });
             }
 
-            let (kind_raw, source_raw) = expect_capture(capture_extra.pc, capture_operands)?;
+            let (kind_raw, source_raw) =
+                expect_ab(capture_extra.pc, capture_opcode, capture_operands)?;
             let kind = LuauCaptureKind::try_from(kind_raw).map_err(|_| {
                 TransformError::InvalidClosureCapture {
                     raw_pc,
@@ -1194,17 +1213,13 @@ impl<'a> ProtoLowerer<'a> {
                 }
             })?;
             let source = match kind {
-                LuauCaptureKind::Val | LuauCaptureKind::Ref => {
-                    CaptureSource::Reg(reg_from_u8(source_raw))
-                }
+                LuauCaptureKind::Val => CaptureSource::ByValue(reg_from_u8(source_raw)),
+                LuauCaptureKind::Ref => CaptureSource::ByReference(reg_from_u8(source_raw)),
                 LuauCaptureKind::Upvalue => {
                     CaptureSource::Upvalue(self.upvalue_ref(capture_extra.pc, source_raw as usize)?)
                 }
             };
-            captures.push(Capture {
-                source,
-                extra: DialectCaptureExtra::None,
-            });
+            captures.push(Capture { source });
         }
 
         Ok((captures, raw_indices))
@@ -1456,16 +1471,5 @@ define_operand_expecters! {
     }
     fn expect_e("E") -> i32 {
         LuauOperands::E { e } => *e
-    }
-}
-
-fn expect_capture(raw_pc: u32, operands: &LuauOperands) -> Result<(u8, u8), TransformError> {
-    match operands {
-        LuauOperands::ABC { a, b, .. } => Ok((*a, *b)),
-        _ => Err(TransformError::UnexpectedOperands {
-            raw_pc,
-            opcode: "CAPTURE",
-            expected: "ABC",
-        }),
     }
 }

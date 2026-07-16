@@ -211,29 +211,18 @@ impl ConstructorBuilder {
 }
 
 fn can_reorder_integer_record_value(expr: &HirExpr) -> bool {
-    match expr {
+    matches!(
+        expr,
         HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::Closure(_) => true,
-        HirExpr::Unary(unary) => can_reorder_integer_record_value(&unary.expr),
-        HirExpr::Binary(binary) => {
-            can_reorder_integer_record_value(&binary.lhs)
-                && can_reorder_integer_record_value(&binary.rhs)
-        }
-        _ => false,
-    }
+            | HirExpr::Boolean(_)
+            | HirExpr::Integer(_)
+            | HirExpr::Number(_)
+            | HirExpr::String(_)
+            | HirExpr::Int64(_)
+            | HirExpr::UInt64(_)
+            | HirExpr::Vector(_)
+            | HirExpr::Complex { .. }
+    )
 }
 
 fn can_stage_pending_integer_record(

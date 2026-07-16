@@ -82,6 +82,11 @@ pub fn format_low_instr(instr: &LowInstr) -> String {
             format_reg(instr.subject),
             instr.name.map_or_else(|| "?".to_owned(), format_const)
         ),
+        LowInstr::TypeGuard(instr) => format!(
+            "type-guard {} expected={}",
+            format_reg(instr.subject),
+            instr.kind.label()
+        ),
         LowInstr::NewTable(instr) => format!("new-table {}", format_reg(instr.dst)),
         LowInstr::SetList(instr) => format!(
             "set-list {} values={} start={}",
@@ -249,7 +254,8 @@ fn format_call_kind(kind: CallKind) -> &'static str {
 
 fn format_capture_source(source: CaptureSource) -> String {
     match source {
-        CaptureSource::Reg(reg) => format!("reg({})", format_reg(reg)),
+        CaptureSource::ByValue(reg) => format!("value({})", format_reg(reg)),
+        CaptureSource::ByReference(reg) => format!("ref({})", format_reg(reg)),
         CaptureSource::Upvalue(upvalue) => format!("upvalue({})", format_upvalue(upvalue)),
     }
 }

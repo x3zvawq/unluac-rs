@@ -208,6 +208,7 @@ pub enum LowInstr {
     GetTable(GetTableInstr),
     SetTable(SetTableInstr),
     ErrNil(ErrNilInstr),
+    TypeGuard(TypeGuardInstr),
     NewTable(NewTableInstr),
     SetList(SetListInstr),
     Call(CallInstr),
@@ -329,22 +330,17 @@ pub enum AccessKey {
 /// 闭包 capture 来源。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum CaptureSource {
-    Reg(Reg),
+    /// 创建闭包时复制寄存器当前值，后续复用该寄存器不会更新 upvalue。
+    ByValue(Reg),
+    /// 捕获寄存器对应的可写词法槽位。
+    ByReference(Reg),
     Upvalue(UpvalueRef),
-}
-
-/// capture 的方言扩展槽位。
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Default)]
-pub enum DialectCaptureExtra {
-    #[default]
-    None,
 }
 
 /// 一个闭包捕获项。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct Capture {
     pub source: CaptureSource,
-    pub extra: DialectCaptureExtra,
 }
 
 /// 条件跳转的谓词。
@@ -520,6 +516,37 @@ pub struct SetTableInstr {
 pub struct ErrNilInstr {
     pub subject: Reg,
     pub name: Option<ConstRef>,
+}
+
+/// VM 内建函数的参数类型守卫。
+///
+/// 这类指令会在类型不匹配时抛出参数错误，部分种类还会原地做 LuaJIT 隐式转换；
+/// 统一 IR 保留这条不可丢弃的语义边界，不把它伪装成普通条件分支。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct TypeGuardInstr {
+    pub subject: Reg,
+    pub kind: TypeGuardKind,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum TypeGuardKind {
+    String,
+    Function,
+    Table,
+    Integer,
+    Number,
+}
+
+impl TypeGuardKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Function => "function",
+            Self::Table => "table",
+            Self::Integer => "integer",
+            Self::Number => "number",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]

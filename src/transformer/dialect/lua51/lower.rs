@@ -16,11 +16,11 @@ use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchPredicate, CallInstr,
     Capture, CaptureSource, CloseInstr, ClosureInstr, ConcatInstr, CondOperand, ConstRef,
-    DialectCaptureExtra, GenericForCallInstr, GetTableInstr, GetTableKind, GetUpvalueInstr,
-    InstrRef, LoadBoolInstr, LoadConstInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto,
-    LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange, ResultPack, ReturnInstr,
-    SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr, TransformError, UnaryOpInstr,
-    UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    GenericForCallInstr, GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, LoadBoolInstr,
+    LoadConstInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr,
+    NewTableInstr, ProtoRef, Reg, RegRange, ResultPack, ReturnInstr, SetListInstr, SetTableInstr,
+    SetUpvalueInstr, TailCallInstr, TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef,
+    ValueOperand, ValuePack, VarArgInstr,
 };
 
 const BITRK: u16 = 1 << 8;
@@ -627,7 +627,7 @@ impl<'a> ProtoLowerer<'a> {
                             Lua51Opcode::Move => {
                                 let (_, b) =
                                     expect_ab(capture_extra.pc, capture_opcode, capture_operands)?;
-                                CaptureSource::Reg(reg_from_u16(b))
+                                CaptureSource::ByReference(reg_from_u16(b))
                             }
                             Lua51Opcode::GetUpVal => {
                                 let (_, b) =
@@ -645,10 +645,7 @@ impl<'a> ProtoLowerer<'a> {
                             }
                         };
 
-                        captures.push(Capture {
-                            source,
-                            extra: DialectCaptureExtra::None,
-                        });
+                        captures.push(Capture { source });
                     }
 
                     self.emit(

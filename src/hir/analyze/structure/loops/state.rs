@@ -96,8 +96,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 value.reg,
                 value.inside_arm.values(),
                 &target,
-                &mut plan.backedge_target_overrides,
-                &mut plan.owned_phis,
+                true,
+                &mut plan,
             );
 
             plan.states.push(LoopStateSlot {
@@ -157,8 +157,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     value.reg,
                     value.inside_arm.values(),
                     &target,
-                    &mut plan.backedge_target_overrides,
-                    &mut plan.owned_phis,
+                    true,
+                    &mut plan,
                 );
             }
 
@@ -191,13 +191,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         reg: Reg,
         values: impl IntoIterator<Item = SsaValue>,
         target: &HirLValue,
-        overrides: &mut BTreeMap<TempId, HirLValue>,
-        owned_phis: &mut BTreeSet<PhiId>,
+        follow_same_reg_updates: bool,
+        plan: &mut LoopStatePlan,
     ) {
-        let mut pending = values.into_iter().collect::<Vec<_>>();
+        let mut pending = values
+            .into_iter()
+            .map(|value| (reg, value))
+            .collect::<Vec<_>>();
         let mut seen_defs = BTreeSet::new();
         let mut seen_phis = BTreeSet::new();
-        while let Some(value) = pending.pop() {
+        while let Some((reg, value)) = pending.pop() {
             match value {
                 SsaValue::Def(def) => {
                     if !seen_defs.insert(def) {
@@ -205,7 +208,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     }
                     let temp = self.lowering.bindings.fixed_temps[def.index()];
                     if target != &HirLValue::Temp(temp) {
-                        overrides.insert(temp, target.clone());
+                        plan.backedge_target_overrides.insert(temp, target.clone());
                     }
                     if !candidate
                         .blocks
@@ -214,7 +217,20 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                         continue;
                     }
                     let instr = self.lowering.dataflow.def_instr(def);
-                    pending.push(self.lowering.dataflow.use_value(instr, reg));
+                    if !follow_same_reg_updates
+                        && let LowInstr::Move(move_instr) =
+                            &self.lowering.proto.instrs[instr.index()]
+                        && move_instr.dst == reg
+                        && let source = self.lowering.dataflow.use_value(instr, move_instr.src)
+                        && self
+                            .lowering
+                            .dataflow
+                            .value_used_only_by(source, instr, move_instr.src)
+                    {
+                        pending.push((move_instr.src, source));
+                    } else if follow_same_reg_updates {
+                        pending.push((reg, self.lowering.dataflow.use_value(instr, reg)));
+                    }
                 }
                 SsaValue::Phi(phi_id) => {
                     let Some(phi) = self.lowering.dataflow.phi_candidate(phi_id) else {
@@ -227,9 +243,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                         continue;
                     }
                     let temp = self.lowering.bindings.phi_temps[phi_id.index()];
-                    owned_phis.insert(phi_id);
+                    plan.owned_phis.insert(phi_id);
                     if target != &HirLValue::Temp(temp) {
-                        overrides.insert(temp, target.clone());
+                        plan.backedge_target_overrides.insert(temp, target.clone());
                     }
                     pending.extend(
                         phi.incoming
@@ -239,7 +255,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                                     .pred
                                     .is_some_and(|pred| candidate.blocks.contains(&pred))
                             })
-                            .map(|incoming| incoming.value),
+                            .map(|incoming| (reg, incoming.value)),
                     );
                 }
                 SsaValue::Entry(_) => {}
@@ -352,19 +368,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             };
             rewrite_expr_temps(&mut init, &temp_expr_overrides(target_overrides));
 
-            match value {
-                SsaValue::Def(def) => {
-                    let def_temp = self.lowering.bindings.fixed_temps[def.index()];
-                    plan.backedge_target_overrides
-                        .insert(def_temp, target.clone());
-                }
-                SsaValue::Phi(phi_id) => {
-                    let phi_temp = self.lowering.bindings.phi_temps[phi_id.index()];
-                    plan.backedge_target_overrides
-                        .insert(phi_temp, target.clone());
-                }
-                SsaValue::Entry(_) => {}
-            }
+            self.extend_loop_state_input_overrides(candidate, *reg, [value], &target, false, plan);
             plan.states.push(LoopStateSlot {
                 phi_id: None,
                 reg: *reg,

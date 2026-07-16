@@ -18,14 +18,14 @@ mod debug {
 pub use common::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchInstr, BranchPredicate,
     BranchSubject, CallInstr, CallKind, Capture, CaptureSource, CloseInstr, ClosureInstr,
-    ConcatInstr, CondOperand, ConstRef, DialectCaptureExtra, ErrNilInstr, GenericForCallInstr,
-    GenericForLoopInstr, GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, JumpInstr,
-    LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr,
-    LoweredChunk, LoweredProto, LoweringMap, MethodNameHint, MoveInstr, NewTableInstr,
-    NumberLiteral, NumericForInitInstr, NumericForLoopInstr, ProtoRef, RawInstrRef, Reg, RegRange,
-    ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr, TbcInstr,
-    TbcKind, UnaryOpInstr, UnaryOpKind, UpvalueOperand, UpvalueRef, ValueOperand, ValuePack,
-    VarArgInstr,
+    ConcatInstr, CondOperand, ConstRef, ErrNilInstr, GenericForCallInstr, GenericForLoopInstr,
+    GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, JumpInstr, LoadBoolInstr,
+    LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr, LoweredChunk,
+    LoweredProto, LoweringMap, MethodNameHint, MoveInstr, NewTableInstr, NumberLiteral,
+    NumericForInitInstr, NumericForLoopInstr, ProtoRef, RawInstrRef, Reg, RegRange, ResultPack,
+    ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr, TbcInstr, TbcKind,
+    TypeGuardInstr, TypeGuardKind, UnaryOpInstr, UnaryOpKind, UpvalueOperand, UpvalueRef,
+    ValueOperand, ValuePack, VarArgInstr,
 };
 pub use debug::dump_lir;
 pub use error::TransformError;

@@ -12,8 +12,9 @@ mod regs;
 
 use crate::ast::is_lua_identifier_name;
 use crate::hir::common::{
-    HirBinaryExpr, HirBinaryOpKind, HirCallExpr, HirCapture, HirClosureExpr, HirExpr, HirGlobalRef,
-    HirLValue, HirPackTail, HirTableAccess, HirUnaryExpr, HirUnaryOpKind, UpvalueId,
+    HirBinaryExpr, HirBinaryOpKind, HirCallExpr, HirCapture, HirCaptureMode, HirClosureExpr,
+    HirExpr, HirGlobalRef, HirLValue, HirPackTail, HirTableAccess, HirUnaryExpr, HirUnaryOpKind,
+    UpvalueId,
 };
 use crate::parser::RawLiteralConst;
 use crate::structure::BlockRef;
@@ -42,8 +43,8 @@ pub(super) use self::defs::{
 pub(super) use self::packs::lower_value_pack;
 use self::packs::lower_value_pack_single_eval;
 pub(super) use self::regs::{
-    expr_for_closure_capture, expr_for_reg_at_block_entry, expr_for_reg_at_block_exit,
-    expr_for_reg_use, expr_for_ssa_value,
+    expr_for_reg_at_block_entry, expr_for_reg_at_block_exit, expr_for_reg_use, expr_for_ssa_value,
+    lower_closure_capture,
 };
 use self::regs::{expr_for_reg_use_inline, expr_for_reg_use_single_eval_with_call_policy};
 use super::ProtoLowering;

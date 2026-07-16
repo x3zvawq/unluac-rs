@@ -298,20 +298,14 @@ impl<'a> AstLowerer<'a> {
             HirExpr::Closure(closure) => {
                 AstExpr::FunctionExpr(Box::new(self.lower_function_expr(proto_index, closure)?))
             }
-            HirExpr::Unresolved(_) => {
+            HirExpr::Unresolved(unresolved) => {
                 if !self.should_recover_errors() {
                     return Err(AstLowerError::ResidualHir {
                         proto: proto_index,
                         kind: "unresolved expr",
                     });
                 }
-                AstExpr::Error(
-                    AstLowerError::ResidualHir {
-                        proto: proto_index,
-                        kind: "unresolved expr",
-                    }
-                    .to_string(),
-                )
+                AstExpr::Error(format!("unresolved HIR expression: {}", unresolved.summary))
             }
         })
     }

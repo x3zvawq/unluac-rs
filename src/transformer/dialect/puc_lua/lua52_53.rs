@@ -20,11 +20,11 @@ use crate::transformer::dialect::puc_lua::{
 use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
     AccessBase, BinaryOpInstr, BinaryOpKind, BranchCond, BranchPredicate, Capture, CaptureSource,
-    CloseInstr, ClosureInstr, ConcatInstr, CondOperand, ConstRef, DialectCaptureExtra,
-    GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, LoadBoolInstr, LoadConstInstr,
-    LoadNilInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr,
-    ProtoRef, Reg, RegRange, ResultPack, SetListInstr, SetTableInstr, SetUpvalueInstr,
-    TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    CloseInstr, ClosureInstr, ConcatInstr, CondOperand, ConstRef, GetTableInstr, GetTableKind,
+    GetUpvalueInstr, InstrRef, LoadBoolInstr, LoadConstInstr, LoadNilInstr, LowInstr, LoweredChunk,
+    LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange, ResultPack,
+    SetListInstr, SetTableInstr, SetUpvalueInstr, TransformError, UnaryOpInstr, UnaryOpKind,
+    UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
 mod adapter;
@@ -724,16 +724,13 @@ impl<'a> ProtoLowerer<'a> {
                         .iter()
                         .map(|descriptor| {
                             let source = if descriptor.in_stack {
-                                CaptureSource::Reg(Reg(descriptor.index as usize))
+                                CaptureSource::ByReference(Reg(descriptor.index as usize))
                             } else {
                                 CaptureSource::Upvalue(
                                     self.upvalue_ref(raw_pc, descriptor.index as usize)?,
                                 )
                             };
-                            Ok(Capture {
-                                source,
-                                extra: DialectCaptureExtra::None,
-                            })
+                            Ok(Capture { source })
                         })
                         .collect::<Result<Vec<_>, TransformError>>()?;
 

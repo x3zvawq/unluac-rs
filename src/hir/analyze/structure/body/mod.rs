@@ -429,6 +429,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .branch_value_merge_for_header(header)
     }
 
+    pub(super) fn branch_value_merge_for_region(
+        &self,
+        header: BlockRef,
+        merge: BlockRef,
+    ) -> Option<&'b BranchValueMergeCandidate> {
+        self.lowering
+            .structure
+            .branch_value_merge_for_region(header, merge)
+    }
+
     pub(super) fn has_loop_header(&self, header: BlockRef) -> bool {
         self.lowering.structure.has_loop_header(header)
     }

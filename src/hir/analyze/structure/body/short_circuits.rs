@@ -82,7 +82,9 @@ impl StructuredBodyLowerer<'_, '_> {
                 return Some(None);
             }
         }
-
+        if stop.is_some_and(|stop| consumed_headers.contains(&stop)) {
+            return Some(None);
+        }
         // 单节点 short-circuit 和普通 branch 在结构信息上是重叠的。
         // 这里如果已经有 plain branch candidate，就优先走普通 branch 恢复：
         // short-circuit 那条 `can_reach(truthy, falsy)` 启发式在 loop 图里会把

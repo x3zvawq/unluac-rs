@@ -276,6 +276,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         }
 
+        // 该快捷路径只消费分支块并等待 merge phi 稍后物化；若叶子 def 已由 loop
+        // state 接管，merge phi 会被抑制，必须退回普通分支让两臂直接写入 owner。
+        if value_merge_defs_are_overridden(self.lowering, short, target_overrides) {
+            return None;
+        }
+
         let allowed_blocks = BTreeSet::from([block]);
         let recovery = recover_short_value_merge_expr_recovery_with_allowed_blocks(
             self.lowering,
@@ -350,12 +356,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let Some(candidate) = self.branch_candidate_for_header(header) else {
             return target_overrides.clone();
         };
+        let Some(value_merge) = self.branch_value_merge_for_header(header) else {
+            return target_overrides.clone();
+        };
 
         if entry == candidate.then_entry {
-            return self.branch_value_then_target_overrides(header, target_overrides);
+            return self.branch_value_then_target_overrides(value_merge, target_overrides);
         }
         if Some(entry) == candidate.else_entry {
-            return self.branch_value_else_target_overrides(header, target_overrides);
+            return self.branch_value_else_target_overrides(value_merge, target_overrides);
         }
 
         target_overrides.clone()
