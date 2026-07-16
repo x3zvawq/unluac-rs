@@ -20,8 +20,9 @@ use crate::transformer::{
     GenericForCallInstr, GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, LoadBoolInstr,
     LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto,
     LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange, ResultPack, ReturnInstr,
-    SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr, TransformError, TypeGuardInstr,
-    TypeGuardKind, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    SetListInstr, SetTableInstr, SetTableKind, SetUpvalueInstr, TailCallInstr, TransformError,
+    TypeGuardInstr, TypeGuardKind, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack,
+    VarArgInstr,
 };
 
 const NO_REG: u8 = 0xff;
@@ -429,6 +430,7 @@ impl<'a> ProtoLowerer<'a> {
                                 base: AccessBase::Reg(dst),
                                 key: AccessKey::Integer(index as i64),
                                 value: self.table_literal_value(literal),
+                                kind: SetTableKind::Normal,
                             })),
                         );
                     }
@@ -443,6 +445,7 @@ impl<'a> ProtoLowerer<'a> {
                                 base: AccessBase::Reg(dst),
                                 key: self.table_literal_key(&record.key),
                                 value: self.table_literal_value(&record.value),
+                                kind: SetTableKind::Normal,
                             })),
                         );
                     }
@@ -475,6 +478,7 @@ impl<'a> ProtoLowerer<'a> {
                                 self.kgc_string_const_ref(raw_pc, usize::from(d))?,
                             ),
                             value: ValueOperand::Reg(reg_from_u8(a)),
+                            kind: SetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -488,7 +492,11 @@ impl<'a> ProtoLowerer<'a> {
                             dst: reg_from_u8(a),
                             base: AccessBase::Reg(reg_from_u8(b)),
                             key: AccessKey::Reg(reg_from_u8(c)),
-                            kind: GetTableKind::Normal,
+                            kind: if opcode == LuaJitOpcode::TGetR {
+                                GetTableKind::Raw
+                            } else {
+                                GetTableKind::Normal
+                            },
                         })),
                     );
                     raw_index += 1;
@@ -532,6 +540,11 @@ impl<'a> ProtoLowerer<'a> {
                             base: AccessBase::Reg(reg_from_u8(b)),
                             key: AccessKey::Reg(reg_from_u8(c)),
                             value: ValueOperand::Reg(reg_from_u8(a)),
+                            kind: if opcode == LuaJitOpcode::TSetR {
+                                SetTableKind::Raw
+                            } else {
+                                SetTableKind::Normal
+                            },
                         })),
                     );
                     raw_index += 1;
@@ -547,6 +560,7 @@ impl<'a> ProtoLowerer<'a> {
                                 self.kgc_string_const_ref(raw_pc, usize::from(c))?,
                             ),
                             value: ValueOperand::Reg(reg_from_u8(a)),
+                            kind: SetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -560,6 +574,7 @@ impl<'a> ProtoLowerer<'a> {
                             base: AccessBase::Reg(reg_from_u8(b)),
                             key: AccessKey::Integer(i64::from(c)),
                             value: ValueOperand::Reg(reg_from_u8(a)),
+                            kind: SetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -1127,14 +1142,14 @@ impl<'a> ProtoLowerer<'a> {
                 let (a, d) = expect_ad(raw_pc, opcode, operands)?;
                 let lhs = CondOperand::Reg(reg_from_u8(a));
                 let rhs = CondOperand::Reg(reg_from_u16(d));
-                let (predicate, left, right) = match opcode {
-                    LuaJitOpcode::IsLt => (BranchPredicate::Lt, lhs, rhs),
-                    LuaJitOpcode::IsLe => (BranchPredicate::Le, lhs, rhs),
-                    LuaJitOpcode::IsGe => (BranchPredicate::Le, rhs, lhs),
-                    LuaJitOpcode::IsGt => (BranchPredicate::Lt, rhs, lhs),
+                let (predicate, negated) = match opcode {
+                    LuaJitOpcode::IsLt => (BranchPredicate::Lt, false),
+                    LuaJitOpcode::IsGe => (BranchPredicate::Lt, true),
+                    LuaJitOpcode::IsLe => (BranchPredicate::Le, false),
+                    LuaJitOpcode::IsGt => (BranchPredicate::Le, true),
                     _ => unreachable!(),
                 };
-                Ok(BranchCond::compare(predicate, left, right, false))
+                Ok(BranchCond::compare(predicate, lhs, rhs, negated))
             }
             LuaJitOpcode::IsEqV | LuaJitOpcode::IsNeV => {
                 let (a, d) = expect_ad(raw_pc, opcode, operands)?;

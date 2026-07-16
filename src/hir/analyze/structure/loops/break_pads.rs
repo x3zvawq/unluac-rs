@@ -15,7 +15,7 @@ struct BreakExitPadArmContext<'a> {
     downstream_post_loop: Option<BlockRef>,
     target_overrides: &'a BTreeMap<TempId, HirLValue>,
     states: &'a [LoopStateSlot],
-    allowed_blocks: &'a BTreeSet<BlockRef>,
+    region: &'a BranchRegionFact,
 }
 
 impl StructuredBodyLowerer<'_, '_> {
@@ -171,13 +171,12 @@ impl StructuredBodyLowerer<'_, '_> {
         }
         let merge = plan.merge?;
         let region = self.branch_regions_by_header.get(&block)?;
-        let allowed_blocks = self.branch_region_blocks(region);
         let arm_context = BreakExitPadArmContext {
             post_loop,
             downstream_post_loop,
             target_overrides,
             states,
-            allowed_blocks: &allowed_blocks,
+            region,
         };
         let tail = if merge == post_loop || Some(merge) == downstream_post_loop {
             BreakExitBlock {
@@ -312,7 +311,7 @@ impl StructuredBodyLowerer<'_, '_> {
                 blocks: BTreeSet::new(),
             });
         }
-        if !context.allowed_blocks.contains(&block) {
+        if !self.branch_region_contains(context.region, block) {
             return None;
         }
 

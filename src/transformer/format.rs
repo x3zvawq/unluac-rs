@@ -7,8 +7,8 @@
 
 use super::{
     AccessBase, AccessKey, BinaryOpKind, BranchCond, BranchPredicate, BranchSubject, CallKind,
-    CaptureSource, CondOperand, InstrRef, LowInstr, Reg, RegRange, ResultPack, UnaryOpKind,
-    ValueOperand, ValuePack,
+    CaptureSource, CondOperand, GetTableKind, InstrRef, LowInstr, Reg, RegRange, ResultPack,
+    SetTableKind, UnaryOpKind, ValueOperand, ValuePack,
 };
 
 pub fn format_low_instr(instr: &LowInstr) -> String {
@@ -66,13 +66,23 @@ pub fn format_low_instr(instr: &LowInstr) -> String {
             format_value_operand(instr.src)
         ),
         LowInstr::GetTable(instr) => format!(
-            "get-table {} <- {}[{}]",
+            "{} {} <- {}[{}]",
+            if instr.kind == GetTableKind::Raw {
+                "raw-get-table"
+            } else {
+                "get-table"
+            },
             format_reg(instr.dst),
             format_access_base(instr.base),
             format_access_key(instr.key)
         ),
         LowInstr::SetTable(instr) => format!(
-            "set-table {}[{}] <- {}",
+            "{} {}[{}] <- {}",
+            if instr.kind == SetTableKind::Raw {
+                "raw-set-table"
+            } else {
+                "set-table"
+            },
             format_access_base(instr.base),
             format_access_key(instr.key),
             format_value_operand(instr.value)

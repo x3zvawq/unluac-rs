@@ -13,7 +13,8 @@ use std::collections::BTreeMap;
 use super::exprs::{
     expr_for_const, expr_for_reg_use, expr_for_value_operand, global_name_for_access,
     lower_binary_op, lower_branch_cond, lower_closure_capture, lower_method_name,
-    lower_table_access_expr, lower_table_access_target, lower_unary_op, lower_upvalue_operand_expr,
+    lower_raw_table_get_expr, lower_raw_table_set_call, lower_table_access_expr,
+    lower_table_access_target, lower_unary_op, lower_upvalue_operand_expr,
     lower_upvalue_operand_target, lower_value_pack,
 };
 use super::helpers::{
@@ -29,7 +30,7 @@ use crate::hir::common::{
 use crate::structure::BlockRef;
 use crate::transformer::{
     AccessBase, AccessKey, CallKind, GenericForCallInstr, GetTableKind, InstrRef, LowInstr,
-    MethodNameHint, Reg, ResultPack,
+    MethodNameHint, Reg, ResultPack, SetTableKind,
 };
 
 pub(super) fn lower_regular_instr(
@@ -136,15 +137,37 @@ pub(super) fn lower_regular_instr(
                 fixed_assign(
                     lowering,
                     instr_ref,
-                    vec![lower_table_access_expr(
-                        lowering,
-                        block,
-                        instr_ref,
-                        get_table.base,
-                        get_table.key,
-                    )],
+                    vec![if get_table.kind == GetTableKind::Raw {
+                        lower_raw_table_get_expr(
+                            lowering,
+                            block,
+                            instr_ref,
+                            get_table.base,
+                            get_table.key,
+                        )
+                    } else {
+                        lower_table_access_expr(
+                            lowering,
+                            block,
+                            instr_ref,
+                            get_table.base,
+                            get_table.key,
+                        )
+                    }],
                 )
             }
+        }
+        LowInstr::SetTable(set_table) if set_table.kind == SetTableKind::Raw => {
+            vec![HirStmt::CallStmt(Box::new(HirCallStmt {
+                call: lower_raw_table_set_call(
+                    lowering,
+                    block,
+                    instr_ref,
+                    set_table.base,
+                    set_table.key,
+                    set_table.value,
+                ),
+            }))]
         }
         LowInstr::SetTable(set_table) => vec![assign_stmt(
             vec![lower_table_access_target(

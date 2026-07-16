@@ -376,10 +376,8 @@ impl StructuredBodyLowerer<'_, '_> {
             return false;
         }
 
-        let mut allowed_blocks = self.branch_region_blocks(region);
-        allowed_blocks.insert(stop);
         let arm_can_truncate_to_stop =
-            |entry| self.branch_arm_can_truncate_to_stop(entry, stop, &allowed_blocks);
+            |entry| self.branch_arm_can_truncate_to_stop(entry, stop, region);
 
         // `if-then` / guard 没有显式 else 臂时，缺席的那一臂本来就代表“当前 region 不再
         // 产生额外语句，直接把控制权交回外层 stop”。这里如果仍然要求 else_entry 存在，
@@ -392,7 +390,7 @@ impl StructuredBodyLowerer<'_, '_> {
         &self,
         entry: BlockRef,
         stop: BlockRef,
-        allowed_blocks: &BTreeSet<BlockRef>,
+        region: &BranchRegionFact,
     ) -> bool {
         if entry == stop {
             return true;
@@ -402,10 +400,9 @@ impl StructuredBodyLowerer<'_, '_> {
             return false;
         }
 
-        self.lowering
-            .cfg
-            .can_reach_within(entry, stop, allowed_blocks)
-            || self.branch_arm_terminates_before_stop(entry, stop)
+        self.lowering.cfg.can_reach_filtered(entry, stop, |block| {
+            self.branch_region_contains(region, block)
+        }) || self.branch_arm_terminates_before_stop(entry, stop)
     }
 
     fn branch_arm_crosses_live_continuation(&self, entry: BlockRef, stop: BlockRef) -> bool {

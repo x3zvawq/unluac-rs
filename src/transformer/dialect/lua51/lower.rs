@@ -19,8 +19,8 @@ use crate::transformer::{
     GenericForCallInstr, GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, LoadBoolInstr,
     LoadConstInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr,
     NewTableInstr, ProtoRef, Reg, RegRange, ResultPack, ReturnInstr, SetListInstr, SetTableInstr,
-    SetUpvalueInstr, TailCallInstr, TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef,
-    ValueOperand, ValuePack, VarArgInstr,
+    SetTableKind, SetUpvalueInstr, TailCallInstr, TransformError, UnaryOpInstr, UnaryOpKind,
+    UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
 const BITRK: u16 = 1 << 8;
@@ -202,6 +202,7 @@ impl<'a> ProtoLowerer<'a> {
                             base: AccessBase::Env,
                             key: AccessKey::Const(self.const_ref(raw_pc, bx as usize)?),
                             value: ValueOperand::Reg(reg_from_u8(a)),
+                            kind: SetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -227,6 +228,7 @@ impl<'a> ProtoLowerer<'a> {
                             base: AccessBase::Reg(reg_from_u8(a)),
                             key: self.access_key(raw_pc, b)?,
                             value: self.value_operand(raw_pc, c)?,
+                            kind: SetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;

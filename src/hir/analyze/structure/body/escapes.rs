@@ -75,7 +75,7 @@ impl StructuredBodyLowerer<'_, '_> {
         let mut values = Vec::new();
 
         for loop_context in &self.active_loops {
-            if loop_context.loop_blocks.contains(&to) {
+            if self.active_loop_contains(loop_context, to) {
                 continue;
             }
 
@@ -117,7 +117,7 @@ impl StructuredBodyLowerer<'_, '_> {
 
         self.active_loops
             .iter()
-            .filter(|loop_context| !loop_context.loop_blocks.contains(&to))
+            .filter(|loop_context| !self.active_loop_contains(loop_context, to))
             .flat_map(|loop_context| loop_context.state_slots.iter())
             .find(|state| state.reg == reg)
             .map(|state| state.target.clone())

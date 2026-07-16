@@ -199,6 +199,12 @@ pub(super) fn compute_side_effect_summary(instr: &LowInstr) -> SideEffectSummary
     let mut tags = BTreeSet::new();
 
     match instr {
+        LowInstr::UnaryOp(instr) if instr.op != UnaryOpKind::Not => {
+            tags.extend([EffectTag::Metamethod, EffectTag::MayThrow]);
+        }
+        LowInstr::BinaryOp(_) | LowInstr::Concat(_) => {
+            tags.extend([EffectTag::Metamethod, EffectTag::MayThrow]);
+        }
         LowInstr::GetUpvalue(_instr) => {
             tags.insert(EffectTag::ReadUpvalue);
         }
@@ -229,7 +235,9 @@ pub(super) fn compute_side_effect_summary(instr: &LowInstr) -> SideEffectSummary
                 AccessBase::Reg(_) => {}
             }
         }
-        LowInstr::ErrNil(_instr) => {}
+        LowInstr::ErrNil(_instr) => {
+            tags.insert(EffectTag::MayThrow);
+        }
         LowInstr::TypeGuard(_instr) => {
             tags.insert(EffectTag::Call);
         }
@@ -247,6 +255,9 @@ pub(super) fn compute_side_effect_summary(instr: &LowInstr) -> SideEffectSummary
         }
         LowInstr::Close(_instr) => {
             tags.insert(EffectTag::Close);
+        }
+        LowInstr::Tbc(_instr) => {
+            tags.extend([EffectTag::MayThrow, EffectTag::RegisterClose]);
         }
         _ => {}
     }

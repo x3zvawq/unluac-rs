@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::super::common::{AstBindingRef, AstBlock, AstModule, AstStmt};
+use super::super::common::{AstBindingRef, AstBlock, AstLocalAttr, AstModule, AstStmt};
 use super::ReadabilityContext;
 use super::binding_flow::{BindingUseIndex, binding_mentions_in_stmt};
 use super::expr_analysis::is_discard_safe_expr;
@@ -58,12 +58,10 @@ fn cleanup_block(block: &mut AstBlock, allow_trailing_empty_return_elision: bool
     // 在父块结束处同样终止，do-end 仅是多余的缩进壳。
     // 典型来源：guard-flip 把 `if cond then BODY else return end` 拉平成
     // `if not cond then return end; do BODY end`，其中 BODY 含 local 声明。
-    // 例外：含 GlobalDecl（如 `global<const> *`）的 do-end 有实际作用域语义，保留。
+    // 例外：global 声明和 `<close>` local 的 do-end 有实际作用域语义，保留。尤其
+    // repeat body 与 until 条件共享外层作用域，拍平资源块会把关闭时点推迟到条件之后。
     while let Some(AstStmt::DoBlock(nested)) = block.stmts.last()
-        && !nested
-            .stmts
-            .iter()
-            .any(|s| matches!(s, AstStmt::GlobalDecl(_)))
+        && trailing_do_block_is_scope_neutral(nested)
     {
         let Some(AstStmt::DoBlock(nested)) = block.stmts.pop() else {
             unreachable!();
@@ -126,6 +124,17 @@ fn cleanup_block(block: &mut AstBlock, allow_trailing_empty_return_elision: bool
     }
 
     changed
+}
+
+fn trailing_do_block_is_scope_neutral(block: &AstBlock) -> bool {
+    !block.stmts.iter().any(|stmt| match stmt {
+        AstStmt::GlobalDecl(_) => true,
+        AstStmt::LocalDecl(local_decl) => local_decl
+            .bindings
+            .iter()
+            .any(|binding| binding.attr == AstLocalAttr::Close),
+        _ => false,
+    })
 }
 
 fn can_elide_single_stmt_do_block(stmt: &AstStmt) -> bool {
@@ -216,6 +225,9 @@ fn collect_discardable_unused_locals(
         let [value] = local_decl.values.as_slice() else {
             continue;
         };
+        if binding.attr != AstLocalAttr::None {
+            continue;
+        }
         if !matches!(binding.origin, crate::ast::AstLocalOrigin::Recovered) {
             continue;
         }

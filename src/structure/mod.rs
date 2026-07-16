@@ -33,8 +33,8 @@ pub use common::{
     GotoRequirement, LoopCandidate, LoopExitValueMergeCandidate, LoopKindHint, LoopSourceBindings,
     LoopValueArm, LoopValueIncoming, LoopValueMerge, PhiEdgeCopy, RegionFact, ScopeCandidate,
     ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNode, ShortCircuitNodeRef,
-    ShortCircuitTarget, ShortCircuitValueIncoming, StructureFacts, StructurePlan,
-    UnstructuredRegionLayout,
+    ShortCircuitTarget, ShortCircuitValueIncoming, SinglePassFenceFact, StructureFacts,
+    StructurePlan, UnstructuredRegionLayout,
 };
 #[cfg(feature = "decompile-debug")]
 pub use debug::dump_structure;

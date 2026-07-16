@@ -710,6 +710,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         )?;
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
+        self.suppress_loop_tbc_boundaries(candidate_id, candidate);
         let repeat_condition = self
             .lowering
             .structure

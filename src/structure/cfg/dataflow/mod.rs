@@ -10,7 +10,7 @@ use std::collections::{BTreeSet, VecDeque};
 use crate::decompile::{DecompileContext, DecompileError, DecompileState};
 use crate::transformer::{
     AccessBase, AccessKey, BranchSubject, CaptureSource, CondOperand, InstrRef, LowInstr,
-    LoweredProto, Reg, RegRange, ResultPack, ValueOperand, ValuePack,
+    LoweredProto, Reg, RegRange, ResultPack, UnaryOpKind, ValueOperand, ValuePack,
 };
 
 use self::effects::{compute_instr_effect, compute_reg_count, compute_side_effect_summary};

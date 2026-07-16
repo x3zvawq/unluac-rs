@@ -440,11 +440,19 @@ fn write_branch_regions(output: &mut String, indent: &str, facts: &[BranchRegion
         );
         let _ = writeln!(
             output,
-            "{indent}    header=#{} kind={} merge=#{} structured={}",
+            "{indent}    header=#{} kind={} merge=#{} structured={} fence={}",
             fact.header.index(),
             format_branch_kind(fact.kind),
             fact.merge.index(),
             structured,
+            fact.single_pass_fence.as_ref().map_or_else(
+                || "-".to_string(),
+                |fence| format!(
+                    "exit=#{} escape-edges={}",
+                    fence.exit.index(),
+                    format_display_set(&fence.escape_edges)
+                )
+            ),
         );
     }
 }

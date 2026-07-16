@@ -493,6 +493,8 @@ pub struct GetTableInstr {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum GetTableKind {
     Normal,
+    /// LuaJIT `TGETR` 的 raw integer-key 读取，不触发 `__index`。
+    Raw,
     /// Luau `GETIMPORT` 展开的稳定路径读取。
     Import,
     /// 来自 `SELF` / `NAMECALL` 三元式的 method-load。
@@ -511,6 +513,15 @@ pub struct SetTableInstr {
     pub base: AccessBase,
     pub key: AccessKey,
     pub value: ValueOperand,
+    pub kind: SetTableKind,
+}
+
+/// 表写入在源字节码中的协议身份。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum SetTableKind {
+    Normal,
+    /// LuaJIT `TSETR` 的 raw integer-key 写入，不触发 `__newindex`。
+    Raw,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]

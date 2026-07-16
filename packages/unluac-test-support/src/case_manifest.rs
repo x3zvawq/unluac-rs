@@ -1240,6 +1240,34 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_241_branch_value_single_eval.lua",
         PUC_LUA_ALL,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_242_repeat_nested_break_shared_fallthrough.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_243_repeat_tbc_iteration_scope.lua",
+        PUC_LUA_GE_54,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_244_effectful_errnnil_tbc.lua",
+        PUC_LUA_GE_55,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_245_observable_repeat_prefix_ops.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_246_repeat_nested_close_scope.lua",
+        PUC_LUA_GE_54,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_247_disconnected_if_else_no_merge.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_248_luajit_negated_compare.lua",
+        LUAJIT_ONLY,
+    ),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {

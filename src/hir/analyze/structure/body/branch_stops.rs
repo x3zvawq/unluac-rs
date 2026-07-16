@@ -283,10 +283,10 @@ impl StructuredBodyLowerer<'_, '_> {
                 || self.can_reach_avoiding_block(entry, candidate, loop_context.header)
         };
         let implicit_else_entry = else_entry.unwrap_or(region.merge);
+        let mut immediate_continuation = None;
         let mut fallback_continuation = None;
-        for candidate in self
-            .branch_region_blocks(region)
-            .into_iter()
+        for candidate in region
+            .structured_blocks(self.lowering.graph_facts)
             .filter(|candidate| *candidate != block)
             .filter(|candidate| !consumed_blocks.contains(candidate))
             .filter(|candidate| *candidate != stop)
@@ -311,10 +311,13 @@ impl StructuredBodyLowerer<'_, '_> {
                             stop,
                         )))
             {
-                return Some(candidate);
+                immediate_continuation = Some(
+                    immediate_continuation
+                        .map_or(candidate, |current: BlockRef| current.min(candidate)),
+                );
+                continue;
             }
-            if fallback_continuation.is_none()
-                && let Some(else_entry) = else_entry
+            if let Some(else_entry) = else_entry
                 && self
                     .branch_candidate_for_header(candidate)
                     .is_some_and(|branch| branch.merge == Some(stop))
@@ -323,8 +326,15 @@ impl StructuredBodyLowerer<'_, '_> {
                 && self.branch_arm_reaches_stop_or_loop_escape(then_entry, candidate, stop)
                 && self.branch_arm_reaches_stop_or_loop_escape(else_entry, candidate, stop)
             {
-                fallback_continuation = Some(candidate);
+                fallback_continuation = Some(
+                    fallback_continuation
+                        .map_or(candidate, |current: BlockRef| current.min(candidate)),
+                );
             }
+        }
+
+        if let Some(continuation) = immediate_continuation {
+            return Some(continuation);
         }
 
         // early continue 可以让一条路径跳过 tail；只用 Structure 明确给出

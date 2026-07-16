@@ -91,12 +91,16 @@ fn loop_value_has_inside_and_outside_incoming(value: &LoopValueMerge) -> bool {
     !value.inside_arm.is_empty() && !value.outside_arm.is_empty()
 }
 
-fn loop_value_incoming_all_within_blocks(
+fn loop_value_incoming_all_inside(
     value: &LoopValueMerge,
-    allowed_blocks: &BTreeSet<BlockRef>,
+    is_inside: impl Fn(BlockRef) -> bool + Copy,
 ) -> bool {
-    value.inside_arm.all_preds_within(allowed_blocks)
-        && value.outside_arm.all_preds_within(allowed_blocks)
+    value
+        .inside_arm
+        .incomings
+        .iter()
+        .chain(value.outside_arm.incomings.iter())
+        .all(|incoming| incoming.pred.is_some_and(is_inside))
 }
 
 fn single_fixed_def_expr(

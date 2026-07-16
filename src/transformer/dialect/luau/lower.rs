@@ -23,8 +23,8 @@ use crate::transformer::{
     GenericForCallInstr, GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, LoadBoolInstr,
     LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto,
     LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange, ResultPack, ReturnInstr,
-    SetListInstr, SetTableInstr, SetUpvalueInstr, TransformError, UnaryOpInstr, UnaryOpKind,
-    UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    SetListInstr, SetTableInstr, SetTableKind, SetUpvalueInstr, TransformError, UnaryOpInstr,
+    UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
 pub(crate) fn lower_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
@@ -273,6 +273,7 @@ impl<'a> ProtoLowerer<'a> {
                                 self.string_const_ref(raw_pc, aux_u24(raw_pc, opcode, extra)?)?,
                             ),
                             value: ValueOperand::Reg(reg_from_u8(a)),
+                            kind: SetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -328,6 +329,7 @@ impl<'a> ProtoLowerer<'a> {
                             base: AccessBase::Reg(reg_from_u8(b)),
                             key: AccessKey::Reg(reg_from_u8(c)),
                             value: ValueOperand::Reg(reg_from_u8(a)),
+                            kind: SetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -361,6 +363,7 @@ impl<'a> ProtoLowerer<'a> {
                                 self.string_const_ref(raw_pc, aux_u24(raw_pc, opcode, extra)?)?,
                             ),
                             value: ValueOperand::Reg(reg_from_u8(a)),
+                            kind: SetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -390,6 +393,7 @@ impl<'a> ProtoLowerer<'a> {
                             base: AccessBase::Reg(reg_from_u8(b)),
                             key: AccessKey::Integer(i64::from(c) + 1),
                             value: ValueOperand::Reg(reg_from_u8(a)),
+                            kind: SetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -1365,6 +1369,7 @@ impl<'a> ProtoLowerer<'a> {
                             value: ValueOperand::Const(
                                 self.literal_const_ref(raw_pc, value_const as usize)?,
                             ),
+                            kind: SetTableKind::Normal,
                         })),
                     );
                 }

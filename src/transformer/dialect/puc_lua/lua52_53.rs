@@ -23,8 +23,8 @@ use crate::transformer::{
     CloseInstr, ClosureInstr, ConcatInstr, CondOperand, ConstRef, GetTableInstr, GetTableKind,
     GetUpvalueInstr, InstrRef, LoadBoolInstr, LoadConstInstr, LoadNilInstr, LowInstr, LoweredChunk,
     LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange, ResultPack,
-    SetListInstr, SetTableInstr, SetUpvalueInstr, TransformError, UnaryOpInstr, UnaryOpKind,
-    UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    SetListInstr, SetTableInstr, SetTableKind, SetUpvalueInstr, TransformError, UnaryOpInstr,
+    UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
 mod adapter;
@@ -264,6 +264,7 @@ impl<'a> ProtoLowerer<'a> {
                             )?,
                             key: rk_access_key(self.raw, raw_pc, b)?,
                             value: rk_value_operand(self.raw, raw_pc, c)?,
+                            kind: SetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -294,6 +295,7 @@ impl<'a> ProtoLowerer<'a> {
                             base: AccessBase::Reg(reg_from_u8(a)),
                             key: rk_access_key(self.raw, raw_pc, b)?,
                             value: rk_value_operand(self.raw, raw_pc, c)?,
+                            kind: SetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;

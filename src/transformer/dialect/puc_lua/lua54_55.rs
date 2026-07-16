@@ -27,8 +27,8 @@ use crate::transformer::{
     GenericForPrepInstr, GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, LoadBoolInstr,
     LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr, LoweredChunk,
     LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange, ResultPack,
-    SetListInstr, SetTableInstr, SetUpvalueInstr, TbcInstr, TransformError, UnaryOpInstr,
-    UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    SetListInstr, SetTableInstr, SetTableKind, SetUpvalueInstr, TbcInstr, TransformError,
+    UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 
 mod adapter;
@@ -368,6 +368,7 @@ impl<'a> ProtoLowerer<'a> {
                             )?,
                             key: AccessKey::Const(self.const_ref(raw_pc, b as usize)?),
                             value: k_value_operand(self.raw, raw_pc, c, k)?,
+                            kind: SetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -398,6 +399,7 @@ impl<'a> ProtoLowerer<'a> {
                             base: AccessBase::Reg(reg_from_u8(a)),
                             key: AccessKey::Reg(reg_from_u8(b)),
                             value: k_value_operand(self.raw, raw_pc, c, k)?,
+                            kind: SetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -411,6 +413,7 @@ impl<'a> ProtoLowerer<'a> {
                             base: AccessBase::Reg(reg_from_u8(a)),
                             key: AccessKey::Integer(i64::from(b)),
                             value: k_value_operand(self.raw, raw_pc, c, k)?,
+                            kind: SetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;
@@ -424,6 +427,7 @@ impl<'a> ProtoLowerer<'a> {
                             base: AccessBase::Reg(reg_from_u8(a)),
                             key: AccessKey::Const(self.const_ref(raw_pc, b as usize)?),
                             value: k_value_operand(self.raw, raw_pc, c, k)?,
+                            kind: SetTableKind::Normal,
                         })),
                     );
                     raw_index += 1;

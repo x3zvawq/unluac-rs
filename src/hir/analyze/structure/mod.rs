@@ -20,9 +20,9 @@ use crate::hir::decision::finalize_condition_decision_expr;
 use crate::structure::{
     BlockOwner, BranchCandidate, BranchCandidateId, BranchKind, BranchRegionFact,
     BranchValueMergeArm, BranchValueMergeCandidate, BranchValueMergeValue, CleanupDisposition,
-    EdgeOwner, GotoReason, LoopCandidate, LoopCandidateId, LoopKindHint, LoopValueArm,
+    EdgeOwner, EdgeRef, GotoReason, LoopCandidate, LoopCandidateId, LoopKindHint, LoopValueArm,
     LoopValueMerge, RegionId, ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNodeRef,
-    ShortCircuitTarget,
+    ShortCircuitTarget, SinglePassFenceFact,
 };
 use crate::structure::{BlockRef, PhiId, ReachableSuccessorShape};
 use crate::transformer::{InstrRef, LowInstr, Reg};

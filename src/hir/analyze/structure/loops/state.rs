@@ -134,16 +134,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             }
 
             let Some(init) = self
-                .loop_exit_entry_expr_with_inside_blocks(
+                .loop_exit_entry_expr(
                     value,
-                    &inside_exit_blocks,
+                    |block| inside_exit_blocks.contains(&block),
                     target_overrides,
                 )
                 .or_else(|| {
                     self.loop_exit_state_preheader_init(
                         preheader,
                         value,
-                        &inside_exit_blocks,
+                        |block| inside_exit_blocks.contains(&block),
                         target_overrides,
                     )
                 })
@@ -457,7 +457,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.apply_exit_phi_bindings(
             candidate,
             exit,
-            &inside_exit_blocks,
+            |block| inside_exit_blocks.contains(&block),
             &state_by_reg,
             target_overrides,
         );
@@ -469,17 +469,22 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .copied()
             .filter(|other| *other != exit)
         {
-            let mut shared_exit_blocks = candidate.blocks.clone();
-            shared_exit_blocks.insert(exit);
-            if let Some(region) = self.branch_regions_by_header.get(&exit)
-                && region.merge == other_exit
-            {
-                shared_exit_blocks.extend(self.branch_region_blocks(region));
-            }
+            let region = self
+                .branch_regions_by_header
+                .get(&exit)
+                .copied()
+                .filter(|region| region.merge == other_exit);
+            let graph_facts = self.lowering.graph_facts;
             self.apply_exit_phi_bindings(
                 candidate,
                 other_exit,
-                &shared_exit_blocks,
+                |block| {
+                    candidate.blocks.contains(&block)
+                        || block == exit
+                        || region.is_some_and(|region| {
+                            region.contains_structured_block(graph_facts, block)
+                        })
+                },
                 &state_by_reg,
                 target_overrides,
             );
@@ -500,12 +505,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // 那条 outside incoming 才能被认成“仍在循环内侧”，从而被顶成同一条
         // loop state。
         if let Some(downstream) = self.normalized_post_loop_successor(exit) {
-            let mut inside_with_pad = inside_exit_blocks.clone();
-            inside_with_pad.insert(exit);
             self.apply_exit_phi_bindings(
                 candidate,
                 downstream,
-                &inside_with_pad,
+                |block| inside_exit_blocks.contains(&block) || block == exit,
                 &state_by_reg,
                 target_overrides,
             );
@@ -516,14 +519,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     ///
     /// 抽出这段逻辑是为了让 `install_loop_exit_bindings` 可以在 `branch_exit`
     /// 自身以及它下游的线性 continuation 上各跑一遍，而不在两处复制分支判定。
-    fn apply_exit_phi_bindings(
+    fn apply_exit_phi_bindings<F>(
         &mut self,
         candidate: &LoopCandidate,
         at_block: BlockRef,
-        inside_exit_blocks: &BTreeSet<BlockRef>,
+        is_inside: F,
         state_by_reg: &BTreeMap<Reg, &LoopStateSlot>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
-    ) {
+    ) where
+        F: Fn(BlockRef) -> bool + Copy,
+    {
         for value in Self::exit_values(candidate, at_block) {
             if let Some(state) = state_by_reg.get(&value.reg) {
                 let Some(state_expr) = lvalue_as_expr(&state.target) else {
@@ -532,7 +537,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 // break 先落在线性 cleanup pad、再跳到 post-loop continuation 时，
                 // exit phi 的 incoming 里会混进这些 pad block。它们虽然 CFG 上已不在
                 // `candidate.blocks` 内，但语义上仍然是 loop state 的内部出口。
-                if loop_value_incoming_all_within_blocks(value, inside_exit_blocks) {
+                if loop_value_incoming_all_inside(value, is_inside) {
                     self.replace_phi_with_target_expr(
                         at_block,
                         value.phi_id,
@@ -541,11 +546,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     );
                     continue;
                 }
-                let Some(exit_init) = self.loop_exit_entry_expr_with_inside_blocks(
-                    value,
-                    inside_exit_blocks,
-                    target_overrides,
-                ) else {
+                let Some(exit_init) = self.loop_exit_entry_expr(value, is_inside, target_overrides)
+                else {
                     continue;
                 };
                 // 只有当 exit phi 的“循环外初值”与当前 loop state 的初值确实是同一个语义槽位时，

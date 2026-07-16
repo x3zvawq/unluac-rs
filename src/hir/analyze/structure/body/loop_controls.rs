@@ -528,7 +528,7 @@ impl StructuredBodyLowerer<'_, '_> {
                 (short_plan.else_entry.is_none()
                     && short_plan.merge == Some(non_continue_entry)
                     && (short_plan.then_entry == continue_target
-                        || (loop_context.loop_blocks.contains(&short_plan.then_entry)
+                        || (self.active_loop_contains(&loop_context, short_plan.then_entry)
                             && self
                                 .lowering
                                 .cfg
@@ -867,7 +867,7 @@ impl StructuredBodyLowerer<'_, '_> {
         let else_entry = plan.else_entry?;
         let is_continue_entry = |entry: BlockRef| {
             entry == continue_target
-                || (loop_context.loop_blocks.contains(&entry)
+                || (self.active_loop_contains(loop_context, entry)
                     && self.lowering.cfg.unique_reachable_successor(entry) == Some(continue_target))
         };
         match (

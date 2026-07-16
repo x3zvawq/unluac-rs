@@ -289,7 +289,15 @@ pub struct BranchRegionFact {
     pub header: BlockRef,
     pub merge: BlockRef,
     pub kind: BranchKind,
+    pub single_pass_fence: Option<SinglePassFenceFact>,
     pub(super) explicit_structured_blocks: Option<BTreeSet<BlockRef>>,
+}
+
+/// 编译器消去 `repeat ... until true` 回边后仍保留的单次 fence 控制事实。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinglePassFenceFact {
+    pub exit: BlockRef,
+    pub escape_edges: BTreeSet<EdgeRef>,
 }
 
 impl BranchRegionFact {
@@ -303,24 +311,29 @@ impl BranchRegionFact {
         )
     }
 
-    pub fn materialize_structured_blocks(&self, graph_facts: &GraphFacts) -> BTreeSet<BlockRef> {
-        self.explicit_structured_blocks.clone().unwrap_or_else(|| {
-            let Some(start) = graph_facts.dominator_tree.preorder_index[self.header.index()] else {
-                return BTreeSet::new();
-            };
-            let Some(end) = graph_facts.dominator_tree.subtree_end[self.header.index()] else {
-                return BTreeSet::new();
-            };
-            graph_facts
-                .dominator_tree
-                .order
-                .get(start..end)
-                .into_iter()
-                .flatten()
-                .copied()
-                .filter(|block| self.contains_structured_block(graph_facts, *block))
-                .collect()
-        })
+    pub fn structured_blocks<'a>(
+        &'a self,
+        graph_facts: &'a GraphFacts,
+    ) -> impl Iterator<Item = BlockRef> + 'a {
+        let dominance_interval = self
+            .explicit_structured_blocks
+            .is_none()
+            .then_some(())
+            .and_then(|()| {
+                let start = graph_facts.dominator_tree.preorder_index[self.header.index()]?;
+                let end = graph_facts.dominator_tree.subtree_end[self.header.index()]?;
+                graph_facts.dominator_tree.order.get(start..end)
+            })
+            .unwrap_or_default();
+        self.explicit_structured_blocks
+            .iter()
+            .flat_map(|blocks| blocks.iter().copied())
+            .chain(
+                dominance_interval
+                    .iter()
+                    .copied()
+                    .filter(|block| self.contains_structured_block(graph_facts, *block)),
+            )
     }
 
     pub(super) fn explicit_structured_blocks(&self) -> Option<&BTreeSet<BlockRef>> {
@@ -456,14 +469,6 @@ impl LoopValueArm {
 
     pub fn values(&self) -> impl Iterator<Item = SsaValue> + '_ {
         self.incomings.iter().map(|incoming| incoming.value)
-    }
-
-    pub fn all_preds_within(&self, allowed_blocks: &BTreeSet<BlockRef>) -> bool {
-        self.incomings.iter().all(|incoming| {
-            incoming
-                .pred
-                .is_some_and(|pred| allowed_blocks.contains(&pred))
-        })
     }
 }
 

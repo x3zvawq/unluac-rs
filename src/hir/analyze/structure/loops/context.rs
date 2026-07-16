@@ -78,6 +78,7 @@ impl StructuredBodyLowerer<'_, '_> {
             candidate_id,
             header: candidate.header,
             loop_blocks: BTreeSet::new(),
+            branch_region_header: None,
             post_loop,
             downstream_post_loop,
             continue_target,

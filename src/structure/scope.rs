@@ -250,12 +250,7 @@ fn explicit_tbc_loop_owner(
         .iter()
         .enumerate()
         .filter(|(_, candidate)| {
-            matches!(
-                candidate.kind_hint,
-                super::common::LoopKindHint::NumericForLike
-                    | super::common::LoopKindHint::GenericForLike
-            ) && loop_lexical_base(proto, cfg, candidate)
-                .is_some_and(|base| close.from.index() >= base.index())
+            loop_tbc_base_is_owned(proto, cfg, candidate, close.from)
                 && covered_tbc_instrs.iter().all(|tbc| {
                     candidate
                         .body_scope_blocks
@@ -287,6 +282,23 @@ fn explicit_tbc_loop_owner(
     innermost.next().is_none().then_some(owner)
 }
 
+fn loop_tbc_base_is_owned(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    candidate: &LoopCandidate,
+    close_from: Reg,
+) -> bool {
+    match candidate.kind_hint {
+        super::common::LoopKindHint::NumericForLike
+        | super::common::LoopKindHint::GenericForLike => loop_lexical_base(proto, cfg, candidate)
+            .is_some_and(|base| close_from.index() >= base.index()),
+        // repeat 的条件与 body 共享词法域；两条条件边上的 CLOSE 都只是同一个
+        // 源码作用域结束的 VM 展开，不应作为独立 HIR cleanup 保留。
+        super::common::LoopKindHint::RepeatLike => true,
+        _ => false,
+    }
+}
+
 fn loop_lexical_base(proto: &LoweredProto, cfg: &Cfg, candidate: &LoopCandidate) -> Option<Reg> {
     match candidate.kind_hint {
         super::common::LoopKindHint::NumericForLike => {
@@ -314,12 +326,7 @@ fn loop_tbc_boundary_location_is_owned(
     close_block: BlockRef,
     close_instr: InstrRef,
 ) -> bool {
-    if cfg.preds[close_block.index()].iter().any(|edge_ref| {
-        let predecessor = cfg.edges[edge_ref.index()].from;
-        cfg.reachable_blocks.contains(&predecessor)
-            && !candidate.body_scope_blocks.contains(&predecessor)
-            && candidate.preheader != Some(predecessor)
-    }) {
+    if !loop_tbc_boundary_entries_are_owned(proto, cfg, candidate, close_block) {
         return false;
     }
 
@@ -341,8 +348,63 @@ fn loop_tbc_boundary_location_is_owned(
     {
         return true;
     }
+    if candidate.kind_hint == super::common::LoopKindHint::RepeatLike
+        && cfg.unique_reachable_successor(close_block) == Some(candidate.header)
+    {
+        return true;
+    }
     cfg.unique_reachable_successor(close_block)
         .is_some_and(|successor| candidate.exits.contains(&successor))
+}
+
+fn loop_tbc_boundary_entries_are_owned(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    candidate: &LoopCandidate,
+    close_block: BlockRef,
+) -> bool {
+    let mut pending = vec![close_block];
+    let mut visited = BTreeSet::new();
+    while let Some(block) = pending.pop() {
+        if !visited.insert(block) {
+            continue;
+        }
+        for edge_ref in &cfg.preds[block.index()] {
+            let predecessor = cfg.edges[edge_ref.index()].from;
+            if !cfg.reachable_blocks.contains(&predecessor)
+                || candidate.body_scope_blocks.contains(&predecessor)
+                || (candidate.preheader == Some(predecessor)
+                    && matches!(
+                        candidate.kind_hint,
+                        super::common::LoopKindHint::NumericForLike
+                            | super::common::LoopKindHint::GenericForLike
+                    ))
+            {
+                continue;
+            }
+            if !candidate.exits.contains(&predecessor)
+                || cfg.unique_reachable_successor(predecessor) != Some(block)
+                || !block_is_cleanup_pad(proto, cfg, predecessor)
+            {
+                return false;
+            }
+            pending.push(predecessor);
+        }
+    }
+    true
+}
+
+fn block_is_cleanup_pad(proto: &LoweredProto, cfg: &Cfg, block: BlockRef) -> bool {
+    let range = cfg.blocks[block.index()].instrs;
+    let Some(last) = range.last() else {
+        return false;
+    };
+    (range.start.index()..last.index())
+        .all(|index| matches!(proto.instrs[index], LowInstr::Close(_)))
+        && matches!(
+            proto.instrs[last.index()],
+            LowInstr::Close(_) | LowInstr::Jump(_)
+        )
 }
 
 fn collect_close_points_by_block(

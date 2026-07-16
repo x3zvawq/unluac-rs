@@ -655,7 +655,10 @@ fn format_effect_tag(tag: EffectTag) -> &'static str {
         EffectTag::ReadUpvalue => "read-upvalue",
         EffectTag::WriteUpvalue => "write-upvalue",
         EffectTag::Call => "call",
+        EffectTag::Metamethod => "metamethod",
+        EffectTag::MayThrow => "may-throw",
         EffectTag::Close => "close",
+        EffectTag::RegisterClose => "register-close",
     }
 }
 

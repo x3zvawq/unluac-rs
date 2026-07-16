@@ -13,16 +13,21 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::structure::{BlockRef, Cfg, DominatorTree, GraphFacts};
+use crate::structure::{BlockRef, Cfg, DominatorTree, EdgeKind, GraphFacts};
 
-use super::common::{BranchCandidate, BranchKind, BranchRegionFact, LoopCandidate, LoopKindHint};
+use super::common::{
+    BranchCandidate, BranchKind, BranchRegionFact, LoopCandidate, LoopKindHint, SinglePassFenceFact,
+};
 use super::helpers::collect_forward_region_blocks;
 
 pub(super) fn analyze_branches(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     loop_candidates: &[LoopCandidate],
-) -> Vec<BranchCandidate> {
+) -> (
+    Vec<BranchCandidate>,
+    BTreeMap<BlockRef, SinglePassFenceFact>,
+) {
     let mut reachability = ReachabilityCache::new(cfg, loop_candidates);
     let mut branch_candidates: Vec<_> = cfg
         .block_order
@@ -89,8 +94,96 @@ pub(super) fn analyze_branches(
         &mut reachability,
         &mut branch_candidates,
     );
+    let single_pass_fences = refine_nested_escape_if_else_merges(
+        cfg,
+        graph_facts,
+        loop_candidates,
+        &mut branch_candidates,
+    );
     branch_candidates.sort_by_key(|candidate| candidate.header);
-    branch_candidates
+    (branch_candidates, single_pass_fences)
+}
+
+fn refine_nested_escape_if_else_merges(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    loop_candidates: &[LoopCandidate],
+    branch_candidates: &mut [BranchCandidate],
+) -> BTreeMap<BlockRef, SinglePassFenceFact> {
+    let loop_headers = loop_candidates
+        .iter()
+        .map(|candidate| candidate.header)
+        .collect::<BTreeSet<_>>();
+    let mut nested_escapes =
+        BTreeMap::<(BlockRef, BlockRef), Vec<(BlockRef, crate::structure::EdgeRef)>>::new();
+    for nested in branch_candidates.iter() {
+        let Some((then_edge, else_edge)) = cfg.branch_edges(nested.header) else {
+            continue;
+        };
+        let then_entry = cfg.edges[then_edge.index()].to;
+        let else_entry = cfg.edges[else_edge.index()].to;
+        let then_target = transparent_jump_target(cfg, then_entry).unwrap_or(then_entry);
+        let else_target = transparent_jump_target(cfg, else_entry).unwrap_or(else_entry);
+        if then_target == else_target {
+            continue;
+        }
+        nested_escapes
+            .entry((then_target, else_target))
+            .or_default()
+            .push((nested.header, then_edge));
+        nested_escapes
+            .entry((else_target, then_target))
+            .or_default()
+            .push((nested.header, else_edge));
+    }
+
+    let mut single_pass_fences = BTreeMap::new();
+    for candidate in branch_candidates {
+        if loop_headers.contains(&candidate.header) {
+            continue;
+        }
+        let (Some(strict_merge), Some(else_entry)) = (candidate.merge, candidate.else_entry) else {
+            continue;
+        };
+        if candidate.kind != BranchKind::IfElse || strict_merge == cfg.exit_block {
+            continue;
+        }
+        let Some(soft_merge) = find_soft_merge(
+            cfg,
+            graph_facts,
+            candidate.header,
+            candidate.then_entry,
+            else_entry,
+        ) else {
+            continue;
+        };
+        let escape_edges = nested_escapes
+            .get(&(strict_merge, soft_merge))
+            .into_iter()
+            .flatten()
+            .filter(|(nested_header, _)| {
+                graph_facts.dominates(candidate.then_entry, *nested_header)
+                    != graph_facts.dominates(else_entry, *nested_header)
+            })
+            .map(|(_, edge)| *edge)
+            .collect::<BTreeSet<_>>();
+        if !escape_edges.is_empty()
+            && cfg.can_reach(candidate.then_entry, soft_merge)
+            && cfg.can_reach(else_entry, soft_merge)
+        {
+            // 一臂内的透明 jump pad 直接跳过共同 fallthrough，严格后支配点因此
+            // 落在 escape 之后；外层 if/else 的正常路径仍在 soft merge 汇合。
+            candidate.merge = Some(soft_merge);
+            single_pass_fences.insert(
+                candidate.header,
+                SinglePassFenceFact {
+                    exit: strict_merge,
+                    escape_edges,
+                },
+            );
+        }
+    }
+    single_pass_fences
 }
 
 fn refine_loop_iteration_if_else_branches(
@@ -166,6 +259,7 @@ pub(super) fn analyze_branch_regions(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     branch_candidates: &[BranchCandidate],
+    single_pass_fences: &BTreeMap<BlockRef, SinglePassFenceFact>,
 ) -> Vec<BranchRegionFact> {
     let mut branch_regions = branch_candidates
         .iter()
@@ -179,6 +273,7 @@ pub(super) fn analyze_branch_regions(
                 header: candidate.header,
                 merge,
                 kind: candidate.kind,
+                single_pass_fence: single_pass_fences.get(&candidate.header).cloned(),
                 explicit_structured_blocks,
             })
         })
@@ -681,6 +776,14 @@ fn classify_if_else_branch(
     })
 }
 
+pub(super) fn transparent_jump_target(cfg: &Cfg, block: BlockRef) -> Option<BlockRef> {
+    let [edge_ref] = cfg.succs[block.index()].as_slice() else {
+        return None;
+    };
+    let edge = cfg.edges[edge_ref.index()];
+    (cfg.blocks[block.index()].instrs.len == 1 && edge.kind == EdgeKind::Jump).then_some(edge.to)
+}
+
 fn classify_guard_branch(
     cfg: &Cfg,
     reachability: &mut ReachabilityCache<'_>,
@@ -697,7 +800,17 @@ fn classify_guard_branch(
     let then_score = branch_continuation_score(cfg, then_entry);
     let else_score = branch_continuation_score(cfg, else_entry);
     if then_score == else_score {
-        return None;
+        // 两臂入口互不可达且没有共同后支配点时，大小相等只表示无法为 guard
+        // 选择展示层 continuation，不能据此丢掉整个 branch owner。显式 if/else
+        // 先不声明强制 merge；HIR 仍可用更严格的路径证明选出可选共享 continuation。
+        return Some(BranchCandidate {
+            header,
+            then_entry,
+            else_entry: Some(else_entry),
+            merge: None,
+            kind: BranchKind::IfElse,
+            invert_hint: false,
+        });
     }
 
     let (continuation, side, invert_hint) = if then_score > else_score {

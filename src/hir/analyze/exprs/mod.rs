@@ -26,11 +26,13 @@ use crate::transformer::{
 };
 
 pub(super) use self::access::{
-    expr_for_const, expr_for_value_operand, global_name_for_access, lower_table_access_expr,
-    lower_table_access_target, lower_upvalue_operand_expr, lower_upvalue_operand_target,
+    expr_for_const, expr_for_value_operand, global_name_for_access, lower_raw_table_get_expr,
+    lower_raw_table_set_call, lower_table_access_expr, lower_table_access_target,
+    lower_upvalue_operand_expr, lower_upvalue_operand_target,
 };
 use self::access::{
     expr_for_value_operand_inline, expr_for_value_operand_single_eval_pure_operand,
+    lower_raw_table_get_expr_inline, lower_raw_table_get_expr_single_eval,
     lower_table_access_expr_inline, lower_table_access_expr_single_eval,
 };
 pub(super) use self::branch::{

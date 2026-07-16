@@ -89,6 +89,43 @@ pub(crate) fn lower_table_access_expr(
     }))
 }
 
+pub(crate) fn lower_raw_table_get_expr(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    base: AccessBase,
+    key: AccessKey,
+) -> HirExpr {
+    // LuaJIT raw opcode 绕过元方法；可覆盖的全局 `rawget` 也不是精确 VM 合同。
+    // 保留为 effectful residual 才能让严格模式拒绝改义、宽松模式显示诊断。
+    raw_table_get_expr(
+        lower_access_base_expr(lowering, block, instr_ref, base),
+        lower_access_key_expr(lowering, block, instr_ref, key),
+    )
+}
+
+pub(crate) fn lower_raw_table_set_call(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    base: AccessBase,
+    key: AccessKey,
+    value: ValueOperand,
+) -> HirCallExpr {
+    // 同 raw read，不把 VM primitive 伪装成会触发 `__newindex` 的普通赋值。
+    HirCallExpr {
+        callee: unresolved_expr("LuaJIT raw table write has no exact Lua source form"),
+        args: vec![
+            lower_access_base_expr(lowering, block, instr_ref, base),
+            lower_access_key_expr(lowering, block, instr_ref, key),
+            expr_for_value_operand(lowering, block, instr_ref, value),
+        ]
+        .into(),
+        method: false,
+        method_name: None,
+    }
+}
+
 pub(crate) fn lower_table_access_target(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,
@@ -121,6 +158,19 @@ pub(crate) fn lower_table_access_expr_inline(
         base: lower_access_base_expr_inline(lowering, block, instr_ref, base),
         key: lower_access_key_expr_inline(lowering, block, instr_ref, key),
     }))
+}
+
+pub(crate) fn lower_raw_table_get_expr_inline(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    base: AccessBase,
+    key: AccessKey,
+) -> HirExpr {
+    raw_table_get_expr(
+        lower_access_base_expr_inline(lowering, block, instr_ref, base),
+        lower_access_key_expr_inline(lowering, block, instr_ref, key),
+    )
 }
 
 fn lower_access_base_expr(
@@ -195,6 +245,28 @@ pub(crate) fn lower_table_access_expr_single_eval(
     HirExpr::TableAccess(Box::new(HirTableAccess {
         base: lower_access_base_expr_single_eval(lowering, block, instr_ref, base),
         key: lower_access_key_expr_single_eval(lowering, block, instr_ref, key),
+    }))
+}
+
+pub(crate) fn lower_raw_table_get_expr_single_eval(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    base: AccessBase,
+    key: AccessKey,
+) -> HirExpr {
+    raw_table_get_expr(
+        lower_access_base_expr_single_eval(lowering, block, instr_ref, base),
+        lower_access_key_expr_single_eval(lowering, block, instr_ref, key),
+    )
+}
+
+fn raw_table_get_expr(base: HirExpr, key: HirExpr) -> HirExpr {
+    HirExpr::Call(Box::new(HirCallExpr {
+        callee: unresolved_expr("LuaJIT raw table read has no exact Lua source form"),
+        args: vec![base, key].into(),
+        method: false,
+        method_name: None,
     }))
 }
 

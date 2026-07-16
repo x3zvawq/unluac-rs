@@ -299,7 +299,7 @@ impl Cfg {
         self.can_reach_filtered(from, to, |block| block != avoided)
     }
 
-    fn can_reach_filtered(
+    pub(crate) fn can_reach_filtered(
         &self,
         from: BlockRef,
         to: BlockRef,

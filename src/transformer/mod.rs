@@ -23,9 +23,9 @@ pub use common::{
     LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr,
     LoweredChunk, LoweredProto, LoweringMap, MethodNameHint, MoveInstr, NewTableInstr,
     NumberLiteral, NumericForInitInstr, NumericForLoopInstr, ProtoRef, RawInstrRef, Reg, RegRange,
-    ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetUpvalueInstr, TailCallInstr, TbcInstr,
-    TypeGuardInstr, TypeGuardKind, UnaryOpInstr, UnaryOpKind, UpvalueOperand, UpvalueRef,
-    ValueOperand, ValuePack, VarArgInstr,
+    ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetTableKind, SetUpvalueInstr,
+    TailCallInstr, TbcInstr, TypeGuardInstr, TypeGuardKind, UnaryOpInstr, UnaryOpKind,
+    UpvalueOperand, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 pub use debug::dump_lir;
 pub use error::TransformError;

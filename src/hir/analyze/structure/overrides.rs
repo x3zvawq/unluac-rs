@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::hir::common::{HirExpr, TempId};
+use crate::hir::common::{HirExpr, HirLValue, TempId};
 use crate::structure::{BlockRef, PhiId};
 use crate::transformer::{InstrRef, Reg};
 
@@ -36,6 +36,7 @@ enum OverrideUndo {
     EntryTempExpr(BlockRef, TempId, Option<HirExpr>),
     PhiExpr(BlockRef, PhiId, Option<HirExpr>),
     PhiTempAlias(TempId, Option<HirExpr>),
+    DefTarget(TempId, Option<HirLValue>),
     SuppressedPhiInserted(PhiId),
     SuppressedPhiRemoved(PhiId),
     SuppressedInstrInserted(InstrRef),
@@ -45,6 +46,7 @@ enum OverrideUndo {
 pub(super) struct StructureOverrideState {
     by_block: BTreeMap<BlockRef, BlockOverrideState>,
     phi_temp_aliases: BTreeMap<TempId, HirExpr>,
+    def_targets: BTreeMap<TempId, HirLValue>,
     suppressed_phis: BTreeSet<PhiId>,
     suppressed_instrs: BTreeSet<InstrRef>,
     undo: Vec<OverrideUndo>,
@@ -104,6 +106,12 @@ impl StructureOverrideState {
                 OverrideUndo::PhiTempAlias(temp, None) => {
                     self.phi_temp_aliases.remove(&temp);
                 }
+                OverrideUndo::DefTarget(temp, Some(old)) => {
+                    self.def_targets.insert(temp, old);
+                }
+                OverrideUndo::DefTarget(temp, None) => {
+                    self.def_targets.remove(&temp);
+                }
                 OverrideUndo::SuppressedPhiInserted(phi_id) => {
                     self.suppressed_phis.remove(&phi_id);
                 }
@@ -142,6 +150,22 @@ impl StructureOverrideState {
 
     pub(super) fn phi_temp_aliases(&self) -> &BTreeMap<TempId, HirExpr> {
         &self.phi_temp_aliases
+    }
+
+    pub(super) fn def_targets(&self) -> &BTreeMap<TempId, HirLValue> {
+        &self.def_targets
+    }
+
+    pub(super) fn insert_def_target(&mut self, temp: TempId, target: HirLValue) -> bool {
+        if self.def_targets.get(&temp) == Some(&target) {
+            return true;
+        }
+        if self.def_targets.contains_key(&temp) {
+            return false;
+        }
+        let old = self.def_targets.insert(temp, target);
+        self.undo.push(OverrideUndo::DefTarget(temp, old));
+        true
     }
 
     pub(super) fn alias_phi_temp(&mut self, temp: TempId, mut expr: HirExpr) -> bool {

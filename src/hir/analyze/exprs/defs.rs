@@ -5,6 +5,7 @@
 //! 例如：单一 `NewTable` 定义会在这里直接变成空表构造器表达式。
 
 use super::*;
+use crate::transformer::GetTableKind;
 
 /// 尝试把一个固定定义直接解释成 HIR 表达式。
 ///
@@ -26,13 +27,23 @@ pub(crate) fn expr_for_fixed_def(lowering: &ProtoLowering<'_>, def_id: DefId) ->
 
     match instr {
         LowInstr::GetTable(get_table) if get_table.dst == def_reg => {
-            Some(lower_table_access_expr_inline(
-                lowering,
-                def_block,
-                def_instr,
-                get_table.base,
-                get_table.key,
-            ))
+            Some(if get_table.kind == GetTableKind::Raw {
+                lower_raw_table_get_expr_inline(
+                    lowering,
+                    def_block,
+                    def_instr,
+                    get_table.base,
+                    get_table.key,
+                )
+            } else {
+                lower_table_access_expr_inline(
+                    lowering,
+                    def_block,
+                    def_instr,
+                    get_table.base,
+                    get_table.key,
+                )
+            })
         }
         LowInstr::NewTable(new_table) if new_table.dst == def_reg => {
             Some(HirExpr::TableConstructor(Box::default()))
@@ -103,13 +114,23 @@ pub(crate) fn expr_for_fixed_def_single_eval(
             return Some(expr);
         }
         LowInstr::GetTable(get_table) if get_table.dst == def_reg => {
-            return Some(lower_table_access_expr_single_eval(
-                lowering,
-                def_block,
-                def_instr,
-                get_table.base,
-                get_table.key,
-            ));
+            return Some(if get_table.kind == GetTableKind::Raw {
+                lower_raw_table_get_expr_single_eval(
+                    lowering,
+                    def_block,
+                    def_instr,
+                    get_table.base,
+                    get_table.key,
+                )
+            } else {
+                lower_table_access_expr_single_eval(
+                    lowering,
+                    def_block,
+                    def_instr,
+                    get_table.base,
+                    get_table.key,
+                )
+            });
         }
         LowInstr::UnaryOp(unary) if unary.dst == def_reg => {
             return Some(HirExpr::Unary(Box::new(HirUnaryExpr {

@@ -46,6 +46,7 @@ pub(super) struct StructuredBodyLowerer<'a, 'b> {
     pub(super) overrides: StructureOverrideState,
     pub(super) visited: TransactionalBlockSet,
     pub(super) active_loops: Vec<ActiveLoopContext>,
+    pub(super) active_single_pass_fences: Vec<ActiveSinglePassFence>,
     reachability: RefCell<BTreeMap<BlockRef, BTreeSet<BlockRef>>>,
 }
 
@@ -82,6 +83,7 @@ pub(super) struct ActiveLoopContext {
     pub(super) candidate_id: LoopCandidateId,
     pub(super) header: BlockRef,
     pub(super) loop_blocks: BTreeSet<BlockRef>,
+    pub(super) branch_region_header: Option<BlockRef>,
     pub(super) post_loop: BlockRef,
     pub(super) downstream_post_loop: Option<BlockRef>,
     pub(super) continue_target: Option<BlockRef>,
@@ -104,6 +106,14 @@ impl ActiveLoopContext {
             vec![HirStmt::Break]
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ActiveSinglePassFence {
+    pub(super) header: BlockRef,
+    pub(super) tail: BlockRef,
+    pub(super) exit: BlockRef,
+    pub(super) escape_edges: BTreeSet<EdgeRef>,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +219,7 @@ pub(super) struct StructureStateCheckpoint {
     overrides_len: usize,
     visited_len: usize,
     active_loops_len: usize,
+    active_single_pass_fences_len: usize,
     stmts_len: usize,
 }
 
@@ -220,6 +231,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             overrides_len: self.overrides.checkpoint(),
             visited_len: self.visited.checkpoint(),
             active_loops_len: self.active_loops.len(),
+            active_single_pass_fences_len: self.active_single_pass_fences.len(),
             stmts_len,
         }
     }
@@ -237,6 +249,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.visited.rollback(checkpoint.visited_len);
         assert!(self.active_loops.len() >= checkpoint.active_loops_len);
         self.active_loops.truncate(checkpoint.active_loops_len);
+        assert!(self.active_single_pass_fences.len() >= checkpoint.active_single_pass_fences_len);
+        self.active_single_pass_fences
+            .truncate(checkpoint.active_single_pass_fences_len);
         stmts.truncate(checkpoint.stmts_len);
     }
 
@@ -282,6 +297,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             overrides: StructureOverrideState::default(),
             visited: TransactionalBlockSet::new(lowering.cfg.blocks.len()),
             active_loops: Vec::new(),
+            active_single_pass_fences: Vec::new(),
             reachability: RefCell::new(BTreeMap::new()),
         }
     }
@@ -306,8 +322,17 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         region.contains_structured_block(self.lowering.graph_facts, block)
     }
 
-    pub(super) fn branch_region_blocks(&self, region: &BranchRegionFact) -> BTreeSet<BlockRef> {
-        region.materialize_structured_blocks(self.lowering.graph_facts)
+    pub(super) fn active_loop_contains(
+        &self,
+        loop_context: &ActiveLoopContext,
+        block: BlockRef,
+    ) -> bool {
+        match loop_context.branch_region_header {
+            Some(header) => {
+                self.branch_region_contains(self.branch_regions_by_header[&header], block)
+            }
+            None => loop_context.loop_blocks.contains(&block),
+        }
     }
 
     fn all_reachable_blocks_covered(&self) -> bool {
@@ -342,8 +367,16 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     ) -> Option<HirBlock> {
         let mut current = Some(start);
         let mut stmts = Vec::new();
+        let mut accumulated_target_overrides = target_overrides.clone();
 
         while let Some(block) = current {
+            accumulated_target_overrides.extend(
+                self.overrides
+                    .def_targets()
+                    .iter()
+                    .map(|(temp, target)| (*temp, target.clone())),
+            );
+            let target_overrides = &accumulated_target_overrides;
             if Some(block) == stop || block == self.lowering.cfg.exit_block {
                 break;
             }
@@ -390,7 +423,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
             if let Some(region_id) = self.lowering.structure.unstructured_region(block)
                 && !self.active_loops.last().is_some_and(|loop_context| {
-                    loop_context.loop_blocks.contains(&block)
+                    self.active_loop_contains(loop_context, block)
                         && self
                             .lowering
                             .structure

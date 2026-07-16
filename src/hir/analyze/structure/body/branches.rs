@@ -34,6 +34,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
         self.restore_state_checkpoint(checkpoint, stmts);
 
+        let checkpoint = self.checkpoint_state(stmts.len());
+        if let Some(next) = self.try_lower_single_pass_fence_break(block, stmts, target_overrides) {
+            return Some(next);
+        }
+        self.restore_state_checkpoint(checkpoint, stmts);
+
         // 下面几个快捷路径都会在成功时直接消费一段 region；其中有些路径需要先
         // 试降子 region 才知道自己是否成立。失败后必须把 visited/override 等状态
         // 回滚，让后续普通 branch lowering 面对的是同一个输入图，而不是半消费状态。
@@ -193,6 +199,9 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             overrides
         });
         if let Some(branch_target_overrides) = branch_target_overrides.as_ref() {
+            if !self.install_branch_def_targets(target_overrides, branch_target_overrides) {
+                return None;
+            }
             for candidate in &branch_value_candidates {
                 stmts.extend(self.branch_value_preserved_entry_stmts(
                     candidate,
@@ -330,31 +339,44 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if stop != Some(continue_target) || !self.block_is_active_loop_escape(boundary) {
             return None;
         }
-        let region_blocks = self.branch_region_blocks(region);
-        region_blocks.iter().copied().find(|tail| {
-            *tail != plan.then_entry
-                && *tail != else_entry
-                && self.branch_candidate_for_header(*tail).is_none()
-                && !self.has_loop_header(*tail)
-                && self.region_predecessor_count(*tail, &region_blocks) >= 2
-                && self.shared_tail_reaches_loop_continue(*tail, continue_target, loop_context)
-                && [plan.then_entry, else_entry].into_iter().any(|entry| {
-                    self.entry_has_continue_owner_before_tail(
-                        entry,
+        let direct_tails = self.lowering.cfg.preds[continue_target.index()]
+            .iter()
+            .map(|edge| self.lowering.cfg.edges[edge.index()].from);
+        let nested_loop_preheaders = self
+            .lowering
+            .structure
+            .loop_candidates
+            .iter()
+            .filter_map(|candidate| candidate.preheader);
+        direct_tails
+            .chain(nested_loop_preheaders)
+            .filter(|tail| self.branch_region_contains(region, *tail))
+            .filter(|tail| {
+                *tail != plan.then_entry
+                    && *tail != else_entry
+                    && self.branch_candidate_for_header(*tail).is_none()
+                    && !self.has_loop_header(*tail)
+                    && self.region_predecessor_count(*tail, region) >= 2
+                    && self.shared_tail_reaches_loop_continue(*tail, continue_target, loop_context)
+                    && [plan.then_entry, else_entry].into_iter().any(|entry| {
+                        self.entry_has_continue_owner_before_tail(
+                            entry,
+                            *tail,
+                            boundary,
+                            continue_target,
+                            loop_context,
+                        )
+                    })
+                    && self.branch_arm_reaches_target_or_boundary_or_terminate(
+                        plan.then_entry,
                         *tail,
                         boundary,
-                        continue_target,
-                        loop_context,
                     )
-                })
-                && self.branch_arm_reaches_target_or_boundary_or_terminate(
-                    plan.then_entry,
-                    *tail,
-                    boundary,
-                )
-                && self
-                    .branch_arm_reaches_target_or_boundary_or_terminate(else_entry, *tail, boundary)
-        })
+                    && self.branch_arm_reaches_target_or_boundary_or_terminate(
+                        else_entry, *tail, boundary,
+                    )
+            })
+            .min()
     }
 
     fn shared_tail_reaches_loop_continue(
@@ -369,7 +391,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .is_some_and(|nested| {
                     !nested.exits.is_empty()
                         && nested.exits.iter().all(|exit| *exit == continue_target)
-                        && nested.blocks.is_subset(&loop_context.loop_blocks)
+                        && nested
+                            .blocks
+                            .iter()
+                            .all(|block| self.active_loop_contains(loop_context, *block))
                 })
     }
 
@@ -700,6 +725,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Option<BlockRef>> {
         let candidate = self.branch_candidate_for_header(block)?;
+        let region = self.branch_regions_by_header.get(&block).copied()?;
+        if let Some(fence) = &region.single_pass_fence {
+            return self.lower_single_pass_fence(block, region, fence, stmts, target_overrides);
+        }
         let merge = candidate.merge?;
         // 除了直接被当作 branch 的 repeat header，LuaJIT 还会把“内层 repeat true
         // fence + 外层 retry loop”压成同一个 Unknown natural-loop header。只有该
@@ -710,7 +739,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             loop_context.candidate_id == loop_candidate_id
                 && loop_context.header == block
                 && loop_candidate.kind_hint == LoopKindHint::Unknown
-                && loop_context.loop_blocks.contains(&merge)
+                && self.active_loop_contains(loop_context, merge)
                 && merge != loop_context.post_loop
                 && Some(merge) != loop_context.downstream_post_loop
         });
@@ -736,11 +765,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         }
 
-        let region = self.branch_regions_by_header.get(&block).copied()?;
         let loop_context = ActiveLoopContext {
             candidate_id: loop_candidate_id,
             header: block,
-            loop_blocks: self.branch_region_blocks(region),
+            loop_blocks: BTreeSet::new(),
+            branch_region_header: Some(region.header),
             post_loop: merge,
             downstream_post_loop: None,
             continue_target: None,
@@ -781,6 +810,129 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         Some(Some(merge))
     }
 
+    fn lower_single_pass_fence(
+        &mut self,
+        block: BlockRef,
+        region: &BranchRegionFact,
+        fence: &SinglePassFenceFact,
+        stmts: &mut Vec<HirStmt>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<Option<BlockRef>> {
+        if self
+            .active_single_pass_fences
+            .last()
+            .is_some_and(|active| active.header == block)
+        {
+            return None;
+        }
+
+        self.active_single_pass_fences.push(ActiveSinglePassFence {
+            header: block,
+            tail: region.merge,
+            exit: fence.exit,
+            escape_edges: fence.escape_edges.clone(),
+        });
+        let body_result = self.lower_region(block, Some(region.merge), target_overrides);
+        self.active_single_pass_fences.pop();
+        let mut body = body_result?.stmts;
+
+        let mut tail_target_overrides = target_overrides.clone();
+        tail_target_overrides.extend(
+            self.overrides
+                .def_targets()
+                .iter()
+                .map(|(temp, target)| (*temp, target.clone())),
+        );
+        let tail_preds = BTreeSet::from([region.merge]);
+        if let Some(candidate) = self.branch_value_merge_for_header(block) {
+            tail_target_overrides = self.branch_value_target_overrides_for_preds(
+                candidate,
+                &tail_preds,
+                &tail_target_overrides,
+            );
+        }
+        body.extend(self.lower_block_prefix(region.merge, false, &tail_target_overrides)?);
+        self.visited.insert(region.merge);
+        stmts.push(HirStmt::Repeat(Box::new(HirRepeat {
+            body: HirBlock { stmts: body },
+            cond: HirExpr::Boolean(true),
+        })));
+        Some(Some(fence.exit))
+    }
+
+    fn try_lower_single_pass_fence_break(
+        &mut self,
+        block: BlockRef,
+        stmts: &mut Vec<HirStmt>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<Option<BlockRef>> {
+        let fence = self.active_single_pass_fences.last()?.clone();
+        let (then_edge, else_edge) = self.lowering.cfg.branch_edges(block)?;
+        let (break_edge, next_edge) = match (
+            fence.escape_edges.contains(&then_edge),
+            fence.escape_edges.contains(&else_edge),
+        ) {
+            (true, false) => (then_edge, else_edge),
+            (false, true) => (else_edge, then_edge),
+            _ => return None,
+        };
+        let break_entry = self.lowering.cfg.edges[break_edge.index()].to;
+        let next_entry = self.lowering.cfg.edges[next_edge.index()].to;
+        if next_entry != fence.tail
+            && self.lowering.cfg.unique_reachable_successor(next_entry) != Some(fence.tail)
+        {
+            return None;
+        }
+
+        stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
+        if break_entry != fence.exit {
+            if !self
+                .lower_block_prefix(break_entry, false, target_overrides)?
+                .is_empty()
+            {
+                return None;
+            }
+            self.visited.insert(break_entry);
+        }
+        self.visited.insert(block);
+
+        if let Some(candidate) = self.branch_value_merge_for_header(block) {
+            let branch_target_overrides =
+                self.branch_value_target_overrides(candidate, target_overrides);
+            if !self.install_branch_def_targets(target_overrides, &branch_target_overrides) {
+                return None;
+            }
+            stmts.extend(self.branch_value_preserved_entry_stmts(
+                candidate,
+                &branch_target_overrides,
+                target_overrides,
+            ));
+            self.install_branch_value_merge_overrides(candidate, &branch_target_overrides);
+        }
+
+        let mut break_cond = self.lower_branch_cond_for_target(block, break_entry)?;
+        rewrite_expr_temps(&mut break_cond, &temp_expr_overrides(target_overrides));
+        stmts.push(branch_stmt(
+            break_cond,
+            HirBlock {
+                stmts: vec![HirStmt::Break],
+            },
+            None,
+        ));
+        Some(Some(next_entry))
+    }
+
+    fn install_branch_def_targets(
+        &mut self,
+        inherited: &BTreeMap<TempId, HirLValue>,
+        branch_targets: &BTreeMap<TempId, HirLValue>,
+    ) -> bool {
+        branch_targets
+            .iter()
+            .filter(|(temp, target)| inherited.get(temp) != Some(*target))
+            .all(|(temp, target)| self.overrides.insert_def_target(*temp, target.clone()))
+    }
+
     fn single_pass_repeat_tail(
         &self,
         block: BlockRef,
@@ -788,10 +940,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     ) -> Option<BlockRef> {
         let merge = candidate.merge?;
         let region = self.branch_regions_by_header.get(&block).copied()?;
-        let region_blocks = self.branch_region_blocks(region);
-        region_blocks
+        self.lowering.cfg.preds[merge.index()]
             .iter()
-            .copied()
+            .map(|edge| self.lowering.cfg.edges[edge.index()].from)
+            .filter(|tail| self.branch_region_contains(region, *tail))
             .filter(|tail| {
                 *tail != block
                     && *tail != merge
@@ -799,7 +951,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     && self.branch_candidate_for_header(*tail).is_none()
                     && !self.has_loop_header(*tail)
                     && self.linear_tail_target(*tail) == Some(merge)
-                    && self.region_predecessor_count(*tail, &region_blocks) >= 2
+                    && self.region_predecessor_count(*tail, region) >= 2
                     && self.branch_arm_reaches_target_or_boundary_or_terminate(
                         candidate.then_entry,
                         *tail,
@@ -832,10 +984,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.lowering.cfg.unique_reachable_successor(block)
     }
 
-    fn region_predecessor_count(&self, block: BlockRef, region: &BTreeSet<BlockRef>) -> usize {
+    fn region_predecessor_count(&self, block: BlockRef, region: &BranchRegionFact) -> usize {
         self.lowering.cfg.preds[block.index()]
             .iter()
-            .filter(|edge_ref| region.contains(&self.lowering.cfg.edges[edge_ref.index()].from))
+            .filter(|edge_ref| {
+                self.branch_region_contains(region, self.lowering.cfg.edges[edge_ref.index()].from)
+            })
             .count()
     }
 

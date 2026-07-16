@@ -20,7 +20,9 @@ use super::common::{
 };
 use super::helpers::collect_merge_arm_preds;
 use super::phi_facts::{BranchValueMergeContext, branch_value_merges_in_block};
-use super::{branches::for_loop_body_entry, branches::for_loop_exit_owner};
+use super::{
+    branches::for_loop_body_entry, branches::for_loop_exit_owner, branches::transparent_jump_target,
+};
 
 #[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 enum CandidateSource {
@@ -176,9 +178,15 @@ fn analyze_branch_value_merge_candidate(
     loop_candidates: &[LoopCandidate],
 ) -> Option<BranchValueMergeCandidate> {
     let merge = branch.merge?;
+    let has_transparent_escape_arm = branch.kind == BranchKind::IfElse
+        && (transparent_jump_target(cfg, branch.then_entry) == Some(merge))
+            != branch
+                .else_entry
+                .is_some_and(|else_entry| transparent_jump_target(cfg, else_entry) == Some(merge));
     if dataflow.phi_candidates_in_block(merge).is_empty()
         || (!graph_facts.dominates(branch.header, merge)
             && !loop_owned_preds_by_header.contains_key(&merge))
+            && !has_transparent_escape_arm
     {
         return None;
     }

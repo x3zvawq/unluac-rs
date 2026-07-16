@@ -17,14 +17,17 @@ use super::*;
 use crate::structure::SsaValue;
 
 impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
-    pub(super) fn loop_exit_state_preheader_init(
+    pub(super) fn loop_exit_state_preheader_init<F>(
         &self,
         preheader: Option<BlockRef>,
         value: &LoopValueMerge,
-        inside_exit_blocks: &BTreeSet<BlockRef>,
+        is_inside: F,
         target_overrides: &BTreeMap<TempId, HirLValue>,
-    ) -> Option<HirExpr> {
-        if !loop_value_incoming_all_within_blocks(value, inside_exit_blocks) {
+    ) -> Option<HirExpr>
+    where
+        F: Fn(BlockRef) -> bool + Copy,
+    {
+        if !loop_value_incoming_all_inside(value, is_inside) {
             return None;
         }
         let preheader = preheader?;
@@ -67,22 +70,21 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         )
     }
 
-    pub(super) fn loop_exit_entry_expr_with_inside_blocks(
+    pub(super) fn loop_exit_entry_expr<F>(
         &self,
         value: &LoopValueMerge,
-        inside_blocks: &BTreeSet<BlockRef>,
+        is_inside: F,
         target_overrides: &BTreeMap<TempId, HirLValue>,
-    ) -> Option<HirExpr> {
+    ) -> Option<HirExpr>
+    where
+        F: Fn(BlockRef) -> bool,
+    {
         let outside_incomings = value
             .inside_arm
             .incomings
             .iter()
             .chain(value.outside_arm.incomings.iter())
-            .filter(|incoming| {
-                incoming
-                    .pred
-                    .is_none_or(|pred| !inside_blocks.contains(&pred))
-            });
+            .filter(|incoming| incoming.pred.is_none_or(|pred| !is_inside(pred)));
         self.uniform_loop_incoming_expr(value.reg, outside_incomings, target_overrides)
     }
 

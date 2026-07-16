@@ -387,7 +387,10 @@ pub enum EffectTag {
     ReadUpvalue,
     WriteUpvalue,
     Call,
+    Metamethod,
+    MayThrow,
     Close,
+    RegisterClose,
 }
 
 /// 一个固定寄存器定义的唯一身份。
