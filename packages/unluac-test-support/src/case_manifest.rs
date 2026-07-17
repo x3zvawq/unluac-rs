@@ -1327,6 +1327,10 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_261_branch_shared_continuation_nearest.lua",
         PUC_LUA_GE_52,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_262_infinite_loop_nearest_merge.lua",
+        PUC_LUA_GE_52,
+    ),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {

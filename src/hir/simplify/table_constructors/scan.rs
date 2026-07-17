@@ -13,7 +13,48 @@ use super::bindings::{
 };
 use super::builder::ConstructorBuilder;
 use super::rebuild::{RegionRebuildContext, try_extend_constructor_from_steps};
-use super::{RebuildScratch, RegionStep, TableBinding};
+use super::{BindingId, RebuildScratch, RegionStep, TableBinding};
+
+/// 按稳定 stmt id 记录每个 binding 最后可能扩展构造器的位置。
+///
+/// 空表 seed 只有在后面存在同 binding 的 record 或 SETLIST 时才需要扫描中间 producer；
+/// 以最后位置作为 horizon，既允许跨过其他 seed，又能在线性预处理后排除独立 seed 的后缀扫描。
+pub(super) struct ConstructorWriteIndex {
+    last_write: Vec<Option<usize>>,
+    last_set_list: Vec<Option<usize>>,
+}
+
+impl ConstructorWriteIndex {
+    pub(super) fn new(stmts: &[HirStmt], binding_index: &BindingIndex) -> Self {
+        let mut index = Self {
+            last_write: vec![None; binding_index.len()],
+            last_set_list: vec![None; binding_index.len()],
+        };
+        for (stmt_id, stmt) in stmts.iter().enumerate() {
+            if let Some(binding) = keyed_write_binding(stmt) {
+                let binding_id = binding_index
+                    .id_of(binding)
+                    .expect("table record binding should be indexed");
+                index.last_write[binding_id] = Some(stmt_id);
+            } else if let Some(binding) = table_set_list_binding(stmt) {
+                let binding_id = binding_index
+                    .id_of(binding)
+                    .expect("table set-list binding should be indexed");
+                index.last_write[binding_id] = Some(stmt_id);
+                index.last_set_list[binding_id] = Some(stmt_id);
+            }
+        }
+        index
+    }
+
+    pub(super) fn has_write_after(&self, binding_id: BindingId, stmt_id: usize) -> bool {
+        self.last_write[binding_id].is_some_and(|last| last > stmt_id)
+    }
+
+    pub(super) fn has_set_list_after(&self, binding_id: BindingId, stmt_id: usize) -> bool {
+        self.last_set_list[binding_id].is_some_and(|last| last > stmt_id)
+    }
+}
 
 pub(super) fn constructor_seed(stmt: &HirStmt) -> Option<(TableBinding, HirTableConstructor)> {
     match stmt {
@@ -205,25 +246,27 @@ pub(super) fn trailing_constructor_handoff(
 }
 
 fn keyed_write_step(stmt: &HirStmt, binding: TableBinding) -> bool {
+    keyed_write_binding(stmt) == Some(binding)
+}
+
+fn keyed_write_binding(stmt: &HirStmt) -> Option<TableBinding> {
     let HirStmt::Assign(assign) = stmt else {
-        return false;
+        return None;
     };
     let [HirLValue::TableAccess(access)] = assign.targets.as_slice() else {
-        return false;
+        return None;
     };
     if assign.values.tail.is_some() {
-        return false;
+        return None;
     }
     let [value] = assign.values.fixed.as_slice() else {
-        return false;
+        return None;
     };
-    if binding_from_expr(&access.base) != Some(binding) {
-        return false;
-    }
+    let binding = binding_from_expr(&access.base)?;
     if expr_uses_binding(&access.key, binding) || expr_uses_binding(value, binding) {
-        return false;
+        return None;
     }
-    true
+    Some(binding)
 }
 
 fn producer_steps(
@@ -298,12 +341,14 @@ fn producer_steps_from_bindings(
 }
 
 fn table_set_list_step(stmt: &HirStmt, binding: TableBinding) -> bool {
+    table_set_list_binding(stmt) == Some(binding)
+}
+
+fn table_set_list_binding(stmt: &HirStmt) -> Option<TableBinding> {
     let HirStmt::TableSetList(set_list) = stmt else {
-        return false;
+        return None;
     };
-    if binding_from_expr(&set_list.base) != Some(binding) {
-        return false;
-    }
+    let binding = binding_from_expr(&set_list.base)?;
     if set_list
         .values
         .fixed
@@ -315,7 +360,7 @@ fn table_set_list_step(stmt: &HirStmt, binding: TableBinding) -> bool {
             .as_ref()
             .is_some_and(|tail| expr_uses_binding(tail.as_expr(), binding))
     {
-        return false;
+        return None;
     }
-    true
+    Some(binding)
 }

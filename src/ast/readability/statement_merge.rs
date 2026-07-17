@@ -17,7 +17,7 @@
 //! - 如果某个 hoisted temp 在声明点与候选下沉点之间已经被读取过，也不能把它下沉
 //!   成后置 `local`，否则 fallback/goto 回边会读到未初始化的局部变量
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::super::common::{
     AstBindingRef, AstBlock, AstLValue, AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl,
@@ -46,25 +46,22 @@ impl AstRewritePass for StatementMergePass {
     fn rewrite_block(&mut self, block: &mut AstBlock, _kind: BlockKind) -> bool {
         let mut changed = sink_hoisted_temp_decls(block);
 
-        let old_stmts = std::mem::take(&mut block.stmts);
+        let mut old_stmts = VecDeque::from(std::mem::take(&mut block.stmts));
         let mut new_stmts = Vec::with_capacity(old_stmts.len());
-        let mut index = 0;
-        while index < old_stmts.len() {
-            let Some(next_stmt) = old_stmts.get(index + 1) else {
-                new_stmts.push(old_stmts[index].clone());
-                index += 1;
+        while let Some(stmt) = old_stmts.pop_front() {
+            let Some(next_stmt) = old_stmts.front() else {
+                new_stmts.push(stmt);
                 continue;
             };
 
-            if let Some(merged) = try_merge_local_decl_with_assign(&old_stmts[index], next_stmt) {
+            if let Some(merged) = try_merge_local_decl_with_assign(&stmt, next_stmt) {
                 new_stmts.push(AstStmt::LocalDecl(Box::new(merged)));
+                old_stmts.pop_front();
                 changed = true;
-                index += 2;
                 continue;
             }
 
-            new_stmts.push(old_stmts[index].clone());
-            index += 1;
+            new_stmts.push(stmt);
         }
 
         block.stmts = new_stmts;
@@ -75,24 +72,21 @@ impl AstRewritePass for StatementMergePass {
 }
 
 fn merge_adjacent_empty_local_decls(block: &mut AstBlock) -> bool {
-    let old_stmts = std::mem::take(&mut block.stmts);
+    let mut old_stmts = VecDeque::from(std::mem::take(&mut block.stmts));
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
-    let mut index = 0;
 
-    while index < old_stmts.len() {
-        let Some(bindings) = empty_local_decl_bindings(&old_stmts[index]) else {
-            new_stmts.push(old_stmts[index].clone());
-            index += 1;
+    while let Some(stmt) = old_stmts.pop_front() {
+        let Some(bindings) = empty_local_decl_bindings(&stmt) else {
+            new_stmts.push(stmt);
             continue;
         };
 
         let mut merged_bindings = bindings.to_vec();
-        let mut lookahead = index + 1;
-        while let Some(next_bindings) = old_stmts.get(lookahead).and_then(empty_local_decl_bindings)
-        {
+        let mut consumed = 0;
+        for next_bindings in old_stmts.iter().map_while(empty_local_decl_bindings) {
             merged_bindings.extend_from_slice(next_bindings);
-            lookahead += 1;
+            consumed += 1;
         }
 
         if merged_bindings.len() > bindings.len() {
@@ -100,11 +94,10 @@ fn merge_adjacent_empty_local_decls(block: &mut AstBlock) -> bool {
                 bindings: merged_bindings,
                 values: Vec::new(),
             })));
+            old_stmts.drain(..consumed);
             changed = true;
-            index = lookahead;
         } else {
-            new_stmts.push(old_stmts[index].clone());
-            index += 1;
+            new_stmts.push(stmt);
         }
     }
 
@@ -130,18 +123,19 @@ fn empty_local_decl_bindings(stmt: &AstStmt) -> Option<&[AstLocalBinding]> {
 fn merge_adjacent_single_value_local_decls(block: &mut AstBlock) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts(&old_stmts);
+    let mut old_stmts = VecDeque::from(old_stmts);
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
     let mut index = 0;
 
-    while index < old_stmts.len() {
-        let Some((binding, value)) = single_value_local_decl(&old_stmts[index]) else {
-            new_stmts.push(old_stmts[index].clone());
+    while let Some(stmt) = old_stmts.pop_front() {
+        let Some((binding, value)) = single_value_local_decl(&stmt) else {
+            new_stmts.push(stmt);
             index += 1;
             continue;
         };
         if !is_mergeable_adjacent_local_value(value) {
-            new_stmts.push(old_stmts[index].clone());
+            new_stmts.push(stmt);
             index += 1;
             continue;
         }
@@ -149,8 +143,9 @@ fn merge_adjacent_single_value_local_decls(block: &mut AstBlock) -> bool {
         let mut bindings = vec![binding.clone()];
         let mut values = vec![value.clone()];
         let mut lookahead = index + 1;
-        while let Some((next_binding, next_value)) =
-            old_stmts.get(lookahead).and_then(single_value_local_decl)
+        while let Some((next_binding, next_value)) = old_stmts
+            .get(lookahead - index - 1)
+            .and_then(single_value_local_decl)
         {
             // 这里故意只收“连续复制/lookup”式的 local：
             // 目标是把 `local a = x; local b = y; local c = t[k]` 这类明显属于同一段
@@ -187,11 +182,12 @@ fn merge_adjacent_single_value_local_decls(block: &mut AstBlock) -> bool {
                 values,
             })));
             changed = true;
+            old_stmts.drain(..(lookahead - index - 1));
             index = lookahead;
             continue;
         }
 
-        new_stmts.push(old_stmts[index].clone());
+        new_stmts.push(stmt);
         index += 1;
     }
 

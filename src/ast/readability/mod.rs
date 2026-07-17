@@ -21,6 +21,7 @@ mod loop_header_merge;
 mod luajit_goto_safety;
 mod materialize_temps;
 mod statement_merge;
+mod stmt_plan;
 mod traverse;
 mod visit;
 mod walk;

@@ -371,6 +371,35 @@ impl<'a> ReachabilityCache<'a> {
             })
             .contains(&to)
     }
+
+    fn unique_nearest_without_entering_loop_header(
+        &mut self,
+        candidates: Vec<BlockRef>,
+    ) -> Option<BlockRef> {
+        let mut nearest = *candidates.first()?;
+        for candidate in candidates.iter().copied().skip(1) {
+            if self.strictly_reaches_without_entering_loop_header(candidate, nearest) {
+                nearest = candidate;
+            }
+        }
+        candidates
+            .into_iter()
+            .all(|candidate| {
+                candidate == nearest
+                    || self.strictly_reaches_without_entering_loop_header(nearest, candidate)
+            })
+            .then_some(nearest)
+    }
+
+    fn strictly_reaches_without_entering_loop_header(
+        &mut self,
+        from: BlockRef,
+        to: BlockRef,
+    ) -> bool {
+        from != to
+            && self.can_reach_without_entering_loop_header(from, to)
+            && !self.can_reach_without_entering_loop_header(to, from)
+    }
 }
 
 fn loop_candidate_for_entry<'a>(
@@ -509,15 +538,18 @@ fn classify_infinite_loop_bounded_branch(
         reachability.can_reach_without_entering_loop_header(then_entry, else_entry);
     let else_reaches_then =
         reachability.can_reach_without_entering_loop_header(else_entry, then_entry);
-    let local_merge = loop_candidate
+    let common_reachable = loop_candidate
         .blocks
         .iter()
         .copied()
-        .filter(|candidate| *candidate != header && *candidate != loop_candidate.header)
-        .find(|candidate| {
-            reachability.can_reach_without_entering_loop_header(then_entry, *candidate)
+        .filter(|candidate| {
+            *candidate != header
+                && *candidate != loop_candidate.header
+                && reachability.can_reach_without_entering_loop_header(then_entry, *candidate)
                 && reachability.can_reach_without_entering_loop_header(else_entry, *candidate)
-        });
+        })
+        .collect();
+    let local_merge = reachability.unique_nearest_without_entering_loop_header(common_reachable);
 
     match (then_reaches_else, else_reaches_then) {
         (true, false) => Some(BranchCandidate {

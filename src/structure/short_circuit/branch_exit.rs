@@ -13,6 +13,10 @@
 //! - `if a and b then return end` 会产出“整体真时流向 then、整体假时流向 fallthrough”的
 //!   短路候选
 //! - `if a or b then body() end` 会产出“整体真时进入 body、整体假时直接跳过”的候选
+//!
+//! `IfElse` 链的每个 root 都可能看到同一条长后缀，因此前缀选择只前向扫描一次：
+//! 增量维护当前前缀的外部出口计数和严格真假出口约束，仍保留最长候选及其原始
+//! strict-before-relaxed 优先级，最后才构造 nodes/blocks。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -277,32 +281,28 @@ pub(super) fn analyze_if_else_branch_exit_candidates(
             continue;
         }
 
-        for prefix_len in (2..=headers.len()).rev() {
-            let prefix = &headers[..prefix_len];
-            let Some(exit) = infer_linear_branch_exit(proto, cfg, prefix)
-                .or_else(|| infer_relaxed_linear_branch_exit(proto, cfg, prefix))
-            else {
-                continue;
-            };
-            let Some(nodes) = build_linear_branch_exit_nodes(proto, cfg, prefix, &exit) else {
-                continue;
-            };
-            let blocks = prefix.iter().copied().collect::<BTreeSet<_>>();
-            let reducible = is_reducible_candidate(cfg, candidate.header, &blocks);
-            candidates.push(ShortCircuitCandidate {
-                header: candidate.header,
-                blocks,
-                entry: ShortCircuitNodeRef(0),
-                nodes,
-                exit,
-                result_reg: None,
-                result_phi_id: None,
-                entry_value: None,
-                value_incomings: Vec::new(),
-                reducible,
-            });
-            break;
-        }
+        let Some((prefix_len, exit)) = infer_longest_if_else_branch_exit(proto, cfg, &headers)
+        else {
+            continue;
+        };
+        let prefix = &headers[..prefix_len];
+        let Some(nodes) = build_linear_branch_exit_nodes(proto, cfg, prefix, &exit) else {
+            continue;
+        };
+        let blocks = prefix.iter().copied().collect::<BTreeSet<_>>();
+        let reducible = is_reducible_candidate(cfg, candidate.header, &blocks);
+        candidates.push(ShortCircuitCandidate {
+            header: candidate.header,
+            blocks,
+            entry: ShortCircuitNodeRef(0),
+            nodes,
+            exit,
+            result_reg: None,
+            result_phi_id: None,
+            entry_value: None,
+            value_incomings: Vec::new(),
+            reducible,
+        });
     }
 
     candidates.sort_by_key(|candidate| candidate.header);
@@ -651,32 +651,89 @@ fn infer_linear_branch_exit(
     })
 }
 
-fn infer_relaxed_linear_branch_exit(
+fn infer_longest_if_else_branch_exit(
     proto: &LoweredProto,
     cfg: &Cfg,
     headers: &[BlockRef],
-) -> Option<ShortCircuitExit> {
-    let mut exits = BTreeSet::new();
+) -> Option<(usize, ShortCircuitExit)> {
+    let (&first_header, remaining_headers) = headers.split_first()?;
+    let mut previous_targets = truthy_falsy_targets(proto, cfg, first_header)?;
+    let mut external_targets = BTreeMap::<BlockRef, usize>::new();
+    for target in [previous_targets.0, previous_targets.1] {
+        *external_targets.entry(target).or_default() += 1;
+    }
+    let mut strict_truthy_exit = None;
+    let mut strict_falsy_exit = None;
+    let mut strict_possible = true;
+    let mut best = None;
 
-    for (index, header) in headers.iter().enumerate() {
-        let next = headers.get(index + 1).copied();
-        let (truthy_target, falsy_target) = truthy_falsy_targets(proto, cfg, *header)?;
-        for target in [truthy_target, falsy_target] {
-            if Some(target) != next {
-                exits.insert(target);
+    for (index, header) in remaining_headers.iter().copied().enumerate() {
+        let Some(targets) = truthy_falsy_targets(proto, cfg, header) else {
+            break;
+        };
+        for target in [previous_targets.0, previous_targets.1] {
+            if target == header {
+                decrement_target_count(&mut external_targets, target);
             }
+        }
+
+        if previous_targets.0 == header {
+            strict_possible = strict_possible
+                && constrain_linear_exit(&mut strict_falsy_exit, previous_targets.1);
+        } else if previous_targets.1 == header {
+            strict_possible = strict_possible
+                && constrain_linear_exit(&mut strict_truthy_exit, previous_targets.0);
+        } else {
+            strict_possible = false;
+        }
+
+        for target in [targets.0, targets.1] {
+            *external_targets.entry(target).or_default() += 1;
+        }
+        previous_targets = targets;
+
+        let strict_exit = (strict_possible
+            && strict_truthy_exit.is_none_or(|exit| exit == targets.0)
+            && strict_falsy_exit.is_none_or(|exit| exit == targets.1))
+        .then_some(ShortCircuitExit::BranchExit {
+            truthy: targets.0,
+            falsy: targets.1,
+        });
+        let relaxed_exit = || {
+            let mut exits = external_targets.keys().copied();
+            let (Some(truthy), Some(falsy), None) = (exits.next(), exits.next(), exits.next())
+            else {
+                return None;
+            };
+            Some(ShortCircuitExit::BranchExit { truthy, falsy })
+        };
+
+        if let Some(exit) = strict_exit.or_else(relaxed_exit) {
+            best = Some((index + 2, exit));
         }
     }
 
-    let exits = exits.into_iter().collect::<Vec<_>>();
-    let [first_exit, second_exit] = exits.as_slice() else {
-        return None;
-    };
+    best
+}
 
-    Some(ShortCircuitExit::BranchExit {
-        truthy: *first_exit,
-        falsy: *second_exit,
-    })
+fn constrain_linear_exit(exit: &mut Option<BlockRef>, target: BlockRef) -> bool {
+    match *exit {
+        Some(existing) => existing == target,
+        None => {
+            *exit = Some(target);
+            true
+        }
+    }
+}
+
+fn decrement_target_count(targets: &mut BTreeMap<BlockRef, usize>, target: BlockRef) {
+    let count = targets
+        .get_mut(&target)
+        .expect("previous branch target must remain counted");
+    *count -= 1;
+    if *count == 0 {
+        targets.remove(&target);
+    }
 }
 
 fn build_linear_branch_exit_nodes(

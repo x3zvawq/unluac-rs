@@ -67,12 +67,14 @@ pub fn compute_dataflow_facts(
         .signature
         .is_vararg
         .then_some(Reg(usize::from(proto.signature.num_params)));
+    let incoming_slots = incoming_slots_by_edge(cfg);
     let open = analyze_open_values(
         cfg,
         graph_facts,
         &instr_effects,
         reg_count,
         entry_open_start,
+        &incoming_slots,
     );
     let liveness = solve_liveness(
         cfg,
@@ -114,6 +116,7 @@ pub fn compute_dataflow_facts(
         &liveness.live_out,
         reg_count,
         proto.instrs.len(),
+        &incoming_slots,
     );
     let children = proto
         .children
@@ -171,6 +174,20 @@ fn index_phi_candidate_ranges(cfg: &Cfg, phis: &[PhiCandidate]) -> Vec<std::ops:
         *range = start..next;
     }
     ranges
+}
+
+fn incoming_slots_by_edge(cfg: &Cfg) -> Vec<Option<usize>> {
+    let mut slots = vec![None; cfg.edges.len()];
+    for block in &cfg.block_order {
+        let mut next = usize::from(*block == cfg.entry_block);
+        for edge in &cfg.preds[block.index()] {
+            if cfg.reachable_blocks.contains(&cfg.edges[edge.index()].from) {
+                slots[edge.index()] = Some(next);
+                next += 1;
+            }
+        }
+    }
+    slots
 }
 
 fn canonical_value(mut value: SsaValue, replacements: &[SsaValue]) -> SsaValue {

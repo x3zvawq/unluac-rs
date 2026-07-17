@@ -52,6 +52,7 @@ pub(super) fn analyze_open_values(
     effects: &[super::super::common::InstrEffect],
     reg_count: usize,
     entry_open_start: Option<Reg>,
+    incoming_slots: &[Option<usize>],
 ) -> OpenAnalysis {
     let (live_in, live_out) = solve_open_liveness(cfg, graph, effects);
     let mut defs = Vec::new();
@@ -112,6 +113,7 @@ pub(super) fn analyze_open_values(
         &block_phi,
         &mut phis,
         &mut uses,
+        incoming_slots,
     );
 
     let phi_sources = index_open_phi_sources(&phis);
@@ -243,6 +245,7 @@ fn rename_open(
     block_phi: &[Option<OpenPhiId>],
     phis: &mut [OpenPhi],
     uses: &mut [Option<OpenValue>],
+    incoming_slots: &[Option<usize>],
 ) {
     let mut pending = vec![(cfg.entry_block, OpenValue::Entry)];
     while let Some((block, inherited)) = pending.pop() {
@@ -263,13 +266,14 @@ fn rename_open(
             let Some(phi) = block_phi[succ.index()] else {
                 continue;
             };
-            if let Some(incoming) = phis[phi.index()]
+            let slot = incoming_slots[edge.index()]
+                .expect("reachable CFG edge must have an incoming slot");
+            let incoming = phis[phi.index()]
                 .incoming
-                .iter_mut()
-                .find(|incoming| incoming.edge == Some(*edge))
-            {
-                incoming.value = current;
-            }
+                .get_mut(slot)
+                .expect("open phi incoming slots must match CFG predecessors");
+            assert_eq!(incoming.edge, Some(*edge));
+            incoming.value = current;
         }
         for child in graph.dominator_tree.children[block.index()].iter().rev() {
             pending.push((*child, current));

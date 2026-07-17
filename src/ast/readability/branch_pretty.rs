@@ -7,12 +7,10 @@
 //! 例子：
 //! - `if not cond then a() else b() end` 会整理成 `if cond then b() else a() end`
 //! - `if cond then body else end` 会整理成 `if cond then body end`
-//! - `if a then if b then return end end` 会折成 `if a and b then return end`
 //! - `if cond then return end else tail()` 会拉平成 `if cond then return end; tail()`
 
 use super::super::common::{
-    AstBlock, AstExpr, AstIf, AstLogicalExpr, AstModule, AstReturn, AstStmt, AstUnaryExpr,
-    AstUnaryOpKind,
+    AstBlock, AstExpr, AstIf, AstModule, AstReturn, AstStmt, AstUnaryExpr, AstUnaryOpKind,
 };
 use super::ReadabilityContext;
 use super::walk::{self, AstRewritePass, BlockKind};
@@ -58,30 +56,11 @@ impl AstRewritePass for BranchPrettyPass {
                     changed = true;
                 }
                 changed |= normalize_empty_if_arms(if_stmt);
-                changed || collapse_nested_guard_if(if_stmt)
+                changed
             }
             _ => false,
         }
     }
-}
-
-fn collapse_nested_guard_if(if_stmt: &mut AstIf) -> bool {
-    if if_stmt.else_block.is_some() {
-        return false;
-    }
-    let [AstStmt::If(inner_if)] = if_stmt.then_block.stmts.as_slice() else {
-        return false;
-    };
-    if inner_if.else_block.is_some() {
-        return false;
-    }
-
-    if_stmt.cond = AstExpr::LogicalAnd(Box::new(AstLogicalExpr {
-        lhs: if_stmt.cond.clone(),
-        rhs: inner_if.cond.clone(),
-    }));
-    if_stmt.then_block = inner_if.then_block.clone();
-    true
 }
 
 fn normalize_empty_if_arms(if_stmt: &mut AstIf) -> bool {

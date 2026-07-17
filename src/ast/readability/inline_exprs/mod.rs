@@ -29,6 +29,7 @@ use super::binding_tree::{
     stmt_has_direct_call_arg_binding_use, stmt_has_index_binding_use, stmt_has_nested_binding_use,
     stmt_has_nested_binding_value_use,
 };
+use super::stmt_plan::{PlannedStmt, materialize_stmt_plan};
 use super::walk::{self, AstRewritePass, BlockKind};
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
@@ -78,17 +79,17 @@ fn rewrite_current_block(
 
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts(&old_stmts);
-    let mut new_stmts = Vec::with_capacity(old_stmts.len());
+    let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut index = 0;
     while index < old_stmts.len() {
         let Some(next_stmt) = old_stmts.get(index + 1) else {
-            new_stmts.push(old_stmts[index].clone());
+            stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
         };
 
         let Some((candidate, value)) = inline_candidate(&old_stmts[index]) else {
-            new_stmts.push(old_stmts[index].clone());
+            stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
         };
@@ -116,7 +117,7 @@ fn rewrite_current_block(
             // 如果太早收成 `local weight = items[i].weight`，后面的机械 run 就只剩一层，
             // 无法再判断“整条链都只是脚手架”。让它留到 run-collapse 一次性处理，
             // 才能既收回 for-loop 里的机械局部，又保住 return 场景下的阶段 local。
-            new_stmts.push(old_stmts[index].clone());
+            stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
         }
@@ -168,12 +169,12 @@ fn rewrite_current_block(
         if !candidate.allows_expr_with_policy(value, effective_policy)
             && !allows_special_lookup_access_base
         {
-            new_stmts.push(old_stmts[index].clone());
+            stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
         }
         if use_index.count_uses_in_suffix(index + 1, candidate.binding()) != 1 {
-            new_stmts.push(old_stmts[index].clone());
+            stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
         }
@@ -183,7 +184,7 @@ fn rewrite_current_block(
             candidate.binding(),
             mutable_snapshots,
         ) {
-            new_stmts.push(old_stmts[index].clone());
+            stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
         }
@@ -210,23 +211,23 @@ fn rewrite_current_block(
                     options,
                     rewrite_policy,
                 ) {
-                    new_stmts.push(old_stmts[index].clone());
+                    stmt_plan.push(PlannedStmt::Original(index));
                     index += 1;
                     continue;
                 }
             } else {
-                new_stmts.push(old_stmts[index].clone());
+                stmt_plan.push(PlannedStmt::Original(index));
                 index += 1;
                 continue;
             }
         }
 
-        new_stmts.push(rewritten_next);
+        stmt_plan.push(PlannedStmt::Rewritten(rewritten_next));
         changed = true;
         index += 2;
     }
 
-    block.stmts = new_stmts;
+    block.stmts = materialize_stmt_plan(old_stmts, stmt_plan);
     changed |= collapse_adjacent_call_alias_runs(block, options, mutable_snapshots);
     changed |= collapse_terminal_call_result_alias_runs(block, options, mutable_snapshots);
     changed |= collapse_terminal_local_mechanical_runs(block, options, mutable_snapshots);
@@ -258,7 +259,7 @@ fn collapse_adjacent_call_alias_runs(
 ) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts(&old_stmts);
-    let mut new_stmts = Vec::with_capacity(old_stmts.len());
+    let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
     let mut index = 0;
 
@@ -272,7 +273,7 @@ fn collapse_adjacent_call_alias_runs(
             || run_end >= old_stmts.len()
             || !stmt_is_terminal_call_alias_sink(&old_stmts[run_end])
         {
-            new_stmts.push(old_stmts[index].clone());
+            stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
         };
@@ -283,12 +284,12 @@ fn collapse_adjacent_call_alias_runs(
             &use_index,
             mutable_snapshots,
         ) {
-            new_stmts.push(old_stmts[index].clone());
+            stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
         }
 
-        let mut rewritten_sink = old_stmts[run_end].clone();
+        let mut rewritten_sink = None;
         let rewrite_policy = if stmt_is_generic_for_call_alias_sink(&old_stmts[run_end]) {
             InlinePolicy::LoopHeaderCall
         } else {
@@ -330,7 +331,10 @@ fn collapse_adjacent_call_alias_runs(
                 continue;
             }
 
-            let mut trial_sink = rewritten_sink.clone();
+            let mut trial_sink = rewritten_sink
+                .as_ref()
+                .unwrap_or(&old_stmts[run_end])
+                .clone();
             if rewrite_stmt_use_sites_with_policy(
                 &mut trial_sink,
                 candidate,
@@ -338,7 +342,7 @@ fn collapse_adjacent_call_alias_runs(
                 options,
                 rewrite_policy,
             ) {
-                rewritten_sink = trial_sink;
+                rewritten_sink = Some(trial_sink);
                 removed[candidate_index - index] = true;
                 collapsed_count += 1;
             }
@@ -357,23 +361,21 @@ fn collapse_adjacent_call_alias_runs(
             )
         {
             changed = true;
-            push_collapsed_run(
-                &mut new_stmts,
-                &old_stmts,
+            plan_collapsed_run(
+                &mut stmt_plan,
                 index,
-                run_end,
                 &removed,
-                rewritten_sink,
+                rewritten_sink.expect("collapsed alias run must rewrite its sink"),
             );
             index = run_end + 1;
             continue;
         }
 
-        new_stmts.push(old_stmts[index].clone());
+        stmt_plan.push(PlannedStmt::Original(index));
         index += 1;
     }
 
-    block.stmts = new_stmts;
+    block.stmts = materialize_stmt_plan(old_stmts, stmt_plan);
     changed
 }
 
@@ -414,13 +416,13 @@ fn collapse_terminal_call_result_alias_runs(
 ) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts(&old_stmts);
-    let mut new_stmts = Vec::with_capacity(old_stmts.len());
+    let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
     let mut index = 0;
 
     while index < old_stmts.len() {
         let Some(sink_index) = find_terminal_call_result_sink(&old_stmts, index) else {
-            new_stmts.push(old_stmts[index].clone());
+            stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
         };
@@ -431,12 +433,12 @@ fn collapse_terminal_call_result_alias_runs(
             &use_index,
             mutable_snapshots,
         ) {
-            new_stmts.push(old_stmts[index].clone());
+            stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
         }
 
-        let mut rewritten_sink = old_stmts[sink_index].clone();
+        let mut rewritten_sink = None;
         let mut removed = vec![false; sink_index - index];
         let mut collapsed_count = 0usize;
         let mut remaining_run_uses = BTreeMap::new();
@@ -467,13 +469,14 @@ fn collapse_terminal_call_result_alias_runs(
             } else {
                 use_index.count_uses_in_range(candidate_index + 1, sink_index, candidate.binding())
             };
+            let current_sink = rewritten_sink.as_ref().unwrap_or(&old_stmts[sink_index]);
             if intermediate_uses != 0
-                || !stmt_has_nested_binding_use(&rewritten_sink, candidate.binding())
+                || !stmt_has_nested_binding_use(current_sink, candidate.binding())
             {
                 continue;
             }
 
-            let mut trial_sink = rewritten_sink.clone();
+            let mut trial_sink = current_sink.clone();
             if rewrite_stmt_use_sites_with_policy(
                 &mut trial_sink,
                 candidate,
@@ -481,7 +484,7 @@ fn collapse_terminal_call_result_alias_runs(
                 options,
                 InlinePolicy::ExtendedCallChain,
             ) {
-                rewritten_sink = trial_sink;
+                rewritten_sink = Some(trial_sink);
                 removed[candidate_index - index] = true;
                 collapsed_count += 1;
             }
@@ -500,23 +503,21 @@ fn collapse_terminal_call_result_alias_runs(
             )
         {
             changed = true;
-            push_collapsed_run(
-                &mut new_stmts,
-                &old_stmts,
+            plan_collapsed_run(
+                &mut stmt_plan,
                 index,
-                sink_index,
                 &removed,
-                rewritten_sink,
+                rewritten_sink.expect("collapsed call-result run must rewrite its sink"),
             );
             index = sink_index + 1;
             continue;
         }
 
-        new_stmts.push(old_stmts[index].clone());
+        stmt_plan.push(PlannedStmt::Original(index));
         index += 1;
     }
 
-    block.stmts = new_stmts;
+    block.stmts = materialize_stmt_plan(old_stmts, stmt_plan);
     changed
 }
 
@@ -556,7 +557,7 @@ fn collapse_adjacent_mechanical_alias_runs(
 ) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts(&old_stmts);
-    let mut new_stmts = Vec::with_capacity(old_stmts.len());
+    let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
     let mut index = 0;
 
@@ -570,12 +571,12 @@ fn collapse_adjacent_mechanical_alias_runs(
             || run_end >= old_stmts.len()
             || !stmt_can_absorb_mechanical_run(&old_stmts[run_end])
         {
-            new_stmts.push(old_stmts[index].clone());
+            stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
         }
 
-        let mut rewritten_sink = old_stmts[run_end].clone();
+        let mut rewritten_sink = None;
         let mut removed = vec![false; run_end - index];
         let mut collapsed_count = 0usize;
         let mut has_non_lookup_piece = false;
@@ -611,11 +612,12 @@ fn collapse_adjacent_mechanical_alias_runs(
             {
                 continue;
             }
-            if !stmt_has_mechanical_run_sink_binding_use(&rewritten_sink, candidate.binding()) {
+            let current_sink = rewritten_sink.as_ref().unwrap_or(&old_stmts[run_end]);
+            if !stmt_has_mechanical_run_sink_binding_use(current_sink, candidate.binding()) {
                 continue;
             }
 
-            let mut trial_sink = rewritten_sink.clone();
+            let mut trial_sink = current_sink.clone();
             if rewrite_stmt_use_sites_with_policy(
                 &mut trial_sink,
                 candidate,
@@ -623,7 +625,7 @@ fn collapse_adjacent_mechanical_alias_runs(
                 options,
                 InlinePolicy::MechanicalRun,
             ) {
-                rewritten_sink = trial_sink;
+                rewritten_sink = Some(trial_sink);
                 removed[candidate_index - index] = true;
                 collapsed_count += 1;
                 has_non_lookup_piece |= !candidate::is_lookup_inline_expr(value);
@@ -636,37 +638,36 @@ fn collapse_adjacent_mechanical_alias_runs(
             }
         }
 
-        if collapsed_count >= 2
-            && (has_non_lookup_piece
-                || stmt_prefers_pure_lookup_run_collapse(&rewritten_sink)
-                || (has_dependent_lookup_piece
-                    && stmt_prefers_dependent_lookup_run_collapse(&rewritten_sink)))
-            && eval_order::run_preserves_eval_order(
-                &old_stmts,
-                index,
-                run_end,
-                &removed,
-                mutable_snapshots,
-            )
-        {
+        if rewritten_sink.as_ref().is_some_and(|rewritten_sink| {
+            collapsed_count >= 2
+                && (has_non_lookup_piece
+                    || stmt_prefers_pure_lookup_run_collapse(rewritten_sink)
+                    || (has_dependent_lookup_piece
+                        && stmt_prefers_dependent_lookup_run_collapse(rewritten_sink)))
+                && eval_order::run_preserves_eval_order(
+                    &old_stmts,
+                    index,
+                    run_end,
+                    &removed,
+                    mutable_snapshots,
+                )
+        }) {
             changed = true;
-            push_collapsed_run(
-                &mut new_stmts,
-                &old_stmts,
+            plan_collapsed_run(
+                &mut stmt_plan,
                 index,
-                run_end,
                 &removed,
-                rewritten_sink,
+                rewritten_sink.expect("collapsed mechanical run must rewrite its sink"),
             );
             index = run_end + 1;
             continue;
         }
 
-        new_stmts.push(old_stmts[index].clone());
+        stmt_plan.push(PlannedStmt::Original(index));
         index += 1;
     }
 
-    block.stmts = new_stmts;
+    block.stmts = materialize_stmt_plan(old_stmts, stmt_plan);
     changed
 }
 
@@ -677,7 +678,7 @@ fn collapse_terminal_local_mechanical_runs(
 ) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts(&old_stmts);
-    let mut new_stmts = Vec::with_capacity(old_stmts.len());
+    let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
     let mut index = 0;
 
@@ -688,13 +689,13 @@ fn collapse_terminal_local_mechanical_runs(
         }
 
         if run_end <= index + 1 || run_end >= old_stmts.len() {
-            new_stmts.push(old_stmts[index].clone());
+            stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
         }
 
         let Some((sink_candidate, _)) = inline_candidate(&old_stmts[run_end - 1]) else {
-            new_stmts.push(old_stmts[index].clone());
+            stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
         };
@@ -706,12 +707,12 @@ fn collapse_terminal_local_mechanical_runs(
             candidate::InlineCandidate::LocalAlias { .. }
         ) || use_index.count_uses_in_suffix(run_end, sink_candidate.binding()) == 0
         {
-            new_stmts.push(old_stmts[index].clone());
+            stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
         }
 
-        let mut rewritten_sink = old_stmts[run_end - 1].clone();
+        let mut rewritten_sink = None;
         let mut removed = vec![false; run_end - index - 1];
         let mut collapsed_count = 0usize;
         let mut remaining_run_uses = BTreeMap::new();
@@ -743,11 +744,12 @@ fn collapse_terminal_local_mechanical_runs(
             {
                 continue;
             }
-            if !stmt_has_nested_binding_use(&rewritten_sink, candidate.binding()) {
+            let current_sink = rewritten_sink.as_ref().unwrap_or(&old_stmts[run_end - 1]);
+            if !stmt_has_nested_binding_use(current_sink, candidate.binding()) {
                 continue;
             }
 
-            let mut trial_sink = rewritten_sink.clone();
+            let mut trial_sink = current_sink.clone();
             if rewrite_stmt_use_sites_with_policy(
                 &mut trial_sink,
                 candidate,
@@ -755,7 +757,7 @@ fn collapse_terminal_local_mechanical_runs(
                 options,
                 InlinePolicy::MechanicalRun,
             ) {
-                rewritten_sink = trial_sink;
+                rewritten_sink = Some(trial_sink);
                 removed[candidate_index - index] = true;
                 collapsed_count += 1;
             }
@@ -771,23 +773,21 @@ fn collapse_terminal_local_mechanical_runs(
             )
         {
             changed = true;
-            push_collapsed_run(
-                &mut new_stmts,
-                &old_stmts,
+            plan_collapsed_run(
+                &mut stmt_plan,
                 index,
-                run_end - 1,
                 &removed,
-                rewritten_sink,
+                rewritten_sink.expect("collapsed terminal-local run must rewrite its sink"),
             );
             index = run_end;
             continue;
         }
 
-        new_stmts.push(old_stmts[index].clone());
+        stmt_plan.push(PlannedStmt::Original(index));
         index += 1;
     }
 
-    block.stmts = new_stmts;
+    block.stmts = materialize_stmt_plan(old_stmts, stmt_plan);
     changed
 }
 
@@ -805,20 +805,18 @@ fn stmt_can_absorb_mechanical_run(stmt: &AstStmt) -> bool {
     )
 }
 
-fn push_collapsed_run(
-    new_stmts: &mut Vec<AstStmt>,
-    old_stmts: &[AstStmt],
+fn plan_collapsed_run(
+    stmt_plan: &mut Vec<PlannedStmt>,
     run_start: usize,
-    run_end: usize,
     removed: &[bool],
     rewritten_sink: AstStmt,
 ) {
-    for (offset, stmt) in old_stmts[run_start..run_end].iter().enumerate() {
-        if !removed[offset] {
-            new_stmts.push(stmt.clone());
+    for (offset, removed) in removed.iter().enumerate() {
+        if !removed {
+            stmt_plan.push(PlannedStmt::Original(run_start + offset));
         }
     }
-    new_stmts.push(rewritten_sink);
+    stmt_plan.push(PlannedStmt::Rewritten(rewritten_sink));
 }
 
 fn stmt_prefers_pure_lookup_run_collapse(stmt: &AstStmt) -> bool {

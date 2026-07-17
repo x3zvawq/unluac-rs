@@ -1,4 +1,5 @@
 -- regress_235_table_constructor_eval_ownership: moved producers keep one ordered evaluation
+-- unluac: expect-contains [[cross_seed = {}]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
 local log = {}
@@ -39,3 +40,8 @@ assert(table.concat(log, ",") == "direct-key,direct-value")
 assert(direct["direct-key"] == "direct-value")
 
 print("regress_235_table_constructor_eval_ownership", "ok")
+
+local parent = {}
+local child = {}
+parent.cross_seed = child
+assert(parent.cross_seed ~= nil)

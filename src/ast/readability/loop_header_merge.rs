@@ -16,6 +16,7 @@ use super::binding_tree::{
     count_name_expr_uses, replace_binding_use_in_expr, stmt_mentions_binding_target,
 };
 use super::expr_analysis::expr_complexity;
+use super::stmt_plan::{PlannedStmt, materialize_stmt_plan};
 use super::walk::{self, AstRewritePass, BlockKind};
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
@@ -51,7 +52,7 @@ impl AstRewritePass for LoopHeaderMergePass {
             use_index = BindingUseIndex::for_stmts(&old_stmts);
         }
 
-        let mut new_stmts = Vec::with_capacity(old_stmts.len());
+        let mut stmt_plan = Vec::with_capacity(old_stmts.len());
         let mut index = 0;
         while index < old_stmts.len() {
             let mut run_end = index;
@@ -61,12 +62,12 @@ impl AstRewritePass for LoopHeaderMergePass {
             }
 
             if run_end == index || run_end >= old_stmts.len() {
-                new_stmts.push(old_stmts[index].clone());
+                stmt_plan.push(PlannedStmt::Original(index));
                 index += 1;
                 continue;
             }
 
-            let mut rewritten_loop = old_stmts[run_end].clone();
+            let mut rewritten_loop = None;
             let mut removed = vec![false; run_end - index];
             let mut collapsed_count = 0usize;
 
@@ -88,13 +89,14 @@ impl AstRewritePass for LoopHeaderMergePass {
                 if use_index.count_uses_in_range(candidate_index + 1, run_end, binding.id) != 0 {
                     continue;
                 }
-                if !header_uses_binding_exactly_once(&rewritten_loop, binding.id) {
+                let current_loop = rewritten_loop.as_ref().unwrap_or(&old_stmts[run_end]);
+                if !header_uses_binding_exactly_once(current_loop, binding.id) {
                     continue;
                 }
 
-                let mut trial_loop = rewritten_loop.clone();
+                let mut trial_loop = current_loop.clone();
                 if rewrite_loop_header_binding(&mut trial_loop, binding.id, value) {
-                    rewritten_loop = trial_loop;
+                    rewritten_loop = Some(trial_loop);
                     removed[candidate_index - index] = true;
                     collapsed_count += 1;
                 }
@@ -102,21 +104,23 @@ impl AstRewritePass for LoopHeaderMergePass {
 
             if collapsed_count >= 2 {
                 changed = true;
-                for (offset, stmt) in old_stmts[index..run_end].iter().enumerate() {
-                    if !removed[offset] {
-                        new_stmts.push(stmt.clone());
+                for (offset, removed) in removed.iter().enumerate() {
+                    if !removed {
+                        stmt_plan.push(PlannedStmt::Original(index + offset));
                     }
                 }
-                new_stmts.push(rewritten_loop);
+                stmt_plan.push(PlannedStmt::Rewritten(
+                    rewritten_loop.expect("collapsed loop header must rewrite the loop"),
+                ));
                 index = run_end + 1;
                 continue;
             }
 
-            new_stmts.push(old_stmts[index].clone());
+            stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
         }
 
-        block.stmts = new_stmts;
+        block.stmts = materialize_stmt_plan(old_stmts, stmt_plan);
         changed
     }
 }

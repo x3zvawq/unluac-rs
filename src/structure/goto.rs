@@ -9,15 +9,17 @@
 //! - `break` 或 `continue` 形状如果提前跳出了当前 loop body，会被记成
 //!   `UnstructuredBreakLike / UnstructuredContinueLike`
 //! - same-header 内层 loop 的结构化出口自然汇入外层条件时，不会误记成 continue
+//! - 多层嵌套 loop 共用一份 `block -> candidate owner` 索引，入口边与 backedge owner
+//!   不会为每个候选重新展开完整 membership 集合
 
 use std::collections::BTreeSet;
 
-use crate::structure::{Cfg, EdgeKind};
+use crate::structure::{Cfg, EdgeKind, EdgeRef};
 use crate::transformer::LoweredProto;
 
 use super::common::IrreducibleRegion;
 use super::common::{BranchCandidate, GotoReason, GotoRequirement, LoopCandidate, LoopKindHint};
-use super::helpers::{block_has_non_control_prefix, collect_region_entry_edges};
+use super::helpers::block_has_non_control_prefix;
 use super::loops::transparent_loop_exit_target;
 
 pub(super) fn analyze_goto_requirements(
@@ -28,9 +30,10 @@ pub(super) fn analyze_goto_requirements(
     irreducible_regions: &[IrreducibleRegion],
 ) -> Vec<GotoRequirement> {
     let mut requirements = BTreeSet::new();
+    let membership = LoopMembershipIndex::new(cfg, loop_candidates);
 
-    for loop_candidate in loop_candidates {
-        for edge_ref in collect_region_entry_edges(cfg, &loop_candidate.blocks) {
+    for (candidate_index, loop_candidate) in loop_candidates.iter().enumerate() {
+        for &edge_ref in &membership.entry_edges_by_candidate[candidate_index] {
             let edge = cfg.edges[edge_ref.index()];
             if edge.to != loop_candidate.header {
                 requirements.insert(GotoRequirement {
@@ -41,8 +44,14 @@ pub(super) fn analyze_goto_requirements(
         }
 
         for edge_ref in &loop_candidate.backedges {
-            if backedge_crosses_nested_loop(proto, cfg, loop_candidates, loop_candidate, *edge_ref)
-            {
+            if backedge_crosses_nested_loop(
+                proto,
+                cfg,
+                loop_candidates,
+                &membership.body_scope_owners_by_block,
+                loop_candidate,
+                *edge_ref,
+            ) {
                 requirements.insert(GotoRequirement {
                     edge: *edge_ref,
                     reason: GotoReason::CrossLoopContinueLike,
@@ -87,6 +96,7 @@ pub(super) fn analyze_goto_requirements(
                         )
                         && !is_same_header_nested_loop_exit(
                             loop_candidates,
+                            &membership.exit_owners_by_block,
                             loop_candidate,
                             edge.from,
                         )
@@ -114,22 +124,73 @@ pub(super) fn analyze_goto_requirements(
     requirements.into_iter().collect()
 }
 
+/// loop 候选 membership 的单次稠密投影。
+///
+/// candidate identity 仍由切片下标精确区分；same-header 与退化候选不会被按 header
+/// 合并。入口边直接从 CFG edge 扫描投影到 owner，避免每个候选再次扫描全部 block。
+struct LoopMembershipIndex {
+    body_scope_owners_by_block: Vec<Vec<usize>>,
+    exit_owners_by_block: Vec<Vec<usize>>,
+    entry_edges_by_candidate: Vec<Vec<EdgeRef>>,
+}
+
+impl LoopMembershipIndex {
+    fn new(cfg: &Cfg, candidates: &[LoopCandidate]) -> Self {
+        let mut core_owners_by_block = vec![Vec::new(); cfg.blocks.len()];
+        let mut body_scope_owners_by_block = vec![Vec::new(); cfg.blocks.len()];
+        let mut exit_owners_by_block = vec![Vec::new(); cfg.blocks.len()];
+        for (candidate_index, candidate) in candidates.iter().enumerate() {
+            for block in &candidate.blocks {
+                core_owners_by_block[block.index()].push(candidate_index);
+            }
+            for block in &candidate.body_scope_blocks {
+                body_scope_owners_by_block[block.index()].push(candidate_index);
+            }
+            for block in &candidate.exits {
+                exit_owners_by_block[block.index()].push(candidate_index);
+            }
+        }
+
+        let mut entry_edges_by_candidate = vec![Vec::new(); candidates.len()];
+        for (edge_index, edge) in cfg.edges.iter().enumerate() {
+            if !cfg.reachable_blocks.contains(&edge.from) {
+                continue;
+            }
+            let source_owners = &core_owners_by_block[edge.from.index()];
+            for &candidate_index in &core_owners_by_block[edge.to.index()] {
+                if source_owners.binary_search(&candidate_index).is_err() {
+                    entry_edges_by_candidate[candidate_index].push(EdgeRef(edge_index));
+                }
+            }
+        }
+
+        Self {
+            body_scope_owners_by_block,
+            exit_owners_by_block,
+            entry_edges_by_candidate,
+        }
+    }
+}
+
 fn backedge_crosses_nested_loop(
     proto: &LoweredProto,
     cfg: &Cfg,
     candidates: &[LoopCandidate],
+    body_scope_owners_by_block: &[Vec<usize>],
     outer: &LoopCandidate,
-    edge_ref: crate::structure::EdgeRef,
+    edge_ref: EdgeRef,
 ) -> bool {
     let edge = cfg.edges[edge_ref.index()];
     edge.to == outer.header
-        && candidates.iter().any(|inner| {
-            inner.header != outer.header
-                && inner.blocks.len() < outer.blocks.len()
-                && inner.blocks.is_subset(&outer.body_scope_blocks)
-                && inner.body_scope_blocks.contains(&edge.from)
-                && !nested_loop_exits_to_outer_header(proto, cfg, inner, outer.header)
-        })
+        && body_scope_owners_by_block[edge.from.index()]
+            .iter()
+            .map(|index| &candidates[*index])
+            .any(|inner| {
+                inner.header != outer.header
+                    && inner.blocks.len() < outer.blocks.len()
+                    && inner.blocks.is_subset(&outer.body_scope_blocks)
+                    && !nested_loop_exits_to_outer_header(proto, cfg, inner, outer.header)
+            })
 }
 
 fn nested_loop_exits_to_outer_header(
@@ -147,17 +208,21 @@ fn nested_loop_exits_to_outer_header(
 
 fn is_same_header_nested_loop_exit(
     candidates: &[LoopCandidate],
+    exit_owners_by_block: &[Vec<usize>],
     outer: &LoopCandidate,
     from: crate::structure::BlockRef,
 ) -> bool {
     // 内层 exit block 属于外层区域却不属于内层 core；它汇入外层条件是正常的
     // 嵌套控制流，不能因为目标恰是外层 continue target 就要求 goto。
-    candidates.iter().any(|inner| {
-        inner.header == outer.header
-            && inner.blocks.len() < outer.blocks.len()
-            && inner.blocks.is_subset(&outer.blocks)
-            && inner.exits.contains(&from)
-    })
+    exit_owners_by_block[from.index()]
+        .iter()
+        .copied()
+        .map(|index| &candidates[index])
+        .any(|inner| {
+            inner.header == outer.header
+                && inner.blocks.len() < outer.blocks.len()
+                && inner.blocks.is_subset(&outer.blocks)
+        })
 }
 
 fn is_degenerate_branch_to_target(

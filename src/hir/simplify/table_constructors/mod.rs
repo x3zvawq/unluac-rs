@@ -35,8 +35,8 @@ use self::bindings::{
     collect_binding_facts, collect_stmt_binding_summary,
 };
 use self::scan::{
-    constructor_seed, install_constructor_seed, trailing_constructor_handoff,
-    try_defer_open_set_list_owner, try_rebuild_constructor_region,
+    ConstructorWriteIndex, constructor_seed, install_constructor_seed,
+    trailing_constructor_handoff, try_defer_open_set_list_owner, try_rebuild_constructor_region,
 };
 use super::walk::{HirRewritePass, rewrite_proto};
 
@@ -200,6 +200,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
             self.promotion_facts,
         );
         let mut stmt_ids = (0..block.stmts.len()).collect::<Vec<_>>();
+        let constructor_writes = ConstructorWriteIndex::new(&block.stmts, &binding_index);
         let materialized_binding_counts =
             binding_index.materialized_counts(&self.materialized_bindings);
         let mut index = 0;
@@ -209,18 +210,26 @@ impl HirRewritePass for TableConstructorPass<'_> {
                 continue;
             };
 
-            let rebuilt = try_rebuild_constructor_region(
-                block,
-                index,
-                binding,
-                seed_ctor.clone(),
-                &binding_index,
-                &binding_occurrences,
-                &materialized_binding_counts,
-                &stmt_ids,
-                self.dialect,
-                &mut scratch,
-            );
+            let binding_id = binding_index
+                .id_of(binding)
+                .expect("constructor seed binding should be indexed");
+            let seed_stmt_id = stmt_ids[index];
+            let rebuilt = if constructor_writes.has_write_after(binding_id, seed_stmt_id) {
+                try_rebuild_constructor_region(
+                    block,
+                    index,
+                    binding,
+                    seed_ctor.clone(),
+                    &binding_index,
+                    &binding_occurrences,
+                    &materialized_binding_counts,
+                    &stmt_ids,
+                    self.dialect,
+                    &mut scratch,
+                )
+            } else {
+                None
+            };
             let (constructor, end_index, rebuilt_region) = match rebuilt {
                 Some((rebuilt_ctor, end_index)) => (rebuilt_ctor, end_index, true),
                 None => (seed_ctor, index, false),
@@ -228,13 +237,11 @@ impl HirRewritePass for TableConstructorPass<'_> {
 
             if !rebuilt_region
                 && self.binding_is_unshared(binding)
+                && constructor_writes.has_set_list_after(binding_id, seed_stmt_id)
                 && let Some((constructor, set_list_index)) =
                     try_defer_open_set_list_owner(block, index, binding, &constructor)
             {
                 let handoff_index = set_list_index + 1;
-                let binding_id = binding_index
-                    .id_of(binding)
-                    .expect("constructor seed binding should be indexed");
                 let handoff_target = stmt_ids
                     .get(handoff_index)
                     .and_then(|stmt_id| {
@@ -257,9 +264,6 @@ impl HirRewritePass for TableConstructorPass<'_> {
             }
 
             let handoff_index = end_index + 1;
-            let binding_id = binding_index
-                .id_of(binding)
-                .expect("constructor seed binding should be indexed");
             let handoff_target = stmt_ids
                 .get(handoff_index)
                 .and_then(|stmt_id| {

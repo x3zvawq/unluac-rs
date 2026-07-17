@@ -36,6 +36,7 @@ pub(super) fn build_ssa(
     live_out: &[BTreeSet<Reg>],
     reg_count: usize,
     instr_count: usize,
+    incoming_slots: &[Option<usize>],
 ) -> SsaAnalysis {
     let mut phis = place_phis(cfg, graph, defs, live_in);
     let phi_block_ranges = super::index_phi_candidate_ranges(cfg, &phis);
@@ -55,6 +56,7 @@ pub(super) fn build_ssa(
         &mut block_entry_values,
         &mut block_exit_values,
         &mut use_values,
+        incoming_slots,
     );
 
     let replacements = trivial_phi_replacements(&phis);
@@ -188,6 +190,7 @@ fn rename(
     block_entry_values: &mut [SsaRegMap],
     block_exit_values: &mut [SsaRegMap],
     use_values: &mut [InstrUseValues],
+    incoming_slots: &[Option<usize>],
 ) {
     let mut stacks = (0..reg_count)
         .map(|index| vec![SsaValue::Entry(Reg(index))])
@@ -226,14 +229,19 @@ fn rename(
 
                 for edge in &cfg.succs[block.index()] {
                     let succ = cfg.edges[edge.index()].to;
-                    for phi in &mut phis[phi_ranges[succ.index()].clone()] {
-                        if let Some(incoming) = phi
+                    let range = phi_ranges[succ.index()].clone();
+                    if range.is_empty() {
+                        continue;
+                    }
+                    let slot = incoming_slots[edge.index()]
+                        .expect("reachable CFG edge must have an incoming slot");
+                    for phi in &mut phis[range] {
+                        let incoming = phi
                             .incoming
-                            .iter_mut()
-                            .find(|incoming| incoming.edge == Some(*edge))
-                        {
-                            incoming.value = current(&stacks, phi.reg);
-                        }
+                            .get_mut(slot)
+                            .expect("phi incoming slots must match CFG predecessors");
+                        assert_eq!(incoming.edge, Some(*edge));
+                        incoming.value = current(&stacks, phi.reg);
                     }
                 }
 
