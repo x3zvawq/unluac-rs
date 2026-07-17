@@ -479,7 +479,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 candidate,
                 other_exit,
                 |block| {
-                    candidate.blocks.contains(&block)
+                    inside_exit_blocks.contains(&block)
                         || block == exit
                         || region.is_some_and(|region| {
                             region.contains_structured_block(graph_facts, block)

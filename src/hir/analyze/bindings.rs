@@ -15,7 +15,9 @@ use crate::hir::common::{LocalId, ParamId, TempId, UpvalueId};
 use crate::parser::RawLocalVar;
 use crate::structure::{BlockRef, Cfg, DataflowFacts, DefId, SsaValue};
 use crate::structure::{LoopSourceBindings, StructureFacts};
-use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto, Reg};
+use crate::transformer::{
+    AccessBase, CaptureSource, GetTableKind, InstrRef, LowInstr, LoweredProto, Reg,
+};
 
 use super::ProtoBindings;
 use super::helpers::decode_raw_string;
@@ -143,8 +145,20 @@ pub(super) fn build_bindings(
 
     for def in &dataflow.defs {
         let temp = fixed_temps[def.id.index()];
-        temp_debug_locals[temp.index()] =
-            debug_local_name_for_reg_at_instr(proto, def.reg, def.instr);
+        temp_debug_locals[temp.index()] = match proto.instrs.get(def.instr.index()) {
+            Some(LowInstr::GetTable(get_table)) if get_table.kind == GetTableKind::Method => None,
+            Some(LowInstr::Move(receiver))
+                if matches!(
+                    proto.instrs.get(def.instr.index() + 1),
+                    Some(LowInstr::GetTable(method))
+                        if method.kind == GetTableKind::Method
+                            && method.base == AccessBase::Reg(receiver.dst)
+                ) =>
+            {
+                None
+            }
+            _ => debug_local_name_for_reg_at_instr(proto, def.reg, def.instr),
+        };
     }
 
     for phi in &dataflow.phi_candidates {

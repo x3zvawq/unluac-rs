@@ -443,7 +443,7 @@ impl<'a> ProtoLowerer<'a> {
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::GetTable(GetTableInstr {
                             dst: callee,
-                            base: AccessBase::Reg(base),
+                            base: AccessBase::Reg(self_arg),
                             key: AccessKey::Const(method_name),
                             kind: GetTableKind::Method,
                         })),

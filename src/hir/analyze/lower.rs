@@ -405,7 +405,7 @@ fn open_pack_bridge_is_method_setup(
         && method.kind == GetTableKind::Method
         && method.dst == call.callee
         && receiver.dst == self_arg
-        && receiver.src == base
+        && base == self_arg
         && producer_start.index() > self_arg.index()
 }
 

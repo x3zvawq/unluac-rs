@@ -1,28 +1,31 @@
 //! 相邻单候选和多候选 run 搬运前的求值顺序证明。
 //!
-//! inline 会把声明 RHS 搬进 sink。这里把可观察 RHS 当成原子事件，递归展开它们之间
-//! 的 binding 依赖，并要求这些事件仍是 sink 的同序前缀；任一 retained 可观察声明
-//! 或 sink 自身的可观察操作都会形成屏障。table lvalue 的写入发生在 RHS 之后，只有
+//! inline 会把声明 RHS 搬进 sink。这里把可观察 RHS 与 binding 值快照当成有序事件，
+//! 递归展开它们之间的依赖，并要求这些事件仍是 sink 的同序前缀；任一 retained 有序
+//! 声明或 sink 自身的状态事件都会形成屏障。table lvalue 的写入发生在 RHS 之后，只有
 //! base/key 自身的事件构成前缀；method lookup 则位于 receiver 与显式参数之间。
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::common::{
-    AstBindingRef, AstCallKind, AstExpr, AstLValue, AstStmt, AstTableField, AstTableKey,
+    AstBindingRef, AstCallKind, AstExpr, AstLValue, AstNameRef, AstStmt, AstTableField, AstTableKey,
 };
 
 use super::super::binding_ref::binding_from_name_ref;
-use super::super::expr_analysis::expr_observes_eval_order;
+use super::super::expr_analysis::{expr_observes_eval_order, expr_requires_ordered_snapshot};
 use super::candidate::inline_candidate;
 
 pub(super) fn preserves_adjacent_eval_order(
     sink: &AstStmt,
     binding: AstBindingRef,
     value: &AstExpr,
+    mutable_snapshots: &BTreeSet<AstNameRef>,
 ) -> bool {
     let values = BTreeMap::from([(binding, value)]);
     let mut collector = EvalPrefixCollector {
         values: &values,
+        ordered: BTreeSet::from([binding]),
+        mutable_snapshots,
         visiting: BTreeSet::new(),
         emitted: BTreeSet::new(),
         prefix: Vec::new(),
@@ -37,38 +40,43 @@ pub(super) fn run_preserves_eval_order(
     run_start: usize,
     sink_index: usize,
     removed: &[bool],
+    mutable_snapshots: &BTreeSet<AstNameRef>,
 ) -> bool {
-    let moved = stmts[run_start..sink_index]
+    let candidates = stmts[run_start..sink_index]
         .iter()
         .zip(removed)
         .filter_map(|(stmt, removed)| {
             let (candidate, value) = inline_candidate(stmt)?;
-            (*removed && expr_observes_eval_order(value)).then_some((candidate.binding(), value))
+            (*removed).then_some((candidate.binding(), value))
         })
         .collect::<Vec<_>>();
-    if moved.is_empty() {
+    let expected = candidates
+        .iter()
+        .filter_map(|(binding, value)| {
+            expr_requires_ordered_snapshot(value, mutable_snapshots).then_some(*binding)
+        })
+        .collect::<Vec<_>>();
+    if expected.is_empty() {
         return true;
     }
 
-    let first_moved = moved[0].0;
+    let first_moved = expected[0];
     let mut reached_first = false;
     for (stmt, removed) in stmts[run_start..sink_index].iter().zip(removed) {
         let Some((candidate, value)) = inline_candidate(stmt) else {
             continue;
         };
         reached_first |= candidate.binding() == first_moved;
-        if reached_first && !removed && expr_observes_eval_order(value) {
+        if reached_first && !removed && expr_requires_ordered_snapshot(value, mutable_snapshots) {
             return false;
         }
     }
 
-    let values = moved.iter().copied().collect::<BTreeMap<_, _>>();
-    let expected = moved
-        .iter()
-        .map(|(binding, _)| *binding)
-        .collect::<Vec<_>>();
+    let values = candidates.iter().copied().collect::<BTreeMap<_, _>>();
     let mut collector = EvalPrefixCollector {
         values: &values,
+        ordered: expected.iter().copied().collect(),
+        mutable_snapshots,
         visiting: BTreeSet::new(),
         emitted: BTreeSet::new(),
         prefix: Vec::new(),
@@ -80,6 +88,8 @@ pub(super) fn run_preserves_eval_order(
 
 struct EvalPrefixCollector<'a> {
     values: &'a BTreeMap<AstBindingRef, &'a AstExpr>,
+    ordered: BTreeSet<AstBindingRef>,
+    mutable_snapshots: &'a BTreeSet<AstNameRef>,
     visiting: BTreeSet<AstBindingRef>,
     emitted: BTreeSet<AstBindingRef>,
     prefix: Vec<AstBindingRef>,
@@ -88,7 +98,15 @@ struct EvalPrefixCollector<'a> {
 
 impl EvalPrefixCollector<'_> {
     fn barrier(&mut self) {
-        self.blocked |= self.prefix.len() < self.values.len();
+        self.blocked |= self.prefix.len() < self.ordered.len();
+    }
+
+    fn snapshot_barrier(&mut self) {
+        self.blocked |= self.values.iter().any(|(binding, value)| {
+            self.ordered.contains(binding)
+                && !self.emitted.contains(binding)
+                && expr_observes_eval_order(value)
+        });
     }
 
     fn stmt(&mut self, stmt: &AstStmt) {
@@ -236,10 +254,12 @@ impl EvalPrefixCollector<'_> {
             | AstExpr::FunctionExpr(_)
             | AstExpr::Error(_) => {}
         }
-        if matches!(mode, WalkMode::Sink)
-            && (expr_observes_eval_order(value) || matches!(value, AstExpr::VarArg))
-        {
-            self.barrier();
+        if matches!(mode, WalkMode::Sink) {
+            if expr_observes_eval_order(value) || matches!(value, AstExpr::VarArg) {
+                self.barrier();
+            } else if expr_requires_ordered_snapshot(value, self.mutable_snapshots) {
+                self.snapshot_barrier();
+            }
         }
     }
 
@@ -251,7 +271,7 @@ impl EvalPrefixCollector<'_> {
         let value = self.values[&binding];
         self.expr(value, WalkMode::Dependency);
         self.visiting.remove(&binding);
-        if !self.blocked {
+        if !self.blocked && self.ordered.contains(&binding) {
             self.prefix.push(binding);
         }
     }

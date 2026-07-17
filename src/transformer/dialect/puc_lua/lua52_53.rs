@@ -335,7 +335,7 @@ impl<'a> ProtoLowerer<'a> {
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::GetTable(GetTableInstr {
                             dst: callee,
-                            base: AccessBase::Reg(reg_from_u16(b)),
+                            base: AccessBase::Reg(self_arg),
                             key: method_key,
                             kind: GetTableKind::Method,
                         })),

@@ -35,6 +35,7 @@ use self::usage::{
     NextStmtState, TempUseScratch, TempUseSummary, collect_stmt_temp_uses, inline_candidate,
     max_temp_index_in_block,
 };
+use super::mention::ReferenceCapturedBindings;
 
 const NESTED_INLINE_MAX_COMPLEXITY: usize = 5;
 const CONTROL_HEAD_INLINE_MAX_COMPLEXITY: usize = 5;
@@ -53,9 +54,11 @@ pub(super) fn inline_temps_in_proto_with_facts(
     let body_temp_count = max_temp_index_in_block(&proto.body).map_or(0, |max_index| max_index + 1);
     let temp_count = proto_temp_count.max(body_temp_count);
     let mut scratch = TempUseScratch::new(proto, temp_count);
+    let reference_captured = super::mention::stmts_reference_captured_bindings(&proto.body.stmts);
     inline_temps_in_block(
         &mut proto.body,
         &mut scratch,
+        &reference_captured,
         readability,
         facts,
         &BTreeSet::new(),
@@ -66,6 +69,7 @@ pub(super) fn inline_temps_in_proto_with_facts(
 fn inline_temps_in_block(
     block: &mut HirBlock,
     scratch: &mut TempUseScratch,
+    reference_captured: &ReferenceCapturedBindings,
     readability: ReadabilityOptions,
     facts: &ProtoPromotionFacts,
     protected_temps: &BTreeSet<TempId>,
@@ -89,6 +93,7 @@ fn inline_temps_in_block(
         changed |= inline_temps_in_nested_blocks(
             stmt,
             scratch,
+            reference_captured,
             readability,
             facts,
             &nested_protected,
@@ -149,7 +154,13 @@ fn inline_temps_in_block(
             && let Some(next_stmt) = kept_rev.last()
             && let Some(site) = inline_site_in_stmt(next_stmt, temp)
             && !call_arg_inline_crosses_materialized_callee(site, value, index, state)
-            && !inline_crosses_evaluation_boundary(site, value, next_stmt, temp)
+            && !inline_crosses_evaluation_boundary(
+                site,
+                value,
+                next_stmt,
+                temp,
+                reference_captured,
+            )
             && site.allows(value, readability)
         {
             state.temp_uses.remove_from_totals(&mut suffix_use_totals);
@@ -185,11 +196,17 @@ fn inline_crosses_evaluation_boundary(
     value: &HirExpr,
     next_stmt: &HirStmt,
     temp: TempId,
+    reference_captured: &ReferenceCapturedBindings,
 ) -> bool {
     fixed_return_tail_call_prefers_materialization(site, value, next_stmt, temp)
         || (site == InlineSite::LoopCondition && !is_stable_inline_value(value))
         || (expr_requires_ordered_snapshot(value)
-            && !temp_precedes_observable_eval_in_stmt(next_stmt, temp))
+            && !temp_precedes_observable_eval_in_stmt(
+                next_stmt,
+                temp,
+                expr_observes_eval_order(value),
+                reference_captured,
+            ))
 }
 
 fn fixed_return_tail_call_prefers_materialization(
@@ -464,6 +481,7 @@ fn prefix_use_count(
 fn inline_temps_in_nested_blocks(
     stmt: &mut HirStmt,
     scratch: &mut TempUseScratch,
+    reference_captured: &ReferenceCapturedBindings,
     readability: ReadabilityOptions,
     facts: &ProtoPromotionFacts,
     protected_temps: &BTreeSet<TempId>,
@@ -474,6 +492,7 @@ fn inline_temps_in_nested_blocks(
             let mut changed = inline_temps_in_block(
                 &mut if_stmt.then_block,
                 scratch,
+                reference_captured,
                 readability,
                 facts,
                 protected_temps,
@@ -483,6 +502,7 @@ fn inline_temps_in_nested_blocks(
                 changed |= inline_temps_in_block(
                     else_block,
                     scratch,
+                    reference_captured,
                     readability,
                     facts,
                     protected_temps,
@@ -494,6 +514,7 @@ fn inline_temps_in_nested_blocks(
         HirStmt::While(while_stmt) => inline_temps_in_block(
             &mut while_stmt.body,
             scratch,
+            reference_captured,
             readability,
             facts,
             protected_temps,
@@ -508,6 +529,7 @@ fn inline_temps_in_nested_blocks(
             inline_temps_in_block(
                 &mut repeat_stmt.body,
                 scratch,
+                reference_captured,
                 readability,
                 facts,
                 &repeat_protected,
@@ -517,6 +539,7 @@ fn inline_temps_in_nested_blocks(
         HirStmt::NumericFor(numeric_for) => inline_temps_in_block(
             &mut numeric_for.body,
             scratch,
+            reference_captured,
             readability,
             facts,
             protected_temps,
@@ -525,6 +548,7 @@ fn inline_temps_in_nested_blocks(
         HirStmt::GenericFor(generic_for) => inline_temps_in_block(
             &mut generic_for.body,
             scratch,
+            reference_captured,
             readability,
             facts,
             protected_temps,
@@ -533,6 +557,7 @@ fn inline_temps_in_nested_blocks(
         HirStmt::Block(block) => inline_temps_in_block(
             block,
             scratch,
+            reference_captured,
             readability,
             facts,
             protected_temps,

@@ -125,10 +125,7 @@ fn pack_tail_for_open_def(
     match instr {
         LowInstr::Call(call) if matches!(call.results, ResultPack::Open(_)) => {
             let method_name = lower_method_name(lowering, call.method_name);
-            let is_method_sugar = matches!(call.kind, CallKind::Method) && method_name.is_some();
-            let callee = if is_method_sugar {
-                HirExpr::Nil
-            } else if single_eval {
+            let callee = if single_eval {
                 expr_for_reg_use_single_eval_with_call_policy(
                     lowering,
                     open_def.block,

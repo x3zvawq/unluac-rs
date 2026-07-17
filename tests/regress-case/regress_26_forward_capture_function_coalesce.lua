@@ -1,4 +1,4 @@
--- regress_26_forward_capture_function_coalesce#1: closure 捕获的前向函数槽位不能被 local-coalesce 合并
+-- regress_26_forward_capture_function_coalesce#1: closure 捕获的前向函数槽位保留独立 binding
 -- unluac: expect-contains [[local r1_0]]
 -- unluac: expect-contains [[r1_0 = function]]
 -- unluac: expect-contains [[return r1_1(1), r1_0(nil, 1)]]

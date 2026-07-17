@@ -130,6 +130,8 @@ const PUC_LUA_ALL: &[LuaCaseDialect] = &[
     LuaCaseDialect::Lua55,
 ];
 const PUC_LUA_51: &[LuaCaseDialect] = &[LuaCaseDialect::Lua51];
+const LUA_51_AND_LUAU: &[LuaCaseDialect] = &[LuaCaseDialect::Lua51, LuaCaseDialect::Luau];
+const LUA_51_AND_LUAJIT: &[LuaCaseDialect] = &[LuaCaseDialect::Lua51, LuaCaseDialect::Luajit];
 const PUC_LUA_52: &[LuaCaseDialect] = &[LuaCaseDialect::Lua52];
 const PUC_LUA_GE_52: &[LuaCaseDialect] = &[
     LuaCaseDialect::Lua52,
@@ -345,7 +347,7 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_25_table_setlist_trailing_short_circuit.lua",
-        PUC_LUA_51,
+        LUA_51_AND_LUAU,
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_26_forward_capture_function_coalesce.lua",
@@ -692,6 +694,10 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         LUAU_ONLY,
     )
     .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_110_luau_generic_for_exit_break_pad.lua",
+        LUA_51_AND_LUAJIT,
+    ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_111_luau_short_continue_shared_tail.lua",
         LUAU_ONLY,
@@ -1267,6 +1273,35 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_248_luajit_negated_compare.lua",
         LUAJIT_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_249_boolean_shell_table_lvalue_order.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_250_ast_inline_ordered_snapshot.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_251_method_alias_sink_order.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_252_materialize_preserves_eval.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_253_luau_deferred_open_setlist.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_254_table_constructor_handoff_snapshot.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_255_header_retry_terminal_state.lua",
+        LUA_51_AND_LUAJIT,
     ),
 ];
 

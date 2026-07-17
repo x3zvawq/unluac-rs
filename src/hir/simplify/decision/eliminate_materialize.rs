@@ -8,13 +8,19 @@
 //! 例子：
 //! - 输入：`target = Decision(a ? b : c)`
 //! - 输出：`local tmp; if a then tmp = b else tmp = c end; target = tmp`
+//! - 两臂相同或 truthiness 已知时，只有可安全丢弃的 test 才能删除控制壳
+//! - 后项产生 statement prefix 时，先快照此前仍待求值的同级表达式
+
+use std::mem;
 
 use crate::hir::common::{
-    HirAssign, HirBinaryExpr, HirBlock, HirCallExpr, HirClosureExpr, HirDecisionExpr,
-    HirDecisionNode, HirDecisionTarget, HirExpr, HirGenericFor, HirIf, HirLValue, HirLocalDecl,
-    HirLogicalExpr, HirNumericFor, HirPackTail, HirRecordField, HirStmt, HirTableAccess,
-    HirTableConstructor, HirTableField, HirTableKey, HirUnaryExpr, HirValuePack, LocalId,
+    HirAssign, HirBinaryExpr, HirBlock, HirCallExpr, HirCaptureMode, HirClosureExpr,
+    HirDecisionExpr, HirDecisionNode, HirDecisionTarget, HirExpr, HirGenericFor, HirIf, HirLValue,
+    HirLocalDecl, HirLogicalExpr, HirNumericFor, HirPackTail, HirRecordField, HirStmt,
+    HirTableAccess, HirTableConstructor, HirTableField, HirTableKey, HirUnaryExpr, HirValuePack,
+    LocalId,
 };
+use crate::hir::expr_safety::{expr_is_discard_safe, expr_requires_ordered_snapshot};
 
 use super::super::visit::{HirVisitor, visit_expr};
 use super::eliminate_state::EliminationState;
@@ -53,18 +59,26 @@ pub(super) fn extract_call_expr(
     call: HirCallExpr,
     state: &mut EliminationState<'_>,
 ) -> (Vec<HirStmt>, HirCallExpr, bool) {
-    let (mut prefix, callee, callee_changed) = extract_value_expr(call.callee, state);
-    let (arg_prefix, args, args_changed) = extract_value_pack(call.args, state);
-    prefix.extend(arg_prefix);
+    let HirCallExpr {
+        callee,
+        args,
+        method,
+        method_name,
+    } = call;
+    let (prefix, mut leading, args, changed) =
+        extract_value_pack_with_leading(vec![callee], args, state);
+    let callee = leading
+        .pop()
+        .expect("call extraction should preserve its callee");
     (
         prefix,
         HirCallExpr {
             callee,
             args,
-            method: call.method,
-            method_name: call.method_name,
+            method,
+            method_name,
         },
-        callee_changed || args_changed,
+        changed,
     )
 }
 
@@ -72,34 +86,159 @@ pub(super) fn extract_value_pack(
     pack: HirValuePack,
     state: &mut EliminationState<'_>,
 ) -> (Vec<HirStmt>, HirValuePack, bool) {
-    let (mut prefix, fixed, mut changed) = extract_value_exprs(pack.fixed, state);
+    let (prefix, leading, pack, changed) = extract_value_pack_with_leading(Vec::new(), pack, state);
+    debug_assert!(leading.is_empty());
+    (prefix, pack, changed)
+}
+
+pub(super) fn extract_value_pack_with_leading(
+    mut leading: Vec<HirExpr>,
+    pack: HirValuePack,
+    state: &mut EliminationState<'_>,
+) -> (Vec<HirStmt>, Vec<HirExpr>, HirValuePack, bool) {
+    let leading_len = leading.len();
+    leading.extend(pack.fixed);
+    let mut extracted = extract_ordered_exprs(leading, state, extract_value_expr);
+    let mut tail_prefix = Vec::new();
+    let mut tail_changed = false;
     let tail = pack.tail.map(|tail| {
         tail.map_call(|call| {
-            let (tail_prefix, call, call_changed) = extract_call_expr(call, state);
-            changed |= call_changed;
-            prefix.extend(tail_prefix);
+            let (prefix, call, changed) = extract_call_expr(call, state);
+            tail_prefix = prefix;
+            tail_changed = changed;
             call
         })
     });
-    (prefix, HirValuePack { fixed, tail }, changed)
+    extracted.append_prefix(tail_prefix, state);
+    extracted.changed |= tail_changed;
+
+    let fixed = extracted.exprs.split_off(leading_len);
+    (
+        extracted.prefix,
+        extracted.exprs,
+        HirValuePack { fixed, tail },
+        extracted.changed,
+    )
 }
 
 pub(super) fn extract_value_exprs(
     exprs: Vec<HirExpr>,
     state: &mut EliminationState<'_>,
 ) -> (Vec<HirStmt>, Vec<HirExpr>, bool) {
-    let mut prefix = Vec::new();
-    let mut rewritten = Vec::with_capacity(exprs.len());
-    let mut changed = false;
+    let extracted = extract_ordered_exprs(exprs, state, extract_value_expr);
+    (extracted.prefix, extracted.exprs, extracted.changed)
+}
 
+fn extract_ordered_exprs(
+    exprs: Vec<HirExpr>,
+    state: &mut EliminationState<'_>,
+    mut extract: impl FnMut(HirExpr, &mut EliminationState<'_>) -> (Vec<HirStmt>, HirExpr, bool),
+) -> OrderedExprExtraction {
+    let mut extracted = OrderedExprExtraction::with_capacity(exprs.len());
     for expr in exprs {
-        let (expr_prefix, expr, expr_changed) = extract_value_expr(expr, state);
-        prefix.extend(expr_prefix);
-        rewritten.push(expr);
-        changed |= expr_changed;
+        let (prefix, expr, changed) = extract(expr, state);
+        let stable = !prefix.is_empty() && matches!(expr, HirExpr::LocalRef(_));
+        extracted.push(prefix, expr, changed, stable, true, state);
+    }
+    extracted
+}
+
+/// 暂存最终表达式中的同级值；只有后项确实产生 prefix 时才物化前项，避免平白制造 local。
+struct OrderedExprExtraction {
+    prefix: Vec<HirStmt>,
+    exprs: Vec<HirExpr>,
+    pending_snapshots: Vec<usize>,
+    changed: bool,
+}
+
+impl OrderedExprExtraction {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            prefix: Vec::new(),
+            exprs: Vec::with_capacity(capacity),
+            pending_snapshots: Vec::new(),
+            changed: false,
+        }
     }
 
-    (prefix, rewritten, changed)
+    fn push(
+        &mut self,
+        prefix: Vec<HirStmt>,
+        expr: HirExpr,
+        changed: bool,
+        stable: bool,
+        snapshot_allowed: bool,
+        state: &mut EliminationState<'_>,
+    ) {
+        self.append_prefix(prefix, state);
+        if snapshot_allowed && !stable && expr_requires_ordered_snapshot(&expr) {
+            self.pending_snapshots.push(self.exprs.len());
+        }
+        self.exprs.push(expr);
+        self.changed |= changed;
+    }
+
+    fn append_prefix(&mut self, mut prefix: Vec<HirStmt>, state: &mut EliminationState<'_>) {
+        if prefix.is_empty() {
+            return;
+        }
+        let mut bindings = Vec::with_capacity(self.pending_snapshots.len());
+        let mut values = Vec::with_capacity(self.pending_snapshots.len());
+        for index in self.pending_snapshots.drain(..) {
+            let local = state.alloc_local();
+            let value = mem::replace(&mut self.exprs[index], HirExpr::Nil);
+            bindings.push(local);
+            values.push(value);
+            self.exprs[index] = HirExpr::LocalRef(local);
+        }
+        if !bindings.is_empty() {
+            self.prefix.push(HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                bindings,
+                values: HirValuePack::fixed(values),
+            })));
+        }
+        self.prefix.append(&mut prefix);
+    }
+}
+
+pub(super) fn extract_assign(
+    assign: HirAssign,
+    state: &mut EliminationState<'_>,
+) -> (Vec<HirStmt>, HirAssign, bool) {
+    let mut leading = Vec::new();
+    let mut target_shapes = Vec::with_capacity(assign.targets.len());
+    for target in assign.targets {
+        match target {
+            HirLValue::TableAccess(access) => {
+                leading.push(access.base);
+                leading.push(access.key);
+                target_shapes.push(None);
+            }
+            target => target_shapes.push(Some(target)),
+        }
+    }
+
+    let (prefix, leading, values, changed) =
+        extract_value_pack_with_leading(leading, assign.values, state);
+    let mut leading = leading.into_iter();
+    let targets = target_shapes
+        .into_iter()
+        .map(|target| {
+            target.unwrap_or_else(|| {
+                HirLValue::TableAccess(Box::new(HirTableAccess {
+                    base: leading
+                        .next()
+                        .expect("table lvalue extraction should preserve its base"),
+                    key: leading
+                        .next()
+                        .expect("table lvalue extraction should preserve its key"),
+                }))
+            })
+        })
+        .collect();
+    debug_assert!(leading.next().is_none());
+
+    (prefix, HirAssign { targets, values }, changed)
 }
 
 pub(super) fn extract_value_expr(
@@ -144,6 +283,26 @@ pub(super) fn materialize_expr_into_target(
     }
 }
 
+pub(super) fn materialize_expr_for_assignment(
+    expr: HirExpr,
+    target: HirLValue,
+    state: &mut EliminationState<'_>,
+) -> Vec<HirStmt> {
+    if matches!(target, HirLValue::Temp(_)) {
+        return materialize_expr_into_target(expr, target, state);
+    }
+
+    let result = state.alloc_local();
+    let mut stmts = vec![empty_local_decl(result)];
+    stmts.extend(materialize_expr_into_target(
+        expr,
+        HirLValue::Local(result),
+        state,
+    ));
+    stmts.push(assign_stmt(target, HirExpr::LocalRef(result)));
+    stmts
+}
+
 fn materialize_logical_expr_into_target(
     is_and: bool,
     logical: HirLogicalExpr,
@@ -151,17 +310,15 @@ fn materialize_logical_expr_into_target(
     state: &mut EliminationState<'_>,
 ) -> Vec<HirStmt> {
     if let Some(lhs_truthy) = super::expr_truthiness(&logical.lhs) {
-        return if is_and {
-            if lhs_truthy {
-                materialize_expr_into_target(logical.rhs, target, state)
+        let selects_rhs = lhs_truthy == is_and;
+        if !selects_rhs || expr_is_discard_safe(&logical.lhs) {
+            let selected = if selects_rhs {
+                logical.rhs
             } else {
-                materialize_expr_into_target(logical.lhs, target, state)
-            }
-        } else if lhs_truthy {
-            materialize_expr_into_target(logical.lhs, target, state)
-        } else {
-            materialize_expr_into_target(logical.rhs, target, state)
-        };
+                logical.lhs
+            };
+            return materialize_expr_into_target(selected, target, state);
+        }
     }
 
     let lhs_local = state.alloc_local();
@@ -240,13 +397,14 @@ fn materialize_decision_node(
         target,
         state,
     );
+    let cond_discard_safe = expr_is_discard_safe(&cond);
 
-    if then_block.stmts == else_stmts {
+    if cond_discard_safe && then_block.stmts == else_stmts {
         prefix.extend(then_block.stmts);
         return prefix;
     }
 
-    if let Some(cond_truthy) = super::expr_truthiness(&cond) {
+    if cond_discard_safe && let Some(cond_truthy) = super::expr_truthiness(&cond) {
         prefix.extend(if cond_truthy {
             then_block.stmts
         } else {
@@ -255,7 +413,7 @@ fn materialize_decision_node(
         return prefix;
     }
 
-    if then_block.stmts.is_empty() && else_stmts.is_empty() {
+    if cond_discard_safe && then_block.stmts.is_empty() && else_stmts.is_empty() {
         return prefix;
     }
 
@@ -316,9 +474,14 @@ fn prepare_pure_expr(expr: HirExpr, state: &mut EliminationState<'_>) -> (Vec<Hi
             (prefix, HirExpr::LocalRef(local))
         }
         HirExpr::TableAccess(access) => {
-            let (mut prefix, base) = prepare_pure_expr(access.base, state);
-            let (key_prefix, key) = prepare_pure_expr(access.key, state);
-            prefix.extend(key_prefix);
+            let (prefix, exprs) = prepare_ordered_exprs(vec![access.base, access.key], state);
+            let mut exprs = exprs.into_iter();
+            let base = exprs
+                .next()
+                .expect("table access extraction should preserve its base");
+            let key = exprs
+                .next()
+                .expect("table access extraction should preserve its key");
             (
                 prefix,
                 HirExpr::TableAccess(Box::new(HirTableAccess { base, key })),
@@ -332,9 +495,14 @@ fn prepare_pure_expr(expr: HirExpr, state: &mut EliminationState<'_>) -> (Vec<Hi
             )
         }
         HirExpr::Binary(binary) => {
-            let (mut prefix, lhs) = prepare_pure_expr(binary.lhs, state);
-            let (rhs_prefix, rhs) = prepare_pure_expr(binary.rhs, state);
-            prefix.extend(rhs_prefix);
+            let (prefix, exprs) = prepare_ordered_exprs(vec![binary.lhs, binary.rhs], state);
+            let mut exprs = exprs.into_iter();
+            let lhs = exprs
+                .next()
+                .expect("binary extraction should preserve its lhs");
+            let rhs = exprs
+                .next()
+                .expect("binary extraction should preserve its rhs");
             (
                 prefix,
                 HirExpr::Binary(Box::new(HirBinaryExpr {
@@ -345,18 +513,28 @@ fn prepare_pure_expr(expr: HirExpr, state: &mut EliminationState<'_>) -> (Vec<Hi
             )
         }
         HirExpr::LogicalAnd(logical) => {
-            let (mut prefix, lhs) = prepare_pure_expr(logical.lhs, state);
-            let (rhs_prefix, rhs) = prepare_pure_expr(logical.rhs, state);
-            prefix.extend(rhs_prefix);
+            let (prefix, exprs) = prepare_ordered_exprs(vec![logical.lhs, logical.rhs], state);
+            let mut exprs = exprs.into_iter();
+            let lhs = exprs
+                .next()
+                .expect("logical extraction should preserve its lhs");
+            let rhs = exprs
+                .next()
+                .expect("logical extraction should preserve its rhs");
             (
                 prefix,
                 HirExpr::LogicalAnd(Box::new(HirLogicalExpr { lhs, rhs })),
             )
         }
         HirExpr::LogicalOr(logical) => {
-            let (mut prefix, lhs) = prepare_pure_expr(logical.lhs, state);
-            let (rhs_prefix, rhs) = prepare_pure_expr(logical.rhs, state);
-            prefix.extend(rhs_prefix);
+            let (prefix, exprs) = prepare_ordered_exprs(vec![logical.lhs, logical.rhs], state);
+            let mut exprs = exprs.into_iter();
+            let lhs = exprs
+                .next()
+                .expect("logical extraction should preserve its lhs");
+            let rhs = exprs
+                .next()
+                .expect("logical extraction should preserve its rhs");
             (
                 prefix,
                 HirExpr::LogicalOr(Box::new(HirLogicalExpr { lhs, rhs })),
@@ -376,6 +554,18 @@ fn prepare_pure_expr(expr: HirExpr, state: &mut EliminationState<'_>) -> (Vec<Hi
         }
         expr => (Vec::new(), expr),
     }
+}
+
+fn prepare_ordered_exprs(
+    exprs: Vec<HirExpr>,
+    state: &mut EliminationState<'_>,
+) -> (Vec<HirStmt>, Vec<HirExpr>) {
+    let extracted = extract_ordered_exprs(exprs, state, |expr, state| {
+        let (prefix, expr) = prepare_pure_expr(expr, state);
+        let changed = !prefix.is_empty();
+        (prefix, expr, changed)
+    });
+    (extracted.prefix, extracted.exprs)
 }
 
 fn collapse_expr_to_pure(expr: HirExpr) -> Option<HirExpr> {
@@ -472,31 +662,34 @@ fn prepare_table_constructor(
     table: HirTableConstructor,
     state: &mut EliminationState<'_>,
 ) -> (Vec<HirStmt>, HirTableConstructor) {
-    let mut prefix = Vec::new();
-    let mut fields = Vec::with_capacity(table.fields.len());
-
+    let mut shapes = Vec::with_capacity(table.fields.len());
+    let mut exprs = Vec::new();
     for field in table.fields {
         match field {
             HirTableField::Array(expr) => {
-                let (expr_prefix, expr) = prepare_pure_expr(expr, state);
-                prefix.extend(expr_prefix);
-                fields.push(HirTableField::Array(expr));
+                shapes.push(PreparedTableFieldShape::Array);
+                exprs.push(expr);
             }
             HirTableField::Record(HirRecordField { key, value }) => {
-                let (key_prefix, key) = match key {
-                    HirTableKey::Name(name) => (Vec::new(), HirTableKey::Name(name)),
-                    HirTableKey::Expr(expr) => {
-                        let (prefix, expr) = prepare_pure_expr(expr, state);
-                        (prefix, HirTableKey::Expr(expr))
+                match key {
+                    HirTableKey::Name(name) => {
+                        shapes.push(PreparedTableFieldShape::Named(name));
                     }
-                };
-                prefix.extend(key_prefix);
-                let (value_prefix, value) = prepare_pure_expr(value, state);
-                prefix.extend(value_prefix);
-                fields.push(HirTableField::Record(HirRecordField { key, value }));
+                    HirTableKey::Expr(expr) => {
+                        shapes.push(PreparedTableFieldShape::ExpressionKey);
+                        exprs.push(expr);
+                    }
+                }
+                exprs.push(value);
             }
         }
     }
+
+    let mut extracted = extract_ordered_exprs(exprs, state, |expr, state| {
+        let (prefix, expr) = prepare_pure_expr(expr, state);
+        let changed = !prefix.is_empty();
+        (prefix, expr, changed)
+    });
 
     let (trailing_prefix, trailing_multivalue) = table
         .trailing_multivalue
@@ -510,10 +703,39 @@ fn prepare_table_constructor(
             (prefix, Some(tail))
         })
         .unwrap_or_default();
-    prefix.extend(trailing_prefix);
+    extracted.append_prefix(trailing_prefix, state);
+
+    let mut exprs = extracted.exprs.into_iter();
+    let fields = shapes
+        .into_iter()
+        .map(|shape| match shape {
+            PreparedTableFieldShape::Array => HirTableField::Array(
+                exprs
+                    .next()
+                    .expect("array field extraction should preserve its value"),
+            ),
+            PreparedTableFieldShape::Named(name) => HirTableField::Record(HirRecordField {
+                key: HirTableKey::Name(name),
+                value: exprs
+                    .next()
+                    .expect("record field extraction should preserve its value"),
+            }),
+            PreparedTableFieldShape::ExpressionKey => HirTableField::Record(HirRecordField {
+                key: HirTableKey::Expr(
+                    exprs
+                        .next()
+                        .expect("record field extraction should preserve its key"),
+                ),
+                value: exprs
+                    .next()
+                    .expect("record field extraction should preserve its value"),
+            }),
+        })
+        .collect();
+    debug_assert!(exprs.next().is_none());
 
     (
-        prefix,
+        extracted.prefix,
         HirTableConstructor {
             fields,
             trailing_multivalue,
@@ -521,17 +743,34 @@ fn prepare_table_constructor(
     )
 }
 
+enum PreparedTableFieldShape {
+    Array,
+    Named(String),
+    ExpressionKey,
+}
+
 fn prepare_closure(
     mut closure: HirClosureExpr,
     state: &mut EliminationState<'_>,
 ) -> (Vec<HirStmt>, HirClosureExpr) {
-    let mut prefix = Vec::new();
+    let mut extracted = OrderedExprExtraction::with_capacity(closure.captures.len());
     for capture in &mut closure.captures {
-        let (capture_prefix, value) = prepare_pure_expr(capture.value.clone(), state);
-        prefix.extend(capture_prefix);
+        let value = mem::replace(&mut capture.value, HirExpr::Nil);
+        let by_value = capture.mode == HirCaptureMode::ByValue;
+        let (prefix, value) = if by_value {
+            prepare_pure_expr(value, state)
+        } else {
+            debug_assert!(!expr_contains_eliminable_decision(&value));
+            (Vec::new(), value)
+        };
+        let stable = !prefix.is_empty() && matches!(value, HirExpr::LocalRef(_));
+        let changed = !prefix.is_empty();
+        extracted.push(prefix, value, changed, stable, by_value, state);
+    }
+    for (capture, value) in closure.captures.iter_mut().zip(extracted.exprs) {
         capture.value = value;
     }
-    (prefix, closure)
+    (extracted.prefix, closure)
 }
 
 pub(super) fn eliminate_condition_expr(expr: &mut HirExpr) -> bool {

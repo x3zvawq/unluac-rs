@@ -95,11 +95,11 @@ fn loop_value_incoming_all_inside(
     value: &LoopValueMerge,
     is_inside: impl Fn(BlockRef) -> bool + Copy,
 ) -> bool {
+    // inside_arm 已由 Structure ownership 证明；这里只提升 HIR 识别出的 break/cleanup pad。
     value
-        .inside_arm
+        .outside_arm
         .incomings
         .iter()
-        .chain(value.outside_arm.incomings.iter())
         .all(|incoming| incoming.pred.is_some_and(is_inside))
 }
 

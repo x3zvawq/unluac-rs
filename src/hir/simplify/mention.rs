@@ -6,7 +6,9 @@
 
 use std::collections::BTreeSet;
 
-use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirStmt, LocalId, TempId};
+use crate::hir::common::{
+    HirBlock, HirCaptureMode, HirExpr, HirLValue, HirStmt, LocalId, ParamId, TempId,
+};
 
 use super::visit::{HirVisitor, visit_block, visit_expr, visit_stmts};
 
@@ -30,6 +32,58 @@ pub(super) fn stmts_captured_locals(stmts: &[HirStmt]) -> BTreeSet<LocalId> {
     let mut collector = CapturedLocalSetCollector::default();
     visit_stmts(stmts, &mut collector);
     collector.locals
+}
+
+#[derive(Default)]
+pub(super) struct ReferenceCapturedBindings {
+    pub(super) locals: BTreeSet<LocalId>,
+    pub(super) params: BTreeSet<ParamId>,
+}
+
+pub(super) fn stmts_reference_captured_bindings(stmts: &[HirStmt]) -> ReferenceCapturedBindings {
+    let mut collector = ReferenceCaptureCollector::default();
+    visit_stmts(stmts, &mut collector);
+    collector.bindings
+}
+
+#[derive(Default)]
+struct ReferenceCaptureCollector {
+    bindings: ReferenceCapturedBindings,
+}
+
+impl HirVisitor for ReferenceCaptureCollector {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        let HirExpr::Closure(closure) = expr else {
+            return;
+        };
+        for capture in &closure.captures {
+            if capture.mode != HirCaptureMode::ByReference {
+                continue;
+            }
+            let mut collector = BindingRefCollector {
+                bindings: &mut self.bindings,
+            };
+            visit_expr(&capture.value, &mut collector);
+        }
+    }
+}
+
+struct BindingRefCollector<'a> {
+    bindings: &'a mut ReferenceCapturedBindings,
+}
+
+impl HirVisitor for BindingRefCollector<'_> {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        match expr {
+            HirExpr::LocalRef(local) => {
+                self.bindings.locals.insert(*local);
+            }
+            HirExpr::ParamRef(param) => {
+                self.bindings.params.insert(*param);
+            }
+            _ => {}
+        }
+    }
 }
 
 pub(super) fn stmts_mention_temp(stmts: &[HirStmt], temp: TempId) -> bool {

@@ -1774,7 +1774,7 @@ fn shared_loop_exit_merge(
         .then_some(merge)
 }
 
-fn transparent_loop_exit_target(
+pub(super) fn transparent_loop_exit_target(
     proto: &LoweredProto,
     cfg: &Cfg,
     block: BlockRef,

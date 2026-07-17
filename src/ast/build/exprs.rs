@@ -315,25 +315,24 @@ impl<'a> AstLowerer<'a> {
         proto_index: usize,
         call: &HirCallExpr,
     ) -> Result<AstCallKind, AstLowerError> {
+        let method_name = call
+            .method_name
+            .as_deref()
+            .filter(|method_name| method_sugar_matches(call, method_name));
         let mut args =
             self.lower_value_pack(proto_index, &call.args, PackLoweringContext::Ordinary)?;
 
-        if call.method
-            && let Some(method_name) = &call.method_name
-        {
+        if let Some(method_name) = method_name {
             if args.is_empty() {
                 return Err(AstLowerError::InvalidMethodCallPattern {
                     proto: proto_index,
                     reason: "method call must keep the implicit receiver as its first argument",
                 });
             }
-            // 这里优先信任前层 `SELF/NAMECALL` 留下的结构事实，而不是再从 callee
-            // 形状反推 method sugar。这样即使中途出现 `local f = obj.pick; f(obj, 4)`
-            // 这样的 alias scaffolding，也能稳定回收到 `obj:pick(4)`。
             let receiver = args.remove(0);
             return Ok(AstCallKind::MethodCall(Box::new(AstMethodCallExpr {
                 receiver,
-                method: method_name.clone(),
+                method: method_name.to_owned(),
                 args,
             })));
         }
@@ -359,6 +358,19 @@ impl<'a> AstLowerer<'a> {
 
         Ok(AstCallKind::Call(Box::new(AstCallExpr { callee, args })))
     }
+}
+
+fn method_sugar_matches(call: &HirCallExpr, method_name: &str) -> bool {
+    if !call.method {
+        return false;
+    }
+    let Some(receiver) = call.args.first() else {
+        return false;
+    };
+    matches!(&call.callee,
+        HirExpr::TableAccess(access)
+            if access.base == *receiver
+                && matches!(&access.key, HirExpr::String(key) if key.as_bytes() == method_name.as_bytes()))
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

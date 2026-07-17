@@ -50,161 +50,163 @@ pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<Inline
     }
 }
 
-pub(super) fn temp_precedes_observable_eval_in_stmt(stmt: &HirStmt, temp: TempId) -> bool {
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => {
-            temp_precedes_observable_eval_in_exprs(&local_decl.values, temp)
-        }
-        HirStmt::Assign(assign) => {
-            let (found, prefix_clear) =
-                temp_precedes_observable_eval_in_lvalues(&assign.targets, temp);
-            found.unwrap_or_else(|| {
-                prefix_clear && temp_precedes_observable_eval_in_exprs(&assign.values, temp)
-            })
-        }
-        HirStmt::TableSetList(set_list) => temp_precedes_observable_eval_in_exprs(
-            std::iter::once(&set_list.base).chain(&set_list.values),
-            temp,
-        ),
-        HirStmt::CallStmt(call_stmt) => {
-            temp_precedes_observable_eval_in_call(&call_stmt.call, temp)
-        }
-        HirStmt::Return(ret) => temp_precedes_observable_eval_in_exprs(&ret.values, temp),
-        HirStmt::If(if_stmt) => temp_precedes_observable_eval_in_expr(&if_stmt.cond, temp),
-        HirStmt::While(while_stmt) => temp_precedes_observable_eval_in_expr(&while_stmt.cond, temp),
-        HirStmt::Repeat(repeat_stmt) => {
-            temp_precedes_observable_eval_in_expr(&repeat_stmt.cond, temp)
-        }
-        HirStmt::NumericFor(numeric_for) => temp_precedes_observable_eval_in_exprs(
-            [&numeric_for.start, &numeric_for.limit, &numeric_for.step],
-            temp,
-        ),
-        HirStmt::GenericFor(generic_for) => {
-            temp_precedes_observable_eval_in_exprs(&generic_for.iterator, temp)
-        }
-        HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
-        | HirStmt::Break
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_)
-        | HirStmt::Block(_) => false,
-    }
-}
-
-fn temp_precedes_observable_eval_in_exprs<'a>(
-    exprs: impl IntoIterator<Item = &'a HirExpr>,
+pub(super) fn temp_precedes_observable_eval_in_stmt(
+    stmt: &HirStmt,
     temp: TempId,
+    moved_value_is_observable: bool,
+    reference_captured: &ReferenceCapturedBindings,
 ) -> bool {
-    for expr in exprs {
-        if expr_touches_temp(expr, temp) {
-            return temp_precedes_observable_eval_in_expr(expr, temp);
-        }
-        if expr_observes_eval_order(expr) {
-            return false;
-        }
+    EvalOrderProbe {
+        temp,
+        mutable_snapshots_are_barriers: moved_value_is_observable,
+        reference_captured,
     }
-    false
+    .stmt(stmt)
 }
 
-fn temp_precedes_observable_eval_in_lvalues(
-    lvalues: &[HirLValue],
+struct EvalOrderProbe<'a> {
     temp: TempId,
-) -> (Option<bool>, bool) {
-    let mut prefix_clear = true;
-    for lvalue in lvalues {
-        if let HirLValue::TableAccess(access) = lvalue {
-            for expr in [&access.base, &access.key] {
-                if expr_touches_temp(expr, temp) {
-                    return (
-                        Some(prefix_clear && temp_precedes_observable_eval_in_expr(expr, temp)),
-                        prefix_clear,
-                    );
-                }
-                prefix_clear &= !expr_observes_eval_order(expr);
+    mutable_snapshots_are_barriers: bool,
+    reference_captured: &'a ReferenceCapturedBindings,
+}
+
+impl EvalOrderProbe<'_> {
+    fn stmt(&self, stmt: &HirStmt) -> bool {
+        match stmt {
+            HirStmt::LocalDecl(local_decl) => self.exprs(&local_decl.values),
+            HirStmt::Assign(assign) => {
+                let (found, prefix_clear) = self.lvalues(&assign.targets);
+                found.unwrap_or_else(|| prefix_clear && self.exprs(&assign.values))
+            }
+            HirStmt::TableSetList(set_list) => {
+                self.exprs(std::iter::once(&set_list.base).chain(&set_list.values))
+            }
+            HirStmt::CallStmt(call_stmt) => self.call(&call_stmt.call),
+            HirStmt::Return(ret) => self.exprs(&ret.values),
+            HirStmt::If(if_stmt) => self.expr(&if_stmt.cond),
+            HirStmt::While(while_stmt) => self.expr(&while_stmt.cond),
+            HirStmt::Repeat(repeat_stmt) => self.expr(&repeat_stmt.cond),
+            HirStmt::NumericFor(numeric_for) => {
+                self.exprs([&numeric_for.start, &numeric_for.limit, &numeric_for.step])
+            }
+            HirStmt::GenericFor(generic_for) => self.exprs(&generic_for.iterator),
+            HirStmt::ErrNil(_)
+            | HirStmt::ToBeClosed(_)
+            | HirStmt::Close(_)
+            | HirStmt::Break
+            | HirStmt::Continue
+            | HirStmt::Goto(_)
+            | HirStmt::Label(_)
+            | HirStmt::Block(_) => false,
+        }
+    }
+
+    fn exprs<'a>(&self, exprs: impl IntoIterator<Item = &'a HirExpr>) -> bool {
+        for expr in exprs {
+            if expr_touches_temp(expr, self.temp) {
+                return self.expr(expr);
+            }
+            if !self.prefix_is_clear(expr) {
+                return false;
             }
         }
+        false
     }
-    (None, prefix_clear)
-}
 
-fn temp_precedes_observable_eval_in_call(call: &HirCallExpr, temp: TempId) -> bool {
-    if call.method && call.method_name.is_some() {
-        return call.args.first().is_some_and(|receiver| {
-            expr_touches_temp(receiver, temp)
-                && temp_precedes_observable_eval_in_expr(receiver, temp)
-        });
-    }
-    temp_precedes_observable_eval_in_exprs(std::iter::once(&call.callee).chain(&call.args), temp)
-}
-
-fn temp_precedes_observable_eval_in_expr(expr: &HirExpr, temp: TempId) -> bool {
-    match expr {
-        HirExpr::TempRef(other) => *other == temp,
-        HirExpr::TableAccess(access) => {
-            temp_precedes_observable_eval_in_exprs([&access.base, &access.key], temp)
-        }
-        HirExpr::Unary(unary) => temp_precedes_observable_eval_in_expr(&unary.expr, temp),
-        HirExpr::Binary(binary) => {
-            temp_precedes_observable_eval_in_exprs([&binary.lhs, &binary.rhs], temp)
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            expr_touches_temp(&logical.lhs, temp)
-                && temp_precedes_observable_eval_in_expr(&logical.lhs, temp)
-        }
-        HirExpr::Call(call) => temp_precedes_observable_eval_in_call(call, temp),
-        HirExpr::TableConstructor(table) => {
-            let mut prefix_clear = true;
-            for field in &table.fields {
-                match field {
-                    HirTableField::Array(value) => {
-                        if expr_touches_temp(value, temp) {
-                            return prefix_clear
-                                && temp_precedes_observable_eval_in_expr(value, temp);
-                        }
-                        prefix_clear &= !expr_observes_eval_order(value);
+    fn lvalues(&self, lvalues: &[HirLValue]) -> (Option<bool>, bool) {
+        let mut prefix_clear = true;
+        for lvalue in lvalues {
+            if let HirLValue::TableAccess(access) = lvalue {
+                for expr in [&access.base, &access.key] {
+                    if expr_touches_temp(expr, self.temp) {
+                        return (Some(prefix_clear && self.expr(expr)), prefix_clear);
                     }
-                    HirTableField::Record(field) => {
-                        if let HirTableKey::Expr(key) = &field.key {
-                            if expr_touches_temp(key, temp) {
-                                return prefix_clear
-                                    && temp_precedes_observable_eval_in_expr(key, temp);
+                    prefix_clear &= self.prefix_is_clear(expr);
+                }
+            }
+        }
+        (None, prefix_clear)
+    }
+
+    fn call(&self, call: &HirCallExpr) -> bool {
+        self.exprs(std::iter::once(&call.callee).chain(&call.args))
+    }
+
+    fn expr(&self, expr: &HirExpr) -> bool {
+        match expr {
+            HirExpr::TempRef(other) => *other == self.temp,
+            HirExpr::TableAccess(access) => self.exprs([&access.base, &access.key]),
+            HirExpr::Unary(unary) => self.expr(&unary.expr),
+            HirExpr::Binary(binary) => self.exprs([&binary.lhs, &binary.rhs]),
+            HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+                expr_touches_temp(&logical.lhs, self.temp) && self.expr(&logical.lhs)
+            }
+            HirExpr::Call(call) => self.call(call),
+            HirExpr::TableConstructor(table) => {
+                let mut prefix_clear = true;
+                for field in &table.fields {
+                    match field {
+                        HirTableField::Array(value) => {
+                            if expr_touches_temp(value, self.temp) {
+                                return prefix_clear && self.expr(value);
                             }
-                            prefix_clear &= !expr_observes_eval_order(key);
+                            prefix_clear &= self.prefix_is_clear(value);
                         }
-                        if expr_touches_temp(&field.value, temp) {
-                            return prefix_clear
-                                && temp_precedes_observable_eval_in_expr(&field.value, temp);
+                        HirTableField::Record(field) => {
+                            if let HirTableKey::Expr(key) = &field.key {
+                                if expr_touches_temp(key, self.temp) {
+                                    return prefix_clear && self.expr(key);
+                                }
+                                prefix_clear &= self.prefix_is_clear(key);
+                            }
+                            if expr_touches_temp(&field.value, self.temp) {
+                                return prefix_clear && self.expr(&field.value);
+                            }
+                            prefix_clear &= self.prefix_is_clear(&field.value);
                         }
-                        prefix_clear &= !expr_observes_eval_order(&field.value);
                     }
                 }
+                table.trailing_multivalue.as_ref().is_some_and(|tail| {
+                    let trailing = tail.as_expr();
+                    prefix_clear && expr_touches_temp(trailing, self.temp) && self.expr(trailing)
+                })
             }
-            table.trailing_multivalue.as_ref().is_some_and(|tail| {
-                let trailing = tail.as_expr();
-                prefix_clear
-                    && expr_touches_temp(trailing, temp)
-                    && temp_precedes_observable_eval_in_expr(trailing, temp)
-            })
+            HirExpr::Decision(_)
+            | HirExpr::Closure(_)
+            | HirExpr::Nil
+            | HirExpr::Boolean(_)
+            | HirExpr::Integer(_)
+            | HirExpr::Number(_)
+            | HirExpr::String(_)
+            | HirExpr::Int64(_)
+            | HirExpr::UInt64(_)
+            | HirExpr::Vector(_)
+            | HirExpr::Complex { .. }
+            | HirExpr::ParamRef(_)
+            | HirExpr::LocalRef(_)
+            | HirExpr::UpvalueRef(_)
+            | HirExpr::GlobalRef(_)
+            | HirExpr::VarArg
+            | HirExpr::Unresolved(_) => false,
         }
-        HirExpr::Decision(_)
-        | HirExpr::Closure(_)
-        | HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => false,
+    }
+
+    fn prefix_is_clear(&self, expr: &HirExpr) -> bool {
+        !(expr_observes_eval_order(expr)
+            || self.mutable_snapshots_are_barriers && self.expr_is_mutable_binding_snapshot(expr))
+    }
+
+    fn expr_is_mutable_binding_snapshot(&self, expr: &HirExpr) -> bool {
+        match expr {
+            HirExpr::ParamRef(param) => self.reference_captured.params.contains(param),
+            HirExpr::LocalRef(local) => self.reference_captured.locals.contains(local),
+            HirExpr::UpvalueRef(_) => true,
+            HirExpr::Closure(closure) => closure.captures.iter().any(|capture| {
+                capture.mode == crate::hir::common::HirCaptureMode::ByValue
+                    && self.expr_is_mutable_binding_snapshot(&capture.value)
+            }),
+            _ => false,
+        }
     }
 }
 
@@ -267,7 +269,7 @@ fn find_site_in_expr(expr: &HirExpr, temp: TempId, site: InlineSite) -> Option<I
                 .or_else(|| find_site_in_decision_target(&node.truthy, temp, InlineSite::Nested))
                 .or_else(|| find_site_in_decision_target(&node.falsy, temp, InlineSite::Nested))
         }),
-        HirExpr::Call(call) => find_site_in_call(call, temp, InlineSite::Nested),
+        HirExpr::Call(call) => find_site_in_call(call, temp, site),
         HirExpr::TableConstructor(table) => table
             .fields
             .iter()

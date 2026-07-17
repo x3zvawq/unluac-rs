@@ -12,15 +12,16 @@
 use std::mem;
 
 use crate::hir::common::{
-    HirAssign, HirBlock, HirCallStmt, HirErrNil, HirLValue, HirLocalDecl, HirProto, HirReturn,
-    HirStmt, HirTableSetList, HirToBeClosed, LocalId,
+    HirBlock, HirCallStmt, HirErrNil, HirLValue, HirLocalDecl, HirProto, HirReturn, HirStmt,
+    HirTableSetList, HirToBeClosed, LocalId,
 };
 
 use super::super::walk::rewrite_nested_blocks_in_stmt;
 use super::eliminate_materialize::{
     assign_target_supports_direct_materialization, eliminate_condition_expr, empty_local_decl,
-    expr_contains_eliminable_decision, extract_call_expr, extract_generic_for, extract_numeric_for,
-    extract_value_expr, extract_value_pack, materialize_expr_into_target,
+    expr_contains_eliminable_decision, extract_assign, extract_call_expr, extract_generic_for,
+    extract_numeric_for, extract_value_expr, extract_value_pack, extract_value_pack_with_leading,
+    materialize_expr_for_assignment, materialize_expr_into_target,
 };
 use super::eliminate_state::EliminationState;
 
@@ -105,7 +106,7 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
                 .into_iter()
                 .next()
                 .expect("single-value assign should stay non-empty");
-            (materialize_expr_into_target(value, target, state), true)
+            (materialize_expr_for_assignment(value, target, state), true)
         }
         HirStmt::LocalDecl(local_decl) => {
             let (mut prefix, values, changed) = extract_value_pack(local_decl.values, state);
@@ -116,23 +117,22 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
             (prefix, changed)
         }
         HirStmt::Assign(assign) => {
-            let (mut prefix, values, values_changed) = extract_value_pack(assign.values, state);
-            prefix.push(HirStmt::Assign(Box::new(HirAssign {
-                targets: assign.targets,
-                values,
-            })));
-            (prefix, values_changed)
+            let (mut prefix, assign, changed) = extract_assign(*assign, state);
+            prefix.push(HirStmt::Assign(Box::new(assign)));
+            (prefix, changed)
         }
         HirStmt::TableSetList(set_list) => {
-            let (mut prefix, base, base_changed) = extract_value_expr(set_list.base, state);
-            let (value_prefix, values, values_changed) = extract_value_pack(set_list.values, state);
-            prefix.extend(value_prefix);
+            let (mut prefix, mut leading, values, changed) =
+                extract_value_pack_with_leading(vec![set_list.base], set_list.values, state);
+            let base = leading
+                .pop()
+                .expect("table-set-list extraction should preserve its base");
             prefix.push(HirStmt::TableSetList(Box::new(HirTableSetList {
                 base,
                 start_index: set_list.start_index,
                 values,
             })));
-            (prefix, base_changed || values_changed)
+            (prefix, changed)
         }
         HirStmt::ErrNil(err_nil) => {
             let (mut prefix, value, changed) = extract_value_expr(err_nil.value, state);

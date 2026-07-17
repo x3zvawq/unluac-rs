@@ -1,6 +1,7 @@
 -- unluac: expect-contains [[if p1_1 and p1_2 and p1_3 and p1_4 then]]
 -- unluac: expect-contains [[local r1_0, r1_1, r1_2, r1_3]]
--- unluac: expect-contains [[local r1_4, r1_5, r1_6, r1_7 = p1_0:getAdjustedRect()]]
+-- unluac: expect-contains [[local r1_4 = p1_0]]
+-- unluac: expect-contains [[local r1_5, r1_6, r1_7, r1_8 = r1_4:getAdjustedRect()]]
 -- unluac: expect-not-contains [[if p1_1 then]]
 -- unluac: expect-not-contains [[unluac error]]
 

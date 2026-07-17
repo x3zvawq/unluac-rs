@@ -6,7 +6,8 @@
 //! `if/else` 结构误删掉。
 //!
 //! 它不会越权去重新判断 branch/loop 是否应该结构化，也不会替前层补决策。
-//! 这里唯一关心的是：当前 `if` 是否已经退化成“无副作用的布尔值搬运壳”。
+//! 这里唯一关心的是：当前 `if` 是否已经退化成“无副作用的布尔值搬运壳”。table
+//! 左值的地址在分支条件之后已经确定，不能把它挪到合并后赋值的 RHS 之前重新求值。
 //!
 //! 例子：
 //! - 输入：`if cond then t = true else t = false end`
@@ -108,9 +109,9 @@ fn collapsible_live_boolean_materialization_shell(stmt: &HirStmt) -> Option<(Hir
         return None;
     };
 
-    let (then_target, then_value) = pure_assign_pattern(&if_stmt.then_block)?;
-    let (else_target, else_value) = pure_assign_pattern(else_block)?;
-    if then_target != else_target {
+    let (then_target, then_value) = single_fixed_assign_pattern(&if_stmt.then_block)?;
+    let (else_target, else_value) = single_fixed_assign_pattern(else_block)?;
+    if then_target != else_target || !target_address_can_follow_condition_eval(then_target) {
         return None;
     }
 
@@ -144,10 +145,10 @@ fn removable_dead_materialization_shell(
         return false;
     }
 
-    let Some((then_target, then_value)) = pure_assign_pattern(&if_stmt.then_block) else {
+    let Some((then_target, then_value)) = single_fixed_assign_pattern(&if_stmt.then_block) else {
         return false;
     };
-    let Some((else_target, else_value)) = pure_assign_pattern(else_block) else {
+    let Some((else_target, else_value)) = single_fixed_assign_pattern(else_block) else {
         return false;
     };
     let (HirLValue::Temp(then_temp), HirLValue::Temp(else_temp)) = (then_target, else_target)
@@ -164,7 +165,7 @@ fn removable_dead_materialization_shell(
     expr_is_discard_safe(then_value) && expr_is_discard_safe(else_value)
 }
 
-fn pure_assign_pattern(block: &HirBlock) -> Option<(&HirLValue, &HirExpr)> {
+fn single_fixed_assign_pattern(block: &HirBlock) -> Option<(&HirLValue, &HirExpr)> {
     let [HirStmt::Assign(assign)] = block.stmts.as_slice() else {
         return None;
     };
@@ -179,6 +180,17 @@ fn pure_assign_pattern(block: &HirBlock) -> Option<(&HirLValue, &HirExpr)> {
     }
 
     Some((target, value))
+}
+
+fn target_address_can_follow_condition_eval(target: &HirLValue) -> bool {
+    matches!(
+        target,
+        HirLValue::Param(_)
+            | HirLValue::Temp(_)
+            | HirLValue::Local(_)
+            | HirLValue::Upvalue(_)
+            | HirLValue::Global(_)
+    )
 }
 
 fn booleanized_truthiness_expr(cond: HirExpr) -> HirExpr {

@@ -9,7 +9,9 @@
 use std::collections::BTreeSet;
 
 use super::super::ReadabilityContext;
-use super::super::binding_flow::BindingUseIndex;
+use super::super::binding_flow::{
+    BindingUseIndex, MutableSnapshotNames, mutable_snapshot_names_in_block,
+};
 use super::super::binding_ref::name_ref_from_binding;
 use super::analysis::{collect_method_field_names, collect_method_field_names_in_block};
 use super::chain::try_chain_local_method_call_stmt;
@@ -30,17 +32,24 @@ pub(in crate::ast::readability) fn apply(
     context: ReadabilityContext,
 ) -> bool {
     let method_fields = collect_method_field_names(module);
-    rewrite_block(&mut module.body, context.target, &method_fields)
+    let mutable_snapshots = mutable_snapshot_names_in_block(&module.body);
+    rewrite_block(
+        &mut module.body,
+        context.target,
+        &method_fields,
+        &mutable_snapshots,
+    )
 }
 
 fn rewrite_block(
     block: &mut AstBlock,
     target: AstTargetDialect,
     method_fields: &BTreeSet<String>,
+    mutable_snapshots: &MutableSnapshotNames,
 ) -> bool {
     let mut changed = false;
     for stmt in &mut block.stmts {
-        changed |= rewrite_nested(stmt, target, method_fields);
+        changed |= rewrite_nested(stmt, target, method_fields, mutable_snapshots);
     }
 
     let old_stmts = std::mem::take(&mut block.stmts);
@@ -71,7 +80,7 @@ fn rewrite_block(
         }
 
         if let Some((stmt, consumed)) =
-            try_recover_method_alias_stmt(&old_stmts[index..], &use_index, index)
+            try_recover_method_alias_stmt(&old_stmts[index..], &use_index, index, mutable_snapshots)
         {
             new_stmts.push(stmt);
             changed = true;
@@ -129,29 +138,49 @@ fn rewrite_nested(
     stmt: &mut AstStmt,
     target: AstTargetDialect,
     method_fields: &BTreeSet<String>,
+    mutable_snapshots: &MutableSnapshotNames,
 ) -> bool {
     match stmt {
         AstStmt::If(if_stmt) => {
-            let mut changed = rewrite_block(&mut if_stmt.then_block, target, method_fields);
+            let mut changed = rewrite_block(
+                &mut if_stmt.then_block,
+                target,
+                method_fields,
+                mutable_snapshots,
+            );
             if let Some(else_block) = &mut if_stmt.else_block {
-                changed |= rewrite_block(else_block, target, method_fields);
+                changed |= rewrite_block(else_block, target, method_fields, mutable_snapshots);
             }
             changed |= rewrite_function_exprs_in_expr(&mut if_stmt.cond, target);
             changed
         }
         AstStmt::While(while_stmt) => {
             rewrite_function_exprs_in_expr(&mut while_stmt.cond, target)
-                | rewrite_block(&mut while_stmt.body, target, method_fields)
+                | rewrite_block(
+                    &mut while_stmt.body,
+                    target,
+                    method_fields,
+                    mutable_snapshots,
+                )
         }
         AstStmt::Repeat(repeat_stmt) => {
-            rewrite_block(&mut repeat_stmt.body, target, method_fields)
-                | rewrite_function_exprs_in_expr(&mut repeat_stmt.cond, target)
+            rewrite_block(
+                &mut repeat_stmt.body,
+                target,
+                method_fields,
+                mutable_snapshots,
+            ) | rewrite_function_exprs_in_expr(&mut repeat_stmt.cond, target)
         }
         AstStmt::NumericFor(numeric_for) => {
             let mut changed = rewrite_function_exprs_in_expr(&mut numeric_for.start, target);
             changed |= rewrite_function_exprs_in_expr(&mut numeric_for.limit, target);
             changed |= rewrite_function_exprs_in_expr(&mut numeric_for.step, target);
-            changed |= rewrite_block(&mut numeric_for.body, target, method_fields);
+            changed |= rewrite_block(
+                &mut numeric_for.body,
+                target,
+                method_fields,
+                mutable_snapshots,
+            );
             changed
         }
         AstStmt::GenericFor(generic_for) => {
@@ -159,10 +188,15 @@ fn rewrite_nested(
             for expr in &mut generic_for.iterator {
                 changed |= rewrite_function_exprs_in_expr(expr, target);
             }
-            changed |= rewrite_block(&mut generic_for.body, target, method_fields);
+            changed |= rewrite_block(
+                &mut generic_for.body,
+                target,
+                method_fields,
+                mutable_snapshots,
+            );
             changed
         }
-        AstStmt::DoBlock(block) => rewrite_block(block, target, method_fields),
+        AstStmt::DoBlock(block) => rewrite_block(block, target, method_fields, mutable_snapshots),
         AstStmt::FunctionDecl(function_decl) => {
             rewrite_function_expr(&mut function_decl.func, target)
         }
@@ -212,7 +246,13 @@ fn rewrite_nested(
 fn rewrite_function_expr(function: &mut AstFunctionExpr, target: AstTargetDialect) -> bool {
     let mut method_fields = BTreeSet::new();
     collect_method_field_names_in_block(&function.body, &mut method_fields);
-    rewrite_block(&mut function.body, target, &method_fields)
+    let mutable_snapshots = mutable_snapshot_names_in_block(&function.body);
+    rewrite_block(
+        &mut function.body,
+        target,
+        &method_fields,
+        &mutable_snapshots,
+    )
 }
 
 fn rewrite_function_exprs_in_call(call: &mut AstCallKind, target: AstTargetDialect) -> bool {

@@ -17,8 +17,8 @@ mod refs;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::common::{
-    AstBindingRef, AstBlock, AstCallExpr, AstCallKind, AstExpr, AstLValue, AstMethodCallExpr,
-    AstStmt, AstTableField, AstTableKey,
+    AstBindingRef, AstBlock, AstCallExpr, AstCallKind, AstExpr, AstFunctionExpr, AstLValue,
+    AstMethodCallExpr, AstNameRef, AstStmt, AstTableField, AstTableKey,
 };
 use super::binding_ref::{binding_from_name_ref, name_matches_binding};
 
@@ -26,6 +26,37 @@ pub(super) use refs::{
     BindingRefSet, block_references_binding_set, expr_references_any_binding,
     expr_references_binding_set, stmt_references_any_binding, stmt_references_binding_set,
 };
+
+pub(super) type MutableSnapshotNames = BTreeSet<AstNameRef>;
+
+pub(super) fn mutable_snapshot_names_in_block(block: &AstBlock) -> MutableSnapshotNames {
+    #[derive(Default)]
+    struct CaptureCollector(MutableSnapshotNames);
+
+    impl super::visit::AstVisitor for CaptureCollector {
+        fn visit_function_expr(&mut self, function: &AstFunctionExpr) -> bool {
+            self.0.extend(
+                function
+                    .captured_bindings
+                    .iter()
+                    .copied()
+                    .map(AstBindingRef::to_name_ref),
+            );
+            self.0.extend(
+                function
+                    .captured_params
+                    .iter()
+                    .copied()
+                    .map(AstNameRef::Param),
+            );
+            false
+        }
+    }
+
+    let mut collector = CaptureCollector::default();
+    super::visit::visit_block(block, &mut collector);
+    collector.0
+}
 
 #[derive(Clone, Copy)]
 enum BindingUseScope {

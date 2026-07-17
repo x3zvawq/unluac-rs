@@ -3,7 +3,7 @@
 //! HIR analyze 和 simplify 都会判断某个表达式是否能被挪动或折进别的表达式。
 //! 这个文件只放跨 pass 共用、和具体恢复策略无关的谓词，避免求值序规则散落后漂移。
 
-use super::common::{HirExpr, HirUnaryOpKind};
+use super::common::{HirCaptureMode, HirExpr, HirUnaryOpKind};
 
 /// 表达式的求值能否在不改变 Lua 可观察行为的前提下被删除。
 pub(crate) fn expr_is_discard_safe(expr: &HirExpr) -> bool {
@@ -112,6 +112,10 @@ pub(crate) fn expr_observes_eval_order(expr: &HirExpr) -> bool {
 /// 快照挪到更晚的调用或 lookup 之后，来源 binding 可能已经被改写。
 pub(crate) fn expr_requires_ordered_snapshot(expr: &HirExpr) -> bool {
     expr_observes_eval_order(expr)
+        || matches!(expr, HirExpr::Closure(closure) if closure.captures.iter().any(|capture| {
+            capture.mode == HirCaptureMode::ByValue
+                && expr_requires_ordered_snapshot(&capture.value)
+        }))
         || matches!(
             expr,
             HirExpr::ParamRef(_)

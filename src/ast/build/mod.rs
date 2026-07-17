@@ -1,7 +1,8 @@
 //! HIR -> AST build 阶段入口。
 //!
 //! 这里调度合法语法模式与逐节点机械 lowering，依赖 HIR 已经完成控制结构、binding 和
-//! value-pack 的语义恢复；不会通过相邻语句重组来补 HIR 丢失的多值或求值顺序事实。
+//! value-pack 的语义恢复；不会通过相邻语句重组来补 HIR 丢失的多值或求值顺序事实，
+//! 也不会把没有等价源码语义的残余 HIR 节点拆成表面合法的 AST。
 
 mod analysis;
 mod exprs;
@@ -19,10 +20,9 @@ use self::analysis::{
 };
 use self::exprs::PackLoweringContext;
 use super::common::{
-    AstAssign, AstBindingRef, AstBlock, AstCallStmt, AstExpr, AstGenericFor, AstGoto, AstIf,
-    AstIndexAccess, AstLabel, AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl,
-    AstLocalOrigin, AstModule, AstNumericFor, AstRepeat, AstReturn, AstStmt, AstTargetDialect,
-    AstWhile,
+    AstBindingRef, AstBlock, AstCallStmt, AstGenericFor, AstGoto, AstIf, AstLabel, AstLabelId,
+    AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstModule, AstNumericFor,
+    AstRepeat, AstReturn, AstStmt, AstTargetDialect, AstWhile,
 };
 use super::error::AstLowerError;
 
@@ -180,34 +180,10 @@ impl<'a> AstLowerer<'a> {
                 ))],
                 1,
             )),
-            HirStmt::TableSetList(set_list) => {
-                if set_list.values.tail.is_some() {
-                    return Err(AstLowerError::UnsupportedSetListTrailingMultivalue {
-                        proto: proto_index,
-                    });
-                }
-                let base = self.lower_expr(proto_index, &set_list.base)?;
-                let stmts = set_list
-                    .values
-                    .fixed
-                    .iter()
-                    .enumerate()
-                    .map(|(offset, value)| {
-                        let index_value =
-                            AstExpr::Integer(i64::from(set_list.start_index) + offset as i64);
-                        let target =
-                            super::common::AstLValue::IndexAccess(Box::new(AstIndexAccess {
-                                base: base.clone(),
-                                index: index_value,
-                            }));
-                        Ok(AstStmt::Assign(Box::new(AstAssign {
-                            targets: vec![target],
-                            values: vec![self.lower_expr(proto_index, value)?],
-                        })))
-                    })
-                    .collect::<Result<Vec<_>, AstLowerError>>()?;
-                Ok((stmts, 1))
-            }
+            HirStmt::TableSetList(_) => Err(AstLowerError::ResidualHir {
+                proto: proto_index,
+                kind: "table-set-list",
+            }),
             HirStmt::ErrNil(_) => {
                 Err(AstLowerError::InvalidGlobalDeclPattern { proto: proto_index })
             }

@@ -27,10 +27,6 @@ pub enum AstLowerError {
         "HIR proto#{proto} still contains explicit close semantics that AST lowering cannot absorb yet"
     )]
     UnsupportedClose { proto: usize },
-    #[error(
-        "HIR proto#{proto} still contains table-set-list with trailing multivalue that AST lowering cannot safely express yet"
-    )]
-    UnsupportedSetListTrailingMultivalue { proto: usize },
     #[error("HIR proto#{proto} contains err-nnil that cannot be matched to a global declaration")]
     InvalidGlobalDeclPattern { proto: usize },
     #[error("HIR proto#{proto} has invalid method call lowering shape: {reason}")]

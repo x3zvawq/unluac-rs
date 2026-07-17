@@ -9,6 +9,8 @@
 //! 它们不试图替代更前层的语义分析，只给 AST readability 提供统一边界，
 //! 避免各个 pass 再各写一套相似但略有偏差的判断。
 
+use std::collections::BTreeSet;
+
 use super::super::common::{AstExpr, AstNameRef, AstTableField, AstTableKey};
 
 pub(super) fn expr_complexity(expr: &AstExpr) -> usize {
@@ -132,6 +134,21 @@ pub(super) fn expr_observes_eval_order(expr: &AstExpr) -> bool {
         | AstExpr::VarArg
         | AstExpr::Error(_) => false,
     }
+}
+
+/// 表达式结果是否是必须保留读取时点的值快照。
+pub(super) fn expr_requires_ordered_snapshot(
+    expr: &AstExpr,
+    mutable_snapshots: &BTreeSet<AstNameRef>,
+) -> bool {
+    expr_observes_eval_order(expr)
+        || matches!(expr, AstExpr::Var(AstNameRef::Upvalue(_)))
+        || matches!(expr, AstExpr::Var(name) if mutable_snapshots.contains(name))
+        || matches!(
+            expr,
+            AstExpr::SingleValue(inner)
+                if expr_requires_ordered_snapshot(inner, mutable_snapshots)
+        )
 }
 
 pub(super) fn is_stable_inline_value(expr: &AstExpr) -> bool {

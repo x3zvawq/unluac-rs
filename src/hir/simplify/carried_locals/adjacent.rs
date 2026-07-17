@@ -3,7 +3,8 @@
 //! 这个规则只处理结构化后暴露出的窄形状：
 //! `local state = init; local next; ... next = state ...`。主模块负责调度不同
 //! handoff owner；这里只在 seed 不再可观察、carried 没有闭包捕获、且后续写回形状
-//! 明确时，把 carried 的使用点认回 seed。
+//! 明确时，把 carried 的使用点认回 seed。相邻 owner 只接受单目标 `carried = seed`
+//! 复制；`seed = carried` 尤其是多目标并行写回会保守保留两个 binding。
 
 use std::collections::BTreeMap;
 
@@ -75,9 +76,7 @@ fn stmt_allows_seed_to_absorb_carried(stmt: &HirStmt, seed: LocalId, carried: Lo
                     .all(|value| !expr_mentions_local(value, seed))
         }
         HirStmt::Assign(assign) => {
-            if is_exact_local_copy_assign(assign, carried, seed)
-                || is_supported_local_writeback_assign(assign, seed, carried)
-            {
+            if is_exact_local_copy_assign(assign, carried, seed) {
                 true
             } else {
                 !assign_targets_local(assign, seed)
@@ -165,37 +164,6 @@ fn is_exact_local_copy_assign(assign: &HirAssign, carried: LocalId, seed: LocalI
         return false;
     }
     *target == carried && *value == seed
-}
-
-fn is_supported_local_writeback_assign(
-    assign: &HirAssign,
-    seed: LocalId,
-    carried: LocalId,
-) -> bool {
-    if assign.values.tail.is_some()
-        || assign.targets.len() != assign.values.fixed.len()
-        || assign.targets.is_empty()
-    {
-        return false;
-    }
-
-    let mut saw_writeback = false;
-    for (target, value) in assign.targets.iter().zip(&assign.values) {
-        let is_writeback = matches!(
-            (target, value),
-            (HirLValue::Local(target), HirExpr::LocalRef(value))
-                if *target == seed && *value == carried
-        );
-        if is_writeback {
-            saw_writeback = true;
-            continue;
-        }
-        if lvalue_mentions_local(target, seed) || expr_mentions_local(value, seed) {
-            return false;
-        }
-    }
-
-    saw_writeback
 }
 
 fn assign_targets_local(assign: &HirAssign, local: LocalId) -> bool {

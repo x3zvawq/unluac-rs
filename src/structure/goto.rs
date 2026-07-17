@@ -18,6 +18,7 @@ use crate::transformer::LoweredProto;
 use super::common::IrreducibleRegion;
 use super::common::{BranchCandidate, GotoReason, GotoRequirement, LoopCandidate, LoopKindHint};
 use super::helpers::{block_has_non_control_prefix, collect_region_entry_edges};
+use super::loops::transparent_loop_exit_target;
 
 pub(super) fn analyze_goto_requirements(
     proto: &LoweredProto,
@@ -40,7 +41,8 @@ pub(super) fn analyze_goto_requirements(
         }
 
         for edge_ref in &loop_candidate.backedges {
-            if backedge_crosses_nested_loop(cfg, loop_candidates, loop_candidate, *edge_ref) {
+            if backedge_crosses_nested_loop(proto, cfg, loop_candidates, loop_candidate, *edge_ref)
+            {
                 requirements.insert(GotoRequirement {
                     edge: *edge_ref,
                     reason: GotoReason::CrossLoopContinueLike,
@@ -113,6 +115,7 @@ pub(super) fn analyze_goto_requirements(
 }
 
 fn backedge_crosses_nested_loop(
+    proto: &LoweredProto,
     cfg: &Cfg,
     candidates: &[LoopCandidate],
     outer: &LoopCandidate,
@@ -125,6 +128,20 @@ fn backedge_crosses_nested_loop(
                 && inner.blocks.len() < outer.blocks.len()
                 && inner.blocks.is_subset(&outer.body_scope_blocks)
                 && inner.body_scope_blocks.contains(&edge.from)
+                && !nested_loop_exits_to_outer_header(proto, cfg, inner, outer.header)
+        })
+}
+
+fn nested_loop_exits_to_outer_header(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    inner: &LoopCandidate,
+    outer_header: crate::structure::BlockRef,
+) -> bool {
+    inner.exits.contains(&outer_header)
+        && inner.exits.iter().all(|exit| {
+            *exit == outer_header
+                || transparent_loop_exit_target(proto, cfg, *exit) == Some(outer_header)
         })
 }
 

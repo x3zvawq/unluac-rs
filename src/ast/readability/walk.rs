@@ -16,6 +16,10 @@ use crate::ast::traverse::{
 };
 
 pub(super) trait AstRewritePass {
+    fn enter_function(&mut self, _function: &AstFunctionExpr) {}
+
+    fn leave_function(&mut self, _function: &AstFunctionExpr) {}
+
     fn rewrite_block(&mut self, _block: &mut AstBlock, _kind: BlockKind) -> bool {
         false
     }
@@ -289,7 +293,10 @@ fn rewrite_function_expr(
     kind: BlockKind,
     pass: &mut impl AstRewritePass,
 ) -> bool {
-    rewrite_block_with_kind(&mut function.body, kind, pass)
+    pass.enter_function(function);
+    let changed = rewrite_block_with_kind(&mut function.body, kind, pass);
+    pass.leave_function(function);
+    changed
 }
 
 fn rewrite_function_expr_scoped<P: ScopedAstRewritePass>(

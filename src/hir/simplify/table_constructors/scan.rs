@@ -132,6 +132,52 @@ pub(super) fn try_rebuild_constructor_region(
     best_end.map(|end_index| (committed_builder.into_constructor(), end_index))
 }
 
+/// open SETLIST 前的 producer 若不能安全内联，允许把空表 owner 延后到 SETLIST 原位。
+/// producer 本身全部保留，因此这里只需证明 seed 在夹层中从未被读取或改写。
+pub(super) fn try_defer_open_set_list_owner(
+    block: &crate::hir::common::HirBlock,
+    seed_index: usize,
+    binding: TableBinding,
+    seed: &HirTableConstructor,
+) -> Option<(HirTableConstructor, usize)> {
+    if !seed.fields.is_empty() || seed.trailing_multivalue.is_some() {
+        return None;
+    }
+
+    let mut ignored_steps = Vec::new();
+    for (offset, stmt) in block.stmts[(seed_index + 1)..].iter().enumerate() {
+        let stmt_index = seed_index + 1 + offset;
+        ignored_steps.clear();
+        if producer_steps(stmt, stmt_index, binding, &mut ignored_steps) {
+            continue;
+        }
+
+        let HirStmt::TableSetList(set_list) = stmt else {
+            return None;
+        };
+        let tail = set_list.values.tail.as_ref()?;
+        if tail.exact_width().is_some()
+            || !table_set_list_step(stmt, binding)
+            || set_list.start_index != 1
+        {
+            return None;
+        }
+
+        let mut constructor = seed.clone();
+        constructor.fields.extend(
+            set_list
+                .values
+                .fixed
+                .iter()
+                .cloned()
+                .map(crate::hir::common::HirTableField::Array),
+        );
+        constructor.trailing_multivalue = Some(tail.clone());
+        return Some((constructor, stmt_index));
+    }
+    None
+}
+
 pub(super) fn trailing_constructor_handoff(
     stmts: &[HirStmt],
     binding: TableBinding,
@@ -234,6 +280,7 @@ fn producer_steps_from_bindings(
     steps: &mut Vec<RegionStep>,
 ) -> bool {
     if bindings.is_empty()
+        || bindings.contains(&constructor_binding)
         || values.is_empty()
         || values
             .iter()

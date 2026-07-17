@@ -16,7 +16,6 @@ mod function_sugar;
 mod global_decl_pretty;
 mod inline_exprs;
 mod installer_iife;
-mod local_coalesce;
 mod local_scope_limit;
 mod loop_header_merge;
 mod luajit_goto_safety;
@@ -64,13 +63,13 @@ pub(super) struct ReadabilityContext {
 /// 每个 pass 声明自己依赖和产出哪些标签，调度器根据 dirty set 决定哪些 pass 需要重跑。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum AstInvalidation {
-    /// 语句相邻关系变化（影响 statement-merge, local-coalesce, loop-header-merge）。
+    /// 语句相邻关系变化（影响 statement-merge, loop-header-merge）。
     StatementAdjacency,
     /// 控制流形状变化（影响 branch-pretty 及其下游）。
     ControlFlowShape,
     /// 表达式形状变化（影响 field-access-sugar, inline-exprs）。
     ExprShape,
-    /// 绑定关系变化（影响 local-coalesce, function-sugar）。
+    /// 绑定关系变化（影响 function-sugar 等 binding 消费者）。
     BindingStructure,
     /// temp 存在性变化（影响 temp-materialize, inline-exprs）。
     TempPresence,
@@ -101,7 +100,7 @@ use AstInvalidation::*;
 // 不必要的多轮迭代。调度器会根据 dirty set 自动跳过不相关的 pass。
 //
 // Normal phase 处理主要形状收敛：
-//   cleanup → local-coalesce → statement-merge → loop-header-merge
+//   cleanup → statement-merge → loop-header-merge
 //   → branch-pretty → field-access-sugar → inline-exprs
 //
 // Deferred phase 在 Normal 全部收敛后执行终态物化和语法糖：
@@ -121,12 +120,6 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
             TempPresence,
         ],
         invalidates: &[StatementAdjacency],
-    },
-    PassDescriptor {
-        name: "local-coalesce",
-        phase: PassPhase::Normal,
-        depends_on: &[StatementAdjacency, ControlFlowShape, BindingStructure],
-        invalidates: &[StatementAdjacency, BindingStructure],
     },
     PassDescriptor {
         name: "statement-merge",
@@ -201,9 +194,6 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
 const PASS_ENTRIES: &[ReadabilityPassEntry] = &[
     ReadabilityPassEntry {
         apply: cleanup::apply,
-    },
-    ReadabilityPassEntry {
-        apply: local_coalesce::apply,
     },
     ReadabilityPassEntry {
         apply: statement_merge::apply,

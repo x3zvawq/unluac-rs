@@ -21,9 +21,9 @@ use self::candidate::{
     stmt_is_alias_initializer_sink, stmt_is_direct_return_value_sink,
 };
 use self::use_sites::rewrite_stmt_use_sites_with_policy;
-use super::super::common::{AstBindingRef, AstBlock, AstExpr, AstModule, AstStmt};
+use super::super::common::{AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstModule, AstStmt};
 use super::ReadabilityContext;
-use super::binding_flow::BindingUseIndex;
+use super::binding_flow::{BindingUseIndex, MutableSnapshotNames, mutable_snapshot_names_in_block};
 use super::binding_tree::{
     expr_references_binding, stmt_has_access_base_binding_use, stmt_has_call_callee_binding_use,
     stmt_has_direct_call_arg_binding_use, stmt_has_index_binding_use, stmt_has_nested_binding_use,
@@ -33,25 +33,47 @@ use super::walk::{self, AstRewritePass, BlockKind};
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
     let _ = context.target;
+    let root_mutable_snapshots = mutable_snapshot_names_in_block(&module.body);
     walk::rewrite_module(
         module,
         &mut InlineExprsPass {
             options: context.options,
+            mutable_snapshot_stack: vec![root_mutable_snapshots],
         },
     )
 }
 
 struct InlineExprsPass {
     options: ReadabilityOptions,
+    mutable_snapshot_stack: Vec<MutableSnapshotNames>,
 }
 
 impl AstRewritePass for InlineExprsPass {
+    fn enter_function(&mut self, function: &AstFunctionExpr) {
+        self.mutable_snapshot_stack
+            .push(mutable_snapshot_names_in_block(&function.body));
+    }
+
+    fn leave_function(&mut self, _function: &AstFunctionExpr) {
+        self.mutable_snapshot_stack.pop();
+    }
+
     fn rewrite_block(&mut self, block: &mut AstBlock, _kind: BlockKind) -> bool {
-        rewrite_current_block(block, self.options)
+        rewrite_current_block(
+            block,
+            self.options,
+            self.mutable_snapshot_stack
+                .last()
+                .expect("module scope must remain active"),
+        )
     }
 }
 
-fn rewrite_current_block(block: &mut AstBlock, options: ReadabilityOptions) -> bool {
+fn rewrite_current_block(
+    block: &mut AstBlock,
+    options: ReadabilityOptions,
+    mutable_snapshots: &MutableSnapshotNames,
+) -> bool {
     let mut changed = false;
 
     let old_stmts = std::mem::take(&mut block.stmts);
@@ -155,7 +177,12 @@ fn rewrite_current_block(block: &mut AstBlock, options: ReadabilityOptions) -> b
             index += 1;
             continue;
         }
-        if inline_crosses_evaluation_boundary(value, next_stmt, candidate.binding()) {
+        if inline_crosses_evaluation_boundary(
+            value,
+            next_stmt,
+            candidate.binding(),
+            mutable_snapshots,
+        ) {
             new_stmts.push(old_stmts[index].clone());
             index += 1;
             continue;
@@ -200,10 +227,10 @@ fn rewrite_current_block(block: &mut AstBlock, options: ReadabilityOptions) -> b
     }
 
     block.stmts = new_stmts;
-    changed |= collapse_adjacent_call_alias_runs(block, options);
-    changed |= collapse_terminal_call_result_alias_runs(block, options);
-    changed |= collapse_terminal_local_mechanical_runs(block, options);
-    changed |= collapse_adjacent_mechanical_alias_runs(block, options);
+    changed |= collapse_adjacent_call_alias_runs(block, options, mutable_snapshots);
+    changed |= collapse_terminal_call_result_alias_runs(block, options, mutable_snapshots);
+    changed |= collapse_terminal_local_mechanical_runs(block, options, mutable_snapshots);
+    changed |= collapse_adjacent_mechanical_alias_runs(block, options, mutable_snapshots);
     changed
 }
 
@@ -211,14 +238,24 @@ fn inline_crosses_evaluation_boundary(
     value: &AstExpr,
     next_stmt: &AstStmt,
     binding: AstBindingRef,
+    mutable_snapshots: &MutableSnapshotNames,
 ) -> bool {
     (matches!(next_stmt, AstStmt::While(_) | AstStmt::Repeat(_))
         && !super::expr_analysis::is_stable_inline_value(value))
-        || (super::expr_analysis::expr_observes_eval_order(value)
-            && !eval_order::preserves_adjacent_eval_order(next_stmt, binding, value))
+        || (super::expr_analysis::expr_requires_ordered_snapshot(value, mutable_snapshots)
+            && !eval_order::preserves_adjacent_eval_order(
+                next_stmt,
+                binding,
+                value,
+                mutable_snapshots,
+            ))
 }
 
-fn collapse_adjacent_call_alias_runs(block: &mut AstBlock, options: ReadabilityOptions) -> bool {
+fn collapse_adjacent_call_alias_runs(
+    block: &mut AstBlock,
+    options: ReadabilityOptions,
+    mutable_snapshots: &MutableSnapshotNames,
+) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts(&old_stmts);
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
@@ -240,7 +277,11 @@ fn collapse_adjacent_call_alias_runs(block: &mut AstBlock, options: ReadabilityO
             continue;
         };
         if super::function_sugar::run_belongs_to_method_alias_owner(
-            &old_stmts, index, run_end, &use_index,
+            &old_stmts,
+            index,
+            run_end,
+            &use_index,
+            mutable_snapshots,
         ) {
             new_stmts.push(old_stmts[index].clone());
             index += 1;
@@ -307,7 +348,13 @@ fn collapse_adjacent_call_alias_runs(block: &mut AstBlock, options: ReadabilityO
         // 至少一次收回两层相邻别名，才能证明我们是在还原机械展开的调用准备序列，
         // 而不是把源码里本来就有阶段语义的 local（例如 stage1 / stage2）继续吞掉。
         if collapsed_count >= 2
-            && eval_order::run_preserves_eval_order(&old_stmts, index, run_end, &removed)
+            && eval_order::run_preserves_eval_order(
+                &old_stmts,
+                index,
+                run_end,
+                &removed,
+                mutable_snapshots,
+            )
         {
             changed = true;
             push_collapsed_run(
@@ -363,6 +410,7 @@ fn stmt_is_terminal_call_alias_sink(stmt: &AstStmt) -> bool {
 fn collapse_terminal_call_result_alias_runs(
     block: &mut AstBlock,
     options: ReadabilityOptions,
+    mutable_snapshots: &MutableSnapshotNames,
 ) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts(&old_stmts);
@@ -377,7 +425,11 @@ fn collapse_terminal_call_result_alias_runs(
             continue;
         };
         if super::function_sugar::run_belongs_to_method_alias_owner(
-            &old_stmts, index, sink_index, &use_index,
+            &old_stmts,
+            index,
+            sink_index,
+            &use_index,
+            mutable_snapshots,
         ) {
             new_stmts.push(old_stmts[index].clone());
             index += 1;
@@ -439,7 +491,13 @@ fn collapse_terminal_call_result_alias_runs(
         // `local f = obj.m; local x = f(arg)`、`local a = t[i]; local v = call(a, ...)`
         // 这类形状和最终 `call_stmt(...)` 属于同一 owner，只是 sink 还保留在结果声明里。
         if collapsed_count >= 2
-            && eval_order::run_preserves_eval_order(&old_stmts, index, sink_index, &removed)
+            && eval_order::run_preserves_eval_order(
+                &old_stmts,
+                index,
+                sink_index,
+                &removed,
+                mutable_snapshots,
+            )
         {
             changed = true;
             push_collapsed_run(
@@ -494,6 +552,7 @@ fn stmt_sink_binding_allows_adjacent_value_inline(stmts: &[AstStmt], sink_index:
 fn collapse_adjacent_mechanical_alias_runs(
     block: &mut AstBlock,
     options: ReadabilityOptions,
+    mutable_snapshots: &MutableSnapshotNames,
 ) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts(&old_stmts);
@@ -582,7 +641,13 @@ fn collapse_adjacent_mechanical_alias_runs(
                 || stmt_prefers_pure_lookup_run_collapse(&rewritten_sink)
                 || (has_dependent_lookup_piece
                     && stmt_prefers_dependent_lookup_run_collapse(&rewritten_sink)))
-            && eval_order::run_preserves_eval_order(&old_stmts, index, run_end, &removed)
+            && eval_order::run_preserves_eval_order(
+                &old_stmts,
+                index,
+                run_end,
+                &removed,
+                mutable_snapshots,
+            )
         {
             changed = true;
             push_collapsed_run(
@@ -608,6 +673,7 @@ fn collapse_adjacent_mechanical_alias_runs(
 fn collapse_terminal_local_mechanical_runs(
     block: &mut AstBlock,
     options: ReadabilityOptions,
+    mutable_snapshots: &MutableSnapshotNames,
 ) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts(&old_stmts);
@@ -696,7 +762,13 @@ fn collapse_terminal_local_mechanical_runs(
         }
 
         if collapsed_count >= 2
-            && eval_order::run_preserves_eval_order(&old_stmts, index, run_end - 1, &removed)
+            && eval_order::run_preserves_eval_order(
+                &old_stmts,
+                index,
+                run_end - 1,
+                &removed,
+                mutable_snapshots,
+            )
         {
             changed = true;
             push_collapsed_run(

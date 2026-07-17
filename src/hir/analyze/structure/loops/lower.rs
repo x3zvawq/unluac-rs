@@ -4,8 +4,8 @@
 //! 状态，不会在这里重新识别循环种类；对于仍归为 Unknown 但已经证明可规约、且只有
 //! 一个普通 post-loop 的 retry loop，会保守降成 `while true ... break`，其他 terminal
 //! exits 仍留在循环体中原样终止。
-//! 多条 sibling latch 由 Structure 以 header 作为共同 continue target；这里复用
-//! header-retry 路径，不再要求挑出一个并不存在的唯一 latch。
+//! 多条 sibling latch 不强行制造唯一 continue target；这里以 header-retry 消费
+//! 各条直接回边。
 //! 例如：`NumericForLike` 的候选会在这里降成 `HirStmt::NumericFor`。
 
 use super::*;
@@ -81,13 +81,17 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .iter()
                 .all(|exit| self.loop_exit_terminates(candidate, *exit))
         {
-            return self.lower_while_true_loop(
-                candidate_id,
-                candidate,
-                stop,
-                stmts,
-                target_overrides,
-            );
+            return if candidate.continue_target.is_none() {
+                self.lower_header_retry_while_true_loop(
+                    candidate_id,
+                    candidate,
+                    stop,
+                    stmts,
+                    target_overrides,
+                )
+            } else {
+                self.lower_while_true_loop(candidate_id, candidate, stop, stmts, target_overrides)
+            };
         }
         let mut post_loops = candidate
             .exits
@@ -141,6 +145,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 &combined_target_overrides,
             )?);
         }
+        self.install_loop_exit_bindings(
+            candidate_id,
+            candidate,
+            post_loop,
+            &plan,
+            target_overrides,
+        );
 
         for phi_id in &plan.owned_phis {
             self.overrides.suppress_phi(*phi_id);
@@ -169,13 +180,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .break_exits
                 .values()
                 .flat_map(|break_exit| break_exit.blocks.iter().copied()),
-        );
-        self.install_loop_exit_bindings(
-            candidate_id,
-            candidate,
-            post_loop,
-            &plan,
-            target_overrides,
         );
         stmts.push(HirStmt::While(Box::new(HirWhile {
             cond: HirExpr::Boolean(true),
@@ -364,6 +368,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         loop_context.continue_target = Some(candidate.header);
         loop_context.continue_sources.clear();
         loop_context.state_slots = plan.states.clone();
+        self.install_loop_exit_bindings(
+            candidate_id,
+            candidate,
+            post_loop,
+            &plan,
+            target_overrides,
+        );
 
         for phi_id in &plan.owned_phis {
             self.overrides.suppress_phi(*phi_id);
@@ -385,13 +396,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .break_exits
                 .values()
                 .flat_map(|break_exit| break_exit.blocks.iter().copied()),
-        );
-        self.install_loop_exit_bindings(
-            candidate_id,
-            candidate,
-            post_loop,
-            &plan,
-            target_overrides,
         );
         stmts.push(HirStmt::While(Box::new(HirWhile {
             cond: HirExpr::Boolean(true),
@@ -609,6 +613,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         )?;
         loop_context.loop_blocks = loop_body_blocks(candidate).clone();
         loop_context.state_slots = plan.states.clone();
+        self.install_loop_exit_bindings(
+            candidate_id,
+            candidate,
+            post_loop,
+            &plan,
+            target_overrides,
+        );
 
         for phi_id in &plan.owned_phis {
             self.overrides.suppress_phi(*phi_id);
@@ -635,13 +646,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                 .break_exits
                 .values()
                 .flat_map(|break_exit| break_exit.blocks.iter().copied()),
-        );
-        self.install_loop_exit_bindings(
-            candidate_id,
-            candidate,
-            post_loop,
-            &plan,
-            target_overrides,
         );
         stmts.push(HirStmt::While(Box::new(HirWhile {
             cond: HirExpr::Boolean(true),

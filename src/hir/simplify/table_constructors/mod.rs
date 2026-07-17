@@ -37,7 +37,7 @@ use self::bindings::{
 };
 use self::scan::{
     constructor_seed, install_constructor_seed, trailing_constructor_handoff,
-    try_rebuild_constructor_region,
+    try_defer_open_set_list_owner, try_rebuild_constructor_region,
 };
 use super::walk::{HirRewritePass, rewrite_proto};
 
@@ -205,7 +205,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
                 continue;
             };
 
-            let (constructor, end_index, rebuilt_region) = match try_rebuild_constructor_region(
+            let rebuilt = try_rebuild_constructor_region(
                 block,
                 index,
                 binding,
@@ -216,22 +216,56 @@ impl HirRewritePass for TableConstructorPass<'_> {
                 &stmt_ids,
                 self.dialect,
                 &mut scratch,
-            ) {
+            );
+            let (constructor, end_index, rebuilt_region) = match rebuilt {
                 Some((rebuilt_ctor, end_index)) => (rebuilt_ctor, end_index, true),
                 None => (seed_ctor, index, false),
             };
+
+            if !rebuilt_region
+                && self.binding_is_unshared(binding)
+                && let Some((constructor, set_list_index)) =
+                    try_defer_open_set_list_owner(block, index, binding, &constructor)
+            {
+                let handoff_index = set_list_index + 1;
+                let binding_id = binding_index
+                    .id_of(binding)
+                    .expect("constructor seed binding should be indexed");
+                let handoff_target = stmt_ids
+                    .get(handoff_index)
+                    .and_then(|stmt_id| {
+                        trailing_constructor_handoff(
+                            &block.stmts[handoff_index..],
+                            binding,
+                            binding_occurrences.mentions_after(binding_id, *stmt_id),
+                        )
+                    })
+                    .filter(|target| self.constructor_handoff_is_safe(target));
+                let consumed_handoff = handoff_target.is_some();
+                let mut owner = block.stmts[index].clone();
+                install_constructor_owner(&mut owner, handoff_target, constructor);
+                block.stmts[set_list_index] = owner;
+                if consumed_handoff {
+                    block.stmts.remove(handoff_index);
+                }
+                block.stmts.remove(index);
+                return true;
+            }
 
             let handoff_index = end_index + 1;
             let binding_id = binding_index
                 .id_of(binding)
                 .expect("constructor seed binding should be indexed");
-            let handoff_target = stmt_ids.get(handoff_index).and_then(|stmt_id| {
-                trailing_constructor_handoff(
-                    &block.stmts[handoff_index..],
-                    binding,
-                    binding_occurrences.mentions_after(binding_id, *stmt_id),
-                )
-            });
+            let handoff_target = stmt_ids
+                .get(handoff_index)
+                .and_then(|stmt_id| {
+                    trailing_constructor_handoff(
+                        &block.stmts[handoff_index..],
+                        binding,
+                        binding_occurrences.mentions_after(binding_id, *stmt_id),
+                    )
+                })
+                .filter(|target| self.constructor_handoff_is_safe(target));
             if !rebuilt_region && handoff_target.is_none() {
                 index += 1;
                 continue;
@@ -257,6 +291,41 @@ impl HirRewritePass for TableConstructorPass<'_> {
 }
 
 impl TableConstructorPass<'_> {
+    fn binding_is_unshared(&self, binding: TableBinding) -> bool {
+        !self.reference_captured_bindings.contains(&binding)
+            && !matches!(
+                binding,
+                TableBinding::Temp(temp)
+                    if self.promotion_facts.home_slot(temp).is_some_and(
+                        |slot| self.reference_captured_home_slots.contains(&slot)
+                    )
+            )
+    }
+
+    /// 表 handoff 的 base/key 会在构造器 RHS 前求值，只能提前读取不会被 RHS 改写的快照。
+    fn constructor_handoff_is_safe(&self, target: &HirLValue) -> bool {
+        let HirLValue::TableAccess(access) = target else {
+            return true;
+        };
+        self.handoff_expr_is_stable(&access.base) && self.handoff_expr_is_stable(&access.key)
+    }
+
+    fn handoff_expr_is_stable(&self, expr: &HirExpr) -> bool {
+        matches!(
+            expr,
+            HirExpr::Nil
+                | HirExpr::Boolean(_)
+                | HirExpr::Integer(_)
+                | HirExpr::Number(_)
+                | HirExpr::String(_)
+                | HirExpr::Int64(_)
+                | HirExpr::UInt64(_)
+                | HirExpr::Vector(_)
+                | HirExpr::Complex { .. }
+        ) || bindings::binding_from_expr(expr)
+            .is_some_and(|binding| self.binding_is_unshared(binding))
+    }
+
     fn materialize_discarded_inline_set_lists(
         &mut self,
         block: &mut crate::hir::common::HirBlock,

@@ -29,8 +29,8 @@ use crate::hir::common::{
 };
 use crate::structure::BlockRef;
 use crate::transformer::{
-    AccessBase, AccessKey, CallKind, GenericForCallInstr, GetTableKind, InstrRef, LowInstr,
-    MethodNameHint, Reg, ResultPack, SetTableKind,
+    AccessBase, CallKind, GenericForCallInstr, GetTableKind, InstrRef, LowInstr, Reg, ResultPack,
+    SetTableKind,
 };
 
 pub(super) fn lower_regular_instr(
@@ -118,45 +118,15 @@ pub(super) fn lower_regular_instr(
                 set_upvalue.src,
             )],
         )],
-        LowInstr::GetTable(get_table) => {
-            // `SELF` / `NAMECALL` 三元式会在 Move + GetTable 之后紧跟一个方法调用，
-            // 该调用的 `method_name` 命中时 AST 端会走 `obj:method()` 糖，彻底忽略
-            // GetTable 写入的目标寄存器。这里在 HIR 降级阶段直接丢弃这类装饰性的
-            // GetTable，避免下游 `temp-inline` / `locals` 等 pass 把它保留成无意义的
-            // `local x = obj.method` 语句。
-            //
-            // 只在 Method 标记、键是字符串常量时跳过：这样和
-            // `lower_method_name` 对 `MethodNameHint` 的成功条件一一对应，若常量不是
-            // 字符串（理论上不会出现，但保险），依然按普通表访问发射。
-            if get_table.kind == GetTableKind::Method
-                && let AccessKey::Const(const_ref) = get_table.key
-                && lower_method_name(lowering, Some(MethodNameHint { const_ref })).is_some()
-            {
-                Vec::new()
+        LowInstr::GetTable(get_table) => fixed_assign(
+            lowering,
+            instr_ref,
+            vec![if get_table.kind == GetTableKind::Raw {
+                lower_raw_table_get_expr(lowering, block, instr_ref, get_table.base, get_table.key)
             } else {
-                fixed_assign(
-                    lowering,
-                    instr_ref,
-                    vec![if get_table.kind == GetTableKind::Raw {
-                        lower_raw_table_get_expr(
-                            lowering,
-                            block,
-                            instr_ref,
-                            get_table.base,
-                            get_table.key,
-                        )
-                    } else {
-                        lower_table_access_expr(
-                            lowering,
-                            block,
-                            instr_ref,
-                            get_table.base,
-                            get_table.key,
-                        )
-                    }],
-                )
-            }
-        }
+                lower_table_access_expr(lowering, block, instr_ref, get_table.base, get_table.key)
+            }],
+        ),
         LowInstr::SetTable(set_table) if set_table.kind == SetTableKind::Raw => {
             vec![HirStmt::CallStmt(Box::new(HirCallStmt {
                 call: lower_raw_table_set_call(
@@ -349,13 +319,7 @@ pub(super) fn lower_control_instr(
         }
         LowInstr::TailCall(tail_call) => {
             let method_name = lower_method_name(lowering, tail_call.method_name);
-            let is_method_sugar =
-                matches!(tail_call.kind, CallKind::Method) && method_name.is_some();
-            let callee = if is_method_sugar {
-                HirExpr::Nil
-            } else {
-                expr_for_reg_use(lowering, block, instr_ref, tail_call.callee)
-            };
+            let callee = expr_for_reg_use(lowering, block, instr_ref, tail_call.callee);
             vec![return_stmt(HirValuePack::expanding(
                 Vec::new(),
                 HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
@@ -429,16 +393,7 @@ fn lower_call(
     call: &crate::transformer::CallInstr,
 ) -> Vec<HirStmt> {
     let method_name = lower_method_name(lowering, call.method_name);
-    let is_method_sugar = matches!(call.kind, CallKind::Method) && method_name.is_some();
-    // 当调用会被 AST 渲染成 `obj:method()` 糖时，AST 只读 args[0] 和
-    // method_name，callee 被丢弃。这里直接把 callee 置为 Nil，从而让源自
-    // `SELF` / `NAMECALL` 的 method-load GetTable 在 HIR 中也真正失去读者，
-    // 配合同一 pass 里对 Method 读取的跳过逻辑建立闭环。
-    let callee = if is_method_sugar {
-        HirExpr::Nil
-    } else {
-        expr_for_reg_use(lowering, block, instr_ref, call.callee)
-    };
+    let callee = expr_for_reg_use(lowering, block, instr_ref, call.callee);
     let expr = HirExpr::Call(Box::new(HirCallExpr {
         callee,
         args: lower_value_pack(lowering, block, instr_ref, call.args),
