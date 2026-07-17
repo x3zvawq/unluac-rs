@@ -61,13 +61,20 @@ impl StructuredBodyLowerer<'_, '_> {
         {
             let body_entry = if truthy == stop { falsy } else { truthy };
             let can_falsy_stop = self.can_short_circuit_to_non_empty_continue(body_entry, stop);
+            let preserves_nested_consumed_header = falsy == stop
+                && !can_falsy_stop
+                && self.plain_branch_fallback_revisits_consumed_header(
+                    header,
+                    stop,
+                    &consumed_headers,
+                );
             if truthy == stop && can_falsy_stop {
                 cond = cond.negate();
                 std::mem::swap(&mut truthy, &mut falsy);
             }
             if truthy == stop
                 || consumed_headers.contains(&stop)
-                || (falsy == stop && !can_falsy_stop)
+                || (falsy == stop && !can_falsy_stop && !preserves_nested_consumed_header)
             {
                 return Some(None);
             }
@@ -333,6 +340,38 @@ impl StructuredBodyLowerer<'_, '_> {
                 && then_entry != continue_target
                 && self.can_reach_avoiding_block(then_entry, merge, continue_target)
                 && self.can_reach_avoiding_block(merge, continue_target, header))
+    }
+
+    fn plain_branch_fallback_revisits_consumed_header(
+        &self,
+        header: BlockRef,
+        stop: BlockRef,
+        consumed_headers: &[BlockRef],
+    ) -> bool {
+        if consumed_headers.len() <= 1 {
+            return false;
+        }
+        let Some(candidate) = self.branch_candidate_for_header(header) else {
+            return false;
+        };
+        if candidate.merge != Some(stop) {
+            return false;
+        }
+        let Some(else_entry) = candidate.else_entry else {
+            return false;
+        };
+        let nested_headers = &consumed_headers[1..];
+        // 非空 continue target 上，若回退到 plain if/else 会先消费一条 direct arm
+        // header，再从另一臂重新进入同一个 consumed header，而该 header 仍是 branch
+        // owner，则 `visited` 只能把整片 region 打回失败。这里仅保留这种已证明的
+        // “当前 SC owner 是唯一完整覆盖” 形状，不放宽到更深层的模糊可达性。
+        let direct_arm_revisited = |entry: BlockRef, sibling: BlockRef| {
+            nested_headers.contains(&entry)
+                && self.branch_candidate_for_header(entry).is_some()
+                && self.can_reach_avoiding_block(sibling, entry, stop)
+        };
+        direct_arm_revisited(candidate.then_entry, else_entry)
+            || direct_arm_revisited(else_entry, candidate.then_entry)
     }
 
     fn branch_short_circuit_consumed_blocks(

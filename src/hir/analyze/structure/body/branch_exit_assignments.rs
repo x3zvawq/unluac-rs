@@ -82,9 +82,18 @@ impl StructuredBodyLowerer<'_, '_> {
             &allowed_blocks,
         )?;
         let mut cond = finalize_condition_decision_expr(decision);
-        let condition_expr_overrides =
-            self.branch_exit_condition_expr_overrides(short, target_overrides)?;
-        rewrite_expr_temps(&mut cond, &condition_expr_overrides);
+        let consumed_headers = short
+            .nodes
+            .iter()
+            .map(|node| node.header)
+            .collect::<Vec<_>>();
+        if !self.rewrite_short_circuit_skipped_header_prefixes(
+            short.header,
+            &consumed_headers,
+            &mut cond,
+        ) {
+            return None;
+        }
         if expr_references_forbidden_candidate_temps(self.lowering, short, &cond, &allowed_blocks) {
             return None;
         }
@@ -94,19 +103,6 @@ impl StructuredBodyLowerer<'_, '_> {
         rewrite_expr_temps(&mut cond, &temp_expr_overrides(target_overrides));
 
         Some((short.blocks.clone(), value_leaf, cond, value_stmts))
-    }
-
-    fn branch_exit_condition_expr_overrides(
-        &self,
-        short: &ShortCircuitCandidate,
-        target_overrides: &BTreeMap<TempId, HirLValue>,
-    ) -> Option<BTreeMap<TempId, HirExpr>> {
-        let mut expr_overrides = BTreeMap::new();
-        for block in &short.blocks {
-            let prefix = self.lower_block_prefix(*block, true, target_overrides)?;
-            branch_exit_condition_prefix_expr_overrides(&prefix, &mut expr_overrides)?;
-        }
-        Some(expr_overrides)
     }
 }
 
@@ -151,69 +147,4 @@ fn branch_exit_value_assignment_leaf_value_is_safe(value: &HirExpr) -> bool {
             | HirExpr::TempRef(_)
             | HirExpr::GlobalRef(_)
     )
-}
-
-fn branch_exit_condition_prefix_expr_overrides(
-    stmts: &[HirStmt],
-    expr_overrides: &mut BTreeMap<TempId, HirExpr>,
-) -> Option<()> {
-    for stmt in stmts {
-        let HirStmt::Assign(assign) = stmt else {
-            return None;
-        };
-        let [HirLValue::Temp(target)] = assign.targets.as_slice() else {
-            return None;
-        };
-        let [value] = assign.values.fixed.as_slice() else {
-            return None;
-        };
-        if assign.values.tail.is_some() {
-            return None;
-        }
-        if !branch_exit_condition_prefix_expr_is_safe(value) {
-            continue;
-        }
-        let mut value = value.clone();
-        rewrite_expr_temps(&mut value, expr_overrides);
-        expr_overrides.insert(*target, value);
-    }
-    Some(())
-}
-
-fn branch_exit_condition_prefix_expr_is_safe(expr: &HirExpr) -> bool {
-    match expr {
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::GlobalRef(_) => true,
-        HirExpr::TableAccess(access) => {
-            branch_exit_condition_prefix_expr_is_safe(&access.base)
-                && branch_exit_condition_prefix_expr_is_safe(&access.key)
-        }
-        HirExpr::Unary(unary) => branch_exit_condition_prefix_expr_is_safe(&unary.expr),
-        HirExpr::Binary(binary) => {
-            branch_exit_condition_prefix_expr_is_safe(&binary.lhs)
-                && branch_exit_condition_prefix_expr_is_safe(&binary.rhs)
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            branch_exit_condition_prefix_expr_is_safe(&logical.lhs)
-                && branch_exit_condition_prefix_expr_is_safe(&logical.rhs)
-        }
-        HirExpr::Call(_)
-        | HirExpr::VarArg
-        | HirExpr::TableConstructor(_)
-        | HirExpr::Closure(_)
-        | HirExpr::Decision(_)
-        | HirExpr::Unresolved(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. } => false,
-    }
 }

@@ -81,7 +81,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         }
 
-        let mut plan = build_conditional_reassign_plan(self.lowering, block)?;
+        let mut plan = build_conditional_reassign_plan(self.lowering, short)?;
         if merge_has_other_live_phi(self.lowering, plan.merge, plan.phi_id) {
             return None;
         }

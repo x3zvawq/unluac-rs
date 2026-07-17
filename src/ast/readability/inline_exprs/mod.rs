@@ -1,7 +1,7 @@
 //! 受阈值约束的保守表达式内联。
 //!
 //! 这里只处理非常窄的一类模式：
-//! - 单值 temp / local 别名
+//! - 单值 local 别名；原生 temp 的语义内联归 HIR
 //! - 后续只使用一次
 //! - 使用点出现在 return / 调用参数 / 索引位 / 调用目标
 //! - 被内联表达式必须是我们能证明“纯且无元方法副作用”的安全子集
@@ -93,17 +93,11 @@ fn rewrite_current_block(
             index += 1;
             continue;
         };
-        let policy = if matches!(candidate, candidate::InlineCandidate::LocalAlias { .. })
-            && stmt_is_alias_initializer_sink(next_stmt)
-        {
+        let policy = if stmt_is_alias_initializer_sink(next_stmt) {
             InlinePolicy::AliasInitializerChain
-        } else if matches!(candidate, candidate::InlineCandidate::LocalAlias { .. })
-            && stmt_is_adjacent_call_result_sink(next_stmt)
-        {
+        } else if stmt_is_adjacent_call_result_sink(next_stmt) {
             InlinePolicy::AdjacentCallResultCallee
-        } else if matches!(candidate, candidate::InlineCandidate::LocalAlias { .. })
-            && stmt_is_direct_return_value_sink(next_stmt)
-        {
+        } else if stmt_is_direct_return_value_sink(next_stmt) {
             InlinePolicy::DirectReturnConstructor
         } else {
             InlinePolicy::Conservative
@@ -121,44 +115,30 @@ fn rewrite_current_block(
             index += 1;
             continue;
         }
-        let allows_special_lookup_access_base = matches!(
-            candidate,
-            candidate::InlineCandidate::LocalAlias {
-                origin: super::super::common::AstLocalOrigin::Recovered,
-                ..
-            }
-        ) && matches!(policy, InlinePolicy::Conservative)
+        let is_recovered = candidate.origin() == super::super::common::AstLocalOrigin::Recovered;
+        let allows_special_lookup_access_base = is_recovered
+            && matches!(policy, InlinePolicy::Conservative)
             && matches!(next_stmt, AstStmt::Assign(_))
             && candidate::is_lookup_inline_expr(value)
             && stmt_has_access_base_binding_use(next_stmt, candidate.binding());
-        let allows_special_index_sink = matches!(
-            candidate,
-            candidate::InlineCandidate::LocalAlias {
-                origin: super::super::common::AstLocalOrigin::Recovered,
-                ..
-            }
-        ) && matches!(policy, InlinePolicy::Conservative)
+        let allows_special_index_sink = is_recovered
+            && matches!(policy, InlinePolicy::Conservative)
             && matches!(next_stmt, AstStmt::Assign(_))
             && super::expr_analysis::is_mechanical_run_inline_expr(value)
             && stmt_has_index_binding_use(next_stmt, candidate.binding());
-        let allows_special_adjacent_value_sink =
-            matches!(
-                candidate,
-                candidate::InlineCandidate::LocalAlias {
-                    origin: super::super::common::AstLocalOrigin::Recovered,
-                    ..
-                }
-            ) && matches!(
+        let allows_special_adjacent_value_sink = is_recovered
+            && matches!(
                 policy,
                 InlinePolicy::Conservative | InlinePolicy::AliasInitializerChain
-            ) && matches!(next_stmt, AstStmt::Assign(_) | AstStmt::LocalDecl(_))
-                && stmt_sink_binding_allows_adjacent_value_inline(&old_stmts, index + 1)
-                && ((candidate::is_raw_global_alias_expr(value)
-                    && stmt_has_direct_call_arg_binding_use(next_stmt, candidate.binding()))
-                    || (stmt_has_nested_binding_value_use(next_stmt, candidate.binding())
-                        && (candidate::is_recallable_inline_expr(value)
-                            || (candidate::is_lookup_inline_expr(value)
-                                && assign_targets_same_lookup_expr(next_stmt, value)))));
+            )
+            && matches!(next_stmt, AstStmt::Assign(_) | AstStmt::LocalDecl(_))
+            && stmt_sink_binding_allows_adjacent_value_inline(&old_stmts, index + 1)
+            && ((candidate::is_raw_global_alias_expr(value)
+                && stmt_has_direct_call_arg_binding_use(next_stmt, candidate.binding()))
+                || (stmt_has_nested_binding_value_use(next_stmt, candidate.binding())
+                    && (candidate::is_recallable_inline_expr(value)
+                        || (candidate::is_lookup_inline_expr(value)
+                            && assign_targets_same_lookup_expr(next_stmt, value)))));
         let effective_policy = if allows_special_index_sink {
             InlinePolicy::MechanicalRun
         } else if allows_special_adjacent_value_sink {
@@ -311,9 +291,6 @@ fn collapse_adjacent_call_alias_runs(
             let Some((candidate, value)) = inline_candidate(&old_stmts[candidate_index]) else {
                 continue;
             };
-            if !matches!(candidate, candidate::InlineCandidate::LocalAlias { .. }) {
-                continue;
-            }
             if use_index.count_uses_in_range(candidate_index + 1, run_end + 1, candidate.binding())
                 != 1
             {
@@ -455,9 +432,6 @@ fn collapse_terminal_call_result_alias_runs(
             let Some((candidate, value)) = inline_candidate(&old_stmts[candidate_index]) else {
                 continue;
             };
-            if !matches!(candidate, candidate::InlineCandidate::LocalAlias { .. }) {
-                continue;
-            }
             if use_index.count_uses_in_suffix(candidate_index + 1, candidate.binding()) != 1 {
                 continue;
             }
@@ -702,11 +676,7 @@ fn collapse_terminal_local_mechanical_runs(
         // 这里只处理“run 末尾这个 local 自己还会跨语句活下去”的情况：
         // 前面的 recovered local 只是为了把最终表达式拆成多个机械阶段，
         // 但末尾这个 binding 仍然是后续语句要继续引用的源码锚点。
-        if !matches!(
-            sink_candidate,
-            candidate::InlineCandidate::LocalAlias { .. }
-        ) || use_index.count_uses_in_suffix(run_end, sink_candidate.binding()) == 0
-        {
+        if use_index.count_uses_in_suffix(run_end, sink_candidate.binding()) == 0 {
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;

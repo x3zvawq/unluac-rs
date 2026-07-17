@@ -557,71 +557,47 @@ impl InlineSite {
             return false;
         }
 
-        match candidate {
-            InlineCandidate::TempLike(_) => match policy {
-                InlinePolicy::MechanicalRun => self.allows_mechanical_run_expr(replacement),
-                InlinePolicy::DirectReturnConstructor => false,
-                _ => {
-                    !matches!(self, Self::AccessBase | Self::CallCallee)
-                        || is_access_base_inline_expr(replacement)
+        match policy {
+            InlinePolicy::Conservative => match candidate.origin() {
+                super::super::super::common::AstLocalOrigin::DebugHinted => {
+                    matches!(self, Self::CallCallee | Self::AccessBase)
+                        && is_access_base_inline_expr(replacement)
                 }
-            },
-            InlineCandidate::LocalAlias { origin, .. } => match policy {
-                InlinePolicy::Conservative => match origin {
-                    super::super::super::common::AstLocalOrigin::DebugHinted => {
-                        matches!(self, Self::CallCallee | Self::AccessBase)
-                            && is_access_base_inline_expr(replacement)
+                super::super::super::common::AstLocalOrigin::Recovered => match self {
+                    Self::CallCallee | Self::AccessBase => {
+                        is_access_base_inline_expr(replacement)
+                            || is_lookup_inline_expr(replacement)
                     }
-                    super::super::super::common::AstLocalOrigin::Recovered => match self {
-                        Self::CallCallee | Self::AccessBase => {
-                            is_access_base_inline_expr(replacement)
-                                || is_lookup_inline_expr(replacement)
-                        }
-                        Self::ComparisonOperand => {
-                            is_access_base_inline_expr(replacement)
-                                || is_recallable_inline_expr(replacement)
-                        }
-                        Self::ReturnNestedValue => {
-                            is_recallable_inline_expr(replacement)
-                                || is_lookup_inline_expr(replacement)
-                        }
-                        _ => false,
-                    },
-                },
-                InlinePolicy::ExtendedCallChain => self.allows_extended_local_alias(replacement),
-                InlinePolicy::AliasInitializerChain => {
-                    self.allows_alias_initializer_local_alias(replacement)
-                }
-                InlinePolicy::AdjacentCallResultCallee => {
-                    self.allows_adjacent_call_result_local_alias(replacement)
-                }
-                InlinePolicy::AdjacentValueSink => match origin {
-                    super::super::super::common::AstLocalOrigin::DebugHinted => false,
-                    super::super::super::common::AstLocalOrigin::Recovered => {
-                        self.allows_adjacent_value_sink_local_alias(replacement)
+                    Self::ComparisonOperand => {
+                        is_access_base_inline_expr(replacement)
+                            || is_recallable_inline_expr(replacement)
                     }
-                },
-                InlinePolicy::LoopHeaderCall => match origin {
-                    super::super::super::common::AstLocalOrigin::DebugHinted => false,
-                    super::super::super::common::AstLocalOrigin::Recovered => {
-                        self.allows_loop_header_call_local_alias(replacement)
+                    Self::ReturnNestedValue => {
+                        is_recallable_inline_expr(replacement) || is_lookup_inline_expr(replacement)
                     }
-                },
-                InlinePolicy::DirectReturnConstructor => match origin {
-                    super::super::super::common::AstLocalOrigin::DebugHinted => false,
-                    super::super::super::common::AstLocalOrigin::Recovered => {
-                        self.allows_direct_return_constructor_local_alias(replacement)
-                    }
-                },
-                InlinePolicy::MechanicalRun => match origin {
-                    super::super::super::common::AstLocalOrigin::DebugHinted => {
-                        self.allows_mechanical_run_expr(replacement)
-                    }
-                    super::super::super::common::AstLocalOrigin::Recovered => {
-                        self.allows_mechanical_run_expr(replacement)
-                    }
+                    _ => false,
                 },
             },
+            InlinePolicy::ExtendedCallChain => self.allows_extended_local_alias(replacement),
+            InlinePolicy::AliasInitializerChain => {
+                self.allows_alias_initializer_local_alias(replacement)
+            }
+            InlinePolicy::AdjacentCallResultCallee => {
+                self.allows_adjacent_call_result_local_alias(replacement)
+            }
+            InlinePolicy::AdjacentValueSink => {
+                candidate.origin() == super::super::super::common::AstLocalOrigin::Recovered
+                    && self.allows_adjacent_value_sink_local_alias(replacement)
+            }
+            InlinePolicy::LoopHeaderCall => {
+                candidate.origin() == super::super::super::common::AstLocalOrigin::Recovered
+                    && self.allows_loop_header_call_local_alias(replacement)
+            }
+            InlinePolicy::DirectReturnConstructor => {
+                candidate.origin() == super::super::super::common::AstLocalOrigin::Recovered
+                    && self.allows_direct_return_constructor_local_alias(replacement)
+            }
+            InlinePolicy::MechanicalRun => self.allows_mechanical_run_expr(replacement),
         }
     }
 

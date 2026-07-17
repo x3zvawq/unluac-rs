@@ -5,8 +5,8 @@
 //! 例如：`local r0 = print` 会在这里被识别成一个可继续审查的 local alias 候选。
 
 use super::super::super::common::{
-    AstAssign, AstBindingRef, AstExpr, AstLValue, AstLocalAttr, AstLocalDecl, AstLocalOrigin,
-    AstNameRef, AstStmt, AstTableField, AstTableKey,
+    AstBindingRef, AstExpr, AstLocalAttr, AstLocalDecl, AstLocalOrigin, AstStmt, AstTableField,
+    AstTableKey,
 };
 use super::super::expr_analysis::{
     is_access_base_inline_expr, is_context_safe_expr, is_direct_return_constructor_inline_expr,
@@ -16,17 +16,13 @@ use super::super::expr_analysis::{
 
 pub(super) fn inline_candidate(stmt: &AstStmt) -> Option<(InlineCandidate, &AstExpr)> {
     match stmt {
-        AstStmt::Assign(assign) => inline_candidate_from_assign(assign),
         AstStmt::LocalDecl(local_decl) => inline_candidate_from_local_decl(local_decl),
         _ => None,
     }
 }
 
 pub(super) fn stmt_is_alias_initializer_sink(stmt: &AstStmt) -> bool {
-    matches!(
-        inline_candidate(stmt),
-        Some((InlineCandidate::LocalAlias { .. }, _))
-    )
+    inline_candidate(stmt).is_some()
 }
 
 pub(super) fn stmt_is_adjacent_call_result_sink(stmt: &AstStmt) -> bool {
@@ -66,12 +62,9 @@ pub(super) fn stmt_is_direct_return_value_sink(stmt: &AstStmt) -> bool {
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum InlineCandidate {
-    TempLike(AstBindingRef),
-    LocalAlias {
-        binding: AstBindingRef,
-        origin: AstLocalOrigin,
-    },
+pub(super) struct InlineCandidate {
+    binding: AstBindingRef,
+    origin: AstLocalOrigin,
 }
 
 #[derive(Clone, Copy)]
@@ -88,34 +81,23 @@ pub(super) enum InlinePolicy {
 
 impl InlineCandidate {
     pub(super) fn binding(self) -> AstBindingRef {
-        match self {
-            Self::TempLike(binding) => binding,
-            Self::LocalAlias { binding, .. } => binding,
-        }
+        self.binding
+    }
+
+    pub(super) fn origin(self) -> AstLocalOrigin {
+        self.origin
     }
 
     pub(super) fn allows_expr_with_policy(self, expr: &AstExpr, policy: InlinePolicy) -> bool {
-        match self {
-            Self::TempLike(_) => match policy {
-                InlinePolicy::MechanicalRun => is_mechanical_run_inline_expr(expr),
-                InlinePolicy::AdjacentValueSink => false,
-                InlinePolicy::DirectReturnConstructor => false,
-                _ => is_inline_candidate_expr(expr),
-            },
-            // 这里故意不把普通 local 别名放宽到所有上下文：
-            // 没有 debug 证据时，我们不能把用户可能主动写出来的局部语义名随手吞掉。
-            // 目前只允许它们作为“前缀表达式别名”收回去，例如 `local concat = table.concat`。
-            Self::LocalAlias {
-                origin: AstLocalOrigin::DebugHinted,
-                ..
-            } => match policy {
+        // 这里故意不把普通 local 别名放宽到所有上下文：
+        // 没有 debug 证据时，我们不能把用户可能主动写出来的局部语义名随手吞掉。
+        // 目前只允许它们作为“前缀表达式别名”收回去，例如 `local concat = table.concat`。
+        match self.origin {
+            AstLocalOrigin::DebugHinted => match policy {
                 InlinePolicy::MechanicalRun => is_mechanical_run_inline_expr(expr),
                 _ => is_access_base_inline_expr(expr),
             },
-            Self::LocalAlias {
-                origin: AstLocalOrigin::Recovered,
-                ..
-            } => match policy {
+            AstLocalOrigin::Recovered => match policy {
                 InlinePolicy::MechanicalRun => is_mechanical_run_inline_expr(expr),
                 InlinePolicy::AdjacentCallResultCallee => is_lookup_inline_expr(expr),
                 InlinePolicy::AdjacentValueSink => {
@@ -172,16 +154,6 @@ pub(super) fn is_recallable_inline_expr(expr: &AstExpr) -> bool {
     matches!(expr, AstExpr::Call(_) | AstExpr::MethodCall(_))
 }
 
-fn inline_candidate_from_assign(assign: &AstAssign) -> Option<(InlineCandidate, &AstExpr)> {
-    let [AstLValue::Name(AstNameRef::Temp(temp))] = assign.targets.as_slice() else {
-        return None;
-    };
-    let [value] = assign.values.as_slice() else {
-        return None;
-    };
-    Some((InlineCandidate::TempLike(AstBindingRef::Temp(*temp)), value))
-}
-
 fn inline_candidate_from_local_decl(
     local_decl: &AstLocalDecl,
 ) -> Option<(InlineCandidate, &AstExpr)> {
@@ -194,14 +166,16 @@ fn inline_candidate_from_local_decl(
     if binding.attr != AstLocalAttr::None {
         return None;
     }
-    let candidate = match binding.id {
-        AstBindingRef::Temp(_) => InlineCandidate::TempLike(binding.id),
-        AstBindingRef::Local(_) | AstBindingRef::SyntheticLocal(_) => InlineCandidate::LocalAlias {
-            binding: binding.id,
-            origin: binding.origin,
-        },
-    };
-    Some((candidate, value))
+    match binding.id {
+        AstBindingRef::Temp(_) => None,
+        AstBindingRef::Local(_) | AstBindingRef::SyntheticLocal(_) => Some((
+            InlineCandidate {
+                binding: binding.id,
+                origin: binding.origin,
+            },
+            value,
+        )),
+    }
 }
 
 fn expr_contains_direct_call_callee_var(expr: &AstExpr) -> bool {
@@ -247,8 +221,4 @@ fn expr_contains_direct_call_callee_var(expr: &AstExpr) -> bool {
         | AstExpr::VarArg
         | AstExpr::Error(_) => false,
     }
-}
-
-fn is_inline_candidate_expr(expr: &AstExpr) -> bool {
-    is_context_safe_expr(expr) || is_access_base_inline_expr(expr)
 }

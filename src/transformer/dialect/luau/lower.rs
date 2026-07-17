@@ -85,16 +85,20 @@ impl<'a> ProtoLowerer<'a> {
             let raw_pc = extra.pc;
 
             match opcode {
+                LuauOpcode::Break | LuauOpcode::NativeCall => {
+                    return Err(TransformError::UnsupportedOpcode {
+                        raw_pc,
+                        opcode: opcode.label(),
+                    });
+                }
                 LuauOpcode::Nop
-                | LuauOpcode::Break
                 | LuauOpcode::PrepVarArgs
                 | LuauOpcode::Coverage
                 | LuauOpcode::FastCall
                 | LuauOpcode::FastCall1
                 | LuauOpcode::FastCall2
                 | LuauOpcode::FastCall2K
-                | LuauOpcode::FastCall3
-                | LuauOpcode::NativeCall => {
+                | LuauOpcode::FastCall3 => {
                     match opcode {
                         LuauOpcode::PrepVarArgs => {
                             expect_a(raw_pc, opcode, operands)?;
@@ -111,7 +115,7 @@ impl<'a> ProtoLowerer<'a> {
                         | LuauOpcode::FastCall3 => {
                             expect_abc(raw_pc, opcode, operands)?;
                         }
-                        LuauOpcode::Nop | LuauOpcode::Break | LuauOpcode::NativeCall => {}
+                        LuauOpcode::Nop => {}
                         _ => unreachable!("only no-op Luau opcodes should reach this arm"),
                     }
                     // 这些 opcode 在 Luau 里都是“VM 内部 hint / 无副作用占位”，对我们要恢复的源
@@ -979,6 +983,13 @@ impl<'a> ProtoLowerer<'a> {
                     let (a, d) = expect_ad(raw_pc, opcode, operands)?;
                     let aux = required_aux(raw_pc, opcode, extra)?;
                     let var_count = (aux & 0xff) as usize;
+                    if var_count == 0 {
+                        return Err(TransformError::UnexpectedOperands {
+                            raw_pc,
+                            opcode: opcode.label(),
+                            expected: "AUX variable count in 1..=255",
+                        });
+                    }
                     let iterator = reg_from_u8(a);
                     let bindings = RegRange::new(Reg(iterator.index() + 3), var_count);
                     self.clear_all_method_hints();
@@ -1170,6 +1181,13 @@ impl<'a> ProtoLowerer<'a> {
     ) -> Result<Vec<ConstRef>, TransformError> {
         let aux = required_aux(raw_pc, LuauOpcode::GetImport, extra)?;
         let count = (aux >> 30) as usize;
+        if count == 0 {
+            return Err(TransformError::UnexpectedOperands {
+                raw_pc,
+                opcode: LuauOpcode::GetImport.label(),
+                expected: "AUX import path length in 1..=3",
+            });
+        }
         let ids = [
             ((aux >> 20) & 0x3ff) as usize,
             ((aux >> 10) & 0x3ff) as usize,

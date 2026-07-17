@@ -77,7 +77,8 @@ impl StructuredBodyLowerer<'_, '_> {
     }
 
     /// 返回 (expr_overrides, all_prefix_temps)，其中：
-    /// - `expr_overrides`：前缀指令能成功内联的 temp → 表达式映射
+    /// - `expr_overrides`：前缀指令能成功内联的 temp → 表达式映射；branch 直接读取的
+    ///   根 temp 已传递展开，其余依赖保留原始表达式，由最终条件重写统一解析
     /// - `all_prefix_temps`：前缀指令定义的所有 temp 集合
     ///
     /// 调用方可通过 `all_prefix_temps - expr_overrides.keys()` 得到"无法内联的前缀 temp"。
@@ -88,6 +89,20 @@ impl StructuredBodyLowerer<'_, '_> {
         let Some(prefix_indices) = self.block_prefix_instr_indices(block, false) else {
             return (BTreeMap::new(), BTreeSet::new());
         };
+        let direct_condition_temps =
+            if let Some((terminator_ref, LowInstr::Branch(_))) = self.block_terminator(block) {
+                self.lowering
+                    .dataflow
+                    .use_values_at(terminator_ref)
+                    .values()
+                    .filter_map(|value| match value {
+                        SsaValue::Def(def) => Some(self.lowering.bindings.fixed_temps[def.index()]),
+                        SsaValue::Entry(_) | SsaValue::Phi(_) => None,
+                    })
+                    .collect::<BTreeSet<_>>()
+            } else {
+                BTreeSet::new()
+            };
 
         let mut expr_overrides = BTreeMap::new();
         let mut all_prefix_temps = BTreeSet::new();
@@ -99,13 +114,25 @@ impl StructuredBodyLowerer<'_, '_> {
             for def in &self.lowering.dataflow.instr_defs[instr_index] {
                 let temp = self.lowering.bindings.fixed_temps[def.index()];
                 all_prefix_temps.insert(temp);
-                let Some(mut expr) = expr_for_fixed_def(self.lowering, *def) else {
+                let Some(expr) = expr_for_fixed_def(self.lowering, *def) else {
                     continue;
                 };
-                rewrite_expr_temps(&mut expr, &expr_overrides);
                 expr_overrides.insert(temp, expr);
             }
         }
+
+        // loop 的求值序保护会直接检查条件根 override，因此这些根仍需看到完整表达式。
+        // BranchSubject 最多直接读取两个寄存器；只展开这组有界根，就能让中间 temp
+        // 作为传递解析图保留，避免每个定义都复制此前整条表达式链。
+        let resolved_condition_overrides = direct_condition_temps
+            .into_iter()
+            .filter_map(|temp| {
+                let mut expr = expr_overrides.get(&temp)?.clone();
+                rewrite_expr_temps(&mut expr, &expr_overrides);
+                Some((temp, expr))
+            })
+            .collect::<Vec<_>>();
+        expr_overrides.extend(resolved_condition_overrides);
 
         (expr_overrides, all_prefix_temps)
     }

@@ -8,8 +8,8 @@ use crate::ast::traverse::{
     traverse_stmt_children,
 };
 use crate::ast::{
-    AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue, AstModule,
-    AstNameRef, AstStmt,
+    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue,
+    AstModule, AstNameRef, AstStmt,
 };
 use crate::hir::{HirModule, HirProtoRef};
 
@@ -59,24 +59,22 @@ fn validate_stmt_has_no_temps(
     match stmt {
         AstStmt::LocalDecl(local_decl) => {
             for binding in &local_decl.bindings {
-                if let crate::ast::AstBindingRef::Temp(temp) = binding.id {
-                    return Err(NamingError::UnexpectedTemp {
-                        function: function.index(),
-                        temp: temp.index(),
-                    });
-                }
+                validate_binding_has_no_temp(binding.id, function)?;
+            }
+        }
+        AstStmt::NumericFor(numeric_for) => {
+            validate_binding_has_no_temp(numeric_for.binding, function)?;
+        }
+        AstStmt::GenericFor(generic_for) => {
+            for &binding in &generic_for.bindings {
+                validate_binding_has_no_temp(binding, function)?;
             }
         }
         AstStmt::FunctionDecl(function_decl) => {
             validate_function_name_has_no_temps(&function_decl.target, function)?;
         }
         AstStmt::LocalFunctionDecl(local_function_decl) => {
-            if let crate::ast::AstBindingRef::Temp(temp) = local_function_decl.name {
-                return Err(NamingError::UnexpectedTemp {
-                    function: function.index(),
-                    temp: temp.index(),
-                });
-            }
+            validate_binding_has_no_temp(local_function_decl.name, function)?;
         }
         _ => {}
     }
@@ -96,7 +94,7 @@ fn validate_stmt_has_no_temps(
             validate_block_has_no_temps(block, function, hir)?;
         },
         function(func) => {
-            validate_function_expr_has_no_temps(func, hir)?;
+            validate_function_expr_has_no_temps(func, function, hir)?;
         },
         condition(cond) => {
             validate_expr_has_no_temps(cond, function, hir)?;
@@ -110,10 +108,30 @@ fn validate_stmt_has_no_temps(
 
 fn validate_function_expr_has_no_temps(
     function_expr: &AstFunctionExpr,
+    parent_function: HirProtoRef,
     hir: &HirModule,
 ) -> Result<(), NamingError> {
     ensure_function_exists(hir, function_expr.function)?;
+    if let Some(named_vararg) = function_expr.named_vararg {
+        validate_binding_has_no_temp(named_vararg, function_expr.function)?;
+    }
+    for &binding in &function_expr.captured_bindings {
+        validate_binding_has_no_temp(binding, parent_function)?;
+    }
     validate_block_has_no_temps(&function_expr.body, function_expr.function, hir)
+}
+
+fn validate_binding_has_no_temp(
+    binding: AstBindingRef,
+    function: HirProtoRef,
+) -> Result<(), NamingError> {
+    let AstBindingRef::Temp(temp) = binding else {
+        return Ok(());
+    };
+    Err(NamingError::UnexpectedTemp {
+        function: function.index(),
+        temp: temp.index(),
+    })
 }
 
 fn validate_function_name_has_no_temps(
@@ -180,7 +198,7 @@ fn validate_expr_has_no_temps(
             validate_expr_has_no_temps(child, function, hir)?;
         },
         function(func) => {
-            validate_function_expr_has_no_temps(func, hir)?;
+            validate_function_expr_has_no_temps(func, function, hir)?;
         }
     );
     Ok(())

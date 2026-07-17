@@ -155,6 +155,12 @@ impl LuauParserState {
                     value: u64::from(type_version),
                 });
             }
+            if bytecode_version < 5 && type_version >= 3 {
+                return Err(ParseError::UnsupportedValue {
+                    field: "luau type version for bytecode version",
+                    value: u64::from(type_version),
+                });
+            }
             Some(type_version)
         } else {
             None
@@ -284,8 +290,8 @@ impl LuauParserState {
             Vec::new()
         };
 
-        let decoded = self.parse_instructions(reader)?;
-        let constants = self.parse_constants(reader)?;
+        let decoded = self.parse_instructions(reader, layout.bytecode_version)?;
+        let constants = self.parse_constants(reader, layout.bytecode_version)?;
         let child_indices = self.parse_child_proto_indices(reader)?;
         let constants = self.normalize_constants(constants, child_indices.as_slice())?;
         let defined_start = reader.read_varint_u32_luau("luau linedefined")?;
@@ -345,6 +351,7 @@ impl LuauParserState {
     fn parse_instructions(
         &self,
         reader: &mut BinaryReader<'_>,
+        bytecode_version: u8,
     ) -> Result<DecodedInstrs, ParseError> {
         let word_count = usize::try_from(reader.read_varint_u32_luau("luau code word count")?)
             .map_err(|_| ParseError::IntegerOverflow {
@@ -370,6 +377,12 @@ impl LuauParserState {
                     pc: word_pc,
                     opcode: invalid,
                 })?;
+            if bytecode_version < opcode.min_bytecode_version() {
+                return Err(ParseError::UnsupportedValue {
+                    field: "luau opcode for bytecode version",
+                    value: u64::from(opcode_byte),
+                });
+            }
             let aux = opcode
                 .has_aux()
                 .then(|| {
@@ -418,6 +431,7 @@ impl LuauParserState {
     fn parse_constants(
         &mut self,
         reader: &mut BinaryReader<'_>,
+        bytecode_version: u8,
     ) -> Result<RawConstPool, ParseError> {
         let const_count = usize::try_from(reader.read_varint_u32_luau("luau const count")?)
             .map_err(|_| ParseError::IntegerOverflow {
@@ -429,6 +443,12 @@ impl LuauParserState {
 
         for _ in 0..const_count {
             let tag = reader.read_u8()?;
+            if (tag == 7 && bytecode_version < 5) || (tag == 8 && bytecode_version < 7) {
+                return Err(ParseError::UnsupportedValue {
+                    field: "luau constant tag for bytecode version",
+                    value: u64::from(tag),
+                });
+            }
             let entry = match tag {
                 0 => {
                     let literal_index = literals.len();

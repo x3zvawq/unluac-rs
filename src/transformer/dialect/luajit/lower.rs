@@ -745,7 +745,13 @@ impl<'a> ProtoLowerer<'a> {
                     );
                     raw_index += 1;
                 }
-                LuaJitOpcode::ForL | LuaJitOpcode::IForL | LuaJitOpcode::JForL => {
+                LuaJitOpcode::JForL => {
+                    return Err(TransformError::UnsupportedOpcode {
+                        raw_pc,
+                        opcode: opcode.label(),
+                    });
+                }
+                LuaJitOpcode::ForL | LuaJitOpcode::IForL => {
                     let (a, d) = expect_ad(raw_pc, opcode, operands)?;
                     let index = reg_from_u8(a);
                     self.emit(
@@ -924,7 +930,13 @@ impl<'a> ProtoLowerer<'a> {
                     }
                     raw_index += 2;
                 }
-                LuaJitOpcode::Loop | LuaJitOpcode::ILoop | LuaJitOpcode::JLoop => {
+                LuaJitOpcode::JLoop => {
+                    return Err(TransformError::UnsupportedOpcode {
+                        raw_pc,
+                        opcode: opcode.label(),
+                    });
+                }
+                LuaJitOpcode::Loop | LuaJitOpcode::ILoop => {
                     self.mark_raw_target(raw_index);
                     raw_index += 1;
                 }
@@ -1271,10 +1283,13 @@ impl<'a> ProtoLowerer<'a> {
         let (helper_opcode, helper_operands, helper_extra) = helper_instr
             .luajit()
             .expect("luajit lowerer should only decode luajit instructions");
-        if !matches!(
-            helper_opcode,
-            LuaJitOpcode::IterL | LuaJitOpcode::IIterL | LuaJitOpcode::JIterL
-        ) {
+        if helper_opcode == LuaJitOpcode::JIterL {
+            return Err(TransformError::UnsupportedOpcode {
+                raw_pc: helper_extra.pc,
+                opcode: helper_opcode.label(),
+            });
+        }
+        if !matches!(helper_opcode, LuaJitOpcode::IterL | LuaJitOpcode::IIterL) {
             return Err(TransformError::InvalidGenericForLoop {
                 raw_pc,
                 helper_pc: helper_extra.pc,

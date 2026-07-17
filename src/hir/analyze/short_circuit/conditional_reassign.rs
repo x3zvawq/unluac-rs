@@ -28,9 +28,8 @@ pub(crate) struct ConditionalReassignPlan {
 /// 而另一部分叶子才真正产生新值，那么这更像 `if cond then x = new end`。
 pub(crate) fn build_conditional_reassign_plan(
     lowering: &ProtoLowering<'_>,
-    header: BlockRef,
+    short: &ShortCircuitCandidate,
 ) -> Option<ConditionalReassignPlan> {
-    let short = value_merge_candidate_by_header(lowering, header)?;
     let ShortCircuitExit::ValueMerge(merge) = short.exit else {
         return None;
     };
@@ -43,7 +42,7 @@ pub(crate) fn build_conditional_reassign_plan(
     let leaf_kinds = classify_value_leaves(short, entry_value)?;
     let changed_region = find_changed_region_entry(short, &leaf_kinds)?;
     let cond_decision = build_region_reach_decision_expr(lowering, short, changed_region)?;
-    let allowed_blocks = BTreeSet::from([header]);
+    let allowed_blocks = BTreeSet::from([short.header]);
     if decision_references_forbidden_candidate_temps(
         lowering,
         short,

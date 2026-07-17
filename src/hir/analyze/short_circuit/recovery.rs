@@ -288,26 +288,6 @@ fn truncate_branch_exit_candidate_at_escaping_header(
     })
 }
 
-/// 如果某个 branch header 已经被值型短路完整消费，结构层就不应该再产出一层重复 `if`。
-pub(crate) fn value_merge_candidate_by_header<'a>(
-    lowering: &'a ProtoLowering<'_>,
-    header: BlockRef,
-) -> Option<&'a ShortCircuitCandidate> {
-    let mut candidates = lowering
-        .structure
-        .short_circuit_candidates
-        .iter()
-        .filter(|candidate| {
-            candidate.header == header
-                && candidate.reducible
-                && matches!(candidate.exit, ShortCircuitExit::ValueMerge(_))
-        });
-    let first = candidates.next()?;
-    candidates
-        .all(|candidate| same_value_merge_shape(first, candidate))
-        .then_some(first)
-}
-
 pub(crate) fn same_value_merge_shape(
     base: &ShortCircuitCandidate,
     candidate: &ShortCircuitCandidate,

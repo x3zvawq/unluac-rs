@@ -507,8 +507,21 @@ fn local_decl_stmts(locals: Vec<LocalId>) -> Vec<HirStmt> {
 }
 
 fn lower_fixed_targets(lowering: &ProtoLowering<'_>, instr_ref: InstrRef) -> Vec<HirLValue> {
-    lowering.bindings.instr_fixed_defs[instr_ref.index()]
+    let block = lowering.cfg.instr_to_block[instr_ref.index()];
+    lowering.dataflow.instr_defs[instr_ref.index()]
         .iter()
-        .map(|temp| lowering.bindings.lvalue_for_temp(*temp))
+        .zip(&lowering.bindings.instr_fixed_defs[instr_ref.index()])
+        .map(|(def, temp)| {
+            // for 的可见 binding 是当前 body 内该寄存器的词法 owner；显式写入也必须
+            // 回到同一个 local。只在读取侧映射会把 `i = value` 留成无人读取的 temp，
+            // 随后 dead-temp 清理会静默删除真实赋值。
+            lowering
+                .bindings
+                .local_for_reg_in_block(block, lowering.dataflow.def_reg(*def))
+                .map_or_else(
+                    || lowering.bindings.lvalue_for_temp(*temp),
+                    HirLValue::Local,
+                )
+        })
         .collect()
 }

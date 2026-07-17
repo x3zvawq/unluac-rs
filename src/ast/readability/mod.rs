@@ -141,7 +141,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
     PassDescriptor {
         name: "inline-exprs",
         phase: PassPhase::Normal,
-        depends_on: &[StatementAdjacency, ExprShape, TempPresence],
+        depends_on: &[StatementAdjacency, ExprShape],
         invalidates: &[StatementAdjacency, ExprShape],
     },
     // ── Deferred phase ──

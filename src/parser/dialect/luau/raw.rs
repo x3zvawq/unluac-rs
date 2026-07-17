@@ -105,6 +105,15 @@ define_opcode_kind_table!(
 );
 
 impl LuauOpcode {
+    pub(crate) const fn min_bytecode_version(self) -> u8 {
+        match self {
+            Self::IDiv | Self::IDivK => 4,
+            Self::SubRK | Self::DivRK => 5,
+            Self::FastCall3 => 6,
+            _ => 3,
+        }
+    }
+
     pub const fn has_aux(self) -> bool {
         matches!(
             self,
