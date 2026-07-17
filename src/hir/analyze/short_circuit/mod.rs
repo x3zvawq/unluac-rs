@@ -46,14 +46,12 @@ pub(super) use self::lowering::{
 use self::lowering::{lower_short_circuit_subject_inline, lower_value_leaf_expr};
 pub(super) use self::recovery::{
     BranchShortCircuitPlan, build_branch_short_circuit_plan,
-    build_branch_short_circuit_plan_for_candidate, consumed_value_merge_subject_instrs,
-    recover_short_value_merge_expr_recovery_with_allowed_blocks,
-    recover_short_value_merge_expr_with_allowed_blocks, same_value_merge_shape,
+    build_branch_short_circuit_plan_for_candidate,
+    recover_short_value_merge_expr_recovery_with_allowed_blocks, same_value_merge_shape,
     value_merge_candidate_by_header, value_merge_candidates_in_block, value_merge_skipped_blocks,
 };
 use super::ProtoLowering;
 use super::exprs::{
-    expr_for_dup_safe_fixed_def, expr_for_fixed_def, expr_for_fixed_def_single_eval,
-    expr_for_reg_at_block_entry, lower_branch_subject, lower_branch_subject_inline,
-    lower_branch_subject_single_eval,
+    expr_for_fixed_def, expr_for_fixed_def_single_eval, expr_for_reg_at_block_entry,
+    lower_branch_subject, lower_branch_subject_inline, lower_branch_subject_single_eval,
 };

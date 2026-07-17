@@ -31,9 +31,9 @@ pub(super) use self::access::{
     lower_upvalue_operand_expr, lower_upvalue_operand_target,
 };
 use self::access::{
-    expr_for_value_operand_inline, expr_for_value_operand_single_eval_pure_operand,
-    lower_raw_table_get_expr_inline, lower_raw_table_get_expr_single_eval,
-    lower_table_access_expr_inline, lower_table_access_expr_single_eval,
+    expr_for_value_operand_single_eval_pure_operand, lower_raw_table_get_expr_inline,
+    lower_raw_table_get_expr_single_eval, lower_table_access_expr_inline,
+    lower_table_access_expr_single_eval,
 };
 pub(super) use self::branch::{
     lower_binary_op, lower_branch_cond, lower_branch_subject, lower_branch_subject_inline,
@@ -48,7 +48,10 @@ pub(super) use self::regs::{
     expr_for_reg_at_block_entry, expr_for_reg_at_block_exit, expr_for_reg_use, expr_for_ssa_value,
     lower_closure_capture,
 };
-use self::regs::{expr_for_reg_use_inline, expr_for_reg_use_single_eval_with_call_policy};
+use self::regs::{
+    expr_for_reg_use_dup_safe, expr_for_reg_use_inline,
+    expr_for_reg_use_single_eval_with_call_policy,
+};
 use super::ProtoLowering;
 use super::helpers::{concat_expr, decode_raw_string, raw_lua_string, unresolved_expr};
 

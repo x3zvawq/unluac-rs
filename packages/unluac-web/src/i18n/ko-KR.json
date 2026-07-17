@@ -139,7 +139,6 @@
       "maxLineLength": "최대 줄 길이",
       "quoteStyle": "따옴표 스타일",
       "tableStyle": "테이블 스타일",
-      "conservativeOutput": "보수적 출력",
       "comment": "주석 출력"
     },
     "tips": {
@@ -159,7 +158,6 @@
       "maxLineLength": "생성 코드의 기본 최대 줄 길이. CLI: --max-line-length",
       "quoteStyle": "문자열 따옴표 스타일. prefer-double: \"를 선호; prefer-single: '를 선호; min-escape: 이스케이프 최소화. CLI: --quote-style",
       "tableStyle": "테이블 생성자 레이아웃. compact: 한 줄; balanced: 자동; expanded: 항목당 한 줄. CLI: --table-style",
-      "conservativeOutput": "보수적 출력 모드를 활성화합니다. 더 안전하지만 더 장황할 수 있는 코드를 생성합니다. CLI: --conservative-output",
       "comment": "생성된 코드에 주석과 메타데이터를 출력할지 여부. CLI: --comment"
     },
     "share": {

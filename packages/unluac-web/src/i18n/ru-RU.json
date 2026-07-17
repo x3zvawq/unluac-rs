@@ -139,7 +139,6 @@
       "maxLineLength": "Макс. длина строки",
       "quoteStyle": "Стиль кавычек",
       "tableStyle": "Стиль таблиц",
-      "conservativeOutput": "Консервативный вывод",
       "comment": "Выводить комментарии"
     },
     "tips": {
@@ -159,7 +158,6 @@
       "maxLineLength": "Предпочтительная максимальная длина строки для сгенерированного кода. CLI: --max-line-length",
       "quoteStyle": "Стиль кавычек для строк. prefer-double: предпочитать \"; prefer-single: предпочитать '; min-escape: минимизировать экранирование. CLI: --quote-style",
       "tableStyle": "Макет конструктора таблиц. compact: одна строка; balanced: автоматически; expanded: одна запись на строку. CLI: --table-style",
-      "conservativeOutput": "Включить консервативный режим вывода для более безопасного, но возможно более многословного кода. CLI: --conservative-output",
       "comment": "Выводить ли комментарии и метаданные в сгенерированном коде. CLI: --comment"
     },
     "share": {

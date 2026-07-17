@@ -277,15 +277,13 @@ fn output_rejects_non_generate_target_stage() {
 }
 
 #[test]
-fn naming_mode_and_bool_options_override_defaults() {
+fn naming_mode_and_bool_option_override_defaults() {
     let options = parse_args(args(&[
         "--source",
         "case.lua",
         "--naming-mode",
         "simple",
         "--debug-like-include-function",
-        "false",
-        "--conservative-output",
         "false",
         "--comment",
         "false",
@@ -295,7 +293,6 @@ fn naming_mode_and_bool_options_override_defaults() {
     .expect("boolish options should parse");
     assert_eq!(options.decompile.naming.mode, NamingMode::Simple);
     assert!(!options.decompile.naming.debug_like_include_function);
-    assert!(!options.decompile.generate.conservative_output);
     assert!(!options.decompile.generate.comment);
     assert_eq!(options.decompile.generate.mode, GenerateMode::Strict);
 }

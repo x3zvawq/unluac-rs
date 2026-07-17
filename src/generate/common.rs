@@ -43,7 +43,6 @@ pub struct GenerateOptions {
     pub number_format: NumberFormat,
     pub quote_style: QuoteStyle,
     pub table_style: TableStyle,
-    pub conservative_output: bool,
     pub comment: bool,
     /// 把 Luau vector 常量重新表达成源码时使用的宿主构造器。
     pub luau_vector_constructor: Option<LuauVectorConstructor>,
@@ -58,7 +57,6 @@ impl Default for GenerateOptions {
             number_format: NumberFormat::Decimal,
             quote_style: QuoteStyle::MinEscape,
             table_style: TableStyle::Balanced,
-            conservative_output: true,
             comment: true,
             luau_vector_constructor: None,
         }

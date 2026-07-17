@@ -144,7 +144,6 @@
       "luauVectorConstructor": "Luau Vector 构造器",
       "luauVectorLibrary": "可选库名",
       "luauVectorConstructorName": "构造器名",
-      "conservativeOutput": "保守输出模式",
       "comment": "生成注释"
     },
     "tips": {
@@ -165,7 +164,6 @@
       "numberFormat": "数字字面量格式。decimal: 普通数字；hex: 尽可能把整数字面量输出为 0x...。CLI: --number-format",
       "tableStyle": "表构造器排版风格。compact: 紧凑；balanced: 均衡；expanded: 展开。CLI: --table-style",
       "luauVectorConstructor": "使用显式构造器和 3D/4D 维度输出 Luau vector 常量。库名可选，构造器名和维度必填。CLI: --luau-vector-library / --luau-vector-constructor / --luau-vector-size",
-      "conservativeOutput": "启用保守输出模式，生成更安全但可能更冗长的代码。CLI: --conservative-output",
       "comment": "是否在生成的代码中输出注释和元信息。CLI: --comment"
     },
     "share": {

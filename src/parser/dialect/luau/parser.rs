@@ -5,6 +5,8 @@
 //! 直接解码，并在读取任何版本相关布局前按仓库 pinned Luau 的兼容范围校验 header，
 //! 避免在公共层伪造 PUC-Lua 头，也避免把未知版本误读成当前常量池或 proto 形状。
 
+use std::collections::HashMap;
+
 use crate::decompile::DecompileDialect;
 use crate::parser::error::ParseError;
 use crate::parser::options::ParseOptions;
@@ -530,6 +532,11 @@ impl LuauParserState {
         let DialectConstPoolExtra::Luau(extra) = &mut constants.extra else {
             unreachable!("luau parser should only normalize luau constant pools");
         };
+        let mut child_slots = HashMap::with_capacity(child_indices.len());
+        for (child_proto_index, proto_index) in child_indices.iter().copied().enumerate() {
+            // 保留原先 position 的首个槽位语义；复用校验仍由后续可达 proto tree 负责。
+            child_slots.entry(proto_index).or_insert(child_proto_index);
+        }
         for (const_index, entry) in extra.entries.iter_mut().enumerate() {
             let LuauConstEntry::Closure {
                 proto_index,
@@ -538,9 +545,9 @@ impl LuauParserState {
             else {
                 continue;
             };
-            *child_proto_index = child_indices
-                .iter()
-                .position(|candidate| *candidate == *proto_index as usize)
+            *child_proto_index = usize::try_from(*proto_index)
+                .ok()
+                .and_then(|proto_index| child_slots.get(&proto_index).copied())
                 .ok_or(ParseError::InvalidLuauClosureProto {
                     const_index,
                     proto_index: *proto_index,

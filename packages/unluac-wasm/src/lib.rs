@@ -66,7 +66,6 @@ struct WasmGenerateOptions {
     quote_style: Option<String>,
     table_style: Option<String>,
     luau_vector_constructor: Option<WasmLuauVectorConstructor>,
-    conservative_output: Option<bool>,
     comment: Option<bool>,
 }
 
@@ -278,9 +277,6 @@ impl WasmGenerateOptions {
                 },
             });
         }
-        if let Some(value) = self.conservative_output {
-            options.generate.conservative_output = value;
-        }
         if let Some(value) = self.comment {
             options.generate.comment = value;
         }
@@ -483,7 +479,6 @@ mod tests {
                     constructor: "new".to_owned(),
                     size: 3,
                 }),
-                conservative_output: Some(false),
                 comment: Some(false),
             }),
         }
@@ -509,7 +504,6 @@ mod tests {
                 size: unluac::decompile::LuauVectorSize::Three,
             })
         );
-        assert!(!options.generate.conservative_output);
         assert!(!options.generate.comment);
     }
 

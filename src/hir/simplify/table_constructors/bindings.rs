@@ -4,7 +4,7 @@
 //! 并用稳定 stmt id 索引 binding 的 use/mention 位置；不会扫描候选 region 或重建字段序列。
 //! 例如：`t.x = v` 会在这里把键翻成 `Name(\"x\")` 并识别 `t` 的绑定身份。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ops::Bound::{Excluded, Unbounded};
 
 use crate::ast::{DecompileDialect, is_lua_identifier_name};
@@ -50,56 +50,112 @@ pub(super) fn table_key_from_expr(expr: &HirExpr, dialect: DecompileDialect) -> 
     HirTableKey::Expr(expr.clone())
 }
 
-pub(super) fn collect_materialized_binding_counts(
-    block: &crate::hir::common::HirBlock,
-) -> BTreeMap<TableBinding, usize> {
-    let mut collector = MaterializedBindingCollector::default();
-    visit_block(block, &mut collector);
-    collector.counts
+pub(super) struct BindingFacts {
+    pub(super) materialized: BindingSlots<u32>,
+    pub(super) reference_captured: BindingSlots<bool>,
+    pub(super) reference_captured_home_slots: BTreeSet<HomeSlotKey>,
 }
 
-pub(super) fn collect_reference_captured_bindings(
+pub(super) fn collect_binding_facts(
     block: &crate::hir::common::HirBlock,
     promotion_facts: &ProtoPromotionFacts,
-) -> (BTreeSet<TableBinding>, BTreeSet<HomeSlotKey>) {
-    let mut collector = ReferenceCaptureCollector {
+    temp_count: usize,
+    local_count: usize,
+) -> BindingFacts {
+    let mut collector = BindingFactCollector {
         promotion_facts,
-        bindings: BTreeSet::new(),
-        home_slots: BTreeSet::new(),
+        materialized: BindingSlots::new(temp_count, local_count),
+        reference_captured: BindingSlots::new(temp_count, local_count),
+        reference_captured_home_slots: BTreeSet::new(),
     };
     visit_block(block, &mut collector);
-    (collector.bindings, collector.home_slots)
+    BindingFacts {
+        materialized: collector.materialized,
+        reference_captured: collector.reference_captured,
+        reference_captured_home_slots: collector.reference_captured_home_slots,
+    }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
+pub(super) struct BindingSlots<T> {
+    temps: Vec<T>,
+    locals: Vec<T>,
+    temp_limit: usize,
+    local_limit: usize,
+}
+
+impl<T> BindingSlots<T> {
+    fn new(temp_limit: usize, local_limit: usize) -> Self {
+        Self {
+            temps: Vec::new(),
+            locals: Vec::new(),
+            temp_limit,
+            local_limit,
+        }
+    }
+
+    pub(super) fn get(&self, binding: TableBinding) -> Option<&T> {
+        match binding {
+            TableBinding::Temp(temp) => self.temps.get(temp.index()),
+            TableBinding::Local(local) => self.locals.get(local.index()),
+        }
+    }
+
+    fn get_mut_or_default(&mut self, binding: TableBinding) -> &mut T
+    where
+        T: Default,
+    {
+        let (slots, index, limit) = match binding {
+            TableBinding::Temp(temp) => (&mut self.temps, temp.index(), self.temp_limit),
+            TableBinding::Local(local) => (&mut self.locals, local.index(), self.local_limit),
+        };
+        assert!(
+            index < limit,
+            "table-constructor binding must belong to its proto"
+        );
+        if slots.len() <= index {
+            slots.resize_with(index + 1, T::default);
+        }
+        &mut slots[index]
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct BindingIndex {
-    ids: BTreeMap<TableBinding, BindingId>,
+    ids: BindingSlots<Option<BindingId>>,
     bindings: Vec<TableBinding>,
 }
 
 impl BindingIndex {
+    pub(super) fn new(temp_count: usize, local_count: usize) -> Self {
+        Self {
+            ids: BindingSlots::new(temp_count, local_count),
+            bindings: Vec::new(),
+        }
+    }
+
     pub(super) fn intern(&mut self, binding: TableBinding) -> BindingId {
-        if let Some(id) = self.ids.get(&binding).copied() {
+        if let Some(id) = self.id_of(binding) {
             return id;
         }
         let id = self.bindings.len();
-        self.ids.insert(binding, id);
+        *self.ids.get_mut_or_default(binding) = Some(id);
         self.bindings.push(binding);
         id
     }
 
     pub(super) fn id_of(&self, binding: TableBinding) -> Option<BindingId> {
-        self.ids.get(&binding).copied()
+        self.ids.get(binding).copied().flatten()
     }
 
     pub(super) fn len(&self) -> usize {
         self.bindings.len()
     }
 
-    pub(super) fn materialized_counts(&self, counts: &BTreeMap<TableBinding, usize>) -> Vec<u32> {
+    pub(super) fn materialized_counts(&self, counts: &BindingSlots<u32>) -> Vec<u32> {
         self.bindings
             .iter()
-            .map(|binding| counts.get(binding).copied().unwrap_or_default() as u32)
+            .map(|binding| counts.get(*binding).copied().unwrap_or_default())
             .collect()
     }
 }
@@ -198,7 +254,7 @@ impl BindingOccurrenceIndex {
     pub(super) fn new(
         binding_index: &BindingIndex,
         stmts: &[StmtBindingSummary],
-        reference_captured_bindings: &BTreeSet<TableBinding>,
+        reference_captured_bindings: &BindingSlots<bool>,
         reference_captured_home_slots: &BTreeSet<HomeSlotKey>,
         promotion_facts: &ProtoPromotionFacts,
     ) -> Self {
@@ -209,7 +265,10 @@ impl BindingOccurrenceIndex {
                 .bindings
                 .iter()
                 .map(|binding| {
-                    reference_captured_bindings.contains(binding)
+                    reference_captured_bindings
+                        .get(*binding)
+                        .copied()
+                        .unwrap_or_default()
                         || matches!(
                             binding,
                             TableBinding::Temp(temp)
@@ -236,6 +295,12 @@ impl BindingOccurrenceIndex {
             index: self,
             after_stmt: stmt_id,
         }
+    }
+
+    pub(super) fn last_use(&self, binding_id: BindingId) -> Option<usize> {
+        self.uses
+            .get(binding_id)
+            .and_then(|occurrences| occurrences.last().copied())
     }
 
     pub(super) fn mentions_after(&self, binding_id: BindingId, stmt_id: usize) -> bool {
@@ -279,13 +344,60 @@ impl BindingUseSummary<'_> {
     }
 }
 
-struct ReferenceCaptureCollector<'a> {
+struct BindingFactCollector<'a> {
     promotion_facts: &'a ProtoPromotionFacts,
-    bindings: BTreeSet<TableBinding>,
-    home_slots: BTreeSet<HomeSlotKey>,
+    materialized: BindingSlots<u32>,
+    reference_captured: BindingSlots<bool>,
+    reference_captured_home_slots: BTreeSet<HomeSlotKey>,
 }
 
-impl HirVisitor for ReferenceCaptureCollector<'_> {
+impl HirVisitor for BindingFactCollector<'_> {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        match stmt {
+            HirStmt::LocalDecl(local_decl) => {
+                for binding in &local_decl.bindings {
+                    increment_materialized_count(
+                        &mut self.materialized,
+                        TableBinding::Local(*binding),
+                    );
+                }
+            }
+            HirStmt::Assign(assign) => {
+                for target in &assign.targets {
+                    if let Some(binding) = binding_from_lvalue(target) {
+                        increment_materialized_count(&mut self.materialized, binding);
+                    }
+                }
+            }
+            HirStmt::NumericFor(numeric_for) => increment_materialized_count(
+                &mut self.materialized,
+                TableBinding::Local(numeric_for.binding),
+            ),
+            HirStmt::GenericFor(generic_for) => {
+                for binding in &generic_for.bindings {
+                    increment_materialized_count(
+                        &mut self.materialized,
+                        TableBinding::Local(*binding),
+                    );
+                }
+            }
+            HirStmt::TableSetList(_)
+            | HirStmt::ErrNil(_)
+            | HirStmt::ToBeClosed(_)
+            | HirStmt::Close(_)
+            | HirStmt::CallStmt(_)
+            | HirStmt::Return(_)
+            | HirStmt::If(_)
+            | HirStmt::While(_)
+            | HirStmt::Repeat(_)
+            | HirStmt::Block(_)
+            | HirStmt::Break
+            | HirStmt::Continue
+            | HirStmt::Goto(_)
+            | HirStmt::Label(_) => {}
+        }
+    }
+
     fn visit_expr(&mut self, expr: &HirExpr) {
         let HirExpr::Closure(closure) = expr else {
             return;
@@ -296,11 +408,11 @@ impl HirVisitor for ReferenceCaptureCollector<'_> {
             .filter(|capture| capture.mode == HirCaptureMode::ByReference)
             .filter_map(|capture| binding_from_expr(&capture.value))
         {
-            self.bindings.insert(binding);
+            *self.reference_captured.get_mut_or_default(binding) = true;
             if let TableBinding::Temp(temp) = binding
                 && let Some(slot) = self.promotion_facts.home_slot(temp)
             {
-                self.home_slots.insert(slot);
+                self.reference_captured_home_slots.insert(slot);
             }
         }
     }
@@ -413,59 +525,11 @@ impl HirVisitor for BindingUseCollector<'_> {
     }
 }
 
-#[derive(Default)]
-struct MaterializedBindingCollector {
-    counts: BTreeMap<TableBinding, usize>,
-}
-
-impl HirVisitor for MaterializedBindingCollector {
-    fn visit_stmt(&mut self, stmt: &HirStmt) {
-        match stmt {
-            HirStmt::LocalDecl(local_decl) => {
-                for binding in &local_decl.bindings {
-                    *self
-                        .counts
-                        .entry(TableBinding::Local(*binding))
-                        .or_default() += 1;
-                }
-            }
-            HirStmt::Assign(assign) => {
-                for target in &assign.targets {
-                    if let Some(binding) = binding_from_lvalue(target) {
-                        *self.counts.entry(binding).or_default() += 1;
-                    }
-                }
-            }
-            HirStmt::NumericFor(numeric_for) => {
-                *self
-                    .counts
-                    .entry(TableBinding::Local(numeric_for.binding))
-                    .or_default() += 1;
-            }
-            HirStmt::GenericFor(generic_for) => {
-                for binding in &generic_for.bindings {
-                    *self
-                        .counts
-                        .entry(TableBinding::Local(*binding))
-                        .or_default() += 1;
-                }
-            }
-            HirStmt::TableSetList(_)
-            | HirStmt::ErrNil(_)
-            | HirStmt::ToBeClosed(_)
-            | HirStmt::Close(_)
-            | HirStmt::CallStmt(_)
-            | HirStmt::Return(_)
-            | HirStmt::If(_)
-            | HirStmt::While(_)
-            | HirStmt::Repeat(_)
-            | HirStmt::Block(_)
-            | HirStmt::Break
-            | HirStmt::Continue
-            | HirStmt::Goto(_)
-            | HirStmt::Label(_) => {}
-        }
-    }
+fn increment_materialized_count(counts: &mut BindingSlots<u32>, binding: TableBinding) {
+    let count = counts.get_mut_or_default(binding);
+    *count = count
+        .checked_add(1)
+        .expect("table-constructor materialization count must fit u32");
 }
 
 fn call_expr_uses_binding(call: &HirCallExpr, binding: TableBinding) -> bool {

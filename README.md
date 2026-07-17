@@ -147,7 +147,6 @@ Generate and output options:
 | `--luau-vector-library` | Optional library name for the Luau vector constructor; requires `--luau-vector-constructor` | None |
 | `--luau-vector-constructor` | Constructor used to render Luau vector constants and compile Luau `--source` inputs; requires `--luau-vector-size` | None |
 | `--luau-vector-size` | Luau vector width: `3` or `4`; required with `--luau-vector-constructor` | None |
-| `--conservative-output` | Whether to prefer conservative source generation | `true` |
 | `--comment` | Whether to emit generate-stage comments and metadata | `true` |
 | `-g`, `--generate-mode` | `strict` requires target-compatible source; `permissive` may emit Error-marked diagnostic pseudocode | `permissive` |
 | `--stop-after` | Last pipeline stage to run | `generate` |

@@ -67,7 +67,6 @@ export interface DecompileOptions {
     quoteStyle: UnluacQuoteStyle
     tableStyle: UnluacTableStyle
     luauVectorConstructor: LuauVectorConstructor | null
-    conservativeOutput: boolean
     comment: boolean
   }
 }

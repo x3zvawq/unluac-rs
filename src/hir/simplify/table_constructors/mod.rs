@@ -21,7 +21,6 @@ mod inline_value;
 mod rebuild;
 mod scan;
 
-use std::collections::BTreeMap;
 use std::ops::Range;
 
 use crate::ast::DecompileDialect;
@@ -32,8 +31,8 @@ use crate::hir::common::{
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use self::bindings::{
-    BindingIndex, BindingOccurrenceIndex, StmtBindingSummary, collect_materialized_binding_counts,
-    collect_reference_captured_bindings, collect_stmt_binding_summary,
+    BindingFacts, BindingIndex, BindingOccurrenceIndex, BindingSlots, StmtBindingSummary,
+    collect_binding_facts, collect_stmt_binding_summary,
 };
 use self::scan::{
     constructor_seed, install_constructor_seed, trailing_constructor_handoff,
@@ -145,16 +144,20 @@ pub(super) fn stabilize_table_constructors_in_proto(
     dialect: DecompileDialect,
     promotion_facts: &ProtoPromotionFacts,
 ) -> bool {
-    let materialized_bindings = collect_materialized_binding_counts(&proto.body);
-    let (reference_captured_bindings, reference_captured_home_slots) =
-        collect_reference_captured_bindings(&proto.body, promotion_facts);
+    let temp_count = proto.temps.len();
     let first_new_local = proto.locals.len();
+    let BindingFacts {
+        materialized: materialized_bindings,
+        reference_captured: reference_captured_bindings,
+        reference_captured_home_slots,
+    } = collect_binding_facts(&proto.body, promotion_facts, temp_count, first_new_local);
     let mut pass = TableConstructorPass {
         materialized_bindings,
         reference_captured_bindings,
         reference_captured_home_slots,
         promotion_facts,
         dialect,
+        temp_count,
         next_local_index: first_new_local,
     };
     let changed = rewrite_proto(proto, &mut pass);
@@ -168,11 +171,12 @@ pub(super) fn stabilize_table_constructors_in_proto(
 }
 
 struct TableConstructorPass<'a> {
-    materialized_bindings: BTreeMap<TableBinding, usize>,
-    reference_captured_bindings: std::collections::BTreeSet<TableBinding>,
+    materialized_bindings: BindingSlots<u32>,
+    reference_captured_bindings: BindingSlots<bool>,
     reference_captured_home_slots: std::collections::BTreeSet<HomeSlotKey>,
     promotion_facts: &'a ProtoPromotionFacts,
     dialect: DecompileDialect,
+    temp_count: usize,
     next_local_index: usize,
 }
 
@@ -182,7 +186,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
         let mut scratch = RebuildScratch::default();
         // 稳定 stmt id 让 occurrence index 在删除已折叠 region 后仍能按源码顺序查询；
         // 每个 seed 只做当前位置之后的有序集合查找，不重建完整 suffix summary。
-        let mut binding_index = BindingIndex::default();
+        let mut binding_index = BindingIndex::new(self.temp_count, self.next_local_index);
         let mut stmt_bindings: Vec<StmtBindingSummary> = block
             .stmts
             .iter()
@@ -292,7 +296,11 @@ impl HirRewritePass for TableConstructorPass<'_> {
 
 impl TableConstructorPass<'_> {
     fn binding_is_unshared(&self, binding: TableBinding) -> bool {
-        !self.reference_captured_bindings.contains(&binding)
+        !self
+            .reference_captured_bindings
+            .get(binding)
+            .copied()
+            .unwrap_or_default()
             && !matches!(
                 binding,
                 TableBinding::Temp(temp)

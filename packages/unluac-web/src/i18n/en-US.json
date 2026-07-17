@@ -144,7 +144,6 @@
       "luauVectorConstructor": "Luau Vector Constructor",
       "luauVectorLibrary": "Optional library",
       "luauVectorConstructorName": "Constructor",
-      "conservativeOutput": "Conservative Output",
       "comment": "Emit Comments"
     },
     "tips": {
@@ -165,7 +164,6 @@
       "numberFormat": "Number literal style. decimal: regular numbers; hex: emit integer literals as 0x... when possible. CLI: --number-format",
       "tableStyle": "Table constructor layout. compact: single line; balanced: auto; expanded: one entry per line. CLI: --table-style",
       "luauVectorConstructor": "Render Luau vector constants with an explicit constructor and 3D/4D size. The library is optional; constructor and size are required. CLI: --luau-vector-library / --luau-vector-constructor / --luau-vector-size",
-      "conservativeOutput": "Enable conservative output mode for safer but potentially more verbose code. CLI: --conservative-output",
       "comment": "Whether to emit comments and metadata in generated code. CLI: --comment"
     },
     "share": {

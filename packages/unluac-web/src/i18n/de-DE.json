@@ -140,7 +140,6 @@
       "maxLineLength": "Max. Zeilenlänge",
       "quoteStyle": "Anführungszeichen-Stil",
       "tableStyle": "Tabellen-Stil",
-      "conservativeOutput": "Konservative Ausgabe",
       "comment": "Kommentare ausgeben"
     },
     "tips": {
@@ -159,7 +158,6 @@
       "maxLineLength": "Bevorzugte maximale Zeilenlänge für generierten Code. CLI: --max-line-length",
       "quoteStyle": "Anführungszeichen-Stil für Strings. prefer-double: \" bevorzugen; prefer-single: ' bevorzugen; min-escape: Escapes minimieren. CLI: --quote-style",
       "tableStyle": "Layout des Tabellenkonstruktors. compact: einzeilig; balanced: automatisch; expanded: ein Eintrag pro Zeile. CLI: --table-style",
-      "conservativeOutput": "Konservativen Ausgabemodus aktivieren für sichereren, aber möglicherweise ausführlicheren Code. CLI: --conservative-output",
       "comment": "Ob Kommentare und Metadaten im generierten Code ausgegeben werden. CLI: --comment"
     },
     "share": {

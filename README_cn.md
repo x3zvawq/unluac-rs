@@ -144,7 +144,6 @@ unluac-cli -i /absolute/path/to/chunk.out -o /tmp/case.lua
 | `--quote-style` | 字符串引号风格 | `min-escape` |
 | `--number-format` | 数字字面量格式：`decimal` 或把整数字面量输出为 `hex` | `decimal` |
 | `--table-style` | 表构造器布局风格 | `balanced` |
-| `--conservative-output` | 是否偏向保守输出 | `true` |
 | `--comment` | 是否输出 generate 阶段注释和元信息 | `true` |
 | `-g`, `--generate-mode` | `strict` 只接受目标方言源码；`permissive` 可输出带 Error 标记的诊断伪源码 | `permissive` |
 | `--stop-after` | pipeline 截止阶段 | `generate` |

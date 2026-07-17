@@ -63,6 +63,10 @@ pub(super) fn build_bindings(
                 .and_then(|name| name.as_ref().map(decode_raw_string))
         })
         .collect::<Vec<_>>();
+    let reference_captured_regs = (0..usize::from(proto.frame.max_stack_size))
+        .map(Reg)
+        .map(|reg| captured_slot_epochs.tracks_reference_capture(reg))
+        .collect::<Vec<_>>();
     let mut locals = Vec::new();
     let mut local_debug_hints = Vec::new();
     let mut entry_local_regs = BTreeMap::new();
@@ -206,6 +210,7 @@ pub(super) fn build_bindings(
         captured_temp_decl_locals: captured_temp_facts.decl_temps,
         capture_empty_local_decls: captured_temp_facts.empty_decls,
         closure_capture_targets: captured_slots.capture_targets,
+        reference_captured_regs,
         entry_local_regs,
         numeric_for_locals,
         generic_for_locals,

@@ -183,7 +183,6 @@ Common `decompile()` options:
 - `quoteStyle`
 - `tableStyle`
 - `luauVectorConstructor`: optional object with an optional `library`, required `constructor`, and required `size` (`3` or `4`); required when rendering Luau vector constants
-- `conservativeOutput`
 - `comment`
 
 Current library defaults used by this package:
@@ -200,7 +199,6 @@ Current library defaults used by this package:
 - `generate.numberFormat = decimal`
 - `generate.quoteStyle = min-escape`
 - `generate.tableStyle = balanced`
-- `generate.conservativeOutput = true`
 - `generate.comment = true`
 
 ## Related Packages

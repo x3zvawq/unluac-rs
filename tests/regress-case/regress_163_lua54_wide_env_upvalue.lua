@@ -267,9 +267,12 @@ wide_target = "ok"
 print("regress_163_lua54_wide_env_upvalue#1", wide_target, values[1], values[256])
 
 local original_env = _ENV
+original_env.regress_163_saved_marker = "original"
 _ENV = {
     marker = "redirected",
+    regress_163_saved_marker = "redirected",
     print = original_env.print,
 }
-print("regress_163_lua54_wide_env_upvalue#2", marker)
+print("regress_163_lua54_wide_env_upvalue#2", marker, original_env.regress_163_saved_marker)
 _ENV = original_env
+original_env.regress_163_saved_marker = nil

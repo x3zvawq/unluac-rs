@@ -140,7 +140,6 @@
       "maxLineLength": "最大行長",
       "quoteStyle": "引用符スタイル",
       "tableStyle": "テーブルスタイル",
-      "conservativeOutput": "保守的出力",
       "comment": "コメント出力"
     },
     "tips": {
@@ -159,7 +158,6 @@
       "maxLineLength": "生成コードの推奨最大行長。CLI: --max-line-length",
       "quoteStyle": "文字列の引用符スタイル。prefer-double: \" を優先；prefer-single: ' を優先；min-escape: エスケープを最小化。CLI: --quote-style",
       "tableStyle": "テーブルコンストラクタのレイアウト。compact: 単一行；balanced: 自動；expanded: 1エントリ1行。CLI: --table-style",
-      "conservativeOutput": "保守的出力モードを有効化。より安全だが冗長になる可能性のあるコードを生成。CLI: --conservative-output",
       "comment": "生成コードにコメントやメタデータを出力するかどうか。CLI: --comment"
     },
     "share": {

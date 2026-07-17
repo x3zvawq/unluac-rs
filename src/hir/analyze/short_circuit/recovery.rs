@@ -16,39 +16,41 @@ pub(crate) struct BranchShortCircuitPlan {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum ValueMergeExprRecovery {
-    Pure {
-        expr: HirExpr,
-        consumed_header_subject: bool,
-    },
-    Impure(HirExpr),
+pub(crate) struct ValueMergeExprRecovery {
+    expr: HirExpr,
+    consumes_header_subject: bool,
+    consumed_subject_instrs: BTreeSet<InstrRef>,
 }
 
 impl ValueMergeExprRecovery {
-    fn into_expr(self) -> HirExpr {
-        match self {
-            Self::Pure { expr, .. } | Self::Impure(expr) => expr,
+    fn new(
+        lowering: &ProtoLowering<'_>,
+        short: &ShortCircuitCandidate,
+        expr: HirExpr,
+        consumes_header_subject: bool,
+    ) -> Option<Self> {
+        let consumed_subject_instrs = if consumes_header_subject {
+            consumed_value_merge_subject_instrs(lowering, short.header)?
+        } else {
+            BTreeSet::new()
+        };
+        if expr_references_consumed_subject_temps(lowering, &consumed_subject_instrs, &expr) {
+            return None;
         }
+        Some(Self {
+            expr,
+            consumes_header_subject,
+            consumed_subject_instrs,
+        })
     }
 
-    pub(crate) fn consumes_header_subject(&self) -> bool {
-        match self {
-            Self::Pure {
-                consumed_header_subject,
-                ..
-            } => *consumed_header_subject,
-            Self::Impure(_) => true,
-        }
+    pub(crate) fn into_expr_without_subject_consumption(self) -> Option<HirExpr> {
+        (!self.consumes_header_subject).then_some(self.expr)
     }
-}
 
-pub(crate) fn recover_short_value_merge_expr_with_allowed_blocks(
-    lowering: &ProtoLowering<'_>,
-    short: &ShortCircuitCandidate,
-    allowed_blocks: &BTreeSet<BlockRef>,
-) -> Option<HirExpr> {
-    recover_short_value_merge_expr_recovery_with_allowed_blocks(lowering, short, allowed_blocks)
-        .map(ValueMergeExprRecovery::into_expr)
+    pub(crate) fn into_parts(self) -> (HirExpr, BTreeSet<InstrRef>) {
+        (self.expr, self.consumed_subject_instrs)
+    }
 }
 
 pub(crate) fn recover_short_value_merge_expr_recovery_with_allowed_blocks(
@@ -64,33 +66,21 @@ pub(crate) fn recover_short_value_merge_expr_recovery_with_allowed_blocks(
             short.entry,
             allowed_blocks,
         )
+        && let Some(recovery) =
+            ValueMergeExprRecovery::new(lowering, short, expr, consumed_header_subject)
     {
-        let recovery = ValueMergeExprRecovery::Pure {
-            expr,
-            consumed_header_subject,
-        };
-        if !expr_references_consumed_subject_temps(lowering, short, &recovery) {
-            if matches!(
-                &recovery,
-                ValueMergeExprRecovery::Pure {
-                    expr: HirExpr::Decision(_),
-                    ..
-                }
-            ) {
-                deferred_decision = Some(recovery);
-            } else {
-                return Some(recovery);
-            }
+        if matches!(&recovery.expr, HirExpr::Decision(_)) {
+            deferred_decision = Some(recovery);
+        } else {
+            return Some(recovery);
         }
     }
 
     if let Some(expr) = build_impure_value_merge_expr(lowering, short, short.entry)
         && !expr_references_forbidden_candidate_temps(lowering, short, &expr, allowed_blocks)
+        && let Some(recovery) = ValueMergeExprRecovery::new(lowering, short, expr, true)
     {
-        let recovery = ValueMergeExprRecovery::Impure(expr);
-        if !expr_references_consumed_subject_temps(lowering, short, &recovery) {
-            return Some(recovery);
-        }
+        return Some(recovery);
     }
     deferred_decision
 }
@@ -386,18 +376,15 @@ pub(crate) fn value_merge_skipped_blocks(short: &ShortCircuitCandidate) -> BTree
 /// 就会产生"空 local"孤儿。该函数检测这种情况，让调用方能及时拒绝本次恢复。
 fn expr_references_consumed_subject_temps(
     lowering: &ProtoLowering<'_>,
-    short: &ShortCircuitCandidate,
-    recovery: &ValueMergeExprRecovery,
+    consumed_instrs: &BTreeSet<InstrRef>,
+    expr: &HirExpr,
 ) -> bool {
-    if !recovery.consumes_header_subject() {
-        return false;
-    }
-    let consumed_instrs = consumed_value_merge_subject_instrs(lowering, short.header);
     if consumed_instrs.is_empty() {
         return false;
     }
     let consumed_temps: BTreeSet<TempId> = consumed_instrs
-        .into_iter()
+        .iter()
+        .copied()
         .flat_map(|instr| {
             lowering.dataflow.instr_defs[instr.index()]
                 .iter()
@@ -405,9 +392,6 @@ fn expr_references_consumed_subject_temps(
                 .map(|def_id| lowering.bindings.fixed_temps[def_id.index()])
         })
         .collect();
-    let expr = match recovery {
-        ValueMergeExprRecovery::Pure { expr, .. } | ValueMergeExprRecovery::Impure(expr) => expr,
-    };
     super::guards::expr_references_any_temp(expr, &consumed_temps)
 }
 /// 当值短路已经把某个 branch header 的 subject 直接吸收到表达式里时，紧邻 branch 的
@@ -416,16 +400,14 @@ fn expr_references_consumed_subject_temps(
 ///
 /// 这里刻意只吃当前 header 内、且没有被后续 prefix 指令再次读取的那批 def，避免把
 /// 还服务于其它前缀语句的中间值一起抹掉。
-pub(crate) fn consumed_value_merge_subject_instrs(
+fn consumed_value_merge_subject_instrs(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,
-) -> BTreeSet<InstrRef> {
+) -> Option<BTreeSet<InstrRef>> {
     let range = lowering.cfg.blocks[block.index()].instrs;
-    let Some(branch_instr_ref) = range.last() else {
-        return BTreeSet::new();
-    };
+    let branch_instr_ref = range.last()?;
     let LowInstr::Branch(branch) = &lowering.proto.instrs[branch_instr_ref.index()] else {
-        return BTreeSet::new();
+        return None;
     };
 
     let mut candidate_defs = BTreeSet::new();
@@ -443,23 +425,24 @@ pub(crate) fn consumed_value_merge_subject_instrs(
         .iter()
         .map(|def_id| lowering.dataflow.def_instr(*def_id))
         .collect::<BTreeSet<_>>();
+    let Some(first_instr) = candidate_instrs.first().copied() else {
+        return Some(BTreeSet::new());
+    };
+    if (first_instr.index()..branch_instr_ref.index())
+        .any(|index| !candidate_instrs.contains(&InstrRef(index)))
+    {
+        return None;
+    }
 
-    candidate_defs
-        .into_iter()
-        .filter_map(|def_id| {
-            let def_instr = lowering.dataflow.def_instr(def_id);
-            let effect = &lowering.dataflow.instr_effects[def_instr.index()];
-            let used_elsewhere = effect.fixed_must_defs.iter().any(|reg| {
-                ((def_instr.index() + 1)..branch_instr_ref.index()).any(|instr_index| {
-                    lowering.dataflow.instr_effects[instr_index]
-                        .fixed_uses
-                        .contains(reg)
-                        && !candidate_instrs.contains(&InstrRef(instr_index))
-                })
-            });
-            (!used_elsewhere).then_some(def_instr)
-        })
-        .collect()
+    let mut allowed_uses = candidate_instrs.clone();
+    allowed_uses.insert(branch_instr_ref);
+    let closed = candidate_instrs.iter().copied().all(|instr| {
+        lowering.dataflow.instr_defs[instr.index()]
+            .iter()
+            .copied()
+            .all(|def| lowering.dataflow.def_uses_are_within(def, &allowed_uses))
+    });
+    closed.then_some(candidate_instrs)
 }
 
 fn collect_consumed_single_eval_defs(
@@ -474,7 +457,14 @@ fn collect_consumed_single_eval_defs(
     };
     let def_block = lowering.dataflow.def_block(def_id);
     let def_instr = lowering.dataflow.def_instr(def_id);
-    if def_block != block || !out.insert(def_id) {
+    let def_temp = lowering.bindings.fixed_temps[def_id.index()];
+    if def_block != block
+        || lowering
+            .bindings
+            .captured_temp_targets
+            .contains_key(&def_temp)
+        || !out.insert(def_id)
+    {
         return;
     }
 
@@ -482,19 +472,16 @@ fn collect_consumed_single_eval_defs(
         out.remove(&def_id);
         return;
     }
-    if consumed_def_is_call_consumed_by_non_branch(lowering, def_id, consumer_instr) {
+    if consumed_def_is_call_consumed_by_non_branch(lowering, def_id, consumer_instr)
+        && !matches!(
+            lowering.proto.instrs[consumer_instr.index()],
+            LowInstr::UnaryOp(_) | LowInstr::BinaryOp(_) | LowInstr::Concat(_)
+        )
+    {
         out.remove(&def_id);
         return;
     }
-
-    let recoverable = if consumer_instr == lowering.cfg.blocks[block.index()].instrs.last().unwrap()
-    {
-        expr_for_fixed_def(lowering, def_id).is_some()
-    } else {
-        expr_for_fixed_def_single_eval(lowering, def_id).is_some()
-            || expr_for_dup_safe_fixed_def(lowering, def_id).is_some()
-    };
-    if !recoverable {
+    if expr_for_fixed_def_single_eval(lowering, def_id).is_none() {
         out.remove(&def_id);
         return;
     }

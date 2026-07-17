@@ -190,6 +190,18 @@ pub(super) fn binding_mentions_in_stmt(stmt: &AstStmt) -> BTreeSet<AstBindingRef
     mentions
 }
 
+pub(super) fn binding_mentions_in_block(block: &AstBlock) -> BTreeSet<AstBindingRef> {
+    let mut mentions = BTreeSet::new();
+    collect_binding_mentions_in_block(block, &mut mentions);
+    mentions
+}
+
+pub(super) fn binding_mentions_in_expr(expr: &AstExpr) -> BTreeSet<AstBindingRef> {
+    let mut mentions = BTreeSet::new();
+    collect_binding_mentions_in_expr(expr, &mut mentions);
+    mentions
+}
+
 pub(super) fn count_binding_uses_in_stmt(stmt: &AstStmt, binding: AstBindingRef) -> usize {
     count_binding_uses_in_stmt_with_scope(stmt, binding, BindingUseScope::CurrentFunctionOnly)
 }

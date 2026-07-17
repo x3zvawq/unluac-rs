@@ -168,6 +168,15 @@ fn refine_nested_escape_if_else_merges(
             .map(|(_, edge)| *edge)
             .collect::<BTreeSet<_>>();
         if !escape_edges.is_empty()
+            && !enclosing_loop_owns_escape(
+                cfg,
+                loop_candidates,
+                candidate,
+                else_entry,
+                soft_merge,
+                strict_merge,
+                &escape_edges,
+            )
             && cfg.can_reach(candidate.then_entry, soft_merge)
             && cfg.can_reach(else_entry, soft_merge)
         {
@@ -184,6 +193,29 @@ fn refine_nested_escape_if_else_merges(
         }
     }
     single_pass_fences
+}
+
+/// 若全部 escape 已从同一 loop body 直达其显式出口，它们表达的是该 loop 的 break；
+/// synthetic fence 会让这些 break 只退出新包的一次性 repeat，从而继续执行原 loop body。
+fn enclosing_loop_owns_escape(
+    cfg: &Cfg,
+    loop_candidates: &[LoopCandidate],
+    branch: &BranchCandidate,
+    else_entry: BlockRef,
+    soft_merge: BlockRef,
+    strict_merge: BlockRef,
+    escape_edges: &BTreeSet<crate::structure::EdgeRef>,
+) -> bool {
+    loop_candidates.iter().any(|owner| {
+        owner.exits.contains(&strict_merge)
+            && [branch.header, branch.then_entry, else_entry, soft_merge]
+                .into_iter()
+                .all(|block| owner.body_scope_blocks.contains(&block))
+            && escape_edges.iter().all(|edge_ref| {
+                let edge = cfg.edges[edge_ref.index()];
+                owner.body_scope_blocks.contains(&edge.from) && owner.exits.contains(&edge.to)
+            })
+    })
 }
 
 fn refine_loop_iteration_if_else_branches(
@@ -369,10 +401,6 @@ fn reachable_without_entering_loop_bodies(
     loops_by_header: &BTreeMap<BlockRef, Vec<&LoopCandidate>>,
 ) -> BTreeSet<BlockRef> {
     let mut reachable = BTreeSet::from([from]);
-    if loops_by_header.contains_key(&from) {
-        return reachable;
-    }
-
     let mut visited = BTreeSet::new();
     let mut worklist = VecDeque::from([(None, from)]);
     while let Some((predecessor, block)) = worklist.pop_front() {
@@ -552,7 +580,7 @@ fn classify_loop_exit_bounded_one_arm_branch(
     let enters_continue_pad = loop_candidates.iter().any(|candidate| {
         candidate.blocks.contains(&header)
             && [then_entry, else_entry].into_iter().any(|entry| {
-                cfg.succs[entry.index()].len() == 1
+                transparent_jump_target(cfg, entry).is_some()
                     && candidate
                         .backedges
                         .iter()

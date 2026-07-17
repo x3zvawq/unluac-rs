@@ -6,13 +6,13 @@
 //! 未变后才提交。例如：`local v = f(); t.x = v` 只在 `f()` 仍位于同一事件位置时折叠。
 
 use crate::hir::common::{
-    HirBinaryExpr, HirBlock, HirCallExpr, HirExpr, HirLogicalExpr, HirPackTail, HirUnaryExpr,
-    HirValuePack,
+    HirBinaryExpr, HirBlock, HirCallExpr, HirDecisionTarget, HirExpr, HirLogicalExpr, HirPackTail,
+    HirTableField, HirTableKey, HirUnaryExpr, HirValuePack,
 };
 use crate::hir::expr_safety::expr_requires_ordered_snapshot;
 
 use super::bindings::{BindingIndex, BindingUseSummary, binding_from_expr};
-use super::{ConstructorEvalEvent, PendingProducer, PendingProducerSource};
+use super::{BindingId, ConstructorEvalEvent, PendingProducer, PendingProducerSource};
 
 pub(super) struct InlineContext<'a> {
     block: &'a HirBlock,
@@ -168,7 +168,7 @@ fn inline_constructor_value_at_site(
         _ if expr_depends_on_any_pending_binding(
             value,
             context.binding_index,
-            context.pending_producers,
+            context.producer_index_by_binding,
             context.consumed_bindings,
         ) =>
         {
@@ -219,7 +219,7 @@ fn inline_short_circuit_expr(
     if expr_mentions_any_pending_binding(
         &logical.rhs,
         context.binding_index,
-        context.pending_producers,
+        context.producer_index_by_binding,
     ) {
         return None;
     }
@@ -237,83 +237,78 @@ fn inline_short_circuit_expr(
 pub(super) fn expr_mentions_any_pending_binding(
     expr: &HirExpr,
     binding_index: &BindingIndex,
-    pending_producers: &[PendingProducer],
+    producer_index_by_binding: &[Option<usize>],
 ) -> bool {
-    if let Some(binding) = binding_from_expr(expr)
-        && let Some(binding_id) = binding_index.id_of(binding)
-        && pending_producers
-            .iter()
-            .any(|producer| producer.binding_id == binding_id)
+    expr_mentions_binding_where(expr, binding_index, |binding_id| {
+        producer_index_by_binding
+            .get(binding_id)
+            .is_some_and(Option::is_some)
+    })
+}
+
+fn expr_mentions_binding_where(
+    expr: &HirExpr,
+    binding_index: &BindingIndex,
+    predicate: impl Fn(BindingId) -> bool + Copy,
+) -> bool {
+    if binding_from_expr(expr)
+        .and_then(|binding| binding_index.id_of(binding))
+        .is_some_and(predicate)
     {
         return true;
     }
 
     match expr {
         HirExpr::TableAccess(access) => {
-            expr_mentions_any_pending_binding(&access.base, binding_index, pending_producers)
-                || expr_mentions_any_pending_binding(&access.key, binding_index, pending_producers)
+            expr_mentions_binding_where(&access.base, binding_index, predicate)
+                || expr_mentions_binding_where(&access.key, binding_index, predicate)
         }
-        HirExpr::Unary(unary) => {
-            expr_mentions_any_pending_binding(&unary.expr, binding_index, pending_producers)
-        }
+        HirExpr::Unary(unary) => expr_mentions_binding_where(&unary.expr, binding_index, predicate),
         HirExpr::Binary(binary) => {
-            expr_mentions_any_pending_binding(&binary.lhs, binding_index, pending_producers)
-                || expr_mentions_any_pending_binding(&binary.rhs, binding_index, pending_producers)
+            expr_mentions_binding_where(&binary.lhs, binding_index, predicate)
+                || expr_mentions_binding_where(&binary.rhs, binding_index, predicate)
         }
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            expr_mentions_any_pending_binding(&logical.lhs, binding_index, pending_producers)
-                || expr_mentions_any_pending_binding(&logical.rhs, binding_index, pending_producers)
+            expr_mentions_binding_where(&logical.lhs, binding_index, predicate)
+                || expr_mentions_binding_where(&logical.rhs, binding_index, predicate)
         }
         HirExpr::Call(call) => {
-            expr_mentions_any_pending_binding(&call.callee, binding_index, pending_producers)
-                || call.args.iter().any(|arg| {
-                    expr_mentions_any_pending_binding(arg, binding_index, pending_producers)
-                })
+            expr_mentions_binding_where(&call.callee, binding_index, predicate)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_mentions_binding_where(arg, binding_index, predicate))
         }
         HirExpr::TableConstructor(table) => {
             table.fields.iter().any(|field| match field {
-                crate::hir::common::HirTableField::Array(value) => {
-                    expr_mentions_any_pending_binding(value, binding_index, pending_producers)
+                HirTableField::Array(value) => {
+                    expr_mentions_binding_where(value, binding_index, predicate)
                 }
-                crate::hir::common::HirTableField::Record(field) => {
-                    expr_mentions_any_pending_binding(
-                        &field.value,
-                        binding_index,
-                        pending_producers,
-                    ) || matches!(
-                        &field.key,
-                        crate::hir::common::HirTableKey::Expr(key_expr)
-                            if expr_mentions_any_pending_binding(
-                                key_expr,
-                                binding_index,
-                                pending_producers,
-                            )
-                    )
+                HirTableField::Record(field) => {
+                    expr_mentions_binding_where(&field.value, binding_index, predicate)
+                        || matches!(
+                            &field.key,
+                            HirTableKey::Expr(key_expr)
+                                if expr_mentions_binding_where(
+                                    key_expr,
+                                    binding_index,
+                                    predicate,
+                                )
+                        )
                 }
             }) || table.trailing_multivalue.as_ref().is_some_and(|tail| {
-                expr_mentions_any_pending_binding(tail.as_expr(), binding_index, pending_producers)
+                expr_mentions_binding_where(tail.as_expr(), binding_index, predicate)
             })
         }
         HirExpr::Decision(decision) => decision.nodes.iter().any(|node| {
-            expr_mentions_any_pending_binding(&node.test, binding_index, pending_producers)
-                || match &node.truthy {
-                    crate::hir::common::HirDecisionTarget::Expr(expr) => {
-                        expr_mentions_any_pending_binding(expr, binding_index, pending_producers)
-                    }
-                    crate::hir::common::HirDecisionTarget::Node(_)
-                    | crate::hir::common::HirDecisionTarget::CurrentValue => false,
-                }
-                || match &node.falsy {
-                    crate::hir::common::HirDecisionTarget::Expr(expr) => {
-                        expr_mentions_any_pending_binding(expr, binding_index, pending_producers)
-                    }
-                    crate::hir::common::HirDecisionTarget::Node(_)
-                    | crate::hir::common::HirDecisionTarget::CurrentValue => false,
-                }
+            expr_mentions_binding_where(&node.test, binding_index, predicate)
+                || decision_target_mentions_binding_where(&node.truthy, binding_index, predicate)
+                || decision_target_mentions_binding_where(&node.falsy, binding_index, predicate)
         }),
-        HirExpr::Closure(closure) => closure.captures.iter().any(|capture| {
-            expr_mentions_any_pending_binding(&capture.value, binding_index, pending_producers)
-        }),
+        HirExpr::Closure(closure) => closure
+            .captures
+            .iter()
+            .any(|capture| expr_mentions_binding_where(&capture.value, binding_index, predicate)),
         HirExpr::Nil
         | HirExpr::Boolean(_)
         | HirExpr::Integer(_)
@@ -329,6 +324,19 @@ pub(super) fn expr_mentions_any_pending_binding(
         | HirExpr::VarArg
         | HirExpr::Unresolved(_) => false,
         HirExpr::TempRef(_) | HirExpr::LocalRef(_) => false,
+    }
+}
+
+fn decision_target_mentions_binding_where(
+    target: &HirDecisionTarget,
+    binding_index: &BindingIndex,
+    predicate: impl Fn(BindingId) -> bool + Copy,
+) -> bool {
+    match target {
+        HirDecisionTarget::Expr(expr) => {
+            expr_mentions_binding_where(expr, binding_index, predicate)
+        }
+        HirDecisionTarget::Node(_) | HirDecisionTarget::CurrentValue => false,
     }
 }
 
@@ -377,170 +385,15 @@ fn producer_source_value(
 fn expr_depends_on_any_pending_binding(
     expr: &HirExpr,
     binding_index: &BindingIndex,
-    pending_producers: &[PendingProducer],
+    producer_index_by_binding: &[Option<usize>],
     consumed_bindings: &[bool],
 ) -> bool {
-    if let Some(binding) = binding_from_expr(expr)
-        && let Some(binding_id) = binding_index.id_of(binding)
-        && !consumed_bindings[binding_id]
-        && pending_producers
-            .iter()
-            .any(|producer| producer.binding_id == binding_id)
-    {
-        return true;
-    }
-
-    match expr {
-        HirExpr::TableAccess(access) => {
-            expr_depends_on_any_pending_binding(
-                &access.base,
-                binding_index,
-                pending_producers,
-                consumed_bindings,
-            ) || expr_depends_on_any_pending_binding(
-                &access.key,
-                binding_index,
-                pending_producers,
-                consumed_bindings,
-            )
-        }
-        HirExpr::Unary(unary) => expr_depends_on_any_pending_binding(
-            &unary.expr,
-            binding_index,
-            pending_producers,
-            consumed_bindings,
-        ),
-        HirExpr::Binary(binary) => {
-            expr_depends_on_any_pending_binding(
-                &binary.lhs,
-                binding_index,
-                pending_producers,
-                consumed_bindings,
-            ) || expr_depends_on_any_pending_binding(
-                &binary.rhs,
-                binding_index,
-                pending_producers,
-                consumed_bindings,
-            )
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            expr_depends_on_any_pending_binding(
-                &logical.lhs,
-                binding_index,
-                pending_producers,
-                consumed_bindings,
-            ) || expr_depends_on_any_pending_binding(
-                &logical.rhs,
-                binding_index,
-                pending_producers,
-                consumed_bindings,
-            )
-        }
-        HirExpr::Call(call) => {
-            expr_depends_on_any_pending_binding(
-                &call.callee,
-                binding_index,
-                pending_producers,
-                consumed_bindings,
-            ) || call.args.iter().any(|arg| {
-                expr_depends_on_any_pending_binding(
-                    arg,
-                    binding_index,
-                    pending_producers,
-                    consumed_bindings,
-                )
-            })
-        }
-        HirExpr::TableConstructor(table) => {
-            table.fields.iter().any(|field| match field {
-                crate::hir::common::HirTableField::Array(value) => {
-                    expr_depends_on_any_pending_binding(
-                        value,
-                        binding_index,
-                        pending_producers,
-                        consumed_bindings,
-                    )
-                }
-                crate::hir::common::HirTableField::Record(field) => {
-                    expr_depends_on_any_pending_binding(
-                        &field.value,
-                        binding_index,
-                        pending_producers,
-                        consumed_bindings,
-                    ) || matches!(
-                        &field.key,
-                        crate::hir::common::HirTableKey::Expr(key_expr)
-                            if expr_depends_on_any_pending_binding(
-                                key_expr,
-                                binding_index,
-                                pending_producers,
-                                consumed_bindings,
-                            )
-                    )
-                }
-            }) || table.trailing_multivalue.as_ref().is_some_and(|tail| {
-                expr_depends_on_any_pending_binding(
-                    tail.as_expr(),
-                    binding_index,
-                    pending_producers,
-                    consumed_bindings,
-                )
-            })
-        }
-        HirExpr::Decision(decision) => decision.nodes.iter().any(|node| {
-            expr_depends_on_any_pending_binding(
-                &node.test,
-                binding_index,
-                pending_producers,
-                consumed_bindings,
-            ) || match &node.truthy {
-                crate::hir::common::HirDecisionTarget::Expr(expr) => {
-                    expr_depends_on_any_pending_binding(
-                        expr,
-                        binding_index,
-                        pending_producers,
-                        consumed_bindings,
-                    )
-                }
-                crate::hir::common::HirDecisionTarget::Node(_)
-                | crate::hir::common::HirDecisionTarget::CurrentValue => false,
-            } || match &node.falsy {
-                crate::hir::common::HirDecisionTarget::Expr(expr) => {
-                    expr_depends_on_any_pending_binding(
-                        expr,
-                        binding_index,
-                        pending_producers,
-                        consumed_bindings,
-                    )
-                }
-                crate::hir::common::HirDecisionTarget::Node(_)
-                | crate::hir::common::HirDecisionTarget::CurrentValue => false,
-            }
-        }),
-        HirExpr::Closure(closure) => closure.captures.iter().any(|capture| {
-            expr_depends_on_any_pending_binding(
-                &capture.value,
-                binding_index,
-                pending_producers,
-                consumed_bindings,
-            )
-        }),
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => false,
-        HirExpr::TempRef(_) | HirExpr::LocalRef(_) => false,
-    }
+    expr_mentions_binding_where(expr, binding_index, |binding_id| {
+        producer_index_by_binding
+            .get(binding_id)
+            .is_some_and(Option::is_some)
+            && !consumed_bindings[binding_id]
+    })
 }
 
 /// 判断一个 producer-value 内联到 callee / access-base 位置后，经过后续

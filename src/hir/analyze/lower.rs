@@ -12,7 +12,7 @@ use super::bindings::build_bindings;
 use super::exprs::{expr_for_reg_at_block_exit, expr_for_ssa_value};
 use super::helpers::{assign_stmt, decode_raw_string, empty_proto, unresolved_expr};
 use super::short_circuit::{
-    recover_short_value_merge_expr_with_allowed_blocks, value_merge_candidates_in_block,
+    recover_short_value_merge_expr_recovery_with_allowed_blocks, value_merge_candidates_in_block,
 };
 use super::structure::build_structured_body;
 use crate::ast::AstTargetDialect;
@@ -44,6 +44,7 @@ pub(super) struct ProtoBindings {
     pub(super) captured_temp_decl_locals: BTreeMap<TempId, LocalId>,
     pub(super) capture_empty_local_decls: BTreeMap<usize, Vec<LocalId>>,
     pub(super) closure_capture_targets: BTreeMap<(usize, usize), BoundSlotTarget>,
+    pub(super) reference_captured_regs: Vec<bool>,
     pub(super) entry_local_regs: BTreeMap<Reg, LocalId>,
     pub(super) numeric_for_locals: BTreeMap<BlockRef, LocalId>,
     pub(super) generic_for_locals: BTreeMap<BlockRef, Vec<LocalId>>,
@@ -99,6 +100,13 @@ impl ProtoBindings {
         self.closure_capture_targets
             .get(&(instr_ref.index(), reg.index()))
             .copied()
+    }
+
+    pub(super) fn reg_is_reference_captured(&self, reg: Reg) -> bool {
+        self.reference_captured_regs
+            .get(reg.index())
+            .copied()
+            .unwrap_or(false)
     }
 }
 
@@ -566,9 +574,13 @@ pub(super) fn lower_phi_materialization_with_allowed_blocks_except(
             unreachable!("every phi id should have a temp binding");
         };
         covered_phi_ids.insert(phi_id);
-        let value =
-            recover_short_value_merge_expr_with_allowed_blocks(lowering, short, allowed_blocks)
-                .unwrap_or_else(|| unresolved_phi_expr("short-circuit value merge", merge, reg));
+        let value = recover_short_value_merge_expr_recovery_with_allowed_blocks(
+            lowering,
+            short,
+            allowed_blocks,
+        )
+        .and_then(|recovery| recovery.into_expr_without_subject_consumption())
+        .unwrap_or_else(|| unresolved_phi_expr("short-circuit value merge", merge, reg));
         stmts.push(assign_stmt(vec![HirLValue::Temp(temp)], vec![value]));
     }
 

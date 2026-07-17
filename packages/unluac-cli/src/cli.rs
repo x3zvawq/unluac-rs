@@ -212,14 +212,6 @@ struct CliArgs {
         help_heading = "Generate"
     )]
     luau_vector_size: Option<LuauVectorSize>,
-    /// Whether to prefer conservative source generation.
-    #[arg(
-        long,
-        value_name = "BOOL",
-        value_parser = BoolishValueParser::new(),
-        help_heading = "Generate"
-    )]
-    conservative_output: Option<bool>,
     /// Whether to emit generate-stage comments and metadata.
     #[arg(
         long,
@@ -445,9 +437,6 @@ where
             constructor: constructor.clone(),
             size,
         });
-    }
-    if let Some(value) = args.conservative_output {
-        decompile.generate.conservative_output = value;
     }
     if let Some(value) = args.comment {
         decompile.generate.comment = value;

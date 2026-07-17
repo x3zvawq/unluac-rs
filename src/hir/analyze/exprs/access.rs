@@ -5,6 +5,8 @@
 //! 例如：`GETTABLE r0, r1, "x"` 会先在这里变成 `r1.x` 对应的访问表达式骨架；
 //! `_ENV["end"]` 这类非法裸标识符仍保留表访问，不会伪装成 global。
 
+use std::collections::BTreeSet;
+
 use super::*;
 
 pub(crate) fn expr_for_value_operand(
@@ -15,21 +17,6 @@ pub(crate) fn expr_for_value_operand(
 ) -> HirExpr {
     match operand {
         ValueOperand::Reg(reg) => expr_for_reg_use(lowering, block, instr_ref, reg),
-        ValueOperand::Const(const_ref) => expr_for_const(lowering.proto, const_ref),
-        ValueOperand::Integer(value) => HirExpr::Integer(value),
-        ValueOperand::Nil => HirExpr::Nil,
-        ValueOperand::Boolean(value) => HirExpr::Boolean(value),
-    }
-}
-
-pub(crate) fn expr_for_value_operand_inline(
-    lowering: &ProtoLowering<'_>,
-    block: BlockRef,
-    instr_ref: InstrRef,
-    operand: ValueOperand,
-) -> HirExpr {
-    match operand {
-        ValueOperand::Reg(reg) => expr_for_reg_use_inline(lowering, block, instr_ref, reg),
         ValueOperand::Const(const_ref) => expr_for_const(lowering.proto, const_ref),
         ValueOperand::Integer(value) => HirExpr::Integer(value),
         ValueOperand::Nil => HirExpr::Nil,
@@ -347,24 +334,70 @@ pub(crate) fn global_name_for_access(
     base: AccessBase,
     key: AccessKey,
 ) -> Option<String> {
-    access_base_is_env(lowering, block, instr_ref, base)
-        .then(|| global_name_from_key(lowering, block, instr_ref, key))?
+    let name = global_name_from_key(lowering, block, instr_ref, key)?;
+    access_base_is_env(lowering, instr_ref, base, &name).then_some(name)
 }
 
 fn access_base_is_env(
     lowering: &ProtoLowering<'_>,
-    block: BlockRef,
     instr_ref: InstrRef,
     base: AccessBase,
+    name: &str,
 ) -> bool {
     match base {
         AccessBase::Env => true,
-        AccessBase::Reg(reg) => matches!(
-            expr_for_reg_use_inline(lowering, block, instr_ref, reg),
-            HirExpr::GlobalRef(global) if global.name == "_ENV"
-        ),
+        AccessBase::Reg(reg) => reg_use_is_env(lowering, instr_ref, reg, name),
         AccessBase::Upvalue(_) => false,
     }
+}
+
+fn reg_use_is_env(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, reg: Reg, name: &str) -> bool {
+    let access_block = lowering.cfg.instr_to_block[instr_ref.index()];
+    let mut value = lowering.dataflow.use_value(instr_ref, reg);
+    let mut seen = BTreeSet::new();
+    while let SsaValue::Def(def) = value {
+        if !seen.insert(def) || lowering.dataflow.def_block(def) != access_block {
+            return false;
+        }
+        let def_instr = lowering.dataflow.def_instr(def);
+        match &lowering.proto.instrs[def_instr.index()] {
+            LowInstr::GetUpvalue(get_upvalue) => {
+                return matches!(get_upvalue.src, UpvalueOperand::Env)
+                    && def_instr.index() < instr_ref.index()
+                    && (((def_instr.index() + 1)..instr_ref.index())
+                        .all(|index| lowering.dataflow.effect_summaries[index].tags.is_empty())
+                        || access_is_global_decl(lowering, instr_ref, name));
+            }
+            LowInstr::Move(move_instr) => {
+                value = lowering.dataflow.use_value(def_instr, move_instr.src);
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn access_is_global_decl(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, name: &str) -> bool {
+    let Some(previous) = instr_ref.index().checked_sub(1) else {
+        return false;
+    };
+    let (LowInstr::SetTable(_), LowInstr::ErrNil(err_nil)) = (
+        &lowering.proto.instrs[instr_ref.index()],
+        &lowering.proto.instrs[previous],
+    ) else {
+        return false;
+    };
+    let Some(RawLiteralConst::String(raw_name)) = err_nil.name.and_then(|const_ref| {
+        lowering
+            .proto
+            .constants
+            .common
+            .literals
+            .get(const_ref.index())
+    }) else {
+        return false;
+    };
+    decode_raw_string(raw_name) == name
 }
 
 fn global_name_from_key(

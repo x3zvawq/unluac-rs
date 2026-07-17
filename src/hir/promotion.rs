@@ -93,6 +93,12 @@ impl SlotEpochFacts {
             .and_then(Option::as_ref)
             .is_none_or(|flow| flow.spans_entry)
     }
+
+    pub(super) fn tracks_reference_capture(&self, reg: Reg) -> bool {
+        self.epochs_by_reg
+            .get(reg.index())
+            .is_some_and(Option::is_some)
+    }
 }
 
 fn analyze_slot_epoch(

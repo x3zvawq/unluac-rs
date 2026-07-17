@@ -296,7 +296,7 @@ fn flush_set_list_values_before_producer(
         if expr_mentions_any_pending_binding(
             front,
             context.binding_index,
-            &context.scratch.pending_producers,
+            &context.scratch.producer_index_by_binding,
         ) {
             return None;
         }

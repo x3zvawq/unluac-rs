@@ -187,15 +187,30 @@ pub(crate) fn expr_for_reg_use_inline(
     }
     match lowering.dataflow.use_value(instr_ref, reg) {
         SsaValue::Entry(entry_reg) => expr_for_entry_reg(lowering, entry_reg),
-        SsaValue::Def(def) => expr_for_dup_safe_fixed_def(lowering, def).unwrap_or_else(|| {
-            lowering
-                .bindings
-                .expr_for_temp(lowering.bindings.fixed_temps[def.index()])
-        }),
+        SsaValue::Def(def) => {
+            let temp = lowering.bindings.fixed_temps[def.index()];
+            if lowering.bindings.captured_temp_targets.contains_key(&temp) {
+                return lowering.bindings.expr_for_temp(temp);
+            }
+            expr_for_dup_safe_fixed_def(lowering, def)
+                .unwrap_or_else(|| lowering.bindings.expr_for_temp(temp))
+        }
         SsaValue::Phi(phi) => lowering
             .bindings
             .expr_for_temp(lowering.bindings.phi_temps[phi.index()]),
     }
+}
+
+/// dup-safe 重建会把表达式移到原定义之后；按引用捕获的寄存器可能在任意调用中改值，
+/// 因此只能由定义点 temp 保存快照，不能把当前 binding 重新读成旧 def 的操作数。
+pub(crate) fn expr_for_reg_use_dup_safe(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    reg: Reg,
+) -> Option<HirExpr> {
+    (!lowering.bindings.reg_is_reference_captured(reg))
+        .then(|| expr_for_reg_use_inline(lowering, block, instr_ref, reg))
 }
 
 /// `single-eval` 只承诺“这次求值可以直接表达出来”，并不承诺“可以重复复制很多次”。
@@ -220,29 +235,27 @@ pub(crate) fn expr_for_reg_use_single_eval_with_call_policy(
     match lowering.dataflow.use_value(instr_ref, reg) {
         SsaValue::Entry(entry_reg) => expr_for_entry_reg(lowering, entry_reg),
         SsaValue::Def(def) => {
+            let temp = lowering.bindings.fixed_temps[def.index()];
+            if lowering.bindings.captured_temp_targets.contains_key(&temp) {
+                return lowering.bindings.expr_for_temp(temp);
+            }
             if lowering.dataflow.def_block(def) != block {
-                return lowering
-                    .bindings
-                    .expr_for_temp(lowering.bindings.fixed_temps[def.index()]);
+                return lowering.bindings.expr_for_temp(temp);
             }
             if def_has_intervening_use(lowering, def, instr_ref) {
-                return lowering
-                    .bindings
-                    .expr_for_temp(lowering.bindings.fixed_temps[def.index()]);
+                return lowering.bindings.expr_for_temp(temp);
+            }
+            if def_has_intervening_observable_effect(lowering, def, instr_ref) {
+                return lowering.bindings.expr_for_temp(temp);
             }
             if def_is_call_consumed_by_non_branch(lowering, def, instr_ref)
                 && (!allow_call_consumed_by_pure_wrapper
                     || def_has_later_use_after_pure_wrapper(lowering, def, instr_ref))
             {
-                return lowering
-                    .bindings
-                    .expr_for_temp(lowering.bindings.fixed_temps[def.index()]);
+                return lowering.bindings.expr_for_temp(temp);
             }
-            expr_for_fixed_def_single_eval(lowering, def).unwrap_or_else(|| {
-                lowering
-                    .bindings
-                    .expr_for_temp(lowering.bindings.fixed_temps[def.index()])
-            })
+            expr_for_fixed_def_single_eval(lowering, def)
+                .unwrap_or_else(|| lowering.bindings.expr_for_temp(temp))
         }
         SsaValue::Phi(phi) => lowering
             .bindings
@@ -324,4 +337,14 @@ fn def_has_intervening_use(
                 .contains(reg)
         })
     })
+}
+
+fn def_has_intervening_observable_effect(
+    lowering: &ProtoLowering<'_>,
+    def: DefId,
+    consumer_instr: InstrRef,
+) -> bool {
+    let def_instr = lowering.dataflow.def_instr(def);
+    ((def_instr.index() + 1)..consumer_instr.index())
+        .any(|index| !lowering.dataflow.effect_summaries[index].tags.is_empty())
 }

@@ -17,7 +17,7 @@
 //! - 如果某个 hoisted temp 在声明点与候选下沉点之间已经被读取过，也不能把它下沉
 //!   成后置 `local`，否则 fallback/goto 回边会读到未初始化的局部变量
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::common::{
     AstBindingRef, AstBlock, AstLValue, AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl,
@@ -25,9 +25,9 @@ use super::super::common::{
 };
 use super::ReadabilityContext;
 use super::binding_flow::{
-    BindingRefSet, BindingUseIndex, binding_mentions_in_stmt, block_references_binding_set,
-    expr_references_any_binding, expr_references_binding_set, stmt_references_any_binding,
-    stmt_references_binding_set,
+    BindingRefSet, BindingUseIndex, binding_mentions_in_block, binding_mentions_in_expr,
+    block_references_binding_set, expr_references_any_binding, expr_references_binding_set,
+    stmt_references_any_binding, stmt_references_binding_set,
 };
 use super::expr_analysis::{expr_complexity, is_copy_like_expr};
 use super::visit::{self, AstVisitor};
@@ -313,17 +313,115 @@ struct NestedSinkAttempt {
     consumed: usize,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum NestedSinkOwner {
+    Blocked,
+    Then,
+    Else,
+    Body,
+}
+
+struct NestedSinkOwners(BTreeMap<AstBindingRef, NestedSinkOwner>);
+
+impl NestedSinkOwners {
+    fn new(stmt: &AstStmt) -> Option<Self> {
+        let mut owners = Self(BTreeMap::new());
+        let body = match stmt {
+            AstStmt::If(if_stmt) => {
+                owners.add(
+                    binding_mentions_in_expr(&if_stmt.cond),
+                    NestedSinkOwner::Blocked,
+                );
+                owners.add(
+                    binding_mentions_in_block(&if_stmt.then_block),
+                    NestedSinkOwner::Then,
+                );
+                if let Some(else_block) = &if_stmt.else_block {
+                    owners.add(binding_mentions_in_block(else_block), NestedSinkOwner::Else);
+                }
+                return Some(owners);
+            }
+            AstStmt::While(while_stmt) => {
+                owners.add(
+                    binding_mentions_in_expr(&while_stmt.cond),
+                    NestedSinkOwner::Blocked,
+                );
+                &while_stmt.body
+            }
+            AstStmt::Repeat(repeat_stmt) => {
+                owners.add(
+                    binding_mentions_in_expr(&repeat_stmt.cond),
+                    NestedSinkOwner::Blocked,
+                );
+                &repeat_stmt.body
+            }
+            AstStmt::NumericFor(numeric_for) => {
+                owners.add(
+                    binding_mentions_in_expr(&numeric_for.start)
+                        .into_iter()
+                        .chain(binding_mentions_in_expr(&numeric_for.limit))
+                        .chain(binding_mentions_in_expr(&numeric_for.step))
+                        .chain(std::iter::once(numeric_for.binding)),
+                    NestedSinkOwner::Blocked,
+                );
+                &numeric_for.body
+            }
+            AstStmt::GenericFor(generic_for) => {
+                owners.add(
+                    generic_for.bindings.iter().copied().chain(
+                        generic_for
+                            .iterator
+                            .iter()
+                            .flat_map(binding_mentions_in_expr),
+                    ),
+                    NestedSinkOwner::Blocked,
+                );
+                &generic_for.body
+            }
+            AstStmt::DoBlock(block) => block,
+            AstStmt::FunctionDecl(_)
+            | AstStmt::LocalFunctionDecl(_)
+            | AstStmt::LocalDecl(_)
+            | AstStmt::GlobalDecl(_)
+            | AstStmt::Assign(_)
+            | AstStmt::CallStmt(_)
+            | AstStmt::Return(_)
+            | AstStmt::Break
+            | AstStmt::Continue
+            | AstStmt::Goto(_)
+            | AstStmt::Label(_)
+            | AstStmt::Error(_) => return None,
+        };
+        owners.add(binding_mentions_in_block(body), NestedSinkOwner::Body);
+        Some(owners)
+    }
+
+    fn add(&mut self, bindings: impl IntoIterator<Item = AstBindingRef>, owner: NestedSinkOwner) {
+        for binding in bindings {
+            self.0
+                .entry(binding)
+                .and_modify(|current| {
+                    if *current != owner {
+                        *current = NestedSinkOwner::Blocked;
+                    }
+                })
+                .or_insert(owner);
+        }
+    }
+
+    fn owner(&self, binding: AstBindingRef) -> Option<NestedSinkOwner> {
+        self.0.get(&binding).copied()
+    }
+}
+
 fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
     pending: &[super::super::common::AstLocalBinding],
     stmt: &AstStmt,
     use_index: &BindingUseIndex,
     suffix_start: usize,
 ) -> Option<NestedSinkAttempt> {
-    if !stmt_can_accept_nested_hoisted_sink(stmt) {
-        return None;
-    }
+    let owners = NestedSinkOwners::new(stmt)?;
 
-    let mentions = binding_mentions_in_stmt(stmt);
     let mut start = 0usize;
     while start < pending.len() {
         if use_index.count_uses_in_suffix(suffix_start, pending[start].id) != 0 {
@@ -333,51 +431,56 @@ fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
 
         let run_start = start;
         let mut run_end = start;
-        let mut first_mentioned = None;
-        let mut mentioned_starts = Vec::new();
+        let mut mentioned_owners = Vec::new();
         while run_end < pending.len()
             && use_index.count_uses_in_suffix(suffix_start, pending[run_end].id) == 0
         {
-            if mentions.contains(&pending[run_end].id) {
-                if first_mentioned.is_none() {
-                    first_mentioned = Some(run_end);
-                    mentioned_starts.push(run_start);
-                }
-                if run_end != run_start {
-                    mentioned_starts.push(run_end);
-                }
+            if let Some(owner) = owners.owner(pending[run_end].id) {
+                mentioned_owners.push((run_end, owner));
             }
             run_end += 1;
         }
 
-        let Some(first_mentioned) = first_mentioned else {
+        let Some(&(_, first_owner)) = mentioned_owners.first() else {
             start = run_end;
             continue;
         };
 
-        // mention 集合这里只做候选缓存：跳过必不可能成功的无 mention 切片，
-        // 但仍保留从 sinkable run 起点整体下沉的既有行为。
-        mentioned_starts.sort_unstable();
-        mentioned_starts.dedup();
-        for slice_start in mentioned_starts {
-            let slice_end_min = if slice_start > first_mentioned {
-                slice_start + 1
+        let mut owner_ends = vec![run_end; mentioned_owners.len()];
+        for index in (0..mentioned_owners.len().saturating_sub(1)).rev() {
+            owner_ends[index] = if mentioned_owners[index].1 == mentioned_owners[index + 1].1 {
+                owner_ends[index + 1]
             } else {
-                first_mentioned + 1
+                mentioned_owners[index + 1].0
             };
-            for slice_end in (slice_end_min..=run_end).rev() {
-                if let Some((rewritten, consumed)) = try_sink_hoisted_decl_into_nested_stmt(
-                    &pending[slice_start..slice_end],
-                    stmt,
-                    use_index,
-                    suffix_start,
-                ) {
-                    return Some(NestedSinkAttempt {
-                        rewritten,
-                        start: slice_start,
-                        consumed,
-                    });
-                }
+        }
+
+        let candidates = std::iter::once((run_start, first_owner, owner_ends[0]))
+            .chain(
+                mentioned_owners
+                    .iter()
+                    .copied()
+                    .zip(owner_ends)
+                    .filter(|((index, _), _)| *index != run_start)
+                    .map(|((index, owner), end)| (index, owner, end)),
+            )
+            .filter(|(_, owner, _)| *owner != NestedSinkOwner::Blocked)
+            .map(|(index, _, end)| (index, end));
+
+        // 对每个真实 mention 起点只尝试 owner 改变前的最大切片。未提及 binding
+        // 继续随同该组下沉，以保留并行赋值的声明/RHS 词法边界。
+        for (slice_start, slice_end) in candidates {
+            if let Some((rewritten, consumed)) = try_sink_hoisted_decl_into_nested_stmt(
+                &pending[slice_start..slice_end],
+                stmt,
+                use_index,
+                suffix_start,
+            ) {
+                return Some(NestedSinkAttempt {
+                    rewritten,
+                    start: slice_start,
+                    consumed,
+                });
             }
         }
 

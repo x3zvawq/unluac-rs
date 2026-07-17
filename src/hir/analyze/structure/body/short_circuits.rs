@@ -605,6 +605,9 @@ impl StructuredBodyLowerer<'_, '_> {
             .copied()
             .filter(|consumed| *consumed != header)
         {
+            if self.block_prefix_has_non_condition_effects(consumed) {
+                return false;
+            }
             let Some(prefix) = self.lower_block_prefix(consumed, true, &target_overrides) else {
                 return false;
             };

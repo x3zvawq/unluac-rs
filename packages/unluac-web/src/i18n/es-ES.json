@@ -139,7 +139,6 @@
       "maxLineLength": "Longitud máxima de línea",
       "quoteStyle": "Estilo de comillas",
       "tableStyle": "Estilo de tabla",
-      "conservativeOutput": "Salida conservadora",
       "comment": "Emitir comentarios"
     },
     "tips": {
@@ -159,7 +158,6 @@
       "maxLineLength": "Longitud máxima de línea preferida para el código generado. CLI: --max-line-length",
       "quoteStyle": "Estilo de comillas para cadenas. prefer-double: preferir \"; prefer-single: preferir '; min-escape: minimizar escapes. CLI: --quote-style",
       "tableStyle": "Diseño del constructor de tablas. compact: línea única; balanced: automático; expanded: una entrada por línea. CLI: --table-style",
-      "conservativeOutput": "Habilitar modo de salida conservadora para código más seguro pero potencialmente más verboso. CLI: --conservative-output",
       "comment": "Si se emiten comentarios y metadatos en el código generado. CLI: --comment"
     },
     "share": {

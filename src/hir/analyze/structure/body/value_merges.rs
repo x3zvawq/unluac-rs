@@ -131,8 +131,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         }
         let should_use_statement_value_merge = would_duplicate_nontrivial_leaf;
-        if recover_short_value_merge_expr_with_allowed_blocks(self.lowering, short, &allowed_blocks)
-            .is_some()
+        if recover_short_value_merge_expr_recovery_with_allowed_blocks(
+            self.lowering,
+            short,
+            &allowed_blocks,
+        )
+        .is_some()
             && !should_use_statement_value_merge
         {
             return None;
@@ -296,14 +300,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return None;
         }
 
-        if recovery.consumes_header_subject() {
-            self.overrides
-                .suppress_instrs(consumed_value_merge_subject_instrs(self.lowering, block));
-        }
+        let phi_id = short.result_phi_id?;
+        let (expr, consumed_subject_instrs) = recovery.into_parts();
+        self.overrides
+            .suppress_instrs(consumed_subject_instrs.iter().copied());
+        self.overrides.insert_phi_expr(merge, phi_id, expr);
         stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
         self.visited.insert(block);
         self.visited.extend(value_merge_skipped_blocks(short));
-        self.merge_allowed_blocks.insert(merge, block);
         Some(Some(merge))
     }
 

@@ -63,7 +63,6 @@ export interface UnluacDecompileOptions {
     quoteStyle?: UnluacQuoteStyle;
     tableStyle?: UnluacTableStyle;
     luauVectorConstructor?: UnluacLuauVectorConstructor;
-    conservativeOutput?: boolean;
     comment?: boolean;
   };
 }

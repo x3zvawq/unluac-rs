@@ -218,6 +218,18 @@ impl DataflowFacts {
         }
     }
 
+    /// 判断固定定义的全部直接 use 是否都属于给定指令集合，且没有继续流入 phi。
+    pub(crate) fn def_uses_are_within(
+        &self,
+        def: DefId,
+        allowed_instrs: &BTreeSet<InstrRef>,
+    ) -> bool {
+        self.def_uses
+            .get(def.index())
+            .is_some_and(|uses| uses.iter().all(|site| allowed_instrs.contains(&site.instr)))
+            && self.def_phi_uses.get(def.index()).is_none_or(Vec::is_empty)
+    }
+
     /// 计算"真正死亡"的 phi 集合——既没有任何指令直接读取，也没有被任何存活 phi
     /// 的 incoming 间接引用。返回的 `BTreeSet<PhiId>` 中的 phi 可以安全地跳过物化。
     pub fn compute_truly_dead_phis(&self) -> BTreeSet<PhiId> {

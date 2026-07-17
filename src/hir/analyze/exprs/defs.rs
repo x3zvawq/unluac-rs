@@ -26,6 +26,32 @@ pub(crate) fn expr_for_fixed_def(lowering: &ProtoLowering<'_>, def_id: DefId) ->
     let instr = lowering.proto.instrs.get(def_instr.index())?;
 
     match instr {
+        LowInstr::GetUpvalue(get_upvalue) if get_upvalue.dst == def_reg => {
+            Some(lower_upvalue_operand_expr(lowering, get_upvalue.src))
+        }
+        LowInstr::UnaryOp(unary) if unary.dst == def_reg => {
+            Some(HirExpr::Unary(Box::new(HirUnaryExpr {
+                op: lower_unary_op(unary.op),
+                expr: expr_for_reg_use(lowering, def_block, def_instr, unary.src),
+            })))
+        }
+        LowInstr::BinaryOp(binary) if binary.dst == def_reg => {
+            Some(super::super::helpers::binary_expr(
+                lower_binary_op(binary.op),
+                expr_for_value_operand(lowering, def_block, def_instr, binary.lhs),
+                expr_for_value_operand(lowering, def_block, def_instr, binary.rhs),
+            ))
+        }
+        LowInstr::Concat(concat) if concat.dst == def_reg => {
+            Some(concat_expr((0..concat.src.len).map(|offset| {
+                expr_for_reg_use(
+                    lowering,
+                    def_block,
+                    def_instr,
+                    Reg(concat.src.start.index() + offset),
+                )
+            })))
+        }
         LowInstr::GetTable(get_table) if get_table.dst == def_reg => {
             Some(if get_table.kind == GetTableKind::Raw {
                 lower_raw_table_get_expr_inline(
@@ -97,6 +123,9 @@ pub(crate) fn expr_for_fixed_def_single_eval(
 
     match instr {
         LowInstr::Move(move_instr) if move_instr.dst == def_reg => {
+            if lowering.bindings.reg_is_reference_captured(move_instr.src) {
+                return None;
+            }
             let expr = expr_for_reg_use_single_eval_with_call_policy(
                 lowering,
                 def_block,
@@ -133,6 +162,9 @@ pub(crate) fn expr_for_fixed_def_single_eval(
             });
         }
         LowInstr::UnaryOp(unary) if unary.dst == def_reg => {
+            if lowering.bindings.reg_is_reference_captured(unary.src) {
+                return None;
+            }
             return Some(HirExpr::Unary(Box::new(HirUnaryExpr {
                 op: lower_unary_op(unary.op),
                 expr: expr_for_reg_use_single_eval_with_call_policy(
@@ -141,6 +173,19 @@ pub(crate) fn expr_for_fixed_def_single_eval(
             })));
         }
         LowInstr::BinaryOp(binary) if binary.dst == def_reg => {
+            if [binary.lhs, binary.rhs]
+                .into_iter()
+                .filter_map(|operand| match operand {
+                    ValueOperand::Reg(reg) => Some(reg),
+                    ValueOperand::Const(_)
+                    | ValueOperand::Integer(_)
+                    | ValueOperand::Nil
+                    | ValueOperand::Boolean(_) => None,
+                })
+                .any(|reg| lowering.bindings.reg_is_reference_captured(reg))
+            {
+                return None;
+            }
             return Some(super::super::helpers::binary_expr(
                 lower_binary_op(binary.op),
                 expr_for_value_operand_single_eval_pure_operand(
@@ -152,6 +197,12 @@ pub(crate) fn expr_for_fixed_def_single_eval(
             ));
         }
         LowInstr::Concat(concat) if concat.dst == def_reg => {
+            if (0..concat.src.len)
+                .map(|offset| Reg(concat.src.start.index() + offset))
+                .any(|reg| lowering.bindings.reg_is_reference_captured(reg))
+            {
+                return None;
+            }
             let value = concat_expr((0..concat.src.len).map(|offset| {
                 expr_for_reg_use_single_eval_with_call_policy(
                     lowering,
@@ -178,14 +229,17 @@ pub(crate) fn expr_for_dup_safe_fixed_def(
     let def_reg = lowering.dataflow.def_reg(def_id);
     let def_block = lowering.dataflow.def_block(def_id);
     let instr = lowering.proto.instrs.get(def_instr.index())?;
+    if !lowering.dataflow.effect_summaries[def_instr.index()]
+        .tags
+        .is_empty()
+    {
+        return None;
+    }
 
     match instr {
-        LowInstr::Move(move_instr) if move_instr.dst == def_reg => Some(expr_for_reg_use_inline(
-            lowering,
-            def_block,
-            def_instr,
-            move_instr.src,
-        )),
+        LowInstr::Move(move_instr) if move_instr.dst == def_reg => {
+            expr_for_reg_use_dup_safe(lowering, def_block, def_instr, move_instr.src)
+        }
         LowInstr::LoadNil(load_nil) if reg_in_range(load_nil.dst, def_reg) => Some(HirExpr::Nil),
         LowInstr::LoadBool(load_bool) if load_bool.dst == def_reg => {
             Some(HirExpr::Boolean(load_bool.value))
@@ -202,42 +256,16 @@ pub(crate) fn expr_for_dup_safe_fixed_def(
         LowInstr::UnaryOp(unary) if unary.dst == def_reg => {
             Some(HirExpr::Unary(Box::new(HirUnaryExpr {
                 op: lower_unary_op(unary.op),
-                expr: expr_for_reg_use_inline(lowering, def_block, def_instr, unary.src),
+                expr: expr_for_reg_use_dup_safe(lowering, def_block, def_instr, unary.src)?,
             })))
-        }
-        LowInstr::BinaryOp(binary) if binary.dst == def_reg => {
-            Some(super::super::helpers::binary_expr(
-                lower_binary_op(binary.op),
-                expr_for_value_operand_inline(lowering, def_block, def_instr, binary.lhs),
-                expr_for_value_operand_inline(lowering, def_block, def_instr, binary.rhs),
-            ))
-        }
-        LowInstr::Concat(concat) if concat.dst == def_reg => {
-            let value = concat_expr((0..concat.src.len).map(|offset| {
-                expr_for_reg_use_inline(
-                    lowering,
-                    def_block,
-                    def_instr,
-                    Reg(concat.src.start.index() + offset),
-                )
-            }));
-            Some(value)
-        }
-        LowInstr::GetUpvalue(get_upvalue) if get_upvalue.dst == def_reg => {
-            Some(lower_upvalue_operand_expr(lowering, get_upvalue.src))
         }
         LowInstr::GenericForPrep(prep) => prep
             .source_for_target(def_reg)
-            .map(|source| expr_for_reg_use_inline(lowering, def_block, def_instr, source)),
+            .and_then(|source| expr_for_reg_use_dup_safe(lowering, def_block, def_instr, source)),
         LowInstr::GenericForLoop(loop_instr)
             if loop_instr.control_target == def_reg && loop_instr.bindings.len != 0 =>
         {
-            Some(expr_for_reg_use_inline(
-                lowering,
-                def_block,
-                def_instr,
-                loop_instr.bindings.start,
-            ))
+            expr_for_reg_use_dup_safe(lowering, def_block, def_instr, loop_instr.bindings.start)
         }
         _ => None,
     }

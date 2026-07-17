@@ -72,56 +72,50 @@ pub(super) fn try_rebuild_constructor_region(
     scratch: &mut RebuildScratch,
 ) -> Option<(HirTableConstructor, usize)> {
     let mut steps = Vec::new();
+    let mut use_horizon: Option<usize> = None;
     let mut best_end = None;
     let mut committed_builder = ConstructorBuilder::from_constructor(constructor);
     let scan_stmts = &block.stmts[(seed_index + 1)..];
     for (offset, stmt) in scan_stmts.iter().enumerate() {
         let index = seed_index + 1 + offset;
         let remaining_uses = binding_occurrences.remaining_uses_after(stmt_ids[index]);
-        if keyed_write_step(stmt, binding) {
-            steps.push(RegionStep::Record { stmt_index: index });
-            let mut rebuild_context = RegionRebuildContext::new(
-                block,
-                binding_index,
-                remaining_uses,
-                materialized_binding_counts,
-                dialect,
-                scratch,
-            );
-            if try_extend_constructor_from_steps(
-                &mut committed_builder,
-                &steps,
-                &mut rebuild_context,
-            ) {
-                best_end = Some(index);
-                steps.clear();
+        let boundary_step = if keyed_write_step(stmt, binding) {
+            RegionStep::Record { stmt_index: index }
+        } else if let Some(producer_bindings) = producer_steps(stmt, index, binding, &mut steps) {
+            for producer_binding in producer_bindings {
+                let binding_id = binding_index
+                    .id_of(producer_binding)
+                    .expect("producer binding should be indexed");
+                if let Some(last_use) = binding_occurrences.last_use(binding_id) {
+                    use_horizon =
+                        Some(use_horizon.map_or(last_use, |horizon| horizon.max(last_use)));
+                }
             }
             continue;
-        }
-        if producer_steps(stmt, index, binding, &mut steps) {
+        } else if table_set_list_step(stmt, binding) {
+            RegionStep::SetList { stmt_index: index }
+        } else {
+            break;
+        };
+        steps.push(boundary_step);
+        // Producer 的最后一次 use 尚在 region 外时，本次事务必然因 remaining_uses
+        // 回滚；候选仍完整保留到 horizon，不能因其他失败原因提前丢弃。
+        if use_horizon.is_some_and(|horizon| stmt_ids[index] < horizon) {
             continue;
         }
-        if table_set_list_step(stmt, binding) {
-            steps.push(RegionStep::SetList { stmt_index: index });
-            let mut rebuild_context = RegionRebuildContext::new(
-                block,
-                binding_index,
-                remaining_uses,
-                materialized_binding_counts,
-                dialect,
-                scratch,
-            );
-            if try_extend_constructor_from_steps(
-                &mut committed_builder,
-                &steps,
-                &mut rebuild_context,
-            ) {
-                best_end = Some(index);
-                steps.clear();
-            }
-            continue;
+        let mut rebuild_context = RegionRebuildContext::new(
+            block,
+            binding_index,
+            remaining_uses,
+            materialized_binding_counts,
+            dialect,
+            scratch,
+        );
+        if try_extend_constructor_from_steps(&mut committed_builder, &steps, &mut rebuild_context) {
+            best_end = Some(index);
+            steps.clear();
+            use_horizon = None;
         }
-        break;
     }
 
     // 不要求“扫描到的最长前缀”整体可折叠。
@@ -148,7 +142,7 @@ pub(super) fn try_defer_open_set_list_owner(
     for (offset, stmt) in block.stmts[(seed_index + 1)..].iter().enumerate() {
         let stmt_index = seed_index + 1 + offset;
         ignored_steps.clear();
-        if producer_steps(stmt, stmt_index, binding, &mut ignored_steps) {
+        if producer_steps(stmt, stmt_index, binding, &mut ignored_steps).is_some() {
             continue;
         }
 
@@ -237,7 +231,7 @@ fn producer_steps(
     stmt_index: usize,
     constructor_binding: TableBinding,
     steps: &mut Vec<RegionStep>,
-) -> bool {
+) -> Option<Vec<TableBinding>> {
     match stmt {
         HirStmt::LocalDecl(local_decl) => producer_steps_from_bindings(
             local_decl
@@ -257,9 +251,7 @@ fn producer_steps(
                 .iter()
                 .map(binding_from_lvalue)
                 .collect::<Option<Vec<_>>>();
-            let Some(bindings) = bindings else {
-                return false;
-            };
+            let bindings = bindings?;
             producer_steps_from_bindings(
                 bindings,
                 &assign.values,
@@ -268,7 +260,7 @@ fn producer_steps(
                 steps,
             )
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -278,7 +270,7 @@ fn producer_steps_from_bindings(
     constructor_binding: TableBinding,
     stmt_index: usize,
     steps: &mut Vec<RegionStep>,
-) -> bool {
+) -> Option<Vec<TableBinding>> {
     if bindings.is_empty()
         || bindings.contains(&constructor_binding)
         || values.is_empty()
@@ -286,7 +278,7 @@ fn producer_steps_from_bindings(
             .iter()
             .any(|value| expr_uses_binding(value, constructor_binding))
     {
-        return false;
+        return None;
     }
 
     if values.tail.is_none() && bindings.len() == values.fixed.len() {
@@ -294,15 +286,15 @@ fn producer_steps_from_bindings(
             stmt_index,
             slot_index,
         }));
-        return true;
+        return Some(bindings);
     }
 
     if bindings.len() > 1 && values.fixed.is_empty() && values.tail.is_some() {
         steps.push(RegionStep::ProducerGroup { stmt_index });
-        return true;
+        return Some(bindings);
     }
 
-    false
+    None
 }
 
 fn table_set_list_step(stmt: &HirStmt, binding: TableBinding) -> bool {

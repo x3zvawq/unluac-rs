@@ -140,7 +140,6 @@
       "maxLineLength": "最大行寬",
       "quoteStyle": "引號風格",
       "tableStyle": "表建構器風格",
-      "conservativeOutput": "保守輸出模式",
       "comment": "產生註解"
     },
     "tips": {
@@ -159,7 +158,6 @@
       "maxLineLength": "產生程式碼的首選最大行寬。CLI: --max-line-length",
       "quoteStyle": "字串引號風格。prefer-double: 偏好雙引號；prefer-single: 偏好單引號；min-escape: 選擇最少跳脫的。CLI: --quote-style",
       "tableStyle": "表建構器排版風格。compact: 緊湊；balanced: 均衡；expanded: 展開。CLI: --table-style",
-      "conservativeOutput": "啟用保守輸出模式，產生更安全但可能更冗長的程式碼。CLI: --conservative-output",
       "comment": "是否在產生的程式碼中輸出註解和中繼資訊。CLI: --comment"
     },
     "share": {
