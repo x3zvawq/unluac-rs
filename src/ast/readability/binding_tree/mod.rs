@@ -1,18 +1,14 @@
 //! 当前函数体内 AST binding 树遍历的共享 helper。
 //!
 //! `binding_flow` 更偏向整段语句流上的 use-count / reachability 分析；这里则只处理
-//! 单棵 stmt/expr/lvalue 树上的递归查询与重写，并且故意不继续钻进嵌套函数体，
+//! 单棵 stmt/expr/lvalue 树上的递归查询，并且故意不继续钻进嵌套函数体，
 //! 避免把不同函数里碰巧同号的 binding 混成同一个局部变量。
-
-mod rewrite;
 
 use crate::ast::common::{
     AstBindingRef, AstCallKind, AstExpr, AstLValue, AstStmt, AstTableField, AstTableKey,
 };
 
-use super::binding_ref::{binding_from_name_ref, name_matches_binding};
-
-pub(super) use rewrite::replace_binding_use_in_expr;
+use super::binding_ref::name_matches_binding;
 
 pub(super) fn expr_references_binding(expr: &AstExpr, binding: AstBindingRef) -> bool {
     match expr {
@@ -68,110 +64,6 @@ pub(super) fn expr_references_binding(expr: &AstExpr, binding: AstBindingRef) ->
         | AstExpr::Complex { .. }
         | AstExpr::VarArg
         | AstExpr::Error(_) => false,
-    }
-}
-
-pub(super) fn count_name_expr_uses(expr: &AstExpr, binding: AstBindingRef) -> usize {
-    match expr {
-        AstExpr::Var(name) if name_matches_binding(name, binding) => 1,
-        AstExpr::FieldAccess(access) => count_name_expr_uses(&access.base, binding),
-        AstExpr::IndexAccess(access) => {
-            count_name_expr_uses(&access.base, binding)
-                + count_name_expr_uses(&access.index, binding)
-        }
-        AstExpr::Unary(unary) => count_name_expr_uses(&unary.expr, binding),
-        AstExpr::Binary(binary) => {
-            count_name_expr_uses(&binary.lhs, binding) + count_name_expr_uses(&binary.rhs, binding)
-        }
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            count_name_expr_uses(&logical.lhs, binding)
-                + count_name_expr_uses(&logical.rhs, binding)
-        }
-        AstExpr::Call(call) => {
-            count_name_expr_uses(&call.callee, binding)
-                + call
-                    .args
-                    .iter()
-                    .map(|arg| count_name_expr_uses(arg, binding))
-                    .sum::<usize>()
-        }
-        AstExpr::MethodCall(call) => {
-            count_name_expr_uses(&call.receiver, binding)
-                + call
-                    .args
-                    .iter()
-                    .map(|arg| count_name_expr_uses(arg, binding))
-                    .sum::<usize>()
-        }
-        AstExpr::SingleValue(expr) => count_name_expr_uses(expr, binding),
-        AstExpr::TableConstructor(table) => table
-            .fields
-            .iter()
-            .map(|field| match field {
-                AstTableField::Array(value) => count_name_expr_uses(value, binding),
-                AstTableField::Record(record) => {
-                    let key_uses = match &record.key {
-                        AstTableKey::Name(_) => 0,
-                        AstTableKey::Expr(key) => count_name_expr_uses(key, binding),
-                    };
-                    key_uses + count_name_expr_uses(&record.value, binding)
-                }
-            })
-            .sum(),
-        AstExpr::FunctionExpr(_)
-        | AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Vector(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::Var(_)
-        | AstExpr::VarArg
-        | AstExpr::Error(_) => 0,
-    }
-}
-
-pub(super) fn stmt_mentions_binding_target(stmt: &AstStmt, binding: AstBindingRef) -> bool {
-    match stmt {
-        AstStmt::LocalDecl(local_decl) => local_decl
-            .bindings
-            .iter()
-            .any(|local_binding| local_binding.id == binding),
-        AstStmt::Assign(assign) => assign
-            .targets
-            .iter()
-            .any(|target| lvalue_mentions_binding_target(target, binding)),
-        AstStmt::If(if_stmt) => {
-            block_mentions_binding_target(&if_stmt.then_block, binding)
-                || if_stmt
-                    .else_block
-                    .as_ref()
-                    .is_some_and(|else_block| block_mentions_binding_target(else_block, binding))
-        }
-        AstStmt::While(while_stmt) => block_mentions_binding_target(&while_stmt.body, binding),
-        AstStmt::Repeat(repeat_stmt) => block_mentions_binding_target(&repeat_stmt.body, binding),
-        AstStmt::NumericFor(numeric_for) => {
-            numeric_for.binding == binding
-                || block_mentions_binding_target(&numeric_for.body, binding)
-        }
-        AstStmt::GenericFor(generic_for) => {
-            generic_for.bindings.contains(&binding)
-                || block_mentions_binding_target(&generic_for.body, binding)
-        }
-        AstStmt::DoBlock(block) => block_mentions_binding_target(block, binding),
-        AstStmt::LocalFunctionDecl(function_decl) => function_decl.name == binding,
-        AstStmt::GlobalDecl(_)
-        | AstStmt::CallStmt(_)
-        | AstStmt::Return(_)
-        | AstStmt::FunctionDecl(_)
-        | AstStmt::Break
-        | AstStmt::Continue
-        | AstStmt::Goto(_)
-        | AstStmt::Label(_)
-        | AstStmt::Error(_) => false,
     }
 }
 
@@ -282,23 +174,6 @@ pub(super) fn stmt_has_nested_binding_value_use(stmt: &AstStmt, binding: AstBind
         call_has_nested_binding_use,
         |_, _| false,
     )
-}
-
-fn block_mentions_binding_target(
-    block: &crate::ast::common::AstBlock,
-    binding: AstBindingRef,
-) -> bool {
-    block
-        .stmts
-        .iter()
-        .any(|stmt| stmt_mentions_binding_target(stmt, binding))
-}
-
-fn lvalue_mentions_binding_target(lvalue: &AstLValue, binding: AstBindingRef) -> bool {
-    match lvalue {
-        AstLValue::Name(name) => binding_from_name_ref(name) == Some(binding),
-        AstLValue::FieldAccess(_) | AstLValue::IndexAccess(_) => false,
-    }
 }
 
 fn call_has_nested_binding_use(call: &AstCallKind, binding: AstBindingRef) -> bool {

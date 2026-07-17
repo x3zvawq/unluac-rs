@@ -269,7 +269,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // merge_allowed_blocks。这样 merge block 的 lower_phi_materialization
         // 才能在 SC 恢复时识别 header 内的 temp 为"安全可引用"，正确恢复
         // SC phi 的值表达式。
-        if let Some(sc) = value_merge_candidate_by_header(self.lowering, block)
+        if let Some(sc) = self.value_merge_candidate_by_header(block)
             && let ShortCircuitExit::ValueMerge(sc_merge) = sc.exit
             && branch_stop == Some(sc_merge)
         {
@@ -775,6 +775,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             continue_target: None,
             body_stop: Some(tail),
             continue_sources: BTreeSet::new(),
+            continue_entries: BTreeSet::new(),
             break_exits: BTreeMap::new(),
             goto_exits: BTreeSet::new(),
             state_slots: Vec::new(),

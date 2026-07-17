@@ -139,6 +139,14 @@ pub(super) fn collect_stmt_temp_uses(
     scratch.finish_summary()
 }
 
+pub(super) fn collect_expr_temp_uses_summary(
+    expr: &HirExpr,
+    scratch: &mut TempUseScratch,
+) -> TempUseSummary {
+    collect_expr_temp_uses(expr, scratch);
+    scratch.finish_summary()
+}
+
 fn collect_stmt_temp_uses_into(stmt: &HirStmt, scratch: &mut TempUseScratch) {
     match stmt {
         HirStmt::LocalDecl(local_decl) => {

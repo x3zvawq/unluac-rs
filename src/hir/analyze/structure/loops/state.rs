@@ -140,8 +140,8 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     target_overrides,
                 )
                 .or_else(|| {
-                    self.loop_exit_state_preheader_init(
-                        preheader,
+                    self.all_inside_loop_exit_state_init(
+                        candidate,
                         value,
                         |block| inside_exit_blocks.contains(&block),
                         target_overrides,

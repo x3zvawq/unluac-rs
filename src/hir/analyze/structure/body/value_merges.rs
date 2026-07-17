@@ -33,7 +33,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stmts: &mut Vec<HirStmt>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Option<BlockRef>> {
-        let short = value_merge_candidate_by_header(self.lowering, block)?;
+        let short = self.value_merge_candidate_by_header(block)?;
         let ShortCircuitExit::ValueMerge(merge) = short.exit else {
             return None;
         };
@@ -116,7 +116,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stmts: &mut Vec<HirStmt>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Option<BlockRef>> {
-        let short = value_merge_candidate_by_header(self.lowering, block)?;
+        let short = self.value_merge_candidate_by_header(block)?;
         let ShortCircuitExit::ValueMerge(merge) = short.exit else {
             return None;
         };
@@ -193,7 +193,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Vec<StatementValueMergeOutput<'b>>> {
         let mut outputs = Vec::new();
-        for candidate in &self.lowering.structure.short_circuit_candidates {
+        for candidate in self
+            .short_circuit_candidates_by_header
+            .get(&short.header)?
+            .iter()
+            .copied()
+        {
             if !same_statement_value_merge_tree(short, candidate) {
                 continue;
             }
@@ -258,7 +263,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stmts: &mut Vec<HirStmt>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Option<BlockRef>> {
-        let short = value_merge_candidate_by_header(self.lowering, block)?;
+        let short = self.value_merge_candidate_by_header(block)?;
         let ShortCircuitExit::ValueMerge(merge) = short.exit else {
             return None;
         };
@@ -328,7 +333,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         let mut cond = lower_short_circuit_subject(self.lowering, node.header)?;
         self.rewrite_expr_at_block_entry(node.header, &mut cond);
-        rewrite_expr_temps(&mut cond, &temp_expr_overrides(target_overrides));
+        rewrite_expr_temp_targets(&mut cond, target_overrides);
         let truthy = self.lower_value_merge_target(
             short,
             node.header,
@@ -481,7 +486,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return;
         };
         self.install_proven_target_phi_overrides(merge, target_overrides);
-        let Some(short) = value_merge_candidate_by_header(self.lowering, header) else {
+        let Some(short) = self.value_merge_candidate_by_header(header) else {
             return;
         };
         let ShortCircuitExit::ValueMerge(short_merge) = short.exit else {
@@ -549,6 +554,24 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         for (phi_id, reg, expr) in replacements {
             self.replace_phi_with_entry_expr(merge, phi_id, reg, expr);
         }
+    }
+
+    pub(super) fn value_merge_candidate_by_header(
+        &self,
+        header: BlockRef,
+    ) -> Option<&'b ShortCircuitCandidate> {
+        let mut candidates = self
+            .short_circuit_candidates_by_header
+            .get(&header)?
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                candidate.reducible && matches!(candidate.exit, ShortCircuitExit::ValueMerge(_))
+            });
+        let first = candidates.next()?;
+        candidates
+            .all(|candidate| same_value_merge_shape(first, candidate))
+            .then_some(first)
     }
 }
 

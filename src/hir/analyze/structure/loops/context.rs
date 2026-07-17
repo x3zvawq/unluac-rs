@@ -49,6 +49,11 @@ impl StructuredBodyLowerer<'_, '_> {
             break_exits.insert(exit, break_exit);
         }
         let continue_target = candidate.continue_target;
+        let continue_entries = candidate
+            .continue_edges
+            .iter()
+            .map(|edge| self.lowering.cfg.edges[edge.index()].to)
+            .collect();
         let mut continue_sources = if self.can_emit_continue_stmt() {
             candidate
                 .continue_edges
@@ -84,6 +89,7 @@ impl StructuredBodyLowerer<'_, '_> {
             continue_target,
             body_stop: None,
             continue_sources,
+            continue_entries,
             break_exits,
             goto_exits,
             state_slots: Vec::new(),

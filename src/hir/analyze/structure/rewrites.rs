@@ -73,9 +73,8 @@ pub(super) fn apply_loop_rewrites(
     // loop body 里某个 def 一旦被我们收成“稳定状态变量写回”，同 block 后面的 use
     // 也必须同步看到这个新身份；否则就会出现“target 已经是 l0，但后续读取还是 t2”
     // 这种半 SSA、半命令式的错误形状。
-    let expr_overrides = temp_expr_overrides(target_overrides);
     for stmt in stmts {
-        rewrite_stmt_exprs(stmt, &expr_overrides);
+        rewrite_stmt_temp_targets(stmt, target_overrides);
         rewrite_stmt_targets(stmt, target_overrides);
     }
 }
@@ -230,18 +229,31 @@ pub(super) fn rewrite_stmt_targets(
 }
 
 pub(super) fn rewrite_stmt_exprs(stmt: &mut HirStmt, expr_overrides: &BTreeMap<TempId, HirExpr>) {
+    rewrite_stmt_temps_with(stmt, &|temp| expr_overrides.get(&temp).cloned());
+}
+
+fn rewrite_stmt_temp_targets(stmt: &mut HirStmt, target_overrides: &BTreeMap<TempId, HirLValue>) {
+    rewrite_stmt_temps_with(stmt, &|temp| {
+        target_overrides.get(&temp).and_then(lvalue_as_expr)
+    });
+}
+
+fn rewrite_stmt_temps_with<F>(stmt: &mut HirStmt, replacement_for: &F)
+where
+    F: Fn(TempId) -> Option<HirExpr>,
+{
     traverse_hir_stmt_children!(
         stmt,
         iter = iter_mut,
         opt = as_mut,
         borrow = [&mut],
-        expr(e) => { rewrite_expr_temps(e, expr_overrides); },
-        tail_call(c) => { rewrite_call_expr_temps(c, expr_overrides); },
+        expr(e) => { rewrite_expr_temps_with(e, replacement_for); },
+        tail_call(c) => { rewrite_call_expr_temps_with(c, replacement_for); },
         lvalue(lv) => {
             traverse_hir_lvalue_children!(
                 lv,
                 borrow = [&mut],
-                expr(e) => { rewrite_expr_temps(e, expr_overrides); }
+                expr(e) => { rewrite_expr_temps_with(e, replacement_for); }
             );
         },
         block(_b) => {},
@@ -250,51 +262,74 @@ pub(super) fn rewrite_stmt_exprs(stmt: &mut HirStmt, expr_overrides: &BTreeMap<T
                 c,
                 iter = iter_mut,
                 borrow = [&mut],
-                expr(e) => { rewrite_expr_temps(e, expr_overrides); },
-                tail_call(c) => { rewrite_call_expr_temps(c, expr_overrides); }
+                expr(e) => { rewrite_expr_temps_with(e, replacement_for); },
+                tail_call(c) => { rewrite_call_expr_temps_with(c, replacement_for); }
             );
         },
-        condition(cond) => { rewrite_expr_temps(cond, expr_overrides); }
+        condition(cond) => { rewrite_expr_temps_with(cond, replacement_for); }
     );
 }
 
 pub(super) fn rewrite_expr_temps(expr: &mut HirExpr, expr_overrides: &BTreeMap<TempId, HirExpr>) {
-    rewrite_expr_temps_inner(expr, expr_overrides, &mut BTreeSet::new());
+    rewrite_expr_temps_with(expr, &|temp| expr_overrides.get(&temp).cloned());
 }
 
-fn rewrite_call_expr_temps(call: &mut HirCallExpr, expr_overrides: &BTreeMap<TempId, HirExpr>) {
-    let mut resolving = BTreeSet::new();
-    rewrite_call_expr_temps_inner(call, expr_overrides, &mut resolving);
-}
-
-fn rewrite_call_expr_temps_inner(
-    call: &mut HirCallExpr,
-    expr_overrides: &BTreeMap<TempId, HirExpr>,
-    resolving: &mut BTreeSet<TempId>,
+pub(super) fn rewrite_expr_temp_targets(
+    expr: &mut HirExpr,
+    target_overrides: &BTreeMap<TempId, HirLValue>,
 ) {
+    rewrite_expr_temps_with(expr, &|temp| {
+        target_overrides.get(&temp).and_then(lvalue_as_expr)
+    });
+}
+
+fn rewrite_expr_temps_with<F>(expr: &mut HirExpr, replacement_for: &F)
+where
+    F: Fn(TempId) -> Option<HirExpr>,
+{
+    rewrite_expr_temps_inner(expr, replacement_for, &mut BTreeSet::new());
+}
+
+fn rewrite_call_expr_temps_with<F>(call: &mut HirCallExpr, replacement_for: &F)
+where
+    F: Fn(TempId) -> Option<HirExpr>,
+{
+    let mut resolving = BTreeSet::new();
+    rewrite_call_expr_temps_inner(call, replacement_for, &mut resolving);
+}
+
+fn rewrite_call_expr_temps_inner<F>(
+    call: &mut HirCallExpr,
+    replacement_for: &F,
+    resolving: &mut BTreeSet<TempId>,
+) where
+    F: Fn(TempId) -> Option<HirExpr>,
+{
     traverse_hir_call_children!(
         call,
         iter = iter_mut,
         borrow = [&mut],
-        expr(e) => { rewrite_expr_temps_inner(e, expr_overrides, resolving); },
-        tail_call(c) => { rewrite_call_expr_temps_inner(c, expr_overrides, resolving); }
+        expr(e) => { rewrite_expr_temps_inner(e, replacement_for, resolving); },
+        tail_call(c) => { rewrite_call_expr_temps_inner(c, replacement_for, resolving); }
     );
 }
 
-fn rewrite_expr_temps_inner(
+fn rewrite_expr_temps_inner<F>(
     expr: &mut HirExpr,
-    expr_overrides: &BTreeMap<TempId, HirExpr>,
+    replacement_for: &F,
     resolving: &mut BTreeSet<TempId>,
-) {
+) where
+    F: Fn(TempId) -> Option<HirExpr>,
+{
     if let HirExpr::TempRef(temp) = expr
-        && let Some(replacement) = expr_overrides.get(temp)
+        && let Some(replacement) = replacement_for(*temp)
     {
         let temp = *temp;
         if !resolving.insert(temp) {
             return;
         }
-        *expr = replacement.clone();
-        rewrite_expr_temps_inner(expr, expr_overrides, resolving);
+        *expr = replacement;
+        rewrite_expr_temps_inner(expr, replacement_for, resolving);
         resolving.remove(&temp);
         return;
     }
@@ -303,17 +338,17 @@ fn rewrite_expr_temps_inner(
         expr,
         iter = iter_mut,
         borrow = [&mut],
-        expr(e) => { rewrite_expr_temps_inner(e, expr_overrides, resolving); },
+        expr(e) => { rewrite_expr_temps_inner(e, replacement_for, resolving); },
         call(c) => {
-            rewrite_call_expr_temps_inner(c, expr_overrides, resolving);
+            rewrite_call_expr_temps_inner(c, replacement_for, resolving);
         },
         decision(d) => {
             traverse_hir_decision_children!(
                 d,
                 iter = iter_mut,
                 borrow = [&mut],
-                expr(e) => { rewrite_expr_temps_inner(e, expr_overrides, resolving); },
-                condition(cond) => { rewrite_expr_temps_inner(cond, expr_overrides, resolving); }
+                expr(e) => { rewrite_expr_temps_inner(e, replacement_for, resolving); },
+                condition(cond) => { rewrite_expr_temps_inner(cond, replacement_for, resolving); }
             );
         },
         table_constructor(t) => {
@@ -322,9 +357,9 @@ fn rewrite_expr_temps_inner(
                 iter = iter_mut,
                 opt = as_mut,
                 borrow = [&mut],
-                expr(e) => { rewrite_expr_temps_inner(e, expr_overrides, resolving); },
+                expr(e) => { rewrite_expr_temps_inner(e, replacement_for, resolving); },
                 tail_call(c) => {
-                    rewrite_call_expr_temps_inner(c, expr_overrides, resolving);
+                    rewrite_call_expr_temps_inner(c, replacement_for, resolving);
                 }
             );
         }

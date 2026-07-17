@@ -50,6 +50,10 @@ pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<Inline
     }
 }
 
+pub(super) fn inline_site_in_repeat_condition(cond: &HirExpr, temp: TempId) -> Option<InlineSite> {
+    find_site_in_expr(cond, temp, InlineSite::LoopCondition)
+}
+
 pub(super) fn temp_precedes_observable_eval_in_stmt(
     stmt: &HirStmt,
     temp: TempId,
@@ -62,6 +66,20 @@ pub(super) fn temp_precedes_observable_eval_in_stmt(
         reference_captured,
     }
     .stmt(stmt)
+}
+
+pub(super) fn temp_precedes_observable_eval_in_expr(
+    expr: &HirExpr,
+    temp: TempId,
+    moved_value_is_observable: bool,
+    reference_captured: &ReferenceCapturedBindings,
+) -> bool {
+    EvalOrderProbe {
+        temp,
+        mutable_snapshots_are_barriers: moved_value_is_observable,
+        reference_captured,
+    }
+    .expr(expr)
 }
 
 struct EvalOrderProbe<'a> {

@@ -293,6 +293,11 @@ fn promote_block_with_child_protection(
             &child_uses_outer_temp,
         );
         changed |= stmt_changed;
+        if is_redundant_binding_self_assign(&stmt) {
+            changed = true;
+            temp_refs.leave_stmt(index);
+            continue;
+        }
         rewritten.push(stmt);
         temp_refs.leave_stmt(index);
     }
@@ -603,6 +608,19 @@ fn simple_temp_assign_target(stmt: &HirStmt) -> Option<TempId> {
         return None;
     }
     Some(*temp)
+}
+
+fn is_redundant_binding_self_assign(stmt: &HirStmt) -> bool {
+    let HirStmt::Assign(assign) = stmt else {
+        return false;
+    };
+    matches!(
+        (assign.targets.as_slice(), assign.values.fixed.as_slice(), &assign.values.tail),
+        ([HirLValue::Temp(target)], [HirExpr::TempRef(value)], None) if target == value
+    ) || matches!(
+        (assign.targets.as_slice(), assign.values.fixed.as_slice(), &assign.values.tail),
+        ([HirLValue::Local(target)], [HirExpr::LocalRef(value)], None) if target == value
+    )
 }
 
 fn alias_temp_for_group(stmt: &HirStmt, group: &BTreeSet<TempId>) -> Option<TempId> {

@@ -156,6 +156,9 @@ pub(super) fn try_rebuild_constructor_region(
             best_end = Some(index);
             steps.clear();
             use_horizon = None;
+        } else {
+            // horizon 已覆盖未来对现有 producer 的引用；后缀无法改写已失败的 segment。
+            break;
         }
     }
 

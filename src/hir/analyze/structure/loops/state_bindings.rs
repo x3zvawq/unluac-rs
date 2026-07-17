@@ -17,9 +17,9 @@ use super::*;
 use crate::structure::SsaValue;
 
 impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
-    pub(super) fn loop_exit_state_preheader_init<F>(
+    pub(super) fn all_inside_loop_exit_state_init<F>(
         &self,
-        preheader: Option<BlockRef>,
+        candidate: &LoopCandidate,
         value: &LoopValueMerge,
         is_inside: F,
         target_overrides: &BTreeMap<TempId, HirLValue>,
@@ -30,15 +30,26 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         if !loop_value_incoming_all_inside(value, is_inside) {
             return None;
         }
-        let preheader = preheader?;
-
         // 有些 generic/numeric for 会用“循环前默认值 + break pad 写入”的方式
         // 表达循环查找结果：`found = false; for ... do found = true; break end`。
-        // exit phi 的 incoming 全部来自 loop body 或 break pad 后，已经没有一个
-        // CFG predecessor 能代表“循环外初值”，但源码初值仍然在 preheader 出口。
-        // 这时把 preheader 出口值作为 loop state 初值，才能让 break pad 写回同一
-        // 个状态槽位，而不是在 post-loop 条件里留下孤立 phi temp。
-        let mut expr = expr_for_reg_at_block_exit(self.lowering, preheader, value.reg);
+        // exit phi 的 incoming 全部来自 loop body 或 break pad 后，已经没有一条
+        // exit incoming 能代表循环外初值；普通 loop 从 preheader 出口取值，入口
+        // block 自身是 header 时则消费 SSA 的虚拟函数入口值。
+        let mut expr = match candidate.preheader {
+            Some(preheader) => expr_for_reg_at_block_exit(self.lowering, preheader, value.reg),
+            None if candidate.header == self.lowering.cfg.entry_block
+                && self
+                    .lowering
+                    .dataflow
+                    .block_entry_value(candidate.header, value.reg)
+                    == SsaValue::Entry(value.reg) =>
+            {
+                // 入口 block 同时是 loop header 时，函数入口边只存在于 SSA 语义中；
+                // exit phi 即使全是 loop 内来边，初值仍是参数或入口栈槽。
+                self.loop_entry_initial_expr(value.reg)
+            }
+            None => return None,
+        };
         rewrite_expr_temps(&mut expr, &temp_expr_overrides(target_overrides));
         Some(expr)
     }

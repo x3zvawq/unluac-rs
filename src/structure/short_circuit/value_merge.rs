@@ -18,7 +18,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::structure::{BlockRef, Cfg, DataflowFacts, DominatorTree, GraphFacts, PhiCandidate};
+use crate::structure::{
+    BlockRef, Cfg, DataflowFacts, DominatorTree, GraphFacts, PhiCandidate, SsaValue,
+};
 use crate::transformer::LoweredProto;
 
 use super::super::common::{
@@ -41,12 +43,14 @@ pub(super) fn analyze_value_merge_candidates(
 ) -> Vec<ShortCircuitCandidate> {
     let mut candidates = Vec::new();
     let dom_tree = &graph_facts.dominator_tree;
+    let recursive_phis = recursive_phi_flags(dataflow);
     let build_ctx = ValueMergeBuildCtx {
         proto,
         cfg,
         dataflow,
         branch_by_header,
         dom_tree,
+        recursive_phis: &recursive_phis,
     };
 
     for phi in &dataflow.phi_candidates {
@@ -89,6 +93,7 @@ struct ValueMergeBuildCtx<'a> {
     dataflow: &'a DataflowFacts,
     branch_by_header: &'a BTreeMap<BlockRef, &'a BranchCandidate>,
     dom_tree: &'a DominatorTree,
+    recursive_phis: &'a [bool],
 }
 
 struct ValueMergeDagBuilder<'a> {
@@ -106,27 +111,20 @@ struct ValueMergeDagBuilder<'a> {
     value_leaves: BTreeSet<BlockRef>,
     value_leaf_predecessors: BTreeSet<BlockRef>,
     phi_predecessors: BTreeSet<BlockRef>,
-    phi_leaf_values: BTreeSet<crate::structure::SsaValue>,
+    value_leaf_values: BTreeMap<BlockRef, Option<SsaValue>>,
 }
 
 impl<'a> ValueMergeDagBuilder<'a> {
     fn new(ctx: &'a ValueMergeBuildCtx<'a>, root: BlockRef, phi: &'a PhiCandidate) -> Option<Self> {
-        let phi_value = crate::structure::SsaValue::Phi(phi.id);
-        if phi.incoming.iter().any(|incoming| {
-            incoming.pred.is_none() || ctx.dataflow.value_contains(incoming.value, phi_value)
-        }) {
+        if phi.incoming.iter().any(|incoming| incoming.pred.is_none())
+            || ctx.recursive_phis[phi.id.index()]
+        {
             return None;
         }
-
         let phi_predecessors = phi
             .incoming
             .iter()
             .filter_map(|incoming| incoming.pred)
-            .collect();
-        let phi_leaf_values = phi
-            .incoming
-            .iter()
-            .flat_map(|incoming| ctx.dataflow.leaf_values(incoming.value))
             .collect();
 
         Some(Self {
@@ -144,7 +142,7 @@ impl<'a> ValueMergeDagBuilder<'a> {
             value_leaves: BTreeSet::new(),
             value_leaf_predecessors: BTreeSet::new(),
             phi_predecessors,
-            phi_leaf_values,
+            value_leaf_values: BTreeMap::new(),
         })
     }
 
@@ -246,8 +244,7 @@ impl<'a> ValueMergeDagBuilder<'a> {
             if matches!(incoming.value, crate::structure::SsaValue::Entry(_)) {
                 return None;
             }
-            self.value_leaves.insert(from_header);
-            self.value_leaf_predecessors.insert(from_header);
+            self.record_value_leaf(from_header, from_header);
             return Some(ShortCircuitTarget::Value(from_header));
         }
 
@@ -275,8 +272,7 @@ impl<'a> ValueMergeDagBuilder<'a> {
                 let (carriers, predecessor) = terminal?;
                 self.blocks.extend(carriers);
                 self.blocks.insert(block);
-                self.value_leaves.insert(block);
-                self.value_leaf_predecessors.insert(predecessor);
+                self.record_value_leaf(block, predecessor);
                 Some(ShortCircuitTarget::Value(block))
             }
         }
@@ -325,6 +321,21 @@ impl<'a> ValueMergeDagBuilder<'a> {
             return false;
         }
 
+        if self.phi.incoming.iter().all(|incoming| {
+            incoming
+                .pred
+                .and_then(|pred| self.value_leaf_values.get(&pred).copied().flatten())
+                == Some(incoming.value)
+        }) {
+            return true;
+        }
+
+        let phi_leaf_values = self
+            .phi
+            .incoming
+            .iter()
+            .flat_map(|incoming| self.dataflow.leaf_values(incoming.value))
+            .collect::<BTreeSet<_>>();
         let leaf_values = self
             .value_leaves
             .iter()
@@ -333,6 +344,79 @@ impl<'a> ValueMergeDagBuilder<'a> {
                     .leaf_values(self.dataflow.block_exit_value(*leaf, self.phi.reg))
             })
             .collect::<BTreeSet<_>>();
-        leaf_values == self.phi_leaf_values
+        leaf_values == phi_leaf_values
     }
+
+    fn record_value_leaf(&mut self, leaf: BlockRef, predecessor: BlockRef) {
+        let value = self.dataflow.block_exit_value(leaf, self.phi.reg);
+        self.value_leaves.insert(leaf);
+        self.value_leaf_predecessors.insert(predecessor);
+        self.value_leaf_values
+            .entry(predecessor)
+            .and_modify(|known| {
+                if *known != Some(value) {
+                    *known = None;
+                }
+            })
+            .or_insert(Some(value));
+    }
+}
+
+/// Phi incoming 依赖若能回到自身，该 phi 就不是可安全展开的 value-merge 叶。
+/// 一次 SCC 标记替代为每个候选重复遍历整条历史 phi 链。
+fn recursive_phi_flags(dataflow: &DataflowFacts) -> Vec<bool> {
+    let phi_count = dataflow.phi_candidates.len();
+    let mut visited = vec![false; phi_count];
+    let mut postorder = Vec::with_capacity(phi_count);
+
+    for root in dataflow.phi_candidates.iter().map(|phi| phi.id) {
+        let mut pending = vec![(root, false)];
+        while let Some((phi_id, expanded)) = pending.pop() {
+            if expanded {
+                postorder.push(phi_id);
+                continue;
+            }
+            if std::mem::replace(&mut visited[phi_id.index()], true) {
+                continue;
+            }
+            pending.push((phi_id, true));
+            let phi = &dataflow.phi_candidates[phi_id.index()];
+            pending.extend(
+                phi.incoming
+                    .iter()
+                    .filter_map(|incoming| match incoming.value {
+                        SsaValue::Phi(dependency) => Some((dependency, false)),
+                        SsaValue::Entry(_) | SsaValue::Def(_) => None,
+                    }),
+            );
+        }
+    }
+
+    visited.fill(false);
+    let mut recursive = vec![false; phi_count];
+    for root in postorder.into_iter().rev() {
+        if visited[root.index()] {
+            continue;
+        }
+        let mut component = Vec::new();
+        let mut pending = vec![root];
+        while let Some(phi_id) = pending.pop() {
+            if std::mem::replace(&mut visited[phi_id.index()], true) {
+                continue;
+            }
+            component.push(phi_id);
+            pending.extend(dataflow.phi_consumer_ids(phi_id).iter().copied());
+        }
+        let is_recursive = component.len() > 1
+            || dataflow.phi_candidates[root.index()]
+                .incoming
+                .iter()
+                .any(|incoming| incoming.value == SsaValue::Phi(root));
+        if is_recursive {
+            for phi_id in component {
+                recursive[phi_id.index()] = true;
+            }
+        }
+    }
+    recursive
 }

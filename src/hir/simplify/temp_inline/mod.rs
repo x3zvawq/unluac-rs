@@ -8,7 +8,9 @@
 //! 相邻内联以可观察事件前缀而非语法子节点顺序判定：纯 local/param 读取本身不是
 //! 屏障，但读取结果形成的 temp 快照不能越过可能改写 binding 的事件；lookup、调用、
 //! 运算和 method sugar 的隐式 lookup 是屏障。while/repeat 条件还属于每轮重新求值的
-//! 独立区域，不能接收循环外快照。
+//! 独立区域，不能接收循环外快照。唯一的跨边界折叠是 repeat body 最后一条 temp 写入：
+//! 它和 until 条件属于同一轮，且只有在没有外部存活、自引用、capture 与绕过尾写入的
+//! 控制路径时，才能把 RHS 移入条件中的唯一消费点。
 
 mod mentioned;
 mod rewrite;
@@ -28,14 +30,16 @@ use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 use self::mentioned::NestedTempProtection;
 use self::rewrite::replace_temp_in_stmt;
 use self::site::{
-    InlineSite, expr_touches_temp, inline_site_in_stmt, is_stable_inline_value,
+    InlineSite, expr_touches_temp, inline_site_in_repeat_condition, inline_site_in_stmt,
+    is_stable_inline_value, temp_precedes_observable_eval_in_expr,
     temp_precedes_observable_eval_in_stmt,
 };
 use self::usage::{
-    NextStmtState, TempUseScratch, TempUseSummary, collect_stmt_temp_uses, inline_candidate,
-    max_temp_index_in_block,
+    NextStmtState, TempUseScratch, TempUseSummary, collect_expr_temp_uses_summary,
+    collect_stmt_temp_uses, inline_candidate, max_temp_index_in_block,
 };
-use super::mention::ReferenceCapturedBindings;
+use super::mention::{ReferenceCapturedBindings, stmt_writes_temp};
+use super::temp_touch::stmt_contains_nested_nonlocal_control;
 
 const NESTED_INLINE_MAX_COMPLEXITY: usize = 5;
 const CONTROL_HEAD_INLINE_MAX_COMPLEXITY: usize = 5;
@@ -526,7 +530,7 @@ fn inline_temps_in_nested_blocks(
             // 到已被消除的 temp。因此将 cond 里提及的所有 temp 加入保护集。
             let mut repeat_protected = protected_temps.clone();
             mentioned::collect_expr_mentioned_temps(&repeat_stmt.cond, &mut repeat_protected);
-            inline_temps_in_block(
+            let mut changed = inline_temps_in_block(
                 &mut repeat_stmt.body,
                 scratch,
                 reference_captured,
@@ -534,7 +538,17 @@ fn inline_temps_in_nested_blocks(
                 facts,
                 &repeat_protected,
                 inherited_captured_slots,
-            )
+            );
+            changed |= inline_repeat_tail_temp(
+                repeat_stmt,
+                scratch,
+                reference_captured,
+                readability,
+                facts,
+                protected_temps,
+                inherited_captured_slots,
+            );
+            changed
         }
         HirStmt::NumericFor(numeric_for) => inline_temps_in_block(
             &mut numeric_for.body,
@@ -576,6 +590,63 @@ fn inline_temps_in_nested_blocks(
         | HirStmt::Goto(_)
         | HirStmt::Label(_) => false,
     }
+}
+
+fn inline_repeat_tail_temp(
+    repeat_stmt: &mut crate::hir::common::HirRepeat,
+    scratch: &mut TempUseScratch,
+    reference_captured: &ReferenceCapturedBindings,
+    readability: ReadabilityOptions,
+    facts: &ProtoPromotionFacts,
+    protected_temps: &BTreeSet<TempId>,
+    inherited_captured_slots: &BTreeSet<HomeSlotKey>,
+) -> bool {
+    let Some(tail_index) = repeat_stmt.body.stmts.len().checked_sub(1) else {
+        return false;
+    };
+    let Some((temp, value)) = inline_candidate(&repeat_stmt.body.stmts[tail_index]) else {
+        return false;
+    };
+    if scratch.has_debug_local_hint(temp)
+        || protected_temps.contains(&temp)
+        || expr_touches_temp(value, temp)
+        || collect_expr_temp_uses_summary(&repeat_stmt.cond, scratch).count(temp) != 1
+    {
+        return false;
+    }
+    let Some(site) = inline_site_in_repeat_condition(&repeat_stmt.cond, temp) else {
+        return false;
+    };
+    if !site.allows(value, readability)
+        || expr_requires_ordered_snapshot(value)
+            && !temp_precedes_observable_eval_in_expr(
+                &repeat_stmt.cond,
+                temp,
+                expr_observes_eval_order(value),
+                reference_captured,
+            )
+    {
+        return false;
+    }
+
+    let mut captured_slots = inherited_captured_slots.clone();
+    for stmt in &repeat_stmt.body.stmts[..tail_index] {
+        if collect_stmt_temp_uses(stmt, scratch).count(temp) != 0
+            || stmt_writes_temp(stmt, temp)
+            || stmt_contains_nested_nonlocal_control(stmt)
+        {
+            return false;
+        }
+        facts.collect_captured_home_slots_in_stmt(stmt, &mut captured_slots);
+    }
+    if temp_rebinds_captured_slot(temp, facts, &captured_slots) {
+        return false;
+    }
+
+    let value = value.clone();
+    rewrite::replace_temp_in_expr(&mut repeat_stmt.cond, temp, &value);
+    repeat_stmt.body.stmts.pop();
+    true
 }
 
 fn temp_rebinds_captured_slot(

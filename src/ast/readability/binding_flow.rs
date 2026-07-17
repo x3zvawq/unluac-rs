@@ -202,10 +202,6 @@ pub(super) fn binding_mentions_in_expr(expr: &AstExpr) -> BTreeSet<AstBindingRef
     mentions
 }
 
-pub(super) fn count_binding_uses_in_stmt(stmt: &AstStmt, binding: AstBindingRef) -> usize {
-    count_binding_uses_in_stmt_with_scope(stmt, binding, BindingUseScope::CurrentFunctionOnly)
-}
-
 fn count_binding_uses_in_stmts_with_scope(
     stmts: &[AstStmt],
     binding: AstBindingRef,

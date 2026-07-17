@@ -197,10 +197,10 @@ impl StructuredBodyLowerer<'_, '_> {
             let loop_candidate = predecessor
                 .and_then(|preheader| {
                     lowerer
-                        .loop_candidates_for_header(block)
-                        .find_map(|(_, candidate)| {
-                            (candidate.preheader == Some(preheader)).then_some(candidate)
+                        .unique_loop_candidate_matching(block, |candidate| {
+                            candidate.preheader == Some(preheader)
                         })
+                        .map(|(_, candidate)| candidate)
                 })
                 .or_else(|| {
                     lowerer

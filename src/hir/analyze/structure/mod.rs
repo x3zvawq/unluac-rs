@@ -36,8 +36,7 @@ use super::short_circuit::{
     build_branch_short_circuit_plan_for_candidate, build_conditional_reassign_plan,
     expr_references_forbidden_candidate_temps, header_subject_is_value_carrier,
     lower_materialized_value_leaf_expr, lower_short_circuit_subject,
-    recover_short_value_merge_expr_recovery_with_allowed_blocks, value_merge_candidate_by_header,
-    value_merge_skipped_blocks,
+    recover_short_value_merge_expr_recovery_with_allowed_blocks, value_merge_skipped_blocks,
 };
 use super::{ProtoLowering, assign_stmt, branch_stmt, lower_branch_cond};
 use super::{
@@ -48,7 +47,7 @@ use body::*;
 use overrides::StructureOverrideState;
 use rewrites::{
     apply_loop_rewrites, expr_as_lvalue, install_def_target_overrides, lvalue_as_expr,
-    prune_identity_assignments, rewrite_expr_temps, rewrite_stmt_exprs, rewrite_stmt_targets,
+    prune_identity_assignments, rewrite_expr_temp_targets, rewrite_expr_temps, rewrite_stmt_exprs,
     shared_expr_for_defs, shared_lvalue_for_defs, temp_expr_overrides,
 };
 

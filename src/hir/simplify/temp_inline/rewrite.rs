@@ -94,7 +94,7 @@ fn replace_temp_in_lvalue(lvalue: &mut HirLValue, temp: TempId, replacement: &Hi
     }
 }
 
-fn replace_temp_in_expr(expr: &mut HirExpr, temp: TempId, replacement: &HirExpr) {
+pub(super) fn replace_temp_in_expr(expr: &mut HirExpr, temp: TempId, replacement: &HirExpr) {
     match expr {
         HirExpr::TempRef(other) if *other == temp => {
             *expr = replacement.clone();

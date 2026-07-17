@@ -17,7 +17,6 @@ mod global_decl_pretty;
 mod inline_exprs;
 mod installer_iife;
 mod local_scope_limit;
-mod loop_header_merge;
 mod luajit_goto_safety;
 mod materialize_temps;
 mod statement_merge;
@@ -64,7 +63,7 @@ pub(super) struct ReadabilityContext {
 /// 每个 pass 声明自己依赖和产出哪些标签，调度器根据 dirty set 决定哪些 pass 需要重跑。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum AstInvalidation {
-    /// 语句相邻关系变化（影响 statement-merge, loop-header-merge）。
+    /// 语句相邻关系变化（影响 statement-merge, inline-exprs）。
     StatementAdjacency,
     /// 控制流形状变化（影响 branch-pretty 及其下游）。
     ControlFlowShape,
@@ -101,8 +100,7 @@ use AstInvalidation::*;
 // 不必要的多轮迭代。调度器会根据 dirty set 自动跳过不相关的 pass。
 //
 // Normal phase 处理主要形状收敛：
-//   cleanup → statement-merge → loop-header-merge
-//   → branch-pretty → field-access-sugar → inline-exprs
+//   cleanup → statement-merge → branch-pretty → field-access-sugar → inline-exprs
 //
 // Deferred phase 在 Normal 全部收敛后执行终态物化和语法糖：
 //   temp-materialize → installer-iife → function-sugar → global-decl-pretty → luajit-goto-safety
@@ -127,12 +125,6 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
         phase: PassPhase::Normal,
         depends_on: &[StatementAdjacency, ControlFlowShape],
         invalidates: &[StatementAdjacency, ExprShape],
-    },
-    PassDescriptor {
-        name: "loop-header-merge",
-        phase: PassPhase::Normal,
-        depends_on: &[StatementAdjacency],
-        invalidates: &[StatementAdjacency, BindingStructure],
     },
     PassDescriptor {
         name: "branch-pretty",
@@ -198,9 +190,6 @@ const PASS_ENTRIES: &[ReadabilityPassEntry] = &[
     },
     ReadabilityPassEntry {
         apply: statement_merge::apply,
-    },
-    ReadabilityPassEntry {
-        apply: loop_header_merge::apply,
     },
     ReadabilityPassEntry {
         apply: branch_pretty::apply,

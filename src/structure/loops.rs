@@ -213,12 +213,14 @@ fn same_header_nested_outer_blocks(
         .instrs
         .start
         .index();
-    if inner_backedges.iter().any(|edge| {
-        let source = cfg.edges[edge.index()].from;
-        cfg.blocks[source.index()].instrs.end() > outer_only_start
-    }) {
-        // 反向布局更适合作为单个 sibling-latch loop 的规范形态；若编译器重排了
-        // 等价 CFG，这里只会保守合并候选，不以布局顺序证明源码层级。
+    if !inner.is_subset(&next.blocks)
+        && inner_backedges.iter().any(|edge| {
+            let source = cfg.edges[edge.index()].from;
+            cfg.blocks[source.index()].instrs.end() > outer_only_start
+        })
+    {
+        // 互不包含的 natural loops 需要用布局区分 sibling latch；严格包含链已经
+        // 由 block 集合证明内外层级，不能再因指令顺序把真实 nested loop 合并。
         return None;
     }
 

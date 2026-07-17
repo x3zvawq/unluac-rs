@@ -40,6 +40,8 @@ pub(super) struct StructuredBodyLowerer<'a, 'b> {
     pub(super) target: AstTargetDialect,
     pub(super) lowering: &'b ProtoLowering<'a>,
     pub(super) branch_regions_by_header: BTreeMap<BlockRef, &'b BranchRegionFact>,
+    pub(super) short_circuit_candidates_by_header:
+        BTreeMap<BlockRef, Vec<&'b ShortCircuitCandidate>>,
     pub(super) label_map: BTreeMap<BlockRef, HirLabelId>,
     pub(super) required_labels: TransactionalBlockSet,
     pub(super) merge_allowed_blocks: TransactionalBlockRelation,
@@ -89,6 +91,7 @@ pub(super) struct ActiveLoopContext {
     pub(super) continue_target: Option<BlockRef>,
     pub(super) body_stop: Option<BlockRef>,
     pub(super) continue_sources: BTreeSet<BlockRef>,
+    pub(super) continue_entries: BTreeSet<BlockRef>,
     pub(super) break_exits: BTreeMap<BlockRef, BreakExitBlock>,
     // 同一不可规约 island 内的侧出口仍会回流到 loop preheader，不能伪装成 break。
     pub(super) goto_exits: BTreeSet<BlockRef>,
@@ -262,6 +265,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             .iter()
             .map(|fact| (fact.header, fact))
             .collect();
+        let mut short_circuit_candidates_by_header = BTreeMap::<_, Vec<_>>::new();
+        for candidate in &lowering.structure.short_circuit_candidates {
+            short_circuit_candidates_by_header
+                .entry(candidate.header)
+                .or_default()
+                .push(candidate);
+        }
         let mut required_labels = TransactionalBlockSet::new(lowering.cfg.blocks.len());
         required_labels.extend(
             lowering
@@ -291,6 +301,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             target,
             lowering,
             branch_regions_by_header,
+            short_circuit_candidates_by_header,
             label_map: build_label_map_for_summary(lowering.cfg),
             required_labels,
             merge_allowed_blocks: TransactionalBlockRelation::default(),
@@ -809,13 +820,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // entry override 先把跨结构边界传入的 SSA 身份还原成既有值槽，再应用
         // target override。这样 `entry phi -> 外层 state` 的两段映射能在同一条
         // 物化语句里完整收敛，不会留下只在 SSA 图中存在的中间 temp。
-        if !target_overrides.is_empty() {
-            let phi_expr_overrides = temp_expr_overrides(target_overrides);
-            for stmt in &mut stmts {
-                rewrite_stmt_exprs(stmt, &phi_expr_overrides);
-                rewrite_stmt_targets(stmt, target_overrides);
-            }
-        }
+        apply_loop_rewrites(&mut stmts, target_overrides);
         for instr_index in self.block_prefix_instr_indices(block, expect_branch_terminator)? {
             let instr_ref = InstrRef(instr_index);
             let instr = &self.lowering.proto.instrs[instr_index];

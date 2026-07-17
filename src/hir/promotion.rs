@@ -7,17 +7,17 @@
 //! 词法槽位，不能继续沿用旧 upvalue 的 local。
 //!
 //! 这里专门把那份“temp -> home slot”事实从 analyze 阶段带给 simplify：
-//! - 它依赖 Dataflow 已经给出的 fixed def/reg 身份，以及 Transformer 保留下来的
-//!   `close from rX` 词法边界
+//! - 它依赖 Dataflow 已经给出的 fixed def/reg 与 phi incoming 身份，以及
+//!   Transformer 保留下来的 `close from rX` 词法边界
 //! - 它不会重新做结构恢复，也不会把事实暴露成公开 HIR API
 //! - 例子：`t0(slot 0, epoch 0)` 被闭包 capture 之后，后续同 epoch 的
-//!   `t7(slot 0, epoch 0)` 会被 locals 认成同一个源码 local 的写回；若中间经过
-//!   `close from r0`，后续 `t8(slot 0, epoch 1)` 会被视为新的词法槽位
+//!   `t7(slot 0, epoch 0)` 与同槽 phi 会被 locals 认成同一个源码 local 的写回；
+//!   若中间经过 `close from r0`，后续 `t8(slot 0, epoch 1)` 会被视为新的词法槽位
 
 use crate::hir::common::{
     HirBlock, HirExpr, HirLValue, HirStmt, HirTableField, HirTableKey, TempId,
 };
-use crate::structure::{BlockRef, Cfg, DataflowFacts, GraphFacts};
+use crate::structure::{BlockRef, Cfg, DataflowFacts, GraphFacts, PhiId, SsaValue};
 use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto, Reg};
 use std::collections::{BTreeSet, VecDeque};
 
@@ -233,6 +233,7 @@ impl ProtoPromotionFacts {
         let mut temp_home_slots = vec![None; total_temps];
 
         fill_fixed_def_home_slots(dataflow, slot_epochs, &mut temp_home_slots);
+        fill_phi_home_slots(dataflow, &mut temp_home_slots);
 
         Self { temp_home_slots }
     }
@@ -556,5 +557,115 @@ fn fill_fixed_def_home_slots(
     for def in &dataflow.defs {
         let epoch = slot_epochs.epoch_at(def.reg, def.instr);
         temp_home_slots[def.id.index()] = Some(HomeSlotKey::new(def.reg.index(), epoch));
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HomeSlotResolution {
+    Unknown,
+    Known(HomeSlotKey),
+    Conflict,
+}
+
+fn fill_phi_home_slots(dataflow: &DataflowFacts, temp_home_slots: &mut [Option<HomeSlotKey>]) {
+    let mut resolutions = vec![HomeSlotResolution::Unknown; dataflow.phi_candidates.len()];
+    let mut pending = dataflow
+        .phi_candidates
+        .iter()
+        .map(|phi| phi.id)
+        .collect::<VecDeque<_>>();
+
+    while let Some(phi_id) = pending.pop_front() {
+        let Some(phi) = dataflow.phi_candidate(phi_id) else {
+            continue;
+        };
+        let resolved =
+            phi.incoming
+                .iter()
+                .fold(HomeSlotResolution::Unknown, |current, incoming| {
+                    merge_home_slot_resolutions(
+                        current,
+                        home_slot_resolution_for_value(
+                            incoming.value,
+                            temp_home_slots,
+                            &resolutions,
+                        ),
+                    )
+                });
+        let Some(previous) = resolutions.get_mut(phi_id.index()) else {
+            continue;
+        };
+        if *previous == resolved {
+            continue;
+        }
+        *previous = resolved;
+        pending.extend(dataflow.phi_consumer_ids(phi_id).iter().copied());
+    }
+
+    // Unknown 只能在 phi 强连通分量内被同一已知槽位收敛。若某个已知候选
+    // 仍依赖最终未解的纯环，就没有证明它的全部 incoming 同槽，不得继承。
+    let mut unresolved = resolutions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, resolution)| {
+            (!matches!(resolution, HomeSlotResolution::Known(_))).then_some(PhiId(index))
+        })
+        .collect::<VecDeque<_>>();
+    while let Some(phi_id) = unresolved.pop_front() {
+        for consumer in dataflow.phi_consumer_ids(phi_id) {
+            let Some(resolution) = resolutions.get_mut(consumer.index()) else {
+                continue;
+            };
+            if matches!(resolution, HomeSlotResolution::Known(_)) {
+                *resolution = HomeSlotResolution::Conflict;
+                unresolved.push_back(*consumer);
+            }
+        }
+    }
+
+    let phi_temp_offset = dataflow.defs.len();
+    for (phi_index, resolution) in resolutions.into_iter().enumerate() {
+        if let HomeSlotResolution::Known(slot) = resolution
+            && let Some(home_slot) = temp_home_slots.get_mut(phi_temp_offset + phi_index)
+        {
+            *home_slot = Some(slot);
+        }
+    }
+}
+
+fn home_slot_resolution_for_value(
+    value: SsaValue,
+    temp_home_slots: &[Option<HomeSlotKey>],
+    phi_resolutions: &[HomeSlotResolution],
+) -> HomeSlotResolution {
+    match value {
+        SsaValue::Entry(reg) => HomeSlotResolution::Known(HomeSlotKey::new(reg.index(), 0)),
+        SsaValue::Def(def) => temp_home_slots
+            .get(def.index())
+            .copied()
+            .flatten()
+            .map_or(HomeSlotResolution::Unknown, HomeSlotResolution::Known),
+        SsaValue::Phi(phi) => phi_resolutions
+            .get(phi.index())
+            .copied()
+            .unwrap_or(HomeSlotResolution::Unknown),
+    }
+}
+
+fn merge_home_slot_resolutions(
+    left: HomeSlotResolution,
+    right: HomeSlotResolution,
+) -> HomeSlotResolution {
+    match (left, right) {
+        (HomeSlotResolution::Conflict, _) | (_, HomeSlotResolution::Conflict) => {
+            HomeSlotResolution::Conflict
+        }
+        (HomeSlotResolution::Unknown, known) | (known, HomeSlotResolution::Unknown) => known,
+        (HomeSlotResolution::Known(left), HomeSlotResolution::Known(right)) if left == right => {
+            HomeSlotResolution::Known(left)
+        }
+        (HomeSlotResolution::Known(_), HomeSlotResolution::Known(_)) => {
+            HomeSlotResolution::Conflict
+        }
     }
 }
