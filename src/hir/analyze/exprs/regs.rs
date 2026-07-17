@@ -242,10 +242,7 @@ pub(crate) fn expr_for_reg_use_single_eval_with_call_policy(
             if lowering.dataflow.def_block(def) != block {
                 return lowering.bindings.expr_for_temp(temp);
             }
-            if def_has_intervening_use(lowering, def, instr_ref) {
-                return lowering.bindings.expr_for_temp(temp);
-            }
-            if def_has_intervening_observable_effect(lowering, def, instr_ref) {
+            if def_has_intervening_barrier(lowering, def, instr_ref) {
                 return lowering.bindings.expr_for_temp(temp);
             }
             if def_is_call_consumed_by_non_branch(lowering, def, instr_ref)
@@ -320,7 +317,7 @@ fn def_has_later_use_after_pure_wrapper(
     false
 }
 
-fn def_has_intervening_use(
+fn def_has_intervening_barrier(
     lowering: &ProtoLowering<'_>,
     def: DefId,
     consumer_instr: InstrRef,
@@ -329,22 +326,11 @@ fn def_has_intervening_use(
     if def_instr.index() >= consumer_instr.index() {
         return false;
     }
-    let effect = &lowering.dataflow.instr_effects[def_instr.index()];
-    effect.fixed_must_defs.iter().any(|reg| {
-        ((def_instr.index() + 1)..consumer_instr.index()).any(|instr_index| {
-            lowering.dataflow.instr_effects[instr_index]
-                .fixed_uses
-                .contains(reg)
-        })
+    let defined_regs = &lowering.dataflow.instr_effects[def_instr.index()].fixed_must_defs;
+    ((def_instr.index() + 1)..consumer_instr.index()).any(|instr_index| {
+        !defined_regs.is_disjoint(&lowering.dataflow.instr_effects[instr_index].fixed_uses)
+            || !lowering.dataflow.effect_summaries[instr_index]
+                .tags
+                .is_empty()
     })
-}
-
-fn def_has_intervening_observable_effect(
-    lowering: &ProtoLowering<'_>,
-    def: DefId,
-    consumer_instr: InstrRef,
-) -> bool {
-    let def_instr = lowering.dataflow.def_instr(def);
-    ((def_instr.index() + 1)..consumer_instr.index())
-        .any(|index| !lowering.dataflow.effect_summaries[index].tags.is_empty())
 }

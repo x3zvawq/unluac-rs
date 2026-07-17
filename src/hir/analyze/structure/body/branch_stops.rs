@@ -106,12 +106,13 @@ impl StructuredBodyLowerer<'_, '_> {
                 .then_some(merge);
         }
 
-        self.lowering
+        let valid_candidates = self
+            .lowering
             .cfg
             .block_order
             .iter()
             .copied()
-            .find(|candidate| {
+            .filter(|candidate| {
                 self.can_reach(then_entry, *candidate)
                     && self.can_reach(else_entry, *candidate)
                     && self.branch_shared_continuation_candidate_is_valid(
@@ -122,6 +123,20 @@ impl StructuredBodyLowerer<'_, '_> {
                         region_stop,
                     )
             })
+            .collect::<Vec<_>>();
+        let mut nearest = *valid_candidates.first()?;
+        for candidate in valid_candidates.iter().copied().skip(1) {
+            if self.can_reach(candidate, nearest) && !self.can_reach(nearest, candidate) {
+                nearest = candidate;
+            }
+        }
+        valid_candidates
+            .into_iter()
+            .all(|candidate| {
+                candidate == nearest
+                    || (self.can_reach(nearest, candidate) && !self.can_reach(candidate, nearest))
+            })
+            .then_some(nearest)
     }
 
     fn branch_shared_continuation_candidate_is_valid(

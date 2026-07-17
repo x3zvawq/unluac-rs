@@ -32,7 +32,7 @@ use super::exprs::{
     expr_for_reg_at_block_exit, expr_for_reg_use,
 };
 use super::short_circuit::{
-    BranchShortCircuitPlan, build_branch_decision_expr_mixed_eval, build_branch_short_circuit_plan,
+    BranchShortCircuitPlan, build_branch_decision_expr_mixed_eval,
     build_branch_short_circuit_plan_for_candidate, build_conditional_reassign_plan,
     expr_references_forbidden_candidate_temps, header_subject_is_value_carrier,
     lower_materialized_value_leaf_expr, lower_short_circuit_subject,

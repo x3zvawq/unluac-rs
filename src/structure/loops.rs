@@ -146,8 +146,15 @@ fn group_same_header_natural_loops(
             groups.push((natural_loop.blocks.clone(), vec![natural_loop.backedge]));
             continue;
         }
-        if let Some(outer_blocks) = groups.last().and_then(|(inner_blocks, _)| {
-            same_header_nested_outer_blocks(proto, cfg, header, inner_blocks, natural_loop)
+        if let Some(outer_blocks) = groups.last().and_then(|(inner_blocks, inner_backedges)| {
+            same_header_nested_outer_blocks(
+                proto,
+                cfg,
+                header,
+                inner_blocks,
+                inner_backedges,
+                natural_loop,
+            )
         }) {
             groups.push((outer_blocks, vec![natural_loop.backedge]));
             continue;
@@ -168,6 +175,7 @@ fn same_header_nested_outer_blocks(
     cfg: &Cfg,
     header: BlockRef,
     inner: &BTreeSet<BlockRef>,
+    inner_backedges: &[EdgeRef],
     next: &crate::structure::NaturalLoop,
 ) -> Option<BTreeSet<BlockRef>> {
     let outer = inner.union(&next.blocks).copied().collect::<BTreeSet<_>>();
@@ -199,6 +207,18 @@ fn same_header_nested_outer_blocks(
         .filter(|block| outer.contains(block) && !inner.contains(block));
     let outer_only_successor = outer_only_successors.next()?;
     if outer_only_successors.next().is_some() {
+        return None;
+    }
+    let outer_only_start = cfg.blocks[outer_only_successor.index()]
+        .instrs
+        .start
+        .index();
+    if inner_backedges.iter().any(|edge| {
+        let source = cfg.edges[edge.index()].from;
+        cfg.blocks[source.index()].instrs.end() > outer_only_start
+    }) {
+        // 反向布局更适合作为单个 sibling-latch loop 的规范形态；若编译器重排了
+        // 等价 CFG，这里只会保守合并候选，不以布局顺序证明源码层级。
         return None;
     }
 
@@ -468,8 +488,8 @@ pub(super) fn refine_short_circuit_repeat_candidates(
         candidate.continue_target = Some(continue_target);
         candidate.condition_header = condition_header;
         candidate.body_scope_blocks = loop_body_scope(
-            candidate.kind_hint,
-            candidate.continue_target,
+            proto,
+            (candidate.kind_hint, candidate.continue_target),
             &candidate.blocks,
             &candidate.exits,
             candidate.header,
@@ -773,8 +793,8 @@ fn refine_ambiguous_repeat_candidates(
             continue;
         };
         let repeat_body_scope = loop_body_scope(
-            LoopKindHint::RepeatLike,
-            Some(continue_target),
+            proto,
+            (LoopKindHint::RepeatLike, Some(continue_target)),
             &candidate.blocks,
             &candidate.exits,
             candidate.header,
@@ -854,8 +874,8 @@ fn refine_nested_for_exit_loops(
         // 以 return 结束，就把外层 retry loop 伪装成没有普通出口的 while true。
         candidate.kind_hint = LoopKindHint::Unknown;
         candidate.body_scope_blocks = loop_body_scope(
-            candidate.kind_hint,
-            candidate.continue_target,
+            proto,
+            (candidate.kind_hint, candidate.continue_target),
             &candidate.blocks,
             &candidate.exits,
             candidate.header,
@@ -970,6 +990,7 @@ fn reachable_numeric_for_loop(
             cfg,
             dataflow,
             &candidate.exits,
+            &candidate.blocks,
             &candidate.blocks,
         );
     }
@@ -1096,15 +1117,16 @@ fn build_loop_candidate(
         header_value_merges: &header_value_merges,
     });
     let body_scope_blocks = loop_body_scope(
-        kind_hint,
-        continue_target,
+        proto,
+        (kind_hint, continue_target),
         &blocks,
         &exits,
         header,
         cfg,
         graph_facts,
     );
-    let exit_value_merges = analyze_loop_exit_value_merges(proto, cfg, dataflow, &exits, &blocks);
+    let exit_value_merges =
+        analyze_loop_exit_value_merges(proto, cfg, dataflow, &exits, &blocks, &blocks);
 
     LoopCandidate {
         header,
@@ -1184,8 +1206,8 @@ fn degenerate_numeric_for_loop(
         return None;
     }
     let body_scope_blocks = loop_body_scope(
-        LoopKindHint::NumericForLike,
-        Some(latch),
+        proto,
+        (LoopKindHint::NumericForLike, Some(latch)),
         &blocks,
         &exits,
         header,
@@ -1206,7 +1228,9 @@ fn degenerate_numeric_for_loop(
         kind_hint: LoopKindHint::NumericForLike,
         source_bindings: Some(LoopSourceBindings::Numeric(init.binding)),
         header_value_merges: analyze_loop_header_value_merges(dataflow, header, &blocks),
-        exit_value_merges: analyze_loop_exit_value_merges(proto, cfg, dataflow, &exits, &blocks),
+        exit_value_merges: analyze_loop_exit_value_merges(
+            proto, cfg, dataflow, &exits, &blocks, &blocks,
+        ),
         blocks,
     })
 }
@@ -1323,8 +1347,8 @@ fn degenerate_generic_for_loop(
         return None;
     }
     let body_scope_blocks = loop_body_scope(
-        LoopKindHint::GenericForLike,
-        Some(header),
+        proto,
+        (LoopKindHint::GenericForLike, Some(header)),
         &blocks,
         &exits,
         header,
@@ -1339,7 +1363,7 @@ fn degenerate_generic_for_loop(
     let mut body_blocks = blocks.clone();
     body_blocks.remove(&header);
     let exit_value_merges =
-        analyze_loop_exit_value_merges(proto, cfg, dataflow, &exits, &body_blocks);
+        analyze_loop_exit_value_merges(proto, cfg, dataflow, &exits, &body_blocks, &blocks);
 
     Some(LoopCandidate {
         header,
@@ -1569,14 +1593,15 @@ fn generic_for_source_bindings(
 /// for 的 LoopExit 与 repeat 尾条件的循环外后继都是词法边界。while/while-true 不做
 /// 扩张，避免把普通 post-loop 和后续 sibling loop 误纳入当前 body。
 fn loop_body_scope(
-    kind_hint: LoopKindHint,
-    continue_target: Option<BlockRef>,
+    proto: &LoweredProto,
+    shape: (LoopKindHint, Option<BlockRef>),
     body_blocks: &BTreeSet<BlockRef>,
     exits: &BTreeSet<BlockRef>,
     header: BlockRef,
     cfg: &Cfg,
     graph_facts: &GraphFacts,
 ) -> BTreeSet<BlockRef> {
+    let (kind_hint, continue_target) = shape;
     if !matches!(
         kind_hint,
         LoopKindHint::NumericForLike | LoopKindHint::GenericForLike | LoopKindHint::RepeatLike
@@ -1605,7 +1630,7 @@ fn loop_body_scope(
                 .filter(|target| !body_blocks.contains(target)),
         );
     }
-    if let Some(shared_successor) = shared_exit_continuation(exits, cfg) {
+    if let Some((shared_successor, _)) = shared_exit_continuation(proto, exits, cfg) {
         scope_boundaries.insert(shared_successor);
     }
 
@@ -1630,25 +1655,48 @@ fn loop_body_scope(
     scope
 }
 
-fn shared_exit_continuation(exits: &BTreeSet<BlockRef>, cfg: &Cfg) -> Option<BlockRef> {
+fn shared_exit_continuation(
+    proto: &LoweredProto,
+    exits: &BTreeSet<BlockRef>,
+    cfg: &Cfg,
+) -> Option<(BlockRef, BTreeSet<BlockRef>)> {
     if exits.len() < 2 {
         return None;
     }
-    let first = *exits.first()?;
-    let first_successor = cfg.unique_reachable_successor(first);
-    let is_shared = |continuation| {
-        exits.iter().copied().all(|exit| {
-            exit == continuation || cfg.unique_reachable_successor(exit) == Some(continuation)
-        })
+    let paths = exits
+        .iter()
+        .copied()
+        .map(|exit| loop_exit_continuation_path(proto, cfg, exit))
+        .collect::<Vec<_>>();
+    let others = paths[1..]
+        .iter()
+        .map(|path| path.iter().copied().collect::<BTreeSet<_>>())
+        .collect::<Vec<_>>();
+    let merge =
+        paths.first()?.iter().copied().find(|block| {
+            *block != cfg.exit_block && others.iter().all(|path| path.contains(block))
+        })?;
+    let path_blocks = paths
+        .iter()
+        .flat_map(|path| path.iter().copied().take_while(|block| *block != merge))
+        .collect();
+    Some((merge, path_blocks))
+}
+
+fn loop_exit_continuation_path(proto: &LoweredProto, cfg: &Cfg, exit: BlockRef) -> Vec<BlockRef> {
+    let mut path = vec![exit];
+    let mut seen = BTreeSet::from([exit]);
+    let Some(mut cursor) = cfg.unique_reachable_successor(exit) else {
+        return path;
     };
-    match first_successor {
-        Some(successor) if successor != first => match (is_shared(first), is_shared(successor)) {
-            (true, false) => Some(first),
-            (false, true) => Some(successor),
-            _ => None,
-        },
-        _ => is_shared(first).then_some(first),
+    while seen.insert(cursor) {
+        path.push(cursor);
+        let Some(next) = transparent_loop_exit_target(proto, cfg, cursor) else {
+            break;
+        };
+        cursor = next;
     }
+    path
 }
 
 fn loop_binding_early_exit_scope(
@@ -1697,19 +1745,21 @@ fn analyze_loop_exit_value_merges(
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     exits: &BTreeSet<BlockRef>,
-    loop_blocks: &BTreeSet<BlockRef>,
+    value_inside_blocks: &BTreeSet<BlockRef>,
+    exit_owner_blocks: &BTreeSet<BlockRef>,
 ) -> Vec<LoopExitValueMergeCandidate> {
-    let shared_merge = shared_loop_exit_merge(proto, cfg, exits, loop_blocks);
+    let shared_merge = shared_loop_exit_merge(proto, cfg, exits, exit_owner_blocks);
+    let shared_merge_block = shared_merge.as_ref().map(|(block, _)| *block);
     let mut candidates = exits
         .iter()
         .copied()
-        .filter(|exit| Some(*exit) != shared_merge)
-        .filter_map(|exit| loop_exit_value_merge_in_block(dataflow, exit, loop_blocks))
+        .filter(|exit| Some(*exit) != shared_merge_block)
+        .filter_map(|exit| loop_exit_value_merge_in_block(dataflow, exit, value_inside_blocks))
         .collect::<Vec<_>>();
 
-    if let Some(shared_merge) = shared_merge {
-        let mut ownership_blocks = loop_blocks.clone();
-        ownership_blocks.extend(exits.iter().copied().filter(|exit| *exit != shared_merge));
+    if let Some((shared_merge, path_blocks)) = shared_merge {
+        let mut ownership_blocks = value_inside_blocks.clone();
+        ownership_blocks.extend(path_blocks);
         if let Some(candidate) =
             loop_exit_value_merge_in_block(dataflow, shared_merge, &ownership_blocks)
         {
@@ -1736,42 +1786,29 @@ fn shared_loop_exit_merge(
     proto: &LoweredProto,
     cfg: &Cfg,
     exits: &BTreeSet<BlockRef>,
-    loop_blocks: &BTreeSet<BlockRef>,
-) -> Option<BlockRef> {
+    exit_owner_blocks: &BTreeSet<BlockRef>,
+) -> Option<(BlockRef, BTreeSet<BlockRef>)> {
     if exits.len() < 2 {
         return None;
     }
     // 出口块自身可以写回 live-out；只要它们直接汇入同一 block，merge 的 incoming
     // 仍完整对应这些出口。透明性只约束继续跨越的中间 pad，不能反过来丢掉直接合流。
-    let merge = shared_exit_continuation(exits, cfg).or_else(|| {
-        let mut common = None::<BTreeSet<BlockRef>>;
-        for exit in exits.iter().copied() {
-            let mut reachable = BTreeSet::from([exit]);
-            if let Some(target) = transparent_loop_exit_target(proto, cfg, exit) {
-                reachable.insert(target);
-            }
-            common = Some(match common {
-                Some(common) => common.intersection(&reachable).copied().collect(),
-                None => reachable,
-            });
-        }
-        let mut common = common?.into_iter().filter(|block| *block != cfg.exit_block);
-        let merge = common.next()?;
-        common.next().is_none().then_some(merge)
-    })?;
+    let continuation = shared_exit_continuation(proto, exits, cfg)?;
+    let path_blocks = &continuation.1;
 
     // ownership_blocks 会把这些 predecessor 的完整输出视为 loop 内值；只要某个块还能
     // 从循环外进入，它的输出就可能已经混合外部路径，不能再整项交给 loop owner。
-    exits
+    path_blocks
         .iter()
-        .filter(|exit| **exit != merge)
-        .all(|exit| {
-            cfg.preds[exit.index()].iter().all(|edge| {
+        .all(|block| {
+            cfg.preds[block.index()].iter().all(|edge| {
                 let pred = cfg.edges[edge.index()].from;
-                !cfg.reachable_blocks.contains(&pred) || loop_blocks.contains(&pred)
+                !cfg.reachable_blocks.contains(&pred)
+                    || exit_owner_blocks.contains(&pred)
+                    || path_blocks.contains(&pred)
             })
         })
-        .then_some(merge)
+        .then_some(continuation)
 }
 
 pub(super) fn transparent_loop_exit_target(

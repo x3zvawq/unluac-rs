@@ -802,6 +802,7 @@ impl<'a> ProtoLowerer<'a> {
                             },
                         );
                     } else {
+                        self.pending_methods.invalidate_reg(reg_from_u8(a));
                         let move_low = self.lowering.next_low_index();
                         self.emit(
                             Some(raw_index),

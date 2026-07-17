@@ -19,16 +19,37 @@ impl StructuredBodyLowerer<'_, '_> {
             return None;
         }
 
-        let short = self
+        let mut plans = self
             .lowering
             .structure
             .short_circuit_candidates
             .iter()
-            .find(|candidate| {
+            .filter(|candidate| {
                 candidate.header == block
                     && candidate.reducible
                     && matches!(candidate.exit, ShortCircuitExit::BranchExit { .. })
-            })?;
+            })
+            .filter_map(|short| {
+                self.branch_exit_value_assignment_plan(short, stop, target_overrides)
+            });
+        let (short_blocks, value_leaf, cond, value_stmts) = plans.next()?;
+        if plans.next().is_some() {
+            return None;
+        }
+
+        stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
+        self.visited.extend(short_blocks);
+        self.visited.insert(value_leaf);
+        stmts.push(branch_stmt(cond, HirBlock { stmts: value_stmts }, None));
+        Some(Some(stop))
+    }
+
+    fn branch_exit_value_assignment_plan(
+        &self,
+        short: &ShortCircuitCandidate,
+        stop: BlockRef,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<(BTreeSet<BlockRef>, BlockRef, HirExpr, Vec<HirStmt>)> {
         let ShortCircuitExit::BranchExit { truthy, falsy } = short.exit else {
             return None;
         };
@@ -53,7 +74,7 @@ impl StructuredBodyLowerer<'_, '_> {
             return None;
         }
 
-        let allowed_blocks = BTreeSet::from([block]);
+        let allowed_blocks = BTreeSet::from([short.header]);
         let decision = build_branch_decision_expr_mixed_eval(
             self.lowering,
             short,
@@ -72,11 +93,7 @@ impl StructuredBodyLowerer<'_, '_> {
         }
         rewrite_expr_temps(&mut cond, &temp_expr_overrides(target_overrides));
 
-        stmts.extend(self.lower_block_prefix(block, true, target_overrides)?);
-        self.visited.extend(short.blocks.iter().copied());
-        self.visited.insert(value_leaf);
-        stmts.push(branch_stmt(cond, HirBlock { stmts: value_stmts }, None));
-        Some(Some(stop))
+        Some((short.blocks.clone(), value_leaf, cond, value_stmts))
     }
 
     fn branch_exit_condition_expr_overrides(

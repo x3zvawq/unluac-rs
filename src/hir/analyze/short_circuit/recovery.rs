@@ -123,33 +123,6 @@ pub(crate) fn value_merge_candidates_in_block<'a>(
         })
 }
 
-/// 条件型短路恢复入口。
-pub(crate) fn build_branch_short_circuit_plan(
-    lowering: &ProtoLowering<'_>,
-    header: BlockRef,
-) -> Option<BranchShortCircuitPlan> {
-    let candidates = lowering
-        .structure
-        .short_circuit_candidates
-        .iter()
-        .filter(|candidate| {
-            candidate.header == header
-                && candidate.reducible
-                && matches!(
-                    candidate.exit,
-                    ShortCircuitExit::BranchExit { .. } | ShortCircuitExit::ValueMerge(_)
-                )
-        });
-
-    for short in candidates {
-        if let Some(plan) = build_branch_short_circuit_plan_for_candidate(lowering, short) {
-            return Some(plan);
-        }
-    }
-
-    None
-}
-
 /// 从 Structure 已选定的候选构建 branch 计划，不再按 header 重新挑选另一棵短路树。
 pub(crate) fn build_branch_short_circuit_plan_for_candidate(
     lowering: &ProtoLowering<'_>,

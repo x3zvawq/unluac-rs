@@ -397,7 +397,23 @@ fn access_is_global_decl(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, name
     }) else {
         return false;
     };
-    decode_raw_string(raw_name) == name
+    if decode_raw_string(raw_name) != name {
+        return false;
+    }
+
+    let SsaValue::Def(probe_def) = lowering
+        .dataflow
+        .use_value(InstrRef(previous), err_nil.subject)
+    else {
+        return false;
+    };
+    let probe_instr = lowering.dataflow.def_instr(probe_def);
+    let LowInstr::GetTable(probe) = &lowering.proto.instrs[probe_instr.index()] else {
+        return false;
+    };
+    let probe_block = lowering.cfg.instr_to_block[probe_instr.index()];
+    global_name_for_access(lowering, probe_block, probe_instr, probe.base, probe.key)
+        .is_some_and(|probe_name| probe_name == name)
 }
 
 fn global_name_from_key(

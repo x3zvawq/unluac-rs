@@ -227,7 +227,7 @@ pub(super) fn analyze_generic_phi_materializations(
         branch_value_merge_candidates,
         plan,
     ));
-    covered.extend(consumed_loop_phi_ids(loop_candidates));
+    covered.extend(consumed_loop_header_phi_ids(loop_candidates));
     extend_transitive_structured_phi_owners(dataflow, &mut covered);
 
     for phi in &dataflow.phi_candidates {
@@ -462,17 +462,13 @@ fn extend_branch_value_arm(
     }
 }
 
-fn consumed_loop_phi_ids(loop_candidates: &[LoopCandidate]) -> impl Iterator<Item = PhiId> + '_ {
+fn consumed_loop_header_phi_ids(
+    loop_candidates: &[LoopCandidate],
+) -> impl Iterator<Item = PhiId> + '_ {
     loop_candidates.iter().flat_map(|candidate| {
         candidate
             .header_value_merges
             .iter()
             .map(|value| value.phi_id)
-            .chain(
-                candidate
-                    .exit_value_merges
-                    .iter()
-                    .flat_map(|exit| exit.values.iter().map(|value| value.phi_id)),
-            )
     })
 }

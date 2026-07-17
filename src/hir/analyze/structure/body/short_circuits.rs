@@ -18,15 +18,36 @@ impl StructuredBodyLowerer<'_, '_> {
         header: BlockRef,
         stop: Option<BlockRef>,
     ) -> Option<Option<StructuredBranchPlan>> {
-        let Some(BranchShortCircuitPlan {
+        for short in self
+            .lowering
+            .structure
+            .short_circuit_candidates
+            .iter()
+            .filter(|candidate| candidate.header == header)
+        {
+            let Some(plan) = build_branch_short_circuit_plan_for_candidate(self.lowering, short)
+            else {
+                continue;
+            };
+            if let Some(plan) = self.finish_branch_short_circuit_plan(header, stop, plan)? {
+                return Some(Some(plan));
+            }
+        }
+        Some(None)
+    }
+
+    fn finish_branch_short_circuit_plan(
+        &self,
+        header: BlockRef,
+        stop: Option<BlockRef>,
+        plan: BranchShortCircuitPlan,
+    ) -> Option<Option<StructuredBranchPlan>> {
+        let BranchShortCircuitPlan {
             mut cond,
             mut truthy,
             mut falsy,
             mut consumed_headers,
-        }) = build_branch_short_circuit_plan(self.lowering, header)
-        else {
-            return Some(None);
-        };
+        } = plan;
         if self.block_exits_outer_active_loop(truthy) || self.block_exits_outer_active_loop(falsy) {
             return Some(None);
         }
@@ -499,19 +520,29 @@ impl StructuredBodyLowerer<'_, '_> {
         if self.has_loop_header(header) {
             return None;
         }
-        let next = build_branch_short_circuit_plan(self.lowering, header)
-            .or_else(|| self.nestable_plain_branch_plan(header))?;
-        if next
-            .consumed_headers
+        let plan_is_nestable = |next: &BranchShortCircuitPlan| {
+            !next
+                .consumed_headers
+                .iter()
+                .any(|header| Some(*header) == stop || consumed_headers.contains(header))
+                && !self.short_circuit_consumed_headers_have_escaping_prefix_defs(
+                    &next.consumed_headers,
+                )
+        };
+        for plan in self
+            .lowering
+            .structure
+            .short_circuit_candidates
             .iter()
-            .any(|header| Some(*header) == stop || consumed_headers.contains(header))
+            .filter(|candidate| candidate.header == header)
+            .filter_map(|short| build_branch_short_circuit_plan_for_candidate(self.lowering, short))
         {
-            return None;
+            if plan_is_nestable(&plan) {
+                return Some(plan);
+            }
         }
-        if self.short_circuit_consumed_headers_have_escaping_prefix_defs(&next.consumed_headers) {
-            return None;
-        }
-        Some(next)
+        self.nestable_plain_branch_plan(header)
+            .filter(plan_is_nestable)
     }
 
     fn block_is_active_loop_control_header(&self, header: BlockRef) -> bool {

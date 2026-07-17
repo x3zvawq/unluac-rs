@@ -49,7 +49,7 @@ pub(super) fn collapse_carried_local_handoffs_in_proto(proto: &mut HirProto) -> 
 fn collapse_handoffs_recursive(block: &mut HirBlock, outer_temps: &BTreeSet<TempId>) -> bool {
     let mut changed = false;
 
-    // 为每个嵌套语句预计算“进入该子块时需要保护的 temp 集”。
+    // 跟踪每个嵌套语句“进入该子块时需要保护的 temp 集”。
     // 对于 index 处的语句，保护集 = 继承的 outer_temps ∪ 本块中「其他语句」引用的 temps。
     // 注意不能用 `all - self` 来近似：如果某个 temp 同时出现在当前语句和其他语句中，
     // 差集会把它减掉，导致跨作用域的引用失去保护。这里用前缀+后缀并集来精确计算。
@@ -57,13 +57,21 @@ fn collapse_handoffs_recursive(block: &mut HirBlock, outer_temps: &BTreeSet<Temp
     let mut temp_refs = TempRefScopeTracker::new(&stmt_temp_refs);
     for index in 0..temp_refs.len() {
         temp_refs.enter_stmt(index);
-        let mut child_outer = temp_refs.outer_with_prefix_and_suffix(outer_temps);
-        if let HirStmt::Repeat(repeat_stmt) = &block.stmts[index] {
-            child_outer.extend(collect_temp_refs_in_expr(&repeat_stmt.cond));
-        }
+        let repeat_cond_refs = match &block.stmts[index] {
+            HirStmt::Repeat(repeat_stmt) => Some(collect_temp_refs_in_expr(&repeat_stmt.cond)),
+            _ => None,
+        };
+        let mut child_outer = None;
 
         for_each_nested_block_mut(&mut block.stmts[index], &mut |nested_block| {
-            changed |= collapse_handoffs_recursive(nested_block, &child_outer);
+            let child_outer = child_outer.get_or_insert_with(|| {
+                let mut child_outer = temp_refs.outer_with_prefix_and_suffix(outer_temps);
+                if let Some(repeat_cond_refs) = &repeat_cond_refs {
+                    child_outer.extend(repeat_cond_refs.iter().copied());
+                }
+                child_outer
+            });
+            changed |= collapse_handoffs_recursive(nested_block, child_outer);
         });
 
         temp_refs.leave_stmt(index);
