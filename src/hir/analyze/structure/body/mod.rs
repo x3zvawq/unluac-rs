@@ -652,11 +652,11 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         stmts.extend(self.lower_block_prefix(block, false, target_overrides)?);
 
         let Some((instr_ref, instr)) = self.block_terminator(block) else {
-            return self.next_linear_successor(block, stop);
+            return self.next_linear_successor(block, stmts, target_overrides);
         };
 
         if !instr.is_control_terminator() {
-            return self.next_linear_successor(block, stop);
+            return self.next_linear_successor(block, stmts, target_overrides);
         }
 
         match instr {
@@ -711,9 +711,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Option<BlockRef>> {
         if let Some(edge_ref) = self.required_goto_edge(block, target) {
-            let mut edge_stmts = lower_edge_phi_copies_for_edge(self.lowering, edge_ref);
-            apply_loop_rewrites(&mut edge_stmts, target_overrides);
-            prune_identity_assignments(&mut edge_stmts);
+            let mut edge_stmts = self.lower_edge_phi_copies(edge_ref, target_overrides);
             edge_stmts.extend(goto_block(self.label_map[&target]).stmts);
             stmts.extend(edge_stmts);
             return Some(None);
@@ -790,7 +788,6 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let mut stmts = overridden_phis
             .into_iter()
             .flat_map(|phi_exprs| phi_exprs.iter())
-            .filter(|(phi_id, _)| !self.lowering.structure.phi_is_edge_owned(**phi_id))
             .map(|(phi_id, value)| {
                 let temp = self.lowering.bindings.phi_temps[phi_id.index()];
                 assign_stmt(vec![HirLValue::Temp(temp)], vec![value.clone()])
@@ -995,17 +992,50 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
     fn next_linear_successor(
         &self,
         block: BlockRef,
-        stop: Option<BlockRef>,
+        stmts: &mut Vec<HirStmt>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<Option<BlockRef>> {
-        match self.lowering.cfg.reachable_successor_shape(block) {
-            ReachableSuccessorShape::Empty => Some(None),
-            ReachableSuccessorShape::Single(succ) if succ == self.lowering.cfg.exit_block => {
-                Some(None)
+        let successor = match self.lowering.cfg.reachable_successor_shape(block) {
+            ReachableSuccessorShape::Empty => return Some(None),
+            ReachableSuccessorShape::Single(successor) => successor,
+            ReachableSuccessorShape::Multiple => return None,
+        };
+        let edge_ref = self.unique_edge_to(block, successor)?;
+        stmts.extend(self.lower_edge_phi_copies(edge_ref, target_overrides));
+
+        (successor != self.lowering.cfg.exit_block).then_some(Some(successor))
+    }
+
+    pub(super) fn unique_edge_to(
+        &self,
+        from: BlockRef,
+        to: BlockRef,
+    ) -> Option<crate::structure::EdgeRef> {
+        let mut edges = self.lowering.cfg.succs[from.index()]
+            .iter()
+            .copied()
+            .filter(|edge_ref| self.lowering.cfg.edges[edge_ref.index()].to == to);
+        let edge = edges.next()?;
+        edges.next().is_none().then_some(edge)
+    }
+
+    pub(super) fn lower_edge_phi_copies(
+        &self,
+        edge_ref: crate::structure::EdgeRef,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Vec<HirStmt> {
+        let mut stmts = lower_edge_phi_copies_for_edge(self.lowering, edge_ref);
+        let edge = self.lowering.cfg.edges[edge_ref.index()];
+        let phi_temp_aliases = self.overrides.phi_temp_aliases();
+        for stmt in &mut stmts {
+            rewrite_stmt_exprs(stmt, phi_temp_aliases);
+            if let Some(entry_expr_overrides) = self.block_entry_expr_overrides(edge.from) {
+                rewrite_stmt_exprs(stmt, entry_expr_overrides);
             }
-            ReachableSuccessorShape::Single(succ) if Some(succ) == stop => Some(Some(succ)),
-            ReachableSuccessorShape::Single(succ) => Some(Some(succ)),
-            ReachableSuccessorShape::Multiple => None,
         }
+        apply_loop_rewrites(&mut stmts, target_overrides);
+        prune_identity_assignments(&mut stmts);
+        stmts
     }
 }
 

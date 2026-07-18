@@ -196,7 +196,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         name: "carried-locals",
         phase: PassPhase::Deferred,
         depends_on: &[LocalBinding],
-        invalidates: &[LocalBinding],
+        invalidates: &[LocalBinding, TempChain],
     },
     PassDescriptor {
         name: "dead-unresolved-temps",

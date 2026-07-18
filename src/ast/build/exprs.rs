@@ -221,14 +221,12 @@ impl<'a> AstLowerer<'a> {
                 lhs: self.lower_expr(proto_index, &binary.lhs)?,
                 rhs: self.lower_expr(proto_index, &binary.rhs)?,
             })),
-            HirExpr::LogicalAnd(logical) => AstExpr::LogicalAnd(Box::new(AstLogicalExpr {
-                lhs: self.lower_expr(proto_index, &logical.lhs)?,
-                rhs: self.lower_expr(proto_index, &logical.rhs)?,
-            })),
-            HirExpr::LogicalOr(logical) => AstExpr::LogicalOr(Box::new(AstLogicalExpr {
-                lhs: self.lower_expr(proto_index, &logical.lhs)?,
-                rhs: self.lower_expr(proto_index, &logical.rhs)?,
-            })),
+            HirExpr::LogicalAnd(_) => {
+                self.lower_logical_chain(proto_index, expr, LogicalKind::And)?
+            }
+            HirExpr::LogicalOr(_) => {
+                self.lower_logical_chain(proto_index, expr, LogicalKind::Or)?
+            }
             HirExpr::Decision(_) => {
                 if !self.should_recover_errors() {
                     return Err(AstLowerError::ResidualHir {
@@ -310,6 +308,34 @@ impl<'a> AstLowerer<'a> {
         })
     }
 
+    /// 同类逻辑运算保持 operand 次序时可安全重结合；先迭代展平再平衡，避免长链把
+    /// build 及后续 AST visitor 的调用栈变成 O(n)。
+    fn lower_logical_chain(
+        &mut self,
+        proto_index: usize,
+        root: &HirExpr,
+        kind: LogicalKind,
+    ) -> Result<AstExpr, AstLowerError> {
+        let mut pending = vec![root];
+        let mut operands = Vec::new();
+        while let Some(expr) = pending.pop() {
+            let logical = match (kind, expr) {
+                (LogicalKind::And, HirExpr::LogicalAnd(logical))
+                | (LogicalKind::Or, HirExpr::LogicalOr(logical)) => logical,
+                _ => {
+                    operands.push(self.lower_expr(proto_index, expr)?);
+                    continue;
+                }
+            };
+            pending.push(&logical.rhs);
+            pending.push(&logical.lhs);
+        }
+
+        let len = operands.len();
+        let mut operands = operands.into_iter();
+        Ok(build_balanced_logical_expr(kind, &mut operands, len))
+    }
+
     pub(super) fn lower_call(
         &mut self,
         proto_index: usize,
@@ -357,6 +383,36 @@ impl<'a> AstLowerer<'a> {
         }
 
         Ok(AstCallKind::Call(Box::new(AstCallExpr { callee, args })))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LogicalKind {
+    And,
+    Or,
+}
+
+fn build_balanced_logical_expr(
+    kind: LogicalKind,
+    operands: &mut std::vec::IntoIter<AstExpr>,
+    len: usize,
+) -> AstExpr {
+    match len {
+        0 => unreachable!("logical chain must contain at least one operand"),
+        1 => {
+            return operands
+                .next()
+                .expect("non-empty logical chain must retain its operand");
+        }
+        _ => {}
+    }
+    let left_len = len / 2;
+    let lhs = build_balanced_logical_expr(kind, operands, left_len);
+    let rhs = build_balanced_logical_expr(kind, operands, len - left_len);
+    let logical = Box::new(AstLogicalExpr { lhs, rhs });
+    match kind {
+        LogicalKind::And => AstExpr::LogicalAnd(logical),
+        LogicalKind::Or => AstExpr::LogicalOr(logical),
     }
 }
 

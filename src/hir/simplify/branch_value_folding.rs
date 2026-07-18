@@ -12,9 +12,10 @@
 //! nil fallback 不会被恢复成 `A or b`，因为 `or` 会把 `false` 也视为 fallback 条件。
 //!
 //! 对 Temp/Local binding，除了平铺的两臂形状以外，结构恢复阶段经常因为短路条件被翻译成多层嵌套 `if`
-//! 而把同一个 binding 的赋值散落在树形 if/else 的所有叶子上。这里通过 `try_collapse_block_to_value`
-//! 递归地把"每条路径都只是给 binding 赋一个值"的子树折回单条 Decision 表达式，
-//! 让后续 `decision::collapse_value_decision_expr` + `logical-simplify` 还原成扁平的 and/or 链。
+//! 而把同一个 binding 的赋值散落在树形 if/else 的所有叶子上。raw Temp 没有稳定的中间
+//! 源码身份，因此由 `BranchValueDecisionBuilder` 一次建立完整 Decision 后统一 finalize；
+//! Local 则保留逐层 finalize 的严格恢复边界。两条路径最终都由 logical-simplify 还原
+//! 成扁平的 and/or 链，不能为共用实现而放宽 Local 候选。
 //! 短路链常见的 guard local 可依靠词法作用域直接消解；raw temp 只有在完整候选根语句之外
 //! 没有 touch、候选表达式不再引用它，且没有 debug local 身份时才会提前消解。无法证明的形状
 //! 保持原树，交给 `locals::branch_merge` 物化稳定 binding 后在下一轮重试，不能为追求折叠丢状态。
@@ -37,9 +38,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::label_refs::count_label_references;
 use super::local_shapes::empty_single_local_decl_binding;
-use super::mention::{
-    block_mentions_local, expr_mentions_local, expr_mentions_temp, stmts_mention_temp,
-};
+use super::mention::{block_mentions_local, expr_mentions_local, expr_mentions_temp};
 use super::temp_touch::collect_temp_refs_by_stmt;
 use super::walk::{HirRewritePass, rewrite_proto};
 use crate::hir::HirLabelId;
@@ -48,6 +47,10 @@ use crate::hir::common::{
     HirDecisionNodeRef, HirDecisionTarget, HirExpr, HirIf, HirLValue, HirLocalDecl, HirProto,
     HirStmt, HirUnaryOpKind, HirValuePack, LocalId, TempId,
 };
+
+mod decision_builder;
+
+use decision_builder::BranchValueDecisionBuilder;
 
 pub(super) fn fold_branch_values_in_proto(proto: &mut HirProto) -> bool {
     let raw_temp_changed = fold_root_branch_value_temps(proto);
@@ -145,7 +148,6 @@ fn fold_root_branch_value_temps(proto: &mut HirProto) -> bool {
                     .temp_debug_locals
                     .get(guard.index())
                     .is_none_or(Option::is_none)
-                && !stmts_mention_temp(std::slice::from_ref(&replacement), *guard)
         });
         if guards_are_mechanical {
             *stmt = replacement;
@@ -257,7 +259,7 @@ fn nil_check_for_local(local: LocalId) -> HirExpr {
     }))
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 enum BranchValueBinding {
     Temp(TempId),
     Local(LocalId),
@@ -312,7 +314,7 @@ fn collapsible_branch_value_local(
     let HirStmt::If(if_stmt) = if_stmt else {
         return None;
     };
-    let value = branch_value_expr(BranchValueBinding::Local(binding), if_stmt, None)?;
+    let value = branch_value_expr(BranchValueBinding::Local(binding), if_stmt)?;
     Some((binding, value))
 }
 
@@ -324,57 +326,82 @@ fn collapsible_branch_value_temp(stmt: &HirStmt) -> Option<(HirStmt, BTreeSet<Te
     if !matches!(binding, BranchValueBinding::Temp(_)) {
         return None;
     }
-    let mut guards = BTreeSet::new();
-    let truthy = try_collapse_block_to_value(&if_stmt.then_block, binding, Some(&mut guards))?;
-    let else_block = if_stmt.else_block.as_ref()?;
-    let falsy = try_collapse_block_to_value(else_block, binding, Some(&mut guards))?;
-    if binding.mentions_expr(&if_stmt.cond)
-        || binding.mentions_expr(&truthy)
-        || binding.mentions_expr(&falsy)
-    {
-        return None;
-    }
+    let mut builder = BranchValueDecisionBuilder::new();
+    let root = builder.collapse_if(if_stmt, binding)?;
     // raw temp 没有 local 壳提供稳定的中间边界；若整棵树尚不能收成值表达式，
     // 只折叠内层会生成一份新的控制形状，并可能让下一次反编译失去原短路 owner。
     // 因此这里全有或全无，保持原树交给 locals 后的路径继续处理。
-    let value = finalize_branch_value(&if_stmt.cond, truthy, falsy, false)?;
+    let (value, guards) = builder.finish(root, binding)?;
     let replacement = assign_binding_value(binding, value);
     Some((replacement, guards))
 }
 
-fn branch_value_expr(
-    binding: BranchValueBinding,
-    if_stmt: &HirIf,
-    mut raw_guards: Option<&mut BTreeSet<TempId>>,
-) -> Option<HirExpr> {
-    let keep_decision = raw_guards.is_some();
-    let truthy = if let Some(guards) = raw_guards.as_mut() {
-        try_collapse_block_to_value(&if_stmt.then_block, binding, Some(&mut **guards))?
-    } else {
-        try_collapse_block_to_value(&if_stmt.then_block, binding, None)?
-    };
-    let else_block = if_stmt.else_block.as_ref()?;
-    let falsy = try_collapse_block_to_value(else_block, binding, raw_guards)?;
+fn branch_value_expr(binding: BranchValueBinding, if_stmt: &HirIf) -> Option<HirExpr> {
+    let truthy = try_collapse_block_to_value(&if_stmt.then_block, binding)?;
+    let falsy = try_collapse_block_to_value(if_stmt.else_block.as_ref()?, binding)?;
     if binding.mentions_expr(&if_stmt.cond)
         || binding.mentions_expr(&truthy)
         || binding.mentions_expr(&falsy)
     {
         return None;
     }
-    finalize_branch_value(&if_stmt.cond, truthy, falsy, keep_decision)
-}
-
-fn finalize_branch_value(
-    cond: &HirExpr,
-    truthy: HirExpr,
-    falsy: HirExpr,
-    keep_decision: bool,
-) -> Option<HirExpr> {
     finalize_branch_value_targets(
-        cond,
+        &if_stmt.cond,
         HirDecisionTarget::Expr(truthy),
         HirDecisionTarget::Expr(falsy),
-        keep_decision,
+    )
+}
+
+fn try_collapse_block_to_value(block: &HirBlock, binding: BranchValueBinding) -> Option<HirExpr> {
+    match block.stmts.as_slice() {
+        [HirStmt::Assign(assign)] => single_assign_value(assign, binding).cloned(),
+        [HirStmt::If(if_stmt)] => branch_value_expr(binding, if_stmt),
+        [HirStmt::LocalDecl(decl), HirStmt::If(if_stmt)] => {
+            collapse_local_guard_pattern(decl, if_stmt, binding)
+        }
+        _ => None,
+    }
+}
+
+fn collapse_local_guard_pattern(
+    decl: &HirLocalDecl,
+    if_stmt: &HirIf,
+    binding: BranchValueBinding,
+) -> Option<HirExpr> {
+    let [guard] = decl.bindings.as_slice() else {
+        return None;
+    };
+    let [value] = decl.values.fixed.as_slice() else {
+        return None;
+    };
+    if decl.values.tail.is_some()
+        || !matches!(if_stmt.cond, HirExpr::LocalRef(local) if local == *guard)
+    {
+        return None;
+    }
+    let [HirStmt::Assign(then_assign)] = if_stmt.then_block.stmts.as_slice() else {
+        return None;
+    };
+    if !matches!(single_assign_value(then_assign, binding)?, HirExpr::LocalRef(local) if local == guard)
+    {
+        return None;
+    }
+
+    let rest_block = if_stmt.else_block.as_ref()?;
+    if expr_mentions_local(value, *guard)
+        || binding.mentions_expr(value)
+        || block_mentions_local(rest_block, *guard)
+    {
+        return None;
+    }
+    let rest_value = try_collapse_block_to_value(rest_block, binding)?;
+    if binding.mentions_expr(&rest_value) || expr_mentions_local(&rest_value, *guard) {
+        return None;
+    }
+    finalize_branch_value_targets(
+        value,
+        HirDecisionTarget::CurrentValue,
+        HirDecisionTarget::Expr(rest_value),
     )
 }
 
@@ -382,7 +409,6 @@ fn finalize_branch_value_targets(
     cond: &HirExpr,
     truthy: HirDecisionTarget,
     falsy: HirDecisionTarget,
-    keep_decision: bool,
 ) -> Option<HirExpr> {
     let decision = HirDecisionExpr {
         entry: HirDecisionNodeRef(0),
@@ -394,34 +420,7 @@ fn finalize_branch_value_targets(
         }],
     };
     let value = crate::hir::decision::finalize_value_decision_expr(decision);
-    (keep_decision || !matches!(value, HirExpr::Decision(_))).then_some(value)
-}
-
-/// 递归地尝试把一个 block 折叠成"对 `binding` 唯一赋值"的值表达式。
-///
-/// 支持三种形态：
-/// 1. 单条 `assign binding = expr`；
-/// 2. 单条 `if cond then THEN else ELSE end`，THEN/ELSE 各自递归满足；
-/// 3. `local LX = v; if LX then assign binding = LX else REST`；
-/// 4. 已证明无额外 touch/capture 的 `tX = v; if tX then ...` raw guard。
-fn try_collapse_block_to_value(
-    block: &HirBlock,
-    binding: BranchValueBinding,
-    raw_guards: Option<&mut BTreeSet<TempId>>,
-) -> Option<HirExpr> {
-    match block.stmts.as_slice() {
-        [HirStmt::Assign(assign)] => single_assign_value(assign, binding).cloned(),
-        [HirStmt::If(if_stmt)] => branch_value_expr(binding, if_stmt, raw_guards),
-        [HirStmt::LocalDecl(decl), HirStmt::If(if_stmt)] => {
-            collapse_local_guard_pattern(decl, if_stmt, binding, raw_guards)
-        }
-        [assign_stmt @ HirStmt::Assign(_), if_stmt @ HirStmt::If(_)] => {
-            collapse_raw_temp_guard_pattern(assign_stmt, if_stmt, raw_guards?)
-                .filter(|(target, _)| *target == binding)
-                .map(|(_, value)| value)
-        }
-        _ => None,
-    }
+    (!matches!(value, HirExpr::Decision(_))).then_some(value)
 }
 
 fn branch_value_binding_in_block(block: &HirBlock) -> Option<BranchValueBinding> {
@@ -820,86 +819,6 @@ fn assign_binding_value(binding: BranchValueBinding, value: HirExpr) -> HirStmt 
 /// 该形态来自结构恢复阶段把 `binding = v or RESTV` 这种短路赋值展开成"先把 `v` 物化到
 /// 新 temp `LX`，再用 `LX` 做条件判断"的中间形态。如果 `LX` 在这之外没有被引用过，
 /// 就可以重新折回 `binding = v or RESTV`，避免给最终输出留下毫无意义的物化壳。
-fn collapse_local_guard_pattern(
-    decl: &HirLocalDecl,
-    if_stmt: &HirIf,
-    binding: BranchValueBinding,
-    raw_guards: Option<&mut BTreeSet<TempId>>,
-) -> Option<HirExpr> {
-    let keep_decision = raw_guards.is_some();
-    let [lx] = decl.bindings.as_slice() else {
-        return None;
-    };
-    let [lx_value] = decl.values.fixed.as_slice() else {
-        return None;
-    };
-    if decl.values.tail.is_some() {
-        return None;
-    }
-    let lx = *lx;
-
-    // cond 必须就是 `LocalRef(lx)`
-    let HirExpr::LocalRef(cond_local) = &if_stmt.cond else {
-        return None;
-    };
-    if *cond_local != lx {
-        return None;
-    }
-
-    // then 分支必须就是 `assign binding = LocalRef(lx)`
-    let [HirStmt::Assign(then_assign)] = if_stmt.then_block.stmts.as_slice() else {
-        return None;
-    };
-    let then_value = single_assign_value(then_assign, binding)?;
-    let HirExpr::LocalRef(then_local) = then_value else {
-        return None;
-    };
-    if *then_local != lx {
-        return None;
-    }
-
-    let else_block = if_stmt.else_block.as_ref()?;
-    if expr_mentions_local(lx_value, lx)
-        || binding.mentions_expr(lx_value)
-        || block_mentions_local(else_block, lx)
-    {
-        return None;
-    }
-    let rest_value = try_collapse_block_to_value(else_block, binding, raw_guards)?;
-    if binding.mentions_expr(&rest_value) || expr_mentions_local(&rest_value, lx) {
-        return None;
-    }
-
-    finalize_branch_value_targets(
-        lx_value,
-        HirDecisionTarget::CurrentValue,
-        HirDecisionTarget::Expr(rest_value),
-        keep_decision,
-    )
-}
-
-fn collapse_raw_temp_guard_pattern(
-    assign_stmt: &HirStmt,
-    if_stmt: &HirStmt,
-    raw_guards: &mut BTreeSet<TempId>,
-) -> Option<(BranchValueBinding, HirExpr)> {
-    let shape = raw_temp_guard_shape(assign_stmt, if_stmt)?;
-    let rest_value =
-        try_collapse_block_to_value(shape.rest_block, shape.binding, Some(raw_guards))?;
-    if shape.binding.mentions_expr(&rest_value) || expr_mentions_temp(&rest_value, shape.guard) {
-        return None;
-    }
-    let rest = HirDecisionTarget::Expr(rest_value);
-    let (truthy, falsy) = if shape.guard_is_truthy_value {
-        (HirDecisionTarget::CurrentValue, rest)
-    } else {
-        (rest, HirDecisionTarget::CurrentValue)
-    };
-    let value = finalize_branch_value_targets(shape.value, truthy, falsy, true)?;
-    raw_guards.insert(shape.guard);
-    Some((shape.binding, value))
-}
-
 struct RawTempGuardShape<'a> {
     guard: TempId,
     binding: BranchValueBinding,
@@ -931,9 +850,6 @@ fn raw_temp_guard_shape<'a>(
             (binding, &if_stmt.then_block, false)
         };
     if binding == BranchValueBinding::Temp(guard) {
-        return None;
-    }
-    if binding.mentions_expr(value) {
         return None;
     }
     Some(RawTempGuardShape {

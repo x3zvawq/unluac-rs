@@ -52,9 +52,30 @@ impl StructuredBodyLowerer<'_, '_> {
             return None;
         }
         self.required_labels.insert(to);
-        let mut stmts = self.escape_state_snapshot_stmts(from, to, target_overrides);
+        let edge_ref = self.unique_edge_to(from, to)?;
+        let mut stmts = self.lower_edge_phi_copies(edge_ref, target_overrides);
+        stmts.extend(self.escape_state_snapshot_stmts(from, to, target_overrides));
         stmts.extend(goto_block(self.label_map[&to]).stmts);
         Some(HirBlock { stmts })
+    }
+
+    pub(super) fn lower_branch_arm_region(
+        &mut self,
+        from: BlockRef,
+        entry: BlockRef,
+        stop: Option<BlockRef>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<HirBlock> {
+        if self
+            .active_loops
+            .last()
+            .is_some_and(|loop_context| loop_context.goto_exits.contains(&entry))
+            && self.unique_edge_to(from, entry).is_some()
+        {
+            self.lower_escape_edge(from, entry, target_overrides)
+        } else {
+            self.lower_region(entry, stop, target_overrides)
+        }
     }
 
     fn escape_state_snapshot_stmts(

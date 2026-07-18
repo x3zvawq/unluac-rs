@@ -1,8 +1,8 @@
-//! carried binding 读取事实的只读收集器。
+//! carried binding 读取与 mention 事实的只读收集器。
 //!
-//! 这个模块只扫描表达式/语句里对 local/temp binding 的读取，用于判断 handoff seed
-//! 是否只读取单个 carried 状态，以及 suffix 是否仍观察旧 binding。它不判断写入安全性，
-//! 也不执行 rewrite。
+//! 读取事实用于判断 handoff seed 是否只依赖单个 carried 状态、suffix 是否仍观察旧
+//! binding；mention 事实同时覆盖直接左值，用于保护子块之外仍存活的 source/target。
+//! 它不判断写入安全性，也不执行 rewrite。
 //!
 //! 例子：
 //! - 输入表达式：`state + 1`
@@ -10,10 +10,27 @@
 
 use std::collections::BTreeSet;
 
-use crate::hir::common::{HirExpr, HirStmt};
+use crate::hir::common::{HirExpr, HirLValue, HirStmt};
 
 use super::super::visit::{HirVisitor, visit_expr, visit_stmts};
-use super::binding::CarryBinding;
+use super::binding::{CarryBinding, carry_binding_from_expr, carry_binding_from_lvalue};
+
+pub(super) fn collect_binding_mentions_by_stmt(stmts: &[HirStmt]) -> Vec<BTreeSet<CarryBinding>> {
+    stmts
+        .iter()
+        .map(|stmt| {
+            let mut collector = BindingMentionCollector::default();
+            collector.collect_stmts(std::slice::from_ref(stmt));
+            collector.mentions
+        })
+        .collect()
+}
+
+pub(super) fn collect_binding_mentions_in_expr(expr: &HirExpr) -> BTreeSet<CarryBinding> {
+    let mut collector = BindingMentionCollector::default();
+    collector.collect_expr(expr);
+    collector.mentions
+}
 
 #[derive(Default)]
 pub(super) struct BindingReadCollector {
@@ -45,6 +62,35 @@ impl HirVisitor for BindingReadCollector {
         };
         if let Some(binding) = binding {
             self.reads.insert(binding);
+        }
+    }
+}
+
+#[derive(Default)]
+struct BindingMentionCollector {
+    mentions: BTreeSet<CarryBinding>,
+}
+
+impl BindingMentionCollector {
+    fn collect_stmts(&mut self, stmts: &[HirStmt]) {
+        visit_stmts(stmts, self);
+    }
+
+    fn collect_expr(&mut self, expr: &HirExpr) {
+        visit_expr(expr, self);
+    }
+}
+
+impl HirVisitor for BindingMentionCollector {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        if let Some(binding) = carry_binding_from_expr(expr) {
+            self.mentions.insert(binding);
+        }
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        if let Some(binding) = carry_binding_from_lvalue(lvalue) {
+            self.mentions.insert(binding);
         }
     }
 }

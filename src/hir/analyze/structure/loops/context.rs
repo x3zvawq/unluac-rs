@@ -27,7 +27,7 @@ impl StructuredBodyLowerer<'_, '_> {
             .structure
             .unstructured_region(candidate.header);
         for exit in candidate.exits.iter().copied().filter(|exit| {
-            *exit != post_loop && !self.loop_exit_enters_nested_loop(candidate_id, candidate, *exit)
+            *exit != post_loop && !self.loop_exit_enters_nested_loop(candidate_id, *exit)
         }) {
             if unstructured_region.is_some()
                 && self.lowering.structure.unstructured_region(exit) == unstructured_region
@@ -130,7 +130,7 @@ impl StructuredBodyLowerer<'_, '_> {
         let body_blocks = loop_body_blocks(candidate);
         let mut inside_blocks = body_blocks.clone();
         for exit in candidate.exits.iter().copied().filter(|exit| {
-            *exit != post_loop && !self.loop_exit_enters_nested_loop(candidate_id, candidate, *exit)
+            *exit != post_loop && !self.loop_exit_enters_nested_loop(candidate_id, *exit)
         }) {
             if self
                 .lower_loop_break_exit(
@@ -180,22 +180,16 @@ impl StructuredBodyLowerer<'_, '_> {
         }
     }
 
-    fn loop_exit_enters_nested_loop(
-        &self,
-        candidate_id: LoopCandidateId,
-        candidate: &LoopCandidate,
-        exit: BlockRef,
-    ) -> bool {
-        self.lowering
-            .structure
-            .loop_candidates
-            .iter()
-            .enumerate()
-            .any(|(index, nested)| {
-                LoopCandidateId(index) != candidate_id
-                    && nested.blocks.is_subset(&candidate.body_scope_blocks)
-                    && (nested.header == exit || nested.preheader == Some(exit))
-            })
+    fn loop_exit_enters_nested_loop(&self, candidate_id: LoopCandidateId, exit: BlockRef) -> bool {
+        // while 的 canonical body scope 刻意保持 natural-loop core；若某条分支进入内层
+        // loop 后直接 break 外层，内层 blocks 不会回到外层 header，因而不可能是该 core
+        // 的子集。header/preheader 已是 Structure 给出的精确入口 owner；当前 loop 的
+        // canonical post 又已在调用处排除，因此这里不能再用 body-scope subset 否定它。
+        let candidates = &self.lowering.structure.loop_candidates;
+        let header = candidates[candidate_id.index()].header;
+        candidates.iter().any(|nested| {
+            nested.header != header && (nested.header == exit || nested.preheader == Some(exit))
+        })
     }
 
     fn loop_exit_region_is_terminal(

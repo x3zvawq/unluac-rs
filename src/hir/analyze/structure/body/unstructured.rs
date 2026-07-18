@@ -1,6 +1,6 @@
 //! 局部不可结构化 island 的保守 lowering。
 //!
-//! island 只扩到不可规约 SCC 及其通往唯一后支配 continuation 的空 jump pad。每个
+//! island 只扩到不可规约 SCC 及其通往唯一后支配 continuation 的线性边界块。每个
 //! block 仍按 `StructurePlan` 的直接 owner 分派：Branch 使用稳定 candidate identity，
 //! plain Loop header 可按真实 CFG 边局部降低；numeric/generic-for 协议只复用既有 loop
 //! candidate，不降级成 raw 控制。无法证明的 cleanup、循环控制或出口边界直接退让。
@@ -81,10 +81,9 @@ impl StructuredBodyLowerer<'_, '_> {
         ) || self.required_labels.contains(&target)
             || self.lowering.cfg.reachable_predecessors(target)
                 != [self.lowering.cfg.edges[entry_edge.index()].from]
-            || !matches!(self.block_terminator(target), Some((_, LowInstr::Jump(_))))
-            || !self
-                .block_prefix_instr_indices(target, false)?
-                .all(|index| self.unstructured_prefix_instr_is_omitted(InstrRef(index)))
+            || self.block_terminator(target).is_some_and(|(_, instr)| {
+                instr.is_control_terminator() && !matches!(instr, LowInstr::Jump(_))
+            })
         {
             return None;
         }
@@ -301,7 +300,7 @@ impl StructuredBodyLowerer<'_, '_> {
             return None;
         };
 
-        let mut stmts = self.lower_unstructured_prefix(block, true)?;
+        let mut stmts = self.lower_block_prefix(block, true, &BTreeMap::new())?;
         stmts.push(branch_stmt(
             self.lower_candidate_cond(block, candidate)?,
             self.lower_unstructured_edge(owned_then, next)?,
@@ -315,7 +314,7 @@ impl StructuredBodyLowerer<'_, '_> {
         block: BlockRef,
         next: Option<BlockRef>,
     ) -> Option<Vec<HirStmt>> {
-        let mut stmts = self.lower_unstructured_prefix(block, false)?;
+        let mut stmts = self.lower_block_prefix(block, false, &BTreeMap::new())?;
         let Some((instr_ref, instr)) = self.block_terminator(block) else {
             if let Some(target) = self.lowering.cfg.unique_reachable_successor(block) {
                 stmts.extend(self.lower_unstructured_edge_to(block, target, next)?.stmts);
@@ -358,40 +357,13 @@ impl StructuredBodyLowerer<'_, '_> {
         Some(stmts)
     }
 
-    fn lower_unstructured_prefix(
-        &self,
-        block: BlockRef,
-        expect_branch: bool,
-    ) -> Option<Vec<HirStmt>> {
-        let mut stmts = Vec::new();
-        for index in self.block_prefix_instr_indices(block, expect_branch)? {
-            let instr_ref = InstrRef(index);
-            if self.unstructured_prefix_instr_is_omitted(instr_ref) {
-                continue;
-            }
-            if matches!(
-                self.lowering.proto.instrs[index],
-                LowInstr::GenericForPrep(_)
-            ) {
-                return None;
-            }
-            stmts.extend(lower_regular_instr(
-                self.lowering,
-                block,
-                instr_ref,
-                &self.lowering.proto.instrs[index],
-            ));
-        }
-        Some(stmts)
-    }
-
     fn lower_unstructured_edge(
         &mut self,
         edge_ref: crate::structure::EdgeRef,
         next: Option<BlockRef>,
     ) -> Option<HirBlock> {
         let edge = self.lowering.cfg.edges.get(edge_ref.index())?;
-        let mut stmts = lower_edge_phi_copies_for_edge(self.lowering, edge_ref);
+        let mut stmts = self.lower_edge_phi_copies(edge_ref, &BTreeMap::new());
         if self.unstructured_loop_escape_target(edge.to) {
             stmts.push(HirStmt::Break);
         } else if edge.to != self.lowering.cfg.exit_block && Some(edge.to) != next {
@@ -431,23 +403,11 @@ impl StructuredBodyLowerer<'_, '_> {
         target_overrides: &BTreeMap<TempId, HirLValue>,
     ) -> Option<HirBlock> {
         let edge = self.lowering.cfg.edges.get(edge_ref.index())?;
-        let mut stmts = lower_edge_phi_copies_for_edge(self.lowering, edge_ref);
-        apply_loop_rewrites(&mut stmts, target_overrides);
-        prune_identity_assignments(&mut stmts);
+        let mut stmts = self.lower_edge_phi_copies(edge_ref, target_overrides);
         if Some(edge.to) != next {
             stmts.extend(goto_block(*self.label_map.get(&edge.to)?).stmts);
         }
         Some(HirBlock { stmts })
-    }
-
-    fn unstructured_prefix_instr_is_omitted(&self, instr_ref: InstrRef) -> bool {
-        matches!(
-            self.lowering.proto.instrs[instr_ref.index()],
-            LowInstr::Close(_) | LowInstr::Tbc(_)
-        ) && matches!(
-            self.lowering.structure.cleanup_disposition(instr_ref),
-            CleanupDisposition::LexicalScope(_) | CleanupDisposition::Unreachable
-        )
     }
 
     pub(super) fn required_goto_edge(

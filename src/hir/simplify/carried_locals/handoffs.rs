@@ -17,7 +17,6 @@ use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirStmt, LocalId, TempId}
 
 use super::super::mention::{stmt_writes_temp, stmts_mention_local, stmts_mention_temp};
 use super::super::temp_touch::TempTouchIndex;
-use super::super::visit::{HirVisitor, visit_stmts};
 use super::super::walk::rewrite_stmts;
 use super::binding::{
     CarryBinding, TempBindingRewrite, TempToBindingPass, TempToLocalPass, TempToTempPass,
@@ -41,7 +40,7 @@ pub(super) enum HandoffAction {
 pub(super) fn try_collapse_handoff_at(
     block: &mut HirBlock,
     index: usize,
-    outer_temps: &BTreeSet<TempId>,
+    outer_bindings: &BTreeSet<CarryBinding>,
     temp_touches: &TempTouchIndex<'_>,
     label_jumps: &LabelJumpIndex,
     captured_locals: &BTreeSet<LocalId>,
@@ -49,27 +48,34 @@ pub(super) fn try_collapse_handoff_at(
     if try_collapse_pure_binding_handoffs(
         block,
         index,
-        outer_temps,
+        outer_bindings,
         temp_touches,
         label_jumps,
         captured_locals,
     ) || try_collapse_label_loop_update_handoff(
         block,
         index,
-        outer_temps,
+        outer_bindings,
         temp_touches,
         label_jumps,
     ) || try_collapse_single_binding_handoff(
         block,
         index,
-        outer_temps,
+        outer_bindings,
         temp_touches,
         label_jumps,
         captured_locals,
     ) {
         return Some(HandoffAction::RetrySameIndex);
     }
-    if try_collapse_binding_update_handoff(block, index, outer_temps, temp_touches, label_jumps) {
+    if try_collapse_binding_update_handoff(
+        block,
+        index,
+        outer_bindings,
+        temp_touches,
+        label_jumps,
+        captured_locals,
+    ) {
         return Some(HandoffAction::AdvanceIndex);
     }
     None
@@ -78,7 +84,7 @@ pub(super) fn try_collapse_handoff_at(
 fn try_collapse_pure_binding_handoffs(
     block: &mut HirBlock,
     index: usize,
-    outer_temps: &BTreeSet<TempId>,
+    outer_bindings: &BTreeSet<CarryBinding>,
     temp_touches: &TempTouchIndex<'_>,
     label_jumps: &LabelJumpIndex,
     captured_locals: &BTreeSet<LocalId>,
@@ -87,9 +93,10 @@ fn try_collapse_pure_binding_handoffs(
         return false;
     };
 
-    // 外层仍引用或 seed 前已有路径触碰的 temp 都不是当前 handoff 新建的身份。
+    // 外层仍提及的 source/target，或 seed 前已有路径触碰的 temp，都不是当前块私有身份。
     if seed.rewrites.iter().any(|rewrite| {
-        outer_temps.contains(&rewrite.from)
+        outer_bindings.contains(&CarryBinding::Temp(rewrite.from))
+            || outer_bindings.contains(&rewrite.to)
             || temp_touches.touches_before(index, rewrite.from)
             || captured_binding(captured_locals, rewrite.to)
     }) {
@@ -138,14 +145,16 @@ fn try_collapse_pure_binding_handoffs(
 fn try_collapse_label_loop_update_handoff(
     block: &mut HirBlock,
     index: usize,
-    outer_temps: &BTreeSet<TempId>,
+    outer_bindings: &BTreeSet<CarryBinding>,
     temp_touches: &TempTouchIndex<'_>,
     label_jumps: &LabelJumpIndex,
 ) -> bool {
     let Some((carried, update_temp)) = direct_temp_writeback_stmt(&block.stmts[index]) else {
         return false;
     };
-    if outer_temps.contains(&update_temp) || temp_touches.touches_before(index, update_temp) {
+    if outer_bindings.contains(&CarryBinding::Temp(update_temp))
+        || temp_touches.touches_before(index, update_temp)
+    {
         return false;
     }
     if !label_jumps.next_label_has_prior_goto(&block.stmts, index) {
@@ -208,7 +217,7 @@ fn find_label_loop_update(
 fn try_collapse_single_binding_handoff(
     block: &mut HirBlock,
     index: usize,
-    outer_temps: &BTreeSet<TempId>,
+    outer_bindings: &BTreeSet<CarryBinding>,
     temp_touches: &TempTouchIndex<'_>,
     label_jumps: &LabelJumpIndex,
     captured_locals: &BTreeSet<LocalId>,
@@ -217,8 +226,11 @@ fn try_collapse_single_binding_handoff(
         return false;
     };
 
-    // 外层仍引用或 seed 前已有路径触碰的 temp 都不是当前 handoff 新建的身份。
-    if outer_temps.contains(&temp) || temp_touches.touches_before(index, temp) {
+    // 外层仍提及 source/target 时，这只是当前块的值快照，不能升级成同一状态身份。
+    if outer_bindings.contains(&CarryBinding::Temp(temp))
+        || outer_bindings.contains(&binding)
+        || temp_touches.touches_before(index, temp)
+    {
         return false;
     }
     if captured_binding(captured_locals, binding) {
@@ -257,16 +269,19 @@ fn try_collapse_single_binding_handoff(
 fn try_collapse_binding_update_handoff(
     block: &mut HirBlock,
     index: usize,
-    outer_temps: &BTreeSet<TempId>,
+    outer_bindings: &BTreeSet<CarryBinding>,
     temp_touches: &TempTouchIndex<'_>,
     label_jumps: &LabelJumpIndex,
+    captured_locals: &BTreeSet<LocalId>,
 ) -> bool {
     let Some((target_temp, carried)) = update_handoff_seed(&block.stmts[index]) else {
         return false;
     };
 
     // 如果被折叠的 temp 在外层作用域中仍被引用，不能消除。
-    if outer_temps.contains(&target_temp) {
+    if outer_bindings.contains(&CarryBinding::Temp(target_temp))
+        || captured_binding(captured_locals, carried)
+    {
         return false;
     }
     if label_jumps.next_label_has_prior_goto(&block.stmts, index) {
@@ -276,7 +291,7 @@ fn try_collapse_binding_update_handoff(
     let suffix = &block.stmts[index + 1..];
     if suffix.is_empty()
         || suffix_reads_binding(suffix, carried)
-        || !suffix_contains_direct_writeback(suffix, carried, target_temp)
+        || !suffix_ends_with_linear_direct_writeback(suffix, carried, target_temp)
         || !temp_touches.touches_after(index + 1, target_temp)
     {
         return false;
@@ -323,18 +338,29 @@ fn captured_binding(captured_locals: &BTreeSet<LocalId>, binding: CarryBinding) 
     matches!(binding, CarryBinding::Local(local) if captured_locals.contains(&local))
 }
 
-fn suffix_contains_direct_writeback(
+fn suffix_ends_with_linear_direct_writeback(
     stmts: &[HirStmt],
     binding: CarryBinding,
     target_temp: TempId,
 ) -> bool {
-    let mut collector = DirectWritebackCollector {
-        binding,
-        target_temp,
-        found: false,
+    let Some((writeback, prefix)) = stmts.split_last() else {
+        return false;
     };
-    visit_stmts(stmts, &mut collector);
-    collector.found
+    prefix.iter().all(stmt_is_linear_handoff_prefix)
+        && direct_temp_writeback_stmt(writeback) == Some((binding, target_temp))
+}
+
+fn stmt_is_linear_handoff_prefix(stmt: &HirStmt) -> bool {
+    matches!(
+        stmt,
+        HirStmt::LocalDecl(_)
+            | HirStmt::Assign(_)
+            | HirStmt::TableSetList(_)
+            | HirStmt::ErrNil(_)
+            | HirStmt::ToBeClosed(_)
+            | HirStmt::Close(_)
+            | HirStmt::CallStmt(_)
+    )
 }
 
 fn suffix_writes_binding_only_via_direct_writeback(
@@ -424,30 +450,6 @@ fn binding_matches_lvalue(lvalue: &HirLValue, binding: CarryBinding) -> bool {
         (CarryBinding::Local(binding), HirLValue::Local(local)) => binding == *local,
         (CarryBinding::Temp(binding), HirLValue::Temp(temp)) => binding == *temp,
         _ => false,
-    }
-}
-
-struct DirectWritebackCollector {
-    binding: CarryBinding,
-    target_temp: TempId,
-    found: bool,
-}
-
-impl HirVisitor for DirectWritebackCollector {
-    fn visit_stmt(&mut self, stmt: &HirStmt) {
-        let HirStmt::Assign(assign) = stmt else {
-            return;
-        };
-        if assign.values.tail.is_some() || assign.targets.len() != assign.values.fixed.len() {
-            return;
-        }
-        self.found |= assign
-            .targets
-            .iter()
-            .zip(&assign.values.fixed)
-            .any(|(target, value)| {
-                matches_direct_writeback_pair(target, value, self.binding, self.target_temp)
-            });
     }
 }
 

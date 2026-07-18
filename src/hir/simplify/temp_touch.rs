@@ -231,14 +231,20 @@ impl<'a> TempTouchIndex<'a> {
     }
 }
 
-pub(super) struct TempRefScopeTracker<'a> {
-    stmt_refs: &'a [BTreeSet<TempId>],
-    suffix_ref_counts: BTreeMap<TempId, usize>,
-    prefix_refs: BTreeSet<TempId>,
+/// 以每条语句的引用集合增量维护当前语句之外仍需保护的身份。
+///
+/// locals 使用 `TempId` 特化；carried-locals 复用同一 tracker 维护 local/temp 统一
+/// binding，避免为两类身份复制前缀/后缀计数逻辑。
+pub(super) type TempRefScopeTracker<'a> = RefScopeTracker<'a, TempId>;
+
+pub(super) struct RefScopeTracker<'a, T> {
+    stmt_refs: &'a [BTreeSet<T>],
+    suffix_ref_counts: BTreeMap<T, usize>,
+    prefix_refs: BTreeSet<T>,
 }
 
-impl<'a> TempRefScopeTracker<'a> {
-    pub(super) fn new(stmt_refs: &'a [BTreeSet<TempId>]) -> Self {
+impl<'a, T: Copy + Ord> RefScopeTracker<'a, T> {
+    pub(super) fn new(stmt_refs: &'a [BTreeSet<T>]) -> Self {
         let mut suffix_ref_counts = BTreeMap::new();
         for refs in stmt_refs {
             for temp in refs {
@@ -275,14 +281,11 @@ impl<'a> TempRefScopeTracker<'a> {
             .extend(self.stmt_refs[index].iter().copied());
     }
 
-    pub(super) fn suffix_contains(&self, temp: TempId) -> bool {
-        self.suffix_ref_counts.contains_key(&temp)
+    pub(super) fn suffix_contains(&self, reference: T) -> bool {
+        self.suffix_ref_counts.contains_key(&reference)
     }
 
-    pub(super) fn outer_with_prefix_and_suffix(
-        &self,
-        inherited: &BTreeSet<TempId>,
-    ) -> BTreeSet<TempId> {
+    pub(super) fn outer_with_prefix_and_suffix(&self, inherited: &BTreeSet<T>) -> BTreeSet<T> {
         inherited
             .iter()
             .copied()

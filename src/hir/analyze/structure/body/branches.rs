@@ -236,11 +236,15 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let else_stop = effective_else_entry.and_then(|else_entry| {
             self.branch_arm_stop(else_entry, Some(plan.then_entry), plan.merge, branch_stop)
         });
-        let then_block = self.lower_region(plan.then_entry, then_stop, arm_target_overrides)?;
+        let then_block =
+            self.lower_branch_arm_region(block, plan.then_entry, then_stop, arm_target_overrides)?;
         let else_block = match effective_else_entry {
-            Some(else_entry) => {
-                Some(self.lower_region(else_entry, else_stop, arm_target_overrides)?)
-            }
+            Some(else_entry) => Some(self.lower_branch_arm_region(
+                block,
+                else_entry,
+                else_stop,
+                arm_target_overrides,
+            )?),
             // IfThen 无 else 臂时，不再为 merge block 上的 phi 生成隐式 else 赋值。
             // 这些 phi 会在 merge block 的 lower_block_prefix 中由 idom 兜底统一
             // 物化（idom 对于 IfThen 就是 header，值与隐式 else 赋值完全一致），
@@ -671,7 +675,12 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         {
             return false;
         }
-        self.branch_arm_reaches_shared_continuation_or_terminate(entry, shared, boundary)
+        // shared tail 只要求非逃逸路径到达；active loop 的 break/continue 臂已有独立 owner。
+        self.branch_arm_reaches_target_or_loop_escape_before_boundary(
+            entry,
+            shared,
+            Some(boundary),
+        )
             || self.branch_candidate_for_header(entry).is_some_and(|candidate| {
                 candidate.else_entry.is_none()
                     && candidate.then_entry == shared

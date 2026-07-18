@@ -1,0 +1,249 @@
+//! raw temp branch-value 树的单次 Decision 构建器。
+//!
+//! Structure/HIR lowering 可能把一条长短路值链展开成多层 `assign guard; if guard`。
+//! 父 pass 已证明候选只为同一 binding 选值；这里一次遍历整棵树，增量携带 local/temp
+//! 引用事实并建立 root-first Decision，最后只做一次 value finalize。它不会决定候选是否
+//! 能跨出根语句，也不会处理 local 壳或 goto/label 壳。
+//!
+//! 例子：`t0=a; if t0 then out=t0 else t1=b; if t1 ... end end` 会先建成两个 Decision
+//! 节点，再一次收敛为 `out = a or b or ...`，而不是每深入一层重扫和 clone 已构造子树。
+
+use std::collections::BTreeSet;
+
+use super::{BranchValueBinding, raw_temp_guard_shape, single_assign_value};
+use crate::hir::common::{
+    HirBlock, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr,
+    HirIf, HirLocalDecl, HirStmt, TempId,
+};
+use crate::hir::expr_safety::expr_is_repeatable;
+use crate::hir::simplify::visit::{HirVisitor, visit_expr};
+
+#[derive(Default)]
+struct BindingRefs(BTreeSet<BranchValueBinding>);
+
+impl BindingRefs {
+    fn in_expr(expr: &HirExpr) -> Self {
+        let mut collector = BindingRefCollector::default();
+        visit_expr(expr, &mut collector);
+        collector.refs
+    }
+
+    fn merge(&mut self, other: Self) {
+        let mut other = other.0;
+        if self.0.len() < other.len() {
+            std::mem::swap(&mut self.0, &mut other);
+        }
+        self.0.extend(other);
+    }
+
+    fn mentions(&self, binding: BranchValueBinding) -> bool {
+        self.0.contains(&binding)
+    }
+}
+
+#[derive(Default)]
+struct BindingRefCollector {
+    refs: BindingRefs,
+}
+
+impl HirVisitor for BindingRefCollector {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        match expr {
+            HirExpr::LocalRef(local) => {
+                self.refs.0.insert(BranchValueBinding::Local(*local));
+            }
+            HirExpr::TempRef(temp) => {
+                self.refs.0.insert(BranchValueBinding::Temp(*temp));
+            }
+            _ => {}
+        }
+    }
+}
+
+pub(super) struct CollapsedBranchValueTarget {
+    target: HirDecisionTarget,
+    refs: BindingRefs,
+}
+
+pub(super) struct BranchValueDecisionBuilder {
+    nodes: Vec<HirDecisionNode>,
+    raw_guards: BTreeSet<TempId>,
+}
+
+impl BranchValueDecisionBuilder {
+    pub(super) fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            raw_guards: BTreeSet::new(),
+        }
+    }
+
+    pub(super) fn collapse_if(
+        &mut self,
+        if_stmt: &HirIf,
+        binding: BranchValueBinding,
+    ) -> Option<CollapsedBranchValueTarget> {
+        let (node_ref, mut refs) = self.reserve_node(&if_stmt.cond);
+        let truthy = self.collapse_block(&if_stmt.then_block, binding)?;
+        let falsy = self.collapse_block(if_stmt.else_block.as_ref()?, binding)?;
+        self.complete_node(node_ref, truthy.target, falsy.target);
+        refs.merge(truthy.refs);
+        refs.merge(falsy.refs);
+        Some(CollapsedBranchValueTarget {
+            target: HirDecisionTarget::Node(node_ref),
+            refs,
+        })
+    }
+
+    fn collapse_block(
+        &mut self,
+        block: &HirBlock,
+        binding: BranchValueBinding,
+    ) -> Option<CollapsedBranchValueTarget> {
+        match block.stmts.as_slice() {
+            [HirStmt::Assign(assign)] => {
+                let expr = single_assign_value(assign, binding)?;
+                Some(CollapsedBranchValueTarget {
+                    target: HirDecisionTarget::Expr(expr.clone()),
+                    refs: BindingRefs::in_expr(expr),
+                })
+            }
+            [HirStmt::If(if_stmt)] => self.collapse_if(if_stmt, binding),
+            [HirStmt::LocalDecl(decl), HirStmt::If(if_stmt)] => {
+                self.collapse_local_guard(decl, if_stmt, binding)
+            }
+            [assign_stmt @ HirStmt::Assign(_), if_stmt @ HirStmt::If(_)] => {
+                self.collapse_raw_temp_guard(assign_stmt, if_stmt, binding)
+            }
+            _ => None,
+        }
+    }
+
+    fn collapse_local_guard(
+        &mut self,
+        decl: &HirLocalDecl,
+        if_stmt: &HirIf,
+        binding: BranchValueBinding,
+    ) -> Option<CollapsedBranchValueTarget> {
+        let [guard] = decl.bindings.as_slice() else {
+            return None;
+        };
+        let [value] = decl.values.fixed.as_slice() else {
+            return None;
+        };
+        if decl.values.tail.is_some()
+            || !matches!(if_stmt.cond, HirExpr::LocalRef(local) if local == *guard)
+        {
+            return None;
+        }
+        let [HirStmt::Assign(then_assign)] = if_stmt.then_block.stmts.as_slice() else {
+            return None;
+        };
+        if !matches!(single_assign_value(then_assign, binding)?, HirExpr::LocalRef(local) if local == guard)
+        {
+            return None;
+        }
+
+        let (node_ref, mut refs) = self.reserve_node(value);
+        let rest = self.collapse_block(if_stmt.else_block.as_ref()?, binding)?;
+        let guard = BranchValueBinding::Local(*guard);
+        if refs.mentions(guard) || rest.refs.mentions(guard) {
+            return None;
+        }
+        self.complete_node(node_ref, HirDecisionTarget::CurrentValue, rest.target);
+        refs.merge(rest.refs);
+        Some(CollapsedBranchValueTarget {
+            target: HirDecisionTarget::Node(node_ref),
+            refs,
+        })
+    }
+
+    fn collapse_raw_temp_guard(
+        &mut self,
+        assign_stmt: &HirStmt,
+        if_stmt: &HirStmt,
+        binding: BranchValueBinding,
+    ) -> Option<CollapsedBranchValueTarget> {
+        let shape = raw_temp_guard_shape(assign_stmt, if_stmt)?;
+        if shape.binding != binding {
+            return None;
+        }
+
+        let (node_ref, mut refs) = self.reserve_node(shape.value);
+        let rest = self.collapse_block(shape.rest_block, binding)?;
+        let guard = BranchValueBinding::Temp(shape.guard);
+        if refs.mentions(guard) || rest.refs.mentions(guard) {
+            return None;
+        }
+        let rest_target = rest.target;
+        let (truthy, falsy) = if shape.guard_is_truthy_value {
+            (HirDecisionTarget::CurrentValue, rest_target)
+        } else {
+            (rest_target, HirDecisionTarget::CurrentValue)
+        };
+        self.complete_node(node_ref, truthy, falsy);
+        self.raw_guards.insert(shape.guard);
+        refs.merge(rest.refs);
+        Some(CollapsedBranchValueTarget {
+            target: HirDecisionTarget::Node(node_ref),
+            refs,
+        })
+    }
+
+    fn reserve_node(&mut self, test: &HirExpr) -> (HirDecisionNodeRef, BindingRefs) {
+        let node_ref = HirDecisionNodeRef(self.nodes.len());
+        self.nodes.push(HirDecisionNode {
+            id: node_ref,
+            test: test.clone(),
+            truthy: HirDecisionTarget::CurrentValue,
+            falsy: HirDecisionTarget::CurrentValue,
+        });
+        (node_ref, BindingRefs::in_expr(test))
+    }
+
+    fn complete_node(
+        &mut self,
+        node_ref: HirDecisionNodeRef,
+        truthy: HirDecisionTarget,
+        falsy: HirDecisionTarget,
+    ) {
+        let node = &mut self.nodes[node_ref.index()];
+        node.truthy = normalize_current_value_target(&node.test, truthy);
+        node.falsy = normalize_current_value_target(&node.test, falsy);
+    }
+
+    pub(super) fn finish(
+        self,
+        root: CollapsedBranchValueTarget,
+        binding: BranchValueBinding,
+    ) -> Option<(HirExpr, BTreeSet<TempId>)> {
+        if root.refs.mentions(binding)
+            || self
+                .raw_guards
+                .iter()
+                .any(|guard| root.refs.mentions(BranchValueBinding::Temp(*guard)))
+        {
+            return None;
+        }
+        let value = match root.target {
+            HirDecisionTarget::Node(entry) => {
+                crate::hir::decision::finalize_value_decision_expr(HirDecisionExpr {
+                    entry,
+                    nodes: self.nodes,
+                })
+            }
+            HirDecisionTarget::Expr(expr) => expr,
+            HirDecisionTarget::CurrentValue => return None,
+        };
+        (!matches!(value, HirExpr::Decision(_))).then_some((value, self.raw_guards))
+    }
+}
+
+fn normalize_current_value_target(test: &HirExpr, target: HirDecisionTarget) -> HirDecisionTarget {
+    match target {
+        HirDecisionTarget::Expr(expr) if expr == *test && expr_is_repeatable(test) => {
+            HirDecisionTarget::CurrentValue
+        }
+        target => target,
+    }
+}

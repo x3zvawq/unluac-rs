@@ -765,14 +765,9 @@ impl StructuredBodyLowerer<'_, '_> {
         // repeat 的 continue target 同时承载循环条件，不能把任意短路出口当成
         // “自然继续”。另一臂的所有路径都必须在本轮回到条件块或退出 active repeat；
         // 不能依赖 nested loop 的形状，因为优化器可能已经把固定轮数循环完全展开。
-        let body_has_loop_owner = candidate.blocks.contains(&body_entry)
-            || self
-                .loop_candidate_from_preheader(body_entry)
-                .is_some_and(|nested| {
-                    nested
-                        .body_scope_blocks
-                        .is_subset(&candidate.body_scope_blocks)
-                });
+        // for/repeat 的源码 body 可能先经过普通 branch prefix，再进入没有独立
+        // preheader 的 nested loop；natural core 不包含这些提前退出路径。
+        let body_has_loop_owner = candidate.body_scope_blocks.contains(&body_entry);
         candidate.kind_hint == LoopKindHint::RepeatLike
             && body_has_loop_owner
             && self.branch_arm_reaches_stop_or_loop_escape(

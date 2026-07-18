@@ -27,6 +27,11 @@ impl StructuredBodyLowerer<'_, '_> {
         let Some(stop) = stop else {
             return merge;
         };
+        // short-circuit 已把当前计划收敛成显式 if-then 且缺省臂直达 stop 时，计划的
+        // merge 比原始 BranchRegion 的远端 merge 更精确，不能再把远端块提升成本轮 tail。
+        if else_entry.is_none() && merge == Some(stop) {
+            return Some(stop);
+        }
         if let Some(loop_continuation) = self.loop_body_shared_continuation_stop(
             block,
             then_entry,

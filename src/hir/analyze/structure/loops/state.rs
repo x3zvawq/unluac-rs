@@ -461,6 +461,31 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             &state_by_reg,
             target_overrides,
         );
+        for other_exit in candidate
+            .exits
+            .iter()
+            .copied()
+            .filter(|other| *other != exit)
+        {
+            let predecessors = self.lowering.cfg.reachable_predecessors(other_exit);
+            if predecessors.is_empty()
+                || predecessors
+                    .iter()
+                    .any(|block| !inside_exit_blocks.contains(block))
+            {
+                continue;
+            }
+            let live_in = self.lowering.dataflow.live_in_regs(other_exit);
+            for state in plan
+                .states
+                .iter()
+                .filter(|state| live_in.contains(&state.reg))
+            {
+                if let Some(expr) = lvalue_as_expr(&state.target) {
+                    self.install_entry_override(other_exit, state.reg, expr);
+                }
+            }
+        }
         // 同一 loop state 可能在主 post-loop 之后再次与另一条 body exit 合流；
         // 主出口仍携带当前 state，应和 loop blocks 一起作为该 merge 的内部来源。
         for other_exit in candidate

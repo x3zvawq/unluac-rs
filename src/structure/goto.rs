@@ -49,6 +49,7 @@ pub(super) fn analyze_goto_requirements(
                 cfg,
                 loop_candidates,
                 &membership.body_scope_owners_by_block,
+                &membership.body_scope_exit_targets_by_candidate,
                 loop_candidate,
                 *edge_ref,
             ) {
@@ -127,9 +128,11 @@ pub(super) fn analyze_goto_requirements(
 /// loop 候选 membership 的单次稠密投影。
 ///
 /// candidate identity 仍由切片下标精确区分；same-header 与退化候选不会被按 header
-/// 合并。入口边直接从 CFG edge 扫描投影到 owner，避免每个候选再次扫描全部 block。
+/// 合并。入口边直接从 CFG edge 扫描投影到 owner，body scope 的真实出口也在同轮缓存，
+/// 避免每条 backedge 再扫描完整候选区域。
 struct LoopMembershipIndex {
     body_scope_owners_by_block: Vec<Vec<usize>>,
+    body_scope_exit_targets_by_candidate: Vec<Vec<crate::structure::BlockRef>>,
     exit_owners_by_block: Vec<Vec<usize>>,
     entry_edges_by_candidate: Vec<Vec<EdgeRef>>,
 }
@@ -138,6 +141,7 @@ impl LoopMembershipIndex {
     fn new(cfg: &Cfg, candidates: &[LoopCandidate]) -> Self {
         let mut core_owners_by_block = vec![Vec::new(); cfg.blocks.len()];
         let mut body_scope_owners_by_block = vec![Vec::new(); cfg.blocks.len()];
+        let mut body_scope_exit_targets_by_candidate = vec![Vec::new(); candidates.len()];
         let mut exit_owners_by_block = vec![Vec::new(); cfg.blocks.len()];
         for (candidate_index, candidate) in candidates.iter().enumerate() {
             for block in &candidate.blocks {
@@ -145,6 +149,14 @@ impl LoopMembershipIndex {
             }
             for block in &candidate.body_scope_blocks {
                 body_scope_owners_by_block[block.index()].push(candidate_index);
+                if cfg.reachable_blocks.contains(block) {
+                    body_scope_exit_targets_by_candidate[candidate_index].extend(
+                        cfg.succs[block.index()]
+                            .iter()
+                            .map(|edge_ref| cfg.edges[edge_ref.index()].to)
+                            .filter(|target| !candidate.body_scope_blocks.contains(target)),
+                    );
+                }
             }
             for block in &candidate.exits {
                 exit_owners_by_block[block.index()].push(candidate_index);
@@ -166,6 +178,7 @@ impl LoopMembershipIndex {
 
         Self {
             body_scope_owners_by_block,
+            body_scope_exit_targets_by_candidate,
             exit_owners_by_block,
             entry_edges_by_candidate,
         }
@@ -177,6 +190,7 @@ fn backedge_crosses_nested_loop(
     cfg: &Cfg,
     candidates: &[LoopCandidate],
     body_scope_owners_by_block: &[Vec<usize>],
+    body_scope_exit_targets_by_candidate: &[Vec<crate::structure::BlockRef>],
     outer: &LoopCandidate,
     edge_ref: EdgeRef,
 ) -> bool {
@@ -184,25 +198,30 @@ fn backedge_crosses_nested_loop(
     edge.to == outer.header
         && body_scope_owners_by_block[edge.from.index()]
             .iter()
-            .map(|index| &candidates[*index])
-            .any(|inner| {
+            .any(|index| {
+                let inner = &candidates[*index];
                 inner.header != outer.header
                     && inner.blocks.len() < outer.blocks.len()
                     && inner.blocks.is_subset(&outer.body_scope_blocks)
-                    && !nested_loop_exits_to_outer_header(proto, cfg, inner, outer.header)
+                    && !nested_loop_body_scope_exits_to_outer_header(
+                        proto,
+                        cfg,
+                        &body_scope_exit_targets_by_candidate[*index],
+                        outer.header,
+                    )
             })
 }
 
-fn nested_loop_exits_to_outer_header(
+fn nested_loop_body_scope_exits_to_outer_header(
     proto: &LoweredProto,
     cfg: &Cfg,
-    inner: &LoopCandidate,
+    exit_targets: &[crate::structure::BlockRef],
     outer_header: crate::structure::BlockRef,
 ) -> bool {
-    inner.exits.contains(&outer_header)
-        && inner.exits.iter().all(|exit| {
-            *exit == outer_header
-                || transparent_loop_exit_target(proto, cfg, *exit) == Some(outer_header)
+    !exit_targets.is_empty()
+        && exit_targets.iter().all(|target| {
+            *target == outer_header
+                || transparent_loop_exit_target(proto, cfg, *target) == Some(outer_header)
         })
 }
 

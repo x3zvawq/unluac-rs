@@ -188,6 +188,10 @@ struct TableConstructorPass<'a> {
 
 impl HirRewritePass for TableConstructorPass<'_> {
     fn rewrite_block(&mut self, block: &mut crate::hir::common::HirBlock) -> bool {
+        if !block.stmts.iter().any(is_direct_constructor_candidate) {
+            return false;
+        }
+
         let mut changed = self.materialize_discarded_inline_set_lists(block);
         let mut scratch = RebuildScratch::default();
         // 稳定 stmt id 让 occurrence index 在删除已折叠 region 后仍能按源码顺序查询；
@@ -372,10 +376,7 @@ fn block_has_table_constructor_candidate(block: &crate::hir::common::HirBlock) -
 }
 
 fn stmt_has_table_constructor_candidate(stmt: &HirStmt) -> bool {
-    if constructor_seed(stmt).is_some()
-        || matches!(stmt, HirStmt::TableSetList(set_list)
-            if matches!(&set_list.base, HirExpr::TableConstructor(_)))
-    {
+    if is_direct_constructor_candidate(stmt) {
         return true;
     }
 
@@ -409,6 +410,12 @@ fn stmt_has_table_constructor_candidate(stmt: &HirStmt) -> bool {
         | HirStmt::Goto(_)
         | HirStmt::Label(_) => false,
     }
+}
+
+fn is_direct_constructor_candidate(stmt: &HirStmt) -> bool {
+    constructor_seed(stmt).is_some()
+        || matches!(stmt, HirStmt::TableSetList(set_list)
+            if matches!(&set_list.base, HirExpr::TableConstructor(_)))
 }
 
 fn discarded_inline_set_list_constructor(stmt: &HirStmt) -> Option<HirTableConstructor> {

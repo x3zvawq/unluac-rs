@@ -890,7 +890,10 @@ pub(crate) fn run_pipeline_case(
 
     // 重编译轮次：拿上一轮生成的源码，再走一遍 compile → decompile → compile → run → 对比 baseline，
     // 同时做前后两轮生成源码的文本收敛检查。
-    let rounds = recompile_rounds();
+    let rounds = entry
+        .options
+        .recompile_rounds
+        .unwrap_or_else(recompile_rounds);
     let mut prev_generated_source = generated.source.clone();
     for round in 1..=rounds {
         let round_label = format!("recompile-round-{round}");

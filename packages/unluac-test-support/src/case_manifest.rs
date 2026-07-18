@@ -70,6 +70,7 @@ pub(crate) struct LuaCaseOptions {
     pub(crate) naming_mode: Option<NamingMode>,
     pub(crate) luau_optimization_level: Option<u8>,
     pub(crate) luau_vector: Option<LuauVectorCaseOptions>,
+    pub(crate) recompile_rounds: Option<u32>,
 }
 
 impl LuaCaseOptions {
@@ -78,6 +79,7 @@ impl LuaCaseOptions {
         naming_mode: None,
         luau_optimization_level: None,
         luau_vector: None,
+        recompile_rounds: None,
     };
 }
 
@@ -133,11 +135,19 @@ const PUC_LUA_51: &[LuaCaseDialect] = &[LuaCaseDialect::Lua51];
 const LUA_51_AND_LUAU: &[LuaCaseDialect] = &[LuaCaseDialect::Lua51, LuaCaseDialect::Luau];
 const LUA_51_AND_LUAJIT: &[LuaCaseDialect] = &[LuaCaseDialect::Lua51, LuaCaseDialect::Luajit];
 const PUC_LUA_52: &[LuaCaseDialect] = &[LuaCaseDialect::Lua52];
+const PUC_LUA_54: &[LuaCaseDialect] = &[LuaCaseDialect::Lua54];
 const PUC_LUA_GE_52: &[LuaCaseDialect] = &[
     LuaCaseDialect::Lua52,
     LuaCaseDialect::Lua53,
     LuaCaseDialect::Lua54,
     LuaCaseDialect::Lua55,
+];
+const LUA_GOTO_DIALECTS: &[LuaCaseDialect] = &[
+    LuaCaseDialect::Lua52,
+    LuaCaseDialect::Lua53,
+    LuaCaseDialect::Lua54,
+    LuaCaseDialect::Lua55,
+    LuaCaseDialect::Luajit,
 ];
 const PUC_LUA_GE_53: &[LuaCaseDialect] = &[
     LuaCaseDialect::Lua53,
@@ -153,6 +163,7 @@ const LUAU_OPTIMIZED_OPTIONS: LuaCaseOptions = LuaCaseOptions {
     naming_mode: None,
     luau_optimization_level: Some(2),
     luau_vector: None,
+    recompile_rounds: None,
 };
 const LUAU_VECTOR_OPTIONS: LuaCaseOptions = LuaCaseOptions {
     retain_debug: false,
@@ -163,6 +174,11 @@ const LUAU_VECTOR_OPTIONS: LuaCaseOptions = LuaCaseOptions {
         constructor: "create",
         components: 3,
     }),
+    recompile_rounds: None,
+};
+const LONG_CHAIN_OPTIONS: LuaCaseOptions = LuaCaseOptions {
+    recompile_rounds: Some(0),
+    ..LuaCaseOptions::DEFAULT
 };
 
 const UNIT_CASES: &[LuaCaseMatrixEntry] = &[
@@ -1373,6 +1389,43 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_274_temp_live_use_boundaries.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_275_nested_loop_body_scope_exit.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_276_degenerate_generic_body_region.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_277_boundary_alias_snapshot.lua",
+        LUA_GOTO_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_278_conditional_captured_writeback.lua",
+        PUC_LUA_GE_52,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_279_repeat_short_body_scope_break.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_280_nested_loop_break_shared_tail.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_281_while_nested_loop_outer_break.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_282_long_logical_ast_depth.lua",
+        PUC_LUA_54,
+    )
+    .with_options(LONG_CHAIN_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_283_nested_table_candidate.lua",
         ALL_DIALECTS,
     ),
 ];

@@ -57,6 +57,29 @@ impl StructuredBodyLowerer<'_, '_> {
         target_overrides: &BTreeMap<TempId, HirLValue>,
         states: &[LoopStateSlot],
     ) -> Option<BreakExitBlock> {
+        self.lower_break_exit_pad_inner(
+            block,
+            post_loop,
+            downstream_post_loop,
+            target_overrides,
+            states,
+            &mut BTreeSet::new(),
+        )
+    }
+
+    fn lower_break_exit_pad_inner(
+        &self,
+        block: BlockRef,
+        post_loop: BlockRef,
+        downstream_post_loop: Option<BlockRef>,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+        states: &[LoopStateSlot],
+        visited: &mut BTreeSet<BlockRef>,
+    ) -> Option<BreakExitBlock> {
+        if !visited.insert(block) {
+            return None;
+        }
+
         // break 垫片允许是线性 cleanup，也允许是一个小型 if cleanup，再统一跳到
         // 循环之后的 continuation。继续限制在单入口、单 merge 的 pad 内，是为了只消费
         // StructureFacts 已能证明属于 break 出口的局部结构，避免退化成任意 exit 拼图。
@@ -76,6 +99,7 @@ impl StructuredBodyLowerer<'_, '_> {
                 downstream_post_loop,
                 &combined,
                 states,
+                visited,
             );
         }
 
@@ -151,6 +175,7 @@ impl StructuredBodyLowerer<'_, '_> {
         downstream_post_loop: Option<BlockRef>,
         target_overrides: &BTreeMap<TempId, HirLValue>,
         states: &[LoopStateSlot],
+        visited: &mut BTreeSet<BlockRef>,
     ) -> Option<BreakExitBlock> {
         // break pad 不一定只是单层 if；`elseif x then ... if a or b then ... end; break`
         // 这种形状会把短路 header 放在 break 前的 cleanup 里。这里复用 branch lowering
@@ -190,12 +215,13 @@ impl StructuredBodyLowerer<'_, '_> {
             // （例如 `if registered then unregister end; table.remove(...); break`）。
             // 这段 tail 仍然只允许通过已有的 break-pad 校验通往 post-loop，
             // 不能把任意 branch merge 都吞进循环出口。
-            self.lower_break_exit_pad(
+            self.lower_break_exit_pad_inner(
                 merge,
                 post_loop,
                 downstream_post_loop,
                 target_overrides,
                 states,
+                visited,
             )?
         };
 
@@ -210,11 +236,13 @@ impl StructuredBodyLowerer<'_, '_> {
             rewrite_expr_temps(&mut cond, entry_expr_overrides);
         }
 
-        let then_pad = self.lower_break_exit_pad_arm(plan.then_entry, merge, &arm_context)?;
+        let then_pad =
+            self.lower_break_exit_pad_arm(plan.then_entry, merge, &arm_context, visited)?;
         blocks.extend(then_pad.blocks.iter().copied());
         let else_pad = match plan.else_entry {
             Some(else_entry) => {
-                let pad = self.lower_break_exit_pad_arm(else_entry, merge, &arm_context)?;
+                let pad =
+                    self.lower_break_exit_pad_arm(else_entry, merge, &arm_context, visited)?;
                 blocks.extend(pad.blocks.iter().copied());
                 Some(pad.block)
             }
@@ -301,6 +329,7 @@ impl StructuredBodyLowerer<'_, '_> {
         block: BlockRef,
         merge: BlockRef,
         context: &BreakExitPadArmContext<'_>,
+        visited: &mut BTreeSet<BlockRef>,
     ) -> Option<BreakExitBlock> {
         if block == merge
             || block == context.post_loop
@@ -315,6 +344,9 @@ impl StructuredBodyLowerer<'_, '_> {
             return None;
         }
 
+        if !visited.insert(block) {
+            return None;
+        }
         if matches!(self.block_terminator(block), Some((_, LowInstr::Branch(_)))) {
             let mut nested = self.lower_branch_break_exit_pad(
                 block,
@@ -322,6 +354,7 @@ impl StructuredBodyLowerer<'_, '_> {
                 None,
                 context.target_overrides,
                 context.states,
+                visited,
             )?;
             if !matches!(nested.block.stmts.pop(), Some(HirStmt::Break)) {
                 return None;
@@ -351,7 +384,7 @@ impl StructuredBodyLowerer<'_, '_> {
                 target_overrides: &target_overrides,
                 ..*context
             };
-            let tail = self.lower_break_exit_pad_arm(target, merge, &nested_context)?;
+            let tail = self.lower_break_exit_pad_arm(target, merge, &nested_context, visited)?;
             stmts.extend(tail.block.stmts);
             blocks.extend(tail.blocks);
         }

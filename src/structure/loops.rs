@@ -9,6 +9,8 @@
 //!   记录成 `LoopSourceBindings::Numeric`
 //! - `GenericForCall/Loop` 会产出 `LoopKindHint::GenericForLike`，并把源码绑定区间
 //!   记录成 `LoopSourceBindings::Generic`
+//! - 无自身回边的 generic-for 以 body target 支配区域恢复完整语义 owner，零次迭代
+//!   出口仍保持在 body 外侧
 //! - `while ... do ... end` 的 header/exit phi 会被整理成 `inside/outside` 两臂的
 //!   incoming facts，后续 HIR 直接消费这些结构事实，不再自己回头拆 `phi.incoming`
 //! - 普通 `while/repeat` 只保留形态 hint，不会伪造额外 binding 证据
@@ -101,14 +103,8 @@ pub(super) fn analyze_loops(
         .map(|candidate| candidate.header)
         .collect::<BTreeSet<_>>();
 
-    let degenerate_generic_for_loops = analyze_degenerate_generic_for_loops(
-        proto,
-        cfg,
-        dataflow,
-        graph_facts,
-        &grouped_headers,
-        &loop_candidates,
-    );
+    let degenerate_generic_for_loops =
+        analyze_degenerate_generic_for_loops(proto, cfg, dataflow, graph_facts, &grouped_headers);
     loop_candidates.extend(degenerate_generic_for_loops);
     loop_candidates.extend(
         cfg.reachable_blocks
@@ -1294,15 +1290,12 @@ fn analyze_degenerate_generic_for_loops(
     dataflow: &DataflowFacts,
     graph_facts: &GraphFacts,
     grouped_headers: &BTreeSet<BlockRef>,
-    nested_loops: &[LoopCandidate],
 ) -> Vec<LoopCandidate> {
     cfg.reachable_blocks
         .iter()
         .copied()
         .filter(|header| !grouped_headers.contains(header))
-        .filter_map(|header| {
-            degenerate_generic_for_loop(proto, cfg, dataflow, graph_facts, nested_loops, header)
-        })
+        .filter_map(|header| degenerate_generic_for_loop(proto, cfg, dataflow, graph_facts, header))
         .collect()
 }
 
@@ -1311,7 +1304,6 @@ fn degenerate_generic_for_loop(
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     graph_facts: &GraphFacts,
-    nested_loops: &[LoopCandidate],
     header: BlockRef,
 ) -> Option<LoopCandidate> {
     let Some(LowInstr::GenericForLoop(instr)) = cfg.terminator(&proto.instrs, header) else {
@@ -1325,16 +1317,12 @@ fn degenerate_generic_for_loop(
         || same_or_transparent_jump_target(proto, cfg, instr.exit_target, instr.body_target);
     let mut blocks = BTreeSet::from([header]);
     if !immediate_break {
-        blocks.insert(body);
-    }
-    let mut owned_nested_loops = nested_loops
-        .iter()
-        .filter(|candidate| candidate.header == body && candidate.preheader == Some(header));
-    if let Some(nested) = owned_nested_loops.next() {
-        if owned_nested_loops.next().is_some() {
-            return None;
-        }
-        blocks.extend(nested.blocks.iter().copied());
+        blocks.extend(collect_forward_region_blocks(
+            cfg,
+            [body],
+            Some(exit),
+            Some((body, &graph_facts.dominator_tree)),
+        ));
     }
     if body == header
         || exit == header
@@ -1361,7 +1349,7 @@ fn degenerate_generic_for_loop(
     let preheader = unique_loop_preheader(cfg, header, &blocks);
     let header_value_merges = analyze_loop_header_value_merges(dataflow, header, &blocks);
     // 退化 generic-for 没有自身回边：header -> exit 表示零次迭代，语义上属于
-    // 循环外初值；只有 body（含直属 nested loop）到 exit 的边才是循环内写回。
+    // 循环外初值；只有被 body 支配的完整区域到 exit 的边才是循环内写回。
     let mut body_blocks = blocks.clone();
     body_blocks.remove(&header);
     let exit_value_merges =

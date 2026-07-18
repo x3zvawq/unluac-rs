@@ -58,66 +58,6 @@ pub(super) fn collect_prunable_bindings(
     bindings.into_iter().collect()
 }
 
-pub(super) fn prune_boundary_snapshot_self_assigns(
-    block: &mut HirBlock,
-    prunable_bindings: &BTreeSet<CarryBinding>,
-) -> bool {
-    if prunable_bindings.is_empty() {
-        return false;
-    }
-    let mut changed = false;
-
-    for index in 0..block.stmts.len() {
-        let top_level_boundary_snapshot = matches!(
-            block.stmts.get(index + 1),
-            Some(HirStmt::Goto(_) | HirStmt::Label(_))
-        );
-        let falls_through_to_label = matches!(block.stmts.get(index + 1), Some(HirStmt::Label(_)));
-
-        match &mut block.stmts[index] {
-            stmt @ HirStmt::Assign(_) if top_level_boundary_snapshot => {
-                changed |= prune_redundant_self_assign_components_in_stmt(stmt, prunable_bindings);
-            }
-            HirStmt::If(if_stmt) => {
-                changed |= prune_edge_snapshot_self_assigns(
-                    &mut if_stmt.then_block,
-                    falls_through_to_label,
-                    prunable_bindings,
-                );
-                if let Some(else_block) = &mut if_stmt.else_block {
-                    changed |= prune_edge_snapshot_self_assigns(
-                        else_block,
-                        falls_through_to_label,
-                        prunable_bindings,
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
-
-    changed |= prune_empty_assign_stmts(block);
-    changed
-}
-
-fn prune_edge_snapshot_self_assigns(
-    block: &mut HirBlock,
-    allow_fallthrough_to_label: bool,
-    prunable_bindings: &BTreeSet<CarryBinding>,
-) -> bool {
-    let mut changed = match block.stmts.as_mut_slice() {
-        [stmt @ HirStmt::Assign(_), HirStmt::Goto(_)] => {
-            prune_redundant_self_assign_components_in_stmt(stmt, prunable_bindings)
-        }
-        [stmt @ HirStmt::Assign(_)] if allow_fallthrough_to_label => {
-            prune_redundant_self_assign_components_in_stmt(stmt, prunable_bindings)
-        }
-        _ => false,
-    };
-    changed |= prune_empty_assign_stmts(block);
-    changed
-}
-
 fn prune_redundant_self_assign_components_in_stmt(
     stmt: &mut HirStmt,
     prunable_bindings: &BTreeSet<CarryBinding>,

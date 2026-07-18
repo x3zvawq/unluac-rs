@@ -321,7 +321,8 @@ impl StructuredBodyLowerer<'_, '_> {
         }
 
         let loop_candidate = self.loop_candidate(loop_context.candidate_id)?;
-        if loop_candidate.blocks.contains(&merge) {
+        // natural core 之外的提前退出 tail 仍在源码 loop body 内，不是跨结构 escape。
+        if loop_candidate.body_scope_blocks.contains(&merge) {
             return None;
         }
 
@@ -713,7 +714,8 @@ impl StructuredBodyLowerer<'_, '_> {
                     Some(non_continue_entry),
                     target_overrides,
                 );
-                let non_continue_block = self.lower_region(
+                let non_continue_block = self.lower_branch_arm_region(
+                    block,
                     non_continue_entry,
                     Some(continue_target),
                     &non_continue_target_overrides,
@@ -745,7 +747,8 @@ impl StructuredBodyLowerer<'_, '_> {
                 Some(non_continue_entry),
                 target_overrides,
             );
-            let non_continue_block = self.lower_region(
+            let non_continue_block = self.lower_branch_arm_region(
+                block,
                 non_continue_entry,
                 branch_stop,
                 &non_continue_target_overrides,
