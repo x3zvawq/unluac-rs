@@ -29,6 +29,7 @@ use crate::transformer::{
     LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange, ResultPack,
     SetListInstr, SetTableInstr, SetTableKind, SetUpvalueInstr, TbcInstr, TransformError,
     UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    instantiate_closure_children,
 };
 
 mod adapter;
@@ -72,7 +73,8 @@ fn lower_proto(
     };
     let (env_upvalues, children) = prepare_env_lowering(raw, parent_env_upvalues, child_lowerer)?;
     let mut lowerer = ProtoLowerer::new(raw, env_upvalues, dialect);
-    let (instrs, lowering_map) = lowerer.lower()?;
+    let (mut instrs, lowering_map) = lowerer.lower()?;
+    let children = instantiate_closure_children(&mut instrs, children);
 
     Ok(finish_lowered_proto(raw, children, instrs, lowering_map))
 }
@@ -1053,6 +1055,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst,
                             proto,
                             captures,
+                            creation: crate::transformer::ClosureCreation::Fresh,
                         })),
                     );
                     raw_index += 1;

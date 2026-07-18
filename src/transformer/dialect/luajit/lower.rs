@@ -22,7 +22,7 @@ use crate::transformer::{
     LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange, ResultPack, ReturnInstr,
     SetListInstr, SetTableInstr, SetTableKind, SetUpvalueInstr, TailCallInstr, TransformError,
     TypeGuardInstr, TypeGuardKind, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack,
-    VarArgInstr,
+    VarArgInstr, instantiate_closure_children,
 };
 
 const NO_REG: u8 = 0xff;
@@ -53,7 +53,8 @@ fn lower_proto(raw: &RawProto, fr2: bool) -> Result<LoweredProto, TransformError
         .map(|child| lower_proto(child, fr2))
         .collect::<Result<Vec<_>, _>>()?;
     let mut lowerer = ProtoLowerer::new(raw, fr2);
-    let (instrs, lowering_map) = lowerer.lower()?;
+    let (mut instrs, lowering_map) = lowerer.lower()?;
+    let children = instantiate_closure_children(&mut instrs, children);
 
     Ok(LoweredProto {
         source: raw.common.source.clone(),
@@ -395,6 +396,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst: reg_from_u8(a),
                             proto,
                             captures,
+                            creation: crate::transformer::ClosureCreation::Fresh,
                         })),
                     );
                     raw_index += 1;

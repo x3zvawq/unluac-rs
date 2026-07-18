@@ -15,17 +15,19 @@ mod debug {
     crate::debug::define_unavailable_stage_dump!(dump_lir);
 }
 
+pub(crate) use common::instantiate_closure_children;
+
 pub use common::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchInstr, BranchPredicate,
-    BranchSubject, CallInstr, CallKind, Capture, CaptureSource, CloseInstr, ClosureInstr,
-    ConcatInstr, CondOperand, ConstRef, ErrNilInstr, GenericForCallInstr, GenericForLoopInstr,
-    GenericForPrepInstr, GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, JumpInstr,
-    LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr,
-    LoweredChunk, LoweredProto, LoweringMap, MethodNameHint, MoveInstr, NewTableInstr,
-    NumberLiteral, NumericForInitInstr, NumericForLoopInstr, ProtoRef, RawInstrRef, Reg, RegRange,
-    ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetTableKind, SetUpvalueInstr,
-    TailCallInstr, TbcInstr, TypeGuardInstr, TypeGuardKind, UnaryOpInstr, UnaryOpKind,
-    UpvalueOperand, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    BranchSubject, CallInstr, CallKind, Capture, CaptureSource, CloseInstr, ClosureCreation,
+    ClosureInstr, ConcatInstr, CondOperand, ConstRef, ErrNilInstr, GenericForCallInstr,
+    GenericForLoopInstr, GenericForPrepInstr, GetTableInstr, GetTableKind, GetUpvalueInstr,
+    InstrRef, JumpInstr, LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr,
+    LoadNumberInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MethodNameHint, MoveInstr,
+    NewTableInstr, NumberLiteral, NumericForInitInstr, NumericForLoopInstr, ProtoRef, RawInstrRef,
+    Reg, RegRange, ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetTableKind,
+    SetUpvalueInstr, SharedClosureRef, TailCallInstr, TbcInstr, TypeGuardInstr, TypeGuardKind,
+    UnaryOpInstr, UnaryOpKind, UpvalueOperand, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
 };
 pub use debug::dump_lir;
 pub use error::TransformError;

@@ -77,22 +77,7 @@ pub(crate) fn expr_for_fixed_def(lowering: &ProtoLowering<'_>, def_id: DefId) ->
         LowInstr::Call(call) => expr_for_fixed_call(lowering, def_block, def_instr, call, def_reg),
         LowInstr::VarArg(vararg) => expr_for_fixed_vararg(vararg.results, def_reg),
         LowInstr::Closure(closure) if closure.dst == def_reg => {
-            Some(HirExpr::Closure(Box::new(HirClosureExpr {
-                proto: lowering.child_refs[closure.proto.index()],
-                captures: closure
-                    .captures
-                    .iter()
-                    .map(|capture| {
-                        lower_closure_capture(
-                            lowering,
-                            def_block,
-                            def_instr,
-                            closure.dst,
-                            capture.source,
-                        )
-                    })
-                    .collect(),
-            })))
+            Some(lower_closure_expr(lowering, def_block, def_instr, closure))
         }
         LowInstr::GenericForPrep(_) | LowInstr::GenericForCall(_) => None,
         LowInstr::SetUpvalue(_)

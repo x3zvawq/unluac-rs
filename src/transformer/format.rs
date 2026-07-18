@@ -7,8 +7,8 @@
 
 use super::{
     AccessBase, AccessKey, BinaryOpKind, BranchCond, BranchPredicate, BranchSubject, CallKind,
-    CaptureSource, CondOperand, GetTableKind, InstrRef, LowInstr, Reg, RegRange, ResultPack,
-    SetTableKind, UnaryOpKind, ValueOperand, ValuePack,
+    CaptureSource, ClosureCreation, CondOperand, GetTableKind, InstrRef, LowInstr, Reg, RegRange,
+    ResultPack, SetTableKind, UnaryOpKind, ValueOperand, ValuePack,
 };
 
 pub fn format_low_instr(instr: &LowInstr) -> String {
@@ -120,7 +120,13 @@ pub fn format_low_instr(instr: &LowInstr) -> String {
         LowInstr::VarArg(instr) => format!("vararg results={}", format_result_pack(instr.results)),
         LowInstr::Return(instr) => format!("return {}", format_value_pack(instr.values)),
         LowInstr::Closure(instr) => format!(
-            "closure {} <- {} captures=[{}]",
+            "{} {} <- {} captures=[{}]",
+            match instr.creation {
+                ClosureCreation::Fresh => "closure".to_owned(),
+                ClosureCreation::Reusable(shared) => {
+                    format!("closure-shared s{}", shared.0)
+                }
+            },
             format_reg(instr.dst),
             format_proto(instr.proto),
             instr

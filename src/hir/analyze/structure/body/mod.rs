@@ -78,6 +78,13 @@ pub(super) struct LoopStatePlan {
     pub(super) states: Vec<LoopStateSlot>,
     pub(super) backedge_target_overrides: BTreeMap<TempId, HirLValue>,
     pub(super) owned_phis: BTreeSet<PhiId>,
+    pub(super) stateful_exit: Option<StatefulLoopExit>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct StatefulLoopExit {
+    pub(super) effective_exit: BlockRef,
+    pub(super) flag: TempId,
 }
 
 #[derive(Debug, Clone)]
@@ -97,17 +104,30 @@ pub(super) struct ActiveLoopContext {
     pub(super) goto_exits: BTreeSet<BlockRef>,
     pub(super) state_slots: Vec<LoopStateSlot>,
     pub(super) post_loop_break: Option<HirBlock>,
+    pub(super) stateful_exit: Option<StatefulLoopExit>,
 }
 
 impl ActiveLoopContext {
     pub(super) fn break_stmts(&self, target: BlockRef) -> Vec<HirStmt> {
-        if target == self.post_loop {
+        let mut stmts = if target == self.post_loop {
             self.post_loop_break
                 .as_ref()
                 .map_or_else(|| vec![HirStmt::Break], |block| block.stmts.clone())
         } else {
             vec![HirStmt::Break]
+        };
+        if let Some(exit) = self.stateful_exit
+            && exit.effective_exit == target
+        {
+            stmts.insert(
+                0,
+                assign_stmt(
+                    vec![HirLValue::Temp(exit.flag)],
+                    vec![HirExpr::Boolean(true)],
+                ),
+            );
         }
+        stmts
     }
 }
 

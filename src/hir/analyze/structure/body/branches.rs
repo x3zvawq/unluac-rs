@@ -129,9 +129,38 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
 
         let short_plan = self.try_build_short_circuit_plan(block, stop)?;
         let mut plan = short_plan.or_else(|| self.build_plain_branch_plan(block))?;
-        if let Some(tail) = self.current_loop_shared_tail(&plan, stop) {
+        let original_merge = plan.merge;
+        let current_loop_shared_tail = self.current_loop_shared_tail(&plan, stop);
+        let current_loop_shared_tail_stop = current_loop_shared_tail.filter(|_| {
+            self.active_loops.last().is_some_and(|loop_context| {
+                original_merge.is_some_and(|merge| {
+                    loop_context.continue_target.is_some_and(|continue_target| {
+                        merge != continue_target
+                            && self.block_is_direct_loop_continue_entry(
+                                merge,
+                                continue_target,
+                                loop_context,
+                            )
+                    })
+                })
+            })
+        });
+        if let Some(tail) = current_loop_shared_tail {
             plan.merge = Some(tail);
         }
+        // 显式 continue 的透明 entry 不是当前 arm 的本地 stop；BVM branch 必须先在
+        // 共享 tail 收束可见臂，再把缺席臂作为 continue 降低，才能保留两边的 target owner。
+        let current_loop_owned_continue_stop = stop.filter(|branch_stop| {
+            plan.else_entry.is_none()
+                && plan.merge.is_some_and(|merge| {
+                    self.active_loop_owns_direct_continue_merge(block, merge, *branch_stop)
+                        && self.branch_arm_reaches_target_or_boundary_or_terminate(
+                            plan.then_entry,
+                            *branch_stop,
+                            merge,
+                        )
+                })
+        });
 
         if let Some(shared) = self.shared_continuation_branch(&plan, stop) {
             let checkpoint = self.checkpoint_state(stmts.len());
@@ -156,14 +185,18 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         for block in &plan.consumed_blocks {
             self.visited.insert(*block);
         }
-        let mut branch_stop = self.branch_stop_for_region(
-            block,
-            plan.then_entry,
-            plan.else_entry,
-            plan.merge,
-            stop,
-            &plan.consumed_blocks,
-        );
+        let mut branch_stop = current_loop_shared_tail_stop
+            .or(current_loop_owned_continue_stop)
+            .or_else(|| {
+                self.branch_stop_for_region(
+                    block,
+                    plan.then_entry,
+                    plan.else_entry,
+                    plan.merge,
+                    stop,
+                    &plan.consumed_blocks,
+                )
+            });
         if let Some(downstream) = self.if_then_downstream_merge_stop(&plan, branch_stop, stop) {
             branch_stop = Some(downstream);
         }
@@ -328,6 +361,36 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         .then_some(downstream)
     }
 
+    fn block_is_direct_loop_continue_entry(
+        &self,
+        block: BlockRef,
+        continue_target: BlockRef,
+        loop_context: &ActiveLoopContext,
+    ) -> bool {
+        block == continue_target
+            || (loop_context.continue_entries.contains(&block)
+                && self.lowering.cfg.unique_reachable_successor(block) == Some(continue_target))
+    }
+
+    fn active_loop_owns_direct_continue_merge(
+        &self,
+        header: BlockRef,
+        merge: BlockRef,
+        stop: BlockRef,
+    ) -> bool {
+        let Some(loop_context) = self.active_loops.last() else {
+            return false;
+        };
+        let Some(continue_target) = loop_context.continue_target else {
+            return false;
+        };
+        loop_context.continue_sources.contains(&header)
+            && (self.loop_candidate_from_preheader(stop).is_none()
+                || self.shared_tail_reaches_loop_continue(stop, continue_target, loop_context))
+            && self.block_is_direct_loop_continue_entry(merge, continue_target, loop_context)
+            && self.branch_value_merge_for_header(header).is_some()
+    }
+
     fn current_loop_shared_tail(
         &self,
         plan: &StructuredBranchPlan,
@@ -340,12 +403,24 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let region = self
             .branch_regions_by_header
             .get(plan.consumed_headers.first()?)?;
-        if stop != Some(continue_target) || !self.block_is_active_loop_escape(boundary) {
+        let boundary_is_loop_escape = self.block_is_active_loop_escape(boundary)
+            || self.block_is_direct_loop_continue_entry(boundary, continue_target, loop_context);
+        if stop != Some(continue_target) || !boundary_is_loop_escape {
             return None;
         }
         let direct_tails = self.lowering.cfg.preds[continue_target.index()]
             .iter()
-            .map(|edge| self.lowering.cfg.edges[edge.index()].from);
+            .map(|edge| self.lowering.cfg.edges[edge.index()].from)
+            .chain(
+                (boundary != continue_target)
+                    .then_some(boundary)
+                    .into_iter()
+                    .flat_map(|entry| {
+                        self.lowering.cfg.preds[entry.index()]
+                            .iter()
+                            .map(|edge| self.lowering.cfg.edges[edge.index()].from)
+                    }),
+            );
         let nested_loop_preheaders = self
             .lowering
             .structure
@@ -389,17 +464,19 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         continue_target: BlockRef,
         loop_context: &ActiveLoopContext,
     ) -> bool {
-        self.lowering.cfg.unique_reachable_successor(tail) == Some(continue_target)
-            || self
-                .loop_candidate_from_preheader(tail)
-                .is_some_and(|nested| {
-                    !nested.exits.is_empty()
-                        && nested.exits.iter().all(|exit| *exit == continue_target)
-                        && nested
-                            .blocks
-                            .iter()
-                            .all(|block| self.active_loop_contains(loop_context, *block))
-                })
+        let successor = self.lowering.cfg.unique_reachable_successor(tail);
+        successor.is_some_and(|entry| {
+            self.block_is_direct_loop_continue_entry(entry, continue_target, loop_context)
+        }) || self
+            .loop_candidate_from_preheader(tail)
+            .is_some_and(|nested| {
+                !nested.exits.is_empty()
+                    && nested.exits.iter().all(|exit| *exit == continue_target)
+                    && nested
+                        .blocks
+                        .iter()
+                        .all(|block| self.active_loop_contains(loop_context, *block))
+            })
     }
 
     fn entry_has_continue_owner_before_tail(
@@ -410,7 +487,21 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         continue_target: BlockRef,
         loop_context: &ActiveLoopContext,
     ) -> bool {
+        let explicit_continue_is_owned =
+            self.can_emit_continue_stmt() && loop_context.continue_sources.contains(&entry);
+        let branch_merge_is_continue = |branch: &BranchCandidate| {
+            branch.merge.is_some_and(|merge| {
+                merge == continue_target
+                    || (explicit_continue_is_owned
+                        && self.block_is_direct_loop_continue_entry(
+                            merge,
+                            continue_target,
+                            loop_context,
+                        ))
+            })
+        };
         let plain_merge_can_be_continue = self.loop_continue_target_is_empty(continue_target)
+            || explicit_continue_is_owned
             || self
                 .loop_candidate(loop_context.candidate_id)
                 .is_some_and(|candidate| {
@@ -430,7 +521,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
                     .branch_candidate_for_header(entry)
                     .is_some_and(|branch| {
                         branch.else_entry.is_none()
-                            && branch.merge == Some(continue_target)
+                            && branch_merge_is_continue(branch)
                             && self.branch_arm_reaches_target_or_boundary_or_terminate(
                                 branch.then_entry,
                                 tail,
@@ -452,6 +543,14 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             return Some(merge);
         }
         let stop = branch_stop?;
+        if plan.else_entry.is_none()
+            && plan.consumed_headers.first().is_some_and(|header| {
+                self.active_loop_owns_direct_continue_merge(*header, merge, stop)
+            })
+        {
+            // BVM 的显式 continue 缺席臂必须保留为 escape；否则它会继续执行共享 tail。
+            return Some(merge);
+        }
         if plan.else_entry.is_none()
             && plan.then_entry == stop
             && self.branch_arm_reaches_stop_or_loop_escape(merge, stop, stop)
@@ -789,6 +888,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             goto_exits: BTreeSet::new(),
             state_slots: Vec::new(),
             post_loop_break: None,
+            stateful_exit: None,
         };
 
         self.active_loops.push(loop_context);

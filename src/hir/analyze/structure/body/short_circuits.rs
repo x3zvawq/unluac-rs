@@ -155,7 +155,9 @@ impl StructuredBodyLowerer<'_, '_> {
 
         let current_continue_break_merge = self.short_circuit_continue_break_merge(truthy, falsy);
         if continue_break_merge.is_some() || current_continue_break_merge.is_some() {
-            let merge = current_continue_break_merge?;
+            let Some(merge) = current_continue_break_merge else {
+                return Some(None);
+            };
             let consumed_blocks =
                 self.branch_short_circuit_consumed_blocks(&consumed_headers, truthy, falsy, stop);
             return Some(Some(StructuredBranchPlan {
@@ -294,6 +296,23 @@ impl StructuredBodyLowerer<'_, '_> {
             }));
         }
 
+        // terminal guard 会把全图最近共同后支配点推到函数出口，但同一 header 的
+        // branch-value owner 仍可能证明两条非终止路径在本轮先汇入一个局部 continuation。
+        // 该 merge 必须留给外层 region 单次消费；否则两条 SC arm 都会降到 loop stop，
+        // 后降的 arm 会重入带 phi 的共享 tail，并让完整 proto lowering 失败。
+        if let Some(merge) = self.branch_value_shared_continuation(header, truthy, falsy, stop) {
+            let consumed_blocks =
+                self.branch_short_circuit_consumed_blocks(&consumed_headers, truthy, falsy, stop);
+            return Some(Some(StructuredBranchPlan {
+                cond,
+                then_entry: truthy,
+                else_entry: Some(falsy),
+                merge: Some(merge),
+                consumed_headers,
+                consumed_blocks,
+            }));
+        }
+
         let Some(merge) = self
             .lowering
             .graph_facts
@@ -312,6 +331,23 @@ impl StructuredBodyLowerer<'_, '_> {
             consumed_headers,
             consumed_blocks,
         }))
+    }
+
+    fn branch_value_shared_continuation(
+        &self,
+        header: BlockRef,
+        truthy: BlockRef,
+        falsy: BlockRef,
+        stop: Option<BlockRef>,
+    ) -> Option<BlockRef> {
+        let merge = self.branch_value_merge_for_header(header)?.merge;
+        if Some(merge) == stop || merge == truthy || merge == falsy {
+            return None;
+        }
+        let boundary = stop.unwrap_or(self.lowering.cfg.exit_block);
+        (self.branch_arm_reaches_shared_continuation_or_terminate(truthy, merge, boundary)
+            && self.branch_arm_reaches_shared_continuation_or_terminate(falsy, merge, boundary))
+        .then_some(merge)
     }
 
     fn short_circuit_preserves_plain_if_then_merge(
@@ -484,7 +520,8 @@ impl StructuredBodyLowerer<'_, '_> {
         stop: Option<BlockRef>,
         consumed_headers: &mut Vec<BlockRef>,
     ) -> bool {
-        let Some(next) = self.nestable_branch_short_circuit_plan(*truthy, stop, consumed_headers)
+        let Some(next) =
+            self.nestable_branch_short_circuit_plan(*truthy, *falsy, stop, consumed_headers)
         else {
             return false;
         };
@@ -518,7 +555,8 @@ impl StructuredBodyLowerer<'_, '_> {
         stop: Option<BlockRef>,
         consumed_headers: &mut Vec<BlockRef>,
     ) -> bool {
-        let Some(next) = self.nestable_branch_short_circuit_plan(*falsy, stop, consumed_headers)
+        let Some(next) =
+            self.nestable_branch_short_circuit_plan(*falsy, *truthy, stop, consumed_headers)
         else {
             return false;
         };
@@ -547,6 +585,7 @@ impl StructuredBodyLowerer<'_, '_> {
     fn nestable_branch_short_circuit_plan(
         &self,
         header: BlockRef,
+        sibling_exit: BlockRef,
         stop: Option<BlockRef>,
         consumed_headers: &[BlockRef],
     ) -> Option<BranchShortCircuitPlan> {
@@ -568,6 +607,10 @@ impl StructuredBodyLowerer<'_, '_> {
                     &next.consumed_headers,
                 )
         };
+        // 候选顺序只保证稳定，不代表出口优先级；错出口不能遮蔽后续同 header 候选。
+        let plan_matches_sibling = |next: &BranchShortCircuitPlan| {
+            next.truthy == sibling_exit || next.falsy == sibling_exit
+        };
         for plan in self
             .lowering
             .structure
@@ -576,11 +619,12 @@ impl StructuredBodyLowerer<'_, '_> {
             .filter(|candidate| candidate.header == header)
             .filter_map(|short| build_branch_short_circuit_plan_for_candidate(self.lowering, short))
         {
-            if plan_is_nestable(&plan) {
+            if plan_matches_sibling(&plan) && plan_is_nestable(&plan) {
                 return Some(plan);
             }
         }
         self.nestable_plain_branch_plan(header)
+            .filter(plan_matches_sibling)
             .filter(plan_is_nestable)
     }
 
@@ -590,7 +634,10 @@ impl StructuredBodyLowerer<'_, '_> {
                 || self
                     .branch_candidate_for_header(header)
                     .is_some_and(|branch| {
-                        branch.merge == Some(loop_context.post_loop)
+                        // one-arm guard 才能用“显式臂回环、缺席臂退出”证明自身就是
+                        // loop control；双臂分支还可能是更宽短路条件的末端节点。
+                        branch.else_entry.is_none()
+                            && branch.merge == Some(loop_context.post_loop)
                             && self.can_reach_avoiding_block(
                                 branch.then_entry,
                                 loop_context.header,

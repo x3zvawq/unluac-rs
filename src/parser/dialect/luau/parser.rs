@@ -49,7 +49,7 @@ struct FlatProto {
 
 enum FlatProtoSlot {
     Pending(Box<FlatProto>),
-    Building,
+    Built(Box<RawProto>),
     Consumed,
 }
 
@@ -99,11 +99,7 @@ impl LuauParserState {
         let layout = header
             .luau_layout()
             .expect("luau parser must produce a luau chunk layout");
-        let mut flat_protos = self
-            .parse_proto_table(&mut reader, layout)?
-            .into_iter()
-            .map(|proto| FlatProtoSlot::Pending(Box::new(proto)))
-            .collect::<Vec<_>>();
+        let flat_protos = self.parse_proto_table(&mut reader, layout)?;
         let main_index = usize::try_from(reader.read_varint_u32_luau("luau main proto id")?)
             .map_err(|_| ParseError::IntegerOverflow {
                 field: "luau main proto id",
@@ -116,7 +112,12 @@ impl LuauParserState {
             });
         }
 
-        let main = build_proto_tree(main_index, &mut flat_protos)?;
+        let mut remaining_uses = count_reachable_proto_uses(main_index, &flat_protos)?;
+        let mut proto_slots = flat_protos
+            .into_iter()
+            .map(|proto| FlatProtoSlot::Pending(Box::new(proto)))
+            .collect::<Vec<_>>();
+        let main = build_proto_tree(main_index, &mut proto_slots, &mut remaining_uses)?;
 
         Ok(RawChunk {
             header,
@@ -766,24 +767,36 @@ impl LuauParserState {
 fn build_proto_tree(
     proto_index: usize,
     flat_protos: &mut [FlatProtoSlot],
+    remaining_uses: &mut [usize],
 ) -> Result<RawProto, ParseError> {
+    let remaining = remaining_uses
+        .get_mut(proto_index)
+        .and_then(|remaining| remaining.checked_sub(1))
+        .ok_or(ParseError::UnsupportedValue {
+            field: "luau proto use count",
+            value: proto_index as u64,
+        })?;
+    remaining_uses[proto_index] = remaining;
     let slot = flat_protos
         .get_mut(proto_index)
         .ok_or(ParseError::UnsupportedValue {
             field: "luau proto index",
             value: proto_index as u64,
         })?;
-    let flat = match std::mem::replace(slot, FlatProtoSlot::Building) {
+    let flat = match std::mem::replace(slot, FlatProtoSlot::Consumed) {
         FlatProtoSlot::Pending(flat) => *flat,
-        FlatProtoSlot::Building => {
-            return Err(ParseError::UnsupportedValue {
-                field: "luau proto cycle",
-                value: proto_index as u64,
-            });
+        FlatProtoSlot::Built(proto) => {
+            if remaining == 0 {
+                flat_protos[proto_index] = FlatProtoSlot::Consumed;
+                return Ok(*proto);
+            }
+            let result = (*proto).clone();
+            flat_protos[proto_index] = FlatProtoSlot::Built(proto);
+            return Ok(result);
         }
         FlatProtoSlot::Consumed => {
             return Err(ParseError::UnsupportedValue {
-                field: "luau proto index reuse",
+                field: "luau proto use count",
                 value: proto_index as u64,
             });
         }
@@ -793,10 +806,47 @@ fn build_proto_tree(
         .child_indices
         .iter()
         .copied()
-        .map(|index| build_proto_tree(index, flat_protos))
+        .map(|index| build_proto_tree(index, flat_protos, remaining_uses))
         .collect::<Result<Vec<_>, _>>()?;
-    flat_protos[proto_index] = FlatProtoSlot::Consumed;
+    flat_protos[proto_index] = if remaining == 0 {
+        FlatProtoSlot::Consumed
+    } else {
+        FlatProtoSlot::Built(Box::new(proto.clone()))
+    };
     Ok(proto)
+}
+
+fn count_reachable_proto_uses(
+    main_index: usize,
+    flat_protos: &[FlatProto],
+) -> Result<Vec<usize>, ParseError> {
+    for (parent_index, flat) in flat_protos.iter().enumerate() {
+        if let Some(&child_index) = flat
+            .child_indices
+            .iter()
+            .find(|&&child_index| child_index >= parent_index)
+        {
+            return Err(ParseError::UnsupportedValue {
+                field: "luau child proto order",
+                value: child_index as u64,
+            });
+        }
+    }
+
+    let mut uses = vec![0; flat_protos.len()];
+    let mut visited = vec![false; flat_protos.len()];
+    let mut pending = vec![main_index];
+    uses[main_index] = 1;
+    while let Some(parent_index) = pending.pop() {
+        if std::mem::replace(&mut visited[parent_index], true) {
+            continue;
+        }
+        for &child_index in &flat_protos[parent_index].child_indices {
+            uses[child_index] += 1;
+            pending.push(child_index);
+        }
+    }
+    Ok(uses)
 }
 
 fn raw_pc_from_word_pc(word_pc: u32, raw_by_word: &[Option<u32>]) -> Result<u32, ParseError> {

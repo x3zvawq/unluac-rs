@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use super::exprs::{
     expr_for_const, expr_for_reg_use, expr_for_value_operand, global_name_for_access,
-    lower_binary_op, lower_branch_cond, lower_closure_capture, lower_method_name,
+    lower_binary_op, lower_branch_cond, lower_closure_expr, lower_method_name,
     lower_raw_table_get_expr, lower_raw_table_set_call, lower_table_access_expr,
     lower_table_access_target, lower_unary_op, lower_upvalue_operand_expr,
     lower_upvalue_operand_target, lower_value_pack,
@@ -23,9 +23,8 @@ use super::helpers::{
 };
 use super::lower::ProtoLowering;
 use crate::hir::common::{
-    HirCallExpr, HirCallStmt, HirClose, HirClosureExpr, HirExpr, HirLValue, HirLabelId,
-    HirLocalDecl, HirPackTail, HirStmt, HirTableSetList, HirToBeClosed, HirUnaryExpr, HirValuePack,
-    LocalId,
+    HirCallExpr, HirCallStmt, HirClose, HirExpr, HirLValue, HirLabelId, HirLocalDecl, HirPackTail,
+    HirStmt, HirTableSetList, HirToBeClosed, HirUnaryExpr, HirValuePack, LocalId,
 };
 use crate::structure::BlockRef;
 use crate::transformer::{
@@ -203,22 +202,7 @@ pub(super) fn lower_regular_instr(
             stmts.extend(fixed_assign(
                 lowering,
                 instr_ref,
-                vec![HirExpr::Closure(Box::new(HirClosureExpr {
-                    proto: lowering.child_refs[closure.proto.index()],
-                    captures: closure
-                        .captures
-                        .iter()
-                        .map(|capture| {
-                            lower_closure_capture(
-                                lowering,
-                                block,
-                                instr_ref,
-                                closure.dst,
-                                capture.source,
-                            )
-                        })
-                        .collect(),
-                }))],
+                vec![lower_closure_expr(lowering, block, instr_ref, closure)],
             ));
             stmts
         }

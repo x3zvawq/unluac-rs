@@ -19,14 +19,14 @@ use super::structure::build_structured_body;
 use crate::ast::AstTargetDialect;
 use crate::decompile::{DecompileContext, DecompileState};
 use crate::hir::common::{
-    HirBlock, HirExpr, HirLValue, HirProto, HirProtoRef, HirStmt, LocalId, ParamId, TempId,
-    UpvalueId,
+    HirBlock, HirClosureExpr, HirExpr, HirLValue, HirLocalDecl, HirProto, HirProtoRef, HirStmt,
+    HirValuePack, LocalId, ParamId, TempId, UpvalueId,
 };
 use crate::structure::{BlockRef, Cfg, CfgGraph, DataflowFacts, GraphFacts, OpenDefId, PhiId};
 use crate::structure::{ShortCircuitExit, StructureFacts};
 use crate::transformer::{
-    AccessBase, AccessKey, CallKind, GetTableKind, InstrRef, LowInstr, LoweredProto, Reg,
-    ResultPack, ValuePack,
+    AccessBase, AccessKey, CallKind, ClosureCreation, GetTableKind, InstrRef, LowInstr,
+    LoweredProto, ProtoRef, Reg, ResultPack, SharedClosureRef, ValuePack,
 };
 
 pub(super) struct ProtoBindings {
@@ -121,6 +121,7 @@ pub(super) struct ProtoLowering<'a> {
     pub(super) structure: &'a StructureFacts,
     pub(super) child_refs: &'a [HirProtoRef],
     pub(super) bindings: ProtoBindings,
+    pub(super) shared_closure_locals: BTreeMap<SharedClosureRef, (LocalId, ProtoRef)>,
     pub(super) open_pack_owners: Vec<Option<InstrRef>>,
     pub(super) owned_open_producers: Vec<bool>,
 }
@@ -205,7 +206,7 @@ fn lower_proto_node(
         .collect::<Vec<_>>();
 
     let slot_epochs = SlotEpochFacts::analyze(proto, cfg, graph_facts, dataflow);
-    let bindings = build_bindings(
+    let mut bindings = build_bindings(
         proto,
         cfg,
         dataflow,
@@ -213,6 +214,7 @@ fn lower_proto_node(
         &slot_epochs,
         &child_mutable_upvalues,
     );
+    let shared_closure_locals = build_shared_closure_locals(proto, &mut bindings);
     let open_pack_owners = build_open_pack_owners(proto, cfg, dataflow);
     let mut owned_open_producers = vec![false; proto.instrs.len()];
     for def in &dataflow.open_defs {
@@ -229,6 +231,7 @@ fn lower_proto_node(
         structure,
         child_refs: &child_refs,
         bindings,
+        shared_closure_locals,
         open_pack_owners,
         owned_open_producers,
     };
@@ -297,6 +300,33 @@ fn mutable_upvalues_for_proto(
         }
     }
     mutable
+}
+
+fn build_shared_closure_locals(
+    proto: &LoweredProto,
+    bindings: &mut ProtoBindings,
+) -> BTreeMap<SharedClosureRef, (LocalId, ProtoRef)> {
+    let mut occurrences = BTreeMap::<SharedClosureRef, (usize, ProtoRef)>::new();
+    for closure in proto.instrs.iter().filter_map(|instr| match instr {
+        LowInstr::Closure(closure) if closure.captures.is_empty() => Some(closure),
+        _ => None,
+    }) {
+        let ClosureCreation::Reusable(identity) = closure.creation else {
+            continue;
+        };
+        let (count, _) = occurrences.entry(identity).or_insert((0, closure.proto));
+        *count += 1;
+    }
+    occurrences
+        .into_iter()
+        .filter(|(_, (count, _))| *count > 1)
+        .map(|(identity, (_, proto))| {
+            let local = LocalId(bindings.locals.len());
+            bindings.locals.push(local);
+            bindings.local_debug_hints.push(None);
+            (identity, (local, proto))
+        })
+        .collect()
 }
 
 fn build_open_pack_owners(
@@ -497,6 +527,15 @@ fn open_producer_start(proto: &LoweredProto, producer: InstrRef) -> Option<Reg> 
 }
 
 impl ProtoLowering<'_> {
+    pub(super) fn shared_closure_local(&self, creation: ClosureCreation) -> Option<LocalId> {
+        let ClosureCreation::Reusable(identity) = creation else {
+            return None;
+        };
+        self.shared_closure_locals
+            .get(&identity)
+            .map(|(local, _)| *local)
+    }
+
     pub(super) fn owns_open_pack(&self, def: OpenDefId, consumer: InstrRef) -> bool {
         self.open_pack_owners.get(def.index()).copied().flatten() == Some(consumer)
     }
@@ -512,6 +551,20 @@ impl ProtoLowering<'_> {
 fn build_proto_body(target: AstTargetDialect, lowering: &ProtoLowering<'_>) -> HirBlock {
     let mut body = build_structured_body(target, lowering);
     let mut prefix = local_decl_stmts(lowering.bindings.capture_entry_local_decls.clone());
+    prefix.extend(
+        lowering
+            .shared_closure_locals
+            .values()
+            .map(|(local, proto)| {
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![*local],
+                    values: HirValuePack::fixed(vec![HirExpr::Closure(Box::new(HirClosureExpr {
+                        proto: lowering.child_refs[proto.index()],
+                        captures: Vec::new(),
+                    }))]),
+                }))
+            }),
+    );
     prefix.append(&mut body.stmts);
     body.stmts = prefix;
     body

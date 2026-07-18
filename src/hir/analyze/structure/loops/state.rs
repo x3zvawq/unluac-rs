@@ -56,7 +56,10 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         // 这里先把进入循环前的初值、回边写回目标和退出循环后的可见身份一次性整理好，
         // 避免后面再靠局部规则去猜"这个 phi 其实是 while/repeat/for 的状态"。
         let excluded = excluded_regs.iter().copied().collect::<BTreeSet<_>>();
-        let mut plan = LoopStatePlan::default();
+        let mut plan = LoopStatePlan {
+            stateful_exit: self.stateful_loop_exit(candidate, exit, target_overrides),
+            ..LoopStatePlan::default()
+        };
         let mut planned_regs = BTreeSet::new();
 
         for value in Self::header_values(candidate) {
@@ -117,13 +120,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         let inside_exit_blocks = self
             .loop_state_inside_exit_blocks(candidate_id, candidate, exit)
             .unwrap_or_else(|| candidate.blocks.clone());
-        let state_exit = if Self::exit_values(candidate, exit).next().is_some() {
-            exit
-        } else {
-            self.normalized_post_loop_successor(exit)
-                .filter(|downstream| Self::exit_values(candidate, *downstream).next().is_some())
-                .unwrap_or(exit)
-        };
+        let state_exit = self.loop_state_exit(candidate, exit, plan.stateful_exit);
 
         for value in Self::exit_values(candidate, state_exit) {
             if excluded.contains(&value.reg)
@@ -188,8 +185,170 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             &mut plan,
         );
         self.extend_generic_for_owned_phi_overrides(candidate, &mut plan);
+        if let Some(stateful) = plan.stateful_exit {
+            Self::defer_stateful_loop_exit_states(candidate, stateful, &mut plan);
+        }
 
         Some(plan)
+    }
+
+    fn loop_state_exit(
+        &self,
+        candidate: &LoopCandidate,
+        exit: BlockRef,
+        stateful_exit: Option<StatefulLoopExit>,
+    ) -> BlockRef {
+        if Self::exit_values(candidate, exit).next().is_some() {
+            return exit;
+        }
+        stateful_exit
+            .map(|stateful| stateful.effective_exit)
+            .or_else(|| self.normalized_post_loop_successor(exit))
+            .filter(|downstream| Self::exit_values(candidate, *downstream).next().is_some())
+            .unwrap_or(exit)
+    }
+
+    /// 识别“正常出口先写结果、early exit 绕过该写入，再在唯一后继合流”的 loop。
+    ///
+    /// flag 复用正常出口上只流入该 merge phi 的固定 def；它在 phi 被 loop state
+    /// 接管后不再有原始值身份，因此无需扩展 proto bindings，也不会挤占用户 local。
+    pub(super) fn stateful_loop_exit(
+        &self,
+        candidate: &LoopCandidate,
+        normal_exit: BlockRef,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<StatefulLoopExit> {
+        if !matches!(
+            candidate.kind_hint,
+            LoopKindHint::NumericForLike | LoopKindHint::GenericForLike
+        ) {
+            return None;
+        }
+        let effective_exit = self.lowering.cfg.unique_reachable_successor(normal_exit)?;
+        if !candidate.exits.contains(&effective_exit) {
+            return None;
+        }
+        match self.block_terminator(normal_exit) {
+            Some((_instr_ref, LowInstr::Jump(jump)))
+                if self.lowering.cfg.instr_to_block[jump.target.index()] == effective_exit => {}
+            Some((_instr_ref, instr)) if !instr.is_control_terminator() => {}
+            None => {}
+            Some(_) => return None,
+        }
+
+        let loop_owned_flag = Self::exit_values(candidate, effective_exit).find_map(|value| {
+            let SsaValue::Def(def) = value.outside_arm.incoming_for_pred(normal_exit)?.value else {
+                return None;
+            };
+            if self.lowering.dataflow.def_block(def) != normal_exit
+                || !self
+                    .lowering
+                    .dataflow
+                    .def_uses
+                    .get(def.index())
+                    .is_none_or(Vec::is_empty)
+                || !matches!(
+                    self.lowering.dataflow.def_phi_uses.get(def.index()),
+                    Some(uses) if uses.as_slice() == [value.phi_id]
+                )
+            {
+                return None;
+            }
+            let temp = self.lowering.bindings.fixed_temps[def.index()];
+            (!self
+                .lowering
+                .bindings
+                .captured_temp_targets
+                .contains_key(&temp))
+            .then_some(temp)
+        });
+        let flag = loop_owned_flag.or_else(|| {
+            let normal_range = self.lowering.cfg.blocks[normal_exit.index()].instrs;
+            self.lowering.dataflow.instr_defs[normal_range.start.index()..normal_range.end()]
+                .iter()
+                .flatten()
+                .copied()
+                .find_map(|def| {
+                    let temp = self.lowering.bindings.fixed_temps[def.index()];
+                    let target = target_overrides.get(&temp)?;
+                    let has_inside_owner = candidate.blocks.iter().any(|block| {
+                        let range = self.lowering.cfg.blocks[block.index()].instrs;
+                        self.lowering.dataflow.instr_defs[range.start.index()..range.end()]
+                            .iter()
+                            .flatten()
+                            .any(|inside_def| {
+                                target_overrides
+                                    .get(&self.lowering.bindings.fixed_temps[inside_def.index()])
+                                    == Some(target)
+                            })
+                    });
+                    (has_inside_owner
+                        && self
+                            .lowering
+                            .dataflow
+                            .def_uses
+                            .get(def.index())
+                            .is_none_or(Vec::is_empty)
+                        && self
+                            .lowering
+                            .dataflow
+                            .def_phi_uses
+                            .get(def.index())
+                            .is_some_and(|uses| !uses.is_empty())
+                        && !self
+                            .lowering
+                            .bindings
+                            .captured_temp_targets
+                            .contains_key(&temp))
+                    .then_some(temp)
+                })
+        })?;
+
+        Some(StatefulLoopExit {
+            effective_exit,
+            flag,
+        })
+    }
+
+    pub(super) fn defer_stateful_loop_exit_states(
+        candidate: &LoopCandidate,
+        stateful: StatefulLoopExit,
+        plan: &mut LoopStatePlan,
+    ) {
+        let exit_phis = Self::exit_values(candidate, stateful.effective_exit)
+            .map(|value| value.phi_id)
+            .collect::<BTreeSet<_>>();
+        for state in &mut plan.states {
+            if state.phi_id.is_some_and(|phi| exit_phis.contains(&phi)) {
+                // 正常出口 prefix 会在 loop 后、且仅在未 early-exit 时写入 target；
+                // 这里仅建立 target owner，不能把 prefix 表达式提前求值。
+                state.initialize_target = false;
+            }
+        }
+    }
+
+    pub(super) fn lower_stateful_loop_exit_prefix(
+        &self,
+        normal_exit: BlockRef,
+        plan: &LoopStatePlan,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+    ) -> Option<HirBlock> {
+        let mut overrides = target_overrides.clone();
+        let states = state_slots_by_reg(&plan.states);
+        let range = self.lowering.cfg.blocks[normal_exit.index()].instrs;
+        for instr_index in range.start.index()..range.end() {
+            for def in &self.lowering.dataflow.instr_defs[instr_index] {
+                if let Some(state) = states.get(&self.lowering.dataflow.def_reg(*def)) {
+                    overrides.insert(
+                        self.lowering.bindings.fixed_temps[def.index()],
+                        state.target.clone(),
+                    );
+                }
+            }
+        }
+        Some(HirBlock {
+            stmts: self.lower_block_prefix(normal_exit, false, &overrides)?,
+        })
     }
 
     fn extend_loop_state_input_overrides(

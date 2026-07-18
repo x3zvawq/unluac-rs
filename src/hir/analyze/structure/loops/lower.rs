@@ -130,6 +130,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             post_loop,
             &combined_target_overrides,
             &plan.states,
+            None,
         )?;
         loop_context.loop_blocks = loop_body_blocks(candidate).clone();
         loop_context.continue_target = Some(candidate.header);
@@ -363,6 +364,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             post_loop,
             &combined_target_overrides,
             &plan.states,
+            None,
         )?;
         loop_context.loop_blocks = loop_body_blocks(candidate).clone();
         loop_context.continue_target = Some(candidate.header);
@@ -440,6 +442,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             exit,
             &combined_target_overrides,
             &plan.states,
+            None,
         )?;
         loop_context.loop_blocks = loop_body_blocks(candidate).clone();
         loop_context.state_slots = plan.states.clone();
@@ -610,6 +613,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             post_loop,
             &combined_target_overrides,
             &plan.states,
+            None,
         )?;
         loop_context.loop_blocks = loop_body_blocks(candidate).clone();
         loop_context.state_slots = plan.states.clone();
@@ -752,6 +756,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             exit,
             &combined_target_overrides,
             &plan.states,
+            None,
         )?;
         loop_context.body_stop = Some(body_stop);
         loop_context.loop_blocks = loop_body_blocks(candidate).clone();
@@ -873,6 +878,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             &[init.index],
             target_overrides,
         )?;
+        let stateful_exit = plan.stateful_exit;
         for state in &mut plan.states {
             if state.reg == init.binding {
                 // numeric-for 语法本身在每轮初始化 binding；这里只保留
@@ -899,6 +905,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.visited.insert(block);
         stmts.extend(self.lower_block_prefix(block, false, target_overrides)?);
         stmts.extend(loop_state_init_stmts(&plan));
+        stmts.extend(stateful_exit.map(stateful_loop_exit_init_stmt));
 
         for phi_id in &suppressed {
             self.overrides.suppress_phi(*phi_id);
@@ -910,6 +917,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             exit,
             &combined_target_overrides,
             &plan.states,
+            stateful_exit,
         )?;
         loop_context.loop_blocks = loop_body_blocks(candidate).clone();
         loop_context.state_slots = plan.states.clone();
@@ -963,7 +971,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             body,
         })));
 
-        Some(Some(exit))
+        Some(Some(self.finish_stateful_loop_exit(
+            exit,
+            stateful_exit,
+            &plan,
+            &combined_target_overrides,
+            stmts,
+        )?))
     }
 
     pub(crate) fn try_lower_generic_for_preheader(
@@ -1019,6 +1033,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             &excluded_regs,
             target_overrides,
         )?;
+        let stateful_exit = plan.stateful_exit;
         self.suppress_unstructured_preheader_state_phis(block, &plan);
         let combined_target_overrides =
             merge_target_overrides(target_overrides, &plan.backedge_target_overrides);
@@ -1029,6 +1044,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         self.visited.insert(block);
         stmts.extend(self.lower_block_prefix(block, false, target_overrides)?);
         stmts.extend(loop_state_init_stmts(&plan));
+        stmts.extend(stateful_exit.map(stateful_loop_exit_init_stmt));
         for phi_id in &plan.owned_phis {
             self.overrides.suppress_phi(*phi_id);
         }
@@ -1039,6 +1055,7 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             exit,
             &combined_target_overrides,
             &plan.states,
+            stateful_exit,
         )?;
         loop_context.loop_blocks = loop_body_blocks(candidate).clone();
         loop_context.state_slots = plan.states.clone();
@@ -1073,7 +1090,35 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
             body,
         })));
 
-        Some(Some(exit))
+        Some(Some(self.finish_stateful_loop_exit(
+            exit,
+            stateful_exit,
+            &plan,
+            &combined_target_overrides,
+            stmts,
+        )?))
+    }
+
+    fn finish_stateful_loop_exit(
+        &mut self,
+        normal_exit: BlockRef,
+        stateful: Option<StatefulLoopExit>,
+        plan: &LoopStatePlan,
+        target_overrides: &BTreeMap<TempId, HirLValue>,
+        stmts: &mut Vec<HirStmt>,
+    ) -> Option<BlockRef> {
+        let Some(stateful) = stateful else {
+            return Some(normal_exit);
+        };
+        let normal_prefix =
+            self.lower_stateful_loop_exit_prefix(normal_exit, plan, target_overrides)?;
+        self.visited.insert(normal_exit);
+        stmts.push(branch_stmt(
+            HirExpr::TempRef(stateful.flag).negate(),
+            normal_prefix,
+            None,
+        ));
+        Some(stateful.effective_exit)
     }
 
     /// 只消费 Structure 已绑定到本 candidate 的 VM cleanup。
@@ -1107,6 +1152,13 @@ impl<'a, 'b> StructuredBodyLowerer<'a, 'b> {
         }
         self.overrides.suppress_instrs(boundaries);
     }
+}
+
+fn stateful_loop_exit_init_stmt(exit: StatefulLoopExit) -> HirStmt {
+    assign_stmt(
+        vec![HirLValue::Temp(exit.flag)],
+        vec![HirExpr::Boolean(false)],
+    )
 }
 
 fn temp_refs_in_eval_order(expr: &HirExpr) -> Vec<TempId> {

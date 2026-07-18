@@ -1428,6 +1428,41 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_283_nested_table_candidate.lua",
         ALL_DIALECTS,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_284_luau_short_bvm_terminal_loop.lua",
+        LUAU_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_285_short_circuit_nested_break_tail.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_286_luau_continue_bvm_shared_tail.lua",
+        LUAU_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_287_luau_continue_nested_loop_tail.lua",
+        LUAU_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_288_luau_shared_proto_dag.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_289_luau_closure_creation_identity.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_290_luau_numeric_for_early_continue_tail.lua",
+        LUAU_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_291_luau_inlined_loop_stateful_exit.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {

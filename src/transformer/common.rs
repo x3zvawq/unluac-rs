@@ -4,7 +4,7 @@
 //! Dataflow、HIR 共同依赖的稳定契约；具体某个 dialect 的 lowering 规则可以
 //! 分目录演进，但这里的类型应该尽量保持统一、明确、可复用。
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 use crate::parser::{
     ChunkHeader, Origin, ProtoFrameInfo, ProtoLineRange, ProtoSignature, RawConstPool,
@@ -174,6 +174,16 @@ impl ProtoRef {
     pub const fn index(self) -> usize {
         self.0
     }
+}
+
+/// 当前 proto 常量表中可复用的闭包对象身份。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct SharedClosureRef(pub usize);
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum ClosureCreation {
+    Fresh,
+    Reusable(SharedClosureRef),
 }
 
 /// raw bytecode 原本就允许 RK 的位置，在 low-IR 里继续保留寄存器/常量二选一。
@@ -603,6 +613,46 @@ pub struct ClosureInstr {
     pub dst: Reg,
     pub proto: ProtoRef,
     pub captures: Vec<Capture>,
+    pub creation: ClosureCreation,
+}
+
+pub(crate) fn instantiate_closure_children(
+    instrs: &mut [LowInstr],
+    children: Vec<LoweredProto>,
+) -> Vec<LoweredProto> {
+    let mut instances = children;
+    let mut claimed = vec![false; instances.len()];
+    let mut shared_instances = BTreeMap::new();
+
+    for closure in instrs.iter_mut().filter_map(|instr| match instr {
+        LowInstr::Closure(closure) => Some(closure),
+        _ => None,
+    }) {
+        let source = closure.proto.index();
+        closure.proto = match closure.creation {
+            ClosureCreation::Fresh => {
+                instantiate_closure_child(source, &mut claimed, &mut instances)
+            }
+            ClosureCreation::Reusable(shared) => *shared_instances
+                .entry(shared)
+                .or_insert_with(|| instantiate_closure_child(source, &mut claimed, &mut instances)),
+        };
+    }
+
+    instances
+}
+
+fn instantiate_closure_child(
+    source: usize,
+    claimed: &mut [bool],
+    instances: &mut Vec<LoweredProto>,
+) -> ProtoRef {
+    if !std::mem::replace(&mut claimed[source], true) {
+        return ProtoRef(source);
+    }
+    let instance = ProtoRef(instances.len());
+    instances.push(instances[source].clone());
+    instance
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]

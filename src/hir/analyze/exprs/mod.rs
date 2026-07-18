@@ -21,8 +21,8 @@ use crate::structure::BlockRef;
 use crate::structure::{DefId, SsaValue};
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpKind, BranchCond, BranchPredicate, BranchSubject, CallKind,
-    CondOperand, ConstRef, InstrRef, LowInstr, LoweredProto, MethodNameHint, Reg, ResultPack,
-    UnaryOpKind, UpvalueOperand, ValueOperand,
+    ClosureInstr, CondOperand, ConstRef, InstrRef, LowInstr, LoweredProto, MethodNameHint, Reg,
+    ResultPack, UnaryOpKind, UpvalueOperand, ValueOperand,
 };
 
 pub(super) use self::access::{
@@ -54,6 +54,27 @@ use self::regs::{
 };
 use super::ProtoLowering;
 use super::helpers::{concat_expr, decode_raw_string, raw_lua_string, unresolved_expr};
+
+pub(super) fn lower_closure_expr(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    closure: &ClosureInstr,
+) -> HirExpr {
+    if let Some(local) = lowering.shared_closure_local(closure.creation) {
+        return HirExpr::LocalRef(local);
+    }
+    HirExpr::Closure(Box::new(HirClosureExpr {
+        proto: lowering.child_refs[closure.proto.index()],
+        captures: closure
+            .captures
+            .iter()
+            .map(|capture| {
+                lower_closure_capture(lowering, block, instr_ref, closure.dst, capture.source)
+            })
+            .collect(),
+    }))
+}
 
 /// `Open(start)` 不是“只有一个开放尾值”，而是“从 start 到 top 的整段值包”。
 ///

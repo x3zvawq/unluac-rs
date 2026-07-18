@@ -4,6 +4,8 @@
 //! 折进 raw 层了；这里专注做语义恢复，把它翻成项目里既有的 CFG/HIR/AST 管线能理解
 //! 的稳定 low-IR 契约。
 
+use std::collections::BTreeSet;
+
 use crate::parser::{
     LuauCaptureKind, LuauConstEntry, LuauInstrExtra, LuauOpcode, LuauOperands, RawChunk,
     RawLiteralConst, RawProto,
@@ -19,12 +21,13 @@ use crate::transformer::dialect::puc_lua::{
 use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchPredicate, CallInstr,
-    CallKind, Capture, CaptureSource, CloseInstr, ClosureInstr, ConcatInstr, CondOperand, ConstRef,
-    GenericForCallInstr, GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, LoadBoolInstr,
-    LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto,
-    LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange, ResultPack, ReturnInstr,
-    SetListInstr, SetTableInstr, SetTableKind, SetUpvalueInstr, TransformError, UnaryOpInstr,
-    UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    CallKind, Capture, CaptureSource, CloseInstr, ClosureCreation, ClosureInstr, ConcatInstr,
+    CondOperand, ConstRef, GenericForCallInstr, GetTableInstr, GetTableKind, GetUpvalueInstr,
+    InstrRef, LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LowInstr,
+    LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange,
+    ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetTableKind, SetUpvalueInstr,
+    SharedClosureRef, TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand,
+    ValuePack, VarArgInstr, instantiate_closure_children,
 };
 
 pub(crate) fn lower_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformError> {
@@ -36,14 +39,15 @@ pub(crate) fn lower_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformErr
 }
 
 fn lower_proto(raw: &RawProto) -> Result<LoweredProto, TransformError> {
-    let children = raw
+    let child_templates = raw
         .common
         .children
         .iter()
         .map(lower_proto)
         .collect::<Result<Vec<_>, _>>()?;
     let mut lowerer = ProtoLowerer::new(raw);
-    let (instrs, lowering_map) = lowerer.lower()?;
+    let (mut instrs, lowering_map) = lowerer.lower()?;
+    let children = instantiate_closure_children(&mut instrs, child_templates);
 
     Ok(finish_lowered_proto(raw, children, instrs, lowering_map))
 }
@@ -53,6 +57,7 @@ struct ProtoLowerer<'a> {
     lowering: PendingLoweringState,
     pending_methods: PendingMethodHints,
     word_code_index: WordCodeIndex,
+    captured_shared_closures: BTreeSet<SharedClosureRef>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -71,6 +76,7 @@ impl<'a> ProtoLowerer<'a> {
             lowering: PendingLoweringState::new(raw_instr_count),
             pending_methods: PendingMethodHints::new(method_slots),
             word_code_index: WordCodeIndex::from_raw(raw, instr_pc, instr_word_len),
+            captured_shared_closures: BTreeSet::new(),
         }
     }
 
@@ -883,6 +889,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst,
                             proto,
                             captures,
+                            creation: ClosureCreation::Fresh,
                         })),
                     );
                     raw_index += 1 + capture_count;
@@ -901,6 +908,13 @@ impl<'a> ProtoLowerer<'a> {
                     self.invalidate_written_reg(dst);
                     let (captures, raw_indices) =
                         self.decode_closure_captures(raw_index, raw_pc, capture_count)?;
+                    let shared = SharedClosureRef(d as usize);
+                    if !captures.is_empty() && !self.captured_shared_closures.insert(shared) {
+                        return Err(TransformError::RepeatedCapturedSharedClosure {
+                            raw_pc,
+                            shared_index: shared.0,
+                        });
+                    }
                     self.emit(
                         Some(raw_index),
                         raw_indices,
@@ -908,6 +922,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst,
                             proto,
                             captures,
+                            creation: ClosureCreation::Reusable(shared),
                         })),
                     );
                     raw_index += 1 + capture_count;

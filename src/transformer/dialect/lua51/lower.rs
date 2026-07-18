@@ -20,7 +20,7 @@ use crate::transformer::{
     LoadConstInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr,
     NewTableInstr, ProtoRef, Reg, RegRange, ResultPack, ReturnInstr, SetListInstr, SetTableInstr,
     SetTableKind, SetUpvalueInstr, TailCallInstr, TransformError, UnaryOpInstr, UnaryOpKind,
-    UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    UpvalueRef, ValueOperand, ValuePack, VarArgInstr, instantiate_closure_children,
 };
 
 const BITRK: u16 = 1 << 8;
@@ -42,7 +42,8 @@ fn lower_proto(raw: &RawProto) -> Result<LoweredProto, TransformError> {
         .map(lower_proto)
         .collect::<Result<Vec<_>, _>>()?;
     let mut lowerer = ProtoLowerer::new(raw);
-    let (instrs, lowering_map) = lowerer.lower()?;
+    let (mut instrs, lowering_map) = lowerer.lower()?;
+    let children = instantiate_closure_children(&mut instrs, children);
 
     Ok(finish_lowered_proto(raw, children, instrs, lowering_map))
 }
@@ -660,6 +661,7 @@ impl<'a> ProtoLowerer<'a> {
                             dst,
                             proto,
                             captures,
+                            creation: crate::transformer::ClosureCreation::Fresh,
                         })),
                     );
                     raw_index += 1 + capture_count;

@@ -18,8 +18,11 @@ impl StructuredBodyLowerer<'_, '_> {
         post_loop: BlockRef,
         target_overrides: &BTreeMap<TempId, HirLValue>,
         states: &[LoopStateSlot],
+        stateful_exit: Option<StatefulLoopExit>,
     ) -> Option<ActiveLoopContext> {
-        let downstream_post_loop = self.normalized_post_loop_successor(post_loop);
+        let downstream_post_loop = stateful_exit
+            .map(|stateful| stateful.effective_exit)
+            .or_else(|| self.normalized_post_loop_successor(post_loop));
         let mut break_exits = BTreeMap::new();
         let mut goto_exits = BTreeSet::new();
         let unstructured_region = self
@@ -27,7 +30,9 @@ impl StructuredBodyLowerer<'_, '_> {
             .structure
             .unstructured_region(candidate.header);
         for exit in candidate.exits.iter().copied().filter(|exit| {
-            *exit != post_loop && !self.loop_exit_enters_nested_loop(candidate_id, *exit)
+            *exit != post_loop
+                && Some(*exit) != downstream_post_loop
+                && !self.loop_exit_enters_nested_loop(candidate_id, *exit)
         }) {
             if unstructured_region.is_some()
                 && self.lowering.structure.unstructured_region(exit) == unstructured_region
@@ -94,6 +99,7 @@ impl StructuredBodyLowerer<'_, '_> {
             goto_exits,
             state_slots: Vec::new(),
             post_loop_break: None,
+            stateful_exit,
         })
     }
 
