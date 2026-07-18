@@ -403,11 +403,14 @@ impl StructuredBodyLowerer<'_, '_> {
         }) {
             return None;
         }
+        let has_branch_value_merge = self.branch_value_merge_for_header(block).is_some();
         // 非空 repeat condition 前仍可能有更近的本轮 tail。if-then 的缺席 else
         // 直接跳 condition，而显式臂完整执行 local tail；这不是自然 fallthrough，
-        // 必须先恢复显式 continue，才能把 tail 留给外层 region 单次消费。
+        // 必须先恢复显式 continue，才能把 tail 留给外层 region 单次消费。BVM 的
+        // 写回可能位于 tail，不能从这里只返回边界而丢掉分支臂对应的 target override。
         if self.can_emit_continue_stmt()
             && active_candidate.kind_hint == LoopKindHint::RepeatLike
+            && !has_branch_value_merge
             && let Some(local_tail) = stop
             && local_tail != continue_target
             && let Some(candidate) = self.branch_candidate_for_header(block)
@@ -536,9 +539,12 @@ impl StructuredBodyLowerer<'_, '_> {
                                 == Some(continue_target))))
                 .then_some((short_plan.then_entry, non_continue_entry, true))
             });
-            if let Some((continue_entry, non_continue_entry, continue_on_truthy)) = self
+            let continue_arm = self
                 .short_circuit_continue_arm(&short_plan, continue_target, &loop_context)
-                .or(implicit_continue_arm)
+                .or(implicit_continue_arm);
+            // 同样只返回 non-continue entry 的短路快捷路径也不能截断 BVM 写回。
+            if !has_branch_value_merge
+                && let Some((continue_entry, non_continue_entry, continue_on_truthy)) = continue_arm
             {
                 let mut continue_cond = if continue_on_truthy {
                     short_plan.cond

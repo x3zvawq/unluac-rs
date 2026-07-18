@@ -495,7 +495,7 @@ fn capture_empty_local_decl_stmts(
     )
 }
 
-fn local_decl_stmts(locals: Vec<LocalId>) -> Vec<HirStmt> {
+pub(super) fn local_decl_stmts(locals: Vec<LocalId>) -> Vec<HirStmt> {
     if locals.is_empty() {
         Vec::new()
     } else {

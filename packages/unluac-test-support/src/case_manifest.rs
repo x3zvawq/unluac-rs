@@ -1355,6 +1355,26 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_268_short_circuit_nonempty_continue_reentry.lua",
         ALL_DIALECTS,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_270_luau_repeat_condition.lua",
+        LUAU_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_271_loop_break_soft_phi.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_272_lua52_goto_capture_identity.lua",
+        PUC_LUA_GE_52,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_273_close_capture_post_slot_reuse.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_274_temp_live_use_boundaries.lua",
+        ALL_DIALECTS,
+    ),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {

@@ -1,8 +1,8 @@
 //! 这个子模块负责 temp-inline pass 的候选识别和使用计数摘要。
 //!
-//! 它依赖 HIR 当前 stmt 序列，只回答“这一句是不是 `temp = expr` 候选”以及下一句对 temp
+//! 它依赖 HIR 当前 stmt 序列，只回答“这一句是不是 `temp = expr` 候选”以及语句树对 temp
 //! 的使用次数，不会在这里改写任何节点。
-//! 例如：`t0 = a.b` 若下一句只用一次 `t0`，这里会把它标成可继续审查的内联候选。
+//! 例如：`t0 = a.b` 若整棵 proto 只消费一次 `t0`，这里会把它标成可继续审查的候选。
 
 use super::*;
 
@@ -21,11 +21,6 @@ pub(super) fn inline_candidate(stmt: &HirStmt) -> Option<(TempId, &HirExpr)> {
     }
 
     Some((*temp, value))
-}
-
-pub(super) struct NextStmtState {
-    pub temp_uses: TempUseSummary,
-    pub call_callee_materialized_at: Option<usize>,
 }
 
 pub(super) enum TempUseSummary {
@@ -48,13 +43,6 @@ impl TempUseSummary {
 
     pub(super) fn add_to_totals(&self, totals: &mut [usize]) {
         self.for_each(|temp, count| totals[temp.index()] += count);
-    }
-
-    pub(super) fn remove_from_totals(&self, totals: &mut [usize]) {
-        self.for_each(|temp, count| {
-            debug_assert!(totals[temp.index()] >= count);
-            totals[temp.index()] -= count;
-        });
     }
 
     fn for_each(&self, mut visitor: impl FnMut(TempId, usize)) {

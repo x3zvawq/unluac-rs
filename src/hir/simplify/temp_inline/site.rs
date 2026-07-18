@@ -250,7 +250,6 @@ fn find_site_in_call(call: &HirCallExpr, temp: TempId, site: InlineSite) -> Opti
 
 fn find_site_in_lvalue(lvalue: &HirLValue, temp: TempId, site: InlineSite) -> Option<InlineSite> {
     match lvalue {
-        HirLValue::Temp(target) if *target == temp => Some(site),
         HirLValue::TableAccess(access) => {
             find_site_in_expr(&access.base, temp, site.descend_access_base())
                 .or_else(|| find_site_in_expr(&access.key, temp, InlineSite::Index))

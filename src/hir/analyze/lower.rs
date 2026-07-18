@@ -11,6 +11,7 @@ use super::super::promotion::{ProtoPromotionFacts, SlotEpochFacts};
 use super::bindings::build_bindings;
 use super::exprs::{expr_for_reg_at_block_exit, expr_for_ssa_value};
 use super::helpers::{assign_stmt, decode_raw_string, empty_proto, unresolved_expr};
+use super::instrs::local_decl_stmts;
 use super::short_circuit::{
     recover_short_value_merge_expr_recovery_with_allowed_blocks, value_merge_candidates_in_block,
 };
@@ -43,6 +44,7 @@ pub(super) struct ProtoBindings {
     pub(super) captured_temp_targets: BTreeMap<TempId, BoundSlotTarget>,
     pub(super) captured_temp_decl_locals: BTreeMap<TempId, LocalId>,
     pub(super) capture_empty_local_decls: BTreeMap<usize, Vec<LocalId>>,
+    pub(super) capture_entry_local_decls: Vec<LocalId>,
     pub(super) closure_capture_targets: BTreeMap<(usize, usize), BoundSlotTarget>,
     pub(super) reference_captured_regs: Vec<bool>,
     pub(super) entry_local_regs: BTreeMap<Reg, LocalId>,
@@ -508,7 +510,11 @@ impl ProtoLowering<'_> {
 }
 
 fn build_proto_body(target: AstTargetDialect, lowering: &ProtoLowering<'_>) -> HirBlock {
-    build_structured_body(target, lowering)
+    let mut body = build_structured_body(target, lowering);
+    let mut prefix = local_decl_stmts(lowering.bindings.capture_entry_local_decls.clone());
+    prefix.append(&mut body.stmts);
+    body.stmts = prefix;
+    body
 }
 
 pub(super) fn lower_edge_phi_copies_for_edge(

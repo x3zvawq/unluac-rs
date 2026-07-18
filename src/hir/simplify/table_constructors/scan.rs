@@ -56,7 +56,7 @@ impl ConstructorWriteIndex {
     }
 }
 
-pub(super) fn constructor_seed(stmt: &HirStmt) -> Option<(TableBinding, HirTableConstructor)> {
+pub(super) fn constructor_seed(stmt: &HirStmt) -> Option<(TableBinding, &HirTableConstructor)> {
     match stmt {
         HirStmt::LocalDecl(local_decl) => {
             let [binding] = local_decl.bindings.as_slice() else {
@@ -68,7 +68,7 @@ pub(super) fn constructor_seed(stmt: &HirStmt) -> Option<(TableBinding, HirTable
             let [HirExpr::TableConstructor(table)] = local_decl.values.fixed.as_slice() else {
                 return None;
             };
-            Some((TableBinding::Local(*binding), (**table).clone()))
+            Some((TableBinding::Local(*binding), table.as_ref()))
         }
         HirStmt::Assign(assign) => {
             let [target] = assign.targets.as_slice() else {
@@ -81,7 +81,7 @@ pub(super) fn constructor_seed(stmt: &HirStmt) -> Option<(TableBinding, HirTable
             let [HirExpr::TableConstructor(table)] = assign.values.fixed.as_slice() else {
                 return None;
             };
-            Some((binding, (**table).clone()))
+            Some((binding, table.as_ref()))
         }
         _ => None,
     }

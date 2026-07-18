@@ -12,6 +12,7 @@
 //! - `x and x` 只会在 `x` 可稳定重复求值时折成 `x`
 //! - `(a and b) or (a and c)` 只会在整段表达式均可稳定重复求值时整理
 //! - `not a and x or y` 在 `x/y` 恒真时整理成 `a and y or x`
+//! - 条件中的 `not (a or b)` 会在一次遍历中下推成 `not a and not b`
 //! - `x or x` 会折成 `x`
 //! - 它不会把一般 `if/branch` 结构强行改写成逻辑表达式，那仍然属于更前面的结构恢复职责
 
@@ -290,24 +291,34 @@ pub(super) fn simplify_condition_truthiness_shape(expr: &HirExpr) -> Option<HirE
         HirExpr::LogicalAnd(logical) => simplify_condition_logical_and(&logical.lhs, &logical.rhs),
         HirExpr::LogicalOr(logical) => simplify_condition_logical_or(&logical.lhs, &logical.rhs),
         HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
-            de_morgan_condition(&unary.expr)
+            push_condition_negation(&unary.expr)
         }
         _ => None,
     }
 }
 
-fn de_morgan_condition(expr: &HirExpr) -> Option<HirExpr> {
-    match expr {
-        HirExpr::LogicalAnd(logical) => Some(HirExpr::LogicalOr(Box::new(HirLogicalExpr {
-            lhs: logical.lhs.clone().negate(),
-            rhs: logical.rhs.clone().negate(),
-        }))),
-        HirExpr::LogicalOr(logical) => Some(HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
-            lhs: logical.lhs.clone().negate(),
-            rhs: logical.rhs.clone().negate(),
-        }))),
-        _ => None,
-    }
+/// 只在条件上下文把外层 `not` 沿连续的 `and/or` 树一次下推到底。
+///
+/// 每次递归都会消费一个仍被当前否定覆盖的逻辑节点，并且只进入它的严格子树；这个度量
+/// 严格递减。左右操作数不交换，因此保持 Lua 的从左到右求值与短路顺序。叶节点继续复用
+/// `negate` 的双重否定规则，使结果与原来逐轮应用 De Morgan 的终态一致。
+fn push_condition_negation(expr: &HirExpr) -> Option<HirExpr> {
+    let replacement = match expr {
+        HirExpr::LogicalAnd(logical) => HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+            lhs: negate_condition_operand(&logical.lhs),
+            rhs: negate_condition_operand(&logical.rhs),
+        })),
+        HirExpr::LogicalOr(logical) => HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+            lhs: negate_condition_operand(&logical.lhs),
+            rhs: negate_condition_operand(&logical.rhs),
+        })),
+        _ => return None,
+    };
+    Some(replacement)
+}
+
+fn negate_condition_operand(expr: &HirExpr) -> HirExpr {
+    push_condition_negation(expr).unwrap_or_else(|| expr.clone().negate())
 }
 
 fn simplify_condition_logical_and(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {

@@ -187,8 +187,26 @@ fn place_epoch_merges(
     graph: &GraphFacts,
     close_blocks: &BTreeSet<BlockRef>,
 ) -> BTreeSet<BlockRef> {
-    let mut placed = BTreeSet::new();
+    // loop 内的 Close 会先在 header 的 dominance frontier 合成 epoch，但 header
+    // 可能同时支配下一轮 body 和循环外 continuation。循环外物理槽已经越过 cleanup，
+    // 因此真实 exit target 也必须显式开始一个 merge epoch，不能继续继承 header 身份。
+    let mut placed = graph
+        .natural_loops
+        .iter()
+        .filter(|natural_loop| !natural_loop.blocks.is_disjoint(close_blocks))
+        .flat_map(|natural_loop| {
+            natural_loop.blocks.iter().flat_map(|block| {
+                cfg.succs[block.index()].iter().filter_map(|edge_ref| {
+                    let target = cfg.edges[edge_ref.index()].to;
+                    (!natural_loop.blocks.contains(&target)
+                        && cfg.reachable_blocks.contains(&target))
+                    .then_some(target)
+                })
+            })
+        })
+        .collect::<BTreeSet<_>>();
     let mut pending = close_blocks.iter().copied().collect::<VecDeque<_>>();
+    pending.extend(placed.iter().copied());
     while let Some(block) = pending.pop_front() {
         for frontier in graph.dominance_frontier_blocks(block) {
             if placed.insert(frontier) && !close_blocks.contains(&frontier) {

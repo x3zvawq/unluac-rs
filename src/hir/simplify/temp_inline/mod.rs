@@ -12,7 +12,6 @@
 //! 它和 until 条件属于同一轮，且只有在没有外部存活、自引用、capture 与绕过尾写入的
 //! 控制路径时，才能把 RHS 移入条件中的唯一消费点。
 
-mod mentioned;
 mod rewrite;
 mod site;
 mod usage;
@@ -27,7 +26,6 @@ use crate::hir::common::{
 use crate::hir::expr_safety::{expr_observes_eval_order, expr_requires_ordered_snapshot};
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
-use self::mentioned::NestedTempProtection;
 use self::rewrite::replace_temp_in_stmt;
 use self::site::{
     InlineSite, expr_touches_temp, inline_site_in_repeat_condition, inline_site_in_stmt,
@@ -35,8 +33,8 @@ use self::site::{
     temp_precedes_observable_eval_in_stmt,
 };
 use self::usage::{
-    NextStmtState, TempUseScratch, TempUseSummary, collect_expr_temp_uses_summary,
-    collect_stmt_temp_uses, inline_candidate, max_temp_index_in_block,
+    TempUseScratch, collect_expr_temp_uses_summary, collect_stmt_temp_uses, inline_candidate,
+    max_temp_index_in_block,
 };
 use super::mention::{ReferenceCapturedBindings, stmt_writes_temp};
 use super::temp_touch::stmt_contains_nested_nonlocal_control;
@@ -58,14 +56,15 @@ pub(super) fn inline_temps_in_proto_with_facts(
     let body_temp_count = max_temp_index_in_block(&proto.body).map_or(0, |max_index| max_index + 1);
     let temp_count = proto_temp_count.max(body_temp_count);
     let mut scratch = TempUseScratch::new(proto, temp_count);
+    let mut live_use_counts = collect_block_temp_use_totals(&proto.body.stmts, &mut scratch);
     let reference_captured = super::mention::stmts_reference_captured_bindings(&proto.body.stmts);
     inline_temps_in_block(
         &mut proto.body,
         &mut scratch,
+        &mut live_use_counts,
         &reference_captured,
         readability,
         facts,
-        &BTreeSet::new(),
         &BTreeSet::new(),
     )
 }
@@ -73,21 +72,19 @@ pub(super) fn inline_temps_in_proto_with_facts(
 fn inline_temps_in_block(
     block: &mut HirBlock,
     scratch: &mut TempUseScratch,
+    live_use_counts: &mut [usize],
     reference_captured: &ReferenceCapturedBindings,
     readability: ReadabilityOptions,
     facts: &ProtoPromotionFacts,
-    protected_temps: &BTreeSet<TempId>,
     inherited_captured_slots: &BTreeSet<HomeSlotKey>,
 ) -> bool {
     let mut changed = false;
     let mut captured_slots_before_stmt =
         CapturedSlotSnapshots::new(block.stmts.len(), inherited_captured_slots);
     let mut active_captured_slots = inherited_captured_slots.clone();
-    let mut nested_protection = NestedTempProtection::new(&block.stmts);
 
     for index in 0..block.stmts.len() {
         captured_slots_before_stmt.push(&active_captured_slots);
-        let nested_protected = nested_protection.begin_stmt(index, protected_temps);
         let mut nested_captured_slots = active_captured_slots.clone();
         facts.collect_prefix_captured_home_slots_in_stmt(
             &block.stmts[index],
@@ -97,21 +94,20 @@ fn inline_temps_in_block(
         changed |= inline_temps_in_nested_blocks(
             stmt,
             scratch,
+            live_use_counts,
             reference_captured,
             readability,
             facts,
-            &nested_protected,
             &nested_captured_slots,
         );
         facts.collect_captured_home_slots_in_stmt(stmt, &mut active_captured_slots);
-        nested_protection.finish_stmt(stmt);
     }
 
     if inline_call_callee_across_argument_materialization(
         block,
         scratch,
+        live_use_counts,
         facts,
-        protected_temps,
         &captured_slots_before_stmt,
     ) {
         changed = true;
@@ -119,25 +115,20 @@ fn inline_temps_in_block(
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
     }
 
-    // 逆向扫描只需要维护“后缀里每个 temp 当前被用了多少次”以及最近一个保留下来的
-    // 语句。这样可以在不反复重扫整个后缀的前提下，保留“只内联到最近简单语句”的约束。
-    // fallback label/goto 可能让回边快照在文本上早于 temp 定义出现；这种 prefix read
-    // 不能被当成普通死用法，否则会把 loop-carried 值只内联到条件里，删掉回边需要的
-    // 中间状态。
-    let total_use_totals = collect_block_temp_use_totals(&block.stmts, scratch);
-    let mut suffix_use_totals = vec![0; scratch.temp_count()];
+    // proto 级 live use count 会随成功内联同步减少；当前 block 只需保留下一条
+    // 语句和 callee 物化位置。这既保留相邻内联边界，也避免每个 nested block
+    // 重新遍历整棵子树。fallback 回边上任何额外读取都会使 live count 大于 1，
+    // 因此不会被当成可删的 forwarding temp。
     let mut kept_rev = Vec::with_capacity(block.stmts.len());
-    let mut next_stmt_state: Option<NextStmtState> = None;
+    let mut call_callee_materialized_at = None;
 
     for (index, stmt) in std::mem::take(&mut block.stmts)
         .into_iter()
         .enumerate()
         .rev()
     {
-        let stmt_uses = collect_stmt_temp_uses(&stmt, scratch);
         if let Some((temp, value)) = inline_candidate(&stmt)
             && !scratch.has_debug_local_hint(temp)
-            && !protected_temps.contains(&temp)
             && !temp_rebinds_captured_slot(
                 temp,
                 facts,
@@ -151,13 +142,15 @@ fn inline_temps_in_block(
             // 后续再也没有地方记录“状态已经更新过”。
             // 因此这里只允许折叠真正的 forwarding temp，不折叠自引用状态槽位。
             && !expr_touches_temp(value, temp)
-            && prefix_use_count(temp, &total_use_totals, &suffix_use_totals, &stmt_uses) == 0
-            && suffix_use_totals.get(temp.index()).copied().unwrap_or(0) == 1
-            && let Some(state) = &mut next_stmt_state
-            && state.temp_uses.count(temp) == 1
+            && total_use_count(temp, live_use_counts) == 1
             && let Some(next_stmt) = kept_rev.last()
             && let Some(site) = inline_site_in_stmt(next_stmt, temp)
-            && !call_arg_inline_crosses_materialized_callee(site, value, index, state)
+            && !call_arg_inline_crosses_materialized_callee(
+                site,
+                value,
+                index,
+                call_callee_materialized_at,
+            )
             && !inline_crosses_evaluation_boundary(
                 site,
                 value,
@@ -167,25 +160,19 @@ fn inline_temps_in_block(
             )
             && site.allows(value, readability)
         {
-            state.temp_uses.remove_from_totals(&mut suffix_use_totals);
             let next_stmt = kept_rev
                 .last_mut()
                 .expect("next stmt metadata must track the last kept stmt");
             replace_temp_in_stmt(next_stmt, temp, value);
-            state.temp_uses = collect_stmt_temp_uses(next_stmt, scratch);
             if site == InlineSite::CallCallee {
-                state.call_callee_materialized_at = Some(index);
+                call_callee_materialized_at = Some(index);
             }
-            state.temp_uses.add_to_totals(&mut suffix_use_totals);
+            remove_live_use(live_use_counts, temp);
             changed = true;
             continue;
         }
 
-        stmt_uses.add_to_totals(&mut suffix_use_totals);
-        next_stmt_state = Some(NextStmtState {
-            temp_uses: stmt_uses,
-            call_callee_materialized_at: None,
-        });
+        call_callee_materialized_at = None;
         kept_rev.push(stmt);
     }
 
@@ -273,11 +260,10 @@ impl CapturedSlotSnapshots {
 fn inline_call_callee_across_argument_materialization(
     block: &mut HirBlock,
     scratch: &mut TempUseScratch,
+    live_use_counts: &mut [usize],
     facts: &ProtoPromotionFacts,
-    protected_temps: &BTreeSet<TempId>,
     captured_slots_before_stmt: &CapturedSlotSnapshots,
 ) -> bool {
-    let total_use_totals = collect_block_temp_use_totals(&block.stmts, scratch);
     let prior_order_sensitive_defs =
         order_sensitive_temp_def_indices(&block.stmts, scratch.temp_count());
     let mut stmt_order = (0..block.stmts.len()).collect::<Vec<_>>();
@@ -295,9 +281,8 @@ fn inline_call_callee_across_argument_materialization(
             index,
             scratch,
             facts,
-            protected_temps,
             captured_slots_before_stmt,
-        ) || total_use_count(callee_temp, &total_use_totals) != 1
+        ) || total_use_count(callee_temp, live_use_counts) != 1
         {
             index += 1;
             continue;
@@ -319,13 +304,12 @@ fn inline_call_callee_across_argument_materialization(
                 call_index,
                 scratch,
                 facts,
-                protected_temps,
                 captured_slots_before_stmt,
             ) || arg_value_forwards_prior_order_sensitive_expr(
                 arg_value,
                 stmt_order[index],
                 &prior_order_sensitive_defs,
-            ) || total_use_count(arg_temp, &total_use_totals) != 1
+            ) || total_use_count(arg_temp, live_use_counts) != 1
             {
                 break;
             }
@@ -369,6 +353,10 @@ fn inline_call_callee_across_argument_materialization(
         }
         block.stmts.drain(index..call_index);
         stmt_order.drain(index..call_index);
+        remove_live_use(live_use_counts, callee_temp);
+        for temp in arg_replacements.keys().copied() {
+            remove_live_use(live_use_counts, temp);
+        }
         changed = true;
     }
 
@@ -379,13 +367,11 @@ fn call_arg_inline_crosses_materialized_callee(
     site: InlineSite,
     value: &HirExpr,
     stmt_index: usize,
-    state: &NextStmtState,
+    callee_materialized_at: Option<usize>,
 ) -> bool {
     site == InlineSite::CallArg
         && expr_observes_eval_order(value)
-        && state
-            .call_callee_materialized_at
-            .is_some_and(|callee_index| stmt_index < callee_index)
+        && callee_materialized_at.is_some_and(|callee_index| stmt_index < callee_index)
 }
 
 fn order_sensitive_temp_def_indices(stmts: &[HirStmt], temp_count: usize) -> Vec<Option<usize>> {
@@ -423,11 +409,9 @@ fn cross_call_inline_candidate_is_safe(
     stmt_index: usize,
     scratch: &TempUseScratch,
     facts: &ProtoPromotionFacts,
-    protected_temps: &BTreeSet<TempId>,
     captured_slots_before_stmt: &CapturedSlotSnapshots,
 ) -> bool {
     !scratch.has_debug_local_hint(temp)
-        && !protected_temps.contains(&temp)
         && !temp_rebinds_captured_slot(
             temp,
             facts,
@@ -443,6 +427,15 @@ fn total_use_count(temp: TempId, total_use_totals: &[usize]) -> usize {
         .get(temp.index())
         .copied()
         .unwrap_or_default()
+}
+
+fn remove_live_use(live_use_counts: &mut [usize], temp: TempId) {
+    let count = live_use_counts
+        .get_mut(temp.index())
+        .expect("live use counts should cover every referenced temp");
+    *count = count
+        .checked_sub(1)
+        .expect("successful inline should remove one live use");
 }
 
 fn call_args_are_exact_temp_refs(args: &HirValuePack, expected_temps: &[TempId]) -> bool {
@@ -463,32 +456,13 @@ fn collect_block_temp_use_totals(stmts: &[HirStmt], scratch: &mut TempUseScratch
     totals
 }
 
-fn prefix_use_count(
-    temp: TempId,
-    total_use_totals: &[usize],
-    suffix_use_totals: &[usize],
-    current_stmt_uses: &TempUseSummary,
-) -> usize {
-    total_use_totals
-        .get(temp.index())
-        .copied()
-        .unwrap_or_default()
-        .saturating_sub(
-            suffix_use_totals
-                .get(temp.index())
-                .copied()
-                .unwrap_or_default(),
-        )
-        .saturating_sub(current_stmt_uses.count(temp))
-}
-
 fn inline_temps_in_nested_blocks(
     stmt: &mut HirStmt,
     scratch: &mut TempUseScratch,
+    live_use_counts: &mut [usize],
     reference_captured: &ReferenceCapturedBindings,
     readability: ReadabilityOptions,
     facts: &ProtoPromotionFacts,
-    protected_temps: &BTreeSet<TempId>,
     inherited_captured_slots: &BTreeSet<HomeSlotKey>,
 ) -> bool {
     match stmt {
@@ -496,20 +470,20 @@ fn inline_temps_in_nested_blocks(
             let mut changed = inline_temps_in_block(
                 &mut if_stmt.then_block,
                 scratch,
+                live_use_counts,
                 reference_captured,
                 readability,
                 facts,
-                protected_temps,
                 inherited_captured_slots,
             );
             if let Some(else_block) = &mut if_stmt.else_block {
                 changed |= inline_temps_in_block(
                     else_block,
                     scratch,
+                    live_use_counts,
                     reference_captured,
                     readability,
                     facts,
-                    protected_temps,
                     inherited_captured_slots,
                 );
             }
@@ -518,34 +492,29 @@ fn inline_temps_in_nested_blocks(
         HirStmt::While(while_stmt) => inline_temps_in_block(
             &mut while_stmt.body,
             scratch,
+            live_use_counts,
             reference_captured,
             readability,
             facts,
-            protected_temps,
             inherited_captured_slots,
         ),
         HirStmt::Repeat(repeat_stmt) => {
-            // repeat-until 的 cond 在 body 之后求值，但与 body 共享词法作用域。
-            // body 里定义的 temp 如果同时出现在 cond 里，内联会导致 cond 引用
-            // 到已被消除的 temp。因此将 cond 里提及的所有 temp 加入保护集。
-            let mut repeat_protected = protected_temps.clone();
-            mentioned::collect_expr_mentioned_temps(&repeat_stmt.cond, &mut repeat_protected);
             let mut changed = inline_temps_in_block(
                 &mut repeat_stmt.body,
                 scratch,
+                live_use_counts,
                 reference_captured,
                 readability,
                 facts,
-                &repeat_protected,
                 inherited_captured_slots,
             );
             changed |= inline_repeat_tail_temp(
                 repeat_stmt,
                 scratch,
+                live_use_counts,
                 reference_captured,
                 readability,
                 facts,
-                protected_temps,
                 inherited_captured_slots,
             );
             changed
@@ -553,28 +522,28 @@ fn inline_temps_in_nested_blocks(
         HirStmt::NumericFor(numeric_for) => inline_temps_in_block(
             &mut numeric_for.body,
             scratch,
+            live_use_counts,
             reference_captured,
             readability,
             facts,
-            protected_temps,
             inherited_captured_slots,
         ),
         HirStmt::GenericFor(generic_for) => inline_temps_in_block(
             &mut generic_for.body,
             scratch,
+            live_use_counts,
             reference_captured,
             readability,
             facts,
-            protected_temps,
             inherited_captured_slots,
         ),
         HirStmt::Block(block) => inline_temps_in_block(
             block,
             scratch,
+            live_use_counts,
             reference_captured,
             readability,
             facts,
-            protected_temps,
             inherited_captured_slots,
         ),
         HirStmt::LocalDecl(_)
@@ -595,10 +564,10 @@ fn inline_temps_in_nested_blocks(
 fn inline_repeat_tail_temp(
     repeat_stmt: &mut crate::hir::common::HirRepeat,
     scratch: &mut TempUseScratch,
+    live_use_counts: &mut [usize],
     reference_captured: &ReferenceCapturedBindings,
     readability: ReadabilityOptions,
     facts: &ProtoPromotionFacts,
-    protected_temps: &BTreeSet<TempId>,
     inherited_captured_slots: &BTreeSet<HomeSlotKey>,
 ) -> bool {
     let Some(tail_index) = repeat_stmt.body.stmts.len().checked_sub(1) else {
@@ -608,8 +577,8 @@ fn inline_repeat_tail_temp(
         return false;
     };
     if scratch.has_debug_local_hint(temp)
-        || protected_temps.contains(&temp)
         || expr_touches_temp(value, temp)
+        || total_use_count(temp, live_use_counts) != 1
         || collect_expr_temp_uses_summary(&repeat_stmt.cond, scratch).count(temp) != 1
     {
         return false;
@@ -646,6 +615,7 @@ fn inline_repeat_tail_temp(
     let value = value.clone();
     rewrite::replace_temp_in_expr(&mut repeat_stmt.cond, temp, &value);
     repeat_stmt.body.stmts.pop();
+    remove_live_use(live_use_counts, temp);
     true
 }
 

@@ -14,6 +14,8 @@
 //! HIR 形状，为后续 AST 降低继续减负。
 //! 另外，如果构造器 seed 在 block 尾声只剩一次“把整张表 handoff 给最终目标”的写入，
 //! 这里也会把 owner 直接认回最终目标，避免后层继续携带机械性的中转 local。
+//! 全量 binding facts 只服务这些候选；没有 seed/SETLIST 根形状的 proto 先通过
+//! statement/block 骨架门跳过，不递归扫描无关表达式。
 
 mod bindings;
 mod builder;
@@ -144,6 +146,10 @@ pub(super) fn stabilize_table_constructors_in_proto(
     dialect: DecompileDialect,
     promotion_facts: &ProtoPromotionFacts,
 ) -> bool {
+    if !block_has_table_constructor_candidate(&proto.body) {
+        return false;
+    }
+
     let temp_count = proto.temps.len();
     let first_new_local = proto.locals.len();
     let BindingFacts {
@@ -209,6 +215,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
                 index += 1;
                 continue;
             };
+            let seed_ctor = seed_ctor.clone();
 
             let binding_id = binding_index
                 .id_of(binding)
@@ -356,6 +363,51 @@ impl TableConstructorPass<'_> {
             changed = true;
         }
         changed
+    }
+}
+
+/// 只沿 statement/block 骨架查找本 pass 可能改写的根形状，不进入表达式子树。
+fn block_has_table_constructor_candidate(block: &crate::hir::common::HirBlock) -> bool {
+    block.stmts.iter().any(stmt_has_table_constructor_candidate)
+}
+
+fn stmt_has_table_constructor_candidate(stmt: &HirStmt) -> bool {
+    if constructor_seed(stmt).is_some()
+        || matches!(stmt, HirStmt::TableSetList(set_list)
+            if matches!(&set_list.base, HirExpr::TableConstructor(_)))
+    {
+        return true;
+    }
+
+    match stmt {
+        HirStmt::If(if_stmt) => {
+            block_has_table_constructor_candidate(&if_stmt.then_block)
+                || if_stmt
+                    .else_block
+                    .as_ref()
+                    .is_some_and(block_has_table_constructor_candidate)
+        }
+        HirStmt::While(while_stmt) => block_has_table_constructor_candidate(&while_stmt.body),
+        HirStmt::Repeat(repeat_stmt) => block_has_table_constructor_candidate(&repeat_stmt.body),
+        HirStmt::NumericFor(numeric_for) => {
+            block_has_table_constructor_candidate(&numeric_for.body)
+        }
+        HirStmt::GenericFor(generic_for) => {
+            block_has_table_constructor_candidate(&generic_for.body)
+        }
+        HirStmt::Block(block) => block_has_table_constructor_candidate(block),
+        HirStmt::LocalDecl(_)
+        | HirStmt::Assign(_)
+        | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::Return(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => false,
     }
 }
 

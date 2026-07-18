@@ -209,6 +209,7 @@ pub(super) fn build_bindings(
         captured_temp_targets: captured_temp_facts.targets,
         captured_temp_decl_locals: captured_temp_facts.decl_temps,
         capture_empty_local_decls: captured_temp_facts.empty_decls,
+        capture_entry_local_decls: captured_slots.entry_local_decls,
         closure_capture_targets: captured_slots.capture_targets,
         reference_captured_regs,
         entry_local_regs,
@@ -247,6 +248,7 @@ fn entry_reg_is_observed(dataflow: &DataflowFacts, reg: Reg) -> bool {
 struct CapturedSlotTargets {
     slot_targets: BTreeMap<CapturedSlotKey, CapturedSlotBinding>,
     capture_targets: BTreeMap<(usize, usize), BoundSlotTarget>,
+    entry_local_decls: Vec<LocalId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -322,6 +324,7 @@ fn collect_captured_slot_targets(
     }
     let mut reachability = BTreeMap::new();
     let mut cyclic_blocks = BTreeMap::new();
+    let mut entry_decl_keys = BTreeSet::new();
 
     for (instr_index, instr) in proto.instrs.iter().enumerate() {
         let LowInstr::Closure(closure) = instr else {
@@ -346,6 +349,7 @@ fn collect_captured_slot_targets(
                 reg,
                 has_no_reaching_value,
             );
+            let entry_local_safe = epochs.spans_entry(reg);
             let key =
                 CapturedSlotKey::new(reg.index(), epochs.epoch_at(reg, InstrRef(start_instr)));
             let child_writes = child_mutable_upvalues
@@ -361,15 +365,26 @@ fn collect_captured_slot_targets(
                 &mut reachability,
                 &mut cyclic_blocks,
             );
+            let requires_local =
+                child_writes || has_no_reaching_value || parent_writes_after_capture;
+            if requires_local
+                && entry_local_safe
+                && block_has_real_cycle(
+                    cfg,
+                    cfg.instr_to_block[instr_index],
+                    &mut reachability,
+                    &mut cyclic_blocks,
+                )
+            {
+                entry_decl_keys.insert(key);
+            }
             captured_uses.push(CapturedSlotUse {
                 instr_index,
                 reg,
                 key,
                 start_instr,
-                requires_local: child_writes
-                    || has_no_reaching_value
-                    || parent_writes_after_capture,
-                entry_local_safe: epochs.spans_entry(reg),
+                requires_local,
+                entry_local_safe,
             });
         }
     }
@@ -412,9 +427,18 @@ fn collect_captured_slot_targets(
         }
     }
 
+    let entry_local_decls = entry_decl_keys
+        .into_iter()
+        .filter_map(|key| slot_targets.get(&key))
+        .map(|binding| {
+            let BoundSlotTarget::Local(local) = binding.target;
+            local
+        })
+        .collect();
     CapturedSlotTargets {
         slot_targets,
         capture_targets,
+        entry_local_decls,
     }
 }
 
@@ -525,7 +549,11 @@ fn collect_captured_temp_facts(
     let mut targets = BTreeMap::new();
     let mut decl_temps = BTreeMap::new();
     let mut empty_decls = BTreeMap::<usize, Vec<LocalId>>::new();
-    let mut declared_locals = BTreeSet::new();
+    let mut declared_locals = captured_slots
+        .entry_local_decls
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
     let mut defs_by_instr = vec![Vec::<(DefId, Reg)>::new(); proto.instrs.len()];
     for def in &dataflow.defs {
         defs_by_instr[def.instr.index()].push((def.id, def.reg));

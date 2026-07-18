@@ -115,6 +115,35 @@ pub(super) fn collect_forward_region_blocks(
     blocks
 }
 
+/// 收集 `allowed_blocks` 内所有能到达任一 `target` 的 block。
+///
+/// 这和 `can_reach_within(block, target, allowed_blocks)` 的判定边界一致，只是把同一
+/// target 的多次 reachability 查询折成一份共享闭包，适合 branch/loop pass 在同一
+/// region 内反复问“哪些入口仍属于本轮 shared tail”。
+pub(super) fn collect_reverse_reachable_blocks(
+    cfg: &Cfg,
+    allowed_blocks: &BTreeSet<BlockRef>,
+    targets: impl IntoIterator<Item = BlockRef>,
+) -> BTreeSet<BlockRef> {
+    let mut reachable = BTreeSet::new();
+    let mut worklist = targets.into_iter().collect::<VecDeque<_>>();
+
+    while let Some(block) = worklist.pop_front() {
+        if !reachable.insert(block) {
+            continue;
+        }
+
+        for edge_ref in &cfg.preds[block.index()] {
+            let pred = cfg.edges[edge_ref.index()].from;
+            if cfg.reachable_blocks.contains(&pred) && allowed_blocks.contains(&pred) {
+                worklist.push_back(pred);
+            }
+        }
+    }
+
+    reachable
+}
+
 pub(super) fn collect_region_predecessors_to_target(
     cfg: &Cfg,
     blocks: &BTreeSet<BlockRef>,

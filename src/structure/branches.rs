@@ -18,7 +18,9 @@ use crate::structure::{BlockRef, Cfg, DominatorTree, EdgeKind, GraphFacts};
 use super::common::{
     BranchCandidate, BranchKind, BranchRegionFact, LoopCandidate, LoopKindHint, SinglePassFenceFact,
 };
-use super::helpers::collect_forward_region_blocks;
+use super::helpers::{
+    collect_forward_region_blocks, collect_region_exit_edges, collect_reverse_reachable_blocks,
+};
 
 pub(super) fn analyze_branches(
     cfg: &Cfg,
@@ -110,6 +112,8 @@ fn refine_nested_escape_if_else_merges(
     loop_candidates: &[LoopCandidate],
     branch_candidates: &mut [BranchCandidate],
 ) -> BTreeMap<BlockRef, SinglePassFenceFact> {
+    let loop_refined_headers =
+        refine_enclosing_loop_escape_merges(cfg, graph_facts, loop_candidates, branch_candidates);
     let loop_headers = loop_candidates
         .iter()
         .map(|candidate| candidate.header)
@@ -139,7 +143,9 @@ fn refine_nested_escape_if_else_merges(
 
     let mut single_pass_fences = BTreeMap::new();
     for candidate in branch_candidates {
-        if loop_headers.contains(&candidate.header) {
+        if loop_headers.contains(&candidate.header)
+            || loop_refined_headers.contains(&candidate.header)
+        {
             continue;
         }
         let (Some(strict_merge), Some(else_entry)) = (candidate.merge, candidate.else_entry) else {
@@ -193,6 +199,120 @@ fn refine_nested_escape_if_else_merges(
         }
     }
     single_pass_fences
+}
+
+fn refine_enclosing_loop_escape_merges(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    loop_candidates: &[LoopCandidate],
+    branch_candidates: &mut [BranchCandidate],
+) -> BTreeSet<BlockRef> {
+    // 先消费现有 branch/loop owner，再用支配域闭包确认本轮 soft merge；这里不从
+    // effectful break 臂的首条 edge 猜出口，否则会漏掉调用之后才发生的真实跳出。
+    let snapshot = branch_candidates.to_vec();
+    let nested_by_merge = snapshot.iter().fold(
+        BTreeMap::<BlockRef, Vec<&BranchCandidate>>::new(),
+        |mut index, candidate| {
+            if candidate.kind == BranchKind::IfThen
+                && candidate.else_entry.is_none()
+                && let Some(merge) = candidate.merge
+            {
+                index.entry(merge).or_default().push(candidate);
+            }
+            index
+        },
+    );
+    let mut refinements = BTreeMap::new();
+    for outer in &snapshot {
+        let (Some(strict_merge), Some(else_entry)) = (outer.merge, outer.else_entry) else {
+            continue;
+        };
+        if outer.kind != BranchKind::IfElse || strict_merge == cfg.exit_block {
+            continue;
+        }
+        let Some(soft_merge) =
+            find_soft_merge(cfg, graph_facts, outer.header, outer.then_entry, else_entry)
+        else {
+            continue;
+        };
+        let Some(owner) = loop_candidates
+            .iter()
+            .filter(|owner| {
+                owner.exits.contains(&strict_merge)
+                    && [outer.header, outer.then_entry, else_entry, soft_merge]
+                        .into_iter()
+                        .all(|block| owner.body_scope_blocks.contains(&block))
+            })
+            .min_by_key(|owner| owner.body_scope_blocks.len())
+        else {
+            continue;
+        };
+        let blocks = collect_forward_region_blocks(
+            cfg,
+            [outer.then_entry, else_entry],
+            Some(soft_merge),
+            Some((outer.header, &graph_facts.dominator_tree)),
+        );
+        let mut allowed = blocks.clone();
+        allowed.insert(soft_merge);
+        let reaches_soft_merge = collect_reverse_reachable_blocks(cfg, &allowed, [soft_merge]);
+        if ![outer.then_entry, else_entry]
+            .into_iter()
+            .all(|entry| reaches_soft_merge.contains(&entry))
+        {
+            continue;
+        }
+        let nested = owner
+            .exits
+            .iter()
+            .filter_map(|exit| nested_by_merge.get(exit))
+            .flatten()
+            .copied()
+            .filter(|candidate| {
+                graph_facts.dominates(outer.then_entry, candidate.header)
+                    != graph_facts.dominates(else_entry, candidate.header)
+                    && reaches_soft_merge.contains(&candidate.then_entry)
+            })
+            .collect::<Vec<_>>();
+        let nested_merges = nested
+            .iter()
+            .filter_map(|candidate| candidate.merge)
+            .collect::<BTreeSet<_>>();
+        if nested.is_empty()
+            || collect_region_exit_edges(cfg, &blocks)
+                .into_iter()
+                .any(|edge| {
+                    let edge = cfg.edges[edge.index()];
+                    edge.to != soft_merge
+                        && !nested_merges.contains(&edge.from)
+                        && !nested_merges.contains(&edge.to)
+                })
+        {
+            continue;
+        }
+        refinements.insert(outer.header, (outer.then_entry, else_entry, soft_merge));
+        for candidate in nested {
+            refinements.insert(
+                candidate.header,
+                (
+                    candidate.then_entry,
+                    candidate.merge.expect("nested escape must have merge"),
+                    soft_merge,
+                ),
+            );
+        }
+    }
+    for candidate in branch_candidates {
+        let Some((then_entry, else_entry, merge)) = refinements.get(&candidate.header).copied()
+        else {
+            continue;
+        };
+        candidate.then_entry = then_entry;
+        candidate.else_entry = Some(else_entry);
+        candidate.merge = Some(merge);
+        candidate.kind = BranchKind::IfElse;
+    }
+    refinements.keys().copied().collect()
 }
 
 /// 若全部 escape 已从同一 loop body 直达其显式出口，它们表达的是该 loop 的 break；
