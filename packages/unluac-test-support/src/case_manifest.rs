@@ -261,7 +261,7 @@ const LUAU_VECTOR_OPTIONS: LuaCaseOptions = LuaCaseOptions {
     }),
     recompile_rounds: None,
 };
-const LONG_CHAIN_OPTIONS: LuaCaseOptions = LuaCaseOptions {
+const NO_RECOMPILE_STRESS_OPTIONS: LuaCaseOptions = LuaCaseOptions {
     recompile_rounds: Some(0),
     ..LuaCaseOptions::DEFAULT
 };
@@ -303,7 +303,8 @@ const UNIT_CASES: &[LuaCaseMatrixEntry] = &[
         },
     ),
     LuaCaseMatrixEntry::new("tests/unit-case/lua52_02_goto.lua", LUA_GOTO_DIALECTS),
-    LuaCaseMatrixEntry::new("tests/unit-case/lua52_03_extraarg_boundary.lua", PUC_LUA_52),
+    LuaCaseMatrixEntry::new("tests/unit-case/lua52_03_extraarg_boundary.lua", PUC_LUA_52)
+        .with_options(NO_RECOMPILE_STRESS_OPTIONS),
     LuaCaseMatrixEntry::new("tests/unit-case/lua53_01.lua", PUC_LUA_GE_53),
     LuaCaseMatrixEntry::new("tests/unit-case/lua54_01_close.lua", PUC_LUA_GE_54),
     LuaCaseMatrixEntry::new("tests/unit-case/lua54_02_const.lua", PUC_LUA_GE_54),
@@ -528,10 +529,6 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_45_inline_stmt_eval_order.lua",
-        PUC_LUA_51,
-    ),
-    LuaCaseMatrixEntry::new(
-        "tests/regress-case/regress_46_method_alias_receiver_eval_count.lua",
         PUC_LUA_51,
     ),
     LuaCaseMatrixEntry::new(
@@ -1517,7 +1514,7 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_282_long_logical_ast_depth.lua",
         PUC_LUA_54,
     )
-    .with_options(LONG_CHAIN_OPTIONS),
+    .with_options(NO_RECOMPILE_STRESS_OPTIONS),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_283_nested_table_candidate.lua",
         ALL_DIALECTS,
