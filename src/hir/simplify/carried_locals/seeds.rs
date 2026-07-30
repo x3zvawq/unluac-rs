@@ -12,7 +12,9 @@ use std::collections::BTreeSet;
 
 use crate::hir::common::{HirExpr, HirLValue, HirStmt, TempId};
 
-use super::binding::{CarryBinding, TempBindingRewrite, carry_binding_from_lvalue};
+use super::binding::{
+    CarryBinding, TempBindingRewrite, carry_binding_from_expr, carry_binding_from_lvalue,
+};
 use super::reads::BindingReadCollector;
 
 pub(super) struct BindingHandoffSeed {
@@ -36,15 +38,13 @@ pub(super) fn binding_handoff_seed(stmt: &HirStmt) -> Option<BindingHandoffSeed>
     let mut rewrites = Vec::with_capacity(assign.targets.len());
     let mut retained_pairs = Vec::new();
     for (target, value) in assign.targets.iter().zip(&assign.values) {
-        let rewrite = match (target, value) {
-            (HirLValue::Temp(target_temp), HirExpr::LocalRef(local)) => Some(TempBindingRewrite {
-                from: *target_temp,
-                to: CarryBinding::Local(*local),
-            }),
-            (HirLValue::Temp(target_temp), HirExpr::TempRef(temp)) => Some(TempBindingRewrite {
-                from: *target_temp,
-                to: CarryBinding::Temp(*temp),
-            }),
+        let rewrite = match target {
+            HirLValue::Temp(target_temp) => {
+                carry_binding_from_expr(value).map(|binding| TempBindingRewrite {
+                    from: *target_temp,
+                    to: binding,
+                })
+            }
             _ => None,
         };
         let Some(rewrite) = rewrite else {
@@ -138,6 +138,7 @@ pub(super) fn rewrite_update_handoff_seed(stmt: &mut HirStmt, carried: CarryBind
         return false;
     };
     *target = match carried {
+        CarryBinding::Param(param) => HirLValue::Param(param),
         CarryBinding::Local(local) => HirLValue::Local(local),
         CarryBinding::Temp(temp) => HirLValue::Temp(temp),
     };
@@ -157,10 +158,6 @@ pub(super) fn single_binding_handoff_seed(stmt: &HirStmt) -> Option<(TempId, Car
     if assign.values.tail.is_some() {
         return None;
     }
-    let binding = match value {
-        HirExpr::LocalRef(local) => CarryBinding::Local(*local),
-        HirExpr::TempRef(source) => CarryBinding::Temp(*source),
-        _ => return None,
-    };
+    let binding = carry_binding_from_expr(value)?;
     Some((*temp, binding))
 }

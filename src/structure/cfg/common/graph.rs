@@ -101,11 +101,15 @@ impl PostDominatorTree {
     }
 }
 
-/// 一条 natural loop 事实。
+/// 同一个 header 的完整 natural-loop 事实。
+///
+/// `backedges` 按 CFG edge id 稳定排序，`blocks` 是这些回边 natural domain 的并集。
+/// 图层不会把同一 header 拆成多份候选；源码级 loop containment 由 Structure 在消费
+/// 这一个事实时一次决定。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NaturalLoop {
     pub header: BlockRef,
-    pub backedge: EdgeRef,
+    pub backedges: Vec<EdgeRef>,
     pub blocks: BTreeSet<BlockRef>,
 }
 

@@ -200,7 +200,7 @@ fn rewrite_call_expr(call: &mut HirCallExpr, pass: &mut impl HirRewritePass) -> 
     call_changed || nested_changed
 }
 
-fn rewrite_expr(expr: &mut HirExpr, pass: &mut impl HirRewritePass) -> bool {
+pub(super) fn rewrite_expr(expr: &mut HirExpr, pass: &mut impl HirRewritePass) -> bool {
     let mut nested_changed = false;
     traverse_hir_expr_children!(
         expr,

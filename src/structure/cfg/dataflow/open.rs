@@ -53,7 +53,7 @@ pub(super) fn analyze_open_values(
     reg_count: usize,
     entry_open_start: Option<Reg>,
     incoming_slots: &[Option<usize>],
-) -> OpenAnalysis {
+) -> Result<OpenAnalysis, StructureError> {
     let (live_in, live_out) = solve_open_liveness(cfg, graph, effects);
     let mut defs = Vec::new();
     let mut instr_defs = vec![None; effects.len()];
@@ -114,41 +114,45 @@ pub(super) fn analyze_open_values(
         &mut phis,
         &mut uses,
         incoming_slots,
-    );
+    )?;
 
-    let phi_sources = index_open_phi_sources(&phis);
+    let phi_sources = index_open_phi_sources(&phis)?;
     let mut use_sources = vec![OpenUseSources::default(); effects.len()];
     let mut fixed_ssa_use_regs = Vec::with_capacity(effects.len());
     let mut fixed_liveness_use_regs = Vec::with_capacity(effects.len());
     for (instr_index, effect) in effects.iter().enumerate() {
-        let sources = open_sources_for_value(uses[instr_index], &phi_sources);
+        let sources = open_sources_for_value(uses[instr_index], &phi_sources)?;
         use_sources[instr_index] = sources.clone();
 
         let mut ssa_regs = effect.fixed_uses.iter().copied().collect::<Vec<_>>();
         let mut liveness_regs = ssa_regs.clone();
         if let Some(start_reg) = effect.open_use {
             let (must_end, may_end) =
-                fixed_prefix_ends(&sources, &defs, entry_open_start, start_reg, reg_count);
+                fixed_prefix_ends(&sources, &defs, entry_open_start, start_reg, reg_count)?;
             ssa_regs.extend((start_reg.index()..must_end).map(Reg));
             liveness_regs.extend((start_reg.index()..may_end).map(Reg));
         }
         for regs in [&mut ssa_regs, &mut liveness_regs] {
             regs.sort_unstable_by_key(|reg| reg.index());
             regs.dedup();
-            debug_assert!(regs.iter().all(|reg| reg.index() < reg_count));
+            if regs.iter().any(|reg| reg.index() >= reg_count) {
+                return Err(StructureError::invalid(format!(
+                    "open-value instruction @{instr_index} references a register outside the arena"
+                )));
+            }
         }
         fixed_ssa_use_regs.push(ssa_regs);
         fixed_liveness_use_regs.push(liveness_regs);
     }
 
-    OpenAnalysis {
+    Ok(OpenAnalysis {
         defs,
         use_sources,
         fixed_ssa_use_regs,
         fixed_liveness_use_regs,
         live_in,
         live_out,
-    }
+    })
 }
 
 fn solve_open_liveness(
@@ -246,7 +250,7 @@ fn rename_open(
     phis: &mut [OpenPhi],
     uses: &mut [Option<OpenValue>],
     incoming_slots: &[Option<usize>],
-) {
+) -> Result<(), StructureError> {
     let mut pending = vec![(cfg.entry_block, OpenValue::Entry)];
     while let Some((block, inherited)) = pending.pop() {
         let mut current = block_phi[block.index()].map_or(inherited, OpenValue::Phi);
@@ -266,22 +270,37 @@ fn rename_open(
             let Some(phi) = block_phi[succ.index()] else {
                 continue;
             };
-            let slot = incoming_slots[edge.index()]
-                .expect("reachable CFG edge must have an incoming slot");
-            let incoming = phis[phi.index()]
-                .incoming
-                .get_mut(slot)
-                .expect("open phi incoming slots must match CFG predecessors");
-            assert_eq!(incoming.edge, Some(*edge));
+            let Some(slot) = incoming_slots.get(edge.index()).copied().flatten() else {
+                return Err(StructureError::invalid(format!(
+                    "reachable CFG edge {edge} has no open-phi incoming slot"
+                )));
+            };
+            let Some(phi) = phis.get_mut(phi.index()) else {
+                return Err(StructureError::invalid(format!(
+                    "open phi #{} is outside the phi arena",
+                    phi.index()
+                )));
+            };
+            let Some(incoming) = phi.incoming.get_mut(slot) else {
+                return Err(StructureError::invalid(format!(
+                    "open phi incoming slot #{slot} does not match CFG edge {edge}"
+                )));
+            };
+            if incoming.edge != Some(*edge) {
+                return Err(StructureError::invalid(format!(
+                    "open phi incoming slot #{slot} references the wrong CFG edge"
+                )));
+            }
             incoming.value = current;
         }
         for child in graph.dominator_tree.children[block.index()].iter().rev() {
             pending.push((*child, current));
         }
     }
+    Ok(())
 }
 
-fn index_open_phi_sources(phis: &[OpenPhi]) -> Vec<OpenUseSources> {
+fn index_open_phi_sources(phis: &[OpenPhi]) -> Result<Vec<OpenUseSources>, StructureError> {
     let mut sources = vec![OpenUseSources::default(); phis.len()];
     let mut dependents = vec![Vec::new(); phis.len()];
     for (phi_index, phi) in phis.iter().enumerate() {
@@ -293,7 +312,15 @@ fn index_open_phi_sources(phis: &[OpenPhi]) -> Vec<OpenUseSources> {
                 OpenValue::Def(def) => {
                     sources[phi_index].insert_def(def);
                 }
-                OpenValue::Phi(source) => dependents[source.index()].push(phi_index),
+                OpenValue::Phi(source) => {
+                    let Some(source_dependents) = dependents.get_mut(source.index()) else {
+                        return Err(StructureError::invalid(format!(
+                            "open phi #{phi_index} references missing source phi #{}",
+                            source.index()
+                        )));
+                    };
+                    source_dependents.push(phi_index);
+                }
             }
         }
     }
@@ -310,13 +337,13 @@ fn index_open_phi_sources(phis: &[OpenPhi]) -> Vec<OpenUseSources> {
             }
         }
     }
-    sources
+    Ok(sources)
 }
 
 fn open_sources_for_value(
     value: Option<OpenValue>,
     phi_sources: &[OpenUseSources],
-) -> OpenUseSources {
+) -> Result<OpenUseSources, StructureError> {
     let mut sources = OpenUseSources::default();
     match value {
         Some(OpenValue::Entry) => {
@@ -326,13 +353,17 @@ fn open_sources_for_value(
             sources.insert_def(def);
         }
         Some(OpenValue::Phi(phi)) => {
-            if let Some(phi_sources) = phi_sources.get(phi.index()) {
-                sources.merge(phi_sources);
-            }
+            let Some(phi_sources) = phi_sources.get(phi.index()) else {
+                return Err(StructureError::invalid(format!(
+                    "open use references missing phi #{}",
+                    phi.index()
+                )));
+            };
+            sources.merge(phi_sources);
         }
         None => {}
     }
-    sources
+    Ok(sources)
 }
 
 fn fixed_prefix_ends(
@@ -341,25 +372,53 @@ fn fixed_prefix_ends(
     entry_open_start: Option<Reg>,
     use_start: Reg,
     reg_count: usize,
-) -> (usize, usize) {
+) -> Result<(usize, usize), StructureError> {
     let start = use_start.index();
-    let mut source_starts = sources
-        .defs()
-        .iter()
-        .map(|def| defs[def.index()].start_reg.index())
-        .collect::<Vec<_>>();
+    if start > reg_count {
+        return Err(StructureError::invalid(format!(
+            "open use starts at r{start}, outside the register arena"
+        )));
+    }
+    let mut source_starts =
+        Vec::with_capacity(sources.defs().len() + usize::from(sources.has_entry()));
+    for def in sources.defs() {
+        let Some(definition) = defs.get(def.index()) else {
+            return Err(StructureError::invalid(format!(
+                "open use references missing definition #{}",
+                def.index()
+            )));
+        };
+        let source_start = definition.start_reg.index();
+        if source_start > reg_count {
+            return Err(StructureError::invalid(format!(
+                "open definition #{} starts at r{source_start}, outside the register arena",
+                def.index()
+            )));
+        }
+        source_starts.push(source_start);
+    }
     if sources.has_entry() {
         let Some(entry_start) = entry_open_start else {
-            return (start, reg_count);
+            return Ok((start, reg_count));
         };
-        source_starts.push(entry_start.index());
+        let entry_start = entry_start.index();
+        if entry_start > reg_count {
+            return Err(StructureError::invalid(format!(
+                "entry open value starts at r{entry_start}, outside the register arena"
+            )));
+        }
+        source_starts.push(entry_start);
     }
     let Some(min_start) = source_starts.iter().copied().min() else {
-        return (start, start);
+        return Ok((start, start));
     };
-    let max_start = source_starts.iter().copied().max().unwrap_or(min_start);
-    (
+    let Some(max_start) = source_starts.iter().copied().max() else {
+        return Err(StructureError::invalid(
+            "open-source range unexpectedly became empty",
+        ));
+    };
+    Ok((
         min_start.clamp(start, reg_count),
         max_start.clamp(start, reg_count),
-    )
+    ))
 }

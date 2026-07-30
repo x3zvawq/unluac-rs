@@ -30,7 +30,7 @@ pub(super) fn solve_liveness(
     instr_effects: &[InstrEffect],
     fixed_use_regs: &[Vec<Reg>],
     reg_count: usize,
-) -> BlockLiveness {
+) -> Result<BlockLiveness, StructureError> {
     let mut block_uses = vec![DenseRegSet::new(reg_count); cfg.blocks.len()];
     let mut block_defs = vec![DenseRegSet::new(reg_count); cfg.blocks.len()];
 
@@ -43,14 +43,14 @@ pub(super) fn solve_liveness(
 
         for instr_index in instr_indices {
             for &reg in &fixed_use_regs[instr_index] {
-                if !seen_defs.contains(reg) {
-                    block_uses[block.index()].insert(reg);
+                if !seen_defs.contains(reg)? {
+                    block_uses[block.index()].insert(reg)?;
                 }
             }
 
             for reg in &instr_effects[instr_index].fixed_must_defs {
-                seen_defs.insert(*reg);
-                block_defs[block.index()].insert(*reg);
+                seen_defs.insert(*reg)?;
+                block_defs[block.index()].insert(*reg)?;
             }
         }
     }
@@ -92,10 +92,10 @@ pub(super) fn solve_liveness(
         }
     }
 
-    BlockLiveness {
+    Ok(BlockLiveness {
         live_in: live_in.into_iter().map(DenseRegSet::into_regs).collect(),
         live_out: live_out.into_iter().map(DenseRegSet::into_regs).collect(),
-    }
+    })
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -110,21 +110,27 @@ impl DenseRegSet {
         }
     }
 
-    fn insert(&mut self, reg: Reg) -> bool {
-        let slot = self
-            .bits
-            .get_mut(reg.index())
-            .expect("liveness reg set should cover every reachable register");
+    fn insert(&mut self, reg: Reg) -> Result<bool, StructureError> {
+        let Some(slot) = self.bits.get_mut(reg.index()) else {
+            return Err(StructureError::invalid(format!(
+                "liveness register r{} exceeds register arena {}",
+                reg.index(),
+                self.bits.len()
+            )));
+        };
         let changed = !*slot;
         *slot = true;
-        changed
+        Ok(changed)
     }
 
-    fn contains(&self, reg: Reg) -> bool {
-        self.bits
-            .get(reg.index())
-            .copied()
-            .expect("liveness reg set should cover every reachable register")
+    fn contains(&self, reg: Reg) -> Result<bool, StructureError> {
+        self.bits.get(reg.index()).copied().ok_or_else(|| {
+            StructureError::invalid(format!(
+                "liveness register r{} exceeds register arena {}",
+                reg.index(),
+                self.bits.len()
+            ))
+        })
     }
 
     fn extend_from(&mut self, other: &Self) {

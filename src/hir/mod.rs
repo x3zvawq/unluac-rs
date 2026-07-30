@@ -8,8 +8,10 @@ mod common;
 #[cfg(feature = "decompile-debug")]
 mod debug;
 mod decision;
+mod error;
 mod expr_safety;
 mod promotion;
+mod rewrite;
 mod simplify;
 pub(crate) mod traverse;
 
@@ -26,6 +28,7 @@ pub use common::{
 };
 #[cfg(feature = "decompile-debug")]
 pub use debug::dump_hir;
+pub use error::HirLowerError;
 #[cfg(not(feature = "decompile-debug"))]
 mod debug {
     crate::debug::define_unavailable_stage_dump!(dump_hir);

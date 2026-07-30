@@ -16,12 +16,12 @@ mod rewrite;
 mod site;
 mod usage;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use crate::ast::ReadabilityOptions;
 use crate::hir::common::{
-    HirBlock, HirCallExpr, HirExpr, HirLValue, HirPackTail, HirProto, HirStmt, HirTableField,
-    HirTableKey, HirValuePack, TempId,
+    HirBlock, HirCallExpr, HirExpr, HirLValue, HirProto, HirStmt, HirTableField, HirTableKey,
+    TempId,
 };
 use crate::hir::expr_safety::{expr_observes_eval_order, expr_requires_ordered_snapshot};
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
@@ -109,6 +109,7 @@ fn inline_temps_in_block(
         live_use_counts,
         facts,
         &captured_slots_before_stmt,
+        reference_captured,
     ) {
         changed = true;
         captured_slots_before_stmt =
@@ -263,104 +264,126 @@ fn inline_call_callee_across_argument_materialization(
     live_use_counts: &mut [usize],
     facts: &ProtoPromotionFacts,
     captured_slots_before_stmt: &CapturedSlotSnapshots,
+    reference_captured: &ReferenceCapturedBindings,
 ) -> bool {
     let prior_order_sensitive_defs =
         order_sensitive_temp_def_indices(&block.stmts, scratch.temp_count());
-    let mut stmt_order = (0..block.stmts.len()).collect::<Vec<_>>();
-    let mut changed = false;
     let mut index = 0;
 
-    while index + 2 < block.stmts.len() {
-        let Some((callee_temp, callee_value)) = inline_candidate(&block.stmts[index]) else {
+    while index < block.stmts.len() {
+        if inline_candidate(&block.stmts[index]).is_none() {
             index += 1;
+            continue;
+        }
+        let run_start = index;
+        let mut run_end = run_start + 1;
+        while run_end < block.stmts.len() && inline_candidate(&block.stmts[run_end]).is_some() {
+            run_end += 1;
+        }
+        let Some(HirStmt::CallStmt(call_stmt)) = block.stmts.get(run_end) else {
+            index = run_end;
+            continue;
+        };
+        let HirExpr::TempRef(callee_temp) = call_stmt.call.callee else {
+            index = run_end + 1;
+            continue;
+        };
+        let Some(callee_index) = (run_start..run_end).find(|candidate_index| {
+            inline_candidate(&block.stmts[*candidate_index])
+                .is_some_and(|(candidate, _)| candidate == callee_temp)
+        }) else {
+            index = run_end + 1;
+            continue;
+        };
+        let Some((_, callee_value)) = inline_candidate(&block.stmts[callee_index]) else {
+            index = run_end + 1;
             continue;
         };
         if !cross_call_inline_candidate_is_safe(
             callee_temp,
             callee_value,
-            index,
+            callee_index,
             scratch,
             facts,
             captured_slots_before_stmt,
         ) || total_use_count(callee_temp, live_use_counts) != 1
         {
-            index += 1;
+            index = run_end + 1;
             continue;
         }
 
-        let mut arg_values = Vec::new();
-        let mut arg_temps = Vec::new();
-        let mut call_index = index + 1;
-        while call_index < block.stmts.len() {
-            if matches!(block.stmts[call_index], HirStmt::CallStmt(_)) {
+        let mut rewritten_sink = block.stmts[run_end].clone();
+        let mut removed_temps = Vec::with_capacity(run_end - callee_index);
+        let mut complete_run = true;
+        for candidate_index in ((callee_index + 1)..run_end).rev() {
+            let Some((temp, value)) = inline_candidate(&block.stmts[candidate_index]) else {
+                complete_run = false;
                 break;
-            }
-            let Some((arg_temp, arg_value)) = inline_candidate(&block.stmts[call_index]) else {
+            };
+            let Some(site) = inline_site_in_stmt(&rewritten_sink, temp) else {
+                complete_run = false;
                 break;
             };
             if !cross_call_inline_candidate_is_safe(
-                arg_temp,
-                arg_value,
-                call_index,
+                temp,
+                value,
+                candidate_index,
                 scratch,
                 facts,
                 captured_slots_before_stmt,
-            ) || arg_value_forwards_prior_order_sensitive_expr(
-                arg_value,
-                stmt_order[index],
-                &prior_order_sensitive_defs,
-            ) || total_use_count(arg_temp, live_use_counts) != 1
+            ) || total_use_count(temp, live_use_counts) != 1
+                || arg_value_forwards_prior_order_sensitive_expr(
+                    value,
+                    callee_index,
+                    &prior_order_sensitive_defs,
+                )
+                || inline_crosses_evaluation_boundary(
+                    site,
+                    value,
+                    &rewritten_sink,
+                    temp,
+                    reference_captured,
+                )
             {
+                complete_run = false;
                 break;
             }
-            arg_temps.push(arg_temp);
-            arg_values.push(arg_value.clone());
-            call_index += 1;
+            replace_temp_in_stmt(&mut rewritten_sink, temp, value);
+            removed_temps.push(temp);
         }
-
-        if arg_temps.is_empty() || call_index >= block.stmts.len() {
-            index += 1;
-            continue;
-        }
-
-        let HirStmt::CallStmt(call_stmt) = &block.stmts[call_index] else {
-            index += 1;
+        let Some(callee_site) = inline_site_in_stmt(&rewritten_sink, callee_temp) else {
+            index = run_end + 1;
             continue;
         };
-        if !matches!(&call_stmt.call.callee, HirExpr::TempRef(temp) if *temp == callee_temp)
-            || !call_args_are_exact_temp_refs(&call_stmt.call.args, &arg_temps)
+        if !complete_run
+            || callee_site != InlineSite::CallCallee
+            || inline_crosses_evaluation_boundary(
+                callee_site,
+                callee_value,
+                &rewritten_sink,
+                callee_temp,
+                reference_captured,
+            )
         {
-            index += 1;
+            index = run_end + 1;
             continue;
         }
+        replace_temp_in_stmt(&mut rewritten_sink, callee_temp, callee_value);
+        removed_temps.push(callee_temp);
 
-        let callee_value = callee_value.clone();
-        let arg_replacements = arg_temps
-            .iter()
-            .copied()
-            .zip(arg_values)
-            .collect::<BTreeMap<_, _>>();
-        if let HirStmt::CallStmt(call_stmt) = &mut block.stmts[call_index] {
-            call_stmt.call.callee = callee_value;
-            for arg in &mut call_stmt.call.args.fixed {
-                let HirExpr::TempRef(temp) = arg else {
-                    continue;
-                };
-                if let Some(value) = arg_replacements.get(temp) {
-                    *arg = value.clone();
-                }
-            }
-        }
-        block.stmts.drain(index..call_index);
-        stmt_order.drain(index..call_index);
+        block.stmts[run_end] = rewritten_sink;
+        block.stmts.drain(callee_index..run_end);
         remove_live_use(live_use_counts, callee_temp);
-        for temp in arg_replacements.keys().copied() {
+        for temp in removed_temps
+            .into_iter()
+            .filter(|temp| *temp != callee_temp)
+        {
             remove_live_use(live_use_counts, temp);
         }
-        changed = true;
+        return true;
     }
 
-    changed
+    false
 }
 
 fn call_arg_inline_crosses_materialized_callee(
@@ -436,16 +459,6 @@ fn remove_live_use(live_use_counts: &mut [usize], temp: TempId) {
     *count = count
         .checked_sub(1)
         .expect("successful inline should remove one live use");
-}
-
-fn call_args_are_exact_temp_refs(args: &HirValuePack, expected_temps: &[TempId]) -> bool {
-    args.tail.is_none()
-        && args.fixed.len() == expected_temps.len()
-        && args
-            .fixed
-            .iter()
-            .zip(expected_temps.iter().copied())
-            .all(|(arg, expected)| matches!(arg, HirExpr::TempRef(temp) if *temp == expected))
 }
 
 fn collect_block_temp_use_totals(stmts: &[HirStmt], scratch: &mut TempUseScratch) -> Vec<usize> {

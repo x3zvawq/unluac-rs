@@ -46,6 +46,38 @@ pub enum DecompileDialect {
     Luau,
 }
 
+/// 控制结构恢复与 AST lowering 共同依赖的目标语法能力。
+///
+/// 这两个能力会直接改变 CFG edge 能否表达为正常源码，因此放在 pipeline 共享层；
+/// Structure 不需要反向依赖 AST，AST 也不再维护另一份方言控制流表。
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct ControlFlowCaps {
+    pub goto_label: bool,
+    pub continue_stmt: bool,
+}
+
+impl DecompileDialect {
+    /// 返回目标方言原生支持的控制流语法。
+    pub const fn control_flow_caps(self) -> ControlFlowCaps {
+        match self {
+            Self::Lua52 | Self::Lua53 | Self::Lua54 | Self::Lua55 | Self::Luajit => {
+                ControlFlowCaps {
+                    goto_label: true,
+                    continue_stmt: false,
+                }
+            }
+            Self::Luau => ControlFlowCaps {
+                goto_label: false,
+                continue_stmt: true,
+            },
+            Self::Auto | Self::Lua51 => ControlFlowCaps {
+                goto_label: false,
+                continue_stmt: false,
+            },
+        }
+    }
+}
+
 /// 一次主反编译调用的顶层选项。
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecompileOptions {

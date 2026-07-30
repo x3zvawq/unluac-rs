@@ -5,6 +5,7 @@
 
 use crate::LuaString;
 use crate::parser::{ProtoLineRange, ProtoSignature};
+use crate::transformer::InstrRef;
 
 /// 整个 chunk 的 HIR 根对象。
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -509,6 +510,9 @@ pub struct HirErrNil {
 /// target dialect 把它收成真正的 `<close>` 局部声明形式。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirToBeClosed {
+    /// 原始 `TBC` 指令 identity；与 label 的冻结 active-set 精确配对，避免寄存器复用
+    /// 让 close-scope materialization 把 goto target 放到错误的词法块。
+    pub origin: InstrRef,
     /// 对应 Lua VM 里的寄存器槽位。
     ///
     /// 这里额外保留 `tbc rX` 的原始槽位，不是为了把后面的 AST 再次绑定回寄存器，
@@ -585,6 +589,8 @@ pub struct HirGoto {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirLabel {
     pub id: HirLabelId,
+    /// Structure 在目标 block 冻结的活跃 TBC 声明。
+    pub tbc_barriers: Vec<InstrRef>,
 }
 
 /// 表构造器。

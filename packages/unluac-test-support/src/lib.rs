@@ -12,13 +12,23 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use unluac::decompile::{DecompileDialect, DecompileOptions, DecompileStage, decompile};
-use unluac::generate::{LuauVectorConstructor, LuauVectorSize};
+use unluac::ast::AstLowerError;
+use unluac::decompile::{
+    DecompileDialect, DecompileError, DecompileOptions, DecompileStage, decompile,
+};
+use unluac::generate::{GenerateMode, GeneratedChunkKind, LuauVectorConstructor, LuauVectorSize};
+use unluac::structure::{
+    ControlFlowFeature, LoopVmProtocol, RegionId, RegionPlan, StructureFacts, StructurePlan,
+    UnstructuredLayoutItem,
+};
 
 #[allow(dead_code)]
 mod case_manifest;
-pub use case_manifest::{LuaCaseDialect, LuaCaseManifestEntry};
-use case_manifest::{LuaCaseOptions, regression_cases, unit_cases};
+pub use case_manifest::{LuaCaseDialect, LuaCaseManifestEntry, LuaCaseVariant};
+use case_manifest::{
+    LuaCaseExpectation, LuaCaseLoopProtocol, LuaCaseOptions, LuaCaseStructureContract,
+    regression_cases, unit_cases,
+};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct LuaCommandOutput {
@@ -162,6 +172,7 @@ pub enum FailureKind {
     AutoDialectMismatch,
     DecompileFailed,
     GenerateWithoutSource,
+    GeneratedChunkKindMismatch,
     WriteGeneratedSourceFailed,
     CompileGeneratedSourceFailed,
     GeneratedSourceCompilationFailed,
@@ -174,6 +185,7 @@ pub enum FailureKind {
     RecompileGeneratedOutputMismatch,
     RecompileConvergenceMismatch,
     ReadabilityAssertionFailed,
+    StructureContractAssertionFailed,
 }
 
 impl FailureKind {
@@ -190,6 +202,7 @@ impl FailureKind {
             Self::AutoDialectMismatch => "auto-dialect-mismatch",
             Self::DecompileFailed => "decompile-failed",
             Self::GenerateWithoutSource => "generate-without-source",
+            Self::GeneratedChunkKindMismatch => "generated-chunk-kind-mismatch",
             Self::WriteGeneratedSourceFailed => "write-generated-source-failed",
             Self::CompileGeneratedSourceFailed => "compile-generated-source-failed",
             Self::GeneratedSourceCompilationFailed => "generated-source-compilation-failed",
@@ -206,6 +219,7 @@ impl FailureKind {
             Self::RecompileGeneratedOutputMismatch => "recompile-generated-output-mismatch",
             Self::RecompileConvergenceMismatch => "recompile-convergence-mismatch",
             Self::ReadabilityAssertionFailed => "readability-assertion-failed",
+            Self::StructureContractAssertionFailed => "structure-contract-assertion-failed",
         }
     }
 }
@@ -341,11 +355,13 @@ pub fn find_unit_case_spec(
     suite: UnitSuite,
     dialect_label: &str,
     path: &str,
+    variant_label: Option<&str>,
 ) -> Option<UnitCaseSpec> {
     unit_case_specs().into_iter().find(|spec| {
         spec.suite == suite
             && <&'static str>::from(spec.entry.dialect) == dialect_label
             && spec.entry.path == path
+            && spec.entry.variant.map(LuaCaseVariant::label) == variant_label
     })
 }
 
@@ -509,10 +525,11 @@ fn assert_readability(
     stage_label: &str,
     generated_source: &str,
     assertions: &[ReadabilityAssertion],
+    check_positive_shape: bool,
 ) -> Result<(), TestFailure> {
     for assertion in assertions {
         match assertion {
-            ReadabilityAssertion::Contains { line, needle } => {
+            ReadabilityAssertion::Contains { line, needle } if check_positive_shape => {
                 if !generated_source.contains(needle) {
                     return Err(readability_assertion_failure(
                         stage_label,
@@ -536,7 +553,7 @@ fn assert_readability(
                 line,
                 before,
                 after,
-            } => {
+            } if check_positive_shape => {
                 let before_pos = generated_source.find(before);
                 let after_pos = generated_source.find(after);
                 if !matches!((before_pos, after_pos), (Some(left), Some(right)) if left < right) {
@@ -548,10 +565,152 @@ fn assert_readability(
                     ));
                 }
             }
+            ReadabilityAssertion::Contains { .. } | ReadabilityAssertion::Order { .. } => {}
         }
     }
 
     Ok(())
+}
+
+fn assert_source_chunk(
+    stage_label: &str,
+    kind: GeneratedChunkKind,
+    case_path: &str,
+) -> Result<(), TestFailure> {
+    if kind == GeneratedChunkKind::Source {
+        return Ok(());
+    }
+    let summary = format!("[{stage_label}] generated diagnostic pseudocode in strict source test");
+    Err(TestFailure::new(
+        FailureKind::GeneratedChunkKindMismatch,
+        summary.clone(),
+        format!("{summary}: case={case_path}, kind={kind:?}"),
+    ))
+}
+
+fn assert_structure_contracts(
+    entry: &LuaCaseManifestEntry,
+    facts: Option<&StructureFacts>,
+) -> Result<(), TestFailure> {
+    for contract in entry
+        .structure_contracts
+        .iter()
+        .copied()
+        .filter(|contract| contract.dialect() == entry.dialect)
+    {
+        let facts = facts.ok_or_else(|| {
+            source_structure_contract_failure(entry, "generate stage returned no StructureFacts")
+        })?;
+        if !structure_facts_match_contract(facts, contract) {
+            let LuaCaseStructureContract::MixedUnstructuredChildLoop { protocol, .. } = contract;
+            return Err(source_structure_contract_failure(
+                entry,
+                format!(
+                    "no Unstructured layout contained both a direct block and a region child whose subtree owns a {} LoopVmProtocol",
+                    loop_protocol_label(protocol)
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn structure_facts_match_contract(
+    facts: &StructureFacts,
+    contract: LuaCaseStructureContract,
+) -> bool {
+    let LuaCaseStructureContract::MixedUnstructuredChildLoop { protocol, .. } = contract;
+    plan_contains_mixed_unstructured_child_loop(facts.plan(), protocol)
+        || facts
+            .children
+            .iter()
+            .any(|child| structure_facts_match_contract(child, contract))
+}
+
+fn plan_contains_mixed_unstructured_child_loop(
+    plan: &StructurePlan,
+    protocol: LuaCaseLoopProtocol,
+) -> bool {
+    plan.regions().any(|(_, region)| {
+        let RegionPlan::Unstructured { layout, .. } = region else {
+            return false;
+        };
+        layout
+            .iter()
+            .any(|item| matches!(item, UnstructuredLayoutItem::Block(_)))
+            && layout.iter().any(|item| match item {
+                UnstructuredLayoutItem::Block(_) => false,
+                UnstructuredLayoutItem::Region(child) => {
+                    region_subtree_contains_loop_protocol(plan, *child, protocol)
+                }
+            })
+    })
+}
+
+fn region_subtree_contains_loop_protocol(
+    plan: &StructurePlan,
+    subtree_root: RegionId,
+    protocol: LuaCaseLoopProtocol,
+) -> bool {
+    plan.loops().any(|(loop_id, _)| {
+        loop_protocol_matches(plan.loop_protocol(loop_id), protocol)
+            && plan
+                .loop_region(loop_id)
+                .is_some_and(|region| region_is_in_subtree(plan, subtree_root, region))
+    })
+}
+
+fn region_is_in_subtree(
+    plan: &StructurePlan,
+    subtree_root: RegionId,
+    mut region: RegionId,
+) -> bool {
+    for _ in 0..plan.regions().len() {
+        if region == subtree_root {
+            return true;
+        }
+        let Some(parent) = plan.region(region).and_then(RegionPlan::parent) else {
+            return false;
+        };
+        region = parent;
+    }
+    false
+}
+
+fn loop_protocol_matches(actual: Option<&LoopVmProtocol>, expected: LuaCaseLoopProtocol) -> bool {
+    matches!(
+        (actual, expected),
+        (
+            Some(LoopVmProtocol::NumericFor(_)),
+            LuaCaseLoopProtocol::NumericFor
+        ) | (
+            Some(LoopVmProtocol::GenericFor(_)),
+            LuaCaseLoopProtocol::GenericFor
+        )
+    )
+}
+
+fn loop_protocol_label(protocol: LuaCaseLoopProtocol) -> &'static str {
+    match protocol {
+        LuaCaseLoopProtocol::NumericFor => "NumericFor",
+        LuaCaseLoopProtocol::GenericFor => "GenericFor",
+    }
+}
+
+fn source_structure_contract_failure(
+    entry: &LuaCaseManifestEntry,
+    reason: impl Into<String>,
+) -> TestFailure {
+    let dialect = <&'static str>::from(entry.dialect);
+    let reason = reason.into();
+    TestFailure::new(
+        FailureKind::StructureContractAssertionFailed,
+        "StructurePlan source contract failed",
+        format!(
+            "StructurePlan source contract failed: case={}, dialect={dialect}: {reason}",
+            entry.path
+        ),
+    )
 }
 
 fn readability_assertion_failure(
@@ -601,6 +760,7 @@ pub(crate) fn compile_lua_case_to_suite_artifact(
     let output = suite_artifact_path(
         suite_label,
         dialect_label,
+        entry.variant,
         artifact_label,
         entry.path,
         toolchain.chunk_extension,
@@ -612,16 +772,17 @@ pub(crate) fn compile_lua_case_to_suite_artifact(
 
 /// 把反编译得到的源码落到稳定产物路径，便于后续编译、执行和排错。
 pub(crate) fn write_generated_case_source(
-    dialect_label: &str,
+    entry: &LuaCaseManifestEntry,
     suite_label: &str,
-    source_relative: &str,
     generated_source: &str,
 ) -> Result<PathBuf, String> {
+    let dialect_label = <&'static str>::from(entry.dialect);
     let output = suite_artifact_path(
         suite_label,
         dialect_label,
+        entry.variant,
         "generated-source",
-        source_relative,
+        entry.path,
         "lua",
     );
     write_output_file(&output, generated_source.as_bytes())?;
@@ -740,6 +901,9 @@ pub(crate) fn run_pipeline_case(
     suite: UnitSuite,
     entry: &LuaCaseManifestEntry,
 ) -> Result<TestSuccess, TestFailure> {
+    if let LuaCaseExpectation::UnsupportedIsland { jump_pc, target_pc } = entry.expectation {
+        return run_unsupported_island_contract(entry, jump_pc, target_pc);
+    }
     let dialect_label = <&'static str>::from(entry.dialect);
     let suite_label = suite.label();
     let toolchain = lua_toolchain(dialect_label).map_err(|error| {
@@ -773,6 +937,7 @@ pub(crate) fn run_pipeline_case(
         expected_dialect,
         entry.path,
     )?;
+    assert_structure_contracts(entry, result.state.structure_facts.as_ref())?;
 
     let generated = result.state.generated.as_ref().ok_or_else(|| {
         TestFailure::new(
@@ -781,16 +946,16 @@ pub(crate) fn run_pipeline_case(
             format!("generate stage finished without source for {}", entry.path),
         )
     })?;
-    assert_readability("generated", &generated.source, &assertions)?;
-    let generated_source_path =
-        write_generated_case_source(dialect_label, suite_label, entry.path, &generated.source)
-            .map_err(|error| {
-                TestFailure::new(
-                    FailureKind::WriteGeneratedSourceFailed,
-                    "write generated source failed",
-                    format!("write generated source failed: {error}"),
-                )
-            })?;
+    assert_source_chunk("generated", generated.kind, entry.path)?;
+    assert_readability("generated", &generated.source, &assertions, true)?;
+    let generated_source_path = write_generated_case_source(entry, suite_label, &generated.source)
+        .map_err(|error| {
+            TestFailure::new(
+                FailureKind::WriteGeneratedSourceFailed,
+                "write generated source failed",
+                format!("write generated source failed: {error}"),
+            )
+        })?;
 
     let (generated_chunk_path, compile_output) = compile_generated_source_to_suite_artifact(
         entry,
@@ -900,9 +1065,8 @@ pub(crate) fn run_pipeline_case(
 
         // 把上一轮生成的源码编译成 chunk
         let prev_source_path = write_generated_case_source(
-            dialect_label,
+            entry,
             &format!("{suite_label}/{round_label}"),
-            entry.path,
             &prev_generated_source,
         )
         .map_err(|error| {
@@ -981,13 +1145,21 @@ pub(crate) fn run_pipeline_case(
                 ),
             )
         })?;
-        assert_readability(&round_label, &recompile_generated.source, &assertions)?;
+        assert_source_chunk(&round_label, recompile_generated.kind, entry.path)?;
+        // 正向 shape 只约束原始 bytecode 的首次恢复；目标编译器可能把合法的
+        // `break`/`while true` 等价规范化成 `return`/`repeat`。安全型负向约束仍需
+        // 在每个 roundtrip 重验，防止 goto、unresolved 或诊断源码回流。
+        assert_readability(
+            &round_label,
+            &recompile_generated.source,
+            &assertions,
+            false,
+        )?;
 
         // 写出、编译、执行再次生成的源码
         let regen_source_path = write_generated_case_source(
-            dialect_label,
+            entry,
             &format!("{suite_label}/{round_label}-regen"),
-            entry.path,
             &recompile_generated.source,
         )
         .map_err(|error| {
@@ -1093,6 +1265,217 @@ pub(crate) fn run_pipeline_case(
 
     let proto_count = count_output_tags(&baseline.source_output.stdout);
     Ok(TestSuccess { proto_count })
+}
+
+fn run_unsupported_island_contract(
+    entry: &LuaCaseManifestEntry,
+    jump_pc: usize,
+    target_pc: usize,
+) -> Result<TestSuccess, TestFailure> {
+    let mut chunk = compile_manifest_case(entry);
+    patch_lua51_main_jump(&mut chunk, jump_pc, target_pc).map_err(|detail| {
+        TestFailure::new(
+            FailureKind::StructureContractAssertionFailed,
+            "prepare unsupported island fixture failed",
+            detail,
+        )
+    })?;
+
+    let mut structure_options = decompile_options(entry);
+    structure_options.target_stage = DecompileStage::Structure;
+    let structure = decompile(&chunk, structure_options).map_err(|error| {
+        structure_contract_failure(format!(
+            "unsupported island fixture failed before the frozen StructurePlan: {error}"
+        ))
+    })?;
+    let facts =
+        structure.state.structure_facts.as_ref().ok_or_else(|| {
+            structure_contract_failure("structure stage returned no StructureFacts")
+        })?;
+    let has_island = facts
+        .plan()
+        .regions()
+        .any(|(_, region)| matches!(region, RegionPlan::Unstructured { .. }));
+    let requires_goto = facts
+        .plan()
+        .requirements()
+        .unavailable_features()
+        .contains(&ControlFlowFeature::GotoLabel);
+    if !has_island || !requires_goto {
+        return Err(structure_contract_failure(format!(
+            "mutated Lua 5.1 fixture did not freeze an unavailable goto island: island={has_island}, requires_goto={requires_goto}"
+        )));
+    }
+
+    let mut strict_options = decompile_options(entry);
+    strict_options.generate.mode = GenerateMode::Strict;
+    match decompile(&chunk, strict_options) {
+        Err(DecompileError::Ast(AstLowerError::UnsupportedFeature {
+            dialect: DecompileDialect::Lua51,
+            feature: "goto/label",
+            context: "StructurePlan",
+        })) => {}
+        Err(error) => {
+            return Err(structure_contract_failure(format!(
+                "strict mode returned the wrong unsupported-island error: {error}"
+            )));
+        }
+        Ok(_) => {
+            return Err(structure_contract_failure(
+                "strict mode accepted an unavailable goto island",
+            ));
+        }
+    }
+
+    let mut permissive_options = decompile_options(entry);
+    permissive_options.generate.mode = GenerateMode::Permissive;
+    let permissive = decompile(&chunk, permissive_options).map_err(|error| {
+        structure_contract_failure(format!(
+            "permissive mode rejected an unsupported island: {error}"
+        ))
+    })?;
+    let generated =
+        permissive.state.generated.as_ref().ok_or_else(|| {
+            structure_contract_failure("permissive mode returned no generated chunk")
+        })?;
+    if generated.kind != GeneratedChunkKind::DiagnosticPseudocode
+        || !generated
+            .source
+            .contains("-- [unluac error] diagnostic pseudocode:")
+        || !generated.source.contains("StructurePlan requirements:")
+    {
+        return Err(structure_contract_failure(format!(
+            "permissive mode did not preserve the plan diagnostic contract: kind={:?}\n{}",
+            generated.kind, generated.source
+        )));
+    }
+
+    Ok(TestSuccess { proto_count: 1 })
+}
+
+fn structure_contract_failure(detail: impl Into<String>) -> TestFailure {
+    TestFailure::new(
+        FailureKind::StructureContractAssertionFailed,
+        "StructurePlan strict/permissive contract failed",
+        detail,
+    )
+}
+
+fn patch_lua51_main_jump(chunk: &mut [u8], jump_pc: usize, target_pc: usize) -> Result<(), String> {
+    const LUA_SIGNATURE: &[u8; 4] = b"\x1bLua";
+    const LUA51_VERSION: u8 = 0x51;
+    const OP_JMP: u32 = 22;
+    const MAXARG_SBX: i32 = 131_071;
+
+    let header = chunk
+        .get(..12)
+        .ok_or_else(|| "Lua 5.1 fixture is shorter than its binary header".to_owned())?;
+    if &header[..4] != LUA_SIGNATURE || header[4] != LUA51_VERSION || header[5] != 0 {
+        return Err("unsupported-island fixture is not a standard Lua 5.1 chunk".to_owned());
+    }
+    let little_endian = match header[6] {
+        0 => false,
+        1 => true,
+        value => return Err(format!("invalid Lua 5.1 endian flag {value}")),
+    };
+    let int_size = usize::from(header[7]);
+    let size_t_size = usize::from(header[8]);
+    let instruction_size = usize::from(header[9]);
+    if int_size == 0 || size_t_size == 0 || instruction_size != 4 {
+        return Err(format!(
+            "unsupported Lua 5.1 fixture widths: int={int_size}, size_t={size_t_size}, instruction={instruction_size}"
+        ));
+    }
+
+    let mut cursor = 12usize;
+    let source_len = read_lua_uint(chunk, &mut cursor, size_t_size, little_endian)?;
+    cursor = cursor
+        .checked_add(source_len)
+        .ok_or_else(|| "Lua 5.1 source name length overflow".to_owned())?;
+    let proto_header_len = int_size
+        .checked_mul(2)
+        .and_then(|len| len.checked_add(4))
+        .ok_or_else(|| "Lua 5.1 proto header width overflow".to_owned())?;
+    cursor = cursor
+        .checked_add(proto_header_len)
+        .ok_or_else(|| "Lua 5.1 proto header offset overflow".to_owned())?;
+    let code_len = read_lua_uint(chunk, &mut cursor, int_size, little_endian)?;
+    if jump_pc == 0 || jump_pc > code_len || target_pc == 0 || target_pc > code_len {
+        return Err(format!(
+            "Lua 5.1 jump patch is outside the main code arena: pc={jump_pc}, target={target_pc}, code={code_len}"
+        ));
+    }
+    let instruction_offset = (jump_pc - 1)
+        .checked_mul(instruction_size)
+        .ok_or_else(|| "Lua 5.1 instruction index overflow".to_owned())?;
+    let offset = cursor
+        .checked_add(instruction_offset)
+        .ok_or_else(|| "Lua 5.1 instruction offset overflow".to_owned())?;
+    let end = offset
+        .checked_add(instruction_size)
+        .ok_or_else(|| "Lua 5.1 instruction end overflow".to_owned())?;
+    let bytes = chunk
+        .get_mut(offset..end)
+        .ok_or_else(|| "Lua 5.1 main code is truncated".to_owned())?;
+    let encoded: [u8; 4] = bytes
+        .as_ref()
+        .try_into()
+        .map_err(|_| "Lua 5.1 instruction is not four bytes".to_owned())?;
+    let mut word = if little_endian {
+        u32::from_le_bytes(encoded)
+    } else {
+        u32::from_be_bytes(encoded)
+    };
+    if word & 0x3f != OP_JMP {
+        return Err(format!(
+            "Lua 5.1 fixture pc {jump_pc} is opcode {}, expected JMP",
+            word & 0x3f
+        ));
+    }
+    let sbx = i32::try_from(target_pc)
+        .and_then(|target| i32::try_from(jump_pc).map(|pc| target - pc - 1))
+        .map_err(|_| "Lua 5.1 jump pc does not fit i32".to_owned())?;
+    let bx = sbx + MAXARG_SBX;
+    if !(0..=2 * MAXARG_SBX + 1).contains(&bx) {
+        return Err(format!("Lua 5.1 jump offset {sbx} is not encodable"));
+    }
+    word = (word & 0x3fff) | ((bx as u32) << 14);
+    let encoded = if little_endian {
+        word.to_le_bytes()
+    } else {
+        word.to_be_bytes()
+    };
+    bytes.copy_from_slice(&encoded);
+    Ok(())
+}
+
+fn read_lua_uint(
+    bytes: &[u8],
+    cursor: &mut usize,
+    width: usize,
+    little_endian: bool,
+) -> Result<usize, String> {
+    if width > 8 {
+        return Err(format!("Lua integer width {width} exceeds u64"));
+    }
+    let end = cursor
+        .checked_add(width)
+        .ok_or_else(|| "Lua integer offset overflow".to_owned())?;
+    let raw = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| "Lua chunk is truncated while reading an integer".to_owned())?;
+    *cursor = end;
+    let mut value = 0u64;
+    if little_endian {
+        for (shift, byte) in raw.iter().copied().enumerate() {
+            value |= u64::from(byte) << (shift * 8);
+        }
+    } else {
+        for byte in raw {
+            value = (value << 8) | u64::from(*byte);
+        }
+    }
+    usize::try_from(value).map_err(|_| format!("Lua integer {value} does not fit usize"))
 }
 
 fn decompile_options(entry: &LuaCaseManifestEntry) -> DecompileOptions {
@@ -1202,6 +1585,7 @@ pub(crate) fn compile_generated_source_to_suite_artifact(
     let output = suite_artifact_path(
         suite_label,
         dialect_label,
+        entry.variant,
         "generated-chunk",
         entry.path,
         toolchain.chunk_extension,
@@ -1247,7 +1631,7 @@ fn test_chunk_output_path(
         .join(dialect_label)
         .join(if strip_debug { "stripped" } else { "debug" })
         .join(relative)
-        .with_extension(format!("{chunk_extension}.{unique}"))
+        .with_extension(format!("{chunk_extension}.{}.{unique}", std::process::id()))
 }
 
 pub(crate) fn diff_command_outputs(
@@ -1399,15 +1783,20 @@ fn lua_tool_path(dialect_label: &str, tool_name: &str) -> Result<PathBuf, String
 fn suite_artifact_path(
     suite_label: &str,
     dialect_label: &str,
+    variant: Option<LuaCaseVariant>,
     artifact_label: &str,
     source_relative: &str,
     extension: &str,
 ) -> PathBuf {
-    repo_root()
+    let dialect_root = repo_root()
         .join("target")
         .join("unluac-tests")
         .join(suite_label)
-        .join(dialect_label)
+        .join(dialect_label);
+    variant
+        .map_or(dialect_root.clone(), |variant| {
+            dialect_root.join(variant.label())
+        })
         .join(artifact_label)
         .join(source_relative)
         .with_extension(extension)

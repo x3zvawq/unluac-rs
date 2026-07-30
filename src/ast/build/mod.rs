@@ -13,6 +13,8 @@ use std::collections::BTreeSet;
 use crate::decompile::{DecompileContext, DecompileError, DecompileState};
 use crate::generate::GenerateMode;
 use crate::hir::{HirBlock, HirGenericFor, HirModule, HirStmt, TempId};
+use crate::structure::{BlockRef, ControlFlowFeature, PhiId, PlanRequirement, StructureFacts};
+use crate::transformer::Reg;
 
 use self::analysis::{
     block_has_continue, collect_close_temps, collect_referenced_temps_in_encounter_order,
@@ -46,13 +48,127 @@ pub(crate) fn lower_ast_for_generate(
     state: &mut DecompileState,
     context: &DecompileContext<'_>,
 ) -> Result<(), DecompileError> {
+    let plan_diagnostics = collect_plan_diagnostics(state.require_structure_facts()?);
+    if context.options.generate.mode == GenerateMode::Strict
+        && let Some(diagnostic) = plan_diagnostics.first()
+    {
+        return Err(diagnostic
+            .strict_error(context.requested_target.version)
+            .into());
+    }
     let hir = state.require_hir()?;
-    state.ast = Some(lower_ast(
-        hir,
-        context.requested_target,
-        context.options.generate.mode,
-    )?);
+    let mut ast = lower_ast(hir, context.requested_target, context.options.generate.mode)?;
+    if !plan_diagnostics.is_empty() {
+        ast.body.stmts.insert(
+            0,
+            AstStmt::Error(format_plan_diagnostics(&plan_diagnostics)),
+        );
+    }
+    state.ast = Some(ast);
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PlanDiagnostic {
+    UnavailableFeature {
+        proto: usize,
+        feature: ControlFlowFeature,
+    },
+    UnresolvedValue {
+        proto: usize,
+        phi_id: PhiId,
+        block: BlockRef,
+        reg: Reg,
+    },
+}
+
+impl PlanDiagnostic {
+    fn strict_error(self, dialect: crate::ast::DecompileDialect) -> AstLowerError {
+        match self {
+            Self::UnavailableFeature { feature, .. } => AstLowerError::UnsupportedFeature {
+                dialect,
+                feature: control_flow_feature_name(feature),
+                context: "StructurePlan",
+            },
+            Self::UnresolvedValue {
+                proto,
+                phi_id,
+                block,
+                reg,
+            } => AstLowerError::UnresolvedStructureValue {
+                proto,
+                phi_id,
+                block,
+                reg,
+            },
+        }
+    }
+}
+
+fn collect_plan_diagnostics(root: &StructureFacts) -> Vec<PlanDiagnostic> {
+    let mut diagnostics = Vec::new();
+    let mut stack = vec![root];
+    let mut proto = 0usize;
+    while let Some(facts) = stack.pop() {
+        diagnostics.extend(
+            facts
+                .plan()
+                .requirements()
+                .unavailable_features()
+                .iter()
+                .copied()
+                .map(|feature| PlanDiagnostic::UnavailableFeature { proto, feature }),
+        );
+        diagnostics.extend(
+            facts
+                .plan()
+                .requirements()
+                .iter()
+                .filter_map(|(_, requirement)| match requirement {
+                    PlanRequirement::UnresolvedValue { phi_id, block, reg } => {
+                        Some(PlanDiagnostic::UnresolvedValue {
+                            proto,
+                            phi_id: *phi_id,
+                            block: *block,
+                            reg: *reg,
+                        })
+                    }
+                    PlanRequirement::Goto { .. }
+                    | PlanRequirement::Continue { .. }
+                    | PlanRequirement::MultiEntryIsland { .. } => None,
+                }),
+        );
+        proto += 1;
+        stack.extend(facts.children.iter().rev());
+    }
+    diagnostics
+}
+
+fn format_plan_diagnostics(diagnostics: &[PlanDiagnostic]) -> String {
+    let details = diagnostics
+        .iter()
+        .map(|diagnostic| match diagnostic {
+            PlanDiagnostic::UnavailableFeature { proto, feature } => format!(
+                "proto#{proto} requires unavailable {}",
+                control_flow_feature_name(*feature)
+            ),
+            PlanDiagnostic::UnresolvedValue {
+                proto,
+                phi_id,
+                block,
+                reg,
+            } => format!("proto#{proto} unresolved {phi_id} at {block} register {reg}"),
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("StructurePlan requirements: {details}")
+}
+
+const fn control_flow_feature_name(feature: ControlFlowFeature) -> &'static str {
+    match feature {
+        ControlFlowFeature::GotoLabel => "goto/label",
+        ControlFlowFeature::ContinueStatement => "continue",
+    }
 }
 
 struct AstLowerer<'a> {

@@ -36,24 +36,22 @@ use self::access::{
     lower_table_access_expr_single_eval,
 };
 pub(super) use self::branch::{
-    lower_binary_op, lower_branch_cond, lower_branch_subject, lower_branch_subject_inline,
-    lower_branch_subject_single_eval, lower_unary_op,
+    lower_binary_op, lower_branch_cond, lower_branch_subject, lower_branch_subject_single_eval,
+    lower_unary_op,
 };
-pub(super) use self::defs::{
-    expr_for_dup_safe_fixed_def, expr_for_fixed_def, expr_for_fixed_def_single_eval,
-};
+use self::defs::expr_for_dup_safe_fixed_def;
+pub(super) use self::defs::{expr_for_fixed_def, expr_for_fixed_def_single_eval};
 pub(super) use self::packs::lower_value_pack;
 use self::packs::lower_value_pack_single_eval;
-pub(super) use self::regs::{
-    expr_for_reg_at_block_entry, expr_for_reg_at_block_exit, expr_for_reg_use, expr_for_ssa_value,
-    lower_closure_capture,
-};
 use self::regs::{
-    expr_for_reg_use_dup_safe, expr_for_reg_use_inline,
+    block_is_absorbed_decision, expr_for_reg_use_dup_safe, expr_for_reg_use_inline,
     expr_for_reg_use_single_eval_with_call_policy,
 };
-use super::ProtoLowering;
+pub(super) use self::regs::{
+    expr_for_reg_at_block_exit, expr_for_reg_use, expr_for_ssa_value, lower_closure_capture,
+};
 use super::helpers::{concat_expr, decode_raw_string, raw_lua_string, unresolved_expr};
+use super::lower::ProtoLowering;
 
 pub(super) fn lower_closure_expr(
     lowering: &ProtoLowering<'_>,
@@ -97,10 +95,7 @@ fn resolve_open_pack_tail_with_policy(
     let sources = lowering.dataflow.open_use_sources_at(instr_ref);
     let defs = sources.defs();
     if !sources.has_entry() && defs.len() == 1 {
-        let def = defs
-            .iter()
-            .next()
-            .expect("len checked above, exactly one reaching open def exists");
+        let def = defs.iter().next()?;
         let open_def = lowering.dataflow.open_defs.get(def.index())?;
         if open_def.start_reg.index() < start_reg.index() {
             return None;

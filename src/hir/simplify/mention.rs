@@ -86,10 +86,6 @@ impl HirVisitor for BindingRefCollector<'_> {
     }
 }
 
-pub(super) fn stmts_mention_temp(stmts: &[HirStmt], temp: TempId) -> bool {
-    TempMentionCollector::mentions_in_stmts(stmts, temp)
-}
-
 pub(super) fn expr_mentions_temp(expr: &HirExpr, temp: TempId) -> bool {
     TempMentionCollector::mentions_in_expr(expr, temp)
 }
@@ -206,15 +202,6 @@ struct TempMentionCollector {
 }
 
 impl TempMentionCollector {
-    fn mentions_in_stmts(stmts: &[HirStmt], temp: TempId) -> bool {
-        let mut collector = Self {
-            temp,
-            mentioned: false,
-        };
-        visit_stmts(stmts, &mut collector);
-        collector.mentioned
-    }
-
     fn mentions_in_expr(expr: &HirExpr, temp: TempId) -> bool {
         let mut collector = Self {
             temp,

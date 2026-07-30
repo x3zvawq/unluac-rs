@@ -39,17 +39,6 @@ pub(crate) fn lower_branch_subject(
     })
 }
 
-pub(crate) fn lower_branch_subject_inline(
-    lowering: &ProtoLowering<'_>,
-    block: BlockRef,
-    instr_ref: InstrRef,
-    cond: BranchCond,
-) -> HirExpr {
-    lower_branch_subject_with(cond, |operand| {
-        lower_cond_operand_inline(lowering, block, instr_ref, operand)
-    })
-}
-
 /// 值型短路恢复需要的是“当前这一跳可以直接表达”的 subject，而不是“可任意复制”的值。
 ///
 /// 例如 `mark("a", x)` 这种调用不能走 dup-safe inline，因为复制它会改变求值次数；
@@ -122,22 +111,6 @@ fn lower_cond_operand(
 ) -> HirExpr {
     match operand {
         CondOperand::Reg(reg) => expr_for_reg_use(lowering, block, instr_ref, reg),
-        CondOperand::Const(const_ref) => expr_for_const(lowering.proto, const_ref),
-        CondOperand::Nil => HirExpr::Nil,
-        CondOperand::Boolean(value) => HirExpr::Boolean(value),
-        CondOperand::Integer(value) => HirExpr::Integer(value),
-        CondOperand::Number(value) => HirExpr::Number(value.to_f64()),
-    }
-}
-
-fn lower_cond_operand_inline(
-    lowering: &ProtoLowering<'_>,
-    block: BlockRef,
-    instr_ref: InstrRef,
-    operand: CondOperand,
-) -> HirExpr {
-    match operand {
-        CondOperand::Reg(reg) => expr_for_reg_use_inline(lowering, block, instr_ref, reg),
         CondOperand::Const(const_ref) => expr_for_const(lowering.proto, const_ref),
         CondOperand::Nil => HirExpr::Nil,
         CondOperand::Boolean(value) => HirExpr::Boolean(value),

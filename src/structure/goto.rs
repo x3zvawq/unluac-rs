@@ -1,8 +1,8 @@
 //! 这个文件实现必须保留跳转的结构约束。
 //!
 //! 它依赖 loop/branch/irreducible region 已经给出的结构候选，负责把这些候选明确
-//! 吞不掉的边提前标成 `GotoRequirement`，避免 HIR/AST 再去临时猜“这里是不是还要
-//! 保留 label/goto”。
+//! 吞不掉的边提前冻结为残余 transfer evidence，避免 HIR/AST 再去临时猜
+//! “这里是不是还要保留 label/goto”。
 //! 它不会越权决定最终 `goto/label` 语法，只表达“哪些跳转现在还不能被结构化吸收”。
 //!
 //! 例子：
@@ -18,25 +18,27 @@ use crate::structure::{Cfg, EdgeKind, EdgeRef};
 use crate::transformer::LoweredProto;
 
 use super::common::IrreducibleRegion;
-use super::common::{BranchCandidate, GotoReason, GotoRequirement, LoopCandidate, LoopKindHint};
+use super::common::{
+    BranchCandidate, GotoReason, LoopCandidate, LoopKindHint, ResidualTransferEvidence,
+};
 use super::helpers::block_has_non_control_prefix;
 use super::loops::transparent_loop_exit_target;
 
-pub(super) fn analyze_goto_requirements(
+pub(super) fn analyze_residual_transfers(
     proto: &LoweredProto,
     cfg: &Cfg,
     loop_candidates: &[LoopCandidate],
     branch_candidates: &[BranchCandidate],
     irreducible_regions: &[IrreducibleRegion],
-) -> Vec<GotoRequirement> {
-    let mut requirements = BTreeSet::new();
+) -> Vec<ResidualTransferEvidence> {
+    let mut residuals = BTreeSet::new();
     let membership = LoopMembershipIndex::new(cfg, loop_candidates);
 
     for (candidate_index, loop_candidate) in loop_candidates.iter().enumerate() {
         for &edge_ref in &membership.entry_edges_by_candidate[candidate_index] {
             let edge = cfg.edges[edge_ref.index()];
             if edge.to != loop_candidate.header {
-                requirements.insert(GotoRequirement {
+                residuals.insert(ResidualTransferEvidence {
                     edge: edge_ref,
                     reason: GotoReason::MultiEntryRegion,
                 });
@@ -53,7 +55,7 @@ pub(super) fn analyze_goto_requirements(
                 loop_candidate,
                 *edge_ref,
             ) {
-                requirements.insert(GotoRequirement {
+                residuals.insert(ResidualTransferEvidence {
                     edge: *edge_ref,
                     reason: GotoReason::CrossLoopContinueLike,
                 });
@@ -103,7 +105,7 @@ pub(super) fn analyze_goto_requirements(
                         )
                         && !is_degenerate_branch_to_target(cfg, edge.from, continue_target)
                     {
-                        requirements.insert(GotoRequirement {
+                        residuals.insert(ResidualTransferEvidence {
                             edge: *edge_ref,
                             reason: GotoReason::UnstructuredContinueLike,
                         });
@@ -115,14 +117,14 @@ pub(super) fn analyze_goto_requirements(
 
     for irreducible in irreducible_regions {
         for edge_ref in &irreducible.entry_edges {
-            requirements.insert(GotoRequirement {
+            residuals.insert(ResidualTransferEvidence {
                 edge: *edge_ref,
                 reason: GotoReason::IrreducibleFlow,
             });
         }
     }
 
-    requirements.into_iter().collect()
+    residuals.into_iter().collect()
 }
 
 /// loop 候选 membership 的单次稠密投影。

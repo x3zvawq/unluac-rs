@@ -9,28 +9,38 @@
 //! - `if cond then ... else ... end` 会产出 `BranchKind::IfElse`
 //! - `if not cond then return end; ...` 这种守卫形状会被标成 `BranchKind::Guard`
 //! - loop 内嵌套 early return 把严格后支配点推到 synthetic exit 时，单臂归属
-//!   仍由截断本轮回边的可达性证明，不直接猜 if/else
+//!   仍由 dominance frontier 的真实汇入关系证明，不直接猜 if/else
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::structure::{BlockRef, Cfg, DominatorTree, EdgeKind, GraphFacts};
+use crate::structure::{BlockRef, Cfg, DataflowFacts, EdgeKind, EdgeRef, GraphFacts};
+use crate::transformer::LoweredProto;
 
 use super::common::{
-    BranchCandidate, BranchKind, BranchRegionFact, LoopCandidate, LoopKindHint, SinglePassFenceFact,
+    BranchCandidate, BranchKind, BranchRegionFact, IrreducibleRegion, LoopCandidate, LoopKindHint,
+    SinglePassFenceFact,
 };
-use super::helpers::{
-    collect_forward_region_blocks, collect_region_exit_edges, collect_reverse_reachable_blocks,
-};
+use super::helpers::{block_has_non_control_prefix, control_prefix_is_movable};
 
 pub(super) fn analyze_branches(
+    proto: &LoweredProto,
     cfg: &Cfg,
     graph_facts: &GraphFacts,
+    dataflow: &DataflowFacts,
     loop_candidates: &[LoopCandidate],
+    irreducible_regions: &[IrreducibleRegion],
 ) -> (
     Vec<BranchCandidate>,
     BTreeMap<BlockRef, SinglePassFenceFact>,
 ) {
-    let mut reachability = ReachabilityCache::new(cfg, loop_candidates);
+    let branch_index = BranchIndex::new(cfg, graph_facts, loop_candidates);
+    let mut irreducible_blocks = vec![false; cfg.blocks.len()];
+    for block in irreducible_regions
+        .iter()
+        .flat_map(|region| region.blocks.iter())
+    {
+        irreducible_blocks[block.index()] = true;
+    }
     let mut branch_candidates: Vec<_> = cfg
         .block_order
         .iter()
@@ -43,62 +53,116 @@ pub(super) fn analyze_branches(
             if then_entry == else_entry {
                 return None;
             }
-            classify_infinite_loop_bounded_branch(
-                &mut reachability,
-                loop_candidates,
+            classify_loop_break_guard(
+                cfg,
+                graph_facts,
+                &branch_index,
                 header,
                 then_entry,
                 else_entry,
             )
             .or_else(|| {
-                classify_postdom_one_arm_branch(graph_facts, header, then_entry, else_entry)
+                classify_loop_continue_guard(
+                    proto,
+                    cfg,
+                    &branch_index,
+                    header,
+                    then_entry,
+                    else_entry,
+                )
+            })
+            .or_else(|| {
+                classify_infinite_loop_bounded_branch(
+                    cfg,
+                    graph_facts,
+                    &branch_index,
+                    header,
+                    then_entry,
+                    else_entry,
+                )
             })
             .or_else(|| {
                 classify_for_loop_exit_branch(
                     cfg,
                     graph_facts,
-                    loop_candidates,
-                    header,
-                    then_entry,
-                    else_entry,
-                )
-            })
-            .or_else(|| classify_one_arm_branch(&mut reachability, header, then_entry, else_entry))
-            .or_else(|| {
-                classify_loop_exit_bounded_one_arm_branch(
-                    cfg,
-                    graph_facts,
-                    loop_candidates,
-                    &mut reachability,
-                    header,
-                    then_entry,
-                    else_entry,
-                )
-            })
-            .or_else(|| classify_if_else_branch(cfg, graph_facts, header, then_entry, else_entry))
-            .or_else(|| {
-                classify_loop_bounded_one_arm_branch(
-                    &mut reachability,
+                    &branch_index,
                     header,
                     then_entry,
                     else_entry,
                 )
             })
             .or_else(|| {
-                classify_guard_branch(cfg, &mut reachability, header, then_entry, else_entry)
+                (!irreducible_blocks[header.index()])
+                    .then(|| {
+                        classify_loop_exit_bounded_one_arm_branch(
+                            cfg,
+                            graph_facts,
+                            &branch_index,
+                            header,
+                            then_entry,
+                            else_entry,
+                        )
+                    })
+                    .flatten()
             })
+            .or_else(|| {
+                // loop 内的 continue/break 会把严格后支配点推到 loop 外；必须先用
+                // loop owner 与 frontier 汇入事实恢复词法 tail，再考虑普通后支配单臂。
+                // 不可规约 SCC 则始终留给 island。
+                (!irreducible_blocks[header.index()])
+                    .then(|| {
+                        classify_postdom_one_arm_branch(graph_facts, header, then_entry, else_entry)
+                    })
+                    .flatten()
+            })
+            .or_else(|| {
+                // 不可规约 SCC 内的共同后支配点可能位于绕回另一入口之后，不能作为
+                // 当前 branch 的词法合流；保留给 island 才能冻结真实跨入口跳转。
+                (!irreducible_blocks[header.index()])
+                    .then(|| {
+                        classify_if_else_branch(cfg, graph_facts, header, then_entry, else_entry)
+                    })
+                    .flatten()
+            })
+            .or_else(|| {
+                (!irreducible_blocks[header.index()])
+                    .then(|| {
+                        classify_loop_bounded_one_arm_branch(
+                            &branch_index,
+                            header,
+                            then_entry,
+                            else_entry,
+                        )
+                    })
+                    .flatten()
+            })
+            .or_else(|| Some(classify_guard_branch(header, then_entry, else_entry)))
         })
         .collect();
     refine_loop_iteration_if_else_branches(
+        proto,
         cfg,
         graph_facts,
-        loop_candidates,
-        &mut reachability,
+        &branch_index,
         &mut branch_candidates,
     );
-    let single_pass_fences = refine_nested_escape_if_else_merges(
+    refine_terminal_one_arm_branches(
+        cfg,
+        &branch_index,
+        &irreducible_blocks,
+        &mut branch_candidates,
+    );
+    refine_enclosing_loop_escape_merges(
+        proto,
         cfg,
         graph_facts,
+        &branch_index,
+        &mut branch_candidates,
+    );
+    let single_pass_fences = refine_single_pass_fences(
+        cfg,
+        graph_facts,
+        dataflow,
         loop_candidates,
         &mut branch_candidates,
     );
@@ -106,123 +170,261 @@ pub(super) fn analyze_branches(
     (branch_candidates, single_pass_fences)
 }
 
-fn refine_nested_escape_if_else_merges(
+/// 恢复被编译器消去回边的 `repeat ... until true`。
+///
+/// 这类区域有一个被多条正常路径共享的线性 tail，同时若干早退路径直接进入 tail
+/// 之后的严格合流点。把外层 branch 的 continuation 收到 tail 后，最终 plan 就能用
+/// 一个 single-pass containment owner 承载所有跳过 tail 的 `break`。
+fn refine_single_pass_fences(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
+    dataflow: &DataflowFacts,
     loop_candidates: &[LoopCandidate],
     branch_candidates: &mut [BranchCandidate],
 ) -> BTreeMap<BlockRef, SinglePassFenceFact> {
-    let loop_refined_headers =
-        refine_enclosing_loop_escape_merges(cfg, graph_facts, loop_candidates, branch_candidates);
+    let mut outer_by_exit = vec![None; cfg.blocks.len()];
+    let mut ambiguous_exit = vec![false; cfg.blocks.len()];
+    let mut branches_by_exit = vec![Vec::new(); cfg.blocks.len()];
+    for (index, candidate) in branch_candidates.iter().enumerate() {
+        let Some(exit) = candidate.merge.filter(|exit| *exit != cfg.exit_block) else {
+            continue;
+        };
+        branches_by_exit[exit.index()].push(index);
+        let slot = &mut outer_by_exit[exit.index()];
+        let Some(current) = *slot else {
+            *slot = Some(index);
+            continue;
+        };
+        let current_header = branch_candidates[current].header;
+        if graph_facts.dominates(candidate.header, current_header) {
+            *slot = Some(index);
+        } else if !graph_facts.dominates(current_header, candidate.header) {
+            ambiguous_exit[exit.index()] = true;
+        }
+    }
+
+    let branch_headers = branch_candidates
+        .iter()
+        .map(|candidate| candidate.header)
+        .collect::<BTreeSet<_>>();
     let loop_headers = loop_candidates
         .iter()
         .map(|candidate| candidate.header)
         .collect::<BTreeSet<_>>();
-    let mut nested_escapes =
-        BTreeMap::<(BlockRef, BlockRef), Vec<(BlockRef, crate::structure::EdgeRef)>>::new();
-    for nested in branch_candidates.iter() {
-        let Some((then_edge, else_edge)) = cfg.branch_edges(nested.header) else {
+    let mut fences = BTreeMap::new();
+    for (exit_index, candidate_index) in outer_by_exit.into_iter().enumerate() {
+        let Some(candidate_index) = candidate_index else {
             continue;
         };
-        let then_entry = cfg.edges[then_edge.index()].to;
-        let else_entry = cfg.edges[else_edge.index()].to;
-        let then_target = transparent_jump_target(cfg, then_entry).unwrap_or(then_entry);
-        let else_target = transparent_jump_target(cfg, else_entry).unwrap_or(else_entry);
-        if then_target == else_target {
+        if ambiguous_exit[exit_index] {
             continue;
         }
-        nested_escapes
-            .entry((then_target, else_target))
-            .or_default()
-            .push((nested.header, then_edge));
-        nested_escapes
-            .entry((else_target, then_target))
-            .or_default()
-            .push((nested.header, else_edge));
-    }
-
-    let mut single_pass_fences = BTreeMap::new();
-    for candidate in branch_candidates {
-        if loop_headers.contains(&candidate.header)
-            || loop_refined_headers.contains(&candidate.header)
+        let exit = BlockRef(exit_index);
+        let header = branch_candidates[candidate_index].header;
+        let mut tails = cfg.preds[exit.index()].iter().filter_map(|edge_ref| {
+            let edge = cfg.edges[edge_ref.index()];
+            let tail = edge.from;
+            if !cfg.reachable_blocks.contains(&tail)
+                || !graph_facts.dominates(header, tail)
+                || branch_headers.contains(&tail)
+                || loop_headers.contains(&tail)
+                || cfg.succs[tail.index()].as_slice() != [*edge_ref]
+            {
+                return None;
+            }
+            let incoming = cfg.preds[tail.index()]
+                .iter()
+                .filter(|incoming| {
+                    let source = cfg.edges[incoming.index()].from;
+                    cfg.reachable_blocks.contains(&source) && graph_facts.dominates(header, source)
+                })
+                .count();
+            (incoming >= 2).then_some((tail, *edge_ref))
+        });
+        let Some((tail, tail_edge)) = tails.next() else {
+            continue;
+        };
+        if tails.next().is_some() {
+            continue;
+        }
+        // loop header 也可能是外层迭代的合法 single-pass continuation，但此时 fence
+        // 必须完整位于该 natural loop 内。否则这里只是循环前的普通 branch 汇入
+        // header，真实 backedge 会被误收为 early escape，并把 branch merge 提前。
+        if loop_headers.contains(&exit)
+            && !loop_candidates.iter().any(|owner| {
+                owner.header == exit
+                    && owner.blocks.contains(&header)
+                    && owner.blocks.contains(&tail)
+            })
         {
             continue;
         }
-        let (Some(strict_merge), Some(else_entry)) = (candidate.merge, candidate.else_entry) else {
-            continue;
-        };
-        if candidate.kind != BranchKind::IfElse || strict_merge == cfg.exit_block {
-            continue;
-        }
-        let Some(soft_merge) = find_soft_merge(
-            cfg,
-            graph_facts,
-            candidate.header,
-            candidate.then_entry,
-            else_entry,
-        ) else {
-            continue;
-        };
-        let escape_edges = nested_escapes
-            .get(&(strict_merge, soft_merge))
-            .into_iter()
-            .flatten()
-            .filter(|(nested_header, _)| {
-                graph_facts.dominates(candidate.then_entry, *nested_header)
-                    != graph_facts.dominates(else_entry, *nested_header)
+
+        let escape_edges = cfg.preds[exit.index()]
+            .iter()
+            .copied()
+            .filter(|edge_ref| {
+                let source = cfg.edges[edge_ref.index()].from;
+                source != tail
+                    && cfg.reachable_blocks.contains(&source)
+                    && graph_facts.dominates(header, source)
             })
-            .map(|(_, edge)| *edge)
             .collect::<BTreeSet<_>>();
-        if !escape_edges.is_empty()
-            && !enclosing_loop_owns_escape(
-                cfg,
-                loop_candidates,
-                candidate,
-                else_entry,
-                soft_merge,
-                strict_merge,
+        // 普通 `if cond then <多路值计算>; tail end` 也会形成“多前驱 tail +
+        // 另一臂直达 exit”，但所有直达 exit 的边都位于 tail 所属 arm 之外。
+        // 真正需要一次性 fence 的 break 至少有一条嵌在同一 tail owner 内；否则
+        // 现有 branch/value decision 已能直接表达，不能为了形状相似改写 branch merge。
+        let tail_owner = graph_facts.dominator_tree.parent[tail.index()];
+        let has_nested_escape = tail_owner.is_some_and(|owner| {
+            owner == header
+                || escape_edges
+                    .iter()
+                    .any(|edge_ref| graph_facts.dominates(owner, cfg.edges[edge_ref.index()].from))
+        });
+        if escape_edges.is_empty()
+            || !has_nested_escape
+            || closed_if_else_owns_value_result(
+                graph_facts,
+                dataflow,
+                &branch_candidates[candidate_index],
+                tail,
+                tail_edge,
+                exit,
                 &escape_edges,
             )
-            && cfg.can_reach(candidate.then_entry, soft_merge)
-            && cfg.can_reach(else_entry, soft_merge)
+            || loop_candidates.iter().any(|owner| {
+                owner.exits.contains(&exit)
+                    && owner.body_scope_blocks.contains(&header)
+                    && owner.body_scope_blocks.contains(&tail)
+                    && escape_edges.iter().all(|edge_ref| {
+                        owner
+                            .body_scope_blocks
+                            .contains(&cfg.edges[edge_ref.index()].from)
+                    })
+            })
         {
-            // 一臂内的透明 jump pad 直接跳过共同 fallthrough，严格后支配点因此
-            // 落在 escape 之后；外层 if/else 的正常路径仍在 soft merge 汇合。
-            candidate.merge = Some(soft_merge);
-            single_pass_fences.insert(
-                candidate.header,
-                SinglePassFenceFact {
-                    exit: strict_merge,
-                    escape_edges,
-                },
-            );
+            continue;
         }
+        let owns = |block| {
+            block != cfg.exit_block
+                && cfg.reachable_blocks.contains(&block)
+                && (block == tail
+                    || graph_facts.dominates(header, block)
+                        && !graph_facts.dominates(tail, block)
+                        && !graph_facts.dominates(exit, block))
+        };
+        // header 的支配关系已经排除了普通外部入口；这里只需检查重新加入的 tail
+        // 以及 fence 出口。这样验证成本与边界边数相关，不再扫描整个支配子树。
+        let tail_is_internal = cfg.preds[tail.index()].iter().all(|edge| {
+            let predecessor = cfg.edges[edge.index()].from;
+            !cfg.reachable_blocks.contains(&predecessor) || owns(predecessor)
+        });
+        let escapes_are_internal = escape_edges
+            .iter()
+            .all(|edge| owns(cfg.edges[edge.index()].from));
+        if !owns(header) || !tail_is_internal || !escapes_are_internal {
+            continue;
+        }
+
+        for nested in &branches_by_exit[exit.index()] {
+            if graph_facts.dominates(header, branch_candidates[*nested].header) {
+                branch_candidates[*nested].merge = Some(tail);
+            }
+        }
+        fences.insert(header, SinglePassFenceFact { exit, escape_edges });
     }
-    single_pass_fences
+    fences
+}
+
+/// value-result 已经证明两臂在严格后支配点闭合时，shared-tail 只是其中一臂的
+/// 实现形状；改成 single-pass 会把正常分支的结果边误解释成 `break`。
+fn closed_if_else_owns_value_result(
+    graph_facts: &GraphFacts,
+    dataflow: &DataflowFacts,
+    candidate: &BranchCandidate,
+    tail: BlockRef,
+    tail_edge: EdgeRef,
+    exit: BlockRef,
+    escape_edges: &BTreeSet<EdgeRef>,
+) -> bool {
+    let Some(else_entry) = candidate.else_entry else {
+        return false;
+    };
+    if candidate.kind != BranchKind::IfElse
+        || candidate.merge != Some(exit)
+        || graph_facts.nearest_common_postdom(candidate.then_entry, else_entry) != Some(exit)
+    {
+        return false;
+    }
+
+    // 普通 if/else 的线性 tail 只属于一臂，另一臂直接给 result phi 供值；真正的
+    // single-pass shared tail 会被两臂共同到达，不能仅因 exit 上恰好存在 phi 就拦截。
+    let (then_owns_tail, else_owns_tail) = (
+        graph_facts.dominates(candidate.then_entry, tail),
+        graph_facts.dominates(else_entry, tail),
+    );
+    let result_arm = match (then_owns_tail, else_owns_tail) {
+        (true, false) => else_entry,
+        (false, true) => candidate.then_entry,
+        (true, true) | (false, false) => return false,
+    };
+
+    // Dataflow 的 block range 是稠密索引；每个 exit 只检查自身 canonical/live phi，
+    // 并要求当前两臂的物理边给同一个非平凡 phi 提供不同值。
+    dataflow.phi_candidates_in_block(exit).iter().any(|phi| {
+        let Some(tail_value) = phi
+            .incoming
+            .iter()
+            .find(|incoming| incoming.edge == Some(tail_edge))
+            .map(|incoming| incoming.value)
+        else {
+            return false;
+        };
+        let mut covered_escapes = 0;
+        let mut differs = false;
+        for incoming in &phi.incoming {
+            if incoming
+                .edge
+                .is_some_and(|edge_ref| escape_edges.contains(&edge_ref))
+            {
+                if !incoming
+                    .pred
+                    .is_some_and(|pred| graph_facts.dominates(result_arm, pred))
+                {
+                    return false;
+                }
+                covered_escapes += 1;
+                differs |= incoming.value != tail_value;
+            }
+        }
+        covered_escapes == escape_edges.len() && differs
+    })
 }
 
 fn refine_enclosing_loop_escape_merges(
+    proto: &LoweredProto,
     cfg: &Cfg,
     graph_facts: &GraphFacts,
-    loop_candidates: &[LoopCandidate],
+    branch_index: &BranchIndex<'_>,
     branch_candidates: &mut [BranchCandidate],
-) -> BTreeSet<BlockRef> {
-    // 先消费现有 branch/loop owner，再用支配域闭包确认本轮 soft merge；这里不从
-    // effectful break 臂的首条 edge 猜出口，否则会漏掉调用之后才发生的真实跳出。
+) {
+    // 先消费现有 branch/loop owner，再用 soft-merge 与 nested branch 自身的出口合同
+    // 确认本轮合流；不为每个 outer branch 重新复制 block 集或扫描 CFG。
     let snapshot = branch_candidates.to_vec();
-    let nested_by_merge = snapshot.iter().fold(
-        BTreeMap::<BlockRef, Vec<&BranchCandidate>>::new(),
-        |mut index, candidate| {
-            if candidate.kind == BranchKind::IfThen
-                && candidate.else_entry.is_none()
-                && let Some(merge) = candidate.merge
-            {
-                index.entry(merge).or_default().push(candidate);
-            }
-            index
-        },
-    );
-    let mut refinements = BTreeMap::new();
+    let mut nested_by_merge = vec![Vec::new(); cfg.blocks.len()];
+    for candidate in &snapshot {
+        if matches!(candidate.kind, BranchKind::IfThen | BranchKind::Guard)
+            && candidate.else_entry.is_none()
+            && let Some(merge) = candidate.merge
+        {
+            nested_by_merge[merge.index()].push(candidate);
+        }
+    }
+    let mut branch_by_header = vec![None; cfg.blocks.len()];
+    for candidate in &snapshot {
+        branch_by_header[candidate.header.index()] = Some(candidate);
+    }
+    let mut refinements = vec![None; cfg.blocks.len()];
     for outer in &snapshot {
         let (Some(strict_merge), Some(else_entry)) = (outer.merge, outer.else_entry) else {
             continue;
@@ -235,76 +437,76 @@ fn refine_enclosing_loop_escape_merges(
         else {
             continue;
         };
-        let Some(owner) = loop_candidates
-            .iter()
+        let Some(owner) = branch_index
+            .body_loops(outer.header)
             .filter(|owner| {
-                owner.exits.contains(&strict_merge)
-                    && [outer.header, outer.then_entry, else_entry, soft_merge]
+                (owner.exits.contains(&strict_merge)
+                    || loop_iteration_escape_entry(proto, cfg, owner, strict_merge)
+                    || branch_by_header[strict_merge.index()].is_some_and(|candidate| {
+                        branch_has_loop_escape_arm(proto, cfg, owner, candidate)
+                    }))
+                    && [outer.header, outer.then_entry, else_entry]
                         .into_iter()
                         .all(|block| owner.body_scope_blocks.contains(&block))
+                    && (owner.body_scope_blocks.contains(&soft_merge)
+                        || owner.blocks.contains(&soft_merge)
+                        || owner.control_blocks.contains(&soft_merge)
+                        || owner.continue_target == Some(soft_merge))
             })
             .min_by_key(|owner| owner.body_scope_blocks.len())
         else {
             continue;
         };
-        let blocks = collect_forward_region_blocks(
-            cfg,
-            [outer.then_entry, else_entry],
-            Some(soft_merge),
-            Some((outer.header, &graph_facts.dominator_tree)),
-        );
-        let mut allowed = blocks.clone();
-        allowed.insert(soft_merge);
-        let reaches_soft_merge = collect_reverse_reachable_blocks(cfg, &allowed, [soft_merge]);
-        if ![outer.then_entry, else_entry]
-            .into_iter()
-            .all(|entry| reaches_soft_merge.contains(&entry))
-        {
-            continue;
-        }
-        let nested = owner
+        let mut nested = owner
             .exits
             .iter()
-            .filter_map(|exit| nested_by_merge.get(exit))
-            .flatten()
+            .chain(std::iter::once(&soft_merge))
+            .flat_map(|merge| nested_by_merge[merge.index()].iter())
             .copied()
             .filter(|candidate| {
-                graph_facts.dominates(outer.then_entry, candidate.header)
-                    != graph_facts.dominates(else_entry, candidate.header)
-                    && reaches_soft_merge.contains(&candidate.then_entry)
+                candidate.header != soft_merge
+                    && graph_facts.dominates(outer.then_entry, candidate.header)
+                        != graph_facts.dominates(else_entry, candidate.header)
+                    && (candidate.merge == Some(soft_merge)
+                        || branch_has_loop_escape_arm(proto, cfg, owner, candidate))
             })
             .collect::<Vec<_>>();
-        let nested_merges = nested
-            .iter()
-            .filter_map(|candidate| candidate.merge)
-            .collect::<BTreeSet<_>>();
+        for entry in [outer.then_entry, else_entry] {
+            let Some(candidate) = branch_by_header[entry.index()] else {
+                continue;
+            };
+            if candidate.header != soft_merge
+                && branch_has_loop_escape_arm(proto, cfg, owner, candidate)
+                && nested
+                    .iter()
+                    .all(|nested| nested.header != candidate.header)
+            {
+                nested.push(candidate);
+            }
+        }
         if nested.is_empty()
-            || collect_region_exit_edges(cfg, &blocks)
-                .into_iter()
-                .any(|edge| {
-                    let edge = cfg.edges[edge.index()];
-                    edge.to != soft_merge
-                        && !nested_merges.contains(&edge.from)
-                        && !nested_merges.contains(&edge.to)
-                })
+            || nested.iter().any(|candidate| candidate.merge.is_none())
+            || !nested.iter().any(|candidate| {
+                candidate.merge == Some(strict_merge)
+                    || candidate.merge == Some(soft_merge)
+                    || branch_has_loop_escape_arm(proto, cfg, owner, candidate)
+            })
         {
             continue;
         }
-        refinements.insert(outer.header, (outer.then_entry, else_entry, soft_merge));
+        refinements[outer.header.index()] = Some((outer.then_entry, else_entry, soft_merge));
         for candidate in nested {
-            refinements.insert(
-                candidate.header,
-                (
-                    candidate.then_entry,
-                    candidate.merge.expect("nested escape must have merge"),
-                    soft_merge,
-                ),
-            );
+            let Some(merge) = candidate.merge else {
+                continue;
+            };
+            if merge == soft_merge {
+                continue;
+            }
+            refinements[candidate.header.index()] = Some((candidate.then_entry, merge, soft_merge));
         }
     }
     for candidate in branch_candidates {
-        let Some((then_entry, else_entry, merge)) = refinements.get(&candidate.header).copied()
-        else {
+        let Some((then_entry, else_entry, merge)) = refinements[candidate.header.index()] else {
             continue;
         };
         candidate.then_entry = then_entry;
@@ -312,43 +514,168 @@ fn refine_enclosing_loop_escape_merges(
         candidate.merge = Some(merge);
         candidate.kind = BranchKind::IfElse;
     }
-    refinements.keys().copied().collect()
 }
 
-/// 若全部 escape 已从同一 loop body 直达其显式出口，它们表达的是该 loop 的 break；
-/// synthetic fence 会让这些 break 只退出新包的一次性 repeat，从而继续执行原 loop body。
-fn enclosing_loop_owns_escape(
+/// 恢复“条件成立时直接结束本轮，否则继续执行共享 tail”的源码分支。
+///
+/// 这类边在 CFG 上不会流回 branch 的词法 continuation，因此普通 postdom 会把
+/// continuation 推到 loop 外。continue target 或其唯一 backedge pad 已经由 loop
+/// candidate 冻结，可以在这里作为精确的 escape arm 证据。
+fn classify_loop_continue_guard(
+    proto: &LoweredProto,
     cfg: &Cfg,
-    loop_candidates: &[LoopCandidate],
-    branch: &BranchCandidate,
+    branch_index: &BranchIndex<'_>,
+    header: BlockRef,
+    then_entry: BlockRef,
     else_entry: BlockRef,
-    soft_merge: BlockRef,
-    strict_merge: BlockRef,
-    escape_edges: &BTreeSet<crate::structure::EdgeRef>,
-) -> bool {
-    loop_candidates.iter().any(|owner| {
-        owner.exits.contains(&strict_merge)
-            && [branch.header, branch.then_entry, else_entry, soft_merge]
-                .into_iter()
-                .all(|block| owner.body_scope_blocks.contains(&block))
-            && escape_edges.iter().all(|edge_ref| {
-                let edge = cfg.edges[edge_ref.index()];
-                owner.body_scope_blocks.contains(&edge.from) && owner.exits.contains(&edge.to)
-            })
+) -> Option<BranchCandidate> {
+    let owner = branch_index
+        .endpoint_loops(header)
+        .filter(|candidate| {
+            loop_candidate_owns_endpoint(cfg, candidate, header)
+                && loop_candidate_owns_endpoint(cfg, candidate, then_entry)
+                && loop_candidate_owns_endpoint(cfg, candidate, else_entry)
+        })
+        .filter_map(|candidate| {
+            let then_escape = loop_iteration_escape_entry(proto, cfg, candidate, then_entry);
+            let else_escape = loop_iteration_escape_entry(proto, cfg, candidate, else_entry);
+            (then_escape != else_escape).then_some((candidate, then_escape))
+        })
+        .min_by_key(|(candidate, _)| candidate.body_scope_blocks.len())?;
+    let (then_entry, merge, invert_hint) = if owner.1 {
+        (then_entry, else_entry, false)
+    } else {
+        (else_entry, then_entry, true)
+    };
+    Some(BranchCandidate {
+        header,
+        then_entry,
+        else_entry: None,
+        merge: Some(merge),
+        kind: BranchKind::Guard,
+        invert_hint,
     })
 }
 
-fn refine_loop_iteration_if_else_branches(
+/// 恢复“一臂退出当前 loop，另一臂继续到共享尾”的条件 break。
+///
+/// 编译器常把 break 先落到一个纯 jump pad，再跳到 loop continuation。若不在 branch
+/// 层认领这个 pad，两个物理条件边都会退化为 fallthrough，HIR 随后会把 break 与
+/// repeat latch 串在同一语句块中。这里只接受已冻结 loop exit 或其唯一透明 pad，且
+/// 排除 loop 自己的 control header。
+fn classify_loop_break_guard(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
-    loop_candidates: &[LoopCandidate],
-    reachability: &mut ReachabilityCache<'_>,
+    branch_index: &BranchIndex<'_>,
+    header: BlockRef,
+    then_entry: BlockRef,
+    else_entry: BlockRef,
+) -> Option<BranchCandidate> {
+    let (_, then_break) = branch_index
+        .endpoint_loops(header)
+        .filter(|candidate| {
+            !candidate.control_blocks.contains(&header)
+                && candidate.condition_header != Some(header)
+                && loop_candidate_owns_endpoint(cfg, candidate, header)
+        })
+        .filter_map(|candidate| {
+            let then_break = loop_break_entry(cfg, candidate, then_entry);
+            let else_break = loop_break_entry(cfg, candidate, else_entry);
+            (then_break != else_break).then_some((candidate, then_break))
+        })
+        .min_by_key(|(candidate, _)| candidate.body_scope_blocks.len())?;
+    let (then_entry, merge, invert_hint) = if then_break {
+        (then_entry, else_entry, false)
+    } else {
+        (else_entry, then_entry, true)
+    };
+    if graph_facts.post_dominates(then_entry, merge) {
+        return None;
+    }
+    Some(BranchCandidate {
+        header,
+        then_entry,
+        else_entry: None,
+        merge: Some(merge),
+        kind: BranchKind::Guard,
+        invert_hint,
+    })
+}
+
+fn loop_break_entry(cfg: &Cfg, candidate: &LoopCandidate, entry: BlockRef) -> bool {
+    candidate.continue_target != Some(entry)
+        && candidate.condition_header != Some(entry)
+        && !candidate.control_blocks.contains(&entry)
+        && (candidate.exits.contains(&entry)
+            || matches!(cfg.succs[entry.index()].as_slice(), [edge]
+                if candidate.exits.contains(&cfg.edges[edge.index()].to))
+            || transparent_jump_target(cfg, entry)
+                .is_some_and(|target| candidate.exits.contains(&target)))
+}
+
+fn loop_candidate_owns_endpoint(cfg: &Cfg, candidate: &LoopCandidate, block: BlockRef) -> bool {
+    candidate.body_scope_blocks.contains(&block)
+        || candidate.blocks.contains(&block)
+        || candidate.control_blocks.contains(&block)
+        || candidate.continue_target == Some(block)
+        || candidate
+            .backedges
+            .iter()
+            .any(|edge| cfg.edges[edge.index()].from == block)
+}
+
+fn branch_has_loop_escape_arm(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    owner: &LoopCandidate,
+    branch: &BranchCandidate,
+) -> bool {
+    cfg.branch_edges(branch.header)
+        .is_some_and(|(truthy, falsy)| {
+            [truthy, falsy].into_iter().any(|edge| {
+                let target = cfg.edges[edge.index()].to;
+                loop_break_entry(cfg, owner, target)
+                    || (branch.merge != Some(target)
+                        && loop_iteration_escape_entry(proto, cfg, owner, target))
+            })
+        })
+}
+
+fn loop_iteration_escape_entry(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    candidate: &LoopCandidate,
+    entry: BlockRef,
+) -> bool {
+    let direct_continue = candidate.continue_target == Some(entry)
+        && !(matches!(
+            candidate.kind_hint,
+            LoopKindHint::Unknown
+                | LoopKindHint::RepeatLike
+                | LoopKindHint::NumericForLike
+                | LoopKindHint::WhileTrueLike
+        ) && block_has_non_control_prefix(proto, cfg, entry)
+            && !control_prefix_is_movable(proto, cfg, entry));
+    direct_continue
+        || candidate.backedges.iter().any(|edge| {
+            cfg.edges[edge.index()].from == entry
+                && cfg.edges[edge.index()].to == candidate.header
+                && transparent_jump_target(cfg, entry) == Some(candidate.header)
+        })
+}
+
+fn refine_loop_iteration_if_else_branches(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    branch_index: &BranchIndex<'_>,
     branch_candidates: &mut [BranchCandidate],
 ) {
-    let candidates_by_header = branch_candidates
-        .iter()
-        .map(|candidate| (candidate.header, candidate.clone()))
-        .collect::<BTreeMap<_, _>>();
+    let mut candidates_by_header = vec![None; cfg.blocks.len()];
+    for candidate in branch_candidates.iter().cloned() {
+        let header = candidate.header;
+        candidates_by_header[header.index()] = Some(candidate);
+    }
 
     for candidate in branch_candidates {
         let Some(downstream_header) = candidate
@@ -359,7 +686,7 @@ fn refine_loop_iteration_if_else_branches(
         else {
             continue;
         };
-        let Some(downstream) = candidates_by_header.get(&downstream_header) else {
+        let Some(downstream) = &candidates_by_header[downstream_header.index()] else {
             continue;
         };
         let Some((then_edge, else_edge)) = cfg.branch_edges(candidate.header) else {
@@ -367,35 +694,44 @@ fn refine_loop_iteration_if_else_branches(
         };
         let then_entry = cfg.edges[then_edge.index()].to;
         let else_entry = cfg.edges[else_edge.index()].to;
-        let Some(owner) = loop_candidates
-            .iter()
+        let Some(owner) = branch_index
+            .endpoint_loops(candidate.header)
             .filter(|owner| {
                 owner.blocks.contains(&candidate.header)
                     && owner.blocks.contains(&then_entry)
                     && owner.blocks.contains(&else_entry)
                     && owner.blocks.contains(&downstream.header)
-                    && downstream
-                        .merge
-                        .is_some_and(|merge| owner.exits.contains(&merge))
+                    && downstream.merge.is_some_and(|merge| {
+                        owner.exits.contains(&merge)
+                            || (downstream.kind == BranchKind::Guard
+                                && downstream.else_entry.is_none()
+                                && branch_has_loop_escape_arm(proto, cfg, owner, downstream)
+                                && (owner.blocks.contains(&merge)
+                                    || owner.body_scope_blocks.contains(&merge)))
+                    })
             })
             .min_by_key(|owner| owner.blocks.len())
         else {
             continue;
         };
-        if reachability.can_reach_without_entering_loop_header(then_entry, else_entry)
-            || reachability.can_reach_without_entering_loop_header(else_entry, then_entry)
+        let downstream_escape_merge = (downstream.kind == BranchKind::Guard
+            && downstream.else_entry.is_none()
+            && branch_has_loop_escape_arm(proto, cfg, owner, downstream))
+        .then_some(downstream.merge)
+        .flatten()
+        .filter(|merge| *merge == then_entry || *merge == else_entry);
+        if (branch_index.joins_at(then_entry, else_entry)
+            || branch_index.joins_at(else_entry, then_entry))
+            && downstream_escape_merge.is_none()
         {
             continue;
         }
-        let Some(merge) =
+        let Some(merge) = downstream_escape_merge.or_else(|| {
             find_soft_merge(cfg, graph_facts, candidate.header, then_entry, else_entry)
-        else {
+        }) else {
             continue;
         };
-        if !owner.blocks.contains(&merge)
-            || !reachability.can_reach_without_entering_loop_header(then_entry, merge)
-            || !reachability.can_reach_without_entering_loop_header(else_entry, merge)
-        {
+        if !owner.blocks.contains(&merge) && !owner.body_scope_blocks.contains(&merge) {
             continue;
         }
 
@@ -408,7 +744,7 @@ fn refine_loop_iteration_if_else_branches(
 }
 
 pub(super) fn analyze_branch_regions(
-    cfg: &Cfg,
+    _cfg: &Cfg,
     graph_facts: &GraphFacts,
     branch_candidates: &[BranchCandidate],
     single_pass_fences: &BTreeMap<BlockRef, SinglePassFenceFact>,
@@ -417,17 +753,14 @@ pub(super) fn analyze_branch_regions(
         .iter()
         .filter_map(|candidate| {
             let merge = candidate.merge?;
-            let explicit_structured_blocks =
-                graph_facts.dominates(merge, candidate.header).then(|| {
-                    collect_branch_region_blocks(cfg, candidate, merge, &graph_facts.dominator_tree)
-                });
-            Some(BranchRegionFact {
-                header: candidate.header,
+            let single_pass_fence = single_pass_fences.get(&candidate.header).cloned();
+            Some(BranchRegionFact::new(
+                graph_facts,
+                candidate.header,
                 merge,
-                kind: candidate.kind,
-                single_pass_fence: single_pass_fences.get(&candidate.header).cloned(),
-                explicit_structured_blocks,
-            })
+                candidate.kind,
+                single_pass_fence,
+            ))
         })
         .collect::<Vec<_>>();
 
@@ -435,160 +768,126 @@ pub(super) fn analyze_branch_regions(
     branch_regions
 }
 
-fn collect_branch_region_blocks(
-    cfg: &Cfg,
-    candidate: &BranchCandidate,
-    merge: BlockRef,
-    dom_tree: &DominatorTree,
-) -> BTreeSet<BlockRef> {
-    let mut blocks = BTreeSet::from([candidate.header]);
-    blocks.extend(collect_forward_region_blocks(
-        cfg,
-        std::iter::once(candidate.then_entry).chain(candidate.else_entry),
-        Some(merge),
-        Some((candidate.header, dom_tree)),
-    ));
-
-    blocks
+/// Branch 分析只消费已经计算好的 dominance frontier 与稠密 loop containment。
+///
+/// `dominance_frontier[from]` 包含 `to` 时，存在一条由 `from` 支配的路径真实汇入
+/// `to`；这正是 branch arm 可以把 `to` 当作词法 continuation 的证明。它比任意
+/// CFG reachability 更强，也避免按每个 branch source 重新遍历整张图。
+struct BranchIndex<'a> {
+    graph_facts: &'a GraphFacts,
+    loop_candidates: &'a [LoopCandidate],
+    loops_by_endpoint: Vec<Vec<usize>>,
+    loops_by_body_block: Vec<Vec<usize>>,
+    loop_headers: Vec<bool>,
+    local_frontiers: Vec<FrontierShape>,
+    exit_block: BlockRef,
 }
 
-struct ReachabilityCache<'a> {
-    cfg: &'a Cfg,
-    memo: BTreeMap<(BlockRef, BlockRef), bool>,
-    loop_bounded_memo: BTreeMap<BlockRef, BTreeSet<BlockRef>>,
-    loops_by_header: BTreeMap<BlockRef, Vec<&'a LoopCandidate>>,
+#[derive(Clone, Copy)]
+enum FrontierShape {
+    Empty,
+    One(BlockRef),
+    Multiple,
 }
 
-impl<'a> ReachabilityCache<'a> {
-    fn new(cfg: &'a Cfg, loop_candidates: &'a [LoopCandidate]) -> Self {
-        let mut loops_by_header = BTreeMap::<_, Vec<_>>::new();
-        for candidate in loop_candidates {
-            loops_by_header
-                .entry(candidate.header)
-                .or_default()
-                .push(candidate);
-        }
-        Self {
-            cfg,
-            memo: BTreeMap::new(),
-            loop_bounded_memo: BTreeMap::new(),
-            loops_by_header,
+impl FrontierShape {
+    fn push(self, block: BlockRef) -> Self {
+        match self {
+            Self::Empty => Self::One(block),
+            Self::One(existing) if existing == block => self,
+            Self::One(_) | Self::Multiple => Self::Multiple,
         }
     }
+}
 
-    fn can_reach(&mut self, from: BlockRef, to: BlockRef) -> bool {
-        *self
-            .memo
-            .entry((from, to))
-            .or_insert_with(|| self.cfg.can_reach(from, to))
-    }
+impl<'a> BranchIndex<'a> {
+    fn new(cfg: &Cfg, graph_facts: &'a GraphFacts, loop_candidates: &'a [LoopCandidate]) -> Self {
+        let mut loops_by_endpoint = vec![Vec::new(); cfg.blocks.len()];
+        let mut loops_by_body_block = vec![Vec::new(); cfg.blocks.len()];
+        let mut loop_headers = vec![false; cfg.blocks.len()];
+        let mut seen = vec![usize::MAX; cfg.blocks.len()];
 
-    fn can_reach_without_entering_loop_header(&mut self, from: BlockRef, to: BlockRef) -> bool {
-        self.loop_bounded_memo
-            .entry(from)
-            .or_insert_with(|| {
-                reachable_without_entering_loop_bodies(self.cfg, from, &self.loops_by_header)
-            })
-            .contains(&to)
-    }
+        for (candidate_id, candidate) in loop_candidates.iter().enumerate() {
+            loop_headers[candidate.header.index()] = true;
+            for block in candidate.body_scope_blocks.iter().copied() {
+                loops_by_body_block[block.index()].push(candidate_id);
+            }
 
-    fn unique_nearest_without_entering_loop_header(
-        &mut self,
-        candidates: Vec<BlockRef>,
-    ) -> Option<BlockRef> {
-        let mut nearest = *candidates.first()?;
-        for candidate in candidates.iter().copied().skip(1) {
-            if self.strictly_reaches_without_entering_loop_header(candidate, nearest) {
-                nearest = candidate;
+            let mut add_endpoint = |block: BlockRef| {
+                if seen[block.index()] != candidate_id {
+                    seen[block.index()] = candidate_id;
+                    loops_by_endpoint[block.index()].push(candidate_id);
+                }
+            };
+            for block in candidate
+                .body_scope_blocks
+                .iter()
+                .chain(&candidate.blocks)
+                .chain(&candidate.control_blocks)
+                .copied()
+            {
+                add_endpoint(block);
+            }
+            if let Some(target) = candidate.continue_target {
+                add_endpoint(target);
+            }
+            for edge in &candidate.backedges {
+                add_endpoint(cfg.edges[edge.index()].from);
             }
         }
-        candidates
-            .into_iter()
-            .all(|candidate| {
-                candidate == nearest
-                    || self.strictly_reaches_without_entering_loop_header(nearest, candidate)
-            })
-            .then_some(nearest)
-    }
 
-    fn strictly_reaches_without_entering_loop_header(
-        &mut self,
-        from: BlockRef,
-        to: BlockRef,
-    ) -> bool {
-        from != to
-            && self.can_reach_without_entering_loop_header(from, to)
-            && !self.can_reach_without_entering_loop_header(to, from)
-    }
-}
-
-fn loop_candidate_for_entry<'a>(
-    candidates: &[&'a LoopCandidate],
-    predecessor: Option<BlockRef>,
-) -> Option<&'a LoopCandidate> {
-    if let Some(predecessor) = predecessor {
-        let mut matching = candidates
+        let local_frontiers = graph_facts
+            .dominance_frontier
             .iter()
-            .copied()
-            .filter(|candidate| candidate.preheader == Some(predecessor));
-        if let Some(candidate) = matching.next()
-            && matching.next().is_none()
-        {
-            return Some(candidate);
+            .map(|frontier| {
+                frontier
+                    .iter()
+                    .copied()
+                    .filter(|block| *block != cfg.exit_block && !loop_headers[block.index()])
+                    .fold(FrontierShape::Empty, FrontierShape::push)
+            })
+            .collect();
+
+        Self {
+            graph_facts,
+            loop_candidates,
+            loops_by_endpoint,
+            loops_by_body_block,
+            loop_headers,
+            local_frontiers,
+            exit_block: cfg.exit_block,
         }
     }
 
-    match candidates {
-        [candidate] => Some(*candidate),
-        _ => None,
-    }
-}
-
-fn reachable_without_entering_loop_bodies(
-    cfg: &Cfg,
-    from: BlockRef,
-    loops_by_header: &BTreeMap<BlockRef, Vec<&LoopCandidate>>,
-) -> BTreeSet<BlockRef> {
-    let mut reachable = BTreeSet::from([from]);
-    let mut visited = BTreeSet::new();
-    let mut worklist = VecDeque::from([(None, from)]);
-    while let Some((predecessor, block)) = worklist.pop_front() {
-        reachable.insert(block);
-        if !visited.insert((predecessor, block)) {
-            continue;
-        }
-        if let Some(candidates) = loops_by_header.get(&block) {
-            let Some(candidate) = loop_candidate_for_entry(candidates, predecessor) else {
-                // 同 header 候选无法按入口唯一选择时，不猜测任意 loop owner。
-                continue;
-            };
-            worklist.extend(candidate.exits.iter().map(|exit| (None, *exit)));
-            continue;
-        }
-        for edge_ref in &cfg.succs[block.index()] {
-            worklist.push_back((Some(block), cfg.edges[edge_ref.index()].to));
-        }
+    fn endpoint_loops(&self, block: BlockRef) -> impl Iterator<Item = &'a LoopCandidate> + '_ {
+        self.loops_by_endpoint[block.index()]
+            .iter()
+            .map(|candidate| &self.loop_candidates[*candidate])
     }
 
-    reachable
-}
+    fn body_loops(&self, block: BlockRef) -> impl Iterator<Item = &'a LoopCandidate> + '_ {
+        self.loops_by_body_block[block.index()]
+            .iter()
+            .map(|candidate| &self.loop_candidates[*candidate])
+    }
 
-fn classify_one_arm_branch(
-    reachability: &mut ReachabilityCache<'_>,
-    header: BlockRef,
-    then_entry: BlockRef,
-    else_entry: BlockRef,
-) -> Option<BranchCandidate> {
-    let then_reaches_else = reachability.can_reach(then_entry, else_entry);
-    let else_reaches_then = reachability.can_reach(else_entry, then_entry);
+    fn joins_at(&self, from: BlockRef, target: BlockRef) -> bool {
+        self.graph_facts
+            .dominance_frontier
+            .get(from.index())
+            .is_some_and(|frontier| frontier.contains(&target))
+    }
 
-    one_arm_candidate(
-        header,
-        then_entry,
-        else_entry,
-        then_reaches_else,
-        else_reaches_then,
-    )
+    fn has_single_local_join(&self, from: BlockRef, target: BlockRef) -> bool {
+        if target == self.exit_block || !self.joins_at(from, target) {
+            return false;
+        }
+        match self.local_frontiers[from.index()] {
+            FrontierShape::Empty => self.loop_headers[target.index()],
+            FrontierShape::One(join) => join == target,
+            FrontierShape::Multiple => false,
+        }
+    }
 }
 
 fn one_arm_candidate(
@@ -637,15 +936,64 @@ fn classify_postdom_one_arm_branch(
     )
 }
 
-fn classify_infinite_loop_bounded_branch(
-    reachability: &mut ReachabilityCache<'_>,
-    loop_candidates: &[LoopCandidate],
+fn classify_reachable_one_arm_branch(
+    branch_index: &BranchIndex<'_>,
     header: BlockRef,
     then_entry: BlockRef,
     else_entry: BlockRef,
 ) -> Option<BranchCandidate> {
-    let loop_candidate = loop_candidates
-        .iter()
+    // 唯一非 exit dominance-frontier 已经证明该臂真实汇入 continuation；再做一遍
+    // 任意 CFG reachability 只会为每个 terminal branch 重扫全图。
+    let then_reaches_else = branch_index.has_single_local_join(then_entry, else_entry);
+    let else_reaches_then = branch_index.has_single_local_join(else_entry, then_entry);
+    one_arm_candidate(
+        header,
+        then_entry,
+        else_entry,
+        then_reaches_else,
+        else_reaches_then,
+    )
+}
+
+fn refine_terminal_one_arm_branches(
+    cfg: &Cfg,
+    branch_index: &BranchIndex<'_>,
+    irreducible_blocks: &[bool],
+    candidates: &mut [BranchCandidate],
+) {
+    for candidate in candidates {
+        if candidate.kind != BranchKind::IfElse
+            || candidate.merge.is_some()
+            || irreducible_blocks[candidate.header.index()]
+        {
+            continue;
+        }
+        let Some((truthy, falsy)) = cfg.branch_edges(candidate.header) else {
+            continue;
+        };
+        let then_entry = cfg.edges[truthy.index()].to;
+        let else_entry = cfg.edges[falsy.index()].to;
+        if let Some(refined) = classify_reachable_one_arm_branch(
+            branch_index,
+            candidate.header,
+            then_entry,
+            else_entry,
+        ) {
+            *candidate = refined;
+        }
+    }
+}
+
+fn classify_infinite_loop_bounded_branch(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    branch_index: &BranchIndex<'_>,
+    header: BlockRef,
+    then_entry: BlockRef,
+    else_entry: BlockRef,
+) -> Option<BranchCandidate> {
+    let loop_candidate = branch_index
+        .endpoint_loops(header)
         .filter(|candidate| {
             candidate.exits.is_empty()
                 && candidate.blocks.contains(&header)
@@ -654,22 +1002,16 @@ fn classify_infinite_loop_bounded_branch(
         })
         .min_by_key(|candidate| candidate.blocks.len())?;
 
-    let then_reaches_else =
-        reachability.can_reach_without_entering_loop_header(then_entry, else_entry);
-    let else_reaches_then =
-        reachability.can_reach_without_entering_loop_header(else_entry, then_entry);
-    let common_reachable = loop_candidate
-        .blocks
-        .iter()
-        .copied()
-        .filter(|candidate| {
-            *candidate != header
-                && *candidate != loop_candidate.header
-                && reachability.can_reach_without_entering_loop_header(then_entry, *candidate)
-                && reachability.can_reach_without_entering_loop_header(else_entry, *candidate)
-        })
-        .collect();
-    let local_merge = reachability.unique_nearest_without_entering_loop_header(common_reachable);
+    let reaches_local_tail = |from, to| {
+        graph_facts.post_dominates(to, from)
+            || branch_index.has_single_local_join(from, to)
+                && !branch_index.joins_at(from, loop_candidate.header)
+    };
+    let then_reaches_else = reaches_local_tail(then_entry, else_entry);
+    let else_reaches_then = reaches_local_tail(else_entry, then_entry);
+    let local_merge = find_soft_merge(cfg, graph_facts, header, then_entry, else_entry)
+        .filter(|merge| *merge != header && *merge != loop_candidate.header)
+        .filter(|merge| loop_candidate.blocks.contains(merge));
 
     match (then_reaches_else, else_reaches_then) {
         (true, false) => Some(BranchCandidate {
@@ -697,10 +1039,8 @@ fn classify_infinite_loop_bounded_branch(
             invert_hint: false,
         }),
         (false, false)
-            if reachability
-                .can_reach_without_entering_loop_header(then_entry, loop_candidate.header)
-                && reachability
-                    .can_reach_without_entering_loop_header(else_entry, loop_candidate.header) =>
+            if branch_index.joins_at(then_entry, loop_candidate.header)
+                && branch_index.joins_at(else_entry, loop_candidate.header) =>
         {
             // 无出口循环没有严格后支配点，但两臂都在本轮结束后回到同一 header，
             // 该 header 就是源码层 if/else 的循环内合流边界。
@@ -720,16 +1060,15 @@ fn classify_infinite_loop_bounded_branch(
 fn classify_loop_exit_bounded_one_arm_branch(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
-    loop_candidates: &[LoopCandidate],
-    reachability: &mut ReachabilityCache<'_>,
+    branch_index: &BranchIndex<'_>,
     header: BlockRef,
     then_entry: BlockRef,
     else_entry: BlockRef,
 ) -> Option<BranchCandidate> {
     let strict_merge = graph_facts.nearest_common_postdom(then_entry, else_entry)?;
     // 局部 break 会把严格后支配点推到外层 loop exit；但若一臂进入单跳回边 pad，
-    // 它表达的是下一轮 continue，不能借整轮回边伪装成对另一臂的局部可达。
-    let enters_continue_pad = loop_candidates.iter().any(|candidate| {
+    // 它表达的是下一轮 continue，不能把 loop-header frontier 当成普通 continuation。
+    let enters_continue_pad = branch_index.endpoint_loops(header).any(|candidate| {
         candidate.blocks.contains(&header)
             && [then_entry, else_entry].into_iter().any(|entry| {
                 transparent_jump_target(cfg, entry).is_some()
@@ -739,34 +1078,53 @@ fn classify_loop_exit_bounded_one_arm_branch(
                         .any(|edge| cfg.edges[edge.index()].from == entry)
             })
     });
-    if enters_continue_pad {
-        return None;
+    let owner = branch_index.endpoint_loops(header).find(|candidate| {
+        candidate.blocks.contains(&header)
+            && [then_entry, else_entry].into_iter().all(|entry| {
+                candidate.body_scope_blocks.contains(&entry)
+                    || candidate.blocks.contains(&entry)
+                    || candidate.exits.contains(&entry)
+            })
+            && (loop_exits_at(cfg, candidate, strict_merge) || strict_merge == cfg.exit_block)
+    })?;
+    let then_continues =
+        then_entry == owner.header || branch_index.joins_at(then_entry, owner.header);
+    let else_continues =
+        else_entry == owner.header || branch_index.joins_at(else_entry, owner.header);
+    match (then_continues, else_continues) {
+        (true, false) => Some(BranchCandidate {
+            header,
+            then_entry: else_entry,
+            else_entry: None,
+            merge: Some(then_entry),
+            kind: BranchKind::Guard,
+            invert_hint: true,
+        }),
+        (false, true) => Some(BranchCandidate {
+            header,
+            then_entry,
+            else_entry: None,
+            merge: Some(else_entry),
+            kind: BranchKind::Guard,
+            invert_hint: false,
+        }),
+        _ if enters_continue_pad => None,
+        _ => classify_loop_bounded_one_arm_branch(branch_index, header, then_entry, else_entry),
     }
-    loop_candidates
-        .iter()
-        .any(|candidate| {
-            candidate.blocks.contains(&header)
-                && candidate.blocks.contains(&then_entry)
-                && candidate.blocks.contains(&else_entry)
-                && (candidate.exits.contains(&strict_merge) || strict_merge == cfg.exit_block)
-        })
-        .then(|| {
-            classify_loop_bounded_one_arm_branch(reachability, header, then_entry, else_entry)
-        })?
 }
 
 fn classify_for_loop_exit_branch(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
-    loop_candidates: &[LoopCandidate],
+    branch_index: &BranchIndex<'_>,
     header: BlockRef,
     then_entry: BlockRef,
     else_entry: BlockRef,
 ) -> Option<BranchCandidate> {
     let strict_merge = graph_facts.nearest_common_postdom(then_entry, else_entry)?;
-    let owner = for_loop_exit_owner(
+    let owner = find_for_loop_exit_owner(
         cfg,
-        loop_candidates,
+        branch_index.endpoint_loops(header),
         header,
         then_entry,
         else_entry,
@@ -823,8 +1181,25 @@ pub(super) fn for_loop_exit_owner<'a>(
     else_entry: BlockRef,
     boundary: BlockRef,
 ) -> Option<&'a LoopCandidate> {
+    find_for_loop_exit_owner(
+        cfg,
+        loop_candidates.iter(),
+        header,
+        then_entry,
+        else_entry,
+        boundary,
+    )
+}
+
+fn find_for_loop_exit_owner<'a>(
+    cfg: &Cfg,
+    loop_candidates: impl Iterator<Item = &'a LoopCandidate>,
+    header: BlockRef,
+    then_entry: BlockRef,
+    else_entry: BlockRef,
+    boundary: BlockRef,
+) -> Option<&'a LoopCandidate> {
     loop_candidates
-        .iter()
         .filter(|candidate| {
             matches!(
                 candidate.kind_hint,
@@ -832,12 +1207,12 @@ pub(super) fn for_loop_exit_owner<'a>(
             ) && candidate.body_scope_blocks.contains(&header)
                 && candidate.body_scope_blocks.contains(&then_entry)
                 && candidate.body_scope_blocks.contains(&else_entry)
-                && for_loop_exits_at(cfg, candidate, boundary)
+                && loop_exits_at(cfg, candidate, boundary)
         })
         .min_by_key(|candidate| candidate.body_scope_blocks.len())
 }
 
-fn for_loop_exits_at(cfg: &Cfg, candidate: &LoopCandidate, boundary: BlockRef) -> bool {
+fn loop_exits_at(cfg: &Cfg, candidate: &LoopCandidate, boundary: BlockRef) -> bool {
     candidate.exits.contains(&boundary)
         || (!candidate.exits.is_empty()
             && candidate
@@ -865,19 +1240,15 @@ pub(super) fn for_loop_body_entry(cfg: &Cfg, candidate: &LoopCandidate) -> Optio
 }
 
 fn classify_loop_bounded_one_arm_branch(
-    reachability: &mut ReachabilityCache<'_>,
+    branch_index: &BranchIndex<'_>,
     header: BlockRef,
     then_entry: BlockRef,
     else_entry: BlockRef,
 ) -> Option<BranchCandidate> {
-    // 普通可达性在无出口或嵌套 loop 里会被回边污染：两个分支臂可能都能绕一整圈
-    // 回到对方，看起来不像 if-then。这里把 reducible nested loop 当成“只通向 exits
-    // 的结构化节点”，既保留 `if ... then skip nested-for end` 这种正常出口，又避免沿
-    // loop body/backedge 绕回另一条臂。
-    let then_reaches_else =
-        reachability.can_reach_without_entering_loop_header(then_entry, else_entry);
-    let else_reaches_then =
-        reachability.can_reach_without_entering_loop_header(else_entry, then_entry);
+    // dominance frontier 只接受当前 arm 真正贡献前驱的 join，不会沿回边绕一整圈后
+    // 把另一条 arm 误当 continuation；nested loop header 也已在稠密索引中单独标记。
+    let then_reaches_else = branch_index.joins_at(then_entry, else_entry);
+    let else_reaches_then = branch_index.joins_at(else_entry, then_entry);
 
     match (then_reaches_else, else_reaches_then) {
         (true, false) => Some(BranchCandidate {
@@ -910,9 +1281,8 @@ fn classify_if_else_branch(
     let merge = graph_facts.nearest_common_postdom(then_entry, else_entry)?;
     if merge == cfg.exit_block {
         // 严格后支配合流是 exit block，说明两侧都有提前 return 的路径。
-        // 但如果一侧的 ipostdom 是非 exit 块且从另一侧可达，那它仍然是
-        // 合法的 if-else merge：提前 return 只是 body 内的 early exit，
-        // 不影响外层的 merge 恢复。
+        // 若两臂仍有唯一共同 dominance frontier，它就是正常路径的 soft merge；
+        // 提前 return 只作为 arm exit，不改变外层的词法 continuation。
         let soft = find_soft_merge(cfg, graph_facts, header, then_entry, else_entry);
         return Some(BranchCandidate {
             header,
@@ -965,68 +1335,21 @@ pub(super) fn transparent_jump_target(cfg: &Cfg, block: BlockRef) -> Option<Bloc
 }
 
 fn classify_guard_branch(
-    cfg: &Cfg,
-    reachability: &mut ReachabilityCache<'_>,
     header: BlockRef,
     then_entry: BlockRef,
     else_entry: BlockRef,
-) -> Option<BranchCandidate> {
-    if reachability.can_reach(then_entry, else_entry)
-        || reachability.can_reach(else_entry, then_entry)
-    {
-        return None;
-    }
-
-    let then_score = branch_continuation_score(cfg, then_entry);
-    let else_score = branch_continuation_score(cfg, else_entry);
-    if then_score == else_score {
-        // 两臂入口互不可达且没有共同后支配点时，大小相等只表示无法为 guard
-        // 选择展示层 continuation，不能据此丢掉整个 branch owner。显式 if/else
-        // 先不声明强制 merge；HIR 仍可用更严格的路径证明选出可选共享 continuation。
-        return Some(BranchCandidate {
-            header,
-            then_entry,
-            else_entry: Some(else_entry),
-            merge: None,
-            kind: BranchKind::IfElse,
-            invert_hint: false,
-        });
-    }
-
-    let (continuation, side, invert_hint) = if then_score > else_score {
-        (then_entry, else_entry, true)
-    } else {
-        (else_entry, then_entry, false)
-    };
-
-    Some(BranchCandidate {
+) -> BranchCandidate {
+    // 前面的 postdom、loop-boundary 与 soft-merge 规则都无法证明 continuation 时，
+    // 不再用“哪一臂可达块更多”猜 guard。保留无 merge 的双臂 owner，后续 plan 会
+    // 分别声明两侧出口；这既不丢控制边，也避免每个 branch 做一次全图 DFS。
+    BranchCandidate {
         header,
-        then_entry: side,
-        else_entry: None,
-        merge: Some(continuation),
-        kind: BranchKind::Guard,
-        invert_hint,
-    })
-}
-
-fn branch_continuation_score(cfg: &Cfg, start: BlockRef) -> usize {
-    let mut visited = BTreeSet::new();
-    let mut stack = vec![start];
-
-    while let Some(block) = stack.pop() {
-        if !cfg.reachable_blocks.contains(&block)
-            || block == cfg.exit_block
-            || !visited.insert(block)
-        {
-            continue;
-        }
-
-        for edge_ref in &cfg.succs[block.index()] {
-            stack.push(cfg.edges[edge_ref.index()].to);
-        }
+        then_entry,
+        else_entry: Some(else_entry),
+        merge: None,
+        kind: BranchKind::IfElse,
+        invert_hint: false,
     }
-
-    visited.len()
 }
 
 /// 当严格后支配合流 = exit block 时，从两臂共同的 dominance frontier 中找一个
@@ -1042,28 +1365,28 @@ fn branch_continuation_score(cfg: &Cfg, start: BlockRef) -> usize {
 /// end
 /// E                ← 软合流 = 两臂共同的 dominance frontier
 /// ```
-fn find_soft_merge(
+pub(super) fn find_soft_merge(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     header: BlockRef,
     then_entry: BlockRef,
     else_entry: BlockRef,
 ) -> Option<BlockRef> {
-    let else_frontier = graph_facts
-        .dominance_frontier_blocks(else_entry)
-        .collect::<BTreeSet<_>>();
-    let common = graph_facts
+    let else_frontier = graph_facts.dominance_frontier.get(else_entry.index())?;
+    let is_common = |candidate: &BlockRef| {
+        *candidate != cfg.exit_block
+            && graph_facts.dominates(header, *candidate)
+            && else_frontier.contains(candidate)
+    };
+    let nearest = graph_facts
         .dominance_frontier_blocks(then_entry)
-        .filter(|candidate| {
-            *candidate != cfg.exit_block
-                && graph_facts.dominates(header, *candidate)
-                && else_frontier.contains(candidate)
-        })
-        .collect::<BTreeSet<_>>();
-
-    common.iter().copied().find(|candidate| {
-        common
-            .iter()
-            .all(|other| graph_facts.dominates(*candidate, *other))
-    })
+        .filter(is_common)
+        .min_by_key(|candidate| {
+            graph_facts.dominator_tree.depth[candidate.index()].unwrap_or(usize::MAX)
+        })?;
+    graph_facts
+        .dominance_frontier_blocks(then_entry)
+        .filter(is_common)
+        .all(|candidate| graph_facts.dominates(nearest, candidate))
+        .then_some(nearest)
 }

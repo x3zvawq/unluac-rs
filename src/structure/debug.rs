@@ -1,7 +1,7 @@
-//! 这个文件承载 Structure 层的共享调试输出。
+//! Structure 阶段的共享调试输出。
 //!
-//! 对外只有一个 Structure dump；内部仍按 CFG、GraphFacts、Dataflow、StructureFacts
-//! 分段输出，方便排查时沿着结构层内部事实链向后看。
+//! dump 只展示已经冻结的 `StructurePlan`。候选是构建 plan 的临时 evidence，若继续把
+//! 它们和最终 owner 并排打印，排错时就无法分辨 HIR 实际消费的是哪一套事实。
 
 use std::fmt::Write as _;
 
@@ -12,14 +12,12 @@ use crate::debug::{
 };
 use crate::decompile::{DebugOptions, DecompileState};
 
-use super::common::{
-    BranchCandidate, BranchRegionFact, BranchValueMergeCandidate, GenericPhiMaterialization,
-    GenericPhiSource, GotoRequirement, LoopCandidate, LoopExitValueMergeCandidate,
-    LoopSourceBindings, LoopValueMerge, RegionFact, ScopeCandidate, ShortCircuitCandidate,
-    ShortCircuitExit, ShortCircuitNode, ShortCircuitTarget, ShortCircuitValueIncoming,
-    StructureFacts,
+use super::plan::EdgeActionPlacement;
+use super::{
+    BlockTerminatorKind, CleanupDisposition, ControlFlowFeature, EdgeTransfer,
+    PhiIncomingDisposition, PlanRequirement, RegionId, RegionPlan, StructureFacts,
+    UnstructuredLayoutItem,
 };
-use super::{BlockOwner, CleanupDisposition, EdgeOwner, PhiIncomingDisposition};
 
 #[derive(Debug, Clone, Copy)]
 struct ProtoEntry<'a> {
@@ -93,7 +91,6 @@ fn append_section(output: &mut String, section: String) {
     }
 }
 
-/// 输出 StructureFacts 的人类可读摘要。
 fn dump_structure_facts(
     structure: &StructureFacts,
     detail: DebugDetail,
@@ -102,7 +99,7 @@ fn dump_structure_facts(
 ) -> String {
     let mut output = String::new();
     let entries = collect_proto_entries(structure);
-    let plan = plan_focus(&entries, filters);
+    let focus = plan_focus(&entries, filters);
 
     let _ = writeln!(output, "===== Dump Structure =====");
     let _ = writeln!(
@@ -115,18 +112,18 @@ fn dump_structure_facts(
         let _ = writeln!(output, "filters proto=proto#{proto_id}");
     }
     let _ = writeln!(output, "filters proto_depth={}", filters.proto_depth);
-    if let Some(breadcrumb) = format_breadcrumb(&plan) {
+    if let Some(breadcrumb) = format_breadcrumb(&focus) {
         let _ = writeln!(output, "focus {breadcrumb}");
     }
     let _ = writeln!(output);
 
-    if plan.focus.is_none() {
+    if focus.focus.is_none() {
         let _ = writeln!(output, "  <no proto matched filters>");
         return colorize_debug_text(&output, color);
     }
 
     for entry in &entries {
-        if plan.is_elided(entry.id) {
+        if focus.is_elided(entry.id) {
             let indent = "  ".repeat(entry.depth);
             let _ = writeln!(
                 output,
@@ -135,160 +132,703 @@ fn dump_structure_facts(
             );
             continue;
         }
-        if !plan.is_visible(entry.id) {
+        if !focus.is_visible(entry.id) {
             continue;
         }
 
         let indent = "  ".repeat(entry.depth);
+        let plan = entry.facts.plan();
+        let island_count = plan
+            .regions()
+            .filter(|(_, region)| matches!(region, RegionPlan::Unstructured { .. }))
+            .count();
         let _ = writeln!(
             output,
-            "{indent}proto#{} branches={} branch-regions={} branch-values={} loops={} short-circuits={} gotos={} regions={} scopes={}",
+            "{indent}proto#{} regions={} branches={} loops={} conditions={} islands={} labels={} edges={} phis={} scopes={} requirements={}",
             entry.id,
-            entry.facts.branch_candidates.len(),
-            entry.facts.branch_region_facts.len(),
-            entry.facts.branch_value_merge_candidates.len(),
-            entry.facts.loop_candidates.len(),
-            entry.facts.short_circuit_candidates.len(),
-            entry.facts.goto_requirements.len(),
-            entry.facts.region_facts.len(),
-            entry.facts.scope_candidates.len(),
+            plan.regions.len(),
+            plan.branches.len(),
+            plan.loops.len(),
+            plan.conditions.len(),
+            island_count,
+            plan.labels.len(),
+            plan.edge_plans.len(),
+            plan.phis.len(),
+            plan.scopes.len(),
+            plan.requirements.entries.len(),
         );
-
         if matches!(detail, DebugDetail::Summary) {
             continue;
         }
 
-        let _ = writeln!(output, "{indent}  branch candidates");
-        write_branches(&mut output, &indent, &entry.facts.branch_candidates);
+        let _ = writeln!(output, "{indent}  region tree");
+        write_region(&mut output, &indent, plan, plan.root(), 2, "root");
 
-        let _ = writeln!(output, "{indent}  structure plan");
-        write_plan(&mut output, &indent, entry.facts);
+        let _ = writeln!(output, "{indent}  block terminators");
+        write_block_terminators(&mut output, &indent, plan);
 
-        let _ = writeln!(output, "{indent}  branch region facts");
-        write_branch_regions(&mut output, &indent, &entry.facts.branch_region_facts);
+        let _ = writeln!(output, "{indent}  condition plans");
+        write_conditions(&mut output, &indent, plan);
 
-        let _ = writeln!(output, "{indent}  branch value merges");
-        write_branch_value_merges(
-            &mut output,
-            &indent,
-            &entry.facts.branch_value_merge_candidates,
-        );
+        let _ = writeln!(output, "{indent}  value decision plans");
+        write_value_decisions(&mut output, &indent, plan);
 
-        let _ = writeln!(output, "{indent}  generic phi materializations");
-        write_generic_phi_materializations(
-            &mut output,
-            &indent,
-            entry.facts.generic_phi_materializations(),
-        );
+        let _ = writeln!(output, "{indent}  planned labels");
+        write_labels(&mut output, &indent, plan);
 
-        let _ = writeln!(output, "{indent}  loop candidates");
-        write_loops(&mut output, &indent, &entry.facts.loop_candidates);
+        let _ = writeln!(output, "{indent}  forward routes");
+        write_forward_routes(&mut output, &indent, plan);
 
-        let _ = writeln!(output, "{indent}  short-circuit candidates");
-        write_short_circuits(&mut output, &indent, &entry.facts.short_circuit_candidates);
+        let _ = writeln!(output, "{indent}  edge transfers");
+        write_edges(&mut output, &indent, plan);
 
-        let _ = writeln!(output, "{indent}  goto requirements");
-        write_gotos(&mut output, &indent, &entry.facts.goto_requirements);
+        let _ = writeln!(output, "{indent}  value owners");
+        write_values(&mut output, &indent, plan);
 
-        let _ = writeln!(output, "{indent}  region facts");
-        write_regions(&mut output, &indent, &entry.facts.region_facts);
+        let _ = writeln!(output, "{indent}  cleanup owners");
+        write_cleanups(&mut output, &indent, plan);
 
-        let _ = writeln!(output, "{indent}  scope candidates");
-        write_scopes(&mut output, &indent, &entry.facts.scope_candidates);
+        let _ = writeln!(output, "{indent}  requirements");
+        write_requirements(&mut output, &indent, plan);
     }
 
     colorize_debug_text(&output, color)
 }
 
-fn write_plan(output: &mut String, indent: &str, facts: &StructureFacts) {
-    let blocks = facts
-        .plan
-        .block_owners
-        .iter()
-        .enumerate()
-        .map(|(index, owner)| format!("#{index}={}", format_block_owner(*owner)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let edges = facts
-        .plan
-        .edge_owners
-        .iter()
-        .enumerate()
-        .map(|(index, owner)| format!("#{index}={}", format_edge_owner(*owner)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let unstructured_membership = facts
-        .plan
-        .unstructured_region_by_block
-        .iter()
-        .enumerate()
-        .filter_map(|(index, region)| region.map(|region| format!("#{index}=r{}", region.index())))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let cleanup_dispositions = facts
-        .plan
-        .cleanup_dispositions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, disposition)| {
-            disposition
-                .map(|disposition| format!("@{index}={}", format_cleanup_disposition(disposition)))
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let unstructured_layouts = facts
-        .plan
-        .unstructured_layouts
-        .iter()
-        .enumerate()
-        .filter_map(|(index, layout)| {
-            layout.as_ref().map(|layout| {
-                format!(
-                    "r{index}=blocks:{} continuation:#{}",
-                    format_display_set(&layout.blocks),
-                    layout.continuation.index()
-                )
-            })
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let phi_incomings = facts
-        .plan
-        .phi_incoming_dispositions
-        .iter()
-        .enumerate()
-        .map(|(index, owners)| {
-            format!(
-                "p{index}=[{}]",
-                owners
-                    .iter()
-                    .map(|owner| format_phi_incoming_disposition(*owner))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let _ = writeln!(output, "{indent}    blocks [{blocks}]");
-    let _ = writeln!(output, "{indent}    edges [{edges}]");
-    let _ = writeln!(
-        output,
-        "{indent}    unstructured-membership [{unstructured_membership}]"
-    );
-    let _ = writeln!(
-        output,
-        "{indent}    unstructured-layouts [{unstructured_layouts}]"
-    );
-    let _ = writeln!(output, "{indent}    phi-incomings [{phi_incomings}]");
-    let _ = writeln!(output, "{indent}    cleanups [{cleanup_dispositions}]");
+fn write_value_decisions(output: &mut String, indent: &str, plan: &super::StructurePlan) {
+    if plan.value_decisions.is_empty() {
+        let _ = writeln!(output, "{indent}    <none>");
+        return;
+    }
+    for (decision_id, decision) in plan.value_decisions() {
+        let _ = writeln!(
+            output,
+            "{indent}    v{} entry=n{} merge=#{} result=p{} reg=r{} blocks={}",
+            decision_id.index(),
+            decision.entry.index(),
+            decision.merge.index(),
+            decision.result_phi.index(),
+            decision.result_reg.index(),
+            format_display_set(&decision.blocks),
+        );
+        for node in &decision.nodes {
+            let _ = writeln!(
+                output,
+                "{indent}      n{} block=#{} predicate=@{} predicate-negated={}",
+                node.id.index(),
+                node.block.index(),
+                node.predicate.index(),
+                node.predicate_negated,
+            );
+            for (semantic, arc) in [("truthy", &node.truthy), ("falsy", &node.falsy)] {
+                let target = match arc.target {
+                    super::ValueDecisionTarget::Node(target) => {
+                        format!("n{}", target.index())
+                    }
+                    super::ValueDecisionTarget::Leaf(target) => {
+                        format!("leaf{}", target.index())
+                    }
+                    super::ValueDecisionTarget::CurrentValue(target) => {
+                        format!("current(leaf{})", target.index())
+                    }
+                };
+                let _ = writeln!(
+                    output,
+                    "{indent}        {semantic} polarity={:?} route={} target={target}",
+                    arc.polarity,
+                    format_display_set(&arc.route),
+                );
+            }
+        }
+        for leaf in &decision.leaves {
+            let _ = writeln!(
+                output,
+                "{indent}      leaf{} block=#{} value={} latest-def={} terminal={} physical-pred=#{} physical-value={}",
+                leaf.id.index(),
+                leaf.block.index(),
+                leaf.value,
+                leaf.latest_local_def
+                    .map_or_else(|| "-".to_owned(), |def| def.to_string()),
+                leaf.terminal_edge,
+                leaf.physical_pred.index(),
+                leaf.physical_value,
+            );
+        }
+    }
 }
 
-fn format_phi_incoming_disposition(disposition: PhiIncomingDisposition) -> &'static str {
+fn write_block_terminators(output: &mut String, indent: &str, plan: &super::StructurePlan) {
+    if plan.block_terminators.is_empty() {
+        let _ = writeln!(output, "{indent}    <none>");
+        return;
+    }
+    for terminator in &plan.block_terminators {
+        let kind = match terminator.kind {
+            BlockTerminatorKind::SyntheticExit => "synthetic-exit".to_owned(),
+            BlockTerminatorKind::Linear { edge } => edge.map_or_else(
+                || "linear edge=-".to_owned(),
+                |edge| format!("linear edge={edge}"),
+            ),
+            BlockTerminatorKind::Jump { instr, edge } => {
+                format!("jump instr={instr} edge={edge}")
+            }
+            BlockTerminatorKind::Branch {
+                instr,
+                truthy,
+                falsy,
+            } => format!("branch instr={instr} truthy={truthy} falsy={falsy}"),
+            BlockTerminatorKind::Return { instr, edge } => {
+                format!("return instr={instr} edge={edge}")
+            }
+            BlockTerminatorKind::TailCall { instr, edge } => {
+                format!("tail-call instr={instr} edge={edge}")
+            }
+            BlockTerminatorKind::NumericForInit { instr, body, exit } => {
+                format!("numeric-for-init instr={instr} body={body} exit={exit}")
+            }
+            BlockTerminatorKind::NumericForLoop { instr, body, exit } => {
+                format!("numeric-for-loop instr={instr} body={body} exit={exit}")
+            }
+            BlockTerminatorKind::GenericForLoop { instr, body, exit } => {
+                format!("generic-for-loop instr={instr} body={body} exit={exit}")
+            }
+        };
+        let _ = writeln!(
+            output,
+            "{indent}    {} instrs=[@{}..@{}) {kind}",
+            terminator.block,
+            terminator.instrs.start.index(),
+            terminator.instrs.end(),
+        );
+    }
+}
+
+fn write_conditions(output: &mut String, indent: &str, plan: &super::StructurePlan) {
+    if plan.conditions.is_empty() {
+        let _ = writeln!(output, "{indent}    <none>");
+        return;
+    }
+    for (condition_id, condition) in plan.conditions() {
+        let _ = writeln!(
+            output,
+            "{indent}    c{} entry=n{} truthy={} falsy={}",
+            condition_id.index(),
+            condition.entry.index(),
+            condition.truthy,
+            condition.falsy,
+        );
+        for node in &condition.nodes {
+            let value = node.materialized_value.map_or_else(
+                || "control".to_owned(),
+                |value| {
+                    format!(
+                        "value=p{} consumer=n{} use=@{} negated={} forwarded-callee={}",
+                        value.phi.index(),
+                        value.consumer.index(),
+                        value.use_instr.index(),
+                        value.negated,
+                        value
+                            .forwarded_callee
+                            .map_or_else(|| "-".to_owned(), |def| def.to_string()),
+                    )
+                },
+            );
+            let _ = writeln!(
+                output,
+                "{indent}      n{} block=#{} predicate=@{} predicate-negated={} {value}",
+                node.id.index(),
+                node.block.index(),
+                node.predicate.index(),
+                node.predicate_negated,
+            );
+            for arc in &node.arcs {
+                let target = match arc.target {
+                    super::ConditionTarget::Node(target) => format!("n{}", target.index()),
+                    super::ConditionTarget::Truthy => "truthy".to_owned(),
+                    super::ConditionTarget::Falsy => "falsy".to_owned(),
+                };
+                let _ = writeln!(
+                    output,
+                    "{indent}        {:?} route={} connectors={} target={target}",
+                    arc.polarity,
+                    format_display_set(&arc.route),
+                    format_display_set(&arc.connector_blocks),
+                );
+            }
+        }
+    }
+}
+
+fn write_region(
+    output: &mut String,
+    base_indent: &str,
+    plan: &super::StructurePlan,
+    id: RegionId,
+    depth: usize,
+    role: &str,
+) {
+    let indent = format!("{base_indent}{}", "  ".repeat(depth));
+    let Some(region) = plan.region(id) else {
+        let _ = writeln!(output, "{indent}{role}: r{} <missing>", id.index());
+        return;
+    };
+    match region {
+        RegionPlan::Block { block, .. } => {
+            let emission = match plan.block_emission(*block) {
+                Some(super::BlockEmissionPlan::ForwardedControl { outgoing }) => {
+                    format!(" forwarded={outgoing}")
+                }
+                _ => String::new(),
+            };
+            let _ = writeln!(
+                output,
+                "{indent}{role}: r{} block #{}{}",
+                id.index(),
+                block.index(),
+                emission,
+            );
+        }
+        RegionPlan::Sequence { children, .. } => {
+            let _ = writeln!(
+                output,
+                "{indent}{role}: r{} sequence children={}",
+                id.index(),
+                children.len()
+            );
+            for child in children {
+                write_region(output, base_indent, plan, *child, depth + 1, "item");
+            }
+        }
+        RegionPlan::Branch {
+            plan: branch,
+            entry,
+            condition,
+            then_arm,
+            else_arm,
+            continuation,
+            ..
+        } => {
+            let payload = plan.branch(*branch);
+            let _ = writeln!(
+                output,
+                "{indent}{role}: r{} branch b{} entry=#{} continuation={} condition={} inverted={} then={} else={}",
+                id.index(),
+                branch.index(),
+                entry.index(),
+                format_optional_block(*continuation),
+                payload.map_or_else(
+                    || "?".to_owned(),
+                    |payload| format!("c{}", payload.condition.index())
+                ),
+                payload.is_some_and(|payload| payload.condition_inverted),
+                payload.map_or_else(|| "?".to_owned(), |payload| payload.then_edge.to_string()),
+                payload.map_or_else(|| "?".to_owned(), |payload| payload.else_edge.to_string()),
+            );
+            write_region(
+                output,
+                base_indent,
+                plan,
+                *condition,
+                depth + 1,
+                "condition",
+            );
+            write_region(output, base_indent, plan, *then_arm, depth + 1, "then");
+            if let Some(else_arm) = else_arm {
+                write_region(output, base_indent, plan, *else_arm, depth + 1, "else");
+            }
+        }
+        RegionPlan::ValueDecision {
+            plan: decision,
+            entry,
+            continuation,
+            ..
+        } => {
+            let payload = plan.value_decision(*decision);
+            let _ = writeln!(
+                output,
+                "{indent}{role}: r{} value-decision v{} entry=#{} continuation=#{} result={}",
+                id.index(),
+                decision.index(),
+                entry.index(),
+                continuation.index(),
+                payload
+                    .map(|payload| payload.result_phi.to_string())
+                    .unwrap_or_else(|| "?".to_owned()),
+            );
+        }
+        RegionPlan::Loop {
+            plan: loop_,
+            entry,
+            preheader,
+            control,
+            body,
+            normal_tail,
+            ..
+        } => {
+            let payload = plan.loop_(*loop_);
+            let _ = writeln!(
+                output,
+                "{indent}{role}: r{} loop l{} kind={} entry=#{} continuation={}",
+                id.index(),
+                loop_.index(),
+                payload
+                    .map(|payload| format_loop_kind(payload.kind))
+                    .unwrap_or("<missing>"),
+                entry.index(),
+                payload
+                    .map(|payload| format_optional_block(payload.continuation))
+                    .unwrap_or_else(|| "-".to_owned()),
+            );
+            if let Some(payload) = payload {
+                let _ = writeln!(output, "{indent}  normal-tail={:?}", payload.normal_tail);
+                let _ = writeln!(
+                    output,
+                    "{indent}  propagated-break={}",
+                    format_optional_region(payload.propagated_break),
+                );
+            }
+            if let Some(preheader) = preheader {
+                write_region(
+                    output,
+                    base_indent,
+                    plan,
+                    *preheader,
+                    depth + 1,
+                    "preheader",
+                );
+            }
+            write_region(output, base_indent, plan, *control, depth + 1, "control");
+            write_region(output, base_indent, plan, *body, depth + 1, "body");
+            if let Some(normal_tail) = normal_tail {
+                write_region(
+                    output,
+                    base_indent,
+                    plan,
+                    *normal_tail,
+                    depth + 1,
+                    "normal-tail",
+                );
+            }
+            if let Some(tail) = payload.and_then(|payload| payload.exit_tail.as_ref()) {
+                let _ = writeln!(
+                    output,
+                    "{indent}  exit-tail: normal={} block=#{} instrs=[@{}..@{}) continuation=#{} early=[{}] cleanup-block=#{} cleanup-route=[{}] cleanup=[{}]",
+                    tail.normal_exit,
+                    tail.block.index(),
+                    tail.range.start.index(),
+                    tail.range.end(),
+                    tail.continuation.index(),
+                    format_display_set(&tail.early_exits),
+                    tail.cleanup_block.index(),
+                    format_display_set(&tail.cleanup_route),
+                    tail.cleanup
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
+        }
+        RegionPlan::Unstructured {
+            entry,
+            entries,
+            layout,
+            exits,
+            ..
+        } => {
+            let layout_text = layout
+                .iter()
+                .map(|item| match item {
+                    UnstructuredLayoutItem::Block(block) => format!("#{}", block.index()),
+                    UnstructuredLayoutItem::Region(region) => format!("r{}", region.index()),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                output,
+                "{indent}{role}: r{} island entry=#{} entry-ports={} exit-ports={} layout=[{}]",
+                id.index(),
+                entry.index(),
+                format_display_set(entries),
+                format_display_set(exits),
+                layout_text,
+            );
+            for child in layout.iter().filter_map(|item| match item {
+                UnstructuredLayoutItem::Region(region) => Some(*region),
+                UnstructuredLayoutItem::Block(_) => None,
+            }) {
+                write_region(
+                    output,
+                    base_indent,
+                    plan,
+                    child,
+                    depth + 1,
+                    "structured-item",
+                );
+            }
+        }
+    }
+}
+
+fn write_labels(output: &mut String, indent: &str, plan: &super::StructurePlan) {
+    if plan.labels.is_empty() {
+        let _ = writeln!(output, "{indent}    <none>");
+        return;
+    }
+    for (id, label) in plan.labels() {
+        let barriers = label
+            .tbc_barriers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            output,
+            "{indent}    l{} block=#{} placement={:?} tbc=[{}]",
+            id.index(),
+            label.block.index(),
+            label.placement,
+            barriers,
+        );
+    }
+}
+
+fn write_edges(output: &mut String, indent: &str, plan: &super::StructurePlan) {
+    if plan.edge_plans.is_empty() {
+        let _ = writeln!(output, "{indent}    <none>");
+        return;
+    }
+    for edge in &plan.edge_plans {
+        let forwarded = edge
+            .forward_route
+            .map_or_else(|| "-".to_owned(), |route| format!("fr{}", route.index()));
+        let copies = edge
+            .phi_copies
+            .iter()
+            .map(|copy| format!("p{}<-{}", copy.phi_id.index(), copy.value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let iteration = edge
+            .iteration
+            .iter()
+            .map(|disposition| {
+                format!(
+                    "r{}:p{}<-{} via {:?}",
+                    disposition.loop_region.index(),
+                    disposition.target.index(),
+                    disposition.incoming,
+                    disposition.source,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let actions = match edge.action_placement {
+            EdgeActionPlacement::BeforeTransfer => "before-transfer".to_owned(),
+            EdgeActionPlacement::BeforeTrailingCleanup { cleanup } => format!(
+                "before-cleanup[@{}..@{})",
+                cleanup.start.index(),
+                cleanup.end()
+            ),
+        };
+        let relation = plan.edge_region_relation(edge.edge);
+        let relation = relation.map_or_else(
+            || "relation=-".to_owned(),
+            |relation| {
+                format!(
+                    "relation=src:{} dst:{} lca:{} src-child:{} dst-child:{}",
+                    format_optional_region(relation.source_owner),
+                    format_optional_region(relation.target_owner),
+                    format_optional_region(relation.lca),
+                    format_optional_region(relation.source_child),
+                    format_optional_region(relation.target_child),
+                )
+            },
+        );
+        let _ = writeln!(
+            output,
+            "{indent}    {} owner=r{} transfer={} actions={} forwarded={} {} phi=[{}] iteration=[{}]",
+            edge.edge,
+            edge.owner.index(),
+            format_edge_transfer(plan, edge.transfer),
+            actions,
+            forwarded,
+            relation,
+            copies,
+            iteration,
+        );
+    }
+}
+
+fn write_forward_routes(output: &mut String, indent: &str, plan: &super::StructurePlan) {
+    if plan.forward_routes().len() == 0 {
+        let _ = writeln!(output, "{indent}    <none>");
+        return;
+    }
+    for (route_id, route) in plan.forward_routes() {
+        let edges = plan.forward_route_edges(route_id).collect::<Vec<_>>();
+        let _ = writeln!(
+            output,
+            "{indent}    fr{} owner=r{} kind={:?} edges={}",
+            route_id.index(),
+            route.loop_region.index(),
+            route.kind,
+            format_display_set(&edges),
+        );
+    }
+}
+
+fn write_values(output: &mut String, indent: &str, plan: &super::StructurePlan) {
+    if plan.phis.is_empty() {
+        let _ = writeln!(output, "{indent}    <none>");
+        return;
+    }
+    for phi in &plan.phis {
+        let _ = writeln!(
+            output,
+            "{indent}    p{} block=#{} reg={}{}",
+            phi.phi.index(),
+            phi.block.index(),
+            phi.reg,
+            plan.condition_value_owner(phi.phi).map_or_else(
+                String::new,
+                |(condition, node)| format!(
+                    " condition-value=c{}/n{}",
+                    condition.index(),
+                    node.index()
+                ),
+            ),
+        );
+        for incoming in &phi.incomings {
+            let edge = incoming
+                .edge
+                .map(|edge| edge.to_string())
+                .unwrap_or_else(|| "entry".to_owned());
+            let _ = writeln!(
+                output,
+                "{indent}      {edge} value={} owner={}",
+                incoming.value,
+                format_phi_disposition(incoming.disposition),
+            );
+        }
+    }
+}
+
+fn write_cleanups(output: &mut String, indent: &str, plan: &super::StructurePlan) {
+    let mut any = false;
+    for (index, disposition) in plan.cleanup_dispositions.iter().enumerate() {
+        let Some(disposition) = disposition else {
+            continue;
+        };
+        any = true;
+        let _ = writeln!(
+            output,
+            "{indent}    @{index} owner={}",
+            format_cleanup_disposition(*disposition)
+        );
+    }
+    if !any {
+        let _ = writeln!(output, "{indent}    <none>");
+    }
+}
+
+fn write_requirements(output: &mut String, indent: &str, plan: &super::StructurePlan) {
+    let requirements = plan.requirements();
+    let required = requirements
+        .required_features()
+        .iter()
+        .map(|feature| format_control_feature(*feature))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let unavailable = requirements
+        .unavailable_features()
+        .iter()
+        .map(|feature| format_control_feature(*feature))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(
+        output,
+        "{indent}    features=[{}] unavailable=[{}]",
+        required, unavailable
+    );
+    if requirements.iter().len() == 0 {
+        let _ = writeln!(output, "{indent}    <none>");
+        return;
+    }
+    for (id, requirement) in requirements.iter() {
+        let text = match requirement {
+            PlanRequirement::Goto {
+                edge,
+                label,
+                reason,
+            } => format!(
+                "goto edge={} label=l{} block={} reason={}",
+                edge,
+                label.index(),
+                plan.label(*label)
+                    .map(|label| format!("#{}", label.block.index()))
+                    .unwrap_or_else(|| "<missing>".to_owned()),
+                format_goto_reason(*reason)
+            ),
+            PlanRequirement::Continue { edge, loop_region } => {
+                format!("continue edge={} loop=r{}", edge, loop_region.index())
+            }
+            PlanRequirement::MultiEntryIsland {
+                region,
+                entry_count,
+            } => format!(
+                "multi-entry-island region=r{} entries={}",
+                region.index(),
+                entry_count
+            ),
+            PlanRequirement::UnresolvedValue { phi_id, block, reg } => format!(
+                "unresolved-value phi=p{} block=#{} reg={}",
+                phi_id.index(),
+                block.index(),
+                reg
+            ),
+        };
+        let _ = writeln!(output, "{indent}    q{} {text}", id.index());
+    }
+}
+
+fn format_edge_transfer(plan: &super::StructurePlan, transfer: EdgeTransfer) -> String {
+    match transfer {
+        EdgeTransfer::Unreachable => "unreachable".to_owned(),
+        EdgeTransfer::Fallthrough => "fallthrough".to_owned(),
+        EdgeTransfer::BranchArm(arm) => format!("branch-arm:{arm:?}"),
+        EdgeTransfer::LoopBack(region) => format!("loop-back:r{}", region.index()),
+        EdgeTransfer::Break(region) => format!("break:r{}", region.index()),
+        EdgeTransfer::Continue(region) => format!("continue:r{}", region.index()),
+        EdgeTransfer::Return => "return".to_owned(),
+        EdgeTransfer::TailCall => "tail-call".to_owned(),
+        EdgeTransfer::Goto(label, reason) => {
+            let block = plan
+                .label(label)
+                .map(|label| format!("#{}", label.block.index()))
+                .unwrap_or_else(|| "<missing>".to_owned());
+            format!(
+                "goto:l{}({block}):{}",
+                label.index(),
+                format_goto_reason(reason)
+            )
+        }
+    }
+}
+
+fn format_phi_disposition(disposition: PhiIncomingDisposition) -> String {
     match disposition {
-        PhiIncomingDisposition::Dead => "dead",
-        PhiIncomingDisposition::Unreachable => "unreachable",
-        PhiIncomingDisposition::EdgeCopy => "edge-copy",
-        PhiIncomingDisposition::Merge => "merge",
+        PhiIncomingDisposition::Dead => "dead".to_owned(),
+        PhiIncomingDisposition::EdgeCopy => "edge-copy".to_owned(),
+        PhiIncomingDisposition::RegionInput(region) => {
+            format!("region-input:r{}", region.index())
+        }
+        PhiIncomingDisposition::RegionResult(region) => {
+            format!("region-result:r{}", region.index())
+        }
+        PhiIncomingDisposition::LoopCarried(region) => {
+            format!("loop-carried:r{}", region.index())
+        }
+        PhiIncomingDisposition::DiagnosticUnresolved => "diagnostic-unresolved".to_owned(),
     }
 }
 
@@ -297,33 +837,22 @@ fn format_cleanup_disposition(disposition: CleanupDisposition) -> String {
         CleanupDisposition::Unreachable => "unreachable".to_owned(),
         CleanupDisposition::ExplicitTbc => "explicit-tbc".to_owned(),
         CleanupDisposition::LoopTbcBoundary(id) => {
-            format!("loop-tbc-boundary:c{}", id.index())
+            format!("loop-tbc-boundary:r{}", id.index())
         }
-        CleanupDisposition::ExplicitTbcBoundary => "explicit-tbc-boundary".to_owned(),
+        CleanupDisposition::ExplicitTbcBoundary(id) => {
+            format!("explicit-tbc-boundary:t{}", id.index())
+        }
+        CleanupDisposition::ExplicitTbcExit(id) => {
+            format!("explicit-tbc-exit:t{}", id.index())
+        }
         CleanupDisposition::LexicalScope(id) => format!("lexical-scope:s{}", id.index()),
     }
 }
 
-fn format_block_owner(owner: BlockOwner) -> String {
-    match owner {
-        BlockOwner::Unreachable => "unreachable".to_owned(),
-        BlockOwner::Linear => "linear".to_owned(),
-        BlockOwner::Branch(id) => format!("branch:c{}", id.index()),
-        BlockOwner::Loop(id) => format!("loop:c{}", id.index()),
-        BlockOwner::Unstructured(id) => format!("unstructured:r{}", id.index()),
-        BlockOwner::Exit => "exit".to_owned(),
-    }
-}
-
-fn format_edge_owner(owner: EdgeOwner) -> String {
-    match owner {
-        EdgeOwner::Unreachable => "unreachable".to_owned(),
-        EdgeOwner::Linear => "linear".to_owned(),
-        EdgeOwner::Branch(id) => format!("branch:c{}", id.index()),
-        EdgeOwner::Loop(id) => format!("loop:c{}", id.index()),
-        EdgeOwner::Unstructured(id) => format!("unstructured:r{}", id.index()),
-        EdgeOwner::Goto(id) => format!("goto:g{}", id.index()),
-        EdgeOwner::Terminal => "terminal".to_owned(),
+fn format_control_feature(feature: ControlFlowFeature) -> &'static str {
+    match feature {
+        ControlFlowFeature::GotoLabel => "goto-label",
+        ControlFlowFeature::ContinueStatement => "continue",
     }
 }
 
@@ -352,7 +881,7 @@ fn collect_proto_entries_inner<'a>(
 }
 
 fn plan_focus(entries: &[ProtoEntry<'_>], filters: &DebugFilters) -> FocusPlan {
-    let parents: Vec<Option<usize>> = entries.iter().map(|e| e.parent).collect();
+    let parents = entries.iter().map(|entry| entry.parent).collect::<Vec<_>>();
     let nodes = build_proto_nodes(&parents);
     compute_focus_plan(&nodes, &filters.as_focus_request())
 }
@@ -369,380 +898,33 @@ fn build_summary_row(entry: &ProtoEntry<'_>) -> ProtoSummaryRow {
     }
 }
 
-fn write_branches(output: &mut String, indent: &str, candidates: &[BranchCandidate]) {
-    if candidates.is_empty() {
-        let _ = writeln!(output, "{indent}    <none>");
-        return;
-    }
-
-    for candidate in candidates {
-        let _ = writeln!(
-            output,
-            "{indent}    header=#{} kind={} then=#{} else={} merge={} invert={}",
-            candidate.header.index(),
-            format_branch_kind(candidate.kind),
-            candidate.then_entry.index(),
-            format_optional_block(candidate.else_entry),
-            format_optional_block(candidate.merge),
-            candidate.invert_hint,
-        );
-    }
-}
-
-fn write_loops(output: &mut String, indent: &str, candidates: &[LoopCandidate]) {
-    if candidates.is_empty() {
-        let _ = writeln!(output, "{indent}    <none>");
-        return;
-    }
-
-    for candidate in candidates {
-        let _ = writeln!(
-            output,
-            "{indent}    header=#{} preheader={} kind={} bindings={} body-scope={} control={} continue={} continue-edges={} condition={} exits={} backedges={} blocks={}",
-            candidate.header.index(),
-            format_optional_block(candidate.preheader),
-            format_loop_kind(candidate.kind_hint),
-            format_loop_source_bindings(candidate.source_bindings),
-            format_display_set(&candidate.body_scope_blocks),
-            format_display_set(&candidate.control_blocks),
-            format_optional_block(candidate.continue_target),
-            format_display_set(&candidate.continue_edges),
-            format_optional_block(candidate.condition_header),
-            format_display_set(&candidate.exits),
-            format_display_set(&candidate.backedges),
-            format_display_set(&candidate.blocks),
-        );
-        for value in &candidate.header_value_merges {
-            write_loop_value_merge(output, indent, "header", value);
-        }
-        for exit in &candidate.exit_value_merges {
-            write_loop_exit_value_merge(output, indent, exit);
-        }
-    }
-}
-
-fn write_branch_regions(output: &mut String, indent: &str, facts: &[BranchRegionFact]) {
-    if facts.is_empty() {
-        let _ = writeln!(output, "{indent}    <none>");
-        return;
-    }
-
-    for fact in facts {
-        let structured = fact.explicit_structured_blocks().map_or_else(
-            || {
-                format!(
-                    "dom-subtree(#{}) - dom-subtree(#{})",
-                    fact.header.index(),
-                    fact.merge.index()
-                )
-            },
-            format_display_set,
-        );
-        let _ = writeln!(
-            output,
-            "{indent}    header=#{} kind={} merge=#{} structured={} fence={}",
-            fact.header.index(),
-            format_branch_kind(fact.kind),
-            fact.merge.index(),
-            structured,
-            fact.single_pass_fence.as_ref().map_or_else(
-                || "-".to_string(),
-                |fence| format!(
-                    "exit=#{} escape-edges={}",
-                    fence.exit.index(),
-                    format_display_set(&fence.escape_edges)
-                )
-            ),
-        );
-    }
-}
-
-fn write_generic_phi_materializations(
-    output: &mut String,
-    indent: &str,
-    candidates: impl IntoIterator<Item = GenericPhiMaterialization>,
-) {
-    let mut candidates = candidates.into_iter().peekable();
-    if candidates.peek().is_none() {
-        let _ = writeln!(output, "{indent}    <none>");
-        return;
-    }
-
-    for candidate in candidates {
-        let _ = writeln!(
-            output,
-            "{indent}    block=#{} phi=p{} reg={} source={}",
-            candidate.block.index(),
-            candidate.phi_id.index(),
-            candidate.reg,
-            format_generic_phi_source(candidate.source),
-        );
-    }
-}
-
-fn format_generic_phi_source(source: GenericPhiSource) -> String {
-    match source {
-        GenericPhiSource::IdomExit(block) => format!("idom-exit:#{}", block.index()),
-        GenericPhiSource::Unresolved => "unresolved".to_string(),
-    }
-}
-
-fn write_branch_value_merges(
-    output: &mut String,
-    indent: &str,
-    candidates: &[BranchValueMergeCandidate],
-) {
-    if candidates.is_empty() {
-        let _ = writeln!(output, "{indent}    <none>");
-        return;
-    }
-
-    for candidate in candidates {
-        let _ = writeln!(
-            output,
-            "{indent}    header=#{} merge=#{} values={}",
-            candidate.header.index(),
-            candidate.merge.index(),
-            candidate.values.len(),
-        );
-        for value in &candidate.values {
-            let _ = writeln!(
-                output,
-                "{indent}      phi=p{} reg={} then-preds={} then-values={} then-entry-values={} then-update-values={} else-preds={} else-values={} else-entry-values={} else-update-values={}",
-                value.phi_id.index(),
-                value.reg,
-                format_display_set(&value.then_arm.preds),
-                format_display_set(&value.then_arm.values),
-                format_display_set(&value.then_arm.entry_values),
-                format_display_set(&value.then_arm.update_values),
-                format_display_set(&value.else_arm.preds),
-                format_display_set(&value.else_arm.values),
-                format_display_set(&value.else_arm.entry_values),
-                format_display_set(&value.else_arm.update_values),
-            );
-        }
-    }
-}
-
-fn write_short_circuits(output: &mut String, indent: &str, candidates: &[ShortCircuitCandidate]) {
-    if candidates.is_empty() {
-        let _ = writeln!(output, "{indent}    <none>");
-        return;
-    }
-
-    for candidate in candidates {
-        let _ = writeln!(
-            output,
-            "{indent}    header=#{} entry=n{} nodes={} exit={} result={} phi={} reducible={} blocks={} entry-value={}",
-            candidate.header.index(),
-            candidate.entry.index(),
-            candidate.nodes.len(),
-            format_short_circuit_exit(&candidate.exit),
-            candidate
-                .result_reg
-                .map(|r| r.to_string())
-                .unwrap_or_else(|| "-".to_owned()),
-            candidate
-                .result_phi_id
-                .map(|phi_id| format!("p{}", phi_id.index()))
-                .unwrap_or_else(|| "-".to_owned()),
-            candidate.reducible,
-            format_display_set(&candidate.blocks),
-            candidate
-                .entry_value
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "-".to_string()),
-        );
-        if !candidate.value_incomings.is_empty() {
-            let _ = writeln!(
-                output,
-                "{indent}      value-incomings={}",
-                format_short_circuit_value_incomings(&candidate.value_incomings),
-            );
-        }
-        write_short_circuit_nodes(output, indent, &candidate.nodes);
-    }
-}
-
-fn write_short_circuit_nodes(output: &mut String, indent: &str, nodes: &[ShortCircuitNode]) {
-    if nodes.is_empty() {
-        return;
-    }
-
-    for node in nodes {
-        let _ = writeln!(
-            output,
-            "{indent}      node n{} header=#{} truthy={} falsy={}",
-            node.id.index(),
-            node.header.index(),
-            format_short_circuit_target(&node.truthy),
-            format_short_circuit_target(&node.falsy),
-        );
-    }
-}
-
-fn format_short_circuit_exit(exit: &ShortCircuitExit) -> String {
-    match exit {
-        ShortCircuitExit::ValueMerge(block) => format!("value-merge=#{}", block.index()),
-        ShortCircuitExit::BranchExit { truthy, falsy } => {
-            format!(
-                "branch(truthy=#{} falsy=#{})",
-                truthy.index(),
-                falsy.index()
-            )
-        }
-    }
-}
-
-fn format_short_circuit_value_incomings(incomings: &[ShortCircuitValueIncoming]) -> String {
-    incomings
-        .iter()
-        .map(|incoming| {
-            format!(
-                "{}=>{} local={}",
-                incoming.pred,
-                incoming.value,
-                incoming
-                    .latest_local_def
-                    .map(|def| def.to_string())
-                    .unwrap_or_else(|| "-".to_string())
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn format_short_circuit_target(target: &ShortCircuitTarget) -> String {
-    match target {
-        ShortCircuitTarget::Node(node_ref) => format!("n{}", node_ref.index()),
-        ShortCircuitTarget::Value(block) => format!("value=#{}", block.index()),
-        ShortCircuitTarget::TruthyExit => "truthy-exit".to_owned(),
-        ShortCircuitTarget::FalsyExit => "falsy-exit".to_owned(),
-    }
-}
-
-fn write_gotos(output: &mut String, indent: &str, requirements: &[GotoRequirement]) {
-    if requirements.is_empty() {
-        let _ = writeln!(output, "{indent}    <none>");
-        return;
-    }
-
-    for requirement in requirements {
-        let _ = writeln!(
-            output,
-            "{indent}    edge={} reason={}",
-            requirement.edge,
-            format_goto_reason(requirement.reason),
-        );
-    }
-}
-
-fn write_regions(output: &mut String, indent: &str, regions: &[RegionFact]) {
-    if regions.is_empty() {
-        let _ = writeln!(output, "{indent}    <none>");
-        return;
-    }
-
-    for region in regions {
-        let _ = writeln!(
-            output,
-            "{indent}    entry=#{} kind=irreducible exits={} blocks={}",
-            region.entry.index(),
-            format_display_set(&region.exits),
-            format_display_set(&region.blocks),
-        );
-    }
-}
-
-fn write_scopes(output: &mut String, indent: &str, scopes: &[ScopeCandidate]) {
-    if scopes.is_empty() {
-        let _ = writeln!(output, "{indent}    <none>");
-        return;
-    }
-
-    for scope in scopes {
-        let _ = writeln!(
-            output,
-            "{indent}    entry=#{} kind=block-scope exit={} close-points={}",
-            scope.entry.index(),
-            format_optional_block(scope.exit),
-            format_display_set(&scope.close_points),
-        );
-    }
-}
-
-fn format_optional_block(block: Option<crate::structure::BlockRef>) -> String {
+fn format_optional_block(block: Option<super::BlockRef>) -> String {
     block
         .map(|block| block.to_string())
-        .unwrap_or_else(|| "-".to_string())
+        .unwrap_or_else(|| "-".to_owned())
 }
 
-fn format_branch_kind(kind: super::common::BranchKind) -> &'static str {
+fn format_optional_region(region: Option<RegionId>) -> String {
+    region.map_or_else(|| "-".to_owned(), |region| format!("r{}", region.index()))
+}
+
+fn format_loop_kind(kind: super::LoopKindHint) -> &'static str {
     match kind {
-        super::common::BranchKind::IfThen => "if-then",
-        super::common::BranchKind::IfElse => "if-else",
-        super::common::BranchKind::Guard => "guard",
+        super::LoopKindHint::WhileLike => "while",
+        super::LoopKindHint::WhileTrueLike => "while-true",
+        super::LoopKindHint::RepeatLike => "repeat",
+        super::LoopKindHint::NumericForLike => "numeric-for",
+        super::LoopKindHint::GenericForLike => "generic-for",
+        super::LoopKindHint::Unknown => "unknown",
     }
 }
 
-fn format_loop_kind(kind: super::common::LoopKindHint) -> &'static str {
-    match kind {
-        super::common::LoopKindHint::WhileLike => "while-like",
-        super::common::LoopKindHint::WhileTrueLike => "while-true-like",
-        super::common::LoopKindHint::RepeatLike => "repeat-like",
-        super::common::LoopKindHint::NumericForLike => "numeric-for-like",
-        super::common::LoopKindHint::GenericForLike => "generic-for-like",
-        super::common::LoopKindHint::Unknown => "unknown",
-    }
-}
-
-fn format_loop_source_bindings(bindings: Option<LoopSourceBindings>) -> String {
-    match bindings {
-        Some(LoopSourceBindings::Numeric(reg)) => format!("numeric:{reg}"),
-        Some(LoopSourceBindings::Generic(range)) => format!(
-            "generic:{}..{}",
-            range.start,
-            range.start.index() + range.len
-        ),
-        None => "-".to_owned(),
-    }
-}
-
-fn write_loop_exit_value_merge(
-    output: &mut String,
-    indent: &str,
-    candidate: &LoopExitValueMergeCandidate,
-) {
-    let _ = writeln!(
-        output,
-        "{indent}      exit=#{} values={}",
-        candidate.exit.index(),
-        candidate.values.len(),
-    );
-    for value in &candidate.values {
-        write_loop_value_merge(output, indent, "exit", value);
-    }
-}
-
-fn write_loop_value_merge(output: &mut String, indent: &str, label: &str, value: &LoopValueMerge) {
-    let _ = writeln!(
-        output,
-        "{indent}      {label} phi=p{} reg={} inside-preds={} inside-values={} outside-preds={} outside-values={}",
-        value.phi_id.index(),
-        value.reg,
-        format_display_set(value.inside_arm.preds()),
-        format_display_set(value.inside_arm.values()),
-        format_display_set(value.outside_arm.preds()),
-        format_display_set(value.outside_arm.values()),
-    );
-}
-
-fn format_goto_reason(reason: super::common::GotoReason) -> &'static str {
+fn format_goto_reason(reason: super::GotoReason) -> &'static str {
     match reason {
-        super::common::GotoReason::IrreducibleFlow => "irreducible-flow",
-        super::common::GotoReason::MultiEntryRegion => "multi-entry-region",
-        super::common::GotoReason::UnstructuredBreakLike => "unstructured-break-like",
-        super::common::GotoReason::UnstructuredContinueLike => "unstructured-continue-like",
-        super::common::GotoReason::CrossLoopContinueLike => "cross-loop-continue-like",
+        super::GotoReason::IrreducibleFlow => "irreducible-flow",
+        super::GotoReason::MultiEntryRegion => "multi-entry-region",
+        super::GotoReason::UnstructuredBreakLike => "unstructured-break-like",
+        super::GotoReason::UnstructuredContinueLike => "unstructured-continue-like",
+        super::GotoReason::CrossLoopContinueLike => "cross-loop-continue-like",
     }
 }

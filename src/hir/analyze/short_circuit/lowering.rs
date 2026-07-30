@@ -9,33 +9,16 @@ use super::*;
 pub(crate) fn lower_short_circuit_subject(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,
+    predicate: crate::transformer::InstrRef,
 ) -> Option<HirExpr> {
-    let instr_ref = lowering.cfg.blocks[block.index()].instrs.last()?;
-    let LowInstr::Branch(branch) = &lowering.proto.instrs[instr_ref.index()] else {
+    let LowInstr::Branch(branch) = &lowering.proto.instrs[predicate.index()] else {
         return None;
     };
 
     Some(lower_branch_subject(
         lowering,
         block,
-        instr_ref,
-        branch.cond,
-    ))
-}
-
-pub(crate) fn lower_short_circuit_subject_inline(
-    lowering: &ProtoLowering<'_>,
-    block: BlockRef,
-) -> Option<HirExpr> {
-    let instr_ref = lowering.cfg.blocks[block.index()].instrs.last()?;
-    let LowInstr::Branch(branch) = &lowering.proto.instrs[instr_ref.index()] else {
-        return None;
-    };
-
-    Some(lower_branch_subject_inline(
-        lowering,
-        block,
-        instr_ref,
+        predicate,
         branch.cond,
     ))
 }
@@ -43,75 +26,16 @@ pub(crate) fn lower_short_circuit_subject_inline(
 pub(crate) fn lower_short_circuit_subject_single_eval(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,
+    predicate: crate::transformer::InstrRef,
 ) -> Option<HirExpr> {
-    let instr_ref = lowering.cfg.blocks[block.index()].instrs.last()?;
-    let LowInstr::Branch(branch) = &lowering.proto.instrs[instr_ref.index()] else {
+    let LowInstr::Branch(branch) = &lowering.proto.instrs[predicate.index()] else {
         return None;
     };
 
     Some(lower_branch_subject_single_eval(
         lowering,
         block,
-        instr_ref,
+        predicate,
         branch.cond,
     ))
-}
-
-pub(crate) fn lower_value_leaf_expr(
-    lowering: &ProtoLowering<'_>,
-    short: &ShortCircuitCandidate,
-    block: BlockRef,
-) -> Option<HirExpr> {
-    // 只有当 header 处分支是对 result_reg 的 Truthiness 测试时，subject 才等于
-    // 被保留的旧寄存器值。比较类分支的 subject 是布尔，跳过提前返回让下面的
-    // local def / entry value 路径正确恢复保留值。
-    if short.nodes.iter().any(|node| node.header == block)
-        && header_subject_is_value_carrier(lowering, block, short.result_reg)
-    {
-        return lower_short_circuit_subject_single_eval(lowering, block);
-    }
-
-    let def = value_leaf_latest_local_def(short, block)?;
-    // 优先用 inline（不深度展开 call）来恢复 leaf 值表达式；
-    // 只有 inline 无法给出结果时（例如 Move 指令），才退回 single_eval。
-    //
-    // 避免的问题：GETTABLE 叶子的 base 寄存器是已物化 temp（如 GetBuff 调用结果 t87）时，
-    // single_eval 会沿 expr_for_reg_use_single_eval_with_call_policy(false)
-    // → expr_for_fixed_def(call) 路径把整条 call 链重新展开，生成重复调用的表达式，
-    // 而不是引用已有的 TempRef(t87)。
-    expr_for_fixed_def(lowering, def).or_else(|| expr_for_fixed_def_single_eval(lowering, def))
-}
-
-/// 语句级短路恢复已经先把 leaf block 自己的副作用语句物化出来了。
-///
-/// 因此这里不能再把 leaf 结果重新 inline 成 `call(...)` 之类的表达式，而是应该优先
-/// 引用“这个 block 最后一次给 result_reg 写出的稳定绑定”；若本 block 没有重写它，
-/// 就回退到 block 入口时已经可见的那个值。
-pub(crate) fn lower_materialized_value_leaf_expr(
-    lowering: &ProtoLowering<'_>,
-    short: &ShortCircuitCandidate,
-    block: BlockRef,
-) -> Option<HirExpr> {
-    let reg = short.result_reg?;
-    // 与 lower_value_leaf_expr 同理：只有 Truthiness 测试在 result_reg 上时
-    // subject 才等于保留值。比较类分支跳过，让 local def / entry value 接管。
-    if short.nodes.iter().any(|node| node.header == block)
-        && header_subject_is_value_carrier(lowering, block, short.result_reg)
-    {
-        return lower_short_circuit_subject(lowering, block);
-    }
-
-    if let Some(def) = value_leaf_latest_local_def(short, block) {
-        return Some(HirExpr::TempRef(lowering.bindings.fixed_temps[def.index()]));
-    }
-
-    Some(expr_for_reg_at_block_entry(lowering, block, reg))
-}
-
-fn value_leaf_latest_local_def(short: &ShortCircuitCandidate, block: BlockRef) -> Option<DefId> {
-    short
-        .value_incomings
-        .iter()
-        .find(|incoming| incoming.pred == block)
-        .and_then(|incoming| incoming.latest_local_def)
 }

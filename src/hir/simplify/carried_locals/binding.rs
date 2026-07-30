@@ -4,20 +4,32 @@
 //! `local/temp` 二元 binding 的统一表示，以及把 temp/local 引用批量改写到目标 binding
 //! 的 rewrite pass。这里不判断 handoff 是否安全。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::hir::common::{HirExpr, HirLValue, LocalId, TempId};
+use crate::hir::common::{HirExpr, HirLValue, LocalId, ParamId, TempId};
 
 use super::super::walk::HirRewritePass;
 
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub(super) enum CarryBinding {
+    Param(ParamId),
     Local(LocalId),
     Temp(TempId),
 }
 
+pub(super) trait BindingProtection {
+    fn contains(&self, binding: &CarryBinding) -> bool;
+}
+
+impl BindingProtection for BTreeSet<CarryBinding> {
+    fn contains(&self, binding: &CarryBinding) -> bool {
+        BTreeSet::contains(self, binding)
+    }
+}
+
 pub(super) fn carry_binding_from_expr(expr: &HirExpr) -> Option<CarryBinding> {
     match expr {
+        HirExpr::ParamRef(param) => Some(CarryBinding::Param(*param)),
         HirExpr::LocalRef(local) => Some(CarryBinding::Local(*local)),
         HirExpr::TempRef(temp) => Some(CarryBinding::Temp(*temp)),
         _ => None,
@@ -26,17 +38,16 @@ pub(super) fn carry_binding_from_expr(expr: &HirExpr) -> Option<CarryBinding> {
 
 pub(super) fn carry_binding_from_lvalue(lvalue: &HirLValue) -> Option<CarryBinding> {
     match lvalue {
+        HirLValue::Param(param) => Some(CarryBinding::Param(*param)),
         HirLValue::Local(local) => Some(CarryBinding::Local(*local)),
         HirLValue::Temp(temp) => Some(CarryBinding::Temp(*temp)),
-        HirLValue::Param(_)
-        | HirLValue::Upvalue(_)
-        | HirLValue::Global(_)
-        | HirLValue::TableAccess(_) => None,
+        HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => None,
     }
 }
 
 fn carry_binding_expr(binding: CarryBinding) -> HirExpr {
     match binding {
+        CarryBinding::Param(param) => HirExpr::ParamRef(param),
         CarryBinding::Local(local) => HirExpr::LocalRef(local),
         CarryBinding::Temp(temp) => HirExpr::TempRef(temp),
     }
@@ -44,6 +55,7 @@ fn carry_binding_expr(binding: CarryBinding) -> HirExpr {
 
 fn carry_binding_lvalue(binding: CarryBinding) -> HirLValue {
     match binding {
+        CarryBinding::Param(param) => HirLValue::Param(param),
         CarryBinding::Local(local) => HirLValue::Local(local),
         CarryBinding::Temp(temp) => HirLValue::Temp(temp),
     }
@@ -89,35 +101,6 @@ impl HirRewritePass for BindingClassRewritePass {
     }
 }
 
-pub(super) struct TempToTempPass {
-    pub(super) from: TempId,
-    pub(super) to: TempId,
-}
-
-impl HirRewritePass for TempToTempPass {
-    fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
-        let HirExpr::TempRef(temp) = expr else {
-            return false;
-        };
-        if *temp != self.from {
-            return false;
-        }
-        *expr = HirExpr::TempRef(self.to);
-        true
-    }
-
-    fn rewrite_lvalue(&mut self, lvalue: &mut HirLValue) -> bool {
-        let HirLValue::Temp(temp) = lvalue else {
-            return false;
-        };
-        if *temp != self.from {
-            return false;
-        }
-        *lvalue = HirLValue::Temp(self.to);
-        true
-    }
-}
-
 pub(super) struct TempToBindingPass {
     pub(super) rewrites: Vec<TempBindingRewrite>,
 }
@@ -139,6 +122,7 @@ impl HirRewritePass for TempToBindingPass {
             return false;
         };
         *expr = match binding {
+            CarryBinding::Param(param) => HirExpr::ParamRef(param),
             CarryBinding::Local(local) => HirExpr::LocalRef(local),
             CarryBinding::Temp(temp) => HirExpr::TempRef(temp),
         };
@@ -153,38 +137,10 @@ impl HirRewritePass for TempToBindingPass {
             return false;
         };
         *lvalue = match binding {
+            CarryBinding::Param(param) => HirLValue::Param(param),
             CarryBinding::Local(local) => HirLValue::Local(local),
             CarryBinding::Temp(temp) => HirLValue::Temp(temp),
         };
-        true
-    }
-}
-
-pub(super) struct TempToLocalPass {
-    pub(super) temp: TempId,
-    pub(super) local: LocalId,
-}
-
-impl HirRewritePass for TempToLocalPass {
-    fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
-        let HirExpr::TempRef(temp) = expr else {
-            return false;
-        };
-        if *temp != self.temp {
-            return false;
-        }
-        *expr = HirExpr::LocalRef(self.local);
-        true
-    }
-
-    fn rewrite_lvalue(&mut self, lvalue: &mut HirLValue) -> bool {
-        let HirLValue::Temp(temp) = lvalue else {
-            return false;
-        };
-        if *temp != self.temp {
-            return false;
-        }
-        *lvalue = HirLValue::Local(self.local);
         true
     }
 }

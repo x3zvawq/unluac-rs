@@ -4,7 +4,8 @@ use std::env;
 use std::process;
 
 use unluac_test_support::{
-    UnitSuite, find_unit_case_spec, format_case_failure, run_unit_case, unit_case_specs,
+    LuaCaseVariant, UnitSuite, find_unit_case_spec, format_case_failure, run_unit_case,
+    unit_case_specs,
 };
 
 enum CommandLine {
@@ -14,6 +15,7 @@ enum CommandLine {
         suite: String,
         dialect: String,
         case_path: String,
+        variant: Option<String>,
     },
 }
 
@@ -56,10 +58,11 @@ fn run() -> Result<ExitKind, String> {
         CommandLine::List => {
             for spec in unit_case_specs() {
                 println!(
-                    "{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}",
                     spec.suite.label(),
                     <&'static str>::from(spec.entry.dialect),
-                    spec.entry.path
+                    spec.entry.path,
+                    spec.entry.variant.map_or("", LuaCaseVariant::label),
                 );
             }
             Ok(ExitKind::Success)
@@ -69,16 +72,19 @@ fn run() -> Result<ExitKind, String> {
             suite,
             dialect,
             case_path,
+            variant,
         } => {
             let suite = UnitSuite::parse(&suite)?;
-            let spec = find_unit_case_spec(suite, &dialect, &case_path).ok_or_else(|| {
-                format!(
-                    "unknown unit case spec: suite={}, dialect={}, case={}",
-                    suite.label(),
-                    dialect,
-                    case_path
-                )
-            })?;
+            let spec = find_unit_case_spec(suite, &dialect, &case_path, variant.as_deref())
+                .ok_or_else(|| {
+                    format!(
+                        "unknown unit case spec: suite={}, dialect={}, case={}, variant={}",
+                        suite.label(),
+                        dialect,
+                        case_path,
+                        variant.as_deref().unwrap_or("-")
+                    )
+                })?;
 
             match run_unit_case(spec) {
                 Ok(success) => {
@@ -128,6 +134,7 @@ where
     let mut suite = None;
     let mut dialect = None;
     let mut case_path = None;
+    let mut variant = None;
     let mut cursor = 0;
 
     while cursor < args.len() {
@@ -163,6 +170,14 @@ where
                         .clone(),
                 );
             }
+            "--variant" => {
+                cursor += 1;
+                variant = Some(
+                    args.get(cursor)
+                        .ok_or_else(|| "missing value for `--variant`".to_owned())?
+                        .clone(),
+                );
+            }
             other => {
                 return Err(format!("unsupported unit_case_runner option: {other}"));
             }
@@ -176,9 +191,10 @@ where
             suite,
             dialect,
             case_path,
+            variant,
         }),
         _ => Err(
-            "usage: unit_case_runner --list | unit_case_runner [--report <human|machine>] --suite <suite> --dialect <dialect> --case <path>"
+            "usage: unit_case_runner --list | unit_case_runner [--report <human|machine>] --suite <suite> --dialect <dialect> --case <path> [--variant <variant>]"
                 .to_owned(),
         ),
     }

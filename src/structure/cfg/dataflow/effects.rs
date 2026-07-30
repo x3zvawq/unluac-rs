@@ -1,6 +1,10 @@
 use super::*;
+use crate::structure::StructureError;
 
-pub(super) fn compute_reg_count(proto: &LoweredProto, instr_effects: &[InstrEffect]) -> usize {
+pub(super) fn compute_reg_count(
+    proto: &LoweredProto,
+    instr_effects: &[InstrEffect],
+) -> Result<usize, StructureError> {
     let mut max_reg = proto.frame.max_stack_size as usize;
 
     for effect in instr_effects {
@@ -9,18 +13,31 @@ pub(super) fn compute_reg_count(proto: &LoweredProto, instr_effects: &[InstrEffe
             .iter()
             .chain(effect.fixed_must_defs.iter())
         {
-            max_reg = max_reg.max(reg.index() + 1);
+            let Some(end) = reg.index().checked_add(1) else {
+                return Err(StructureError::invalid("register index overflows usize"));
+            };
+            max_reg = max_reg.max(end);
         }
 
         if let Some(reg) = effect.open_use {
-            max_reg = max_reg.max(reg.index() + 1);
+            let Some(end) = reg.index().checked_add(1) else {
+                return Err(StructureError::invalid(
+                    "open-use register index overflows usize",
+                ));
+            };
+            max_reg = max_reg.max(end);
         }
         if let Some(reg) = effect.open_must_def {
-            max_reg = max_reg.max(reg.index() + 1);
+            let Some(end) = reg.index().checked_add(1) else {
+                return Err(StructureError::invalid(
+                    "open-def register index overflows usize",
+                ));
+            };
+            max_reg = max_reg.max(end);
         }
     }
 
-    max_reg
+    Ok(max_reg)
 }
 
 pub(super) fn compute_instr_effect(instr: &LowInstr) -> InstrEffect {

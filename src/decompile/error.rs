@@ -9,7 +9,9 @@ use super::state::DecompileStage;
 use crate::ast::AstLowerError;
 use crate::ast::NamingError;
 use crate::generate::GenerateError;
+use crate::hir::HirLowerError;
 use crate::parser::ParseError;
+use crate::structure::StructureError;
 use crate::transformer::TransformError;
 
 /// 主反编译 pipeline 可能返回的错误。
@@ -25,6 +27,10 @@ pub enum DecompileError {
     Naming(#[from] NamingError),
     #[error(transparent)]
     Generate(#[from] GenerateError),
+    #[error(transparent)]
+    Hir(#[from] HirLowerError),
+    #[error(transparent)]
+    Structure(#[from] StructureError),
     #[error(
         "stage `{stage}` is not implemented yet; pipeline currently stops after `{completed_stage}`"
     )]

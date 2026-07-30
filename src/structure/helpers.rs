@@ -15,10 +15,26 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
-use crate::structure::{BlockRef, Cfg, DominatorTree, EdgeRef};
+use crate::structure::{BlockRef, Cfg, DominatorTree, EdgeKind, EdgeRef};
 use crate::transformer::{LowInstr, LoweredProto};
 
 use super::common::IrreducibleRegion;
+
+/// 返回共享的纯 terminal block 所代表的控制语义。
+///
+/// 这种 block 只有一条 Return/TailCall 指令；非自然边可以在源处执行 phi copy 后
+/// 直接物化同一 terminal，而自然路径仍由该 block 的唯一 containment owner 发射。
+pub(super) fn shared_pure_terminal_kind(cfg: &Cfg, block: BlockRef) -> Option<EdgeKind> {
+    if cfg.preds.get(block.index())?.len() < 2 || cfg.blocks.get(block.index())?.instrs.len != 1 {
+        return None;
+    }
+    let [edge] = cfg.succs.get(block.index())?.as_slice() else {
+        return None;
+    };
+    let edge = cfg.edges.get(edge.index())?;
+    (edge.to == cfg.exit_block && matches!(edge.kind, EdgeKind::Return | EdgeKind::TailCall))
+        .then_some(edge.kind)
+}
 
 pub(super) fn block_has_non_control_prefix(
     proto: &LoweredProto,
@@ -47,6 +63,88 @@ pub(super) fn block_has_non_control_prefix(
         range.end()
     };
     range.start.index() < body_end
+}
+
+pub(super) fn control_prefix_is_movable(proto: &LoweredProto, cfg: &Cfg, block: BlockRef) -> bool {
+    let range = cfg.blocks[block.index()].instrs;
+    let body_end = range.last().map_or(range.end(), |last| {
+        if proto.instrs[last.index()].is_control_terminator() {
+            range.end() - 1
+        } else {
+            range.end()
+        }
+    });
+    (range.start.index()..body_end).all(|index| {
+        matches!(
+            proto.instrs[index],
+            LowInstr::LoadNil(_)
+                | LowInstr::LoadBool(_)
+                | LowInstr::LoadConst(_)
+                | LowInstr::LoadInteger(_)
+                | LowInstr::LoadNumber(_)
+        )
+    })
+}
+
+pub(super) fn same_or_transparent_jump_target(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    actual: crate::transformer::InstrRef,
+    expected: crate::transformer::InstrRef,
+) -> bool {
+    if actual == expected {
+        return true;
+    }
+    let block = cfg.instr_to_block[actual.index()];
+    let range = cfg.blocks[block.index()].instrs;
+    range.len == 1
+        && matches!(
+            cfg.terminator(&proto.instrs, block),
+            Some(LowInstr::Jump(jump))
+                if cfg.instr_to_block[jump.target.index()]
+                    == cfg.instr_to_block[expected.index()]
+        )
+}
+
+pub(super) fn equivalent_single_return_targets(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    actual: crate::transformer::InstrRef,
+    expected: crate::transformer::InstrRef,
+) -> bool {
+    let block = cfg.instr_to_block[actual.index()];
+    let expected_block = cfg.instr_to_block[expected.index()];
+    cfg.blocks[block.index()].instrs.len == 1
+        && cfg.blocks[expected_block.index()].instrs.len == 1
+        && matches!(
+            (
+                cfg.terminator(&proto.instrs, block),
+                cfg.terminator(&proto.instrs, expected_block),
+            ),
+            (Some(LowInstr::Return(actual)), Some(LowInstr::Return(expected)))
+                if actual == expected
+        )
+}
+
+/// 两个 VM target 可以各自先经过一个透明 jump pad，再汇入同一 block。
+pub(super) fn share_transparent_jump_target(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    left: crate::transformer::InstrRef,
+    right: crate::transformer::InstrRef,
+) -> bool {
+    let transparent_target = |instr: crate::transformer::InstrRef| {
+        let block = cfg.instr_to_block[instr.index()];
+        let range = cfg.blocks[block.index()].instrs;
+        if range.len == 1
+            && let Some(LowInstr::Jump(jump)) = cfg.terminator(&proto.instrs, block)
+        {
+            cfg.instr_to_block[jump.target.index()]
+        } else {
+            block
+        }
+    };
+    transparent_target(left) == transparent_target(right)
 }
 
 pub(super) fn collect_region_exits(cfg: &Cfg, blocks: &BTreeSet<BlockRef>) -> BTreeSet<BlockRef> {
@@ -113,35 +211,6 @@ pub(super) fn collect_forward_region_blocks(
     }
 
     blocks
-}
-
-/// 收集 `allowed_blocks` 内所有能到达任一 `target` 的 block。
-///
-/// 这和 `can_reach_within(block, target, allowed_blocks)` 的判定边界一致，只是把同一
-/// target 的多次 reachability 查询折成一份共享闭包，适合 branch/loop pass 在同一
-/// region 内反复问“哪些入口仍属于本轮 shared tail”。
-pub(super) fn collect_reverse_reachable_blocks(
-    cfg: &Cfg,
-    allowed_blocks: &BTreeSet<BlockRef>,
-    targets: impl IntoIterator<Item = BlockRef>,
-) -> BTreeSet<BlockRef> {
-    let mut reachable = BTreeSet::new();
-    let mut worklist = targets.into_iter().collect::<VecDeque<_>>();
-
-    while let Some(block) = worklist.pop_front() {
-        if !reachable.insert(block) {
-            continue;
-        }
-
-        for edge_ref in &cfg.preds[block.index()] {
-            let pred = cfg.edges[edge_ref.index()].from;
-            if cfg.reachable_blocks.contains(&pred) && allowed_blocks.contains(&pred) {
-                worklist.push_back(pred);
-            }
-        }
-    }
-
-    reachable
 }
 
 pub(super) fn collect_region_predecessors_to_target(
@@ -243,11 +312,9 @@ pub(super) fn compute_irreducible_regions(cfg: &Cfg) -> Vec<IrreducibleRegion> {
             continue;
         }
 
-        let entry = component
-            .iter()
-            .copied()
-            .min()
-            .expect("irreducible component should not be empty");
+        let Some(entry) = component.iter().copied().min() else {
+            continue;
+        };
         irreducible_regions.push(IrreducibleRegion {
             entry,
             blocks: component,

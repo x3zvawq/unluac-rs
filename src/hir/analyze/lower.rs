@@ -1,29 +1,26 @@
 //! 这个文件承载 HIR 初始恢复里真正的 lowering 内核。
 //!
 //! 外层 [analyze.rs](/Users/x3zvawq/workspace/unluac-rs/src/hir/analyze/mod.rs) 只负责组织模块和
-//! 暴露主入口，这里集中放 proto 递归构造、线性 block 降低、edge phi copy 和 phi
-//! 物化。单条 low-IR 指令到 HIR 语句的映射由 `instrs.rs` 负责，避免主流程再次
-//! 膨胀成所有 lowering 细节的集合。
+//! 暴露主入口，这里集中放 proto 递归构造和共享 lowering 上下文。final edge 的 phi
+//! copy 由 plan 执行器消费；单条 low-IR 指令到 HIR 语句的映射由 `instrs.rs` 负责，
+//! 避免主流程再次膨胀成所有 lowering 细节的集合。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use super::super::promotion::{ProtoPromotionFacts, SlotEpochFacts};
 use super::bindings::build_bindings;
-use super::exprs::{expr_for_reg_at_block_exit, expr_for_ssa_value};
-use super::helpers::{assign_stmt, decode_raw_string, empty_proto, unresolved_expr};
+use super::helpers::{decode_raw_string, empty_proto};
 use super::instrs::local_decl_stmts;
-use super::short_circuit::{
-    recover_short_value_merge_expr_recovery_with_allowed_blocks, value_merge_candidates_in_block,
-};
 use super::structure::build_structured_body;
 use crate::ast::AstTargetDialect;
 use crate::decompile::{DecompileContext, DecompileState};
+use crate::hir::HirLowerError;
 use crate::hir::common::{
     HirBlock, HirClosureExpr, HirExpr, HirLValue, HirLocalDecl, HirProto, HirProtoRef, HirStmt,
     HirValuePack, LocalId, ParamId, TempId, UpvalueId,
 };
-use crate::structure::{BlockRef, Cfg, CfgGraph, DataflowFacts, GraphFacts, OpenDefId, PhiId};
-use crate::structure::{ShortCircuitExit, StructureFacts};
+use crate::structure::StructureFacts;
+use crate::structure::{BlockRef, Cfg, CfgGraph, DataflowFacts, GraphFacts, OpenDefId};
 use crate::transformer::{
     AccessBase, AccessKey, CallKind, ClosureCreation, GetTableKind, InstrRef, LowInstr,
     LoweredProto, ProtoRef, Reg, ResultPack, SharedClosureRef, ValuePack,
@@ -40,11 +37,14 @@ pub(super) struct ProtoBindings {
     pub(super) temp_debug_locals: Vec<Option<String>>,
     pub(super) fixed_temps: Vec<TempId>,
     pub(super) phi_temps: Vec<TempId>,
+    pub(super) loop_guard_temps: Vec<Option<TempId>>,
+    pub(super) repeat_staged_temps: Vec<Vec<TempId>>,
     pub(super) instr_fixed_defs: Vec<Vec<TempId>>,
     pub(super) captured_temp_targets: BTreeMap<TempId, BoundSlotTarget>,
     pub(super) captured_temp_decl_locals: BTreeMap<TempId, LocalId>,
     pub(super) capture_empty_local_decls: BTreeMap<usize, Vec<LocalId>>,
     pub(super) capture_entry_local_decls: Vec<LocalId>,
+    pub(super) capture_region_local_decls: BTreeMap<crate::structure::RegionId, Vec<LocalId>>,
     pub(super) closure_capture_targets: BTreeMap<(usize, usize), BoundSlotTarget>,
     pub(super) reference_captured_regs: Vec<bool>,
     pub(super) entry_local_regs: BTreeMap<Reg, LocalId>,
@@ -116,7 +116,6 @@ pub(super) struct ProtoLowering<'a> {
     pub(super) target: AstTargetDialect,
     pub(super) proto: &'a LoweredProto,
     pub(super) cfg: &'a Cfg,
-    pub(super) graph_facts: &'a GraphFacts,
     pub(super) dataflow: &'a DataflowFacts,
     pub(super) structure: &'a StructureFacts,
     pub(super) child_refs: &'a [HirProtoRef],
@@ -155,7 +154,7 @@ pub(super) fn lower_proto(
         dataflow,
         structure,
         artifacts,
-    )
+    )?
     .id)
 }
 
@@ -167,7 +166,7 @@ fn lower_proto_node(
     dataflow: &DataflowFacts,
     structure: &StructureFacts,
     artifacts: &mut LowerArtifacts,
-) -> LoweredProtoResult {
+) -> Result<LoweredProtoResult, HirLowerError> {
     let cfg = &cfg_graph.cfg;
     let id = HirProtoRef(artifacts.protos.len());
     artifacts.protos.push(empty_proto(id));
@@ -195,7 +194,7 @@ fn lower_proto_node(
                 )
             },
         )
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     let child_refs = child_results
         .iter()
         .map(|child| child.id)
@@ -226,7 +225,6 @@ fn lower_proto_node(
         target,
         proto,
         cfg,
-        graph_facts,
         dataflow,
         structure,
         child_refs: &child_refs,
@@ -249,16 +247,16 @@ fn lower_proto_node(
         upvalue_debug_hints: lowering.bindings.upvalue_debug_hints.clone(),
         temps: lowering.bindings.temps.clone(),
         temp_debug_locals: lowering.bindings.temp_debug_locals.clone(),
-        body: build_proto_body(target, &lowering),
+        body: build_proto_body(id, &lowering)?,
         children: child_refs,
     };
     artifacts.promotion_facts[id.index()] =
-        ProtoPromotionFacts::from_dataflow(dataflow, &slot_epochs);
+        ProtoPromotionFacts::from_plan(dataflow, structure.plan(), &slot_epochs);
 
-    LoweredProtoResult {
+    Ok(LoweredProtoResult {
         id,
         mutable_upvalues: mutable_upvalues_for_proto(proto, &child_mutable_upvalues),
-    }
+    })
 }
 
 fn mutable_upvalues_for_proto(
@@ -343,11 +341,9 @@ fn build_open_pack_owners(
         if sources.has_entry() || sources.defs().len() != 1 {
             continue;
         }
-        let def_id = *sources
-            .defs()
-            .iter()
-            .next()
-            .expect("single open source checked above");
+        let Some(def_id) = sources.defs().iter().next().copied() else {
+            continue;
+        };
         let Some(def) = dataflow.open_defs.get(def_id.index()) else {
             continue;
         };
@@ -548,8 +544,11 @@ impl ProtoLowering<'_> {
     }
 }
 
-fn build_proto_body(target: AstTargetDialect, lowering: &ProtoLowering<'_>) -> HirBlock {
-    let mut body = build_structured_body(target, lowering);
+fn build_proto_body(
+    proto: HirProtoRef,
+    lowering: &ProtoLowering<'_>,
+) -> Result<HirBlock, HirLowerError> {
+    let mut body = build_structured_body(proto, lowering)?;
     let mut prefix = local_decl_stmts(lowering.bindings.capture_entry_local_decls.clone());
     prefix.extend(
         lowering
@@ -567,124 +566,5 @@ fn build_proto_body(target: AstTargetDialect, lowering: &ProtoLowering<'_>) -> H
     );
     prefix.append(&mut body.stmts);
     body.stmts = prefix;
-    body
-}
-
-pub(super) fn lower_edge_phi_copies_for_edge(
-    lowering: &ProtoLowering<'_>,
-    edge_ref: crate::structure::EdgeRef,
-) -> Vec<HirStmt> {
-    let copies = lowering.structure.phi_edge_copies(edge_ref);
-    if copies.is_empty() {
-        return Vec::new();
-    }
-
-    let (targets, values): (Vec<HirLValue>, Vec<HirExpr>) = copies
-        .iter()
-        .map(|copy| {
-            (
-                HirLValue::Temp(lowering.bindings.phi_temps[copy.phi_id.index()]),
-                expr_for_ssa_value(lowering, copy.value),
-            )
-        })
-        .unzip();
-    vec![assign_stmt(targets, values)]
-}
-
-/// 某些结构化路径会先把短路 header 的前缀语句物化出来，再跳到 merge block。
-///
-/// 这时 merge 上的 phi 表达式虽然跨过了候选区域，但其中引用的 header 临时值其实已经
-/// 在当前 HIR 位置稳定存在。这里额外接收一组 `allowed_blocks`，显式告诉 phi 恢复逻辑
-/// 哪些 block 的临时值已经“在更早的语句里落地”，避免把简单 `a and b` / `a or b`
-/// 错误地退化回 `if + assign`。
-pub(super) fn lower_phi_materialization_with_allowed_blocks_except(
-    lowering: &ProtoLowering<'_>,
-    block: BlockRef,
-    is_suppressed: impl Fn(PhiId) -> bool,
-    allowed_blocks: &BTreeSet<BlockRef>,
-) -> Vec<HirStmt> {
-    let mut stmts = Vec::new();
-    let mut covered_phi_ids = BTreeSet::new();
-    let mut short_value_merges =
-        value_merge_candidates_in_block(lowering, block).collect::<Vec<_>>();
-    short_value_merges.sort_by_key(|candidate| match candidate.result_phi_id {
-        Some(phi_id) => phi_id,
-        None => unreachable!("value-merge short-circuit should carry a phi id"),
-    });
-
-    for short in short_value_merges {
-        let Some(phi_id) = short.result_phi_id else {
-            unreachable!("value-merge short-circuit should carry a phi id");
-        };
-        if is_suppressed(phi_id)
-            || lowering.structure.phi_is_dead(phi_id)
-            || lowering.structure.phi_is_edge_owned(phi_id)
-        {
-            continue;
-        }
-
-        let ShortCircuitExit::ValueMerge(merge) = short.exit else {
-            unreachable!("value merge candidate iterator should only yield value merges");
-        };
-        let Some(reg) = short.result_reg else {
-            unreachable!("value merge short-circuit should carry a result reg");
-        };
-        let Some(temp) = lowering.bindings.phi_temps.get(phi_id.index()).copied() else {
-            unreachable!("every phi id should have a temp binding");
-        };
-        covered_phi_ids.insert(phi_id);
-        let value = recover_short_value_merge_expr_recovery_with_allowed_blocks(
-            lowering,
-            short,
-            allowed_blocks,
-        )
-        .and_then(|recovery| recovery.into_expr_without_subject_consumption())
-        .unwrap_or_else(|| unresolved_phi_expr("short-circuit value merge", merge, reg));
-        stmts.push(assign_stmt(vec![HirLValue::Temp(temp)], vec![value]));
-    }
-
-    stmts.extend(
-        lowering
-            .structure
-            .generic_phi_materializations_in_block(block)
-            .iter()
-            .copied()
-            .filter(|phi| !is_suppressed(phi.phi_id))
-            .filter(|phi| !lowering.structure.phi_is_dead(phi.phi_id))
-            .filter(|phi| !lowering.structure.phi_is_edge_owned(phi.phi_id))
-            .filter(|phi| !covered_phi_ids.contains(&phi.phi_id))
-            .filter_map(|phi| {
-                let temp = lowering
-                    .bindings
-                    .phi_temps
-                    .get(phi.phi_id.index())
-                    .copied()?;
-                let value = generic_phi_materialization_value(lowering, phi);
-                Some(assign_stmt(vec![HirLValue::Temp(temp)], vec![value]))
-            }),
-    );
-
-    stmts
-}
-
-fn generic_phi_materialization_value(
-    lowering: &ProtoLowering<'_>,
-    phi: crate::structure::GenericPhiMaterialization,
-) -> HirExpr {
-    match phi.source {
-        crate::structure::GenericPhiSource::IdomExit(source) => {
-            expr_for_reg_at_block_exit(lowering, source, phi.reg)
-        }
-        crate::structure::GenericPhiSource::Unresolved => {
-            unresolved_phi_expr("generic phi", phi.block, phi.reg)
-        }
-    }
-}
-
-fn unresolved_phi_expr(reason: &str, block: BlockRef, reg: Reg) -> HirExpr {
-    unresolved_expr(format!(
-        "{reason} block=#{} reg=r{}",
-        block.index(),
-        reg.index()
-    ))
+    Ok(body)
 }

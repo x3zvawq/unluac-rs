@@ -198,6 +198,11 @@ fn merge_adjacent_single_value_local_decls(block: &mut AstBlock) -> bool {
 fn sink_hoisted_temp_decls(block: &mut AstBlock) -> bool {
     let use_index = BindingUseIndex::for_stmts(&block.stmts);
     let forward_gotos = ForwardGotoIndex::new(&block.stmts);
+    if forward_gotos.has_backward_goto {
+        // backward goto 把当前 block 变成显式 CFG：hoisted temp 可能是回边上的 phi
+        // 槽。把声明沉进任一分支会创建不同的词法 local，破坏 label 后读取的值。
+        return false;
+    }
     let mut index = 0;
     while index < block.stmts.len() {
         let Some(pending_bindings) = hoisted_temp_bindings(&block.stmts[index]) else {
@@ -876,6 +881,7 @@ fn local_binding_matches_target(binding: AstBindingRef, target: &AstLValue) -> b
 
 struct ForwardGotoIndex {
     has_forward_goto_past_index: Vec<bool>,
+    has_backward_goto: bool,
 }
 
 impl ForwardGotoIndex {
@@ -888,6 +894,21 @@ impl ForwardGotoIndex {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        let label_positions = labels_by_stmt
+            .iter()
+            .enumerate()
+            .filter_map(|(index, label)| label.map(|label| (label, index)))
+            .collect::<BTreeMap<_, _>>();
+        let has_backward_goto = goto_targets_by_stmt
+            .iter()
+            .enumerate()
+            .any(|(index, targets)| {
+                targets.iter().any(|target| {
+                    label_positions
+                        .get(target)
+                        .is_some_and(|label_index| *label_index < index)
+                })
+            });
 
         let mut future_labels: BTreeSet<AstLabelId> =
             labels_by_stmt.iter().skip(1).flatten().copied().collect();
@@ -914,6 +935,7 @@ impl ForwardGotoIndex {
 
         Self {
             has_forward_goto_past_index,
+            has_backward_goto,
         }
     }
 

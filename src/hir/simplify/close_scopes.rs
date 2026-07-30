@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 use crate::hir::common::{
     HirBlock, HirExpr, HirLValue, HirLabelId, HirProto, HirStmt, LocalId, TempId,
 };
+use crate::transformer::InstrRef;
 
 use super::label_refs::count_label_references;
 use super::visit::{HirVisitor, visit_stmts};
@@ -41,6 +42,7 @@ enum ScopeBinding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ScopeStart {
     start: usize,
+    origin: InstrRef,
     reg_index: usize,
     binding: ScopeBinding,
 }
@@ -120,6 +122,7 @@ fn collect_scope_intervals(stmts: &[HirStmt]) -> Vec<ScopeInterval> {
                 scope_start.start,
                 scope_start.start + 2,
                 scope_start.binding,
+                scope_start.origin,
                 scope_start.reg_index,
             )?;
             (scope_start.start < scope_end.end).then_some(ScopeInterval {
@@ -147,6 +150,7 @@ fn scope_start(stmts: &[HirStmt], index: usize) -> Option<ScopeStart> {
             Some(HirStmt::ToBeClosed(to_be_closed)),
         ) => binding_from_expr(&to_be_closed.value).map(|binding| ScopeStart {
             start: index,
+            origin: to_be_closed.origin,
             reg_index: to_be_closed.reg_index,
             binding,
         }),
@@ -167,6 +171,7 @@ fn find_scope_end(
     scope_start: usize,
     start_index: usize,
     binding: ScopeBinding,
+    origin: InstrRef,
     reg_index: usize,
 ) -> Option<ScopeEnd> {
     if let Some(scope_end) =
@@ -184,6 +189,7 @@ fn find_scope_end(
     // 当成 scope 末端会把后续仍在同一 scope 内的表达式错误地挤出块外。
     let mut last_scope_close = None;
     let mut covering_close_indices = Vec::new();
+    let label_scope_end = active_label_scope_end(stmts, start_index, origin);
 
     for (index, stmt) in stmts.iter().enumerate().skip(start_index) {
         if let HirStmt::Close(close) = stmt
@@ -205,7 +211,7 @@ fn find_scope_end(
     if let Some(close_idx) = last_scope_close {
         // composite close 同时终结多个嵌套 TBC scope；所有 interval 会在重建前一次收集，
         // 因此最内层可以消费这条 VM cleanup，外层仍由自己的词法 block 结束来表达。
-        let end = close_idx + 1;
+        let end = label_scope_end.map_or(close_idx + 1, |label_end| label_end.max(close_idx + 1));
         let end = last_activity.map_or(end, |la| la.max(end));
         // 同一 TBC scope 内可能有多个 goto/分支 cleanup，只消费最终词法区间实际覆盖的
         // close；区间之外的 cleanup 继续由对应 sibling/outer interval 接管。
@@ -217,13 +223,43 @@ fn find_scope_end(
     }
 
     if saw_close {
-        last_activity.map(|end| ScopeEnd {
+        last_activity.or(label_scope_end).map(|end| ScopeEnd {
             end,
             covering_close_indices,
         })
     } else {
         None
     }
+}
+
+/// label 的 TBC active-set 是 Structure 冻结的词法事实。物理 layout 中较早的 exit
+/// cleanup 只属于对应 goto path；只要后面的 label 仍携带同一 origin，整个连续片段
+/// 就必须留在该 `<close>` block 内，不能把那条 cleanup 当作线性 scope 末端。
+fn active_label_scope_end(
+    stmts: &[HirStmt],
+    start_index: usize,
+    origin: InstrRef,
+) -> Option<usize> {
+    let mut saw_active = false;
+    let mut saw_inactive = false;
+    for (index, stmt) in stmts.iter().enumerate().skip(start_index) {
+        let HirStmt::Label(label) = stmt else {
+            continue;
+        };
+        if label.tbc_barriers.contains(&origin) {
+            if saw_inactive {
+                // 一个词法 block 无法跨过 inactive label 后再次激活同一声明；保留旧
+                // 边界，让最终 verifier 明确拒绝，而不是猜一个错误的包围范围。
+                return None;
+            }
+            saw_active = true;
+        } else if saw_active {
+            return Some(index);
+        } else {
+            saw_inactive = true;
+        }
+    }
+    saw_active.then_some(stmts.len())
 }
 
 fn externally_entered_scope_end(
@@ -236,7 +272,7 @@ fn externally_entered_scope_end(
     // 以匹配的 VM Close 开始，该 label 就是作用域硬边界。其他可消费 Close 只取
     // 块内真实 goto 出口，避免同一物理寄存器后续复用时误删 sibling cleanup。
     let external_targets = goto_targets(&stmts[..scope_start]);
-    let (end, external_target) =
+    let (scope_end, external_target) =
         stmts
             .iter()
             .enumerate()
@@ -251,21 +287,26 @@ fn externally_entered_scope_end(
                         scope_boundary_for_external_label(stmts, search_start, index, reg_index)
                     })
                     .flatten()
-                    .map(|boundary| (boundary, label.id))
+                    .map(|scope_end| (scope_end, label.id))
             })?;
+    let end = scope_end.end;
 
     let mut exit_targets = goto_targets(&stmts[scope_start..end]);
     exit_targets.insert(external_target);
-    let covering_close_indices = stmts
-        .iter()
-        .enumerate()
-        .skip(end)
-        .filter_map(|(index, stmt)| match stmt {
-            HirStmt::Label(label) if exit_targets.contains(&label.id) => Some(index),
-            _ => None,
-        })
-        .flat_map(|index| covering_closes_after_label(stmts, index, reg_index))
-        .collect();
+    let mut covering_close_indices = scope_end.covering_close_indices;
+    covering_close_indices.extend(
+        stmts
+            .iter()
+            .enumerate()
+            .skip(end)
+            .filter_map(|(index, stmt)| match stmt {
+                HirStmt::Label(label) if exit_targets.contains(&label.id) => Some(index),
+                _ => None,
+            })
+            .flat_map(|index| covering_closes_after_label(stmts, index, reg_index)),
+    );
+    covering_close_indices.sort_unstable();
+    covering_close_indices.dedup();
     Some(ScopeEnd {
         end,
         covering_close_indices,
@@ -277,20 +318,44 @@ fn scope_boundary_for_external_label(
     search_start: usize,
     label_index: usize,
     reg_index: usize,
-) -> Option<usize> {
-    if !covering_closes_after_label(stmts, label_index, reg_index).is_empty() {
-        return Some(label_index);
+) -> Option<ScopeEnd> {
+    let closes_after = covering_closes_after_label(stmts, label_index, reg_index);
+    if !closes_after.is_empty() {
+        return Some(ScopeEnd {
+            end: label_index,
+            covering_close_indices: closes_after,
+        });
+    }
+
+    // PUC 5.4 也会把离开 `<close>` 块的 cleanup 放在目标 label 之前。label 本身
+    // 已在局部作用域之外，interval 必须截止到第一条 cleanup，并把这段 cleanup
+    // 作为词法块 owner 消费，不能把外部 goto 的目标一起包进 do block。
+    let close_start = (search_start..label_index)
+        .rev()
+        .take_while(|index| {
+            matches!(stmts[*index], HirStmt::Close(ref close) if close.from_reg != 0 && close.from_reg <= reg_index)
+        })
+        .last();
+    if let Some(close_start) = close_start {
+        return Some(ScopeEnd {
+            end: close_start,
+            covering_close_indices: (close_start..label_index).collect(),
+        });
     }
 
     let cleanup_label = (search_start..label_index)
         .rev()
         .find(|index| matches!(stmts[*index], HirStmt::Label(_)))?;
     let cleanup = &stmts[cleanup_label + 1..label_index];
-    (!cleanup.is_empty()
+    let covering_close_indices = (!cleanup.is_empty()
         && cleanup.iter().all(|stmt| {
             matches!(stmt, HirStmt::Close(close) if close.from_reg != 0 && close.from_reg <= reg_index)
         }))
-    .then_some(cleanup_label)
+    .then(|| (cleanup_label + 1..label_index).collect::<Vec<_>>())?;
+    Some(ScopeEnd {
+        end: cleanup_label,
+        covering_close_indices,
+    })
 }
 
 fn covering_closes_after_label(

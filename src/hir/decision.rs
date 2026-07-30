@@ -19,11 +19,3 @@ pub(in crate::hir) fn finalize_value_decision_expr(decision: HirDecisionExpr) ->
     super::simplify::decision::collapse_value_decision_expr(&decision)
         .unwrap_or_else(|| HirExpr::Decision(Box::new(decision)))
 }
-
-pub(in crate::hir) fn decision_is_synth_safe(decision: &HirDecisionExpr) -> bool {
-    super::simplify::decision::decision_is_synth_safe(decision)
-}
-
-pub(in crate::hir) fn expr_truthiness(expr: &HirExpr) -> Option<bool> {
-    super::simplify::expr_truthiness(expr)
-}

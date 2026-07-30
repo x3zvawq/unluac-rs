@@ -5,6 +5,10 @@
 //! 例如：`local r0 = print; r0(1)` 选定站点后，会在这里把 `r0` 改成 `print`。
 
 use super::*;
+pub(super) use crate::hir::rewrite::replace_temp_in_expr;
+use crate::hir::rewrite::{
+    replace_temp_in_call as replace_temp_in_call_expr, replace_temp_in_value_pack,
+};
 
 pub(super) fn replace_temp_in_stmt(stmt: &mut HirStmt, temp: TempId, replacement: &HirExpr) {
     match stmt {
@@ -28,7 +32,7 @@ pub(super) fn replace_temp_in_stmt(stmt: &mut HirStmt, temp: TempId, replacement
             replace_temp_in_expr(&mut to_be_closed.value, temp, replacement);
         }
         HirStmt::CallStmt(call_stmt) => {
-            replace_temp_in_call_expr(&mut call_stmt.call, temp, replacement)
+            replace_temp_in_call_expr(&mut call_stmt.call, temp, replacement);
         }
         HirStmt::Return(ret) => {
             replace_temp_in_value_pack(&mut ret.values, temp, replacement);
@@ -73,109 +77,9 @@ fn replace_temp_in_block(block: &mut HirBlock, temp: TempId, replacement: &HirEx
     }
 }
 
-fn replace_temp_in_call_expr(call: &mut HirCallExpr, temp: TempId, replacement: &HirExpr) {
-    replace_temp_in_expr(&mut call.callee, temp, replacement);
-    replace_temp_in_value_pack(&mut call.args, temp, replacement);
-}
-
-fn replace_temp_in_value_pack(pack: &mut HirValuePack, temp: TempId, replacement: &HirExpr) {
-    for arg in &mut pack.fixed {
-        replace_temp_in_expr(arg, temp, replacement);
-    }
-    if let Some(call) = pack.tail.as_mut().and_then(HirPackTail::call_mut) {
-        replace_temp_in_call_expr(call, temp, replacement);
-    }
-}
-
 fn replace_temp_in_lvalue(lvalue: &mut HirLValue, temp: TempId, replacement: &HirExpr) {
     if let HirLValue::TableAccess(access) = lvalue {
         replace_temp_in_expr(&mut access.base, temp, replacement);
         replace_temp_in_expr(&mut access.key, temp, replacement);
-    }
-}
-
-pub(super) fn replace_temp_in_expr(expr: &mut HirExpr, temp: TempId, replacement: &HirExpr) {
-    match expr {
-        HirExpr::TempRef(other) if *other == temp => {
-            *expr = replacement.clone();
-        }
-        HirExpr::TableAccess(access) => {
-            replace_temp_in_expr(&mut access.base, temp, replacement);
-            replace_temp_in_expr(&mut access.key, temp, replacement);
-        }
-        HirExpr::Unary(unary) => replace_temp_in_expr(&mut unary.expr, temp, replacement),
-        HirExpr::Binary(binary) => {
-            replace_temp_in_expr(&mut binary.lhs, temp, replacement);
-            replace_temp_in_expr(&mut binary.rhs, temp, replacement);
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            replace_temp_in_expr(&mut logical.lhs, temp, replacement);
-            replace_temp_in_expr(&mut logical.rhs, temp, replacement);
-        }
-        HirExpr::Decision(decision) => {
-            for node in &mut decision.nodes {
-                replace_temp_in_expr(&mut node.test, temp, replacement);
-                replace_temp_in_decision_target(&mut node.truthy, temp, replacement);
-                replace_temp_in_decision_target(&mut node.falsy, temp, replacement);
-            }
-        }
-        HirExpr::Call(call) => replace_temp_in_call_expr(call, temp, replacement),
-        HirExpr::TableConstructor(table) => {
-            for field in &mut table.fields {
-                match field {
-                    HirTableField::Array(expr) => replace_temp_in_expr(expr, temp, replacement),
-                    HirTableField::Record(field) => {
-                        replace_temp_in_table_key(&mut field.key, temp, replacement);
-                        replace_temp_in_expr(&mut field.value, temp, replacement);
-                    }
-                }
-            }
-            if let Some(tail) = &mut table.trailing_multivalue
-                && let Some(call) = tail.call_mut()
-            {
-                replace_temp_in_call_expr(call, temp, replacement);
-            }
-        }
-        HirExpr::Closure(closure) => {
-            for capture in &mut closure.captures {
-                replace_temp_in_expr(&mut capture.value, temp, replacement);
-            }
-        }
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => {}
-    }
-}
-
-fn replace_temp_in_decision_target(
-    target: &mut crate::hir::common::HirDecisionTarget,
-    temp: TempId,
-    replacement: &HirExpr,
-) {
-    if let crate::hir::common::HirDecisionTarget::Expr(expr) = target {
-        replace_temp_in_expr(expr, temp, replacement);
-    }
-}
-
-fn replace_temp_in_table_key(
-    key: &mut crate::hir::common::HirTableKey,
-    temp: TempId,
-    replacement: &HirExpr,
-) {
-    if let crate::hir::common::HirTableKey::Expr(expr) = key {
-        replace_temp_in_expr(expr, temp, replacement);
     }
 }

@@ -19,7 +19,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::structure::{
-    BlockRef, Cfg, DataflowFacts, DominatorTree, GraphFacts, PhiCandidate, SsaValue,
+    BlockRef, Cfg, DataflowFacts, DominatorTree, GraphFacts, PhiCandidate, PostDominatorTree,
+    SsaValue,
 };
 use crate::transformer::LoweredProto;
 
@@ -41,7 +42,6 @@ pub(super) fn analyze_value_merge_candidates(
     dataflow: &DataflowFacts,
     branch_by_header: &BTreeMap<BlockRef, &BranchCandidate>,
 ) -> Vec<ShortCircuitCandidate> {
-    let mut candidates = Vec::new();
     let dom_tree = &graph_facts.dominator_tree;
     let recursive_phis = recursive_phi_flags(dataflow);
     let build_ctx = ValueMergeBuildCtx {
@@ -50,27 +50,27 @@ pub(super) fn analyze_value_merge_candidates(
         dataflow,
         branch_by_header,
         dom_tree,
+        postdom_tree: &graph_facts.post_dominator_tree,
         recursive_phis: &recursive_phis,
     };
-
+    let mut candidates = Vec::new();
+    let mut node_refs = DenseNodeRefs::new(cfg.blocks.len());
     for phi in &dataflow.phi_candidates {
         if phi.incoming.len() < 2 {
             continue;
         }
-
         let Some(root) = value_merge_root(dom_tree, branch_by_header, phi) else {
             continue;
         };
-        let Some(builder) = ValueMergeDagBuilder::new(&build_ctx, root.header, phi) else {
+        let Some(builder) = ValueMergeDagBuilder::new(&build_ctx, root.header, phi, &mut node_refs)
+        else {
             continue;
         };
         let Some(candidate) = builder.build() else {
             continue;
         };
-
         candidates.push(candidate);
     }
-
     candidates
 }
 
@@ -93,39 +93,100 @@ struct ValueMergeBuildCtx<'a> {
     dataflow: &'a DataflowFacts,
     branch_by_header: &'a BTreeMap<BlockRef, &'a BranchCandidate>,
     dom_tree: &'a DominatorTree,
+    postdom_tree: &'a PostDominatorTree,
     recursive_phis: &'a [bool],
 }
 
-struct ValueMergeDagBuilder<'a> {
+struct DenseNodeRefs {
+    epochs: Vec<u32>,
+    refs: Vec<ShortCircuitNodeRef>,
+    next_epoch: u32,
+}
+
+impl DenseNodeRefs {
+    fn new(len: usize) -> Self {
+        Self {
+            epochs: vec![0; len],
+            refs: vec![ShortCircuitNodeRef(0); len],
+            next_epoch: 1,
+        }
+    }
+
+    fn begin(&mut self) -> u32 {
+        if self.next_epoch == u32::MAX {
+            self.epochs.fill(0);
+            self.next_epoch = 1;
+        }
+        let epoch = self.next_epoch;
+        self.next_epoch += 1;
+        epoch
+    }
+
+    fn get(&self, block: BlockRef, epoch: u32) -> Option<ShortCircuitNodeRef> {
+        (self.epochs.get(block.index()).copied() == Some(epoch)).then(|| self.refs[block.index()])
+    }
+
+    fn insert(&mut self, block: BlockRef, node_ref: ShortCircuitNodeRef, epoch: u32) {
+        self.epochs[block.index()] = epoch;
+        self.refs[block.index()] = node_ref;
+    }
+}
+
+struct ValueMergeDagBuilder<'a, 'w> {
     proto: &'a LoweredProto,
     cfg: &'a Cfg,
     dataflow: &'a DataflowFacts,
     branch_by_header: &'a BTreeMap<BlockRef, &'a BranchCandidate>,
     dom_tree: &'a DominatorTree,
+    postdom_tree: &'a PostDominatorTree,
     root: BlockRef,
     phi: &'a PhiCandidate,
     nodes: Vec<ShortCircuitNode>,
-    node_by_header: BTreeMap<BlockRef, ShortCircuitNodeRef>,
-    visiting: BTreeSet<BlockRef>,
+    branch_targets: Vec<(BlockRef, BlockRef)>,
+    node_refs: &'w mut DenseNodeRefs,
+    node_epoch: u32,
     blocks: BTreeSet<BlockRef>,
     value_leaves: BTreeSet<BlockRef>,
     value_leaf_predecessors: BTreeSet<BlockRef>,
     phi_predecessors: BTreeSet<BlockRef>,
+    decision_incoming_indices: Vec<usize>,
     value_leaf_values: BTreeMap<BlockRef, Option<SsaValue>>,
 }
 
-impl<'a> ValueMergeDagBuilder<'a> {
-    fn new(ctx: &'a ValueMergeBuildCtx<'a>, root: BlockRef, phi: &'a PhiCandidate) -> Option<Self> {
-        if phi.incoming.iter().any(|incoming| incoming.pred.is_none())
-            || ctx.recursive_phis[phi.id.index()]
+impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
+    fn new(
+        ctx: &'a ValueMergeBuildCtx<'a>,
+        root: BlockRef,
+        phi: &'a PhiCandidate,
+        node_refs: &'w mut DenseNodeRefs,
+    ) -> Option<Self> {
+        if phi.incoming.iter().any(|incoming| incoming.pred.is_none()) {
+            return None;
+        }
+        if ctx.recursive_phis[phi.id.index()]
+            && !phi
+                .incoming
+                .iter()
+                .any(|incoming| incoming.value == SsaValue::Phi(phi.id))
         {
             return None;
         }
-        let phi_predecessors = phi
+        let decision_incoming_indices = phi
             .incoming
             .iter()
-            .filter_map(|incoming| incoming.pred)
+            .enumerate()
+            .filter_map(|(index, incoming)| {
+                (incoming.value != SsaValue::Phi(phi.id)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if decision_incoming_indices.len() < 2 {
+            return None;
+        }
+        let phi_predecessors = decision_incoming_indices
+            .iter()
+            .filter_map(|index| phi.incoming[*index].pred)
             .collect();
+        let node_epoch = node_refs.begin();
 
         Some(Self {
             proto: ctx.proto,
@@ -133,16 +194,19 @@ impl<'a> ValueMergeDagBuilder<'a> {
             dataflow: ctx.dataflow,
             branch_by_header: ctx.branch_by_header,
             dom_tree: ctx.dom_tree,
+            postdom_tree: ctx.postdom_tree,
             root,
             phi,
             nodes: Vec::new(),
-            node_by_header: BTreeMap::new(),
-            visiting: BTreeSet::new(),
+            branch_targets: Vec::new(),
+            node_refs,
+            node_epoch,
             blocks: BTreeSet::new(),
             value_leaves: BTreeSet::new(),
             value_leaf_predecessors: BTreeSet::new(),
             phi_predecessors,
             value_leaf_values: BTreeMap::new(),
+            decision_incoming_indices,
         })
     }
 
@@ -154,7 +218,7 @@ impl<'a> ValueMergeDagBuilder<'a> {
             return None;
         }
 
-        let entry = self.build_node(self.root)?;
+        let entry = self.build_nodes()?;
         if entry != ShortCircuitNodeRef(0) {
             return None;
         }
@@ -165,7 +229,7 @@ impl<'a> ValueMergeDagBuilder<'a> {
         let has_header_leaf = self
             .value_leaves
             .iter()
-            .any(|leaf| self.node_by_header.contains_key(leaf));
+            .any(|leaf| self.node_refs.get(*leaf, self.node_epoch).is_some());
         if self.nodes.len() == 1 && !has_header_leaf {
             return None;
         }
@@ -190,25 +254,21 @@ impl<'a> ValueMergeDagBuilder<'a> {
         })
     }
 
-    fn build_node(&mut self, header: BlockRef) -> Option<ShortCircuitNodeRef> {
-        if let Some(node_ref) = self.node_by_header.get(&header).copied() {
-            return Some(node_ref);
-        }
-        if !self.visiting.insert(header) {
-            return None;
+    fn reserve_node(&mut self, header: BlockRef) -> Option<(ShortCircuitNodeRef, bool)> {
+        if let Some(node_ref) = self.node_refs.get(header, self.node_epoch) {
+            return Some((node_ref, false));
         }
 
         let _candidate = self.branch_by_header.get(&header)?;
         if !self.dom_tree.dominates(self.root, header)
-            || !self.cfg.can_reach(header, self.phi.block)
+            || !self.postdom_tree.dominates(self.phi.block, header)
         {
-            self.visiting.remove(&header);
             return None;
         }
 
         let (truthy_block, falsy_block) = truthy_falsy_targets(self.proto, self.cfg, header)?;
         let id = ShortCircuitNodeRef(self.nodes.len());
-        self.node_by_header.insert(header, id);
+        self.node_refs.insert(header, id, self.node_epoch);
         self.blocks.insert(header);
         self.nodes.push(ShortCircuitNode {
             id,
@@ -216,36 +276,67 @@ impl<'a> ValueMergeDagBuilder<'a> {
             truthy: ShortCircuitTarget::Value(header),
             falsy: ShortCircuitTarget::Value(header),
         });
+        self.branch_targets.push((truthy_block, falsy_block));
 
-        let truthy = self.resolve_value_target(header, truthy_block)?;
-        let falsy = self.resolve_value_target(header, falsy_block)?;
-        self.nodes[id.index()] = ShortCircuitNode {
-            id,
-            header,
-            truthy,
-            falsy,
-        };
+        Some((id, true))
+    }
 
-        self.visiting.remove(&header);
-        Some(id)
+    fn build_nodes(&mut self) -> Option<ShortCircuitNodeRef> {
+        let (entry, _) = self.reserve_node(self.root)?;
+        // 显式 frame 保留旧实现 truthy-first 的编号顺序，同时让 DAG 深度不再占用
+        // Rust 调用栈；共享节点在 reserve 时直接复用稠密 node id。
+        let mut pending = vec![(entry, 0u8)];
+
+        while !pending.is_empty() {
+            let frame_index = pending.len() - 1;
+            let (node_ref, arm) = pending[frame_index];
+            if arm == 2 {
+                pending.pop();
+                continue;
+            }
+            pending[frame_index].1 += 1;
+            let header = self.nodes.get(node_ref.index())?.header;
+            let (truthy_block, falsy_block) = *self.branch_targets.get(node_ref.index())?;
+            let target = if arm == 0 { truthy_block } else { falsy_block };
+            let resolved = self.resolve_value_target(header, target)?;
+            let target = match resolved {
+                ResolvedValueTarget::Final(target) => target,
+                ResolvedValueTarget::Header(header) => {
+                    let (child, is_new) = self.reserve_node(header)?;
+                    if is_new {
+                        pending.push((child, 0));
+                    }
+                    ShortCircuitTarget::Node(child)
+                }
+            };
+
+            let node = self.nodes.get_mut(node_ref.index())?;
+            if arm == 0 {
+                node.truthy = target;
+            } else {
+                node.falsy = target;
+            }
+        }
+
+        Some(entry)
     }
 
     fn resolve_value_target(
         &mut self,
         from_header: BlockRef,
         target: BlockRef,
-    ) -> Option<ShortCircuitTarget> {
+    ) -> Option<ResolvedValueTarget> {
         if target == self.phi.block {
             let incoming = self
-                .phi
-                .incoming
-                .iter()
+                .decision_incomings()
                 .find(|incoming| incoming.pred == Some(from_header))?;
             if matches!(incoming.value, crate::structure::SsaValue::Entry(_)) {
                 return None;
             }
             self.record_value_leaf(from_header, from_header);
-            return Some(ShortCircuitTarget::Value(from_header));
+            return Some(ResolvedValueTarget::Final(ShortCircuitTarget::Value(
+                from_header,
+            )));
         }
 
         let mut terminal = None;
@@ -258,22 +349,21 @@ impl<'a> ValueMergeDagBuilder<'a> {
         })
         .follow(
             target,
-            |block| block != self.phi.block && self.cfg.can_reach(block, self.phi.block),
+            |block| block != self.phi.block && self.postdom_tree.dominates(self.phi.block, block),
             |block, _| {
                 terminal = self.value_leaf_carrier(block);
                 terminal.is_some()
             },
         )?;
-        match followed {
-            LinearFollowTarget::Header(header) => {
-                Some(ShortCircuitTarget::Node(self.build_node(header)?))
-            }
+        self.blocks.extend(followed.traversed);
+        match followed.target {
+            LinearFollowTarget::Header(header) => Some(ResolvedValueTarget::Header(header)),
             LinearFollowTarget::Terminal(block) => {
                 let (carriers, predecessor) = terminal?;
                 self.blocks.extend(carriers);
                 self.blocks.insert(block);
                 self.record_value_leaf(block, predecessor);
-                Some(ShortCircuitTarget::Value(block))
+                Some(ResolvedValueTarget::Final(ShortCircuitTarget::Value(block)))
             }
         }
     }
@@ -295,9 +385,7 @@ impl<'a> ValueMergeDagBuilder<'a> {
             let successor = self.cfg.unique_reachable_successor(current)?;
             if successor == self.phi.block {
                 let incoming = self
-                    .phi
-                    .incoming
-                    .iter()
+                    .decision_incomings()
                     .find(|incoming| incoming.pred == Some(current))?;
                 return self
                     .dataflow
@@ -321,7 +409,7 @@ impl<'a> ValueMergeDagBuilder<'a> {
             return false;
         }
 
-        if self.phi.incoming.iter().all(|incoming| {
+        if self.decision_incomings().all(|incoming| {
             incoming
                 .pred
                 .and_then(|pred| self.value_leaf_values.get(&pred).copied().flatten())
@@ -331,9 +419,7 @@ impl<'a> ValueMergeDagBuilder<'a> {
         }
 
         let phi_leaf_values = self
-            .phi
-            .incoming
-            .iter()
+            .decision_incomings()
             .flat_map(|incoming| self.dataflow.leaf_values(incoming.value))
             .collect::<BTreeSet<_>>();
         let leaf_values = self
@@ -360,6 +446,17 @@ impl<'a> ValueMergeDagBuilder<'a> {
             })
             .or_insert(Some(value));
     }
+
+    fn decision_incomings(&self) -> impl Iterator<Item = &crate::structure::PhiIncoming> {
+        self.decision_incoming_indices
+            .iter()
+            .map(|index| &self.phi.incoming[*index])
+    }
+}
+
+enum ResolvedValueTarget {
+    Final(ShortCircuitTarget),
+    Header(BlockRef),
 }
 
 /// Phi incoming 依赖若能回到自身，该 phi 就不是可安全展开的 value-merge 叶。

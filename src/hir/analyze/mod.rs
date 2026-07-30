@@ -17,14 +17,6 @@ use super::simplify::{PassDumpConfig, simplify_hir};
 use crate::decompile::{DecompileContext, DecompileError, DecompileState};
 use crate::hir::common::HirModule;
 
-use self::exprs::lower_branch_cond;
-use self::helpers::{assign_stmt, branch_stmt, build_label_map_for_summary, goto_block};
-use self::instrs::{lower_control_instr, lower_regular_instr};
-use self::lower::{
-    ProtoBindings, ProtoLowering, lower_edge_phi_copies_for_edge,
-    lower_phi_materialization_with_allowed_blocks_except,
-};
-
 /// HIR 阶段入口：消费结构事实与前序控制/数据流事实，写回 HIR 模块。
 pub(crate) fn analyze_hir(
     state: &mut DecompileState,
@@ -50,7 +42,7 @@ pub(crate) fn analyze_hir(
             &mut module,
             context.options.readability,
             context.timings,
-            &artifacts.promotion_facts,
+            &mut artifacts.promotion_facts,
             context.options.generate.mode,
             context.options.dialect,
             &dump_config,

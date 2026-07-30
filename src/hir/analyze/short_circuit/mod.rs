@@ -4,53 +4,20 @@
 //! 的线性链。这里的职责就是把这些 DAG 重新折回 HIR 的 `LogicalAnd / LogicalOr`，
 //! 同时保留值位置和条件位置在 Lua 里的不同语义。
 
-mod conditional_reassign;
 mod decision;
-mod guards;
 mod lowering;
-mod recovery;
-
-use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
-    HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr, TempId,
+    HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr,
 };
-use crate::hir::decision::{
-    decision_is_synth_safe, expr_truthiness, finalize_condition_decision_expr,
-    finalize_value_decision_expr,
-};
-use crate::structure::{BlockRef, DefId, PhiId, SsaValue};
-use crate::structure::{
-    ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNode, ShortCircuitNodeRef,
-    ShortCircuitTarget,
-};
-use crate::transformer::{BranchSubject, CondOperand, InstrRef, LowInstr, Reg};
+use crate::structure::BlockRef;
+use crate::structure::{ConditionPlan, ConditionTarget, ValueDecisionPlan, ValueDecisionTarget};
+use crate::transformer::LowInstr;
 
-pub(super) use self::conditional_reassign::build_conditional_reassign_plan;
-pub(super) use self::decision::{
-    DecisionEdge, build_branch_decision_expr_mixed_eval, build_decision_expr,
-    header_subject_is_value_carrier,
-};
-use self::decision::{
-    branch_exit_blocks_from_value_merge_candidate, build_branch_decision_expr,
-    build_branch_decision_expr_for_value_merge_candidate,
-    build_branch_decision_expr_for_value_merge_candidate_mixed_eval, build_impure_value_merge_expr,
-    build_value_decision_expr, build_value_decision_expr_single_eval,
-};
-use self::guards::decision_references_forbidden_candidate_temps;
-pub(super) use self::guards::expr_references_forbidden_candidate_temps;
-pub(super) use self::lowering::{
-    lower_materialized_value_leaf_expr, lower_short_circuit_subject,
-    lower_short_circuit_subject_single_eval,
-};
-use self::lowering::{lower_short_circuit_subject_inline, lower_value_leaf_expr};
-pub(super) use self::recovery::{
-    BranchShortCircuitPlan, build_branch_short_circuit_plan_for_candidate,
-    recover_short_value_merge_expr_recovery_with_allowed_blocks, same_value_merge_shape,
-    value_merge_candidates_in_block, value_merge_skipped_blocks,
-};
-use super::ProtoLowering;
+pub(super) use self::decision::{build_condition_decision_expr, build_value_decision_expr};
+use self::lowering::{lower_short_circuit_subject, lower_short_circuit_subject_single_eval};
 use super::exprs::{
-    expr_for_fixed_def, expr_for_fixed_def_single_eval, expr_for_reg_at_block_entry,
-    lower_branch_subject, lower_branch_subject_inline, lower_branch_subject_single_eval,
+    expr_for_fixed_def, expr_for_fixed_def_single_eval, expr_for_ssa_value, lower_branch_subject,
+    lower_branch_subject_single_eval,
 };
+use super::lower::ProtoLowering;

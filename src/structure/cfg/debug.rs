@@ -224,9 +224,9 @@ pub(in crate::structure) fn dump_graph_facts_tree(
             for natural_loop in &facts.natural_loops {
                 let _ = writeln!(
                     output,
-                    "{indent}    header=#{} backedge=#{} blocks={}",
+                    "{indent}    header=#{} backedges={} blocks={}",
                     natural_loop.header.index(),
-                    natural_loop.backedge.index(),
+                    format_edge_refs(&natural_loop.backedges),
                     format_display_set(&natural_loop.blocks),
                 );
             }

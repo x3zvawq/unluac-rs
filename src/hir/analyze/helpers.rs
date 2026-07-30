@@ -4,14 +4,10 @@
 //! 避免主分析流程被 `Assign/If/Goto/Label` 之类的机械拼装淹没。这样后续如果我们要
 //! 调整 fallback 形态或者 debug 展示格式，只需要收敛修改这些公共入口。
 
-use std::collections::BTreeMap;
-
 use crate::hir::common::{
     HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirExpr, HirGoto, HirIf, HirLValue,
     HirLabelId, HirProto, HirProtoRef, HirReturn, HirStmt, HirUnresolvedExpr, HirValuePack,
 };
-use crate::structure::{BlockRef, Cfg};
-use crate::transformer::InstrRef;
 
 pub(super) fn assign_stmt(targets: Vec<HirLValue>, values: impl Into<HirValuePack>) -> HirStmt {
     HirStmt::Assign(Box::new(HirAssign {
@@ -71,24 +67,6 @@ pub(super) fn concat_expr(parts: impl IntoIterator<Item = HirExpr>) -> HirExpr {
 
 pub(super) fn binary_expr(op: HirBinaryOpKind, lhs: HirExpr, rhs: HirExpr) -> HirExpr {
     HirExpr::Binary(Box::new(HirBinaryExpr { op, lhs, rhs }))
-}
-
-pub(super) fn label_for_block(
-    cfg: &Cfg,
-    label_map: &BTreeMap<BlockRef, HirLabelId>,
-    target: InstrRef,
-) -> HirLabelId {
-    let block = cfg.instr_to_block[target.index()];
-    label_map[&block]
-}
-
-pub(super) fn build_label_map_for_summary(cfg: &Cfg) -> BTreeMap<BlockRef, HirLabelId> {
-    cfg.block_order
-        .iter()
-        .filter(|block| cfg.reachable_blocks.contains(block))
-        .enumerate()
-        .map(|(index, block)| (*block, HirLabelId(index)))
-        .collect()
 }
 
 pub(super) fn decode_raw_string(raw: &crate::parser::RawString) -> String {

@@ -48,29 +48,39 @@ use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 /// 对单个 proto 执行带 promotion facts 的 temp -> local 提升。
 pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     proto: &mut HirProto,
-    facts: &ProtoPromotionFacts,
+    facts: &mut ProtoPromotionFacts,
 ) -> bool {
     let compact_home_slots = facts.home_slot_definition_count() > crate::SOURCE_LOCAL_LIMIT
         && proto.temp_debug_locals.iter().all(Option::is_none);
+    if compact_home_slots {
+        facts.enable_home_slot_compaction();
+    }
     let mut next_local_index = proto.locals.len();
     let mut new_locals = Vec::new();
     let mut new_local_debug_hints = Vec::new();
-    let mut ctx = PromotionCtx {
-        facts,
-        temp_debug_locals: &proto.temp_debug_locals,
-        next_local_index: &mut next_local_index,
-        new_locals: &mut new_locals,
-        new_local_debug_hints: &mut new_local_debug_hints,
-        compact_home_slots,
+    let mut promoted_home_slots = Vec::new();
+    let result = {
+        let mut ctx = PromotionCtx {
+            facts,
+            temp_debug_locals: &proto.temp_debug_locals,
+            next_local_index: &mut next_local_index,
+            new_locals: &mut new_locals,
+            new_local_debug_hints: &mut new_local_debug_hints,
+            promoted_home_slots: &mut promoted_home_slots,
+            compact_home_slots,
+        };
+        let empty_mapping = Rc::new(BTreeMap::new());
+        promote_block(
+            &mut ctx,
+            &mut proto.body,
+            &empty_mapping,
+            &BTreeMap::new(),
+            &|_| false,
+        )
     };
-    let empty_mapping = Rc::new(BTreeMap::new());
-    let result = promote_block(
-        &mut ctx,
-        &mut proto.body,
-        &empty_mapping,
-        &BTreeMap::new(),
-        &|_| false,
-    );
+    for (local, home_slot) in promoted_home_slots {
+        facts.record_local_home_slot(local, home_slot);
+    }
     proto.locals.extend(new_locals);
     proto.local_debug_hints.extend(new_local_debug_hints);
     let alias_changed = param_alias::coalesce_param_aliases_in_proto(proto);
@@ -119,6 +129,7 @@ struct PromotionCtx<'a> {
     next_local_index: &'a mut usize,
     new_locals: &'a mut Vec<LocalId>,
     new_local_debug_hints: &'a mut Vec<Option<String>>,
+    promoted_home_slots: &'a mut Vec<(LocalId, HomeSlotKey)>,
     compact_home_slots: bool,
 }
 
@@ -130,6 +141,7 @@ struct PlanAllocator<'a> {
     next_local_index: &'a mut usize,
     new_locals: &'a mut Vec<LocalId>,
     new_local_debug_hints: &'a mut Vec<Option<String>>,
+    promoted_home_slots: &'a mut Vec<(LocalId, HomeSlotKey)>,
 }
 
 impl PlanAllocator<'_> {
@@ -146,6 +158,9 @@ impl PlanAllocator<'_> {
         self.new_locals.push(local);
         self.new_local_debug_hints
             .push(debug_hint_for_temp_group(self.temp_debug_locals, &temps));
+        if let Some(home_slot) = home_slot {
+            self.promoted_home_slots.push((local, home_slot));
+        }
         self.reserved_temps.extend(temps.iter().copied());
         self.reserved_alias_indices
             .extend(removable_aliases.iter().copied());
@@ -169,6 +184,9 @@ impl PlanAllocator<'_> {
         removable_aliases: BTreeSet<usize>,
         init: PromotionInit,
     ) {
+        if let Some(home_slot) = home_slot {
+            self.promoted_home_slots.push((local, home_slot));
+        }
         self.reserved_temps.extend(temps.iter().copied());
         self.reserved_alias_indices
             .extend(removable_aliases.iter().copied());
@@ -327,12 +345,11 @@ fn collect_plans(
     inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
     outer_uses_temp: &dyn Fn(TempId) -> bool,
 ) -> Vec<PromotionPlan> {
-    if block.stmts.iter().any(|stmt| {
-        matches!(
-            stmt,
-            HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_)
-        )
-    }) {
+    if block
+        .stmts
+        .iter()
+        .any(|stmt| matches!(stmt, HirStmt::Goto(_) | HirStmt::Label(_)))
+    {
         return Vec::new();
     }
 
@@ -441,6 +458,7 @@ fn collect_plans(
             next_local_index: ctx.next_local_index,
             new_locals: ctx.new_locals,
             new_local_debug_hints: ctx.new_local_debug_hints,
+            promoted_home_slots: ctx.promoted_home_slots,
         };
         if let Some(local) = reusable_local {
             allocator.reuse_existing_local(
@@ -487,6 +505,7 @@ fn collect_plans(
                 next_local_index: ctx.next_local_index,
                 new_locals: ctx.new_locals,
                 new_local_debug_hints: ctx.new_local_debug_hints,
+                promoted_home_slots: ctx.promoted_home_slots,
             };
             if let Some(local) = facts.home_slot(temp).and_then(|slot| {
                 sticky_slots.get(&slot).copied().or_else(|| {
@@ -557,7 +576,10 @@ fn collect_promotion_group(
                 && !temps.contains(alias_temp)
                 && same_slot
                 && slot_is_available
-                && !temp_touches.touches_in_range(decl_index + 1, future_index, *alias_temp)
+                // `next = f(carried); carried = next` 是 loop 回边写回，不是可删除
+                // alias。若 alias 的旧值已在 root 定义语句中参与求值，合并二者会删掉
+                // 下一轮所需的写回，只留下每轮都读取入口 seed 的局部变量。
+                && !temp_touches.touches_in_range(decl_index, future_index, *alias_temp)
         });
         if let Some(alias_temp) = alias {
             temps.insert(alias_temp);

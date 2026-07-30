@@ -14,10 +14,10 @@ mod expr_analysis;
 mod field_access_sugar;
 mod function_sugar;
 mod global_decl_pretty;
+mod goto_syntax_safety;
 mod inline_exprs;
 mod installer_iife;
 mod local_scope_limit;
-mod luajit_goto_safety;
 mod materialize_temps;
 mod statement_merge;
 mod stmt_plan;
@@ -103,7 +103,7 @@ use AstInvalidation::*;
 //   cleanup → statement-merge → branch-pretty → field-access-sugar → inline-exprs
 //
 // Deferred phase 在 Normal 全部收敛后执行终态物化和语法糖：
-//   temp-materialize → installer-iife → function-sugar → global-decl-pretty → luajit-goto-safety
+//   temp-materialize → installer-iife → function-sugar → global-decl-pretty → goto-syntax-safety
 //
 // 如果 Deferred pass 产出新 invalidation，Normal phase 会重新收敛。
 const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
@@ -170,7 +170,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
         invalidates: &[StatementAdjacency],
     },
     PassDescriptor {
-        name: "luajit-goto-safety",
+        name: "goto-syntax-safety",
         phase: PassPhase::Deferred,
         depends_on: &[ControlFlowShape],
         invalidates: &[],
@@ -213,7 +213,7 @@ const PASS_ENTRIES: &[ReadabilityPassEntry] = &[
         apply: global_decl_pretty::apply,
     },
     ReadabilityPassEntry {
-        apply: luajit_goto_safety::apply,
+        apply: goto_syntax_safety::apply,
     },
     ReadabilityPassEntry {
         apply: local_scope_limit::apply,

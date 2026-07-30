@@ -34,7 +34,6 @@ pub(super) fn simplify_decision_exprs_in_proto(proto: &mut HirProto) -> bool {
 /// HIR 输出，它就应该已经被重新线性化成普通 `if/local/assign` 或纯表达式，避免把
 /// 共享图的语义恢复继续后移给 AST。
 pub(crate) use eliminate::eliminate_remaining_decisions_in_proto;
-pub(crate) use synthesize::decision_is_synth_safe;
 pub(crate) use synthesize::naturalize_pure_logical_expr;
 
 struct DecisionExprPass;
@@ -538,6 +537,26 @@ fn combine_value_expr(
             {
                 return Some(subject);
             }
+            (CollapsedValueTarget::Expr(lhs), CollapsedValueTarget::Expr(rhs))
+                if expr_is_boolean_valued(lhs) && is_false(rhs) =>
+            {
+                return Some(logical_and(subject, lhs.clone()));
+            }
+            (CollapsedValueTarget::Expr(lhs), CollapsedValueTarget::Expr(rhs))
+                if is_true(lhs) && expr_is_boolean_valued(rhs) =>
+            {
+                return Some(logical_or(subject, rhs.clone()));
+            }
+            (CollapsedValueTarget::Expr(lhs), CollapsedValueTarget::Expr(rhs))
+                if is_false(lhs) && expr_is_boolean_valued(rhs) =>
+            {
+                return Some(logical_and(subject.negate(), rhs.clone()));
+            }
+            (CollapsedValueTarget::Expr(lhs), CollapsedValueTarget::Expr(rhs))
+                if expr_is_boolean_valued(lhs) && is_true(rhs) =>
+            {
+                return Some(logical_or(subject.negate(), lhs.clone()));
+            }
             _ => {}
         }
     }
@@ -555,10 +574,58 @@ fn combine_value_expr(
                 Some(logical_or(logical_and(subject, lhs), rhs))
             } else if expr_truthiness(&rhs) == Some(true) {
                 Some(logical_or(logical_and(subject.negate(), rhs), lhs))
+            } else if expr_is_repeatable(&subject)
+                && expr_is_repeatable(&lhs)
+                && expr_truthiness_assuming(&lhs, &subject, true) == Some(true)
+            {
+                // 分支值可能只在当前 guard 成立时恒真。把这种路径约束留在
+                // Decision 外就会误判成普通三元式并物化为 if；guard 与被跨越的
+                // 分支都可重复时，原顺序的 `subject and lhs or rhs` 才不会因求值中
+                // 改写 guard 而误入 fallback。
+                Some(logical_or(logical_and(subject, lhs), rhs))
+            } else if expr_is_repeatable(&subject)
+                && expr_is_repeatable(&rhs)
+                && expr_truthiness_assuming(&rhs, &subject, false) == Some(true)
+            {
+                Some(logical_or(logical_and(subject.negate(), rhs), lhs))
             } else {
                 None
             }
         }
+    }
+}
+
+fn expr_truthiness_assuming(
+    expr: &HirExpr,
+    subject: &HirExpr,
+    subject_truthy: bool,
+) -> Option<bool> {
+    if expr == subject {
+        return Some(subject_truthy);
+    }
+    match expr {
+        HirExpr::Unary(unary) if unary.op == crate::hir::HirUnaryOpKind::Not => {
+            expr_truthiness_assuming(&unary.expr, subject, subject_truthy).map(|value| !value)
+        }
+        HirExpr::LogicalOr(logical) => {
+            let lhs = expr_truthiness_assuming(&logical.lhs, subject, subject_truthy);
+            let rhs = expr_truthiness_assuming(&logical.rhs, subject, subject_truthy);
+            match (lhs, rhs) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), rhs) => rhs,
+                _ => None,
+            }
+        }
+        HirExpr::LogicalAnd(logical) => {
+            let lhs = expr_truthiness_assuming(&logical.lhs, subject, subject_truthy);
+            let rhs = expr_truthiness_assuming(&logical.rhs, subject, subject_truthy);
+            match (lhs, rhs) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), rhs) => rhs,
+                _ => None,
+            }
+        }
+        _ => expr_truthiness(expr),
     }
 }
 
@@ -741,6 +808,16 @@ fn combine_condition_expr(subject: HirExpr, truthy: HirExpr, falsy: HirExpr) -> 
     }
     if is_true(&falsy) {
         return Some(logical_or(subject.negate(), truthy));
+    }
+    // 条件位置只观察 truthiness。guard 与两臂都不会在求值间改写状态时，互斥 guard
+    // 才能保证只求值原 decision 选中的 value arm；这覆盖 phi/value decision 随后
+    // 立刻作为 branch 条件的通用形状，避免把内部 Decision 泄漏到 AST。
+    if expr_is_repeatable(&subject) && expr_is_repeatable(&truthy) && expr_is_repeatable(&falsy) {
+        let falsy_guard = subject.clone().negate();
+        return Some(logical_or(
+            logical_and(subject, truthy),
+            logical_and(falsy_guard, falsy),
+        ));
     }
     None
 }

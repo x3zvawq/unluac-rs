@@ -101,7 +101,7 @@ pub(super) fn stmt_contains_nested_nonlocal_control(stmt: &HirStmt) -> bool {
         HirStmt::NumericFor(numeric_for) => block_contains_nonlocal_control(&numeric_for.body),
         HirStmt::GenericFor(generic_for) => block_contains_nonlocal_control(&generic_for.body),
         HirStmt::Block(block) => block_contains_nonlocal_control(block),
-        HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => true,
+        HirStmt::Goto(_) | HirStmt::Label(_) => true,
         HirStmt::LocalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
@@ -110,7 +110,8 @@ pub(super) fn stmt_contains_nested_nonlocal_control(stmt: &HirStmt) -> bool {
         | HirStmt::Close(_)
         | HirStmt::CallStmt(_)
         | HirStmt::Return(_)
-        | HirStmt::Break => false,
+        | HirStmt::Break
+        | HirStmt::Continue => false,
     }
 }
 
@@ -285,13 +286,8 @@ impl<'a, T: Copy + Ord> RefScopeTracker<'a, T> {
         self.suffix_ref_counts.contains_key(&reference)
     }
 
-    pub(super) fn outer_with_prefix_and_suffix(&self, inherited: &BTreeSet<T>) -> BTreeSet<T> {
-        inherited
-            .iter()
-            .copied()
-            .chain(self.prefix_refs.iter().copied())
-            .chain(self.suffix_ref_counts.keys().copied())
-            .collect()
+    pub(super) fn prefix_contains(&self, reference: T) -> bool {
+        self.prefix_refs.contains(&reference)
     }
 }
 

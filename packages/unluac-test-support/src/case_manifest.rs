@@ -46,6 +46,9 @@ pub(crate) struct LuaCaseMatrixEntry {
     pub(crate) path: &'static str,
     pub(crate) dialects: &'static [LuaCaseDialect],
     pub(crate) options: LuaCaseOptions,
+    pub(crate) variants: &'static [LuaCaseVariant],
+    pub(crate) expectation: LuaCaseExpectation,
+    pub(crate) structure_contracts: &'static [LuaCaseStructureContract],
 }
 
 impl LuaCaseMatrixEntry {
@@ -54,6 +57,9 @@ impl LuaCaseMatrixEntry {
             path,
             dialects,
             options: LuaCaseOptions::DEFAULT,
+            variants: &[],
+            expectation: LuaCaseExpectation::Source,
+            structure_contracts: &[],
         }
     }
 
@@ -61,6 +67,52 @@ impl LuaCaseMatrixEntry {
         self.options = options;
         self
     }
+
+    const fn with_variants(mut self, variants: &'static [LuaCaseVariant]) -> Self {
+        self.variants = variants;
+        self
+    }
+
+    const fn with_expectation(mut self, expectation: LuaCaseExpectation) -> Self {
+        self.expectation = expectation;
+        self
+    }
+
+    const fn with_structure_contracts(
+        mut self,
+        structure_contracts: &'static [LuaCaseStructureContract],
+    ) -> Self {
+        self.structure_contracts = structure_contracts;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum LuaCaseExpectation {
+    Source,
+    UnsupportedIsland { jump_pc: usize, target_pc: usize },
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum LuaCaseStructureContract {
+    MixedUnstructuredChildLoop {
+        dialect: LuaCaseDialect,
+        protocol: LuaCaseLoopProtocol,
+    },
+}
+
+impl LuaCaseStructureContract {
+    pub(crate) const fn dialect(self) -> LuaCaseDialect {
+        match self {
+            Self::MixedUnstructuredChildLoop { dialect, .. } => dialect,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum LuaCaseLoopProtocol {
+    NumericFor,
+    GenericFor,
 }
 
 /// 单个源码 case 需要的宿主编译与反编译选项。
@@ -96,7 +148,35 @@ pub(crate) struct LuauVectorCaseOptions {
 pub struct LuaCaseManifestEntry {
     pub path: &'static str,
     pub dialect: LuaCaseDialect,
+    pub variant: Option<LuaCaseVariant>,
     pub(crate) options: LuaCaseOptions,
+    pub(crate) expectation: LuaCaseExpectation,
+    pub(crate) structure_contracts: &'static [LuaCaseStructureContract],
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum LuaCaseVariant {
+    LuauO0,
+    LuauO1,
+    LuauO2,
+}
+
+impl LuaCaseVariant {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::LuauO0 => "O0",
+            Self::LuauO1 => "O1",
+            Self::LuauO2 => "O2",
+        }
+    }
+
+    const fn luau_optimization_level(self) -> u8 {
+        match self {
+            Self::LuauO0 => 0,
+            Self::LuauO1 => 1,
+            Self::LuauO2 => 2,
+        }
+    }
 }
 
 const ALL_DIALECTS: &[LuaCaseDialect] = &[
@@ -158,6 +238,11 @@ const PUC_LUA_GE_54: &[LuaCaseDialect] = &[LuaCaseDialect::Lua54, LuaCaseDialect
 const PUC_LUA_GE_55: &[LuaCaseDialect] = &[LuaCaseDialect::Lua55];
 const LUAU_ONLY: &[LuaCaseDialect] = &[LuaCaseDialect::Luau];
 const LUAJIT_ONLY: &[LuaCaseDialect] = &[LuaCaseDialect::Luajit];
+const LUAU_ALL_OPTIMIZATION_VARIANTS: &[LuaCaseVariant] = &[
+    LuaCaseVariant::LuauO0,
+    LuaCaseVariant::LuauO1,
+    LuaCaseVariant::LuauO2,
+];
 const LUAU_OPTIMIZED_OPTIONS: LuaCaseOptions = LuaCaseOptions {
     retain_debug: false,
     naming_mode: None,
@@ -217,7 +302,7 @@ const UNIT_CASES: &[LuaCaseMatrixEntry] = &[
             ..LuaCaseOptions::DEFAULT
         },
     ),
-    LuaCaseMatrixEntry::new("tests/unit-case/lua52_02_goto.lua", PUC_LUA_GE_52),
+    LuaCaseMatrixEntry::new("tests/unit-case/lua52_02_goto.lua", LUA_GOTO_DIALECTS),
     LuaCaseMatrixEntry::new("tests/unit-case/lua52_03_extraarg_boundary.lua", PUC_LUA_52),
     LuaCaseMatrixEntry::new("tests/unit-case/lua53_01.lua", PUC_LUA_GE_53),
     LuaCaseMatrixEntry::new("tests/unit-case/lua54_01_close.lua", PUC_LUA_GE_54),
@@ -604,7 +689,8 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_85_repeat_nested_numeric_body.lua",
         LUAU_ONLY,
-    ),
+    )
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_86_numeric_for_duplicated_return_state.lua",
         LUAU_ONLY,
@@ -1024,7 +1110,7 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_182_numeric_for_before_irreducible_goto.lua",
-        PUC_LUA_GE_52,
+        LUA_GOTO_DIALECTS,
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_183_mixed_irreducible_explicit_close.lua",
@@ -1036,7 +1122,7 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_185_branch_control_forward_guards.lua",
-        PUC_LUA_GE_52,
+        LUA_GOTO_DIALECTS,
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_186_truthy_ternary_hir_owner.lua",
@@ -1044,7 +1130,7 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_187_irreducible_plain_loop_owner.lua",
-        PUC_LUA_GE_52,
+        LUA_GOTO_DIALECTS,
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_188_luau_nan_fixed_point.lua",
@@ -1104,12 +1190,20 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_202_irreducible_numeric_for_owner.lua",
-        PUC_LUA_GE_52,
-    ),
+        LUA_GOTO_DIALECTS,
+    )
+    .with_structure_contracts(&[LuaCaseStructureContract::MixedUnstructuredChildLoop {
+        dialect: LuaCaseDialect::Lua54,
+        protocol: LuaCaseLoopProtocol::NumericFor,
+    }]),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_203_irreducible_generic_for_owner.lua",
-        PUC_LUA_GE_52,
-    ),
+        LUA_GOTO_DIALECTS,
+    )
+    .with_structure_contracts(&[LuaCaseStructureContract::MixedUnstructuredChildLoop {
+        dialect: LuaCaseDialect::Lua54,
+        protocol: LuaCaseLoopProtocol::GenericFor,
+    }]),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_204_irreducible_explicit_close_owner.lua",
         PUC_LUA_GE_54,
@@ -1381,7 +1475,7 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_272_lua52_goto_capture_identity.lua",
-        PUC_LUA_GE_52,
+        LUA_GOTO_DIALECTS,
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_273_close_capture_post_slot_reuse.lua",
@@ -1463,6 +1557,32 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         LUAU_ONLY,
     )
     .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_292_lua51_short_while_break_shared_tail.lua",
+        PUC_LUA_51,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_293_puc_nested_repeat_break_live_out.lua",
+        PUC_LUA_ALL,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_294_luau_continue_shared_break_tail.lua",
+        LUAU_ONLY,
+    )
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_295_lua51_unsupported_island_contract.lua",
+        PUC_LUA_51,
+    )
+    .with_expectation(LuaCaseExpectation::UnsupportedIsland {
+        jump_pc: 7,
+        target_pc: 13,
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_297_luau_decision_guard_mutation.lua",
+        LUAU_ONLY,
+    )
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {
@@ -1477,14 +1597,24 @@ fn manifest_entries(
     cases: &'static [LuaCaseMatrixEntry],
 ) -> impl Iterator<Item = LuaCaseManifestEntry> {
     cases.iter().flat_map(|entry| {
-        entry
-            .dialects
-            .iter()
-            .copied()
-            .map(move |dialect| LuaCaseManifestEntry {
-                path: entry.path,
-                dialect,
-                options: entry.options,
-            })
+        entry.dialects.iter().copied().flat_map(move |dialect| {
+            std::iter::once(None)
+                .filter(move |_| entry.variants.is_empty())
+                .chain(entry.variants.iter().copied().map(Some))
+                .map(move |variant| {
+                    let mut options = entry.options;
+                    if let Some(variant) = variant {
+                        options.luau_optimization_level = Some(variant.luau_optimization_level());
+                    }
+                    LuaCaseManifestEntry {
+                        path: entry.path,
+                        dialect,
+                        variant,
+                        options,
+                        expectation: entry.expectation,
+                        structure_contracts: entry.structure_contracts,
+                    }
+                })
+        })
     })
 }

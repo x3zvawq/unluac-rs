@@ -29,7 +29,109 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::structure::{BlockRef, Cfg, DataflowFacts, GraphFacts};
 use crate::transformer::{LoweredProto, Reg};
 
-use super::common::{BranchCandidate, ShortCircuitCandidate};
+use super::common::{BranchCandidate, IrreducibleRegion, LoopCandidate, ShortCircuitCandidate};
+
+pub(super) use branch_exit::{ClosedControlDagEvidence, ConditionArcEvidence};
+
+struct ReverseReachability {
+    marks: Vec<u32>,
+    reachable: Vec<bool>,
+    pending: Vec<BlockRef>,
+    next_epoch: u32,
+}
+
+impl ReverseReachability {
+    fn new(cfg: &Cfg) -> Self {
+        let mut reachable = vec![false; cfg.blocks.len()];
+        for block in &cfg.reachable_blocks {
+            reachable[block.index()] = true;
+        }
+        Self {
+            marks: vec![0; cfg.blocks.len()],
+            reachable,
+            pending: Vec::with_capacity(cfg.blocks.len()),
+            next_epoch: 1,
+        }
+    }
+
+    fn mark_reaching(&mut self, cfg: &Cfg, target: BlockRef) -> u32 {
+        if self.next_epoch == u32::MAX {
+            self.marks.fill(0);
+            self.next_epoch = 1;
+        }
+        let epoch = self.next_epoch;
+        self.next_epoch += 1;
+        self.pending.clear();
+        if let Some(mark) = self.marks.get_mut(target.index()) {
+            *mark = epoch;
+            self.pending.push(target);
+        }
+
+        while let Some(block) = self.pending.pop() {
+            for edge in &cfg.preds[block.index()] {
+                let predecessor = cfg.edges[edge.index()].from;
+                if !self.reachable[predecessor.index()] || self.marks[predecessor.index()] == epoch
+                {
+                    continue;
+                }
+                self.marks[predecessor.index()] = epoch;
+                self.pending.push(predecessor);
+            }
+        }
+        epoch
+    }
+
+    fn reaches(&self, block: BlockRef, epoch: u32) -> bool {
+        self.marks.get(block.index()).copied() == Some(epoch)
+    }
+}
+
+pub(super) struct ClosedControlDagContext<'a> {
+    pub(super) proto: &'a LoweredProto,
+    pub(super) cfg: &'a Cfg,
+    pub(super) graph_facts: &'a GraphFacts,
+    pub(super) dataflow: &'a DataflowFacts,
+}
+
+pub(super) fn analyze_closed_control_dags(
+    context: ClosedControlDagContext<'_>,
+    irreducible_regions: &[IrreducibleRegion],
+    loops: &[LoopCandidate],
+    branches: &[BranchCandidate],
+    value_decision_blocks: &BTreeSet<BlockRef>,
+) -> Vec<ClosedControlDagEvidence> {
+    let ClosedControlDagContext {
+        proto,
+        cfg,
+        graph_facts,
+        dataflow,
+    } = context;
+    let mut evidence = branch_exit::analyze_closed_control_dag_candidates(
+        proto,
+        cfg,
+        graph_facts,
+        dataflow,
+        irreducible_regions,
+        loops,
+    );
+    evidence.extend(branch_exit::analyze_closed_branch_components(
+        proto,
+        cfg,
+        graph_facts,
+        dataflow,
+        irreducible_regions,
+        loops,
+        value_decision_blocks,
+    ));
+    evidence.extend(branch_exit::analyze_closed_branch_control_dag_candidates(
+        proto,
+        cfg,
+        graph_facts,
+        dataflow,
+        branches,
+    ));
+    evidence
+}
 
 pub(super) fn analyze_short_circuits(
     proto: &LoweredProto,
@@ -42,6 +144,21 @@ pub(super) fn analyze_short_circuits(
         .iter()
         .map(|candidate| (candidate.header, candidate))
         .collect::<BTreeMap<BlockRef, _>>();
+
+    // 值 decision 的 entry 是表达式 body 的语义边界。条件 DAG 若继续穿过这个
+    // header，会把 body 自己的判断也吞成外层条件，最终得到三个以上的伪出口。
+    // 先提取 value evidence，再让条件恢复把这些 entry 当作 opaque exit。
+    let value_candidates = value_merge::analyze_value_merge_candidates(
+        proto,
+        cfg,
+        graph_facts,
+        dataflow,
+        &branch_by_header,
+    );
+    let value_decision_headers = value_candidates
+        .iter()
+        .map(|candidate| candidate.header)
+        .collect::<BTreeSet<_>>();
 
     let mut candidates = branch_exit::analyze_linear_branch_exit_candidates(
         proto,
@@ -64,14 +181,9 @@ pub(super) fn analyze_short_circuits(
         &branch_by_header,
         branch_candidates,
         &closed_linear_interiors,
+        &value_decision_headers,
     ));
-    candidates.extend(value_merge::analyze_value_merge_candidates(
-        proto,
-        cfg,
-        graph_facts,
-        dataflow,
-        &branch_by_header,
-    ));
+    candidates.extend(value_candidates);
     candidates = candidates
         .into_iter()
         .collect::<BTreeSet<_>>()

@@ -18,7 +18,7 @@
 
 use super::expr_facts::expr_truthiness;
 use super::walk::{ExprRewritePass, rewrite_proto_exprs};
-use crate::hir::common::{HirExpr, HirLogicalExpr, HirProto, HirUnaryOpKind};
+use crate::hir::common::{HirBinaryOpKind, HirExpr, HirLogicalExpr, HirProto, HirUnaryOpKind};
 use crate::hir::expr_safety::{expr_is_discard_safe, expr_is_repeatable};
 
 /// 对单个 proto 递归执行安全的逻辑表达式整理。
@@ -52,6 +52,11 @@ impl ExprRewritePass for LogicalExprPass {
         }
         if let Some(replacement) = simplify_condition_truthiness_shape(expr) {
             *expr = replacement;
+            changed = true;
+        }
+        let normalized = normalize_condition_context(expr, false);
+        if normalized.changed {
+            *expr = normalized.expr;
             changed = true;
         }
         changed
@@ -290,35 +295,96 @@ pub(super) fn simplify_condition_truthiness_shape(expr: &HirExpr) -> Option<HirE
     match expr {
         HirExpr::LogicalAnd(logical) => simplify_condition_logical_and(&logical.lhs, &logical.rhs),
         HirExpr::LogicalOr(logical) => simplify_condition_logical_or(&logical.lhs, &logical.rhs),
-        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
-            push_condition_negation(&unary.expr)
-        }
         _ => None,
     }
 }
 
-/// 只在条件上下文把外层 `not` 沿连续的 `and/or` 树一次下推到底。
-///
-/// 每次递归都会消费一个仍被当前否定覆盖的逻辑节点，并且只进入它的严格子树；这个度量
-/// 严格递减。左右操作数不交换，因此保持 Lua 的从左到右求值与短路顺序。叶节点继续复用
-/// `negate` 的双重否定规则，使结果与原来逐轮应用 De Morgan 的终态一致。
-fn push_condition_negation(expr: &HirExpr) -> Option<HirExpr> {
-    let replacement = match expr {
-        HirExpr::LogicalAnd(logical) => HirExpr::LogicalOr(Box::new(HirLogicalExpr {
-            lhs: negate_condition_operand(&logical.lhs),
-            rhs: negate_condition_operand(&logical.rhs),
-        })),
-        HirExpr::LogicalOr(logical) => HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
-            lhs: negate_condition_operand(&logical.lhs),
-            rhs: negate_condition_operand(&logical.rhs),
-        })),
-        _ => return None,
-    };
-    Some(replacement)
+pub(super) struct ConditionContextForm {
+    pub(super) expr: HirExpr,
+    pub(super) not_cost: usize,
+    pub(super) changed: bool,
 }
 
-fn negate_condition_operand(expr: &HirExpr) -> HirExpr {
-    push_condition_negation(expr).unwrap_or_else(|| expr.clone().negate())
+/// 构造条件及其反形的统一规范形，并计算最终需要打印的显式 `not` 数。
+///
+/// De Morgan 只沿 `and/or/not` 条件骨架下推，始终先处理 lhs 再处理 rhs，不交换也不复制
+/// 操作数。`not Eq` 可由生成器直接打印成 `~=`，因此不计成本；`Lt/Le` 不能在 NaN 或
+/// 元方法语义下安全反转，仍保留为显式 `not`。
+pub(super) fn normalize_condition_context(expr: &HirExpr, negated: bool) -> ConditionContextForm {
+    let changed = requested_polarity_needs_normalization(expr, negated);
+    let (expr, not_cost) = normalize_condition_context_inner(expr, negated);
+    ConditionContextForm {
+        expr,
+        not_cost,
+        changed,
+    }
+}
+
+fn normalize_condition_context_inner(expr: &HirExpr, negated: bool) -> (HirExpr, usize) {
+    match expr {
+        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
+            normalize_condition_context_inner(&unary.expr, !negated)
+        }
+        HirExpr::LogicalAnd(logical) => {
+            let (lhs, lhs_cost) = normalize_condition_context_inner(&logical.lhs, negated);
+            let (rhs, rhs_cost) = normalize_condition_context_inner(&logical.rhs, negated);
+            let logical = Box::new(HirLogicalExpr { lhs, rhs });
+            let expr = if negated {
+                HirExpr::LogicalOr(logical)
+            } else {
+                HirExpr::LogicalAnd(logical)
+            };
+            (expr, lhs_cost.saturating_add(rhs_cost))
+        }
+        HirExpr::LogicalOr(logical) => {
+            let (lhs, lhs_cost) = normalize_condition_context_inner(&logical.lhs, negated);
+            let (rhs, rhs_cost) = normalize_condition_context_inner(&logical.rhs, negated);
+            let logical = Box::new(HirLogicalExpr { lhs, rhs });
+            let expr = if negated {
+                HirExpr::LogicalAnd(logical)
+            } else {
+                HirExpr::LogicalOr(logical)
+            };
+            (expr, lhs_cost.saturating_add(rhs_cost))
+        }
+        _ if negated => {
+            let not_cost = usize::from(
+                !matches!(expr, HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Eq),
+            );
+            (expr.clone().negate(), not_cost)
+        }
+        _ => (expr.clone(), 0),
+    }
+}
+
+fn requested_polarity_needs_normalization(expr: &HirExpr, negated: bool) -> bool {
+    if !negated {
+        return condition_needs_normalization(expr);
+    }
+
+    match expr {
+        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
+            condition_needs_normalization(&unary.expr)
+        }
+        HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_) => true,
+        _ => false,
+    }
+}
+
+fn condition_needs_normalization(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
+            matches!(
+                &unary.expr,
+                HirExpr::Unary(inner) if inner.op == HirUnaryOpKind::Not
+            ) || matches!(&unary.expr, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_))
+        }
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            condition_needs_normalization(&logical.lhs)
+                || condition_needs_normalization(&logical.rhs)
+        }
+        _ => false,
+    }
 }
 
 fn simplify_condition_logical_and(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {

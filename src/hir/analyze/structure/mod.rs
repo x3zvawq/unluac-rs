@@ -1,60 +1,17 @@
-//! 这个文件是 HIR 结构恢复的 facade。
-//!
-//! 它只负责声明 `structure/` 子模块、拼装共享上下文，并暴露结构化 lowering 的入口。
-//! 真正的业务逻辑都放在目录里，避免入口文件再次膨胀成难维护的巨型实现。
+//! HIR 结构恢复 facade：只消费最终 StructurePlan。
 
-mod body;
-mod branch_values;
-mod loops;
-mod overrides;
-mod rewrites;
+mod generic_for;
+mod plan_body;
 
-use std::collections::{BTreeMap, BTreeSet};
+use crate::hir::HirLowerError;
+use crate::hir::common::{HirBlock, HirProtoRef};
 
-use crate::ast::AstTargetDialect;
-use crate::hir::common::{
-    HirBlock, HirDecisionTarget, HirExpr, HirGenericFor, HirIf, HirLValue, HirLabel, HirLabelId,
-    HirLogicalExpr, HirNumericFor, HirRepeat, HirStmt, HirWhile, TempId,
-};
-use crate::hir::decision::finalize_condition_decision_expr;
-use crate::structure::{
-    BlockOwner, BranchCandidate, BranchCandidateId, BranchKind, BranchRegionFact,
-    BranchValueMergeArm, BranchValueMergeCandidate, BranchValueMergeValue, CleanupDisposition,
-    EdgeOwner, EdgeRef, GotoReason, LoopCandidate, LoopCandidateId, LoopKindHint, LoopValueArm,
-    LoopValueMerge, RegionId, ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNodeRef,
-    ShortCircuitTarget, SinglePassFenceFact,
-};
-use crate::structure::{BlockRef, PhiId, ReachableSuccessorShape};
-use crate::transformer::{InstrRef, LowInstr, Reg};
-
-use super::exprs::{
-    expr_for_dup_safe_fixed_def, expr_for_entry_reg, expr_for_fixed_def,
-    expr_for_reg_at_block_exit, expr_for_reg_use,
-};
-use super::short_circuit::{
-    BranchShortCircuitPlan, build_branch_decision_expr_mixed_eval,
-    build_branch_short_circuit_plan_for_candidate, build_conditional_reassign_plan,
-    expr_references_forbidden_candidate_temps, header_subject_is_value_carrier,
-    lower_materialized_value_leaf_expr, lower_short_circuit_subject,
-    recover_short_value_merge_expr_recovery_with_allowed_blocks, value_merge_skipped_blocks,
-};
-use super::{ProtoLowering, assign_stmt, branch_stmt, lower_branch_cond};
-use super::{
-    build_label_map_for_summary, goto_block, lower_control_instr, lower_edge_phi_copies_for_edge,
-    lower_phi_materialization_with_allowed_blocks_except, lower_regular_instr,
-};
-use body::*;
-use overrides::StructureOverrideState;
-use rewrites::{
-    apply_loop_rewrites, expr_as_lvalue, install_def_target_overrides, lvalue_as_expr,
-    prune_identity_assignments, rewrite_expr_temp_targets, rewrite_expr_temps, rewrite_stmt_exprs,
-    shared_expr_for_defs, shared_lvalue_for_defs, temp_expr_overrides,
-};
+use super::lower::ProtoLowering;
 
 /// 基于 StructurePlan 恢复一个更接近源码的 HIR block。
 pub(super) fn build_structured_body(
-    target: AstTargetDialect,
+    proto: HirProtoRef,
     lowering: &ProtoLowering<'_>,
-) -> HirBlock {
-    body::build_structured_body(target, lowering)
+) -> Result<HirBlock, HirLowerError> {
+    plan_body::build_planned_body(proto, lowering)
 }

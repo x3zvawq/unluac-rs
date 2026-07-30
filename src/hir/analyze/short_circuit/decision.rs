@@ -1,595 +1,245 @@
-//! 这个子模块负责把 `ShortCircuitCandidate` 解释成 decision-expression 形式。
+//! 这个子模块把 Structure 冻结的 condition DAG 逐节点降低成 HIR decision。
 //!
-//! 它依赖 StructureFacts 已经确认好的短路 DAG 和真假出口，不会在这里重新抽取候选或决定
-//! 是否改写成 `if then else` 赋值壳。
-//! 例如：`a and b or c` 这类值级短路，会先在这里整理成 decision node/leaf 图。
+//! 节点 identity、真假连边和终端出口都由 `ConditionPlan` 给出；这里不再读取 raw
+//! candidate、重选候选或截断控制图。入口 block 的 prefix 由结构 lowering 显式发射，
+//! 其余被折叠节点使用单次求值表达式，避免引用不会单独发射的中间 temp。
 
 use super::*;
-use crate::hir::expr_safety::expr_is_repeatable;
+use crate::hir::rewrite::replace_temp_in_expr;
 
-pub(crate) fn branch_exit_blocks_from_value_merge_candidate(
-    short: &ShortCircuitCandidate,
-) -> Option<(BlockRef, BlockRef, BTreeSet<BlockRef>, BTreeSet<BlockRef>)> {
-    let ShortCircuitExit::ValueMerge(_) = short.exit else {
-        return None;
-    };
-
-    let (truthy_leaves, falsy_leaves) = short.value_truthiness_leaves()?;
-
-    if truthy_leaves.len() != 1 || falsy_leaves.len() != 1 {
-        return None;
-    }
-
-    let truthy = *truthy_leaves
-        .iter()
-        .next()
-        .expect("len checked above, exactly one truthy leaf exists");
-    let falsy = *falsy_leaves
-        .iter()
-        .next()
-        .expect("len checked above, exactly one falsy leaf exists");
-    (truthy != falsy).then_some((truthy, falsy, truthy_leaves, falsy_leaves))
-}
-
-pub(crate) fn build_branch_decision_expr(
+pub(crate) fn build_condition_decision_expr(
     lowering: &ProtoLowering<'_>,
-    short: &ShortCircuitCandidate,
-    entry: ShortCircuitNodeRef,
+    condition: &ConditionPlan,
 ) -> Option<HirDecisionExpr> {
-    build_branch_decision_expr_with_subject(lowering, short, entry, lower_short_circuit_subject)
-}
-
-pub(crate) fn build_branch_decision_expr_mixed_eval(
-    lowering: &ProtoLowering<'_>,
-    short: &ShortCircuitCandidate,
-    entry: ShortCircuitNodeRef,
-    materialized_blocks: &BTreeSet<BlockRef>,
-) -> Option<HirDecisionExpr> {
-    build_branch_decision_expr_with_subject(lowering, short, entry, |lowering, block| {
-        if materialized_blocks.contains(&block) {
-            lower_short_circuit_subject(lowering, block)
+    let mut remap = vec![None; condition.nodes.len()];
+    let mut values_by_consumer = vec![Vec::new(); condition.nodes.len()];
+    let mut next_node = 0usize;
+    for node in &condition.nodes {
+        if let Some(value) = node.materialized_value {
+            values_by_consumer
+                .get_mut(value.consumer.index())?
+                .push(node.id);
         } else {
-            lower_short_circuit_subject_single_eval(lowering, block)
+            remap[node.id.index()] = Some(HirDecisionNodeRef(next_node));
+            next_node += 1;
         }
-    })
-}
-
-fn build_branch_decision_expr_with_subject<FSubject>(
-    lowering: &ProtoLowering<'_>,
-    short: &ShortCircuitCandidate,
-    entry: ShortCircuitNodeRef,
-    subject_for_block: FSubject,
-) -> Option<HirDecisionExpr>
-where
-    FSubject: Fn(&ProtoLowering<'_>, BlockRef) -> Option<HirExpr>,
-{
-    build_decision_expr(
-        lowering,
-        short,
-        entry,
-        subject_for_block,
-        |node, target| match target {
-            ShortCircuitTarget::Node(next_ref) => Some(DecisionEdge::Node(*next_ref)),
-            ShortCircuitTarget::TruthyExit => Some(DecisionEdge::Leaf(HirDecisionTarget::Expr(
-                HirExpr::Boolean(true),
-            ))),
-            ShortCircuitTarget::FalsyExit => Some(DecisionEdge::Leaf(HirDecisionTarget::Expr(
-                HirExpr::Boolean(false),
-            ))),
-            ShortCircuitTarget::Value(block) if *block == node.header => Some(DecisionEdge::Leaf(
-                HirDecisionTarget::Expr(HirExpr::Boolean(true)),
-            )),
-            ShortCircuitTarget::Value(_) => None,
-        },
-    )
-}
-
-pub(crate) fn build_branch_decision_expr_for_value_merge_candidate(
-    lowering: &ProtoLowering<'_>,
-    short: &ShortCircuitCandidate,
-    truthy_leaves: &BTreeSet<BlockRef>,
-    falsy_leaves: &BTreeSet<BlockRef>,
-) -> Option<HirDecisionExpr> {
-    build_branch_decision_expr_for_value_merge_candidate_with_subject(
-        lowering,
-        short,
-        truthy_leaves,
-        falsy_leaves,
-        lower_short_circuit_subject_inline,
-    )
-}
-
-pub(crate) fn build_branch_decision_expr_for_value_merge_candidate_mixed_eval(
-    lowering: &ProtoLowering<'_>,
-    short: &ShortCircuitCandidate,
-    truthy_leaves: &BTreeSet<BlockRef>,
-    falsy_leaves: &BTreeSet<BlockRef>,
-    materialized_blocks: &BTreeSet<BlockRef>,
-) -> Option<HirDecisionExpr> {
-    build_branch_decision_expr_for_value_merge_candidate_with_subject(
-        lowering,
-        short,
-        truthy_leaves,
-        falsy_leaves,
-        |lowering, block| {
-            if materialized_blocks.contains(&block) {
-                lower_short_circuit_subject_inline(lowering, block)
-            } else {
-                lower_short_circuit_subject_single_eval(lowering, block)
-            }
-        },
-    )
-}
-
-fn build_branch_decision_expr_for_value_merge_candidate_with_subject<FSubject>(
-    lowering: &ProtoLowering<'_>,
-    short: &ShortCircuitCandidate,
-    truthy_leaves: &BTreeSet<BlockRef>,
-    falsy_leaves: &BTreeSet<BlockRef>,
-    subject_for_block: FSubject,
-) -> Option<HirDecisionExpr>
-where
-    FSubject: Fn(&ProtoLowering<'_>, BlockRef) -> Option<HirExpr>,
-{
-    let _ = branch_exit_blocks_from_value_merge_candidate(short)?;
-    build_decision_expr(
-        lowering,
-        short,
-        short.entry,
-        subject_for_block,
-        |_, target| match target {
-            ShortCircuitTarget::Node(next_ref) => Some(DecisionEdge::Node(*next_ref)),
-            ShortCircuitTarget::Value(block) if truthy_leaves.contains(block) => Some(
-                DecisionEdge::Leaf(HirDecisionTarget::Expr(HirExpr::Boolean(true))),
-            ),
-            ShortCircuitTarget::Value(block) if falsy_leaves.contains(block) => Some(
-                DecisionEdge::Leaf(HirDecisionTarget::Expr(HirExpr::Boolean(false))),
-            ),
-            ShortCircuitTarget::Value(_)
-            | ShortCircuitTarget::TruthyExit
-            | ShortCircuitTarget::FalsyExit => None,
-        },
-    )
+    }
+    let resolved = resolve_condition_nodes(condition, &remap)?;
+    let entry = resolved.get(condition.entry.index()).copied().flatten()?;
+    let mut subjects = lower_condition_subjects(lowering, condition, &values_by_consumer)?;
+    let nodes = condition
+        .nodes
+        .iter()
+        .filter(|node| node.materialized_value.is_none())
+        .map(|node| {
+            let test = subjects.get_mut(node.id.index())?.take()?;
+            Some(HirDecisionNode {
+                id: remap[node.id.index()]?,
+                test,
+                truthy: lower_target(node.semantic_target(true), &resolved)?,
+                falsy: lower_target(node.semantic_target(false), &resolved)?,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!nodes.is_empty()).then_some(HirDecisionExpr { entry, nodes })
 }
 
 pub(crate) fn build_value_decision_expr(
     lowering: &ProtoLowering<'_>,
-    short: &ShortCircuitCandidate,
-    entry: ShortCircuitNodeRef,
+    decision: &ValueDecisionPlan,
 ) -> Option<HirDecisionExpr> {
-    build_value_decision_expr_with_subject(
-        lowering,
-        short,
-        entry,
-        lower_short_circuit_subject_inline,
-    )
-}
-
-pub(crate) fn build_value_decision_expr_single_eval(
-    lowering: &ProtoLowering<'_>,
-    short: &ShortCircuitCandidate,
-    entry: ShortCircuitNodeRef,
-) -> Option<HirDecisionExpr> {
-    build_value_decision_expr_with_subject(
-        lowering,
-        short,
-        entry,
-        lower_short_circuit_subject_single_eval,
-    )
-}
-
-fn build_value_decision_expr_with_subject(
-    lowering: &ProtoLowering<'_>,
-    short: &ShortCircuitCandidate,
-    entry: ShortCircuitNodeRef,
-    subject_for_block: fn(&ProtoLowering<'_>, BlockRef) -> Option<HirExpr>,
-) -> Option<HirDecisionExpr> {
-    build_decision_expr(
-        lowering,
-        short,
-        entry,
-        subject_for_block,
-        |node, target| match target {
-            ShortCircuitTarget::Node(next_ref) => Some(DecisionEdge::Node(*next_ref)),
-            // 只有当 header 处的分支是对 result_reg 的 Truthiness 测试时，subject 的
-            // 运行时值才恰好等于被保留的旧寄存器值（如 `x or y` 中 x 同时是条件和值）。
-            // 对比较类分支（EQ/LT/LE），subject 是布尔结果而非目标寄存器值，
-            // 使用 CurrentValue 会把 `false` 当成保留值，导致语义错误。
-            ShortCircuitTarget::Value(block)
-                if *block == node.header
-                    && header_subject_is_value_carrier(lowering, node.header, short.result_reg) =>
-            {
-                Some(DecisionEdge::Leaf(HirDecisionTarget::CurrentValue))
-            }
-            // header 处的比较类分支无法通过 subject 传递 result_reg 的保留值，
-            // 回退到 lower_value_leaf_expr 也只会拿到 subject（布尔），直接放弃
-            // 让外层 fallback 到 if-then 结构。
-            ShortCircuitTarget::Value(block) if *block == node.header => None,
-            ShortCircuitTarget::Value(block) => Some(DecisionEdge::Leaf(HirDecisionTarget::Expr(
-                lower_value_leaf_expr(lowering, short, *block)?,
-            ))),
-            ShortCircuitTarget::TruthyExit | ShortCircuitTarget::FalsyExit => None,
-        },
-    )
-}
-
-/// 纯 `Decision` 综合器会拒绝带副作用的 subject，但值短路里的 `call(...) and ...`
-/// 在 Lua 里本来就是合法且单次求值的。
-///
-/// 这里补的是一条更早层的、结构受限的恢复路径：只吃“共享 fallback 的 guarded
-/// disjunction”这一类值短路 DAG。它不会尝试做表达式空间搜索，也不会放宽成
-/// 可重复求值的 inline；目标只是把最常见的带副作用短路值恢复成源码级 `and/or`
-/// 形状，而不是让它们先掉成 `if` 壳。
-pub(crate) fn build_impure_value_merge_expr(
-    lowering: &ProtoLowering<'_>,
-    short: &ShortCircuitCandidate,
-    entry: ShortCircuitNodeRef,
-) -> Option<HirExpr> {
-    Some(build_impure_value_merge_plan(lowering, short, entry)?.into_expr())
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum ImpureValueMergePlan {
-    Expr(HirExpr),
-    OrFallback { head: HirExpr, fallback: HirExpr },
-}
-
-impl ImpureValueMergePlan {
-    fn into_expr(self) -> HirExpr {
-        match self {
-            Self::Expr(expr) => expr,
-            Self::OrFallback { head, fallback } => {
-                HirExpr::LogicalOr(Box::new(crate::hir::common::HirLogicalExpr {
-                    lhs: head,
-                    rhs: fallback,
-                }))
-            }
-        }
-    }
-
-    fn matches_expr(&self, expr: &HirExpr) -> bool {
-        match (self, expr) {
-            (Self::Expr(value), _) => value == expr,
-            (Self::OrFallback { head, fallback }, HirExpr::LogicalOr(logical)) => {
-                head == &logical.lhs && fallback == &logical.rhs
-            }
-            (Self::OrFallback { .. }, _) => false,
-        }
-    }
-
-    fn truthiness(&self) -> Option<bool> {
-        match self {
-            Self::Expr(expr) => expr_truthiness(expr),
-            Self::OrFallback { head, fallback } => {
-                match (expr_truthiness(head), expr_truthiness(fallback)) {
-                    (Some(true), _) | (_, Some(true)) => Some(true),
-                    (Some(false), fallback) => fallback,
-                    _ => None,
-                }
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum ImpureValueMergeTarget {
-    Current,
-    Plan(ImpureValueMergePlan),
-}
-
-fn build_impure_value_merge_plan(
-    lowering: &ProtoLowering<'_>,
-    short: &ShortCircuitCandidate,
-    node_ref: ShortCircuitNodeRef,
-) -> Option<ImpureValueMergePlan> {
-    let node = short.nodes.get(node_ref.index())?;
-    let subject = lower_short_circuit_subject_single_eval(lowering, node.header)?;
-    let truthy = build_impure_value_merge_target(lowering, short, node.header, &node.truthy)?;
-    let falsy = build_impure_value_merge_target(lowering, short, node.header, &node.falsy)?;
-    combine_impure_value_merge_targets(subject, truthy, falsy)
-}
-
-fn build_impure_value_merge_target(
-    lowering: &ProtoLowering<'_>,
-    short: &ShortCircuitCandidate,
-    current_header: BlockRef,
-    target: &ShortCircuitTarget,
-) -> Option<ImpureValueMergeTarget> {
-    match target {
-        ShortCircuitTarget::Node(next_ref) => Some(ImpureValueMergeTarget::Plan(
-            build_impure_value_merge_plan(lowering, short, *next_ref)?,
-        )),
-        // 与上面 build_value_decision_expr_with_subject 同理：只有 Truthiness 测试
-        // 在 result_reg 上时，subject 运行时值才等于保留的旧寄存器值。
-        ShortCircuitTarget::Value(block)
-            if *block == current_header
-                && header_subject_is_value_carrier(lowering, current_header, short.result_reg) =>
-        {
-            Some(ImpureValueMergeTarget::Current)
-        }
-        // 同上：比较类分支无法携带 result_reg 的值，放弃恢复。
-        ShortCircuitTarget::Value(block) if *block == current_header => None,
-        ShortCircuitTarget::Value(block) => Some(ImpureValueMergeTarget::Plan(
-            ImpureValueMergePlan::Expr(lower_value_leaf_expr(lowering, short, *block)?),
-        )),
-        ShortCircuitTarget::TruthyExit | ShortCircuitTarget::FalsyExit => None,
-    }
-}
-
-fn combine_impure_value_merge_targets(
-    subject: HirExpr,
-    truthy: ImpureValueMergeTarget,
-    falsy: ImpureValueMergeTarget,
-) -> Option<ImpureValueMergePlan> {
-    let truthy = normalize_impure_value_merge_target(&subject, truthy);
-    let falsy = normalize_impure_value_merge_target(&subject, falsy);
-    match (truthy, falsy) {
-        (ImpureValueMergeTarget::Plan(truthy), ImpureValueMergeTarget::Plan(falsy))
-            if impure_subject_is_boolean_valued(&subject)
-                && impure_plan_is_boolean(&truthy, true)
-                && impure_plan_is_boolean(&falsy, false) =>
-        {
-            Some(ImpureValueMergePlan::Expr(subject))
-        }
-        (ImpureValueMergeTarget::Plan(truthy), ImpureValueMergeTarget::Plan(falsy))
-            if impure_subject_is_boolean_valued(&subject)
-                && impure_plan_is_boolean(&truthy, false)
-                && impure_plan_is_boolean(&falsy, true) =>
-        {
-            Some(ImpureValueMergePlan::Expr(subject.negate()))
-        }
-        (ImpureValueMergeTarget::Plan(truthy), ImpureValueMergeTarget::Plan(falsy))
-            if impure_subject_is_boolean_valued(&subject)
-                && impure_plan_is_boolean(&falsy, false) =>
-        {
-            let truthy = impure_plan_boolean_expr(&truthy)?;
-            Some(ImpureValueMergePlan::Expr(HirExpr::LogicalAnd(Box::new(
-                crate::hir::common::HirLogicalExpr {
-                    lhs: subject,
-                    rhs: truthy,
-                },
-            ))))
-        }
-        (ImpureValueMergeTarget::Plan(truthy), ImpureValueMergeTarget::Plan(falsy))
-            if impure_subject_is_boolean_valued(&subject)
-                && impure_plan_is_boolean(&truthy, true) =>
-        {
-            let falsy = impure_plan_boolean_expr(&falsy)?;
-            Some(ImpureValueMergePlan::Expr(HirExpr::LogicalOr(Box::new(
-                crate::hir::common::HirLogicalExpr {
-                    lhs: subject,
-                    rhs: falsy,
-                },
-            ))))
-        }
-        (ImpureValueMergeTarget::Current, ImpureValueMergeTarget::Current) => {
-            Some(ImpureValueMergePlan::Expr(subject))
-        }
-        (ImpureValueMergeTarget::Current, ImpureValueMergeTarget::Plan(fallback)) => {
-            Some(ImpureValueMergePlan::OrFallback {
-                head: subject,
-                fallback: fallback.into_expr(),
-            })
-        }
-        (ImpureValueMergeTarget::Plan(truthy), ImpureValueMergeTarget::Current) => {
-            Some(ImpureValueMergePlan::Expr(HirExpr::LogicalAnd(Box::new(
-                crate::hir::common::HirLogicalExpr {
-                    lhs: subject,
-                    rhs: truthy.into_expr(),
-                },
-            ))))
-        }
-        (
-            ImpureValueMergeTarget::Plan(ImpureValueMergePlan::OrFallback { head, fallback }),
-            ImpureValueMergeTarget::Plan(falsy),
-        ) if falsy.matches_expr(&fallback) => Some(ImpureValueMergePlan::OrFallback {
-            head: HirExpr::LogicalAnd(Box::new(crate::hir::common::HirLogicalExpr {
-                lhs: subject,
-                rhs: head,
-            })),
-            fallback,
-        }),
-        (
-            ImpureValueMergeTarget::Plan(ImpureValueMergePlan::OrFallback {
-                head: truthy_head,
-                fallback,
-            }),
-            ImpureValueMergeTarget::Plan(ImpureValueMergePlan::OrFallback {
-                head: falsy_head,
-                fallback: falsy_fallback,
-            }),
-        ) if fallback == falsy_fallback => {
-            combine_shared_fallback_impure_heads(subject, truthy_head, falsy_head, fallback)
-        }
-        (ImpureValueMergeTarget::Plan(truthy), ImpureValueMergeTarget::Plan(falsy))
-            if truthy.truthiness() == Some(true) =>
-        {
-            Some(ImpureValueMergePlan::OrFallback {
-                head: HirExpr::LogicalAnd(Box::new(crate::hir::common::HirLogicalExpr {
-                    lhs: subject,
-                    rhs: truthy.into_expr(),
-                })),
-                fallback: falsy.into_expr(),
-            })
-        }
-        (ImpureValueMergeTarget::Plan(truthy), ImpureValueMergeTarget::Plan(falsy))
-            if falsy.truthiness() == Some(true) =>
-        {
-            Some(ImpureValueMergePlan::OrFallback {
-                head: HirExpr::LogicalAnd(Box::new(crate::hir::common::HirLogicalExpr {
-                    lhs: subject.negate(),
-                    rhs: falsy.into_expr(),
-                })),
-                fallback: truthy.into_expr(),
-            })
-        }
-        _ => None,
-    }
-}
-
-fn normalize_impure_value_merge_target(
-    subject: &HirExpr,
-    target: ImpureValueMergeTarget,
-) -> ImpureValueMergeTarget {
-    match target {
-        ImpureValueMergeTarget::Plan(ImpureValueMergePlan::Expr(expr))
-            if &expr == subject && expr_is_repeatable(subject) =>
-        {
-            ImpureValueMergeTarget::Current
-        }
-        other => other,
-    }
-}
-
-fn impure_subject_is_boolean_valued(expr: &HirExpr) -> bool {
-    match expr {
-        HirExpr::Boolean(_) => true,
-        HirExpr::Unary(unary) => unary.op == crate::hir::common::HirUnaryOpKind::Not,
-        HirExpr::Binary(binary) => matches!(
-            binary.op,
-            crate::hir::common::HirBinaryOpKind::Eq
-                | crate::hir::common::HirBinaryOpKind::Lt
-                | crate::hir::common::HirBinaryOpKind::Le
-        ),
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            impure_subject_is_boolean_valued(&logical.lhs)
-                && impure_subject_is_boolean_valued(&logical.rhs)
-        }
-        _ => false,
-    }
-}
-
-fn impure_plan_is_boolean(plan: &ImpureValueMergePlan, value: bool) -> bool {
-    matches!(plan, ImpureValueMergePlan::Expr(HirExpr::Boolean(v)) if *v == value)
-}
-
-fn impure_plan_boolean_expr(plan: &ImpureValueMergePlan) -> Option<HirExpr> {
-    match plan {
-        ImpureValueMergePlan::Expr(expr) if impure_subject_is_boolean_valued(expr) => {
-            Some(expr.clone())
-        }
-        _ => None,
-    }
-}
-
-fn combine_shared_fallback_impure_heads(
-    subject: HirExpr,
-    truthy_head: HirExpr,
-    falsy_head: HirExpr,
-    fallback: HirExpr,
-) -> Option<ImpureValueMergePlan> {
-    let falsy_guard = split_and_guard_with_shared_rhs(&falsy_head, &truthy_head)?;
-    Some(ImpureValueMergePlan::OrFallback {
-        head: HirExpr::LogicalAnd(Box::new(crate::hir::common::HirLogicalExpr {
-            lhs: HirExpr::LogicalOr(Box::new(crate::hir::common::HirLogicalExpr {
-                lhs: subject,
-                rhs: falsy_guard,
-            })),
-            rhs: truthy_head,
-        })),
-        fallback,
-    })
-}
-
-fn split_and_guard_with_shared_rhs(expr: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
-    match expr {
-        HirExpr::LogicalAnd(logical) if logical.rhs == *rhs => Some(logical.lhs.clone()),
-        _ => None,
-    }
-}
-
-/// 判断 header 处的分支条件是否直接测试 result 寄存器的 truthiness。
-///
-/// 只有 Truthiness 测试才能让 subject 运行时值等于被保留的旧寄存器值；
-/// 比较类分支 (EQ/LT/LE) 的 subject 是布尔结果，不携带目标寄存器的值。
-pub(crate) fn header_subject_is_value_carrier(
-    lowering: &ProtoLowering<'_>,
-    header: BlockRef,
-    result_reg: Option<Reg>,
-) -> bool {
-    let Some(result_reg) = result_reg else {
-        return false;
-    };
-    let Some(instr_ref) = lowering.cfg.blocks[header.index()].instrs.last() else {
-        return false;
-    };
-    let LowInstr::Branch(branch) = &lowering.proto.instrs[instr_ref.index()] else {
-        return false;
-    };
-    matches!(
-        branch.cond.subject,
-        BranchSubject::Truthy(CondOperand::Reg(reg)) if reg == result_reg
-    )
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum DecisionEdge {
-    Node(ShortCircuitNodeRef),
-    Leaf(HirDecisionTarget),
-}
-
-pub(crate) fn build_decision_expr<FTest, FTarget>(
-    lowering: &ProtoLowering<'_>,
-    short: &ShortCircuitCandidate,
-    entry: ShortCircuitNodeRef,
-    test_for_block: FTest,
-    target_for_edge: FTarget,
-) -> Option<HirDecisionExpr>
-where
-    FTest: Fn(&ProtoLowering<'_>, BlockRef) -> Option<HirExpr>,
-    FTarget: Fn(&ShortCircuitNode, &ShortCircuitTarget) -> Option<DecisionEdge>,
-{
-    let mut remap = BTreeMap::new();
-    let mut pending = Vec::new();
-    let mut stack = vec![entry];
-
-    while let Some(node_ref) = stack.pop() {
-        if remap.contains_key(&node_ref) {
-            continue;
-        }
-        let node = short.nodes.get(node_ref.index())?;
-        let mapped = HirDecisionNodeRef(remap.len());
-        remap.insert(node_ref, mapped);
-        let truthy = target_for_edge(node, &node.truthy)?;
-        let falsy = target_for_edge(node, &node.falsy)?;
-        for edge in [&falsy, &truthy] {
-            if let DecisionEdge::Node(next_ref) = edge
-                && !remap.contains_key(next_ref)
-            {
-                stack.push(*next_ref);
-            }
-        }
-        pending.push((
-            mapped,
-            test_for_block(lowering, node.header)?,
-            truthy,
-            falsy,
-        ));
-    }
-
-    let nodes = pending
-        .into_iter()
-        .map(|(id, test, truthy, falsy)| {
+    let entry = HirDecisionNodeRef(decision.entry.index());
+    let nodes = decision
+        .nodes
+        .iter()
+        .map(|node| {
+            let test = if node.id == decision.entry {
+                lower_short_circuit_subject(lowering, node.block, node.predicate)
+            } else {
+                lower_short_circuit_subject_single_eval(lowering, node.block, node.predicate)
+            }?;
             Some(HirDecisionNode {
-                id,
+                id: HirDecisionNodeRef(node.id.index()),
                 test,
-                truthy: remap_decision_edge(truthy, &remap)?,
-                falsy: remap_decision_edge(falsy, &remap)?,
+                truthy: lower_value_target(lowering, decision, node.truthy.target)?,
+                falsy: lower_value_target(lowering, decision, node.falsy.target)?,
             })
         })
         .collect::<Option<Vec<_>>>()?;
-    Some(HirDecisionExpr {
-        entry: remap[&entry],
-        nodes,
-    })
+    (!nodes.is_empty() && entry.index() < nodes.len()).then_some(HirDecisionExpr { entry, nodes })
 }
 
-fn remap_decision_edge(
-    edge: DecisionEdge,
-    remap: &BTreeMap<ShortCircuitNodeRef, HirDecisionNodeRef>,
+fn lower_value_target(
+    lowering: &ProtoLowering<'_>,
+    decision: &ValueDecisionPlan,
+    target: ValueDecisionTarget,
 ) -> Option<HirDecisionTarget> {
-    match edge {
-        DecisionEdge::Node(node_ref) => Some(HirDecisionTarget::Node(*remap.get(&node_ref)?)),
-        DecisionEdge::Leaf(target) => Some(target),
+    match target {
+        ValueDecisionTarget::Node(node) => (node.index() < decision.nodes.len())
+            .then_some(HirDecisionTarget::Node(HirDecisionNodeRef(node.index()))),
+        ValueDecisionTarget::Leaf(leaf) => {
+            let leaf = decision.leaves.get(leaf.index())?;
+            let expr = match leaf.latest_local_def {
+                // entry prefix 会正常发射其中的定义。此时 leaf 必须继续引用这次已经
+                // 求值的 SSA identity；重新展开定义会把全局读取等动态操作执行两次。
+                Some(def)
+                    if lowering.dataflow.def_block(def) == decision.header()?
+                        && leaf.value == crate::structure::SsaValue::Def(def) =>
+                {
+                    expr_for_ssa_value(lowering, leaf.value)
+                }
+                // ValueDecision 吞掉了 leaf block 的普通指令，必须优先沿完整单次求值
+                // 依赖链展开；普通 def lowering 可能返回引用那些不会再被发射的中间 temp。
+                Some(def) => expr_for_fixed_def_single_eval(lowering, def)
+                    .or_else(|| expr_for_fixed_def(lowering, def))?,
+                None => expr_for_ssa_value(lowering, leaf.value),
+            };
+            Some(HirDecisionTarget::Expr(expr))
+        }
+        ValueDecisionTarget::CurrentValue(leaf) => decision
+            .leaves
+            .get(leaf.index())
+            .map(|_| HirDecisionTarget::CurrentValue),
+    }
+}
+
+fn lower_condition_subjects(
+    lowering: &ProtoLowering<'_>,
+    condition: &ConditionPlan,
+    values_by_consumer: &[Vec<crate::structure::ConditionNodeId>],
+) -> Option<Vec<Option<HirExpr>>> {
+    let mut subjects = vec![None; condition.nodes.len()];
+    let mut state = vec![0u8; condition.nodes.len()];
+
+    for start in 0..condition.nodes.len() {
+        if state[start] == 2 {
+            continue;
+        }
+        let mut pending = vec![(crate::structure::ConditionNodeId(start), false)];
+        while let Some((node_id, exiting)) = pending.pop() {
+            let index = node_id.index();
+            if exiting {
+                if *state.get(index)? != 1 {
+                    return None;
+                }
+                let node = condition.nodes.get(index)?;
+                if !matches!(
+                    lowering.proto.instrs.get(node.predicate.index()),
+                    Some(LowInstr::Branch(_))
+                ) {
+                    return None;
+                }
+                let mut expr = if node.id == condition.entry {
+                    lower_short_circuit_subject(lowering, node.block, node.predicate)
+                } else {
+                    lower_short_circuit_subject_single_eval(lowering, node.block, node.predicate)
+                }?;
+                for producer_id in values_by_consumer.get(index)? {
+                    let producer = condition.nodes.get(producer_id.index())?;
+                    let value = producer.materialized_value?;
+                    let mut replacement = subjects.get_mut(producer_id.index())?.take()?;
+                    if value.negated {
+                        replacement = HirExpr::Unary(Box::new(crate::hir::HirUnaryExpr {
+                            op: crate::hir::HirUnaryOpKind::Not,
+                            expr: replacement,
+                        }));
+                    }
+                    let temp = *lowering.bindings.phi_temps.get(value.phi.index())?;
+                    if replace_temp_in_expr(&mut expr, temp, &replacement) != 1 {
+                        return None;
+                    }
+                    if let Some(def) = value.forwarded_callee {
+                        let temp = *lowering.bindings.fixed_temps.get(def.index())?;
+                        let replacement = expr_for_fixed_def_single_eval(lowering, def)?;
+                        // absorbed-condition 的稠密 owner 会让 single-eval lowering 提前展开
+                        // 同一 condition 内的 callee；0 次替换表示它已经被展开。
+                        if replace_temp_in_expr(&mut expr, temp, &replacement) > 1 {
+                            return None;
+                        }
+                    }
+                }
+                state[index] = 2;
+                subjects[index] = Some(expr);
+                continue;
+            }
+
+            match *state.get(index)? {
+                0 => {
+                    state[index] = 1;
+                    pending.push((node_id, true));
+                    for producer in values_by_consumer.get(index)?.iter().rev() {
+                        match *state.get(producer.index())? {
+                            0 => pending.push((*producer, false)),
+                            1 => return None,
+                            2 => {}
+                            _ => return None,
+                        }
+                    }
+                }
+                1 => return None,
+                2 => {}
+                _ => return None,
+            }
+        }
+    }
+    Some(subjects)
+}
+
+fn resolve_condition_nodes(
+    condition: &ConditionPlan,
+    remap: &[Option<HirDecisionNodeRef>],
+) -> Option<Vec<Option<HirDecisionNodeRef>>> {
+    let mut resolved = vec![None; condition.nodes.len()];
+    let mut state = vec![0u8; condition.nodes.len()];
+    let mut pending = Vec::new();
+    for start in 0..condition.nodes.len() {
+        if state[start] == 2 {
+            continue;
+        }
+        pending.clear();
+        let mut node = crate::structure::ConditionNodeId(start);
+        let target = loop {
+            let index = node.index();
+            match *state.get(index)? {
+                0 => {}
+                1 => return None,
+                2 => break resolved.get(index).copied().flatten()?,
+                _ => return None,
+            }
+            state[index] = 1;
+            pending.push(node);
+
+            let plan = condition.nodes.get(index)?;
+            if plan.materialized_value.is_none() {
+                break remap.get(index).copied().flatten()?;
+            }
+            let (ConditionTarget::Node(truthy), ConditionTarget::Node(falsy)) =
+                (plan.semantic_target(true), plan.semantic_target(false))
+            else {
+                return None;
+            };
+            if truthy != falsy {
+                return None;
+            }
+            node = truthy;
+        };
+        for node in pending.drain(..).rev() {
+            state[node.index()] = 2;
+            resolved[node.index()] = Some(target);
+        }
+    }
+    Some(resolved)
+}
+
+fn lower_target(
+    target: ConditionTarget,
+    resolved: &[Option<HirDecisionNodeRef>],
+) -> Option<HirDecisionTarget> {
+    match target {
+        ConditionTarget::Node(node) => Some(HirDecisionTarget::Node(
+            resolved.get(node.index()).copied().flatten()?,
+        )),
+        ConditionTarget::Truthy => Some(HirDecisionTarget::Expr(HirExpr::Boolean(true))),
+        ConditionTarget::Falsy => Some(HirDecisionTarget::Expr(HirExpr::Boolean(false))),
     }
 }

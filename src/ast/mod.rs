@@ -6,6 +6,7 @@ mod common;
 mod debug;
 mod error;
 mod features;
+mod goto_scope;
 mod naming;
 pub(crate) mod pretty;
 mod readability;
@@ -52,6 +53,15 @@ pub(crate) fn analyze_ast_stage(
     {
         let _timing = context.timings.scope("readability");
         readability::make_readable(state, context)?;
+    }
+    {
+        let _timing = context.timings.scope("goto-scope");
+        let Some(readability) = state.readability.as_mut() else {
+            return Err(crate::decompile::DecompileError::MissingStageOutput {
+                stage: crate::decompile::DecompileStage::Ast,
+            });
+        };
+        goto_scope::verify_or_diagnose(readability, context.options.generate.mode)?;
     }
     {
         let _timing = context.timings.scope("naming");

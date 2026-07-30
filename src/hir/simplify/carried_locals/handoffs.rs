@@ -13,14 +13,12 @@
 
 use std::collections::BTreeSet;
 
-use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirStmt, LocalId, TempId};
+use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirStmt, TempId};
 
-use super::super::mention::{stmt_writes_temp, stmts_mention_local, stmts_mention_temp};
+use super::super::mention::stmt_writes_temp;
 use super::super::temp_touch::TempTouchIndex;
 use super::super::walk::rewrite_stmts;
-use super::binding::{
-    CarryBinding, TempBindingRewrite, TempToBindingPass, TempToLocalPass, TempToTempPass,
-};
+use super::binding::{BindingProtection, CarryBinding, TempBindingRewrite, TempToBindingPass};
 use super::boundary::LabelJumpIndex;
 use super::prune::{
     RedundantSelfAssignPrunePass, collect_prunable_bindings, prune_empty_assign_stmts,
@@ -40,10 +38,10 @@ pub(super) enum HandoffAction {
 pub(super) fn try_collapse_handoff_at(
     block: &mut HirBlock,
     index: usize,
-    outer_bindings: &BTreeSet<CarryBinding>,
+    outer_bindings: &dyn BindingProtection,
     temp_touches: &TempTouchIndex<'_>,
     label_jumps: &LabelJumpIndex,
-    captured_locals: &BTreeSet<LocalId>,
+    captured_bindings: &BTreeSet<CarryBinding>,
 ) -> Option<HandoffAction> {
     if try_collapse_pure_binding_handoffs(
         block,
@@ -51,7 +49,7 @@ pub(super) fn try_collapse_handoff_at(
         outer_bindings,
         temp_touches,
         label_jumps,
-        captured_locals,
+        captured_bindings,
     ) || try_collapse_label_loop_update_handoff(
         block,
         index,
@@ -64,7 +62,7 @@ pub(super) fn try_collapse_handoff_at(
         outer_bindings,
         temp_touches,
         label_jumps,
-        captured_locals,
+        captured_bindings,
     ) {
         return Some(HandoffAction::RetrySameIndex);
     }
@@ -74,7 +72,7 @@ pub(super) fn try_collapse_handoff_at(
         outer_bindings,
         temp_touches,
         label_jumps,
-        captured_locals,
+        captured_bindings,
     ) {
         return Some(HandoffAction::AdvanceIndex);
     }
@@ -84,10 +82,10 @@ pub(super) fn try_collapse_handoff_at(
 fn try_collapse_pure_binding_handoffs(
     block: &mut HirBlock,
     index: usize,
-    outer_bindings: &BTreeSet<CarryBinding>,
+    outer_bindings: &dyn BindingProtection,
     temp_touches: &TempTouchIndex<'_>,
     label_jumps: &LabelJumpIndex,
-    captured_locals: &BTreeSet<LocalId>,
+    captured_bindings: &BTreeSet<CarryBinding>,
 ) -> bool {
     let Some(seed) = binding_handoff_seed(&block.stmts[index]) else {
         return false;
@@ -98,7 +96,7 @@ fn try_collapse_pure_binding_handoffs(
         outer_bindings.contains(&CarryBinding::Temp(rewrite.from))
             || outer_bindings.contains(&rewrite.to)
             || temp_touches.touches_before(index, rewrite.from)
-            || captured_binding(captured_locals, rewrite.to)
+            || captured_bindings.contains(&rewrite.to)
     }) {
         return false;
     }
@@ -145,7 +143,7 @@ fn try_collapse_pure_binding_handoffs(
 fn try_collapse_label_loop_update_handoff(
     block: &mut HirBlock,
     index: usize,
-    outer_bindings: &BTreeSet<CarryBinding>,
+    outer_bindings: &dyn BindingProtection,
     temp_touches: &TempTouchIndex<'_>,
     label_jumps: &LabelJumpIndex,
 ) -> bool {
@@ -217,10 +215,10 @@ fn find_label_loop_update(
 fn try_collapse_single_binding_handoff(
     block: &mut HirBlock,
     index: usize,
-    outer_bindings: &BTreeSet<CarryBinding>,
+    outer_bindings: &dyn BindingProtection,
     temp_touches: &TempTouchIndex<'_>,
     label_jumps: &LabelJumpIndex,
-    captured_locals: &BTreeSet<LocalId>,
+    captured_bindings: &BTreeSet<CarryBinding>,
 ) -> bool {
     let Some((temp, binding)) = single_binding_handoff_seed(&block.stmts[index]) else {
         return false;
@@ -233,7 +231,7 @@ fn try_collapse_single_binding_handoff(
     {
         return false;
     }
-    if captured_binding(captured_locals, binding) {
+    if captured_bindings.contains(&binding) {
         return false;
     }
     if label_jumps.next_label_has_prior_goto(&block.stmts, index) {
@@ -248,16 +246,15 @@ fn try_collapse_single_binding_handoff(
         return false;
     }
 
-    let rewritten = match binding {
-        CarryBinding::Local(local) => {
-            let mut pass = TempToLocalPass { temp, local };
-            rewrite_stmts(&mut block.stmts[index + 1..], &mut pass)
-        }
-        CarryBinding::Temp(to) => {
-            let mut pass = TempToTempPass { from: temp, to };
-            rewrite_stmts(&mut block.stmts[index + 1..], &mut pass)
-        }
-    };
+    let rewritten = rewrite_stmts(
+        &mut block.stmts[index + 1..],
+        &mut TempToBindingPass {
+            rewrites: vec![TempBindingRewrite {
+                from: temp,
+                to: binding,
+            }],
+        },
+    );
     if !rewritten {
         return false;
     }
@@ -269,10 +266,10 @@ fn try_collapse_single_binding_handoff(
 fn try_collapse_binding_update_handoff(
     block: &mut HirBlock,
     index: usize,
-    outer_bindings: &BTreeSet<CarryBinding>,
+    outer_bindings: &dyn BindingProtection,
     temp_touches: &TempTouchIndex<'_>,
     label_jumps: &LabelJumpIndex,
-    captured_locals: &BTreeSet<LocalId>,
+    captured_bindings: &BTreeSet<CarryBinding>,
 ) -> bool {
     let Some((target_temp, carried)) = update_handoff_seed(&block.stmts[index]) else {
         return false;
@@ -280,7 +277,7 @@ fn try_collapse_binding_update_handoff(
 
     // 如果被折叠的 temp 在外层作用域中仍被引用，不能消除。
     if outer_bindings.contains(&CarryBinding::Temp(target_temp))
-        || captured_binding(captured_locals, carried)
+        || captured_bindings.contains(&carried)
     {
         return false;
     }
@@ -297,22 +294,15 @@ fn try_collapse_binding_update_handoff(
         return false;
     }
 
-    let rewritten = match carried {
-        CarryBinding::Local(local) => {
-            let mut pass = TempToLocalPass {
-                temp: target_temp,
-                local,
-            };
-            rewrite_stmts(&mut block.stmts[index + 1..], &mut pass)
-        }
-        CarryBinding::Temp(temp) => {
-            let mut pass = TempToTempPass {
+    let rewritten = rewrite_stmts(
+        &mut block.stmts[index + 1..],
+        &mut TempToBindingPass {
+            rewrites: vec![TempBindingRewrite {
                 from: target_temp,
-                to: temp,
-            };
-            rewrite_stmts(&mut block.stmts[index + 1..], &mut pass)
-        }
-    };
+                to: carried,
+            }],
+        },
+    );
     if !rewritten {
         return false;
     }
@@ -332,10 +322,6 @@ fn suffix_reads_binding(stmts: &[HirStmt], binding: CarryBinding) -> bool {
     let mut collector = BindingReadCollector::default();
     collector.collect_stmts(stmts);
     collector.reads.contains(&binding)
-}
-
-fn captured_binding(captured_locals: &BTreeSet<LocalId>, binding: CarryBinding) -> bool {
-    matches!(binding, CarryBinding::Local(local) if captured_locals.contains(&local))
 }
 
 fn suffix_ends_with_linear_direct_writeback(
@@ -447,6 +433,7 @@ fn stmt_writes_binding_only_via_direct_writeback(
 
 fn binding_matches_lvalue(lvalue: &HirLValue, binding: CarryBinding) -> bool {
     match (binding, lvalue) {
+        (CarryBinding::Param(binding), HirLValue::Param(param)) => binding == *param,
         (CarryBinding::Local(binding), HirLValue::Local(local)) => binding == *local,
         (CarryBinding::Temp(binding), HirLValue::Temp(temp)) => binding == *temp,
         _ => false,
@@ -461,6 +448,7 @@ fn matches_direct_writeback_pair(
 ) -> bool {
     matches!(value, HirExpr::TempRef(temp) if *temp == target_temp)
         && match (binding, target) {
+            (CarryBinding::Param(binding), HirLValue::Param(target)) => binding == *target,
             (CarryBinding::Local(binding), HirLValue::Local(target)) => binding == *target,
             (CarryBinding::Temp(binding), HirLValue::Temp(target)) => binding == *target,
             _ => false,
@@ -468,10 +456,9 @@ fn matches_direct_writeback_pair(
 }
 
 fn suffix_mentions_binding(stmts: &[HirStmt], binding: CarryBinding) -> bool {
-    match binding {
-        CarryBinding::Local(local) => stmts_mention_local(stmts, local),
-        CarryBinding::Temp(temp) => stmts_mention_temp(stmts, temp),
-    }
+    super::reads::collect_binding_mentions_by_stmt(stmts)
+        .iter()
+        .any(|mentions| mentions.contains(&binding))
 }
 
 fn stmt_reads_binding(stmt: &HirStmt, binding: CarryBinding) -> bool {

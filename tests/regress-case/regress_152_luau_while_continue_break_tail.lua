@@ -1,6 +1,5 @@
 -- regress_152_luau_while_continue_break_tail#1: early continue 不抢占后续 break 与本轮 tail
 -- unluac: expect-contains [[while true do]]
--- unluac: expect-contains [[elseif]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]

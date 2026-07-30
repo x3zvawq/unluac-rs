@@ -1,9 +1,9 @@
-//! 这个文件集中声明 StructureFacts 层的共享类型。
+//! 这个文件集中声明 Structure 的内部 evidence 与最终 `StructureFacts` 容器。
 //!
-//! 这些类型只表达“结构候选”和“必须保留的约束”，刻意不提前做最终语法决定，
-//! 这样 HIR 还能基于完整证据再做一次更稳的恢复取舍。
+//! branch/loop/short-circuit 类型只在 Structure 内参与冲突消解；对下游公开的事实已经
+//! 收窄为冻结的 `StructurePlan + children`，HIR 不再读取 raw evidence 做第二次取舍。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use crate::structure::{BlockRef, DefId, EdgeRef, PhiId, SsaValue};
 use crate::transformer::{InstrRef, Reg, RegRange};
@@ -11,215 +11,456 @@ use crate::transformer::{InstrRef, Reg, RegRange};
 use super::cfg::GraphFacts;
 
 use super::plan::{
-    BlockOwner, BranchCandidateId, BranchValueMergeId, CleanupDisposition, EdgeOwner,
-    GotoRequirementId, LoopCandidateId, PhiIncomingDisposition, RegionId,
+    BlockEmissionPlan, BlockTerminatorPlan, BranchPlanData, BranchPlanId, CleanupDisposition,
+    ConditionPlan, ConditionPlanId, EdgePlan, EdgeRegionRelation, ForwardRouteId, ForwardRouteKind,
+    ForwardRoutePlan, LabelPlan, LabelPlanId, LoopExitTailPlan, LoopPlanData, LoopPlanId,
+    LoopValueActions, LoopVmProtocol, PlanRequirements, RegionBoundarySummary, RegionId,
+    RegionNavigation, RegionPlan, ScopePlanId, SinglePassPlan, SinglePassPlanId, TbcScopePlan,
+    TbcScopePlanId, ValueDecisionPlan, ValueDecisionPlanId,
 };
 
-/// 一个 proto 的结构候选集合，以及它的子 proto 结果。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// 一个 proto 已冻结的结构计划，以及它的子 proto 结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructureFacts {
     pub plan: StructurePlan,
-    pub branch_candidates: Vec<BranchCandidate>,
-    pub branch_region_facts: Vec<BranchRegionFact>,
-    pub branch_value_merge_candidates: Vec<BranchValueMergeCandidate>,
-    pub loop_candidates: Vec<LoopCandidate>,
-    pub short_circuit_candidates: Vec<ShortCircuitCandidate>,
-    pub goto_requirements: Vec<GotoRequirement>,
-    pub region_facts: Vec<RegionFact>,
-    pub scope_candidates: Vec<ScopeCandidate>,
     pub children: Vec<StructureFacts>,
 }
 
-/// Structure 已完成冲突消解后的稳定 owner 索引。
-///
-/// HIR 必须通过这里的 candidate identity 消费结构事实，不能再按 header 临时覆盖、
-/// 取首项或在重复时把整组候选删除。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Structure 已完成冲突消解后的稠密 region/edge/value/cleanup 计划。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructurePlan {
-    pub(super) branch_by_header: BTreeMap<BlockRef, BranchCandidateId>,
-    pub(super) branch_value_merge_by_header: BTreeMap<BlockRef, BranchValueMergeId>,
-    pub(super) branch_value_merge_by_region: BTreeMap<(BlockRef, BlockRef), BranchValueMergeId>,
-    pub(super) loops_by_header: BTreeMap<BlockRef, Vec<LoopCandidateId>>,
-    pub(super) unstructured_region_by_block: Vec<Option<RegionId>>,
-    pub(super) unstructured_layouts: Vec<Option<UnstructuredRegionLayout>>,
-    pub(super) unstructured_layout_by_block: Vec<Option<RegionId>>,
-    pub(super) block_owners: Vec<BlockOwner>,
-    pub(super) edge_owners: Vec<EdgeOwner>,
+    pub(super) root: RegionId,
+    pub(super) regions: Vec<RegionPlan>,
+    pub(super) region_by_block: Vec<Option<RegionId>>,
+    pub(super) navigation: RegionNavigation,
+    pub(super) block_terminators: Vec<BlockTerminatorPlan>,
+    pub(super) block_emissions: Vec<BlockEmissionPlan>,
+    pub(super) edge_plans: Vec<EdgePlan>,
+    pub(super) forward_routes: Vec<ForwardRoutePlan>,
+    pub(super) forward_next: Vec<Option<EdgeRef>>,
+    pub(super) forward_preorder: Vec<usize>,
+    pub(super) forward_subtree_end: Vec<usize>,
+    pub(super) forward_depth: Vec<usize>,
+    pub(super) forward_owner_by_edge: Vec<Option<RegionId>>,
+    pub(super) forward_kind_by_edge: Vec<Option<ForwardRouteKind>>,
+    pub(super) forward_action_head: Vec<Option<EdgeRef>>,
+    pub(super) requirements: PlanRequirements,
+    pub(super) labels: Vec<LabelPlan>,
+    pub(super) label_by_block: Vec<Option<LabelPlanId>>,
+    pub(super) branches: Vec<BranchPlanData>,
+    pub(super) single_passes: Vec<SinglePassPlan>,
+    pub(super) single_pass_by_region: Vec<Option<SinglePassPlanId>>,
+    pub(super) loops: Vec<LoopPlanData>,
+    pub(super) loop_region_by_plan: Vec<RegionId>,
+    pub(super) loop_exit_tail_by_block: Vec<Option<LoopPlanId>>,
+    pub(super) loop_exit_tail_by_edge: Vec<Option<LoopPlanId>>,
+    pub(super) loop_exit_tail_by_cleanup_instr: Vec<Option<LoopPlanId>>,
+    pub(super) conditions: Vec<ConditionPlan>,
+    pub(super) condition_value_by_phi: Vec<Option<(ConditionPlanId, super::plan::ConditionNodeId)>>,
+    pub(super) absorbed_condition_by_block: Vec<Option<ConditionPlanId>>,
+    pub(super) value_decisions: Vec<ValueDecisionPlan>,
+    pub(super) value_decision_region_by_plan: Vec<RegionId>,
+    pub(super) value_decision_by_phi: Vec<Option<ValueDecisionPlanId>>,
+    pub(super) scopes: Vec<ScopePlan>,
+    pub(super) tbc_scopes: Vec<TbcScopePlan>,
+    pub(super) phis: Vec<super::plan::PhiPlan>,
+    pub(super) phis_by_block: Vec<Vec<PhiId>>,
+    pub(super) phis_by_region: Vec<Vec<PhiId>>,
     pub(super) cleanup_dispositions: Vec<Option<CleanupDisposition>>,
-    pub(super) generic_phi_materializations: Vec<Option<GenericPhiMaterialization>>,
-    pub(super) generic_phi_materializations_by_block: Vec<Vec<GenericPhiMaterialization>>,
-    pub(super) phi_incoming_dispositions: Vec<Vec<PhiIncomingDisposition>>,
-    pub(super) phi_edge_copies: Vec<Vec<PhiEdgeCopy>>,
 }
 
 impl StructurePlan {
-    pub(super) fn phi_is_dead(&self, phi_id: PhiId) -> bool {
-        matches!(
-            self.phi_incoming_dispositions[phi_id.index()].first(),
-            Some(PhiIncomingDisposition::Dead)
-        )
+    pub const fn root(&self) -> RegionId {
+        self.root
     }
 
-    pub(super) fn phi_has_edge_copy(&self, phi_id: PhiId) -> bool {
-        self.phi_incoming_dispositions[phi_id.index()]
+    pub fn region(&self, id: RegionId) -> Option<&RegionPlan> {
+        self.regions.get(id.index())
+    }
+
+    pub fn regions(&self) -> impl ExactSizeIterator<Item = (RegionId, &RegionPlan)> {
+        self.regions
             .iter()
-            .any(|owner| matches!(owner, PhiIncomingDisposition::EdgeCopy))
+            .enumerate()
+            .map(|(index, region)| (RegionId(index), region))
     }
 
-    pub(super) fn phi_is_edge_owned(&self, phi_id: PhiId) -> bool {
-        let owners = &self.phi_incoming_dispositions[phi_id.index()];
-        self.phi_has_edge_copy(phi_id)
-            && owners.iter().all(|owner| {
-                matches!(
-                    owner,
-                    PhiIncomingDisposition::EdgeCopy | PhiIncomingDisposition::Unreachable
-                )
-            })
-    }
-}
-
-impl StructureFacts {
-    pub fn branch_candidate_for_header(&self, header: BlockRef) -> Option<&BranchCandidate> {
-        let id = self.plan.branch_by_header.get(&header)?;
-        self.branch_candidate(*id)
+    pub fn region_for_block(&self, block: BlockRef) -> Option<RegionId> {
+        self.region_by_block.get(block.index()).copied().flatten()
     }
 
-    pub fn branch_candidate(&self, id: BranchCandidateId) -> Option<&BranchCandidate> {
-        self.branch_candidates.get(id.index())
+    pub fn region_contains(&self, outer: RegionId, inner: RegionId) -> bool {
+        self.navigation.contains(outer, inner)
     }
 
-    pub fn branch_candidates_by_header(
+    pub fn edge_region_relation(&self, edge: EdgeRef) -> Option<EdgeRegionRelation> {
+        self.navigation.edge_relation(edge)
+    }
+
+    pub fn region_boundary(&self, region: RegionId) -> Option<RegionBoundarySummary> {
+        self.navigation.boundary(region)
+    }
+
+    pub(crate) fn region_postorder(&self) -> &[RegionId] {
+        self.navigation.postorder()
+    }
+
+    pub fn block_terminator(&self, block: BlockRef) -> Option<&BlockTerminatorPlan> {
+        self.block_terminators.get(block.index())
+    }
+
+    pub fn block_emission(&self, block: BlockRef) -> Option<BlockEmissionPlan> {
+        self.block_emissions.get(block.index()).copied()
+    }
+
+    pub fn edge_plan(&self, edge: EdgeRef) -> Option<&EdgePlan> {
+        self.edge_plans.get(edge.index())
+    }
+
+    pub fn forward_route(&self, id: ForwardRouteId) -> Option<&ForwardRoutePlan> {
+        self.forward_routes.get(id.index())
+    }
+
+    pub fn forward_routes(
         &self,
-    ) -> impl Iterator<Item = (BlockRef, &BranchCandidate)> {
-        self.plan
-            .branch_by_header
+    ) -> impl ExactSizeIterator<Item = (ForwardRouteId, &ForwardRoutePlan)> {
+        self.forward_routes
             .iter()
-            .filter_map(|(header, id)| {
-                self.branch_candidate(*id)
-                    .map(|candidate| (*header, candidate))
-            })
+            .enumerate()
+            .map(|(index, route)| (ForwardRouteId(index), route))
     }
 
-    pub fn branch_value_merge_for_header(
+    pub fn forward_route_edges(
         &self,
-        header: BlockRef,
-    ) -> Option<&BranchValueMergeCandidate> {
-        let id = self.plan.branch_value_merge_by_header.get(&header)?;
-        self.branch_value_merge_candidates.get(id.index())
+        id: ForwardRouteId,
+    ) -> impl ExactSizeIterator<Item = EdgeRef> + '_ {
+        let route = self.forward_route(id);
+        ForwardRouteEdges {
+            next: &self.forward_next,
+            current: route.map(|route| route.first),
+            remaining: route.map_or(0, |route| route.len),
+        }
     }
 
-    pub fn branch_value_merge_for_region(
+    pub(crate) fn forward_route_contains_edge(&self, id: ForwardRouteId, edge: EdgeRef) -> bool {
+        let Some(route) = self.forward_route(id) else {
+            return false;
+        };
+        self.forward_edge_is_ancestor(edge, route.first)
+            && self.forward_edge_is_ancestor(route.last, edge)
+    }
+
+    pub(crate) fn forward_route_action_edges(
         &self,
-        header: BlockRef,
-        merge: BlockRef,
-    ) -> Option<&BranchValueMergeCandidate> {
-        let id = self
-            .plan
-            .branch_value_merge_by_region
-            .get(&(header, merge))?;
-        self.branch_value_merge_candidates.get(id.index())
+        id: ForwardRouteId,
+    ) -> impl Iterator<Item = EdgeRef> + '_ {
+        let current = self.forward_route(id).and_then(|route| {
+            self.forward_action_head
+                .get(route.first.index())
+                .copied()
+                .flatten()
+        });
+        ForwardRouteActionEdges {
+            plan: self,
+            route: id,
+            current,
+        }
     }
 
-    pub fn loop_candidate(&self, id: LoopCandidateId) -> Option<&LoopCandidate> {
-        self.loop_candidates.get(id.index())
-    }
-
-    pub fn goto_requirement(&self, id: GotoRequirementId) -> Option<&GotoRequirement> {
-        self.goto_requirements.get(id.index())
-    }
-
-    pub fn region(&self, id: RegionId) -> Option<&RegionFact> {
-        self.region_facts.get(id.index())
-    }
-
-    pub fn loop_candidates_for_header(
-        &self,
-        header: BlockRef,
-    ) -> impl DoubleEndedIterator<Item = (LoopCandidateId, &LoopCandidate)> {
-        self.plan
-            .loops_by_header
-            .get(&header)
-            .into_iter()
-            .flatten()
+    pub(crate) fn edge_action_is_forwarded_only(&self, edge: EdgeRef) -> bool {
+        self.forward_kind_by_edge
+            .get(edge.index())
             .copied()
-            .filter_map(|id| self.loop_candidate(id).map(|candidate| (id, candidate)))
+            .flatten()
+            == Some(ForwardRouteKind::ExclusiveBreak)
     }
 
-    pub fn loop_headers(&self) -> impl Iterator<Item = BlockRef> + '_ {
-        self.plan.loops_by_header.keys().copied()
+    pub(crate) fn forward_path_contains_edge(
+        &self,
+        first: EdgeRef,
+        last: EdgeRef,
+        edge: EdgeRef,
+    ) -> bool {
+        self.forward_edge_is_ancestor(edge, first) && self.forward_edge_is_ancestor(last, edge)
     }
 
-    pub fn has_loop_header(&self, header: BlockRef) -> bool {
-        self.plan.loops_by_header.contains_key(&header)
+    fn forward_edge_is_ancestor(&self, ancestor: EdgeRef, edge: EdgeRef) -> bool {
+        let Some(ancestor_start) = self.forward_preorder.get(ancestor.index()).copied() else {
+            return false;
+        };
+        let Some(ancestor_end) = self.forward_subtree_end.get(ancestor.index()).copied() else {
+            return false;
+        };
+        let Some(edge_start) = self.forward_preorder.get(edge.index()).copied() else {
+            return false;
+        };
+        ancestor_start != usize::MAX
+            && edge_start != usize::MAX
+            && ancestor_start <= edge_start
+            && edge_start < ancestor_end
     }
 
-    pub fn block_owner(&self, block: BlockRef) -> Option<BlockOwner> {
-        self.plan.block_owners.get(block.index()).copied()
+    pub fn requirements(&self) -> &PlanRequirements {
+        &self.requirements
     }
 
-    pub fn edge_owner(&self, edge: EdgeRef) -> Option<EdgeOwner> {
-        self.plan.edge_owners.get(edge.index()).copied()
+    pub fn label(&self, id: LabelPlanId) -> Option<&LabelPlan> {
+        self.labels.get(id.index())
     }
 
-    pub fn unstructured_region(&self, block: BlockRef) -> Option<RegionId> {
-        self.plan
-            .unstructured_region_by_block
+    pub fn label_for_block(&self, block: BlockRef) -> Option<LabelPlanId> {
+        self.label_by_block.get(block.index()).copied().flatten()
+    }
+
+    pub fn labels(&self) -> impl ExactSizeIterator<Item = (LabelPlanId, &LabelPlan)> {
+        self.labels
+            .iter()
+            .enumerate()
+            .map(|(index, label)| (LabelPlanId(index), label))
+    }
+
+    pub fn branch(&self, id: BranchPlanId) -> Option<&BranchPlanData> {
+        self.branches.get(id.index())
+    }
+
+    pub fn single_pass(&self, id: SinglePassPlanId) -> Option<&SinglePassPlan> {
+        self.single_passes.get(id.index())
+    }
+
+    pub fn single_pass_for_region(
+        &self,
+        region: RegionId,
+    ) -> Option<(SinglePassPlanId, &SinglePassPlan)> {
+        let id = self
+            .single_pass_by_region
+            .get(region.index())
+            .copied()
+            .flatten()?;
+        self.single_pass(id).map(|plan| (id, plan))
+    }
+
+    pub fn loop_(&self, id: LoopPlanId) -> Option<&LoopPlanData> {
+        self.loops.get(id.index())
+    }
+
+    pub fn loop_protocol(&self, id: LoopPlanId) -> Option<&LoopVmProtocol> {
+        self.loops.get(id.index())?.protocol.as_ref()
+    }
+
+    pub fn loop_value_actions(&self, id: LoopPlanId) -> Option<&LoopValueActions> {
+        self.loops.get(id.index())?.value_actions.as_ref()
+    }
+
+    pub fn loop_region(&self, id: LoopPlanId) -> Option<RegionId> {
+        self.loop_region_by_plan.get(id.index()).copied()
+    }
+
+    pub fn loop_exit_tail_for_block(
+        &self,
+        block: BlockRef,
+    ) -> Option<(LoopPlanId, &LoopExitTailPlan)> {
+        let id = self
+            .loop_exit_tail_by_block
+            .get(block.index())
+            .copied()
+            .flatten()?;
+        self.loop_(id)?.exit_tail.as_ref().map(|tail| (id, tail))
+    }
+
+    pub fn loop_exit_tail_for_edge(
+        &self,
+        edge: EdgeRef,
+    ) -> Option<(LoopPlanId, &LoopExitTailPlan)> {
+        let id = self
+            .loop_exit_tail_by_edge
+            .get(edge.index())
+            .copied()
+            .flatten()?;
+        self.loop_(id)?.exit_tail.as_ref().map(|tail| (id, tail))
+    }
+
+    pub fn loop_exit_tail_for_cleanup_instr(
+        &self,
+        instr: InstrRef,
+    ) -> Option<(LoopPlanId, &LoopExitTailPlan)> {
+        let id = self
+            .loop_exit_tail_by_cleanup_instr
+            .get(instr.index())
+            .copied()
+            .flatten()?;
+        self.loop_(id)?.exit_tail.as_ref().map(|tail| (id, tail))
+    }
+
+    pub fn condition(&self, id: ConditionPlanId) -> Option<&ConditionPlan> {
+        self.conditions.get(id.index())
+    }
+
+    pub fn condition_value_owner(
+        &self,
+        phi: PhiId,
+    ) -> Option<(ConditionPlanId, super::plan::ConditionNodeId)> {
+        self.condition_value_by_phi
+            .get(phi.index())
+            .copied()
+            .flatten()
+    }
+
+    pub(crate) fn absorbed_condition_owner(&self, block: BlockRef) -> Option<ConditionPlanId> {
+        self.absorbed_condition_by_block
             .get(block.index())
             .copied()
             .flatten()
     }
 
-    pub fn unstructured_layout(&self, region: RegionId) -> Option<&UnstructuredRegionLayout> {
-        self.plan.unstructured_layouts.get(region.index())?.as_ref()
+    pub fn value_decision(&self, id: ValueDecisionPlanId) -> Option<&ValueDecisionPlan> {
+        self.value_decisions.get(id.index())
     }
 
-    pub fn cleanup_disposition(&self, instr: InstrRef) -> CleanupDisposition {
-        self.plan
-            .cleanup_dispositions
-            .get(instr.index())
-            .copied()
-            .flatten()
-            .expect("cleanup instruction must have one disposition")
+    pub fn value_decision_region(&self, id: ValueDecisionPlanId) -> Option<RegionId> {
+        self.value_decision_region_by_plan.get(id.index()).copied()
     }
 
-    pub fn generic_phi_materialization(&self, phi_id: PhiId) -> Option<GenericPhiMaterialization> {
-        self.plan
-            .generic_phi_materializations
-            .get(phi_id.index())
+    pub fn value_decision_owner(&self, phi: PhiId) -> Option<ValueDecisionPlanId> {
+        self.value_decision_by_phi
+            .get(phi.index())
             .copied()
             .flatten()
     }
 
-    pub fn generic_phi_materializations(
-        &self,
-    ) -> impl Iterator<Item = GenericPhiMaterialization> + '_ {
-        self.plan
-            .generic_phi_materializations
+    pub(crate) fn scope(&self, id: ScopePlanId) -> Option<&ScopePlan> {
+        self.scopes.get(id.index())
+    }
+
+    pub fn tbc_scope(&self, id: TbcScopePlanId) -> Option<&TbcScopePlan> {
+        self.tbc_scopes.get(id.index())
+    }
+
+    pub fn branches(&self) -> impl ExactSizeIterator<Item = (BranchPlanId, &BranchPlanData)> {
+        self.branches
             .iter()
-            .copied()
-            .flatten()
+            .enumerate()
+            .map(|(index, branch)| (BranchPlanId(index), branch))
     }
 
-    pub fn generic_phi_materializations_in_block(
+    pub fn single_passes(
         &self,
-        block: BlockRef,
-    ) -> &[GenericPhiMaterialization] {
-        self.plan
-            .generic_phi_materializations_by_block
+    ) -> impl ExactSizeIterator<Item = (SinglePassPlanId, &SinglePassPlan)> {
+        self.single_passes
+            .iter()
+            .enumerate()
+            .map(|(index, plan)| (SinglePassPlanId(index), plan))
+    }
+
+    pub fn loops(&self) -> impl ExactSizeIterator<Item = (LoopPlanId, &LoopPlanData)> {
+        self.loops
+            .iter()
+            .enumerate()
+            .map(|(index, loop_)| (LoopPlanId(index), loop_))
+    }
+
+    pub fn conditions(&self) -> impl ExactSizeIterator<Item = (ConditionPlanId, &ConditionPlan)> {
+        self.conditions
+            .iter()
+            .enumerate()
+            .map(|(index, condition)| (ConditionPlanId(index), condition))
+    }
+
+    pub fn value_decisions(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (ValueDecisionPlanId, &ValueDecisionPlan)> {
+        self.value_decisions
+            .iter()
+            .enumerate()
+            .map(|(index, decision)| (ValueDecisionPlanId(index), decision))
+    }
+
+    pub fn phi_plan(&self, phi_id: PhiId) -> Option<&super::plan::PhiPlan> {
+        self.phis.get(phi_id.index())
+    }
+
+    pub fn phis(&self) -> impl ExactSizeIterator<Item = &super::plan::PhiPlan> {
+        self.phis.iter()
+    }
+
+    pub fn phis_in_block(&self, block: BlockRef) -> &[PhiId] {
+        self.phis_by_block
             .get(block.index())
             .map_or(&[], Vec::as_slice)
     }
 
-    pub fn phi_edge_copies(&self, edge: EdgeRef) -> &[PhiEdgeCopy] {
-        &self.plan.phi_edge_copies[edge.index()]
+    pub fn phis_for_region(&self, region: RegionId) -> &[PhiId] {
+        self.phis_by_region
+            .get(region.index())
+            .map_or(&[], Vec::as_slice)
     }
 
-    pub fn phi_is_dead(&self, phi_id: PhiId) -> bool {
-        self.plan.phi_is_dead(phi_id)
+    pub fn cleanup_disposition(&self, instr: InstrRef) -> Option<CleanupDisposition> {
+        self.cleanup_dispositions
+            .get(instr.index())
+            .copied()
+            .flatten()
+    }
+}
+
+struct ForwardRouteEdges<'a> {
+    next: &'a [Option<EdgeRef>],
+    current: Option<EdgeRef>,
+    remaining: usize,
+}
+
+impl Iterator for ForwardRouteEdges<'_> {
+    type Item = EdgeRef;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let edge = self.current?;
+        self.remaining -= 1;
+        self.current = self.next.get(edge.index()).copied().flatten();
+        Some(edge)
     }
 
-    pub fn phi_is_edge_owned(&self, phi_id: PhiId) -> bool {
-        self.plan.phi_is_edge_owned(phi_id)
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for ForwardRouteEdges<'_> {}
+
+struct ForwardRouteActionEdges<'a> {
+    plan: &'a StructurePlan,
+    route: ForwardRouteId,
+    current: Option<EdgeRef>,
+}
+
+impl Iterator for ForwardRouteActionEdges<'_> {
+    type Item = EdgeRef;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let edge = self
+            .current
+            .filter(|edge| self.plan.forward_route_contains_edge(self.route, *edge))?;
+        self.current = self
+            .plan
+            .forward_next
+            .get(edge.index())
+            .copied()
+            .flatten()
+            .and_then(|next| {
+                self.plan
+                    .forward_action_head
+                    .get(next.index())
+                    .copied()
+                    .flatten()
+            });
+        Some(edge)
+    }
+}
+
+impl StructureFacts {
+    pub const fn plan(&self) -> &StructurePlan {
+        &self.plan
     }
 }
 
@@ -230,34 +471,11 @@ pub struct PhiEdgeCopy {
     pub value: SsaValue,
 }
 
-/// 不可规约 region 的实际 mixed-lowering 布局。
+/// Structure 内部 evidence 可附带的既有 island 布局提示。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnstructuredRegionLayout {
     pub blocks: BTreeSet<BlockRef>,
     pub continuation: BlockRef,
-}
-
-/// 一个仍需 generic unresolved 物化的 phi。
-///
-/// 结构层已经尽力把 branch/loop/short-circuit 能直接解释成源码结构的 phi 接管掉了；
-/// 剩下这些说明当前还没有更高层的结构 owner，HIR 只能保守落成 generic phi temp。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash)]
-pub struct GenericPhiMaterialization {
-    pub block: BlockRef,
-    pub phi_id: PhiId,
-    pub reg: Reg,
-    pub source: GenericPhiSource,
-}
-
-/// generic phi fallback 的保守来源事实。
-///
-/// `IdomExit` 表示所有 incoming defs 都等于该支配块出口处的寄存器值；HIR 可以用这个
-/// block 降表达式。`Unresolved` 表示 Structure 无法证明单一来源，后层应显式暴露
-/// unresolved，而不是猜某个 predecessor。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash)]
-pub enum GenericPhiSource {
-    IdomExit(BlockRef),
-    Unresolved,
 }
 
 /// 一个分支结构候选。
@@ -281,16 +499,58 @@ pub enum BranchKind {
 
 /// 一个普通 branch 区域的共享边界事实。
 ///
-/// 普通非回环 branch 的结构区域精确等于 `header` 的支配子树减去 `merge` 的
-/// 支配子树，因此不为每个嵌套 branch 复制一份 block 集合。只有 `merge` 支配
-/// `header` 的循环边界无法用这个差集表达，才保留显式集合。
+/// 普通非回环 branch 的结构区域精确等于 `header` 的支配子树减去若干支配子树。
+/// 必须冻结特殊改写的精确边界时，也只保存 dominator preorder 的连续区间，不再为
+/// 每个嵌套 branch 复制完整 block 集。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchRegionFact {
     pub header: BlockRef,
     pub merge: BlockRef,
     pub kind: BranchKind,
     pub single_pass_fence: Option<SinglePassFenceFact>,
-    pub(super) explicit_structured_blocks: Option<BTreeSet<BlockRef>>,
+    pub(super) domain: BranchRegionDomain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct BranchRegionDomain {
+    pub spans: Vec<BranchRegionSpan>,
+    pub included_blocks: Vec<BlockRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct BranchRegionSpan {
+    pub root: BlockRef,
+    pub excluded_subtrees: Vec<BlockRef>,
+}
+
+impl BranchRegionDomain {
+    pub(super) fn from_span(
+        root: BlockRef,
+        excluded_subtrees: impl IntoIterator<Item = BlockRef>,
+    ) -> Self {
+        Self {
+            spans: vec![BranchRegionSpan {
+                root,
+                excluded_subtrees: excluded_subtrees.into_iter().collect(),
+            }],
+            included_blocks: Vec::new(),
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.spans.is_empty() && self.included_blocks.is_empty()
+    }
+
+    pub(super) fn contains(&self, graph_facts: &GraphFacts, block: BlockRef) -> bool {
+        self.included_blocks.binary_search(&block).is_ok()
+            || self.spans.iter().any(|span| {
+                graph_facts.dominates(span.root, block)
+                    && span
+                        .excluded_subtrees
+                        .iter()
+                        .all(|excluded| !graph_facts.dominates(*excluded, block))
+            })
+    }
 }
 
 /// 编译器消去 `repeat ... until true` 回边后仍保留的单次 fence 控制事实。
@@ -301,43 +561,136 @@ pub struct SinglePassFenceFact {
 }
 
 impl BranchRegionFact {
-    pub fn contains_structured_block(&self, graph_facts: &GraphFacts, block: BlockRef) -> bool {
-        self.explicit_structured_blocks.as_ref().map_or_else(
-            || {
-                graph_facts.dominates(self.header, block)
-                    && !graph_facts.dominates(self.merge, block)
-            },
-            |blocks| blocks.contains(&block),
-        )
+    pub(super) fn new(
+        graph_facts: &GraphFacts,
+        header: BlockRef,
+        merge: BlockRef,
+        kind: BranchKind,
+        single_pass_fence: Option<SinglePassFenceFact>,
+    ) -> Self {
+        let excluded_subtrees = if let Some(fence) = &single_pass_fence {
+            vec![merge, fence.exit]
+        } else if graph_facts.dominates(merge, header) {
+            Vec::new()
+        } else {
+            vec![merge]
+        };
+        let domain = BranchRegionDomain {
+            spans: vec![BranchRegionSpan {
+                root: header,
+                excluded_subtrees,
+            }],
+            included_blocks: Vec::new(),
+        };
+        Self {
+            header,
+            merge,
+            kind,
+            single_pass_fence,
+            domain,
+        }
+    }
+
+    pub(super) fn replace_domain(&mut self, mut domain: BranchRegionDomain) {
+        domain.included_blocks.sort_unstable();
+        domain.included_blocks.dedup();
+        self.domain = domain;
+    }
+
+    pub(super) fn preorder_intervals(
+        &self,
+        graph_facts: &GraphFacts,
+    ) -> Result<Vec<std::ops::Range<usize>>, BlockRef> {
+        let position = |block: BlockRef| {
+            graph_facts
+                .dominator_tree
+                .preorder_index
+                .get(block.index())
+                .copied()
+                .flatten()
+                .ok_or(block)
+        };
+        let subtree_end = |block: BlockRef| {
+            graph_facts
+                .dominator_tree
+                .subtree_end
+                .get(block.index())
+                .copied()
+                .flatten()
+                .ok_or(block)
+        };
+
+        let mut intervals = Vec::<std::ops::Range<usize>>::new();
+        for span in &self.domain.spans {
+            let start = position(span.root)?;
+            let end = subtree_end(span.root)?;
+            let mut holes = span
+                .excluded_subtrees
+                .iter()
+                .copied()
+                .map(|block| Ok(position(block)?..subtree_end(block)?))
+                .collect::<Result<Vec<_>, BlockRef>>()?;
+            holes.sort_unstable_by_key(|hole| (hole.start, hole.end));
+
+            let mut cursor = start;
+            for hole in holes {
+                let hole_start = hole.start.max(start).min(end);
+                let hole_end = hole.end.max(start).min(end);
+                if cursor < hole_start {
+                    intervals.push(cursor..hole_start);
+                }
+                cursor = cursor.max(hole_end);
+            }
+            if cursor < end {
+                intervals.push(cursor..end);
+            }
+        }
+        intervals.extend(
+            self.domain
+                .included_blocks
+                .iter()
+                .copied()
+                .map(|block| position(block).map(|position| position..position + 1))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        intervals.sort_unstable_by_key(|interval| (interval.start, interval.end));
+        let mut merged = Vec::<std::ops::Range<usize>>::with_capacity(intervals.len());
+        for interval in intervals {
+            if let Some(last) = merged.last_mut()
+                && interval.start <= last.end
+            {
+                last.end = last.end.max(interval.end);
+            } else if !interval.is_empty() {
+                merged.push(interval);
+            }
+        }
+        Ok(merged)
     }
 
     pub fn structured_blocks<'a>(
         &'a self,
         graph_facts: &'a GraphFacts,
-    ) -> impl Iterator<Item = BlockRef> + 'a {
-        let dominance_interval = self
-            .explicit_structured_blocks
-            .is_none()
-            .then_some(())
-            .and_then(|()| {
-                let start = graph_facts.dominator_tree.preorder_index[self.header.index()]?;
-                let end = graph_facts.dominator_tree.subtree_end[self.header.index()]?;
-                graph_facts.dominator_tree.order.get(start..end)
-            })
-            .unwrap_or_default();
-        self.explicit_structured_blocks
-            .iter()
-            .flat_map(|blocks| blocks.iter().copied())
-            .chain(
-                dominance_interval
-                    .iter()
-                    .copied()
-                    .filter(|block| self.contains_structured_block(graph_facts, *block)),
-            )
-    }
-
-    pub(super) fn explicit_structured_blocks(&self) -> Option<&BTreeSet<BlockRef>> {
-        self.explicit_structured_blocks.as_ref()
+    ) -> Result<impl Iterator<Item = BlockRef> + 'a, BlockRef> {
+        let intervals = self.preorder_intervals(graph_facts)?;
+        for interval in &intervals {
+            if graph_facts
+                .dominator_tree
+                .order
+                .get(interval.clone())
+                .is_none()
+            {
+                return Err(self.header);
+            }
+        }
+        Ok(intervals.into_iter().flat_map(|interval| {
+            graph_facts
+                .dominator_tree
+                .order
+                .get(interval)
+                .into_iter()
+                .flatten()
+                .copied()
+        }))
     }
 }
 
@@ -401,6 +754,8 @@ pub struct LoopCandidate {
     pub body_scope_blocks: BTreeSet<BlockRef>,
     /// 已被循环语法或规范化出口吸收、无需作为源码 body 单独降低的 block。
     pub control_blocks: BTreeSet<BlockRef>,
+    /// VM latch 指向的重复终止块与 preheader 正常出口语义等价；源码只发射后者。
+    pub normalized_exit_aliases: Vec<LoopExitAlias>,
     pub backedges: Vec<EdgeRef>,
     pub exits: BTreeSet<BlockRef>,
     pub continue_target: Option<BlockRef>,
@@ -412,6 +767,12 @@ pub struct LoopCandidate {
     pub source_bindings: Option<LoopSourceBindings>,
     pub header_value_merges: Vec<LoopValueMerge>,
     pub exit_value_merges: Vec<LoopExitValueMergeCandidate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LoopExitAlias {
+    pub block: BlockRef,
+    pub continuation: BlockRef,
 }
 
 /// 循环头已经暴露给 HIR 的源码绑定证据。
@@ -449,22 +810,6 @@ impl LoopValueArm {
         self.incomings
             .iter()
             .any(|incoming| incoming.pred == Some(pred))
-    }
-
-    pub fn incoming_for_pred(&self, pred: BlockRef) -> Option<&LoopValueIncoming> {
-        self.incomings
-            .iter()
-            .find(|incoming| incoming.pred == Some(pred))
-    }
-
-    pub fn entry_incoming(&self) -> Option<&LoopValueIncoming> {
-        self.incomings
-            .iter()
-            .find(|incoming| incoming.pred.is_none())
-    }
-
-    pub fn preds(&self) -> impl Iterator<Item = BlockRef> + '_ {
-        self.incomings.iter().filter_map(|incoming| incoming.pred)
     }
 
     pub fn values(&self) -> impl Iterator<Item = SsaValue> + '_ {
@@ -530,131 +875,6 @@ impl ShortCircuitCandidate {
             })
             .collect()
     }
-
-    pub(crate) fn value_truthiness_leaves(
-        &self,
-    ) -> Option<(BTreeSet<BlockRef>, BTreeSet<BlockRef>)> {
-        let ShortCircuitExit::ValueMerge(_) = self.exit else {
-            return None;
-        };
-
-        fn collect_truthy_value_leaves(
-            short: &ShortCircuitCandidate,
-            node_ref: ShortCircuitNodeRef,
-            truthy_memo: &mut BTreeMap<ShortCircuitNodeRef, BTreeSet<BlockRef>>,
-            falsy_memo: &mut BTreeMap<ShortCircuitNodeRef, BTreeSet<BlockRef>>,
-        ) -> Option<BTreeSet<BlockRef>> {
-            if let Some(leaves) = truthy_memo.get(&node_ref) {
-                return Some(leaves.clone());
-            }
-
-            let node = short.nodes.get(node_ref.index())?;
-            let leaves =
-                collect_target_value_leaves(short, &node.truthy, true, truthy_memo, falsy_memo)?;
-            Some(truthy_memo.entry(node_ref).or_insert(leaves).clone())
-        }
-
-        fn collect_falsy_value_leaves(
-            short: &ShortCircuitCandidate,
-            node_ref: ShortCircuitNodeRef,
-            truthy_memo: &mut BTreeMap<ShortCircuitNodeRef, BTreeSet<BlockRef>>,
-            falsy_memo: &mut BTreeMap<ShortCircuitNodeRef, BTreeSet<BlockRef>>,
-        ) -> Option<BTreeSet<BlockRef>> {
-            if let Some(leaves) = falsy_memo.get(&node_ref) {
-                return Some(leaves.clone());
-            }
-
-            let node = short.nodes.get(node_ref.index())?;
-            let leaves =
-                collect_target_value_leaves(short, &node.falsy, false, truthy_memo, falsy_memo)?;
-            Some(falsy_memo.entry(node_ref).or_insert(leaves).clone())
-        }
-
-        fn collect_target_value_leaves(
-            short: &ShortCircuitCandidate,
-            target: &ShortCircuitTarget,
-            want_truthy: bool,
-            truthy_memo: &mut BTreeMap<ShortCircuitNodeRef, BTreeSet<BlockRef>>,
-            falsy_memo: &mut BTreeMap<ShortCircuitNodeRef, BTreeSet<BlockRef>>,
-        ) -> Option<BTreeSet<BlockRef>> {
-            match target {
-                ShortCircuitTarget::Node(next_ref) => {
-                    if want_truthy {
-                        collect_truthy_value_leaves(short, *next_ref, truthy_memo, falsy_memo)
-                    } else {
-                        collect_falsy_value_leaves(short, *next_ref, truthy_memo, falsy_memo)
-                    }
-                }
-                ShortCircuitTarget::Value(block) => Some(BTreeSet::from([*block])),
-                ShortCircuitTarget::TruthyExit | ShortCircuitTarget::FalsyExit => None,
-            }
-        }
-
-        let mut truthy_memo = BTreeMap::new();
-        let mut falsy_memo = BTreeMap::new();
-        let truthy_leaves =
-            collect_truthy_value_leaves(self, self.entry, &mut truthy_memo, &mut falsy_memo)?;
-        let falsy_leaves =
-            collect_falsy_value_leaves(self, self.entry, &mut truthy_memo, &mut falsy_memo)?;
-        Some((truthy_leaves, falsy_leaves))
-    }
-
-    pub(crate) fn node_depths(&self) -> BTreeMap<ShortCircuitNodeRef, usize> {
-        let mut depths = BTreeMap::new();
-        let mut worklist = vec![(self.entry, 0usize)];
-
-        while let Some((node_ref, depth)) = worklist.pop() {
-            if depths
-                .get(&node_ref)
-                .is_some_and(|known_depth| *known_depth <= depth)
-            {
-                continue;
-            }
-            depths.insert(node_ref, depth);
-
-            let Some(node) = self.nodes.get(node_ref.index()) else {
-                continue;
-            };
-            if let ShortCircuitTarget::Node(next_ref) = node.truthy {
-                worklist.push((next_ref, depth + 1));
-            }
-            if let ShortCircuitTarget::Node(next_ref) = node.falsy {
-                worklist.push((next_ref, depth + 1));
-            }
-        }
-
-        depths
-    }
-
-    pub(crate) fn node_leaves(
-        &self,
-        node_ref: ShortCircuitNodeRef,
-        memo: &mut BTreeMap<ShortCircuitNodeRef, BTreeSet<BlockRef>>,
-    ) -> BTreeSet<BlockRef> {
-        if let Some(leaves) = memo.get(&node_ref) {
-            return leaves.clone();
-        }
-
-        let Some(node) = self.nodes.get(node_ref.index()) else {
-            return BTreeSet::new();
-        };
-
-        let mut leaves = self.target_leaves(&node.truthy, memo);
-        leaves.extend(self.target_leaves(&node.falsy, memo));
-        memo.entry(node_ref).or_insert(leaves).clone()
-    }
-
-    fn target_leaves(
-        &self,
-        target: &ShortCircuitTarget,
-        memo: &mut BTreeMap<ShortCircuitNodeRef, BTreeSet<BlockRef>>,
-    ) -> BTreeSet<BlockRef> {
-        match target {
-            ShortCircuitTarget::Node(next_ref) => self.node_leaves(*next_ref, memo),
-            ShortCircuitTarget::Value(block) => BTreeSet::from([*block]),
-            ShortCircuitTarget::TruthyExit | ShortCircuitTarget::FalsyExit => BTreeSet::new(),
-        }
-    }
 }
 
 /// 值型 short-circuit merge 每个叶子最终送进 merge 的 canonical SSA 值。
@@ -715,14 +935,17 @@ pub enum ShortCircuitExit {
     BranchExit { truthy: BlockRef, falsy: BlockRef },
 }
 
-/// 一个必须保留跳转的要求。
+/// 结构候选尚未吸收的一条控制边证据。
+///
+/// 这只是 Structure 内部冻结最终 edge transfer 的输入，不是对下游公开的
+/// `goto` 语法需求。
 #[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash)]
-pub struct GotoRequirement {
-    pub edge: EdgeRef,
-    pub reason: GotoReason,
+pub(super) struct ResidualTransferEvidence {
+    pub(super) edge: EdgeRef,
+    pub(super) reason: GotoReason,
 }
 
-/// 为什么这条边当前不能被结构候选吸收。
+/// 最终计划为什么需要把这条边表达为显式 `goto`。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum GotoReason {
     IrreducibleFlow,
@@ -740,9 +963,9 @@ pub struct RegionFact {
     pub exits: BTreeSet<BlockRef>,
 }
 
-/// 一个潜在的词法 scope。
+/// 已冻结的词法 cleanup scope。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScopeCandidate {
+pub struct ScopePlan {
     pub entry: BlockRef,
     pub exit: Option<BlockRef>,
     pub close_points: Vec<InstrRef>,

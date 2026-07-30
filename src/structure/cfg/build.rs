@@ -9,6 +9,7 @@
 use std::collections::BTreeSet;
 
 use crate::decompile::{DecompileContext, DecompileError, DecompileState};
+use crate::structure::StructureError;
 use crate::transformer::{InstrRef, LowInstr, LoweredProto};
 
 use super::common::{
@@ -21,19 +22,23 @@ pub(crate) fn build_cfg_proto(
     _context: &DecompileContext<'_>,
 ) -> Result<(), DecompileError> {
     let lowered = state.require_lowered()?;
-    state.cfg = Some(build_cfg_graph(&lowered.main));
+    state.cfg = Some(build_cfg_graph(&lowered.main)?);
     Ok(())
 }
 
 /// 对 proto 树递归构建 CFG。
-pub fn build_cfg_graph(proto: &LoweredProto) -> CfgGraph {
-    CfgGraph {
-        cfg: build_cfg(&proto.instrs),
-        children: proto.children.iter().map(build_cfg_graph).collect(),
-    }
+pub fn build_cfg_graph(proto: &LoweredProto) -> Result<CfgGraph, StructureError> {
+    Ok(CfgGraph {
+        cfg: build_cfg(&proto.instrs)?,
+        children: proto
+            .children
+            .iter()
+            .map(build_cfg_graph)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
 }
 
-fn build_cfg(instrs: &[LowInstr]) -> Cfg {
+fn build_cfg(instrs: &[LowInstr]) -> Result<Cfg, StructureError> {
     if instrs.is_empty() {
         let blocks = vec![
             BasicBlock {
@@ -46,7 +51,7 @@ fn build_cfg(instrs: &[LowInstr]) -> Cfg {
             },
         ];
 
-        return Cfg {
+        return Ok(Cfg {
             blocks,
             edges: Vec::new(),
             entry_block: BlockRef(0),
@@ -56,10 +61,10 @@ fn build_cfg(instrs: &[LowInstr]) -> Cfg {
             preds: vec![Vec::new(), Vec::new()],
             succs: vec![Vec::new(), Vec::new()],
             reachable_blocks: [BlockRef(0)].into_iter().collect(),
-        };
+        });
     }
 
-    let leaders = collect_leaders(instrs);
+    let leaders = collect_leaders(instrs)?;
     let block_starts = leaders.into_iter().collect::<Vec<_>>();
     let mut blocks = Vec::with_capacity(block_starts.len() + 1);
     let mut instr_to_block = vec![BlockRef(0); instrs.len()];
@@ -103,7 +108,12 @@ fn build_cfg(instrs: &[LowInstr]) -> Cfg {
 
         match &instrs[last_instr.index()] {
             LowInstr::Jump(instr) => {
-                builder.add_target_edge(&instr_to_block, block_ref, instr.target, EdgeKind::Jump);
+                builder.add_target_edge(
+                    &instr_to_block,
+                    block_ref,
+                    instr.target,
+                    EdgeKind::Jump,
+                )?;
             }
             LowInstr::Branch(instr) => {
                 builder.add_target_edge(
@@ -111,13 +121,13 @@ fn build_cfg(instrs: &[LowInstr]) -> Cfg {
                     block_ref,
                     instr.then_target,
                     EdgeKind::BranchTrue,
-                );
+                )?;
                 builder.add_target_edge(
                     &instr_to_block,
                     block_ref,
                     instr.else_target,
                     EdgeKind::BranchFalse,
-                );
+                )?;
             }
             LowInstr::NumericForInit(instr) => {
                 builder.add_target_edge(
@@ -125,13 +135,13 @@ fn build_cfg(instrs: &[LowInstr]) -> Cfg {
                     block_ref,
                     instr.body_target,
                     EdgeKind::LoopBody,
-                );
+                )?;
                 builder.add_target_edge(
                     &instr_to_block,
                     block_ref,
                     instr.exit_target,
                     EdgeKind::LoopExit,
-                );
+                )?;
             }
             LowInstr::NumericForLoop(instr) => {
                 builder.add_target_edge(
@@ -139,13 +149,13 @@ fn build_cfg(instrs: &[LowInstr]) -> Cfg {
                     block_ref,
                     instr.body_target,
                     EdgeKind::LoopBody,
-                );
+                )?;
                 builder.add_target_edge(
                     &instr_to_block,
                     block_ref,
                     instr.exit_target,
                     EdgeKind::LoopExit,
-                );
+                )?;
             }
             LowInstr::GenericForLoop(instr) => {
                 builder.add_target_edge(
@@ -153,13 +163,13 @@ fn build_cfg(instrs: &[LowInstr]) -> Cfg {
                     block_ref,
                     instr.body_target,
                     EdgeKind::LoopBody,
-                );
+                )?;
                 builder.add_target_edge(
                     &instr_to_block,
                     block_ref,
                     instr.exit_target,
                     EdgeKind::LoopExit,
-                );
+                )?;
             }
             LowInstr::Return(_) => {
                 builder.add_edge(block_ref, exit_block, EdgeKind::Return);
@@ -178,7 +188,7 @@ fn build_cfg(instrs: &[LowInstr]) -> Cfg {
     let entry_block = BlockRef(0);
     let reachable_blocks = compute_reachable_blocks(entry_block, &builder.edges, &builder.succs);
 
-    Cfg {
+    let cfg = Cfg {
         blocks,
         edges: builder.edges,
         entry_block,
@@ -188,7 +198,9 @@ fn build_cfg(instrs: &[LowInstr]) -> Cfg {
         preds: builder.preds,
         succs: builder.succs,
         reachable_blocks,
-    }
+    };
+    super::validate_cfg(&cfg)?;
+    Ok(cfg)
 }
 
 /// 构图期间的可变上下文，把 `edges/preds/succs` 收拢到一处，
@@ -214,55 +226,65 @@ impl CfgBuilder {
         from: BlockRef,
         target: InstrRef,
         kind: EdgeKind,
-    ) {
-        let to = instr_to_block[target.index()];
+    ) -> Result<(), StructureError> {
+        let to = instr_to_block.get(target.index()).copied().ok_or_else(|| {
+            StructureError::invalid(format!(
+                "low-IR control edge from {from} targets missing instruction {target}"
+            ))
+        })?;
         self.add_edge(from, to, kind);
+        Ok(())
     }
 }
 
-fn collect_leaders(instrs: &[LowInstr]) -> BTreeSet<usize> {
+fn collect_leaders(instrs: &[LowInstr]) -> Result<BTreeSet<usize>, StructureError> {
     let mut leaders = BTreeSet::from([0]);
 
     for (index, instr) in instrs.iter().enumerate() {
         collect_jump_targets(instr, |target| {
-            assert!(
-                target.index() < instrs.len(),
-                "low-IR jump target @{} must stay inside proto",
-                target.index()
-            );
+            if target.index() >= instrs.len() {
+                return Err(StructureError::invalid(format!(
+                    "low-IR control instruction @{index} targets missing instruction {target}"
+                )));
+            }
             leaders.insert(target.index());
-        });
+            Ok(())
+        })?;
 
         if instr.is_control_terminator() && index + 1 < instrs.len() {
             leaders.insert(index + 1);
         }
     }
 
-    leaders
+    Ok(leaders)
 }
 
 /// 把指令的跳转目标通过回调交给调用方，避免为至多 2 个元素分配 `Vec`。
-fn collect_jump_targets(instr: &LowInstr, mut f: impl FnMut(InstrRef)) {
+fn collect_jump_targets<E>(
+    instr: &LowInstr,
+    mut f: impl FnMut(InstrRef) -> Result<(), E>,
+) -> Result<(), E> {
     match instr {
-        LowInstr::Jump(instr) => f(instr.target),
+        LowInstr::Jump(instr) => f(instr.target)?,
         LowInstr::Branch(instr) => {
-            f(instr.then_target);
-            f(instr.else_target);
+            f(instr.then_target)?;
+            f(instr.else_target)?;
         }
         LowInstr::NumericForInit(instr) => {
-            f(instr.body_target);
-            f(instr.exit_target);
+            f(instr.body_target)?;
+            f(instr.exit_target)?;
         }
         LowInstr::NumericForLoop(instr) => {
-            f(instr.body_target);
-            f(instr.exit_target);
+            f(instr.body_target)?;
+            f(instr.exit_target)?;
         }
         LowInstr::GenericForLoop(instr) => {
-            f(instr.body_target);
-            f(instr.exit_target);
+            f(instr.body_target)?;
+            f(instr.exit_target)?;
         }
         _ => {}
     }
+    Ok(())
 }
 
 fn compute_reachable_blocks(

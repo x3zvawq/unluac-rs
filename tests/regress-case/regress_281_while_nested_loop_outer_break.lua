@@ -14,4 +14,5 @@ local function run(a, b, c)
     end
 end
 
-print("regress_281_while_nested_loop_outer_break", type(run))
+print("regress_281_while_nested_loop_outer_break", run(true, false, true))
+print("regress_281_while_nested_loop_outer_break", run(false, false, false))

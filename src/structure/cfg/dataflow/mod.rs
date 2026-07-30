@@ -8,6 +8,7 @@ mod ssa;
 use std::collections::{BTreeSet, VecDeque};
 
 use crate::decompile::{DecompileContext, DecompileError, DecompileState};
+use crate::structure::StructureError;
 use crate::transformer::{
     AccessBase, AccessKey, BranchSubject, CaptureSource, CondOperand, InstrRef, LowInstr,
     LoweredProto, Reg, RegRange, ResultPack, UnaryOpKind, ValueOperand, ValuePack,
@@ -40,7 +41,7 @@ pub(crate) fn analyze_dataflow(
         &cfg.cfg,
         graph_facts,
         &cfg.children,
-    ));
+    )?);
     Ok(())
 }
 
@@ -50,7 +51,15 @@ pub fn compute_dataflow_facts(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     child_cfgs: &[CfgGraph],
-) -> DataflowFacts {
+) -> Result<DataflowFacts, StructureError> {
+    super::validate_cfg(cfg)?;
+    if cfg.instr_to_block.len() != proto.instrs.len() {
+        return Err(StructureError::invalid(format!(
+            "CFG covers {} instructions, but the lowered proto contains {}",
+            cfg.instr_to_block.len(),
+            proto.instrs.len()
+        )));
+    }
     let instr_effects = proto
         .instrs
         .iter()
@@ -61,7 +70,7 @@ pub fn compute_dataflow_facts(
         .iter()
         .map(compute_side_effect_summary)
         .collect::<Vec<_>>();
-    let reg_count = compute_reg_count(proto, &instr_effects);
+    let reg_count = compute_reg_count(proto, &instr_effects)?;
 
     let entry_open_start = proto
         .signature
@@ -75,14 +84,14 @@ pub fn compute_dataflow_facts(
         reg_count,
         entry_open_start,
         &incoming_slots,
-    );
+    )?;
     let liveness = solve_liveness(
         cfg,
         graph_facts,
         &instr_effects,
         &open.fixed_liveness_use_regs,
         reg_count,
-    );
+    )?;
 
     let mut defs = Vec::new();
     let mut instr_defs = vec![Vec::new(); proto.instrs.len()];
@@ -117,7 +126,14 @@ pub fn compute_dataflow_facts(
         reg_count,
         proto.instrs.len(),
         &incoming_slots,
-    );
+    )?;
+    if proto.children.len() != child_cfgs.len()
+        || proto.children.len() != graph_facts.children.len()
+    {
+        return Err(StructureError::invalid(
+            "proto, CFG, and graph child counts disagree",
+        ));
+    }
     let children = proto
         .children
         .iter()
@@ -131,9 +147,9 @@ pub fn compute_dataflow_facts(
                 &child_cfg.children,
             )
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
-    DataflowFacts {
+    Ok(DataflowFacts {
         instr_effects,
         effect_summaries,
         defs,
@@ -155,7 +171,7 @@ pub fn compute_dataflow_facts(
         phi_block_ranges: ssa.phi_block_ranges,
         phi_use_blocks: ssa.phi_use_blocks,
         children,
-    }
+    })
 }
 
 fn instr_indices(cfg: &Cfg, block: BlockRef) -> Option<impl Iterator<Item = usize>> {
@@ -190,15 +206,27 @@ fn incoming_slots_by_edge(cfg: &Cfg) -> Vec<Option<usize>> {
     slots
 }
 
-fn canonical_value(mut value: SsaValue, replacements: &[SsaValue]) -> SsaValue {
+fn canonical_value(
+    mut value: SsaValue,
+    replacements: &[SsaValue],
+) -> Result<SsaValue, StructureError> {
     let mut remaining = replacements.len() + 1;
     while let SsaValue::Phi(phi) = value {
-        let next = replacements.get(phi.index()).copied().unwrap_or(value);
-        if next == value || remaining == 0 {
+        let Some(next) = replacements.get(phi.index()).copied() else {
+            return Err(StructureError::invalid(format!(
+                "SSA canonicalization references missing {phi}"
+            )));
+        };
+        if next == value {
             break;
+        }
+        if remaining == 0 {
+            return Err(StructureError::invalid(
+                "SSA replacement graph contains a cycle",
+            ));
         }
         value = next;
         remaining -= 1;
     }
-    value
+    Ok(value)
 }

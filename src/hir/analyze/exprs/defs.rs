@@ -105,10 +105,11 @@ pub(crate) fn expr_for_fixed_def_single_eval(
     let def_reg = lowering.dataflow.def_reg(def_id);
     let def_block = lowering.dataflow.def_block(def_id);
     let instr = lowering.proto.instrs.get(def_instr.index())?;
+    let absorbed = block_is_absorbed_decision(lowering, def_block);
 
     match instr {
         LowInstr::Move(move_instr) if move_instr.dst == def_reg => {
-            if lowering.bindings.reg_is_reference_captured(move_instr.src) {
+            if !absorbed && lowering.bindings.reg_is_reference_captured(move_instr.src) {
                 return None;
             }
             let expr = expr_for_reg_use_single_eval_with_call_policy(
@@ -123,7 +124,10 @@ pub(crate) fn expr_for_fixed_def_single_eval(
             // 可能绕过后续 local override，让 capture 从 `local pos` 退回字面量初值。
             // 这种值保留 temp 更安全，也和普通 single-eval 的“只恢复操作数本体”边界一致。
             if matches!(expr, HirExpr::Closure(_)) {
-                return None;
+                return Some(expr_for_ssa_value(
+                    lowering,
+                    lowering.dataflow.use_value(def_instr, move_instr.src),
+                ));
             }
             return Some(expr);
         }
@@ -147,7 +151,7 @@ pub(crate) fn expr_for_fixed_def_single_eval(
             });
         }
         LowInstr::UnaryOp(unary) if unary.dst == def_reg => {
-            if lowering.bindings.reg_is_reference_captured(unary.src) {
+            if !absorbed && lowering.bindings.reg_is_reference_captured(unary.src) {
                 return None;
             }
             return Some(HirExpr::Unary(Box::new(HirUnaryExpr {
@@ -158,16 +162,17 @@ pub(crate) fn expr_for_fixed_def_single_eval(
             })));
         }
         LowInstr::BinaryOp(binary) if binary.dst == def_reg => {
-            if [binary.lhs, binary.rhs]
-                .into_iter()
-                .filter_map(|operand| match operand {
-                    ValueOperand::Reg(reg) => Some(reg),
-                    ValueOperand::Const(_)
-                    | ValueOperand::Integer(_)
-                    | ValueOperand::Nil
-                    | ValueOperand::Boolean(_) => None,
-                })
-                .any(|reg| lowering.bindings.reg_is_reference_captured(reg))
+            if !absorbed
+                && [binary.lhs, binary.rhs]
+                    .into_iter()
+                    .filter_map(|operand| match operand {
+                        ValueOperand::Reg(reg) => Some(reg),
+                        ValueOperand::Const(_)
+                        | ValueOperand::Integer(_)
+                        | ValueOperand::Nil
+                        | ValueOperand::Boolean(_) => None,
+                    })
+                    .any(|reg| lowering.bindings.reg_is_reference_captured(reg))
             {
                 return None;
             }
@@ -182,9 +187,10 @@ pub(crate) fn expr_for_fixed_def_single_eval(
             ));
         }
         LowInstr::Concat(concat) if concat.dst == def_reg => {
-            if (0..concat.src.len)
-                .map(|offset| Reg(concat.src.start.index() + offset))
-                .any(|reg| lowering.bindings.reg_is_reference_captured(reg))
+            if !absorbed
+                && (0..concat.src.len)
+                    .map(|offset| Reg(concat.src.start.index() + offset))
+                    .any(|reg| lowering.bindings.reg_is_reference_captured(reg))
             {
                 return None;
             }

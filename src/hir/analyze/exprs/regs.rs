@@ -5,6 +5,7 @@
 //! 例如：某条指令读取 `r0`，若对应唯一 `TempId`，这里会直接降成 `TempRef(t0)`。
 
 use super::*;
+use crate::hir::HirUnresolvedExpr;
 
 pub(crate) fn expr_for_reg_use(
     lowering: &ProtoLowering<'_>,
@@ -80,11 +81,15 @@ pub(crate) fn lower_closure_capture(
 }
 
 fn closure_result_expr(lowering: &ProtoLowering<'_>, instr_ref: InstrRef) -> HirExpr {
-    let self_temp = lowering.bindings.instr_fixed_defs[instr_ref.index()]
+    lowering.bindings.instr_fixed_defs[instr_ref.index()]
         .first()
         .copied()
-        .expect("closure writes exactly one fixed target");
-    lowering.bindings.expr_for_temp(self_temp)
+        .map(|self_temp| lowering.bindings.expr_for_temp(self_temp))
+        .unwrap_or_else(|| {
+            HirExpr::Unresolved(Box::new(HirUnresolvedExpr {
+                summary: format!("closure at {instr_ref} has no fixed result"),
+            }))
+        })
 }
 
 fn reg_use_is_entry_empty(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, reg: Reg) -> bool {
@@ -137,21 +142,6 @@ fn forward_def_in_block(
         }
     }
     last_def_temp.map(|temp| lowering.bindings.expr_for_temp(temp))
-}
-
-/// 某些结构恢复需要读取“进入 block 时这个寄存器代表哪个稳定值”，而不是某条真实 use。
-///
-/// 例如值短路被恢复成 `if + assign` 后，leaf block 可能根本没有再次显式读取结果寄存器，
-/// 但我们仍然需要知道“走到这个 leaf 时 merge 值应该取谁”。
-pub(crate) fn expr_for_reg_at_block_entry(
-    lowering: &ProtoLowering<'_>,
-    block: BlockRef,
-    reg: Reg,
-) -> HirExpr {
-    if let Some(local) = lowering.bindings.local_for_reg_in_block(block, reg) {
-        return HirExpr::LocalRef(local);
-    }
-    expr_for_ssa_value(lowering, lowering.dataflow.block_entry_value(block, reg))
 }
 
 /// 某些 `goto + label` 形状需要读取“离开 block 时这个寄存器的稳定值”。
@@ -229,23 +219,43 @@ pub(crate) fn expr_for_reg_use_single_eval_with_call_policy(
     reg: Reg,
     allow_call_consumed_by_pure_wrapper: bool,
 ) -> HirExpr {
-    if let Some(local) = lowering.bindings.local_for_reg_in_block(block, reg) {
+    let decision_owner = absorbed_decision_owner(lowering, block);
+    let absorbed = decision_owner.is_some();
+    // 被整体吸收的 decision 可以省掉内部机械 temp，但不能省掉按引用 capture 的
+    // 词法 local：任意 child call 都可能经 upvalue 改写它，旧 SSA def 不是调用后的值。
+    if let Some(local) = lowering.bindings.local_for_reg_in_block(block, reg)
+        && (!absorbed || lowering.bindings.reg_is_reference_captured(reg))
+    {
         return HirExpr::LocalRef(local);
     }
     match lowering.dataflow.use_value(instr_ref, reg) {
-        SsaValue::Entry(entry_reg) => expr_for_entry_reg(lowering, entry_reg),
+        SsaValue::Entry(entry_reg) => lowering
+            .bindings
+            .local_for_reg_in_block(block, reg)
+            .map(HirExpr::LocalRef)
+            .unwrap_or_else(|| expr_for_entry_reg(lowering, entry_reg)),
         SsaValue::Def(def) => {
             let temp = lowering.bindings.fixed_temps[def.index()];
             if lowering.bindings.captured_temp_targets.contains_key(&temp) {
                 return lowering.bindings.expr_for_temp(temp);
             }
-            if lowering.dataflow.def_block(def) != block {
+            let def_block = lowering.dataflow.def_block(def);
+            let def_is_absorbed = decision_owner.is_some_and(|owner| {
+                absorbed_decision_owner(lowering, def_block) == Some(owner)
+                    && absorbed_decision_entry(lowering, owner) != Some(def_block)
+            });
+            if def_block != block && !def_is_absorbed {
+                return lowering
+                    .bindings
+                    .local_for_reg_in_block(block, reg)
+                    .map(HirExpr::LocalRef)
+                    .unwrap_or_else(|| lowering.bindings.expr_for_temp(temp));
+            }
+            if !absorbed && def_has_intervening_barrier(lowering, def, instr_ref) {
                 return lowering.bindings.expr_for_temp(temp);
             }
-            if def_has_intervening_barrier(lowering, def, instr_ref) {
-                return lowering.bindings.expr_for_temp(temp);
-            }
-            if def_is_call_consumed_by_non_branch(lowering, def, instr_ref)
+            if !absorbed
+                && def_is_call_consumed_by_non_branch(lowering, def, instr_ref)
                 && (!allow_call_consumed_by_pure_wrapper
                     || def_has_later_use_after_pure_wrapper(lowering, def, instr_ref))
             {
@@ -256,7 +266,58 @@ pub(crate) fn expr_for_reg_use_single_eval_with_call_policy(
         }
         SsaValue::Phi(phi) => lowering
             .bindings
-            .expr_for_temp(lowering.bindings.phi_temps[phi.index()]),
+            .local_for_reg_in_block(block, reg)
+            .map(HirExpr::LocalRef)
+            .unwrap_or_else(|| {
+                lowering
+                    .bindings
+                    .expr_for_temp(lowering.bindings.phi_temps[phi.index()])
+            }),
+    }
+}
+
+pub(crate) fn block_is_absorbed_decision(lowering: &ProtoLowering<'_>, block: BlockRef) -> bool {
+    absorbed_decision_owner(lowering, block).is_some()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbsorbedDecisionOwner {
+    Value(crate::structure::RegionId),
+    Condition(crate::structure::ConditionPlanId),
+}
+
+fn absorbed_decision_owner(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+) -> Option<AbsorbedDecisionOwner> {
+    if let Some(condition) = lowering.structure.plan().absorbed_condition_owner(block) {
+        return Some(AbsorbedDecisionOwner::Condition(condition));
+    }
+    lowering
+        .structure
+        .plan()
+        .region_for_block(block)
+        .filter(|region| {
+            matches!(
+                lowering.structure.plan().region(*region),
+                Some(crate::structure::RegionPlan::ValueDecision { .. })
+            )
+        })
+        .map(AbsorbedDecisionOwner::Value)
+}
+
+fn absorbed_decision_entry(
+    lowering: &ProtoLowering<'_>,
+    owner: AbsorbedDecisionOwner,
+) -> Option<BlockRef> {
+    match owner {
+        AbsorbedDecisionOwner::Condition(condition) => {
+            lowering.structure.plan().condition(condition)?.header()
+        }
+        AbsorbedDecisionOwner::Value(region) => match lowering.structure.plan().region(region)? {
+            crate::structure::RegionPlan::ValueDecision { entry, .. } => Some(*entry),
+            _ => None,
+        },
     }
 }
 

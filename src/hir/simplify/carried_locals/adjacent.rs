@@ -15,10 +15,75 @@ use super::super::local_shapes::{
 };
 use super::super::mention::{expr_mentions_local, stmt_captures_local, stmts_mention_local};
 use super::super::walk::rewrite_stmts;
-use super::binding::{BindingClassRewritePass, CarryBinding};
+use super::binding::{BindingClassRewritePass, BindingProtection, CarryBinding};
 use super::prune::{
     collect_prunable_bindings, prune_empty_assign_stmts, prune_redundant_self_assigns_in_stmts,
 };
+use super::reads::{collect_binding_mentions_by_stmt, collect_binding_mentions_in_expr};
+
+pub(super) fn try_collapse_guarded_local_update(
+    block: &mut HirBlock,
+    index: usize,
+    outer_bindings: &dyn BindingProtection,
+    captured_bindings: &std::collections::BTreeSet<CarryBinding>,
+) -> bool {
+    let Some((next, value)) = block.stmts.get(index).and_then(initialized_local) else {
+        return false;
+    };
+    let next_binding = CarryBinding::Local(next);
+    let Some(HirStmt::If(if_stmt)) = block.stmts.get(index + 1) else {
+        return false;
+    };
+    if if_stmt.cond != HirExpr::LocalRef(next) {
+        return false;
+    }
+    let Some(state) = exact_binding_copy(&if_stmt.then_block.stmts, next) else {
+        return false;
+    };
+    if !matches!(state, CarryBinding::Param(_) | CarryBinding::Local(_))
+        || state == next_binding
+        || matches!(state, CarryBinding::Local(_)) && outer_bindings.contains(&state)
+        || captured_bindings.contains(&state)
+        || captured_bindings.contains(&next_binding)
+        || collect_binding_mentions_in_expr(value).contains(&next_binding)
+    {
+        return false;
+    }
+    let Some(else_block) = if_stmt.else_block.as_ref() else {
+        return false;
+    };
+    if !matches!(else_block.stmts.as_slice(), [HirStmt::Return(_)])
+        || collect_binding_mentions_by_stmt(&else_block.stmts)[0]
+            .iter()
+            .any(|binding| *binding == state || *binding == next_binding)
+        || collect_binding_mentions_by_stmt(&block.stmts[index + 2..])
+            .iter()
+            .any(|mentions| mentions.contains(&next_binding))
+    {
+        return false;
+    }
+
+    let values = match &mut block.stmts[index] {
+        HirStmt::LocalDecl(local_decl) => std::mem::take(&mut local_decl.values),
+        _ => return false,
+    };
+    block.stmts[index] = HirStmt::Assign(Box::new(HirAssign {
+        targets: vec![binding_lvalue(state)],
+        values,
+    }));
+
+    let mut rewrites = BTreeMap::new();
+    rewrites.insert(next_binding, state);
+    rewrite_stmts(
+        &mut block.stmts[index + 1..index + 2],
+        &mut BindingClassRewritePass { rewrites },
+    );
+    prune_redundant_self_assigns_in_stmts(
+        &mut block.stmts[index + 1..index + 2],
+        collect_prunable_bindings([state]),
+    );
+    true
+}
 
 pub(super) fn try_collapse_adjacent_local_seed_handoff(block: &mut HirBlock, index: usize) -> bool {
     let Some(seed) = initialized_single_local_decl_binding(&block.stmts[index]) else {
@@ -188,4 +253,44 @@ fn lvalue_mentions_local(lvalue: &HirLValue, local: LocalId) -> bool {
 fn call_mentions_local(call: &HirCallExpr, local: LocalId) -> bool {
     expr_mentions_local(&call.callee, local)
         || call.args.iter().any(|arg| expr_mentions_local(arg, local))
+}
+
+fn initialized_local(stmt: &HirStmt) -> Option<(LocalId, &HirExpr)> {
+    let HirStmt::LocalDecl(local_decl) = stmt else {
+        return None;
+    };
+    let [binding] = local_decl.bindings.as_slice() else {
+        return None;
+    };
+    let [value] = local_decl.values.fixed.as_slice() else {
+        return None;
+    };
+    local_decl
+        .values
+        .tail
+        .is_none()
+        .then_some((*binding, value))
+}
+
+fn exact_binding_copy(stmts: &[HirStmt], value: LocalId) -> Option<CarryBinding> {
+    let [HirStmt::Assign(assign)] = stmts else {
+        return None;
+    };
+    let [target] = assign.targets.as_slice() else {
+        return None;
+    };
+    let [HirExpr::LocalRef(source)] = assign.values.fixed.as_slice() else {
+        return None;
+    };
+    (assign.values.tail.is_none() && *source == value)
+        .then(|| super::binding::carry_binding_from_lvalue(target))
+        .flatten()
+}
+
+fn binding_lvalue(binding: CarryBinding) -> HirLValue {
+    match binding {
+        CarryBinding::Param(param) => HirLValue::Param(param),
+        CarryBinding::Local(local) => HirLValue::Local(local),
+        CarryBinding::Temp(temp) => HirLValue::Temp(temp),
+    }
 }

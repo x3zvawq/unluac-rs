@@ -100,6 +100,16 @@ struct UnitCaseDescriptor {
     suite: String,
     dialect: String,
     path: String,
+    variant: Option<String>,
+}
+
+impl UnitCaseDescriptor {
+    fn display_path(&self) -> String {
+        self.variant.as_ref().map_or_else(
+            || self.path.clone(),
+            |variant| format!("{} [{variant}]", self.path),
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -400,7 +410,7 @@ impl Reporter {
             counts.completed,
             counts.total,
             self.palette.cyan(&case.dialect),
-            case.path,
+            case.display_path(),
             self.palette
                 .yellow(format!("timed out after {}s", timeout_seconds))
         )
@@ -427,7 +437,7 @@ impl Reporter {
                 counts.completed,
                 counts.total,
                 self.palette.cyan(&case.dialect),
-                case.path,
+                case.display_path(),
                 self.palette.red(&normalized),
                 self.palette.yellow(&tag_suffix),
             ),
@@ -439,7 +449,7 @@ impl Reporter {
                     counts.completed,
                     counts.total,
                     self.palette.cyan(&case.dialect),
-                    case.path,
+                    case.display_path(),
                     self.palette.yellow(&tag_suffix),
                 ));
                 lines.extend(
@@ -597,7 +607,9 @@ where
             Ok(WorkerEvent::WorkerError { case, error }) => {
                 worker_error = Some(format!(
                     "worker failed while running {} {} {}: {error}",
-                    case.suite, case.dialect, case.path
+                    case.suite,
+                    case.dialect,
+                    case.display_path()
                 ));
             }
             Err(_) => {
@@ -796,9 +808,13 @@ fn stderr_supports_live_updates() -> bool {
 
 fn matches_case_filters(case: &UnitCaseDescriptor, case_filters: &[String]) -> bool {
     case_filters.is_empty()
-        || case_filters
-            .iter()
-            .any(|case_filter| case.path.contains(case_filter))
+        || case_filters.iter().any(|case_filter| {
+            case.path.contains(case_filter)
+                || case
+                    .variant
+                    .as_ref()
+                    .is_some_and(|variant| variant.contains(case_filter))
+        })
 }
 
 fn sorted_failure_counts(failure_counts: &BTreeMap<String, usize>) -> Vec<(&str, usize)> {
@@ -869,7 +885,7 @@ fn list_unit_cases(root: &Path, runner: &Path) -> Result<Vec<UnitCaseDescriptor>
     stdout
         .lines()
         .map(|line| {
-            let mut parts = line.splitn(3, '\t');
+            let mut parts = line.splitn(4, '\t');
             let suite = parts
                 .next()
                 .context("missing suite column in unit case list")?;
@@ -879,10 +895,15 @@ fn list_unit_cases(root: &Path, runner: &Path) -> Result<Vec<UnitCaseDescriptor>
             let path = parts
                 .next()
                 .context("missing path column in unit case list")?;
+            let variant = parts
+                .next()
+                .filter(|variant| !variant.is_empty())
+                .map(str::to_owned);
             Ok(UnitCaseDescriptor {
                 suite: suite.to_owned(),
                 dialect: dialect.to_owned(),
                 path: path.to_owned(),
+                variant,
             })
         })
         .collect()
@@ -978,17 +999,21 @@ fn run_unit_case_with_timeout(
     recompile_rounds: u32,
     timeout: Duration,
 ) -> Result<UnitCaseExecution> {
-    let mut child = Command::new(runner)
-        .args([
-            "--report",
-            "machine",
-            "--suite",
-            case.suite.as_str(),
-            "--dialect",
-            case.dialect.as_str(),
-            "--case",
-            case.path.as_str(),
-        ])
+    let mut command = Command::new(runner);
+    command.args([
+        "--report",
+        "machine",
+        "--suite",
+        case.suite.as_str(),
+        "--dialect",
+        case.dialect.as_str(),
+        "--case",
+        case.path.as_str(),
+    ]);
+    if let Some(variant) = &case.variant {
+        command.args(["--variant", variant]);
+    }
+    let mut child = command
         .env(OUTPUT_ENV, output_mode)
         .env(RECOMPILE_ROUNDS_ENV, recompile_rounds.to_string())
         .current_dir(root)
@@ -1031,7 +1056,7 @@ fn run_unit_case_with_timeout(
                     "unit case runner exited unexpectedly for {} {} {} with status {}",
                     case.suite,
                     case.dialect,
-                    case.path,
+                    case.display_path(),
                     status
                 ),
             };
@@ -1136,7 +1161,7 @@ fn progress_message(
     format!(
         "[{completed}/{total}]\tactive: {active}\tdialect: {}\tcase: {}",
         palette.cyan(&case.dialect),
-        case.path
+        case.display_path()
     )
 }
 
@@ -1318,6 +1343,7 @@ mod tests {
             suite: "unit".to_owned(),
             dialect: "lua5.4".to_owned(),
             path: "tests/example.lua".to_owned(),
+            variant: None,
         };
         let rendered = normalize_runner_failure(
             "tests/example.lua :: source execution failed: bad",
@@ -1374,6 +1400,7 @@ mod tests {
             suite: "unit".to_owned(),
             dialect: "lua5.4".to_owned(),
             path: "tests/unit-case/common_04_generic_for.lua".to_owned(),
+            variant: None,
         };
 
         assert!(matches_case_filters(&case, &[]));

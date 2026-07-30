@@ -1,35 +1,31 @@
 //! low-IR 普通指令与非循环控制终结到 HIR 语句的直接 lowering。
 //!
-//! 这个模块只处理“单条指令如何发射 HIR 语句”：普通赋值、调用、返回、vararg、
-//! set-list 和显式 jump/branch。它依赖 `ProtoLowering` 中已经准备好的 CFG / Dataflow /
+//! 这个模块只处理“单条指令如何发射 HIR 语句”：普通赋值、调用、返回、vararg 和
+//! set-list。它依赖 `ProtoLowering` 中已经准备好的 CFG / Dataflow /
 //! StructureFacts / binding 映射，不重新识别 block 结构，也不接管 numeric/generic-for
 //! 控制协议；这些 terminator 只能由 StructurePlan 选中的 loop owner 消费。
 //!
 //! 输入形状：`CALL r0 ...` + 指令 def 映射。
 //! 输出形状：`t0 = f(args)` 或 `f(args)` 这类 HIR 语句。
 
-use std::collections::BTreeMap;
-
 use super::exprs::{
     expr_for_const, expr_for_reg_use, expr_for_value_operand, global_name_for_access,
-    lower_binary_op, lower_branch_cond, lower_closure_expr, lower_method_name,
-    lower_raw_table_get_expr, lower_raw_table_set_call, lower_table_access_expr,
-    lower_table_access_target, lower_unary_op, lower_upvalue_operand_expr,
-    lower_upvalue_operand_target, lower_value_pack,
+    lower_binary_op, lower_closure_expr, lower_method_name, lower_raw_table_get_expr,
+    lower_raw_table_set_call, lower_table_access_expr, lower_table_access_target, lower_unary_op,
+    lower_upvalue_operand_expr, lower_upvalue_operand_target, lower_value_pack,
 };
 use super::helpers::{
-    assign_stmt, binary_expr, branch_stmt, concat_expr, decode_raw_string, goto_block,
-    label_for_block, return_stmt, unresolved_expr,
+    assign_stmt, binary_expr, concat_expr, decode_raw_string, return_stmt, unresolved_expr,
 };
 use super::lower::ProtoLowering;
 use crate::hir::common::{
-    HirCallExpr, HirCallStmt, HirClose, HirExpr, HirLValue, HirLabelId, HirLocalDecl, HirPackTail,
-    HirStmt, HirTableSetList, HirToBeClosed, HirUnaryExpr, HirValuePack, LocalId,
+    HirCallExpr, HirCallStmt, HirClose, HirExpr, HirLValue, HirLocalDecl, HirPackTail, HirStmt,
+    HirTableSetList, HirToBeClosed, HirUnaryExpr, HirValuePack, LocalId,
 };
 use crate::structure::BlockRef;
 use crate::transformer::{
-    AccessBase, CallKind, GenericForCallInstr, GetTableKind, InstrRef, LowInstr, Reg, ResultPack,
-    SetTableKind,
+    AccessBase, CallKind, GenericForCallInstr, GetTableKind, InstrRef, LowInstr, Reg, RegRange,
+    ResultPack, SetTableKind,
 };
 
 pub(super) fn lower_regular_instr(
@@ -37,8 +33,8 @@ pub(super) fn lower_regular_instr(
     block: BlockRef,
     instr_ref: InstrRef,
     instr: &LowInstr,
-) -> Vec<HirStmt> {
-    match instr {
+) -> Option<Vec<HirStmt>> {
+    let stmts = match instr {
         LowInstr::Move(move_instr) => fixed_assign(
             lowering,
             instr_ref,
@@ -210,11 +206,15 @@ pub(super) fn lower_regular_instr(
             from_reg: close.from.index(),
         }))],
         LowInstr::Tbc(tbc) => vec![HirStmt::ToBeClosed(Box::new(HirToBeClosed {
+            origin: instr_ref,
             reg_index: tbc.reg.index(),
             value: expr_for_reg_use(lowering, block, instr_ref, tbc.reg),
         }))],
         LowInstr::GenericForCall(instr) => {
-            lower_generic_for_call(lowering, block, instr_ref, instr)
+            let ResultPack::Fixed(results) = instr.results else {
+                return None;
+            };
+            lower_generic_for_call(lowering, block, instr_ref, instr, results)
         }
         LowInstr::TailCall(_)
         | LowInstr::Return(_)
@@ -223,10 +223,9 @@ pub(super) fn lower_regular_instr(
         | LowInstr::GenericForPrep(_)
         | LowInstr::GenericForLoop(_)
         | LowInstr::Jump(_)
-        | LowInstr::Branch(_) => {
-            unreachable!("control terminators must be lowered by their structure owner")
-        }
-    }
+        | LowInstr::Branch(_) => return None,
+    };
+    Some(stmts)
 }
 
 fn env_upvalue_is_consumed_by_global_accesses(
@@ -274,37 +273,20 @@ fn env_upvalue_is_consumed_by_global_accesses(
         })
 }
 
-pub(super) fn lower_control_instr(
+pub(super) fn lower_terminal_instr(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,
     instr_ref: InstrRef,
     instr: &LowInstr,
-    label_map: &BTreeMap<BlockRef, HirLabelId>,
-) -> Vec<HirStmt> {
+) -> Option<Vec<HirStmt>> {
     match instr {
-        LowInstr::Jump(jump) => vec![super::helpers::goto_stmt(label_for_block(
-            lowering.cfg,
-            label_map,
-            jump.target,
-        ))],
-        LowInstr::Branch(branch) => vec![branch_stmt(
-            lower_branch_cond(lowering, block, instr_ref, branch.cond),
-            goto_block(label_for_block(lowering.cfg, label_map, branch.then_target)),
-            Some(goto_block(label_for_block(
-                lowering.cfg,
-                label_map,
-                branch.else_target,
-            ))),
-        )],
-        LowInstr::Return(ret) => {
-            vec![return_stmt(lower_value_pack(
-                lowering, block, instr_ref, ret.values,
-            ))]
-        }
+        LowInstr::Return(ret) => Some(vec![return_stmt(lower_value_pack(
+            lowering, block, instr_ref, ret.values,
+        ))]),
         LowInstr::TailCall(tail_call) => {
             let method_name = lower_method_name(lowering, tail_call.method_name);
             let callee = expr_for_reg_use(lowering, block, instr_ref, tail_call.callee);
-            vec![return_stmt(HirValuePack::expanding(
+            Some(vec![return_stmt(HirValuePack::expanding(
                 Vec::new(),
                 HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
                     callee,
@@ -312,12 +294,9 @@ pub(super) fn lower_control_instr(
                     method: matches!(tail_call.kind, CallKind::Method),
                     method_name,
                 }))),
-            ))]
+            ))])
         }
-        LowInstr::NumericForInit(_) | LowInstr::NumericForLoop(_) | LowInstr::GenericForLoop(_) => {
-            unreachable!("for control terminators must be consumed by a loop owner")
-        }
-        _ => unreachable!("non-control instructions must use regular lowering"),
+        _ => None,
     }
 }
 
@@ -340,12 +319,13 @@ fn lower_generic_for_call(
     block: BlockRef,
     instr_ref: InstrRef,
     instr: &GenericForCallInstr,
+    results: RegRange,
 ) -> Vec<HirStmt> {
     lower_result_assign(
         lowering,
         instr_ref,
         generic_for_iterator_call(lowering, block, instr_ref, instr),
-        instr.results,
+        results,
     )
 }
 
@@ -376,20 +356,26 @@ fn lower_call(
     instr_ref: InstrRef,
     call: &crate::transformer::CallInstr,
 ) -> Vec<HirStmt> {
+    let results = call.results;
     let method_name = lower_method_name(lowering, call.method_name);
     let callee = expr_for_reg_use(lowering, block, instr_ref, call.callee);
-    let expr = HirExpr::Call(Box::new(HirCallExpr {
+    let call_expr = HirCallExpr {
         callee,
         args: lower_value_pack(lowering, block, instr_ref, call.args),
         method: matches!(call.kind, CallKind::Method),
         method_name,
-    }));
+    };
 
-    match call.results {
-        ResultPack::Ignore => call_stmt(expr),
+    match results {
+        ResultPack::Ignore => call_stmt(call_expr),
         ResultPack::Open(_) if lowering.open_pack_is_owned(instr_ref) => Vec::new(),
-        ResultPack::Open(_) => call_stmt(expr),
-        ResultPack::Fixed(_) => lower_result_assign(lowering, instr_ref, expr, call.results),
+        ResultPack::Open(_) => call_stmt(call_expr),
+        ResultPack::Fixed(results) => lower_result_assign(
+            lowering,
+            instr_ref,
+            HirExpr::Call(Box::new(call_expr)),
+            results,
+        ),
     }
 }
 
@@ -403,26 +389,22 @@ fn lower_vararg(
         ResultPack::Ignore => Vec::new(),
         ResultPack::Open(_) if lowering.open_pack_is_owned(instr_ref) => Vec::new(),
         ResultPack::Open(_) => Vec::new(),
-        ResultPack::Fixed(_) => lower_result_assign(lowering, instr_ref, HirExpr::VarArg, results),
+        ResultPack::Fixed(results) => {
+            lower_result_assign(lowering, instr_ref, HirExpr::VarArg, results)
+        }
     }
 }
 
-fn call_stmt(expr: HirExpr) -> Vec<HirStmt> {
-    let HirExpr::Call(call) = expr else {
-        unreachable!("call lowering should always build a call expression");
-    };
-    vec![HirStmt::CallStmt(Box::new(HirCallStmt { call: *call }))]
+fn call_stmt(call: HirCallExpr) -> Vec<HirStmt> {
+    vec![HirStmt::CallStmt(Box::new(HirCallStmt { call }))]
 }
 
 fn lower_result_assign(
     lowering: &ProtoLowering<'_>,
     instr_ref: InstrRef,
     expr: HirExpr,
-    results: ResultPack,
+    range: RegRange,
 ) -> Vec<HirStmt> {
-    let ResultPack::Fixed(range) = results else {
-        unreachable!("only fixed results can be assigned as scalar HIR values");
-    };
     let values = if range.len > 1 {
         HirValuePack::expanding(Vec::new(), HirPackTail::exact(expr, range.len))
     } else {

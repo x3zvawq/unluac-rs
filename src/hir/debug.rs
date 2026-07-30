@@ -236,7 +236,17 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
                 let _ = writeln!(output, "{indent}goto L{}", goto_stmt.target.index());
             }
             HirStmt::Label(label) => {
-                let _ = writeln!(output, "{indent}label L{}", label.id.index());
+                let barriers = label
+                    .tbc_barriers
+                    .iter()
+                    .map(|instr| format!("@{}", instr.index()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(
+                    output,
+                    "{indent}label L{} tbc=[{barriers}]",
+                    label.id.index()
+                );
             }
             HirStmt::Block(block) => {
                 let _ = writeln!(output, "{indent}block");

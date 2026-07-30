@@ -51,7 +51,7 @@ impl<'a> LinearFollowCtx<'a> {
         start: BlockRef,
         mut extra_valid: impl FnMut(BlockRef) -> bool,
         mut is_terminal: impl FnMut(BlockRef, &[BlockRef]) -> bool,
-    ) -> Option<LinearFollowTarget> {
+    ) -> Option<LinearFollowResult> {
         let mut current = start;
         let mut visited = BTreeSet::new();
 
@@ -66,12 +66,18 @@ impl<'a> LinearFollowCtx<'a> {
             }
 
             if self.branch_by_header.contains_key(&current) {
-                return Some(LinearFollowTarget::Header(current));
+                return Some(LinearFollowResult {
+                    target: LinearFollowTarget::Header(current),
+                    traversed: visited,
+                });
             }
 
             let succs = self.cfg.reachable_successors(current);
             if is_terminal(current, succs.as_slice()) {
-                return Some(LinearFollowTarget::Terminal(current));
+                return Some(LinearFollowResult {
+                    target: LinearFollowTarget::Terminal(current),
+                    traversed: visited,
+                });
             }
 
             match succs.as_slice() {
@@ -80,6 +86,11 @@ impl<'a> LinearFollowCtx<'a> {
             }
         }
     }
+}
+
+pub(super) struct LinearFollowResult {
+    pub(super) target: LinearFollowTarget,
+    pub(super) traversed: BTreeSet<BlockRef>,
 }
 
 pub(super) enum LinearFollowTarget {

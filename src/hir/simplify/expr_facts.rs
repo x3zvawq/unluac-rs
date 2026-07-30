@@ -70,6 +70,9 @@ pub(super) fn expr_is_boolean_valued(expr: &HirExpr) -> bool {
             binary.op,
             HirBinaryOpKind::Eq | HirBinaryOpKind::Lt | HirBinaryOpKind::Le
         ),
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            expr_is_boolean_valued(&logical.lhs) && expr_is_boolean_valued(&logical.rhs)
+        }
         HirExpr::Decision(decision) => decision.nodes.iter().all(|node| {
             decision_target_is_boolean(&node.truthy) && decision_target_is_boolean(&node.falsy)
         }),

@@ -7,9 +7,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::hir::common::{HirBlock, HirIf, HirLabelId, HirProto, HirStmt};
+use crate::hir::common::{HirBlock, HirExpr, HirIf, HirLabelId, HirProto, HirStmt};
 
 use super::label_refs::count_label_references;
+use super::logical_simplify::normalize_condition_context;
 use super::walk::{HirRewritePass, rewrite_proto};
 
 pub(super) fn fold_branch_control_in_proto(proto: &mut HirProto) -> bool {
@@ -25,6 +26,58 @@ impl HirRewritePass for BranchControlPass {
         let nop_changed = remove_nop_goto_labels(&mut block.stmts);
         terminal_changed || guard_changed || nop_changed
     }
+
+    fn rewrite_stmt(&mut self, stmt: &mut HirStmt) -> bool {
+        fold_leading_while_break_guard(stmt) || naturalize_if_polarity(stmt)
+    }
+}
+
+fn fold_leading_while_break_guard(stmt: &mut HirStmt) -> bool {
+    let HirStmt::While(while_stmt) = stmt else {
+        return false;
+    };
+    if while_stmt.cond != HirExpr::Boolean(true) {
+        return false;
+    }
+    let Some(HirStmt::If(guard)) = while_stmt.body.stmts.first() else {
+        return false;
+    };
+    if guard.else_block.is_some() || !matches!(guard.then_block.stmts.as_slice(), [HirStmt::Break])
+    {
+        return false;
+    }
+    while_stmt.cond = normalize_condition_context(&guard.cond, true).expr;
+    while_stmt.body.stmts.remove(0);
+    true
+}
+
+fn naturalize_if_polarity(stmt: &mut HirStmt) -> bool {
+    let HirStmt::If(if_stmt) = stmt else {
+        return false;
+    };
+    let Some(else_block) = if_stmt.else_block.as_ref() else {
+        return false;
+    };
+    if if_stmt.then_block.stmts.is_empty() || else_block.stmts.is_empty() {
+        return false;
+    }
+
+    let current = normalize_condition_context(&if_stmt.cond, false);
+    let negated = normalize_condition_context(&if_stmt.cond, true);
+    if negated.not_cost < current.not_cost {
+        let Some(else_block) = if_stmt.else_block.as_mut() else {
+            return false;
+        };
+        if_stmt.cond = negated.expr;
+        std::mem::swap(&mut if_stmt.then_block, else_block);
+        return true;
+    }
+
+    if current.changed {
+        if_stmt.cond = current.expr;
+        return true;
+    }
+    false
 }
 
 #[derive(Clone, Copy)]
@@ -61,7 +114,7 @@ fn fold_forward_gotos(stmts: &mut Vec<HirStmt>, kind: FoldKind) -> bool {
             continue;
         }
         let body = &stmts[(if_index + 1)..label_index];
-        if !can_move_into_branch(body)
+        if !can_move_into_branch(body, kind)
             || matches!(kind, FoldKind::TerminalElse)
                 && is_branch_value_assignment(stmt, body, invert_cond)
         {
@@ -180,7 +233,13 @@ fn fold_target(stmt: &HirStmt, kind: FoldKind) -> Option<(HirLabelId, bool)> {
     }
 }
 
-fn can_move_into_branch(stmts: &[HirStmt]) -> bool {
+fn can_move_into_branch(stmts: &[HirStmt], kind: FoldKind) -> bool {
+    // `if cond then goto A end; goto B; ::A::` 是 island 常见的双向 guard。
+    // 把唯一的备用 goto 收进反向 arm 不改变 transfer，只减少一层壳；最终 AST
+    // scope verifier 仍负责确认目标 label 对嵌套 arm 可见且没有跳进 local/TBC。
+    if matches!(kind, FoldKind::Guard) && matches!(stmts, [HirStmt::Goto(_)]) {
+        return true;
+    }
     stmts.iter().all(|stmt| {
         !matches!(
             stmt,

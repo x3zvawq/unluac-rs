@@ -28,8 +28,6 @@ mod temp_touch;
 mod visit;
 mod walk;
 
-pub(in crate::hir) use expr_facts::expr_truthiness;
-
 use crate::ast::ReadabilityOptions;
 use crate::debug::DebugFilters;
 use crate::generate::GenerateMode;
@@ -170,7 +168,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
     PassDescriptor {
         name: "branch-control",
         phase: PassPhase::Normal,
-        depends_on: &[LabelGoto, LocalBinding],
+        depends_on: &[LabelGoto, LocalBinding, LogicalExpr],
         invalidates: &[
             LabelGoto,
             BlockStructure,
@@ -217,12 +215,12 @@ pub(super) fn simplify_hir(
     module: &mut HirModule,
     readability: ReadabilityOptions,
     timings: &TimingCollector,
-    promotion_facts: &[ProtoPromotionFacts],
+    promotion_facts: &mut [ProtoPromotionFacts],
     generate_mode: GenerateMode,
     dialect: crate::ast::DecompileDialect,
     dump_config: &PassDumpConfig,
 ) -> Result<(), crate::decompile::DecompileError> {
-    let empty_facts = ProtoPromotionFacts::default();
+    let mut empty_facts = ProtoPromotionFacts::default();
 
     let convergence = run_invalidation_loop(
         PASS_DESCRIPTORS,
@@ -234,8 +232,8 @@ pub(super) fn simplify_hir(
             let changed = timings.record(name, || {
                 apply_proto_pass(module, |proto| {
                     let facts = promotion_facts
-                        .get(proto.id.index())
-                        .unwrap_or(&empty_facts);
+                        .get_mut(proto.id.index())
+                        .unwrap_or(&mut empty_facts);
                     match index {
                         0 => decision::simplify_decision_exprs_in_proto(proto),
                         1 => boolean_shells::remove_boolean_materialization_shells_in_proto(proto),
@@ -257,7 +255,9 @@ pub(super) fn simplify_hir(
                         9 => branch_control_folding::fold_branch_control_in_proto(proto),
                         10 => decision::eliminate_remaining_decisions_in_proto(proto),
                         11 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
-                        12 => carried_locals::collapse_carried_local_handoffs_in_proto(proto),
+                        12 => {
+                            carried_locals::collapse_carried_local_handoffs_in_proto(proto, facts)
+                        }
                         13 => dead_temps::remove_dead_temp_materializations_in_proto(proto),
                         14 => dead_labels::remove_unused_labels_in_proto(proto),
                         _ => unreachable!("invalid HIR pass index: {index}"),

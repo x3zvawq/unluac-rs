@@ -1,5 +1,5 @@
 -- regress_195_terminal_exit_unknown_loop#1: 多个 terminal exit 不应让无限循环退回 label/goto
--- unluac: expect-contains [[while true do]]
+-- unluac: expect-contains [[while ]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]

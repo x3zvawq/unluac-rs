@@ -55,12 +55,7 @@ impl BindingReadCollector {
 
 impl HirVisitor for BindingReadCollector {
     fn visit_expr(&mut self, expr: &HirExpr) {
-        let binding = match expr {
-            HirExpr::LocalRef(local) => Some(CarryBinding::Local(*local)),
-            HirExpr::TempRef(temp) => Some(CarryBinding::Temp(*temp)),
-            _ => None,
-        };
-        if let Some(binding) = binding {
+        if let Some(binding) = carry_binding_from_expr(expr) {
             self.reads.insert(binding);
         }
     }

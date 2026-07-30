@@ -37,7 +37,7 @@ pub(super) fn build_ssa(
     reg_count: usize,
     instr_count: usize,
     incoming_slots: &[Option<usize>],
-) -> SsaAnalysis {
+) -> Result<SsaAnalysis, StructureError> {
     let mut phis = place_phis(cfg, graph, defs, live_in);
     let phi_block_ranges = super::index_phi_candidate_ranges(cfg, &phis);
     let mut block_entry_values = vec![SsaRegMap::default(); cfg.blocks.len()];
@@ -57,31 +57,31 @@ pub(super) fn build_ssa(
         &mut block_exit_values,
         &mut use_values,
         incoming_slots,
-    );
+    )?;
 
-    let replacements = trivial_phi_replacements(&phis);
-    let (mut phis, remap) = compact_phis(phis, &replacements);
+    let replacements = trivial_phi_replacements(&phis)?;
+    let (mut phis, remap) = compact_phis(phis, &replacements)?;
     for values in &mut block_entry_values {
-        values.map_values(|value| remap_value(value, &replacements, &remap));
+        values.try_map_values(|value| remap_value(value, &replacements, &remap))?;
     }
     for values in &mut block_exit_values {
-        values.map_values(|value| remap_value(value, &replacements, &remap));
+        values.try_map_values(|value| remap_value(value, &replacements, &remap))?;
     }
     for values in &mut use_values {
         values
             .fixed
-            .map_values(|value| remap_value(value, &replacements, &remap));
+            .try_map_values(|value| remap_value(value, &replacements, &remap))?;
     }
     for phi in &mut phis {
         for incoming in &mut phi.incoming {
-            incoming.value = remap_value(incoming.value, &replacements, &remap);
+            incoming.value = remap_value(incoming.value, &replacements, &remap)?;
         }
     }
     let phi_block_ranges = super::index_phi_candidate_ranges(cfg, &phis);
     let (def_uses, def_phi_uses, phi_uses, phi_phi_uses, phi_use_blocks) =
-        index_uses(cfg, defs.len(), &phis, &use_values);
+        index_uses(cfg, defs.len(), &phis, &use_values)?;
 
-    SsaAnalysis {
+    Ok(SsaAnalysis {
         phis,
         phi_block_ranges,
         block_entry_values,
@@ -92,7 +92,7 @@ pub(super) fn build_ssa(
         phi_uses,
         phi_phi_uses,
         phi_use_blocks,
-    }
+    })
 }
 
 fn place_phis(
@@ -191,7 +191,7 @@ fn rename(
     block_exit_values: &mut [SsaRegMap],
     use_values: &mut [InstrUseValues],
     incoming_slots: &[Option<usize>],
-) {
+) -> Result<(), StructureError> {
     let mut stacks = (0..reg_count)
         .map(|index| vec![SsaValue::Entry(Reg(index))])
         .collect::<Vec<_>>();
@@ -200,32 +200,55 @@ fn rename(
         match event {
             RenameEvent::Exit(regs) => {
                 for reg in regs.into_iter().rev() {
-                    stacks[reg.index()].pop();
+                    let Some(stack) = stacks.get_mut(reg.index()) else {
+                        return Err(StructureError::invalid(format!(
+                            "SSA exit references register r{} outside the stack arena",
+                            reg.index()
+                        )));
+                    };
+                    if stack.pop().is_none() {
+                        return Err(StructureError::invalid(format!(
+                            "SSA stack for register r{} is empty on exit",
+                            reg.index()
+                        )));
+                    }
                 }
             }
             RenameEvent::Enter(block) => {
                 let mut pushed = Vec::new();
                 for phi in &phis[phi_ranges[block.index()].clone()] {
-                    stacks[phi.reg.index()].push(SsaValue::Phi(phi.id));
+                    let Some(stack) = stacks.get_mut(phi.reg.index()) else {
+                        return Err(StructureError::invalid(format!(
+                            "{} register r{} exceeds the SSA stack arena",
+                            phi.id,
+                            phi.reg.index()
+                        )));
+                    };
+                    stack.push(SsaValue::Phi(phi.id));
                     pushed.push(phi.reg);
                 }
-                block_entry_values[block.index()] = snapshot(&stacks, &live_in[block.index()]);
+                block_entry_values[block.index()] = snapshot(&stacks, &live_in[block.index()])?;
 
                 if let Some(indices) = super::instr_indices(cfg, block) {
                     for instr_index in indices {
-                        use_values[instr_index].fixed = SsaRegMap::from_sorted_entries(
-                            fixed_use_regs[instr_index]
-                                .iter()
-                                .map(|&reg| (reg, current(&stacks, reg)))
-                                .collect(),
-                        );
+                        let mut entries = Vec::with_capacity(fixed_use_regs[instr_index].len());
+                        for &reg in &fixed_use_regs[instr_index] {
+                            entries.push((reg, current(&stacks, reg)?));
+                        }
+                        use_values[instr_index].fixed = SsaRegMap::from_sorted_entries(entries)?;
                         for &(reg, def) in &def_lookup[instr_index] {
-                            stacks[reg.index()].push(SsaValue::Def(def));
+                            let Some(stack) = stacks.get_mut(reg.index()) else {
+                                return Err(StructureError::invalid(format!(
+                                    "definition {def:?} register r{} exceeds the SSA stack arena",
+                                    reg.index()
+                                )));
+                            };
+                            stack.push(SsaValue::Def(def));
                             pushed.push(reg);
                         }
                     }
                 }
-                block_exit_values[block.index()] = snapshot(&stacks, &live_out[block.index()]);
+                block_exit_values[block.index()] = snapshot(&stacks, &live_out[block.index()])?;
 
                 for edge in &cfg.succs[block.index()] {
                     let succ = cfg.edges[edge.index()].to;
@@ -233,15 +256,25 @@ fn rename(
                     if range.is_empty() {
                         continue;
                     }
-                    let slot = incoming_slots[edge.index()]
-                        .expect("reachable CFG edge must have an incoming slot");
+                    let Some(slot) = incoming_slots.get(edge.index()).copied().flatten() else {
+                        return Err(StructureError::invalid(format!(
+                            "reachable CFG edge {edge} has no phi incoming slot"
+                        )));
+                    };
                     for phi in &mut phis[range] {
-                        let incoming = phi
-                            .incoming
-                            .get_mut(slot)
-                            .expect("phi incoming slots must match CFG predecessors");
-                        assert_eq!(incoming.edge, Some(*edge));
-                        incoming.value = current(&stacks, phi.reg);
+                        let Some(incoming) = phi.incoming.get_mut(slot) else {
+                            return Err(StructureError::invalid(format!(
+                                "{} incoming slot #{slot} does not match CFG edge {edge}",
+                                phi.id
+                            )));
+                        };
+                        if incoming.edge != Some(*edge) {
+                            return Err(StructureError::invalid(format!(
+                                "{} incoming slot #{slot} references the wrong CFG edge",
+                                phi.id
+                            )));
+                        }
+                        incoming.value = current(&stacks, phi.reg)?;
                     }
                 }
 
@@ -252,23 +285,30 @@ fn rename(
             }
         }
     }
+    Ok(())
 }
 
-fn current(stacks: &[Vec<SsaValue>], reg: Reg) -> SsaValue {
-    *stacks[reg.index()]
-        .last()
-        .expect("every fixed register has an entry SSA value")
+fn current(stacks: &[Vec<SsaValue>], reg: Reg) -> Result<SsaValue, StructureError> {
+    let Some(stack) = stacks.get(reg.index()) else {
+        return Err(StructureError::invalid(format!(
+            "register r{} exceeds the SSA stack arena",
+            reg.index()
+        )));
+    };
+    stack.last().copied().ok_or_else(|| {
+        StructureError::invalid(format!("register r{} has an empty SSA stack", reg.index()))
+    })
 }
 
-fn snapshot(stacks: &[Vec<SsaValue>], live: &BTreeSet<Reg>) -> SsaRegMap {
-    SsaRegMap::from_sorted_entries(
-        live.iter()
-            .map(|&reg| (reg, current(stacks, reg)))
-            .collect(),
-    )
+fn snapshot(stacks: &[Vec<SsaValue>], live: &BTreeSet<Reg>) -> Result<SsaRegMap, StructureError> {
+    let mut entries = Vec::with_capacity(live.len());
+    for &reg in live {
+        entries.push((reg, current(stacks, reg)?));
+    }
+    SsaRegMap::from_sorted_entries(entries)
 }
 
-fn trivial_phi_replacements(phis: &[PhiCandidate]) -> Vec<SsaValue> {
+fn trivial_phi_replacements(phis: &[PhiCandidate]) -> Result<Vec<SsaValue>, StructureError> {
     let mut replacements = phis
         .iter()
         .map(|phi| SsaValue::Phi(phi.id))
@@ -292,7 +332,7 @@ fn trivial_phi_replacements(phis: &[PhiCandidate]) -> Vec<SsaValue> {
         let mut unique = None;
         let mut conflict = false;
         for incoming in &phi.incoming {
-            let value = canonical_value_compress(incoming.value, &mut replacements);
+            let value = canonical_value_compress(incoming.value, &mut replacements)?;
             if value == own {
                 continue;
             }
@@ -321,16 +361,23 @@ fn trivial_phi_replacements(phis: &[PhiCandidate]) -> Vec<SsaValue> {
     }
     for index in 0..replacements.len() {
         replacements[index] =
-            canonical_value_compress(SsaValue::Phi(PhiId(index)), &mut replacements);
+            canonical_value_compress(SsaValue::Phi(PhiId(index)), &mut replacements)?;
     }
-    replacements
+    Ok(replacements)
 }
 
-fn canonical_value_compress(value: SsaValue, replacements: &mut [SsaValue]) -> SsaValue {
+fn canonical_value_compress(
+    value: SsaValue,
+    replacements: &mut [SsaValue],
+) -> Result<SsaValue, StructureError> {
     let mut value = value;
     let mut path = Vec::new();
     while let SsaValue::Phi(phi) = value {
-        let next = replacements.get(phi.index()).copied().unwrap_or(value);
+        let Some(next) = replacements.get(phi.index()).copied() else {
+            return Err(StructureError::invalid(format!(
+                "SSA replacement references missing {phi}"
+            )));
+        };
         if next == value {
             break;
         }
@@ -340,17 +387,17 @@ fn canonical_value_compress(value: SsaValue, replacements: &mut [SsaValue]) -> S
     for phi in path {
         replacements[phi.index()] = value;
     }
-    value
+    Ok(value)
 }
 
 fn compact_phis(
     phis: Vec<PhiCandidate>,
     replacements: &[SsaValue],
-) -> (Vec<PhiCandidate>, Vec<Option<PhiId>>) {
+) -> Result<(Vec<PhiCandidate>, Vec<Option<PhiId>>), StructureError> {
     let mut remap = vec![None; phis.len()];
     let mut kept = Vec::new();
     for mut phi in phis {
-        if super::canonical_value(SsaValue::Phi(phi.id), replacements) != SsaValue::Phi(phi.id) {
+        if super::canonical_value(SsaValue::Phi(phi.id), replacements)? != SsaValue::Phi(phi.id) {
             continue;
         }
         let id = PhiId(kept.len());
@@ -358,15 +405,24 @@ fn compact_phis(
         phi.id = id;
         kept.push(phi);
     }
-    (kept, remap)
+    Ok((kept, remap))
 }
 
-fn remap_value(value: SsaValue, replacements: &[SsaValue], remap: &[Option<PhiId>]) -> SsaValue {
-    match super::canonical_value(value, replacements) {
-        SsaValue::Phi(old) => SsaValue::Phi(
-            remap[old.index()].expect("non-trivial phi should have a compacted identity"),
-        ),
-        other => other,
+fn remap_value(
+    value: SsaValue,
+    replacements: &[SsaValue],
+    remap: &[Option<PhiId>],
+) -> Result<SsaValue, StructureError> {
+    match super::canonical_value(value, replacements)? {
+        SsaValue::Phi(old) => {
+            let Some(remapped) = remap.get(old.index()).copied().flatten() else {
+                return Err(StructureError::invalid(format!(
+                    "non-trivial {old} has no compacted identity"
+                )));
+            };
+            Ok(SsaValue::Phi(remapped))
+        }
+        other => Ok(other),
     }
 }
 
@@ -383,14 +439,18 @@ fn index_uses(
     def_count: usize,
     phis: &[PhiCandidate],
     uses: &[InstrUseValues],
-) -> UseIndex {
+) -> Result<UseIndex, StructureError> {
     let mut def_uses = vec![Vec::new(); def_count];
     let mut def_phi_uses = vec![Vec::new(); def_count];
     let mut phi_uses = vec![Vec::new(); phis.len()];
     let mut phi_phi_uses = vec![Vec::new(); phis.len()];
     let mut phi_use_blocks = vec![None; phis.len()];
     for (instr_index, values) in uses.iter().enumerate() {
-        let block = cfg.instr_to_block[instr_index];
+        let Some(&block) = cfg.instr_to_block.get(instr_index) else {
+            return Err(StructureError::invalid(format!(
+                "SSA use table contains missing instruction @{instr_index}"
+            )));
+        };
         for (reg, value) in values.fixed.iter() {
             let site = UseSite {
                 instr: InstrRef(instr_index),
@@ -398,14 +458,32 @@ fn index_uses(
             };
             match value {
                 SsaValue::Entry(_) => {}
-                SsaValue::Def(def) => def_uses[def.index()].push(site),
+                SsaValue::Def(def) => {
+                    let Some(sites) = def_uses.get_mut(def.index()) else {
+                        return Err(StructureError::invalid(format!(
+                            "SSA use references missing definition {def:?}"
+                        )));
+                    };
+                    sites.push(site);
+                }
                 SsaValue::Phi(phi) => {
-                    phi_uses[phi.index()].push(site);
-                    match phi_use_blocks[phi.index()] {
-                        None if phi_uses[phi.index()].len() == 1 => {
-                            phi_use_blocks[phi.index()] = Some(block);
+                    let Some(sites) = phi_uses.get_mut(phi.index()) else {
+                        return Err(StructureError::invalid(format!(
+                            "SSA use references missing {phi}"
+                        )));
+                    };
+                    sites.push(site);
+                    let is_first_use = sites.len() == 1;
+                    let Some(use_block) = phi_use_blocks.get_mut(phi.index()) else {
+                        return Err(StructureError::invalid(format!(
+                            "SSA use block index references missing {phi}"
+                        )));
+                    };
+                    match *use_block {
+                        None if is_first_use => {
+                            *use_block = Some(block);
                         }
-                        Some(existing) if existing != block => phi_use_blocks[phi.index()] = None,
+                        Some(existing) if existing != block => *use_block = None,
                         _ => {}
                     }
                 }
@@ -416,19 +494,33 @@ fn index_uses(
         for incoming in &phi.incoming {
             match incoming.value {
                 SsaValue::Entry(_) => {}
-                SsaValue::Def(def) => def_phi_uses[def.index()].push(phi.id),
+                SsaValue::Def(def) => {
+                    let Some(users) = def_phi_uses.get_mut(def.index()) else {
+                        return Err(StructureError::invalid(format!(
+                            "{} references missing definition {def:?}",
+                            phi.id
+                        )));
+                    };
+                    users.push(phi.id);
+                }
                 SsaValue::Phi(source) if source != phi.id => {
-                    phi_phi_uses[source.index()].push(phi.id);
+                    let Some(users) = phi_phi_uses.get_mut(source.index()) else {
+                        return Err(StructureError::invalid(format!(
+                            "{} references missing source {source}",
+                            phi.id
+                        )));
+                    };
+                    users.push(phi.id);
                 }
                 SsaValue::Phi(_) => {}
             }
         }
     }
-    (
+    Ok((
         def_uses,
         def_phi_uses,
         phi_uses,
         phi_phi_uses,
         phi_use_blocks,
-    )
+    ))
 }

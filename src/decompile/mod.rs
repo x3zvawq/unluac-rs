@@ -29,7 +29,7 @@ pub use contracts::{
     NamingResult, ReadabilityResult, StructureFacts,
 };
 pub use error::DecompileError;
-pub use options::{DebugOptions, DecompileDialect, DecompileOptions};
+pub use options::{ControlFlowCaps, DebugOptions, DecompileDialect, DecompileOptions};
 pub use pipeline::{DecompileResult, decompile};
 pub(crate) use state::DecompileContext;
 pub use state::{DecompileStage, DecompileState, StageDebugOutput};

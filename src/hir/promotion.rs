@@ -17,7 +17,10 @@
 use crate::hir::common::{
     HirBlock, HirExpr, HirLValue, HirStmt, HirTableField, HirTableKey, TempId,
 };
-use crate::structure::{BlockRef, Cfg, DataflowFacts, GraphFacts, PhiId, SsaValue};
+use crate::structure::{
+    BlockRef, Cfg, DataflowFacts, GraphFacts, PhiId, PhiIncomingDisposition, SsaValue,
+    StructurePlan,
+};
 use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto, Reg};
 use std::collections::{BTreeSet, VecDeque};
 
@@ -233,27 +236,45 @@ enum EpochRenameEvent {
 }
 
 impl HomeSlotKey {
-    fn new(slot: usize, epoch: usize) -> Self {
+    pub(super) const fn new(slot: usize, epoch: usize) -> Self {
         Self { slot, epoch }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+enum HomeSlotResolution {
+    #[default]
+    Unknown,
+    Known(HomeSlotKey),
+    Conflict,
 }
 
 /// 单个 proto 的 temp promotion 辅助事实。
 #[derive(Debug, Clone, Default)]
 pub(super) struct ProtoPromotionFacts {
     temp_home_slots: Vec<Option<HomeSlotKey>>,
+    local_home_slots: Vec<HomeSlotResolution>,
+    compact_home_slots: bool,
 }
 
 impl ProtoPromotionFacts {
-    /// 从 Dataflow 里提取当前 proto 所需的 temp -> home slot 对照表。
-    pub(super) fn from_dataflow(dataflow: &DataflowFacts, slot_epochs: &SlotEpochFacts) -> Self {
-        let total_temps = dataflow.defs.len() + dataflow.phi_candidates.len();
+    /// 从 canonical def 与最终 value plan 提取当前 proto 的 temp -> home slot 对照表。
+    pub(super) fn from_plan(
+        dataflow: &DataflowFacts,
+        plan: &StructurePlan,
+        slot_epochs: &SlotEpochFacts,
+    ) -> Self {
+        let total_temps = dataflow.defs.len() + plan.phis().len();
         let mut temp_home_slots = vec![None; total_temps];
 
         fill_fixed_def_home_slots(dataflow, slot_epochs, &mut temp_home_slots);
-        fill_phi_home_slots(dataflow, &mut temp_home_slots);
+        fill_phi_home_slots(dataflow, plan, &mut temp_home_slots);
 
-        Self { temp_home_slots }
+        Self {
+            temp_home_slots,
+            local_home_slots: Vec::new(),
+            compact_home_slots: false,
+        }
     }
 
     /// 返回某个 temp 对应的原始寄存器槽位。
@@ -263,6 +284,42 @@ impl ProtoPromotionFacts {
 
     pub(super) fn home_slot_definition_count(&self) -> usize {
         self.temp_home_slots.iter().flatten().count()
+    }
+
+    /// 返回 temp 提升后 local 仍对应的原始词法槽位。
+    ///
+    /// 同一 local 若吸收过不同槽位会永久标为 conflict；后续 pass 不能再把它作为
+    /// 跨 region 合并的物理身份依据。
+    pub(super) fn local_home_slot(
+        &self,
+        local: crate::hir::common::LocalId,
+    ) -> Option<HomeSlotKey> {
+        match self.local_home_slots.get(local.index()) {
+            Some(HomeSlotResolution::Known(slot)) => Some(*slot),
+            Some(HomeSlotResolution::Unknown | HomeSlotResolution::Conflict) | None => None,
+        }
+    }
+
+    pub(super) fn record_local_home_slot(
+        &mut self,
+        local: crate::hir::common::LocalId,
+        home_slot: HomeSlotKey,
+    ) {
+        if self.local_home_slots.len() <= local.index() {
+            self.local_home_slots
+                .resize(local.index() + 1, HomeSlotResolution::Unknown);
+        }
+        let resolution = &mut self.local_home_slots[local.index()];
+        *resolution =
+            merge_home_slot_resolutions(*resolution, HomeSlotResolution::Known(home_slot));
+    }
+
+    pub(super) fn enable_home_slot_compaction(&mut self) {
+        self.compact_home_slots = true;
+    }
+
+    pub(super) const fn compacts_home_slots(&self) -> bool {
+        self.compact_home_slots
     }
 
     /// 把当前语句里所有 closure capture 观察到的 home slot 收集进集合。
@@ -578,66 +635,93 @@ fn fill_fixed_def_home_slots(
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum HomeSlotResolution {
-    Unknown,
-    Known(HomeSlotKey),
-    Conflict,
-}
+fn fill_phi_home_slots(
+    dataflow: &DataflowFacts,
+    plan: &StructurePlan,
+    temp_home_slots: &mut [Option<HomeSlotKey>],
+) {
+    let phi_count = plan.phis().len();
+    let mut resolutions = vec![HomeSlotResolution::Unknown; phi_count];
+    let mut consumers = vec![Vec::<PhiId>::new(); phi_count];
+    let mut pending = VecDeque::<(PhiId, HomeSlotResolution)>::new();
 
-fn fill_phi_home_slots(dataflow: &DataflowFacts, temp_home_slots: &mut [Option<HomeSlotKey>]) {
-    let mut resolutions = vec![HomeSlotResolution::Unknown; dataflow.phi_candidates.len()];
-    let mut pending = dataflow
-        .phi_candidates
-        .iter()
-        .map(|phi| phi.id)
-        .collect::<VecDeque<_>>();
-
-    while let Some(phi_id) = pending.pop_front() {
-        let Some(phi) = dataflow.phi_candidate(phi_id) else {
-            continue;
-        };
-        let resolved =
-            phi.incoming
-                .iter()
-                .fold(HomeSlotResolution::Unknown, |current, incoming| {
-                    merge_home_slot_resolutions(
-                        current,
-                        home_slot_resolution_for_value(
-                            incoming.value,
-                            temp_home_slots,
-                            &resolutions,
-                        ),
-                    )
-                });
-        let Some(previous) = resolutions.get_mut(phi_id.index()) else {
-            continue;
-        };
-        if *previous == resolved {
-            continue;
+    for phi in plan.phis() {
+        let mut resolution = HomeSlotResolution::Unknown;
+        for incoming in &phi.incomings {
+            match incoming.disposition {
+                PhiIncomingDisposition::Dead => continue,
+                PhiIncomingDisposition::DiagnosticUnresolved => {
+                    resolution = HomeSlotResolution::Conflict;
+                    continue;
+                }
+                PhiIncomingDisposition::RegionInput(_)
+                | PhiIncomingDisposition::RegionResult(_)
+                | PhiIncomingDisposition::LoopCarried(_)
+                | PhiIncomingDisposition::EdgeCopy => {}
+            }
+            if let SsaValue::Phi(source) = incoming.value {
+                if let Some(source_consumers) = consumers.get_mut(source.index()) {
+                    source_consumers.push(phi.phi);
+                }
+                continue;
+            }
+            resolution = merge_home_slot_resolutions(
+                resolution,
+                home_slot_resolution_for_leaf(incoming.value, temp_home_slots),
+            );
         }
-        *previous = resolved;
-        pending.extend(dataflow.phi_consumer_ids(phi_id).iter().copied());
+        let Some(slot) = resolutions.get_mut(phi.phi.index()) else {
+            continue;
+        };
+        *slot = resolution;
+        if !matches!(resolution, HomeSlotResolution::Unknown) {
+            pending.push_back((phi.phi, resolution));
+        }
     }
 
-    // Unknown 只能在 phi 强连通分量内被同一已知槽位收敛。若某个已知候选
-    // 仍依赖最终未解的纯环，就没有证明它的全部 incoming 同槽，不得继承。
-    let mut unresolved = resolutions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, resolution)| {
-            (!matches!(resolution, HomeSlotResolution::Known(_))).then_some(PhiId(index))
-        })
-        .collect::<VecDeque<_>>();
-    while let Some(phi_id) = unresolved.pop_front() {
-        for consumer in dataflow.phi_consumer_ids(phi_id) {
+    // resolution 只会 Unknown -> Known -> Conflict，每条依赖边最多处理两次。
+    while let Some((phi_id, source_resolution)) = pending.pop_front() {
+        let Some(phi_consumers) = consumers.get(phi_id.index()) else {
+            continue;
+        };
+        for consumer in phi_consumers {
             let Some(resolution) = resolutions.get_mut(consumer.index()) else {
                 continue;
             };
-            if matches!(resolution, HomeSlotResolution::Known(_)) {
-                *resolution = HomeSlotResolution::Conflict;
-                unresolved.push_back(*consumer);
+            let merged = merge_home_slot_resolutions(*resolution, source_resolution);
+            if merged != *resolution {
+                *resolution = merged;
+                pending.push_back((*consumer, merged));
             }
+        }
+    }
+
+    // 纯 phi 环没有已知 leaf；依赖该环的后续 phi 也不能只凭其它 incoming
+    // 继承 home slot。在反向索引上做一次闭包，避免重新扫描 incoming。
+    let mut unresolved = VecDeque::new();
+    let mut invalid = vec![false; phi_count];
+    for (index, resolution) in resolutions.iter().enumerate() {
+        if matches!(resolution, HomeSlotResolution::Unknown) {
+            invalid[index] = true;
+            unresolved.push_back(PhiId(index));
+        }
+    }
+    while let Some(phi_id) = unresolved.pop_front() {
+        let Some(phi_consumers) = consumers.get(phi_id.index()) else {
+            continue;
+        };
+        for consumer in phi_consumers {
+            let Some(is_invalid) = invalid.get_mut(consumer.index()) else {
+                continue;
+            };
+            if *is_invalid {
+                continue;
+            }
+            *is_invalid = true;
+            if let Some(resolution) = resolutions.get_mut(consumer.index()) {
+                *resolution = HomeSlotResolution::Conflict;
+            }
+            unresolved.push_back(*consumer);
         }
     }
 
@@ -651,10 +735,9 @@ fn fill_phi_home_slots(dataflow: &DataflowFacts, temp_home_slots: &mut [Option<H
     }
 }
 
-fn home_slot_resolution_for_value(
+fn home_slot_resolution_for_leaf(
     value: SsaValue,
     temp_home_slots: &[Option<HomeSlotKey>],
-    phi_resolutions: &[HomeSlotResolution],
 ) -> HomeSlotResolution {
     match value {
         SsaValue::Entry(reg) => HomeSlotResolution::Known(HomeSlotKey::new(reg.index(), 0)),
@@ -663,10 +746,7 @@ fn home_slot_resolution_for_value(
             .copied()
             .flatten()
             .map_or(HomeSlotResolution::Unknown, HomeSlotResolution::Known),
-        SsaValue::Phi(phi) => phi_resolutions
-            .get(phi.index())
-            .copied()
-            .unwrap_or(HomeSlotResolution::Unknown),
+        SsaValue::Phi(_) => HomeSlotResolution::Unknown,
     }
 }
 

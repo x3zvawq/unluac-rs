@@ -21,33 +21,45 @@ mod adjacent;
 mod binding;
 mod boundary;
 mod handoffs;
+mod loop_updates;
 mod prune;
 mod reads;
+mod region_results;
 mod seeds;
 
 use std::collections::BTreeSet;
 
 use crate::hir::common::{HirBlock, HirProto, HirStmt};
+use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::temp_touch::{RefScopeTracker, TempTouchIndex, collect_temp_refs_by_stmt};
 use super::walk::for_each_nested_block_mut;
 
-use self::adjacent::try_collapse_adjacent_local_seed_handoff;
-use self::binding::CarryBinding;
+use self::adjacent::{try_collapse_adjacent_local_seed_handoff, try_collapse_guarded_local_update};
+use self::binding::{BindingProtection, CarryBinding};
 use self::boundary::LabelJumpIndex;
 use self::handoffs::{HandoffAction, try_collapse_handoff_at};
+use self::loop_updates::collapse_dead_loop_update_handoffs;
 use self::reads::{collect_binding_mentions_by_stmt, collect_binding_mentions_in_expr};
-use super::mention::stmts_captured_locals;
+use self::region_results::{
+    RegionResultIndex, collapse_inferred_if_result_chains, collapse_written_back_if_results,
+    try_collapse_region_result_handoff,
+};
+use super::mention::{stmts_captured_locals, stmts_reference_captured_bindings};
 
-pub(super) fn collapse_carried_local_handoffs_in_proto(proto: &mut HirProto) -> bool {
-    collapse_handoffs_recursive(&mut proto.body, &BTreeSet::new())
+pub(super) fn collapse_carried_local_handoffs_in_proto(
+    proto: &mut HirProto,
+    promotion_facts: &ProtoPromotionFacts,
+) -> bool {
+    collapse_handoffs_recursive(&mut proto.body, &BTreeSet::new(), promotion_facts)
 }
 
 /// 自定义后序遍历：先递归处理子块（同时把外层 binding 引用集传下去），再在当前块做
 /// handoff 折叠。外层仍提及的 source 或 target 不能在当前块内被当成私有快照消除。
 fn collapse_handoffs_recursive(
     block: &mut HirBlock,
-    outer_bindings: &BTreeSet<CarryBinding>,
+    outer_bindings: &dyn BindingProtection,
+    promotion_facts: &ProtoPromotionFacts,
 ) -> bool {
     let mut changed = false;
 
@@ -65,29 +77,39 @@ fn collapse_handoffs_recursive(
             }
             _ => None,
         };
-        let mut child_outer = None;
+        let child_outer = ScopedBindingProtection {
+            inherited: outer_bindings,
+            refs: &binding_refs,
+            extra: repeat_cond_refs.as_ref(),
+        };
 
         for_each_nested_block_mut(&mut block.stmts[index], &mut |nested_block| {
-            let child_outer = child_outer.get_or_insert_with(|| {
-                let mut child_outer = binding_refs.outer_with_prefix_and_suffix(outer_bindings);
-                if let Some(repeat_cond_refs) = &repeat_cond_refs {
-                    child_outer.extend(repeat_cond_refs.iter().copied());
-                }
-                child_outer
-            });
-            changed |= collapse_handoffs_recursive(nested_block, child_outer);
+            changed |= collapse_handoffs_recursive(nested_block, &child_outer, promotion_facts);
         });
 
         binding_refs.leave_stmt(index);
     }
 
     // 后序：子块都处理完之后，再处理当前块的 handoff。
-    changed |= collapse_block_handoffs(block, outer_bindings);
+    changed |= collapse_dead_loop_update_handoffs(block, &stmt_binding_refs);
+    changed |= collapse_block_handoffs(block, outer_bindings, promotion_facts);
     changed
 }
 
-fn collapse_block_handoffs(block: &mut HirBlock, outer_bindings: &BTreeSet<CarryBinding>) -> bool {
-    let mut changed = false;
+fn collapse_block_handoffs(
+    block: &mut HirBlock,
+    outer_bindings: &dyn BindingProtection,
+    promotion_facts: &ProtoPromotionFacts,
+) -> bool {
+    let mut captured_bindings = collect_captured_bindings(&block.stmts);
+    let mut changed = collapse_written_back_if_results(block, outer_bindings, &captured_bindings);
+    captured_bindings = collect_captured_bindings(&block.stmts);
+    changed |= collapse_inferred_if_result_chains(
+        block,
+        outer_bindings,
+        promotion_facts,
+        &captured_bindings,
+    );
     let mut index = 0;
     let mut stmt_temp_refs = collect_temp_refs_by_stmt(&block.stmts);
 
@@ -95,9 +117,29 @@ fn collapse_block_handoffs(block: &mut HirBlock, outer_bindings: &BTreeSet<Carry
         let action = {
             let temp_touches = TempTouchIndex::new(&stmt_temp_refs);
             let label_jumps = LabelJumpIndex::new(&block.stmts);
-            let captured_locals = stmts_captured_locals(&block.stmts);
+            captured_bindings = collect_captured_bindings(&block.stmts);
+            let region_results = RegionResultIndex::new(&block.stmts, &captured_bindings);
             let mut action = None;
             while index < block.stmts.len() {
+                if try_collapse_region_result_handoff(
+                    block,
+                    index,
+                    outer_bindings,
+                    promotion_facts,
+                    &region_results,
+                ) {
+                    action = Some(HandoffAction::RetrySameIndex);
+                    break;
+                }
+                if try_collapse_guarded_local_update(
+                    block,
+                    index,
+                    outer_bindings,
+                    &captured_bindings,
+                ) {
+                    action = Some(HandoffAction::RetrySameIndex);
+                    break;
+                }
                 if try_collapse_adjacent_local_seed_handoff(block, index) {
                     action = Some(HandoffAction::RetrySameIndex);
                     break;
@@ -108,7 +150,7 @@ fn collapse_block_handoffs(block: &mut HirBlock, outer_bindings: &BTreeSet<Carry
                     outer_bindings,
                     &temp_touches,
                     &label_jumps,
-                    &captured_locals,
+                    &captured_bindings,
                 ) {
                     action = Some(handoff_action);
                     break;
@@ -130,4 +172,29 @@ fn collapse_block_handoffs(block: &mut HirBlock, outer_bindings: &BTreeSet<Carry
     }
 
     changed
+}
+
+struct ScopedBindingProtection<'scope, 'refs> {
+    inherited: &'scope dyn BindingProtection,
+    refs: &'scope RefScopeTracker<'refs, CarryBinding>,
+    extra: Option<&'scope BTreeSet<CarryBinding>>,
+}
+
+impl BindingProtection for ScopedBindingProtection<'_, '_> {
+    fn contains(&self, binding: &CarryBinding) -> bool {
+        self.inherited.contains(binding)
+            || self.refs.prefix_contains(*binding)
+            || self.refs.suffix_contains(*binding)
+            || self.extra.is_some_and(|extra| extra.contains(binding))
+    }
+}
+
+fn collect_captured_bindings(stmts: &[HirStmt]) -> BTreeSet<CarryBinding> {
+    let captured = stmts_reference_captured_bindings(stmts);
+    let mut bindings = stmts_captured_locals(stmts)
+        .into_iter()
+        .map(CarryBinding::Local)
+        .collect::<BTreeSet<_>>();
+    bindings.extend(captured.params.into_iter().map(CarryBinding::Param));
+    bindings
 }

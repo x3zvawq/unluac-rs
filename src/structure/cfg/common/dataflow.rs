@@ -10,6 +10,8 @@ use std::ops::Range;
 
 use crate::transformer::{InstrRef, Reg};
 
+use crate::structure::StructureError;
+
 use super::cfg::EdgeRef;
 use super::cfg::{BlockRef, Cfg};
 
@@ -20,9 +22,15 @@ pub struct SsaRegMap {
 }
 
 impl SsaRegMap {
-    pub(crate) fn from_sorted_entries(entries: Vec<(Reg, SsaValue)>) -> Self {
-        debug_assert!(entries.windows(2).all(|pair| pair[0].0 < pair[1].0));
-        Self { entries }
+    pub(crate) fn from_sorted_entries(
+        entries: Vec<(Reg, SsaValue)>,
+    ) -> Result<Self, StructureError> {
+        if !entries.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+            return Err(StructureError::invalid(
+                "SSA register map entries are not strictly sorted",
+            ));
+        }
+        Ok(Self { entries })
     }
 
     pub fn get(&self, reg: Reg) -> Option<SsaValue> {
@@ -40,10 +48,14 @@ impl SsaRegMap {
         self.entries.iter().map(|(_, value)| *value)
     }
 
-    pub(crate) fn map_values(&mut self, mut map: impl FnMut(SsaValue) -> SsaValue) {
+    pub(crate) fn try_map_values<E>(
+        &mut self,
+        mut map: impl FnMut(SsaValue) -> Result<SsaValue, E>,
+    ) -> Result<(), E> {
         for (_, value) in &mut self.entries {
-            *value = map(*value);
+            *value = map(*value)?;
         }
+        Ok(())
     }
 }
 
@@ -195,39 +207,6 @@ impl DataflowFacts {
     pub fn phi_used_only_in_block(&self, phi_id: PhiId, block: BlockRef) -> bool {
         self.phi_use_count(phi_id) > 0
             && self.phi_use_blocks.get(phi_id.index()).copied().flatten() == Some(block)
-    }
-
-    /// SSA 值是否只被指定指令直接读取，且没有继续流入其他 phi。
-    pub(crate) fn value_used_only_by(&self, value: SsaValue, instr: InstrRef, reg: Reg) -> bool {
-        let is_only_site =
-            |uses: &[UseSite]| matches!(uses, [site] if site.instr == instr && site.reg == reg);
-        match value {
-            SsaValue::Def(def) => {
-                self.def_uses
-                    .get(def.index())
-                    .is_some_and(|uses| is_only_site(uses))
-                    && self.def_phi_uses.get(def.index()).is_none_or(Vec::is_empty)
-            }
-            SsaValue::Phi(phi) => {
-                self.phi_uses
-                    .get(phi.index())
-                    .is_some_and(|uses| is_only_site(uses))
-                    && self.phi_phi_uses.get(phi.index()).is_none_or(Vec::is_empty)
-            }
-            SsaValue::Entry(_) => false,
-        }
-    }
-
-    /// 判断固定定义的全部直接 use 是否都属于给定指令集合，且没有继续流入 phi。
-    pub(crate) fn def_uses_are_within(
-        &self,
-        def: DefId,
-        allowed_instrs: &BTreeSet<InstrRef>,
-    ) -> bool {
-        self.def_uses
-            .get(def.index())
-            .is_some_and(|uses| uses.iter().all(|site| allowed_instrs.contains(&site.instr)))
-            && self.def_phi_uses.get(def.index()).is_none_or(Vec::is_empty)
     }
 
     /// 计算"真正死亡"的 phi 集合——既没有任何指令直接读取，也没有被任何存活 phi

@@ -3,7 +3,7 @@
 //! HIR analyze 和 simplify 都会判断某个表达式是否能被挪动或折进别的表达式。
 //! 这个文件只放跨 pass 共用、和具体恢复策略无关的谓词，避免求值序规则散落后漂移。
 
-use super::common::{HirCaptureMode, HirExpr, HirUnaryOpKind};
+use super::common::{HirBinaryOpKind, HirCaptureMode, HirExpr, HirUnaryOpKind};
 
 /// 表达式的求值能否在不改变 Lua 可观察行为的前提下被删除。
 pub(crate) fn expr_is_discard_safe(expr: &HirExpr) -> bool {
@@ -25,6 +25,9 @@ pub(crate) fn expr_is_discard_safe(expr: &HirExpr) -> bool {
         | HirExpr::Unresolved(_) => true,
         HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
             expr_is_discard_safe(&unary.expr)
+        }
+        HirExpr::Binary(binary) if stable_literal_equality(binary.op, &binary.lhs, &binary.rhs) => {
+            expr_is_discard_safe(&binary.lhs) && expr_is_discard_safe(&binary.rhs)
         }
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
             expr_is_discard_safe(&logical.lhs) && expr_is_discard_safe(&logical.rhs)
@@ -61,6 +64,9 @@ pub(crate) fn expr_is_repeatable(expr: &HirExpr) -> bool {
         | HirExpr::UpvalueRef(_)
         | HirExpr::TempRef(_) => true,
         HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => expr_is_repeatable(&unary.expr),
+        HirExpr::Binary(binary) if stable_literal_equality(binary.op, &binary.lhs, &binary.rhs) => {
+            expr_is_repeatable(&binary.lhs) && expr_is_repeatable(&binary.rhs)
+        }
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
             expr_is_repeatable(&logical.lhs) && expr_is_repeatable(&logical.rhs)
         }
@@ -75,6 +81,28 @@ pub(crate) fn expr_is_repeatable(expr: &HirExpr) -> bool {
         | HirExpr::Closure(_)
         | HirExpr::Unresolved(_) => false,
     }
+}
+
+/// Lua equality 只有在两侧都可能是 table/userdata 一类对象时才会进入 `__eq`。
+/// 一侧是原始字面量即可排除用户代码；另一侧仍必须由调用方证明可重复读取。
+fn stable_literal_equality(op: HirBinaryOpKind, lhs: &HirExpr, rhs: &HirExpr) -> bool {
+    op == HirBinaryOpKind::Eq
+        && (is_metamethod_inert_literal(lhs) || is_metamethod_inert_literal(rhs))
+}
+
+fn is_metamethod_inert_literal(expr: &HirExpr) -> bool {
+    matches!(
+        expr,
+        HirExpr::Nil
+            | HirExpr::Boolean(_)
+            | HirExpr::Integer(_)
+            | HirExpr::Number(_)
+            | HirExpr::String(_)
+            | HirExpr::Int64(_)
+            | HirExpr::UInt64(_)
+            | HirExpr::Vector(_)
+            | HirExpr::Complex { .. }
+    )
 }
 
 pub(crate) fn expr_observes_eval_order(expr: &HirExpr) -> bool {

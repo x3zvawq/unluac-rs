@@ -101,6 +101,9 @@ fn matches_redundant_self_assign_pair(
 
 fn redundant_self_assign_binding(target: &HirLValue, value: &HirExpr) -> Option<CarryBinding> {
     match (target, value) {
+        (HirLValue::Param(target), HirExpr::ParamRef(value)) if target == value => {
+            Some(CarryBinding::Param(*target))
+        }
         (HirLValue::Temp(target), HirExpr::TempRef(value)) if target == value => {
             Some(CarryBinding::Temp(*target))
         }

@@ -25,4 +25,4 @@ local function run(a, b, c, xs)
     return x
 end
 
-print("regress_113_luau_short_circuit_outer_break#1", run(false, false, true, { 1 }))
+print("regress_113_luau_nested_exit#1", run(false, false, true, { 1, 2 }))
