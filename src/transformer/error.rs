@@ -137,8 +137,4 @@ pub enum TransformError {
         capture_pc: u32,
         found: &'static str,
     },
-    #[error(
-        "shared closure s{shared_index} with captures is repeated at raw pc {raw_pc}; dynamic Luau closure identity cannot be represented as independent closure literals"
-    )]
-    RepeatedCapturedSharedClosure { raw_pc: u32, shared_index: usize },
 }

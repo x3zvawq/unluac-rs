@@ -10,17 +10,20 @@
 
 use super::exprs::{
     expr_for_const, expr_for_reg_use, expr_for_value_operand, global_name_for_access,
-    lower_binary_op, lower_closure_expr, lower_method_name, lower_raw_table_get_expr,
-    lower_raw_table_set_call, lower_table_access_expr, lower_table_access_target, lower_unary_op,
-    lower_upvalue_operand_expr, lower_upvalue_operand_target, lower_value_pack,
+    lower_binary_op, lower_closure_capture, lower_closure_expr, lower_composite_factory_expr,
+    lower_method_name, lower_raw_table_get_expr, lower_raw_table_set_call, lower_table_access_expr,
+    lower_table_access_target, lower_unary_op, lower_upvalue_operand_expr,
+    lower_upvalue_operand_target, lower_value_pack,
 };
 use super::helpers::{
     assign_stmt, binary_expr, concat_expr, decode_raw_string, return_stmt, unresolved_expr,
 };
 use super::lower::ProtoLowering;
+use super::shared_closures::CompositeFactoryRef;
 use crate::hir::common::{
     HirCallExpr, HirCallStmt, HirClose, HirExpr, HirLValue, HirLocalDecl, HirPackTail, HirStmt,
-    HirTableSetList, HirToBeClosed, HirUnaryExpr, HirValuePack, LocalId,
+    HirTableAccess, HirTableConstructor, HirTableField, HirTableSetList, HirToBeClosed,
+    HirUnaryExpr, HirValuePack, LocalId,
 };
 use crate::structure::BlockRef;
 use crate::transformer::{
@@ -194,12 +197,39 @@ pub(super) fn lower_regular_instr(
         LowInstr::Call(call) => lower_call(lowering, block, instr_ref, call),
         LowInstr::VarArg(vararg) => lower_vararg(lowering, instr_ref, vararg.results),
         LowInstr::Closure(closure) => {
+            let owner = lowering.shared_closure_owner(instr_ref);
+            let consumed = lowering.shared_closure_is_consumed(instr_ref);
+            if consumed && owner.is_none() {
+                return Some(Vec::new());
+            }
             let mut stmts = capture_empty_local_decl_stmts(lowering, instr_ref);
-            stmts.extend(fixed_assign(
-                lowering,
-                instr_ref,
-                vec![lower_closure_expr(lowering, block, instr_ref, closure)],
-            ));
+            match owner {
+                Some(factory) => {
+                    let plan = lowering.captured_shared_closures.composite_plan(factory);
+                    if !consumed && plan.preserve_owner_value {
+                        stmts.extend(fixed_assign(
+                            lowering,
+                            instr_ref,
+                            vec![lower_closure_expr(lowering, block, instr_ref, closure)],
+                        ));
+                    }
+                    stmts.extend(lower_shared_capture_barrier(
+                        lowering, block, instr_ref, closure, factory,
+                    ));
+                    stmts.push(HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                        bindings: vec![lowering.shared_factory_local(factory)],
+                        values: vec![lower_composite_factory_expr(
+                            lowering, block, instr_ref, closure, factory,
+                        )]
+                        .into(),
+                    })));
+                }
+                None => stmts.extend(fixed_assign(
+                    lowering,
+                    instr_ref,
+                    vec![lower_closure_expr(lowering, block, instr_ref, closure)],
+                )),
+            }
             stmts
         }
         LowInstr::Close(close) => vec![HirStmt::Close(Box::new(HirClose {
@@ -411,6 +441,57 @@ fn lower_result_assign(
         HirValuePack::fixed(vec![expr])
     };
     fixed_assign(lowering, instr_ref, values)
+}
+
+fn lower_shared_capture_barrier(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    closure: &crate::transformer::ClosureInstr,
+    factory: CompositeFactoryRef,
+) -> Vec<HirStmt> {
+    let Some(barrier) = lowering.captured_shared_closures.capture_barrier(factory) else {
+        return Vec::new();
+    };
+    let sources = &lowering
+        .captured_shared_closures
+        .composite_plan(factory)
+        .outer_captures;
+    let mut locals = Vec::new();
+    let mut fields = Vec::new();
+    for (index, snapshot) in barrier.snapshots.iter().enumerate() {
+        let Some(local) = snapshot else {
+            continue;
+        };
+        let capture =
+            lower_closure_capture(lowering, block, instr_ref, closure.dst, sources[index]);
+        locals.push(*local);
+        fields.push(HirTableField::Array(capture.value));
+    }
+    let table = HirExpr::TableConstructor(Box::new(HirTableConstructor {
+        fields,
+        trailing_multivalue: None,
+    }));
+    let snapshots = locals
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            HirExpr::TableAccess(Box::new(HirTableAccess {
+                base: HirExpr::LocalRef(barrier.box_local),
+                key: HirExpr::Integer((index + 1) as i64),
+            }))
+        })
+        .collect::<Vec<_>>();
+    vec![
+        HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![barrier.box_local],
+            values: vec![table].into(),
+        })),
+        HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: locals,
+            values: snapshots.into(),
+        })),
+    ]
 }
 
 fn fixed_assign(

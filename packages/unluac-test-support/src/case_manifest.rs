@@ -250,6 +250,10 @@ const LUAU_OPTIMIZED_OPTIONS: LuaCaseOptions = LuaCaseOptions {
     luau_vector: None,
     recompile_rounds: None,
 };
+const LUAU_OPTIMIZED_CONVERGENCE_OPTIONS: LuaCaseOptions = LuaCaseOptions {
+    recompile_rounds: Some(3),
+    ..LUAU_OPTIMIZED_OPTIONS
+};
 const LUAU_VECTOR_OPTIONS: LuaCaseOptions = LuaCaseOptions {
     retain_debug: false,
     naming_mode: None,
@@ -1576,10 +1580,30 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         target_pc: 13,
     }),
     LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_296_luau_captured_shared_factory.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_CONVERGENCE_OPTIONS),
+    LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_297_luau_decision_guard_mutation.lua",
         LUAU_ONLY,
     )
     .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_298_luau_captured_shared_capture_free_dependency.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_299_luau_captured_shared_owner_dependency.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_300_luau_captured_shared_repeat_condition.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {

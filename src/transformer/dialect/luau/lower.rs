@@ -4,8 +4,6 @@
 //! 折进 raw 层了；这里专注做语义恢复，把它翻成项目里既有的 CFG/HIR/AST 管线能理解
 //! 的稳定 low-IR 契约。
 
-use std::collections::BTreeSet;
-
 use crate::parser::{
     LuauCaptureKind, LuauConstEntry, LuauInstrExtra, LuauOpcode, LuauOperands, RawChunk,
     RawLiteralConst, RawProto,
@@ -57,7 +55,6 @@ struct ProtoLowerer<'a> {
     lowering: PendingLoweringState,
     pending_methods: PendingMethodHints,
     word_code_index: WordCodeIndex,
-    captured_shared_closures: BTreeSet<SharedClosureRef>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -76,7 +73,6 @@ impl<'a> ProtoLowerer<'a> {
             lowering: PendingLoweringState::new(raw_instr_count),
             pending_methods: PendingMethodHints::new(method_slots),
             word_code_index: WordCodeIndex::from_raw(raw, instr_pc, instr_word_len),
-            captured_shared_closures: BTreeSet::new(),
         }
     }
 
@@ -909,12 +905,6 @@ impl<'a> ProtoLowerer<'a> {
                     let (captures, raw_indices) =
                         self.decode_closure_captures(raw_index, raw_pc, capture_count)?;
                     let shared = SharedClosureRef(d as usize);
-                    if !captures.is_empty() && !self.captured_shared_closures.insert(shared) {
-                        return Err(TransformError::RepeatedCapturedSharedClosure {
-                            raw_pc,
-                            shared_index: shared.0,
-                        });
-                    }
                     self.emit(
                         Some(raw_index),
                         raw_indices,

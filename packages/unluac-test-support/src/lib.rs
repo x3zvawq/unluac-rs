@@ -1059,6 +1059,10 @@ pub(crate) fn run_pipeline_case(
         .options
         .recompile_rounds
         .unwrap_or_else(recompile_rounds);
+    let require_convergence = entry
+        .options
+        .recompile_rounds
+        .is_some_and(|rounds| rounds > 0);
     let mut prev_generated_source = generated.source.clone();
     for round in 1..=rounds {
         let round_label = format!("recompile-round-{round}");
@@ -1258,6 +1262,22 @@ pub(crate) fn run_pipeline_case(
                 ),
             )
             .with_proto_stats(proto_count, failed_tags));
+        }
+
+        if prev_generated_source == recompile_generated.source {
+            if require_convergence {
+                break;
+            }
+        } else if require_convergence && round == rounds {
+            let summary = format!("[{round_label}] generated source did not converge");
+            return Err(TestFailure::new(
+                FailureKind::RecompileConvergenceMismatch,
+                summary.clone(),
+                format!(
+                    "{summary}\nprevious source:\n{}\ncurrent source:\n{}",
+                    prev_generated_source, recompile_generated.source,
+                ),
+            ));
         }
 
         prev_generated_source = recompile_generated.source.clone();

@@ -3,27 +3,34 @@
 //! 外层 [analyze.rs](/Users/x3zvawq/workspace/unluac-rs/src/hir/analyze/mod.rs) 只负责组织模块和
 //! 暴露主入口，这里集中放 proto 递归构造和共享 lowering 上下文。final edge 的 phi
 //! copy 由 plan 执行器消费；单条 low-IR 指令到 HIR 语句的映射由 `instrs.rs` 负责，
-//! 避免主流程再次膨胀成所有 lowering 细节的集合。
+//! captured Luau shared closure 的词法 factory 由 `shared_closures.rs` 先冻结，再由这里
+//! 预留并填充 synthetic proto；避免主流程重新猜 closure identity。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::promotion::{ProtoPromotionFacts, SlotEpochFacts};
 use super::bindings::build_bindings;
-use super::helpers::{decode_raw_string, empty_proto};
+use super::helpers::{decode_raw_string, empty_proto, return_stmt};
 use super::instrs::local_decl_stmts;
+use super::shared_closures::{
+    CompositeCapture, CompositeFactoryPlan, CompositeFactoryRef, SharedClosurePlan,
+    build_shared_closure_plan,
+};
 use super::structure::build_structured_body;
 use crate::ast::AstTargetDialect;
 use crate::decompile::{DecompileContext, DecompileState};
 use crate::hir::HirLowerError;
 use crate::hir::common::{
-    HirBlock, HirClosureExpr, HirExpr, HirLValue, HirLocalDecl, HirProto, HirProtoRef, HirStmt,
-    HirValuePack, LocalId, ParamId, TempId, UpvalueId,
+    HirBlock, HirCapture, HirCaptureMode, HirClosureExpr, HirExpr, HirLValue, HirLocalDecl,
+    HirProto, HirProtoRef, HirStmt, HirValuePack, LocalId, ParamId, TempId, UpvalueId,
 };
 use crate::structure::StructureFacts;
-use crate::structure::{BlockRef, Cfg, CfgGraph, DataflowFacts, GraphFacts, OpenDefId};
+use crate::structure::{
+    BlockRef, CanonicalMoveIndex, Cfg, CfgGraph, DataflowFacts, GraphFacts, OpenDefId, SsaValue,
+};
 use crate::transformer::{
-    AccessBase, AccessKey, CallKind, ClosureCreation, GetTableKind, InstrRef, LowInstr,
-    LoweredProto, ProtoRef, Reg, ResultPack, SharedClosureRef, ValuePack,
+    AccessBase, AccessKey, CallKind, CaptureSource, ClosureCreation, GetTableKind, InstrRef,
+    LowInstr, LoweredProto, ProtoRef, Reg, ResultPack, SharedClosureRef, ValuePack,
 };
 
 pub(super) struct ProtoBindings {
@@ -121,8 +128,21 @@ pub(super) struct ProtoLowering<'a> {
     pub(super) child_refs: &'a [HirProtoRef],
     pub(super) bindings: ProtoBindings,
     pub(super) shared_closure_locals: BTreeMap<SharedClosureRef, (LocalId, ProtoRef)>,
+    pub(super) captured_shared_closures: CapturedSharedClosureLowering,
     pub(super) open_pack_owners: Vec<Option<InstrRef>>,
     pub(super) owned_open_producers: Vec<bool>,
+}
+
+pub(super) struct CapturedSharedClosureLowering {
+    plan: SharedClosurePlan,
+    factory_locals: Vec<LocalId>,
+    capture_barriers: Vec<Option<SharedCaptureBarrier>>,
+    composite_protos: Vec<HirProtoRef>,
+}
+
+pub(super) struct SharedCaptureBarrier {
+    pub(super) box_local: LocalId,
+    pub(super) snapshots: Vec<Option<LocalId>>,
 }
 
 #[derive(Default)]
@@ -168,11 +188,15 @@ fn lower_proto_node(
     artifacts: &mut LowerArtifacts,
 ) -> Result<LoweredProtoResult, HirLowerError> {
     let cfg = &cfg_graph.cfg;
+    let captured_shared_plan =
+        build_shared_closure_plan(proto, cfg_graph, graph_facts, dataflow, structure.plan())?;
     let id = HirProtoRef(artifacts.protos.len());
     artifacts.protos.push(empty_proto(id));
     artifacts
         .promotion_facts
         .push(ProtoPromotionFacts::default());
+    let composite_protos =
+        reserve_composite_factory_protos(captured_shared_plan.composites().len(), artifacts);
 
     let child_results = proto
         .children
@@ -203,6 +227,13 @@ fn lower_proto_node(
         .into_iter()
         .map(|child| child.mutable_upvalues)
         .collect::<Vec<_>>();
+    fill_composite_factory_protos(
+        proto,
+        &child_refs,
+        &captured_shared_plan,
+        &composite_protos,
+        artifacts,
+    )?;
 
     let slot_epochs = SlotEpochFacts::analyze(proto, cfg, graph_facts, dataflow);
     let mut bindings = build_bindings(
@@ -214,7 +245,15 @@ fn lower_proto_node(
         &slot_epochs,
         &child_mutable_upvalues,
     );
-    let shared_closure_locals = build_shared_closure_locals(proto, &mut bindings);
+    let shared_closure_locals =
+        build_shared_closure_locals(proto, &captured_shared_plan, &mut bindings);
+    let captured_shared_closures = CapturedSharedClosureLowering::new(
+        captured_shared_plan,
+        composite_protos,
+        proto,
+        dataflow,
+        &mut bindings,
+    );
     let open_pack_owners = build_open_pack_owners(proto, cfg, dataflow);
     let mut owned_open_producers = vec![false; proto.instrs.len()];
     for def in &dataflow.open_defs {
@@ -231,6 +270,7 @@ fn lower_proto_node(
         child_refs: &child_refs,
         bindings,
         shared_closure_locals,
+        captured_shared_closures,
         open_pack_owners,
         owned_open_producers,
     };
@@ -249,7 +289,7 @@ fn lower_proto_node(
         temps: lowering.bindings.temps.clone(),
         temp_debug_locals: lowering.bindings.temp_debug_locals.clone(),
         body: build_proto_body(id, &lowering)?,
-        children: child_refs,
+        children: lowering.hir_children(),
     };
     artifacts.promotion_facts[id.index()] =
         ProtoPromotionFacts::from_plan(dataflow, structure.plan(), &slot_epochs);
@@ -303,13 +343,22 @@ fn mutable_upvalues_for_proto(
 
 fn build_shared_closure_locals(
     proto: &LoweredProto,
+    captured_plan: &SharedClosurePlan,
     bindings: &mut ProtoBindings,
 ) -> BTreeMap<SharedClosureRef, (LocalId, ProtoRef)> {
     let mut occurrences = BTreeMap::<SharedClosureRef, (usize, ProtoRef)>::new();
-    for closure in proto.instrs.iter().filter_map(|instr| match instr {
-        LowInstr::Closure(closure) if closure.captures.is_empty() => Some(closure),
-        _ => None,
-    }) {
+    for (index, closure) in proto
+        .instrs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instr)| match instr {
+            LowInstr::Closure(closure) if closure.captures.is_empty() => Some((index, closure)),
+            _ => None,
+        })
+    {
+        if captured_plan.is_consumed(InstrRef(index)) {
+            continue;
+        }
         let ClosureCreation::Reusable(identity) = closure.creation else {
             continue;
         };
@@ -326,6 +375,251 @@ fn build_shared_closure_locals(
             (identity, (local, proto))
         })
         .collect()
+}
+
+impl CapturedSharedClosureLowering {
+    fn new(
+        plan: SharedClosurePlan,
+        composite_protos: Vec<HirProtoRef>,
+        proto: &LoweredProto,
+        dataflow: &DataflowFacts,
+        bindings: &mut ProtoBindings,
+    ) -> Self {
+        let mut factory_locals = Vec::with_capacity(plan.composites().len());
+        let mut capture_barriers = Vec::with_capacity(plan.composites().len());
+        let mut canonical_moves = CanonicalMoveIndex::new(proto, dataflow);
+        for composite in plan.composites() {
+            let instr = composite.anchor;
+            let index = instr.index();
+            let local = LocalId(bindings.locals.len());
+            bindings.locals.push(local);
+            bindings.local_debug_hints.push(None);
+            factory_locals.push(local);
+
+            let owner_dst = match proto.instrs.get(index) {
+                Some(LowInstr::Closure(closure)) => closure.dst,
+                _ => {
+                    capture_barriers.push(None);
+                    continue;
+                }
+            };
+            let sources = &composite.outer_captures;
+            let mut snapshots = vec![None; sources.len()];
+            for (source, snapshot) in sources.iter().copied().zip(&mut snapshots) {
+                if !matches!(source, CaptureSource::ByValue(reg) if reg != owner_dst)
+                    || !capture_needs_non_reflexive_barrier(
+                        proto,
+                        dataflow,
+                        instr,
+                        source,
+                        &mut canonical_moves,
+                    )
+                {
+                    continue;
+                }
+                let local = LocalId(bindings.locals.len());
+                bindings.locals.push(local);
+                bindings.local_debug_hints.push(None);
+                *snapshot = Some(local);
+            }
+            let barrier = snapshots.iter().any(Option::is_some).then(|| {
+                let box_local = LocalId(bindings.locals.len());
+                bindings.locals.push(box_local);
+                bindings.local_debug_hints.push(None);
+                SharedCaptureBarrier {
+                    box_local,
+                    snapshots,
+                }
+            });
+            capture_barriers.push(barrier);
+        }
+        Self {
+            plan,
+            factory_locals,
+            capture_barriers,
+            composite_protos,
+        }
+    }
+
+    pub(super) fn factory_local(&self, factory: CompositeFactoryRef) -> LocalId {
+        self.factory_locals[factory.0]
+    }
+
+    pub(super) fn composite_proto(&self, id: CompositeFactoryRef) -> HirProtoRef {
+        self.composite_protos[id.0]
+    }
+
+    pub(super) fn composite_plan(&self, id: CompositeFactoryRef) -> &CompositeFactoryPlan {
+        &self.plan.composites()[id.0]
+    }
+
+    pub(super) fn capture_barrier(
+        &self,
+        factory: CompositeFactoryRef,
+    ) -> Option<&SharedCaptureBarrier> {
+        self.capture_barriers[factory.0].as_ref()
+    }
+}
+
+fn capture_needs_non_reflexive_barrier(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    instr: InstrRef,
+    source: CaptureSource,
+    canonical_moves: &mut CanonicalMoveIndex<'_>,
+) -> bool {
+    let CaptureSource::ByValue(reg) = source else {
+        return false;
+    };
+    let Ok(SsaValue::Def(def)) = canonical_moves.resolve(dataflow.use_value(instr, reg)) else {
+        return false;
+    };
+    let def_instr = dataflow.def_instr(def);
+    match proto.instrs.get(def_instr.index()) {
+        Some(LowInstr::LoadNumber(load)) => load.value.is_nan(),
+        Some(LowInstr::LoadConst(load)) => {
+            match proto.constants.common.literals.get(load.value.index()) {
+                Some(crate::parser::RawLiteralConst::Number(value)) => value.is_nan(),
+                Some(crate::parser::RawLiteralConst::Vector(value)) => value
+                    .components
+                    .iter()
+                    .any(|bits| f32::from_bits(*bits).is_nan()),
+                Some(crate::parser::RawLiteralConst::Complex { real, imag }) => {
+                    real.is_nan() || imag.is_nan()
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn reserve_composite_factory_protos(
+    count: usize,
+    artifacts: &mut LowerArtifacts,
+) -> Vec<HirProtoRef> {
+    (0..count)
+        .map(|_| {
+            let id = HirProtoRef(artifacts.protos.len());
+            artifacts.protos.push(empty_proto(id));
+            artifacts
+                .promotion_facts
+                .push(ProtoPromotionFacts::default());
+            id
+        })
+        .collect()
+}
+
+fn fill_composite_factory_protos(
+    proto: &LoweredProto,
+    child_refs: &[HirProtoRef],
+    plan: &SharedClosurePlan,
+    ids: &[HirProtoRef],
+    artifacts: &mut LowerArtifacts,
+) -> Result<(), HirLowerError> {
+    for (composite, id) in plan.composites().iter().zip(ids) {
+        artifacts.protos[id.index()] =
+            build_composite_factory_proto(*id, proto, child_refs, composite)?;
+    }
+    Ok(())
+}
+
+fn build_composite_factory_proto(
+    id: HirProtoRef,
+    proto: &LoweredProto,
+    child_refs: &[HirProtoRef],
+    plan: &CompositeFactoryPlan,
+) -> Result<HirProto, HirLowerError> {
+    let error = || HirLowerError::UnrepresentableRepeatedCapturedSharedClosure {
+        shared_index: plan.root_shared.0,
+        instr: plan.anchor.index(),
+    };
+    let owner = proto
+        .children
+        .get(plan.lexical_owner_proto.index())
+        .ok_or_else(error)?;
+    let mut body = HirBlock::default();
+    let mut children = Vec::new();
+    let mut seen_children = BTreeSet::new();
+
+    for (index, node) in plan.nodes.iter().enumerate() {
+        let child = proto.children.get(node.proto.index()).ok_or_else(error)?;
+        if usize::from(child.upvalues.common.count) != node.captures.len() {
+            return Err(error());
+        }
+        let child_ref = *child_refs.get(node.proto.index()).ok_or_else(error)?;
+        if seen_children.insert(child_ref) {
+            children.push(child_ref);
+        }
+
+        let local = LocalId(index);
+        let captures = node
+            .captures
+            .iter()
+            .map(|capture| {
+                let (mode, value) = match *capture {
+                    CompositeCapture::Outer(outer) => {
+                        if outer >= plan.outer_captures.len() {
+                            return None;
+                        }
+                        (
+                            HirCaptureMode::ByReference,
+                            HirExpr::UpvalueRef(UpvalueId(outer)),
+                        )
+                    }
+                    CompositeCapture::Dependency(dependency) => {
+                        if dependency.index() >= index {
+                            return None;
+                        }
+                        (
+                            HirCaptureMode::ByValue,
+                            HirExpr::LocalRef(LocalId(dependency.index())),
+                        )
+                    }
+                };
+                Some(HirCapture { mode, value })
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(error)?;
+        let closure = HirExpr::Closure(Box::new(HirClosureExpr {
+            proto: child_ref,
+            captures,
+        }));
+        body.stmts.push(HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![local],
+            values: HirValuePack::fixed(vec![closure]),
+        })));
+    }
+    if plan.root.index() >= plan.nodes.len() {
+        return Err(error());
+    }
+    body.stmts
+        .push(return_stmt(HirValuePack::fixed(vec![HirExpr::LocalRef(
+            LocalId(plan.root.index()),
+        )])));
+
+    Ok(HirProto {
+        id,
+        source: owner.source.as_ref().map(decode_raw_string),
+        line_range: owner.line_range,
+        signature: crate::parser::ProtoSignature {
+            num_params: 0,
+            is_vararg: false,
+            has_vararg_param_reg: false,
+            named_vararg_table: false,
+            legacy_arg_slot: false,
+        },
+        params: Vec::new(),
+        param_debug_hints: Vec::new(),
+        locals: (0..plan.nodes.len()).map(LocalId).collect(),
+        local_debug_hints: vec![None; plan.nodes.len()],
+        upvalues: (0..plan.outer_captures.len()).map(UpvalueId).collect(),
+        upvalue_debug_hints: vec![None; plan.outer_captures.len()],
+        temps: Vec::new(),
+        temp_debug_locals: Vec::new(),
+        body,
+        children,
+    })
 }
 
 fn build_open_pack_owners(
@@ -531,6 +825,45 @@ impl ProtoLowering<'_> {
         self.shared_closure_locals
             .get(&identity)
             .map(|(local, _)| *local)
+    }
+
+    pub(super) fn shared_closure_replacement(
+        &self,
+        instr: InstrRef,
+    ) -> Option<CompositeFactoryRef> {
+        self.captured_shared_closures.plan.replacement_at(instr)
+    }
+
+    pub(super) fn shared_closure_owner(&self, instr: InstrRef) -> Option<CompositeFactoryRef> {
+        self.captured_shared_closures.plan.owner_at(instr)
+    }
+
+    pub(super) fn shared_closure_is_consumed(&self, instr: InstrRef) -> bool {
+        self.captured_shared_closures.plan.is_consumed(instr)
+    }
+
+    pub(super) fn shared_factory_local(&self, factory: CompositeFactoryRef) -> LocalId {
+        self.captured_shared_closures.factory_local(factory)
+    }
+
+    pub(super) fn hir_children(&self) -> Vec<HirProtoRef> {
+        self.child_refs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, child)| {
+                (!self
+                    .captured_shared_closures
+                    .plan
+                    .child_is_claimed(ProtoRef(index)))
+                .then_some(*child)
+            })
+            .chain(
+                self.captured_shared_closures
+                    .composite_protos
+                    .iter()
+                    .copied(),
+            )
+            .collect()
     }
 
     pub(super) fn owns_open_pack(&self, def: OpenDefId, consumer: InstrRef) -> bool {

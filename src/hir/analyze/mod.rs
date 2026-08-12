@@ -9,6 +9,7 @@ mod exprs;
 mod helpers;
 mod instrs;
 mod lower;
+mod shared_closures;
 mod short_circuit;
 mod structure;
 

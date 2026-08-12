@@ -21,8 +21,8 @@ use crate::structure::BlockRef;
 use crate::structure::{DefId, SsaValue};
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpKind, BranchCond, BranchPredicate, BranchSubject, CallKind,
-    ClosureInstr, CondOperand, ConstRef, InstrRef, LowInstr, LoweredProto, MethodNameHint, Reg,
-    ResultPack, UnaryOpKind, UpvalueOperand, ValueOperand,
+    CaptureSource, ClosureInstr, CondOperand, ConstRef, InstrRef, LowInstr, LoweredProto,
+    MethodNameHint, Reg, ResultPack, UnaryOpKind, UpvalueOperand, ValueOperand,
 };
 
 pub(super) use self::access::{
@@ -52,6 +52,7 @@ pub(super) use self::regs::{
 };
 use super::helpers::{concat_expr, decode_raw_string, raw_lua_string, unresolved_expr};
 use super::lower::ProtoLowering;
+use super::shared_closures::CompositeFactoryRef;
 
 pub(super) fn lower_closure_expr(
     lowering: &ProtoLowering<'_>,
@@ -59,9 +60,26 @@ pub(super) fn lower_closure_expr(
     instr_ref: InstrRef,
     closure: &ClosureInstr,
 ) -> HirExpr {
+    if let Some(factory) = lowering.shared_closure_replacement(instr_ref) {
+        return HirExpr::Call(Box::new(HirCallExpr {
+            callee: HirExpr::LocalRef(lowering.shared_factory_local(factory)),
+            args: Default::default(),
+            method: false,
+            method_name: None,
+        }));
+    }
     if let Some(local) = lowering.shared_closure_local(closure.creation) {
         return HirExpr::LocalRef(local);
     }
+    lower_plain_closure_expr(lowering, block, instr_ref, closure)
+}
+
+pub(super) fn lower_plain_closure_expr(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    closure: &ClosureInstr,
+) -> HirExpr {
     HirExpr::Closure(Box::new(HirClosureExpr {
         proto: lowering.child_refs[closure.proto.index()],
         captures: closure
@@ -72,6 +90,53 @@ pub(super) fn lower_closure_expr(
             })
             .collect(),
     }))
+}
+
+pub(super) fn lower_composite_factory_expr(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    closure: &ClosureInstr,
+    factory: CompositeFactoryRef,
+) -> HirExpr {
+    let plan = lowering.captured_shared_closures.composite_plan(factory);
+    HirExpr::Closure(Box::new(HirClosureExpr {
+        proto: lowering.captured_shared_closures.composite_proto(factory),
+        captures: lower_factory_captures(
+            lowering,
+            block,
+            instr_ref,
+            closure.dst,
+            factory,
+            plan.outer_captures.iter().copied(),
+        ),
+    }))
+}
+
+fn lower_factory_captures(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    dst: Reg,
+    factory: CompositeFactoryRef,
+    sources: impl IntoIterator<Item = CaptureSource>,
+) -> Vec<HirCapture> {
+    let barrier = lowering.captured_shared_closures.capture_barrier(factory);
+    sources
+        .into_iter()
+        .enumerate()
+        .map(|(index, source)| {
+            barrier
+                .and_then(|barrier| barrier.snapshots.get(index).copied().flatten())
+                .map_or_else(
+                    || lower_closure_capture(lowering, block, instr_ref, dst, source),
+                    |snapshot| HirCapture {
+                        mode: HirCaptureMode::ByValue,
+                        value: HirExpr::LocalRef(snapshot),
+                    },
+                )
+        })
+        .collect()
 }
 
 /// `Open(start)` 不是“只有一个开放尾值”，而是“从 start 到 top 的整段值包”。
