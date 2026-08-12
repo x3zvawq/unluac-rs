@@ -119,7 +119,8 @@
       "title": "Parsing-Optionen",
       "mode": "Parsing-Modus",
       "stringEncoding": "String-Kodierung",
-      "stringDecodeMode": "String-Dekodierungsmodus"
+      "stringDecodeMode": "String-Dekodierungsmodus",
+      "ignoreDebug": "Debug-Informationen ignorieren"
     },
     "readability": {
       "title": "Lesbarkeitsoptionen",
@@ -148,11 +149,12 @@
       "parseMode": "Parser-Strenge. strict: strenge Validierung; permissive: nicht-standardmäßigen Bytecode tolerieren. CLI: --parse-mode / -p",
       "stringEncoding": "Kodierung für die Dekodierung von String-Konstanten. CLI: --encoding / -e",
       "stringDecodeMode": "Verhalten bei String-Dekodierungsfehler. strict: Fehler; lossy: durch Platzhalter ersetzen. CLI: --decode-mode / -m",
+      "ignoreDebug": "Debug-Abschnitte prüfen, aber nicht für Rekonstruktion oder Kommentare verwenden. CLI: --ignore-debug",
       "returnInlineMaxComplexity": "Max. Inline-Ausdruckskomplexität in return-Anweisungen. CLI: --return-inline-max-complexity",
       "indexInlineMaxComplexity": "Max. Inline-Ausdruckskomplexität in Tabellen-Index-Ausdrücken. CLI: --index-inline-max-complexity",
       "argsInlineMaxComplexity": "Max. Inline-Ausdruckskomplexität in Aufrufargumenten. CLI: --args-inline-max-complexity",
       "accessBaseInlineMaxComplexity": "Max. Inline-Ausdruckskomplexität in Tabellenzugriffsbasen. CLI: --access-base-inline-max-complexity",
-      "namingMode": "Variablenbenennungsstrategie. debug-like: Debug-Infos verwenden; simple: fortlaufende Nummern; heuristic: abgeleitete Namen. CLI: --naming-mode / -n",
+      "namingMode": "Fallback-Benennung, wenn kein gültiger Debug-Name vorhanden ist. Alle Modi bevorzugen Debug-Namen. CLI: --naming-mode / -n",
       "debugLikeIncludeFunction": "Im debug-like-Modus, ob funktionsförmige Namen einbezogen werden. CLI: --debug-like-include-function",
       "indentWidth": "Einrückbreite (Anzahl der Leerzeichen). CLI: --indent-width",
       "maxLineLength": "Bevorzugte maximale Zeilenlänge für generierten Code. CLI: --max-line-length",

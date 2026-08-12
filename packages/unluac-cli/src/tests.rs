@@ -16,7 +16,10 @@ use unluac::decompile::{
 };
 use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
-use super::{CliArgs, OUTPUT_ONLY_SUPPORTS_FINAL_SOURCE, emit_generated_source, parse_args};
+use super::{
+    CliArgs, CompilerProtocol, OUTPUT_ONLY_SUPPORTS_FINAL_SOURCE, build_compile_command,
+    emit_generated_source, parse_args,
+};
 
 fn args(values: &[&str]) -> Vec<OsString> {
     std::iter::once(OsString::from("unluac-cli"))
@@ -33,6 +36,13 @@ fn unique_temp_path(name: &str) -> PathBuf {
         "unluac-cli-tests-{}-{name}-{nonce}",
         std::process::id()
     ))
+}
+
+fn command_args(command: &std::process::Command) -> Vec<String> {
+    command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
 }
 
 fn render_help() -> String {
@@ -70,6 +80,46 @@ fn defaults_to_pure_source_output_when_only_source_is_given() {
     assert_eq!(
         options.decompile.parse.string_encoding,
         StringEncoding::Auto
+    );
+    assert!(options.strip_debug);
+    assert!(!options.decompile.parse.ignore_debug);
+}
+
+#[test]
+fn ignore_debug_is_an_independent_input_policy() {
+    let source = parse_args(args(&[
+        "--source",
+        "case.lua",
+        "--strip",
+        "false",
+        "--ignore-debug",
+    ]))
+    .expect("source debug policy should parse");
+    assert!(!source.strip_debug);
+    assert!(source.decompile.parse.ignore_debug);
+
+    let input = parse_args(args(&["--input", "case.luac", "--ignore-debug"]))
+        .expect("compiled input debug policy should parse");
+    assert!(input.decompile.parse.ignore_debug);
+}
+
+#[test]
+fn strip_false_retains_source_debug_metadata() {
+    let options = parse_args(args(&["--source", "case.lua", "--strip", "false"]))
+        .expect("strip=false should parse for source input");
+
+    assert!(!options.strip_debug);
+}
+
+#[test]
+fn strip_rejects_compiled_chunk_input() {
+    let error = parse_args(args(&["--input", "case.out", "--strip", "false"]))
+        .expect_err("strip should only apply to source compilation");
+    let rendered = error.to_string();
+
+    assert!(
+        rendered.contains("--input <INPUT>") && rendered.contains("--strip <BOOL>"),
+        "unexpected clap error: {rendered}"
     );
 }
 
@@ -127,9 +177,10 @@ fn explicit_dump_replaces_repo_debug_dump_stage() {
 fn stop_after_only_accepts_outer_stages() {
     let error = parse_args(args(&["--source", "case.lua", "--stop-after", "cfg"]))
         .expect_err("cfg is internal to structure and should not be a stop target");
+    let rendered = error.to_string();
     assert!(
-        error.to_string().contains("unsupported stage: cfg"),
-        "unexpected clap error: {error}"
+        rendered.contains("invalid value 'cfg'") && rendered.contains("--stop-after"),
+        "unexpected clap error: {rendered}"
     );
 }
 
@@ -137,10 +188,70 @@ fn stop_after_only_accepts_outer_stages() {
 fn dump_only_accepts_outer_stages() {
     let error = parse_args(args(&["--source", "case.lua", "--dump", "dataflow"]))
         .expect_err("dataflow is included in the structure dump");
+    let rendered = error.to_string();
     assert!(
-        error.to_string().contains("unsupported stage: dataflow"),
-        "unexpected clap error: {error}"
+        rendered.contains("invalid value 'dataflow'") && rendered.contains("--dump"),
+        "unexpected clap error: {rendered}"
     );
+}
+
+#[test]
+fn luac_command_omits_strip_flag_when_debug_metadata_is_retained() {
+    let options = parse_args(args(&["--source", "case.lua", "--strip", "false"]))
+        .expect("strip=false should parse");
+    let command = build_compile_command(
+        &options,
+        Path::new("luac"),
+        CompilerProtocol::LuacStyle,
+        Path::new("case.lua"),
+        Path::new("case.out"),
+    );
+
+    assert_eq!(command_args(&command), ["-o", "case.out", "case.lua"]);
+}
+
+#[test]
+fn luac_command_strips_debug_metadata_by_default() {
+    let options = parse_args(args(&["--source", "case.lua"])).expect("source input should parse");
+    let command = build_compile_command(
+        &options,
+        Path::new("luac"),
+        CompilerProtocol::LuacStyle,
+        Path::new("case.lua"),
+        Path::new("case.out"),
+    );
+
+    assert_eq!(command_args(&command), ["-s", "-o", "case.out", "case.lua"]);
+}
+
+#[test]
+fn luajit_command_uses_debug_flag_when_debug_metadata_is_retained() {
+    let options = parse_args(args(&["--source", "case.lua", "--strip", "false"]))
+        .expect("strip=false should parse");
+    let command = build_compile_command(
+        &options,
+        Path::new("luac"),
+        CompilerProtocol::LuaJitBytecodeTool,
+        Path::new("case.lua"),
+        Path::new("case.luajit"),
+    );
+
+    assert_eq!(command_args(&command), ["-g", "case.lua", "case.luajit"]);
+}
+
+#[test]
+fn luau_command_uses_full_debug_level_when_debug_metadata_is_retained() {
+    let options = parse_args(args(&["--source", "case.luau", "--strip", "false"]))
+        .expect("strip=false should parse");
+    let command = build_compile_command(
+        &options,
+        Path::new("luau-compile"),
+        CompilerProtocol::LuauBinaryStdout,
+        Path::new("case.luau"),
+        Path::new("case.luau-bytecode"),
+    );
+
+    assert_eq!(command_args(&command), ["--binary", "-g2", "case.luau"]);
 }
 
 #[test]
@@ -373,6 +484,7 @@ fn help_is_grouped_by_section_and_includes_repo_link() {
     assert!(help.contains("Repository: https://github.com/x3zvawq/unluac-rs"));
     assert!(help.contains("-i, --input <INPUT>"));
     assert!(help.contains("-s, --source <SOURCE>"));
+    assert!(help.contains("--strip <BOOL>"));
     assert!(help.contains("--number-format <NUMBER_FORMAT>"));
     assert!(help.contains("-o, --output <OUTPUT>"));
     assert!(input < debug && debug < generate && generate < output);

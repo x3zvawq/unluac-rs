@@ -1,8 +1,7 @@
-//! 这个文件实现仓库自带的命令行入口。
+//! 这个文件实现仓库自带命令行的执行入口。
 //!
-//! 它负责把外部命令行参数映射成核心库的 `DecompileOptions`，并明确把 CLI 侧的
-//! 输入约束、编译器查找、输出路由和调试输出拼装留在二进制包里，避免这些
-//! 发布形态相关的细节重新渗回核心库。
+//! 参数声明与归一化由 `cli/args.rs` 负责；这里保留编译器查找和调用、核心 pipeline
+//! 执行、输出路由与调试结果拼装，避免这些发布形态相关的细节渗回核心库。
 
 use std::env;
 use std::ffi::OsStr;
@@ -11,22 +10,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use clap::{CommandFactory, Parser, builder::BoolishValueParser, error::ErrorKind};
 use unluac::decompile::{
-    DebugColorMode, DebugDetail, DebugFilters, DecompileDialect, DecompileOptions, DecompileStage,
-    GenerateMode, LuauVectorConstructor, LuauVectorSize, NamingMode, NumberFormat, ProtoDepth,
-    QuoteStyle, TableStyle, decompile, render_timing_report,
+    DecompileDialect, DecompileOptions, DecompileStage, decompile, render_timing_report,
 };
-use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
-const CLI_VERSION_TEXT: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    "\n",
-    env!("CARGO_PKG_REPOSITORY")
-);
-const CLI_AFTER_HELP: &str = concat!("Repository: ", env!("CARGO_PKG_REPOSITORY"));
 const OUTPUT_ONLY_SUPPORTS_FINAL_SOURCE: &str = "`--output` only supports pure final generated \
 source output; remove `--output` or keep `--stop-after=generate` without debug or timing flags.";
+
+mod args;
+
+#[cfg(test)]
+use args::CliArgs;
+use args::{output_argument_conflict, parse_args};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum CompilerProtocol {
@@ -41,204 +36,10 @@ struct CliOptions {
     source: Option<PathBuf>,
     output: Option<PathBuf>,
     luac: Option<PathBuf>,
+    strip_debug: bool,
     decompile: DecompileOptions,
     /// 请求仅打印 proto 列表后直接退出。
     list_protos: bool,
-}
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "unluac-cli",
-    bin_name = "unluac-cli",
-    version = CLI_VERSION_TEXT,
-    long_version = CLI_VERSION_TEXT,
-    after_help = CLI_AFTER_HELP,
-    about = "Decompile Lua, LuaJIT, and Luau bytecode inputs, or source inputs when an external compiler is available.",
-    disable_help_subcommand = true
-)]
-struct CliArgs {
-    /// Dialect to compile or decompile against.
-    #[arg(short = 'D', long, value_parser = parse_dialect_arg, help_heading = "Input")]
-    dialect: Option<DecompileDialect>,
-    /// Existing compiled chunk path.
-    #[arg(
-        short = 'i',
-        long,
-        conflicts_with = "source",
-        required_unless_present = "source",
-        help_heading = "Input"
-    )]
-    input: Option<PathBuf>,
-    /// Lua source path to compile before decompilation. Requires an external compiler via `--luac`,
-    /// a bundled compiler under `lua/build/<dialect>/`, or a compatible compiler on PATH.
-    #[arg(
-        short = 's',
-        long,
-        conflicts_with = "input",
-        required_unless_present = "input",
-        help_heading = "Input"
-    )]
-    source: Option<PathBuf>,
-    /// Override the external compiler path used by `--source`.
-    #[arg(short = 'l', long, help_heading = "Input")]
-    luac: Option<PathBuf>,
-    /// String decoding encoding (`auto` or any Encoding Standard label).
-    #[arg(
-        short = 'e',
-        long,
-        value_parser = parse_string_encoding_arg,
-        help_heading = "Input"
-    )]
-    encoding: Option<StringEncoding>,
-    /// String decoding failure mode.
-    #[arg(
-        short = 'm',
-        long,
-        value_parser = parse_string_decode_mode_arg,
-        help_heading = "Input"
-    )]
-    decode_mode: Option<StringDecodeMode>,
-    /// Parser strictness.
-    #[arg(
-        short = 'p',
-        long,
-        value_parser = parse_parse_mode_arg,
-        help_heading = "Input"
-    )]
-    parse_mode: Option<ParseMode>,
-    /// Enable debug output using the default final-source preset.
-    #[arg(short = 'd', long, help_heading = "Debug")]
-    debug: bool,
-    /// Dump one or more outer pipeline stages.
-    #[arg(long, value_parser = parse_stage_arg, help_heading = "Debug")]
-    dump: Vec<DecompileStage>,
-    /// Debug output detail level.
-    #[arg(long, value_parser = parse_debug_detail_arg, help_heading = "Debug")]
-    detail: Option<DebugDetail>,
-    /// Debug color mode.
-    #[arg(
-        short = 'c',
-        long,
-        value_parser = parse_debug_color_arg,
-        help_heading = "Debug"
-    )]
-    color: Option<DebugColorMode>,
-    /// Restrict debug dumps to a specific proto id.
-    #[arg(long, help_heading = "Debug")]
-    proto: Option<usize>,
-    /// Max depth of child protos to expand in debug dumps, relative to the focused proto.
-    /// `0` (default) hides all child protos (replaced with single-line summaries);
-    /// `1` expands direct children; `all` restores full output.
-    #[arg(long, value_parser = parse_proto_depth_arg, help_heading = "Debug")]
-    proto_depth: Option<ProtoDepth>,
-    /// Emit timing report.
-    #[arg(short = 't', long, help_heading = "Debug")]
-    timing: bool,
-    /// Dump before/after snapshots for specific passes (comma-separated names).
-    /// Supports HIR simplify passes (e.g. `carried-locals`, `temp-inline`) and
-    /// AST readability passes (e.g. `inline-exprs`, `branch-pretty`).
-    #[arg(long, value_delimiter = ',', help_heading = "Debug")]
-    dump_pass: Vec<String>,
-    /// List all protos in the chunk (id, parent, lines, instrs, children) and exit.
-    /// Runs up to the parse stage only; useful for picking a `--proto` target.
-    #[arg(long, help_heading = "Debug")]
-    list_protos: bool,
-    /// Max inline complexity for returned expressions.
-    #[arg(long, help_heading = "Generate")]
-    return_inline_max_complexity: Option<usize>,
-    /// Max inline complexity for table index expressions.
-    #[arg(long, help_heading = "Generate")]
-    index_inline_max_complexity: Option<usize>,
-    /// Max inline complexity for call arguments.
-    #[arg(long, help_heading = "Generate")]
-    args_inline_max_complexity: Option<usize>,
-    /// Max inline complexity for table access bases.
-    #[arg(long, help_heading = "Generate")]
-    access_base_inline_max_complexity: Option<usize>,
-    /// Naming strategy.
-    #[arg(
-        short = 'n',
-        long,
-        value_parser = parse_naming_mode_arg,
-        help_heading = "Generate"
-    )]
-    naming_mode: Option<NamingMode>,
-    /// Whether debug-like names should include function-shaped names.
-    #[arg(
-        long,
-        value_name = "BOOL",
-        value_parser = BoolishValueParser::new(),
-        help_heading = "Generate"
-    )]
-    debug_like_include_function: Option<bool>,
-    /// Generated source indentation width.
-    #[arg(long, help_heading = "Generate")]
-    indent_width: Option<usize>,
-    /// Preferred maximum line length.
-    #[arg(long, help_heading = "Generate")]
-    max_line_length: Option<usize>,
-    /// String quote style.
-    #[arg(
-        long,
-        value_parser = parse_quote_style_arg,
-        help_heading = "Generate"
-    )]
-    quote_style: Option<QuoteStyle>,
-    /// Number literal style.
-    #[arg(
-        long,
-        value_parser = parse_number_format_arg,
-        help_heading = "Generate"
-    )]
-    number_format: Option<NumberFormat>,
-    /// Table constructor layout style.
-    #[arg(
-        long,
-        value_parser = parse_table_style_arg,
-        help_heading = "Generate"
-    )]
-    table_style: Option<TableStyle>,
-    /// Optional Luau vector library name used with `--luau-vector-constructor`.
-    #[arg(long, requires = "luau_vector_constructor", help_heading = "Generate")]
-    luau_vector_library: Option<String>,
-    /// Luau vector constructor used to render vector constants and compile `--source` inputs.
-    #[arg(long, requires = "luau_vector_size", help_heading = "Generate")]
-    luau_vector_constructor: Option<String>,
-    /// Luau vector width (`3` or `4`); required with `--luau-vector-constructor`.
-    #[arg(
-        long,
-        requires = "luau_vector_constructor",
-        value_parser = parse_luau_vector_size_arg,
-        help_heading = "Generate"
-    )]
-    luau_vector_size: Option<LuauVectorSize>,
-    /// Whether to emit generate-stage comments and metadata.
-    #[arg(
-        long,
-        value_name = "BOOL",
-        value_parser = BoolishValueParser::new(),
-        help_heading = "Generate"
-    )]
-    comment: Option<bool>,
-    /// Whether unstructured control flow may be emitted as diagnostic pseudocode.
-    #[arg(
-        short = 'g',
-        long,
-        value_parser = parse_generate_mode_arg,
-        help_heading = "Generate"
-    )]
-    generate_mode: Option<GenerateMode>,
-    /// Stop the pipeline after a specific stage.
-    #[arg(long, value_parser = parse_stage_arg, help_heading = "Output")]
-    stop_after: Option<DecompileStage>,
-    /// Write the final generated source to a file instead of stdout. Only available for pure final-source runs.
-    #[arg(
-        short = 'o',
-        long,
-        conflicts_with_all = ["debug", "dump", "detail", "color", "proto", "proto_depth", "timing", "dump_pass", "list_protos"],
-        help_heading = "Output"
-    )]
-    output: Option<PathBuf>,
 }
 
 pub fn run<I>(args: I) -> Result<(), CliError>
@@ -307,166 +108,6 @@ where
     Ok(())
 }
 
-fn parse_args<I>(args: I) -> Result<CliOptions, CliError>
-where
-    I: IntoIterator,
-    I::Item: Into<std::ffi::OsString> + Clone,
-{
-    let args = match CliArgs::try_parse_from(args) {
-        Ok(args) => args,
-        Err(error) => {
-            if error.use_stderr() {
-                return Err(clap_usage_error(error));
-            }
-            error.print().map_err(CliError::WriteCliOutput)?;
-            return Err(CliError::HelpShown);
-        }
-    };
-
-    let mut decompile = DecompileOptions::default();
-    let has_explicit_dump = !args.dump.is_empty();
-    let has_explicit_debug_output = args.debug
-        || has_explicit_dump
-        || args.detail.is_some()
-        || args.color.is_some()
-        || args.proto.is_some()
-        || args.proto_depth.is_some();
-
-    // CLI 默认直接输出最终源码；只有显式请求时才启用 repo debug preset 的调试行为。
-    decompile.debug.enable = false;
-    decompile.debug.output_stages.clear();
-    decompile.debug.timing = false;
-
-    if let Some(dialect) = args.dialect {
-        decompile.dialect = dialect;
-    }
-    if let Some(encoding) = args.encoding {
-        decompile.parse.string_encoding = encoding;
-    }
-    if let Some(mode) = args.decode_mode {
-        decompile.parse.string_decode_mode = mode;
-    }
-    if let Some(mode) = args.parse_mode {
-        decompile.parse.mode = mode;
-    }
-    if let Some(stage) = args.stop_after {
-        decompile.target_stage = stage;
-    }
-    if let Some(detail) = args.detail {
-        decompile.debug.detail = detail;
-    }
-    if let Some(color) = args.color {
-        decompile.debug.color = color;
-    }
-    decompile.debug.filters = DebugFilters {
-        proto: args.proto,
-        proto_depth: args.proto_depth.unwrap_or(ProtoDepth::Fixed(0)),
-    };
-
-    if has_explicit_debug_output {
-        decompile.debug.enable = true;
-        if has_explicit_dump {
-            decompile.debug.output_stages = args.dump.clone();
-        } else {
-            // 只要显式请求了 debug 输出但没指定 dump，就沿用默认 preset
-            // 的“当前目标阶段”约定，而不是静默什么都不打印。
-            decompile.debug.output_stages = vec![decompile.target_stage];
-        }
-    }
-
-    if args.timing {
-        decompile.debug.enable = true;
-        decompile.debug.timing = true;
-        if !has_explicit_debug_output {
-            decompile.debug.output_stages.clear();
-        }
-    }
-
-    if !args.dump_pass.is_empty() {
-        decompile.debug.dump_passes = args.dump_pass.clone();
-    }
-
-    if args.list_protos {
-        // 列 proto 不需要跑整条 pipeline，停在 parse；也不启用 debug 输出，
-        // 避免 run() 里走到 debug 分支而再二次渲染。
-        decompile.target_stage = DecompileStage::Parser;
-        decompile.debug.enable = false;
-        decompile.debug.timing = false;
-        decompile.debug.output_stages.clear();
-    }
-
-    if let Some(value) = args.return_inline_max_complexity {
-        decompile.readability.return_inline_max_complexity = value;
-    }
-    if let Some(value) = args.index_inline_max_complexity {
-        decompile.readability.index_inline_max_complexity = value;
-    }
-    if let Some(value) = args.args_inline_max_complexity {
-        decompile.readability.args_inline_max_complexity = value;
-    }
-    if let Some(value) = args.access_base_inline_max_complexity {
-        decompile.readability.access_base_inline_max_complexity = value;
-    }
-
-    if let Some(mode) = args.naming_mode {
-        decompile.naming.mode = mode;
-    }
-    if let Some(value) = args.debug_like_include_function {
-        decompile.naming.debug_like_include_function = value;
-    }
-
-    if let Some(value) = args.indent_width {
-        decompile.generate.indent_width = value;
-    }
-    if let Some(value) = args.max_line_length {
-        decompile.generate.max_line_length = value;
-    }
-    if let Some(style) = args.quote_style {
-        decompile.generate.quote_style = style;
-    }
-    if let Some(format) = args.number_format {
-        decompile.generate.number_format = format;
-    }
-    if let Some(style) = args.table_style {
-        decompile.generate.table_style = style;
-    }
-    if let (Some(constructor), Some(size)) = (&args.luau_vector_constructor, args.luau_vector_size)
-    {
-        decompile.generate.luau_vector_constructor = Some(LuauVectorConstructor {
-            library: args.luau_vector_library.clone(),
-            constructor: constructor.clone(),
-            size,
-        });
-    }
-    if let Some(value) = args.comment {
-        decompile.generate.comment = value;
-    }
-    decompile.generate.mode = args.generate_mode.unwrap_or(GenerateMode::Permissive);
-    validate_output_request(&args, &decompile)?;
-
-    Ok(CliOptions {
-        input: args.input,
-        source: args.source,
-        output: args.output,
-        luac: args.luac,
-        decompile,
-        list_protos: args.list_protos,
-    })
-}
-
-fn validate_output_request(args: &CliArgs, decompile: &DecompileOptions) -> Result<(), CliError> {
-    if args.output.is_some()
-        && (decompile.target_stage != DecompileStage::Generate
-            || decompile.debug.enable
-            || decompile.debug.timing
-            || !decompile.debug.output_stages.is_empty())
-    {
-        return Err(output_argument_conflict());
-    }
-
-    Ok(())
-}
-
 fn emit_generated_source<'a>(
     source: &'a str,
     output: Option<&Path>,
@@ -481,23 +122,6 @@ fn emit_generated_source<'a>(
     }
 
     Ok(Some(source))
-}
-
-fn output_argument_conflict() -> CliError {
-    let error = CliArgs::command().error(
-        ErrorKind::ArgumentConflict,
-        OUTPUT_ONLY_SUPPORTS_FINAL_SOURCE,
-    );
-    clap_usage_error(error)
-}
-
-fn clap_usage_error(error: clap::Error) -> CliError {
-    let rendered = error.to_string();
-    let message = rendered
-        .strip_prefix("error: ")
-        .unwrap_or(rendered.as_str())
-        .to_owned();
-    CliError::Usage(message)
 }
 
 fn resolve_input_path(options: &CliOptions) -> Result<PathBuf, CliError> {
@@ -533,38 +157,14 @@ fn compile_source(options: &CliOptions, source: &Path) -> Result<PathBuf, CliErr
         .to_owned();
     let output = output_dir.join(format!("{file_stem}.{}", compiled_chunk_extension(dialect)));
 
+    let mut command = build_compile_command(options, &compiler, protocol, source, &output);
     match protocol {
-        CompilerProtocol::LuacStyle => {
-            let status = Command::new(&compiler)
-                .arg("-s")
-                .arg("-o")
-                .arg(&output)
-                .arg(source)
-                .status()
-                .map_err(|source_error| CliError::Io {
-                    action: "spawn compiler",
-                    path: compiler.clone(),
-                    source: source_error,
-                })?;
-
-            if !status.success() {
-                return Err(CliError::Process(format!(
-                    "compiler exited with status {status} while compiling {}",
-                    source.display()
-                )));
-            }
-        }
-        CompilerProtocol::LuaJitBytecodeTool => {
-            let status = Command::new(&compiler)
-                .arg("-s")
-                .arg(source)
-                .arg(&output)
-                .status()
-                .map_err(|source_error| CliError::Io {
-                    action: "spawn compiler",
-                    path: compiler.clone(),
-                    source: source_error,
-                })?;
+        CompilerProtocol::LuacStyle | CompilerProtocol::LuaJitBytecodeTool => {
+            let status = command.status().map_err(|source_error| CliError::Io {
+                action: "spawn compiler",
+                path: compiler.clone(),
+                source: source_error,
+            })?;
 
             if !status.success() {
                 return Err(CliError::Process(format!(
@@ -574,23 +174,11 @@ fn compile_source(options: &CliOptions, source: &Path) -> Result<PathBuf, CliErr
             }
         }
         CompilerProtocol::LuauBinaryStdout => {
-            let mut command = Command::new(&compiler);
-            command.arg("--binary").arg("-g0");
-            if let Some(vector) = &options.decompile.generate.luau_vector_constructor {
-                if let Some(library) = &vector.library {
-                    command.arg(format!("--vector-lib={library}"));
-                }
-                command.arg(format!("--vector-ctor={}", vector.constructor));
-            }
-            let command_output =
-                command
-                    .arg(source)
-                    .output()
-                    .map_err(|source_error| CliError::Io {
-                        action: "spawn compiler",
-                        path: compiler.clone(),
-                        source: source_error,
-                    })?;
+            let command_output = command.output().map_err(|source_error| CliError::Io {
+                action: "spawn compiler",
+                path: compiler.clone(),
+                source: source_error,
+            })?;
             if !command_output.status.success() {
                 return Err(CliError::Process(format!(
                     "compiler exited with status {} while compiling {}",
@@ -607,6 +195,43 @@ fn compile_source(options: &CliOptions, source: &Path) -> Result<PathBuf, CliErr
     }
 
     Ok(output)
+}
+
+fn build_compile_command(
+    options: &CliOptions,
+    compiler: &Path,
+    protocol: CompilerProtocol,
+    source: &Path,
+    output: &Path,
+) -> Command {
+    let mut command = Command::new(compiler);
+    match protocol {
+        CompilerProtocol::LuacStyle => {
+            if options.strip_debug {
+                command.arg("-s");
+            }
+            command.arg("-o").arg(output).arg(source);
+        }
+        CompilerProtocol::LuaJitBytecodeTool => {
+            command
+                .arg(if options.strip_debug { "-s" } else { "-g" })
+                .arg(source)
+                .arg(output);
+        }
+        CompilerProtocol::LuauBinaryStdout => {
+            command
+                .arg("--binary")
+                .arg(if options.strip_debug { "-g0" } else { "-g2" });
+            if let Some(vector) = &options.decompile.generate.luau_vector_constructor {
+                if let Some(library) = &vector.library {
+                    command.arg(format!("--vector-lib={library}"));
+                }
+                command.arg(format!("--vector-ctor={}", vector.constructor));
+            }
+            command.arg(source);
+        }
+    }
+    command
 }
 
 fn source_compile_dialect(dialect: DecompileDialect) -> Result<DecompileDialect, CliError> {
@@ -689,95 +314,6 @@ fn repo_root() -> PathBuf {
         .and_then(Path::parent)
         .map(Path::to_path_buf)
         .expect("cli crate should stay under <workspace>/packages/unluac-cli")
-}
-
-fn parse_dialect_arg(value: &str) -> Result<DecompileDialect, String> {
-    value
-        .parse()
-        .map_err(|_| format!("unsupported dialect: {value}"))
-}
-
-fn parse_stage_arg(value: &str) -> Result<DecompileStage, String> {
-    value
-        .parse()
-        .map_err(|_| format!("unsupported stage: {value}"))
-}
-
-fn parse_debug_detail_arg(value: &str) -> Result<DebugDetail, String> {
-    value
-        .parse()
-        .map_err(|_| format!("unsupported debug detail: {value}"))
-}
-
-fn parse_debug_color_arg(value: &str) -> Result<DebugColorMode, String> {
-    value
-        .parse()
-        .map_err(|_| format!("unsupported debug color mode: {value}"))
-}
-
-fn parse_proto_depth_arg(value: &str) -> Result<ProtoDepth, String> {
-    match value {
-        "all" | "max" | "*" => Ok(ProtoDepth::All),
-        other => other.parse::<usize>().map(ProtoDepth::Fixed).map_err(|_| {
-            format!("unsupported proto depth: {value} (expected a non-negative integer or `all`)")
-        }),
-    }
-}
-
-fn parse_string_encoding_arg(value: &str) -> Result<StringEncoding, String> {
-    value
-        .parse()
-        .map_err(|_| format!("unsupported encoding: {value}"))
-}
-
-fn parse_string_decode_mode_arg(value: &str) -> Result<StringDecodeMode, String> {
-    value
-        .parse()
-        .map_err(|_| format!("unsupported string decode mode: {value}"))
-}
-
-fn parse_parse_mode_arg(value: &str) -> Result<ParseMode, String> {
-    value
-        .parse()
-        .map_err(|_| format!("unsupported parse mode: {value}"))
-}
-
-fn parse_naming_mode_arg(value: &str) -> Result<NamingMode, String> {
-    value
-        .parse()
-        .map_err(|_| format!("unsupported naming mode: {value}"))
-}
-
-fn parse_quote_style_arg(value: &str) -> Result<QuoteStyle, String> {
-    value
-        .parse()
-        .map_err(|_| format!("unsupported quote style: {value}"))
-}
-
-fn parse_number_format_arg(value: &str) -> Result<NumberFormat, String> {
-    value
-        .parse()
-        .map_err(|_| format!("unsupported number format: {value}"))
-}
-
-fn parse_table_style_arg(value: &str) -> Result<TableStyle, String> {
-    value
-        .parse()
-        .map_err(|_| format!("unsupported table style: {value}"))
-}
-
-fn parse_generate_mode_arg(value: &str) -> Result<GenerateMode, String> {
-    value
-        .parse()
-        .map_err(|_| format!("unsupported generate mode: {value}"))
-}
-
-fn parse_luau_vector_size_arg(value: &str) -> Result<LuauVectorSize, String> {
-    match value {
-        "3" => Ok(LuauVectorSize::Three),
-        "4" => Ok(LuauVectorSize::Four),
-        _ => Err(format!("unsupported Luau vector size: {value}")),
-    }
 }
 
 /// 把 RawChunk 渲染成 `--list-protos` 需要的扁平表格。

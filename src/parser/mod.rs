@@ -103,7 +103,7 @@ pub fn parse_chunk_with_dialect(
         DecompileDialect::Auto => detect_dialect(bytes)?,
         resolved => resolved,
     };
-    match dialect {
+    let mut chunk = match dialect {
         DecompileDialect::Auto => unreachable!("auto dialect must be resolved before parsing"),
         DecompileDialect::Lua51 => Lua51Parser::new(options).parse(bytes),
         DecompileDialect::Lua52 => Lua52Parser::new(options).parse(bytes),
@@ -112,5 +112,11 @@ pub fn parse_chunk_with_dialect(
         DecompileDialect::Lua55 => Lua55Parser::new(options).parse(bytes),
         DecompileDialect::Luajit => LuaJitParser::new(options).parse(bytes),
         DecompileDialect::Luau => LuauParser::new(options).parse(bytes),
+    }?;
+    if options.ignore_debug {
+        // parser 仍需先完整消费并校验变长 debug section；只有成功解析后才统一清除，
+        // 这样 ignore 模式不会成为绕过格式校验或错位读取后续 proto 的入口。
+        chunk.discard_debug_metadata();
     }
+    Ok(chunk)
 }

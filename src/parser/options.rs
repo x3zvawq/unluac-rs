@@ -146,4 +146,6 @@ pub struct ParseOptions {
     pub mode: ParseMode,
     pub string_encoding: StringEncoding,
     pub string_decode_mode: StringDecodeMode,
+    /// 完整解析输入后，不向后续 pipeline 暴露任何源码调试元数据。
+    pub ignore_debug: bool,
 }

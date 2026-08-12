@@ -118,7 +118,8 @@
       "title": "Opções de análise",
       "mode": "Modo de análise",
       "stringEncoding": "Codificação de strings",
-      "stringDecodeMode": "Modo de decodificação de strings"
+      "stringDecodeMode": "Modo de decodificação de strings",
+      "ignoreDebug": "Ignorar informações de depuração"
     },
     "readability": {
       "title": "Opções de legibilidade",
@@ -148,11 +149,12 @@
       "parseMode": "Rigor do analisador. strict: validação rigorosa; permissive: tolerar bytecode não padrão. CLI: --parse-mode / -p",
       "stringEncoding": "Codificação para decodificação de constantes de string. CLI: --encoding / -e",
       "stringDecodeMode": "Comportamento em falha de decodificação de string. strict: erro; lossy: substituir por marcadores. CLI: --decode-mode / -m",
+      "ignoreDebug": "Valida as seções de depuração, mas não as usa na recuperação nem nos comentários gerados. CLI: --ignore-debug",
       "returnInlineMaxComplexity": "Complexidade máxima de expressão inline em instruções return. CLI: --return-inline-max-complexity",
       "indexInlineMaxComplexity": "Complexidade máxima de expressão inline em índices de tabela. CLI: --index-inline-max-complexity",
       "argsInlineMaxComplexity": "Complexidade máxima de expressão inline em argumentos de chamada. CLI: --args-inline-max-complexity",
       "accessBaseInlineMaxComplexity": "Complexidade máxima de expressão inline em bases de acesso a tabela. CLI: --access-base-inline-max-complexity",
-      "namingMode": "Estratégia de nomeação de variáveis. debug-like: usar info de depuração; simple: números sequenciais; heuristic: nomes inferidos. CLI: --naming-mode / -n",
+      "namingMode": "Estratégia alternativa quando não há nome de depuração válido. Todos os modos preferem nomes de depuração. CLI: --naming-mode / -n",
       "debugLikeIncludeFunction": "No modo debug-like, se inclui nomes com forma de função. CLI: --debug-like-include-function",
       "indentWidth": "Largura da indentação (número de espaços). CLI: --indent-width",
       "maxLineLength": "Comprimento máximo de linha preferido para o código gerado. CLI: --max-line-length",

@@ -70,6 +70,7 @@ function buildCliArgs(): string {
   pushOption(args, '--encoding', options.parse.stringEncoding, defaults.parse.stringEncoding)
   pushOption(args, '--decode-mode', options.parse.stringDecodeMode, defaults.parse.stringDecodeMode)
   pushOption(args, '--parse-mode', options.parse.mode, defaults.parse.mode)
+  if (options.parse.ignoreDebug) args.push('--ignore-debug')
   pushOption(
     args,
     '--return-inline-max-complexity',
@@ -325,6 +326,18 @@ const tableStyleOptions = [
                 :options="stringDecodeModeOptions"
                 size="small"
               />
+            </div>
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-1">
+                <label class="text-sm">{{ t('settings.parse.ignoreDebug') }}</label>
+                <NTooltip>
+                  <template #trigger>
+                    <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
+                  </template>
+                  {{ t('settings.tips.ignoreDebug') }}
+                </NTooltip>
+              </div>
+              <NSwitch v-model:value="settings.options.parse.ignoreDebug" size="small" />
             </div>
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-1">

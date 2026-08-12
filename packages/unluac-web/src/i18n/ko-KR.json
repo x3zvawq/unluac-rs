@@ -118,7 +118,8 @@
       "title": "파싱 옵션",
       "mode": "파싱 모드",
       "stringEncoding": "문자열 인코딩",
-      "stringDecodeMode": "문자열 디코드 모드"
+      "stringDecodeMode": "문자열 디코드 모드",
+      "ignoreDebug": "디버그 정보 무시"
     },
     "readability": {
       "title": "가독성 옵션",
@@ -148,11 +149,12 @@
       "parseMode": "파서 엄격도. strict: 엄격한 검증; permissive: 비표준 바이트코드 허용. CLI: --parse-mode / -p",
       "stringEncoding": "문자열 상수 디코딩에 사용할 인코딩. CLI: --encoding / -e",
       "stringDecodeMode": "문자열 디코드 실패 시 동작. strict: 오류; lossy: 플레이스홀더로 대체. CLI: --decode-mode / -m",
+      "ignoreDebug": "디버그 섹션을 검증하지만 복구 및 생성 주석에는 사용하지 않습니다. CLI: --ignore-debug",
       "returnInlineMaxComplexity": "return 문에서 인라인 표현식의 최대 복잡도. CLI: --return-inline-max-complexity",
       "indexInlineMaxComplexity": "테이블 인덱스 표현식의 최대 인라인 복잡도. CLI: --index-inline-max-complexity",
       "argsInlineMaxComplexity": "함수 호출 인자의 최대 인라인 표현식 복잡도. CLI: --args-inline-max-complexity",
       "accessBaseInlineMaxComplexity": "테이블 접근 기반의 최대 인라인 표현식 복잡도. CLI: --access-base-inline-max-complexity",
-      "namingMode": "변수 명명 전략. debug-like: 디버그 정보 사용; simple: 순차 번호; heuristic: 추론된 이름. CLI: --naming-mode / -n",
+      "namingMode": "유효한 디버그 이름이 없을 때의 대체 전략입니다. 모든 모드는 디버그 이름을 우선합니다. CLI: --naming-mode / -n",
       "debugLikeIncludeFunction": "debug-like 명명 모드에서 함수 형태의 이름을 포함할지 여부. CLI: --debug-like-include-function",
       "indentWidth": "들여쓰기 너비 (공백 수). CLI: --indent-width",
       "maxLineLength": "생성 코드의 기본 최대 줄 길이. CLI: --max-line-length",

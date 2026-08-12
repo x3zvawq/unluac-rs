@@ -90,6 +90,7 @@ impl LuaCaseMatrixEntry {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum LuaCaseExpectation {
     Source,
+    InvalidDebugStillRejected,
     LuaJitBuiltinTableRemove,
     LuaJitMethodProtocol,
     UnsupportedIsland { jump_pc: usize, target_pc: usize },
@@ -121,6 +122,7 @@ pub(crate) enum LuaCaseLoopProtocol {
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub(crate) struct LuaCaseOptions {
     pub(crate) retain_debug: bool,
+    pub(crate) ignore_debug: bool,
     pub(crate) naming_mode: Option<NamingMode>,
     pub(crate) luau_optimization_level: Option<u8>,
     pub(crate) luau_vector: Option<LuauVectorCaseOptions>,
@@ -130,6 +132,7 @@ pub(crate) struct LuaCaseOptions {
 impl LuaCaseOptions {
     const DEFAULT: Self = Self {
         retain_debug: false,
+        ignore_debug: false,
         naming_mode: None,
         luau_optimization_level: None,
         luau_vector: None,
@@ -161,6 +164,9 @@ pub enum LuaCaseVariant {
     LuauO0,
     LuauO1,
     LuauO2,
+    NamingDebugLike,
+    NamingSimple,
+    NamingHeuristic,
 }
 
 impl LuaCaseVariant {
@@ -169,17 +175,29 @@ impl LuaCaseVariant {
             Self::LuauO0 => "O0",
             Self::LuauO1 => "O1",
             Self::LuauO2 => "O2",
+            Self::NamingDebugLike => "naming-debug-like",
+            Self::NamingSimple => "naming-simple",
+            Self::NamingHeuristic => "naming-heuristic",
         }
     }
 
-    const fn luau_optimization_level(self) -> u8 {
+    const fn apply(self, options: &mut LuaCaseOptions) {
         match self {
-            Self::LuauO0 => 0,
-            Self::LuauO1 => 1,
-            Self::LuauO2 => 2,
+            Self::LuauO0 => options.luau_optimization_level = Some(0),
+            Self::LuauO1 => options.luau_optimization_level = Some(1),
+            Self::LuauO2 => options.luau_optimization_level = Some(2),
+            Self::NamingDebugLike => options.naming_mode = Some(NamingMode::DebugLike),
+            Self::NamingSimple => options.naming_mode = Some(NamingMode::Simple),
+            Self::NamingHeuristic => options.naming_mode = Some(NamingMode::Heuristic),
         }
     }
 }
+
+const ALL_NAMING_VARIANTS: &[LuaCaseVariant] = &[
+    LuaCaseVariant::NamingDebugLike,
+    LuaCaseVariant::NamingSimple,
+    LuaCaseVariant::NamingHeuristic,
+];
 
 const ALL_DIALECTS: &[LuaCaseDialect] = &[
     LuaCaseDialect::Lua51,
@@ -248,6 +266,7 @@ const LUAU_ALL_OPTIMIZATION_VARIANTS: &[LuaCaseVariant] = &[
 ];
 const LUAU_OPTIMIZED_OPTIONS: LuaCaseOptions = LuaCaseOptions {
     retain_debug: false,
+    ignore_debug: false,
     naming_mode: None,
     luau_optimization_level: Some(2),
     luau_vector: None,
@@ -259,6 +278,7 @@ const LUAU_OPTIMIZED_CONVERGENCE_OPTIONS: LuaCaseOptions = LuaCaseOptions {
 };
 const LUAU_VECTOR_OPTIONS: LuaCaseOptions = LuaCaseOptions {
     retain_debug: false,
+    ignore_debug: false,
     naming_mode: None,
     luau_optimization_level: Some(2),
     luau_vector: Some(LuauVectorCaseOptions {
@@ -479,7 +499,12 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_28_lua51_loop_branch_recovery.lua",
         PUC_LUA_51,
-    ),
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    })
+    .with_variants(ALL_NAMING_VARIANTS),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_29_lua51_retry_loop_live_out.lua",
         PUC_LUA_51,
@@ -1648,6 +1673,33 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         LUAJIT_ONLY,
     )
     .with_expectation(LuaCaseExpectation::LuaJitMethodProtocol),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_307_ignore_debug_policy.lua",
+        ALL_DIALECTS,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ignore_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_308_debug_names_all_dialects.lua",
+        ALL_DIALECTS,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    })
+    .with_variants(ALL_NAMING_VARIANTS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_309_ignore_debug_keeps_validation.lua",
+        PUC_LUA_51,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    })
+    .with_expectation(LuaCaseExpectation::InvalidDebugStillRejected),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {
@@ -1669,7 +1721,7 @@ fn manifest_entries(
                 .map(move |variant| {
                     let mut options = entry.options;
                     if let Some(variant) = variant {
-                        options.luau_optimization_level = Some(variant.luau_optimization_level());
+                        variant.apply(&mut options);
                     }
                     LuaCaseManifestEntry {
                         path: entry.path,

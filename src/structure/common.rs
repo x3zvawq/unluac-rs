@@ -1,7 +1,8 @@
 //! 这个文件集中声明 Structure 的内部 evidence 与最终 `StructureFacts` 容器。
 //!
 //! branch/loop/short-circuit 类型只在 Structure 内参与冲突消解；对下游公开的事实已经
-//! 收窄为冻结的 `StructurePlan + children`，HIR 不再读取 raw evidence 做第二次取舍。
+//! 收窄为冻结的 `StructurePlan + DebugBindingFacts + children`，HIR 不再读取 raw evidence
+//! 做第二次取舍。
 
 use std::collections::BTreeSet;
 
@@ -23,7 +24,36 @@ use super::plan::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructureFacts {
     pub plan: StructurePlan,
+    pub debug_bindings: DebugBindingFacts,
     pub children: Vec<StructureFacts>,
+}
+
+/// debug local 在其源码生命周期入口对应的 canonical SSA 身份。
+///
+/// `scope` 是 Transformer 归一化 debug local arena 的稳定索引。这里不携带名称，避免
+/// Structure 越权处理字符串和命名合法性；HIR 只需把这个索引与归一化 local 事实连接，
+/// 就能在 table/closure 等跨多条指令的初始化之后仍找回正确 binding。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DebugBindingFact {
+    pub scope: usize,
+    pub reg: Reg,
+    pub start_pc: u32,
+    pub end_pc: u32,
+    pub value: SsaValue,
+}
+
+/// 多个源码 scope 竞争同一 canonical SSA 时保留的拒绝证据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugBindingConflict {
+    pub value: SsaValue,
+    pub scopes: Vec<usize>,
+}
+
+/// 一个 proto 已冻结的 debug binding 映射及被拒绝的冲突证据。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DebugBindingFacts {
+    pub accepted: Vec<DebugBindingFact>,
+    pub conflicts: Vec<DebugBindingConflict>,
 }
 
 /// Structure 已完成冲突消解后的稠密 region/edge/value/cleanup 计划。
@@ -461,6 +491,10 @@ impl Iterator for ForwardRouteActionEdges<'_> {
 impl StructureFacts {
     pub const fn plan(&self) -> &StructurePlan {
         &self.plan
+    }
+
+    pub const fn debug_bindings(&self) -> &DebugBindingFacts {
+        &self.debug_bindings
     }
 }
 

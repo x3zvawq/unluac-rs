@@ -35,7 +35,10 @@ pub(crate) use common::{
     ShortCircuitNode, ShortCircuitNodeRef, ShortCircuitTarget, ShortCircuitValueIncoming,
     UnstructuredRegionLayout,
 };
-pub use common::{BranchKind, GotoReason, PhiEdgeCopy, StructureFacts, StructurePlan};
+pub use common::{
+    BranchKind, DebugBindingConflict, DebugBindingFact, DebugBindingFacts, GotoReason, PhiEdgeCopy,
+    StructureFacts, StructurePlan,
+};
 #[cfg(feature = "decompile-debug")]
 pub use debug::dump_structure;
 pub use error::StructureError;

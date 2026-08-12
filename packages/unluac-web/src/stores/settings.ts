@@ -18,6 +18,7 @@ export function defaultOptions(): DecompileOptions {
       mode: 'permissive',
       stringEncoding: 'auto',
       stringDecodeMode: 'strict',
+      ignoreDebug: false,
     },
     readability: {
       returnInlineMaxComplexity: 10,

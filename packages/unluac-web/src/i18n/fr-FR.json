@@ -119,7 +119,8 @@
       "title": "Options d'analyse",
       "mode": "Mode d'analyse",
       "stringEncoding": "Encodage des chaînes",
-      "stringDecodeMode": "Mode de décodage des chaînes"
+      "stringDecodeMode": "Mode de décodage des chaînes",
+      "ignoreDebug": "Ignorer les informations de débogage"
     },
     "readability": {
       "title": "Options de lisibilité",
@@ -148,11 +149,12 @@
       "parseMode": "Rigueur de l'analyseur. strict : validation stricte ; permissive : tolérer le bytecode non standard. CLI : --parse-mode / -p",
       "stringEncoding": "Encodage pour le décodage des constantes de chaînes. CLI : --encoding / -e",
       "stringDecodeMode": "Comportement en cas d'échec du décodage de chaîne. strict : erreur ; lossy : remplacer par des marqueurs. CLI : --decode-mode / -m",
+      "ignoreDebug": "Valide les sections de débogage sans les utiliser pour la récupération ni les commentaires générés. CLI : --ignore-debug",
       "returnInlineMaxComplexity": "Complexité max des expressions inline dans les instructions return. CLI : --return-inline-max-complexity",
       "indexInlineMaxComplexity": "Complexité max des expressions inline dans les index de table. CLI : --index-inline-max-complexity",
       "argsInlineMaxComplexity": "Complexité max des expressions inline dans les arguments d'appel. CLI : --args-inline-max-complexity",
       "accessBaseInlineMaxComplexity": "Complexité max des expressions inline dans les bases d'accès aux tables. CLI : --access-base-inline-max-complexity",
-      "namingMode": "Stratégie de nommage des variables. debug-like : utiliser les infos de débogage ; simple : numéros séquentiels ; heuristic : noms inférés. CLI : --naming-mode / -n",
+      "namingMode": "Stratégie de repli sans nom de débogage valide. Tous les modes préfèrent les noms de débogage. CLI : --naming-mode / -n",
       "debugLikeIncludeFunction": "En mode debug-like, inclure ou non les noms en forme de fonction. CLI : --debug-like-include-function",
       "indentWidth": "Largeur d'indentation (nombre d'espaces). CLI : --indent-width",
       "maxLineLength": "Longueur maximale de ligne préférée pour le code généré. CLI : --max-line-length",

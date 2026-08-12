@@ -83,6 +83,8 @@ cargo run -p unluac-cli -- --help
 ```bash
 unluac-cli -i /absolute/path/to/chunk.out
 unluac-cli -s tests/unit-case/lua51_01.lua -D lua5.1
+unluac-cli -s tests/unit-case/lua51_01.lua -D lua5.1 --strip false
+unluac-cli -s tests/unit-case/lua51_01.lua -D lua5.1 --strip false --ignore-debug
 unluac-cli -i /absolute/path/to/chunk.out -o /tmp/case.lua
 ```
 
@@ -90,6 +92,9 @@ unluac-cli -i /absolute/path/to/chunk.out -o /tmp/case.lua
 
 - CLI 要求你显式传入 `-i/--input` 或 `-s/--source`
 - 如果传入 `-s/--source`，CLI 会先调用外部编译器生成 chunk，再执行反编译
+- 源码编译默认会剥离 debug/local 元数据；传入 `--strip false` 可以保留它们
+- 只要 debug 元数据可用，三种命名模式都会把它作为高置信 binding 与命名证据；传入 `--ignore-debug` 后仍会解析并校验 debug 段，但不会发布给恢复流程或生成相关注释
+- `--strip` 只控制 `--source` 的编译过程；`--ignore-debug` 与其独立，同时适用于 `--source` 和 `--input`
 - `auto` dialect 检测只适用于已编译字节码输入；`--source` 仍需显式传入 `--dialect`，这样 CLI 才能选择编译器
 - GitHub Releases 提供的独立二进制不会自带 Lua 编译器；`-s/--source` 只有在你显式传入 `-l/--luac`，或运行环境里存在 `lua/build/<dialect>/` / PATH 上的兼容编译器时才可用
 - 如果传入 `-o/--output`，CLI 会把最终生成源码写入目标文件，而不是输出到 stdout
@@ -106,6 +111,8 @@ unluac-cli -i /absolute/path/to/chunk.out -o /tmp/case.lua
 | `-i`, `--input` | 已编译 chunk 路径 | 无 |
 | `-s`, `--source` | Lua 源码路径，CLI 会先调用外部编译器，再执行反编译 | 无 |
 | `-l`, `--luac` | 显式指定 `--source` 使用的外部编译器路径 | 先尝试 `lua/build/<dialect>/`，否则回退到 PATH 上的兼容编译器 |
+| `--strip <BOOL>` | 源码编译时是否剥离 debug 与局部变量元数据 | `true` |
+| `--ignore-debug` | 解析并校验 debug 段，但不让任何 debug 元数据参与恢复或生成注释 | `false` |
 | `-e`, `--encoding` | 字符串解码编码（`auto` 或 [Encoding Standard](https://encoding.spec.whatwg.org/) 定义的任意标签，如 `utf-8`、`gbk`、`shift_jis`、`euc-kr`、`big5`） | `auto` |
 | `-m`, `--decode-mode` | 字符串解码失败策略 | `strict` |
 | `-p`, `--parse-mode` | parser 严格 / 宽松模式 | `permissive` |
@@ -134,6 +141,8 @@ unluac-cli -i /absolute/path/to/chunk.out -o /tmp/case.lua
 | `--access-base-inline-max-complexity` | 访问基表达式内联复杂度上限 | `5` |
 | `-n`, `--naming-mode` | 命名策略 | `debug-like` |
 | `--debug-like-include-function` | debug-like 命名是否包含函数形状名字 | `true` |
+
+三种命名模式都会优先使用合法的 debug 名；命名模式只决定没有可用 debug 名时的回退策略。
 
 生成与输出参数：
 

@@ -16,6 +16,12 @@ cargo unluac -i /path/to/chunk.out -D lua5.1
 # 从源码编译后再反编译
 cargo unluac -s tests/unit-case/lua51_01.lua -D lua5.1
 
+# 保留编译器生成的 debug/local 信息后再反编译
+cargo unluac -s tests/unit-case/lua51_01.lua -D lua5.1 --strip false
+
+# 保留编译产物中的 debug 段，但验证忽略 debug 后的纯字节码恢复路径
+cargo unluac -s tests/unit-case/lua51_01.lua -D lua5.1 --strip false --ignore-debug
+
 # 查看某一层的 dump
 cargo unluac -i /path/to/chunk.out -D lua5.4 --dump hir --detail verbose
 
@@ -32,6 +38,8 @@ cargo unluac -i /path/to/chunk.out -D lua5.4 --dump-pass temp-inline --proto 2
 | --------------- | -------------------------------- |
 | `-i/--input`    | 输入已编译 chunk                 |
 | `-s/--source`   | 输入 Lua 源码并自动编译          |
+| `--strip`       | 源码编译时是否剥离 debug/local 信息（默认 `true`） |
+| `--ignore-debug` | 仍解析并校验 debug 段，但不让它参与恢复或生成注释（默认 `false`） |
 | `-D/--dialect`  | 指定方言                         |
 | `-d/--debug`    | 使用仓库默认 debug dump 预设     |
 | `--dump`        | 指定要打印的外层阶段，可重复传入 |
@@ -50,6 +58,8 @@ cargo unluac -i /path/to/chunk.out -D lua5.4 --dump-pass temp-inline --proto 2
 ## 使用约定
 
 - `--stop-after` 决定 pipeline 跑到哪一层，`--dump` 只能打印已到达的层。
+- `--strip` 只影响 `-s/--source` 调用编译器时是否产生 debug 信息；`--ignore-debug` 与其独立，也适用于 `-i/--input`。
+- Transformer dump 展示归一化 debug local 的分类、寄存器和生命周期；Structure dump 展示 scope 到 canonical SSA 的映射与被忽略的冲突；HIR/Naming dump 展示最终 binding hint 和名字来源。
 - `--proto` / `--proto-depth` 适合在 parser、HIR、AST 之间来回比对同一子函数。
 - `--dump-pass` 只在 pass 实际改动内容时输出快照；未变化时不会刷屏。
 - `-o/--output` 面向最终源码输出，不适合与调试输出混用。

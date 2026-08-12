@@ -29,6 +29,8 @@ pub struct HirProto {
     pub upvalue_debug_hints: Vec<Option<String>>,
     pub temps: Vec<TempId>,
     pub temp_debug_locals: Vec<Option<String>>,
+    /// `temp_debug_locals` 对应的源码局部作用域身份；编译器内部槽位为 `None`。
+    pub temp_debug_scopes: Vec<Option<usize>>,
     pub body: HirBlock,
     pub children: Vec<HirProtoRef>,
 }

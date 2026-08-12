@@ -24,6 +24,54 @@ pub struct RawChunk {
     pub origin: Origin,
 }
 
+impl RawChunk {
+    /// 清除所有可能影响源码恢复或生成注释的调试元数据。
+    ///
+    /// 该操作只允许在 dialect parser 已完整解析并校验 chunk 后执行；指令、常量、
+    /// upvalue 描述符和字节来源区间等运行时语义事实保持不变。
+    pub(crate) fn discard_debug_metadata(&mut self) {
+        if let DialectHeaderExtra::LuaJit(extra) = &mut self.header.extra {
+            extra.chunk_name = None;
+        }
+        discard_proto_debug_metadata(&mut self.main);
+    }
+}
+
+fn discard_proto_debug_metadata(proto: &mut RawProto) {
+    proto.common.source = None;
+    proto.common.line_range = ProtoLineRange {
+        defined_start: 0,
+        defined_end: 0,
+    };
+    proto.common.debug_info.common.line_info.clear();
+    proto.common.debug_info.common.local_vars.clear();
+    proto.common.debug_info.common.upvalue_names.clear();
+
+    match &mut proto.common.debug_info.extra {
+        DialectDebugExtra::Lua54(extra) => *extra = Default::default(),
+        DialectDebugExtra::Lua55(extra) => *extra = Default::default(),
+        DialectDebugExtra::LuaJit(extra) => *extra = Default::default(),
+        DialectDebugExtra::Luau(extra) => *extra = Default::default(),
+        DialectDebugExtra::Lua51 | DialectDebugExtra::Lua52 | DialectDebugExtra::Lua53 => {}
+    }
+    match &mut proto.extra {
+        DialectProtoExtra::LuaJit(extra) => {
+            extra.first_line = None;
+            extra.line_count = None;
+            extra.debug_size = 0;
+        }
+        DialectProtoExtra::Luau(extra) => extra.debug_name = None,
+        DialectProtoExtra::Lua51(_)
+        | DialectProtoExtra::Lua52(_)
+        | DialectProtoExtra::Lua53(_)
+        | DialectProtoExtra::Lua54(_)
+        | DialectProtoExtra::Lua55(_) => {}
+    }
+    for child in &mut proto.common.children {
+        discard_proto_debug_metadata(child);
+    }
+}
+
 /// 所有 dialect 共用的 chunk header 元数据。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChunkHeader {

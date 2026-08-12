@@ -103,6 +103,7 @@ pub(super) fn empty_proto(id: HirProtoRef) -> HirProto {
         upvalue_debug_hints: Vec::new(),
         temps: Vec::new(),
         temp_debug_locals: Vec::new(),
+        temp_debug_scopes: Vec::new(),
         body: HirBlock::default(),
         children: Vec::new(),
     }

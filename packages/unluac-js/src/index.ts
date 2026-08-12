@@ -42,6 +42,7 @@ export interface UnluacDecompileOptions {
     mode?: UnluacParseMode;
     stringEncoding?: UnluacStringEncoding;
     stringDecodeMode?: UnluacStringDecodeMode;
+    ignoreDebug?: boolean;
   };
   // The published npm package ships a slim wasm build and rejects debug/timing options.
   debug?: never;

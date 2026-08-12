@@ -20,7 +20,7 @@ use unluac::decompile::{
     DecompileDialect, DecompileError, DecompileOptions, DecompileStage, decompile,
 };
 use unluac::generate::{GenerateMode, GeneratedChunkKind, LuauVectorConstructor, LuauVectorSize};
-use unluac::parser::DialectConstPoolExtra;
+use unluac::parser::{DialectConstPoolExtra, ParseMode};
 use unluac::structure::{
     ControlFlowFeature, LoopVmProtocol, RegionId, RegionPlan, StructureFacts, StructurePlan,
     UnstructuredLayoutItem,
@@ -1314,6 +1314,9 @@ pub(crate) fn run_pipeline_case(
     }
 
     match entry.expectation {
+        LuaCaseExpectation::InvalidDebugStillRejected => {
+            assert_ignore_debug_keeps_parser_validation(entry)?;
+        }
         LuaCaseExpectation::LuaJitBuiltinTableRemove => {
             assert_luajit_table_remove_contract(entry, suite_label)?;
         }
@@ -1325,6 +1328,43 @@ pub(crate) fn run_pipeline_case(
 
     let proto_count = count_output_tags(&baseline.source_output.stdout);
     Ok(TestSuccess { proto_count })
+}
+
+fn assert_ignore_debug_keeps_parser_validation(
+    entry: &LuaCaseManifestEntry,
+) -> Result<(), TestFailure> {
+    let mut truncated = compile_manifest_case(entry);
+    truncated.pop().ok_or_else(|| {
+        TestFailure::new(
+            FailureKind::DecompileFailed,
+            "debug validation contract produced an empty chunk",
+            "debug validation contract produced an empty chunk",
+        )
+    })?;
+
+    for ignore_debug in [false, true] {
+        let mut options = decompile_options(entry);
+        options.parse.mode = ParseMode::Strict;
+        options.parse.ignore_debug = ignore_debug;
+        match decompile(&truncated, options) {
+            Err(DecompileError::Parse(_)) => {}
+            Err(error) => {
+                return Err(TestFailure::new(
+                    FailureKind::DecompileFailed,
+                    "truncated debug layout escaped the parser error boundary",
+                    format!("ignore_debug={ignore_debug} should fail in Parser, got: {error}"),
+                ));
+            }
+            Ok(_) => {
+                return Err(TestFailure::new(
+                    FailureKind::DecompileFailed,
+                    "truncated debug layout was accepted",
+                    format!("ignore_debug={ignore_debug} accepted a truncated debug layout"),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn assert_luajit_table_remove_contract(
@@ -1893,6 +1933,7 @@ fn decompile_options(entry: &LuaCaseManifestEntry) -> DecompileOptions {
     if let Some(mode) = entry.options.naming_mode {
         options.naming.mode = mode;
     }
+    options.parse.ignore_debug = entry.options.ignore_debug;
     options.generate.luau_vector_constructor =
         entry
             .options
@@ -2260,9 +2301,7 @@ fn run_compiler_to_output_path(
         }
         LuaCompilerProtocol::LuaJitBytecodeTool => {
             let mut command = Command::new(compiler);
-            if strip_debug {
-                command.arg("-s");
-            }
+            command.arg(if strip_debug { "-s" } else { "-g" });
             let output = command.arg(source).arg(output).output().map_err(|error| {
                 format!(
                     "should spawn compiler {} for {}: {error}",

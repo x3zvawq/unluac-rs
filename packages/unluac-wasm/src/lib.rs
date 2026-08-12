@@ -38,6 +38,7 @@ struct WasmParseOptions {
     mode: Option<String>,
     string_encoding: Option<String>,
     string_decode_mode: Option<String>,
+    ignore_debug: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -206,6 +207,9 @@ impl WasmParseOptions {
         }
         if let Some(value) = self.string_decode_mode {
             options.parse.string_decode_mode = parse_option("parse.stringDecodeMode", &value)?;
+        }
+        if let Some(value) = self.ignore_debug {
+            options.parse.ignore_debug = value;
         }
         Ok(())
     }
@@ -460,6 +464,7 @@ mod tests {
                 mode: Some("permissive".to_owned()),
                 string_encoding: Some("gbk".to_owned()),
                 string_decode_mode: Some("lossy".to_owned()),
+                ignore_debug: Some(true),
             }),
             debug: None,
             readability: None,
@@ -489,6 +494,7 @@ mod tests {
         assert_eq!(options.parse.mode, ParseMode::Permissive);
         assert_eq!(options.parse.string_encoding, "gbk".parse().unwrap());
         assert_eq!(options.parse.string_decode_mode, StringDecodeMode::Lossy);
+        assert!(options.parse.ignore_debug);
         assert_eq!(options.naming.mode, NamingMode::Heuristic);
         assert!(!options.naming.debug_like_include_function);
         assert_eq!(options.generate.indent_width, 2);

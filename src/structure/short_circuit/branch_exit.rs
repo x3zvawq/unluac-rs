@@ -1221,7 +1221,8 @@ pub(super) fn analyze_guard_branch_exit_dag_candidates(
         };
 
         match best_by_header.get(&root.header) {
-            Some(existing) if !prefer_short_circuit_candidate(&candidate, existing) => {}
+            Some(existing) if !prefer_short_circuit_candidate(proto, cfg, &candidate, existing) => {
+            }
             _ => {
                 best_by_header.insert(root.header, candidate);
             }

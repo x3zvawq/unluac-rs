@@ -950,12 +950,14 @@ pub(crate) fn finish_lowered_proto(
 ) -> LoweredProto {
     LoweredProto {
         source: raw.common.source.clone(),
+        debug_name: raw.extra.luau().and_then(|extra| extra.debug_name.clone()),
         line_range: raw.common.line_range,
         signature: raw.common.signature,
         frame: raw.common.frame,
         constants: raw.common.constants.clone(),
         upvalues: raw.common.upvalues.clone(),
         debug_info: raw.common.debug_info.clone(),
+        debug_locals: crate::transformer::common::normalize_debug_locals(raw),
         children,
         instrs,
         lowering_map,

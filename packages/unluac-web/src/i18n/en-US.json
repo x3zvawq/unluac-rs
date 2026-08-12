@@ -119,7 +119,8 @@
       "title": "Parse Options",
       "mode": "Parse Mode",
       "stringEncoding": "String Encoding",
-      "stringDecodeMode": "String Decode Mode"
+      "stringDecodeMode": "String Decode Mode",
+      "ignoreDebug": "Ignore Debug Information"
     },
     "readability": {
       "title": "Readability Options",
@@ -152,11 +153,12 @@
       "parseMode": "Parser strictness. strict: strict validation; permissive: tolerate non-standard bytecode. CLI: --parse-mode / -p",
       "stringEncoding": "Encoding for string constant decoding. auto detects common legacy encodings. CLI: --encoding / -e",
       "stringDecodeMode": "Behavior on string decode failure. strict: error; lossy: replace with placeholders. CLI: --decode-mode / -m",
+      "ignoreDebug": "Parse and validate debug sections, but exclude them from recovery and generated comments. CLI: --ignore-debug",
       "returnInlineMaxComplexity": "Max inline expression complexity in return statements. CLI: --return-inline-max-complexity",
       "indexInlineMaxComplexity": "Max inline expression complexity in table index expressions. CLI: --index-inline-max-complexity",
       "argsInlineMaxComplexity": "Max inline expression complexity in call arguments. CLI: --args-inline-max-complexity",
       "accessBaseInlineMaxComplexity": "Max inline expression complexity in table access bases. CLI: --access-base-inline-max-complexity",
-      "namingMode": "Variable naming strategy. debug-like: use debug info; simple: sequential numbers; heuristic: inferred names. CLI: --naming-mode / -n",
+      "namingMode": "Fallback naming strategy when no valid debug name exists. All modes prefer debug names. CLI: --naming-mode / -n",
       "debugLikeIncludeFunction": "In debug-like naming mode, whether to include function-shaped names. CLI: --debug-like-include-function",
       "indentWidth": "Indentation width (number of spaces). CLI: --indent-width",
       "maxLineLength": "Preferred maximum line length for generated code. CLI: --max-line-length",

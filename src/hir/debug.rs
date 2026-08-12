@@ -1,9 +1,9 @@
 //! 这个文件承载 HIR 层的共享调试输出。
 //!
-//! HIR dump 的重点是把 proto 边界、绑定数量和 stmt tree 稳定打印出来，并让残留
-//! 的 `Temp / Goto / Label / Continue / Unstructured` 一眼可见。stage dump 入口直接
-//! 从主 pipeline state 读取 HIR module；如果最终 dump 里还出现 `decision(...)`，
-//! 那说明 HIR 末端的决策图消除退化了。
+//! HIR dump 的重点是把 proto 边界、debug binding hint、绑定数量和 stmt tree 稳定打印
+//! 出来，并让残留的 `Temp / Goto / Label / Continue / Unstructured` 一眼可见。stage dump
+//! 入口直接从主 pipeline state 读取 HIR module；如果最终 dump 里还出现
+//! `decision(...)`，那说明 HIR 末端的决策图消除退化了。
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -109,11 +109,43 @@ pub(crate) fn dump_hir_module(
             proto.line_range.defined_end,
             proto.signature.is_vararg
         );
+        write_debug_bindings(&mut output, proto);
         let _ = writeln!(output, "  body");
         write_block(&mut output, "    ", &proto.body);
     }
 
     colorize_debug_text(&output, color)
+}
+
+fn write_debug_bindings(output: &mut String, proto: &HirProto) {
+    let _ = writeln!(output, "  debug binding hints");
+    write_debug_hint_slice(output, "p", &proto.param_debug_hints, None);
+    write_debug_hint_slice(output, "l", &proto.local_debug_hints, None);
+    write_debug_hint_slice(output, "u", &proto.upvalue_debug_hints, None);
+    write_debug_hint_slice(
+        output,
+        "t",
+        &proto.temp_debug_locals,
+        Some(&proto.temp_debug_scopes),
+    );
+}
+
+fn write_debug_hint_slice(
+    output: &mut String,
+    prefix: &str,
+    hints: &[Option<String>],
+    scopes: Option<&[Option<usize>]>,
+) {
+    for (index, hint) in hints.iter().enumerate() {
+        let Some(hint) = hint else {
+            continue;
+        };
+        let scope = scopes
+            .and_then(|scopes| scopes.get(index))
+            .and_then(|scope| *scope)
+            .map_or_else(String::new, |scope| format!(" scope#{scope}"));
+        let _ = writeln!(output, "    {prefix}{index}{scope} -> {hint:?}");
+    }
 }
 
 fn write_block(output: &mut String, indent: &str, block: &HirBlock) {

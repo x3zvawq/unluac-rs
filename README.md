@@ -83,6 +83,8 @@ Typical usage:
 ```bash
 unluac-cli -i /absolute/path/to/chunk.out -D lua5.1
 unluac-cli -s tests/unit-case/lua51_01.lua -D lua5.1
+unluac-cli -s tests/unit-case/lua51_01.lua -D lua5.1 --strip false
+unluac-cli -s tests/unit-case/lua51_01.lua -D lua5.1 --strip false --ignore-debug
 unluac-cli -i /absolute/path/to/chunk.out -D lua5.1 -o /tmp/case.lua
 ```
 
@@ -90,6 +92,9 @@ Notes:
 
 - The CLI requires either `-i/--input` or `-s/--source`
 - When `-s/--source` is provided, the CLI first invokes an external compiler to produce a chunk, then decompiles that generated chunk
+- Source compilation strips debug/local metadata by default; pass `--strip false` to retain it
+- Available debug metadata is used as high-confidence binding and naming evidence in every naming mode; pass `--ignore-debug` to parse and validate it without publishing it to recovery or generated comments
+- `--strip` only controls compilation through `--source`; `--ignore-debug` independently applies to both `--source` and `--input`
 - `auto` dialect detection applies to compiled bytecode inputs; `--source` still needs an explicit `--dialect` so the CLI can pick the compiler
 - Standalone GitHub Release binaries do not bundle a Lua compiler; `-s/--source` only works when you pass `-l/--luac` explicitly, or when a compatible compiler is available under `lua/build/<dialect>/` or on PATH
 - When `-o/--output` is provided, the CLI writes the final generated source to the target file instead of stdout
@@ -106,6 +111,8 @@ Input options:
 | `-i`, `--input` | Path to a compiled chunk | None |
 | `-s`, `--source` | Path to Lua source; the CLI invokes an external compiler before decompiling | None |
 | `-l`, `--luac` | Explicit compiler path used by `--source` | First tries `lua/build/<dialect>/`, otherwise falls back to a compatible compiler on PATH |
+| `--strip <BOOL>` | Whether source compilation strips debug and local-variable metadata | `true` |
+| `--ignore-debug` | Parse and validate debug sections, but exclude all debug metadata from recovery and generated comments | `false` |
 | `-e`, `--encoding` | String decoding encoding (`auto` or any [Encoding Standard](https://encoding.spec.whatwg.org/) label, e.g. `utf-8`, `gbk`, `shift_jis`, `euc-kr`, `big5`) | `auto` |
 | `-m`, `--decode-mode` | String decode failure strategy | `strict` |
 | `-p`, `--parse-mode` | Strict vs permissive parser mode | `permissive` |
@@ -134,6 +141,8 @@ Readability and naming options:
 | `--access-base-inline-max-complexity` | Max inline complexity for table access bases | `5` |
 | `-n`, `--naming-mode` | Naming strategy | `debug-like` |
 | `--debug-like-include-function` | Whether debug-like names should include function-shaped names | `true` |
+
+All three naming modes prefer valid debug names when available. The selected mode controls only the fallback used when no valid debug name exists.
 
 Generate and output options:
 

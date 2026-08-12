@@ -43,15 +43,18 @@ pub(super) struct ProtoBindings {
     pub(super) upvalue_debug_hints: Vec<Option<String>>,
     pub(super) temps: Vec<TempId>,
     pub(super) temp_debug_locals: Vec<Option<String>>,
+    pub(super) temp_debug_scopes: Vec<Option<usize>>,
     pub(super) fixed_temps: Vec<TempId>,
     pub(super) phi_temps: Vec<TempId>,
     pub(super) loop_guard_temps: Vec<Option<TempId>>,
     pub(super) repeat_staged_temps: Vec<Vec<TempId>>,
     pub(super) instr_fixed_defs: Vec<Vec<TempId>>,
+    pub(super) debug_temp_targets: BTreeMap<TempId, BoundSlotTarget>,
     pub(super) captured_temp_targets: BTreeMap<TempId, BoundSlotTarget>,
     pub(super) captured_temp_decl_locals: BTreeMap<TempId, LocalId>,
     pub(super) capture_empty_local_decls: BTreeMap<usize, Vec<LocalId>>,
     pub(super) capture_entry_local_decls: Vec<LocalId>,
+    pub(super) debug_entry_local_decls: Vec<LocalId>,
     pub(super) capture_region_local_decls: BTreeMap<crate::structure::RegionId, Vec<LocalId>>,
     pub(super) closure_capture_targets: BTreeMap<(usize, usize), BoundSlotTarget>,
     pub(super) reference_captured_regs: Vec<bool>,
@@ -82,6 +85,13 @@ impl BoundSlotTarget {
 }
 
 impl ProtoBindings {
+    fn temp_target(&self, temp: TempId) -> Option<BoundSlotTarget> {
+        self.debug_temp_targets
+            .get(&temp)
+            .or_else(|| self.captured_temp_targets.get(&temp))
+            .copied()
+    }
+
     pub(super) fn local_for_reg_in_block(&self, block: BlockRef, reg: Reg) -> Option<LocalId> {
         self.block_local_regs
             .get(&block)
@@ -90,16 +100,12 @@ impl ProtoBindings {
     }
 
     pub(super) fn expr_for_temp(&self, temp: TempId) -> HirExpr {
-        self.captured_temp_targets
-            .get(&temp)
-            .copied()
+        self.temp_target(temp)
             .map_or(HirExpr::TempRef(temp), BoundSlotTarget::expr)
     }
 
     pub(super) fn lvalue_for_temp(&self, temp: TempId) -> HirLValue {
-        self.captured_temp_targets
-            .get(&temp)
-            .copied()
+        self.temp_target(temp)
             .map_or(HirLValue::Temp(temp), BoundSlotTarget::lvalue)
     }
 
@@ -301,6 +307,7 @@ fn lower_proto_node(
         upvalue_debug_hints: lowering.bindings.upvalue_debug_hints.clone(),
         temps: lowering.bindings.temps.clone(),
         temp_debug_locals: lowering.bindings.temp_debug_locals.clone(),
+        temp_debug_scopes: lowering.bindings.temp_debug_scopes.clone(),
         body: build_proto_body(id, &lowering)?,
         children: lowering.hir_children(),
     };
@@ -630,6 +637,7 @@ fn build_composite_factory_proto(
         upvalue_debug_hints: vec![None; plan.outer_captures.len()],
         temps: Vec::new(),
         temp_debug_locals: Vec::new(),
+        temp_debug_scopes: Vec::new(),
         body,
         children,
     })
@@ -896,7 +904,20 @@ fn build_proto_body(
     lowering: &ProtoLowering<'_>,
 ) -> Result<HirBlock, HirLowerError> {
     let mut body = build_structured_body(proto, lowering)?;
-    let mut prefix = local_decl_stmts(lowering.bindings.capture_entry_local_decls.clone());
+    let mut prefix = if lowering.bindings.debug_entry_local_decls.is_empty() {
+        Vec::new()
+    } else {
+        vec![HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: lowering.bindings.debug_entry_local_decls.clone(),
+            values: HirValuePack::fixed(vec![
+                HirExpr::Nil;
+                lowering.bindings.debug_entry_local_decls.len()
+            ]),
+        }))]
+    };
+    prefix.extend(local_decl_stmts(
+        lowering.bindings.capture_entry_local_decls.clone(),
+    ));
     prefix.extend(
         lowering
             .shared_closure_locals

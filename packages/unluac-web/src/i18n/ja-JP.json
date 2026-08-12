@@ -119,7 +119,8 @@
       "title": "解析オプション",
       "mode": "解析モード",
       "stringEncoding": "文字列エンコーディング",
-      "stringDecodeMode": "文字列デコードモード"
+      "stringDecodeMode": "文字列デコードモード",
+      "ignoreDebug": "デバッグ情報を無視"
     },
     "readability": {
       "title": "可読性オプション",
@@ -148,11 +149,12 @@
       "parseMode": "パーサーの厳密さ。strict: 厳密な検証；permissive: 非標準バイトコードを許容。CLI: --parse-mode / -p",
       "stringEncoding": "文字列定数のデコードに使用するエンコーディング。CLI: --encoding / -e",
       "stringDecodeMode": "文字列デコード失敗時の動作。strict: エラー；lossy: プレースホルダーで置換。CLI: --decode-mode / -m",
+      "ignoreDebug": "デバッグセクションは検証しますが、復元や生成コメントには使用しません。CLI: --ignore-debug",
       "returnInlineMaxComplexity": "return 文のインライン式の最大複雑度。CLI: --return-inline-max-complexity",
       "indexInlineMaxComplexity": "テーブルインデックス式のインライン式の最大複雑度。CLI: --index-inline-max-complexity",
       "argsInlineMaxComplexity": "関数呼び出し引数のインライン式の最大複雑度。CLI: --args-inline-max-complexity",
       "accessBaseInlineMaxComplexity": "テーブルアクセスベースのインライン式の最大複雑度。CLI: --access-base-inline-max-complexity",
-      "namingMode": "変数命名戦略。debug-like: デバッグ情報を使用；simple: 連番；heuristic: 推論された名前。CLI: --naming-mode / -n",
+      "namingMode": "有効なデバッグ名がない場合のフォールバック戦略です。すべてのモードでデバッグ名を優先します。CLI: --naming-mode / -n",
       "debugLikeIncludeFunction": "debug-like 命名モードで、関数形状の名前を含めるかどうか。CLI: --debug-like-include-function",
       "indentWidth": "インデント幅（スペース数）。CLI: --indent-width",
       "maxLineLength": "生成コードの推奨最大行長。CLI: --max-line-length",

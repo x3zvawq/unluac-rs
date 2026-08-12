@@ -120,6 +120,20 @@ impl<T> BindingSlots<T> {
     }
 }
 
+impl BindingSlots<bool> {
+    pub(super) fn from_debug_hints(
+        temp_hints: &[Option<String>],
+        local_hints: &[Option<String>],
+    ) -> Self {
+        Self {
+            temps: temp_hints.iter().map(Option::is_some).collect(),
+            locals: local_hints.iter().map(Option::is_some).collect(),
+            temp_limit: temp_hints.len(),
+            local_limit: local_hints.len(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct BindingIndex {
     ids: BindingSlots<Option<BindingId>>,
@@ -256,6 +270,7 @@ impl BindingOccurrenceIndex {
         stmts: &[StmtBindingSummary],
         reference_captured_bindings: &BindingSlots<bool>,
         reference_captured_home_slots: &BTreeSet<HomeSlotKey>,
+        debug_identity_bindings: &BindingSlots<bool>,
         promotion_facts: &ProtoPromotionFacts,
     ) -> Self {
         let mut index = Self {
@@ -269,6 +284,10 @@ impl BindingOccurrenceIndex {
                         .get(*binding)
                         .copied()
                         .unwrap_or_default()
+                        || debug_identity_bindings
+                            .get(*binding)
+                            .copied()
+                            .unwrap_or_default()
                         || matches!(
                             binding,
                             TableBinding::Temp(temp)

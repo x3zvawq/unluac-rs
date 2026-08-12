@@ -48,6 +48,7 @@ export interface DecompileOptions {
     mode: UnluacParseMode
     stringEncoding: UnluacStringEncoding
     stringDecodeMode: UnluacStringDecodeMode
+    ignoreDebug: boolean
   }
   readability: {
     returnInlineMaxComplexity: number

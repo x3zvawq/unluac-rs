@@ -119,7 +119,8 @@
       "title": "解析選項",
       "mode": "解析模式",
       "stringEncoding": "字串編碼",
-      "stringDecodeMode": "字串解碼模式"
+      "stringDecodeMode": "字串解碼模式",
+      "ignoreDebug": "忽略除錯資訊"
     },
     "readability": {
       "title": "可讀性選項",
@@ -148,11 +149,12 @@
       "parseMode": "解析器嚴格程度。strict: 嚴格校驗；permissive: 容忍不規範的位元組碼。CLI: --parse-mode / -p",
       "stringEncoding": "字串常數的解碼編碼。CLI: --encoding / -e",
       "stringDecodeMode": "字串解碼失敗時的處理策略。strict: 報錯；lossy: 替換為佔位符。CLI: --decode-mode / -m",
+      "ignoreDebug": "仍解析並驗證 debug 區段，但不讓其參與還原，也不產生相關註解。CLI: --ignore-debug",
       "returnInlineMaxComplexity": "return 陳述式中允許的最大內聯運算式複雜度。CLI: --return-inline-max-complexity",
       "indexInlineMaxComplexity": "表索引中允許的最大內聯運算式複雜度。CLI: --index-inline-max-complexity",
       "argsInlineMaxComplexity": "函式呼叫參數中允許的最大內聯運算式複雜度。CLI: --args-inline-max-complexity",
       "accessBaseInlineMaxComplexity": "表存取基底表中允許的最大內聯運算式複雜度。CLI: --access-base-inline-max-complexity",
-      "namingMode": "變數命名策略。debug-like: 使用偵錯資訊命名；simple: 簡單序號；heuristic: 啟發式推斷。CLI: --naming-mode / -n",
+      "namingMode": "沒有合法 debug 名時的後備命名策略；所有模式都會優先採用 debug 名。CLI: --naming-mode / -n",
       "debugLikeIncludeFunction": "debug-like 命名模式下，是否包含函式形狀的名稱。CLI: --debug-like-include-function",
       "indentWidth": "產生程式碼的縮排寬度（空格數）。CLI: --indent-width",
       "maxLineLength": "產生程式碼的首選最大行寬。CLI: --max-line-length",

@@ -161,6 +161,10 @@ pub(super) fn stabilize_table_constructors_in_proto(
         materialized_bindings,
         reference_captured_bindings,
         reference_captured_home_slots,
+        debug_identity_bindings: BindingSlots::from_debug_hints(
+            &proto.temp_debug_locals,
+            &proto.local_debug_hints,
+        ),
         promotion_facts,
         dialect,
         temp_count,
@@ -180,6 +184,7 @@ struct TableConstructorPass<'a> {
     materialized_bindings: BindingSlots<u32>,
     reference_captured_bindings: BindingSlots<bool>,
     reference_captured_home_slots: std::collections::BTreeSet<HomeSlotKey>,
+    debug_identity_bindings: BindingSlots<bool>,
     promotion_facts: &'a ProtoPromotionFacts,
     dialect: DecompileDialect,
     temp_count: usize,
@@ -207,6 +212,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
             &stmt_bindings,
             &self.reference_captured_bindings,
             &self.reference_captured_home_slots,
+            &self.debug_identity_bindings,
             self.promotion_facts,
         );
         let mut stmt_ids = (0..block.stmts.len()).collect::<Vec<_>>();
@@ -262,7 +268,10 @@ impl HirRewritePass for TableConstructorPass<'_> {
                             binding_occurrences.mentions_after(binding_id, *stmt_id),
                         )
                     })
-                    .filter(|target| self.constructor_handoff_is_safe(target));
+                    .filter(|target| {
+                        !self.binding_has_debug_identity(binding)
+                            && self.constructor_handoff_is_safe(target)
+                    });
                 let consumed_handoff = handoff_target.is_some();
                 let mut owner = block.stmts[index].clone();
                 install_constructor_owner(&mut owner, handoff_target, constructor);
@@ -284,7 +293,10 @@ impl HirRewritePass for TableConstructorPass<'_> {
                         binding_occurrences.mentions_after(binding_id, *stmt_id),
                     )
                 })
-                .filter(|target| self.constructor_handoff_is_safe(target));
+                .filter(|target| {
+                    !self.binding_has_debug_identity(binding)
+                        && self.constructor_handoff_is_safe(target)
+                });
             if !rebuilt_region && handoff_target.is_none() {
                 index += 1;
                 continue;
@@ -323,6 +335,13 @@ impl TableConstructorPass<'_> {
                         |slot| self.reference_captured_home_slots.contains(&slot)
                     )
             )
+    }
+
+    fn binding_has_debug_identity(&self, binding: TableBinding) -> bool {
+        self.debug_identity_bindings
+            .get(binding)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// 表 handoff 的 base/key 会在构造器 RHS 前求值，只能提前读取不会被 RHS 改写的快照。

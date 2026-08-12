@@ -98,6 +98,7 @@ impl Default for DecompileOptions {
                 mode: ParseMode::Permissive,
                 string_encoding: StringEncoding::Auto,
                 string_decode_mode: StringDecodeMode::Strict,
+                ignore_debug: false,
             },
             // 默认更偏向直接拿到最终源码，仓库内 CLI / wasm / 集成调用方都共享这套预期。
             target_stage: DecompileStage::Generate,

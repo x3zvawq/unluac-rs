@@ -118,7 +118,8 @@
       "title": "Параметры парсинга",
       "mode": "Режим парсинга",
       "stringEncoding": "Кодировка строк",
-      "stringDecodeMode": "Режим декодирования строк"
+      "stringDecodeMode": "Режим декодирования строк",
+      "ignoreDebug": "Игнорировать отладочную информацию"
     },
     "readability": {
       "title": "Параметры читаемости",
@@ -148,11 +149,12 @@
       "parseMode": "Строгость парсера. strict: строгая валидация; permissive: допускать нестандартный байткод. CLI: --parse-mode / -p",
       "stringEncoding": "Кодировка для декодирования строковых констант. CLI: --encoding / -e",
       "stringDecodeMode": "Поведение при ошибке декодирования строки. strict: ошибка; lossy: замена заполнителями. CLI: --decode-mode / -m",
+      "ignoreDebug": "Проверять секции отладки, но не использовать их для восстановления и комментариев. CLI: --ignore-debug",
       "returnInlineMaxComplexity": "Макс. сложность инлайн-выражений в операторах return. CLI: --return-inline-max-complexity",
       "indexInlineMaxComplexity": "Макс. сложность инлайн-выражений в индексных выражениях таблиц. CLI: --index-inline-max-complexity",
       "argsInlineMaxComplexity": "Макс. сложность инлайн-выражений в аргументах вызовов. CLI: --args-inline-max-complexity",
       "accessBaseInlineMaxComplexity": "Макс. сложность инлайн-выражений в базах доступа к таблицам. CLI: --access-base-inline-max-complexity",
-      "namingMode": "Стратегия именования переменных. debug-like: использовать отладочную информацию; simple: порядковые номера; heuristic: выведенные имена. CLI: --naming-mode / -n",
+      "namingMode": "Резервная стратегия при отсутствии допустимого отладочного имени. Все режимы предпочитают отладочные имена. CLI: --naming-mode / -n",
       "debugLikeIncludeFunction": "В режиме именования debug-like, включать ли имена в форме функций. CLI: --debug-like-include-function",
       "indentWidth": "Ширина отступа (количество пробелов). CLI: --indent-width",
       "maxLineLength": "Предпочтительная максимальная длина строки для сгенерированного кода. CLI: --max-line-length",

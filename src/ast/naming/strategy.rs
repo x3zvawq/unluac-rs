@@ -48,15 +48,6 @@ pub(super) fn choose_param_candidate(
     {
         return hint.clone();
     }
-    if options.mode == NamingMode::DebugLike {
-        return mode_fallback_candidate(
-            options,
-            proto.id,
-            "p",
-            index,
-            alphabetical_name(index).unwrap_or_else(|| format!("arg{}", index + 1)),
-        );
-    }
     if let Some(name) = evidence
         .param_debug_names
         .get(index)
@@ -66,6 +57,15 @@ pub(super) fn choose_param_candidate(
             text: name,
             source: NameSource::Debug,
         };
+    }
+    if options.mode == NamingMode::DebugLike {
+        return mode_fallback_candidate(
+            options,
+            proto.id,
+            "p",
+            index,
+            alphabetical_name(index).unwrap_or_else(|| format!("arg{}", index + 1)),
+        );
     }
     if let Some(hint) = hints.param_hints.get(&param) {
         return hint.clone();
@@ -95,6 +95,16 @@ pub(super) fn choose_local_candidate(
             source: NameSource::LegacyArg,
         };
     }
+    if let Some(name) = evidence
+        .local_debug_names
+        .get(index)
+        .and_then(as_valid_name)
+    {
+        return CandidateHint {
+            text: name,
+            source: NameSource::Debug,
+        };
+    }
     if options.mode == NamingMode::DebugLike {
         let visible_count = ast_facts.debug_like_binding_order.len();
         return mode_fallback_candidate(
@@ -105,16 +115,6 @@ pub(super) fn choose_local_candidate(
                 .unwrap_or(visible_count + index),
             "value".to_owned(),
         );
-    }
-    if let Some(name) = evidence
-        .local_debug_names
-        .get(index)
-        .and_then(as_valid_name)
-    {
-        return CandidateHint {
-            text: name,
-            source: NameSource::Debug,
-        };
     }
     if let Some(hint) = hints.local_hints.get(&local) {
         return hint.clone();
@@ -139,15 +139,6 @@ pub(super) fn choose_upvalue_candidate(
         // 就应该沿用那个绑定在父作用域里已经稳定下来的名字。
         return resolve_captured_name(proto.id, capture, assigned_functions);
     }
-    if options.mode == NamingMode::DebugLike {
-        return Ok(mode_fallback_candidate(
-            options,
-            proto.id,
-            "u",
-            index,
-            "up".to_owned(),
-        ));
-    }
     if let Some(name) = evidence
         .upvalue_debug_names
         .get(index)
@@ -157,6 +148,15 @@ pub(super) fn choose_upvalue_candidate(
             text: name,
             source: NameSource::Debug,
         });
+    }
+    if options.mode == NamingMode::DebugLike {
+        return Ok(mode_fallback_candidate(
+            options,
+            proto.id,
+            "u",
+            index,
+            "up".to_owned(),
+        ));
     }
     Ok(mode_fallback_candidate(
         options,
@@ -177,6 +177,13 @@ pub(super) fn choose_synthetic_local_candidate(
     ast_facts: &FunctionAstNamingFacts,
     options: NamingOptions,
 ) -> CandidateHint {
+    let index = local.index();
+    if let Some(name) = evidence.temp_debug_names.get(index).and_then(as_valid_name) {
+        return CandidateHint {
+            text: name,
+            source: NameSource::Debug,
+        };
+    }
     if options.mode == NamingMode::DebugLike {
         let visible_count = ast_facts.debug_like_binding_order.len();
         return mode_fallback_candidate(
@@ -187,13 +194,6 @@ pub(super) fn choose_synthetic_local_candidate(
                 .unwrap_or(visible_count + proto.locals.len() + synthetic_order),
             "value".to_owned(),
         );
-    }
-    let index = local.index();
-    if let Some(name) = evidence.temp_debug_names.get(index).and_then(as_valid_name) {
-        return CandidateHint {
-            text: name,
-            source: NameSource::Debug,
-        };
     }
     if ast_facts.unused_synthetic_locals.contains(&local) {
         return CandidateHint {

@@ -13,7 +13,7 @@ use crate::debug::{
 };
 use crate::decompile::DecompileDialect;
 
-use super::{LoweredChunk, LoweredProto, RawInstrRef, format_low_instr};
+use super::{DebugLocalKind, LoweredChunk, LoweredProto, RawInstrRef, format_low_instr};
 
 #[derive(Debug, Clone, Copy)]
 struct ProtoEntry<'a> {
@@ -143,7 +143,7 @@ fn write_proto_tree_view(
         let indent = "  ".repeat(entry.depth + 1);
         let _ = writeln!(
             output,
-            "{indent}proto#{} parent={} params={} upvalues={} stack={} instrs={} children={} lines={}..{} source={}",
+            "{indent}proto#{} parent={} params={} upvalues={} stack={} instrs={} children={} lines={}..{} source={} debug-name={}",
             entry.id,
             entry
                 .parent
@@ -156,15 +156,17 @@ fn write_proto_tree_view(
             entry.proto.line_range.defined_start,
             entry.proto.line_range.defined_end,
             format_optional_source(entry.proto),
+            format_optional_raw_string(entry.proto.debug_name.as_ref()),
         );
 
         if matches!(detail, DebugDetail::Verbose) {
             let _ = writeln!(
                 output,
-                "{indent}  raw_instrs={} consts={} low_instrs={}",
+                "{indent}  raw_instrs={} consts={} low_instrs={} debug_locals={}",
                 entry.proto.lowering_map.raw_to_low.len(),
                 entry.proto.constants.common.literals.len(),
                 entry.proto.instrs.len(),
+                entry.proto.debug_locals.len(),
             );
         }
     }
@@ -191,8 +193,31 @@ fn write_lir_listing(output: &mut String, protos: &[ProtoEntry<'_>], plan: &Focu
         }
 
         let _ = writeln!(output, "  proto#{}", entry.id);
+        let _ = writeln!(output, "    debug locals");
+        if entry.proto.debug_locals.is_empty() {
+            let _ = writeln!(output, "      <none>");
+        } else {
+            for (scope, local) in entry.proto.debug_locals.iter().enumerate() {
+                let kind = match local.kind {
+                    DebugLocalKind::Source => "source",
+                    DebugLocalKind::CompilerInternal => "compiler-internal",
+                };
+                let name = local.name.text.as_ref().map_or_else(
+                    || String::from_utf8_lossy(&local.name.bytes).into_owned(),
+                    |text| text.value.to_string(),
+                );
+                let _ = writeln!(
+                    output,
+                    "      scope#{scope} {kind} name={name:?} r{} pc={}..{}",
+                    local.reg.index(),
+                    local.start_pc,
+                    local.end_pc,
+                );
+            }
+        }
+        let _ = writeln!(output, "    instructions");
         if entry.proto.instrs.is_empty() {
-            let _ = writeln!(output, "    <empty>");
+            let _ = writeln!(output, "      <empty>");
             continue;
         }
 
@@ -204,7 +229,7 @@ fn write_lir_listing(output: &mut String, protos: &[ProtoEntry<'_>], plan: &Focu
 
             let _ = writeln!(
                 output,
-                "    @{index:03} {:<60} origin=pc={} raw={} line={}",
+                "      @{index:03} {:<60} origin=pc={} raw={} line={}",
                 format_low_instr(instr),
                 format_pc_list(pcs),
                 format_raw_refs(raws),
@@ -215,9 +240,11 @@ fn write_lir_listing(output: &mut String, protos: &[ProtoEntry<'_>], plan: &Focu
 }
 
 fn format_optional_source(proto: &LoweredProto) -> String {
-    proto
-        .source
-        .as_ref()
+    format_optional_raw_string(proto.source.as_ref())
+}
+
+fn format_optional_raw_string(source: Option<&crate::parser::RawString>) -> String {
+    source
         .and_then(|source| source.text.as_ref())
         .map_or_else(|| "-".to_owned(), |text| format!("{:?}", text.value))
 }

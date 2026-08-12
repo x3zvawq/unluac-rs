@@ -23,18 +23,53 @@ use super::super::common::{
 use super::super::helpers::is_reducible_region;
 
 pub(super) fn prefer_short_circuit_candidate(
+    proto: &LoweredProto,
+    cfg: &Cfg,
     candidate: &ShortCircuitCandidate,
     existing: &ShortCircuitCandidate,
 ) -> bool {
-    short_circuit_candidate_score(candidate) > short_circuit_candidate_score(existing)
+    short_circuit_candidate_score(proto, cfg, candidate)
+        > short_circuit_candidate_score(proto, cfg, existing)
 }
 
-fn short_circuit_candidate_score(candidate: &ShortCircuitCandidate) -> (usize, usize, usize) {
+fn short_circuit_candidate_score(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    candidate: &ShortCircuitCandidate,
+) -> (usize, usize, usize, usize) {
     (
         candidate.blocks.len(),
         candidate.nodes.len(),
+        debug_line_coherence(proto, cfg, candidate),
         usize::MAX - candidate.header.index(),
     )
+}
+
+/// 行号只在两个候选已经通过相同语义校验且覆盖规模相同时参与排序。
+///
+/// 同一源码短路表达式的相邻判断通常共享行号；缺失的行号不产生奖励也不产生惩罚，
+/// 因而不会改变 CFG membership、phi 或 transfer，只替代最后的任意 block-id 裁决。
+fn debug_line_coherence(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    candidate: &ShortCircuitCandidate,
+) -> usize {
+    candidate
+        .nodes
+        .windows(2)
+        .filter(|nodes| {
+            let lhs = block_line_hint(proto, cfg, nodes[0].header);
+            let rhs = block_line_hint(proto, cfg, nodes[1].header);
+            lhs.is_some() && lhs == rhs
+        })
+        .count()
+}
+
+fn block_line_hint(proto: &LoweredProto, cfg: &Cfg, block: BlockRef) -> Option<u32> {
+    let instrs = cfg.blocks.get(block.index())?.instrs;
+    (instrs.start.index()..instrs.end())
+        .rev()
+        .find_map(|index| proto.lowering_map.line_hints.get(index).copied().flatten())
 }
 
 pub(super) struct LinearFollowCtx<'a> {

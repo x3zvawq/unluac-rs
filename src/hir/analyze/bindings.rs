@@ -14,7 +14,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::hir::common::{LocalId, ParamId, TempId, UpvalueId};
-use crate::parser::RawLocalVar;
 use crate::structure::{
     BlockRef, Cfg, DataflowFacts, DefId, GraphFacts, PhiId, PhiIncomingDisposition, PhiPlan,
     SsaValue,
@@ -37,6 +36,12 @@ struct CapturedSlotKey {
     epoch: usize,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct DebugBindingHint {
+    scope: usize,
+    name: String,
+}
+
 impl CapturedSlotKey {
     fn new(slot: usize, epoch: usize) -> Self {
         Self { slot, epoch }
@@ -52,11 +57,17 @@ pub(super) fn build_bindings(
     captured_slot_epochs: &SlotEpochFacts,
     child_mutable_upvalues: &[Vec<bool>],
 ) -> ProtoBindings {
+    let debug_names_by_ssa = debug_names_by_ssa(proto, structure);
     let params = (0..usize::from(proto.signature.num_params))
         .map(ParamId)
         .collect::<Vec<_>>();
     let param_debug_hints = (0..params.len())
-        .map(|reg| debug_local_name_for_reg_at_pc(proto, Reg(reg), 0))
+        .map(|reg| {
+            debug_names_by_ssa
+                .get(&SsaValue::Entry(Reg(reg)))
+                .map(|hint| hint.name.clone())
+                .or_else(|| debug_local_name_for_reg_at_pc(proto, Reg(reg), 0))
+        })
         .collect::<Vec<_>>();
     let upvalues = (0..usize::from(proto.upvalues.common.count))
         .map(UpvalueId)
@@ -93,6 +104,14 @@ pub(super) fn build_bindings(
         }
     }
 
+    let (debug_entry_local_decls, debug_scope_locals) = allocate_debug_entry_locals(
+        proto,
+        structure,
+        &mut entry_local_regs,
+        &mut locals,
+        &mut local_debug_hints,
+    );
+
     let captured_slots = collect_captured_slot_targets(
         CapturedSlotInputs {
             proto,
@@ -118,7 +137,18 @@ pub(super) fn build_bindings(
             Some(LoopSourceBindings::Numeric(reg)) => {
                 let local = LocalId(locals.len());
                 locals.push(local);
-                local_debug_hints.push(None);
+                local_debug_hints.push(
+                    debug_local_name_for_reg_in_blocks(proto, cfg, &body_blocks, reg).or_else(
+                        || {
+                            debug_local_name_for_reg_at_block_entry(
+                                proto,
+                                cfg,
+                                loop_plan.header,
+                                reg,
+                            )
+                        },
+                    ),
+                );
                 numeric_for_locals.insert(loop_plan.header, local);
 
                 for block in &body_blocks {
@@ -133,8 +163,19 @@ pub(super) fn build_bindings(
                 for offset in 0..bindings.len {
                     let local = LocalId(locals.len());
                     locals.push(local);
-                    local_debug_hints.push(None);
                     let reg = crate::transformer::Reg(bindings.start.index() + offset);
+                    local_debug_hints.push(
+                        debug_local_name_for_reg_in_blocks(proto, cfg, &body_blocks, reg).or_else(
+                            || {
+                                debug_local_name_for_reg_at_block_entry(
+                                    proto,
+                                    cfg,
+                                    loop_plan.header,
+                                    reg,
+                                )
+                            },
+                        ),
+                    );
                     locals_for_loop.push(local);
 
                     for block in &body_blocks {
@@ -248,10 +289,12 @@ pub(super) fn build_bindings(
 
     let temps = (0..next_temp_index).map(TempId).collect::<Vec<_>>();
     let mut temp_debug_locals = vec![None; next_temp_index];
+    let mut temp_debug_scopes = vec![None; next_temp_index];
 
     for def in &dataflow.defs {
         let temp = fixed_temps[def.id.index()];
-        temp_debug_locals[temp.index()] = match proto.instrs.get(def.instr.index()) {
+        let instr = proto.instrs.get(def.instr.index());
+        let hint = match instr {
             Some(LowInstr::GetTable(get_table)) if get_table.kind == GetTableKind::Method => None,
             Some(LowInstr::Move(receiver))
                 if matches!(
@@ -263,8 +306,16 @@ pub(super) fn build_bindings(
             {
                 None
             }
-            _ => debug_local_name_for_reg_at_instr(proto, def.reg, def.instr),
+            _ => debug_names_by_ssa
+                .get(&SsaValue::Def(def.id))
+                .cloned()
+                .or_else(|| debug_local_hint_for_reg_at_instr(proto, def.reg, def.instr)),
         };
+        temp_debug_locals[temp.index()] = hint
+            .as_ref()
+            .map(|hint| hint.name.clone())
+            .or_else(|| closure_debug_name(proto, instr));
+        temp_debug_scopes[temp.index()] = hint.map(|hint| hint.scope);
     }
 
     for phi in structure.plan().phis() {
@@ -272,10 +323,26 @@ pub(super) fn build_bindings(
             continue;
         };
         if phi_participates_in_normal_binding(phi) {
-            temp_debug_locals[temp.index()] =
-                debug_local_name_for_reg_at_block_entry(proto, cfg, phi.block, phi.reg);
+            let hint = debug_names_by_ssa
+                .get(&SsaValue::Phi(phi.phi))
+                .cloned()
+                .or_else(|| {
+                    debug_local_hint_for_reg_at_block_entry(proto, cfg, phi.block, phi.reg)
+                });
+            temp_debug_locals[temp.index()] = hint.as_ref().map(|hint| hint.name.clone());
+            temp_debug_scopes[temp.index()] = hint.map(|hint| hint.scope);
         }
     }
+
+    let debug_temp_targets = temp_debug_scopes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, scope)| {
+            let scope = (*scope)?;
+            let local = debug_scope_locals.get(&scope).copied()?;
+            Some((TempId(index), BoundSlotTarget::Local(local)))
+        })
+        .collect::<BTreeMap<_, _>>();
 
     let captured_temp_facts = collect_captured_temp_facts(CapturedTempFactsInput {
         proto,
@@ -311,15 +378,18 @@ pub(super) fn build_bindings(
         upvalue_debug_hints,
         temps,
         temp_debug_locals,
+        temp_debug_scopes,
         fixed_temps,
         phi_temps,
         loop_guard_temps,
         repeat_staged_temps,
         instr_fixed_defs,
+        debug_temp_targets,
         captured_temp_targets: captured_temp_facts.targets,
         captured_temp_decl_locals: captured_temp_facts.decl_temps,
         capture_empty_local_decls: captured_temp_facts.empty_decls,
         capture_entry_local_decls: captured_slots.entry_local_decls,
+        debug_entry_local_decls,
         capture_region_local_decls: captured_slots.region_local_decls,
         closure_capture_targets: captured_slots.capture_targets,
         reference_captured_regs,
@@ -329,6 +399,64 @@ pub(super) fn build_bindings(
         generic_for_locals,
         block_local_regs,
     }
+}
+
+/// 函数入口已经活跃、且没有显式 producer 的源码 local 由 VM 的 nil 初值承载。
+///
+/// 若继续把 `Entry(reg)` 只当作一个普通 nil 值，loop-carried phi 会在循环前才被
+/// `locals` 提升，进而把源码声明错误地移动到前置调用之后。这里直接建立 scope 对应的
+/// `LocalId`，后续同 scope 的 def/phi temp 都写回这个绑定。
+fn allocate_debug_entry_locals(
+    proto: &LoweredProto,
+    structure: &StructureFacts,
+    entry_local_regs: &mut BTreeMap<Reg, LocalId>,
+    locals: &mut Vec<LocalId>,
+    local_debug_hints: &mut Vec<Option<String>>,
+) -> (Vec<LocalId>, BTreeMap<usize, LocalId>) {
+    let param_count = usize::from(proto.signature.num_params);
+    let vararg_reg = proto
+        .signature
+        .has_vararg_param_reg
+        .then_some(Reg(param_count));
+    let mut declarations = Vec::new();
+    let mut scope_locals = BTreeMap::new();
+
+    for fact in &structure.debug_bindings().accepted {
+        let SsaValue::Entry(reg) = fact.value else {
+            continue;
+        };
+        if fact.start_pc != 0 || reg.index() < param_count || Some(reg) == vararg_reg {
+            continue;
+        }
+        let Some(debug_local) = proto.debug_locals.get(fact.scope) else {
+            continue;
+        };
+        let local = if let Some(local) = entry_local_regs.get(&reg).copied() {
+            local
+        } else {
+            let local = LocalId(locals.len());
+            locals.push(local);
+            local_debug_hints.push(Some(decode_raw_string(&debug_local.name)));
+            entry_local_regs.insert(reg, local);
+            declarations.push(local);
+            local
+        };
+        scope_locals.insert(fact.scope, local);
+    }
+
+    (declarations, scope_locals)
+}
+
+fn closure_debug_name(proto: &LoweredProto, instr: Option<&LowInstr>) -> Option<String> {
+    let LowInstr::Closure(closure) = instr? else {
+        return None;
+    };
+    proto
+        .children
+        .get(closure.proto.index())?
+        .debug_name
+        .as_ref()
+        .map(decode_raw_string)
 }
 
 #[derive(Clone, Copy)]
@@ -1515,13 +1643,21 @@ fn debug_local_name_for_reg_at_instr(
     reg: Reg,
     instr: InstrRef,
 ) -> Option<String> {
+    debug_local_hint_for_reg_at_instr(proto, reg, instr).map(|hint| hint.name)
+}
+
+fn debug_local_hint_for_reg_at_instr(
+    proto: &LoweredProto,
+    reg: Reg,
+    instr: InstrRef,
+) -> Option<DebugBindingHint> {
     let pc = proto
         .lowering_map
         .pc_map
         .get(instr.index())?
         .first()
         .copied()?;
-    debug_local_name_for_reg_at_pc(proto, reg, pc)
+    debug_local_hint_for_reg_at_pc(proto, reg, pc)
 }
 
 fn debug_local_name_for_reg_at_block_entry(
@@ -1530,40 +1666,82 @@ fn debug_local_name_for_reg_at_block_entry(
     block: crate::structure::BlockRef,
     reg: Reg,
 ) -> Option<String> {
+    debug_local_hint_for_reg_at_block_entry(proto, cfg, block, reg).map(|hint| hint.name)
+}
+
+fn debug_local_hint_for_reg_at_block_entry(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    block: crate::structure::BlockRef,
+    reg: Reg,
+) -> Option<DebugBindingHint> {
     let instrs = cfg.blocks[block.index()].instrs;
     if instrs.is_empty() {
         return None;
     }
     let instr = instrs.start;
-    debug_local_name_for_reg_at_instr(proto, reg, instr)
+    debug_local_hint_for_reg_at_instr(proto, reg, instr)
+}
+
+fn debug_local_name_for_reg_in_blocks(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    blocks: &BTreeSet<BlockRef>,
+    reg: Reg,
+) -> Option<String> {
+    blocks
+        .iter()
+        .filter_map(|block| {
+            let instr = cfg.blocks[block.index()].instrs.start;
+            let pc = proto
+                .lowering_map
+                .pc_map
+                .get(instr.index())?
+                .first()
+                .copied()?;
+            Some((pc, *block))
+        })
+        .min_by_key(|(pc, block)| (*pc, *block))
+        .and_then(|(_, block)| debug_local_name_for_reg_at_block_entry(proto, cfg, block, reg))
 }
 
 fn debug_local_name_for_reg_at_pc(proto: &LoweredProto, reg: Reg, pc: u32) -> Option<String> {
-    if let Some(extra) = proto.debug_info.extra.luau()
-        && !extra.local_regs.is_empty()
-    {
-        return proto
-            .debug_info
-            .common
-            .local_vars
-            .iter()
-            .zip(extra.local_regs.iter().copied())
-            .find_map(|(local, local_reg)| {
-                (debug_local_is_active_at_pc(local, pc) && usize::from(local_reg) == reg.index())
-                    .then(|| decode_raw_string(&local.name))
-            });
-    }
-
-    proto
-        .debug_info
-        .common
-        .local_vars
-        .iter()
-        .filter(|local| debug_local_is_active_at_pc(local, pc))
-        .nth(reg.index())
-        .map(|local| decode_raw_string(&local.name))
+    debug_local_hint_for_reg_at_pc(proto, reg, pc).map(|hint| hint.name)
 }
 
-fn debug_local_is_active_at_pc(local: &RawLocalVar, pc: u32) -> bool {
-    local.start_pc <= pc && pc < local.end_pc
+fn debug_local_hint_for_reg_at_pc(
+    proto: &LoweredProto,
+    reg: Reg,
+    pc: u32,
+) -> Option<DebugBindingHint> {
+    proto
+        .debug_locals
+        .iter()
+        .enumerate()
+        .find(|(_, local)| local.is_source() && local.reg == reg && local.is_active_at(pc))
+        .map(|(scope, local)| DebugBindingHint {
+            scope,
+            name: decode_raw_string(&local.name),
+        })
+}
+
+fn debug_names_by_ssa(
+    proto: &LoweredProto,
+    structure: &StructureFacts,
+) -> BTreeMap<SsaValue, DebugBindingHint> {
+    structure
+        .debug_bindings()
+        .accepted
+        .iter()
+        .filter_map(|fact| {
+            let local = proto.debug_locals.get(fact.scope)?;
+            local.is_source().then_some((
+                fact.value,
+                DebugBindingHint {
+                    scope: fact.scope,
+                    name: decode_raw_string(&local.name),
+                },
+            ))
+        })
+        .collect()
 }

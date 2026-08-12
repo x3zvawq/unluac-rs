@@ -435,29 +435,76 @@ impl TemplateBuilder<'_, '_> {
 
         let closure = closure_at(self.proto, instr_ref)?;
         let origin = self.proto.children.get(closure.proto.index())?.origin;
-        let mut captures = Vec::with_capacity(closure.captures.len());
-        for capture in &closure.captures {
-            let template_capture = match capture.source {
-                CaptureSource::Upvalue(upvalue) => {
-                    self.outer_upvalues.insert(upvalue);
-                    TemplateCapture::Outer(upvalue)
-                }
-                CaptureSource::ByReference(_) => return None,
-                CaptureSource::ByValue(reg) if reg == closure.dst => return None,
-                CaptureSource::ByValue(reg) => {
-                    let value = self.dataflow.use_value(instr_ref, reg);
-                    let dependency = self.resolve_capture_value(value)?;
-                    TemplateCapture::Dependency(self.build_node(dependency)?)
-                }
-            };
-            captures.push(template_capture);
+        struct BuildFrame {
+            instr_ref: InstrRef,
+            origin: Origin,
+            next_capture: usize,
+            captures: Vec<TemplateCapture>,
         }
 
-        self.visiting.remove(&instr_ref);
-        let node = CompositeNodeRef(self.nodes.len());
-        self.nodes.push(TemplateNode { origin, captures });
-        self.node_by_instr.insert(instr_ref, node);
-        Some(node)
+        // 父 frame 保留到依赖完成后再接收 node ref，使 capture 顺序和 node 后序编号
+        // 与递归 DFS 相同；visiting 则覆盖整个 frame 生命周期以拒绝环。
+        let mut stack = vec![BuildFrame {
+            instr_ref,
+            origin,
+            next_capture: 0,
+            captures: Vec::with_capacity(closure.captures.len()),
+        }];
+        loop {
+            let frame = stack.last_mut()?;
+            let closure = closure_at(self.proto, frame.instr_ref)?;
+            let Some(capture) = closure.captures.get(frame.next_capture) else {
+                let frame = stack.pop()?;
+                self.visiting.remove(&frame.instr_ref);
+                let node = CompositeNodeRef(self.nodes.len());
+                self.nodes.push(TemplateNode {
+                    origin: frame.origin,
+                    captures: frame.captures,
+                });
+                self.node_by_instr.insert(frame.instr_ref, node);
+                if let Some(parent) = stack.last_mut() {
+                    parent.captures.push(TemplateCapture::Dependency(node));
+                    continue;
+                }
+                return Some(node);
+            };
+
+            let capture_source = capture.source;
+            let closure_dst = closure.dst;
+            let current_instr = frame.instr_ref;
+            frame.next_capture += 1;
+            match capture_source {
+                CaptureSource::Upvalue(upvalue) => {
+                    self.outer_upvalues.insert(upvalue);
+                    frame.captures.push(TemplateCapture::Outer(upvalue));
+                }
+                CaptureSource::ByReference(_) => return None,
+                CaptureSource::ByValue(reg) if reg == closure_dst => return None,
+                CaptureSource::ByValue(reg) => {
+                    let value = self.dataflow.use_value(current_instr, reg);
+                    let dependency = self.resolve_capture_value(value)?;
+                    if let Some(node) = self.node_by_instr.get(&dependency) {
+                        frame.captures.push(TemplateCapture::Dependency(*node));
+                        continue;
+                    }
+                    if !self.visiting.insert(dependency) {
+                        return None;
+                    }
+                    let dependency_closure = closure_at(self.proto, dependency)?;
+                    let dependency_origin = self
+                        .proto
+                        .children
+                        .get(dependency_closure.proto.index())?
+                        .origin;
+                    stack.push(BuildFrame {
+                        instr_ref: dependency,
+                        origin: dependency_origin,
+                        next_capture: 0,
+                        captures: Vec::with_capacity(dependency_closure.captures.len()),
+                    });
+                }
+            }
+        }
     }
 
     fn resolve_capture_value(&mut self, value: SsaValue) -> Option<InstrRef> {
@@ -616,88 +663,137 @@ impl ComponentMatcher<'_> {
         generation: usize,
         canonical_moves: &mut CanonicalMoveIndex<'_>,
     ) -> Option<()> {
-        if *instance_generations.get(node.index())? == generation {
-            return (instance_nodes[node.index()] == instr_ref).then_some(());
+        enum MatchFrame {
+            Enter {
+                node: CompositeNodeRef,
+                instr_ref: InstrRef,
+            },
+            Captures {
+                node: CompositeNodeRef,
+                instr_ref: InstrRef,
+                next_capture: usize,
+            },
         }
-        instance_nodes[node.index()] = instr_ref;
-        instance_generations[node.index()] = generation;
 
-        let closure = closure_at(self.proto, instr_ref)?;
-        let ClosureCreation::Reusable(shared) = closure.creation else {
-            return None;
-        };
-        let group = self.groups.get(&shared)?;
-        if !group.consistent_proto
-            || self.proto.children.get(closure.proto.index())?.origin
-                != self.template.nodes.get(node.0)?.origin
-        {
-            return None;
-        }
-        match self.node_groups[node.0] {
-            None => self.node_groups[node.0] = Some(shared),
-            Some(existing) if existing == shared => {}
-            Some(_) => return None,
-        }
-        match self.group_nodes.get(&shared) {
-            None => {
-                self.group_nodes.insert(shared, node);
-            }
-            Some(existing) if *existing == node => {}
-            Some(_) => return None,
-        }
-        let template_captures = &self.template.nodes[node.0].captures;
-        if closure.captures.len() != template_captures.len() {
-            return None;
-        }
-        for (capture, template_capture) in closure.captures.iter().zip(template_captures) {
-            match *template_capture {
-                TemplateCapture::Outer(upvalue) => {
-                    let owner_source = self.owner_closure.captures.get(upvalue.index())?.source;
-                    if capture_identity(
-                        owner_source,
-                        self.owner_instr,
-                        self.dataflow,
-                        canonical_moves,
-                    )? != capture_identity(
-                        capture.source,
+        // dependency 前先压入父 capture 续点，确保 expected use 在下潜前登记，
+        // node occurrence 仍只在全部 capture 验证完成后登记。
+        let mut stack = vec![MatchFrame::Enter { node, instr_ref }];
+        while let Some(frame) = stack.pop() {
+            match frame {
+                MatchFrame::Enter { node, instr_ref } => {
+                    if *instance_generations.get(node.index())? == generation {
+                        if instance_nodes[node.index()] != instr_ref {
+                            return None;
+                        }
+                        continue;
+                    }
+                    instance_nodes[node.index()] = instr_ref;
+                    instance_generations[node.index()] = generation;
+
+                    let closure = closure_at(self.proto, instr_ref)?;
+                    let ClosureCreation::Reusable(shared) = closure.creation else {
+                        return None;
+                    };
+                    let group = self.groups.get(&shared)?;
+                    if !group.consistent_proto
+                        || self.proto.children.get(closure.proto.index())?.origin
+                            != self.template.nodes.get(node.0)?.origin
+                    {
+                        return None;
+                    }
+                    match self.node_groups[node.0] {
+                        None => self.node_groups[node.0] = Some(shared),
+                        Some(existing) if existing == shared => {}
+                        Some(_) => return None,
+                    }
+                    match self.group_nodes.get(&shared) {
+                        None => {
+                            self.group_nodes.insert(shared, node);
+                        }
+                        Some(existing) if *existing == node => {}
+                        Some(_) => return None,
+                    }
+                    if closure.captures.len() != self.template.nodes[node.0].captures.len() {
+                        return None;
+                    }
+                    stack.push(MatchFrame::Captures {
+                        node,
                         instr_ref,
-                        self.dataflow,
-                        canonical_moves,
-                    )? {
-                        return None;
-                    }
+                        next_capture: 0,
+                    });
                 }
-                TemplateCapture::Dependency(dependency) => {
-                    let CaptureSource::ByValue(reg) = capture.source else {
-                        return None;
+                MatchFrame::Captures {
+                    node,
+                    instr_ref,
+                    next_capture,
+                } => {
+                    let closure = closure_at(self.proto, instr_ref)?;
+                    let Some(capture) = closure.captures.get(next_capture) else {
+                        self.node_occurrences[node.index()].insert(instr_ref);
+                        continue;
                     };
-                    if reg == closure.dst {
-                        return None;
+                    let template_capture = *self
+                        .template
+                        .nodes
+                        .get(node.index())?
+                        .captures
+                        .get(next_capture)?;
+                    match template_capture {
+                        TemplateCapture::Outer(upvalue) => {
+                            let owner_source =
+                                self.owner_closure.captures.get(upvalue.index())?.source;
+                            if capture_identity(
+                                owner_source,
+                                self.owner_instr,
+                                self.dataflow,
+                                canonical_moves,
+                            )? != capture_identity(
+                                capture.source,
+                                instr_ref,
+                                self.dataflow,
+                                canonical_moves,
+                            )? {
+                                return None;
+                            }
+                            stack.push(MatchFrame::Captures {
+                                node,
+                                instr_ref,
+                                next_capture: next_capture + 1,
+                            });
+                        }
+                        TemplateCapture::Dependency(dependency) => {
+                            let CaptureSource::ByValue(reg) = capture.source else {
+                                return None;
+                            };
+                            if reg == closure.dst {
+                                return None;
+                            }
+                            let SsaValue::Def(def) = self.dataflow.use_value(instr_ref, reg) else {
+                                return None;
+                            };
+                            let dependency_instr = self.dataflow.def_instr(def);
+                            let dependency_closure = closure_at(self.proto, dependency_instr)?;
+                            if dependency_closure.dst != self.dataflow.def_reg(def) {
+                                return None;
+                            }
+                            self.expected_dependency_uses
+                                .entry(dependency_instr)
+                                .or_default()
+                                .insert((instr_ref, reg));
+                            stack.push(MatchFrame::Captures {
+                                node,
+                                instr_ref,
+                                next_capture: next_capture + 1,
+                            });
+                            stack.push(MatchFrame::Enter {
+                                node: dependency,
+                                instr_ref: dependency_instr,
+                            });
+                        }
                     }
-                    let SsaValue::Def(def) = self.dataflow.use_value(instr_ref, reg) else {
-                        return None;
-                    };
-                    let dependency_instr = self.dataflow.def_instr(def);
-                    let dependency_closure = closure_at(self.proto, dependency_instr)?;
-                    if dependency_closure.dst != self.dataflow.def_reg(def) {
-                        return None;
-                    }
-                    self.expected_dependency_uses
-                        .entry(dependency_instr)
-                        .or_default()
-                        .insert((instr_ref, reg));
-                    self.match_node(
-                        dependency,
-                        dependency_instr,
-                        instance_nodes,
-                        instance_generations,
-                        generation,
-                        canonical_moves,
-                    )?;
                 }
             }
         }
-        self.node_occurrences[node.index()].insert(instr_ref);
         Some(())
     }
 }

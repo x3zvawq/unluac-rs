@@ -559,10 +559,7 @@ impl InlineSite {
 
         match policy {
             InlinePolicy::Conservative => match candidate.origin() {
-                super::super::super::common::AstLocalOrigin::DebugHinted => {
-                    matches!(self, Self::CallCallee | Self::AccessBase)
-                        && is_access_base_inline_expr(replacement)
-                }
+                super::super::super::common::AstLocalOrigin::DebugHinted => false,
                 super::super::super::common::AstLocalOrigin::Recovered => match self {
                     Self::CallCallee | Self::AccessBase => {
                         is_access_base_inline_expr(replacement)

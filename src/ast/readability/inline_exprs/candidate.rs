@@ -89,14 +89,11 @@ impl InlineCandidate {
     }
 
     pub(super) fn allows_expr_with_policy(self, expr: &AstExpr, policy: InlinePolicy) -> bool {
-        // 这里故意不把普通 local 别名放宽到所有上下文：
-        // 没有 debug 证据时，我们不能把用户可能主动写出来的局部语义名随手吞掉。
-        // 目前只允许它们作为“前缀表达式别名”收回去，例如 `local concat = table.concat`。
+        // debug local 明确表示源码中存在该 binding；把它内联掉会同时丢失名字和
+        // 生命周期证据。编译器内部 for 槽已经在 Transformer 归一化时排除，因而这里
+        // 可以完整保护 DebugHinted，普通 recovered alias 则继续按上下文收敛。
         match self.origin {
-            AstLocalOrigin::DebugHinted => match policy {
-                InlinePolicy::MechanicalRun => is_mechanical_run_inline_expr(expr),
-                _ => is_access_base_inline_expr(expr),
-            },
+            AstLocalOrigin::DebugHinted => false,
             AstLocalOrigin::Recovered => match policy {
                 InlinePolicy::MechanicalRun => is_mechanical_run_inline_expr(expr),
                 InlinePolicy::AdjacentCallResultCallee => is_lookup_inline_expr(expr),

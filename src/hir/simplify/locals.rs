@@ -59,14 +59,17 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     let mut new_locals = Vec::new();
     let mut new_local_debug_hints = Vec::new();
     let mut promoted_home_slots = Vec::new();
+    let mut debug_scope_locals = BTreeMap::new();
     let result = {
         let mut ctx = PromotionCtx {
             facts,
             temp_debug_locals: &proto.temp_debug_locals,
+            temp_debug_scopes: &proto.temp_debug_scopes,
             next_local_index: &mut next_local_index,
             new_locals: &mut new_locals,
             new_local_debug_hints: &mut new_local_debug_hints,
             promoted_home_slots: &mut promoted_home_slots,
+            debug_scope_locals: &mut debug_scope_locals,
             compact_home_slots,
         };
         let empty_mapping = Rc::new(BTreeMap::new());
@@ -126,15 +129,18 @@ struct PromotionGroup {
 struct PromotionCtx<'a> {
     facts: &'a ProtoPromotionFacts,
     temp_debug_locals: &'a [Option<String>],
+    temp_debug_scopes: &'a [Option<usize>],
     next_local_index: &'a mut usize,
     new_locals: &'a mut Vec<LocalId>,
     new_local_debug_hints: &'a mut Vec<Option<String>>,
     promoted_home_slots: &'a mut Vec<(LocalId, HomeSlotKey)>,
+    debug_scope_locals: &'a mut BTreeMap<(HomeSlotKey, usize), LocalId>,
     compact_home_slots: bool,
 }
 
 struct PlanAllocator<'a> {
     temp_debug_locals: &'a [Option<String>],
+    temp_debug_scopes: &'a [Option<usize>],
     plans: &'a mut Vec<PromotionPlan>,
     reserved_temps: &'a mut BTreeSet<TempId>,
     reserved_alias_indices: &'a mut BTreeSet<usize>,
@@ -142,6 +148,7 @@ struct PlanAllocator<'a> {
     new_locals: &'a mut Vec<LocalId>,
     new_local_debug_hints: &'a mut Vec<Option<String>>,
     promoted_home_slots: &'a mut Vec<(LocalId, HomeSlotKey)>,
+    debug_scope_locals: &'a mut BTreeMap<(HomeSlotKey, usize), LocalId>,
 }
 
 impl PlanAllocator<'_> {
@@ -160,6 +167,9 @@ impl PlanAllocator<'_> {
             .push(debug_hint_for_temp_group(self.temp_debug_locals, &temps));
         if let Some(home_slot) = home_slot {
             self.promoted_home_slots.push((local, home_slot));
+            if let Some(scope) = debug_scope_for_temp_group(self.temp_debug_scopes, &temps) {
+                self.debug_scope_locals.insert((home_slot, scope), local);
+            }
         }
         self.reserved_temps.extend(temps.iter().copied());
         self.reserved_alias_indices
@@ -355,6 +365,7 @@ fn collect_plans(
 
     let facts = ctx.facts;
     let temp_debug_locals = ctx.temp_debug_locals;
+    let temp_debug_scopes = ctx.temp_debug_scopes;
     let mut plans = Vec::new();
     let temp_touches = TempTouchIndex::new(stmt_temp_refs);
     let mut reserved_temps = BTreeSet::new();
@@ -409,7 +420,11 @@ fn collect_plans(
         let sticky_local = facts
             .home_slot(root_temp)
             .and_then(|slot| sticky_slots.get(&slot).copied());
-        let reusable_local = sticky_local.or_else(|| {
+        let debug_local = facts.home_slot(root_temp).and_then(|slot| {
+            debug_scope_for_temp_group(temp_debug_scopes, &group)
+                .and_then(|scope| ctx.debug_scope_locals.get(&(slot, scope)).copied())
+        });
+        let reusable_local = sticky_local.or(debug_local).or_else(|| {
             ctx.compact_home_slots
                 .then(|| {
                     facts
@@ -452,6 +467,7 @@ fn collect_plans(
 
         let mut allocator = PlanAllocator {
             temp_debug_locals,
+            temp_debug_scopes,
             plans: &mut plans,
             reserved_temps: &mut reserved_temps,
             reserved_alias_indices: &mut reserved_alias_indices,
@@ -459,6 +475,7 @@ fn collect_plans(
             new_locals: ctx.new_locals,
             new_local_debug_hints: ctx.new_local_debug_hints,
             promoted_home_slots: ctx.promoted_home_slots,
+            debug_scope_locals: ctx.debug_scope_locals,
         };
         if let Some(local) = reusable_local {
             allocator.reuse_existing_local(
@@ -499,6 +516,7 @@ fn collect_plans(
             }
             let mut allocator = PlanAllocator {
                 temp_debug_locals,
+                temp_debug_scopes,
                 plans: &mut plans,
                 reserved_temps: &mut reserved_temps,
                 reserved_alias_indices: &mut reserved_alias_indices,
@@ -506,13 +524,23 @@ fn collect_plans(
                 new_locals: ctx.new_locals,
                 new_local_debug_hints: ctx.new_local_debug_hints,
                 promoted_home_slots: ctx.promoted_home_slots,
+                debug_scope_locals: ctx.debug_scope_locals,
             };
             if let Some(local) = facts.home_slot(temp).and_then(|slot| {
-                sticky_slots.get(&slot).copied().or_else(|| {
-                    ctx.compact_home_slots
-                        .then(|| slot_candidates.get(&slot).copied())
-                        .flatten()
-                })
+                sticky_slots
+                    .get(&slot)
+                    .copied()
+                    .or_else(|| {
+                        debug_scope_for_temp_group(temp_debug_scopes, &BTreeSet::from([temp]))
+                            .and_then(|scope| {
+                                allocator.debug_scope_locals.get(&(slot, scope)).copied()
+                            })
+                    })
+                    .or_else(|| {
+                        ctx.compact_home_slots
+                            .then(|| slot_candidates.get(&slot).copied())
+                            .flatten()
+                    })
             }) {
                 allocator.reuse_existing_local(
                     decl_index,
@@ -910,4 +938,15 @@ fn debug_hint_for_temp_group(
     temps
         .iter()
         .find_map(|temp| temp_debug_locals.get(temp.index()).cloned().flatten())
+}
+
+fn debug_scope_for_temp_group(
+    temp_debug_scopes: &[Option<usize>],
+    temps: &BTreeSet<TempId>,
+) -> Option<usize> {
+    let mut scopes = temps
+        .iter()
+        .filter_map(|temp| temp_debug_scopes.get(temp.index()).copied().flatten());
+    let scope = scopes.next()?;
+    scopes.all(|candidate| candidate == scope).then_some(scope)
 }

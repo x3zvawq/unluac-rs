@@ -172,27 +172,29 @@ impl<'a> Emitter<'a> {
             return None;
         }
 
-        let file_name = self
-            .metadata
-            .and_then(|metadata| metadata.chunk.file_name.as_deref())
-            .map(sanitize_comment_text)
-            .unwrap_or_else(|| "<unknown>".to_owned());
         let encoding = self
             .metadata
             .map(|metadata| metadata.chunk.encoding.as_str())
             .unwrap_or("unknown");
-        Some(Doc::join(
-            [
-                Doc::text(format!("-- file: {file_name}")),
-                Doc::text(format!(
-                    "-- dialect: {}",
-                    <&'static str>::from(self.target.version)
-                )),
-                Doc::text(format!("-- encoding: {encoding}")),
-                Doc::text("-- decompiled by unluac-rs"),
-            ],
-            Doc::line(),
-        ))
+        let mut comments = Vec::with_capacity(4);
+        if let Some(file_name) = self
+            .metadata
+            .and_then(|metadata| metadata.chunk.file_name.as_deref())
+        {
+            comments.push(Doc::text(format!(
+                "-- file: {}",
+                sanitize_comment_text(file_name)
+            )));
+        }
+        comments.extend([
+            Doc::text(format!(
+                "-- dialect: {}",
+                <&'static str>::from(self.target.version)
+            )),
+            Doc::text(format!("-- encoding: {encoding}")),
+            Doc::text("-- decompiled by unluac-rs"),
+        ]);
+        Some(Doc::join(comments, Doc::line()))
     }
 
     fn emit_function_comment(&self, function: HirProtoRef) -> Option<Doc> {
@@ -220,16 +222,15 @@ impl<'a> Emitter<'a> {
             proto_meta.push_str(&sanitize_comment_text(source));
         }
 
-        Some(Doc::join(
-            [
-                Doc::text(format!(
-                    "-- line {}-{}",
-                    metadata.line_range.defined_start, metadata.line_range.defined_end
-                )),
-                Doc::text(proto_meta),
-            ],
-            Doc::line(),
-        ))
+        let mut comments = Vec::with_capacity(2);
+        if metadata.line_range.defined_start != 0 || metadata.line_range.defined_end != 0 {
+            comments.push(Doc::text(format!(
+                "-- line {}-{}",
+                metadata.line_range.defined_start, metadata.line_range.defined_end
+            )));
+        }
+        comments.push(Doc::text(proto_meta));
+        Some(Doc::join(comments, Doc::line()))
     }
 
     fn emit_stmt_separator(&self, prev: &crate::ast::AstStmt, next: &crate::ast::AstStmt) -> Doc {

@@ -1,7 +1,8 @@
 //! Structure 阶段的共享调试输出。
 //!
-//! dump 只展示已经冻结的 `StructurePlan`。候选是构建 plan 的临时 evidence，若继续把
-//! 它们和最终 owner 并排打印，排错时就无法分辨 HIR 实际消费的是哪一套事实。
+//! dump 只展示已经冻结的 `StructurePlan` 与 `DebugBindingFacts`。候选是构建 plan 的
+//! 临时 evidence，若继续把它们和最终 owner 并排打印，排错时就无法分辨 HIR 实际
+//! 消费的是哪一套事实。
 
 use std::fmt::Write as _;
 
@@ -144,7 +145,7 @@ fn dump_structure_facts(
             .count();
         let _ = writeln!(
             output,
-            "{indent}proto#{} regions={} branches={} loops={} conditions={} islands={} labels={} edges={} phis={} scopes={} requirements={}",
+            "{indent}proto#{} regions={} branches={} loops={} conditions={} islands={} labels={} edges={} phis={} scopes={} debug-bindings={} debug-conflicts={} requirements={}",
             entry.id,
             plan.regions.len(),
             plan.branches.len(),
@@ -155,6 +156,8 @@ fn dump_structure_facts(
             plan.edge_plans.len(),
             plan.phis.len(),
             plan.scopes.len(),
+            entry.facts.debug_bindings.accepted.len(),
+            entry.facts.debug_bindings.conflicts.len(),
             plan.requirements.entries.len(),
         );
         if matches!(detail, DebugDetail::Summary) {
@@ -163,6 +166,9 @@ fn dump_structure_facts(
 
         let _ = writeln!(output, "{indent}  region tree");
         write_region(&mut output, &indent, plan, plan.root(), 2, "root");
+
+        let _ = writeln!(output, "{indent}  debug binding facts");
+        write_debug_bindings(&mut output, &indent, entry.facts);
 
         let _ = writeln!(output, "{indent}  block terminators");
         write_block_terminators(&mut output, &indent, plan);
@@ -193,6 +199,37 @@ fn dump_structure_facts(
     }
 
     colorize_debug_text(&output, color)
+}
+
+fn write_debug_bindings(output: &mut String, indent: &str, facts: &StructureFacts) {
+    if facts.debug_bindings.accepted.is_empty() && facts.debug_bindings.conflicts.is_empty() {
+        let _ = writeln!(output, "{indent}    <none>");
+        return;
+    }
+    for binding in &facts.debug_bindings.accepted {
+        let _ = writeln!(
+            output,
+            "{indent}    scope#{} source r{} pc={}..{} -> {}",
+            binding.scope,
+            binding.reg.index(),
+            binding.start_pc,
+            binding.end_pc,
+            binding.value,
+        );
+    }
+    for conflict in &facts.debug_bindings.conflicts {
+        let scopes = conflict
+            .scopes
+            .iter()
+            .map(|scope| format!("scope#{scope}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            output,
+            "{indent}    ignored conflict value={} scopes=[{}]",
+            conflict.value, scopes,
+        );
+    }
 }
 
 fn write_value_decisions(output: &mut String, indent: &str, plan: &super::StructurePlan) {
