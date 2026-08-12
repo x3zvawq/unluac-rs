@@ -23,7 +23,9 @@ pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<Inline
         HirStmt::CallStmt(call_stmt) => {
             find_site_in_call(&call_stmt.call, temp, InlineSite::Direct)
         }
-        HirStmt::Return(ret) => find_site_in_exprs(&ret.values, temp, InlineSite::ReturnValue),
+        HirStmt::Return(ret) => direct_fastcall_expr(&ret.values)
+            .and_then(|call| find_site_in_call(call, temp, InlineSite::Direct))
+            .or_else(|| find_site_in_exprs(&ret.values, temp, InlineSite::ReturnValue)),
         HirStmt::If(if_stmt) => find_site_in_expr(&if_stmt.cond, temp, InlineSite::Condition),
         HirStmt::While(while_stmt) => {
             find_site_in_expr(&while_stmt.cond, temp, InlineSite::LoopCondition)
@@ -90,6 +92,24 @@ fn direct_call_expr(values: &crate::hir::common::HirValuePack) -> Option<&HirCal
         HirExpr::Call(call) => Some(call),
         _ => None,
     }
+}
+
+fn direct_fastcall_expr(values: &crate::hir::common::HirValuePack) -> Option<&HirCallExpr> {
+    direct_call_expr(values).filter(|call| call.fastcall.is_some())
+}
+
+pub(super) fn fastcall_callee_materialization_precedes_temp(stmt: &HirStmt, temp: TempId) -> bool {
+    let call = match stmt {
+        HirStmt::CallStmt(call_stmt) => &call_stmt.call,
+        HirStmt::Return(ret) => {
+            let Some(call) = direct_fastcall_expr(&ret.values) else {
+                return false;
+            };
+            call
+        }
+        _ => return false,
+    };
+    call.fastcall.is_some() && call.args.iter().any(|arg| expr_touches_temp(arg, temp))
 }
 
 pub(super) fn temp_precedes_observable_eval_in_stmt(
@@ -217,6 +237,22 @@ impl EvalOrderProbe<'_> {
     }
 
     fn call(&self, call: &HirCallExpr) -> bool {
+        if let Some(fastcall) = call.fastcall {
+            if expr_touches_temp(&call.callee, self.temp) {
+                return self.expr(&call.callee);
+            }
+            for (index, arg) in call.args.fixed.iter().enumerate() {
+                if expr_touches_temp(arg, self.temp) {
+                    return fastcall.fixed_is_direct(index) && self.expr(arg);
+                }
+            }
+            if let Some(tail) = &call.args.tail
+                && expr_touches_temp(tail.as_expr(), self.temp)
+            {
+                return fastcall.tail_is_direct() && self.expr(tail.as_expr());
+            }
+            return false;
+        }
         self.exprs(std::iter::once(&call.callee).chain(&call.args))
     }
 
@@ -310,12 +346,68 @@ fn find_site_in_exprs<'a>(
 
 fn find_site_in_call(call: &HirCallExpr, temp: TempId, site: InlineSite) -> Option<InlineSite> {
     let callee_site = if matches!(site, InlineSite::Direct) {
-        InlineSite::CallCallee
+        if call.fastcall.is_some() {
+            InlineSite::FastCallCallee
+        } else {
+            InlineSite::CallCallee
+        }
     } else {
         InlineSite::Nested
     };
-    find_site_in_expr(&call.callee, temp, callee_site)
-        .or_else(|| find_site_in_exprs(&call.args, temp, InlineSite::CallArg))
+    find_site_in_expr(&call.callee, temp, callee_site).or_else(|| {
+        if let Some(fastcall) = call.fastcall {
+            for (index, arg) in call.args.fixed.iter().enumerate() {
+                if let Some(site) = if fastcall.fixed_is_direct(index) {
+                    find_site_in_fastcall_arg(arg, temp, InlineSite::FastCallArg)
+                } else {
+                    find_site_in_expr(arg, temp, InlineSite::CallArg)
+                } {
+                    return Some(site);
+                }
+            }
+            call.args.tail.as_ref().and_then(|tail| {
+                if fastcall.tail_is_direct() {
+                    find_site_in_fastcall_arg(tail.as_expr(), temp, InlineSite::FastCallArg)
+                } else {
+                    find_site_in_expr(tail.as_expr(), temp, InlineSite::CallArg)
+                }
+            })
+        } else {
+            find_site_in_exprs(&call.args, temp, InlineSite::CallArg)
+        }
+    })
+}
+
+fn find_site_in_fastcall_arg(
+    expr: &HirExpr,
+    temp: TempId,
+    direct_site: InlineSite,
+) -> Option<InlineSite> {
+    find_site_in_expr_with_fastcall_context(expr, temp, direct_site)
+}
+
+fn find_site_in_expr_with_fastcall_context(
+    expr: &HirExpr,
+    temp: TempId,
+    direct_site: InlineSite,
+) -> Option<InlineSite> {
+    match expr {
+        HirExpr::Call(call) => find_site_in_call(call, temp, InlineSite::Direct),
+        HirExpr::Unary(unary) => {
+            find_site_in_expr_with_fastcall_context(&unary.expr, temp, direct_site)
+        }
+        HirExpr::Binary(binary) => {
+            find_site_in_expr_with_fastcall_context(&binary.lhs, temp, direct_site)
+                .or_else(|| find_site_in_expr_with_fastcall_context(&binary.rhs, temp, direct_site))
+        }
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            find_site_in_expr_with_fastcall_context(&logical.lhs, temp, direct_site).or_else(|| {
+                find_site_in_expr_with_fastcall_context(&logical.rhs, temp, direct_site)
+            })
+        }
+        // 表构造、表访问与 decision arm 会建立独立求值域，只有纯包装节点继承外层 FASTCALL 参数协议。
+        _ => find_site_in_expr(expr, temp, direct_site),
+    }
 }
 
 fn find_site_in_lvalue(lvalue: &HirLValue, temp: TempId, site: InlineSite) -> Option<InlineSite> {
@@ -507,7 +599,9 @@ pub(super) enum InlineSite {
     ReturnValue,
     Index,
     CallArg,
+    FastCallArg,
     CallCallee,
+    FastCallCallee,
     AccessBase,
     Condition,
     LoopCondition,
@@ -518,7 +612,7 @@ impl InlineSite {
     pub(super) fn allows(self, replacement: &HirExpr, options: ReadabilityOptions) -> bool {
         match self {
             Self::Direct => true,
-            Self::CallCallee => true,
+            Self::CallCallee | Self::FastCallCallee => true,
             Self::Nested => {
                 expr_complexity(replacement) <= NESTED_INLINE_MAX_COMPLEXITY
                     && is_small_pure_nested_inline_expr(replacement)
@@ -533,7 +627,7 @@ impl InlineSite {
             Self::Condition | Self::LoopCondition | Self::LoopHead => {
                 expr_complexity(replacement) <= CONTROL_HEAD_INLINE_MAX_COMPLEXITY
             }
-            Self::ReturnValue | Self::Index | Self::CallArg => self
+            Self::ReturnValue | Self::Index | Self::CallArg | Self::FastCallArg => self
                 .complexity_limit(options)
                 .is_some_and(|limit| expr_complexity(replacement) <= limit),
         }
@@ -544,12 +638,14 @@ impl InlineSite {
             Self::Direct
             | Self::Nested
             | Self::CallCallee
+            | Self::FastCallCallee
             | Self::Condition
             | Self::LoopCondition
             | Self::LoopHead => None,
             Self::ReturnValue => Some(options.return_inline_max_complexity),
             Self::Index => Some(options.index_inline_max_complexity),
             Self::CallArg => Some(options.args_inline_max_complexity),
+            Self::FastCallArg => Some(options.args_inline_max_complexity),
             Self::AccessBase => Some(options.access_base_inline_max_complexity),
         }
     }
@@ -561,7 +657,9 @@ impl InlineSite {
             | Self::ReturnValue
             | Self::Index
             | Self::CallArg
+            | Self::FastCallArg
             | Self::CallCallee
+            | Self::FastCallCallee
             | Self::AccessBase
             | Self::Condition
             | Self::LoopCondition
@@ -585,9 +683,15 @@ impl InlineSite {
             | Self::Nested
             | Self::ReturnValue
             | Self::CallArg
+            | Self::FastCallArg
             | Self::CallCallee
+            | Self::FastCallCallee
             | Self::AccessBase => Self::Nested,
         }
+    }
+
+    pub(super) const fn is_call_callee(self) -> bool {
+        matches!(self, Self::CallCallee | Self::FastCallCallee)
     }
 }
 

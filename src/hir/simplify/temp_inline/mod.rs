@@ -41,10 +41,10 @@ use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use self::rewrite::replace_temp_in_stmt;
 use self::site::{
-    InlineSite, expr_touches_temp, inline_site_in_repeat_condition, inline_site_in_stmt,
-    is_direct_method_receiver_snapshot, is_stable_inline_value,
-    puc_upvalue_table_key_with_deferred_base_read, temp_precedes_observable_eval_in_expr,
-    temp_precedes_observable_eval_in_stmt,
+    InlineSite, expr_touches_temp, fastcall_callee_materialization_precedes_temp,
+    inline_site_in_repeat_condition, inline_site_in_stmt, is_direct_method_receiver_snapshot,
+    is_stable_inline_value, puc_upvalue_table_key_with_deferred_base_read,
+    temp_precedes_observable_eval_in_expr, temp_precedes_observable_eval_in_stmt,
 };
 use self::usage::{
     TempUseScratch, collect_expr_temp_uses_summary, collect_stmt_temp_uses, inline_candidate,
@@ -259,7 +259,7 @@ fn inline_temps_in_block(
     // 重新遍历整棵子树。fallback 回边上任何额外读取都会使 live count 大于 1，
     // 因此不会被当成可删的 forwarding temp。
     let mut kept_rev = Vec::with_capacity(block.stmts.len());
-    let mut call_callee_materialized_at = None;
+    let mut callee_materialized_at = None;
 
     for (index, stmt) in std::mem::take(&mut block.stmts)
         .into_iter()
@@ -294,7 +294,7 @@ fn inline_temps_in_block(
                 site,
                 value,
                 index,
-                call_callee_materialized_at,
+                callee_materialized_at,
             )
             && !inline_crosses_evaluation_boundary(
                 site,
@@ -310,8 +310,8 @@ fn inline_temps_in_block(
                 .last_mut()
                 .expect("next stmt metadata must track the last kept stmt");
             replace_temp_in_stmt(next_stmt, temp, value);
-            if site == InlineSite::CallCallee {
-                call_callee_materialized_at = Some(index);
+            if site.is_call_callee() {
+                callee_materialized_at = Some(index);
             }
             remove_live_use(live_use_counts, temp);
             if use_count == 2 {
@@ -325,7 +325,14 @@ fn inline_temps_in_block(
             continue;
         }
 
-        call_callee_materialized_at = None;
+        // FASTCALL fallback callee 在参数后物化，收回 callee 后仍可按协议折叠相邻末参数；普通调用保留原顺序屏障。
+        callee_materialized_at =
+            kept_rev
+                .last()
+                .and_then(inline_candidate)
+                .and_then(|(next_temp, _)| {
+                    fastcall_callee_materialization_precedes_temp(&stmt, next_temp).then_some(index)
+                });
         kept_rev.push(stmt);
     }
 
@@ -580,7 +587,7 @@ fn inline_materialization_runs(
             index = run_end + 1;
             continue;
         };
-        if callee_site != InlineSite::CallCallee
+        if !callee_site.is_call_callee()
             || inline_crosses_evaluation_boundary(
                 callee_site,
                 callee_value,

@@ -67,6 +67,7 @@ pub(super) fn lower_closure_expr(
             callee: HirExpr::LocalRef(lowering.shared_factory_local(factory)),
             args: Default::default(),
             method: false,
+            fastcall: None,
             method_name: None,
         }));
     }
@@ -235,6 +236,10 @@ fn pack_tail_for_open_def(
                     lower_value_pack(lowering, open_def.block, open_def.instr, call.args)
                 },
                 method: matches!(call.kind, CallKind::Method),
+                fastcall: match call.kind {
+                    CallKind::FastCall(args) => Some(args),
+                    CallKind::Normal | CallKind::Method => None,
+                },
                 method_name,
             }))))
         }

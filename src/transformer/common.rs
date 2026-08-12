@@ -357,11 +357,37 @@ pub enum BinaryOpKind {
     Shr,
 }
 
-/// 调用形态，区分普通调用和方法糖。
+/// Luau FASTCALL 参数是否由当前调用直接物化。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum FastCallArgs {
+    All,
+    Mask { direct_fixed: u8, direct_tail: bool },
+}
+
+impl FastCallArgs {
+    pub const fn fixed_is_direct(self, index: usize) -> bool {
+        match self {
+            Self::All => true,
+            Self::Mask { direct_fixed, .. } => {
+                index < u8::BITS as usize && direct_fixed & (1 << index) != 0
+            }
+        }
+    }
+
+    pub const fn tail_is_direct(self) -> bool {
+        match self {
+            Self::All => true,
+            Self::Mask { direct_tail, .. } => direct_tail,
+        }
+    }
+}
+
+/// 调用形态，区分普通调用、方法糖与 Luau fastcall fallback 协议。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum CallKind {
     Normal,
     Method,
+    FastCall(FastCallArgs),
 }
 
 /// 方言 method setup 协议在 low-IR 上携带的 method 名提示。

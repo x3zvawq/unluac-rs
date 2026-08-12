@@ -192,7 +192,7 @@ impl<'a> Emitter<'a> {
                 <&'static str>::from(self.target.version)
             )),
             Doc::text(format!("-- encoding: {encoding}")),
-            Doc::text("-- decompiled by unluac-rs"),
+            Doc::text("-- decompiled by unluac-rs (https://github.com/x3zvawq/unluac-rs)"),
         ]);
         Some(Doc::join(comments, Doc::line()))
     }

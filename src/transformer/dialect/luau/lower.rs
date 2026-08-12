@@ -20,10 +20,10 @@ use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchPredicate, CallInstr,
     CallKind, Capture, CaptureSource, CloseInstr, ClosureCreation, ClosureInstr, ConcatInstr,
-    CondOperand, ConstRef, GenericForCallInstr, GetTableInstr, GetTableKind, GetUpvalueInstr,
-    InstrRef, LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LowInstr,
-    LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange,
-    ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetTableKind, SetUpvalueInstr,
+    CondOperand, ConstRef, FastCallArgs, GenericForCallInstr, GetTableInstr, GetTableKind,
+    GetUpvalueInstr, InstrRef, LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr,
+    LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg,
+    RegRange, ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetTableKind, SetUpvalueInstr,
     SharedClosureRef, TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand,
     ValuePack, VarArgInstr, instantiate_closure_children,
 };
@@ -54,6 +54,7 @@ struct ProtoLowerer<'a> {
     raw: &'a RawProto,
     lowering: PendingLoweringState,
     pending_methods: PendingMethodHints,
+    pending_fastcall_calls: Vec<Option<PendingFastCall>>,
     word_code_index: WordCodeIndex,
 }
 
@@ -61,6 +62,44 @@ struct ProtoLowerer<'a> {
 enum LogicalSelectValue {
     Reg(Reg),
     Const(ConstRef),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PendingFastCall {
+    All,
+    Fixed { sources: [Option<Reg>; 3], len: u8 },
+}
+
+impl PendingFastCall {
+    fn freeze(self, callee: Reg, args: ValuePack) -> Option<FastCallArgs> {
+        match self {
+            Self::All => Some(FastCallArgs::All),
+            Self::Fixed { sources, len } => {
+                let (start, direct_tail) = match args {
+                    ValuePack::Fixed(range) if range.len == usize::from(len) => {
+                        (range.start, false)
+                    }
+                    // `select(k, ...)` 等 fixed FASTCALL 保留已编码前缀，开放尾由 fast path 直接读取、fallback 才在 CALL 前物化。
+                    ValuePack::Open(start) => (start, true),
+                    ValuePack::Fixed(_) => return None,
+                };
+                if start != Reg(callee.index() + 1) {
+                    return None;
+                }
+                let mut direct_fixed = 0_u8;
+                for (index, source) in sources[..usize::from(len)].iter().enumerate() {
+                    let target = Reg(start.index() + index);
+                    if source.is_none_or(|source| source == target) {
+                        direct_fixed |= 1 << index;
+                    }
+                }
+                Some(FastCallArgs::Mask {
+                    direct_fixed,
+                    direct_tail,
+                })
+            }
+        }
+    }
 }
 
 impl<'a> ProtoLowerer<'a> {
@@ -72,6 +111,7 @@ impl<'a> ProtoLowerer<'a> {
             raw,
             lowering: PendingLoweringState::new(raw_instr_count),
             pending_methods: PendingMethodHints::new(method_slots),
+            pending_fastcall_calls: vec![None; raw_instr_count],
             word_code_index: WordCodeIndex::from_raw(raw, instr_pc, instr_word_len),
         }
     }
@@ -101,32 +141,74 @@ impl<'a> ProtoLowerer<'a> {
                 | LuauOpcode::FastCall2
                 | LuauOpcode::FastCall2K
                 | LuauOpcode::FastCall3 => {
-                    match opcode {
+                    let fastcall = match opcode {
                         LuauOpcode::PrepVarArgs => {
                             expect_a(raw_pc, opcode, operands)?;
+                            None
                         }
                         LuauOpcode::Coverage => {
                             expect_e(raw_pc, opcode, operands)?;
+                            None
                         }
                         LuauOpcode::FastCall => {
-                            expect_ac(raw_pc, opcode, operands)?;
+                            let (_, skip) = expect_ac(raw_pc, opcode, operands)?;
+                            Some((skip, PendingFastCall::All))
                         }
-                        LuauOpcode::FastCall1
-                        | LuauOpcode::FastCall2
-                        | LuauOpcode::FastCall2K
-                        | LuauOpcode::FastCall3 => {
-                            expect_abc(raw_pc, opcode, operands)?;
+                        LuauOpcode::FastCall1 => {
+                            let (_, source, skip) = expect_abc(raw_pc, opcode, operands)?;
+                            Some((
+                                skip,
+                                PendingFastCall::Fixed {
+                                    sources: [Some(reg_from_u8(source)), None, None],
+                                    len: 1,
+                                },
+                            ))
                         }
-                        LuauOpcode::Nop => {}
+                        LuauOpcode::FastCall2 | LuauOpcode::FastCall2K => {
+                            let (_, source, skip) = expect_abc(raw_pc, opcode, operands)?;
+                            let second = if opcode == LuauOpcode::FastCall2 {
+                                Some(reg_from_u8(aux_reg(raw_pc, opcode, extra)?))
+                            } else {
+                                required_aux(raw_pc, opcode, extra)?;
+                                None
+                            };
+                            Some((
+                                skip,
+                                PendingFastCall::Fixed {
+                                    sources: [Some(reg_from_u8(source)), second, None],
+                                    len: 2,
+                                },
+                            ))
+                        }
+                        LuauOpcode::FastCall3 => {
+                            let (_, source, skip) = expect_abc(raw_pc, opcode, operands)?;
+                            let aux = required_aux(raw_pc, opcode, extra)?;
+                            if aux >> 16 != 0 {
+                                return Err(TransformError::UnexpectedOperands {
+                                    raw_pc,
+                                    opcode: opcode.label(),
+                                    expected: "AUX upper 16 bits must be zero",
+                                });
+                            }
+                            Some((
+                                skip,
+                                PendingFastCall::Fixed {
+                                    sources: [
+                                        Some(reg_from_u8(source)),
+                                        Some(reg_from_u8(aux as u8)),
+                                        Some(reg_from_u8((aux >> 8) as u8)),
+                                    ],
+                                    len: 3,
+                                },
+                            ))
+                        }
+                        LuauOpcode::Nop => None,
                         _ => unreachable!("only no-op Luau opcodes should reach this arm"),
+                    };
+                    if let Some((skip, fastcall)) = fastcall {
+                        self.record_fastcall_target(raw_pc, opcode, skip, fastcall)?;
                     }
-                    // 这些 opcode 在 Luau 里都是“VM 内部 hint / 无副作用占位”，对我们要恢复的源
-                    // 级语义没有贡献，所以不发射任何 low-IR。但它们仍然占据真实 raw pc，并且
-                    // 完全可能成为其它指令（典型如 LoadB.C != 0 的“跳过下一条”、JumpIfNot 跳到
-                    // FastCall 紧接着的 Call 一段）的跳转目标。如果不在这里登记 raw_target_low，
-                    // 后续 resolve 阶段就会把目标判为“raw 指令没有起始 low-IR”，整段反编译
-                    // 直接挂掉。这里调用 mark_raw_target，让目标被解释为“跳到我之后第一条
-                    // 真正发射出来的 low-IR”，与“FastCall 是 no-op”的语义一致。
+                    // opcode 本身不发 low-IR；FASTCALL 协议已冻结到 fallback CALL，raw pc 仍映射到其后的首条 low-IR 供跳转引用。
                     self.lowering.mark_raw_target(raw_index);
                     raw_index += 1;
                 }
@@ -463,6 +545,28 @@ impl<'a> ProtoLowerer<'a> {
                         self.fold_single_result_call_move(raw_index, a, c)?;
                     let (kind, method_name) =
                         self.take_call_info(reg_from_u8(a), u16::from(b), result_pack);
+                    let kind = if let Some(fastcall) = self.pending_fastcall_calls[raw_index].take()
+                    {
+                        if kind != CallKind::Normal {
+                            return Err(TransformError::UnexpectedOperands {
+                                raw_pc,
+                                opcode: opcode.label(),
+                                expected: "FASTCALL fallback CALL without method setup",
+                            });
+                        }
+                        let Some(args) =
+                            fastcall.freeze(reg_from_u8(a), call_args_pack(a, u16::from(b)))
+                        else {
+                            return Err(TransformError::UnexpectedOperands {
+                                raw_pc,
+                                opcode: opcode.label(),
+                                expected: "CALL argument pack matching FASTCALL operands",
+                            });
+                        };
+                        CallKind::FastCall(args)
+                    } else {
+                        kind
+                    };
                     self.emit(
                         Some(raw_index),
                         if let Some(extra_raw) = consumed_extra_raw {
@@ -1041,6 +1145,14 @@ impl<'a> ProtoLowerer<'a> {
             }
         }
 
+        if let Some(raw_index) = self.pending_fastcall_calls.iter().position(Option::is_some) {
+            return Err(TransformError::UnexpectedOperands {
+                raw_pc: self.raw.common.instructions[raw_index].pc(),
+                opcode: "CALL",
+                expected: "FASTCALL protocol consumed exactly once",
+            });
+        }
+
         self.finish()
     }
 
@@ -1274,6 +1386,29 @@ impl<'a> ProtoLowerer<'a> {
     fn jump_target(&self, raw_pc: u32, offset: i32) -> Result<usize, TransformError> {
         let target_pc = i64::from(raw_pc) + 1 + i64::from(offset);
         self.word_code_index.ensure_valid_jump_pc(raw_pc, target_pc)
+    }
+
+    fn record_fastcall_target(
+        &mut self,
+        raw_pc: u32,
+        opcode: LuauOpcode,
+        skip: u8,
+        fastcall: PendingFastCall,
+    ) -> Result<(), TransformError> {
+        // C 指向 fallback CALL（pc + 1 + C）；fast path 成功后跳到下一条，但协议 owner 仍是该 CALL。
+        let call_raw = self.jump_target(raw_pc, i32::from(skip))?;
+        let (target_opcode, _, _) = self.raw.common.instructions[call_raw]
+            .luau()
+            .expect("luau lowerer should only decode luau instructions");
+        if target_opcode != LuauOpcode::Call || self.pending_fastcall_calls[call_raw].is_some() {
+            return Err(TransformError::UnexpectedOperands {
+                raw_pc,
+                opcode: opcode.label(),
+                expected: "C must uniquely target CALL",
+            });
+        }
+        self.pending_fastcall_calls[call_raw] = Some(fastcall);
+        Ok(())
     }
 
     fn ensure_targetable_pc(&self, raw_pc: u32, target_pc: u32) -> Result<usize, TransformError> {

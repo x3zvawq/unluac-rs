@@ -269,6 +269,7 @@ fn format_call_kind(kind: CallKind) -> &'static str {
     match kind {
         CallKind::Normal => "normal",
         CallKind::Method => "method",
+        CallKind::FastCall(_) => "fastcall",
     }
 }
 

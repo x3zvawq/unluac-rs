@@ -5,6 +5,7 @@
 
 use crate::LuaString;
 use crate::parser::{ProtoLineRange, ProtoSignature};
+use crate::transformer::FastCallArgs;
 use crate::transformer::InstrRef;
 
 /// 整个 chunk 的 HIR 根对象。
@@ -290,6 +291,8 @@ pub struct HirCallExpr {
     pub callee: HirExpr,
     pub args: HirValuePack,
     pub method: bool,
+    /// Luau FASTCALL 协议证明 fallback callee setup 位于参数物化之后，仅用于恢复源码求值顺序。
+    pub fastcall: Option<FastCallArgs>,
     /// 来自 `SELF` / `NAMECALL` 的 method 名事实。
     ///
     /// 这一层显式保留字段名，是为了避免后面的 AST build 再去猜

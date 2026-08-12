@@ -185,6 +185,7 @@ pub(super) fn lower_regular_instr(
                 )]
                 .into(),
                 method: false,
+                fastcall: None,
                 method_name: None,
             };
             if type_guard.kind.normalizes_subject() {
@@ -327,6 +328,10 @@ pub(super) fn lower_terminal_instr(
                     callee,
                     args: lower_value_pack(lowering, block, instr_ref, tail_call.args),
                     method: matches!(tail_call.kind, CallKind::Method),
+                    fastcall: match tail_call.kind {
+                        CallKind::FastCall(args) => Some(args),
+                        CallKind::Normal | CallKind::Method => None,
+                    },
                     method_name,
                 }))),
             ))])
@@ -381,6 +386,7 @@ fn generic_for_iterator_call(
         callee,
         args,
         method: false,
+        fastcall: None,
         method_name: None,
     }))
 }
@@ -398,6 +404,10 @@ fn lower_call(
         callee,
         args: lower_value_pack(lowering, block, instr_ref, call.args),
         method: matches!(call.kind, CallKind::Method),
+        fastcall: match call.kind {
+            CallKind::FastCall(args) => Some(args),
+            CallKind::Normal | CallKind::Method => None,
+        },
         method_name,
     };
 

@@ -205,6 +205,7 @@ pub(super) fn inline_constructor_call(
         callee,
         args: HirValuePack { fixed, tail },
         method: call.method,
+        fastcall: call.fastcall,
         method_name: call.method_name.clone(),
     })
 }

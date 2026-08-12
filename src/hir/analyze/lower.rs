@@ -780,7 +780,7 @@ fn open_pack_bridge_is_import_setup(
         return false;
     };
 
-    matches!(call.kind, CallKind::Normal)
+    matches!(call.kind, CallKind::Normal | CallKind::FastCall(_))
         && producer_start.index() >= args_start.index()
         && first.kind == GetTableKind::Import
         && first.dst == call.callee
@@ -817,7 +817,7 @@ fn open_pack_bridge_is_callee_move(
         return false;
     };
 
-    matches!(call.kind, CallKind::Normal)
+    matches!(call.kind, CallKind::Normal | CallKind::FastCall(_))
         && producer_start.index() >= args_start.index()
         && callee_move.src.index() < producer_start.index()
         && callee_move.dst == call.callee

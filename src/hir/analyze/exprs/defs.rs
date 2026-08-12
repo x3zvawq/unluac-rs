@@ -308,6 +308,10 @@ fn expr_for_fixed_call(
         callee,
         args: lower_value_pack_single_eval(lowering, block, instr_ref, call.args),
         method: matches!(call.kind, CallKind::Method),
+        fastcall: match call.kind {
+            CallKind::FastCall(args) => Some(args),
+            CallKind::Normal | CallKind::Method => None,
+        },
         method_name,
     })))
 }

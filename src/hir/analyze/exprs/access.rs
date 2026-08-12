@@ -109,6 +109,7 @@ pub(crate) fn lower_raw_table_set_call(
         ]
         .into(),
         method: false,
+        fastcall: None,
         method_name: None,
     }
 }
@@ -253,6 +254,7 @@ fn raw_table_get_expr(base: HirExpr, key: HirExpr) -> HirExpr {
         callee: unresolved_expr("LuaJIT raw table read has no exact Lua source form"),
         args: vec![base, key].into(),
         method: false,
+        fastcall: None,
         method_name: None,
     }))
 }

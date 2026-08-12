@@ -63,6 +63,7 @@ pub(super) fn extract_call_expr(
         callee,
         args,
         method,
+        fastcall,
         method_name,
     } = call;
     let (prefix, mut leading, args, changed) =
@@ -76,6 +77,7 @@ pub(super) fn extract_call_expr(
             callee,
             args,
             method,
+            fastcall,
             method_name,
         },
         changed,
@@ -654,6 +656,7 @@ fn collapse_call_to_pure(call: HirCallExpr) -> Option<HirCallExpr> {
         callee,
         args: HirValuePack { fixed, tail },
         method: call.method,
+        fastcall: call.fastcall,
         method_name: call.method_name,
     })
 }
