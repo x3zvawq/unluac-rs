@@ -254,6 +254,10 @@ pub(super) fn collapse_written_back_if_results(
             continue;
         };
         let facts = binding_facts(std::slice::from_ref(&block.stmts[index + 1]));
+        let state_writes_preserve_result = exits.iter().all(|exit| {
+            !exit.contains_key(&state)
+                && exit.get(&result).and_then(carry_binding_from_expr) == Some(state)
+        });
         if exits.len() < 2
             || !matches!(state, CarryBinding::Param(_) | CarryBinding::Local(_))
             || state == result
@@ -263,7 +267,7 @@ pub(super) fn collapse_written_back_if_results(
             || mention_counts.get(&result).copied() != Some(2)
             || facts.reads.contains_key(&result)
             || facts.writes.get(&result).copied() != Some(exits.len())
-            || facts.writes.contains_key(&state)
+            || (facts.writes.contains_key(&state) && !state_writes_preserve_result)
             || stmt_has_label_or_goto(&block.stmts[index + 1])
         {
             index += 1;
@@ -569,7 +573,7 @@ fn collect_complete_assignments(
     }
     match last {
         HirStmt::Assign(assign) => {
-            exits.push(result_assignment_values(assign, results)?);
+            exits.push(complete_result_assignment_values(assign, results)?);
             Some(())
         }
         HirStmt::If(if_stmt) => {
@@ -580,6 +584,18 @@ fn collect_complete_assignments(
         HirStmt::Block(block) => collect_complete_assignments(block, results, exits),
         _ => None,
     }
+}
+
+fn complete_result_assignment_values(
+    assign: &HirAssign,
+    results: &[CarryBinding],
+) -> Option<BTreeMap<CarryBinding, HirExpr>> {
+    let values = assignment_values(assign)?;
+    let result_values = results
+        .iter()
+        .map(|result| values.get(result))
+        .collect::<Option<Vec<_>>>()?;
+    (!bindings_are_mentioned_in_exprs(result_values, results)).then_some(values)
 }
 
 fn exact_state_writeback(stmt: &HirStmt, result: CarryBinding) -> Option<CarryBinding> {

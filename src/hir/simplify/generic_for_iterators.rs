@@ -22,6 +22,13 @@ pub(super) fn fold_generic_for_iterators_in_proto(proto: &mut HirProto) -> bool 
 struct GenericForIteratorPass;
 
 impl HirRewritePass for GenericForIteratorPass {
+    fn rewrite_stmt(&mut self, stmt: &mut HirStmt) -> bool {
+        let HirStmt::GenericFor(generic_for) = stmt else {
+            return false;
+        };
+        trim_trailing_nil_iterators(&mut generic_for.iterator)
+    }
+
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
         let old_stmts = std::mem::take(&mut block.stmts);
         let mut pending = VecDeque::from(old_stmts);
@@ -44,6 +51,17 @@ impl HirRewritePass for GenericForIteratorPass {
         block.stmts = new_stmts;
         changed
     }
+}
+
+fn trim_trailing_nil_iterators(iterator: &mut HirValuePack) -> bool {
+    if iterator.tail.is_some() {
+        return false;
+    }
+    let original_len = iterator.fixed.len();
+    while iterator.fixed.len() > 1 && matches!(iterator.fixed.last(), Some(HirExpr::Nil)) {
+        iterator.fixed.pop();
+    }
+    iterator.fixed.len() != original_len
 }
 
 #[derive(Clone, Copy)]
@@ -120,11 +138,7 @@ fn fold_front(pending: &mut VecDeque<HirStmt>, plan: FoldPlan) -> HirStmt {
         }
     }
 
-    if iterator.tail.is_none() {
-        while iterator.fixed.len() > 1 && matches!(iterator.fixed.last(), Some(HirExpr::Nil)) {
-            iterator.fixed.pop();
-        }
-    }
+    trim_trailing_nil_iterators(&mut iterator);
 
     let Some(HirStmt::GenericFor(mut generic_for)) = pending.pop_front() else {
         unreachable!("validated generic-for owner");

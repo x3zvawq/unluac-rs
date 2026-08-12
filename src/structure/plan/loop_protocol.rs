@@ -197,6 +197,7 @@ impl PhiUseExtent {
 struct LoopValueAnalysis {
     vm_for_control: Vec<bool>,
     use_extents: Vec<PhiUseExtent>,
+    absorbed_owner_by_edge: Vec<Option<super::LoopPlanId>>,
 }
 
 #[derive(Clone, Copy)]
@@ -383,9 +384,35 @@ impl LoopValueAnalysis {
                 });
         }
 
+        let mut absorbed_owner_by_edge = vec![None; cfg.edges.len()];
+        for (loop_id, payload) in plan.loops() {
+            if !matches!(
+                payload.kind,
+                LoopKindHint::NumericForLike | LoopKindHint::GenericForLike
+            ) {
+                continue;
+            }
+            let region = plan
+                .loop_region(loop_id)
+                .ok_or_else(|| StructureError::invalid("VM-for has no owning region"))?;
+            for edge in absorbed_value_edges(cfg, plan, region, payload)? {
+                let slot = absorbed_owner_by_edge
+                    .get_mut(edge.index())
+                    .ok_or_else(|| {
+                        StructureError::invalid("loop value action references a missing CFG edge")
+                    })?;
+                if slot.replace(loop_id).is_some() {
+                    return Err(StructureError::invalid(format!(
+                        "CFG edge {edge} is absorbed by multiple loop protocols"
+                    )));
+                }
+            }
+        }
+
         Ok(Self {
             vm_for_control,
             use_extents,
+            absorbed_owner_by_edge,
         })
     }
 
@@ -513,8 +540,9 @@ pub(super) fn validate(
         ));
     }
 
-    let mut absorbed_owner = vec![None; cfg.edges.len()];
+    let absorbed_owner = analysis.absorbed_owner_by_edge.clone();
     let mut origins_by_edge = vec![Vec::<PhiId>::new(); cfg.edges.len()];
+    let mut partial_elided_by_edge = vec![Vec::<PhiId>::new(); cfg.edges.len()];
     for (index, payload) in plan.loops.iter().enumerate() {
         let loop_id = super::LoopPlanId(index);
         let region = plan
@@ -567,19 +595,6 @@ pub(super) fn validate(
             )));
         }
 
-        if is_vm_for {
-            for edge in absorbed_value_edges(cfg, plan, region, payload)? {
-                let slot = absorbed_owner.get_mut(edge.index()).ok_or_else(|| {
-                    StructureError::invalid("loop value action references a missing CFG edge")
-                })?;
-                if slot.replace(loop_id).is_some() {
-                    return Err(StructureError::invalid(format!(
-                        "CFG edge {edge} is absorbed by multiple loop protocols"
-                    )));
-                }
-            }
-        }
-
         for batch in &actions.batches {
             for write in &batch.writes {
                 if write.origins.is_empty()
@@ -603,7 +618,29 @@ pub(super) fn validate(
             }
         }
         for origin in &actions.elided {
-            record_origin(cfg, &absorbed_owner, &mut origins_by_edge, loop_id, *origin)?;
+            match absorbed_owner.get(origin.edge.index()).copied().flatten() {
+                Some(owner) if owner == loop_id => {
+                    record_origin(cfg, &absorbed_owner, &mut origins_by_edge, loop_id, *origin)?;
+                }
+                None if cfg.edges.get(origin.edge.index()).is_some()
+                    && payload
+                        .control_edges
+                        .backedges
+                        .binary_search(&origin.edge)
+                        .is_ok()
+                    && plan.edge_plan(origin.edge).is_some_and(|edge| {
+                        edge.owner == region || plan.region_contains(region, edge.owner)
+                    }) =>
+                {
+                    partial_elided_by_edge[origin.edge.index()].push(origin.target);
+                }
+                _ => {
+                    return Err(StructureError::invalid(format!(
+                        "loop value action #{} cites an invalid edge origin",
+                        loop_id.index()
+                    )));
+                }
+            }
         }
     }
 
@@ -674,6 +711,41 @@ pub(super) fn validate(
         if missing_origin || undispositioned_owned_copy {
             return Err(StructureError::invalid(format!(
                 "absorbed loop edge {edge} does not disposition every canonical phi copy exactly once"
+            )));
+        }
+    }
+    for (edge_index, targets) in partial_elided_by_edge.into_iter().enumerate() {
+        if targets.is_empty() {
+            continue;
+        }
+        epoch = epoch.checked_add(1).ok_or_else(|| {
+            StructureError::invalid("loop value-action validation epoch overflow")
+        })?;
+        for target in &targets {
+            let slot = seen_phi.get_mut(target.index()).ok_or_else(|| {
+                StructureError::invalid("loop value action references a missing phi")
+            })?;
+            if std::mem::replace(slot, epoch) == epoch {
+                return Err(StructureError::invalid(
+                    "one backedge phi copy has multiple loop value dispositions",
+                ));
+            }
+        }
+        let edge = EdgeRef(edge_index);
+        let matching = plan
+            .edge_plan(edge)
+            .ok_or_else(|| StructureError::invalid("elided loop backedge has no final plan"))?
+            .phi_copies
+            .iter()
+            .filter(|copy| {
+                seen_phi
+                    .get(copy.phi_id.index())
+                    .is_some_and(|seen| *seen == epoch)
+            })
+            .count();
+        if matching != targets.len() {
+            return Err(StructureError::invalid(format!(
+                "loop backedge {edge} does not contain every elided phi copy exactly once"
             )));
         }
     }
@@ -1455,6 +1527,36 @@ fn freeze_value_actions(
         iteration,
     );
 
+    // 普通 body 回边仍由自己的 region 执行真实 carried copy；但 VM-for 的隐藏
+    // control copy 已被循环语法消费，不能因此物化一个源码 local。
+    for edge in payload.control_edges.backedges.iter().copied() {
+        if latch_edges.binary_search(&edge).is_ok() {
+            continue;
+        }
+        if analysis
+            .absorbed_owner_by_edge
+            .get(edge.index())
+            .copied()
+            .flatten()
+            .and_then(|loop_id| plan.loop_region(loop_id))
+            .is_some_and(|absorbed_owner| absorbed_owner != owner)
+        {
+            continue;
+        }
+        let edge_plan = plan
+            .edge_plan(edge)
+            .ok_or_else(|| StructureError::invalid("loop backedge has no final edge plan"))?;
+        for copy in &edge_plan.phi_copies {
+            let origin = EdgeCopyOrigin {
+                edge,
+                target: copy.phi_id,
+            };
+            if classify_copy_source(&context, copy.value, copy.phi_id, &[origin])?.is_none() {
+                actions.elided.push(origin);
+            }
+        }
+    }
+
     let exit = freeze_exit_actions(&context)?;
     push_batch(
         &mut actions.batches,
@@ -1759,24 +1861,34 @@ fn classify_value_source(
     value: SsaValue,
     target: PhiId,
 ) -> Result<Option<LoopValueSource>, StructureError> {
-    if target_is_generic_for_control(
+    if target_is_vm_for_control(
         context.proto,
         context.dataflow,
         context.plan,
         context.payload,
         target,
     ) {
+        let numeric_binding = context.payload.kind == LoopKindHint::NumericForLike;
+        let syntax_region = if numeric_binding {
+            context.owner
+        } else {
+            context.control
+        };
         if context
             .analysis
-            .phi_observed_outside(context.plan, context.control, target)
+            .phi_observed_outside(context.plan, syntax_region, target)
         {
             return Err(StructureError::invalid(format!(
-                "VM for-control value {value:?} for {target} escapes loop header {} control region #{}",
+                "VM for-control value {value:?} for {target} escapes loop header {} syntax region #{}",
                 context.payload.header,
-                context.control.index(),
+                syntax_region.index(),
             )));
         }
-        return Ok(None);
+        if !numeric_binding
+            || numeric_binding_is_protocol_only(context.proto, context.dataflow, target)
+        {
+            return Ok(None);
+        }
     }
     if let Some(binding) = binding_source(context.dataflow, context.payload, value) {
         return Ok(Some(LoopValueSource::Binding(binding)));
@@ -1800,25 +1912,51 @@ fn classify_value_source(
     Ok(Some(LoopValueSource::Ssa(value)))
 }
 
-fn target_is_generic_for_control(
+fn numeric_binding_is_protocol_only(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    target: PhiId,
+) -> bool {
+    dataflow
+        .phi_phi_uses
+        .get(target.index())
+        .is_some_and(Vec::is_empty)
+        && dataflow.phi_uses.get(target.index()).is_some_and(|uses| {
+            uses.iter().all(|site| {
+                matches!(
+                    proto.instrs.get(site.instr.index()),
+                    Some(LowInstr::NumericForLoop(loop_))
+                        if loop_.index == loop_.binding && site.reg == loop_.binding
+                )
+            })
+        })
+}
+
+fn target_is_vm_for_control(
     proto: &LoweredProto,
     dataflow: &DataflowFacts,
     plan: &StructurePlan,
     payload: &LoopPlanData,
     target: PhiId,
 ) -> bool {
-    if payload.kind != LoopKindHint::GenericForLike {
+    let Some(candidate) = dataflow.phi_candidate(target) else {
         return false;
+    };
+    match payload.source_bindings {
+        Some(LoopSourceBindings::Numeric(binding)) => {
+            payload.kind == LoopKindHint::NumericForLike && candidate.reg == binding
+        }
+        Some(LoopSourceBindings::Generic(_)) if payload.kind == LoopKindHint::GenericForLike => {
+            let Some(terminator) = plan.block_terminator(payload.header) else {
+                return false;
+            };
+            let Some((_, call, loop_)) = generic_for_header_instrs(proto, terminator) else {
+                return false;
+            };
+            candidate.reg == call.control && candidate.reg == loop_.control_target
+        }
+        _ => false,
     }
-    let Some(terminator) = plan.block_terminator(payload.header) else {
-        return false;
-    };
-    let Some((_, call, loop_)) = generic_for_header_instrs(proto, terminator) else {
-        return false;
-    };
-    dataflow.phi_candidate(target).is_some_and(|candidate| {
-        candidate.reg == call.control && candidate.reg == loop_.control_target
-    })
 }
 
 fn binding_source(

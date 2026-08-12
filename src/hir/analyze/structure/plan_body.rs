@@ -65,6 +65,7 @@ struct PlanLoweringIndex {
     region_inputs: Vec<Vec<(PhiId, SsaValue)>>,
     unresolved_requirement: Vec<Option<(BlockRef, Reg)>>,
     normal_tail_guard_by_edge: Vec<Option<(RegionId, TempId)>>,
+    elided_loop_copy_targets: Vec<Vec<PhiId>>,
     repeat_staged_result_by_phi: Vec<Option<(RegionId, TempId)>>,
     canonical_move_source: Vec<Option<SsaValue>>,
     absorbed_region_result_moves: Vec<bool>,
@@ -342,6 +343,33 @@ impl PlanLoweringIndex {
                 *slot = Some(identity);
             }
         }
+        let mut elided_loop_copy_targets = vec![Vec::new(); lowering.cfg.edges.len()];
+        for (loop_id, _) in plan.loops() {
+            let region = plan
+                .loop_region(loop_id)
+                .ok_or_else(|| invalid(root, "loop value actions have no owning region"))?;
+            let actions = plan
+                .loop_value_actions(loop_id)
+                .ok_or_else(|| invalid(region, "loop value actions are missing"))?;
+            for origin in &actions.elided {
+                let Some(targets) = elided_loop_copy_targets.get_mut(origin.edge.index()) else {
+                    return Err(invalid(
+                        region,
+                        "elided loop copy is outside the edge arena",
+                    ));
+                };
+                targets.push(origin.target);
+            }
+        }
+        for targets in &mut elided_loop_copy_targets {
+            targets.sort_unstable();
+            if targets.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(invalid(
+                    root,
+                    "one edge copy is elided by multiple loop owners",
+                ));
+            }
+        }
         let mut canonical_move_source = vec![None; lowering.dataflow.defs.len()];
         let mut edge_action_use_count = vec![0_usize; lowering.dataflow.defs.len()];
         let mut canonical_moves =
@@ -394,6 +422,7 @@ impl PlanLoweringIndex {
             region_inputs,
             unresolved_requirement,
             normal_tail_guard_by_edge,
+            elided_loop_copy_targets,
             repeat_staged_result_by_phi,
             canonical_move_source,
             absorbed_region_result_moves,
@@ -1198,6 +1227,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             normal_tail_body,
         ) {
             (false, None, None) => None,
+            (true, Some(_), Some(tail)) if tail.stmts.is_empty() => None,
             (true, Some(_), Some(tail)) => Some((
                 tail,
                 self.lowering
@@ -2970,8 +3000,19 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             })?;
         let mut targets = Vec::new();
         let mut values = Vec::new();
+        let elided = self
+            .index
+            .elided_loop_copy_targets
+            .get(edge.index())
+            .ok_or(HirLowerError::InvalidPlanRegion {
+                proto: self.proto.index(),
+                region: owner.index(),
+                detail: "edge copy elision index misses a final edge",
+            })?;
         for copy in copies {
-            if copy.value == crate::structure::SsaValue::Phi(copy.phi_id) {
+            if copy.value == crate::structure::SsaValue::Phi(copy.phi_id)
+                || elided.binary_search(&copy.phi_id).is_ok()
+            {
                 continue;
             }
             let source_reg = self.ssa_reg(owner, copy.value)?;

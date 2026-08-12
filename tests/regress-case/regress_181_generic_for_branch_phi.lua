@@ -1,4 +1,7 @@
 -- regress_181_generic_for_branch_phi#1: generic-for body 的局部分支 Phi 归本轮 soft merge
+-- unluac: expect-contains [[r1_1 =]]
+-- unluac: expect-not-contains [[r1_1,]]
+-- unluac: expect-not-contains [[if not r1_7 then]]
 
 local function run(text, should_break)
     local values = {}

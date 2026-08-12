@@ -1,6 +1,6 @@
 -- regress_99_nested_loop_branch_state_seed#1: branch seed 必须复用外层 loop state，不能读取未物化的 header phi
 -- unluac: expect-contains [[local r1_0 = 0]]
--- unluac: expect-contains [[for r1_1 in p1_3, nil, nil do]]
+-- unluac: expect-contains [[for r1_1 in p1_3 do]]
 -- unluac: expect-not-contains [[local r1_2]]
 -- unluac: expect-not-contains [[r1_0 = r1_2]]
 -- unluac: expect-not-contains [[goto ]]

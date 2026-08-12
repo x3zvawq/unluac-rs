@@ -154,6 +154,17 @@ pub(super) fn build_bindings(
     let captured_regs = captured_regs(proto);
     let nested_carried_parents =
         coalesce_nested_loop_carried_temps(structure.plan(), &captured_regs, &mut phi_temps);
+    let nested_carried_child_owners = nested_carried_parents
+        .iter()
+        .enumerate()
+        .filter_map(|(child, parent)| {
+            Some((
+                (*parent)?,
+                loop_carried_binding(structure.plan(), structure.plan().phi_plan(PhiId(child))?)?
+                    .owner,
+            ))
+        })
+        .collect::<BTreeSet<_>>();
     let nested_results = coalesce_nested_loop_result_temps(
         structure.plan(),
         &captured_regs,
@@ -211,7 +222,7 @@ pub(super) fn build_bindings(
                     loop_id,
                     result.target,
                     &captured_regs,
-                    &nested_carried_parents,
+                    &nested_carried_child_owners,
                     &phi_temps,
                 ) {
                     temps.push(temp);
@@ -548,7 +559,7 @@ fn repeat_stage_carried_temp(
     loop_id: LoopPlanId,
     target: PhiId,
     captured_regs: &BTreeSet<Reg>,
-    nested_carried_parents: &[Option<PhiId>],
+    nested_carried_child_owners: &BTreeSet<(PhiId, RegionId)>,
     phi_temps: &[TempId],
 ) -> Option<TempId> {
     let owner = plan.loop_region(loop_id)?;
@@ -559,11 +570,7 @@ fn repeat_stage_carried_temp(
     let carried = loop_carried_binding(plan, result)?;
     if carried.owner == owner
         || !plan.region_contains(carried.owner, owner)
-        || nested_carried_parents
-            .get(target.index())
-            .copied()
-            .flatten()
-            .is_none()
+        || !nested_carried_child_owners.contains(&(target, owner))
     {
         return None;
     }
