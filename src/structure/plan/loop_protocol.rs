@@ -70,7 +70,7 @@ pub struct NumericForProtocol {
     pub init_instr: InstrRef,
     pub body_edge: EdgeRef,
     pub exit_edge: EdgeRef,
-    /// source body 是否存在一条不经显式 break/continue/goto 的正常 latch 路径。
+    /// planned body 是否存在一条可落入 protocol tail 的普通完成路径；空 body 为 true。
     pub body_completes_normally: bool,
     pub index: Reg,
     pub limit: Reg,
@@ -85,10 +85,11 @@ pub struct GenericForProtocol {
     pub loop_instr: InstrRef,
     pub body_edge: EdgeRef,
     pub exit_edge: EdgeRef,
-    /// source body 是否存在一条不经显式 break/continue/goto 的正常 latch 路径。
+    /// planned body 是否存在一条可落入 protocol tail 的普通完成路径；空 body 为 true。
     pub body_completes_normally: bool,
     pub iterator: RegRange,
     pub bindings: RegRange,
+    /// 空 body 的 yield edge 是否等价于立即退出本 generic-for。
     pub immediate_break: bool,
 }
 
@@ -1352,12 +1353,7 @@ fn freeze_generic_for_protocol(
         body_completes_normally,
         iterator,
         bindings: loop_instr.bindings,
-        immediate_break: super::super::helpers::share_transparent_jump_target(
-            proto,
-            cfg,
-            loop_instr.exit_target,
-            loop_instr.body_target,
-        ),
+        immediate_break: super::super::loops::generic_for_immediate_break(proto, cfg, &loop_instr),
     })
 }
 

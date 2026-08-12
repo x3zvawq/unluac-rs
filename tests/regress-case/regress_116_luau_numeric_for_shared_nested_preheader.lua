@@ -3,6 +3,9 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-not-contains [[r1_5 = r1_7]]
+-- unluac: expect-not-contains [[r1_5 = r1_8]]
+-- unluac: expect-not-contains [[r1_3 = r1_6]]
 local function run(a, b, c, xs)
     local x = 0
     if a and b then

@@ -4,8 +4,12 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]
 local saved
+local token = {}
 
-local function run(mode)
+local function run(mode, actual_token)
+    -- 同一 proto 同时暴露 branch-value call sink；不得因此对整个 proto 再跑
+    -- 无边界的 temp-inline，把下面每轮更新的 first 常量化进循环条件。
+    assert(actual_token == token)
     local first = 1
     while true do
         if mode == 3 and not first then
@@ -26,13 +30,13 @@ local function run(mode)
     end
 end
 
-local break_result = run(1)
+local break_result = run(1, token)
 local break_saved = saved()
-local return_result = run(2)
+local return_result = run(2, token)
 local return_saved = saved()
-local retry_result = run(3)
+local retry_result = run(3, token)
 local retry_saved = saved()
-local error_ok = pcall(run, 4)
+local error_ok = pcall(run, 4, token)
 
 print(
     "regress_195_terminal_exit_unknown_loop#1",

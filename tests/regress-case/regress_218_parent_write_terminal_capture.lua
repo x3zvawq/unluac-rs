@@ -1,4 +1,5 @@
 -- regress_218_parent_write_terminal_capture#1: 终结 close 不得让父级后续写入脱离只读 capture
+-- unluac: expect-not-contains [[ = assert]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
 local function build(skip_write)

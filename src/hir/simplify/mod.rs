@@ -246,13 +246,21 @@ pub(super) fn simplify_hir(
                                 proto,
                             )
                         }
-                        5 => {
-                            temp_inline::inline_temps_in_proto_with_facts(proto, readability, facts)
-                        }
+                        5 => temp_inline::inline_temps_in_proto_with_facts(
+                            proto,
+                            readability,
+                            facts,
+                            dialect,
+                        ),
                         6 => {
                             generic_for_iterators::fold_generic_for_iterators_in_proto(proto, facts)
                         }
-                        7 => branch_value_folding::fold_branch_values_in_proto(proto),
+                        7 => branch_value_folding::fold_branch_values_in_proto(
+                            proto,
+                            readability,
+                            facts,
+                            dialect,
+                        ),
                         8 => locals::promote_temps_to_locals_in_proto_with_facts(proto, facts),
                         9 => branch_control_folding::fold_branch_control_in_proto(proto),
                         10 => decision::eliminate_remaining_decisions_in_proto(proto),

@@ -4,6 +4,8 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[r4_1 = r4_]]
 -- unluac: expect-not-contains [[r1_1 = r1_]]
+-- unluac: expect-not-contains [[r3_0 = r3_1]]
+-- unluac: expect-not-contains [[r2_0 = r2_1]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
 

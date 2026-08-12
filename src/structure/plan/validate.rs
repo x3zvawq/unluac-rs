@@ -3636,12 +3636,7 @@ fn validate_loop_plans(
                 && matches!(
                     cfg.terminator(&proto.instrs, payload.header),
                     Some(LowInstr::GenericForLoop(instr))
-                        if super::super::helpers::same_or_transparent_jump_target(
-                            proto,
-                            cfg,
-                            instr.exit_target,
-                            instr.body_target,
-                        )
+                        if super::super::loops::generic_for_immediate_break(proto, cfg, instr)
                 );
             let expects_inside = role.ends_with("body") && !immediate_break_body
                 || normal_exit_epoch[edge.index()] == syntax_epoch;

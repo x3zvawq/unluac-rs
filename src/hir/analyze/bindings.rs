@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::hir::common::{LocalId, ParamId, TempId, UpvalueId};
 use crate::structure::{
-    BlockRef, Cfg, DataflowFacts, DefId, GraphFacts, PhiId, PhiIncomingDisposition, PhiPlan,
-    SsaValue,
+    BlockRef, BlockTerminatorKind, BranchArm, Cfg, DataflowFacts, DefId, EdgeRef, EdgeTransfer,
+    GraphFacts, PhiId, PhiIncomingDisposition, PhiIncomingPlan, PhiPlan, SsaValue,
 };
 use crate::structure::{
     LoopPlanId, LoopSourceBindings, LoopVmProtocol, RegionId, RegionPlan, StructureFacts,
@@ -93,6 +93,19 @@ pub(super) fn build_bindings(
     let mut generic_for_locals = BTreeMap::new();
     let mut block_local_regs = BTreeMap::new();
     let numeric_binding_phis = numeric_for_binding_phis(structure.plan());
+    let phi_debug_hints = structure
+        .plan()
+        .phis()
+        .map(|phi| {
+            if !phi_participates_in_normal_binding(phi) {
+                return None;
+            }
+            debug_names_by_ssa
+                .get(&SsaValue::Phi(phi.phi))
+                .cloned()
+                .or_else(|| debug_local_hint_for_reg_at_block_entry(proto, cfg, phi.block, phi.reg))
+        })
+        .collect::<Vec<_>>();
 
     if proto.signature.has_vararg_param_reg {
         let reg = crate::transformer::Reg(usize::from(proto.signature.num_params));
@@ -226,13 +239,13 @@ pub(super) fn build_bindings(
         })
         .collect::<BTreeSet<_>>();
     coalesce_loop_state_temps(
+        cfg,
         dataflow,
         structure.plan(),
         &captured_regs,
         &nested_carried_parents,
-        &numeric_binding_phis.bindings,
-        &mut phi_temps,
-        &mut fixed_temps,
+        (&numeric_binding_phis.bindings, &phi_debug_hints),
+        (&mut phi_temps, &mut fixed_temps),
     );
     let loop_guard_temps = structure
         .plan()
@@ -323,12 +336,7 @@ pub(super) fn build_bindings(
             continue;
         };
         if phi_participates_in_normal_binding(phi) {
-            let hint = debug_names_by_ssa
-                .get(&SsaValue::Phi(phi.phi))
-                .cloned()
-                .or_else(|| {
-                    debug_local_hint_for_reg_at_block_entry(proto, cfg, phi.block, phi.reg)
-                });
+            let hint = phi_debug_hints[phi.phi.index()].clone();
             temp_debug_locals[temp.index()] = hint.as_ref().map(|hint| hint.name.clone());
             temp_debug_scopes[temp.index()] = hint.map(|hint| hint.scope);
         }
@@ -597,16 +605,21 @@ impl<T: Copy + Eq> BindingCandidate<T> {
 }
 
 /// 同一未捕获 VM 槽的 loop state 在原定义点直接写回 carried temp；这里只合并 identity，
-/// 不移动表达式。候选从 carried target 出发一次构建，避免 result × owner 的重复扫描。
+/// 不移动表达式。无真实读取的同 loop phi stage 也只有在全部消费者仍属于该 carried/result
+/// 协议时才共址；nested carried target 仅额外接纳直接正常出口上唯一的独立 snapshot，
+/// 避免其它 edge copy 延后读取已被覆盖的状态。候选从 carried target 出发一次构建，
+/// 避免 result × owner 的重复扫描。
 fn coalesce_loop_state_temps(
+    cfg: &Cfg,
     dataflow: &DataflowFacts,
     plan: &StructurePlan,
     captured_regs: &[bool],
     nested_carried_parents: &[Option<PhiId>],
-    numeric_binding_phis: &[bool],
-    phi_temps: &mut [TempId],
-    fixed_temps: &mut [TempId],
+    binding_barriers: (&[bool], &[Option<DebugBindingHint>]),
+    binding_temps: (&mut [TempId], &mut [TempId]),
 ) {
+    let (numeric_binding_phis, phi_debug_hints) = binding_barriers;
+    let (phi_temps, fixed_temps) = binding_temps;
     let pure_result_owners = plan
         .phis()
         .map(|phi| {
@@ -624,8 +637,55 @@ fn coalesce_loop_state_temps(
             owner.filter(|_| compatible)
         })
         .collect::<Vec<_>>();
+    let stage_source_eligible = plan
+        .phis()
+        .map(|phi| {
+            pure_result_owners[phi.phi.index()].is_none()
+                && nested_carried_parents[phi.phi.index()].is_none()
+                && !numeric_binding_phis[phi.phi.index()]
+                && phi_debug_hints[phi.phi.index()].is_none()
+                && dataflow.phi_use_count(phi.phi) == 0
+                && phi_participates_in_normal_binding(phi)
+                // Numeric-for 的独立 exit identity 让后续 pass 能把 VM control pack 收回循环头；
+                // 提前并入外围 carried temp 反而会把 state seed 固化成 preheader local。
+                && !phi.incomings.iter().any(|incoming| {
+                    let PhiIncomingDisposition::RegionResult(owner) = incoming.disposition else {
+                        return false;
+                    };
+                    matches!(
+                        plan.region(owner),
+                        Some(RegionPlan::Loop { plan: loop_id, .. })
+                            if matches!(
+                                plan.loop_protocol(*loop_id),
+                                Some(LoopVmProtocol::NumericFor(_))
+                            )
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    let mut direct_exit_stages = vec![BindingCandidate::default(); phi_temps.len()];
+    for consumer in plan.phis() {
+        for incoming in &consumer.incomings {
+            let Some((source, owner, edge)) =
+                direct_loop_exit_stage_snapshot(cfg, plan, consumer.phi, incoming)
+            else {
+                continue;
+            };
+            direct_exit_stages[source.index()].add((owner, edge));
+        }
+    }
+    let mut nested_stage_barrier_temps = vec![false; fixed_temps.len() + phi_temps.len()];
+    for ((temp, is_numeric), debug_hint) in phi_temps
+        .iter()
+        .zip(numeric_binding_phis)
+        .zip(phi_debug_hints)
+    {
+        if *is_numeric || debug_hint.is_some() {
+            nested_stage_barrier_temps[temp.index()] = true;
+        }
+    }
     let mut def_candidates = vec![BindingCandidate::default(); fixed_temps.len()];
-    let mut result_candidates = vec![BindingCandidate::default(); phi_temps.len()];
+    let mut phi_candidates = vec![BindingCandidate::default(); phi_temps.len()];
 
     for phi in plan.phis() {
         if reg_is_captured(captured_regs, phi.reg) || numeric_binding_phis[phi.phi.index()] {
@@ -675,6 +735,27 @@ fn coalesce_loop_state_temps(
                 }
                 SsaValue::Phi(source) => {
                     direct_compatible = false;
+                    let source_plan = plan.phi_plan(source);
+                    let loop_stage = source != phi.phi
+                        && (!has_nested_parent
+                            || (!nested_stage_barrier_temps[target.index()]
+                                && direct_exit_stages[source.index()]
+                                    .resolved()
+                                    .is_some_and(|(owner, _)| owner == carried.owner)))
+                        && phi_debug_hints[phi.phi.index()].is_none()
+                        && stage_source_eligible[source.index()]
+                        && source_plan.is_some_and(|source| {
+                            source.reg == phi.reg
+                                && plan.region_for_block(source.block).is_some_and(|owner| {
+                                    plan.region_contains(*loop_body, owner)
+                                        || plan.region_contains(*loop_control, owner)
+                                })
+                        });
+                    if loop_stage {
+                        phi_candidates[source.index()].add((target, carried.owner, Some(phi.phi)));
+                        result_compatible = false;
+                        continue;
+                    }
                     let result_region = pure_result_owners
                         .get(source.index())
                         .copied()
@@ -722,22 +803,51 @@ fn coalesce_loop_state_temps(
                 def_candidates[def.index()].add(target);
             }
         } else if result_compatible && let Some((source, result_region)) = result_source {
-            result_candidates[source.index()].add((target, result_region));
+            phi_candidates[source.index()].add((target, result_region, None));
         }
     }
 
-    let result_targets = result_candidates
+    let mut phi_targets = phi_candidates
         .into_iter()
         .map(BindingCandidate::resolved)
         .collect::<Vec<_>>();
-    for (temp, target) in phi_temps.iter_mut().zip(&result_targets) {
-        if let Some((target, _)) = target {
+    for consumer in plan.phis() {
+        for incoming in &consumer.incomings {
+            let SsaValue::Phi(source) = incoming.value else {
+                continue;
+            };
+            let Some((target_temp, owner, Some(target))) = phi_targets[source.index()] else {
+                continue;
+            };
+            let nested_target = nested_carried_parents[target.index()].is_some();
+            let compatible = match incoming.disposition {
+                PhiIncomingDisposition::LoopCarried(region) => {
+                    consumer.phi == target && region == owner
+                }
+                PhiIncomingDisposition::RegionResult(region) => !nested_target && region == owner,
+                PhiIncomingDisposition::EdgeCopy => {
+                    nested_target
+                        && incoming.edge.is_some_and(|edge| {
+                            direct_exit_stages[source.index()].resolved() == Some((owner, edge))
+                        })
+                        && phi_temps[consumer.phi.index()] != target_temp
+                }
+                PhiIncomingDisposition::Dead => true,
+                _ => false,
+            };
+            if !compatible {
+                phi_targets[source.index()] = None;
+            }
+        }
+    }
+    for (temp, target) in phi_temps.iter_mut().zip(&phi_targets) {
+        if let Some((target, _, _)) = target {
             *temp = *target;
         }
     }
 
     for phi in plan.phis() {
-        let Some((target, result_region)) = result_targets[phi.phi.index()] else {
+        let Some((target, result_region, None)) = phi_targets[phi.phi.index()] else {
             continue;
         };
         for incoming in &phi.incomings {
@@ -760,6 +870,55 @@ fn coalesce_loop_state_temps(
             *temp = target;
         }
     }
+}
+
+/// 普通 loop control prefix 可能在 exit 前观察 binding，因此这里只接受无普通前缀的
+/// numeric-for control；forwarded action、cleanup、iteration 或并行 batch 也保留独立 snapshot。
+fn direct_loop_exit_stage_snapshot(
+    cfg: &Cfg,
+    plan: &StructurePlan,
+    consumer: PhiId,
+    incoming: &PhiIncomingPlan,
+) -> Option<(PhiId, RegionId, EdgeRef)> {
+    if incoming.disposition != PhiIncomingDisposition::EdgeCopy {
+        return None;
+    }
+    let SsaValue::Phi(source) = incoming.value else {
+        return None;
+    };
+    let edge = incoming.edge?;
+    let edge_plan = plan.edge_plan(edge)?;
+    let cfg_edge = cfg.edges.get(edge.index())?;
+    let source_block = plan.phi_plan(source)?.block;
+    let source_region = plan.region_for_block(source_block)?;
+    let Some(RegionPlan::Loop { control, .. }) = plan.region(edge_plan.owner) else {
+        return None;
+    };
+    let terminator = plan.block_terminator(source_block)?;
+    let BlockTerminatorKind::NumericForLoop { instr, exit, .. } = terminator.kind else {
+        return None;
+    };
+    let [copy] = edge_plan.phi_copies.as_slice() else {
+        return None;
+    };
+    if edge_plan.forward_route.is_some()
+        || plan.edge_action_is_forwarded_only(edge)
+        || edge_plan.actions_before_trailing_cleanup().is_some()
+        || !edge_plan.iteration.is_empty()
+        || !plan.region_contains(*control, source_region)
+        || !matches!(
+            edge_plan.transfer,
+            EdgeTransfer::BranchArm(BranchArm::LoopExit)
+        )
+        || cfg_edge.from != source_block
+        || exit != edge
+        || terminator.instrs.start != instr
+        || copy.phi_id != consumer
+        || copy.value != incoming.value
+    {
+        return None;
+    }
+    Some((source, edge_plan.owner, edge))
 }
 
 fn def_is_same_reg_in_region(

@@ -1712,6 +1712,14 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_312_cross_block_direct_snapshot.lua",
         ALL_NON_LUAU_DIALECTS,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_313_branch_value_terminal_sink.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_314_lvalue_key_deferred_base.lua",
+        ALL_DIALECTS,
+    ),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {

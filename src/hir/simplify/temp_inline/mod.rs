@@ -13,9 +13,13 @@
 //! 相邻内联以可观察事件前缀而非语法子节点顺序判定：纯 local/param 读取本身不是
 //! 屏障，但读取结果形成的 temp 快照不能越过可能改写 binding 的事件；lookup、调用、
 //! 运算和 method sugar 的隐式 lookup 是屏障。while/repeat 条件还属于每轮重新求值的
-//! 独立区域，不能接收循环外快照。跨边界折叠只有两个窄合同：repeat body 尾写入与
-//! until 属于同一轮；open return 的 fixed alias 则必须先于完整保留的 tail setup，且
-//! source/target home 不被 setup 写入或 capture。两者都要求唯一消费且不绕过原求值点。
+//! 独立区域，不能接收循环外快照。跨边界折叠只有三个窄合同：repeat body 尾写入与
+//! until 属于同一轮；open return 的 fixed alias 必须先于完整保留的 tail setup；PUC
+//! Lua 5.2–5.5 的单 upvalue table 左值可把相邻 producer 收回 key。三项仍要求唯一消费
+//! 且不绕过原求值点；前两项不允许相关 home 被跨越区间写入或 capture，table key 则
+//! 继续服从内部前缀顺序证明。
+//! branch-values 的定向入口只重用同一证明去处理本轮新暴露的根级 global-call run 或
+//! 单值 terminal return，不递归，也不开放其它普通内联 site。
 
 mod rewrite;
 mod site;
@@ -23,7 +27,7 @@ mod usage;
 
 use std::collections::BTreeSet;
 
-use crate::ast::ReadabilityOptions;
+use crate::ast::{DecompileDialect, ReadabilityOptions};
 use crate::hir::common::{
     HirBlock, HirCallExpr, HirExpr, HirLValue, HirProto, HirStmt, HirTableField, HirTableKey,
     TempId,
@@ -36,8 +40,8 @@ use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 use self::rewrite::replace_temp_in_stmt;
 use self::site::{
     InlineSite, expr_touches_temp, inline_site_in_repeat_condition, inline_site_in_stmt,
-    is_stable_inline_value, temp_precedes_observable_eval_in_expr,
-    temp_precedes_observable_eval_in_stmt,
+    is_stable_inline_value, puc_upvalue_table_key_with_deferred_base_read,
+    temp_precedes_observable_eval_in_expr, temp_precedes_observable_eval_in_stmt,
 };
 use self::usage::{
     TempUseScratch, collect_expr_temp_uses_summary, collect_stmt_temp_uses, inline_candidate,
@@ -55,13 +59,74 @@ const CALL_MATERIALIZATION_SINK_REWRITE_BUDGET: usize = 1024;
 struct TempInlineWorkspace {
     uses: TempUseScratch,
     order_sensitive_defs: OrderSensitiveDefWorkspace,
+    scope: TempInlineScope,
+    dialect: DecompileDialect,
+}
+
+enum TempInlineScope {
+    All,
+    BranchValueSinks(Vec<bool>),
+}
+
+impl TempInlineScope {
+    fn allows_open_return(&self) -> bool {
+        matches!(self, Self::All)
+    }
+
+    fn allows_adjacent(
+        &self,
+        temp: TempId,
+        site: InlineSite,
+        next_stmt: &HirStmt,
+        is_block_terminal: bool,
+    ) -> bool {
+        let Self::BranchValueSinks(exposed) = self else {
+            return true;
+        };
+        exposed.get(temp.index()).copied().unwrap_or(false)
+            && site == InlineSite::ReturnValue
+            && is_block_terminal
+            && matches!(
+                next_stmt,
+                HirStmt::Return(ret)
+                    if ret.values.tail.is_none()
+                        && matches!(ret.values.fixed.as_slice(),
+                            [HirExpr::TempRef(result)] if *result == temp)
+            )
+    }
+
+    fn allows_call(
+        &self,
+        call_stmt: &crate::hir::common::HirCallStmt,
+        callee_value: &HirExpr,
+        terminal_candidate: Option<TempId>,
+        sink: &HirStmt,
+    ) -> bool {
+        let Self::BranchValueSinks(exposed) = self else {
+            return true;
+        };
+        !call_stmt.call.method
+            && call_stmt.call.method_name.is_none()
+            && matches!(callee_value, HirExpr::GlobalRef(_))
+            && terminal_candidate.is_some_and(|temp| {
+                exposed.get(temp.index()).copied().unwrap_or(false)
+                    && inline_site_in_stmt(sink, temp).is_some()
+            })
+    }
 }
 
 impl TempInlineWorkspace {
-    fn new(proto: &HirProto, temp_count: usize) -> Self {
+    fn new(
+        proto: &HirProto,
+        temp_count: usize,
+        scope: TempInlineScope,
+        dialect: DecompileDialect,
+    ) -> Self {
         Self {
             uses: TempUseScratch::new(proto, temp_count),
             order_sensitive_defs: OrderSensitiveDefWorkspace::new(temp_count),
+            scope,
+            dialect,
         }
     }
 }
@@ -70,16 +135,49 @@ pub(super) fn inline_temps_in_proto_with_facts(
     proto: &mut HirProto,
     readability: ReadabilityOptions,
     facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
 ) -> bool {
-    let proto_temp_count = proto
-        .temps
+    inline_temps_in_proto_with_scope(proto, readability, facts, TempInlineScope::All, dialect)
+}
+
+pub(super) fn inline_exposed_branch_value_sinks_in_proto_with_facts(
+    proto: &mut HirProto,
+    exposed_temps: &[TempId],
+    readability: ReadabilityOptions,
+    facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
+) {
+    if exposed_temps.is_empty() {
+        return;
+    }
+    let exposed_len = exposed_temps
         .iter()
         .map(|temp| temp.index())
         .max()
-        .map_or(0, |max_index| max_index + 1);
-    let body_temp_count = max_temp_index_in_block(&proto.body).map_or(0, |max_index| max_index + 1);
-    let temp_count = proto_temp_count.max(body_temp_count);
-    let mut workspace = TempInlineWorkspace::new(proto, temp_count);
+        .expect("non-empty exposed temp set must have a maximum")
+        + 1;
+    let mut exposed = vec![false; exposed_len];
+    for temp in exposed_temps {
+        exposed[temp.index()] = true;
+    }
+    inline_temps_in_proto_with_scope(
+        proto,
+        readability,
+        facts,
+        TempInlineScope::BranchValueSinks(exposed),
+        dialect,
+    );
+}
+
+fn inline_temps_in_proto_with_scope(
+    proto: &mut HirProto,
+    readability: ReadabilityOptions,
+    facts: &ProtoPromotionFacts,
+    scope: TempInlineScope,
+    dialect: DecompileDialect,
+) -> bool {
+    let temp_count = temp_count_for_proto(proto);
+    let mut workspace = TempInlineWorkspace::new(proto, temp_count, scope, dialect);
     let mut live_use_counts = collect_block_temp_use_totals(&proto.body.stmts, &mut workspace.uses);
     let reference_captured = super::mention::stmts_reference_captured_bindings(&proto.body.stmts);
     inline_temps_in_block(
@@ -91,6 +189,17 @@ pub(super) fn inline_temps_in_proto_with_facts(
         facts,
         &BTreeSet::new(),
     )
+}
+
+fn temp_count_for_proto(proto: &HirProto) -> usize {
+    let proto_temp_count = proto
+        .temps
+        .iter()
+        .map(|temp| temp.index())
+        .max()
+        .map_or(0, |max_index| max_index + 1);
+    let body_temp_count = max_temp_index_in_block(&proto.body).map_or(0, |max_index| max_index + 1);
+    proto_temp_count.max(body_temp_count)
 }
 
 fn inline_temps_in_block(
@@ -109,28 +218,29 @@ fn inline_temps_in_block(
 
     for index in 0..block.stmts.len() {
         captured_slots_before_stmt.push(&active_captured_slots);
-        let mut nested_captured_slots = active_captured_slots.clone();
-        facts.collect_prefix_captured_home_slots_in_stmt(
-            &block.stmts[index],
-            &mut nested_captured_slots,
-        );
-        let stmt = &mut block.stmts[index];
-        changed |= inline_temps_in_nested_blocks(
-            stmt,
-            workspace,
-            live_use_counts,
-            reference_captured,
-            readability,
-            facts,
-            &nested_captured_slots,
-        );
+        if matches!(workspace.scope, TempInlineScope::All) {
+            let mut nested_captured_slots = active_captured_slots.clone();
+            facts.collect_prefix_captured_home_slots_in_stmt(
+                &block.stmts[index],
+                &mut nested_captured_slots,
+            );
+            changed |= inline_temps_in_nested_blocks(
+                &mut block.stmts[index],
+                workspace,
+                live_use_counts,
+                reference_captured,
+                readability,
+                facts,
+                &nested_captured_slots,
+            );
+        }
+        let stmt = &block.stmts[index];
         facts.collect_captured_home_slots_in_stmt(stmt, &mut active_captured_slots);
     }
 
     if inline_materialization_runs(
         block,
-        &mut workspace.uses,
-        &mut workspace.order_sensitive_defs,
+        workspace,
         live_use_counts,
         facts,
         &captured_slots_before_stmt,
@@ -171,6 +281,9 @@ fn inline_temps_in_block(
             && total_use_count(temp, live_use_counts) == 1
             && let Some(next_stmt) = kept_rev.last()
             && let Some(site) = inline_site_in_stmt(next_stmt, temp)
+            && workspace
+                .scope
+                .allows_adjacent(temp, site, next_stmt, kept_rev.len() == 1)
             && !call_arg_inline_crosses_materialized_callee(
                 site,
                 value,
@@ -183,6 +296,7 @@ fn inline_temps_in_block(
                 next_stmt,
                 temp,
                 reference_captured,
+                workspace.dialect,
             )
             && site.allows(value, readability)
         {
@@ -214,10 +328,20 @@ fn inline_crosses_evaluation_boundary(
     next_stmt: &HirStmt,
     temp: TempId,
     reference_captured: &ReferenceCapturedBindings,
+    dialect: DecompileDialect,
 ) -> bool {
     fixed_return_tail_call_prefers_materialization(site, value, next_stmt, temp)
         || (site == InlineSite::LoopCondition && !is_stable_inline_value(value))
         || (expr_requires_ordered_snapshot(value)
+            && !puc_upvalue_table_key_with_deferred_base_read(site, next_stmt, dialect)
+                .is_some_and(|key| {
+                    temp_precedes_observable_eval_in_expr(
+                        key,
+                        temp,
+                        expr_observes_eval_order(value),
+                        reference_captured,
+                    )
+                })
             && !temp_precedes_observable_eval_in_stmt(
                 next_stmt,
                 temp,
@@ -285,8 +409,7 @@ impl CapturedSlotSnapshots {
 
 fn inline_materialization_runs(
     block: &mut HirBlock,
-    scratch: &mut TempUseScratch,
-    order_sensitive_defs: &mut OrderSensitiveDefWorkspace,
+    workspace: &mut TempInlineWorkspace,
     live_use_counts: &mut [usize],
     facts: &ProtoPromotionFacts,
     captured_slots_before_stmt: &CapturedSlotSnapshots,
@@ -294,6 +417,12 @@ fn inline_materialization_runs(
 ) -> bool {
     // child block 已全部处理完才会到这里，因此同一个 proto 级 workspace 不会覆盖
     // 仍在活跃递归 frame 中的 parent 索引。
+    let TempInlineWorkspace {
+        uses,
+        order_sensitive_defs,
+        scope,
+        dialect,
+    } = workspace;
     order_sensitive_defs.rebuild(&block.stmts);
     let mut removed_stmts = vec![false; block.stmts.len()];
     let mut changed = false;
@@ -309,15 +438,17 @@ fn inline_materialization_runs(
         while run_end < block.stmts.len() && inline_candidate(&block.stmts[run_end]).is_some() {
             run_end += 1;
         }
-        if inline_open_return_fixed_alias_run(
-            block,
-            run_start..run_end,
-            scratch,
-            live_use_counts,
-            facts,
-            captured_slots_before_stmt,
-            &mut removed_stmts,
-        ) {
+        if scope.allows_open_return()
+            && inline_open_return_fixed_alias_run(
+                block,
+                run_start..run_end,
+                uses,
+                live_use_counts,
+                facts,
+                captured_slots_before_stmt,
+                &mut removed_stmts,
+            )
+        {
             changed = true;
             index = run_end + 1;
             continue;
@@ -341,11 +472,24 @@ fn inline_materialization_runs(
             index = run_end + 1;
             continue;
         };
+        let terminal_candidate = block.stmts[..run_end]
+            .last()
+            .and_then(inline_candidate)
+            .map(|(temp, _)| temp);
+        if !scope.allows_call(
+            call_stmt,
+            callee_value,
+            terminal_candidate,
+            &block.stmts[run_end],
+        ) {
+            index = run_end + 1;
+            continue;
+        }
         if !cross_call_inline_candidate_is_safe(
             callee_temp,
             callee_value,
             callee_index,
-            scratch,
+            uses,
             facts,
             captured_slots_before_stmt,
         ) || total_use_count(callee_temp, live_use_counts) != 1
@@ -373,13 +517,13 @@ fn inline_materialization_runs(
                 temp,
                 value,
                 candidate_index,
-                scratch,
+                uses,
                 facts,
                 captured_slots_before_stmt,
             );
             if use_count == 0 {
                 if candidate_is_safe && expr_is_discard_safe(value) {
-                    discarded_uses.push(collect_expr_temp_uses_summary(value, scratch));
+                    discarded_uses.push(collect_expr_temp_uses_summary(value, uses));
                     continue;
                 }
                 complete_run = false;
@@ -406,6 +550,7 @@ fn inline_materialization_runs(
                     &rewritten_sink,
                     temp,
                     reference_captured,
+                    *dialect,
                 )
             {
                 complete_run = false;
@@ -429,6 +574,7 @@ fn inline_materialization_runs(
                 &rewritten_sink,
                 callee_temp,
                 reference_captured,
+                *dialect,
             )
         {
             index = run_end + 1;

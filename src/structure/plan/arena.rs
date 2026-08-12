@@ -5559,16 +5559,11 @@ fn detect_normal_loop_tail(
         && matches!(
             cfg.terminator(&proto.instrs, candidate.header),
             Some(LowInstr::GenericForLoop(instr))
-                if crate::structure::helpers::share_transparent_jump_target(
-                    proto,
-                    cfg,
-                    instr.exit_target,
-                    instr.body_target,
-                )
+                if crate::structure::loops::generic_for_immediate_break(proto, cfg, instr)
         )
     {
-        // body 与零迭代出口最终进入同一透明 pad 时，源码语义是“首轮立即
-        // break”，并不存在只应由正常出口执行的 tail。
+        // body 与零迭代出口相同，或后者先经单跳 pad 汇入 body 时，源码语义是
+        // “首轮立即 break”，并不存在只应由正常出口执行的 tail。
         return None;
     }
     let continuation = domain.continuation?;

@@ -1,6 +1,7 @@
 -- regress_114_luau_repeat_shared_nested_loop_tail#1: repeat 分支共享嵌套 for tail
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-contains [[for ]]
+-- unluac: expect-contains [[for r1_12 = 1, 3 do]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]

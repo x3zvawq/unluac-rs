@@ -33,7 +33,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::structure::{BlockRef, Cfg, DataflowFacts, EdgeKind, EdgeRef, GraphFacts};
-use crate::transformer::{LowInstr, LoweredProto, Reg};
+use crate::transformer::{GenericForLoopInstr, LowInstr, LoweredProto, Reg};
 
 use super::common::{
     BranchCandidate, BranchKind, LoopCandidate, LoopExitAlias, LoopExitValueMergeCandidate,
@@ -1495,6 +1495,17 @@ fn same_or_equivalent_exit_target(
         || equivalent_single_return_targets(proto, cfg, actual, expected)
 }
 
+/// generic-for 的零迭代出口可以先经过一层纯 jump 汇入原始 body target；
+/// body target 本身不能继续穿透，否则会把祖先 loop latch 误当成普通空 body。
+pub(super) fn generic_for_immediate_break(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    instr: &GenericForLoopInstr,
+) -> bool {
+    cfg.instr_to_block[instr.exit_target.index()] == cfg.instr_to_block[instr.body_target.index()]
+        || same_or_transparent_jump_target(proto, cfg, instr.exit_target, instr.body_target)
+}
+
 fn analyze_degenerate_generic_for_loops(
     proto: &LoweredProto,
     cfg: &Cfg,
@@ -1535,8 +1546,7 @@ fn degenerate_generic_for_loop(
     let exit = cfg.instr_to_block[instr.exit_target.index()];
     // Luau 会把 `for ... do break end` 编译成 body/exit 同目标，或让 exit 先经过
     // 单条 jump pad 再汇入 body；这不是“没有循环”，候选只需让 header 持有控制结构。
-    let immediate_break = body == exit
-        || same_or_transparent_jump_target(proto, cfg, instr.exit_target, instr.body_target);
+    let immediate_break = generic_for_immediate_break(proto, cfg, instr);
     let mut blocks = BTreeSet::from([header]);
     if !immediate_break {
         blocks.extend(collect_forward_region_blocks(
@@ -2287,7 +2297,7 @@ fn generic_for_has_loop_body_and_exit(
     proto: &LoweredProto,
     cfg: &Cfg,
     header: BlockRef,
-    instr: &crate::transformer::GenericForLoopInstr,
+    instr: &GenericForLoopInstr,
     blocks: &BTreeSet<BlockRef>,
 ) -> bool {
     let range = cfg.blocks[header.index()].instrs;
@@ -2305,8 +2315,6 @@ fn generic_for_has_loop_body_and_exit(
 
     call.control == instr.control_target
         && matches!(call.results, crate::transformer::ResultPack::Fixed(range) if range == instr.bindings)
-        && (body_block == exit_block
-            || same_or_transparent_jump_target(proto, cfg, instr.exit_target, instr.body_target)
-            || blocks.contains(&body_block))
+        && (generic_for_immediate_break(proto, cfg, instr) || blocks.contains(&body_block))
         && !blocks.contains(&exit_block)
 }

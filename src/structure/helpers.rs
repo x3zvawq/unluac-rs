@@ -86,6 +86,7 @@ pub(super) fn control_prefix_is_movable(proto: &LoweredProto, cfg: &Cfg, block: 
     })
 }
 
+/// `actual` 可以是直达 `expected` 所在 block 的单跳 pad；只穿透实际目标这一侧。
 pub(super) fn same_or_transparent_jump_target(
     proto: &LoweredProto,
     cfg: &Cfg,
@@ -124,27 +125,6 @@ pub(super) fn equivalent_single_return_targets(
             (Some(LowInstr::Return(actual)), Some(LowInstr::Return(expected)))
                 if actual == expected
         )
-}
-
-/// 两个 VM target 可以各自先经过一个透明 jump pad，再汇入同一 block。
-pub(super) fn share_transparent_jump_target(
-    proto: &LoweredProto,
-    cfg: &Cfg,
-    left: crate::transformer::InstrRef,
-    right: crate::transformer::InstrRef,
-) -> bool {
-    let transparent_target = |instr: crate::transformer::InstrRef| {
-        let block = cfg.instr_to_block[instr.index()];
-        let range = cfg.blocks[block.index()].instrs;
-        if range.len == 1
-            && let Some(LowInstr::Jump(jump)) = cfg.terminator(&proto.instrs, block)
-        {
-            cfg.instr_to_block[jump.target.index()]
-        } else {
-            block
-        }
-    };
-    transparent_target(left) == transparent_target(right)
 }
 
 pub(super) fn collect_region_exits(cfg: &Cfg, blocks: &BTreeSet<BlockRef>) -> BTreeSet<BlockRef> {

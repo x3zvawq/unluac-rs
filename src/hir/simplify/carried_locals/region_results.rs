@@ -3,8 +3,9 @@
 //! StructurePlan 会为 branch/loop result 保留独立 SSA 身份。提升到 HIR 后，这类身份
 //! 可能表现为 `local result; if ... result = state ... end`，或在每个 loop break 前把
 //! carried state 复制到 result temp。只有所有能抵达后缀的路径都完整定义 result，
-//! 并能证明相邻写回或后续使用仍由同一 home slot 承担时，result 才能安全复用原
-//! local/param；capture、跨 label 与独立状态写入都会阻止该折叠。
+//! 并能证明同一 home slot，或证明动态 repeat 的匿名 result 在每个出口都只是 state 的
+//! 精确副本时，result 才能安全复用原 local/param；capture、跨 label 与独立状态写入都会
+//! 阻止该折叠。continue/goto 的条件路径不由这个 pass 猜测。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -111,6 +112,7 @@ pub(super) fn collapse_inferred_if_result_chains(
                 declaration_start,
                 &result_index,
                 promotion_facts,
+                true,
             )?;
             (!inferred.iter().any(|(result, seed)| {
                 outer_bindings.contains(result) || outer_bindings.contains(seed)
@@ -424,7 +426,8 @@ fn try_collapse_inferred_if_results(
     let Some(exits) = if_fallthrough_assignments(if_stmt, &results) else {
         return false;
     };
-    let Some(rewrites) = infer_rewrites(&results, &exits, index, result_index, promotion_facts)
+    let Some(rewrites) =
+        infer_rewrites(&results, &exits, index, result_index, promotion_facts, true)
     else {
         return false;
     };
@@ -448,18 +451,19 @@ fn try_collapse_loop_results(
     let Some(stmt) = block.stmts.get(index) else {
         return false;
     };
-    let (body, include_fallthrough) = match stmt {
+    let (body, include_fallthrough, requires_exact_exits) = match stmt {
         HirStmt::While(while_stmt) if while_stmt.cond == HirExpr::Boolean(true) => {
-            (&while_stmt.body, false)
+            (&while_stmt.body, false, false)
         }
-        HirStmt::Repeat(repeat_stmt) if repeat_stmt.cond == HirExpr::Boolean(true) => {
-            (&repeat_stmt.body, true)
-        }
+        HirStmt::Repeat(repeat_stmt) => (
+            &repeat_stmt.body,
+            true,
+            repeat_stmt.cond != HirExpr::Boolean(true),
+        ),
         _ => return false,
     };
-
     let mut exits = Vec::new();
-    if !collect_break_assignments(body, &mut exits) || exits.is_empty() {
+    if !collect_break_assignments(body, &mut exits, requires_exact_exits) || exits.is_empty() {
         return false;
     }
     if include_fallthrough && block_may_fall_through(body) {
@@ -499,10 +503,28 @@ fn try_collapse_loop_results(
         return false;
     }
     let results = results.into_iter().collect::<Vec<_>>();
-    let Some(rewrites) = infer_rewrites(&results, &exits, index, result_index, promotion_facts)
-    else {
+    let Some(rewrites) = infer_rewrites(
+        &results,
+        &exits,
+        index,
+        result_index,
+        promotion_facts,
+        !requires_exact_exits,
+    ) else {
         return false;
     };
+    // 动态 repeat 的 synthetic result 没有稳定 home slot；只有每条出口都是 state 的
+    // 精确快照且不在同一赋值中改写 state，才能把这个跨槽身份安全消掉。
+    if requires_exact_exits
+        && !rewrites.iter().all(|(result, seed)| {
+            exits.iter().all(|exit| {
+                !exit.contains_key(seed)
+                    && exit.get(result).and_then(carry_binding_from_expr) == Some(*seed)
+            })
+        })
+    {
+        return false;
+    }
     if rewrites
         .iter()
         .any(|(result, seed)| outer_bindings.contains(result) || outer_bindings.contains(seed))
@@ -812,6 +834,7 @@ fn assignment_values(assign: &HirAssign) -> Option<BTreeMap<CarryBinding, HirExp
 fn collect_break_assignments(
     block: &HirBlock,
     exits: &mut Vec<BTreeMap<CarryBinding, HirExpr>>,
+    reject_untracked_transfers: bool,
 ) -> bool {
     for (index, stmt) in block.stmts.iter().enumerate() {
         match stmt {
@@ -828,19 +851,25 @@ fn collect_break_assignments(
                 exits.push(exit);
             }
             HirStmt::If(if_stmt) => {
-                if !collect_break_assignments(&if_stmt.then_block, exits)
-                    || if_stmt
-                        .else_block
-                        .as_ref()
-                        .is_some_and(|block| !collect_break_assignments(block, exits))
-                {
+                if !collect_break_assignments(
+                    &if_stmt.then_block,
+                    exits,
+                    reject_untracked_transfers,
+                ) || if_stmt.else_block.as_ref().is_some_and(|block| {
+                    !collect_break_assignments(block, exits, reject_untracked_transfers)
+                }) {
                     return false;
                 }
             }
             HirStmt::Block(block) => {
-                if !collect_break_assignments(block, exits) {
+                if !collect_break_assignments(block, exits, reject_untracked_transfers) {
                     return false;
                 }
+            }
+            HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_)
+                if reject_untracked_transfers =>
+            {
+                return false;
             }
             HirStmt::While(_)
             | HirStmt::Repeat(_)
@@ -872,6 +901,7 @@ fn infer_rewrites(
     region_index: usize,
     result_index: &RegionResultIndex<'_>,
     promotion_facts: &ProtoPromotionFacts,
+    require_home_slot: bool,
 ) -> Option<BTreeMap<CarryBinding, CarryBinding>> {
     let mut rewrites = BTreeMap::new();
     let mut claimed = BTreeSet::new();
@@ -890,7 +920,7 @@ fn infer_rewrites(
         if seed == *result || !claimed.insert(seed) {
             return None;
         }
-        if !bindings_share_home_slot(*result, seed, promotion_facts) {
+        if require_home_slot && !bindings_share_home_slot(*result, seed, promotion_facts) {
             return None;
         }
         rewrites.insert(*result, seed);

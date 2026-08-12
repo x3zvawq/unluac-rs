@@ -21,6 +21,8 @@
 //! 保持原树，交给 `locals::branch_merge` 物化稳定 binding 后在下一轮重试，不能为追求折叠丢状态。
 //! guard producer 的结果通过 `CurrentValue` 进入 Decision 结果臂，带调用或动态读取的 producer
 //! 也只在原位置求值一次，不能把同一表达式 clone 成条件与结果后重复执行。
+//! raw Temp 收成值后，仅把本轮新生成的 target 交给 temp-inline 的根级 Call/Return 定向入口；
+//! 不能重跑全 proto 的普通内联，也不能让 `locals` 延后到另一个 phase。
 //! goto/label 壳先建立一次 label facts，再选择不交叉区间线性重建 block；独立候选不会每命中一个
 //! 就重新扫描整块。
 //!
@@ -39,21 +41,37 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::label_refs::count_label_references;
 use super::local_shapes::empty_single_local_decl_binding;
 use super::mention::{block_mentions_local, expr_mentions_local, expr_mentions_temp};
+use super::temp_inline::inline_exposed_branch_value_sinks_in_proto_with_facts;
 use super::temp_touch::collect_temp_refs_by_stmt;
 use super::walk::{HirRewritePass, rewrite_proto};
+use crate::ast::{DecompileDialect, ReadabilityOptions};
 use crate::hir::HirLabelId;
 use crate::hir::common::{
     HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirDecisionExpr, HirDecisionNode,
     HirDecisionNodeRef, HirDecisionTarget, HirExpr, HirIf, HirLValue, HirLocalDecl, HirProto,
     HirStmt, HirUnaryOpKind, HirValuePack, LocalId, TempId,
 };
+use crate::hir::promotion::ProtoPromotionFacts;
 
 mod decision_builder;
 
 use decision_builder::BranchValueDecisionBuilder;
 
-pub(super) fn fold_branch_values_in_proto(proto: &mut HirProto) -> bool {
-    let raw_temp_changed = fold_root_branch_value_temps(proto);
+pub(super) fn fold_branch_values_in_proto(
+    proto: &mut HirProto,
+    readability: ReadabilityOptions,
+    facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
+) -> bool {
+    let exposed_temps = fold_root_branch_value_temps(proto);
+    let raw_temp_changed = !exposed_temps.is_empty();
+    inline_exposed_branch_value_sinks_in_proto_with_facts(
+        proto,
+        &exposed_temps,
+        readability,
+        facts,
+        dialect,
+    );
     let label_refs = count_label_references(&proto.body.stmts);
     let other_changed = rewrite_proto(
         proto,
@@ -119,14 +137,14 @@ fn fold_branch_value_locals_in_block(stmts: &mut Vec<HirStmt>) -> bool {
 
 /// `locals` 之前只处理 proto 根 block 的机械 temp 值树。每个 proto 单独调用，因此同号
 /// TempId 不会跨 child proto 混合；现有 per-stmt touch facts 证明 guard 没有逃出候选语句。
-fn fold_root_branch_value_temps(proto: &mut HirProto) -> bool {
+fn fold_root_branch_value_temps(proto: &mut HirProto) -> Vec<TempId> {
     if !proto
         .body
         .stmts
         .iter()
         .any(|stmt| matches!(stmt, HirStmt::If(_)))
     {
-        return false;
+        return Vec::new();
     }
 
     let refs_by_stmt = collect_temp_refs_by_stmt(&proto.body.stmts);
@@ -137,9 +155,9 @@ fn fold_root_branch_value_temps(proto: &mut HirProto) -> bool {
         }
     }
 
-    let mut changed = false;
+    let mut exposed_temps = Vec::new();
     for stmt in &mut proto.body.stmts {
-        let Some((replacement, guards)) = collapsible_branch_value_temp(stmt) else {
+        let Some((target, replacement, guards)) = collapsible_branch_value_temp(stmt) else {
             continue;
         };
         let guards_are_mechanical = guards.iter().all(|guard| {
@@ -151,10 +169,10 @@ fn fold_root_branch_value_temps(proto: &mut HirProto) -> bool {
         });
         if guards_are_mechanical {
             *stmt = replacement;
-            changed = true;
+            exposed_temps.push(target);
         }
     }
-    changed
+    exposed_temps
 }
 
 /// 扫描 block 中相邻的 `local X; if A == nil then X=b else X=A end` 形状，
@@ -318,14 +336,14 @@ fn collapsible_branch_value_local(
     Some((binding, value))
 }
 
-fn collapsible_branch_value_temp(stmt: &HirStmt) -> Option<(HirStmt, BTreeSet<TempId>)> {
+fn collapsible_branch_value_temp(stmt: &HirStmt) -> Option<(TempId, HirStmt, BTreeSet<TempId>)> {
     let HirStmt::If(if_stmt) = stmt else {
         return None;
     };
     let binding = branch_value_binding_in_block(&if_stmt.then_block)?;
-    if !matches!(binding, BranchValueBinding::Temp(_)) {
+    let BranchValueBinding::Temp(target) = binding else {
         return None;
-    }
+    };
     let mut builder = BranchValueDecisionBuilder::new();
     let root = builder.collapse_if(if_stmt, binding)?;
     // raw temp 没有 local 壳提供稳定的中间边界；若整棵树尚不能收成值表达式，
@@ -333,7 +351,7 @@ fn collapsible_branch_value_temp(stmt: &HirStmt) -> Option<(HirStmt, BTreeSet<Te
     // 因此这里全有或全无，保持原树交给 locals 后的路径继续处理。
     let (value, guards) = builder.finish(root, binding)?;
     let replacement = assign_binding_value(binding, value);
-    Some((replacement, guards))
+    Some((target, replacement, guards))
 }
 
 fn branch_value_expr(binding: BranchValueBinding, if_stmt: &HirIf) -> Option<HirExpr> {

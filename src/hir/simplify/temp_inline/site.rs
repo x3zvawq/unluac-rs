@@ -82,6 +82,38 @@ pub(super) fn temp_precedes_observable_eval_in_expr(
     .expr(expr)
 }
 
+/// 返回 PUC Lua 5.2–5.5 标量 upvalue table 左值的 key。
+///
+/// 这四种方言会先求 key，再读取最终 table upvalue。Lua 5.1、LuaJIT 与 Luau
+/// 会先快照 inherited upvalue，因此不能共享这个合同。
+pub(super) fn puc_upvalue_table_key_with_deferred_base_read(
+    site: InlineSite,
+    stmt: &HirStmt,
+    dialect: DecompileDialect,
+) -> Option<&HirExpr> {
+    if site != InlineSite::Index
+        || !matches!(
+            dialect,
+            DecompileDialect::Lua52
+                | DecompileDialect::Lua53
+                | DecompileDialect::Lua54
+                | DecompileDialect::Lua55
+        )
+    {
+        return None;
+    }
+    let HirStmt::Assign(assign) = stmt else {
+        return None;
+    };
+    let [HirLValue::TableAccess(access)] = assign.targets.as_slice() else {
+        return None;
+    };
+    if !matches!(&access.base, HirExpr::UpvalueRef(_)) {
+        return None;
+    }
+    Some(&access.key)
+}
+
 struct EvalOrderProbe<'a> {
     temp: TempId,
     mutable_snapshots_are_barriers: bool,
