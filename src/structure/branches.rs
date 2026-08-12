@@ -21,6 +21,7 @@ use super::common::{
     SinglePassFenceFact,
 };
 use super::helpers::{block_has_non_control_prefix, control_prefix_is_movable};
+use super::phi_facts::{BranchValueMergeContext, branch_value_merges_in_block};
 
 pub(super) fn analyze_branches(
     proto: &LoweredProto,
@@ -284,11 +285,11 @@ fn refine_single_pass_fences(
         if escape_edges.is_empty()
             || !has_nested_escape
             || closed_if_else_owns_value_result(
+                cfg,
                 graph_facts,
                 dataflow,
                 &branch_candidates[candidate_index],
-                tail,
-                tail_edge,
+                (tail, tail_edge),
                 exit,
                 &escape_edges,
             )
@@ -339,14 +340,15 @@ fn refine_single_pass_fences(
 /// value-result 已经证明两臂在严格后支配点闭合时，shared-tail 只是其中一臂的
 /// 实现形状；改成 single-pass 会把正常分支的结果边误解释成 `break`。
 fn closed_if_else_owns_value_result(
+    cfg: &Cfg,
     graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
     candidate: &BranchCandidate,
-    tail: BlockRef,
-    tail_edge: EdgeRef,
+    tail: (BlockRef, EdgeRef),
     exit: BlockRef,
     escape_edges: &BTreeSet<EdgeRef>,
 ) -> bool {
+    let (tail, tail_edge) = tail;
     let Some(else_entry) = candidate.else_entry else {
         return false;
     };
@@ -371,7 +373,7 @@ fn closed_if_else_owns_value_result(
 
     // Dataflow 的 block range 是稠密索引；每个 exit 只检查自身 canonical/live phi，
     // 并要求当前两臂的物理边给同一个非平凡 phi 提供不同值。
-    dataflow.phi_candidates_in_block(exit).iter().any(|phi| {
+    let direct_result = dataflow.phi_candidates_in_block(exit).iter().any(|phi| {
         let Some(tail_value) = phi
             .incoming
             .iter()
@@ -398,7 +400,49 @@ fn closed_if_else_owns_value_result(
             }
         }
         covered_escapes == escape_edges.len() && differs
-    })
+    });
+    if direct_result {
+        return true;
+    }
+
+    if graph_facts.block_is_cyclic(candidate.header) || graph_facts.block_is_cyclic(tail) {
+        return false;
+    }
+
+    // 嵌套短路臂会让同一源码臂的多个 leaf 直接进入 strict exit，浅层
+    // `result_arm` 因此不再支配每条 escape。此时仍只信任原始 IfElse 两臂的支配归属，
+    // 再复用 branch-value 的 phi 闭合证明；任意歧义 predecessor 都保守拒绝。
+    let mut then_preds = BTreeSet::new();
+    let mut else_preds = BTreeSet::new();
+    for edge in &cfg.preds[exit.index()] {
+        let pred = cfg.edges[edge.index()].from;
+        if !cfg.reachable_blocks.contains(&pred) {
+            continue;
+        }
+        match (
+            graph_facts.dominates(candidate.then_entry, pred),
+            graph_facts.dominates(else_entry, pred),
+        ) {
+            (true, false) => {
+                then_preds.insert(pred);
+            }
+            (false, true) => {
+                else_preds.insert(pred);
+            }
+            (true, true) | (false, false) => return false,
+        }
+    }
+    !then_preds.is_empty()
+        && !else_preds.is_empty()
+        && then_preds.is_disjoint(&else_preds)
+        && !branch_value_merges_in_block(
+            &BranchValueMergeContext::new(cfg, candidate.header, graph_facts, dataflow),
+            exit,
+            &then_preds,
+            &else_preds,
+            None,
+        )
+        .is_empty()
 }
 
 fn refine_enclosing_loop_escape_merges(

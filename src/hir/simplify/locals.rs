@@ -21,10 +21,11 @@
 //! binding 形状。
 //! 不同 home slot 上的 move alias 是当时值的快照，不能与来源槽位后续的状态合并；
 //! 没有 home slot 的 phi temp 仍可沿同一状态链归并。
-//! 对没有 debug local 证据、home-slot 定义数已经超过源码局部槽上限的大函数，同一
-//! `(slot, close epoch)` 会复用一个 local；物理覆盖保证旧值已死，close epoch 与 capture
-//! sticky 事实继续隔离不同词法身份。候选扩张只沿 temp occurrence index 访问真实 touch，
-//! 不按“每个定义 × 全部后缀语句”重复扫描。
+//! 对没有 debug local 证据、home-slot 定义和根 block 直接 temp 绑定压力都已经超过
+//! 源码局部槽上限的大函数，同一 `(slot, close epoch)` 会复用一个 local；两个门同时
+//! 成立才能证明这是源码层的局部数压力，而不是单纯由 SSA 拆分制造的定义数。物理覆盖
+//! 保证旧值已死，close epoch 与 capture sticky 事实继续隔离不同词法身份。候选扩张只沿
+//! temp occurrence index 访问真实 touch，不按“每个定义 × 全部后缀语句”重复扫描。
 //!
 mod branch_merge;
 mod param_alias;
@@ -50,7 +51,8 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     proto: &mut HirProto,
     facts: &mut ProtoPromotionFacts,
 ) -> bool {
-    let compact_home_slots = facts.home_slot_definition_count() > crate::SOURCE_LOCAL_LIMIT
+    let compact_home_slots = hir_block_local_pressure(&proto.body) > crate::SOURCE_LOCAL_LIMIT
+        && facts.home_slot_definition_count() > crate::SOURCE_LOCAL_LIMIT
         && proto.temp_debug_locals.iter().all(Option::is_none);
     if compact_home_slots {
         facts.enable_home_slot_compaction();
@@ -88,6 +90,22 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     proto.local_debug_hints.extend(new_local_debug_hints);
     let alias_changed = param_alias::coalesce_param_aliases_in_proto(proto);
     result.changed || alias_changed
+}
+
+fn hir_block_local_pressure(block: &HirBlock) -> usize {
+    block
+        .stmts
+        .iter()
+        .map(|stmt| match stmt {
+            HirStmt::Assign(assign) => assign
+                .targets
+                .iter()
+                .filter(|target| matches!(target, HirLValue::Temp(_)))
+                .count(),
+            HirStmt::LocalDecl(local) => local.bindings.len(),
+            _ => 0,
+        })
+        .sum()
 }
 
 #[derive(Debug, Clone)]
