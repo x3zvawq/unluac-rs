@@ -7,6 +7,7 @@
 //! - 被内联表达式必须是我们能证明“纯且无元方法副作用”的安全子集
 //! - 相邻调用准备 run 中的简单表构造参数，可以随同 receiver/callee 一起收回调用位
 //! - 相邻 recovered local run 里，只有末尾 local 仍会跨语句存活的机械链
+//! - generic-for 的 method receiver 允许收回一个紧邻的 recovered binding 别名
 
 mod candidate;
 mod eval_order;
@@ -17,19 +18,27 @@ use std::collections::BTreeMap;
 use crate::ast::ReadabilityOptions;
 
 use self::candidate::{
-    InlinePolicy, inline_candidate, stmt_is_adjacent_call_result_sink,
+    InlineCandidate, InlinePolicy, inline_candidate, stmt_is_adjacent_call_result_sink,
     stmt_is_alias_initializer_sink, stmt_is_direct_return_value_sink,
 };
 use self::use_sites::rewrite_stmt_use_sites_with_policy;
-use super::super::common::{AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstModule, AstStmt};
+use super::super::common::{
+    AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue, AstModule,
+    AstNameRef, AstStmt,
+};
 use super::ReadabilityContext;
-use super::binding_flow::{BindingUseIndex, MutableSnapshotNames, mutable_snapshot_names_in_block};
+use super::binding_flow::{
+    BindingUseIndex, MutableSnapshotNames, binding_mentions_in_expr,
+    mutable_snapshot_names_in_block,
+};
+use super::binding_ref::binding_from_name_ref;
 use super::binding_tree::{
     expr_references_binding, stmt_has_access_base_binding_use, stmt_has_call_callee_binding_use,
     stmt_has_direct_call_arg_binding_use, stmt_has_index_binding_use, stmt_has_nested_binding_use,
     stmt_has_nested_binding_value_use,
 };
 use super::stmt_plan::{PlannedStmt, materialize_stmt_plan};
+use super::visit::AstVisitor;
 use super::walk::{self, AstRewritePass, BlockKind};
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
@@ -47,6 +56,78 @@ pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool
 struct InlineExprsPass {
     options: ReadabilityOptions,
     mutable_snapshot_stack: Vec<MutableSnapshotNames>,
+}
+
+#[derive(Default)]
+struct BindingWriteIndex {
+    last_write_by_binding: BTreeMap<AstBindingRef, usize>,
+}
+
+impl BindingWriteIndex {
+    fn for_stmts(stmts: &[AstStmt]) -> Self {
+        let mut index = Self::default();
+        for (stmt_index, stmt) in stmts.iter().enumerate() {
+            let mut collector = BindingWriteCollector {
+                stmt_index,
+                index: &mut index,
+            };
+            super::visit::visit_stmt(stmt, &mut collector);
+        }
+        index
+    }
+
+    fn record(&mut self, stmt_index: usize, binding: AstBindingRef) {
+        self.last_write_by_binding.insert(binding, stmt_index);
+    }
+
+    fn has_write_after(&self, stmt_index: usize, binding: AstBindingRef) -> bool {
+        self.last_write_by_binding
+            .get(&binding)
+            .is_some_and(|last_write| *last_write > stmt_index)
+    }
+}
+
+fn removable_inline_candidate<'a>(
+    stmts: &'a [AstStmt],
+    stmt_index: usize,
+    write_index: &BindingWriteIndex,
+) -> Option<(InlineCandidate, &'a AstExpr)> {
+    let (candidate, value) = inline_candidate(stmts.get(stmt_index)?)?;
+    (!write_index.has_write_after(stmt_index, candidate.binding())).then_some((candidate, value))
+}
+
+struct BindingWriteCollector<'a> {
+    stmt_index: usize,
+    index: &'a mut BindingWriteIndex,
+}
+
+impl AstVisitor for BindingWriteCollector<'_> {
+    fn visit_stmt(&mut self, stmt: &AstStmt) {
+        let AstStmt::FunctionDecl(function) = stmt else {
+            return;
+        };
+        let AstFunctionName::Plain(path) = &function.target else {
+            return;
+        };
+        if path.fields.is_empty()
+            && let Some(binding) = binding_from_name_ref(&path.root)
+        {
+            self.index.record(self.stmt_index, binding);
+        }
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &AstLValue) {
+        let AstLValue::Name(name) = lvalue else {
+            return;
+        };
+        if let Some(binding) = binding_from_name_ref(name) {
+            self.index.record(self.stmt_index, binding);
+        }
+    }
+
+    fn visit_function_expr(&mut self, _function: &AstFunctionExpr) -> bool {
+        false
+    }
 }
 
 impl AstRewritePass for InlineExprsPass {
@@ -79,6 +160,7 @@ fn rewrite_current_block(
 
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts(&old_stmts);
+    let write_index = BindingWriteIndex::for_stmts(&old_stmts);
     let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut index = 0;
     while index < old_stmts.len() {
@@ -88,7 +170,8 @@ fn rewrite_current_block(
             continue;
         };
 
-        let Some((candidate, value)) = inline_candidate(&old_stmts[index]) else {
+        let Some((candidate, value)) = removable_inline_candidate(&old_stmts, index, &write_index)
+        else {
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
@@ -239,6 +322,7 @@ fn collapse_adjacent_call_alias_runs(
 ) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts(&old_stmts);
+    let write_index = BindingWriteIndex::for_stmts(&old_stmts);
     let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
     let mut index = 0;
@@ -288,12 +372,12 @@ fn collapse_adjacent_call_alias_runs(
                 &removed,
                 &mut remaining_run_uses,
             );
-            let Some((candidate, value)) = inline_candidate(&old_stmts[candidate_index]) else {
+            let Some((candidate, value)) =
+                removable_inline_candidate(&old_stmts, candidate_index, &write_index)
+            else {
                 continue;
             };
-            if use_index.count_uses_in_range(candidate_index + 1, run_end + 1, candidate.binding())
-                != 1
-            {
+            if use_index.count_uses_in_suffix(candidate_index + 1, candidate.binding()) != 1 {
                 continue;
             }
             let intermediate_uses = if candidate::is_lookup_inline_expr(value) {
@@ -325,10 +409,12 @@ fn collapse_adjacent_call_alias_runs(
             }
         }
 
-        // 这里只折叠真正的“局部别名包”：
-        // 至少一次收回两层相邻别名，才能证明我们是在还原机械展开的调用准备序列，
-        // 而不是把源码里本来就有阶段语义的 local（例如 stage1 / stage2）继续吞掉。
-        if collapsed_count >= 2
+        // 常规路径只折叠真正的“局部别名包”，避免吞掉有阶段语义的源码 local。
+        // 单项只接受 method fact 已经冻结后的直接 receiver binding；若迭代器仍引用
+        // 待物化 temp，则留到下一轮与整个调用准备包一起收回。
+        let allows_single_receiver_alias = collapsed_count == 1
+            && single_generic_for_method_receiver_alias(&old_stmts, index, run_end);
+        if (collapsed_count >= 2 || allows_single_receiver_alias)
             && eval_order::run_preserves_eval_order(
                 &old_stmts,
                 index,
@@ -367,6 +453,34 @@ fn stmt_is_generic_for_call_alias_sink(stmt: &AstStmt) -> bool {
     )
 }
 
+fn single_generic_for_method_receiver_alias(
+    stmts: &[AstStmt],
+    run_start: usize,
+    sink_index: usize,
+) -> bool {
+    let Some((candidate, AstExpr::Var(source))) = (sink_index == run_start + 1)
+        .then(|| inline_candidate(&stmts[run_start]))
+        .flatten()
+    else {
+        return false;
+    };
+    let AstStmt::GenericFor(generic_for) = &stmts[sink_index] else {
+        return false;
+    };
+    let [AstExpr::MethodCall(call)] = generic_for.iterator.as_slice() else {
+        return false;
+    };
+    let AstExpr::Var(receiver) = &call.receiver else {
+        return false;
+    };
+    candidate.origin() == super::super::common::AstLocalOrigin::Recovered
+        && !matches!(source, AstNameRef::Global(_) | AstNameRef::Temp(_))
+        && candidate.binding().matches_name_ref(receiver)
+        && !binding_mentions_in_expr(&generic_for.iterator[0])
+            .iter()
+            .any(|binding| matches!(binding, AstBindingRef::Temp(_)))
+}
+
 fn stmt_is_terminal_call_alias_sink(stmt: &AstStmt) -> bool {
     match stmt {
         AstStmt::CallStmt(_) => true,
@@ -393,6 +507,7 @@ fn collapse_terminal_call_result_alias_runs(
 ) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts(&old_stmts);
+    let write_index = BindingWriteIndex::for_stmts(&old_stmts);
     let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
     let mut index = 0;
@@ -429,7 +544,9 @@ fn collapse_terminal_call_result_alias_runs(
                 &removed,
                 &mut remaining_run_uses,
             );
-            let Some((candidate, value)) = inline_candidate(&old_stmts[candidate_index]) else {
+            let Some((candidate, value)) =
+                removable_inline_candidate(&old_stmts, candidate_index, &write_index)
+            else {
                 continue;
             };
             if use_index.count_uses_in_suffix(candidate_index + 1, candidate.binding()) != 1 {
@@ -531,6 +648,7 @@ fn collapse_adjacent_mechanical_alias_runs(
 ) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts(&old_stmts);
+    let write_index = BindingWriteIndex::for_stmts(&old_stmts);
     let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
     let mut index = 0;
@@ -566,7 +684,9 @@ fn collapse_adjacent_mechanical_alias_runs(
                 &removed,
                 &mut remaining_run_uses,
             );
-            let Some((candidate, value)) = inline_candidate(&old_stmts[candidate_index]) else {
+            let Some((candidate, value)) =
+                removable_inline_candidate(&old_stmts, candidate_index, &write_index)
+            else {
                 continue;
             };
             if !candidate.allows_expr_with_policy(value, InlinePolicy::MechanicalRun) {
@@ -652,6 +772,7 @@ fn collapse_terminal_local_mechanical_runs(
 ) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts(&old_stmts);
+    let write_index = BindingWriteIndex::for_stmts(&old_stmts);
     let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
     let mut index = 0;
@@ -696,7 +817,9 @@ fn collapse_terminal_local_mechanical_runs(
                 &removed,
                 &mut remaining_run_uses,
             );
-            let Some((candidate, value)) = inline_candidate(&old_stmts[candidate_index]) else {
+            let Some((candidate, value)) =
+                removable_inline_candidate(&old_stmts, candidate_index, &write_index)
+            else {
                 continue;
             };
             if !candidate.allows_expr_with_policy(value, InlinePolicy::MechanicalRun) {
@@ -896,5 +1019,56 @@ fn add_next_kept_stmt_uses(
     }
     for (binding, count) in use_index.uses_in_stmt_index(next_index) {
         *remaining_uses.entry(binding).or_default() += count;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ast::common::{
+        AstAssign, AstCallExpr, AstCallKind, AstCallStmt, AstGlobalName, AstLocalAttr,
+        AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstNameRef,
+    };
+    use crate::hir::LocalId;
+
+    use super::*;
+
+    #[test]
+    fn keeps_local_declaration_before_later_direct_write() {
+        let binding = AstBindingRef::Local(LocalId(0));
+        let global = |text: &str| {
+            AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                text: text.to_owned(),
+            }))
+        };
+        let mut block = AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: binding,
+                        attr: AstLocalAttr::None,
+                        origin: AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![global("factory")],
+                })),
+                AstStmt::CallStmt(Box::new(AstCallStmt {
+                    call: AstCallKind::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(binding.to_name_ref()),
+                        args: Vec::new(),
+                    })),
+                })),
+                AstStmt::Assign(Box::new(AstAssign {
+                    targets: vec![AstLValue::Name(binding.to_name_ref())],
+                    values: vec![global("replacement")],
+                })),
+            ],
+        };
+        let expected = block.clone();
+
+        assert!(!rewrite_current_block(
+            &mut block,
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+        ));
+        assert_eq!(block, expected);
     }
 }

@@ -2,6 +2,7 @@
 -- regress_214_loop_if_then_continuation#2: generic-for implicit else must bypass the gated tail
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
+-- unluac: expect-not-contains [[    continue]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
 local function while_case(enabled, choose_first, limit)

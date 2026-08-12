@@ -1515,7 +1515,7 @@ fn freeze_value_actions(
     latch_edges.sort_by_key(|edge| edge.index());
     latch_edges.dedup();
     let latch_copies = uniform_edge_copies(plan, owner, &latch_edges)?;
-    let (iteration, elided) = classify_uniform_copies(&context, latch_copies)?;
+    let (iteration, elided) = classify_latch_copies(&context, latch_copies)?;
     actions.elided.extend(elided);
     push_batch(
         &mut actions.batches,
@@ -1808,7 +1808,7 @@ fn classify_edge_copies(
     Ok((before, body, elided))
 }
 
-fn classify_uniform_copies(
+fn classify_latch_copies(
     context: &LoopValueContext<'_>,
     copies: Vec<(crate::structure::PhiEdgeCopy, Vec<EdgeCopyOrigin>)>,
 ) -> Result<(Vec<LoopValueWrite>, Vec<EdgeCopyOrigin>), StructureError> {
@@ -1816,7 +1816,8 @@ fn classify_uniform_copies(
     let mut elided = Vec::new();
     for (copy, mut origins) in copies {
         origins.sort();
-        let Some(source) = classify_copy_source(context, copy.value, copy.phi_id, &origins)? else {
+        let Some(source) = classify_latch_copy_source(context, copy.value, copy.phi_id, &origins)?
+        else {
             elided.extend(origins);
             continue;
         };
@@ -1827,6 +1828,31 @@ fn classify_uniform_copies(
         });
     }
     Ok((writes, elided))
+}
+
+fn classify_latch_copy_source(
+    context: &LoopValueContext<'_>,
+    value: SsaValue,
+    target: PhiId,
+    origins: &[EdgeCopyOrigin],
+) -> Result<Option<LoopValueSource>, StructureError> {
+    if context.payload.kind == LoopKindHint::NumericForLike
+        && target_is_vm_for_control(
+            context.proto,
+            context.dataflow,
+            context.plan,
+            context.payload,
+            target,
+        )
+        && context
+            .analysis
+            .value_is_vm_for_control(context.proto, context.dataflow, value)
+    {
+        // 下一轮 body 会先由 BodyPrologue 重新绑定；normal latch 的同值写回不可观察。
+        // 仍调用通用分类以保留 escape 校验，不能把同一规则扩大到 preheader。
+        return classify_value_source(context, value, target).map(|_| None);
+    }
+    classify_copy_source(context, value, target, origins)
 }
 
 fn classify_copy_source(
@@ -1944,7 +1970,9 @@ fn target_is_vm_for_control(
     };
     match payload.source_bindings {
         Some(LoopSourceBindings::Numeric(binding)) => {
-            payload.kind == LoopKindHint::NumericForLike && candidate.reg == binding
+            payload.kind == LoopKindHint::NumericForLike
+                && candidate.block == payload.header
+                && candidate.reg == binding
         }
         Some(LoopSourceBindings::Generic(_)) if payload.kind == LoopKindHint::GenericForLike => {
             let Some(terminator) = plan.block_terminator(payload.header) else {
@@ -1953,7 +1981,9 @@ fn target_is_vm_for_control(
             let Some((_, call, loop_)) = generic_for_header_instrs(proto, terminator) else {
                 return false;
             };
-            candidate.reg == call.control && candidate.reg == loop_.control_target
+            candidate.block == payload.header
+                && candidate.reg == call.control
+                && candidate.reg == loop_.control_target
         }
         _ => false,
     }

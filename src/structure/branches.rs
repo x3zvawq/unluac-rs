@@ -547,6 +547,14 @@ fn classify_loop_continue_guard(
     } else {
         (else_entry, then_entry, true)
     };
+    // 普通 while/generic-for 的 normal arm 若只在 escape 汇入，就是源码 gated tail。
+    if matches!(
+        owner.0.kind_hint,
+        LoopKindHint::WhileLike | LoopKindHint::WhileTrueLike | LoopKindHint::GenericForLike
+    ) && branch_index.has_single_local_join(merge, then_entry)
+    {
+        return None;
+    }
     Some(BranchCandidate {
         header,
         then_entry,

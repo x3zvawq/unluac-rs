@@ -81,6 +81,7 @@ pub(super) fn build_bindings(
     let mut numeric_for_locals = BTreeMap::new();
     let mut generic_for_locals = BTreeMap::new();
     let mut block_local_regs = BTreeMap::new();
+    let numeric_binding_phis = numeric_for_binding_phis(structure.plan());
 
     if proto.signature.has_vararg_param_reg {
         let reg = crate::transformer::Reg(usize::from(proto.signature.num_params));
@@ -101,6 +102,7 @@ pub(super) fn build_bindings(
             structure,
             epochs: captured_slot_epochs,
             child_mutable_upvalues,
+            numeric_binding_phis: &numeric_binding_phis.bindings,
         },
         &mut entry_local_regs,
         &mut locals,
@@ -147,6 +149,18 @@ pub(super) fn build_bindings(
             None => {}
         }
     }
+    let numeric_binding_phi_locals = numeric_binding_phis
+        .source_direct
+        .iter()
+        .enumerate()
+        .map(|(index, is_binding)| {
+            if !is_binding {
+                return None;
+            }
+            let header = structure.plan().phi_plan(PhiId(index))?.block;
+            numeric_for_locals.get(&header).copied()
+        })
+        .collect::<Vec<_>>();
 
     let mut fixed_temps = (0..dataflow.defs.len()).map(TempId).collect::<Vec<_>>();
     let mut next_temp_index = fixed_temps.len();
@@ -280,6 +294,7 @@ pub(super) fn build_bindings(
         phi_temps: &phi_temps,
         captured_slots: &captured_slots,
         epochs: captured_slot_epochs,
+        numeric_binding_phis: &numeric_binding_phis.bindings,
     });
 
     let instr_fixed_defs = dataflow
@@ -318,6 +333,7 @@ pub(super) fn build_bindings(
         reference_captured_regs,
         entry_local_regs,
         numeric_for_locals,
+        numeric_binding_phi_locals,
         generic_for_locals,
         block_local_regs,
     }
@@ -624,6 +640,47 @@ fn loop_body_region(plan: &StructurePlan, loop_id: LoopPlanId) -> Option<RegionI
     }
 }
 
+struct NumericBindingPhiFacts {
+    bindings: Vec<bool>,
+    source_direct: Vec<bool>,
+}
+
+/// capture 所有权需要识别全部 exact header phi；只有 Structure 已冻结为 elided target 的
+/// phi 才能把读取直接绑定到循环语法 local。寄存器相同不足以建立任一别名。
+fn numeric_for_binding_phis(plan: &StructurePlan) -> NumericBindingPhiFacts {
+    let mut phi_by_block_reg = BTreeMap::<(BlockRef, Reg), Option<PhiId>>::new();
+    for phi in plan.phis() {
+        phi_by_block_reg
+            .entry((phi.block, phi.reg))
+            .and_modify(|candidate| *candidate = None)
+            .or_insert(Some(phi.phi));
+    }
+
+    let mut bindings = vec![false; plan.phis().len()];
+    let mut source_direct = vec![false; plan.phis().len()];
+    for (phi, direct) in plan.loops().filter_map(|(_, loop_plan)| {
+        let LoopSourceBindings::Numeric(binding) = loop_plan.source_bindings? else {
+            return None;
+        };
+        let phi = phi_by_block_reg
+            .get(&(loop_plan.header, binding))
+            .copied()
+            .flatten()?;
+        let direct = loop_plan
+            .value_actions
+            .as_ref()
+            .is_some_and(|actions| actions.elided.iter().any(|origin| origin.target == phi));
+        Some((phi, direct))
+    }) {
+        bindings[phi.index()] = true;
+        source_direct[phi.index()] |= direct;
+    }
+    NumericBindingPhiFacts {
+        bindings,
+        source_direct,
+    }
+}
+
 fn region_blocks(plan: &StructurePlan, region: RegionId) -> BTreeSet<BlockRef> {
     fn collect(plan: &StructurePlan, region: RegionId, blocks: &mut BTreeSet<BlockRef>) {
         let Some(node) = plan.region(region) else {
@@ -899,6 +956,7 @@ struct CapturedSlotInputs<'a> {
     structure: &'a StructureFacts,
     epochs: &'a SlotEpochFacts,
     child_mutable_upvalues: &'a [Vec<bool>],
+    numeric_binding_phis: &'a [bool],
 }
 
 fn collect_captured_slot_targets(
@@ -915,6 +973,7 @@ fn collect_captured_slot_targets(
         structure,
         epochs,
         child_mutable_upvalues,
+        numeric_binding_phis,
     } = inputs;
     let mut slot_targets = BTreeMap::<CapturedSlotKey, CapturedSlotBinding>::new();
     let mut capture_targets = BTreeMap::new();
@@ -926,9 +985,7 @@ fn collect_captured_slot_targets(
         };
         for block in region_blocks(structure.plan(), body) {
             match loop_plan.source_bindings {
-                Some(LoopSourceBindings::Numeric(reg)) => {
-                    loop_owned_slots.insert((block, reg));
-                }
+                Some(LoopSourceBindings::Numeric(_)) => {}
                 Some(LoopSourceBindings::Generic(bindings)) => {
                     for offset in 0..bindings.len {
                         loop_owned_slots.insert((block, Reg(bindings.start.index() + offset)));
@@ -937,6 +994,12 @@ fn collect_captured_slot_targets(
                 None => {}
             }
             for value in &loop_plan.header_values {
+                if matches!(
+                    loop_plan.source_bindings,
+                    Some(LoopSourceBindings::Numeric(binding)) if value.reg == binding
+                ) {
+                    continue;
+                }
                 loop_owned_slots.insert((block, value.reg));
             }
         }
@@ -959,6 +1022,11 @@ fn collect_captured_slot_targets(
             if reg == closure.dst
                 || reg.index() < usize::from(proto.signature.num_params)
                 || entry_local_regs.contains_key(&reg)
+                || matches!(
+                    dataflow.use_value(InstrRef(instr_index), reg),
+                    SsaValue::Phi(phi)
+                        if numeric_binding_phis.get(phi.index()).copied().unwrap_or(false)
+                )
                 || loop_owned_slots.contains(&(cfg.instr_to_block[instr_index], reg))
             {
                 continue;
@@ -1264,6 +1332,7 @@ struct CapturedTempFactsInput<'a> {
     phi_temps: &'a [TempId],
     captured_slots: &'a CapturedSlotTargets,
     epochs: &'a SlotEpochFacts,
+    numeric_binding_phis: &'a [bool],
 }
 
 fn collect_captured_temp_facts(input: CapturedTempFactsInput<'_>) -> CapturedTempFacts {
@@ -1276,6 +1345,7 @@ fn collect_captured_temp_facts(input: CapturedTempFactsInput<'_>) -> CapturedTem
         phi_temps,
         captured_slots,
         epochs,
+        numeric_binding_phis,
     } = input;
     if captured_slots.slot_targets.is_empty() {
         return CapturedTempFacts {
@@ -1329,6 +1399,13 @@ fn collect_captured_temp_facts(input: CapturedTempFactsInput<'_>) -> CapturedTem
         }
 
         for (phi_id, reg) in phis_by_instr[instr_index].iter().copied() {
+            if numeric_binding_phis
+                .get(phi_id.index())
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
             if let Some(target) = target_for_slot(reg, instr_index, epochs, captured_slots)
                 && let Some(temp) = phi_temps.get(phi_id.index()).copied()
             {

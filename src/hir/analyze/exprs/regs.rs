@@ -185,9 +185,7 @@ pub(crate) fn expr_for_reg_use_inline(
             expr_for_dup_safe_fixed_def(lowering, def)
                 .unwrap_or_else(|| lowering.bindings.expr_for_temp(temp))
         }
-        SsaValue::Phi(phi) => lowering
-            .bindings
-            .expr_for_temp(lowering.bindings.phi_temps[phi.index()]),
+        SsaValue::Phi(phi) => lowering.bindings.expr_for_phi(phi),
     }
 }
 
@@ -267,12 +265,7 @@ pub(crate) fn expr_for_reg_use_single_eval_with_call_policy(
         SsaValue::Phi(phi) => lowering
             .bindings
             .local_for_reg_in_block(block, reg)
-            .map(HirExpr::LocalRef)
-            .unwrap_or_else(|| {
-                lowering
-                    .bindings
-                    .expr_for_temp(lowering.bindings.phi_temps[phi.index()])
-            }),
+            .map_or_else(|| lowering.bindings.expr_for_phi(phi), HirExpr::LocalRef),
     }
 }
 
@@ -330,9 +323,7 @@ pub(in crate::hir::analyze) fn expr_for_ssa_value(
         SsaValue::Def(def) => lowering
             .bindings
             .expr_for_temp(lowering.bindings.fixed_temps[def.index()]),
-        SsaValue::Phi(phi) => lowering
-            .bindings
-            .expr_for_temp(lowering.bindings.phi_temps[phi.index()]),
+        SsaValue::Phi(phi) => lowering.bindings.expr_for_phi(phi),
     }
 }
 

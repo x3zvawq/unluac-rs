@@ -5128,19 +5128,22 @@ fn build_loop_partition(
     };
     let mut continues = candidate.continue_edges.clone();
     continues.extend(loop_.semantic_continue_edges.iter().copied());
-    // branch continuation 只描述 containment 边界，不能覆盖已经证明会跳过同级
-    // body tail 的 iteration transfer。
+    // branch continuation 只描述 containment 边界；带语句的 continue 也可能恰好是
+    // natural backedge，只有 partition 证明它跳过同级 body tail 时才保留显式语义。
     continues.retain(|edge| {
         let source = cfg.edges[edge.index()].from;
+        let proven_body_bypass =
+            caps.continue_stmt && continue_edge_bypasses_body_parts(cfg, &body, *edge);
         !matches!(
             cfg.edges[edge.index()].kind,
             EdgeKind::Fallthrough | EdgeKind::LoopBody | EdgeKind::LoopExit
         ) && (!is_own_branch_continuation(*edge)
             || loop_.semantic_continue_edges.contains(edge)
-            || caps.continue_stmt && continue_edge_bypasses_body_parts(cfg, &body, *edge)
+            || proven_body_bypass
             || candidate.kind_hint == LoopKindHint::RepeatLike && repeat_prefix_is_movable)
             && (candidate.backedges.binary_search(edge).is_err()
                 || cfg.succs[source.index()].len() > 1
+                || proven_body_bypass
                 || loop_.semantic_continue_edges.contains(edge))
     });
     let continue_target_carries_body_tail = candidate.kind_hint == LoopKindHint::NumericForLike

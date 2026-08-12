@@ -142,6 +142,7 @@ pub(super) fn analyze_loops(
 pub(super) fn assign_continue_edge_ownership(
     proto: &LoweredProto,
     cfg: &Cfg,
+    graph_facts: &GraphFacts,
     branches: &[BranchCandidate],
     candidates: &mut [LoopCandidate],
 ) {
@@ -220,27 +221,38 @@ pub(super) fn assign_continue_edge_ownership(
         if branch.else_entry.is_some() {
             continue;
         }
-        for index in owners_by_block[branch.header.index()].iter().copied() {
-            let candidate = &mut candidates[index];
-            if candidate.kind_hint == LoopKindHint::RepeatLike
-                || numeric_continue_target_carries_body_tail(proto, cfg, candidate)
-                || !candidate.blocks.contains(&branch.then_entry)
-            {
-                continue;
+        let guard_merge = (branch.kind == BranchKind::Guard)
+            .then_some(branch.merge)
+            .flatten()
+            .filter(|merge| {
+                *merge != branch.then_entry
+                    && !graph_facts.dominance_frontier[branch.then_entry.index()].contains(merge)
+            })
+            .map(|entry| (entry, None, true));
+        for (entry, merge, from_guard_merge) in
+            std::iter::once((branch.then_entry, branch.merge, false)).chain(guard_merge)
+        {
+            for index in owners_by_block[branch.header.index()].iter().copied() {
+                let candidate = &mut candidates[index];
+                if candidate.kind_hint == LoopKindHint::RepeatLike
+                    || numeric_continue_target_carries_body_tail(proto, cfg, candidate)
+                    || !candidate.blocks.contains(&entry)
+                    || from_guard_merge
+                        && (candidate.backedges.len() < 2
+                            || !candidate.blocks.contains(&branch.then_entry))
+                {
+                    continue;
+                }
+                let Some(target) = candidate.continue_target else {
+                    continue;
+                };
+                let Some(edge_ref) =
+                    linear_arm_continue_edge(cfg, &candidate.blocks, entry, merge, target)
+                else {
+                    continue;
+                };
+                candidate.continue_edges.insert(edge_ref);
             }
-            let Some(target) = candidate.continue_target else {
-                continue;
-            };
-            let Some(edge_ref) = linear_arm_continue_edge(
-                cfg,
-                &candidate.blocks,
-                branch.then_entry,
-                branch.merge,
-                target,
-            ) else {
-                continue;
-            };
-            candidate.continue_edges.insert(edge_ref);
         }
     }
 }

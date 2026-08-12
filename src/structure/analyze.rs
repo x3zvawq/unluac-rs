@@ -151,7 +151,13 @@ pub(crate) fn analyze_structure_proto(
         &mut short_circuit_candidates_for_loops,
         &mut loop_candidates,
     );
-    loops::assign_continue_edge_ownership(proto, cfg, &branch_candidates, &mut loop_candidates);
+    loops::assign_continue_edge_ownership(
+        proto,
+        cfg,
+        graph_facts,
+        &branch_candidates,
+        &mut loop_candidates,
+    );
     let residual_transfers = goto::analyze_residual_transfers(
         proto,
         cfg,

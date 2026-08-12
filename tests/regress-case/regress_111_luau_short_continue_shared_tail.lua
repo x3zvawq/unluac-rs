@@ -1,7 +1,7 @@
 -- regress_111_luau_short_continue_shared_tail#1: 短路 continue 与 break 共享本轮 for tail
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-contains [[repeat]]
--- unluac: expect-contains [[continue]]
+-- unluac: expect-contains [[    continue]]
 -- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
@@ -38,4 +38,4 @@ local function run(a, b, c, xs)
     return x
 end
 
-print("regress_111_luau_short_continue_shared_tail#1", run(false, true, false, {}))
+print("regress_111_result", run(false, true, false, {}), run(false, true, false, { 1 }), run(false, true, true, { 1 }))

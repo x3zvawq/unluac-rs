@@ -26,7 +26,8 @@ use crate::hir::common::{
 };
 use crate::structure::StructureFacts;
 use crate::structure::{
-    BlockRef, CanonicalMoveIndex, Cfg, CfgGraph, DataflowFacts, GraphFacts, OpenDefId, SsaValue,
+    BlockRef, CanonicalMoveIndex, Cfg, CfgGraph, DataflowFacts, GraphFacts, OpenDefId, PhiId,
+    SsaValue,
 };
 use crate::transformer::{
     AccessBase, AccessKey, CallKind, CaptureSource, ClosureCreation, GetTableKind, InstrRef,
@@ -56,6 +57,7 @@ pub(super) struct ProtoBindings {
     pub(super) reference_captured_regs: Vec<bool>,
     pub(super) entry_local_regs: BTreeMap<Reg, LocalId>,
     pub(super) numeric_for_locals: BTreeMap<BlockRef, LocalId>,
+    pub(super) numeric_binding_phi_locals: Vec<Option<LocalId>>,
     pub(super) generic_for_locals: BTreeMap<BlockRef, Vec<LocalId>>,
     pub(super) block_local_regs: BTreeMap<BlockRef, BTreeMap<Reg, LocalId>>,
 }
@@ -99,6 +101,17 @@ impl ProtoBindings {
             .get(&temp)
             .copied()
             .map_or(HirLValue::Temp(temp), BoundSlotTarget::lvalue)
+    }
+
+    pub(super) fn expr_for_phi(&self, phi: PhiId) -> HirExpr {
+        self.numeric_binding_phi_locals
+            .get(phi.index())
+            .copied()
+            .flatten()
+            .map_or_else(
+                || self.expr_for_temp(self.phi_temps[phi.index()]),
+                HirExpr::LocalRef,
+            )
     }
 
     pub(super) fn closure_capture_target(

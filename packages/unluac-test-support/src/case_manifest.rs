@@ -1593,7 +1593,7 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_298_luau_captured_shared_capture_free_dependency.lua",
         LUAU_ONLY,
     )
-    .with_options(LUAU_OPTIMIZED_OPTIONS),
+    .with_options(LUAU_OPTIMIZED_CONVERGENCE_OPTIONS),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_299_luau_captured_shared_owner_dependency.lua",
         LUAU_ONLY,
@@ -1604,6 +1604,22 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         LUAU_ONLY,
     )
     .with_options(LUAU_OPTIMIZED_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_301_numeric_for_mutated_binding_capture.lua",
+        MUTABLE_NUMERIC_FOR_BINDING_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_302_luau_numeric_for_multi_read_binding.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LuaCaseOptions {
+        recompile_rounds: Some(4),
+        ..LUAU_OPTIMIZED_OPTIONS
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_303_generic_for_live_method_receiver.lua",
+        ALL_DIALECTS,
+    ),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {
