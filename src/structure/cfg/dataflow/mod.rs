@@ -157,6 +157,7 @@ pub fn compute_dataflow_facts(
         instr_defs,
         block_entry_values: ssa.block_entry_values,
         block_exit_values: ssa.block_exit_values,
+        block_end_values: ssa.block_end_values,
         use_values: ssa.use_values,
         def_uses: ssa.def_uses,
         def_phi_uses: ssa.def_phi_uses,

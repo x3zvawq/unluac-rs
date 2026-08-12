@@ -2951,6 +2951,9 @@ fn validate_loop_plans(
         else {
             continue;
         };
+        if tail.normal_exits.binary_search(&edge_plan.edge).is_ok() {
+            continue;
+        }
         let cfg_edge = cfg.edges.get(edge_plan.edge.index()).ok_or_else(|| {
             StructureError::invalid("normal-tail guard entry references a missing CFG edge")
         })?;
@@ -3111,6 +3114,10 @@ fn validate_loop_plans(
                         .normal_exits
                         .windows(2)
                         .any(|pair| pair[0].index() >= pair[1].index())
+                    || tail
+                        .early_exits
+                        .iter()
+                        .any(|edge| tail.normal_exits.binary_search(edge).is_ok())
                     || boundary.entry_count != tail.normal_exits.len()
                     || boundary.exit_count != tail.completion_exits.len()
                 {
@@ -3140,6 +3147,7 @@ fn validate_loop_plans(
                     if !syntax_exit_kind
                         || cfg_edge.to != tail.entry
                         || region_contains_block(plan, intervals, *tail_region, cfg_edge.from)
+                        || !loop_edges.has_exit(*loop_id, *edge)
                         || !syntax_exit_transfer
                     {
                         return Err(StructureError::invalid(format!(

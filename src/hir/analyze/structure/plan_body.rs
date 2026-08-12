@@ -71,6 +71,7 @@ struct PlanLoweringIndex {
     repeat_staged_result_by_phi: Vec<Option<(RegionId, TempId)>>,
     canonical_move_source: Vec<Option<SsaValue>>,
     absorbed_region_result_moves: Vec<bool>,
+    shared_ssa_temps: Vec<bool>,
 }
 
 struct PlannedLoopCondition {
@@ -472,6 +473,21 @@ impl PlanLoweringIndex {
             &canonical_move_source,
             &edge_action_use_count,
         )?;
+        let mut seen_ssa_temps = vec![false; lowering.bindings.temps.len()];
+        let mut shared_ssa_temps = vec![false; lowering.bindings.temps.len()];
+        for temp in lowering
+            .bindings
+            .fixed_temps
+            .iter()
+            .chain(&lowering.bindings.phi_temps)
+        {
+            let Some(seen) = seen_ssa_temps.get_mut(temp.index()) else {
+                return Err(invalid(root, "SSA binding is outside the HIR temp arena"));
+            };
+            if std::mem::replace(seen, true) {
+                shared_ssa_temps[temp.index()] = true;
+            }
+        }
 
         Ok(Self {
             plain_block_count,
@@ -483,6 +499,7 @@ impl PlanLoweringIndex {
             repeat_staged_result_by_phi,
             canonical_move_source,
             absorbed_region_result_moves,
+            shared_ssa_temps,
         })
     }
 }
@@ -2317,9 +2334,9 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         }
     }
 
-    /// 条件 region 会吸收内部纯 `Move`，通常必须沿 SSA 恒等链读取真实来源。若 bindings
-    /// 已让一个未吸收 def 在原指令处直接写入 copy target，则必须读取该 target；再次穿透
-    /// Move 会复制赋值并让后续 local 提升拆散 loop-carried identity。
+    /// 条件 region 会吸收内部纯 `Move`，通常必须沿 SSA 恒等链读取真实来源。普通 def
+    /// 若已在原指令处物化，则只有 canonical binding 到 source block 出口仍未被另一个
+    /// SSA 值复用时才能延后读取；否则必须使用 frozen def binding 保存的快照。
     fn edge_copy_expr(
         &self,
         owner: RegionId,
@@ -2357,24 +2374,60 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                         region: owner.index(),
                         detail: "edge copy source has no absorption disposition",
                     })?;
-                let writes_fixed_temp = self
+                let writes_fixed_binding = self
                     .lowering
                     .bindings
                     .local_for_reg_in_block(definition.block, definition.reg)
-                    .is_none();
-                if fixed == target && !absorbed && writes_fixed_temp {
-                    value
-                } else {
-                    self.index
-                        .canonical_move_source
-                        .get(def.index())
-                        .copied()
-                        .flatten()
-                        .unwrap_or(value)
-                }
+                    .is_none()
+                    && !super::super::exprs::block_is_absorbed_decision(
+                        self.lowering,
+                        definition.block,
+                    );
+                let canonical = self
+                    .index
+                    .canonical_move_source
+                    .get(def.index())
+                    .copied()
+                    .flatten()
+                    .unwrap_or(value);
+                let read_exact = !absorbed
+                    && writes_fixed_binding
+                    && (fixed == target || {
+                        let canonical_expr = self.edge_ssa_expr(owner, source_block, canonical)?;
+                        match self
+                            .lowering
+                            .dataflow
+                            .block_end_value(source_block, self.ssa_reg(owner, canonical)?)
+                        {
+                            Some(current) if current != canonical => {
+                                self.edge_ssa_expr(owner, source_block, current)? == canonical_expr
+                            }
+                            Some(_) => false,
+                            None => match canonical_expr {
+                                HirExpr::LocalRef(_) => true,
+                                HirExpr::TempRef(temp) => self
+                                    .index
+                                    .shared_ssa_temps
+                                    .get(temp.index())
+                                    .copied()
+                                    .unwrap_or(true),
+                                _ => false,
+                            },
+                        }
+                    });
+                if read_exact { value } else { canonical }
             }
             _ => value,
         };
+        self.edge_ssa_expr(owner, source_block, value)
+    }
+
+    fn edge_ssa_expr(
+        &self,
+        owner: RegionId,
+        source_block: BlockRef,
+        value: SsaValue,
+    ) -> Result<HirExpr, HirLowerError> {
         let reg = self.ssa_reg(owner, value)?;
         if let Some(local) = self
             .lowering

@@ -44,12 +44,13 @@ use self::defs::expr_for_dup_safe_fixed_def;
 pub(super) use self::defs::{expr_for_fixed_def, expr_for_fixed_def_single_eval};
 pub(super) use self::packs::lower_value_pack;
 use self::packs::lower_value_pack_single_eval;
-use self::regs::{
-    block_is_absorbed_decision, expr_for_reg_use_dup_safe, expr_for_reg_use_inline,
-    expr_for_reg_use_single_eval_with_call_policy,
-};
+pub(super) use self::regs::block_is_absorbed_decision;
 pub(super) use self::regs::{
     expr_for_reg_at_block_exit, expr_for_reg_use, expr_for_ssa_value, lower_closure_capture,
+};
+use self::regs::{
+    expr_for_reg_use_dup_safe, expr_for_reg_use_inline,
+    expr_for_reg_use_single_eval_with_call_policy,
 };
 use super::helpers::{concat_expr, decode_raw_string, raw_lua_string, unresolved_expr};
 use super::lower::ProtoLowering;

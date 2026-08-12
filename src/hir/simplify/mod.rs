@@ -168,7 +168,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
     PassDescriptor {
         name: "branch-control",
         phase: PassPhase::Normal,
-        depends_on: &[LabelGoto, LocalBinding, LogicalExpr],
+        depends_on: &[LabelGoto, TempChain, LogicalExpr, DecisionShape],
         invalidates: &[
             LabelGoto,
             BlockStructure,

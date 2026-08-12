@@ -765,6 +765,9 @@ fn finalize_normal_tail_guards(cfg: &Cfg, plan: &mut StructurePlan) -> Result<()
         else {
             continue;
         };
+        if tail.normal_exits.binary_search(&edge_plan.edge).is_ok() {
+            continue;
+        }
         let cfg_edge = cfg.edges.get(edge_plan.edge.index()).ok_or_else(|| {
             StructureError::invalid("normal-tail guard references a missing CFG edge")
         })?;

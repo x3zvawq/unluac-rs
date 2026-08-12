@@ -2,6 +2,8 @@
 -- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
+-- unluac: expect-not-contains [[r4_1 = r4_]]
+-- unluac: expect-not-contains [[r1_1 = r1_]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
 

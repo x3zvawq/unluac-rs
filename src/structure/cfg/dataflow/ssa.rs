@@ -17,6 +17,7 @@ pub(super) struct SsaAnalysis {
     pub(super) phi_block_ranges: Vec<std::ops::Range<usize>>,
     pub(super) block_entry_values: Vec<SsaRegMap>,
     pub(super) block_exit_values: Vec<SsaRegMap>,
+    pub(super) block_end_values: Vec<SsaRegMap>,
     pub(super) use_values: Vec<InstrUseValues>,
     pub(super) def_uses: Vec<Vec<UseSite>>,
     pub(super) def_phi_uses: Vec<Vec<PhiId>>,
@@ -43,6 +44,7 @@ pub(super) fn build_ssa(
     let phi_block_ranges = super::index_phi_candidate_ranges(cfg, &phis);
     let mut block_entry_values = vec![SsaRegMap::default(); cfg.blocks.len()];
     let mut block_exit_values = vec![SsaRegMap::default(); cfg.blocks.len()];
+    let mut block_end_values = vec![SsaRegMap::default(); cfg.blocks.len()];
     let mut use_values = vec![InstrUseValues::default(); instr_count];
     rename(
         cfg,
@@ -56,6 +58,7 @@ pub(super) fn build_ssa(
         &mut phis,
         &mut block_entry_values,
         &mut block_exit_values,
+        &mut block_end_values,
         &mut use_values,
         incoming_slots,
     )?;
@@ -66,6 +69,9 @@ pub(super) fn build_ssa(
         values.try_map_values(|value| remap_value(value, &replacements, &remap))?;
     }
     for values in &mut block_exit_values {
+        values.try_map_values(|value| remap_value(value, &replacements, &remap))?;
+    }
+    for values in &mut block_end_values {
         values.try_map_values(|value| remap_value(value, &replacements, &remap))?;
     }
     for values in &mut use_values {
@@ -88,6 +94,7 @@ pub(super) fn build_ssa(
         phi_block_ranges,
         block_entry_values,
         block_exit_values,
+        block_end_values,
         use_values,
         def_uses,
         def_phi_uses,
@@ -217,6 +224,7 @@ fn rename(
     phis: &mut [PhiCandidate],
     block_entry_values: &mut [SsaRegMap],
     block_exit_values: &mut [SsaRegMap],
+    block_end_values: &mut [SsaRegMap],
     use_values: &mut [InstrUseValues],
     incoming_slots: &[Option<usize>],
 ) -> Result<(), StructureError> {
@@ -277,6 +285,12 @@ fn rename(
                     }
                 }
                 block_exit_values[block.index()] = snapshot(&stacks, &live_out[block.index()])?;
+                let end_regs = pushed
+                    .iter()
+                    .copied()
+                    .filter(|reg| !live_out[block.index()].contains(reg))
+                    .collect::<BTreeSet<_>>();
+                block_end_values[block.index()] = snapshot(&stacks, &end_regs)?;
 
                 for edge in &cfg.succs[block.index()] {
                     let succ = cfg.edges[edge.index()].to;

@@ -5572,7 +5572,7 @@ fn detect_normal_loop_tail(
         return None;
     }
     let continuation = domain.continuation?;
-    let normal_exits = preheader
+    let mut normal_exits = preheader
         .into_iter()
         .chain(control.iter().copied())
         .flat_map(|block| cfg.succs[block.index()].iter().copied())
@@ -5590,32 +5590,33 @@ fn detect_normal_loop_tail(
                 }
         })
         .collect::<Vec<_>>();
-    let entries = normal_exits
+    let entry = cfg.edges[normal_exits.first()?.index()].to;
+    if normal_exits
         .iter()
-        .map(|edge| cfg.edges[edge.index()].to)
-        .collect::<BTreeSet<_>>();
-    let mut entries = entries.into_iter();
-    let entry = entries.next()?;
-    if entries.next().is_some() {
+        .any(|edge| cfg.edges[edge.index()].to != entry)
+    {
         return None;
     }
     if entry == continuation || owned.contains(&entry) {
         return None;
     }
 
-    let mut early_exits = body
+    // 候选阶段只证明存在 bypass；精确 guard 依赖最终 Break owner 与
+    // forwarding target，由 plan finalizer 统一冻结。
+    if !body
         .iter()
         .flat_map(|block| cfg.succs[block.index()].iter().copied())
-        .filter(|edge| {
+        .any(|edge| {
             let edge_data = cfg.edges[edge.index()];
             edge_data.to == continuation
                 && edge_data.kind != EdgeKind::LoopExit
-                && candidate.backedges.binary_search(edge).is_err()
+                && candidate.backedges.binary_search(&edge).is_err()
         })
-        .collect::<Vec<_>>();
-    if early_exits.is_empty() {
+    {
         return None;
     }
+    normal_exits.sort_by_key(|edge| edge.index());
+    normal_exits.dedup();
 
     let mut blocks = BTreeSet::new();
     let mut pending = vec![entry];
@@ -5640,14 +5641,13 @@ fn detect_normal_loop_tail(
         }
     }
 
-    let normal_exit_set = normal_exits.iter().copied().collect::<BTreeSet<_>>();
     let mut completion_exits = Vec::new();
     for block in &blocks {
         if cfg.preds[block.index()].iter().any(|edge| {
             let source = cfg.edges[edge.index()].from;
             cfg.reachable_blocks.contains(&source)
                 && !blocks.contains(&source)
-                && !normal_exit_set.contains(edge)
+                && normal_exits.binary_search(edge).is_err()
         }) {
             return None;
         }
@@ -5695,11 +5695,6 @@ fn detect_normal_loop_tail(
         return None;
     }
 
-    early_exits.sort_by_key(|edge| edge.index());
-    early_exits.dedup();
-    let mut normal_exits = normal_exits;
-    normal_exits.sort_by_key(|edge| edge.index());
-    normal_exits.dedup();
     completion_exits.sort_by_key(|edge| edge.index());
     completion_exits.dedup();
     Some(NormalTailPartition {
@@ -5707,7 +5702,7 @@ fn detect_normal_loop_tail(
         contract: LoopNormalTailPlan {
             entry,
             continuation,
-            early_exits,
+            early_exits: Vec::new(),
             normal_exits,
             completion_exits,
         },

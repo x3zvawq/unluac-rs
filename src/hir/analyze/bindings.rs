@@ -635,13 +635,23 @@ fn coalesce_loop_state_temps(
             continue;
         };
         let Some(RegionPlan::Loop {
-            body: loop_body, ..
+            plan: loop_id,
+            control: loop_control,
+            body: loop_body,
+            ..
         }) = plan.region(carried.owner)
         else {
             continue;
         };
         let target = phi_temps[phi.phi.index()];
         let has_nested_parent = nested_carried_parents[phi.phi.index()].is_some();
+        let repeat_control = (!has_nested_parent
+            && matches!(
+                plan.loop_(*loop_id)
+                    .and_then(|loop_| loop_.protocol.as_ref()),
+                Some(LoopVmProtocol::Repeat(_))
+            ))
+        .then_some(*loop_control);
         let direct_region = if has_nested_parent {
             carried.owner
         } else {
@@ -656,7 +666,10 @@ fn coalesce_loop_state_temps(
             }
             match incoming.value {
                 SsaValue::Def(def)
-                    if def_is_same_reg_in_region(dataflow, plan, def, phi.reg, direct_region) =>
+                    if def_is_same_reg_in_region(dataflow, plan, def, phi.reg, direct_region)
+                        || repeat_control.is_some_and(|control| {
+                            def_is_same_reg_in_region(dataflow, plan, def, phi.reg, control)
+                        }) =>
                 {
                     result_compatible = false;
                 }

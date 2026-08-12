@@ -412,12 +412,19 @@ fn refine_enclosing_loop_escape_merges(
     // 确认本轮合流；不为每个 outer branch 重新复制 block 集或扫描 CFG。
     let snapshot = branch_candidates.to_vec();
     let mut nested_by_merge = vec![Vec::new(); cfg.blocks.len()];
+    let mut nested_by_escape = vec![Vec::new(); cfg.blocks.len()];
     for candidate in &snapshot {
         if matches!(candidate.kind, BranchKind::IfThen | BranchKind::Guard)
             && candidate.else_entry.is_none()
             && let Some(merge) = candidate.merge
         {
             nested_by_merge[merge.index()].push(candidate);
+            // loop-break guard 的 merge 是正常入口而非 exit；同时索引显式 arm 边界，
+            // 最终仍由具体 loop owner 的 branch_has_loop_escape_arm 做精确资格判定。
+            nested_by_escape[candidate.then_entry.index()].push(candidate);
+            if let Some(exit) = cfg.unique_reachable_successor(candidate.then_entry) {
+                nested_by_escape[exit.index()].push(candidate);
+            }
         }
     }
     let mut branch_by_header = vec![None; cfg.blocks.len()];
@@ -460,8 +467,12 @@ fn refine_enclosing_loop_escape_merges(
         let mut nested = owner
             .exits
             .iter()
-            .chain(std::iter::once(&soft_merge))
-            .flat_map(|merge| nested_by_merge[merge.index()].iter())
+            .flat_map(|exit| {
+                nested_by_merge[exit.index()]
+                    .iter()
+                    .chain(&nested_by_escape[exit.index()])
+            })
+            .chain(&nested_by_merge[soft_merge.index()])
             .copied()
             .filter(|candidate| {
                 candidate.header != soft_merge
@@ -686,6 +697,20 @@ fn refine_loop_iteration_if_else_branches(
     }
 
     for candidate in branch_candidates {
+        if let Some((then_entry, merge, invert_hint)) = loop_escape_prefix_refinement(
+            proto,
+            cfg,
+            branch_index,
+            candidate,
+            &candidates_by_header,
+        ) {
+            candidate.then_entry = then_entry;
+            candidate.else_entry = None;
+            candidate.merge = Some(merge);
+            candidate.kind = BranchKind::IfThen;
+            candidate.invert_hint = invert_hint;
+            continue;
+        }
         let Some(downstream_header) = candidate
             .else_entry
             .is_none()
@@ -748,6 +773,58 @@ fn refine_loop_iteration_if_else_branches(
         candidate.merge = Some(merge);
         candidate.kind = BranchKind::IfElse;
         candidate.invert_hint = false;
+    }
+}
+
+/// 收回 `if A then if B then escape end end` 的外层 one-arm prefix。
+/// 嵌套 guard 必须由 outer 唯一进入，且正常/escape 两端分别精确等于 outer 的
+/// sibling/strict merge，避免把共享或跨 loop 的 guard 强压进当前分支。
+fn loop_escape_prefix_refinement(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    branch_index: &BranchIndex<'_>,
+    outer: &BranchCandidate,
+    candidates_by_header: &[Option<BranchCandidate>],
+) -> Option<(BlockRef, BlockRef, bool)> {
+    let (Some(strict_merge), Some(else_entry)) = (outer.merge, outer.else_entry) else {
+        return None;
+    };
+    if outer.kind != BranchKind::IfElse {
+        return None;
+    }
+
+    let refinement = |nested_entry: BlockRef, sibling: BlockRef, invert_hint: bool| {
+        let nested = candidates_by_header
+            .get(nested_entry.index())
+            .and_then(Option::as_ref)?;
+        (nested.kind == BranchKind::Guard
+            && nested_entry != outer.header
+            && nested.else_entry.is_none()
+            && nested.merge == Some(sibling)
+            && nested.then_entry == strict_merge
+            && cfg.unique_reachable_predecessor_matching(nested_entry, |_| true)
+                == Some(outer.header))
+        .then_some(())?;
+        let owner = branch_index
+            .body_loops(outer.header)
+            .filter(|owner| {
+                owner.body_scope_blocks.contains(&nested_entry)
+                    && owner.body_scope_blocks.contains(&sibling)
+                    && loop_candidate_owns_endpoint(cfg, owner, strict_merge)
+            })
+            .min_by_key(|owner| owner.body_scope_blocks.len())?;
+        branch_has_loop_escape_arm(proto, cfg, owner, nested).then_some((
+            nested_entry,
+            sibling,
+            invert_hint,
+        ))
+    };
+    match (
+        refinement(outer.then_entry, else_entry, false),
+        refinement(else_entry, outer.then_entry, true),
+    ) {
+        (Some(refinement), None) | (None, Some(refinement)) => Some(refinement),
+        _ => None,
     }
 }
 

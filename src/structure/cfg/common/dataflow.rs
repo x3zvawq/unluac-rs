@@ -69,6 +69,7 @@ pub struct DataflowFacts {
     pub instr_defs: Vec<Vec<DefId>>,
     pub block_entry_values: Vec<SsaRegMap>,
     pub block_exit_values: Vec<SsaRegMap>,
+    pub(crate) block_end_values: Vec<SsaRegMap>,
     pub use_values: Vec<InstrUseValues>,
     pub(crate) def_uses: Vec<Vec<UseSite>>,
     pub(crate) def_phi_uses: Vec<Vec<PhiId>>,
@@ -99,6 +100,24 @@ impl DataflowFacts {
             .get(block.index())
             .and_then(|values| values.get(reg))
             .unwrap_or(SsaValue::Entry(reg))
+    }
+
+    /// 返回 basic block 末尾仍可由稀疏 SSA 证明的值。exit map 保存 live-out，end map
+    /// 补充本块定义后已死的寄存器；只从前驱继承的槽再查询 entry，仍缺失则未知。
+    pub(crate) fn block_end_value(&self, block: BlockRef, reg: Reg) -> Option<SsaValue> {
+        self.block_exit_values
+            .get(block.index())
+            .and_then(|values| values.get(reg))
+            .or_else(|| {
+                self.block_end_values
+                    .get(block.index())
+                    .and_then(|values| values.get(reg))
+            })
+            .or_else(|| {
+                self.block_entry_values
+                    .get(block.index())
+                    .and_then(|values| values.get(reg))
+            })
     }
 
     pub fn use_value(&self, instr: InstrRef, reg: Reg) -> SsaValue {

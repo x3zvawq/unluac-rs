@@ -196,19 +196,7 @@ fn assignments_match_iterator(assignments: &[HirStmt], generic_for: &HirGenericF
         return false;
     }
 
-    let Some(expected) = generic_for
-        .iterator
-        .fixed
-        .iter()
-        .map(|expr| match expr {
-            HirExpr::TempRef(temp) => Some(*temp),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()
-    else {
-        return false;
-    };
-    let mut actual = Vec::with_capacity(expected.len());
+    let mut expected = generic_for.iterator.fixed.iter();
     for (index, stmt) in assignments.iter().enumerate() {
         let HirStmt::Assign(assign) = stmt else {
             return false;
@@ -219,13 +207,17 @@ fn assignments_match_iterator(assignments: &[HirStmt], generic_for: &HirGenericF
             return false;
         }
         for target in &assign.targets {
-            let HirLValue::Temp(temp) = target else {
+            let (HirLValue::Temp(actual), Some(HirExpr::TempRef(expected))) =
+                (target, expected.next())
+            else {
                 return false;
             };
-            actual.push(*temp);
+            if actual != expected {
+                return false;
+            }
         }
     }
-    actual == expected
+    expected.next().is_none()
 }
 
 fn fold_front(pending: &mut VecDeque<HirStmt>, plan: FoldPlan, new_stmts: &mut Vec<HirStmt>) {

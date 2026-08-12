@@ -1,3 +1,6 @@
+-- unluac: expect-not-contains [[if r9_0 == 1 or r9_0 == 2 then]]
+-- unluac: expect-not-contains [[if r1_0 == 1 or r1_0 == 2 then]]
+
 -- common_06_boolean_regression#1: 共享主语短路分支
 local function test_shared_subjects()
     function f(player)
@@ -80,8 +83,9 @@ local function test_degenerate_guard()
     local a = 1
     local b = true
 
-    -- Case 1: empty body – `and b` produces a degenerate TEST block
+    -- Case 1: dead temp leaves an empty body after deferred cleanup
     if (a == 1 or a == 2) and b then
+        local unused = 1
     end
 
     -- Case 2: non-empty body

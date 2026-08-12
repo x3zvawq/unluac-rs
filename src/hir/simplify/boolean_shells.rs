@@ -29,20 +29,21 @@ use super::walk::{HirRewritePass, rewrite_proto};
 
 pub(super) fn remove_boolean_materialization_shells_in_proto(proto: &mut HirProto) -> bool {
     let use_counts = collect_temp_use_counts(proto);
-    let mut dead_shell_pass = DeadBooleanShellPass {
+    let mut pass = BooleanShellPass {
         use_counts: &use_counts,
     };
-    let mut collapse_shell_pass = CollapseBooleanShellPass;
-    rewrite_proto(proto, &mut dead_shell_pass) | rewrite_proto(proto, &mut collapse_shell_pass)
+    rewrite_proto(proto, &mut pass)
 }
 
-struct DeadBooleanShellPass<'a> {
+struct BooleanShellPass<'a> {
     use_counts: &'a BTreeMap<TempId, usize>,
 }
 
-impl HirRewritePass for DeadBooleanShellPass<'_> {
+impl HirRewritePass for BooleanShellPass<'_> {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
-        remove_dead_materialization_shells_from_block(block, self.use_counts)
+        let dead_changed = remove_dead_materialization_shells_from_block(block, self.use_counts);
+        let collapse_changed = collapse_live_boolean_materialization_shells_in_block(block);
+        dead_changed || collapse_changed
     }
 }
 
@@ -55,14 +56,6 @@ fn remove_dead_materialization_shells_from_block(
         .stmts
         .retain(|stmt| !removable_dead_materialization_shell(stmt, use_counts));
     block.stmts.len() != old_len
-}
-
-struct CollapseBooleanShellPass;
-
-impl HirRewritePass for CollapseBooleanShellPass {
-    fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
-        collapse_live_boolean_materialization_shells_in_block(block)
-    }
 }
 
 fn collapse_live_boolean_materialization_shells_in_block(block: &mut HirBlock) -> bool {

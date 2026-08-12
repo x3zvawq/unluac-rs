@@ -1,4 +1,4 @@
-//! branch-control 收敛：把 HIR 中残留的前向 goto 壳恢复成普通条件结构。
+//! branch-control 收敛：删除无求值行为的空分支，把残留的前向 goto 壳恢复成普通条件结构。
 //!
 //! 这里只消费已经存在的 `If/Goto/Label`，不重新解释 CFG，也不接管同一 lvalue 选值；
 //! branch-value 形状仍由 `branch_value_folding` 先处理。每轮先为当前 block 建一次 label
@@ -11,6 +11,7 @@ use crate::hir::common::{
     HirBlock, HirCallExpr, HirCallStmt, HirExpr, HirIf, HirLabelId, HirProto, HirStmt,
     HirUnaryOpKind,
 };
+use crate::hir::expr_safety::expr_is_discard_safe;
 
 use super::label_refs::count_label_references;
 use super::logical_simplify::normalize_condition_context;
@@ -24,10 +25,11 @@ struct BranchControlPass;
 
 impl HirRewritePass for BranchControlPass {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
+        let empty_changed = remove_discard_safe_empty_ifs(&mut block.stmts);
         let terminal_changed = fold_forward_gotos(&mut block.stmts, FoldKind::TerminalElse);
         let guard_changed = fold_forward_gotos(&mut block.stmts, FoldKind::Guard);
         let nop_changed = remove_nop_goto_labels(&mut block.stmts);
-        terminal_changed || guard_changed || nop_changed
+        empty_changed || terminal_changed || guard_changed || nop_changed
     }
 
     fn rewrite_stmt(&mut self, stmt: &mut HirStmt) -> bool {
@@ -41,12 +43,7 @@ fn fold_effect_only_call(stmt: &mut HirStmt) -> bool {
     let HirStmt::If(if_stmt) = stmt else {
         return false;
     };
-    if !if_stmt.then_block.stmts.is_empty()
-        || if_stmt
-            .else_block
-            .as_ref()
-            .is_some_and(|block| !block.stmts.is_empty())
-    {
+    if !if_arms_are_empty(if_stmt) {
         return false;
     }
 
@@ -55,6 +52,45 @@ fn fold_effect_only_call(stmt: &mut HirStmt) -> bool {
     };
     *stmt = HirStmt::CallStmt(Box::new(HirCallStmt { call: *call }));
     true
+}
+
+fn remove_discard_safe_empty_ifs(stmts: &mut Vec<HirStmt>) -> bool {
+    let original_len = stmts.len();
+    stmts.retain(|stmt| {
+        !matches!(
+            stmt,
+            HirStmt::If(if_stmt)
+                if if_arms_are_empty(if_stmt)
+                    && expr_is_discard_safe(&if_stmt.cond)
+                    && !discard_safe_expr_has_unresolved(&if_stmt.cond)
+        )
+    });
+    stmts.len() != original_len
+}
+
+/// `expr_is_discard_safe` 可递归接纳的表达式形状中是否仍携带显式诊断。
+fn discard_safe_expr_has_unresolved(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::Unresolved(_) => true,
+        HirExpr::Unary(unary) => discard_safe_expr_has_unresolved(&unary.expr),
+        HirExpr::Binary(binary) => {
+            discard_safe_expr_has_unresolved(&binary.lhs)
+                || discard_safe_expr_has_unresolved(&binary.rhs)
+        }
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            discard_safe_expr_has_unresolved(&logical.lhs)
+                || discard_safe_expr_has_unresolved(&logical.rhs)
+        }
+        _ => false,
+    }
+}
+
+fn if_arms_are_empty(if_stmt: &HirIf) -> bool {
+    if_stmt.then_block.stmts.is_empty()
+        && if_stmt
+            .else_block
+            .as_ref()
+            .is_none_or(|block| block.stmts.is_empty())
 }
 
 fn take_effect_only_call(mut expr: &mut HirExpr) -> Option<Box<HirCallExpr>> {

@@ -1,4 +1,5 @@
 -- unluac: expect-contains [[missing_global]]
+-- unluac: expect-contains [[if probe then]]
 
 local env = _VERSION == "Lua 5.1" and getfenv() or _ENV
 local global_hits = 0
@@ -18,6 +19,16 @@ print("global-read", global_hits)
 global_hits = 0
 local global_value = (probe and false) or (probe and true)
 print("global-logic", global_hits, global_value)
+
+local table_hits = 0
+local subject = setmetatable({}, {
+    __index = function()
+        table_hits = table_hits + 1
+        return true
+    end,
+})
+local table_value = (subject.probe and false) or (subject.probe and true)
+print("table-logic", table_hits, table_value)
 
 local compare_hits = 0
 local mt = {
