@@ -39,6 +39,7 @@ pub(super) use self::branch::{
     lower_binary_op, lower_branch_cond, lower_branch_subject, lower_branch_subject_single_eval,
     lower_unary_op,
 };
+pub(super) use self::defs::expr_for_direct_literal_def;
 use self::defs::expr_for_dup_safe_fixed_def;
 pub(super) use self::defs::{expr_for_fixed_def, expr_for_fixed_def_single_eval};
 pub(super) use self::packs::lower_value_pack;

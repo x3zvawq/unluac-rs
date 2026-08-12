@@ -1,8 +1,9 @@
-//! 这个子模块把 Structure 冻结的 condition DAG 逐节点降低成 HIR decision。
+//! 这个子模块把 Structure 冻结的 condition/value-decision DAG 逐节点降低成 HIR decision。
 //!
 //! 节点 identity、真假连边和终端出口都由 `ConditionPlan` 给出；这里不再读取 raw
 //! candidate、重选候选或截断控制图。入口 block 的 prefix 由结构 lowering 显式发射，
-//! 其余被折叠节点使用单次求值表达式，避免引用不会单独发射的中间 temp。
+//! 其余被折叠节点使用单次求值表达式，避免引用不会单独发射的中间 temp。入口 prefix
+//! 里的匿名稳定字面量允许直接成为 value leaf；动态值和源码 binding 仍引用已发射身份。
 
 use super::*;
 use crate::hir::rewrite::replace_temp_in_expr;
@@ -86,7 +87,7 @@ fn lower_value_target(
                     if lowering.dataflow.def_block(def) == decision.header()?
                         && leaf.value == crate::structure::SsaValue::Def(def) =>
                 {
-                    expr_for_ssa_value(lowering, leaf.value)
+                    expr_for_emitted_header_leaf(lowering, decision.header()?, def)
                 }
                 // ValueDecision 吞掉了 leaf block 的普通指令，必须优先沿完整单次求值
                 // 依赖链展开；普通 def lowering 可能返回引用那些不会再被发射的中间 temp。
@@ -101,6 +102,39 @@ fn lower_value_target(
             .get(leaf.index())
             .map(|_| HirDecisionTarget::CurrentValue),
     }
+}
+
+fn expr_for_emitted_header_leaf(
+    lowering: &ProtoLowering<'_>,
+    header: BlockRef,
+    def: crate::structure::DefId,
+) -> HirExpr {
+    let fallback = || expr_for_ssa_value(lowering, crate::structure::SsaValue::Def(def));
+    let Some(temp) = lowering.bindings.fixed_temps.get(def.index()).copied() else {
+        return fallback();
+    };
+    let reg = lowering.dataflow.def_reg(def);
+
+    // Header prefix 仍按原位置发射。这里只把没有源码/捕获身份的稳定字面量交给
+    // decision leaf；随后 dead-temp 才能在确认无剩余引用后删除那条机械赋值。
+    if !matches!(
+        lowering.bindings.temp_debug_locals.get(temp.index()),
+        Some(None)
+    ) || lowering.bindings.captured_temp_targets.contains_key(&temp)
+        || lowering
+            .bindings
+            .captured_temp_decl_locals
+            .contains_key(&temp)
+        || lowering.bindings.reg_is_reference_captured(reg)
+        || lowering
+            .bindings
+            .local_for_reg_in_block(header, reg)
+            .is_some()
+    {
+        return fallback();
+    }
+
+    expr_for_direct_literal_def(lowering, def).unwrap_or_else(fallback)
 }
 
 fn lower_condition_subjects(

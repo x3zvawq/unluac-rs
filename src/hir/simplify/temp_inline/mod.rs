@@ -4,7 +4,12 @@
 //! 简单语句使用一次”的情况。调用表达式另有一条更窄的连续融合规则，用来处理
 //! `callee_temp = f; arg_temp = expr; callee_temp(arg_temp)` 这种 bytecode 为保持 Lua
 //! “先求 callee、再求参数”而拆出的形状；融合时必须把 callee 和参数一起放回同一条
-//! call，不能只把 callee 延后到参数求值之后。
+//! call，不能只把 callee 延后到参数求值之后。run 中无读取且可安全丢弃的匿名 temp
+//! 不构成求值事件，但带 debug/capture 身份的赋值仍会阻断整包融合。
+//! 同一 block 的独立 run 沿进入本函数时的语句索引批量判定：sink 原位改写，删除区间
+//! 延迟到扫描结束后一次压缩，使 capture 与求值顺序快照始终处在同一坐标系。
+//! order-sensitive def 索引由 proto 级 scratch 复用，每个 block 只清理上次实际写过的槽，
+//! 避免结构块数量与全局 temp 数相乘的稠密初始化成本。
 //! 相邻内联以可观察事件前缀而非语法子节点顺序判定：纯 local/param 读取本身不是
 //! 屏障，但读取结果形成的 temp 快照不能越过可能改写 binding 的事件；lookup、调用、
 //! 运算和 method sugar 的隐式 lookup 是屏障。while/repeat 条件还属于每轮重新求值的
@@ -23,7 +28,9 @@ use crate::hir::common::{
     HirBlock, HirCallExpr, HirExpr, HirLValue, HirProto, HirStmt, HirTableField, HirTableKey,
     TempId,
 };
-use crate::hir::expr_safety::{expr_observes_eval_order, expr_requires_ordered_snapshot};
+use crate::hir::expr_safety::{
+    expr_is_discard_safe, expr_observes_eval_order, expr_requires_ordered_snapshot,
+};
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use self::rewrite::replace_temp_in_stmt;
@@ -41,6 +48,23 @@ use super::temp_touch::stmt_contains_nested_nonlocal_control;
 
 const NESTED_INLINE_MAX_COMPLEXITY: usize = 5;
 const CONTROL_HEAD_INLINE_MAX_COMPLEXITY: usize = 5;
+// 限制人工 chunk 的超长单 run 反复扫描 growing sink；这不是 VM 参数上限。
+// 超限只放弃可读性融合，原 temp 与求值语义保持不变。
+const CALL_MATERIALIZATION_SINK_REWRITE_BUDGET: usize = 1024;
+
+struct TempInlineWorkspace {
+    uses: TempUseScratch,
+    order_sensitive_defs: OrderSensitiveDefWorkspace,
+}
+
+impl TempInlineWorkspace {
+    fn new(proto: &HirProto, temp_count: usize) -> Self {
+        Self {
+            uses: TempUseScratch::new(proto, temp_count),
+            order_sensitive_defs: OrderSensitiveDefWorkspace::new(temp_count),
+        }
+    }
+}
 
 pub(super) fn inline_temps_in_proto_with_facts(
     proto: &mut HirProto,
@@ -55,12 +79,12 @@ pub(super) fn inline_temps_in_proto_with_facts(
         .map_or(0, |max_index| max_index + 1);
     let body_temp_count = max_temp_index_in_block(&proto.body).map_or(0, |max_index| max_index + 1);
     let temp_count = proto_temp_count.max(body_temp_count);
-    let mut scratch = TempUseScratch::new(proto, temp_count);
-    let mut live_use_counts = collect_block_temp_use_totals(&proto.body.stmts, &mut scratch);
+    let mut workspace = TempInlineWorkspace::new(proto, temp_count);
+    let mut live_use_counts = collect_block_temp_use_totals(&proto.body.stmts, &mut workspace.uses);
     let reference_captured = super::mention::stmts_reference_captured_bindings(&proto.body.stmts);
     inline_temps_in_block(
         &mut proto.body,
-        &mut scratch,
+        &mut workspace,
         &mut live_use_counts,
         &reference_captured,
         readability,
@@ -71,7 +95,7 @@ pub(super) fn inline_temps_in_proto_with_facts(
 
 fn inline_temps_in_block(
     block: &mut HirBlock,
-    scratch: &mut TempUseScratch,
+    workspace: &mut TempInlineWorkspace,
     live_use_counts: &mut [usize],
     reference_captured: &ReferenceCapturedBindings,
     readability: ReadabilityOptions,
@@ -93,7 +117,7 @@ fn inline_temps_in_block(
         let stmt = &mut block.stmts[index];
         changed |= inline_temps_in_nested_blocks(
             stmt,
-            scratch,
+            workspace,
             live_use_counts,
             reference_captured,
             readability,
@@ -105,7 +129,8 @@ fn inline_temps_in_block(
 
     if inline_call_callee_across_argument_materialization(
         block,
-        scratch,
+        &mut workspace.uses,
+        &mut workspace.order_sensitive_defs,
         live_use_counts,
         facts,
         &captured_slots_before_stmt,
@@ -129,7 +154,7 @@ fn inline_temps_in_block(
         .rev()
     {
         if let Some((temp, value)) = inline_candidate(&stmt)
-            && !scratch.has_debug_local_hint(temp)
+            && !workspace.uses.has_debug_local_hint(temp)
             && !temp_rebinds_captured_slot(
                 temp,
                 facts,
@@ -261,13 +286,17 @@ impl CapturedSlotSnapshots {
 fn inline_call_callee_across_argument_materialization(
     block: &mut HirBlock,
     scratch: &mut TempUseScratch,
+    order_sensitive_defs: &mut OrderSensitiveDefWorkspace,
     live_use_counts: &mut [usize],
     facts: &ProtoPromotionFacts,
     captured_slots_before_stmt: &CapturedSlotSnapshots,
     reference_captured: &ReferenceCapturedBindings,
 ) -> bool {
-    let prior_order_sensitive_defs =
-        order_sensitive_temp_def_indices(&block.stmts, scratch.temp_count());
+    // child block 已全部处理完才会到这里，因此同一个 proto 级 workspace 不会覆盖
+    // 仍在活跃递归 frame 中的 parent 索引。
+    order_sensitive_defs.rebuild(&block.stmts);
+    let mut removed_stmts = vec![false; block.stmts.len()];
+    let mut changed = false;
     let mut index = 0;
 
     while index < block.stmts.len() {
@@ -314,28 +343,49 @@ fn inline_call_callee_across_argument_materialization(
 
         let mut rewritten_sink = block.stmts[run_end].clone();
         let mut removed_temps = Vec::with_capacity(run_end - callee_index);
+        let mut discarded_uses = Vec::new();
         let mut complete_run = true;
+        let mut sink_rewrite_count = 0;
         for candidate_index in ((callee_index + 1)..run_end).rev() {
             let Some((temp, value)) = inline_candidate(&block.stmts[candidate_index]) else {
                 complete_run = false;
                 break;
             };
-            let Some(site) = inline_site_in_stmt(&rewritten_sink, temp) else {
+            let use_count = total_use_count(temp, live_use_counts);
+            if use_count > 1 {
                 complete_run = false;
                 break;
-            };
-            if !cross_call_inline_candidate_is_safe(
+            }
+            let candidate_is_safe = cross_call_inline_candidate_is_safe(
                 temp,
                 value,
                 candidate_index,
                 scratch,
                 facts,
                 captured_slots_before_stmt,
-            ) || total_use_count(temp, live_use_counts) != 1
+            );
+            if use_count == 0 {
+                if candidate_is_safe && expr_is_discard_safe(value) {
+                    discarded_uses.push(collect_expr_temp_uses_summary(value, scratch));
+                    continue;
+                }
+                complete_run = false;
+                break;
+            }
+            if sink_rewrite_count >= CALL_MATERIALIZATION_SINK_REWRITE_BUDGET {
+                complete_run = false;
+                break;
+            }
+            sink_rewrite_count += 1;
+            let Some(site) = inline_site_in_stmt(&rewritten_sink, temp) else {
+                complete_run = false;
+                break;
+            };
+            if !candidate_is_safe
                 || arg_value_forwards_prior_order_sensitive_expr(
                     value,
                     callee_index,
-                    &prior_order_sensitive_defs,
+                    order_sensitive_defs,
                 )
                 || inline_crosses_evaluation_boundary(
                     site,
@@ -351,12 +401,15 @@ fn inline_call_callee_across_argument_materialization(
             replace_temp_in_stmt(&mut rewritten_sink, temp, value);
             removed_temps.push(temp);
         }
+        if !complete_run {
+            index = run_end + 1;
+            continue;
+        }
         let Some(callee_site) = inline_site_in_stmt(&rewritten_sink, callee_temp) else {
             index = run_end + 1;
             continue;
         };
-        if !complete_run
-            || callee_site != InlineSite::CallCallee
+        if callee_site != InlineSite::CallCallee
             || inline_crosses_evaluation_boundary(
                 callee_site,
                 callee_value,
@@ -372,7 +425,7 @@ fn inline_call_callee_across_argument_materialization(
         removed_temps.push(callee_temp);
 
         block.stmts[run_end] = rewritten_sink;
-        block.stmts.drain(callee_index..run_end);
+        removed_stmts[callee_index..run_end].fill(true);
         remove_live_use(live_use_counts, callee_temp);
         for temp in removed_temps
             .into_iter()
@@ -380,10 +433,24 @@ fn inline_call_callee_across_argument_materialization(
         {
             remove_live_use(live_use_counts, temp);
         }
-        return true;
+        for uses in discarded_uses {
+            uses.subtract_from_totals(live_use_counts);
+        }
+        changed = true;
+        // 语句仍保留原索引，后续 run 可以继续复用进入本函数前冻结的 capture 与
+        // order-sensitive def 快照；压缩只能在整次扫描结束后统一发生。
+        index = run_end + 1;
     }
 
-    false
+    if changed {
+        let mut index = 0;
+        block.stmts.retain(|_| {
+            let keep = !removed_stmts[index];
+            index += 1;
+            keep
+        });
+    }
+    changed
 }
 
 fn call_arg_inline_crosses_materialized_callee(
@@ -397,32 +464,53 @@ fn call_arg_inline_crosses_materialized_callee(
         && callee_materialized_at.is_some_and(|callee_index| stmt_index < callee_index)
 }
 
-fn order_sensitive_temp_def_indices(stmts: &[HirStmt], temp_count: usize) -> Vec<Option<usize>> {
-    let mut defs = vec![None; temp_count];
-    for (index, stmt) in stmts.iter().enumerate() {
-        let Some((temp, value)) = inline_candidate(stmt) else {
-            continue;
-        };
-        if expr_observes_eval_order(value)
-            && let Some(slot) = defs.get_mut(temp.index())
-        {
+struct OrderSensitiveDefWorkspace {
+    defs: Vec<Option<usize>>,
+    touched: Vec<TempId>,
+}
+
+impl OrderSensitiveDefWorkspace {
+    fn new(temp_count: usize) -> Self {
+        Self {
+            defs: vec![None; temp_count],
+            touched: Vec::new(),
+        }
+    }
+
+    fn rebuild(&mut self, stmts: &[HirStmt]) {
+        for temp in self.touched.drain(..) {
+            self.defs[temp.index()] = None;
+        }
+        for (index, stmt) in stmts.iter().enumerate() {
+            let Some((temp, value)) = inline_candidate(stmt) else {
+                continue;
+            };
+            if !expr_observes_eval_order(value) {
+                continue;
+            }
+            let slot = &mut self.defs[temp.index()];
+            if slot.is_none() {
+                self.touched.push(temp);
+            }
             *slot = Some(index);
         }
     }
-    defs
+
+    fn get(&self, temp: TempId) -> Option<usize> {
+        self.defs[temp.index()]
+    }
 }
 
 fn arg_value_forwards_prior_order_sensitive_expr(
     arg_value: &HirExpr,
     callee_def_index: usize,
-    prior_order_sensitive_defs: &[Option<usize>],
+    prior_order_sensitive_defs: &OrderSensitiveDefWorkspace,
 ) -> bool {
     let HirExpr::TempRef(temp) = arg_value else {
         return false;
     };
     prior_order_sensitive_defs
-        .get(temp.index())
-        .and_then(|def_index| *def_index)
+        .get(*temp)
         .is_some_and(|arg_def_index| arg_def_index < callee_def_index)
 }
 
@@ -471,7 +559,7 @@ fn collect_block_temp_use_totals(stmts: &[HirStmt], scratch: &mut TempUseScratch
 
 fn inline_temps_in_nested_blocks(
     stmt: &mut HirStmt,
-    scratch: &mut TempUseScratch,
+    workspace: &mut TempInlineWorkspace,
     live_use_counts: &mut [usize],
     reference_captured: &ReferenceCapturedBindings,
     readability: ReadabilityOptions,
@@ -482,7 +570,7 @@ fn inline_temps_in_nested_blocks(
         HirStmt::If(if_stmt) => {
             let mut changed = inline_temps_in_block(
                 &mut if_stmt.then_block,
-                scratch,
+                workspace,
                 live_use_counts,
                 reference_captured,
                 readability,
@@ -492,7 +580,7 @@ fn inline_temps_in_nested_blocks(
             if let Some(else_block) = &mut if_stmt.else_block {
                 changed |= inline_temps_in_block(
                     else_block,
-                    scratch,
+                    workspace,
                     live_use_counts,
                     reference_captured,
                     readability,
@@ -504,7 +592,7 @@ fn inline_temps_in_nested_blocks(
         }
         HirStmt::While(while_stmt) => inline_temps_in_block(
             &mut while_stmt.body,
-            scratch,
+            workspace,
             live_use_counts,
             reference_captured,
             readability,
@@ -514,7 +602,7 @@ fn inline_temps_in_nested_blocks(
         HirStmt::Repeat(repeat_stmt) => {
             let mut changed = inline_temps_in_block(
                 &mut repeat_stmt.body,
-                scratch,
+                workspace,
                 live_use_counts,
                 reference_captured,
                 readability,
@@ -523,7 +611,7 @@ fn inline_temps_in_nested_blocks(
             );
             changed |= inline_repeat_tail_temp(
                 repeat_stmt,
-                scratch,
+                &mut workspace.uses,
                 live_use_counts,
                 reference_captured,
                 readability,
@@ -534,7 +622,7 @@ fn inline_temps_in_nested_blocks(
         }
         HirStmt::NumericFor(numeric_for) => inline_temps_in_block(
             &mut numeric_for.body,
-            scratch,
+            workspace,
             live_use_counts,
             reference_captured,
             readability,
@@ -543,7 +631,7 @@ fn inline_temps_in_nested_blocks(
         ),
         HirStmt::GenericFor(generic_for) => inline_temps_in_block(
             &mut generic_for.body,
-            scratch,
+            workspace,
             live_use_counts,
             reference_captured,
             readability,
@@ -552,7 +640,7 @@ fn inline_temps_in_nested_blocks(
         ),
         HirStmt::Block(block) => inline_temps_in_block(
             block,
-            scratch,
+            workspace,
             live_use_counts,
             reference_captured,
             readability,

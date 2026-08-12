@@ -17,7 +17,7 @@ use crate::transformer::LowInstr;
 pub(super) use self::decision::{build_condition_decision_expr, build_value_decision_expr};
 use self::lowering::{lower_short_circuit_subject, lower_short_circuit_subject_single_eval};
 use super::exprs::{
-    expr_for_fixed_def, expr_for_fixed_def_single_eval, expr_for_ssa_value, lower_branch_subject,
-    lower_branch_subject_single_eval,
+    expr_for_direct_literal_def, expr_for_fixed_def, expr_for_fixed_def_single_eval,
+    expr_for_ssa_value, lower_branch_subject, lower_branch_subject_single_eval,
 };
 use super::lower::ProtoLowering;

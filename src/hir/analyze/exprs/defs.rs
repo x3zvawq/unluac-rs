@@ -262,6 +262,25 @@ pub(crate) fn expr_for_dup_safe_fixed_def(
     }
 }
 
+/// 只恢复定义指令直接写入的稳定字面量，不沿 Move 或其它表达式来源递归。
+pub(crate) fn expr_for_direct_literal_def(
+    lowering: &ProtoLowering<'_>,
+    def_id: DefId,
+) -> Option<HirExpr> {
+    let def_instr = lowering.dataflow.def_instr(def_id);
+    if !matches!(
+        lowering.proto.instrs.get(def_instr.index())?,
+        LowInstr::LoadNil(_)
+            | LowInstr::LoadBool(_)
+            | LowInstr::LoadConst(_)
+            | LowInstr::LoadInteger(_)
+            | LowInstr::LoadNumber(_)
+    ) {
+        return None;
+    }
+    expr_for_dup_safe_fixed_def(lowering, def_id)
+}
+
 fn expr_for_fixed_call(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,

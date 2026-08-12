@@ -45,6 +45,14 @@ impl TempUseSummary {
         self.for_each(|temp, count| totals[temp.index()] += count);
     }
 
+    pub(super) fn subtract_from_totals(&self, totals: &mut [usize]) {
+        self.for_each(|temp, count| {
+            totals[temp.index()] = totals[temp.index()]
+                .checked_sub(count)
+                .expect("rewrite should not remove more temp uses than remain live");
+        });
+    }
+
     fn for_each(&self, mut visitor: impl FnMut(TempId, usize)) {
         match self {
             Self::Empty => {}

@@ -239,6 +239,7 @@ const PUC_LUA_GE_54: &[LuaCaseDialect] = &[LuaCaseDialect::Lua54, LuaCaseDialect
 const PUC_LUA_GE_55: &[LuaCaseDialect] = &[LuaCaseDialect::Lua55];
 const LUAU_ONLY: &[LuaCaseDialect] = &[LuaCaseDialect::Luau];
 const LUAJIT_ONLY: &[LuaCaseDialect] = &[LuaCaseDialect::Luajit];
+const LUAU_O0_ONLY: &[LuaCaseVariant] = &[LuaCaseVariant::LuauO0];
 const LUAU_ALL_OPTIMIZATION_VARIANTS: &[LuaCaseVariant] = &[
     LuaCaseVariant::LuauO0,
     LuaCaseVariant::LuauO1,
@@ -377,6 +378,11 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_11_assert_short_circuit_value_merge.lua",
         PUC_LUA_GE_52,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_11_assert_short_circuit_value_merge.lua",
+        LUAU_ONLY,
+    )
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_12_loop_break_shared_continuation.lua",
         PUC_LUA_51,
@@ -1631,6 +1637,11 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         LUAU_ONLY,
     )
     .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_305_temp_inline_independent_runs.lua",
+        LUAU_ONLY,
+    )
+    .with_variants(LUAU_O0_ONLY),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {
