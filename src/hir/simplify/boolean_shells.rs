@@ -24,7 +24,7 @@ use crate::hir::expr_safety::expr_is_discard_safe;
 
 use super::expr_facts::expr_is_boolean_valued;
 use super::local_shapes::empty_single_local_decl_binding;
-use super::visit::{HirVisitor, visit_proto};
+use super::mention::collect_temp_use_counts;
 use super::walk::{HirRewritePass, rewrite_proto};
 
 pub(super) fn remove_boolean_materialization_shells_in_proto(proto: &mut HirProto) -> bool {
@@ -204,24 +204,5 @@ fn booleanized_truthiness_expr(cond: HirExpr) -> HirExpr {
             })),
             rhs: HirExpr::Boolean(false),
         }))
-    }
-}
-
-fn collect_temp_use_counts(proto: &HirProto) -> BTreeMap<TempId, usize> {
-    let mut collector = TempUseCollector::default();
-    visit_proto(proto, &mut collector);
-    collector.use_counts
-}
-
-#[derive(Default)]
-struct TempUseCollector {
-    use_counts: BTreeMap<TempId, usize>,
-}
-
-impl HirVisitor for TempUseCollector {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        if let HirExpr::TempRef(temp) = expr {
-            *self.use_counts.entry(*temp).or_default() += 1;
-        }
     }
 }

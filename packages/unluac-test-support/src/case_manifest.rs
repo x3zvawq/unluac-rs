@@ -1700,6 +1700,10 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         ..LuaCaseOptions::DEFAULT
     })
     .with_expectation(LuaCaseExpectation::InvalidDebugStillRejected),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_310_open_return_captured_snapshot.lua",
+        ALL_DIALECTS,
+    ),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {

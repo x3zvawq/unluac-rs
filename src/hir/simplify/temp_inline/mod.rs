@@ -13,9 +13,9 @@
 //! 相邻内联以可观察事件前缀而非语法子节点顺序判定：纯 local/param 读取本身不是
 //! 屏障，但读取结果形成的 temp 快照不能越过可能改写 binding 的事件；lookup、调用、
 //! 运算和 method sugar 的隐式 lookup 是屏障。while/repeat 条件还属于每轮重新求值的
-//! 独立区域，不能接收循环外快照。唯一的跨边界折叠是 repeat body 最后一条 temp 写入：
-//! 它和 until 条件属于同一轮，且只有在没有外部存活、自引用、capture 与绕过尾写入的
-//! 控制路径时，才能把 RHS 移入条件中的唯一消费点。
+//! 独立区域，不能接收循环外快照。跨边界折叠只有两个窄合同：repeat body 尾写入与
+//! until 属于同一轮；open return 的 fixed alias 则必须先于完整保留的 tail setup，且
+//! source/target home 不被 setup 写入或 capture。两者都要求唯一消费且不绕过原求值点。
 
 mod rewrite;
 mod site;
@@ -127,7 +127,7 @@ fn inline_temps_in_block(
         facts.collect_captured_home_slots_in_stmt(stmt, &mut active_captured_slots);
     }
 
-    if inline_call_callee_across_argument_materialization(
+    if inline_materialization_runs(
         block,
         &mut workspace.uses,
         &mut workspace.order_sensitive_defs,
@@ -283,7 +283,7 @@ impl CapturedSlotSnapshots {
     }
 }
 
-fn inline_call_callee_across_argument_materialization(
+fn inline_materialization_runs(
     block: &mut HirBlock,
     scratch: &mut TempUseScratch,
     order_sensitive_defs: &mut OrderSensitiveDefWorkspace,
@@ -308,6 +308,19 @@ fn inline_call_callee_across_argument_materialization(
         let mut run_end = run_start + 1;
         while run_end < block.stmts.len() && inline_candidate(&block.stmts[run_end]).is_some() {
             run_end += 1;
+        }
+        if inline_open_return_fixed_alias_run(
+            block,
+            run_start..run_end,
+            scratch,
+            live_use_counts,
+            facts,
+            captured_slots_before_stmt,
+            &mut removed_stmts,
+        ) {
+            changed = true;
+            index = run_end + 1;
+            continue;
         }
         let Some(HirStmt::CallStmt(call_stmt)) = block.stmts.get(run_end) else {
             index = run_end;
@@ -451,6 +464,96 @@ fn inline_call_callee_across_argument_materialization(
         });
     }
     changed
+}
+
+fn inline_open_return_fixed_alias_run(
+    block: &mut HirBlock,
+    run: std::ops::Range<usize>,
+    scratch: &TempUseScratch,
+    live_use_counts: &mut [usize],
+    facts: &ProtoPromotionFacts,
+    captured_slots_before_stmt: &CapturedSlotSnapshots,
+    removed_stmts: &mut [bool],
+) -> bool {
+    let (run_start, run_end) = (run.start, run.end);
+    let Some(HirStmt::Return(ret)) = block.stmts.get(run_end) else {
+        return false;
+    };
+    let Some(tail) = ret.values.tail.as_ref() else {
+        return false;
+    };
+    if tail.exact_width().is_some() || !matches!(tail.as_expr(), HirExpr::Call(_)) {
+        return false;
+    }
+    let alias_count = ret.values.fixed.len();
+    if alias_count == 0 || alias_count >= run_end - run_start {
+        return false;
+    }
+
+    let Some(captured_slots) = captured_slots_before_stmt.get(run_end) else {
+        return false;
+    };
+    let mut target_slots = BTreeSet::new();
+    let mut source_slots = BTreeSet::new();
+    for (stmt, fixed) in block.stmts[run_start..(run_start + alias_count)]
+        .iter()
+        .zip(&ret.values.fixed)
+    {
+        let Some((target, HirExpr::TempRef(source))) = inline_candidate(stmt) else {
+            return false;
+        };
+        if !matches!(fixed, HirExpr::TempRef(temp) if *temp == target)
+            || total_use_count(target, live_use_counts) != 1
+            || scratch.has_debug_local_hint(target)
+        {
+            return false;
+        }
+        let (Some(target_slot), Some(source_slot)) =
+            (facts.home_slot(target), facts.home_slot(*source))
+        else {
+            return false;
+        };
+        if captured_slots.contains(&target_slot)
+            || captured_slots.contains(&source_slot)
+            || !target_slots.insert(target_slot)
+        {
+            return false;
+        }
+        source_slots.insert(source_slot);
+    }
+    if !target_slots.is_disjoint(&source_slots) {
+        return false;
+    }
+
+    for stmt in &block.stmts[(run_start + alias_count)..run_end] {
+        let Some((target, _)) = inline_candidate(stmt) else {
+            return false;
+        };
+        let Some(slot) = facts.home_slot(target) else {
+            return false;
+        };
+        if target_slots.contains(&slot) || source_slots.contains(&slot) {
+            return false;
+        }
+    }
+
+    let (run, sink) = block.stmts.split_at_mut(run_end);
+    let HirStmt::Return(ret) = &mut sink[0] else {
+        unreachable!("validated open-return sink must remain a return")
+    };
+    for (offset, (stmt, fixed)) in run[run_start..(run_start + alias_count)]
+        .iter()
+        .zip(&mut ret.values.fixed)
+        .enumerate()
+    {
+        let Some((target, HirExpr::TempRef(source))) = inline_candidate(stmt) else {
+            unreachable!("validated fixed-prefix alias must remain scalar")
+        };
+        *fixed = HirExpr::TempRef(*source);
+        removed_stmts[run_start + offset] = true;
+        remove_live_use(live_use_counts, target);
+    }
+    true
 }
 
 fn call_arg_inline_crosses_materialized_callee(

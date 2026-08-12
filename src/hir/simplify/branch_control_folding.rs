@@ -7,7 +7,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::hir::common::{HirBlock, HirExpr, HirIf, HirLabelId, HirProto, HirStmt};
+use crate::hir::common::{
+    HirBlock, HirCallExpr, HirCallStmt, HirExpr, HirIf, HirLabelId, HirProto, HirStmt,
+    HirUnaryOpKind,
+};
 
 use super::label_refs::count_label_references;
 use super::logical_simplify::normalize_condition_context;
@@ -28,7 +31,46 @@ impl HirRewritePass for BranchControlPass {
     }
 
     fn rewrite_stmt(&mut self, stmt: &mut HirStmt) -> bool {
-        fold_leading_while_break_guard(stmt) || naturalize_if_polarity(stmt)
+        fold_effect_only_call(stmt)
+            || fold_leading_while_break_guard(stmt)
+            || naturalize_if_polarity(stmt)
+    }
+}
+
+fn fold_effect_only_call(stmt: &mut HirStmt) -> bool {
+    let HirStmt::If(if_stmt) = stmt else {
+        return false;
+    };
+    if !if_stmt.then_block.stmts.is_empty()
+        || if_stmt
+            .else_block
+            .as_ref()
+            .is_some_and(|block| !block.stmts.is_empty())
+    {
+        return false;
+    }
+
+    let Some(call) = take_effect_only_call(&mut if_stmt.cond) else {
+        return false;
+    };
+    *stmt = HirStmt::CallStmt(Box::new(HirCallStmt { call: *call }));
+    true
+}
+
+fn take_effect_only_call(mut expr: &mut HirExpr) -> Option<Box<HirCallExpr>> {
+    loop {
+        match expr {
+            HirExpr::Call(_) => {
+                let HirExpr::Call(call) = std::mem::replace(expr, HirExpr::Nil) else {
+                    unreachable!("matched call must remain a call")
+                };
+                return Some(call);
+            }
+            HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
+                expr = &mut unary.expr;
+            }
+            _ => return None,
+        }
     }
 }
 

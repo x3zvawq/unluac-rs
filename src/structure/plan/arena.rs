@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use super::{
     ControlFlowFeature, EdgeActionPlacement, EdgePlan, EdgeTransfer, FinalPlanInput,
     ForwardRouteId, ForwardRouteKind, ForwardRoutePlan, LabelPlacement, LabelPlan, LabelPlanId,
-    PlanRequirement, PlanRequirementId, PlanRequirements, RegionId, RegionNavigation, RegionPlan,
-    StructureError, UnstructuredLayoutItem,
+    LoopNormalTailPlan, PlanRequirement, PlanRequirementId, PlanRequirements, RegionId,
+    RegionNavigation, RegionPlan, StructureError, UnstructuredLayoutItem,
 };
 use crate::decompile::ControlFlowCaps;
 use crate::structure::{
@@ -698,12 +698,8 @@ impl WhileBreakArmWorkspace {
 
 #[derive(Debug, Clone)]
 struct NormalTailPartition {
-    entry: BlockRef,
     blocks: BTreeSet<BlockRef>,
-    continuation: BlockRef,
-    early_exits: Vec<EdgeRef>,
-    normal_exits: Vec<EdgeRef>,
-    completion_exits: Vec<EdgeRef>,
+    contract: LoopNormalTailPlan,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1403,8 +1399,10 @@ impl LoopQueryIndex {
             spec_by_region[region.index()] = Some(spec_index);
             continuation[region.index()] = partition.continuation;
             continue_target[region.index()] = loop_.candidate.continue_target;
-            normal_tail_entry[region.index()] =
-                partition.normal_tail.as_ref().map(|tail| tail.entry);
+            normal_tail_entry[region.index()] = partition
+                .normal_tail
+                .as_ref()
+                .map(|tail| tail.contract.entry);
             let Some(RegionPlan::Loop {
                 preheader, control, ..
             }) = arena.regions.get(region.index())
@@ -5705,12 +5703,14 @@ fn detect_normal_loop_tail(
     completion_exits.sort_by_key(|edge| edge.index());
     completion_exits.dedup();
     Some(NormalTailPartition {
-        entry,
         blocks,
-        continuation,
-        early_exits,
-        normal_exits,
-        completion_exits,
+        contract: LoopNormalTailPlan {
+            entry,
+            continuation,
+            early_exits,
+            normal_exits,
+            completion_exits,
+        },
     })
 }
 
@@ -6158,13 +6158,7 @@ fn freeze_loop_payload(
         normal_tail: partition
             .normal_tail
             .as_ref()
-            .map(|tail| super::LoopNormalTailPlan {
-                entry: tail.entry,
-                continuation: tail.continuation,
-                early_exits: tail.early_exits.clone(),
-                normal_exits: tail.normal_exits.clone(),
-                completion_exits: tail.completion_exits.clone(),
-            }),
+            .map(|tail| tail.contract.clone()),
         exit_tail,
         propagated_break,
         header_values: candidate.header_value_merges.clone(),

@@ -4,13 +4,13 @@
 //! temp”。这些问题属于只读树遍历，不应散落在各个 pass 里各写一套 visitor。
 //! 本模块只提供语法树提及事实，不判断 carried-local、branch-value 等业务形状。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
-    HirBlock, HirCaptureMode, HirExpr, HirLValue, HirStmt, LocalId, ParamId, TempId,
+    HirBlock, HirCaptureMode, HirExpr, HirLValue, HirProto, HirStmt, LocalId, ParamId, TempId,
 };
 
-use super::visit::{HirVisitor, visit_block, visit_expr, visit_stmts};
+use super::visit::{HirVisitor, visit_block, visit_expr, visit_proto, visit_stmts};
 
 pub(super) fn stmts_mention_local(stmts: &[HirStmt], local: LocalId) -> bool {
     LocalMentionCollector::mentions_in_stmts(stmts, local)
@@ -92,6 +92,25 @@ pub(super) fn expr_mentions_temp(expr: &HirExpr, temp: TempId) -> bool {
 
 pub(super) fn stmt_writes_temp(stmt: &HirStmt, temp: TempId) -> bool {
     TempWriteCollector::writes_in_stmt(stmt, temp)
+}
+
+pub(super) fn collect_temp_use_counts(proto: &HirProto) -> BTreeMap<TempId, usize> {
+    let mut collector = TempUseCollector::default();
+    visit_proto(proto, &mut collector);
+    collector.counts
+}
+
+#[derive(Default)]
+struct TempUseCollector {
+    counts: BTreeMap<TempId, usize>,
+}
+
+impl HirVisitor for TempUseCollector {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        if let HirExpr::TempRef(temp) = expr {
+            *self.counts.entry(*temp).or_default() += 1;
+        }
+    }
 }
 
 struct LocalMentionCollector {

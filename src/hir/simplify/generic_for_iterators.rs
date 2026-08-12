@@ -7,21 +7,43 @@
 //! 输入：`t0 = next; t1,t2,t3 = factory()<exact:3>; GenericFor(t0,t1,t2,t3)`
 //! 输出：`GenericFor(next, factory()<open>)`
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::hir::common::{
-    HirBlock, HirExpr, HirGenericFor, HirLValue, HirProto, HirStmt, HirValuePack,
+    HirBlock, HirExpr, HirGenericFor, HirLValue, HirProto, HirStmt, HirValuePack, TempId,
 };
+use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
+use super::mention::collect_temp_use_counts;
 use super::walk::{HirRewritePass, rewrite_proto};
 
-pub(super) fn fold_generic_for_iterators_in_proto(proto: &mut HirProto) -> bool {
-    rewrite_proto(proto, &mut GenericForIteratorPass)
+pub(super) fn fold_generic_for_iterators_in_proto(
+    proto: &mut HirProto,
+    facts: &ProtoPromotionFacts,
+) -> bool {
+    let use_counts = collect_temp_use_counts(proto);
+    let debug_temps = proto
+        .temp_debug_locals
+        .iter()
+        .map(Option::is_some)
+        .collect();
+    rewrite_proto(
+        proto,
+        &mut GenericForIteratorPass {
+            use_counts,
+            debug_temps,
+            facts,
+        },
+    )
 }
 
-struct GenericForIteratorPass;
+struct GenericForIteratorPass<'a> {
+    use_counts: BTreeMap<TempId, usize>,
+    debug_temps: Vec<bool>,
+    facts: &'a ProtoPromotionFacts,
+}
 
-impl HirRewritePass for GenericForIteratorPass {
+impl HirRewritePass for GenericForIteratorPass<'_> {
     fn rewrite_stmt(&mut self, stmt: &mut HirStmt) -> bool {
         let HirStmt::GenericFor(generic_for) = stmt else {
             return false;
@@ -36,8 +58,8 @@ impl HirRewritePass for GenericForIteratorPass {
         let mut changed = false;
 
         while !pending.is_empty() {
-            if let Some(plan) = fold_plan(pending.make_contiguous()) {
-                new_stmts.push(fold_front(&mut pending, plan));
+            if let Some(plan) = fold_plan(pending.make_contiguous(), self) {
+                fold_front(&mut pending, plan, &mut new_stmts);
                 changed = true;
             } else {
                 new_stmts.push(
@@ -67,23 +89,106 @@ fn trim_trailing_nil_iterators(iterator: &mut HirValuePack) -> bool {
 #[derive(Clone, Copy)]
 struct FoldPlan {
     assignment_count: usize,
+    gap_count: usize,
 }
 
-fn fold_plan(stmts: &[HirStmt]) -> Option<FoldPlan> {
+fn fold_plan(stmts: &[HirStmt], context: &GenericForIteratorPass<'_>) -> Option<FoldPlan> {
     // VM 最多给 generic-for 保留 iterator/state/control/closing 四个 source slots。
     for assignment_count in 1..=4 {
         if !matches!(stmts.get(assignment_count - 1), Some(HirStmt::Assign(_))) {
             return None;
         }
-        let Some(HirStmt::GenericFor(generic_for)) = stmts.get(assignment_count) else {
-            continue;
-        };
-        if assignments_match_iterator(&stmts[..assignment_count], generic_for) {
-            return Some(FoldPlan { assignment_count });
+        let assignments = &stmts[..assignment_count];
+        if let Some(HirStmt::GenericFor(generic_for)) = stmts.get(assignment_count) {
+            return assignments_match_iterator(assignments, generic_for).then_some(FoldPlan {
+                assignment_count,
+                gap_count: 0,
+            });
         }
-        return None;
+        if let (Some(gap @ HirStmt::Assign(_)), Some(HirStmt::GenericFor(generic_for))) =
+            (stmts.get(assignment_count), stmts.get(assignment_count + 1))
+            && assignments_match_iterator(assignments, generic_for)
+        {
+            return parameter_pack_can_cross_temp_copy(assignments, gap, context).then_some(
+                FoldPlan {
+                    assignment_count,
+                    gap_count: 1,
+                },
+            );
+        }
     }
     None
+}
+
+// 跨 gap 比相邻折叠多一次求值重排；这里只接纳 VM 的 parameter+nil pack，
+// 并以唯一 use/debug identity/home slot 同时证明被删 temp 与保留 copy 相互独立。
+fn parameter_pack_can_cross_temp_copy(
+    assignments: &[HirStmt],
+    gap: &HirStmt,
+    context: &GenericForIteratorPass<'_>,
+) -> bool {
+    let HirStmt::Assign(gap) = gap else {
+        return false;
+    };
+    let ([HirLValue::Temp(gap_target)], [HirExpr::TempRef(gap_source)], None) = (
+        gap.targets.as_slice(),
+        gap.values.fixed.as_slice(),
+        gap.values.tail.as_ref(),
+    ) else {
+        return false;
+    };
+    let (Some(gap_target_slot), Some(gap_source_slot)) = (
+        context.facts.home_slot(*gap_target),
+        context.facts.home_slot(*gap_source),
+    ) else {
+        return false;
+    };
+
+    let mut iterator_target_slots = Vec::new();
+    let mut iterator_source_slots = Vec::new();
+    for stmt in assignments {
+        let HirStmt::Assign(assign) = stmt else {
+            return false;
+        };
+        if assign.values.tail.is_some() {
+            return false;
+        }
+        for target in &assign.targets {
+            let HirLValue::Temp(temp) = target else {
+                return false;
+            };
+            let Some(slot) = context.facts.home_slot(*temp) else {
+                return false;
+            };
+            if context.use_counts.get(temp) != Some(&1)
+                || context
+                    .debug_temps
+                    .get(temp.index())
+                    .copied()
+                    .unwrap_or(false)
+                || iterator_target_slots.contains(&slot)
+            {
+                return false;
+            }
+            iterator_target_slots.push(slot);
+        }
+        for value in &assign.values.fixed {
+            match value {
+                HirExpr::Nil => {}
+                HirExpr::ParamRef(param) => {
+                    iterator_source_slots.push(HomeSlotKey::new(param.index(), 0));
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    !iterator_target_slots.contains(&gap_target_slot)
+        && !iterator_source_slots.contains(&gap_target_slot)
+        && !iterator_target_slots.contains(&gap_source_slot)
+        && iterator_source_slots
+            .iter()
+            .all(|slot| !iterator_target_slots.contains(slot))
 }
 
 fn assignments_match_iterator(assignments: &[HirStmt], generic_for: &HirGenericFor) -> bool {
@@ -123,7 +228,7 @@ fn assignments_match_iterator(assignments: &[HirStmt], generic_for: &HirGenericF
     actual == expected
 }
 
-fn fold_front(pending: &mut VecDeque<HirStmt>, plan: FoldPlan) -> HirStmt {
+fn fold_front(pending: &mut VecDeque<HirStmt>, plan: FoldPlan, new_stmts: &mut Vec<HirStmt>) {
     let mut iterator = HirValuePack::default();
     for _ in 0..plan.assignment_count {
         let HirStmt::Assign(assign) = pending
@@ -140,9 +245,17 @@ fn fold_front(pending: &mut VecDeque<HirStmt>, plan: FoldPlan) -> HirStmt {
 
     trim_trailing_nil_iterators(&mut iterator);
 
+    for _ in 0..plan.gap_count {
+        new_stmts.push(
+            pending
+                .pop_front()
+                .expect("validated generic-for assignment gap"),
+        );
+    }
+
     let Some(HirStmt::GenericFor(mut generic_for)) = pending.pop_front() else {
         unreachable!("validated generic-for owner");
     };
     generic_for.iterator = iterator;
-    HirStmt::GenericFor(generic_for)
+    new_stmts.push(HirStmt::GenericFor(generic_for));
 }
