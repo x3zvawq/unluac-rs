@@ -30,6 +30,12 @@ pub enum ParseError {
     UnsupportedValue { field: &'static str, value: u64 },
     #[error("integer overflow while decoding {field}: {value}")]
     IntegerOverflow { field: &'static str, value: u64 },
+    #[error("{field} depth {found} exceeds the parser limit of {limit}")]
+    DepthLimit {
+        field: &'static str,
+        limit: usize,
+        found: usize,
+    },
     #[error("negative {field} value {value} is not valid in this bytecode chunk")]
     NegativeValue { field: &'static str, value: i64 },
     #[error("invalid constant tag {tag} at offset {offset}")]

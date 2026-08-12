@@ -17,6 +17,7 @@ use crate::parser::family::puc_lua::{
     validate_instruction_word_size, validate_main_proto_upvalue_count,
     validate_optional_count_match,
 };
+use crate::parser::limits::check_proto_depth;
 use crate::parser::options::ParseOptions;
 use crate::parser::raw::{
     ChunkHeader, ChunkLayout, Dialect, DialectConstPoolExtra, DialectDebugExtra,
@@ -123,7 +124,7 @@ impl Lua54Parser {
             .puc_lua_layout()
             .expect("lua54 parser must produce a PUC-Lua header layout");
         let main_upvalue_count = reader.read_u8()?;
-        let main = self.parse_proto(&mut reader, layout, None)?;
+        let main = self.parse_proto(&mut reader, layout, None, 1)?;
 
         validate_main_proto_upvalue_count(
             self.options.mode.is_permissive(),
@@ -206,7 +207,9 @@ impl Lua54Parser {
         reader: &mut BinaryReader<'_>,
         layout: &PucLuaChunkLayout,
         parent_source: Option<&RawString>,
+        depth: usize,
     ) -> Result<RawProto, ParseError> {
+        check_proto_depth(depth)?;
         let (prelude, header_source) = read_proto_prelude(
             reader,
             |reader| self.parse_string(reader),
@@ -226,8 +229,8 @@ impl Lua54Parser {
         let constants = self.parse_constants(reader, layout)?;
         let upvalues = self.parse_upvalues(reader)?;
         let child_count = reader.read_varint_u32_lua54("child proto count")?;
-        let children = collect_counted(child_count, || {
-            self.parse_proto(reader, layout, source.as_ref())
+        let children = collect_counted(reader, child_count, 1, |reader| {
+            self.parse_proto(reader, layout, source.as_ref(), depth + 1)
         })?;
         let debug_info = self.parse_debug_info(
             reader,
@@ -362,7 +365,7 @@ impl Lua54Parser {
                 value: payload_size,
             })?;
         let offset = reader.offset();
-        let bytes = reader.read_exact(byte_count)?.to_vec();
+        let bytes = reader.read_exact(byte_count)?;
         Ok(Some(build_raw_string(
             self.options,
             offset,

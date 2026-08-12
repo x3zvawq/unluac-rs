@@ -1,6 +1,6 @@
 # 审计问题与交接清单
 
-> 更新时间：2026-07-30
+> 更新时间：2026-08-10
 > 基线：当前 `dev`
 > 本文只记录尚未解决且已经取证的问题、明确风险和已确认的设计决定；完成项立即删除。
 
@@ -21,3 +21,5 @@
    重新枚举 body subtree，并把外围 for binding 展开到每个后代 block。后续应让
    binding owner 直接挂在 region/loop forest 上，由 lowering 按 ancestor stack 查询，
    不再复制 `loop × descendant block` 映射。
+5. **合法 Luau 深原型与当前递归 tree pipeline 不兼容**：pinned Luau 能生成主 proto 深度 999 的合法平面表；当前输入在约 300 层进入 Structure 时会系统栈溢出。Parser 已把所有 dialect 的 raw proto 深度统一限制为 200，使畸形或过深输入稳定返回 `ParseError`；这只是安全闭环，不是完整 Luau 兼容。关闭此项需要把 `RawProto -> LoweredProto -> Cfg/Graph/Dataflow/StructureFacts -> HIR` 的跨 proto 调度改为索引 arena 上的迭代后序遍历，再按实测安全边界放宽 Luau。相同重构还应消除 `build_proto_tree` 把共享 flat-proto DAG 递归克隆成潜在指数级 tree 的风险。
+6. **HIR capture 跨 key 图遍历仍可受不同 epoch 数放大**：当 `K` 个不同 `(slot, epoch)` 都覆盖整张 CFG 时，逐 key 反向写后数据流仍为 `O(K×(blocks+edges))`；不同 capture root 也可能重复遍历同一大型 normal-phi ancestry。普通编译器输出受寄存器数和词法 epoch domain 限制，但人工构造输入仍可放大此路径。关闭此项需要利用 epoch 的 dominator domain 限制反向传播范围，并对 normal phi graph 做 SCC 后的 earliest-def memo，不能建立 `key×block` 持久矩阵。

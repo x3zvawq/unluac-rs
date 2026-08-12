@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use crate::decompile::DecompileDialect;
 use crate::parser::error::ParseError;
+use crate::parser::limits::check_proto_depth;
 use crate::parser::options::ParseOptions;
 use crate::parser::raw::{
     ChunkHeader, ChunkLayout, Dialect, DialectConstPoolExtra, DialectDebugExtra,
@@ -194,7 +195,8 @@ impl LuauParserState {
                 field: "luau string count",
                 value: u64::MAX,
             })?;
-        let mut strings = Vec::with_capacity(string_count);
+        let capacity = reader.checked_count_capacity(string_count, 1)?;
+        let mut strings = Vec::with_capacity(capacity);
 
         for _ in 0..string_count {
             let offset = reader.offset();
@@ -203,7 +205,7 @@ impl LuauParserState {
                     field: "luau string length",
                     value: u64::MAX,
                 })?;
-            let bytes = reader.read_exact(length)?.to_vec();
+            let bytes = reader.read_exact(length)?;
             strings.push(build_raw_string(
                 self.options,
                 offset,
@@ -255,7 +257,8 @@ impl LuauParserState {
                 field: "luau proto count",
                 value: u64::MAX,
             })?;
-        let mut protos = Vec::with_capacity(proto_count);
+        let capacity = reader.checked_count_capacity(proto_count, 1)?;
+        let mut protos = Vec::with_capacity(capacity);
 
         for _ in 0..proto_count {
             protos.push(self.parse_flat_proto(reader, layout)?);
@@ -360,7 +363,8 @@ impl LuauParserState {
                 value: u64::MAX,
             })?;
         let code_offset = reader.offset();
-        let mut words = Vec::with_capacity(word_count);
+        let capacity = reader.checked_count_capacity(word_count, 4)?;
+        let mut words = Vec::with_capacity(capacity);
         for _ in 0..word_count {
             words.push(reader.read_u32_le()?);
         }
@@ -440,7 +444,8 @@ impl LuauParserState {
                 value: u64::MAX,
             })?;
         let mut literals = Vec::new();
-        let mut entries = Vec::with_capacity(const_count);
+        let capacity = reader.checked_count_capacity(const_count, 1)?;
+        let mut entries = Vec::with_capacity(capacity);
 
         for _ in 0..const_count {
             let tag = reader.read_u8()?;
@@ -487,7 +492,8 @@ impl LuauParserState {
                                 field: "luau table key count",
                                 value: u64::MAX,
                             })?;
-                    let mut key_consts = Vec::with_capacity(key_count);
+                    let capacity = reader.checked_count_capacity(key_count, 1)?;
+                    let mut key_consts = Vec::with_capacity(capacity);
                     for _ in 0..key_count {
                         key_consts.push(reader.read_varint_u32_luau("luau table key const")?);
                     }
@@ -515,7 +521,8 @@ impl LuauParserState {
                         field: "luau table-with-constants key count",
                         value: u64::MAX,
                     })?;
-                    let mut table_entries = Vec::with_capacity(key_count);
+                    let capacity = reader.checked_count_capacity(key_count, 5)?;
+                    let mut table_entries = Vec::with_capacity(capacity);
                     for _ in 0..key_count {
                         let key_const =
                             reader.read_varint_u32_luau("luau table-with-constants key")?;
@@ -587,7 +594,8 @@ impl LuauParserState {
             field: "luau child proto count",
             value: u64::MAX,
         })?;
-        let mut children = Vec::with_capacity(child_count);
+        let capacity = reader.checked_count_capacity(child_count, 1)?;
+        let mut children = Vec::with_capacity(capacity);
         for _ in 0..child_count {
             children.push(
                 usize::try_from(reader.read_varint_u32_luau("luau child proto index")?).map_err(
@@ -693,8 +701,9 @@ impl LuauParserState {
             field: "luau local debug count",
             value: u64::MAX,
         })?;
-        let mut locals = Vec::with_capacity(local_count);
-        let mut regs = Vec::with_capacity(local_count);
+        let capacity = reader.checked_count_capacity(local_count, 1)?;
+        let mut locals = Vec::with_capacity(capacity);
+        let mut regs = Vec::with_capacity(capacity);
 
         for _ in 0..local_count {
             let name = self
@@ -728,7 +737,8 @@ impl LuauParserState {
             });
         }
 
-        let mut upvalue_names = Vec::with_capacity(encoded_upvalue_names);
+        let capacity = reader.checked_count_capacity(encoded_upvalue_names, 1)?;
+        let mut upvalue_names = Vec::with_capacity(capacity);
         for _ in 0..encoded_upvalue_names {
             upvalue_names.push(self.read_string_ref(reader)?);
         }
@@ -820,6 +830,7 @@ fn count_reachable_proto_uses(
     main_index: usize,
     flat_protos: &[FlatProto],
 ) -> Result<Vec<usize>, ParseError> {
+    let mut depths = vec![1; flat_protos.len()];
     for (parent_index, flat) in flat_protos.iter().enumerate() {
         if let Some(&child_index) = flat
             .child_indices
@@ -831,7 +842,14 @@ fn count_reachable_proto_uses(
                 value: child_index as u64,
             });
         }
+        depths[parent_index] = flat
+            .child_indices
+            .iter()
+            .map(|&child_index| depths[child_index] + 1)
+            .max()
+            .unwrap_or(1);
     }
+    check_proto_depth(depths[main_index])?;
 
     let mut uses = vec![0; flat_protos.len()];
     let mut visited = vec![false; flat_protos.len()];

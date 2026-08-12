@@ -103,7 +103,6 @@ fn plan_focus(protos: &[ProtoEntry<'_>], filters: &DebugFilters) -> FocusPlan {
 fn build_summary_row(entry: &ProtoEntry<'_>) -> ProtoSummaryRow {
     ProtoSummaryRow {
         id: entry.id,
-        depth_below_focus: entry.depth,
         name: None,
         first: None,
         lines: Some((

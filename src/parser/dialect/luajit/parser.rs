@@ -8,6 +8,7 @@
 
 use crate::decompile::DecompileDialect;
 use crate::parser::error::ParseError;
+use crate::parser::limits::check_proto_depth;
 use crate::parser::options::ParseOptions;
 use crate::parser::raw::{
     ChunkHeader, ChunkLayout, Dialect, DialectConstPoolExtra, DialectDebugExtra,
@@ -130,7 +131,8 @@ impl LuaJitParser {
 
         let main = proto_stack
             .pop()
-            .expect("root proto count was checked above");
+            .expect("root proto count was checked above")
+            .proto;
 
         Ok(RawChunk {
             header,
@@ -178,7 +180,7 @@ impl LuaJitParser {
         } else {
             let name_start = reader.offset();
             let name_len = reader.read_uleb128_u32("luajit chunk name length")? as usize;
-            let bytes = reader.read_exact(name_len)?.to_vec();
+            let bytes = reader.read_exact(name_len)?;
             Some(self.decode_raw_string(name_start, reader.offset() - name_start, bytes)?)
         };
 
@@ -212,8 +214,8 @@ impl LuaJitParser {
         base_offset: usize,
         layout: &LuaJitChunkLayout,
         chunk_name: Option<&RawString>,
-        proto_stack: &mut Vec<RawProto>,
-    ) -> Result<RawProto, ParseError> {
+        proto_stack: &mut Vec<ParsedProto>,
+    ) -> Result<ParsedProto, ParseError> {
         let mut reader = BinaryReader::new(bytes);
         let flags = reader.read_u8()?;
         let num_params = reader.read_u8()?;
@@ -253,6 +255,7 @@ impl LuaJitParser {
         let ParsedConstPool {
             const_pool,
             children,
+            max_child_depth,
         } = self.parse_constants(&mut reader, base_offset, kgc_count, knum_count, proto_stack)?;
 
         let debug_info = if debug_size == 0 {
@@ -296,46 +299,51 @@ impl LuaJitParser {
             .map(|(first, count)| first.saturating_add(count.saturating_sub(1)))
             .unwrap_or(defined_start);
 
-        Ok(RawProto {
-            common: RawProtoCommon {
-                source: chunk_name.cloned(),
-                line_range: ProtoLineRange {
-                    defined_start,
-                    defined_end,
-                },
-                signature: ProtoSignature {
-                    num_params,
-                    is_vararg: (flags & PROTO_VARARG) != 0,
-                    has_vararg_param_reg: false,
-                    named_vararg_table: false,
-                    legacy_arg_slot: false,
-                },
-                frame: ProtoFrameInfo { max_stack_size },
-                instructions,
-                constants: const_pool,
-                upvalues: RawUpvalueInfo {
-                    common: RawUpvalueInfoCommon {
-                        count: upvalue_count,
-                        descriptors,
+        let depth = max_child_depth + 1;
+        check_proto_depth(depth)?;
+        Ok(ParsedProto {
+            proto: RawProto {
+                common: RawProtoCommon {
+                    source: chunk_name.cloned(),
+                    line_range: ProtoLineRange {
+                        defined_start,
+                        defined_end,
                     },
-                    extra: DialectUpvalueExtra::LuaJit(LuaJitUpvalueExtra { immutable }),
+                    signature: ProtoSignature {
+                        num_params,
+                        is_vararg: (flags & PROTO_VARARG) != 0,
+                        has_vararg_param_reg: false,
+                        named_vararg_table: false,
+                        legacy_arg_slot: false,
+                    },
+                    frame: ProtoFrameInfo { max_stack_size },
+                    instructions,
+                    constants: const_pool,
+                    upvalues: RawUpvalueInfo {
+                        common: RawUpvalueInfoCommon {
+                            count: upvalue_count,
+                            descriptors,
+                        },
+                        extra: DialectUpvalueExtra::LuaJit(LuaJitUpvalueExtra { immutable }),
+                    },
+                    debug_info,
+                    children,
                 },
-                debug_info,
-                children,
-            },
-            extra: DialectProtoExtra::LuaJit(LuaJitProtoExtra {
-                flags,
-                first_line,
-                line_count,
-                debug_size,
-            }),
-            origin: Origin {
-                span: Span {
-                    offset: base_offset,
-                    size: bytes.len(),
+                extra: DialectProtoExtra::LuaJit(LuaJitProtoExtra {
+                    flags,
+                    first_line,
+                    line_count,
+                    debug_size,
+                }),
+                origin: Origin {
+                    span: Span {
+                        offset: base_offset,
+                        size: bytes.len(),
+                    },
+                    raw_word: None,
                 },
-                raw_word: None,
             },
+            depth,
         })
     }
 
@@ -346,7 +354,8 @@ impl LuaJitParser {
         instruction_count: usize,
         big_endian: bool,
     ) -> Result<Vec<RawInstr>, ParseError> {
-        let mut instructions = Vec::with_capacity(instruction_count);
+        let capacity = reader.checked_count_capacity(instruction_count, 4)?;
+        let mut instructions = Vec::with_capacity(capacity);
 
         for pc in 0..instruction_count {
             let offset = reader.offset();
@@ -386,8 +395,9 @@ impl LuaJitParser {
         upvalue_count: u8,
         big_endian: bool,
     ) -> Result<(Vec<RawUpvalueDescriptor>, Vec<bool>), ParseError> {
-        let mut descriptors = Vec::with_capacity(upvalue_count as usize);
-        let mut immutable = Vec::with_capacity(upvalue_count as usize);
+        let capacity = reader.checked_count_capacity(upvalue_count as usize, 2)?;
+        let mut descriptors = Vec::with_capacity(capacity);
+        let mut immutable = Vec::with_capacity(capacity);
 
         for _ in 0..upvalue_count {
             let bytes = reader.read_array::<2>()?;
@@ -417,18 +427,20 @@ impl LuaJitParser {
         base_offset: usize,
         kgc_count: usize,
         knum_count: usize,
-        proto_stack: &mut Vec<RawProto>,
+        proto_stack: &mut Vec<ParsedProto>,
     ) -> Result<ParsedConstPool, ParseError> {
         let mut literals = Vec::new();
-        let mut kgc_entries = Vec::with_capacity(kgc_count);
+        let capacity = reader.checked_count_capacity(kgc_count, 1)?;
+        let mut kgc_entries = Vec::with_capacity(capacity);
         let mut children = Vec::new();
+        let mut max_child_depth = 0;
 
         for _ in 0..kgc_count {
             let tag = reader.read_uleb128_u32("luajit kgc tag")?;
             if tag >= BCDUMP_KGC_STR {
                 let string_len = (tag - BCDUMP_KGC_STR) as usize;
                 let start = reader.offset();
-                let bytes = reader.read_exact(string_len)?.to_vec();
+                let bytes = reader.read_exact(string_len)?;
                 let raw = self.decode_raw_string(start + base_offset, string_len, bytes)?;
                 let literal_index = literals.len();
                 let value = RawLiteralConst::String(raw.clone());
@@ -446,8 +458,9 @@ impl LuaJitParser {
                         field: "luajit child proto stack",
                         value: 0,
                     })?;
+                    max_child_depth = max_child_depth.max(child.depth);
                     let child_proto_index = children.len();
-                    children.push(child);
+                    children.push(child.proto);
                     kgc_entries.push(LuaJitKgcEntry::Child { child_proto_index });
                 }
                 BCDUMP_KGC_TAB => {
@@ -494,7 +507,8 @@ impl LuaJitParser {
             }
         }
 
-        let mut knum_entries = Vec::with_capacity(knum_count);
+        let capacity = reader.checked_count_capacity(knum_count, 1)?;
+        let mut knum_entries = Vec::with_capacity(capacity);
         for _ in 0..knum_count {
             let (lo, is_number) = reader.read_uleb128_33("luajit knum lo")?;
             if is_number {
@@ -532,6 +546,7 @@ impl LuaJitParser {
                 }),
             },
             children,
+            max_child_depth,
         })
     }
 
@@ -543,8 +558,10 @@ impl LuaJitParser {
     ) -> Result<LuaJitTableConst, ParseError> {
         let array_len = reader.read_uleb128_u32("luajit table array length")? as usize;
         let hash_len = reader.read_uleb128_u32("luajit table hash length")? as usize;
-        let mut array = Vec::with_capacity(array_len);
-        let mut hash = Vec::with_capacity(hash_len);
+        let array_capacity = reader.checked_count_capacity(array_len, 1)?;
+        let hash_capacity = reader.checked_count_capacity(hash_len, 2)?;
+        let mut array = Vec::with_capacity(array_capacity);
+        let mut hash = Vec::with_capacity(hash_capacity);
 
         for _ in 0..array_len {
             array.push(self.parse_table_literal(reader, base_offset, literals)?);
@@ -575,7 +592,7 @@ impl LuaJitParser {
         let value = if tag >= BCDUMP_KTAB_STR {
             let string_len = (tag - BCDUMP_KTAB_STR) as usize;
             let start = reader.offset();
-            let bytes = reader.read_exact(string_len)?.to_vec();
+            let bytes = reader.read_exact(string_len)?;
             let raw = self.decode_raw_string(start + base_offset, string_len, bytes)?;
             RawLiteralConst::String(raw)
         } else {
@@ -629,7 +646,8 @@ impl LuaJitParser {
         } else {
             4
         };
-        let mut line_info = Vec::with_capacity(instruction_count);
+        let capacity = reader.checked_count_capacity(instruction_count, line_width)?;
+        let mut line_info = Vec::with_capacity(capacity);
         for _ in 0..instruction_count {
             let offset = match line_width {
                 1 => u32::from(reader.read_u8()?),
@@ -654,7 +672,8 @@ impl LuaJitParser {
             line_info.push(first_line.saturating_add(offset));
         }
 
-        let mut upvalue_names = Vec::with_capacity(upvalue_count as usize);
+        let capacity = reader.checked_count_capacity(upvalue_count as usize, 1)?;
+        let mut upvalue_names = Vec::with_capacity(capacity);
         for _ in 0..upvalue_count {
             let start = reader.offset();
             let mut bytes = Vec::new();
@@ -668,7 +687,7 @@ impl LuaJitParser {
             upvalue_names.push(Some(self.decode_raw_string(
                 base_offset + start,
                 reader.offset() - start,
-                bytes,
+                &bytes,
             )?));
         }
 
@@ -691,7 +710,7 @@ impl LuaJitParser {
         &self,
         offset: usize,
         size: usize,
-        bytes: Vec<u8>,
+        bytes: &[u8],
     ) -> Result<RawString, ParseError> {
         build_raw_string(self.options, offset, bytes, size)
     }
@@ -718,7 +737,7 @@ impl LuaJitParser {
             }
 
             let name = if let Some(bytes) = luajit_fixed_var_name(first) {
-                self.decode_raw_string(base_offset + name_start, 1, bytes.to_vec())?
+                self.decode_raw_string(base_offset + name_start, 1, bytes)?
             } else {
                 let mut bytes = vec![first];
                 loop {
@@ -731,7 +750,7 @@ impl LuaJitParser {
                 self.decode_raw_string(
                     base_offset + name_start,
                     reader.offset() - name_start,
-                    bytes,
+                    &bytes,
                 )?
             };
 
@@ -792,6 +811,12 @@ fn luajit_fixed_var_name(tag: u8) -> Option<&'static [u8]> {
 struct ParsedConstPool {
     const_pool: RawConstPool,
     children: Vec<RawProto>,
+    max_child_depth: usize,
+}
+
+struct ParsedProto {
+    proto: RawProto,
+    depth: usize,
 }
 
 #[cfg(test)]

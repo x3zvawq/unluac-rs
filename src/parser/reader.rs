@@ -24,6 +24,23 @@ impl<'a> BinaryReader<'a> {
         self.bytes.len().saturating_sub(self.offset)
     }
 
+    /// 校验输入声明的元素数量至少能由剩余字节承载，再允许调用方预分配。
+    pub(crate) fn checked_count_capacity(
+        &self,
+        count: usize,
+        min_item_size: usize,
+    ) -> Result<usize, ParseError> {
+        let requested = count.saturating_mul(min_item_size.max(1));
+        if requested > self.remaining() {
+            return Err(ParseError::UnexpectedEof {
+                offset: self.offset,
+                requested,
+                remaining: self.remaining(),
+            });
+        }
+        Ok(count)
+    }
+
     pub(crate) fn read_exact(&mut self, size: usize) -> Result<&'a [u8], ParseError> {
         if self.remaining() < size {
             return Err(ParseError::UnexpectedEof {

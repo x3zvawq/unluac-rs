@@ -5,13 +5,16 @@ use crate::parser::raw::{
 use crate::parser::reader::BinaryReader;
 
 /// 读取一个带显式计数前缀的序列。
-pub(crate) fn collect_counted<T>(
+pub(crate) fn collect_counted<'a, T>(
+    reader: &mut BinaryReader<'a>,
     count: u32,
-    mut parse_item: impl FnMut() -> Result<T, ParseError>,
+    min_item_size: usize,
+    mut parse_item: impl FnMut(&mut BinaryReader<'a>) -> Result<T, ParseError>,
 ) -> Result<Vec<T>, ParseError> {
-    let mut items = Vec::with_capacity(count as usize);
+    let capacity = reader.checked_count_capacity(count as usize, min_item_size)?;
+    let mut items = Vec::with_capacity(capacity);
     for _ in 0..count {
-        items.push(parse_item()?);
+        items.push(parse_item(reader)?);
     }
     Ok(items)
 }
@@ -65,7 +68,7 @@ pub(crate) fn parse_upvalue_descriptors(
     reader: &mut BinaryReader<'_>,
     count: u32,
 ) -> Result<Vec<RawUpvalueDescriptor>, ParseError> {
-    collect_counted(count, || {
+    collect_counted(reader, count, 2, |reader| {
         Ok(RawUpvalueDescriptor {
             in_stack: reader.read_u8()? != 0,
             index: reader.read_u8()?,
@@ -78,7 +81,7 @@ pub(crate) fn parse_upvalues_with_kinds(
     reader: &mut BinaryReader<'_>,
     count: u32,
 ) -> Result<(Vec<RawUpvalueDescriptor>, Vec<u8>), ParseError> {
-    let pairs = collect_counted(count, || {
+    let pairs = collect_counted(reader, count, 3, |reader| {
         Ok((
             RawUpvalueDescriptor {
                 in_stack: reader.read_u8()? != 0,
@@ -91,15 +94,12 @@ pub(crate) fn parse_upvalues_with_kinds(
 }
 
 /// 统一读取可选的 upvalue 名字，并保留空槽与 upvalue slot 对齐。
-pub(crate) fn parse_upvalue_names(
+pub(crate) fn parse_upvalue_names<'a>(
+    reader: &mut BinaryReader<'a>,
     count: u32,
-    mut parse_name: impl FnMut() -> Result<Option<RawString>, ParseError>,
+    parse_name: impl FnMut(&mut BinaryReader<'a>) -> Result<Option<RawString>, ParseError>,
 ) -> Result<Vec<Option<RawString>>, ParseError> {
-    let mut names = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        names.push(parse_name()?);
-    }
-    Ok(names)
+    collect_counted(reader, count, 1, parse_name)
 }
 
 pub(crate) struct ClassicDebugSections {
@@ -137,16 +137,19 @@ pub(crate) fn parse_classic_debug_sections<'a>(
     let source = driver.read_source(reader)?;
 
     let line_count = driver.read_count(reader, "line info count")?;
-    let line_info = collect_counted(line_count, || driver.read_line(reader))?;
+    let line_info = collect_counted(reader, line_count, 1, |reader| driver.read_line(reader))?;
     validate_line_info_length(permissive, line_info.len(), raw_instruction_words)?;
 
     let local_count = driver.read_count(reader, "local var count")?;
-    let local_vars = collect_counted(local_count, || driver.parse_local_var(reader))?;
+    let local_vars = collect_counted(reader, local_count, 1, |reader| {
+        driver.parse_local_var(reader)
+    })?;
 
     let upvalue_name_count = driver.read_count(reader, "upvalue name count")?;
     driver.validate_upvalue_count(upvalue_name_count)?;
-    let upvalue_names =
-        parse_upvalue_names(upvalue_name_count, || driver.parse_upvalue_name(reader))?;
+    let upvalue_names = parse_upvalue_names(reader, upvalue_name_count, |reader| {
+        driver.parse_upvalue_name(reader)
+    })?;
 
     Ok(ClassicDebugSections {
         source,
@@ -170,7 +173,7 @@ where
         for<'b> FnMut(u8, usize, &'b mut BinaryReader<'a>) -> Result<RawLiteralConst, ParseError>,
 {
     let count = read_count(reader, "constant count")?;
-    collect_counted(count, || {
+    collect_counted(reader, count, 1, |reader| {
         let offset = reader.offset();
         let tag = reader.read_u8()?;
         parse_literal(tag, offset, reader)
@@ -222,11 +225,15 @@ pub(crate) fn parse_abs_debug_sections<'a>(
     driver: &mut impl AbsDebugDriver<'a>,
 ) -> Result<AbsDebugSections, ParseError> {
     let line_count = driver.read_count(reader, "line info count")?;
-    let line_deltas = collect_counted(line_count, || driver.read_line_delta(reader))?;
+    let line_deltas = collect_counted(reader, line_count, 1, |reader| {
+        driver.read_line_delta(reader)
+    })?;
 
     let abs_line_count = driver.read_count(reader, "abs line info count")?;
     driver.prepare_abs_line_info(reader, abs_line_count)?;
-    let abs_line_pairs = collect_counted(abs_line_count, || driver.read_abs_line_pair(reader))?;
+    let abs_line_pairs = collect_counted(reader, abs_line_count, 1, |reader| {
+        driver.read_abs_line_pair(reader)
+    })?;
 
     validate_line_info_length(
         abs_line_info.permissive,
@@ -244,12 +251,15 @@ pub(crate) fn parse_abs_debug_sections<'a>(
     )?;
 
     let local_count = driver.read_count(reader, "local var count")?;
-    let local_vars = collect_counted(local_count, || driver.parse_local_var(reader))?;
+    let local_vars = collect_counted(reader, local_count, 1, |reader| {
+        driver.parse_local_var(reader)
+    })?;
 
     let upvalue_name_count = driver.read_count(reader, "upvalue name count")?;
     driver.validate_upvalue_count(upvalue_name_count)?;
-    let upvalue_names =
-        parse_upvalue_names(upvalue_name_count, || driver.parse_upvalue_name(reader))?;
+    let upvalue_names = parse_upvalue_names(reader, upvalue_name_count, |reader| {
+        driver.parse_upvalue_name(reader)
+    })?;
 
     Ok(AbsDebugSections {
         common: RawDebugInfoCommon {

@@ -101,6 +101,8 @@ struct GraphAnalysis {
     dominator_tree: DominatorTree,
     post_dominator_tree: PostDominatorTree,
     dominance_frontier: Vec<BTreeSet<BlockRef>>,
+    strongly_connected_components: Vec<Vec<BlockRef>>,
+    cyclic_blocks: Vec<bool>,
     backedges: Vec<EdgeRef>,
     loop_headers: BTreeSet<BlockRef>,
     natural_loops: Vec<NaturalLoop>,
@@ -114,6 +116,9 @@ impl GraphAnalysis {
         let forward =
             compute_dfs_traversal(cfg, cfg.entry_block, &reachable, FlowDirection::Forward);
         let dominator_tree = compute_dominator_tree(cfg, &forward)?;
+        let strongly_connected_components =
+            compute_strongly_connected_components(cfg, &forward.postorder, &reachable);
+        let cyclic_blocks = compute_cyclic_blocks(cfg, &strongly_connected_components);
         let mut rpo = forward.postorder;
         rpo.reverse();
         let reverse_reachable = compute_reverse_reachable(cfg, &reachable);
@@ -134,6 +139,8 @@ impl GraphAnalysis {
             dominator_tree,
             post_dominator_tree,
             dominance_frontier,
+            strongly_connected_components,
+            cyclic_blocks,
             backedges,
             loop_headers,
             natural_loops,
@@ -146,12 +153,63 @@ impl GraphAnalysis {
             dominator_tree: self.dominator_tree,
             post_dominator_tree: self.post_dominator_tree,
             dominance_frontier: self.dominance_frontier,
+            strongly_connected_components: self.strongly_connected_components,
+            cyclic_blocks: self.cyclic_blocks,
             backedges: self.backedges,
             loop_headers: self.loop_headers,
             natural_loops: self.natural_loops,
             children,
         }
     }
+}
+
+fn compute_strongly_connected_components(
+    cfg: &Cfg,
+    postorder: &[BlockRef],
+    reachable: &DenseBlockSet,
+) -> Vec<Vec<BlockRef>> {
+    let mut visited = DenseBlockSet::new(cfg.blocks.len());
+    let mut components = Vec::new();
+    let mut pending = Vec::new();
+
+    for root in postorder.iter().rev().copied() {
+        if !visited.insert(root) {
+            continue;
+        }
+        let mut component = Vec::new();
+        pending.push(root);
+        while let Some(block) = pending.pop() {
+            component.push(block);
+            for edge_ref in &cfg.preds[block.index()] {
+                let pred = cfg.edges[edge_ref.index()].from;
+                if reachable.contains(pred) && visited.insert(pred) {
+                    pending.push(pred);
+                }
+            }
+        }
+        component.sort_unstable();
+        components.push(component);
+    }
+
+    components
+}
+
+fn compute_cyclic_blocks(cfg: &Cfg, components: &[Vec<BlockRef>]) -> Vec<bool> {
+    let mut cyclic_blocks = vec![false; cfg.blocks.len()];
+    for component in components {
+        let cyclic = component.len() > 1
+            || component.first().is_some_and(|block| {
+                cfg.succs[block.index()]
+                    .iter()
+                    .any(|edge_ref| cfg.edges[edge_ref.index()].to == *block)
+            });
+        if cyclic {
+            for block in component {
+                cyclic_blocks[block.index()] = true;
+            }
+        }
+    }
+    cyclic_blocks
 }
 
 use crate::decompile::{DecompileContext, DecompileError, DecompileState};

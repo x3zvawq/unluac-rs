@@ -260,48 +260,19 @@ pub(super) fn is_reducible_region(
     })
 }
 
-pub(super) fn compute_irreducible_regions(cfg: &Cfg) -> Vec<IrreducibleRegion> {
-    let real_blocks = cfg
-        .block_order
-        .iter()
-        .copied()
-        .filter(|block| cfg.reachable_blocks.contains(block))
-        .collect::<Vec<_>>();
-
-    let order = kosaraju_postorder(cfg, &real_blocks);
-    let mut visited = BTreeSet::new();
-    let mut components = Vec::new();
-
-    for block in order.into_iter().rev() {
-        if visited.contains(&block) {
-            continue;
-        }
-
-        let mut component = BTreeSet::new();
-        let mut worklist = VecDeque::from([block]);
-        while let Some(cursor) = worklist.pop_front() {
-            if !visited.insert(cursor) {
-                continue;
-            }
-            component.insert(cursor);
-
-            for pred in cfg.reachable_predecessors(cursor) {
-                if pred != cfg.exit_block {
-                    worklist.push_back(pred);
-                }
-            }
-        }
-
-        components.push(component);
-    }
-
+pub(super) fn compute_irreducible_regions(
+    cfg: &Cfg,
+    graph_facts: &crate::structure::GraphFacts,
+) -> Vec<IrreducibleRegion> {
     let mut irreducible_regions = Vec::new();
-    for component in components {
-        if component.len() == 1
-            && !has_self_loop(cfg, *component.iter().next().unwrap_or(&cfg.entry_block))
-        {
+    for blocks in graph_facts.strongly_connected_components() {
+        let Some(first) = blocks.first().copied() else {
+            continue;
+        };
+        if !graph_facts.block_is_cyclic(first) {
             continue;
         }
+        let component = blocks.iter().copied().collect::<BTreeSet<_>>();
 
         let entry_edges = collect_region_entry_edges(cfg, &component);
         let entry_targets = entry_edges
@@ -324,46 +295,4 @@ pub(super) fn compute_irreducible_regions(cfg: &Cfg) -> Vec<IrreducibleRegion> {
 
     irreducible_regions.sort_by_key(|region| region.entry);
     irreducible_regions
-}
-
-fn kosaraju_postorder(cfg: &Cfg, blocks: &[BlockRef]) -> Vec<BlockRef> {
-    let mut visited = BTreeSet::new();
-    let mut order = Vec::new();
-    let mut stack = Vec::with_capacity(blocks.len());
-
-    for root in blocks.iter().copied() {
-        if !cfg.reachable_blocks.contains(&root) || !visited.insert(root) {
-            continue;
-        }
-
-        stack.clear();
-        stack.push((root, 0));
-        while !stack.is_empty() {
-            let top = stack.len() - 1;
-            let (block, edge_index) = stack[top];
-            let successors = &cfg.succs[block.index()];
-            if edge_index == successors.len() {
-                order.push(block);
-                stack.pop();
-                continue;
-            }
-
-            stack[top].1 += 1;
-            let successor = cfg.edges[successors[edge_index].index()].to;
-            if successor != cfg.exit_block
-                && cfg.reachable_blocks.contains(&successor)
-                && visited.insert(successor)
-            {
-                stack.push((successor, 0));
-            }
-        }
-    }
-
-    order
-}
-
-fn has_self_loop(cfg: &Cfg, block: BlockRef) -> bool {
-    cfg.succs[block.index()]
-        .iter()
-        .any(|edge_ref| cfg.edges[edge_ref.index()].to == block)
 }

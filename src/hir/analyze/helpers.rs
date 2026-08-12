@@ -72,7 +72,7 @@ pub(super) fn binary_expr(op: HirBinaryOpKind, lhs: HirExpr, rhs: HirExpr) -> Hi
 pub(super) fn decode_raw_string(raw: &crate::parser::RawString) -> String {
     raw.text
         .as_ref()
-        .map(|text| text.value.clone())
+        .map(|text| text.value.to_string())
         .unwrap_or_else(|| String::from_utf8_lossy(&raw.bytes).into_owned())
 }
 

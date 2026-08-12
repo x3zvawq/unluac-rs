@@ -14,6 +14,7 @@ use crate::parser::family::puc_lua::{
     read_proto_prelude, read_sized_i64, read_sized_u32, require_present,
     validate_instruction_word_size,
 };
+use crate::parser::limits::check_proto_depth;
 use crate::parser::options::ParseOptions;
 use crate::parser::raw::{
     ChunkHeader, ChunkLayout, Dialect, DialectConstPoolExtra, DialectDebugExtra,
@@ -100,7 +101,7 @@ impl Lua52Parser {
         let layout = header
             .puc_lua_layout()
             .expect("lua52 parser must produce a PUC-Lua header layout");
-        let main = self.parse_proto(&mut reader, layout)?;
+        let main = self.parse_proto(&mut reader, layout, 1)?;
 
         Ok(RawChunk {
             header,
@@ -188,7 +189,9 @@ impl Lua52Parser {
         &self,
         reader: &mut BinaryReader<'_>,
         layout: &PucLuaChunkLayout,
+        depth: usize,
     ) -> Result<RawProto, ParseError> {
+        check_proto_depth(depth)?;
         let (prelude, header_source) = read_proto_prelude(
             reader,
             |_| Ok(None),
@@ -204,7 +207,7 @@ impl Lua52Parser {
                 |_, _| Ok(()),
                 "instruction_size",
             )?;
-        let (constants, children) = self.parse_constants(reader, layout)?;
+        let (constants, children) = self.parse_constants(reader, layout, depth)?;
         let upvalues = self.parse_upvalues(reader, layout)?;
         let (source, debug_info) = self.parse_debug_info(reader, layout, raw_instruction_words)?;
         let source = inherit_source(source.or(header_source), None);
@@ -235,6 +238,7 @@ impl Lua52Parser {
         &self,
         reader: &mut BinaryReader<'_>,
         layout: &PucLuaChunkLayout,
+        depth: usize,
     ) -> Result<(RawConstPool, Vec<RawProto>), ParseError> {
         let literals = parse_tagged_literal_pool(
             reader,
@@ -265,7 +269,9 @@ impl Lua52Parser {
         )?;
 
         let child_count = read_sized_u32(reader, layout, "child proto count")?;
-        let children = collect_counted(child_count, || self.parse_proto(reader, layout))?;
+        let children = collect_counted(reader, child_count, 1, |reader| {
+            self.parse_proto(reader, layout, depth + 1)
+        })?;
 
         Ok((
             RawConstPool {
@@ -335,9 +341,9 @@ impl Lua52Parser {
             value: size,
         })?;
         let offset = reader.offset();
-        let payload = reader.read_exact(byte_count)?.to_vec();
+        let payload = reader.read_exact(byte_count)?;
         let bytes = match payload.split_last() {
-            Some((&0, bytes_without_nul)) => bytes_without_nul.to_vec(),
+            Some((&0, bytes_without_nul)) => bytes_without_nul,
             _ if self.options.mode.is_permissive() => payload,
             _ => return Err(ParseError::UnterminatedString { offset }),
         };

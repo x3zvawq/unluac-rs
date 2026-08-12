@@ -17,6 +17,7 @@ use crate::parser::family::puc_lua::{
     read_sized_u32, require_present, validate_instruction_word_size,
     validate_main_proto_upvalue_count, validate_optional_count_match,
 };
+use crate::parser::limits::check_proto_depth;
 use crate::parser::options::ParseOptions;
 use crate::parser::raw::{
     ChunkHeader, ChunkLayout, Dialect, DialectConstPoolExtra, DialectDebugExtra,
@@ -147,7 +148,7 @@ impl Lua55ParserState {
             .puc_lua_layout()
             .expect("lua55 parser must produce a PUC-Lua header layout");
         let main_upvalue_count = reader.read_u8()?;
-        let main = self.parse_proto(&mut reader, layout, None)?;
+        let main = self.parse_proto(&mut reader, layout, None, 1)?;
 
         validate_main_proto_upvalue_count(
             self.options.mode.is_permissive(),
@@ -250,7 +251,9 @@ impl Lua55ParserState {
         reader: &mut BinaryReader<'_>,
         layout: &PucLuaChunkLayout,
         parent_source: Option<&RawString>,
+        depth: usize,
     ) -> Result<RawProto, ParseError> {
+        check_proto_depth(depth)?;
         let (prelude, header_source) = read_proto_prelude(
             reader,
             |_| Ok(None),
@@ -270,8 +273,8 @@ impl Lua55ParserState {
         let constants = self.parse_constants(reader, layout)?;
         let upvalues = self.parse_upvalues(reader)?;
         let child_count = reader.read_varint_u32_lua55("child proto count")?;
-        let children = collect_counted(child_count, || {
-            self.parse_proto(reader, layout, parent_source)
+        let children = collect_counted(reader, child_count, 1, |reader| {
+            self.parse_proto(reader, layout, parent_source, depth + 1)
         })?;
         let source = inherit_source(self.parse_string(reader)?.or(header_source), parent_source);
         let debug_info = self.parse_debug_info(
@@ -442,7 +445,7 @@ impl Lua55ParserState {
             });
         }
         let payload = &bytes[..payload_len];
-        let raw = build_raw_string(self.options, offset, payload.to_vec(), byte_count)?;
+        let raw = build_raw_string(self.options, offset, payload, byte_count)?;
         self.saved_strings.push(raw.clone());
         Ok(Some(raw))
     }

@@ -8,13 +8,16 @@
 //!   会直接产出一个 `LocalId` 绑定到该 loop header
 //! - `for k, v in iter() do ... end` 对应的 `LoopSourceBindings::Generic(rA..)` 会直接产出
 //!   一组 header locals，而不是再从 `GenericForLoop` terminator 回扫一次
+//! - 同一 `(slot, close epoch)` 的引用捕获会共用一次反向写后分析，不会按
+//!   `closure 数 × def 数` 重复扫描；这里只决定绑定身份，不改写 closure 语义
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::hir::common::{LocalId, ParamId, TempId, UpvalueId};
 use crate::parser::RawLocalVar;
 use crate::structure::{
-    BlockRef, Cfg, DataflowFacts, DefId, PhiId, PhiIncomingDisposition, PhiPlan, SsaValue,
+    BlockRef, Cfg, DataflowFacts, DefId, GraphFacts, PhiId, PhiIncomingDisposition, PhiPlan,
+    SsaValue,
 };
 use crate::structure::{
     LoopPlanId, LoopSourceBindings, RegionId, RegionPlan, StructureFacts, StructurePlan,
@@ -43,6 +46,7 @@ impl CapturedSlotKey {
 pub(super) fn build_bindings(
     proto: &LoweredProto,
     cfg: &Cfg,
+    graph: &GraphFacts,
     dataflow: &DataflowFacts,
     structure: &StructureFacts,
     captured_slot_epochs: &SlotEpochFacts,
@@ -92,6 +96,7 @@ pub(super) fn build_bindings(
         CapturedSlotInputs {
             proto,
             cfg,
+            graph,
             dataflow,
             structure,
             epochs: captured_slot_epochs,
@@ -760,9 +765,136 @@ struct CapturedSlotUse {
     entry_local_safe: bool,
 }
 
+#[derive(Default)]
+struct CapturedSlotWriteQueries {
+    uses: Vec<usize>,
+    defs: Vec<(usize, BlockRef)>,
+}
+
+struct CapturedSlotWriteWorkspace {
+    epoch: usize,
+    def_epoch: Vec<usize>,
+    last_def_instr: Vec<usize>,
+    def_blocks: Vec<BlockRef>,
+    reach_epoch: Vec<usize>,
+    pending: VecDeque<BlockRef>,
+}
+
+impl CapturedSlotWriteWorkspace {
+    fn new(block_count: usize) -> Self {
+        Self {
+            epoch: 0,
+            def_epoch: vec![0; block_count],
+            last_def_instr: vec![0; block_count],
+            def_blocks: Vec::new(),
+            reach_epoch: vec![0; block_count],
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn analyze(&mut self, cfg: &Cfg, defs: &[(usize, BlockRef)]) {
+        self.begin();
+        for &(instr_index, block) in defs {
+            if !cfg.reachable_blocks.contains(&block) {
+                continue;
+            }
+            if self.def_epoch[block.index()] != self.epoch {
+                self.def_epoch[block.index()] = self.epoch;
+                self.last_def_instr[block.index()] = instr_index;
+                self.def_blocks.push(block);
+            } else {
+                self.last_def_instr[block.index()] =
+                    self.last_def_instr[block.index()].max(instr_index);
+            }
+        }
+
+        // Def block 本身不是 seed：从 predecessor 开始才表示“至少经过一条边”。
+        // 这使同块且位于 capture 之前的 def 只有在真实回路中才会命中。
+        for index in 0..self.def_blocks.len() {
+            let def_block = self.def_blocks[index];
+            for edge_ref in &cfg.preds[def_block.index()] {
+                self.enqueue(cfg, cfg.edges[edge_ref.index()].from);
+            }
+        }
+        while let Some(block) = self.pending.pop_front() {
+            for edge_ref in &cfg.preds[block.index()] {
+                self.enqueue(cfg, cfg.edges[edge_ref.index()].from);
+            }
+        }
+    }
+
+    fn has_write_after(&self, cfg: &Cfg, capture_instr: usize) -> bool {
+        let block = cfg.instr_to_block[capture_instr];
+        // Closure 只定义 dst，且收集阶段已排除 dst 自捕获，所以不存在同指令
+        // 定义 capture reg 的 equality 形状；若 Closure effect 改为多定义，必须重审此谓词。
+        cfg.reachable_blocks.contains(&block)
+            && ((self.def_epoch[block.index()] == self.epoch
+                && self.last_def_instr[block.index()] > capture_instr)
+                || self.reach_epoch[block.index()] == self.epoch)
+    }
+
+    fn begin(&mut self) {
+        if self.epoch == usize::MAX {
+            self.def_epoch.fill(0);
+            self.reach_epoch.fill(0);
+            self.epoch = 1;
+        } else {
+            self.epoch += 1;
+        }
+        self.def_blocks.clear();
+        self.pending.clear();
+    }
+
+    fn enqueue(&mut self, cfg: &Cfg, block: BlockRef) {
+        if cfg.reachable_blocks.contains(&block) && self.reach_epoch[block.index()] != self.epoch {
+            self.reach_epoch[block.index()] = self.epoch;
+            self.pending.push_back(block);
+        }
+    }
+}
+
+struct CapturedSlotStartWorkspace {
+    epoch: usize,
+    seen_phi_epoch: Vec<usize>,
+    pending: Vec<SsaValue>,
+}
+
+impl CapturedSlotStartWorkspace {
+    fn new(phi_count: usize) -> Self {
+        Self {
+            epoch: 0,
+            seen_phi_epoch: vec![0; phi_count],
+            pending: Vec::new(),
+        }
+    }
+
+    fn begin(&mut self, root: SsaValue) {
+        if self.epoch == usize::MAX {
+            self.seen_phi_epoch.fill(0);
+            self.epoch = 1;
+        } else {
+            self.epoch += 1;
+        }
+        self.pending.clear();
+        self.pending.push(root);
+    }
+
+    fn visit(&mut self, phi: PhiId) -> bool {
+        let Some(seen_epoch) = self.seen_phi_epoch.get_mut(phi.index()) else {
+            return false;
+        };
+        if *seen_epoch == self.epoch {
+            return false;
+        }
+        *seen_epoch = self.epoch;
+        true
+    }
+}
+
 struct CapturedSlotInputs<'a> {
     proto: &'a LoweredProto,
     cfg: &'a Cfg,
+    graph: &'a GraphFacts,
     dataflow: &'a DataflowFacts,
     structure: &'a StructureFacts,
     epochs: &'a SlotEpochFacts,
@@ -778,6 +910,7 @@ fn collect_captured_slot_targets(
     let CapturedSlotInputs {
         proto,
         cfg,
+        graph,
         dataflow,
         structure,
         epochs,
@@ -808,19 +941,8 @@ fn collect_captured_slot_targets(
             }
         }
     }
-    let mut defs_by_slot = BTreeMap::<CapturedSlotKey, Vec<(usize, BlockRef)>>::new();
-    for def in &dataflow.defs {
-        let instr_index = def.instr.index();
-        defs_by_slot
-            .entry(CapturedSlotKey::new(
-                def.reg.index(),
-                epochs.epoch_at(def.reg, def.instr),
-            ))
-            .or_default()
-            .push((instr_index, cfg.instr_to_block[instr_index]));
-    }
-    let mut reachability = BTreeMap::new();
-    let mut cyclic_blocks = BTreeMap::new();
+    let mut write_queries = BTreeMap::<CapturedSlotKey, CapturedSlotWriteQueries>::new();
+    let mut start_workspace = CapturedSlotStartWorkspace::new(structure.plan().phis().len());
     let mut entry_decl_keys = BTreeSet::new();
     let mut region_decl_keys = BTreeMap::new();
     let mut conflicting_region_decl_keys = BTreeSet::new();
@@ -849,6 +971,7 @@ fn collect_captured_slot_targets(
                 InstrRef(instr_index),
                 reg,
                 has_no_reaching_value,
+                &mut start_workspace,
             );
             let entry_local_safe = epochs.spans_entry(reg);
             let key =
@@ -858,51 +981,8 @@ fn collect_captured_slot_targets(
                 .and_then(|mutable| mutable.get(capture_index))
                 .copied()
                 .unwrap_or(false);
-            let parent_writes_after_capture = parent_writes_after_capture_same_epoch(
-                cfg,
-                instr_index,
-                key,
-                &defs_by_slot,
-                &mut reachability,
-                &mut cyclic_blocks,
-            );
-            let requires_local =
-                child_writes || has_no_reaching_value || parent_writes_after_capture;
-            entry_safe_by_key
-                .entry(key)
-                .and_modify(|safe| *safe &= entry_local_safe)
-                .or_insert(entry_local_safe);
-            if requires_local
-                && entry_local_safe
-                && block_has_real_cycle(
-                    cfg,
-                    cfg.instr_to_block[instr_index],
-                    &mut reachability,
-                    &mut cyclic_blocks,
-                )
-            {
-                entry_decl_keys.insert(key);
-            }
-            if requires_local
-                && let Some(region) = captured_slot_declaration_region(
-                    dataflow,
-                    structure.plan(),
-                    InstrRef(instr_index),
-                    reg,
-                )
-                && !conflicting_region_decl_keys.contains(&key)
-            {
-                match region_decl_keys.get(&key).copied() {
-                    None => {
-                        region_decl_keys.insert(key, region);
-                    }
-                    Some(existing) if existing == region => {}
-                    Some(_) => {
-                        region_decl_keys.remove(&key);
-                        conflicting_region_decl_keys.insert(key);
-                    }
-                }
-            }
+            let requires_local = child_writes || has_no_reaching_value;
+            let use_index = captured_uses.len();
             captured_uses.push(CapturedSlotUse {
                 instr_index,
                 reg,
@@ -911,6 +991,49 @@ fn collect_captured_slot_targets(
                 requires_local,
                 entry_local_safe,
             });
+            if !requires_local {
+                write_queries.entry(key).or_default().uses.push(use_index);
+            }
+        }
+    }
+
+    resolve_parent_writes_after_capture(
+        cfg,
+        dataflow,
+        epochs,
+        &mut write_queries,
+        &mut captured_uses,
+    );
+    for captured in &captured_uses {
+        entry_safe_by_key
+            .entry(captured.key)
+            .and_modify(|safe| *safe &= captured.entry_local_safe)
+            .or_insert(captured.entry_local_safe);
+        if captured.requires_local
+            && captured.entry_local_safe
+            && graph.block_is_cyclic(cfg.instr_to_block[captured.instr_index])
+        {
+            entry_decl_keys.insert(captured.key);
+        }
+        if captured.requires_local
+            && let Some(region) = captured_slot_declaration_region(
+                dataflow,
+                structure.plan(),
+                InstrRef(captured.instr_index),
+                captured.reg,
+            )
+            && !conflicting_region_decl_keys.contains(&captured.key)
+        {
+            match region_decl_keys.get(&captured.key).copied() {
+                None => {
+                    region_decl_keys.insert(captured.key, region);
+                }
+                Some(existing) if existing == region => {}
+                Some(_) => {
+                    region_decl_keys.remove(&captured.key);
+                    conflicting_region_decl_keys.insert(captured.key);
+                }
+            }
         }
     }
 
@@ -1052,60 +1175,32 @@ fn captured_slot_lexical_owner(plan: &StructurePlan, owner: RegionId) -> Option<
     Some(declaration)
 }
 
-fn parent_writes_after_capture_same_epoch(
+fn resolve_parent_writes_after_capture(
     cfg: &Cfg,
-    capture_instr: usize,
-    key: CapturedSlotKey,
-    defs_by_slot: &BTreeMap<CapturedSlotKey, Vec<(usize, BlockRef)>>,
-    reachability: &mut BTreeMap<(BlockRef, BlockRef), bool>,
-    cyclic_blocks: &mut BTreeMap<BlockRef, bool>,
-) -> bool {
-    let capture_block = cfg.instr_to_block[capture_instr];
-    if !cfg.reachable_blocks.contains(&capture_block) {
-        return false;
+    dataflow: &DataflowFacts,
+    epochs: &SlotEpochFacts,
+    queries_by_key: &mut BTreeMap<CapturedSlotKey, CapturedSlotWriteQueries>,
+    captured_uses: &mut [CapturedSlotUse],
+) {
+    for def in &dataflow.defs {
+        let key = CapturedSlotKey::new(def.reg.index(), epochs.epoch_at(def.reg, def.instr));
+        let Some(queries) = queries_by_key.get_mut(&key) else {
+            continue;
+        };
+        let instr_index = def.instr.index();
+        queries
+            .defs
+            .push((instr_index, cfg.instr_to_block[instr_index]));
     }
 
-    defs_by_slot.get(&key).is_some_and(|defs| {
-        defs.iter().any(|&(def_instr, def_block)| {
-            if !cfg.reachable_blocks.contains(&def_block) {
-                return false;
-            }
-            if def_block != capture_block {
-                return cached_can_reach(cfg, capture_block, def_block, reachability);
-            }
-            def_instr > capture_instr
-                || (def_instr < capture_instr
-                    && block_has_real_cycle(cfg, capture_block, reachability, cyclic_blocks))
-        })
-    })
-}
-
-fn block_has_real_cycle(
-    cfg: &Cfg,
-    block: BlockRef,
-    reachability: &mut BTreeMap<(BlockRef, BlockRef), bool>,
-    cyclic_blocks: &mut BTreeMap<BlockRef, bool>,
-) -> bool {
-    if let Some(cyclic) = cyclic_blocks.get(&block) {
-        return *cyclic;
+    let mut workspace = CapturedSlotWriteWorkspace::new(cfg.blocks.len());
+    for queries in queries_by_key.values() {
+        workspace.analyze(cfg, &queries.defs);
+        for &use_index in &queries.uses {
+            let captured = &mut captured_uses[use_index];
+            captured.requires_local = workspace.has_write_after(cfg, captured.instr_index);
+        }
     }
-    let cyclic = cfg.succs[block.index()].iter().any(|edge_ref| {
-        let succ = cfg.edges[edge_ref.index()].to;
-        succ == block || cached_can_reach(cfg, succ, block, reachability)
-    });
-    cyclic_blocks.insert(block, cyclic);
-    cyclic
-}
-
-fn cached_can_reach(
-    cfg: &Cfg,
-    from: BlockRef,
-    to: BlockRef,
-    reachability: &mut BTreeMap<(BlockRef, BlockRef), bool>,
-) -> bool {
-    *reachability
-        .entry((from, to))
-        .or_insert_with(|| cfg.can_reach(from, to))
 }
 
 fn captured_slot_start_instr(
@@ -1114,15 +1209,15 @@ fn captured_slot_start_instr(
     capture_instr: InstrRef,
     reg: Reg,
     has_no_reaching_value: bool,
+    workspace: &mut CapturedSlotStartWorkspace,
 ) -> usize {
     if has_no_reaching_value {
         return capture_instr.index();
     }
 
     let mut earliest = None;
-    let mut pending = vec![dataflow.use_value(capture_instr, reg)];
-    let mut seen_phis = vec![false; plan.phis().len()];
-    while let Some(value) = pending.pop() {
+    workspace.begin(dataflow.use_value(capture_instr, reg));
+    while let Some(value) = workspace.pending.pop() {
         match value {
             SsaValue::Entry(_) => {}
             SsaValue::Def(def) => {
@@ -1130,15 +1225,11 @@ fn captured_slot_start_instr(
                 earliest = Some(earliest.map_or(instr, |current: usize| current.min(instr)));
             }
             SsaValue::Phi(phi_id) => {
-                let Some(seen) = seen_phis.get_mut(phi_id.index()) else {
-                    continue;
-                };
-                if *seen {
+                if !workspace.visit(phi_id) {
                     continue;
                 }
-                *seen = true;
                 if let Some(phi) = plan.phi_plan(phi_id) {
-                    pending.extend(
+                    workspace.pending.extend(
                         phi.incomings
                             .iter()
                             .filter(|incoming| phi_incoming_is_normal(incoming.disposition))

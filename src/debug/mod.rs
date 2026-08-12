@@ -14,9 +14,10 @@ mod focus;
 
 #[cfg(any(feature = "decompile-debug", feature = "timing-report"))]
 pub(crate) use colorize::colorize_debug_text;
-pub use focus::{
-    FocusPlan, FocusRequest, ProtoDepth, ProtoNode, ProtoSummaryRow, build_proto_nodes,
-    compute_focus_plan, format_breadcrumb, format_proto_summary_row,
+pub use focus::ProtoDepth;
+pub(crate) use focus::{
+    FocusPlan, FocusRequest, ProtoNode, ProtoSummaryRow, build_proto_nodes, compute_focus_plan,
+    format_breadcrumb, format_proto_summary_row,
 };
 
 /// 生成一对 `#[cfg(feature)]` / `#[cfg(not)]` 的阶段 dump 入口。
@@ -129,7 +130,7 @@ pub struct DebugFilters {
 
 impl DebugFilters {
     /// 把 `DebugFilters` 投射成 `FocusRequest`，方便传给 `compute_focus_plan`。
-    pub fn as_focus_request(&self) -> FocusRequest {
+    pub(crate) fn as_focus_request(&self) -> FocusRequest {
         FocusRequest {
             proto: self.proto,
             depth: self.proto_depth,

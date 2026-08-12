@@ -90,7 +90,7 @@ pub(crate) fn analyze_structure_proto(
     caps: ControlFlowCaps,
 ) -> Result<StructureFacts, StructureError> {
     let mut loop_candidates = loops::analyze_loops(proto, cfg, graph_facts, dataflow);
-    let irreducible_regions = helpers::compute_irreducible_regions(cfg);
+    let irreducible_regions = helpers::compute_irreducible_regions(cfg, graph_facts);
     let (branch_candidates, single_pass_fences) = branches::analyze_branches(
         proto,
         cfg,

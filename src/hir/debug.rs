@@ -23,7 +23,6 @@ use super::common::{
 pub(super) struct HirProtoEntry<'a> {
     pub id: usize,
     pub parent: Option<usize>,
-    pub depth: usize,
     pub proto: &'a HirProto,
 }
 
@@ -469,7 +468,7 @@ pub(super) fn collect_hir_entries<'a>(module: &'a HirModule) -> Vec<HirProtoEntr
         module.protos.iter().map(|p| (p.id.index(), p)).collect();
 
     let mut entries = Vec::new();
-    walk(module.entry, None, 0, &proto_by_id, &mut entries);
+    walk(module.entry, None, &proto_by_id, &mut entries);
     // 兜底：如果 module.protos 里有孤岛 proto（没被 entry 可达到），附在末尾，
     // 保证线性下标的稳定性，elided 计数也才准。
     let seen: std::collections::BTreeSet<usize> =
@@ -480,7 +479,6 @@ pub(super) fn collect_hir_entries<'a>(module: &'a HirModule) -> Vec<HirProtoEntr
             entries.push(HirProtoEntry {
                 id,
                 parent: None,
-                depth: 0,
                 proto,
             });
         }
@@ -490,7 +488,6 @@ pub(super) fn collect_hir_entries<'a>(module: &'a HirModule) -> Vec<HirProtoEntr
     fn walk<'a>(
         current: HirProtoRef,
         parent_slot: Option<usize>,
-        depth: usize,
         proto_by_id: &BTreeMap<usize, &'a HirProto>,
         entries: &mut Vec<HirProtoEntry<'a>>,
     ) {
@@ -501,11 +498,10 @@ pub(super) fn collect_hir_entries<'a>(module: &'a HirModule) -> Vec<HirProtoEntr
         entries.push(HirProtoEntry {
             id: slot,
             parent: parent_slot,
-            depth,
             proto,
         });
         for child in &proto.children {
-            walk(*child, Some(slot), depth + 1, proto_by_id, entries);
+            walk(*child, Some(slot), proto_by_id, entries);
         }
     }
 }
@@ -528,7 +524,6 @@ pub(super) fn plan_focus(entries: &[HirProtoEntry<'_>], filters: &DebugFilters) 
 pub(super) fn build_summary_row(entry: &HirProtoEntry<'_>) -> ProtoSummaryRow {
     ProtoSummaryRow {
         id: entry.proto.id.index(),
-        depth_below_focus: entry.depth,
         name: None,
         first: None,
         lines: Some((

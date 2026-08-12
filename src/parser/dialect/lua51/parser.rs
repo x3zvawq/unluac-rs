@@ -7,9 +7,10 @@ use crate::decompile::DecompileDialect;
 use crate::parser::error::ParseError;
 use crate::parser::family::puc_lua::{
     DecodedInstructionFields, LUA_SIGNATURE, PucLuaInstructionCodec, RawInstructionWord,
-    build_raw_string, decode_instruction_word, parse_puc_lua_instruction_section, read_sized_i64,
-    read_sized_u32,
+    build_raw_string, collect_counted, decode_instruction_word, parse_puc_lua_instruction_section,
+    read_sized_i64, read_sized_u32,
 };
+use crate::parser::limits::check_proto_depth;
 use crate::parser::options::ParseOptions;
 use crate::parser::raw::{
     ChunkHeader, ChunkLayout, Dialect, DialectConstPoolExtra, DialectDebugExtra,
@@ -50,7 +51,7 @@ impl Lua51Parser {
         let layout = header
             .puc_lua_layout()
             .expect("lua51 parser must produce a PUC-Lua header layout");
-        let main = self.parse_proto(&mut reader, layout, None)?;
+        let main = self.parse_proto(&mut reader, layout, None, 1)?;
 
         Ok(RawChunk {
             header,
@@ -137,7 +138,9 @@ impl Lua51Parser {
         reader: &mut BinaryReader<'_>,
         layout: &PucLuaChunkLayout,
         parent_source: Option<&RawString>,
+        depth: usize,
     ) -> Result<RawProto, ParseError> {
+        check_proto_depth(depth)?;
         let start = reader.offset();
         let source = self
             .parse_string(reader, layout)?
@@ -158,7 +161,7 @@ impl Lua51Parser {
                 "instruction_size",
             )?;
         let constants = self.parse_constants(reader, layout)?;
-        let children = self.parse_children(reader, layout, source.as_ref())?;
+        let children = self.parse_children(reader, layout, source.as_ref(), depth)?;
         let debug_info = self.parse_debug_info(reader, layout, raw_instruction_words)?;
 
         Ok(RawProto {
@@ -205,12 +208,10 @@ impl Lua51Parser {
         layout: &PucLuaChunkLayout,
     ) -> Result<RawConstPool, ParseError> {
         let constant_count = read_sized_u32(reader, layout, "constant count")?;
-        let mut literals = Vec::with_capacity(constant_count as usize);
-
-        for _ in 0..constant_count {
+        let literals = collect_counted(reader, constant_count, 1, |reader| {
             let offset = reader.offset();
             let tag = reader.read_u8()?;
-            let literal = match tag {
+            Ok(match tag {
                 LUA_TNIL => RawLiteralConst::Nil,
                 LUA_TBOOLEAN => RawLiteralConst::Boolean(reader.read_u8()? != 0),
                 LUA_TNUMBER => {
@@ -232,9 +233,8 @@ impl Lua51Parser {
                     RawLiteralConst::String(value)
                 }
                 _ => return Err(ParseError::InvalidConstantTag { offset, tag }),
-            };
-            literals.push(literal);
-        }
+            })
+        })?;
 
         Ok(RawConstPool {
             common: RawConstPoolCommon { literals },
@@ -247,15 +247,12 @@ impl Lua51Parser {
         reader: &mut BinaryReader<'_>,
         layout: &PucLuaChunkLayout,
         parent_source: Option<&RawString>,
+        depth: usize,
     ) -> Result<Vec<RawProto>, ParseError> {
         let child_count = read_sized_u32(reader, layout, "child proto count")?;
-        let mut children = Vec::with_capacity(child_count as usize);
-
-        for _ in 0..child_count {
-            children.push(self.parse_proto(reader, layout, parent_source)?);
-        }
-
-        Ok(children)
+        collect_counted(reader, child_count, 1, |reader| {
+            self.parse_proto(reader, layout, parent_source, depth + 1)
+        })
     }
 
     fn parse_debug_info(
@@ -265,15 +262,13 @@ impl Lua51Parser {
         raw_instruction_words: usize,
     ) -> Result<RawDebugInfo, ParseError> {
         let line_count = read_sized_u32(reader, layout, "line info count")?;
-        let mut line_info = Vec::with_capacity(line_count as usize);
-
-        for _ in 0..line_count {
-            line_info.push(read_sized_u32(reader, layout, "line info")?);
-        }
+        let line_info =
+            collect_counted(reader, line_count, layout.integer_size.into(), |reader| {
+                read_sized_u32(reader, layout, "line info")
+            })?;
 
         let local_count = read_sized_u32(reader, layout, "local var count")?;
-        let mut local_vars = Vec::with_capacity(local_count as usize);
-        for _ in 0..local_count {
+        let local_vars = collect_counted(reader, local_count, 1, |reader| {
             let name = self
                 .parse_string(reader, layout)?
                 .ok_or(ParseError::UnsupportedValue {
@@ -282,18 +277,17 @@ impl Lua51Parser {
                 })?;
             let start_pc = read_sized_u32(reader, layout, "local var startpc")?;
             let end_pc = read_sized_u32(reader, layout, "local var endpc")?;
-            local_vars.push(RawLocalVar {
+            Ok(RawLocalVar {
                 name,
                 start_pc,
                 end_pc,
-            });
-        }
+            })
+        })?;
 
         let upvalue_name_count = read_sized_u32(reader, layout, "upvalue name count")?;
-        let mut upvalue_names = Vec::with_capacity(upvalue_name_count as usize);
-        for _ in 0..upvalue_name_count {
-            upvalue_names.push(self.parse_string(reader, layout)?);
-        }
+        let upvalue_names = collect_counted(reader, upvalue_name_count, 1, |reader| {
+            self.parse_string(reader, layout)
+        })?;
 
         if !self.options.mode.is_permissive()
             && !line_info.is_empty()
@@ -330,9 +324,9 @@ impl Lua51Parser {
             value: size,
         })?;
         let offset = reader.offset();
-        let payload = reader.read_exact(byte_count)?.to_vec();
+        let payload = reader.read_exact(byte_count)?;
         let bytes = match payload.split_last() {
-            Some((&0, bytes_without_nul)) => bytes_without_nul.to_vec(),
+            Some((&0, bytes_without_nul)) => bytes_without_nul,
             _ if self.options.mode.is_permissive() => payload,
             _ => return Err(ParseError::UnterminatedString { offset }),
         };

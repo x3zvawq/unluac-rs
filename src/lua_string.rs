@@ -2,16 +2,18 @@
 //!
 //! Lua string 是任意字节序列，不等同于 Rust `String`。HIR 之后的表达式层必须保留
 //! 原始字节；只有在需要生成字段名、全局名或调试名这类文本身份时，才临时尝试 UTF-8
-//! 视图。
+//! 视图。字节与已解码文本使用 `Arc` 共享，RawString -> HIR -> AST 的机械 Clone
+//! 不应随 pipeline 阶段重复深拷贝字面量。
 
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use crate::parser::{RawString, StringEncoding};
 
 #[derive(Debug, Clone, Default)]
 pub struct LuaString {
-    bytes: Vec<u8>,
-    text: Option<String>,
+    bytes: Arc<[u8]>,
+    text: Option<Arc<str>>,
     encoding: Option<StringEncoding>,
 }
 
@@ -52,7 +54,7 @@ impl LuaString {
 
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
         Self {
-            bytes,
+            bytes: bytes.into(),
             text: None,
             encoding: None,
         }
@@ -88,13 +90,20 @@ impl LuaString {
             .or_else(|| self.as_utf8())
             .map_or_else(
                 || {
-                    let bytes = self
-                        .bytes
-                        .iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    format!("<{} bytes: {bytes}>", self.bytes.len())
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    let mut literal = format!("<{} bytes: ", self.bytes.len()).into_bytes();
+                    literal.reserve(self.bytes.len().saturating_mul(3));
+                    if let Some((&first, rest)) = self.bytes.split_first() {
+                        literal.push(HEX[usize::from(first >> 4)]);
+                        literal.push(HEX[usize::from(first & 0x0f)]);
+                        for byte in rest.iter().copied() {
+                            literal.push(b' ');
+                            literal.push(HEX[usize::from(byte >> 4)]);
+                            literal.push(HEX[usize::from(byte & 0x0f)]);
+                        }
+                    }
+                    literal.push(b'>');
+                    String::from_utf8(literal).expect("hex debug literal must be ASCII")
                 },
                 |text| format!("{text:?}"),
             )
@@ -104,8 +113,8 @@ impl LuaString {
 impl From<&str> for LuaString {
     fn from(value: &str) -> Self {
         Self {
-            bytes: value.as_bytes().to_vec(),
-            text: Some(value.to_owned()),
+            bytes: value.as_bytes().into(),
+            text: Some(value.into()),
             encoding: Some(StringEncoding::Utf8),
         }
     }
@@ -113,9 +122,10 @@ impl From<&str> for LuaString {
 
 impl From<String> for LuaString {
     fn from(value: String) -> Self {
+        let bytes = Arc::from(value.as_bytes());
         Self {
-            bytes: value.as_bytes().to_vec(),
-            text: Some(value),
+            bytes,
+            text: Some(value.into()),
             encoding: Some(StringEncoding::Utf8),
         }
     }

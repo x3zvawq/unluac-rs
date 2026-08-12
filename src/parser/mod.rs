@@ -13,6 +13,7 @@ mod debug {
 mod dialect;
 mod error;
 mod family;
+mod limits;
 mod options;
 mod raw;
 mod reader;

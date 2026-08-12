@@ -208,6 +208,7 @@ fn lower_proto_node(
     let mut bindings = build_bindings(
         proto,
         cfg,
+        graph_facts,
         dataflow,
         structure,
         &slot_epochs,

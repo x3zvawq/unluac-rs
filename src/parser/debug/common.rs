@@ -62,7 +62,6 @@ pub(crate) fn plan_parser_focus(
 pub(crate) fn build_parser_summary_row(entry: &ParserProtoEntry<'_>) -> ProtoSummaryRow {
     ProtoSummaryRow {
         id: entry.id,
-        depth_below_focus: entry.depth,
         name: None,
         first: None,
         lines: Some((

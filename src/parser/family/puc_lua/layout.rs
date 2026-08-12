@@ -22,7 +22,8 @@ pub(crate) fn read_instruction_words(
     count: u32,
     instruction_size_field: &'static str,
 ) -> Result<Vec<RawInstructionWord>, ParseError> {
-    let mut words = Vec::with_capacity(count as usize);
+    let capacity = reader.checked_count_capacity(count as usize, layout.instruction_size.into())?;
+    let mut words = Vec::with_capacity(capacity);
 
     for _ in 0..count {
         let offset = reader.offset();

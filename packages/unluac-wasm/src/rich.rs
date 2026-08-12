@@ -297,7 +297,7 @@ fn edge_kind_str(kind: EdgeKind) -> &'static str {
 fn raw_string_to_string(s: &RawString) -> String {
     // 优先使用已解码文本，否则 lossy UTF-8
     if let Some(decoded) = &s.text {
-        decoded.value.clone()
+        decoded.value.to_string()
     } else {
         String::from_utf8_lossy(&s.bytes).into_owned()
     }

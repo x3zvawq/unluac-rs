@@ -44,7 +44,7 @@ impl ProtoDepth {
     /// 判断给定的相对深度是否仍在展开范围内。
     ///
     /// `relative == 0` 表示焦点自身，一定在范围内。
-    pub fn includes(self, relative: usize) -> bool {
+    pub(crate) fn includes(self, relative: usize) -> bool {
         match self {
             Self::Fixed(limit) => relative <= limit,
             Self::All => true,
@@ -66,9 +66,9 @@ impl fmt::Display for ProtoDepth {
 /// 每个 `ProtoNode` 在 `nodes` 切片里的下标就是它的稳定 id（DFS 序），
 /// 各层在调用本 helper 前要自己先把树线性化成这个形态。
 #[derive(Debug, Clone)]
-pub struct ProtoNode {
-    pub parent: Option<usize>,
-    pub children: Vec<usize>,
+pub(crate) struct ProtoNode {
+    pub(crate) parent: Option<usize>,
+    pub(crate) children: Vec<usize>,
 }
 
 /// 从 DFS 序的 `(id, parent)` 对列表反推 `Vec<ProtoNode>`。
@@ -77,7 +77,7 @@ pub struct ProtoNode {
 /// `parent`。这个 helper 允许层自己决定是否跟踪 parent，再统一交由 focus 计算。
 /// 要求 `id` 等于 `parents.len() - 1 - idx_in_reverse`，也就是 `(id, parent)`
 /// 按 DFS 顺序 push 进来即可。
-pub fn build_proto_nodes(parents: &[Option<usize>]) -> Vec<ProtoNode> {
+pub(crate) fn build_proto_nodes(parents: &[Option<usize>]) -> Vec<ProtoNode> {
     let mut nodes: Vec<ProtoNode> = (0..parents.len())
         .map(|_| ProtoNode {
             parent: None,
@@ -102,20 +102,20 @@ pub fn build_proto_nodes(parents: &[Option<usize>]) -> Vec<ProtoNode> {
 /// - `visible`：需要完整渲染的 proto id 集合（包含焦点本身）。
 /// - `elided_at`：需要以 summary 行占位的 proto id，按 DFS 序排列。
 #[derive(Debug, Clone, Default)]
-pub struct FocusPlan {
-    pub focus: Option<usize>,
-    pub ancestors: Vec<usize>,
-    pub visible: BTreeSet<usize>,
-    pub elided_at: Vec<usize>,
+pub(crate) struct FocusPlan {
+    pub(crate) focus: Option<usize>,
+    pub(crate) ancestors: Vec<usize>,
+    pub(crate) visible: BTreeSet<usize>,
+    pub(crate) elided_at: Vec<usize>,
 }
 
 impl FocusPlan {
-    pub fn is_visible(&self, id: usize) -> bool {
+    pub(crate) fn is_visible(&self, id: usize) -> bool {
         self.visible.contains(&id)
     }
 
-    pub fn is_elided(&self, id: usize) -> bool {
-        self.elided_at.contains(&id)
+    pub(crate) fn is_elided(&self, id: usize) -> bool {
+        self.elided_at.binary_search(&id).is_ok()
     }
 }
 
@@ -123,7 +123,7 @@ impl FocusPlan {
 ///
 /// 当 `focus` 指向的 id 不存在时，返回空 plan：所有 proto 都被隐藏，
 /// 调用方应显示类似 `<no proto matched filters>` 的提示。
-pub fn compute_focus_plan(nodes: &[ProtoNode], filters: &FocusRequest) -> FocusPlan {
+pub(crate) fn compute_focus_plan(nodes: &[ProtoNode], filters: &FocusRequest) -> FocusPlan {
     if nodes.is_empty() {
         return FocusPlan::default();
     }
@@ -143,7 +143,7 @@ pub fn compute_focus_plan(nodes: &[ProtoNode], filters: &FocusRequest) -> FocusP
     }
     ancestors.reverse();
 
-    // 从焦点向下按相对深度 BFS 扩展可见集合，
+    // 从焦点向下按相对深度 DFS 扩展可见集合，
     // 同时把被裁掉的直接子节点加入 `elided_at`，保证在 DFS 原序中出现。
     let mut visible = BTreeSet::new();
     let mut elided_at = Vec::new();
@@ -184,9 +184,9 @@ fn walk_below(
 
 /// 聚焦参数的最小输入。`DebugFilters` 与 pass dump config 都能投射到这个结构。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
-pub struct FocusRequest {
-    pub proto: Option<usize>,
-    pub depth: ProtoDepth,
+pub(crate) struct FocusRequest {
+    pub(crate) proto: Option<usize>,
+    pub(crate) depth: ProtoDepth,
 }
 
 /// 每个 dump 层需要打印 elided 占位行时，把可获得的辨识信息放进这个 struct，
@@ -197,14 +197,13 @@ pub struct FocusRequest {
 ///   `lines / instrs / children / first`（`name=-`）。
 /// - HIR / AST / generate 可额外填 `name`。
 #[derive(Debug, Clone, Default)]
-pub struct ProtoSummaryRow {
-    pub id: usize,
-    pub depth_below_focus: usize,
-    pub name: Option<String>,
-    pub first: Option<String>,
-    pub lines: Option<(u32, u32)>,
-    pub instrs: Option<usize>,
-    pub children: Option<usize>,
+pub(crate) struct ProtoSummaryRow {
+    pub(crate) id: usize,
+    pub(crate) name: Option<String>,
+    pub(crate) first: Option<String>,
+    pub(crate) lines: Option<(u32, u32)>,
+    pub(crate) instrs: Option<usize>,
+    pub(crate) children: Option<usize>,
 }
 
 /// 渲染单个 elided 占位行。
@@ -213,7 +212,7 @@ pub struct ProtoSummaryRow {
 ///   `proto#<id> <elided> name=<n> lines=<A..B> first=<"..."> instrs=<K> children=<C>`
 ///
 /// 缺失的字段统一用 `-` 占位；`first` 会做长度截断避免一行爆炸。
-pub fn format_proto_summary_row(row: &ProtoSummaryRow) -> String {
+pub(crate) fn format_proto_summary_row(row: &ProtoSummaryRow) -> String {
     let mut output = String::new();
     let _ = write!(output, "proto#{} <elided>", row.id);
 
@@ -266,7 +265,7 @@ fn truncate_first(raw: &str) -> String {
 /// 渲染 breadcrumb 行（`focus proto#<id> path=proto#A -> proto#B -> ...`）。
 ///
 /// 当焦点就是入口 proto 且无祖先时，返回 `None`，让调用方自己决定是否跳过这行。
-pub fn format_breadcrumb(plan: &FocusPlan) -> Option<String> {
+pub(crate) fn format_breadcrumb(plan: &FocusPlan) -> Option<String> {
     let focus = plan.focus?;
     if plan.ancestors.is_empty() {
         return None;

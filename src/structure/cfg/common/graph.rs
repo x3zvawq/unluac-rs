@@ -1,8 +1,8 @@
 //! GraphFacts 层的稳定事实与树查询。
 //!
-//! 这里负责支配树、后支配树、backedge、natural loop 这些“已经脱离原始 CFG 结构、
+//! 这里负责支配树、后支配树、SCC、backedge、natural loop 这些“已经脱离原始 CFG 结构、
 //! 但仍属于通用图分析”的事实。StructureFacts/HIR 只应该调这些查询接口，不应再回头
-//! 自己揉 parent 数组或重新实现最近公共祖先逻辑。
+//! 自己揉 parent 数组、重新实现最近公共祖先或重复扫描图判断环。
 
 use std::collections::BTreeSet;
 
@@ -15,6 +15,8 @@ pub struct GraphFacts {
     pub dominator_tree: DominatorTree,
     pub post_dominator_tree: PostDominatorTree,
     pub dominance_frontier: Vec<BTreeSet<BlockRef>>,
+    pub(crate) strongly_connected_components: Vec<Vec<BlockRef>>,
+    pub(crate) cyclic_blocks: Vec<bool>,
     pub backedges: Vec<EdgeRef>,
     pub loop_headers: BTreeSet<BlockRef>,
     pub natural_loops: Vec<NaturalLoop>,
@@ -22,6 +24,17 @@ pub struct GraphFacts {
 }
 
 impl GraphFacts {
+    pub(crate) fn strongly_connected_components(&self) -> impl Iterator<Item = &[BlockRef]> {
+        self.strongly_connected_components.iter().map(Vec::as_slice)
+    }
+
+    pub fn block_is_cyclic(&self, block: BlockRef) -> bool {
+        self.cyclic_blocks
+            .get(block.index())
+            .copied()
+            .unwrap_or(false)
+    }
+
     /// 返回某个 block 的 dominance frontier。
     ///
     /// 调用方应通过这个查询接口消费 frontier，而不是依赖底层当前恰好用

@@ -482,7 +482,6 @@ where
 {
     ProtoSummaryRow {
         id: entry.id,
-        depth_below_focus: entry.depth,
         name: None,
         first: None,
         lines: None,
@@ -494,7 +493,6 @@ where
 fn build_graph_facts_summary_row(entry: &ProtoEntry<'_, GraphFacts>) -> ProtoSummaryRow {
     ProtoSummaryRow {
         id: entry.id,
-        depth_below_focus: entry.depth,
         name: None,
         first: None,
         lines: None,
@@ -506,7 +504,6 @@ fn build_graph_facts_summary_row(entry: &ProtoEntry<'_, GraphFacts>) -> ProtoSum
 fn build_dataflow_summary_row(entry: &DataflowProtoEntry<'_>) -> ProtoSummaryRow {
     ProtoSummaryRow {
         id: entry.id,
-        depth_below_focus: entry.depth,
         name: None,
         first: None,
         lines: None,
