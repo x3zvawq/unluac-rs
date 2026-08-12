@@ -67,7 +67,7 @@ struct PlanLoweringIndex {
     region_inputs: Vec<Vec<(PhiId, SsaValue)>>,
     unresolved_requirement: Vec<Option<(BlockRef, Reg)>>,
     normal_tail_guard_by_edge: Vec<Option<(RegionId, TempId)>>,
-    elided_loop_copy_targets: Vec<Vec<PhiId>>,
+    consumed_loop_copy_targets: Vec<Vec<PhiId>>,
     repeat_staged_result_by_phi: Vec<Option<(RegionId, TempId)>>,
     canonical_move_source: Vec<Option<SsaValue>>,
     absorbed_region_result_moves: Vec<bool>,
@@ -389,7 +389,7 @@ impl PlanLoweringIndex {
                 *slot = Some(identity);
             }
         }
-        let mut elided_loop_copy_targets = vec![Vec::new(); lowering.cfg.edges.len()];
+        let mut consumed_loop_copy_targets = vec![Vec::new(); lowering.cfg.edges.len()];
         for (loop_id, _) in plan.loops() {
             let region = plan
                 .loop_region(loop_id)
@@ -397,22 +397,33 @@ impl PlanLoweringIndex {
             let actions = plan
                 .loop_value_actions(loop_id)
                 .ok_or_else(|| invalid(region, "loop value actions are missing"))?;
-            for origin in &actions.elided {
-                let Some(targets) = elided_loop_copy_targets.get_mut(origin.edge.index()) else {
+            let completion_exits = plan
+                .loop_(loop_id)
+                .and_then(|payload| payload.normal_tail.as_ref())
+                .map(|tail| tail.completion_exits.as_slice())
+                .unwrap_or_default();
+            let completion_origins = actions
+                .batches
+                .iter()
+                .flat_map(|batch| &batch.writes)
+                .flat_map(|write| &write.origins)
+                .filter(|origin| completion_exits.binary_search(&origin.edge).is_ok());
+            for origin in completion_origins.chain(&actions.elided) {
+                let Some(targets) = consumed_loop_copy_targets.get_mut(origin.edge.index()) else {
                     return Err(invalid(
                         region,
-                        "elided loop copy is outside the edge arena",
+                        "consumed loop copy is outside the edge arena",
                     ));
                 };
                 targets.push(origin.target);
             }
         }
-        for targets in &mut elided_loop_copy_targets {
+        for targets in &mut consumed_loop_copy_targets {
             targets.sort_unstable();
             if targets.windows(2).any(|pair| pair[0] == pair[1]) {
                 return Err(invalid(
                     root,
-                    "one edge copy is elided by multiple loop owners",
+                    "one edge copy is consumed by multiple loop actions",
                 ));
             }
         }
@@ -468,7 +479,7 @@ impl PlanLoweringIndex {
             region_inputs,
             unresolved_requirement,
             normal_tail_guard_by_edge,
-            elided_loop_copy_targets,
+            consumed_loop_copy_targets,
             repeat_staged_result_by_phi,
             canonical_move_source,
             absorbed_region_result_moves,
@@ -555,8 +566,21 @@ fn build_absorbed_region_result_moves(
             return Err(invalid(root, "Move definition block contradicts the CFG"));
         }
 
-        let canonical = canonical_move_source.get(def_index).copied().flatten();
-        if canonical.is_none() || canonical == Some(SsaValue::Def(definition.id)) {
+        let Some(canonical) = canonical_move_source.get(def_index).copied().flatten() else {
+            continue;
+        };
+        if canonical == SsaValue::Def(definition.id) {
+            continue;
+        }
+        let immediate_source = lowering
+            .dataflow
+            .use_values
+            .get(definition.instr.index())
+            .and_then(|uses| uses.fixed.get(move_.src))
+            .ok_or_else(|| invalid(root, "Move has no immediate SSA source"))?;
+        if canonical != immediate_source {
+            // 多跳链的 immediate source 可能是为并行赋值保存的旧值；把 edge read
+            // 穿透到 mutable canonical home 会越过中间覆写。单跳才可无条件延后读取。
             continue;
         }
         let action_uses = edge_action_use_count
@@ -3088,7 +3112,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         let mut values = Vec::new();
         let elided = self
             .index
-            .elided_loop_copy_targets
+            .consumed_loop_copy_targets
             .get(edge.index())
             .ok_or(HirLowerError::InvalidPlanRegion {
                 proto: self.proto.index(),

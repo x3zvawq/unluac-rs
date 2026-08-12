@@ -3103,6 +3103,22 @@ fn validate_loop_plans(
                         loop_id.index()
                     )));
                 }
+                let boundary = intervals.boundary(*tail_region).ok_or_else(|| {
+                    StructureError::invalid("normal-tail region has no boundary summary")
+                })?;
+                if tail.normal_exits.is_empty()
+                    || tail
+                        .normal_exits
+                        .windows(2)
+                        .any(|pair| pair[0].index() >= pair[1].index())
+                    || boundary.entry_count != tail.normal_exits.len()
+                    || boundary.exit_count != tail.completion_exits.len()
+                {
+                    return Err(StructureError::invalid(format!(
+                        "loop payload #{} has stale normal-tail boundary ports",
+                        loop_id.index()
+                    )));
+                }
                 for edge in &tail.normal_exits {
                     let edge_plan = plan.edge_plan(*edge).ok_or_else(|| {
                         StructureError::invalid("normal-tail exit has no edge plan")
@@ -3121,9 +3137,41 @@ fn validate_loop_plans(
                         EdgeTransfer::Break(target) => target == region_id,
                         _ => false,
                     };
-                    if !syntax_exit_kind || cfg_edge.to != tail.entry || !syntax_exit_transfer {
+                    if !syntax_exit_kind
+                        || cfg_edge.to != tail.entry
+                        || region_contains_block(plan, intervals, *tail_region, cfg_edge.from)
+                        || !syntax_exit_transfer
+                    {
                         return Err(StructureError::invalid(format!(
                             "loop payload #{} normal-tail exit is stale",
+                            loop_id.index()
+                        )));
+                    }
+                }
+                if tail.completion_exits.is_empty()
+                    || tail
+                        .completion_exits
+                        .windows(2)
+                        .any(|pair| pair[0].index() >= pair[1].index())
+                {
+                    return Err(StructureError::invalid(format!(
+                        "loop payload #{} has invalid normal-tail completion exits",
+                        loop_id.index()
+                    )));
+                }
+                for edge in &tail.completion_exits {
+                    let edge_plan = plan.edge_plan(*edge).ok_or_else(|| {
+                        StructureError::invalid("normal-tail completion has no edge plan")
+                    })?;
+                    let cfg_edge = cfg.edges.get(edge.index()).ok_or_else(|| {
+                        StructureError::invalid("normal-tail completion references a missing edge")
+                    })?;
+                    if edge_plan.edge != *edge
+                        || cfg_edge.to != tail.continuation
+                        || !region_contains_block(plan, intervals, *tail_region, cfg_edge.from)
+                    {
+                        return Err(StructureError::invalid(format!(
+                            "loop payload #{} normal-tail completion is stale",
                             loop_id.index()
                         )));
                     }

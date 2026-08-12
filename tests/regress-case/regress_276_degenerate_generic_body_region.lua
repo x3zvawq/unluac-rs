@@ -1,5 +1,6 @@
 -- regress_276_degenerate_generic_body_region: branch前缀与nested loop同属退化for状态
 -- unluac: expect-contains [[repeat]]
+-- unluac: expect-contains [[in pairs(p1_1) do]]
 -- unluac: expect-contains [[return ]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]

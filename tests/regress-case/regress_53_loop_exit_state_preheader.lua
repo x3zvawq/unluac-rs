@@ -1,5 +1,6 @@
 -- regress_53_loop_exit_state_preheader#1: exit-only loop state 使用 preheader 初值
 -- unluac: expect-contains [[for ]]
+-- unluac: expect-contains [[in ipairs(p1_0) do]]
 -- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]

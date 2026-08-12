@@ -160,6 +160,8 @@ struct FrozenExitActions {
     elided: Vec<EdgeCopyOrigin>,
 }
 
+type UniformEdgeCopies = Vec<(crate::structure::PhiEdgeCopy, Vec<EdgeCopyOrigin>)>;
+
 #[derive(Clone, Copy, Default)]
 struct PhiUseExtent {
     first_region: usize,
@@ -216,6 +218,7 @@ impl LoopValueAnalysis {
     fn build(
         proto: &LoweredProto,
         cfg: &Cfg,
+        graph_facts: &GraphFacts,
         dataflow: &DataflowFacts,
         plan: &StructurePlan,
     ) -> Result<Self, StructureError> {
@@ -395,7 +398,7 @@ impl LoopValueAnalysis {
             let region = plan
                 .loop_region(loop_id)
                 .ok_or_else(|| StructureError::invalid("VM-for has no owning region"))?;
-            for edge in absorbed_value_edges(cfg, plan, region, payload)? {
+            for edge in absorbed_value_edges(cfg, graph_facts, dataflow, plan, region, payload)? {
                 let slot = absorbed_owner_by_edge
                     .get_mut(edge.index())
                     .ok_or_else(|| {
@@ -482,7 +485,7 @@ pub(super) fn finalize(
     dataflow: &DataflowFacts,
     plan: &mut StructurePlan,
 ) -> Result<(), StructureError> {
-    let analysis = LoopValueAnalysis::build(proto, cfg, dataflow, plan)?;
+    let analysis = LoopValueAnalysis::build(proto, cfg, graph_facts, dataflow, plan)?;
     let body_completion = freeze_vm_for_body_completion(cfg, plan)?;
     let frozen = plan
         .loops
@@ -528,7 +531,7 @@ pub(super) fn validate(
     dataflow: &DataflowFacts,
     plan: &StructurePlan,
 ) -> Result<(), StructureError> {
-    let analysis = LoopValueAnalysis::build(proto, cfg, dataflow, plan)?;
+    let analysis = LoopValueAnalysis::build(proto, cfg, graph_facts, dataflow, plan)?;
     let body_completion = freeze_vm_for_body_completion(cfg, plan)?;
     if plan
         .loops
@@ -964,6 +967,8 @@ fn value_is_available_at_edge_action(
 
 fn absorbed_value_edges(
     cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    dataflow: &DataflowFacts,
     plan: &StructurePlan,
     owner: RegionId,
     payload: &LoopPlanData,
@@ -989,9 +994,37 @@ fn absorbed_value_edges(
                 }),
         )
         .collect::<Vec<_>>();
+    if normal_tail_completion_copies(plan, owner, payload)?.is_some_and(|copies| {
+        copies.iter().all(|(copy, _)| {
+            value_is_available_before_loop(graph_facts, dataflow, payload, copy.value)
+        })
+    }) && let Some(tail) = &payload.normal_tail
+    {
+        edges.extend(tail.completion_exits.iter().copied());
+    }
     edges.sort_by_key(|edge| edge.index());
     edges.dedup();
     Ok(edges)
+}
+
+fn value_is_available_before_loop(
+    graph_facts: &GraphFacts,
+    dataflow: &DataflowFacts,
+    payload: &LoopPlanData,
+    value: SsaValue,
+) -> bool {
+    match value {
+        SsaValue::Entry(_) => true,
+        SsaValue::Def(def) => dataflow.defs.get(def.index()).is_some_and(|definition| {
+            Some(definition.block) == payload.preheader_block
+                || (definition.block != payload.header
+                    && graph_facts.dominates(definition.block, payload.header))
+        }),
+        SsaValue::Phi(phi) => dataflow.phi_candidate(phi).is_some_and(|candidate| {
+            candidate.block == payload.header
+                || graph_facts.dominates(candidate.block, payload.header)
+        }),
+    }
 }
 
 fn record_origin(
@@ -1583,8 +1616,8 @@ fn freeze_exit_actions(
     context: &LoopValueContext<'_>,
 ) -> Result<FrozenExitActions, StructureError> {
     let LoopValueContext {
-        dataflow,
         plan,
+        analysis,
         owner,
         payload,
         ..
@@ -1595,7 +1628,90 @@ fn freeze_exit_actions(
         .map(|edge| edge_copies(plan, owner, edge))
         .transpose()?
         .unwrap_or_default();
-    let normal = uniform_edge_copies(plan, owner, &payload.control_edges.exit)?;
+    let mut normal = uniform_edge_copies(plan, owner, &payload.control_edges.exit)?;
+    let completion_is_absorbed = payload.normal_tail.as_ref().is_some_and(|tail| {
+        tail.completion_exits.iter().all(|edge| {
+            analysis
+                .absorbed_owner_by_edge
+                .get(edge.index())
+                .copied()
+                .flatten()
+                .and_then(|loop_id| plan.loop_region(loop_id))
+                == Some(owner)
+        })
+    });
+    if completion_is_absorbed
+        && let Some(completion) = normal_tail_completion_copies(plan, owner, payload)?
+    {
+        normal.extend(completion);
+    }
+    freeze_exit_copy_actions(context, preheader, normal)
+}
+
+/// 只有 normal-tail 的每条完成边都由当前 loop 直接拥有、以 fallthrough 完成，且
+/// canonical copy 完全一致时，才允许把它们提升为统一的 loop exit action。其它形状
+/// 继续由 tail region 原位执行，保留 guard 语义。
+fn normal_tail_completion_copies(
+    plan: &StructurePlan,
+    owner: RegionId,
+    payload: &LoopPlanData,
+) -> Result<Option<UniformEdgeCopies>, StructureError> {
+    let Some(tail) = &payload.normal_tail else {
+        return Ok(None);
+    };
+    let mut expected = None;
+    for edge in &tail.completion_exits {
+        let edge_plan = plan.edge_plan(*edge).ok_or_else(|| {
+            StructureError::invalid("normal-tail completion has no final edge plan")
+        })?;
+        if edge_plan.owner != owner || edge_plan.transfer != EdgeTransfer::Fallthrough {
+            return Ok(None);
+        }
+        if let Some(expected) = expected
+            && expected != edge_plan.phi_copies.as_slice()
+        {
+            return Ok(None);
+        }
+        expected = Some(edge_plan.phi_copies.as_slice());
+    }
+    let Some(expected) = expected.filter(|copies| !copies.is_empty()) else {
+        return Ok(None);
+    };
+
+    let mut syntax_targets = BTreeSet::new();
+    for edge in payload
+        .control_edges
+        .preheader_exit
+        .into_iter()
+        .chain(payload.control_edges.exit.iter().copied())
+    {
+        let edge_plan = plan
+            .edge_plan(edge)
+            .ok_or_else(|| StructureError::invalid("loop syntax exit has no final edge plan"))?;
+        if edge_plan.owner == owner {
+            syntax_targets.extend(edge_plan.phi_copies.iter().map(|copy| copy.phi_id));
+        }
+    }
+    if expected
+        .iter()
+        .any(|copy| syntax_targets.contains(&copy.phi_id))
+    {
+        return Ok(None);
+    }
+    uniform_edge_copies(plan, owner, &tail.completion_exits).map(Some)
+}
+
+fn freeze_exit_copy_actions(
+    context: &LoopValueContext<'_>,
+    preheader: Vec<(EdgeRef, crate::structure::PhiEdgeCopy)>,
+    normal: UniformEdgeCopies,
+) -> Result<FrozenExitActions, StructureError> {
+    let LoopValueContext {
+        dataflow,
+        plan,
+        payload,
+        ..
+    } = *context;
     if preheader.is_empty() && normal.is_empty() {
         return Ok(FrozenExitActions::default());
     }
@@ -1810,7 +1926,7 @@ fn classify_edge_copies(
 
 fn classify_latch_copies(
     context: &LoopValueContext<'_>,
-    copies: Vec<(crate::structure::PhiEdgeCopy, Vec<EdgeCopyOrigin>)>,
+    copies: UniformEdgeCopies,
 ) -> Result<(Vec<LoopValueWrite>, Vec<EdgeCopyOrigin>), StructureError> {
     let mut writes = Vec::new();
     let mut elided = Vec::new();
@@ -2034,7 +2150,7 @@ fn uniform_edge_copies(
     plan: &StructurePlan,
     owner: RegionId,
     edges: &[EdgeRef],
-) -> Result<Vec<(crate::structure::PhiEdgeCopy, Vec<EdgeCopyOrigin>)>, StructureError> {
+) -> Result<UniformEdgeCopies, StructureError> {
     let Some(first) = edges.first().copied() else {
         return Ok(Vec::new());
     };

@@ -1,5 +1,6 @@
 -- regress_260_lua55_degenerate_generic_shared_exit#1: 零次迭代出口与 body 出口共享 continuation
 -- unluac: expect-contains [[for ]]
+-- unluac: expect-contains [[in pairs(p1_2) do]]
 -- unluac: expect-contains [[while true do]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[unresolved]]

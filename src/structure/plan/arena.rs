@@ -703,6 +703,7 @@ struct NormalTailPartition {
     continuation: BlockRef,
     early_exits: Vec<EdgeRef>,
     normal_exits: Vec<EdgeRef>,
+    completion_exits: Vec<EdgeRef>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5642,18 +5643,27 @@ fn detect_normal_loop_tail(
     }
 
     let normal_exit_set = normal_exits.iter().copied().collect::<BTreeSet<_>>();
+    let mut completion_exits = Vec::new();
     for block in &blocks {
         if cfg.preds[block.index()].iter().any(|edge| {
             let source = cfg.edges[edge.index()].from;
             cfg.reachable_blocks.contains(&source)
                 && !blocks.contains(&source)
                 && !normal_exit_set.contains(edge)
-        }) || cfg.succs[block.index()].iter().any(|edge| {
-            let target = cfg.edges[edge.index()].to;
-            target != continuation && !blocks.contains(&target)
         }) {
             return None;
         }
+        for edge in &cfg.succs[block.index()] {
+            let target = cfg.edges[edge.index()].to;
+            if target == continuation {
+                completion_exits.push(*edge);
+            } else if !blocks.contains(&target) {
+                return None;
+            }
+        }
+    }
+    if completion_exits.is_empty() {
+        return None;
     }
     let mut indegree = vec![0usize; cfg.blocks.len()];
     for block in &blocks {
@@ -5692,12 +5702,15 @@ fn detect_normal_loop_tail(
     let mut normal_exits = normal_exits;
     normal_exits.sort_by_key(|edge| edge.index());
     normal_exits.dedup();
+    completion_exits.sort_by_key(|edge| edge.index());
+    completion_exits.dedup();
     Some(NormalTailPartition {
         entry,
         blocks,
         continuation,
         early_exits,
         normal_exits,
+        completion_exits,
     })
 }
 
@@ -6150,6 +6163,7 @@ fn freeze_loop_payload(
                 continuation: tail.continuation,
                 early_exits: tail.early_exits.clone(),
                 normal_exits: tail.normal_exits.clone(),
+                completion_exits: tail.completion_exits.clone(),
             }),
         exit_tail,
         propagated_break,

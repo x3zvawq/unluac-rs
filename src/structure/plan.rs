@@ -297,6 +297,7 @@ pub struct LoopNormalTailPlan {
     pub continuation: BlockRef,
     pub early_exits: Vec<EdgeRef>,
     pub normal_exits: Vec<EdgeRef>,
+    pub completion_exits: Vec<EdgeRef>,
 }
 
 /// 普通 loop 正常退出边独占的 block 前缀。
