@@ -4,7 +4,7 @@
 //! 下游应通过这里提供的查询接口读取定义、phi 和 reaching/use 信息，而不是直接依赖
 //! 这些事实在内存中的当前组织形状。
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::Range;
 
@@ -74,6 +74,7 @@ pub struct DataflowFacts {
     pub(crate) def_phi_uses: Vec<Vec<PhiId>>,
     pub(crate) phi_uses: Vec<Vec<UseSite>>,
     pub(crate) phi_phi_uses: Vec<Vec<PhiId>>,
+    pub(crate) phi_truly_dead: Vec<bool>,
     pub open_use_sources: Vec<OpenUseSources>,
     pub live_in: Vec<BTreeSet<Reg>>,
     pub live_out: Vec<BTreeSet<Reg>>,
@@ -175,6 +176,13 @@ impl DataflowFacts {
             .map_or(&[], Vec::as_slice)
     }
 
+    pub fn phi_is_truly_dead(&self, phi_id: PhiId) -> bool {
+        self.phi_truly_dead
+            .get(phi_id.index())
+            .copied()
+            .expect("dataflow should have a dead/live flag for every phi")
+    }
+
     pub fn def_reg(&self, def_id: DefId) -> Reg {
         self.defs
             .get(def_id.index())
@@ -207,45 +215,6 @@ impl DataflowFacts {
     pub fn phi_used_only_in_block(&self, phi_id: PhiId, block: BlockRef) -> bool {
         self.phi_use_count(phi_id) > 0
             && self.phi_use_blocks.get(phi_id.index()).copied().flatten() == Some(block)
-    }
-
-    /// 计算"真正死亡"的 phi 集合——既没有任何指令直接读取，也没有被任何存活 phi
-    /// 的 incoming 间接引用。返回的 `BTreeSet<PhiId>` 中的 phi 可以安全地跳过物化。
-    pub fn compute_truly_dead_phis(&self) -> BTreeSet<PhiId> {
-        if self.phi_candidates.is_empty() {
-            return BTreeSet::new();
-        }
-
-        // Step 1: 收集被至少一条指令直接使用的 phi（instruction-level alive）。
-        let mut alive = BTreeSet::new();
-        for values in &self.use_values {
-            for value in values.fixed.values() {
-                if let SsaValue::Phi(phi_id) = value {
-                    alive.insert(phi_id);
-                }
-            }
-        }
-
-        // Step 2: 从 alive phi 反向传播——如果某个 alive phi 的 incoming 边上
-        //         predecessor 出口处寄存器的 SSA 值是另一个 phi，则那个 phi 也 alive。
-        let mut queue: VecDeque<PhiId> = alive.iter().copied().collect();
-        while let Some(phi_id) = queue.pop_front() {
-            let phi = &self.phi_candidates[phi_id.index()];
-            for incoming in &phi.incoming {
-                if let SsaValue::Phi(upstream) = incoming.value
-                    && alive.insert(upstream)
-                {
-                    queue.push_back(upstream);
-                }
-            }
-        }
-
-        // Step 3: dead = all - alive
-        self.phi_candidates
-            .iter()
-            .map(|phi| phi.id)
-            .filter(|id| !alive.contains(id))
-            .collect()
     }
 
     /// 展开 phi 链，返回最终可到达的 entry/def 身份。

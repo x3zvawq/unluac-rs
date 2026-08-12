@@ -463,9 +463,7 @@ fn selected_value_decisions(
     residual_transfers: &[ResidualTransferEvidence],
     candidates: &[ShortCircuitCandidate],
 ) -> Vec<ValueDecisionPlanInput> {
-    let dead_phis = dataflow.compute_truly_dead_phis();
-    let safety =
-        ValueDecisionSafetyIndex::new(cfg, dataflow, loops, residual_transfers, &dead_phis);
+    let safety = ValueDecisionSafetyIndex::new(cfg, dataflow, loops, residual_transfers);
     let mut scratch = ValueDecisionCandidateScratch::new(proto, cfg, dataflow);
     let mut group_by_dag = HashMap::<ValueDecisionDagKey<'_>, usize>::new();
     let mut groups = Vec::<Vec<(usize, &ShortCircuitCandidate)>>::new();
@@ -626,7 +624,6 @@ impl ValueDecisionSafetyIndex {
         dataflow: &DataflowFacts,
         loops: &[LoopCandidate],
         residual_transfers: &[ResidualTransferEvidence],
-        dead_phis: &BTreeSet<super::PhiId>,
     ) -> Self {
         let mut forbidden_blocks = vec![true; cfg.blocks.len()];
         let mut loop_input_blocks = vec![false; cfg.blocks.len()];
@@ -668,7 +665,7 @@ impl ValueDecisionSafetyIndex {
 
         let mut live_phi_edges = vec![Vec::new(); cfg.edges.len()];
         for phi in &dataflow.phi_candidates {
-            if dead_phis.contains(&phi.id) {
+            if dataflow.phi_is_truly_dead(phi.id) {
                 continue;
             }
             for edge in phi.incoming.iter().filter_map(|incoming| incoming.edge) {

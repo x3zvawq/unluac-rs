@@ -1620,6 +1620,11 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_303_generic_for_live_method_receiver.lua",
         ALL_DIALECTS,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_304_luau_loop_carried_binding.lua",
+        LUAU_ONLY,
+    )
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {

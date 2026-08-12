@@ -20,8 +20,8 @@ use crate::structure::{
     SsaValue,
 };
 use crate::structure::{
-    LoopPlanId, LoopSourceBindings, RegionId, RegionPlan, StructureFacts, StructurePlan,
-    UnstructuredLayoutItem,
+    LoopPlanId, LoopSourceBindings, LoopVmProtocol, RegionId, RegionPlan, StructureFacts,
+    StructurePlan, UnstructuredLayoutItem,
 };
 use crate::transformer::{
     AccessBase, CaptureSource, GetTableKind, InstrRef, LowInstr, LoweredProto, Reg,
@@ -184,19 +184,13 @@ pub(super) fn build_bindings(
             ))
         })
         .collect::<BTreeSet<_>>();
-    let nested_results = coalesce_nested_loop_result_temps(
-        structure.plan(),
-        &captured_regs,
-        &nested_carried_parents,
-        &mut phi_temps,
-    );
-    coalesce_nested_loop_state_defs(
+    coalesce_loop_state_temps(
         dataflow,
         structure.plan(),
         &captured_regs,
         &nested_carried_parents,
-        &nested_results,
-        &phi_temps,
+        &numeric_binding_phis.bindings,
+        &mut phi_temps,
         &mut fixed_temps,
     );
     let loop_guard_temps = structure
@@ -218,9 +212,7 @@ pub(super) fn build_bindings(
                 .protocol
                 .as_ref()
                 .and_then(|protocol| match protocol {
-                    crate::structure::LoopVmProtocol::Repeat(repeat) => {
-                        Some(repeat.value_plan.staged_results.len())
-                    }
+                    LoopVmProtocol::Repeat(repeat) => Some(repeat.value_plan.staged_results.len()),
                     _ => None,
                 })
                 .unwrap_or(0);
@@ -229,7 +221,7 @@ pub(super) fn build_bindings(
                 .protocol
                 .as_ref()
                 .and_then(|protocol| match protocol {
-                    crate::structure::LoopVmProtocol::Repeat(repeat) => {
+                    LoopVmProtocol::Repeat(repeat) => {
                         Some(repeat.value_plan.staged_results.as_slice())
                     }
                     _ => None,
@@ -352,7 +344,7 @@ struct LoopCarriedBinding {
 /// 提前写回变得可观察，因此保守保留独立 temp。
 fn coalesce_nested_loop_carried_temps(
     plan: &StructurePlan,
-    captured_regs: &BTreeSet<Reg>,
+    captured_regs: &[bool],
     phi_temps: &mut [TempId],
 ) -> Vec<Option<PhiId>> {
     let carried = plan
@@ -362,7 +354,7 @@ fn coalesce_nested_loop_carried_temps(
     let mut parents = vec![None; carried.len()];
 
     for phi in plan.phis() {
-        if captured_regs.contains(&phi.reg) {
+        if reg_is_captured(captured_regs, phi.reg) {
             continue;
         }
         let Some(binding) = carried.get(phi.phi.index()).copied().flatten() else {
@@ -420,8 +412,9 @@ fn coalesce_nested_loop_carried_temps(
     parents
 }
 
-fn captured_regs(proto: &LoweredProto) -> BTreeSet<Reg> {
-    proto
+fn captured_regs(proto: &LoweredProto) -> Vec<bool> {
+    let mut captured = vec![false; usize::from(proto.frame.max_stack_size)];
+    for reg in proto
         .instrs
         .iter()
         .filter_map(|instr| match instr {
@@ -433,159 +426,227 @@ fn captured_regs(proto: &LoweredProto) -> BTreeSet<Reg> {
             CaptureSource::ByValue(reg) | CaptureSource::ByReference(reg) => Some(reg),
             CaptureSource::Upvalue(_) => None,
         })
-        .collect()
-}
-
-fn coalesce_nested_loop_result_temps(
-    plan: &StructurePlan,
-    captured_regs: &BTreeSet<Reg>,
-    nested_carried_parents: &[Option<PhiId>],
-    phi_temps: &mut [TempId],
-) -> Vec<bool> {
-    let mut coalesced = vec![false; phi_temps.len()];
-    for result in plan.phis() {
-        if captured_regs.contains(&result.reg) {
-            continue;
+    {
+        if reg.index() >= captured.len() {
+            captured.resize(reg.index() + 1, false);
         }
-        let mut owner = None;
-        let mut has_result = false;
-        let compatible = result
-            .incomings
-            .iter()
-            .all(|incoming| match incoming.disposition {
-                PhiIncomingDisposition::RegionResult(region) => {
-                    has_result = true;
-                    owner.replace(region).is_none_or(|owner| owner == region)
-                }
-                PhiIncomingDisposition::Dead => true,
-                _ => false,
-            });
-        let Some(owner) = owner.filter(|_| compatible && has_result) else {
-            continue;
-        };
-
-        let mut candidates = plan
-            .phis_for_region(owner)
-            .iter()
-            .filter_map(|phi| plan.phi_plan(*phi))
-            .filter(|phi| phi.reg == result.reg)
-            .filter(|phi| {
-                loop_carried_binding(plan, phi).is_some_and(|binding| binding.owner == owner)
-                    && nested_carried_parents
-                        .get(phi.phi.index())
-                        .copied()
-                        .flatten()
-                        .is_some()
-                    && phi.incomings.iter().any(|incoming| {
-                        incoming.disposition == PhiIncomingDisposition::LoopCarried(owner)
-                    })
-                    && phi.incomings.iter().all(|incoming| {
-                        incoming.disposition != PhiIncomingDisposition::LoopCarried(owner)
-                            || incoming.value == SsaValue::Phi(result.phi)
-                    })
-            });
-        let Some(carried) = candidates.next() else {
-            continue;
-        };
-        if candidates.next().is_some() {
-            continue;
-        }
-        let Some(carried_temp) = phi_temps.get(carried.phi.index()).copied() else {
-            continue;
-        };
-        if let Some(result_temp) = phi_temps.get_mut(result.phi.index()) {
-            *result_temp = carried_temp;
-            coalesced[result.phi.index()] = true;
-        }
+        captured[reg.index()] = true;
     }
-    coalesced
+    captured
 }
 
-#[derive(Clone, Copy, Default)]
-struct DefBindingCandidate {
-    target: Option<TempId>,
+fn reg_is_captured(captured: &[bool], reg: Reg) -> bool {
+    captured.get(reg.index()).copied().unwrap_or(false)
+}
+
+#[derive(Clone, Copy)]
+struct BindingCandidate<T> {
+    target: Option<T>,
     conflict: bool,
 }
 
-fn coalesce_nested_loop_state_defs(
+impl<T> Default for BindingCandidate<T> {
+    fn default() -> Self {
+        Self {
+            target: None,
+            conflict: false,
+        }
+    }
+}
+
+impl<T: Copy + Eq> BindingCandidate<T> {
+    fn add(&mut self, target: T) {
+        if self.target.is_some_and(|current| current != target) {
+            self.conflict = true;
+        } else {
+            self.target = Some(target);
+        }
+    }
+
+    fn resolved(self) -> Option<T> {
+        (!self.conflict).then_some(self.target).flatten()
+    }
+}
+
+/// 同一未捕获 VM 槽的 loop state 在原定义点直接写回 carried temp；这里只合并 identity，
+/// 不移动表达式。候选从 carried target 出发一次构建，避免 result × owner 的重复扫描。
+fn coalesce_loop_state_temps(
     dataflow: &DataflowFacts,
     plan: &StructurePlan,
-    captured_regs: &BTreeSet<Reg>,
+    captured_regs: &[bool],
     nested_carried_parents: &[Option<PhiId>],
-    nested_results: &[bool],
-    phi_temps: &[TempId],
+    numeric_binding_phis: &[bool],
+    phi_temps: &mut [TempId],
     fixed_temps: &mut [TempId],
 ) {
-    let mut candidates = vec![DefBindingCandidate::default(); fixed_temps.len()];
+    let pure_result_owners = plan
+        .phis()
+        .map(|phi| {
+            let mut owner = None;
+            let compatible = phi
+                .incomings
+                .iter()
+                .all(|incoming| match incoming.disposition {
+                    PhiIncomingDisposition::RegionResult(region) => {
+                        owner.replace(region).is_none_or(|owner| owner == region)
+                    }
+                    PhiIncomingDisposition::Dead => true,
+                    _ => false,
+                });
+            owner.filter(|_| compatible)
+        })
+        .collect::<Vec<_>>();
+    let mut def_candidates = vec![BindingCandidate::default(); fixed_temps.len()];
+    let mut result_candidates = vec![BindingCandidate::default(); phi_temps.len()];
+
     for phi in plan.phis() {
-        if captured_regs.contains(&phi.reg) {
+        if reg_is_captured(captured_regs, phi.reg) || numeric_binding_phis[phi.phi.index()] {
             continue;
         }
-        let carried_owner = loop_carried_binding(plan, phi)
-            .filter(|_| {
-                nested_carried_parents
-                    .get(phi.phi.index())
-                    .copied()
-                    .flatten()
-                    .is_some()
-            })
-            .map(|binding| binding.owner);
-        let result_is_coalesced = nested_results
-            .get(phi.phi.index())
-            .copied()
-            .unwrap_or(false);
-        let Some(target) = phi_temps.get(phi.phi.index()).copied() else {
+        let Some(carried) = loop_carried_binding(plan, phi) else {
+            continue;
+        };
+        let Some(RegionPlan::Loop {
+            body: loop_body, ..
+        }) = plan.region(carried.owner)
+        else {
+            continue;
+        };
+        let target = phi_temps[phi.phi.index()];
+        let has_nested_parent = nested_carried_parents[phi.phi.index()].is_some();
+        let direct_region = if has_nested_parent {
+            carried.owner
+        } else {
+            *loop_body
+        };
+        let mut result_source = None;
+        let mut direct_compatible = true;
+        let mut result_compatible = true;
+        for incoming in &phi.incomings {
+            if incoming.disposition != PhiIncomingDisposition::LoopCarried(carried.owner) {
+                continue;
+            }
+            match incoming.value {
+                SsaValue::Def(def)
+                    if def_is_same_reg_in_region(dataflow, plan, def, phi.reg, direct_region) =>
+                {
+                    result_compatible = false;
+                }
+                SsaValue::Phi(source) => {
+                    direct_compatible = false;
+                    let result_region = pure_result_owners
+                        .get(source.index())
+                        .copied()
+                        .flatten()
+                        .and_then(|owner| {
+                            if source == phi.phi
+                                || plan
+                                    .phi_plan(source)
+                                    .is_none_or(|source| source.reg != phi.reg)
+                            {
+                                None
+                            } else if plan.region_contains(*loop_body, owner) {
+                                Some(owner)
+                            } else if has_nested_parent && owner == carried.owner {
+                                Some(carried.owner)
+                            } else {
+                                None
+                            }
+                        });
+                    let Some(result_region) = result_region else {
+                        result_compatible = false;
+                        continue;
+                    };
+                    if result_source
+                        .replace((source, result_region))
+                        .is_some_and(|current| current != (source, result_region))
+                    {
+                        result_compatible = false;
+                    }
+                }
+                _ => {
+                    direct_compatible = false;
+                    result_compatible = false;
+                }
+            }
+        }
+        if direct_compatible {
+            for incoming in &phi.incomings {
+                if incoming.disposition != PhiIncomingDisposition::LoopCarried(carried.owner) {
+                    continue;
+                }
+                let SsaValue::Def(def) = incoming.value else {
+                    continue;
+                };
+                def_candidates[def.index()].add(target);
+            }
+        } else if result_compatible && let Some((source, result_region)) = result_source {
+            result_candidates[source.index()].add((target, result_region));
+        }
+    }
+
+    let result_targets = result_candidates
+        .into_iter()
+        .map(BindingCandidate::resolved)
+        .collect::<Vec<_>>();
+    for (temp, target) in phi_temps.iter_mut().zip(&result_targets) {
+        if let Some((target, _)) = target {
+            *temp = *target;
+        }
+    }
+
+    for phi in plan.phis() {
+        let Some((target, result_region)) = result_targets[phi.phi.index()] else {
             continue;
         };
         for incoming in &phi.incomings {
-            let owns_def = carried_owner.is_some_and(|owner| {
-                incoming.disposition == PhiIncomingDisposition::LoopCarried(owner)
-            }) || (result_is_coalesced
-                && matches!(
-                    incoming.disposition,
-                    PhiIncomingDisposition::RegionResult(_)
-                ));
             let SsaValue::Def(def) = incoming.value else {
                 continue;
             };
-            if !owns_def
-                || dataflow
-                    .defs
-                    .get(def.index())
-                    .is_none_or(|definition| definition.reg != phi.reg)
+            if !matches!(
+                incoming.disposition,
+                PhiIncomingDisposition::RegionResult(_)
+            ) || !def_is_same_reg_in_region(dataflow, plan, def, phi.reg, result_region)
             {
                 continue;
             }
-            let Some(candidate) = candidates.get_mut(def.index()) else {
-                continue;
-            };
-            if candidate.target.is_some_and(|current| current != target) {
-                candidate.conflict = true;
-            } else {
-                candidate.target = Some(target);
-            }
+            def_candidates[def.index()].add(target);
         }
     }
-    for (temp, candidate) in fixed_temps.iter_mut().zip(candidates) {
-        if !candidate.conflict
-            && let Some(target) = candidate.target
-        {
+
+    for (temp, candidate) in fixed_temps.iter_mut().zip(def_candidates) {
+        if let Some(target) = candidate.resolved() {
             *temp = target;
         }
     }
+}
+
+fn def_is_same_reg_in_region(
+    dataflow: &DataflowFacts,
+    plan: &StructurePlan,
+    def: DefId,
+    reg: Reg,
+    region: RegionId,
+) -> bool {
+    dataflow.defs.get(def.index()).is_some_and(|definition| {
+        definition.reg == reg
+            && plan
+                .region_for_block(definition.block)
+                .is_some_and(|owner| plan.region_contains(region, owner))
+    })
 }
 
 fn repeat_stage_carried_temp(
     plan: &StructurePlan,
     loop_id: LoopPlanId,
     target: PhiId,
-    captured_regs: &BTreeSet<Reg>,
+    captured_regs: &[bool],
     nested_carried_child_owners: &BTreeSet<(PhiId, RegionId)>,
     phi_temps: &[TempId],
 ) -> Option<TempId> {
     let owner = plan.loop_region(loop_id)?;
     let result = plan.phi_plan(target)?;
-    if captured_regs.contains(&result.reg) {
+    if reg_is_captured(captured_regs, result.reg) {
         return None;
     }
     let carried = loop_carried_binding(plan, result)?;

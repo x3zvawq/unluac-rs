@@ -3,6 +3,8 @@
 //! 这里不按 header 搜候选、不做试降回滚，也不把 emitted 集合作为结构决策依据。
 //! region、edge 与 value identity 已在 Structure 冻结；本模块只执行计划并校验引用一致性。
 
+use std::collections::BTreeMap;
+
 use crate::hir::HirLowerError;
 use crate::hir::common::{
     HirBlock, HirExpr, HirGenericFor, HirLValue, HirLabel, HirLabelId, HirNumericFor, HirProtoRef,
@@ -74,6 +76,50 @@ struct PlanLoweringIndex {
 struct PlannedLoopCondition {
     prefix: Vec<HirStmt>,
     cond: HirExpr,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+enum CopyBinding {
+    Temp(TempId),
+    Local(crate::hir::common::LocalId),
+}
+
+fn copy_target_binding(target: &HirLValue) -> Option<CopyBinding> {
+    match target {
+        HirLValue::Temp(temp) => Some(CopyBinding::Temp(*temp)),
+        HirLValue::Local(local) => Some(CopyBinding::Local(*local)),
+        _ => None,
+    }
+}
+
+fn copy_value_binding(value: &HirExpr) -> Option<CopyBinding> {
+    match value {
+        HirExpr::TempRef(temp) => Some(CopyBinding::Temp(*temp)),
+        HirExpr::LocalRef(local) => Some(CopyBinding::Local(*local)),
+        _ => None,
+    }
+}
+
+fn copy_assignment_stmt(targets: Vec<HirLValue>, values: Vec<HirExpr>) -> Option<HirStmt> {
+    if targets.len() != values.len() {
+        return Some(assign_stmt(targets, values));
+    }
+    let mut target_counts = BTreeMap::<CopyBinding, usize>::new();
+    for binding in targets.iter().filter_map(copy_target_binding) {
+        *target_counts.entry(binding).or_default() += 1;
+    }
+    let mut retained_targets = Vec::with_capacity(targets.len());
+    let mut retained_values = Vec::with_capacity(values.len());
+    for (target, value) in targets.into_iter().zip(values) {
+        let binding = copy_target_binding(&target);
+        let is_unique_self_copy = binding == copy_value_binding(&value)
+            && binding.is_some_and(|binding| target_counts.get(&binding) == Some(&1));
+        if !is_unique_self_copy {
+            retained_targets.push(target);
+            retained_values.push(value);
+        }
+    }
+    (!retained_targets.is_empty()).then(|| assign_stmt(retained_targets, retained_values))
 }
 
 struct PlannedForRegions {
@@ -2085,7 +2131,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             targets.push(self.lowering.bindings.lvalue_for_temp(target));
             values.push(value);
         }
-        Ok(vec![assign_stmt(targets, values)])
+        Ok(copy_assignment_stmt(targets, values).into_iter().collect())
     }
 
     fn verify_condition_plan(
@@ -2247,22 +2293,62 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         }
     }
 
-    /// 条件 region 会吸收内部纯 `Move`，edge copy 必须沿 SSA 恒等链读取真实来源，
-    /// 不能引用没有物化语句的中间 temp。
+    /// 条件 region 会吸收内部纯 `Move`，通常必须沿 SSA 恒等链读取真实来源。若 bindings
+    /// 已让一个未吸收 def 在原指令处直接写入 copy target，则必须读取该 target；再次穿透
+    /// Move 会复制赋值并让后续 local 提升拆散 loop-carried identity。
     fn edge_copy_expr(
         &self,
         owner: RegionId,
         source_block: BlockRef,
+        target: TempId,
         value: SsaValue,
     ) -> Result<HirExpr, HirLowerError> {
         let value = match value {
-            SsaValue::Def(def) => self
-                .index
-                .canonical_move_source
-                .get(def.index())
-                .copied()
-                .flatten()
-                .unwrap_or(value),
+            SsaValue::Def(def) => {
+                let fixed = self
+                    .lowering
+                    .bindings
+                    .fixed_temps
+                    .get(def.index())
+                    .copied()
+                    .ok_or(HirLowerError::InvalidPlanRegion {
+                        proto: self.proto.index(),
+                        region: owner.index(),
+                        detail: "edge copy source has no fixed-temp binding",
+                    })?;
+                let definition = self.lowering.dataflow.defs.get(def.index()).ok_or(
+                    HirLowerError::InvalidPlanRegion {
+                        proto: self.proto.index(),
+                        region: owner.index(),
+                        detail: "edge copy source references a missing SSA def",
+                    },
+                )?;
+                let absorbed = self
+                    .index
+                    .absorbed_region_result_moves
+                    .get(definition.instr.index())
+                    .copied()
+                    .ok_or(HirLowerError::InvalidPlanRegion {
+                        proto: self.proto.index(),
+                        region: owner.index(),
+                        detail: "edge copy source has no absorption disposition",
+                    })?;
+                let writes_fixed_temp = self
+                    .lowering
+                    .bindings
+                    .local_for_reg_in_block(definition.block, definition.reg)
+                    .is_none();
+                if fixed == target && !absorbed && writes_fixed_temp {
+                    value
+                } else {
+                    self.index
+                        .canonical_move_source
+                        .get(def.index())
+                        .copied()
+                        .flatten()
+                        .unwrap_or(value)
+                }
+            }
             _ => value,
         };
         let reg = self.ssa_reg(owner, value)?;
@@ -3015,6 +3101,17 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             {
                 continue;
             }
+            let phi_target = self
+                .lowering
+                .bindings
+                .phi_temps
+                .get(copy.phi_id.index())
+                .copied()
+                .ok_or(HirLowerError::InvalidPlanRegion {
+                    proto: self.proto.index(),
+                    region: owner.index(),
+                    detail: "edge phi copy target has no HIR temp binding",
+                })?;
             let source_reg = self.ssa_reg(owner, copy.value)?;
             let value = if let Some(local) = self
                 .lowering
@@ -3023,7 +3120,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             {
                 HirExpr::LocalRef(local)
             } else {
-                self.edge_copy_expr(owner, source_block, copy.value)?
+                self.edge_copy_expr(owner, source_block, phi_target, copy.value)?
             };
             let staged_target = match effective_transfer {
                 EdgeTransfer::Break(loop_region) => self
@@ -3039,18 +3136,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             let target = if let Some(stage) = staged_target {
                 HirLValue::Temp(stage)
             } else {
-                let target = self
-                    .lowering
-                    .bindings
-                    .phi_temps
-                    .get(copy.phi_id.index())
-                    .copied()
-                    .ok_or(HirLowerError::InvalidPlanRegion {
-                        proto: self.proto.index(),
-                        region: owner.index(),
-                        detail: "edge phi copy target has no HIR temp binding",
-                    })?;
-                self.lowering.bindings.lvalue_for_temp(target)
+                self.lowering.bindings.lvalue_for_temp(phi_target)
             };
             targets.push(target);
             values.push(value);
@@ -3073,18 +3159,6 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                         .invalid_region(owner, "iteration edge action owner is not a loop region");
                 }
             }
-            let value = match source {
-                LoopValueSource::Ssa(value) if value == incoming => {
-                    self.edge_copy_expr(owner, source_block, value)?
-                }
-                LoopValueSource::Ssa(_) => {
-                    return self.invalid_region(
-                        owner,
-                        "iteration edge source changed its canonical SSA identity",
-                    );
-                }
-                source => self.lower_loop_value_source(loop_region, source)?,
-            };
             let target = self
                 .lowering
                 .bindings
@@ -3096,14 +3170,22 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                     region: owner.index(),
                     detail: "iteration edge target has no HIR temp binding",
                 })?;
+            let value = match source {
+                LoopValueSource::Ssa(value) if value == incoming => {
+                    self.edge_copy_expr(owner, source_block, target, value)?
+                }
+                LoopValueSource::Ssa(_) => {
+                    return self.invalid_region(
+                        owner,
+                        "iteration edge source changed its canonical SSA identity",
+                    );
+                }
+                source => self.lower_loop_value_source(loop_region, source)?,
+            };
             targets.push(self.lowering.bindings.lvalue_for_temp(target));
             values.push(value);
         }
-        Ok(if targets.is_empty() {
-            Vec::new()
-        } else {
-            vec![assign_stmt(targets, values)]
-        })
+        Ok(copy_assignment_stmt(targets, values).into_iter().collect())
     }
 
     fn edge_requirement_matches(&self, edge: EdgeRef, transfer: EdgeTransfer) -> bool {

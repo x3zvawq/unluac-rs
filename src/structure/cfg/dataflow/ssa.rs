@@ -22,6 +22,7 @@ pub(super) struct SsaAnalysis {
     pub(super) def_phi_uses: Vec<Vec<PhiId>>,
     pub(super) phi_uses: Vec<Vec<UseSite>>,
     pub(super) phi_phi_uses: Vec<Vec<PhiId>>,
+    pub(super) phi_truly_dead: Vec<bool>,
     pub(super) phi_use_blocks: Vec<Option<BlockRef>>,
 }
 
@@ -80,6 +81,7 @@ pub(super) fn build_ssa(
     let phi_block_ranges = super::index_phi_candidate_ranges(cfg, &phis);
     let (def_uses, def_phi_uses, phi_uses, phi_phi_uses, phi_use_blocks) =
         index_uses(cfg, defs.len(), &phis, &use_values)?;
+    let phi_truly_dead = compute_truly_dead_phis(&phis, &phi_uses);
 
     Ok(SsaAnalysis {
         phis,
@@ -91,8 +93,34 @@ pub(super) fn build_ssa(
         def_phi_uses,
         phi_uses,
         phi_phi_uses,
+        phi_truly_dead,
         phi_use_blocks,
     })
+}
+
+/// instruction use 是活性种子；存活 phi 的 incoming source 也必须存活。
+/// `PhiId` 已在 compact 后稠密化，因此整份闭包只需一张 bool arena。
+fn compute_truly_dead_phis(phis: &[PhiCandidate], phi_uses: &[Vec<UseSite>]) -> Vec<bool> {
+    let mut alive = phi_uses
+        .iter()
+        .map(|uses| !uses.is_empty())
+        .collect::<Vec<_>>();
+    let mut pending = alive
+        .iter()
+        .enumerate()
+        .filter_map(|(index, alive)| alive.then_some(PhiId(index)))
+        .collect::<VecDeque<_>>();
+    while let Some(phi_id) = pending.pop_front() {
+        for incoming in &phis[phi_id.index()].incoming {
+            if let SsaValue::Phi(upstream) = incoming.value
+                && !alive[upstream.index()]
+            {
+                alive[upstream.index()] = true;
+                pending.push_back(upstream);
+            }
+        }
+    }
+    alive.into_iter().map(|alive| !alive).collect()
 }
 
 fn place_phis(

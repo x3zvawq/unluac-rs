@@ -297,7 +297,6 @@ pub(super) fn finalize_phi_ownership(
     plan: &mut StructurePlan,
 ) -> Result<(), StructureError> {
     validate_phi_arena(dataflow)?;
-    let dead_phis = dataflow.compute_truly_dead_phis();
     let island_regions = regions_owned_by_island_graph(plan)?;
     let owner_index = RegionOwnerIndex::new(plan)?;
     let mut dispositions = dataflow
@@ -307,7 +306,7 @@ pub(super) fn finalize_phi_ownership(
         .collect::<Vec<Vec<Option<PhiIncomingDisposition>>>>();
 
     for phi in &dataflow.phi_candidates {
-        if dead_phis.contains(&phi.id) {
+        if dataflow.phi_is_truly_dead(phi.id) {
             dispositions[phi.id.index()].fill(Some(PhiIncomingDisposition::Dead));
             continue;
         }
@@ -404,7 +403,7 @@ pub(super) fn finalize_phi_ownership(
     plan.forward_action_head = build_forwarded_action_heads(plan)?;
     install_phi_plans(cfg, dataflow, plan, dispositions)?;
     install_unresolved_requirements(plan, dataflow, unresolved)?;
-    validate_phi_ownership(cfg, dataflow, plan, &dead_phis)
+    validate_phi_ownership(cfg, dataflow, plan)
 }
 
 fn collect_dense_edge_actions(
@@ -1894,7 +1893,6 @@ fn validate_phi_ownership(
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     plan: &StructurePlan,
-    dead_phis: &BTreeSet<PhiId>,
 ) -> Result<(), StructureError> {
     if plan.phis.len() != dataflow.phi_candidates.len()
         || plan.phis_by_block.len() != cfg.blocks.len()
@@ -1995,7 +1993,7 @@ fn validate_phi_ownership(
                             Some(EdgeTransfer::Unreachable)
                         )
                     });
-                    if !dead_phis.contains(&phi.id) && !unreachable_edge {
+                    if !dataflow.phi_is_truly_dead(phi.id) && !unreachable_edge {
                         return Err(StructureError::invalid(format!(
                             "live reachable {} incoming #{incoming_index} is dead",
                             phi.id
