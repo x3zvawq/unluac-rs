@@ -2,6 +2,8 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-contains [[p1_0:add("button")]]
+-- unluac: expect-not-contains [[local r1_1 = p1_0]]
 
 local function maybe_add_button(state)
     local enabled = state.enabled

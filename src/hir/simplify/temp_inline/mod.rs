@@ -18,6 +18,8 @@
 //! Lua 5.2–5.5 的单 upvalue table 左值可把相邻 producer 收回 key。三项仍要求唯一消费
 //! 且不绕过原求值点；前两项不允许相关 home 被跨越区间写入或 capture，table key 则
 //! 继续服从内部前缀顺序证明。
+//! method 协议的 callee base 与隐式首参虽是两个语法 use，却只求值一次 receiver；相邻
+//! direct binding 快照可在严格匹配这对 use 后原子收回，普通点调用仍按两次读取处理。
 //! branch-values 的定向入口只重用同一证明去处理本轮新暴露的根级 global-call run 或
 //! 单值 terminal return，不递归，也不开放其它普通内联 site。
 
@@ -40,8 +42,9 @@ use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 use self::rewrite::replace_temp_in_stmt;
 use self::site::{
     InlineSite, expr_touches_temp, inline_site_in_repeat_condition, inline_site_in_stmt,
-    is_stable_inline_value, puc_upvalue_table_key_with_deferred_base_read,
-    temp_precedes_observable_eval_in_expr, temp_precedes_observable_eval_in_stmt,
+    is_direct_method_receiver_snapshot, is_stable_inline_value,
+    puc_upvalue_table_key_with_deferred_base_read, temp_precedes_observable_eval_in_expr,
+    temp_precedes_observable_eval_in_stmt,
 };
 use self::usage::{
     TempUseScratch, collect_expr_temp_uses_summary, collect_stmt_temp_uses, inline_candidate,
@@ -278,8 +281,11 @@ fn inline_temps_in_block(
             // 后续再也没有地方记录“状态已经更新过”。
             // 因此这里只允许折叠真正的 forwarding temp，不折叠自引用状态槽位。
             && !expr_touches_temp(value, temp)
-            && total_use_count(temp, live_use_counts) == 1
             && let Some(next_stmt) = kept_rev.last()
+            && let use_count = total_use_count(temp, live_use_counts)
+            && (use_count == 1
+                || (use_count == 2
+                    && is_direct_method_receiver_snapshot(next_stmt, temp, value)))
             && let Some(site) = inline_site_in_stmt(next_stmt, temp)
             && workspace
                 .scope
@@ -308,6 +314,13 @@ fn inline_temps_in_block(
                 call_callee_materialized_at = Some(index);
             }
             remove_live_use(live_use_counts, temp);
+            if use_count == 2 {
+                // method receiver 会把 replacement 同时写入 callee base 与隐式首参；
+                // 删除原赋值只抵消其中一份，因此需把新增的语法 use 记回本轮计数。
+                collect_expr_temp_uses_summary(value, &mut workspace.uses)
+                    .add_to_totals(live_use_counts);
+                remove_live_use(live_use_counts, temp);
+            }
             changed = true;
             continue;
         }

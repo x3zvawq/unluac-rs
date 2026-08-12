@@ -341,10 +341,7 @@ impl<'a> AstLowerer<'a> {
         proto_index: usize,
         call: &HirCallExpr,
     ) -> Result<AstCallKind, AstLowerError> {
-        let method_name = call
-            .method_name
-            .as_deref()
-            .filter(|method_name| method_sugar_matches(call, method_name));
+        let method_name = call.method_receiver().map(|(_, method_name)| method_name);
         let mut args =
             self.lower_value_pack(proto_index, &call.args, PackLoweringContext::Ordinary)?;
 
@@ -414,19 +411,6 @@ fn build_balanced_logical_expr(
         LogicalKind::And => AstExpr::LogicalAnd(logical),
         LogicalKind::Or => AstExpr::LogicalOr(logical),
     }
-}
-
-fn method_sugar_matches(call: &HirCallExpr, method_name: &str) -> bool {
-    if !call.method {
-        return false;
-    }
-    let Some(receiver) = call.args.first() else {
-        return false;
-    };
-    matches!(&call.callee,
-        HirExpr::TableAccess(access)
-            if access.base == *receiver
-                && matches!(&access.key, HirExpr::String(key) if key.as_bytes() == method_name.as_bytes()))
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

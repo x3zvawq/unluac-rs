@@ -297,6 +297,23 @@ pub struct HirCallExpr {
     pub method_name: Option<String>,
 }
 
+impl HirCallExpr {
+    /// 返回由前层 method 协议证明的 receiver 与字段名。
+    pub(crate) fn method_receiver(&self) -> Option<(&HirExpr, &str)> {
+        if !self.method {
+            return None;
+        }
+        let method_name = self.method_name.as_deref()?;
+        let receiver = self.args.first()?;
+        matches!(&self.callee,
+            HirExpr::TableAccess(access)
+                if access.base == *receiver
+                    && matches!(&access.key,
+                        HirExpr::String(key) if key.as_bytes() == method_name.as_bytes()))
+        .then_some((receiver, method_name))
+    }
+}
+
 /// Lua 表达式列表：若存在尾包，它是列表中唯一会展开的值。
 ///
 /// 普通 `HirExpr` 始终只产生一个标量值；开放结果不能再借普通 temp/local 保存。

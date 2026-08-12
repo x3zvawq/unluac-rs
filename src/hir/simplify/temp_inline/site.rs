@@ -54,6 +54,44 @@ pub(super) fn inline_site_in_repeat_condition(cond: &HirExpr, temp: TempId) -> O
     find_site_in_expr(cond, temp, InlineSite::LoopCondition)
 }
 
+/// 判断相邻赋值是否只是在 method 协议前冻结 direct binding receiver。
+///
+/// method call 在 HIR 中同时保留 callee base 与隐式首参，因此这里的两个 temp use
+/// 最终只对应一次源码 receiver 求值。普通点调用没有这层协议，不能共享该合同。
+pub(super) fn is_direct_method_receiver_snapshot(
+    stmt: &HirStmt,
+    temp: TempId,
+    value: &HirExpr,
+) -> bool {
+    if !matches!(
+        value,
+        HirExpr::ParamRef(_) | HirExpr::LocalRef(_) | HirExpr::UpvalueRef(_) | HirExpr::TempRef(_)
+    ) {
+        return false;
+    }
+    let call = match stmt {
+        HirStmt::CallStmt(call_stmt) => Some(&call_stmt.call),
+        HirStmt::LocalDecl(local_decl) => direct_call_expr(&local_decl.values),
+        HirStmt::Assign(assign) => direct_call_expr(&assign.values),
+        HirStmt::Return(ret) => direct_call_expr(&ret.values),
+        _ => None,
+    };
+    matches!(
+        call.and_then(HirCallExpr::method_receiver),
+        Some((HirExpr::TempRef(receiver), _)) if *receiver == temp
+    )
+}
+
+fn direct_call_expr(values: &crate::hir::common::HirValuePack) -> Option<&HirCallExpr> {
+    if values.expr_len() != 1 {
+        return None;
+    }
+    match values.first()? {
+        HirExpr::Call(call) => Some(call),
+        _ => None,
+    }
+}
+
 pub(super) fn temp_precedes_observable_eval_in_stmt(
     stmt: &HirStmt,
     temp: TempId,

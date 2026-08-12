@@ -57,6 +57,9 @@ print(
 )
 
 -- regress_172_temp_inline_eval_regions#5: 方法 lookup 发生在显式参数前，不能越过前置 producer
+-- unluac: expect-not-contains [[local r0_15 = r0_13]]
+-- unluac: expect-not-contains [[local r0_16 = r0_14]]
+-- unluac: expect-not-contains [[local r0_17 = r0_15]]
 local method_log = {}
 local method_receiver = setmetatable({}, {
     __index = function(_, name)
