@@ -1,9 +1,11 @@
-//! 这个 crate 承载仓库测试共享的轻量辅助函数。
+//! 这个 crate 承载仓库源码 case 的统一端到端测试流水线。
 //!
-//! 这些 helper 只负责测试夹具解码这类稳定、无业务语义的重复逻辑，避免 unit
-//! 和 regression 两套入口各自复制同一份样板代码。
+//! unit 与 regression 共用官方 toolchain 编译、反编译、回编译、执行和可读性/结构合同；
+//! 少数源码编译器无法产出的 VM 内建协议也只能由 manifest 显式授权，再从同一源码通过
+//! pinned 运行时动态导出临时 chunk。这里不提交 bytecode fixture，也不改变业务 lowering。
 #![allow(dead_code)]
 
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,6 +22,10 @@ use unluac::generate::{GenerateMode, GeneratedChunkKind, LuauVectorConstructor, 
 use unluac::structure::{
     ControlFlowFeature, LoopVmProtocol, RegionId, RegionPlan, StructureFacts, StructurePlan,
     UnstructuredLayoutItem,
+};
+use unluac::transformer::{
+    AccessBase, AccessKey, GetTableKind, LowInstr, Reg, SetTableKind, TypeGuardKind, ValueOperand,
+    format_low_instr,
 };
 
 #[allow(dead_code)]
@@ -186,6 +192,7 @@ pub enum FailureKind {
     RecompileConvergenceMismatch,
     ReadabilityAssertionFailed,
     StructureContractAssertionFailed,
+    LuaJitBuiltinContractAssertionFailed,
 }
 
 impl FailureKind {
@@ -220,6 +227,9 @@ impl FailureKind {
             Self::RecompileConvergenceMismatch => "recompile-convergence-mismatch",
             Self::ReadabilityAssertionFailed => "readability-assertion-failed",
             Self::StructureContractAssertionFailed => "structure-contract-assertion-failed",
+            Self::LuaJitBuiltinContractAssertionFailed => {
+                "luajit-builtin-contract-assertion-failed"
+            }
         }
     }
 }
@@ -744,7 +754,21 @@ pub(crate) fn run_lua_file(
 ) -> Result<LuaCommandOutput, String> {
     let toolchain = lua_toolchain(dialect_label)?;
     let runtime = lua_tool_path(dialect_label, toolchain.runtime_name)?;
-    run_command(&runtime, &[input_path.as_os_str()], toolchain.runtime_name)
+    run_command(&runtime, [input_path.as_os_str()], toolchain.runtime_name)
+}
+
+fn run_lua_file_with_args(
+    dialect_label: &str,
+    input_path: &Path,
+    args: &[&str],
+) -> Result<LuaCommandOutput, String> {
+    let toolchain = lua_toolchain(dialect_label)?;
+    let runtime = lua_tool_path(dialect_label, toolchain.runtime_name)?;
+    run_command(
+        &runtime,
+        std::iter::once(input_path.as_os_str()).chain(args.iter().map(OsStr::new)),
+        toolchain.runtime_name,
+    )
 }
 
 /// 使用 vendored 的 `luac` 把一个仓库内 case 编译到 health suite 的稳定产物路径。
@@ -1283,8 +1307,175 @@ pub(crate) fn run_pipeline_case(
         prev_generated_source = recompile_generated.source.clone();
     }
 
+    if entry.expectation == LuaCaseExpectation::LuaJitBuiltinTableRemove {
+        assert_luajit_table_remove_contract(entry, suite_label)?;
+    }
+
     let proto_count = count_output_tags(&baseline.source_output.stdout);
     Ok(TestSuccess { proto_count })
+}
+
+fn assert_luajit_table_remove_contract(
+    entry: &LuaCaseManifestEntry,
+    suite_label: &str,
+) -> Result<(), TestFailure> {
+    if entry.dialect != LuaCaseDialect::Luajit {
+        return Err(luajit_builtin_contract_failure(
+            entry,
+            "table.remove contract requires the LuaJIT dialect",
+        ));
+    }
+
+    let source = repo_root().join(entry.path);
+    let dump = run_lua_file_with_args("luajit", &source, &["--dump-table-remove"])
+        .map_err(|error| luajit_builtin_contract_failure(entry, error))?;
+    if !dump.success() {
+        return Err(luajit_builtin_contract_failure(
+            entry,
+            format!(
+                "official runtime failed to dump table.remove\n{}",
+                dump.render()
+            ),
+        ));
+    }
+
+    let artifact = suite_artifact_path(
+        suite_label,
+        "luajit",
+        entry.variant,
+        "toolchain-fixture",
+        entry.path,
+        "luajit",
+    );
+    write_output_file(&artifact, &dump.stdout).map_err(|error| {
+        luajit_builtin_contract_failure(
+            entry,
+            format!("write {} failed: {error}", repo_relative_display(&artifact)),
+        )
+    })?;
+
+    let mut options = decompile_options(entry);
+    options.generate.mode = GenerateMode::Permissive;
+    let result = decompile(&dump.stdout, options).map_err(|error| {
+        luajit_builtin_contract_failure(
+            entry,
+            format!(
+                "decompile {} failed: {error}",
+                repo_relative_display(&artifact)
+            ),
+        )
+    })?;
+    assert_auto_dialect(
+        "LuaJIT table.remove fixture",
+        result.state.dialect,
+        DecompileDialect::Luajit,
+        entry.path,
+    )?;
+
+    let lowered = result.state.lowered.as_ref().ok_or_else(|| {
+        luajit_builtin_contract_failure(entry, "generate stage returned no lowered chunk")
+    })?;
+    let generated = result.state.generated.as_ref().ok_or_else(|| {
+        luajit_builtin_contract_failure(entry, "generate stage returned no generated chunk")
+    })?;
+
+    let mut guards = Vec::new();
+    let mut raw_gets = Vec::new();
+    let mut raw_sets = Vec::new();
+    for instr in &lowered.main.instrs {
+        match instr {
+            LowInstr::TypeGuard(instr) => guards.push((instr.subject, instr.kind)),
+            LowInstr::GetTable(instr) if instr.kind == GetTableKind::Raw => {
+                raw_gets.push((instr.dst, instr.base, instr.key));
+            }
+            LowInstr::SetTable(instr) if instr.kind == SetTableKind::Raw => {
+                raw_sets.push((instr.base, instr.key, instr.value));
+            }
+            _ => {}
+        }
+    }
+
+    let guards_match = matches!(
+        guards.as_slice(),
+        [
+            (Reg(0), TypeGuardKind::Table),
+            (Reg(1), TypeGuardKind::Integer | TypeGuardKind::Number)
+        ]
+    );
+    let expected_raw_gets = [
+        (Reg(3), AccessBase::Reg(Reg(0)), AccessKey::Reg(Reg(2))),
+        (Reg(3), AccessBase::Reg(Reg(0)), AccessKey::Reg(Reg(1))),
+        (Reg(9), AccessBase::Reg(Reg(0)), AccessKey::Reg(Reg(7))),
+    ];
+    let expected_raw_sets = [
+        (
+            AccessBase::Reg(Reg(0)),
+            AccessKey::Reg(Reg(2)),
+            ValueOperand::Reg(Reg(4)),
+        ),
+        (
+            AccessBase::Reg(Reg(0)),
+            AccessKey::Reg(Reg(8)),
+            ValueOperand::Reg(Reg(9)),
+        ),
+        (
+            AccessBase::Reg(Reg(0)),
+            AccessKey::Reg(Reg(2)),
+            ValueOperand::Reg(Reg(4)),
+        ),
+    ];
+    if !guards_match || raw_gets != expected_raw_gets || raw_sets != expected_raw_sets {
+        let lir = lowered
+            .main
+            .instrs
+            .iter()
+            .map(format_low_instr)
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(luajit_builtin_contract_failure(
+            entry,
+            format!(
+                "typed LIR contract mismatch in {}\nguards={guards:?}\nraw_gets={raw_gets:?}\nraw_sets={raw_sets:?}\nlow-ir:\n{lir}",
+                repo_relative_display(&artifact)
+            ),
+        ));
+    }
+
+    const RAW_READ_DIAGNOSTIC: &str = "LuaJIT raw table read has no exact Lua source form";
+    const RAW_WRITE_DIAGNOSTIC: &str = "LuaJIT raw table write has no exact Lua source form";
+    let read_diagnostics = generated.source.matches(RAW_READ_DIAGNOSTIC).count();
+    let write_diagnostics = generated.source.matches(RAW_WRITE_DIAGNOSTIC).count();
+    if generated.kind != GeneratedChunkKind::DiagnosticPseudocode
+        || read_diagnostics != 3
+        || write_diagnostics != 3
+    {
+        return Err(luajit_builtin_contract_failure(
+            entry,
+            format!(
+                "raw access diagnostic contract mismatch in {}: kind={:?}, reads={read_diagnostics}, writes={write_diagnostics}\n{}",
+                repo_relative_display(&artifact),
+                generated.kind,
+                generated.source
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn luajit_builtin_contract_failure(
+    entry: &LuaCaseManifestEntry,
+    detail: impl Into<String>,
+) -> TestFailure {
+    let detail = detail.into();
+    TestFailure::new(
+        FailureKind::LuaJitBuiltinContractAssertionFailed,
+        "LuaJIT builtin contract failed",
+        format!(
+            "LuaJIT builtin contract failed for {}: {detail}",
+            entry.path
+        ),
+    )
 }
 
 fn run_unsupported_island_contract(
@@ -1938,11 +2129,15 @@ fn run_compiler_to_output_path(
     }
 }
 
-fn run_command(
+fn run_command<I, S>(
     command_path: &Path,
-    args: &[&std::ffi::OsStr],
+    args: I,
     tool_name: &str,
-) -> Result<LuaCommandOutput, String> {
+) -> Result<LuaCommandOutput, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let output = Command::new(command_path)
         .args(args)
         .output()

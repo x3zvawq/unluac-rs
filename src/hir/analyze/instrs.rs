@@ -171,8 +171,8 @@ pub(super) fn lower_regular_instr(
                 }),
             }))]
         }
-        LowInstr::TypeGuard(type_guard) => vec![HirStmt::CallStmt(Box::new(HirCallStmt {
-            call: HirCallExpr {
+        LowInstr::TypeGuard(type_guard) => {
+            let call = HirCallExpr {
                 callee: unresolved_expr(format!(
                     "LuaJIT {} type guard has no exact Lua source form",
                     type_guard.kind.label()
@@ -186,8 +186,13 @@ pub(super) fn lower_regular_instr(
                 .into(),
                 method: false,
                 method_name: None,
-            },
-        }))],
+            };
+            if type_guard.kind.normalizes_subject() {
+                fixed_assign(lowering, instr_ref, vec![HirExpr::Call(Box::new(call))])
+            } else {
+                vec![HirStmt::CallStmt(Box::new(HirCallStmt { call }))]
+            }
+        }
         LowInstr::NewTable(_new_table) => fixed_assign(
             lowering,
             instr_ref,

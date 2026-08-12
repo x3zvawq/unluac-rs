@@ -567,6 +567,11 @@ impl TypeGuardKind {
             Self::Number => "number",
         }
     }
+
+    /// 成功路径会把参数槽规范化成目标类型；后续读取必须使用 guard 之后的 SSA 值。
+    pub const fn normalizes_subject(self) -> bool {
+        matches!(self, Self::String | Self::Integer | Self::Number)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]

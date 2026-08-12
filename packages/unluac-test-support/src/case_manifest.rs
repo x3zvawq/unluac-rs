@@ -90,6 +90,7 @@ impl LuaCaseMatrixEntry {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum LuaCaseExpectation {
     Source,
+    LuaJitBuiltinTableRemove,
     UnsupportedIsland { jump_pc: usize, target_pc: usize },
 }
 
@@ -315,6 +316,11 @@ const UNIT_CASES: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new("tests/unit-case/lua55_01_global.lua", PUC_LUA_GE_55),
     LuaCaseMatrixEntry::new("tests/unit-case/lua55_02_named_vararg.lua", PUC_LUA_GE_55),
     LuaCaseMatrixEntry::new("tests/unit-case/luajit_01.lua", LUAJIT_ONLY),
+    LuaCaseMatrixEntry::new(
+        "tests/unit-case/luajit_02_ljlib_table_remove.lua",
+        LUAJIT_ONLY,
+    )
+    .with_expectation(LuaCaseExpectation::LuaJitBuiltinTableRemove),
     LuaCaseMatrixEntry::new("tests/unit-case/luau_01.lua", LUAU_ONLY),
     LuaCaseMatrixEntry::new("tests/unit-case/luau_02_vector.lua", LUAU_ONLY)
         .with_options(LUAU_VECTOR_OPTIONS),

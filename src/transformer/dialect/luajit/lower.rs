@@ -4,6 +4,7 @@
 //! - calls/returns/vararg 用 LuaJIT 自己的 B/C 约定解释；
 //! - compare/test + helper JMP 直接压成结构化 branch；
 //! - LOOP/ILOOP/JLOOP 只当 targetable marker，不伪造成额外语义；
+//! - ISTYPE/ISNUM 保留内建 guard 与可能的原槽规范化，不猜普通 Lua helper；
 //! - TDUP 在这里展开成 `NewTable + SetTable*`，不把模板表细节泄漏到后层。
 
 use crate::parser::{
@@ -1449,7 +1450,7 @@ fn lua_jit_type_guard_kind(
         (LuaJitOpcode::IsType, 9) => TypeGuardKind::Function,
         (LuaJitOpcode::IsType, 12) => TypeGuardKind::Table,
         (LuaJitOpcode::IsType, 14) => TypeGuardKind::Integer,
-        (LuaJitOpcode::IsType, 15) | (LuaJitOpcode::IsNum, 15) => TypeGuardKind::Number,
+        (LuaJitOpcode::IsNum, 15) => TypeGuardKind::Number,
         _ => return Err(TransformError::InvalidTypeGuard { raw_pc, type_id }),
     };
     Ok(kind)

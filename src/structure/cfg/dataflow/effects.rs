@@ -1,3 +1,9 @@
+//! low-IR 指令的寄存器读写与副作用摘要。
+//!
+//! 这里把 Transformer 已冻结的单条指令语义投影成 canonical SSA 和后续移动安全性所需的
+//! 稠密事实；不识别控制结构，也不根据 opcode 外形猜隐式 owner。例如可能原槽转换的
+//! `TypeGuard` 同时读取并定义 subject，而纯类型检查只保留读取。
+
 use super::*;
 use crate::structure::StructureError;
 
@@ -95,6 +101,9 @@ pub(super) fn compute_instr_effect(instr: &LowInstr) -> InstrEffect {
         }
         LowInstr::TypeGuard(instr) => {
             effect.fixed_uses.insert(instr.subject);
+            if instr.kind.normalizes_subject() {
+                effect.fixed_must_defs.insert(instr.subject);
+            }
         }
         LowInstr::NewTable(instr) => {
             effect.fixed_must_defs.insert(instr.dst);
