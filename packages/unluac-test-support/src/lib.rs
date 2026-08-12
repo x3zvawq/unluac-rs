@@ -1,8 +1,9 @@
 //! 这个 crate 承载仓库源码 case 的统一端到端测试流水线。
 //!
 //! unit 与 regression 共用官方 toolchain 编译、反编译、回编译、执行和可读性/结构合同；
-//! 少数源码编译器无法产出的 VM 内建协议也只能由 manifest 显式授权，再从同一源码通过
-//! pinned 运行时动态导出临时 chunk。这里不提交 bytecode fixture，也不改变业务 lowering。
+//! 少数 VM 内建协议或普通小样例难以稳定触发的宽度边界，只能由 manifest 显式授权，
+//! 再从同一源码通过 pinned 运行时动态导出临时 chunk。这里不提交 bytecode fixture，
+//! 也不改变业务 lowering。
 #![allow(dead_code)]
 
 use std::ffi::OsStr;
@@ -19,13 +20,14 @@ use unluac::decompile::{
     DecompileDialect, DecompileError, DecompileOptions, DecompileStage, decompile,
 };
 use unluac::generate::{GenerateMode, GeneratedChunkKind, LuauVectorConstructor, LuauVectorSize};
+use unluac::parser::DialectConstPoolExtra;
 use unluac::structure::{
     ControlFlowFeature, LoopVmProtocol, RegionId, RegionPlan, StructureFacts, StructurePlan,
     UnstructuredLayoutItem,
 };
 use unluac::transformer::{
-    AccessBase, AccessKey, GetTableKind, LowInstr, Reg, SetTableKind, TypeGuardKind, ValueOperand,
-    format_low_instr,
+    AccessBase, AccessKey, CallKind, GetTableKind, LowInstr, LoweredChunk, LoweredProto, Reg,
+    SetTableKind, TypeGuardKind, ValueOperand, ValuePack, format_low_instr,
 };
 
 #[allow(dead_code)]
@@ -193,6 +195,7 @@ pub enum FailureKind {
     ReadabilityAssertionFailed,
     StructureContractAssertionFailed,
     LuaJitBuiltinContractAssertionFailed,
+    LuaJitMethodProtocolContractAssertionFailed,
 }
 
 impl FailureKind {
@@ -229,6 +232,9 @@ impl FailureKind {
             Self::StructureContractAssertionFailed => "structure-contract-assertion-failed",
             Self::LuaJitBuiltinContractAssertionFailed => {
                 "luajit-builtin-contract-assertion-failed"
+            }
+            Self::LuaJitMethodProtocolContractAssertionFailed => {
+                "luajit-method-protocol-contract-assertion-failed"
             }
         }
     }
@@ -1307,8 +1313,14 @@ pub(crate) fn run_pipeline_case(
         prev_generated_source = recompile_generated.source.clone();
     }
 
-    if entry.expectation == LuaCaseExpectation::LuaJitBuiltinTableRemove {
-        assert_luajit_table_remove_contract(entry, suite_label)?;
+    match entry.expectation {
+        LuaCaseExpectation::LuaJitBuiltinTableRemove => {
+            assert_luajit_table_remove_contract(entry, suite_label)?;
+        }
+        LuaCaseExpectation::LuaJitMethodProtocol => {
+            assert_luajit_method_protocol_contract(entry, suite_label)?;
+        }
+        LuaCaseExpectation::Source | LuaCaseExpectation::UnsupportedIsland { .. } => {}
     }
 
     let proto_count = count_output_tags(&baseline.source_output.stdout);
@@ -1463,6 +1475,173 @@ fn assert_luajit_table_remove_contract(
     Ok(())
 }
 
+fn assert_luajit_method_protocol_contract(
+    entry: &LuaCaseManifestEntry,
+    suite_label: &str,
+) -> Result<(), TestFailure> {
+    if entry.dialect != LuaCaseDialect::Luajit {
+        return Err(luajit_method_contract_failure(
+            entry,
+            "method protocol contract requires the LuaJIT dialect",
+        ));
+    }
+
+    let lowered = lower_luajit_method_fixture(
+        entry,
+        suite_label,
+        "large-method-fixture",
+        "--dump-large-method",
+    )?;
+
+    let signatures = lowered
+        .main
+        .children
+        .iter()
+        .map(large_method_signature)
+        .collect::<Vec<_>>();
+    if signatures.len() != 2
+        || !signatures.contains(&Some(LargeMethodSignature::Method))
+        || !signatures.contains(&Some(LargeMethodSignature::Dot))
+    {
+        return Err(luajit_method_contract_failure(
+            entry,
+            format!("large-key method/dot LIR signatures mismatch: {signatures:?}"),
+        ));
+    }
+    let bypassed = lower_luajit_method_fixture(
+        entry,
+        suite_label,
+        "bypassed-method-fixture",
+        "--dump-bypassed-method",
+    )?;
+    if !bypassed_method_signature(&bypassed.main) {
+        return Err(luajit_method_contract_failure(
+            entry,
+            "external entry into split setup was not kept as a normal call",
+        ));
+    }
+    Ok(())
+}
+
+fn lower_luajit_method_fixture(
+    entry: &LuaCaseManifestEntry,
+    suite_label: &str,
+    artifact_label: &str,
+    argument: &str,
+) -> Result<LoweredChunk, TestFailure> {
+    let source = repo_root().join(entry.path);
+    let dump = run_lua_file_with_args("luajit", &source, &[argument])
+        .map_err(|error| luajit_method_contract_failure(entry, error))?;
+    if !dump.success() {
+        return Err(luajit_method_contract_failure(entry, dump.render()));
+    }
+    let artifact = suite_artifact_path(
+        suite_label,
+        "luajit",
+        entry.variant,
+        artifact_label,
+        entry.path,
+        "luajit",
+    );
+    write_output_file(&artifact, &dump.stdout).map_err(|error| {
+        luajit_method_contract_failure(
+            entry,
+            format!("write {} failed: {error}", repo_relative_display(&artifact)),
+        )
+    })?;
+    let mut options = decompile_options(entry);
+    options.target_stage = DecompileStage::Transformer;
+    decompile(&dump.stdout, options)
+        .map_err(|error| luajit_method_contract_failure(entry, error.to_string()))?
+        .state
+        .lowered
+        .ok_or_else(|| {
+            luajit_method_contract_failure(entry, "method fixture produced no lowered chunk")
+        })
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum LargeMethodSignature {
+    Method,
+    Dot,
+}
+
+fn large_method_signature(proto: &LoweredProto) -> Option<LargeMethodSignature> {
+    let DialectConstPoolExtra::LuaJit(constants) = &proto.constants.extra else {
+        return None;
+    };
+    if constants.kgc_entries.len() <= u8::MAX as usize {
+        return None;
+    }
+
+    if let [
+        ..,
+        LowInstr::Move(snapshot),
+        LowInstr::LoadConst(key),
+        LowInstr::GetTable(get),
+        LowInstr::TailCall(call),
+    ] = proto.instrs.as_slice()
+    {
+        let method_args = matches!(call.args, ValuePack::Fixed(args) if args.start == snapshot.dst && args.len == 1);
+        if snapshot.src == Reg(0)
+            && key.dst.index() == snapshot.dst.index() + 1
+            && get.dst == call.callee
+            && get.base == AccessBase::Reg(snapshot.dst)
+            && get.key == AccessKey::Const(key.value)
+            && get.kind == GetTableKind::Method
+            && call.kind == CallKind::Method
+            && call.method_name.map(|hint| hint.const_ref) == Some(key.value)
+            && method_args
+        {
+            return Some(LargeMethodSignature::Method);
+        }
+    }
+
+    if let [
+        ..,
+        LowInstr::LoadConst(key),
+        LowInstr::GetTable(get),
+        LowInstr::Move(arg),
+        LowInstr::TailCall(call),
+    ] = proto.instrs.as_slice()
+    {
+        let explicit_arg =
+            matches!(call.args, ValuePack::Fixed(args) if args.start == arg.dst && args.len == 1);
+        if arg.src == Reg(0)
+            && get.dst == call.callee
+            && get.base == AccessBase::Reg(arg.src)
+            && get.key == AccessKey::Reg(key.dst)
+            && get.kind == GetTableKind::Normal
+            && call.kind == CallKind::Normal
+            && call.method_name.is_none()
+            && explicit_arg
+        {
+            return Some(LargeMethodSignature::Dot);
+        }
+    }
+    None
+}
+
+fn bypassed_method_signature(proto: &LoweredProto) -> bool {
+    let [
+        ..,
+        LowInstr::Move(snapshot),
+        LowInstr::GetTable(get),
+        LowInstr::TailCall(call),
+    ] = proto.instrs.as_slice()
+    else {
+        return false;
+    };
+    matches!(call.args, ValuePack::Fixed(args) if args.start == snapshot.dst && args.len == 1)
+        && snapshot.src == Reg(0)
+        && get.dst == call.callee
+        && get.base == AccessBase::Reg(snapshot.src)
+        && matches!(get.key, AccessKey::Const(_))
+        && get.kind == GetTableKind::Normal
+        && call.kind == CallKind::Normal
+        && call.method_name.is_none()
+}
+
 fn luajit_builtin_contract_failure(
     entry: &LuaCaseManifestEntry,
     detail: impl Into<String>,
@@ -1474,6 +1653,21 @@ fn luajit_builtin_contract_failure(
         format!(
             "LuaJIT builtin contract failed for {}: {detail}",
             entry.path
+        ),
+    )
+}
+
+fn luajit_method_contract_failure(
+    entry: &LuaCaseManifestEntry,
+    detail: impl Into<String>,
+) -> TestFailure {
+    TestFailure::new(
+        FailureKind::LuaJitMethodProtocolContractAssertionFailed,
+        "LuaJIT method protocol contract failed",
+        format!(
+            "LuaJIT method protocol contract failed for {}: {}",
+            entry.path,
+            detail.into()
         ),
     )
 }

@@ -215,44 +215,27 @@ impl PendingMethodHints {
         }
     }
 
-    pub(crate) fn set(&mut self, callee: Reg, self_arg: Reg, method_name: Option<ConstRef>) {
-        set_pending_method_hint(&mut self.slots, callee, self_arg, method_name);
-    }
-
-    pub(crate) fn call_info(&self, callee: Reg, raw_b: u16) -> (CallKind, Option<MethodNameHint>) {
-        self.call_info_if(callee, raw_b != 1)
+    pub(crate) fn set(
+        &mut self,
+        callee: Reg,
+        self_arg: Reg,
+        method_name: Option<ConstRef>,
+        live_from: Option<usize>,
+    ) {
+        set_pending_method_hint(&mut self.slots, callee, self_arg, method_name, live_from);
     }
 
     pub(crate) fn consume_call_info(
         &mut self,
         callee: Reg,
-        raw_b: u16,
-        results: ResultPack,
-    ) -> (CallKind, Option<MethodNameHint>) {
-        let info = self.call_info(callee, raw_b);
-        self.invalidate_reg(callee);
-        self.invalidate_result_pack(results);
-        info
-    }
-
-    pub(crate) fn consume_call_info_if(
-        &mut self,
-        callee: Reg,
+        first_arg: Reg,
         hint_allowed: bool,
         results: ResultPack,
     ) -> (CallKind, Option<MethodNameHint>) {
-        let info = self.call_info_if(callee, hint_allowed);
+        let info = pending_call_info(&self.slots, callee, first_arg, hint_allowed);
         self.invalidate_reg(callee);
         self.invalidate_result_pack(results);
         info
-    }
-
-    pub(crate) fn call_info_if(
-        &self,
-        callee: Reg,
-        hint_allowed: bool,
-    ) -> (CallKind, Option<MethodNameHint>) {
-        pending_call_info(&self.slots, callee, hint_allowed)
     }
 
     pub(crate) fn invalidate_reg(&mut self, reg: Reg) {
@@ -263,7 +246,7 @@ impl PendingMethodHints {
         invalidate_pending_method_range(&mut self.slots, range);
     }
 
-    fn invalidate_result_pack(&mut self, results: ResultPack) {
+    pub(crate) fn invalidate_result_pack(&mut self, results: ResultPack) {
         match results {
             ResultPack::Fixed(range) => self.invalidate_range(range),
             ResultPack::Open(start) => {
@@ -278,12 +261,59 @@ impl PendingMethodHints {
     pub(crate) fn clear(&mut self) {
         clear_pending_method_hints(&mut self.slots);
     }
+
+    pub(crate) fn invalidate_bypassed_setups(
+        &mut self,
+        raw_index: usize,
+        incoming_sources: JumpSourceEnvelope,
+    ) {
+        for pending in &mut self.slots {
+            let Some(hint) = *pending else {
+                continue;
+            };
+            if hint
+                .live_from
+                .is_some_and(|live_from| !incoming_sources.all_within(live_from, raw_index))
+            {
+                *pending = None;
+            }
+        }
+    }
+}
+
+/// 入边查询只问“全部 source 是否落在某个连续区间”，因此保留两端即可精确回答，
+/// 同时避免为每个 target 分配小 `Vec`。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct JumpSourceEnvelope {
+    min: usize,
+    max: usize,
+}
+
+impl JumpSourceEnvelope {
+    pub(crate) const EMPTY: Self = Self {
+        min: usize::MAX,
+        max: 0,
+    };
+
+    pub(crate) fn include(&mut self, source: usize) {
+        self.min = self.min.min(source);
+        self.max = self.max.max(source);
+    }
+
+    pub(crate) fn all_within(self, start: usize, end: usize) -> bool {
+        self.min == usize::MAX || (self.min >= start && self.max < end)
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.min == usize::MAX
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct PendingMethodHint {
     self_arg: Reg,
     method_name: Option<ConstRef>,
+    live_from: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -504,11 +534,13 @@ fn set_pending_method_hint(
     callee: Reg,
     self_arg: Reg,
     method_name: Option<ConstRef>,
+    live_from: Option<usize>,
 ) {
     if callee.index() < pending_methods.len() {
         pending_methods[callee.index()] = Some(PendingMethodHint {
             self_arg,
             method_name,
+            live_from,
         });
     }
 }
@@ -516,6 +548,7 @@ fn set_pending_method_hint(
 fn pending_call_info(
     pending_methods: &[Option<PendingMethodHint>],
     callee: Reg,
+    first_arg: Reg,
     hint_allowed: bool,
 ) -> (CallKind, Option<MethodNameHint>) {
     if !hint_allowed {
@@ -523,7 +556,7 @@ fn pending_call_info(
     }
 
     match pending_methods.get(callee.index()).and_then(|value| *value) {
-        Some(hint) if hint.self_arg == Reg(callee.index() + 1) => (
+        Some(hint) if hint.self_arg == first_arg => (
             CallKind::Method,
             hint.method_name
                 .map(|const_ref| MethodNameHint { const_ref }),

@@ -1291,7 +1291,8 @@ impl<'a> ProtoLowerer<'a> {
         self_arg: Reg,
         method_name: Option<crate::transformer::ConstRef>,
     ) {
-        self.pending_methods.set(callee, self_arg, method_name);
+        self.pending_methods
+            .set(callee, self_arg, method_name, None);
     }
 
     fn take_call_info(
@@ -1301,7 +1302,7 @@ impl<'a> ProtoLowerer<'a> {
         results: ResultPack,
     ) -> (CallKind, Option<crate::transformer::MethodNameHint>) {
         self.pending_methods
-            .consume_call_info_if(callee, raw_b != 1, results)
+            .consume_call_info(callee, Reg(callee.index() + 1), raw_b != 1, results)
     }
 
     fn invalidate_written_reg(&mut self, reg: Reg) {

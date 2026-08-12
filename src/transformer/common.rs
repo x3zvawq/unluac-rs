@@ -285,7 +285,7 @@ pub enum CallKind {
     Method,
 }
 
-/// `SELF` 在 low-IR 上携带的 method 名提示。
+/// 方言 method setup 协议在 low-IR 上携带的 method 名提示。
 ///
 /// 这里只保留“常量池里的字段名索引”，避免在 transformer 层过早解码字符串；
 /// 到 HIR / AST 再按各层自己的字符串语义恢复。
@@ -507,10 +507,11 @@ pub enum GetTableKind {
     Raw,
     /// Luau `GETIMPORT` 展开的稳定路径读取。
     Import,
-    /// 来自 `SELF` / `NAMECALL` 三元式的 method-load。
+    /// 来自方言 method setup 协议的 method-load。
     ///
-    /// Lua 的 `obj:name(args)` 在 bytecode 层展开成"先把 `obj` 搬到 self 槽位、再从
-    /// `obj[name]` 载入 method、然后 CALL"三步。`CallInstr.method_name` 保存可读性事实，
+    /// Lua 的 `obj:name(args)` 会由 `SELF` / `NAMECALL` 单指令，或 LuaJIT 的 split
+    /// `MOV + TGETS/TGETV` 展开成 receiver snapshot、method lookup 和 CALL。
+    /// `CallInstr.method_name` 保存可读性事实，
     /// 但 GetTable 仍是会触发 `__index` 的真实求值事件；该标志只描述 setup 协议，不能
     /// 作为删除或跨参数副作用移动 lookup 的依据。
     Method,

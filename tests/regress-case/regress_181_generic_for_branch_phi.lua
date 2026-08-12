@@ -1,4 +1,5 @@
 -- regress_181_generic_for_branch_phi#1: generic-for body 的局部分支 Phi 归本轮 soft merge
+-- unluac: expect-contains [[in p1_0:gmatch(".")]]
 -- unluac: expect-not-contains [[in r1_2:gmatch]]
 -- unluac: expect-not-contains [[local r1_2 = "."]]
 -- unluac: expect-contains [[r1_1 =]]

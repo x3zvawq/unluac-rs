@@ -495,7 +495,8 @@ impl<'a> ProtoLowerer<'a> {
                             kind: GetTableKind::Method,
                         })),
                     );
-                    self.pending_methods.set(callee, self_arg, method_name);
+                    self.pending_methods
+                        .set(callee, self_arg, method_name, None);
                     raw_index += 1;
                 }
                 FamilyOpcode::AddI | FamilyOpcode::ShrI | FamilyOpcode::ShlI => {
@@ -837,15 +838,17 @@ impl<'a> ProtoLowerer<'a> {
                 FamilyOpcode::Call => {
                     let (a, b, c, _) = expect_abck(raw_pc, opcode, operands)?;
                     let results = call_result_pack(a, u16::from(c));
+                    let callee = reg_from_u8(a);
                     let (kind, method_name) = self.pending_methods.consume_call_info(
-                        reg_from_u8(a),
-                        u16::from(b),
+                        callee,
+                        Reg(callee.index() + 1),
+                        b != 1,
                         results,
                     );
                     emit_call(
                         &mut self.lowering,
                         raw_index,
-                        reg_from_u8(a),
+                        callee,
                         call_args_pack(a, u16::from(b)),
                         results,
                         kind,
@@ -855,15 +858,17 @@ impl<'a> ProtoLowerer<'a> {
                 }
                 FamilyOpcode::TailCall => {
                     let (a, b, _, k) = expect_abck(raw_pc, opcode, operands)?;
+                    let callee = reg_from_u8(a);
                     let (kind, method_name) = self.pending_methods.consume_call_info(
-                        reg_from_u8(a),
-                        u16::from(b),
+                        callee,
+                        Reg(callee.index() + 1),
+                        b != 1,
                         ResultPack::Ignore,
                     );
                     emit_tail_call(
                         &mut self.lowering,
                         raw_index,
-                        reg_from_u8(a),
+                        callee,
                         call_args_pack(a, u16::from(b)),
                         kind,
                         method_name,

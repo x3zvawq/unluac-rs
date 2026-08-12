@@ -91,6 +91,7 @@ impl LuaCaseMatrixEntry {
 pub(crate) enum LuaCaseExpectation {
     Source,
     LuaJitBuiltinTableRemove,
+    LuaJitMethodProtocol,
     UnsupportedIsland { jump_pc: usize, target_pc: usize },
 }
 
@@ -1642,6 +1643,11 @@ const REGRESSION_CASES: &[LuaCaseMatrixEntry] = &[
         LUAU_ONLY,
     )
     .with_variants(LUAU_O0_ONLY),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_306_luajit_method_protocol.lua",
+        LUAJIT_ONLY,
+    )
+    .with_expectation(LuaCaseExpectation::LuaJitMethodProtocol),
 ];
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {
