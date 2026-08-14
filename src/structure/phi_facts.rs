@@ -1059,9 +1059,7 @@ fn claim_selected_region_values(
     for (region_id, region) in plan.regions() {
         match region {
             RegionPlan::Branch {
-                plan: branch_id,
-                condition: _,
-                ..
+                plan: branch_id, ..
             } => {
                 let branch = plan.branch(*branch_id).ok_or_else(|| {
                     StructureError::invalid(format!(
