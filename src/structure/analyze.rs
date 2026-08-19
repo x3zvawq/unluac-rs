@@ -126,20 +126,44 @@ pub(crate) fn analyze_structure_proto(
         &branch_candidates,
         &value_decision_blocks,
     );
-    // repeat refinement 只查询 BranchExit；ValueMerge 往往携带最大的 blocks/nodes/leaf
-    // payload，把整张 short-circuit 表复制一遍既无语义作用，也会按 phi 放大内存。
+    // repeat refinement 与最终 condition 冻结必须消费同一份安全边界。否则带可观察
+    // 副作用的后继节点会先参与 loop 形态判断、再在 condition selection 中被截断，
+    // 同一个 header 最终就可能拿到一份更窄、且仍指向 loop body 的伪尾条件。
+    // 这里只查询 BranchExit；ValueMerge 往往携带最大的 blocks/nodes/leaf payload，
+    // 把整张 short-circuit 表复制一遍既无语义作用，也会按 phi 放大内存。
+    let mut loop_condition_safety_workspace = ConditionSafetyWorkspace::new(dataflow);
     let mut short_circuit_candidates_for_loops = short_circuit_candidates
         .iter()
         .filter(|candidate| matches!(candidate.exit, ShortCircuitExit::BranchExit { .. }))
-        .cloned()
+        .filter_map(|candidate| {
+            safe_condition_candidate(
+                cfg,
+                dataflow,
+                candidate,
+                &mut loop_condition_safety_workspace,
+            )
+        })
         .collect::<Vec<_>>();
-    short_circuit_candidates_for_loops.extend(
-        closed_control_dags
-            .iter()
-            .map(|evidence| evidence.candidate.clone()),
-    );
+    short_circuit_candidates_for_loops.extend(closed_control_dags.iter().filter_map(|evidence| {
+        safe_condition_candidate(
+            cfg,
+            dataflow,
+            &evidence.candidate,
+            &mut loop_condition_safety_workspace,
+        )
+    }));
     let loop_condition_supplements =
-        short_circuit::analyze_cfg_linear_branch_exits(proto, cfg, &branch_candidates);
+        short_circuit::analyze_cfg_linear_branch_exits(proto, cfg, &branch_candidates)
+            .iter()
+            .filter_map(|candidate| {
+                safe_condition_candidate(
+                    cfg,
+                    dataflow,
+                    candidate,
+                    &mut loop_condition_safety_workspace,
+                )
+            })
+            .collect::<Vec<_>>();
     loops::refine_short_circuit_repeat_candidates(
         loops::RepeatRefinementInput {
             proto,

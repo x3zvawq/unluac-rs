@@ -141,10 +141,13 @@ fn validate_single_pass_plans(
             if edge.from == fence.tail
                 || edge.to != fence.continuation
                 || !intervals.contains(fence.region, source)
-                || plan.edge_plan(*edge_ref).is_none_or(|edge_plan| {
-                    edge_plan.owner != fence.region
-                        || edge_plan.transfer != EdgeTransfer::Break(fence.region)
-                })
+                || !single_pass_escape_plan_matches(
+                    plan,
+                    intervals,
+                    fence.region,
+                    source,
+                    *edge_ref,
+                )
             {
                 return Err(StructureError::invalid(format!(
                     "single-pass payload #{index} escape edge {edge_ref} is stale: region={:?} entry={} tail={} continuation={} edge={} -> {} plan={:?}",
@@ -167,6 +170,42 @@ fn validate_single_pass_plans(
         }
     }
     Ok(())
+}
+
+/// single-pass escape 通常由 fence 自身发射；唯一允许的更深 owner 是同时被
+/// numeric/generic-for protocol 吸收的 LoopExit。此时源码顺序是 `for ... end`
+/// 后紧跟祖先 `break`，所以 edge 仍归 for，transfer 则指向包含它的 fence。
+fn single_pass_escape_plan_matches(
+    plan: &StructurePlan,
+    intervals: &RegionNavigation,
+    fence: RegionId,
+    source: RegionId,
+    edge: EdgeRef,
+) -> bool {
+    let Some(edge_plan) = plan.edge_plan(edge) else {
+        return false;
+    };
+    if edge_plan.transfer != EdgeTransfer::Break(fence) || edge_plan.forward_route.is_some() {
+        return false;
+    }
+    if edge_plan.owner == fence {
+        return true;
+    }
+    if !intervals.contains(fence, edge_plan.owner) || !intervals.contains(edge_plan.owner, source) {
+        return false;
+    }
+    let Some(RegionPlan::Loop { plan: loop_id, .. }) = plan.region(edge_plan.owner) else {
+        return false;
+    };
+    let Some(loop_) = plan.loop_(*loop_id) else {
+        return false;
+    };
+    matches!(
+        loop_.kind,
+        crate::structure::LoopKindHint::NumericForLike
+            | crate::structure::LoopKindHint::GenericForLike
+    ) && (loop_.control_edges.preheader_exit == Some(edge)
+        || loop_.control_edges.exit.binary_search(&edge).is_ok())
 }
 
 /// 证明稠密 terminator arena 与 low-IR/CFG 是同一份物理控制流事实。
@@ -4017,11 +4056,16 @@ fn validate_edges(
                 let source = plan.region_for_block(edge.from).ok_or_else(|| {
                     StructureError::invalid(format!("edge #{index} source has no region"))
                 })?;
-                if edge_plan.owner != region
-                    || !intervals.contains(region, source)
+                if !intervals.contains(region, source)
                     || edge.to != fence.continuation
-                    || edge_plan.forward_route.is_some()
                     || fence.escape_edges.binary_search(&edge_plan.edge).is_err()
+                    || !single_pass_escape_plan_matches(
+                        plan,
+                        intervals,
+                        region,
+                        source,
+                        edge_plan.edge,
+                    )
                 {
                     return Err(StructureError::invalid(format!(
                         "edge #{index} does not match single-pass region #{}",

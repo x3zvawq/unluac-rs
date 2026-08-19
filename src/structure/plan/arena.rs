@@ -2664,6 +2664,15 @@ impl EdgeSemantics {
             };
         }
         if let Some(region) = self.single_pass_breaks[edge_ref.index()] {
+            if self.for_syntax_edges[edge_ref.index()]
+                && let Some((loop_region, super::BranchArm::LoopExit)) =
+                    self.syntax_arms[edge_ref.index()]
+            {
+                // VM-for 的 exit 同时离开祖先 single-pass fence 时，物理边仍由
+                // 最内层 for protocol 吸收；祖先 break 必须紧跟源码 for 发射。
+                // 把 owner 提升到 fence 会让同一条 LoopExit 丢失唯一语法 owner。
+                return (loop_region, EdgeTransfer::Break(region));
+            }
             return (region, EdgeTransfer::Break(region));
         }
         if self.breaks[edge_ref.index()].is_none()
