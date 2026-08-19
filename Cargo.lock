@@ -404,7 +404,7 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "unluac"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "chardetng",
  "encoding_rs",
@@ -417,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "unluac-cli"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "clap",
  "unluac",
@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "unluac-test-support"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "strum",
  "strum_macros",
@@ -434,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "unluac-wasm"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "serde",
  "serde-wasm-bindgen",
@@ -593,7 +593,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "xtask"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "anyhow",
  "indicatif",
