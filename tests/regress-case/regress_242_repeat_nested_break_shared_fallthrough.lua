@@ -1,4 +1,5 @@
 -- regress_242_repeat_nested_break_shared_fallthrough: nested break不能把共享fallthrough错误并入外层branch
+-- unluac: expect-contains [[repeat]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]

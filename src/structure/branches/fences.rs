@@ -1,4 +1,9 @@
-//! 细化 single-pass fence、loop escape merge 与 iteration if/else；依赖 branch/loop 候选，不负责基础分支分类；例如把局部 break/continue guard 纳入正确 owner。
+//! 细化 single-pass fence、loop escape merge 与 iteration if/else。
+//!
+//! 本模块依赖已经分类的 branch/loop 候选和支配事实，只把真正跨分支共享的线性 tail
+//! 冻结成 single-pass fence；它不负责基础分支分类，也不会把两臂各自闭合到同一出口的
+//! 普通 `if/else` 改写成合成 `repeat`。例如，嵌套 break 跳过共享 tail 时建立 fence，
+//! 而一臂执行普通语句、另一臂执行 numeric-for 后共同结束时继续保留 `if/else`。
 
 use super::*;
 
@@ -7,6 +12,9 @@ use super::*;
 /// 这类区域有一个被多条正常路径共享的线性 tail，同时若干早退路径直接进入 tail
 /// 之后的严格合流点。把外层 branch 的 continuation 收到 tail 后，最终 plan 就能用
 /// 一个 single-pass containment owner 承载所有跳过 tail 的 `break`。
+///
+/// 如果 tail 完全属于 strict `if/else` 的一臂、其余出口完全属于另一臂，那么 tail
+/// 并未被两臂共享；这只是普通分支的两条完成路径，必须保留原 branch continuation。
 pub(super) fn refine_single_pass_fences(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
@@ -115,6 +123,14 @@ pub(super) fn refine_single_pass_fences(
         });
         if escape_edges.is_empty()
             || !has_nested_escape
+            || closed_if_else_partitions_tail_and_escapes(
+                cfg,
+                graph_facts,
+                &branch_candidates[candidate_index],
+                tail,
+                exit,
+                &escape_edges,
+            )
             || closed_if_else_owns_value_result(
                 cfg,
                 graph_facts,
@@ -168,6 +184,58 @@ pub(super) fn refine_single_pass_fences(
     fences
 }
 
+/// strict `if/else` 的线性 tail 若完全属于一臂，则返回另一臂入口。
+///
+/// 两臂都不支配 tail 时，它才可能是 single-pass 的共享 tail；两臂都支配则候选边界
+/// 已经歧义。这个查询同时供纯控制分区和 value-result 闭合证明使用。
+fn opposite_if_else_arm_for_owned_tail(
+    graph_facts: &GraphFacts,
+    candidate: &BranchCandidate,
+    tail: BlockRef,
+    exit: BlockRef,
+) -> Option<BlockRef> {
+    let else_entry = candidate.else_entry?;
+    if candidate.kind != BranchKind::IfElse
+        || candidate.merge != Some(exit)
+        || graph_facts.nearest_common_postdom(candidate.then_entry, else_entry) != Some(exit)
+    {
+        return None;
+    }
+
+    match (
+        graph_facts.dominates(candidate.then_entry, tail),
+        graph_facts.dominates(else_entry, tail),
+    ) {
+        (true, false) => Some(else_entry),
+        (false, true) => Some(candidate.then_entry),
+        (true, true) | (false, false) => None,
+    }
+}
+
+/// 拒绝把两臂各自完成到 strict exit 的普通 `if/else` 伪装成 single-pass fence。
+fn closed_if_else_partitions_tail_and_escapes(
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    candidate: &BranchCandidate,
+    tail: BlockRef,
+    exit: BlockRef,
+    escape_edges: &BTreeSet<EdgeRef>,
+) -> bool {
+    if graph_facts.block_is_cyclic(candidate.header) || graph_facts.block_is_cyclic(tail) {
+        return false;
+    }
+    let Some(opposite_arm) =
+        opposite_if_else_arm_for_owned_tail(graph_facts, candidate, tail, exit)
+    else {
+        return false;
+    };
+
+    !escape_edges.is_empty()
+        && escape_edges
+            .iter()
+            .all(|edge| graph_facts.dominates(opposite_arm, cfg.edges[edge.index()].from))
+}
+
 /// value-result 已经证明两臂在严格后支配点闭合时，shared-tail 只是其中一臂的
 /// 实现形状；改成 single-pass 会把正常分支的结果边误解释成 `break`。
 pub(super) fn closed_if_else_owns_value_result(
@@ -183,23 +251,9 @@ pub(super) fn closed_if_else_owns_value_result(
     let Some(else_entry) = candidate.else_entry else {
         return false;
     };
-    if candidate.kind != BranchKind::IfElse
-        || candidate.merge != Some(exit)
-        || graph_facts.nearest_common_postdom(candidate.then_entry, else_entry) != Some(exit)
-    {
+    let Some(result_arm) = opposite_if_else_arm_for_owned_tail(graph_facts, candidate, tail, exit)
+    else {
         return false;
-    }
-
-    // 普通 if/else 的线性 tail 只属于一臂，另一臂直接给 result phi 供值；真正的
-    // single-pass shared tail 会被两臂共同到达，不能仅因 exit 上恰好存在 phi 就拦截。
-    let (then_owns_tail, else_owns_tail) = (
-        graph_facts.dominates(candidate.then_entry, tail),
-        graph_facts.dominates(else_entry, tail),
-    );
-    let result_arm = match (then_owns_tail, else_owns_tail) {
-        (true, false) => else_entry,
-        (false, true) => candidate.then_entry,
-        (true, true) | (false, false) => return false,
     };
 
     // Dataflow 的 block range 是稠密索引；每个 exit 只检查自身 canonical/live phi，
