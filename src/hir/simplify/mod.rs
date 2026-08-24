@@ -22,6 +22,7 @@ mod locals;
 mod logical_simplify;
 mod mention;
 mod residuals;
+mod root_lifetimes;
 mod table_constructors;
 mod temp_inline;
 mod temp_touch;

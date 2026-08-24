@@ -1,15 +1,14 @@
 //! 这个子模块负责从连续 stmt 区域里扫描表构造器候选步骤。
 //!
 //! 它依赖 HIR 已经稳定的赋值/构造器形状，只回答“哪些 stmt 可视为构造器 seed、record、
-//! setlist、producer 或 trailing handoff”，不会在这里直接改写语句。
+//! setlist 或 producer”，不会在这里直接改写语句。
 //! 例如：`local t = {}; t.x = 1; t.y = 2` 会在这里被扫描成一串 constructor steps。
 
 use crate::ast::DecompileDialect;
 use crate::hir::common::{HirExpr, HirLValue, HirStmt, HirTableConstructor, HirValuePack};
 
 use super::bindings::{
-    BindingIndex, BindingOccurrenceIndex, binding_from_expr, binding_from_lvalue,
-    expr_uses_binding, lvalue_uses_binding,
+    BindingIndex, BindingOccurrenceIndex, binding_from_expr, binding_from_lvalue, expr_uses_binding,
 };
 use super::builder::ConstructorBuilder;
 use super::rebuild::{RegionRebuildContext, try_extend_constructor_from_steps};
@@ -21,14 +20,12 @@ use super::{BindingId, RebuildScratch, RegionStep, TableBinding};
 /// 以最后位置作为 horizon，既允许跨过其他 seed，又能在线性预处理后排除独立 seed 的后缀扫描。
 pub(super) struct ConstructorWriteIndex {
     last_write: Vec<Option<usize>>,
-    last_set_list: Vec<Option<usize>>,
 }
 
 impl ConstructorWriteIndex {
     pub(super) fn new(stmts: &[HirStmt], binding_index: &BindingIndex) -> Self {
         let mut index = Self {
             last_write: vec![None; binding_index.len()],
-            last_set_list: vec![None; binding_index.len()],
         };
         for (stmt_id, stmt) in stmts.iter().enumerate() {
             if let Some(binding) = keyed_write_binding(stmt) {
@@ -41,7 +38,6 @@ impl ConstructorWriteIndex {
                     .id_of(binding)
                     .expect("table set-list binding should be indexed");
                 index.last_write[binding_id] = Some(stmt_id);
-                index.last_set_list[binding_id] = Some(stmt_id);
             }
         }
         index
@@ -49,10 +45,6 @@ impl ConstructorWriteIndex {
 
     pub(super) fn has_write_after(&self, binding_id: BindingId, stmt_id: usize) -> bool {
         self.last_write[binding_id].is_some_and(|last| last > stmt_id)
-    }
-
-    pub(super) fn has_set_list_after(&self, binding_id: BindingId, stmt_id: usize) -> bool {
-        self.last_set_list[binding_id].is_some_and(|last| last > stmt_id)
     }
 }
 
@@ -97,6 +89,22 @@ pub(super) fn install_constructor_seed(stmt: &mut HirStmt, constructor: HirTable
         }
         _ => unreachable!("constructor region must start from a constructor seed"),
     }
+}
+
+pub(super) fn constructor_uses_binding(
+    constructor: &HirTableConstructor,
+    binding: TableBinding,
+) -> bool {
+    constructor.fields.iter().any(|field| match field {
+        crate::hir::common::HirTableField::Array(value) => expr_uses_binding(value, binding),
+        crate::hir::common::HirTableField::Record(record) => {
+            matches!(&record.key, crate::hir::common::HirTableKey::Expr(key) if expr_uses_binding(key, binding))
+                || expr_uses_binding(&record.value, binding)
+        }
+    }) || constructor
+        .trailing_multivalue
+        .as_ref()
+        .is_some_and(|tail| expr_uses_binding(tail.as_expr(), binding))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -170,84 +178,6 @@ pub(super) fn try_rebuild_constructor_region(
     best_end.map(|end_index| (committed_builder.into_constructor(), end_index))
 }
 
-/// open SETLIST 前的 producer 若不能安全内联，允许把空表 owner 延后到 SETLIST 原位。
-/// producer 本身全部保留，因此这里只需证明 seed 在夹层中从未被读取或改写。
-pub(super) fn try_defer_open_set_list_owner(
-    block: &crate::hir::common::HirBlock,
-    seed_index: usize,
-    binding: TableBinding,
-    seed: &HirTableConstructor,
-) -> Option<(HirTableConstructor, usize)> {
-    if !seed.fields.is_empty() || seed.trailing_multivalue.is_some() {
-        return None;
-    }
-
-    let mut ignored_steps = Vec::new();
-    for (offset, stmt) in block.stmts[(seed_index + 1)..].iter().enumerate() {
-        let stmt_index = seed_index + 1 + offset;
-        ignored_steps.clear();
-        if producer_steps(stmt, stmt_index, binding, &mut ignored_steps).is_some() {
-            continue;
-        }
-
-        let HirStmt::TableSetList(set_list) = stmt else {
-            return None;
-        };
-        let tail = set_list.values.tail.as_ref()?;
-        if tail.exact_width().is_some()
-            || !table_set_list_step(stmt, binding)
-            || set_list.start_index != 1
-        {
-            return None;
-        }
-
-        let mut constructor = seed.clone();
-        constructor.fields.extend(
-            set_list
-                .values
-                .fixed
-                .iter()
-                .cloned()
-                .map(crate::hir::common::HirTableField::Array),
-        );
-        constructor.trailing_multivalue = Some(tail.clone());
-        return Some((constructor, stmt_index));
-    }
-    None
-}
-
-pub(super) fn trailing_constructor_handoff(
-    stmts: &[HirStmt],
-    binding: TableBinding,
-    binding_mentioned_after: bool,
-) -> Option<HirLValue> {
-    let HirStmt::Assign(assign) = stmts.first()? else {
-        return None;
-    };
-    let [target] = assign.targets.as_slice() else {
-        return None;
-    };
-    if assign.values.tail.is_some() {
-        return None;
-    }
-    let [value] = assign.values.fixed.as_slice() else {
-        return None;
-    };
-    if binding_from_expr(value) != Some(binding) {
-        return None;
-    }
-    // 这里只认“构造器 seed 的唯一尾部 handoff”：
-    // - target 自己不能再回看 seed binding，否则不是所有权转移而是继续同表写入；
-    // - handoff 之后也不能再出现这个 binding，否则后层还需要它的稳定身份。
-    if binding_from_lvalue(target) == Some(binding)
-        || lvalue_uses_binding(target, binding)
-        || binding_mentioned_after
-    {
-        return None;
-    }
-    Some(target.clone())
-}
-
 fn keyed_write_step(stmt: &HirStmt, binding: TableBinding) -> bool {
     keyed_write_binding(stmt) == Some(binding)
 }
@@ -279,33 +209,23 @@ fn producer_steps(
     steps: &mut Vec<RegionStep>,
 ) -> Option<Vec<TableBinding>> {
     match stmt {
-        HirStmt::LocalDecl(local_decl) => producer_steps_from_bindings(
-            local_decl
-                .bindings
-                .iter()
-                .copied()
-                .map(TableBinding::Local)
-                .collect::<Vec<_>>(),
-            &local_decl.values,
-            constructor_binding,
-            stmt_index,
-            steps,
-        ),
-        HirStmt::Assign(assign) => {
-            let bindings = assign
-                .targets
-                .iter()
-                .map(binding_from_lvalue)
-                .collect::<Option<Vec<_>>>();
-            let bindings = bindings?;
+        HirStmt::LocalDecl(local_decl) if local_decl.values.tail.is_none() => {
             producer_steps_from_bindings(
-                bindings,
-                &assign.values,
+                local_decl
+                    .bindings
+                    .iter()
+                    .copied()
+                    .map(TableBinding::Local)
+                    .collect::<Vec<_>>(),
+                &local_decl.values,
                 constructor_binding,
                 stmt_index,
                 steps,
             )
         }
+        // Existing assignments keep the physical overwrite point of their target.  They may
+        // own a source-visible value even when the result is consumed only once.
+        HirStmt::Assign(_) => None,
         _ => None,
     }
 }
@@ -341,6 +261,60 @@ fn producer_steps_from_bindings(
     }
 
     None
+}
+
+pub(super) fn seed_overwrite_delay_is_unobservable(
+    block: &crate::hir::common::HirBlock,
+    seed_index: usize,
+    end_index: usize,
+    binding: TableBinding,
+) -> bool {
+    block.stmts[(seed_index + 1)..=end_index]
+        .iter()
+        .all(|stmt| match stmt {
+            HirStmt::Assign(assign) => {
+                let [HirLValue::TableAccess(access)] = assign.targets.as_slice() else {
+                    return false;
+                };
+                assign.values.tail.is_none()
+                    && binding_from_expr(&access.base) == Some(binding)
+                    && seed_delay_expr_is_unobservable(&access.key)
+                    && assign
+                        .values
+                        .fixed
+                        .iter()
+                        .all(seed_delay_expr_is_unobservable)
+            }
+            HirStmt::TableSetList(set_list) => {
+                binding_from_expr(&set_list.base) == Some(binding)
+                    && set_list.values.tail.is_none()
+                    && set_list
+                        .values
+                        .fixed
+                        .iter()
+                        .all(seed_delay_expr_is_unobservable)
+            }
+            _ => false,
+        })
+}
+
+pub(super) fn seed_delay_expr_is_unobservable(expr: &HirExpr) -> bool {
+    matches!(
+        expr,
+        HirExpr::Nil
+            | HirExpr::Boolean(_)
+            | HirExpr::Integer(_)
+            | HirExpr::Number(_)
+            | HirExpr::String(_)
+            | HirExpr::Int64(_)
+            | HirExpr::UInt64(_)
+            | HirExpr::Vector(_)
+            | HirExpr::Complex { .. }
+            | HirExpr::ParamRef(_)
+            | HirExpr::LocalRef(_)
+            | HirExpr::UpvalueRef(_)
+            | HirExpr::TempRef(_)
+    )
 }
 
 fn table_set_list_step(stmt: &HirStmt, binding: TableBinding) -> bool {

@@ -5,6 +5,8 @@
 -- unluac: expect-contains [[_ENV = ]]
 -- unluac: expect-not-contains [[u0_0]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-contains [["k000", "k001", "k002"]]
+-- unluac: expect-max-line-length [[120]]
 local values = {
     "k000",
     "k001",

@@ -47,6 +47,15 @@ pub(super) fn stmts_reference_captured_bindings(stmts: &[HirStmt]) -> ReferenceC
     collector.bindings
 }
 
+/// Collect bindings copied into a closure by value.  Unlike a reference capture, a value
+/// capture is a snapshot: a later write to the same physical slot must not be merged back into
+/// the captured binding merely because the snapshot has no ordinary expression use.
+pub(super) fn stmts_value_captured_bindings(stmts: &[HirStmt]) -> ReferenceCapturedBindings {
+    let mut collector = ValueCaptureCollector::default();
+    visit_stmts(stmts, &mut collector);
+    collector.bindings
+}
+
 pub(super) fn stmts_to_be_closed_temps(stmts: &[HirStmt]) -> BTreeSet<TempId> {
     let mut collector = ToBeClosedTempCollector::default();
     visit_stmts(stmts, &mut collector);
@@ -81,6 +90,28 @@ impl HirVisitor for ReferenceCaptureCollector {
         };
         for capture in &closure.captures {
             if capture.mode != HirCaptureMode::ByReference {
+                continue;
+            }
+            let mut collector = BindingRefCollector {
+                bindings: &mut self.bindings,
+            };
+            visit_expr(&capture.value, &mut collector);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ValueCaptureCollector {
+    bindings: ReferenceCapturedBindings,
+}
+
+impl HirVisitor for ValueCaptureCollector {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        let HirExpr::Closure(closure) = expr else {
+            return;
+        };
+        for capture in &closure.captures {
+            if capture.mode != HirCaptureMode::ByValue {
                 continue;
             }
             let mut collector = BindingRefCollector {

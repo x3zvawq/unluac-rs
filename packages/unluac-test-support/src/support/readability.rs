@@ -77,6 +77,23 @@ pub(super) fn read_readability_assertions(
                     after: after.clone(),
                 });
             }
+            "expect-max-line-length" => {
+                let [max] = args.as_slice() else {
+                    return Err(readability_parse_failure(
+                        source_relative,
+                        line_no,
+                        "expect-max-line-length requires exactly one [[...]] argument",
+                    ));
+                };
+                let max = max.parse::<usize>().map_err(|_| {
+                    readability_parse_failure(
+                        source_relative,
+                        line_no,
+                        "expect-max-line-length requires a non-negative integer",
+                    )
+                })?;
+                assertions.push(ReadabilityAssertion::MaxLineLength { line: line_no, max });
+            }
             other => {
                 return Err(readability_parse_failure(
                     source_relative,
@@ -172,6 +189,25 @@ pub(super) fn assert_readability(
                         stage_label,
                         *line,
                         format!("expected generated source to contain {before:?} before {after:?}"),
+                        generated_source,
+                    ));
+                }
+            }
+            ReadabilityAssertion::MaxLineLength { line, max } => {
+                if let Some((physical_line, width, source_line)) = generated_source
+                    .lines()
+                    .enumerate()
+                    .map(|(index, source_line)| {
+                        (index + 1, source_line.chars().count(), source_line)
+                    })
+                    .find(|(_, width, _)| width > max)
+                {
+                    return Err(readability_assertion_failure(
+                        stage_label,
+                        *line,
+                        format!(
+                            "expected generated source lines to be at most {max} characters; physical line {physical_line} has {width}: {source_line:?}"
+                        ),
                         generated_source,
                     ));
                 }

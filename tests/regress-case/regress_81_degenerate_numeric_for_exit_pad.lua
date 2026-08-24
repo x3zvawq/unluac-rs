@@ -5,6 +5,7 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-not-contains [[(function()]]
 local function run(xs)
     for _ in xs do
         print("regress_81_degenerate_numeric_for_exit_pad#1 body")

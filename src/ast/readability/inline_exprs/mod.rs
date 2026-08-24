@@ -37,7 +37,7 @@ use super::binding_ref::binding_from_name_ref;
 use super::binding_tree::{
     expr_references_binding, stmt_has_access_base_binding_use, stmt_has_call_callee_binding_use,
     stmt_has_direct_call_arg_binding_use, stmt_has_index_binding_use, stmt_has_nested_binding_use,
-    stmt_has_nested_binding_value_use,
+    stmt_has_nested_binding_value_use, stmt_stores_binding_in_table,
 };
 use super::stmt_plan::{PlannedStmt, materialize_stmt_plan};
 use super::visit::AstVisitor;
@@ -191,6 +191,15 @@ fn rewrite_current_block(
             index += 1;
             continue;
         };
+        if matches!(value, AstExpr::Call(_) | AstExpr::MethodCall(_))
+            && stmt_stores_binding_in_table(next_stmt, candidate.binding())
+        {
+            // Keep a call result local while it is the table's only strong root.  A later
+            // rawset/clear may otherwise make the generated expression collectable earlier.
+            stmt_plan.push(PlannedStmt::Original(index));
+            index += 1;
+            continue;
+        }
         let policy = if stmt_is_alias_initializer_sink(next_stmt) {
             InlinePolicy::AliasInitializerChain
         } else if stmt_is_adjacent_call_result_sink(next_stmt) {

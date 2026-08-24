@@ -8,8 +8,8 @@
 use crate::ast::pretty::{preferred_negated_relational_render, preferred_relational_render};
 use crate::ast::{
     AstCallExpr, AstCallKind, AstExpr, AstFieldAccess, AstFunctionExpr, AstFunctionName,
-    AstIndexAccess, AstLValue, AstMethodCallExpr, AstNamePath, AstNameRef, AstRecordField,
-    AstTableConstructor, AstTableField, AstTableKey, AstUnaryOpKind,
+    AstIndexAccess, AstLValue, AstLogicalExpr, AstMethodCallExpr, AstNamePath, AstNameRef,
+    AstRecordField, AstTableConstructor, AstTableField, AstTableKey, AstUnaryOpKind,
 };
 use crate::decompile::DecompileDialect;
 use crate::generate::LuauVectorSize;
@@ -34,6 +34,28 @@ fn numeric_literal(rendered: String) -> (Doc, u8, Assoc) {
         PREC_LITERAL
     };
     (Doc::text(rendered), precedence, Assoc::Non)
+}
+
+#[derive(Clone, Copy)]
+enum LogicalOperator {
+    And,
+    Or,
+}
+
+impl LogicalOperator {
+    const fn precedence(self) -> u8 {
+        match self {
+            Self::And => PREC_AND,
+            Self::Or => PREC_OR,
+        }
+    }
+
+    const fn text(self) -> &'static str {
+        match self {
+            Self::And => "and",
+            Self::Or => "or",
+        }
+    }
 }
 
 impl<'a> Emitter<'a> {
@@ -198,22 +220,12 @@ impl<'a> Emitter<'a> {
                 )
             }
             AstExpr::LogicalAnd(logical) => {
-                let lhs = self.emit_expr(&logical.lhs, function, PREC_AND, ExprSide::Left)?;
-                let rhs = self.emit_expr(&logical.rhs, function, PREC_AND, ExprSide::Right)?;
-                (
-                    Doc::concat([lhs, Doc::text(" and "), rhs]),
-                    PREC_AND,
-                    Assoc::Full,
-                )
+                let doc = self.emit_logical_chain(logical, function, LogicalOperator::And)?;
+                (doc, PREC_AND, Assoc::Full)
             }
             AstExpr::LogicalOr(logical) => {
-                let lhs = self.emit_expr(&logical.lhs, function, PREC_OR, ExprSide::Left)?;
-                let rhs = self.emit_expr(&logical.rhs, function, PREC_OR, ExprSide::Right)?;
-                (
-                    Doc::concat([lhs, Doc::text(" or "), rhs]),
-                    PREC_OR,
-                    Assoc::Full,
-                )
+                let doc = self.emit_logical_chain(logical, function, LogicalOperator::Or)?;
+                (doc, PREC_OR, Assoc::Full)
             }
             AstExpr::Call(call) => (
                 self.emit_call_expr(call, function)?,
@@ -250,6 +262,47 @@ impl<'a> Emitter<'a> {
             ),
         };
         Ok(maybe_parenthesize(doc, prec, parent_prec, side, assoc))
+    }
+
+    fn emit_logical_chain(
+        &self,
+        logical: &AstLogicalExpr,
+        function: HirProtoRef,
+        operator: LogicalOperator,
+    ) -> Result<Doc, GenerateError> {
+        let mut operands = Vec::new();
+        collect_logical_operands(&logical.lhs, operator, &mut operands);
+        collect_logical_operands(&logical.rhs, operator, &mut operands);
+
+        let precedence = operator.precedence();
+        let mut docs = operands.into_iter().enumerate().map(|(index, operand)| {
+            let side = if index == 0 {
+                ExprSide::Left
+            } else {
+                ExprSide::Right
+            };
+            self.emit_expr(operand, function, precedence, side)
+        });
+        let first = docs
+            .next()
+            .expect("a logical expression always has at least two operands")?;
+        let continuations = docs
+            .map(|doc| {
+                doc.map(|doc| {
+                    Doc::concat([
+                        Doc::soft_line(),
+                        Doc::text(operator.text()),
+                        Doc::text(" "),
+                        doc,
+                    ])
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Doc::group(Doc::concat([
+            first,
+            Doc::indent(Doc::concat(continuations)),
+        ])))
     }
 
     fn emit_vector_literal(
@@ -346,7 +399,7 @@ impl<'a> Emitter<'a> {
                     Doc::text("{"),
                     Doc::indent(Doc::concat([
                         Doc::soft_line(),
-                        Doc::join(field_docs, separator),
+                        Doc::fill(field_docs, separator),
                     ])),
                     Doc::soft_line(),
                     Doc::text("}"),
@@ -462,6 +515,26 @@ impl<'a> Emitter<'a> {
             params.push(vararg);
         }
         Ok(self.emit_parenthesized_list(params))
+    }
+}
+
+/// Flattening here changes only Doc layout. Lua gives equal-precedence `and`/`or` chains full
+/// associativity, so the emitted token order and short-circuit evaluation remain unchanged.
+fn collect_logical_operands<'a>(
+    expr: &'a AstExpr,
+    operator: LogicalOperator,
+    operands: &mut Vec<&'a AstExpr>,
+) {
+    let nested = match (operator, expr) {
+        (LogicalOperator::And, AstExpr::LogicalAnd(logical))
+        | (LogicalOperator::Or, AstExpr::LogicalOr(logical)) => Some(logical.as_ref()),
+        _ => None,
+    };
+    if let Some(logical) = nested {
+        collect_logical_operands(&logical.lhs, operator, operands);
+        collect_logical_operands(&logical.rhs, operator, operands);
+    } else {
+        operands.push(expr);
     }
 }
 

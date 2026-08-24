@@ -405,6 +405,10 @@ enum ReadabilityAssertion {
         before: String,
         after: String,
     },
+    MaxLineLength {
+        line: usize,
+        max: usize,
+    },
 }
 
 #[path = "support/chunk_patch.rs"]

@@ -311,8 +311,13 @@ fn lower_proto_node(
         body: build_proto_body(id, &lowering)?,
         children: lowering.hir_children(),
     };
-    artifacts.promotion_facts[id.index()] =
-        ProtoPromotionFacts::from_plan(dataflow, structure.plan(), &slot_epochs);
+    artifacts.promotion_facts[id.index()] = ProtoPromotionFacts::from_plan(
+        proto,
+        dataflow,
+        structure.plan(),
+        &slot_epochs,
+        &lowering.bindings.fixed_temps,
+    );
 
     Ok(LoweredProtoResult {
         id,

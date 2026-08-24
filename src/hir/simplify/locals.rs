@@ -42,7 +42,10 @@ use std::{
     rc::Rc,
 };
 
-use super::mention::{stmts_reference_captured_bindings, stmts_to_be_closed_temps};
+use super::mention::{
+    stmts_reference_captured_bindings, stmts_to_be_closed_temps, stmts_value_captured_bindings,
+};
+use super::root_lifetimes::collect_call_root_lifetimes;
 use super::temp_touch::{
     TempRefScopeTracker, TempTouchIndex, collect_temp_reads_by_stmt, collect_temp_refs_by_stmt,
     collect_temp_refs_in_expr, expr_touches_any_temp, stmt_consumes_temps_only_in_control_head,
@@ -68,8 +71,10 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     let mut new_locals = Vec::new();
     let mut new_local_debug_hints = Vec::new();
     let mut promoted_bindings = Vec::new();
+    let mut direct_seed_promotions = Vec::new();
     let mut debug_scope_locals = BTreeMap::new();
     let mut identity_sensitive_temps = stmts_reference_captured_bindings(&proto.body.stmts).temps;
+    identity_sensitive_temps.extend(stmts_value_captured_bindings(&proto.body.stmts).temps);
     identity_sensitive_temps.extend(stmts_to_be_closed_temps(&proto.body.stmts));
     let result = {
         let mut ctx = PromotionCtx {
@@ -80,6 +85,7 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
             new_locals: &mut new_locals,
             new_local_debug_hints: &mut new_local_debug_hints,
             promoted_bindings: &mut promoted_bindings,
+            direct_seed_promotions: &mut direct_seed_promotions,
             identity_sensitive_temps: &identity_sensitive_temps,
             debug_scope_locals: &mut debug_scope_locals,
             compact_home_slots,
@@ -97,6 +103,9 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
         if let Some(home_slot) = facts.home_slot(temp) {
             facts.record_local_home_slot(local, home_slot);
         }
+    }
+    for (temp, local) in direct_seed_promotions {
+        facts.record_direct_table_seed_promotion(temp, local);
     }
     for (temp, local) in promoted_bindings {
         facts.record_temp_to_local_merge(temp, local);
@@ -178,6 +187,7 @@ struct PromotionCtx<'a> {
     new_locals: &'a mut Vec<LocalId>,
     new_local_debug_hints: &'a mut Vec<Option<String>>,
     promoted_bindings: &'a mut Vec<(TempId, LocalId)>,
+    direct_seed_promotions: &'a mut Vec<(TempId, LocalId)>,
     identity_sensitive_temps: &'a BTreeSet<TempId>,
     debug_scope_locals: &'a mut BTreeMap<(HomeSlotKey, usize), LocalId>,
     compact_home_slots: bool,
@@ -193,6 +203,7 @@ struct PlanAllocator<'a> {
     new_locals: &'a mut Vec<LocalId>,
     new_local_debug_hints: &'a mut Vec<Option<String>>,
     promoted_bindings: &'a mut Vec<(TempId, LocalId)>,
+    direct_seed_promotions: &'a mut Vec<(TempId, LocalId)>,
     debug_scope_locals: &'a mut BTreeMap<(HomeSlotKey, usize), LocalId>,
 }
 
@@ -414,10 +425,17 @@ fn collect_plans(
     let stmt_temp_reads = collect_temp_reads_by_stmt(&block.stmts);
     let mut plans = Vec::new();
     let temp_touches = TempTouchIndex::new(stmt_temp_refs);
+    let call_root_lifetimes = collect_call_root_lifetimes(&block.stmts, facts, |temp| {
+        !ctx.identity_sensitive_temps.contains(&temp)
+            && temp_debug_locals
+                .get(temp.index())
+                .is_none_or(Option::is_none)
+    });
     let mut reserved_temps = BTreeSet::new();
     let mut reserved_alias_indices = BTreeSet::new();
     let mut slot_candidates = inherited_sticky_slots.clone();
     let mut sticky_slots = inherited_sticky_slots.clone();
+    let mut call_root_locals = BTreeMap::<usize, LocalId>::new();
     for (decl_index, stmt) in block.stmts.iter().enumerate() {
         if reserved_alias_indices.contains(&decl_index) {
             activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
@@ -476,16 +494,25 @@ fn collect_plans(
             debug_scope_for_temp_group(temp_debug_scopes, &group)
                 .and_then(|scope| ctx.debug_scope_locals.get(&(slot, scope)).copied())
         });
-        let reusable_local = sticky_local.or(debug_local).or_else(|| {
-            ctx.compact_home_slots
-                .then(|| home_slot.and_then(|slot| slot_candidates.get(&slot).copied()))
-                .flatten()
-        });
+        let preceding_call_root = call_root_lifetimes.root_for_overwrite(decl_index);
+        let preceding_call_root_local =
+            preceding_call_root.and_then(|root| call_root_locals.get(&root).copied());
+        let force_call_root_local =
+            call_root_lifetimes.is_root(decl_index) || preceding_call_root_local.is_some();
+        let reusable_local = sticky_local
+            .or(debug_local)
+            .or(preceding_call_root_local)
+            .or_else(|| {
+                ctx.compact_home_slots
+                    .then(|| home_slot.and_then(|slot| slot_candidates.get(&slot).copied()))
+                    .flatten()
+            });
 
-        if sticky_local.is_none() && touching_stmt_indices.is_empty() {
+        if sticky_local.is_none() && !force_call_root_local && touching_stmt_indices.is_empty() {
             continue;
         }
         if sticky_local.is_none()
+            && !force_call_root_local
             && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
             && std::iter::once(decl_index)
                 .chain(touching_stmt_indices.iter().copied())
@@ -493,7 +520,7 @@ fn collect_plans(
         {
             continue;
         }
-        if sticky_local.is_none() {
+        if sticky_local.is_none() && !force_call_root_local {
             let first_touch_index = touching_stmt_indices.first().copied();
             // 只在控制头里单次消费的 temp，更像机械性的结构参数而不是源码级 local。
             // 只有一次后续消费的全局别名或字符串常量，必须结合消费站点判定：
@@ -531,9 +558,10 @@ fn collect_plans(
             new_locals: ctx.new_locals,
             new_local_debug_hints: ctx.new_local_debug_hints,
             promoted_bindings: ctx.promoted_bindings,
+            direct_seed_promotions: ctx.direct_seed_promotions,
             debug_scope_locals: ctx.debug_scope_locals,
         };
-        if let Some(local) = reusable_local {
+        let selected_local = if let Some(local) = reusable_local {
             allocator.reuse_existing_local(
                 decl_index,
                 local,
@@ -542,6 +570,7 @@ fn collect_plans(
                 removable_aliases,
                 PromotionInit::FromAssign,
             );
+            local
         } else {
             allocator.allocate_local(
                 decl_index,
@@ -550,11 +579,21 @@ fn collect_plans(
                 removable_aliases,
                 PromotionInit::FromAssign,
             );
-            if let Some(slot) = home_slot
-                && let Some(local) = allocator.plans.last().map(|plan| plan.local)
-            {
+            let local = allocator
+                .plans
+                .last()
+                .expect("allocated promotion plan must exist")
+                .local;
+            if let Some(slot) = home_slot {
                 slot_candidates.insert(slot, local);
             }
+            if ctx.facts.is_direct_table_seed_temp(root_temp) {
+                allocator.direct_seed_promotions.push((root_temp, local));
+            }
+            local
+        };
+        if call_root_lifetimes.is_root(decl_index) {
+            call_root_locals.insert(decl_index, selected_local);
         }
     }
 
@@ -583,6 +622,7 @@ fn collect_plans(
                 new_locals: ctx.new_locals,
                 new_local_debug_hints: ctx.new_local_debug_hints,
                 promoted_bindings: ctx.promoted_bindings,
+                direct_seed_promotions: ctx.direct_seed_promotions,
                 debug_scope_locals: ctx.debug_scope_locals,
             };
             if let Some(local) = home_slot.and_then(|slot| {

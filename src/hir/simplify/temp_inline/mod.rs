@@ -57,6 +57,7 @@ use self::usage::{
     max_temp_index_in_block,
 };
 use super::mention::{ReferenceCapturedBindings, stmt_writes_temp};
+use super::root_lifetimes::collect_call_root_lifetimes;
 use super::temp_touch::stmt_contains_nested_nonlocal_control;
 
 const NESTED_INLINE_MAX_COMPLEXITY: usize = 5;
@@ -221,6 +222,8 @@ fn inline_temps_in_block(
     inherited_captured_slots: &BTreeSet<HomeSlotKey>,
 ) -> bool {
     let mut changed = false;
+    let mut call_root_lifetimes =
+        collect_call_root_lifetimes(&block.stmts, facts, |_| true).marked_stmts(block.stmts.len());
     let mut captured_slots_before_stmt =
         CapturedSlotSnapshots::new(block.stmts.len(), inherited_captured_slots);
     let mut active_captured_slots = inherited_captured_slots.clone();
@@ -254,10 +257,13 @@ fn inline_temps_in_block(
         facts,
         &captured_slots_before_stmt,
         reference_captured,
+        &call_root_lifetimes,
     ) {
         changed = true;
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
+        call_root_lifetimes = collect_call_root_lifetimes(&block.stmts, facts, |_| true)
+            .marked_stmts(block.stmts.len());
     }
 
     // proto 级 live use count 会随成功内联同步减少；当前 block 只需保留下一条
@@ -273,6 +279,14 @@ fn inline_temps_in_block(
         .rev()
     {
         if let Some((temp, value)) = inline_candidate(&stmt)
+            && !call_root_lifetimes[index]
+            // A call result stored in a table can outlive the immediate write. Removing the
+            // temp would remove the only lexical/VM root before a later rawset or table clear;
+            // keep that producer unless a separate lifetime proof exists.
+            && !(matches!(value, HirExpr::Call(_))
+                && kept_rev
+                    .last()
+                    .is_some_and(|next_stmt| stmt_stores_temp_in_table(next_stmt, temp)))
             && !workspace.uses.has_debug_local_hint(temp)
             && !temp_rebinds_captured_slot(
                 temp,
@@ -433,6 +447,45 @@ impl CapturedSlotSnapshots {
     }
 }
 
+fn stmt_stores_temp_in_table(stmt: &HirStmt, temp: TempId) -> bool {
+    match stmt {
+        HirStmt::Assign(assign) => {
+            let table_lvalue = assign.targets.iter().any(|target| {
+                matches!(
+                    target,
+                    HirLValue::TableAccess(access)
+                        if expr_touches_temp(&access.base, temp)
+                            || expr_touches_temp(&access.key, temp)
+                )
+            });
+            let table_constructor_value = assign.values.iter().any(|value| {
+                matches!(value, HirExpr::TableConstructor(_)) && expr_touches_temp(value, temp)
+            });
+            table_lvalue
+                || table_constructor_value
+                || (assign
+                    .targets
+                    .iter()
+                    .any(|target| matches!(target, HirLValue::TableAccess(_)))
+                    && assign
+                        .values
+                        .iter()
+                        .any(|value| expr_touches_temp(value, temp)))
+        }
+        HirStmt::TableSetList(set_list) => {
+            expr_touches_temp(&set_list.base, temp)
+                || set_list
+                    .values
+                    .iter()
+                    .any(|value| expr_touches_temp(value, temp))
+        }
+        HirStmt::LocalDecl(local_decl) => local_decl.values.iter().any(|value| {
+            matches!(value, HirExpr::TableConstructor(_)) && expr_touches_temp(value, temp)
+        }),
+        _ => false,
+    }
+}
+
 fn inline_materialization_runs(
     block: &mut HirBlock,
     workspace: &mut TempInlineWorkspace,
@@ -440,6 +493,7 @@ fn inline_materialization_runs(
     facts: &ProtoPromotionFacts,
     captured_slots_before_stmt: &CapturedSlotSnapshots,
     reference_captured: &ReferenceCapturedBindings,
+    call_root_lifetimes: &[bool],
 ) -> bool {
     // child block 已全部处理完才会到这里，因此同一个 proto 级 workspace 不会覆盖
     // 仍在活跃递归 frame 中的 parent 索引。
@@ -463,6 +517,13 @@ fn inline_materialization_runs(
         let mut run_end = run_start + 1;
         while run_end < block.stmts.len() && inline_candidate(&block.stmts[run_end]).is_some() {
             run_end += 1;
+        }
+        if call_root_lifetimes[run_start..run_end]
+            .iter()
+            .any(|preserve| *preserve)
+        {
+            index = run_end;
+            continue;
         }
         if scope.allows_open_return()
             && inline_open_return_fixed_alias_run(
@@ -560,6 +621,11 @@ fn inline_materialization_runs(
                 facts,
                 captured_slots_before_stmt,
             );
+            if matches!(value, HirExpr::Call(_)) && stmt_stores_temp_in_table(&rewritten_sink, temp)
+            {
+                complete_run = false;
+                break;
+            }
             if use_count == 0 {
                 if candidate_is_safe && expr_is_discard_safe(value) {
                     discarded_uses.push(collect_expr_temp_uses_summary(value, uses));

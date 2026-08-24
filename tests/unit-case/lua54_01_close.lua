@@ -235,6 +235,193 @@ local function test_param_alias_gc_root()
     print("lua54_01_close#7", alive, alias_alive)
 end
 
+-- lua54_01_close#8: table seed覆盖必须先于字段RHS
+local function test_table_seed_overwrite_order()
+    local finalized = 0
+    local observed
+    local function make_old_value()
+        return setmetatable({}, {
+            __gc = function()
+                finalized = finalized + 1
+            end,
+        })
+    end
+    local function observe_collection()
+        collectgarbage("collect")
+        observed = finalized
+        return "value"
+    end
+
+    local table_value = make_old_value()
+    local turns = 0
+    while turns < 1 do
+        turns = turns + 1
+        table_value = {}
+        table_value.field = observe_collection()
+    end
+    assert(observed == 1)
+    print("lua54_01_close#8", observed, table_value.field)
+end
+
+-- lua54_01_close#9: constructor producer不能删除已有local的覆盖
+local function test_constructor_producer_overwrite_order()
+    local finalized = 0
+    local function make_old_value()
+        return setmetatable({}, {
+            __gc = function()
+                finalized = finalized + 1
+            end,
+        })
+    end
+    local function replacement()
+        collectgarbage("collect")
+        assert(finalized == 0)
+        return "replacement"
+    end
+
+    local old = make_old_value()
+    assert(old ~= nil)
+    local table_value = {}
+    old = replacement()
+    table_value.field = old
+    collectgarbage("collect")
+    assert(finalized == 1)
+    print("lua54_01_close#9", finalized, table_value.field)
+end
+
+-- lua54_01_close#10: nil数组槽不能被折叠成带空洞的构造器
+local function test_nil_array_hole_length()
+    local table_value = {}
+    table_value[1] = nil
+    table_value[2] = 1
+    assert(#table_value == 0)
+    print("lua54_01_close#10", #table_value)
+end
+
+-- lua54_01_close#11: 运行时 nil 也不能被当成已填充的数组槽
+local function test_runtime_nil_array_hole()
+    local function maybe_nil()
+        return nil
+    end
+    local value = maybe_nil()
+    local table_value = {}
+    table_value[1] = value
+    table_value[2] = 1
+    assert(#table_value == 0)
+    print("lua54_01_close#11", #table_value)
+end
+
+-- lua54_01_close#12: 非 nil 构造器值不能跨整数键重排副作用
+local function test_integer_write_order()
+    local order = {}
+    local function mark(value)
+        order[#order + 1] = value
+        return {}
+    end
+    local table_value = {}
+    table_value[2] = mark("second")
+    table_value[1] = mark("first")
+    assert(order[1] == "second" and order[2] == "first")
+    print("lua54_01_close#12", order[1], order[2])
+end
+
+-- lua54_01_close#13: 被折入构造器的 producer 仍须保留对象 root
+local function test_constructor_producer_root_lifetime()
+    local finalized = 0
+    local function make_gc_value()
+        return setmetatable({}, {
+            __gc = function()
+                finalized = finalized + 1
+            end,
+        })
+    end
+
+    local value = make_gc_value()
+    local table_value = { value }
+    table_value[1] = nil
+    collectgarbage("collect")
+    assert(finalized == 0)
+    print("lua54_01_close#13", finalized, table_value[1])
+end
+
+-- lua54_01_close#14: constructor不能删除独立producer local的强引用
+local function test_constructor_independent_producer_root()
+    local finalized = 0
+    local function make_gc_value()
+        return setmetatable({}, {
+            __gc = function()
+                finalized = finalized + 1
+            end,
+        })
+    end
+
+    local value = make_gc_value()
+    local table_value = {}
+    table_value[1] = value
+    rawset(table_value, 1, nil)
+    collectgarbage("collect")
+    assert(finalized == 0)
+    print("lua54_01_close#14", finalized, table_value[1])
+end
+
+-- lua54_01_close#15: seed尾部的运行时nil不能在后续SETLIST后变成已填充数组槽
+local function test_fixed_setlist_combined_nil_shape()
+    local first = nil
+    local table_value = { first }
+    table_value[2] = 1
+    assert(#table_value == 0)
+    print("lua54_01_close#15", #table_value)
+end
+
+-- lua54_01_close#16: 多级alias的producer仍须保留强引用到table清空之后
+local function test_constructor_alias_root_lifetime()
+    local finalized = 0
+    local function make_gc_value()
+        return setmetatable({}, {
+            __gc = function()
+                finalized = finalized + 1
+            end,
+        })
+    end
+
+    local table_value = {}
+    local first = make_gc_value()
+    local second = first
+    local third = second
+    table_value[1] = third
+    rawset(table_value, 1, nil)
+    collectgarbage("collect")
+    assert(finalized == 0)
+    print("lua54_01_close#16", finalized)
+end
+
+-- lua54_01_close#17: 无显式读取的call结果仍是同槽清空前的GC root
+local function test_unused_call_result_root_lifetime()
+    local finalized = 0
+    local function make_gc_value()
+        return setmetatable({}, {
+            __gc = function()
+                finalized = finalized + 1
+            end,
+        })
+    end
+
+    local function observe()
+        local value = make_gc_value()
+        collectgarbage("collect")
+        local before_clear = finalized
+        value = nil
+        collectgarbage("collect")
+        return before_clear, finalized
+    end
+
+    local before_clear, after_clear = observe()
+    assert(before_clear == 0)
+    assert(after_clear == 1)
+    print("lua54_01_close#17", before_clear, after_clear)
+end
+
+
 test_tbc_basic()
 test_tbc_multi_exit()
 test_tbc_goto_reenter()
@@ -242,3 +429,13 @@ test_close_tailcall()
 test_for_const_close()
 test_tbc_param_binding()
 test_param_alias_gc_root()
+test_table_seed_overwrite_order()
+test_constructor_producer_overwrite_order()
+test_nil_array_hole_length()
+test_runtime_nil_array_hole()
+test_integer_write_order()
+test_constructor_producer_root_lifetime()
+test_constructor_independent_producer_root()
+test_fixed_setlist_combined_nil_shape()
+test_constructor_alias_root_lifetime()
+test_unused_call_result_root_lifetime()

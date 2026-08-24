@@ -1,4 +1,5 @@
 -- regress_07_method_receiver_single_value#1: receiver-only method chain should not treat receiver as final arg
+-- unluac: expect-not-contains [[(function()]]
 local function test_method_receiver_chain()
     local child = {
         opened = false,

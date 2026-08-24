@@ -4,6 +4,7 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-not-contains [[(function()]]
 local show_editor = false
 
 local block_table = {

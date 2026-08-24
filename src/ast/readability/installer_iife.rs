@@ -1,11 +1,20 @@
-//! `installer_iife`：把“匿名安装器立即调用”从合法 AST 收回成可读性更稳定的局部名。
+//! `installer_iife`：把需要独立展示的匿名立即调用从合法 AST 收回成局部函数名。
 //!
-//! 这个 pass 处理“匿名函数只负责准备局部上下文并导出一个函数值，然后立刻调用”的 IIFE：
-//! 它会把输入
+//! 这个 pass 处理两类 IIFE。匿名安装器沿用父 block 中的局部名：
+//!
 //! ` (function(x) local f = function(y) return x, y end; emit = f end)("ax") `
-//! 收成
+//!
+//! 会收成
+//!
 //! ` local l0 = function(x) local f = function(y) return x, y end; emit = f end; l0("ax") `
-//! 然后交给后面的 `function_sugar` 再决定是否继续变成 `local function l0(x) ... end`。
+//!
+//! 其它包含多条语句或复合控制流的 IIFE 则放进最小 `do` 作用域：
+//!
+//! ` do local l0 = function() BODY end; l0() end `
+//!
+//! 这样新增 closure binding 会在原调用点后立即死亡，不会把 captured value 的 root
+//! 生命周期延长到父 block 末尾。单条简单语句的短 IIFE 保留原样。两类结果都交给后面的
+//! `function_sugar` 再决定是否继续变成 `local function l0(...) ... end`。
 //!
 //! 它依赖 AST build 已经把直接调用的 callee 落成合法 `FunctionExpr`，也依赖
 //! `materialize-temps` 先把 AST 自己残留的 temp 物化掉，这样这里新增的名字只需要走
@@ -46,9 +55,10 @@ impl AstRewritePass for InstallerIifePass {
                 index += 1;
                 continue;
             };
+            let rewritten_len = rewritten.len();
             block.stmts.splice(index..=index, rewritten);
             changed = true;
-            index += 2;
+            index += rewritten_len;
         }
         changed
     }
@@ -67,14 +77,15 @@ fn rewrite_installer_iife_stmt(
     let AstExpr::FunctionExpr(function) = &call.callee else {
         return None;
     };
-    if !function_expr_looks_like_named_installer(function) {
+    let is_named_installer = function_expr_looks_like_named_installer(function);
+    if !is_named_installer && !function_expr_is_substantial(function) {
         return None;
     }
 
     let binding_id = AstSyntheticLocalId(TempId(*next_synthetic_local));
     *next_synthetic_local += 1;
 
-    Some(vec![
+    let rewritten = vec![
         AstStmt::LocalDecl(Box::new(AstLocalDecl {
             bindings: vec![AstLocalBinding {
                 id: AstBindingRef::SyntheticLocal(binding_id),
@@ -89,7 +100,41 @@ fn rewrite_installer_iife_stmt(
                 args: call.args.clone(),
             })),
         })),
-    ])
+    ];
+
+    if is_named_installer {
+        Some(rewritten)
+    } else {
+        Some(vec![AstStmt::DoBlock(Box::new(AstBlock {
+            stmts: rewritten,
+        }))])
+    }
+}
+
+fn function_expr_is_substantial(function: &AstFunctionExpr) -> bool {
+    let body_stmts = substantive_function_body_stmts(function);
+    body_stmts.len() > 1
+        || matches!(
+            body_stmts.first(),
+            Some(
+                AstStmt::If(_)
+                    | AstStmt::While(_)
+                    | AstStmt::Repeat(_)
+                    | AstStmt::NumericFor(_)
+                    | AstStmt::GenericFor(_)
+                    | AstStmt::DoBlock(_)
+                    | AstStmt::FunctionDecl(_)
+                    | AstStmt::LocalFunctionDecl(_)
+            )
+        )
+}
+
+fn substantive_function_body_stmts(function: &AstFunctionExpr) -> &[AstStmt] {
+    let body_stmts = function.body.stmts.as_slice();
+    match body_stmts.last() {
+        Some(AstStmt::Return(ret)) if ret.values.is_empty() => &body_stmts[..body_stmts.len() - 1],
+        _ => body_stmts,
+    }
 }
 
 fn next_synthetic_local_index_in_block(block: &AstBlock) -> usize {
@@ -186,11 +231,7 @@ impl SyntheticLocalCollector {
 }
 
 fn function_expr_looks_like_named_installer(function: &AstFunctionExpr) -> bool {
-    let body_stmts = function.body.stmts.as_slice();
-    let body_stmts = match body_stmts.last() {
-        Some(AstStmt::Return(ret)) if ret.values.is_empty() => &body_stmts[..body_stmts.len() - 1],
-        _ => body_stmts,
-    };
+    let body_stmts = substantive_function_body_stmts(function);
     let Some((installer_stmt, setup_stmts)) = body_stmts.split_last() else {
         return false;
     };

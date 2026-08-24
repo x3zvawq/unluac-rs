@@ -1,6 +1,8 @@
 -- regress_164_lua55_wide_global_decl#1: 宽常量环境访问仍须与 ERRNNIL 配对恢复 global 声明
 -- unluac: expect-contains [[global boundary_name = 1]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-contains [["k000", "k001", "k002"]]
+-- unluac: expect-max-line-length [[120]]
 local values = {
     "k000",
     "k001",

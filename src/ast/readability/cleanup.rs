@@ -14,11 +14,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::common::{
-    AstBindingRef, AstBlock, AstCallKind, AstCallStmt, AstExpr, AstLocalAttr, AstLocalOrigin,
-    AstModule, AstStmt,
+    AstBindingRef, AstBlock, AstCallKind, AstCallStmt, AstExpr, AstLocalAttr, AstLocalDecl,
+    AstLocalOrigin, AstModule, AstStmt,
 };
 use super::ReadabilityContext;
-use super::binding_flow::{BindingUseIndex, binding_mentions_in_stmt};
+use super::binding_flow::{BindingUseIndex, binding_mentions_in_expr, binding_mentions_in_stmt};
 use super::expr_analysis::is_discard_safe_expr;
 use super::walk::{self, AstRewritePass, BlockKind};
 
@@ -67,12 +67,19 @@ fn cleanup_block(
     }
     block.stmts = flattened_stmts;
 
+    // A recovered call result can be an implementation-only value that is immediately
+    // overwritten before any read. Keep the call at its original evaluation point, but
+    // declare the binding with the value that actually survives. This removes a misleading
+    // `local x = f(); x = value` pair without moving a call across another statement.
+    changed |= split_overwritten_call_result_locals(block);
+
     // 尾部 do-end 展开：当 do-end 是块的最后一条语句时，其内部 local 的作用域
     // 在父块结束处同样终止，do-end 仅是多余的缩进壳。
     // 典型来源：guard-flip 把 `if cond then BODY else return end` 拉平成
     // `if not cond then return end; do BODY end`，其中 BODY 含 local 声明。
-    // 例外：global 声明和 `<close>` local 的 do-end 有实际作用域语义，保留。尤其
-    // repeat body 与 until 条件共享外层作用域，拍平资源块会把关闭时点推迟到条件之后。
+    // 例外：global 声明、`<close>` local 和局部 closure 的 do-end 有实际作用域语义，
+    // 保留。尤其 repeat body 与 until 条件共享外层作用域，拍平资源块会把关闭时点推迟到
+    // 条件之后；局部 closure 则会把自身和 captured value 的 root 生命周期延长到父块末尾。
     while let Some(AstStmt::DoBlock(nested)) = block.stmts.last()
         && trailing_do_block_is_scope_neutral(nested)
     {
@@ -161,13 +168,94 @@ fn cleanup_block(
     changed
 }
 
+fn split_overwritten_call_result_locals(block: &mut AstBlock) -> bool {
+    let old_stmts = std::mem::take(&mut block.stmts);
+    let mut rewritten = Vec::with_capacity(old_stmts.len());
+    let mut changed = false;
+    let mut index = 0;
+
+    while index < old_stmts.len() {
+        if let Some((call, declaration)) =
+            old_stmts.get(index).zip(old_stmts.get(index + 1)).and_then(
+                |(declaration, overwrite)| split_overwritten_call_result(declaration, overwrite),
+            )
+        {
+            rewritten.push(AstStmt::CallStmt(Box::new(AstCallStmt { call })));
+            rewritten.push(AstStmt::LocalDecl(Box::new(declaration)));
+            index += 2;
+            changed = true;
+        } else {
+            rewritten.push(
+                old_stmts
+                    .get(index)
+                    .cloned()
+                    .expect("cleanup scan index must stay in bounds"),
+            );
+            index += 1;
+        }
+    }
+
+    block.stmts = rewritten;
+    changed
+}
+
+fn split_overwritten_call_result(
+    declaration: &AstStmt,
+    overwrite: &AstStmt,
+) -> Option<(AstCallKind, AstLocalDecl)> {
+    let AstStmt::LocalDecl(local_decl) = declaration else {
+        return None;
+    };
+    let AstStmt::Assign(assign) = overwrite else {
+        return None;
+    };
+    let [binding] = local_decl.bindings.as_slice() else {
+        return None;
+    };
+    let [call_value] = local_decl.values.as_slice() else {
+        return None;
+    };
+    if binding.attr != AstLocalAttr::None || binding.origin != AstLocalOrigin::Recovered {
+        return None;
+    }
+    let [target] = assign.targets.as_slice() else {
+        return None;
+    };
+    let [replacement] = assign.values.as_slice() else {
+        return None;
+    };
+    if !matches!(target, super::super::common::AstLValue::Name(name) if binding.id.matches_name_ref(name))
+        || binding_mentions_in_expr(call_value).contains(&binding.id)
+        || binding_mentions_in_expr(replacement).contains(&binding.id)
+    {
+        return None;
+    }
+
+    let call = into_call_kind(call_value.clone()).ok()?;
+
+    Some((
+        call,
+        AstLocalDecl {
+            bindings: local_decl.bindings.clone(),
+            values: vec![replacement.clone()],
+        },
+    ))
+}
+
 fn trailing_do_block_is_scope_neutral(block: &AstBlock) -> bool {
     !block.stmts.iter().any(|stmt| match stmt {
         AstStmt::GlobalDecl(_) => true,
-        AstStmt::LocalDecl(local_decl) => local_decl
-            .bindings
-            .iter()
-            .any(|binding| binding.attr == AstLocalAttr::Close),
+        AstStmt::LocalDecl(local_decl) => {
+            local_decl
+                .bindings
+                .iter()
+                .any(|binding| binding.attr == AstLocalAttr::Close)
+                || local_decl
+                    .values
+                    .iter()
+                    .any(|value| matches!(value, AstExpr::FunctionExpr(_)))
+        }
+        AstStmt::LocalFunctionDecl(_) => true,
         _ => false,
     })
 }
@@ -260,5 +348,80 @@ fn into_call_kind(expr: AstExpr) -> Result<AstCallKind, AstExpr> {
             into_call_kind(*inner).map_err(|inner| AstExpr::SingleValue(Box::new(inner)))
         }
         other => Err(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::common::{
+        AstAssign, AstCallExpr, AstGlobalName, AstLValue, AstLocalBinding, AstNameRef,
+    };
+    use crate::hir::LocalId;
+
+    fn recovered_binding() -> AstLocalBinding {
+        AstLocalBinding {
+            id: AstBindingRef::Local(LocalId(0)),
+            attr: AstLocalAttr::None,
+            origin: AstLocalOrigin::Recovered,
+        }
+    }
+
+    fn call_value() -> AstExpr {
+        AstExpr::Call(Box::new(AstCallExpr {
+            callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                text: "factory".to_owned(),
+            })),
+            args: vec![],
+        }))
+    }
+
+    #[test]
+    fn splits_recovered_call_result_before_direct_overwrite() {
+        let binding = recovered_binding();
+        let declaration = AstStmt::LocalDecl(Box::new(AstLocalDecl {
+            bindings: vec![binding.clone()],
+            values: vec![call_value()],
+        }));
+        let overwrite = AstStmt::Assign(Box::new(AstAssign {
+            targets: vec![AstLValue::Name(binding.id.to_name_ref())],
+            values: vec![AstExpr::Integer(9)],
+        }));
+
+        let (call, rewritten) = split_overwritten_call_result(&declaration, &overwrite)
+            .expect("a recovered call result with a direct overwrite is safe to split");
+        assert!(matches!(call, AstCallKind::Call(_)));
+        assert_eq!(rewritten.bindings, vec![binding]);
+        assert_eq!(rewritten.values, vec![AstExpr::Integer(9)]);
+    }
+
+    #[test]
+    fn keeps_debug_and_self_referencing_call_results() {
+        let mut debug_binding = recovered_binding();
+        debug_binding.origin = AstLocalOrigin::DebugHinted;
+        let debug_decl = AstStmt::LocalDecl(Box::new(AstLocalDecl {
+            bindings: vec![debug_binding.clone()],
+            values: vec![call_value()],
+        }));
+        let debug_write = AstStmt::Assign(Box::new(AstAssign {
+            targets: vec![AstLValue::Name(debug_binding.id.to_name_ref())],
+            values: vec![AstExpr::Integer(9)],
+        }));
+        assert!(split_overwritten_call_result(&debug_decl, &debug_write).is_none());
+
+        let binding = recovered_binding();
+        let self_call = AstExpr::Call(Box::new(AstCallExpr {
+            callee: AstExpr::Var(binding.id.to_name_ref()),
+            args: vec![],
+        }));
+        let declaration = AstStmt::LocalDecl(Box::new(AstLocalDecl {
+            bindings: vec![binding.clone()],
+            values: vec![self_call],
+        }));
+        let overwrite = AstStmt::Assign(Box::new(AstAssign {
+            targets: vec![AstLValue::Name(binding.id.to_name_ref())],
+            values: vec![AstExpr::Integer(9)],
+        }));
+        assert!(split_overwritten_call_result(&declaration, &overwrite).is_none());
     }
 }

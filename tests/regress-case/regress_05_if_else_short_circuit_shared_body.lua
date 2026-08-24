@@ -1,3 +1,4 @@
+-- unluac: expect-not-contains [[(function()]]
 local dead_blocks = {
   one = { material = "wood" },
   two = { material = "bubble" },

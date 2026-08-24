@@ -1,4 +1,5 @@
 -- regress_229_long_short_circuit_chain#1: 超过 fixed-point 轮数的值/条件长链必须一次收敛
+-- unluac: expect-max-line-length [[120]]
 local function pick(values)
     return
         values[1]

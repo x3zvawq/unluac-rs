@@ -1,7 +1,8 @@
 -- regress_25_table_setlist_trailing_short_circuit#1: SETLIST 尾部多返回里的短路左值 producer 可以折回构造器
--- unluac: expect-contains [[themeLayerTags = { tostring(]]
+-- unluac: expect-contains [[{ tostring(]]
 -- unluac: expect-contains [[background or 0]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-not-contains [[table-set-list]]
 local function build_tags(loaded)
     local objects = {}
     if not loaded.themeLayertags then

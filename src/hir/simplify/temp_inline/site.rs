@@ -20,10 +20,14 @@ pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<Inline
             .iter()
             .find_map(|target| find_site_in_lvalue(target, temp, InlineSite::Direct))
             .or_else(|| find_site_in_exprs(&assign.values, temp, InlineSite::Direct)),
-        HirStmt::TableSetList(set_list) => {
-            find_site_in_expr(&set_list.base, temp, InlineSite::Direct)
-                .or_else(|| find_site_in_exprs(&set_list.values, temp, InlineSite::Direct))
-        }
+        // SETLIST carries raw table-write semantics and the physical lifetime of its base
+        // register.  Keep that base as a direct binding so the table-constructor pass can prove
+        // its NewTable origin/home slot; inlining the producer here loses both facts and used to
+        // require materializing an unrelated block-local owner afterward.  Values remain normal
+        // direct sites.
+        HirStmt::TableSetList(set_list) => (!expr_touches_temp(&set_list.base, temp))
+            .then(|| find_site_in_exprs(&set_list.values, temp, InlineSite::Direct))
+            .flatten(),
         HirStmt::CallStmt(call_stmt) => {
             find_site_in_call(&call_stmt.call, temp, InlineSite::Direct)
         }

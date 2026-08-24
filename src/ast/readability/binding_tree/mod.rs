@@ -176,6 +176,96 @@ pub(super) fn stmt_has_nested_binding_value_use(stmt: &AstStmt, binding: AstBind
     )
 }
 
+/// Return whether a binding is stored in a table constructor or table lvalue at this statement.
+/// A call-valued local is a strong root until such a table value is cleared; inlining that call
+/// directly into the table would shorten the root lifetime in the generated source.
+pub(super) fn stmt_stores_binding_in_table(stmt: &AstStmt, binding: AstBindingRef) -> bool {
+    match stmt {
+        AstStmt::LocalDecl(local_decl) => local_decl
+            .values
+            .iter()
+            .any(|value| expr_contains_table_binding(value, binding)),
+        AstStmt::Assign(assign) => {
+            let table_target = assign.targets.iter().any(|target| match target {
+                AstLValue::FieldAccess(access) => expr_references_binding(&access.base, binding),
+                AstLValue::IndexAccess(access) => {
+                    expr_references_binding(&access.base, binding)
+                        || expr_references_binding(&access.index, binding)
+                }
+                AstLValue::Name(_) => false,
+            });
+            table_target
+                || (assign.targets.iter().any(|target| {
+                    matches!(
+                        target,
+                        AstLValue::FieldAccess(_) | AstLValue::IndexAccess(_)
+                    )
+                }) && assign.values.iter().any(|value| {
+                    expr_references_binding(value, binding)
+                        || expr_contains_table_binding(value, binding)
+                }))
+        }
+        _ => false,
+    }
+}
+
+fn expr_contains_table_binding(expr: &AstExpr, binding: AstBindingRef) -> bool {
+    match expr {
+        AstExpr::TableConstructor(table) => table.fields.iter().any(|field| match field {
+            AstTableField::Array(value) => expr_references_binding(value, binding),
+            AstTableField::Record(record) => {
+                let key_uses = match &record.key {
+                    AstTableKey::Name(_) => false,
+                    AstTableKey::Expr(key) => expr_references_binding(key, binding),
+                };
+                key_uses || expr_references_binding(&record.value, binding)
+            }
+        }),
+        AstExpr::FieldAccess(access) => expr_contains_table_binding(&access.base, binding),
+        AstExpr::IndexAccess(access) => {
+            expr_contains_table_binding(&access.base, binding)
+                || expr_contains_table_binding(&access.index, binding)
+        }
+        AstExpr::Unary(unary) => expr_contains_table_binding(&unary.expr, binding),
+        AstExpr::Binary(binary) => {
+            expr_contains_table_binding(&binary.lhs, binding)
+                || expr_contains_table_binding(&binary.rhs, binding)
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            expr_contains_table_binding(&logical.lhs, binding)
+                || expr_contains_table_binding(&logical.rhs, binding)
+        }
+        AstExpr::Call(call) => {
+            expr_contains_table_binding(&call.callee, binding)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_contains_table_binding(arg, binding))
+        }
+        AstExpr::MethodCall(call) => {
+            expr_contains_table_binding(&call.receiver, binding)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_contains_table_binding(arg, binding))
+        }
+        AstExpr::SingleValue(inner) => expr_contains_table_binding(inner, binding),
+        AstExpr::FunctionExpr(function) => function.captured_bindings.contains(&binding),
+        AstExpr::Var(_)
+        | AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => false,
+    }
+}
+
 fn call_has_nested_binding_use(call: &AstCallKind, binding: AstBindingRef) -> bool {
     call_has_contextual_binding_use(call, binding, BindingUseContext::Nested { active: false })
 }

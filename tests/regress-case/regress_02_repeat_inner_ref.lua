@@ -2,6 +2,7 @@
 -- unluac: expect-contains [[local r1_2 = r1_1 * 2]]
 -- unluac: expect-contains [[local r1_3 = r1_1 * 3]]
 -- unluac: expect-contains [[until r1_2 > 10 or r1_3 > 20]]
+-- unluac: expect-not-contains [[(function()]]
 local function test_until_inner_ref()
     local result = {}
     local i = 0

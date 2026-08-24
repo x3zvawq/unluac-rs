@@ -4,6 +4,7 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-not-contains [[(function()]]
 local counts = { 3, 0, 0 }
 local modes = { "red", "green", "blue" }
 local current_mode = 1

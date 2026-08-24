@@ -15,6 +15,8 @@
 //!   若中间经过 `close from r0`，后续 `t8(slot 0, epoch 1)` 会被视为新的词法槽位
 //! - carried-local 后续若把不同或未知 home 的 binding 并入同一目标，会持久失效该目标
 //!   binding 的正向 provenance；原始物理槽事实仍保留给 capture/TBC 等负向保护
+//! - 由 `NewTable` canonical def 直接产生的 temp 单独保留 constructor origin；MOVE、
+//!   phi 或后续 local 物化不能冒充分配本身
 
 use crate::hir::common::{
     HirBlock, HirExpr, HirLValue, HirStmt, HirTableField, HirTableKey, LocalId, ParamId, TempId,
@@ -255,6 +257,8 @@ enum HomeSlotResolution {
 #[derive(Debug, Clone, Default)]
 pub(super) struct ProtoPromotionFacts {
     temp_home_slots: Vec<Option<HomeSlotKey>>,
+    direct_table_seed_temps: BTreeSet<TempId>,
+    direct_table_seed_locals: BTreeSet<LocalId>,
     local_home_slots: Vec<HomeSlotResolution>,
     invalidated_param_homes: BTreeSet<ParamId>,
     invalidated_local_homes: BTreeSet<LocalId>,
@@ -265,9 +269,11 @@ pub(super) struct ProtoPromotionFacts {
 impl ProtoPromotionFacts {
     /// 从 canonical def 与最终 value plan 提取当前 proto 的 temp -> home slot 对照表。
     pub(super) fn from_plan(
+        proto: &LoweredProto,
         dataflow: &DataflowFacts,
         plan: &StructurePlan,
         slot_epochs: &SlotEpochFacts,
+        fixed_temps: &[TempId],
     ) -> Self {
         let total_temps = dataflow.defs.len() + plan.phis().len();
         let mut temp_home_slots = vec![None; total_temps];
@@ -277,11 +283,27 @@ impl ProtoPromotionFacts {
 
         Self {
             temp_home_slots,
+            direct_table_seed_temps: collect_direct_table_seed_temps(proto, dataflow, fixed_temps),
+            direct_table_seed_locals: BTreeSet::new(),
             local_home_slots: Vec::new(),
             invalidated_param_homes: BTreeSet::new(),
             invalidated_local_homes: BTreeSet::new(),
             invalidated_temp_homes: BTreeSet::new(),
             compact_home_slots: false,
+        }
+    }
+
+    pub(super) fn is_direct_table_seed_temp(&self, temp: TempId) -> bool {
+        self.direct_table_seed_temps.contains(&temp)
+    }
+
+    pub(super) fn is_direct_table_seed_local(&self, local: LocalId) -> bool {
+        self.direct_table_seed_locals.contains(&local)
+    }
+
+    pub(super) fn record_direct_table_seed_promotion(&mut self, temp: TempId, local: LocalId) {
+        if self.is_direct_table_seed_temp(temp) {
+            self.direct_table_seed_locals.insert(local);
         }
     }
 
@@ -364,6 +386,7 @@ impl ProtoPromotionFacts {
 
     pub(super) fn invalidate_local_home(&mut self, local: LocalId) {
         self.invalidated_local_homes.insert(local);
+        self.direct_table_seed_locals.remove(&local);
     }
 
     pub(super) fn invalidate_temp_home(&mut self, temp: TempId) {
@@ -697,6 +720,32 @@ fn fill_fixed_def_home_slots(
         let epoch = slot_epochs.epoch_at(def.reg, def.instr);
         temp_home_slots[def.id.index()] = Some(HomeSlotKey::new(def.reg.index(), epoch));
     }
+}
+
+fn collect_direct_table_seed_temps(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    fixed_temps: &[TempId],
+) -> BTreeSet<TempId> {
+    proto
+        .instrs
+        .iter()
+        .enumerate()
+        .filter_map(|(instr_index, instr)| {
+            let LowInstr::NewTable(new_table) = instr else {
+                return None;
+            };
+            dataflow.instr_defs[instr_index]
+                .iter()
+                .find(|def| dataflow.defs[def.index()].reg == new_table.dst)
+                .and_then(|def| {
+                    let canonical = fixed_temps.get(def.index()).copied()?;
+                    // loop-state coalescing 可把多个 fixed def 映射到同一个 phi temp；
+                    // 这时 temp 也代表分配前的旧状态，不能再作为 fresh owner 证据。
+                    (canonical == TempId(def.index())).then_some(canonical)
+                })
+        })
+        .collect()
 }
 
 fn fill_phi_home_slots(

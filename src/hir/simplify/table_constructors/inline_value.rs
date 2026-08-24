@@ -186,24 +186,49 @@ pub(super) fn inline_constructor_call(
     context: &mut InlineContext<'_>,
     call: &HirCallExpr,
 ) -> Option<HirCallExpr> {
-    let callee =
-        inline_constructor_value_at_site(context, &call.callee, ConstructorInlineSite::CallCallee)?;
-    let fixed = call
-        .args
-        .fixed
-        .iter()
-        .map(|arg| inline_constructor_value_at_site(context, arg, ConstructorInlineSite::Neutral))
-        .collect::<Option<Vec<_>>>()?;
-    let tail = match &call.args.tail {
-        Some(tail) => Some(
-            tail.clone()
-                .try_map_call(|call| inline_constructor_call(context, &call))?,
-        ),
-        None => None,
+    let inline_args = |context: &mut InlineContext<'_>, args: &HirValuePack| {
+        let fixed = args
+            .fixed
+            .iter()
+            .map(|arg| {
+                inline_constructor_value_at_site(context, arg, ConstructorInlineSite::Neutral)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let tail = match &args.tail {
+            Some(tail) => Some(tail.clone().try_map_call(|nested| {
+                let mapped = inline_constructor_call(context, &nested)?;
+                // `try_map_call` bypasses the normal expression wrapper, so account for the
+                // nested tail call explicitly in the eval-order proof.
+                context.eval_events.push(ConstructorEvalEvent::Barrier);
+                Some(mapped)
+            })?),
+            None => None,
+        };
+        Some(HirValuePack { fixed, tail })
+    };
+
+    // Luau FASTCALL materializes direct arguments before fallback callee setup.  The metadata
+    // is part of HIR's evaluation-order contract even though AST still prints a normal call.
+    let (callee, args) = if call.fastcall.is_some() {
+        let args = inline_args(context, &call.args)?;
+        let callee = inline_constructor_value_at_site(
+            context,
+            &call.callee,
+            ConstructorInlineSite::CallCallee,
+        )?;
+        (callee, args)
+    } else {
+        let callee = inline_constructor_value_at_site(
+            context,
+            &call.callee,
+            ConstructorInlineSite::CallCallee,
+        )?;
+        let args = inline_args(context, &call.args)?;
+        (callee, args)
     };
     Some(HirCallExpr {
         callee,
-        args: HirValuePack { fixed, tail },
+        args,
         method: call.method,
         fastcall: call.fastcall,
         method_name: call.method_name.clone(),

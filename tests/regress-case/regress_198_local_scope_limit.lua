@@ -1,5 +1,6 @@
 -- regress_198_local_scope_limit#1: 大函数的机械 local 必须分段释放，避免生成源码超过编译器上限
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-contains [[(function()]]
 assert((function() return 1 end)() == 1)
 assert((function() return 2 end)() == 2)
 assert((function() return 3 end)() == 3)

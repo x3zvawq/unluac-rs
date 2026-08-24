@@ -399,8 +399,30 @@ fn collect_source_eval_events(
             }
         }
         HirExpr::Call(call) => {
-            for value in std::iter::once(&call.callee).chain(&call.args) {
-                collect_source_eval_events(value, binding_index, producer_index_by_binding, events);
+            if call.fastcall.is_some() {
+                for value in &call.args {
+                    collect_source_eval_events(
+                        value,
+                        binding_index,
+                        producer_index_by_binding,
+                        events,
+                    );
+                }
+                collect_source_eval_events(
+                    &call.callee,
+                    binding_index,
+                    producer_index_by_binding,
+                    events,
+                );
+            } else {
+                for value in std::iter::once(&call.callee).chain(&call.args) {
+                    collect_source_eval_events(
+                        value,
+                        binding_index,
+                        producer_index_by_binding,
+                        events,
+                    );
+                }
             }
         }
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
@@ -695,6 +717,25 @@ fn single_producer(
         }
         _ => None,
     }
+}
+
+/// A producer declaration is removable only when its value cannot carry a source-visible
+/// object/root.  A table field may be cleared before the producer's lexical scope ends, so
+/// aliases, calls, constructors, strings, and unknown expressions must retain their explicit
+/// materialization even if the constructor would otherwise consume them exactly once.
+pub(super) fn producer_value_can_be_dropped(expr: &HirExpr) -> bool {
+    matches!(
+        expr,
+        HirExpr::Nil
+            | HirExpr::Boolean(_)
+            | HirExpr::Integer(_)
+            | HirExpr::Number(_)
+            | HirExpr::String(_)
+            | HirExpr::Int64(_)
+            | HirExpr::UInt64(_)
+            | HirExpr::Vector(_)
+            | HirExpr::Complex { .. }
+    )
 }
 
 fn producer_group_stmt(

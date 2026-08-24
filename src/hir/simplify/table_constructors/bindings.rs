@@ -9,8 +9,7 @@ use std::ops::Bound::{Excluded, Unbounded};
 
 use crate::ast::{DecompileDialect, is_lua_identifier_name};
 use crate::hir::common::{
-    HirCallExpr, HirCaptureMode, HirDecisionTarget, HirExpr, HirLValue, HirStmt, HirTableField,
-    HirTableKey,
+    HirCallExpr, HirDecisionTarget, HirExpr, HirLValue, HirStmt, HirTableField, HirTableKey,
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
@@ -54,6 +53,16 @@ pub(super) struct BindingFacts {
     pub(super) materialized: BindingSlots<u32>,
     pub(super) reference_captured: BindingSlots<bool>,
     pub(super) reference_captured_home_slots: BTreeSet<HomeSlotKey>,
+}
+
+fn binding_home_slot(
+    binding: TableBinding,
+    promotion_facts: &ProtoPromotionFacts,
+) -> Option<HomeSlotKey> {
+    match binding {
+        TableBinding::Temp(temp) => promotion_facts.home_slot(temp),
+        TableBinding::Local(local) => promotion_facts.local_home_slot(local),
+    }
 }
 
 pub(super) fn collect_binding_facts(
@@ -288,13 +297,8 @@ impl BindingOccurrenceIndex {
                             .get(*binding)
                             .copied()
                             .unwrap_or_default()
-                        || matches!(
-                            binding,
-                            TableBinding::Temp(temp)
-                                if promotion_facts.home_slot(*temp).is_some_and(
-                                    |slot| reference_captured_home_slots.contains(&slot)
-                                )
-                        )
+                        || binding_home_slot(*binding, promotion_facts)
+                            .is_some_and(|slot| reference_captured_home_slots.contains(&slot))
                 })
                 .collect(),
         };
@@ -320,15 +324,6 @@ impl BindingOccurrenceIndex {
         self.uses
             .get(binding_id)
             .and_then(|occurrences| occurrences.last().copied())
-    }
-
-    pub(super) fn mentions_after(&self, binding_id: BindingId, stmt_id: usize) -> bool {
-        self.mentions.get(binding_id).is_some_and(|occurrences| {
-            occurrences
-                .range((Excluded(stmt_id), Unbounded))
-                .next()
-                .is_some()
-        })
     }
 
     pub(super) fn remove_stmt(&mut self, stmt_id: usize, summary: &StmtBindingSummary) {
@@ -366,6 +361,8 @@ impl BindingUseSummary<'_> {
 struct BindingFactCollector<'a> {
     promotion_facts: &'a ProtoPromotionFacts,
     materialized: BindingSlots<u32>,
+    // The table pass must preserve both by-reference cells and by-value snapshots.  A
+    // constructor rewrite can otherwise move a declaration before a closure observes it.
     reference_captured: BindingSlots<bool>,
     reference_captured_home_slots: BTreeSet<HomeSlotKey>,
 }
@@ -424,13 +421,10 @@ impl HirVisitor for BindingFactCollector<'_> {
         for binding in closure
             .captures
             .iter()
-            .filter(|capture| capture.mode == HirCaptureMode::ByReference)
             .filter_map(|capture| binding_from_expr(&capture.value))
         {
             *self.reference_captured.get_mut_or_default(binding) = true;
-            if let TableBinding::Temp(temp) = binding
-                && let Some(slot) = self.promotion_facts.home_slot(temp)
-            {
+            if let Some(slot) = binding_home_slot(binding, self.promotion_facts) {
                 self.reference_captured_home_slots.insert(slot);
             }
         }
@@ -490,19 +484,6 @@ pub(super) fn expr_uses_binding(expr: &HirExpr, binding: TableBinding) -> bool {
         | HirExpr::VarArg
         | HirExpr::Unresolved(_) => false,
         HirExpr::TempRef(_) | HirExpr::LocalRef(_) => false,
-    }
-}
-
-pub(super) fn lvalue_uses_binding(lvalue: &HirLValue, binding: TableBinding) -> bool {
-    match lvalue {
-        HirLValue::Temp(temp) => TableBinding::Temp(*temp) == binding,
-        HirLValue::Local(local) => TableBinding::Local(*local) == binding,
-        HirLValue::Param(_) => false,
-        HirLValue::Upvalue(_) => false,
-        HirLValue::Global(_) => false,
-        HirLValue::TableAccess(access) => {
-            expr_uses_binding(&access.base, binding) || expr_uses_binding(&access.key, binding)
-        }
     }
 }
 

@@ -3,6 +3,7 @@
 -- unluac: expect-contains [[arg.n]]
 -- unluac: expect-not-contains [[...arg]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-not-contains [[(function(]]
 local function legacy(arg, ...)
     print("regress_126_lua51_legacy_arg_table#1", type(arg), arg.n, arg[1], arg[2])
 

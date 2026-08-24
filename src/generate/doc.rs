@@ -10,6 +10,7 @@ pub enum Doc {
     Line,
     SoftLine,
     Concat(Vec<Doc>),
+    Fill { docs: Vec<Doc>, separator: Box<Doc> },
     Indent(Box<Doc>),
     Group(Box<Doc>),
 }
@@ -44,6 +45,16 @@ impl Doc {
 
     pub fn group(doc: Doc) -> Self {
         Self::Group(Box::new(doc))
+    }
+
+    pub fn fill<I>(docs: I, separator: Doc) -> Self
+    where
+        I: IntoIterator<Item = Doc>,
+    {
+        Self::Fill {
+            docs: docs.into_iter().collect(),
+            separator: Box::new(separator),
+        }
     }
 
     pub fn join<I>(docs: I, separator: Doc) -> Self

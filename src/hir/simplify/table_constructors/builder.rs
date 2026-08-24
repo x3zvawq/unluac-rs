@@ -184,7 +184,9 @@ impl ConstructorBuilder {
         match field.key {
             HirTableKey::Expr(HirExpr::Integer(value))
                 if matches!(policy, RecordPromotionPolicy::Normal)
-                    && value == current_next_index =>
+                    && value == current_next_index
+                    && !self.has_numeric_key(value)
+                    && expr_is_definitely_non_nil(&field.value) =>
             {
                 self.push_array_value(field.value);
             }
@@ -305,6 +307,22 @@ impl ConstructorBuilder {
             }
         }
     }
+
+    fn has_numeric_key(&self, key: i64) -> bool {
+        let mut array_index = 1_i64;
+        self.fields.iter().any(|field| match field {
+            BuilderField::Final(HirTableField::Array(_)) => {
+                let matches = array_index == key;
+                array_index += 1;
+                matches
+            }
+            BuilderField::Final(HirTableField::Record(record)) => {
+                numeric_key_matches(&record.key, key)
+            }
+            BuilderField::PendingInt { key: existing, .. } => *existing == key,
+            BuilderField::MovedPendingInt => false,
+        })
+    }
 }
 
 fn statically_known_numeric_key(key: &HirTableKey) -> Option<Option<i64>> {
@@ -351,11 +369,20 @@ fn statically_known_numeric_key(key: &HirTableKey) -> Option<Option<i64>> {
     }
 }
 
+fn numeric_key_matches(key: &HirTableKey, expected: i64) -> bool {
+    match key {
+        HirTableKey::Expr(HirExpr::Integer(value)) => *value == expected,
+        HirTableKey::Expr(HirExpr::Number(value)) => {
+            value.is_finite() && value.fract() == 0.0 && *value == expected as f64
+        }
+        _ => false,
+    }
+}
+
 fn can_reorder_integer_record_value(expr: &HirExpr) -> bool {
     matches!(
         expr,
-        HirExpr::Nil
-            | HirExpr::Boolean(_)
+        HirExpr::Boolean(_)
             | HirExpr::Integer(_)
             | HirExpr::Number(_)
             | HirExpr::String(_)
@@ -363,6 +390,22 @@ fn can_reorder_integer_record_value(expr: &HirExpr) -> bool {
             | HirExpr::UInt64(_)
             | HirExpr::Vector(_)
             | HirExpr::Complex { .. }
+    )
+}
+
+pub(super) fn expr_is_definitely_non_nil(expr: &HirExpr) -> bool {
+    matches!(
+        expr,
+        HirExpr::Boolean(_)
+            | HirExpr::Integer(_)
+            | HirExpr::Number(_)
+            | HirExpr::String(_)
+            | HirExpr::Int64(_)
+            | HirExpr::UInt64(_)
+            | HirExpr::Vector(_)
+            | HirExpr::Complex { .. }
+            | HirExpr::Closure(_)
+            | HirExpr::TableConstructor(_)
     )
 }
 
