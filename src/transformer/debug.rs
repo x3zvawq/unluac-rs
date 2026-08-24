@@ -71,27 +71,26 @@ fn dump_lir_chunk(
 
 fn collect_proto_entries(root: &LoweredProto) -> Vec<ProtoEntry<'_>> {
     let mut entries = Vec::new();
-    collect_proto_entries_inner(root, None, 0, &mut entries);
-    entries
-}
-
-fn collect_proto_entries_inner<'a>(
-    proto: &'a LoweredProto,
-    parent: Option<usize>,
-    depth: usize,
-    entries: &mut Vec<ProtoEntry<'a>>,
-) {
-    let id = entries.len();
-    entries.push(ProtoEntry {
-        id,
-        parent,
-        depth,
-        proto,
-    });
-
-    for child in &proto.children {
-        collect_proto_entries_inner(child, Some(id), depth + 1, entries);
+    // Debug dump 与 lowering 消费同一棵深 Luau 树；使用显式 DFS 栈，开启 dump
+    // 也不会把合法 proto 深度变成进程栈溢出。
+    let mut pending = vec![(root, None, 0usize)];
+    while let Some((proto, parent, depth)) = pending.pop() {
+        let id = entries.len();
+        entries.push(ProtoEntry {
+            id,
+            parent,
+            depth,
+            proto,
+        });
+        pending.extend(
+            proto
+                .children
+                .iter()
+                .rev()
+                .map(|child| (child.as_ref(), Some(id), depth + 1)),
+        );
     }
+    entries
 }
 
 fn plan_focus(protos: &[ProtoEntry<'_>], filters: &DebugFilters) -> FocusPlan {

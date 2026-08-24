@@ -36,6 +36,12 @@ pub enum ParseError {
         limit: usize,
         found: usize,
     },
+    #[error("{field} expansion {found} exceeds the parser budget of {limit}")]
+    ExpansionLimit {
+        field: &'static str,
+        limit: usize,
+        found: usize,
+    },
     #[error("negative {field} value {value} is not valid in this bytecode chunk")]
     NegativeValue { field: &'static str, value: i64 },
     #[error("invalid constant tag {tag} at offset {offset}")]

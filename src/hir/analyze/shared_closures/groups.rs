@@ -62,14 +62,22 @@ pub(super) fn collect_reusable_groups(
 pub(super) struct OwnerTemplate {
     pub(super) instr: InstrRef,
     pub(super) template: Arc<ClosureTemplate>,
+    /// 同一 child `Origin` 提取出的 owner-independent template shape 的稳定 class。匹配
+    /// 结果按 class 与 root shared group 缓存；owner 的外层 capture identity 仍在 occurrence
+    /// proof 后校验。
+    pub(super) class: TemplateClassRef,
 }
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub(super) struct TemplateClassRef(pub(super) usize);
 
 pub(super) fn collect_owner_templates(
     proto: &LoweredProto,
     cfg_graph: &CfgGraph,
     dataflow: &DataflowFacts,
 ) -> Vec<OwnerTemplate> {
-    let mut templates = BTreeMap::<_, Option<Arc<ClosureTemplate>>>::new();
+    let mut templates = BTreeMap::<_, Option<(Arc<ClosureTemplate>, TemplateClassRef)>>::new();
+    let mut next_class = 0;
     let mut owners = Vec::new();
     for (index, instr) in proto.instrs.iter().enumerate() {
         let instr_ref = InstrRef(index);
@@ -87,13 +95,17 @@ pub(super) fn collect_owner_templates(
             .or_insert_with(|| {
                 let child_cfg = cfg_graph.children.get(closure.proto.index())?;
                 let child_dataflow = dataflow.children.get(closure.proto.index())?;
-                extract_template(child, &child_cfg.cfg, child_dataflow).map(Arc::new)
+                let template = extract_template(child, &child_cfg.cfg, child_dataflow)?;
+                let class = TemplateClassRef(next_class);
+                next_class += 1;
+                Some((Arc::new(template), class))
             })
             .clone();
-        if let Some(template) = template {
+        if let Some((template, class)) = template {
             owners.push(OwnerTemplate {
                 instr: instr_ref,
                 template,
+                class,
             });
         }
     }

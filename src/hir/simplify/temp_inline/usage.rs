@@ -53,7 +53,7 @@ impl TempUseSummary {
         });
     }
 
-    fn for_each(&self, mut visitor: impl FnMut(TempId, usize)) {
+    pub(super) fn for_each(&self, mut visitor: impl FnMut(TempId, usize)) {
         match self {
             Self::Empty => {}
             Self::One(temp, count) => visitor(*temp, *count),

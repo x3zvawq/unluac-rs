@@ -189,7 +189,7 @@ impl Lua51Parser {
                     extra: DialectUpvalueExtra::Lua51,
                 },
                 debug_info,
-                children,
+                children: children.into_iter().map(std::sync::Arc::new).collect(),
             },
             extra: DialectProtoExtra::Lua51(Lua51ProtoExtra { raw_is_vararg }),
             origin: Origin {

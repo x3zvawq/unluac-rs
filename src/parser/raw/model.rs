@@ -4,9 +4,10 @@
 //! origin 和保留位模式的宿主字面量；具体 opcode、operand 和 dialect extra 只通过 wrapper 字段挂接进来，
 //! 避免公共模型被某个版本的协议细节撑大。
 //! `RawString` 的原始字节和解码文本都是不可变共享 payload，raw tree 和后续层的
-//! Clone 只复制所有权，不复制字符串内容。
+//! Clone 只复制所有权，不复制字符串内容；Luau 的平铺 proto 还通过 `Arc` 保留共享
+//! 子图，避免把同一个 lexical proto 展开成指数级树。
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::decompile::DecompileDialect;
 use crate::parser::StringEncoding;
@@ -37,38 +38,91 @@ impl RawChunk {
     }
 }
 
-fn discard_proto_debug_metadata(proto: &mut RawProto) {
-    proto.common.source = None;
-    proto.common.line_range = ProtoLineRange {
-        defined_start: 0,
-        defined_end: 0,
-    };
-    proto.common.debug_info.common.line_info.clear();
-    proto.common.debug_info.common.local_vars.clear();
-    proto.common.debug_info.common.upvalue_names.clear();
+fn discard_proto_debug_metadata(root: &mut RawProto) {
+    // Metadata stripping is part of the normal parse path (`strip=true`). A
+    // `make_mut` walk would clone every shared edge, undoing the flat-DAG
+    // contract. Rebuild the graph iteratively instead: each source address is
+    // transformed once, then all incoming edges reuse the resulting `Arc`.
+    let transformed = strip_proto_graph(Arc::new(root.clone()));
+    // The root value is kept by the public `RawChunk` field, so a shallow clone
+    // is sufficient and does not depend on the temporary Arc being unique.
+    // Descendant payloads remain shared through their Arc edges.
+    *root = (*transformed).clone();
+}
 
-    match &mut proto.common.debug_info.extra {
-        DialectDebugExtra::Lua54(extra) => *extra = Default::default(),
-        DialectDebugExtra::Lua55(extra) => *extra = Default::default(),
-        DialectDebugExtra::LuaJit(extra) => *extra = Default::default(),
-        DialectDebugExtra::Luau(extra) => *extra = Default::default(),
-        DialectDebugExtra::Lua51 | DialectDebugExtra::Lua52 | DialectDebugExtra::Lua53 => {}
-    }
-    match &mut proto.extra {
-        DialectProtoExtra::LuaJit(extra) => {
-            extra.first_line = None;
-            extra.line_count = None;
-            extra.debug_size = 0;
+struct StripFrame {
+    source: Arc<RawProto>,
+    next_child: usize,
+    children: Vec<Arc<RawProto>>,
+}
+
+fn strip_proto_graph(root: Arc<RawProto>) -> Arc<RawProto> {
+    let mut memo: HashMap<*const RawProto, Arc<RawProto>> = HashMap::new();
+    let mut frames = vec![StripFrame {
+        children: Vec::with_capacity(root.common.children.len()),
+        source: root,
+        next_child: 0,
+    }];
+
+    loop {
+        let Some(frame) = frames.last_mut() else {
+            unreachable!("the root frame is returned before the stack is empty");
+        };
+        if let Some(child) = frame.source.common.children.get(frame.next_child).cloned() {
+            frame.next_child += 1;
+            let key = Arc::as_ptr(&child);
+            if let Some(transformed) = memo.get(&key) {
+                frame.children.push(Arc::clone(transformed));
+            } else {
+                frames.push(StripFrame {
+                    children: Vec::with_capacity(child.common.children.len()),
+                    source: child,
+                    next_child: 0,
+                });
+            }
+            continue;
         }
-        DialectProtoExtra::Luau(extra) => extra.debug_name = None,
-        DialectProtoExtra::Lua51(_)
-        | DialectProtoExtra::Lua52(_)
-        | DialectProtoExtra::Lua53(_)
-        | DialectProtoExtra::Lua54(_)
-        | DialectProtoExtra::Lua55(_) => {}
-    }
-    for child in &mut proto.common.children {
-        discard_proto_debug_metadata(child);
+
+        let frame = frames.pop().expect("root frame exists");
+        let key = Arc::as_ptr(&frame.source);
+        let mut proto = (*frame.source).clone();
+        proto.common.source = None;
+        proto.common.line_range = ProtoLineRange {
+            defined_start: 0,
+            defined_end: 0,
+        };
+        proto.common.debug_info.common.line_info.clear();
+        proto.common.debug_info.common.local_vars.clear();
+        proto.common.debug_info.common.upvalue_names.clear();
+        match &mut proto.common.debug_info.extra {
+            DialectDebugExtra::Lua54(extra) => *extra = Default::default(),
+            DialectDebugExtra::Lua55(extra) => *extra = Default::default(),
+            DialectDebugExtra::LuaJit(extra) => *extra = Default::default(),
+            DialectDebugExtra::Luau(extra) => *extra = Default::default(),
+            DialectDebugExtra::Lua51 | DialectDebugExtra::Lua52 | DialectDebugExtra::Lua53 => {}
+        }
+        match &mut proto.extra {
+            DialectProtoExtra::LuaJit(extra) => {
+                extra.first_line = None;
+                extra.line_count = None;
+                extra.debug_size = 0;
+            }
+            DialectProtoExtra::Luau(extra) => extra.debug_name = None,
+            DialectProtoExtra::Lua51(_)
+            | DialectProtoExtra::Lua52(_)
+            | DialectProtoExtra::Lua53(_)
+            | DialectProtoExtra::Lua54(_)
+            | DialectProtoExtra::Lua55(_) => {}
+        }
+        proto.common.children = frame.children;
+        let transformed = Arc::new(proto);
+        memo.insert(key, Arc::clone(&transformed));
+
+        if let Some(parent) = frames.last_mut() {
+            parent.children.push(transformed);
+        } else {
+            return transformed;
+        }
     }
 }
 
@@ -182,7 +236,11 @@ pub struct RawProtoCommon {
     pub constants: RawConstPool,
     pub upvalues: RawUpvalueInfo,
     pub debug_info: RawDebugInfo,
-    pub children: Vec<RawProto>,
+    /// Child protos are immutable after parsing.  Keeping each edge as an `Arc` is
+    /// important for Luau's flat proto table: a `DUPCLOSURE` may reference the same
+    /// serialized proto from several lexical slots, and materializing those slots must
+    /// not recursively clone the entire descendant subtree.
+    pub children: Vec<Arc<RawProto>>,
 }
 
 /// proto 在源码中的定义行范围。

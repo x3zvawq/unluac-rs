@@ -33,3 +33,13 @@ pub enum HirLowerError {
     )]
     UnrepresentableRepeatedCapturedSharedClosure { shared_index: usize, instr: usize },
 }
+
+impl HirLowerError {
+    pub(crate) const fn invalid(detail: &'static str) -> Self {
+        Self::InvalidPlanRegion {
+            proto: 0,
+            region: 0,
+            detail,
+        }
+    }
+}

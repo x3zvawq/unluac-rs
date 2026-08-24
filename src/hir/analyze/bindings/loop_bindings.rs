@@ -580,14 +580,14 @@ pub(super) fn numeric_for_binding_phis(plan: &StructurePlan) -> NumericBindingPh
     }
 }
 
-pub(super) fn region_blocks(plan: &StructurePlan, region: RegionId) -> BTreeSet<BlockRef> {
-    pub(super) fn collect(plan: &StructurePlan, region: RegionId, blocks: &mut BTreeSet<BlockRef>) {
+pub(super) fn region_blocks(plan: &StructurePlan, region: RegionId) -> Vec<BlockRef> {
+    fn collect(plan: &StructurePlan, region: RegionId, blocks: &mut Vec<BlockRef>) {
         let Some(node) = plan.region(region) else {
             return;
         };
         match node {
             RegionPlan::Block { block, .. } => {
-                blocks.insert(*block);
+                blocks.push(*block);
             }
             RegionPlan::Sequence { children, .. } => {
                 for child in children {
@@ -631,7 +631,7 @@ pub(super) fn region_blocks(plan: &StructurePlan, region: RegionId) -> BTreeSet<
                 for item in layout {
                     match item {
                         UnstructuredLayoutItem::Block(block) => {
-                            blocks.insert(*block);
+                            blocks.push(*block);
                         }
                         UnstructuredLayoutItem::Region(child) => collect(plan, *child, blocks),
                     }
@@ -640,8 +640,10 @@ pub(super) fn region_blocks(plan: &StructurePlan, region: RegionId) -> BTreeSet<
         }
     }
 
-    let mut blocks = BTreeSet::new();
+    let mut blocks = Vec::new();
     collect(plan, region, &mut blocks);
+    blocks.sort_unstable();
+    blocks.dedup();
     blocks
 }
 

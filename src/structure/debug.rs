@@ -895,26 +895,24 @@ fn format_control_feature(feature: ControlFlowFeature) -> &'static str {
 
 fn collect_proto_entries(root: &StructureFacts) -> Vec<ProtoEntry<'_>> {
     let mut entries = Vec::new();
-    collect_proto_entries_inner(root, None, 0, &mut entries);
-    entries
-}
-
-fn collect_proto_entries_inner<'a>(
-    facts: &'a StructureFacts,
-    parent: Option<usize>,
-    depth: usize,
-    entries: &mut Vec<ProtoEntry<'a>>,
-) {
-    let id = entries.len();
-    entries.push(ProtoEntry {
-        id,
-        parent,
-        depth,
-        facts,
-    });
-    for child in &facts.children {
-        collect_proto_entries_inner(child, Some(id), depth + 1, entries);
+    let mut pending = vec![(root, None, 0usize)];
+    while let Some((facts, parent, depth)) = pending.pop() {
+        let id = entries.len();
+        entries.push(ProtoEntry {
+            id,
+            parent,
+            depth,
+            facts,
+        });
+        pending.extend(
+            facts
+                .children
+                .iter()
+                .rev()
+                .map(|child| (child, Some(id), depth + 1)),
+        );
     }
+    entries
 }
 
 fn plan_focus(entries: &[ProtoEntry<'_>], filters: &DebugFilters) -> FocusPlan {

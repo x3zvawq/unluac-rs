@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(super) enum CaptureIdentity {
     Value(SsaValue),
     Upvalue(UpvalueRef),

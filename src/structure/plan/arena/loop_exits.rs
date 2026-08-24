@@ -494,8 +494,25 @@ pub(super) fn block_has_non_control_prefix(
 
 pub(super) fn merged_natural_loop_domain(
     cfg: &Cfg,
+    graph_facts: &GraphFacts,
     candidate: &crate::structure::LoopCandidate,
 ) -> BTreeSet<BlockRef> {
+    // 普通候选直接沿用 GraphFacts 已经证明过的按 header 合并 domain。这里不能只按
+    // header 取值：numeric-for residual partition 可能共享 header 但只拥有部分回边，
+    // 因此只有 backedge 身份完全一致时才走零扫描快路径。
+    if let Some(loop_id) = graph_facts
+        .natural_loop_forest()
+        .loop_for_header(candidate.header)
+        && graph_facts
+            .natural_loops
+            .get(loop_id.index())
+            .is_some_and(|natural_loop| natural_loop.backedges == candidate.backedges)
+    {
+        return graph_facts.natural_loops[loop_id.index()].blocks.clone();
+    }
+
+    // 共享 header 的语义分区仍需按指定 backedge 重新求自然域；这是必要的精确性
+    // 退化路径，不把 residual cycle 错误扩成 wrapper 的完整 domain。
     let mut domain = BTreeSet::from([candidate.header]);
     let mut pending = candidate
         .backedges

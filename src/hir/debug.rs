@@ -15,8 +15,8 @@ use crate::debug::{
 };
 
 use super::common::{
-    HirBlock, HirDecisionExpr, HirDecisionTarget, HirExpr, HirLValue, HirModule, HirProto,
-    HirProtoRef, HirStmt, HirTableField, HirUnaryOpKind, HirValuePack,
+    HirBlock, HirDecisionExpr, HirDecisionTarget, HirExpr, HirLValue, HirModule, HirProto, HirStmt,
+    HirTableField, HirUnaryOpKind, HirValuePack,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -506,7 +506,25 @@ pub(super) fn collect_hir_entries<'a>(module: &'a HirModule) -> Vec<HirProtoEntr
         module.protos.iter().map(|p| (p.id.index(), p)).collect();
 
     let mut entries = Vec::new();
-    walk(module.entry, None, &proto_by_id, &mut entries);
+    let mut pending = vec![(module.entry, None)];
+    while let Some((current, parent_slot)) = pending.pop() {
+        let Some(proto) = proto_by_id.get(&current.index()).copied() else {
+            continue;
+        };
+        let slot = entries.len();
+        entries.push(HirProtoEntry {
+            id: slot,
+            parent: parent_slot,
+            proto,
+        });
+        pending.extend(
+            proto
+                .children
+                .iter()
+                .rev()
+                .map(|child| (*child, Some(slot))),
+        );
+    }
     // 兜底：如果 module.protos 里有孤岛 proto（没被 entry 可达到），附在末尾，
     // 保证线性下标的稳定性，elided 计数也才准。
     let seen: std::collections::BTreeSet<usize> =
@@ -521,27 +539,7 @@ pub(super) fn collect_hir_entries<'a>(module: &'a HirModule) -> Vec<HirProtoEntr
             });
         }
     }
-    return entries;
-
-    fn walk<'a>(
-        current: HirProtoRef,
-        parent_slot: Option<usize>,
-        proto_by_id: &BTreeMap<usize, &'a HirProto>,
-        entries: &mut Vec<HirProtoEntry<'a>>,
-    ) {
-        let Some(proto) = proto_by_id.get(&current.index()).copied() else {
-            return;
-        };
-        let slot = entries.len();
-        entries.push(HirProtoEntry {
-            id: slot,
-            parent: parent_slot,
-            proto,
-        });
-        for child in &proto.children {
-            walk(*child, Some(slot), proto_by_id, entries);
-        }
-    }
+    entries
 }
 
 pub(super) fn plan_focus(entries: &[HirProtoEntry<'_>], filters: &DebugFilters) -> FocusPlan {

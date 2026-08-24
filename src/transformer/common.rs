@@ -4,7 +4,7 @@
 //! Dataflow、HIR 共同依赖的稳定契约；具体某个 dialect 的 lowering 规则可以
 //! 分目录演进，但这里的类型应该尽量保持统一、明确、可复用。
 
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use crate::parser::{
     ChunkHeader, Origin, ProtoFrameInfo, ProtoLineRange, ProtoSignature, RawConstPool,
@@ -33,7 +33,10 @@ pub struct LoweredProto {
     pub debug_info: RawDebugInfo,
     /// 已按方言协议归一到寄存器与生命周期的局部变量调试事实。
     pub debug_locals: Vec<DebugLocalFact>,
-    pub children: Vec<LoweredProto>,
+    /// Lowered child templates are immutable.  `Arc` keeps closure instances cheap:
+    /// creating a second closure from one child copies only the current proto
+    /// payload and shares its descendants instead of recursively cloning a subtree.
+    pub children: Vec<Arc<LoweredProto>>,
     pub instrs: Vec<LowInstr>,
     pub lowering_map: LoweringMap,
     pub origin: Origin,
@@ -729,8 +732,8 @@ pub struct ClosureInstr {
 
 pub(crate) fn instantiate_closure_children(
     instrs: &mut [LowInstr],
-    children: Vec<LoweredProto>,
-) -> Vec<LoweredProto> {
+    children: Vec<Arc<LoweredProto>>,
+) -> Vec<Arc<LoweredProto>> {
     let mut instances = children;
     let mut claimed = vec![false; instances.len()];
     let mut shared_instances = BTreeMap::new();
@@ -756,13 +759,13 @@ pub(crate) fn instantiate_closure_children(
 fn instantiate_closure_child(
     source: usize,
     claimed: &mut [bool],
-    instances: &mut Vec<LoweredProto>,
+    instances: &mut Vec<Arc<LoweredProto>>,
 ) -> ProtoRef {
     if !std::mem::replace(&mut claimed[source], true) {
         return ProtoRef(source);
     }
     let instance = ProtoRef(instances.len());
-    instances.push(instances[source].clone());
+    instances.push(Arc::clone(&instances[source]));
     instance
 }
 

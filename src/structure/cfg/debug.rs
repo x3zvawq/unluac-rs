@@ -384,29 +384,23 @@ where
     T: ProtoChildren<T>,
 {
     let mut entries = Vec::new();
-    collect_proto_entries_inner(root, None, 0, &mut entries);
-    entries
-}
-
-fn collect_proto_entries_inner<'a, T>(
-    node: &'a T,
-    parent: Option<usize>,
-    depth: usize,
-    entries: &mut Vec<ProtoEntry<'a, T>>,
-) where
-    T: ProtoChildren<T>,
-{
-    let id = entries.len();
-    entries.push(ProtoEntry {
-        id,
-        parent,
-        depth,
-        facts: node,
-    });
-
-    for child in node.children() {
-        collect_proto_entries_inner(child, Some(id), depth + 1, entries);
+    let mut pending: Vec<(&'a T, Option<usize>, usize)> = vec![(root, None, 0usize)];
+    while let Some((node, parent, depth)) = pending.pop() {
+        let id = entries.len();
+        entries.push(ProtoEntry {
+            id,
+            parent,
+            depth,
+            facts: node,
+        });
+        pending.extend(
+            node.children()
+                .iter()
+                .rev()
+                .map(|child| (child, Some(id), depth + 1)),
+        );
     }
+    entries
 }
 
 fn collect_dataflow_entries<'a>(
@@ -415,43 +409,47 @@ fn collect_dataflow_entries<'a>(
     dataflow: &'a DataflowFacts,
 ) -> Vec<DataflowProtoEntry<'a>> {
     let mut entries = Vec::new();
-    collect_dataflow_entries_inner(proto, cfg, dataflow, None, 0, &mut entries);
-    entries
-}
-
-fn collect_dataflow_entries_inner<'a>(
-    proto: &'a LoweredProto,
-    cfg: &'a CfgGraph,
-    dataflow: &'a DataflowFacts,
-    parent: Option<usize>,
-    depth: usize,
-    entries: &mut Vec<DataflowProtoEntry<'a>>,
-) {
-    let id = entries.len();
-    entries.push(DataflowProtoEntry {
-        id,
-        parent,
-        depth,
+    struct Frame<'a> {
+        proto: &'a LoweredProto,
+        cfg: &'a CfgGraph,
+        dataflow: &'a DataflowFacts,
+        parent: Option<usize>,
+        depth: usize,
+    }
+    let mut pending = vec![Frame {
         proto,
         cfg,
-        facts: dataflow,
-    });
-
-    for ((child_proto, child_cfg), child_dataflow) in proto
-        .children
-        .iter()
-        .zip(cfg.children.iter())
-        .zip(dataflow.children.iter())
-    {
-        collect_dataflow_entries_inner(
-            child_proto,
-            child_cfg,
-            child_dataflow,
-            Some(id),
-            depth + 1,
-            entries,
-        );
+        dataflow,
+        parent: None,
+        depth: 0,
+    }];
+    while let Some(frame) = pending.pop() {
+        let id = entries.len();
+        entries.push(DataflowProtoEntry {
+            id,
+            parent: frame.parent,
+            depth: frame.depth,
+            proto: frame.proto,
+            cfg: frame.cfg,
+            facts: frame.dataflow,
+        });
+        let child_count = frame
+            .proto
+            .children
+            .len()
+            .min(frame.cfg.children.len())
+            .min(frame.dataflow.children.len());
+        for index in (0..child_count).rev() {
+            pending.push(Frame {
+                proto: &frame.proto.children[index],
+                cfg: &frame.cfg.children[index],
+                dataflow: &frame.dataflow.children[index],
+                parent: Some(id),
+                depth: frame.depth + 1,
+            });
+        }
     }
+    entries
 }
 
 fn plan_focus<T>(entries: &[ProtoEntry<'_, T>], filters: &DebugFilters) -> FocusPlan {

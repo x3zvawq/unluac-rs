@@ -66,11 +66,12 @@ pub(super) fn debug_local_hint_for_reg_at_block_entry(
 pub(super) fn debug_local_name_for_reg_in_blocks(
     proto: &LoweredProto,
     cfg: &Cfg,
-    blocks: &BTreeSet<BlockRef>,
+    blocks: &[BlockRef],
     reg: Reg,
 ) -> Option<String> {
     blocks
         .iter()
+        .copied()
         .filter_map(|block| {
             let instr = cfg.blocks[block.index()].instrs.start;
             let pc = proto
@@ -79,7 +80,7 @@ pub(super) fn debug_local_name_for_reg_in_blocks(
                 .get(instr.index())?
                 .first()
                 .copied()?;
-            Some((pc, *block))
+            Some((pc, block))
         })
         .min_by_key(|(pc, block)| (*pc, *block))
         .and_then(|(_, block)| debug_local_name_for_reg_at_block_entry(proto, cfg, block, reg))

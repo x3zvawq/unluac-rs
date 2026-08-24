@@ -24,27 +24,27 @@ pub(crate) struct ParserProtoEntry<'a> {
 /// 收集 proto tree 的前序遍历视图，供 focus plan 和 elided 行共用。
 pub(crate) fn collect_parser_proto_entries(root: &RawProto) -> Vec<ParserProtoEntry<'_>> {
     let mut entries = Vec::new();
-    collect_parser_proto_entries_inner(root, None, 0, &mut entries);
-    entries
-}
-
-fn collect_parser_proto_entries_inner<'a>(
-    proto: &'a RawProto,
-    parent: Option<usize>,
-    depth: usize,
-    entries: &mut Vec<ParserProtoEntry<'a>>,
-) {
-    let id = entries.len();
-    entries.push(ParserProtoEntry {
-        id,
-        parent,
-        depth,
-        proto,
-    });
-
-    for child in &proto.common.children {
-        collect_parser_proto_entries_inner(child, Some(id), depth + 1, entries);
+    // proto 遍历不占用 Rust 调用栈。Luau 平表可以合法地包含数千层词法嵌套，
+    // parser debug 不能把解码阶段已经移除的深度风险重新引入。
+    let mut pending = vec![(root, None, 0usize)];
+    while let Some((proto, parent, depth)) = pending.pop() {
+        let id = entries.len();
+        entries.push(ParserProtoEntry {
+            id,
+            parent,
+            depth,
+            proto,
+        });
+        pending.extend(
+            proto
+                .common
+                .children
+                .iter()
+                .rev()
+                .map(|child| (child.as_ref(), Some(id), depth + 1)),
+        );
     }
+    entries
 }
 
 /// 根据 parser proto traversal 生成统一 focus plan。

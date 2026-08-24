@@ -95,13 +95,109 @@ pub(crate) fn analyze_structure(
     Ok(())
 }
 
-/// 对单个 proto 递归提取结构候选，子 proto 走完全相同的分析顺序。
+/// 对 proto 树提取结构候选。
 pub(crate) fn analyze_structure_proto(
     proto: &LoweredProto,
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
     child_cfgs: &[CfgGraph],
+    caps: ControlFlowCaps,
+) -> Result<StructureFacts, StructureError> {
+    struct Frame<'a> {
+        proto: &'a LoweredProto,
+        cfg: &'a Cfg,
+        graph_facts: &'a GraphFacts,
+        dataflow: &'a DataflowFacts,
+        child_cfgs: &'a [CfgGraph],
+        next_child: usize,
+        children: Vec<StructureFacts>,
+        context_index: Option<usize>,
+    }
+
+    let mut stack = vec![Frame {
+        proto,
+        cfg,
+        graph_facts,
+        dataflow,
+        child_cfgs,
+        next_child: 0,
+        children: Vec::new(),
+        context_index: None,
+    }];
+    loop {
+        let child = {
+            let frame = stack
+                .last_mut()
+                .expect("structure proto frame is non-empty");
+            if frame.proto.children.len() != frame.child_cfgs.len()
+                || frame.proto.children.len() != frame.graph_facts.children.len()
+                || frame.proto.children.len() != frame.dataflow.children.len()
+            {
+                return Err(StructureError::invalid(
+                    "proto, CFG, graph, and dataflow child counts disagree",
+                ));
+            }
+            let index = frame.next_child;
+            let child = frame.proto.children.get(index).map(|proto| {
+                (
+                    index,
+                    proto,
+                    &frame.child_cfgs[index],
+                    &frame.graph_facts.children[index],
+                    &frame.dataflow.children[index],
+                )
+            });
+            if child.is_some() {
+                frame.next_child += 1;
+            }
+            child
+        };
+        if let Some((child_index, child_proto, child_cfg, child_graph, child_dataflow)) = child {
+            // The explicit frame is the only stack growth for proto nesting.  CFG, graph,
+            // dataflow, and all per-proto Structure algorithms already use bounded worklists.
+            stack.push(Frame {
+                proto: child_proto,
+                cfg: &child_cfg.cfg,
+                graph_facts: child_graph,
+                dataflow: child_dataflow,
+                child_cfgs: &child_cfg.children,
+                next_child: 0,
+                children: Vec::new(),
+                context_index: Some(child_index),
+            });
+            continue;
+        }
+
+        let frame = stack.pop().expect("structure proto frame is non-empty");
+        let mut facts = analyze_structure_proto_one(
+            frame.proto,
+            frame.cfg,
+            frame.graph_facts,
+            frame.dataflow,
+            caps,
+        )
+        .map_err(|error| {
+            if let Some(index) = frame.context_index {
+                error.context(format!("child proto #{index}"))
+            } else {
+                error
+            }
+        })?;
+        facts.children = frame.children;
+        if let Some(parent) = stack.last_mut() {
+            parent.children.push(facts);
+        } else {
+            return Ok(facts);
+        }
+    }
+}
+
+fn analyze_structure_proto_one(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    dataflow: &DataflowFacts,
     caps: ControlFlowCaps,
 ) -> Result<StructureFacts, StructureError> {
     let mut loop_candidates = loops::analyze_loops(proto, cfg, graph_facts, dataflow);
@@ -243,33 +339,11 @@ pub(crate) fn analyze_structure_proto(
     plan::finalize_loop_contracts(proto, cfg, graph_facts, dataflow, &mut plan)?;
     plan::finalize_block_emissions(cfg, &mut plan)?;
     plan::validate_final_structure_plan(proto, cfg, graph_facts, dataflow, &plan)?;
-    let children = proto
-        .children
-        .iter()
-        .zip(child_cfgs.iter())
-        .zip(graph_facts.children.iter())
-        .zip(dataflow.children.iter())
-        .enumerate()
-        .map(
-            |(child_index, (((child_proto, child_cfg), child_graph_facts), child_dataflow))| {
-                analyze_structure_proto(
-                    child_proto,
-                    &child_cfg.cfg,
-                    child_graph_facts,
-                    child_dataflow,
-                    &child_cfg.children,
-                    caps,
-                )
-                .map_err(|error| error.context(format!("child proto #{child_index}")))
-            },
-        )
-        .collect::<Result<Vec<_>, _>>()?;
-
     let debug_bindings = analyze_debug_bindings(proto, cfg, dataflow);
 
     Ok(StructureFacts {
         plan,
         debug_bindings,
-        children,
+        children: Vec::new(),
     })
 }

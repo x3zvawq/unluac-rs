@@ -8,10 +8,33 @@ use super::*;
 /// 原生 continue 目标保留已证明的 transfer；其余目标才把 Guard 改写为包住 tail 的
 /// 单臂 branch。
 pub(super) struct LoopRewriteIndex {
-    containing_by_block: Vec<Vec<usize>>,
+    /// 普通可规约 block 只保存最内层候选，祖先通过 `parent` 链按需查询。
+    innermost_by_block: Vec<Option<usize>>,
+    /// 非树形/交叠候选保留精确 owner 列表；这是安全退化路径，不参与普通嵌套成本。
+    fallback_by_block: Vec<Option<Box<[usize]>>>,
+    parent: Vec<Option<usize>>,
     preorder: Vec<usize>,
     subtree_end: Vec<usize>,
     loops_by_header: Vec<Vec<usize>>,
+}
+
+struct ContainingLoops<'a> {
+    next: Option<usize>,
+    parent: &'a [Option<usize>],
+    fallback: Option<std::slice::Iter<'a, usize>>,
+}
+
+impl Iterator for ContainingLoops<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(fallback) = self.fallback.as_mut() {
+            return fallback.next().copied();
+        }
+        let current = self.next?;
+        self.next = self.parent.get(current).copied().flatten();
+        Some(current)
+    }
 }
 
 impl LoopRewriteIndex {
@@ -33,7 +56,8 @@ impl LoopRewriteIndex {
             *slot = true;
         }
         let mut owners_by_loop_header = vec![Vec::new(); cfg.blocks.len()];
-        let mut containing_by_block = vec![Vec::new(); cfg.blocks.len()];
+        let mut innermost_by_block = vec![None; cfg.blocks.len()];
+        let mut membership_count_by_block = vec![0usize; cfg.blocks.len()];
         let mut epoch_by_block = vec![0u32; cfg.blocks.len()];
         let mut epoch = 0u32;
         for (index, loop_) in loops.iter().enumerate() {
@@ -57,9 +81,14 @@ impl LoopRewriteIndex {
                     continue;
                 }
                 *seen = epoch;
-                containing_by_block[block.index()].push(index);
+                membership_count_by_block[block.index()] += 1;
                 if loop_header_by_block[block.index()] {
                     owners_by_loop_header[block.index()].push(index);
+                }
+                let replace = innermost_by_block[block.index()]
+                    .is_none_or(|current| score(index) < score(current));
+                if replace {
+                    innermost_by_block[block.index()] = Some(index);
                 }
             }
         }
@@ -100,6 +129,7 @@ impl LoopRewriteIndex {
 
         let mut preorder = vec![usize::MAX; loops.len()];
         let mut subtree_end = vec![usize::MAX; loops.len()];
+        let mut depth = vec![0usize; loops.len()];
         let mut order = Vec::with_capacity(loops.len());
         let mut pending = parent
             .iter()
@@ -122,6 +152,7 @@ impl LoopRewriteIndex {
             order.push(node);
             pending.push((node, true));
             for child in children[node].iter().rev().copied() {
+                depth[child] = depth[node] + 1;
                 pending.push((child, false));
             }
         }
@@ -131,6 +162,92 @@ impl LoopRewriteIndex {
             )));
         }
 
+        // containing_by_block 的旧排序是 score（最内层优先），而 parent chain 只在
+        // 每条边也保持该顺序时才等价。若语义候选出现反常 score，后面的 owner 会走
+        // 显式 fallback，避免改变 continue/break 重写的候选优先级。
+        let chain_order_is_score_order = parent
+            .iter()
+            .enumerate()
+            .all(|(child, parent)| parent.is_none_or(|parent| score(child) < score(parent)));
+        let mut fallback_blocks = vec![false; cfg.blocks.len()];
+        for (block_index, owner) in innermost_by_block.iter().copied().enumerate() {
+            let Some(owner) = owner else {
+                continue;
+            };
+            let expected = depth[owner] + 1;
+            if !chain_order_is_score_order || membership_count_by_block[block_index] != expected {
+                fallback_blocks[block_index] = true;
+            }
+        }
+
+        // 每个 candidate 的 domain 只再扫一遍，用 Euler 区间验证其 owner 是否真的是
+        // selected innermost 的祖先。非 ancestor 表示交叠候选，转入精确 fallback；
+        // 普通嵌套路径不会保存 block×ancestor 列表。
+        for (index, loop_) in loops.iter().enumerate() {
+            epoch = epoch.wrapping_add(1);
+            if epoch == 0 {
+                epoch_by_block.fill(0);
+                epoch = 1;
+            }
+            for block in loop_
+                .candidate
+                .blocks
+                .iter()
+                .chain(&loop_.candidate.body_scope_blocks)
+            {
+                let Some(seen) = epoch_by_block.get_mut(block.index()) else {
+                    return Err(StructureError::invalid(
+                        "loop rewrite index references a block outside the CFG arena",
+                    ));
+                };
+                if *seen == epoch {
+                    continue;
+                }
+                *seen = epoch;
+                let Some(selected) = innermost_by_block[block.index()] else {
+                    continue;
+                };
+                if !is_ancestor_in_intervals(&preorder, &subtree_end, index, selected) {
+                    fallback_blocks[block.index()] = true;
+                }
+            }
+        }
+
+        let mut fallback_by_block = vec![None; cfg.blocks.len()];
+        for (index, loop_) in loops.iter().enumerate() {
+            epoch = epoch.wrapping_add(1);
+            if epoch == 0 {
+                epoch_by_block.fill(0);
+                epoch = 1;
+            }
+            for block in loop_
+                .candidate
+                .blocks
+                .iter()
+                .chain(&loop_.candidate.body_scope_blocks)
+            {
+                let Some(seen) = epoch_by_block.get_mut(block.index()) else {
+                    return Err(StructureError::invalid(
+                        "loop rewrite index references a block outside the CFG arena",
+                    ));
+                };
+                if *seen == epoch {
+                    continue;
+                }
+                *seen = epoch;
+                if !fallback_blocks[block.index()] {
+                    continue;
+                }
+                fallback_by_block[block.index()]
+                    .get_or_insert_with(Vec::new)
+                    .push(index);
+            }
+        }
+        for owners in fallback_by_block.iter_mut().flatten() {
+            owners.sort_unstable_by_key(|index| score(*index));
+            owners.dedup();
+        }
+
         let mut loops_by_header = vec![Vec::new(); cfg.blocks.len()];
         for (index, loop_) in loops.iter().enumerate() {
             loops_by_header[loop_.candidate.header.index()].push(index);
@@ -138,33 +255,41 @@ impl LoopRewriteIndex {
         for entries in &mut loops_by_header {
             entries.sort_unstable_by_key(|index| score(*index));
         }
-        for entries in &mut containing_by_block {
-            entries.sort_unstable_by_key(|index| score(*index));
-        }
         Ok(Self {
-            containing_by_block,
+            innermost_by_block,
+            fallback_by_block: fallback_by_block
+                .into_iter()
+                .map(|owners| owners.map(Vec::into_boxed_slice))
+                .collect(),
+            parent,
             preorder,
             subtree_end,
             loops_by_header,
         })
     }
 
-    fn containing(&self, block: BlockRef) -> &[usize] {
-        self.containing_by_block
+    fn containing(&self, block: BlockRef) -> ContainingLoops<'_> {
+        let fallback = self
+            .fallback_by_block
             .get(block.index())
-            .map_or(&[], Vec::as_slice)
+            .and_then(Option::as_deref);
+        ContainingLoops {
+            next: fallback
+                .is_none()
+                .then(|| {
+                    self.innermost_by_block
+                        .get(block.index())
+                        .copied()
+                        .flatten()
+                })
+                .flatten(),
+            parent: &self.parent,
+            fallback: fallback.map(<[usize]>::iter),
+        }
     }
 
     fn contains_loop(&self, ancestor: usize, descendant: usize) -> bool {
-        let Some(start) = self.preorder.get(ancestor).copied() else {
-            return false;
-        };
-        let Some(end) = self.subtree_end.get(ancestor).copied() else {
-            return false;
-        };
-        self.preorder
-            .get(descendant)
-            .is_some_and(|descendant| start <= *descendant && *descendant < end)
+        is_ancestor_in_intervals(&self.preorder, &self.subtree_end, ancestor, descendant)
     }
 
     fn at_header(&self, block: BlockRef) -> &[usize] {
@@ -172,6 +297,23 @@ impl LoopRewriteIndex {
             .get(block.index())
             .map_or(&[], Vec::as_slice)
     }
+}
+
+fn is_ancestor_in_intervals(
+    preorder: &[usize],
+    subtree_end: &[usize],
+    ancestor: usize,
+    descendant: usize,
+) -> bool {
+    let Some(start) = preorder.get(ancestor).copied() else {
+        return false;
+    };
+    let Some(end) = subtree_end.get(ancestor).copied() else {
+        return false;
+    };
+    preorder
+        .get(descendant)
+        .is_some_and(|descendant| start <= *descendant && *descendant < end)
 }
 
 pub(super) fn legalize_conditional_continues(
@@ -377,7 +519,7 @@ pub(super) fn condition_continue_rewrite_for_orientation(
     continue_entry: BlockRef,
     normal_entry: BlockRef,
 ) -> Option<(usize, BranchRegionDomain, BTreeSet<EdgeRef>)> {
-    for &owner in loop_index.containing(branch.branch.header) {
+    for owner in loop_index.containing(branch.branch.header) {
         let loop_ = &input.loops[owner];
         let candidate = &loop_.candidate;
         let contains_header = candidate.blocks.contains(&branch.branch.header)
@@ -460,7 +602,7 @@ pub(super) fn loop_break_arm_domain(
         return None;
     }
     let merge = branch.branch.merge?;
-    for &owner in loop_index.containing(branch.branch.header) {
+    for owner in loop_index.containing(branch.branch.header) {
         let loop_ = &loops[owner];
         let candidate = &loop_.candidate;
         let eligible_header = !candidate.control_blocks.contains(&branch.branch.header)
@@ -533,7 +675,7 @@ pub(super) fn conditional_continue_loop(
     loop_index: &LoopRewriteIndex,
 ) -> Option<usize> {
     (branch.branch.kind == BranchKind::Guard).then_some(())?;
-    for &owner in loop_index.containing(branch.branch.header) {
+    for owner in loop_index.containing(branch.branch.header) {
         let loop_ = &loops[owner];
         if loop_.candidate.blocks.contains(&branch.branch.header)
             && loop_iteration_escape_entry(proto, cfg, &loop_.candidate, branch.branch.then_entry)
@@ -557,7 +699,7 @@ pub(super) fn body_tail_guard_loop(
         return None;
     };
     (cfg.edges[tail_edge.index()].to == branch.branch.then_entry).then_some(())?;
-    for &owner in loop_index.containing(branch.branch.header) {
+    for owner in loop_index.containing(branch.branch.header) {
         let loop_ = &loops[owner];
         if (loop_.candidate.blocks.contains(&branch.branch.header)
             || loop_
@@ -586,7 +728,7 @@ pub(super) fn native_continue_arm_domain(
         return None;
     }
     let merge = branch.branch.merge?;
-    for &owner in loop_index.containing(branch.branch.header) {
+    for owner in loop_index.containing(branch.branch.header) {
         let loop_ = &loops[owner];
         if (loop_.candidate.blocks.contains(&branch.branch.header)
             || loop_

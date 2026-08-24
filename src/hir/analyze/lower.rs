@@ -175,6 +175,20 @@ struct LoweredProtoResult {
     mutable_upvalues: Vec<bool>,
 }
 
+struct ProtoLowerFrame<'a> {
+    target: AstTargetDialect,
+    proto: &'a LoweredProto,
+    cfg_graph: &'a CfgGraph,
+    graph_facts: &'a GraphFacts,
+    dataflow: &'a DataflowFacts,
+    structure: &'a StructureFacts,
+    captured_shared_plan: SharedClosurePlan,
+    id: HirProtoRef,
+    composite_protos: Vec<HirProtoRef>,
+    next_child: usize,
+    child_results: Vec<LoweredProtoResult>,
+}
+
 pub(super) fn lower_proto(
     state: &DecompileState,
     context: &DecompileContext<'_>,
@@ -206,38 +220,123 @@ fn lower_proto_node(
     structure: &StructureFacts,
     artifacts: &mut LowerArtifacts,
 ) -> Result<LoweredProtoResult, HirLowerError> {
-    let cfg = &cfg_graph.cfg;
-    let captured_shared_plan =
-        build_shared_closure_plan(proto, cfg_graph, graph_facts, dataflow, structure.plan())?;
-    let id = HirProtoRef(artifacts.protos.len());
-    artifacts.protos.push(empty_proto(id));
-    artifacts
-        .promotion_facts
-        .push(ProtoPromotionFacts::default());
-    let composite_protos =
-        reserve_composite_factory_protos(captured_shared_plan.composites().len(), artifacts);
+    fn make_frame<'a>(
+        target: AstTargetDialect,
+        proto: &'a LoweredProto,
+        cfg_graph: &'a CfgGraph,
+        graph_facts: &'a GraphFacts,
+        dataflow: &'a DataflowFacts,
+        structure: &'a StructureFacts,
+        artifacts: &mut LowerArtifacts,
+    ) -> Result<ProtoLowerFrame<'a>, HirLowerError> {
+        let captured_shared_plan =
+            build_shared_closure_plan(proto, cfg_graph, graph_facts, dataflow, structure.plan())?;
+        let id = HirProtoRef(artifacts.protos.len());
+        artifacts.protos.push(empty_proto(id));
+        artifacts
+            .promotion_facts
+            .push(ProtoPromotionFacts::default());
+        let composite_protos =
+            reserve_composite_factory_protos(captured_shared_plan.composites().len(), artifacts);
+        Ok(ProtoLowerFrame {
+            target,
+            proto,
+            cfg_graph,
+            graph_facts,
+            dataflow,
+            structure,
+            captured_shared_plan,
+            id,
+            composite_protos,
+            next_child: 0,
+            child_results: Vec::new(),
+        })
+    }
 
-    let child_results = proto
-        .children
-        .iter()
-        .zip(cfg_graph.children.iter())
-        .zip(graph_facts.children.iter())
-        .zip(dataflow.children.iter())
-        .zip(structure.children.iter())
-        .map(
-            |((((child_proto, child_cfg), child_graph_facts), child_dataflow), child_structure)| {
-                lower_proto_node(
-                    target,
-                    child_proto,
-                    child_cfg,
-                    child_graph_facts,
-                    child_dataflow,
-                    child_structure,
-                    artifacts,
+    let mut stack = vec![make_frame(
+        target,
+        proto,
+        cfg_graph,
+        graph_facts,
+        dataflow,
+        structure,
+        artifacts,
+    )?];
+    loop {
+        let child = {
+            let frame = stack.last_mut().expect("HIR proto frame is non-empty");
+            if frame.proto.children.len() != frame.cfg_graph.children.len()
+                || frame.proto.children.len() != frame.graph_facts.children.len()
+                || frame.proto.children.len() != frame.dataflow.children.len()
+                || frame.proto.children.len() != frame.structure.children.len()
+            {
+                return Err(HirLowerError::invalid("proto fact child counts disagree"));
+            }
+            let index = frame.next_child;
+            let child = frame.proto.children.get(index).map(|proto| {
+                (
+                    index,
+                    proto,
+                    &frame.cfg_graph.children[index],
+                    &frame.graph_facts.children[index],
+                    &frame.dataflow.children[index],
+                    &frame.structure.children[index],
                 )
-            },
-        )
-        .collect::<Result<Vec<_>, _>>()?;
+            });
+            if child.is_some() {
+                frame.next_child += 1;
+            }
+            child
+        };
+        if let Some((
+            _index,
+            child_proto,
+            child_cfg,
+            child_graph,
+            child_dataflow,
+            child_structure,
+        )) = child
+        {
+            stack.push(make_frame(
+                target,
+                child_proto,
+                child_cfg,
+                child_graph,
+                child_dataflow,
+                child_structure,
+                artifacts,
+            )?);
+            continue;
+        }
+
+        let frame = stack.pop().expect("HIR proto frame is non-empty");
+        let result = lower_proto_one(frame, artifacts)?;
+        if let Some(parent) = stack.last_mut() {
+            parent.child_results.push(result);
+        } else {
+            return Ok(result);
+        }
+    }
+}
+
+fn lower_proto_one(
+    frame: ProtoLowerFrame<'_>,
+    artifacts: &mut LowerArtifacts,
+) -> Result<LoweredProtoResult, HirLowerError> {
+    let ProtoLowerFrame {
+        target,
+        proto,
+        cfg_graph,
+        graph_facts,
+        dataflow,
+        structure,
+        captured_shared_plan,
+        id,
+        composite_protos,
+        next_child: _,
+        child_results,
+    } = frame;
+    let cfg = &cfg_graph.cfg;
     let child_refs = child_results
         .iter()
         .map(|child| child.id)

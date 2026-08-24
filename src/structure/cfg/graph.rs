@@ -15,7 +15,8 @@ use std::collections::{BTreeSet, VecDeque};
 use crate::structure::StructureError;
 
 use super::common::{
-    BlockRef, Cfg, CfgGraph, DominatorTree, EdgeRef, GraphFacts, NaturalLoop, PostDominatorTree,
+    BlockRef, Cfg, CfgGraph, DominatorTree, EdgeRef, GraphFacts, NaturalLoop, NaturalLoopForest,
+    PostDominatorTree,
 };
 
 struct DenseBlockSet {
@@ -106,6 +107,7 @@ struct GraphAnalysis {
     backedges: Vec<EdgeRef>,
     loop_headers: BTreeSet<BlockRef>,
     natural_loops: Vec<NaturalLoop>,
+    natural_loop_forest: NaturalLoopForest,
 }
 
 impl GraphAnalysis {
@@ -133,6 +135,8 @@ impl GraphAnalysis {
         let backedges = compute_backedges(cfg, &dominator_tree, &reachable);
         let loop_headers = compute_loop_headers(cfg, &backedges);
         let natural_loops = compute_natural_loops(cfg, &backedges, &reachable);
+        let natural_loop_forest =
+            NaturalLoopForest::build(&natural_loops, &dominator_tree, cfg.blocks.len());
 
         Ok(Self {
             rpo,
@@ -144,6 +148,7 @@ impl GraphAnalysis {
             backedges,
             loop_headers,
             natural_loops,
+            natural_loop_forest,
         })
     }
 
@@ -158,6 +163,7 @@ impl GraphAnalysis {
             backedges: self.backedges,
             loop_headers: self.loop_headers,
             natural_loops: self.natural_loops,
+            natural_loop_forest: self.natural_loop_forest,
             children,
         }
     }
@@ -219,18 +225,48 @@ pub(crate) fn analyze_graph_facts(
     state: &mut DecompileState,
     _context: &DecompileContext<'_>,
 ) -> Result<(), DecompileError> {
-    fn analyze_cfg_graph(cfg: &CfgGraph) -> Result<GraphFacts, StructureError> {
-        let analysis = GraphAnalysis::analyze(&cfg.cfg)?;
-        let children = cfg
-            .children
-            .iter()
-            .map(analyze_cfg_graph)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(analysis.into_graph_facts(children))
+    let cfg = state.require_cfg()?;
+    struct Frame<'a> {
+        cfg: &'a CfgGraph,
+        next_child: usize,
+        children: Vec<GraphFacts>,
     }
 
-    let cfg = state.require_cfg()?;
-    state.graph_facts = Some(analyze_cfg_graph(cfg)?);
+    // The graph algorithms themselves are iterative over blocks.  Keep the proto
+    // traversal iterative as well: a legal Luau flat table may contain 999 nested
+    // child protos and must not consume the Rust call stack between those analyses.
+    let mut stack = vec![Frame {
+        cfg,
+        next_child: 0,
+        children: Vec::new(),
+    }];
+    let result = loop {
+        let child = {
+            let frame = stack.last_mut().expect("graph proto frame is non-empty");
+            let child = frame.cfg.children.get(frame.next_child);
+            if child.is_some() {
+                frame.next_child += 1;
+            }
+            child
+        };
+        if let Some(child) = child {
+            stack.push(Frame {
+                cfg: child,
+                next_child: 0,
+                children: Vec::new(),
+            });
+            continue;
+        }
+
+        let frame = stack.pop().expect("graph proto frame is non-empty");
+        let facts = GraphAnalysis::analyze(&frame.cfg.cfg)?.into_graph_facts(frame.children);
+        if let Some(parent) = stack.last_mut() {
+            parent.children.push(facts);
+        } else {
+            break facts;
+        }
+    };
+    state.graph_facts = Some(result);
     Ok(())
 }
 

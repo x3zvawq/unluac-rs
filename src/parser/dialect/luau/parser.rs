@@ -5,11 +5,11 @@
 //! 直接解码，并在读取任何版本相关布局前按仓库 pinned Luau 的兼容范围校验 header，
 //! 避免在公共层伪造 PUC-Lua 头，也避免把未知版本误读成当前常量池或 proto 形状。
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::decompile::DecompileDialect;
 use crate::parser::error::ParseError;
-use crate::parser::limits::check_proto_depth;
+use crate::parser::limits::{check_luau_proto_depth, check_luau_proto_expansion};
 use crate::parser::options::ParseOptions;
 use crate::parser::raw::{
     ChunkHeader, ChunkLayout, Dialect, DialectConstPoolExtra, DialectDebugExtra,
@@ -50,7 +50,7 @@ struct FlatProto {
 
 enum FlatProtoSlot {
     Pending(Box<FlatProto>),
-    Built(Box<RawProto>),
+    Built(Arc<RawProto>),
     Consumed,
 }
 
@@ -774,63 +774,124 @@ impl LuauParserState {
     }
 }
 
+/// Materialize the lexical child slots without using the Rust call stack.
+///
+/// Luau serializes a child-before-parent DAG.  The old recursive implementation was
+/// correct for ordinary chunks but exhausted the process stack on a legal 300+ deep
+/// chain.  Each frame below owns only the current proto's child cursor; completed
+/// children are moved upward and represented by immutable `Arc`s, so a shared flat
+/// proto never recursively clones its descendants.
 fn build_proto_tree(
     proto_index: usize,
     flat_protos: &mut [FlatProtoSlot],
     remaining_uses: &mut [usize],
 ) -> Result<RawProto, ParseError> {
-    let remaining = remaining_uses
-        .get_mut(proto_index)
-        .and_then(|remaining| remaining.checked_sub(1))
-        .ok_or(ParseError::UnsupportedValue {
-            field: "luau proto use count",
-            value: proto_index as u64,
-        })?;
-    remaining_uses[proto_index] = remaining;
-    let slot = flat_protos
-        .get_mut(proto_index)
-        .ok_or(ParseError::UnsupportedValue {
-            field: "luau proto index",
-            value: proto_index as u64,
-        })?;
-    let flat = match std::mem::replace(slot, FlatProtoSlot::Consumed) {
-        FlatProtoSlot::Pending(flat) => *flat,
-        FlatProtoSlot::Built(proto) => {
-            if remaining == 0 {
-                flat_protos[proto_index] = FlatProtoSlot::Consumed;
-                return Ok(*proto);
+    struct Frame {
+        index: usize,
+        flat: FlatProto,
+        next_child: usize,
+        children: Vec<Arc<RawProto>>,
+        remaining: usize,
+    }
+
+    let mut frames = Vec::new();
+    let mut next_index = Some(proto_index);
+    let mut completed: Option<Arc<RawProto>> = None;
+
+    loop {
+        if let Some(index) = next_index.take() {
+            let remaining = remaining_uses
+                .get_mut(index)
+                .and_then(|remaining| remaining.checked_sub(1))
+                .ok_or(ParseError::UnsupportedValue {
+                    field: "luau proto use count",
+                    value: index as u64,
+                })?;
+            remaining_uses[index] = remaining;
+
+            let slot = flat_protos
+                .get_mut(index)
+                .ok_or(ParseError::UnsupportedValue {
+                    field: "luau proto index",
+                    value: index as u64,
+                })?;
+            match std::mem::replace(slot, FlatProtoSlot::Consumed) {
+                FlatProtoSlot::Pending(flat) => {
+                    let flat = *flat;
+                    let child_capacity = flat.child_indices.len();
+                    frames.push(Frame {
+                        index,
+                        flat,
+                        next_child: 0,
+                        children: Vec::with_capacity(child_capacity),
+                        remaining,
+                    });
+                    if let Some(frame) = frames.last() {
+                        next_index = frame.flat.child_indices.first().copied();
+                    }
+                    if next_index.is_none() {
+                        let frame = frames.pop().expect("new proto frame exists");
+                        let mut proto = frame.flat.proto;
+                        proto.common.children = frame.children;
+                        let completed_proto = Arc::new(proto);
+                        flat_protos[frame.index] = if frame.remaining == 0 {
+                            FlatProtoSlot::Consumed
+                        } else {
+                            FlatProtoSlot::Built(Arc::clone(&completed_proto))
+                        };
+                        completed = Some(completed_proto);
+                    }
+                }
+                FlatProtoSlot::Built(proto) => {
+                    let result = Arc::clone(&proto);
+                    flat_protos[index] = if remaining == 0 {
+                        FlatProtoSlot::Consumed
+                    } else {
+                        FlatProtoSlot::Built(proto)
+                    };
+                    completed = Some(result);
+                }
+                FlatProtoSlot::Consumed => {
+                    return Err(ParseError::UnsupportedValue {
+                        field: "luau proto use count",
+                        value: index as u64,
+                    });
+                }
             }
-            let result = (*proto).clone();
-            flat_protos[proto_index] = FlatProtoSlot::Built(proto);
-            return Ok(result);
         }
-        FlatProtoSlot::Consumed => {
-            return Err(ParseError::UnsupportedValue {
-                field: "luau proto use count",
-                value: proto_index as u64,
-            });
+
+        if let Some(proto) = completed.take() {
+            let Some(parent) = frames.last_mut() else {
+                return Arc::try_unwrap(proto).map_err(|_| ParseError::UnsupportedValue {
+                    field: "luau root proto sharing",
+                    value: proto_index as u64,
+                });
+            };
+            parent.children.push(proto);
+            parent.next_child += 1;
+            if let Some(&child_index) = parent.flat.child_indices.get(parent.next_child) {
+                next_index = Some(child_index);
+                continue;
+            }
+
+            let mut frame = frames.pop().expect("parent frame exists");
+            frame.flat.proto.common.children = frame.children;
+            let completed_proto = Arc::new(frame.flat.proto);
+            flat_protos[frame.index] = if frame.remaining == 0 {
+                FlatProtoSlot::Consumed
+            } else {
+                FlatProtoSlot::Built(Arc::clone(&completed_proto))
+            };
+            completed = Some(completed_proto);
         }
-    };
-    let mut proto = flat.proto;
-    proto.common.children = flat
-        .child_indices
-        .iter()
-        .copied()
-        .map(|index| build_proto_tree(index, flat_protos, remaining_uses))
-        .collect::<Result<Vec<_>, _>>()?;
-    flat_protos[proto_index] = if remaining == 0 {
-        FlatProtoSlot::Consumed
-    } else {
-        FlatProtoSlot::Built(Box::new(proto.clone()))
-    };
-    Ok(proto)
+    }
 }
 
 fn count_reachable_proto_uses(
     main_index: usize,
     flat_protos: &[FlatProto],
 ) -> Result<Vec<usize>, ParseError> {
-    let mut depths = vec![1; flat_protos.len()];
+    let mut depths: Vec<usize> = vec![1; flat_protos.len()];
     for (parent_index, flat) in flat_protos.iter().enumerate() {
         if let Some(&child_index) = flat
             .child_indices
@@ -842,29 +903,68 @@ fn count_reachable_proto_uses(
                 value: child_index as u64,
             });
         }
-        depths[parent_index] = flat
-            .child_indices
-            .iter()
-            .map(|&child_index| depths[child_index] + 1)
-            .max()
-            .unwrap_or(1);
+        let mut depth: usize = 1;
+        for &child_index in &flat.child_indices {
+            // The Luau table is serialized child-before-parent.  Reject malformed forward
+            // edges here instead of silently using the initial depth/occurrence value and
+            // letting the explicit materializer observe a misleading budget.
+            if child_index >= parent_index {
+                return Err(ParseError::UnsupportedValue {
+                    field: "luau child proto order",
+                    value: child_index as u64,
+                });
+            }
+            let child_depth =
+                depths
+                    .get(child_index)
+                    .copied()
+                    .ok_or(ParseError::UnsupportedValue {
+                        field: "luau child proto index",
+                        value: child_index as u64,
+                    })?;
+            depth = depth.max(
+                child_depth
+                    .checked_add(1)
+                    .ok_or(ParseError::IntegerOverflow {
+                        field: "luau proto depth",
+                        value: u64::MAX,
+                    })?,
+            );
+        }
+        depths[parent_index] = depth;
     }
-    check_proto_depth(depths[main_index])?;
+    check_luau_proto_depth(depths[main_index])?;
 
-    let mut uses = vec![0; flat_protos.len()];
-    let mut visited = vec![false; flat_protos.len()];
-    let mut pending = vec![main_index];
-    uses[main_index] = 1;
-    while let Some(parent_index) = pending.pop() {
-        if std::mem::replace(&mut visited[parent_index], true) {
+    // Child indices are strictly lower than their parent, so a descending flat-table
+    // pass computes the exact number of lexical occurrences without walking the
+    // exponentially expanded tree.  The budget rejects pathological shared DAGs
+    // before `build_proto_tree` can allocate them.
+    let mut occurrences = vec![0usize; flat_protos.len()];
+    occurrences[main_index] = 1;
+    let mut expanded_total = 0usize;
+    for parent_index in (0..flat_protos.len()).rev() {
+        let occurrence = occurrences[parent_index];
+        if occurrence == 0 {
             continue;
         }
+        expanded_total =
+            expanded_total
+                .checked_add(occurrence)
+                .ok_or(ParseError::IntegerOverflow {
+                    field: "luau proto expansion",
+                    value: u64::MAX,
+                })?;
+        check_luau_proto_expansion(expanded_total)?;
         for &child_index in &flat_protos[parent_index].child_indices {
-            uses[child_index] += 1;
-            pending.push(child_index);
+            occurrences[child_index] = occurrences[child_index].checked_add(occurrence).ok_or(
+                ParseError::IntegerOverflow {
+                    field: "luau proto expansion",
+                    value: u64::MAX,
+                },
+            )?;
         }
     }
-    Ok(uses)
+    Ok(occurrences)
 }
 
 fn raw_pc_from_word_pc(word_pc: u32, raw_by_word: &[Option<u32>]) -> Result<u32, ParseError> {

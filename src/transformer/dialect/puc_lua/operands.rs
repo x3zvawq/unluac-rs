@@ -1,5 +1,7 @@
 //! 提供 PUC-Lua 寄存器/常量操作数、调用 pack、proto 组装和跳转边界辅助；依赖 parser raw proto 与 lowering state，不负责 opcode family 分派；例如解析 RK 常量、构造 open result pack 并校验 jump target。
 
+use std::sync::Arc;
+
 use super::*;
 
 pub(crate) fn reg_from_u8(index: u8) -> Reg {
@@ -334,13 +336,13 @@ pub(crate) fn prepare_env_lowering(
     raw: &RawProto,
     parent_env_upvalues: Option<&[bool]>,
     lower_proto: fn(&RawProto, Option<&[bool]>) -> Result<LoweredProto, TransformError>,
-) -> Result<(Vec<bool>, Vec<LoweredProto>), TransformError> {
+) -> Result<(Vec<bool>, Vec<Arc<LoweredProto>>), TransformError> {
     let env_upvalues = resolve_env_upvalues(raw, parent_env_upvalues);
     let children = raw
         .common
         .children
         .iter()
-        .map(|child| lower_proto(child, Some(&env_upvalues)))
+        .map(|child| lower_proto(child, Some(&env_upvalues)).map(Arc::new))
         .collect::<Result<Vec<_>, _>>()?;
     Ok((env_upvalues, children))
 }
@@ -348,7 +350,7 @@ pub(crate) fn prepare_env_lowering(
 /// 共享 `LoweredProto` 组装壳，避免 5.2+ 每个版本重复复制元数据拼装代码。
 pub(crate) fn finish_lowered_proto(
     raw: &RawProto,
-    children: Vec<LoweredProto>,
+    children: Vec<Arc<LoweredProto>>,
     instrs: Vec<LowInstr>,
     lowering_map: LoweringMap,
 ) -> LoweredProto {

@@ -209,7 +209,7 @@ pub(super) fn assert_luajit_method_protocol_contract(
         .main
         .children
         .iter()
-        .map(large_method_signature)
+        .map(|proto| large_method_signature(proto))
         .collect::<Vec<_>>();
     if signatures.len() != 2
         || !signatures.contains(&Some(LargeMethodSignature::Method))

@@ -137,51 +137,56 @@ pub fn project_rich_result(result: &DecompileResult) -> WasmRichResult {
 
 /// DFS 收集 proto 元数据，`counter` 跟踪全局 ID 分配。
 fn collect_proto_meta(proto: &RawProto, out: &mut Vec<WasmProtoMeta>, counter: &mut usize) {
-    let my_id = *counter;
-    *counter += 1;
+    // Child metadata is emitted in pre-order, but the explicit stack keeps a
+    // deep Luau chain out of the WASM host call stack.
+    let mut pending: Vec<(&RawProto, Option<usize>)> = vec![(proto, None)];
+    while let Some((proto, parent)) = pending.pop() {
+        let my_id = *counter;
+        *counter += 1;
+        let child_start_id = *counter;
+        let num_children = proto.common.children.len();
 
-    let child_start_id = *counter;
-    let num_children = proto.common.children.len();
-
-    // 先预留位置，后面填充 children
-    out.push(WasmProtoMeta {
-        id: my_id,
-        name: proto.common.source.as_ref().map(raw_string_to_string),
-        line_start: proto.common.line_range.defined_start,
-        line_end: proto.common.line_range.defined_end,
-        num_params: proto.common.signature.num_params,
-        is_vararg: proto.common.signature.is_vararg,
-        num_upvalues: proto.common.upvalues.common.count as usize,
-        num_constants: proto.common.constants.common.literals.len(),
-        num_instructions: proto.common.instructions.len(),
-        constants: proto
-            .common
-            .constants
-            .common
-            .literals
-            .iter()
-            .enumerate()
-            .map(|(i, lit)| project_constant(i, lit))
-            .collect(),
-        children: Vec::with_capacity(num_children),
-    });
-
-    // 递归收集子 proto
-    for child in &proto.common.children {
-        let child_id = *counter;
-        out[my_id].children.push(child_id);
-        collect_proto_meta(child, out, counter);
-    }
-
-    // 断言子序列连续
-    debug_assert_eq!(
-        out[my_id].children.first().copied(),
-        if num_children > 0 {
-            Some(child_start_id)
-        } else {
-            None
+        if let Some(parent) = parent {
+            out[parent].children.push(my_id);
         }
-    );
+
+        out.push(WasmProtoMeta {
+            id: my_id,
+            name: proto.common.source.as_ref().map(raw_string_to_string),
+            line_start: proto.common.line_range.defined_start,
+            line_end: proto.common.line_range.defined_end,
+            num_params: proto.common.signature.num_params,
+            is_vararg: proto.common.signature.is_vararg,
+            num_upvalues: proto.common.upvalues.common.count as usize,
+            num_constants: proto.common.constants.common.literals.len(),
+            num_instructions: proto.common.instructions.len(),
+            constants: proto
+                .common
+                .constants
+                .common
+                .literals
+                .iter()
+                .enumerate()
+                .map(|(i, lit)| project_constant(i, lit))
+                .collect(),
+            children: Vec::with_capacity(num_children),
+        });
+
+        // Reverse-push preserves lexical child order in the pre-order output;
+        // IDs are assigned when a frame is popped, matching the old recursion.
+        for child in proto.common.children.iter().rev() {
+            pending.push((child.as_ref(), Some(my_id)));
+        }
+
+        debug_assert_eq!(
+            out[my_id].children.first().copied(),
+            if num_children > 0 {
+                Some(child_start_id)
+            } else {
+                None
+            }
+        );
+    }
 }
 
 /// DFS 收集每个 proto 的 CFG。
@@ -195,82 +200,101 @@ fn collect_cfgs(
     out: &mut Vec<WasmProtoCfg>,
     counter: &mut usize,
 ) {
-    let proto_id = *counter;
-    *counter += 1;
+    struct Frame<'a> {
+        lowered: &'a LoweredProto,
+        raw: Option<&'a RawProto>,
+        cfg_graph: &'a CfgGraph,
+    }
 
-    let raw_instrs = raw_proto.map(|p| &p.common.instructions);
+    let mut pending = vec![Frame {
+        lowered,
+        raw: raw_proto,
+        cfg_graph,
+    }];
+    while let Some(frame) = pending.pop() {
+        let proto_id = *counter;
+        *counter += 1;
 
-    let cfg = &cfg_graph.cfg;
-    let blocks: Vec<WasmCfgBlock> = cfg
-        .blocks
-        .iter()
-        .enumerate()
-        .map(|(i, block)| {
-            let mut instructions = Vec::new();
-            let mut raw_instructions = Vec::new();
+        let raw_instrs = frame.raw.map(|p| &p.common.instructions);
+        let cfg = &frame.cfg_graph.cfg;
+        let blocks: Vec<WasmCfgBlock> = cfg
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, block)| {
+                let mut instructions = Vec::new();
+                let mut raw_instructions = Vec::new();
 
-            for offset in 0..block.instrs.len {
-                let idx = block.instrs.start.index() + offset;
-                if let Some(low_instr) = lowered.instrs.get(idx) {
-                    instructions.push(format_low_instr(low_instr));
+                for offset in 0..block.instrs.len {
+                    let idx = block.instrs.start.index() + offset;
+                    if let Some(low_instr) = frame.lowered.instrs.get(idx) {
+                        instructions.push(format_low_instr(low_instr));
 
-                    // 通过 lowering_map 找到对应的原始指令
-                    if let Some(raw_vec) = raw_instrs {
-                        let raw_refs = lowered.lowering_map.low_to_raw.get(idx);
-                        let raw_text: Vec<String> = raw_refs
-                            .map(|refs| {
-                                refs.iter()
-                                    .filter_map(|RawInstrRef(raw_idx)| {
-                                        raw_vec.get(*raw_idx).map(format_raw_instr)
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        raw_instructions.push(raw_text.join("; "));
+                        // 通过 lowering_map 找到对应的原始指令
+                        if let Some(raw_vec) = raw_instrs {
+                            let raw_refs = frame.lowered.lowering_map.low_to_raw.get(idx);
+                            let raw_text: Vec<String> = raw_refs
+                                .map(|refs| {
+                                    refs.iter()
+                                        .filter_map(|RawInstrRef(raw_idx)| {
+                                            raw_vec.get(*raw_idx).map(format_raw_instr)
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            raw_instructions.push(raw_text.join("; "));
+                        }
                     }
                 }
-            }
 
-            WasmCfgBlock {
-                id: i,
-                kind: block_kind_str(block.kind),
-                instructions,
-                raw_instructions,
-            }
-        })
-        .collect();
+                WasmCfgBlock {
+                    id: i,
+                    kind: block_kind_str(block.kind),
+                    instructions,
+                    raw_instructions,
+                }
+            })
+            .collect();
 
-    let edges: Vec<WasmCfgEdge> = cfg
-        .edges
-        .iter()
-        .map(|edge| WasmCfgEdge {
-            from: edge.from.index(),
-            to: edge.to.index(),
-            kind: edge_kind_str(edge.kind),
-        })
-        .collect();
+        let edges: Vec<WasmCfgEdge> = cfg
+            .edges
+            .iter()
+            .map(|edge| WasmCfgEdge {
+                from: edge.from.index(),
+                to: edge.to.index(),
+                kind: edge_kind_str(edge.kind),
+            })
+            .collect();
 
-    out.push(WasmProtoCfg {
-        proto_id,
-        blocks,
-        edges,
-        entry_block: cfg.entry_block.index(),
-        exit_block: cfg.exit_block.index(),
-        block_order: cfg.block_order.iter().map(|b| b.index()).collect(),
-    });
+        out.push(WasmProtoCfg {
+            proto_id,
+            blocks,
+            edges,
+            entry_block: cfg.entry_block.index(),
+            exit_block: cfg.exit_block.index(),
+            block_order: cfg.block_order.iter().map(|b| b.index()).collect(),
+        });
 
-    // 递归子 proto
-    let raw_children: Vec<Option<&RawProto>> = raw_proto
-        .map(|p| p.common.children.iter().map(Some).collect())
-        .unwrap_or_else(|| vec![None; lowered.children.len()]);
-
-    for ((child_lowered, child_cfg), child_raw) in lowered
-        .children
-        .iter()
-        .zip(cfg_graph.children.iter())
-        .zip(raw_children)
-    {
-        collect_cfgs(child_lowered, child_raw, child_cfg, out, counter);
+        // Reverse-push preserves the lexical child order of the old recursion.
+        let child_count = frame
+            .lowered
+            .children
+            .len()
+            .min(frame.cfg_graph.children.len())
+            .min(
+                frame
+                    .raw
+                    .map_or(usize::MAX, |raw| raw.common.children.len()),
+            );
+        for index in (0..child_count).rev() {
+            pending.push(Frame {
+                lowered: &frame.lowered.children[index],
+                raw: frame
+                    .raw
+                    .and_then(|raw| raw.common.children.get(index).map(|child| child.as_ref())),
+                cfg_graph: &frame.cfg_graph.children[index],
+            });
+        }
     }
 }
 

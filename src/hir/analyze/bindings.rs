@@ -10,8 +10,10 @@
 //!   一组 header locals，而不是再从 `GenericForLoop` terminator 回扫一次
 //! - 同一 `(slot, close epoch)` 的引用捕获会共用一次反向写后分析，不会按
 //!   `closure 数 × def 数` 重复扫描；这里只决定绑定身份，不改写 closure 语义
+//! - loop body 的 block 列表在 bindings 入口按 `LoopPlanId` 只展开一次，loop local 与
+//!   captured-slot owner 判定共享紧凑快照，不重复 DFS region tree。
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{LocalId, ParamId, TempId, UpvalueId};
 use crate::structure::{
@@ -104,6 +106,17 @@ pub(super) fn build_bindings(
     let mut numeric_for_locals = BTreeMap::new();
     let mut generic_for_locals = BTreeMap::new();
     let mut block_local_regs = BTreeMap::new();
+    // loop body 的 region tree 展开同时服务 loop binding 与 captured-slot owner 判定。
+    // 先按稠密 LoopPlanId 只展开一次，并压成 block 列表，避免保留每个 loop 的 BTreeSet
+    // 节点开销；嵌套 ancestor incidence 仍由后续 owner map 合同单独约束。
+    let loop_body_blocks = structure
+        .plan()
+        .loops()
+        .map(|(loop_id, _)| {
+            loop_body_region(structure.plan(), loop_id)
+                .map(|body| region_blocks(structure.plan(), body))
+        })
+        .collect::<Vec<_>>();
     let numeric_binding_phis = numeric_for_binding_phis(structure.plan());
     let phi_debug_hints = structure
         .plan()
@@ -147,6 +160,7 @@ pub(super) fn build_bindings(
             epochs: captured_slot_epochs,
             child_mutable_upvalues,
             numeric_binding_phis: &numeric_binding_phis.bindings,
+            loop_body_blocks: &loop_body_blocks,
         },
         &mut entry_local_regs,
         &mut locals,
@@ -154,16 +168,18 @@ pub(super) fn build_bindings(
     );
 
     for (loop_id, loop_plan) in structure.plan().loops() {
-        let Some(body) = loop_body_region(structure.plan(), loop_id) else {
+        let Some(body_blocks) = loop_body_blocks
+            .get(loop_id.index())
+            .and_then(Option::as_ref)
+        else {
             continue;
         };
-        let body_blocks = region_blocks(structure.plan(), body);
         match loop_plan.source_bindings {
             Some(LoopSourceBindings::Numeric(reg)) => {
                 let local = LocalId(locals.len());
                 locals.push(local);
                 local_debug_hints.push(
-                    debug_local_name_for_reg_in_blocks(proto, cfg, &body_blocks, reg).or_else(
+                    debug_local_name_for_reg_in_blocks(proto, cfg, body_blocks, reg).or_else(
                         || {
                             debug_local_name_for_reg_at_block_entry(
                                 proto,
@@ -176,9 +192,9 @@ pub(super) fn build_bindings(
                 );
                 numeric_for_locals.insert(loop_plan.header, local);
 
-                for block in &body_blocks {
+                for &block in body_blocks {
                     block_local_regs
-                        .entry(*block)
+                        .entry(block)
                         .or_insert_with(BTreeMap::new)
                         .insert(reg, local);
                 }
@@ -190,7 +206,7 @@ pub(super) fn build_bindings(
                     locals.push(local);
                     let reg = crate::transformer::Reg(bindings.start.index() + offset);
                     local_debug_hints.push(
-                        debug_local_name_for_reg_in_blocks(proto, cfg, &body_blocks, reg).or_else(
+                        debug_local_name_for_reg_in_blocks(proto, cfg, body_blocks, reg).or_else(
                             || {
                                 debug_local_name_for_reg_at_block_entry(
                                     proto,
@@ -203,9 +219,9 @@ pub(super) fn build_bindings(
                     );
                     locals_for_loop.push(local);
 
-                    for block in &body_blocks {
+                    for &block in body_blocks {
                         block_local_regs
-                            .entry(*block)
+                            .entry(block)
                             .or_insert_with(BTreeMap::new)
                             .insert(reg, local);
                     }

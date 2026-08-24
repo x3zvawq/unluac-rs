@@ -1,4 +1,6 @@
-//! 收集闭包捕获槽目标、声明区域与 capture 后写入；依赖 CFG、slot epoch 和 region tree，不负责 temp 映射；例如把同一槽的不同时代分成独立 local。
+//! 收集闭包捕获槽目标、声明区域与 capture 后写入；依赖 CFG、slot epoch 和 region tree，
+//! 不负责 temp 映射；loop body block 列表由 bindings 入口共享，避免重复展开；例如把同一槽
+//! 的不同时代分成独立 local。
 
 use super::*;
 
@@ -30,85 +32,121 @@ pub(super) struct CapturedSlotWriteQueries {
     defs: Vec<(usize, BlockRef)>,
 }
 
-pub(super) struct CapturedSlotWriteWorkspace {
-    epoch: usize,
-    def_epoch: Vec<usize>,
-    last_def_instr: Vec<usize>,
-    def_blocks: Vec<BlockRef>,
-    reach_epoch: Vec<usize>,
-    pending: VecDeque<BlockRef>,
+/// Cross-epoch write queries share the same CFG reachability facts.
+///
+/// The old implementation rebuilt a reverse CFG worklist for every `(slot, epoch)` key.  That
+/// made a synthetic chunk with many epochs pay for the same graph walk repeatedly.  The SCC
+/// condensation is a DAG, so its transitive reachability can be memoized by source SCC once and
+/// then reused by every epoch.  This is a graph-shaped cache (`SCC × SCC`), never a persistent
+/// `(key × block)` matrix; instruction-order checks remain local to the queried block.
+pub(super) struct CapturedSlotWriteMemo {
+    block_scc: Vec<Option<usize>>,
+    cyclic_scc: Vec<bool>,
+    successors: Vec<Vec<usize>>,
+    source_reachability: Vec<Option<Vec<bool>>>,
 }
 
-impl CapturedSlotWriteWorkspace {
-    pub(super) fn new(block_count: usize) -> Self {
+impl CapturedSlotWriteMemo {
+    pub(super) fn new(cfg: &Cfg, graph: &GraphFacts) -> Self {
+        let components = graph.strongly_connected_components().collect::<Vec<_>>();
+        let mut block_scc = vec![None; cfg.blocks.len()];
+        let mut cyclic_scc = vec![false; components.len()];
+        for (scc, blocks) in components.iter().enumerate() {
+            for &block in *blocks {
+                if let Some(slot) = block_scc.get_mut(block.index()) {
+                    *slot = Some(scc);
+                }
+            }
+            cyclic_scc[scc] = blocks.len() > 1
+                || blocks.first().is_some_and(|block| {
+                    cfg.succs[block.index()]
+                        .iter()
+                        .any(|edge_ref| cfg.edges[edge_ref.index()].to == *block)
+                });
+        }
+
+        let mut successors = vec![BTreeSet::new(); components.len()];
+        for edge in &cfg.edges {
+            let (Some(from), Some(to)) = (
+                block_scc.get(edge.from.index()).copied().flatten(),
+                block_scc.get(edge.to.index()).copied().flatten(),
+            ) else {
+                continue;
+            };
+            if from != to {
+                successors[from].insert(to);
+            }
+        }
+        let successors = successors
+            .into_iter()
+            .map(|set| set.into_iter().collect())
+            .collect::<Vec<Vec<_>>>();
+        let source_reachability = vec![None; components.len()];
         Self {
-            epoch: 0,
-            def_epoch: vec![0; block_count],
-            last_def_instr: vec![0; block_count],
-            def_blocks: Vec::new(),
-            reach_epoch: vec![0; block_count],
-            pending: VecDeque::new(),
+            block_scc,
+            cyclic_scc,
+            successors,
+            source_reachability,
         }
     }
 
-    pub(super) fn analyze(&mut self, cfg: &Cfg, defs: &[(usize, BlockRef)]) {
-        self.begin();
-        for &(instr_index, block) in defs {
-            if !cfg.reachable_blocks.contains(&block) {
+    pub(super) fn has_write_after(
+        &mut self,
+        cfg: &Cfg,
+        capture_instr: usize,
+        defs: &[(usize, BlockRef)],
+    ) -> bool {
+        let Some(&capture_block) = cfg.instr_to_block.get(capture_instr) else {
+            return false;
+        };
+        if !cfg.reachable_blocks.contains(&capture_block) {
+            return false;
+        }
+        let Some(capture_scc) = self.block_scc.get(capture_block.index()).copied().flatten() else {
+            return false;
+        };
+
+        for &(def_instr, def_block) in defs {
+            if !cfg.reachable_blocks.contains(&def_block) {
                 continue;
             }
-            if self.def_epoch[block.index()] != self.epoch {
-                self.def_epoch[block.index()] = self.epoch;
-                self.last_def_instr[block.index()] = instr_index;
-                self.def_blocks.push(block);
-            } else {
-                self.last_def_instr[block.index()] =
-                    self.last_def_instr[block.index()].max(instr_index);
+            if def_block == capture_block {
+                if def_instr > capture_instr || self.cyclic_scc[capture_scc] {
+                    return true;
+                }
+                continue;
+            }
+            let Some(def_scc) = self.block_scc.get(def_block.index()).copied().flatten() else {
+                continue;
+            };
+            if def_scc == capture_scc || self.reaches(capture_scc, def_scc) {
+                return true;
             }
         }
+        false
+    }
 
-        // Def block 本身不是 seed：从 predecessor 开始才表示“至少经过一条边”。
-        // 这使同块且位于 capture 之前的 def 只有在真实回路中才会命中。
-        for index in 0..self.def_blocks.len() {
-            let def_block = self.def_blocks[index];
-            for edge_ref in &cfg.preds[def_block.index()] {
-                self.enqueue(cfg, cfg.edges[edge_ref.index()].from);
+    fn reaches(&mut self, source: usize, target: usize) -> bool {
+        if source == target {
+            return true;
+        }
+        if self.source_reachability[source].is_none() {
+            let mut reachable = vec![false; self.successors.len()];
+            let mut pending = vec![source];
+            while let Some(current) = pending.pop() {
+                for &next in &self.successors[current] {
+                    if reachable[next] {
+                        continue;
+                    }
+                    reachable[next] = true;
+                    pending.push(next);
+                }
             }
+            self.source_reachability[source] = Some(reachable);
         }
-        while let Some(block) = self.pending.pop_front() {
-            for edge_ref in &cfg.preds[block.index()] {
-                self.enqueue(cfg, cfg.edges[edge_ref.index()].from);
-            }
-        }
-    }
-
-    pub(super) fn has_write_after(&self, cfg: &Cfg, capture_instr: usize) -> bool {
-        let block = cfg.instr_to_block[capture_instr];
-        // Closure 只定义 dst，且收集阶段已排除 dst 自捕获，所以不存在同指令
-        // 定义 capture reg 的 equality 形状；若 Closure effect 改为多定义，必须重审此谓词。
-        cfg.reachable_blocks.contains(&block)
-            && ((self.def_epoch[block.index()] == self.epoch
-                && self.last_def_instr[block.index()] > capture_instr)
-                || self.reach_epoch[block.index()] == self.epoch)
-    }
-
-    pub(super) fn begin(&mut self) {
-        if self.epoch == usize::MAX {
-            self.def_epoch.fill(0);
-            self.reach_epoch.fill(0);
-            self.epoch = 1;
-        } else {
-            self.epoch += 1;
-        }
-        self.def_blocks.clear();
-        self.pending.clear();
-    }
-
-    pub(super) fn enqueue(&mut self, cfg: &Cfg, block: BlockRef) {
-        if cfg.reachable_blocks.contains(&block) && self.reach_epoch[block.index()] != self.epoch {
-            self.reach_epoch[block.index()] = self.epoch;
-            self.pending.push_back(block);
-        }
+        self.source_reachability[source]
+            .as_ref()
+            .is_some_and(|reachable| reachable[target])
     }
 }
 
@@ -159,6 +197,8 @@ pub(super) struct CapturedSlotInputs<'a> {
     pub(super) epochs: &'a SlotEpochFacts,
     pub(super) child_mutable_upvalues: &'a [Vec<bool>],
     pub(super) numeric_binding_phis: &'a [bool],
+    /// 与 loop binding pass 共享的紧凑 body block 列表；每个 loop 只在 bindings 总入口展开一次。
+    pub(super) loop_body_blocks: &'a [Option<Vec<BlockRef>>],
 }
 
 pub(super) fn collect_captured_slot_targets(
@@ -176,16 +216,20 @@ pub(super) fn collect_captured_slot_targets(
         epochs,
         child_mutable_upvalues,
         numeric_binding_phis,
+        loop_body_blocks,
     } = inputs;
     let mut slot_targets = BTreeMap::<CapturedSlotKey, CapturedSlotBinding>::new();
     let mut capture_targets = BTreeMap::new();
     let mut captured_uses = Vec::new();
     let mut loop_owned_slots = BTreeSet::new();
     for (loop_id, loop_plan) in structure.plan().loops() {
-        let Some(body) = loop_body_region(structure.plan(), loop_id) else {
+        let Some(body_blocks) = loop_body_blocks
+            .get(loop_id.index())
+            .and_then(Option::as_ref)
+        else {
             continue;
         };
-        for block in region_blocks(structure.plan(), body) {
+        for &block in body_blocks {
             match loop_plan.source_bindings {
                 Some(LoopSourceBindings::Numeric(_)) => {}
                 Some(LoopSourceBindings::Generic(bindings)) => {
@@ -269,6 +313,7 @@ pub(super) fn collect_captured_slot_targets(
 
     resolve_parent_writes_after_capture(
         cfg,
+        graph,
         dataflow,
         epochs,
         &mut write_queries,
@@ -450,6 +495,7 @@ pub(super) fn captured_slot_lexical_owner(
 
 pub(super) fn resolve_parent_writes_after_capture(
     cfg: &Cfg,
+    graph: &GraphFacts,
     dataflow: &DataflowFacts,
     epochs: &SlotEpochFacts,
     queries_by_key: &mut BTreeMap<CapturedSlotKey, CapturedSlotWriteQueries>,
@@ -466,12 +512,12 @@ pub(super) fn resolve_parent_writes_after_capture(
             .push((instr_index, cfg.instr_to_block[instr_index]));
     }
 
-    let mut workspace = CapturedSlotWriteWorkspace::new(cfg.blocks.len());
+    let mut memo = CapturedSlotWriteMemo::new(cfg, graph);
     for queries in queries_by_key.values() {
-        workspace.analyze(cfg, &queries.defs);
         for &use_index in &queries.uses {
             let captured = &mut captured_uses[use_index];
-            captured.requires_local = workspace.has_write_after(cfg, captured.instr_index);
+            captured.requires_local =
+                memo.has_write_after(cfg, captured.instr_index, &queries.defs);
         }
     }
 }

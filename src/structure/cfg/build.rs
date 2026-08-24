@@ -26,16 +26,52 @@ pub(crate) fn build_cfg_proto(
     Ok(())
 }
 
-/// 对 proto 树递归构建 CFG。
+/// 对 proto 树构建 CFG。
+///
+/// Luau 的 serialized chunk 可以合法地包含数百层嵌套 proto。这里使用显式
+/// postorder frame，而不是把 proto 深度压到 Rust 调用栈；每个 frame 只保留
+/// 已完成的 child CFG，语义与原先的递归后序构建一致。
 pub fn build_cfg_graph(proto: &LoweredProto) -> Result<CfgGraph, StructureError> {
-    Ok(CfgGraph {
-        cfg: build_cfg(&proto.instrs)?,
-        children: proto
-            .children
-            .iter()
-            .map(build_cfg_graph)
-            .collect::<Result<Vec<_>, _>>()?,
-    })
+    struct Frame<'a> {
+        proto: &'a LoweredProto,
+        next_child: usize,
+        children: Vec<CfgGraph>,
+    }
+
+    let mut stack = vec![Frame {
+        proto,
+        next_child: 0,
+        children: Vec::new(),
+    }];
+    loop {
+        let child = {
+            let frame = stack.last_mut().expect("CFG proto frame is non-empty");
+            let child = frame.proto.children.get(frame.next_child);
+            if child.is_some() {
+                frame.next_child += 1;
+            }
+            child
+        };
+        if let Some(child) = child {
+            stack.push(Frame {
+                proto: child,
+                next_child: 0,
+                children: Vec::new(),
+            });
+            continue;
+        }
+
+        let frame = stack.pop().expect("CFG proto frame is non-empty");
+        let result = CfgGraph {
+            cfg: build_cfg(&frame.proto.instrs)?,
+            children: frame.children,
+        };
+        if let Some(parent) = stack.last_mut() {
+            parent.children.push(result);
+        } else {
+            return Ok(result);
+        }
+    }
 }
 
 fn build_cfg(instrs: &[LowInstr]) -> Result<Cfg, StructureError> {

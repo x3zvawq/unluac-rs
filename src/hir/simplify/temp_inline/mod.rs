@@ -38,7 +38,7 @@ mod rewrite;
 mod site;
 mod usage;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::{DecompileDialect, ReadabilityOptions};
 use crate::hir::common::{
@@ -46,11 +46,12 @@ use crate::hir::common::{
     TempId,
 };
 use crate::hir::expr_safety::{
-    expr_is_discard_safe, expr_observes_eval_order, expr_requires_ordered_snapshot,
+    expr_is_discard_safe, expr_is_repeatable, expr_observes_eval_order,
+    expr_requires_ordered_snapshot,
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
-use self::rewrite::replace_temp_in_stmt;
+use self::rewrite::{replace_temp_in_stmt, replace_temps_in_stmt};
 use self::site::{
     InlineSite, expr_touches_temp, fastcall_callee_materialization_precedes_temp,
     inline_site_in_repeat_condition, inline_site_in_stmt, is_method_receiver_snapshot,
@@ -67,16 +68,13 @@ use super::temp_touch::stmt_contains_nested_nonlocal_control;
 
 const NESTED_INLINE_MAX_COMPLEXITY: usize = 5;
 const CONTROL_HEAD_INLINE_MAX_COMPLEXITY: usize = 5;
-// 限制人工 chunk 的超长单 run 反复扫描 growing sink；这不是 VM 参数上限。
-// 超限只放弃可读性融合，原 temp 与求值语义保持不变。
-const CALL_MATERIALIZATION_SINK_REWRITE_BUDGET: usize = 1024;
-
 struct TempInlineWorkspace<'a> {
     uses: TempUseScratch,
     order_sensitive_defs: OrderSensitiveDefWorkspace,
     block_depth: usize,
     scope: TempInlineScope,
     dialect: DecompileDialect,
+    readability: ReadabilityOptions,
     substantial_closure_bodies: &'a [bool],
 }
 
@@ -138,6 +136,7 @@ impl<'a> TempInlineWorkspace<'a> {
         temp_count: usize,
         scope: TempInlineScope,
         dialect: DecompileDialect,
+        readability: ReadabilityOptions,
         substantial_closure_bodies: &'a [bool],
     ) -> Self {
         Self {
@@ -146,6 +145,7 @@ impl<'a> TempInlineWorkspace<'a> {
             block_depth: 0,
             scope,
             dialect,
+            readability,
             substantial_closure_bodies,
         }
     }
@@ -212,6 +212,7 @@ fn inline_temps_in_proto_with_scope(
         temp_count,
         scope,
         dialect,
+        readability,
         substantial_closure_bodies,
     );
     let mut live_use_counts = collect_block_temp_use_totals(&proto.body.stmts, &mut workspace.uses);
@@ -578,6 +579,131 @@ fn stmt_stores_temp_in_table(stmt: &HirStmt, temp: TempId) -> bool {
     }
 }
 
+/// Inline a contiguous pure alias chain through one substitution-DAG rewrite.
+///
+/// This path deliberately accepts only repeatable expressions.  Such a chain has no
+/// lookup, call, allocation, or mutable snapshot whose evaluation point could move;
+/// every candidate has one total use and the dependency edges point forward in the
+/// statement run.  The stricter contract is useful here because it lets the rewrite
+/// operate on the final sink directly instead of recreating every intermediate sink.
+struct PureMaterializationContext<'a> {
+    scratch: &'a mut TempUseScratch,
+    live_use_counts: &'a mut [usize],
+    facts: &'a ProtoPromotionFacts,
+    captured_slots_before_stmt: &'a CapturedSlotSnapshots,
+    order_sensitive_defs: &'a OrderSensitiveDefWorkspace,
+    readability: ReadabilityOptions,
+    removed_stmts: &'a mut [bool],
+}
+
+fn inline_pure_materialization_run(
+    block: &mut HirBlock,
+    run_start: usize,
+    run_end: usize,
+    callee_index: usize,
+    callee_temp: TempId,
+    context: &mut PureMaterializationContext<'_>,
+) -> bool {
+    if callee_index != run_start || run_end <= run_start {
+        return false;
+    }
+
+    let mut replacements = BTreeMap::new();
+    let mut positions = BTreeMap::new();
+    for index in run_start..run_end {
+        let Some((temp, value)) = inline_candidate(&block.stmts[index]) else {
+            return false;
+        };
+        if total_use_count(temp, context.live_use_counts) != 1
+            || !expr_is_repeatable(value)
+            || !InlineSite::Nested.allows(value, context.readability)
+            || !materialization_run_candidate_is_safe(
+                temp,
+                value,
+                index,
+                context.scratch,
+                context.facts,
+                context.captured_slots_before_stmt,
+            )
+            || arg_value_forwards_prior_order_sensitive_expr(
+                value,
+                run_start,
+                context.order_sensitive_defs,
+            )
+        {
+            return false;
+        }
+        positions.insert(temp, index);
+        replacements.insert(temp, value.clone());
+    }
+
+    // Every candidate must be on the dependency path that reaches the sink.  This
+    // avoids deleting a dead assignment merely because its value happens to be pure.
+    let mut needed = BTreeSet::new();
+    collect_stmt_temp_uses(&block.stmts[run_end], context.scratch).for_each(|temp, _| {
+        needed.insert(temp);
+    });
+    let mut pending = needed.iter().copied().collect::<Vec<_>>();
+    while let Some(temp) = pending.pop() {
+        let Some(value) = replacements.get(&temp) else {
+            continue;
+        };
+        collect_expr_temp_uses_summary(value, context.scratch).for_each(|dependency, _| {
+            if needed.insert(dependency) {
+                pending.push(dependency);
+            }
+        });
+    }
+    if positions.keys().any(|temp| !needed.contains(temp)) {
+        return false;
+    }
+
+    // A candidate may only depend on an earlier assignment.  Reject forward edges
+    // explicitly so the map cannot contain a cycle or change source evaluation order.
+    for (&temp, value) in &replacements {
+        let Some(&position) = positions.get(&temp) else {
+            continue;
+        };
+        let mut valid = true;
+        collect_expr_temp_uses_summary(value, context.scratch).for_each(|dependency, _| {
+            if positions
+                .get(&dependency)
+                .is_some_and(|dependency_position| *dependency_position >= position)
+            {
+                valid = false;
+            }
+        });
+        if !valid {
+            return false;
+        }
+    }
+
+    let mut rewritten_sink = block.stmts[run_end].clone();
+    if replace_temps_in_stmt(&mut rewritten_sink, &replacements) == 0 {
+        return false;
+    }
+    let mut remaining = false;
+    collect_stmt_temp_uses(&rewritten_sink, context.scratch).for_each(|temp, _| {
+        remaining |= positions.contains_key(&temp);
+    });
+    if remaining {
+        return false;
+    }
+
+    // The source call already establishes that `callee_temp` is the direct call
+    // target.  The map expansion above only substitutes forwarding refs, so this
+    // check guards against an unexpected shape change in future HIR variants.
+    if !replacements.contains_key(&callee_temp) {
+        return false;
+    }
+    block.stmts[run_end] = rewritten_sink;
+    context.removed_stmts[run_start..run_end].fill(true);
+    for temp in positions.keys().copied() {
+        remove_live_use(context.live_use_counts, temp);
+    }
+    true
+}
+
 fn inline_materialization_runs(
     block: &mut HirBlock,
     workspace: &mut TempInlineWorkspace<'_>,
@@ -594,6 +720,7 @@ fn inline_materialization_runs(
         order_sensitive_defs,
         scope,
         dialect,
+        readability,
         ..
     } = workspace;
     order_sensitive_defs.rebuild(&block.stmts);
@@ -665,13 +792,14 @@ fn inline_materialization_runs(
             index = run_end + 1;
             continue;
         };
+        let callee_value = callee_value.clone();
         let terminal_candidate = block.stmts[..run_end]
             .last()
             .and_then(inline_candidate)
             .map(|(temp, _)| temp);
         if !scope.allows_call(
             call_stmt,
-            callee_value,
+            &callee_value,
             terminal_candidate,
             &block.stmts[run_end],
         ) {
@@ -680,7 +808,7 @@ fn inline_materialization_runs(
         }
         if !materialization_run_candidate_is_safe(
             callee_temp,
-            callee_value,
+            &callee_value,
             callee_index,
             uses,
             facts,
@@ -691,11 +819,37 @@ fn inline_materialization_runs(
             continue;
         }
 
+        // A long forwarding run can be represented as a substitution DAG.  Validate
+        // the complete pure alias chain once, then rewrite the sink in one traversal;
+        // this keeps generated source readable without imposing an arbitrary run-size
+        // cutoff.  Runs containing observable expressions continue through the precise
+        // per-site proof below.
+        let mut pure_context = PureMaterializationContext {
+            scratch: uses,
+            live_use_counts,
+            facts,
+            captured_slots_before_stmt,
+            order_sensitive_defs,
+            readability: *readability,
+            removed_stmts: &mut removed_stmts,
+        };
+        if inline_pure_materialization_run(
+            block,
+            run_start,
+            run_end,
+            callee_index,
+            callee_temp,
+            &mut pure_context,
+        ) {
+            changed = true;
+            index = run_end + 1;
+            continue;
+        }
+
         let mut rewritten_sink = block.stmts[run_end].clone();
         let mut removed_temps = Vec::with_capacity(run_end - callee_index);
         let mut discarded_uses = Vec::new();
         let mut complete_run = true;
-        let mut sink_rewrite_count = 0;
         for candidate_index in ((callee_index + 1)..run_end).rev() {
             let Some((temp, value)) = inline_candidate(&block.stmts[candidate_index]) else {
                 complete_run = false;
@@ -727,11 +881,6 @@ fn inline_materialization_runs(
                 complete_run = false;
                 break;
             }
-            if sink_rewrite_count >= CALL_MATERIALIZATION_SINK_REWRITE_BUDGET {
-                complete_run = false;
-                break;
-            }
-            sink_rewrite_count += 1;
             let Some(site) = inline_site_in_stmt(&rewritten_sink, temp) else {
                 complete_run = false;
                 break;
@@ -768,7 +917,7 @@ fn inline_materialization_runs(
         if !callee_site.is_call_callee()
             || inline_crosses_evaluation_boundary(
                 callee_site,
-                callee_value,
+                &callee_value,
                 &rewritten_sink,
                 callee_temp,
                 reference_captured,
@@ -778,7 +927,7 @@ fn inline_materialization_runs(
             index = run_end + 1;
             continue;
         }
-        replace_temp_in_stmt(&mut rewritten_sink, callee_temp, callee_value);
+        replace_temp_in_stmt(&mut rewritten_sink, callee_temp, &callee_value);
         removed_temps.push(callee_temp);
 
         block.stmts[run_end] = rewritten_sink;

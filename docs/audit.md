@@ -1,8 +1,8 @@
 # 审计问题与交接清单
 
-> 更新时间：2026-08-22
+> 更新时间：2026-08-23
 > 审计起点：`main@ce3ad8e`（本轮 observable condition carrier 复核前）
-> 当前复核：`main@2698c81`（physical call-root lifetime 主题已收口）
+> 当前复核：`main@ba19008`（natural-loop bindings 重复 DFS 子题已收口）
 > 本文只记录尚未解决且已经取证的问题、明确风险和已确认的设计决定；完成项立即删除。
 
 ## 不应回退的决定
@@ -17,10 +17,11 @@
 1. **LuaJIT `ISTYPE/ISNUM` 尚无严格源码表达**：官方 `LJLIB_LUA` 内建函数用这两条指令实现 `CHECK_str/func/tab/int/num`；失败路径调用 `lj_meta_istype`。Transformer/HIR 已保留 guard 的读取、顺序、具体 expected type，以及 string/integer/number 原槽转换后的 SSA def；function/table 仍是纯检查。官方 opcode/type-id 矩阵之外的组合会 typed fail-fast。宽松模式能继续恢复余下函数，严格模式会拒绝 unresolved guard；但直接生成 `assert(type(...))` / `tonumber(...)` 会依赖可覆盖全局且不满足 LuaJIT 的错误与 `int32` 转换合同，不能冒充等价源码。后续若要关闭此项，需要先确定一个目标方言 helper 合同或正式的内建伪源码输出模式。
 2. **Luau 递归词法 factory owner self-capture 尚只安全拒绝**：官方 Luau 0.713 `-O2` 会稳定生成 owner `DUPCLOSURE` 对自身目标寄存器的 `CAPTURE VAL`，再把该 owner 传给重复 captured shared site。当前 HIR shared-closure matcher 不会把 owner 创建前的 `Entry(reg)` 与创建后的 `Def(reg)` 猜成同一 identity，稳定返回 `UnrepresentableRepeatedCapturedSharedClosure`，不会 panic 或误编译；synthetic DAG 内的直接 self-capture 同样 fail-fast，避免退化成 `NEWCLOSURE CAPTURE REF` 后改变对象相等性。关闭此项需要在 HIR plan 显式建模 `OwnerSelf`，并证明 occurrence 精确捕获该 owner def；不能全局合并前后 SSA identity，也不能在 AST 用 function sugar 兜底。
 3. **natural-loop 成员合同仍会在深层嵌套上展开为二次 incidence**：最终 StructurePlan 的 branch domain、edge/phi/cleanup validator 已改为稠密索引和区间，但 `cfg/graph.rs::compute_natural_loops` 仍为每个 header 反向物化完整 `NaturalLoop.blocks`，随后 `loops.rs`、`goto.rs`、`branches.rs` 和 `plan/arena.rs::LoopPartitions` 又把每个 block 展开到全部祖先 loop。普通编译器受语法嵌套上限约束，现有 corpus 与 16k 顺序分支压力样例不会触发灾难性退化；人工构造的深层可规约 CFG 仍可达到 Θ(blocks × loop-depth) 时间与内存。要关闭此项，需要一次独立 `perf(structure)` 主重构：用 LLVM LoopInfo 风格的子 loop 收缩构建 `NaturalLoopForest`，保存唯一 `innermost_by_block + loop parent + direct blocks`；Structure 再建立 canonical semantic loop forest 和 dense `LoopPart`，删除 `LoopCandidate.blocks/body_scope_blocks/control_blocks`、逐候选 subset/clone 以及每 loop 的 body BFS。DSU 实现的严谨复杂度是 `O((blocks + edges) α(blocks))`，不能继续在文档或交付说明中把这条尚未完成的 evidence 路径声称为纯线性。
-   同一主题还包括 `hir/analyze/bindings.rs::region_blocks`：它目前为每个嵌套 loop
-   重新枚举 body subtree，并把外围 for binding 展开到每个后代 block。后续应让
-   binding owner 直接挂在 region/loop forest 上，由 lowering 按 ancestor stack 查询，
-   不再复制 `loop × descendant block` 映射。
+   同一主题还包括 `hir/analyze/bindings.rs::region_blocks`：bindings 入口现在按稠密
+   `LoopPlanId` 缓存一次 body block 列表，loop-local 与 captured-slot owner 判定共享
+   紧凑快照，已消除同一 consumer 组的二次 DFS；但外围 for binding 仍会展开到每个后代
+   block。后续应让 binding owner 直接挂在 region/loop forest 上，由 lowering 按 ancestor
+   stack 查询，不再复制 `loop × descendant block` 映射。
 4. **合法 Luau 深原型与当前递归 tree pipeline 不兼容**：pinned Luau 能生成主 proto 深度 999 的合法平面表；当前输入在约 300 层进入 Structure 时会系统栈溢出。Parser 已把所有 dialect 的 raw proto 深度统一限制为 200，使畸形或过深输入稳定返回 `ParseError`；这只是安全闭环，不是完整 Luau 兼容。关闭此项需要把 `RawProto -> LoweredProto -> Cfg/Graph/Dataflow/StructureFacts -> HIR` 的跨 proto 调度改为索引 arena 上的迭代后序遍历，再按实测安全边界放宽 Luau。相同重构还应消除 `build_proto_tree` 把共享 flat-proto DAG 递归克隆成潜在指数级 tree 的风险。
 5. **HIR capture 跨 key 图遍历仍可受不同 epoch 数放大**：当 `K` 个不同 `(slot, epoch)` 都覆盖整张 CFG 时，逐 key 反向写后数据流仍为 `O(K×(blocks+edges))`；不同 capture root 也可能重复遍历同一大型 normal-phi ancestry。普通编译器输出受寄存器数和词法 epoch domain 限制，但人工构造输入仍可放大此路径。关闭此项需要利用 epoch 的 dominator domain 限制反向传播范围，并对 normal phi graph 做 SCC 后的 earliest-def memo，不能建立 `key×block` 持久矩阵。
 6. **Luau captured-shared component matcher 对人工共享 DAG 仍可能二次展开**：owner 对 root occurrence 的支配检查已折成每组一次 NCA 包络，词法 scope 也先按稠密 region memo 与 containment DFS 左右端点冻结，Move identity 统一使用 `CanonicalMoveIndex`；但 `shared_closures.rs::match_component` 仍需为每个 root occurrence 递归验证完整 template DAG。官方 O2 通常为每个内联 function-expression 现场物化对应的 `DUPCLOSURE + captures`，此时遍历与实际 instruction/capture incidence 同阶；人工 chunk 可以让 `R` 个 root 共用一条深度 `N` 的 dependency DAG，使物理输入为 `O(R+N)`、验证退化为 `Θ(R×N)`。同一 root `Origin` 若有多种 owner template，component shape 也会按候选重验。关闭此项需要把 owner-independent shape proof 与 owner capture proof 分开，按 `TemplateClass` 缓存 node/group 关系，并构建压缩或持久的 alias 约束，使成本只随新出现的 `(template node, physical instr/capture edge)` incidence 增长；不能只记“某 node/instr 已见”，否则 diamond dependency 会漏检同一实例中的别名冲突。
@@ -42,6 +43,19 @@
 - `regress_313_branch_value_terminal_sink`：Lua 5.1/5.2/5.3/5.4/5.5、LuaJIT（6 个）仍保留 `local r = assert(...)`。
 
 这些失败均已归档到下方 residual/可读性队列；不应通过放宽 producer、handoff、global lookup 或 root-lifetime 身份门来“修复”。
+
+本轮关闭 natural-loop bindings 的重复 DFS 子题：`build_bindings` 为每个
+`LoopPlanId` 只展开一次 `region_blocks`，并以保持排序/去重的紧凑 `Vec<BlockRef>` 同时
+服务 loop source-local 映射和 captured-slot owner 判定；`LocalId` 分配、block map 写入
+与 debug-name 选择顺序不变。18 个 loop/capture 定向 entry（含 round-1 重编译）全部通过，
+`cargo check` 与 `cargo clippy -D warnings` 通过。该优化不改变 loop 语义，也不关闭本项剩余的
+ancestor-incidence 与 loop-forest 复杂度问题。
+
+本轮对 `temp-inline` 的一次性 substitution DAG 方向和 `regress_235` 做了取证，但没有
+扩大现有 producer 白名单：完整 LuaJIT 样例中 child `NEWTABLE` 覆盖了先前已观察且逃逸到
+direct table 的 CALL 结果，当前 root-lifetime 事实不携带 table-alias 存活链；仅凭 fresh
+table、唯一 direct field use 或 home slot 会把旧对象的覆盖/GC 时点推迟。该主题继续保留在
+residual 队列，待 HIR 建立 alias-liveness proof 后再处理。
 
 本轮关闭一个窄的 AST 展示子题：对“已恢复的单值调用结果紧接着被同一 binding 的直接写入覆盖”的形状，cleanup pass 将调用保留在原求值位置，并把 surviving value 作为后置 local 声明。该规则拒绝 debug/带属性 binding、多目标或间接 lvalue，以及调用或 replacement 再引用该 binding 的情况；它只关闭 `regress_252` 的机械外壳，不代表该案例涉及的 branch/value proof 已完成。`regress_252` 的 7 个方言、round-1 重编译和 Rust 负例测试均通过。
 
@@ -106,7 +120,11 @@ debug/strip 分层的必要残差，不再把“少一个 loop local”作为待
 不可变性证明时改成直接调用，必须保留 `_ENV` 查找时点；`regress_12` 的 `ipairs` 与循环
 准备表、`regress_08` 的 global/table lvalue，以及 `regress_09` 的嵌套构造器别名都涉及
 接收者求值、元方法或对象生命周期，不能仅按“下一条使用”内联；`regress_235` 的
-`parent/child` 构造器合并同样缺少 allocation/identity 证明。后续若要关闭这些断言，
+`parent/child` 构造器合并同样缺少 allocation/identity 证明：LuaJIT 的 child
+`NEWTABLE` 复用了先前 `mark("direct-value")` 的物理槽；该 CALL 结果已经写入前面的
+direct table 并被 root-lifetimes 标为 observed/escaped。移除 child 的 `Assign` 会让现有
+HIR 无法证明旧 CALL root 在 table alias 上继续存活（尤其跨 call/GC fence），所以不能只
+按 fresh table/唯一字段 use 放宽 producer。后续若要关闭这些断言，
 必须先在 AST/HIR 建立对应的全局查找、lvalue 顺序和 root-lifetime 合同，不能为满足
 `expect-not-contains` 直接扩大 alias/constructor 白名单。
 

@@ -196,26 +196,78 @@ pub(super) struct MatchedComponent {
     pub(super) dependency_occurrences: BTreeSet<InstrRef>,
 }
 
+/// owner-independent component proof cached by `(TemplateClassRef, SharedClosureRef)`.
+///
+/// The shape pass resolves every physical dependency edge and records the canonical identity
+/// of each outer capture.  A later owner candidate only compares its own capture sources with
+/// these facts; it never re-walks a validated `(template node, physical instruction)` pair.
+/// The occurrence sets are also the alias/liveness contract used to consume the matched shared
+/// groups.
+#[derive(Debug, Clone)]
+pub(super) struct MatchedShape {
+    pub(super) node_groups: Vec<SharedClosureRef>,
+    pub(super) node_protos: Vec<ProtoRef>,
+    pub(super) root_occurrences: BTreeSet<InstrRef>,
+    pub(super) dependency_occurrences: BTreeSet<InstrRef>,
+    pub(super) outer_identities: BTreeMap<UpvalueRef, CaptureIdentity>,
+}
+
 pub(super) fn match_component(
     proto: &LoweredProto,
     dataflow: &DataflowFacts,
     groups: &BTreeMap<SharedClosureRef, ReusableGroup>,
     owner: &OwnerTemplate,
     root_group: &ReusableGroup,
+    shape_cache: &mut BTreeMap<(TemplateClassRef, SharedClosureRef), Option<Arc<MatchedShape>>>,
     canonical_moves: &mut CanonicalMoveIndex<'_>,
 ) -> Option<MatchedComponent> {
-    if !root_group.consistent_proto
-        || proto.children.get(root_group.proto.index())?.origin
-            != owner.template.nodes[owner.template.root.0].origin
-    {
-        return None;
-    }
     let owner_closure = closure_at(proto, owner.instr)?;
+    let shape = shape_cache
+        .entry((owner.class, root_group.shared))
+        .or_insert_with(|| {
+            match_component_shape(proto, dataflow, groups, owner, root_group, canonical_moves)
+                .map(Arc::new)
+        })
+        .clone()?;
+
+    // The shape cache deliberately does not include the owner occurrence.  Compare all outer
+    // capture identities here, once per upvalue, so an owner with a different lexical value is
+    // rejected without replaying the dependency DAG.
     if owner
         .template
         .outer_upvalues
         .iter()
         .any(|upvalue| owner_closure.captures.get(upvalue.index()).is_none())
+    {
+        return None;
+    }
+    for (upvalue, expected) in &shape.outer_identities {
+        let source = owner_closure.captures.get(upvalue.index())?.source;
+        if capture_identity(source, owner.instr, dataflow, canonical_moves) != Some(*expected) {
+            return None;
+        }
+    }
+
+    Some(MatchedComponent {
+        root_shared: root_group.shared,
+        node_groups: shape.node_groups.clone(),
+        node_protos: shape.node_protos.clone(),
+        root_occurrences: shape.root_occurrences.clone(),
+        dependency_occurrences: shape.dependency_occurrences.clone(),
+    })
+}
+
+fn match_component_shape(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    groups: &BTreeMap<SharedClosureRef, ReusableGroup>,
+    owner: &OwnerTemplate,
+    root_group: &ReusableGroup,
+    canonical_moves: &mut CanonicalMoveIndex<'_>,
+) -> Option<MatchedShape> {
+    if !root_group.consistent_proto
+        || proto.children.get(root_group.proto.index())?.origin
+            != owner.template.nodes[owner.template.root.0].origin
     {
         return None;
     }
@@ -225,13 +277,13 @@ pub(super) fn match_component(
         proto,
         dataflow,
         groups,
-        owner_instr: owner.instr,
-        owner_closure,
         template: &owner.template,
         node_groups: vec![None; node_count],
         group_nodes: BTreeMap::new(),
         node_occurrences: vec![BTreeSet::new(); node_count],
         expected_dependency_uses: BTreeMap::new(),
+        outer_identities: BTreeMap::new(),
+        validated_pairs: BTreeSet::new(),
     };
     let mut instance_nodes = vec![InstrRef(0); node_count];
     let mut instance_generations = vec![0usize; node_count];
@@ -301,12 +353,12 @@ pub(super) fn match_component(
         .filter(|(index, _)| *index != owner.template.root.index())
         .flat_map(|(_, occurrences)| occurrences.iter().copied())
         .collect();
-    Some(MatchedComponent {
-        root_shared: root_group.shared,
-        node_groups,
-        node_protos,
+    Some(MatchedShape {
         root_occurrences,
         dependency_occurrences,
+        node_groups,
+        node_protos,
+        outer_identities: matcher.outer_identities,
     })
 }
 
@@ -314,13 +366,16 @@ pub(super) struct ComponentMatcher<'a> {
     proto: &'a LoweredProto,
     dataflow: &'a DataflowFacts,
     groups: &'a BTreeMap<SharedClosureRef, ReusableGroup>,
-    owner_instr: InstrRef,
-    owner_closure: &'a crate::transformer::ClosureInstr,
     template: &'a ClosureTemplate,
     node_groups: Vec<Option<SharedClosureRef>>,
     group_nodes: BTreeMap<SharedClosureRef, CompositeNodeRef>,
     node_occurrences: Vec<BTreeSet<InstrRef>>,
     expected_dependency_uses: BTreeMap<InstrRef, BTreeSet<(InstrRef, Reg)>>,
+    outer_identities: BTreeMap<UpvalueRef, CaptureIdentity>,
+    /// `(template node, physical instruction)` 已完成全部 capture proof 的持久索引。
+    /// 它只跳过重复的子图 materialization；每次进入仍先执行 generation 与 group alias
+    /// 检查，因此 diamond 中的同一 node 不会因 seen 去重而接受不同物理指令。
+    validated_pairs: BTreeSet<(CompositeNodeRef, InstrRef)>,
 }
 
 impl ComponentMatcher<'_> {
@@ -386,6 +441,9 @@ impl ComponentMatcher<'_> {
                     if closure.captures.len() != self.template.nodes[node.0].captures.len() {
                         return None;
                     }
+                    if self.validated_pairs.contains(&(node, instr_ref)) {
+                        continue;
+                    }
                     stack.push(MatchFrame::Captures {
                         node,
                         instr_ref,
@@ -399,6 +457,7 @@ impl ComponentMatcher<'_> {
                 } => {
                     let closure = closure_at(self.proto, instr_ref)?;
                     let Some(capture) = closure.captures.get(next_capture) else {
+                        self.validated_pairs.insert((node, instr_ref));
                         self.node_occurrences[node.index()].insert(instr_ref);
                         continue;
                     };
@@ -410,20 +469,22 @@ impl ComponentMatcher<'_> {
                         .get(next_capture)?;
                     match template_capture {
                         TemplateCapture::Outer(upvalue) => {
-                            let owner_source =
-                                self.owner_closure.captures.get(upvalue.index())?.source;
-                            if capture_identity(
-                                owner_source,
-                                self.owner_instr,
-                                self.dataflow,
-                                canonical_moves,
-                            )? != capture_identity(
+                            let identity = capture_identity(
                                 capture.source,
                                 instr_ref,
                                 self.dataflow,
                                 canonical_moves,
-                            )? {
-                                return None;
+                            )?;
+                            match self.outer_identities.entry(upvalue) {
+                                std::collections::btree_map::Entry::Vacant(entry) => {
+                                    entry.insert(identity);
+                                }
+                                std::collections::btree_map::Entry::Occupied(entry)
+                                    if *entry.get() != identity =>
+                                {
+                                    return None;
+                                }
+                                std::collections::btree_map::Entry::Occupied(_) => {}
                             }
                             stack.push(MatchFrame::Captures {
                                 node,

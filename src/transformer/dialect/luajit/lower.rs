@@ -9,6 +9,8 @@
 //! - 写入和绕过 setup 的外部入边会使 method hint 失效，后层不再猜冒号调用；
 //! - TDUP 在这里展开成 `NewTable + SetTable*`，不把模板表细节泄漏到后层。
 
+use std::sync::Arc;
+
 use crate::parser::{
     LuaJitKgcEntry, LuaJitNumberConstEntry, LuaJitOpcode, LuaJitOperands, LuaJitTableConst,
     LuaJitTableLiteral, RawChunk, RawLiteralConst, RawProto,
@@ -56,7 +58,7 @@ fn lower_proto(raw: &RawProto, fr2: bool) -> Result<LoweredProto, TransformError
         .common
         .children
         .iter()
-        .map(|child| lower_proto(child, fr2))
+        .map(|child| lower_proto(child, fr2).map(Arc::new))
         .collect::<Result<Vec<_>, _>>()?;
     let mut lowerer = ProtoLowerer::new(raw, fr2);
     let (mut instrs, lowering_map) = lowerer.lower()?;

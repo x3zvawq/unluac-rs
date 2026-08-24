@@ -3,6 +3,8 @@
 //! 它只负责“proto 公共前导字段怎么收口、父 source 怎么继承、公共 RawProto 怎么组装”
 //! 这些跨版本稳定事实；真正的 section 读取顺序和版本语义仍留在各个 parser 里。
 
+use std::sync::Arc;
+
 use crate::parser::error::ParseError;
 use crate::parser::raw::{
     DialectProtoExtra, Origin, ProtoFrameInfo, ProtoLineRange, ProtoSignature, RawConstPool,
@@ -87,7 +89,7 @@ pub(crate) fn finish_puc_lua_proto(
             constants: sections.constants,
             upvalues: sections.upvalues,
             debug_info: sections.debug_info,
-            children: sections.children,
+            children: sections.children.into_iter().map(Arc::new).collect(),
         },
         extra,
         origin: Origin {

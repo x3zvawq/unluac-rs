@@ -108,7 +108,7 @@ pub(super) fn reachable_numeric_for_loop(
     );
     if duplicated_terminal_exit {
         candidate.exits.insert(exit);
-        candidate.control_blocks.insert(latch_exit);
+        candidate.add_control_block(latch_exit);
         candidate.normalized_exit_aliases.push(LoopExitAlias {
             block: latch_exit,
             continuation: exit,
@@ -131,7 +131,7 @@ pub(super) fn reachable_numeric_for_loop(
         return None;
     }
     if latch_exit != exit && !duplicated_terminal_exit {
-        candidate.control_blocks.insert(latch_exit);
+        candidate.add_control_block(latch_exit);
     }
     let mut partition = Vec::with_capacity(1 + usize::from(residual_blocks.is_some()));
     if let Some(residual_blocks) = residual_blocks {

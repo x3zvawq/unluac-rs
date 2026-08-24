@@ -6,6 +6,8 @@
 //! - 把 LuaJIT 自己的 KGC/KNUM/TDUP 常量空间落到 dialect extra，同时把
 //!   后续 low/HIR 能直接消费的字面量同步进公共 `RawLiteralConst` 表。
 
+use std::sync::Arc;
+
 use crate::decompile::DecompileDialect;
 use crate::parser::error::ParseError;
 use crate::parser::limits::check_proto_depth;
@@ -327,7 +329,7 @@ impl LuaJitParser {
                         extra: DialectUpvalueExtra::LuaJit(LuaJitUpvalueExtra { immutable }),
                     },
                     debug_info,
-                    children,
+                    children: children.into_iter().map(Arc::new).collect(),
                 },
                 extra: DialectProtoExtra::LuaJit(LuaJitProtoExtra {
                     flags,

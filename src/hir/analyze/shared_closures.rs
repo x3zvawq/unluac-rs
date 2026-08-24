@@ -137,6 +137,7 @@ pub(super) fn build_shared_closure_plan(
             .push(index);
     }
     let mut lexical_scopes = LexicalScopeIndex::new(structure);
+    let mut shape_cache = BTreeMap::new();
     let mut roots = Vec::new();
     for shared in &targets {
         let group = &groups[shared];
@@ -166,7 +167,15 @@ pub(super) fn build_shared_closure_plan(
                                 && structure.region_contains(owner_scope, lexical_scope.last)
                         }))
                 .then(|| {
-                    match_component(proto, dataflow, &groups, owner, group, &mut canonical_moves)
+                    match_component(
+                        proto,
+                        dataflow,
+                        &groups,
+                        owner,
+                        group,
+                        &mut shape_cache,
+                        &mut canonical_moves,
+                    )
                 })
                 .flatten()
             else {

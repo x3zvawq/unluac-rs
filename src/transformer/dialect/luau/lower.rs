@@ -4,6 +4,8 @@
 //! 折进 raw 层了；这里专注做语义恢复，把它翻成项目里既有的 CFG/HIR/AST 管线能理解
 //! 的稳定 low-IR 契约。
 
+use std::sync::Arc;
+
 use crate::parser::{
     LuauCaptureKind, LuauConstEntry, LuauInstrExtra, LuauOpcode, LuauOperands, RawChunk,
     RawLiteralConst, RawProto,
@@ -40,17 +42,46 @@ pub(crate) fn lower_chunk(chunk: &RawChunk) -> Result<LoweredChunk, TransformErr
 }
 
 fn lower_proto(raw: &RawProto) -> Result<LoweredProto, TransformError> {
-    let child_templates = raw
-        .common
-        .children
-        .iter()
-        .map(lower_proto)
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut lowerer = ProtoLowerer::new(raw);
-    let (mut instrs, lowering_map) = lowerer.lower()?;
-    let children = instantiate_closure_children(&mut instrs, child_templates);
+    struct Frame<'a> {
+        raw: &'a RawProto,
+        next_child: usize,
+        children: Vec<Arc<LoweredProto>>,
+    }
 
-    Ok(finish_lowered_proto(raw, children, instrs, lowering_map))
+    let mut stack = vec![Frame {
+        raw,
+        next_child: 0,
+        children: Vec::new(),
+    }];
+    loop {
+        let child = {
+            let frame = stack.last_mut().expect("Luau proto frame is non-empty");
+            let child = frame.raw.common.children.get(frame.next_child);
+            if child.is_some() {
+                frame.next_child += 1;
+            }
+            child
+        };
+        if let Some(child) = child {
+            stack.push(Frame {
+                raw: child,
+                next_child: 0,
+                children: Vec::new(),
+            });
+            continue;
+        }
+
+        let frame = stack.pop().expect("Luau proto frame is non-empty");
+        let mut lowerer = ProtoLowerer::new(frame.raw);
+        let (mut instrs, lowering_map) = lowerer.lower()?;
+        let children = instantiate_closure_children(&mut instrs, frame.children);
+        let result = finish_lowered_proto(frame.raw, children, instrs, lowering_map);
+        if let Some(parent) = stack.last_mut() {
+            parent.children.push(Arc::new(result));
+        } else {
+            return Ok(result);
+        }
+    }
 }
 
 struct ProtoLowerer<'a> {

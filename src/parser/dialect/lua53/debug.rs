@@ -73,27 +73,25 @@ fn render_human(chunk: &RawChunk, detail: DebugDetail, filters: &DebugFilters) -
 
 fn collect_proto_entries(root: &RawProto) -> Vec<ProtoEntry<'_>> {
     let mut entries = Vec::new();
-    collect_proto_entries_inner(root, None, 0, &mut entries);
-    entries
-}
-
-fn collect_proto_entries_inner<'a>(
-    proto: &'a RawProto,
-    parent: Option<usize>,
-    depth: usize,
-    entries: &mut Vec<ProtoEntry<'a>>,
-) {
-    let id = entries.len();
-    entries.push(ProtoEntry {
-        id,
-        parent,
-        depth,
-        proto,
-    });
-
-    for child in &proto.common.children {
-        collect_proto_entries_inner(child, Some(id), depth + 1, entries);
+    let mut pending = vec![(root, None, 0usize)];
+    while let Some((proto, parent, depth)) = pending.pop() {
+        let id = entries.len();
+        entries.push(ProtoEntry {
+            id,
+            parent,
+            depth,
+            proto,
+        });
+        pending.extend(
+            proto
+                .common
+                .children
+                .iter()
+                .rev()
+                .map(|child| (child.as_ref(), Some(id), depth + 1)),
+        );
     }
+    entries
 }
 
 fn plan_focus(protos: &[ProtoEntry<'_>], filters: &DebugFilters) -> FocusPlan {

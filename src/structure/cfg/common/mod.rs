@@ -16,4 +16,7 @@ pub use dataflow::{
     OpenUseSources, PhiCandidate, PhiId, PhiIncoming, SideEffectSummary, SsaRegMap, SsaValue,
     UseSite,
 };
-pub use graph::{DominatorTree, GraphFacts, NaturalLoop, PostDominatorTree};
+pub use graph::{
+    DominatorTree, GraphFacts, NaturalLoop, NaturalLoopAncestors, NaturalLoopForest, NaturalLoopId,
+    PostDominatorTree,
+};

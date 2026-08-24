@@ -4,6 +4,8 @@
 //! `JMP`、`CLOSURE` 后置 capture、`FORPREP/FORLOOP` 和 `TFORLOOP` 这类模式型
 //! 指令。这里一次性把这些模式吃干净，避免后续 CFG 再去理解方言细节。
 
+use std::sync::Arc;
+
 use crate::parser::{Lua51Opcode, Lua51Operands, RawChunk, RawProto};
 use crate::transformer::dialect::lowering::{
     PendingLowInstr, PendingLoweringState, PendingMethodHints, TargetPlaceholder, WordCodeIndex,
@@ -39,7 +41,7 @@ fn lower_proto(raw: &RawProto) -> Result<LoweredProto, TransformError> {
         .common
         .children
         .iter()
-        .map(lower_proto)
+        .map(|child| lower_proto(child).map(Arc::new))
         .collect::<Result<Vec<_>, _>>()?;
     let mut lowerer = ProtoLowerer::new(raw);
     let (mut instrs, lowering_map) = lowerer.lower()?;

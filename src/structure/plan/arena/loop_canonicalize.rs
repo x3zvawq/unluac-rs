@@ -160,6 +160,7 @@ pub(super) fn canonicalize_loops(
                 .candidate
                 .backedges
                 .sort_by_key(|edge| edge.index());
+            selected.candidate.normalize_control_blocks();
             selected.candidate.normalized_exit_aliases.sort();
             selected.candidate.normalized_exit_aliases.dedup();
             selected_loops.push(selected);

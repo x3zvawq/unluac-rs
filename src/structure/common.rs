@@ -358,7 +358,10 @@ pub struct LoopCandidate {
     /// 这份事实，不回头用 CFG 扩张作用域。
     pub body_scope_blocks: BTreeSet<BlockRef>,
     /// 已被循环语法或规范化出口吸收、无需作为源码 body 单独降低的 block。
-    pub control_blocks: BTreeSet<BlockRef>,
+    ///
+    /// 这类 block 只来自少量 latch/控制 pad，不值得为每个候选分配一棵
+    /// `BTreeSet`；集合语义由排序且去重的紧凑向量维持。
+    pub control_blocks: Vec<BlockRef>,
     /// VM latch 指向的重复终止块与 preheader 正常出口语义等价；源码只发射后者。
     pub normalized_exit_aliases: Vec<LoopExitAlias>,
     pub backedges: Vec<EdgeRef>,
@@ -378,6 +381,22 @@ pub struct LoopCandidate {
 pub struct LoopExitAlias {
     pub block: BlockRef,
     pub continuation: BlockRef,
+}
+
+impl LoopCandidate {
+    /// 加入一个已被循环控制吸收的 block，并保持稳定的集合顺序。
+    pub(crate) fn add_control_block(&mut self, block: BlockRef) {
+        if !self.control_blocks.contains(&block) {
+            self.control_blocks.push(block);
+            self.control_blocks.sort_unstable();
+        }
+    }
+
+    /// 规范化跨候选合并后的控制 block 列表。
+    pub(crate) fn normalize_control_blocks(&mut self) {
+        self.control_blocks.sort_unstable();
+        self.control_blocks.dedup();
+    }
 }
 
 /// 循环头已经暴露给 HIR 的源码绑定证据。

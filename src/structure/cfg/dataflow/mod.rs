@@ -45,12 +45,82 @@ pub(crate) fn analyze_dataflow(
     Ok(())
 }
 
-/// 对 proto 树递归计算数据流事实。
+/// 对 proto 树计算数据流事实。
 pub fn compute_dataflow_facts(
     proto: &LoweredProto,
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     child_cfgs: &[CfgGraph],
+) -> Result<DataflowFacts, StructureError> {
+    struct Frame<'a> {
+        proto: &'a LoweredProto,
+        cfg: &'a Cfg,
+        graph_facts: &'a GraphFacts,
+        child_cfgs: &'a [CfgGraph],
+        next_child: usize,
+        children: Vec<DataflowFacts>,
+    }
+
+    let mut stack = vec![Frame {
+        proto,
+        cfg,
+        graph_facts,
+        child_cfgs,
+        next_child: 0,
+        children: Vec::new(),
+    }];
+    loop {
+        let child = {
+            let frame = stack.last_mut().expect("dataflow proto frame is non-empty");
+            if frame.proto.children.len() != frame.child_cfgs.len()
+                || frame.proto.children.len() != frame.graph_facts.children.len()
+            {
+                return Err(StructureError::invalid(
+                    "proto, CFG, and graph child counts disagree",
+                ));
+            }
+            let index = frame.next_child;
+            let child = frame.proto.children.get(index).map(|proto| {
+                (
+                    proto,
+                    &frame.child_cfgs[index],
+                    &frame.graph_facts.children[index],
+                )
+            });
+            if child.is_some() {
+                frame.next_child += 1;
+            }
+            child
+        };
+        if let Some((child_proto, child_cfg, child_graph)) = child {
+            stack.push(Frame {
+                proto: child_proto,
+                cfg: &child_cfg.cfg,
+                graph_facts: child_graph,
+                child_cfgs: &child_cfg.children,
+                next_child: 0,
+                children: Vec::new(),
+            });
+            continue;
+        }
+
+        let frame = stack.pop().expect("dataflow proto frame is non-empty");
+        let mut facts = compute_dataflow_proto(frame.proto, frame.cfg, frame.graph_facts)?;
+        facts.children = frame.children;
+        if let Some(parent) = stack.last_mut() {
+            parent.children.push(facts);
+        } else {
+            return Ok(facts);
+        }
+    }
+}
+
+/// Compute one proto's block-local dataflow facts.  Proto scheduling is kept outside
+/// this function so deep Luau child chains never recurse through the analysis stack.
+fn compute_dataflow_proto(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
 ) -> Result<DataflowFacts, StructureError> {
     super::validate_cfg(cfg)?;
     if cfg.instr_to_block.len() != proto.instrs.len() {
@@ -127,28 +197,6 @@ pub fn compute_dataflow_facts(
         proto.instrs.len(),
         &incoming_slots,
     )?;
-    if proto.children.len() != child_cfgs.len()
-        || proto.children.len() != graph_facts.children.len()
-    {
-        return Err(StructureError::invalid(
-            "proto, CFG, and graph child counts disagree",
-        ));
-    }
-    let children = proto
-        .children
-        .iter()
-        .zip(child_cfgs.iter())
-        .zip(graph_facts.children.iter())
-        .map(|((child_proto, child_cfg), child_graph)| {
-            compute_dataflow_facts(
-                child_proto,
-                &child_cfg.cfg,
-                child_graph,
-                &child_cfg.children,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
     Ok(DataflowFacts {
         instr_effects,
         effect_summaries,
@@ -172,7 +220,7 @@ pub fn compute_dataflow_facts(
         phi_candidates: ssa.phis,
         phi_block_ranges: ssa.phi_block_ranges,
         phi_use_blocks: ssa.phi_use_blocks,
-        children,
+        children: Vec::new(),
     })
 }
 

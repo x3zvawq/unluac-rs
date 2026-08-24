@@ -275,7 +275,7 @@ pub(super) fn build_loop_partition(
             owned.extend(candidate.body_scope_blocks.iter().copied());
         }
         LoopKindHint::WhileLike => {
-            let natural = merged_natural_loop_domain(cfg, candidate);
+            let natural = merged_natural_loop_domain(cfg, graph_facts, candidate);
             owned.retain(|block| natural.contains(block) || Some(*block) == preheader);
             owned.insert(candidate.header);
             let lexical_continuation = loop_.continuation.or_else(|| {

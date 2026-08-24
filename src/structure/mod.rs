@@ -24,9 +24,10 @@ pub(crate) use analyze::analyze_structure_stage;
 pub use cfg::{
     BasicBlock, BlockKind, BlockRef, Cfg, CfgEdge, CfgGraph, DataflowFacts, Def, DefId,
     DominatorTree, EdgeKind, EdgeRef, EffectTag, GraphFacts, InstrEffect, InstrRange,
-    InstrUseValues, NaturalLoop, OpenDef, OpenDefId, OpenUseSources, PhiCandidate, PhiId,
-    PhiIncoming, PostDominatorTree, ReachableSuccessorShape, SideEffectSummary, SsaRegMap,
-    SsaValue, UseSite, build_cfg_graph, compute_dataflow_facts,
+    InstrUseValues, NaturalLoop, NaturalLoopAncestors, NaturalLoopForest, NaturalLoopId, OpenDef,
+    OpenDefId, OpenUseSources, PhiCandidate, PhiId, PhiIncoming, PostDominatorTree,
+    ReachableSuccessorShape, SideEffectSummary, SsaRegMap, SsaValue, UseSite, build_cfg_graph,
+    compute_dataflow_facts,
 };
 pub(crate) use common::{
     BranchCandidate, BranchRegionFact, BranchValueMergeCandidate, LoopCandidate, LoopExitAlias,
