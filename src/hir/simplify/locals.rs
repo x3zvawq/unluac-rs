@@ -28,6 +28,10 @@
 //! temp occurrence index 访问真实 touch，不按“每个定义 × 全部后缀语句”重复扫描。
 //! 没有 debug/capture 身份且只被写入、从未被表达式读取的 temp 链继续保留为 temp，交给
 //! dead-temp 清理删除纯写入；把这类链提升成 local 只会把可删除的 SSA 壳固化到源码里。
+//! carried-local fixed point 若已让某个 binding 吸收不同或未知 home，后续 promotion 仍可
+//! 建立源码 local，但不能借原始槽号复用 sticky/debug local：raw home 只登记给 capture/TBC
+//! 保护，组内所有 temp 的 trusted home 完全一致时才参与正向复用，taint 再传播到新 local；
+//! 含引用 capture 的 temp 组若不能证明同槽，则保持 temp，避免丢失 capture cell 身份。
 //!
 mod branch_merge;
 mod param_alias;
@@ -38,6 +42,7 @@ use std::{
     rc::Rc,
 };
 
+use super::mention::{stmts_reference_captured_bindings, stmts_to_be_closed_temps};
 use super::temp_touch::{
     TempRefScopeTracker, TempTouchIndex, collect_temp_reads_by_stmt, collect_temp_refs_by_stmt,
     collect_temp_refs_in_expr, expr_touches_any_temp, stmt_consumes_temps_only_in_control_head,
@@ -62,8 +67,10 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     let mut next_local_index = proto.locals.len();
     let mut new_locals = Vec::new();
     let mut new_local_debug_hints = Vec::new();
-    let mut promoted_home_slots = Vec::new();
+    let mut promoted_bindings = Vec::new();
     let mut debug_scope_locals = BTreeMap::new();
+    let mut identity_sensitive_temps = stmts_reference_captured_bindings(&proto.body.stmts).temps;
+    identity_sensitive_temps.extend(stmts_to_be_closed_temps(&proto.body.stmts));
     let result = {
         let mut ctx = PromotionCtx {
             facts,
@@ -72,7 +79,8 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
             next_local_index: &mut next_local_index,
             new_locals: &mut new_locals,
             new_local_debug_hints: &mut new_local_debug_hints,
-            promoted_home_slots: &mut promoted_home_slots,
+            promoted_bindings: &mut promoted_bindings,
+            identity_sensitive_temps: &identity_sensitive_temps,
             debug_scope_locals: &mut debug_scope_locals,
             compact_home_slots,
         };
@@ -85,12 +93,17 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
             &|_| false,
         )
     };
-    for (local, home_slot) in promoted_home_slots {
-        facts.record_local_home_slot(local, home_slot);
+    for (temp, local) in promoted_bindings.iter().copied() {
+        if let Some(home_slot) = facts.home_slot(temp) {
+            facts.record_local_home_slot(local, home_slot);
+        }
+    }
+    for (temp, local) in promoted_bindings {
+        facts.record_temp_to_local_merge(temp, local);
     }
     proto.locals.extend(new_locals);
     proto.local_debug_hints.extend(new_local_debug_hints);
-    let alias_changed = param_alias::coalesce_param_aliases_in_proto(proto);
+    let alias_changed = param_alias::coalesce_param_aliases_in_proto(proto, facts);
     result.changed || alias_changed
 }
 
@@ -146,6 +159,17 @@ struct PromotionGroup {
     touching_stmt_indices: BTreeSet<usize>,
 }
 
+fn trusted_home_slot_for_group(
+    temps: &BTreeSet<TempId>,
+    facts: &ProtoPromotionFacts,
+) -> Option<HomeSlotKey> {
+    let mut slots = temps.iter().map(|temp| facts.trusted_temp_home_slot(*temp));
+    let slot = slots.next().flatten()?;
+    slots
+        .all(|candidate| candidate == Some(slot))
+        .then_some(slot)
+}
+
 struct PromotionCtx<'a> {
     facts: &'a ProtoPromotionFacts,
     temp_debug_locals: &'a [Option<String>],
@@ -153,7 +177,8 @@ struct PromotionCtx<'a> {
     next_local_index: &'a mut usize,
     new_locals: &'a mut Vec<LocalId>,
     new_local_debug_hints: &'a mut Vec<Option<String>>,
-    promoted_home_slots: &'a mut Vec<(LocalId, HomeSlotKey)>,
+    promoted_bindings: &'a mut Vec<(TempId, LocalId)>,
+    identity_sensitive_temps: &'a BTreeSet<TempId>,
     debug_scope_locals: &'a mut BTreeMap<(HomeSlotKey, usize), LocalId>,
     compact_home_slots: bool,
 }
@@ -167,7 +192,7 @@ struct PlanAllocator<'a> {
     next_local_index: &'a mut usize,
     new_locals: &'a mut Vec<LocalId>,
     new_local_debug_hints: &'a mut Vec<Option<String>>,
-    promoted_home_slots: &'a mut Vec<(LocalId, HomeSlotKey)>,
+    promoted_bindings: &'a mut Vec<(TempId, LocalId)>,
     debug_scope_locals: &'a mut BTreeMap<(HomeSlotKey, usize), LocalId>,
 }
 
@@ -185,13 +210,14 @@ impl PlanAllocator<'_> {
         self.new_locals.push(local);
         self.new_local_debug_hints
             .push(debug_hint_for_temp_group(self.temp_debug_locals, &temps));
-        if let Some(home_slot) = home_slot {
-            self.promoted_home_slots.push((local, home_slot));
-            if let Some(scope) = debug_scope_for_temp_group(self.temp_debug_scopes, &temps) {
-                self.debug_scope_locals.insert((home_slot, scope), local);
-            }
+        if let Some(home_slot) = home_slot
+            && let Some(scope) = debug_scope_for_temp_group(self.temp_debug_scopes, &temps)
+        {
+            self.debug_scope_locals.insert((home_slot, scope), local);
         }
         self.reserved_temps.extend(temps.iter().copied());
+        self.promoted_bindings
+            .extend(temps.iter().map(|temp| (*temp, local)));
         self.reserved_alias_indices
             .extend(removable_aliases.iter().copied());
         self.plans.push(PromotionPlan {
@@ -214,10 +240,9 @@ impl PlanAllocator<'_> {
         removable_aliases: BTreeSet<usize>,
         init: PromotionInit,
     ) {
-        if let Some(home_slot) = home_slot {
-            self.promoted_home_slots.push((local, home_slot));
-        }
         self.reserved_temps.extend(temps.iter().copied());
+        self.promoted_bindings
+            .extend(temps.iter().map(|temp| (*temp, local)));
         self.reserved_alias_indices
             .extend(removable_aliases.iter().copied());
         self.plans.push(PromotionPlan {
@@ -438,20 +463,22 @@ fn collect_plans(
             continue;
         }
 
-        let sticky_local = facts
-            .home_slot(root_temp)
-            .and_then(|slot| sticky_slots.get(&slot).copied());
-        let debug_local = facts.home_slot(root_temp).and_then(|slot| {
+        let home_slot = trusted_home_slot_for_group(&group, facts);
+        if home_slot.is_none()
+            && group
+                .iter()
+                .any(|temp| ctx.identity_sensitive_temps.contains(temp))
+        {
+            continue;
+        }
+        let sticky_local = home_slot.and_then(|slot| sticky_slots.get(&slot).copied());
+        let debug_local = home_slot.and_then(|slot| {
             debug_scope_for_temp_group(temp_debug_scopes, &group)
                 .and_then(|scope| ctx.debug_scope_locals.get(&(slot, scope)).copied())
         });
         let reusable_local = sticky_local.or(debug_local).or_else(|| {
             ctx.compact_home_slots
-                .then(|| {
-                    facts
-                        .home_slot(root_temp)
-                        .and_then(|slot| slot_candidates.get(&slot).copied())
-                })
+                .then(|| home_slot.and_then(|slot| slot_candidates.get(&slot).copied()))
                 .flatten()
         });
 
@@ -503,28 +530,27 @@ fn collect_plans(
             next_local_index: ctx.next_local_index,
             new_locals: ctx.new_locals,
             new_local_debug_hints: ctx.new_local_debug_hints,
-            promoted_home_slots: ctx.promoted_home_slots,
+            promoted_bindings: ctx.promoted_bindings,
             debug_scope_locals: ctx.debug_scope_locals,
         };
         if let Some(local) = reusable_local {
             allocator.reuse_existing_local(
                 decl_index,
                 local,
-                facts.home_slot(root_temp),
+                home_slot,
                 group.clone(),
                 removable_aliases,
                 PromotionInit::FromAssign,
             );
         } else {
-            let slot = facts.home_slot(root_temp);
             allocator.allocate_local(
                 decl_index,
-                slot,
+                home_slot,
                 group.clone(),
                 removable_aliases,
                 PromotionInit::FromAssign,
             );
-            if let Some(slot) = slot
+            if let Some(slot) = home_slot
                 && let Some(local) = allocator.plans.last().map(|plan| plan.local)
             {
                 slot_candidates.insert(slot, local);
@@ -543,6 +569,10 @@ fn collect_plans(
             if outer_uses_temp(temp) {
                 continue;
             }
+            let home_slot = facts.trusted_temp_home_slot(temp);
+            if home_slot.is_none() && ctx.identity_sensitive_temps.contains(&temp) {
+                continue;
+            }
             let mut allocator = PlanAllocator {
                 temp_debug_locals,
                 temp_debug_scopes,
@@ -552,10 +582,10 @@ fn collect_plans(
                 next_local_index: ctx.next_local_index,
                 new_locals: ctx.new_locals,
                 new_local_debug_hints: ctx.new_local_debug_hints,
-                promoted_home_slots: ctx.promoted_home_slots,
+                promoted_bindings: ctx.promoted_bindings,
                 debug_scope_locals: ctx.debug_scope_locals,
             };
-            if let Some(local) = facts.home_slot(temp).and_then(|slot| {
+            if let Some(local) = home_slot.and_then(|slot| {
                 sticky_slots
                     .get(&slot)
                     .copied()
@@ -574,21 +604,20 @@ fn collect_plans(
                 allocator.reuse_existing_local(
                     decl_index,
                     local,
-                    facts.home_slot(temp),
+                    home_slot,
                     BTreeSet::from([temp]),
                     BTreeSet::new(),
                     PromotionInit::Empty,
                 );
             } else {
-                let slot = facts.home_slot(temp);
                 allocator.allocate_local(
                     decl_index,
-                    slot,
+                    home_slot,
                     BTreeSet::from([temp]),
                     BTreeSet::new(),
                     PromotionInit::Empty,
                 );
-                if let Some(slot) = slot
+                if let Some(slot) = home_slot
                     && let Some(local) = allocator.plans.last().map(|plan| plan.local)
                 {
                     slot_candidates.insert(slot, local);

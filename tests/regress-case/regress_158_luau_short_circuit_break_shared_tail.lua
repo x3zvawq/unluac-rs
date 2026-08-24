@@ -1,5 +1,6 @@
 -- regress_158_luau_short_circuit_break_shared_tail#1: 短路一臂经 guard break，另一臂直达共享 tail
 -- unluac: expect-contains [[repeat]]
+-- unluac: expect-not-contains [[not p1_0 and]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]

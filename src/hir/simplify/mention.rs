@@ -38,12 +38,35 @@ pub(super) fn stmts_captured_locals(stmts: &[HirStmt]) -> BTreeSet<LocalId> {
 pub(super) struct ReferenceCapturedBindings {
     pub(super) locals: BTreeSet<LocalId>,
     pub(super) params: BTreeSet<ParamId>,
+    pub(super) temps: BTreeSet<TempId>,
 }
 
 pub(super) fn stmts_reference_captured_bindings(stmts: &[HirStmt]) -> ReferenceCapturedBindings {
     let mut collector = ReferenceCaptureCollector::default();
     visit_stmts(stmts, &mut collector);
     collector.bindings
+}
+
+pub(super) fn stmts_to_be_closed_temps(stmts: &[HirStmt]) -> BTreeSet<TempId> {
+    let mut collector = ToBeClosedTempCollector::default();
+    visit_stmts(stmts, &mut collector);
+    collector.temps
+}
+
+#[derive(Default)]
+struct ToBeClosedTempCollector {
+    temps: BTreeSet<TempId>,
+}
+
+impl HirVisitor for ToBeClosedTempCollector {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        let HirStmt::ToBeClosed(to_be_closed) = stmt else {
+            return;
+        };
+        if let HirExpr::TempRef(temp) = &to_be_closed.value {
+            self.temps.insert(*temp);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -80,6 +103,9 @@ impl HirVisitor for BindingRefCollector<'_> {
             }
             HirExpr::ParamRef(param) => {
                 self.bindings.params.insert(*param);
+            }
+            HirExpr::TempRef(temp) => {
+                self.bindings.temps.insert(*temp);
             }
             _ => {}
         }

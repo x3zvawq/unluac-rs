@@ -113,21 +113,10 @@ pub(super) fn bindings_share_home_slot(
     seed: CarryBinding,
     promotion_facts: &ProtoPromotionFacts,
 ) -> bool {
-    promotion_facts.compacts_home_slots()
-        || binding_home_slot(result, promotion_facts)
+    !promotion_facts.compacts_home_slots()
+        && binding_home_slot(result, promotion_facts)
             .zip(binding_home_slot(seed, promotion_facts))
             .is_some_and(|(result, seed)| result == seed)
-}
-
-pub(super) fn binding_home_slot(
-    binding: CarryBinding,
-    promotion_facts: &ProtoPromotionFacts,
-) -> Option<HomeSlotKey> {
-    match binding {
-        CarryBinding::Param(param) => Some(HomeSlotKey::new(param.index(), 0)),
-        CarryBinding::Local(local) => promotion_facts.local_home_slot(local),
-        CarryBinding::Temp(temp) => promotion_facts.home_slot(temp),
-    }
 }
 
 pub(super) fn rewrite_is_private_and_uncaptured(
@@ -145,11 +134,15 @@ pub(super) fn apply_rewrites(
     declarations: std::ops::Range<usize>,
     region_index: usize,
     rewrites: BTreeMap<CarryBinding, CarryBinding>,
+    promotion_facts: &mut ProtoPromotionFacts,
 ) -> bool {
     let prunable = rewrites.values().copied().collect::<BTreeSet<_>>();
     let rewritten = rewrite_stmts(
         &mut block.stmts[region_index..],
-        &mut BindingClassRewritePass { rewrites },
+        &mut BindingClassRewritePass {
+            rewrites,
+            promotion_facts,
+        },
     );
     if !rewritten {
         return false;
@@ -158,7 +151,6 @@ pub(super) fn apply_rewrites(
         &mut block.stmts[region_index..],
         &mut RedundantSelfAssignPrunePass::for_bindings(prunable.iter().copied()),
     );
-    split_rewritten_parallel_assignments(&mut block.stmts[region_index], &prunable);
     if !declarations.is_empty() {
         block.stmts.drain(declarations);
     }

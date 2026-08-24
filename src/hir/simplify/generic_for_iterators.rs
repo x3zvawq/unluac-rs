@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, VecDeque};
 use crate::hir::common::{
     HirBlock, HirExpr, HirGenericFor, HirLValue, HirProto, HirStmt, HirValuePack, TempId,
 };
-use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
+use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::mention::collect_temp_use_counts;
 use super::walk::{HirRewritePass, rewrite_proto};
@@ -210,8 +210,8 @@ fn parameter_pack_can_cross_temp_copy(
         return false;
     };
     let (Some(gap_target_slot), Some(gap_source_slot)) = (
-        context.facts.home_slot(*gap_target),
-        context.facts.home_slot(*gap_source),
+        context.facts.trusted_temp_home_slot(*gap_target),
+        context.facts.trusted_temp_home_slot(*gap_source),
     ) else {
         return false;
     };
@@ -229,7 +229,7 @@ fn parameter_pack_can_cross_temp_copy(
             let HirLValue::Temp(temp) = target else {
                 return false;
             };
-            let Some(slot) = context.facts.home_slot(*temp) else {
+            let Some(slot) = context.facts.trusted_temp_home_slot(*temp) else {
                 return false;
             };
             if context.use_counts.get(temp) != Some(&1)
@@ -248,7 +248,10 @@ fn parameter_pack_can_cross_temp_copy(
             match value {
                 HirExpr::Nil => {}
                 HirExpr::ParamRef(param) => {
-                    iterator_source_slots.push(HomeSlotKey::new(param.index(), 0));
+                    let Some(slot) = context.facts.trusted_param_home_slot(*param) else {
+                        return false;
+                    };
+                    iterator_source_slots.push(slot);
                 }
                 _ => return false,
             }

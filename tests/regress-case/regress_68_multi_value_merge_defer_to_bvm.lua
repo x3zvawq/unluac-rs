@@ -1,7 +1,6 @@
 -- unluac: expect-contains [[local r1_0, r1_1 = 160, 1]]
 -- unluac: expect-contains [[if p1_0 == "mobile" and p1_1 ~= "tablet" then]]
--- unluac: expect-contains [[r1_1 = 0.5]]
--- unluac: expect-contains [[r1_0 = 120]]
+-- unluac: expect-contains [[r1_0, r1_1 = 120, 0.5]]
 -- unluac: expect-contains [[return r1_0, r1_1]]
 -- unluac: expect-not-contains [[local r1_2]]
 -- unluac: expect-not-contains [[if r1_2 == "tablet"]]

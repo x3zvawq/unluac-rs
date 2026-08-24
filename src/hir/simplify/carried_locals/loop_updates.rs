@@ -5,16 +5,30 @@
 //! `local next = f(carried)`，并在循环尾写回 `carried = next`。当 local 身份在循环外
 //! 已死时可以直接复用 carried；repeat 的 next-value 若只是唯一的尾部 temp，则还可在
 //! 所有路径必经写回、后缀无状态改写与词法跳转的前提下，把条件和 live-out 一并归回
-//! carried。两种折叠都不跨越 capture、提前退出或 label barrier。
+//! carried。
+//!
+//! 该规则依赖结构化 loop、binding mentions/capture/TBC 身份和 promotion 提供的精确
+//! `(slot, close epoch)`；它不重新推断 loop owner，也不会跨 distinct slot 移动可观察状态。
+//! 相邻 `next = carried + 1; carried = next` 可直接收回；中间若有 `guard = xs[next]` 之类
+//! consumer，则只有 next/carried 同一 home-slot、consumer 不提旧 carried 且没有控制转移时，
+//! 才恢复为 `carried = carried + 1; guard = xs[carried]`。capture、for binding、TBC、提前退出
+//! 或 label barrier 均保留原形。旧 local 形状即使尾写回前只有提前退出，也必须同槽且未启用
+//! compaction；否则弱表、finalizer 或外层 cleanup 仍能观察旧 carried root 的生命周期。
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{HirAssign, HirBlock, HirExpr, HirLValue, HirStmt, LocalId, TempId};
+use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::super::mention::{stmts_captured_locals, stmts_mention_local};
 use super::super::visit::{HirVisitor, visit_stmts};
 use super::super::walk::{rewrite_expr, rewrite_stmts};
-use super::binding::{BindingClassRewritePass, CarryBinding, carry_binding_from_lvalue};
+use super::HandoffIdentityFacts;
+use super::binding::{
+    BindingClassRewritePass, BindingProtection, CarryBinding,
+    binding_home_slot_provenance_is_invalid, bindings_share_exact_home_slot,
+    carry_binding_from_lvalue, record_binding_merge,
+};
 use super::prune::RedundantSelfAssignPrunePass;
 use super::reads::BindingReadCollector;
 
@@ -28,9 +42,21 @@ struct LoopUpdateFold {
 pub(super) fn collapse_dead_loop_update_handoffs(
     block: &mut HirBlock,
     stmt_mentions: &[BTreeSet<CarryBinding>],
+    outer_bindings: &dyn BindingProtection,
+    promotion_facts: &mut ProtoPromotionFacts,
+    identity_facts: &HandoffIdentityFacts,
+    inherited_locals: &BTreeSet<LocalId>,
 ) -> bool {
     let captured_locals = stmts_captured_locals(&block.stmts);
-    if collapse_repeat_tail_temp_updates(block, stmt_mentions, &captured_locals) {
+    if collapse_repeat_tail_temp_updates(
+        block,
+        stmt_mentions,
+        outer_bindings,
+        &captured_locals,
+        promotion_facts,
+        identity_facts,
+        inherited_locals,
+    ) {
         return true;
     }
 
@@ -38,11 +64,18 @@ pub(super) fn collapse_dead_loop_update_handoffs(
     let mut changed = false;
 
     for index in 0..block.stmts.len() {
-        let Some(fold) = find_fold(&block.stmts[index], index, &last_mentions, &captured_locals)
-        else {
+        let Some(fold) = find_fold(
+            &block.stmts[index],
+            index,
+            &last_mentions,
+            &captured_locals,
+            outer_bindings,
+            promotion_facts,
+            identity_facts,
+        ) else {
             continue;
         };
-        apply_fold(&mut block.stmts[index], fold);
+        apply_fold(&mut block.stmts[index], fold, promotion_facts);
         changed = true;
     }
 
@@ -52,7 +85,11 @@ pub(super) fn collapse_dead_loop_update_handoffs(
 fn collapse_repeat_tail_temp_updates(
     block: &mut HirBlock,
     stmt_mentions: &[BTreeSet<CarryBinding>],
+    outer_bindings: &dyn BindingProtection,
     captured_locals: &BTreeSet<LocalId>,
+    promotion_facts: &mut ProtoPromotionFacts,
+    identity_facts: &HandoffIdentityFacts,
+    inherited_locals: &BTreeSet<LocalId>,
 ) -> bool {
     let mut first_mentions = BTreeMap::new();
     let mut last_mentions = BTreeMap::new();
@@ -78,28 +115,57 @@ fn collapse_repeat_tail_temp_updates(
         let HirStmt::Repeat(repeat_stmt) = stmt else {
             continue;
         };
-        let Some((next, state, value, prefix)) = repeat_tail_temp_update(&repeat_stmt.body) else {
+        let Some((next, state, value, prefix, between)) =
+            repeat_tail_temp_update(&repeat_stmt.body)
+        else {
             continue;
         };
         let next_binding = CarryBinding::Temp(next);
         let state_binding = CarryBinding::Local(state);
         let mut reads = BindingReadCollector::default();
         reads.collect_expr(value);
+        let prefix_mentions = super::reads::collect_binding_mentions_by_stmt(prefix);
+        let between_mentions = super::reads::collect_binding_mentions_by_stmt(between);
+        let condition_mentions = super::reads::collect_binding_mentions_in_expr(&repeat_stmt.cond);
         let last_next_mention = last_mentions.get(&next_binding).copied().unwrap_or(index);
         if reads.single_read() != Some(state_binding)
             || captured_locals.contains(&state)
+            || !local_available_before(block, index, state, inherited_locals)
+            || identity_facts.for_bindings.contains(&state)
+            || outer_bindings.contains(&next_binding)
+            || !identity_facts.binding_merge_preserves_identity(
+                next_binding,
+                state_binding,
+                promotion_facts,
+            )
+            || binding_home_slot_provenance_is_invalid(next_binding, promotion_facts)
+            || binding_home_slot_provenance_is_invalid(state_binding, promotion_facts)
+            || !between.is_empty()
+                && (promotion_facts.compacts_home_slots()
+                    || !bindings_share_exact_home_slot(
+                        next_binding,
+                        state_binding,
+                        promotion_facts,
+                    ))
             || first_mentions.get(&next_binding).copied() != Some(index)
             || writes.counts.get(&next_binding).copied() != Some(1)
             || writes.last_stmt.get(&state_binding).copied() != Some(index)
-            || !super::reads::collect_binding_mentions_in_expr(&repeat_stmt.cond)
-                .contains(&next_binding)
+            || !condition_mentions.contains(&next_binding)
+                && !between_mentions
+                    .iter()
+                    .any(|mentions| mentions.contains(&next_binding))
             || prefix.iter().any(stmt_has_early_control)
             || prefix
                 .iter()
                 .any(|stmt| stmt_writes_binding(stmt, state_binding))
-            || super::reads::collect_binding_mentions_by_stmt(prefix)
+            || between.iter().any(stmt_has_early_control)
+            || stmts_have_cleanup_or_opaque(between)
+            || prefix_mentions
                 .iter()
                 .any(|mentions| mentions.contains(&next_binding))
+            || between_mentions
+                .iter()
+                .any(|mentions| mentions.contains(&state_binding))
             || control_prefix[last_next_mention + 1] != control_prefix[index]
             || rewrites.insert(next_binding, state_binding).is_some()
         {
@@ -111,7 +177,13 @@ fn collapse_repeat_tail_temp_updates(
         return false;
     }
 
-    rewrite_stmts(&mut block.stmts, &mut BindingClassRewritePass { rewrites });
+    rewrite_stmts(
+        &mut block.stmts,
+        &mut BindingClassRewritePass {
+            rewrites,
+            promotion_facts,
+        },
+    );
     rewrite_stmts(
         &mut block.stmts,
         &mut RedundantSelfAssignPrunePass::for_bindings(carried),
@@ -119,19 +191,23 @@ fn collapse_repeat_tail_temp_updates(
     true
 }
 
-fn repeat_tail_temp_update(body: &HirBlock) -> Option<(TempId, LocalId, &HirExpr, &[HirStmt])> {
-    let [
-        prefix @ ..,
-        HirStmt::Assign(seed),
-        HirStmt::Assign(writeback),
-    ] = body.stmts.as_slice()
-    else {
-        return None;
-    };
-    let [HirLValue::Temp(next)] = seed.targets.as_slice() else {
-        return None;
-    };
-    let [value] = seed.values.fixed.as_slice() else {
+fn local_available_before(
+    block: &HirBlock,
+    index: usize,
+    local: LocalId,
+    inherited_locals: &BTreeSet<LocalId>,
+) -> bool {
+    inherited_locals.contains(&local)
+        || block.stmts[..index].iter().any(|stmt| {
+            matches!(stmt,
+                HirStmt::LocalDecl(local_decl) if local_decl.bindings.contains(&local))
+        })
+}
+
+type RepeatTailTempUpdate<'a> = (TempId, LocalId, &'a HirExpr, &'a [HirStmt], &'a [HirStmt]);
+
+fn repeat_tail_temp_update(body: &HirBlock) -> Option<RepeatTailTempUpdate<'_>> {
+    let (HirStmt::Assign(writeback), before_writeback) = body.stmts.split_last()? else {
         return None;
     };
     let [HirLValue::Local(state)] = writeback.targets.as_slice() else {
@@ -140,8 +216,34 @@ fn repeat_tail_temp_update(body: &HirBlock) -> Option<(TempId, LocalId, &HirExpr
     let [HirExpr::TempRef(source)] = writeback.values.fixed.as_slice() else {
         return None;
     };
-    (seed.values.tail.is_none() && writeback.values.tail.is_none() && next == source)
-        .then_some((*next, *state, value, prefix))
+    if writeback.values.tail.is_some() {
+        return None;
+    }
+    let (seed_index, next, value) =
+        before_writeback
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, stmt)| {
+                let HirStmt::Assign(seed) = stmt else {
+                    return None;
+                };
+                let ([HirLValue::Temp(next)], [value], None) = (
+                    seed.targets.as_slice(),
+                    seed.values.fixed.as_slice(),
+                    &seed.values.tail,
+                ) else {
+                    return None;
+                };
+                (*next == *source).then_some((index, *next, value))
+            })?;
+    Some((
+        next,
+        *state,
+        value,
+        &before_writeback[..seed_index],
+        &before_writeback[seed_index + 1..],
+    ))
 }
 
 #[derive(Default)]
@@ -228,6 +330,27 @@ fn stmt_has_label_or_goto(stmt: &HirStmt) -> bool {
     }
 }
 
+fn stmts_have_cleanup_or_opaque(stmts: &[HirStmt]) -> bool {
+    let mut collector = CleanupOrOpaqueCollector::default();
+    visit_stmts(stmts, &mut collector);
+    collector.found
+}
+
+#[derive(Default)]
+struct CleanupOrOpaqueCollector {
+    found: bool,
+}
+
+impl HirVisitor for CleanupOrOpaqueCollector {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        self.found |= matches!(stmt, HirStmt::ToBeClosed(_) | HirStmt::Close(_));
+    }
+
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        self.found |= matches!(expr, HirExpr::Decision(_) | HirExpr::Unresolved(_));
+    }
+}
+
 fn last_local_mentions(stmt_mentions: &[BTreeSet<CarryBinding>]) -> BTreeMap<LocalId, usize> {
     let mut last_mentions = BTreeMap::new();
     for (index, mentions) in stmt_mentions.iter().enumerate() {
@@ -245,6 +368,9 @@ fn find_fold(
     stmt_index: usize,
     last_mentions: &BTreeMap<LocalId, usize>,
     captured_locals: &BTreeSet<LocalId>,
+    outer_bindings: &dyn BindingProtection,
+    promotion_facts: &ProtoPromotionFacts,
+    identity_facts: &HandoffIdentityFacts,
 ) -> Option<LoopUpdateFold> {
     let body = loop_body(stmt)?;
     let (writeback, prefix) = body.stmts.split_last()?;
@@ -254,6 +380,19 @@ fn find_fold(
         || last_mentions.get(&next).copied() != Some(stmt_index)
         || captured_locals.contains(&carried)
         || captured_locals.contains(&next)
+        || outer_bindings.contains(&CarryBinding::Local(carried))
+        || outer_bindings.contains(&CarryBinding::Local(next))
+        || promotion_facts.compacts_home_slots()
+        || !bindings_share_exact_home_slot(
+            CarryBinding::Local(carried),
+            CarryBinding::Local(next),
+            promotion_facts,
+        )
+        || !identity_facts.binding_merge_preserves_identity(
+            CarryBinding::Local(next),
+            CarryBinding::Local(carried),
+            promotion_facts,
+        )
         || !stmts_allow_dead_update_fold(prefix)
     {
         return None;
@@ -381,7 +520,7 @@ fn stmt_contains_terminal_exit(stmt: &HirStmt) -> bool {
     }
 }
 
-fn apply_fold(stmt: &mut HirStmt, fold: LoopUpdateFold) {
+fn apply_fold(stmt: &mut HirStmt, fold: LoopUpdateFold, promotion_facts: &mut ProtoPromotionFacts) {
     let Some((body, repeat_cond)) = loop_body_mut(stmt) else {
         return;
     };
@@ -389,6 +528,11 @@ fn apply_fold(stmt: &mut HirStmt, fold: LoopUpdateFold) {
         HirStmt::LocalDecl(local_decl) => std::mem::take(&mut local_decl.values),
         _ => return,
     };
+    record_binding_merge(
+        CarryBinding::Local(fold.next),
+        CarryBinding::Local(fold.carried),
+        promotion_facts,
+    );
     body.stmts[fold.seed_index] = HirStmt::Assign(Box::new(HirAssign {
         targets: vec![HirLValue::Local(fold.carried)],
         values,
@@ -400,7 +544,10 @@ fn apply_fold(stmt: &mut HirStmt, fold: LoopUpdateFold) {
         CarryBinding::Local(fold.next),
         CarryBinding::Local(fold.carried),
     );
-    let mut pass = BindingClassRewritePass { rewrites };
+    let mut pass = BindingClassRewritePass {
+        rewrites,
+        promotion_facts,
+    };
     rewrite_stmts(&mut body.stmts[fold.seed_index + 1..], &mut pass);
     if let Some(cond) = repeat_cond {
         rewrite_expr(cond, &mut pass);

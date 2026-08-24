@@ -30,6 +30,14 @@ pub(super) const UNIT_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/unit-case/common_12_string_encoding.lua",
         ALL_NON_LUAU_DIALECTS,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/unit-case/common_13_path_conditions.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/unit-case/common_14_loop_lexical_arms.lua",
+        ALL_DIALECTS,
+    ),
     // ── dialect-specific cases ──
     LuaCaseMatrixEntry::new("tests/unit-case/lua51_01.lua", PUC_LUA_51),
     LuaCaseMatrixEntry::new("tests/unit-case/lua52_01_env.lua", PUC_LUA_GE_52).with_options(

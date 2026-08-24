@@ -1,6 +1,7 @@
 -- regress_124_luau_loop_break_header_phi_owner#1: nested break branch 的入口 phi 继承 active loop state owner
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-contains [[break]]
+-- unluac: expect-not-contains [[not p1_0 or not p1_1]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]

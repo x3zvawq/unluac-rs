@@ -90,10 +90,89 @@ impl HirRewritePass for BranchValuePass<'_> {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
         let goto_changed =
             fold_branch_value_goto_labels_in_block(&mut block.stmts, self.label_refs);
+        let nil_decision_changed = fold_nil_fallback_decision_locals_in_block(&mut block.stmts);
         let nil_fallback_changed = fold_nil_fallback_alias_locals_in_block(&mut block.stmts);
         let local_changed = fold_branch_value_locals_in_block(&mut block.stmts);
-        goto_changed || nil_fallback_changed || local_changed
+        goto_changed || nil_decision_changed || nil_fallback_changed || local_changed
     }
+}
+
+/// 把 `local target = Decision(source == nil ? fallback : source)` 物化为
+/// `local target = source; if target == nil then target = fallback end`。
+///
+/// 结构化 HIR 有时会把已经恢复过的 nil fallback 重新编码成一个单节点 Decision，
+/// 尤其是在源码经过一轮反编译后再次编译时。把它留给 Decision elimination 会丢掉
+/// 原本已经证明的“无 else fallback”形状；这里仅接受 direct local、单节点 DAG 和
+/// 不读取 target 的 fallback，因此不会重复求值 source，也不会改变 fallback 的时序。
+fn fold_nil_fallback_decision_locals_in_block(stmts: &mut Vec<HirStmt>) -> bool {
+    let mut changed = false;
+    let mut index = 0;
+    while index < stmts.len() {
+        let Some(rewrite) = nil_fallback_decision_rewrite(&stmts[index]) else {
+            index += 1;
+            continue;
+        };
+
+        stmts[index] = HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![rewrite.target],
+            values: HirValuePack::fixed(vec![HirExpr::LocalRef(rewrite.source)]),
+        }));
+        stmts.insert(
+            index + 1,
+            HirStmt::If(Box::new(HirIf {
+                cond: nil_check_for_local(rewrite.target),
+                then_block: HirBlock {
+                    stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Local(rewrite.target)],
+                        values: HirValuePack::fixed(vec![rewrite.fallback]),
+                    }))],
+                },
+                else_block: None,
+            })),
+        );
+        changed = true;
+        index += 2;
+    }
+    changed
+}
+
+struct NilFallbackDecisionRewrite {
+    target: LocalId,
+    source: LocalId,
+    fallback: HirExpr,
+}
+
+fn nil_fallback_decision_rewrite(stmt: &HirStmt) -> Option<NilFallbackDecisionRewrite> {
+    let HirStmt::LocalDecl(local_decl) = stmt else {
+        return None;
+    };
+    let [target] = local_decl.bindings.as_slice() else {
+        return None;
+    };
+    let [HirExpr::Decision(decision)] = local_decl.values.fixed.as_slice() else {
+        return None;
+    };
+    if local_decl.values.tail.is_some() || decision.entry.index() != 0 || decision.nodes.len() != 1
+    {
+        return None;
+    }
+    let node = decision.nodes.first()?;
+    let source = nil_check_local(&node.test)?;
+    let (fallback, source_target) = match (&node.truthy, &node.falsy) {
+        (
+            HirDecisionTarget::Expr(fallback),
+            HirDecisionTarget::Expr(HirExpr::LocalRef(source_target)),
+        ) => (fallback.clone(), *source_target),
+        _ => return None,
+    };
+    if source_target != source || *target == source || expr_mentions_local(&fallback, *target) {
+        return None;
+    }
+    Some(NilFallbackDecisionRewrite {
+        target: *target,
+        source,
+        fallback,
+    })
 }
 
 /// 扫描 block 中的 fallback label/goto branch-value 壳，先收回普通 `if/else`。

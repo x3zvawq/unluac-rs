@@ -6,6 +6,8 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-not-contains [[local r1_2]]
+-- unluac: expect-contains [[r1_0 = r1_0 + r1_1]]
 
 local function run(a, b, c, n)
     local count = 0

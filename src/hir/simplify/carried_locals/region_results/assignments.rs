@@ -102,26 +102,3 @@ pub(super) fn exact_state_writeback(stmt: &HirStmt, result: CarryBinding) -> Opt
     }
     carry_binding_from_lvalue(target)
 }
-
-pub(super) fn stmt_has_label_or_goto(stmt: &HirStmt) -> bool {
-    match stmt {
-        HirStmt::Goto(_) | HirStmt::Label(_) => true,
-        HirStmt::If(if_stmt) => {
-            block_has_label_or_goto(&if_stmt.then_block)
-                || if_stmt
-                    .else_block
-                    .as_ref()
-                    .is_some_and(block_has_label_or_goto)
-        }
-        HirStmt::While(while_stmt) => block_has_label_or_goto(&while_stmt.body),
-        HirStmt::Repeat(repeat_stmt) => block_has_label_or_goto(&repeat_stmt.body),
-        HirStmt::NumericFor(numeric_for) => block_has_label_or_goto(&numeric_for.body),
-        HirStmt::GenericFor(generic_for) => block_has_label_or_goto(&generic_for.body),
-        HirStmt::Block(block) => block_has_label_or_goto(block),
-        _ => false,
-    }
-}
-
-pub(super) fn block_has_label_or_goto(block: &HirBlock) -> bool {
-    block.stmts.iter().any(stmt_has_label_or_goto)
-}

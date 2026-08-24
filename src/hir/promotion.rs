@@ -13,9 +13,11 @@
 //! - 例子：`t0(slot 0, epoch 0)` 被闭包 capture 之后，后续同 epoch 的
 //!   `t7(slot 0, epoch 0)` 与同槽 phi 会被 locals 认成同一个源码 local 的写回；
 //!   若中间经过 `close from r0`，后续 `t8(slot 0, epoch 1)` 会被视为新的词法槽位
+//! - carried-local 后续若把不同或未知 home 的 binding 并入同一目标，会持久失效该目标
+//!   binding 的正向 provenance；原始物理槽事实仍保留给 capture/TBC 等负向保护
 
 use crate::hir::common::{
-    HirBlock, HirExpr, HirLValue, HirStmt, HirTableField, HirTableKey, TempId,
+    HirBlock, HirExpr, HirLValue, HirStmt, HirTableField, HirTableKey, LocalId, ParamId, TempId,
 };
 use crate::structure::{
     BlockRef, Cfg, DataflowFacts, GraphFacts, PhiId, PhiIncomingDisposition, SsaValue,
@@ -249,11 +251,14 @@ enum HomeSlotResolution {
     Conflict,
 }
 
-/// 单个 proto 的 temp promotion 辅助事实。
+/// 单个 proto 的 temp promotion 与后续 binding provenance 辅助事实。
 #[derive(Debug, Clone, Default)]
 pub(super) struct ProtoPromotionFacts {
     temp_home_slots: Vec<Option<HomeSlotKey>>,
     local_home_slots: Vec<HomeSlotResolution>,
+    invalidated_param_homes: BTreeSet<ParamId>,
+    invalidated_local_homes: BTreeSet<LocalId>,
+    invalidated_temp_homes: BTreeSet<TempId>,
     compact_home_slots: bool,
 }
 
@@ -273,6 +278,9 @@ impl ProtoPromotionFacts {
         Self {
             temp_home_slots,
             local_home_slots: Vec::new(),
+            invalidated_param_homes: BTreeSet::new(),
+            invalidated_local_homes: BTreeSet::new(),
+            invalidated_temp_homes: BTreeSet::new(),
             compact_home_slots: false,
         }
     }
@@ -320,6 +328,62 @@ impl ProtoPromotionFacts {
 
     pub(super) const fn compacts_home_slots(&self) -> bool {
         self.compact_home_slots
+    }
+
+    pub(super) fn trusted_param_home_slot(&self, param: ParamId) -> Option<HomeSlotKey> {
+        (!self.param_home_was_invalidated(param)).then_some(HomeSlotKey::new(param.index(), 0))
+    }
+
+    pub(super) fn trusted_local_home_slot(&self, local: LocalId) -> Option<HomeSlotKey> {
+        (!self.local_home_was_invalidated(local))
+            .then(|| self.local_home_slot(local))
+            .flatten()
+    }
+
+    pub(super) fn trusted_temp_home_slot(&self, temp: TempId) -> Option<HomeSlotKey> {
+        (!self.temp_home_was_invalidated(temp))
+            .then(|| self.home_slot(temp))
+            .flatten()
+    }
+
+    pub(super) fn param_home_was_invalidated(&self, param: ParamId) -> bool {
+        self.invalidated_param_homes.contains(&param)
+    }
+
+    pub(super) fn local_home_was_invalidated(&self, local: LocalId) -> bool {
+        self.invalidated_local_homes.contains(&local)
+    }
+
+    pub(super) fn temp_home_was_invalidated(&self, temp: TempId) -> bool {
+        self.invalidated_temp_homes.contains(&temp)
+    }
+
+    pub(super) fn invalidate_param_home(&mut self, param: ParamId) {
+        self.invalidated_param_homes.insert(param);
+    }
+
+    pub(super) fn invalidate_local_home(&mut self, local: LocalId) {
+        self.invalidated_local_homes.insert(local);
+    }
+
+    pub(super) fn invalidate_temp_home(&mut self, temp: TempId) {
+        self.invalidated_temp_homes.insert(temp);
+    }
+
+    pub(super) fn record_temp_to_local_merge(&mut self, temp: TempId, local: LocalId) {
+        let source_home = self.trusted_temp_home_slot(temp);
+        let target_home = self.trusted_local_home_slot(local);
+        if source_home.is_none() || source_home != target_home {
+            self.invalidate_local_home(local);
+        }
+    }
+
+    pub(super) fn record_local_to_param_merge(&mut self, local: LocalId, param: ParamId) {
+        let source_home = self.trusted_local_home_slot(local);
+        let target_home = self.trusted_param_home_slot(param);
+        if source_home.is_none() || source_home != target_home {
+            self.invalidate_param_home(param);
+        }
     }
 
     /// 把当前语句里所有 closure capture 观察到的 home slot 收集进集合。

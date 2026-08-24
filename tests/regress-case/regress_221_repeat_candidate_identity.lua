@@ -5,7 +5,10 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-not-contains [[local r1_0]]
+-- unluac: expect-not-contains [[r1_0 = p1_2]]
 -- unluac: expect-not-contains [[p1_2 = r1_0]]
+-- unluac: expect-contains [[return p1_2]]
 local function run(a, b, value)
     repeat
         for index = 1, 2 do

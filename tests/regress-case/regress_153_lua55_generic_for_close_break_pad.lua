@@ -5,6 +5,9 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-not-contains [[local r1_3]]
+-- unluac: expect-contains [[r1_0 = r1_0 + r1_2]]
+-- unluac: expect-contains [[r1_0 = r1_0 + 7]]
 local function run(xs, stop)
     local total = 0
     for i, v in ipairs(xs) do

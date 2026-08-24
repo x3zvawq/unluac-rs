@@ -91,7 +91,35 @@ local function test_goto_irreducible()
     print("lua52_02_goto#4", x, y)
 end
 
+-- lua52_02_goto#5: label合流不能继承单条词法fallthrough的条件事实
+local function test_goto_path_condition_merge()
+    local function classify(flag, jump)
+        local trace = {}
+        if jump then
+            goto merge
+        end
+        if flag then
+            return "early-true"
+        end
+        trace[#trace + 1] = "fallthrough"
+
+        ::merge::
+        if flag then
+            return "merged-true", #trace
+        end
+        return "false", #trace
+    end
+
+    print(
+        "lua52_02_goto#5",
+        classify(false, false),
+        classify(true, false),
+        classify(true, true)
+    )
+end
+
 test_goto_label()
 test_goto_break()
 test_goto_continue()
 test_goto_irreducible()
+test_goto_path_condition_merge()

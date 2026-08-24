@@ -743,9 +743,10 @@ fn inline_open_return_fixed_alias_run(
         {
             return false;
         }
-        let (Some(target_slot), Some(source_slot)) =
-            (facts.home_slot(target), facts.home_slot(*source))
-        else {
+        let (Some(target_slot), Some(source_slot)) = (
+            facts.trusted_temp_home_slot(target),
+            facts.trusted_temp_home_slot(*source),
+        ) else {
             return false;
         };
         if captured_slots.contains(&target_slot)
@@ -764,7 +765,7 @@ fn inline_open_return_fixed_alias_run(
         let Some((target, _)) = inline_candidate(stmt) else {
             return false;
         };
-        let Some(slot) = facts.home_slot(target) else {
+        let Some(slot) = facts.trusted_temp_home_slot(target) else {
             return false;
         };
         if target_slots.contains(&slot) || source_slots.contains(&slot) {

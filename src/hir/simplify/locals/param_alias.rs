@@ -17,10 +17,15 @@
 //! 从入口相同值开始不会被分别观察。alias 一旦在某条路径写入，该路径后续不得再读取
 //! 原参数；循环还会用“alias 已写入”的状态验证下一轮。参数写入、引用 capture 与 goto
 //! 会直接拒绝，alias local 被任意 closure 捕获时也不会改写。
+//! alias 后续写入会提前覆盖参数，因此还要求两者属于同一可信物理 home；仅有显式读写
+//! 等价不足以排除弱表、`__gc` 或异常 cleanup 对旧参数存活期的观察。
+//! 实际发生的 `Local -> Param` 引用改写还会把失效的 home provenance 传播到参数，避免
+//! deferred carried-local 的下一轮把换壳后的参数重新当作可信物理槽。
 
 use crate::hir::common::{
     HirBlock, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId, ParamId,
 };
+use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::super::mention::{
     expr_mentions_local, stmt_captures_local, stmts_reference_captured_bindings,
@@ -28,27 +33,39 @@ use super::super::mention::{
 use super::super::visit::{self, HirVisitor};
 use super::super::walk::{self, HirRewritePass};
 
-pub(super) fn coalesce_param_aliases_in_proto(proto: &mut HirProto) -> bool {
+pub(super) fn coalesce_param_aliases_in_proto(
+    proto: &mut HirProto,
+    promotion_facts: &mut ProtoPromotionFacts,
+) -> bool {
     let Some(alias) = match_param_alias_prefix(&proto.body) else {
         return false;
     };
+    let shares_exact_home = promotion_facts
+        .trusted_local_home_slot(alias.local)
+        .zip(promotion_facts.trusted_param_home_slot(alias.param))
+        .is_some_and(|(local, param)| local == param);
     let rest = &proto.body.stmts[alias.consumed..];
-    if rest
-        .iter()
-        .any(|stmt| stmt_captures_local(stmt, alias.local))
+    if promotion_facts.compacts_home_slots()
+        || !shares_exact_home
+        || rest
+            .iter()
+            .any(|stmt| stmt_captures_local(stmt, alias.local))
         || !rest_preserves_param_alias_identity(rest, alias.local, alias.param)
     {
         return false;
     }
 
     let mut tail = proto.body.stmts.split_off(alias.consumed);
-    walk::rewrite_stmts(
+    let rewritten = walk::rewrite_stmts(
         &mut tail,
         &mut LocalToParamRewrite {
             local: alias.local,
             param: alias.param,
         },
     );
+    if rewritten {
+        promotion_facts.record_local_to_param_merge(alias.local, alias.param);
+    }
     proto.body.stmts.append(&mut tail);
     proto.body.stmts.drain(..alias.consumed);
     true

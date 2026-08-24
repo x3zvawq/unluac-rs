@@ -6,6 +6,9 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-not-contains [[local r0_2]]
+-- unluac: expect-contains [[r0_0 = r0_0 + 2]]
+-- unluac: expect-contains [[r0_0 = r0_0 + 5]]
 local x = 0
 for i = 1, 5 do
     if i < 3 then

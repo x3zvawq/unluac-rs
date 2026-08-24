@@ -9,6 +9,8 @@
 //! 例如 `if false then body end` 会被删除，`if true then body end` 会保留原 branch block
 //! 的词法作用域后去掉条件壳；动态 lookup、调用、table 构造与元方法比较都不进入该规则。
 
+mod path_conditions;
+
 use std::collections::BTreeMap;
 
 use crate::hir::common::{
@@ -25,7 +27,16 @@ use super::visit::{HirVisitor, visit_block, visit_expr, visit_stmts};
 use super::walk::{HirRewritePass, rewrite_proto};
 
 pub(super) fn fold_branch_control_in_proto(proto: &mut HirProto) -> bool {
-    rewrite_proto(proto, &mut BranchControlPass)
+    let mut changed = false;
+    loop {
+        let path_changed = path_conditions::specialize_stable_path_conditions(proto);
+        changed |= path_changed | rewrite_proto(proto, &mut BranchControlPass);
+        // 删除不可达写可能让下一项 local 立刻满足稳定性证明。这里收完本 pass 自己的
+        // 单调链，避免合法的长链逐项消耗全局 scheduler 的固定轮次预算。
+        if !path_changed {
+            return changed;
+        }
+    }
 }
 
 struct BranchControlPass;

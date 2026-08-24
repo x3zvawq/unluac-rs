@@ -146,7 +146,7 @@ pub(super) fn build_loop_partitions(
     };
     let mut workspaces = LoopPartitionWorkspaces {
         exit_pad: LoopExitPadWorkspace::new(cfg.blocks.len()),
-        while_break: WhileBreakArmWorkspace::new(cfg.blocks.len(), cfg.edges.len()),
+        while_arm: WhileLexicalArmWorkspace::new(cfg.blocks.len(), cfg.edges.len()),
     };
     let mut partitions = Vec::with_capacity(input.loops.len());
     for (index, loop_) in input.loops.iter().enumerate() {
@@ -291,19 +291,19 @@ pub(super) fn build_loop_partition(
                     .collect::<BTreeSet<_>>();
                 (exits.len() == 1).then(|| exits.pop_first()).flatten()
             });
-            let break_arms = verified_while_break_arms(
+            let lexical_arms = verified_while_lexical_arms(
                 cfg,
                 graph_facts,
                 context,
-                WhileBreakArmDomain {
+                WhileLexicalArmDomain {
                     candidate,
                     natural: &natural,
                     condition_blocks: condition_blocks.as_ref(),
                     continuation: lexical_continuation,
                 },
-                &mut workspaces.while_break,
+                &mut workspaces.while_arm,
             )?;
-            owned.extend(break_arms);
+            owned.extend(lexical_arms);
         }
         LoopKindHint::Unknown => {
             let terminal_condition_arm = loop_

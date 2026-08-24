@@ -6,6 +6,10 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-not-contains [[local r1_2]]
+-- unluac: expect-not-contains [[local r2_2]]
+-- unluac: expect-contains [[r1_0 = r1_0 + r1_1]]
+-- unluac: expect-contains [[r2_1 = r2_1 + r2_0]]
 local function run_numeric(a, c, n)
     local x = 0
     for i = 1, n do

@@ -15,6 +15,8 @@ use crate::hir::common::{
     HirTableField, HirTableKey, HirValuePack, LocalId, TempId,
 };
 
+use super::super::walk::{self, HirRewritePass};
+
 pub(super) fn call_expr(call: &mut HirCallExpr, mapping: &BTreeMap<TempId, LocalId>) -> bool {
     let callee_changed = expr(&mut call.callee, mapping);
     let args_changed = value_pack(&mut call.args, mapping);
@@ -158,25 +160,25 @@ pub(super) fn lvalue(lvalue: &mut HirLValue, mapping: &BTreeMap<TempId, LocalId>
 /// TempRef。这里用最终 mapping 补一次定向重写，只处理 closure capture 这一种残留，
 /// 避免做全量二次遍历。
 pub(super) fn forward_capture_refs(stmt: &mut HirStmt, mapping: &BTreeMap<TempId, LocalId>) {
-    match stmt {
-        HirStmt::Assign(assign) => {
-            for expr in &mut assign.values.fixed {
-                closure_capture_temps(expr, mapping);
-            }
-        }
-        HirStmt::LocalDecl(local_decl) => {
-            for expr in &mut local_decl.values.fixed {
-                closure_capture_temps(expr, mapping);
-            }
-        }
-        _ => {}
-    }
+    walk::rewrite_stmts(
+        std::slice::from_mut(stmt),
+        &mut ForwardCaptureRefPass { mapping },
+    );
 }
 
-fn closure_capture_temps(expr: &mut HirExpr, mapping: &BTreeMap<TempId, LocalId>) {
-    if let HirExpr::Closure(closure) = expr {
+struct ForwardCaptureRefPass<'a> {
+    mapping: &'a BTreeMap<TempId, LocalId>,
+}
+
+impl HirRewritePass for ForwardCaptureRefPass<'_> {
+    fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
+        let HirExpr::Closure(closure) = expr else {
+            return false;
+        };
+        let mut changed = false;
         for capture in &mut closure.captures {
-            self::expr(&mut capture.value, mapping);
+            changed |= self::expr(&mut capture.value, self.mapping);
         }
+        changed
     }
 }

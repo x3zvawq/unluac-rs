@@ -3,7 +3,10 @@
 //! 这个模块处理 fallback block 中形如 `assign t = local/temp`、多目标 alias handoff、
 //! 以及 `assign next = state + 1; ... state = next` 的更新后交棒。它依赖当前块的
 //! temp touch 索引、边界 goto 判断和 binding rewrite 工具；不负责递归遍历，也不负责
-//! label/goto mesh 的全局等价类收敛。
+//! label/goto mesh 的全局等价类收敛。source/target 若承载 capture/TBC 身份或可能与其
+//! 共用物理 home，会在父模块冻结的 proto 身份事实下保留原形。任何把 temp 的求值提前
+//! 写入已有 binding 的 handoff 还必须证明两端属于相同的 `(slot, close epoch)`，避免改变
+//! 弱表、`__gc` 或异常 cleanup 可观察到的旧值存活期。
 //!
 //! 例子：
 //! - 输入：`assign t = s; ... t = t + 1`
@@ -13,12 +16,14 @@
 
 use std::collections::BTreeSet;
 
-use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirStmt, TempId};
-
 use super::super::mention::stmt_writes_temp;
 use super::super::temp_touch::TempTouchIndex;
 use super::super::walk::rewrite_stmts;
-use super::binding::{BindingProtection, CarryBinding, TempBindingRewrite, TempToBindingPass};
+use super::HandoffSafety;
+use super::binding::{
+    BindingProtection, CarryBinding, TempBindingRewrite, TempToBindingPass,
+    bindings_share_exact_home_slot,
+};
 use super::boundary::LabelJumpIndex;
 use super::prune::{
     RedundantSelfAssignPrunePass, collect_prunable_bindings, prune_empty_assign_stmts,
@@ -29,6 +34,7 @@ use super::seeds::{
     binding_handoff_seed, direct_temp_writeback_stmt, rewrite_binding_handoff_seed,
     rewrite_update_handoff_seed, single_binding_handoff_seed, update_handoff_seed,
 };
+use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirStmt, TempId};
 
 pub(super) enum HandoffAction {
     RetrySameIndex,
@@ -42,6 +48,7 @@ pub(super) fn try_collapse_handoff_at(
     temp_touches: &TempTouchIndex<'_>,
     label_jumps: &LabelJumpIndex,
     captured_bindings: &BTreeSet<CarryBinding>,
+    safety: &mut HandoffSafety<'_>,
 ) -> Option<HandoffAction> {
     if try_collapse_pure_binding_handoffs(
         block,
@@ -50,12 +57,14 @@ pub(super) fn try_collapse_handoff_at(
         temp_touches,
         label_jumps,
         captured_bindings,
+        safety,
     ) || try_collapse_label_loop_update_handoff(
         block,
         index,
         outer_bindings,
         temp_touches,
         label_jumps,
+        safety,
     ) || try_collapse_single_binding_handoff(
         block,
         index,
@@ -63,6 +72,7 @@ pub(super) fn try_collapse_handoff_at(
         temp_touches,
         label_jumps,
         captured_bindings,
+        safety,
     ) {
         return Some(HandoffAction::RetrySameIndex);
     }
@@ -73,6 +83,7 @@ pub(super) fn try_collapse_handoff_at(
         temp_touches,
         label_jumps,
         captured_bindings,
+        safety,
     ) {
         return Some(HandoffAction::AdvanceIndex);
     }
@@ -86,6 +97,7 @@ fn try_collapse_pure_binding_handoffs(
     temp_touches: &TempTouchIndex<'_>,
     label_jumps: &LabelJumpIndex,
     captured_bindings: &BTreeSet<CarryBinding>,
+    safety: &mut HandoffSafety<'_>,
 ) -> bool {
     let Some(seed) = binding_handoff_seed(&block.stmts[index]) else {
         return false;
@@ -97,6 +109,7 @@ fn try_collapse_pure_binding_handoffs(
             || outer_bindings.contains(&rewrite.to)
             || temp_touches.touches_before(index, rewrite.from)
             || captured_bindings.contains(&rewrite.to)
+            || !temp_handoff_preserves_storage(rewrite.from, rewrite.to, safety)
     }) {
         return false;
     }
@@ -121,6 +134,7 @@ fn try_collapse_pure_binding_handoffs(
 
     let mut pass = TempToBindingPass {
         rewrites: seed.rewrites.clone(),
+        promotion_facts: safety.promotion_facts,
     };
     if !rewrite_stmts(&mut block.stmts[index + 1..], &mut pass) {
         return false;
@@ -146,12 +160,14 @@ fn try_collapse_label_loop_update_handoff(
     outer_bindings: &dyn BindingProtection,
     temp_touches: &TempTouchIndex<'_>,
     label_jumps: &LabelJumpIndex,
+    safety: &mut HandoffSafety<'_>,
 ) -> bool {
     let Some((carried, update_temp)) = direct_temp_writeback_stmt(&block.stmts[index]) else {
         return false;
     };
     if outer_bindings.contains(&CarryBinding::Temp(update_temp))
         || temp_touches.touches_before(index, update_temp)
+        || !temp_handoff_preserves_storage(update_temp, carried, safety)
     {
         return false;
     }
@@ -182,6 +198,7 @@ fn try_collapse_label_loop_update_handoff(
             from: update_temp,
             to: carried,
         }],
+        promotion_facts: safety.promotion_facts,
     };
     if !rewrite_stmts(&mut block.stmts[index..], &mut pass) {
         return false;
@@ -219,6 +236,7 @@ fn try_collapse_single_binding_handoff(
     temp_touches: &TempTouchIndex<'_>,
     label_jumps: &LabelJumpIndex,
     captured_bindings: &BTreeSet<CarryBinding>,
+    safety: &mut HandoffSafety<'_>,
 ) -> bool {
     let Some((temp, binding)) = single_binding_handoff_seed(&block.stmts[index]) else {
         return false;
@@ -232,6 +250,9 @@ fn try_collapse_single_binding_handoff(
         return false;
     }
     if captured_bindings.contains(&binding) {
+        return false;
+    }
+    if !temp_handoff_preserves_storage(temp, binding, safety) {
         return false;
     }
     if label_jumps.next_label_has_prior_goto(&block.stmts, index) {
@@ -253,6 +274,7 @@ fn try_collapse_single_binding_handoff(
                 from: temp,
                 to: binding,
             }],
+            promotion_facts: safety.promotion_facts,
         },
     );
     if !rewritten {
@@ -270,6 +292,7 @@ fn try_collapse_binding_update_handoff(
     temp_touches: &TempTouchIndex<'_>,
     label_jumps: &LabelJumpIndex,
     captured_bindings: &BTreeSet<CarryBinding>,
+    safety: &mut HandoffSafety<'_>,
 ) -> bool {
     let Some((target_temp, carried)) = update_handoff_seed(&block.stmts[index]) else {
         return false;
@@ -278,6 +301,7 @@ fn try_collapse_binding_update_handoff(
     // 如果被折叠的 temp 在外层作用域中仍被引用，不能消除。
     if outer_bindings.contains(&CarryBinding::Temp(target_temp))
         || captured_bindings.contains(&carried)
+        || !temp_handoff_preserves_storage(target_temp, carried, safety)
     {
         return false;
     }
@@ -301,6 +325,7 @@ fn try_collapse_binding_update_handoff(
                 from: target_temp,
                 to: carried,
             }],
+            promotion_facts: safety.promotion_facts,
         },
     );
     if !rewritten {
@@ -316,6 +341,21 @@ fn try_collapse_binding_update_handoff(
     );
     prune_empty_assign_stmts(block);
     true
+}
+
+fn temp_handoff_preserves_storage(
+    temp: TempId,
+    target: CarryBinding,
+    safety: &HandoffSafety<'_>,
+) -> bool {
+    let source = CarryBinding::Temp(temp);
+    !safety.promotion_facts.compacts_home_slots()
+        && bindings_share_exact_home_slot(source, target, safety.promotion_facts)
+        && safety.identity_facts.binding_merge_preserves_identity(
+            source,
+            target,
+            safety.promotion_facts,
+        )
 }
 
 fn suffix_reads_binding(stmts: &[HirStmt], binding: CarryBinding) -> bool {

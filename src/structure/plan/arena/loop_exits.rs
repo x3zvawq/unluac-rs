@@ -1,4 +1,4 @@
-//! 循环提前退出、正常尾部与透明 pad 的证明。输入 CFG、loop domain 和 scope barriers，输出 break arms、normal tail 与可转发 exit routes；不负责创建 RegionPlan。例如 while 的共享尾只有在 normal/early 出口合同闭合时才会冻结。
+//! 循环词法 arm、正常尾部与透明 pad 的证明。输入 CFG、loop domain 和 scope barriers，输出 lexical arms、normal tail 与可转发 exit routes；不负责创建 RegionPlan。例如 while 的共享尾只有在 normal/early 出口合同闭合时才会冻结。
 
 use super::*;
 
@@ -37,22 +37,22 @@ pub(super) fn closed_linear_terminal_arm(
     }
 }
 
-/// natural-loop SCC 不包含“进入一个结构化子图后只会 break/return”的词法 arm。
-/// 这类 arm 若留在 loop 外，入口边只能退化为 goto；这里仅接纳单入口、且所有出口
-/// 都直达当前 loop continuation 或函数出口的闭合子图。
-pub(super) struct WhileBreakArmDomain<'a> {
+/// natural-loop SCC 不包含进入后只会离开当前迭代或永不返回的词法 arm。这类 arm
+/// 若留在 loop 外，入口边只能退化为 goto；这里仅接纳单入口、且所有完成路径只会
+/// 抵达当前 loop continuation 或函数出口的闭合子图，无出口 SCC 也保持在原 arm 内。
+pub(super) struct WhileLexicalArmDomain<'a> {
     pub(super) candidate: &'a crate::structure::LoopCandidate,
     pub(super) natural: &'a BTreeSet<BlockRef>,
     pub(super) condition_blocks: Option<&'a BTreeSet<BlockRef>>,
     pub(super) continuation: Option<BlockRef>,
 }
 
-pub(super) fn verified_while_break_arms(
+pub(super) fn verified_while_lexical_arms(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     context: &LoopPartitionContext,
-    domain: WhileBreakArmDomain<'_>,
-    workspace: &mut WhileBreakArmWorkspace,
+    domain: WhileLexicalArmDomain<'_>,
+    workspace: &mut WhileLexicalArmWorkspace,
 ) -> Result<BTreeSet<BlockRef>, StructureError> {
     let Some(continuation) = domain.continuation else {
         return Ok(BTreeSet::new());
@@ -61,8 +61,8 @@ pub(super) fn verified_while_break_arms(
     let natural = domain.natural;
     workspace.begin_loop();
     for &block in natural {
-        workspace.insert(block, WHILE_BREAK_OWNED)?;
-        if workspace.insert(block, WHILE_BREAK_QUEUED)? {
+        workspace.insert(block, WHILE_ARM_OWNED)?;
+        if workspace.insert(block, WHILE_ARM_QUEUED)? {
             workspace.pending.push_back(block);
         }
     }
@@ -70,14 +70,14 @@ pub(super) fn verified_while_break_arms(
         .chain(candidate.control_blocks.iter().copied())
         .chain(domain.condition_blocks.into_iter().flatten().copied())
     {
-        workspace.insert(block, WHILE_BREAK_EXCLUDED)?;
+        workspace.insert(block, WHILE_ARM_EXCLUDED)?;
     }
 
     let mut added = Vec::new();
     while let Some(source) = workspace.pending.pop_front() {
-        workspace.remove(source, WHILE_BREAK_QUEUED)?;
-        if !workspace.contains(source, WHILE_BREAK_OWNED)?
-            || workspace.contains(source, WHILE_BREAK_EXCLUDED)?
+        workspace.remove(source, WHILE_ARM_QUEUED)?;
+        if !workspace.contains(source, WHILE_ARM_OWNED)?
+            || workspace.contains(source, WHILE_ARM_EXCLUDED)?
         {
             continue;
         }
@@ -97,13 +97,13 @@ pub(super) fn verified_while_break_arms(
             let sibling = cfg.edges[successors[1 - entry_index].index()].to;
             if entry == continuation
                 || entry == cfg.exit_block
-                || workspace.contains(entry, WHILE_BREAK_OWNED)?
-                || !(workspace.contains(sibling, WHILE_BREAK_OWNED)? || sibling == continuation)
+                || workspace.contains(entry, WHILE_ARM_OWNED)?
+                || !(workspace.contains(sibling, WHILE_ARM_OWNED)? || sibling == continuation)
             {
                 continue;
             }
             if !workspace.mark_attempted(entry_edge)?
-                || !closed_break_arm(
+                || !closed_while_lexical_arm(
                     cfg,
                     graph_facts,
                     context,
@@ -118,19 +118,19 @@ pub(super) fn verified_while_break_arms(
             let arm_len = workspace.arm_blocks.len();
             for arm_index in 0..arm_len {
                 let block = workspace.arm_blocks[arm_index];
-                if !workspace.insert(block, WHILE_BREAK_OWNED)? {
+                if !workspace.insert(block, WHILE_ARM_OWNED)? {
                     return Err(StructureError::invalid(
-                        "verified break arms overlap after ownership was frozen",
+                        "verified while lexical arms overlap after ownership was frozen",
                     ));
                 }
                 added.push(block);
-                if workspace.insert(block, WHILE_BREAK_QUEUED)? {
+                if workspace.insert(block, WHILE_ARM_QUEUED)? {
                     workspace.pending.push_back(block);
                 }
                 for &incoming in &cfg.preds[block.index()] {
                     let predecessor = cfg.edges[incoming.index()].from;
-                    if workspace.contains(predecessor, WHILE_BREAK_OWNED)?
-                        && workspace.insert(predecessor, WHILE_BREAK_QUEUED)?
+                    if workspace.contains(predecessor, WHILE_ARM_OWNED)?
+                        && workspace.insert(predecessor, WHILE_ARM_QUEUED)?
                     {
                         workspace.pending.push_back(predecessor);
                     }
@@ -141,11 +141,11 @@ pub(super) fn verified_while_break_arms(
     Ok(added.into_iter().collect())
 }
 
-pub(super) fn closed_break_arm(
+pub(super) fn closed_while_lexical_arm(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     context: &LoopPartitionContext,
-    workspace: &mut WhileBreakArmWorkspace,
+    workspace: &mut WhileLexicalArmWorkspace,
     source: BlockRef,
     entry_edge: EdgeRef,
     continuation: BlockRef,
@@ -153,26 +153,26 @@ pub(super) fn closed_break_arm(
     let entry = cfg
         .edges
         .get(entry_edge.index())
-        .ok_or_else(|| StructureError::invalid("break arm entry edge is outside the CFG arena"))?
+        .ok_or_else(|| {
+            StructureError::invalid("while lexical arm entry edge is outside the CFG arena")
+        })?
         .to;
     workspace.begin_arm();
     workspace.arm_pending.push(entry);
-    let mut reaches_continuation = false;
     while let Some(block) = workspace.arm_pending.pop() {
         if block == continuation {
-            reaches_continuation = true;
             continue;
         }
         if block == cfg.exit_block {
             continue;
         }
-        if workspace.contains(block, WHILE_BREAK_OWNED)?
+        if workspace.contains(block, WHILE_ARM_OWNED)?
             || !context
                 .reachable_by_block
                 .get(block.index())
                 .copied()
                 .ok_or_else(|| {
-                    StructureError::invalid("break arm block is outside the CFG arena")
+                    StructureError::invalid("while lexical arm block is outside the CFG arena")
                 })?
             // 单入口闭合 arm 的 entry 必须支配其全部 block。这个 interval 检查使
             // 多入口共享尾在首个汇合点即失败，避免每个入口重复遍历同一长尾。
@@ -182,13 +182,13 @@ pub(super) fn closed_break_arm(
                 .get(block.index())
                 .copied()
                 .ok_or_else(|| {
-                    StructureError::invalid("break arm block is outside the CFG arena")
+                    StructureError::invalid("while lexical arm block is outside the CFG arena")
                 })?
             || context
                 .residual_incidents_by_block
                 .get(block.index())
                 .ok_or_else(|| {
-                    StructureError::invalid("break arm block is outside the CFG arena")
+                    StructureError::invalid("while lexical arm block is outside the CFG arena")
                 })?
                 .iter()
                 .any(|residual| *residual != entry_edge)
@@ -201,30 +201,32 @@ pub(super) fn closed_break_arm(
         workspace.arm_blocks.push(block);
         for edge in &cfg.succs[block.index()] {
             let target = cfg.edges[edge.index()].to;
-            if workspace.contains(target, WHILE_BREAK_OWNED)? {
+            if workspace.contains(target, WHILE_ARM_OWNED)? {
                 return Ok(false);
             }
-            if target == continuation {
-                reaches_continuation = true;
-            } else if target != cfg.exit_block {
+            if target != continuation && target != cfg.exit_block {
                 workspace.arm_pending.push(target);
             }
         }
     }
-    if workspace.arm_blocks.is_empty() || !reaches_continuation {
+    if workspace.arm_blocks.is_empty() {
         return Ok(false);
     }
     for &block in &workspace.arm_blocks {
         for incoming in &cfg.preds[block.index()] {
             let edge = cfg.edges.get(incoming.index()).ok_or_else(|| {
-                StructureError::invalid("break arm predecessor edge is outside the CFG arena")
+                StructureError::invalid(
+                    "while lexical arm predecessor edge is outside the CFG arena",
+                )
             })?;
             if !context
                 .reachable_by_block
                 .get(edge.from.index())
                 .copied()
                 .ok_or_else(|| {
-                    StructureError::invalid("break arm predecessor is outside the CFG arena")
+                    StructureError::invalid(
+                        "while lexical arm predecessor is outside the CFG arena",
+                    )
                 })?
                 || workspace.is_visited(edge.from)?
             {

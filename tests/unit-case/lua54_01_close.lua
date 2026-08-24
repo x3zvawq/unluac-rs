@@ -212,9 +212,33 @@ local function test_tbc_param_binding()
     print("lua54_01_close#6", name, closed)
 end
 
+-- lua54_01_close#7: 参数alias不能提前释放原参数槽的GC root
+local function test_param_alias_gc_root()
+    local function survives_alias_write(value)
+        local alias = value
+        local weak = setmetatable({ value }, { __mode = "v" })
+        local turns = 0
+        while turns < 1 do
+            turns = turns + 1
+            if alias == nil then
+                return false, false
+            end
+            alias = {}
+        end
+        collectgarbage("collect")
+        return weak[1] ~= nil, alias ~= nil
+    end
+
+    local alive, alias_alive = survives_alias_write({})
+    assert(alive)
+    assert(alias_alive)
+    print("lua54_01_close#7", alive, alias_alive)
+end
+
 test_tbc_basic()
 test_tbc_multi_exit()
 test_tbc_goto_reenter()
 test_close_tailcall()
 test_for_const_close()
 test_tbc_param_binding()
+test_param_alias_gc_root()

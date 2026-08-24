@@ -168,13 +168,24 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
     PassDescriptor {
         name: "branch-control",
         phase: PassPhase::Normal,
-        depends_on: &[LabelGoto, TempChain, LogicalExpr, DecisionShape],
-        invalidates: &[
+        depends_on: &[
             LabelGoto,
             BlockStructure,
+            BooleanPattern,
             TempChain,
             LocalBinding,
             LogicalExpr,
+            DecisionShape,
+            ClosureCapture,
+        ],
+        invalidates: &[
+            LabelGoto,
+            BlockStructure,
+            BooleanPattern,
+            TempChain,
+            LocalBinding,
+            LogicalExpr,
+            ClosureCapture,
         ],
     },
     // ── Deferred phase ──
@@ -193,7 +204,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
     PassDescriptor {
         name: "carried-locals",
         phase: PassPhase::Deferred,
-        depends_on: &[LocalBinding],
+        depends_on: &[LocalBinding, BlockStructure, ClosureCapture, LabelGoto],
         invalidates: &[LocalBinding, TempChain],
     },
     PassDescriptor {

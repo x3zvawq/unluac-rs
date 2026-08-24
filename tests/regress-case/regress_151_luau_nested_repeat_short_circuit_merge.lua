@@ -1,5 +1,6 @@
 -- regress_151_luau_nested_repeat_short_circuit_merge#1: 短路链尾与 plain if-then 共享本轮 merge
 -- unluac: expect-contains [[repeat]]
+-- unluac: expect-not-contains [[not (p1_0 or p1_2)]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]

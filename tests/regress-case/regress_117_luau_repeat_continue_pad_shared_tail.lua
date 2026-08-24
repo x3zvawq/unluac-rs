@@ -1,5 +1,6 @@
 -- regress_117_luau_repeat_continue_pad_shared_tail#1: repeat continue pad 不消费共享 tail 与 condition
 -- unluac: expect-contains [[continue]]
+-- unluac: expect-not-contains [[                if p1_0 then]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]

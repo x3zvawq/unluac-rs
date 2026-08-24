@@ -1,6 +1,7 @@
 -- regress_289_luau_closure_creation_identity: O2的DUPCLOSURE与NEWCLOSURE不能按child proto混同
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-not-contains [[r0_9 = r0_12]]
 local function shared_make()
     return function(value)
         return value + 1

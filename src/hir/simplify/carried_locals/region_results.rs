@@ -5,20 +5,22 @@
 //! carried state 复制到 result temp。只有所有能抵达后缀的路径都完整定义 result，
 //! 并能证明同一 home slot，或证明动态 repeat 的匿名 result 在每个出口都只是 state 的
 //! 精确副本时，result 才能安全复用原 local/param；capture、跨 label 与独立状态写入都会
-//! 阻止该折叠。continue/goto 的条件路径不由这个 pass 猜测。
+//! 阻止该折叠。proto 级资源身份门还拒绝 TBC 和 reference-capture raw-home may-alias；
+//! continue/goto 的条件路径不由这个 pass 猜测。
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirIf, HirLValue, HirLocalDecl, HirStmt, HirValuePack, LocalId,
 };
-use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
+use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::super::visit::{HirVisitor, visit_stmts};
 use super::super::walk::rewrite_stmts;
+use super::HandoffIdentityFacts;
 use super::binding::{
-    BindingClassRewritePass, BindingProtection, CarryBinding, carry_binding_from_expr,
-    carry_binding_from_lvalue,
+    BindingClassRewritePass, BindingProtection, CarryBinding, binding_home_slot,
+    bindings_share_exact_home_slot, carry_binding_from_expr, carry_binding_from_lvalue,
 };
 use super::prune::{RedundantSelfAssignPrunePass, prune_empty_assign_stmts};
 use super::reads::{collect_binding_mentions_by_stmt, collect_binding_mentions_in_expr};
@@ -26,12 +28,15 @@ use super::reads::{collect_binding_mentions_by_stmt, collect_binding_mentions_in
 mod assignments;
 mod binding_facts;
 mod conditions;
+mod flow;
 mod parallel;
 mod rewrites;
 
 use assignments::*;
 use binding_facts::*;
 use conditions::*;
+pub(super) use flow::collapse_result_writeback_transactions;
+use flow::{expr_has_forbidden_nodes, region_has_forbidden_nodes};
 use parallel::*;
 use rewrites::*;
 
@@ -92,8 +97,9 @@ impl<'a> RegionResultIndex<'a> {
 pub(super) fn collapse_inferred_if_result_chains(
     block: &mut HirBlock,
     outer_bindings: &dyn BindingProtection,
-    promotion_facts: &ProtoPromotionFacts,
+    promotion_facts: &mut ProtoPromotionFacts,
     captured_bindings: &BTreeSet<CarryBinding>,
+    identity_facts: &HandoffIdentityFacts,
 ) -> bool {
     let result_index = RegionResultIndex::new(&block.stmts, captured_bindings);
     let mut rewrites = BTreeMap::<CarryBinding, CarryBinding>::new();
@@ -117,6 +123,9 @@ pub(super) fn collapse_inferred_if_result_chains(
             let HirStmt::If(if_stmt) = block.stmts.get(region_index)? else {
                 return None;
             };
+            if region_has_forbidden_nodes(&block.stmts[region_index..=region_index]) {
+                return None;
+            }
             let exits = if_fallthrough_assignments(if_stmt, &results)?;
             let inferred = infer_rewrites(
                 &results,
@@ -128,7 +137,8 @@ pub(super) fn collapse_inferred_if_result_chains(
             )?;
             (!inferred.iter().any(|(result, seed)| {
                 outer_bindings.contains(result) || outer_bindings.contains(seed)
-            }) && rewrite_is_private_and_uncaptured(region_index, &inferred, &result_index))
+            }) && rewrites_preserve_identity(&inferred, promotion_facts, identity_facts)
+                && rewrite_is_private_and_uncaptured(region_index, &inferred, &result_index))
             .then_some(inferred)
         })();
         let Some(inferred) = candidate else {
@@ -181,15 +191,13 @@ pub(super) fn collapse_inferred_if_result_chains(
         &mut block.stmts,
         &mut BindingClassRewritePass {
             rewrites: rewrites.clone(),
+            promotion_facts,
         },
     );
     rewrite_stmts(
         &mut block.stmts,
         &mut RedundantSelfAssignPrunePass::for_bindings(rewritten.iter().copied()),
     );
-    for stmt in &mut block.stmts {
-        split_rewritten_parallel_assignments(stmt, &rewritten);
-    }
     let mut index = 0;
     block.stmts.retain(|_| {
         let keep = !removed_declarations[index];
@@ -239,6 +247,8 @@ pub(super) fn collapse_written_back_if_results(
     block: &mut HirBlock,
     outer_bindings: &dyn BindingProtection,
     captured_bindings: &BTreeSet<CarryBinding>,
+    promotion_facts: &mut ProtoPromotionFacts,
+    identity_facts: &HandoffIdentityFacts,
 ) -> bool {
     let mentions = collect_binding_mentions_by_stmt(&block.stmts);
     let mut mention_counts = BTreeMap::<CarryBinding, usize>::new();
@@ -278,11 +288,14 @@ pub(super) fn collapse_written_back_if_results(
             || outer_bindings.contains(&result)
             || captured_bindings.contains(&result)
             || captured_bindings.contains(&state)
+            || promotion_facts.compacts_home_slots()
+            || !bindings_share_exact_home_slot(result, state, promotion_facts)
+            || !identity_facts.binding_merge_preserves_identity(result, state, promotion_facts)
             || mention_counts.get(&result).copied() != Some(2)
             || facts.reads.contains_key(&result)
             || facts.writes.get(&result).copied() != Some(exits.len())
             || (facts.writes.contains_key(&state) && !state_writes_preserve_result)
-            || stmt_has_label_or_goto(&block.stmts[index + 1])
+            || region_has_forbidden_nodes(&block.stmts[index + 1..=index + 1])
         {
             index += 1;
             continue;
@@ -311,7 +324,10 @@ pub(super) fn collapse_written_back_if_results(
         rewrites.insert(fold.result, fold.state);
         rewrite_stmts(
             &mut block.stmts[fold.region..=fold.region],
-            &mut BindingClassRewritePass { rewrites },
+            &mut BindingClassRewritePass {
+                rewrites,
+                promotion_facts,
+            },
         );
         rewrite_stmts(
             &mut block.stmts[fold.region..=fold.region],
@@ -347,26 +363,41 @@ pub(super) fn try_collapse_region_result_handoff(
     block: &mut HirBlock,
     index: usize,
     outer_bindings: &dyn BindingProtection,
-    promotion_facts: &ProtoPromotionFacts,
+    promotion_facts: &mut ProtoPromotionFacts,
     result_index: &RegionResultIndex<'_>,
+    identity_facts: &HandoffIdentityFacts,
 ) -> bool {
-    try_collapse_seeded_if_results(block, index, outer_bindings, promotion_facts, result_index)
-        || try_collapse_inferred_if_results(
-            block,
-            index,
-            outer_bindings,
-            promotion_facts,
-            result_index,
-        )
-        || try_collapse_loop_results(block, index, outer_bindings, promotion_facts, result_index)
+    try_collapse_seeded_if_results(
+        block,
+        index,
+        outer_bindings,
+        promotion_facts,
+        result_index,
+        identity_facts,
+    ) || try_collapse_inferred_if_results(
+        block,
+        index,
+        outer_bindings,
+        promotion_facts,
+        result_index,
+        identity_facts,
+    ) || try_collapse_loop_results(
+        block,
+        index,
+        outer_bindings,
+        promotion_facts,
+        result_index,
+        identity_facts,
+    )
 }
 
 fn try_collapse_seeded_if_results(
     block: &mut HirBlock,
     index: usize,
     outer_bindings: &dyn BindingProtection,
-    promotion_facts: &ProtoPromotionFacts,
+    promotion_facts: &mut ProtoPromotionFacts,
     result_index: &RegionResultIndex<'_>,
+    identity_facts: &HandoffIdentityFacts,
 ) -> bool {
     let mut cursor = index;
     let mut seeds = Vec::new();
@@ -386,6 +417,9 @@ fn try_collapse_seeded_if_results(
     let Some(HirStmt::If(if_stmt)) = block.stmts.get(cursor) else {
         return false;
     };
+    if region_has_forbidden_nodes(&block.stmts[cursor..=cursor]) {
+        return false;
+    }
     let Some(exits) = if_fallthrough_assignments(if_stmt, &results) else {
         return false;
     };
@@ -405,11 +439,18 @@ fn try_collapse_seeded_if_results(
         .iter()
         .any(|(result, seed)| outer_bindings.contains(result) || outer_bindings.contains(seed))
         || !rewrites_preserve_home_slots(&rewrites, promotion_facts)
+        || !rewrites_preserve_identity(&rewrites, promotion_facts, identity_facts)
         || !rewrite_is_private_and_uncaptured(cursor, &rewrites, result_index)
     {
         return false;
     }
-    if !apply_rewrites(block, result_start..cursor, cursor, rewrites) {
+    if !apply_rewrites(
+        block,
+        result_start..cursor,
+        cursor,
+        rewrites,
+        promotion_facts,
+    ) {
         return false;
     }
     merge_initialized_local_declarations(block, index, seeds.len());
@@ -420,8 +461,9 @@ fn try_collapse_inferred_if_results(
     block: &mut HirBlock,
     index: usize,
     outer_bindings: &dyn BindingProtection,
-    promotion_facts: &ProtoPromotionFacts,
+    promotion_facts: &mut ProtoPromotionFacts,
     result_index: &RegionResultIndex<'_>,
+    identity_facts: &HandoffIdentityFacts,
 ) -> bool {
     let mut cursor = index;
     let mut results = Vec::new();
@@ -435,6 +477,9 @@ fn try_collapse_inferred_if_results(
     let Some(HirStmt::If(if_stmt)) = block.stmts.get(cursor) else {
         return false;
     };
+    if region_has_forbidden_nodes(&block.stmts[cursor..=cursor]) {
+        return false;
+    }
     let Some(exits) = if_fallthrough_assignments(if_stmt, &results) else {
         return false;
     };
@@ -446,39 +491,43 @@ fn try_collapse_inferred_if_results(
     if rewrites
         .iter()
         .any(|(result, seed)| outer_bindings.contains(result) || outer_bindings.contains(seed))
+        || !rewrites_preserve_identity(&rewrites, promotion_facts, identity_facts)
         || !rewrite_is_private_and_uncaptured(cursor, &rewrites, result_index)
     {
         return false;
     }
-    apply_rewrites(block, index..cursor, cursor, rewrites)
+    apply_rewrites(block, index..cursor, cursor, rewrites, promotion_facts)
 }
 
 fn try_collapse_loop_results(
     block: &mut HirBlock,
     index: usize,
     outer_bindings: &dyn BindingProtection,
-    promotion_facts: &ProtoPromotionFacts,
+    promotion_facts: &mut ProtoPromotionFacts,
     result_index: &RegionResultIndex<'_>,
+    identity_facts: &HandoffIdentityFacts,
 ) -> bool {
     let Some(stmt) = block.stmts.get(index) else {
         return false;
     };
-    let (body, include_fallthrough, requires_exact_exits) = match stmt {
+    let (body, include_fallthrough, requires_exact_exits, condition_forbidden) = match stmt {
         HirStmt::While(while_stmt) if while_stmt.cond == HirExpr::Boolean(true) => {
-            (&while_stmt.body, false, false)
+            (&while_stmt.body, false, false, false)
         }
         HirStmt::Repeat(repeat_stmt) => (
             &repeat_stmt.body,
             repeat_stmt.cond != HirExpr::Boolean(false),
             repeat_stmt.cond != HirExpr::Boolean(true),
+            expr_has_forbidden_nodes(&repeat_stmt.cond),
         ),
         _ => return false,
     };
     let mut exits = Vec::new();
-    // 内层 loop 的 break/continue 归内层 owner，但 goto 可以直接越过当前 loop。
-    if requires_exact_exits && block_has_label_or_goto(body)
+    // 内层 loop 的 break/continue 归内层 owner，但跳转、cleanup 或残留 Decision 都
+    // 可能绕过 result 写回；这类边界不能交给 `collect_break_assignments` 猜测。
+    if condition_forbidden
+        || region_has_forbidden_nodes(&body.stmts)
         || !collect_break_assignments(body, &mut exits, requires_exact_exits)
-        || exits.is_empty()
     {
         return false;
     }
@@ -490,6 +539,9 @@ fn try_collapse_loop_results(
             return false;
         };
         exits.push(exit);
+    }
+    if exits.is_empty() {
+        return false;
     }
     let mut results = exits
         .first()
@@ -544,9 +596,20 @@ fn try_collapse_loop_results(
     if rewrites
         .iter()
         .any(|(result, seed)| outer_bindings.contains(result) || outer_bindings.contains(seed))
+        || !rewrites_preserve_identity(&rewrites, promotion_facts, identity_facts)
         || !rewrite_is_private_and_uncaptured(index, &rewrites, result_index)
     {
         return false;
     }
-    apply_rewrites(block, index..index, index, rewrites)
+    apply_rewrites(block, index..index, index, rewrites, promotion_facts)
+}
+
+fn rewrites_preserve_identity(
+    rewrites: &BTreeMap<CarryBinding, CarryBinding>,
+    promotion_facts: &ProtoPromotionFacts,
+    identity_facts: &HandoffIdentityFacts,
+) -> bool {
+    rewrites.iter().all(|(source, target)| {
+        identity_facts.binding_merge_preserves_identity(*source, *target, promotion_facts)
+    })
 }

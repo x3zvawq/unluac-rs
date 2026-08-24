@@ -7,6 +7,10 @@
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[        else]]
+-- unluac: expect-not-contains [[local r1_2]]
+-- unluac: expect-not-contains [[local r1_3]]
+-- unluac: expect-contains [[r1_0 = r1_0 + 1]]
+-- unluac: expect-contains [[until p1_1[r1_0]]
 local function run(log_body, xs)
     local x = 0
     for key in pairs(xs) do

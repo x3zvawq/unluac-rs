@@ -1,7 +1,7 @@
 # 审计问题与交接清单
 
-> 更新时间：2026-08-12
-> 基线：当前 `dev`
+> 更新时间：2026-08-20
+> 基线：`main@fbc45e0`
 > 本文只记录尚未解决且已经取证的问题、明确风险和已确认的设计决定；完成项立即删除。
 
 ## 不应回退的决定
@@ -24,3 +24,24 @@
 5. **HIR capture 跨 key 图遍历仍可受不同 epoch 数放大**：当 `K` 个不同 `(slot, epoch)` 都覆盖整张 CFG 时，逐 key 反向写后数据流仍为 `O(K×(blocks+edges))`；不同 capture root 也可能重复遍历同一大型 normal-phi ancestry。普通编译器输出受寄存器数和词法 epoch domain 限制，但人工构造输入仍可放大此路径。关闭此项需要利用 epoch 的 dominator domain 限制反向传播范围，并对 normal phi graph 做 SCC 后的 earliest-def memo，不能建立 `key×block` 持久矩阵。
 6. **Luau captured-shared component matcher 对人工共享 DAG 仍可能二次展开**：owner 对 root occurrence 的支配检查已折成每组一次 NCA 包络，词法 scope 也先按稠密 region memo 与 containment DFS 左右端点冻结，Move identity 统一使用 `CanonicalMoveIndex`；但 `shared_closures.rs::match_component` 仍需为每个 root occurrence 递归验证完整 template DAG。官方 O2 通常为每个内联 function-expression 现场物化对应的 `DUPCLOSURE + captures`，此时遍历与实际 instruction/capture incidence 同阶；人工 chunk 可以让 `R` 个 root 共用一条深度 `N` 的 dependency DAG，使物理输入为 `O(R+N)`、验证退化为 `Θ(R×N)`。同一 root `Origin` 若有多种 owner template，component shape 也会按候选重验。关闭此项需要把 owner-independent shape proof 与 owner capture proof 分开，按 `TemplateClass` 缓存 node/group 关系，并构建压缩或持久的 alias 约束，使成本只随新出现的 `(template node, physical instr/capture edge)` incidence 增长；不能只记“某 node/instr 已见”，否则 diamond dependency 会漏检同一实例中的别名冲突。
 7. **`temp-inline` 的单个超长 argument run 已有硬预算，但极端链会保守放弃融合**：同一 block 的多个独立 callee/materialization run 已按原 statement 索引批量处理并一次压缩；单个 run 对 growing sink 做 site/rewrite 的单读 argument/materialization 候选最多处理 1024 个，超限时整包保留原 temp，零读且 discard-safe 的候选因不扫描 sink 而不计，callee 只增加固定一次扫描。人工 chunk 因而不能再无界放大这条路径，但算法仍是有界的 `Θ(min(arguments, 1024) × sink expr nodes)`，不能声称整个 pass 已线性化。关闭剩余 TODO 需要为 sink 建立一次性 substitution DAG/use-site rewrite 计划，在 output incidence 内完成验证和改写，以去掉极端链的保守上限并恢复可读性融合。
+
+## 人工可读性审计队列
+
+`cargo unit-test` 证明现有语义 oracle 与机器可读断言通过，不证明生成源码已经逐项达到人工
+可读。当前已分段复查 regression 001–318，但尚未为每个 manifest entry 的每个 dialect 产物
+形成“已优化”或“现状必要”的关闭证据；因此全量测试绿色不能作为本轮人工审计完成条件。
+
+已定位 owner、可以围绕统一安全合同继续实现的高置信主题：
+
+1. **跨分支/循环 handoff**：312。owner 是 deferred HIR carried-locals；它只能收回 immediate snapshot，不能沿 ancestry 合并到随后覆写的 carried state。
+2. **机械控制与 materialization**：03、20、34、70 的 single-pass 壳；78 的 condition-only absorption；154 的 terminal nil pack；157、294 的 repeat 条件 scratch；175 的 close 声明前死 local；178 的可观察空 boolean shell；198、199、206、209 的 Luau 大量临时链；222 的稳定 binding 吸收律；266 的无效 nil arm；267 的 generic-for 准备间隔。
+3. **函数展示策略**：02、05、07、10、11、17、29、33、38、42、52、59、81、82、83、126、134，以及 250、251、255、258、275、293、301、310、314，仍会把源码命名 local function 压成多行 IIFE。需要区分短小 capture-free 立即调用与应保留声明的多行 closure，不能全局禁止或全局强制内联。
+4. **formatter 展示**：161、163、164 的大型 constructor 固定为一项一行，229 的逻辑表达式形成超长物理行。需要独立的稳定换行策略，不在 HIR 中为排版改写语义树。
+
+仍需先补齐语义证明、不得直接按输出形状改写的候选包括 35、40、86、94、100、101、109、
+112、116、117、123、152、156、157、208、226、252、265、270、291、296、311。它们涉及
+循环入口 phi、并行 snapshot、closure identity、continue latch、构造器求值或资源作用域，应与
+上面的高置信主题分开处理。
+
+关闭本节必须逐项核对源码与当前生成产物；可安全优化的主题完成实现、负例和运行 oracle，
+不能证明安全的主题保留原因与最小反例。仅有“未再发现失败”或全量测试通过不构成关闭证据。

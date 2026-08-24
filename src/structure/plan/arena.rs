@@ -619,14 +619,14 @@ struct LoopPartitionInputs<'a> {
 
 struct LoopPartitionWorkspaces {
     exit_pad: LoopExitPadWorkspace,
-    while_break: WhileBreakArmWorkspace,
+    while_arm: WhileLexicalArmWorkspace,
 }
 
-const WHILE_BREAK_OWNED: u8 = 1 << 0;
-const WHILE_BREAK_EXCLUDED: u8 = 1 << 1;
-const WHILE_BREAK_QUEUED: u8 = 1 << 2;
+const WHILE_ARM_OWNED: u8 = 1 << 0;
+const WHILE_ARM_EXCLUDED: u8 = 1 << 1;
+const WHILE_ARM_QUEUED: u8 = 1 << 2;
 
-struct WhileBreakArmWorkspace {
+struct WhileLexicalArmWorkspace {
     block_flags: Vec<u8>,
     attempted_edges: Vec<bool>,
     visited: Vec<bool>,
@@ -638,7 +638,7 @@ struct WhileBreakArmWorkspace {
     arm_blocks: Vec<BlockRef>,
 }
 
-impl WhileBreakArmWorkspace {
+impl WhileLexicalArmWorkspace {
     fn new(block_count: usize, edge_count: usize) -> Self {
         Self {
             block_flags: vec![0; block_count],
@@ -677,13 +677,15 @@ impl WhileBreakArmWorkspace {
             .get(block.index())
             .map(|flags| flags & flag != 0)
             .ok_or_else(|| {
-                StructureError::invalid("while break-arm references a block outside the CFG arena")
+                StructureError::invalid(
+                    "while lexical arm references a block outside the CFG arena",
+                )
             })
     }
 
     fn insert(&mut self, block: BlockRef, flag: u8) -> Result<bool, StructureError> {
         let flags = self.block_flags.get_mut(block.index()).ok_or_else(|| {
-            StructureError::invalid("while break-arm references a block outside the CFG arena")
+            StructureError::invalid("while lexical arm references a block outside the CFG arena")
         })?;
         if *flags == 0 {
             self.touched_blocks.push(block);
@@ -695,7 +697,7 @@ impl WhileBreakArmWorkspace {
 
     fn remove(&mut self, block: BlockRef, flag: u8) -> Result<(), StructureError> {
         let flags = self.block_flags.get_mut(block.index()).ok_or_else(|| {
-            StructureError::invalid("while break-arm references a block outside the CFG arena")
+            StructureError::invalid("while lexical arm references a block outside the CFG arena")
         })?;
         *flags &= !flag;
         Ok(())
@@ -703,7 +705,7 @@ impl WhileBreakArmWorkspace {
 
     fn mark_attempted(&mut self, edge: EdgeRef) -> Result<bool, StructureError> {
         let attempted = self.attempted_edges.get_mut(edge.index()).ok_or_else(|| {
-            StructureError::invalid("while break-arm references an edge outside the CFG arena")
+            StructureError::invalid("while lexical arm references an edge outside the CFG arena")
         })?;
         if *attempted {
             return Ok(false);
@@ -715,7 +717,7 @@ impl WhileBreakArmWorkspace {
 
     fn visit(&mut self, block: BlockRef) -> Result<bool, StructureError> {
         let visited = self.visited.get_mut(block.index()).ok_or_else(|| {
-            StructureError::invalid("while break-arm references a block outside the CFG arena")
+            StructureError::invalid("while lexical arm references a block outside the CFG arena")
         })?;
         if *visited {
             return Ok(false);
@@ -727,7 +729,7 @@ impl WhileBreakArmWorkspace {
 
     fn is_visited(&self, block: BlockRef) -> Result<bool, StructureError> {
         self.visited.get(block.index()).copied().ok_or_else(|| {
-            StructureError::invalid("while break-arm references a block outside the CFG arena")
+            StructureError::invalid("while lexical arm references a block outside the CFG arena")
         })
     }
 }

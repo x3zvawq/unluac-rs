@@ -2,6 +2,7 @@
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-contains [[break]]
+-- unluac: expect-contains [[until false]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]

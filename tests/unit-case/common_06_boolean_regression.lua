@@ -73,7 +73,7 @@ local function test_impure_or()
 end
 
 -- common_06_boolean_regression#5: 退化guard链
-local function test_degenerate_guard()
+local function test_degenerate_guard(b)
     -- Exercises `(A or B) and C` patterns where the `and C` guard compiles to a
     -- degenerate TEST block (both CFG edges point to the same successor) because
     -- the if-then body is empty or the guard is the last condition before merge.
@@ -81,8 +81,6 @@ local function test_degenerate_guard()
     -- condition instead of silently dropping it.
 
     local a = 1
-    local b = true
-
     -- Case 1: dead temp leaves an empty body after deferred cleanup
     if (a == 1 or a == 2) and b then
         local unused = 1
@@ -103,4 +101,4 @@ test_shared_subjects()
 test_adjacent_sinks()
 test_self_assign()
 test_impure_or()
-test_degenerate_guard()
+test_degenerate_guard(true)

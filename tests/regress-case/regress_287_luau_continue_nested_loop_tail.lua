@@ -5,7 +5,8 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
-local function run(a, c, n)
+-- unluac: expect-contains [[r1_0 = r1_0 + r1_2]]
+local function run(a, c, n, inner_n)
     local x = 0
     for i = 1, n do
         if a then
@@ -15,7 +16,7 @@ local function run(a, c, n)
         else
             x = x + i
         end
-        for j = 1, 2 do
+        for j = 1, inner_n do
             x = x + j
         end
     end
@@ -24,7 +25,8 @@ end
 
 print(
     "regress_287_luau_continue_nested_loop_tail",
-    run(false, false, 3),
-    run(true, false, 3),
-    run(true, true, 3)
+    run(false, false, 3, 2),
+    run(false, false, 3, 0),
+    run(true, false, 3, 2),
+    run(true, true, 3, 2)
 )

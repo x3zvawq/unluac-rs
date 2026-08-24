@@ -1,6 +1,7 @@
 -- regress_118_luau_early_continue_nested_loop_tail#1: early-continue guard 不抢占 nested generic-for tail
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-contains [[for ]]
+-- unluac: expect-not-contains [[if p1_0 then]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
