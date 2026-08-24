@@ -15,6 +15,7 @@ mod regressions_319;
 mod regressions_320;
 mod regressions_321;
 mod regressions_322;
+mod regressions_323;
 mod unit_cases;
 
 use regressions_001_100::REGRESSION_CASES_001_100;
@@ -24,6 +25,7 @@ use regressions_319::REGRESSION_CASES_319;
 use regressions_320::REGRESSION_CASES_320;
 use regressions_321::REGRESSION_CASES_321;
 use regressions_322::REGRESSION_CASES_322;
+use regressions_323::REGRESSION_CASES_323;
 use unit_cases::UNIT_CASES;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Display, IntoStaticStr)]
@@ -325,6 +327,7 @@ pub(crate) fn regression_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {
         REGRESSION_CASES_320,
         REGRESSION_CASES_321,
         REGRESSION_CASES_322,
+        REGRESSION_CASES_323,
     ]
     .into_iter()
     .flat_map(manifest_entries)

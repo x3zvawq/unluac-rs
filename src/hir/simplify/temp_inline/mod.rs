@@ -13,12 +13,13 @@
 //! 相邻内联以可观察事件前缀而非语法子节点顺序判定：纯 local/param 读取本身不是
 //! 屏障，但读取结果形成的 temp 快照不能越过可能改写 binding 的事件；lookup、调用、
 //! 运算和 method sugar 的隐式 lookup 是屏障。while/repeat 条件还属于每轮重新求值的
-//! 独立区域，不能接收循环外快照。跨边界折叠只有三个窄合同：repeat body 尾写入与
-//! until 属于同一轮；open return 的 fixed alias 必须先于完整保留的 tail setup，根级
-//! terminal return 还可收回写入入口 nil 槽的并行 nil pack；PUC
-//! Lua 5.2–5.5 的单 upvalue table 左值可把相邻 producer 收回 key。三项仍要求唯一消费
-//! 且不绕过原求值点；前两项不允许相关 home 被跨越区间写入或 capture，table key 则
-//! 继续服从内部前缀顺序证明。
+//! 独立区域，不能接收循环外快照。跨边界折叠现在有四个窄合同：repeat body 尾写入与
+//! until 属于同一轮；open return 的 fixed alias 必须先于完整保留的 tail setup；终态
+//! fixed return 前的纯 nil 并行写可在无资源边界的 proto 内直接并入 return；PUC Lua
+//! 5.2–5.5 的单 upvalue table 左值可把相邻 producer 收回 key。四项仍要求唯一消费
+//! 且不绕过原求值点；前两项不允许相关 home 被跨越区间写入或 capture，nil pack 还
+//! 拒绝任何 `<close>`/`Close` 资源事实与 home compaction，table key 则继续服从内部
+//! 前缀顺序证明。
 //! numeric-for 前的连续 materialization run 还允许越过保留下来的状态赋值收回稳定字面量
 //! header temp；例如 `t0 = 1; t1 = 3; state = seed; for i = t0, t1` 会恢复成
 //! `state = seed; for i = 1, 3`。非字面量仍走相邻求值顺序证明，不跨状态赋值猜快照。
@@ -67,6 +68,7 @@ use self::usage::{
 use super::mention::{ReferenceCapturedBindings, stmt_writes_temp};
 use super::root_lifetimes::{CallRootLifetimeIndices, collect_call_root_lifetimes};
 use super::temp_touch::stmt_contains_nested_nonlocal_control;
+use super::visit::{HirVisitor, visit_stmts};
 
 const NESTED_INLINE_MAX_COMPLEXITY: usize = 5;
 const CONTROL_HEAD_INLINE_MAX_COMPLEXITY: usize = 5;
@@ -78,6 +80,7 @@ struct TempInlineWorkspace<'a> {
     dialect: DecompileDialect,
     readability: ReadabilityOptions,
     substantial_closure_bodies: &'a [bool],
+    has_resource_boundary: bool,
 }
 
 enum TempInlineScope {
@@ -140,6 +143,7 @@ impl<'a> TempInlineWorkspace<'a> {
         dialect: DecompileDialect,
         readability: ReadabilityOptions,
         substantial_closure_bodies: &'a [bool],
+        has_resource_boundary: bool,
     ) -> Self {
         Self {
             uses: TempUseScratch::new(proto, temp_count),
@@ -149,6 +153,7 @@ impl<'a> TempInlineWorkspace<'a> {
             dialect,
             readability,
             substantial_closure_bodies,
+            has_resource_boundary,
         }
     }
 }
@@ -209,6 +214,7 @@ fn inline_temps_in_proto_with_scope(
     substantial_closure_bodies: &[bool],
 ) -> bool {
     let temp_count = temp_count_for_proto(proto);
+    let has_resource_boundary = proto_contains_resource_boundary(proto);
     let mut workspace = TempInlineWorkspace::new(
         proto,
         temp_count,
@@ -216,6 +222,7 @@ fn inline_temps_in_proto_with_scope(
         dialect,
         readability,
         substantial_closure_bodies,
+        has_resource_boundary,
     );
     let mut live_use_counts = collect_block_temp_use_totals(&proto.body.stmts, &mut workspace.uses);
     let reference_captured = super::mention::stmts_reference_captured_bindings(&proto.body.stmts);
@@ -239,6 +246,21 @@ fn temp_count_for_proto(proto: &HirProto) -> usize {
         .map_or(0, |max_index| max_index + 1);
     let body_temp_count = max_temp_index_in_block(&proto.body).map_or(0, |max_index| max_index + 1);
     proto_temp_count.max(body_temp_count)
+}
+
+fn proto_contains_resource_boundary(proto: &HirProto) -> bool {
+    #[derive(Default)]
+    struct ResourceBoundaryProbe(bool);
+
+    impl HirVisitor for ResourceBoundaryProbe {
+        fn visit_stmt(&mut self, stmt: &HirStmt) {
+            self.0 |= matches!(stmt, HirStmt::ToBeClosed(_) | HirStmt::Close(_));
+        }
+    }
+
+    let mut probe = ResourceBoundaryProbe::default();
+    visit_stmts(&proto.body.stmts, &mut probe);
+    probe.0
 }
 
 fn inline_temps_in_block(
@@ -290,6 +312,22 @@ fn inline_temps_in_block(
             &captured_slots_before_stmt,
         )
     {
+        changed = true;
+        captured_slots_before_stmt =
+            captured_slots_before_stmts(block, facts, inherited_captured_slots);
+        call_root_indices = collect_call_root_lifetimes(&block.stmts, facts, |_| true);
+        call_root_lifetimes = call_root_indices.marked_stmts(block.stmts.len());
+    }
+
+    if inline_terminal_nil_return_pack(
+        block,
+        &workspace.uses,
+        live_use_counts,
+        facts,
+        &captured_slots_before_stmt,
+        workspace.has_resource_boundary,
+        &call_root_lifetimes,
+    ) {
         changed = true;
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
@@ -1240,6 +1278,109 @@ fn root_open_return_nil_pack_plan(
         });
     }
     None
+}
+
+/// 收回紧邻终态 fixed return 前的并行 nil 写入。
+///
+/// 这条路径与 open-tail 的 root handoff 分开：return 本身仍在原 statement 位置产生
+/// 同样宽度的 nil pack，因而没有把 nil 跨过 call/lookup 或其它求值事件。只有临时槽、
+/// 非压缩 home、无 debug/capture 且每个目标只有唯一 return 读取时才成立；带 tail 的
+/// return、局部/参数目标和任何不可信 home 继续保留原始并行写。
+fn inline_terminal_nil_return_pack(
+    block: &mut HirBlock,
+    scratch: &TempUseScratch,
+    live_use_counts: &mut [usize],
+    facts: &ProtoPromotionFacts,
+    captured_slots_before_stmt: &CapturedSlotSnapshots,
+    has_resource_boundary: bool,
+    call_root_lifetimes: &[bool],
+) -> bool {
+    if facts.compacts_home_slots() || has_resource_boundary {
+        return false;
+    }
+    let Some(return_index) = block.stmts.len().checked_sub(1) else {
+        return false;
+    };
+    let Some(assign_index) = return_index.checked_sub(1) else {
+        return false;
+    };
+    if call_root_lifetimes
+        .get(assign_index)
+        .copied()
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    let (HirStmt::Assign(assign), HirStmt::Return(ret)) =
+        (&block.stmts[assign_index], &block.stmts[return_index])
+    else {
+        return false;
+    };
+    if assign.targets.len() < 2
+        || assign.values.tail.is_some()
+        || assign.values.fixed.len() != assign.targets.len()
+        || !assign
+            .values
+            .fixed
+            .iter()
+            .all(|value| matches!(value, HirExpr::Nil))
+        || ret.values.tail.is_some()
+        || ret.values.fixed.len() != assign.targets.len()
+    {
+        return false;
+    }
+
+    let Some(targets) = assign
+        .targets
+        .iter()
+        .map(|target| match target {
+            HirLValue::Temp(temp) => Some(*temp),
+            HirLValue::Param(_)
+            | HirLValue::Local(_)
+            | HirLValue::Upvalue(_)
+            | HirLValue::Global(_)
+            | HirLValue::TableAccess(_) => None,
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    if !ret
+        .values
+        .fixed
+        .iter()
+        .zip(&targets)
+        .all(|(value, target)| matches!(value, HirExpr::TempRef(temp) if temp == target))
+    {
+        return false;
+    }
+
+    let Some(captured_slots) = captured_slots_before_stmt.get(assign_index) else {
+        return false;
+    };
+    let mut target_slots = BTreeSet::new();
+    for target in &targets {
+        let Some(slot) = facts.trusted_temp_home_slot(*target) else {
+            return false;
+        };
+        if !target_slots.insert(slot)
+            || captured_slots.contains(&slot)
+            || scratch.has_debug_local_hint(*target)
+            || total_use_count(*target, live_use_counts) != 1
+        {
+            return false;
+        }
+    }
+
+    let HirStmt::Return(ret) = &mut block.stmts[return_index] else {
+        unreachable!("validated terminal nil-pack sink must remain a return")
+    };
+    ret.values.fixed.fill(HirExpr::Nil);
+    for target in targets {
+        remove_live_use(live_use_counts, target);
+    }
+    block.stmts.remove(assign_index);
+    true
 }
 
 fn root_nil_pack_prefix_stmt_is_single_pass(stmt: &HirStmt) -> bool {
