@@ -1,4 +1,5 @@
 -- regress_134_negative_literal_power#1: 负数字面量作为幂底数必须保留括号
+-- unluac: expect-contains [[end)(]]
 -- unluac: expect-contains [[(-2) ^]]
 -- unluac: expect-contains [[(-2.5) ^]]
 local function powers(exponent)

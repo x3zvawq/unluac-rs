@@ -7,6 +7,8 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-contains [[<= 0]]
+-- unluac: expect-not-contains [[ = 0]]
 local function run_while(a, b, n)
     while n > 0 do
         n -= 1

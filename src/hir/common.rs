@@ -3,6 +3,8 @@
 //! HIR 已经进入“变量世界”，因此这里的核心职责是提供稳定的绑定身份、结构化
 //! 语句节点、保真的纯字面量以及少量受控 fallback 节点，供 AST/Readability/Naming 继续消费。
 
+use std::collections::BTreeSet;
+
 use crate::LuaString;
 use crate::parser::{ProtoLineRange, ProtoSignature};
 use crate::transformer::FastCallArgs;
@@ -26,6 +28,11 @@ pub struct HirProto {
     pub param_debug_hints: Vec<Option<String>>,
     pub locals: Vec<LocalId>,
     pub local_debug_hints: Vec<Option<String>>,
+    /// Locals materialized solely to preserve a physical GC root proven by HIR.
+    ///
+    /// AST cleanup must not turn these declarations back into bare calls: the VM stack slot
+    /// can keep the call result alive even when no HIR expression reads it.
+    pub physical_root_locals: BTreeSet<LocalId>,
     pub upvalues: Vec<UpvalueId>,
     pub upvalue_debug_hints: Vec<Option<String>>,
     pub temps: Vec<TempId>,

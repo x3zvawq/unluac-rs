@@ -296,7 +296,13 @@ impl HandoffIdentityFacts {
         target: CarryBinding,
         promotion_facts: &ProtoPromotionFacts,
     ) -> bool {
-        !self.captured.contains(&source)
+        !source
+            .local()
+            .is_some_and(|local| promotion_facts.entry_nil_writes_were_pruned(local))
+            && !target
+                .local()
+                .is_some_and(|local| promotion_facts.entry_nil_writes_were_pruned(local))
+            && !self.captured.contains(&source)
             && !self.captured.contains(&target)
             && !self.to_be_closed.contains(&source)
             && !self.to_be_closed.contains(&target)

@@ -129,7 +129,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
     PassDescriptor {
         name: "branch-pretty",
         phase: PassPhase::Normal,
-        depends_on: &[ControlFlowShape],
+        depends_on: &[ControlFlowShape, StatementAdjacency],
         invalidates: &[ControlFlowShape, StatementAdjacency],
     },
     PassDescriptor {

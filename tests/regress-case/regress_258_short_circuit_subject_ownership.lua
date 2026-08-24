@@ -1,4 +1,5 @@
 -- regress_258_short_circuit_subject_ownership#1: single-eval subject 必须保留 binding、live-out 与求值位置
+-- unluac: expect-contains [[end)()]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
 do

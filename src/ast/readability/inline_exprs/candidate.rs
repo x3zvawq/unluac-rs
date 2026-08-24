@@ -93,7 +93,7 @@ impl InlineCandidate {
         // 生命周期证据。编译器内部 for 槽已经在 Transformer 归一化时排除，因而这里
         // 可以完整保护 DebugHinted，普通 recovered alias 则继续按上下文收敛。
         match self.origin {
-            AstLocalOrigin::DebugHinted => false,
+            AstLocalOrigin::DebugHinted | AstLocalOrigin::PhysicalRoot => false,
             AstLocalOrigin::Recovered => match policy {
                 InlinePolicy::MechanicalRun => is_mechanical_run_inline_expr(expr),
                 InlinePolicy::AdjacentCallResultCallee => is_lookup_inline_expr(expr),

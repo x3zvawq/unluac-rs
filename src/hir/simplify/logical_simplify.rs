@@ -404,6 +404,9 @@ fn simplify_condition_logical_and(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExp
 }
 
 fn simplify_condition_logical_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
+    if let Some(replacement) = absorb_stable_or_guard(lhs, rhs) {
+        return Some(replacement);
+    }
     if matches!(rhs, HirExpr::Boolean(false)) {
         return Some(lhs.clone());
     }
@@ -417,4 +420,63 @@ fn simplify_condition_logical_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr
         return Some(HirExpr::Boolean(true));
     }
     None
+}
+
+/// In a condition, a stable guard repeated on the left side of a nested `or` is
+/// only an implementation detail of a shared short-circuit DAG:
+/// `x or ((x or y) and z)` and `x or (y and z)` have the same truthiness and
+/// preserve the evaluation order of `y` and `z`.  Keep this rule in the
+/// condition-only path; the two expressions do not have the same Lua value.
+fn absorb_stable_or_guard(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
+    let HirExpr::LogicalAnd(and_expr) = rhs else {
+        return None;
+    };
+    let HirExpr::LogicalOr(inner_or) = &and_expr.lhs else {
+        return None;
+    };
+    if lhs != &inner_or.lhs || !expr_is_repeatable(lhs) {
+        return None;
+    }
+
+    Some(HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+        lhs: lhs.clone(),
+        rhs: HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+            lhs: inner_or.rhs.clone(),
+            rhs: and_expr.rhs.clone(),
+        })),
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{simplify_condition_truthiness_shape, simplify_logical_shape};
+    use crate::hir::common::{HirExpr, HirLogicalExpr, ParamId};
+
+    fn param(index: usize) -> HirExpr {
+        HirExpr::ParamRef(ParamId(index))
+    }
+
+    #[test]
+    fn absorbs_stable_guard_only_in_condition_context() {
+        let a = param(0);
+        let b = param(1);
+        let c = param(2);
+        let expr = HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+            lhs: a.clone(),
+            rhs: HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+                lhs: HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+                    lhs: a.clone(),
+                    rhs: b.clone(),
+                })),
+                rhs: c.clone(),
+            })),
+        }));
+        let expected = HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+            lhs: a,
+            rhs: HirExpr::LogicalAnd(Box::new(HirLogicalExpr { lhs: b, rhs: c })),
+        }));
+
+        assert_eq!(simplify_condition_truthiness_shape(&expr), Some(expected));
+        assert_eq!(simplify_logical_shape(&expr), None);
+    }
 }

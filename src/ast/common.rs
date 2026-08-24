@@ -458,6 +458,8 @@ pub enum AstLocalAttr {
 pub enum AstLocalOrigin {
     Recovered,
     DebugHinted,
+    /// HIR proved that this recovered declaration keeps a physical VM root alive.
+    PhysicalRoot,
 }
 
 /// 全局声明属性。

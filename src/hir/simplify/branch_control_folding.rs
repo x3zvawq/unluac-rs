@@ -22,7 +22,7 @@ use crate::hir::expr_safety::expr_is_discard_safe;
 use super::carried_locals::{CarryBinding, single_binding_copy};
 use super::expr_facts::expr_truthiness;
 use super::label_refs::count_label_references;
-use super::logical_simplify::normalize_condition_context;
+use super::logical_simplify::{normalize_condition_context, simplify_condition_truthiness_shape};
 use super::visit::{HirVisitor, visit_block, visit_expr, visit_stmts};
 use super::walk::{HirRewritePass, rewrite_proto};
 
@@ -323,7 +323,11 @@ fn fold_trailing_repeat_break_condition(stmt: &mut HirStmt) -> bool {
         guard.cond
     };
     let rhs = std::mem::replace(&mut repeat_stmt.cond, HirExpr::Boolean(false));
-    repeat_stmt.cond = HirExpr::LogicalOr(Box::new(HirLogicalExpr { lhs, rhs }));
+    let folded = HirExpr::LogicalOr(Box::new(HirLogicalExpr { lhs, rhs }));
+    // branch-control synthesizes this condition after the general logical pass.  Re-run only
+    // the condition-safe normalizer here so shared stable guards are absorbed without changing
+    // Lua value semantics in ordinary expression positions.
+    repeat_stmt.cond = simplify_condition_truthiness_shape(&folded).unwrap_or(folded);
     true
 }
 

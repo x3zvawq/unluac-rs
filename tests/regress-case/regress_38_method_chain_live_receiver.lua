@@ -1,4 +1,5 @@
 -- regress_38_method_chain_live_receiver#1: method-chain sugar 不能删掉后续仍活跃的 receiver local
+-- unluac: expect-not-contains [[end)(]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-contains [[getLayoutPosition()]]
 

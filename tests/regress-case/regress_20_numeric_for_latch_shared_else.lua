@@ -4,6 +4,7 @@
 -- unluac: expect-contains [[else]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
+-- unluac: expect-not-contains [[repeat]]
 -- unluac: expect-not-contains [[unluac error]]
 local releaseBuild = true
 local last_open = {}

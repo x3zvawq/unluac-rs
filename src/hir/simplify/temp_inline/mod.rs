@@ -14,15 +14,20 @@
 //! 屏障，但读取结果形成的 temp 快照不能越过可能改写 binding 的事件；lookup、调用、
 //! 运算和 method sugar 的隐式 lookup 是屏障。while/repeat 条件还属于每轮重新求值的
 //! 独立区域，不能接收循环外快照。跨边界折叠只有三个窄合同：repeat body 尾写入与
-//! until 属于同一轮；open return 的 fixed alias 必须先于完整保留的 tail setup；PUC
+//! until 属于同一轮；open return 的 fixed alias 必须先于完整保留的 tail setup，根级
+//! terminal return 还可收回写入入口 nil 槽的并行 nil pack；PUC
 //! Lua 5.2–5.5 的单 upvalue table 左值可把相邻 producer 收回 key。三项仍要求唯一消费
 //! 且不绕过原求值点；前两项不允许相关 home 被跨越区间写入或 capture，table key 则
 //! 继续服从内部前缀顺序证明。
 //! numeric-for 前的连续 materialization run 还允许越过保留下来的状态赋值收回稳定字面量
 //! header temp；例如 `t0 = 1; t1 = 3; state = seed; for i = t0, t1` 会恢复成
 //! `state = seed; for i = 1, 3`。非字面量仍走相邻求值顺序证明，不跨状态赋值猜快照。
+//! repeat 的 frozen condition prefix 因直接 continue 被移到 body 首句时，若它是只由 latch
+//! 读取一次的稳定标量，也可直接收回条件；continue 仍抵达同一 latch，break/return 则跳过。
 //! closure 的复杂度无法代表 child proto 函数体，因此不把 closure producer 内联进 loop head；
 //! 普通 `local function iter()` 应保留为独立声明，避免生成多行匿名 iterator。
+//! 具有返回值的 call 同样按 child proto 当前 body 判断：复杂 callee 保留 producer binding，
+//! 单条简单 body 才继续内联，避免把命名函数压回赋值或 return 中的多行 IIFE。
 //! method 协议的 callee base 与隐式首参虽是两个语法 use，却只求值一次 receiver；相邻
 //! 裸 binding 或命名字段链快照可在严格匹配这对 use 后原子收回，例如
 //! `t = subject.worker; t:touch()` 会恢复成 `subject.worker:touch()`；普通点调用仍按两次读取处理。
@@ -66,11 +71,13 @@ const CONTROL_HEAD_INLINE_MAX_COMPLEXITY: usize = 5;
 // 超限只放弃可读性融合，原 temp 与求值语义保持不变。
 const CALL_MATERIALIZATION_SINK_REWRITE_BUDGET: usize = 1024;
 
-struct TempInlineWorkspace {
+struct TempInlineWorkspace<'a> {
     uses: TempUseScratch,
     order_sensitive_defs: OrderSensitiveDefWorkspace,
+    block_depth: usize,
     scope: TempInlineScope,
     dialect: DecompileDialect,
+    substantial_closure_bodies: &'a [bool],
 }
 
 enum TempInlineScope {
@@ -125,18 +132,21 @@ impl TempInlineScope {
     }
 }
 
-impl TempInlineWorkspace {
+impl<'a> TempInlineWorkspace<'a> {
     fn new(
         proto: &HirProto,
         temp_count: usize,
         scope: TempInlineScope,
         dialect: DecompileDialect,
+        substantial_closure_bodies: &'a [bool],
     ) -> Self {
         Self {
             uses: TempUseScratch::new(proto, temp_count),
             order_sensitive_defs: OrderSensitiveDefWorkspace::new(temp_count),
+            block_depth: 0,
             scope,
             dialect,
+            substantial_closure_bodies,
         }
     }
 }
@@ -146,8 +156,16 @@ pub(super) fn inline_temps_in_proto_with_facts(
     readability: ReadabilityOptions,
     facts: &ProtoPromotionFacts,
     dialect: DecompileDialect,
+    substantial_closure_bodies: &[bool],
 ) -> bool {
-    inline_temps_in_proto_with_scope(proto, readability, facts, TempInlineScope::All, dialect)
+    inline_temps_in_proto_with_scope(
+        proto,
+        readability,
+        facts,
+        TempInlineScope::All,
+        dialect,
+        substantial_closure_bodies,
+    )
 }
 
 pub(super) fn inline_exposed_branch_value_sinks_in_proto_with_facts(
@@ -176,6 +194,7 @@ pub(super) fn inline_exposed_branch_value_sinks_in_proto_with_facts(
         facts,
         TempInlineScope::BranchValueSinks(exposed),
         dialect,
+        &[],
     );
 }
 
@@ -185,9 +204,16 @@ fn inline_temps_in_proto_with_scope(
     facts: &ProtoPromotionFacts,
     scope: TempInlineScope,
     dialect: DecompileDialect,
+    substantial_closure_bodies: &[bool],
 ) -> bool {
     let temp_count = temp_count_for_proto(proto);
-    let mut workspace = TempInlineWorkspace::new(proto, temp_count, scope, dialect);
+    let mut workspace = TempInlineWorkspace::new(
+        proto,
+        temp_count,
+        scope,
+        dialect,
+        substantial_closure_bodies,
+    );
     let mut live_use_counts = collect_block_temp_use_totals(&proto.body.stmts, &mut workspace.uses);
     let reference_captured = super::mention::stmts_reference_captured_bindings(&proto.body.stmts);
     inline_temps_in_block(
@@ -214,13 +240,15 @@ fn temp_count_for_proto(proto: &HirProto) -> usize {
 
 fn inline_temps_in_block(
     block: &mut HirBlock,
-    workspace: &mut TempInlineWorkspace,
+    workspace: &mut TempInlineWorkspace<'_>,
     live_use_counts: &mut [usize],
     reference_captured: &ReferenceCapturedBindings,
     readability: ReadabilityOptions,
     facts: &ProtoPromotionFacts,
     inherited_captured_slots: &BTreeSet<HomeSlotKey>,
 ) -> bool {
+    let is_proto_root = workspace.block_depth == 0;
+    workspace.block_depth += 1;
     let mut changed = false;
     let mut call_root_lifetimes =
         collect_call_root_lifetimes(&block.stmts, facts, |_| true).marked_stmts(block.stmts.len());
@@ -248,6 +276,22 @@ fn inline_temps_in_block(
         }
         let stmt = &block.stmts[index];
         facts.collect_captured_home_slots_in_stmt(stmt, &mut active_captured_slots);
+    }
+
+    if is_proto_root
+        && inline_root_open_return_nil_pack(
+            block,
+            &workspace.uses,
+            live_use_counts,
+            facts,
+            &captured_slots_before_stmt,
+        )
+    {
+        changed = true;
+        captured_slots_before_stmt =
+            captured_slots_before_stmts(block, facts, inherited_captured_slots);
+        call_root_lifetimes = collect_call_root_lifetimes(&block.stmts, facts, |_| true)
+            .marked_stmts(block.stmts.len());
     }
 
     if inline_materialization_runs(
@@ -324,6 +368,12 @@ fn inline_temps_in_block(
                 reference_captured,
                 workspace.dialect,
             )
+            && !substantial_result_closure_prefers_binding(
+                site,
+                value,
+                next_stmt,
+                workspace.substantial_closure_bodies,
+            )
             && site.allows(value, readability)
         {
             let next_stmt = kept_rev
@@ -359,7 +409,49 @@ fn inline_temps_in_block(
     kept_rev.reverse();
     block.stmts = kept_rev;
 
+    workspace.block_depth -= 1;
     changed
+}
+
+fn substantial_result_closure_prefers_binding(
+    site: InlineSite,
+    value: &HirExpr,
+    sink: &HirStmt,
+    substantial_closure_bodies: &[bool],
+) -> bool {
+    let HirExpr::Closure(closure) = value else {
+        return false;
+    };
+    site.is_call_callee()
+        && matches!(
+            sink,
+            HirStmt::Assign(_) | HirStmt::LocalDecl(_) | HirStmt::Return(_)
+        )
+        && substantial_closure_bodies
+            .get(closure.proto.index())
+            .copied()
+            .unwrap_or(true)
+}
+
+pub(super) fn proto_body_prefers_named_callee(body: &HirBlock) -> bool {
+    let stmts = match body.stmts.last() {
+        Some(HirStmt::Return(ret)) if ret.values.fixed.is_empty() && ret.values.tail.is_none() => {
+            &body.stmts[..body.stmts.len() - 1]
+        }
+        _ => body.stmts.as_slice(),
+    };
+    stmts.len() > 1
+        || matches!(
+            stmts.first(),
+            Some(
+                HirStmt::If(_)
+                    | HirStmt::While(_)
+                    | HirStmt::Repeat(_)
+                    | HirStmt::NumericFor(_)
+                    | HirStmt::GenericFor(_)
+                    | HirStmt::Block(_)
+            )
+        )
 }
 
 fn inline_crosses_evaluation_boundary(
@@ -488,7 +580,7 @@ fn stmt_stores_temp_in_table(stmt: &HirStmt, temp: TempId) -> bool {
 
 fn inline_materialization_runs(
     block: &mut HirBlock,
-    workspace: &mut TempInlineWorkspace,
+    workspace: &mut TempInlineWorkspace<'_>,
     live_use_counts: &mut [usize],
     facts: &ProtoPromotionFacts,
     captured_slots_before_stmt: &CapturedSlotSnapshots,
@@ -502,6 +594,7 @@ fn inline_materialization_runs(
         order_sensitive_defs,
         scope,
         dialect,
+        ..
     } = workspace;
     order_sensitive_defs.rebuild(&block.stmts);
     let mut removed_stmts = vec![false; block.stmts.len()];
@@ -715,6 +808,183 @@ fn inline_materialization_runs(
         });
     }
     changed
+}
+
+struct RootOpenReturnNilPackPlan {
+    assignment_index: usize,
+    fixed_start: usize,
+    targets: Vec<TempId>,
+}
+
+fn inline_root_open_return_nil_pack(
+    block: &mut HirBlock,
+    scratch: &TempUseScratch,
+    live_use_counts: &mut [usize],
+    facts: &ProtoPromotionFacts,
+    captured_slots_before_stmt: &CapturedSlotSnapshots,
+) -> bool {
+    let Some(plan) = root_open_return_nil_pack_plan(
+        block,
+        scratch,
+        live_use_counts,
+        facts,
+        captured_slots_before_stmt,
+    ) else {
+        return false;
+    };
+
+    let return_index = block.stmts.len() - 1;
+    let HirStmt::Return(ret) = &mut block.stmts[return_index] else {
+        unreachable!("validated terminal nil-pack sink must remain a return")
+    };
+    ret.values.fixed[plan.fixed_start..plan.fixed_start + plan.targets.len()].fill(HirExpr::Nil);
+    for target in plan.targets {
+        remove_live_use(live_use_counts, target);
+    }
+    block.stmts.remove(plan.assignment_index);
+    true
+}
+
+fn root_open_return_nil_pack_plan(
+    block: &HirBlock,
+    scratch: &TempUseScratch,
+    live_use_counts: &[usize],
+    facts: &ProtoPromotionFacts,
+    captured_slots_before_stmt: &CapturedSlotSnapshots,
+) -> Option<RootOpenReturnNilPackPlan> {
+    if facts.compacts_home_slots() {
+        return None;
+    }
+    let return_index = block.stmts.len().checked_sub(1)?;
+    let HirStmt::Return(ret) = &block.stmts[return_index] else {
+        return None;
+    };
+    let tail = ret.values.tail.as_ref()?;
+    if tail.exact_width().is_some() || !matches!(tail.as_expr(), HirExpr::Call(_)) {
+        return None;
+    }
+    let captured_slots = captured_slots_before_stmt.get(return_index)?;
+
+    for assignment_index in (0..return_index).rev() {
+        let HirStmt::Assign(assign) = &block.stmts[assignment_index] else {
+            continue;
+        };
+        if assign.targets.len() < 2
+            || assign.values.tail.is_some()
+            || assign.values.fixed.len() != assign.targets.len()
+            || !assign
+                .values
+                .fixed
+                .iter()
+                .all(|value| matches!(value, HirExpr::Nil))
+            || !block.stmts[..assignment_index]
+                .iter()
+                .all(root_nil_pack_prefix_stmt_is_single_pass)
+        {
+            continue;
+        }
+        let Some(targets) = assign
+            .targets
+            .iter()
+            .map(|target| match target {
+                HirLValue::Temp(temp) => Some(*temp),
+                HirLValue::Param(_)
+                | HirLValue::Local(_)
+                | HirLValue::Upvalue(_)
+                | HirLValue::Global(_)
+                | HirLValue::TableAccess(_) => None,
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let fixed_start = ret.values.fixed.windows(targets.len()).position(|window| {
+            window
+                .iter()
+                .zip(&targets)
+                .all(|(value, target)| matches!(value, HirExpr::TempRef(temp) if temp == target))
+        });
+        let Some(fixed_start) = fixed_start else {
+            continue;
+        };
+
+        let mut target_slots = BTreeSet::new();
+        if targets.iter().any(|target| {
+            !facts.overwrites_entry_nil(*target)
+                || total_use_count(*target, live_use_counts) != 1
+                || scratch.has_debug_local_hint(*target)
+                || facts
+                    .trusted_temp_home_slot(*target)
+                    .is_none_or(|slot| captured_slots.contains(&slot) || !target_slots.insert(slot))
+        }) || !block.stmts[assignment_index + 1..return_index]
+            .iter()
+            .all(|stmt| root_nil_pack_gap_preserves_slots(stmt, &target_slots, facts))
+        {
+            continue;
+        }
+
+        return Some(RootOpenReturnNilPackPlan {
+            assignment_index,
+            fixed_start,
+            targets,
+        });
+    }
+    None
+}
+
+fn root_nil_pack_prefix_stmt_is_single_pass(stmt: &HirStmt) -> bool {
+    matches!(
+        stmt,
+        HirStmt::LocalDecl(_)
+            | HirStmt::Assign(_)
+            | HirStmt::TableSetList(_)
+            | HirStmt::CallStmt(_)
+    )
+}
+
+fn root_nil_pack_gap_preserves_slots(
+    stmt: &HirStmt,
+    protected: &BTreeSet<HomeSlotKey>,
+    facts: &ProtoPromotionFacts,
+) -> bool {
+    match stmt {
+        HirStmt::Assign(assign) => assign.targets.iter().all(|target| {
+            direct_lvalue_home_slot(target, facts)
+                .is_some_and(|slot| slot.is_none_or(|slot| !protected.contains(&slot)))
+        }),
+        HirStmt::LocalDecl(local_decl) => local_decl.bindings.iter().all(|local| {
+            facts
+                .trusted_local_home_slot(*local)
+                .is_some_and(|slot| !protected.contains(&slot))
+        }),
+        HirStmt::TableSetList(_) | HirStmt::CallStmt(_) => true,
+        HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::Return(_)
+        | HirStmt::If(_)
+        | HirStmt::While(_)
+        | HirStmt::Repeat(_)
+        | HirStmt::NumericFor(_)
+        | HirStmt::GenericFor(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_)
+        | HirStmt::Block(_) => false,
+    }
+}
+
+fn direct_lvalue_home_slot(
+    target: &HirLValue,
+    facts: &ProtoPromotionFacts,
+) -> Option<Option<HomeSlotKey>> {
+    match target {
+        HirLValue::Param(param) => facts.trusted_param_home_slot(*param).map(Some),
+        HirLValue::Temp(temp) => facts.trusted_temp_home_slot(*temp).map(Some),
+        HirLValue::Local(local) => facts.trusted_local_home_slot(*local).map(Some),
+        HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => Some(None),
+    }
 }
 
 fn inline_numeric_for_stable_header_aliases(
@@ -964,7 +1234,7 @@ fn collect_block_temp_use_totals(stmts: &[HirStmt], scratch: &mut TempUseScratch
 
 fn inline_temps_in_nested_blocks(
     stmt: &mut HirStmt,
-    workspace: &mut TempInlineWorkspace,
+    workspace: &mut TempInlineWorkspace<'_>,
     live_use_counts: &mut [usize],
     reference_captured: &ReferenceCapturedBindings,
     readability: ReadabilityOptions,
@@ -1010,6 +1280,14 @@ fn inline_temps_in_nested_blocks(
                 workspace,
                 live_use_counts,
                 reference_captured,
+                readability,
+                facts,
+                inherited_captured_slots,
+            );
+            changed |= inline_repeat_head_scalar_temp(
+                repeat_stmt,
+                &mut workspace.uses,
+                live_use_counts,
                 readability,
                 facts,
                 inherited_captured_slots,
@@ -1065,6 +1343,67 @@ fn inline_temps_in_nested_blocks(
         | HirStmt::Goto(_)
         | HirStmt::Label(_) => false,
     }
+}
+
+fn inline_repeat_head_scalar_temp(
+    repeat_stmt: &mut crate::hir::common::HirRepeat,
+    scratch: &mut TempUseScratch,
+    live_use_counts: &mut [usize],
+    readability: ReadabilityOptions,
+    facts: &ProtoPromotionFacts,
+    inherited_captured_slots: &BTreeSet<HomeSlotKey>,
+) -> bool {
+    let Some((temp, value)) = repeat_stmt.body.stmts.first().and_then(inline_candidate) else {
+        return false;
+    };
+    if facts.compacts_home_slots()
+        || !facts.is_repeat_condition_prefix_temp(temp)
+        || facts.trusted_temp_home_slot(temp).is_none()
+        || !is_repeat_header_rootless_scalar(value)
+        || scratch.has_debug_local_hint(temp)
+        || total_use_count(temp, live_use_counts) != 1
+        || collect_expr_temp_uses_summary(&repeat_stmt.cond, scratch).count(temp) != 1
+    {
+        return false;
+    }
+    let Some(site) = inline_site_in_repeat_condition(&repeat_stmt.cond, temp) else {
+        return false;
+    };
+    if !site.allows(value, readability) {
+        return false;
+    }
+
+    let mut captured_slots = inherited_captured_slots.clone();
+    for stmt in &repeat_stmt.body.stmts[1..] {
+        if collect_stmt_temp_uses(stmt, scratch).count(temp) != 0
+            || stmt_writes_temp(stmt, temp)
+            || stmt_contains_nested_nonlocal_control(stmt)
+        {
+            return false;
+        }
+        facts.collect_captured_home_slots_in_stmt(stmt, &mut captured_slots);
+    }
+    if temp_rebinds_captured_slot(temp, facts, &captured_slots) {
+        return false;
+    }
+
+    let value = value.clone();
+    rewrite::replace_temp_in_expr(&mut repeat_stmt.cond, temp, &value);
+    repeat_stmt.body.stmts.remove(0);
+    remove_live_use(live_use_counts, temp);
+    true
+}
+
+fn is_repeat_header_rootless_scalar(expr: &HirExpr) -> bool {
+    matches!(
+        expr,
+        HirExpr::Nil
+            | HirExpr::Boolean(_)
+            | HirExpr::Integer(_)
+            | HirExpr::Number(_)
+            | HirExpr::Int64(_)
+            | HirExpr::UInt64(_)
+    )
 }
 
 fn inline_repeat_tail_temp(

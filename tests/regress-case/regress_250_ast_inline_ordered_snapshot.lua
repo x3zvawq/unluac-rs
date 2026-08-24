@@ -1,4 +1,5 @@
 -- regress_250_ast_inline_ordered_snapshot: binding alias 保留定义点的值快照
+-- unluac: expect-not-contains [[end)(]]
 
 local state = 1
 

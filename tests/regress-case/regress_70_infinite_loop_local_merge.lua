@@ -4,6 +4,7 @@
 -- unluac: expect-contains [[r0_0 = screen_pressed()]]
 -- unluac: expect-not-contains [[goto]]
 -- unluac: expect-not-contains [[::L]]
+-- unluac: expect-not-contains [[repeat]]
 -- unluac: expect-not-contains [[unluac error]]
 
 local last_pressed = false

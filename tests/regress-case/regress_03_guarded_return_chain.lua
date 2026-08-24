@@ -1,3 +1,4 @@
+-- unluac: expect-not-contains [[repeat]]
 local frame = {}
 
 function guarded_return_chain(kind, key)

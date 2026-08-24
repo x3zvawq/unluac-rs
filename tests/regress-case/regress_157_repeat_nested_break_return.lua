@@ -4,6 +4,7 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
+-- unluac: expect-not-contains [[ = 4]]
 local function run(a, b, c, d)
     local i = 0
     repeat

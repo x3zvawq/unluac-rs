@@ -1,4 +1,5 @@
 -- regress_255_header_retry_terminal_state#1: direct sibling latch 保留 header-retry state
+-- unluac: expect-not-contains [[end)(]]
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]

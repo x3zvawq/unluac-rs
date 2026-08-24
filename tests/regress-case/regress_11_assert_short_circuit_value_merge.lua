@@ -1,4 +1,5 @@
 -- regress_11_assert_short_circuit_value_merge#1: assert 参数里的布尔短路值合流不应退化成嵌套 if 壳
+-- unluac: expect-not-contains [[end)(]]
 -- unluac: expect-not-contains [[if ]]
 -- unluac: expect-not-contains [[ = assert]]
 -- unluac: expect-contains [[ and ]]

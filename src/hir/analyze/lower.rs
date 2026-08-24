@@ -303,6 +303,7 @@ fn lower_proto_node(
         param_debug_hints: lowering.bindings.param_debug_hints.clone(),
         locals: lowering.bindings.locals.clone(),
         local_debug_hints: lowering.bindings.local_debug_hints.clone(),
+        physical_root_locals: BTreeSet::new(),
         upvalues: lowering.bindings.upvalues.clone(),
         upvalue_debug_hints: lowering.bindings.upvalue_debug_hints.clone(),
         temps: lowering.bindings.temps.clone(),
@@ -317,6 +318,7 @@ fn lower_proto_node(
         structure.plan(),
         &slot_epochs,
         &lowering.bindings.fixed_temps,
+        &lowering.bindings.phi_temps,
     );
 
     Ok(LoweredProtoResult {
@@ -638,6 +640,7 @@ fn build_composite_factory_proto(
         param_debug_hints: Vec::new(),
         locals: (0..plan.nodes.len()).map(LocalId).collect(),
         local_debug_hints: vec![None; plan.nodes.len()],
+        physical_root_locals: BTreeSet::new(),
         upvalues: (0..plan.outer_captures.len()).map(UpvalueId).collect(),
         upvalue_debug_hints: vec![None; plan.outer_captures.len()],
         temps: Vec::new(),

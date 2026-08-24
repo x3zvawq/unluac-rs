@@ -1,4 +1,5 @@
 -- regress_78_adjacent_loop_state_handoff#1: adjacent loops share the first loop exit state
+-- unluac: expect-contains [[p1_2[r1_0] then]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]

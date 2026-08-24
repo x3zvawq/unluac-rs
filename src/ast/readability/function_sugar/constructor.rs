@@ -14,6 +14,7 @@
 
 use super::super::binding_flow::BindingUseIndex;
 use super::super::binding_ref::{binding_from_name_ref, name_matches_binding};
+use super::super::installer_iife::function_expr_is_substantial;
 use crate::ast::common::{
     AstAssign, AstBindingRef, AstExpr, AstFieldAccess, AstFunctionExpr, AstFunctionName, AstLValue,
     AstLocalAttr, AstLocalDecl, AstReturn, AstStmt, AstTableField, AstTableKey,
@@ -79,6 +80,14 @@ pub(super) fn try_inline_terminal_constructor_call(
     stmt_base: usize,
 ) -> Option<(AstStmt, usize)> {
     let (callee_binding, callee_expr) = single_local_alias_decl(stmts.first()?)?;
+    // This rule exists to remove constructor scaffolding, not to turn a readable named function
+    // back into a multiline result-position IIFE. Short callees still benefit from the compact
+    // terminal form.
+    if let AstExpr::FunctionExpr(function) = callee_expr
+        && function_expr_is_substantial(function)
+    {
+        return None;
+    }
     let mut consumed = 1usize;
     let mut arg_locals = Vec::<ConstructorArg>::new();
 

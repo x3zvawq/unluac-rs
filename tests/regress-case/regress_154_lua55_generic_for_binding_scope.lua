@@ -4,6 +4,8 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
+-- unluac: expect-contains [[, nil, nil, ]]
+-- unluac: expect-not-contains [[ = nil, nil]]
 local function iter(values)
     local index = 0
     local function next_value()

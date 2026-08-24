@@ -242,6 +242,15 @@ pub(super) fn simplify_hir(
             let before_snapshots = capture_hir_snapshots_if_requested(module, dump_config, name);
 
             let changed = timings.record(name, || {
+                if index == 5 {
+                    return apply_temp_inline_pass(
+                        module,
+                        readability,
+                        promotion_facts,
+                        &empty_facts,
+                        dialect,
+                    );
+                }
                 apply_proto_pass(module, |proto| {
                     let facts = promotion_facts
                         .get_mut(proto.id.index())
@@ -258,12 +267,7 @@ pub(super) fn simplify_hir(
                                 proto,
                             )
                         }
-                        5 => temp_inline::inline_temps_in_proto_with_facts(
-                            proto,
-                            readability,
-                            facts,
-                            dialect,
-                        ),
+                        5 => unreachable!("temp-inline needs child proto body facts"),
                         6 => {
                             generic_for_iterators::fold_generic_for_iterators_in_proto(proto, facts)
                         }
@@ -311,6 +315,37 @@ pub(super) fn simplify_hir(
         ));
     }
     Ok(())
+}
+
+fn apply_temp_inline_pass(
+    module: &mut HirModule,
+    readability: ReadabilityOptions,
+    promotion_facts: &[ProtoPromotionFacts],
+    empty_facts: &ProtoPromotionFacts,
+    dialect: crate::ast::DecompileDialect,
+) -> bool {
+    // HIR proto ids are allocated parent-first. Walk the flat arena backwards so every direct
+    // child has already reached its current temp-inline shape before the parent decides whether
+    // a one-use closure is substantial enough to keep as a named callee. Unknown/backward refs
+    // stay conservative (`true`) instead of being inlined on incomplete body evidence.
+    let mut substantial_closure_bodies = vec![true; module.protos.len()];
+    let mut changed = false;
+    for proto_index in (0..module.protos.len()).rev() {
+        let proto_id = module.protos[proto_index].id.index();
+        let facts = promotion_facts.get(proto_id).unwrap_or(empty_facts);
+        let proto = &mut module.protos[proto_index];
+        changed |= temp_inline::inline_temps_in_proto_with_facts(
+            proto,
+            readability,
+            facts,
+            dialect,
+            &substantial_closure_bodies,
+        );
+        if let Some(slot) = substantial_closure_bodies.get_mut(proto_id) {
+            *slot = temp_inline::proto_body_prefers_named_callee(&proto.body);
+        }
+    }
+    changed
 }
 
 #[cfg(feature = "decompile-debug")]

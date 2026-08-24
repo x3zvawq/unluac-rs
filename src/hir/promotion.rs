@@ -22,7 +22,8 @@ use crate::hir::common::{
     HirBlock, HirExpr, HirLValue, HirStmt, HirTableField, HirTableKey, LocalId, ParamId, TempId,
 };
 use crate::structure::{
-    BlockRef, Cfg, DataflowFacts, GraphFacts, PhiId, PhiIncomingDisposition, SsaValue,
+    BlockRef, CanonicalMoveIndex, Cfg, DataflowFacts, DefId, GraphFacts,
+    LoopConditionPrefixPlacement, LoopVmProtocol, PhiId, PhiIncomingDisposition, SsaValue,
     StructurePlan,
 };
 use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto, Reg};
@@ -257,6 +258,12 @@ enum HomeSlotResolution {
 #[derive(Debug, Clone, Default)]
 pub(super) struct ProtoPromotionFacts {
     temp_home_slots: Vec<Option<HomeSlotKey>>,
+    immediate_move_write_homes: Vec<BTreeSet<HomeSlotKey>>,
+    entry_nil_overwrite_temps: BTreeSet<TempId>,
+    entry_nil_phi_temps: BTreeSet<TempId>,
+    entry_nil_phi_locals: BTreeSet<LocalId>,
+    entry_nil_pruned_locals: BTreeSet<LocalId>,
+    repeat_condition_prefix_temps: BTreeSet<TempId>,
     direct_table_seed_temps: BTreeSet<TempId>,
     direct_table_seed_locals: BTreeSet<LocalId>,
     local_home_slots: Vec<HomeSlotResolution>,
@@ -274,15 +281,38 @@ impl ProtoPromotionFacts {
         plan: &StructurePlan,
         slot_epochs: &SlotEpochFacts,
         fixed_temps: &[TempId],
+        phi_temps: &[TempId],
     ) -> Self {
         let total_temps = dataflow.defs.len() + plan.phis().len();
         let mut temp_home_slots = vec![None; total_temps];
 
         fill_fixed_def_home_slots(dataflow, slot_epochs, &mut temp_home_slots);
         fill_phi_home_slots(dataflow, plan, &mut temp_home_slots);
+        let immediate_move_write_homes = collect_immediate_move_write_homes(
+            proto,
+            dataflow,
+            slot_epochs,
+            fixed_temps,
+            phi_temps,
+            total_temps,
+        );
 
         Self {
             temp_home_slots,
+            immediate_move_write_homes,
+            entry_nil_overwrite_temps: collect_entry_nil_overwrite_temps(
+                proto,
+                dataflow,
+                fixed_temps,
+            ),
+            entry_nil_phi_temps: collect_entry_nil_phi_temps(proto, dataflow, plan, phi_temps),
+            entry_nil_phi_locals: BTreeSet::new(),
+            entry_nil_pruned_locals: BTreeSet::new(),
+            repeat_condition_prefix_temps: collect_repeat_condition_prefix_temps(
+                dataflow,
+                plan,
+                fixed_temps,
+            ),
             direct_table_seed_temps: collect_direct_table_seed_temps(proto, dataflow, fixed_temps),
             direct_table_seed_locals: BTreeSet::new(),
             local_home_slots: Vec::new(),
@@ -295,6 +325,38 @@ impl ProtoPromotionFacts {
 
     pub(super) fn is_direct_table_seed_temp(&self, temp: TempId) -> bool {
         self.direct_table_seed_temps.contains(&temp)
+    }
+
+    /// 该 temp 是非参数槽的首个 canonical fixed def；槽在函数入口因此必为 nil。
+    ///
+    /// 这不证明 def 只执行一次。消费方仍须把候选限制在 proto 根级单次执行区间，
+    /// 不能把同一静态 def 在循环下一轮面对的旧值误当成入口 nil。
+    pub(super) fn overwrites_entry_nil(&self, temp: TempId) -> bool {
+        self.entry_nil_overwrite_temps.contains(&temp)
+    }
+
+    /// 该 local 来自仍含同槽 `Entry(nil)` incoming 的 direct region-result phi。
+    pub(super) fn is_entry_nil_phi_local(&self, local: LocalId) -> bool {
+        self.entry_nil_phi_locals.contains(&local)
+    }
+
+    pub(super) fn record_entry_nil_phi_promotion(&mut self, temp: TempId, local: LocalId) {
+        if self.entry_nil_phi_temps.contains(&temp) {
+            self.entry_nil_phi_locals.insert(local);
+        }
+    }
+
+    pub(super) fn mark_entry_nil_writes_pruned(&mut self, local: LocalId) {
+        self.entry_nil_pruned_locals.insert(local);
+    }
+
+    pub(super) fn entry_nil_writes_were_pruned(&self, local: LocalId) -> bool {
+        self.entry_nil_pruned_locals.contains(&local)
+    }
+
+    /// Structure 已冻结为 repeat condition prefix、但为 continue 语义移到 body 前的 temp。
+    pub(super) fn is_repeat_condition_prefix_temp(&self, temp: TempId) -> bool {
+        self.repeat_condition_prefix_temps.contains(&temp)
     }
 
     pub(super) fn is_direct_table_seed_local(&self, local: LocalId) -> bool {
@@ -368,6 +430,20 @@ impl ProtoPromotionFacts {
             .flatten()
     }
 
+    /// Returns physical homes written by an immediately following transparent MOVE chain.
+    ///
+    /// This is intentionally separate from `home_slot`: a compiler MOVE can be elided from HIR
+    /// while its adjacent destination write remains observable through GC root lifetime. A MOVE
+    /// separated from its producer is excluded because HIR no longer retains its exact timing.
+    pub(super) fn trusted_immediate_move_write_homes(
+        &self,
+        temp: TempId,
+    ) -> Option<&BTreeSet<HomeSlotKey>> {
+        (!self.temp_home_was_invalidated(temp))
+            .then(|| self.immediate_move_write_homes.get(temp.index()))
+            .flatten()
+    }
+
     pub(super) fn param_home_was_invalidated(&self, param: ParamId) -> bool {
         self.invalidated_param_homes.contains(&param)
     }
@@ -387,6 +463,7 @@ impl ProtoPromotionFacts {
     pub(super) fn invalidate_local_home(&mut self, local: LocalId) {
         self.invalidated_local_homes.insert(local);
         self.direct_table_seed_locals.remove(&local);
+        self.entry_nil_phi_locals.remove(&local);
     }
 
     pub(super) fn invalidate_temp_home(&mut self, temp: TempId) {
@@ -720,6 +797,164 @@ fn fill_fixed_def_home_slots(
         let epoch = slot_epochs.epoch_at(def.reg, def.instr);
         temp_home_slots[def.id.index()] = Some(HomeSlotKey::new(def.reg.index(), epoch));
     }
+}
+
+fn collect_immediate_move_write_homes(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    slot_epochs: &SlotEpochFacts,
+    fixed_temps: &[TempId],
+    phi_temps: &[TempId],
+    total_temps: usize,
+) -> Vec<BTreeSet<HomeSlotKey>> {
+    let mut homes = vec![BTreeSet::new(); total_temps];
+    let mut canonical_moves = CanonicalMoveIndex::new(proto, dataflow);
+    let mut last_instr_by_root = std::collections::BTreeMap::<SsaValue, (usize, BlockRef)>::new();
+
+    for (instr_index, def_ids) in dataflow.instr_defs.iter().enumerate() {
+        for def_id in def_ids {
+            let Some(def) = dataflow.defs.get(def_id.index()) else {
+                continue;
+            };
+            let value = SsaValue::Def(*def_id);
+            let Ok(root) = canonical_moves.resolve(value) else {
+                continue;
+            };
+
+            if root == value {
+                // Start a chain only at a real definition. A later MOVE is accepted only when
+                // it is the next low instruction in the same basic block.
+                last_instr_by_root.insert(root, (instr_index, def.block));
+                continue;
+            }
+
+            let Some(crate::transformer::LowInstr::Move(move_)) = proto.instrs.get(instr_index)
+            else {
+                continue;
+            };
+            if move_.dst != def.reg {
+                continue;
+            }
+            let Some((last_instr, last_block)) = last_instr_by_root.get(&root).copied() else {
+                continue;
+            };
+            if last_block != def.block || last_instr.checked_add(1) != Some(instr_index) {
+                continue;
+            }
+
+            let Some(temp) = (match root {
+                SsaValue::Def(source) => fixed_temps.get(source.index()).copied(),
+                SsaValue::Phi(source) => phi_temps.get(source.index()).copied(),
+                SsaValue::Entry(_) => None,
+            }) else {
+                continue;
+            };
+            let epoch = slot_epochs.epoch_at(def.reg, def.instr);
+            if let Some(temp_homes) = homes.get_mut(temp.index()) {
+                temp_homes.insert(HomeSlotKey::new(def.reg.index(), epoch));
+            }
+            last_instr_by_root.insert(root, (instr_index, def.block));
+        }
+    }
+    homes
+}
+
+fn collect_entry_nil_overwrite_temps(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    fixed_temps: &[TempId],
+) -> BTreeSet<TempId> {
+    let param_count = usize::from(proto.signature.num_params);
+    let vararg_param_reg = proto.signature.has_vararg_param_reg.then_some(param_count);
+    let mut first_defs = vec![None::<DefId>; usize::from(proto.frame.max_stack_size)];
+
+    for def in &dataflow.defs {
+        let slot = def.reg.index();
+        if slot < param_count || Some(slot) == vararg_param_reg {
+            continue;
+        }
+        let Some(first) = first_defs.get_mut(slot) else {
+            continue;
+        };
+        if first.is_none_or(|current| dataflow.def_instr(current).index() > def.instr.index()) {
+            *first = Some(def.id);
+        }
+    }
+
+    first_defs
+        .into_iter()
+        .flatten()
+        .filter_map(|def| {
+            let direct = TempId(def.index());
+            (fixed_temps.get(def.index()) == Some(&direct)).then_some(direct)
+        })
+        .collect()
+}
+
+fn collect_entry_nil_phi_temps(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    plan: &StructurePlan,
+    phi_temps: &[TempId],
+) -> BTreeSet<TempId> {
+    let param_count = usize::from(proto.signature.num_params);
+    let vararg_param_reg = proto.signature.has_vararg_param_reg.then_some(param_count);
+    let direct_offset = dataflow.defs.len();
+
+    plan.phis()
+        .filter_map(|phi| {
+            let slot = phi.reg.index();
+            if slot < param_count || Some(slot) == vararg_param_reg {
+                return None;
+            }
+            let direct = TempId(direct_offset + phi.phi.index());
+            (phi_temps.get(phi.phi.index()) == Some(&direct)
+                && phi.incomings.iter().any(|incoming| {
+                    incoming.value == SsaValue::Entry(phi.reg)
+                        && matches!(
+                            incoming.disposition,
+                            PhiIncomingDisposition::RegionResult(_)
+                        )
+                }))
+            .then_some(direct)
+        })
+        .collect()
+}
+
+fn collect_repeat_condition_prefix_temps(
+    dataflow: &DataflowFacts,
+    plan: &StructurePlan,
+    fixed_temps: &[TempId],
+) -> BTreeSet<TempId> {
+    let condition_headers = plan
+        .loops()
+        .filter_map(|(loop_id, _)| match plan.loop_protocol(loop_id) {
+            Some(LoopVmProtocol::Repeat(protocol))
+                if protocol.prefix_placement == LoopConditionPrefixPlacement::BeforeBody =>
+            {
+                plan.condition(protocol.condition.condition)
+                    .and_then(|condition| condition.header())
+            }
+            Some(
+                LoopVmProtocol::While(_)
+                | LoopVmProtocol::Repeat(_)
+                | LoopVmProtocol::WhileTrue
+                | LoopVmProtocol::NumericFor(_)
+                | LoopVmProtocol::GenericFor(_),
+            )
+            | None => None,
+        })
+        .collect::<BTreeSet<_>>();
+
+    dataflow
+        .defs
+        .iter()
+        .filter(|def| condition_headers.contains(&def.block))
+        .filter_map(|def| {
+            let direct = TempId(def.id.index());
+            (fixed_temps.get(def.id.index()) == Some(&direct)).then_some(direct)
+        })
+        .collect()
 }
 
 fn collect_direct_table_seed_temps(

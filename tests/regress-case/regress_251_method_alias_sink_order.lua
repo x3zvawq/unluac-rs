@@ -1,4 +1,5 @@
 -- regress_251_method_alias_sink_order: method alias 不跨外层 callee 或循环边界
+-- unluac: expect-not-contains [[end)(]]
 
 local obj = {}
 local wrap

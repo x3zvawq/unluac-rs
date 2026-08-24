@@ -1,4 +1,5 @@
 -- unluac: expect-contains [[-0x8000000000000000]]
+-- unluac: expect-not-contains [[end)(]]
 -- unluac: expect-contains [[return r1_0, math.type(r1_0)]]
 -- unluac: expect-not-contains [[local r1_1 = r1_0]]
 local function run()

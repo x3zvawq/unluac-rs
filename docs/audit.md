@@ -1,7 +1,8 @@
 # 审计问题与交接清单
 
 > 更新时间：2026-08-22
-> 基线：`main@ba7d2d1`（本轮 AST IIFE 主题提交前）
+> 审计起点：`main@ce3ad8e`（本轮 observable condition carrier 复核前）
+> 当前复核：`main@2698c81`（physical call-root lifetime 主题已收口）
 > 本文只记录尚未解决且已经取证的问题、明确风险和已确认的设计决定；完成项立即删除。
 
 ## 不应回退的决定
@@ -26,7 +27,21 @@
 7. **`temp-inline` 的单个超长 argument run 已有硬预算，但极端链会保守放弃融合**：同一 block 的多个独立 callee/materialization run 已按原 statement 索引批量处理并一次压缩；单个 run 对 growing sink 做 site/rewrite 的单读 argument/materialization 候选最多处理 1024 个，超限时整包保留原 temp，零读且 discard-safe 的候选因不扫描 sink 而不计，callee 只增加固定一次扫描。人工 chunk 因而不能再无界放大这条路径，但算法仍是有界的 `Θ(min(arguments, 1024) × sink expr nodes)`，不能声称整个 pass 已线性化。关闭剩余 TODO 需要为 sink 建立一次性 substitution DAG/use-site rewrite 计划，在 output incidence 内完成验证和改写，以去掉极端链的保守上限并恢复可读性融合。
 8. **table-constructor 的 SETLIST carrier 仍有明确 residual 边界**：已有 local/temp 的 `Assign` producer、跨 producer 的 open `SETLIST`、尾部 handoff、exact-width pack，以及无法证明多值求值顺序的区域都保留原 HIR 节点；不能在 AST 阶段静默拆成普通 table assignment，因为 raw SETLIST 的 `__newindex`、nil hole、open pack 和分配时点均可能不同。当前放行三类窄路径：canonical `NewTable` 后紧邻、同 binding 的 fixed data-only batch；保留 `LocalDecl` seed 原位、在完整 prefix proof 下把 fixed batch 改成 indexed writes；以及 seed 原位保持、prefix/producer/eval-order 全部通过的极窄 LocalDecl open-tail 路径。所有路径都保留 seed 分配点，拒绝 nil/不确定数组形状、控制流、跨 block、producer `Assign`、debug/capture 资源身份和外部 mention；raw temp 不进入 generic open 路径。联合数组形状检查还拒绝“seed 尾部可能为 nil、后续 SETLIST 追加确定值”的跨语句折叠（`lua54_01_close#15`），避免把 `t[1] = nil; t[2] = 1` 改成 `{ nil, 1 }`。源码 `LocalDecl` 的 indexed proof 可覆盖已经证明连续的数组前缀（`start <= seed_array_len + 1`），但不能跳过未知或可能为 nil 的洞。当前仍会 fail-fast 的 HIR carrier 只有 `common_07`（全方言）、`common_10`（仅 Luau）、`regress_30`（Lua 5.1）和 `regress_33`（Lua 5.1）；它们涉及多返回/复杂表、open tail 或复杂调用，后续必须在 HIR 建立完整 producer/eval-order/GC proof 后再处理，不应为通过形状断言恢复旧 defer/handoff。
 
-本轮完整矩阵（`cargo unit-test --suite all --recompile-rounds 1 --jobs 8`）为 `1220/1248` entries、`1623/1623` protos。10 个 decompile failure 正是上述 carrier residual 的 strict fail-fast；没有回编译或运行语义失败。另有 18 个首轮 readability assertion failure，主要集中在 `regress_11`、`regress_12`、`regress_08`、`regress_09`、`regress_235`、`regress_305` 和 `regress_313`；它们是 owner/GC/inline 保守门造成的源码形状差异，后续 round 的负向合同仍通过，不应通过放宽 producer/handoff 身份门来“修复”。
+本轮完整矩阵（`cargo unit-test --suite all --recompile-rounds 1 --jobs 8`）为 `1220/1248` entries、`1629/1629` protos，`timed_out=0`。10 个 decompile failure 正是上述 carrier residual 的 strict fail-fast；没有回编译或运行语义失败：
+
+- `common_07_return_and_multiret`：Lua 5.1/5.2/5.3/5.4/5.5、LuaJIT、Luau（7 个）仍有 residual `table-set-list`。
+- `common_10_tables`：Luau 仍有 residual `table-set-list`。
+- `regress_30_table_setlist_nested_producer`、`regress_33_table_setlist_binary_producer`：Lua 5.1 仍有 residual `table-set-list`。
+
+另有 18 个首轮 readability assertion failure，均是源码形状差异而非运行失败：
+
+- `regress_11_assert_short_circuit_value_merge`：Lua 5.2/5.3/5.4/5.5、Luau O0/O1/O2（7 个）仍保留 `local r = assert(...)`。
+- `regress_08_global_table_install_readability`、`regress_09_mechanical_call_and_for_inline`、`regress_12_loop_break_shared_continuation`：各有 1 个 Lua 5.1 形状断言未满足。
+- `regress_235_table_constructor_eval_ownership`：LuaJIT 仍保留分步 `cross_seed` 初始化。
+- `regress_305_temp_inline_independent_runs`：Luau O0 仍保留 `local r = assert(...)`。
+- `regress_313_branch_value_terminal_sink`：Lua 5.1/5.2/5.3/5.4/5.5、LuaJIT（6 个）仍保留 `local r = assert(...)`。
+
+这些失败均已归档到下方 residual/可读性队列；不应通过放宽 producer、handoff、global lookup 或 root-lifetime 身份门来“修复”。
 
 本轮关闭一个窄的 AST 展示子题：对“已恢复的单值调用结果紧接着被同一 binding 的直接写入覆盖”的形状，cleanup pass 将调用保留在原求值位置，并把 surviving value 作为后置 local 声明。该规则拒绝 debug/带属性 binding、多目标或间接 lvalue，以及调用或 replacement 再引用该 binding 的情况；它只关闭 `regress_252` 的机械外壳，不代表该案例涉及的 branch/value proof 已完成。`regress_252` 的 7 个方言、round-1 重编译和 Rust 负例测试均通过。
 
@@ -35,6 +50,56 @@
 global、method、param/upvalue 根以及会捕获根 binding 的函数保留声明语法，避免 implicit-self、
 词法 owner 或 debug 身份变化。`regress_37`、`regress_65`、`regress_165` 定向用例和全量
 原型回归均通过；这只是 Generate 的等价表面选择，不替代 HIR 的 owner/eval-order 证明。
+
+本轮关闭 266 的无效 `Entry(nil)` arm：promotion 传递 canonical region-result phi provenance，
+`locals` 只对无身份敏感、同槽且结构化可证明的 nil 写做路径状态裁剪；allocation-root 轨道
+同时保留 direct table escape 后的物理 GC root，直到同一 alias 链的 nil 覆盖。回归包含
+“先写非 nil 再清空”的负例，以及弱表 + 两次 `collectgarbage` 的运行时 oracle，并通过首轮与
+round-1 重编译。
+
+本轮补齐 call-result 的物理槽边界：显式 GC 栅栏会保留仍占据 trusted home 的未读结果，
+canonical MOVE 只有在同一 basic block 内紧随 producer 时才可作为跨槽覆盖证据；中间隔着
+语句的 MOVE 不再被提前到 CALL 位置。`lua54_01_close#18` 覆盖未读结果到栅栏的存活，
+`#19` 覆盖不同槽独立调用，`#20` 覆盖延后 MOVE 的时点负例；Lua 5.4/5.5 首轮与
+round-1 重编译均通过。
+
+本轮关闭 267 的 for 可见 binding 写回缺口：HIR 降低阶段把 numeric/generic-for body 中
+可见的 loop binding 直接映射为同一 local lvalue，保留臂内对 `i`、`key`、`value` 的显式
+覆盖，不再让 dead-temp 清理误删真实写入。Lua 5.1–5.4、LuaJIT、Luau 的生成产物均保留
+这些写回，首轮与 round-1 回编译及运行 oracle 通过；该样例不是 generic-for 准备间隔主题。
+
+本轮关闭 175 的 close 声明前死 local：AST build 现在把 `Assign(temp..., close_temp) +
+ToBeClosed(close_temp)` 识别为一条完整的多 binding `<close>` 声明，整组 temp 都不再被
+根块预先 hoist。生成结果恢复为单条 `local plain, resource <close> = ...`，不改变值包求值、
+词法作用域或关闭时点；Lua 5.4/5.5 的首轮与 round-1 回归通过。
+
+本轮关闭 198、199、206、209 的临时链队列：198 的短独立 IIFE 按正向合同保留，避免把
+大量调用重新物化成长生命周期 local；199 的 `local-scope-limit` 携带外层活跃 local 预算，
+用有限 `do` 块分段释放嵌套 block；206 的 stripped Luau 只在无 debug 身份时按 trusted
+home slot 复用稳定 local；209 的 HIR method bridge 保留固定参数前缀并把 open tail 留给
+末位调用。对应方言产物均无诊断源码，首轮与 round-1 回编译及运行 oracle 通过；这些不再
+属于“Luau 大量临时链”未解决项。
+
+本轮关闭 222 的稳定 binding 吸收律：branch-control 在合成 repeat 尾条件后，针对条件上下文
+再次应用一条严格的 truthiness 规则，把 `x or ((x or y) and z)` 收成 `x or (y and z)`；
+重复 guard 必须是 `expr_is_repeatable` 的同一 binding，普通值表达式不会走这条规则，`y/z`
+的原求值顺序也不改变。222 的 Lua 5.1–5.5、LuaJIT 六个入口及 round-1 回编译、运行 oracle
+均通过，生成结果保留 `repeat` 且无 goto、unresolved 或诊断；逻辑简化模块另有值上下文负例
+单测，防止把仅在条件中成立的吸收律外溢。
+
+本轮关闭 312 的跨块 direct snapshot：carried-locals verifier 以 `Unproduced/Pending/Synced`
+状态逐路径验证 result 是否已被当前 state 精确承接，禁止沿后续覆写或 ancestry 继续合并；
+因此 `result = carried` 仍在递增前保留为独立快照，`stop=true` 与正常退出分别返回 `nil` 和
+`1`。Lua 5.1–5.5、LuaJIT 六个入口及 round-1 回编译、运行 oracle 全部通过，生成代码无
+诊断或错误控制边；该规则不再属于未收敛的 handoff 队列。
+
+本轮关闭 `regress_35` 的多入口 while 状态审计：StructurePlan 明确记录了 branch-entry 的
+共同初值、loop header 的 self/backedge phi，以及 break 后的 result phi。带 debug 元数据时，
+`count2/index3` 是进入 loop 的 edge snapshot，不是可按词法名字直接删除的临时变量；把它们
+强行并回 `count/index` 会丢失多入口快照与 source-debug binding 身份。strip 输入则满足无捕获、
+无 debug、共同 `(reg, epoch)` 的 coalescing 合同，现有 lowering 已生成直接更新 `count/index`
+的形状。Lua 5.1 入口的首轮与 round-1 回编译、两条运行 oracle 均通过，故该项保留为按
+debug/strip 分层的必要残差，不再把“少一个 loop local”作为待实现优化。
 
 剩余 18 个 readability 断言已按生成形状复核，当前属于必要的保守残留而不是失败语义：
 `regress_11`、`regress_305`、`regress_313` 的 `local r = assert` 快照不能在没有全局环境
@@ -61,15 +126,38 @@ AST `installer-iife` 现把独立调用语句中包含多条语句或复合控�
 `do` 作用域内的 `local function + call`，保持 closure 创建、参数求值和调用顺序，并让新增
 binding 在原调用点后立即失活。该规则关闭 02、05、07、17、29、126、275；短独立 IIFE
 （166）与表达式内短 IIFE（198）由正向断言保留。81、82、83 复核后确认当前产物本来已经是
-普通 `local function`，也补了负向断言并移出历史队列。剩余 IIFE 均位于 return、参数、赋值
-或其它嵌套表达式，不能复用独立语句的作用域证明。
+普通 `local function`，也补了负向断言并移出历史队列。
 
-1. **跨分支/循环 handoff**：312。owner 是 deferred HIR carried-locals；它只能收回 immediate snapshot，不能沿 ancestry 合并到随后覆写的 carried state。
-2. **机械控制与 materialization**：03、20、34、70 的 single-pass 壳；78 的 condition-only absorption；154 的 terminal nil pack；157、294 的 repeat 条件 scratch；175 的 close 声明前死 local；178 的可观察空 boolean shell；198、199、206、209 的 Luau 大量临时链；222 的稳定 binding 吸收律；266 的无效 nil arm；267 的 generic-for 准备间隔。
-3. **函数展示策略**：10、11、33、38、42、52、59、134，以及 250、251、255、258、293、301、310、314，仍会把源码命名 local function 压成表达式位置的多行 IIFE。需要按 return、参数、赋值等 sink 分别证明 closure 创建与外围求值顺序，不能把独立调用语句的 `do` 作用域规则直接扩到表达式内部。
+具有返回值的 closure callee 现由 HIR `temp-inline` 按 child-first body 事实决定是否保留
+producer binding：去掉机械空 return 后包含多条语句或复合控制流的 child 不再内联进
+assign/local-decl/return call。AST `function-sugar` 的 terminal-constructor 规则复用同一阈值，
+不会在稍后又把复杂 callee 连同 constructor 参数吞回表达式。该合同关闭 10、11、38、42、
+52、59、250、251、255、293、301、310，并由 `end)(` 负向断言锁定；134、258 的单条简单
+body 由正向断言保留短 IIFE。314 在 PUC Lua 5.2–5.5 只包一条为 deferred lvalue base/key
+顺序服务的写入，也不扩大为命名函数；33 的剩余 strict failure 属于上面的 SETLIST carrier，
+不再重复列入函数展示队列。
 
-仍需先补齐语义证明、不得直接按输出形状改写的候选包括 35、40、86、94、100、101、109、
-112、116、117、123、152、156、157、208、226、252、265、270、291、296、311。它们涉及
+AST `branch-pretty` 现会在控制流和相邻语句都收敛后，把恒真 single-pass fence 收回普通
+`if/else`：只允许一个 arm 接管线性后缀，后缀不复制；两个 arm 都可能 fallthrough、直接
+local 作用域会被延长、`do` 内仍有 fence break，或出现 continue/goto/label 时均保留 repeat。
+嵌套真实循环的 break 也不参与候选。该规则关闭 03、20、34、70，并由四个 AST 单测与
+Lua 5.1 round-1 回编译锁定；HIR 仍保留 synthetic repeat 来保证无标签 break 的 owner。
+
+78 与 178 的空条件壳复核后确认是必要的 effect carrier，不是可继续删除的机械控制：
+78 的两个 break 动作虽然相同，中间的 `xs[x]` 仍可能触发 `__index` 或错误；178 则明确用
+global/table lookup 和比较元方法计数验证每次条件求值。Lua 只有调用能独立成为表达式语句，
+其它动态 predicate 若删除空 if 就会丢求值，改成临时 local 又会引入新的 root 生命周期。
+现有 HIR `branch-control` 因而只删除 discard-safe 条件，并把 effect-only call 收成调用语句；
+78 新增表读取正向断言，178 继续由 global shell 断言和运行 oracle 锁定。
+
+157 与 294 的 Luau repeat 条件 scratch 已按 frozen condition owner 收敛：Structure 在存在
+直接 continue 时把 latch header 的纯常量 prefix 放到 HIR body 首部，`temp-inline` 只消费
+这个 plan 标记、canonical、trusted-home 且唯一由当前 repeat condition 使用的标量 temp。
+普通 body producer、lookup/call、capture/debug、coalesced state 与任意层 goto/label 都不能
+进入这条规则；定向首轮与 round-1 回编译覆盖 7 个 157 方言和 3 个 294 Luau 优化级别。
+
+仍需先补齐语义证明、不得直接按输出形状改写的候选包括 40、86、94、100、101、109、
+112、116、117、123、152、156、208、226、252、265、270、291、296、311。它们涉及
 循环入口 phi、并行 snapshot、closure identity、continue latch、构造器求值或资源作用域，应与
 上面的高置信主题分开处理。
 

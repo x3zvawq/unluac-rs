@@ -46,6 +46,7 @@ pub(super) fn coalesce_param_aliases_in_proto(
         .is_some_and(|(local, param)| local == param);
     let rest = &proto.body.stmts[alias.consumed..];
     if promotion_facts.compacts_home_slots()
+        || promotion_facts.entry_nil_writes_were_pruned(alias.local)
         || !shares_exact_home
         || rest
             .iter()

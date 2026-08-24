@@ -4,6 +4,8 @@
 //! 避免主分析流程被 `Assign/If/Goto/Label` 之类的机械拼装淹没。这样后续如果我们要
 //! 调整 fallback 形态或者 debug 展示格式，只需要收敛修改这些公共入口。
 
+use std::collections::BTreeSet;
+
 use crate::hir::common::{
     HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirExpr, HirGoto, HirIf, HirLValue,
     HirLabelId, HirProto, HirProtoRef, HirReturn, HirStmt, HirUnresolvedExpr, HirValuePack,
@@ -99,6 +101,7 @@ pub(super) fn empty_proto(id: HirProtoRef) -> HirProto {
         param_debug_hints: Vec::new(),
         locals: Vec::new(),
         local_debug_hints: Vec::new(),
+        physical_root_locals: BTreeSet::new(),
         upvalues: Vec::new(),
         upvalue_debug_hints: Vec::new(),
         temps: Vec::new(),

@@ -421,6 +421,95 @@ local function test_unused_call_result_root_lifetime()
     print("lua54_01_close#17", before_clear, after_clear)
 end
 
+-- lua54_01_close#18: 未读取的local call结果仍保持到作用域结束
+local function test_unread_call_root_until_scope_end()
+    local finalized = 0
+    local function make_gc_value()
+        return setmetatable({}, {
+            __gc = function()
+                finalized = finalized + 1
+            end,
+        })
+    end
+
+    local function observe()
+        local old = make_gc_value()
+        local values = { 1, 2, 3, 4, 5, 6, 7, 8 }
+        collectgarbage("collect")
+        return finalized, #values
+    end
+
+    local before, length = observe()
+    assert(before == 0)
+    assert(length == 8)
+    print("lua54_01_close#18", before, length)
+end
+
+-- lua54_01_close#19: 不同槽的独立call不能冒充旧root的覆盖写
+local function test_independent_call_does_not_overwrite_old_root()
+    local finalized = 0
+    local function make_gc_value()
+        return setmetatable({}, {
+            __gc = function()
+                finalized = finalized + 1
+            end,
+        })
+    end
+    local function replacement()
+        return "replacement"
+    end
+
+    local function observe()
+        local old = make_gc_value()
+        assert(old ~= nil)
+        local table_value = {}
+        local current = replacement()
+        table_value.field = current
+        collectgarbage("collect")
+        local before_clear = finalized
+        old = nil
+        collectgarbage("collect")
+        return before_clear, finalized, table_value.field
+    end
+
+    local before_clear, after_clear, field = observe()
+    assert(before_clear == 0)
+    assert(after_clear == 1)
+    assert(field == "replacement")
+    print("lua54_01_close#19", before_clear, after_clear, field)
+end
+
+-- lua54_01_close#20: 非紧邻MOVE不能把旧root的覆盖提前到call
+local function test_delayed_move_does_not_overwrite_at_call()
+    local finalized = 0
+    local function make_gc_value()
+        return setmetatable({}, {
+            __gc = function()
+                finalized = finalized + 1
+            end,
+        })
+    end
+    local function replacement()
+        return "replacement"
+    end
+
+    local function observe()
+        local old = make_gc_value()
+        assert(old ~= nil)
+        local current = replacement()
+        collectgarbage("collect")
+        local before_overwrite = finalized
+        old = current
+        collectgarbage("collect")
+        return before_overwrite, finalized, old
+    end
+
+    local before_overwrite, after_overwrite, value = observe()
+    assert(before_overwrite == 0)
+    assert(after_overwrite == 1)
+    assert(value == "replacement")
+    print("lua54_01_close#20", before_overwrite, after_overwrite, value)
+end
 
 test_tbc_basic()
 test_tbc_multi_exit()
@@ -439,3 +528,6 @@ test_constructor_independent_producer_root()
 test_fixed_setlist_combined_nil_shape()
 test_constructor_alias_root_lifetime()
 test_unused_call_result_root_lifetime()
+test_unread_call_root_until_scope_end()
+test_independent_call_does_not_overwrite_old_root()
+test_delayed_move_does_not_overwrite_at_call()

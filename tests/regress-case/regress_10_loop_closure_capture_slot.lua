@@ -1,4 +1,5 @@
 -- regress_10_loop_closure_capture_slot#1: 循环内被 closure capture 的局部槽位不能和 closure 结果槽位混成同一绑定
+-- unluac: expect-not-contains [[end)(]]
 local function build()
     local list = {}
     local i = 1

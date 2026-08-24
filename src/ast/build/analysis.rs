@@ -249,11 +249,33 @@ fn collect_referenced_temps_in_target(
 }
 
 fn collect_close_temps_in_block(block: &HirBlock, temps: &mut BTreeSet<TempId>) {
-    for stmt in &block.stmts {
+    for (index, stmt) in block.stmts.iter().enumerate() {
         match stmt {
             HirStmt::ToBeClosed(to_be_closed) => {
                 if let HirExpr::TempRef(temp) = &to_be_closed.value {
                     temps.insert(*temp);
+                    // `try_lower_temp_close_decl` consumes the preceding exact assignment as
+                    // one local declaration. Keep every binding in that pair out of the root
+                    // hoist; hoisting a plain sibling first creates a duplicate shadowing local
+                    // before the `<close>` declaration.
+                    if let Some(HirStmt::Assign(assign)) = index
+                        .checked_sub(1)
+                        .and_then(|previous| block.stmts.get(previous))
+                    {
+                        let exact_pair = assign.values.exact_result_len()
+                            == Some(assign.targets.len())
+                            && assign.targets.last() == Some(&HirLValue::Temp(*temp))
+                            && assign
+                                .targets
+                                .iter()
+                                .all(|target| matches!(target, HirLValue::Temp(_)));
+                        if exact_pair {
+                            temps.extend(assign.targets.iter().filter_map(|target| match target {
+                                HirLValue::Temp(temp) => Some(*temp),
+                                _ => None,
+                            }));
+                        }
+                    }
                 }
             }
             HirStmt::If(if_stmt) => {

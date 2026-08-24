@@ -1,4 +1,5 @@
 -- regress_301_numeric_for_mutated_binding_capture: 赋值后的for binding捕获不能回读header phi
+-- unluac: expect-not-contains [[end)(]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
 local globals = {}

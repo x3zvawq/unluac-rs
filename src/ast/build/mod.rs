@@ -526,7 +526,9 @@ impl<'a> AstLowerer<'a> {
         attr: AstLocalAttr,
     ) -> AstLocalBinding {
         let proto = &self.module.protos[proto_index];
-        let origin = if proto
+        let origin = if proto.physical_root_locals.contains(&binding) {
+            AstLocalOrigin::PhysicalRoot
+        } else if proto
             .local_debug_hints
             .get(binding.index())
             .is_some_and(|hint| hint.is_some())

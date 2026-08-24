@@ -111,7 +111,7 @@ fn rewrite_installer_iife_stmt(
     }
 }
 
-fn function_expr_is_substantial(function: &AstFunctionExpr) -> bool {
+pub(super) fn function_expr_is_substantial(function: &AstFunctionExpr) -> bool {
     let body_stmts = substantive_function_body_stmts(function);
     body_stmts.len() > 1
         || matches!(

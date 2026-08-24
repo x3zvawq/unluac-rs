@@ -1,6 +1,7 @@
 -- regress_34_short_circuit_exit_jump_pad#1: short-circuit 出口的空 jump pad 应随条件一起消费
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
+-- unluac: expect-not-contains [[repeat]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-contains [[p1_0:add("button")]]
 -- unluac: expect-not-contains [[local r1_1 = p1_0]]

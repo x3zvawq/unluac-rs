@@ -1,4 +1,5 @@
 -- regress_293_puc_nested_repeat_break_live_out: nested repeat的条件写回与early break共同决定live-out
+-- unluac: expect-not-contains [[end)(]]
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-contains [[break]]

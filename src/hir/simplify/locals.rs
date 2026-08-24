@@ -34,6 +34,7 @@
 //! 含引用 capture 的 temp 组若不能证明同槽，则保持 temp，避免丢失 capture cell 身份。
 //!
 mod branch_merge;
+mod entry_nil;
 mod param_alias;
 mod rewrite;
 
@@ -45,7 +46,7 @@ use std::{
 use super::mention::{
     stmts_reference_captured_bindings, stmts_to_be_closed_temps, stmts_value_captured_bindings,
 };
-use super::root_lifetimes::collect_call_root_lifetimes;
+use super::root_lifetimes::{collect_call_root_lifetimes, collect_gc_fence_indices};
 use super::temp_touch::{
     TempRefScopeTracker, TempTouchIndex, collect_temp_reads_by_stmt, collect_temp_refs_by_stmt,
     collect_temp_refs_in_expr, expr_touches_any_temp, stmt_consumes_temps_only_in_control_head,
@@ -70,6 +71,7 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     let mut next_local_index = proto.locals.len();
     let mut new_locals = Vec::new();
     let mut new_local_debug_hints = Vec::new();
+    let mut physical_root_locals = BTreeSet::new();
     let mut promoted_bindings = Vec::new();
     let mut direct_seed_promotions = Vec::new();
     let mut debug_scope_locals = BTreeMap::new();
@@ -84,6 +86,7 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
             next_local_index: &mut next_local_index,
             new_locals: &mut new_locals,
             new_local_debug_hints: &mut new_local_debug_hints,
+            physical_root_locals: &mut physical_root_locals,
             promoted_bindings: &mut promoted_bindings,
             direct_seed_promotions: &mut direct_seed_promotions,
             identity_sensitive_temps: &identity_sensitive_temps,
@@ -104,6 +107,9 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
             facts.record_local_home_slot(local, home_slot);
         }
     }
+    for (temp, local) in promoted_bindings.iter().copied() {
+        facts.record_entry_nil_phi_promotion(temp, local);
+    }
     for (temp, local) in direct_seed_promotions {
         facts.record_direct_table_seed_promotion(temp, local);
     }
@@ -112,8 +118,10 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     }
     proto.locals.extend(new_locals);
     proto.local_debug_hints.extend(new_local_debug_hints);
+    proto.physical_root_locals.extend(physical_root_locals);
+    let entry_nil_changed = entry_nil::prune_redundant_entry_nil_writes(proto, facts);
     let alias_changed = param_alias::coalesce_param_aliases_in_proto(proto, facts);
-    result.changed || alias_changed
+    result.changed || entry_nil_changed || alias_changed
 }
 
 fn hir_block_local_pressure(block: &HirBlock) -> usize {
@@ -186,6 +194,7 @@ struct PromotionCtx<'a> {
     next_local_index: &'a mut usize,
     new_locals: &'a mut Vec<LocalId>,
     new_local_debug_hints: &'a mut Vec<Option<String>>,
+    physical_root_locals: &'a mut BTreeSet<LocalId>,
     promoted_bindings: &'a mut Vec<(TempId, LocalId)>,
     direct_seed_promotions: &'a mut Vec<(TempId, LocalId)>,
     identity_sensitive_temps: &'a BTreeSet<TempId>,
@@ -293,6 +302,8 @@ fn promote_block_with_child_protection(
     outer_uses_temp: &dyn Fn(TempId) -> bool,
     child_protected_temps: &BTreeSet<TempId>,
 ) -> PromotionResult {
+    record_gc_fenced_local_roots(block, ctx.physical_root_locals);
+
     // 递归进入子作用域时，把当前语句之后仍被外层引用的 temp 传给子 block。
     // tracker 用引用计数维护后缀集合，避免为每个 index 克隆一份成长中的 BTreeSet。
     let stmt_temp_refs = collect_temp_refs_by_stmt(&block.stmts);
@@ -403,6 +414,48 @@ fn promote_block_with_child_protection(
     }
 }
 
+fn record_gc_fenced_local_roots(block: &HirBlock, roots: &mut BTreeSet<LocalId>) {
+    let mut active = BTreeSet::new();
+    let fences = collect_gc_fence_indices(&block.stmts);
+    for (index, stmt) in block.stmts.iter().enumerate() {
+        if fences.contains(&index) {
+            // Binding liveness may end after an earlier read, but the VM slot remains a root
+            // until overwritten or until the lexical scope ends.
+            roots.extend(active.iter().copied());
+        }
+
+        match stmt {
+            HirStmt::Assign(assign) => {
+                for target in &assign.targets {
+                    if let HirLValue::Local(local) = target {
+                        active.remove(local);
+                    }
+                }
+                if let ([HirLValue::Local(local)], [HirExpr::Call(_)], None) = (
+                    assign.targets.as_slice(),
+                    assign.values.fixed.as_slice(),
+                    &assign.values.tail,
+                ) {
+                    active.insert(*local);
+                }
+            }
+            HirStmt::LocalDecl(decl) => {
+                for local in &decl.bindings {
+                    active.remove(local);
+                }
+                if let ([local], [HirExpr::Call(_)], None) = (
+                    decl.bindings.as_slice(),
+                    decl.values.fixed.as_slice(),
+                    &decl.values.tail,
+                ) {
+                    active.insert(*local);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn collect_plans(
     ctx: &mut PromotionCtx<'_>,
     block: &HirBlock,
@@ -494,7 +547,9 @@ fn collect_plans(
             debug_scope_for_temp_group(temp_debug_scopes, &group)
                 .and_then(|scope| ctx.debug_scope_locals.get(&(slot, scope)).copied())
         });
-        let preceding_call_root = call_root_lifetimes.root_for_overwrite(decl_index);
+        let preceding_call_root = call_root_lifetimes
+            .root_for_overwrite(decl_index)
+            .or_else(|| call_root_lifetimes.root_for_protected(decl_index));
         let preceding_call_root_local =
             preceding_call_root.and_then(|root| call_root_locals.get(&root).copied());
         let force_call_root_local =
@@ -596,6 +651,11 @@ fn collect_plans(
             call_root_locals.insert(decl_index, selected_local);
         }
     }
+
+    // The AST cleanup pass cannot infer physical-slot lifetime from ordinary binding mentions.
+    // Carry the proven root identity across the HIR -> AST boundary explicitly.
+    ctx.physical_root_locals
+        .extend(call_root_locals.values().copied());
 
     let mut sticky_slots = inherited_sticky_slots.clone();
     for (decl_index, stmt) in block.stmts.iter().enumerate() {
