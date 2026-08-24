@@ -47,6 +47,17 @@
   改变求值顺序；LuaJIT 的 `debug.setlocal` 可实际改写 caller slot，当前 HIR 没有 raw-length
   producer 与 debug/opaque-write 排除事实，故不在 AST 增加特判。只有新增通用 HIR 事实或真实
   错误复现后才重新立项。
+- `tmp/test/01_alias_and_sugar.lua` / `regress_322_alias_and_sugar`：该样例的安全部分已经
+  收敛为 `p.first .. " " .. p.last`、记录式 table constructor 和直接的局部函数声明；
+  stripped 输出中的 `r0_*` 只是没有 debug 名时的默认 `debug-like` 命名，可用
+  `--naming-mode heuristic` 改善观感，但不属于语义 pass。剩余顶层顺序为
+  `r0_3:add(2)`、`r0_6:add(3)`、`r0_7.value_text`、`r0_6(...)`：`r0_5 = print` 必须在
+  method chain 前捕获全局快照，`r0_4 = display_name(r0_2)` 不能跨过该快照移动，且首个
+  call-result 在后续 field lookup 写回同一 home 前是 HIR `PhysicalRoot`。折成
+  `r0_3:add(2):add(3):value_text()` 会在 field lookup 前释放首个结果，可能改变弱表、
+  `__gc`/自动 GC 或 lookup metamethod 的观察；构造器中的 `add = function` 与源码
+  `function box:add` 在 Lua 5.1 bytecode 中没有可区分的来源事实。该形状因此归档为已有
+  readability/HIR root 合同与 bytecode non-uniqueness residual，不新增 AST 特判。
 
 ## 审计规则
 
