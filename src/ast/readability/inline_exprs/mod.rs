@@ -601,6 +601,7 @@ mod tests {
                     call: AstCallKind::Call(Box::new(AstCallExpr {
                         callee: AstExpr::Var(binding.to_name_ref()),
                         args: Vec::new(),
+                        method_name: None,
                     })),
                 })),
                 AstStmt::Assign(Box::new(AstAssign {
@@ -641,6 +642,7 @@ mod tests {
                         call: AstCallKind::Call(Box::new(AstCallExpr {
                             callee: AstExpr::Var(binding.to_name_ref()),
                             args: vec![AstExpr::Boolean(true)],
+                            method_name: None,
                         })),
                     })),
                 ],
@@ -784,6 +786,7 @@ mod tests {
                 text: "fallback".to_owned(),
             })),
             args: Vec::new(),
+            method_name: None,
         }));
         let logical = AstExpr::LogicalOr(Box::new(AstLogicalExpr {
             lhs: AstExpr::Var(binding.to_name_ref()),

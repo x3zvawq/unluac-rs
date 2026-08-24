@@ -62,7 +62,8 @@ fn rewrite_block(
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut index = 0;
     while index < old_stmts.len() {
-        if let Some((stmt, consumed)) = try_inline_terminal_constructor_fields(&old_stmts[index..])
+        if let Some((stmt, consumed)) =
+            try_inline_terminal_constructor_fields(&old_stmts[index..], method_fields)
         {
             new_stmts.push(stmt);
             changed = true;
@@ -151,11 +152,11 @@ fn rewrite_nested(
             if let Some(else_block) = &mut if_stmt.else_block {
                 changed |= rewrite_block(else_block, target, method_fields, mutable_snapshots);
             }
-            changed |= rewrite_function_exprs_in_expr(&mut if_stmt.cond, target);
+            changed |= rewrite_function_exprs_in_expr(&mut if_stmt.cond, target, method_fields);
             changed
         }
         AstStmt::While(while_stmt) => {
-            rewrite_function_exprs_in_expr(&mut while_stmt.cond, target)
+            rewrite_function_exprs_in_expr(&mut while_stmt.cond, target, method_fields)
                 | rewrite_block(
                     &mut while_stmt.body,
                     target,
@@ -169,12 +170,14 @@ fn rewrite_nested(
                 target,
                 method_fields,
                 mutable_snapshots,
-            ) | rewrite_function_exprs_in_expr(&mut repeat_stmt.cond, target)
+            ) | rewrite_function_exprs_in_expr(&mut repeat_stmt.cond, target, method_fields)
         }
         AstStmt::NumericFor(numeric_for) => {
-            let mut changed = rewrite_function_exprs_in_expr(&mut numeric_for.start, target);
-            changed |= rewrite_function_exprs_in_expr(&mut numeric_for.limit, target);
-            changed |= rewrite_function_exprs_in_expr(&mut numeric_for.step, target);
+            let mut changed =
+                rewrite_function_exprs_in_expr(&mut numeric_for.start, target, method_fields);
+            changed |=
+                rewrite_function_exprs_in_expr(&mut numeric_for.limit, target, method_fields);
+            changed |= rewrite_function_exprs_in_expr(&mut numeric_for.step, target, method_fields);
             changed |= rewrite_block(
                 &mut numeric_for.body,
                 target,
@@ -186,7 +189,7 @@ fn rewrite_nested(
         AstStmt::GenericFor(generic_for) => {
             let mut changed = false;
             for expr in &mut generic_for.iterator {
-                changed |= rewrite_function_exprs_in_expr(expr, target);
+                changed |= rewrite_function_exprs_in_expr(expr, target, method_fields);
             }
             changed |= rewrite_block(
                 &mut generic_for.body,
@@ -198,40 +201,42 @@ fn rewrite_nested(
         }
         AstStmt::DoBlock(block) => rewrite_block(block, target, method_fields, mutable_snapshots),
         AstStmt::FunctionDecl(function_decl) => {
-            rewrite_function_expr(&mut function_decl.func, target)
+            rewrite_function_expr(&mut function_decl.func, target, method_fields)
         }
         AstStmt::LocalFunctionDecl(local_function_decl) => {
-            rewrite_function_expr(&mut local_function_decl.func, target)
+            rewrite_function_expr(&mut local_function_decl.func, target, method_fields)
         }
         AstStmt::LocalDecl(local_decl) => {
             let mut changed = false;
             for value in &mut local_decl.values {
-                changed |= rewrite_function_exprs_in_expr(value, target);
+                changed |= rewrite_function_exprs_in_expr(value, target, method_fields);
             }
             changed
         }
         AstStmt::GlobalDecl(global_decl) => {
             let mut changed = false;
             for value in &mut global_decl.values {
-                changed |= rewrite_function_exprs_in_expr(value, target);
+                changed |= rewrite_function_exprs_in_expr(value, target, method_fields);
             }
             changed
         }
         AstStmt::Assign(assign) => {
             let mut changed = false;
             for target_lvalue in &mut assign.targets {
-                changed |= rewrite_function_exprs_in_lvalue(target_lvalue, target);
+                changed |= rewrite_function_exprs_in_lvalue(target_lvalue, target, method_fields);
             }
             for value in &mut assign.values {
-                changed |= rewrite_function_exprs_in_expr(value, target);
+                changed |= rewrite_function_exprs_in_expr(value, target, method_fields);
             }
             changed
         }
-        AstStmt::CallStmt(call_stmt) => rewrite_function_exprs_in_call(&mut call_stmt.call, target),
+        AstStmt::CallStmt(call_stmt) => {
+            rewrite_function_exprs_in_call(&mut call_stmt.call, target, method_fields)
+        }
         AstStmt::Return(ret) => {
             let mut changed = false;
             for value in &mut ret.values {
-                changed |= rewrite_function_exprs_in_expr(value, target);
+                changed |= rewrite_function_exprs_in_expr(value, target, method_fields);
             }
             changed
         }
@@ -243,8 +248,12 @@ fn rewrite_nested(
     }
 }
 
-fn rewrite_function_expr(function: &mut AstFunctionExpr, target: AstTargetDialect) -> bool {
-    let mut method_fields = BTreeSet::new();
+fn rewrite_function_expr(
+    function: &mut AstFunctionExpr,
+    target: AstTargetDialect,
+    inherited_method_fields: &BTreeSet<String>,
+) -> bool {
+    let mut method_fields = inherited_method_fields.clone();
     collect_method_field_names_in_block(&function.body, &mut method_fields);
     let mutable_snapshots = mutable_snapshot_names_in_block(&function.body);
     rewrite_block(
@@ -255,19 +264,25 @@ fn rewrite_function_expr(function: &mut AstFunctionExpr, target: AstTargetDialec
     )
 }
 
-fn rewrite_function_exprs_in_call(call: &mut AstCallKind, target: AstTargetDialect) -> bool {
+fn rewrite_function_exprs_in_call(
+    call: &mut AstCallKind,
+    target: AstTargetDialect,
+    method_fields: &BTreeSet<String>,
+) -> bool {
     match call {
         AstCallKind::Call(call) => {
-            let mut changed = rewrite_function_exprs_in_expr(&mut call.callee, target);
+            let mut changed =
+                rewrite_function_exprs_in_expr(&mut call.callee, target, method_fields);
             for arg in &mut call.args {
-                changed |= rewrite_function_exprs_in_expr(arg, target);
+                changed |= rewrite_function_exprs_in_expr(arg, target, method_fields);
             }
             changed
         }
         AstCallKind::MethodCall(call) => {
-            let mut changed = rewrite_function_exprs_in_expr(&mut call.receiver, target);
+            let mut changed =
+                rewrite_function_exprs_in_expr(&mut call.receiver, target, method_fields);
             for arg in &mut call.args {
-                changed |= rewrite_function_exprs_in_expr(arg, target);
+                changed |= rewrite_function_exprs_in_expr(arg, target, method_fields);
             }
             changed
         }
@@ -277,66 +292,83 @@ fn rewrite_function_exprs_in_call(call: &mut AstCallKind, target: AstTargetDiale
 fn rewrite_function_exprs_in_lvalue(
     target_lvalue: &mut AstLValue,
     target: AstTargetDialect,
+    method_fields: &BTreeSet<String>,
 ) -> bool {
     match target_lvalue {
         AstLValue::Name(_) => false,
-        AstLValue::FieldAccess(access) => rewrite_function_exprs_in_expr(&mut access.base, target),
+        AstLValue::FieldAccess(access) => {
+            rewrite_function_exprs_in_expr(&mut access.base, target, method_fields)
+        }
         AstLValue::IndexAccess(access) => {
-            rewrite_function_exprs_in_expr(&mut access.base, target)
-                | rewrite_function_exprs_in_expr(&mut access.index, target)
+            rewrite_function_exprs_in_expr(&mut access.base, target, method_fields)
+                | rewrite_function_exprs_in_expr(&mut access.index, target, method_fields)
         }
     }
 }
 
-fn rewrite_function_exprs_in_expr(expr: &mut AstExpr, target: AstTargetDialect) -> bool {
+fn rewrite_function_exprs_in_expr(
+    expr: &mut AstExpr,
+    target: AstTargetDialect,
+    method_fields: &BTreeSet<String>,
+) -> bool {
     match expr {
-        AstExpr::FieldAccess(access) => rewrite_function_exprs_in_expr(&mut access.base, target),
-        AstExpr::IndexAccess(access) => {
-            rewrite_function_exprs_in_expr(&mut access.base, target)
-                | rewrite_function_exprs_in_expr(&mut access.index, target)
+        AstExpr::FieldAccess(access) => {
+            rewrite_function_exprs_in_expr(&mut access.base, target, method_fields)
         }
-        AstExpr::Unary(unary) => rewrite_function_exprs_in_expr(&mut unary.expr, target),
+        AstExpr::IndexAccess(access) => {
+            rewrite_function_exprs_in_expr(&mut access.base, target, method_fields)
+                | rewrite_function_exprs_in_expr(&mut access.index, target, method_fields)
+        }
+        AstExpr::Unary(unary) => {
+            rewrite_function_exprs_in_expr(&mut unary.expr, target, method_fields)
+        }
         AstExpr::Binary(binary) => {
-            rewrite_function_exprs_in_expr(&mut binary.lhs, target)
-                | rewrite_function_exprs_in_expr(&mut binary.rhs, target)
+            rewrite_function_exprs_in_expr(&mut binary.lhs, target, method_fields)
+                | rewrite_function_exprs_in_expr(&mut binary.rhs, target, method_fields)
         }
         AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            rewrite_function_exprs_in_expr(&mut logical.lhs, target)
-                | rewrite_function_exprs_in_expr(&mut logical.rhs, target)
+            rewrite_function_exprs_in_expr(&mut logical.lhs, target, method_fields)
+                | rewrite_function_exprs_in_expr(&mut logical.rhs, target, method_fields)
         }
         AstExpr::Call(call) => {
-            let mut changed = rewrite_function_exprs_in_expr(&mut call.callee, target);
+            let mut changed =
+                rewrite_function_exprs_in_expr(&mut call.callee, target, method_fields);
             for arg in &mut call.args {
-                changed |= rewrite_function_exprs_in_expr(arg, target);
+                changed |= rewrite_function_exprs_in_expr(arg, target, method_fields);
             }
             changed
         }
         AstExpr::MethodCall(call) => {
-            let mut changed = rewrite_function_exprs_in_expr(&mut call.receiver, target);
+            let mut changed =
+                rewrite_function_exprs_in_expr(&mut call.receiver, target, method_fields);
             for arg in &mut call.args {
-                changed |= rewrite_function_exprs_in_expr(arg, target);
+                changed |= rewrite_function_exprs_in_expr(arg, target, method_fields);
             }
             changed
         }
-        AstExpr::SingleValue(expr) => rewrite_function_exprs_in_expr(expr, target),
+        AstExpr::SingleValue(expr) => rewrite_function_exprs_in_expr(expr, target, method_fields),
         AstExpr::TableConstructor(table) => {
             let mut changed = false;
             for field in &mut table.fields {
                 match field {
                     AstTableField::Array(value) => {
-                        changed |= rewrite_function_exprs_in_expr(value, target);
+                        changed |= rewrite_function_exprs_in_expr(value, target, method_fields);
                     }
                     AstTableField::Record(record) => {
                         if let AstTableKey::Expr(key) = &mut record.key {
-                            changed |= rewrite_function_exprs_in_expr(key, target);
+                            changed |= rewrite_function_exprs_in_expr(key, target, method_fields);
                         }
-                        changed |= rewrite_function_exprs_in_expr(&mut record.value, target);
+                        changed |= rewrite_function_exprs_in_expr(
+                            &mut record.value,
+                            target,
+                            method_fields,
+                        );
                     }
                 }
             }
             changed
         }
-        AstExpr::FunctionExpr(function) => rewrite_function_expr(function, target),
+        AstExpr::FunctionExpr(function) => rewrite_function_expr(function, target, method_fields),
         AstExpr::Nil
         | AstExpr::Boolean(_)
         | AstExpr::Integer(_)

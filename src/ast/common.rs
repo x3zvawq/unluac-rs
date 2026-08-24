@@ -510,6 +510,9 @@ pub struct AstLogicalExpr {
 pub struct AstCallExpr {
     pub callee: AstExpr,
     pub args: Vec<AstExpr>,
+    /// HIR 已确认的 SELF/NAMECALL 字段名。`Call` 形状仍保留这份 provenance，
+    /// 即使 receiver/callee 快照暂时不能安全渲染成 `obj:method(...)`。
+    pub method_name: Option<String>,
 }
 
 /// 方法调用。

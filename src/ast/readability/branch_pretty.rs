@@ -683,6 +683,7 @@ mod tests {
             call: AstCallKind::Call(Box::new(AstCallExpr {
                 callee: global_expr(name),
                 args: Vec::new(),
+                method_name: None,
             })),
         }))
     }

@@ -10,11 +10,15 @@
 //!   -> `local ctor = ffi.metatype("x", { __index = { bump = function(...) end } })`
 //!
 //! 这里不会去猜任意跨语句的数据流；只有“构造器 local -> 构造器字段接线 -> 终端返回/终端局部初始化”
-//! 这一整段都还保持机械脚手架形状时，才会收回源码结构。
+//! 这一整段都还保持机械脚手架形状时，才会收回源码结构。若字段闭包已有 method
+//! provenance，则先让位给 `direct`，避免把可读的声明再次折回匿名 constructor field。
+
+use std::collections::BTreeSet;
 
 use super::super::binding_flow::BindingUseIndex;
 use super::super::binding_ref::{binding_from_name_ref, name_matches_binding};
 use super::super::installer_iife::function_expr_is_substantial;
+use super::direct::function_decl_target_from_lvalue;
 use crate::ast::common::{
     AstAssign, AstBindingRef, AstExpr, AstFieldAccess, AstFunctionExpr, AstFunctionName, AstLValue,
     AstLocalAttr, AstLocalDecl, AstReturn, AstStmt, AstTableField, AstTableKey,
@@ -22,6 +26,7 @@ use crate::ast::common::{
 
 pub(super) fn try_inline_terminal_constructor_fields(
     stmts: &[AstStmt],
+    method_fields: &BTreeSet<String>,
 ) -> Option<(AstStmt, usize)> {
     let AstStmt::LocalDecl(local_decl) = stmts.first()? else {
         return None;
@@ -45,6 +50,12 @@ pub(super) fn try_inline_terminal_constructor_fields(
     let mut consumed = 1usize;
     let mut inlined_any = false;
     while let Some(stmt) = stmts.get(consumed) {
+        // Preserve an assignment that the existing function-sugar owner can render as a
+        // method declaration.  Folding it into the constructor would erase the lvalue/closure
+        // pair before `direct` gets a chance to consume the already-proven method field fact.
+        if stmt_is_recoverable_method_decl(stmt, binding, method_fields) {
+            return None;
+        }
         let Some((field, func)) = inlineable_local_table_function_stmt(stmt, binding) else {
             break;
         };
@@ -72,6 +83,39 @@ pub(super) fn try_inline_terminal_constructor_fields(
     }
 
     Some((AstStmt::LocalDecl(Box::new(rewritten)), consumed))
+}
+
+fn stmt_is_recoverable_method_decl(
+    stmt: &AstStmt,
+    binding: AstBindingRef,
+    method_fields: &BTreeSet<String>,
+) -> bool {
+    if let AstStmt::FunctionDecl(function_decl) = stmt {
+        let AstFunctionName::Method(path, _) = &function_decl.target else {
+            return false;
+        };
+        return path.fields.len() == 1 && name_matches_binding(&path.root, binding);
+    }
+    let AstStmt::Assign(assign) = stmt else {
+        return false;
+    };
+    if assign.targets.len() != 1 || assign.values.len() != 1 {
+        return false;
+    }
+    let AstLValue::FieldAccess(access) = &assign.targets[0] else {
+        return false;
+    };
+    let AstExpr::Var(base) = &access.base else {
+        return false;
+    };
+    if !name_matches_binding(base, binding) {
+        return false;
+    }
+    let AstExpr::FunctionExpr(function) = &assign.values[0] else {
+        return false;
+    };
+    let target = function_decl_target_from_lvalue(&assign.targets[0], function, method_fields);
+    matches!(target, Some((AstFunctionName::Method(_, _), _)))
 }
 
 pub(super) fn try_inline_terminal_constructor_call(

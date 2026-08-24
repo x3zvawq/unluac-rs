@@ -373,6 +373,7 @@ mod tests {
                 text: "factory".to_owned(),
             })),
             args: vec![],
+            method_name: None,
         }))
     }
 
@@ -413,6 +414,7 @@ mod tests {
         let self_call = AstExpr::Call(Box::new(AstCallExpr {
             callee: AstExpr::Var(binding.id.to_name_ref()),
             args: vec![],
+            method_name: None,
         }));
         let declaration = AstStmt::LocalDecl(Box::new(AstLocalDecl {
             bindings: vec![binding.clone()],

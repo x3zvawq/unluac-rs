@@ -1,7 +1,11 @@
 -- regress_322_alias_and_sugar: stripped alias/field sugar 与 call-result PhysicalRoot 边界
 -- unluac: expect-contains [[return p1_0.first .. " " .. p1_0.last]]
 -- unluac: expect-not-contains [[p1_0["]]
+-- unluac: expect-contains [[function r2_0:add(p3_1)]]
+-- unluac: expect-not-contains [[add = function]]
+-- unluac: expect-contains [[function r2_0:value_text()]]
 -- unluac: expect-order [[local r0_5 = print]] [[r0_6 = r0_7.value_text]]
+-- unluac: expect-not-contains [[r0_7:value_text()]]
 -- unluac: expect-contains [[r0_5(r0_4, r0_6(r0_7))]]
 
 local function display_name(user)

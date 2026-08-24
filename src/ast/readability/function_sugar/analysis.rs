@@ -1,7 +1,7 @@
 //! 这个子模块负责 `function_sugar` 的只读事实收集。
 //!
 //! 它依赖 AST 已经合法化后的函数声明/调用形状，只收集 method field 名称，不会在这里
-//! 直接改写语句。
+//! 直接改写语句。普通 `Call` 上由 HIR 保留的 `method_name` 也属于同一份 provenance。
 //! 例如：`function t:x() end` 会在这里把 `x` 记录成 method field 证据。
 
 use std::collections::BTreeSet;
@@ -90,14 +90,29 @@ impl AstVisitor for MethodFieldCollector {
     }
 
     fn visit_call(&mut self, call: &AstCallKind) {
-        if let AstCallKind::MethodCall(call) = call {
-            self.fields.insert(call.method.clone());
+        match call {
+            AstCallKind::MethodCall(call) => {
+                self.fields.insert(call.method.clone());
+            }
+            AstCallKind::Call(call) => {
+                if let Some(method) = &call.method_name {
+                    self.fields.insert(method.clone());
+                }
+            }
         }
     }
 
     fn visit_expr(&mut self, expr: &AstExpr) {
-        if let AstExpr::MethodCall(call) = expr {
-            self.fields.insert(call.method.clone());
+        match expr {
+            AstExpr::MethodCall(call) => {
+                self.fields.insert(call.method.clone());
+            }
+            AstExpr::Call(call) => {
+                if let Some(method) = &call.method_name {
+                    self.fields.insert(method.clone());
+                }
+            }
+            _ => {}
         }
     }
 }

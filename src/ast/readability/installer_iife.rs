@@ -98,6 +98,7 @@ fn rewrite_installer_iife_stmt(
             call: AstCallKind::Call(Box::new(AstCallExpr {
                 callee: AstExpr::Var(AstNameRef::SyntheticLocal(binding_id)),
                 args: call.args.clone(),
+                method_name: None,
             })),
         })),
     ];

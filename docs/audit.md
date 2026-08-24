@@ -50,14 +50,17 @@
 - `tmp/test/01_alias_and_sugar.lua` / `regress_322_alias_and_sugar`：该样例的安全部分已经
   收敛为 `p.first .. " " .. p.last`、记录式 table constructor 和直接的局部函数声明；
   stripped 输出中的 `r0_*` 只是没有 debug 名时的默认 `debug-like` 命名，可用
-  `--naming-mode heuristic` 改善观感，但不属于语义 pass。剩余顶层顺序为
-  `r0_3:add(2)`、`r0_6:add(3)`、`r0_7.value_text`、`r0_6(...)`：`r0_5 = print` 必须在
-  method chain 前捕获全局快照，`r0_4 = display_name(r0_2)` 不能跨过该快照移动，且首个
-  call-result 在后续 field lookup 写回同一 home 前是 HIR `PhysicalRoot`。折成
-  `r0_3:add(2):add(3):value_text()` 会在 field lookup 前释放首个结果，可能改变弱表、
-  `__gc`/自动 GC 或 lookup metamethod 的观察；构造器中的 `add = function` 与源码
-  `function box:add` 在 Lua 5.1 bytecode 中没有可区分的来源事实。该形状因此归档为已有
-  readability/HIR root 合同与 bytecode non-uniqueness residual，不新增 AST 特判。
+  `--naming-mode heuristic` 改善观感，但不属于语义 pass。HIR 的 `method_name` 现在会
+  跨 AST 普通 `Call` 保留，constructor 不再吞掉同一 fresh owner 上已有 method 事实的
+  字段闭包，因此首轮输出可恢复 `function r2_0:add(...)` / `function r2_0:value_text()`。
+  这只是字段写的 canonical spelling，不是对原始冒号源码的猜测；round-trip 后若调用已
+  退化为普通点调用，字节码没有办法重新提供该事实，允许回到字段函数形状。
+  顶层运行时顺序仍是 `r0_3:add(2)`、`r0_6:add(3)`、`r0_7.value_text`、`r0_6(...)`：
+  `r0_5 = print` 必须在 method chain 前捕获全局快照，`r0_4 = display_name(r0_2)` 不能
+  跨过该快照移动，且首个 call-result 在后续 field lookup 写回同一 home 前是 HIR
+  `PhysicalRoot`。折成 `r0_3:add(2):add(3):value_text()` 会在 field lookup 前释放首个
+  结果，可能改变弱表、`__gc`/自动 GC 或 lookup metamethod 的观察；因此末尾仍保留
+  `r0_6 = r0_7.value_text; r0_6(r0_7)`，不新增 AST 特判。
 
 ## 审计规则
 

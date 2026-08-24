@@ -379,7 +379,11 @@ impl<'a> AstLowerer<'a> {
             })));
         }
 
-        Ok(AstCallKind::Call(Box::new(AstCallExpr { callee, args })))
+        Ok(AstCallKind::Call(Box::new(AstCallExpr {
+            callee,
+            args,
+            method_name: call.method.then(|| call.method_name.clone()).flatten(),
+        })))
     }
 }
 
