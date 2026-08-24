@@ -1,5 +1,7 @@
 -- regress_127_puc54_metamethod_operand_flip#1: MMBINI/MMBINK 的 flip 必须保留源码操作数顺序
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-not-contains [[local r2_2 = p1_0 ..]]
+-- unluac: expect-contains [[return p1_0 .. ":"]]
 local function mark(name)
     return function(a, b)
         local av = type(a) == "number" and a or "-"

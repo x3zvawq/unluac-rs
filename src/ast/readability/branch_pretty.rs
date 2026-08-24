@@ -13,11 +13,12 @@
 //!   `repeat ... until not G and B or C`
 
 use super::super::common::{
-    AstBlock, AstExpr, AstIf, AstLogicalExpr, AstModule, AstRepeat, AstReturn, AstStmt,
-    AstUnaryExpr, AstUnaryOpKind,
+    AstBlock, AstExpr, AstFunctionExpr, AstIf, AstLocalAttr, AstLocalOrigin, AstLogicalExpr,
+    AstModule, AstRepeat, AstReturn, AstStmt, AstUnaryExpr, AstUnaryOpKind,
 };
 use super::ReadabilityContext;
-use super::control_flow::block_contains_label_or_goto;
+use super::control_flow::{block_contains_label_or_goto, block_contains_loop_control};
+use super::visit::{self, AstVisitor};
 use super::walk::{self, AstRewritePass, BlockKind};
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
@@ -33,7 +34,17 @@ impl AstRewritePass for BranchPrettyPass {
         let mut flattened_stmts = Vec::with_capacity(old_stmts.len());
         let mut changed = false;
         for stmt in old_stmts {
-            match flatten_terminating_if(stmt) {
+            // `fold_constant_if` deliberately refuses protected arms.  Do not pass such a
+            // constant if to the older terminating-if rewrite, which could otherwise consume
+            // the same shell through a different path before the next fixed-point round.
+            if let AstStmt::If(if_stmt) = &stmt
+                && matches!(if_stmt.cond, AstExpr::Boolean(_))
+                && constant_if_has_protected_nodes(if_stmt)
+            {
+                flattened_stmts.push(stmt);
+                continue;
+            }
+            match fold_constant_if(stmt).or_else(flatten_terminating_if) {
                 Ok(flattened) => {
                     flattened_stmts.extend(flattened);
                     changed = true;
@@ -414,6 +425,116 @@ fn flatten_terminating_if(stmt: AstStmt) -> Result<Vec<AstStmt>, AstStmt> {
     Err(AstStmt::If(if_stmt))
 }
 
+/// 收回前层已经证明为常量的 `if`，但不越过诊断、跳转或词法作用域边界。
+///
+/// `literal-fold` 只会把无元方法的原始字面量条件变成 `Boolean`；因此选中的 arm
+/// 不再有条件求值事件，未选中的 arm 也不会执行。不过，label/goto 可能从 arm 外部
+/// 直接进入一个看似不可达的 arm，break/continue 也携带 loop owner，诊断节点不能被
+/// 静默丢弃；`global` 是方言级的词法声明，搬出原 arm 会改变其可见范围；debug/物理根、
+/// local-function 与 capture 则携带不可消除的 binding identity。任一边界存在时，外壳
+/// 继续保留。含普通 recovered local 的选中 arm 用 `do ... end` 保持原 if block 的词法
+/// 边界，包括 `<close>` 的退出点和 captured local 的 root lifetime。
+fn fold_constant_if(stmt: AstStmt) -> Result<Vec<AstStmt>, AstStmt> {
+    let AstStmt::If(mut if_stmt) = stmt else {
+        return Err(stmt);
+    };
+    let selected_then = match &if_stmt.cond {
+        AstExpr::Boolean(value) => *value,
+        _ => return Err(AstStmt::If(if_stmt)),
+    };
+
+    if constant_if_has_protected_nodes(&if_stmt) {
+        return Err(AstStmt::If(if_stmt));
+    }
+
+    let selected = if selected_then {
+        if_stmt.then_block
+    } else {
+        if_stmt.else_block.take().unwrap_or_default()
+    };
+    if selected.stmts.is_empty() {
+        Ok(Vec::new())
+    } else {
+        Ok(lifted_tail_stmts(selected))
+    }
+}
+
+fn constant_if_has_protected_nodes(if_stmt: &AstIf) -> bool {
+    let else_block = if_stmt.else_block.as_ref();
+    block_contains_label_or_goto(&if_stmt.then_block)
+        || else_block.is_some_and(block_contains_label_or_goto)
+        || block_contains_loop_control(&if_stmt.then_block)
+        || else_block.is_some_and(block_contains_loop_control)
+        || block_contains_diagnostic(&if_stmt.then_block)
+        || else_block.is_some_and(block_contains_diagnostic)
+        || block_contains_global_decl(&if_stmt.then_block)
+        || else_block.is_some_and(block_contains_global_decl)
+        || block_contains_identity_boundary(&if_stmt.then_block)
+        || else_block.is_some_and(block_contains_identity_boundary)
+}
+
+struct DiagnosticVisitor(bool);
+
+impl AstVisitor for DiagnosticVisitor {
+    fn visit_stmt(&mut self, stmt: &AstStmt) {
+        self.0 |= matches!(stmt, AstStmt::Error(_));
+    }
+
+    fn visit_expr(&mut self, expr: &AstExpr) {
+        self.0 |= matches!(expr, AstExpr::Error(_));
+    }
+}
+
+fn block_contains_diagnostic(block: &AstBlock) -> bool {
+    let mut visitor = DiagnosticVisitor(false);
+    visit::visit_block(block, &mut visitor);
+    visitor.0
+}
+
+struct GlobalDeclVisitor(bool);
+
+impl AstVisitor for GlobalDeclVisitor {
+    fn visit_stmt(&mut self, stmt: &AstStmt) {
+        self.0 |= matches!(stmt, AstStmt::GlobalDecl(_));
+    }
+}
+
+fn block_contains_global_decl(block: &AstBlock) -> bool {
+    let mut visitor = GlobalDeclVisitor(false);
+    visit::visit_block(block, &mut visitor);
+    visitor.0
+}
+
+struct IdentityBoundaryVisitor(bool);
+
+impl AstVisitor for IdentityBoundaryVisitor {
+    fn visit_stmt(&mut self, stmt: &AstStmt) {
+        match stmt {
+            AstStmt::LocalDecl(local_decl) => {
+                self.0 |= local_decl.bindings.iter().any(|binding| {
+                    binding.origin != AstLocalOrigin::Recovered
+                        || !matches!(binding.attr, AstLocalAttr::None)
+                });
+            }
+            // A local-function declaration carries a binding identity even when its body has no
+            // explicit capture; dropping it from an unselected arm would erase that evidence.
+            AstStmt::LocalFunctionDecl(_) => self.0 = true,
+            _ => {}
+        }
+    }
+
+    fn visit_function_expr(&mut self, function: &AstFunctionExpr) -> bool {
+        self.0 |= !function.captured_bindings.is_empty() || !function.captured_params.is_empty();
+        true
+    }
+}
+
+fn block_contains_identity_boundary(block: &AstBlock) -> bool {
+    let mut visitor = IdentityBoundaryVisitor(false);
+    visit::visit_block(block, &mut visitor);
+    visitor.0
+}
+
 fn fold_terminal_guard_return(block: &mut AstBlock, kind: BlockKind) -> bool {
     if !matches!(kind, BlockKind::ModuleBody | BlockKind::FunctionBody) {
         return false;
@@ -442,7 +563,7 @@ fn fold_terminal_guard_return(block: &mut AstBlock, kind: BlockKind) -> bool {
     if_stmt.else_block = None;
 
     block.stmts.push(AstStmt::If(if_stmt));
-    block.stmts.extend(lifted_body.stmts);
+    block.stmts.extend(lifted_tail_stmts(lifted_body));
     true
 }
 
@@ -461,6 +582,11 @@ fn terminal_guard_return_candidate(block: &AstBlock) -> Option<(usize, bool)> {
         // 单独的空 return 没有可提升主体；取反只会与 cleanup 的尾 return 省略来回振荡。
         || matches!(if_stmt.then_block.stmts.as_slice(), [stmt] if is_empty_return_stmt(stmt))
         || block_contains_label_or_goto(&if_stmt.then_block)
+        // The ordinary statement loop fences protected constant-if nodes.  Keep the same
+        // boundary here because terminal-guard folding runs after that loop and would
+        // otherwise consume the shell through a second path.
+        || (matches!(if_stmt.cond, AstExpr::Boolean(_))
+            && constant_if_has_protected_nodes(if_stmt))
     {
         return None;
     }
@@ -518,6 +644,7 @@ fn stmt_requires_scope_barrier(stmt: &AstStmt) -> bool {
         stmt,
         AstStmt::LocalDecl(_)
             | AstStmt::LocalFunctionDecl(_)
+            | AstStmt::GlobalDecl(_)
             | AstStmt::Label(_)
             | AstStmt::Goto(_)
     )
@@ -539,8 +666,9 @@ fn negate_guard_condition(expr: AstExpr) -> AstExpr {
 mod tests {
     use super::*;
     use crate::ast::common::{
-        AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstGlobalName, AstLocalAttr,
-        AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstRepeat, AstWhile,
+        AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstGlobalAttr, AstGlobalBinding,
+        AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstLocalAttr, AstLocalBinding,
+        AstLocalDecl, AstLocalOrigin, AstRepeat, AstWhile,
     };
     use crate::hir::LocalId;
 
@@ -567,6 +695,198 @@ mod tests {
             },
             else_block: None,
         }))
+    }
+
+    fn recovered_local(id: usize) -> AstStmt {
+        AstStmt::LocalDecl(Box::new(AstLocalDecl {
+            bindings: vec![AstLocalBinding {
+                id: AstBindingRef::Local(LocalId(id)),
+                attr: AstLocalAttr::None,
+                origin: AstLocalOrigin::Recovered,
+            }],
+            values: vec![AstExpr::Integer(1)],
+        }))
+    }
+
+    fn global_decl_stmt(name: &str) -> AstStmt {
+        AstStmt::GlobalDecl(Box::new(AstGlobalDecl {
+            bindings: vec![AstGlobalBinding {
+                target: AstGlobalBindingTarget::Name(AstGlobalName {
+                    text: name.to_owned(),
+                }),
+                attr: AstGlobalAttr::None,
+            }],
+            values: Vec::new(),
+        }))
+    }
+
+    #[test]
+    fn folds_constant_if_to_the_selected_arm() {
+        let stmt = AstStmt::If(Box::new(AstIf {
+            cond: AstExpr::Boolean(true),
+            then_block: AstBlock {
+                stmts: vec![call_stmt("selected")],
+            },
+            else_block: Some(AstBlock {
+                stmts: vec![call_stmt("unreachable")],
+            }),
+        }));
+
+        assert_eq!(fold_constant_if(stmt), Ok(vec![call_stmt("selected")]));
+    }
+
+    #[test]
+    fn constant_if_keeps_selected_local_scope() {
+        let stmt = AstStmt::If(Box::new(AstIf {
+            cond: AstExpr::Boolean(false),
+            then_block: AstBlock {
+                stmts: vec![call_stmt("unreachable")],
+            },
+            else_block: Some(AstBlock {
+                stmts: vec![recovered_local(0), call_stmt("selected")],
+            }),
+        }));
+
+        let Ok(selected_stmts) = fold_constant_if(stmt) else {
+            panic!("selected local block must retain a lexical scope barrier");
+        };
+        let [AstStmt::DoBlock(selected)] = selected_stmts.as_slice() else {
+            panic!("selected local block must retain a lexical scope barrier");
+        };
+        assert_eq!(
+            selected.stmts,
+            vec![recovered_local(0), call_stmt("selected")]
+        );
+    }
+
+    #[test]
+    fn constant_if_does_not_drop_unreachable_diagnostic() {
+        let stmt = AstStmt::If(Box::new(AstIf {
+            cond: AstExpr::Boolean(true),
+            then_block: AstBlock {
+                stmts: vec![call_stmt("selected")],
+            },
+            else_block: Some(AstBlock {
+                stmts: vec![AstStmt::Error("unresolved".to_owned())],
+            }),
+        }));
+
+        assert!(fold_constant_if(stmt).is_err());
+    }
+
+    #[test]
+    fn constant_if_keeps_global_declaration_scope() {
+        let stmt = AstStmt::If(Box::new(AstIf {
+            cond: AstExpr::Boolean(true),
+            then_block: AstBlock {
+                stmts: vec![global_decl_stmt("selected")],
+            },
+            else_block: None,
+        }));
+
+        assert!(fold_constant_if(stmt).is_err());
+    }
+
+    #[test]
+    fn constant_if_keeps_unselected_debug_identity() {
+        let mut debug_local = recovered_local(0);
+        let AstStmt::LocalDecl(local_decl) = &mut debug_local else {
+            unreachable!("recovered_local must produce a local declaration");
+        };
+        local_decl.bindings[0].origin = AstLocalOrigin::DebugHinted;
+        let stmt = AstStmt::If(Box::new(AstIf {
+            cond: AstExpr::Boolean(true),
+            then_block: AstBlock {
+                stmts: vec![call_stmt("selected")],
+            },
+            else_block: Some(AstBlock {
+                stmts: vec![debug_local],
+            }),
+        }));
+
+        assert!(fold_constant_if(stmt).is_err());
+    }
+
+    #[test]
+    fn constant_if_keeps_loop_control_owner() {
+        let stmt = AstStmt::If(Box::new(AstIf {
+            cond: AstExpr::Boolean(false),
+            then_block: AstBlock {
+                stmts: vec![AstStmt::Break],
+            },
+            else_block: Some(AstBlock {
+                stmts: vec![call_stmt("selected")],
+            }),
+        }));
+
+        assert!(fold_constant_if(stmt).is_err());
+    }
+
+    #[test]
+    fn protected_constant_if_does_not_reenter_terminating_flatten() {
+        let mut block = AstBlock {
+            stmts: vec![AstStmt::If(Box::new(AstIf {
+                cond: AstExpr::Boolean(true),
+                then_block: AstBlock {
+                    stmts: vec![AstStmt::Break],
+                },
+                else_block: Some(AstBlock {
+                    stmts: vec![AstStmt::Return(Box::new(AstReturn { values: vec![] }))],
+                }),
+            }))],
+        };
+
+        assert!(!BranchPrettyPass.rewrite_block(&mut block, BlockKind::Regular));
+        assert!(matches!(block.stmts.as_slice(), [AstStmt::If(_)]));
+    }
+
+    #[test]
+    fn terminal_guard_keeps_lifted_local_scope() {
+        let mut block = AstBlock {
+            stmts: vec![AstStmt::If(Box::new(AstIf {
+                cond: global_expr("guard"),
+                then_block: AstBlock {
+                    stmts: vec![
+                        recovered_local(0),
+                        AstStmt::Return(Box::new(AstReturn { values: vec![] })),
+                    ],
+                },
+                else_block: None,
+            }))],
+        };
+
+        assert!(BranchPrettyPass.rewrite_block(&mut block, BlockKind::FunctionBody));
+        let [AstStmt::If(_), AstStmt::DoBlock(body)] = block.stmts.as_slice() else {
+            panic!("terminal guard must retain the lifted local scope");
+        };
+        assert!(matches!(
+            body.stmts.as_slice(),
+            [AstStmt::LocalDecl(_), AstStmt::Return(_)]
+        ));
+    }
+
+    #[test]
+    fn terminal_guard_does_not_reenter_protected_constant_if() {
+        let mut debug_local = recovered_local(0);
+        let AstStmt::LocalDecl(local_decl) = &mut debug_local else {
+            unreachable!("recovered_local must produce a local declaration");
+        };
+        local_decl.bindings[0].origin = AstLocalOrigin::DebugHinted;
+        let mut block = AstBlock {
+            stmts: vec![AstStmt::If(Box::new(AstIf {
+                cond: AstExpr::Boolean(true),
+                then_block: AstBlock {
+                    stmts: vec![
+                        debug_local,
+                        AstStmt::Return(Box::new(AstReturn { values: vec![] })),
+                    ],
+                },
+                else_block: None,
+            }))],
+        };
+
+        assert!(!BranchPrettyPass.rewrite_block(&mut block, BlockKind::FunctionBody));
+        assert!(matches!(block.stmts.as_slice(), [AstStmt::If(_)]));
     }
 
     #[test]
@@ -622,14 +942,7 @@ mod tests {
 
     #[test]
     fn keeps_single_pass_fence_when_tail_would_extend_local_scope() {
-        let local_decl = AstStmt::LocalDecl(Box::new(AstLocalDecl {
-            bindings: vec![AstLocalBinding {
-                id: AstBindingRef::Local(LocalId(0)),
-                attr: AstLocalAttr::None,
-                origin: AstLocalOrigin::Recovered,
-            }],
-            values: vec![AstExpr::Integer(1)],
-        }));
+        let local_decl = recovered_local(0);
         let mut stmt = AstStmt::Repeat(Box::new(AstRepeat {
             body: AstBlock {
                 stmts: vec![

@@ -3,6 +3,9 @@
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[if p2_1 then]]
 -- unluac: expect-not-contains [[local r1_0 = p1_1 or p1_0]]
+-- unluac: expect-not-contains [[local r1_0 = p1_0 and]]
+-- unluac: expect-not-contains [[return r1_0]]
+-- unluac: expect-contains [[return p]]
 local function pick(x, a, b, c)
     local out
     if x then

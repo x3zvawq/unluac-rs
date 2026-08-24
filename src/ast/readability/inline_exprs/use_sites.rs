@@ -12,9 +12,10 @@ use super::super::super::common::{
 };
 use super::super::binding_ref::name_matches_binding;
 use super::super::expr_analysis::{
-    expr_complexity, is_access_base_inline_expr, is_call_arg_constructor_inline_expr,
-    is_context_safe_expr, is_direct_return_inline_expr, is_mechanical_run_inline_expr,
-    is_multi_return_inline_expr, is_stable_copy_alias_expr,
+    direct_return_concat_cost, direct_return_logical_cost, expr_complexity,
+    is_access_base_inline_expr, is_call_arg_constructor_inline_expr, is_context_safe_expr,
+    is_direct_return_inline_expr, is_mechanical_run_inline_expr, is_multi_return_inline_expr,
+    is_stable_copy_alias_expr,
 };
 use super::candidate::{
     InlineCandidate, InlinePolicy, is_call_callee_inline_expr,
@@ -554,7 +555,16 @@ impl InlineSite {
         let Some(limit) = self.complexity_limit(options, policy, replacement) else {
             return false;
         };
-        if expr_complexity(replacement) > limit {
+        let complexity_ok = expr_complexity(replacement) <= limit
+            || (matches!(self, Self::ReturnValue)
+                && matches!(policy, InlinePolicy::DirectReturnValue)
+                && direct_return_concat_cost(replacement)
+                    .is_some_and(|cost| cost <= options.return_inline_max_complexity))
+            || (matches!(self, Self::ReturnValue)
+                && matches!(policy, InlinePolicy::DirectReturnValue)
+                && direct_return_logical_cost(replacement)
+                    .is_some_and(|cost| cost <= options.return_inline_max_complexity));
+        if !complexity_ok {
             return false;
         }
 

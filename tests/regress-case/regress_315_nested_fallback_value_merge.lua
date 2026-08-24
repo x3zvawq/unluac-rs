@@ -2,6 +2,9 @@
 -- unluac: expect-not-contains [[goto]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[repeat]]
+-- unluac: expect-not-contains [[if true then]]
+-- unluac: expect-contains [[do]]
+-- unluac: expect-order [[do]] [[assert]]
 
 local hardware_type = "mobile"
 local environment = {

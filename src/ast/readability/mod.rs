@@ -132,7 +132,9 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
     PassDescriptor {
         name: "branch-pretty",
         phase: PassPhase::Normal,
-        depends_on: &[ControlFlowShape, StatementAdjacency],
+        // literal-fold can expose a constant condition after the initial branch pass;
+        // rerun here so the control shell consumes that proven ExprShape fact.
+        depends_on: &[ControlFlowShape, StatementAdjacency, ExprShape],
         invalidates: &[ControlFlowShape, StatementAdjacency],
     },
     PassDescriptor {

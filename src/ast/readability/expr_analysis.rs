@@ -390,6 +390,131 @@ pub(super) fn is_direct_return_inline_expr(expr: &AstExpr) -> bool {
     )
 }
 
+/// 返回终态拼接链的展示成本；诊断、非有限或过深的形状继续交给普通复杂度阈值。
+///
+/// 这不是新的语义证明：调用方仍须先通过 `is_direct_return_inline_expr` 和唯一
+/// 相邻 return 的 use-site 规则。这里仅把一串有限的 `..` 段按段数计费，避免
+/// `type(x)` 这类单个小段把机械的整串终态结果挡在默认阈值之外。每个叶段仍有
+/// 独立复杂度上限，因而不会借此放行任意大的嵌套表达式。
+pub(super) fn direct_return_concat_cost(expr: &AstExpr) -> Option<usize> {
+    const MAX_PARTS: usize = 10;
+    const MAX_PART_COMPLEXITY: usize = 3;
+
+    fn collect_parts(expr: &AstExpr, parts: &mut usize) -> bool {
+        match expr {
+            AstExpr::Binary(binary) if binary.op == AstBinaryOpKind::Concat => {
+                collect_parts(&binary.lhs, parts) && collect_parts(&binary.rhs, parts)
+            }
+            AstExpr::Error(_) => false,
+            AstExpr::Number(value) if !value.is_finite() => false,
+            _ if expr_complexity(expr) <= MAX_PART_COMPLEXITY
+                && is_direct_return_budget_term_safe(expr) =>
+            {
+                *parts = parts.saturating_add(1);
+                *parts <= MAX_PARTS
+            }
+            _ => false,
+        }
+    }
+
+    let mut parts = 0;
+    (matches!(expr, AstExpr::Binary(binary) if binary.op == AstBinaryOpKind::Concat)
+        && collect_parts(expr, &mut parts)
+        && parts >= 2)
+        .then_some(parts)
+}
+
+/// 返回终态短路链的展示成本；其余表达式继续使用完整 AST 复杂度阈值。
+///
+/// `and`/`or` 的嵌套本身不会改变任何运行时事件；这里仅按有限叶子数计费，避免
+/// HIR 已经证明为单次值合流的长短路壳被机械 local 隔开。叶子仍受独立复杂度上限
+/// 约束，因此不会借这条展示规则放行任意大的调用、查表或构造器树。
+pub(super) fn direct_return_logical_cost(expr: &AstExpr) -> Option<usize> {
+    const MAX_TERMS: usize = 12;
+    const MAX_TERM_COMPLEXITY: usize = 3;
+
+    fn collect_terms(expr: &AstExpr, terms: &mut usize) -> bool {
+        match expr {
+            AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+                collect_terms(&logical.lhs, terms) && collect_terms(&logical.rhs, terms)
+            }
+            AstExpr::Error(_) => false,
+            AstExpr::Number(value) if !value.is_finite() => false,
+            _ if expr_complexity(expr) <= MAX_TERM_COMPLEXITY
+                && is_direct_return_budget_term_safe(expr) =>
+            {
+                *terms = terms.saturating_add(1);
+                *terms <= MAX_TERMS
+            }
+            _ => false,
+        }
+    }
+
+    let mut terms = 0;
+    (matches!(expr, AstExpr::LogicalAnd(_) | AstExpr::LogicalOr(_))
+        && collect_terms(expr, &mut terms)
+        && terms >= 2)
+        .then_some(terms)
+}
+
+/// 展示预算的叶子不能偷偷携带诊断或由生成器改写成额外算术事件的非有限值。
+///
+/// 调用方已经先限制了整棵叶子的复杂度；这里因此只递归检查该小叶子内部，且拒绝
+/// 函数体未知的 `FunctionExpr`。这不是求值安全证明，调用方仍须执行 DirectReturn
+/// 的 binding、顺序、root 与多返回门槛。
+fn is_direct_return_budget_term_safe(expr: &AstExpr) -> bool {
+    match expr {
+        AstExpr::Number(value) => value.is_finite(),
+        AstExpr::Complex { real, imag } => real.is_finite() && imag.is_finite(),
+        AstExpr::Vector(vector) => vector
+            .components
+            .iter()
+            .all(|bits| f32::from_bits(*bits).is_finite()),
+        AstExpr::FieldAccess(access) => is_direct_return_budget_term_safe(&access.base),
+        AstExpr::IndexAccess(access) => {
+            is_direct_return_budget_term_safe(&access.base)
+                && is_direct_return_budget_term_safe(&access.index)
+        }
+        AstExpr::Unary(unary) => is_direct_return_budget_term_safe(&unary.expr),
+        AstExpr::Binary(binary) => {
+            is_direct_return_budget_term_safe(&binary.lhs)
+                && is_direct_return_budget_term_safe(&binary.rhs)
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            is_direct_return_budget_term_safe(&logical.lhs)
+                && is_direct_return_budget_term_safe(&logical.rhs)
+        }
+        AstExpr::Call(call) => {
+            is_direct_return_budget_term_safe(&call.callee)
+                && call.args.iter().all(is_direct_return_budget_term_safe)
+        }
+        AstExpr::MethodCall(call) => {
+            is_direct_return_budget_term_safe(&call.receiver)
+                && call.args.iter().all(is_direct_return_budget_term_safe)
+        }
+        AstExpr::SingleValue(inner) => is_direct_return_budget_term_safe(inner),
+        AstExpr::TableConstructor(table) => table.fields.iter().all(|field| match field {
+            AstTableField::Array(value) => is_direct_return_budget_term_safe(value),
+            AstTableField::Record(record) => {
+                let key_safe = match &record.key {
+                    AstTableKey::Name(_) => true,
+                    AstTableKey::Expr(key) => is_direct_return_budget_term_safe(key),
+                };
+                key_safe && is_direct_return_budget_term_safe(&record.value)
+            }
+        }),
+        AstExpr::FunctionExpr(_) | AstExpr::Error(_) => false,
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Var(_)
+        | AstExpr::VarArg => true,
+    }
+}
+
 /// 多值 `return` 中可安全收回的单值表达式。
 ///
 /// 现有的 context-safe 子集已经覆盖不会观察运行时事件的表达式。额外放行的只有
@@ -474,4 +599,153 @@ fn is_atomic_access_base_expr(expr: &AstExpr) -> bool {
             | AstExpr::Complex { .. }
             | AstExpr::Var(_)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ast::common::{AstBinaryExpr, AstLogicalExpr, AstUnaryExpr};
+    use crate::hir::ParamId;
+
+    use super::*;
+
+    fn concat(lhs: AstExpr, rhs: AstExpr) -> AstExpr {
+        AstExpr::Binary(Box::new(AstBinaryExpr {
+            op: AstBinaryOpKind::Concat,
+            lhs,
+            rhs,
+        }))
+    }
+
+    fn logical_and(lhs: AstExpr, rhs: AstExpr) -> AstExpr {
+        AstExpr::LogicalAnd(Box::new(AstLogicalExpr { lhs, rhs }))
+    }
+
+    fn logical_or(lhs: AstExpr, rhs: AstExpr) -> AstExpr {
+        AstExpr::LogicalOr(Box::new(AstLogicalExpr { lhs, rhs }))
+    }
+
+    #[test]
+    fn direct_return_concat_cost_is_bounded_by_parts_and_leaves() {
+        assert_eq!(
+            direct_return_concat_cost(&concat(AstExpr::Integer(1), AstExpr::Integer(2))),
+            Some(2)
+        );
+
+        let deep_leaf = AstExpr::Unary(Box::new(AstUnaryExpr {
+            op: AstUnaryOpKind::Not,
+            expr: AstExpr::Unary(Box::new(AstUnaryExpr {
+                op: AstUnaryOpKind::Not,
+                expr: AstExpr::Unary(Box::new(AstUnaryExpr {
+                    op: AstUnaryOpKind::Not,
+                    expr: AstExpr::Integer(1),
+                })),
+            })),
+        }));
+        assert_eq!(
+            direct_return_concat_cost(&concat(deep_leaf, AstExpr::Integer(2))),
+            None
+        );
+
+        let mut chain = AstExpr::Integer(0);
+        for _ in 0..10 {
+            chain = concat(chain, AstExpr::Integer(1));
+        }
+        assert_eq!(direct_return_concat_cost(&chain), None);
+    }
+
+    #[test]
+    fn direct_return_concat_cost_rejects_diagnostics_and_nonfinite_numbers() {
+        assert_eq!(
+            direct_return_concat_cost(&concat(
+                AstExpr::Error("bad".to_owned()),
+                AstExpr::Integer(1)
+            )),
+            None
+        );
+        assert_eq!(
+            direct_return_concat_cost(&concat(AstExpr::Number(f64::NAN), AstExpr::Integer(1))),
+            None
+        );
+        assert_eq!(
+            direct_return_concat_cost(&concat(
+                AstExpr::Unary(Box::new(AstUnaryExpr {
+                    op: AstUnaryOpKind::Not,
+                    expr: AstExpr::Number(f64::INFINITY),
+                })),
+                AstExpr::Integer(1),
+            )),
+            None
+        );
+        assert_eq!(
+            direct_return_concat_cost(&concat(
+                AstExpr::Unary(Box::new(AstUnaryExpr {
+                    op: AstUnaryOpKind::Not,
+                    expr: AstExpr::Error("nested".to_owned()),
+                })),
+                AstExpr::Integer(1),
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn direct_return_logical_cost_is_bounded_by_terms_and_leaves() {
+        let chain = logical_or(
+            logical_and(
+                AstExpr::Var(AstNameRef::Param(ParamId(0))),
+                AstExpr::Boolean(true),
+            ),
+            AstExpr::String("fallback".into()),
+        );
+        assert_eq!(direct_return_logical_cost(&chain), Some(3));
+
+        let deep_leaf = AstExpr::Unary(Box::new(AstUnaryExpr {
+            op: AstUnaryOpKind::Not,
+            expr: AstExpr::Unary(Box::new(AstUnaryExpr {
+                op: AstUnaryOpKind::Not,
+                expr: AstExpr::Unary(Box::new(AstUnaryExpr {
+                    op: AstUnaryOpKind::Not,
+                    expr: AstExpr::Boolean(true),
+                })),
+            })),
+        }));
+        assert_eq!(
+            direct_return_logical_cost(&logical_and(deep_leaf, AstExpr::Boolean(false),)),
+            None
+        );
+        assert_eq!(
+            direct_return_logical_cost(&logical_or(
+                AstExpr::Number(f64::NAN),
+                AstExpr::Boolean(true),
+            )),
+            None
+        );
+        assert_eq!(
+            direct_return_logical_cost(&logical_and(
+                AstExpr::Unary(Box::new(AstUnaryExpr {
+                    op: AstUnaryOpKind::Not,
+                    expr: AstExpr::Error("nested".to_owned()),
+                })),
+                AstExpr::Boolean(false),
+            )),
+            None
+        );
+
+        let mut chain = AstExpr::Boolean(false);
+        for _ in 0..12 {
+            chain = logical_or(chain, AstExpr::Boolean(true));
+        }
+        assert_eq!(direct_return_logical_cost(&chain), None);
+    }
+
+    #[test]
+    fn direct_return_logical_cost_can_budget_a_wide_chain_below_the_term_cap() {
+        let mut chain = AstExpr::Var(AstNameRef::Param(ParamId(0)));
+        for index in 1..8 {
+            chain = logical_or(chain, AstExpr::Var(AstNameRef::Param(ParamId(index))));
+        }
+
+        assert!(expr_complexity(&chain) > 10);
+        assert_eq!(direct_return_logical_cost(&chain), Some(8));
+    }
 }

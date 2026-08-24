@@ -1,6 +1,8 @@
 -- regress_80_same_header_nested_loops#1: Luau shares the numeric-for body header with an inner while
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-contains [[while ]]
+-- unluac: expect-not-contains [[local r1_0 = 0 + 1]]
+-- unluac: expect-contains [[local r1_0 = 1]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]

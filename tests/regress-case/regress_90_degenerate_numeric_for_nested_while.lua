@@ -1,6 +1,8 @@
 -- regress_90_degenerate_numeric_for_nested_while#1: unreachable numeric latch may share nested while header
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-contains [[while ]]
+-- unluac: expect-not-contains [[while not true do]]
+-- unluac: expect-contains [[while false do]]
 -- unluac: expect-contains [[break]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]

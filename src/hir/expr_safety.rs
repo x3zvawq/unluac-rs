@@ -41,6 +41,46 @@ pub(crate) fn primitive_literal_comparison_value(
     }
 }
 
+/// Luau 的 number 加法在两个原始数字操作数上走 VM 数值路径，不查用户元方法。
+///
+/// `HirExpr::Integer` 也可能来自 Luau 的 `LOADN`，并不代表 PUC Lua 的
+/// `lua_Integer` 语义；因此这里只在调用方已确认目标是 Luau 时使用，并把两种
+/// HIR 数字都先放进可精确表示的整数范围。超出范围、非有限数和负零都保留原
+/// 运算，避免宿主 `f64` 舍入或符号位成为可观察差异。
+pub(crate) fn luau_literal_addition_value(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
+    const MAX_EXACT_INTEGER: i128 = 1_i128 << 53;
+
+    fn exact_integer(expr: &HirExpr) -> Option<i128> {
+        match expr {
+            HirExpr::Integer(value) => {
+                let value = i128::from(*value);
+                (-(MAX_EXACT_INTEGER)..=MAX_EXACT_INTEGER)
+                    .contains(&value)
+                    .then_some(value)
+            }
+            HirExpr::Number(value)
+                if value.is_finite()
+                    && !(*value == 0.0 && value.is_sign_negative())
+                    && value.fract() == 0.0
+                    && value.abs() <= MAX_EXACT_INTEGER as f64 =>
+            {
+                let integer = *value as i128;
+                (integer as f64 == *value
+                    && (-(MAX_EXACT_INTEGER)..=MAX_EXACT_INTEGER).contains(&integer))
+                .then_some(integer)
+            }
+            _ => None,
+        }
+    }
+
+    let value = exact_integer(lhs)?.checked_add(exact_integer(rhs)?)?;
+    if !(-(MAX_EXACT_INTEGER)..=MAX_EXACT_INTEGER).contains(&value) {
+        return None;
+    }
+    let result = value as f64;
+    (result as i128 == value).then_some(HirExpr::Number(result))
+}
+
 /// 表达式的求值能否在不改变 Lua 可观察行为的前提下被删除。
 pub(crate) fn expr_is_discard_safe(expr: &HirExpr) -> bool {
     match expr {

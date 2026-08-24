@@ -18,17 +18,32 @@
 
 use super::expr_facts::{expr_is_boolean_valued, expr_truthiness};
 use super::walk::{ExprRewritePass, rewrite_proto_exprs};
+use crate::decompile::DecompileDialect;
 use crate::hir::common::{HirBinaryOpKind, HirExpr, HirLogicalExpr, HirProto, HirUnaryOpKind};
 use crate::hir::expr_safety::{
-    expr_is_discard_safe, expr_is_repeatable, primitive_literal_comparison_value,
+    expr_is_discard_safe, expr_is_repeatable, luau_literal_addition_value,
+    primitive_literal_comparison_value,
 };
 
 /// 对单个 proto 递归执行安全的逻辑表达式整理。
-pub(super) fn simplify_logical_exprs_in_proto(proto: &mut HirProto) -> bool {
-    rewrite_proto_exprs(proto, &mut LogicalExprPass)
+pub(super) fn simplify_logical_exprs_in_proto(
+    proto: &mut HirProto,
+    dialect: DecompileDialect,
+) -> bool {
+    rewrite_proto_exprs(proto, &mut LogicalExprPass::for_dialect(dialect))
 }
 
-struct LogicalExprPass;
+struct LogicalExprPass {
+    fold_luau_literal_addition: bool,
+}
+
+impl LogicalExprPass {
+    fn for_dialect(dialect: DecompileDialect) -> Self {
+        Self {
+            fold_luau_literal_addition: dialect == DecompileDialect::Luau,
+        }
+    }
+}
 
 impl ExprRewritePass for LogicalExprPass {
     fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
@@ -39,6 +54,15 @@ impl ExprRewritePass for LogicalExprPass {
                 primitive_literal_comparison_value(binary.op, &binary.lhs, &binary.rhs)
         {
             *expr = HirExpr::Boolean(value);
+            changed = true;
+        }
+
+        if self.fold_luau_literal_addition
+            && let HirExpr::Binary(binary) = expr
+            && binary.op == HirBinaryOpKind::Add
+            && let Some(value) = luau_literal_addition_value(&binary.lhs, &binary.rhs)
+        {
+            *expr = value;
             changed = true;
         }
 
@@ -507,8 +531,11 @@ fn absorb_stable_or_guard(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
 
 #[cfg(test)]
 mod tests {
-    use super::{simplify_condition_truthiness_shape, simplify_logical_shape};
-    use crate::hir::common::{HirExpr, HirLogicalExpr, ParamId};
+    use super::super::walk::ExprRewritePass;
+    use super::{LogicalExprPass, simplify_condition_truthiness_shape, simplify_logical_shape};
+    use crate::decompile::DecompileDialect;
+    use crate::hir::common::{HirBinaryExpr, HirBinaryOpKind, HirExpr, HirLogicalExpr, ParamId};
+    use crate::hir::expr_safety::luau_literal_addition_value;
 
     fn param(index: usize) -> HirExpr {
         HirExpr::ParamRef(ParamId(index))
@@ -536,5 +563,65 @@ mod tests {
 
         assert_eq!(simplify_condition_truthiness_shape(&expr), Some(expected));
         assert_eq!(simplify_logical_shape(&expr), None);
+    }
+
+    #[test]
+    fn folds_exact_luau_literal_addition() {
+        assert_eq!(
+            luau_literal_addition_value(&HirExpr::Integer(2), &HirExpr::Integer(3)),
+            Some(HirExpr::Number(5.0))
+        );
+        assert_eq!(
+            luau_literal_addition_value(&HirExpr::Number(1.5), &HirExpr::Number(2.0)),
+            None
+        );
+        assert_eq!(
+            luau_literal_addition_value(&HirExpr::Integer(0), &HirExpr::Number(1.0)),
+            Some(HirExpr::Number(1.0))
+        );
+    }
+
+    #[test]
+    fn rejects_non_literal_or_unrepresentable_addition() {
+        assert_eq!(
+            luau_literal_addition_value(&param(0), &HirExpr::Number(1.0)),
+            None
+        );
+        assert_eq!(
+            luau_literal_addition_value(&HirExpr::Number(-0.0), &HirExpr::Number(0.0)),
+            None
+        );
+        assert_eq!(
+            luau_literal_addition_value(
+                &HirExpr::Number(9_007_199_254_740_992.0),
+                &HirExpr::Number(1.0)
+            ),
+            None
+        );
+        assert_eq!(
+            luau_literal_addition_value(&HirExpr::Number(f64::NAN), &HirExpr::Number(1.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn literal_addition_fold_is_dialect_gated() {
+        let add = || {
+            HirExpr::Binary(Box::new(HirBinaryExpr {
+                op: HirBinaryOpKind::Add,
+                lhs: HirExpr::Integer(2),
+                rhs: HirExpr::Integer(3),
+            }))
+        };
+
+        let mut luau_expr = add();
+        let mut luau_pass = LogicalExprPass::for_dialect(DecompileDialect::Luau);
+        assert!(luau_pass.rewrite_expr(&mut luau_expr));
+        assert_eq!(luau_expr, HirExpr::Number(5.0));
+
+        let mut puc_expr = add();
+        let mut puc_pass = LogicalExprPass::for_dialect(DecompileDialect::Lua54);
+        assert!(!puc_pass.rewrite_expr(&mut puc_expr));
+        assert!(matches!(puc_expr, HirExpr::Binary(_)));
     }
 }

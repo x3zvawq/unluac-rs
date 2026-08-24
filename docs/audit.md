@@ -4,9 +4,49 @@
 > 审计起点：`main@ce3ad8e`
 > 当前复核：跨方言 common_11/common_05 与 regress_258 原始比较布尔壳已收敛；本轮新增收回
 > fresh 构造器中的标量/布尔字段 producer、相邻单值终态 return alias 与多值 return 中可证明的
-> 布尔比较 alias、单值 return 短路前缀中的必达布尔 alias，以及终态查表短路尾 alias；抽样仍确认 PUC/Luau/LuaJIT
-> 的物理槽、闭包、字段快照、构造器逃逸与 repeat 作用域 residual 没有越过现有安全证明
+> 布尔比较 alias、单值 return 短路前缀中的必达布尔 alias、终态查表短路尾 alias，以及有界短路链展示 alias；抽样仍确认 PUC/Luau/LuaJIT
+> 的物理槽、闭包、字段快照、构造器逃逸与 repeat 作用域 residual 没有越过现有安全证明；本轮再收回
+> 已由 `literal-fold` 证明为 `Boolean` 的常量 if 外壳（保留 local/诊断/跳转边界）
 > 本文件只保留尚未完成、需要后续决策或仍需安全证明的事项；完成项应立即删除。
+
+## 本轮审计归档（2026-08-24）
+
+- `regress_127_puc54_metamethod_operand_flip`：`inline-exprs` 原先只按整棵 AST
+  复杂度拒绝终态 `local value = E; return value`。HIR/AST 已证明它是 recovered、唯一
+  相邻单值 return、无后续写入/捕获/PhysicalRoot/`<close>`，因此仅按有限 `..` 段重新计费，
+  不改变 `name`/`type` 查找、调用、concat 元方法或返回时点；默认预算下收回，用户降低
+  `return_inline_max_complexity` 时仍保留原 local。
+- `regress_80_same_header_nested_loops` / `regress_302_luau_numeric_for_multi_read_binding`：
+  `logical-simplify` 仅在 Luau 方言下
+  折叠有限、排除负零、`|n| <= 2^53` 的原始且整数值 numeric literal（`Integer` 或整数值
+  `Number`）加法，并输出 `Number`。该范围内 VM
+  数值快路径不查用户元方法，后序折叠不移动任何绑定、capture、root 或控制流事件；PUC、
+  LuaJIT、非字面量、非有限数和舍入边界均保留原运算。
+- `regress_234_nested_phi_short_value_merge`：HIR 已将分支值合流固定为单次求值的 `and/or`
+  表达式，但默认完整节点预算会留下 `local value = E; return value`。Readability 仅对顶层
+  最多 12 个有限、每个复杂度不超过 3 的短路叶按项计费；规则 40 的 recovered/唯一相邻单值
+  return、write/capture/eval-prefix、call/lookup/global/metamethod、single/multi/vararg、
+  debug/PhysicalRoot、GC/`<close>` 和控制流门槛均未放宽。故所有原始变量读取、短路跳过、
+  比较/元方法与返回事件仍在同一顺序和同一返回点执行；仅删除机械 local。PUC 5.1–5.5、
+  LuaJIT 与 round-trip 产物均覆盖该形状。
+- `regress_315_nested_fallback_value_merge`：HIR/`logical-simplify` 已把严格的原始字面量
+  比较收回 `Boolean(true)`，但首轮 `branch-pretty` 早于 `literal-fold`，留下 `if true then`
+  与不可达 fallback。`branch-pretty` 现在订阅 `ExprShape` 并在下一轮消费该显式事实；条件
+  没有运行时求值，未选 arm 的 lookup/call/assignment 不会发生。选中 arm 含 recovered local，
+  因而保留一个 `do` 作用域；诊断、label/goto、break/continue、方言 `GlobalDecl` 或
+  DebugHinted/PhysicalRoot/local-function/captured binding 任一存在时整壳保留，分别避免
+  丢失诊断、改变 loop owner、移动 global 声明范围或削弱 binding identity。普通 recovered
+  local 的选中 arm 仍以 `do` 保持词法域；`<close>`/GC root、单值/多值与原有 arm 内事件
+  顺序均未改变。
+- `regress_90_degenerate_numeric_for_nested_while` / `regress_116_luau_numeric_for_shared_nested_preheader`：
+  HIR 路径事实会留下 `not true` / `not false` 的无事件 Boolean 壳。`literal-fold` 现在只把
+  这两个显式字面量归一为 `false` / `true`，不触碰 HIR loop owner、body、break/continue
+  edge 或嵌套作用域；因此 #90 仍保留 `while` 结构哨兵，#116 仅改善为 `while true`。
+- LuaJIT `regress_55_leading_newline_string` / `regress_58_binary_string_bytes`：未证明安全，
+  继续作为 residual。`#value` 位于多值 return 的 fixed prefix 时，跨 opaque call 移动会
+  改变求值顺序；LuaJIT 的 `debug.setlocal` 可实际改写 caller slot，当前 HIR 没有 raw-length
+  producer 与 debug/opaque-write 排除事实，故不在 AST 增加特判。只有新增通用 HIR 事实或真实
+  错误复现后才重新立项。
 
 ## 审计规则
 
@@ -27,6 +67,10 @@ call→field、闭包/字段快照与构造器 wiring 都保留原形：其中�
 `local comparison; assert(alias)`、循环/分支状态 alias 与长短路值合流：直接调用可覆盖的
 全局 `assert` 会改变 global lookup 与比较元方法的相对时点，循环项会改变重复求值或写回，
 合流项则缺少稳定 HIR owner；这些形状继续保留机械 local，不再作为可读性待办。
+`regress_90_degenerate_numeric_for_nested_while` 的 Luau inner while 虽由路径事实使正文
+为空，但当前 HIR 没有可复用的 loop-owner/外部跳转证明，且回归明确保护嵌套循环壳；只
+归一条件、不删除循环。`regress_258_short_circuit_subject_ownership` 的 `if true` 外壳同样
+仍携带 TempRef owner/capture 边界，保留为 residual。
 另外，`regress_20` 的 `local lookup; return lookup or literal` 已证明可在同一终态表达式中
 安全收回：只允许 stripped/recovered binding 与无事件短路尾，调用尾、debug local、物理根
 和多返回/其它 return 位点仍保留，因此不把 call→field 等 residual 扩大到这条规则。

@@ -139,7 +139,10 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         name: "temp-inline",
         phase: PassPhase::Normal,
         depends_on: &[TempChain, DecisionShape, BooleanPattern, LogicalExpr],
-        invalidates: &[TempChain, LocalBinding],
+        // Temp substitution can expose literal/logical shapes that were not present in the
+        // pre-inline HIR expression.  Let logical-simplify consume those facts in the next
+        // invalidation round instead of leaving a mechanical numeric shell behind.
+        invalidates: &[TempChain, LocalBinding, LogicalExpr],
     },
     PassDescriptor {
         name: "generic-for-iterators",
@@ -258,7 +261,7 @@ pub(super) fn simplify_hir(
                     match index {
                         0 => decision::simplify_decision_exprs_in_proto(proto),
                         1 => boolean_shells::remove_boolean_materialization_shells_in_proto(proto),
-                        2 => logical_simplify::simplify_logical_exprs_in_proto(proto),
+                        2 => logical_simplify::simplify_logical_exprs_in_proto(proto, dialect),
                         3 => table_constructors::stabilize_table_constructors_in_proto(
                             proto, dialect, facts,
                         ),
