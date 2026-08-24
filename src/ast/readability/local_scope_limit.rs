@@ -5,13 +5,15 @@
 //! 携带外层 local 预算，把短生命周期、无属性的声明分批放入 `do ... end`；带属性 local
 //! 与 label/goto 边界保持原状。例如同一函数内 240 个顺序临时声明会变成若干个最多 64
 //! 个 local 的 `do` 块，而闭包捕获或后续仍读取的 binding 会把作用域延长到最后 mention。
+//! repeat body 中被 until 条件读取的 local 必须留在正文直属作用域，不能包进 `do`。
 
 use std::collections::BTreeMap;
 
 use super::super::common::{
-    AstBindingRef, AstBlock, AstFunctionExpr, AstLocalAttr, AstLocalBinding, AstModule, AstStmt,
+    AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstLocalAttr, AstLocalBinding, AstModule,
+    AstStmt,
 };
-use super::binding_flow::binding_mentions_in_stmt;
+use super::binding_flow::{binding_mentions_in_expr, binding_mentions_in_stmt};
 use super::{ReadabilityContext, walk};
 use walk::{BlockKind, ScopedAstRewritePass};
 
@@ -40,22 +42,47 @@ impl ScopedAstRewritePass for LocalScopeLimitPass {
         _kind: BlockKind,
         outer_locals: &Self::Scope,
     ) -> (bool, Self::Scope) {
-        let changed = scope_locals(
-            block,
-            crate::SOURCE_LOCAL_LIMIT.saturating_sub(*outer_locals),
-        );
-        let direct_locals = block.stmts.iter().map(direct_local_count).sum::<usize>();
-        (changed, outer_locals.saturating_add(direct_locals))
+        enter_block_with_trailing_condition(block, None, *outer_locals)
+    }
+
+    fn enter_repeat_body(
+        &mut self,
+        block: &mut AstBlock,
+        condition: &AstExpr,
+        outer_locals: &Self::Scope,
+    ) -> (bool, Self::Scope) {
+        enter_block_with_trailing_condition(block, Some(condition), *outer_locals)
     }
 }
 
-fn scope_locals(block: &mut AstBlock, available_locals: usize) -> bool {
+fn enter_block_with_trailing_condition(
+    block: &mut AstBlock,
+    trailing_condition: Option<&AstExpr>,
+    outer_locals: usize,
+) -> (bool, usize) {
+    let changed = scope_locals(
+        block,
+        crate::SOURCE_LOCAL_LIMIT.saturating_sub(outer_locals),
+        trailing_condition,
+    );
+    let direct_locals = block.stmts.iter().map(direct_local_count).sum::<usize>();
+    (changed, outer_locals.saturating_add(direct_locals))
+}
+
+fn scope_locals(
+    block: &mut AstBlock,
+    available_locals: usize,
+    trailing_condition: Option<&AstExpr>,
+) -> bool {
     let direct_local_count = block.stmts.iter().map(direct_local_count).sum::<usize>();
     if available_locals == 0 || direct_local_count <= available_locals {
         return false;
     }
 
     let last_mentions = last_binding_mentions(&block.stmts);
+    let trailing_mentions = trailing_condition
+        .map(binding_mentions_in_expr)
+        .unwrap_or_default();
     let scopeable_prefix = scopeable_local_prefix(&block.stmts);
     let lifetime_limit = SCOPE_LOCAL_TARGET.min(available_locals.max(1));
     let short_lived = block
@@ -65,8 +92,10 @@ fn scope_locals(block: &mut AstBlock, available_locals: usize) -> bool {
         .map(|(index, stmt)| {
             scopeable_bindings(stmt).is_some_and(|bindings| {
                 bindings.ids().all(|binding| {
-                    let last = last_mentions.get(&binding).copied().unwrap_or(index);
-                    scopeable_prefix[last + 1] - scopeable_prefix[index] <= lifetime_limit
+                    !trailing_mentions.contains(&binding) && {
+                        let last = last_mentions.get(&binding).copied().unwrap_or(index);
+                        scopeable_prefix[last + 1] - scopeable_prefix[index] <= lifetime_limit
+                    }
                 })
             })
         })

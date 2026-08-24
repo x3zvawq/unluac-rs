@@ -5,6 +5,7 @@
 //! - 某个语句实际提到了哪些 binding（包括赋值目标这种 mention，而不只是读取）？
 //! - 某个语句/块会不会提前引用一组待下沉的 hoisted local？
 //! - 某个 binding 在当前函数体里一共被用了几次？
+//! - repeat body 之后的 until 条件会不会继续读取正文 local？
 //!
 //! 这里故意把“当前函数体”作为边界，不继续钻进嵌套函数体。
 //! 原因是 AST 的 `LocalId` / `SyntheticLocalId` 都是按函数局部编号的，跨闭包继续统计
@@ -79,20 +80,45 @@ struct BindingUseSuffixCounts {
 
 impl BindingUseIndex {
     pub(super) fn for_stmts(stmts: &[AstStmt]) -> Self {
-        Self::for_stmts_with_scope(stmts, BindingUseScope::CurrentFunctionOnly)
+        Self::for_stmts_with_scope(stmts, None, BindingUseScope::CurrentFunctionOnly)
+    }
+
+    pub(super) fn for_stmts_with_trailing_expr(
+        stmts: &[AstStmt],
+        trailing_expr: Option<&AstExpr>,
+    ) -> Self {
+        Self::for_stmts_with_scope(stmts, trailing_expr, BindingUseScope::CurrentFunctionOnly)
     }
 
     pub(super) fn for_stmts_deep(stmts: &[AstStmt]) -> Self {
-        Self::for_stmts_with_scope(stmts, BindingUseScope::IncludingNestedFunctions)
+        Self::for_stmts_with_scope(stmts, None, BindingUseScope::IncludingNestedFunctions)
     }
 
-    fn for_stmts_with_scope(stmts: &[AstStmt], scope: BindingUseScope) -> Self {
-        let mut stmt_counts = Vec::with_capacity(stmts.len());
+    fn for_stmts_with_scope(
+        stmts: &[AstStmt],
+        trailing_expr: Option<&AstExpr>,
+        scope: BindingUseScope,
+    ) -> Self {
+        let stmt_len = stmts.len() + usize::from(trailing_expr.is_some());
+        let mut stmt_counts = Vec::with_capacity(stmt_len);
         let mut occurrences = BTreeMap::<AstBindingRef, Vec<(usize, usize)>>::new();
 
         for (stmt_index, stmt) in stmts.iter().enumerate() {
             let mut counts = BTreeMap::new();
             collect_binding_uses_in_stmt_with_scope(stmt, scope, &mut counts);
+            for (&binding, &count) in &counts {
+                occurrences
+                    .entry(binding)
+                    .or_default()
+                    .push((stmt_index, count));
+            }
+            stmt_counts.push(counts);
+        }
+
+        if let Some(expr) = trailing_expr {
+            let stmt_index = stmts.len();
+            let mut counts = BTreeMap::new();
+            collect_binding_uses_in_expr_with_scope(expr, scope, &mut counts);
             for (&binding, &count) in &counts {
                 occurrences
                     .entry(binding)
@@ -129,7 +155,7 @@ impl BindingUseIndex {
             .collect();
 
         Self {
-            stmt_len: stmts.len(),
+            stmt_len,
             stmt_counts,
             suffix_counts,
         }

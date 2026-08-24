@@ -26,6 +26,8 @@
 //! 成立才能证明这是源码层的局部数压力，而不是单纯由 SSA 拆分制造的定义数。物理覆盖
 //! 保证旧值已死，close epoch 与 capture sticky 事实继续隔离不同词法身份。候选扩张只沿
 //! temp occurrence index 访问真实 touch，不按“每个定义 × 全部后缀语句”重复扫描。
+//! 没有 debug/capture 身份且只被写入、从未被表达式读取的 temp 链继续保留为 temp，交给
+//! dead-temp 清理删除纯写入；把这类链提升成 local 只会把可删除的 SSA 壳固化到源码里。
 //!
 mod branch_merge;
 mod param_alias;
@@ -37,8 +39,8 @@ use std::{
 };
 
 use super::temp_touch::{
-    TempRefScopeTracker, TempTouchIndex, collect_temp_refs_by_stmt, collect_temp_refs_in_expr,
-    expr_touches_any_temp, stmt_consumes_temps_only_in_control_head,
+    TempRefScopeTracker, TempTouchIndex, collect_temp_reads_by_stmt, collect_temp_refs_by_stmt,
+    collect_temp_refs_in_expr, expr_touches_any_temp, stmt_consumes_temps_only_in_control_head,
     stmt_contains_nested_nonlocal_control,
 };
 use crate::hir::common::{
@@ -384,6 +386,7 @@ fn collect_plans(
     let facts = ctx.facts;
     let temp_debug_locals = ctx.temp_debug_locals;
     let temp_debug_scopes = ctx.temp_debug_scopes;
+    let stmt_temp_reads = collect_temp_reads_by_stmt(&block.stmts);
     let mut plans = Vec::new();
     let temp_touches = TempTouchIndex::new(stmt_temp_refs);
     let mut reserved_temps = BTreeSet::new();
@@ -453,6 +456,14 @@ fn collect_plans(
         });
 
         if sticky_local.is_none() && touching_stmt_indices.is_empty() {
+            continue;
+        }
+        if sticky_local.is_none()
+            && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
+            && std::iter::once(decl_index)
+                .chain(touching_stmt_indices.iter().copied())
+                .all(|index| stmt_temp_reads[index].is_disjoint(&group))
+        {
             continue;
         }
         if sticky_local.is_none() {

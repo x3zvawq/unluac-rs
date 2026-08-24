@@ -1,20 +1,27 @@
-//! branch-control 收敛：删除无求值行为的空分支，把残留的前向 goto 壳恢复成普通条件结构。
+//! branch-control 收敛：删除无求值行为的空/常量分支，把公共 direct-copy 尾部移出分支，
+//! 将 repeat 尾部的单次 break guard 收回 until 条件，并把残留前向 goto 壳恢复成普通条件结构。
 //!
 //! 这里只消费已经存在的 `If/Goto/Label`，不重新解释 CFG，也不接管同一 lvalue 选值；
 //! branch-value 形状仍由 `branch_value_folding` 先处理。每轮先为当前 block 建一次 label
 //! 位置和引用计数，再按不交叉区间从右向左改写，避免多个 guard 共用 label 时反复全块
 //! 扫描和重建。
+//!
+//! 例如 `if false then body end` 会被删除，`if true then body end` 会保留原 branch block
+//! 的词法作用域后去掉条件壳；动态 lookup、调用、table 构造与元方法比较都不进入该规则。
 
 use std::collections::BTreeMap;
 
 use crate::hir::common::{
-    HirBlock, HirCallExpr, HirCallStmt, HirExpr, HirIf, HirLabelId, HirProto, HirStmt,
-    HirUnaryOpKind,
+    HirBlock, HirCallExpr, HirCallStmt, HirExpr, HirIf, HirLabelId, HirLogicalExpr, HirProto,
+    HirStmt, HirUnaryOpKind, LocalId,
 };
 use crate::hir::expr_safety::expr_is_discard_safe;
 
+use super::carried_locals::{CarryBinding, single_binding_copy};
+use super::expr_facts::expr_truthiness;
 use super::label_refs::count_label_references;
 use super::logical_simplify::normalize_condition_context;
+use super::visit::{HirVisitor, visit_block, visit_expr, visit_stmts};
 use super::walk::{HirRewritePass, rewrite_proto};
 
 pub(super) fn fold_branch_control_in_proto(proto: &mut HirProto) -> bool {
@@ -25,18 +32,154 @@ struct BranchControlPass;
 
 impl HirRewritePass for BranchControlPass {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
+        let constant_changed = fold_redundant_ifs(&mut block.stmts);
+        let common_tail_changed = sink_common_direct_copy_tails(&mut block.stmts);
         let empty_changed = remove_discard_safe_empty_ifs(&mut block.stmts);
         let terminal_changed = fold_forward_gotos(&mut block.stmts, FoldKind::TerminalElse);
         let guard_changed = fold_forward_gotos(&mut block.stmts, FoldKind::Guard);
         let nop_changed = remove_nop_goto_labels(&mut block.stmts);
-        empty_changed || terminal_changed || guard_changed || nop_changed
+        constant_changed
+            || common_tail_changed
+            || empty_changed
+            || terminal_changed
+            || guard_changed
+            || nop_changed
     }
 
     fn rewrite_stmt(&mut self, stmt: &mut HirStmt) -> bool {
-        fold_effect_only_call(stmt)
+        fold_trailing_repeat_break_condition(stmt)
+            || fold_effect_only_call(stmt)
             || fold_leading_while_break_guard(stmt)
             || naturalize_if_polarity(stmt)
     }
+}
+
+fn sink_common_direct_copy_tails(stmts: &mut Vec<HirStmt>) -> bool {
+    let original = std::mem::take(stmts);
+    let mut rewritten = Vec::with_capacity(original.len());
+    let mut changed = false;
+
+    for stmt in original {
+        let HirStmt::If(mut if_stmt) = stmt else {
+            rewritten.push(stmt);
+            continue;
+        };
+        let Some(common_tail) = take_common_direct_copy_tail(&mut if_stmt) else {
+            rewritten.push(HirStmt::If(if_stmt));
+            continue;
+        };
+        rewritten.push(HirStmt::If(if_stmt));
+        rewritten.push(common_tail);
+        changed = true;
+    }
+
+    *stmts = rewritten;
+    changed
+}
+
+fn take_common_direct_copy_tail(if_stmt: &mut HirIf) -> Option<HirStmt> {
+    let else_block = if_stmt.else_block.as_ref()?;
+    let then_tail = if_stmt.then_block.stmts.last()?;
+    let else_tail = else_block.stmts.last()?;
+    if then_tail != else_tail {
+        return None;
+    }
+    let (target, source) = single_binding_copy(then_tail)?;
+    if !arm_allows_direct_copy_sink(&if_stmt.then_block, target, source)
+        || !arm_allows_direct_copy_sink(else_block, target, source)
+    {
+        return None;
+    }
+
+    let common_tail = if_stmt.then_block.stmts.pop()?;
+    let removed_else_tail = if_stmt.else_block.as_mut()?.stmts.pop();
+    debug_assert_eq!(removed_else_tail.as_ref(), Some(&common_tail));
+    Some(common_tail)
+}
+
+fn arm_allows_direct_copy_sink(
+    block: &HirBlock,
+    target: CarryBinding,
+    source: CarryBinding,
+) -> bool {
+    let mut visitor = DirectCopySinkBoundary {
+        locals: [target.local(), source.local()],
+        safe: true,
+    };
+    visit_block(block, &mut visitor);
+    visitor.safe
+}
+
+struct DirectCopySinkBoundary {
+    locals: [Option<LocalId>; 2],
+    safe: bool,
+}
+
+impl DirectCopySinkBoundary {
+    fn introduces(&self, local: LocalId) -> bool {
+        self.locals.contains(&Some(local))
+    }
+}
+
+impl HirVisitor for DirectCopySinkBoundary {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        self.safe &= match stmt {
+            HirStmt::LocalDecl(local_decl) => !local_decl
+                .bindings
+                .iter()
+                .any(|local| self.introduces(*local)),
+            HirStmt::NumericFor(numeric_for) => !self.introduces(numeric_for.binding),
+            HirStmt::GenericFor(generic_for) => !generic_for
+                .bindings
+                .iter()
+                .any(|local| self.introduces(*local)),
+            HirStmt::ToBeClosed(_) | HirStmt::Close(_) => false,
+            _ => true,
+        };
+    }
+}
+
+fn fold_redundant_ifs(stmts: &mut Vec<HirStmt>) -> bool {
+    let original = std::mem::take(stmts);
+    let mut rewritten = Vec::with_capacity(original.len());
+    let mut changed = false;
+
+    for stmt in original {
+        let HirStmt::If(mut if_stmt) = stmt else {
+            rewritten.push(stmt);
+            continue;
+        };
+        let selected_then = if expr_is_discard_safe(&if_stmt.cond)
+            && !discard_safe_expr_has_unresolved(&if_stmt.cond)
+        {
+            expr_truthiness(&if_stmt.cond).or_else(|| {
+                if_stmt
+                    .else_block
+                    .as_ref()
+                    .is_some_and(|else_block| if_stmt.then_block == *else_block)
+                    .then_some(true)
+            })
+        } else {
+            None
+        };
+        let Some(selected_then) = selected_then else {
+            rewritten.push(HirStmt::If(if_stmt));
+            continue;
+        };
+
+        let selected = if selected_then {
+            if_stmt.then_block
+        } else {
+            if_stmt.else_block.take().unwrap_or_default()
+        };
+        if !selected.stmts.is_empty() {
+            rewritten.push(HirStmt::Block(Box::new(selected)));
+        }
+        changed = true;
+    }
+
+    *stmts = rewritten;
+    changed
 }
 
 fn fold_effect_only_call(stmt: &mut HirStmt) -> bool {
@@ -107,6 +250,102 @@ fn take_effect_only_call(mut expr: &mut HirExpr) -> Option<Box<HirCallExpr>> {
             }
             _ => return None,
         }
+    }
+}
+
+fn fold_trailing_repeat_break_condition(stmt: &mut HirStmt) -> bool {
+    let HirStmt::Repeat(repeat_stmt) = stmt else {
+        return false;
+    };
+    let Some((tail, prefix)) = repeat_stmt.body.stmts.split_last() else {
+        return false;
+    };
+    let HirStmt::If(outer) = tail else {
+        return false;
+    };
+    if !matches!(outer.then_block.stmts.as_slice(), [HirStmt::Break]) {
+        return false;
+    }
+
+    let (nested_else, outer_cond, moved_cond) = if let Some(else_block) = &outer.else_block {
+        let [HirStmt::If(nested)] = else_block.stmts.as_slice() else {
+            return false;
+        };
+        if nested.else_block.is_some()
+            || !matches!(nested.then_block.stmts.as_slice(), [HirStmt::Break])
+        {
+            return false;
+        }
+        (true, Some(&outer.cond), &nested.cond)
+    } else {
+        (false, None, &outer.cond)
+    };
+    if matches!(moved_cond, HirExpr::LogicalOr(_))
+        || matches!(repeat_stmt.cond, HirExpr::LogicalOr(_))
+        || !repeat_condition_fold_is_safe(
+            prefix,
+            outer_cond
+                .into_iter()
+                .chain([moved_cond, &repeat_stmt.cond]),
+        )
+    {
+        return false;
+    }
+
+    let lhs = if nested_else {
+        let Some(HirStmt::If(outer)) = repeat_stmt.body.stmts.last_mut() else {
+            unreachable!("validated repeat tail must remain an if");
+        };
+        let mut nested_stmts = outer
+            .else_block
+            .take()
+            .expect("validated repeat tail must retain its else block")
+            .stmts;
+        let Some(HirStmt::If(nested)) = nested_stmts.pop() else {
+            unreachable!("validated repeat else must contain one if");
+        };
+        nested.cond
+    } else {
+        let Some(HirStmt::If(guard)) = repeat_stmt.body.stmts.pop() else {
+            unreachable!("validated repeat tail must remain an if");
+        };
+        guard.cond
+    };
+    let rhs = std::mem::replace(&mut repeat_stmt.cond, HirExpr::Boolean(false));
+    repeat_stmt.cond = HirExpr::LogicalOr(Box::new(HirLogicalExpr { lhs, rhs }));
+    true
+}
+
+fn repeat_condition_fold_is_safe<'a>(
+    prefix: &[HirStmt],
+    exprs: impl IntoIterator<Item = &'a HirExpr>,
+) -> bool {
+    let mut boundary = RepeatConditionFoldBoundary { safe: true };
+    visit_stmts(prefix, &mut boundary);
+    for expr in exprs {
+        visit_expr(expr, &mut boundary);
+    }
+    boundary.safe
+}
+
+struct RepeatConditionFoldBoundary {
+    safe: bool,
+}
+
+impl HirVisitor for RepeatConditionFoldBoundary {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        self.safe &= !matches!(
+            stmt,
+            HirStmt::ToBeClosed(_)
+                | HirStmt::Close(_)
+                | HirStmt::Continue
+                | HirStmt::Goto(_)
+                | HirStmt::Label(_)
+        );
+    }
+
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        self.safe &= !matches!(expr, HirExpr::Decision(_) | HirExpr::Unresolved(_));
     }
 }
 

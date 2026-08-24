@@ -92,6 +92,7 @@ pub(super) fn reachable_numeric_for_loop(
     };
     if residual_blocks.as_ref().is_some_and(|residual| {
         !residual_cycle_is_nested(cfg, natural_loop, residual, &residual_backedges)
+            && !residual_cycle_precedes_numeric_latch(cfg, natural_loop, residual, latch)
     }) {
         // residual cycle 与 VM latch 无法形成严格的 containment 分区时，不能任选一个
         // 回边当 numeric-for；交回 merged candidate，最终 plan 会结构化或形成 island。
@@ -315,6 +316,21 @@ pub(super) fn residual_cycle_is_nested(
         let source = cfg.edges[backedge.index()].from;
         cfg.blocks[source.index()].instrs.end() <= outer_only_start
     })
+}
+
+/// Numeric latch 是推进外层迭代的唯一协议动作；只向它退出的严格 residual cycle
+/// 必然在同一次迭代内完成，因此可以作为共享 header 的 child loop。
+fn residual_cycle_precedes_numeric_latch(
+    cfg: &Cfg,
+    natural_loop: &crate::structure::NaturalLoop,
+    residual: &BTreeSet<BlockRef>,
+    latch: BlockRef,
+) -> bool {
+    residual != &natural_loop.blocks
+        && residual.len() > 1
+        && !residual.contains(&latch)
+        && is_reducible_region(cfg, natural_loop.header, residual)
+        && collect_region_exits(cfg, residual) == BTreeSet::from([latch])
 }
 
 pub(super) fn numeric_for_owner(

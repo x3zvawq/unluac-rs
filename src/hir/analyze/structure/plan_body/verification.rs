@@ -222,9 +222,22 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                     .copied()
                     .flatten()
                     .unwrap_or(value);
+                // Capture targets include the slot close epoch. Also require the normal temp
+                // resolver to select that cell, so a debug binding cannot override this proof.
+                let shares_capture_target = self
+                    .lowering
+                    .bindings
+                    .captured_temp_targets
+                    .get(&fixed)
+                    .copied()
+                    .is_some_and(|capture| {
+                        self.lowering.bindings.captured_temp_targets.get(&target) == Some(&capture)
+                            && self.lowering.bindings.lvalue_for_temp(fixed) == capture.lvalue()
+                            && self.lowering.bindings.lvalue_for_temp(target) == capture.lvalue()
+                    });
                 let read_exact = !absorbed
                     && writes_fixed_binding
-                    && (fixed == target || {
+                    && (fixed == target || shares_capture_target || {
                         let canonical_expr = self.edge_ssa_expr(owner, source_block, canonical)?;
                         match self
                             .lowering

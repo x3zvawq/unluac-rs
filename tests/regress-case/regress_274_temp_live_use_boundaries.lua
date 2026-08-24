@@ -1,6 +1,8 @@
 -- regress_274_temp_live_use_boundaries: proto级live-use必须保留跨结构存活与覆盖写入副作用
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-not-contains [[local r0_11 = r0_2("first", 10)]]
+-- unluac: expect-not-contains [[ in nil do]]
 
 local events = {}
 

@@ -6,6 +6,9 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-contains [[, nil, nil, ]]
+-- unluac: expect-not-contains [[ = nil, nil]]
+-- unluac: expect-not-contains [[in function()]]
 local log = {}
 
 local closer = setmetatable({}, {

@@ -192,8 +192,29 @@ local function test_for_const_close()
 
 end
 
+-- lua54_01_close#6: 参数alias不能取代to-be-closed绑定身份
+local function test_tbc_param_binding()
+    local closed
+    local resource = setmetatable({ name = "parameter" }, {
+        __close = function(self)
+            closed = self.name
+        end,
+    })
+
+    local function consume(value)
+        local owned <close> = value
+        return owned.name
+    end
+
+    local name = consume(resource)
+    assert(name == "parameter")
+    assert(closed == "parameter")
+    print("lua54_01_close#6", name, closed)
+end
+
 test_tbc_basic()
 test_tbc_multi_exit()
 test_tbc_goto_reenter()
 test_close_tailcall()
 test_for_const_close()
+test_tbc_param_binding()

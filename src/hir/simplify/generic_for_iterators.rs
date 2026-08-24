@@ -1,11 +1,16 @@
 //! 把 generic-for 的 VM 初始化序列收回完整 source value pack。
 //!
 //! Lua 5.4+ 除 iterator/state/control 外还会物化第 4 个 closing value；前置固定表达式
-//! 与最终多返回调用又可能拆成多条赋值。这里按 GenericFor 已记录的完整源码 pack
-//! 一次接管初始化序列，不再按 call/nil 形状分别猜测。
+//! 与最终多返回调用又可能拆成多条赋值。这里优先按 GenericFor 已记录的完整源码 pack
+//! 一次接管初始化序列；若 closing value 已经更早求值，则只额外收回紧邻循环头的匿名
+//! 单次 `nil` run，不跨语句移动其它表达式。
 //!
 //! 输入：`t0 = next; t1,t2,t3 = factory()<exact:3>; GenericFor(t0,t1,t2,t3)`
 //! 输出：`GenericFor(next, factory()<open>)`
+//! 输入：`t1,t2 = nil,nil; GenericFor(t0,t1,t2,t3)`
+//! 输出：`GenericFor(t0,nil,nil,t3)`
+//! direct closure producer 保留为独立 local function；child proto 的体量无法由 HIR
+//! 表达式复杂度概括，不应恢复成 loop head 内的多行匿名函数。
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -58,7 +63,9 @@ impl HirRewritePass for GenericForIteratorPass<'_> {
         let mut changed = false;
 
         while !pending.is_empty() {
-            if let Some(plan) = fold_plan(pending.make_contiguous(), self) {
+            if fold_adjacent_nil_iterators(&mut pending, self, &mut new_stmts) {
+                changed = true;
+            } else if let Some(plan) = fold_plan(pending.make_contiguous(), self) {
                 fold_front(&mut pending, plan, &mut new_stmts);
                 changed = true;
             } else {
@@ -84,6 +91,71 @@ fn trim_trailing_nil_iterators(iterator: &mut HirValuePack) -> bool {
         iterator.fixed.pop();
     }
     iterator.fixed.len() != original_len
+}
+
+fn fold_adjacent_nil_iterators(
+    pending: &mut VecDeque<HirStmt>,
+    context: &GenericForIteratorPass<'_>,
+    new_stmts: &mut Vec<HirStmt>,
+) -> bool {
+    let (iterator_start, value_count) = {
+        let stmts = pending.make_contiguous();
+        let (Some(HirStmt::Assign(assign)), Some(HirStmt::GenericFor(generic_for))) =
+            (stmts.first(), stmts.get(1))
+        else {
+            return false;
+        };
+        let value_count = assign.targets.len();
+        // exact-width tail 也能给出目标数，但 fixed 为空；这里只接受逐项可核验的 nil。
+        if value_count == 0
+            || assign.values.tail.is_some()
+            || assign.values.fixed.len() != value_count
+        {
+            return false;
+        }
+        let Some(iterator_start) =
+            generic_for
+                .iterator
+                .fixed
+                .windows(value_count)
+                .position(|window| {
+                    window
+                        .iter()
+                        .zip(&assign.targets)
+                        .zip(&assign.values.fixed)
+                        .all(|((iterator, target), value)| {
+                            matches!(
+                                (iterator, target, value),
+                                (
+                                    HirExpr::TempRef(actual),
+                                    HirLValue::Temp(expected),
+                                    HirExpr::Nil
+                                ) if actual == expected
+                                    && context.use_counts.get(expected) == Some(&1)
+                                    && !context
+                                        .debug_temps
+                                        .get(expected.index())
+                                        .copied()
+                                        .unwrap_or(false)
+                            )
+                        })
+                })
+        else {
+            return false;
+        };
+        (iterator_start, value_count)
+    };
+
+    let Some(HirStmt::Assign(_)) = pending.pop_front() else {
+        unreachable!("validated adjacent generic-for nil assignment");
+    };
+    let Some(HirStmt::GenericFor(mut generic_for)) = pending.pop_front() else {
+        unreachable!("validated adjacent generic-for owner");
+    };
+    generic_for.iterator.fixed[iterator_start..iterator_start + value_count].fill(HirExpr::Nil);
+    trim_trailing_nil_iterators(&mut generic_for.iterator);
+    new_stmts.push(HirStmt::GenericFor(generic_for));
+    true
 }
 
 #[derive(Clone, Copy)]
@@ -203,6 +275,11 @@ fn assignments_match_iterator(assignments: &[HirStmt], generic_for: &HirGenericF
         };
         if assign.values.exact_result_len() != Some(assign.targets.len())
             || (assign.values.tail.is_some() && index + 1 != assignments.len())
+            || assign
+                .values
+                .fixed
+                .iter()
+                .any(|value| matches!(value, HirExpr::Closure(_)))
         {
             return false;
         }

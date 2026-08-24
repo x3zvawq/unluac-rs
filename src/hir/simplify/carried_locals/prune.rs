@@ -1,15 +1,15 @@
-//! carried-local 改写后的冗余赋值裁剪。
+//! carried-local 收敛后的冗余赋值裁剪。
 //!
 //! handoff owner 在主模块里完成语义判断；这个模块只删除本次改写可以证明制造出来的
-//! `x = x` 组件和空 assign。它不重新判断 carried 状态是否可合并，避免把 preserved
-//! current-value 这类仍有语义的分支快照误删。
+//! `x = x` 组件和空 assign，以及精确相邻的 `a = b; b = a` 无操作回写。它不重新判断
+//! carried 状态是否可合并，避免把 preserved current-value 这类仍有语义的分支快照误删。
 
 use std::collections::BTreeSet;
 
 use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirStmt};
 
 use super::super::walk::{HirRewritePass, rewrite_stmts};
-use super::binding::CarryBinding;
+use super::binding::{CarryBinding, single_binding_copy};
 
 pub(super) struct RedundantSelfAssignPrunePass {
     prunable_bindings: BTreeSet<CarryBinding>,
@@ -39,6 +39,32 @@ pub(super) fn prune_empty_assign_stmts(block: &mut HirBlock) -> bool {
     let original_len = block.stmts.len();
     block.stmts.retain(|stmt| !is_empty_assign_stmt(stmt));
     block.stmts.len() != original_len
+}
+
+pub(super) fn prune_redundant_copy_stmts(block: &mut HirBlock) -> bool {
+    let original = std::mem::take(&mut block.stmts);
+    let mut rewritten = Vec::<HirStmt>::with_capacity(original.len());
+    let mut changed = false;
+
+    for stmt in original {
+        let copy = single_binding_copy(&stmt);
+        if copy.is_some_and(|(target, source)| target == source)
+            || rewritten
+                .last()
+                .and_then(single_binding_copy)
+                .zip(copy)
+                .is_some_and(|((first_target, first_source), (target, source))| {
+                    first_target != first_source && first_target == source && first_source == target
+                })
+        {
+            changed = true;
+        } else {
+            rewritten.push(stmt);
+        }
+    }
+
+    block.stmts = rewritten;
+    changed
 }
 
 pub(super) fn prune_redundant_self_assigns_in_stmts(

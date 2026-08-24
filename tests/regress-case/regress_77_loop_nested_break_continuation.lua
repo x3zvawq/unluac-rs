@@ -2,6 +2,8 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-not-contains [[r1_0 = r1_1]]
+-- unluac: expect-not-contains [[r2_0 = r2_1]]
 local function repeat_branch(a, c)
     local x = 0
     repeat
@@ -34,5 +36,7 @@ end
 print(
     "regress_77_loop_nested_break_continuation#1",
     repeat_branch(false, true),
+    repeat_branch(true, false),
+    repeat_branch(true, true),
     while_branch(true, true, true)
 )

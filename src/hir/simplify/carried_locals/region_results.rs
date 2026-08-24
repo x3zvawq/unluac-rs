@@ -469,13 +469,17 @@ fn try_collapse_loop_results(
         }
         HirStmt::Repeat(repeat_stmt) => (
             &repeat_stmt.body,
-            true,
+            repeat_stmt.cond != HirExpr::Boolean(false),
             repeat_stmt.cond != HirExpr::Boolean(true),
         ),
         _ => return false,
     };
     let mut exits = Vec::new();
-    if !collect_break_assignments(body, &mut exits, requires_exact_exits) || exits.is_empty() {
+    // 内层 loop 的 break/continue 归内层 owner，但 goto 可以直接越过当前 loop。
+    if requires_exact_exits && block_has_label_or_goto(body)
+        || !collect_break_assignments(body, &mut exits, requires_exact_exits)
+        || exits.is_empty()
+    {
         return false;
     }
     if include_fallthrough && block_may_fall_through(body) {

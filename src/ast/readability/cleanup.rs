@@ -8,11 +8,15 @@
 //! 例子：
 //! - `do print(x) end` 会在内部没有局部作用域意义时折成 `print(x)`
 //! - `local t0` 这种只剩机械 temp 壳、且没有值也没有使用的声明会被删除
+//! - 未使用的 recovered `local t0 = side_effect()` 会保留为 `side_effect()` 调用
 //! - 函数尾部的 `return` 会在没有返回值时被去掉
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::super::common::{AstBindingRef, AstBlock, AstLocalAttr, AstModule, AstStmt};
+use super::super::common::{
+    AstBindingRef, AstBlock, AstCallKind, AstCallStmt, AstExpr, AstLocalAttr, AstLocalOrigin,
+    AstModule, AstStmt,
+};
 use super::ReadabilityContext;
 use super::binding_flow::{BindingUseIndex, binding_mentions_in_stmt};
 use super::expr_analysis::is_discard_safe_expr;
@@ -29,11 +33,20 @@ impl AstRewritePass for CleanupPass {
         cleanup_block(
             block,
             matches!(kind, BlockKind::ModuleBody | BlockKind::FunctionBody),
+            None,
         )
+    }
+
+    fn rewrite_repeat_body(&mut self, block: &mut AstBlock, condition: &AstExpr) -> bool {
+        cleanup_block(block, false, Some(condition))
     }
 }
 
-fn cleanup_block(block: &mut AstBlock, allow_trailing_empty_return_elision: bool) -> bool {
+fn cleanup_block(
+    block: &mut AstBlock,
+    allow_trailing_empty_return_elision: bool,
+    trailing_condition: Option<&AstExpr>,
+) -> bool {
     let mut changed = false;
 
     let old_stmts = std::mem::take(&mut block.stmts);
@@ -46,7 +59,7 @@ fn cleanup_block(block: &mut AstBlock, allow_trailing_empty_return_elision: bool
                 // 这里专门清理“只剩一条非局部作用域语句”的机械 do-end。
                 // 它通常是前层为了暂存中间 local 范围而留下来的壳；一旦内部局部已经被
                 // 其他 pass 收回，这层壳继续保留只会让源码多出无意义缩进。
-                flattened_stmts.push(nested.stmts[0].clone());
+                flattened_stmts.extend(nested.stmts);
                 changed = true;
             }
             other => flattened_stmts.push(other),
@@ -70,21 +83,43 @@ fn cleanup_block(block: &mut AstBlock, allow_trailing_empty_return_elision: bool
         changed = true;
     }
 
-    let binding_flow = BlockBindingFlow::new(block);
-    let discardable_unused_locals = collect_discardable_unused_locals(block, &binding_flow);
-    let original_len = block.stmts.len();
-    block.stmts.retain(|stmt| {
-        !matches!(
-            stmt,
-            AstStmt::LocalDecl(local_decl)
+    let binding_flow = BlockBindingFlow::new(block, trailing_condition);
+    let original_stmts = std::mem::take(&mut block.stmts);
+    let mut retained_stmts = Vec::with_capacity(original_stmts.len());
+    for stmt in original_stmts {
+        match stmt {
+            AstStmt::LocalDecl(mut local_decl)
                 if local_decl.bindings.len() == 1
                     && local_decl.values.len() == 1
-                    && discardable_unused_locals.contains(&local_decl.bindings[0].id)
-        )
-    });
-    changed |= block.stmts.len() != original_len;
+                    && local_decl.bindings[0].attr == AstLocalAttr::None
+                    && local_decl.bindings[0].origin == AstLocalOrigin::Recovered
+                    && !binding_flow.keeps_decl_alive(local_decl.bindings[0].id) =>
+            {
+                if is_discard_safe_expr(&local_decl.values[0]) {
+                    changed = true;
+                } else {
+                    let Some(value) = local_decl.values.pop() else {
+                        retained_stmts.push(AstStmt::LocalDecl(local_decl));
+                        continue;
+                    };
+                    match into_call_kind(value) {
+                        Ok(call) => {
+                            retained_stmts.push(AstStmt::CallStmt(Box::new(AstCallStmt { call })));
+                            changed = true;
+                        }
+                        Err(value) => {
+                            local_decl.values.push(value);
+                            retained_stmts.push(AstStmt::LocalDecl(local_decl));
+                        }
+                    }
+                }
+            }
+            other => retained_stmts.push(other),
+        }
+    }
+    block.stmts = retained_stmts;
 
-    let binding_flow = BlockBindingFlow::new(block);
+    let binding_flow = BlockBindingFlow::new(block, trailing_condition);
     let live_mechanical_bindings = collect_live_mechanical_bindings(block, &binding_flow);
     for stmt in &mut block.stmts {
         let AstStmt::LocalDecl(local_decl) = stmt else {
@@ -161,16 +196,23 @@ struct BlockBindingFlow {
 }
 
 impl BlockBindingFlow {
-    fn new(block: &AstBlock) -> Self {
+    fn new(block: &AstBlock, trailing_condition: Option<&AstExpr>) -> Self {
         let mut mention_counts = BTreeMap::<AstBindingRef, usize>::new();
         for stmt in &block.stmts {
             for binding in binding_mentions_in_stmt(stmt) {
                 *mention_counts.entry(binding).or_default() += 1;
             }
         }
+        if let Some(condition) = trailing_condition {
+            for binding in super::binding_flow::binding_mentions_in_expr(condition) {
+                *mention_counts.entry(binding).or_default() += 1;
+            }
+        }
+        let use_index =
+            BindingUseIndex::for_stmts_with_trailing_expr(&block.stmts, trailing_condition);
         Self {
             mention_counts,
-            use_index: BindingUseIndex::for_stmts(&block.stmts),
+            use_index,
         }
     }
 
@@ -210,33 +252,13 @@ fn collect_live_mechanical_bindings(
     live_bindings
 }
 
-fn collect_discardable_unused_locals(
-    block: &AstBlock,
-    binding_flow: &BlockBindingFlow,
-) -> std::collections::BTreeSet<AstBindingRef> {
-    let mut bindings = std::collections::BTreeSet::new();
-    for stmt in &block.stmts {
-        let AstStmt::LocalDecl(local_decl) = stmt else {
-            continue;
-        };
-        let [binding] = local_decl.bindings.as_slice() else {
-            continue;
-        };
-        let [value] = local_decl.values.as_slice() else {
-            continue;
-        };
-        if binding.attr != AstLocalAttr::None {
-            continue;
+fn into_call_kind(expr: AstExpr) -> Result<AstCallKind, AstExpr> {
+    match expr {
+        AstExpr::Call(call) => Ok(AstCallKind::Call(call)),
+        AstExpr::MethodCall(call) => Ok(AstCallKind::MethodCall(call)),
+        AstExpr::SingleValue(inner) => {
+            into_call_kind(*inner).map_err(|inner| AstExpr::SingleValue(Box::new(inner)))
         }
-        if !matches!(binding.origin, crate::ast::AstLocalOrigin::Recovered) {
-            continue;
-        }
-        if binding_flow.keeps_decl_alive(binding.id) {
-            continue;
-        }
-        if is_discard_safe_expr(value) {
-            bindings.insert(binding.id);
-        }
+        other => Err(other),
     }
-    bindings
 }

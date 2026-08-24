@@ -8,6 +8,8 @@
 //! - 相邻调用准备 run 中的简单表构造参数，可以随同 receiver/callee 一起收回调用位
 //! - 相邻 recovered local run 里，只有末尾 local 仍会跨语句存活的机械链
 //! - generic-for 的 method receiver 允许收回一个紧邻的 recovered binding 别名
+//! - repeat body 的 use index 把 until 条件计作尾随表达式，不删除仍对条件可见的 local
+//! - 多值 return 顶层只收回 context-safe 的唯一引用 alias；可变快照仍通过求值前缀证明
 
 mod candidate;
 mod eval_order;
@@ -147,6 +149,18 @@ impl AstRewritePass for InlineExprsPass {
             self.mutable_snapshot_stack
                 .last()
                 .expect("module scope must remain active"),
+            None,
+        )
+    }
+
+    fn rewrite_repeat_body(&mut self, block: &mut AstBlock, condition: &AstExpr) -> bool {
+        rewrite_current_block(
+            block,
+            self.options,
+            self.mutable_snapshot_stack
+                .last()
+                .expect("module scope must remain active"),
+            Some(condition),
         )
     }
 }
@@ -155,11 +169,12 @@ fn rewrite_current_block(
     block: &mut AstBlock,
     options: ReadabilityOptions,
     mutable_snapshots: &MutableSnapshotNames,
+    trailing_condition: Option<&AstExpr>,
 ) -> bool {
     let mut changed = false;
 
     let old_stmts = std::mem::take(&mut block.stmts);
-    let use_index = BindingUseIndex::for_stmts(&old_stmts);
+    let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_condition);
     let write_index = BindingWriteIndex::for_stmts(&old_stmts);
     let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut index = 0;
@@ -291,10 +306,26 @@ fn rewrite_current_block(
     }
 
     block.stmts = materialize_stmt_plan(old_stmts, stmt_plan);
-    changed |= collapse_adjacent_call_alias_runs(block, options, mutable_snapshots);
-    changed |= collapse_terminal_call_result_alias_runs(block, options, mutable_snapshots);
-    changed |= collapse_terminal_local_mechanical_runs(block, options, mutable_snapshots);
-    changed |= collapse_adjacent_mechanical_alias_runs(block, options, mutable_snapshots);
+    changed |=
+        collapse_adjacent_call_alias_runs(block, options, mutable_snapshots, trailing_condition);
+    changed |= collapse_terminal_call_result_alias_runs(
+        block,
+        options,
+        mutable_snapshots,
+        trailing_condition,
+    );
+    changed |= collapse_terminal_local_mechanical_runs(
+        block,
+        options,
+        mutable_snapshots,
+        trailing_condition,
+    );
+    changed |= collapse_adjacent_mechanical_alias_runs(
+        block,
+        options,
+        mutable_snapshots,
+        trailing_condition,
+    );
     changed
 }
 
@@ -364,6 +395,7 @@ mod tests {
             &mut block,
             ReadabilityOptions::default(),
             &MutableSnapshotNames::new(),
+            None,
         ));
         assert_eq!(block, expected);
     }

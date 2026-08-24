@@ -1,7 +1,9 @@
 -- regress_316_large_ssa_scope_identity: SSA 定义多不等于源码 local 压力，不能因物理槽复用合并不同作用域身份
 -- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-contains [[local r1_62 = 0.5]]
+-- unluac: expect-contains [[local r1_2 = 0.5]]
 -- unluac: expect-not-contains [[    r1_2 = 0.5]]
+-- unluac: expect-contains [[p1_0.worker:touch(1, 2, 3, 4)]]
+-- unluac: expect-not-contains [[ = p1_0.worker]]
 
 local function configure(subject)
     local width, height = 122, 165

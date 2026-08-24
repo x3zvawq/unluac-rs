@@ -75,7 +75,7 @@ pub(super) fn validate(
     validate_block_coverage(cfg, plan)?;
     validate_region_entries(cfg, plan, intervals)?;
     validate_single_pass_plans(cfg, plan, intervals)?;
-    let condition_edges = validate_condition_plans(cfg, plan)?;
+    let condition_edges = validate_condition_plans(proto, cfg, plan)?;
     validate_branch_plans(cfg, plan, intervals, &block_stats, &condition_edges)?;
     let loop_edges = validate_loop_plans(proto, cfg, plan, intervals, &block_stats)?;
     validate_labels(cfg, plan)?;

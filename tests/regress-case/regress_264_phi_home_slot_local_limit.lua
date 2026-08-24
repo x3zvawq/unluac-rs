@@ -1,5 +1,7 @@
--- regress_264_phi_home_slot_local_limit#1: 顺序branch phi必须复用同一物理home slot
--- unluac: expect-not-contains [[local r1_1]]
+-- regress_264_phi_home_slot_local_limit#1: 顺序branch phi复用状态binding且不物化条件scratch
+-- unluac: expect-contains [[if p1_0[2] then]]
+-- unluac: expect-contains [[if p1_0[200] then]]
+-- unluac: expect-not-contains [[    r1_1 = p1_0]]
 local function run(flags)
     local value = 0
     if flags[1] then value = value + 0 end if flags[2] then value = value + 0 end if flags[3] then value = value + 0 end if flags[4] then value = value + 0 end
@@ -55,5 +57,16 @@ local function run(flags)
     return value
 end
 
-print("regress_264_phi_home_slot_local_limit#1", run({}))
-
+local reads = {}
+local flags = setmetatable({}, {
+    __index = function(_, key)
+        reads[#reads + 1] = key
+        return false
+    end,
+})
+local result = run(flags)
+assert(result == 0 and #reads == 200 and reads[1] == 1 and reads[200] == 200)
+for key = 1, 200 do
+    assert(reads[key] == key)
+end
+print("regress_264_phi_home_slot_local_limit#1", result, #reads)

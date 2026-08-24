@@ -5,6 +5,38 @@
 
 use super::common::{HirBinaryOpKind, HirCaptureMode, HirExpr, HirUnaryOpKind};
 
+/// 只计算不可能触发元方法的原始字面量比较。
+///
+/// 不同数值表示、cdata/vector/complex 等方言相关值故意不在这里互转；调用方只能把
+/// `Some` 当作可删除求值的常量事实，`None` 必须继续保留原表达式。
+pub(crate) fn primitive_literal_comparison_value(
+    op: HirBinaryOpKind,
+    lhs: &HirExpr,
+    rhs: &HirExpr,
+) -> Option<bool> {
+    if op == HirBinaryOpKind::Eq {
+        return match (lhs, rhs) {
+            (HirExpr::Integer(lhs), HirExpr::Integer(rhs)) => Some(lhs == rhs),
+            (HirExpr::Number(lhs), HirExpr::Number(rhs)) => Some(lhs == rhs),
+            (HirExpr::String(lhs), HirExpr::String(rhs)) => Some(lhs == rhs),
+            (HirExpr::Boolean(lhs), HirExpr::Boolean(rhs)) => Some(lhs == rhs),
+            (HirExpr::Nil, HirExpr::Nil) => Some(true),
+            _ => None,
+        };
+    }
+    let ordering = match (lhs, rhs) {
+        (HirExpr::Integer(lhs), HirExpr::Integer(rhs)) => lhs.cmp(rhs),
+        (HirExpr::Number(lhs), HirExpr::Number(rhs)) => lhs.partial_cmp(rhs)?,
+        (HirExpr::String(lhs), HirExpr::String(rhs)) => lhs.cmp(rhs),
+        _ => return None,
+    };
+    match op {
+        HirBinaryOpKind::Lt => Some(ordering == std::cmp::Ordering::Less),
+        HirBinaryOpKind::Le => Some(ordering != std::cmp::Ordering::Greater),
+        _ => None,
+    }
+}
+
 /// 表达式的求值能否在不改变 Lua 可观察行为的前提下被删除。
 pub(crate) fn expr_is_discard_safe(expr: &HirExpr) -> bool {
     match expr {
@@ -25,6 +57,12 @@ pub(crate) fn expr_is_discard_safe(expr: &HirExpr) -> bool {
         | HirExpr::Unresolved(_) => true,
         HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
             expr_is_discard_safe(&unary.expr)
+        }
+        HirExpr::Binary(binary)
+            if primitive_literal_comparison_value(binary.op, &binary.lhs, &binary.rhs)
+                .is_some() =>
+        {
+            true
         }
         HirExpr::Binary(binary) if stable_literal_equality(binary.op, &binary.lhs, &binary.rhs) => {
             expr_is_discard_safe(&binary.lhs) && expr_is_discard_safe(&binary.rhs)
@@ -64,6 +102,12 @@ pub(crate) fn expr_is_repeatable(expr: &HirExpr) -> bool {
         | HirExpr::UpvalueRef(_)
         | HirExpr::TempRef(_) => true,
         HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => expr_is_repeatable(&unary.expr),
+        HirExpr::Binary(binary)
+            if primitive_literal_comparison_value(binary.op, &binary.lhs, &binary.rhs)
+                .is_some() =>
+        {
+            true
+        }
         HirExpr::Binary(binary) if stable_literal_equality(binary.op, &binary.lhs, &binary.rhs) => {
             expr_is_repeatable(&binary.lhs) && expr_is_repeatable(&binary.rhs)
         }

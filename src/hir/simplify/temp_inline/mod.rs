@@ -18,8 +18,14 @@
 //! Lua 5.2–5.5 的单 upvalue table 左值可把相邻 producer 收回 key。三项仍要求唯一消费
 //! 且不绕过原求值点；前两项不允许相关 home 被跨越区间写入或 capture，table key 则
 //! 继续服从内部前缀顺序证明。
+//! numeric-for 前的连续 materialization run 还允许越过保留下来的状态赋值收回稳定字面量
+//! header temp；例如 `t0 = 1; t1 = 3; state = seed; for i = t0, t1` 会恢复成
+//! `state = seed; for i = 1, 3`。非字面量仍走相邻求值顺序证明，不跨状态赋值猜快照。
+//! closure 的复杂度无法代表 child proto 函数体，因此不把 closure producer 内联进 loop head；
+//! 普通 `local function iter()` 应保留为独立声明，避免生成多行匿名 iterator。
 //! method 协议的 callee base 与隐式首参虽是两个语法 use，却只求值一次 receiver；相邻
-//! direct binding 快照可在严格匹配这对 use 后原子收回，普通点调用仍按两次读取处理。
+//! 裸 binding 或命名字段链快照可在严格匹配这对 use 后原子收回，例如
+//! `t = subject.worker; t:touch()` 会恢复成 `subject.worker:touch()`；普通点调用仍按两次读取处理。
 //! branch-values 的定向入口只重用同一证明去处理本轮新暴露的根级 global-call run 或
 //! 单值 terminal return，不递归，也不开放其它普通内联 site。
 
@@ -42,7 +48,7 @@ use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 use self::rewrite::replace_temp_in_stmt;
 use self::site::{
     InlineSite, expr_touches_temp, fastcall_callee_materialization_precedes_temp,
-    inline_site_in_repeat_condition, inline_site_in_stmt, is_direct_method_receiver_snapshot,
+    inline_site_in_repeat_condition, inline_site_in_stmt, is_method_receiver_snapshot,
     is_stable_inline_value, puc_upvalue_table_key_with_deferred_base_read,
     temp_precedes_observable_eval_in_expr, temp_precedes_observable_eval_in_stmt,
 };
@@ -285,7 +291,7 @@ fn inline_temps_in_block(
             && let use_count = total_use_count(temp, live_use_counts)
             && (use_count == 1
                 || (use_count == 2
-                    && is_direct_method_receiver_snapshot(next_stmt, temp, value)))
+                    && is_method_receiver_snapshot(next_stmt, temp, value)))
             && let Some(site) = inline_site_in_stmt(next_stmt, temp)
             && workspace
                 .scope
@@ -473,6 +479,19 @@ fn inline_materialization_runs(
             index = run_end + 1;
             continue;
         }
+        if inline_numeric_for_stable_header_aliases(
+            block,
+            run_start..run_end,
+            uses,
+            live_use_counts,
+            facts,
+            captured_slots_before_stmt,
+            &mut removed_stmts,
+        ) {
+            changed = true;
+            index = run_end + 1;
+            continue;
+        }
         let Some(HirStmt::CallStmt(call_stmt)) = block.stmts.get(run_end) else {
             index = run_end;
             continue;
@@ -505,7 +524,7 @@ fn inline_materialization_runs(
             index = run_end + 1;
             continue;
         }
-        if !cross_call_inline_candidate_is_safe(
+        if !materialization_run_candidate_is_safe(
             callee_temp,
             callee_value,
             callee_index,
@@ -533,7 +552,7 @@ fn inline_materialization_runs(
                 complete_run = false;
                 break;
             }
-            let candidate_is_safe = cross_call_inline_candidate_is_safe(
+            let candidate_is_safe = materialization_run_candidate_is_safe(
                 temp,
                 value,
                 candidate_index,
@@ -628,6 +647,56 @@ fn inline_materialization_runs(
             index += 1;
             keep
         });
+    }
+    changed
+}
+
+fn inline_numeric_for_stable_header_aliases(
+    block: &mut HirBlock,
+    run: std::ops::Range<usize>,
+    scratch: &TempUseScratch,
+    live_use_counts: &mut [usize],
+    facts: &ProtoPromotionFacts,
+    captured_slots_before_stmt: &CapturedSlotSnapshots,
+    removed_stmts: &mut [bool],
+) -> bool {
+    let (run_start, run_end) = (run.start, run.end);
+    if !matches!(block.stmts.get(run_end), Some(HirStmt::NumericFor(_))) {
+        return false;
+    }
+
+    let mut rewritten_sink = block.stmts[run_end].clone();
+    let mut changed = false;
+    for (candidate_index, removed) in removed_stmts
+        .iter_mut()
+        .enumerate()
+        .take(run_end)
+        .skip(run_start)
+    {
+        let Some((temp, value)) = inline_candidate(&block.stmts[candidate_index]) else {
+            continue;
+        };
+        if !is_stable_inline_value(value)
+            || total_use_count(temp, live_use_counts) != 1
+            || !materialization_run_candidate_is_safe(
+                temp,
+                value,
+                candidate_index,
+                scratch,
+                facts,
+                captured_slots_before_stmt,
+            )
+            || inline_site_in_stmt(&rewritten_sink, temp) != Some(InlineSite::LoopHead)
+        {
+            continue;
+        }
+        replace_temp_in_stmt(&mut rewritten_sink, temp, value);
+        *removed = true;
+        remove_live_use(live_use_counts, temp);
+        changed = true;
+    }
+    if changed {
+        block.stmts[run_end] = rewritten_sink;
     }
     changed
 }
@@ -783,7 +852,7 @@ fn arg_value_forwards_prior_order_sensitive_expr(
         .is_some_and(|arg_def_index| arg_def_index < callee_def_index)
 }
 
-fn cross_call_inline_candidate_is_safe(
+fn materialization_run_candidate_is_safe(
     temp: TempId,
     value: &HirExpr,
     stmt_index: usize,

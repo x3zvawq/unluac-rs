@@ -5,6 +5,7 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-contains [[for r1_3 = 1, 3 do]]
 local function run(a, b)
     local x = 0
     if a and b then

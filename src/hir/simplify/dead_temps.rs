@@ -11,14 +11,14 @@
 
 use std::collections::BTreeSet;
 
-use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirProto, HirStmt, TempId};
+use crate::hir::common::{HirBlock, HirLValue, HirProto, HirStmt, TempId};
 use crate::hir::expr_safety::expr_is_discard_safe;
 
-use super::visit::{HirVisitor, visit_proto};
+use super::temp_touch::collect_temp_reads_in_proto;
 use super::walk::{HirRewritePass, rewrite_proto};
 
 pub(super) fn remove_dead_temp_materializations_in_proto(proto: &mut HirProto) -> bool {
-    let live_reads = collect_live_temp_reads(proto);
+    let live_reads = collect_temp_reads_in_proto(proto);
     let mut pass = DeadTempPass {
         live_reads: &live_reads,
     };
@@ -36,25 +36,6 @@ impl HirRewritePass for DeadTempPass<'_> {
             .stmts
             .retain(|stmt| !is_dead_pure_temp_assignment(stmt, self.live_reads));
         block.stmts.len() != original_len
-    }
-}
-
-fn collect_live_temp_reads(proto: &HirProto) -> BTreeSet<TempId> {
-    let mut collector = TempReadCollector::default();
-    visit_proto(proto, &mut collector);
-    collector.reads
-}
-
-#[derive(Default)]
-struct TempReadCollector {
-    reads: BTreeSet<TempId>,
-}
-
-impl HirVisitor for TempReadCollector {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        if let HirExpr::TempRef(temp) = expr {
-            self.reads.insert(*temp);
-        }
     }
 }
 

@@ -7,7 +7,8 @@
 -- unluac: expect-not-contains [[unresolved(generic-for-call)]]
 -- unluac: expect-not-contains [[unresolved(generic-for-loop cond)]]
 -- unluac: expect-not-contains [[goto label_]]
-local values = { "AA=", "BBBB" }
+-- unluac: expect-not-contains [[until true]]
+local values = { "A==B", "BBBB" }
 
 for _, span in ipairs({ { 1, 2 }, { 1, 2 } }) do
     while span[1] < span[2] do
@@ -55,4 +56,9 @@ for index = 1, #values do
     end
 end
 
+print(
+    "regress_12_loop_break_shared_continuation#1",
+    #output[1],
+    string.byte(output[1], 1, #output[1])
+)
 return output

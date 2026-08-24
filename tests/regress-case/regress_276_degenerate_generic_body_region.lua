@@ -6,6 +6,7 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-not-contains [[        else]]
 local function run(log_body, xs)
     local x = 0
     for key in pairs(xs) do

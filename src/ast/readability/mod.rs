@@ -118,7 +118,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
             BindingStructure,
             TempPresence,
         ],
-        invalidates: &[StatementAdjacency],
+        invalidates: &[StatementAdjacency, ExprShape, BindingStructure],
     },
     PassDescriptor {
         name: "statement-merge",

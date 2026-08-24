@@ -13,7 +13,7 @@ use super::super::super::common::{
 use super::super::binding_ref::name_matches_binding;
 use super::super::expr_analysis::{
     expr_complexity, is_access_base_inline_expr, is_call_arg_constructor_inline_expr,
-    is_direct_return_constructor_inline_expr, is_mechanical_run_inline_expr,
+    is_context_safe_expr, is_direct_return_constructor_inline_expr, is_mechanical_run_inline_expr,
 };
 use super::candidate::{
     InlineCandidate, InlinePolicy, is_call_callee_inline_expr,
@@ -572,6 +572,7 @@ impl InlineSite {
                     Self::ReturnNestedValue => {
                         is_recallable_inline_expr(replacement) || is_lookup_inline_expr(replacement)
                     }
+                    Self::ReturnValue => is_context_safe_expr(replacement),
                     _ => false,
                 },
             },

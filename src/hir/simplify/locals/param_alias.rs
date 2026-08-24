@@ -13,14 +13,18 @@
 //! return l0
 //! ```
 //!
-//! 这里不重新推断前层 phi，也不处理循环累加器；只有参数原值不会在 alias 写入后继续
-//! 被读取、alias local 没有被闭包捕获、且 alias 不在循环体内写入时才改写。
+//! 这里不重新推断前层 phi，也不处理任意 local 对；它只沿结构化语句证明参数与 alias
+//! 从入口相同值开始不会被分别观察。alias 一旦在某条路径写入，该路径后续不得再读取
+//! 原参数；循环还会用“alias 已写入”的状态验证下一轮。参数写入、引用 capture 与 goto
+//! 会直接拒绝，alias local 被任意 closure 捕获时也不会改写。
 
 use crate::hir::common::{
     HirBlock, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId, ParamId,
 };
 
-use super::super::mention::stmt_captures_local;
+use super::super::mention::{
+    expr_mentions_local, stmt_captures_local, stmts_reference_captured_bindings,
+};
 use super::super::visit::{self, HirVisitor};
 use super::super::walk::{self, HirRewritePass};
 
@@ -32,8 +36,7 @@ pub(super) fn coalesce_param_aliases_in_proto(proto: &mut HirProto) -> bool {
     if rest
         .iter()
         .any(|stmt| stmt_captures_local(stmt, alias.local))
-        || !rest_reads_of_param_safe_against_writes_of_local(rest, alias.local, alias.param)
-        || any_local_write_inside_loop(rest, alias.local)
+        || !rest_preserves_param_alias_identity(rest, alias.local, alias.param)
     {
         return false;
     }
@@ -121,61 +124,127 @@ fn single_local_binding(local_decl: &HirLocalDecl) -> Option<LocalId> {
     Some(*local)
 }
 
-fn rest_reads_of_param_safe_against_writes_of_local(
+fn rest_preserves_param_alias_identity(stmts: &[HirStmt], local: LocalId, param: ParamId) -> bool {
+    if stmts_reference_captured_bindings(stmts)
+        .params
+        .contains(&param)
+        || stmts_write_param(stmts, param)
+    {
+        return false;
+    }
+    validate_alias_flow(stmts, local, param, false).is_some()
+}
+
+fn validate_alias_flow(
     stmts: &[HirStmt],
     local: LocalId,
     param: ParamId,
-) -> bool {
-    let mut seen_local_write = false;
+    mut local_written: bool,
+) -> Option<bool> {
     for stmt in stmts {
-        if stmt_reads_param(stmt, param) && seen_local_write {
-            return false;
-        }
-        seen_local_write |= stmt_writes_local(stmt, local);
+        local_written = validate_alias_stmt(stmt, local, param, local_written)?;
     }
-    true
+    Some(local_written)
 }
 
-fn any_local_write_inside_loop(stmts: &[HirStmt], local: LocalId) -> bool {
-    stmts
-        .iter()
-        .any(|stmt| stmt_has_local_write_inside_loop(stmt, local))
-}
-
-fn stmt_has_local_write_inside_loop(stmt: &HirStmt, local: LocalId) -> bool {
+fn validate_alias_stmt(
+    stmt: &HirStmt,
+    local: LocalId,
+    param: ParamId,
+    local_written: bool,
+) -> Option<bool> {
     match stmt {
-        HirStmt::While(while_stmt) => block_writes_local(&while_stmt.body, local),
-        HirStmt::Repeat(repeat_stmt) => block_writes_local(&repeat_stmt.body, local),
-        HirStmt::NumericFor(numeric_for) => block_writes_local(&numeric_for.body, local),
-        HirStmt::GenericFor(generic_for) => block_writes_local(&generic_for.body, local),
         HirStmt::If(if_stmt) => {
-            any_local_write_inside_loop(&if_stmt.then_block.stmts, local)
-                || if_stmt
-                    .else_block
-                    .as_ref()
-                    .is_some_and(|block| any_local_write_inside_loop(&block.stmts, local))
+            reject_param_read_after_local_write(&if_stmt.cond, param, local_written)?;
+            let then_written =
+                validate_alias_flow(&if_stmt.then_block.stmts, local, param, local_written)?;
+            let else_written = if let Some(else_block) = &if_stmt.else_block {
+                validate_alias_flow(&else_block.stmts, local, param, local_written)?
+            } else {
+                local_written
+            };
+            Some(then_written || else_written)
         }
-        HirStmt::Block(block) => any_local_write_inside_loop(&block.stmts, local),
+        HirStmt::While(while_stmt) => {
+            reject_param_read_after_local_write(&while_stmt.cond, param, local_written)?;
+            let body_written =
+                validate_repeating_body(&while_stmt.body, local, param, local_written)?;
+            if body_written && !local_written {
+                reject_param_read_after_local_write(&while_stmt.cond, param, true)?;
+            }
+            Some(body_written)
+        }
+        HirStmt::Repeat(repeat_stmt) => {
+            let body_written =
+                validate_repeating_body(&repeat_stmt.body, local, param, local_written)?;
+            reject_param_read_after_local_write(&repeat_stmt.cond, param, body_written)?;
+            Some(body_written)
+        }
+        HirStmt::NumericFor(numeric_for) => {
+            if numeric_for.binding == local {
+                return None;
+            }
+            for expr in [&numeric_for.start, &numeric_for.limit, &numeric_for.step] {
+                reject_param_read_after_local_write(expr, param, local_written)?;
+            }
+            validate_repeating_body(&numeric_for.body, local, param, local_written)
+        }
+        HirStmt::GenericFor(generic_for) => {
+            if generic_for.bindings.contains(&local) {
+                return None;
+            }
+            for expr in &generic_for.iterator {
+                reject_param_read_after_local_write(expr, param, local_written)?;
+            }
+            validate_repeating_body(&generic_for.body, local, param, local_written)
+        }
+        HirStmt::Block(block) => validate_alias_flow(&block.stmts, local, param, local_written),
+        HirStmt::ToBeClosed(to_be_closed) => {
+            // close-scopes 依赖 direct local/temp 身份配对 TBC；参数不能替代该 binding。
+            if expr_mentions_local(&to_be_closed.value, local) {
+                return None;
+            }
+            reject_param_read_after_local_write(&to_be_closed.value, param, local_written)?;
+            Some(local_written)
+        }
+        HirStmt::Goto(_) | HirStmt::Label(_) => None,
+        HirStmt::LocalDecl(local_decl) if local_decl.bindings.contains(&local) => None,
         HirStmt::LocalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
         | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
         | HirStmt::CallStmt(_)
         | HirStmt::Return(_)
+        | HirStmt::Close(_)
         | HirStmt::Break
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => false,
+        | HirStmt::Continue => {
+            if local_written && stmt_reads_param(stmt, param) {
+                return None;
+            }
+            Some(local_written || stmt_writes_local(stmt, local))
+        }
     }
 }
 
-fn block_writes_local(block: &HirBlock, local: LocalId) -> bool {
-    block
-        .stmts
-        .iter()
-        .any(|stmt| stmt_writes_local(stmt, local))
+fn validate_repeating_body(
+    body: &HirBlock,
+    local: LocalId,
+    param: ParamId,
+    local_written: bool,
+) -> Option<bool> {
+    let body_written = validate_alias_flow(&body.stmts, local, param, local_written)?;
+    if body_written && !local_written {
+        validate_alias_flow(&body.stmts, local, param, true)?;
+    }
+    Some(body_written)
+}
+
+fn reject_param_read_after_local_write(
+    expr: &HirExpr,
+    param: ParamId,
+    local_written: bool,
+) -> Option<()> {
+    (!local_written || !expr_reads_param(expr, param)).then_some(())
 }
 
 fn stmt_writes_local(stmt: &HirStmt, local: LocalId) -> bool {
@@ -192,6 +261,26 @@ struct LocalWriteCollector {
     written: bool,
 }
 
+fn stmts_write_param(stmts: &[HirStmt], param: ParamId) -> bool {
+    let mut collector = ParamWriteCollector {
+        param,
+        written: false,
+    };
+    visit::visit_stmts(stmts, &mut collector);
+    collector.written
+}
+
+struct ParamWriteCollector {
+    param: ParamId,
+    written: bool,
+}
+
+impl HirVisitor for ParamWriteCollector {
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        self.written |= matches!(lvalue, HirLValue::Param(param) if *param == self.param);
+    }
+}
+
 impl HirVisitor for LocalWriteCollector {
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
         self.written |= matches!(lvalue, HirLValue::Local(local) if *local == self.local);
@@ -201,6 +290,12 @@ impl HirVisitor for LocalWriteCollector {
 fn stmt_reads_param(stmt: &HirStmt, param: ParamId) -> bool {
     let mut collector = ParamReadCollector { param, read: false };
     visit::visit_stmts(std::slice::from_ref(stmt), &mut collector);
+    collector.read
+}
+
+fn expr_reads_param(expr: &HirExpr, param: ParamId) -> bool {
+    let mut collector = ParamReadCollector { param, read: false };
+    visit::visit_expr(expr, &mut collector);
     collector.read
 }
 

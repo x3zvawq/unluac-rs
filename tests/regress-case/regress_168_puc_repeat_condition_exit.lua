@@ -4,6 +4,8 @@
 -- unluac: expect-not-contains [[goto]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-contains [[until r1_0 == 3]]
+-- unluac: expect-not-contains [[until false]]
 local function counter()
     local x = 0
     repeat

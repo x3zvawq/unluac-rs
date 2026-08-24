@@ -3,7 +3,8 @@
 //! 很多 readability pass 只是“递归遍历整棵 AST，然后在局部 block/stmt/expr 上做
 //! 保守重写”。如果每个 pass 都各自维护一套 `block/stmt/lvalue/call/expr` 骨架，
 //! 新 AST 节点一加，或者遍历边界一改，就要在一堆文件里同步返工。这里把纯遍历
-//! 样板收成共享设施，让 pass 更专注在“当前节点要不要改写”。
+//! 样板收成共享设施，让 pass 更专注在“当前节点要不要改写”。repeat body 通过专用
+//! hook 暴露同作用域的 until 条件，避免块级分析漏掉正文之后的读取。
 
 use crate::ast::common::{
     AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstModule, AstStmt,
@@ -22,6 +23,10 @@ pub(super) trait AstRewritePass {
 
     fn rewrite_block(&mut self, _block: &mut AstBlock, _kind: BlockKind) -> bool {
         false
+    }
+
+    fn rewrite_repeat_body(&mut self, block: &mut AstBlock, _condition: &AstExpr) -> bool {
+        self.rewrite_block(block, BlockKind::Regular)
     }
 
     fn rewrite_stmt(&mut self, _stmt: &mut AstStmt) -> bool {
@@ -64,6 +69,15 @@ pub(super) trait ScopedAstRewritePass {
         outer_scope: &Self::Scope,
     ) -> (bool, Self::Scope) {
         (false, outer_scope.clone())
+    }
+
+    fn enter_repeat_body(
+        &mut self,
+        block: &mut AstBlock,
+        _condition: &AstExpr,
+        outer_scope: &Self::Scope,
+    ) -> (bool, Self::Scope) {
+        self.enter_block(block, BlockKind::Regular, outer_scope)
     }
 
     fn rewrite_stmt(&mut self, _stmt: &mut AstStmt, _scope: &Self::Scope) -> bool {
@@ -123,6 +137,16 @@ fn rewrite_block_with_kind_scoped<P: ScopedAstRewritePass>(
 }
 
 pub(super) fn rewrite_stmt(stmt: &mut AstStmt, pass: &mut impl AstRewritePass) -> bool {
+    if let AstStmt::Repeat(repeat_stmt) = stmt {
+        let mut nested_changed = false;
+        for stmt in &mut repeat_stmt.body.stmts {
+            nested_changed |= rewrite_stmt(stmt, pass);
+        }
+        nested_changed |= pass.rewrite_repeat_body(&mut repeat_stmt.body, &repeat_stmt.cond);
+        nested_changed |= rewrite_condition_expr(&mut repeat_stmt.cond, pass);
+        return pass.rewrite_stmt(stmt) || nested_changed;
+    }
+
     let mut nested_changed = false;
     traverse_stmt_children!(
         stmt,
@@ -158,6 +182,17 @@ fn rewrite_stmt_scoped<P: ScopedAstRewritePass>(
     scope: &P::Scope,
     pass: &mut P,
 ) -> bool {
+    if let AstStmt::Repeat(repeat_stmt) = stmt {
+        let (block_changed, body_scope) =
+            pass.enter_repeat_body(&mut repeat_stmt.body, &repeat_stmt.cond, scope);
+        let mut nested_changed = false;
+        for stmt in &mut repeat_stmt.body.stmts {
+            nested_changed |= rewrite_stmt_scoped(stmt, &body_scope, pass);
+        }
+        nested_changed |= rewrite_condition_expr_scoped(&mut repeat_stmt.cond, scope, pass);
+        return pass.rewrite_stmt(stmt, scope) || block_changed || nested_changed;
+    }
+
     let mut nested_changed = false;
     traverse_stmt_children!(
         stmt,

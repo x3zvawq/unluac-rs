@@ -7,6 +7,7 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-not-contains [[r1_2 = r1_1]]
 local function run(a, b, should_break)
     local x = 0
     while not b do

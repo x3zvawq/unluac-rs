@@ -5,6 +5,7 @@
 //! 第二套“纯表达式”分类。
 
 use crate::hir::common::{HirBinaryOpKind, HirDecisionTarget, HirExpr, HirUnaryOpKind};
+use crate::hir::expr_safety::primitive_literal_comparison_value;
 
 /// 判断字面值的静态 truthiness。
 ///
@@ -46,6 +47,12 @@ pub(in crate::hir) fn expr_truthiness(expr: &HirExpr) -> Option<bool> {
                 _ => None,
             }
         }
+        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
+            expr_truthiness(&unary.expr).map(|truthy| !truthy)
+        }
+        HirExpr::Binary(binary) => {
+            primitive_literal_comparison_value(binary.op, &binary.lhs, &binary.rhs)
+        }
         HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)
         | HirExpr::UpvalueRef(_)
@@ -53,7 +60,6 @@ pub(in crate::hir) fn expr_truthiness(expr: &HirExpr) -> Option<bool> {
         | HirExpr::GlobalRef(_)
         | HirExpr::TableAccess(_)
         | HirExpr::Unary(_)
-        | HirExpr::Binary(_)
         | HirExpr::Decision(_)
         | HirExpr::Call(_)
         | HirExpr::VarArg

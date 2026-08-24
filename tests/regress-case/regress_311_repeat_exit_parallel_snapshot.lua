@@ -1,5 +1,6 @@
 -- regress_311_repeat_exit_parallel_snapshot: repeat 正常退出必须保留并行赋值的 RHS 快照
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-not-contains [[        else]]
 
 local function swap_or_break(stop)
     local left, right = 1, 2

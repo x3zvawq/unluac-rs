@@ -16,12 +16,13 @@
 //!   这里会停止继续下沉，避免生成“goto 跳进 local 作用域”的非法 Lua
 //! - 如果某个 hoisted temp 在声明点与候选下沉点之间已经被读取过，也不能把它下沉
 //!   成后置 `local`，否则 fallback/goto 回边会读到未初始化的局部变量
+//! - repeat body 的 until 条件是正文之后的读取，引用到的声明不能沉入更窄的嵌套块
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::super::common::{
-    AstBindingRef, AstBlock, AstLValue, AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl,
-    AstModule, AstStmt,
+    AstBindingRef, AstBlock, AstExpr, AstLValue, AstLabelId, AstLocalAttr, AstLocalBinding,
+    AstLocalDecl, AstModule, AstStmt,
 };
 use super::ReadabilityContext;
 use super::binding_flow::{
@@ -44,31 +45,39 @@ struct StatementMergePass;
 
 impl AstRewritePass for StatementMergePass {
     fn rewrite_block(&mut self, block: &mut AstBlock, _kind: BlockKind) -> bool {
-        let mut changed = sink_hoisted_temp_decls(block);
+        rewrite_current_block(block, None)
+    }
 
-        let mut old_stmts = VecDeque::from(std::mem::take(&mut block.stmts));
-        let mut new_stmts = Vec::with_capacity(old_stmts.len());
-        while let Some(stmt) = old_stmts.pop_front() {
-            let Some(next_stmt) = old_stmts.front() else {
-                new_stmts.push(stmt);
-                continue;
-            };
+    fn rewrite_repeat_body(&mut self, block: &mut AstBlock, condition: &AstExpr) -> bool {
+        rewrite_current_block(block, Some(condition))
+    }
+}
 
-            if let Some(merged) = try_merge_local_decl_with_assign(&stmt, next_stmt) {
-                new_stmts.push(AstStmt::LocalDecl(Box::new(merged)));
-                old_stmts.pop_front();
-                changed = true;
-                continue;
-            }
+fn rewrite_current_block(block: &mut AstBlock, trailing_condition: Option<&AstExpr>) -> bool {
+    let mut changed = sink_hoisted_temp_decls(block, trailing_condition);
 
+    let mut old_stmts = VecDeque::from(std::mem::take(&mut block.stmts));
+    let mut new_stmts = Vec::with_capacity(old_stmts.len());
+    while let Some(stmt) = old_stmts.pop_front() {
+        let Some(next_stmt) = old_stmts.front() else {
             new_stmts.push(stmt);
+            continue;
+        };
+
+        if let Some(merged) = try_merge_local_decl_with_assign(&stmt, next_stmt) {
+            new_stmts.push(AstStmt::LocalDecl(Box::new(merged)));
+            old_stmts.pop_front();
+            changed = true;
+            continue;
         }
 
-        block.stmts = new_stmts;
-        changed |= merge_adjacent_empty_local_decls(block);
-        changed |= merge_adjacent_single_value_local_decls(block);
-        changed
+        new_stmts.push(stmt);
     }
+
+    block.stmts = new_stmts;
+    changed |= merge_adjacent_empty_local_decls(block);
+    changed |= merge_adjacent_single_value_local_decls(block, trailing_condition);
+    changed
 }
 
 fn merge_adjacent_empty_local_decls(block: &mut AstBlock) -> bool {
@@ -120,9 +129,12 @@ fn empty_local_decl_bindings(stmt: &AstStmt) -> Option<&[AstLocalBinding]> {
     Some(&local_decl.bindings)
 }
 
-fn merge_adjacent_single_value_local_decls(block: &mut AstBlock) -> bool {
+fn merge_adjacent_single_value_local_decls(
+    block: &mut AstBlock,
+    trailing_condition: Option<&AstExpr>,
+) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
-    let use_index = BindingUseIndex::for_stmts(&old_stmts);
+    let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_condition);
     let mut old_stmts = VecDeque::from(old_stmts);
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
@@ -195,8 +207,8 @@ fn merge_adjacent_single_value_local_decls(block: &mut AstBlock) -> bool {
     changed
 }
 
-fn sink_hoisted_temp_decls(block: &mut AstBlock) -> bool {
-    let use_index = BindingUseIndex::for_stmts(&block.stmts);
+fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&AstExpr>) -> bool {
+    let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&block.stmts, trailing_condition);
     let forward_gotos = ForwardGotoIndex::new(&block.stmts);
     if forward_gotos.has_backward_goto {
         // backward goto 把当前 block 变成显式 CFG：hoisted temp 可能是回边上的 phi

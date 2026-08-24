@@ -32,3 +32,27 @@ do
     end
 end
 print("regress_175_lua54_close_value_pack#2-close", table.concat(close_log, ","))
+
+-- regress_175_lua54_close_value_pack#3: 公共赋值不得越过 branch 内的隐式 close
+local function assign_before_branch_close(flag)
+    local assigned = "assigned"
+    local result
+    local branch_meta = {
+        __close = function()
+            close_log[#close_log + 1] = "branch:" .. tostring(result)
+            result = "closed"
+        end,
+    }
+    if flag then
+        local resource <close> = setmetatable({}, branch_meta)
+        result = assigned
+    else
+        local resource <close> = setmetatable({}, branch_meta)
+        result = assigned
+    end
+    return result
+end
+
+assert(assign_before_branch_close(true) == "closed")
+assert(assign_before_branch_close(false) == "closed")
+print("regress_175_lua54_close_value_pack#3-close", table.concat(close_log, ","))

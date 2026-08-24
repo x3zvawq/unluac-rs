@@ -1,4 +1,5 @@
-//! 校验单遍分支围栏及逃逸边；依赖区域导航与边计划，不负责普通分支/循环；例如确认 fence 的出口动作落在合法位置。
+//! 校验单遍分支围栏及逃逸边；依赖区域导航与边计划，不负责普通分支/循环；例如确认
+//! fence 的出口动作落在合法位置，并拒绝 synthetic repeat 遮蔽祖先 break/continue。
 
 use super::*;
 
@@ -107,6 +108,56 @@ pub(super) fn validate_single_pass_plans(
             return Err(StructureError::invalid(
                 "single-pass reverse index has a stale entry",
             ));
+        }
+    }
+    let mut fence_depth = vec![0usize; plan.regions.len()];
+    for region in &intervals.preorder {
+        let parent_depth = intervals.parent[region.index()]
+            .map(|parent| fence_depth[parent.index()])
+            .unwrap_or(0);
+        fence_depth[region.index()] =
+            parent_depth + usize::from(plan.single_pass_by_region[region.index()].is_some());
+    }
+    let crosses_fence = |source: RegionId, target: RegionId| -> Result<bool, StructureError> {
+        let (Some(source_depth), Some(target_depth)) = (
+            fence_depth.get(source.index()),
+            fence_depth.get(target.index()),
+        ) else {
+            return Err(StructureError::invalid(
+                "single-pass control target is outside the region arena",
+            ));
+        };
+        Ok(intervals.contains(target, source) && source_depth > target_depth)
+    };
+    for edge_plan in &plan.edge_plans {
+        let target = match edge_plan.transfer {
+            EdgeTransfer::Break(target) | EdgeTransfer::Continue(target) => target,
+            _ => continue,
+        };
+        let edge = cfg.edges.get(edge_plan.edge.index()).ok_or_else(|| {
+            StructureError::invalid("single-pass control edge is outside the CFG")
+        })?;
+        let source = plan
+            .region_for_block(edge.from)
+            .ok_or_else(|| StructureError::invalid("single-pass control edge source is unowned"))?;
+        if crosses_fence(source, target)? {
+            return Err(StructureError::invalid(format!(
+                "edge {} control transfer is shadowed by a single-pass fence",
+                edge_plan.edge
+            )));
+        }
+    }
+    for (index, payload) in plan.loops.iter().enumerate() {
+        let Some(target) = payload.propagated_break else {
+            continue;
+        };
+        let source = plan
+            .loop_region(LoopPlanId(index))
+            .ok_or_else(|| StructureError::invalid("single-pass loop source is unowned"))?;
+        if crosses_fence(source, target)? {
+            return Err(StructureError::invalid(format!(
+                "loop #{index} propagated break is shadowed by a single-pass fence"
+            )));
         }
     }
     Ok(())

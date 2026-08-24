@@ -36,10 +36,12 @@ use super::temp_touch::{RefScopeTracker, TempTouchIndex, collect_temp_refs_by_st
 use super::walk::for_each_nested_block_mut;
 
 use self::adjacent::{try_collapse_adjacent_local_seed_handoff, try_collapse_guarded_local_update};
-use self::binding::{BindingProtection, CarryBinding};
+use self::binding::BindingProtection;
+pub(super) use self::binding::{CarryBinding, single_binding_copy};
 use self::boundary::LabelJumpIndex;
 use self::handoffs::{HandoffAction, try_collapse_handoff_at};
 use self::loop_updates::collapse_dead_loop_update_handoffs;
+use self::prune::prune_redundant_copy_stmts;
 use self::reads::{collect_binding_mentions_by_stmt, collect_binding_mentions_in_expr};
 use self::region_results::{
     RegionResultIndex, collapse_inferred_if_result_chains, collapse_written_back_if_results,
@@ -93,6 +95,7 @@ fn collapse_handoffs_recursive(
     // 后序：子块都处理完之后，再处理当前块的 handoff。
     changed |= collapse_dead_loop_update_handoffs(block, &stmt_binding_refs);
     changed |= collapse_block_handoffs(block, outer_bindings, promotion_facts);
+    changed |= prune_redundant_copy_stmts(block);
     changed
 }
 

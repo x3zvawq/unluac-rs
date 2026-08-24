@@ -4,6 +4,8 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
+-- unluac: expect-not-contains [[r1_3 = r1_2]]
+-- unluac: expect-not-contains [[r2_3 = r2_2]]
 local function run_while(values)
     local total = 0
     for _, value in ipairs(values) do

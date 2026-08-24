@@ -1,4 +1,6 @@
-//! 用安全短路条件证据细化 repeat 候选及嵌套 for 出口；依赖候选集合和 CFG，不负责初始 natural-loop 发现；例如把伪 while header 恢复为 repeat 尾条件。
+//! 用安全短路条件证据细化 repeat 候选及嵌套 for 出口；依赖候选集合和 CFG，
+//! 不负责初始 natural-loop 发现；例如把伪 while header 恢复为 repeat 尾条件。
+//! 多叶条件必须同时冻结完整 DAG 根；最终叶只作为 continue target，不能替代完整条件。
 
 use super::*;
 
@@ -86,7 +88,7 @@ pub(in crate::structure) fn refine_short_circuit_repeat_candidates(
             .map(|(target, short)| {
                 (
                     target,
-                    owned_sources.map(|_| short.header),
+                    Some(short.header),
                     Some(short.header),
                     Option::<ShortCircuitCandidate>::None,
                     Option::<BlockRef>::None,
@@ -105,7 +107,7 @@ pub(in crate::structure) fn refine_short_circuit_repeat_candidates(
                 .map(|(target, short)| {
                     (
                         target,
-                        owned_sources.map(|_| short.header),
+                        Some(short.header),
                         Some(short.header),
                         Some(short.clone()),
                         None,
@@ -152,8 +154,8 @@ pub(in crate::structure) fn refine_short_circuit_repeat_candidates(
         // 路径，它只能是 while/while-true 中的提前 continue。把这种形状精化成 repeat
         // 会让 continue 错误执行原本应跳过的尾条件。
         // 单回边经共享 jump pad 时，最终 condition node 不支配 pad，但完整短路
-        // condition 的 header 必须支配它。这个 header 只用于证明，不能同时写回
-        // `condition_header`，否则冻结时会把同一 connector 重复纳入 condition node。
+        // condition 的 header 必须支配它。最终冻结也必须从这个 header 消费同一张
+        // DAG；若只记录末尾 node，前置短路项会退化成无行为的 body branch。
         let condition_entry = dominance_entry
             .or(condition_header)
             .unwrap_or(continue_target);

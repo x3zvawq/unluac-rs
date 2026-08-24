@@ -2,6 +2,7 @@
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[rawequal]]
+-- unluac: expect-not-contains [[if true then]]
 local function opaque(value)
     return value
 end

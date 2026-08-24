@@ -1,9 +1,13 @@
 //! 这个子模块负责 temp-inline pass 的站点分类。
 //!
 //! 它依赖 HIR 当前语句/表达式形状，只回答某个 temp 首次被消费的位置属于 direct、callee、
-//! condition 还是 loop-head，不会在这里执行内联。
-//! 例如：`r0(1)` 会把 `r0` 的使用站点标成 `CallCallee`。
+//! condition 还是 loop-head，不会在这里执行内联。无环 Decision 只把唯一入口节点的
+//! test 当作必达 condition；其它节点和 target 仍是条件执行的 nested site。method 协议
+//! 已经证明 callee base 与隐式首参是同一次 receiver 求值，因此这里把这两个结构引用
+//! 合并视为 call 所在的单一站点；普通点调用仍分别扫描 callee 与参数。
+//! 例如：`r0(1)` 会把 `r0` 标成 `CallCallee`，`r0:m()` 则把 receiver 标成 call 所在站点。
 
+use super::super::decision::decision_has_cycles;
 use super::*;
 
 pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<InlineSite> {
@@ -56,19 +60,13 @@ pub(super) fn inline_site_in_repeat_condition(cond: &HirExpr, temp: TempId) -> O
     find_site_in_expr(cond, temp, InlineSite::LoopCondition)
 }
 
-/// 判断相邻赋值是否只是在 method 协议前冻结 direct binding receiver。
+/// 判断相邻赋值是否只是在 method 协议前冻结可直接写回源码的 receiver。
 ///
 /// method call 在 HIR 中同时保留 callee base 与隐式首参，因此这里的两个 temp use
-/// 最终只对应一次源码 receiver 求值。普通点调用没有这层协议，不能共享该合同。
-pub(super) fn is_direct_method_receiver_snapshot(
-    stmt: &HirStmt,
-    temp: TempId,
-    value: &HirExpr,
-) -> bool {
-    if !matches!(
-        value,
-        HirExpr::ParamRef(_) | HirExpr::LocalRef(_) | HirExpr::UpvalueRef(_) | HirExpr::TempRef(_)
-    ) {
+/// 最终只对应一次源码 receiver 求值。裸 binding 与以 binding 为根的命名字段链都能
+/// 原子收回；普通点调用没有这层协议，不能共享该合同。
+pub(super) fn is_method_receiver_snapshot(stmt: &HirStmt, temp: TempId, value: &HirExpr) -> bool {
+    if !is_method_receiver_inline_expr(value) {
         return false;
     }
     let call = match stmt {
@@ -82,6 +80,20 @@ pub(super) fn is_direct_method_receiver_snapshot(
         call.and_then(HirCallExpr::method_receiver),
         Some((HirExpr::TempRef(receiver), _)) if *receiver == temp
     )
+}
+
+fn is_method_receiver_inline_expr(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::TempRef(_) => true,
+        HirExpr::TableAccess(access) => {
+            matches!(&access.key, HirExpr::String(_))
+                && is_method_receiver_inline_expr(&access.base)
+        }
+        _ => false,
+    }
 }
 
 fn direct_call_expr(values: &crate::hir::common::HirValuePack) -> Option<&HirCallExpr> {
@@ -295,8 +307,16 @@ impl EvalOrderProbe<'_> {
                     prefix_clear && expr_touches_temp(trailing, self.temp) && self.expr(trailing)
                 })
             }
-            HirExpr::Decision(_)
-            | HirExpr::Closure(_)
+            HirExpr::Decision(decision) => {
+                !decision_has_cycles(decision)
+                    && decision
+                        .nodes
+                        .get(decision.entry.index())
+                        .is_some_and(|entry| {
+                            expr_touches_temp(&entry.test, self.temp) && self.expr(&entry.test)
+                        })
+            }
+            HirExpr::Closure(_)
             | HirExpr::Nil
             | HirExpr::Boolean(_)
             | HirExpr::Integer(_)
@@ -345,6 +365,15 @@ fn find_site_in_exprs<'a>(
 }
 
 fn find_site_in_call(call: &HirCallExpr, temp: TempId, site: InlineSite) -> Option<InlineSite> {
+    // method receiver 在 HIR 中出现于 callee base 和隐式首参，但 AST lowering 会依赖
+    // method fact 只生成一次 receiver；先识别这对引用，避免把源码级单站点误分类成
+    // callee 内部的 Nested use。
+    if call
+        .method_receiver()
+        .is_some_and(|(receiver, _)| matches!(receiver, HirExpr::TempRef(other) if *other == temp))
+    {
+        return Some(site);
+    }
     let callee_site = if matches!(site, InlineSite::Direct) {
         if call.fastcall.is_some() {
             InlineSite::FastCallCallee
@@ -440,14 +469,15 @@ fn find_site_in_expr(expr: &HirExpr, temp: TempId, site: InlineSite) -> Option<I
         }
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
             let child_site = site.descend_pure_wrapper();
-            find_site_in_expr(&logical.lhs, temp, child_site)
+            let lhs_site = if site == InlineSite::Direct {
+                InlineSite::Condition
+            } else {
+                child_site
+            };
+            find_site_in_expr(&logical.lhs, temp, lhs_site)
                 .or_else(|| find_site_in_expr(&logical.rhs, temp, child_site))
         }
-        HirExpr::Decision(decision) => decision.nodes.iter().find_map(|node| {
-            find_site_in_expr(&node.test, temp, InlineSite::Nested)
-                .or_else(|| find_site_in_decision_target(&node.truthy, temp, InlineSite::Nested))
-                .or_else(|| find_site_in_decision_target(&node.falsy, temp, InlineSite::Nested))
-        }),
+        HirExpr::Decision(decision) => find_site_in_decision(decision, temp, site),
         HirExpr::Call(call) => find_site_in_call(call, temp, site),
         HirExpr::TableConstructor(table) => table
             .fields
@@ -488,6 +518,42 @@ fn find_site_in_expr(expr: &HirExpr, temp: TempId, site: InlineSite) -> Option<I
         | HirExpr::VarArg
         | HirExpr::Unresolved(_) => None,
     }
+}
+
+fn find_site_in_decision(
+    decision: &crate::hir::common::HirDecisionExpr,
+    temp: TempId,
+    outer_site: InlineSite,
+) -> Option<InlineSite> {
+    let entry_index = decision.entry.index();
+    let entry = decision.nodes.get(entry_index)?;
+    let entry_site = if decision_has_cycles(decision) {
+        InlineSite::Nested
+    } else {
+        match outer_site {
+            InlineSite::Direct => InlineSite::Condition,
+            InlineSite::ReturnValue
+            | InlineSite::Condition
+            | InlineSite::LoopCondition
+            | InlineSite::LoopHead => outer_site,
+            InlineSite::Nested
+            | InlineSite::Index
+            | InlineSite::CallArg
+            | InlineSite::FastCallArg
+            | InlineSite::CallCallee
+            | InlineSite::FastCallCallee
+            | InlineSite::AccessBase => InlineSite::Nested,
+        }
+    };
+    find_site_in_expr(&entry.test, temp, entry_site).or_else(|| {
+        decision.nodes.iter().enumerate().find_map(|(index, node)| {
+            (index != entry_index)
+                .then(|| find_site_in_expr(&node.test, temp, InlineSite::Nested))
+                .flatten()
+                .or_else(|| find_site_in_decision_target(&node.truthy, temp, InlineSite::Nested))
+                .or_else(|| find_site_in_decision_target(&node.falsy, temp, InlineSite::Nested))
+        })
+    })
 }
 
 fn find_site_in_decision_target(
@@ -624,8 +690,14 @@ impl InlineSite {
             }
             // 条件头 / for 头属于源码结构骨架，保留少量低复杂度表达式能明显减少
             // 机械 temp 噪音；但这里仍然用固定的小阈值，避免把整坨复杂逻辑塞回控制头。
-            Self::Condition | Self::LoopCondition | Self::LoopHead => {
+            Self::Condition | Self::LoopCondition => {
                 expr_complexity(replacement) <= CONTROL_HEAD_INLINE_MAX_COMPLEXITY
+            }
+            // closure 的复杂度无法概括 child proto 函数体；保留独立 producer，避免把普通
+            // local function 压成 loop head 里的多行匿名 iterator。
+            Self::LoopHead => {
+                !matches!(replacement, HirExpr::Closure(_))
+                    && expr_complexity(replacement) <= CONTROL_HEAD_INLINE_MAX_COMPLEXITY
             }
             Self::ReturnValue | Self::Index | Self::CallArg | Self::FastCallArg => self
                 .complexity_limit(options)

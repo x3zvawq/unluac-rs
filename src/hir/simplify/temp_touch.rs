@@ -13,9 +13,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirStmt, TempId};
+use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirProto, HirStmt, TempId};
 
-use super::visit::{HirVisitor, visit_expr, visit_stmts};
+use super::visit::{HirVisitor, visit_expr, visit_proto, visit_stmts};
 
 pub(super) fn stmts_touch_any_temp(stmts: &[HirStmt], temps: &BTreeSet<TempId>) -> bool {
     TempTouchCollector::touches_in_stmts(stmts, temps)
@@ -182,6 +182,25 @@ pub(super) fn collect_temp_refs_by_stmt(stmts: &[HirStmt]) -> Vec<BTreeSet<TempI
         .collect()
 }
 
+pub(super) fn collect_temp_reads_by_stmt(stmts: &[HirStmt]) -> Vec<BTreeSet<TempId>> {
+    stmts
+        .iter()
+        .map(|stmt| collect_temp_reads_in_stmts(std::slice::from_ref(stmt)))
+        .collect()
+}
+
+pub(super) fn collect_temp_reads_in_proto(proto: &HirProto) -> BTreeSet<TempId> {
+    let mut collector = TempReadCollector::default();
+    visit_proto(proto, &mut collector);
+    collector.temps
+}
+
+fn collect_temp_reads_in_stmts(stmts: &[HirStmt]) -> BTreeSet<TempId> {
+    let mut collector = TempReadCollector::default();
+    visit_stmts(stmts, &mut collector);
+    collector.temps
+}
+
 pub(super) struct TempTouchIndex<'a> {
     stmt_refs: &'a [BTreeSet<TempId>],
     indices_by_temp: BTreeMap<TempId, Vec<usize>>,
@@ -293,6 +312,19 @@ impl<'a, T: Copy + Ord> RefScopeTracker<'a, T> {
 
 struct TempRefCollector {
     temps: BTreeSet<TempId>,
+}
+
+#[derive(Default)]
+struct TempReadCollector {
+    temps: BTreeSet<TempId>,
+}
+
+impl HirVisitor for TempReadCollector {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        if let HirExpr::TempRef(temp) = expr {
+            self.temps.insert(*temp);
+        }
+    }
 }
 
 impl HirVisitor for TempRefCollector {

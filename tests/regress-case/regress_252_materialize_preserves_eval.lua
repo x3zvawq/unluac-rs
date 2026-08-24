@@ -1,5 +1,7 @@
 -- regress_252_materialize_preserves_eval: 等值/常量短路不能删除可观察求值
 -- unluac: expect-not-contains [["logic") then]]
+-- unluac: expect-not-contains [[ = r0_1("logic")]]
+-- unluac: expect-not-contains [[ = r0_2("logic")]]
 
 local trace = ""
 

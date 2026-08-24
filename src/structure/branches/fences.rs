@@ -4,6 +4,8 @@
 //! 冻结成 single-pass fence；它不负责基础分支分类，也不会把两臂各自闭合到同一出口的
 //! 普通 `if/else` 改写成合成 `repeat`。例如，嵌套 break 跳过共享 tail 时建立 fence，
 //! 而一臂执行普通语句、另一臂执行 numeric-for 后共同结束时继续保留 `if/else`。
+//! fence 也不能包住指向祖先 loop 的 break/continue；Lua 的无标签控制会被合成 repeat
+//! 截获，因此这类 pre-exit 域必须保留普通 branch。
 
 use super::*;
 
@@ -141,14 +143,16 @@ pub(super) fn refine_single_pass_fences(
                 &escape_edges,
             )
             || loop_candidates.iter().any(|owner| {
+                let is_before_exit = |block| {
+                    graph_facts.dominates(owner.header, block)
+                        && !graph_facts.dominates(exit, block)
+                };
                 owner.exits.contains(&exit)
-                    && owner.body_scope_blocks.contains(&header)
-                    && owner.body_scope_blocks.contains(&tail)
-                    && escape_edges.iter().all(|edge_ref| {
-                        owner
-                            .body_scope_blocks
-                            .contains(&cfg.edges[edge_ref.index()].from)
-                    })
+                    && is_before_exit(header)
+                    && is_before_exit(tail)
+                    && escape_edges
+                        .iter()
+                        .all(|edge_ref| is_before_exit(cfg.edges[edge_ref.index()].from))
             })
         {
             continue;

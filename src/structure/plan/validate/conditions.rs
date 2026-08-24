@@ -1,4 +1,6 @@
-//! 校验条件谓词、值、前缀位置与条件边索引；依赖 CFG/SSA/区域计划，不负责分支或循环 payload；例如核对短路条件终端的极性。
+//! 校验条件谓词、值、前缀位置与条件边索引；依赖 CFG/SSA/区域计划，不负责分支或
+//! 循环 payload；例如核对短路条件终端的极性。多个短路叶可以共享同一条纯终端 route，
+//! 但节点和内部 route 仍必须各自唯一。
 
 use super::*;
 
@@ -269,7 +271,19 @@ impl ConditionEdgeIndex {
         binding: ConditionEdgeBinding,
         endpoint: BlockRef,
     ) -> Result<(), StructureError> {
-        record_condition_edge(&mut self.terminal, edge, binding, "terminal")?;
+        let slot = self
+            .terminal
+            .get_mut(edge.index())
+            .ok_or_else(|| StructureError::invalid("condition terminal edge is outside the CFG"))?;
+        if let Some(existing) = *slot {
+            if existing.condition != binding.condition || existing.target != binding.target {
+                return Err(StructureError::invalid(format!(
+                    "condition terminal edge {edge} has conflicting frozen owners: {existing:?} vs {binding:?}"
+                )));
+            }
+        } else {
+            *slot = Some(binding);
+        }
         let slot = self
             .terminal_endpoint
             .get_mut(edge.index())
@@ -342,6 +356,7 @@ pub(super) fn record_condition_edge(
 }
 
 pub(super) fn validate_condition_plans(
+    proto: &LoweredProto,
     cfg: &Cfg,
     plan: &StructurePlan,
 ) -> Result<ConditionEdgeIndex, StructureError> {
@@ -384,6 +399,7 @@ pub(super) fn validate_condition_plans(
     }
 
     let mut seen_block_epoch = vec![0usize; cfg.blocks.len()];
+    let mut shared_terminal_connector = vec![None; cfg.blocks.len()];
     for (index, condition) in plan.conditions.iter().enumerate() {
         if !referenced[index]
             || condition.nodes.is_empty()
@@ -507,10 +523,31 @@ pub(super) fn validate_condition_plans(
                         )));
                     };
                     if std::mem::replace(seen_epoch, epoch) == epoch {
-                        return Err(StructureError::invalid(format!(
-                            "condition payload #{index} reuses a condition block across nodes"
-                        )));
+                        let pure_shared_jump =
+                            cfg.blocks.get(block.index()).is_some_and(|block_data| {
+                                block_data.instrs.len == 1
+                                    && matches!(
+                                        proto.instrs.get(block_data.instrs.start.index()),
+                                        Some(LowInstr::Jump(_))
+                                    )
+                                    && cfg
+                                        .succs
+                                        .get(block.index())
+                                        .is_some_and(|edges| edges.len() == 1)
+                            });
+                        if shared_terminal_connector[block.index()]
+                            != Some((epoch, arc.transfer, arc.target))
+                            || !pure_shared_jump
+                        {
+                            return Err(StructureError::invalid(format!(
+                                "condition payload #{index} reuses a condition block across nodes"
+                            )));
+                        }
+                        continue;
                     }
+                    shared_terminal_connector[block.index()] =
+                        matches!(arc.target, ConditionTarget::Truthy | ConditionTarget::Falsy)
+                            .then_some((epoch, arc.transfer, arc.target));
                     blocks.push(*block);
                 }
                 validate_condition_internal_route(cfg, plan, index, node_index, arc)?;

@@ -6,15 +6,24 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::hir::common::{HirExpr, HirLValue, LocalId, ParamId, TempId};
+use crate::hir::common::{HirExpr, HirLValue, HirStmt, LocalId, ParamId, TempId};
 
 use super::super::walk::HirRewritePass;
 
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
-pub(super) enum CarryBinding {
+pub(in crate::hir::simplify) enum CarryBinding {
     Param(ParamId),
     Local(LocalId),
     Temp(TempId),
+}
+
+impl CarryBinding {
+    pub(in crate::hir::simplify) const fn local(self) -> Option<LocalId> {
+        match self {
+            Self::Local(local) => Some(local),
+            Self::Param(_) | Self::Temp(_) => None,
+        }
+    }
 }
 
 pub(super) trait BindingProtection {
@@ -43,6 +52,25 @@ pub(super) fn carry_binding_from_lvalue(lvalue: &HirLValue) -> Option<CarryBindi
         HirLValue::Temp(temp) => Some(CarryBinding::Temp(*temp)),
         HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => None,
     }
+}
+
+pub(in crate::hir::simplify) fn single_binding_copy(
+    stmt: &HirStmt,
+) -> Option<(CarryBinding, CarryBinding)> {
+    let HirStmt::Assign(assign) = stmt else {
+        return None;
+    };
+    let ([target], [value], None) = (
+        assign.targets.as_slice(),
+        assign.values.fixed.as_slice(),
+        &assign.values.tail,
+    ) else {
+        return None;
+    };
+    Some((
+        carry_binding_from_lvalue(target)?,
+        carry_binding_from_expr(value)?,
+    ))
 }
 
 fn carry_binding_expr(binding: CarryBinding) -> HirExpr {
