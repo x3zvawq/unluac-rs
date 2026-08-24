@@ -367,8 +367,11 @@ fn build_stock_lua(root: &Path, toolchain: &Toolchain) -> Result<()> {
     run_command("make", [make_target], &source)?;
 
     reset_build_dir(&build)?;
-    copy_executable(&source.join("src/lua"), &build.join("lua"))?;
-    copy_executable(&source.join("src/luac"), &build.join("luac"))?;
+    copy_executable(&source.join("src/lua"), &build.join(executable_name("lua")))?;
+    copy_executable(
+        &source.join("src/luac"),
+        &build.join(executable_name("luac")),
+    )?;
 
     Ok(())
 }
@@ -397,8 +400,14 @@ fn build_stock_lua(root: &Path, toolchain: &Toolchain) -> Result<()> {
     run_windows_command(&command, root)?;
 
     reset_build_dir(&build)?;
-    copy_executable(&temporary.join("lua.exe"), &build.join("lua"))?;
-    copy_executable(&temporary.join("luac.exe"), &build.join("luac"))?;
+    copy_executable(
+        &temporary.join("lua.exe"),
+        &build.join(executable_name("lua")),
+    )?;
+    copy_executable(
+        &temporary.join("luac.exe"),
+        &build.join(executable_name("luac")),
+    )?;
     remove_dir_if_exists(&temporary)?;
 
     Ok(())
@@ -420,10 +429,13 @@ fn build_luajit(root: &Path, toolchain: &Toolchain) -> Result<()> {
     run_with_env("make", std::iter::empty::<&str>(), &source, &extra_env)?;
 
     reset_build_dir(&build)?;
-    copy_executable(&source.join("src/luajit"), &build.join("luajit"))?;
+    copy_executable(
+        &source.join("src/luajit"),
+        &build.join(executable_name("luajit")),
+    )?;
     copy_dir_all(&source.join("src/jit"), &build.join("jit"))?;
     write_script(
-        &build.join("luac"),
+        &build.join(executable_name("luac")),
         r#"#!/usr/bin/env sh
 SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 export LUA_PATH="$SELF_DIR/?.lua;$SELF_DIR/?/init.lua;$SELF_DIR/jit/?.lua;$SELF_DIR/jit/?/init.lua;;"
@@ -448,10 +460,16 @@ fn build_luajit(root: &Path, toolchain: &Toolchain) -> Result<()> {
     run_windows_command(&command, root)?;
 
     reset_build_dir(&build)?;
-    copy_executable(&source.join("src/luajit.exe"), &build.join("luajit"))?;
+    copy_executable(
+        &source.join("src/luajit.exe"),
+        &build.join(executable_name("luajit")),
+    )?;
     // Windows 构建是 DLL 版本；把运行时 DLL 放在两个入口旁边，保证直接启动时能解析。
     copy_executable(&source.join("src/lua51.dll"), &build.join("lua51.dll"))?;
-    copy_executable(&source.join("src/luajit.exe"), &build.join("luac"))?;
+    copy_executable(
+        &source.join("src/luajit.exe"),
+        &build.join(executable_name("luac")),
+    )?;
     copy_dir_all(&source.join("src/jit"), &build.join("jit"))?;
 
     Ok(())
@@ -475,7 +493,7 @@ fn build_luau(root: &Path, toolchain: &Toolchain) -> Result<()> {
     for target in LUAU_TARGETS {
         copy_executable(
             &source.join("build/release").join(target),
-            &build.join(target),
+            &build.join(executable_name(target)),
         )?;
     }
 
@@ -508,7 +526,7 @@ fn build_luau(root: &Path, toolchain: &Toolchain) -> Result<()> {
     for target in LUAU_TARGETS {
         copy_executable(
             &temporary.join(format!("{target}.exe")),
-            &build.join(target),
+            &build.join(executable_name(target)),
         )?;
     }
     remove_dir_if_exists(&temporary)?;
@@ -537,6 +555,10 @@ fn source_dir(root: &Path, toolchain: &Toolchain) -> PathBuf {
 
 fn build_dir(root: &Path, toolchain: &Toolchain) -> PathBuf {
     lua_root(root).join("build").join(toolchain.key)
+}
+
+fn executable_name(name: &str) -> String {
+    format!("{name}{}", env::consts::EXE_SUFFIX)
 }
 
 fn tmp_root(root: &Path) -> PathBuf {

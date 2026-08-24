@@ -165,7 +165,11 @@ fn bundled_compiler_path(repo_root: &Path, dialect: DecompileDialect) -> PathBuf
         .join("lua")
         .join("build")
         .join(<&'static str>::from(dialect))
-        .join(bundled_compiler_name(dialect))
+        .join(executable_name(bundled_compiler_name(dialect)))
+}
+
+fn executable_name(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
 fn bundled_compiler_name(dialect: DecompileDialect) -> &'static str {

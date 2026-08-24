@@ -22,7 +22,7 @@
 - 调试时临时文件可以在tmp里读写，但是不能假设这个目录里的文件会持久存在。如果需要持久存在的测试样例应该考虑丢到`tests/lua_cases`里。
 - 每一轮工作完成如果修改了业务代码则需要通过一下两条命令进行验证。
   - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
-  - `cargo unit-test --jobs 8`
+  - `cargo unit-test --jobs 8` （jobs取决于可用CPU核心数）
 - 当更新了decompile参数输入的时候，需要同步更新以下项目：
   - `README.md/README_en.md` 中的参数列表
   - `packages/unluac-js/src/index.ts` js包装库中的类型声明

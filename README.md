@@ -96,7 +96,7 @@ Notes:
 - Available debug metadata is used as high-confidence binding and naming evidence in every naming mode; pass `--ignore-debug` to parse and validate it without publishing it to recovery or generated comments
 - `--strip` only controls compilation through `--source`; `--ignore-debug` independently applies to both `--source` and `--input`
 - `auto` dialect detection applies to compiled bytecode inputs; `--source` still needs an explicit `--dialect` so the CLI can pick the compiler
-- Standalone GitHub Release binaries do not bundle a Lua compiler; `-s/--source` only works when you pass `-l/--luac` explicitly, or when a compatible compiler is available under `lua/build/<dialect>/` or on PATH
+- Standalone GitHub Release binaries do not bundle a Lua compiler; `-s/--source` only works when you pass `-l/--luac` explicitly, or when a compatible compiler is available under `lua/build/<dialect>/` or on PATH. On Windows, bundled executable paths use the `.exe` suffix.
 - When `-o/--output` is provided, the CLI writes the final generated source to the target file instead of stdout
 - `-o/--output` only works for pure final-source runs and cannot be combined with debug / timing flags or `--stop-after` earlier than `generate`
 - The CLI prints plain generated source by default and does not emit debug dumps unless you explicitly request them

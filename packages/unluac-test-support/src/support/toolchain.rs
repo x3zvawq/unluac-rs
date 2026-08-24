@@ -46,7 +46,7 @@ pub(super) fn lua_tool_path(dialect_label: &str, tool_name: &str) -> Result<Path
         .join("lua")
         .join("build")
         .join(dialect_label)
-        .join(tool_name);
+        .join(executable_name(tool_name));
     if !tool.exists() {
         return Err(format!(
             "missing bundled {tool_name} for {dialect_label}: {}",
@@ -54,6 +54,10 @@ pub(super) fn lua_tool_path(dialect_label: &str, tool_name: &str) -> Result<Path
         ));
     }
     Ok(tool)
+}
+
+fn executable_name(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
 pub(super) fn suite_artifact_path(

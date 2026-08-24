@@ -274,20 +274,20 @@ fn resolve_compiler(options: &CliOptions, dialect: DecompileDialect) -> Result<P
         .join("lua")
         .join("build")
         .join(<&'static str>::from(dialect))
-        .join(bundled_compiler_name(dialect));
+        .join(executable_name(bundled_compiler_name(dialect)));
     if bundled.exists() {
         return Ok(bundled);
     }
 
     Ok(match dialect {
         DecompileDialect::Auto => unreachable!("source compile dialect must be explicit"),
-        DecompileDialect::Lua51 => PathBuf::from("lua5.1"),
-        DecompileDialect::Lua52 => PathBuf::from("lua5.2"),
-        DecompileDialect::Lua53 => PathBuf::from("lua5.3"),
-        DecompileDialect::Lua54 => PathBuf::from("lua5.4"),
-        DecompileDialect::Lua55 => PathBuf::from("lua5.5"),
-        DecompileDialect::Luajit => PathBuf::from("luajit"),
-        DecompileDialect::Luau => PathBuf::from("luau-compile"),
+        DecompileDialect::Lua51 => PathBuf::from(executable_name("lua5.1")),
+        DecompileDialect::Lua52 => PathBuf::from(executable_name("lua5.2")),
+        DecompileDialect::Lua53 => PathBuf::from(executable_name("lua5.3")),
+        DecompileDialect::Lua54 => PathBuf::from(executable_name("lua5.4")),
+        DecompileDialect::Lua55 => PathBuf::from(executable_name("lua5.5")),
+        DecompileDialect::Luajit => PathBuf::from(executable_name("luajit")),
+        DecompileDialect::Luau => PathBuf::from(executable_name("luau-compile")),
     })
 }
 
@@ -315,6 +315,10 @@ fn bundled_compiler_name(dialect: DecompileDialect) -> &'static str {
         DecompileDialect::Luajit => "luac",
         DecompileDialect::Luau => "luau-compile",
     }
+}
+
+fn executable_name(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
 fn compiled_chunk_extension(dialect: DecompileDialect) -> &'static str {

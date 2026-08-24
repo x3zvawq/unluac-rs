@@ -34,6 +34,7 @@ Outputs:
 - stock Lua builds produce `lua` and `luac`
 - `luajit` produces `luajit`, its bundled `jit/` modules, and a compatibility wrapper `luac` that runs `luajit -b`
 - `luau` produces `luau`, `luau-analyze`, `luau-compile`, and `luau-bytecode`
+- Windows appends `.exe` to each executable name; Unix keeps the names extensionless
 
 Host prerequisites:
 
@@ -45,5 +46,5 @@ Host prerequisites:
 
 Windows bootstrap is supported. `cargo lua init` discovers the installed Visual Studio toolchain through
 `vswhere` (or uses the active Visual Studio developer environment), builds stock Lua with MSVC, LuaJIT
-with its bundled `msvcbuild.bat`, and Luau with CMake/Ninja. The generated executables have no `.exe`
-suffix in `lua/build`, so the repository's CLI and test commands use the same paths on every host.
+with its bundled `msvcbuild.bat`, and Luau with CMake/Ninja. The repository's CLI and test commands use
+the host's native executable suffix when resolving these generated tools.
