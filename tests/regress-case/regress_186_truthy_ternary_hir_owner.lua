@@ -1,6 +1,7 @@
 -- regress_186_truthy_ternary_hir_owner#1: truthy ternary 的臂交换必须在 HIR 完成
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
+-- unluac: expect-not-contains [[local r1_0 = p1_0 ~= p1_1]]
 
 local function choose(lhs, rhs)
     local different = lhs ~= rhs

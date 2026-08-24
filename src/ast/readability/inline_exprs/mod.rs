@@ -9,7 +9,8 @@
 //! - 相邻 recovered local run 里，只有末尾 local 仍会跨语句存活的机械链
 //! - generic-for 的 method receiver 允许收回一个紧邻的 recovered binding 别名
 //! - repeat body 的 use index 把 until 条件计作尾随表达式，不删除仍对条件可见的 local
-//! - 多值 return 顶层只收回 context-safe 的唯一引用 alias；可变快照仍通过求值前缀证明
+//! - 多值 return 顶层只收回 context-safe 或已证明为单值布尔比较的唯一 alias；可变快照仍通过求值前缀证明
+//! - 单值 return 短路树只收回最左、必达位置的布尔比较 alias；右臂仍保留原 binding
 //! - 稳定 local copy 可跨越无关语句收回到唯一后续 use；只替换名字读取，不搬动 RHS
 
 mod candidate;
@@ -21,8 +22,10 @@ use std::collections::BTreeMap;
 use crate::ast::ReadabilityOptions;
 
 use self::candidate::{
-    InlineCandidate, InlinePolicy, inline_candidate, stmt_is_adjacent_call_result_sink,
-    stmt_is_alias_initializer_sink, stmt_is_direct_return_value_sink,
+    InlineCandidate, InlinePolicy, inline_candidate, is_lookup_inline_expr,
+    stmt_is_adjacent_call_result_sink, stmt_is_alias_initializer_sink,
+    stmt_is_boolean_return_value_sink, stmt_is_direct_return_value_sink,
+    stmt_is_multi_return_value_sink, stmt_is_terminal_lookup_return_sink,
 };
 use self::use_sites::rewrite_stmt_use_sites_with_policy;
 use super::super::common::{
@@ -230,7 +233,11 @@ fn rewrite_current_block(
         } else if stmt_is_adjacent_call_result_sink(next_stmt) {
             InlinePolicy::AdjacentCallResultCallee
         } else if stmt_is_direct_return_value_sink(next_stmt) {
-            InlinePolicy::DirectReturnConstructor
+            InlinePolicy::DirectReturnValue
+        } else if stmt_is_multi_return_value_sink(next_stmt, candidate.binding()) {
+            InlinePolicy::MultiReturnValue
+        } else if stmt_is_boolean_return_value_sink(next_stmt, candidate.binding()) {
+            InlinePolicy::BooleanReturnValue
         } else {
             InlinePolicy::Conservative
         };
@@ -278,6 +285,20 @@ fn rewrite_current_block(
         } else {
             policy
         };
+        if matches!(
+            effective_policy,
+            InlinePolicy::DirectReturnValue
+                | InlinePolicy::MultiReturnValue
+                | InlinePolicy::BooleanReturnValue
+        ) && binding_mentions_in_expr(value).contains(&candidate.binding())
+        {
+            // A closure capture or self-reference would still depend on the local's lexical
+            // identity after the declaration is removed.  The ordinary use index starts after
+            // this declaration, so reject that case explicitly before the unique-use check.
+            stmt_plan.push(PlannedStmt::Original(index));
+            index += 1;
+            continue;
+        }
         if !candidate.allows_expr_with_policy(value, effective_policy)
             && !allows_special_lookup_access_base
         {
@@ -295,6 +316,7 @@ fn rewrite_current_block(
             next_stmt,
             candidate.binding(),
             mutable_snapshots,
+            effective_policy,
         ) {
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
@@ -494,7 +516,17 @@ fn inline_crosses_evaluation_boundary(
     next_stmt: &AstStmt,
     binding: AstBindingRef,
     mutable_snapshots: &MutableSnapshotNames,
+    policy: InlinePolicy,
 ) -> bool {
+    if matches!(policy, InlinePolicy::BooleanReturnValue)
+        && is_lookup_inline_expr(value)
+        && stmt_is_terminal_lookup_return_sink(next_stmt, binding)
+    {
+        // The lookup is the first and only observable producer in the return expression.  The
+        // remaining short-circuit suffix is context-safe, so the expression temporary itself
+        // carries the value through the same truthiness/return operation as the old local root.
+        return false;
+    }
     (matches!(next_stmt, AstStmt::While(_) | AstStmt::Repeat(_))
         && !super::expr_analysis::is_stable_inline_value(value))
         || (super::expr_analysis::expr_requires_ordered_snapshot(value, mutable_snapshots)
@@ -512,12 +544,40 @@ use runs::*;
 #[cfg(test)]
 mod tests {
     use crate::ast::common::{
-        AstAssign, AstCallExpr, AstCallKind, AstCallStmt, AstGlobalName, AstLocalAttr,
-        AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstNameRef,
+        AstAssign, AstBinaryExpr, AstBinaryOpKind, AstCallExpr, AstCallKind, AstCallStmt,
+        AstFieldAccess, AstGlobalName, AstIndexAccess, AstLocalAttr, AstLocalBinding, AstLocalDecl,
+        AstLocalOrigin, AstLogicalExpr, AstNameRef, AstReturn,
     };
-    use crate::hir::LocalId;
+    use crate::hir::{LocalId, ParamId};
 
     use super::*;
+
+    fn recovered_local(binding: AstBindingRef, value: AstExpr) -> AstStmt {
+        AstStmt::LocalDecl(Box::new(AstLocalDecl {
+            bindings: vec![AstLocalBinding {
+                id: binding,
+                attr: AstLocalAttr::None,
+                origin: AstLocalOrigin::Recovered,
+            }],
+            values: vec![value],
+        }))
+    }
+
+    fn equals(lhs: AstExpr, rhs: AstExpr) -> AstExpr {
+        AstExpr::Binary(Box::new(AstBinaryExpr {
+            op: AstBinaryOpKind::Eq,
+            lhs,
+            rhs,
+        }))
+    }
+
+    fn return_values(values: Vec<AstExpr>) -> AstStmt {
+        AstStmt::Return(Box::new(AstReturn { values }))
+    }
+
+    fn indexed(base: AstExpr, index: AstExpr) -> AstExpr {
+        AstExpr::IndexAccess(Box::new(AstIndexAccess { base, index }))
+    }
 
     #[test]
     fn keeps_local_declaration_before_later_direct_write() {
@@ -602,5 +662,248 @@ mod tests {
                     )
             ));
         }
+    }
+
+    #[test]
+    fn inlines_proven_boolean_alias_in_multi_return() {
+        let binding = AstBindingRef::Local(LocalId(0));
+        let parameter = AstExpr::Var(AstNameRef::Param(ParamId(0)));
+        let mut block = AstBlock {
+            stmts: vec![
+                recovered_local(
+                    binding,
+                    equals(parameter, AstExpr::String("target".to_owned().into())),
+                ),
+                return_values(vec![
+                    AstExpr::Var(binding.to_name_ref()),
+                    AstExpr::Integer(1),
+                ]),
+            ],
+        };
+
+        assert!(rewrite_current_block(
+            &mut block,
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            None,
+        ));
+        assert!(matches!(
+            block.stmts.as_slice(),
+            [AstStmt::Return(ret)]
+                if matches!(
+                    ret.values.as_slice(),
+                    [AstExpr::Binary(binary), AstExpr::Integer(1)]
+                        if binary.op == AstBinaryOpKind::Eq
+                )
+        ));
+    }
+
+    #[test]
+    fn inlines_proven_boolean_alias_in_return_short_circuit_prefix() {
+        let binding = AstBindingRef::Local(LocalId(0));
+        let logical = AstExpr::LogicalOr(Box::new(AstLogicalExpr {
+            lhs: AstExpr::LogicalAnd(Box::new(AstLogicalExpr {
+                lhs: AstExpr::Var(binding.to_name_ref()),
+                rhs: AstExpr::Boolean(true),
+            })),
+            rhs: AstExpr::Boolean(false),
+        }));
+        let mut block = AstBlock {
+            stmts: vec![
+                recovered_local(
+                    binding,
+                    equals(
+                        AstExpr::Var(AstNameRef::Param(ParamId(0))),
+                        AstExpr::String("target".to_owned().into()),
+                    ),
+                ),
+                return_values(vec![logical]),
+            ],
+        };
+
+        assert!(rewrite_current_block(
+            &mut block,
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            None,
+        ));
+        assert!(matches!(
+            block.stmts.as_slice(),
+            [AstStmt::Return(ret)]
+                if matches!(
+                    &ret.values[0],
+                    AstExpr::LogicalOr(logical)
+                        if matches!(&logical.lhs, AstExpr::LogicalAnd(and)
+                            if matches!(&and.lhs, AstExpr::Binary(binary)
+                                if binary.op == AstBinaryOpKind::Eq))
+                )
+        ));
+    }
+
+    #[test]
+    fn inlines_lookup_alias_in_terminal_short_circuit_return() {
+        let binding = AstBindingRef::Local(LocalId(0));
+        let lookup = indexed(
+            AstExpr::Var(AstNameRef::Local(LocalId(1))),
+            AstExpr::Var(AstNameRef::Param(ParamId(0))),
+        );
+        let logical = AstExpr::LogicalOr(Box::new(AstLogicalExpr {
+            lhs: AstExpr::Var(binding.to_name_ref()),
+            rhs: AstExpr::Integer(0),
+        }));
+        let mut block = AstBlock {
+            stmts: vec![
+                recovered_local(binding, lookup),
+                return_values(vec![logical]),
+            ],
+        };
+
+        assert!(rewrite_current_block(
+            &mut block,
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            None,
+        ));
+        assert!(matches!(
+            block.stmts.as_slice(),
+            [AstStmt::Return(ret)]
+                if matches!(&ret.values[0], AstExpr::LogicalOr(logical)
+                    if matches!(&logical.lhs, AstExpr::IndexAccess(_)))
+        ));
+    }
+
+    #[test]
+    fn keeps_lookup_alias_when_terminal_short_circuit_tail_calls() {
+        let binding = AstBindingRef::Local(LocalId(0));
+        let lookup = indexed(
+            AstExpr::Var(AstNameRef::Local(LocalId(1))),
+            AstExpr::Var(AstNameRef::Param(ParamId(0))),
+        );
+        let fallback = AstExpr::Call(Box::new(AstCallExpr {
+            callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                text: "fallback".to_owned(),
+            })),
+            args: Vec::new(),
+        }));
+        let logical = AstExpr::LogicalOr(Box::new(AstLogicalExpr {
+            lhs: AstExpr::Var(binding.to_name_ref()),
+            rhs: fallback,
+        }));
+        let mut block = AstBlock {
+            stmts: vec![
+                recovered_local(binding, lookup),
+                return_values(vec![logical]),
+            ],
+        };
+        let expected = block.clone();
+
+        assert!(!rewrite_current_block(
+            &mut block,
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            None,
+        ));
+        assert_eq!(block, expected);
+    }
+
+    #[test]
+    fn keeps_lookup_alias_for_protected_origins() {
+        for origin in [AstLocalOrigin::DebugHinted, AstLocalOrigin::PhysicalRoot] {
+            let binding = AstBindingRef::Local(LocalId(0));
+            let lookup = indexed(
+                AstExpr::Var(AstNameRef::Local(LocalId(1))),
+                AstExpr::Var(AstNameRef::Param(ParamId(0))),
+            );
+            let logical = AstExpr::LogicalOr(Box::new(AstLogicalExpr {
+                lhs: AstExpr::Var(binding.to_name_ref()),
+                rhs: AstExpr::Integer(0),
+            }));
+            let mut block = AstBlock {
+                stmts: vec![
+                    AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                        bindings: vec![AstLocalBinding {
+                            id: binding,
+                            attr: AstLocalAttr::None,
+                            origin,
+                        }],
+                        values: vec![lookup],
+                    })),
+                    return_values(vec![logical]),
+                ],
+            };
+            let expected = block.clone();
+
+            assert!(!rewrite_current_block(
+                &mut block,
+                ReadabilityOptions::default(),
+                &MutableSnapshotNames::new(),
+                None,
+            ));
+            assert_eq!(block, expected);
+        }
+    }
+
+    #[test]
+    fn keeps_boolean_alias_in_return_short_circuit_rhs() {
+        let binding = AstBindingRef::Local(LocalId(0));
+        let logical = AstExpr::LogicalAnd(Box::new(AstLogicalExpr {
+            lhs: AstExpr::Var(AstNameRef::Param(ParamId(1))),
+            rhs: AstExpr::Var(binding.to_name_ref()),
+        }));
+        let mut block = AstBlock {
+            stmts: vec![
+                recovered_local(
+                    binding,
+                    equals(
+                        AstExpr::Var(AstNameRef::Param(ParamId(0))),
+                        AstExpr::String("target".to_owned().into()),
+                    ),
+                ),
+                return_values(vec![logical]),
+            ],
+        };
+        let expected = block.clone();
+
+        assert!(!rewrite_current_block(
+            &mut block,
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            None,
+        ));
+        assert_eq!(block, expected);
+    }
+
+    #[test]
+    fn keeps_boolean_alias_when_an_earlier_return_value_observes_order() {
+        let binding = AstBindingRef::Local(LocalId(0));
+        let mut block = AstBlock {
+            stmts: vec![
+                recovered_local(
+                    binding,
+                    equals(
+                        AstExpr::Var(AstNameRef::Local(LocalId(1))),
+                        AstExpr::Integer(1),
+                    ),
+                ),
+                return_values(vec![
+                    AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                            text: "observe".to_owned(),
+                        })),
+                        field: "value".to_owned(),
+                    })),
+                    AstExpr::Var(binding.to_name_ref()),
+                ]),
+            ],
+        };
+        let expected = block.clone();
+
+        assert!(!rewrite_current_block(
+            &mut block,
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            None,
+        ));
+        assert_eq!(block, expected);
     }
 }

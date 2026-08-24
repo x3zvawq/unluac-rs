@@ -5,6 +5,8 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[repeat]]
+-- unluac: expect-not-contains [[local r1_0 = r0_1[p1_1]]
+-- unluac: expect-contains [[return r0_1[p1_1] or 0]]
 -- unluac: expect-not-contains [[unluac error]]
 local releaseBuild = true
 local last_open = {}

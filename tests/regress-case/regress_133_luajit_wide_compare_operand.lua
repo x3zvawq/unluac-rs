@@ -1,6 +1,7 @@
 -- regress_133_luajit_wide_compare_operand#1: compare 必须保留 16-bit D 常量索引
 -- unluac: expect-contains [["target-compare"]]
 -- unluac: expect-not-contains [["padding-005"]]
+-- unluac: expect-not-contains [[local r0_1 = r0_0 == "target-compare"]]
 local x = ...
 local sink
 sink = "padding-001"

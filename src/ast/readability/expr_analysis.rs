@@ -376,8 +376,59 @@ pub(super) fn is_mechanical_run_inline_expr(expr: &AstExpr) -> bool {
     }
 }
 
-pub(super) fn is_direct_return_constructor_inline_expr(expr: &AstExpr) -> bool {
-    matches!(expr, AstExpr::TableConstructor(_))
+/// 直接终态 return 能否消费该表达式而不展开额外返回值。
+///
+/// `local value = expr; return value` 的 local initializer 处于目标计数上下文，
+/// 因此裸 `Call` / `MethodCall` / `VarArg` 在移到 return 后可能从单值变成多值；
+/// `SingleValue` 则是 lowering 已经保留的单值边界。其它 AST 表达式在运算、访问、
+/// 构造器或函数表达式位置都只产出一个值。`Error` 继续保留为 residual，避免把未知
+/// 语义伪装成可读源码。
+pub(super) fn is_direct_return_inline_expr(expr: &AstExpr) -> bool {
+    !matches!(
+        expr,
+        AstExpr::Call(_) | AstExpr::MethodCall(_) | AstExpr::VarArg | AstExpr::Error(_)
+    )
+}
+
+/// 多值 `return` 中可安全收回的单值表达式。
+///
+/// 现有的 context-safe 子集已经覆盖不会观察运行时事件的表达式。额外放行的只有
+/// “比较结果为布尔值”的表达式树，且比较操作数仍必须属于 context-safe 子集（或是
+/// 已处于单值比较操作数语境的 vararg）；这样
+/// 比较本身即使触发 Lua 的比较协议，也不会把对象结果从 local root 搬到别的求值点，
+/// 并且不会产生多返回值。短路/`not` 只在整棵树仍保证布尔结果时递归接受。
+pub(super) fn is_multi_return_inline_expr(expr: &AstExpr) -> bool {
+    if is_context_safe_expr(expr) {
+        return true;
+    }
+    if !expr_is_boolean_valued(expr) {
+        return false;
+    }
+    match expr {
+        AstExpr::Binary(binary)
+            if matches!(
+                binary.op,
+                AstBinaryOpKind::Eq | AstBinaryOpKind::Lt | AstBinaryOpKind::Le
+            ) =>
+        {
+            is_multi_return_comparison_operand(&binary.lhs)
+                && is_multi_return_comparison_operand(&binary.rhs)
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            is_multi_return_inline_expr(&logical.lhs) && is_multi_return_inline_expr(&logical.rhs)
+        }
+        AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not => {
+            is_multi_return_inline_expr(&unary.expr)
+        }
+        AstExpr::SingleValue(inner) => is_multi_return_inline_expr(inner),
+        _ => false,
+    }
+}
+
+fn is_multi_return_comparison_operand(expr: &AstExpr) -> bool {
+    is_context_safe_expr(expr)
+        || matches!(expr, AstExpr::VarArg)
+        || matches!(expr, AstExpr::SingleValue(inner) if matches!(inner.as_ref(), AstExpr::VarArg))
 }
 
 pub(super) fn is_call_arg_constructor_inline_expr(expr: &AstExpr) -> bool {

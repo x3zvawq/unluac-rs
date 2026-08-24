@@ -13,8 +13,8 @@ use super::super::super::common::{
 use super::super::binding_ref::name_matches_binding;
 use super::super::expr_analysis::{
     expr_complexity, is_access_base_inline_expr, is_call_arg_constructor_inline_expr,
-    is_context_safe_expr, is_direct_return_constructor_inline_expr, is_mechanical_run_inline_expr,
-    is_stable_copy_alias_expr,
+    is_context_safe_expr, is_direct_return_inline_expr, is_mechanical_run_inline_expr,
+    is_multi_return_inline_expr, is_stable_copy_alias_expr,
 };
 use super::candidate::{
     InlineCandidate, InlinePolicy, is_call_callee_inline_expr,
@@ -551,7 +551,7 @@ impl InlineSite {
             return false;
         }
 
-        let Some(limit) = self.complexity_limit(options, policy) else {
+        let Some(limit) = self.complexity_limit(options, policy, replacement) else {
             return false;
         };
         if expr_complexity(replacement) > limit {
@@ -576,7 +576,9 @@ impl InlineSite {
                             || is_recallable_inline_expr(replacement)
                     }
                     Self::ReturnNestedValue => {
-                        is_recallable_inline_expr(replacement) || is_lookup_inline_expr(replacement)
+                        is_context_safe_expr(replacement)
+                            || is_recallable_inline_expr(replacement)
+                            || is_lookup_inline_expr(replacement)
                     }
                     Self::ReturnValue => is_context_safe_expr(replacement),
                     _ => false,
@@ -597,15 +599,28 @@ impl InlineSite {
                 candidate.origin() == super::super::super::common::AstLocalOrigin::Recovered
                     && self.allows_loop_header_call_local_alias(replacement)
             }
-            InlinePolicy::DirectReturnConstructor => {
+            InlinePolicy::DirectReturnValue => {
                 candidate.origin() == super::super::super::common::AstLocalOrigin::Recovered
-                    && self.allows_direct_return_constructor_local_alias(replacement)
+                    && self.allows_direct_return_value_local_alias(replacement)
+            }
+            InlinePolicy::MultiReturnValue => {
+                candidate.origin() == super::super::super::common::AstLocalOrigin::Recovered
+                    && self.allows_multi_return_value_local_alias(replacement)
+            }
+            InlinePolicy::BooleanReturnValue => {
+                candidate.origin() == super::super::super::common::AstLocalOrigin::Recovered
+                    && self.allows_boolean_return_value_local_alias(replacement)
             }
             InlinePolicy::MechanicalRun => self.allows_mechanical_run_expr(replacement),
         }
     }
 
-    fn complexity_limit(self, options: ReadabilityOptions, policy: InlinePolicy) -> Option<usize> {
+    fn complexity_limit(
+        self,
+        options: ReadabilityOptions,
+        policy: InlinePolicy,
+        replacement: &AstExpr,
+    ) -> Option<usize> {
         match self {
             Self::Neutral => match policy {
                 InlinePolicy::StableCopy => Some(1),
@@ -615,7 +630,9 @@ impl InlineSite {
                 InlinePolicy::AdjacentCallResultCallee => None,
                 InlinePolicy::AdjacentValueSink => Some(options.return_inline_max_complexity),
                 InlinePolicy::Conservative => None,
-                InlinePolicy::DirectReturnConstructor => None,
+                InlinePolicy::DirectReturnValue => None,
+                InlinePolicy::MultiReturnValue => None,
+                InlinePolicy::BooleanReturnValue => Some(options.return_inline_max_complexity),
                 InlinePolicy::ExtendedCallChain => Some(options.access_base_inline_max_complexity),
                 InlinePolicy::LoopHeaderCall => Some(options.return_inline_max_complexity),
                 InlinePolicy::MechanicalRun => Some(options.return_inline_max_complexity),
@@ -623,7 +640,15 @@ impl InlineSite {
             Self::ComparisonOperand => Some(options.args_inline_max_complexity),
             Self::ReturnValue => match policy {
                 InlinePolicy::StableCopy => Some(1),
-                InlinePolicy::DirectReturnConstructor => Some(usize::MAX),
+                InlinePolicy::DirectReturnValue => {
+                    if matches!(replacement, AstExpr::TableConstructor(_)) {
+                        Some(usize::MAX)
+                    } else {
+                        Some(options.return_inline_max_complexity)
+                    }
+                }
+                InlinePolicy::MultiReturnValue => Some(options.return_inline_max_complexity),
+                InlinePolicy::BooleanReturnValue => Some(options.return_inline_max_complexity),
                 _ => Some(options.return_inline_max_complexity),
             },
             Self::ReturnNestedValue => Some(options.return_inline_max_complexity),
@@ -769,8 +794,17 @@ impl InlineSite {
         }
     }
 
-    fn allows_direct_return_constructor_local_alias(self, replacement: &AstExpr) -> bool {
-        matches!(self, Self::ReturnValue) && is_direct_return_constructor_inline_expr(replacement)
+    fn allows_direct_return_value_local_alias(self, replacement: &AstExpr) -> bool {
+        matches!(self, Self::ReturnValue) && is_direct_return_inline_expr(replacement)
+    }
+
+    fn allows_multi_return_value_local_alias(self, replacement: &AstExpr) -> bool {
+        matches!(self, Self::ReturnValue) && is_multi_return_inline_expr(replacement)
+    }
+
+    fn allows_boolean_return_value_local_alias(self, replacement: &AstExpr) -> bool {
+        matches!(self, Self::ReturnNestedValue | Self::ReturnValue)
+            && (is_multi_return_inline_expr(replacement) || is_lookup_inline_expr(replacement))
     }
 
     fn allows_mechanical_run_expr(self, replacement: &AstExpr) -> bool {

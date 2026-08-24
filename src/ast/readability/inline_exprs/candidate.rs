@@ -9,9 +9,10 @@ use super::super::super::common::{
     AstTableField, AstTableKey,
 };
 use super::super::expr_analysis::{
-    is_access_base_inline_expr, is_context_safe_expr, is_direct_return_constructor_inline_expr,
+    is_access_base_inline_expr, is_context_safe_expr, is_direct_return_inline_expr,
     is_lookup_inline_expr as is_lookup_expr, is_mechanical_run_inline_expr,
-    is_raw_global_alias_expr as is_raw_global_expr, is_stable_copy_alias_expr,
+    is_multi_return_inline_expr, is_raw_global_alias_expr as is_raw_global_expr,
+    is_stable_copy_alias_expr,
 };
 
 pub(super) fn inline_candidate(stmt: &AstStmt) -> Option<(InlineCandidate, &AstExpr)> {
@@ -64,6 +65,73 @@ pub(super) fn stmt_is_direct_return_value_sink(stmt: &AstStmt) -> bool {
     )
 }
 
+pub(super) fn stmt_is_multi_return_value_sink(stmt: &AstStmt, binding: AstBindingRef) -> bool {
+    matches!(
+        stmt,
+        AstStmt::Return(ret)
+            if ret.values.len() > 1
+                && ret.values.iter().any(
+                    |value| matches!(value, AstExpr::Var(name) if binding.matches_name_ref(name))
+                )
+    )
+}
+
+/// 单值 `return` 的短路树是否在最左、必达位置读取该 binding。
+///
+/// 只有这个位置能保证把 producer 从相邻 local initializer 搬进 return 后仍然只求值
+/// 一次；逻辑右臂会受前置 truthiness 控制，不能把可能触发比较协议的 producer 延后到那里。
+pub(super) fn stmt_is_boolean_return_value_sink(stmt: &AstStmt, binding: AstBindingRef) -> bool {
+    matches!(
+        stmt,
+        AstStmt::Return(ret)
+            if matches!(ret.values.as_slice(), [value]
+                if expr_has_unconditional_boolean_binding_use(value, binding))
+    )
+}
+
+/// 终态查表值是否位于短路 return 的最左必达前缀，且其余逻辑尾部没有新的求值事件。
+///
+/// 这个比普通 boolean sink 更窄：查表结果会观察 lookup/元方法，只有在紧邻 return
+/// 中先完成同一次 lookup，后续只剩 context-safe 的 truthiness/值读取时，才能证明把
+/// local initializer 搬进表达式不会改变顺序或临时值的存活期。
+pub(super) fn stmt_is_terminal_lookup_return_sink(stmt: &AstStmt, binding: AstBindingRef) -> bool {
+    matches!(
+        stmt,
+        AstStmt::Return(ret)
+            if matches!(ret.values.as_slice(), [value]
+                if expr_has_terminal_lookup_binding_use(value, binding))
+    )
+}
+
+fn expr_has_terminal_lookup_binding_use(expr: &AstExpr, binding: AstBindingRef) -> bool {
+    match expr {
+        AstExpr::Var(name) => binding.matches_name_ref(name),
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            expr_has_terminal_lookup_binding_use(&logical.lhs, binding)
+                && is_context_safe_expr(&logical.rhs)
+        }
+        AstExpr::Unary(unary) if unary.op == super::super::super::common::AstUnaryOpKind::Not => {
+            expr_has_terminal_lookup_binding_use(&unary.expr, binding)
+        }
+        AstExpr::SingleValue(inner) => expr_has_terminal_lookup_binding_use(inner, binding),
+        _ => false,
+    }
+}
+
+fn expr_has_unconditional_boolean_binding_use(expr: &AstExpr, binding: AstBindingRef) -> bool {
+    match expr {
+        AstExpr::Var(name) => binding.matches_name_ref(name),
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            expr_has_unconditional_boolean_binding_use(&logical.lhs, binding)
+        }
+        AstExpr::Unary(unary) if unary.op == super::super::super::common::AstUnaryOpKind::Not => {
+            expr_has_unconditional_boolean_binding_use(&unary.expr, binding)
+        }
+        AstExpr::SingleValue(inner) => expr_has_unconditional_boolean_binding_use(inner, binding),
+        _ => false,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct InlineCandidate {
     binding: AstBindingRef,
@@ -77,7 +145,9 @@ pub(super) enum InlinePolicy {
     AliasInitializerChain,
     AdjacentCallResultCallee,
     AdjacentValueSink,
-    DirectReturnConstructor,
+    DirectReturnValue,
+    MultiReturnValue,
+    BooleanReturnValue,
     MechanicalRun,
     LoopHeaderCall,
     /// 单次后续使用的稳定 local copy；不会重复 RHS，也不会移动 producer。
@@ -117,8 +187,10 @@ impl InlineCandidate {
                         || is_recallable_inline_expr(expr)
                         || is_raw_global_alias_expr(expr)
                 }
-                InlinePolicy::DirectReturnConstructor => {
-                    is_direct_return_constructor_inline_expr(expr)
+                InlinePolicy::DirectReturnValue => is_direct_return_inline_expr(expr),
+                InlinePolicy::MultiReturnValue => is_multi_return_inline_expr(expr),
+                InlinePolicy::BooleanReturnValue => {
+                    is_multi_return_inline_expr(expr) || is_lookup_inline_expr(expr)
                 }
                 InlinePolicy::LoopHeaderCall => {
                     is_access_base_inline_expr(expr)
@@ -132,7 +204,12 @@ impl InlineCandidate {
                         || is_lookup_inline_expr(expr)
                         || is_recallable_inline_expr(expr)
                 }
-                InlinePolicy::Conservative | InlinePolicy::ExtendedCallChain => {
+                InlinePolicy::Conservative => {
+                    is_context_safe_expr(expr)
+                        || is_access_base_inline_expr(expr)
+                        || is_recallable_inline_expr(expr)
+                }
+                InlinePolicy::ExtendedCallChain => {
                     is_access_base_inline_expr(expr) || is_recallable_inline_expr(expr)
                 }
             },
