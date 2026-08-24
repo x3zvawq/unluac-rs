@@ -55,12 +55,33 @@
   字段闭包，因此首轮输出可恢复 `function r2_0:add(...)` / `function r2_0:value_text()`。
   这只是字段写的 canonical spelling，不是对原始冒号源码的猜测；round-trip 后若调用已
   退化为普通点调用，字节码没有办法重新提供该事实，允许回到字段函数形状。
-  顶层运行时顺序仍是 `r0_3:add(2)`、`r0_6:add(3)`、`r0_7.value_text`、`r0_6(...)`：
-  `r0_5 = print` 必须在 method chain 前捕获全局快照，`r0_4 = display_name(r0_2)` 不能
-  跨过该快照移动，且首个 call-result 在后续 field lookup 写回同一 home 前是 HIR
-  `PhysicalRoot`。折成 `r0_3:add(2):add(3):value_text()` 会在 field lookup 前释放首个
-  结果，可能改变弱表、`__gc`/自动 GC 或 lookup metamethod 的观察；因此末尾仍保留
-  `r0_6 = r0_7.value_text; r0_6(r0_7)`，不新增 AST 特判。
+  顶层 low-IR 仍是 `r0_3:add(2)`、`r0_6:add(3)`、`r0_7.value_text`、`r0_6(...)`，但
+  `SELF` 不是普通的 `GETTABLE + CALL`：VM 先执行
+  `MOVE (A + 1) <- B` 覆盖隐式 `self` 槽，再用该快照做字段查找，`CALL` 随后消费同一
+  槽。因此 `method=true/method_name` 足以证明 receiver 的一次求值、lookup 顺序和隐式
+  首参协议；它不提供跨调用的 result identity，也不自动把旧 home 在下一次 `SELF` 中的
+  覆盖与 lookup 时点配成一个可消费的 intra-call epoch。当前 promotion facts
+  虽保留 trusted home/epoch 和相邻 MOVE 的写集合，`temp-inline` 融合 setup 后仍没有把
+  “lookup 前的 SELF 覆盖”与“CALL 结果写回”区分给后层，因而只能把相关值保守标为
+  `PhysicalRoot`。
+
+  这使“只删最后两句”不能从 `SELF` 单独推出。可复现的 Lua 5.1 反例是：`first()` 返回带
+  `__gc` 的 userdata，`second()` 返回另一个带 `__gc` 的 userdata，最终
+  `__index.value_text` 先执行 `collectgarbage("collect")` 再记录日志。原始
+  `object:first():second():value_text()` 在最终 lookup 内可观察到
+  `first-result`；当前展开形状
+  `first_result = object:first(); second_result = first_result:second();
+  first_result = second_result.value_text; first_result(second_result)` 的 lookup 内日志
+  为空，显式 collection 后才看到首个 finalizer。把它改成
+  `second_result:value_text()` 又得到另一种存活时点。也就是说，删除/移动
+  `r0_6` 的 home 覆盖会改变弱表、`__gc`、自动 GC 或 lookup metamethod 的观察。
+  当前样例里的 `add` 虽然表面上每条路径都 `return self`，HIR 还没有把确切 closure
+  occurrence、字段单写/逃逸和 return-self identity 作为可消费的通用事实；不能用这个
+  case 的常量路径替代证明。这并不表示完整链恢复必须依赖 `return self`；若未来 HIR
+  保留每次 `SELF` 的 receiver snapshot 与 lookup 前覆盖，嵌套链可以按原始结果逐次传递，
+  但那仍须是覆盖/求值顺序的原子事务。因此末尾仍保留
+  `r0_6 = r0_7.value_text; r0_6(r0_7)`，不新增 AST 文本特判。只有前层同时保留
+  `SELF` snapshot/overwrite provenance，并能原子重建整条 method chain 时，才值得重新立项。
 
 ## 审计规则
 
@@ -72,7 +93,10 @@
 ## 待处理问题
 
 当前没有待处理项。已经证明属于 VM/源码表达边界或精确语义证据的数据结构不再作为可读性
-优化缺口登记；只有出现新的等价性证明或真实错误复现时才重新立项。本轮抽样确认的
+优化缺口登记；只有出现新的等价性证明或真实错误复现时才重新立项。本轮还用匹配的 PUC
+Lua 5.1 toolchain 复核了 `SELF` 的隐式槽覆盖与 `__gc` 观察：method provenance 是真实
+证据，但不足以删除 `PhysicalRoot`/field alias，故该候选继续归档为 HIR snapshot/overwrite
+事实缺口，而不是 AST 漏收。本轮抽样确认的
 call-result logical self-update、`common_11` 的调用结果短路壳、`regress_282` 长 `or` 链、
 call→field、闭包/字段快照与构造器 wiring 都保留原形：其中长链首值已由 HIR 标为 `PhysicalRoot`，不能按普通
 `Recovered` alias 缩短。构造器字段 write 不再被错误计作独立 producer，但调用/查表/闭包
