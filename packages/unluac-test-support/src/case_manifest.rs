@@ -104,6 +104,7 @@ impl LuaCaseMatrixEntry {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum LuaCaseExpectation {
     Source,
+    TableSetListResidual,
     InvalidDebugStillRejected,
     LuaJitBuiltinTableRemove,
     LuaJitMethodProtocol,

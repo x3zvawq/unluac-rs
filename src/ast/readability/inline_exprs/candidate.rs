@@ -5,8 +5,8 @@
 //! 例如：`local r0 = print` 会在这里被识别成一个可继续审查的 local alias 候选。
 
 use super::super::super::common::{
-    AstBindingRef, AstExpr, AstLocalAttr, AstLocalDecl, AstLocalOrigin, AstStmt, AstTableField,
-    AstTableKey,
+    AstBindingRef, AstCallKind, AstExpr, AstLocalAttr, AstLocalDecl, AstLocalOrigin, AstStmt,
+    AstTableField, AstTableKey,
 };
 use super::super::expr_analysis::{
     is_access_base_inline_expr, is_context_safe_expr, is_direct_return_constructor_inline_expr,
@@ -36,8 +36,11 @@ pub(super) fn stmt_is_adjacent_call_result_sink(stmt: &AstStmt) -> bool {
             .iter()
             .any(expr_contains_direct_call_callee_var),
         AstStmt::Return(ret) => ret.values.iter().any(expr_contains_direct_call_callee_var),
+        AstStmt::CallStmt(call_stmt) => matches!(
+            &call_stmt.call,
+            AstCallKind::Call(call) if matches!(call.callee, AstExpr::Var(_))
+        ),
         AstStmt::GlobalDecl(_)
-        | AstStmt::CallStmt(_)
         | AstStmt::If(_)
         | AstStmt::While(_)
         | AstStmt::Repeat(_)
@@ -93,10 +96,19 @@ impl InlineCandidate {
         // 生命周期证据。编译器内部 for 槽已经在 Transformer 归一化时排除，因而这里
         // 可以完整保护 DebugHinted，普通 recovered alias 则继续按上下文收敛。
         match self.origin {
-            AstLocalOrigin::DebugHinted | AstLocalOrigin::PhysicalRoot => false,
+            AstLocalOrigin::DebugHinted => false,
+            AstLocalOrigin::PhysicalRoot => {
+                // 物理根若只是紧邻普通调用的全局 callee，调用帧会在参数求值期间继续
+                // 持有同一函数值；把前置别名收回 callee 位不会缩短 GC 根，也不会改变
+                // callee-before-argument 的求值顺序。其它物理根仍必须保留原声明。
+                matches!(policy, InlinePolicy::AdjacentCallResultCallee)
+                    && is_raw_global_alias_expr(expr)
+            }
             AstLocalOrigin::Recovered => match policy {
                 InlinePolicy::MechanicalRun => is_mechanical_run_inline_expr(expr),
-                InlinePolicy::AdjacentCallResultCallee => is_lookup_inline_expr(expr),
+                InlinePolicy::AdjacentCallResultCallee => {
+                    is_lookup_inline_expr(expr) || is_raw_global_alias_expr(expr)
+                }
                 InlinePolicy::AdjacentValueSink => {
                     is_extended_neutral_local_alias_expr(expr)
                         || is_recallable_inline_expr(expr)

@@ -194,6 +194,7 @@ pub enum FailureKind {
     RecompileConvergenceMismatch,
     ReadabilityAssertionFailed,
     StructureContractAssertionFailed,
+    ResidualContractAssertionFailed,
     LuaJitBuiltinContractAssertionFailed,
     LuaJitMethodProtocolContractAssertionFailed,
 }
@@ -230,6 +231,7 @@ impl FailureKind {
             Self::RecompileConvergenceMismatch => "recompile-convergence-mismatch",
             Self::ReadabilityAssertionFailed => "readability-assertion-failed",
             Self::StructureContractAssertionFailed => "structure-contract-assertion-failed",
+            Self::ResidualContractAssertionFailed => "residual-contract-assertion-failed",
             Self::LuaJitBuiltinContractAssertionFailed => {
                 "luajit-builtin-contract-assertion-failed"
             }

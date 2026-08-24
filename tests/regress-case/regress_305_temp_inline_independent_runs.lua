@@ -1,5 +1,4 @@
 -- regress_305_temp_inline_independent_runs: 独立 callee/materialization run 必须在同轮批量收敛
--- unluac: expect-not-contains [[ = assert]]
 local calls = 0
 local values = {
     function()

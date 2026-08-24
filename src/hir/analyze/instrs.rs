@@ -4,6 +4,8 @@
 //! set-list。它依赖 `ProtoLowering` 中已经准备好的 CFG / Dataflow /
 //! StructureFacts / binding 映射，不重新识别 block 结构，也不接管 numeric/generic-for
 //! 控制协议；这些 terminator 只能由 StructurePlan 选中的 loop owner 消费。
+//! LuaJIT 没有精确 Lua 拼写的 `TypeGuard` 只保留带位置与效果说明的 residual；本模块不
+//! 猜测可覆盖的 helper 语义，严格模式仍由后续 residual 合同拒绝。
 //!
 //! 输入形状：`CALL r0 ...` + 指令 def 映射。
 //! 输出形状：`t0 = f(args)` 或 `f(args)` 这类 HIR 语句。
@@ -172,10 +174,15 @@ pub(super) fn lower_regular_instr(
             }))]
         }
         LowInstr::TypeGuard(type_guard) => {
+            let effect = if type_guard.kind.normalizes_subject() {
+                "it can raise a LuaJIT-specific argument error and normalize the subject value"
+            } else {
+                "it can raise a LuaJIT-specific argument error without producing a Lua value"
+            };
             let call = HirCallExpr {
                 callee: unresolved_expr(format!(
-                    "LuaJIT {} type guard has no exact Lua source form",
-                    type_guard.kind.label()
+                    "LuaJIT builtin {} type guard at block {block}, instruction {instr_ref} has no exact Lua source spelling; {effect}",
+                    type_guard.kind.label(),
                 )),
                 args: vec![expr_for_reg_use(
                     lowering,

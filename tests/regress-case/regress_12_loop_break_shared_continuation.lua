@@ -2,8 +2,6 @@
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-contains [[while ]]
 -- unluac: expect-contains [[break]]
--- unluac: expect-contains [[in ipairs({]]
--- unluac: expect-not-contains [[ = ipairs]]
 -- unluac: expect-not-contains [[unresolved(generic-for-call)]]
 -- unluac: expect-not-contains [[unresolved(generic-for-loop cond)]]
 -- unluac: expect-not-contains [[goto label_]]

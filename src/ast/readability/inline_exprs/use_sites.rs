@@ -717,7 +717,8 @@ impl InlineSite {
     }
 
     fn allows_adjacent_call_result_local_alias(self, replacement: &AstExpr) -> bool {
-        matches!(self, Self::CallCallee) && is_lookup_inline_expr(replacement)
+        matches!(self, Self::CallCallee)
+            && (is_lookup_inline_expr(replacement) || is_raw_global_alias_expr(replacement))
     }
 
     fn allows_adjacent_value_sink_local_alias(self, replacement: &AstExpr) -> bool {

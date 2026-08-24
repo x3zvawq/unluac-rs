@@ -27,6 +27,7 @@ mod loop_updates;
 mod prune;
 mod reads;
 mod region_results;
+mod repeat_snapshots;
 mod seeds;
 
 use std::collections::BTreeSet;
@@ -43,7 +44,7 @@ pub(super) use self::binding::{CarryBinding, single_binding_copy};
 use self::boundary::LabelJumpIndex;
 use self::handoffs::{HandoffAction, try_collapse_handoff_at};
 use self::loop_updates::collapse_dead_loop_update_handoffs;
-use self::prune::prune_redundant_copy_stmts;
+use self::prune::{prune_redundant_branch_state_copies, prune_redundant_copy_stmts};
 use self::reads::{collect_binding_mentions_by_stmt, collect_binding_mentions_in_expr};
 use self::region_results::{
     RegionResultIndex, collapse_inferred_if_result_chains, collapse_result_writeback_transactions,
@@ -61,14 +62,21 @@ pub(super) fn collapse_carried_local_handoffs_in_proto(
     proto: &mut HirProto,
     promotion_facts: &mut ProtoPromotionFacts,
 ) -> bool {
+    let branch_copies_changed = prune_redundant_branch_state_copies(proto);
+    let snapshots_changed = repeat_snapshots::coalesce_repeat_terminal_snapshots(proto);
+    // Both structural rewrites above can remove a materialization that would otherwise be
+    // recorded as an active identity.  Freeze protection facts only after those rewrites so the
+    // handoff owner never reasons over a stale binding set.
     let identity_facts = HandoffIdentityFacts::new(proto);
-    collapse_handoffs_recursive(
-        &mut proto.body,
-        &BTreeSet::new(),
-        promotion_facts,
-        &identity_facts,
-        &BTreeSet::new(),
-    )
+    branch_copies_changed
+        | snapshots_changed
+        | collapse_handoffs_recursive(
+            &mut proto.body,
+            &BTreeSet::new(),
+            promotion_facts,
+            &identity_facts,
+            &BTreeSet::new(),
+        )
 }
 
 /// 自定义后序遍历：先递归处理子块（同时把外层 binding 引用集传下去），再在当前块做

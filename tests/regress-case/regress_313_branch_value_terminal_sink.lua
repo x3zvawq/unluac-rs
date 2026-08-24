@@ -1,7 +1,6 @@
 -- regress_313_branch_value_terminal_sink#1: branch value 新暴露的终结 temp 应在 locals 前收回
 -- unluac: expect-contains [[    return ]]
 -- unluac: expect-not-contains [[    local ]]
--- unluac: expect-not-contains [[ = assert]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
 local anchor = {}

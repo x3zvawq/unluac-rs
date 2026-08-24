@@ -222,6 +222,34 @@ impl NaturalLoopForest {
             child_list.sort_unstable();
         }
 
+        // 先冻结 loop containment 的 Euler 区间。后面的 block owner 判定只需要一次
+        // 区间查询；如果沿 parent 链逐个回溯，深层嵌套会把同一份 evidence 放大为
+        // `block × loop-depth` 的重复工作。
+        let mut preorder_index = vec![None; loop_count];
+        let mut subtree_end = vec![None; loop_count];
+        let mut preorder_len = 0;
+        let roots = parent
+            .iter()
+            .enumerate()
+            .filter_map(|(index, parent)| parent.is_none().then_some(NaturalLoopId(index)));
+        let mut pending = roots.rev().map(|root| (root, true)).collect::<Vec<_>>();
+        while let Some((loop_id, entering)) = pending.pop() {
+            if entering {
+                preorder_index[loop_id.index()] = Some(preorder_len);
+                preorder_len += 1;
+                pending.push((loop_id, false));
+                pending.extend(
+                    children[loop_id.index()]
+                        .iter()
+                        .rev()
+                        .copied()
+                        .map(|child| (child, true)),
+                );
+            } else {
+                subtree_end[loop_id.index()] = Some(preorder_len);
+            }
+        }
+
         // A block can belong to several natural domains only when the domains are nested in
         // the reducible case. Compare the domains explicitly so an overlapping irreducible
         // pair never receives an invented innermost owner.
@@ -251,12 +279,12 @@ impl NaturalLoopForest {
                 // stay ambiguous instead of inventing an owner.
                 if natural_loop.blocks.len() < previous.blocks.len()
                     && natural_loop.blocks.is_subset(&previous.blocks)
-                    && parent_chain_contains(&parent, previous_id, current_id)
+                    && strict_loop_ancestor(&preorder_index, &subtree_end, previous_id, current_id)
                 {
                     *current_slot = Some(current_id);
                 } else if previous.blocks.len() < natural_loop.blocks.len()
                     && previous.blocks.is_subset(&natural_loop.blocks)
-                    && parent_chain_contains(&parent, current_id, previous_id)
+                    && strict_loop_ancestor(&preorder_index, &subtree_end, current_id, previous_id)
                 {
                     // The existing owner is the strict inner loop.
                 } else {
@@ -270,31 +298,6 @@ impl NaturalLoopForest {
         for (block_index, owner) in innermost_by_block.iter().copied().enumerate() {
             if let Some(owner) = owner {
                 direct_blocks[owner.index()].push(BlockRef(block_index));
-            }
-        }
-
-        let mut preorder_index = vec![None; loop_count];
-        let mut subtree_end = vec![None; loop_count];
-        let mut preorder = Vec::with_capacity(loop_count);
-        let roots = parent
-            .iter()
-            .enumerate()
-            .filter_map(|(index, parent)| parent.is_none().then_some(NaturalLoopId(index)));
-        let mut pending = roots.rev().map(|root| (root, true)).collect::<Vec<_>>();
-        while let Some((loop_id, entering)) = pending.pop() {
-            if entering {
-                preorder_index[loop_id.index()] = Some(preorder.len());
-                preorder.push(loop_id);
-                pending.push((loop_id, false));
-                pending.extend(
-                    children[loop_id.index()]
-                        .iter()
-                        .rev()
-                        .copied()
-                        .map(|child| (child, true)),
-                );
-            } else {
-                subtree_end[loop_id.index()] = Some(preorder.len());
             }
         }
 
@@ -393,18 +396,22 @@ impl NaturalLoopForest {
     }
 }
 
-fn parent_chain_contains(
-    parent: &[Option<NaturalLoopId>],
+fn strict_loop_ancestor(
+    preorder_index: &[Option<usize>],
+    subtree_end: &[Option<usize>],
     ancestor: NaturalLoopId,
-    mut descendant: NaturalLoopId,
+    descendant: NaturalLoopId,
 ) -> bool {
-    while let Some(current) = parent.get(descendant.index()).copied().flatten() {
-        if current == ancestor {
-            return true;
-        }
-        descendant = current;
-    }
-    false
+    ancestor != descendant
+        && preorder_index
+            .get(ancestor.index())
+            .copied()
+            .flatten()
+            .zip(subtree_end.get(ancestor.index()).copied().flatten())
+            .zip(preorder_index.get(descendant.index()).copied().flatten())
+            .is_some_and(|((start, end), descendant_start)| {
+                start <= descendant_start && descendant_start < end
+            })
 }
 
 /// 从 block 的 innermost loop 向外迭代，避免 lowering 为每个 block 重新展开一份祖先 Vec。

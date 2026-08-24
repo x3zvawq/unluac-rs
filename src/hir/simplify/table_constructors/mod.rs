@@ -438,6 +438,27 @@ impl TableConstructorPass<'_> {
                 continue;
             };
 
+            // A source LocalDecl immediately followed by its SETLIST is already one
+            // constructor split by the VM encoder.  The values are not moved across any
+            // producer statement and no producer binding is removed; keeping the seed at the
+            // same statement index therefore preserves allocation and field-evaluation order.
+            // This path intentionally accepts observable field expressions (unlike the
+            // cross-stmt folding paths below): direct-seed provenance plus the no-mention,
+            // capture and debug gates establish that the fresh owner is still only an
+            // initializer result while those expressions run.
+            if let Some(seed_index) =
+                self.find_adjacent_local_constructor_seed(block, index, binding, &set_list)
+            {
+                let Some((_, seed)) = constructor_seed(&block.stmts[seed_index]) else {
+                    unreachable!("adjacent LocalDecl SETLIST seed must be a constructor");
+                };
+                let constructor = constructor_with_set_list(seed, &set_list);
+                install_constructor_seed(&mut block.stmts[seed_index], constructor);
+                block.stmts.remove(index);
+                changed = true;
+                continue;
+            }
+
             // A fixed SETLIST immediately following the canonical NewTable definition is the
             // compiler's own constructor encoding, rather than a write into an existing table.
             // Rebuilding this narrow shape preserves the original allocation/evaluation point,
@@ -449,16 +470,7 @@ impl TableConstructorPass<'_> {
                 let Some((_, seed)) = constructor_seed(&block.stmts[seed_index]) else {
                     unreachable!("direct SETLIST seed must be a constructor");
                 };
-                let mut constructor = seed.clone();
-                constructor.fields.extend(
-                    set_list
-                        .values
-                        .fixed
-                        .iter()
-                        .cloned()
-                        .map(HirTableField::Array),
-                );
-                constructor.trailing_multivalue = set_list.values.tail.clone();
+                let constructor = constructor_with_set_list(seed, &set_list);
                 install_constructor_seed(&mut block.stmts[seed_index], constructor);
                 block.stmts.remove(index);
                 changed = true;
@@ -550,16 +562,7 @@ impl TableConstructorPass<'_> {
                     let Some((_, seed)) = constructor_seed(&block.stmts[seed_index]) else {
                         unreachable!("open SETLIST seed must be a constructor");
                     };
-                    let mut constructor = seed.clone();
-                    constructor.fields.extend(
-                        set_list
-                            .values
-                            .fixed
-                            .iter()
-                            .cloned()
-                            .map(HirTableField::Array),
-                    );
-                    constructor.trailing_multivalue = set_list.values.tail.clone();
+                    let constructor = constructor_with_set_list(seed, &set_list);
                     install_constructor_seed(&mut block.stmts[seed_index], constructor);
                     block.stmts.remove(index);
                     changed = true;
@@ -593,6 +596,87 @@ impl TableConstructorPass<'_> {
             index += 1;
         }
         changed
+    }
+
+    fn find_adjacent_local_constructor_seed(
+        &self,
+        block: &crate::hir::common::HirBlock,
+        set_list_index: usize,
+        binding: TableBinding,
+        set_list: &crate::hir::common::HirTableSetList,
+    ) -> Option<usize> {
+        let seed_index = set_list_index.checked_sub(1)?;
+        let TableBinding::Local(local) = binding else {
+            return None;
+        };
+        let (seed_binding, seed) = constructor_seed(block.stmts.get(seed_index)?)?;
+        let HirStmt::LocalDecl(local_decl) = block.stmts.get(seed_index)? else {
+            return None;
+        };
+        if seed_binding != binding
+            || local_decl.bindings.as_slice() != [local]
+            || seed.trailing_multivalue.is_some()
+            || constructor_has_numeric_record(seed)
+            || constructor_uses_binding(seed, binding)
+            || self.binding_is_shared_before_seed(block, seed_index, binding)
+            || self
+                .reference_captured_bindings
+                .get(binding)
+                .copied()
+                .unwrap_or_default()
+            || self
+                .debug_identity_bindings
+                .get(binding)
+                .copied()
+                .unwrap_or_default()
+            || self.materialized_bindings.get(binding).copied() != Some(1)
+            || self.promotion_facts.compacts_home_slots()
+            || self
+                .promotion_facts
+                .trusted_local_home_slot(local)
+                .is_none()
+            || !self.promotion_facts.is_direct_table_seed_local(local)
+            || !self.adjacent_set_list_array_shape_is_safe(seed, set_list)
+            || (set_list.values.fixed.is_empty() && set_list.values.tail.is_none())
+            || set_list.values.tail.as_ref().is_some_and(|tail| {
+                tail.exact_width().is_some()
+                    || !expr_is_open_tail_safe(tail.as_expr())
+                    || expr_uses_binding(tail.as_expr(), binding)
+                    || !set_list.values.fixed.iter().all(expr_is_definitely_non_nil)
+            })
+            || set_list
+                .values
+                .fixed
+                .iter()
+                .any(|value| !expr_is_open_tail_safe(value) || expr_uses_binding(value, binding))
+        {
+            return None;
+        }
+
+        let array_len = seed
+            .fields
+            .iter()
+            .filter(|field| matches!(field, HirTableField::Array(_)))
+            .count();
+        (set_list.start_index == u32::try_from(array_len).ok()?.checked_add(1)?)
+            .then_some(seed_index)
+    }
+
+    fn adjacent_set_list_array_shape_is_safe(
+        &self,
+        seed: &HirTableConstructor,
+        set_list: &crate::hir::common::HirTableSetList,
+    ) -> bool {
+        let mut fields = seed.fields.clone();
+        fields.extend(
+            set_list
+                .values
+                .fixed
+                .iter()
+                .cloned()
+                .map(HirTableField::Array),
+        );
+        array_fields_have_safe_nil_shape(&fields)
     }
 
     fn find_direct_set_list_seed(
@@ -1320,6 +1404,23 @@ impl TableConstructorPass<'_> {
     ) -> bool {
         block_prefix_mentions_binding(block, seed_index, binding)
     }
+}
+
+fn constructor_with_set_list(
+    seed: &HirTableConstructor,
+    set_list: &crate::hir::common::HirTableSetList,
+) -> HirTableConstructor {
+    let mut constructor = seed.clone();
+    constructor.fields.extend(
+        set_list
+            .values
+            .fixed
+            .iter()
+            .cloned()
+            .map(HirTableField::Array),
+    );
+    constructor.trailing_multivalue = set_list.values.tail.clone();
+    constructor
 }
 
 fn block_prefix_mentions_binding(

@@ -24,6 +24,12 @@ struct ContainingLoops<'a> {
     fallback: Option<std::slice::Iter<'a, usize>>,
 }
 
+fn candidate_domain(
+    candidate: &crate::structure::LoopCandidate,
+) -> impl Iterator<Item = &BlockRef> {
+    candidate.blocks.iter().chain(&candidate.body_scope_blocks)
+}
+
 impl Iterator for ContainingLoops<'_> {
     type Item = usize;
 
@@ -66,12 +72,7 @@ impl LoopRewriteIndex {
                 epoch_by_block.fill(0);
                 epoch = 1;
             }
-            for block in loop_
-                .candidate
-                .blocks
-                .iter()
-                .chain(&loop_.candidate.body_scope_blocks)
-            {
+            for block in candidate_domain(&loop_.candidate) {
                 let Some(seen) = epoch_by_block.get_mut(block.index()) else {
                     return Err(StructureError::invalid(
                         "loop rewrite index references a block outside the CFG arena",
@@ -189,12 +190,7 @@ impl LoopRewriteIndex {
                 epoch_by_block.fill(0);
                 epoch = 1;
             }
-            for block in loop_
-                .candidate
-                .blocks
-                .iter()
-                .chain(&loop_.candidate.body_scope_blocks)
-            {
+            for block in candidate_domain(&loop_.candidate) {
                 let Some(seen) = epoch_by_block.get_mut(block.index()) else {
                     return Err(StructureError::invalid(
                         "loop rewrite index references a block outside the CFG arena",
@@ -220,12 +216,7 @@ impl LoopRewriteIndex {
                 epoch_by_block.fill(0);
                 epoch = 1;
             }
-            for block in loop_
-                .candidate
-                .blocks
-                .iter()
-                .chain(&loop_.candidate.body_scope_blocks)
-            {
+            for block in candidate_domain(&loop_.candidate) {
                 let Some(seen) = epoch_by_block.get_mut(block.index()) else {
                     return Err(StructureError::invalid(
                         "loop rewrite index references a block outside the CFG arena",

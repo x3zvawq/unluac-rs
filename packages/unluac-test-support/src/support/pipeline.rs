@@ -189,6 +189,9 @@ pub(crate) fn run_pipeline_case(
     suite: UnitSuite,
     entry: &LuaCaseManifestEntry,
 ) -> Result<TestSuccess, TestFailure> {
+    if entry.expectation == LuaCaseExpectation::TableSetListResidual {
+        return run_table_set_list_residual_contract(suite, entry);
+    }
     if let LuaCaseExpectation::UnsupportedIsland { jump_pc, target_pc } = entry.expectation {
         return run_unsupported_island_contract(entry, jump_pc, target_pc);
     }
@@ -581,9 +584,100 @@ pub(crate) fn run_pipeline_case(
         LuaCaseExpectation::LuaJitMethodProtocol => {
             assert_luajit_method_protocol_contract(entry, suite_label)?;
         }
-        LuaCaseExpectation::Source | LuaCaseExpectation::UnsupportedIsland { .. } => {}
+        LuaCaseExpectation::Source
+        | LuaCaseExpectation::TableSetListResidual
+        | LuaCaseExpectation::UnsupportedIsland { .. } => {}
     }
 
     let proto_count = count_output_tags(&baseline.source_output.stdout);
     Ok(TestSuccess { proto_count })
+}
+
+fn run_table_set_list_residual_contract(
+    suite: UnitSuite,
+    entry: &LuaCaseManifestEntry,
+) -> Result<TestSuccess, TestFailure> {
+    let baseline = build_case_baseline(entry, suite.label()).map_err(|failure| {
+        TestFailure::new(
+            FailureKind::BaselineFailed,
+            format!("baseline failed first: {}", failure.summary()),
+            format!("baseline failed first\n{}", failure.detail()),
+        )
+    })?;
+    let chunk = compile_manifest_case(entry);
+
+    let mut strict_options = decompile_options(entry);
+    strict_options.generate.mode = GenerateMode::Strict;
+    match decompile(&chunk, strict_options) {
+        Err(DecompileError::Ast(AstLowerError::ResidualHir {
+            kind: "table-set-list",
+            ..
+        })) => {}
+        Err(error) => {
+            return Err(table_set_list_residual_contract_failure(
+                entry,
+                format!("strict mode returned the wrong error: {error}"),
+            ));
+        }
+        Ok(_) => {
+            return Err(table_set_list_residual_contract_failure(
+                entry,
+                "strict mode accepted an unrepresentable table-set-list",
+            ));
+        }
+    }
+
+    let mut permissive_options = decompile_options(entry);
+    permissive_options.generate.mode = GenerateMode::Permissive;
+    let permissive = decompile(&chunk, permissive_options).map_err(|error| {
+        table_set_list_residual_contract_failure(
+            entry,
+            format!("permissive mode rejected table-set-list: {error}"),
+        )
+    })?;
+    assert_auto_dialect(
+        "table-set-list residual",
+        permissive.state.dialect,
+        entry.dialect.decompile_dialect(),
+        entry.path,
+    )?;
+    let generated = permissive.state.generated.as_ref().ok_or_else(|| {
+        table_set_list_residual_contract_failure(
+            entry,
+            "permissive mode returned no generated chunk",
+        )
+    })?;
+    if generated.kind != GeneratedChunkKind::DiagnosticPseudocode
+        || !generated
+            .source
+            .contains("-- [unluac error] diagnostic pseudocode:")
+        || !generated.source.contains("residual table-set-list")
+    {
+        return Err(table_set_list_residual_contract_failure(
+            entry,
+            format!(
+                "permissive mode did not preserve the table-set-list diagnostic: kind={:?}\n{}",
+                generated.kind, generated.source
+            ),
+        ));
+    }
+
+    Ok(TestSuccess {
+        proto_count: count_output_tags(&baseline.source_output.stdout),
+    })
+}
+
+fn table_set_list_residual_contract_failure(
+    entry: &LuaCaseManifestEntry,
+    detail: impl Into<String>,
+) -> TestFailure {
+    TestFailure::new(
+        FailureKind::ResidualContractAssertionFailed,
+        "table-set-list residual contract failed",
+        format!(
+            "table-set-list residual contract failed for {}: {}",
+            entry.path,
+            detail.into()
+        ),
+    )
 }

@@ -166,7 +166,8 @@ pub(super) const REGRESSION_CASES_001_100: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_30_table_setlist_nested_producer.lua",
         PUC_LUA_51,
-    ),
+    )
+    .with_expectation(LuaCaseExpectation::TableSetListResidual),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_31_numeric_for_terminal_branch_coverage.lua",
         PUC_LUA_51,
@@ -178,7 +179,8 @@ pub(super) const REGRESSION_CASES_001_100: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_33_table_setlist_binary_producer.lua",
         PUC_LUA_51,
-    ),
+    )
+    .with_expectation(LuaCaseExpectation::TableSetListResidual),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_34_short_circuit_exit_jump_pad.lua",
         PUC_LUA_51,

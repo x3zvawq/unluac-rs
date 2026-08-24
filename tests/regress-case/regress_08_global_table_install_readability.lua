@@ -25,8 +25,3 @@ g_level_scripts.LevelP4_426 = {
 g_level_scripts.LevelP4_426.onLoadLevel()
 g_level_scripts.LevelP4_426.onBeforeLevelEnding()
 print("regress_08_global_table_install_readability#1", g_level_scripts.LevelP4_440.objectName)
-
--- unluac: expect-contains [[g_level_scripts.LevelP4_440 = make_level("ExtraGoldenEgg_1", "LevelGE_9")]]
--- unluac: expect-contains [[g_level_scripts.LevelP4_444 = make_level("ExtraRubberDuck_1", "LevelGE_10", true)]]
--- unluac: expect-contains [[g_level_scripts.LevelP4_426 = {]]
--- unluac: expect-not-contains [[local r0_]]

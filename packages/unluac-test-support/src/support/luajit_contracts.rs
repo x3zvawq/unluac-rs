@@ -184,6 +184,25 @@ pub(super) fn assert_luajit_table_remove_contract(
         ));
     }
 
+    const TYPE_GUARD_PREFIX: &str = "LuaJIT builtin ";
+    const TYPE_GUARD_LOCATION: &str = "type guard at block #";
+    const TYPE_GUARD_SPELLING: &str = "has no exact Lua source spelling;";
+    let type_guard_diagnostics = generated.source.matches(TYPE_GUARD_PREFIX).count();
+    if type_guard_diagnostics != guards.len()
+        || !generated.source.contains(TYPE_GUARD_LOCATION)
+        || !generated.source.contains(TYPE_GUARD_SPELLING)
+    {
+        return Err(luajit_builtin_contract_failure(
+            entry,
+            format!(
+                "type-guard diagnostic contract mismatch in {}: expected={}, found={type_guard_diagnostics}\n{}",
+                repo_relative_display(&artifact),
+                guards.len(),
+                generated.source
+            ),
+        ));
+    }
+
     Ok(())
 }
 

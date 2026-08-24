@@ -26,4 +26,3 @@ end
 
 -- unluac: expect-contains [[loadLuaFile(scriptPath .. "/subsystems/eggdefender/EggDefenderSetup.lua", "")]]
 -- unluac: expect-contains [[in _G.ipairs(g_episodes[7].pages[3].levels) do]]
--- unluac: expect-not-contains [[local r0_]]

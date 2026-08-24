@@ -62,6 +62,41 @@ pub(super) fn stmts_to_be_closed_temps(stmts: &[HirStmt]) -> BTreeSet<TempId> {
     collector.temps
 }
 
+/// 收集不能改写成普通 local 状态的词法身份。
+///
+/// numeric/generic-for binding 和 `<close>` 值都有 VM 级生命周期合同；即使 HIR 中只看见
+/// 一条等值赋值，也不能把它们当作普通 carried local。调用方只把这个集合当作保守阻断门。
+pub(super) fn stmts_protected_locals(stmts: &[HirStmt]) -> BTreeSet<LocalId> {
+    let mut collector = ProtectedLocalCollector::default();
+    visit_stmts(stmts, &mut collector);
+    collector.locals
+}
+
+#[derive(Default)]
+struct ProtectedLocalCollector {
+    locals: BTreeSet<LocalId>,
+}
+
+impl HirVisitor for ProtectedLocalCollector {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        match stmt {
+            HirStmt::NumericFor(for_stmt) => {
+                self.locals.insert(for_stmt.binding);
+            }
+            HirStmt::GenericFor(for_stmt) => {
+                self.locals.extend(for_stmt.bindings.iter().copied());
+            }
+            HirStmt::ToBeClosed(to_be_closed) => {
+                let mut refs = LocalRefSetCollector {
+                    locals: &mut self.locals,
+                };
+                visit_expr(&to_be_closed.value, &mut refs);
+            }
+            _ => {}
+        }
+    }
+}
+
 #[derive(Default)]
 struct ToBeClosedTempCollector {
     temps: BTreeSet<TempId>,
@@ -155,6 +190,25 @@ pub(super) fn collect_temp_use_counts(proto: &HirProto) -> BTreeMap<TempId, usiz
     let mut collector = TempUseCollector::default();
     visit_proto(proto, &mut collector);
     collector.counts
+}
+
+pub(super) fn collect_temp_write_counts(proto: &HirProto) -> BTreeMap<TempId, usize> {
+    let mut collector = TempWriteCountCollector::default();
+    visit_proto(proto, &mut collector);
+    collector.counts
+}
+
+#[derive(Default)]
+struct TempWriteCountCollector {
+    counts: BTreeMap<TempId, usize>,
+}
+
+impl HirVisitor for TempWriteCountCollector {
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        if let HirLValue::Temp(temp) = lvalue {
+            *self.counts.entry(*temp).or_default() += 1;
+        }
+    }
 }
 
 #[derive(Default)]

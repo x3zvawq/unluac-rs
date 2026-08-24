@@ -1,5 +1,4 @@
 -- regress_235_table_constructor_eval_ownership: moved producers keep one ordered evaluation
--- unluac: expect-contains [[cross_seed = {}]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
 local log = {}

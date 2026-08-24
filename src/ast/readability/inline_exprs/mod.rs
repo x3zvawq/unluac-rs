@@ -408,4 +408,48 @@ mod tests {
         ));
         assert_eq!(block, expected);
     }
+
+    #[test]
+    fn inlines_global_callee_when_the_call_is_adjacent() {
+        for origin in [AstLocalOrigin::Recovered, AstLocalOrigin::PhysicalRoot] {
+            let binding = AstBindingRef::Local(LocalId(0));
+            let global = AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                text: "assert".to_owned(),
+            }));
+            let mut block = AstBlock {
+                stmts: vec![
+                    AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                        bindings: vec![AstLocalBinding {
+                            id: binding,
+                            attr: AstLocalAttr::None,
+                            origin,
+                        }],
+                        values: vec![global],
+                    })),
+                    AstStmt::CallStmt(Box::new(AstCallStmt {
+                        call: AstCallKind::Call(Box::new(AstCallExpr {
+                            callee: AstExpr::Var(binding.to_name_ref()),
+                            args: vec![AstExpr::Boolean(true)],
+                        })),
+                    })),
+                ],
+            };
+
+            assert!(rewrite_current_block(
+                &mut block,
+                ReadabilityOptions::default(),
+                &MutableSnapshotNames::new(),
+                None,
+            ));
+            assert!(matches!(
+                block.stmts.as_slice(),
+                [AstStmt::CallStmt(call)]
+                    if matches!(
+                        &call.call,
+                        AstCallKind::Call(call)
+                            if matches!(call.callee, AstExpr::Var(AstNameRef::Global(_)))
+                    )
+            ));
+        }
+    }
 }
