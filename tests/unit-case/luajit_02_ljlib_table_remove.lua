@@ -1,5 +1,14 @@
-if ... == "--dump-table-remove" then
-    io.stdout:write(string.dump(table.remove, true))
+local dump_command, dump_path = ...
+if dump_command == "--dump-table-remove" then
+    local dump = string.dump(table.remove, true)
+    if dump_path then
+        -- Windows 的 CRT 会把 stdout 中的 LF 转成 CRLF；文件模式保持 chunk 原字节。
+        local file = assert(io.open(dump_path, "wb"))
+        file:write(dump)
+        file:close()
+    else
+        io.stdout:write(dump)
+    end
     return
 end
 

@@ -39,6 +39,11 @@ Host prerequisites:
 
 - `curl`
 - `tar`
-- `make`
 - `git`
-- a working C/C++ toolchain
+- Unix: `make` and a working C/C++ toolchain
+- Windows: Visual Studio C++ Build Tools (Desktop development with C++ and a Windows SDK), plus CMake and Ninja
+
+Windows bootstrap is supported. `cargo lua init` discovers the installed Visual Studio toolchain through
+`vswhere` (or uses the active Visual Studio developer environment), builds stock Lua with MSVC, LuaJIT
+with its bundled `msvcbuild.bat`, and Luau with CMake/Ninja. The generated executables have no `.exe`
+suffix in `lua/build`, so the repository's CLI and test commands use the same paths on every host.

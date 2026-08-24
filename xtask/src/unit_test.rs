@@ -173,7 +173,10 @@ mod tests {
         is_help_request, matches_case_filters, normalize_runner_failure, parse_args,
         parse_machine_failure, sorted_failure_counts,
     };
+    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
 
     #[test]
     fn parse_args_should_accept_options() {

@@ -115,11 +115,10 @@ fn compile_source(
             }
         }
         CompilerProtocol::LuaJitBytecodeTool => {
-            let status = Command::new(compiler)
-                .arg("-s")
-                .arg(source)
-                .arg(&output)
-                .status()?;
+            let mut command = Command::new(compiler);
+            #[cfg(windows)]
+            configure_windows_luajit_compiler(&mut command, compiler);
+            let status = command.arg("-s").arg(source).arg(&output).status()?;
             if !status.success() {
                 return Err(format!("compiler exited with status {status}").into());
             }
@@ -141,6 +140,24 @@ fn compile_source(
     }
 
     Ok(output)
+}
+
+#[cfg(windows)]
+fn configure_windows_luajit_compiler(command: &mut Command, compiler: &Path) {
+    command.arg("-b");
+    let root = compiler.parent().unwrap_or_else(|| Path::new("."));
+    let lua_path = [
+        root.join("?.lua"),
+        root.join("?").join("init.lua"),
+        root.join("jit").join("?.lua"),
+        root.join("jit").join("?").join("init.lua"),
+    ]
+    .into_iter()
+    .map(|path| path.to_string_lossy().into_owned())
+    .chain(std::iter::once(String::new()))
+    .collect::<Vec<_>>()
+    .join(";");
+    command.env("LUA_PATH", lua_path);
 }
 
 fn bundled_compiler_path(repo_root: &Path, dialect: DecompileDialect) -> PathBuf {

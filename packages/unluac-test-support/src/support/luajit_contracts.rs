@@ -51,18 +51,6 @@ pub(super) fn assert_luajit_table_remove_contract(
     }
 
     let source = repo_root().join(entry.path);
-    let dump = run_lua_file_with_args("luajit", &source, &["--dump-table-remove"])
-        .map_err(|error| luajit_builtin_contract_failure(entry, error))?;
-    if !dump.success() {
-        return Err(luajit_builtin_contract_failure(
-            entry,
-            format!(
-                "official runtime failed to dump table.remove\n{}",
-                dump.render()
-            ),
-        ));
-    }
-
     let artifact = suite_artifact_path(
         suite_label,
         "luajit",
@@ -71,7 +59,31 @@ pub(super) fn assert_luajit_table_remove_contract(
         entry.path,
         "luajit",
     );
-    write_output_file(&artifact, &dump.stdout).map_err(|error| {
+    let raw_dump = artifact.with_extension("raw.luajit");
+    ensure_parent_dir(&raw_dump).map_err(|error| luajit_builtin_contract_failure(entry, error))?;
+    let raw_dump_arg = raw_dump.to_string_lossy().into_owned();
+    let command_output = run_lua_file_with_args(
+        "luajit",
+        &source,
+        &["--dump-table-remove", raw_dump_arg.as_str()],
+    )
+    .map_err(|error| luajit_builtin_contract_failure(entry, error))?;
+    if !command_output.success() {
+        return Err(luajit_builtin_contract_failure(
+            entry,
+            format!(
+                "official runtime failed to dump table.remove\n{}",
+                command_output.render()
+            ),
+        ));
+    }
+    let dump_bytes = fs::read(&raw_dump).map_err(|error| {
+        luajit_builtin_contract_failure(
+            entry,
+            format!("read {} failed: {error}", repo_relative_display(&raw_dump)),
+        )
+    })?;
+    write_output_file(&artifact, &dump_bytes).map_err(|error| {
         luajit_builtin_contract_failure(
             entry,
             format!("write {} failed: {error}", repo_relative_display(&artifact)),
@@ -80,7 +92,7 @@ pub(super) fn assert_luajit_table_remove_contract(
 
     let mut options = decompile_options(entry);
     options.generate.mode = GenerateMode::Permissive;
-    let result = decompile(&dump.stdout, options).map_err(|error| {
+    let result = decompile(&dump_bytes, options).map_err(|error| {
         luajit_builtin_contract_failure(
             entry,
             format!(
@@ -261,11 +273,6 @@ pub(super) fn lower_luajit_method_fixture(
     argument: &str,
 ) -> Result<LoweredChunk, TestFailure> {
     let source = repo_root().join(entry.path);
-    let dump = run_lua_file_with_args("luajit", &source, &[argument])
-        .map_err(|error| luajit_method_contract_failure(entry, error))?;
-    if !dump.success() {
-        return Err(luajit_method_contract_failure(entry, dump.render()));
-    }
     let artifact = suite_artifact_path(
         suite_label,
         "luajit",
@@ -274,7 +281,25 @@ pub(super) fn lower_luajit_method_fixture(
         entry.path,
         "luajit",
     );
-    write_output_file(&artifact, &dump.stdout).map_err(|error| {
+    let raw_dump = artifact.with_extension("raw.luajit");
+    ensure_parent_dir(&raw_dump).map_err(|error| luajit_method_contract_failure(entry, error))?;
+    let raw_dump_arg = raw_dump.to_string_lossy().into_owned();
+    let command_output =
+        run_lua_file_with_args("luajit", &source, &[argument, raw_dump_arg.as_str()])
+            .map_err(|error| luajit_method_contract_failure(entry, error))?;
+    if !command_output.success() {
+        return Err(luajit_method_contract_failure(
+            entry,
+            command_output.render(),
+        ));
+    }
+    let dump = fs::read(&raw_dump).map_err(|error| {
+        luajit_method_contract_failure(
+            entry,
+            format!("read {} failed: {error}", repo_relative_display(&raw_dump)),
+        )
+    })?;
+    write_output_file(&artifact, &dump).map_err(|error| {
         luajit_method_contract_failure(
             entry,
             format!("write {} failed: {error}", repo_relative_display(&artifact)),
@@ -282,7 +307,7 @@ pub(super) fn lower_luajit_method_fixture(
     })?;
     let mut options = decompile_options(entry);
     options.target_stage = DecompileStage::Transformer;
-    decompile(&dump.stdout, options)
+    decompile(&dump, options)
         .map_err(|error| luajit_method_contract_failure(entry, error.to_string()))?
         .state
         .lowered

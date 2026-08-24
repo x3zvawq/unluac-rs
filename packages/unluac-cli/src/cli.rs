@@ -213,6 +213,8 @@ fn build_compile_command(
             command.arg("-o").arg(output).arg(source);
         }
         CompilerProtocol::LuaJitBytecodeTool => {
+            #[cfg(windows)]
+            configure_windows_luajit_compiler(&mut command, compiler);
             command
                 .arg(if options.strip_debug { "-s" } else { "-g" })
                 .arg(source)
@@ -232,6 +234,26 @@ fn build_compile_command(
         }
     }
     command
+}
+
+#[cfg(windows)]
+fn configure_windows_luajit_compiler(command: &mut Command, compiler: &Path) {
+    // Windows bootstrap 直接把 LuaJIT 可执行文件作为 `luac` 入口；它不像 Unix
+    // shell wrapper 那样自动补参数，因此需要显式指定字节码子命令和模块路径。
+    command.arg("-b");
+    let root = compiler.parent().unwrap_or_else(|| Path::new("."));
+    let lua_path = [
+        root.join("?.lua"),
+        root.join("?").join("init.lua"),
+        root.join("jit").join("?.lua"),
+        root.join("jit").join("?").join("init.lua"),
+    ]
+    .into_iter()
+    .map(|path| path.to_string_lossy().into_owned())
+    .chain(std::iter::once(String::new()))
+    .collect::<Vec<_>>()
+    .join(";");
+    command.env("LUA_PATH", lua_path);
 }
 
 fn source_compile_dialect(dialect: DecompileDialect) -> Result<DecompileDialect, CliError> {

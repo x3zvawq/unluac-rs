@@ -236,6 +236,12 @@ fn luajit_command_uses_debug_flag_when_debug_metadata_is_retained() {
         Path::new("case.luajit"),
     );
 
+    #[cfg(windows)]
+    assert_eq!(
+        command_args(&command),
+        ["-b", "-g", "case.lua", "case.luajit"]
+    );
+    #[cfg(not(windows))]
     assert_eq!(command_args(&command), ["-g", "case.lua", "case.luajit"]);
 }
 

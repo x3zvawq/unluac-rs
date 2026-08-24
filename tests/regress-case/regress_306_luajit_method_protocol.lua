@@ -14,7 +14,14 @@ if arg[1] == "--dump-large-method" then
     add_case("method", "obj:large_method()")
     add_case("dot", "obj.large_method(obj)")
     source[#source + 1] = "return method, dot"
-    io.write(string.dump(assert(loadstring(table.concat(source, "\n"))), true))
+    local dump = string.dump(assert(loadstring(table.concat(source, "\n"))), true)
+    if arg[2] then
+        local file = assert(io.open(arg[2], "wb"))
+        file:write(dump)
+        file:close()
+    else
+        io.write(dump)
+    end
     return
 end
 
@@ -40,7 +47,14 @@ if arg[1] == "--dump-bypassed-method" then
     local patched = bit.bor(instruction, bit.lshift(1, 16))
     local first, last = assert(dump:find(original, 1, true))
     assert(not dump:find(original, last + 1, true))
-    io.write(dump:sub(1, first - 1), encode_word(patched), dump:sub(last + 1))
+    dump = dump:sub(1, first - 1) .. encode_word(patched) .. dump:sub(last + 1)
+    if arg[2] then
+        local file = assert(io.open(arg[2], "wb"))
+        file:write(dump)
+        file:close()
+    else
+        io.write(dump)
+    end
     return
 end
 

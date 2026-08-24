@@ -131,6 +131,8 @@ pub(super) fn run_compiler_to_output_path(
         }
         LuaCompilerProtocol::LuaJitBytecodeTool => {
             let mut command = Command::new(compiler);
+            #[cfg(windows)]
+            configure_windows_luajit_compiler(&mut command, compiler);
             command.arg(if strip_debug { "-s" } else { "-g" });
             let output = command.arg(source).arg(output).output().map_err(|error| {
                 format!(
@@ -190,6 +192,24 @@ pub(super) fn run_compiler_to_output_path(
             })
         }
     }
+}
+
+#[cfg(windows)]
+fn configure_windows_luajit_compiler(command: &mut Command, compiler: &Path) {
+    command.arg("-b");
+    let root = compiler.parent().unwrap_or_else(|| Path::new("."));
+    let lua_path = [
+        root.join("?.lua"),
+        root.join("?").join("init.lua"),
+        root.join("jit").join("?.lua"),
+        root.join("jit").join("?").join("init.lua"),
+    ]
+    .into_iter()
+    .map(|path| path.to_string_lossy().into_owned())
+    .chain(std::iter::once(String::new()))
+    .collect::<Vec<_>>()
+    .join(";");
+    command.env("LUA_PATH", lua_path);
 }
 
 pub(super) fn run_command<I, S>(
