@@ -1,4 +1,6 @@
 -- regress_08_global_table_install_readability#1: inline recovered aliases in table field installs
+-- unluac: expect-contains [[return { objectName = p1_0, eggName = p1_1, hidden = p1_2 == true }]]
+-- unluac: expect-not-contains [[r1_0.objectName]]
 g_level_scripts = {}
 
 function make_level(object_name, egg_name, hidden)

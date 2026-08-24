@@ -1,5 +1,9 @@
 -- unluac: expect-not-contains [[if r9_0 == 1 or r9_0 == 2 then]]
 -- unluac: expect-not-contains [[if r1_0 == 1 or r1_0 == 2 then]]
+-- unluac: expect-not-contains [[if r2_2 then]]
+-- unluac: expect-not-contains [[if r9_2 then]]
+-- unluac: expect-contains [[("m2", 1)]]
+-- unluac: expect-not-contains [[("m2", 1) then]]
 
 -- common_06_boolean_regression#1: 共享主语短路分支
 local function test_shared_subjects()

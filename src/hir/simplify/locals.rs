@@ -649,6 +649,10 @@ fn collect_plans(
         };
         if call_root_lifetimes.is_root(decl_index) {
             call_root_locals.insert(decl_index, selected_local);
+            // This local must stay dedicated to the call result until its proven physical
+            // overwrite partner reuses it. Home-slot compaction may otherwise lend the same
+            // source local to a simultaneously-live value before that overwrite occurs.
+            slot_candidates.retain(|_, candidate| *candidate != selected_local);
         }
     }
 

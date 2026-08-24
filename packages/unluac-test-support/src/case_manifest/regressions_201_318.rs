@@ -34,7 +34,8 @@ pub(super) const REGRESSION_CASES_201_318: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_206_luau_home_slot_compaction.lua",
         LUAU_ONLY,
-    ),
+    )
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_207_decision_naturalize_budget.lua",
         ALL_DIALECTS,
@@ -112,6 +113,11 @@ pub(super) const REGRESSION_CASES_201_318: &[LuaCaseMatrixEntry] = &[
         ALL_NON_LUAU_DIALECTS,
     ),
     LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_225_repeat_shared_condition_break.lua",
+        LUAU_ONLY,
+    )
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+    LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_226_repeat_direct_break_condition_owner.lua",
         ALL_NON_LUAU_DIALECTS,
     ),
@@ -119,6 +125,11 @@ pub(super) const REGRESSION_CASES_201_318: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_227_while_short_condition_body_backedge.lua",
         ALL_NON_LUAU_DIALECTS,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_227_while_short_condition_body_backedge.lua",
+        LUAU_ONLY,
+    )
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_228_generic_for_cleanup_shared_continuation.lua",
         ALL_NON_LUAU_DIALECTS,
@@ -302,8 +313,13 @@ pub(super) const REGRESSION_CASES_201_318: &[LuaCaseMatrixEntry] = &[
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_274_temp_live_use_boundaries.lua",
-        ALL_DIALECTS,
+        ALL_NON_LUAU_DIALECTS,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_274_temp_live_use_boundaries.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_OPTIMIZED_OPTIONS),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_275_nested_loop_body_scope_exit.lua",
         ALL_DIALECTS,

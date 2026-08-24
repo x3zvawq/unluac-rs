@@ -16,10 +16,12 @@
 //! - `x or x` 会折成 `x`
 //! - 它不会把一般 `if/branch` 结构强行改写成逻辑表达式，那仍然属于更前面的结构恢复职责
 
-use super::expr_facts::expr_truthiness;
+use super::expr_facts::{expr_is_boolean_valued, expr_truthiness};
 use super::walk::{ExprRewritePass, rewrite_proto_exprs};
 use crate::hir::common::{HirBinaryOpKind, HirExpr, HirLogicalExpr, HirProto, HirUnaryOpKind};
-use crate::hir::expr_safety::{expr_is_discard_safe, expr_is_repeatable};
+use crate::hir::expr_safety::{
+    expr_is_discard_safe, expr_is_repeatable, primitive_literal_comparison_value,
+};
 
 /// 对单个 proto 递归执行安全的逻辑表达式整理。
 pub(super) fn simplify_logical_exprs_in_proto(proto: &mut HirProto) -> bool {
@@ -31,6 +33,14 @@ struct LogicalExprPass;
 impl ExprRewritePass for LogicalExprPass {
     fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
         let mut changed = false;
+
+        if let HirExpr::Binary(binary) = expr
+            && let Some(value) =
+                primitive_literal_comparison_value(binary.op, &binary.lhs, &binary.rhs)
+        {
+            *expr = HirExpr::Boolean(value);
+            changed = true;
+        }
 
         if let Some(replacement) = simplify_logical_shape(expr) {
             *expr = replacement;
@@ -84,6 +94,10 @@ fn simplify_logical_and(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
         return Some(replacement);
     }
 
+    if expr_is_boolean_valued(lhs) && matches!(rhs, HirExpr::Boolean(true)) {
+        return Some(lhs.clone());
+    }
+
     if !expr_is_repeatable(lhs) || !expr_is_repeatable(rhs) {
         return None;
     }
@@ -106,6 +120,10 @@ fn simplify_logical_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
 
     if let Some(replacement) = fold_constant_short_circuit_or(lhs, rhs) {
         return Some(replacement);
+    }
+
+    if expr_is_boolean_valued(lhs) && matches!(rhs, HirExpr::Boolean(false)) {
+        return Some(lhs.clone());
     }
     if let Some(replacement) = naturalize_truthy_ternary(lhs, rhs) {
         return Some(replacement);
@@ -262,7 +280,9 @@ fn fold_constant_short_circuit_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExp
 /// 决策 DAG 时留下重复的 fallback 片段。只要 `y` 无副作用，这里就可以安全地
 /// 把它重新收回更自然的短路表达式。
 fn fold_shared_fallback_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
-    shared_fallback_or_one_side(lhs, rhs).or_else(|| shared_fallback_or_one_side(rhs, lhs))
+    shared_fallback_or_one_side(lhs, rhs)
+        .or_else(|| shared_fallback_or_one_side(rhs, lhs))
+        .or_else(|| fold_prefixed_shared_fallback_or(lhs, rhs))
 }
 
 fn shared_fallback_or_one_side(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
@@ -280,6 +300,17 @@ fn shared_fallback_or_one_side(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> 
         return None;
     }
     Some(rhs.clone())
+}
+
+fn fold_prefixed_shared_fallback_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
+    let HirExpr::LogicalOr(rhs_or) = rhs else {
+        return None;
+    };
+    let prefix = HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+        lhs: lhs.clone(),
+        rhs: rhs_or.lhs.clone(),
+    }));
+    shared_fallback_or_one_side(&rhs_or.rhs, &prefix)
 }
 
 fn strip_negation(expr: &HirExpr) -> Option<HirExpr> {
@@ -404,6 +435,9 @@ fn simplify_condition_logical_and(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExp
 }
 
 fn simplify_condition_logical_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
+    if let Some(replacement) = factor_condition_shared_and_tail(lhs, rhs) {
+        return Some(replacement);
+    }
     if let Some(replacement) = absorb_stable_or_guard(lhs, rhs) {
         return Some(replacement);
     }
@@ -420,6 +454,30 @@ fn simplify_condition_logical_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr
         return Some(HirExpr::Boolean(true));
     }
     None
+}
+
+/// `(a and c) or (b and c)` 在条件中可收成 `(a or b) and c`。
+///
+/// 两臂均可重复时，被删除的 `b` 或第二次 `c` 读取没有可观察事件；这里只保持 truthiness，
+/// 所以不能进入会返回原始 Lua 操作数的普通值语境。
+fn factor_condition_shared_and_tail(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
+    if !expr_is_repeatable(lhs) || !expr_is_repeatable(rhs) {
+        return None;
+    }
+    let (HirExpr::LogicalAnd(lhs), HirExpr::LogicalAnd(rhs)) = (lhs, rhs) else {
+        return None;
+    };
+    if lhs.rhs != rhs.rhs {
+        return None;
+    }
+
+    Some(HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+        lhs: HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+            lhs: lhs.lhs.clone(),
+            rhs: rhs.lhs.clone(),
+        })),
+        rhs: lhs.rhs.clone(),
+    })))
 }
 
 /// In a condition, a stable guard repeated on the left side of a nested `or` is

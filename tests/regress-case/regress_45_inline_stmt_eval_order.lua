@@ -1,6 +1,7 @@
 -- regress_45_inline_stmt_eval_order#1:
 -- inline-exprs 不能把前置调用移到 call receiver/callee 之后；
 -- method alias 也不能因两个调用参数相同而合并 receiver 求值。
+-- unluac: expect-not-contains [[local r0_6 = r0_4]]
 
 local log = {}
 
@@ -31,3 +32,23 @@ print(
     value,
     table.concat(log, ",")
 )
+
+local function written_source_keeps_snapshot()
+    local source = { tag = "before" }
+    local snapshot = source
+    source = { tag = "after" }
+    return snapshot.tag, source.tag
+end
+
+local function captured_source_keeps_snapshot()
+    local source = { tag = "captured" }
+    local snapshot = source
+    local function replace()
+        source = { tag = "replaced" }
+    end
+    replace()
+    return snapshot.tag, source.tag
+end
+
+print("regress_45_inline_stmt_eval_order#2", written_source_keeps_snapshot())
+print("regress_45_inline_stmt_eval_order#3", captured_source_keeps_snapshot())

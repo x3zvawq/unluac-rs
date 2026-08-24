@@ -9,11 +9,15 @@
 //! - `if cond then body else end` 会整理成 `if cond then body end`
 //! - `if cond then return end else tail()` 会拉平成 `if cond then return end; tail()`
 //! - `repeat if cond then break end; tail() until true` 会整理成 `if not cond then tail() end`
+//! - `repeat ...; if G then continue; if B then break until C` 会整理成
+//!   `repeat ... until not G and B or C`
 
 use super::super::common::{
-    AstBlock, AstExpr, AstIf, AstModule, AstReturn, AstStmt, AstUnaryExpr, AstUnaryOpKind,
+    AstBlock, AstExpr, AstIf, AstLogicalExpr, AstModule, AstRepeat, AstReturn, AstStmt,
+    AstUnaryExpr, AstUnaryOpKind,
 };
 use super::ReadabilityContext;
+use super::control_flow::block_contains_label_or_goto;
 use super::walk::{self, AstRewritePass, BlockKind};
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
@@ -43,6 +47,11 @@ impl AstRewritePass for BranchPrettyPass {
     }
 
     fn rewrite_stmt(&mut self, stmt: &mut AstStmt) -> bool {
+        if let AstStmt::Repeat(repeat_stmt) = stmt
+            && fold_repeat_tail_continue_break(repeat_stmt)
+        {
+            return true;
+        }
         match stmt {
             AstStmt::If(if_stmt) => {
                 let mut changed = false;
@@ -57,6 +66,7 @@ impl AstRewritePass for BranchPrettyPass {
                     changed = true;
                 }
                 changed |= normalize_empty_if_arms(if_stmt);
+                changed |= merge_exact_nested_if(if_stmt);
                 changed
             }
             AstStmt::Repeat(repeat_stmt)
@@ -73,6 +83,44 @@ impl AstRewritePass for BranchPrettyPass {
             _ => false,
         }
     }
+}
+
+fn fold_repeat_tail_continue_break(repeat_stmt: &mut AstRepeat) -> bool {
+    let len = repeat_stmt.body.stmts.len();
+    if len < 2
+        || repeat_stmt.body.stmts[..len - 2]
+            .iter()
+            .any(stmt_contains_single_pass_forbidden_nodes)
+    {
+        return false;
+    }
+    let [AstStmt::If(continue_if), AstStmt::If(break_if)] = &repeat_stmt.body.stmts[len - 2..]
+    else {
+        return false;
+    };
+    if continue_if.else_block.is_some()
+        || break_if.else_block.is_some()
+        || !matches!(continue_if.then_block.stmts.as_slice(), [AstStmt::Continue])
+        || !matches!(break_if.then_block.stmts.as_slice(), [AstStmt::Break])
+    {
+        return false;
+    }
+
+    let continued = negate_guard_condition(continue_if.cond.clone());
+    if continued == repeat_stmt.cond {
+        return false;
+    }
+    let broken = break_if.cond.clone();
+    let latch = std::mem::replace(&mut repeat_stmt.cond, AstExpr::Boolean(false));
+    repeat_stmt.body.stmts.truncate(len - 2);
+    repeat_stmt.cond = AstExpr::LogicalOr(Box::new(AstLogicalExpr {
+        lhs: AstExpr::LogicalAnd(Box::new(AstLogicalExpr {
+            lhs: continued,
+            rhs: broken,
+        })),
+        rhs: latch,
+    }));
+    true
 }
 
 #[derive(Clone, Copy)]
@@ -289,6 +337,29 @@ fn stmt_contains_single_pass_forbidden_nodes(stmt: &AstStmt) -> bool {
     }
 }
 
+fn merge_exact_nested_if(if_stmt: &mut AstIf) -> bool {
+    let [AstStmt::If(inner)] = if_stmt.then_block.stmts.as_slice() else {
+        return false;
+    };
+    if if_stmt.else_block.is_some()
+        || inner.else_block.is_some()
+        || block_contains_label_or_goto(&inner.then_block)
+    {
+        return false;
+    }
+
+    let Some(AstStmt::If(mut inner)) = if_stmt.then_block.stmts.pop() else {
+        unreachable!("validated nested if must remain the only then statement");
+    };
+    let lhs = std::mem::replace(&mut if_stmt.cond, AstExpr::Boolean(false));
+    inner.cond = AstExpr::LogicalAnd(Box::new(AstLogicalExpr {
+        lhs,
+        rhs: inner.cond,
+    }));
+    *if_stmt = *inner;
+    true
+}
+
 fn normalize_empty_if_arms(if_stmt: &mut AstIf) -> bool {
     if if_stmt
         .else_block
@@ -438,10 +509,6 @@ fn block_requires_scope_barrier(block: &AstBlock) -> bool {
     block.stmts.iter().any(stmt_requires_scope_barrier)
 }
 
-fn block_contains_label_or_goto(block: &AstBlock) -> bool {
-    block.stmts.iter().any(stmt_contains_label_or_goto)
-}
-
 fn is_empty_return_stmt(stmt: &AstStmt) -> bool {
     matches!(stmt, AstStmt::Return(ret) if ret.values.is_empty())
 }
@@ -454,34 +521,6 @@ fn stmt_requires_scope_barrier(stmt: &AstStmt) -> bool {
             | AstStmt::Label(_)
             | AstStmt::Goto(_)
     )
-}
-
-fn stmt_contains_label_or_goto(stmt: &AstStmt) -> bool {
-    match stmt {
-        AstStmt::If(if_stmt) => {
-            block_contains_label_or_goto(&if_stmt.then_block)
-                || if_stmt
-                    .else_block
-                    .as_ref()
-                    .is_some_and(block_contains_label_or_goto)
-        }
-        AstStmt::While(while_stmt) => block_contains_label_or_goto(&while_stmt.body),
-        AstStmt::Repeat(repeat_stmt) => block_contains_label_or_goto(&repeat_stmt.body),
-        AstStmt::NumericFor(numeric_for) => block_contains_label_or_goto(&numeric_for.body),
-        AstStmt::GenericFor(generic_for) => block_contains_label_or_goto(&generic_for.body),
-        AstStmt::DoBlock(block) => block_contains_label_or_goto(block),
-        AstStmt::Label(_) | AstStmt::Goto(_) => true,
-        AstStmt::LocalDecl(_)
-        | AstStmt::GlobalDecl(_)
-        | AstStmt::Assign(_)
-        | AstStmt::CallStmt(_)
-        | AstStmt::Break
-        | AstStmt::Continue
-        | AstStmt::FunctionDecl(_)
-        | AstStmt::LocalFunctionDecl(_)
-        | AstStmt::Return(_)
-        | AstStmt::Error(_) => false,
-    }
 }
 
 fn negate_guard_condition(expr: AstExpr) -> AstExpr {

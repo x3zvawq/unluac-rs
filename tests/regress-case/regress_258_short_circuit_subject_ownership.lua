@@ -2,6 +2,8 @@
 -- unluac: expect-contains [[end)()]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
+-- unluac: expect-not-contains [[and 1 == 1]]
+-- unluac: expect-not-contains [[and true]]
 do
     local x
     local old = {}

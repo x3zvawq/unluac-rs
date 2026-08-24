@@ -1,8 +1,8 @@
 # 审计问题与交接清单
 
-> 更新时间：2026-08-23
+> 更新时间：2026-08-24
 > 审计起点：`main@ce3ad8e`
-> 当前复核：本次 residual 收口
+> 当前复核：跨方言 common_11/common_05 与 regress_258 原始比较布尔壳已收敛；本轮抽样确认 PUC/Luau/LuaJIT 的物理槽、闭包、字段快照、构造器与 repeat 作用域残差均无新增安全证明
 > 本文件只保留尚未完成、需要后续决策或仍需安全证明的事项；完成项应立即删除。
 
 ## 审计规则
@@ -15,12 +15,15 @@
 ## 待处理问题
 
 当前没有待处理项。已经证明属于 VM/源码表达边界或精确语义证据的数据结构不再作为可读性
-优化缺口登记；只有出现新的等价性证明或真实错误复现时才重新立项。
+优化缺口登记；只有出现新的等价性证明或真实错误复现时才重新立项。本轮抽样确认的
+call-result logical self-update、`regress_282` 长 `or` 链、call→field、闭包/字段快照与
+构造器 wiring 都保留原形：其中长链首值已由 HIR 标为 `PhysicalRoot`，不能按普通
+`Recovered` alias 缩短。
 
 ## 当前验证基线
 
 - `cargo fmt --all -- --check`：通过。
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`：通过。
 - `cargo test --workspace --all-targets --locked`：通过。
-- `cargo unit-test --suite all --recompile-rounds 1 --jobs 8 --progress off`：1250/1250 entries
-  通过，`timed_out=0`；1714/1714 proto 通过。
+- `cargo unit-test --suite all --recompile-rounds 1 --jobs 8 --progress off`：1271/1271 entries
+  通过，`timed_out=0`；1748/1748 proto 通过。

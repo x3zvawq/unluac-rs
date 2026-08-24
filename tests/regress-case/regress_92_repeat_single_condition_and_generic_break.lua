@@ -3,6 +3,7 @@
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-contains [[break]]
+-- unluac: expect-contains [[continue]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
@@ -34,6 +35,28 @@ local function generic_immediate_break()
     return calls
 end
 
+local function repeat_prefix_continue()
+    local rounds = 0
+    local probes = 0
+    local function probe(value)
+        probes = probes + 1
+        return value
+    end
+    repeat
+        rounds = rounds + 1
+        if rounds == 1 then
+            continue
+        end
+        if probe(false) then
+            continue
+        end
+        if probe(true) then
+            break
+        end
+    until rounds > 3
+    return rounds, probes
+end
+
 print(
     "regress_92_repeat_single_condition_and_generic_break#1",
     repeat_single_condition(true, { [0] = false })
@@ -41,4 +64,8 @@ print(
 print(
     "regress_92_repeat_single_condition_and_generic_break#2",
     generic_immediate_break()
+)
+print(
+    "regress_92_repeat_single_condition_and_generic_break#3",
+    repeat_prefix_continue()
 )

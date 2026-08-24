@@ -179,6 +179,19 @@ impl BindingUseIndex {
             .unwrap_or(0)
     }
 
+    pub(super) fn unique_use_stmt_in_suffix(
+        &self,
+        start: usize,
+        binding: AstBindingRef,
+    ) -> Option<usize> {
+        let counts = self.suffix_counts.get(&binding)?;
+        let index = counts
+            .stmt_indices
+            .partition_point(|stmt_index| *stmt_index < start);
+        let stmt_index = *counts.stmt_indices.get(index)?;
+        (counts.suffix_totals.get(index) == Some(&1)).then_some(stmt_index)
+    }
+
     pub(super) fn count_uses_in_range(
         &self,
         start: usize,

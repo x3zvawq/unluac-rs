@@ -345,19 +345,7 @@ fn region_has_non_drop_safe_producer(
 ) -> bool {
     block.stmts[start_index + 1..=end_index]
         .iter()
-        .any(|stmt| match stmt {
-            HirStmt::LocalDecl(decl) => decl
-                .values
-                .fixed
-                .iter()
-                .any(|value| !producer_value_can_be_dropped(value)),
-            HirStmt::Assign(assign) => assign
-                .values
-                .fixed
-                .iter()
-                .any(|value| !producer_value_can_be_dropped(value)),
-            _ => false,
-        })
+        .any(stmt_has_non_drop_safe_producer)
 }
 
 fn region_has_followup_table_write_after_object_producer(
@@ -392,11 +380,9 @@ fn stmt_has_non_drop_safe_producer(stmt: &HirStmt) -> bool {
             .fixed
             .iter()
             .any(|value| !producer_value_can_be_dropped(value)),
-        HirStmt::Assign(assign) => assign
-            .values
-            .fixed
-            .iter()
-            .any(|value| !producer_value_can_be_dropped(value)),
+        // Keyed writes are constructor fields, not independent producer materializations.
+        // Their object values remain rooted by the rebuilt table itself and must not make the
+        // enclosing region look as if a removable local producer were still alive.
         _ => false,
     }
 }

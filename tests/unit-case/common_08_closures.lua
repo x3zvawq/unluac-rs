@@ -1,4 +1,5 @@
 -- unluac: expect-not-contains [[ = #]]
+-- unluac: expect-contains [[ - 1) + 1]]
 -- common_08_closures#1: 闭包计数器(upvalue捕获)
 local function test_counter()
     local function make_counter(start)
@@ -212,6 +213,46 @@ local function test_loop_break()
     print("common_08_closures#10", a, b, c, d, final_i, funcs[4] == nil)
 end
 
+-- common_08_closures#11: captured local 在元方法期间仍须暴露调用旧值
+local function test_captured_binary_update()
+    local current
+    local function read_current()
+        return current
+    end
+
+    local mt = {}
+    function mt.__add(value, increment)
+        assert(read_current() == value)
+        return increment + 4
+    end
+
+    local function make_value()
+        return setmetatable({}, mt)
+    end
+
+    current = make_value()
+    current = current + 3
+    assert(current == 7)
+    print("common_08_closures#11", current)
+end
+
+-- common_08_closures#12: captured local 必须观察 call-result 的原位覆盖
+local function test_captured_logical_update()
+    local current = "old"
+    local function read_current()
+        return current
+    end
+
+    local function make_false()
+        return false
+    end
+
+    current = make_false()
+    current = current or read_current()
+    assert(current == false)
+    print("common_08_closures#12", current)
+end
+
 test_counter()
 test_recursive()
 test_pipeline()
@@ -222,3 +263,5 @@ test_return_pair()
 test_nested_factory()
 test_recursive_slot()
 test_loop_break()
+test_captured_binary_update()
+test_captured_logical_update()

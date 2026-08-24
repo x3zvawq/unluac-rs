@@ -30,7 +30,8 @@
 //! 单条简单 body 才继续内联，避免把命名函数压回赋值或 return 中的多行 IIFE。
 //! method 协议的 callee base 与隐式首参虽是两个语法 use，却只求值一次 receiver；相邻
 //! 裸 binding 或命名字段链快照可在严格匹配这对 use 后原子收回，例如
-//! `t = subject.worker; t:touch()` 会恢复成 `subject.worker:touch()`；普通点调用仍按两次读取处理。
+//! `t = subject.worker; t:touch()` 会恢复成 `subject.worker:touch()`；终结调用的连续物化 run
+//! 还可收回 owner 保持存活的裸 receiver，普通点调用仍按两次读取处理。
 //! branch-values 的定向入口只重用同一证明去处理本轮新暴露的根级 global-call run 或
 //! 单值 terminal return，不递归，也不开放其它普通内联 site。
 
@@ -54,16 +55,17 @@ use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 use self::rewrite::{replace_temp_in_stmt, replace_temps_in_stmt};
 use self::site::{
     InlineSite, expr_touches_temp, fastcall_callee_materialization_precedes_temp,
-    inline_site_in_repeat_condition, inline_site_in_stmt, is_method_receiver_snapshot,
-    is_stable_inline_value, puc_upvalue_table_key_with_deferred_base_read,
-    temp_precedes_observable_eval_in_expr, temp_precedes_observable_eval_in_stmt,
+    inline_site_in_repeat_condition, inline_site_in_stmt, is_bare_method_receiver_snapshot_in_stmt,
+    is_method_receiver_snapshot, is_stable_inline_value,
+    puc_upvalue_table_key_with_deferred_base_read, temp_precedes_observable_eval_in_expr,
+    temp_precedes_observable_eval_in_stmt,
 };
 use self::usage::{
     TempUseScratch, collect_expr_temp_uses_summary, collect_stmt_temp_uses, inline_candidate,
     max_temp_index_in_block,
 };
 use super::mention::{ReferenceCapturedBindings, stmt_writes_temp};
-use super::root_lifetimes::collect_call_root_lifetimes;
+use super::root_lifetimes::{CallRootLifetimeIndices, collect_call_root_lifetimes};
 use super::temp_touch::stmt_contains_nested_nonlocal_control;
 
 const NESTED_INLINE_MAX_COMPLEXITY: usize = 5;
@@ -251,8 +253,8 @@ fn inline_temps_in_block(
     let is_proto_root = workspace.block_depth == 0;
     workspace.block_depth += 1;
     let mut changed = false;
-    let mut call_root_lifetimes =
-        collect_call_root_lifetimes(&block.stmts, facts, |_| true).marked_stmts(block.stmts.len());
+    let mut call_root_indices = collect_call_root_lifetimes(&block.stmts, facts, |_| true);
+    let mut call_root_lifetimes = call_root_indices.marked_stmts(block.stmts.len());
     let mut captured_slots_before_stmt =
         CapturedSlotSnapshots::new(block.stmts.len(), inherited_captured_slots);
     let mut active_captured_slots = inherited_captured_slots.clone();
@@ -291,8 +293,8 @@ fn inline_temps_in_block(
         changed = true;
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
-        call_root_lifetimes = collect_call_root_lifetimes(&block.stmts, facts, |_| true)
-            .marked_stmts(block.stmts.len());
+        call_root_indices = collect_call_root_lifetimes(&block.stmts, facts, |_| true);
+        call_root_lifetimes = call_root_indices.marked_stmts(block.stmts.len());
     }
 
     if inline_materialization_runs(
@@ -304,6 +306,23 @@ fn inline_temps_in_block(
         reference_captured,
         &call_root_lifetimes,
     ) {
+        changed = true;
+        captured_slots_before_stmt =
+            captured_slots_before_stmts(block, facts, inherited_captured_slots);
+        call_root_indices = collect_call_root_lifetimes(&block.stmts, facts, |_| true);
+        call_root_lifetimes = call_root_indices.marked_stmts(block.stmts.len());
+    }
+
+    if matches!(workspace.scope, TempInlineScope::All)
+        && inline_adjacent_call_root_expression_overwrites(
+            block,
+            &workspace.uses,
+            live_use_counts,
+            facts,
+            &captured_slots_before_stmt,
+            &call_root_indices,
+        )
+    {
         changed = true;
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
@@ -579,6 +598,87 @@ fn stmt_stores_temp_in_table(stmt: &HirStmt, temp: TempId) -> bool {
     }
 }
 
+fn inline_adjacent_call_root_expression_overwrites(
+    block: &mut HirBlock,
+    scratch: &TempUseScratch,
+    live_use_counts: &mut [usize],
+    facts: &ProtoPromotionFacts,
+    captured_slots_before_stmt: &CapturedSlotSnapshots,
+    call_roots: &CallRootLifetimeIndices,
+) -> bool {
+    let mut removed = vec![false; block.stmts.len()];
+    for overwrite_index in 1..block.stmts.len() {
+        let root_index = overwrite_index - 1;
+        if call_roots.root_for_overwrite(overwrite_index) != Some(root_index) {
+            continue;
+        }
+        let Some((root, HirExpr::Call(call))) = inline_candidate(&block.stmts[root_index]) else {
+            continue;
+        };
+        let Some((target, overwrite)) = inline_candidate(&block.stmts[overwrite_index]) else {
+            continue;
+        };
+        let (Some(root_slot), Some(target_slot)) = (
+            facts.trusted_temp_home_slot(root),
+            facts.trusted_temp_home_slot(target),
+        ) else {
+            continue;
+        };
+        if root == target
+            || root_slot != target_slot
+            || total_use_count(root, live_use_counts) != 1
+            || scratch.has_debug_local_hint(root)
+            || scratch.has_debug_local_hint(target)
+            || !call_root_overwrite_is_inlineable(overwrite, root)
+            || captured_slots_before_stmt
+                .get(overwrite_index)
+                .is_none_or(|captured| captured.contains(&root_slot))
+        {
+            continue;
+        }
+
+        let call = HirExpr::Call(call.clone());
+        replace_temp_in_stmt(&mut block.stmts[overwrite_index], root, &call);
+        removed[root_index] = true;
+        remove_live_use(live_use_counts, root);
+    }
+    let changed = removed.contains(&true);
+    if changed {
+        block.stmts = std::mem::take(&mut block.stmts)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, stmt)| (!removed[index]).then_some(stmt))
+            .collect();
+    }
+    changed
+}
+
+fn call_root_overwrite_is_inlineable(expr: &HirExpr, root: TempId) -> bool {
+    match expr {
+        HirExpr::Binary(binary) => {
+            matches!(&binary.lhs, HirExpr::TempRef(source) if *source == root)
+                && call_root_rhs_is_primitive_literal(&binary.rhs)
+        }
+        HirExpr::LogicalOr(logical) => {
+            matches!(&logical.lhs, HirExpr::TempRef(source) if *source == root)
+                && (call_root_rhs_is_primitive_literal(&logical.rhs)
+                    || matches!(
+                        logical.rhs,
+                        HirExpr::ParamRef(_) | HirExpr::LocalRef(_) | HirExpr::UpvalueRef(_)
+                    ))
+        }
+        _ => false,
+    }
+}
+
+fn call_root_rhs_is_primitive_literal(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::Number(value) => value.is_finite(),
+        HirExpr::Nil | HirExpr::Boolean(_) | HirExpr::Integer(_) | HirExpr::String(_) => true,
+        _ => false,
+    }
+}
+
 /// Inline a contiguous pure alias chain through one substitution-DAG rewrite.
 ///
 /// This path deliberately accepts only repeatable expressions.  Such a chain has no
@@ -849,6 +949,13 @@ fn inline_materialization_runs(
         let mut rewritten_sink = block.stmts[run_end].clone();
         let mut removed_temps = Vec::with_capacity(run_end - callee_index);
         let mut discarded_uses = Vec::new();
+        let mut duplicated_uses = Vec::new();
+        let trailing = &block.stmts[run_end + 1..];
+        let sink_is_terminal = trailing.is_empty()
+            || matches!(trailing, [HirStmt::Return(ret)]
+                if ret.values.fixed.is_empty() && ret.values.tail.is_none());
+        let materialization_run = &block.stmts[callee_index..run_end];
+        let mut method_receiver_pair_seen = false;
         let mut complete_run = true;
         for candidate_index in ((callee_index + 1)..run_end).rev() {
             let Some((temp, value)) = inline_candidate(&block.stmts[candidate_index]) else {
@@ -856,7 +963,20 @@ fn inline_materialization_runs(
                 break;
             };
             let use_count = total_use_count(temp, live_use_counts);
-            if use_count > 1 {
+            let forwarded_owner_survives = sink_is_terminal
+                && materialization_run_preserves_forwarded_temp_owner(
+                    materialization_run,
+                    candidate_index - callee_index,
+                    value,
+                    facts,
+                );
+            let method_receiver_pair = use_count == 2
+                && sink_is_terminal
+                && (!matches!(value, HirExpr::TempRef(_)) || forwarded_owner_survives)
+                && is_bare_method_receiver_snapshot_in_stmt(&rewritten_sink, temp, value);
+            let stable_method_run_alias =
+                forwarded_owner_survives && (method_receiver_pair || method_receiver_pair_seen);
+            if use_count > 1 && !method_receiver_pair {
                 complete_run = false;
                 break;
             }
@@ -886,25 +1006,34 @@ fn inline_materialization_runs(
                 break;
             };
             if !candidate_is_safe
-                || arg_value_forwards_prior_order_sensitive_expr(
-                    value,
-                    callee_index,
-                    order_sensitive_defs,
-                )
-                || inline_crosses_evaluation_boundary(
-                    site,
-                    value,
-                    &rewritten_sink,
-                    temp,
-                    reference_captured,
-                    *dialect,
-                )
+                || (!stable_method_run_alias
+                    && arg_value_forwards_prior_order_sensitive_expr(
+                        value,
+                        callee_index,
+                        order_sensitive_defs,
+                    ))
+                || (!stable_method_run_alias
+                    && inline_crosses_evaluation_boundary(
+                        site,
+                        value,
+                        &rewritten_sink,
+                        temp,
+                        reference_captured,
+                        *dialect,
+                    ))
             {
                 complete_run = false;
                 break;
             }
             replace_temp_in_stmt(&mut rewritten_sink, temp, value);
             removed_temps.push(temp);
+            if method_receiver_pair {
+                // 原赋值已经持有 replacement 的一份 use；method lowering 把两处 HIR
+                // 引用收成一次源码求值，因此替换后只新增一份活跃依赖。
+                duplicated_uses.push(collect_expr_temp_uses_summary(value, uses));
+                removed_temps.push(temp);
+                method_receiver_pair_seen = true;
+            }
         }
         if !complete_run {
             index = run_end + 1;
@@ -942,6 +1071,9 @@ fn inline_materialization_runs(
         for uses in discarded_uses {
             uses.subtract_from_totals(live_use_counts);
         }
+        for uses in duplicated_uses {
+            uses.add_to_totals(live_use_counts);
+        }
         changed = true;
         // 语句仍保留原索引，后续 run 可以继续复用进入本函数前冻结的 capture 与
         // order-sensitive def 快照；压缩只能在整次扫描结束后统一发生。
@@ -957,6 +1089,35 @@ fn inline_materialization_runs(
         });
     }
     changed
+}
+
+fn materialization_run_preserves_forwarded_temp_owner(
+    run: &[HirStmt],
+    candidate_offset: usize,
+    value: &HirExpr,
+    facts: &ProtoPromotionFacts,
+) -> bool {
+    let HirExpr::TempRef(owner) = value else {
+        return false;
+    };
+    let Some(owner_home) = facts.trusted_temp_home_slot(*owner) else {
+        return false;
+    };
+
+    run.iter().enumerate().all(|(offset, stmt)| {
+        if offset == candidate_offset {
+            return true;
+        }
+        let Some((target, _)) = inline_candidate(stmt) else {
+            return false;
+        };
+        facts
+            .trusted_temp_home_slot(target)
+            .is_some_and(|home| home != owner_home)
+            && facts
+                .trusted_immediate_move_write_homes(target)
+                .is_some_and(|homes| !homes.contains(&owner_home))
+    })
 }
 
 struct RootOpenReturnNilPackPlan {

@@ -11,6 +11,7 @@ use super::bindings::{
     BindingIndex, BindingOccurrenceIndex, binding_from_expr, binding_from_lvalue, expr_uses_binding,
 };
 use super::builder::ConstructorBuilder;
+use super::rebuild::producer_value_can_be_dropped;
 use super::rebuild::{RegionRebuildContext, try_extend_constructor_from_steps};
 use super::{BindingId, RebuildScratch, RegionStep, TableBinding};
 
@@ -272,6 +273,16 @@ pub(super) fn seed_overwrite_delay_is_unobservable(
     block.stmts[(seed_index + 1)..=end_index]
         .iter()
         .all(|stmt| match stmt {
+            HirStmt::LocalDecl(decl) => {
+                decl.values.tail.is_none()
+                    && decl.values.fixed.len() == decl.bindings.len()
+                    && decl.values.fixed.iter().all(producer_value_can_be_dropped)
+                    && decl
+                        .values
+                        .fixed
+                        .iter()
+                        .all(|value| !expr_uses_binding(value, binding))
+            }
             HirStmt::Assign(assign) => {
                 let [HirLValue::TableAccess(access)] = assign.targets.as_slice() else {
                     return false;

@@ -11,7 +11,7 @@ use super::super::super::common::{
 use super::super::expr_analysis::{
     is_access_base_inline_expr, is_context_safe_expr, is_direct_return_constructor_inline_expr,
     is_lookup_inline_expr as is_lookup_expr, is_mechanical_run_inline_expr,
-    is_raw_global_alias_expr as is_raw_global_expr,
+    is_raw_global_alias_expr as is_raw_global_expr, is_stable_copy_alias_expr,
 };
 
 pub(super) fn inline_candidate(stmt: &AstStmt) -> Option<(InlineCandidate, &AstExpr)> {
@@ -80,6 +80,8 @@ pub(super) enum InlinePolicy {
     DirectReturnConstructor,
     MechanicalRun,
     LoopHeaderCall,
+    /// 单次后续使用的稳定 local copy；不会重复 RHS，也不会移动 producer。
+    StableCopy,
 }
 
 impl InlineCandidate {
@@ -105,6 +107,7 @@ impl InlineCandidate {
                     && is_raw_global_alias_expr(expr)
             }
             AstLocalOrigin::Recovered => match policy {
+                InlinePolicy::StableCopy => is_stable_copy_alias_expr(expr),
                 InlinePolicy::MechanicalRun => is_mechanical_run_inline_expr(expr),
                 InlinePolicy::AdjacentCallResultCallee => {
                     is_lookup_inline_expr(expr) || is_raw_global_alias_expr(expr)

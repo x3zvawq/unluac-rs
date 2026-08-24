@@ -14,6 +14,7 @@ use super::super::binding_ref::name_matches_binding;
 use super::super::expr_analysis::{
     expr_complexity, is_access_base_inline_expr, is_call_arg_constructor_inline_expr,
     is_context_safe_expr, is_direct_return_constructor_inline_expr, is_mechanical_run_inline_expr,
+    is_stable_copy_alias_expr,
 };
 use super::candidate::{
     InlineCandidate, InlinePolicy, is_call_callee_inline_expr,
@@ -558,6 +559,10 @@ impl InlineSite {
         }
 
         match policy {
+            InlinePolicy::StableCopy => {
+                candidate.origin() == super::super::super::common::AstLocalOrigin::Recovered
+                    && is_stable_copy_alias_expr(replacement)
+            }
             InlinePolicy::Conservative => match candidate.origin() {
                 super::super::super::common::AstLocalOrigin::DebugHinted
                 | super::super::super::common::AstLocalOrigin::PhysicalRoot => false,
@@ -603,6 +608,7 @@ impl InlineSite {
     fn complexity_limit(self, options: ReadabilityOptions, policy: InlinePolicy) -> Option<usize> {
         match self {
             Self::Neutral => match policy {
+                InlinePolicy::StableCopy => Some(1),
                 InlinePolicy::AliasInitializerChain => {
                     Some(options.access_base_inline_max_complexity)
                 }
@@ -616,12 +622,14 @@ impl InlineSite {
             },
             Self::ComparisonOperand => Some(options.args_inline_max_complexity),
             Self::ReturnValue => match policy {
+                InlinePolicy::StableCopy => Some(1),
                 InlinePolicy::DirectReturnConstructor => Some(usize::MAX),
                 _ => Some(options.return_inline_max_complexity),
             },
             Self::ReturnNestedValue => Some(options.return_inline_max_complexity),
             Self::Index => Some(options.index_inline_max_complexity),
             Self::CallArgNonFinal | Self::CallArgFinal => match policy {
+                InlinePolicy::StableCopy => Some(1),
                 InlinePolicy::LoopHeaderCall => Some(usize::MAX),
                 // MechanicalRun 已经证明这一组相邻 local 只服务于同一个消费点；
                 // 这里适度放宽到 return 阈值，让长 lookup 迭代器不会残留成两行脚手架。

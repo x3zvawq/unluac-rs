@@ -1,5 +1,7 @@
 -- common_11_runtime#1: pcall保护调用
 -- unluac: expect-not-contains [[_6 = r]]
+-- unluac: expect-not-contains [[r9_0 = r9_0 or p9_0]]
+-- unluac: expect-not-contains [[r13_0 = r13_0 or p13_0]]
 local function test_pcall()
     local function may_fail(x)
         if x < 0 then

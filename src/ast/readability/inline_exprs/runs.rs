@@ -2,6 +2,106 @@
 
 use super::*;
 
+/// 把非 debug call-result local 的紧邻自调用更新收回初始化式。
+///
+/// `local x = first(); x = x:next()` 的两次 call 原本就在同一条无条件求值链上；
+/// 第二句只读一次 `x` 时，第一段结果在原程序中由 local、在折叠后由 receiver/callee
+/// 求值槽持有，求值顺序、单值宽度与 GC root 都不变。binding 本身仍由 local 声明，
+/// 因而这里只消除机械更新，不做 binding 身份收敛。
+pub(super) fn collapse_adjacent_self_call_updates(
+    block: &mut AstBlock,
+    trailing_condition: Option<&AstExpr>,
+) -> bool {
+    let old_stmts = std::mem::take(&mut block.stmts);
+    let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_condition);
+    let mut stmt_plan = Vec::with_capacity(old_stmts.len());
+    let mut changed = false;
+    let mut index = 0;
+
+    while index < old_stmts.len() {
+        let AstStmt::LocalDecl(local_decl) = &old_stmts[index] else {
+            stmt_plan.push(PlannedStmt::Original(index));
+            index += 1;
+            continue;
+        };
+        let ([binding], [initial]) = (local_decl.bindings.as_slice(), local_decl.values.as_slice())
+        else {
+            stmt_plan.push(PlannedStmt::Original(index));
+            index += 1;
+            continue;
+        };
+        if binding.attr != AstLocalAttr::None
+            || binding.origin == AstLocalOrigin::DebugHinted
+            || use_index.count_uses_in_range(index, index + 1, binding.id) != 0
+            || !matches!(initial, AstExpr::Call(_) | AstExpr::MethodCall(_))
+        {
+            stmt_plan.push(PlannedStmt::Original(index));
+            index += 1;
+            continue;
+        }
+
+        let mut value = initial.clone();
+        let mut run_end = index + 1;
+        while use_index.count_uses_in_range(run_end, run_end + 1, binding.id) == 1
+            && let Some(next) = old_stmts.get(run_end)
+            && let Some(rewritten) = self_call_update_value(next, binding.id, &value)
+        {
+            value = rewritten;
+            run_end += 1;
+        }
+        if run_end == index + 1 {
+            stmt_plan.push(PlannedStmt::Original(index));
+            index += 1;
+            continue;
+        }
+
+        let mut rewritten = (**local_decl).clone();
+        rewritten.values[0] = value;
+        stmt_plan.push(PlannedStmt::Rewritten(AstStmt::LocalDecl(Box::new(
+            rewritten,
+        ))));
+        changed = true;
+        index = run_end;
+    }
+
+    block.stmts = materialize_stmt_plan(old_stmts, stmt_plan);
+    changed
+}
+
+fn self_call_update_value(
+    stmt: &AstStmt,
+    binding: AstBindingRef,
+    receiver: &AstExpr,
+) -> Option<AstExpr> {
+    let AstStmt::Assign(assign) = stmt else {
+        return None;
+    };
+    let ([AstLValue::Name(target)], [value]) =
+        (assign.targets.as_slice(), assign.values.as_slice())
+    else {
+        return None;
+    };
+    if !binding.matches_name_ref(target) {
+        return None;
+    }
+
+    match value {
+        AstExpr::Call(call) if matches!(&call.callee, AstExpr::Var(name) if binding.matches_name_ref(name)) =>
+        {
+            let mut call = (**call).clone();
+            call.callee = receiver.clone();
+            Some(AstExpr::Call(Box::new(call)))
+        }
+        AstExpr::MethodCall(call) if matches!(&call.receiver, AstExpr::Var(name) if binding.matches_name_ref(name)) =>
+        {
+            let mut call = (**call).clone();
+            call.receiver = receiver.clone();
+            Some(AstExpr::MethodCall(Box::new(call)))
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn collapse_adjacent_call_alias_runs(
     block: &mut AstBlock,
     options: ReadabilityOptions,

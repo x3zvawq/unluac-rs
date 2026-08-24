@@ -106,7 +106,7 @@ fn try_recover_receiver_alias_direct_method_call(
         return None;
     };
     let (receiver_binding, receiver_expr) = single_local_alias_decl(receiver_alias)?;
-    if use_index.count_uses_in_suffix(stmt_base + 1, receiver_binding) != 1 {
+    if use_index.count_uses_in_suffix(stmt_base + 1, receiver_binding) != 2 {
         return None;
     }
     if !is_context_safe_expr(receiver_expr) {
@@ -394,7 +394,10 @@ fn recover_direct_method_call_with_receiver_alias_expr(
     let AstExpr::FieldAccess(access) = &call.callee else {
         return None;
     };
-    if &access.base != receiver_expr {
+    let AstExpr::Var(receiver_base_name) = &access.base else {
+        return None;
+    };
+    if !name_matches_binding(receiver_base_name, receiver_binding) {
         return None;
     }
     let [receiver_arg, args @ ..] = call.args.as_slice() else {

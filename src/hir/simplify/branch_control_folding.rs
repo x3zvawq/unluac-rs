@@ -17,7 +17,7 @@ use crate::hir::common::{
     HirBlock, HirCallExpr, HirCallStmt, HirExpr, HirIf, HirLabelId, HirLogicalExpr, HirProto,
     HirStmt, HirUnaryOpKind, LocalId,
 };
-use crate::hir::expr_safety::expr_is_discard_safe;
+use crate::hir::expr_safety::{expr_is_discard_safe, expr_is_repeatable};
 
 use super::carried_locals::{CarryBinding, single_binding_copy};
 use super::expr_facts::expr_truthiness;
@@ -43,7 +43,7 @@ struct BranchControlPass;
 
 impl HirRewritePass for BranchControlPass {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
-        let constant_changed = fold_redundant_ifs(&mut block.stmts);
+        let constant_changed = fold_constant_control(&mut block.stmts);
         let common_tail_changed = sink_common_direct_copy_tails(&mut block.stmts);
         let empty_changed = remove_discard_safe_empty_ifs(&mut block.stmts);
         let terminal_changed = fold_forward_gotos(&mut block.stmts, FoldKind::TerminalElse);
@@ -150,12 +150,31 @@ impl HirVisitor for DirectCopySinkBoundary {
     }
 }
 
-fn fold_redundant_ifs(stmts: &mut Vec<HirStmt>) -> bool {
+fn fold_constant_control(stmts: &mut Vec<HirStmt>) -> bool {
     let original = std::mem::take(stmts);
     let mut rewritten = Vec::with_capacity(original.len());
     let mut changed = false;
 
     for stmt in original {
+        if let HirStmt::While(current) = &stmt
+            && current.body.stmts.is_empty()
+            && expr_is_repeatable(&current.cond)
+            && matches!(rewritten.last(),
+                Some(HirStmt::While(previous))
+                    if previous.body.stmts.is_empty() && previous.cond == current.cond)
+        {
+            changed = true;
+            continue;
+        }
+        if matches!(&stmt, HirStmt::Block(block) if block.stmts.is_empty())
+            || matches!(
+                &stmt,
+                HirStmt::While(while_stmt) if while_stmt.cond == HirExpr::Boolean(false)
+            )
+        {
+            changed = true;
+            continue;
+        }
         let HirStmt::If(mut if_stmt) = stmt else {
             rewritten.push(stmt);
             continue;

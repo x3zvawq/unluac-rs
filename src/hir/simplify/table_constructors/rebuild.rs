@@ -17,6 +17,7 @@ use crate::hir::common::{
 };
 use crate::hir::expr_safety::expr_requires_ordered_snapshot;
 
+use super::super::expr_facts::expr_is_boolean_valued;
 use super::bindings::{
     BindingIndex, BindingUseSummary, binding_from_expr, binding_from_lvalue, matches_binding_ref,
     table_key_from_expr,
@@ -720,9 +721,11 @@ fn single_producer(
 }
 
 /// A producer declaration is removable only when its value cannot carry a source-visible
-/// object/root.  A table field may be cleared before the producer's lexical scope ends, so
-/// aliases, calls, constructors, strings, and unknown expressions must retain their explicit
-/// materialization even if the constructor would otherwise consume them exactly once.
+/// object/root.  In addition to primitive literals, a value whose HIR type is proved boolean is
+/// scalar even when evaluating it can still observe user code (for example a comparison with a
+/// metamethod-capable operand).  The constructor-region evaluator separately preserves that
+/// expression's order; this predicate only answers whether the materialized result can be a
+/// surviving object root.
 pub(super) fn producer_value_can_be_dropped(expr: &HirExpr) -> bool {
     matches!(
         expr,
@@ -735,7 +738,7 @@ pub(super) fn producer_value_can_be_dropped(expr: &HirExpr) -> bool {
             | HirExpr::UInt64(_)
             | HirExpr::Vector(_)
             | HirExpr::Complex { .. }
-    )
+    ) || expr_is_boolean_valued(expr)
 }
 
 fn producer_group_stmt(

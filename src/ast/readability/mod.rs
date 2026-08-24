@@ -10,6 +10,7 @@ mod binding_ref;
 mod binding_tree;
 mod branch_pretty;
 mod cleanup;
+mod control_flow;
 mod expr_analysis;
 mod field_access_sugar;
 mod function_sugar;
@@ -17,6 +18,7 @@ mod global_decl_pretty;
 mod goto_syntax_safety;
 mod inline_exprs;
 mod installer_iife;
+mod literal_fold;
 mod local_scope_limit;
 mod materialize_temps;
 mod statement_merge;
@@ -101,6 +103,7 @@ use AstInvalidation::*;
 //
 // Normal phase 处理主要形状收敛：
 //   cleanup → statement-merge → branch-pretty → field-access-sugar → inline-exprs
+//   → literal-fold
 //
 // Deferred phase 在 Normal 全部收敛后执行终态物化和语法糖：
 //   temp-materialize → installer-iife → function-sugar → global-decl-pretty → goto-syntax-safety
@@ -143,6 +146,12 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
         phase: PassPhase::Normal,
         depends_on: &[StatementAdjacency, ExprShape],
         invalidates: &[StatementAdjacency, ExprShape],
+    },
+    PassDescriptor {
+        name: "literal-fold",
+        phase: PassPhase::Normal,
+        depends_on: &[ControlFlowShape, ExprShape],
+        invalidates: &[ExprShape],
     },
     // ── Deferred phase ──
     PassDescriptor {
@@ -199,6 +208,9 @@ const PASS_ENTRIES: &[ReadabilityPassEntry] = &[
     },
     ReadabilityPassEntry {
         apply: inline_exprs::apply,
+    },
+    ReadabilityPassEntry {
+        apply: literal_fold::apply,
     },
     ReadabilityPassEntry {
         apply: materialize_temps::apply,

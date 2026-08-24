@@ -1,3 +1,6 @@
+-- unluac: expect-not-contains [[p5_0 or p5_3 and p5_1 and p5_2) and p5_1 and p5_2]]
+-- unluac: expect-not-contains [[p10_0 or p10_3 and p10_1 and p10_2) and p10_1 and p10_2]]
+
 -- common_05_boolean_expr#1: 算术与逻辑运算符混合
 local function test_arith_logic()
     local x = 5 + 3 * 2

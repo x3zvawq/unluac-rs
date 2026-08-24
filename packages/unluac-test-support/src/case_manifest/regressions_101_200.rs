@@ -61,7 +61,7 @@ pub(super) const REGRESSION_CASES_101_200: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_112_luau_continue_merge_state_owner.lua",
         LUAU_ONLY,
     )
-    .with_options(LUAU_OPTIMIZED_OPTIONS),
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_113_luau_short_circuit_outer_break.lua",
         LUAU_ONLY,

@@ -8,6 +8,7 @@
 //! 例如：`r0(1)` 会把 `r0` 标成 `CallCallee`，`r0:m()` 则把 receiver 标成 call 所在站点。
 
 use super::super::decision::decision_has_cycles;
+use super::super::visit::{HirVisitor, visit_stmts};
 use super::*;
 
 pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<InlineSite> {
@@ -84,6 +85,40 @@ pub(super) fn is_method_receiver_snapshot(stmt: &HirStmt, temp: TempId, value: &
         call.and_then(HirCallExpr::method_receiver),
         Some((HirExpr::TempRef(receiver), _)) if *receiver == temp
     )
+}
+
+/// 判断 materialization run 中的裸 binding 是否只由某个嵌套 method receiver 对消费。
+///
+/// 全 proto use-count 由调用方另行限制为两个；这里找到协议匹配的一对引用后，就能排除
+/// 普通点调用或第三处消费。字段链不进入这条跨 run 合同，避免重新求 lookup。
+pub(super) fn is_bare_method_receiver_snapshot_in_stmt(
+    stmt: &HirStmt,
+    temp: TempId,
+    value: &HirExpr,
+) -> bool {
+    if !matches!(
+        value,
+        HirExpr::ParamRef(_) | HirExpr::LocalRef(_) | HirExpr::UpvalueRef(_) | HirExpr::TempRef(_)
+    ) {
+        return false;
+    }
+
+    let mut probe = MethodReceiverTempProbe { temp, found: false };
+    visit_stmts(std::slice::from_ref(stmt), &mut probe);
+    probe.found
+}
+
+struct MethodReceiverTempProbe {
+    temp: TempId,
+    found: bool,
+}
+
+impl HirVisitor for MethodReceiverTempProbe {
+    fn visit_call(&mut self, call: &HirCallExpr) {
+        self.found |= call.method_receiver().is_some_and(
+            |(receiver, _)| matches!(receiver, HirExpr::TempRef(temp) if *temp == self.temp),
+        );
+    }
 }
 
 fn is_method_receiver_inline_expr(expr: &HirExpr) -> bool {

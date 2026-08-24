@@ -1,4 +1,5 @@
 -- common_10_tables#1: 表构造器与索引
+-- unluac: expect-not-contains [[local r1_1 = 1]]
 local function test_ctor_index()
     local t = {
         1,

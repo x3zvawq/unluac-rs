@@ -4,6 +4,7 @@
 -- unluac: expect-not-contains [[repeat]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-contains [[p1_0:add("button")]]
+-- unluac: expect-contains [[and p1_0.purchased then]]
 -- unluac: expect-not-contains [[local r1_1 = p1_0]]
 
 local function maybe_add_button(state)

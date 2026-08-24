@@ -11,7 +11,64 @@
 
 use std::collections::BTreeSet;
 
-use super::super::common::{AstExpr, AstNameRef, AstTableField, AstTableKey};
+use super::super::common::{
+    AstBinaryOpKind, AstExpr, AstNameRef, AstTableField, AstTableKey, AstUnaryOpKind,
+};
+
+/// 只计算同类型原始字面量比较。
+///
+/// 这份证明与 HIR 的同名规则保持一致：不跨数值表示，不触碰 cdata/vector/complex，
+/// 也不把非有限 number 当成无运行时事件的字面量。调用方只能把 `Some` 当作可安全
+/// 删除比较壳的事实，`None` 必须保留原表达式。
+pub(super) fn primitive_literal_comparison_value(
+    op: AstBinaryOpKind,
+    lhs: &AstExpr,
+    rhs: &AstExpr,
+) -> Option<bool> {
+    if op == AstBinaryOpKind::Eq {
+        return match (lhs, rhs) {
+            (AstExpr::Integer(lhs), AstExpr::Integer(rhs)) => Some(lhs == rhs),
+            (AstExpr::Number(lhs), AstExpr::Number(rhs)) if lhs.is_finite() && rhs.is_finite() => {
+                Some(lhs == rhs)
+            }
+            (AstExpr::String(lhs), AstExpr::String(rhs)) => Some(lhs == rhs),
+            (AstExpr::Boolean(lhs), AstExpr::Boolean(rhs)) => Some(lhs == rhs),
+            (AstExpr::Nil, AstExpr::Nil) => Some(true),
+            _ => None,
+        };
+    }
+
+    let ordering = match (lhs, rhs) {
+        (AstExpr::Integer(lhs), AstExpr::Integer(rhs)) => lhs.cmp(rhs),
+        (AstExpr::Number(lhs), AstExpr::Number(rhs)) if lhs.is_finite() && rhs.is_finite() => {
+            lhs.partial_cmp(rhs)?
+        }
+        (AstExpr::String(lhs), AstExpr::String(rhs)) => lhs.cmp(rhs),
+        _ => return None,
+    };
+    match op {
+        AstBinaryOpKind::Lt => Some(ordering == std::cmp::Ordering::Less),
+        AstBinaryOpKind::Le => Some(ordering != std::cmp::Ordering::Greater),
+        _ => None,
+    }
+}
+
+/// 表达式是否保证只产生布尔值。
+pub(super) fn expr_is_boolean_valued(expr: &AstExpr) -> bool {
+    match expr {
+        AstExpr::Boolean(_) => true,
+        AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not => true,
+        AstExpr::Binary(binary) => matches!(
+            binary.op,
+            AstBinaryOpKind::Eq | AstBinaryOpKind::Lt | AstBinaryOpKind::Le
+        ),
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            expr_is_boolean_valued(&logical.lhs) && expr_is_boolean_valued(&logical.rhs)
+        }
+        AstExpr::SingleValue(inner) => expr_is_boolean_valued(inner),
+        _ => false,
+    }
+}
 
 pub(super) fn expr_complexity(expr: &AstExpr) -> usize {
     match expr {
@@ -227,6 +284,25 @@ pub(super) fn is_copy_like_expr(expr: &AstExpr) -> bool {
         | AstExpr::TableConstructor(_)
         | AstExpr::FunctionExpr(_)
         | AstExpr::Error(_) => false,
+    }
+}
+
+/// A direct local copy or primitive Lua literal has no expression-level work to repeat.
+///
+/// This is intentionally narrower than [`is_copy_like_expr`].  The latter is used by
+/// run-level heuristics and also accepts dialect-specific literals and lookup-shaped
+/// expressions. Int64/UInt64/Vector/Complex stay excluded because materializing those
+/// can create a cdata/vector value rather than merely load a primitive Lua constant;
+/// non-finite numbers are emitted as division expressions and therefore are not event-free.
+pub(super) fn is_stable_copy_alias_expr(expr: &AstExpr) -> bool {
+    match expr {
+        AstExpr::Number(value) => value.is_finite(),
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::String(_)
+        | AstExpr::Var(AstNameRef::Local(_) | AstNameRef::SyntheticLocal(_)) => true,
+        _ => false,
     }
 }
 

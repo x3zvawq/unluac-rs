@@ -17,7 +17,9 @@ pub(crate) fn primitive_literal_comparison_value(
     if op == HirBinaryOpKind::Eq {
         return match (lhs, rhs) {
             (HirExpr::Integer(lhs), HirExpr::Integer(rhs)) => Some(lhs == rhs),
-            (HirExpr::Number(lhs), HirExpr::Number(rhs)) => Some(lhs == rhs),
+            (HirExpr::Number(lhs), HirExpr::Number(rhs)) if lhs.is_finite() && rhs.is_finite() => {
+                Some(lhs == rhs)
+            }
             (HirExpr::String(lhs), HirExpr::String(rhs)) => Some(lhs == rhs),
             (HirExpr::Boolean(lhs), HirExpr::Boolean(rhs)) => Some(lhs == rhs),
             (HirExpr::Nil, HirExpr::Nil) => Some(true),
@@ -26,7 +28,9 @@ pub(crate) fn primitive_literal_comparison_value(
     }
     let ordering = match (lhs, rhs) {
         (HirExpr::Integer(lhs), HirExpr::Integer(rhs)) => lhs.cmp(rhs),
-        (HirExpr::Number(lhs), HirExpr::Number(rhs)) => lhs.partial_cmp(rhs)?,
+        (HirExpr::Number(lhs), HirExpr::Number(rhs)) if lhs.is_finite() && rhs.is_finite() => {
+            lhs.partial_cmp(rhs)?
+        }
         (HirExpr::String(lhs), HirExpr::String(rhs)) => lhs.cmp(rhs),
         _ => return None,
     };

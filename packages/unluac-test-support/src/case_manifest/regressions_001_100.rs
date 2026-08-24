@@ -372,7 +372,8 @@ pub(super) const REGRESSION_CASES_001_100: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_82_numeric_for_control_pad.lua",
         LUAU_ONLY,
-    ),
+    )
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_83_nested_break_exit_pad.lua",
         LUAU_ONLY,
@@ -413,7 +414,8 @@ pub(super) const REGRESSION_CASES_001_100: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_92_repeat_single_condition_and_generic_break.lua",
         LUAU_ONLY,
-    ),
+    )
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_93_numeric_for_continue_pad_state.lua",
         LUAU_ONLY,

@@ -2,6 +2,7 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-contains [[while (p1_0 or p1_1) and p1_2 do]]
 local function run(a, b, c)
     local count = 0
     while (a or b) and c do

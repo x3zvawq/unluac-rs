@@ -1,5 +1,6 @@
 -- unluac: expect-contains [[missing_global]]
 -- unluac: expect-contains [[if probe then]]
+-- unluac: expect-contains [[.probe then]]
 
 local env = _VERSION == "Lua 5.1" and getfenv() or _ENV
 local global_hits = 0
@@ -40,6 +41,17 @@ local mt = {
 local left, right = setmetatable({}, mt), setmetatable({}, mt)
 local compare_value = (left < right and false) or (left < right and true)
 print("metamethod-logic", compare_hits, compare_value)
+
+local while_hits = 0
+local function false_probe()
+    while_hits = while_hits + 1
+    return false
+end
+while false_probe() do
+end
+while false_probe() do
+end
+print("empty-while-reads", while_hits)
 
 local function shared_rhs(a, b, c)
     return (a and b) or (c and b)

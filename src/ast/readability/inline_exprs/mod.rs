@@ -10,6 +10,7 @@
 //! - generic-for 的 method receiver 允许收回一个紧邻的 recovered binding 别名
 //! - repeat body 的 use index 把 until 条件计作尾随表达式，不删除仍对条件可见的 local
 //! - 多值 return 顶层只收回 context-safe 的唯一引用 alias；可变快照仍通过求值前缀证明
+//! - 稳定 local copy 可跨越无关语句收回到唯一后续 use；只替换名字读取，不搬动 RHS
 
 mod candidate;
 mod eval_order;
@@ -25,8 +26,8 @@ use self::candidate::{
 };
 use self::use_sites::rewrite_stmt_use_sites_with_policy;
 use super::super::common::{
-    AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue, AstModule,
-    AstNameRef, AstStmt,
+    AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue, AstLocalAttr,
+    AstLocalOrigin, AstModule, AstNameRef, AstStmt,
 };
 use super::ReadabilityContext;
 use super::binding_flow::{
@@ -62,7 +63,7 @@ struct InlineExprsPass {
 
 #[derive(Default)]
 struct BindingWriteIndex {
-    last_write_by_binding: BTreeMap<AstBindingRef, usize>,
+    write_bounds_by_binding: BTreeMap<AstBindingRef, (usize, usize)>,
 }
 
 impl BindingWriteIndex {
@@ -79,13 +80,22 @@ impl BindingWriteIndex {
     }
 
     fn record(&mut self, stmt_index: usize, binding: AstBindingRef) {
-        self.last_write_by_binding.insert(binding, stmt_index);
+        self.write_bounds_by_binding
+            .entry(binding)
+            .and_modify(|bounds| bounds.1 = stmt_index)
+            .or_insert((stmt_index, stmt_index));
     }
 
     fn has_write_after(&self, stmt_index: usize, binding: AstBindingRef) -> bool {
-        self.last_write_by_binding
+        self.write_bounds_by_binding
             .get(&binding)
-            .is_some_and(|last_write| *last_write > stmt_index)
+            .is_some_and(|(_, last_write)| *last_write > stmt_index)
+    }
+
+    fn writes_start_after(&self, stmt_index: usize, binding: AstBindingRef) -> bool {
+        self.write_bounds_by_binding
+            .get(&binding)
+            .is_some_and(|(first_write, _)| *first_write > stmt_index)
     }
 }
 
@@ -171,7 +181,7 @@ fn rewrite_current_block(
     mutable_snapshots: &MutableSnapshotNames,
     trailing_condition: Option<&AstExpr>,
 ) -> bool {
-    let mut changed = false;
+    let mut changed = collapse_adjacent_self_call_updates(block, trailing_condition);
 
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_condition);
@@ -191,6 +201,21 @@ fn rewrite_current_block(
             index += 1;
             continue;
         };
+        if index.checked_sub(1).is_some_and(|run_start| {
+            super::function_sugar::run_belongs_to_method_alias_owner(
+                &old_stmts,
+                run_start,
+                index + 1,
+                &use_index,
+                mutable_snapshots,
+            )
+        }) {
+            // Preserve the field alias until function-sugar can consume the receiver snapshot,
+            // lookup, and call atomically. Inlining only the lookup loses the method proof.
+            stmt_plan.push(PlannedStmt::Original(index));
+            index += 1;
+            continue;
+        }
         if matches!(value, AstExpr::Call(_) | AstExpr::MethodCall(_))
             && stmt_stores_binding_in_table(next_stmt, candidate.binding())
         {
@@ -315,6 +340,7 @@ fn rewrite_current_block(
     }
 
     block.stmts = materialize_stmt_plan(old_stmts, stmt_plan);
+    changed |= collapse_stable_copy_aliases(block, options, mutable_snapshots, trailing_condition);
     changed |=
         collapse_adjacent_call_alias_runs(block, options, mutable_snapshots, trailing_condition);
     changed |= collapse_terminal_call_result_alias_runs(
@@ -336,6 +362,131 @@ fn rewrite_current_block(
         trailing_condition,
     );
     changed
+}
+
+/// 收回跨越无关语句的直接 local copy。
+///
+/// 这条规则与相邻表达式内联故意分开：相邻规则可以凭 sink 形状证明调用/lookup 的
+/// 求值前缀，而这里只接受 `local alias = source`。source 在候选声明之前已经声明、
+/// 候选之后没有任何 direct write，也没有 closure capture；因此把唯一后续读取改回
+/// source 只改变 binding 名；primitive literal 则没有求值事件且只替换一次读取。
+/// repeat 的精确 trailing handoff 允许 source 在 use 后写入，因为 target 会接管 root
+/// 直到 `until` 条件；两条路径都不改变调用顺序或对象存活期。
+fn collapse_stable_copy_aliases(
+    block: &mut AstBlock,
+    options: ReadabilityOptions,
+    mutable_snapshots: &MutableSnapshotNames,
+    trailing_condition: Option<&AstExpr>,
+) -> bool {
+    let mut stmts = std::mem::take(&mut block.stmts);
+    let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&stmts, trailing_condition);
+    let write_index = BindingWriteIndex::for_stmts(&stmts);
+    let mut removed = vec![false; stmts.len()];
+
+    for (candidate_index, is_removed) in removed.iter_mut().enumerate() {
+        let Some((candidate, value)) =
+            removable_inline_candidate(&stmts, candidate_index, &write_index)
+        else {
+            continue;
+        };
+        if candidate.origin() != super::super::common::AstLocalOrigin::Recovered
+            || !candidate.allows_expr_with_policy(value, InlinePolicy::StableCopy)
+            || mutable_snapshots.contains(&candidate.binding().to_name_ref())
+        {
+            continue;
+        }
+
+        let Some(use_stmt_index) = use_index
+            .unique_use_stmt_in_suffix(candidate_index + 1, candidate.binding())
+            .filter(|use_stmt_index| *use_stmt_index < stmts.len())
+        else {
+            // A repeat's trailing condition is outside this block's statement rewrite boundary.
+            continue;
+        };
+
+        if let AstExpr::Var(source_name) = value {
+            let Some(source_binding) = binding_from_name_ref(source_name) else {
+                // Parameters are intentionally owned by HIR local convergence; globals,
+                // upvalues and temps have no stable copy proof at this AST stage.
+                continue;
+            };
+            // A bound local/synthetic name can only appear while its lexical declaration is
+            // active, so the AST binding identity itself supplies the dominance proof.
+            if !matches!(
+                source_binding,
+                AstBindingRef::Local(_) | AstBindingRef::SyntheticLocal(_)
+            ) || mutable_snapshots.contains(source_name)
+            {
+                continue;
+            }
+            if write_index.has_write_after(candidate_index, source_binding)
+                && !stable_copy_has_trailing_root_handoff(
+                    &stmts,
+                    trailing_condition,
+                    &write_index,
+                    mutable_snapshots,
+                    use_stmt_index,
+                    candidate.binding(),
+                    source_binding,
+                )
+            {
+                continue;
+            }
+        }
+
+        let replacement = value.clone();
+        if rewrite_stmt_use_sites_with_policy(
+            &mut stmts[use_stmt_index],
+            candidate,
+            &replacement,
+            options,
+            InlinePolicy::StableCopy,
+        ) {
+            *is_removed = true;
+        }
+    }
+
+    let changed = removed.contains(&true);
+    block.stmts = stmts
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, stmt)| (!removed[index]).then_some(stmt))
+        .collect();
+    changed
+}
+
+fn stable_copy_has_trailing_root_handoff(
+    stmts: &[AstStmt],
+    trailing_condition: Option<&AstExpr>,
+    write_index: &BindingWriteIndex,
+    mutable_snapshots: &MutableSnapshotNames,
+    use_stmt_index: usize,
+    candidate: AstBindingRef,
+    source: AstBindingRef,
+) -> bool {
+    if stmts
+        .iter()
+        .any(super::control_flow::stmt_contains_label_or_goto)
+        || !write_index.writes_start_after(use_stmt_index, source)
+    {
+        return false;
+    }
+    let AstStmt::Assign(assign) = &stmts[use_stmt_index] else {
+        return false;
+    };
+    let ([AstLValue::Name(target)], [AstExpr::Var(value)]) =
+        (assign.targets.as_slice(), assign.values.as_slice())
+    else {
+        return false;
+    };
+    let Some(target) = binding_from_name_ref(target).filter(|_| candidate.matches_name_ref(value))
+    else {
+        return false;
+    };
+    target != source
+        && !mutable_snapshots.contains(&target.to_name_ref())
+        && !write_index.has_write_after(use_stmt_index, target)
+        && trailing_condition.is_some_and(|condition| expr_references_binding(condition, target))
 }
 
 fn inline_crosses_evaluation_boundary(

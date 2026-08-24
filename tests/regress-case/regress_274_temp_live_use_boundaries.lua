@@ -2,6 +2,7 @@
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[local r0_11 = r0_2("first", 10)]]
+-- unluac: expect-not-contains [[local r0_4 = r0_3]]
 -- unluac: expect-not-contains [[ in nil do]]
 
 local events = {}

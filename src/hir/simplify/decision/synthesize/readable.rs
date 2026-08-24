@@ -17,6 +17,8 @@ use super::safety::expr_is_synth_safe;
 use super::{MAX_SYNTH_REFS, normalize_candidate_expr};
 
 const MAX_NATURALIZE_OR_TERMS: usize = 16;
+const MAX_NATURALIZE_NESTED_CANDIDATES: usize = 128;
+const MAX_NATURALIZE_ROUNDS: usize = 8;
 
 pub(crate) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
     if !matches!(expr, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_)) {
@@ -26,16 +28,11 @@ pub(crate) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
         return None;
     }
 
-    let current = normalize_candidate_expr(expr.clone());
+    let mut current = normalize_candidate_expr(expr.clone());
     let mut refs = BTreeSet::new();
     collect_refs_from_expr(&current, &mut refs);
     let refs = refs.into_iter().collect::<Vec<_>>();
     if refs.len() > MAX_SYNTH_REFS {
-        return None;
-    }
-
-    let candidates = direct_pure_logical_rewrite_candidates(&current);
-    if candidates.is_empty() {
         return None;
     }
 
@@ -56,22 +53,72 @@ pub(crate) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
         (0..super::EXTRA_TRUTHY_SYMBOLS).map(|index| AbstractValue::TruthySymbol(index as u8)),
     );
     let environments = enumerate_environments(refs.len(), &domain)?;
-    let current_cost = super::expr_cost(&current);
+    let mut changed = false;
+    for _ in 0..MAX_NATURALIZE_ROUNDS {
+        let current_cost = super::expr_cost(&current);
+        let Some(next) = pure_logical_rewrite_candidates(&current)
+            .into_iter()
+            .map(normalize_candidate_expr)
+            .filter(|candidate| {
+                validate_pure_expr_equivalence(expr, candidate, &environments, &ref_positions)
+            })
+            .filter(|candidate| super::expr_cost(candidate) < current_cost)
+            .min_by_key(super::expr_cost)
+        else {
+            break;
+        };
+        current = next;
+        changed = true;
+    }
 
+    changed.then_some(current)
+}
+
+/// Return one-step rewrites at the root and one logical child.
+///
+/// The fixed-point loop above revisits the rebuilt expression, so deeper opportunities are still
+/// reached without enumerating all expression paths at once.  Rebuilding one child at a time is
+/// bounded and, because the caller validates every result and requires a lower cost, cannot relax
+/// the semantic or convergence contract.
+fn pure_logical_rewrite_candidates(expr: &HirExpr) -> Vec<HirExpr> {
+    let mut candidates = direct_pure_logical_rewrite_candidates(expr);
+    let (lhs, rhs, is_and) = match expr {
+        HirExpr::LogicalAnd(logical) => (&logical.lhs, &logical.rhs, true),
+        HirExpr::LogicalOr(logical) => (&logical.lhs, &logical.rhs, false),
+        _ => return candidates,
+    };
+
+    for (left, child, sibling) in [(true, lhs, rhs), (false, rhs, lhs)] {
+        for replacement in direct_pure_logical_rewrite_candidates(child) {
+            let rebuilt = if is_and {
+                if left {
+                    logical_and(replacement, sibling.clone())
+                } else {
+                    logical_and(sibling.clone(), replacement)
+                }
+            } else if left {
+                logical_or(replacement, sibling.clone())
+            } else {
+                logical_or(sibling.clone(), replacement)
+            };
+            if !candidates.contains(&rebuilt) {
+                candidates.push(rebuilt);
+            }
+            if candidates.len() >= MAX_NATURALIZE_NESTED_CANDIDATES {
+                return candidates;
+            }
+        }
+    }
+
+    candidates.truncate(MAX_NATURALIZE_NESTED_CANDIDATES);
     candidates
-        .into_iter()
-        .map(normalize_candidate_expr)
-        .filter(|candidate| {
-            validate_pure_expr_equivalence(expr, candidate, &environments, &ref_positions)
-        })
-        .filter(|candidate| super::expr_cost(candidate) < current_cost)
-        .min_by_key(super::expr_cost)
 }
 
 fn direct_pure_logical_rewrite_candidates(expr: &HirExpr) -> Vec<HirExpr> {
     let mut candidates = Vec::new();
     match expr {
         HirExpr::LogicalAnd(logical) => {
+            candidates.extend(factor_or_shared_and_tail(&logical.lhs, &logical.rhs));
             if let HirExpr::LogicalOr(lhs_or) = &logical.lhs {
                 candidates.push(logical_or(
                     logical_and(lhs_or.lhs.clone(), logical.rhs.clone()),
@@ -86,10 +133,71 @@ fn direct_pure_logical_rewrite_candidates(expr: &HirExpr) -> Vec<HirExpr> {
             }
         }
         HirExpr::LogicalOr(logical) => {
+            candidates.extend(drop_shared_or_fallback(&logical.lhs, &logical.rhs));
             candidates.extend(factor_or_of_ands(&logical.lhs, &logical.rhs));
             candidates.extend(factor_or_chain_of_ands(expr));
         }
         _ => {}
+    }
+    candidates
+}
+
+/// Generate a candidate for `((a and (b or ... or c)) or c)` with the inner fallback removed.
+///
+/// The shape is common after a shared decision continuation is treeified.  Removing `c` is not
+/// a general Lua value identity, so this helper only proposes the candidate; the caller's
+/// exhaustive pure-expression validator decides whether the surrounding guards make it exact.
+fn drop_shared_or_fallback(lhs: &HirExpr, rhs: &HirExpr) -> Vec<HirExpr> {
+    let HirExpr::LogicalAnd(and_expr) = lhs else {
+        return Vec::new();
+    };
+    let terms = flatten_or_chain(&and_expr.rhs);
+    if terms.len() < 2 {
+        return Vec::new();
+    }
+
+    let Some(index) = terms.iter().rposition(|term| *term == rhs) else {
+        return Vec::new();
+    };
+    let shortened = terms
+        .into_iter()
+        .enumerate()
+        .filter(|(term_index, _)| *term_index != index)
+        .map(|(_, term)| term.clone())
+        .collect::<Vec<_>>();
+    let inner = rebuild_or_chain(shortened);
+    vec![logical_or(
+        logical_and(and_expr.lhs.clone(), inner),
+        rhs.clone(),
+    )]
+}
+
+/// `((a or (b and c)) and c)` can be shortened to `(a or b) and c`.
+///
+/// If `a` is truthy, both forms return `c`.  Otherwise both evaluate `b`; a falsy `b` is
+/// returned directly and a truthy `b` proceeds to the same `c`.  The operands are restricted to
+/// repeatable expressions by the caller, so removing the duplicate reads cannot expose a side
+/// effect.  The symmetric inner `and` layout follows the same argument.
+fn factor_or_shared_and_tail(lhs: &HirExpr, rhs: &HirExpr) -> Vec<HirExpr> {
+    let HirExpr::LogicalOr(inner) = lhs else {
+        return Vec::new();
+    };
+    let HirExpr::LogicalAnd(shared) = &inner.rhs else {
+        return Vec::new();
+    };
+
+    let mut candidates = Vec::new();
+    if shared.rhs == *rhs {
+        candidates.push(logical_and(
+            logical_or(inner.lhs.clone(), shared.lhs.clone()),
+            rhs.clone(),
+        ));
+    }
+    if shared.lhs == *rhs {
+        candidates.push(logical_and(
+            logical_or(inner.lhs.clone(), shared.rhs.clone()),
+            rhs.clone(),
+        ));
     }
     candidates
 }
