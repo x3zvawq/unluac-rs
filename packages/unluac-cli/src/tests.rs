@@ -215,6 +215,22 @@ fn explicit_dump_replaces_repo_debug_dump_stage() {
 }
 
 #[test]
+fn documented_enum_aliases_remain_accepted() {
+    let options = parse_args(args(&[
+        "--source",
+        "case.lua",
+        "--dialect",
+        "lua51",
+        "--stop-after",
+        "transform",
+    ]))
+    .expect("documented enum aliases should parse");
+
+    assert_eq!(<&'static str>::from(options.decompile.dialect), "lua5.1");
+    assert_eq!(options.decompile.target_stage, DecompileStage::Transformer);
+}
+
+#[test]
 fn stop_after_only_accepts_outer_stages() {
     let error = parse_args(args(&["--source", "case.lua", "--stop-after", "cfg"]))
         .expect_err("cfg is internal to structure and should not be a stop target");
@@ -232,6 +248,24 @@ fn dump_only_accepts_outer_stages() {
     let rendered = error.to_string();
     assert!(
         rendered.contains("invalid value 'dataflow'") && rendered.contains("--dump"),
+        "unexpected clap error: {rendered}"
+    );
+}
+
+#[test]
+fn invalid_enumerated_value_lists_allowed_values() {
+    let error = parse_args(args(&[
+        "--source",
+        "case.lua",
+        "--decode-mode",
+        "permissive",
+    ]))
+    .expect_err("decode mode should reject parser-mode values");
+    let rendered = error.to_string();
+
+    assert!(
+        rendered.contains("invalid value 'permissive'")
+            && rendered.contains("possible values: strict, lossy"),
         "unexpected clap error: {rendered}"
     );
 }
@@ -534,6 +568,23 @@ fn help_is_grouped_by_section_and_includes_repo_link() {
     assert!(help.contains("--strip <BOOL>"));
     assert!(help.contains("--number-format <NUMBER_FORMAT>"));
     assert!(help.contains("-o, --output <OUTPUT>"));
+    for possible_values in [
+        "possible values: auto, lua5.1, lua51, lua5.2, lua52, lua5.3, lua53, lua5.4, lua54, lua5.5, lua55, luajit, luau",
+        "possible values: strict, lossy",
+        "possible values: strict, permissive",
+        "possible values: parser, parse, transformer, transform, structure, hir, ast, generate",
+        "possible values: summary, normal, verbose",
+        "possible values: auto, always, never",
+        "possible values: debug-like, simple, heuristic",
+        "possible values: prefer-double, prefer-single, min-escape",
+        "possible values: decimal, hex",
+        "possible values: compact, balanced, expanded",
+    ] {
+        assert!(
+            help.contains(possible_values),
+            "help should include [{possible_values}]"
+        );
+    }
     assert!(input < debug && debug < generate && generate < output);
 }
 

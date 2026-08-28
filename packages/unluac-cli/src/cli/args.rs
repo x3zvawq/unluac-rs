@@ -5,8 +5,13 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::str::FromStr;
 
-use clap::{Args, CommandFactory, Parser, builder::BoolishValueParser, error::ErrorKind};
+use clap::{
+    Args, CommandFactory, Parser,
+    builder::{BoolishValueParser, PossibleValuesParser, TypedValueParser},
+    error::ErrorKind,
+};
 use unluac::decompile::{
     DebugColorMode, DebugDetail, DebugFilters, DecompileDialect, DecompileOptions, DecompileStage,
     GenerateMode, LuauVectorConstructor, LuauVectorSize, NamingMode, NumberFormat, ProtoDepth,
@@ -22,6 +27,37 @@ const CLI_VERSION_TEXT: &str = concat!(
     env!("CARGO_PKG_REPOSITORY")
 );
 const CLI_AFTER_HELP: &str = concat!("Repository: ", env!("CARGO_PKG_REPOSITORY"));
+const DIALECT_VALUES: &[&str] = &[
+    "auto", "lua5.1", "lua51", "lua5.2", "lua52", "lua5.3", "lua53", "lua5.4", "lua54", "lua5.5",
+    "lua55", "luajit", "luau",
+];
+const DECODE_MODE_VALUES: &[&str] = &["strict", "lossy"];
+const PARSE_MODE_VALUES: &[&str] = &["strict", "permissive"];
+const STAGE_VALUES: &[&str] = &[
+    "parser",
+    "parse",
+    "transformer",
+    "transform",
+    "structure",
+    "hir",
+    "ast",
+    "generate",
+];
+const DETAIL_VALUES: &[&str] = &["summary", "normal", "verbose"];
+const COLOR_VALUES: &[&str] = &["auto", "always", "never"];
+const NAMING_MODE_VALUES: &[&str] = &["debug-like", "simple", "heuristic"];
+const QUOTE_STYLE_VALUES: &[&str] = &["prefer-double", "prefer-single", "min-escape"];
+const NUMBER_FORMAT_VALUES: &[&str] = &["decimal", "hex"];
+const TABLE_STYLE_VALUES: &[&str] = &["compact", "balanced", "expanded"];
+const GENERATE_MODE_VALUES: &[&str] = &["strict", "permissive"];
+
+fn known_value_parser<T>(values: &'static [&'static str]) -> impl TypedValueParser<Value = T>
+where
+    T: FromStr + Clone + Send + Sync + 'static,
+    T::Err: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+{
+    PossibleValuesParser::new(values.iter().copied()).try_map(|value| value.parse::<T>())
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -52,7 +88,7 @@ struct InputArgs {
     #[arg(
         short = 'D',
         long,
-        value_parser = clap::value_parser!(DecompileDialect),
+        value_parser = known_value_parser::<DecompileDialect>(DIALECT_VALUES),
         help_heading = "Input"
     )]
     dialect: Option<DecompileDialect>,
@@ -99,7 +135,7 @@ struct InputArgs {
     #[arg(
         short = 'm',
         long,
-        value_parser = clap::value_parser!(StringDecodeMode),
+        value_parser = known_value_parser::<StringDecodeMode>(DECODE_MODE_VALUES),
         help_heading = "Input"
     )]
     decode_mode: Option<StringDecodeMode>,
@@ -107,7 +143,7 @@ struct InputArgs {
     #[arg(
         short = 'p',
         long,
-        value_parser = clap::value_parser!(ParseMode),
+        value_parser = known_value_parser::<ParseMode>(PARSE_MODE_VALUES),
         help_heading = "Input"
     )]
     parse_mode: Option<ParseMode>,
@@ -134,14 +170,14 @@ struct DebugArgs {
     /// Dump one or more outer pipeline stages.
     #[arg(
         long,
-        value_parser = clap::value_parser!(DecompileStage),
+        value_parser = known_value_parser::<DecompileStage>(STAGE_VALUES),
         help_heading = "Debug"
     )]
     dump: Vec<DecompileStage>,
     /// Debug output detail level.
     #[arg(
         long,
-        value_parser = clap::value_parser!(DebugDetail),
+        value_parser = known_value_parser::<DebugDetail>(DETAIL_VALUES),
         help_heading = "Debug"
     )]
     detail: Option<DebugDetail>,
@@ -149,7 +185,7 @@ struct DebugArgs {
     #[arg(
         short = 'c',
         long,
-        value_parser = clap::value_parser!(DebugColorMode),
+        value_parser = known_value_parser::<DebugColorMode>(COLOR_VALUES),
         help_heading = "Debug"
     )]
     color: Option<DebugColorMode>,
@@ -240,7 +276,7 @@ struct ReadabilityArgs {
     #[arg(
         short = 'n',
         long,
-        value_parser = clap::value_parser!(NamingMode),
+        value_parser = known_value_parser::<NamingMode>(NAMING_MODE_VALUES),
         help_heading = "Generate"
     )]
     naming_mode: Option<NamingMode>,
@@ -291,21 +327,21 @@ struct GenerateArgs {
     /// String quote style.
     #[arg(
         long,
-        value_parser = clap::value_parser!(QuoteStyle),
+        value_parser = known_value_parser::<QuoteStyle>(QUOTE_STYLE_VALUES),
         help_heading = "Generate"
     )]
     quote_style: Option<QuoteStyle>,
     /// Number literal style.
     #[arg(
         long,
-        value_parser = clap::value_parser!(NumberFormat),
+        value_parser = known_value_parser::<NumberFormat>(NUMBER_FORMAT_VALUES),
         help_heading = "Generate"
     )]
     number_format: Option<NumberFormat>,
     /// Table constructor layout style.
     #[arg(
         long,
-        value_parser = clap::value_parser!(TableStyle),
+        value_parser = known_value_parser::<TableStyle>(TABLE_STYLE_VALUES),
         help_heading = "Generate"
     )]
     table_style: Option<TableStyle>,
@@ -335,7 +371,7 @@ struct GenerateArgs {
     #[arg(
         short = 'g',
         long,
-        value_parser = clap::value_parser!(GenerateMode),
+        value_parser = known_value_parser::<GenerateMode>(GENERATE_MODE_VALUES),
         help_heading = "Generate"
     )]
     generate_mode: Option<GenerateMode>,
@@ -367,7 +403,7 @@ struct OutputArgs {
     /// Stop the pipeline after a specific stage.
     #[arg(
         long,
-        value_parser = clap::value_parser!(DecompileStage),
+        value_parser = known_value_parser::<DecompileStage>(STAGE_VALUES),
         help_heading = "Output"
     )]
     stop_after: Option<DecompileStage>,
