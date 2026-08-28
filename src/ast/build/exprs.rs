@@ -66,7 +66,7 @@ impl<'a> AstLowerer<'a> {
         Ok(values)
     }
 
-    fn lower_function_expr(
+    pub(super) fn lower_function_expr(
         &mut self,
         owner_proto: usize,
         closure: &HirClosureExpr,

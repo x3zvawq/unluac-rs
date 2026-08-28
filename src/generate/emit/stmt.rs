@@ -65,7 +65,7 @@ impl<'a> Emitter<'a> {
             AstStmt::LocalFunctionDecl(local_function_decl) => {
                 self.emit_local_function_decl(local_function_decl, function)
             }
-            AstStmt::Error(message) => Ok(Doc::text(format!("-- [unluac error] {message}"))),
+            AstStmt::Error(message) => Ok(emit_error_comment(message)),
         }
     }
 
@@ -419,6 +419,15 @@ impl<'a> Emitter<'a> {
         };
         Doc::concat([comment, Doc::line(), doc])
     }
+}
+
+fn emit_error_comment(message: &str) -> Doc {
+    let mut lines = message.lines();
+    let first = lines.next().unwrap_or_default();
+    let comments = std::iter::once(Doc::text(format!("-- [unluac error] {first}")))
+        .chain(lines.map(|line| Doc::text(format!("-- {line}"))))
+        .collect::<Vec<_>>();
+    Doc::join(comments, Doc::line())
 }
 
 fn function_captures_path_root(

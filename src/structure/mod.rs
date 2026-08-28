@@ -10,6 +10,7 @@ mod cfg;
 mod common;
 #[cfg(feature = "decompile-debug")]
 mod debug;
+mod diagnostic;
 mod error;
 mod goto;
 mod helpers;
@@ -38,10 +39,11 @@ pub(crate) use common::{
 };
 pub use common::{
     BranchKind, DebugBindingConflict, DebugBindingFact, DebugBindingFacts, GotoReason, PhiEdgeCopy,
-    StructureFacts, StructurePlan,
+    ReadyStructureFacts, StructureFacts, StructureOutcome, StructurePlan,
 };
 #[cfg(feature = "decompile-debug")]
 pub use debug::dump_structure;
+pub(crate) use diagnostic::{dump_dataflow_proto, dump_structure_proto};
 pub use error::StructureError;
 pub(crate) use phi_facts::CanonicalMoveIndex;
 pub use plan::{

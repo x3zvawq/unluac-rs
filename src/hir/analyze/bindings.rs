@@ -21,7 +21,7 @@ use crate::structure::{
     GraphFacts, PhiId, PhiIncomingDisposition, PhiIncomingPlan, PhiPlan, SsaValue,
 };
 use crate::structure::{
-    LoopPlanId, LoopSourceBindings, LoopVmProtocol, RegionId, RegionPlan, StructureFacts,
+    LoopPlanId, LoopSourceBindings, LoopVmProtocol, ReadyStructureFacts, RegionId, RegionPlan,
     StructurePlan, UnstructuredLayoutItem,
 };
 use crate::transformer::{
@@ -67,7 +67,7 @@ pub(super) fn build_bindings(
     cfg: &Cfg,
     graph: &GraphFacts,
     dataflow: &DataflowFacts,
-    structure: &StructureFacts,
+    structure: &ReadyStructureFacts,
     captured_slot_epochs: &SlotEpochFacts,
     child_mutable_upvalues: &[Vec<bool>],
 ) -> ProtoBindings {

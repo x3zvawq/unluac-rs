@@ -30,6 +30,9 @@ cargo unluac -i /path/to/chunk.out -D lua5.4 --stop-after ast --proto 3 --proto-
 
 # 查看某个 pass 的前后变化
 cargo unluac -i /path/to/chunk.out -D lua5.4 --dump-pass temp-inline --proto 2
+
+# 保留 Structure/HIR 失败 proto 的最后完成产物和其它可恢复 proto
+cargo unluac -i /path/to/chunk.out -D lua5.4 --generate-mode permissive
 ```
 
 ## 调试参数速查
@@ -50,6 +53,7 @@ cargo unluac -i /path/to/chunk.out -D lua5.4 --dump-pass temp-inline --proto 2
 | `--dump-pass`   | 看 pass 的 before/after 快照     |
 | `--list-protos` | 先列出 proto，便于决定 `--proto` |
 | `-t/--timing`   | 输出阶段耗时                     |
+| `-g/--generate-mode` | `strict` 首错退出；`permissive` 以注释保留失败 proto 与最后完成产物 |
 
 > 其中，`--dump` 和 `--stop-after` 支持的阶段包括：`parser`（兼容 `parse`）、`transformer`（兼容 `transform`）、`structure`, `hir`, `ast`, `generate`。
 > `structure` dump 内含 CFG / graph-facts / dataflow / structure-facts 分段；`ast` dump 内含 AST / readability / naming 分段。
@@ -63,6 +67,8 @@ cargo unluac -i /path/to/chunk.out -D lua5.4 --dump-pass temp-inline --proto 2
 - `--proto` / `--proto-depth` 适合在 parser、HIR、AST 之间来回比对同一子函数。
 - `--dump-pass` 只在 pass 实际改动内容时输出快照；未变化时不会刷屏。
 - `-o/--output` 面向最终源码输出，不适合与调试输出混用。
+- permissive 的 proto 恢复注释属于最终 stdout/输出文件，不是 stderr stage dump；失败父节点下
+  标为 detached 的子函数仅供诊断，原 closure 位置与 capture 语义没有被证明。
 
 ## 推荐排错流程
 

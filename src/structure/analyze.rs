@@ -17,14 +17,16 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 
 use crate::decompile::{ControlFlowCaps, DecompileContext, DecompileError, DecompileState};
+use crate::generate::GenerateMode;
+use crate::recovery::{ProtoArtifactStage, ProtoFailure};
 use crate::structure::{Cfg, CfgGraph, DataflowFacts, EdgeKind, GraphFacts};
 use crate::transformer::{InstrRef, LowInstr, LoweredProto};
 
 use super::common::{
     BranchCandidate, BranchKind, BranchRegionFact, BranchValueMergeCandidate, DebugBindingConflict,
-    DebugBindingFact, DebugBindingFacts, LoopCandidate, RegionFact, ResidualTransferEvidence,
-    ScopePlan, ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNodeRef, ShortCircuitTarget,
-    StructureFacts,
+    DebugBindingFact, DebugBindingFacts, LoopCandidate, ReadyStructureFacts, RegionFact,
+    ResidualTransferEvidence, ScopePlan, ShortCircuitCandidate, ShortCircuitExit,
+    ShortCircuitNodeRef, ShortCircuitTarget, StructureFacts, StructureOutcome,
 };
 use super::plan::{
     BranchPlanInput, ConditionPlanId, ConditionPlanInput, FinalPlanInput, LoopPlanInput,
@@ -91,6 +93,7 @@ pub(crate) fn analyze_structure(
         dataflow,
         &cfg.children,
         context.options.dialect.control_flow_caps(),
+        context.options.generate.mode == GenerateMode::Permissive,
     )?);
     Ok(())
 }
@@ -103,6 +106,7 @@ pub(crate) fn analyze_structure_proto(
     dataflow: &DataflowFacts,
     child_cfgs: &[CfgGraph],
     caps: ControlFlowCaps,
+    recover_failures: bool,
 ) -> Result<StructureFacts, StructureError> {
     struct Frame<'a> {
         proto: &'a LoweredProto,
@@ -113,6 +117,7 @@ pub(crate) fn analyze_structure_proto(
         next_child: usize,
         children: Vec<StructureFacts>,
         context_index: Option<usize>,
+        proto_id: usize,
     }
 
     let mut stack = vec![Frame {
@@ -124,7 +129,9 @@ pub(crate) fn analyze_structure_proto(
         next_child: 0,
         children: Vec::new(),
         context_index: None,
+        proto_id: 0,
     }];
+    let mut next_proto_id = 1usize;
     loop {
         let child = {
             let frame = stack
@@ -156,6 +163,8 @@ pub(crate) fn analyze_structure_proto(
         if let Some((child_index, child_proto, child_cfg, child_graph, child_dataflow)) = child {
             // The explicit frame is the only stack growth for proto nesting.  CFG, graph,
             // dataflow, and all per-proto Structure algorithms already use bounded worklists.
+            let proto_id = next_proto_id;
+            next_proto_id += 1;
             stack.push(Frame {
                 proto: child_proto,
                 cfg: &child_cfg.cfg,
@@ -165,26 +174,45 @@ pub(crate) fn analyze_structure_proto(
                 next_child: 0,
                 children: Vec::new(),
                 context_index: Some(child_index),
+                proto_id,
             });
             continue;
         }
 
         let frame = stack.pop().expect("structure proto frame is non-empty");
-        let mut facts = analyze_structure_proto_one(
+        let outcome = match analyze_structure_proto_one(
             frame.proto,
             frame.cfg,
             frame.graph_facts,
             frame.dataflow,
             caps,
-        )
-        .map_err(|error| {
-            if let Some(index) = frame.context_index {
-                error.context(format!("child proto #{index}"))
-            } else {
-                error
+        ) {
+            Ok(facts) => StructureOutcome::Ready(Box::new(facts)),
+            Err(error) if recover_failures => StructureOutcome::Failed(ProtoFailure {
+                proto: frame.proto_id,
+                failed_stage: ProtoArtifactStage::Structure,
+                last_completed_stage: ProtoArtifactStage::Dataflow,
+                error: error.to_string().into(),
+                last_completed_dump: super::dump_dataflow_proto(
+                    frame.proto_id,
+                    frame.proto,
+                    frame.cfg,
+                    frame.dataflow,
+                )
+                .into(),
+            }),
+            Err(error) => {
+                return Err(if let Some(index) = frame.context_index {
+                    error.context(format!("child proto #{index}"))
+                } else {
+                    error
+                });
             }
-        })?;
-        facts.children = frame.children;
+        };
+        let facts = StructureFacts {
+            outcome,
+            children: frame.children,
+        };
         if let Some(parent) = stack.last_mut() {
             parent.children.push(facts);
         } else {
@@ -199,7 +227,7 @@ fn analyze_structure_proto_one(
     graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
     caps: ControlFlowCaps,
-) -> Result<StructureFacts, StructureError> {
+) -> Result<ReadyStructureFacts, StructureError> {
     let mut loop_candidates = loops::analyze_loops(proto, cfg, graph_facts, dataflow);
     let irreducible_regions = helpers::compute_irreducible_regions(cfg, graph_facts);
     let (branch_candidates, single_pass_fences) = branches::analyze_branches(
@@ -341,9 +369,8 @@ fn analyze_structure_proto_one(
     plan::validate_final_structure_plan(proto, cfg, graph_facts, dataflow, &plan)?;
     let debug_bindings = analyze_debug_bindings(proto, cfg, dataflow);
 
-    Ok(StructureFacts {
+    Ok(ReadyStructureFacts {
         plan,
         debug_bindings,
-        children: Vec::new(),
     })
 }

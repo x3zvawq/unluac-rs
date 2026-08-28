@@ -16,8 +16,8 @@ use crate::decompile::{DebugOptions, DecompileState};
 use super::plan::EdgeActionPlacement;
 use super::{
     BlockTerminatorKind, CleanupDisposition, ControlFlowFeature, EdgeTransfer,
-    PhiIncomingDisposition, PlanRequirement, RegionId, RegionPlan, StructureFacts,
-    UnstructuredLayoutItem,
+    PhiIncomingDisposition, PlanRequirement, ReadyStructureFacts, RegionId, RegionPlan,
+    StructureFacts, UnstructuredLayoutItem,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -138,7 +138,24 @@ fn dump_structure_facts(
         }
 
         let indent = "  ".repeat(entry.depth);
-        let plan = entry.facts.plan();
+        let Some(facts) = entry.facts.ready() else {
+            let Some(failure) = entry.facts.failure() else {
+                let _ = writeln!(output, "{indent}proto#{} <invalid outcome>", entry.id);
+                continue;
+            };
+            let _ = writeln!(
+                output,
+                "{indent}proto#{} failed-stage={} last-completed={} error={}",
+                entry.id, failure.failed_stage, failure.last_completed_stage, failure.error,
+            );
+            if !matches!(detail, DebugDetail::Summary) {
+                for line in failure.last_completed_dump.lines() {
+                    let _ = writeln!(output, "{indent}  {line}");
+                }
+            }
+            continue;
+        };
+        let plan = facts.plan();
         let island_count = plan
             .regions()
             .filter(|(_, region)| matches!(region, RegionPlan::Unstructured { .. }))
@@ -156,8 +173,8 @@ fn dump_structure_facts(
             plan.edge_plans.len(),
             plan.phis.len(),
             plan.scopes.len(),
-            entry.facts.debug_bindings.accepted.len(),
-            entry.facts.debug_bindings.conflicts.len(),
+            facts.debug_bindings.accepted.len(),
+            facts.debug_bindings.conflicts.len(),
             plan.requirements.entries.len(),
         );
         if matches!(detail, DebugDetail::Summary) {
@@ -168,7 +185,7 @@ fn dump_structure_facts(
         write_region(&mut output, &indent, plan, plan.root(), 2, "root");
 
         let _ = writeln!(output, "{indent}  debug binding facts");
-        write_debug_bindings(&mut output, &indent, entry.facts);
+        write_debug_bindings(&mut output, &indent, facts);
 
         let _ = writeln!(output, "{indent}  block terminators");
         write_block_terminators(&mut output, &indent, plan);
@@ -201,7 +218,7 @@ fn dump_structure_facts(
     colorize_debug_text(&output, color)
 }
 
-fn write_debug_bindings(output: &mut String, indent: &str, facts: &StructureFacts) {
+fn write_debug_bindings(output: &mut String, indent: &str, facts: &ReadyStructureFacts) {
     if facts.debug_bindings.accepted.is_empty() && facts.debug_bindings.conflicts.is_empty() {
         let _ = writeln!(output, "{indent}    <none>");
         return;

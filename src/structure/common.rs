@@ -1,14 +1,15 @@
 //! 这个文件集中声明 Structure 的内部 evidence 与最终 `StructureFacts` 容器。
 //!
-//! branch/loop/short-circuit 类型只在 Structure 内参与冲突消解；对下游公开的事实已经
-//! 收窄为冻结的 `StructurePlan + DebugBindingFacts + children`，HIR 不再读取 raw evidence
-//! 做第二次取舍。
+//! branch/loop/short-circuit 类型只在 Structure 内参与冲突消解；对下游公开的成功事实已经
+//! 收窄为冻结的 `StructurePlan + DebugBindingFacts`。失败 proto 则保留 `ProtoFailure` 和原
+//! children 位置，HIR 不会对失败节点重新选择候选，也不会因跳过节点而改变 child slot。
 
 use std::collections::BTreeSet;
 
 mod plan_access;
 pub use plan_access::StructurePlan;
 
+use crate::recovery::ProtoFailure;
 use crate::structure::{BlockRef, DefId, EdgeRef, PhiId, SsaValue};
 use crate::transformer::{InstrRef, Reg, RegRange};
 
@@ -23,12 +24,25 @@ use super::plan::{
     TbcScopePlanId, ValueDecisionPlan, ValueDecisionPlanId,
 };
 
-/// 一个 proto 已冻结的结构计划，以及它的子 proto 结果。
+/// 一个 proto 的 Structure 结果，以及保持原顺序的子 proto 结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructureFacts {
+    pub outcome: StructureOutcome,
+    pub children: Vec<StructureFacts>,
+}
+
+/// 单个 proto 要么拥有完整冻结计划，要么保留停止推进时的失败事实。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StructureOutcome {
+    Ready(Box<ReadyStructureFacts>),
+    Failed(ProtoFailure),
+}
+
+/// HIR 可消费的完整 Structure 事实。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyStructureFacts {
     pub plan: StructurePlan,
     pub debug_bindings: DebugBindingFacts,
-    pub children: Vec<StructureFacts>,
 }
 
 /// debug local 在其源码生命周期入口对应的 canonical SSA 身份。
@@ -60,6 +74,22 @@ pub struct DebugBindingFacts {
 }
 
 impl StructureFacts {
+    pub const fn ready(&self) -> Option<&ReadyStructureFacts> {
+        match &self.outcome {
+            StructureOutcome::Ready(facts) => Some(facts),
+            StructureOutcome::Failed(_) => None,
+        }
+    }
+
+    pub const fn failure(&self) -> Option<&ProtoFailure> {
+        match &self.outcome {
+            StructureOutcome::Ready(_) => None,
+            StructureOutcome::Failed(failure) => Some(failure),
+        }
+    }
+}
+
+impl ReadyStructureFacts {
     pub const fn plan(&self) -> &StructurePlan {
         &self.plan
     }

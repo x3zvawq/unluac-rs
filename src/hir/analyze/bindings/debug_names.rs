@@ -112,7 +112,7 @@ pub(super) fn debug_local_hint_for_reg_at_pc(
 
 pub(super) fn debug_names_by_ssa(
     proto: &LoweredProto,
-    structure: &StructureFacts,
+    structure: &ReadyStructureFacts,
 ) -> BTreeMap<SsaValue, DebugBindingHint> {
     structure
         .debug_bindings()

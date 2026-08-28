@@ -4,6 +4,7 @@
 //! lowering 能力串起来。这样 `src/hir/analyze` 和 `src/hir/simplify` 的外层形状就会
 //! 保持一致，后续继续拆分实现时也更容易定位“入口”与“细节”。
 
+mod artifact_recovery;
 mod bindings;
 mod exprs;
 mod helpers;

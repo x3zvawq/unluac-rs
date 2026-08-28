@@ -18,6 +18,7 @@ bytes ──→ Parser ──→ Transformer ──→ Structure ──→ HIR �
 | `src/decompile/options.rs` | 顶层选项 `DecompileOptions` 与 `DebugOptions`，统一默认值补齐 |
 | `src/debug.rs` | 跨层 debug 公共类型、聚焦工具与 `define_stage_dump!` 宏 |
 | `src/scheduler.rs` | HIR Simplify 与 AST Readability 共用的 invalidation-driven 调度器 |
+| `src/recovery.rs` | Structure/HIR proto 级失败事实与最后完成产物合同 |
 
 ## 分层文档
 

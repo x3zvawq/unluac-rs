@@ -12,6 +12,7 @@ pub mod generate;
 pub mod hir;
 mod lua_string;
 pub mod parser;
+pub mod recovery;
 pub(crate) mod scheduler;
 pub mod structure;
 mod timing;

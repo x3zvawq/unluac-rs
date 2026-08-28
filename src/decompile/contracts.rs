@@ -15,7 +15,7 @@ pub use crate::structure::GraphFacts;
 /// Structure 层内部产出的 def-use、活跃性和副作用摘要。
 pub use crate::structure::DataflowFacts;
 
-/// 结构恢复前置层产出的结构候选与保留约束。
+/// Structure 层产出的成功冻结计划或 proto 级失败事实，以及稳定 child slot。
 pub use crate::structure::StructureFacts;
 
 /// HIR 层产出的结构化语义树。

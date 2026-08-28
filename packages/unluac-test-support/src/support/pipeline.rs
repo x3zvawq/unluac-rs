@@ -195,6 +195,9 @@ pub(crate) fn run_pipeline_case(
     if let LuaCaseExpectation::UnsupportedIsland { jump_pc, target_pc } = entry.expectation {
         return run_unsupported_island_contract(entry, jump_pc, target_pc);
     }
+    if entry.expectation == LuaCaseExpectation::ProtoFailureRecovery {
+        return run_proto_failure_recovery_contract(suite, entry);
+    }
     let dialect_label = <&'static str>::from(entry.dialect);
     let suite_label = suite.label();
     let toolchain = lua_toolchain(dialect_label).map_err(|error| {
@@ -584,6 +587,12 @@ pub(crate) fn run_pipeline_case(
         LuaCaseExpectation::LuaJitMethodProtocol => {
             assert_luajit_method_protocol_contract(entry, suite_label)?;
         }
+        LuaCaseExpectation::ProtoFailureRecovery => {
+            return Err(proto_failure_contract_failure(
+                entry,
+                "proto failure contract unexpectedly entered the normal pipeline",
+            ));
+        }
         LuaCaseExpectation::Source
         | LuaCaseExpectation::TableSetListResidual
         | LuaCaseExpectation::UnsupportedIsland { .. } => {}
@@ -591,6 +600,157 @@ pub(crate) fn run_pipeline_case(
 
     let proto_count = count_output_tags(&baseline.source_output.stdout);
     Ok(TestSuccess { proto_count })
+}
+
+fn run_proto_failure_recovery_contract(
+    suite: UnitSuite,
+    entry: &LuaCaseManifestEntry,
+) -> Result<TestSuccess, TestFailure> {
+    use unluac::ast::{AstExpr, AstStmt, AstTargetDialect, lower_ast};
+    use unluac::hir::{HirBlock, LocalId};
+    use unluac::recovery::{ProtoArtifactStage, ProtoFailure};
+
+    let source_entry = LuaCaseManifestEntry {
+        expectation: LuaCaseExpectation::Source,
+        ..*entry
+    };
+    let baseline = run_pipeline_case(suite, &source_entry)?;
+    let chunk = compile_manifest_case(entry);
+    let mut options = decompile_options(entry);
+    options.target_stage = DecompileStage::Hir;
+    options.generate.mode = GenerateMode::Permissive;
+    let result = decompile(&chunk, options).map_err(|error| {
+        proto_failure_contract_failure(entry, format!("HIR baseline failed: {error}"))
+    })?;
+    let mut module = result
+        .state
+        .hir
+        .ok_or_else(|| proto_failure_contract_failure(entry, "HIR baseline returned no module"))?;
+    let entry_ref = module.entry;
+    let root = module.protos.get_mut(entry_ref.index()).ok_or_else(|| {
+        proto_failure_contract_failure(entry, "HIR entry references a missing proto")
+    })?;
+    let children = root.children.clone();
+    if children.len() < 2 {
+        return Err(proto_failure_contract_failure(
+            entry,
+            format!(
+                "fixture must produce at least two direct child protos, got {}",
+                children.len()
+            ),
+        ));
+    }
+    let first_recovery_local = root
+        .locals
+        .iter()
+        .map(|local| local.index())
+        .max()
+        .map_or(0, |index| index + 1);
+    root.detached_children = children
+        .iter()
+        .enumerate()
+        .map(|(index, child)| (LocalId(first_recovery_local + index), *child))
+        .collect();
+    for (local, _) in &root.detached_children {
+        root.locals.push(*local);
+        root.local_debug_hints
+            .push(Some(format!("unluac_proto_{}", local.index())));
+    }
+    root.body = HirBlock::default();
+    root.failure = Some(ProtoFailure {
+        proto: 0,
+        failed_stage: ProtoArtifactStage::Structure,
+        last_completed_stage: ProtoArtifactStage::Dataflow,
+        error: "forced recovery contract".into(),
+        last_completed_dump: "dataflow proto#0\n  @000 return".into(),
+    });
+
+    let target = AstTargetDialect::new(entry.dialect.decompile_dialect());
+    match lower_ast(&module, target, GenerateMode::Strict) {
+        Err(AstLowerError::ResidualHir {
+            proto: 0,
+            kind: "proto recovery failure",
+        }) => {}
+        Err(error) => {
+            return Err(proto_failure_contract_failure(
+                entry,
+                format!("strict mode returned the wrong error: {error}"),
+            ));
+        }
+        Ok(_) => {
+            return Err(proto_failure_contract_failure(
+                entry,
+                "strict mode accepted a failed proto",
+            ));
+        }
+    }
+
+    let ast = lower_ast(&module, target, GenerateMode::Permissive).map_err(|error| {
+        proto_failure_contract_failure(entry, format!("permissive lowering failed: {error}"))
+    })?;
+    let expected_stmt_count = children.len() + 2;
+    if ast.body.stmts.len() != expected_stmt_count {
+        return Err(proto_failure_contract_failure(
+            entry,
+            format!(
+                "permissive root has {} statements, expected {expected_stmt_count}",
+                ast.body.stmts.len()
+            ),
+        ));
+    }
+    let Some(AstStmt::Error(failure)) = ast.body.stmts.first() else {
+        return Err(proto_failure_contract_failure(
+            entry,
+            "permissive root does not start with a failure diagnostic",
+        ));
+    };
+    if !failure.contains("proto#0 failed during structure")
+        || !failure.contains("last completed stage: dataflow")
+        || !failure.contains("\n  @000 return")
+    {
+        return Err(proto_failure_contract_failure(
+            entry,
+            format!("failure diagnostic lost stage or dump details: {failure}"),
+        ));
+    }
+    if !matches!(
+        ast.body.stmts.get(1),
+        Some(AstStmt::Error(message)) if message.contains("detached diagnostic functions")
+    ) {
+        return Err(proto_failure_contract_failure(
+            entry,
+            "permissive root does not explain detached child placement",
+        ));
+    }
+    if !ast.body.stmts[2..].iter().all(|stmt| {
+        matches!(
+            stmt,
+            AstStmt::LocalDecl(decl)
+                if matches!(decl.values.as_slice(), [AstExpr::FunctionExpr(_)])
+        )
+    }) {
+        return Err(proto_failure_contract_failure(
+            entry,
+            "permissive root did not preserve every child as a diagnostic function",
+        ));
+    }
+
+    Ok(baseline)
+}
+
+fn proto_failure_contract_failure(
+    entry: &LuaCaseManifestEntry,
+    detail: impl Into<String>,
+) -> TestFailure {
+    TestFailure::new(
+        FailureKind::ResidualContractAssertionFailed,
+        "proto failure recovery contract failed",
+        format!(
+            "proto failure recovery contract failed for {}: {}",
+            entry.path,
+            detail.into()
+        ),
+    )
 }
 
 fn run_table_set_list_residual_contract(

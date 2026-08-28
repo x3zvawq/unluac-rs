@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 
 use crate::decompile::{DecompileContext, DecompileError, DecompileState};
 use crate::generate::GenerateMode;
-use crate::hir::{HirBlock, HirGenericFor, HirModule, HirStmt, TempId};
+use crate::hir::{HirBlock, HirClosureExpr, HirGenericFor, HirModule, HirStmt, TempId};
 use crate::structure::{BlockRef, ControlFlowFeature, PhiId, PlanRequirement, StructureFacts};
 use crate::transformer::Reg;
 
@@ -22,9 +22,9 @@ use self::analysis::{
 };
 use self::exprs::PackLoweringContext;
 use super::common::{
-    AstBindingRef, AstBlock, AstCallStmt, AstGenericFor, AstGoto, AstIf, AstLabel, AstLabelId,
-    AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstModule, AstNumericFor,
-    AstRepeat, AstReturn, AstStmt, AstTargetDialect, AstWhile,
+    AstBindingRef, AstBlock, AstCallStmt, AstExpr, AstGenericFor, AstGoto, AstIf, AstLabel,
+    AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstModule,
+    AstNumericFor, AstRepeat, AstReturn, AstStmt, AstTargetDialect, AstWhile,
 };
 use super::error::AstLowerError;
 
@@ -110,21 +110,18 @@ fn collect_plan_diagnostics(root: &StructureFacts) -> Vec<PlanDiagnostic> {
     let mut stack = vec![root];
     let mut proto = 0usize;
     while let Some(facts) = stack.pop() {
-        diagnostics.extend(
-            facts
-                .plan()
-                .requirements()
-                .unavailable_features()
-                .iter()
-                .copied()
-                .map(|feature| PlanDiagnostic::UnavailableFeature { proto, feature }),
-        );
-        diagnostics.extend(
-            facts
-                .plan()
-                .requirements()
-                .iter()
-                .filter_map(|(_, requirement)| match requirement {
+        if let Some(ready) = facts.ready() {
+            diagnostics.extend(
+                ready
+                    .plan()
+                    .requirements()
+                    .unavailable_features()
+                    .iter()
+                    .copied()
+                    .map(|feature| PlanDiagnostic::UnavailableFeature { proto, feature }),
+            );
+            diagnostics.extend(ready.plan().requirements().iter().filter_map(
+                |(_, requirement)| match requirement {
                     PlanRequirement::UnresolvedValue { phi_id, block, reg } => {
                         Some(PlanDiagnostic::UnresolvedValue {
                             proto,
@@ -136,8 +133,9 @@ fn collect_plan_diagnostics(root: &StructureFacts) -> Vec<PlanDiagnostic> {
                     PlanRequirement::Goto { .. }
                     | PlanRequirement::Continue { .. }
                     | PlanRequirement::MultiEntryIsland { .. } => None,
-                }),
-        );
+                },
+            ));
+        }
         proto += 1;
         stack.extend(facts.children.iter().rev());
     }
@@ -210,7 +208,39 @@ impl<'a> AstLowerer<'a> {
                     child: proto_index,
                 })?;
         let close_temps = collect_close_temps(&proto.body);
-        self.lower_block(proto_index, &proto.body, Some(&close_temps), None)
+        let mut body = self.lower_block(proto_index, &proto.body, Some(&close_temps), None)?;
+        if let Some(failure) = &proto.failure {
+            if !self.should_recover_errors() {
+                return Err(AstLowerError::ResidualHir {
+                    proto: proto_index,
+                    kind: "proto recovery failure",
+                });
+            }
+            body.stmts.insert(0, AstStmt::Error(failure.diagnostic()));
+            if !proto.detached_children.is_empty() {
+                body.stmts.push(AstStmt::Error(format!(
+                    "proto#{} failed before child closure placement and captures were recovered; direct child protos follow as detached diagnostic functions",
+                    failure.proto,
+                )));
+            }
+            for (binding, child) in &proto.detached_children {
+                let function = self.lower_function_expr(
+                    proto_index,
+                    &HirClosureExpr {
+                        proto: *child,
+                        captures: Vec::new(),
+                    },
+                )?;
+                body.stmts.push(AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![self.recovered_local_binding(
+                        AstBindingRef::Local(*binding),
+                        AstLocalAttr::None,
+                    )],
+                    values: vec![AstExpr::FunctionExpr(Box::new(function))],
+                })));
+            }
+        }
+        Ok(body)
     }
 
     fn lower_block(

@@ -27,7 +27,7 @@ mod table_constructors;
 mod temp_inline;
 mod temp_touch;
 mod visit;
-mod walk;
+pub(crate) mod walk;
 
 use crate::ast::ReadabilityOptions;
 use crate::debug::DebugFilters;

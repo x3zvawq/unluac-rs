@@ -67,7 +67,7 @@ pub(super) fn rewrite_stmts(stmts: &mut [HirStmt], pass: &mut impl HirRewritePas
     changed
 }
 
-pub(super) trait ExprRewritePass {
+pub(crate) trait ExprRewritePass {
     fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool;
 
     fn rewrite_condition_expr(&mut self, expr: &mut HirExpr) -> bool {
@@ -75,7 +75,7 @@ pub(super) trait ExprRewritePass {
     }
 }
 
-pub(super) fn rewrite_proto_exprs(proto: &mut HirProto, pass: &mut impl ExprRewritePass) -> bool {
+pub(crate) fn rewrite_proto_exprs(proto: &mut HirProto, pass: &mut impl ExprRewritePass) -> bool {
     let mut adapter = ExprRewritePassAdapter { pass };
     rewrite_proto(proto, &mut adapter)
 }

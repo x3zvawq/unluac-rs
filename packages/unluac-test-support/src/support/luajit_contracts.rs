@@ -453,11 +453,14 @@ pub(super) fn run_unsupported_island_contract(
         structure.state.structure_facts.as_ref().ok_or_else(|| {
             structure_contract_failure("structure stage returned no StructureFacts")
         })?;
-    let has_island = facts
+    let ready = facts.ready().ok_or_else(|| {
+        structure_contract_failure("structure fixture unexpectedly produced a failed proto")
+    })?;
+    let has_island = ready
         .plan()
         .regions()
         .any(|(_, region)| matches!(region, RegionPlan::Unstructured { .. }));
-    let requires_goto = facts
+    let requires_goto = ready
         .plan()
         .requirements()
         .unavailable_features()

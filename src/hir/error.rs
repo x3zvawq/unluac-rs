@@ -32,6 +32,8 @@ pub enum HirLowerError {
         "HIR cannot recover repeated captured shared closure s{shared_index} at instruction @{instr} as one lexical factory"
     )]
     UnrepresentableRepeatedCapturedSharedClosure { shared_index: usize, instr: usize },
+    #[error("failed HIR proto still references discarded composite proto#{proto}")]
+    DiscardedCompositeStillReferenced { proto: usize },
 }
 
 impl HirLowerError {

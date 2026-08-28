@@ -193,7 +193,7 @@ pub(super) struct CapturedSlotInputs<'a> {
     pub(super) cfg: &'a Cfg,
     pub(super) graph: &'a GraphFacts,
     pub(super) dataflow: &'a DataflowFacts,
-    pub(super) structure: &'a StructureFacts,
+    pub(super) structure: &'a ReadyStructureFacts,
     pub(super) epochs: &'a SlotEpochFacts,
     pub(super) child_mutable_upvalues: &'a [Vec<bool>],
     pub(super) numeric_binding_phis: &'a [bool],

@@ -19,16 +19,18 @@ use super::shared_closures::{
 use super::structure::build_structured_body;
 use crate::ast::AstTargetDialect;
 use crate::decompile::{DecompileContext, DecompileState};
+use crate::generate::GenerateMode;
 use crate::hir::HirLowerError;
 use crate::hir::common::{
     HirBlock, HirCapture, HirCaptureMode, HirClosureExpr, HirExpr, HirLValue, HirLocalDecl,
     HirProto, HirProtoRef, HirStmt, HirValuePack, LocalId, ParamId, TempId, UpvalueId,
 };
-use crate::structure::StructureFacts;
+use crate::recovery::{ProtoArtifactStage, ProtoFailure};
 use crate::structure::{
     BlockRef, CanonicalMoveIndex, Cfg, CfgGraph, DataflowFacts, GraphFacts, OpenDefId, PhiId,
     SsaValue,
 };
+use crate::structure::{ReadyStructureFacts, StructureFacts};
 use crate::transformer::{
     AccessBase, AccessKey, CallKind, CaptureSource, ClosureCreation, GetTableKind, InstrRef,
     LowInstr, LoweredProto, ProtoRef, Reg, ResultPack, SharedClosureRef, ValuePack,
@@ -143,7 +145,7 @@ pub(super) struct ProtoLowering<'a> {
     pub(super) proto: &'a LoweredProto,
     pub(super) cfg: &'a Cfg,
     pub(super) dataflow: &'a DataflowFacts,
-    pub(super) structure: &'a StructureFacts,
+    pub(super) structure: &'a ReadyStructureFacts,
     pub(super) child_refs: &'a [HirProtoRef],
     pub(super) bindings: ProtoBindings,
     pub(super) shared_closure_locals: BTreeMap<SharedClosureRef, (LocalId, ProtoRef)>,
@@ -170,8 +172,9 @@ pub(super) struct LowerArtifacts {
     pub(super) promotion_facts: Vec<ProtoPromotionFacts>,
 }
 
-struct LoweredProtoResult {
-    id: HirProtoRef,
+pub(super) struct LoweredProtoResult {
+    pub(super) id: HirProtoRef,
+    source_proto_id: usize,
     mutable_upvalues: Vec<bool>,
 }
 
@@ -182,11 +185,21 @@ struct ProtoLowerFrame<'a> {
     graph_facts: &'a GraphFacts,
     dataflow: &'a DataflowFacts,
     structure: &'a StructureFacts,
-    captured_shared_plan: SharedClosurePlan,
     id: HirProtoRef,
+    source_proto_id: usize,
+    captured_shared_plan: Option<Result<SharedClosurePlan, HirLowerError>>,
     composite_protos: Vec<HirProtoRef>,
     next_child: usize,
     child_results: Vec<LoweredProtoResult>,
+}
+
+#[derive(Clone, Copy)]
+struct ProtoNodeFacts<'a> {
+    proto: &'a LoweredProto,
+    cfg_graph: &'a CfgGraph,
+    graph_facts: &'a GraphFacts,
+    dataflow: &'a DataflowFacts,
+    structure: &'a StructureFacts,
 }
 
 pub(super) fn lower_proto(
@@ -201,67 +214,69 @@ pub(super) fn lower_proto(
     let structure = state.require_structure_facts()?;
     Ok(lower_proto_node(
         context.requested_target,
-        &lowered.main,
-        cfg,
-        graph_facts,
-        dataflow,
-        structure,
+        ProtoNodeFacts {
+            proto: &lowered.main,
+            cfg_graph: cfg,
+            graph_facts,
+            dataflow,
+            structure,
+        },
         artifacts,
+        context.options.generate.mode == GenerateMode::Permissive,
     )?
     .id)
 }
 
 fn lower_proto_node(
     target: AstTargetDialect,
-    proto: &LoweredProto,
-    cfg_graph: &CfgGraph,
-    graph_facts: &GraphFacts,
-    dataflow: &DataflowFacts,
-    structure: &StructureFacts,
+    node: ProtoNodeFacts<'_>,
     artifacts: &mut LowerArtifacts,
+    recover_failures: bool,
 ) -> Result<LoweredProtoResult, HirLowerError> {
     fn make_frame<'a>(
         target: AstTargetDialect,
-        proto: &'a LoweredProto,
-        cfg_graph: &'a CfgGraph,
-        graph_facts: &'a GraphFacts,
-        dataflow: &'a DataflowFacts,
-        structure: &'a StructureFacts,
+        node: ProtoNodeFacts<'a>,
         artifacts: &mut LowerArtifacts,
-    ) -> Result<ProtoLowerFrame<'a>, HirLowerError> {
-        let captured_shared_plan =
-            build_shared_closure_plan(proto, cfg_graph, graph_facts, dataflow, structure.plan())?;
+        source_proto_id: usize,
+    ) -> ProtoLowerFrame<'a> {
         let id = HirProtoRef(artifacts.protos.len());
         artifacts.protos.push(empty_proto(id));
         artifacts
             .promotion_facts
             .push(ProtoPromotionFacts::default());
-        let composite_protos =
-            reserve_composite_factory_protos(captured_shared_plan.composites().len(), artifacts);
-        Ok(ProtoLowerFrame {
+        let captured_shared_plan = node.structure.ready().map(|structure| {
+            build_shared_closure_plan(
+                node.proto,
+                node.cfg_graph,
+                node.graph_facts,
+                node.dataflow,
+                structure.plan(),
+            )
+        });
+        let composite_protos = captured_shared_plan
+            .as_ref()
+            .and_then(|plan| plan.as_ref().ok())
+            .map_or_else(Vec::new, |plan| {
+                reserve_composite_factory_protos(plan.composites().len(), artifacts)
+            });
+        ProtoLowerFrame {
             target,
-            proto,
-            cfg_graph,
-            graph_facts,
-            dataflow,
-            structure,
-            captured_shared_plan,
+            proto: node.proto,
+            cfg_graph: node.cfg_graph,
+            graph_facts: node.graph_facts,
+            dataflow: node.dataflow,
+            structure: node.structure,
             id,
+            source_proto_id,
+            captured_shared_plan,
             composite_protos,
             next_child: 0,
             child_results: Vec::new(),
-        })
+        }
     }
 
-    let mut stack = vec![make_frame(
-        target,
-        proto,
-        cfg_graph,
-        graph_facts,
-        dataflow,
-        structure,
-        artifacts,
-    )?];
+    let mut stack = vec![make_frame(target, node, artifacts, 0)];
+    let mut next_source_proto_id = 1usize;
     loop {
         let child = {
             let frame = stack.last_mut().expect("HIR proto frame is non-empty");
@@ -297,20 +312,55 @@ fn lower_proto_node(
             child_structure,
         )) = child
         {
+            let source_proto_id = next_source_proto_id;
+            next_source_proto_id += 1;
             stack.push(make_frame(
                 target,
-                child_proto,
-                child_cfg,
-                child_graph,
-                child_dataflow,
-                child_structure,
+                ProtoNodeFacts {
+                    proto: child_proto,
+                    cfg_graph: child_cfg,
+                    graph_facts: child_graph,
+                    dataflow: child_dataflow,
+                    structure: child_structure,
+                },
                 artifacts,
-            )?);
+                source_proto_id,
+            ));
             continue;
         }
 
-        let frame = stack.pop().expect("HIR proto frame is non-empty");
-        let result = lower_proto_one(frame, artifacts)?;
+        let mut frame = stack.pop().expect("HIR proto frame is non-empty");
+        let result = if let Some(failure) = frame.structure.failure() {
+            fill_failed_proto(&frame, failure.clone(), artifacts)
+        } else {
+            match lower_proto_one(&mut frame, artifacts) {
+                Ok(result) => result,
+                Err(error) if recover_failures => {
+                    super::artifact_recovery::discard_composite_factory_protos(
+                        &mut frame.composite_protos,
+                        &mut frame.child_results,
+                        artifacts,
+                    )?;
+                    let ready = frame
+                        .structure
+                        .ready()
+                        .ok_or_else(|| HirLowerError::invalid("missing ready structure facts"))?;
+                    let failure = ProtoFailure {
+                        proto: frame.source_proto_id,
+                        failed_stage: ProtoArtifactStage::Hir,
+                        last_completed_stage: ProtoArtifactStage::Structure,
+                        error: error.to_string().into(),
+                        last_completed_dump: crate::structure::dump_structure_proto(
+                            frame.source_proto_id,
+                            ready,
+                        )
+                        .into(),
+                    };
+                    fill_failed_proto(&frame, failure, artifacts)
+                }
+                Err(error) => return Err(error),
+            }
+        };
         if let Some(parent) = stack.last_mut() {
             parent.child_results.push(result);
         } else {
@@ -320,30 +370,33 @@ fn lower_proto_node(
 }
 
 fn lower_proto_one(
-    frame: ProtoLowerFrame<'_>,
+    frame: &mut ProtoLowerFrame<'_>,
     artifacts: &mut LowerArtifacts,
 ) -> Result<LoweredProtoResult, HirLowerError> {
-    let ProtoLowerFrame {
-        target,
-        proto,
-        cfg_graph,
-        graph_facts,
-        dataflow,
-        structure,
-        captured_shared_plan,
-        id,
-        composite_protos,
-        next_child: _,
-        child_results,
-    } = frame;
+    let target = frame.target;
+    let proto = frame.proto;
+    let cfg_graph = frame.cfg_graph;
+    let graph_facts = frame.graph_facts;
+    let dataflow = frame.dataflow;
+    let structure = frame
+        .structure
+        .ready()
+        .ok_or_else(|| HirLowerError::invalid("missing ready structure facts"))?;
+    let id = frame.id;
+    let captured_shared_plan = frame
+        .captured_shared_plan
+        .take()
+        .ok_or_else(|| HirLowerError::invalid("missing HIR proto lowering plan"))??;
+    let composite_protos = frame.composite_protos.clone();
+    let child_results = &frame.child_results;
     let cfg = &cfg_graph.cfg;
     let child_refs = child_results
         .iter()
         .map(|child| child.id)
         .collect::<Vec<_>>();
     let child_mutable_upvalues = child_results
-        .into_iter()
-        .map(|child| child.mutable_upvalues)
+        .iter()
+        .map(|child| child.mutable_upvalues.clone())
         .collect::<Vec<_>>();
     fill_composite_factory_protos(
         proto,
@@ -367,7 +420,7 @@ fn lower_proto_one(
         build_shared_closure_locals(proto, &captured_shared_plan, &mut bindings);
     let captured_shared_closures = CapturedSharedClosureLowering::new(
         captured_shared_plan,
-        composite_protos,
+        composite_protos.clone(),
         proto,
         dataflow,
         &mut bindings,
@@ -410,6 +463,8 @@ fn lower_proto_one(
         temp_debug_scopes: lowering.bindings.temp_debug_scopes.clone(),
         body: build_proto_body(id, &lowering)?,
         children: lowering.hir_children(),
+        failure: None,
+        detached_children: Vec::new(),
     };
     artifacts.promotion_facts[id.index()] = ProtoPromotionFacts::from_plan(
         proto,
@@ -422,8 +477,80 @@ fn lower_proto_one(
 
     Ok(LoweredProtoResult {
         id,
+        source_proto_id: frame.source_proto_id,
         mutable_upvalues: mutable_upvalues_for_proto(proto, &child_mutable_upvalues),
     })
+}
+
+fn fill_failed_proto(
+    frame: &ProtoLowerFrame<'_>,
+    failure: ProtoFailure,
+    artifacts: &mut LowerArtifacts,
+) -> LoweredProtoResult {
+    let proto = frame.proto;
+    let id = frame.id;
+    let named_vararg_locals = usize::from(proto.signature.has_vararg_param_reg);
+    let detached_children = frame
+        .child_results
+        .iter()
+        .enumerate()
+        .map(|(index, child)| (LocalId(named_vararg_locals + index), child.id))
+        .collect::<Vec<_>>();
+    let locals = (0..named_vararg_locals + detached_children.len())
+        .map(LocalId)
+        .collect::<Vec<_>>();
+    let mut local_debug_hints = vec![None; named_vararg_locals];
+    local_debug_hints.extend(
+        frame
+            .child_results
+            .iter()
+            .map(|child| Some(format!("unluac_proto_{}", child.source_proto_id))),
+    );
+    let child_mutable_upvalues = frame
+        .child_results
+        .iter()
+        .map(|child| child.mutable_upvalues.clone())
+        .collect::<Vec<_>>();
+
+    artifacts.protos[id.index()] = HirProto {
+        id,
+        source: proto.source.as_ref().map(decode_raw_string),
+        line_range: proto.line_range,
+        signature: proto.signature,
+        params: (0..usize::from(proto.signature.num_params))
+            .map(ParamId)
+            .collect(),
+        param_debug_hints: vec![None; usize::from(proto.signature.num_params)],
+        locals,
+        local_debug_hints,
+        physical_root_locals: BTreeSet::new(),
+        upvalues: (0..usize::from(proto.upvalues.common.count))
+            .map(UpvalueId)
+            .collect(),
+        upvalue_debug_hints: (0..usize::from(proto.upvalues.common.count))
+            .map(|index| {
+                proto
+                    .debug_info
+                    .common
+                    .upvalue_names
+                    .get(index)
+                    .and_then(|name| name.as_ref().map(decode_raw_string))
+            })
+            .collect(),
+        temps: Vec::new(),
+        temp_debug_locals: Vec::new(),
+        temp_debug_scopes: Vec::new(),
+        body: HirBlock::default(),
+        children: frame.child_results.iter().map(|child| child.id).collect(),
+        failure: Some(failure),
+        detached_children,
+    };
+
+    LoweredProtoResult {
+        id,
+        source_proto_id: frame.source_proto_id,
+        mutable_upvalues: mutable_upvalues_for_proto(proto, &child_mutable_upvalues),
+    }
 }
 
 fn mutable_upvalues_for_proto(
@@ -747,6 +874,8 @@ fn build_composite_factory_proto(
         temp_debug_scopes: Vec::new(),
         body,
         children,
+        failure: None,
+        detached_children: Vec::new(),
     })
 }
 

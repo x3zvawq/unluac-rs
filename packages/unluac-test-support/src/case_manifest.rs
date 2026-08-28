@@ -17,6 +17,7 @@ mod regressions_321;
 mod regressions_322;
 mod regressions_323;
 mod regressions_324;
+mod regressions_325;
 mod unit_cases;
 
 use regressions_001_100::REGRESSION_CASES_001_100;
@@ -28,6 +29,7 @@ use regressions_321::REGRESSION_CASES_321;
 use regressions_322::REGRESSION_CASES_322;
 use regressions_323::REGRESSION_CASES_323;
 use regressions_324::REGRESSION_CASES_324;
+use regressions_325::REGRESSION_CASES_325;
 use unit_cases::UNIT_CASES;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Display, IntoStaticStr)]
@@ -116,6 +118,7 @@ pub(crate) enum LuaCaseExpectation {
     InvalidDebugStillRejected,
     LuaJitBuiltinTableRemove,
     LuaJitMethodProtocol,
+    ProtoFailureRecovery,
     UnsupportedIsland { jump_pc: usize, target_pc: usize },
 }
 
@@ -331,6 +334,7 @@ pub(crate) fn regression_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {
         REGRESSION_CASES_322,
         REGRESSION_CASES_323,
         REGRESSION_CASES_324,
+        REGRESSION_CASES_325,
     ]
     .into_iter()
     .flat_map(manifest_entries)

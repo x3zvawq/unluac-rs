@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 
 use crate::LuaString;
 use crate::parser::{ProtoLineRange, ProtoSignature};
+use crate::recovery::ProtoFailure;
 use crate::transformer::FastCallArgs;
 use crate::transformer::InstrRef;
 
@@ -41,6 +42,10 @@ pub struct HirProto {
     pub temp_debug_scopes: Vec<Option<usize>>,
     pub body: HirBlock,
     pub children: Vec<HirProtoRef>,
+    /// 当前 proto 无法继续降低时保留的分层诊断；成功 proto 为 `None`。
+    pub failure: Option<ProtoFailure>,
+    /// 失败父节点无法恢复原 closure 放置时，仍以诊断 local 展示的直接子 proto。
+    pub detached_children: Vec<(LocalId, HirProtoRef)>,
 }
 
 /// proto 的稳定引用。

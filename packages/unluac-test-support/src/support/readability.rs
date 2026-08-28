@@ -267,7 +267,9 @@ pub(super) fn structure_facts_match_contract(
     contract: LuaCaseStructureContract,
 ) -> bool {
     let LuaCaseStructureContract::MixedUnstructuredChildLoop { protocol, .. } = contract;
-    plan_contains_mixed_unstructured_child_loop(facts.plan(), protocol)
+    facts
+        .ready()
+        .is_some_and(|ready| plan_contains_mixed_unstructured_child_loop(ready.plan(), protocol))
         || facts
             .children
             .iter()

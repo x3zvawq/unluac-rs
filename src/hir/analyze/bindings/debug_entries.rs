@@ -9,7 +9,7 @@ use super::*;
 /// `LocalId`，后续同 scope 的 def/phi temp 都写回这个绑定。
 pub(super) fn allocate_debug_entry_locals(
     proto: &LoweredProto,
-    structure: &StructureFacts,
+    structure: &ReadyStructureFacts,
     entry_local_regs: &mut BTreeMap<Reg, LocalId>,
     locals: &mut Vec<LocalId>,
     local_debug_hints: &mut Vec<Option<String>>,
