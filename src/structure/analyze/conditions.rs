@@ -90,22 +90,16 @@ pub(super) fn selected_conditions(
         else {
             continue;
         };
-        let input = ConditionPlanInput {
-            arcs: synthesize_direct_condition_arcs(
-                proto,
-                cfg,
-                &candidate,
-                &mut condition_arc_workspace,
-            )?
-            .unwrap_or_default(),
-            candidate: candidate.clone(),
-        };
+        let arcs =
+            synthesize_direct_condition_arcs(proto, cfg, &candidate, &mut condition_arc_workspace)?
+                .unwrap_or_default();
+        let input = normalized_condition_input(candidate, arcs);
         if input.arcs.is_empty() || !condition_terminal_actions_are_uniform(&input, &edge_actions) {
             continue;
         }
         let score = score_condition(&input, index);
         let replace = selected
-            .get(&candidate.header)
+            .get(&input.candidate.header)
             .is_none_or(|(current, old)| score > score_condition(old, *current));
         if replace {
             selected.insert(input.candidate.header, (index, input));
@@ -138,7 +132,7 @@ pub(super) fn selected_conditions(
             synthesize_direct_condition_arcs(proto, cfg, &candidate, &mut condition_arc_workspace)?
                 .unwrap_or_default()
         };
-        let input = ConditionPlanInput { candidate, arcs };
+        let input = normalized_condition_input(candidate, arcs);
         if input.arcs.is_empty() || !condition_terminal_actions_are_uniform(&input, &edge_actions) {
             continue;
         }
@@ -184,6 +178,23 @@ pub(super) fn selected_conditions(
         by_header.insert(header, id);
     }
     Ok((conditions, by_header))
+}
+
+/// Keep the logical condition candidate and its physical CFG evidence in sync.
+///
+/// A short-circuit arc may cross a side-effect-free jump block before reaching its
+/// semantic target. That connector is part of the condition's owned region even
+/// though it is not a decision node, so every condition producer must include it
+/// before branch ranges and region ownership are materialized.
+fn normalized_condition_input(
+    mut candidate: ShortCircuitCandidate,
+    arcs: Vec<ConditionArcEvidence>,
+) -> ConditionPlanInput {
+    candidate.blocks.extend(
+        arcs.iter()
+            .flat_map(|arc| arc.connector_blocks.iter().copied()),
+    );
+    ConditionPlanInput { candidate, arcs }
 }
 
 pub(super) fn compose_adjacent_condition_guards(
@@ -655,8 +666,9 @@ pub(super) fn simple_condition_input(
         value_incomings: Vec::new(),
         reducible: true,
     };
-    Some(ConditionPlanInput {
-        arcs: vec![
+    Some(normalized_condition_input(
+        candidate,
+        vec![
             ConditionArcEvidence {
                 source: ShortCircuitNodeRef(0),
                 truthy: true,
@@ -672,8 +684,7 @@ pub(super) fn simple_condition_input(
                 target: ShortCircuitTarget::FalsyExit,
             },
         ],
-        candidate,
-    })
+    ))
 }
 
 pub(super) fn required_loop_condition_header(
