@@ -6,6 +6,7 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,9 +18,17 @@ use unluac::decompile::{
 use unluac::parser::{ParseMode, StringDecodeMode, StringEncoding};
 
 use super::{
-    CliArgs, CompilerProtocol, OUTPUT_ONLY_SUPPORTS_FINAL_SOURCE, build_compile_command,
-    emit_generated_source, parse_args,
+    CliArgs, CliError, CompilerProtocol, OUTPUT_ONLY_SUPPORTS_FINAL_SOURCE, build_compile_command,
+    emit_generated_source, parse_args, read_stdin, resolve_input_path,
 };
+
+struct FailingReader;
+
+impl Read for FailingReader {
+    fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::new(io::ErrorKind::BrokenPipe, "input closed"))
+    }
+}
 
 fn args(values: &[&str]) -> Vec<OsString> {
     std::iter::once(OsString::from("unluac-cli"))
@@ -63,6 +72,38 @@ fn requires_explicit_input_or_source() {
         rendered.contains("--input <INPUT>") || rendered.contains("--source <SOURCE>"),
         "unexpected clap error: {rendered}"
     );
+}
+
+#[test]
+fn dash_input_resolves_to_stdin() {
+    let options = parse_args(args(&["--input", "-"])).expect("dash input should parse");
+    assert_eq!(
+        resolve_input_path(&options).expect("input should resolve"),
+        None
+    );
+}
+
+#[test]
+fn stdin_reader_returns_all_bytes() {
+    let bytes = read_stdin(Cursor::new(b"lua-bytecode".to_vec())).expect("stdin should read");
+    assert_eq!(bytes, b"lua-bytecode");
+}
+
+#[test]
+fn stdin_reader_maps_errors_to_cli_error() {
+    let error = read_stdin(FailingReader).expect_err("stdin read should fail");
+    match error {
+        CliError::Io {
+            action,
+            path,
+            source,
+        } => {
+            assert_eq!(action, "read input chunk");
+            assert_eq!(path, PathBuf::from("-"));
+            assert_eq!(source.kind(), io::ErrorKind::BrokenPipe);
+        }
+        other => panic!("unexpected CLI error: {other:?}"),
+    }
 }
 
 #[test]

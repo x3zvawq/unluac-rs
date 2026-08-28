@@ -51,16 +51,12 @@ where
     let options = parse_args(args)?;
     let input_source = resolve_input_path(&options)?;
     let bytes = match input_source {
-        None => {
-            let mut buffer = Vec::new();
-            std::io::stdin().read_to_end(&mut buffer).unwrap();
-            buffer
-        }
+        None => read_stdin(std::io::stdin())?,
         Some(path) => fs::read(&path).map_err(|source| CliError::Io {
             action: "read input chunk",
             path: path.clone(),
             source,
-        })?
+        })?,
     };
     let debug_detail = options.decompile.debug.detail;
     let debug_color = options.decompile.debug.color;
@@ -132,9 +128,25 @@ fn emit_generated_source<'a>(
     Ok(Some(source))
 }
 
+fn read_stdin<R: Read>(mut reader: R) -> Result<Vec<u8>, CliError> {
+    let mut buffer = Vec::new();
+    reader
+        .read_to_end(&mut buffer)
+        .map_err(|source| CliError::Io {
+            action: "read input chunk",
+            path: PathBuf::from("-"),
+            source,
+        })?;
+    Ok(buffer)
+}
+
 fn resolve_input_path(options: &CliOptions) -> Result<Option<PathBuf>, CliError> {
     if let Some(input) = options.input.as_ref() {
-        return Ok(if Path::new("-") == input {None} else {Some(input.clone())});
+        return Ok(if Path::new("-") == input {
+            None
+        } else {
+            Some(input.clone())
+        });
     }
 
     let source = options

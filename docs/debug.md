@@ -36,7 +36,7 @@ cargo unluac -i /path/to/chunk.out -D lua5.4 --dump-pass temp-inline --proto 2
 
 | 参数            | 作用                             |
 | --------------- | -------------------------------- |
-| `-i/--input`    | 输入已编译 chunk                 |
+| `-i/--input`    | 输入已编译 chunk；传 `-` 时从 stdin 读取 |
 | `-s/--source`   | 输入 Lua 源码并自动编译          |
 | `--strip`       | 源码编译时是否剥离 debug/local 信息（默认 `true`） |
 | `--ignore-debug` | 仍解析并校验 debug 段，但不让它参与恢复或生成注释（默认 `false`） |

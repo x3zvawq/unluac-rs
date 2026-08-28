@@ -86,11 +86,13 @@ unluac-cli -s tests/unit-case/lua51_01.lua -D lua5.1
 unluac-cli -s tests/unit-case/lua51_01.lua -D lua5.1 --strip false
 unluac-cli -s tests/unit-case/lua51_01.lua -D lua5.1 --strip false --ignore-debug
 unluac-cli -i /absolute/path/to/chunk.out -D lua5.1 -o /tmp/case.lua
+cat /absolute/path/to/chunk.out | unluac-cli -i - -D lua5.1
 ```
 
 Notes:
 
 - The CLI requires either `-i/--input` or `-s/--source`
+- Pass `-i -` to read a compiled chunk from stdin, which is useful in shell pipelines
 - When `-s/--source` is provided, the CLI first invokes an external compiler to produce a chunk, then decompiles that generated chunk
 - Source compilation strips debug/local metadata by default; pass `--strip false` to retain it
 - Available debug metadata is used as high-confidence binding and naming evidence in every naming mode; pass `--ignore-debug` to parse and validate it without publishing it to recovery or generated comments
@@ -108,7 +110,7 @@ Input options:
 | Argument | Description | Default |
 | - | - | - |
 | `-D`, `--dialect` | Dialect used for compilation / decompilation (`auto` detects compiled bytecode headers) | `auto` |
-| `-i`, `--input` | Path to a compiled chunk | None |
+| `-i`, `--input` | Path to a compiled chunk, or `-` for stdin | None |
 | `-s`, `--source` | Path to Lua source; the CLI invokes an external compiler before decompiling | None |
 | `-l`, `--luac` | Explicit compiler path used by `--source` | First tries `lua/build/<dialect>/`, otherwise falls back to a compatible compiler on PATH |
 | `--strip <BOOL>` | Whether source compilation strips debug and local-variable metadata | `true` |

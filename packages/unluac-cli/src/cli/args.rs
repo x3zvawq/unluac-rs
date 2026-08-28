@@ -56,7 +56,7 @@ struct InputArgs {
         help_heading = "Input"
     )]
     dialect: Option<DecompileDialect>,
-    /// Existing compiled chunk path.
+    /// Existing compiled chunk path, or `-` to read a chunk from stdin.
     #[arg(
         short = 'i',
         long,
