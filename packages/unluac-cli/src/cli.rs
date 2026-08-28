@@ -7,6 +7,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -48,12 +49,19 @@ where
     I::Item: Into<std::ffi::OsString> + Clone,
 {
     let options = parse_args(args)?;
-    let input_path = resolve_input_path(&options)?;
-    let bytes = fs::read(&input_path).map_err(|source| CliError::Io {
-        action: "read input chunk",
-        path: input_path.clone(),
-        source,
-    })?;
+    let input_source = resolve_input_path(&options)?;
+    let bytes = match input_source {
+        None => {
+            let mut buffer = Vec::new();
+            std::io::stdin().read_to_end(&mut buffer).unwrap();
+            buffer
+        }
+        Some(path) => fs::read(&path).map_err(|source| CliError::Io {
+            action: "read input chunk",
+            path: path.clone(),
+            source,
+        })?
+    };
     let debug_detail = options.decompile.debug.detail;
     let debug_color = options.decompile.debug.color;
     let list_protos = options.list_protos;
@@ -124,16 +132,16 @@ fn emit_generated_source<'a>(
     Ok(Some(source))
 }
 
-fn resolve_input_path(options: &CliOptions) -> Result<PathBuf, CliError> {
+fn resolve_input_path(options: &CliOptions) -> Result<Option<PathBuf>, CliError> {
     if let Some(input) = options.input.as_ref() {
-        return Ok(input.clone());
+        return Ok(if Path::new("-") == input {None} else {Some(input.clone())});
     }
 
     let source = options
         .source
         .as_ref()
         .ok_or_else(|| CliError::Usage("missing `--input` or `--source`".to_owned()))?;
-    compile_source(options, source)
+    compile_source(options, source).map(Some)
 }
 
 fn compile_source(options: &CliOptions, source: &Path) -> Result<PathBuf, CliError> {
