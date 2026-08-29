@@ -71,7 +71,9 @@ pub(super) fn run_preserves_eval_order(
             )
         })
     {
-        // 候选拒绝[SemanticBarrier:EvalTime/EvalCount]：循环内可写快照或 lookup/call/元方法事件搬入循环头会改成体后重读或逐轮执行（regress_355、regress_373_loop_lookup_eval_count）；候选拒绝[ProofIncomplete]：只读 capture/upvalue、VarArg 单值位置及无事件运算仍缺少写入、值宽度或目标类型事实。
+        // 候选拒绝[SemanticBarrier:EvalTime]：循环内可写快照搬入循环头会改成体后重读；
+        // 候选拒绝[SemanticBarrier:EvalCount]：lookup/call/元方法事件会从一次变成逐轮执行（regress_355、regress_373_loop_lookup_eval_count）；
+        // 候选拒绝[ProofIncomplete]：只读 capture/upvalue、VarArg 单值位置及无事件运算仍缺少写入、值宽度或目标类型事实。
         return false;
     }
     let expected = candidates

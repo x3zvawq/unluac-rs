@@ -11,12 +11,12 @@
 use std::collections::BTreeSet;
 
 use crate::hir::common::{
-    HirBlock, HirExpr, HirLValue, HirLabelId, HirProto, HirStmt, LocalId, TempId,
+    HirBlock, HirDebugScope, HirExpr, HirLValue, HirLabelId, HirProto, HirStmt, LocalId, TempId,
 };
 use crate::transformer::InstrRef;
 
 use super::label_refs::count_label_references;
-use super::visit::{HirVisitor, visit_stmts};
+use super::visit::{HirVisitor, visit_proto, visit_stmts};
 use super::walk::{HirRewritePass, for_each_nested_block_mut, rewrite_proto};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,27 +60,126 @@ impl ScopeActivity {
 }
 
 pub(super) fn materialize_tbc_close_scopes_in_proto(proto: &mut HirProto) -> bool {
-    rewrite_proto(proto, &mut CloseScopePass)
+    let mut pass = CloseScopePass {
+        local_debug_scopes: proto.local_debug_scopes.clone(),
+        temp_debug_scopes: proto.temp_debug_scopes.clone(),
+        debug_scopes: proto.debug_scopes.clone(),
+    };
+    rewrite_proto(proto, &mut pass)
 }
 
-struct CloseScopePass;
+/// 返回仍被 close-scope materialization 当作 TBC active-set 边界读取的 label。
+///
+/// 事实必须按直接 block 与同槽 TBC epoch 收集：active label 决定资源作用域仍在继续，
+/// 第一个 inactive label 决定作用域终点，二者在 raw Close 被消费前都不能由 dead-labels
+/// 删除。嵌套 block 有自己的词法 owner，不能因为 sibling 存在 TBC/Close 就整棵 proto
+/// 一律保护。
+pub(super) fn pending_tbc_boundary_labels_in_proto(proto: &HirProto) -> BTreeSet<HirLabelId> {
+    let mut labels = BTreeSet::new();
+    visit_proto(
+        proto,
+        &mut PendingTbcBoundaryCollector {
+            labels: &mut labels,
+        },
+    );
+    labels
+}
 
-impl HirRewritePass for CloseScopePass {
-    fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
-        materialize_block(block)
+#[cfg(test)]
+fn collect_pending_tbc_boundary_labels_in_block(
+    block: &HirBlock,
+    labels: &mut BTreeSet<HirLabelId>,
+) {
+    super::visit::visit_block(block, &mut PendingTbcBoundaryCollector { labels });
+}
+
+struct PendingTbcBoundaryCollector<'a> {
+    labels: &'a mut BTreeSet<HirLabelId>,
+}
+
+impl HirVisitor for PendingTbcBoundaryCollector<'_> {
+    fn visit_block(&mut self, block: &HirBlock) {
+        collect_direct_pending_tbc_boundary_labels(&block.stmts, self.labels);
     }
 }
 
-fn materialize_block(block: &mut HirBlock) -> bool {
-    let Some(rewritten) = rewrite_stmt_slice(&block.stmts) else {
+fn collect_direct_pending_tbc_boundary_labels(
+    stmts: &[HirStmt],
+    labels: &mut BTreeSet<HirLabelId>,
+) {
+    for index in 0..stmts.len() {
+        let Some(scope) = scope_start(stmts, index) else {
+            continue;
+        };
+        let search_start = scope.start + 2;
+        let epoch_end = tbc_epoch_end(stmts, search_start, scope.origin, scope.reg_index);
+        let epoch_stmts = &stmts[..epoch_end];
+        let has_pending_close = epoch_stmts.iter().enumerate().skip(search_start).any(
+            |(stmt_index, stmt)| match stmt {
+                HirStmt::Close(close) if close.from_reg != 0 => close.from_reg <= scope.reg_index,
+                HirStmt::Close(close) => {
+                    close.from_reg == 0
+                        && terminal_close_zero_end(epoch_stmts, stmt_index).is_some()
+                }
+                _ => scope_activity_in_stmt(stmt, scope.binding, scope.reg_index).closes_scope,
+            },
+        );
+        if !has_pending_close {
+            continue;
+        }
+
+        labels.extend(epoch_stmts.iter().skip(search_start).filter_map(|stmt| {
+            let HirStmt::Label(label) = stmt else {
+                return None;
+            };
+            Some(label.id)
+        }));
+    }
+}
+
+struct CloseScopePass {
+    local_debug_scopes: Vec<Option<usize>>,
+    temp_debug_scopes: Vec<Option<usize>>,
+    debug_scopes: Vec<Option<HirDebugScope>>,
+}
+
+impl HirRewritePass for CloseScopePass {
+    fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
+        materialize_block(
+            block,
+            &self.local_debug_scopes,
+            &self.temp_debug_scopes,
+            &self.debug_scopes,
+        )
+    }
+}
+
+fn materialize_block(
+    block: &mut HirBlock,
+    local_debug_scopes: &[Option<usize>],
+    temp_debug_scopes: &[Option<usize>],
+    debug_scopes: &[Option<HirDebugScope>],
+) -> bool {
+    let Some(rewritten) = rewrite_stmt_slice(
+        &block.stmts,
+        local_debug_scopes,
+        temp_debug_scopes,
+        debug_scopes,
+    ) else {
         return false;
     };
     block.stmts = rewritten;
     true
 }
 
-fn rewrite_stmt_slice(stmts: &[HirStmt]) -> Option<Vec<HirStmt>> {
-    let intervals = collect_scope_intervals(stmts);
+fn rewrite_stmt_slice(
+    stmts: &[HirStmt],
+    local_debug_scopes: &[Option<usize>],
+    temp_debug_scopes: &[Option<usize>],
+    debug_scopes: &[Option<HirDebugScope>],
+) -> Option<Vec<HirStmt>> {
+    let intervals =
+        collect_scope_intervals(stmts, local_debug_scopes, temp_debug_scopes, debug_scopes);
     let mut changed = !intervals.is_empty();
     let mut rewritten = if intervals.is_empty() {
         stmts.to_vec()
@@ -121,7 +220,12 @@ fn remove_terminal_close_zero(stmts: &mut Vec<HirStmt>) -> bool {
     changed
 }
 
-fn collect_scope_intervals(stmts: &[HirStmt]) -> Vec<ScopeInterval> {
+fn collect_scope_intervals(
+    stmts: &[HirStmt],
+    local_debug_scopes: &[Option<usize>],
+    temp_debug_scopes: &[Option<usize>],
+    debug_scopes: &[Option<HirDebugScope>],
+) -> Vec<ScopeInterval> {
     let mut intervals: Vec<_> = (0..stmts.len())
         .filter_map(|index| {
             let scope_start = scope_start(stmts, index)?;
@@ -132,8 +236,17 @@ fn collect_scope_intervals(stmts: &[HirStmt]) -> Vec<ScopeInterval> {
                 scope_start.binding,
                 scope_start.origin,
                 scope_start.reg_index,
+                binding_debug_scope_ends_before_return(
+                    scope_start.binding,
+                    local_debug_scopes,
+                    temp_debug_scopes,
+                    debug_scopes,
+                ),
             )?;
-            debug_assert!(scope_start.start < scope_end.end);
+            assert!(
+                scope_start.start < scope_end.end,
+                "validated close-scope interval must advance past its declaration"
+            );
             Some(ScopeInterval {
                 start: scope_start.start,
                 end: scope_end.end,
@@ -203,16 +316,9 @@ fn find_scope_end(
     binding: ScopeBinding,
     origin: InstrRef,
     reg_index: usize,
+    debug_scope_ends_before_return: bool,
 ) -> Option<ScopeEnd> {
-    let epoch_end = stmts
-        .iter()
-        .enumerate()
-        .skip(start_index)
-        .find_map(|(index, stmt)| {
-            matches!(stmt, HirStmt::ToBeClosed(next) if next.reg_index == reg_index && next.origin != origin)
-                .then_some(index.saturating_sub(1))
-        })
-        .unwrap_or(stmts.len());
+    let epoch_end = tbc_epoch_end(stmts, start_index, origin, reg_index);
     let epoch_stmts = &stmts[..epoch_end];
 
     match externally_entered_scope_end(epoch_stmts, scope_start, start_index, reg_index) {
@@ -238,7 +344,13 @@ fn find_scope_end(
                 if let Some(end) = terminal_close_zero_end(epoch_stmts, index) {
                     last_scope_close = Some(index);
                     covering_close_indices.push(index);
-                    last_activity = Some(end);
+                    let terminal_return_has_values = matches!(
+                        epoch_stmts.get(index + 1),
+                        Some(HirStmt::Return(return_stmt)) if !return_stmt.values.is_empty()
+                    );
+                    if !debug_scope_ends_before_return || terminal_return_has_values {
+                        last_activity = Some(end);
+                    }
                     saw_close = true;
                 }
             } else if close.from_reg <= reg_index {
@@ -279,6 +391,40 @@ fn find_scope_end(
     }
 }
 
+fn binding_debug_scope_ends_before_return(
+    binding: ScopeBinding,
+    local_debug_scopes: &[Option<usize>],
+    temp_debug_scopes: &[Option<usize>],
+    debug_scopes: &[Option<HirDebugScope>],
+) -> bool {
+    let scope = match binding {
+        ScopeBinding::Local(local) => local_debug_scopes.get(local.index()),
+        ScopeBinding::Temp(temp) => temp_debug_scopes.get(temp.index()),
+    }
+    .copied()
+    .flatten();
+    scope
+        .and_then(|scope| debug_scopes.get(scope).copied().flatten())
+        .is_some_and(|scope| scope.ends_before_return)
+}
+
+fn tbc_epoch_end(
+    stmts: &[HirStmt],
+    start_index: usize,
+    origin: InstrRef,
+    reg_index: usize,
+) -> usize {
+    stmts
+        .iter()
+        .enumerate()
+        .skip(start_index)
+        .find_map(|(index, stmt)| {
+            matches!(stmt, HirStmt::ToBeClosed(next) if next.reg_index == reg_index && next.origin != origin)
+                .then_some(index.saturating_sub(1))
+        })
+        .unwrap_or(stmts.len())
+}
+
 fn terminal_close_zero_end(stmts: &[HirStmt], index: usize) -> Option<usize> {
     if index + 1 == stmts.len() {
         Some(stmts.len())
@@ -297,27 +443,30 @@ fn active_label_scope_end(
     start_index: usize,
     origin: InstrRef,
 ) -> Result<Option<usize>, ()> {
-    let mut saw_active = false;
-    let mut saw_inactive = false;
+    let mut inactive_before_active = false;
+    let mut first_inactive_after_active = None;
+    let mut last_active_end = None;
     for (index, stmt) in stmts.iter().enumerate().skip(start_index) {
         let HirStmt::Label(label) = stmt else {
             continue;
         };
         if label.tbc_barriers.contains(&origin) {
-            if saw_inactive {
-                // 候选拒绝[SemanticBarrier:Scope]：同一 TBC origin 的 label active-set
-                // 出现 active -> inactive -> active 时，单一 Lua block 无法跨过中间的
-                // scope 外入口；包住它会产生 goto 进入 `<close>` local 作用域。
+            if inactive_before_active || first_inactive_after_active.is_some() {
+                // 候选拒绝[SemanticBarrier:Scope]：`TBC; ::outside::; ::inside::` 允许
+                // scope 外 goto 命中 outside，`inside -> outside -> inside` 又要求同一
+                // origin 跨过 scope 外入口；两种 active-set 都不能用单一 Lua block 表达。
                 return Err(());
             }
-            saw_active = true;
-        } else if saw_active {
-            return Ok(Some(index));
+            last_active_end = Some(index + 1);
+        } else if last_active_end.is_some() {
+            first_inactive_after_active.get_or_insert(index);
         } else {
-            saw_inactive = true;
+            inactive_before_active = true;
         }
     }
-    Ok(saw_active.then_some(stmts.len()))
+    // 没有 inactive label 时，active-set 只证明到最后一个 active label；显式 Close
+    // 和 binding activity 决定其后的真实词法终点，不能把无关尾语句扩进资源作用域。
+    Ok(first_inactive_after_active.or(last_active_end))
 }
 
 fn externally_entered_scope_end(
@@ -661,5 +810,59 @@ impl HirVisitor for ScopeActivityCollector {
             | HirLValue::Global(_)
             | HirLValue::TableAccess(_) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::common::{HirAssign, HirClose, HirLabel, HirToBeClosed, HirValuePack};
+
+    fn temp_definition(temp: TempId) -> HirStmt {
+        HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Temp(temp)],
+            values: HirValuePack::fixed(vec![HirExpr::Nil]),
+        }))
+    }
+
+    fn tbc(temp: TempId, origin: InstrRef, reg_index: usize) -> HirStmt {
+        HirStmt::ToBeClosed(Box::new(HirToBeClosed {
+            origin,
+            reg_index,
+            value: HirExpr::TempRef(temp),
+        }))
+    }
+
+    fn label(id: usize, barriers: Vec<InstrRef>) -> HirStmt {
+        HirStmt::Label(Box::new(HirLabel {
+            id: HirLabelId(id),
+            tbc_barriers: barriers,
+        }))
+    }
+
+    #[test]
+    fn pending_boundaries_are_direct_and_epoch_local() {
+        let first_origin = InstrRef(10);
+        let second_origin = InstrRef(20);
+        let block = HirBlock {
+            stmts: vec![
+                temp_definition(TempId(0)),
+                tbc(TempId(0), first_origin, 2),
+                label(1, vec![first_origin]),
+                label(2, Vec::new()),
+                HirStmt::Block(Box::new(HirBlock {
+                    stmts: vec![label(3, vec![first_origin])],
+                })),
+                HirStmt::Close(Box::new(HirClose { from_reg: 2 })),
+                temp_definition(TempId(1)),
+                tbc(TempId(1), second_origin, 2),
+                label(4, vec![second_origin]),
+            ],
+        };
+
+        let mut boundaries = BTreeSet::new();
+        collect_pending_tbc_boundary_labels_in_block(&block, &mut boundaries);
+
+        assert_eq!(boundaries, BTreeSet::from([HirLabelId(1), HirLabelId(2)]));
     }
 }

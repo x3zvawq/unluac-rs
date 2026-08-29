@@ -183,7 +183,7 @@ pub(super) fn prune_redundant_entry_nil_writes(
                     // 候选拒绝[LayerBoundary]：label/goto 的 predecessor 与目标边由 Structure island/branch-control owner 维护，本 pass 不在线性 HIR 上重建 CFG。
                 }
                 PruneError::BindingInvariant => {
-                    // 候选拒绝[ConvergenceGuard]：同一 LocalId 再次声明或充当 for binder 违反唯一 binding 身份，不能删除异常 HIR 中的写入。
+                    panic!("entry-nil local must not be redeclared or reused as a for binding")
                 }
             }
             continue;

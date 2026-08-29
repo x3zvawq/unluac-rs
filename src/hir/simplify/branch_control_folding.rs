@@ -717,7 +717,8 @@ fn repeat_condition_fold_is_safe<'a>(
         visit_expr(expr, &mut boundary);
     }
     if boundary.decision {
-        // 候选拒绝[LayerBoundary]：被重挂到 latch 的 Decision 由 eliminate-decisions 原位物化；候选拒绝[ConvergenceGuard]：其 invalidation 会让 branch-control 在 owner 收敛后重跑（regress_370）。
+        // 候选拒绝[LayerBoundary]：被重挂到 latch 的 Decision 由 eliminate-decisions
+        // 原位物化；其 invalidation 会让 branch-control 在 owner 收敛后重跑（regress_370）。
         return false;
     }
     if boundary.unresolved {
@@ -934,7 +935,8 @@ fn fold_forward_gotos(stmts: &mut Vec<HirStmt>, kind: FoldKind) -> bool {
         }
         let body = &stmts[(if_index + 1)..label_index];
         if !can_move_into_branch(body) {
-            // 候选拒绝[SemanticBarrier:Scope/ControlFlow]：区间 local 若在 label 后仍被引用，移入 arm 会使 use 失去作用域；区间 goto/label 则可能改变跳转配对或跳入 local 的合法性。
+            // 候选拒绝[SemanticBarrier:Scope]：区间 local 若在 label 后仍被引用，移入 arm 会使 use 失去作用域；
+            // 候选拒绝[SemanticBarrier:ControlFlow]：区间 goto/label 可能改变跳转配对或跳入 local 的合法性。
             continue;
         }
         if matches!(kind, FoldKind::TerminalElse)

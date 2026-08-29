@@ -141,7 +141,7 @@ pub(super) fn apply_rewrites(
     region_index: usize,
     rewrites: BTreeMap<CarryBinding, CarryBinding>,
     promotion_facts: &mut ProtoPromotionFacts,
-) -> bool {
+) {
     let prunable = rewrites.values().copied().collect::<BTreeSet<_>>();
     let rewritten = rewrite_stmts(
         &mut block.stmts[region_index..],
@@ -150,10 +150,10 @@ pub(super) fn apply_rewrites(
             promotion_facts,
         },
     );
-    if !rewritten {
-        // 候选拒绝[ConvergenceGuard]：inference 已从 region assignments 得到 result；apply 无命中表示分析与 rewrite visitor 契约漂移。
-        return false;
-    }
+    assert!(
+        rewritten,
+        "inferred region results must contain at least one planned binding rewrite"
+    );
     rewrite_stmts(
         &mut block.stmts[region_index..],
         &mut RedundantSelfAssignPrunePass::for_bindings(prunable.iter().copied()),
@@ -162,5 +162,4 @@ pub(super) fn apply_rewrites(
         block.stmts.drain(declarations);
     }
     prune_empty_assign_stmts(block);
-    true
 }

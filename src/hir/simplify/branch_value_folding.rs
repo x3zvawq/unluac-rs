@@ -24,7 +24,8 @@
 //! raw Temp 收成值后，仅把本轮新生成的 target 交给 temp-inline 的根级 Call/Return 定向入口；
 //! 不能重跑全 proto 的普通内联，也不能让 `locals` 延后到另一个 phase。
 //! goto/label 壳先建立一次 label facts，再选择不交叉区间线性重建 block；独立候选不会每命中一个
-//! 就重新扫描整块。
+//! 就重新扫描整块。fallback assignment 只会被放进互斥分支，整条 value-pack 与 lvalue
+//! 保持原样，因此每条运行路径仍只求值一次，不需要按表达式形状维护复制白名单。
 //!
 //! 例子：
 //! - 输入：`local l0; if cond then l0 = "a" else l0 = "b" end`
@@ -252,9 +253,9 @@ fn fold_root_branch_value_temps(proto: &mut HirProto, safety: HirExprSafety) -> 
             continue;
         };
         let guards_are_mechanical = guards.iter().all(|guard| {
-            // 候选拒绝[SemanticBarrier:Lifetime]：guard 若还被其它根语句读取，删除其赋值会留下未定义/旧 epoch 的 temp 读取。
+            // 候选拒绝[SemanticBarrier:ValueFlow]：guard 若还被其它根语句读取，删除其赋值会留下未定义/旧 epoch 的 temp 读取。
             stmt_touch_counts.get(guard) == Some(&1)
-                // 候选拒绝[LayerBoundary]：带 debug-local identity 的 temp 由 locals/source identity 层决定，HIR 值折叠不能抢先删除。
+                // 候选拒绝[SemanticBarrier:DebugScope]：带 debug-local identity 的 temp 是 IR 已保留的源码 binding，HIR 值折叠不能删除。
                 && proto
                     .temp_debug_locals
                     .get(guard.index())
@@ -619,7 +620,6 @@ fn plan_branch_value_goto_folds(
     let mut next_start = stmts.len();
     let mut selected = Vec::new();
     for fold in candidates.into_iter().rev() {
-        // 候选搜索裁剪[ConvergenceGuard]：与右侧已选区间交叉/包含的候选留给 fixed-point 下一轮，不是语义拒绝。
         if fold.label_index < next_start {
             next_start = fold.if_index;
             selected.push(fold);
@@ -628,7 +628,7 @@ fn plan_branch_value_goto_folds(
     selected.reverse();
     selected
         .into_iter()
-        .filter_map(|fold| prepare_branch_value_goto_fold(stmts, fold))
+        .map(|fold| prepare_branch_value_goto_fold(stmts, fold))
         .collect()
 }
 
@@ -694,24 +694,23 @@ fn nested_default_goto_label_fold_at(
 fn prepare_branch_value_goto_fold(
     stmts: &[HirStmt],
     fold: BranchValueGotoFold,
-) -> Option<PreparedBranchValueGotoFold> {
-    // 候选拒绝[ConvergenceGuard]：matcher 已验证 if/terminal goto 形状；rewrite 返回 None 表示 plan 与 rewrite 的内部契约漂移。
+) -> PreparedBranchValueGotoFold {
     let replacement = match fold.kind {
         BranchValueGotoFoldKind::Direct => rewrite_direct_goto_value_if(
             stmts[fold.if_index].clone(),
             stmts[fold.if_index + 1].clone(),
-        )?,
+        ),
         BranchValueGotoFoldKind::NestedDefault => rewrite_nested_default_goto_value_if(
             stmts[fold.if_index].clone(),
             stmts[(fold.if_index + 1)..fold.default_label_index].to_vec(),
             stmts[fold.default_label_index + 1].clone(),
-        )?,
+        ),
     };
-    Some(PreparedBranchValueGotoFold {
+    PreparedBranchValueGotoFold {
         start: fold.if_index,
         end: fold.label_index,
         replacement,
-    })
+    }
 }
 
 fn apply_branch_value_goto_folds(
@@ -788,15 +787,9 @@ fn nested_default_goto_value_matches(
     if has_non_empty_else(outer_if) || single_goto_if_target(outer_stmt).is_none() {
         return false;
     }
-    let Some((fallback_target, fallback_value)) = single_assign(fallback_stmt) else {
+    let HirStmt::Assign(fallback_assign) = fallback_stmt else {
         return false;
     };
-    // 候选拒绝[ProofIncomplete]：fallback 只复制到互斥分支且每条路径一次；当前 target/value 白名单缺少路径互斥与 lvalue 求值时点证明。
-    if !target_allows_default_duplication(fallback_target)
-        || !is_branch_default_value_expr(fallback_value)
-    {
-        return false;
-    }
     let [.., HirStmt::If(inner_if)] = prefix_stmts else {
         return false;
     };
@@ -804,38 +797,46 @@ fn nested_default_goto_value_matches(
     if has_non_empty_else(inner_if) {
         return false;
     }
-    terminal_goto_assign_target(&inner_if.then_block, label)
-        .is_some_and(|success_target| success_target == fallback_target)
+    // outer false/inner false 两条 fallback 路径互斥；整条 assignment 虽在树上出现两次，
+    // 运行时仍只执行一次，targets 的 lvalue 求值与 value-pack 宽度/顺序都保持在原语句内。
+    terminal_goto_assign(&inner_if.then_block, label)
+        .is_some_and(|success_assign| success_assign.targets == fallback_assign.targets)
 }
 
-fn rewrite_direct_goto_value_if(if_stmt: HirStmt, fallback_stmt: HirStmt) -> Option<HirStmt> {
-    // 候选拒绝[ConvergenceGuard]：direct matcher 已证明输入是 if 且 then 以目标 goto 终结，以下失败仅表示内部不变量损坏。
+fn rewrite_direct_goto_value_if(if_stmt: HirStmt, fallback_stmt: HirStmt) -> HirStmt {
     let HirStmt::If(mut if_stmt) = if_stmt else {
-        return None;
+        unreachable!("matched direct branch-value fold must own an if statement");
     };
-    if_stmt.then_block.stmts.pop()?;
+    if_stmt
+        .then_block
+        .stmts
+        .pop()
+        .expect("matched direct branch-value fold must end in goto");
     if_stmt.else_block = Some(HirBlock {
         stmts: vec![fallback_stmt],
     });
-    Some(HirStmt::If(if_stmt))
+    HirStmt::If(if_stmt)
 }
 
 fn rewrite_nested_default_goto_value_if(
     outer_stmt: HirStmt,
     prefix_stmts: Vec<HirStmt>,
     fallback_stmt: HirStmt,
-) -> Option<HirStmt> {
-    // 候选拒绝[ConvergenceGuard]：nested matcher 已证明 outer/inner if 与 terminal goto；以下失败仅表示 plan/rewrite 不变量损坏。
+) -> HirStmt {
     let HirStmt::If(mut outer_if) = outer_stmt else {
-        return None;
+        unreachable!("matched nested branch-value fold must own an outer if statement");
     };
     outer_if.cond = outer_if.cond.negate();
     let mut then_stmts = prefix_stmts;
     let Some(HirStmt::If(inner_stmt)) = then_stmts.pop() else {
-        return None;
+        unreachable!("matched nested branch-value fold must end its prefix in an inner if");
     };
     let mut inner_if = *inner_stmt;
-    inner_if.then_block.stmts.pop()?;
+    inner_if
+        .then_block
+        .stmts
+        .pop()
+        .expect("matched nested branch-value fold must end its success arm in goto");
     inner_if.else_block = Some(HirBlock {
         stmts: vec![fallback_stmt.clone()],
     });
@@ -844,7 +845,7 @@ fn rewrite_nested_default_goto_value_if(
     outer_if.else_block = Some(HirBlock {
         stmts: vec![fallback_stmt],
     });
-    Some(HirStmt::If(outer_if))
+    HirStmt::If(outer_if)
 }
 
 fn single_goto_if_target(stmt: &HirStmt) -> Option<HirLabelId> {
@@ -865,20 +866,6 @@ fn has_non_empty_else(if_stmt: &HirIf) -> bool {
         .else_block
         .as_ref()
         .is_some_and(|block| !block.stmts.is_empty())
-}
-
-fn terminal_goto_assign_target(block: &HirBlock, label: HirLabelId) -> Option<&HirLValue> {
-    let assign = terminal_goto_assign(block, label)?;
-    let [target] = assign.targets.as_slice() else {
-        return None;
-    };
-    let [_] = assign.values.fixed.as_slice() else {
-        return None;
-    };
-    if assign.values.tail.is_some() {
-        return None;
-    }
-    Some(target)
 }
 
 fn terminal_goto_assign(block: &HirBlock, label: HirLabelId) -> Option<&HirAssign> {
@@ -909,30 +896,6 @@ fn single_assign(stmt: &HirStmt) -> Option<(&HirLValue, &HirExpr)> {
         return None;
     }
     Some((target, value))
-}
-
-fn target_allows_default_duplication(target: &HirLValue) -> bool {
-    matches!(target, HirLValue::Temp(_) | HirLValue::Local(_))
-}
-
-fn is_branch_default_value_expr(expr: &HirExpr) -> bool {
-    matches!(
-        expr,
-        HirExpr::Nil
-            | HirExpr::Boolean(_)
-            | HirExpr::Integer(_)
-            | HirExpr::Number(_)
-            | HirExpr::String(_)
-            | HirExpr::Int64(_)
-            | HirExpr::UInt64(_)
-            | HirExpr::Vector(_)
-            | HirExpr::Complex { .. }
-            | HirExpr::ParamRef(_)
-            | HirExpr::LocalRef(_)
-            | HirExpr::UpvalueRef(_)
-            | HirExpr::TempRef(_)
-            | HirExpr::GlobalRef(_)
-    )
 }
 
 fn single_assign_value(assign: &HirAssign, binding: BranchValueBinding) -> Option<&HirExpr> {

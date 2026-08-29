@@ -113,7 +113,7 @@ fn cleanup_block(
             // 候选拒绝[SemanticBarrier:Lifetime]：有 initializer 的 `<close>` 即使无普通 use
             // 也必须在域末执行 `__close`（regress246）。`<const>` 没有退出动作，在其 binding
             // 无引用且 initializer 可安全丢弃/保留为 call 时允许清理。
-            // 候选拒绝[PolicyBoundary]：DebugHinted 身份保留；候选拒绝[SemanticBarrier:Lifetime]：
+            // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted 身份和可观察词法槽保留；候选拒绝[SemanticBarrier:Lifetime]：
             // PhysicalRoot 可能由弱表/`__gc` 观察，不能按普通未使用 local 删除。
             // 候选拒绝[SemanticBarrier:Scope]：声明外仍有读取、capture 或写入时，删除 local
             // 会改变读取值、捕获 cell，或让后续 name target 解析成外层/global。
@@ -150,8 +150,8 @@ fn cleanup_block(
                             // floor-div 与 modulo 的最小反例。
                             // 候选拒绝[ProofIncomplete]：literal concat、table/closure 分配以及
                             // 非字面量除数尚缺无分配事件或确定非零事实，不能删除。
-                            // 候选拒绝[LayerBoundary]：Lua 5.1/5.2 integral-number layout 需由
-                            // parser/HIR 经 ast::build 传入 AstTargetDialect 后才能证明 Integer 算术。
+                            // 候选拒绝[ProofIncomplete]：AstTargetDialect 只有 Lua 5.1/5.2 版本，
+                            // 尚未携带 chunk 的 integral-number 位宽/溢出语义，不能证明 Integer 算术无错误事件。
                             // 候选拒绝[LayerBoundary]：Error 由 ast::build 的诊断 owner 保留。
                             local_decl.values.push(value);
                             retained_stmts.push(AstStmt::LocalDecl(local_decl));
@@ -175,8 +175,8 @@ fn cleanup_block(
         }
         let original_len = local_decl.bindings.len();
         local_decl.bindings.retain(|binding| {
-            if binding.origin == AstLocalOrigin::DebugHinted {
-                // 候选拒绝[PolicyBoundary]：DebugHinted 空声明仍是显式源码身份。
+            if binding.origin.is_debug_hinted() {
+                // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted 空声明仍是可观察的源码词法槽。
                 return true;
             }
 
@@ -350,15 +350,15 @@ fn split_overwritten_call_result(
     if local_decl
         .bindings
         .iter()
-        .any(|binding| binding.origin == AstLocalOrigin::DebugHinted)
+        .any(|binding| binding.origin.is_debug_hinted())
     {
-        // 候选拒绝[PolicyBoundary]：任一 DebugHinted initializer 都保留整组源码声明身份。
+        // 候选拒绝[SemanticBarrier:DebugScope]：任一 DebugHinted initializer 都保留整组源码词法槽。
         return None;
     }
     if local_decl
         .bindings
         .iter()
-        .any(|binding| binding.origin == AstLocalOrigin::PhysicalRoot)
+        .any(|binding| binding.origin.is_physical_root())
         && !assign.values.iter().all(is_eventless_primitive_literal)
     {
         // 候选拒绝[SemanticBarrier:Lifetime]：事件性 RHS 求值期间 PhysicalRoot call result
@@ -398,8 +398,14 @@ fn split_overwritten_call_result(
 
 fn trailing_do_block_is_scope_neutral(block: &AstBlock, has_trailing_condition: bool) -> bool {
     if !has_trailing_condition {
+        if block.stmts.iter().any(stmt_declares_debug_binding) {
+            // 候选拒绝[SemanticBarrier:DebugScope]：函数 Return hook 可以在 return event
+            // 观察直属 local。拍平尾 do 会把原本在 Return 前结束的 debug local 延长到
+            // 函数作用域；regress420 固定 LocalDecl 与 LocalFunctionDecl 两种身份。
+            return false;
+        }
         // 候选接受：尾 do 与普通父 block 在同一控制流出口结束；展开不会移动任何后继
-        // 求值，local/`<close>`/closure 的退出时点仍是该出口（regress344）。
+        // 求值，非 debug local/`<close>`/closure 的退出时点仍是该出口（regress344）。
         return true;
     }
 
@@ -434,12 +440,12 @@ fn trailing_do_block_is_scope_neutral(block: &AstBlock, has_trailing_condition: 
                 || local_decl
                     .bindings
                     .iter()
-                    .any(|binding| binding.origin == AstLocalOrigin::PhysicalRoot)
-                // 候选拒绝[PolicyBoundary]：DebugHinted 的显式 repeat 内层词法域按源码证据保留。
+                    .any(|binding| binding.origin.is_physical_root())
+                // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted 的显式 repeat 内层词法域可由 debug API 观察。
                 || local_decl
                     .bindings
                     .iter()
-                    .any(|binding| binding.origin == AstLocalOrigin::DebugHinted)
+                    .any(|binding| binding.origin.is_debug_hinted())
                 // 候选拒绝[SemanticBarrier:Lifetime]：repeat 尾 closure 拍平会让 closure 及
                 // captured object 活过 condition；regress378 在 condition 中以 `__gc` 观察。
                 || local_decl
@@ -484,6 +490,17 @@ fn trailing_do_block_is_scope_neutral(block: &AstBlock, has_trailing_condition: 
             false
         }
     })
+}
+
+fn stmt_declares_debug_binding(stmt: &AstStmt) -> bool {
+    match stmt {
+        AstStmt::LocalDecl(local_decl) => local_decl
+            .bindings
+            .iter()
+            .any(|binding| binding.origin.is_debug_hinted()),
+        AstStmt::LocalFunctionDecl(function_decl) => function_decl.origin.is_debug_hinted(),
+        _ => false,
+    }
 }
 
 fn nested_or_hoisted_binding(

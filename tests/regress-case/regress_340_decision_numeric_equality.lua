@@ -16,4 +16,19 @@ end
 
 assert(choose(1.0, "fallback") == false)
 assert(choose(2, "fallback") == "fallback")
-print("regress340", choose(1.0, "fallback"), choose(2, "fallback"))
+
+local function preserve_numeric_representation(value)
+    if value and 1 then
+        return (value == 1) and 1
+    else
+        return value
+    end
+end
+
+assert(math.type(preserve_numeric_representation(1.0)) == "integer")
+print(
+    "regress340",
+    choose(1.0, "fallback"),
+    choose(2, "fallback"),
+    math.type(preserve_numeric_representation(1.0))
+)

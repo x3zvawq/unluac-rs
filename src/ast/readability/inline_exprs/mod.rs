@@ -34,7 +34,7 @@ use self::candidate::{
 use self::use_sites::rewrite_stmt_use_sites_with_policy;
 use super::super::common::{
     AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue,
-    AstLocalAttr, AstLocalOrigin, AstModule, AstNameRef, AstStmt,
+    AstLocalAttr, AstModule, AstNameRef, AstStmt,
 };
 use super::ReadabilityContext;
 use super::binding_flow::{
@@ -47,7 +47,7 @@ use super::binding_tree::{
     stmt_has_direct_call_arg_binding_use, stmt_has_index_binding_use, stmt_has_nested_binding_use,
     stmt_has_nested_binding_value_use, stmt_stores_binding_in_table,
 };
-use super::expr_analysis::collect_stable_copy_snapshot_names;
+use super::expr_analysis::{collect_stable_copy_snapshot_names, result_cannot_root_collectable};
 use super::stmt_plan::{PlannedStmt, materialize_stmt_plan};
 use super::visit::AstVisitor;
 use super::walk::{self, AstRewritePass, BlockKind};
@@ -127,6 +127,12 @@ impl BindingWriteIndex {
         self.write_bounds_by_name
             .get(name)
             .is_some_and(|(_, last_write)| *last_write > stmt_index)
+    }
+
+    fn name_has_write_in_range(&self, start: usize, end: usize, name: &AstNameRef) -> bool {
+        self.direct_write_names_by_stmt
+            .get(start..end)
+            .is_some_and(|names_by_stmt| names_by_stmt.iter().any(|names| names.contains(name)))
     }
 
     fn writes_start_after(&self, stmt_index: usize, binding: AstBindingRef) -> bool {
@@ -366,7 +372,9 @@ fn rewrite_current_block(
             mutable_snapshots,
             effective_policy,
         ) {
-            // 候选拒绝[SemanticBarrier:EvalOrder/Lifetime]：producer 不能跨过 sink 的调用、lookup、循环重求值或 mutable snapshot；如 `v=side(); guard()==v` 不等价于 `guard()==side()`。
+            // 候选拒绝[SemanticBarrier:EvalOrder]：producer 不能跨过 sink 的调用、lookup
+            // 或 mutable snapshot；如 `v=side(); guard()==v` 不等价于 `guard()==side()`。
+            // 候选拒绝[SemanticBarrier:EvalTime]：while/repeat condition 会逐轮重求值非稳定 RHS。
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
@@ -460,6 +468,22 @@ fn collapse_stable_copy_aliases(
         else {
             continue;
         };
+        if [candidate_index + 1, candidate_index + 2]
+            .into_iter()
+            .any(|sink_index| {
+                super::function_sugar::run_belongs_to_method_alias_owner(
+                    &stmts,
+                    candidate_index,
+                    sink_index,
+                    &use_index,
+                    mutable_snapshots,
+                )
+            })
+        {
+            // 候选拒绝[LayerBoundary]：receiver snapshot 与 direct/field method sink 必须由
+            // function-sugar 原子消费；提前删除 alias 会丢失 `:` 恢复所需的双 use 证明。
+            continue;
+        }
         if candidate.origin() != super::super::common::AstLocalOrigin::Recovered {
             // 候选拒绝[SemanticBarrier:DebugScope]：删除 DebugHinted 会改变 debug.getlocal 可观察的作用域（regress_351）；候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 若在 use 后仍处于原词法作用域，会延后弱表消失或 `__gc`。
             continue;
@@ -468,28 +492,59 @@ fn collapse_stable_copy_aliases(
         if !candidate.allows_expr_with_policy(value, InlinePolicy::StableCopy)
             || !collect_stable_copy_snapshot_names(value, &mut snapshot_names)
         {
-            // 候选拒绝[SemanticBarrier:EvalTime/EvalCount/ValueArity/Metamethod/Lifetime]：带可观察调用、lookup、元方法、vararg 或分配的输入搬到 use 会改变次数、快照、值宽度、对象身份或 root 生命周期（regress_387）；候选拒绝[ProofIncomplete]：该形状 guard 仍 blanket 覆盖稳定 global/upvalue、已知 primitive 运算、非有限 number 与 Int64/UInt64/Vector/Complex，当前缺外部写入、操作数类型及目标方言物化事实；候选拒绝[LayerBoundary]：残留 Temp/Error 分别归 HIR/materialize 与错误输出 owner。
+            // 候选拒绝[SemanticBarrier:EvalTime]：调用/lookup 从声明点搬到 use 会改变可观察时点；
+            // 候选拒绝[SemanticBarrier:EvalCount]：多 use 会复制调用/lookup；
+            // 候选拒绝[SemanticBarrier:ValueArity]：vararg 搬入新位置可能重新打开值宽；
+            // 候选拒绝[SemanticBarrier:Metamethod]：算术、比较和 lookup 可能触发协议；
+            // 候选拒绝[SemanticBarrier:Lifetime]：分配值或 logical operand 可能改变对象 identity/root 生命周期（regress_387）；
+            // 候选拒绝[ProofIncomplete]：该形状 guard 仍 blanket 覆盖稳定 global/upvalue、已知 primitive 运算、非有限 number 与 Int64/UInt64/Vector/Complex，当前缺外部写入、操作数类型及目标方言物化事实；
+            // 候选拒绝[LayerBoundary]：残留 Temp/Error 分别归 HIR/materialize 与错误输出 owner。
             continue;
         }
         if mutable_snapshots.contains(&candidate.binding().to_name_ref()) {
             // 候选拒绝[SemanticBarrier:EvalOrder]：captured/mutable snapshot 的值可能被中间调用改写，直接替换会读取新值。
             continue;
         }
-        if !matches!(value, AstExpr::Var(_))
-            && snapshot_names.iter().any(|name| {
-                mutable_snapshots.contains(name)
-                    || write_index.name_has_write_after(candidate_index, name)
-            })
-        {
-            // 候选拒绝[ProofIncomplete]：当前用 suffix-wide write/capture 保证复合快照稳定，尚不能区分最后 use 后的无关写或不会改写的 closure；声明到 use 之间的改写会从 use 点读到新值（regress_387）。
-            continue;
-        }
-
         let use_stmt_indices =
             use_index.use_stmt_indices_in_suffix(candidate_index + 1, candidate.binding());
         if use_stmt_indices.is_empty() {
             // 候选拒绝[LayerBoundary]：未使用声明的删除归 cleanup/dead-local，不属于 copy-inline。
             continue;
+        }
+        if !matches!(value, AstExpr::Var(_)) {
+            let last_use = use_stmt_indices
+                .last()
+                .copied()
+                .expect("uses are non-empty");
+            if snapshot_names
+                .iter()
+                .any(|name| mutable_snapshots.contains(name))
+            {
+                // 候选拒绝[ProofIncomplete]：capture provenance 尚不能区分只读与写入；sink 前的未知 closure 调用可能改写声明点快照。
+                continue;
+            }
+            if snapshot_names.iter().any(|name| {
+                write_index.name_has_write_in_range(candidate_index + 1, last_use, name)
+            }) {
+                // 候选拒绝[SemanticBarrier:EvalOrder]：声明后、最后 use 前的 direct write 会让内联表达式读取新值，regress_387 的 written dependency 可观察差异。
+                continue;
+            }
+            if snapshot_names
+                .iter()
+                .any(|name| write_index.stmt_directly_writes_name(last_use, name))
+            {
+                // 候选拒绝[ProofIncomplete]：最后 use owner 内尚无 read/write 顺序与重复执行
+                // provenance；普通赋值可能先读后写，但 loop condition 与 body write 会跨迭代交错。
+                continue;
+            }
+            if !result_cannot_root_collectable(value)
+                && snapshot_names
+                    .iter()
+                    .any(|name| write_index.name_has_write_after(candidate_index, name))
+            {
+                // 候选拒绝[SemanticBarrier:Lifetime]：可能返回 operand 对象的 logical 快照必须在 source 覆盖后继续保留旧 root；删除 alias 会提前释放它。
+                continue;
+            }
         }
         if use_stmt_indices
             .iter()
@@ -506,37 +561,46 @@ fn collapse_stable_copy_aliases(
         }
 
         if let AstExpr::Var(source_name) = value {
-            let Some(source_binding) = binding_from_name_ref(source_name) else {
-                // Parameters are intentionally owned by HIR local convergence; globals,
-                // upvalues and temps have no stable copy proof at this AST stage.
-                // 候选拒绝[LayerBoundary]：参数 alias 归 HIR locals；候选拒绝[ProofIncomplete]：global/upvalue 缺少声明点快照与写入事实，AST 不能跨语句猜测。
-                continue;
-            };
-            // A bound local/synthetic name can only appear while its lexical declaration is
-            // active, so the AST binding identity itself supplies the dominance proof.
-            if !matches!(
-                source_binding,
-                AstBindingRef::Local(_) | AstBindingRef::SyntheticLocal(_)
-            ) || mutable_snapshots.contains(source_name)
-            {
-                // 候选拒绝[SemanticBarrier:EvalOrder]：captured/upvalue/global/temp source 可在中间调用中改变；只允许当前词法域内未捕获 local/synthetic 快照。
+            if mutable_snapshots.contains(source_name) {
+                // 候选拒绝[ProofIncomplete]：capture provenance 尚不能区分只读与写入；
+                // 中间 closure 调用可能改写 local/param 的声明点快照。
                 continue;
             }
-            if write_index.has_write_after(candidate_index, source_binding)
-                && (use_stmt_indices.len() != 1
-                    || !stable_copy_has_trailing_root_handoff(
-                        &stmts,
-                        trailing_condition,
-                        &write_index,
-                        mutable_snapshots,
-                        use_stmt_indices[0],
-                        candidate.binding(),
-                        source_binding,
-                    ))
-            {
-                // 候选拒绝[SemanticBarrier:EvalOrder/Lifetime]：source 在 use 前后写入时 alias
-                // 保存的是旧快照/root；只有单 owner 的精确 repeat handoff 已证明安全。
-                continue;
+            match source_name {
+                AstNameRef::Param(_) => {
+                    if write_index.name_has_write_after(candidate_index, source_name) {
+                        // 候选拒绝[SemanticBarrier:EvalOrder]：参数后续写入会让 alias 保存旧值；
+                        // 候选拒绝[SemanticBarrier:Lifetime]：旧值若是对象，alias 还保存旧 root。
+                        // 参数没有 AstBindingRef，当前不走 repeat handoff。
+                        continue;
+                    }
+                }
+                AstNameRef::Local(_) | AstNameRef::SyntheticLocal(_) => {
+                    let source_binding = binding_from_name_ref(source_name)
+                        .expect("local-like name must have an AST binding identity");
+                    // A bound local/synthetic name can only appear while its lexical declaration
+                    // is active, so the AST binding identity itself supplies the dominance proof.
+                    if write_index.has_write_after(candidate_index, source_binding)
+                        && (use_stmt_indices.len() != 1
+                            || !stable_copy_has_trailing_root_handoff(
+                                &stmts,
+                                trailing_condition,
+                                &write_index,
+                                mutable_snapshots,
+                                use_stmt_indices[0],
+                                candidate.binding(),
+                                source_binding,
+                            ))
+                    {
+                        // 候选拒绝[SemanticBarrier:EvalOrder]：source 写入会让 alias 保存旧快照；
+                        // 候选拒绝[SemanticBarrier:Lifetime]：旧值若是对象，alias 还保存旧 root。
+                        // 只有单 owner 的精确 repeat handoff 已证明安全。
+                        continue;
+                    }
+                }
+                AstNameRef::Global(_) | AstNameRef::Upvalue(_) | AstNameRef::Temp(_) => {
+                    unreachable!("stable-copy expression filter only admits lexical names")
+                }
             }
         }
 

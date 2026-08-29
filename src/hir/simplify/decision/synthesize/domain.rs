@@ -115,7 +115,7 @@ impl<'a> SynthesisContext<'a> {
             .enumerate()
             .map(|(index, key)| (*key, index))
             .collect::<BTreeMap<_, _>>();
-        let domain = build_domain(decision);
+        let domain = build_domain(decision, safety)?;
         let environments = enumerate_environments(refs.len(), &domain)?;
         Some(Self {
             decision,
@@ -396,7 +396,7 @@ fn collect_refs_from_target(target: &HirDecisionTarget, refs: &mut BTreeSet<RefK
     }
 }
 
-fn build_domain(decision: &HirDecisionExpr) -> Vec<AbstractValue> {
+fn build_domain(decision: &HirDecisionExpr, safety: HirExprSafety) -> Option<Vec<AbstractValue>> {
     let mut domain = vec![
         AbstractValue::Nil,
         AbstractValue::False,
@@ -408,9 +408,25 @@ fn build_domain(decision: &HirDecisionExpr) -> Vec<AbstractValue> {
         collect_literals_from_target(&node.truthy, &mut literals);
         collect_literals_from_target(&node.falsy, &mut literals);
     }
+    if !domain_supports_literal_value_identities(&literals, safety) {
+        // 候选拒绝[ProofIncomplete]：PUC Lua 5.3+ 中 `1 == 1.0`，但
+        // `math.type` 能区分二者。当前有限域只收集出现过的 literal，不能证明所有
+        // equality-equivalent 的另一数值表示都已枚举，不能用它批准值综合。
+        return None;
+    }
     domain.extend(literals);
     domain.extend((0..EXTRA_TRUTHY_SYMBOLS).map(|index| AbstractValue::TruthySymbol(index as u8)));
-    domain
+    Some(domain)
+}
+
+pub(super) fn domain_supports_literal_value_identities(
+    literals: &BTreeSet<AbstractValue>,
+    safety: HirExprSafety,
+) -> bool {
+    !safety.distinguishes_integer_number_values()
+        || !literals
+            .iter()
+            .any(|value| matches!(value, AbstractValue::Integer(_) | AbstractValue::Number(_)))
 }
 
 fn collect_literals_from_target(

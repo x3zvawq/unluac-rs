@@ -10,16 +10,15 @@ pub(super) fn merge_initialized_local_declarations(
     if count < 2 {
         return false;
     }
-    // 候选拒绝[ConvergenceGuard]：越界表示 caller 提供的 declaration group 与当前 block 漂移，不是语义候选缺少证明。
-    if start + count > block.stmts.len() {
-        return false;
-    }
+    assert!(
+        start + count <= block.stmts.len(),
+        "planned declaration merge must remain within the current block"
+    );
     let mut bindings = Vec::with_capacity(count);
     let mut values = Vec::with_capacity(count);
     for stmt in &block.stmts[start..start + count] {
-        let Some((binding, value)) = initialized_local(stmt) else {
-            return false;
-        };
+        let (binding, value) = initialized_local(stmt)
+            .expect("planned declaration merge must retain initialized local statements");
         let earlier = bindings
             .iter()
             .copied()

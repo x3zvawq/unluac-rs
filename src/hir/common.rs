@@ -29,6 +29,10 @@ pub struct HirProto {
     pub param_debug_hints: Vec<Option<String>>,
     pub locals: Vec<LocalId>,
     pub local_debug_hints: Vec<Option<String>>,
+    /// `local_debug_hints` 对应的源码局部作用域身份；合成 local 为 `None`。
+    pub local_debug_scopes: Vec<Option<usize>>,
+    /// Structure 已接受的源码 debug local 区间，按原 debug scope identity 索引。
+    pub debug_scopes: Vec<Option<HirDebugScope>>,
     /// Temps retained solely because their physical slot keeps an aliased object rooted.
     ///
     /// These have not been promoted to HIR locals, so AST build must transfer the root identity
@@ -51,6 +55,15 @@ pub struct HirProto {
     pub failure: Option<ProtoFailure>,
     /// 失败父节点无法恢复原 closure 放置时，仍以诊断 local 展示的直接子 proto。
     pub detached_children: Vec<(LocalId, HirProtoRef)>,
+}
+
+/// 已由 Structure 绑定到唯一 SSA 身份的源码 debug local 区间。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HirDebugScope {
+    pub start_pc: u32,
+    pub end_pc: u32,
+    /// 该 debug 区间在函数终结 Return 指令执行前结束。
+    pub ends_before_return: bool,
 }
 
 /// proto 的稳定引用。

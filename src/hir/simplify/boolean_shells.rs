@@ -117,13 +117,26 @@ struct VisibleHomeUseCollector<'a> {
     local_homes: &'a BTreeMap<LocalId, HomeSlotKey>,
 }
 
-#[derive(Default)]
-struct ToBeClosedSlots(BTreeSet<usize>);
+struct ToBeClosedHomes<'a> {
+    definite: BTreeSet<HomeSlotKey>,
+    unresolved_slots: BTreeSet<usize>,
+    promotion_facts: &'a ProtoPromotionFacts,
+}
 
-impl HirVisitor for ToBeClosedSlots {
+impl HirVisitor for ToBeClosedHomes<'_> {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         if let HirStmt::ToBeClosed(to_be_closed) = stmt {
-            self.0.insert(to_be_closed.reg_index);
+            let home = match &to_be_closed.value {
+                HirExpr::ParamRef(param) => self.promotion_facts.trusted_param_home_slot(*param),
+                HirExpr::LocalRef(local) => self.promotion_facts.trusted_local_home_slot(*local),
+                HirExpr::TempRef(temp) => self.promotion_facts.trusted_temp_home_slot(*temp),
+                _ => None,
+            };
+            if let Some(home) = home.filter(|home| home.slot() == to_be_closed.reg_index) {
+                self.definite.insert(home);
+            } else {
+                self.unresolved_slots.insert(to_be_closed.reg_index);
+            }
         }
     }
 }
@@ -177,7 +190,8 @@ struct BooleanShellFacts {
     trusted_local_homes: BTreeMap<LocalId, HomeSlotKey>,
     visible_home_uses: VisibleHomeUseCounts,
     reference_captured_homes: Option<BTreeSet<HomeSlotKey>>,
-    to_be_closed_slots: BTreeSet<usize>,
+    to_be_closed_homes: BTreeSet<HomeSlotKey>,
+    unresolved_to_be_closed_slots: BTreeSet<usize>,
     reference_captured_locals: BTreeSet<LocalId>,
     possibly_reference_captured_locals: BTreeSet<LocalId>,
 }
@@ -218,8 +232,12 @@ impl BooleanShellFacts {
             .collect::<BTreeMap<_, _>>();
         let visible_home_uses =
             VisibleHomeUseCounts::collect_from_proto(proto, &param_homes, &trusted_local_homes);
-        let mut to_be_closed_slots = ToBeClosedSlots::default();
-        visit_proto(proto, &mut to_be_closed_slots);
+        let mut to_be_closed_homes = ToBeClosedHomes {
+            definite: BTreeSet::new(),
+            unresolved_slots: BTreeSet::new(),
+            promotion_facts,
+        };
+        visit_proto(proto, &mut to_be_closed_homes);
         Self {
             uses: BindingUseCounts::collect_from_proto(proto),
             debug_temps: proto
@@ -247,7 +265,8 @@ impl BooleanShellFacts {
                 &reference_captured,
                 promotion_facts,
             ),
-            to_be_closed_slots: to_be_closed_slots.0,
+            to_be_closed_homes: to_be_closed_homes.definite,
+            unresolved_to_be_closed_slots: to_be_closed_homes.unresolved_slots,
             reference_captured_locals,
             possibly_reference_captured_locals,
         }
@@ -264,7 +283,7 @@ impl BooleanShellFacts {
     ) -> bool {
         match target {
             HirLValue::Temp(temp) => {
-                // 候选拒绝[PolicyBoundary]：debug temp 是源码 binding；删除其分支写入会抹掉保留的 source identity。
+                // 候选拒绝[SemanticBarrier:DebugScope]：debug temp 是 IR 已保留的源码 binding；删除其分支写入会抹掉该 source identity。
                 if self.debug_temps.contains(temp) {
                     return false;
                 }
@@ -281,8 +300,12 @@ impl BooleanShellFacts {
                         // 候选拒绝[SemanticBarrier:Capture]：同 home 的 ByReference closure 会观察这次布尔写；删除后它继续读取旧值。
                         return false;
                     }
-                    if self.to_be_closed_slots.contains(&home.slot()) {
-                        // 候选拒绝[ProofIncomplete]：同物理槽承载过 TBC resource；当前尚缺 shell 点位与 Close epoch 的精确作用域关系，不能证明删除写入不改变 close owner。
+                    if self.to_be_closed_homes.contains(home) {
+                        // 候选拒绝[SemanticBarrier:Lifetime]：`TBC t0; shell-write t1; Close r0` 中 t0/t1 同 home 时，Close 读取 shell 新值；删除写入会改为关闭旧 resource（`tbc_protection_is_scoped_to_exact_home_epoch`）。
+                        return false;
+                    }
+                    if self.unresolved_to_be_closed_slots.contains(&home.slot()) {
+                        // 候选拒绝[ProofIncomplete]：同物理槽存在缺 trusted home 的 TBC resource，尚不能证明它与 shell 写入属于不同 close epoch。
                         return false;
                     }
                     if !self.visible_home_uses.proof_complete {
@@ -319,7 +342,7 @@ impl BooleanShellFacts {
                     // 候选拒绝[SemanticBarrier:Lifetime]：把对象引用写入 local 会建立新的可见 root；删除死写可能让该对象在后续显式 GC 中提前终结。
                     return false;
                 }
-                // 候选拒绝[PolicyBoundary]：retain-debug local 的显式分支写入属于项目选择保留的源码身份。
+                // 候选拒绝[SemanticBarrier:DebugScope]：retain-debug local 是 IR 已保留的源码 binding；删除显式分支写入会抹掉该 source identity。
                 if self.debug_locals.contains(local) {
                     return false;
                 }
@@ -706,5 +729,160 @@ fn booleanized_truthiness_expr(cond: HirExpr) -> HirExpr {
             })),
             rhs: HirExpr::Boolean(false),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::decompile::DecompileDialect;
+    use crate::hir::common::{
+        HirAssign, HirBlock, HirExpr, HirIf, HirLValue, HirLocalDecl, HirProto, HirProtoRef,
+        HirStmt, HirUnresolvedExpr, HirValuePack, LocalId, TempId,
+    };
+    use crate::hir::expr_safety::HirExprSafety;
+    use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
+
+    use super::{
+        BindingUseCounts, BooleanShellFacts, DeadShellOldValueFacts, OldValueClass,
+        VisibleHomeUseCounts, remove_boolean_materialization_shells_in_proto,
+    };
+
+    #[test]
+    fn unrelated_residual_does_not_disable_old_value_proof() {
+        let candidate = LocalId(0);
+        let mut proto = empty_test_proto();
+        proto.locals = vec![candidate];
+        proto.local_debug_hints = vec![None];
+        proto.local_debug_scopes = vec![None];
+        proto.body.stmts = vec![
+            local_decl(candidate, HirExpr::Nil),
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::Unresolved(Box::new(HirUnresolvedExpr {
+                    summary: "unrelated test residual".to_owned(),
+                })),
+                then_block: HirBlock::default(),
+                else_block: None,
+            })),
+            boolean_shell(HirLValue::Local(candidate)),
+        ];
+
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &ProtoPromotionFacts::default(),
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        assert_eq!(proto.body.stmts.len(), 2);
+        assert!(matches!(proto.body.stmts[1], HirStmt::If(_)));
+    }
+
+    #[test]
+    fn tbc_protection_is_scoped_to_exact_home_epoch() {
+        let temp = TempId(0);
+        let closed_home = HomeSlotKey::new(0, 0);
+        let reused_home = HomeSlotKey::new(0, 1);
+        let mut facts = BooleanShellFacts {
+            uses: BindingUseCounts::default(),
+            debug_temps: BTreeSet::new(),
+            debug_locals: BTreeSet::new(),
+            physical_root_locals: BTreeSet::new(),
+            temp_homes: BTreeMap::from([(temp, reused_home)]),
+            param_homes: BTreeMap::new(),
+            trusted_local_homes: BTreeMap::new(),
+            visible_home_uses: VisibleHomeUseCounts {
+                counts: BTreeMap::new(),
+                proof_complete: true,
+            },
+            reference_captured_homes: Some(BTreeSet::new()),
+            to_be_closed_homes: BTreeSet::from([closed_home]),
+            unresolved_to_be_closed_slots: BTreeSet::new(),
+            reference_captured_locals: BTreeSet::new(),
+            possibly_reference_captured_locals: BTreeSet::new(),
+        };
+        let old_values = DeadShellOldValueFacts {
+            locals: BTreeMap::new(),
+            homes: BTreeMap::from([(reused_home, OldValueClass::GcInert)]),
+        };
+        let internal_uses = BindingUseCounts::default();
+        let internal_home_uses = VisibleHomeUseCounts {
+            counts: BTreeMap::new(),
+            proof_complete: true,
+        };
+
+        assert!(facts.target_write_is_unobservable(
+            &HirLValue::Temp(temp),
+            true,
+            &internal_uses,
+            &internal_home_uses,
+            None,
+            &old_values,
+        ));
+
+        facts.to_be_closed_homes.insert(reused_home);
+        assert!(!facts.target_write_is_unobservable(
+            &HirLValue::Temp(temp),
+            true,
+            &internal_uses,
+            &internal_home_uses,
+            None,
+            &old_values,
+        ));
+    }
+
+    fn local_decl(local: LocalId, value: HirExpr) -> HirStmt {
+        HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![local],
+            values: HirValuePack::fixed(vec![value]),
+        }))
+    }
+
+    fn boolean_shell(target: HirLValue) -> HirStmt {
+        let arm = |value| HirBlock {
+            stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![target.clone()],
+                values: HirValuePack::fixed(vec![HirExpr::Boolean(value)]),
+            }))],
+        };
+        HirStmt::If(Box::new(HirIf {
+            cond: HirExpr::Boolean(true),
+            then_block: arm(true),
+            else_block: Some(arm(false)),
+        }))
+    }
+
+    fn empty_test_proto() -> HirProto {
+        HirProto {
+            id: HirProtoRef(0),
+            source: None,
+            line_range: crate::parser::ProtoLineRange {
+                defined_start: 0,
+                defined_end: 0,
+            },
+            signature: crate::parser::ProtoSignature {
+                num_params: 0,
+                is_vararg: false,
+                has_vararg_param_reg: false,
+                named_vararg_table: false,
+                legacy_arg_slot: false,
+            },
+            params: Vec::new(),
+            param_debug_hints: Vec::new(),
+            locals: Vec::new(),
+            local_debug_hints: Vec::new(),
+            local_debug_scopes: Vec::new(),
+            debug_scopes: Vec::new(),
+            physical_root_temps: BTreeSet::new(),
+            physical_root_locals: BTreeSet::new(),
+            upvalues: Vec::new(),
+            upvalue_debug_hints: Vec::new(),
+            temps: Vec::new(),
+            temp_debug_locals: Vec::new(),
+            temp_debug_scopes: Vec::new(),
+            body: HirBlock::default(),
+            children: Vec::new(),
+            failure: None,
+            detached_children: Vec::new(),
+        }
     }
 }

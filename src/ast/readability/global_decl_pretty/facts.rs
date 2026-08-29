@@ -65,8 +65,31 @@ pub(super) struct BlockFacts {
 
 impl BlockFacts {
     pub(super) fn collect(block: &AstBlock) -> Self {
-        let mut collector = GlobalFactsCollector::default();
-        visit::visit_block(block, &mut collector);
+        Self::collect_current_scope(block, None)
+    }
+
+    pub(super) fn collect_repeat(block: &AstBlock, condition: &AstExpr) -> Self {
+        Self::collect_current_scope(block, Some(condition))
+    }
+
+    fn collect_current_scope(block: &AstBlock, trailing_expr: Option<&AstExpr>) -> Self {
+        let mut collector = GlobalFactsCollector {
+            root_seen: true,
+            ..GlobalFactsCollector::default()
+        };
+        // 当前 block 是事实根；普通子 block 由 scoped walker 单独处理。repeat 的 body
+        // 与 condition 属于子级共享作用域，不能把 condition 提升成当前 block 的观测。
+        for stmt in &block.stmts {
+            if matches!(stmt, AstStmt::Repeat(_)) {
+                collector.visit_stmt(stmt);
+                collector.leave_stmt(stmt);
+            } else {
+                visit::visit_stmt(stmt, &mut collector);
+            }
+        }
+        if let Some(expr) = trailing_expr {
+            visit::visit_expr(expr, &mut collector);
+        }
 
         Self {
             explicit_here: collector.explicit_here,

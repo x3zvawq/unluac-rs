@@ -87,9 +87,8 @@ pub(super) fn rewrite_binding_handoff_seed(
     stmt: &mut HirStmt,
     retained_pairs: &[(HirLValue, HirExpr)],
 ) -> bool {
-    // 候选拒绝[ConvergenceGuard]：seed parser 已证明当前语句为 Assign；apply 形状不符表示 plan/apply 契约漂移。
     let HirStmt::Assign(assign) = stmt else {
-        return false;
+        panic!("parsed binding handoff seed must remain an assignment during apply")
     };
     assign.targets = retained_pairs
         .iter()
@@ -150,13 +149,11 @@ pub(super) fn update_handoff_seed(stmt: &HirStmt) -> Option<(TempId, CarryBindin
 }
 
 pub(super) fn rewrite_update_handoff_seed(stmt: &mut HirStmt, carried: CarryBinding) -> bool {
-    // 候选拒绝[ConvergenceGuard]：update seed parser 已证明单 target Assign；apply 失败表示 shape 契约漂移。
     let HirStmt::Assign(assign) = stmt else {
-        return false;
+        panic!("parsed update handoff seed must remain an assignment during apply")
     };
     let [target] = assign.targets.as_mut_slice() else {
-        // 候选拒绝[ConvergenceGuard]：已解析的 update seed 不应失去唯一 target。
-        return false;
+        panic!("parsed update handoff seed must retain its unique target during apply")
     };
     *target = match carried {
         CarryBinding::Param(param) => HirLValue::Param(param),

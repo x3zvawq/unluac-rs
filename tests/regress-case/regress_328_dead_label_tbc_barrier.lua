@@ -37,4 +37,5 @@ do
     assert(x == 3)
     assert(closed == 0)
 end
+assert(closed == 1)
 print("regress_328_dead_label_tbc_barrier")

@@ -595,13 +595,16 @@ impl<'a> AstLowerer<'a> {
         attr: AstLocalAttr,
     ) -> AstLocalBinding {
         let proto = &self.module.protos[proto_index];
-        let origin = if proto.physical_root_locals.contains(&binding) {
-            AstLocalOrigin::PhysicalRoot
-        } else if proto
+        let debug_hinted = proto
             .local_debug_hints
             .get(binding.index())
-            .is_some_and(|hint| hint.is_some())
-        {
+            .is_some_and(|hint| hint.is_some());
+        let physical_root = proto.physical_root_locals.contains(&binding);
+        let origin = if debug_hinted && physical_root {
+            AstLocalOrigin::DebugHintedPhysicalRoot
+        } else if physical_root {
+            AstLocalOrigin::PhysicalRoot
+        } else if debug_hinted {
             AstLocalOrigin::DebugHinted
         } else {
             AstLocalOrigin::Recovered
@@ -615,8 +618,17 @@ impl<'a> AstLowerer<'a> {
 
     fn lower_temp_binding(&self, proto_index: usize, temp: TempId) -> AstLocalBinding {
         let proto = &self.module.protos[proto_index];
-        let origin = if proto.physical_root_temps.contains(&temp) {
+        let debug_hinted = proto
+            .temp_debug_locals
+            .get(temp.index())
+            .is_some_and(|hint| hint.is_some());
+        let physical_root = proto.physical_root_temps.contains(&temp);
+        let origin = if debug_hinted && physical_root {
+            AstLocalOrigin::DebugHintedPhysicalRoot
+        } else if physical_root {
             AstLocalOrigin::PhysicalRoot
+        } else if debug_hinted {
+            AstLocalOrigin::DebugHinted
         } else {
             AstLocalOrigin::Recovered
         };

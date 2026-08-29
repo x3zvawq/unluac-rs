@@ -461,6 +461,18 @@ pub enum AstLocalOrigin {
     DebugHinted,
     /// HIR proved that this recovered declaration keeps a physical VM root alive.
     PhysicalRoot,
+    /// The source debug identity and the physical VM root are independently observable.
+    DebugHintedPhysicalRoot,
+}
+
+impl AstLocalOrigin {
+    pub const fn is_debug_hinted(self) -> bool {
+        matches!(self, Self::DebugHinted | Self::DebugHintedPhysicalRoot)
+    }
+
+    pub const fn is_physical_root(self) -> bool {
+        matches!(self, Self::PhysicalRoot | Self::DebugHintedPhysicalRoot)
+    }
 }
 
 /// 全局声明属性。

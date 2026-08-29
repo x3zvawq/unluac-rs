@@ -1828,10 +1828,9 @@ fn inline_open_return_fixed_alias_run(
         return false;
     }
 
-    let Some(captured_slots) = captured_slots_before_stmt.get(run_end) else {
-        // 候选拒绝[ConvergenceGuard]：capture 快照必须覆盖 open-return sink；缺项表示语句索引失配。
-        return false;
-    };
+    let captured_slots = captured_slots_before_stmt
+        .get(run_end)
+        .expect("capture snapshots must cover the planned open-return sink");
     let mut target_slots = BTreeSet::new();
     let mut source_slots = BTreeSet::new();
     for (stmt, fixed) in block.stmts[run_start..(run_start + alias_count)]

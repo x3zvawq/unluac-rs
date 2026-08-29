@@ -39,13 +39,14 @@ pub(super) struct HomeSlotKey {
     epoch: usize,
 }
 
-/// capture / promotion 共用的物理槽词法 epoch。
+/// capture / TBC / promotion 共用的物理槽词法 epoch。
 ///
 /// `Close` 只结束经过该 CFG 路径的 upvalue。这里把 close 当作槽位身份的 SSA 定义，
 /// 在 dominance frontier 建 merge epoch，再沿支配树给指令标注进入点身份；不能按线性
 /// PC 给所有后缀指令累加边界，否则 break/continue cleanup 会污染 sibling 路径。
 pub(super) struct SlotEpochFacts {
     epochs_by_reg: Vec<Option<SlotEpochFlow>>,
+    reference_captured_regs: Vec<bool>,
 }
 
 struct SlotEpochFlow {
@@ -60,7 +61,7 @@ impl SlotEpochFacts {
         graph: &GraphFacts,
         dataflow: &DataflowFacts,
     ) -> Self {
-        let captured_regs = proto
+        let reference_captured_regs = proto
             .instrs
             .iter()
             .filter_map(|instr| match instr {
@@ -73,17 +74,29 @@ impl SlotEpochFacts {
                 CaptureSource::ByValue(_) | CaptureSource::Upvalue(_) => None,
             })
             .collect::<BTreeSet<_>>();
-        let reg_count = captured_regs
+        let mut tracked_regs = reference_captured_regs.clone();
+        tracked_regs.extend(proto.instrs.iter().filter_map(|instr| match instr {
+            LowInstr::Tbc(tbc) => Some(tbc.reg),
+            _ => None,
+        }));
+        let reg_count = tracked_regs
             .iter()
             .map(|reg| reg.index() + 1)
             .max()
             .unwrap_or_default()
             .max(usize::from(proto.frame.max_stack_size));
         let mut epochs_by_reg = (0..reg_count).map(|_| None).collect::<Vec<_>>();
-        for reg in captured_regs {
+        for reg in tracked_regs {
             epochs_by_reg[reg.index()] = Some(analyze_slot_epoch(proto, cfg, graph, dataflow, reg));
         }
-        Self { epochs_by_reg }
+        let mut reference_captured_by_reg = vec![false; reg_count];
+        for reg in reference_captured_regs {
+            reference_captured_by_reg[reg.index()] = true;
+        }
+        Self {
+            epochs_by_reg,
+            reference_captured_regs: reference_captured_by_reg,
+        }
     }
 
     pub(super) fn epoch_at(&self, reg: Reg, instr: InstrRef) -> usize {
@@ -103,9 +116,10 @@ impl SlotEpochFacts {
     }
 
     pub(super) fn tracks_reference_capture(&self, reg: Reg) -> bool {
-        self.epochs_by_reg
+        self.reference_captured_regs
             .get(reg.index())
-            .is_some_and(Option::is_some)
+            .copied()
+            .unwrap_or(false)
     }
 }
 
@@ -271,8 +285,8 @@ pub(super) struct ProtoPromotionFacts {
     direct_table_seed_temps: BTreeSet<TempId>,
     direct_table_seed_locals: BTreeSet<LocalId>,
     loop_carrier_temps: BTreeSet<TempId>,
-    scope_end_upvalue_copy_root_temps: BTreeSet<TempId>,
-    upvalue_copy_root_overwrites: BTreeMap<TempId, TempId>,
+    scope_end_copy_root_temps: BTreeSet<TempId>,
+    copy_root_overwrites: BTreeMap<TempId, TempId>,
     local_home_slots: Vec<HomeSlotResolution>,
     invalidated_param_homes: BTreeSet<ParamId>,
     invalidated_local_homes: BTreeSet<LocalId>,
@@ -303,8 +317,7 @@ impl ProtoPromotionFacts {
             phi_temps,
             total_temps,
         );
-        let upvalue_copy_roots =
-            collect_upvalue_copy_root_facts(proto, dataflow, fixed_temps);
+        let copy_roots = collect_copy_root_facts(proto, dataflow, fixed_temps);
 
         Self {
             temp_home_slots,
@@ -325,8 +338,8 @@ impl ProtoPromotionFacts {
             direct_table_seed_temps: collect_direct_table_seed_temps(proto, dataflow, fixed_temps),
             direct_table_seed_locals: BTreeSet::new(),
             loop_carrier_temps: collect_loop_carrier_temps(plan, phi_temps),
-            scope_end_upvalue_copy_root_temps: upvalue_copy_roots.scope_end,
-            upvalue_copy_root_overwrites: upvalue_copy_roots.overwrites,
+            scope_end_copy_root_temps: copy_roots.scope_end,
+            copy_root_overwrites: copy_roots.overwrites,
             local_home_slots: Vec::new(),
             invalidated_param_homes: BTreeSet::new(),
             invalidated_local_homes: BTreeSet::new(),
@@ -393,21 +406,20 @@ impl ProtoPromotionFacts {
         self.loop_carrier_temps.contains(&temp)
     }
 
-    /// 该 temp 的 `GETUPVAL` copy home 在同一 low-IR block 内一直活跃到 Return。
+    /// 该 temp 的 direct copy home 在同一 low-IR block 内一直活跃到 Return。
     ///
     /// 这份事实只服务于“源码读取已经结束、物理栈槽仍作为 GC root”的负向保护；若
     /// 后续 binding 合并使 home provenance 失效，就不能再消费原始证明。
-    pub(super) fn is_scope_end_upvalue_copy_root_temp(&self, temp: TempId) -> bool {
-        !self.temp_home_was_invalidated(temp)
-            && self.scope_end_upvalue_copy_root_temps.contains(&temp)
+    pub(super) fn is_scope_end_copy_root_temp(&self, temp: TempId) -> bool {
+        !self.temp_home_was_invalidated(temp) && self.scope_end_copy_root_temps.contains(&temp)
     }
 
-    /// 返回结束该 upvalue copy root transaction 的精确 scalar-nil overwrite temp。
-    pub(super) fn upvalue_copy_root_overwrite(&self, temp: TempId) -> Option<TempId> {
+    /// 返回结束该 direct copy root transaction 的精确 scalar-nil overwrite temp。
+    pub(super) fn copy_root_overwrite(&self, temp: TempId) -> Option<TempId> {
         if self.temp_home_was_invalidated(temp) {
             return None;
         }
-        let overwrite = self.upvalue_copy_root_overwrites.get(&temp).copied()?;
+        let overwrite = self.copy_root_overwrites.get(&temp).copied()?;
         (!self.temp_home_was_invalidated(overwrite)
             && self.trusted_temp_home_slot(temp) == self.trusted_temp_home_slot(overwrite))
         .then_some(overwrite)
@@ -1091,37 +1103,41 @@ fn collect_loop_carrier_temps(plan: &StructurePlan, phi_temps: &[TempId]) -> BTr
     temps
 }
 
-/// 从 low-IR 正证一个 `GETUPVAL` copy 的物理槽在后续所有潜在用户代码/GC 观察点
+/// 从 low-IR 正证一个 direct `GETUPVAL`/跨槽 `MOVE` copy 的物理槽在后续所有潜在
+/// 用户代码/GC 观察点
 /// 都仍位于 VM active stack top 以下，并沿同一 basic block 活到 Return 或一个精确的
 /// scalar-nil overwrite。
 ///
 /// HIR 会丢失 block 结束时的隐式 stack-top 收缩；只看“后缀没有同槽写”会把已经到期
 /// 的高槽误提升成函数级 local。这里保留 raw 指令层的最小充分事实，且不跨任何控制
-/// terminator、Close/TBC 或无法计算活动栈下界的事件。
+/// terminator、TBC 标记、专用调用协议或无法计算活动栈下界的事件；`Close` 本身不
+/// 覆盖槽位，因此可以在已证明的活动 caller prefix 内继续到原始 `Return`。
 #[derive(Default)]
-struct UpvalueCopyRootFacts {
+struct CopyRootFacts {
     scope_end: BTreeSet<TempId>,
     overwrites: BTreeMap<TempId, TempId>,
 }
 
-enum UpvalueCopyRootEnd {
+enum CopyRootEnd {
     ScopeEnd,
     NilOverwrite(TempId),
 }
 
-fn collect_upvalue_copy_root_facts(
+fn collect_copy_root_facts(
     proto: &LoweredProto,
     dataflow: &DataflowFacts,
     fixed_temps: &[TempId],
-) -> UpvalueCopyRootFacts {
-    let mut facts = UpvalueCopyRootFacts::default();
+) -> CopyRootFacts {
+    let mut facts = CopyRootFacts::default();
     for def in &dataflow.defs {
-        let Some(LowInstr::GetUpvalue(get_upvalue)) = proto.instrs.get(def.instr.index()) else {
-            continue;
+        let is_direct_copy = match proto.instrs.get(def.instr.index()) {
+            Some(LowInstr::GetUpvalue(get_upvalue)) => {
+                get_upvalue.dst == def.reg && matches!(get_upvalue.src, UpvalueOperand::Upvalue(_))
+            }
+            Some(LowInstr::Move(move_)) => move_.dst == def.reg && move_.src != move_.dst,
+            _ => false,
         };
-        if get_upvalue.dst != def.reg
-            || !matches!(get_upvalue.src, UpvalueOperand::Upvalue(_))
-        {
+        if !is_direct_copy {
             continue;
         }
 
@@ -1130,10 +1146,10 @@ fn collect_upvalue_copy_root_facts(
             continue;
         }
         match copy_root_end(proto, dataflow, fixed_temps, def.instr, def.reg) {
-            Some(UpvalueCopyRootEnd::ScopeEnd) => {
+            Some(CopyRootEnd::ScopeEnd) => {
                 facts.scope_end.insert(direct);
             }
-            Some(UpvalueCopyRootEnd::NilOverwrite(overwrite)) => {
+            Some(CopyRootEnd::NilOverwrite(overwrite)) => {
                 facts.overwrites.insert(direct, overwrite);
             }
             None => {}
@@ -1148,7 +1164,7 @@ fn copy_root_end(
     fixed_temps: &[TempId],
     producer: InstrRef,
     home: Reg,
-) -> Option<UpvalueCopyRootEnd> {
+) -> Option<CopyRootEnd> {
     let mut observed = false;
 
     for index in producer.index() + 1..proto.instrs.len() {
@@ -1158,15 +1174,10 @@ fn copy_root_end(
         // 当前值若被覆盖，同一 root transaction 要么在精确 nil 写处终止，要么失去证明。
         if effect.must_define(home) {
             if observed
-                && let Some(overwrite) = direct_scalar_nil_overwrite_temp(
-                    proto,
-                    dataflow,
-                    fixed_temps,
-                    index,
-                    home,
-                )
+                && let Some(overwrite) =
+                    direct_scalar_nil_overwrite_temp(proto, dataflow, fixed_temps, index, home)
             {
-                return Some(UpvalueCopyRootEnd::NilOverwrite(overwrite));
+                return Some(CopyRootEnd::NilOverwrite(overwrite));
             }
             // 候选拒绝[SemanticBarrier:Lifetime]：同槽覆盖会在原位置结束旧 root；
             // 只有 direct scalar nil overwrite 能在 HIR 精确复现该终止点。
@@ -1174,7 +1185,7 @@ fn copy_root_end(
         }
 
         match instr {
-            LowInstr::Return(_) => return observed.then_some(UpvalueCopyRootEnd::ScopeEnd),
+            LowInstr::Return(_) => return observed.then_some(CopyRootEnd::ScopeEnd),
             LowInstr::Call(call) => {
                 // 只消费跨方言共同成立的 caller-prefix：callee base 以下的槽在被调
                 // 函数执行期间仍属于 caller frame。LuaJIT 的 FR1/FR2 frame link 会让
@@ -1186,11 +1197,13 @@ fn copy_root_end(
                 }
                 observed = true;
             }
-            LowInstr::Close(_)
-            | LowInstr::Tbc(_)
-            | LowInstr::TailCall(_)
-            | LowInstr::GenericForCall(_) => {
-                // 候选拒绝[ProofIncomplete]：close/resource 与专用调用协议需要各自的
+            LowInstr::Close(_) => {
+                // CLOSE 结束 open-upvalue / TBC 事务，但不覆盖当前槽；前序观察点已经
+                // 证明 home 位于活动 caller prefix，保留同一物理 local 穿过 CLOSE
+                // 只复现 VM 原有 root。继续扫描到原始 Return 才冻结作用域终点。
+            }
+            LowInstr::Tbc(_) | LowInstr::TailCall(_) | LowInstr::GenericForCall(_) => {
+                // 候选拒绝[ProofIncomplete]：resource 标记与专用调用协议需要各自的
                 // frame/root 区间事实，不能复用普通 CALL 的 caller-prefix 证明。
                 return None;
             }
@@ -1260,14 +1273,11 @@ fn low_instr_may_observe_gc_roots(dataflow: &DataflowFacts, index: usize) -> boo
         EffectTag::Metamethod,
     ];
 
-    dataflow
-        .effect_summaries
-        .get(index)
-        .is_some_and(|summary| {
-            OBSERVATION_TAGS
-                .iter()
-                .any(|tag| summary.tags.contains(tag))
-        })
+    dataflow.effect_summaries.get(index).is_some_and(|summary| {
+        OBSERVATION_TAGS
+            .iter()
+            .any(|tag| summary.tags.contains(tag))
+    })
 }
 
 fn fill_phi_home_slots(

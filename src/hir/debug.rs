@@ -120,7 +120,12 @@ pub(crate) fn dump_hir_module(
 fn write_debug_bindings(output: &mut String, proto: &HirProto) {
     let _ = writeln!(output, "  debug binding hints");
     write_debug_hint_slice(output, "p", &proto.param_debug_hints, None);
-    write_debug_hint_slice(output, "l", &proto.local_debug_hints, None);
+    write_debug_hint_slice(
+        output,
+        "l",
+        &proto.local_debug_hints,
+        Some(&proto.local_debug_scopes),
+    );
     write_debug_hint_slice(output, "u", &proto.upvalue_debug_hints, None);
     write_debug_hint_slice(
         output,

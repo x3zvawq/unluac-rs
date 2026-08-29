@@ -82,7 +82,8 @@ fn choose_best_structured_candidate(
     structured_candidates(subject, truthy, falsy, safety)
         .into_iter()
         .map(|candidate| normalize_candidate_expr(candidate, safety))
-        // 候选拒绝[ProofIncomplete]：有限抽象域当前只能提供筛选反例；错误路径与跨数值表示尚未精确建模，不能据此宣称完整等价证明。
+        // 候选验证：跨数值表示已在 SynthesisContext 建域前拒绝；任一未建模/错误路径
+        // 会让抽象求值返回 None 并拒绝候选，完整枚举覆盖剩余受支持的 primitive 分区。
         .filter(|candidate| validate_candidate_for_node(context, node_ref, candidate))
         .min_by_key(expr_cost)
 }
@@ -163,4 +164,49 @@ pub(super) fn validate_candidate_for_node(
         let candidate_value = context.eval_expr(candidate, env);
         candidate_value.as_ref() == Some(&decision_value)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::decompile::DecompileDialect;
+    use crate::hir::common::{
+        HirBinaryExpr, HirBinaryOpKind, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef,
+        HirDecisionTarget, HirExpr, HirLogicalExpr, LocalId,
+    };
+    use crate::hir::expr_safety::HirExprSafety;
+
+    use super::synthesize_value_decision_expr;
+
+    #[test]
+    fn mixed_numeric_value_identity_is_not_approved_by_finite_domain() {
+        let value = HirExpr::LocalRef(LocalId(0));
+        let integer_one = HirExpr::Integer(1);
+        let decision = HirDecisionExpr {
+            entry: HirDecisionNodeRef(0),
+            nodes: vec![HirDecisionNode {
+                id: HirDecisionNodeRef(0),
+                test: HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+                    lhs: value.clone(),
+                    rhs: integer_one.clone(),
+                })),
+                truthy: HirDecisionTarget::Expr(HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+                    lhs: HirExpr::Binary(Box::new(HirBinaryExpr {
+                        op: HirBinaryOpKind::Eq,
+                        lhs: value.clone(),
+                        rhs: integer_one.clone(),
+                    })),
+                    rhs: integer_one,
+                }))),
+                falsy: HirDecisionTarget::Expr(value),
+            }],
+        };
+
+        assert!(
+            synthesize_value_decision_expr(
+                &decision,
+                HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            )
+            .is_none()
+        );
+    }
 }

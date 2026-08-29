@@ -96,7 +96,10 @@ pub(super) fn extract_value_pack(
 ) -> (Vec<HirStmt>, HirValuePack, bool) {
     let (prefix, leading, pack, changed) =
         extract_value_pack_with_leading(Vec::new(), pack, state, safety);
-    debug_assert!(leading.is_empty());
+    assert!(
+        leading.is_empty(),
+        "value-pack extraction without leading values must not retain a leading expression"
+    );
     (prefix, pack, changed)
 }
 
@@ -253,7 +256,10 @@ pub(super) fn extract_assign(
             })
         })
         .collect();
-    debug_assert!(leading.next().is_none());
+    assert!(
+        leading.next().is_none(),
+        "table lvalue extraction must consume every preserved base and key"
+    );
 
     (prefix, HirAssign { targets, values }, changed)
 }
@@ -785,7 +791,10 @@ fn prepare_table_constructor(
             }),
         })
         .collect();
-    debug_assert!(exprs.next().is_none());
+    assert!(
+        exprs.next().is_none(),
+        "table field extraction must consume every prepared expression"
+    );
 
     (
         extracted.prefix,
@@ -814,7 +823,10 @@ fn prepare_closure(
         let (prefix, value) = if by_value {
             prepare_pure_expr(value, state, safety)
         } else {
-            debug_assert!(!expr_contains_eliminable_decision(&value));
+            assert!(
+                !expr_contains_eliminable_decision(&value),
+                "by-reference capture must not retain an eliminable decision"
+            );
             (Vec::new(), value)
         };
         let stable = !prefix.is_empty() && matches!(value, HirExpr::LocalRef(_));
@@ -850,7 +862,7 @@ pub(super) fn eliminate_condition_expr(expr: &mut HirExpr, safety: HirExprSafety
                 *expr = replacement;
                 true
             } else {
-                // 候选拒绝[ProofIncomplete]：条件位置尚无 statement-prefix 物化通道，非稳定或循环 Decision 只能暂留，需由前层补 loop owner 或本 pass 抽取条件前缀。
+                // 候选拒绝[ProofIncomplete]：纯表达式通道无法物化非稳定 Decision；If/While owner 会抽取短作用域 truthiness，Repeat 仍缺让 continue 先执行尾条件前缀的布局。
                 false
             }
         }
@@ -945,9 +957,7 @@ struct EliminableDecisionCollector {
 
 impl HirVisitor for EliminableDecisionCollector {
     fn visit_expr(&mut self, expr: &HirExpr) {
-        // 候选拒绝[ProofIncomplete]：循环 Decision 不能进入递归物化；缺少把回边映射为结构化 loop 的 owner/fact。
-        self.found |=
-            matches!(expr, HirExpr::Decision(decision) if !super::decision_has_cycles(decision));
+        self.found |= matches!(expr, HirExpr::Decision(_));
     }
 }
 

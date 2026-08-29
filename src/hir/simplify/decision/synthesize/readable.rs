@@ -11,7 +11,8 @@ use crate::hir::expr_safety::HirExprSafety;
 
 use super::super::{logical_and, logical_or};
 use super::domain::{
-    AbstractValue, collect_literals_from_expr, collect_refs_from_expr, enumerate_environments,
+    AbstractValue, collect_literals_from_expr, collect_refs_from_expr,
+    domain_supports_literal_value_identities, enumerate_environments,
     validate_pure_expr_equivalence,
 };
 use super::normalize_candidate_expr;
@@ -42,6 +43,11 @@ pub(crate) fn naturalize_pure_logical_expr(
         .collect::<BTreeMap<_, _>>();
     let mut literals = BTreeSet::new();
     collect_literals_from_expr(&current, &mut literals);
+    if !domain_supports_literal_value_identities(&literals, safety) {
+        // 候选拒绝[ProofIncomplete]：有限域尚未覆盖 PUC Lua 5.3+
+        // equality-equivalent 的 Integer/Number 双表示，不能批准会改变返回值身份的改写。
+        return None;
+    }
     let mut domain = vec![
         AbstractValue::Nil,
         AbstractValue::False,
@@ -61,7 +67,8 @@ pub(crate) fn naturalize_pure_logical_expr(
         let Some(next) = pure_logical_rewrite_candidates(&current)
             .into_iter()
             .map(|candidate| normalize_candidate_expr(candidate, safety))
-            // 候选拒绝[ProofIncomplete]：有限抽象域当前只能筛掉已见反例；错误路径与跨数值表示尚未精确建模，不能据此宣称完整等价证明。
+            // 候选验证：跨数值表示已在建域前拒绝；任一未建模/错误路径会让抽象求值
+            // 返回 None 并拒绝候选，完整枚举覆盖剩余受支持的 primitive 分区。
             .filter(|candidate| {
                 validate_pure_expr_equivalence(
                     expr,

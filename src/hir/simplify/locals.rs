@@ -81,6 +81,7 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     let mut next_local_index = proto.locals.len();
     let mut new_locals = Vec::new();
     let mut new_local_debug_hints = Vec::new();
+    let mut new_local_debug_scopes = Vec::new();
     let mut physical_root_locals = BTreeSet::new();
     let mut promoted_bindings = Vec::new();
     let mut direct_seed_promotions = Vec::new();
@@ -98,6 +99,7 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
             next_local_index: &mut next_local_index,
             new_locals: &mut new_locals,
             new_local_debug_hints: &mut new_local_debug_hints,
+            new_local_debug_scopes: &mut new_local_debug_scopes,
             physical_root_locals: &mut physical_root_locals,
             promoted_bindings: &mut promoted_bindings,
             direct_seed_promotions: &mut direct_seed_promotions,
@@ -131,6 +133,7 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     }
     proto.locals.extend(new_locals);
     proto.local_debug_hints.extend(new_local_debug_hints);
+    proto.local_debug_scopes.extend(new_local_debug_scopes);
     proto.physical_root_locals.extend(physical_root_locals);
     let entry_nil_changed = entry_nil::prune_redundant_entry_nil_writes(proto, facts, safety);
     let alias_changed = param_alias::coalesce_param_aliases_in_proto(proto, facts, safety);
@@ -209,6 +212,7 @@ struct PromotionCtx<'a> {
     next_local_index: &'a mut usize,
     new_locals: &'a mut Vec<LocalId>,
     new_local_debug_hints: &'a mut Vec<Option<String>>,
+    new_local_debug_scopes: &'a mut Vec<Option<usize>>,
     physical_root_locals: &'a mut BTreeSet<LocalId>,
     promoted_bindings: &'a mut Vec<(TempId, LocalId)>,
     direct_seed_promotions: &'a mut Vec<(TempId, LocalId)>,
@@ -227,6 +231,7 @@ struct PlanAllocator<'a> {
     next_local_index: &'a mut usize,
     new_locals: &'a mut Vec<LocalId>,
     new_local_debug_hints: &'a mut Vec<Option<String>>,
+    new_local_debug_scopes: &'a mut Vec<Option<usize>>,
     promoted_bindings: &'a mut Vec<(TempId, LocalId)>,
     direct_seed_promotions: &'a mut Vec<(TempId, LocalId)>,
     debug_scope_locals: &'a mut BTreeMap<(HomeSlotKey, usize), LocalId>,
@@ -246,6 +251,8 @@ impl PlanAllocator<'_> {
         self.new_locals.push(local);
         self.new_local_debug_hints
             .push(debug_hint_for_temp_group(self.temp_debug_locals, &temps));
+        self.new_local_debug_scopes
+            .push(debug_scope_for_temp_group(self.temp_debug_scopes, &temps));
         if let Some(home_slot) = home_slot
             && let Some(scope) = debug_scope_for_temp_group(self.temp_debug_scopes, &temps)
         {
@@ -281,6 +288,12 @@ impl PlanAllocator<'_> {
             self.temp_debug_locals
                 .get(temp.index())
                 .cloned()
+                .unwrap_or_default(),
+        );
+        self.new_local_debug_scopes.push(
+            self.temp_debug_scopes
+                .get(temp.index())
+                .copied()
                 .unwrap_or_default(),
         );
         self.reserved_temps.insert(temp);
@@ -620,6 +633,7 @@ fn collect_plans(
                 next_local_index: ctx.next_local_index,
                 new_locals: ctx.new_locals,
                 new_local_debug_hints: ctx.new_local_debug_hints,
+                new_local_debug_scopes: ctx.new_local_debug_scopes,
                 promoted_bindings: ctx.promoted_bindings,
                 direct_seed_promotions: ctx.direct_seed_promotions,
                 debug_scope_locals: ctx.debug_scope_locals,
@@ -682,6 +696,7 @@ fn collect_plans(
                 next_local_index: ctx.next_local_index,
                 new_locals: ctx.new_locals,
                 new_local_debug_hints: ctx.new_local_debug_hints,
+                new_local_debug_scopes: ctx.new_local_debug_scopes,
                 promoted_bindings: ctx.promoted_bindings,
                 direct_seed_promotions: ctx.direct_seed_promotions,
                 debug_scope_locals: ctx.debug_scope_locals,
@@ -759,7 +774,8 @@ fn collect_plans(
                 .iter()
                 .any(|temp| ctx.identity_sensitive_temps.contains(temp))
         {
-            // 候选拒绝[SemanticBarrier:Capture/Resource]：`f` 引用捕获 t0、move 后 `g` 捕获 t1、再覆盖 t0 时，缺同一 trusted home 却合并会让 f/g 错误共享 cell；TBC 同理会更换 close owner。
+            // 候选拒绝[SemanticBarrier:Capture]：`f` 引用捕获 t0、move 后 `g` 捕获 t1、再覆盖 t0 时，缺同一 trusted home 却合并会让 f/g 错误共享 cell；
+            // 候选拒绝[SemanticBarrier:Resource]：TBC 跨同样的不可信合并会更换 close owner。
             // 候选拒绝[ProofIncomplete]：该 blanket 也包含按值 capture 与无 alias 的单节点组；应按 capture kind、组大小与实际 home 收窄。
             continue;
         }
@@ -853,6 +869,7 @@ fn collect_plans(
             next_local_index: ctx.next_local_index,
             new_locals: ctx.new_locals,
             new_local_debug_hints: ctx.new_local_debug_hints,
+            new_local_debug_scopes: ctx.new_local_debug_scopes,
             promoted_bindings: ctx.promoted_bindings,
             direct_seed_promotions: ctx.direct_seed_promotions,
             debug_scope_locals: ctx.debug_scope_locals,
@@ -969,6 +986,7 @@ fn collect_plans(
                 next_local_index: ctx.next_local_index,
                 new_locals: ctx.new_locals,
                 new_local_debug_hints: ctx.new_local_debug_hints,
+                new_local_debug_scopes: ctx.new_local_debug_scopes,
                 promoted_bindings: ctx.promoted_bindings,
                 direct_seed_promotions: ctx.direct_seed_promotions,
                 debug_scope_locals: ctx.debug_scope_locals,

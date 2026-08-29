@@ -53,6 +53,27 @@ impl ScopedAstRewritePass for LocalScopeLimitPass {
     ) -> (bool, Self::Scope) {
         enter_block_with_trailing_condition(block, Some(condition), *outer_locals)
     }
+
+    fn scope_for_stmt_children(
+        &mut self,
+        stmt: &AstStmt,
+        outer_locals: &Self::Scope,
+    ) -> Self::Scope {
+        // for 控制变量只在 loop body 内可见；控制表达式里即使出现嵌套函数，
+        // enter_function 也会重置预算，因此统一给 statement children 加上它们是精确的。
+        match stmt {
+            AstStmt::NumericFor(_) => outer_locals.saturating_add(1),
+            AstStmt::GenericFor(generic_for) => {
+                outer_locals.saturating_add(generic_for.bindings.len())
+            }
+            _ => *outer_locals,
+        }
+    }
+
+    fn scope_after_stmt(&mut self, stmt: &AstStmt, outer_locals: &Self::Scope) -> Self::Scope {
+        // Lua local 从声明语句结束后才进入当前 block 的后续词法作用域。
+        outer_locals.saturating_add(direct_local_count(stmt))
+    }
 }
 
 fn enter_block_with_trailing_condition(
@@ -65,8 +86,9 @@ fn enter_block_with_trailing_condition(
         crate::SOURCE_LOCAL_LIMIT.saturating_sub(outer_locals),
         trailing_condition,
     );
-    let direct_locals = block.stmts.iter().map(direct_local_count).sum::<usize>();
-    (changed, outer_locals.saturating_add(direct_locals))
+    // 当前 block 的声明不能在入口一次性加入：它们只应通过 scope_after_stmt
+    // 按源码位置影响后续 sibling 及其子 block。
+    (changed, outer_locals)
 }
 
 fn scope_locals(
@@ -79,7 +101,7 @@ fn scope_locals(
         // 分析停用[LayerBoundary]：外层/参数已耗尽全部源码 local 预算时，内层 `do` 不能降低同时活跃的外层数量；需由 HIR home compaction 减少 persistent locals。
         return false;
     }
-    if direct_local_count <= available_locals {
+    if direct_local_pressure(&block.stmts) <= available_locals {
         return false;
     }
 
@@ -98,7 +120,10 @@ fn scope_locals(
                 bindings.ids().all(|binding| {
                     // 候选拒绝[SemanticBarrier:Scope]：repeat 的 `until binding` 在 body 直属作用域读取，包进内层 `do` 会使条件失去该 local。
                     !trailing_mentions.contains(&binding) && {
-                        let last = last_mentions.get(&binding).copied().unwrap_or(index);
+                        let last = last_mentions
+                            .get(&binding)
+                            .copied()
+                            .expect("scopeable declaration must mention its binding");
                         // 候选拒绝[ProofIncomplete]：生命周期跨过超过 64 个 scopeable local 的 binding 暂不分组；需按区间图/峰值活跃数规划重叠作用域，而非固定窗口。
                         scopeable_prefix[last + 1] - scopeable_prefix[index] <= lifetime_limit
                     }
@@ -118,7 +143,7 @@ fn scope_locals(
         SCOPE_LOCAL_TARGET.min(available_locals.saturating_sub(persistent_locals).max(1));
     let ranges = scope_ranges(&block.stmts, &last_mentions, &short_lived, scope_target);
     if ranges.is_empty() {
-        // 候选拒绝[ProofIncomplete]：函数已超 local 预算但当前连续区间算法找不到安全范围；需报告不可缩减的 persistent 集合并由前层压缩身份。
+        // 候选拒绝[ProofIncomplete]：block 峰值已超 local 预算但当前连续区间算法找不到安全范围；需报告不可缩减的 persistent 集合并由前层压缩身份。
         return false;
     }
 
@@ -143,6 +168,22 @@ fn direct_local_count(stmt: &AstStmt) -> usize {
         AstStmt::LocalFunctionDecl(_) => 1,
         _ => 0,
     }
+}
+
+fn direct_local_pressure(stmts: &[AstStmt]) -> usize {
+    let mut active = 0usize;
+    let mut peak = 0usize;
+    for stmt in stmts {
+        let loop_bindings = match stmt {
+            AstStmt::NumericFor(_) => 1,
+            AstStmt::GenericFor(generic_for) => generic_for.bindings.len(),
+            _ => 0,
+        };
+        peak = peak.max(active.saturating_add(loop_bindings));
+        active = active.saturating_add(direct_local_count(stmt));
+        peak = peak.max(active);
+    }
+    peak
 }
 
 #[derive(Clone, Copy)]
@@ -234,9 +275,14 @@ fn scope_ranges(
         let start = index;
         let mut required_end = bindings
             .ids()
-            .filter_map(|binding| last_mentions.get(&binding).copied())
+            .map(|binding| {
+                last_mentions
+                    .get(&binding)
+                    .copied()
+                    .expect("scopeable declaration must mention its binding")
+            })
             .max()
-            .unwrap_or(index);
+            .expect("scopeable declaration must contain a binding");
         let mut scoped_locals = 0usize;
         let mut safe_end = None;
         while index < stmts.len() && !is_scope_barrier(&stmts[index]) {
@@ -253,9 +299,14 @@ fn scope_ranges(
                 required_end = required_end.max(
                     bindings
                         .ids()
-                        .filter_map(|binding| last_mentions.get(&binding).copied())
+                        .map(|binding| {
+                            last_mentions
+                                .get(&binding)
+                                .copied()
+                                .expect("scopeable declaration must mention its binding")
+                        })
                         .max()
-                        .unwrap_or(index),
+                        .expect("scopeable declaration must contain a binding"),
                 );
             }
             if index >= required_end {
@@ -281,7 +332,50 @@ fn scope_ranges(
 }
 
 fn is_scope_barrier(stmt: &AstStmt) -> bool {
-    // 候选拒绝[SemanticBarrier:Scope]：新增 `do` 若跨 label/goto 会改变 label 可见性或制造跳入 local 作用域；候选拒绝[SemanticBarrier:Lifetime]：也不能跨 `<close>` 资源边界。
-    matches!(stmt, AstStmt::Goto(_) | AstStmt::Label(_))
-        || (direct_local_count(stmt) != 0 && scopeable_bindings(stmt).is_none())
+    if matches!(stmt, AstStmt::Goto(_) | AstStmt::Label(_)) {
+        // 候选拒绝[ProofIncomplete]：区间规划尚未携带 goto/label 的相对 owner 与入边；只有外部跳入新 `do` 的形状是 Scope 反例，同区间或跳出形状仍待精确放行。
+        return true;
+    }
+    // 属性/debug/root 声明的具体拒绝理由由 scopeable_bindings 在同一候选点分类。
+    direct_local_count(stmt) != 0 && scopeable_bindings(stmt).is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::common::{AstGenericFor, AstLocalDecl};
+    use crate::hir::LocalId;
+
+    fn recovered_local(index: usize) -> AstStmt {
+        AstStmt::LocalDecl(Box::new(AstLocalDecl {
+            bindings: vec![AstLocalBinding {
+                id: AstBindingRef::Local(LocalId(index)),
+                attr: AstLocalAttr::None,
+                origin: AstLocalOrigin::Recovered,
+            }],
+            values: vec![AstExpr::Integer(index as i64)],
+        }))
+    }
+
+    #[test]
+    fn scopes_preceding_locals_before_generic_for_binder_peak() {
+        let mut block = AstBlock {
+            stmts: (0..crate::SOURCE_LOCAL_LIMIT - 1)
+                .map(recovered_local)
+                .chain(std::iter::once(AstStmt::GenericFor(Box::new(
+                    AstGenericFor {
+                        bindings: vec![
+                            AstBindingRef::Local(LocalId(1_000)),
+                            AstBindingRef::Local(LocalId(1_001)),
+                        ],
+                        iterator: vec![AstExpr::Nil],
+                        body: AstBlock::default(),
+                    },
+                ))))
+                .collect(),
+        };
+
+        assert!(scope_locals(&mut block, crate::SOURCE_LOCAL_LIMIT, None));
+        assert!(matches!(block.stmts.first(), Some(AstStmt::DoBlock(_))));
+    }
 }

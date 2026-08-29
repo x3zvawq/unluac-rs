@@ -36,8 +36,14 @@ pub(super) fn collapse_adjacent_self_call_updates(
             index += 1;
             continue;
         }
-        if binding.attr == AstLocalAttr::Const || binding.origin == AstLocalOrigin::DebugHinted {
-            // 候选拒绝[PolicyBoundary]：`<const>` 与 DebugHinted 的源码声明身份按保真策略保留。
+        if binding.attr == AstLocalAttr::Const {
+            // 候选拒绝[PolicyBoundary]：`<const>` 的源码声明身份按展示策略保留。
+            stmt_plan.push(PlannedStmt::Original(index));
+            index += 1;
+            continue;
+        }
+        if binding.origin.is_debug_hinted() {
+            // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted 是 IR 已保留的源码 binding；吞掉更新壳会改写其显式值 epoch。
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
@@ -203,7 +209,8 @@ pub(super) fn collapse_adjacent_call_alias_runs(
                 use_index.count_uses_in_range(candidate_index + 1, run_end, candidate.binding())
             };
             if intermediate_uses != 0 {
-                // 候选拒绝[SemanticBarrier:EvalOrder/Lifetime]：候选在抵达 sink 前已有读取，删除声明会改变快照时点或重复 producer。
+                // 候选拒绝[SemanticBarrier:EvalOrder]：候选在抵达 sink 前已有读取，删除声明会改变快照时点；
+                // 候选拒绝[SemanticBarrier:EvalCount]：有事件 producer 会被中间读取与 sink 重复消费。
                 continue;
             }
 
@@ -588,7 +595,9 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
                 continue;
             };
             if !candidate.allows_expr_with_policy(value, InlinePolicy::MechanicalRun) {
-                // 候选拒绝[SemanticBarrier:DebugScope/Lifetime]：DebugHinted/PhysicalRoot 不能删除（regress_351、regress_353）；候选拒绝[ProofIncomplete]：Recovered call/vararg/table/closure 尚缺值宽度或 root 证明；候选拒绝[LayerBoundary]：Error residual 不由 readability 消费。
+                // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted 不能删除（regress_351）；
+                // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 不能脱离原 root（regress_353）；
+                // 候选拒绝[ProofIncomplete]：Recovered call/vararg/table/closure 尚缺值宽度或 root 证明；候选拒绝[LayerBoundary]：Error residual 不由 readability 消费。
                 continue;
             }
             let run_uses = use_index.count_uses_in_range(
@@ -746,7 +755,9 @@ pub(super) fn collapse_terminal_local_mechanical_runs(
                 continue;
             };
             if !candidate.allows_expr_with_policy(value, InlinePolicy::MechanicalRun) {
-                // 候选拒绝[SemanticBarrier:DebugScope/Lifetime]：DebugHinted/PhysicalRoot 不能删除（regress_351、regress_353）；候选拒绝[ProofIncomplete]：Recovered call/vararg/table/closure 尚缺值宽度或 root 证明；候选拒绝[LayerBoundary]：Error residual 不由 readability 消费。
+                // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted 不能删除（regress_351）；
+                // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 不能脱离原 root（regress_353）；
+                // 候选拒绝[ProofIncomplete]：Recovered call/vararg/table/closure 尚缺值宽度或 root 证明；候选拒绝[LayerBoundary]：Error residual 不由 readability 消费。
                 continue;
             }
             let suffix_uses =

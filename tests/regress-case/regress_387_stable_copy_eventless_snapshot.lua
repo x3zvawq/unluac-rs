@@ -6,6 +6,11 @@
 -- unluac: expect-not-contains [[local r2_0 = p2_0 and]]
 -- unluac: expect-contains [[local r3_0 = not p3_0]]
 -- unluac: expect-contains [[local r5_0 = p5_0 == p5_1]]
+-- unluac: expect-contains [[p8_1(not p8_0)]]
+-- unluac: expect-not-contains [[local r8_0 = not p8_0]]
+-- unluac: expect-contains [[local r9_0 = not p9_0]]
+-- unluac: expect-contains [[p10_1(p10_0)]]
+-- unluac: expect-not-contains [[local r10_0 = p10_0]]
 
 local function stable_not(value, sink)
     local inverted = not value
@@ -47,6 +52,29 @@ local function captured_dependency(value)
     return inverted
 end
 
+local function write_after_last_use(value, sink)
+    local inverted = not value
+    sink()
+    sink(inverted)
+    value = true
+end
+
+local function repeated_dependency(value)
+    local inverted = not value
+    local count = 0
+    while inverted and count < 2 do
+        count = count + 1
+        value = true
+    end
+    return count
+end
+
+local function stable_parameter(value, sink)
+    local alias = value
+    sink()
+    sink(alias)
+end
+
 local function allocated_twice()
     local value = {}
     return value, value
@@ -61,6 +89,21 @@ assert(stable_choice(true, left, right, function() end) == left)
 assert(stable_choice(false, left, right, function() end) == right)
 assert(written_dependency(false) == true)
 assert(captured_dependency(false) == true)
+
+local seen = {}
+write_after_last_use(false, function(value)
+    if value ~= nil then
+        seen[#seen + 1] = value
+    end
+end)
+assert(#seen == 1 and seen[1] == true)
+assert(repeated_dependency(false) == 2)
+stable_parameter("parameter", function(value)
+    if value ~= nil then
+        seen[#seen + 1] = value
+    end
+end)
+assert(seen[2] == "parameter")
 
 local equal_first, equal_second = compared_twice(left, right)
 assert(equal_first == true and equal_second == true)

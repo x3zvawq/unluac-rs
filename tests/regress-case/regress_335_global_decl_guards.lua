@@ -81,6 +81,18 @@ local function test_field_root()
     return field_owner.read()
 end
 
+local function test_function_name_seed()
+    local seed = {}
+    global exported_seed = seed
+    global<const> assert
+
+    function seed.field()
+        return 23
+    end
+    assert(exported_seed.field() == 23)
+    return exported_seed.field()
+end
+
 local function test_nonterminal_collective()
     global gate = 0
     global<const> math, print
@@ -167,6 +179,7 @@ local captured = test_captured_seed()
 local rooted = test_physical_root()
 local child = test_child_gate(true)
 local field = test_field_root()
+local function_name_seed = test_function_name_seed()
 local collective = test_nonterminal_collective()
 local collective_root = test_collective_lifetime()
 local collective_close = test_collective_close()
@@ -178,6 +191,7 @@ print(
     rooted,
     child,
     field,
+    function_name_seed,
     collective,
     collective_root,
     collective_close,

@@ -35,9 +35,7 @@ pub(super) trait AstVisitor {
 
     fn leave_function_expr(&mut self, _function: &AstFunctionExpr) {}
 
-    fn visit_condition_expr(&mut self, expr: &AstExpr) {
-        self.visit_expr(expr);
-    }
+    fn visit_condition_expr(&mut self, _expr: &AstExpr) {}
 }
 
 pub(super) fn visit_block(block: &AstBlock, visitor: &mut impl AstVisitor) {
@@ -100,7 +98,7 @@ fn visit_lvalue(lvalue: &AstLValue, visitor: &mut impl AstVisitor) {
     });
 }
 
-fn visit_expr(expr: &AstExpr, visitor: &mut impl AstVisitor) {
+pub(super) fn visit_expr(expr: &AstExpr, visitor: &mut impl AstVisitor) {
     visitor.visit_expr(expr);
     traverse_expr_children!(
         expr,

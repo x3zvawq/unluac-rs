@@ -429,7 +429,7 @@ fn iterator_target_can_be_deleted(target: TempId, context: &GenericForIteratorPa
     if context.use_counts.get(&target) != Some(&1) {
         return false;
     }
-    // 候选拒绝[SemanticBarrier:Scope]：debug.getlocal 可观察 source iterator/state/control 的词法身份；见 regress_343。
+    // 候选拒绝[SemanticBarrier:DebugScope]：debug.getlocal 可观察 source iterator/state/control 的词法身份；见 regress_343。
     if context
         .debug_temps
         .get(target.index())

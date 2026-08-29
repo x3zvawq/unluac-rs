@@ -47,11 +47,7 @@ impl DeadShellPlan {
         let mut boundary = AnalysisBoundary::default();
         visit::visit_proto(proto, &mut boundary);
         if boundary.unstructured_control {
-            // 分析停用[LayerBoundary]：label/goto 的非局部 predecessor 由 Structure island/branch-control owner 维护；相邻空声明的局部证明仍由外层 fallback 消费。
-            return Self::default();
-        }
-        if boundary.residual_expr {
-            // 分析停用[LayerBoundary]：Decision/Unresolved 的路径和值域由 decision/dead-unresolved owner 收敛；本分析不把 residual 当成普通 reaching value。
+            // 分析停用[ProofIncomplete]：label/goto 存在非局部 predecessor，当前线性 HIR 分析缺少候选点的 CFG reaching-state；dead-labels/branch-control 改写 LabelGoto 后会重跑本 pass。
             return Self::default();
         }
 
@@ -95,16 +91,11 @@ impl DeadShellPlan {
 #[derive(Default)]
 struct AnalysisBoundary {
     unstructured_control: bool,
-    residual_expr: bool,
 }
 
 impl HirVisitor for AnalysisBoundary {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         self.unstructured_control |= matches!(stmt, HirStmt::Goto(_) | HirStmt::Label(_));
-    }
-
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        self.residual_expr |= matches!(expr, HirExpr::Decision(_) | HirExpr::Unresolved(_));
     }
 }
 

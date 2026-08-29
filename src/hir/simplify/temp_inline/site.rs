@@ -9,7 +9,7 @@
 //! 合并视为 call 所在的单一站点；普通点调用仍分别扫描 callee 与参数。
 //! 例如：`r0(1)` 会把 `r0` 标成 `CallCallee`，`r0:m()` 则把 receiver 标成 call 所在站点。
 
-use super::super::decision::decision_has_cycles;
+use super::super::decision::assert_valid_decision;
 use super::super::visit::{HirVisitor, visit_stmts};
 use super::*;
 
@@ -375,13 +375,9 @@ impl EvalOrderProbe<'_> {
                 })
             }
             HirExpr::Decision(decision) => {
-                !decision_has_cycles(decision)
-                    && decision
-                        .nodes
-                        .get(decision.entry.index())
-                        .is_some_and(|entry| {
-                            expr_touches_temp(&entry.test, self.temp) && self.expr(&entry.test)
-                        })
+                assert_valid_decision(decision);
+                let entry = &decision.nodes[decision.entry.index()];
+                expr_touches_temp(&entry.test, self.temp) && self.expr(&entry.test)
             }
             HirExpr::Closure(_)
             | HirExpr::Nil
@@ -620,37 +616,27 @@ fn find_site_in_decision(
     temp: TempId,
     outer_site: InlineSite,
 ) -> Option<InlineSite> {
+    assert_valid_decision(decision);
     let entry_index = decision.entry.index();
-    let entry = decision
-        .nodes
-        .get(entry_index)
-        .expect("HIR Decision entry must reference an existing node");
-    let entry_site = if decision_has_cycles(decision) {
-        InlineSite::RepeatedNested
-    } else {
-        match outer_site {
-            InlineSite::Direct => InlineSite::Condition,
-            InlineSite::ReturnValue
-            | InlineSite::Condition
-            | InlineSite::LoopCondition
-            | InlineSite::LoopHead => outer_site,
-            InlineSite::ConditionalNested | InlineSite::RepeatedNested => outer_site,
-            InlineSite::Nested
-            | InlineSite::EagerOperand
-            | InlineSite::EagerAccessBase
-            | InlineSite::Index
-            | InlineSite::CallArg
-            | InlineSite::FastCallArg
-            | InlineSite::CallCallee
-            | InlineSite::FastCallCallee
-            | InlineSite::AccessBase => InlineSite::Nested,
-        }
+    let entry = &decision.nodes[entry_index];
+    let entry_site = match outer_site {
+        InlineSite::Direct => InlineSite::Condition,
+        InlineSite::ReturnValue
+        | InlineSite::Condition
+        | InlineSite::LoopCondition
+        | InlineSite::LoopHead => outer_site,
+        InlineSite::ConditionalNested | InlineSite::RepeatedNested => outer_site,
+        InlineSite::Nested
+        | InlineSite::EagerOperand
+        | InlineSite::EagerAccessBase
+        | InlineSite::Index
+        | InlineSite::CallArg
+        | InlineSite::FastCallArg
+        | InlineSite::CallCallee
+        | InlineSite::FastCallCallee
+        | InlineSite::AccessBase => InlineSite::Nested,
     };
-    let conditional_site = if decision_has_cycles(decision) {
-        InlineSite::RepeatedNested
-    } else {
-        outer_site.conditional()
-    };
+    let conditional_site = outer_site.conditional();
     find_site_in_expr(&entry.test, temp, entry_site).or_else(|| {
         decision.nodes.iter().enumerate().find_map(|(index, node)| {
             (index != entry_index)

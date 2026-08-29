@@ -2,8 +2,8 @@
 //!
 //! `Decision` 适合作为 HIR 内部恢复共享短路子图时的过渡表示，但不应该继续流到 AST。
 //! 这个文件只负责按语句顺序遍历 block，并把表达式抽取、值物化和条件消除委托给
-//! `eliminate_materialize.rs`；它不重新识别 Decision DAG，也不在 statement 层补 case
-//! 特判。
+//! `eliminate_materialize.rs`；它不重新识别 Decision DAG。If/While 条件无法纯表达式化时，
+//! 这里用短作用域物化 truthiness，确保原值根在 branch/body 前释放。
 //!
 //! 例子：
 //! - 输入：`local x = Decision(...)`
@@ -12,8 +12,8 @@
 use std::mem;
 
 use crate::hir::common::{
-    HirBlock, HirCallStmt, HirErrNil, HirLValue, HirLocalDecl, HirProto, HirReturn, HirStmt,
-    HirTableSetList, HirToBeClosed, LocalId,
+    HirBlock, HirCallStmt, HirErrNil, HirExpr, HirLValue, HirLocalDecl, HirProto, HirReturn,
+    HirStmt, HirTableSetList, HirToBeClosed, LocalId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 
@@ -42,6 +42,7 @@ pub(crate) fn eliminate_remaining_decisions_in_proto(
     );
     proto.locals.extend(new_locals);
     proto.local_debug_hints.extend(new_local_debug_hints);
+    proto.local_debug_scopes.resize(proto.locals.len(), None);
     changed
 }
 
@@ -191,13 +192,46 @@ fn eliminate_stmt(
             (prefix, changed)
         }
         HirStmt::If(mut if_stmt) => {
-            let cond_changed = eliminate_condition_expr(&mut if_stmt.cond, safety);
+            let mut cond_changed = eliminate_condition_expr(&mut if_stmt.cond, safety);
+            if expr_contains_eliminable_decision(&if_stmt.cond) {
+                let condition = mem::replace(&mut if_stmt.cond, HirExpr::Nil);
+                let (flag, condition_scope) = materialize_condition_flag(condition, state, safety);
+                if_stmt.cond = HirExpr::LocalRef(flag);
+                cond_changed = true;
+                let mut stmt = HirStmt::Block(Box::new(HirBlock {
+                    stmts: vec![
+                        empty_local_decl(flag),
+                        condition_scope,
+                        HirStmt::If(if_stmt),
+                    ],
+                }));
+                let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state, safety);
+                return (vec![stmt], cond_changed || nested_changed);
+            }
             let mut stmt = HirStmt::If(if_stmt);
             let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state, safety);
             (vec![stmt], cond_changed || nested_changed)
         }
         HirStmt::While(mut while_stmt) => {
-            let cond_changed = eliminate_condition_expr(&mut while_stmt.cond, safety);
+            let mut cond_changed = eliminate_condition_expr(&mut while_stmt.cond, safety);
+            if expr_contains_eliminable_decision(&while_stmt.cond) {
+                let condition = mem::replace(&mut while_stmt.cond, HirExpr::Boolean(true));
+                let (flag, condition_scope) = materialize_condition_flag(condition, state, safety);
+                let exit_guard = HirStmt::If(Box::new(crate::hir::common::HirIf {
+                    cond: HirExpr::LocalRef(flag).negate(),
+                    then_block: HirBlock {
+                        stmts: vec![HirStmt::Break],
+                    },
+                    else_block: None,
+                }));
+                while_stmt.body.stmts.insert(
+                    0,
+                    HirStmt::Block(Box::new(HirBlock {
+                        stmts: vec![empty_local_decl(flag), condition_scope, exit_guard],
+                    })),
+                );
+                cond_changed = true;
+            }
             let mut stmt = HirStmt::While(while_stmt);
             let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state, safety);
             (vec![stmt], cond_changed || nested_changed)
@@ -251,4 +285,138 @@ fn eliminate_nested_blocks_in_stmt(
             safety,
         )
     })
+}
+
+fn materialize_condition_flag(
+    condition: HirExpr,
+    state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
+) -> (LocalId, HirStmt) {
+    let flag = state.alloc_local();
+    let (mut prefix, value, extracted) = extract_value_expr(condition, state, safety);
+    assert!(
+        extracted && !expr_contains_eliminable_decision(&value),
+        "condition extraction must eliminate every Decision"
+    );
+    prefix.push(HirStmt::Assign(Box::new(crate::hir::common::HirAssign {
+        targets: vec![HirLValue::Local(flag)],
+        values: crate::hir::common::HirValuePack::fixed(vec![value.negate().negate()]),
+    })));
+    (flag, HirStmt::Block(Box::new(HirBlock { stmts: prefix })))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::decompile::DecompileDialect;
+    use crate::hir::common::{
+        HirBlock, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr,
+        HirGlobalRef, HirIf, HirStmt, LocalId,
+    };
+    use crate::hir::expr_safety::HirExprSafety;
+
+    use super::{EliminationState, eliminate_stmt};
+
+    #[test]
+    fn nonstable_if_decision_is_materialized_before_the_condition() {
+        let decision = HirExpr::Decision(Box::new(HirDecisionExpr {
+            entry: HirDecisionNodeRef(0),
+            nodes: vec![HirDecisionNode {
+                id: HirDecisionNodeRef(0),
+                test: global("guard"),
+                truthy: HirDecisionTarget::Expr(global("truthy")),
+                falsy: HirDecisionTarget::Expr(global("falsy")),
+            }],
+        }));
+        let stmt = HirStmt::If(Box::new(HirIf {
+            cond: decision,
+            then_block: HirBlock::default(),
+            else_block: None,
+        }));
+        let mut next_local_index = 0;
+        let mut new_locals = Vec::new();
+        let mut new_local_debug_hints = Vec::new();
+        let mut state = EliminationState {
+            next_local_index: &mut next_local_index,
+            new_locals: &mut new_locals,
+            new_local_debug_hints: &mut new_local_debug_hints,
+        };
+
+        let (lowered, changed) = eliminate_stmt(
+            stmt,
+            &mut state,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        );
+
+        assert!(changed);
+        let [HirStmt::Block(scope)] = lowered.as_slice() else {
+            panic!("nonstable if Decision must use one guard scope");
+        };
+        let [
+            HirStmt::LocalDecl(flag),
+            HirStmt::Block(condition_scope),
+            HirStmt::If(consumer),
+        ] = scope.stmts.as_slice()
+        else {
+            panic!("if guard scope must contain flag, condition scope, and consumer");
+        };
+        let [flag_local] = flag.bindings.as_slice() else {
+            panic!("condition flag must use one synthetic local");
+        };
+        assert!(flag.values.fixed.is_empty() && flag.values.tail.is_none());
+        assert!(matches!(condition_scope.stmts[1], HirStmt::If(_)));
+        assert!(matches!(consumer.cond, HirExpr::LocalRef(local) if local == *flag_local));
+        assert_eq!(new_locals, vec![LocalId(0), LocalId(1)]);
+        assert_eq!(new_local_debug_hints, vec![None, None]);
+    }
+
+    #[test]
+    fn nonstable_while_decision_runs_before_each_continue_iteration() {
+        let decision = HirExpr::Decision(Box::new(HirDecisionExpr {
+            entry: HirDecisionNodeRef(0),
+            nodes: vec![HirDecisionNode {
+                id: HirDecisionNodeRef(0),
+                test: global("guard"),
+                truthy: HirDecisionTarget::Expr(global("truthy")),
+                falsy: HirDecisionTarget::Expr(global("falsy")),
+            }],
+        }));
+        let stmt = HirStmt::While(Box::new(crate::hir::common::HirWhile {
+            cond: decision,
+            body: HirBlock {
+                stmts: vec![HirStmt::Continue],
+            },
+        }));
+        let mut next_local_index = 0;
+        let mut new_locals = Vec::new();
+        let mut new_local_debug_hints = Vec::new();
+        let mut state = EliminationState {
+            next_local_index: &mut next_local_index,
+            new_locals: &mut new_locals,
+            new_local_debug_hints: &mut new_local_debug_hints,
+        };
+
+        let (lowered, changed) = eliminate_stmt(
+            stmt,
+            &mut state,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        );
+
+        assert!(changed);
+        let [HirStmt::While(while_stmt)] = lowered.as_slice() else {
+            panic!("nonstable while Decision must remain a while");
+        };
+        assert_eq!(while_stmt.cond, HirExpr::Boolean(true));
+        assert!(matches!(while_stmt.body.stmts[0], HirStmt::Block(_)));
+        assert!(matches!(while_stmt.body.stmts[1], HirStmt::Continue));
+        let HirStmt::Block(guard_scope) = &while_stmt.body.stmts[0] else {
+            unreachable!();
+        };
+        assert!(matches!(guard_scope.stmts[2], HirStmt::If(_)));
+    }
+
+    fn global(name: &str) -> HirExpr {
+        HirExpr::GlobalRef(HirGlobalRef {
+            name: name.to_owned(),
+        })
+    }
 }

@@ -379,6 +379,26 @@ pub(super) fn build_bindings(
             Some((TempId(index), BoundSlotTarget::Local(local)))
         })
         .collect::<BTreeMap<_, _>>();
+    let mut local_debug_scopes = vec![None; locals.len()];
+    for (&scope, &local) in &debug_scope_locals {
+        local_debug_scopes[local.index()] = Some(scope);
+    }
+    let mut conflicted_local_debug_scopes = BTreeSet::new();
+    for (&temp, &BoundSlotTarget::Local(local)) in &debug_temp_targets {
+        let Some(scope) = temp_debug_scopes[temp.index()] else {
+            continue;
+        };
+        if conflicted_local_debug_scopes.contains(&local) {
+            continue;
+        }
+        let local_scope = &mut local_debug_scopes[local.index()];
+        if local_scope.is_none() || *local_scope == Some(scope) {
+            *local_scope = Some(scope);
+        } else {
+            *local_scope = None;
+            conflicted_local_debug_scopes.insert(local);
+        }
+    }
 
     let captured_temp_facts = collect_captured_temp_facts(CapturedTempFactsInput {
         proto,
@@ -420,6 +440,7 @@ pub(super) fn build_bindings(
         param_debug_hints,
         locals,
         local_debug_hints,
+        local_debug_scopes,
         upvalues,
         upvalue_debug_hints,
         temps,

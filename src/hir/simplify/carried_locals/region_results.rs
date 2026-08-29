@@ -457,16 +457,13 @@ fn try_collapse_seeded_if_results(
         // 候选拒绝[SemanticBarrier:Lifetime]：outer/private/capture/异槽或资源 identity 会观察 seed/result 的独立生命周期。
         return false;
     }
-    if !apply_rewrites(
+    apply_rewrites(
         block,
         result_start..cursor,
         cursor,
         rewrites,
         promotion_facts,
-    ) {
-        // 候选拒绝[ConvergenceGuard]：exits 已证明 region 中存在每个 result 写；apply 无命中表示分析/rewriter 契约漂移。
-        return false;
-    }
+    );
     merge_initialized_local_declarations(block, index, seeds.len());
     true
 }
@@ -512,7 +509,8 @@ fn try_collapse_inferred_if_results(
         // 候选拒绝[SemanticBarrier:Lifetime]：outer/private/capture/identity 不满足时，result 改名会影响 region 外或 closure 可见 epoch。
         return false;
     }
-    apply_rewrites(block, index..cursor, cursor, rewrites, promotion_facts)
+    apply_rewrites(block, index..cursor, cursor, rewrites, promotion_facts);
+    true
 }
 
 fn try_collapse_loop_results(
@@ -624,7 +622,8 @@ fn try_collapse_loop_results(
         // 候选拒绝[SemanticBarrier:Lifetime]：outer/private/capture/identity 不满足时，loop 外或 closure 可观察独立 result/state epoch。
         return false;
     }
-    apply_rewrites(block, index..index, index, rewrites, promotion_facts)
+    apply_rewrites(block, index..index, index, rewrites, promotion_facts);
+    true
 }
 
 fn rewrites_preserve_identity(

@@ -107,8 +107,8 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
         promotion_facts,
         safety,
     );
-    changed |= preserve_bounded_upvalue_copy_roots(
-        &mut proto.body,
+    changed |= preserve_copy_roots_in_proto(
+        proto,
         &live_reads,
         &pass.debug_temps,
         promotion_facts,
@@ -131,7 +131,53 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
     changed
 }
 
-fn preserve_bounded_upvalue_copy_roots(
+fn preserve_copy_roots_in_proto(
+    proto: &mut HirProto,
+    live_reads: &BTreeSet<TempId>,
+    debug_temps: &BTreeSet<TempId>,
+    facts: &ProtoPromotionFacts,
+    safety: HirExprSafety,
+    physical_root_temps: &mut BTreeSet<TempId>,
+) -> bool {
+    rewrite_proto(
+        proto,
+        &mut CopyRootPass {
+            live_reads,
+            debug_temps,
+            facts,
+            safety,
+            physical_root_temps,
+        },
+    )
+}
+
+struct CopyRootPass<'a> {
+    live_reads: &'a BTreeSet<TempId>,
+    debug_temps: &'a BTreeSet<TempId>,
+    facts: &'a ProtoPromotionFacts,
+    safety: HirExprSafety,
+    physical_root_temps: &'a mut BTreeSet<TempId>,
+}
+
+impl HirRewritePass for CopyRootPass<'_> {
+    fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
+        preserve_copy_roots_in_block(
+            block,
+            self.live_reads,
+            self.debug_temps,
+            self.facts,
+            self.safety,
+            self.physical_root_temps,
+        )
+    }
+}
+
+enum CopyRootPlan {
+    ScopeEnd { producer: TempId },
+    NilOverwrite { producer: TempId, index: usize },
+}
+
+fn preserve_copy_roots_in_block(
     block: &mut HirBlock,
     live_reads: &BTreeSet<TempId>,
     debug_temps: &BTreeSet<TempId>,
@@ -144,51 +190,74 @@ fn preserve_bounded_upvalue_copy_roots(
         facts.collect_captured_home_slots_in_stmt(stmt, &mut captured_homes);
     }
 
-    let mut rewrites = Vec::<(usize, TempId)>::new();
+    let mut plans = Vec::new();
     for (producer_index, stmt) in block.stmts.iter().enumerate() {
-        let Some((producer, HirExpr::UpvalueRef(_))) = single_temp_assignment(stmt) else {
+        let Some((producer, value)) = single_temp_assignment(stmt) else {
             continue;
         };
-        if dead_pure_temp_assignment(stmt, live_reads, safety) != Some(producer)
-            || debug_temps.contains(&producer)
-        {
+        if dead_pure_temp_assignment(stmt, live_reads, safety) != Some(producer) {
             continue;
         }
-        let Some(overwrite) = facts.upvalue_copy_root_overwrite(producer) else {
+        if safety.result_is_gc_inert(value) {
             continue;
-        };
-        let Some(home) = facts.trusted_temp_home_slot(producer) else {
+        }
+        let scope_end = facts.is_scope_end_copy_root_temp(producer);
+        let overwrite = facts.copy_root_overwrite(producer);
+        if !scope_end && overwrite.is_none() {
             continue;
-        };
-        if debug_temps.contains(&overwrite) || captured_homes.contains(&home) {
-            // 候选拒绝[PolicyBoundary]：debug identity 仍由 locals owner 保留；
+        }
+        let home = facts
+            .trusted_temp_home_slot(producer)
+            .expect("validated copy-root fact must retain producer home");
+        if captured_homes.contains(&home) {
             // 候选拒绝[SemanticBarrier:Capture]：同槽 capture 可观察独立 cell identity。
             continue;
         }
 
-        let overwrite_index = block.stmts[producer_index + 1..]
-            .iter()
-            .position(|suffix| {
-                matches!(single_temp_assignment(suffix), Some((temp, HirExpr::Nil)) if temp == overwrite)
-                    && dead_pure_temp_assignment(suffix, live_reads, safety) == Some(overwrite)
-            })
-            .map(|offset| producer_index + 1 + offset);
-        let Some(overwrite_index) = overwrite_index else {
-            // 候选拒绝[LayerBoundary]：raw overwrite 已不再对应当前 HIR 的 direct scalar
-            // nil assignment，不能只保留 producer 而丢失精确 root 终止点。
-            continue;
-        };
-        rewrites.push((overwrite_index, producer));
+        if let Some(overwrite) = overwrite {
+            let (overwrite_index, hir_overwrite) = block.stmts[producer_index + 1..]
+                .iter()
+                .enumerate()
+                .find_map(|(offset, suffix)| {
+                    let Some((temp, HirExpr::Nil)) = single_temp_assignment(suffix) else {
+                        return None;
+                    };
+                    ((temp == overwrite || temp == producer)
+                        && dead_pure_temp_assignment(suffix, live_reads, safety) == Some(temp))
+                    .then_some((producer_index + 1 + offset, temp))
+                })
+                .expect("copy-root overwrite fact must retain its direct scalar nil assignment");
+            if hir_overwrite == overwrite && debug_temps.contains(&overwrite) {
+                // 候选拒绝[SemanticBarrier:DebugScope]：把仍独立存在的 debug overwrite
+                // 改写为 producer 会抹掉它自己的源码 local identity。
+                continue;
+            }
+            plans.push(CopyRootPlan::NilOverwrite {
+                producer,
+                index: overwrite_index,
+            });
+        } else {
+            plans.push(CopyRootPlan::ScopeEnd { producer });
+        }
     }
 
-    for (overwrite_index, producer) in &rewrites {
-        let HirStmt::Assign(assign) = &mut block.stmts[*overwrite_index] else {
-            unreachable!("bounded root overwrite must remain an assignment")
-        };
-        assign.targets[0] = HirLValue::Temp(*producer);
-        physical_root_temps.insert(*producer);
+    let mut changed = false;
+    for plan in plans {
+        match plan {
+            CopyRootPlan::ScopeEnd { producer } => {
+                physical_root_temps.insert(producer);
+            }
+            CopyRootPlan::NilOverwrite { producer, index } => {
+                let HirStmt::Assign(assign) = &mut block.stmts[index] else {
+                    unreachable!("validated copy-root overwrite must remain an assignment")
+                };
+                changed |= assign.targets[0] != HirLValue::Temp(producer);
+                assign.targets[0] = HirLValue::Temp(producer);
+                physical_root_temps.insert(producer);
+            }
+        }
     }
-    !rewrites.is_empty()
+    changed
 }
 
 fn preserve_adjacent_dead_physical_overwrites(
@@ -210,8 +279,7 @@ fn preserve_adjacent_dead_physical_overwrites(
         else {
             continue;
         };
-        let Some((previous, previous_value)) =
-            single_temp_assignment(&block.stmts[index - 1])
+        let Some((previous, previous_value)) = single_temp_assignment(&block.stmts[index - 1])
         else {
             // 候选拒绝[ProofIncomplete]：非相邻 producer 需要区间 reaching-def、控制流与同槽写入证明。
             continue;
@@ -223,18 +291,23 @@ fn preserve_adjacent_dead_physical_overwrites(
             // 候选拒绝[ProofIncomplete]：producer 缺可信 home 时无法证明两次物理写命中同一 root cell。
             continue;
         };
-        if current == previous
-            || facts.trusted_temp_home_slot(current) != Some(home)
-            || live_reads.contains(&previous)
-        {
-            // 候选拒绝[SemanticBarrier:ValueFlow/Lifetime]：异槽或任一旧 identity 仍有读取时，合并会改变值 epoch 或 root 生命周期。
+        if current == previous {
             continue;
         }
-        if debug_temps.contains(&current)
-            || debug_temps.contains(&previous)
-            || captured_homes.contains(&home)
-        {
-            // 候选拒绝[LayerBoundary]：debug identity 由 locals owner 保留；候选拒绝[SemanticBarrier:Capture]：同槽 capture 可观察每次写入。
+        if facts.trusted_temp_home_slot(current) != Some(home) {
+            // 候选拒绝[SemanticBarrier:Lifetime]：异槽写没有共享物理 root cell，合并会错误延长 previous home 的生命周期。
+            continue;
+        }
+        if live_reads.contains(&previous) {
+            // 候选拒绝[SemanticBarrier:ValueFlow]：previous identity 仍被读取，合并覆盖会改变该读取的 reaching value。
+            continue;
+        }
+        if debug_temps.contains(&current) || debug_temps.contains(&previous) {
+            // 候选拒绝[SemanticBarrier:DebugScope]：任一写入带已保留的源码 local identity，合并会抹掉一段声明可见期。
+            continue;
+        }
+        if captured_homes.contains(&home) {
+            // 候选拒绝[SemanticBarrier:Capture]：同槽 capture 可观察每次写入。
             continue;
         }
         let HirStmt::Assign(assign) = &mut block.stmts[index] else {
@@ -280,8 +353,6 @@ fn remove_dead_entry_nil_writes_from_root_prefix(
             return true;
         }
         if !root_prefix_stmt_preserves_single_pass_continuation(stmt) {
-            // 分析停用[SemanticBarrier:ControlFlow]：任意深度的 label/goto 可能让后缀重新进入已扫描区间。
-            // 分析停用[LayerBoundary]：root terminal 后的不可达后缀属于前层 CFG/dead-code owner。
             in_single_pass_prefix = false;
             return true;
         }
@@ -289,7 +360,7 @@ fn remove_dead_entry_nil_writes_from_root_prefix(
         let removable = dead_pure_temp_assignment(stmt, live_reads, safety).is_some_and(|temp| {
             let home = facts.home_slot(temp);
             facts.overwrites_entry_nil(temp)
-                // 候选拒绝[PolicyBoundary]：debug temp 是源码 binding；即使入口旧值为 nil，删除定义也会抹掉项目选择保留的 source identity。
+                // 候选拒绝[SemanticBarrier:DebugScope]：debug temp 是已保留的源码 binding；删除定义会抹掉其声明可见期。
                 && !debug_temps.contains(&temp)
                 // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot temp 可能已由精确
                 // overwrite handoff 复用；删除其 GC-inert 写会丢失原 root 终止点。
@@ -315,18 +386,26 @@ fn root_prefix_stmt_preserves_single_pass_continuation(stmt: &HirStmt) -> bool {
         | HirStmt::ToBeClosed(_)
         | HirStmt::Close(_)
         | HirStmt::CallStmt(_) => true,
-        HirStmt::GlobalDecl(_) => false,
+        HirStmt::GlobalDecl(_) => {
+            // 分析停用[ProofIncomplete]：全局声明的种子与后续赋值共享源码 identity；
+            // 当前证明只覆盖 temp 写，不能让扫描越过该 AST-owned 声明边界。
+            false
+        }
         HirStmt::If(_)
         | HirStmt::While(_)
         | HirStmt::Repeat(_)
         | HirStmt::NumericFor(_)
         | HirStmt::GenericFor(_)
         | HirStmt::Block(_) => !stmt_contains_nested_nonlocal_control(stmt),
-        HirStmt::Return(_)
-        | HirStmt::Break
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => false,
+        HirStmt::Return(_) => {
+            // 分析停用[LayerBoundary]：Return 后缀的不可达性属于 CFG/dead-code owner。
+            false
+        }
+        HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => {
+            // 分析停用[SemanticBarrier:ControlFlow]：非局部跳转或可重入 label 会破坏
+            // 根前缀“每条语句至多执行一次且只能顺序进入后缀”的证明。
+            false
+        }
     }
 }
 
@@ -369,7 +448,7 @@ impl HirRewritePass for DeadTempPass<'_> {
             let Some(temp) = dead_pure_temp_assignment(stmt, self.live_reads, self.safety) else {
                 return true;
             };
-            // 候选拒绝[PolicyBoundary]：debug temp 是源码 binding；即使值无读取，删除定义也会抹掉项目选择保留的 source identity。
+            // 候选拒绝[SemanticBarrier:DebugScope]：debug temp 是已保留的源码 binding；删除定义会抹掉其声明可见期。
             if self.debug_temps.contains(&temp) {
                 return true;
             }
@@ -389,14 +468,11 @@ impl HirRewritePass for DeadTempPass<'_> {
                 return true;
             }
             if self.physical_home_temps.contains(&temp) {
-                if expr_may_alias_overwritten_param(value, &self.overwritten_visible_params)
-                    || (matches!(value, HirExpr::UpvalueRef(_))
-                        && self.facts.is_scope_end_upvalue_copy_root_temp(temp))
-                {
+                if expr_may_alias_overwritten_param(value, &self.overwritten_visible_params) {
                     // 候选拒绝[SemanticBarrier:Lifetime]：RHS 参数会在当前 slot 生命周期
-                    // 结束前被同 home 写覆盖；或 raw active-top 证明独立 upvalue copy
-                    // home 跨用户代码事件活到 Return。把该 temp 标成 PhysicalRoot，
-                    // 防止 AST cleanup 再删除这个保活 alias。
+                    // 结束前被同 home 写覆盖。把该 temp 标成 PhysicalRoot，防止 AST
+                    // cleanup 再删除这个保活 alias；direct copy 的精确区间由后置
+                    // copy-root owner 统一处理。
                     self.physical_root_temps.insert(temp);
                 }
                 // 候选拒绝[ProofIncomplete]：root-prefix entry-nil/inert 子集已在专用证明中删除；其余 raw-home 写仍可能释放旧 root，或让 RHS 引用成为新 root，需双向 reaching resource-value 与可见 binding 映射。
@@ -459,12 +535,12 @@ fn dead_pure_temp_assignment(
     if assign.values.tail.is_some() {
         return None;
     }
-    // 候选拒绝[SemanticBarrier:Value]：仍被读取的 temp 定义决定后续值；删除
+    // 候选拒绝[SemanticBarrier:ValueFlow]：仍被读取的 temp 定义决定后续值；删除
     // `t = 1; return t` 会把读取变成未定义槽。
     if live_reads.contains(temp) {
         return None;
     }
-    // 候选拒绝[SemanticBarrier:EvalMultiplicity]：不可丢弃 RHS 必须求值一次；调用、
+    // 候选拒绝[SemanticBarrier:EvalCount]：不可丢弃 RHS 必须求值一次；调用、
     // table/global lookup 或分配即使结果未读也可能执行用户代码、抛错或产生对象身份。
     safety.is_discard_safe(value).then_some(*temp)
 }

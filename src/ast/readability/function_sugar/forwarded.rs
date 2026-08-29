@@ -10,7 +10,7 @@ use super::super::expr_analysis::is_context_safe_expr;
 use super::direct::function_decl_target_from_lvalue;
 use crate::ast::common::{
     AstBindingRef, AstExpr, AstFunctionDecl, AstFunctionExpr, AstGlobalBindingTarget, AstLValue,
-    AstLocalOrigin, AstNamePath, AstNameRef, AstStmt, AstTargetDialect,
+    AstNamePath, AstNameRef, AstStmt, AstTargetDialect,
 };
 
 pub(super) fn try_lower_forwarded_function_stmt(
@@ -31,8 +31,12 @@ pub(super) fn try_lower_forwarded_function_stmt(
         // 候选拒绝[PolicyBoundary]：`<const>` 声明身份继续由声明 owner 保留。
         return None;
     }
-    if local_decl.bindings[0].origin != AstLocalOrigin::Recovered {
-        // 候选拒绝[PolicyBoundary]：DebugHinted 是源码声明身份；候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 的词法根不能随转发壳提前消失。
+    if local_decl.bindings[0].origin.is_debug_hinted() {
+        // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted 是 IR 已保留的源码 binding；删除转发壳会抹掉其名字与词法区间。
+        return None;
+    }
+    if local_decl.bindings[0].origin.is_physical_root() {
+        // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 的词法根不能随转发壳提前消失。
         return None;
     }
     let AstExpr::FunctionExpr(function) = &local_decl.values[0] else {

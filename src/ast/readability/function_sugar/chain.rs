@@ -62,7 +62,7 @@ fn single_method_call_local(stmt: &AstStmt) -> Option<(AstBindingRef, &AstMethod
     }
     match binding.origin {
         AstLocalOrigin::Recovered => {}
-        AstLocalOrigin::DebugHinted => {
+        AstLocalOrigin::DebugHinted | AstLocalOrigin::DebugHintedPhysicalRoot => {
             // 候选拒绝[SemanticBarrier:DebugScope]：删除 debug local 会改变 debug.getlocal 可观察的名字与作用域。
             return None;
         }

@@ -64,8 +64,6 @@ impl ExprRewritePass for DecisionExprPass {
     fn rewrite_condition_expr(&mut self, expr: &mut HirExpr) -> bool {
         let mut changed = false;
         if let HirExpr::Decision(decision) = expr
-            // 候选拒绝[ProofIncomplete]：循环 Decision 缺少可物化为结构化 loop 的 owner/fact，直接递归展开会重复求值并且不终止。
-            && !decision_has_cycles(decision)
             && let Some(replacement) = collapse_condition_decision_expr(decision, self.safety)
         {
             *expr = replacement;
@@ -107,13 +105,7 @@ fn reduce_decision_expr(
     decision: &HirDecisionExpr,
     safety: HirExprSafety,
 ) -> Option<ReducedDecision> {
-    // 候选拒绝[ProofIncomplete]：循环 Decision 缺少可物化为结构化 loop 的 owner/fact，不能用递归树化代替控制流证明。
-    // 循环 DAG 目前只允许“原样保留为 Decision”，不能继续走 value-collapse /
-    // known-test specialize 这条树化路径。否则会把同一条环上的节点反复递归展开，
-    // 最后在 simplify 阶段自己把栈打穿。
-    if decision_has_cycles(decision) {
-        return None;
-    }
+    assert_valid_decision(decision);
 
     let mut nodes = decision.nodes.clone();
     let mut replacements = vec![None; nodes.len()];
@@ -332,10 +324,7 @@ pub(in crate::hir) fn collapse_value_decision_expr(
     decision: &HirDecisionExpr,
     safety: HirExprSafety,
 ) -> Option<HirExpr> {
-    // 候选拒绝[ProofIncomplete]：循环 Decision 缺少结构化 loop owner/fact，有限 `and/or` 表达式不能直接承载回边。
-    if decision_has_cycles(decision) {
-        return None;
-    }
+    assert_valid_decision(decision);
 
     if decision_has_shared_nodes(decision) {
         synthesize::synthesize_value_decision_expr(decision, safety).or_else(|| {
@@ -680,10 +669,7 @@ pub(in crate::hir) fn collapse_condition_decision_expr(
     decision: &HirDecisionExpr,
     safety: HirExprSafety,
 ) -> Option<HirExpr> {
-    // 候选拒绝[ProofIncomplete]：循环 Decision 需要前层提供 loop owner，条件表达式递归展开无法保持回边与求值次数。
-    if decision_has_cycles(decision) {
-        return None;
-    }
+    assert_valid_decision(decision);
 
     let mut memo = BTreeMap::new();
     collapse_condition_node(decision, decision.entry, &mut memo, safety)
@@ -890,9 +876,7 @@ fn is_false(expr: &HirExpr) -> bool {
 }
 
 pub(in crate::hir) fn decision_has_shared_nodes(decision: &HirDecisionExpr) -> bool {
-    if decision.nodes.is_empty() || decision.entry.index() >= decision.nodes.len() {
-        return false;
-    }
+    assert_valid_decision(decision);
 
     let mut incoming = vec![0usize; decision.nodes.len()];
     incoming[decision.entry.index()] += 1;
@@ -910,52 +894,95 @@ pub(in crate::hir) fn decision_has_shared_nodes(decision: &HirDecisionExpr) -> b
     incoming.into_iter().any(|count| count > 1)
 }
 
-pub(in crate::hir) fn decision_has_cycles(decision: &HirDecisionExpr) -> bool {
-    if decision.nodes.is_empty() || decision.entry.index() >= decision.nodes.len() {
-        return false;
-    }
+pub(in crate::hir) fn assert_valid_decision(decision: &HirDecisionExpr) {
+    assert!(!decision.nodes.is_empty(), "HIR Decision must not be empty");
+    assert!(
+        decision.entry.index() < decision.nodes.len(),
+        "HIR Decision entry must reference an existing node"
+    );
 
-    #[derive(Clone, Copy, Eq, PartialEq)]
-    enum VisitState {
-        Unvisited,
-        Visiting,
-        Done,
-    }
-
-    let mut states = vec![VisitState::Unvisited; decision.nodes.len()];
-    let mut stack = vec![(decision.entry, false)];
-
-    while let Some((node_ref, expanded)) = stack.pop() {
-        let node_index = node_ref.index();
-        let Some(node) = decision.nodes.get(node_index) else {
-            continue;
-        };
-
-        if expanded {
-            states[node_index] = VisitState::Done;
-            continue;
-        }
-
-        match states[node_index] {
-            VisitState::Done => continue,
-            VisitState::Visiting => return true,
-            VisitState::Unvisited => {
-                states[node_index] = VisitState::Visiting;
-                stack.push((node_ref, true));
+    let mut incoming = vec![0usize; decision.nodes.len()];
+    for (index, node) in decision.nodes.iter().enumerate() {
+        assert_eq!(
+            node.id,
+            HirDecisionNodeRef(index),
+            "HIR Decision node id must match its arena index"
+        );
+        for target in [&node.truthy, &node.falsy] {
+            if let HirDecisionTarget::Node(node_ref) = target {
+                let Some(count) = incoming.get_mut(node_ref.index()) else {
+                    panic!("HIR Decision edge must reference an existing node");
+                };
+                *count += 1;
             }
         }
+    }
 
+    let mut reachable = vec![false; decision.nodes.len()];
+    let mut pending = vec![decision.entry];
+    while let Some(node_ref) = pending.pop() {
+        if std::mem::replace(&mut reachable[node_ref.index()], true) {
+            continue;
+        }
+        let node = &decision.nodes[node_ref.index()];
+        for target in [&node.truthy, &node.falsy] {
+            if let HirDecisionTarget::Node(next_ref) = target {
+                pending.push(*next_ref);
+            }
+        }
+    }
+    assert!(
+        reachable.into_iter().all(|reachable| reachable),
+        "HIR Decision must not contain unreachable nodes"
+    );
+
+    let mut ready = incoming
+        .iter()
+        .enumerate()
+        .filter_map(|(index, count)| (*count == 0).then_some(index))
+        .collect::<Vec<_>>();
+    let mut visited = 0usize;
+    while let Some(index) = ready.pop() {
+        visited += 1;
+        let node = &decision.nodes[index];
         for target in [&node.truthy, &node.falsy] {
             let HirDecisionTarget::Node(next_ref) = target else {
                 continue;
             };
-            match states.get(next_ref.index()) {
-                Some(VisitState::Done) | None => {}
-                Some(VisitState::Visiting) => return true,
-                Some(VisitState::Unvisited) => stack.push((*next_ref, false)),
+            incoming[next_ref.index()] -= 1;
+            if incoming[next_ref.index()] == 0 {
+                ready.push(next_ref.index());
             }
         }
     }
+    assert_eq!(
+        visited,
+        decision.nodes.len(),
+        "HIR Decision must be acyclic"
+    );
+}
 
-    false
+#[cfg(test)]
+mod tests {
+    use crate::hir::common::{
+        HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr,
+    };
+
+    use super::assert_valid_decision;
+
+    #[test]
+    #[should_panic(expected = "HIR Decision must be acyclic")]
+    fn decision_cycle_violates_hir_contract() {
+        let decision = HirDecisionExpr {
+            entry: HirDecisionNodeRef(0),
+            nodes: vec![HirDecisionNode {
+                id: HirDecisionNodeRef(0),
+                test: HirExpr::Boolean(true),
+                truthy: HirDecisionTarget::Node(HirDecisionNodeRef(0)),
+                falsy: HirDecisionTarget::Expr(HirExpr::Boolean(false)),
+            }],
+        };
+
+        assert_valid_decision(&decision);
+    }
 }

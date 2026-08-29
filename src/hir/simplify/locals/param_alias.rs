@@ -77,7 +77,7 @@ pub(super) fn coalesce_param_aliases_in_proto(
                 // 候选拒绝[LayerBoundary]：残留 label/goto 的 predecessor 与目标边由 Structure island/branch-control owner 维护；locals 不在线性 HIR 上重建 CFG。
             }
             AliasFlowError::BindingInvariant => {
-                // 候选拒绝[ConvergenceGuard]：alias LocalId 在后缀再次充当声明或 for binder 违反唯一 binding 身份；删除入口声明会改变异常 HIR 的作用域。
+                panic!("alias local must not be redeclared or reused as a for binding")
             }
         }
         return false;

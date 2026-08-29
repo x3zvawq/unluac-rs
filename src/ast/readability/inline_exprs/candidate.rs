@@ -180,7 +180,7 @@ impl InlineCandidate {
         // 可以完整保护 DebugHinted，普通 recovered alias 则继续按上下文收敛。
         match self.origin {
             // 候选拒绝[SemanticBarrier:DebugScope]：删除 DebugHinted local 会改变调用中 debug.getlocal 可观察的名字与作用域（regress_351）。
-            AstLocalOrigin::DebugHinted => false,
+            AstLocalOrigin::DebugHinted | AstLocalOrigin::DebugHintedPhysicalRoot => false,
             AstLocalOrigin::PhysicalRoot => {
                 // 物理根若只是紧邻普通调用的全局 callee，调用帧会在参数求值期间继续
                 // 持有同一函数值；把前置别名收回 callee 位不会缩短 GC 根，也不会改变

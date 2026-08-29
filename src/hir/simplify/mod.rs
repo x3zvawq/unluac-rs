@@ -12,6 +12,7 @@ mod carried_locals;
 mod close_scopes;
 mod dead_labels;
 mod dead_temps;
+mod debug_scopes;
 pub(super) mod decision;
 mod expr_facts;
 mod generic_for_iterators;
@@ -114,7 +115,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
     PassDescriptor {
         name: "boolean-shells",
         phase: PassPhase::Normal,
-        depends_on: &[BooleanPattern, DecisionShape],
+        depends_on: &[BooleanPattern, DecisionShape, LabelGoto],
         invalidates: &[BooleanPattern, TempChain],
     },
     PassDescriptor {
@@ -194,6 +195,12 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         invalidates: &[DecisionShape],
     },
     PassDescriptor {
+        name: "debug-scopes",
+        phase: PassPhase::Deferred,
+        depends_on: &[LocalBinding, BlockStructure],
+        invalidates: &[BlockStructure],
+    },
+    PassDescriptor {
         name: "close-scopes",
         phase: PassPhase::Deferred,
         depends_on: &[BlockStructure],
@@ -215,7 +222,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         name: "dead-labels",
         phase: PassPhase::Deferred,
         depends_on: &[LabelGoto],
-        invalidates: &[LabelGoto],
+        invalidates: &[LabelGoto, BlockStructure, TempChain],
     },
 ];
 
@@ -277,14 +284,15 @@ pub(super) fn simplify_hir(
                         ),
                         8 => branch_control_folding::fold_branch_control_in_proto(proto, safety),
                         9 => decision::eliminate_remaining_decisions_in_proto(proto, safety),
-                        10 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
-                        11 => carried_locals::collapse_carried_local_handoffs_in_proto(
+                        10 => debug_scopes::materialize_tail_debug_scopes_in_proto(proto),
+                        11 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
+                        12 => carried_locals::collapse_carried_local_handoffs_in_proto(
                             proto, facts, safety,
                         ),
-                        12 => dead_temps::remove_dead_temp_materializations_in_proto(
+                        13 => dead_temps::remove_dead_temp_materializations_in_proto(
                             proto, facts, safety,
                         ),
-                        13 => dead_labels::remove_unused_labels_in_proto(proto),
+                        14 => dead_labels::remove_unused_labels_in_proto(proto),
                         _ => unreachable!("invalid HIR pass index: {index}"),
                     }
                 })

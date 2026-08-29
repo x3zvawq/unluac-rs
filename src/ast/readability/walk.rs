@@ -193,13 +193,18 @@ fn rewrite_stmt_scoped<P: ScopedAstRewritePass>(
     pass: &mut P,
 ) -> bool {
     if let AstStmt::Repeat(repeat_stmt) = stmt {
-        let (block_changed, body_scope) =
+        let (block_changed, mut body_scope) =
             pass.enter_repeat_body(&mut repeat_stmt.body, &repeat_stmt.cond, scope);
         let mut nested_changed = false;
+        // repeat body 与 until 条件共享词法作用域；逐句推进后，条件必须看到
+        // body 末尾已经生效的声明，而不能退回 repeat 外层 scope。
         for stmt in &mut repeat_stmt.body.stmts {
-            nested_changed |= rewrite_stmt_scoped(stmt, &body_scope, pass);
+            let child_scope = pass.scope_for_stmt_children(stmt, &body_scope);
+            nested_changed |= rewrite_stmt_scoped(stmt, &child_scope, pass);
+            body_scope = pass.scope_after_stmt(stmt, &body_scope);
         }
-        nested_changed |= rewrite_condition_expr_scoped(&mut repeat_stmt.cond, scope, pass);
+        nested_changed |=
+            rewrite_condition_expr_scoped(&mut repeat_stmt.cond, &body_scope, pass);
         return pass.rewrite_stmt(stmt, scope) || block_changed || nested_changed;
     }
 

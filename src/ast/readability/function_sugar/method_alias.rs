@@ -198,8 +198,12 @@ fn receiver_alias_source_may_drop_root(
         // 候选拒绝[SemanticBarrier:Lifetime]：global/upvalue 可在 sink 期间换值，删除 alias 会提前释放旧 receiver root。
         return true;
     }
-    if mutable_snapshots.contains(source) || name_is_written_in_suffix(stmts, 1, source) {
-        // 候选拒绝[SemanticBarrier:Lifetime/ProofIncomplete]：后缀写会丢失旧 root；capture 尚无只读 provenance，反例见 regress_406。
+    if name_is_written_in_suffix(stmts, 1, source) {
+        // 候选拒绝[SemanticBarrier:Lifetime]：后缀写会丢失旧 root，反例见 regress_406。
+        return true;
+    }
+    if mutable_snapshots.contains(source) {
+        // 候选拒绝[ProofIncomplete]：capture 尚无只读/写 provenance，无法证明 sink 期间不会换值并改变旧 root 的生命周期。
         return true;
     }
     false
@@ -237,7 +241,9 @@ impl AstVisitor for NameWriteFinder {
     }
 
     fn visit_lvalue(&mut self, lvalue: &AstLValue) {
-        if let AstLValue::Name(name) = lvalue && name == &self.name {
+        if let AstLValue::Name(name) = lvalue
+            && name == &self.name
+        {
             self.found = true;
         }
     }

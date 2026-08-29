@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::super::common::{
     AstBindingRef, AstBlock, AstExpr, AstLValue, AstLabelId, AstLocalAttr, AstLocalBinding,
-    AstLocalDecl, AstLocalOrigin, AstModule, AstStmt,
+    AstLocalDecl, AstModule, AstStmt,
 };
 use super::ReadabilityContext;
 use super::binding_flow::{
@@ -96,7 +96,7 @@ fn merge_adjacent_empty_local_decls(block: &mut AstBlock) -> bool {
         for next_bindings in old_stmts.iter().map_while(empty_local_decl_bindings) {
             if next_bindings
                 .iter()
-                .any(|binding| binding.origin == AstLocalOrigin::DebugHinted)
+                .any(|binding| binding.origin.is_debug_hinted())
             {
                 // 候选拒绝[SemanticBarrier:DebugScope]：line hook 能在相邻声明间观察
                 // DebugHinted local 的边界，不能把后续声明提前到同一 local list。
@@ -190,7 +190,7 @@ fn merge_adjacent_single_value_local_decls(
             index += 1;
             continue;
         };
-        if binding.origin == AstLocalOrigin::DebugHinted {
+        if binding.origin.is_debug_hinted() {
             // 候选拒绝[SemanticBarrier:DebugScope]：后续 RHS 求值期间 line hook/元方法可观察
             // 当前 DebugHinted local；并行声明会把它的作用域起点推迟到整组 RHS 之后。
             new_stmts.push(stmt);
@@ -211,7 +211,7 @@ fn merge_adjacent_single_value_local_decls(
             .get(lookahead - index - 1)
             .and_then(single_value_local_decl)
         {
-            if next_binding.origin == AstLocalOrigin::DebugHinted {
+            if next_binding.origin.is_debug_hinted() {
                 // 候选拒绝[SemanticBarrier:DebugScope]：line hook 可在相邻声明间观察
                 // DebugHinted local；并行声明会让该名字提前可见。
                 break;
@@ -585,7 +585,8 @@ fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
                     .filter(|((index, _), _)| *index != run_start)
                     .map(|((index, owner), end)| (index, owner, end)),
             )
-            // 候选拒绝[SemanticBarrier:ControlFlow/Scope]：header 或多个 arm 同时 mention 的 binding 没有唯一 nested owner，声明必须留在共同支配点。
+            // 候选拒绝[SemanticBarrier:Scope]：header 或多个 arm 同时 mention 的 binding
+            // 没有唯一 nested owner，声明必须留在共同支配点。
             .filter(|(_, owner, _)| *owner != NestedSinkOwner::Blocked)
             .map(|(index, _, end)| (index, end));
 
@@ -895,7 +896,7 @@ fn try_merge_local_decl_with_assign(current: &AstStmt, next: &AstStmt) -> Option
     if local_decl
         .bindings
         .iter()
-        .any(|binding| binding.origin == AstLocalOrigin::DebugHinted)
+        .any(|binding| binding.origin.is_debug_hinted())
     {
         // 候选拒绝[SemanticBarrier:DebugScope]：regress_342 中条件调用通过 `debug.getlocal`
         // 观察空声明；合并到 initializer 会把 debug local 的作用域起点后移到调用之后。

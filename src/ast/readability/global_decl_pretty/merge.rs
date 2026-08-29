@@ -5,7 +5,7 @@
 //! Recovered seed。
 //! 例如：连续的 `local g = _ENV.g` seed 运行，会在这里尝试折成一条更紧凑的 global 声明。
 
-use super::super::binding_flow::BindingUseIndex;
+use super::super::binding_flow::{BindingUseIndex, binding_mentions_in_stmt};
 use super::super::binding_ref::binding_from_name_ref;
 use crate::ast::common::{
     AstBindingRef, AstBlock, AstExpr, AstGlobalBinding, AstGlobalDecl, AstLocalAttr,
@@ -88,7 +88,8 @@ fn try_merge_seed_global_run(
     }
 
     if seeds.len() != globals.len() {
-        // 候选拒绝[SemanticBarrier:Identity]：seed/global 不是精确双射时，合并会删除未交接 seed 的 initializer，或丢掉没有来源的 global 写入；regress335 的 captured_seed 会因此失去闭包 owner。
+        // 候选拒绝[SemanticBarrier:EvalCount]：seed/global 不是精确双射时，合并会删除未交接 seed 的 initializer，或丢掉没有来源的 global 写入；
+        // 候选拒绝[SemanticBarrier:Capture]：regress335 的 captured_seed 会因此失去闭包 owner。
         return None;
     }
 
@@ -101,8 +102,8 @@ fn try_merge_seed_global_run(
         }
         match seed.origin {
             AstLocalOrigin::Recovered => {}
-            AstLocalOrigin::DebugHinted => {
-                // 候选拒绝[PolicyBoundary]：DebugHinted seed 是显式源码 local 身份；regress335 通过 debug.getlocal 观察该名字，声明合并不得抹掉它。
+            AstLocalOrigin::DebugHinted | AstLocalOrigin::DebugHintedPhysicalRoot => {
+                // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted seed 是显式源码 local 身份；regress335 通过 debug.getlocal 观察该名字，声明合并不得抹掉它。
                 return None;
             }
             AstLocalOrigin::PhysicalRoot => {
@@ -112,6 +113,15 @@ fn try_merge_seed_global_run(
         }
         if use_index.count_uses_in_suffix(start, seed.id) != 1 {
             // 候选拒绝[SemanticBarrier:Capture]：唯一允许的 seed use 是对应 global handoff；initializer capture 或 run 后 use 都依赖被删 local，regress335 的闭包 seed 会变成未绑定引用。
+            return None;
+        }
+        if stmts[index..]
+            .iter()
+            .any(|stmt| binding_mentions_in_stmt(stmt).contains(&seed.id))
+        {
+            // 候选拒绝[SemanticBarrier:Scope]：global handoff 后的 direct write 或
+            // `function seed.field()` 仍依赖该 local owner；删除声明会把它改成未声明/global
+            // binding。regress335 的 function-name seed 可直接观察生成源码失去 owner。
             return None;
         }
         merged_bindings.push(global_binding.clone());

@@ -178,7 +178,7 @@ impl BranchValueDecisionBuilder {
         let (node_ref, mut refs) = self.reserve_node(shape.value);
         let rest = self.collapse_block(shape.rest_block, binding)?;
         let guard = BranchValueBinding::Temp(shape.guard);
-        // 候选拒绝[SemanticBarrier:Lifetime]：删除 raw guard 赋值后，候选内部仍读取该 temp 会改读旧 epoch 或未定义值。
+        // 候选拒绝[SemanticBarrier:ValueFlow]：删除 raw guard 赋值后，候选内部仍读取该 temp 会改读旧 epoch 或未定义值。
         if refs.mentions(guard) || rest.refs.mentions(guard) {
             return None;
         }
@@ -225,7 +225,7 @@ impl BranchValueDecisionBuilder {
         binding: BranchValueBinding,
     ) -> Option<(HirExpr, BTreeSet<TempId>)> {
         // 候选拒绝[ProofIncomplete]：leaf 对 output binding 的读取通常仍是赋值前 epoch，但 builder 尚未显式证明树内没有更早的 output write。
-        // 候选拒绝[SemanticBarrier:Lifetime]：结果若仍读将删除的 raw guard（如 `g=v; if g then out=g+1`），会改读旧 g epoch 或未定义值。
+        // 候选拒绝[SemanticBarrier:ValueFlow]：结果若仍读将删除的 raw guard（如 `g=v; if g then out=g+1`），会改读旧 g epoch 或未定义值。
         if root.refs.mentions(binding)
             || self
                 .raw_guards
@@ -243,8 +243,9 @@ impl BranchValueDecisionBuilder {
                 self.safety,
             ),
             HirDecisionTarget::Expr(expr) => expr,
-            // 候选拒绝[ConvergenceGuard]：root 没有父 test 可提供 CurrentValue；出现该 target 表示 builder 不变量未闭合。
-            HirDecisionTarget::CurrentValue => return None,
+            HirDecisionTarget::CurrentValue => {
+                unreachable!("branch-value root cannot borrow a parent test value")
+            }
         };
         // 候选拒绝[ProofIncomplete]：finalize 后仍是 Decision 表示当前表达式层无法承载该 DAG；应增强 decision collapse 再删除控制树。
         (!matches!(value, HirExpr::Decision(_))).then_some((value, self.raw_guards))

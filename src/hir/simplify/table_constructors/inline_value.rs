@@ -84,7 +84,7 @@ fn inline_constructor_value_at_site(
         if context.remaining_uses.contains(producer.binding_id) {
             return None;
         }
-        // 候选拒绝[SemanticBarrier:EvalMultiplicity]：同一 producer 被第二次消费时再次展开会
+        // 候选拒绝[SemanticBarrier:EvalCount]：同一 producer 被第二次消费时再次展开会
         // 重复求值；`local v = mark(); t[v] = v` 必须只调用一次，见 regress_235。
         if context.consumed_bindings[producer.binding_id] {
             return None;

@@ -23,8 +23,9 @@ use crate::decompile::{DecompileContext, DecompileState};
 use crate::generate::GenerateMode;
 use crate::hir::HirLowerError;
 use crate::hir::common::{
-    HirBlock, HirCapture, HirCaptureMode, HirClosureExpr, HirExpr, HirLValue, HirLocalDecl,
-    HirProto, HirProtoRef, HirStmt, HirValuePack, LocalId, ParamId, TempId, UpvalueId,
+    HirBlock, HirCapture, HirCaptureMode, HirClosureExpr, HirDebugScope, HirExpr, HirLValue,
+    HirLocalDecl, HirProto, HirProtoRef, HirStmt, HirValuePack, LocalId, ParamId, TempId,
+    UpvalueId,
 };
 use crate::recovery::{ProtoArtifactStage, ProtoFailure};
 use crate::structure::{
@@ -42,6 +43,7 @@ pub(super) struct ProtoBindings {
     pub(super) param_debug_hints: Vec<Option<String>>,
     pub(super) locals: Vec<LocalId>,
     pub(super) local_debug_hints: Vec<Option<String>>,
+    pub(super) local_debug_scopes: Vec<Option<usize>>,
     pub(super) upvalues: Vec<UpvalueId>,
     pub(super) upvalue_debug_hints: Vec<Option<String>>,
     pub(super) temps: Vec<TempId>,
@@ -482,6 +484,8 @@ fn lower_proto_one(
         param_debug_hints: lowering.bindings.param_debug_hints.clone(),
         locals: lowering.bindings.locals.clone(),
         local_debug_hints: lowering.bindings.local_debug_hints.clone(),
+        local_debug_scopes: lowering.bindings.local_debug_scopes.clone(),
+        debug_scopes: accepted_debug_scopes(proto, structure),
         physical_root_temps: BTreeSet::new(),
         physical_root_locals: BTreeSet::new(),
         upvalues: lowering.bindings.upvalues.clone(),
@@ -602,6 +606,7 @@ fn build_self_value_capture_locals(
                     let local = LocalId(bindings.locals.len());
                     bindings.locals.push(local);
                     bindings.local_debug_hints.push(None);
+                    bindings.local_debug_scopes.push(None);
                     (InstrRef(index), local)
                 })
         })
@@ -649,6 +654,8 @@ fn fill_failed_proto(
         param_debug_hints: vec![None; usize::from(proto.signature.num_params)],
         locals,
         local_debug_hints,
+        local_debug_scopes: vec![None; named_vararg_locals + detached_children.len()],
+        debug_scopes: Vec::new(),
         physical_root_temps: BTreeSet::new(),
         physical_root_locals: BTreeSet::new(),
         upvalues: (0..usize::from(proto.upvalues.common.count))
@@ -678,6 +685,41 @@ fn fill_failed_proto(
         source_proto_id: frame.source_proto_id,
         mutable_upvalues: mutable_upvalues_for_proto(proto, &child_mutable_upvalues),
     }
+}
+
+fn accepted_debug_scopes(
+    proto: &LoweredProto,
+    structure: &ReadyStructureFacts,
+) -> Vec<Option<HirDebugScope>> {
+    let mut scopes = vec![None; proto.debug_locals.len()];
+    for fact in &structure.debug_bindings().accepted {
+        scopes[fact.scope] = Some(HirDebugScope {
+            start_pc: fact.start_pc,
+            end_pc: fact.end_pc,
+            ends_before_return: low_instr_at_or_after_raw_pc(proto, fact.end_pc)
+                .is_some_and(|instr| debug_scope_end_precedes_return(proto, instr)),
+        });
+    }
+    scopes
+}
+
+fn low_instr_at_or_after_raw_pc(proto: &LoweredProto, pc: u32) -> Option<InstrRef> {
+    proto
+        .lowering_map
+        .pc_map
+        .iter()
+        .enumerate()
+        .find(|(_, raw_pcs)| raw_pcs.iter().any(|raw_pc| *raw_pc >= pc))
+        .map(|(index, _)| InstrRef(index))
+}
+
+fn debug_scope_end_precedes_return(proto: &LoweredProto, instr: InstrRef) -> bool {
+    let tail = &proto.instrs[instr.index()..];
+    let close_count = tail
+        .iter()
+        .take_while(|instr| matches!(instr, LowInstr::Close(_)))
+        .count();
+    matches!(tail.get(close_count), Some(LowInstr::Return(_))) && close_count + 1 == tail.len()
 }
 
 fn mutable_upvalues_for_proto(
@@ -752,6 +794,7 @@ fn build_shared_closure_locals(
             let local = LocalId(bindings.locals.len());
             bindings.locals.push(local);
             bindings.local_debug_hints.push(None);
+            bindings.local_debug_scopes.push(None);
             (identity, (local, proto))
         })
         .collect()
@@ -774,6 +817,7 @@ impl CapturedSharedClosureLowering {
             let local = LocalId(bindings.locals.len());
             bindings.locals.push(local);
             bindings.local_debug_hints.push(None);
+            bindings.local_debug_scopes.push(None);
             factory_locals.push(local);
 
             let owner_dst = match proto.instrs.get(index) {
@@ -800,12 +844,14 @@ impl CapturedSharedClosureLowering {
                 let local = LocalId(bindings.locals.len());
                 bindings.locals.push(local);
                 bindings.local_debug_hints.push(None);
+                bindings.local_debug_scopes.push(None);
                 *snapshot = Some(local);
             }
             let barrier = snapshots.iter().any(Option::is_some).then(|| {
                 let box_local = LocalId(bindings.locals.len());
                 bindings.locals.push(box_local);
                 bindings.local_debug_hints.push(None);
+                bindings.local_debug_scopes.push(None);
                 SharedCaptureBarrier {
                     box_local,
                     snapshots,
@@ -993,6 +1039,8 @@ fn build_composite_factory_proto(
         param_debug_hints: Vec::new(),
         locals: (0..plan.nodes.len()).map(LocalId).collect(),
         local_debug_hints: vec![None; plan.nodes.len()],
+        local_debug_scopes: vec![None; plan.nodes.len()],
+        debug_scopes: Vec::new(),
         physical_root_temps: BTreeSet::new(),
         physical_root_locals: BTreeSet::new(),
         upvalues: (0..plan.outer_captures.len()).map(UpvalueId).collect(),

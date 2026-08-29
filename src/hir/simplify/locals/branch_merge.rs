@@ -6,8 +6,10 @@
 //!
 //! 本文件只消费当前 HIR 树和 `TempTouchIndex`，不分配 local、不改写语句。分支摘要同时
 //! 维护“所有合流路径都已写入”和“首次写入前可能读取”，因此主 pass 只会在声明可以
-//! 支配所有读取时接受候选。常真 while 还会汇总所有 break 出口的 must-def；普通 while
-//! 保留零次执行路径，不会把 body 写入误报成 loop fallthrough 写入。
+//! 支配所有读取时接受候选。global 声明只向全局名字提交写入，它的 RHS temp 读取仍纳入
+//! read-before-def；不会因为 AST-owned 声明身份而丢掉同 arm 后续的 temp must-def。常真
+//! while 还会汇总所有 break 出口的 must-def；普通 while 保留零次执行路径，不会把 body
+//! 写入误报成 loop fallthrough 写入。
 //!
 //! 输入形状：`if c then t1 = a else t1 = b end; use(t1)`。
 //! 输出形状：候选 temp 集合 `{ t1 }`，后续由主 pass 物化成 `local l; if c then l = a else l = b end`。
@@ -150,8 +152,8 @@ fn summarize_stmt_fallthrough_assignments(
             .unwrap_or_default()
     };
     match stmt {
-        HirStmt::GlobalDecl(_) => None,
         HirStmt::LocalDecl(_)
+        | HirStmt::GlobalDecl(_)
         | HirStmt::ErrNil(_)
         | HirStmt::ToBeClosed(_)
         | HirStmt::Close(_)

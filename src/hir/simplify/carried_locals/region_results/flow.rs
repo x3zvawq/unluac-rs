@@ -413,8 +413,7 @@ impl FlowVerifier {
             }
             entries = next;
         }
-        // 候选拒绝[ConvergenceGuard]：RelationSet 仅三位且 union 单调，四轮仍不稳定表示 transfer 不变量损坏。
-        None
+        panic!("three-state monotone loop relation must converge within four rounds")
     }
 
     fn validate_loop_condition(
@@ -442,8 +441,7 @@ impl FlowVerifier {
             }
             entries = next;
         }
-        // 候选拒绝[ConvergenceGuard]：三态单调 fixed-point 四轮仍不收敛表示 relation transfer 不变量损坏。
-        None
+        panic!("three-state monotone condition relation must converge within four rounds")
     }
 
     fn validate_leaf(&self, stmt: &HirStmt, states: RelationSet) -> Option<()> {

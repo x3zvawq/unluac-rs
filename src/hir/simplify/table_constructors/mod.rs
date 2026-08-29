@@ -1009,20 +1009,18 @@ impl TableConstructorPass<'_> {
         {
             return false;
         }
-        // 候选拒绝[ProofIncomplete]：debug/capture 全局事实尚未按该相邻区间证明可观察性。
+        // 候选拒绝[SemanticBarrier:DebugScope]：把后置 SETLIST 收进 LocalDecl initializer
+        // 会改变 debug hook 在声明行可观察到的初始化内容。
         if self
             .debug_identity_bindings
             .get(binding)
             .copied()
             .unwrap_or_default()
-            || self
-                .reference_captured_bindings
-                .get(binding)
-                .copied()
-                .unwrap_or_default()
         {
             return false;
         }
+        // seed LocalDecl 与 LocalId 都保留，且相邻 SETLIST 之间没有 closure 创建点；区间后
+        // 的 reference capture 仍观察同一个已初始化 table owner，无需 proto 级 capture gate。
         // A branch-local LocalDecl may originate from a coalesced fixed temp rather than retain
         // the direct-SSA marker. The declaration is fresh only when no earlier statement mentions
         // this LocalId; eventually this should consume precise promotion provenance.
@@ -1103,21 +1101,19 @@ impl TableConstructorPass<'_> {
         if seed.trailing_multivalue.is_some() {
             return false;
         }
-        // 候选拒绝[ProofIncomplete]：debug/capture 仍是 proto 级 blanket gate，尚未证明该
-        // open-owner 区间是否改变可观察身份。
+        // 候选拒绝[SemanticBarrier:DebugScope]：把区间写入收进 LocalDecl initializer 会改变
+        // debug hook 在声明行可观察到的初始化内容。
         if self
             .debug_identity_bindings
             .get(binding)
             .copied()
             .unwrap_or_default()
-            || self
-                .reference_captured_bindings
-                .get(binding)
-                .copied()
-                .unwrap_or_default()
         {
             return false;
         }
+        // owner 的 LocalDecl/LocalId 不会被删除；下方逐句证明又拒绝任何在 drain 区间内
+        // 读取 owner 的 producer、key 或 value（closure capture 也通过 capture value 命中）。
+        // 因此只有区间后的 reference capture 可达，它仍捕获同一个 table owner。
         let tail = set_list.values.tail.as_ref().expect("checked open tail");
         // 候选拒绝[ProofIncomplete]：exact-width carrier 尚无 constructor-tail 精确表示。
         if tail.exact_width().is_some() {

@@ -610,7 +610,8 @@ pub(super) fn collect_call_root_lifetimes(
 ///
 /// Call 的观察、allocation owner 与相邻 overwrite 合同保持在既有 collector 中；这里不把
 /// 普通 lookup 一概提升为 source local。标量与无求值 multi-nil 只按同 home 精确配对；
-/// 无 overwrite 的 block-end 路径仍有下方标出的终止事实缺陷，不能视为已完成证明。
+/// 没有可见 overwrite 时，跨过显式 GC 的 lookup 由当前 HIR block 的词法 local 保活到
+/// block end。block 外的 successor 不属于该 local 的可见区间，因此无需猜测跨块 home 复用。
 pub(super) fn collect_lookup_gc_root_lifetimes(
     stmts: &[HirStmt],
     facts: &ProtoPromotionFacts,
@@ -810,9 +811,10 @@ fn preserve_lookup_roots_to_scope_end(
     active: &BTreeMap<HomeSlotKey, ActiveLookupGcHome>,
     lifetimes: &mut LookupGcRootLifetimeIndices,
 ) {
-    // 证明缺陷[AcceptanceProofIncomplete:Lifetime]：regress_396 的 PUC Lua 5.4 child-if
-    // 在 block 后立即复用 lookup home，证明当前物化范围对该形状精确；但普通 child block
-    // 尚无通用 stack-top/跨块 successor overwrite 事实，不能把同一结论外推到任意 chunk。
+    // collector 按 HirBlock 独立运行，locals pass 也把 producer 提升为同一 block 内的词法
+    // local。active 说明本 block 内没有已证明的同-home overwrite；一旦离开 block，源码
+    // local 的作用域自然终止，所以无需也不能把 parent successor 的 home 复用算进这里。
+    // regress_396 覆盖 child-if 后立即复用该 home 的边界。
     lifetimes.roots.extend(
         active
             .values()

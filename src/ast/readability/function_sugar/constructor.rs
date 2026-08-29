@@ -20,8 +20,8 @@ use super::super::binding_ref::{binding_from_name_ref, name_matches_binding};
 use super::super::expr_analysis::is_eventless_primitive_literal;
 use super::super::installer_iife::function_expr_is_substantial;
 use crate::ast::common::{
-    AstAssign, AstBindingRef, AstCallKind, AstExpr, AstFieldAccess, AstFunctionExpr, AstFunctionName,
-    AstLValue, AstLocalAttr, AstLocalDecl, AstLocalOrigin, AstReturn, AstStmt, AstTableField,
+    AstAssign, AstBindingRef, AstCallKind, AstExpr, AstFieldAccess, AstFunctionExpr,
+    AstFunctionName, AstLValue, AstLocalAttr, AstLocalDecl, AstReturn, AstStmt, AstTableField,
     AstTableKey,
 };
 
@@ -32,11 +32,6 @@ pub(super) fn try_inline_terminal_constructor_fields(
         return None;
     };
     if local_decl.bindings.len() != 1 || local_decl.values.len() != 1 {
-        return None;
-    }
-    if local_decl.bindings[0].attr != AstLocalAttr::None {
-        // 候选拒绝[PolicyBoundary]：`<const>`/`<close>` 声明属性仍由声明 owner 保留；本
-        // pass 不改变属性归属或资源生命周期。
         return None;
     }
     let binding = local_decl.bindings[0].id;
@@ -185,8 +180,12 @@ fn single_local_alias_decl(stmt: &AstStmt) -> Option<(AstBindingRef, &AstExpr)> 
             return None;
         }
     }
-    if local_decl.bindings[0].origin != AstLocalOrigin::Recovered {
-        // 候选拒绝[PolicyBoundary]：DebugHinted 的源码声明身份保留；候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 必须活到原 block 末。
+    if local_decl.bindings[0].origin.is_debug_hinted() {
+        // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted 是 IR 已保留的源码 binding；删除 alias 会抹掉其名字与词法区间。
+        return None;
+    }
+    if local_decl.bindings[0].origin.is_physical_root() {
+        // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 必须活到原 block 末。
         return None;
     }
     Some((local_decl.bindings[0].id, &local_decl.values[0]))
@@ -462,33 +461,36 @@ fn rewrite_terminal_constructor_call_expr(
 
     let mut expected_args = active_args.iter().copied().peekable();
     let mut rewritten_args = Vec::with_capacity(call.args.len());
+    let mut last_arg_is_inlined_constructor = false;
     for arg in &call.args {
         if let Some(expected) = expected_args.peek()
             && matches!(arg, AstExpr::Var(name) if name_matches_binding(name, expected.binding))
         {
             rewritten_args.push(expected.value.clone());
             expected_args.next();
+            last_arg_is_inlined_constructor = true;
             continue;
         }
-        if !is_eventless_primitive_literal(arg) {
-            // 候选拒绝[ProofIncomplete]：额外实参若含 binding、lookup、调用或分配，
-            // 仍需证明把 constructor initializer 搬到其后不会改变快照与求值顺序。
+        if expected_args.peek().is_some() && !is_eventless_primitive_literal(arg) {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：尚有 constructor handoff 时，事件型额外实参会从其后移到其前；regress_423 的 prefix case 可观察到顺序反转。
             return None;
         }
-        // 候选接受[EvalOrderProof]：primitive literal 没有读取、分配或运行时事件，
-        // 保留在原参数位置不会与被搬入的 constructor initializer 交换可观察行为。
+        // 候选接受[EvalOrderProof]：primitive literal 可安全位于待下沉 initializer 前；
+        // 最后一个 handoff 之后的实参没有被任何 initializer 跨越，可按原位保留任意表达式。
         rewritten_args.push(arg.clone());
+        last_arg_is_inlined_constructor = false;
     }
     if expected_args.next().is_some() {
-        // 候选拒绝[SemanticBarrier:Scope/EvalOrder]：每个 active constructor local 都必须
-        // 按声明顺序由 sink 承接一次，否则删除声明会丢失 handoff 或改变 initializer 顺序。
+        // 候选拒绝[SemanticBarrier:Scope]：每个 active constructor local 都必须由 sink 承接一次，否则删除声明会丢失 handoff；
+        // 候选拒绝[SemanticBarrier:EvalOrder]：承接顺序还必须与 initializer 声明顺序一致。
         return None;
     }
 
     let mut rewritten = call.as_ref().clone();
     rewritten.callee = callee_expr.clone();
     rewritten.args = rewritten_args;
-    if let Some(last) = rewritten.args.last_mut()
+    if last_arg_is_inlined_constructor
+        && let Some(last) = rewritten.args.last_mut()
         && matches!(
             last,
             AstExpr::Call(_) | AstExpr::MethodCall(_) | AstExpr::VarArg
@@ -516,4 +518,60 @@ fn removed_constructor_locals_are_dead_after_sink(
     arg_locals
         .iter()
         .all(|arg| use_index.count_uses_in_suffix(suffix_start, arg.binding) == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::common::{
+        AstBlock, AstLocalBinding, AstLocalOrigin, AstNameRef, AstTableConstructor,
+    };
+    use crate::hir::{HirProtoRef, LocalId};
+
+    fn function_value() -> AstExpr {
+        AstExpr::FunctionExpr(Box::new(AstFunctionExpr {
+            function: HirProtoRef(0),
+            params: Vec::new(),
+            is_vararg: false,
+            named_vararg: None,
+            body: AstBlock::default(),
+            captured_bindings: BTreeSet::new(),
+            captured_params: BTreeSet::new(),
+        }))
+    }
+
+    #[test]
+    fn field_folding_preserves_local_attributes() {
+        for attr in [AstLocalAttr::Const, AstLocalAttr::Close] {
+            let binding = AstBindingRef::Local(LocalId(0));
+            let stmts = vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: binding,
+                        attr,
+                        origin: AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::TableConstructor(Box::new(AstTableConstructor {
+                        fields: Vec::new(),
+                    }))],
+                })),
+                AstStmt::Assign(Box::new(AstAssign {
+                    targets: vec![AstLValue::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(AstNameRef::Local(LocalId(0))),
+                        field: "read".to_owned(),
+                    }))],
+                    values: vec![function_value()],
+                })),
+            ];
+
+            let (AstStmt::LocalDecl(rewritten), consumed) =
+                try_inline_terminal_constructor_fields(&stmts)
+                    .expect("field folding keeps the declaration owner")
+            else {
+                panic!("field folding should keep a local declaration")
+            };
+            assert_eq!(consumed, 2);
+            assert_eq!(rewritten.bindings[0].attr, attr);
+        }
+    }
 }

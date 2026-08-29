@@ -468,7 +468,7 @@ fn record_local_declaration(
         && let Some(truthy) = expr_truthiness(value, stable.safety)
     {
         let inserted = facts.insert(binding, truthy);
-        debug_assert!(
+        assert!(
             inserted,
             "new local declaration cannot contradict prior facts"
         );

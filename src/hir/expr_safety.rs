@@ -78,6 +78,10 @@ impl HirExprSafety {
         self.literal_string_order_is_binary
     }
 
+    pub(crate) const fn distinguishes_integer_number_values(self) -> bool {
+        matches!(self.mixed_numeric_mode, MixedNumericMode::ExactIntegerFloat)
+    }
+
     fn equality_is_stable(self, op: HirBinaryOpKind, lhs: &HirExpr, rhs: &HirExpr) -> bool {
         if op != HirBinaryOpKind::Eq {
             return false;

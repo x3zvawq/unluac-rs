@@ -167,10 +167,10 @@ fn try_collapse_pure_binding_handoffs(
         rewrites: seed.rewrites.clone(),
         promotion_facts: safety.promotion_facts,
     };
-    if !rewrite_stmts(&mut block.stmts[index + 1..], &mut pass) {
-        // 候选拒绝[ConvergenceGuard]：touch/writeback facts 已证明 suffix 存在 temp；rewrite 无命中表示 collector 与 rewriter 不变量漂移。
-        return false;
-    }
+    assert!(
+        rewrite_stmts(&mut block.stmts[index + 1..], &mut pass),
+        "binding handoff suffix must contain a planned temp rewrite"
+    );
 
     if let Some(rewritten_seed) = rewritten_seed {
         block.stmts[index] = rewritten_seed;
@@ -235,10 +235,10 @@ fn try_collapse_label_loop_update_handoff(
         }],
         promotion_facts: safety.promotion_facts,
     };
-    if !rewrite_stmts(&mut block.stmts[index..], &mut pass) {
-        // 候选拒绝[ConvergenceGuard]：已定位 seed/update/writeback；无 rewrite 命中表示 touch index 与 rewriter 契约漂移。
-        return false;
-    }
+    assert!(
+        rewrite_stmts(&mut block.stmts[index..], &mut pass),
+        "label-loop handoff must contain its planned temp rewrite"
+    );
 
     prune_redundant_self_assigns_in_stmts(
         &mut block.stmts[index..],
@@ -319,10 +319,10 @@ fn try_collapse_single_binding_handoff(
             promotion_facts: safety.promotion_facts,
         },
     );
-    if !rewritten {
-        // 候选拒绝[ConvergenceGuard]：touch facts 已证明 suffix 命中 temp；无 rewrite 表示索引/visitor 不变量漂移。
-        return false;
-    }
+    assert!(
+        rewritten,
+        "single binding handoff suffix must contain its planned temp rewrite"
+    );
 
     block.stmts.remove(index);
     true
@@ -382,10 +382,10 @@ fn try_collapse_binding_update_handoff(
             promotion_facts: safety.promotion_facts,
         },
     );
-    if !rewritten {
-        // 候选拒绝[ConvergenceGuard]：suffix touch/writeback 已证明 temp 存在；无 rewrite 命中表示 plan facts 漂移。
-        return false;
-    }
+    assert!(
+        rewritten,
+        "binding update suffix must contain its planned temp rewrite"
+    );
     block.stmts[index] = rewritten_seed;
 
     rewrite_stmts(

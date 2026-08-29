@@ -591,7 +591,8 @@ impl InlineSite {
             InlinePolicy::Conservative => match candidate.origin() {
                 // 候选拒绝[SemanticBarrier:DebugScope]：删除 debug local 会改变 debug.getlocal 可观察的作用域（regress_351）；候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 可能被弱表/`__gc` 观察，不能走通用 use-site 内联。
                 super::super::super::common::AstLocalOrigin::DebugHinted
-                | super::super::super::common::AstLocalOrigin::PhysicalRoot => false,
+                | super::super::super::common::AstLocalOrigin::PhysicalRoot
+                | super::super::super::common::AstLocalOrigin::DebugHintedPhysicalRoot => false,
                 super::super::super::common::AstLocalOrigin::Recovered => match self {
                     Self::CallCallee | Self::AccessBase => {
                         is_access_base_inline_expr(replacement)

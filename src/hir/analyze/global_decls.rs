@@ -107,9 +107,10 @@ fn recognize_protocol(
         names.push(item.name);
     }
 
-    // 候选拒绝[SemanticRisk]: a fixed call can provide only the trailing slots of a wider
+    // 候选拒绝[SemanticBarrier:ValueArity]: a fixed call can provide only the trailing slots of a wider
     // declaration (`global a, b, c = 11, pair()`). Consuming that suffix would strand the leading
-    // item as a different declaration, so any immediately adjacent complete item rejects the run.
+    // item as a different declaration, so any immediately adjacent complete item rejects the run
+    // (regress_410_lua55_mixed_global_rhs).
     if end
         .checked_add(3)
         .is_some_and(|item_end| item_end <= block_end)
@@ -117,10 +118,11 @@ fn recognize_protocol(
     {
         return None;
     }
-    // 候选拒绝[SemanticRisk]: wide target descriptors can be prepared before the tail call, so
+    // 候选拒绝[SemanticBarrier:EvalOrder]: wide target descriptors can be prepared before the tail call, so
     // the leading item is not necessarily adjacent to the direct suffix. A later ERRNNIL/SET
     // pair consuming a pre-owner SSA value may still belong to this declaration; splitting it
-    // would re-evaluate its environment after the call (which can rebind `_ENV`).
+    // would re-evaluate its environment after the call, which can rebind `_ENV`
+    // (regress_410_lua55_wide_mixed_global_rhs).
     if ((end + 1)..block_end).any(|set_index| {
         matches!(proto.instrs.get(set_index - 1), Some(LowInstr::ErrNil(_)))
             && matches!(proto.instrs.get(set_index), Some(LowInstr::SetTable(_)))

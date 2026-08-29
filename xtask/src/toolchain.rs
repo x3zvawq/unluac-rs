@@ -4,7 +4,9 @@
 //! `msvcbuild.bat` 和 Luau 的 CMake，统一输出到 `lua/build`，供 CLI 与测试复用。
 
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
+#[cfg(not(windows))]
+use std::ffi::OsString;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -19,6 +21,7 @@ const LUAJIT_REV: &str = "659a61693aa3b87661864ad0f12eee14c865cd7f";
 const LUAJIT_BRANCH: &str = "v2.1";
 const LUAU_URL: &str = "https://github.com/luau-lang/luau/archive/refs/tags/0.713.tar.gz";
 const LUAU_EXTRACTED_DIR: &str = "luau-0.713";
+#[cfg(not(windows))]
 const LUAU_UPSTREAM_TARGETS: &[&str] = &["luau", "luau-analyze", "luau-compile", "luau-bytecode"];
 const LUAU_TARGETS: &[&str] = &[
     "luau",

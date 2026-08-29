@@ -552,17 +552,14 @@ fn apply_fold(
     fold: LoopUpdateFold,
     promotion_facts: &mut ProtoPromotionFacts,
 ) -> bool {
-    let Some((body, repeat_cond)) = loop_body_mut(stmt) else {
-        // 候选拒绝[ConvergenceGuard]：candidate 的 loop owner 已漂移；重验发生在所有修改之前。
-        return false;
-    };
+    let (body, repeat_cond) =
+        loop_body_mut(stmt).expect("planned loop-update candidate must retain its loop owner");
 
-    if body.stmts.get(fold.seed_index) != Some(&fold.seed)
-        || body.stmts.last() != Some(&fold.writeback)
-    {
-        // 候选拒绝[ConvergenceGuard]：candidate 的 seed 或尾写回已漂移；重验发生在所有修改之前。
-        return false;
-    }
+    assert!(
+        body.stmts.get(fold.seed_index) == Some(&fold.seed)
+            && body.stmts.last() == Some(&fold.writeback),
+        "planned loop-update seed and writeback must remain unchanged before apply"
+    );
 
     let HirStmt::LocalDecl(local_decl) = &mut body.stmts[fold.seed_index] else {
         unreachable!("exactly matched loop-update seed must remain a local declaration")
