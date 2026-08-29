@@ -26,8 +26,6 @@ use super::super::mention::stmts_reference_captured_bindings;
 use super::super::visit::{HirVisitor, visit_proto};
 use super::DiscardBoundaryFacts;
 
-const MAX_TRACKED_BINDINGS: usize = 256;
-
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 enum StableBinding {
     Param(ParamId),
@@ -106,14 +104,7 @@ impl StableBindingIndex {
 
     fn track_condition(&mut self, expr: &HirExpr) {
         if let Some(binding) = stable_binding(expr) {
-            if self.candidates.len() == MAX_TRACKED_BINDINGS && !self.candidates.contains(&binding)
-            {
-                // 候选搜索裁剪[ResourceLimit]：超过 256 个独立 binding 时只跳过该 binding，
-                // 保留已有候选的路径事实，避免无关条件让整个 proto 停止专门化。
-                self.unstable.insert(binding);
-            } else {
-                self.candidates.insert(binding);
-            }
+            self.candidates.insert(binding);
             return;
         }
 
@@ -552,25 +543,25 @@ fn extend_condition_facts(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_TRACKED_BINDINGS, StableBinding, StableBindingIndex};
+    use super::{StableBinding, StableBindingIndex};
     use crate::decompile::DecompileDialect;
     use crate::hir::common::{HirExpr, ParamId};
     use crate::hir::expr_safety::HirExprSafety;
 
     #[test]
-    fn condition_budget_prunes_only_new_bindings() {
+    fn tracks_every_condition_binding() {
         let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
         let mut index = StableBindingIndex {
             candidates: Default::default(),
             unstable: Default::default(),
             safety,
         };
-        for param in 0..=MAX_TRACKED_BINDINGS {
+        for param in 0..=256 {
             index.track_condition(&HirExpr::ParamRef(ParamId(param)));
         }
 
-        assert_eq!(index.candidates.len(), MAX_TRACKED_BINDINGS);
+        assert_eq!(index.candidates.len(), 257);
         assert!(index.contains(StableBinding::Param(ParamId(0))));
-        assert!(!index.contains(StableBinding::Param(ParamId(MAX_TRACKED_BINDINGS))));
+        assert!(index.contains(StableBinding::Param(ParamId(256))));
     }
 }

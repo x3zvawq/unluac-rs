@@ -1,11 +1,16 @@
 //! 这个子模块负责 decision synthesis 的抽象值域和等价性验证上下文。
 //!
-//! 它依赖前面已经规范化的 HIR decision 表达式，只表达“候选式子在抽象环境里代表什么”，
-//! 不会在这里决定哪一种源码形状更可读。
-//! 例如：`temp == nil` 会在这里被解释成可枚举的抽象真假环境；整数与浮点数的判等
-//! 则按 Lua 数值语义计算，而不是按抽象值枚举项的 Rust 身份计算。
+//! 它依赖前面已经规范化的 HIR decision 表达式，用 canonical multi-valued decision
+//! diagram 表达候选在完整抽象环境中的值，不会物化环境笛卡尔积，也不会在这里决定哪种
+//! 源码形状更可读。当前 synthesis grammar 只观察 truthiness、与 primitive literal 的稳定
+//! equality 和最终返回身份；域包含全部 literal equality class 及两个 fresh truthy symbol，
+//! 足以给任意不同的非 literal 结果构造区分赋值。若将来接纳 dynamic-dynamic equality 或
+//! ordering，必须先扩展该 small-model 证明。
+//!
+//! 例如：`temp == nil` 会成为以 `temp` 为变量的共享多值分支；整数与浮点数的判等按 Lua
+//! 数值语义计算，而 terminal 仍保留两种结果身份。Decision 的 `CurrentValue` 始终绑定当前
+//! node 已求出的 test diagram，不会重求值或跨节点复用。
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::LuaString;
@@ -16,7 +21,6 @@ use crate::hir::common::{
 use crate::hir::expr_safety::HirExprSafety;
 
 use super::EXTRA_TRUTHY_SYMBOLS;
-use super::cost::is_truthy;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(super) enum RefKey {
@@ -41,6 +45,317 @@ pub(super) enum AbstractValue {
     TruthySymbol(u8),
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub(super) struct DiagramId(usize);
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+enum DiagramNode {
+    Terminal(AbstractValue),
+    Branch {
+        variable: usize,
+        edges: Vec<DiagramId>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+enum DiagramBinaryOp {
+    Eq,
+    Lt,
+    Le,
+    LogicalAnd,
+    LogicalOr,
+}
+
+/// 在共享的有限抽象值域上构造 canonical multi-valued decision diagram。
+///
+/// 每个 `RefKey` 只对应一层有序分支；所有终端、同构分支和 apply 结果都会复用。这样验证
+/// 覆盖的仍是完整笛卡尔积，但不会先物化 `domain.len() ^ refs.len()` 个环境。两个表达式在
+/// 同一 arena 中得到相同根节点，当且仅当它们在每个抽象环境中返回相同值。
+pub(super) struct SymbolicVerifier {
+    ref_positions: BTreeMap<RefKey, usize>,
+    domain_terminals: Vec<DiagramId>,
+    nodes: Vec<DiagramNode>,
+    interned: BTreeMap<DiagramNode, DiagramId>,
+    not_cache: BTreeMap<DiagramId, DiagramId>,
+    binary_cache: BTreeMap<(DiagramBinaryOp, DiagramId, DiagramId), Option<DiagramId>>,
+    select_cache: BTreeMap<(DiagramId, DiagramId, DiagramId), DiagramId>,
+    safety: HirExprSafety,
+}
+
+impl SymbolicVerifier {
+    pub(super) fn new(
+        refs: Vec<RefKey>,
+        domain: Vec<AbstractValue>,
+        safety: HirExprSafety,
+    ) -> Self {
+        let ref_positions = refs
+            .into_iter()
+            .enumerate()
+            .map(|(index, key)| (key, index))
+            .collect();
+        let mut verifier = Self {
+            ref_positions,
+            domain_terminals: Vec::new(),
+            nodes: Vec::new(),
+            interned: BTreeMap::new(),
+            not_cache: BTreeMap::new(),
+            binary_cache: BTreeMap::new(),
+            select_cache: BTreeMap::new(),
+            safety,
+        };
+        verifier.domain_terminals = domain
+            .into_iter()
+            .map(|value| verifier.intern_terminal(value))
+            .collect();
+        verifier
+    }
+
+    pub(super) fn eval_expr(&mut self, expr: &HirExpr) -> Option<DiagramId> {
+        match expr {
+            HirExpr::Nil => Some(self.intern_terminal(AbstractValue::Nil)),
+            HirExpr::Boolean(false) => Some(self.intern_terminal(AbstractValue::False)),
+            HirExpr::Boolean(true) => Some(self.intern_terminal(AbstractValue::True)),
+            HirExpr::Integer(value) => Some(self.intern_terminal(AbstractValue::Integer(*value))),
+            HirExpr::Number(value) => {
+                Some(self.intern_terminal(AbstractValue::Number(value.to_bits())))
+            }
+            HirExpr::String(value) => {
+                Some(self.intern_terminal(AbstractValue::String(value.clone())))
+            }
+            HirExpr::Int64(value) => Some(self.intern_terminal(AbstractValue::Int64(*value))),
+            HirExpr::UInt64(value) => Some(self.intern_terminal(AbstractValue::UInt64(*value))),
+            HirExpr::Vector(vector) => {
+                Some(self.intern_terminal(AbstractValue::Vector(vector.components)))
+            }
+            HirExpr::Complex { real, imag } => Some(self.intern_terminal(AbstractValue::Complex {
+                real_bits: real.to_bits(),
+                imag_bits: imag.to_bits(),
+            })),
+            HirExpr::ParamRef(param) => self.ref_value(RefKey::Param(*param)),
+            HirExpr::LocalRef(local) => self.ref_value(RefKey::Local(*local)),
+            HirExpr::UpvalueRef(upvalue) => self.ref_value(RefKey::Upvalue(*upvalue)),
+            HirExpr::TempRef(temp) => self.ref_value(RefKey::Temp(*temp)),
+            HirExpr::Unary(unary) if unary.op == crate::hir::common::HirUnaryOpKind::Not => {
+                let value = self.eval_expr(&unary.expr)?;
+                Some(self.apply_not(value))
+            }
+            HirExpr::Binary(binary)
+                if matches!(
+                    binary.op,
+                    HirBinaryOpKind::Eq | HirBinaryOpKind::Lt | HirBinaryOpKind::Le
+                ) =>
+            {
+                let lhs = self.eval_expr(&binary.lhs)?;
+                let rhs = self.eval_expr(&binary.rhs)?;
+                let op = match binary.op {
+                    HirBinaryOpKind::Eq => DiagramBinaryOp::Eq,
+                    HirBinaryOpKind::Lt => DiagramBinaryOp::Lt,
+                    HirBinaryOpKind::Le => DiagramBinaryOp::Le,
+                    _ => unreachable!(),
+                };
+                self.apply_binary(op, lhs, rhs)
+            }
+            HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+                let lhs = self.eval_expr(&logical.lhs)?;
+                let rhs = self.eval_expr(&logical.rhs)?;
+                let op = if matches!(expr, HirExpr::LogicalAnd(_)) {
+                    DiagramBinaryOp::LogicalAnd
+                } else {
+                    DiagramBinaryOp::LogicalOr
+                };
+                self.apply_binary(op, lhs, rhs)
+            }
+            HirExpr::Decision(_)
+            | HirExpr::GlobalRef(_)
+            | HirExpr::TableAccess(_)
+            | HirExpr::Unary(_)
+            | HirExpr::Binary(_)
+            | HirExpr::Call(_)
+            | HirExpr::VarArg
+            | HirExpr::TableConstructor(_)
+            | HirExpr::Closure(_)
+            | HirExpr::Unresolved(_) => None,
+        }
+    }
+
+    pub(super) fn select(
+        &mut self,
+        condition: DiagramId,
+        truthy: DiagramId,
+        falsy: DiagramId,
+    ) -> DiagramId {
+        if truthy == falsy {
+            return truthy;
+        }
+        if let DiagramNode::Terminal(value) = &self.nodes[condition.0] {
+            return if super::cost::is_truthy(value) {
+                truthy
+            } else {
+                falsy
+            };
+        }
+        if let Some(cached) = self.select_cache.get(&(condition, truthy, falsy)) {
+            return *cached;
+        }
+
+        let variable = [condition, truthy, falsy]
+            .into_iter()
+            .filter_map(|node| self.top_variable(node))
+            .min()
+            .expect("non-terminal select must have a branch variable");
+        let edges = (0..self.domain_terminals.len())
+            .map(|edge| {
+                let condition = self.cofactor(condition, variable, edge);
+                let truthy = self.cofactor(truthy, variable, edge);
+                let falsy = self.cofactor(falsy, variable, edge);
+                self.select(condition, truthy, falsy)
+            })
+            .collect();
+        let result = self.intern_branch(variable, edges);
+        self.select_cache.insert((condition, truthy, falsy), result);
+        result
+    }
+
+    fn ref_value(&mut self, key: RefKey) -> Option<DiagramId> {
+        let variable = *self.ref_positions.get(&key)?;
+        Some(self.intern_branch(variable, self.domain_terminals.clone()))
+    }
+
+    fn apply_not(&mut self, node: DiagramId) -> DiagramId {
+        if let Some(cached) = self.not_cache.get(&node) {
+            return *cached;
+        }
+        let result = match self.nodes[node.0].clone() {
+            DiagramNode::Terminal(value) => {
+                self.intern_terminal(if super::cost::is_truthy(&value) {
+                    AbstractValue::False
+                } else {
+                    AbstractValue::True
+                })
+            }
+            DiagramNode::Branch { variable, edges } => {
+                let edges = edges.into_iter().map(|edge| self.apply_not(edge)).collect();
+                self.intern_branch(variable, edges)
+            }
+        };
+        self.not_cache.insert(node, result);
+        result
+    }
+
+    fn apply_binary(
+        &mut self,
+        op: DiagramBinaryOp,
+        lhs: DiagramId,
+        rhs: DiagramId,
+    ) -> Option<DiagramId> {
+        if let Some(cached) = self.binary_cache.get(&(op, lhs, rhs)) {
+            return *cached;
+        }
+        let result = match (&self.nodes[lhs.0], &self.nodes[rhs.0]) {
+            (DiagramNode::Terminal(lhs), DiagramNode::Terminal(rhs)) => {
+                let value = match op {
+                    DiagramBinaryOp::Eq => {
+                        if abstract_value_eq(lhs, rhs, self.safety)? {
+                            AbstractValue::True
+                        } else {
+                            AbstractValue::False
+                        }
+                    }
+                    DiagramBinaryOp::Lt | DiagramBinaryOp::Le => {
+                        let ordering = abstract_value_partial_cmp(lhs, rhs, self.safety)?;
+                        let value = match op {
+                            DiagramBinaryOp::Lt => ordering == std::cmp::Ordering::Less,
+                            DiagramBinaryOp::Le => ordering != std::cmp::Ordering::Greater,
+                            _ => unreachable!(),
+                        };
+                        if value {
+                            AbstractValue::True
+                        } else {
+                            AbstractValue::False
+                        }
+                    }
+                    DiagramBinaryOp::LogicalAnd => {
+                        if super::cost::is_truthy(lhs) {
+                            rhs.clone()
+                        } else {
+                            lhs.clone()
+                        }
+                    }
+                    DiagramBinaryOp::LogicalOr => {
+                        if super::cost::is_truthy(lhs) {
+                            lhs.clone()
+                        } else {
+                            rhs.clone()
+                        }
+                    }
+                };
+                Some(self.intern_terminal(value))
+            }
+            _ => {
+                let variable = [lhs, rhs]
+                    .into_iter()
+                    .filter_map(|node| self.top_variable(node))
+                    .min()
+                    .expect("non-terminal binary apply must have a branch variable");
+                let mut edges = Vec::with_capacity(self.domain_terminals.len());
+                for edge in 0..self.domain_terminals.len() {
+                    let lhs = self.cofactor(lhs, variable, edge);
+                    let rhs = self.cofactor(rhs, variable, edge);
+                    edges.push(self.apply_binary(op, lhs, rhs)?);
+                }
+                Some(self.intern_branch(variable, edges))
+            }
+        };
+        self.binary_cache.insert((op, lhs, rhs), result);
+        result
+    }
+
+    fn intern_terminal(&mut self, value: AbstractValue) -> DiagramId {
+        self.intern_node(DiagramNode::Terminal(value))
+    }
+
+    fn intern_branch(&mut self, variable: usize, edges: Vec<DiagramId>) -> DiagramId {
+        let Some(first) = edges.first().copied() else {
+            unreachable!("symbolic domain always contains base values")
+        };
+        if edges.iter().all(|edge| *edge == first) {
+            return first;
+        }
+        debug_assert!(edges.iter().all(|edge| {
+            self.top_variable(*edge)
+                .is_none_or(|child| child > variable)
+        }));
+        self.intern_node(DiagramNode::Branch { variable, edges })
+    }
+
+    fn intern_node(&mut self, node: DiagramNode) -> DiagramId {
+        if let Some(existing) = self.interned.get(&node) {
+            return *existing;
+        }
+        let id = DiagramId(self.nodes.len());
+        self.nodes.push(node.clone());
+        self.interned.insert(node, id);
+        id
+    }
+
+    fn top_variable(&self, node: DiagramId) -> Option<usize> {
+        match &self.nodes[node.0] {
+            DiagramNode::Terminal(_) => None,
+            DiagramNode::Branch { variable, .. } => Some(*variable),
+        }
+    }
+
+    fn cofactor(&self, node: DiagramId, variable: usize, edge: usize) -> DiagramId {
+        match &self.nodes[node.0] {
+            DiagramNode::Branch {
+                variable: node_variable,
+                edges,
+            } if *node_variable == variable => edges[edge],
+            _ => node,
+        }
+    }
+}
+
 /// 模拟 Lua 对两个抽象值的 `<` / `<=` 比较语义。
 ///
 /// Lua 只允许两个数字或两个字符串之间的比较（不考虑元方法）。
@@ -63,7 +378,7 @@ fn abstract_value_partial_cmp(
             .mixed_integer_number_ordering(*b, f64::from_bits(*a))
             .map(|o| o.reverse()),
         (AbstractValue::String(a), AbstractValue::String(b)) => {
-            // 候选拒绝[SemanticBarrier:Locale]：PUC Lua 的字符串顺序依赖运行时 `LC_COLLATE`，抽象域不能用固定字节序验证候选。
+            // 候选拒绝[SemanticBarrier:Locale]：PUC Lua 的字符串顺序依赖运行时 `LC_COLLATE`，抽象域不能用固定字节序验证候选（regress_392）。
             safety.literal_string_order_is_binary().then(|| a.cmp(b))
         }
         (AbstractValue::Int64(a), AbstractValue::Int64(b)) => Some(a.cmp(b)),
@@ -96,12 +411,10 @@ fn abstract_value_eq(
     }
 }
 
-#[derive(Clone)]
 pub(super) struct SynthesisContext<'a> {
     pub(super) decision: &'a HirDecisionExpr,
-    pub(super) ref_positions: Cow<'a, BTreeMap<RefKey, usize>>,
-    pub(super) environments: Cow<'a, [Vec<AbstractValue>]>,
-    safety: HirExprSafety,
+    verifier: SymbolicVerifier,
+    node_values: BTreeMap<HirDecisionNodeRef, DiagramId>,
 }
 
 impl<'a> SynthesisContext<'a> {
@@ -109,161 +422,49 @@ impl<'a> SynthesisContext<'a> {
         decision: &'a HirDecisionExpr,
         refs: Vec<RefKey>,
         safety: HirExprSafety,
-    ) -> Option<Self> {
-        let ref_positions = refs
-            .iter()
-            .enumerate()
-            .map(|(index, key)| (*key, index))
-            .collect::<BTreeMap<_, _>>();
-        let domain = build_domain(decision, safety)?;
-        let environments = enumerate_environments(refs.len(), &domain)?;
-        Some(Self {
+    ) -> Self {
+        let domain = build_domain(decision, safety);
+        Self {
             decision,
-            ref_positions: Cow::Owned(ref_positions),
-            environments: Cow::Owned(environments),
-            safety,
-        })
+            verifier: SymbolicVerifier::new(refs, domain, safety),
+            node_values: BTreeMap::new(),
+        }
     }
 
-    pub(super) fn eval_node(
-        &self,
-        node_ref: HirDecisionNodeRef,
-        env: &[AbstractValue],
-    ) -> Option<AbstractValue> {
+    pub(super) fn eval_node(&mut self, node_ref: HirDecisionNodeRef) -> Option<DiagramId> {
+        if let Some(cached) = self.node_values.get(&node_ref) {
+            return Some(*cached);
+        }
         let node = self.decision.nodes.get(node_ref.index())?;
-        let test = self.eval_expr(&node.test, env)?;
-        let branch = if is_truthy(&test) {
-            &node.truthy
-        } else {
-            &node.falsy
-        };
-        self.eval_target(branch, &test, env)
+        let test_expr = node.test.clone();
+        let truthy_target = node.truthy.clone();
+        let falsy_target = node.falsy.clone();
+        let test = self.verifier.eval_expr(&test_expr)?;
+        let truthy = self.eval_target(&truthy_target, test)?;
+        let falsy = self.eval_target(&falsy_target, test)?;
+        let value = self.verifier.select(test, truthy, falsy);
+        self.node_values.insert(node_ref, value);
+        Some(value)
     }
 
-    fn eval_target(
-        &self,
-        target: &HirDecisionTarget,
-        current: &AbstractValue,
-        env: &[AbstractValue],
-    ) -> Option<AbstractValue> {
+    fn eval_target(&mut self, target: &HirDecisionTarget, current: DiagramId) -> Option<DiagramId> {
         match target {
-            HirDecisionTarget::Node(next_ref) => self.eval_node(*next_ref, env),
-            HirDecisionTarget::CurrentValue => Some(current.clone()),
-            HirDecisionTarget::Expr(expr) => self.eval_expr(expr, env),
+            HirDecisionTarget::Node(next_ref) => self.eval_node(*next_ref),
+            HirDecisionTarget::CurrentValue => Some(current),
+            HirDecisionTarget::Expr(expr) => self.verifier.eval_expr(expr),
         }
     }
 
-    pub(super) fn eval_expr(&self, expr: &HirExpr, env: &[AbstractValue]) -> Option<AbstractValue> {
-        eval_pure_expr(expr, env, &self.ref_positions, self.safety)
+    pub(super) fn candidate_matches_node(
+        &mut self,
+        node_ref: HirDecisionNodeRef,
+        candidate: &HirExpr,
+    ) -> bool {
+        let Some(expected) = self.eval_node(node_ref) else {
+            return false;
+        };
+        self.verifier.eval_expr(candidate) == Some(expected)
     }
-}
-
-pub(super) fn eval_pure_expr(
-    expr: &HirExpr,
-    env: &[AbstractValue],
-    ref_positions: &BTreeMap<RefKey, usize>,
-    safety: HirExprSafety,
-) -> Option<AbstractValue> {
-    match expr {
-        HirExpr::Nil => Some(AbstractValue::Nil),
-        HirExpr::Boolean(false) => Some(AbstractValue::False),
-        HirExpr::Boolean(true) => Some(AbstractValue::True),
-        HirExpr::Integer(value) => Some(AbstractValue::Integer(*value)),
-        HirExpr::Number(value) => Some(AbstractValue::Number(value.to_bits())),
-        HirExpr::String(value) => Some(AbstractValue::String(value.clone())),
-        HirExpr::Int64(value) => Some(AbstractValue::Int64(*value)),
-        HirExpr::UInt64(value) => Some(AbstractValue::UInt64(*value)),
-        HirExpr::Vector(vector) => Some(AbstractValue::Vector(vector.components)),
-        HirExpr::Complex { real, imag } => Some(AbstractValue::Complex {
-            real_bits: real.to_bits(),
-            imag_bits: imag.to_bits(),
-        }),
-        HirExpr::ParamRef(param) => env
-            .get(*ref_positions.get(&RefKey::Param(*param))?)
-            .cloned(),
-        HirExpr::LocalRef(local) => env
-            .get(*ref_positions.get(&RefKey::Local(*local))?)
-            .cloned(),
-        HirExpr::UpvalueRef(upvalue) => env
-            .get(*ref_positions.get(&RefKey::Upvalue(*upvalue))?)
-            .cloned(),
-        HirExpr::TempRef(temp) => env.get(*ref_positions.get(&RefKey::Temp(*temp))?).cloned(),
-        HirExpr::Unary(unary) if unary.op == crate::hir::common::HirUnaryOpKind::Not => {
-            let value = eval_pure_expr(&unary.expr, env, ref_positions, safety)?;
-            Some(if is_truthy(&value) {
-                AbstractValue::False
-            } else {
-                AbstractValue::True
-            })
-        }
-        HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Eq => {
-            let lhs = eval_pure_expr(&binary.lhs, env, ref_positions, safety)?;
-            let rhs = eval_pure_expr(&binary.rhs, env, ref_positions, safety)?;
-            Some(if abstract_value_eq(&lhs, &rhs, safety)? {
-                AbstractValue::True
-            } else {
-                AbstractValue::False
-            })
-        }
-        HirExpr::Binary(binary)
-            if matches!(binary.op, HirBinaryOpKind::Lt | HirBinaryOpKind::Le) =>
-        {
-            let lhs = eval_pure_expr(&binary.lhs, env, ref_positions, safety)?;
-            let rhs = eval_pure_expr(&binary.rhs, env, ref_positions, safety)?;
-            let ordering = abstract_value_partial_cmp(&lhs, &rhs, safety)?;
-            let result = match binary.op {
-                HirBinaryOpKind::Lt => ordering == std::cmp::Ordering::Less,
-                HirBinaryOpKind::Le => ordering != std::cmp::Ordering::Greater,
-                _ => unreachable!(),
-            };
-            Some(if result {
-                AbstractValue::True
-            } else {
-                AbstractValue::False
-            })
-        }
-        HirExpr::LogicalAnd(logical) => {
-            let lhs = eval_pure_expr(&logical.lhs, env, ref_positions, safety)?;
-            if is_truthy(&lhs) {
-                eval_pure_expr(&logical.rhs, env, ref_positions, safety)
-            } else {
-                Some(lhs)
-            }
-        }
-        HirExpr::LogicalOr(logical) => {
-            let lhs = eval_pure_expr(&logical.lhs, env, ref_positions, safety)?;
-            if is_truthy(&lhs) {
-                Some(lhs)
-            } else {
-                eval_pure_expr(&logical.rhs, env, ref_positions, safety)
-            }
-        }
-        HirExpr::Decision(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::TableAccess(_)
-        | HirExpr::Unary(_)
-        | HirExpr::Binary(_)
-        | HirExpr::Call(_)
-        | HirExpr::VarArg
-        | HirExpr::TableConstructor(_)
-        | HirExpr::Closure(_)
-        | HirExpr::Unresolved(_) => None,
-    }
-}
-
-pub(super) fn validate_pure_expr_equivalence(
-    lhs: &HirExpr,
-    rhs: &HirExpr,
-    environments: &[Vec<AbstractValue>],
-    ref_positions: &BTreeMap<RefKey, usize>,
-    safety: HirExprSafety,
-) -> bool {
-    environments.iter().all(|env| {
-        let lhs = eval_pure_expr(lhs, env, ref_positions, safety);
-        let rhs = eval_pure_expr(rhs, env, ref_positions, safety);
-        // 候选拒绝[ProofIncomplete]：抽象解释任一侧未知时没有等价证明，`None == None` 不能作为接受依据。
-        matches!((lhs, rhs), (Some(lhs), Some(rhs)) if lhs == rhs)
-    })
 }
 
 pub(super) fn collect_refs_from_decision(decision: &HirDecisionExpr) -> Vec<RefKey> {
@@ -371,62 +572,82 @@ pub(super) fn collect_literals_from_expr(expr: &HirExpr, literals: &mut BTreeSet
     }
 }
 
-pub(super) fn enumerate_environments(
-    ref_count: usize,
-    domain: &[AbstractValue],
-) -> Option<Vec<Vec<AbstractValue>>> {
-    // 候选拒绝[ResourceLimit]：环境数溢出 usize 时无法分配穷举表；后续应改用符号验证。
-    // u32 是 checked_pow 的指数类型；超出它时直接拒绝，不能截断成较小指数。
-    let exponent = u32::try_from(ref_count).ok()?;
-    let total = domain.len().checked_pow(exponent)?;
-    // 候选拒绝[ResourceLimit]：完整环境枚举上限为 4096；后续应改用符号验证或按依赖分区。
-    if total > 4096 {
-        return None;
-    }
-
-    let mut envs = Vec::with_capacity(total);
-    let mut current = Vec::with_capacity(ref_count);
-    enumerate_envs_recursive(ref_count, domain, &mut current, &mut envs);
-    Some(envs)
-}
-
 fn collect_refs_from_target(target: &HirDecisionTarget, refs: &mut BTreeSet<RefKey>) {
     if let HirDecisionTarget::Expr(expr) = target {
         collect_refs_from_expr(expr, refs);
     }
 }
 
-fn build_domain(decision: &HirDecisionExpr, safety: HirExprSafety) -> Option<Vec<AbstractValue>> {
-    let mut domain = vec![
-        AbstractValue::Nil,
-        AbstractValue::False,
-        AbstractValue::True,
-    ];
+fn build_domain(decision: &HirDecisionExpr, safety: HirExprSafety) -> Vec<AbstractValue> {
     let mut literals = BTreeSet::new();
     for node in &decision.nodes {
         collect_literals_from_expr(&node.test, &mut literals);
         collect_literals_from_target(&node.truthy, &mut literals);
         collect_literals_from_target(&node.falsy, &mut literals);
     }
-    if !domain_supports_literal_value_identities(&literals, safety) {
-        // 候选拒绝[ProofIncomplete]：PUC Lua 5.3+ 中 `1 == 1.0`，但
-        // `math.type` 能区分二者。当前有限域只收集出现过的 literal，不能证明所有
-        // equality-equivalent 的另一数值表示都已枚举，不能用它批准值综合。
-        return None;
-    }
-    domain.extend(literals);
-    domain.extend((0..EXTRA_TRUTHY_SYMBOLS).map(|index| AbstractValue::TruthySymbol(index as u8)));
-    Some(domain)
+    build_validation_domain(&literals, safety)
 }
 
-pub(super) fn domain_supports_literal_value_identities(
+/// 为当前 synthesis grammar 构造完备的代表域。
+///
+/// 动态值只会参与 truthiness、与原始字面量的稳定 equality，以及作为最终原值返回；两个
+/// fresh truthy symbol 足以区分任意两个非字面量结果。数值字面量则必须补齐所有 `==`
+/// 相等但结果身份不同的表示，特别是 Integer/Number 双表示与正负零。
+pub(super) fn build_validation_domain(
     literals: &BTreeSet<AbstractValue>,
     safety: HirExprSafety,
-) -> bool {
-    !safety.distinguishes_integer_number_values()
-        || !literals
-            .iter()
-            .any(|value| matches!(value, AbstractValue::Integer(_) | AbstractValue::Number(_)))
+) -> Vec<AbstractValue> {
+    let mut domain = BTreeSet::from([
+        AbstractValue::Nil,
+        AbstractValue::False,
+        AbstractValue::True,
+    ]);
+    domain.extend(literals.iter().cloned());
+
+    for literal in literals {
+        match literal {
+            AbstractValue::Integer(integer) if safety.distinguishes_integer_number_values() => {
+                let number = *integer as f64;
+                if safety.mixed_integer_number_equal(*integer, number) == Some(true) {
+                    domain.insert(AbstractValue::Number(number.to_bits()));
+                }
+                if *integer == 0 {
+                    domain.insert(AbstractValue::Number(0.0f64.to_bits()));
+                    domain.insert(AbstractValue::Number((-0.0f64).to_bits()));
+                }
+            }
+            AbstractValue::Number(bits) => {
+                let number = f64::from_bits(*bits);
+                if number == 0.0 {
+                    domain.insert(AbstractValue::Number(0.0f64.to_bits()));
+                    domain.insert(AbstractValue::Number((-0.0f64).to_bits()));
+                }
+                if safety.distinguishes_integer_number_values()
+                    && let Some(integer) = exact_integer_representation(number, safety)
+                {
+                    domain.insert(AbstractValue::Integer(integer));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    domain.extend((0..EXTRA_TRUTHY_SYMBOLS).map(|index| AbstractValue::TruthySymbol(index as u8)));
+    domain.into_iter().collect()
+}
+
+fn exact_integer_representation(number: f64, safety: HirExprSafety) -> Option<i64> {
+    const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
+    if !number.is_finite()
+        || number.fract() != 0.0
+        || number < i64::MIN as f64
+        || number >= I64_UPPER_EXCLUSIVE
+    {
+        return None;
+    }
+    // 边界和整数性已在上面证明；最终 equality 复核同时排除 binary64 无法精确承载的整数。
+    let integer = number as i64;
+    (safety.mixed_integer_number_equal(integer, number) == Some(true)).then_some(integer)
 }
 
 fn collect_literals_from_target(
@@ -435,52 +656,5 @@ fn collect_literals_from_target(
 ) {
     if let HirDecisionTarget::Expr(expr) = target {
         collect_literals_from_expr(expr, literals);
-    }
-}
-
-fn enumerate_envs_recursive(
-    remaining: usize,
-    domain: &[AbstractValue],
-    current: &mut Vec<AbstractValue>,
-    out: &mut Vec<Vec<AbstractValue>>,
-) {
-    if remaining == 0 {
-        out.push(current.clone());
-        return;
-    }
-
-    for value in domain {
-        current.push(value.clone());
-        enumerate_envs_recursive(remaining - 1, domain, current, out);
-        current.pop();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{AbstractValue, enumerate_environments};
-
-    #[test]
-    fn environment_cap_allows_five_base_domain_references() {
-        let domain = [
-            AbstractValue::Nil,
-            AbstractValue::False,
-            AbstractValue::True,
-            AbstractValue::TruthySymbol(0),
-            AbstractValue::TruthySymbol(1),
-        ];
-        assert_eq!(
-            enumerate_environments(5, &domain).map(|envs| envs.len()),
-            Some(3125)
-        );
-        assert!(enumerate_environments(6, &domain).is_none());
-    }
-
-    #[test]
-    fn environment_exponent_does_not_truncate() {
-        let Some(ref_count) = usize::try_from(u64::from(u32::MAX) + 1).ok() else {
-            return;
-        };
-        assert!(enumerate_environments(ref_count, &[AbstractValue::Nil]).is_none());
     }
 }

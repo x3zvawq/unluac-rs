@@ -4,22 +4,17 @@
 //! 布尔表达式，不会越权放松语义约束。
 //! 例如：`not (a == nil)` 可能在这里被整理成更顺的逻辑表达式。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use crate::hir::common::HirExpr;
 use crate::hir::expr_safety::HirExprSafety;
 
 use super::super::{logical_and, logical_or};
 use super::domain::{
-    AbstractValue, collect_literals_from_expr, collect_refs_from_expr,
-    domain_supports_literal_value_identities, enumerate_environments,
-    validate_pure_expr_equivalence,
+    SymbolicVerifier, build_validation_domain, collect_literals_from_expr, collect_refs_from_expr,
 };
 use super::normalize_candidate_expr;
 use super::safety::expr_is_synth_safe;
-
-const MAX_NATURALIZE_OR_TERMS: usize = 16;
-const MAX_NATURALIZE_NESTED_CANDIDATES: usize = 128;
 
 pub(crate) fn naturalize_pure_logical_expr(
     expr: &HirExpr,
@@ -36,52 +31,31 @@ pub(crate) fn naturalize_pure_logical_expr(
     let mut refs = BTreeSet::new();
     collect_refs_from_expr(&current, &mut refs);
     let refs = refs.into_iter().collect::<Vec<_>>();
-    let ref_positions = refs
-        .iter()
-        .enumerate()
-        .map(|(index, key)| (*key, index))
-        .collect::<BTreeMap<_, _>>();
     let mut literals = BTreeSet::new();
     collect_literals_from_expr(&current, &mut literals);
-    if !domain_supports_literal_value_identities(&literals, safety) {
-        // 候选拒绝[ProofIncomplete]：有限域尚未覆盖 PUC Lua 5.3+
-        // equality-equivalent 的 Integer/Number 双表示，不能批准会改变返回值身份的改写。
-        return None;
-    }
-    let mut domain = vec![
-        AbstractValue::Nil,
-        AbstractValue::False,
-        AbstractValue::True,
-    ];
-    domain.extend(literals);
-    domain.extend(
-        (0..super::EXTRA_TRUTHY_SYMBOLS).map(|index| AbstractValue::TruthySymbol(index as u8)),
-    );
-    // 候选拒绝[ResourceLimit]：抽象环境笛卡尔积超过 4096 时停止 naturalize；后续应避免完整枚举。
-    let environments = enumerate_environments(refs.len(), &domain)?;
+    let domain = build_validation_domain(&literals, safety);
+    let mut verifier = SymbolicVerifier::new(refs, domain, safety);
+    let expected = verifier.eval_expr(expr)?;
     let mut changed = false;
     // 每次提交都严格降低有限的 expr_cost；因此即使深层候选需要超过八轮，也会在有限步内
     // 收敛，不需要用任意轮数截断已证明安全的改写。
     loop {
         let current_cost = super::expr_cost(&current);
-        let Some(next) = pure_logical_rewrite_candidates(&current)
-            .into_iter()
-            .map(|candidate| normalize_candidate_expr(candidate, safety))
-            // 候选验证：跨数值表示已在建域前拒绝；任一未建模/错误路径会让抽象求值
-            // 返回 None 并拒绝候选，完整枚举覆盖剩余受支持的 primitive 分区。
-            .filter(|candidate| {
-                validate_pure_expr_equivalence(
-                    expr,
-                    candidate,
-                    &environments,
-                    &ref_positions,
-                    safety,
-                )
-            })
-            // 候选拒绝[PolicyBoundary]：等价但不严格降低可读性成本的形状不提交。
-            .filter(|candidate| super::expr_cost(candidate) < current_cost)
-            .min_by_key(super::expr_cost)
-        else {
+        let mut next = None;
+        visit_pure_logical_rewrite_candidates(&current, &mut |candidate| {
+            let candidate = normalize_candidate_expr(candidate, safety);
+            let candidate_cost = super::expr_cost(&candidate);
+            if verifier.eval_expr(&candidate) == Some(expected)
+                && candidate_cost < current_cost
+                && next
+                    .as_ref()
+                    .is_none_or(|(best_cost, _)| candidate_cost < *best_cost)
+            {
+                next = Some((candidate_cost, candidate));
+            }
+        });
+        // 候选拒绝[PolicyBoundary]：等价但不严格降低可读性成本的形状不提交。
+        let Some((_, next)) = next else {
             break;
         };
         current = next;
@@ -91,23 +65,22 @@ pub(crate) fn naturalize_pure_logical_expr(
     changed.then_some(current)
 }
 
-/// Return one-step rewrites at the root and one logical child.
+/// Visit one-step rewrites at the root and one logical child.
 ///
 /// The fixed-point loop above revisits the rebuilt expression, so deeper opportunities are still
-/// reached without enumerating all expression paths at once.  Rebuilding one child at a time is
-/// bounded and, because the caller validates every result and requires a lower cost, cannot relax
-/// the semantic or convergence contract.
-fn pure_logical_rewrite_candidates(expr: &HirExpr) -> Vec<HirExpr> {
-    let mut candidates = direct_pure_logical_rewrite_candidates(expr);
+/// reached without enumerating all expression paths at once. Candidates are emitted immediately,
+/// so the caller retains only the cheapest validated rewrite instead of an arbitrarily capped set.
+fn visit_pure_logical_rewrite_candidates(expr: &HirExpr, emit: &mut impl FnMut(HirExpr)) {
+    visit_direct_pure_logical_rewrite_candidates(expr, emit);
     let (lhs, rhs, is_and) = match expr {
         HirExpr::LogicalAnd(logical) => (&logical.lhs, &logical.rhs, true),
         HirExpr::LogicalOr(logical) => (&logical.lhs, &logical.rhs, false),
-        _ => return candidates,
+        _ => return,
     };
 
     for (left, child, sibling) in [(true, lhs, rhs), (false, rhs, lhs)] {
-        for replacement in direct_pure_logical_rewrite_candidates(child) {
-            let rebuilt = if is_and {
+        visit_direct_pure_logical_rewrite_candidates(child, &mut |replacement| {
+            emit(if is_and {
                 if left {
                     logical_and(replacement, sibling.clone())
                 } else {
@@ -117,48 +90,41 @@ fn pure_logical_rewrite_candidates(expr: &HirExpr) -> Vec<HirExpr> {
                 logical_or(replacement, sibling.clone())
             } else {
                 logical_or(sibling.clone(), replacement)
-            };
-            if !candidates.contains(&rebuilt) {
-                candidates.push(rebuilt);
-            }
-            if candidates.len() >= MAX_NATURALIZE_NESTED_CANDIDATES {
-                // 候选搜索裁剪[ResourceLimit]：单轮最多保留 128 个一层子树候选；后续应使用去重工作队列。
-                return candidates;
-            }
-        }
+            });
+        });
     }
-
-    // 候选搜索裁剪[ResourceLimit]：root 直接生成的候选同样最多保留 128 个；后续应使用增量最小成本队列。
-    candidates.truncate(MAX_NATURALIZE_NESTED_CANDIDATES);
-    candidates
 }
 
-fn direct_pure_logical_rewrite_candidates(expr: &HirExpr) -> Vec<HirExpr> {
-    let mut candidates = Vec::new();
+fn visit_direct_pure_logical_rewrite_candidates(expr: &HirExpr, emit: &mut impl FnMut(HirExpr)) {
     match expr {
         HirExpr::LogicalAnd(logical) => {
-            candidates.extend(factor_or_shared_and_tail(&logical.lhs, &logical.rhs));
+            for candidate in factor_or_shared_and_tail(&logical.lhs, &logical.rhs) {
+                emit(candidate);
+            }
             if let HirExpr::LogicalOr(lhs_or) = &logical.lhs {
-                candidates.push(logical_or(
+                emit(logical_or(
                     logical_and(lhs_or.lhs.clone(), logical.rhs.clone()),
                     logical_and(lhs_or.rhs.clone(), logical.rhs.clone()),
                 ));
             }
             if let HirExpr::LogicalOr(rhs_or) = &logical.rhs {
-                candidates.push(logical_or(
+                emit(logical_or(
                     logical_and(logical.lhs.clone(), rhs_or.lhs.clone()),
                     logical_and(logical.lhs.clone(), rhs_or.rhs.clone()),
                 ));
             }
         }
         HirExpr::LogicalOr(logical) => {
-            candidates.extend(drop_shared_or_fallback(&logical.lhs, &logical.rhs));
-            candidates.extend(factor_or_of_ands(&logical.lhs, &logical.rhs));
-            candidates.extend(factor_or_chain_of_ands(expr));
+            for candidate in drop_shared_or_fallback(&logical.lhs, &logical.rhs) {
+                emit(candidate);
+            }
+            for candidate in factor_or_of_ands(&logical.lhs, &logical.rhs) {
+                emit(candidate);
+            }
+            visit_factor_or_chain_of_ands(expr, emit);
         }
         _ => {}
     }
-    candidates
 }
 
 /// Generate a candidate for `((a and (b or ... or c)) or c)` with the inner fallback removed.
@@ -250,14 +216,12 @@ fn factor_or_of_ands(lhs: &HirExpr, rhs: &HirExpr) -> Vec<HirExpr> {
     candidates
 }
 
-fn factor_or_chain_of_ands(expr: &HirExpr) -> Vec<HirExpr> {
+fn visit_factor_or_chain_of_ands(expr: &HirExpr, emit: &mut impl FnMut(HirExpr)) {
     let terms = flatten_or_chain(expr);
-    // 候选搜索裁剪[ResourceLimit]：超过 16 项的 or 链不做两两因式分解，避免二次候选爆炸。
-    if !(3..=MAX_NATURALIZE_OR_TERMS).contains(&terms.len()) {
-        return Vec::new();
+    if terms.len() < 3 {
+        return;
     }
 
-    let mut candidates = Vec::new();
     for left in 0..terms.len() {
         for right in left + 1..terms.len() {
             if let Some(factored) = factor_and_term_pair(terms[left], terms[right]) {
@@ -269,11 +233,10 @@ fn factor_or_chain_of_ands(expr: &HirExpr) -> Vec<HirExpr> {
                         rebuilt.push((*term).clone());
                     }
                 }
-                candidates.push(rebuild_or_chain(rebuilt));
+                emit(rebuild_or_chain(rebuilt));
             }
         }
     }
-    candidates
 }
 
 fn factor_and_term_pair(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {

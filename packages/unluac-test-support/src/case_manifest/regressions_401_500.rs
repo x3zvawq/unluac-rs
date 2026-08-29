@@ -133,4 +133,16 @@ LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_424_lua55_repeat_global_scope.lua",
         &[LuaCaseDialect::Lua55],
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_425_decision_naturalize_unbounded.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_426_decision_environment_partition.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_427_decision_signed_zero_identity.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
 ];

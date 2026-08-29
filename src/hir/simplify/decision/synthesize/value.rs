@@ -22,10 +22,9 @@ pub(crate) fn synthesize_value_decision_expr(
     }
 
     let refs = collect_refs_from_decision(decision);
-    // 候选拒绝[ResourceLimit]：抽象环境笛卡尔积超过 4096 时停止综合；后续应避免完整枚举。
-    let context = SynthesisContext::new(decision, refs, safety)?;
+    let mut context = SynthesisContext::new(decision, refs, safety);
     let mut memo = BTreeMap::new();
-    synthesize_value_node_expr(&context, decision.entry, &mut memo, safety)
+    synthesize_value_node_expr(&mut context, decision.entry, &mut memo, safety)
 }
 
 #[derive(Clone, PartialEq)]
@@ -35,7 +34,7 @@ pub(super) enum SynthTarget {
 }
 
 fn synthesize_value_node_expr(
-    context: &SynthesisContext<'_>,
+    context: &mut SynthesisContext<'_>,
     node_ref: HirDecisionNodeRef,
     memo: &mut BTreeMap<HirDecisionNodeRef, HirExpr>,
     safety: HirExprSafety,
@@ -44,7 +43,7 @@ fn synthesize_value_node_expr(
         return Some(cached.clone());
     }
 
-    let node = &context.decision.nodes[node_ref.index()];
+    let node = context.decision.nodes[node_ref.index()].clone();
     let truthy = synthesize_value_target(context, &node.truthy, memo, safety)?;
     let falsy = synthesize_value_target(context, &node.falsy, memo, safety)?;
     let expr =
@@ -54,7 +53,7 @@ fn synthesize_value_node_expr(
 }
 
 fn synthesize_value_target(
-    context: &SynthesisContext<'_>,
+    context: &mut SynthesisContext<'_>,
     target: &HirDecisionTarget,
     memo: &mut BTreeMap<HirDecisionNodeRef, HirExpr>,
     safety: HirExprSafety,
@@ -72,7 +71,7 @@ fn synthesize_value_target(
 }
 
 fn choose_best_structured_candidate(
-    context: &SynthesisContext<'_>,
+    context: &mut SynthesisContext<'_>,
     node_ref: HirDecisionNodeRef,
     subject: &HirExpr,
     truthy: &SynthTarget,
@@ -82,8 +81,8 @@ fn choose_best_structured_candidate(
     structured_candidates(subject, truthy, falsy, safety)
         .into_iter()
         .map(|candidate| normalize_candidate_expr(candidate, safety))
-        // 候选验证：跨数值表示已在 SynthesisContext 建域前拒绝；任一未建模/错误路径
-        // 会让抽象求值返回 None 并拒绝候选，完整枚举覆盖剩余受支持的 primitive 分区。
+        // 候选验证：canonical MDD 共享同一 RefKey 的所有出现；任一未建模路径都会
+        // 让符号求值返回 None 并拒绝候选。
         .filter(|candidate| validate_candidate_for_node(context, node_ref, candidate))
         .min_by_key(expr_cost)
 }
@@ -151,19 +150,11 @@ fn target_as_expr(subject: &HirExpr, target: &SynthTarget) -> HirExpr {
 }
 
 pub(super) fn validate_candidate_for_node(
-    context: &SynthesisContext<'_>,
+    context: &mut SynthesisContext<'_>,
     node_ref: HirDecisionNodeRef,
     candidate: &HirExpr,
 ) -> bool {
-    context.environments.iter().all(|env| {
-        let decision_value = context.eval_node(node_ref, env);
-        // 候选拒绝[ProofIncomplete]：抽象解释未知时没有候选等价证明，不能把未建模路径当作验证通过。
-        let Some(decision_value) = decision_value else {
-            return false;
-        };
-        let candidate_value = context.eval_expr(candidate, env);
-        candidate_value.as_ref() == Some(&decision_value)
-    })
+    context.candidate_matches_node(node_ref, candidate)
 }
 
 #[cfg(test)]
@@ -178,7 +169,7 @@ mod tests {
     use super::synthesize_value_decision_expr;
 
     #[test]
-    fn mixed_numeric_value_identity_is_not_approved_by_finite_domain() {
+    fn mixed_numeric_value_identity_uses_equality_closed_domain() {
         let value = HirExpr::LocalRef(LocalId(0));
         let integer_one = HirExpr::Integer(1);
         let decision = HirDecisionExpr {
@@ -206,7 +197,7 @@ mod tests {
                 &decision,
                 HirExprSafety::for_dialect(DecompileDialect::Lua54),
             )
-            .is_none()
+            .is_some()
         );
     }
 }
