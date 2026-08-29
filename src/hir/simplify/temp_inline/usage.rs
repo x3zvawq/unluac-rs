@@ -150,6 +150,11 @@ fn collect_stmt_temp_uses_into(stmt: &HirStmt, scratch: &mut TempUseScratch) {
                 collect_expr_temp_uses(value, scratch);
             }
         }
+        HirStmt::GlobalDecl(global_decl) => {
+            for value in &global_decl.values {
+                collect_expr_temp_uses(value, scratch);
+            }
+        }
         HirStmt::Assign(assign) => {
             for target in &assign.targets {
                 collect_lvalue_temp_uses(target, scratch);
@@ -328,6 +333,11 @@ pub(super) fn max_temp_index_in_block(block: &HirBlock) -> Option<usize> {
 fn max_temp_index_in_stmt(stmt: &HirStmt) -> Option<usize> {
     match stmt {
         HirStmt::LocalDecl(local_decl) => local_decl
+            .values
+            .iter()
+            .filter_map(max_temp_index_in_expr)
+            .max(),
+        HirStmt::GlobalDecl(global_decl) => global_decl
             .values
             .iter()
             .filter_map(max_temp_index_in_expr)

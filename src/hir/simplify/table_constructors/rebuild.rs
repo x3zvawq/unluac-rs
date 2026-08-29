@@ -12,7 +12,7 @@ use captures::*;
 
 use crate::ast::DecompileDialect;
 use crate::hir::common::{
-    HirBlock, HirCallExpr, HirCapture, HirDecisionTarget, HirExpr, HirLValue, HirPackTail, HirStmt,
+    HirBlock, HirCallExpr, HirCapture, HirDecisionTarget, HirExpr, HirLValue, HirStmt,
     HirTableField, HirTableKey, HirTableSetList,
 };
 use crate::hir::expr_safety::expr_requires_ordered_snapshot;
@@ -27,8 +27,8 @@ use super::inline_value::{
     InlineContext, InlineRewriteState, expr_mentions_any_pending_binding, inline_constructor_value,
 };
 use super::{
-    ConstructorEvalEvent, PendingProducer, PendingProducerSource, PreparedRecord,
-    ProducerGroupMeta, RebuildScratch, RegionStep, SegmentToken, TableBinding,
+    ConstructorEvalEvent, PendingProducer, PendingProducerSource, PreparedRecord, RebuildScratch,
+    RegionStep, SegmentToken, TableBinding,
 };
 
 pub(super) struct RegionRebuildContext<'a> {
@@ -104,6 +104,8 @@ fn flush_constructor_segment(
     if builder.trailing_multivalue.is_some()
         && (!segment.is_empty() || set_list_stmt_index.is_some())
     {
+        // 候选拒绝[SemanticBarrier:ValueArity]：constructor 的 open tail 已决定后续数组槽；
+        // 再吸收字段会改变多返回值覆盖范围，反例见 regress_52_table_trailing_multivalue_boundary。
         return None;
     }
 
@@ -119,11 +121,15 @@ fn flush_constructor_segment(
                     &mut context.scratch.restored_array_fields,
                 )
             {
+                // 候选拒绝[SemanticBarrier:TableShape]：重叠 SETLIST 只有在既有 array 后缀可
+                // 精确降为整数 record 时才能表示；反例见 regress_237_table_constructor_open_overlap。
                 return None;
             }
             builder
                 .drain_pending_integer_fields(&mut context.scratch.restored_pending_integer_fields);
             if set_list.start_index != builder.next_array_index() {
+                // 候选拒绝[SemanticBarrier:TableShape]：SETLIST 起点与隐式数组下标不连续，
+                // 直接追加会改写键集合与 `#table` 结果。
                 return None;
             }
             for value in &set_list.values.fixed {
@@ -144,6 +150,8 @@ fn flush_constructor_segment(
         if start_index < builder.next_array_index()
             && !builder.demote_array_suffix(start_index, &mut context.scratch.restored_array_fields)
         {
+            // 候选拒绝[SemanticBarrier:TableShape]：不能表示的 SETLIST overlap 会改变旧后缀
+            // 是否被 open pack 覆盖；反例见 regress_237_table_constructor_open_overlap。
             return None;
         }
         builder.next_array_index()
@@ -163,12 +171,6 @@ fn flush_constructor_segment(
                 *slot_index,
                 context.scratch,
             )?,
-            RegionStep::ProducerGroup { stmt_index } => register_producer_group(
-                context.block,
-                context.binding_index,
-                *stmt_index,
-                context.scratch,
-            )?,
             RegionStep::Record { stmt_index } => prepare_record_step(*stmt_index, context)?,
             RegionStep::SetList { .. } => {
                 unreachable!("set-list should terminate constructor segment")
@@ -179,6 +181,8 @@ fn flush_constructor_segment(
     if let Some(stmt_index) = set_list_stmt_index {
         let set_list = set_list_stmt(context.block, stmt_index)?;
         if set_list.start_index != expected_set_list_start {
+            // 候选拒绝[SemanticBarrier:TableShape]：producer/record 不能改变 raw SETLIST 的
+            // 固定起点；否则隐式 array key 与原字节码不一致。
             return None;
         }
 
@@ -255,23 +259,20 @@ fn flush_constructor_segment(
         }
     }
 
-    if context.scratch.pending_producers.iter().any(|producer| {
-        if context.scratch.consumed_bindings[producer.binding_id] {
-            return false;
-        }
-        if context.remaining_uses.contains(producer.binding_id) {
-            return true;
-        }
-        match producer.group {
-            Some(group) if context.scratch.consumed_groups[group] => false,
-            Some(group) => !context.scratch.producer_groups[group].drop_without_consumption_is_safe,
-            None => true,
-        }
-    }) {
+    if context
+        .scratch
+        .pending_producers
+        .iter()
+        .any(|producer| !context.scratch.consumed_bindings[producer.binding_id])
+    {
+        // 候选拒绝[ProofIncomplete]：仍有 use 或未消费的单值 producer 时，当前事务只能
+        // 删除整个声明；应支持保留 producer 的 partial rebuild。
         return None;
     }
 
     if !constructor_eval_order_is_preserved(set_list_stmt_index, context) {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：source/generated 事件序列不同会重排 lookup、
+        // call 或元方法；反例见 regress_212 与 regress_235。
         return None;
     }
 
@@ -302,6 +303,8 @@ fn flush_set_list_values_before_producer(
             context.binding_index,
             &context.scratch.producer_index_by_binding,
         ) {
+            // 候选拒绝[ProofIncomplete]：SETLIST 队首存在跨 producer 依赖时，当前队列计划
+            // 不能拓扑展开全部依赖；应扩展 producer DAG，而不是永久拒绝该 region。
             return None;
         }
         let value = queued_values.pop_front()?;
@@ -323,7 +326,6 @@ fn inline_set_list_value(
         &scratch.producer_index_by_binding,
         InlineRewriteState {
             consumed_bindings: &mut scratch.consumed_bindings,
-            consumed_groups: &mut scratch.consumed_groups,
             eval_events: &mut scratch.generated_eval_events,
         },
         context.remaining_uses,
@@ -461,13 +463,11 @@ fn collect_source_eval_events(
 
 fn prepare_scratch(scratch: &mut RebuildScratch, binding_count: usize) {
     scratch.pending_producers.clear();
-    scratch.producer_groups.clear();
     scratch.tokens.clear();
     scratch.prepared_records.clear();
     scratch.prepared_eval_events.clear();
     scratch.source_eval_events.clear();
     scratch.generated_eval_events.clear();
-    scratch.consumed_groups.clear();
     reset_touched_bindings(scratch);
     ensure_binding_capacity(scratch, binding_count);
 }
@@ -526,51 +526,6 @@ fn register_single_producer(
     Some(())
 }
 
-fn register_producer_group(
-    block: &HirBlock,
-    binding_index: &BindingIndex,
-    stmt_index: usize,
-    scratch: &mut RebuildScratch,
-) -> Option<()> {
-    let (bindings, source) = producer_group_stmt(block, stmt_index)?;
-    let group_id = scratch.producer_groups.len();
-    scratch.producer_groups.push(ProducerGroupMeta {
-        drop_without_consumption_is_safe: can_drop_open_pack_source_if_unused(source),
-    });
-    scratch.consumed_groups.push(false);
-
-    for (slot_index, binding) in bindings.into_iter().enumerate() {
-        let binding_id = binding_index.id_of(binding)?;
-        let source = if slot_index == 0 {
-            PendingProducerSource::Tail { stmt_index }
-        } else {
-            PendingProducerSource::Empty
-        };
-        let producer_index = scratch.pending_producers.len();
-        mark_binding_active(scratch, binding_id);
-        scratch.producer_index_by_binding[binding_id] = Some(producer_index);
-        scratch.removed_materializations[binding_id] += 1;
-        scratch.pending_producers.push(PendingProducer {
-            binding,
-            binding_id,
-            source,
-            group: Some(group_id),
-        });
-        if pending_producer_value(block, &scratch.pending_producers[producer_index])
-            .is_some_and(expr_requires_ordered_snapshot)
-        {
-            scratch
-                .source_eval_events
-                .push(ConstructorEvalEvent::Producer(producer_index));
-        }
-        scratch
-            .tokens
-            .push(SegmentToken::Producer { producer_index });
-    }
-
-    Some(())
-}
-
 fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>) -> Option<()> {
     let (key, value) = record_field_parts(context.block, stmt_index, context.dialect)?;
     if let HirTableKey::Expr(key_expr) = &key {
@@ -601,7 +556,6 @@ fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>
                     &scratch.producer_index_by_binding,
                     InlineRewriteState {
                         consumed_bindings: &mut scratch.consumed_bindings,
-                        consumed_groups: &mut scratch.consumed_groups,
                         eval_events: &mut scratch.prepared_eval_events,
                     },
                     context.remaining_uses,
@@ -628,7 +582,6 @@ fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>
             &scratch.producer_index_by_binding,
             InlineRewriteState {
                 consumed_bindings: &mut scratch.consumed_bindings,
-                consumed_groups: &mut scratch.consumed_groups,
                 eval_events: &mut scratch.prepared_eval_events,
             },
             context.remaining_uses,
@@ -636,6 +589,8 @@ fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>
         inline_constructor_value(&mut inline_context, value)?
     };
     if matches!(value, HirExpr::Closure(_)) && recursive_closure_slot {
+        // 候选拒绝[SemanticBarrier:Capture]：删除递归 closure 的独立 binding 会让 closure
+        // 捕获失去自身 owner，例如 `local f; f = function() return f end; t.x = f`。
         return None;
     }
     if expr_captures_orphaned_binding(
@@ -644,6 +599,8 @@ fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>
         context.materialized_binding_counts,
         &context.scratch.removed_materializations,
     ) {
+        // 候选拒绝[SemanticBarrier:Capture]：被删除的最后一次 materialization 仍被 closure
+        // 捕获会产生 orphan upvalue；反例见 regress_224_table_capture_writeback。
         return None;
     }
     let prepared_record_index = context.scratch.prepared_records.len();
@@ -701,7 +658,6 @@ fn single_producer(
                     stmt_index,
                     value_index: slot_index,
                 },
-                group: None,
             })
         }
         HirStmt::Assign(assign) => {
@@ -713,7 +669,6 @@ fn single_producer(
                     stmt_index,
                     value_index: slot_index,
                 },
-                group: None,
             })
         }
         _ => None,
@@ -741,47 +696,6 @@ pub(super) fn producer_value_can_be_dropped(expr: &HirExpr) -> bool {
     ) || expr_is_boolean_valued(expr)
 }
 
-fn producer_group_stmt(
-    block: &HirBlock,
-    stmt_index: usize,
-) -> Option<(Vec<TableBinding>, &HirPackTail)> {
-    let stmt = block.stmts.get(stmt_index)?;
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => {
-            if !local_decl.values.fixed.is_empty() {
-                return None;
-            }
-            let source = local_decl.values.tail.as_ref()?;
-            Some((
-                local_decl
-                    .bindings
-                    .iter()
-                    .copied()
-                    .map(TableBinding::Local)
-                    .collect(),
-                source,
-            ))
-        }
-        HirStmt::Assign(assign) => {
-            if !assign.values.fixed.is_empty() {
-                return None;
-            }
-            let source = assign.values.tail.as_ref()?;
-            let bindings = assign
-                .targets
-                .iter()
-                .map(binding_from_lvalue)
-                .collect::<Option<Vec<_>>>()?;
-            Some((bindings, source))
-        }
-        _ => None,
-    }
-}
-
-fn can_drop_open_pack_source_if_unused(tail: &HirPackTail) -> bool {
-    matches!(tail.as_expr(), HirExpr::VarArg)
-}
-
 fn pending_producer_value<'a>(
     block: &'a HirBlock,
     producer: &PendingProducer,
@@ -795,13 +709,5 @@ fn pending_producer_value<'a>(
             HirStmt::Assign(assign) => assign.values.fixed.get(value_index),
             _ => None,
         },
-        PendingProducerSource::Tail { stmt_index } => match block.stmts.get(stmt_index)? {
-            HirStmt::LocalDecl(local_decl) => {
-                local_decl.values.tail.as_ref().map(HirPackTail::as_expr)
-            }
-            HirStmt::Assign(assign) => assign.values.tail.as_ref().map(HirPackTail::as_expr),
-            _ => None,
-        },
-        PendingProducerSource::Empty => None,
     }
 }

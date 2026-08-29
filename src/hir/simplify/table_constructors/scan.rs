@@ -145,6 +145,11 @@ pub(super) fn try_rebuild_constructor_region(
         } else if table_set_list_step(stmt, binding) {
             RegionStep::SetList { stmt_index: index }
         } else {
+            // 分析停用[ProofIncomplete]：scanner 尚未区分可跨越的无事件语句与真正的
+            // 求值/作用域边界；遇到任意未建模 stmt 都结束后缀候选，后续应按 stmt 事件分类。
+            // 例如 `setmetatable(t, mt); t.x = 1` 若跨过前置 CallStmt，会把字段写入移到
+            // 元表安装之前；`if flag then t.x = 1 end` 则会把条件写变成无条件字段。即使
+            // 某个中间语句本身无事件，当前整体 drain 也没有保留其作用域/声明的事务形状。
             break;
         };
         steps.push(boundary_step);
@@ -198,6 +203,8 @@ fn keyed_write_binding(stmt: &HirStmt) -> Option<TableBinding> {
     };
     let binding = binding_from_expr(&access.base)?;
     if expr_uses_binding(&access.key, binding) || expr_uses_binding(value, binding) {
+        // 候选拒绝[SemanticBarrier:Scope]：`t[t] = v` / `t.x = t` 若进入
+        // `local t = { ... }`，initializer 内的 `t` 不再指向刚创建的 owner。
         return None;
     }
     Some(binding)
@@ -224,8 +231,11 @@ fn producer_steps(
                 steps,
             )
         }
-        // Existing assignments keep the physical overwrite point of their target.  They may
-        // own a source-visible value even when the result is consumed only once.
+        // 分析停用[ProofIncomplete]：scanner 尚未区分 harmless assignment 与会移动物理
+        // 覆盖点的 producer；后者确有 Lifetime 反例（lua54_01_close#9），但不能据此把
+        // `x = 1` 等全部 assignment 都升级为永久语义屏障。即使 RHS 是 primitive，
+        // `local x=0; local function get() return x end; x=1; t.v=x; return get()` 也要求
+        // 保留捕获 cell 的写入；还需旧槽值类型、capture/TBC 与后续 use 的完整事实才能放行。
         HirStmt::Assign(_) => None,
         _ => None,
     }
@@ -238,9 +248,12 @@ fn producer_steps_from_bindings(
     stmt_index: usize,
     steps: &mut Vec<RegionStep>,
 ) -> Option<Vec<TableBinding>> {
-    if bindings.is_empty()
-        || bindings.contains(&constructor_binding)
-        || values.is_empty()
+    if bindings.is_empty() || values.is_empty() {
+        return None;
+    }
+    // 候选拒绝[SemanticBarrier:Scope]：`local t = t` 或 producer RHS 读取 owner 时，
+    // 搬进 `local t = { ... }` 会让读取解析到外层/旧 binding，而不是新表 owner。
+    if bindings.contains(&constructor_binding)
         || values
             .iter()
             .any(|value| expr_uses_binding(value, constructor_binding))
@@ -248,20 +261,16 @@ fn producer_steps_from_bindings(
         return None;
     }
 
-    if values.tail.is_none() && bindings.len() == values.fixed.len() {
-        steps.extend((0..bindings.len()).map(|slot_index| RegionStep::Producer {
-            stmt_index,
-            slot_index,
-        }));
-        return Some(bindings);
+    if values.tail.is_some() || bindings.len() != values.fixed.len() {
+        // 候选拒绝[ProofIncomplete]：open/mismatched pack 缺少逐 slot value-width 与 owner 事实。
+        return None;
     }
 
-    if bindings.len() > 1 && values.fixed.is_empty() && values.tail.is_some() {
-        steps.push(RegionStep::ProducerGroup { stmt_index });
-        return Some(bindings);
-    }
-
-    None
+    steps.extend((0..bindings.len()).map(|slot_index| RegionStep::Producer {
+        stmt_index,
+        slot_index,
+    }));
+    Some(bindings)
 }
 
 pub(super) fn seed_overwrite_delay_is_unobservable(
@@ -348,6 +357,8 @@ fn table_set_list_binding(stmt: &HirStmt) -> Option<TableBinding> {
             .as_ref()
             .is_some_and(|tail| expr_uses_binding(tail.as_expr(), binding))
     {
+        // 候选拒绝[SemanticBarrier:Scope]：SETLIST 值读取 owner 时不能搬进 owner 自身的
+        // initializer；`local t = {}; t[1] = t` 与 `local t = { t }` 解析不同 binding。
         return None;
     }
     Some(binding)

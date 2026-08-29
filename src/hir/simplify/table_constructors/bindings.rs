@@ -230,6 +230,7 @@ pub(super) fn intern_stmt_bindings(stmt: &HirStmt, binding_index: &mut BindingIn
             }
         }
         HirStmt::TableSetList(_)
+        | HirStmt::GlobalDecl(_)
         | HirStmt::ErrNil(_)
         | HirStmt::ToBeClosed(_)
         | HirStmt::Close(_)
@@ -398,6 +399,7 @@ impl HirVisitor for BindingFactCollector<'_> {
                 }
             }
             HirStmt::TableSetList(_)
+            | HirStmt::GlobalDecl(_)
             | HirStmt::ErrNil(_)
             | HirStmt::ToBeClosed(_)
             | HirStmt::Close(_)

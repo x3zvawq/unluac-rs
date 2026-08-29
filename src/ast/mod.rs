@@ -1,6 +1,7 @@
 //! AST 层入口。
 
 mod build;
+mod capture_scope;
 mod common;
 #[cfg(feature = "decompile-debug")]
 mod debug;

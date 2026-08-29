@@ -11,7 +11,7 @@ use super::super::mention::{
     collect_temp_use_counts, collect_temp_write_counts, stmts_protected_locals,
     stmts_reference_captured_bindings, stmts_to_be_closed_temps, stmts_value_captured_bindings,
 };
-use super::super::temp_touch::collect_temp_refs_in_expr;
+use super::super::visit::{HirVisitor, visit_block};
 use super::super::walk::for_each_nested_block_mut;
 use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId,
@@ -99,6 +99,14 @@ fn try_rewrite_repeat(
     return_temp: TempId,
     facts: &RepeatSnapshotFacts<'_>,
 ) -> Option<LocalId> {
+    // 候选拒绝[SemanticBarrier:ControlFlow]：当前 repeat 的 break/continue/return/goto 可绕过尾 copy；删除 temp 会改变对应出口的 live-out。
+    // 内层 loop 的 break/continue 只消费内层控制边，不会绕过外层尾 copy；depth-aware helper
+    // 仅在内层没有 goto/label/cleanup 时放行，避免把非结构化跳转误当作局部 transfer。
+    // 候选拒绝[ProofIncomplete]：Close/TBC 的 blanket cleanup 阻断尚未细分不会触及候选
+    // binding 的安全情形；需完整 raw-home/resource alias 证明后才能放宽。
+    // 候选拒绝[SemanticBarrier:Capture]：捕获 return temp 时，删除其唯一写会让 closure 观察旧值。
+    // 候选拒绝[SemanticBarrier:Lifetime]：TBC temp 或非唯一 use/write 仍有额外 epoch/close 观察者。
+    // 候选拒绝[LayerBoundary]：debug temp 的源码身份由 locals owner 保留。
     if repeat.body.stmts.len() < 2
         || stmt_contains_loop_exit(&repeat.body)
         || facts.captured_temps.contains(&return_temp)
@@ -122,7 +130,6 @@ fn try_rewrite_repeat(
         _ => return None,
     };
     if temp != return_temp
-        || value_mentions_temp(&value, temp)
         || !matches!(
             &repeat.body.stmts[copy_index],
             HirStmt::Assign(assign)
@@ -138,6 +145,14 @@ fn try_rewrite_repeat(
         },
         _ => return None,
     };
+    // 候选拒绝[SemanticBarrier:Scope]：repeat body 内声明的 local 在循环外不可见；把外层 Return 改写到它会生成越界引用。
+    if repeat_body_declares_local(&repeat.body, local) {
+        return None;
+    }
+    // 候选拒绝[SemanticBarrier:Capture]：captured local 的 cell 被 closure 观察，合并
+    // producer 会改变 closure 可见的写入 epoch。
+    // 候选拒绝[PolicyBoundary]：for binding 的迭代 identity 由 loop owner 保留；候选拒绝
+    // [SemanticBarrier:Lifetime]：TBC local 的 resource/close identity 不可并入普通 snapshot。
     if facts.captured_locals.contains(&local) || facts.protected_locals.contains(&local) {
         return None;
     }
@@ -155,39 +170,83 @@ fn assign_shape(assign: &HirAssign) -> Option<(&HirLValue, &HirExpr)> {
         .then(|| (&assign.targets[0], &assign.values.fixed[0]))
 }
 
-fn value_mentions_temp(value: &HirExpr, temp: crate::hir::common::TempId) -> bool {
-    collect_temp_refs_in_expr(value).contains(&temp)
+fn repeat_body_declares_local(body: &HirBlock, local: LocalId) -> bool {
+    struct LocalDeclarationFinder {
+        local: LocalId,
+        found: bool,
+    }
+
+    impl HirVisitor for LocalDeclarationFinder {
+        fn visit_stmt(&mut self, stmt: &HirStmt) {
+            self.found |=
+                matches!(stmt, HirStmt::LocalDecl(decl) if decl.bindings.contains(&self.local));
+        }
+    }
+
+    let mut finder = LocalDeclarationFinder {
+        local,
+        found: false,
+    };
+    visit_block(body, &mut finder);
+    finder.found
 }
 
 fn stmt_contains_loop_exit(block: &HirBlock) -> bool {
-    block.stmts.iter().any(stmt_contains_unsafe_control)
+    block
+        .stmts
+        .iter()
+        .any(|stmt| stmt_contains_unsafe_control(stmt, 0))
 }
 
-/// A nested loop can consume `break`/`continue` without leaving the repeat, but it also
-/// introduces another state machine whose writes are not covered by this local two-statement
-/// proof.  Reject the whole nested control subtree; this keeps the rewrite structural instead
-/// of trying to infer path coverage from HIR alone.
-fn stmt_contains_unsafe_control(stmt: &HirStmt) -> bool {
+/// `break`/`continue` are scoped to the innermost loop.  A nested loop therefore cannot bypass
+/// the outer repeat's tail copy; only non-local control and cleanup remain barriers here.
+fn stmt_contains_unsafe_control(stmt: &HirStmt, loop_depth: usize) -> bool {
     match stmt {
-        HirStmt::Break
-        | HirStmt::Continue
-        | HirStmt::Return(_)
+        HirStmt::Break | HirStmt::Continue if loop_depth == 0 => true,
+        HirStmt::Return(_)
         | HirStmt::Goto(_)
         | HirStmt::Label(_)
+        | HirStmt::GlobalDecl(_)
         | HirStmt::Close(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::While(_)
-        | HirStmt::Repeat(_)
-        | HirStmt::NumericFor(_)
-        | HirStmt::GenericFor(_) => true,
+        | HirStmt::ToBeClosed(_) => true,
+        HirStmt::Break | HirStmt::Continue => false,
+        HirStmt::While(while_stmt) => while_stmt
+            .body
+            .stmts
+            .iter()
+            .any(|stmt| stmt_contains_unsafe_control(stmt, loop_depth + 1)),
+        HirStmt::Repeat(repeat_stmt) => repeat_stmt
+            .body
+            .stmts
+            .iter()
+            .any(|stmt| stmt_contains_unsafe_control(stmt, loop_depth + 1)),
+        HirStmt::NumericFor(numeric_for) => numeric_for
+            .body
+            .stmts
+            .iter()
+            .any(|stmt| stmt_contains_unsafe_control(stmt, loop_depth + 1)),
+        HirStmt::GenericFor(generic_for) => generic_for
+            .body
+            .stmts
+            .iter()
+            .any(|stmt| stmt_contains_unsafe_control(stmt, loop_depth + 1)),
         HirStmt::If(if_stmt) => {
-            block_contains_unsafe_control(&if_stmt.then_block)
-                || if_stmt
-                    .else_block
-                    .as_ref()
-                    .is_some_and(block_contains_unsafe_control)
+            if_stmt
+                .then_block
+                .stmts
+                .iter()
+                .any(|stmt| stmt_contains_unsafe_control(stmt, loop_depth))
+                || if_stmt.else_block.as_ref().is_some_and(|block| {
+                    block
+                        .stmts
+                        .iter()
+                        .any(|stmt| stmt_contains_unsafe_control(stmt, loop_depth))
+                })
         }
-        HirStmt::Block(block) => block_contains_unsafe_control(block),
+        HirStmt::Block(block) => block
+            .stmts
+            .iter()
+            .any(|stmt| stmt_contains_unsafe_control(stmt, loop_depth)),
         HirStmt::LocalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
@@ -196,6 +255,101 @@ fn stmt_contains_unsafe_control(stmt: &HirStmt) -> bool {
     }
 }
 
-fn block_contains_unsafe_control(block: &HirBlock) -> bool {
-    block.stmts.iter().any(stmt_contains_unsafe_control)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::common::{HirLocalDecl, HirRepeat, HirReturn, HirValuePack};
+
+    fn assign(target: HirLValue, value: HirExpr) -> HirStmt {
+        HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![target],
+            values: HirValuePack::fixed(vec![value]),
+        }))
+    }
+
+    fn repeat_snapshot_body(local: LocalId, declare_local: bool) -> HirBlock {
+        let temp = TempId(0);
+        let mut stmts = Vec::new();
+        if declare_local {
+            stmts.push(HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                bindings: vec![local],
+                values: HirValuePack::fixed(vec![HirExpr::Nil]),
+            })));
+        }
+        stmts.push(assign(HirLValue::Temp(temp), HirExpr::Integer(7)));
+        stmts.push(assign(HirLValue::Local(local), HirExpr::TempRef(temp)));
+        HirBlock { stmts }
+    }
+
+    fn repeat_snapshot_stmt(local: LocalId, declare_local: bool) -> HirStmt {
+        HirStmt::Repeat(Box::new(HirRepeat {
+            body: repeat_snapshot_body(local, declare_local),
+            cond: HirExpr::Boolean(true),
+        }))
+    }
+
+    fn return_temp(temp: TempId) -> HirStmt {
+        HirStmt::Return(Box::new(HirReturn {
+            values: HirValuePack::fixed(vec![HirExpr::TempRef(temp)]),
+        }))
+    }
+
+    fn with_snapshot_facts(test: impl FnOnce(&RepeatSnapshotFacts<'_>)) {
+        let use_counts = BTreeMap::from([(TempId(0), 2)]);
+        let write_counts = BTreeMap::from([(TempId(0), 1)]);
+        let empty_locals = BTreeSet::new();
+        let empty_temps = BTreeSet::new();
+        let facts = RepeatSnapshotFacts {
+            use_counts: &use_counts,
+            captured_locals: &empty_locals,
+            protected_locals: &empty_locals,
+            captured_temps: &empty_temps,
+            closed_temps: &empty_temps,
+            write_counts: &write_counts,
+            debug_temps: &[],
+        };
+        test(&facts);
+    }
+
+    #[test]
+    fn repeat_snapshot_rejects_local_declared_inside_repeat() {
+        let local = LocalId(0);
+        let mut block = HirBlock {
+            stmts: vec![repeat_snapshot_stmt(local, true), return_temp(TempId(0))],
+        };
+        let before = block.clone();
+
+        with_snapshot_facts(|facts| assert!(!rewrite_block(&mut block, facts)));
+
+        assert_eq!(block, before);
+    }
+
+    #[test]
+    fn repeat_snapshot_rewrites_local_visible_before_repeat() {
+        let local = LocalId(0);
+        let mut block = HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![local],
+                    values: HirValuePack::fixed(vec![HirExpr::Nil]),
+                })),
+                repeat_snapshot_stmt(local, false),
+                return_temp(TempId(0)),
+            ],
+        };
+
+        with_snapshot_facts(|facts| assert!(rewrite_block(&mut block, facts)));
+
+        let HirStmt::Repeat(repeat) = &block.stmts[1] else {
+            panic!("expected repeat statement");
+        };
+        assert_eq!(
+            repeat.body.stmts,
+            vec![assign(HirLValue::Local(local), HirExpr::Integer(7))]
+        );
+        let HirStmt::Return(ret) = &block.stmts[2] else {
+            panic!("expected return statement");
+        };
+        assert_eq!(ret.values.fixed, vec![HirExpr::LocalRef(local)]);
+    }
 }

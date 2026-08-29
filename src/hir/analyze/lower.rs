@@ -8,8 +8,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::super::promotion::{ProtoPromotionFacts, SlotEpochFacts};
+use super::super::promotion::{HomeSlotKey, ProtoPromotionFacts, SlotEpochFacts};
 use super::bindings::build_bindings;
+use super::global_decls::GlobalDeclProtocols;
 use super::helpers::{decode_raw_string, empty_proto, return_stmt};
 use super::instrs::local_decl_stmts;
 use super::shared_closures::{
@@ -27,8 +28,8 @@ use crate::hir::common::{
 };
 use crate::recovery::{ProtoArtifactStage, ProtoFailure};
 use crate::structure::{
-    BlockRef, CanonicalMoveIndex, Cfg, CfgGraph, DataflowFacts, GraphFacts, OpenDefId, PhiId,
-    SsaValue,
+    BlockRef, BlockTerminatorKind, CanonicalMoveIndex, Cfg, CfgGraph, DataflowFacts, GraphFacts,
+    LoopSourceBindings, LoopVmProtocol, OpenDefId, PhiId, SsaValue, StructurePlan,
 };
 use crate::structure::{ReadyStructureFacts, StructureFacts};
 use crate::transformer::{
@@ -54,11 +55,13 @@ pub(super) struct ProtoBindings {
     pub(super) debug_temp_targets: BTreeMap<TempId, BoundSlotTarget>,
     pub(super) captured_temp_targets: BTreeMap<TempId, BoundSlotTarget>,
     pub(super) captured_temp_decl_locals: BTreeMap<TempId, LocalId>,
+    pub(super) captured_local_home_slots: Vec<(LocalId, HomeSlotKey)>,
     pub(super) capture_empty_local_decls: BTreeMap<usize, Vec<LocalId>>,
     pub(super) capture_entry_local_decls: Vec<LocalId>,
     pub(super) debug_entry_local_decls: Vec<LocalId>,
     pub(super) capture_region_local_decls: BTreeMap<crate::structure::RegionId, Vec<LocalId>>,
     pub(super) closure_capture_targets: BTreeMap<(usize, usize), BoundSlotTarget>,
+    pub(super) lexical_close_scope_starts: BTreeMap<usize, usize>,
     pub(super) reference_captured_regs: Vec<bool>,
     pub(super) entry_local_regs: BTreeMap<Reg, LocalId>,
     pub(super) numeric_for_locals: BTreeMap<BlockRef, LocalId>,
@@ -111,6 +114,24 @@ impl ProtoBindings {
             .map_or(HirLValue::Temp(temp), BoundSlotTarget::lvalue)
     }
 
+    /// 固定定义优先投影到当前 block 的 local owner，否则回退到 temp target。
+    /// 同一个 VM 结果的读写必须使用这对投影，避免 closure 的 self capture 与接收
+    /// closure 的 binding 分裂成两个身份。
+    pub(super) fn expr_for_fixed_def(&self, block: BlockRef, reg: Reg, temp: TempId) -> HirExpr {
+        self.local_for_reg_in_block(block, reg)
+            .map_or_else(|| self.expr_for_temp(temp), HirExpr::LocalRef)
+    }
+
+    pub(super) fn lvalue_for_fixed_def(
+        &self,
+        block: BlockRef,
+        reg: Reg,
+        temp: TempId,
+    ) -> HirLValue {
+        self.local_for_reg_in_block(block, reg)
+            .map_or_else(|| self.lvalue_for_temp(temp), HirLValue::Local)
+    }
+
     pub(super) fn expr_for_phi(&self, phi: PhiId) -> HirExpr {
         self.numeric_binding_phi_locals
             .get(phi.index())
@@ -148,10 +169,12 @@ pub(super) struct ProtoLowering<'a> {
     pub(super) structure: &'a ReadyStructureFacts,
     pub(super) child_refs: &'a [HirProtoRef],
     pub(super) bindings: ProtoBindings,
+    pub(super) self_value_capture_locals: BTreeMap<InstrRef, LocalId>,
     pub(super) shared_closure_locals: BTreeMap<SharedClosureRef, (LocalId, ProtoRef)>,
     pub(super) captured_shared_closures: CapturedSharedClosureLowering,
     pub(super) open_pack_owners: Vec<Option<InstrRef>>,
     pub(super) owned_open_producers: Vec<bool>,
+    pub(super) global_decls: GlobalDeclProtocols,
 }
 
 pub(super) struct CapturedSharedClosureLowering {
@@ -416,6 +439,7 @@ fn lower_proto_one(
         &slot_epochs,
         &child_mutable_upvalues,
     );
+    let self_value_capture_locals = build_self_value_capture_locals(proto, &mut bindings);
     let shared_closure_locals =
         build_shared_closure_locals(proto, &captured_shared_plan, &mut bindings);
     let captured_shared_closures = CapturedSharedClosureLowering::new(
@@ -432,6 +456,7 @@ fn lower_proto_one(
             owned_open_producers[def.instr.index()] = true;
         }
     }
+    let global_decls = GlobalDeclProtocols::analyze(target, proto, cfg, dataflow);
     let lowering = ProtoLowering {
         target,
         proto,
@@ -440,10 +465,12 @@ fn lower_proto_one(
         structure,
         child_refs: &child_refs,
         bindings,
+        self_value_capture_locals,
         shared_closure_locals,
         captured_shared_closures,
         open_pack_owners,
         owned_open_producers,
+        global_decls,
     };
 
     artifacts.protos[id.index()] = HirProto {
@@ -455,6 +482,7 @@ fn lower_proto_one(
         param_debug_hints: lowering.bindings.param_debug_hints.clone(),
         locals: lowering.bindings.locals.clone(),
         local_debug_hints: lowering.bindings.local_debug_hints.clone(),
+        physical_root_temps: BTreeSet::new(),
         physical_root_locals: BTreeSet::new(),
         upvalues: lowering.bindings.upvalues.clone(),
         upvalue_debug_hints: lowering.bindings.upvalue_debug_hints.clone(),
@@ -466,7 +494,7 @@ fn lower_proto_one(
         failure: None,
         detached_children: Vec::new(),
     };
-    artifacts.promotion_facts[id.index()] = ProtoPromotionFacts::from_plan(
+    let mut promotion_facts = ProtoPromotionFacts::from_plan(
         proto,
         dataflow,
         structure.plan(),
@@ -474,12 +502,110 @@ fn lower_proto_one(
         &lowering.bindings.fixed_temps,
         &lowering.bindings.phi_temps,
     );
+    // `entry_local_regs` 是 Entry(reg) 的可见 binding；它与 SSA entry leaf 一样属于
+    // `(reg, epoch 0)`。把这份已知身份带入 simplify，避免异槽 reference capture 被误判
+    // 为可能观察任意 local 写入。后续异槽合并仍会通过 promotion invalidation 使其失效。
+    for (&reg, &local) in &lowering.bindings.entry_local_regs {
+        promotion_facts.record_local_home_slot(local, HomeSlotKey::new(reg.index(), 0));
+    }
+    for &(local, home) in &lowering.bindings.captured_local_home_slots {
+        promotion_facts.record_local_home_slot(local, home);
+    }
+    record_loop_binding_local_homes(
+        structure.plan(),
+        &slot_epochs,
+        &lowering.bindings,
+        &mut promotion_facts,
+    );
+    artifacts.promotion_facts[id.index()] = promotion_facts;
 
     Ok(LoweredProtoResult {
         id,
         source_proto_id: frame.source_proto_id,
         mutable_upvalues: mutable_upvalues_for_proto(proto, &child_mutable_upvalues),
     })
+}
+
+fn record_loop_binding_local_homes(
+    plan: &StructurePlan,
+    slot_epochs: &SlotEpochFacts,
+    bindings: &ProtoBindings,
+    facts: &mut ProtoPromotionFacts,
+) {
+    for (loop_id, loop_plan) in plan.loops() {
+        match (loop_plan.source_bindings, plan.loop_protocol(loop_id)) {
+            (
+                Some(LoopSourceBindings::Numeric(reg)),
+                Some(LoopVmProtocol::NumericFor(protocol)),
+            ) => {
+                let Some(local) = bindings.numeric_for_locals.get(&loop_plan.header).copied()
+                else {
+                    continue;
+                };
+                facts.record_local_home_slot(
+                    local,
+                    HomeSlotKey::new(reg.index(), slot_epochs.epoch_at(reg, protocol.init_instr)),
+                );
+                let Some(BlockTerminatorKind::NumericForLoop { instr, .. }) = plan
+                    .block_terminator(loop_plan.header)
+                    .map(|terminator| terminator.kind)
+                else {
+                    continue;
+                };
+                facts.record_local_home_slot(
+                    local,
+                    HomeSlotKey::new(reg.index(), slot_epochs.epoch_at(reg, instr)),
+                );
+            }
+            (
+                Some(LoopSourceBindings::Generic(regs)),
+                Some(LoopVmProtocol::GenericFor(protocol)),
+            ) => {
+                let Some(locals) = bindings.generic_for_locals.get(&loop_plan.header) else {
+                    continue;
+                };
+                for (offset, local) in locals.iter().copied().enumerate() {
+                    let reg = Reg(regs.start.index() + offset);
+                    facts.record_local_home_slot(
+                        local,
+                        HomeSlotKey::new(
+                            reg.index(),
+                            slot_epochs.epoch_at(reg, protocol.call_instr),
+                        ),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn build_self_value_capture_locals(
+    proto: &LoweredProto,
+    bindings: &mut ProtoBindings,
+) -> BTreeMap<InstrRef, LocalId> {
+    proto
+        .instrs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instr)| {
+            let LowInstr::Closure(closure) = instr else {
+                return None;
+            };
+            closure
+                .captures
+                .iter()
+                .any(|capture| {
+                    matches!(capture.source, CaptureSource::ByValue(reg) if reg == closure.dst)
+                })
+                .then(|| {
+                    let local = LocalId(bindings.locals.len());
+                    bindings.locals.push(local);
+                    bindings.local_debug_hints.push(None);
+                    (InstrRef(index), local)
+                })
+        })
+        .collect()
 }
 
 fn fill_failed_proto(
@@ -523,6 +649,7 @@ fn fill_failed_proto(
         param_debug_hints: vec![None; usize::from(proto.signature.num_params)],
         locals,
         local_debug_hints,
+        physical_root_temps: BTreeSet::new(),
         physical_root_locals: BTreeSet::new(),
         upvalues: (0..usize::from(proto.upvalues.common.count))
             .map(UpvalueId)
@@ -866,6 +993,7 @@ fn build_composite_factory_proto(
         param_debug_hints: Vec::new(),
         locals: (0..plan.nodes.len()).map(LocalId).collect(),
         local_debug_hints: vec![None; plan.nodes.len()],
+        physical_root_temps: BTreeSet::new(),
         physical_root_locals: BTreeSet::new(),
         upvalues: (0..plan.outer_captures.len()).map(UpvalueId).collect(),
         upvalue_debug_hints: vec![None; plan.outer_captures.len()],

@@ -168,6 +168,14 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
                     format_value_pack(&local_decl.values),
                 );
             }
+            HirStmt::GlobalDecl(global_decl) => {
+                let _ = writeln!(
+                    output,
+                    "{indent}global {} = {}",
+                    global_decl.names.join(", "),
+                    format_value_pack(&global_decl.values),
+                );
+            }
             HirStmt::Assign(assign) => {
                 let _ = writeln!(
                     output,

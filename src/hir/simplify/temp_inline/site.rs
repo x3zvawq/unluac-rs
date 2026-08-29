@@ -2,7 +2,9 @@
 //!
 //! 它依赖 HIR 当前语句/表达式形状，只回答某个 temp 首次被消费的位置属于 direct、callee、
 //! condition 还是 loop-head，不会在这里执行内联。无环 Decision 只把唯一入口节点的
-//! test 当作必达 condition；其它节点和 target 仍是条件执行的 nested site。method 协议
+//! test 当作必达 condition；其它节点和 target 仍是条件执行的 nested site。条件区域和
+//! 循环重复区域向所有子表达式传播，不能被 call/index 等展示站位覆盖。table constructor
+//! 的分配发生在首字段之前，因此即使字段必达，也会作为独立求值顺序屏障。method 协议
 //! 已经证明 callee base 与隐式首参是同一次 receiver 求值，因此这里把这两个结构引用
 //! 合并视为 call 所在的单一站点；普通点调用仍分别扫描 callee 与参数。
 //! 例如：`r0(1)` 会把 `r0` 标成 `CallCallee`，`r0:m()` 则把 receiver 标成 call 所在站点。
@@ -12,15 +14,20 @@ use super::super::visit::{HirVisitor, visit_stmts};
 use super::*;
 
 pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<InlineSite> {
+    let stmt = transparent_block_head(stmt)?;
     match stmt {
         HirStmt::LocalDecl(local_decl) => {
             find_site_in_exprs(&local_decl.values, temp, InlineSite::Direct)
+        }
+        HirStmt::GlobalDecl(global_decl) => {
+            find_site_in_exprs(&global_decl.values, temp, InlineSite::Direct)
         }
         HirStmt::Assign(assign) => assign
             .targets
             .iter()
             .find_map(|target| find_site_in_lvalue(target, temp, InlineSite::Direct))
             .or_else(|| find_site_in_exprs(&assign.values, temp, InlineSite::Direct)),
+        // 候选拒绝[LayerBoundary]：SETLIST base 的 NewTable origin/home 由 table-constructors 消费，temp-inline 只处理 values。
         // SETLIST carries raw table-write semantics and the physical lifetime of its base
         // register.  Keep that base as a direct binding so the table-constructor pass can prove
         // its NewTable origin/home slot; inlining the producer here loses both facts and used to
@@ -35,7 +42,9 @@ pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<Inline
         HirStmt::Return(ret) => direct_fastcall_expr(&ret.values)
             .and_then(|call| find_site_in_call(call, temp, InlineSite::Direct))
             .or_else(|| find_site_in_exprs(&ret.values, temp, InlineSite::ReturnValue)),
+        // 候选拒绝[SemanticBarrier:ControlFlow]：`t=f(); if c then use(t) end` 不能把必达的 `f()` 移入零或一次执行的 body；这里只扫描 condition。
         HirStmt::If(if_stmt) => find_site_in_expr(&if_stmt.cond, temp, InlineSite::Condition),
+        // 候选拒绝[SemanticBarrier:ControlFlow]：`t=f(); while c do use(t) end` 若移入 body，会把一次求值改成零或多次；repeat/for body 同理，只扫描各自的循环头。
         HirStmt::While(while_stmt) => {
             find_site_in_expr(&while_stmt.cond, temp, InlineSite::LoopCondition)
         }
@@ -50,14 +59,30 @@ pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<Inline
         HirStmt::GenericFor(generic_for) => {
             find_site_in_exprs(&generic_for.iterator, temp, InlineSite::LoopHead)
         }
-        HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
+        // 候选拒绝[LayerBoundary]：ErrNil 是 AST build global-decl syntax pattern 的显式诊断标记，temp-inline 不改写其 probe identity（regress_244）。
+        HirStmt::ErrNil(_) => None,
+        // 候选拒绝[LayerBoundary]：TBC value 与声明的配对由 AST build syntax pattern/close-scopes 消费，temp-inline 不改写该 resource identity（regress_244）。
+        HirStmt::ToBeClosed(_) => None,
+        HirStmt::Close(_)
         | HirStmt::Break
         | HirStmt::Continue
         | HirStmt::Goto(_)
-        | HirStmt::Label(_)
-        | HirStmt::Block(_) => None,
+        | HirStmt::Label(_) => None,
+        HirStmt::Block(_) => unreachable!("transparent block head must be fully unwrapped"),
+    }
+}
+
+pub(super) fn transparent_block_head(mut stmt: &HirStmt) -> Option<&HirStmt> {
+    loop {
+        let HirStmt::Block(block) = stmt else {
+            return Some(stmt);
+        };
+        // 候选拒绝[ProofIncomplete]：第二条及更晚消费仍需 block-prefix 的求值、写入、capture、
+        // 词法遮蔽与外部控制流摘要；当前只把零前缀的首语句视为透明。缺少这些事实时，
+        // `local t=f(); do g(); return t end` 会把 f/g 顺序倒置，`local x=1; local t=x;
+        // do local x; return t end` 则可能把 x 解析成内层 nil；因此不能仅按“前缀未使用
+        // candidate temp”就继续扫描后续语句。
+        stmt = block.stmts.first()?;
     }
 }
 
@@ -233,6 +258,7 @@ impl EvalOrderProbe<'_> {
     fn stmt(&self, stmt: &HirStmt) -> bool {
         match stmt {
             HirStmt::LocalDecl(local_decl) => self.exprs(&local_decl.values),
+            HirStmt::GlobalDecl(global_decl) => self.exprs(&global_decl.values),
             HirStmt::Assign(assign) => {
                 let (found, prefix_clear) = self.lvalues(&assign.targets);
                 found.unwrap_or_else(|| prefix_clear && self.exprs(&assign.values))
@@ -249,14 +275,14 @@ impl EvalOrderProbe<'_> {
                 self.exprs([&numeric_for.start, &numeric_for.limit, &numeric_for.step])
             }
             HirStmt::GenericFor(generic_for) => self.exprs(&generic_for.iterator),
+            HirStmt::Block(_) => transparent_block_head(stmt).is_some_and(|stmt| self.stmt(stmt)),
             HirStmt::ErrNil(_)
             | HirStmt::ToBeClosed(_)
             | HirStmt::Close(_)
             | HirStmt::Break
             | HirStmt::Continue
             | HirStmt::Goto(_)
-            | HirStmt::Label(_)
-            | HirStmt::Block(_) => false,
+            | HirStmt::Label(_) => false,
         }
     }
 
@@ -318,7 +344,9 @@ impl EvalOrderProbe<'_> {
             }
             HirExpr::Call(call) => self.call(call),
             HirExpr::TableConstructor(table) => {
-                let mut prefix_clear = true;
+                // table 在首字段前已经分配，可能触发 GC/finalizer；原本位于 constructor
+                // 之前的有序 producer 不能移入任何字段，包括第一个字段。
+                let mut prefix_clear = false;
                 for field in &table.fields {
                     match field {
                         HirTableField::Array(value) => {
@@ -413,35 +441,51 @@ fn find_site_in_call(call: &HirCallExpr, temp: TempId, site: InlineSite) -> Opti
     {
         return Some(site);
     }
-    let callee_site = if matches!(site, InlineSite::Direct) {
+    let callee_site = if site.preserves_execution_region() {
+        site.nested()
+    } else if matches!(site, InlineSite::Direct) {
         if call.fastcall.is_some() {
             InlineSite::FastCallCallee
         } else {
             InlineSite::CallCallee
         }
     } else {
-        InlineSite::Nested
+        site.nested()
     };
     find_site_in_expr(&call.callee, temp, callee_site).or_else(|| {
         if let Some(fastcall) = call.fastcall {
             for (index, arg) in call.args.fixed.iter().enumerate() {
-                if let Some(site) = if fastcall.fixed_is_direct(index) {
-                    find_site_in_fastcall_arg(arg, temp, InlineSite::FastCallArg)
+                let arg_site = if fastcall.fixed_is_direct(index) {
+                    InlineSite::FastCallArg
                 } else {
-                    find_site_in_expr(arg, temp, InlineSite::CallArg)
+                    InlineSite::CallArg
+                };
+                if let Some(found) = if site.preserves_execution_region() {
+                    find_site_in_expr(arg, temp, site.nested())
+                } else if fastcall.fixed_is_direct(index) {
+                    find_site_in_fastcall_arg(arg, temp, arg_site)
+                } else {
+                    find_site_in_expr(arg, temp, arg_site)
                 } {
-                    return Some(site);
+                    return Some(found);
                 }
             }
             call.args.tail.as_ref().and_then(|tail| {
-                if fastcall.tail_is_direct() {
+                if site.preserves_execution_region() {
+                    find_site_in_expr(tail.as_expr(), temp, site.nested())
+                } else if fastcall.tail_is_direct() {
                     find_site_in_fastcall_arg(tail.as_expr(), temp, InlineSite::FastCallArg)
                 } else {
                     find_site_in_expr(tail.as_expr(), temp, InlineSite::CallArg)
                 }
             })
         } else {
-            find_site_in_exprs(&call.args, temp, InlineSite::CallArg)
+            let arg_site = if site.preserves_execution_region() {
+                site.nested()
+            } else {
+                InlineSite::CallArg
+            };
+            find_site_in_exprs(&call.args, temp, arg_site)
         }
     })
 }
@@ -460,7 +504,14 @@ fn find_site_in_expr_with_fastcall_context(
     direct_site: InlineSite,
 ) -> Option<InlineSite> {
     match expr {
-        HirExpr::Call(call) => find_site_in_call(call, temp, InlineSite::Direct),
+        HirExpr::Call(call) => {
+            let call_site = if direct_site.preserves_execution_region() {
+                direct_site
+            } else {
+                InlineSite::Direct
+            };
+            find_site_in_call(call, temp, call_site)
+        }
         HirExpr::Unary(unary) => {
             find_site_in_expr_with_fastcall_context(&unary.expr, temp, direct_site)
         }
@@ -469,9 +520,8 @@ fn find_site_in_expr_with_fastcall_context(
                 .or_else(|| find_site_in_expr_with_fastcall_context(&binary.rhs, temp, direct_site))
         }
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            find_site_in_expr_with_fastcall_context(&logical.lhs, temp, direct_site).or_else(|| {
-                find_site_in_expr_with_fastcall_context(&logical.rhs, temp, direct_site)
-            })
+            find_site_in_expr_with_fastcall_context(&logical.lhs, temp, direct_site)
+                .or_else(|| find_site_in_expr(&logical.rhs, temp, direct_site.conditional()))
         }
         // 表构造、表访问与 decision arm 会建立独立求值域，只有纯包装节点继承外层 FASTCALL 参数协议。
         _ => find_site_in_expr(expr, temp, direct_site),
@@ -514,25 +564,31 @@ fn find_site_in_expr(expr: &HirExpr, temp: TempId, site: InlineSite) -> Option<I
                 child_site
             };
             find_site_in_expr(&logical.lhs, temp, lhs_site)
-                .or_else(|| find_site_in_expr(&logical.rhs, temp, child_site))
+                .or_else(|| find_site_in_expr(&logical.rhs, temp, child_site.conditional()))
         }
         HirExpr::Decision(decision) => find_site_in_decision(decision, temp, site),
         HirExpr::Call(call) => find_site_in_call(call, temp, site),
-        HirExpr::TableConstructor(table) => table
-            .fields
-            .iter()
-            .find_map(|field| match field {
-                HirTableField::Array(value) => find_site_in_expr(value, temp, InlineSite::Nested),
-                HirTableField::Record(field) => find_site_in_table_key(&field.key, temp)
-                    .or_else(|| find_site_in_expr(&field.value, temp, InlineSite::Nested)),
-            })
-            .or_else(|| {
-                table
-                    .trailing_multivalue
-                    .as_ref()
-                    .and_then(|tail| find_site_in_expr(tail.as_expr(), temp, InlineSite::Nested))
-            }),
+        HirExpr::TableConstructor(table) => {
+            let child_site = site.nested();
+            table
+                .fields
+                .iter()
+                .find_map(|field| match field {
+                    HirTableField::Array(value) => find_site_in_expr(value, temp, child_site),
+                    HirTableField::Record(field) => {
+                        find_site_in_table_key(&field.key, temp, child_site)
+                            .or_else(|| find_site_in_expr(&field.value, temp, child_site))
+                    }
+                })
+                .or_else(|| {
+                    table
+                        .trailing_multivalue
+                        .as_ref()
+                        .and_then(|tail| find_site_in_expr(tail.as_expr(), temp, child_site))
+                })
+        }
         HirExpr::Closure(_) => {
+            // 候选拒绝[LayerBoundary]：closure capture 的 source identity/upvalue provenance 由后续 locals/promotion owner 消费。
             // capture 一旦跨过函数边界，就会直接决定子 proto 的 upvalue provenance。
             // 如果这里把 temp 内联进 capture，后面的 locals / naming 就再也看不到
             // “这是一个单独的局部变量被捕获”这层结构事实了，像
@@ -565,9 +621,12 @@ fn find_site_in_decision(
     outer_site: InlineSite,
 ) -> Option<InlineSite> {
     let entry_index = decision.entry.index();
-    let entry = decision.nodes.get(entry_index)?;
+    let entry = decision
+        .nodes
+        .get(entry_index)
+        .expect("HIR Decision entry must reference an existing node");
     let entry_site = if decision_has_cycles(decision) {
-        InlineSite::Nested
+        InlineSite::RepeatedNested
     } else {
         match outer_site {
             InlineSite::Direct => InlineSite::Condition,
@@ -575,7 +634,10 @@ fn find_site_in_decision(
             | InlineSite::Condition
             | InlineSite::LoopCondition
             | InlineSite::LoopHead => outer_site,
+            InlineSite::ConditionalNested | InlineSite::RepeatedNested => outer_site,
             InlineSite::Nested
+            | InlineSite::EagerOperand
+            | InlineSite::EagerAccessBase
             | InlineSite::Index
             | InlineSite::CallArg
             | InlineSite::FastCallArg
@@ -584,13 +646,18 @@ fn find_site_in_decision(
             | InlineSite::AccessBase => InlineSite::Nested,
         }
     };
+    let conditional_site = if decision_has_cycles(decision) {
+        InlineSite::RepeatedNested
+    } else {
+        outer_site.conditional()
+    };
     find_site_in_expr(&entry.test, temp, entry_site).or_else(|| {
         decision.nodes.iter().enumerate().find_map(|(index, node)| {
             (index != entry_index)
-                .then(|| find_site_in_expr(&node.test, temp, InlineSite::Nested))
+                .then(|| find_site_in_expr(&node.test, temp, conditional_site))
                 .flatten()
-                .or_else(|| find_site_in_decision_target(&node.truthy, temp, InlineSite::Nested))
-                .or_else(|| find_site_in_decision_target(&node.falsy, temp, InlineSite::Nested))
+                .or_else(|| find_site_in_decision_target(&node.truthy, temp, conditional_site))
+                .or_else(|| find_site_in_decision_target(&node.falsy, temp, conditional_site))
         })
     })
 }
@@ -607,10 +674,10 @@ fn find_site_in_decision_target(
     }
 }
 
-fn find_site_in_table_key(key: &HirTableKey, temp: TempId) -> Option<InlineSite> {
+fn find_site_in_table_key(key: &HirTableKey, temp: TempId, site: InlineSite) -> Option<InlineSite> {
     match key {
         HirTableKey::Name(_) => None,
-        HirTableKey::Expr(expr) => find_site_in_expr(expr, temp, InlineSite::Index),
+        HirTableKey::Expr(expr) => find_site_in_expr(expr, temp, site),
     }
 }
 
@@ -701,6 +768,10 @@ fn table_key_complexity(key: &HirTableKey) -> usize {
 pub(super) enum InlineSite {
     Direct,
     Nested,
+    EagerOperand,
+    EagerAccessBase,
+    ConditionalNested,
+    RepeatedNested,
     ReturnValue,
     Index,
     CallArg,
@@ -714,15 +785,39 @@ pub(super) enum InlineSite {
 }
 
 impl InlineSite {
-    pub(super) fn allows(self, replacement: &HirExpr, options: ReadabilityOptions) -> bool {
+    pub(super) fn allows(
+        self,
+        replacement: &HirExpr,
+        options: ReadabilityOptions,
+        safety: HirExprSafety,
+    ) -> bool {
         match self {
             Self::Direct => true,
             Self::CallCallee | Self::FastCallCallee => true,
             Self::Nested => {
+                // 候选拒绝[PolicyBoundary]：普通 nested 只收回无事件小表达式；effectful producer 需要先归入已证明的具体 eager 位置。
                 expr_complexity(replacement) <= NESTED_INLINE_MAX_COMPLEXITY
                     && is_small_pure_nested_inline_expr(replacement)
             }
+            Self::EagerOperand | Self::EagerAccessBase => {
+                // 候选拒绝[PolicyBoundary]：已证明必达的直接操作数/access base 仍受固定复杂度阈值限制。
+                // 候选拒绝[LayerBoundary]：Decision/Unresolved 由 decision/eliminate 与 residual owner 消费；temp-inline 不把中间恢复节点埋入普通表达式。
+                // 候选拒绝[PolicyBoundary]：closure child body 不计入表达式复杂度，保留独立 producer 避免多行 IIFE。
+                expr_complexity(replacement) <= NESTED_INLINE_MAX_COMPLEXITY
+                    && !matches!(
+                        replacement,
+                        HirExpr::Decision(_) | HirExpr::Closure(_) | HirExpr::Unresolved(_)
+                    )
+            }
+            Self::ConditionalNested | Self::RepeatedNested => {
+                // 候选拒绝[SemanticBarrier:ControlFlow]：`t=f(); return c and t` 若把 call/lookup producer 移进条件区域，会从 eager 求值变成条件求值；重复区域还可能每轮重算。
+                // 候选拒绝[SemanticBarrier:Lifetime]：`t=x; return mutate() and t` 若延后可变 binding 快照，会读取 mutate 后的新值。
+                // 候选拒绝[PolicyBoundary]：可跳过且 effect-invariant 的 nested 值仍受固定复杂度阈值限制。
+                expr_complexity(replacement) <= NESTED_INLINE_MAX_COMPLEXITY
+                    && is_safe_conditional_nested_inline_expr(replacement, safety)
+            }
             Self::AccessBase => {
+                // 候选拒绝[PolicyBoundary]：access base 只展示原子值或命名字段链，并服从用户配置的复杂度上限。
                 self.complexity_limit(options)
                     .is_some_and(|limit| expr_complexity(replacement) <= limit)
                     && is_access_base_inline_expr(replacement)
@@ -730,17 +825,21 @@ impl InlineSite {
             // 条件头 / for 头属于源码结构骨架，保留少量低复杂度表达式能明显减少
             // 机械 temp 噪音；但这里仍然用固定的小阈值，避免把整坨复杂逻辑塞回控制头。
             Self::Condition | Self::LoopCondition => {
+                // 候选拒绝[PolicyBoundary]：控制头使用固定展示复杂度上限；该限制不表示表达式不等价。
                 expr_complexity(replacement) <= CONTROL_HEAD_INLINE_MAX_COMPLEXITY
             }
             // closure 的复杂度无法概括 child proto 函数体；保留独立 producer，避免把普通
             // local function 压成 loop head 里的多行匿名 iterator。
             Self::LoopHead => {
+                // 候选拒绝[PolicyBoundary]：closure 保留命名 producer，避免多行 IIFE；其它 loop-head 值仅受展示复杂度限制。
                 !matches!(replacement, HirExpr::Closure(_))
                     && expr_complexity(replacement) <= CONTROL_HEAD_INLINE_MAX_COMPLEXITY
             }
-            Self::ReturnValue | Self::Index | Self::CallArg | Self::FastCallArg => self
-                .complexity_limit(options)
-                .is_some_and(|limit| expr_complexity(replacement) <= limit),
+            Self::ReturnValue | Self::Index | Self::CallArg | Self::FastCallArg => {
+                // 候选拒绝[PolicyBoundary]：return/index/arg 的用户可配置复杂度阈值只控制源码展示密度。
+                self.complexity_limit(options)
+                    .is_some_and(|limit| expr_complexity(replacement) <= limit)
+            }
         }
     }
 
@@ -748,6 +847,10 @@ impl InlineSite {
         match self {
             Self::Direct
             | Self::Nested
+            | Self::EagerOperand
+            | Self::EagerAccessBase
+            | Self::ConditionalNested
+            | Self::RepeatedNested
             | Self::CallCallee
             | Self::FastCallCallee
             | Self::Condition
@@ -764,16 +867,16 @@ impl InlineSite {
     fn descend_access_base(self) -> Self {
         match self {
             Self::Direct => Self::AccessBase,
+            Self::LoopCondition | Self::ConditionalNested | Self::RepeatedNested => self.nested(),
+            Self::CallCallee | Self::FastCallCallee => Self::EagerAccessBase,
+            Self::EagerOperand | Self::EagerAccessBase => self,
             Self::Nested
             | Self::ReturnValue
             | Self::Index
             | Self::CallArg
             | Self::FastCallArg
-            | Self::CallCallee
-            | Self::FastCallCallee
             | Self::AccessBase
             | Self::Condition
-            | Self::LoopCondition
             | Self::LoopHead => Self::Nested,
         }
     }
@@ -790,8 +893,11 @@ impl InlineSite {
             Self::Condition => Self::Condition,
             Self::LoopCondition => Self::LoopCondition,
             Self::LoopHead => Self::LoopHead,
-            Self::Direct
-            | Self::Nested
+            Self::ConditionalNested | Self::RepeatedNested => self,
+            Self::Direct => Self::EagerOperand,
+            Self::Nested
+            | Self::EagerOperand
+            | Self::EagerAccessBase
             | Self::ReturnValue
             | Self::CallArg
             | Self::FastCallArg
@@ -803,6 +909,33 @@ impl InlineSite {
 
     pub(super) const fn is_call_callee(self) -> bool {
         matches!(self, Self::CallCallee | Self::FastCallCallee)
+    }
+
+    fn conditional(self) -> Self {
+        match self {
+            Self::LoopCondition | Self::RepeatedNested => Self::RepeatedNested,
+            Self::ConditionalNested => Self::ConditionalNested,
+            _ => Self::ConditionalNested,
+        }
+    }
+
+    fn nested(self) -> Self {
+        match self {
+            Self::LoopCondition | Self::RepeatedNested => Self::RepeatedNested,
+            Self::ConditionalNested => Self::ConditionalNested,
+            _ => Self::Nested,
+        }
+    }
+
+    const fn preserves_execution_region(self) -> bool {
+        matches!(
+            self,
+            Self::LoopCondition | Self::ConditionalNested | Self::RepeatedNested
+        )
+    }
+
+    pub(super) const fn is_repeated_region(self) -> bool {
+        matches!(self, Self::LoopCondition | Self::RepeatedNested)
     }
 }
 
@@ -840,6 +973,12 @@ fn is_atomic_nested_inline_expr(expr: &HirExpr) -> bool {
             | HirExpr::GlobalRef(_)
             | HirExpr::VarArg
     )
+}
+
+fn is_safe_conditional_nested_inline_expr(expr: &HirExpr, safety: HirExprSafety) -> bool {
+    safety.is_discard_safe(expr)
+        && safety.is_effect_invariant_in_single_value_context(expr)
+        && safety.is_repeatable_in_single_value_context(expr)
 }
 
 fn is_small_pure_nested_inline_expr(expr: &HirExpr) -> bool {

@@ -189,6 +189,9 @@ pub(crate) fn run_pipeline_case(
     suite: UnitSuite,
     entry: &LuaCaseManifestEntry,
 ) -> Result<TestSuccess, TestFailure> {
+    if entry.expectation == LuaCaseExpectation::GlobalDeclResidual {
+        return run_global_decl_residual_contract(suite, entry);
+    }
     if entry.expectation == LuaCaseExpectation::TableSetListResidual {
         return run_table_set_list_residual_contract(suite, entry);
     }
@@ -208,7 +211,7 @@ pub(crate) fn run_pipeline_case(
         )
     })?;
     let assertions = read_readability_assertions(entry.path)?;
-    let baseline = build_case_baseline(entry, suite_label).map_err(|failure| {
+    let mut baseline = build_case_baseline(entry, suite_label).map_err(|failure| {
         TestFailure::new(
             FailureKind::BaselineFailed,
             format!("baseline failed first: {}", failure.summary()),
@@ -217,7 +220,90 @@ pub(crate) fn run_pipeline_case(
     })?;
     let expected_dialect = entry.dialect.decompile_dialect();
 
-    let chunk = compile_manifest_case(entry);
+    let mut chunk = compile_manifest_case(entry);
+    if let LuaCaseExpectation::LuauSelfValueCaptureCarrier {
+        closure_pc,
+        save_pc,
+        overwrite_pc,
+        target_reg,
+    } = entry.expectation
+    {
+        patch_luau_self_value_capture_carrier(
+            &mut chunk,
+            closure_pc,
+            save_pc,
+            overwrite_pc,
+            target_reg,
+        )
+        .map_err(|detail| {
+            TestFailure::new(
+                FailureKind::CompileSourceFailed,
+                "patch Luau self-value carrier failed",
+                detail,
+            )
+        })?;
+        let carrier_path = suite_artifact_path(
+            suite_label,
+            dialect_label,
+            entry.variant,
+            "patched-self-value-carrier",
+            entry.path,
+            toolchain.chunk_extension,
+        );
+        write_output_file(&carrier_path, &chunk).map_err(|detail| {
+            TestFailure::new(
+                FailureKind::CompileSourceFailed,
+                "write patched Luau self-value carrier failed",
+                detail,
+            )
+        })?;
+        let runner = lua_tool_path("luau", "luau-bytecode-runner").map_err(|detail| {
+            TestFailure::new(
+                FailureKind::RunCompiledChunkFailed,
+                "locate Luau bytecode runner failed",
+                detail,
+            )
+        })?;
+        let carrier_output =
+            run_command(&runner, [carrier_path.as_os_str()], "luau-bytecode-runner").map_err(
+                |detail| {
+                    TestFailure::new(
+                        FailureKind::RunCompiledChunkFailed,
+                        "run patched Luau self-value carrier failed",
+                        detail,
+                    )
+                },
+            )?;
+        if !carrier_output.success() {
+            let summary = format!(
+                "patched Luau self-value carrier execution failed (artifact: {}, status: {})",
+                repo_relative_display(&carrier_path),
+                render_status_code(carrier_output.status_code),
+            );
+            return Err(TestFailure::new(
+                FailureKind::CompiledChunkExecutionFailed,
+                summary.clone(),
+                format!("{summary}\n{}", carrier_output.render()),
+            ));
+        }
+        if let Some(diff) = diff_command_outputs(
+            "source",
+            &baseline.source_output,
+            "patched-chunk",
+            &carrier_output,
+        ) {
+            let summary = format!(
+                "source/patched Luau carrier output mismatch (artifact: {})",
+                repo_relative_display(&carrier_path),
+            );
+            return Err(TestFailure::new(
+                FailureKind::SourceChunkOutputMismatch,
+                summary.clone(),
+                format!("{summary}\n{diff}"),
+            ));
+        }
+        baseline.source_output = carrier_output;
+    }
     let result = decompile(&chunk, decompile_options(entry)).map_err(|error| {
         TestFailure::new(
             FailureKind::DecompileFailed,
@@ -594,12 +680,116 @@ pub(crate) fn run_pipeline_case(
             ));
         }
         LuaCaseExpectation::Source
+        | LuaCaseExpectation::GlobalDeclResidual
         | LuaCaseExpectation::TableSetListResidual
+        | LuaCaseExpectation::LuauSelfValueCaptureCarrier { .. }
         | LuaCaseExpectation::UnsupportedIsland { .. } => {}
     }
 
     let proto_count = count_output_tags(&baseline.source_output.stdout);
     Ok(TestSuccess { proto_count })
+}
+
+fn run_global_decl_residual_contract(
+    suite: UnitSuite,
+    entry: &LuaCaseManifestEntry,
+) -> Result<TestSuccess, TestFailure> {
+    use unluac::hir::HirStmt;
+
+    let baseline = build_case_baseline(entry, suite.label()).map_err(|failure| {
+        TestFailure::new(
+            FailureKind::BaselineFailed,
+            format!("baseline failed first: {}", failure.summary()),
+            format!("baseline failed first\n{}", failure.detail()),
+        )
+    })?;
+    let chunk = compile_manifest_case(entry);
+
+    let mut hir_options = decompile_options(entry);
+    hir_options.target_stage = DecompileStage::Hir;
+    hir_options.generate.mode = GenerateMode::Permissive;
+    let hir_result = decompile(&chunk, hir_options).map_err(|error| {
+        global_decl_residual_contract_failure(entry, format!("HIR lowering failed: {error}"))
+    })?;
+    let module = hir_result.state.hir.ok_or_else(|| {
+        global_decl_residual_contract_failure(entry, "HIR lowering returned no module")
+    })?;
+    let root = module.protos.get(module.entry.index()).ok_or_else(|| {
+        global_decl_residual_contract_failure(entry, "HIR entry references a missing proto")
+    })?;
+    if root
+        .body
+        .stmts
+        .iter()
+        .any(|stmt| matches!(stmt, HirStmt::GlobalDecl(_)))
+    {
+        return Err(global_decl_residual_contract_failure(
+            entry,
+            "mixed RHS was partially claimed as a global declaration",
+        ));
+    }
+
+    let mut strict_options = decompile_options(entry);
+    strict_options.generate.mode = GenerateMode::Strict;
+    match decompile(&chunk, strict_options) {
+        Err(DecompileError::Ast(AstLowerError::InvalidGlobalDeclPattern { proto: 0 })) => {}
+        Err(error) => {
+            return Err(global_decl_residual_contract_failure(
+                entry,
+                format!("strict mode returned the wrong error: {error}"),
+            ));
+        }
+        Ok(_) => {
+            return Err(global_decl_residual_contract_failure(
+                entry,
+                "strict mode accepted a partially recoverable global declaration",
+            ));
+        }
+    }
+
+    let mut permissive_options = decompile_options(entry);
+    permissive_options.generate.mode = GenerateMode::Permissive;
+    let permissive = decompile(&chunk, permissive_options).map_err(|error| {
+        global_decl_residual_contract_failure(
+            entry,
+            format!("permissive mode rejected mixed global declaration: {error}"),
+        )
+    })?;
+    let generated = permissive.state.generated.as_ref().ok_or_else(|| {
+        global_decl_residual_contract_failure(entry, "permissive mode returned no generated chunk")
+    })?;
+    if generated.kind != GeneratedChunkKind::DiagnosticPseudocode
+        || !generated.source.contains("err-nnil")
+    {
+        return Err(global_decl_residual_contract_failure(
+            entry,
+            format!(
+                "permissive mode lost the global declaration diagnostic: kind={:?}\n{}",
+                generated.kind, generated.source
+            ),
+        ));
+    }
+    let assertions = read_readability_assertions(entry.path)?;
+    assert_readability("permissive", &generated.source, &assertions, false)?;
+
+    Ok(TestSuccess {
+        proto_count: count_output_tags(&baseline.source_output.stdout),
+    })
+}
+
+fn global_decl_residual_contract_failure(
+    entry: &LuaCaseManifestEntry,
+    detail: impl Into<String>,
+) -> TestFailure {
+    TestFailure::new(
+        FailureKind::ResidualContractAssertionFailed,
+        "global declaration residual contract failed",
+        format!(
+            "global declaration residual contract failed for {}: {}",
+            entry.path,
+            detail.into()
+        ),
+    )
 }
 
 fn run_proto_failure_recovery_contract(

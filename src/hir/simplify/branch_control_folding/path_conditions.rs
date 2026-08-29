@@ -3,21 +3,28 @@
 //! 本模块只服务 branch-control：它依赖已经结构化的 HIR block，并预先证明 Param/Local
 //! 在整个 proto 内没有写入、for binder 或 ByReference capture，随后沿真实 fallthrough
 //! 传播真假事实。事实只改写 `not/and/or` 条件骨架，不进入值表达式，也不把 truthy 原值
-//! 替换成布尔结果。
+//! 替换成布尔结果。proto 若仍有活跃 goto/label 流，则只分析与它隔离的结构化子树与
+//! 连续 clean fallthrough run；clean `If` arm 及其 tainted child 前缀可继承唯一入口的
+//! header truthiness，遇到活跃 label/goto 后立即清空，出口事实也不会泄漏回污染父级。
 //!
 //! 例如 `if flag then break end; if flag then body end` 可删除第二个分支；若 flag 可能被
-//! 赋值、闭包回写，或控制流仍含 goto/label，则整个规则保守停用。
+//! 赋值、闭包回写则仍保守停用。被引用 label 与任意 goto 会污染所在结构化祖先，未引用
+//! label 不影响词法 fallthrough 证明。
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
     HirBlock, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, HirUnaryOpKind, LocalId, ParamId,
 };
+use crate::hir::expr_safety::HirExprSafety;
 
 use super::super::expr_facts::expr_truthiness;
-use super::super::logical_simplify::{simplify_condition_truthiness_shape, simplify_logical_shape};
+use super::super::logical_simplify::{
+    simplify_condition_truthiness_shape_with_safety, simplify_logical_shape_with_safety,
+};
 use super::super::mention::stmts_reference_captured_bindings;
 use super::super::visit::{HirVisitor, visit_proto};
+use super::DiscardBoundaryFacts;
 
 const MAX_TRACKED_BINDINGS: usize = 256;
 
@@ -68,17 +75,19 @@ impl PathFacts {
     }
 }
 
-#[derive(Default)]
 struct StableBindingIndex {
     candidates: BTreeSet<StableBinding>,
     unstable: BTreeSet<StableBinding>,
-    candidate_budget_exceeded: bool,
-    has_label_or_goto: bool,
+    safety: HirExprSafety,
 }
 
 impl StableBindingIndex {
-    fn new(proto: &HirProto) -> Self {
-        let mut index = Self::default();
+    fn new(proto: &HirProto, safety: HirExprSafety) -> Self {
+        let mut index = Self {
+            candidates: BTreeSet::new(),
+            unstable: BTreeSet::new(),
+            safety,
+        };
         visit_proto(proto, &mut index);
 
         let captured = stmts_reference_captured_bindings(&proto.body.stmts);
@@ -99,7 +108,9 @@ impl StableBindingIndex {
         if let Some(binding) = stable_binding(expr) {
             if self.candidates.len() == MAX_TRACKED_BINDINGS && !self.candidates.contains(&binding)
             {
-                self.candidate_budget_exceeded = true;
+                // 候选搜索裁剪[ResourceLimit]：超过 256 个独立 binding 时只跳过该 binding，
+                // 保留已有候选的路径事实，避免无关条件让整个 proto 停止专门化。
+                self.unstable.insert(binding);
             } else {
                 self.candidates.insert(binding);
             }
@@ -138,7 +149,6 @@ impl HirVisitor for StableBindingIndex {
                         .map(StableBinding::Local),
                 );
             }
-            HirStmt::Goto(_) | HirStmt::Label(_) => self.has_label_or_goto = true,
             _ => {}
         }
     }
@@ -161,21 +171,120 @@ struct Flow {
     falls_through: bool,
 }
 
-pub(super) fn specialize_stable_path_conditions(proto: &mut HirProto) -> bool {
-    let stable = StableBindingIndex::new(proto);
-    if stable.has_label_or_goto || stable.candidate_budget_exceeded {
-        return false;
-    }
-
+pub(super) fn specialize_stable_path_conditions(
+    proto: &mut HirProto,
+    discard_facts: &DiscardBoundaryFacts,
+    safety: HirExprSafety,
+) -> bool {
+    let stable = StableBindingIndex::new(proto, safety);
     let mut changed = false;
-    rewrite_block(&mut proto.body, PathFacts::default(), &stable, &mut changed);
+    if discard_facts
+        .block_boundary(&proto.body)
+        .has_live_label_flow()
+    {
+        rewrite_clean_islands_in_tainted_block(
+            &mut proto.body,
+            PathFacts::default(),
+            &stable,
+            discard_facts,
+            &mut changed,
+        );
+    } else {
+        rewrite_block(
+            &mut proto.body,
+            PathFacts::default(),
+            &stable,
+            discard_facts,
+            &mut changed,
+        );
+    }
     changed
+}
+
+fn rewrite_clean_islands_in_tainted_block(
+    block: &mut HirBlock,
+    entry_facts: PathFacts,
+    stable: &StableBindingIndex,
+    discard_facts: &DiscardBoundaryFacts,
+    changed: &mut bool,
+) {
+    let mut run_facts = Some(entry_facts);
+    for stmt in &mut block.stmts {
+        if !discard_facts.stmt_boundary(stmt).has_live_label_flow() {
+            let run_is_reachable = run_facts.is_some();
+            let flow = rewrite_stmt(
+                stmt,
+                run_facts.take().unwrap_or_default(),
+                stable,
+                discard_facts,
+                changed,
+            );
+            run_facts = (run_is_reachable && flow.falls_through).then_some(flow.facts);
+            continue;
+        }
+
+        // 分析停用[ProofIncomplete]：活跃 label graph 缺少 predecessor facts 合流；clean `If` arm 由唯一结构化入口单独消费 header facts，含 label/goto 的子图仍从空事实递归（regress_374）。
+        rewrite_clean_child_blocks(stmt, stable, discard_facts, changed);
+        run_facts = Some(PathFacts::default());
+    }
+}
+
+fn rewrite_clean_child_blocks(
+    stmt: &mut HirStmt,
+    stable: &StableBindingIndex,
+    discard_facts: &DiscardBoundaryFacts,
+    changed: &mut bool,
+) {
+    let mut rewrite_child = |block: &mut HirBlock, facts: PathFacts| {
+        if discard_facts.block_boundary(block).has_live_label_flow() {
+            rewrite_clean_islands_in_tainted_block(block, facts, stable, discard_facts, changed);
+        } else {
+            let _ = rewrite_block(block, facts, stable, discard_facts, changed);
+        }
+    };
+
+    match stmt {
+        HirStmt::If(if_stmt) => {
+            let empty = PathFacts::default();
+            let then_facts = facts_for_condition(&empty, &if_stmt.cond, true, stable)
+                .unwrap_or_else(|| empty.clone());
+            let else_facts = facts_for_condition(&empty, &if_stmt.cond, false, stable)
+                .unwrap_or_else(|| empty.clone());
+            rewrite_child(&mut if_stmt.then_block, then_facts);
+            if let Some(else_block) = &mut if_stmt.else_block {
+                rewrite_child(else_block, else_facts);
+            }
+        }
+        HirStmt::While(while_stmt) => rewrite_child(&mut while_stmt.body, PathFacts::default()),
+        HirStmt::Repeat(repeat_stmt) => rewrite_child(&mut repeat_stmt.body, PathFacts::default()),
+        HirStmt::NumericFor(numeric_for) => {
+            rewrite_child(&mut numeric_for.body, PathFacts::default());
+        }
+        HirStmt::GenericFor(generic_for) => {
+            rewrite_child(&mut generic_for.body, PathFacts::default());
+        }
+        HirStmt::Block(block) => rewrite_child(block, PathFacts::default()),
+        HirStmt::LocalDecl(_)
+        | HirStmt::GlobalDecl(_)
+        | HirStmt::Assign(_)
+        | HirStmt::TableSetList(_)
+        | HirStmt::Return(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::CallStmt(_) => {}
+    }
 }
 
 fn rewrite_block(
     block: &mut HirBlock,
     mut facts: PathFacts,
     stable: &StableBindingIndex,
+    discard_facts: &DiscardBoundaryFacts,
     changed: &mut bool,
 ) -> Flow {
     let mut scoped_locals = Vec::new();
@@ -186,7 +295,7 @@ fn rewrite_block(
         if let HirStmt::LocalDecl(local_decl) = stmt {
             scoped_locals.extend(local_decl.bindings.iter().copied());
         }
-        let flow = rewrite_stmt(stmt, facts, stable, changed);
+        let flow = rewrite_stmt(stmt, facts, stable, discard_facts, changed);
         facts = flow.facts;
         falls_through = flow.falls_through;
         if !falls_through {
@@ -195,8 +304,17 @@ fn rewrite_block(
         }
     }
     if retained_len != block.stmts.len() {
-        block.stmts.truncate(retained_len);
-        *changed = true;
+        let boundary = discard_facts.stmts_boundary(&block.stmts[retained_len..]);
+        if boundary.has_control_entry() {
+            // 候选拒绝[SemanticBarrier:ControlFlow]：全局 label 引用数大于尾部内部引用数，如前缀 `goto L` 指向被截尾的 `::L::`；删除尾部会丢失确定入边。
+        } else if boundary.has_identity() {
+            // 候选拒绝[PolicyBoundary]：尾部 debug/PhysicalRoot/TBC 身份按源码证据策略保留（regress339 retain-debug）。
+        } else if boundary.has_diagnostic() {
+            // 候选拒绝[LayerBoundary]：ErrNil/Unresolved 显式诊断由其 owner 保留，路径专门化不吞掉该尾部（regress339 Lua 5.5 ERRNNIL）。
+        } else {
+            block.stmts.truncate(retained_len);
+            *changed = true;
+        }
     }
 
     for local in scoped_locals {
@@ -212,6 +330,7 @@ fn rewrite_stmt(
     stmt: &mut HirStmt,
     mut facts: PathFacts,
     stable: &StableBindingIndex,
+    discard_facts: &DiscardBoundaryFacts,
     changed: &mut bool,
 ) -> Flow {
     match stmt {
@@ -220,7 +339,7 @@ fn rewrite_stmt(
         }
         HirStmt::If(if_stmt) => {
             *changed |= specialize_condition(&mut if_stmt.cond, &facts, stable);
-            let condition_truthiness = expr_truthiness(&if_stmt.cond);
+            let condition_truthiness = expr_truthiness(&if_stmt.cond, stable.safety);
             let then_facts = facts_for_condition(&facts, &if_stmt.cond, true, stable);
             let else_facts = facts_for_condition(&facts, &if_stmt.cond, false, stable);
             let then_reachable = condition_truthiness != Some(false) && then_facts.is_some();
@@ -230,6 +349,7 @@ fn rewrite_stmt(
                 &mut if_stmt.then_block,
                 then_facts.unwrap_or_else(|| facts.clone()),
                 stable,
+                discard_facts,
                 changed,
             );
             let else_flow = if_stmt.else_block.as_mut().map(|else_block| {
@@ -237,6 +357,7 @@ fn rewrite_stmt(
                     else_block,
                     else_facts.clone().unwrap_or_else(|| facts.clone()),
                     stable,
+                    discard_facts,
                     changed,
                 )
             });
@@ -266,19 +387,45 @@ fn rewrite_stmt(
             *changed |= specialize_condition(&mut while_stmt.cond, &facts, stable);
             let body_facts = facts_for_condition(&facts, &while_stmt.cond, true, stable)
                 .unwrap_or_else(|| facts.clone());
-            rewrite_block(&mut while_stmt.body, body_facts, stable, changed);
+            rewrite_block(
+                &mut while_stmt.body,
+                body_facts,
+                stable,
+                discard_facts,
+                changed,
+            );
         }
         HirStmt::Repeat(repeat_stmt) => {
-            rewrite_block(&mut repeat_stmt.body, facts.clone(), stable, changed);
+            rewrite_block(
+                &mut repeat_stmt.body,
+                facts.clone(),
+                stable,
+                discard_facts,
+                changed,
+            );
             *changed |= specialize_condition(&mut repeat_stmt.cond, &facts, stable);
         }
         HirStmt::NumericFor(numeric_for) => {
-            rewrite_block(&mut numeric_for.body, facts.clone(), stable, changed);
+            rewrite_block(
+                &mut numeric_for.body,
+                facts.clone(),
+                stable,
+                discard_facts,
+                changed,
+            );
         }
         HirStmt::GenericFor(generic_for) => {
-            rewrite_block(&mut generic_for.body, facts.clone(), stable, changed);
+            rewrite_block(
+                &mut generic_for.body,
+                facts.clone(),
+                stable,
+                discard_facts,
+                changed,
+            );
         }
-        HirStmt::Block(block) => return rewrite_block(block, facts, stable, changed),
+        HirStmt::Block(block) => {
+            return rewrite_block(block, facts, stable, discard_facts, changed);
+        }
         HirStmt::Return(_) | HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) => {
             return Flow {
                 facts,
@@ -286,6 +433,7 @@ fn rewrite_stmt(
             };
         }
         HirStmt::Assign(_)
+        | HirStmt::GlobalDecl(_)
         | HirStmt::TableSetList(_)
         | HirStmt::ErrNil(_)
         | HirStmt::ToBeClosed(_)
@@ -317,7 +465,7 @@ fn record_local_declaration(
     };
     let binding = StableBinding::Local(*local);
     if stable.contains(binding)
-        && let Some(truthy) = expr_truthiness(value)
+        && let Some(truthy) = expr_truthiness(value, stable.safety)
     {
         let inserted = facts.insert(binding, truthy);
         debug_assert!(
@@ -351,8 +499,8 @@ fn specialize_condition(
         _ => false,
     };
     loop {
-        let replacement =
-            simplify_logical_shape(expr).or_else(|| simplify_condition_truthiness_shape(expr));
+        let replacement = simplify_logical_shape_with_safety(expr, stable.safety)
+            .or_else(|| simplify_condition_truthiness_shape_with_safety(expr, stable.safety));
         let Some(replacement) = replacement.filter(|replacement| replacement != expr) else {
             break;
         };
@@ -378,7 +526,7 @@ fn extend_condition_facts(
     truthy: bool,
     stable: &StableBindingIndex,
 ) -> bool {
-    if let Some(known) = expr_truthiness(expr) {
+    if let Some(known) = expr_truthiness(expr, stable.safety) {
         return known == truthy;
     }
 
@@ -399,5 +547,30 @@ fn extend_condition_facts(
                 && extend_condition_facts(facts, &logical.rhs, false, stable)
         }
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_TRACKED_BINDINGS, StableBinding, StableBindingIndex};
+    use crate::decompile::DecompileDialect;
+    use crate::hir::common::{HirExpr, ParamId};
+    use crate::hir::expr_safety::HirExprSafety;
+
+    #[test]
+    fn condition_budget_prunes_only_new_bindings() {
+        let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
+        let mut index = StableBindingIndex {
+            candidates: Default::default(),
+            unstable: Default::default(),
+            safety,
+        };
+        for param in 0..=MAX_TRACKED_BINDINGS {
+            index.track_condition(&HirExpr::ParamRef(ParamId(param)));
+        }
+
+        assert_eq!(index.candidates.len(), MAX_TRACKED_BINDINGS);
+        assert!(index.contains(StableBinding::Param(ParamId(0))));
+        assert!(!index.contains(StableBinding::Param(ParamId(MAX_TRACKED_BINDINGS))));
     }
 }

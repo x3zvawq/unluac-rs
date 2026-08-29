@@ -2,7 +2,8 @@
 //!
 //! 它依赖前面已经规范化的 HIR decision 表达式，只表达“候选式子在抽象环境里代表什么”，
 //! 不会在这里决定哪一种源码形状更可读。
-//! 例如：`temp == nil` 会在这里被解释成可枚举的抽象真假环境。
+//! 例如：`temp == nil` 会在这里被解释成可枚举的抽象真假环境；整数与浮点数的判等
+//! 则按 Lua 数值语义计算，而不是按抽象值枚举项的 Rust 身份计算。
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,6 +13,7 @@ use crate::hir::common::{
     HirBinaryOpKind, HirDecisionExpr, HirDecisionNodeRef, HirDecisionTarget, HirExpr, LocalId,
     ParamId, TempId, UpvalueId,
 };
+use crate::hir::expr_safety::HirExprSafety;
 
 use super::EXTRA_TRUTHY_SYMBOLS;
 use super::cost::is_truthy;
@@ -47,6 +49,7 @@ pub(super) enum AbstractValue {
 fn abstract_value_partial_cmp(
     lhs: &AbstractValue,
     rhs: &AbstractValue,
+    safety: HirExprSafety,
 ) -> Option<std::cmp::Ordering> {
     match (lhs, rhs) {
         (AbstractValue::Integer(a), AbstractValue::Integer(b)) => Some(a.cmp(b)),
@@ -54,16 +57,42 @@ fn abstract_value_partial_cmp(
             f64::from_bits(*a).partial_cmp(&f64::from_bits(*b))
         }
         (AbstractValue::Integer(a), AbstractValue::Number(b)) => {
-            (*a as f64).partial_cmp(&f64::from_bits(*b))
+            safety.mixed_integer_number_ordering(*a, f64::from_bits(*b))
         }
-        (AbstractValue::Number(a), AbstractValue::Integer(b)) => {
-            f64::from_bits(*a).partial_cmp(&(*b as f64))
+        (AbstractValue::Number(a), AbstractValue::Integer(b)) => safety
+            .mixed_integer_number_ordering(*b, f64::from_bits(*a))
+            .map(|o| o.reverse()),
+        (AbstractValue::String(a), AbstractValue::String(b)) => {
+            // 候选拒绝[SemanticBarrier:Locale]：PUC Lua 的字符串顺序依赖运行时 `LC_COLLATE`，抽象域不能用固定字节序验证候选。
+            safety.literal_string_order_is_binary().then(|| a.cmp(b))
         }
-        (AbstractValue::String(a), AbstractValue::String(b)) => Some(a.cmp(b)),
         (AbstractValue::Int64(a), AbstractValue::Int64(b)) => Some(a.cmp(b)),
         (AbstractValue::UInt64(a), AbstractValue::UInt64(b)) => Some(a.cmp(b)),
+        // 模型边界：TruthySymbol 的全序不是 Lua 语义；当前 repeatable 安全门会拒绝两个非字面量的顺序比较。
         (AbstractValue::TruthySymbol(a), AbstractValue::TruthySymbol(b)) => Some(a.cmp(b)),
         _ => None,
+    }
+}
+
+/// 模拟 Lua `==` 对抽象值的原始判等语义。
+///
+/// 结果值等价性仍需区分 Integer/Number，因为 Lua 5.3+ 的 `math.type` 能观察表示；只有
+/// `==` 运算本身会在整数与浮点数之间做精确数值比较。浮点同类比较直接使用 IEEE 754
+/// `==`，从而让正负零相等、NaN 与任何值（包括自身）都不相等。
+fn abstract_value_eq(
+    lhs: &AbstractValue,
+    rhs: &AbstractValue,
+    safety: HirExprSafety,
+) -> Option<bool> {
+    match (lhs, rhs) {
+        (AbstractValue::Number(lhs), AbstractValue::Number(rhs)) => {
+            Some(f64::from_bits(*lhs) == f64::from_bits(*rhs))
+        }
+        (AbstractValue::Integer(integer), AbstractValue::Number(number))
+        | (AbstractValue::Number(number), AbstractValue::Integer(integer)) => {
+            safety.mixed_integer_number_equal(*integer, f64::from_bits(*number))
+        }
+        _ => Some(lhs == rhs),
     }
 }
 
@@ -72,10 +101,15 @@ pub(super) struct SynthesisContext<'a> {
     pub(super) decision: &'a HirDecisionExpr,
     pub(super) ref_positions: Cow<'a, BTreeMap<RefKey, usize>>,
     pub(super) environments: Cow<'a, [Vec<AbstractValue>]>,
+    safety: HirExprSafety,
 }
 
 impl<'a> SynthesisContext<'a> {
-    pub(super) fn new(decision: &'a HirDecisionExpr, refs: Vec<RefKey>) -> Option<Self> {
+    pub(super) fn new(
+        decision: &'a HirDecisionExpr,
+        refs: Vec<RefKey>,
+        safety: HirExprSafety,
+    ) -> Option<Self> {
         let ref_positions = refs
             .iter()
             .enumerate()
@@ -87,6 +121,7 @@ impl<'a> SynthesisContext<'a> {
             decision,
             ref_positions: Cow::Owned(ref_positions),
             environments: Cow::Owned(environments),
+            safety,
         })
     }
 
@@ -119,7 +154,7 @@ impl<'a> SynthesisContext<'a> {
     }
 
     pub(super) fn eval_expr(&self, expr: &HirExpr, env: &[AbstractValue]) -> Option<AbstractValue> {
-        eval_pure_expr(expr, env, &self.ref_positions)
+        eval_pure_expr(expr, env, &self.ref_positions, self.safety)
     }
 }
 
@@ -127,6 +162,7 @@ pub(super) fn eval_pure_expr(
     expr: &HirExpr,
     env: &[AbstractValue],
     ref_positions: &BTreeMap<RefKey, usize>,
+    safety: HirExprSafety,
 ) -> Option<AbstractValue> {
     match expr {
         HirExpr::Nil => Some(AbstractValue::Nil),
@@ -153,7 +189,7 @@ pub(super) fn eval_pure_expr(
             .cloned(),
         HirExpr::TempRef(temp) => env.get(*ref_positions.get(&RefKey::Temp(*temp))?).cloned(),
         HirExpr::Unary(unary) if unary.op == crate::hir::common::HirUnaryOpKind::Not => {
-            let value = eval_pure_expr(&unary.expr, env, ref_positions)?;
+            let value = eval_pure_expr(&unary.expr, env, ref_positions, safety)?;
             Some(if is_truthy(&value) {
                 AbstractValue::False
             } else {
@@ -161,9 +197,9 @@ pub(super) fn eval_pure_expr(
             })
         }
         HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Eq => {
-            let lhs = eval_pure_expr(&binary.lhs, env, ref_positions)?;
-            let rhs = eval_pure_expr(&binary.rhs, env, ref_positions)?;
-            Some(if lhs == rhs {
+            let lhs = eval_pure_expr(&binary.lhs, env, ref_positions, safety)?;
+            let rhs = eval_pure_expr(&binary.rhs, env, ref_positions, safety)?;
+            Some(if abstract_value_eq(&lhs, &rhs, safety)? {
                 AbstractValue::True
             } else {
                 AbstractValue::False
@@ -172,9 +208,9 @@ pub(super) fn eval_pure_expr(
         HirExpr::Binary(binary)
             if matches!(binary.op, HirBinaryOpKind::Lt | HirBinaryOpKind::Le) =>
         {
-            let lhs = eval_pure_expr(&binary.lhs, env, ref_positions)?;
-            let rhs = eval_pure_expr(&binary.rhs, env, ref_positions)?;
-            let ordering = abstract_value_partial_cmp(&lhs, &rhs)?;
+            let lhs = eval_pure_expr(&binary.lhs, env, ref_positions, safety)?;
+            let rhs = eval_pure_expr(&binary.rhs, env, ref_positions, safety)?;
+            let ordering = abstract_value_partial_cmp(&lhs, &rhs, safety)?;
             let result = match binary.op {
                 HirBinaryOpKind::Lt => ordering == std::cmp::Ordering::Less,
                 HirBinaryOpKind::Le => ordering != std::cmp::Ordering::Greater,
@@ -187,19 +223,19 @@ pub(super) fn eval_pure_expr(
             })
         }
         HirExpr::LogicalAnd(logical) => {
-            let lhs = eval_pure_expr(&logical.lhs, env, ref_positions)?;
+            let lhs = eval_pure_expr(&logical.lhs, env, ref_positions, safety)?;
             if is_truthy(&lhs) {
-                eval_pure_expr(&logical.rhs, env, ref_positions)
+                eval_pure_expr(&logical.rhs, env, ref_positions, safety)
             } else {
                 Some(lhs)
             }
         }
         HirExpr::LogicalOr(logical) => {
-            let lhs = eval_pure_expr(&logical.lhs, env, ref_positions)?;
+            let lhs = eval_pure_expr(&logical.lhs, env, ref_positions, safety)?;
             if is_truthy(&lhs) {
                 Some(lhs)
             } else {
-                eval_pure_expr(&logical.rhs, env, ref_positions)
+                eval_pure_expr(&logical.rhs, env, ref_positions, safety)
             }
         }
         HirExpr::Decision(_)
@@ -220,9 +256,13 @@ pub(super) fn validate_pure_expr_equivalence(
     rhs: &HirExpr,
     environments: &[Vec<AbstractValue>],
     ref_positions: &BTreeMap<RefKey, usize>,
+    safety: HirExprSafety,
 ) -> bool {
     environments.iter().all(|env| {
-        eval_pure_expr(lhs, env, ref_positions) == eval_pure_expr(rhs, env, ref_positions)
+        let lhs = eval_pure_expr(lhs, env, ref_positions, safety);
+        let rhs = eval_pure_expr(rhs, env, ref_positions, safety);
+        // 候选拒绝[ProofIncomplete]：抽象解释任一侧未知时没有等价证明，`None == None` 不能作为接受依据。
+        matches!((lhs, rhs), (Some(lhs), Some(rhs)) if lhs == rhs)
     })
 }
 
@@ -335,7 +375,11 @@ pub(super) fn enumerate_environments(
     ref_count: usize,
     domain: &[AbstractValue],
 ) -> Option<Vec<Vec<AbstractValue>>> {
-    let total = domain.len().checked_pow(ref_count as u32)?;
+    // 候选拒绝[ResourceLimit]：环境数溢出 usize 时无法分配穷举表；后续应改用符号验证。
+    // u32 是 checked_pow 的指数类型；超出它时直接拒绝，不能截断成较小指数。
+    let exponent = u32::try_from(ref_count).ok()?;
+    let total = domain.len().checked_pow(exponent)?;
+    // 候选拒绝[ResourceLimit]：完整环境枚举上限为 4096；后续应改用符号验证或按依赖分区。
     if total > 4096 {
         return None;
     }
@@ -393,5 +437,34 @@ fn enumerate_envs_recursive(
         current.push(value.clone());
         enumerate_envs_recursive(remaining - 1, domain, current, out);
         current.pop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AbstractValue, enumerate_environments};
+
+    #[test]
+    fn environment_cap_allows_five_base_domain_references() {
+        let domain = [
+            AbstractValue::Nil,
+            AbstractValue::False,
+            AbstractValue::True,
+            AbstractValue::TruthySymbol(0),
+            AbstractValue::TruthySymbol(1),
+        ];
+        assert_eq!(
+            enumerate_environments(5, &domain).map(|envs| envs.len()),
+            Some(3125)
+        );
+        assert!(enumerate_environments(6, &domain).is_none());
+    }
+
+    #[test]
+    fn environment_exponent_does_not_truncate() {
+        let Some(ref_count) = usize::try_from(u64::from(u32::MAX) + 1).ok() else {
+            return;
+        };
+        assert!(enumerate_environments(ref_count, &[AbstractValue::Nil]).is_none());
     }
 }

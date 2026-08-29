@@ -10,8 +10,12 @@
 //! 先证明 seed 在后续不再可观察、temp 不被外层作用域消费，并且写回形状可证明。
 //! captured local 也不能作为纯 alias handoff 的来源：闭包调用可能在后缀没有显式提及
 //! 该 local 时写回它，跨过这类调用消除快照会改变后续读值。
-//! 所有 owner 还共享 proto 级 capture/TBC 身份门：direct 资源 binding 与其 raw home
-//! may-alias 都不得成为改写两端，避免先改坏 closure cell/close 身份再靠 provenance 兜底。
+//! 所有 owner 还共享 proto 级 source/capture/resource 身份门：debug、for、physical-root、
+//! direct capture/TBC binding 与其 raw home may-alias 都不得成为改写两端，避免先改坏
+//! source identity、closure cell 或 root/close 生命周期再靠 provenance 兜底。
+//! 唯一例外是 proven internal loop-carrier temp mirror：它先在 `prune.rs` 里被要求满足
+//! no-read、non-debug、loop-carrier owner、same-exact-home write audit 之后，才会在冻结
+//! identity 前删除；源码作者可见的 for binding 身份本身仍继续受这里的保护。
 //!
 //! 例子：
 //! - 输入：`local l0 = 1; do t4 = l0; ::L1:: if t4 < 3 then t4 = t4 + 1; goto L1 end end`
@@ -33,6 +37,7 @@ mod seeds;
 use std::collections::BTreeSet;
 
 use crate::hir::common::{HirBlock, HirProto, HirStmt, LocalId};
+use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::temp_touch::{RefScopeTracker, TempTouchIndex, collect_temp_refs_by_stmt};
@@ -44,7 +49,10 @@ pub(super) use self::binding::{CarryBinding, single_binding_copy};
 use self::boundary::LabelJumpIndex;
 use self::handoffs::{HandoffAction, try_collapse_handoff_at};
 use self::loop_updates::collapse_dead_loop_update_handoffs;
-use self::prune::{prune_redundant_branch_state_copies, prune_redundant_copy_stmts};
+use self::prune::{
+    prune_dead_for_binding_temp_mirrors, prune_redundant_branch_state_copies,
+    prune_redundant_copy_stmts,
+};
 use self::reads::{collect_binding_mentions_by_stmt, collect_binding_mentions_in_expr};
 use self::region_results::{
     RegionResultIndex, collapse_inferred_if_result_chains, collapse_result_writeback_transactions,
@@ -61,21 +69,26 @@ struct HandoffSafety<'a> {
 pub(super) fn collapse_carried_local_handoffs_in_proto(
     proto: &mut HirProto,
     promotion_facts: &mut ProtoPromotionFacts,
+    expr_safety: HirExprSafety,
 ) -> bool {
-    let branch_copies_changed = prune_redundant_branch_state_copies(proto);
+    let branch_copies_changed = prune_redundant_branch_state_copies(proto, expr_safety);
     let snapshots_changed = repeat_snapshots::coalesce_repeat_terminal_snapshots(proto);
+    let dead_for_binding_mirrors_changed =
+        prune_dead_for_binding_temp_mirrors(proto, promotion_facts);
     // Both structural rewrites above can remove a materialization that would otherwise be
     // recorded as an active identity.  Freeze protection facts only after those rewrites so the
     // handoff owner never reasons over a stale binding set.
     let identity_facts = HandoffIdentityFacts::new(proto);
     branch_copies_changed
         | snapshots_changed
+        | dead_for_binding_mirrors_changed
         | collapse_handoffs_recursive(
             &mut proto.body,
             &BTreeSet::new(),
             promotion_facts,
             &identity_facts,
             &BTreeSet::new(),
+            expr_safety,
         )
 }
 
@@ -87,6 +100,7 @@ fn collapse_handoffs_recursive(
     promotion_facts: &mut ProtoPromotionFacts,
     identity_facts: &HandoffIdentityFacts,
     inherited_locals: &BTreeSet<LocalId>,
+    expr_safety: HirExprSafety,
 ) -> bool {
     let mut changed = false;
     let mut visible_locals = inherited_locals.clone();
@@ -128,6 +142,7 @@ fn collapse_handoffs_recursive(
                 promotion_facts,
                 identity_facts,
                 &child_locals,
+                expr_safety,
             );
         });
 
@@ -154,6 +169,7 @@ fn collapse_handoffs_recursive(
         promotion_facts,
         identity_facts,
         inherited_locals,
+        expr_safety,
     );
     changed |= prune_redundant_copy_stmts(block);
     changed
@@ -165,6 +181,7 @@ fn collapse_block_handoffs(
     promotion_facts: &mut ProtoPromotionFacts,
     identity_facts: &HandoffIdentityFacts,
     inherited_locals: &BTreeSet<LocalId>,
+    expr_safety: HirExprSafety,
 ) -> bool {
     let mut changed = collapse_result_writeback_transactions(
         block,
@@ -227,6 +244,7 @@ fn collapse_block_handoffs(
                     index,
                     promotion_facts,
                     identity_facts,
+                    expr_safety,
                 ) {
                     action = Some(HandoffAction::RetrySameIndex);
                     break;
@@ -269,6 +287,7 @@ fn collapse_block_handoffs(
 struct HandoffIdentityFacts {
     debug: BTreeSet<LocalId>,
     for_bindings: BTreeSet<LocalId>,
+    physical_roots: BTreeSet<LocalId>,
     captured: BTreeSet<CarryBinding>,
     reference_captured: BTreeSet<CarryBinding>,
     to_be_closed: BTreeSet<CarryBinding>,
@@ -288,6 +307,7 @@ impl HandoffIdentityFacts {
         Self {
             debug,
             for_bindings: collector.for_bindings,
+            physical_roots: proto.physical_root_locals.clone(),
             captured: collector.captured,
             reference_captured: collector.reference_captured,
             to_be_closed: collector.to_be_closed,
@@ -295,7 +315,9 @@ impl HandoffIdentityFacts {
     }
 
     fn contains(&self, local: LocalId) -> bool {
-        self.debug.contains(&local) || self.for_bindings.contains(&local)
+        self.debug.contains(&local)
+            || self.for_bindings.contains(&local)
+            || self.physical_roots.contains(&local)
     }
 
     fn binding_merge_preserves_identity(
@@ -304,9 +326,16 @@ impl HandoffIdentityFacts {
         target: CarryBinding,
         promotion_facts: &ProtoPromotionFacts,
     ) -> bool {
-        !source
-            .local()
-            .is_some_and(|local| promotion_facts.entry_nil_writes_were_pruned(local))
+        // 候选拒绝[LayerBoundary]：entry-nil provenance 已被前层裁剪时，promotion owner 无法再证明原 binding identity。
+        // 候选拒绝[PolicyBoundary]：debug/for source identity 由 proto identity owner 保留。
+        // 候选拒绝[SemanticBarrier:Lifetime]：把 physical-root result 合并到 state 会删除其 VM root declaration；lua54_01_close#17 用 __gc + collectgarbage 观察同槽清空前的对象若失去该 root 会提前析构。
+        // 候选拒绝[SemanticBarrier:Capture]：capture 任一端或 raw-home may-alias reference capture 时，closure 可区分合并前的 cell。
+        // 候选拒绝[SemanticBarrier:Lifetime]：TBC 任一端或 raw-home may-alias resource binding 时，合并会改变 close/root epoch。
+        !source.local().is_some_and(|local| self.contains(local))
+            && !target.local().is_some_and(|local| self.contains(local))
+            && !source
+                .local()
+                .is_some_and(|local| promotion_facts.entry_nil_writes_were_pruned(local))
             && !target
                 .local()
                 .is_some_and(|local| promotion_facts.entry_nil_writes_were_pruned(local))

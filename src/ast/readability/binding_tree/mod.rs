@@ -156,16 +156,6 @@ pub(super) fn stmt_has_direct_call_arg_binding_use(stmt: &AstStmt, binding: AstB
     )
 }
 
-pub(super) fn stmt_has_call_callee_binding_use(stmt: &AstStmt, binding: AstBindingRef) -> bool {
-    stmt_has_binding_use_by(
-        stmt,
-        binding,
-        |e, b| expr_has_call_callee_binding_use(e, b, false),
-        call_has_call_callee_binding_use,
-        |_, _| false,
-    )
-}
-
 pub(super) fn stmt_has_nested_binding_value_use(stmt: &AstStmt, binding: AstBindingRef) -> bool {
     stmt_has_binding_use_by(
         stmt,
@@ -336,14 +326,6 @@ fn call_parts_have_contextual_binding_use(
     }
 }
 
-fn call_has_call_callee_binding_use(call: &AstCallKind, binding: AstBindingRef) -> bool {
-    call_has_contextual_binding_use(
-        call,
-        binding,
-        BindingUseContext::CallCallee { active: false },
-    )
-}
-
 fn lvalue_has_access_base_binding_use(target: &AstLValue, binding: AstBindingRef) -> bool {
     match target {
         AstLValue::Name(_) => false,
@@ -378,7 +360,6 @@ enum BindingUseContext {
     AccessBase { active: bool },
     Index { active: bool },
     DirectCallArg,
-    CallCallee { active: bool },
     Nested { active: bool },
 }
 
@@ -386,7 +367,7 @@ impl BindingUseContext {
     fn matches_var(self) -> bool {
         match self {
             Self::AccessBase { active } | Self::Index { active } => active,
-            Self::CallCallee { active } | Self::Nested { active } => active,
+            Self::Nested { active } => active,
             Self::DirectCallArg => false,
         }
     }
@@ -395,7 +376,6 @@ impl BindingUseContext {
         match self {
             Self::AccessBase { .. } => Self::AccessBase { active: true },
             Self::Index { .. } => Self::Index { active: false },
-            Self::CallCallee { active } => Self::CallCallee { active },
             Self::Nested { .. } => Self::Nested { active: true },
             Self::DirectCallArg => Self::DirectCallArg,
         }
@@ -405,7 +385,6 @@ impl BindingUseContext {
         match self {
             Self::AccessBase { .. } => Self::AccessBase { active: true },
             Self::Index { .. } => Self::Index { active: false },
-            Self::CallCallee { active } => Self::CallCallee { active },
             Self::Nested { .. } => Self::Nested { active: true },
             Self::DirectCallArg => Self::DirectCallArg,
         }
@@ -415,7 +394,6 @@ impl BindingUseContext {
         match self {
             Self::AccessBase { .. } => Self::AccessBase { active: false },
             Self::Index { .. } => Self::Index { active: true },
-            Self::CallCallee { .. } => Self::CallCallee { active: false },
             Self::Nested { .. } => Self::Nested { active: true },
             Self::DirectCallArg => Self::DirectCallArg,
         }
@@ -425,22 +403,17 @@ impl BindingUseContext {
         match self {
             Self::AccessBase { .. } => Self::AccessBase { active: false },
             Self::Index { .. } => Self::Index { active: false },
-            Self::CallCallee { .. } => Self::CallCallee { active: false },
             Self::Nested { .. } => Self::Nested { active: true },
             Self::DirectCallArg => Self::DirectCallArg,
         }
     }
 
     fn single_value(self) -> Self {
-        match self {
-            Self::CallCallee { active } => Self::CallCallee { active },
-            other => other.nested_expr(),
-        }
+        self.nested_expr()
     }
 
     fn call_target(self) -> Self {
         match self {
-            Self::CallCallee { .. } => Self::CallCallee { active: true },
             Self::Nested { .. } => Self::Nested { active: true },
             Self::AccessBase { .. } => Self::AccessBase { active: false },
             Self::Index { .. } => Self::Index { active: false },
@@ -473,20 +446,6 @@ fn expr_has_index_binding_use(expr: &AstExpr, binding: AstBindingRef, index: boo
 
 fn expr_has_direct_call_arg_binding_use(expr: &AstExpr, binding: AstBindingRef) -> bool {
     expr_has_contextual_binding_use(expr, binding, BindingUseContext::DirectCallArg)
-}
-
-fn expr_has_call_callee_binding_use(
-    expr: &AstExpr,
-    binding: AstBindingRef,
-    callee_position: bool,
-) -> bool {
-    expr_has_contextual_binding_use(
-        expr,
-        binding,
-        BindingUseContext::CallCallee {
-            active: callee_position,
-        },
-    )
 }
 
 fn expr_has_nested_binding_use(expr: &AstExpr, binding: AstBindingRef, nested: bool) -> bool {

@@ -84,6 +84,7 @@ fn collect_goto_targets(stmt: &HirStmt, targets: &mut BTreeSet<HirLabelId>) {
         HirStmt::NumericFor(numeric_for) => collect_block_goto_targets(&numeric_for.body, targets),
         HirStmt::GenericFor(generic_for) => collect_block_goto_targets(&generic_for.body, targets),
         HirStmt::LocalDecl(_)
+        | HirStmt::GlobalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
         | HirStmt::ErrNil(_)

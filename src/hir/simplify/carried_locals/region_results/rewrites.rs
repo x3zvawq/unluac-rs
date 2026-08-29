@@ -14,9 +14,11 @@ pub(super) fn collect_break_assignments(
                     .checked_sub(1)
                     .and_then(|index| block.stmts.get(index))
                 else {
+                    // 候选拒绝[ProofIncomplete]：break 前没有紧邻 assignment 时，需路径 reaching-def 证明而非固定相邻形状。
                     return false;
                 };
                 let Some(exit) = assignment_values(assign) else {
+                    // 候选拒绝[ProofIncomplete]：复杂/open-tail break writeback 缺 value-pack 出口映射。
                     return false;
                 };
                 exits.push(exit);
@@ -40,6 +42,7 @@ pub(super) fn collect_break_assignments(
             HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_)
                 if reject_untracked_transfers =>
             {
+                // 候选拒绝[SemanticBarrier:ControlFlow]：continue/goto/label 可绕过已收集的 break writeback，出口集合不完整会提交错误 state。
                 return false;
             }
             HirStmt::While(_)
@@ -86,12 +89,15 @@ pub(super) fn infer_rewrites(
         let mut candidates = candidates.into_iter();
         let seed = candidates.next()?;
         if candidates.next().is_some() {
+            // 候选拒绝[ProofIncomplete]：不同出口指向多个 seed 时尚未构造 path-sensitive phi/decision rewrite。
             return None;
         }
         if seed == *result || !claimed.insert(seed) {
+            // 候选拒绝[ProofIncomplete]：多个 result 共享同一 seed 时需并行 identity/epoch 合并证明，当前一对一 claimed 模型无法表达。
             return None;
         }
         if require_home_slot && !bindings_share_home_slot(*result, seed, promotion_facts) {
+            // 候选拒绝[SemanticBarrier:Lifetime]：异槽或 compaction 下 result/state 是两个 GC/close 可观察 root，不能只凭值相同合并。
             return None;
         }
         rewrites.insert(*result, seed);
@@ -145,6 +151,7 @@ pub(super) fn apply_rewrites(
         },
     );
     if !rewritten {
+        // 候选拒绝[ConvergenceGuard]：inference 已从 region assignments 得到 result；apply 无命中表示分析与 rewrite visitor 契约漂移。
         return false;
     }
     rewrite_stmts(

@@ -5,12 +5,12 @@
 //! 第二套“纯表达式”分类。
 
 use crate::hir::common::{HirBinaryOpKind, HirDecisionTarget, HirExpr, HirUnaryOpKind};
-use crate::hir::expr_safety::primitive_literal_comparison_value;
+use crate::hir::expr_safety::HirExprSafety;
 
 /// 判断字面值的静态 truthiness。
 ///
 /// 返回 `Some(true/false)` 当表达式 truthiness 可在编译期确定，运行时可能为真或假时返回 `None`。
-pub(in crate::hir) fn expr_truthiness(expr: &HirExpr) -> Option<bool> {
+pub(in crate::hir) fn expr_truthiness(expr: &HirExpr, safety: HirExprSafety) -> Option<bool> {
     match expr {
         HirExpr::Nil => Some(false),
         HirExpr::Boolean(value) => Some(*value),
@@ -27,8 +27,8 @@ pub(in crate::hir) fn expr_truthiness(expr: &HirExpr) -> Option<bool> {
         // 因此只要 a 或 b 其中一个恒真，整个表达式就恒真；
         // a 恒假时结果完全取决于 b。
         HirExpr::LogicalOr(logical) => {
-            let a = expr_truthiness(&logical.lhs);
-            let b = expr_truthiness(&logical.rhs);
+            let a = expr_truthiness(&logical.lhs, safety);
+            let b = expr_truthiness(&logical.rhs, safety);
             match (a, b) {
                 (Some(true), _) | (_, Some(true)) => Some(true),
                 (Some(false), b_val) => b_val,
@@ -39,8 +39,8 @@ pub(in crate::hir) fn expr_truthiness(expr: &HirExpr) -> Option<bool> {
         // 因此只要 a 或 b 其中一个恒假，整个表达式就恒假；
         // a 恒真时结果完全取决于 b。
         HirExpr::LogicalAnd(logical) => {
-            let a = expr_truthiness(&logical.lhs);
-            let b = expr_truthiness(&logical.rhs);
+            let a = expr_truthiness(&logical.lhs, safety);
+            let b = expr_truthiness(&logical.rhs, safety);
             match (a, b) {
                 (Some(false), _) | (_, Some(false)) => Some(false),
                 (Some(true), b_val) => b_val,
@@ -48,10 +48,10 @@ pub(in crate::hir) fn expr_truthiness(expr: &HirExpr) -> Option<bool> {
             }
         }
         HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
-            expr_truthiness(&unary.expr).map(|truthy| !truthy)
+            expr_truthiness(&unary.expr, safety).map(|truthy| !truthy)
         }
         HirExpr::Binary(binary) => {
-            primitive_literal_comparison_value(binary.op, &binary.lhs, &binary.rhs)
+            safety.primitive_literal_comparison_value(binary.op, &binary.lhs, &binary.rhs)
         }
         HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)

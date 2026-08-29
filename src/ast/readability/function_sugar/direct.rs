@@ -4,36 +4,25 @@
 //! `function ... end` 形式，不会处理转发壳或 method alias。
 //! 例如：`local f = function() end` 会在这里变成 `local function f() end`。
 
-use std::collections::BTreeSet;
-
-use super::super::binding_ref::binding_from_name_ref;
-use super::analysis::function_uses_global_name;
 use crate::ast::common::{
-    AstAssign, AstBindingRef, AstExpr, AstFunctionDecl, AstFunctionExpr, AstFunctionName,
-    AstGlobalBindingTarget, AstGlobalDecl, AstLValue, AstLocalAttr, AstLocalDecl,
-    AstLocalFunctionDecl, AstNamePath, AstNameRef, AstStmt, AstTargetDialect,
+    AstAssign, AstExpr, AstFunctionDecl, AstFunctionExpr, AstFunctionName, AstGlobalBindingTarget,
+    AstGlobalDecl, AstLValue, AstLocalAttr, AstLocalDecl, AstLocalFunctionDecl, AstNamePath,
+    AstNameRef, AstStmt, AstTargetDialect,
 };
 
 pub(super) fn lower_direct_function_stmt(
     stmt: &AstStmt,
     target: AstTargetDialect,
-    method_fields: &BTreeSet<String>,
-    blocked_bindings: &BTreeSet<AstBindingRef>,
 ) -> Option<AstStmt> {
     match stmt {
-        AstStmt::LocalDecl(local_decl) => {
-            try_lower_local_function_decl(local_decl, blocked_bindings)
-        }
+        AstStmt::LocalDecl(local_decl) => try_lower_local_function_decl(local_decl),
         AstStmt::GlobalDecl(global_decl) => try_lower_global_function_decl(global_decl, target),
-        AstStmt::Assign(assign) => try_lower_function_assign(assign, method_fields),
+        AstStmt::Assign(assign) => try_lower_function_assign(assign, target),
         _ => None,
     }
 }
 
-fn try_lower_local_function_decl(
-    local_decl: &AstLocalDecl,
-    blocked_bindings: &BTreeSet<AstBindingRef>,
-) -> Option<AstStmt> {
+fn try_lower_local_function_decl(local_decl: &AstLocalDecl) -> Option<AstStmt> {
     if local_decl.bindings.len() != 1 || local_decl.values.len() != 1 {
         return None;
     }
@@ -41,24 +30,13 @@ fn try_lower_local_function_decl(
     if binding.attr != AstLocalAttr::None {
         return None;
     }
-    let name = match binding.id {
-        AstBindingRef::Local(name) => AstBindingRef::Local(name),
-        AstBindingRef::SyntheticLocal(name) => AstBindingRef::SyntheticLocal(name),
-        crate::ast::common::AstBindingRef::Temp(_) => {
-            return None;
-        }
-    };
+    let name = binding.id;
     let AstExpr::FunctionExpr(func) = &local_decl.values[0] else {
         return None;
     };
-    // 互递归/前向声明模式：如果当前 binding 在 blocked_bindings 中（由
-    // collect_forward_capture_blocked 计算），说明它参与了一个互递归前向声明组，
-    // 不能使用 `local function` 语法。必须保持 `local X = function() end` 形式。
-    if blocked_bindings.contains(&name) {
-        return None;
-    }
     Some(AstStmt::LocalFunctionDecl(Box::new(AstLocalFunctionDecl {
         name,
+        origin: binding.origin,
         func: func.as_ref().clone(),
     })))
 }
@@ -89,17 +67,14 @@ fn try_lower_global_function_decl(
     })))
 }
 
-fn try_lower_function_assign(
-    assign: &AstAssign,
-    method_fields: &BTreeSet<String>,
-) -> Option<AstStmt> {
+fn try_lower_function_assign(assign: &AstAssign, target: AstTargetDialect) -> Option<AstStmt> {
     if assign.targets.len() != 1 || assign.values.len() != 1 {
         return None;
     }
     let AstExpr::FunctionExpr(func) = &assign.values[0] else {
         return None;
     };
-    let (target, func) = function_decl_target_from_lvalue(&assign.targets[0], func, method_fields)?;
+    let (target, func) = function_decl_target_from_lvalue(&assign.targets[0], func, target)?;
     Some(AstStmt::FunctionDecl(Box::new(AstFunctionDecl {
         target,
         func,
@@ -109,29 +84,27 @@ fn try_lower_function_assign(
 pub(super) fn function_decl_target_from_lvalue(
     target: &AstLValue,
     func: &AstFunctionExpr,
-    method_fields: &BTreeSet<String>,
+    dialect: AstTargetDialect,
 ) -> Option<(AstFunctionName, AstFunctionExpr)> {
     match target {
-        AstLValue::Name(AstNameRef::Global(global)) => Some((
-            AstFunctionName::Plain(AstNamePath {
-                root: AstNameRef::Global(global.clone()),
-                fields: Vec::new(),
-            }),
-            func.clone(),
-        )),
-        AstLValue::Name(_) => None,
+        AstLValue::Name(AstNameRef::Global(_)) if dialect.caps.global_decl => {
+            // 候选拒绝[SemanticBarrier:DeclarationIdentity]：普通赋值若输出成 `global function` 会重复声明已有 global，反例见 regress_411。
+            None
+        }
+        AstLValue::Name(name) => {
+            // 候选接受[BindingIdentityProof]：Lua 的 plain `function name()` 正是对当前
+            // binding 的函数赋值；流水线中的 Temp 已由前置 materialize pass 物化。
+            Some((
+                AstFunctionName::Plain(AstNamePath {
+                    root: name.clone(),
+                    fields: Vec::new(),
+                }),
+                func.clone(),
+            ))
+        }
         AstLValue::FieldAccess(access) => {
-            let (root, mut fields) = name_path_from_expr(&access.base)?;
-            if method_fields.contains(&access.field)
-                && !func.params.is_empty()
-                && !function_captures_name_path_root(func, &root)
-                && !function_uses_global_name(func, "self")
-            {
-                return Some((
-                    AstFunctionName::Method(AstNamePath { root, fields }, access.field.clone()),
-                    func.clone(),
-                ));
-            }
+            // 候选拒绝[SemanticBarrier:ParameterBinding]：无定义 provenance 时改成 method 会删除显式首参；同名 receiver 的可达反例见 regress_333。
+            let AstNamePath { root, mut fields } = name_path_from_expr(&access.base)?;
             fields.push(access.field.clone());
             Some((
                 AstFunctionName::Plain(AstNamePath { root, fields }),
@@ -142,15 +115,7 @@ pub(super) fn function_decl_target_from_lvalue(
     }
 }
 
-fn function_captures_name_path_root(func: &AstFunctionExpr, root: &AstNameRef) -> bool {
-    match root {
-        AstNameRef::Param(param) => func.captured_params.contains(param),
-        _ => binding_from_name_ref(root)
-            .is_some_and(|binding| func.captured_bindings.contains(&binding)),
-    }
-}
-
-fn name_path_from_expr(expr: &AstExpr) -> Option<(AstNameRef, Vec<String>)> {
+fn name_path_from_expr(expr: &AstExpr) -> Option<AstNamePath> {
     match expr {
         AstExpr::Var(
             name @ (AstNameRef::Param(_)
@@ -158,12 +123,59 @@ fn name_path_from_expr(expr: &AstExpr) -> Option<(AstNameRef, Vec<String>)> {
             | AstNameRef::SyntheticLocal(_)
             | AstNameRef::Upvalue(_)
             | AstNameRef::Global(_)),
-        ) => Some((name.clone(), Vec::new())),
+        ) => Some(AstNamePath {
+            root: name.clone(),
+            fields: Vec::new(),
+        }),
         AstExpr::FieldAccess(access) => {
-            let (root, mut fields) = name_path_from_expr(&access.base)?;
-            fields.push(access.field.clone());
-            Some((root, fields))
+            let mut path = name_path_from_expr(&access.base)?;
+            path.fields.push(access.field.clone());
+            Some(path)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use crate::ast::common::{AstBindingRef, AstLocalOrigin};
+    use crate::hir::{HirProtoRef, LocalId};
+
+    fn local_function(origin: AstLocalOrigin) -> AstLocalDecl {
+        AstLocalDecl {
+            bindings: vec![crate::ast::common::AstLocalBinding {
+                id: AstBindingRef::Local(LocalId(0)),
+                attr: AstLocalAttr::None,
+                origin,
+            }],
+            values: vec![AstExpr::FunctionExpr(Box::new(AstFunctionExpr {
+                function: HirProtoRef(0),
+                params: Vec::new(),
+                is_vararg: false,
+                named_vararg: None,
+                body: crate::ast::common::AstBlock::default(),
+                captured_bindings: BTreeSet::new(),
+                captured_params: BTreeSet::new(),
+            }))],
+        }
+    }
+
+    #[test]
+    fn local_function_sugar_preserves_origin() {
+        for origin in [
+            AstLocalOrigin::Recovered,
+            AstLocalOrigin::DebugHinted,
+            AstLocalOrigin::PhysicalRoot,
+        ] {
+            let Some(AstStmt::LocalFunctionDecl(decl)) =
+                try_lower_local_function_decl(&local_function(origin))
+            else {
+                panic!("eligible local function should retain sugar")
+            };
+            assert_eq!(decl.origin, origin);
+        }
     }
 }

@@ -7,35 +7,34 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::HirExpr;
+use crate::hir::expr_safety::HirExprSafety;
 
 use super::super::{logical_and, logical_or};
 use super::domain::{
     AbstractValue, collect_literals_from_expr, collect_refs_from_expr, enumerate_environments,
     validate_pure_expr_equivalence,
 };
+use super::normalize_candidate_expr;
 use super::safety::expr_is_synth_safe;
-use super::{MAX_SYNTH_REFS, normalize_candidate_expr};
 
 const MAX_NATURALIZE_OR_TERMS: usize = 16;
 const MAX_NATURALIZE_NESTED_CANDIDATES: usize = 128;
-const MAX_NATURALIZE_ROUNDS: usize = 8;
 
-pub(crate) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
+pub(crate) fn naturalize_pure_logical_expr(
+    expr: &HirExpr,
+    safety: HirExprSafety,
+) -> Option<HirExpr> {
     if !matches!(expr, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_)) {
         return None;
     }
-    if !expr_is_synth_safe(expr) {
+    if !expr_is_synth_safe(expr, safety) {
         return None;
     }
 
-    let mut current = normalize_candidate_expr(expr.clone());
+    let mut current = normalize_candidate_expr(expr.clone(), safety);
     let mut refs = BTreeSet::new();
     collect_refs_from_expr(&current, &mut refs);
     let refs = refs.into_iter().collect::<Vec<_>>();
-    if refs.len() > MAX_SYNTH_REFS {
-        return None;
-    }
-
     let ref_positions = refs
         .iter()
         .enumerate()
@@ -52,16 +51,27 @@ pub(crate) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
     domain.extend(
         (0..super::EXTRA_TRUTHY_SYMBOLS).map(|index| AbstractValue::TruthySymbol(index as u8)),
     );
+    // 候选拒绝[ResourceLimit]：抽象环境笛卡尔积超过 4096 时停止 naturalize；后续应避免完整枚举。
     let environments = enumerate_environments(refs.len(), &domain)?;
     let mut changed = false;
-    for _ in 0..MAX_NATURALIZE_ROUNDS {
+    // 每次提交都严格降低有限的 expr_cost；因此即使深层候选需要超过八轮，也会在有限步内
+    // 收敛，不需要用任意轮数截断已证明安全的改写。
+    loop {
         let current_cost = super::expr_cost(&current);
         let Some(next) = pure_logical_rewrite_candidates(&current)
             .into_iter()
-            .map(normalize_candidate_expr)
+            .map(|candidate| normalize_candidate_expr(candidate, safety))
+            // 候选拒绝[ProofIncomplete]：有限抽象域当前只能筛掉已见反例；错误路径与跨数值表示尚未精确建模，不能据此宣称完整等价证明。
             .filter(|candidate| {
-                validate_pure_expr_equivalence(expr, candidate, &environments, &ref_positions)
+                validate_pure_expr_equivalence(
+                    expr,
+                    candidate,
+                    &environments,
+                    &ref_positions,
+                    safety,
+                )
             })
+            // 候选拒绝[PolicyBoundary]：等价但不严格降低可读性成本的形状不提交。
             .filter(|candidate| super::expr_cost(candidate) < current_cost)
             .min_by_key(super::expr_cost)
         else {
@@ -105,11 +115,13 @@ fn pure_logical_rewrite_candidates(expr: &HirExpr) -> Vec<HirExpr> {
                 candidates.push(rebuilt);
             }
             if candidates.len() >= MAX_NATURALIZE_NESTED_CANDIDATES {
+                // 候选搜索裁剪[ResourceLimit]：单轮最多保留 128 个一层子树候选；后续应使用去重工作队列。
                 return candidates;
             }
         }
     }
 
+    // 候选搜索裁剪[ResourceLimit]：root 直接生成的候选同样最多保留 128 个；后续应使用增量最小成本队列。
     candidates.truncate(MAX_NATURALIZE_NESTED_CANDIDATES);
     candidates
 }
@@ -233,6 +245,7 @@ fn factor_or_of_ands(lhs: &HirExpr, rhs: &HirExpr) -> Vec<HirExpr> {
 
 fn factor_or_chain_of_ands(expr: &HirExpr) -> Vec<HirExpr> {
     let terms = flatten_or_chain(expr);
+    // 候选搜索裁剪[ResourceLimit]：超过 16 项的 or 链不做两两因式分解，避免二次候选爆炸。
     if !(3..=MAX_NATURALIZE_OR_TERMS).contains(&terms.len()) {
         return Vec::new();
     }

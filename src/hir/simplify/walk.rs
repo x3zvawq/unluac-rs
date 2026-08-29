@@ -94,6 +94,7 @@ pub(super) fn for_each_nested_block_mut(stmt: &mut HirStmt, visit: &mut impl FnM
         HirStmt::GenericFor(generic_for) => visit(&mut generic_for.body),
         HirStmt::Block(block) => visit(block),
         HirStmt::LocalDecl(_)
+        | HirStmt::GlobalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
         | HirStmt::ErrNil(_)

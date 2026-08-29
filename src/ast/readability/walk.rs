@@ -80,6 +80,14 @@ pub(super) trait ScopedAstRewritePass {
         self.enter_block(block, BlockKind::Regular, outer_scope)
     }
 
+    fn scope_for_stmt_children(&mut self, _stmt: &AstStmt, scope: &Self::Scope) -> Self::Scope {
+        scope.clone()
+    }
+
+    fn scope_after_stmt(&mut self, _stmt: &AstStmt, scope: &Self::Scope) -> Self::Scope {
+        scope.clone()
+    }
+
     fn rewrite_stmt(&mut self, _stmt: &mut AstStmt, _scope: &Self::Scope) -> bool {
         false
     }
@@ -128,10 +136,12 @@ fn rewrite_block_with_kind_scoped<P: ScopedAstRewritePass>(
     outer_scope: &P::Scope,
     pass: &mut P,
 ) -> bool {
-    let (block_changed, scope) = pass.enter_block(block, kind, outer_scope);
+    let (block_changed, mut scope) = pass.enter_block(block, kind, outer_scope);
     let mut nested_changed = false;
     for stmt in &mut block.stmts {
-        nested_changed |= rewrite_stmt_scoped(stmt, &scope, pass);
+        let child_scope = pass.scope_for_stmt_children(stmt, &scope);
+        nested_changed |= rewrite_stmt_scoped(stmt, &child_scope, pass);
+        scope = pass.scope_after_stmt(stmt, &scope);
     }
     block_changed || nested_changed
 }

@@ -265,6 +265,8 @@ impl ConstructorBuilder {
             return true;
         }
         if start_index == 0 || start_index > self.next_array_index {
+            // 候选拒绝[SemanticBarrier:TableShape]：SETLIST 起点跳过尚未生成的隐式数组槽，
+            // 不能用 constructor array 语法表示而不改变后续隐式下标。
             return false;
         }
 
@@ -416,6 +418,9 @@ fn can_stage_pending_integer_record(
     policy: RecordPromotionPolicy,
 ) -> bool {
     if !can_reorder_integer_record_value(record_value) {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：暂存 future integer record 会把 value 求值
+        // 延后到较小整数键之后；反例见 regress_212_table_constructor_field_order 与
+        // lua54_01_close#12。
         return false;
     }
 

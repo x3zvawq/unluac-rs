@@ -4,15 +4,22 @@
 //! 递归展开它们之间的依赖，并要求这些事件仍是 sink 的同序前缀；任一 retained 有序
 //! 声明或 sink 自身的状态事件都会形成屏障。table lvalue 的写入发生在 RHS 之后，只有
 //! base/key 自身的事件构成前缀；method lookup 则位于 receiver 与显式参数之间。
+//! 循环头还要求搬入 RHS 无事件且循环不变：递归展开已删除候选，外部 local/param
+//! 必须未捕获并且循环体没有直接写入；未知读取和可能触发元方法的运算一律拒绝。
+//! 合法顺序声明的候选依赖只会指向更早语句；递归环表示上游破坏了 binding 不变量。
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::common::{
-    AstBindingRef, AstCallKind, AstExpr, AstLValue, AstNameRef, AstStmt, AstTableField, AstTableKey,
+    AstBindingRef, AstCallKind, AstExpr, AstLValue, AstNameRef, AstStmt, AstTableField,
+    AstTableKey, AstUnaryOpKind,
 };
 
 use super::super::binding_ref::binding_from_name_ref;
-use super::super::expr_analysis::{expr_observes_eval_order, expr_requires_ordered_snapshot};
+use super::super::expr_analysis::{
+    expr_observes_eval_order, expr_requires_ordered_snapshot, is_eventless_primitive_literal,
+};
+use super::BindingWriteIndex;
 use super::candidate::inline_candidate;
 
 pub(super) fn preserves_adjacent_eval_order(
@@ -41,6 +48,7 @@ pub(super) fn run_preserves_eval_order(
     sink_index: usize,
     removed: &[bool],
     mutable_snapshots: &BTreeSet<AstNameRef>,
+    write_index: &BindingWriteIndex,
 ) -> bool {
     let candidates = stmts[run_start..sink_index]
         .iter()
@@ -50,6 +58,22 @@ pub(super) fn run_preserves_eval_order(
             (*removed).then_some((candidate.binding(), value))
         })
         .collect::<Vec<_>>();
+    let values = candidates.iter().copied().collect::<BTreeMap<_, _>>();
+    if matches!(stmts[sink_index], AstStmt::While(_) | AstStmt::Repeat(_))
+        && candidates.iter().any(|(_, value)| {
+            !loop_header_rhs_is_invariant(
+                value,
+                &values,
+                sink_index,
+                mutable_snapshots,
+                write_index,
+                &mut BTreeSet::new(),
+            )
+        })
+    {
+        // 候选拒绝[SemanticBarrier:EvalTime/EvalCount]：循环内可写快照或 lookup/call/元方法事件搬入循环头会改成体后重读或逐轮执行（regress_355、regress_373_loop_lookup_eval_count）；候选拒绝[ProofIncomplete]：只读 capture/upvalue、VarArg 单值位置及无事件运算仍缺少写入、值宽度或目标类型事实。
+        return false;
+    }
     let expected = candidates
         .iter()
         .filter_map(|(binding, value)| {
@@ -68,11 +92,11 @@ pub(super) fn run_preserves_eval_order(
         };
         reached_first |= candidate.binding() == first_moved;
         if reached_first && !removed && expr_requires_ordered_snapshot(value, mutable_snapshots) {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：已移动事件之后仍保留有序 producer，会把原声明顺序交错成 sink 内的另一顺序。
             return false;
         }
     }
 
-    let values = candidates.iter().copied().collect::<BTreeMap<_, _>>();
     let mut collector = EvalPrefixCollector {
         values: &values,
         ordered: expected.iter().copied().collect(),
@@ -84,6 +108,100 @@ pub(super) fn run_preserves_eval_order(
     };
     collector.stmt(&stmts[sink_index]);
     !collector.blocked && collector.prefix == expected
+}
+
+fn loop_header_rhs_is_invariant(
+    value: &AstExpr,
+    removed_values: &BTreeMap<AstBindingRef, &AstExpr>,
+    loop_stmt_index: usize,
+    mutable_snapshots: &BTreeSet<AstNameRef>,
+    write_index: &BindingWriteIndex,
+    visiting: &mut BTreeSet<AstBindingRef>,
+) -> bool {
+    if is_eventless_primitive_literal(value) {
+        return true;
+    }
+
+    match value {
+        AstExpr::Var(name) => {
+            if let Some(binding) = binding_from_name_ref(name)
+                && let Some(candidate_value) = removed_values.get(&binding)
+            {
+                assert!(
+                    visiting.insert(binding),
+                    "inline candidate dependency must point to an earlier local declaration"
+                );
+                let invariant = loop_header_rhs_is_invariant(
+                    candidate_value,
+                    removed_values,
+                    loop_stmt_index,
+                    mutable_snapshots,
+                    write_index,
+                    visiting,
+                );
+                visiting.remove(&binding);
+                return invariant;
+            }
+
+            matches!(
+                name,
+                AstNameRef::Param(_) | AstNameRef::Local(_) | AstNameRef::SyntheticLocal(_)
+            ) && !mutable_snapshots.contains(name)
+                && !write_index.stmt_directly_writes_name(loop_stmt_index, name)
+        }
+        AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not => loop_header_rhs_is_invariant(
+            &unary.expr,
+            removed_values,
+            loop_stmt_index,
+            mutable_snapshots,
+            write_index,
+            visiting,
+        ),
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            loop_header_rhs_is_invariant(
+                &logical.lhs,
+                removed_values,
+                loop_stmt_index,
+                mutable_snapshots,
+                write_index,
+                visiting,
+            ) && loop_header_rhs_is_invariant(
+                &logical.rhs,
+                removed_values,
+                loop_stmt_index,
+                mutable_snapshots,
+                write_index,
+                visiting,
+            )
+        }
+        AstExpr::SingleValue(inner) => loop_header_rhs_is_invariant(
+            inner,
+            removed_values,
+            loop_stmt_index,
+            mutable_snapshots,
+            write_index,
+            visiting,
+        ),
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::FieldAccess(_)
+        | AstExpr::IndexAccess(_)
+        | AstExpr::Unary(_)
+        | AstExpr::Binary(_)
+        | AstExpr::Call(_)
+        | AstExpr::MethodCall(_)
+        | AstExpr::VarArg
+        | AstExpr::TableConstructor(_)
+        | AstExpr::FunctionExpr(_)
+        | AstExpr::Error(_) => false,
+    }
 }
 
 struct EvalPrefixCollector<'a> {
@@ -98,6 +216,7 @@ struct EvalPrefixCollector<'a> {
 
 impl EvalPrefixCollector<'_> {
     fn barrier(&mut self) {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：尚未发射的 producer 若位于该调用/lookup/控制事件之后，内联会改变可观察事件前缀。
         self.blocked |= self.prefix.len() < self.ordered.len();
     }
 
@@ -206,6 +325,7 @@ impl EvalPrefixCollector<'_> {
                 if matches!(mode, WalkMode::Dependency)
                     && contains_moved_binding(&logical.rhs, self.values)
                 {
+                    // 候选拒绝[SemanticBarrier:ControlFlow]：把必达声明搬进 `and/or` 右臂会让 producer 受左值 truthiness 控制。
                     self.barrier();
                 }
             }
@@ -239,7 +359,10 @@ impl EvalPrefixCollector<'_> {
                     }
                 }
             }
-            AstExpr::FunctionExpr(_) if matches!(mode, WalkMode::Dependency) => self.barrier(),
+            AstExpr::FunctionExpr(_) if matches!(mode, WalkMode::Dependency) => {
+                // 候选拒绝[SemanticBarrier:Capture]：closure dependency 会把声明时捕获改成 sink 时创建/捕获，生命周期与值快照均可能改变。
+                self.barrier();
+            }
             AstExpr::Nil
             | AstExpr::Boolean(_)
             | AstExpr::Integer(_)
@@ -265,6 +388,7 @@ impl EvalPrefixCollector<'_> {
 
     fn candidate(&mut self, binding: AstBindingRef) {
         if !self.visiting.insert(binding) || !self.emitted.insert(binding) {
+            // 候选拒绝[SemanticBarrier:EvalCount]：循环依赖或同一候选在 sink 出现多次会递归/复制 RHS，不能保持一次求值。
             self.barrier();
             return;
         }
