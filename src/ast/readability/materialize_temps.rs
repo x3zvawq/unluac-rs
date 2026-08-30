@@ -135,20 +135,37 @@ fn rewrite_function_metadata(function: &mut AstFunctionExpr) -> bool {
         changed |= rewrite_binding_ref(named_vararg);
     }
 
-    let captured_changed = function
+    if function
         .captured_bindings
         .iter()
-        .any(|binding| matches!(binding, AstBindingRef::Temp(_)));
-    if !captured_changed {
-        return changed;
+        .any(|binding| matches!(binding, AstBindingRef::Temp(_)))
+    {
+        function.captured_bindings = std::mem::take(&mut function.captured_bindings)
+            .into_iter()
+            .map(|binding| match binding {
+                AstBindingRef::Temp(temp) => {
+                    AstBindingRef::SyntheticLocal(AstSyntheticLocalId(temp))
+                }
+                binding => binding,
+            })
+            .collect();
+        changed = true;
     }
 
-    function.captured_bindings = std::mem::take(&mut function.captured_bindings)
-        .into_iter()
-        .map(|binding| match binding {
-            AstBindingRef::Temp(temp) => AstBindingRef::SyntheticLocal(AstSyntheticLocalId(temp)),
-            binding => binding,
-        })
-        .collect();
-    true
+    if function
+        .capture_write_names
+        .iter()
+        .any(|name| matches!(name, AstNameRef::Temp(_)))
+    {
+        function.capture_write_names = std::mem::take(&mut function.capture_write_names)
+            .into_iter()
+            .map(|mut name| {
+                rewrite_name_ref(&mut name);
+                name
+            })
+            .collect();
+        changed = true;
+    }
+
+    changed
 }

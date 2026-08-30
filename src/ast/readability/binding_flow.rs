@@ -32,29 +32,16 @@ pub(super) type MutableSnapshotNames = BTreeSet<AstNameRef>;
 
 pub(super) fn mutable_snapshot_names_in_block(block: &AstBlock) -> MutableSnapshotNames {
     #[derive(Default)]
-    struct CaptureCollector(MutableSnapshotNames);
+    struct CaptureWriteCollector(MutableSnapshotNames);
 
-    impl super::visit::AstVisitor for CaptureCollector {
+    impl super::visit::AstVisitor for CaptureWriteCollector {
         fn visit_function_expr(&mut self, function: &AstFunctionExpr) -> bool {
-            self.0.extend(
-                function
-                    .captured_bindings
-                    .iter()
-                    .copied()
-                    .map(AstBindingRef::to_name_ref),
-            );
-            self.0.extend(
-                function
-                    .captured_params
-                    .iter()
-                    .copied()
-                    .map(AstNameRef::Param),
-            );
+            self.0.extend(function.capture_write_names.iter().cloned());
             false
         }
     }
 
-    let mut collector = CaptureCollector::default();
+    let mut collector = CaptureWriteCollector::default();
     super::visit::visit_block(block, &mut collector);
     collector.0
 }

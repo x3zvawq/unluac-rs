@@ -203,7 +203,7 @@ fn receiver_alias_source_may_drop_root(
         return true;
     }
     if mutable_snapshots.contains(source) {
-        // 候选拒绝[ProofIncomplete]：capture 尚无只读/写 provenance，无法证明 sink 期间不会换值并改变旧 root 的生命周期。
+        // 候选拒绝[SemanticBarrier:Lifetime]：可写 reference capture 能在 sink 期间换值，删除 alias 会提前释放旧 receiver root。
         return true;
     }
     false

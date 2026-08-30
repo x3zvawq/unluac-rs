@@ -8,8 +8,9 @@
 use std::collections::BTreeSet;
 
 use crate::hir::{
-    HirAssign, HirBinaryOpKind, HirCallExpr, HirClosureExpr, HirExpr, HirLValue, HirLocalDecl,
-    HirTableAccess, HirTableField, HirTableKey, HirUnaryOpKind, HirValuePack,
+    HirAssign, HirBinaryOpKind, HirCallExpr, HirCaptureMode, HirClosureExpr, HirExpr, HirLValue,
+    HirLocalDecl, HirTableAccess, HirTableField, HirTableKey, HirUnaryOpKind, HirValuePack,
+    UpvalueId,
 };
 
 use super::{AstLowerError, AstLowerer};
@@ -92,7 +93,8 @@ impl<'a> AstLowerer<'a> {
             };
         let mut captured_bindings = BTreeSet::new();
         let mut captured_params = BTreeSet::new();
-        for capture in &closure.captures {
+        let mut capture_write_names = BTreeSet::new();
+        for (capture_index, capture) in closure.captures.iter().enumerate() {
             match &capture.value {
                 HirExpr::ParamRef(param) => {
                     captured_params.insert(*param);
@@ -103,6 +105,12 @@ impl<'a> AstLowerer<'a> {
                     }
                 }
             }
+            if capture.mode == HirCaptureMode::ByReference
+                && child.mutable_upvalues.contains(&UpvalueId(capture_index))
+                && let Some(name) = capture_name_from_hir_expr(&capture.value)
+            {
+                capture_write_names.insert(name);
+            }
         }
         Ok(AstFunctionExpr {
             function: closure.proto,
@@ -112,6 +120,7 @@ impl<'a> AstLowerer<'a> {
             body,
             captured_bindings,
             captured_params,
+            capture_write_names,
         })
     }
 
@@ -427,6 +436,16 @@ fn capture_binding_from_hir_expr(expr: &HirExpr) -> Option<crate::ast::common::A
     match expr {
         HirExpr::LocalRef(local) => Some(crate::ast::common::AstBindingRef::Local(*local)),
         HirExpr::TempRef(temp) => Some(crate::ast::common::AstBindingRef::Temp(*temp)),
+        _ => None,
+    }
+}
+
+fn capture_name_from_hir_expr(expr: &HirExpr) -> Option<AstNameRef> {
+    match expr {
+        HirExpr::ParamRef(param) => Some(AstNameRef::Param(*param)),
+        HirExpr::LocalRef(local) => Some(AstNameRef::Local(*local)),
+        HirExpr::TempRef(temp) => Some(AstNameRef::Temp(*temp)),
+        HirExpr::UpvalueRef(upvalue) => Some(AstNameRef::Upvalue(*upvalue)),
         _ => None,
     }
 }

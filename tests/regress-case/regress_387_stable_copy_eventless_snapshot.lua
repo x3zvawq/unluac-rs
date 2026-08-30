@@ -9,8 +9,13 @@
 -- unluac: expect-contains [[p8_1(not p8_0)]]
 -- unluac: expect-not-contains [[local r8_0 = not p8_0]]
 -- unluac: expect-contains [[local r9_0 = not p9_0]]
--- unluac: expect-contains [[p10_1(p10_0)]]
--- unluac: expect-not-contains [[local r10_0 = p10_0]]
+-- unluac: expect-contains [[p10_1[1] = not p10_0]]
+-- unluac: expect-not-contains [[local r10_0 = not p10_0]]
+-- unluac: expect-contains [[p11_1(p11_0)]]
+-- unluac: expect-not-contains [[local r11_0 = p11_0]]
+-- unluac: expect-contains [[r13_0 = p13_0]]
+-- unluac: expect-contains [[r14_0 = p14_0]]
+-- unluac: expect-contains [[r15_0 = p15_1]]
 
 local function stable_not(value, sink)
     local inverted = not value
@@ -69,6 +74,11 @@ local function repeated_dependency(value)
     return count
 end
 
+local function same_owner_write(value, sink)
+    local inverted = not value
+    value, sink[1] = true, inverted
+end
+
 local function stable_parameter(value, sink)
     local alias = value
     sink()
@@ -78,6 +88,37 @@ end
 local function allocated_twice()
     local value = {}
     return value, value
+end
+
+local function local_decl_handoff(seed)
+    repeat
+        local source = seed
+        local alias = source
+        local target = alias
+        source = {}
+    until target
+    return true
+end
+
+local function parallel_handoff(seed)
+    repeat
+        local source = seed
+        local alias = source
+        local target, marker
+        target, marker = alias, "parallel"
+        source = {}
+    until target
+    return true
+end
+
+local function parameter_handoff(target, seed)
+    repeat
+        local source = seed
+        local alias = source
+        target = alias
+        source = {}
+    until target
+    return target
 end
 
 local first, second = stable_not(false, function() end)
@@ -98,6 +139,9 @@ write_after_last_use(false, function(value)
 end)
 assert(#seen == 1 and seen[1] == true)
 assert(repeated_dependency(false) == 2)
+local same_owner_seen = {}
+same_owner_write(false, same_owner_seen)
+assert(same_owner_seen[1] == true)
 stable_parameter("parameter", function(value)
     if value ~= nil then
         seen[#seen + 1] = value
@@ -111,3 +155,8 @@ assert(comparison_hits == 1)
 
 local allocated_first, allocated_second = allocated_twice()
 assert(allocated_first == allocated_second)
+
+local handoff_seed = {}
+assert(local_decl_handoff(handoff_seed) == true)
+assert(parallel_handoff(handoff_seed) == true)
+assert(parameter_handoff(nil, handoff_seed) == handoff_seed)

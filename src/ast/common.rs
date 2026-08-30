@@ -179,6 +179,11 @@ pub struct AstFunctionExpr {
     pub captured_bindings: BTreeSet<AstBindingRef>,
     /// 同上，但记录被闭包捕获的当前函数参数。
     pub captured_params: BTreeSet<ParamId>,
+    /// 当前闭包或其后代可能通过 by-reference capture 写入的父级名字。
+    ///
+    /// 这是 `captured_bindings` / `captured_params` 的写入子集；只读或 by-value capture
+    /// 仍保留在前两者中供词法身份与存活分析使用，但不构成可变快照。
+    pub capture_write_names: BTreeSet<AstNameRef>,
 }
 
 /// 顶层/表字段函数声明。

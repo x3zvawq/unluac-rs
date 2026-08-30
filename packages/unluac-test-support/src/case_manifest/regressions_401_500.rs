@@ -145,4 +145,8 @@ LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_427_decision_signed_zero_identity.lua",
         ALL_NON_LUAU_DIALECTS,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_428_method_alias_capture_writes.lua",
+        &[LuaCaseDialect::Lua54],
+    ),
 ];

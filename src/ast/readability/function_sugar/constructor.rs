@@ -537,6 +537,7 @@ mod tests {
             body: AstBlock::default(),
             captured_bindings: BTreeSet::new(),
             captured_params: BTreeSet::new(),
+            capture_write_names: BTreeSet::new(),
         }))
     }
 

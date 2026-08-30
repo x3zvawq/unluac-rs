@@ -2,6 +2,78 @@
 
 use super::*;
 
+fn extended_run_allows_recovered_expr(
+    candidate: InlineCandidate,
+    value: &AstExpr,
+    policy: InlinePolicy,
+) -> bool {
+    if candidate.origin() != super::super::super::common::AstLocalOrigin::Recovered {
+        return false;
+    }
+    match policy {
+        InlinePolicy::ExtendedCallChain => {
+            super::super::expr_analysis::is_context_safe_expr(value)
+                || candidate::is_lookup_inline_expr(value)
+                || super::super::expr_analysis::is_call_arg_constructor_inline_expr(value)
+                || matches!(value, AstExpr::VarArg)
+        }
+        _ => false,
+    }
+}
+
+fn rewrite_direct_call_arg_as_single_value(stmt: &mut AstStmt, binding: AstBindingRef) -> bool {
+    fn rewrite_expr(expr: &mut AstExpr, binding: AstBindingRef) -> bool {
+        let args = match expr {
+            AstExpr::Call(call) => &mut call.args,
+            AstExpr::MethodCall(call) => &mut call.args,
+            AstExpr::SingleValue(inner) => return rewrite_expr(inner, binding),
+            _ => return false,
+        };
+        let Some(arg) = args
+            .iter_mut()
+            .find(|arg| matches!(arg, AstExpr::Var(name) if binding.matches_name_ref(name)))
+        else {
+            return false;
+        };
+        *arg = AstExpr::SingleValue(Box::new(AstExpr::VarArg));
+        true
+    }
+
+    match stmt {
+        AstStmt::LocalDecl(decl) => decl
+            .values
+            .iter_mut()
+            .any(|value| rewrite_expr(value, binding)),
+        AstStmt::Assign(assign) => assign
+            .values
+            .iter_mut()
+            .any(|value| rewrite_expr(value, binding)),
+        AstStmt::Return(ret) => ret
+            .values
+            .iter_mut()
+            .any(|value| rewrite_expr(value, binding)),
+        AstStmt::CallStmt(call) => match &mut call.call {
+            AstCallKind::Call(call) => call.args.iter_mut().any(|arg| {
+                if matches!(arg, AstExpr::Var(name) if binding.matches_name_ref(name)) {
+                    *arg = AstExpr::SingleValue(Box::new(AstExpr::VarArg));
+                    true
+                } else {
+                    false
+                }
+            }),
+            AstCallKind::MethodCall(call) => call.args.iter_mut().any(|arg| {
+                if matches!(arg, AstExpr::Var(name) if binding.matches_name_ref(name)) {
+                    *arg = AstExpr::SingleValue(Box::new(AstExpr::VarArg));
+                    true
+                } else {
+                    false
+                }
+            }),
+        },
+        _ => false,
+    }
+}
+
 /// 把非 debug call-result local 的紧邻自调用更新收回初始化式。
 ///
 /// `local x = first(); x = x:next()` 的两次 call 原本就在同一条无条件求值链上；
@@ -124,6 +196,7 @@ fn self_call_update_value(
 
 pub(super) fn collapse_adjacent_call_alias_runs(
     block: &mut AstBlock,
+    target: AstTargetDialect,
     options: ReadabilityOptions,
     mutable_snapshots: &MutableSnapshotNames,
     trailing_condition: Option<&AstExpr>,
@@ -186,8 +259,15 @@ pub(super) fn collapse_adjacent_call_alias_runs(
             else {
                 continue;
             };
-            if !candidate.allows_expr_with_policy(value, rewrite_policy) {
-                // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted local 可被调用中的 debug.getlocal 观察（regress_351）；候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 不能脱离原 root；候选拒绝[ProofIncomplete]：其余 RHS 超出该 run policy 的值与事件证明。
+            if !candidate.allows_expr_with_policy(value, rewrite_policy)
+                && !extended_run_allows_recovered_expr(candidate, value, rewrite_policy)
+            {
+                // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted local 可被调用中的 debug.getlocal 观察（regress_351）。
+                // 候选拒绝[SemanticBarrier:Lifetime]：当前 run policy 不接管 PhysicalRoot 的原词法根。
+                // 候选忽略[NotApplicable]：call 已由当前 policy 接受；loop-header 的 lookup/构造器也已进入逐 site 审查。
+                // 候选拒绝[SemanticBarrier:ValueArity]：Extended run 的裸 vararg 仅在直接 call 参数位由下方单值特例接管；loop-header/其它开放尾位继续保留。
+                // 候选拒绝[SemanticBarrier:Capture]：closure 搬到 sink 会改变分配/capture 时点；安全的直接 return 由相邻 DirectReturnValue owner 消费。
+                // 候选拒绝[LayerBoundary]：Error residual 由错误输出 owner 保留，不由 call-alias run 消费。
                 continue;
             }
             let suffix_uses =
@@ -224,7 +304,9 @@ pub(super) fn collapse_adjacent_call_alias_runs(
                 value,
                 options,
                 rewrite_policy,
-            ) {
+            ) || (matches!(value, AstExpr::VarArg)
+                && rewrite_direct_call_arg_as_single_value(&mut trial_sink, candidate.binding()))
+            {
                 rewritten_sink = Some(trial_sink);
                 removed[candidate_index - index] = true;
                 collapsed_count += 1;
@@ -243,6 +325,7 @@ pub(super) fn collapse_adjacent_call_alias_runs(
                 index,
                 run_end,
                 &removed,
+                target,
                 mutable_snapshots,
                 &write_index,
             )
@@ -337,7 +420,7 @@ pub(super) fn single_call_callee_alias(
                 return false;
             };
             let AstExpr::Var(callee) = &call.callee else {
-                // 候选拒绝[ProofIncomplete]：非直接 binding callee 没有唯一 use-site 位置证明。
+                // 候选拒绝[PolicyBoundary]：caller 已证明唯一 use 并完成 trial rewrite；单项展示例外只收回直接 callee，非直接 callee 仍需普通多项 run。
                 return false;
             };
             candidate.binding().matches_name_ref(callee)
@@ -349,8 +432,8 @@ pub(super) fn single_call_callee_alias(
                 return false;
             };
             let AstExpr::Var(callee) = &call.callee else {
-                // 候选拒绝[ProofIncomplete]：非直接 binding callee 没有唯一 loop-header
-                // use-site 位置证明。
+                // 候选拒绝[PolicyBoundary]：caller 已证明唯一 loop-header use 并完成 trial
+                // rewrite；generic-for 的单项展示例外只收回直接 callee。
                 return false;
             };
             candidate.binding().matches_name_ref(callee)
@@ -401,6 +484,7 @@ pub(super) fn stmt_is_terminal_call_alias_sink(stmt: &AstStmt) -> bool {
 
 pub(super) fn collapse_terminal_call_result_alias_runs(
     block: &mut AstBlock,
+    target: AstTargetDialect,
     options: ReadabilityOptions,
     mutable_snapshots: &MutableSnapshotNames,
     trailing_condition: Option<&AstExpr>,
@@ -450,8 +534,19 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
             else {
                 continue;
             };
-            if !candidate.allows_expr_with_policy(value, InlinePolicy::ExtendedCallChain) {
-                // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted local 可被调用中的 debug.getlocal 观察（regress_351）；候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 不能脱离原 root；候选拒绝[ProofIncomplete]：其余 RHS 超出 call-result run 的值与事件证明。
+            if !candidate.allows_expr_with_policy(value, InlinePolicy::ExtendedCallChain)
+                && !extended_run_allows_recovered_expr(
+                    candidate,
+                    value,
+                    InlinePolicy::ExtendedCallChain,
+                )
+            {
+                // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted local 可被调用中的 debug.getlocal 观察（regress_351）。
+                // 候选拒绝[SemanticBarrier:Lifetime]：call-result run 不接管 PhysicalRoot 的原词法根。
+                // 候选忽略[NotApplicable]：call 已由 ExtendedCallChain 接受；lookup、context-safe 运算与受限构造器由逐 site 合同审查。
+                // 候选拒绝[SemanticBarrier:ValueArity]：裸 vararg 仅在直接 call 参数位由下方单值特例接管。
+                // 候选拒绝[SemanticBarrier:Capture]：closure 的分配/capture 时点不能由 call-result run 搬移；直接 return 归相邻 owner。
+                // 候选拒绝[LayerBoundary]：Error residual 由错误输出 owner 保留，不由 call-result run 消费。
                 continue;
             }
             let suffix_uses =
@@ -473,10 +568,12 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
                 use_index.count_uses_in_range(candidate_index + 1, sink_index, candidate.binding())
             };
             let current_sink = rewritten_sink.as_ref().unwrap_or(&old_stmts[sink_index]);
-            if intermediate_uses != 0
-                || !stmt_has_nested_binding_use(current_sink, candidate.binding())
-            {
-                // 候选拒绝[SemanticBarrier:EvalOrder]：中间读取会改变快照/次数；候选拒绝[ProofIncomplete]：非 nested sink 位置缺少该 run 的位置级证明。
+            if intermediate_uses != 0 {
+                // 候选拒绝[SemanticBarrier:EvalOrder]：仍保留的中间读取会把声明点快照与 sink 求值交错。
+                continue;
+            }
+            if !stmt_has_nested_binding_use(current_sink, candidate.binding()) {
+                // 候选拒绝[LayerBoundary]：当前 call-result sink 不消费该唯一 suffix use；它属于后续 owner，不是本 run 的替换位置。
                 continue;
             }
 
@@ -487,7 +584,9 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
                 value,
                 options,
                 InlinePolicy::ExtendedCallChain,
-            ) {
+            ) || (matches!(value, AstExpr::VarArg)
+                && rewrite_direct_call_arg_as_single_value(&mut trial_sink, candidate.binding()))
+            {
                 rewritten_sink = Some(trial_sink);
                 removed[candidate_index - index] = true;
                 collapsed_count += 1;
@@ -503,6 +602,7 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
                 index,
                 sink_index,
                 &removed,
+                target,
                 mutable_snapshots,
                 &write_index,
             )
@@ -544,6 +644,7 @@ pub(super) fn find_terminal_call_result_sink(stmts: &[AstStmt], index: usize) ->
 
 pub(super) fn collapse_adjacent_mechanical_alias_runs(
     block: &mut AstBlock,
+    target: AstTargetDialect,
     options: ReadabilityOptions,
     mutable_snapshots: &MutableSnapshotNames,
     trailing_condition: Option<&AstExpr>,
@@ -597,7 +698,10 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
             if !candidate.allows_expr_with_policy(value, InlinePolicy::MechanicalRun) {
                 // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted 不能删除（regress_351）；
                 // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 不能脱离原 root（regress_353）；
-                // 候选拒绝[ProofIncomplete]：Recovered call/vararg/table/closure 尚缺值宽度或 root 证明；候选拒绝[LayerBoundary]：Error residual 不由 readability 消费。
+                // 候选忽略[NotApplicable]：call/受限 table/标量 vararg 的调用消费点由前置 call-run owner 处理；直接 return 的 table/closure 由相邻 owner 处理。
+                // 候选拒绝[SemanticBarrier:ValueArity]：其它 call/vararg 尾位可能重新打开多值。
+                // 候选拒绝[SemanticBarrier:Capture]：nested closure 会改变分配/capture 时点。
+                // 候选拒绝[LayerBoundary]：Error residual 不由 readability 消费。
                 continue;
             }
             let run_uses = use_index.count_uses_in_range(
@@ -626,7 +730,7 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
             }
             let current_sink = rewritten_sink.as_ref().unwrap_or(&old_stmts[run_end]);
             if !matches!(current_sink, AstStmt::While(_) | AstStmt::Repeat(_))
-                && !super::super::expr_analysis::result_cannot_root_collectable(value)
+                && !mechanical_value_cannot_root_collectable(value, target)
                 && !mechanical_sink_preserves_root_lifetime(
                     current_sink,
                     candidate.binding(),
@@ -635,7 +739,9 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
                     block_has_close,
                 )
             {
-                // 候选拒绝[SemanticBarrier:Lifetime]：把 recovered lookup/object 快照搬入非终态 sink 会在 sink 后提前释放唯一强 root（regress_355）；候选拒绝[ProofIncomplete]：其它可能持有 collectable 的 RHS 尚缺精确 root-handoff 事实。
+                // 候选拒绝[SemanticBarrier:Lifetime]：把 recovered lookup/object/动态运算结果搬入非终态 sink 会在 sink 后提前释放唯一强 root（regress_355）。
+                // 候选拒绝[TargetConstraint]：只有目标已定义的 literal 运算可证明结果为标量；动态 operand 仍可能经元方法返回 collectable。
+                // 候选拒绝[SemanticBarrier:EvalOrder]：fresh table/container 在字段前先分配，不能充当 producer 的透明 handoff；否则会交换 allocation/GC 事件。
                 continue;
             }
             let mut trial_sink = current_sink.clone();
@@ -670,6 +776,7 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
                     index,
                     run_end,
                     &removed,
+                    target,
                     mutable_snapshots,
                     &write_index,
                 )
@@ -697,6 +804,7 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
 
 pub(super) fn collapse_terminal_local_mechanical_runs(
     block: &mut AstBlock,
+    target: AstTargetDialect,
     options: ReadabilityOptions,
     mutable_snapshots: &MutableSnapshotNames,
     trailing_condition: Option<&AstExpr>,
@@ -757,7 +865,10 @@ pub(super) fn collapse_terminal_local_mechanical_runs(
             if !candidate.allows_expr_with_policy(value, InlinePolicy::MechanicalRun) {
                 // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted 不能删除（regress_351）；
                 // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 不能脱离原 root（regress_353）；
-                // 候选拒绝[ProofIncomplete]：Recovered call/vararg/table/closure 尚缺值宽度或 root 证明；候选拒绝[LayerBoundary]：Error residual 不由 readability 消费。
+                // 候选忽略[NotApplicable]：call/受限 table/标量 vararg 的调用消费点由 call-run owner 处理；直接 return 的 table/closure 由相邻 owner 处理。
+                // 候选拒绝[SemanticBarrier:ValueArity]：其它 call/vararg 尾位可能重新打开多值。
+                // 候选拒绝[SemanticBarrier:Capture]：nested closure 会改变分配/capture 时点。
+                // 候选拒绝[LayerBoundary]：Error residual 不由 readability 消费。
                 continue;
             }
             let suffix_uses =
@@ -786,7 +897,8 @@ pub(super) fn collapse_terminal_local_mechanical_runs(
                 && (!terminal_local_hands_off_root(current_sink, candidate.binding())
                     || write_index.has_write_after(run_end - 1, sink_candidate.binding()))
             {
-                // 候选拒绝[SemanticBarrier:Lifetime]：nested terminal initializer 可能在后续语句前释放 recovered lookup/object root（regress_355）；候选拒绝[ProofIncomplete]：只有无后续写入的顶层 copy 已证明由 terminal local 持续接管同一 root。
+                // 候选拒绝[SemanticBarrier:Lifetime]：nested terminal initializer 可能在后续语句前释放 recovered lookup/object root（regress_355）；只有无后续写入的顶层 copy 仍直接持有同一对象。
+                // 候选拒绝[SemanticBarrier:Resource]：table/container 后续可被设为 weak 或经 alias 清空，不能等同于 local 的持续强 root。
                 continue;
             }
             let mut trial_sink = current_sink.clone();
@@ -809,6 +921,7 @@ pub(super) fn collapse_terminal_local_mechanical_runs(
                 index,
                 run_end - 1,
                 &removed,
+                target,
                 mutable_snapshots,
                 &write_index,
             )
@@ -861,6 +974,12 @@ fn mechanical_sink_preserves_root_lifetime(
             && is_block_terminal
             && has_no_trailing_condition
             && call_stmt_hands_off_root(stmt, binding))
+}
+
+fn mechanical_value_cannot_root_collectable(value: &AstExpr, target: AstTargetDialect) -> bool {
+    super::super::expr_analysis::result_cannot_root_collectable(value)
+        || (matches!(value, AstExpr::Unary(_) | AstExpr::Binary(_))
+            && super::super::expr_analysis::is_discard_safe_expr_for_target(value, target))
 }
 
 fn proven_method_call_consumes_callee(stmt: &AstStmt, binding: AstBindingRef) -> bool {
@@ -1014,5 +1133,155 @@ pub(super) fn add_next_kept_stmt_uses(
     }
     for (binding, count) in use_index.uses_in_stmt_index(next_index) {
         *remaining_uses.entry(binding).or_default() += count;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::ast::common::{
+        AstBinaryExpr, AstBinaryOpKind, AstCallExpr, AstCallStmt, AstFunctionExpr, AstLocalBinding,
+        AstLocalDecl, AstLocalOrigin, AstTableConstructor, AstTableField,
+    };
+    use crate::decompile::DecompileDialect;
+    use crate::hir::{HirProtoRef, LocalId, ParamId};
+
+    use super::*;
+
+    fn recovered_local(binding: AstBindingRef, value: AstExpr) -> AstStmt {
+        AstStmt::LocalDecl(Box::new(AstLocalDecl {
+            bindings: vec![AstLocalBinding {
+                id: binding,
+                attr: AstLocalAttr::None,
+                origin: AstLocalOrigin::Recovered,
+            }],
+            values: vec![value],
+        }))
+    }
+
+    fn direct_call(callee: AstExpr, arg: AstExpr) -> AstStmt {
+        AstStmt::CallStmt(Box::new(AstCallStmt {
+            call: AstCallKind::Call(Box::new(AstCallExpr {
+                callee,
+                args: vec![arg],
+                method_name: None,
+            })),
+        }))
+    }
+
+    fn collapse_call_run(block: &mut AstBlock) -> bool {
+        collapse_adjacent_call_alias_runs(
+            block,
+            AstTargetDialect::new(DecompileDialect::Lua54),
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            None,
+        )
+    }
+
+    #[test]
+    fn extended_call_run_accepts_table_arg_and_scalarizes_vararg() {
+        let first = AstBindingRef::Local(LocalId(0));
+        let second = AstBindingRef::Local(LocalId(1));
+        let table = AstExpr::TableConstructor(Box::new(AstTableConstructor {
+            fields: vec![AstTableField::Array(AstExpr::Integer(1))],
+        }));
+        let mut table_block = AstBlock {
+            stmts: vec![
+                recovered_local(first, table.clone()),
+                recovered_local(second, AstExpr::Var(AstNameRef::Param(ParamId(1)))),
+                direct_call(
+                    AstExpr::Var(second.to_name_ref()),
+                    AstExpr::Var(first.to_name_ref()),
+                ),
+            ],
+        };
+        let (table_candidate, table_value) = inline_candidate(&table_block.stmts[0]).unwrap();
+        assert!(extended_run_allows_recovered_expr(
+            table_candidate,
+            table_value,
+            InlinePolicy::ExtendedCallChain
+        ));
+        assert!(collapse_call_run(&mut table_block));
+        assert!(matches!(
+            table_block.stmts.as_slice(),
+            [AstStmt::CallStmt(call)]
+                if matches!(&call.call, AstCallKind::Call(call) if call.args == vec![table])
+        ));
+
+        let mut vararg_block = AstBlock {
+            stmts: vec![
+                recovered_local(first, AstExpr::VarArg),
+                recovered_local(second, AstExpr::Var(AstNameRef::Param(ParamId(1)))),
+                direct_call(
+                    AstExpr::Var(second.to_name_ref()),
+                    AstExpr::Var(first.to_name_ref()),
+                ),
+            ],
+        };
+        assert!(collapse_call_run(&mut vararg_block));
+        assert!(matches!(
+            vararg_block.stmts.as_slice(),
+            [AstStmt::CallStmt(call)]
+                if matches!(&call.call, AstCallKind::Call(call)
+                    if call.args == vec![AstExpr::SingleValue(Box::new(AstExpr::VarArg))])
+        ));
+    }
+
+    #[test]
+    fn call_run_keeps_closure_allocation_and_terminal_container_is_not_a_root_handoff() {
+        let first = AstBindingRef::Local(LocalId(0));
+        let second = AstBindingRef::Local(LocalId(1));
+        let closure = AstExpr::FunctionExpr(Box::new(AstFunctionExpr {
+            function: HirProtoRef(1),
+            params: Vec::new(),
+            is_vararg: false,
+            named_vararg: None,
+            body: AstBlock::default(),
+            captured_bindings: BTreeSet::new(),
+            captured_params: BTreeSet::new(),
+            capture_write_names: BTreeSet::new(),
+        }));
+        let mut block = AstBlock {
+            stmts: vec![
+                recovered_local(first, closure),
+                recovered_local(second, AstExpr::Var(AstNameRef::Param(ParamId(1)))),
+                direct_call(
+                    AstExpr::Var(second.to_name_ref()),
+                    AstExpr::Var(first.to_name_ref()),
+                ),
+            ],
+        };
+        let original = block.clone();
+        assert!(!collapse_call_run(&mut block));
+        assert_eq!(block, original);
+
+        let direct_copy = recovered_local(second, AstExpr::Var(first.to_name_ref()));
+        assert!(terminal_local_hands_off_root(&direct_copy, first));
+        let container = recovered_local(
+            second,
+            AstExpr::TableConstructor(Box::new(AstTableConstructor {
+                fields: vec![AstTableField::Array(AstExpr::Var(first.to_name_ref()))],
+            })),
+        );
+        assert!(!terminal_local_hands_off_root(&container, first));
+    }
+
+    #[test]
+    fn mechanical_scalar_result_uses_target_integer_semantics() {
+        let value = AstExpr::Binary(Box::new(AstBinaryExpr {
+            op: AstBinaryOpKind::Add,
+            lhs: AstExpr::Integer(1),
+            rhs: AstExpr::Integer(2),
+        }));
+        assert!(mechanical_value_cannot_root_collectable(
+            &value,
+            AstTargetDialect::new(DecompileDialect::Lua54)
+        ));
+        assert!(!mechanical_value_cannot_root_collectable(
+            &value,
+            AstTargetDialect::new(DecompileDialect::Auto)
+        ));
     }
 }

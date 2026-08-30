@@ -14,6 +14,7 @@ use super::super::common::{
     AstLocalOrigin, AstModule, AstStmt,
 };
 use super::binding_flow::{binding_mentions_in_expr, binding_mentions_in_stmt};
+use super::control_flow::BlockGotoIndex;
 use super::{ReadabilityContext, walk};
 use walk::{BlockKind, ScopedAstRewritePass};
 
@@ -124,7 +125,8 @@ fn scope_locals(
                             .get(&binding)
                             .copied()
                             .expect("scopeable declaration must mention its binding");
-                        // 候选拒绝[ProofIncomplete]：生命周期跨过超过 64 个 scopeable local 的 binding 暂不分组；需按区间图/峰值活跃数规划重叠作用域，而非固定窗口。
+                        // 候选拒绝[PolicyBoundary]：项目把单个生成作用域的 local 密度限制为
+                        // 64；跨过更大窗口的 binding 不进入这一轮紧凑分组。
                         scopeable_prefix[last + 1] - scopeable_prefix[index] <= lifetime_limit
                     }
                 })
@@ -139,11 +141,17 @@ fn scope_locals(
             .filter(|(index, _)| short_lived[*index])
             .map(|(_, stmt)| scopeable_bindings(stmt).map_or(0, ScopeableBindings::len))
             .sum::<usize>();
+    if persistent_locals >= available_locals {
+        // 分析停用[LayerBoundary]：不可缩短的同时活跃 binding 已耗尽当前 block 的源码
+        // local 预算；新增 `do` 无法降低该峰值，owner 是 HIR home/binding compaction。
+        return false;
+    }
     let scope_target =
         SCOPE_LOCAL_TARGET.min(available_locals.saturating_sub(persistent_locals).max(1));
     let ranges = scope_ranges(&block.stmts, &last_mentions, &short_lived, scope_target);
     if ranges.is_empty() {
-        // 候选拒绝[ProofIncomplete]：block 峰值已超 local 预算但当前连续区间算法找不到安全范围；需报告不可缩减的 persistent 集合并由前层压缩身份。
+        // 所有形成过的 range 已在 planner 内按具体 density、scope 或 lifetime 原因拒绝；
+        // 空计划不是新的候选拒绝点。
         return false;
     }
 
@@ -263,6 +271,7 @@ fn scope_ranges(
     short_lived: &[bool],
     scope_target: usize,
 ) -> Vec<(usize, usize)> {
+    let goto_index = BlockGotoIndex::new(stmts);
     let mut ranges = Vec::new();
     let mut index = 0usize;
     while index < stmts.len() {
@@ -288,7 +297,8 @@ fn scope_ranges(
         while index < stmts.len() && !is_scope_barrier(&stmts[index]) {
             if let Some(bindings) = scopeable_bindings(&stmts[index]) {
                 if !short_lived[index] {
-                    // 候选拒绝[ProofIncomplete]：当前区间只容纳全部 short-lived 的连续声明；遇到长生命周期声明即停止，缺少交错区间分配证明。
+                    // 候选拒绝[PolicyBoundary]：当前 pass 只生成不超过 64-local 的连续
+                    // laminar 作用域，不为交错生命周期引入额外嵌套层。
                     break;
                 }
                 if scoped_locals + bindings.len() > scope_target && safe_end.is_some() {
@@ -318,24 +328,30 @@ fn scope_ranges(
             index += 1;
         }
 
-        if let Some((end, safe_local_count)) = safe_end
-            && safe_local_count <= scope_target
-        {
-            ranges.push((start, end));
-            index = end;
-        } else {
-            // 候选拒绝[ProofIncomplete]：候选起点到 barrier/扫描终点前没有同时闭合且不超预算的安全区间；需更精确的活跃区间切分。
-            index = start + 1;
+        match safe_end {
+            Some((end, safe_local_count)) if safe_local_count <= scope_target => {
+                if goto_index.has_external_entry(start, end) {
+                    // 候选拒绝[SemanticBarrier:Scope]：把 range 包进新 `do` 会让区间外
+                    // goto 跳入该 range 内 label；Lua 禁止跳入新 local 词法作用域。
+                    index = start + 1;
+                } else {
+                    // 候选接受：range 内部 goto/label 随整段一起移动，向外 goto 也仍是
+                    // 合法的离开作用域；只有外部入边会改变 label 可见性/词法合法性。
+                    ranges.push((start, end));
+                    index = end;
+                }
+            }
+            _ => {
+                // 候选拒绝[PolicyBoundary]：起点到 barrier/扫描终点没有同时闭合且不超过
+                // 64-local 密度的连续 laminar range；本 pass 不增加更深的交错嵌套。
+                index = start + 1;
+            }
         }
     }
     ranges
 }
 
 fn is_scope_barrier(stmt: &AstStmt) -> bool {
-    if matches!(stmt, AstStmt::Goto(_) | AstStmt::Label(_)) {
-        // 候选拒绝[ProofIncomplete]：区间规划尚未携带 goto/label 的相对 owner 与入边；只有外部跳入新 `do` 的形状是 Scope 反例，同区间或跳出形状仍待精确放行。
-        return true;
-    }
     // 属性/debug/root 声明的具体拒绝理由由 scopeable_bindings 在同一候选点分类。
     direct_local_count(stmt) != 0 && scopeable_bindings(stmt).is_none()
 }
@@ -343,7 +359,9 @@ fn is_scope_barrier(stmt: &AstStmt) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::common::{AstGenericFor, AstLocalDecl};
+    use crate::ast::common::{
+        AstGenericFor, AstGoto, AstLabel, AstLabelId, AstLocalDecl, AstReturn,
+    };
     use crate::hir::LocalId;
 
     fn recovered_local(index: usize) -> AstStmt {
@@ -354,6 +372,34 @@ mod tests {
                 origin: AstLocalOrigin::Recovered,
             }],
             values: vec![AstExpr::Integer(index as i64)],
+        }))
+    }
+
+    fn debug_local(index: usize) -> AstStmt {
+        let AstStmt::LocalDecl(mut decl) = recovered_local(index) else {
+            unreachable!();
+        };
+        decl.bindings[0].origin = AstLocalOrigin::DebugHinted;
+        AstStmt::LocalDecl(decl)
+    }
+
+    fn return_binding(index: usize) -> AstStmt {
+        AstStmt::Return(Box::new(AstReturn {
+            values: vec![AstExpr::Var(
+                AstBindingRef::Local(LocalId(index)).to_name_ref(),
+            )],
+        }))
+    }
+
+    fn goto(label: usize) -> AstStmt {
+        AstStmt::Goto(Box::new(AstGoto {
+            target: AstLabelId(label),
+        }))
+    }
+
+    fn label(label: usize) -> AstStmt {
+        AstStmt::Label(Box::new(AstLabel {
+            id: AstLabelId(label),
         }))
     }
 
@@ -377,5 +423,47 @@ mod tests {
 
         assert!(scope_locals(&mut block, crate::SOURCE_LOCAL_LIMIT, None));
         assert!(matches!(block.stmts.first(), Some(AstStmt::DoBlock(_))));
+    }
+
+    #[test]
+    fn scope_ranges_only_reject_external_goto_entries() {
+        let internal = vec![recovered_local(0), goto(7), label(7), return_binding(0)];
+        assert_eq!(
+            scope_ranges(
+                &internal,
+                &last_binding_mentions(&internal),
+                &[true, false, false, false],
+                SCOPE_LOCAL_TARGET,
+            ),
+            vec![(0, 4)]
+        );
+
+        let outgoing = vec![
+            recovered_local(0),
+            goto(8),
+            return_binding(0),
+            debug_local(1),
+            label(8),
+        ];
+        assert_eq!(
+            scope_ranges(
+                &outgoing,
+                &last_binding_mentions(&outgoing),
+                &[true, false, false, false, false],
+                SCOPE_LOCAL_TARGET,
+            ),
+            vec![(0, 3)]
+        );
+
+        let incoming = vec![goto(9), recovered_local(0), label(9), return_binding(0)];
+        assert!(
+            scope_ranges(
+                &incoming,
+                &last_binding_mentions(&incoming),
+                &[false, true, false, false],
+                SCOPE_LOCAL_TARGET,
+            )
+            .is_empty()
+        );
     }
 }

@@ -238,7 +238,11 @@ LuaCaseMatrixEntry::new(
 LuaCaseMatrixEntry::new(
     "tests/regress-case/regress_344_tail_do_same_exit.lua",
     PUC_LUA_54,
-),
+)
+.with_options(LuaCaseOptions {
+    retain_debug: true,
+    ..LuaCaseOptions::DEFAULT
+}),
 LuaCaseMatrixEntry::new(
     "tests/regress-case/regress_345_dead_temp_entry_nil.lua",
     PUC_LUA_54,

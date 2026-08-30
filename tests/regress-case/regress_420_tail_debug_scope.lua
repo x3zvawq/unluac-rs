@@ -29,6 +29,15 @@ local function close_tail_scope()
     end
 end
 
+local function local_function_tail_scope()
+    do
+        local function inner_function()
+            return 42
+        end
+        assert(inner_function() == 42)
+    end
+end
+
 local function outer_close_scope()
     local closer <close> = setmetatable({}, {
         __close = function()
@@ -53,6 +62,10 @@ armed = false
 forbidden_name = "resource"
 armed = true
 close_tail_scope()
+armed = false
+forbidden_name = "inner_function"
+armed = true
+local_function_tail_scope()
 armed = false
 debug.sethook()
 

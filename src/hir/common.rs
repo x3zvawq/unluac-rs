@@ -44,6 +44,11 @@ pub struct HirProto {
     /// can keep the call result alive even when no HIR expression reads it.
     pub physical_root_locals: BTreeSet<LocalId>,
     pub upvalues: Vec<UpvalueId>,
+    /// Upvalues that this proto or one of its descendant closures may write.
+    ///
+    /// The set is transitive through by-reference captures. A by-value capture may mutate the
+    /// child's private snapshot, but does not make the parent binding mutable.
+    pub mutable_upvalues: BTreeSet<UpvalueId>,
     pub upvalue_debug_hints: Vec<Option<String>>,
     pub temps: Vec<TempId>,
     pub temp_debug_locals: Vec<Option<String>>,

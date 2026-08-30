@@ -72,7 +72,8 @@ pub(super) fn collapse_carried_local_handoffs_in_proto(
     expr_safety: HirExprSafety,
 ) -> bool {
     let branch_copies_changed = prune_redundant_branch_state_copies(proto, expr_safety);
-    let snapshots_changed = repeat_snapshots::coalesce_repeat_terminal_snapshots(proto);
+    let snapshots_changed =
+        repeat_snapshots::coalesce_repeat_terminal_snapshots(proto, promotion_facts);
     let dead_for_binding_mirrors_changed =
         prune_dead_for_binding_temp_mirrors(proto, promotion_facts);
     // Both structural rewrites above can remove a materialization that would otherwise be

@@ -19,7 +19,6 @@ use super::super::expr_analysis::{
     direct_return_concat_cost, direct_return_logical_cost, expr_complexity,
     is_access_base_inline_expr, is_call_arg_constructor_inline_expr, is_context_safe_expr,
     is_direct_return_inline_expr, is_mechanical_run_inline_expr, is_multi_return_inline_expr,
-    is_stable_copy_alias_expr,
 };
 use super::candidate::{
     InlineCandidate, InlinePolicy, is_call_callee_inline_expr,
@@ -565,10 +564,12 @@ impl InlineSite {
             return false;
         }
 
-        let Some(limit) = self.complexity_limit(options, policy, replacement) else {
-            // 候选拒绝[ProofIncomplete]：该 policy/site 组合尚无位置级值宽度与求值顺序证明；不能因找到同名 use 就直接替换。
+        if !self.policy_allows(candidate, replacement, policy) {
             return false;
-        };
+        }
+        let limit = self
+            .complexity_limit(options, policy, replacement)
+            .expect("semantically allowed inline sites must have a presentation budget");
         let complexity_ok = expr_complexity(replacement) <= limit
             || (matches!(self, Self::ReturnValue)
                 && matches!(policy, InlinePolicy::DirectReturnValue)
@@ -583,10 +584,20 @@ impl InlineSite {
             return false;
         }
 
+        true
+    }
+
+    fn policy_allows(
+        self,
+        candidate: InlineCandidate,
+        replacement: &AstExpr,
+        policy: InlinePolicy,
+    ) -> bool {
         match policy {
             InlinePolicy::StableCopy => {
+                // `collapse_stable_copy_aliases` has already applied its target-aware expression,
+                // write, capture, and lifetime proof. The site owns only binding origin and budget.
                 candidate.origin() == super::super::super::common::AstLocalOrigin::Recovered
-                    && is_stable_copy_alias_expr(replacement)
             }
             InlinePolicy::Conservative => match candidate.origin() {
                 // 候选拒绝[SemanticBarrier:DebugScope]：删除 debug local 会改变 debug.getlocal 可观察的作用域（regress_351）；候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 可能被弱表/`__gc` 观察，不能走通用 use-site 内联。
@@ -740,9 +751,11 @@ impl InlineSite {
                     || is_recallable_inline_expr(replacement)
                     || is_call_arg_constructor_inline_expr(replacement)
             }
-            // 最终参数只接受不会重新打开返回值的 lookup/constructor。
+            // local initializer 已把裸 call 收窄为单值；最终参数由
+            // replacement_preserving_value_width 补回 SingleValue，避免重新打开返回值。
             Self::CallArgFinal => {
                 is_extended_call_arg_local_alias_expr(replacement)
+                    || is_recallable_inline_expr(replacement)
                     || is_call_arg_constructor_inline_expr(replacement)
             }
             Self::AccessBase => is_access_base_inline_expr(replacement),
@@ -811,9 +824,10 @@ impl InlineSite {
                 false
             }
             Self::Index => {
-                // 候选拒绝[ProofIncomplete]：index 位置仍缺 base 求值顺序与 key root
-                // lifetime 的联合证明，不能把 call/lookup 结果直接移入索引。
-                false
+                // 相邻候选在进入 use-site rewrite 前已经由 preserves_adjacent_eval_order
+                // 证明 producer 仍是 sink 的事件前缀；无事件 base 因此可以安全承接
+                // call/lookup key，事件性 base 则在前一层被拒绝。
+                is_recallable_inline_expr(replacement) || is_lookup_inline_expr(replacement)
             }
         }
     }

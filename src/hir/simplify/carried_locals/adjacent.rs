@@ -56,13 +56,11 @@ pub(super) fn try_collapse_guarded_local_update(
     let Some(state) = exact_binding_copy(&if_stmt.then_block.stmts, next) else {
         return false;
     };
-    // 候选拒绝[ProofIncomplete]：temp state 尚未接入 local/param 的可用性与声明 owner 证明。
     // 候选拒绝[SemanticBarrier:Lifetime]：外层仍活跃的 state 或 next 被合并后会让 false-return 路径提前覆盖旧 state。
     // 候选拒绝[SemanticBarrier:Capture]：捕获任一 binding 时，false path 上 closure 可区分“只写 next”和“已写 state”。
     // 候选拒绝[LayerBoundary]：debug/TBC/for/raw-home identity 由 identity facts owner 保留。
     // 候选拒绝[SemanticBarrier:Scope]：initializer 自读 next 时，删除其 local 声明会把读取改指另一 lexical identity。
-    if !matches!(state, CarryBinding::Param(_) | CarryBinding::Local(_))
-        || state == next_binding
+    if state == next_binding
         || matches!(state, CarryBinding::Local(_)) && outer_bindings.contains(&state)
         || captured_bindings.contains(&state)
         || captured_bindings.contains(&next_binding)
@@ -792,7 +790,11 @@ fn binding_lvalue(binding: CarryBinding) -> HirLValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hir::common::{HirGoto, HirIf, HirLabelId, HirReturn, HirValuePack};
+    use std::collections::BTreeSet;
+
+    use crate::hir::common::{
+        HirGoto, HirIf, HirLabelId, HirLocalDecl, HirReturn, HirValuePack, TempId,
+    };
 
     fn empty_return() -> HirStmt {
         HirStmt::Return(Box::new(HirReturn {
@@ -837,5 +839,59 @@ mod tests {
         }))));
         assert!(!stmt_is_return_shell(&incomplete_if));
         assert!(!stmt_is_return_shell(&prefixed_return));
+    }
+
+    #[test]
+    fn guarded_local_update_can_handoff_to_a_temp_state() {
+        let next = LocalId(0);
+        let state = TempId(0);
+        let mut block = HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![next],
+                    values: HirValuePack::fixed(vec![HirExpr::Boolean(true)]),
+                })),
+                HirStmt::If(Box::new(HirIf {
+                    cond: HirExpr::LocalRef(next),
+                    then_block: HirBlock {
+                        stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                            targets: vec![HirLValue::Temp(state)],
+                            values: HirValuePack::fixed(vec![HirExpr::LocalRef(next)]),
+                        }))],
+                    },
+                    else_block: Some(block(empty_return())),
+                })),
+            ],
+        };
+        let identity_facts = HandoffIdentityFacts {
+            debug: BTreeSet::new(),
+            for_bindings: BTreeSet::new(),
+            physical_roots: BTreeSet::new(),
+            captured: BTreeSet::new(),
+            reference_captured: BTreeSet::new(),
+            to_be_closed: BTreeSet::new(),
+        };
+        let mut promotion_facts = ProtoPromotionFacts::default();
+
+        assert!(try_collapse_guarded_local_update(
+            &mut block,
+            0,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &mut promotion_facts,
+            &identity_facts,
+        ));
+        assert!(matches!(
+            &block.stmts[0],
+            HirStmt::Assign(assign)
+                if assign.targets == [HirLValue::Temp(state)]
+                    && assign.values.fixed == [HirExpr::Boolean(true)]
+        ));
+        assert!(matches!(
+            &block.stmts[1],
+            HirStmt::If(if_stmt)
+                if if_stmt.cond == HirExpr::TempRef(state)
+                    && if_stmt.then_block.stmts.is_empty()
+        ));
     }
 }

@@ -426,6 +426,7 @@ fn lower_proto_one(
     fill_composite_factory_protos(
         proto,
         &child_refs,
+        &child_mutable_upvalues,
         &captured_shared_plan,
         &composite_protos,
         artifacts,
@@ -474,6 +475,7 @@ fn lower_proto_one(
         owned_open_producers,
         global_decls,
     };
+    let mutable_upvalues = mutable_upvalues_for_proto(proto, &child_mutable_upvalues);
 
     artifacts.protos[id.index()] = HirProto {
         id,
@@ -489,6 +491,7 @@ fn lower_proto_one(
         physical_root_temps: BTreeSet::new(),
         physical_root_locals: BTreeSet::new(),
         upvalues: lowering.bindings.upvalues.clone(),
+        mutable_upvalues: mutable_upvalue_ids(&mutable_upvalues),
         upvalue_debug_hints: lowering.bindings.upvalue_debug_hints.clone(),
         temps: lowering.bindings.temps.clone(),
         temp_debug_locals: lowering.bindings.temp_debug_locals.clone(),
@@ -526,7 +529,7 @@ fn lower_proto_one(
     Ok(LoweredProtoResult {
         id,
         source_proto_id: frame.source_proto_id,
-        mutable_upvalues: mutable_upvalues_for_proto(proto, &child_mutable_upvalues),
+        mutable_upvalues,
     })
 }
 
@@ -642,6 +645,7 @@ fn fill_failed_proto(
         .iter()
         .map(|child| child.mutable_upvalues.clone())
         .collect::<Vec<_>>();
+    let mutable_upvalues = mutable_upvalues_for_proto(proto, &child_mutable_upvalues);
 
     artifacts.protos[id.index()] = HirProto {
         id,
@@ -661,6 +665,7 @@ fn fill_failed_proto(
         upvalues: (0..usize::from(proto.upvalues.common.count))
             .map(UpvalueId)
             .collect(),
+        mutable_upvalues: mutable_upvalue_ids(&mutable_upvalues),
         upvalue_debug_hints: (0..usize::from(proto.upvalues.common.count))
             .map(|index| {
                 proto
@@ -683,7 +688,7 @@ fn fill_failed_proto(
     LoweredProtoResult {
         id,
         source_proto_id: frame.source_proto_id,
-        mutable_upvalues: mutable_upvalues_for_proto(proto, &child_mutable_upvalues),
+        mutable_upvalues,
     }
 }
 
@@ -761,6 +766,15 @@ fn mutable_upvalues_for_proto(
         }
     }
     mutable
+}
+
+fn mutable_upvalue_ids(mutable: &[bool]) -> BTreeSet<UpvalueId> {
+    mutable
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(index, can_write)| can_write.then_some(UpvalueId(index)))
+        .collect()
 }
 
 fn build_shared_closure_locals(
@@ -939,13 +953,19 @@ fn reserve_composite_factory_protos(
 fn fill_composite_factory_protos(
     proto: &LoweredProto,
     child_refs: &[HirProtoRef],
+    child_mutable_upvalues: &[Vec<bool>],
     plan: &SharedClosurePlan,
     ids: &[HirProtoRef],
     artifacts: &mut LowerArtifacts,
 ) -> Result<(), HirLowerError> {
     for (composite, id) in plan.composites().iter().zip(ids) {
-        artifacts.protos[id.index()] =
-            build_composite_factory_proto(*id, proto, child_refs, composite)?;
+        artifacts.protos[id.index()] = build_composite_factory_proto(
+            *id,
+            proto,
+            child_refs,
+            child_mutable_upvalues,
+            composite,
+        )?;
     }
     Ok(())
 }
@@ -954,6 +974,7 @@ fn build_composite_factory_proto(
     id: HirProtoRef,
     proto: &LoweredProto,
     child_refs: &[HirProtoRef],
+    child_mutable_upvalues: &[Vec<bool>],
     plan: &CompositeFactoryPlan,
 ) -> Result<HirProto, HirLowerError> {
     let error = || HirLowerError::UnrepresentableRepeatedCapturedSharedClosure {
@@ -967,6 +988,7 @@ fn build_composite_factory_proto(
     let mut body = HirBlock::default();
     let mut children = Vec::new();
     let mut seen_children = BTreeSet::new();
+    let mut mutable_upvalues = BTreeSet::new();
 
     for (index, node) in plan.nodes.iter().enumerate() {
         let child = proto.children.get(node.proto.index()).ok_or_else(error)?;
@@ -982,11 +1004,20 @@ fn build_composite_factory_proto(
         let captures = node
             .captures
             .iter()
-            .map(|capture| {
+            .enumerate()
+            .map(|(capture_index, capture)| {
                 let (mode, value) = match *capture {
                     CompositeCapture::Outer(outer) => {
                         if outer >= plan.outer_captures.len() {
                             return None;
+                        }
+                        if child_mutable_upvalues
+                            .get(node.proto.index())
+                            .and_then(|mutable| mutable.get(capture_index))
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            mutable_upvalues.insert(UpvalueId(outer));
                         }
                         (
                             HirCaptureMode::ByReference,
@@ -1044,6 +1075,7 @@ fn build_composite_factory_proto(
         physical_root_temps: BTreeSet::new(),
         physical_root_locals: BTreeSet::new(),
         upvalues: (0..plan.outer_captures.len()).map(UpvalueId).collect(),
+        mutable_upvalues,
         upvalue_debug_hints: vec![None; plan.outer_captures.len()],
         temps: Vec::new(),
         temp_debug_locals: Vec::new(),

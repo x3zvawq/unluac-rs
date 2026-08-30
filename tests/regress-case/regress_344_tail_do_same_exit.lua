@@ -1,5 +1,4 @@
--- regress_344_tail_do_same_exit: a function-tail do shares the function's exit
--- unluac: expect-not-contains [[    do]]
+-- regress_344_tail_do_same_exit: a function-tail close still runs once when debug scope keeps the do
 
 local closed = 0
 

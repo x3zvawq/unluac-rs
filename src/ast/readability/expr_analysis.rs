@@ -513,30 +513,36 @@ pub(super) fn is_copy_like_expr(expr: &AstExpr) -> bool {
 pub(super) fn collect_stable_copy_snapshot_names(
     expr: &AstExpr,
     names: &mut BTreeSet<AstNameRef>,
+    target: AstTargetDialect,
 ) -> bool {
+    if is_eventless_primitive_expr_for_target(expr, target) {
+        return true;
+    }
     match expr {
-        AstExpr::Number(value) => value.is_finite(),
-        AstExpr::Nil | AstExpr::Boolean(_) | AstExpr::Integer(_) | AstExpr::String(_) => true,
         AstExpr::Var(
             name @ (AstNameRef::Param(_) | AstNameRef::Local(_) | AstNameRef::SyntheticLocal(_)),
         ) => {
             names.insert(name.clone());
             true
         }
-        AstExpr::SingleValue(expr) => collect_stable_copy_snapshot_names(expr, names),
+        AstExpr::SingleValue(expr) => collect_stable_copy_snapshot_names(expr, names, target),
         AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not => {
-            collect_stable_copy_snapshot_names(&unary.expr, names)
+            collect_stable_copy_snapshot_names(&unary.expr, names, target)
         }
         AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            collect_stable_copy_snapshot_names(&logical.lhs, names)
-                && collect_stable_copy_snapshot_names(&logical.rhs, names)
+            collect_stable_copy_snapshot_names(&logical.lhs, names, target)
+                && collect_stable_copy_snapshot_names(&logical.rhs, names, target)
         }
         _ => false,
     }
 }
 
 pub(super) fn is_stable_copy_alias_expr(expr: &AstExpr) -> bool {
-    collect_stable_copy_snapshot_names(expr, &mut BTreeSet::new())
+    collect_stable_copy_snapshot_names(
+        expr,
+        &mut BTreeSet::new(),
+        AstTargetDialect::new(DecompileDialect::Auto),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -704,6 +710,69 @@ fn eventless_literal_kind(
         | AstExpr::FunctionExpr(_)
         | AstExpr::Error(_) => None,
     }
+}
+
+/// Primitive literal expression that can be re-evaluated without VM events and whose generated
+/// source preserves that property for the selected target.
+///
+/// Non-finite numbers are excluded because the generator materializes them as arithmetic. The
+/// dialect fact is needed for integer arithmetic: Lua 5.1/5.2 may use a custom integral-number
+/// layout, while the newer PUC dialects, LuaJIT, and Luau have a defined model here.
+pub(super) fn is_eventless_primitive_expr_for_target(
+    expr: &AstExpr,
+    target: AstTargetDialect,
+) -> bool {
+    fn has_stable_literal_materialization(
+        expr: &AstExpr,
+        integer_arithmetic_is_defined: bool,
+    ) -> bool {
+        match expr {
+            AstExpr::Number(value) => value.is_finite(),
+            AstExpr::SingleValue(inner) => {
+                has_stable_literal_materialization(inner, integer_arithmetic_is_defined)
+            }
+            AstExpr::Unary(unary) => {
+                has_stable_literal_materialization(&unary.expr, integer_arithmetic_is_defined)
+            }
+            AstExpr::Binary(binary) => {
+                let locale_sensitive_string_order =
+                    matches!(binary.op, AstBinaryOpKind::Lt | AstBinaryOpKind::Le)
+                        && eventless_literal_kind(&binary.lhs, integer_arithmetic_is_defined)
+                            == Some(EventlessLiteralKind::String)
+                        && eventless_literal_kind(&binary.rhs, integer_arithmetic_is_defined)
+                            == Some(EventlessLiteralKind::String);
+                !locale_sensitive_string_order
+                    && has_stable_literal_materialization(
+                        &binary.lhs,
+                        integer_arithmetic_is_defined,
+                    )
+                    && has_stable_literal_materialization(
+                        &binary.rhs,
+                        integer_arithmetic_is_defined,
+                    )
+            }
+            AstExpr::Nil | AstExpr::Boolean(_) | AstExpr::Integer(_) | AstExpr::String(_) => true,
+            AstExpr::Int64(_)
+            | AstExpr::UInt64(_)
+            | AstExpr::Vector(_)
+            | AstExpr::Complex { .. }
+            | AstExpr::Var(_)
+            | AstExpr::FieldAccess(_)
+            | AstExpr::IndexAccess(_)
+            | AstExpr::LogicalAnd(_)
+            | AstExpr::LogicalOr(_)
+            | AstExpr::Call(_)
+            | AstExpr::MethodCall(_)
+            | AstExpr::VarArg
+            | AstExpr::TableConstructor(_)
+            | AstExpr::FunctionExpr(_)
+            | AstExpr::Error(_) => false,
+        }
+    }
+
+    let integer_arithmetic_is_defined = target_defines_integer_literal_arithmetic(target);
+    has_stable_literal_materialization(expr, integer_arithmetic_is_defined)
+        && eventless_literal_kind(expr, integer_arithmetic_is_defined).is_some()
 }
 
 fn stable_literal_equality(

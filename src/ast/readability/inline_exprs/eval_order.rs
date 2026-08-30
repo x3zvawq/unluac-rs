@@ -12,12 +12,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::common::{
     AstBindingRef, AstCallKind, AstExpr, AstLValue, AstNameRef, AstStmt, AstTableField,
-    AstTableKey, AstUnaryOpKind,
+    AstTableKey, AstTargetDialect, AstUnaryOpKind,
 };
 
 use super::super::binding_ref::binding_from_name_ref;
 use super::super::expr_analysis::{
-    expr_observes_eval_order, expr_requires_ordered_snapshot, is_eventless_primitive_literal,
+    expr_observes_eval_order, expr_requires_ordered_snapshot,
+    is_eventless_primitive_expr_for_target,
 };
 use super::BindingWriteIndex;
 use super::candidate::inline_candidate;
@@ -47,6 +48,7 @@ pub(super) fn run_preserves_eval_order(
     run_start: usize,
     sink_index: usize,
     removed: &[bool],
+    target: AstTargetDialect,
     mutable_snapshots: &BTreeSet<AstNameRef>,
     write_index: &BindingWriteIndex,
 ) -> bool {
@@ -65,6 +67,7 @@ pub(super) fn run_preserves_eval_order(
                 value,
                 &values,
                 sink_index,
+                target,
                 mutable_snapshots,
                 write_index,
                 &mut BTreeSet::new(),
@@ -73,7 +76,9 @@ pub(super) fn run_preserves_eval_order(
     {
         // 候选拒绝[SemanticBarrier:EvalTime]：循环内可写快照搬入循环头会改成体后重读；
         // 候选拒绝[SemanticBarrier:EvalCount]：lookup/call/元方法事件会从一次变成逐轮执行（regress_355、regress_373_loop_lookup_eval_count）；
-        // 候选拒绝[ProofIncomplete]：只读 capture/upvalue、VarArg 单值位置及无事件运算仍缺少写入、值宽度或目标类型事实。
+        // 候选拒绝[SemanticBarrier:EvalTime]：upvalue 可能由当前 block 外部写入，不能作为循环不变量。
+        // 候选拒绝[TargetConstraint]：目标未定义的整数运算或方言专属常量物化不能重复搬入循环头。
+        // 候选忽略[NotApplicable]：VarArg 已被所有可形成 removed run 的 expression policy 拒绝，不会抵达此 guard。
         return false;
     }
     let expected = candidates
@@ -116,11 +121,12 @@ fn loop_header_rhs_is_invariant(
     value: &AstExpr,
     removed_values: &BTreeMap<AstBindingRef, &AstExpr>,
     loop_stmt_index: usize,
+    target: AstTargetDialect,
     mutable_snapshots: &BTreeSet<AstNameRef>,
     write_index: &BindingWriteIndex,
     visiting: &mut BTreeSet<AstBindingRef>,
 ) -> bool {
-    if is_eventless_primitive_literal(value) {
+    if is_eventless_primitive_expr_for_target(value, target) {
         return true;
     }
 
@@ -137,6 +143,7 @@ fn loop_header_rhs_is_invariant(
                     candidate_value,
                     removed_values,
                     loop_stmt_index,
+                    target,
                     mutable_snapshots,
                     write_index,
                     visiting,
@@ -155,6 +162,7 @@ fn loop_header_rhs_is_invariant(
             &unary.expr,
             removed_values,
             loop_stmt_index,
+            target,
             mutable_snapshots,
             write_index,
             visiting,
@@ -164,6 +172,7 @@ fn loop_header_rhs_is_invariant(
                 &logical.lhs,
                 removed_values,
                 loop_stmt_index,
+                target,
                 mutable_snapshots,
                 write_index,
                 visiting,
@@ -171,6 +180,7 @@ fn loop_header_rhs_is_invariant(
                 &logical.rhs,
                 removed_values,
                 loop_stmt_index,
+                target,
                 mutable_snapshots,
                 write_index,
                 visiting,
@@ -180,6 +190,7 @@ fn loop_header_rhs_is_invariant(
             inner,
             removed_values,
             loop_stmt_index,
+            target,
             mutable_snapshots,
             write_index,
             visiting,

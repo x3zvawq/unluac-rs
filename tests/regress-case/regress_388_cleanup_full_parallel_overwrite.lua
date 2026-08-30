@@ -70,6 +70,32 @@ local function eventful_scalar_overwrite()
     end
 end
 
+local pending_weak = setmetatable({}, { __mode = "k" })
+
+local function pending_root()
+    local value = {}
+    pending_weak[value] = true
+    return value
+end
+
+local function pending_root_is_live()
+    collectgarbage("collect")
+    return next(pending_weak) ~= nil
+end
+
+local function multi_initializer_keeps_pending_root()
+    local root, live = pending_root(), pending_root_is_live()
+    root, live = false, live
+    return live
+end
+
+local function eventless_copy_overwrite(replacement)
+    local value = rooted_value()
+    value = replacement
+    local released = overwritten_root_is_dead()
+    return value, released
+end
+
 local first, second = overwrite_pair()()
 assert(first == 11 and second == 22)
 assert(overwrite_multi_initializer()() == 33)
@@ -77,6 +103,15 @@ assert(calls == 2)
 
 local scalar, scalar_released = eventful_scalar_overwrite()()
 assert(scalar == true and scalar_released == true)
+collectgarbage("collect")
+assert(next(weak) == nil)
+
+assert(multi_initializer_keeps_pending_root())
+collectgarbage("collect")
+assert(next(pending_weak) == nil)
+
+local copied, copy_released = eventless_copy_overwrite("copy")
+assert(copied == "copy" and copy_released == true)
 collectgarbage("collect")
 assert(next(weak) == nil)
 

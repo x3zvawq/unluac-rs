@@ -186,11 +186,9 @@ fn single_pass_stmt_flow(stmt: &AstStmt) -> Option<SinglePassFlow> {
             // 被下沉的共享后缀并直接进入 latch（regress_294）。
             None
         }
-        AstStmt::Goto(_) | AstStmt::Label(_) => {
-            // 候选拒绝[ProofIncomplete]：缺少 goto/label 相对当前 repeat 的入口与目标 owner，
-            // 不能证明它们是否穿越 single-pass fence。
-            None
-        }
+        // goto/label 已由 single-pass 候选入口的 forbidden-node 预检拒绝；这里保留
+        // None 只是让 flow helper 对全部 AST 节点保持封闭。
+        AstStmt::Goto(_) | AstStmt::Label(_) => None,
         // 候选拒绝[LayerBoundary]：Error 是必须保留的前层诊断。
         AstStmt::Error(_) => None,
         AstStmt::LocalDecl(_)
@@ -236,8 +234,7 @@ fn single_pass_block_is_foldable(block: &AstBlock, mut tail_is_nonempty: bool) -
         }
 
         let AstStmt::If(if_stmt) = stmt else {
-            // 候选拒绝[ProofIncomplete]：当前证明只会把 break 所在的 if 分配给唯一后缀；缺少其它复合语句的精确路径 owner 分析。
-            return false;
+            unreachable!("validated direct breaks can only remain under an if");
         };
         let Some(then_flow) = single_pass_block_flow(&if_stmt.then_block) else {
             return false;
@@ -252,7 +249,9 @@ fn single_pass_block_is_foldable(block: &AstBlock, mut tail_is_nonempty: bool) -
             None => FALLTHROUGH_FLOW,
         };
         if then_flow.falls_through && else_flow.falls_through && tail_is_nonempty {
-            // 候选拒绝[ProofIncomplete]：两臂互斥但共享 continuation 非空；当前 AST 没有共享表示，复制 tail 还缺少作用域与代码膨胀成本模型（regress_242）。
+            // 候选拒绝[PolicyBoundary]：两臂都可能 fallthrough 时只能把非空 continuation
+            // 复制进两个互斥 arm；项目不为消除 single-pass fence 复制整段源码或重复声明
+            // binding identity（regress_242）。
             return false;
         }
 
@@ -405,7 +404,9 @@ fn stmt_contains_single_pass_forbidden_nodes(stmt: &AstStmt, loop_depth: usize) 
         }
         // 候选拒绝[SemanticBarrier:ControlFlow]：当前 loop owner 的 continue 会绕过外层 latch/fence 尾部求值（regress_294）；嵌套 owner 则原位保留。
         AstStmt::Continue => loop_depth == 0,
-        // 候选拒绝[ProofIncomplete]：goto/label 仍缺少相对当前 repeat 的精确入口与目标 owner，不能重建 single-pass fence。
+        // 候选拒绝[LayerBoundary]：显式 goto/label 子图的入口、回边与 owner 属于
+        // Structure/HIR reducible-control 恢复；branch-pretty 只消费已结构化的 break tree，
+        // 不在 AST 重新解释 CFG（regress_368）。
         AstStmt::Goto(_) | AstStmt::Label(_) => true,
         // 候选拒绝[LayerBoundary]：Error 是前层诊断，不参与展示层控制重建。
         AstStmt::Error(_) => true,

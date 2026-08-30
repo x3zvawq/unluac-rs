@@ -875,6 +875,7 @@ mod tests {
             physical_root_temps: BTreeSet::new(),
             physical_root_locals: BTreeSet::new(),
             upvalues: Vec::new(),
+            mutable_upvalues: BTreeSet::new(),
             upvalue_debug_hints: Vec::new(),
             temps: Vec::new(),
             temp_debug_locals: Vec::new(),
